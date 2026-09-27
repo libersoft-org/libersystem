@@ -1,0 +1,92 @@
+//! LiberSystem I2C and SMBus - the contract an `i2c-bus` controller serves on one ADDRESS-SCOPED connection.
+//!
+//! NEVER THE WHOLE BUS. The only connections to an `i2c-bus` provider are the ones DeviceManager mints with a
+//! SCOPED `CONNECT` naming one seven-bit address, so every operation below addresses that device and no other:
+//! there is no address argument to get wrong, and no way to reach a neighbour on the bus. The controller holds
+//! each address for one connection at a time.
+//!
+//! ONE CONTRACT WITH A FUNCTIONALITY SET. A controller DECLARES the transactions it serves, and a consumer that
+//! needs one the controller lacks refuses it at bind instead of failing later: plain I2C - write, read, and a
+//! write then a read as ONE transfer with a repeated start, each at most `max-transfer` bytes - and the SMBus
+//! transactions, with the packet error code on any of them where the controller declares it. A transaction
+//! outside the declared set answers `unsupported`.
+//!
+//! NO CLOCK RATE, NO BUS NUMBER AND NO PIN: a controller that has a clock takes it from its own firmware
+//! description. SMBus alert and host notify are not here; SMBus consumers poll.
+
+package liber:i2c-device@1;
+
+use liber:base@1.{error};
+
+/// What the controller serves.
+record i2c-functionality {
+	/// Write, read, and a write then a read with a repeated start.
+	plain:          bool,
+	/// The longest plain message, in bytes.
+	max-transfer:   u16,
+	quick:          bool,
+	/// Send byte and receive byte.
+	byte:           bool,
+	/// Read and write byte data.
+	byte-data:      bool,
+	/// Read and write word data.
+	word-data:      bool,
+	block-write:    bool,
+	/// The block read whose length THE DEVICE sends first, at most 32 bytes.
+	block-read:     bool,
+	/// A read of a length the caller names, after a one-byte command.
+	i2c-block-read: bool,
+	/// The packet error code, on any declared SMBus transaction.
+	pec:            bool,
+}
+
+/// How a transfer ended on the bus.
+enum i2c-status {
+	ok,
+	/// Nothing answered at the address.
+	no-device,
+	/// The transfer did not complete - the device stopped acknowledging, or the controller says only that it
+	/// failed.
+	interrupted,
+	/// Longer than the controller's bound.
+	too-long,
+	/// The controller itself failed.
+	controller,
+	/// Outside the declared functionality set.
+	unsupported,
+	/// The packet error code the device sent does not match its bytes.
+	pec,
+}
+
+/// A transfer's status and what it read: the bytes of a read, a byte for a byte and two for a word (low byte
+/// first), the block for a block read. Empty for a write.
+record i2c-reply {
+	status:             i2c-status,
+	@bound(2048) bytes: list<u8>,
+}
+
+/// THE CONTRACT an `i2c-bus` publication serves on each address-scoped connection.
+interface i2c-device {
+	/// What the controller serves.
+	@op(1) functionality:  func() -> result<i2c-functionality, error>;
+	/// The seven-bit address this connection is scoped to.
+	@op(2) address:        func() -> result<u8, error>;
+	@op(3) write:          func(@bound(2048) data: list<u8>) -> result<i2c-reply, error>;
+	@op(4) read:           func(len: u16) -> result<i2c-reply, error>;
+	/// A write then a read, as ONE transfer with a repeated start.
+	@op(5) write-read:     func(@bound(2048) data: list<u8>, len: u16) -> result<i2c-reply, error>;
+	/// The address alone, with the read or write bit: a zero-length message.
+	@op(6) quick:          func(read: bool) -> result<i2c-reply, error>;
+	@op(7) send-byte:      func(value: u8, pec: bool) -> result<i2c-reply, error>;
+	@op(8) receive-byte:   func(pec: bool) -> result<i2c-reply, error>;
+	@op(9) write-byte-data: func(command: u8, value: u8, pec: bool) -> result<i2c-reply, error>;
+	@op(10) read-byte-data: func(command: u8, pec: bool) -> result<i2c-reply, error>;
+	@op(11) write-word-data: func(command: u8, value: u16, pec: bool) -> result<i2c-reply, error>;
+	@op(12) read-word-data: func(command: u8, pec: bool) -> result<i2c-reply, error>;
+	/// At most 32 bytes, which the controller sends with their count.
+	@op(13) block-write:    func(command: u8, @bound(32) data: list<u8>, pec: bool) -> result<i2c-reply, error>;
+	/// The count the device sends first, then that many bytes; at most 32.
+	@op(14) block-read:     func(command: u8, pec: bool) -> result<i2c-reply, error>;
+	/// `len` bytes after a one-byte command, with no count from the device; at most 32.
+	@op(15) i2c-block-read: func(command: u8, len: u8, pec: bool) -> result<i2c-reply, error>;
+}

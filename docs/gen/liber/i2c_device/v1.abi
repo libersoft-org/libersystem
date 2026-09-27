@@ -1,0 +1,20 @@
+package liber:i2c-device@1
+record i2c-functionality(plain:bool,max-transfer:u16,quick:bool,byte:bool,byte-data:bool,word-data:bool,block-write:bool,block-read:bool,i2c-block-read:bool,pec:bool)
+enum i2c-status(ok=0,no-device=1,interrupted=2,too-long=3,controller=4,unsupported=5,pec=6)
+record i2c-reply(status:i2c-status,bytes:list<u8>:bound=2048)
+interface i2c-device
+method i2c-device.functionality op=1 () -> result<i2c-functionality, liber:base@1::error>
+method i2c-device.address op=2 () -> result<u8, liber:base@1::error>
+method i2c-device.write op=3 (data:list<u8>:bound=2048:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.read op=4 (len:u16:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.write-read op=5 (data:list<u8>:bound=2048:rights=,len:u16:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.quick op=6 (read:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.send-byte op=7 (value:u8:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.receive-byte op=8 (pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.write-byte-data op=9 (command:u8:rights=,value:u8:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.read-byte-data op=10 (command:u8:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.write-word-data op=11 (command:u8:rights=,value:u16:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.read-word-data op=12 (command:u8:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.block-write op=13 (command:u8:rights=,data:list<u8>:bound=32:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.block-read op=14 (command:u8:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>
+method i2c-device.i2c-block-read op=15 (command:u8:rights=,len:u8:rights=,pec:bool:rights=) -> result<i2c-reply, liber:base@1::error>

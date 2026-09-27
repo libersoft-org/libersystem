@@ -36,11 +36,39 @@ fn red() -> Paint {
 }
 
 fn draw(list: &DrawList, image: &mut OwnedImage) {
+	let before = copy_of(image);
 	let mut backend = Soft2d::new();
 	let description = description(image);
 	let prepared = backend.prepare(list, &description).expect("a preparation");
-	let mut view = image.view_mut();
-	backend.render(&prepared, &mut view).expect("a frame");
+	{
+		let mut view = image.view_mut();
+		backend.render(&prepared, &mut view).expect("a frame");
+	}
+	every_schedule_agrees(list, &before, image, &target::NoImages, &crate::glyph::NoGlyphs);
+}
+
+/// The same image, again.
+fn copy_of(image: &OwnedImage) -> OwnedImage {
+	let mut copy = OwnedImage::new(*image.layout()).expect("an image");
+	copy.bytes_mut().copy_from_slice(image.bytes());
+	copy
+}
+
+/// THE SCALAR REFERENCE HOLDS EVERY SCENE: `list` drawn onto `before` through every schedule - real threads at
+/// two and four lanes, a pool that runs the units backwards and one that hands every unit out twice - with
+/// every kind of unit, is `expected`, the serial walk's target, to the byte. No tolerance: the units run one
+/// algorithm over disjoint pixels, so a difference is a defect. MOST SCENES ARE ONE TILE, which is the case of
+/// lanes left idle; the crowded scene below is the one cut into more units than any pool has lanes.
+fn every_schedule_agrees(list: &DrawList, before: &OwnedImage, expected: &OwnedImage, images: &dyn ImageSource, glyphs: &dyn GlyphProvider) {
+	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
+		for (name, pool) in [("threads(2)", &Threads(2) as &dyn Workers), ("threads(4)", &Threads(4)), ("backwards", &Backwards), ("twice", &Twice)] {
+			let mut image = copy_of(before);
+			let mut backend = Soft2d::new().with_images(images).with_glyphs(glyphs).with_workers(pool).with_units(kind);
+			let prepared = backend.prepare(list, &description(&image)).expect("a preparation through a pool");
+			backend.render(&prepared, &mut image.view_mut()).expect("a frame through a pool");
+			assert!(image.bytes() == expected.bytes(), "{name} {kind:?}: the target differs from the serial walk's");
+		}
+	}
 }
 
 fn rect_path(rect: RectF) -> render2d::path::Path {
@@ -368,36 +396,43 @@ fn damage_is_conservative_and_clipped_to_the_target() {
 #[test]
 // A RENDERER THAT WRITES PAST ITS TARGET IS A SECURITY BUG AND NOT A DRAWING BUG. The canaries are the
 // pitch padding inside every row and the bytes after the last visible one: a drawing that reaches
-// either has written outside the image it was given.
+// either has written outside the image it was given. THE TARGET IS THREE TILES BY TWO, the last of each
+// partial, and it is drawn by the serial walk and by four lanes with every kind of unit - so a unit's
+// part of the target is held to its edges as well.
 fn nothing_is_written_outside_the_target() {
 	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
 	let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
 	// A pitch eight bytes wider than the rows need, and sixty-four bytes of tail.
-	let (width, height, pitch) = (16u32, 16u32, 16 * 4 + 8);
+	let (width, height, pitch) = (150u32, 70u32, 150 * 4 + 8);
 	let layout = ImageLayout::new(Extent2D::new(width, height), pitch, storage, RowOrigin::TopLeft, semantics).expect("a layout");
-	let mut bytes = alloc::vec![0xA5u8; pitch as usize * height as usize + 64];
 	let mut canvas = Canvas::new();
-	canvas.fill_path(rect_path(RectF::new(-8.0, -8.0, 64.0, 64.0)), red(), FillRule::NonZero).expect("a fill reaching past every edge");
+	canvas.fill_path(rect_path(RectF::new(-8.0, -8.0, width as f32 + 16.0, height as f32 + 16.0)), red(), FillRule::NonZero).expect("a fill reaching past every edge");
 	let list = canvas.finish().expect("a list");
-	let mut backend = Soft2d::new();
 	let description = TargetDescription { extent: Extent2D::new(width, height), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
-	let prepared = backend.prepare(&list, &description).expect("a preparation");
-	{
-		let mut view = graphics_core::ImageViewMut::new(layout, &mut bytes).expect("a view");
-		backend.render(&prepared, &mut view).expect("a frame");
-	}
-	for row in 0..height {
-		let padding_start = row as usize * pitch as usize + width as usize * 4;
-		for byte in &bytes[padding_start..padding_start + 8] {
-			assert_eq!(*byte, 0xA5, "the pitch padding of row {row} was written");
+	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
+		for (name, pool) in [("serial", &Serial as &dyn Workers), ("threads(4)", &Threads(4))] {
+			let mut bytes = alloc::vec![0xA5u8; pitch as usize * height as usize + 64];
+			let mut backend = Soft2d::new().with_workers(pool).with_units(kind);
+			let prepared = backend.prepare(&list, &description).expect("a preparation");
+			{
+				let mut view = graphics_core::ImageViewMut::new(layout, &mut bytes).expect("a view");
+				backend.render(&prepared, &mut view).expect("a frame");
+			}
+			for row in 0..height {
+				let padding_start = row as usize * pitch as usize + width as usize * 4;
+				for byte in &bytes[padding_start..padding_start + 8] {
+					assert_eq!(*byte, 0xA5, "{name} {kind:?}: the pitch padding of row {row} was written");
+				}
+			}
+			let tail = pitch as usize * height as usize;
+			for byte in &bytes[tail..] {
+				assert_eq!(*byte, 0xA5, "{name} {kind:?}: the bytes after the image were written");
+			}
+			// And the drawing itself did happen, to the last visible pixel.
+			assert_eq!(bytes[3], 255, "{name} {kind:?}");
+			assert_eq!(bytes[(height as usize - 1) * pitch as usize + (width as usize - 1) * 4 + 3], 255, "{name} {kind:?}");
 		}
 	}
-	let tail = pitch as usize * height as usize;
-	for byte in &bytes[tail..] {
-		assert_eq!(*byte, 0xA5, "the bytes after the image were written");
-	}
-	// And the drawing itself did happen.
-	assert_eq!(bytes[3], 255);
 }
 
 /// An image source for a fixture: one image, under one identity.
@@ -512,12 +547,14 @@ fn images_are_drawn_at_quality_and_minified_without_aliasing() {
 		let mut canvas = Canvas::new();
 		canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 4.0, 4.0), quality).expect("an image");
 		let list = canvas.finish().expect("a list");
+		let before = copy_of(&image);
 		let mut backend = Soft2d::new().with_images(&source);
 		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
 		{
 			let mut view = image.view_mut();
 			backend.render(&prepared, &mut view).expect("a frame");
 		}
+		every_schedule_agrees(&list, &before, &image, &source, &crate::glyph::NoGlyphs);
 		image
 	};
 
@@ -540,12 +577,14 @@ fn images_are_drawn_at_quality_and_minified_without_aliasing() {
 	canvas.set_transform(render2d::transform::Transform { m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -0.01, 1.0]] });
 	canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 32.0, 32.0), render2d::paint::ImageQuality::Mipmapped).expect("an image");
 	let list = canvas.finish().expect("a list");
+	let before = copy_of(&perspective);
 	let mut backend = Soft2d::new().with_images(&source);
 	let prepared = backend.prepare(&list, &description(&perspective)).expect("a preparation");
 	{
 		let mut view = perspective.view_mut();
 		backend.render(&prepared, &mut view).expect("a frame");
 	}
+	every_schedule_agrees(&list, &before, &perspective, &source, &crate::glyph::NoGlyphs);
 	let drawn = (0..32).flat_map(|y| (0..32).map(move |x| (x, y))).filter(|(x, y)| pixel(&perspective, *x, *y)[3] > 0).count();
 	assert!(drawn > 100, "a projectively transformed image is drawn: {drawn} pixels");
 }
@@ -767,12 +806,14 @@ fn every_glyph_kind_is_drawn_and_the_cache_keys_them_apart() {
 		let mut canvas = Canvas::new();
 		canvas.draw_glyph_run(run(kind, mode), red()).expect("a run");
 		let list = canvas.finish().expect("a list");
+		let before = copy_of(&image);
 		let mut backend = Soft2d::new().with_glyphs(&provider);
 		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
 		{
 			let mut view = image.view_mut();
 			backend.render(&prepared, &mut view).expect("a frame");
 		}
+		every_schedule_agrees(&list, &before, &image, &crate::target::NoImages, &provider);
 		(image, backend.glyph_cache().len())
 	};
 
@@ -999,10 +1040,7 @@ fn hostile_input_is_answered_rather_than_crashed_on() {
 	}
 	let list = canvas.finish().expect("a list");
 	let mut image = target(16, 16);
-	let mut backend = Soft2d::new();
-	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
-	let mut view = image.view_mut();
-	backend.render(&prepared, &mut view).expect("a frame under sixteen nested clips");
+	draw(&list, &mut image);
 	assert!(pixel(&image, 8, 8)[3] > 0, "the drawing survives the nesting");
 }
 
@@ -1093,12 +1131,14 @@ fn a_planar_video_frame_draws_without_being_converted_first() {
 	let mut canvas = Canvas::new();
 	canvas.draw_image(render2d::list::ImageRecord { identity: 11, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 8.0, 8.0), RectF::new(0.0, 0.0, 16.0, 16.0), render2d::paint::ImageQuality::Nearest).expect("a frame");
 	let list = canvas.finish().expect("a list");
+	let before = copy_of(&image);
 	let mut backend = Soft2d::new().with_images(&source);
 	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
 	{
 		let mut view = image.view_mut();
 		backend.render(&prepared, &mut view).expect("a frame");
 	}
+	every_schedule_agrees(&list, &before, &image, &source, &crate::glyph::NoGlyphs);
 
 	let white = pixel(&image, 2, 8);
 	let black = pixel(&image, 13, 8);
@@ -1679,7 +1719,6 @@ struct Crowd {
 /// glyph kind - spread over a frame of SEVEN bands and fifty-six tiles, so every pool below has at least
 /// as many units as it has lanes, whichever unit is chosen.
 fn crowded_list() -> DrawList {
-	use font_contract::glyph::{GlyphKind, RasterisationMode, SubpixelLayout};
 	let record = render2d::list::ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 };
 	let mut canvas = Canvas::new();
 	let stops = canvas
@@ -1728,8 +1767,15 @@ fn crowded_list() -> DrawList {
 	canvas.fill_path(rect_path(RectF::new(210.0, 190.0, 180.0, 120.0)), Paint::Solid(Color::new(1.0, 1.0, 1.0, 0.15, ColorSpace::Srgb)), FillRule::NonZero).expect("a pane");
 	canvas.end_layer().expect("closed");
 	canvas.end_layer().expect("closed");
-	// TEXT OF EVERY GLYPH KIND, across several tiles.
-	let run = |kind: GlyphKind, mode: RasterisationMode, x: i16, y: i16| render2d::list::RecordedGlyphRun { face: font_contract::FaceRef { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity([7u8; 32]), index: 0 }, generation: font_contract::face::Generation(1) }, size: font_contract::Fixed266::from_pixels(8), variation: font_contract::VariationCoordinates::default(), script: font_contract::ScriptTag::from_bytes(*b"latn"), direction: font_contract::Direction::LeftToRight, mode, origin_x: font_contract::Fixed266::from_pixels(x), origin_y: font_contract::Fixed266::from_pixels(y), glyphs: (0..24).map(|index| font_contract::PositionedGlyph { glyph: 40 + (index % 5), x_offset: font_contract::Fixed266::ZERO, y_offset: font_contract::Fixed266::ZERO, x_advance: font_contract::Fixed266::from_pixels(7), y_advance: font_contract::Fixed266::ZERO, kind, selection: font_contract::cache::KindSelection { strike: None, palette: None } }).collect(), clusters: alloc::vec![] };
+	every_kind_of_text(&mut canvas, 40);
+	canvas.finish().expect("a list")
+}
+
+/// TEXT OF EVERY GLYPH KIND, across several tiles: five runs of twenty-four glyphs each, cycling through
+/// five glyph indices from `first`.
+fn every_kind_of_text(canvas: &mut Canvas, first: u32) {
+	use font_contract::glyph::{GlyphKind, RasterisationMode, SubpixelLayout};
+	let run = |kind: GlyphKind, mode: RasterisationMode, x: i16, y: i16| render2d::list::RecordedGlyphRun { face: font_contract::FaceRef { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity([7u8; 32]), index: 0 }, generation: font_contract::face::Generation(1) }, size: font_contract::Fixed266::from_pixels(8), variation: font_contract::VariationCoordinates::default(), script: font_contract::ScriptTag::from_bytes(*b"latn"), direction: font_contract::Direction::LeftToRight, mode, origin_x: font_contract::Fixed266::from_pixels(x), origin_y: font_contract::Fixed266::from_pixels(y), glyphs: (0..24).map(|index| font_contract::PositionedGlyph { glyph: first + (index % 5), x_offset: font_contract::Fixed266::ZERO, y_offset: font_contract::Fixed266::ZERO, x_advance: font_contract::Fixed266::from_pixels(7), y_advance: font_contract::Fixed266::ZERO, kind, selection: font_contract::cache::KindSelection { strike: None, palette: None } }).collect(), clusters: alloc::vec![] };
 	let modes = [
 		(GlyphKind::Outline, RasterisationMode::Grayscale),
 		(GlyphKind::GrayscaleMask, RasterisationMode::Grayscale),
@@ -1740,7 +1786,6 @@ fn crowded_list() -> DrawList {
 	for (row, (kind, mode)) in modes.into_iter().enumerate() {
 		canvas.draw_glyph_run(run(kind, mode, 12 + row as i16 * 9, 390 + row as i16 * 11), red()).expect("a run");
 	}
-	canvas.finish().expect("a list")
 }
 
 /// Draw a list through a pool, with units of one kind, onto a fresh target; the target and the frame's
@@ -1770,7 +1815,7 @@ fn every_schedule_draws_the_serial_walks_pixels() {
 	let list = crowded_list();
 	let (reference, lanes, units) = drawn_with(&list, &Serial, UnitKind::Bands, &crowd).expect("the serial walk");
 	assert_eq!((lanes, units), (1, 7), "the serial walk is one lane over seven bands");
-	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
 		for (name, pool) in [
 			("threads(2)", &Threads(2) as &dyn Workers),
 			("threads(4)", &Threads(4)),
@@ -1785,9 +1830,11 @@ fn every_schedule_draws_the_serial_walks_pixels() {
 			assert!(image.bytes() == reference.bytes(), "{name} {kind:?}: the target differs from the serial walk's");
 		}
 	}
-	// And the tiles are what the tile unit counts.
-	let (_, _, tiles) = drawn_with(&list, &Threads(4), UnitKind::Tiles, &crowd).expect("tiles");
-	assert_eq!(tiles, 56, "every tile of the frame draws something, under the conic background");
+	// And the tiles are what both tile units count.
+	for kind in [UnitKind::Tiles, UnitKind::Rectangles] {
+		let (_, _, tiles) = drawn_with(&list, &Threads(4), kind, &crowd).expect("tiles");
+		assert_eq!(tiles, 56, "{kind:?}: every tile of the frame draws something, under the conic background");
+	}
 }
 
 #[test]
@@ -1796,7 +1843,7 @@ fn every_schedule_draws_the_serial_walks_pixels() {
 fn a_pool_that_returns_early_is_refused() {
 	let crowd = crowd();
 	let list = crowded_list();
-	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
 		assert_eq!(drawn_with(&list, &Short, kind, &crowd).err(), Some(render2d::Error::IncompletePool), "{kind:?}");
 	}
 }
@@ -1809,7 +1856,12 @@ fn a_pool_that_returns_early_is_refused() {
 fn a_warmed_frame_asks_the_allocator_for_nothing() {
 	let crowd = crowd();
 	let list = crowded_list();
-	for (name, pool, kind) in [("serial", &Serial as &dyn Workers, UnitKind::Bands), ("rotating(4) bands", &Rotating(4), UnitKind::Bands), ("rotating(4) tiles", &Rotating(4), UnitKind::Tiles)] {
+	for (name, pool, kind) in [
+		("serial", &Serial as &dyn Workers, UnitKind::Bands),
+		("rotating(4) bands", &Rotating(4), UnitKind::Bands),
+		("rotating(4) tiles", &Rotating(4), UnitKind::Tiles),
+		("rotating(4) rectangles", &Rotating(4), UnitKind::Rectangles),
+	] {
 		let mut image = target(512, 448);
 		let mut backend = Soft2d::new().with_images(&crowd.images).with_glyphs(&EveryKind).with_workers(pool).with_units(kind);
 		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
@@ -1832,9 +1884,11 @@ fn a_warmed_frame_asks_the_allocator_for_nothing() {
 #[test]
 // THE CEILING IS SPENT IN AN ORDER THAT CANNOT CHANGE A PIXEL: the decoded copy is settled against one
 // lane, and lanes beyond the first fit only into what is left. The image here is sized so its copy fits
-// beside TWO lanes and not three, on a frame cut into more units than the pool's six lanes - so the lane
-// count held down is the ceiling's doing and not a cap at the units - and every worker count keeps the
-// copy and draws the one-lane frame's pixels.
+// beside TWO lanes and not three, on a frame cut into at least as many units as each pool has lanes - so
+// a lane count held down is the ceiling's doing and not a cap at the units - and every worker count
+// from one to six keeps the copy and draws the one-lane frame's pixels: every count with the unit a
+// frame is cut into by default, and the boundary and the pool's six with the other two. (Each count is
+// a preparation that decodes a copy the size of the ceiling, which is what the case costs.)
 fn a_second_lane_never_displaces_a_decoded_copy() {
 	let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
 	let draw_image = |size: u32| {
@@ -1850,12 +1904,13 @@ fn a_second_lane_never_displaces_a_decoded_copy() {
 	let mut probe = Soft2d::new().with_images(&small);
 	let prepared = probe.prepare(&draw_image(8), &description(&target(512, 448))).expect("a small preparation");
 	let base = render2d::backend::Prepared::scratch_bytes(&prepared) - 8 * 8 * 8;
-	let lane = {
-		// IN BANDS, which charge a second lane its scratch and nothing more - tiles charge it the
-		// intermediate as well.
-		let mut two = Soft2d::new().with_images(&small).with_workers(&Rotating(2)).with_units(UnitKind::Bands);
+	// WHAT A SECOND LANE COSTS with each kind of unit: in bands its scratch and nothing more, cut into
+	// tiles the unit table as well, and through the intermediate the intermediate too.
+	let second = |kind: UnitKind| {
+		let mut two = Soft2d::new().with_images(&small).with_workers(&Rotating(2)).with_units(kind);
 		render2d::backend::Prepared::scratch_bytes(&two.prepare(&draw_image(8), &description(&target(512, 448))).expect("two lanes")) - 8 * 8 * 8 - base
 	};
+	let lane = second(UnitKind::Bands);
 	assert!(lane > 0, "a second lane costs scratch");
 	// A copy that leaves room for one and a half lanes beside the first: two lanes fit, three do not.
 	let texels = (ceiling - base - lane - lane / 2) / 8;
@@ -1867,20 +1922,69 @@ fn a_second_lane_never_displaces_a_decoded_copy() {
 	assert_eq!(one.decoded_images(), 1, "the copy fits beside one lane");
 	let mut reference = target(512, 448);
 	serial.render(&one, &mut reference.view_mut()).expect("the serial frame");
-	for kind in [UnitKind::Bands, UnitKind::Tiles] {
-		let pool = Threads(6);
-		let mut backend = Soft2d::new().with_images(&big).with_workers(&pool).with_units(kind);
-		let prepared = backend.prepare(&list, &description(&target(512, 448))).expect("a preparation with a pool");
-		assert_eq!(prepared.decoded_images(), 1, "{kind:?}: the pool's lanes did not displace the copy");
-		assert!(prepared.units() >= pool.lanes() || kind == UnitKind::Bands, "{kind:?}: the frame has at least as many units as the pool has lanes");
-		assert!(prepared.lanes() < pool.lanes(), "{kind:?}: the ceiling held the lanes below the pool's six: {}", prepared.lanes());
+	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
+		// TWO LANES WHERE THE SECOND LANE'S WHOLE COST FITS THE ROOM LEFT, and never three: the room is
+		// less than two lanes' scratch.
+		let fits = if second(kind) <= lane + lane / 2 { 2 } else { 1 };
 		if kind == UnitKind::Bands {
-			assert_eq!(prepared.lanes(), 2, "the lanes are what the ceiling left room for");
+			assert_eq!(fits, 2, "bands fit a second lane, so the case sits on the boundary it tests");
 		}
-		let mut image = target(512, 448);
-		backend.render(&prepared, &mut image.view_mut()).expect("a frame");
-		assert!(image.bytes() == reference.bytes(), "{kind:?}: the pixels are the one-lane frame's");
+		let counts: &[usize] = if kind == UnitKind::Rectangles { &[1, 2, 3, 4, 5, 6] } else { &[2, 6] };
+		for &workers in counts {
+			let pool = Threads(workers);
+			let mut backend = Soft2d::new().with_images(&big).with_workers(&pool).with_units(kind);
+			let prepared = backend.prepare(&list, &description(&target(512, 448))).expect("a preparation with a pool");
+			assert_eq!(prepared.decoded_images(), 1, "{kind:?} x{workers}: the pool's lanes did not displace the copy");
+			assert!(prepared.units() >= pool.lanes(), "{kind:?} x{workers}: the frame has {} units, fewer than the pool's lanes", prepared.units());
+			assert_eq!(prepared.lanes(), workers.min(fits), "{kind:?} x{workers}: the lanes are what the ceiling left room for");
+			if workers > fits {
+				assert!(prepared.lanes() < pool.lanes(), "{kind:?} x{workers}: the ceiling held the lanes below the pool's");
+			}
+			let mut image = target(512, 448);
+			backend.render(&prepared, &mut image.view_mut()).expect("a frame");
+			assert!(image.bytes() == reference.bytes(), "{kind:?} x{workers}: the pixels are the one-lane frame's");
+		}
 	}
+}
+
+/// A provider that counts what it is asked for.
+struct Counted {
+	calls: core::cell::Cell<usize>,
+}
+
+impl GlyphProvider for Counted {
+	fn glyph(&self, key: &font_contract::cache::GlyphCacheKey) -> GlyphImage {
+		self.calls.set(self.calls.get() + 1);
+		EveryKind.glyph(key)
+	}
+}
+
+#[test]
+// THERE IS NO MISS AT RENDER. Every form a list draws is resolved at `prepare` and held by the list, so a
+// replay asks the provider for nothing, and an eviction between the prepare and the render takes nothing
+// the list draws. The cache here holds ONE BYTE, so every form it resolves evicts the one before, and one
+// more glyph resolved after the preparation evicts the last of them - and the list, on four lanes, still
+// draws the pixels a backend with the whole cache draws on one.
+fn the_replay_never_meets_a_miss() {
+	let crowd = crowd();
+	let list = crowded_list();
+	let (reference, _, _) = drawn_with(&list, &Serial, UnitKind::Bands, &crowd).expect("the serial walk, with the whole cache");
+	let counted = Counted { calls: core::cell::Cell::new(0) };
+	let pool = Threads(4);
+	let mut image = target(512, 448);
+	let mut backend = Soft2d::new().with_images(&crowd.images).with_glyphs(&counted).with_workers(&pool);
+	*backend.glyph_cache_mut() = crate::glyph::GlyphRaster::new(1);
+	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+	assert!(counted.calls.get() > 0, "the preparation resolved the list's forms through the provider");
+	assert!(backend.glyph_cache().len() <= 1, "and the cache kept at most the last of them");
+	// A GLYPH THE LIST DOES NOT DRAW, which evicts the last form it does.
+	let stranger = font_contract::cache::GlyphCacheKey { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity([7u8; 32]), index: 0 }, generation: font_contract::face::Generation(1), glyph: 90, size: font_contract::Fixed266::from_pixels(8), variation: font_contract::VariationCoordinates::default(), transform: font_contract::glyph::TransformKey::IDENTITY, phase: font_contract::glyph::SubpixelPhase::of(font_contract::Fixed266::ZERO, font_contract::Fixed266::ZERO), kind: font_contract::glyph::GlyphKind::GrayscaleMask, selection: font_contract::cache::KindSelection { strike: None, palette: None }, mode: font_contract::glyph::RasterisationMode::Grayscale };
+	backend.glyph_cache_mut().get(&stranger, &counted);
+	assert_eq!(backend.glyph_cache().len(), 1, "the cache holds the stranger alone");
+	let asked = counted.calls.get();
+	backend.render(&prepared, &mut image.view_mut()).expect("the list, with none of its forms left in the cache");
+	assert_eq!(counted.calls.get(), asked, "the replay asked the provider for nothing");
+	assert!(image.bytes() == reference.bytes(), "and drew the pixels the whole cache draws");
 }
 
 /// A cancellation that fires after a stated number of questions, and counts the questions asked.
@@ -1902,7 +2006,7 @@ fn a_cancelled_frame_leaves_every_unit_whole_or_untouched() {
 	let crowd = crowd();
 	let list = crowded_list();
 	let (finished, _, _) = drawn_with(&list, &Serial, UnitKind::Bands, &crowd).expect("the finished frame");
-	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
 		let stop = StopAfterUnits { left: core::sync::atomic::AtomicU32::new(3) };
 		let mut image = target(512, 448);
 		let pool = Threads(3);
@@ -1912,7 +2016,7 @@ fn a_cancelled_frame_leaves_every_unit_whole_or_untouched() {
 		assert_eq!(backend.render(&prepared, &mut image.view_mut()).err(), Some(render2d::Error::Cancelled), "{kind:?}");
 		let (unit_width, unit_height) = match kind {
 			UnitKind::Bands => (512, TILE_SIZE),
-			UnitKind::Tiles => (TILE_SIZE, TILE_SIZE),
+			UnitKind::Tiles | UnitKind::Rectangles => (TILE_SIZE, TILE_SIZE),
 		};
 		let (mut whole, mut untouched) = (0, 0);
 		for top in (0..448).step_by(unit_height as usize) {

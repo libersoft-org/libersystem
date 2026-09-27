@@ -94,6 +94,10 @@ declare -A GATES=(
 	# scripted packets, SysEx bounds, typed faults, saturation, loss, unplug, grants and reclamation. The
 	# service - not USB MIDI transport, UMP or output.
 	["qemu-midi-service"]="tools/check-midi-service.sh"
+	# THE GAMEPAD TOOL AGAINST THE IN-GUEST GAMEPAD FIXTURE: `gamepad --lines | gamepadcheck`, the probe reading the
+	# tool's own lines - which gamepad pressed what, a range's ends, a hat, a departure and a replug under a new id.
+	# The vocabulary, InputService's identities and the tool - not USB transport.
+	["qemu-gamepad-tool"]="tools/check-gamepad-tool.sh"
 	# SPOOLSERVICE AGAINST PRINTERS THE KERNEL HARNESS PLAYS: admission and bounded staging, exact transmission by
 	# acknowledged prefix, stalls, every ending, withdrawal, reset and failed recovery, and PermissionManager's
 	# grant of `spool`. The service - not USB printer transport.

@@ -6,6 +6,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod ioapic;
+pub mod ioports;
 pub mod msr;
 pub mod paging;
 pub mod pci;
@@ -72,6 +73,7 @@ pub fn init_tsc() {
 pub fn init_bsp_percpu(lapic_id: u64) {
 	percpu::init(0, lapic_id);
 	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
+	percpu::set_io_slots(gdt::io_slots());
 }
 
 // Full per-core bring-up for an application processor, run on that core: enable
@@ -87,6 +89,7 @@ pub fn init_ap(cpu_id: usize, lapic_id: u64) {
 	idt::load();
 	percpu::init(cpu_id, lapic_id);
 	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
+	percpu::set_io_slots(gdt::io_slots());
 	apic::init_ap();
 	syscall::init();
 }

@@ -269,6 +269,7 @@ const VIRTIO_CAP_ISR: u8 = 3;
 const VIRTIO_CAP_DEVICE: u8 = 4;
 
 // The command-register bits (config offset 0x04, low 16).
+const CMD_IO_SPACE: u16 = 1 << 0;
 const CMD_MEMORY_SPACE: u16 = 1 << 1;
 const CMD_BUS_MASTER: u16 = 1 << 2;
 const CMD_INTX_DISABLE: u16 = 1 << 10;
@@ -1611,6 +1612,82 @@ pub fn msix_disable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 #[cfg(target_arch = "riscv64")]
 pub fn enable_memory_space<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
 	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE) as u32);
+}
+
+// ONE FUNCTION'S I/O BARS: (index, base, length) for each, into `out`, answering how many.
+//
+// SIZED WITH THE FUNCTION'S I/O DECODE OFF for as long as the all-ones pattern is in a register, so the
+// probe never makes the function answer at ports nobody gave it; the command register and every BAR are
+// restored before the serialised access ends. A function with no I/O BAR is never written at all - its
+// decode is left exactly as it was, which matters for the bridges and the chipset functions whose decode
+// carries ports the kernel itself uses.
+//
+// A BAR nobody placed reads back zero and is not recorded; neither is one whose base or end lies past
+// 0xFFFF, which is no port.
+pub fn io_bars<A: ConfigAccess>(bus: u8, dev: u8, func: u8, out: &mut [(u8, u16, u16); 6]) -> usize {
+	// Endpoints only: a bridge's I/O window forwards for what is behind it and is nobody's to grant.
+	if (A::read32(bus, dev, func, 0x0C) >> 16) & 0x7F != 0 {
+		return 0;
+	}
+	let mut any = false;
+	let mut slot = 0usize;
+	while slot < 6 {
+		let bar = A::read32(bus, dev, func, 0x10 + slot as u16 * 4);
+		if bar & 1 != 0 {
+			any = true;
+			slot += 1;
+		} else {
+			// A 64-bit memory BAR takes two slots.
+			slot += if (bar >> 1) & 3 == 2 { 2 } else { 1 };
+		}
+	}
+	if !any {
+		return 0;
+	}
+	let mut count = 0usize;
+	A::with_config(|| {
+		let command = A::read32_raw(bus, dev, func, 0x04) as u16;
+		// Only the command half is written back: writing zero to the status half's write-one-to-clear bits
+		// leaves them as they are.
+		A::write32_raw(bus, dev, func, 0x04, (command & !CMD_IO_SPACE) as u32);
+		let mut slot = 0usize;
+		while slot < 6 {
+			let offset = 0x10 + slot as u16 * 4;
+			let bar = A::read32_raw(bus, dev, func, offset);
+			if bar & 1 == 0 {
+				slot += if (bar >> 1) & 3 == 2 { 2 } else { 1 };
+				continue;
+			}
+			A::write32_raw(bus, dev, func, offset, 0xFFFF_FFFF);
+			let mask = A::read32_raw(bus, dev, func, offset);
+			A::write32_raw(bus, dev, func, offset, bar);
+			// A decoder of sixteen bits reads the upper half back as zero; the size is in the low half
+			// either way.
+			let decoded = mask & 0xFFFC;
+			let base = bar & 0xFFFF_FFFC;
+			if decoded != 0 && base != 0 {
+				let len = ((!decoded) & 0xFFFF) + 1;
+				if base + len <= 0x1_0000 {
+					out[count] = (slot as u8, base as u16, len as u16);
+					count += 1;
+				} else {
+					crate::serial_println!("pci: {bus:02x}:{dev:02x}.{func} BAR {slot} is an I/O BAR past the port space ({base:#x}+{len:#x}) - not recorded");
+				}
+			}
+			slot += 1;
+		}
+		A::write32_raw(bus, dev, func, 0x04, command as u32);
+	});
+	count
+}
+
+// Turn a function's I/O decode on or off - a claim of a row with an I/O BAR sets it, its release clears
+// it, exactly as bus mastering is handled.
+pub fn set_io_decode<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
+	A::update32(bus, dev, func, 0x04, |dword| {
+		let command = dword as u16;
+		(if on { command | CMD_IO_SPACE } else { command & !CMD_IO_SPACE }) as u32
+	});
 }
 
 // Turn bus mastering on or off for one function.

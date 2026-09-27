@@ -69,6 +69,12 @@ unsafe extern "C" {
 	fn user_stack_probe_program_end();
 	fn user_spin_program_start();
 	fn user_spin_program_end();
+	fn user_port_loopback_program_start();
+	fn user_port_loopback_program_end();
+	fn user_port_loop_program_start();
+	fn user_port_loop_program_end();
+	fn user_port_wait_program_start();
+	fn user_port_wait_program_end();
 }
 
 // Drop the calling thread into ring 3 at `entry` with `user_stack` and `arg` (the
@@ -183,6 +189,35 @@ pub fn program_stack_probe_bytes() -> &'static [u8] {
 pub fn program_spin_bytes() -> &'static [u8] {
 	let start = user_spin_program_start as *const () as usize;
 	let end = user_spin_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+// The bytes of the embedded ring-3 PORT probes, for the port-range suite. Each takes a shared data page
+// in rdi: [0] the port it reaches, [8] a flag another thread raises, [16] what it read, [24] a counter,
+// [32] the port it reaches LAST.
+//
+// - loopback: a 16550 round trip at the base in [0] - eight data bits, loopback on, 0x5A written and
+//   read back into [16], loopback off - and then one read of [32].
+// - loop: read [0] until [8] is raised, counting into [24]; then read [32] once, into [16].
+// - wait: spin until [8] is raised, touching no port; then read [0] into [16] and set [24].
+#[cfg(test)]
+pub fn program_port_loopback_bytes() -> &'static [u8] {
+	let start = user_port_loopback_program_start as *const () as usize;
+	let end = user_port_loopback_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+#[cfg(test)]
+pub fn program_port_loop_bytes() -> &'static [u8] {
+	let start = user_port_loop_program_start as *const () as usize;
+	let end = user_port_loop_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+#[cfg(test)]
+pub fn program_port_wait_bytes() -> &'static [u8] {
+	let start = user_port_wait_program_start as *const () as usize;
+	let end = user_port_wait_program_end as *const () as usize;
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
@@ -411,5 +446,107 @@ global_asm!(
 	"jmp 3b",
 	".global user_spin_program_end",
 	"user_spin_program_end:",
+	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+// The port probes. Position-independent; see `program_port_loopback_bytes`.
+#[cfg(test)]
+global_asm!(
+	".text",
+	".global user_port_loopback_program_start",
+	"user_port_loopback_program_start:",
+	"mov rsi, rdi",
+	// LCR: eight data bits, no parity, DLAB clear.
+	"mov dx, word ptr [rsi]",
+	"add dx, 3",
+	"mov al, 3",
+	"out dx, al",
+	// MCR: loopback.
+	"mov dx, word ptr [rsi]",
+	"add dx, 4",
+	"mov al, 0x10",
+	"out dx, al",
+	// THR.
+	"mov dx, word ptr [rsi]",
+	"mov al, 0x5a",
+	"out dx, al",
+	// LSR bit 0, bounded.
+	"mov ecx, 1000000",
+	"2:",
+	"mov dx, word ptr [rsi]",
+	"add dx, 5",
+	"in al, dx",
+	"test al, 1",
+	"jnz 3f",
+	"dec ecx",
+	"jnz 2b",
+	"3:",
+	// RBR.
+	"mov dx, word ptr [rsi]",
+	"in al, dx",
+	"movzx eax, al",
+	"mov qword ptr [rsi + 16], rax",
+	// Loopback off.
+	"mov dx, word ptr [rsi]",
+	"add dx, 4",
+	"xor eax, eax",
+	"out dx, al",
+	// And the last port, which a test may put outside the range.
+	"mov dx, word ptr [rsi + 32]",
+	"in al, dx",
+	"mov eax, {exit}",
+	"syscall",
+	"4:",
+	"jmp 4b",
+	".global user_port_loopback_program_end",
+	"user_port_loopback_program_end:",
+	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+#[cfg(test)]
+global_asm!(
+	".text",
+	".global user_port_loop_program_start",
+	"user_port_loop_program_start:",
+	"2:",
+	"mov dx, word ptr [rdi]",
+	"in al, dx",
+	"inc qword ptr [rdi + 24]",
+	"mov rax, qword ptr [rdi + 8]",
+	"test rax, rax",
+	"jz 2b",
+	"mov dx, word ptr [rdi + 32]",
+	"in al, dx",
+	"movzx eax, al",
+	"mov qword ptr [rdi + 16], rax",
+	"mov eax, {exit}",
+	"syscall",
+	"3:",
+	"jmp 3b",
+	".global user_port_loop_program_end",
+	"user_port_loop_program_end:",
+	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+#[cfg(test)]
+global_asm!(
+	".text",
+	".global user_port_wait_program_start",
+	"user_port_wait_program_start:",
+	"2:",
+	"mov rax, qword ptr [rdi + 8]",
+	"test rax, rax",
+	"jz 2b",
+	"mov dx, word ptr [rdi]",
+	"in al, dx",
+	"movzx eax, al",
+	"mov qword ptr [rdi + 16], rax",
+	"mov qword ptr [rdi + 24], 1",
+	"mov eax, {exit}",
+	"syscall",
+	"3:",
+	"jmp 3b",
+	".global user_port_wait_program_end",
+	"user_port_wait_program_end:",
 	exit = const crate::syscall::SYS_USER_EXIT,
 );

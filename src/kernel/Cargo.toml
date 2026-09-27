@@ -98,6 +98,9 @@ camera-proto = { path = "../user/libs/protocol/camera-proto" }
 # provider wire it answers and the observation wire it reads, both through the generated code.
 modem-device-proto = { path = "../user/libs/protocol/modem-device-proto" }
 modem-proto = { path = "../user/libs/protocol/modem-proto" }
+# AND THE INPUT WIRE, for the gamepad scenario: it reads InputService's gamepad streams through the generated
+# decoder, so a stream that drifted from its interface fails to compile rather than being misread.
+input-proto = { path = "../user/libs/protocol/input-proto" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
 # can drive tens of millions of operations through - which is what the one unexplained
 # double allocation needed and could never get from a guest boot.

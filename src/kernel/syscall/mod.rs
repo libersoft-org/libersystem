@@ -523,6 +523,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_PROCESS_SELF => sys_process_self(),
 		SYS_PERF_RECORD => crate::perf::sys_record(a0, a1, a2),
 		SYS_PERF_CONTROL => crate::perf::sys_control(a0),
+		abi::SYS_DEVICE_RESOURCE_ACQUIRE => sys_device_resource_acquire(a0, a1, a2),
+		abi::SYS_PORT_RANGE_MAP => sys_port_range_map(a0),
+		abi::SYS_PORT_RANGE_UNMAP => sys_port_range_unmap(a0),
+		abi::SYS_PORT_RANGE_FIRMWARE => sys_port_range_firmware(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
 		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
@@ -1231,7 +1235,7 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, transport: d.transport, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad0: 0, _pad1: [0; 1], _pad2: [0; 3] });
+	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, transport: d.transport, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad0: 0, _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports });
 	match info {
 		Some(info) => {
 			if let Err(e) = write_user(buf_ptr, info) {
@@ -1882,6 +1886,124 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		return ERR_ACCESS_DENIED;
 	}
 	thread.handles().lock().insert_reserved(interrupt_capability).raw() as i64
+}
+
+// A REFUSED PORT MINT, as the caller sees it: a range nobody may have is an access refusal, one somebody
+// holds is exhaustion - it may be granted later - and a range past the space is invalid.
+fn port_refusal(refusal: crate::object::port_range::grants::Refusal) -> i64 {
+	use crate::object::port_range::grants::Refusal;
+	match refusal {
+		Refusal::OutOfRange => ERR_INVALID,
+		Refusal::Reserved(_) | Refusal::Retired => ERR_ACCESS_DENIED,
+		Refusal::Granted => ERR_RESOURCE_EXHAUSTED,
+		Refusal::NoMemory => ERR_NO_MEMORY,
+	}
+}
+
+// ONE RESOURCE OF A CLAIMED ROW, BY KIND AND INDEX - see the ABI's note. The claim is the authority and it
+// names the row; the index names the resource on it, never an address.
+fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 {
+	if !arch::ioports::supported() {
+		return ERR_UNSUPPORTED;
+	}
+	if kind != abi::RESOURCE_KIND_PORT_RANGE {
+		return ERR_INVALID;
+	}
+	let thread = current_thread!();
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	// A BINDING THAT HAS ENDED DERIVES NOTHING - as for an interrupt.
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let key = claim.key();
+	let Some(resource) = device::port_resource(key.device_index as usize, which) else { return ERR_INVALID };
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	// CHECKED AGAIN AT THE MINT, against the reserved set and every live grant, as it was when the row was
+	// recorded: a run-time install or another grant may have taken a port since.
+	let range = match crate::object::port_range::PortRange::mint(resource.base, resource.len, Some(key)) {
+		Ok(range) => range,
+		Err(refusal) => {
+			thread.handles().lock().release_reservation(1);
+			return port_refusal(refusal);
+		}
+	};
+	// DERIVED FROM THE CLAIM, so the release revokes it - and refused when the claim ended while this call
+	// ran, which drops the range and ends its grant.
+	let weak: alloc::sync::Weak<dyn KernelObject> = alloc::sync::Arc::downgrade(&(range.clone() as alloc::sync::Arc<dyn KernelObject>));
+	if !device::register_derived(key, weak) {
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
+	thread.handles().lock().insert_reserved(Capability::new(range, Rights::MAP | Rights::TRANSFER)).raw() as i64
+}
+
+// MAP A PORT RANGE INTO THE CALLER'S PROCESS: its threads may use those ports from their next access.
+fn sys_port_range_map(handle: u64) -> i64 {
+	if !arch::ioports::supported() {
+		return ERR_UNSUPPORTED;
+	}
+	let thread = current_thread!();
+	let range = match current_typed::<crate::object::port_range::PortRange>(handle, ObjectType::PortRange, Rights::MAP) {
+		Ok(range) => range,
+		Err(e) => return e,
+	};
+	use crate::object::port_range::MapError;
+	match range.map_into(thread.process()) {
+		Ok(()) => 0,
+		Err(MapError::Busy) => ERR_RESOURCE_EXHAUSTED,
+		Err(MapError::Ended) | Err(MapError::Terminating) => ERR_ACCESS_DENIED,
+		Err(MapError::NoMemory) => ERR_NO_MEMORY,
+	}
+}
+
+// TAKE A PORT RANGE BACK FROM THE CALLER'S PROCESS: 1 when every core confirmed, 0 when one did not answer
+// in time - the range is out of the process either way, and then its ports are retired for the boot.
+fn sys_port_range_unmap(handle: u64) -> i64 {
+	if !arch::ioports::supported() {
+		return ERR_UNSUPPORTED;
+	}
+	let thread = current_thread!();
+	let range = match current_typed::<crate::object::port_range::PortRange>(handle, ObjectType::PortRange, Rights::MAP) {
+		Ok(range) => range,
+		Err(e) => return e,
+	};
+	use crate::object::port_range::MapError;
+	match range.unmap_from(thread.process()) {
+		Ok(confirmed) => i64::from(confirmed),
+		Err(MapError::Busy) => ERR_INVALID,
+		Err(MapError::Ended) | Err(MapError::Terminating) => ERR_ACCESS_DENIED,
+		Err(MapError::NoMemory) => ERR_NO_MEMORY,
+	}
+}
+
+// THE FIRMWARE INTERPRETER'S SYSTEMIO REGION, by address: the one mint that takes a base and a length from
+// its caller, gated by the `FirmwareInterpreter` privilege and held to the reserved set and exclusivity
+// like a claim's range. Not derived from any claim: the region lives until its holder drops it.
+fn sys_port_range_firmware(privilege: u64, base: u64, len: u64) -> i64 {
+	if !arch::ioports::supported() {
+		return ERR_UNSUPPORTED;
+	}
+	let thread = current_thread!();
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::FirmwareInterpreter) {
+		return error;
+	}
+	let (Ok(base), Ok(len)) = (u16::try_from(base), u16::try_from(len)) else { return ERR_INVALID };
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	let range = match crate::object::port_range::PortRange::mint(base, len, None) {
+		Ok(range) => range,
+		Err(refusal) => {
+			thread.handles().lock().release_reservation(1);
+			return port_refusal(refusal);
+		}
+	};
+	thread.handles().lock().insert_reserved(Capability::new(range, Rights::MAP | Rights::TRANSFER)).raw() as i64
 }
 
 // Acknowledge a serviced interrupt: clear the Interrupt's pending flag so the driver's

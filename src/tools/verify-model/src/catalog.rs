@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 139] = [
+const GATES: [(&str, &str); 140] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -363,6 +363,7 @@ const GATES: [(&str, &str); 139] = [
 	// bootstrap plumbing - a userspace change selects it - and it boots a development image because the
 	// fixture is development-only.
 	("qemu-midi-service", "userspace.build"),
+	("qemu-gamepad-tool", "userspace.build"),
 	// SPOOLSERVICE, against printers the kernel harness plays: admission, bounded staging, exact transmission by
 	// acknowledged prefix, stalls, endings, withdrawal, reset and failed recovery, and the production grant of
 	// `spool`. Its subject is the service, its pure leaves, the protocols and the grant plumbing - a userspace
@@ -825,7 +826,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 45] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 46] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -835,6 +836,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 45] = [
 	"qemu-modem-service",
 	"qemu-camera-service",
 	"qemu-midi-service",
+	"qemu-gamepad-tool",
 	// And the spool gate, which boots the test kernel with its sink scenario rather than a development image.
 	"spool-service",
 	"media-import-service",

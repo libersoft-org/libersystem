@@ -82,6 +82,13 @@ pub mod ptp;
 // consumed by the rest: one command set, several transports, one place that knows what its bytes
 // mean.
 pub mod scsi;
+// SMBus transactions composed from I2C messages, and their packet error code - for a controller that moves
+// plain I2C messages, as virtio-i2c does.
+pub mod smbus;
+// Virtio-i2c's requests (device 34) and virtio-gpio's per-line event state (device 41): the parts of the two
+// drivers a host can test.
+pub mod gpio;
+pub mod i2c;
 pub mod sdhci;
 pub mod serial_port;
 pub mod snd;

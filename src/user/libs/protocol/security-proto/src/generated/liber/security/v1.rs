@@ -150,6 +150,11 @@ pub enum Capability {
 	/// LAST AND NOT BESIDE `midi-input`, because a capability's number is its position and every one after it
 	/// would move.
 	MidiOutput = 44,
+	/// WATCHING EVERY GAMEPAD FROM THE CONSOLE, minted per launch as a connection of InputService's gamepad
+	/// scope, on which only `input.observe-gamepads` works - and it delivers only while no graphical surface
+	/// holds display focus, so a background program cannot watch a game's input. Appended last, for the reason
+	/// `midi-output` states.
+	InputGamepad = 45,
 }
 
 impl Capability {
@@ -237,6 +242,7 @@ impl Capability {
 			42 => Some(Capability::AdminAudit),
 			43 => Some(Capability::AdminTest),
 			44 => Some(Capability::MidiOutput),
+			45 => Some(Capability::InputGamepad),
 			_ => None,
 		}
 	}
@@ -1399,6 +1405,7 @@ impl Capability {
 			Capability::AdminAudit => out.push_str("\"admin-audit\""),
 			Capability::AdminTest => out.push_str("\"admin-test\""),
 			Capability::MidiOutput => out.push_str("\"midi-output\""),
+			Capability::InputGamepad => out.push_str("\"input-gamepad\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1448,6 +1455,7 @@ impl Capability {
 			Capability::AdminAudit => out.push_str("admin-audit"),
 			Capability::AdminTest => out.push_str("admin-test"),
 			Capability::MidiOutput => out.push_str("midi-output"),
+			Capability::InputGamepad => out.push_str("input-gamepad"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1497,6 +1505,7 @@ impl Capability {
 			Capability::AdminAudit => crate::codec::cbor::text(out, "admin-audit"),
 			Capability::AdminTest => crate::codec::cbor::text(out, "admin-test"),
 			Capability::MidiOutput => crate::codec::cbor::text(out, "midi-output"),
+			Capability::InputGamepad => crate::codec::cbor::text(out, "input-gamepad"),
 		}
 	}
 }

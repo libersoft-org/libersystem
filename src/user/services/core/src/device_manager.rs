@@ -2536,9 +2536,21 @@ struct Provider {
 // whole per-consumer factory exists to prevent - and a change meant to honour that rule committed
 // exactly it once, so it is written here where the next caller will read it.
 fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u64 {
+	mint_scoped_connection(catalogue, nodes, slot, driver_protocol::Scope::Whole)
+}
+
+// THE SAME, SCOPED: a connection to ONE address or ONE line of a bus provider - the only kind of connection an
+// `i2c-bus` or a `gpio-lines` publication ever gets, for a child binding with its claim and for the ACPI
+// service. A scoped connection to any other kind, and an unscoped one to a bus, is refused here: the scope is
+// what makes a bus connection safe to hand out, and a scope on anything else is a word with nothing behind it.
+fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize, scope: driver_protocol::Scope) -> u64 {
 	let Some((binding, token, kind, taken)) = catalogue.entries[slot].as_ref().map(|provider| (provider.id.binding, provider.token, provider.kind, outstanding(provider))) else {
 		return 0;
 	};
+	if driver_binding::scoped_only(kind) == (scope == driver_protocol::Scope::Whole) {
+		print(b"DeviceManager: a connection was asked for with the wrong scope for its provider's kind; refused\n");
+		return 0;
+	}
 	let Some(node) = nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation) else {
 		return 0;
 	};
@@ -2554,7 +2566,10 @@ fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u6
 	// belongs to a live binding, so its declared consumer bound is that driver's declaration and
 	// not whichever candidate an operator has since selected for the next bind.
 	let admits = node.entry().and_then(|entry| entry.provides.iter().find(|&&(declared, _, _)| declared == kind)).map_or(1, |&(_, _, consumers)| consumers);
-	if taken >= admits {
+	// A BUS'S SCOPED CONNECTIONS BY THE SHARED RULE (`driver_binding::admits_scoped`, host-tested); every other
+	// kind by the one it always had.
+	let refused = if driver_binding::scoped_only(kind) { !driver_binding::admits_scoped(kind, taken, admits) } else { taken >= admits };
+	if refused {
 		print(b"DeviceManager: a provider was asked for one more connection than its driver declares it admits; refused\n");
 		return 0;
 	}
@@ -2562,9 +2577,9 @@ fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u6
 		return 0;
 	};
 	let Some((server, client)) = channel() else { return 0 };
-	let mut payload = [0u8; driver_protocol::OFFER_PAYLOAD_LEN];
-	payload[..2].copy_from_slice(&token.to_le_bytes());
-	if !send_frame(control, driver_protocol::Opcode::Connect, generation, &payload[..2], server, u32::MAX) {
+	let mut payload = [0u8; driver_protocol::CONNECT_PAYLOAD_MAX];
+	let len = driver_protocol::encode_connect(token, scope, &mut payload);
+	if !send_frame(control, driver_protocol::Opcode::Connect, generation, &payload[..len], server, u32::MAX) {
 		close(server);
 		close(client);
 		return 0;
@@ -2827,6 +2842,15 @@ impl Catalogue {
 			let mut name = [0u8; driver_protocol::MAX_PROVIDER_NAME];
 			let published_name = offers.name(index);
 			name[..published_name.len()].copy_from_slice(published_name);
+			// THE OFFERED ENDPOINT OF A BUS SERVES NOTHING: it would be an unscoped connection to the whole
+			// controller, the driver keeps no end of it, and it is closed here without being counted - so
+			// only the scoped connections this program mints count against `consumers`.
+			let handle = if driver_binding::keeps_offered_endpoint(kind) {
+				handle
+			} else {
+				close(handle);
+				0
+			};
 			let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 0, name, name_len: published_name.len() as u8 };
 			// AND EVERYONE WATCHING THAT KIND IS TOLD, which is the live half of a subscription:
 			// a consumer that subscribed before this driver bound sees it appear.
@@ -4118,7 +4142,7 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// state one too many and the driver waits forever for a frame that is not coming.
 	//
 	// The interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci, virtio-gpu,
-	// dev-channel, virtio-console, virtio-scsi) each take their own per-device MSI-X vector, edge-triggered
+	// dev-channel, virtio-console, virtio-scsi, virtio-gpio) each take their own per-device MSI-X vector, edge-triggered
 	// with no INTx sharing. The gpu routes only its CONFIG vector to it and keeps its control
 	// queue polled; the dev channel is idle almost always and must block on its interrupt rather
 	// than poll, because a spinning driver starves the cooperative scheduler for the guest's
@@ -4126,12 +4150,13 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// streams served to consumers, which is the same idle-then-burst shape on the same hardware.
 	// virtio-scsi joined it for its EVENT queue: a unit arriving or leaving is announced there and
 	// nowhere else, so without a vector the only way to notice is a thread polling for the guest's
-	// whole life over a disk that may never be plugged.
+	// whole life over a disk that may never be plugged. virtio-gpio joined it for ITS event queue, on
+	// which a line that may never fire is reported.
 	// The remaining polling drivers get none, so their device IRQs stay silent.
 	// RECORDED ON THE TRANSACTION AS THEY ARE TAKEN. The list used to be a local array, so a
 	// failure while acquiring a later entry - or while sending - reached `give_up` with the
 	// earlier ones held and nothing able to close them.
-	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel" || driver_name == b"virtio_console" || driver_name == b"virtio_scsi";
+	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel" || driver_name == b"virtio_console" || driver_name == b"virtio_scsi" || driver_name == b"virtio_gpio";
 	// WHICH RESOURCE REFUSED, SAID WHERE IT REFUSED.
 	//
 	// Every arm below ends as `resource-exhausted`, which the manager then prints for all of them -
@@ -4192,6 +4217,17 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 			}
 			txn.holds(driver_protocol::ResourceKind::Console as u16, feed as u64);
 		}
+	}
+	// EVERY PORT RANGE THE ROW CARRIES, one resource each, in the row's order - no per-driver list decides
+	// it, exactly as the register window is passed. A range the kernel will not mint ends the attempt: a
+	// driver handed part of its device fails later, and less clearly.
+	for which in 0..info.port_count as u64 {
+		let range: i64 = device_resource_acquire(grant.claim, abi::RESOURCE_KIND_PORT_RANGE, which);
+		if range < 0 {
+			refused(b"a port range - the kernel would not mint one the row carries");
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+		}
+		txn.holds(driver_protocol::ResourceKind::PortRange as u16, range as u64);
 	}
 	let resource_count: usize = txn.held.resources().len();
 	node.granted_resources = resource_count as u32;
@@ -5543,6 +5579,12 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 			print(b"DeviceManager: a catalogue connection asked to open a provider of a kind it was not minted for; refused\n");
 			return Err(proto::system::Error::Denied);
 		}
+		// A BUS IS NEVER OPENED WHOLE, whatever the connection's scope admits: an I2C or a GPIO controller's
+		// connections are the ones this program mints scoped to one address or one line.
+		if !driver_binding::openable(published) {
+			print(b"DeviceManager: a catalogue connection asked to open a whole bus controller; refused - its connections are scoped to one address or line\n");
+			return Err(proto::system::Error::Denied);
+		}
 		// WHAT ITS DRIVER DECLARED. A kind that admits one consumer is refused here, at the ask,
 		// which is the difference between a consumer that knows and one that waits for ever.
 		let (token, admits) = {
@@ -6085,6 +6127,9 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::PRINTER => proto::system::ProviderKind::Printer,
 		provider::PTP_TRANSPORT => proto::system::ProviderKind::PtpTransport,
 		provider::ADMIN_EXECUTOR => proto::system::ProviderKind::AdminExecutor,
+		provider::GAMEPAD => proto::system::ProviderKind::Gamepad,
+		provider::I2C_BUS => proto::system::ProviderKind::I2cBus,
+		provider::GPIO_LINES => proto::system::ProviderKind::GpioLines,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6111,6 +6156,9 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Printer => driver_protocol::provider::PRINTER,
 		proto::system::ProviderKind::PtpTransport => driver_protocol::provider::PTP_TRANSPORT,
 		proto::system::ProviderKind::AdminExecutor => driver_protocol::provider::ADMIN_EXECUTOR,
+		proto::system::ProviderKind::Gamepad => driver_protocol::provider::GAMEPAD,
+		proto::system::ProviderKind::I2cBus => driver_protocol::provider::I2C_BUS,
+		proto::system::ProviderKind::GpioLines => driver_protocol::provider::GPIO_LINES,
 	}
 }
 

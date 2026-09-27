@@ -542,6 +542,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		b"arp" as &[u8],
 		b"ss" as &[u8],
 		b"httpd" as &[u8],
+		b"gamepad" as &[u8],
 	]
 	.iter()
 	.enumerate()

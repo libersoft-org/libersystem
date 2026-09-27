@@ -783,6 +783,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"midihold", Shape::Rest),
 	(b"midiread", Shape::Rest),
 	(b"midifail", Shape::Rest),
+	(b"gamepadcheck", Shape::Rest),
 	(b"admincheck", Shape::Rest),
 	(b"adminhelper", Shape::Rest),
 	(b"adminhostile", Shape::Rest),
@@ -802,6 +803,9 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"lspci", Shape::Json),
 	(b"lsblk", Shape::Json),
 	(b"lsusb", Shape::Json),
+	// FULL-SCREEN BY DEFAULT, so it is a foreground job on the terminal like `watch` and `less`; `--lines` is
+	// the same stream as lines.
+	(b"gamepad", Shape::InteractiveArgs),
 	(b"lsvol", Shape::Json),
 	(b"log", Shape::Rest),
 	(b"config", Shape::Rest),

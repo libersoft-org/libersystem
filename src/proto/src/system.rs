@@ -16,6 +16,9 @@ pub use crate::generated::liber::event::v1::*;
 pub use crate::generated::liber::import::v1::*;
 pub use crate::generated::liber::midi::v1::*;
 pub use crate::generated::liber::midi_device::v1::*;
+// The two bus contracts: an I2C controller's and a GPIO controller's, each served on scoped connections.
+pub use crate::generated::liber::gpio_device::v1::*;
+pub use crate::generated::liber::i2c_device::v1::*;
 pub use crate::generated::liber::modem::v1::*;
 pub use crate::generated::liber::modem_device::v1::*;
 pub use crate::generated::liber::power::v1::*;

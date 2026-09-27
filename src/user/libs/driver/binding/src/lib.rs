@@ -804,6 +804,43 @@ pub fn sort_probe_slots<T>(slots: &mut [usize], entries: &[Option<T>], id_of: im
 	slots.sort_unstable_by_key(|&slot| (entries[slot].as_ref().map(|entry| provider_address(id_of(entry))), slot));
 }
 
+// ------------------------------------------------------------------- the kinds nobody opens whole
+//
+// AN I2C CONTROLLER AND A GPIO CONTROLLER ARE REACHED ONE ADDRESS AND ONE LINE AT A TIME. Their only
+// connections are the ones DeviceManager mints with a SCOPED `CONNECT` - for a child binding with its claim,
+// and for the ACPI service - so the rules every other kind follows change in three places, written here as
+// one pure function each so the arithmetic is host-tested (DeviceManager is a `no_std` binary no host drives):
+//
+// - THE OFFERED ENDPOINT SERVES NOTHING. An `OFFER` carries exactly one endpoint, and for these kinds it would
+//   be an unscoped connection to the whole controller: the driver keeps no end of it, and DeviceManager closes
+//   it at publication WITHOUT COUNTING it, so only scoped connections count against `consumers`.
+// - THE CATALOGUE'S `open` REFUSES THEM, whatever the connection's scope admits.
+// - A SCOPED MINT IS COUNTED against the declared `consumers` and refused past it; each `DISCONNECT` refunds
+//   one, exactly as for any other kind.
+
+// Whether `kind` is reached only through scoped connections.
+pub fn scoped_only(kind: u16) -> bool {
+	kind == driver_protocol::provider::I2C_BUS || kind == driver_protocol::provider::GPIO_LINES
+}
+
+// Whether a publication of `kind` keeps the endpoint its offer carried. False for the scoped-only kinds,
+// whose offered endpoint is closed at publication and never counted.
+pub fn keeps_offered_endpoint(kind: u16) -> bool {
+	!scoped_only(kind)
+}
+
+// Whether the catalogue's `open` may hand a consumer a connection to `kind`.
+pub fn openable(kind: u16) -> bool {
+	!scoped_only(kind)
+}
+
+// Whether one more SCOPED connection may be minted to a provider of `kind` that has `consumers` connections
+// out and whose driver declares it admits `declared`. Only the scoped-only kinds are minted scoped, and each
+// one counts.
+pub fn admits_scoped(kind: u16, consumers: u16, declared: u16) -> bool {
+	scoped_only(kind) && consumers < declared
+}
+
 pub fn next_handoff_slot<T>(entries: &[Option<T>], eligible: impl Fn(&T) -> bool, id_of: impl Fn(&T) -> ProviderId) -> Option<usize> {
 	let mut best = None;
 	for (slot, entry) in entries.iter().enumerate() {
@@ -1088,10 +1125,11 @@ impl IncidentWindow {
 // thing a machine checks.
 
 // The most resources one bind hands over: the device MMIO, an MSI vector, a key sink, the trusted key
-// sink, a power connection and a console feed - the six a physical keyboard's driver is given. A ledger
-// that is full refuses the next entry, and DeviceManager does not look: at five, the trusted key sink
-// pushed the console feed out of every keyboard's bind, and nothing a person typed reached the console.
-pub const MAX_BIND_RESOURCES: usize = 6;
+// sink, a power connection and a console feed - the six a physical keyboard's driver is given - and one
+// port range for each port resource a row can carry. A ledger that is full refuses the next entry, and
+// DeviceManager does not look: at five, the trusted key sink pushed the console feed out of every
+// keyboard's bind, and nothing a person typed reached the console.
+pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES;
 
 // What a rollback does to the world. Separated from the ledger so the ledger can be driven.
 //

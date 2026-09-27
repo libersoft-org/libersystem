@@ -17,6 +17,7 @@
 use alloc::vec::Vec;
 
 use graphics_core::geom::PixelRect;
+use graphics_core::layout::ImageLayout;
 use graphics_core::{ImageView, ImageViewMut};
 use render2d::Error;
 
@@ -78,7 +79,9 @@ impl Lane {
 	}
 }
 
-/// How a frame is cut into units.
+/// How a frame is cut into units - `Rectangles` unless a caller asks otherwise, because it was measured
+/// fastest of the three; the other two are what it was measured against. A frame on one lane is cut into
+/// bands whichever is asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnitKind {
 	/// A BAND OF TILE ROWS: one contiguous slice of the target, every tile of one tile row. Safe to hand
@@ -90,6 +93,11 @@ pub enum UnitKind {
 	/// the target once every unit has returned. As many units as the frame has tiles that draw, for the
 	/// cost of the intermediate's memory and one copy of what was drawn.
 	Tiles,
+	/// ONE TILE, IN PLACE, through a DISJOINT-RECTANGLE WRITER: every row of the target is cut into the
+	/// parts its tiles cover, and a unit holds the parts of its own tile's rows - so it reads and writes
+	/// its rectangle of the target and no byte of any other. As many units as tiles, with no intermediate
+	/// and no copy, for the cost of the cut: once per row of the frame, and a table of row parts per unit.
+	Rectangles,
 }
 
 /// One unit of a frame: the tiles it replays, in serial order, and its part of the target.
@@ -115,6 +123,11 @@ impl Unit<'_> {
 }
 
 /// A unit's part of the target.
+///
+/// THE RECTANGLE'S ROW PARTS ARE HELD INLINE, which makes every unit the size of the largest variant: a
+/// table of them is kept from one frame to the next, and parts held anywhere else would be storage a
+/// frame asks for.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Access<'u> {
 	/// Every row of the unit's band and nothing else, as a view of its own whose row zero is the band's
 	/// first row `top`.
@@ -122,4 +135,7 @@ pub(crate) enum Access<'u> {
 	/// The whole target, READ ONLY, and the unit's slot of the intermediate. `tile` is the rectangle the
 	/// slot holds, and `pitch` its row length in bytes.
 	Slot { source: &'u ImageView<'u>, slot: &'u mut [u8], tile: PixelRect, pitch: usize },
+	/// The unit's tile of the target, row by row: `rows[n]` is the part of target row `tile.y + n` the tile
+	/// covers, split off that row, and `layout` is the target's.
+	Rect { rows: [&'u mut [u8]; crate::TILE_SIZE as usize], tile: PixelRect, layout: ImageLayout },
 }

@@ -18,7 +18,7 @@ fn a_class_module_is_refused_at_its_own_ceiling_and_says_which() {
 	let usage = budget.usage(ClassKind::Hid);
 	assert_eq!(usage.devices, HID_LIMITS.devices);
 	assert_eq!(usage.endpoints, HID_LIMITS.endpoints);
-	assert_eq!(usage.dma_bytes, HID_LIMITS.dma_bytes, "eight rings is exactly the DMA ceiling");
+	assert_eq!(usage.dma_bytes, HID_LIMITS.dma_bytes, "eight devices' rings and report pages is exactly the DMA ceiling");
 	assert_eq!(usage.in_flight, HID_LIMITS.in_flight);
 }
 
@@ -67,6 +67,35 @@ fn two_class_modules_do_not_share_one_pool() {
 	other.admit(ClassKind::Storage).expect("the storage budget");
 	assert_eq!(other.admit(ClassKind::Storage), Err(Refusal::Devices));
 	assert_eq!(other.admit(ClassKind::Hid), Ok(()), "a full disk budget does not refuse a keyboard");
+}
+
+#[test]
+// A DEVICE OF FOUR HID INTERFACES IS CHARGED ONCE, FOR ALL FOUR. Its one admission covers four interrupt
+// endpoints, four rings, four report pages and four reports in flight; eight such devices fill every
+// dimension exactly and a ninth is refused BY COUNT, the ceiling still meaning devices; and a detach gives
+// all of it back.
+fn a_four_interface_device_is_charged_once_for_every_interface() {
+	assert_eq!(HID_COST.endpoints, HID_INTERFACES, "an interrupt IN endpoint per interface");
+	assert_eq!(HID_COST.dma_bytes, HID_INTERFACES as u64 * (RING_BYTES + 4096), "a ring and a report page per interface");
+	assert_eq!(HID_COST.in_flight, HID_INTERFACES, "a standing report per interface");
+	let mut budget = Budget::new();
+	budget.admit(ClassKind::Hid).expect("a four-interface gamepad adapter");
+	let usage = budget.usage(ClassKind::Hid);
+	assert_eq!((usage.devices, usage.endpoints, usage.dma_bytes, usage.in_flight), (1, 4, 4 * (RING_BYTES + 4096), 4), "one charge covers all four interfaces");
+	for _ in 1..HID_LIMITS.devices {
+		budget.admit(ClassKind::Hid).expect("eight such devices");
+	}
+	let full = budget.usage(ClassKind::Hid);
+	assert_eq!((full.endpoints, full.dma_bytes, full.in_flight), (HID_LIMITS.endpoints, HID_LIMITS.dma_bytes, HID_LIMITS.in_flight), "eight fill every dimension exactly");
+	assert_eq!((HID_LIMITS.endpoints, HID_LIMITS.dma_bytes, HID_LIMITS.in_flight), (32, 256 * 1024, 32));
+	assert_eq!(budget.admit(ClassKind::Hid), Err(Refusal::Devices), "and a ninth is refused by count");
+	for _ in 0..HID_LIMITS.devices {
+		budget.release(ClassKind::Hid);
+	}
+	assert_eq!(budget.usage(ClassKind::Hid), Usage::default(), "every detach gave its whole charge back");
+	// ONE PAGE IS STILL THE BUFFER BOUND: a ring's or a report page's size, never four.
+	assert!(Budget::buffer_within(ClassKind::Hid, RING_BYTES));
+	assert!(!Budget::buffer_within(ClassKind::Hid, RING_BYTES + 1));
 }
 
 #[test]

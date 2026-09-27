@@ -193,3 +193,50 @@ fn an_asynchronous_submission_is_reaped_within_the_bytes_its_chain_offered() {
 	assert_eq!(queue.take_used(), None);
 	assert_eq!(queue.fault(), Some(UsedFault::Index), "nothing was posted, so a completion is a completion of nothing");
 }
+
+// TWO REQUESTS THE DEVICE PERFORMS AS ONE OPERATION, on a four-entry ring - virtio-i2c's write then read. Each
+// chain takes one ring slot through its indirect table, both heads are published before the one notify, and
+// the call returns only when both completed.
+#[test]
+fn two_chains_go_out_together_through_indirect_tables_and_complete_together() {
+	let ring = Ring::new(4);
+	let queue = ring.queue();
+	// The DMA area the tables live in: two tables of eight descriptors.
+	let tables = vec![0u64; super::INDIRECT_TABLE_LEN * 2 * 2];
+	let (tables_virt, tables_phys) = (tables.as_ptr() as u64, 0xAB0000u64);
+	let first = [(0x1000u64, 8u32, false), (0x1100u64, 2u32, false), (0x1200u64, 1u32, true)];
+	let second = [(0x2000u64, 8u32, false), (0x2100u64, 30u32, true), (0x2200u64, 1u32, true)];
+	// The fake device completes both, the second first, after the call has published them.
+	let base = ring.base();
+	let (used_off, size) = (ring.used_off, ring.size);
+	let device = std::thread::spawn(move || {
+		std::thread::sleep(std::time::Duration::from_millis(2));
+		let element = |slot: u16| base + used_off + 4 + (slot % size) as u64 * 8;
+		unsafe {
+			(element(0) as *mut u32).write_volatile(1);
+			((element(0) + 4) as *mut u32).write_volatile(31);
+			(element(1) as *mut u32).write_volatile(0);
+			((element(1) + 4) as *mut u32).write_volatile(1);
+			core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+			((base + used_off + 2) as *mut u16).write_volatile(2);
+		}
+	});
+	let mut used = [0u32; 2];
+	assert_eq!(queue.submit_chains(&[&first, &second], Some((tables_virt, tables_phys)), &mut used), Ok(()));
+	device.join().unwrap();
+	assert_eq!(used, [1, 31], "each chain's length, in the order the chains were given");
+	assert_eq!(ring.available_index(), 2, "both heads published");
+	// EACH RING SLOT POINTS AT ITS TABLE, and each table holds its chain.
+	let (phys, len, flags, _) = ring.descriptor(1);
+	assert_eq!((phys, len, flags), (tables_phys + (super::INDIRECT_TABLE_LEN * 16) as u64, 48, 4), "the second chain's table, three descriptors long");
+	let table = |k: usize, i: usize| unsafe {
+		let d = tables_virt + (k * super::INDIRECT_TABLE_LEN * 16 + i * 16) as u64;
+		((d as *const u64).read_volatile(), ((d + 8) as *const u32).read_volatile(), ((d + 12) as *const u16).read_volatile(), ((d + 14) as *const u16).read_volatile())
+	};
+	assert_eq!(table(1, 1), (0x2100, 30, DESC_WRITE | DESC_NEXT, 2));
+	assert_eq!(table(1, 2), (0x2200, 1, DESC_WRITE, 0));
+	// WITHOUT TABLES, two three-descriptor chains do not fit four slots, and are refused before anything is
+	// written.
+	assert_eq!(queue.submit_chains(&[&first, &second], None, &mut used), Err(UsedFault::Chain));
+	drop(tables);
+}

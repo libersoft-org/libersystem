@@ -107,6 +107,11 @@ plan_for() {
 	acm-late) printf 'c.1 printer.usb0 printer\nc.2 acm.usb0 acm\n' ;;
 	hid-touch) printf 'c.1 hid.usb0 hid-touch\n' ;;
 	hid-gamepad) printf 'c.1 hid.usb0 hid-gamepad\n' ;;
+	# TWO GAMEPADS ON ONE DEVICE, a HID function each, as `acm-pair` puts two serial ports on one: which is a
+	# composite adapter with a HID interface per player, and the case a driver that binds only a device's first
+	# HID interface gets wrong. ONE COMPOSITE DEVICE, UNPLUGGED WHOLE - the harness has one gadget controller and
+	# one free root port, and a function cannot be unlinked from a bound gadget.
+	hid-gamepad-pair) printf 'c.1 hid.usb0 hid-gamepad\nc.1 hid.usb1 hid-gamepad\n' ;;
 	uac2) printf 'c.1 uac2.usb0 uac2\n' ;;
 	# A PRINTER, for the USB printer class: the kernel's own printer function, whose far end is
 	# `/dev/g_printer0` on this host - where `printer-sink.py` reads what the guest prints and answers
@@ -131,7 +136,7 @@ plan_for() {
 	mbim) printf 'gadgetfs mbim\n' ;;
 	# And a video camera streaming over bulk.
 	uvc) printf 'gadgetfs uvc\n' ;;
-	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, uac2, printer, midi, midi-echo, ups, ccid, dfu, bt, mbim, uvc" ;;
+	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, hid-gamepad-pair, uac2, printer, midi, midi-echo, ups, ccid, dfu, bt, mbim, uvc" ;;
 	esac
 }
 
@@ -161,10 +166,12 @@ hid_descriptor() {
 		local finger='\x05\x0d\x09\x22\xa1\x02\x09\x51\x15\x00\x25\x0f\x75\x04\x95\x01\x81\x02\x09\x42\x25\x01\x75\x01\x81\x02\x75\x03\x81\x03\x05\x01\x09\x30\x26\xff\x7f\x75\x10\x81\x02\x09\x31\x81\x02\xc0'
 		printf '%b' '\x05\x0d\x09\x04\xa1\x01'"$finger""$finger"'\x05\x0d\x09\x54\x15\x00\x25\x02\x75\x08\x95\x01\x81\x02\xc0'
 		;;
-	# A gamepad: two sticks as four axes, and sixteen buttons. The mapping under test is from
-	# this shape to the input vocabulary, so the shape is the fixture.
+	# A gamepad: two sticks as four axes, sixteen buttons, and a HAT - a four-bit Hat Switch over 0..7
+	# (physical 0..315 degrees) with the NULL STATE flag, then four bits of padding, so a report is seven
+	# bytes. The mapping under test is from this shape to the input vocabulary, so the shape is the fixture:
+	# byte for byte what the driver library's parser tests call the gadget's gamepad.
 	hid-gamepad)
-		printf '%b' '\x05\x01\x09\x05\xa1\x01\x09\x30\x09\x31\x09\x32\x09\x35\x15\x00\x26\xff\x00\x75\x08\x95\x04\x81\x02\x05\x09\x19\x01\x29\x10\x15\x00\x25\x01\x75\x01\x95\x10\x81\x02\xc0'
+		printf '%b' '\x05\x01\x09\x05\xa1\x01\x09\x30\x09\x31\x09\x32\x09\x35\x15\x00\x26\xff\x00\x75\x08\x95\x04\x81\x02\x05\x09\x19\x01\x29\x10\x15\x00\x25\x01\x75\x01\x95\x10\x81\x02\x05\x01\x09\x39\x15\x00\x25\x07\x35\x00\x46\x3b\x01\x65\x14\x75\x04\x95\x01\x81\x42\x65\x00\x75\x04\x95\x01\x81\x03\xc0'
 		;;
 	# A UPS, on the Power Device and Battery System pages. Byte for byte the descriptor the driver library's
 	# `hid_power` tests carry: five status flags, a percentage capacity and a run time in input report 1; the
@@ -213,7 +220,7 @@ write_attr_quietly() {
 hid_report_length() {
 	case "$1" in
 	hid-touch) echo 11 ;;
-	hid-gamepad) echo 6 ;;
+	hid-gamepad) echo 7 ;;
 	# The longest report with its ID byte: feature report 2 is seven.
 	hid-ups) echo 8 ;;
 	esac
@@ -664,7 +671,7 @@ setup)
 teardown) cmd_teardown ;;
 verify) cmd_verify ;;
 *)
-	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|uac2|printer|midi|midi-echo|ups|ccid|dfu|bt|mbim|uvc> | teardown | verify" >&2
+	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|hid-gamepad-pair|uac2|printer|midi|midi-echo|ups|ccid|dfu|bt|mbim|uvc> | teardown | verify" >&2
 	exit 2
 	;;
 esac

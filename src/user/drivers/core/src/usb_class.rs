@@ -95,8 +95,22 @@ pub struct Cost {
 	pub in_flight: u32,
 }
 
-/// What one HID device costs: one interrupt IN endpoint with its ring, and one report in flight.
-pub const HID_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES, in_flight: 1 };
+/// THE HID INTERFACES OF ONE DEVICE the HID module binds, and what it charges a device for.
+///
+/// EVERY HID INTERFACE, as the serial module brings up every port: a composite gamepad adapter is one
+/// device with a HID interface per player, and binding only the first left the second player's pad
+/// unseen.
+pub const HID_INTERFACES: u32 = 4;
+
+/// What one HID device costs: FOUR INTERFACES' worth - per interface an interrupt IN endpoint, its ring,
+/// ITS OWN REPORT PAGE and one report in flight.
+///
+/// CHARGED ONCE, WHEN THE MODULE TAKES THE DEVICE, AT FOUR INTERFACES: the admission tried before the
+/// device is configured stays one check, the refusal line and the ceiling keep meaning devices, a detach
+/// gives one charge back, and no device holds more than it was charged for. THE REPORT PAGE IS NEW MEMORY:
+/// a standing report used to land in the device's own data page, which carries its control transfers,
+/// cannot be shared by several standing reports, and was never counted here.
+pub const HID_COST: Cost = Cost { endpoints: HID_INTERFACES, dma_bytes: HID_INTERFACES as u64 * (RING_BYTES + 4096), in_flight: HID_INTERFACES };
 
 /// What one mass-storage device costs: a bulk IN and a bulk OUT endpoint with their rings, the data
 /// buffer it may grow to, and one transfer in flight.
@@ -192,7 +206,7 @@ pub struct Limits {
 /// The number is a bound on a hostile hub tree rather than a guess at a desk: a USB bus admits 127
 /// addresses, every one of them can be a keyboard, and each one this module configures takes a DMA
 /// page and an endpoint of the controller's for as long as it stays plugged in.
-pub const HID_LIMITS: Limits = Limits { devices: 8, endpoints: 8, dma_bytes: 8 * RING_BYTES, in_flight: 8 };
+pub const HID_LIMITS: Limits = Limits { devices: 8, endpoints: 8 * HID_COST.endpoints, dma_bytes: 8 * HID_COST.dma_bytes, in_flight: 8 * HID_COST.in_flight };
 
 /// ONE MASS-STORAGE DEVICE, which is what this controller has always served.
 ///
@@ -381,6 +395,7 @@ impl Budget {
 	/// what stops the one caller that grows a buffer from being the one place with no bound.
 	pub const fn buffer_within(kind: ClassKind, bytes: u64) -> bool {
 		match kind {
+			// One page: a ring's or a report page's size.
 			ClassKind::Hid => bytes <= RING_BYTES,
 			ClassKind::Storage => bytes <= STORAGE_MAX_DATA_BYTES,
 			// The network module's buffers are the two pages it was charged for and it never grows

@@ -244,6 +244,16 @@ fn acknowledged(cpus: usize, me: usize, generation: u64) -> usize {
 // Relaxed: it is read only by a human, in a report that is already printing.
 static SERVICED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+#[cfg(test)]
+static HELD_BACK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+// Make core `cpu` stop acknowledging shootdowns - and servicing anything they carry - until it is called
+// again with `None`.
+#[cfg(test)]
+pub fn hold_back_for_test(cpu: Option<usize>) {
+	HELD_BACK.store(cpu.map_or(u64::MAX, |cpu| cpu as u64), Ordering::Release);
+}
+
 pub fn service_pending() {
 	let me = arch::percpu::this_cpu().cpu_id() as usize;
 	if me < MAX_CPUS {
@@ -255,8 +265,19 @@ pub fn service_pending() {
 	if me >= MAX_CPUS {
 		return;
 	}
+	// A core that does not answer, made on purpose: the only way a test reaches a round that is not
+	// confirmed, which is a property of the machine and cannot be produced otherwise.
+	#[cfg(test)]
+	if HELD_BACK.load(Ordering::Acquire) == me as u64 {
+		return;
+	}
 	let wanted = PENDING_GENERATION[me].load(Ordering::Acquire);
 	if wanted > ACK_GENERATION[me].load(Ordering::Acquire) {
+		// AND THE PORTS THIS CORE LETS RING 3 USE, before the acknowledgement says this core is done: a
+		// port range's revocation rides this same round, and a core whose running process's permission
+		// bitmap moved copies it again here. It reads only this core's own record, so it takes no lock -
+		// which is what keeps this function lock-free for the spin waits that call it.
+		arch::ioports::service();
 		arch::paging::flush_local_tlb();
 		// `fetch_max`, not a store: this can be re-entered - the idle loop and the wake-IPI handler
 		// both call it - and a plain store could move a core's acknowledgement BACKWARDS if an

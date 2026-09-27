@@ -1975,3 +1975,30 @@ fn resuming_an_unsupervised_watchdog_schedules_nothing() {
 	assert_eq!(beat.tick(1_000), Beat::Idle, "and nothing is ever asked");
 	assert_eq!(beat.wake_at(), 0);
 }
+
+// THE KINDS NOBODY OPENS WHOLE, driven through their counts the way DeviceManager's catalogue keeps them: the
+// offered endpoint closed at publication and never counted, a scoped mint counted and refused past the
+// declared bound, a `DISCONNECT` refunding one, and the catalogue's `open` refused.
+#[test]
+fn a_bus_provider_is_reached_only_through_counted_scoped_connections() {
+	use driver_protocol::provider::{BLOCK, GPIO_LINES, I2C_BUS};
+	for (kind, declared) in [(I2C_BUS, 8u16), (GPIO_LINES, 16u16)] {
+		assert!(scoped_only(kind));
+		assert!(!keeps_offered_endpoint(kind), "the offered endpoint is closed at publication");
+		assert!(!openable(kind), "and `open` refuses the kind");
+		// PUBLISHED: nothing counted, since the offered endpoint was closed rather than kept.
+		let mut consumers: u16 = 0;
+		// MINTED UP TO THE DECLARATION, each one counted.
+		for _ in 0..declared {
+			assert!(admits_scoped(kind, consumers, declared));
+			consumers += 1;
+		}
+		assert!(!admits_scoped(kind, consumers, declared), "refused past the declared bound");
+		// A DISCONNECT gives one place back.
+		consumers -= 1;
+		assert!(admits_scoped(kind, consumers, declared));
+	}
+	// EVERY OTHER KIND keeps its offered endpoint, is opened by the catalogue, and is never minted scoped.
+	assert!(!scoped_only(BLOCK) && keeps_offered_endpoint(BLOCK) && openable(BLOCK));
+	assert!(!admits_scoped(BLOCK, 0, 4));
+}

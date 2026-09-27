@@ -15,6 +15,7 @@ pub mod event;
 pub mod handle;
 pub mod interrupt;
 pub mod memory_object;
+pub mod port_range;
 pub mod privilege;
 // What the implementation DID, in the vocabulary the model speaks. The sink is the conformance
 // fixture replayed against `docs/spec/capability`; in a production build every record is an
@@ -62,6 +63,8 @@ pub enum ObjectType {
 	Privilege,
 	// A set of objects registered once and waited on many times. See `wait_set`.
 	WaitSet,
+	// The authority to a range of x86 I/O ports. See `port_range`.
+	PortRange,
 }
 
 impl ObjectType {
@@ -86,6 +89,7 @@ impl ObjectType {
 			ObjectType::ProcessGroup => abi::OBJECT_TYPE_PROCESS_GROUP,
 			ObjectType::Privilege => abi::OBJECT_TYPE_PRIVILEGE,
 			ObjectType::WaitSet => abi::OBJECT_TYPE_WAIT_SET,
+			ObjectType::PortRange => abi::OBJECT_TYPE_PORT_RANGE,
 		}
 	}
 }

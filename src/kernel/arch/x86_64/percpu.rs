@@ -49,11 +49,32 @@ pub struct PerCpu {
 	// path can point the ring-3 interrupt stack at the current thread's own kernel
 	// stack (per-thread RSP0 is what makes ring-3 preemption safe).
 	tss_rsp0: u64,
+	// What this core's I/O permission bitmap holds. See `ioports`.
+	io: IoCore,
+	// This block's own address, so the switch path reaches it with one GS-relative load instead of an
+	// RDMSR - the kernel is built unoptimised, and the switch is its hottest path.
+	self_addr: u64,
+}
+
+const SELF_OFFSET: usize = core::mem::offset_of!(PerCpu, self_addr);
+
+// THE CORE'S PORT RECORD: where its TSS keeps the bitmap and the map base, the process whose thread is
+// running (valid while that thread is current, cleared by every switch to the idle context), which
+// process's bitmap is loaded and at which generation, and how many leading words of the bitmap may hold
+// an allowed port. Read and written only on this core, with interrupts masked - which is what lets the
+// cross-core service step and the #GP path reach it without a lock.
+pub struct IoCore {
+	pub map: u64,
+	pub base: u64,
+	pub running: u64,
+	pub koid: u64,
+	pub generation: u64,
+	pub dirty: u64,
 }
 
 impl PerCpu {
 	const fn empty() -> Self {
-		Self { cpu_id: 0, lapic_id: 0, kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0, from_user: 0, tss_rsp0: 0 }
+		Self { cpu_id: 0, lapic_id: 0, kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0, from_user: 0, tss_rsp0: 0, io: IoCore { map: 0, base: 0, running: 0, koid: 0, generation: 0, dirty: 0 }, self_addr: 0 }
 	}
 
 	pub fn cpu_id(&self) -> u32 {
@@ -102,6 +123,7 @@ pub fn init(cpu_id: usize, lapic_id: u64) {
 		let slot = base.add(cpu_id);
 		(*slot).cpu_id = cpu_id as u32;
 		(*slot).lapic_id = lapic_id;
+		(*slot).self_addr = slot as u64;
 		msr::write(IA32_GS_BASE, slot as u64);
 	}
 }
@@ -126,6 +148,25 @@ pub fn set_kernel_rsp(value: u64) {
 pub fn set_tss_rsp0_slot(addr: u64) {
 	let base = msr::read(IA32_GS_BASE);
 	unsafe { (*(base as *mut PerCpu)).tss_rsp0 = addr };
+}
+
+// Record where this core's I/O bitmap and its TSS's map base live (once per core, beside the RSP0 slot).
+pub fn set_io_slots((map, base): (u64, u64)) {
+	let io = io_core();
+	// SAFETY: this core's own block, written before anything on this core reads it.
+	unsafe {
+		(*io).map = map;
+		(*io).base = base;
+	}
+}
+
+// The running core's port record. Only ever dereferenced on this core with interrupts masked.
+#[inline(always)]
+pub fn io_core() -> *mut IoCore {
+	let base: u64;
+	// SAFETY: GS holds this core's block from `init` on, and `self_addr` is its own address.
+	unsafe { core::arch::asm!("mov {}, gs:[{off}]", out(reg) base, off = const SELF_OFFSET, options(nostack, preserves_flags, readonly)) };
+	unsafe { core::ptr::addr_of_mut!((*(base as *mut PerCpu)).io) }
 }
 
 // Point this core's TSS.RSP0 at `value` - the incoming thread's parked kernel

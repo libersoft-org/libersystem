@@ -101,6 +101,14 @@ silent re-preparation.
   of one drawing do different work.
 * **The application's own images** are its own: a surface's presentable images are created by the
   client, charged to the client's Domain, and imported by the display service.
+* **A worker pool's lanes** are scratch like the rest. A backend given a pool (`soft2d::Workers`, the
+  shape `soft3d`'s has, so one pool serves both) reserves one LANE per worker at `prepare` - the tile,
+  the rasteriser, the layer and mask pools, the stacks - and charges them against the prepared-scratch
+  ceiling in an order that cannot change a pixel: the first lane as the one set of scratch always was,
+  the optional decoded image copies settled against it, and further lanes only in what is left. A frame
+  may therefore run on fewer lanes than the pool has, and reports the lanes and the units it ran with.
+  The units are tiles, each drawn in place into its own rectangle of the target, and every schedule
+  draws the serial walk's pixels to the bit; the measurements are in [`PERF.md`](PERF.md).
 
 ## Conformance
 

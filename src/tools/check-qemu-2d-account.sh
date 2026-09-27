@@ -20,8 +20,12 @@
 #      surfaces; then the same scene offscreen at 640x480 and 1280x800;
 #   2. `development-trace` with GPU_SIZE=640x480: the account at the screen's own size (direct);
 #   3. `development` (every site dormant): the 640x480 run without the account - the instrument's cost -
-#      the same run with the core kept busy before each draw, and `--primitives`, so the dormant site is
-#      measured dormant.
+#      the same run with the core kept busy before each draw, `--primitives`, so the dormant site is
+#      measured dormant, and the 640x480 run once more at the demo's default worker count: the POOLED ROW.
+#
+# THE ACCOUNT IS THE SERIAL WALK. It describes one chain of work per frame, so every run but the pooled
+# one pins `--workers=1` and must report one lane; the pooled run must report more than one, and its
+# draw, interval and lanes are recorded beside the account, not as a term of it.
 #
 # THE OPTIMISED ROW. With CARGO_PROFILE_DEV_OPT_LEVEL exported, and ACCOUNT_REFERENCE naming the
 # results directory of an ordinary run on the same tree, the gate takes the row only if the image digest
@@ -61,9 +65,9 @@ if ps -eo comm= | grep -q '^qemu-system'; then
 	die "a QEMU guest is already running - this gate boots its own under stated conditions and will not share or take down another"
 fi
 
-# WHEN THE DEMO HAS A WORKER POOL, every run pins one worker so the draw is the serial walk the account
-# describes (the demo has no `--workers` yet, so this list is empty).
-PIN=()
+# EVERY RUN PINS ONE WORKER, so the draw is the serial walk the account describes; only the pooled row
+# runs at the demo's default.
+PIN=(--workers=1)
 
 # The staged artifact of a program, where `mkpackages` takes it from: a static program from cargo's
 # `debug` output, a dynamic one from the release PIE tree `build-shared` fills.
@@ -127,6 +131,18 @@ run() {
 	grep -q "test2d-sw: done" "$RESULTS/run-$name.out" || die "run $name did not reach its end - see $RESULTS/run-$name.out"
 }
 
+# The lanes a run's frames were drawn with, as the demo's report line gives them.
+lanes_of() {
+	grep -a -o -m1 ' lanes=[0-9]*' "$RESULTS/run-$1.out" | cut -d= -f2
+}
+
+# A PINNED RUN THAT DREW ON SEVERAL LANES is a pin that did not reach the demo - and a draw the account
+# would be describing wrongly.
+pinned() {
+	local name="$1"
+	[[ "$(lanes_of "$name")" == 1 ]] || die "run $name was pinned to one worker and reports lanes=$(lanes_of "$name") - see $RESULTS/run-$name.out"
+}
+
 ACCOUNT=(--account --no-input --no-second-surface --frames=160 --phase-frames=40)
 
 boot trace DEV_PROFILE=1 LIBER_BOOT_PROFILE=development-trace
@@ -147,9 +163,27 @@ run dormant --no-input --no-second-surface --frames=160 --phase-frames=40 --size
 # the spin was paying for starting on a core that had been idle, which is the host's and not the draw's.
 run warm-core --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 --warm-core=60 "${PIN[@]}"
 run primitives --primitives
+# THE POOLED ROW: the dormant run once more, at the demo's default worker count - one lane per vCPU, and
+# the workers share those four vCPUs with DisplayService.
+run pooled --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480
 cp "$SERIAL_LOG" "$RESULTS/serial-dormant.log"
 "$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true
 BOOTED=0
+
+for name in scaled direct hidden offscreen-640x480 offscreen-1280x800 small-direct dormant warm-core; do
+	pinned "$name"
+done
+pooled_lanes="$(lanes_of pooled)"
+((${pooled_lanes:-0} > 1)) || die "the pooled run drew on ${pooled_lanes:-no} lanes - the demo's default is not a pool, and there is no pooled row - see $RESULTS/run-pooled.out"
+field_of() {
+	grep -a -o -m1 " $1=[0-9]*" "$RESULTS/run-$2.out" | cut -d= -f2
+}
+# The vCPUs the guest brought up, which the pool's workers share with DisplayService.
+vcpus="$(grep -a -o -m1 'smp: [0-9]* of [0-9]* cores online' "$RESULTS/conditions-dormant.tsv" | cut -d' ' -f2)"
+printf 'pooled\tworkers=default vcpus=%s lanes=%s units=%s draw-mean-us=%s interval-mean-us=%s\nserial\tworkers=1 vcpus=%s lanes=1 units=%s draw-mean-us=%s interval-mean-us=%s\n' \
+	"${vcpus:-unknown}" "$pooled_lanes" "$(field_of units pooled)" "$(field_of draw-mean-us pooled)" "$(field_of interval-mean-us pooled)" \
+	"${vcpus:-unknown}" "$(field_of units dormant)" "$(field_of draw-mean-us dormant)" "$(field_of interval-mean-us dormant)" >"$RESULTS/pooled-row.tsv"
+note "every pinned run drew on one lane; pooled row: $(head -n 1 "$RESULTS/pooled-row.tsv" | cut -f2)"
 
 # ONE IMAGE FOR EVERY BOOT. The build is reproducible, so a digest that moved means something changed
 # between two boots of one measurement - and the comparisons below would be across it.

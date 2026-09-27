@@ -137,6 +137,8 @@ fn input_service_streams_pointer_events() {
 	// service that never finishes its bootstrap - which reads as "no online report" and not as a
 	// missing device.
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the touch subscription with nothing");
+	// AND THE GAMEPAD SUBSCRIPTION, which InputService keeps open: an empty one is a machine with no gamepad yet.
+	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the gamepad subscription with nothing");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
 	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
@@ -250,6 +252,7 @@ fn a_touch_surface_reports_contacts_and_not_a_cursor() {
 	// THE TOUCH KIND IS ITS OWN SUBSCRIPTION, which is what makes a surface discoverable without
 	// being published as a pointer.
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Touch, touch_input).expect("the touch subscription");
+	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("no gamepad");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("InputService online report");
 	assert_eq!(&online.bytes[..], b"InputService: online");
@@ -340,6 +343,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	crate::tests::serve_provider_catalogue(&pointer_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
 	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the touch subscription with nothing");
+	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the gamepad subscription with nothing");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("InputService online report");
 	assert_eq!(&online.bytes[..], b"InputService: online");
@@ -410,6 +414,424 @@ fn input_service_streams_keys_only_with_display_focus() {
 		frames += 1;
 	}
 	assert_eq!(frames, 6, "three key-down frames are followed by three synthetic releases");
+}
+
+tagged_test!(gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity, [Service, Input, Display], id = "kernel.services.gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity", covers = ["kernel", "bin.input_service", "input-proto"]);
+// WHICH GAMEPAD PRESSED WHAT, AND WHO MAY SEE IT. InputService stands between the gamepad providers and two
+// kinds of reader - the graphical application holding display focus and one console program - and this plays
+// every other side of it: the catalogue, two gamepad drivers on the production wire, DisplayService's focus
+// channel and the protected-input holder.
+fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
+	use device_proto::codec as wire;
+	use device_proto::generated::liber::device::v1 as device;
+	use driver_protocol::gamepad as pad_wire;
+	use input_proto::generated::liber::input::v1::{GamepadEvent, input};
+	use object::channel::{Channel, ChannelError, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+
+	// THE CATALOGUE, ANSWERED AS IT IS ASKED: an empty snapshot for the pointer and touch kinds, and for the
+	// gamepad kind a stream this test keeps - so a provider can be published on it later - and an `open` of a
+	// published gamepad provider answered with the driver end this test holds.
+	struct Catalogue {
+		server: alloc::sync::Arc<Channel>,
+		gamepads: Option<alloc::sync::Arc<Channel>>,
+		seq: u32,
+		providers: alloc::vec::Vec<(device::ProviderInfo, Option<alloc::sync::Arc<Channel>>)>,
+		empties: alloc::vec::Vec<alloc::sync::Arc<Channel>>,
+	}
+	impl Catalogue {
+		fn answer(&mut self) {
+			while let Ok(request) = self.server.recv() {
+				let op = u16::from_le_bytes([request.bytes[0], request.bytes[1]]);
+				let corr = request.bytes[2..6].to_vec();
+				match op {
+					1 => {
+						let (stream, stream_client) = Channel::create();
+						self.server.send(Message::new(corr, alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the subscribe answer");
+						if request.bytes[6..] == [device::ProviderKind::Gamepad as u8] {
+							self.gamepads = Some(stream);
+							for at in 0..self.providers.len() {
+								let info = self.providers[at].0.clone();
+								self.frame(&info);
+							}
+						} else {
+							self.empties.push(stream);
+						}
+					}
+					3 => {
+						let mut handles = wire::Handles::new();
+						let mut reader = wire::Reader::with_handles(&request.bytes[6..], &mut handles);
+						let info = device::ProviderInfo::read(&mut reader).expect("an open names a publication");
+						let client = self.providers.iter_mut().find(|(held, _)| held.slot == info.slot && held.provider_generation == info.provider_generation).and_then(|(_, client)| client.take()).expect("an open named a published gamepad provider, once");
+						let mut answer = corr;
+						answer.push(1);
+						answer.extend_from_slice(&0u32.to_le_bytes());
+						self.server.send(Message::new(answer, alloc::vec![Capability::new(client, Rights::ALL)])).expect("the open answer");
+					}
+					_ => panic!("InputService asked the catalogue for op {op}"),
+				}
+			}
+		}
+
+		fn frame(&mut self, info: &device::ProviderInfo) {
+			let mut frame = [0u8; 128];
+			let mut handles = wire::Handles::new();
+			let len = device::provider_catalogue::subscribe_frame(self.seq, info, &mut frame, &mut handles).expect("a publication frame encodes");
+			self.seq += 1;
+			self.gamepads.as_ref().expect("the gamepad subscription was made").send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).expect("a publication frame");
+		}
+
+		// A gamepad provider published - now, or on the kept subscription later - and the driver end of it.
+		fn publish(&mut self, slot: u32) -> alloc::sync::Arc<Channel> {
+			let (driver, client) = Channel::create();
+			let info = device::ProviderInfo { kind: device::ProviderKind::Gamepad, bus: 0, dev: 20, func: 0, binding_generation: 1, slot, provider_generation: 1, name: alloc::string::String::new().into(), live: true };
+			self.providers.push((info.clone(), Some(client)));
+			if self.gamepads.is_some() {
+				self.frame(&info);
+			}
+			driver
+		}
+	}
+
+	// THE PRODUCTION WIRE, from the driver's side: the harness's gamepad shape - X, Y, Z and Rz over 0..255,
+	// sixteen buttons, one hat.
+	fn shape(label: &[u8]) -> pad_wire::Shape {
+		let axis = |usage: u32| pad_wire::Axis { usage: 0x0001_0000 | usage, minimum: 0, maximum: 255 };
+		pad_wire::Shape::new(label, 16, 1, &[axis(0x30), axis(0x31), axis(0x32), axis(0x35)]).expect("the harness's gamepad")
+	}
+	fn arrival(handle: u32, label: &[u8]) -> alloc::vec::Vec<u8> {
+		let mut out = [0u8; pad_wire::MAX_FRAME];
+		let len = pad_wire::encode_arrival(handle, &shape(label), &mut out);
+		out[..len].to_vec()
+	}
+	fn state(handle: u32, buttons: u32, hat: u8, axes: [i32; 4]) -> alloc::vec::Vec<u8> {
+		let mut values = [0i32; pad_wire::MAX_AXES];
+		values[..4].copy_from_slice(&axes);
+		let mut out = [0u8; pad_wire::MAX_FRAME];
+		let len = pad_wire::encode_state(handle, &shape(b"any"), &pad_wire::State { buttons, hats: [hat, pad_wire::CENTRED], axes: values }, &mut out);
+		out[..len].to_vec()
+	}
+	fn departure(handle: u32) -> alloc::vec::Vec<u8> {
+		let mut out = [0u8; pad_wire::MAX_FRAME];
+		let len = pad_wire::encode_departure(handle, &mut out);
+		out[..len].to_vec()
+	}
+	fn drive(driver: &Channel, frame: alloc::vec::Vec<u8>) {
+		driver.send(Message::new(frame, alloc::vec::Vec::new())).expect("a driver frame");
+	}
+	const MID: [i32; 4] = [127; 4];
+
+	// Every event a stream holds now, decoded through the generated reader.
+	fn events(stream: &Channel) -> alloc::vec::Vec<GamepadEvent> {
+		let mut out = alloc::vec::Vec::new();
+		while let Ok(frame) = stream.recv() {
+			let mut handles = input_proto::codec::Handles::new();
+			out.push(input::observe_gamepads_read(&frame.bytes, &mut handles).unwrap_or_else(|| panic!("a gamepad frame decodes: {:?}", frame.bytes)));
+		}
+		out
+	}
+	fn closed(stream: &Channel) -> bool {
+		matches!(stream.recv(), Err(ChannelError::PeerClosed))
+	}
+	// A request that hands a capability over and answers with one - or refuses with the correlation alone.
+	fn call(client: &Channel, op: u16, corr: u32, proof: Option<alloc::sync::Arc<Channel>>, pump: &mut dyn FnMut()) -> Option<alloc::sync::Arc<Channel>> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&op.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		match proof {
+			Some(proof) => {
+				request.extend_from_slice(&0u32.to_le_bytes());
+				send_cap(client, &request, proof, Rights::ALL).expect("a request with a proof");
+			}
+			None => client.send(Message::new(request, alloc::vec::Vec::new())).expect("a request"),
+		}
+		let mut reply = None;
+		for _ in 0..64 {
+			pump();
+			if let Ok(message) = client.recv() {
+				reply = Some(message);
+				break;
+			}
+		}
+		let reply = reply.expect("a reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr, "the reply echoes the correlation id");
+		reply.caps.first().map(|cap| cap.object().into_any_arc().downcast::<Channel>().expect("a channel"))
+	}
+	fn at_rest(event: &GamepadEvent, id: u32) -> bool {
+		matches!(event, GamepadEvent::State(held) if held.id == id && held.buttons == 0 && held.hats == [pad_wire::CENTRED] && held.axes == [127, 127, 127, 127])
+	}
+	fn state_of(event: &GamepadEvent) -> Option<(u32, u32, alloc::vec::Vec<u8>)> {
+		match event {
+			GamepadEvent::State(held) => Some((held.id, held.buttons, held.hats.clone())),
+			_ => None,
+		}
+	}
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"input_service").expect("input_service in the package or volume");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	let (console_focus, forward_b) = Channel::create();
+	let (_keys_driver, keys_input) = Channel::create();
+	let (focus_display, focus_input) = Channel::create();
+	let (_kill_display, kill_input) = Channel::create();
+	let (input_admin, admin) = Channel::create();
+	let (catalogue_server, catalogue_client) = Channel::create();
+	let (trusted_keyboard, trusted_keys_input) = Channel::create();
+	let (trusted_root, trusted_root_input) = Channel::create();
+	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	send_cap(&boot_kernel, b"FORWARD", forward_b, Rights::ALL).expect("forward bootstrap");
+	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
+	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
+	send_cap(&boot_kernel, b"KILL", kill_input, Rights::ALL).expect("kill bootstrap");
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	send_cap(&boot_kernel, b"TRUSTEDKEYS", trusted_keys_input, Rights::ALL).expect("trusted keys bootstrap");
+	send_cap(&boot_kernel, b"TRUSTED", trusted_root_input, Rights::ALL).expect("trusted input bootstrap");
+
+	let catalogue = core::cell::RefCell::new(Catalogue { server: catalogue_server, gamepads: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new() });
+	// PROVIDER A IS PUBLISHED BEFORE THE SERVICE STARTS, as a controller bound at boot is.
+	let driver_a = catalogue.borrow_mut().publish(0);
+	let mut pump = || {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		catalogue.borrow_mut().answer();
+		// ConsoleService's end of the key-focus notices, read so a notice never waits out its deadline.
+		while console_focus.recv().is_ok() {}
+	};
+	let mut online = false;
+	for _ in 0..200 {
+		pump();
+		if let Ok(report) = boot_kernel.recv() {
+			assert_eq!(&report.bytes[..], b"InputService: online");
+			online = true;
+			break;
+		}
+	}
+	assert!(online, "InputService reported in with the gamepad subscription answered");
+
+	// TWO GAMEPADS FROM ONE PROVIDER, with no report yet.
+	drive(&driver_a, arrival(1, b"pad a1"));
+	drive(&driver_a, arrival(2, b"pad a2"));
+	for _ in 0..4 {
+		pump();
+	}
+
+	// THE CONSOLE PROGRAM'S CONNECTION: the gamepad scope, on which only `observe-gamepads` works.
+	let pads = call(&input_admin, 2, 50, None, &mut pump).expect("a gamepad-scope connection");
+	assert!(call(&pads, 1, 51, None, &mut pump).is_none(), "the gamepad scope refuses the pointer snapshot");
+	let (forged, _forged_peer) = Channel::create();
+	assert!(call(&pads, 2, 52, Some(forged), &mut pump).is_none(), "and the key stream");
+	assert!(call(&service_client, 5, 53, None, &mut pump).is_none(), "and `observe-gamepads` is refused on every other scope");
+	let console = call(&pads, 5, 54, None, &mut pump).expect("the console stream opens while no surface holds focus");
+	let opening = events(&console);
+	assert_eq!(opening.len(), 4, "a present and a state for each gamepad there: {opening:?}");
+	let (a1, a2) = match (&opening[0], &opening[2]) {
+		(GamepadEvent::Present(first), GamepadEvent::Present(second)) => {
+			assert_eq!((first.label.as_str(), second.label.as_str()), ("pad a1", "pad a2"));
+			assert_eq!((first.buttons, first.hats, first.axes.len()), (16, 1, 4));
+			(first.id, second.id)
+		}
+		other => panic!("the stream opens with the gamepads present: {other:?}"),
+	};
+	assert_ne!(a1, a2, "two gamepads, two ids");
+	// AN ARRIVAL WITH NO REPORT YET IS AT REST: no buttons, the hat centred - never north - and each axis at its
+	// midpoint.
+	assert!(at_rest(&opening[1], a1) && at_rest(&opening[3], a2), "{opening:?}");
+	assert!(call(&pads, 5, 55, None, &mut pump).is_none(), "a second console stream is refused while the first is open");
+
+	// A STATE ON ONE REACHES THE CONSUMER UNDER THAT ID ALONE.
+	drive(&driver_a, state(2, 1 << 2, 8, MID));
+	pump();
+	let pressed = events(&console);
+	assert_eq!(pressed.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 4, alloc::vec![8])], "button 3 on the second, and nothing for the first");
+
+	// A THIRD FROM A PROVIDER PUBLISHED LATER on the subscription InputService kept open.
+	let driver_b = catalogue.borrow_mut().publish(1);
+	for _ in 0..4 {
+		pump();
+	}
+	drive(&driver_b, arrival(1, b"pad b1"));
+	for _ in 0..2 {
+		pump();
+	}
+	let arrived = events(&console);
+	let b1 = match arrived.first() {
+		Some(GamepadEvent::Arrived(pad)) => pad.id,
+		other => panic!("the later provider's gamepad arrives: {other:?}"),
+	};
+	assert!(b1 != a1 && b1 != a2, "a third id, although its publisher numbers it 1 as the first provider does");
+	assert!(arrived.len() == 2 && at_rest(&arrived[1], b1), "its first state is at rest: {arrived:?}");
+
+	// A MALFORMED OR FOREIGN FRAME CHANGES NOTHING: an unknown tag, a state for a handle nobody attached, a
+	// state of the wrong shape, a hat past centred, and a second arrival for a handle held.
+	drive(&driver_a, alloc::vec![9, 1, 0, 0, 0]);
+	drive(&driver_a, state(7, 1, 8, MID));
+	let mut short = state(1, 1, 8, MID);
+	short.truncate(short.len() - 4);
+	drive(&driver_a, short);
+	let mut past = state(1, 0, 8, MID);
+	past[9] = 9;
+	drive(&driver_a, past);
+	drive(&driver_a, arrival(1, b"pad a1 again"));
+	pump();
+	assert!(events(&console).is_empty(), "nothing reached the consumer");
+
+	// ONE DEPARTS AND THE OTHERS KEEP REPORTING.
+	drive(&driver_a, departure(1));
+	drive(&driver_a, state(2, 0, 8, MID));
+	drive(&driver_b, state(1, 0, 2, MID));
+	pump();
+	let after = events(&console);
+	assert!(matches!(after.first(), Some(GamepadEvent::Departed(id)) if *id == a1), "{after:?}");
+	assert_eq!(after.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8]), (b1, 0, alloc::vec![2])]);
+
+	// A PROVIDER'S CLOSED CONNECTION DEPARTS ITS GAMEPADS.
+	core::mem::drop(driver_b);
+	for _ in 0..2 {
+		pump();
+	}
+	let gone = events(&console);
+	assert!(matches!(gone.as_slice(), [GamepadEvent::Departed(id)] if *id == b1), "{gone:?}");
+
+	// A SURFACE TAKING FOCUS RELEASES THE CONSOLE STREAM'S HELD BUTTONS AND CLOSES IT.
+	drive(&driver_a, state(2, 1, 8, MID));
+	pump();
+	assert_eq!(events(&console).iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 1, alloc::vec![8])]);
+	let (forged, _forged_peer) = Channel::create();
+	assert!(call(&service_client, 4, 60, Some(forged), &mut pump).is_none(), "the graphical stream refuses a forged proof");
+	let (proof, registered) = Channel::create();
+	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("a surface takes focus");
+	pump();
+	assert_eq!(&focus_display.recv().expect("focus acknowledgement").bytes[..], b"OK");
+	let released = events(&console);
+	assert_eq!(released.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8])], "the held button is released to the console stream");
+	assert!(closed(&console), "and the console stream closes");
+	assert!(call(&pads, 5, 61, None, &mut pump).is_none(), "and is refused while a surface holds focus");
+
+	// THE GRAPHICAL STREAM SNAPSHOTS ON THE VALID PROOF, and releases on focus loss.
+	let focused = call(&service_client, 4, 62, Some(proof), &mut pump).expect("the focus owner's proof opens the gamepad stream");
+	let snapshot = events(&focused);
+	assert!(matches!(snapshot.first(), Some(GamepadEvent::Present(pad)) if pad.id == a2), "{snapshot:?}");
+	assert_eq!(snapshot.iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 1, alloc::vec![8])], "at the gamepad's current state");
+	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new())).expect("revoke focus");
+	pump();
+	assert_eq!(&focus_display.recv().expect("clear acknowledgement").bytes[..], b"OK");
+	assert_eq!(events(&focused).iter().filter_map(state_of).collect::<alloc::vec::Vec<_>>(), [(a2, 0, alloc::vec![8])], "focus loss releases the held button");
+	assert!(closed(&focused), "and closes the stream");
+
+	// A READER THAT FALLS BEHIND ENDS ON EVERY GAMEPAD'S REAL STATE. Past the channel's depth the stream stays
+	// open, and read afterwards its last state is the gamepad's current one.
+	focus_display.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("the console takes focus back");
+	pump();
+	assert_eq!(&focus_display.recv().expect("console acknowledgement").bytes[..], b"OK");
+	let slow = call(&pads, 5, 63, None, &mut pump).expect("the console stream opens again with no surface focused");
+	// The DRIVER'S channel is as deep as any other, so the service is let to read it as the states go in: what
+	// falls behind is the reader, not the driver.
+	for step in 0..100u32 {
+		drive(&driver_a, state(2, step % 16 + 1, 8, MID));
+		if step % 16 == 15 {
+			pump();
+		}
+	}
+	for _ in 0..4 {
+		pump();
+	}
+	assert!(!slow.is_peer_closed(), "a state the reader cannot take is never a reason to close its stream");
+	// WHAT IT IS OWED GOES ON THE SERVICE'S ONE-TICK RETRY, and that is a periodic wait - which `run_until_idle`
+	// does not count as work and does not wait out - so between reads the clock is moved past it.
+	let mut last: Option<u32> = None;
+	for _ in 0..8 {
+		for event in events(&slow) {
+			if let GamepadEvent::State(held) = event {
+				last = Some(held.buttons);
+			}
+		}
+		crate::tests::advance_clock(2);
+		pump();
+	}
+	assert_eq!(last, Some(99 % 16 + 1), "read afterwards, it ends on the gamepad's current state");
+	// AND LEFT UNREAD AGAIN, the next arrival - which is never coalesced - cannot follow the states it owes, and
+	// the stream is closed.
+	for step in 0..100u32 {
+		drive(&driver_a, state(2, step % 8 + 1, 8, MID));
+		if step % 16 == 15 {
+			pump();
+		}
+	}
+	for _ in 0..4 {
+		pump();
+	}
+	drive(&driver_a, arrival(3, b"pad a3"));
+	for _ in 0..4 {
+		pump();
+	}
+	let drained = events(&slow);
+	assert!(!drained.iter().any(|event| matches!(event, GamepadEvent::Arrived(_))), "the arrival did not reach a reader that was owed states");
+	assert!(closed(&slow), "the next arrival closed the stream");
+
+	// ARMING THE PROTECTED SESSION CLOSES BOTH KINDS OF STREAM AND REFUSES NEW ONES; the gamepads are still
+	// tracked.
+	let watcher = call(&pads, 5, 64, None, &mut pump).expect("a console stream, before the session");
+	let _ = events(&watcher);
+	let trusted_events = call(&trusted_root, 1, 65, None, &mut pump).expect("AdminService's protected-input stream");
+	let key = |usage: u16, down: bool| {
+		let mut raw = usage.to_le_bytes().to_vec();
+		raw.push(down as u8);
+		trusted_keyboard.send(Message::new(raw, alloc::vec::Vec::new())).expect("a trusted key");
+	};
+	key(0xe0, true);
+	key(0xe2, true);
+	key(0x45, true);
+	for _ in 0..2 {
+		pump();
+	}
+	// The protected-input stream carries KEYS, which this test does not read: only drained.
+	while trusted_events.recv().is_ok() {}
+	// RELEASED, THEN CLOSED: the button the second gamepad still holds is let go before the stream ends.
+	let released = events(&watcher);
+	assert!(released.iter().filter_map(state_of).any(|(id, buttons, hats)| id == a2 && buttons == 0 && hats == [pad_wire::CENTRED]), "the console stream releases what was held before it closes: {released:?}");
+	assert!(closed(&watcher), "the console stream closes when the session is armed");
+	assert!(call(&pads, 5, 66, None, &mut pump).is_none(), "and a console stream is refused while it is up");
+	let (proof, registered) = Channel::create();
+	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("a surface takes focus during the session");
+	pump();
+	let _ = focus_display.recv();
+	assert!(call(&service_client, 4, 67, Some(proof), &mut pump).is_none(), "and so is the graphical one");
+	drive(&driver_a, state(2, 1 << 7, 8, MID));
+	pump();
+	for usage in [0x45u16, 0xe2, 0xe0] {
+		key(usage, false);
+	}
+	let mut disarm = alloc::vec::Vec::new();
+	disarm.extend_from_slice(&3u16.to_le_bytes());
+	disarm.extend_from_slice(&68u32.to_le_bytes());
+	disarm.extend_from_slice(&0u64.to_le_bytes());
+	trusted_root.send(Message::new(disarm, alloc::vec::Vec::new())).expect("the session ends");
+	for _ in 0..2 {
+		pump();
+	}
+	let _ = trusted_root.recv();
+	let (proof, registered) = Channel::create();
+	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("a surface takes focus after the session");
+	pump();
+	let _ = focus_display.recv();
+	let after_session = call(&service_client, 4, 69, Some(proof), &mut pump).expect("the graphical stream opens again once the session is over");
+	let snapshot = events(&after_session);
+	assert!(snapshot.iter().filter_map(state_of).any(|(id, buttons, _)| id == a2 && buttons == 1 << 7), "the state reported during the session was tracked: {snapshot:?}");
+	// AND ARMED AGAIN, THE GRAPHICAL STREAM CLOSES TOO.
+	key(0xe0, true);
+	key(0xe2, true);
+	key(0x45, true);
+	for _ in 0..2 {
+		pump();
+	}
+	let _ = events(&after_session);
+	assert!(closed(&after_session), "the graphical stream closes when the session is armed");
+	core::mem::drop(driver_a);
 }
 
 // THE DISPLAY HARNESS, SHARED BY EVERY TEST THAT SPEAKS THE PRESENT-QUEUE CONTRACT.
@@ -3767,6 +4189,96 @@ mod spool_sink {
 		assert!(!rig.service.is_terminated(), "SpoolService outlived spool_probe {mode}");
 		printed
 	}
+}
+
+tagged_test!(the_2d_demo_draws_the_same_frames_through_its_workers, [Service, Display, Process, Image], id = "kernel.services.the_2d_demo_draws_the_same_frames_through_its_workers", covers = ["bin.test2d-sw", "soft2d", "render2d", "rt", "kernel"]);
+// THE WORKER POOL, WHERE IT RUNS. `--workers=4 --compare` draws every frame on four lanes - the demo's own
+// thread and three `rt::pool` workers - and again on the demo's thread alone into a spare copy of what
+// the image held before, and the two must be the same bytes. The host suite holds the parallel replay to
+// the serial walk on the machine that built the image; this holds it on the target, with the target's
+// threads, stacks, channels and scheduler.
+//
+// AT 256 BY 256, because a frame is only as parallel as its units: four bands of sixty-four rows, or
+// sixteen tiles, is at least as many units as the four workers asked for, whichever unit the backend cuts
+// a frame into. The 3D demo's test runs at 64x48, which is ONE 2D tile - a comparison there would compare
+// the serial walk with itself.
+//
+// AND THE NUMBERS ARE READ, NOT ONLY FOUND: the lanes the frames ran with, the units they were cut into and
+// how many frames were compared come from the demo's own line, and a run that compared nothing prints the
+// same line with a zero.
+fn the_2d_demo_draws_the_same_frames_through_its_workers() {
+	use display_harness::*;
+
+	let harness = display_harness::start(256, 256);
+	let console_client = harness.console;
+	let focus_input = harness.focus;
+	let gpu_kernel = harness.gpu;
+	let _device_events = harness.device_events.expect("DisplayService opened the device's event stream");
+	let _display_service = harness.service;
+	let _boot_kernel = harness.boot;
+	let _stats_root = harness.stats;
+	let _admin = harness.admin;
+	let _scanout = harness.scanout;
+
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init_package_bytes().expect("init package module not found")).expect("init package parses");
+	let demo_elf = program_elf(&package, volume, b"test2d-sw").expect("test2d-sw in the package or volume");
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let display = connect(&console_client);
+	let process = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	bootstrap.send(Message::new(crate::tests::launch_context(b"--frames=6 --phase-frames=3 --no-input --no-second-surface --workers=4 --compare", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
+	send_cap(&bootstrap, b"DISPLAY", display, Rights::ALL).expect("the demo's display");
+
+	let mut output: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..400_000u32 {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		if focus_input.recv().is_ok() {
+			focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
+		}
+		while let Ok(present) = gpu_kernel.recv() {
+			let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
+			reply.push(1);
+			gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
+		}
+		while let Ok(message) = stdout.recv() {
+			output.extend_from_slice(&message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	while let Ok(message) = stdout.recv() {
+		output.extend_from_slice(&message.bytes);
+	}
+	for line in output.split(|byte| *byte == b'\n') {
+		if !line.is_empty() {
+			crate::serial_println!("  {}", alloc::string::String::from_utf8_lossy(line));
+		}
+	}
+	// A FIELD OF ONE OF THE DEMO'S LINES, as a number.
+	let field = |prefix: &[u8], name: &[u8]| -> Option<u64> {
+		let line = output.split(|byte| *byte == b'\n').find(|line| line.starts_with(prefix))?;
+		let at = line.windows(name.len()).position(|window| window == name)? + name.len();
+		let digits: alloc::vec::Vec<u8> = line[at..].iter().copied().take_while(u8::is_ascii_digit).collect();
+		alloc::string::String::from_utf8_lossy(&digits).parse().ok()
+	};
+	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
+	assert!(contains(b"matched the serial walk"), "every frame through the workers was the serial walk's: {output:?}");
+	assert!(!contains(b"DIFFERED"), "no frame through the workers differs from the serial walk: {output:?}");
+	let presented = field(b"test2d-sw: presented=", b"presented=").expect("the demo's report");
+	let compared = field(b"test2d-sw: compare", b"frames=").expect("the comparison's report");
+	let lanes = field(b"test2d-sw: compare", b"lanes=").expect("the lanes");
+	let units = field(b"test2d-sw: compare", b"units=").expect("the units");
+	assert_eq!(lanes, 4, "the frames ran on the four lanes asked for: {output:?}");
+	assert!(units >= lanes, "the frames were cut into at least as many units as lanes: {units} units, {output:?}");
+	assert!(presented >= 6 && compared >= presented, "every presented frame was drawn twice and compared: {compared} compared, {presented} presented, {output:?}");
+
+	assert!(process.is_terminated(), "the run ended on its frame count with its workers alive, and the process still finished: {output:?}");
+	assert!(!process.is_killed(), "it finished rather than being killed: {output:?}");
+	assert_eq!(process.exit_status(), Some(0), "and reported the demo's own status, not a worker's: {output:?}");
 }
 
 // THE SPOOL, END TO END, AGAINST A SINK. Every step is a real `spool_probe` process on a fresh grant context,

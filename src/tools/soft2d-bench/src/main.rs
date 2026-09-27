@@ -139,16 +139,18 @@ impl ImageSource for Images {
 	}
 }
 
-/// `--workers N` (the frozen report on a pool of N lanes, one by default) and `--units bands|tiles` (how
-/// a frame is cut; tiles by default) from the command line.
+/// `--workers N` (the frozen report on a pool of N lanes, one by default) and `--units
+/// bands|tiles|rectangles` (how a frame is cut; rectangles, the backend's own default, by default) from
+/// the command line.
 fn workers_and_units() -> (usize, UnitKind) {
 	let arguments: Vec<String> = std::env::args().collect();
 	let value = |flag: &str| arguments.iter().position(|argument| argument == flag).and_then(|at| arguments.get(at + 1)).cloned();
 	let workers = value("--workers").map(|text| text.parse::<usize>().expect("--workers takes a count")).unwrap_or(1).max(1);
 	let units = match value("--units").as_deref() {
-		None | Some("tiles") => UnitKind::Tiles,
+		None | Some("rectangles") => UnitKind::Rectangles,
+		Some("tiles") => UnitKind::Tiles,
 		Some("bands") => UnitKind::Bands,
-		Some(other) => panic!("--units takes bands or tiles, not {other}"),
+		Some(other) => panic!("--units takes bands, tiles or rectangles, not {other}"),
 	};
 	(workers, units)
 }
@@ -175,7 +177,7 @@ fn replay(backend: &mut Soft2d<'_>, prepared: &soft2d::SoftPrepared, target: &mu
 	(samples[samples.len() / 2], samples[((samples.len() as f64 * 0.99) as usize).min(samples.len() - 1)])
 }
 
-/// `--scaling`: every frozen scene at one to sixty-four workers, with both kinds of unit - the lanes each
+/// `--scaling`: every frozen scene at one to sixty-four workers, with every kind of unit - the lanes each
 /// frame ran with, its units, its replay median, and whether its picture is the one-worker frame's to
 /// the byte. A picture that is not is a defect, and the run stops on it.
 fn scaling(images: &Images) {
@@ -185,7 +187,7 @@ fn scaling(images: &Images) {
 		let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
 		let mut reference: Option<Vec<u8>> = None;
 		let mut one_worker = 0.0f64;
-		for kind in [UnitKind::Bands, UnitKind::Tiles] {
+		for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
 			for &workers in SCALING.iter() {
 				let pool = pool::HostPool::new(workers);
 				let mut backend = Soft2d::new().with_images(images).with_workers(&pool).with_units(kind);
@@ -203,7 +205,11 @@ fn scaling(images: &Images) {
 				if workers == 1 && kind == UnitKind::Bands {
 					one_worker = median;
 				}
-				let kind_name = if kind == UnitKind::Bands { "bands" } else { "tiles" };
+				let kind_name = match kind {
+					UnitKind::Bands => "bands",
+					UnitKind::Tiles => "tiles",
+					UnitKind::Rectangles => "rectangles",
+				};
 				println!("{}	{kind_name}	{workers}	{}	{}	{median:.3}	{:.2}	{}", scene.name, prepared.lanes(), prepared.units(), one_worker / median, if identical { "yes" } else { "NO" });
 				assert!(identical, "{} at {workers} workers ({kind_name}): the picture differs from one worker's", scene.name);
 			}

@@ -68,6 +68,16 @@ bench = false
 required-features = ["development"]
 
 [[bin]]
+# THE IN-GUEST GAMEPAD FIXTURE: gamepads of the harness's shape published over the production `gamepad` wire,
+# and the control endpoint the gamepad tool's gate drives. Development-only in the manifest, bound to a QEMU
+# test device at a pinned address.
+name = "gamepad_fixture"
+path = "src/gamepad_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
 # THE IN-GUEST ADMINISTRATIVE EXECUTOR: a bounded probe write over two target generations, published as an
 # `admin-executor` provider, and the read-only witness the administrative-path gate counts effects through.
 # Development-only in the manifest, bound to a QEMU test device at a pinned address.
@@ -174,6 +184,23 @@ bench = false
 [[bin]]
 name = "virtio_snd"
 path = "src/virtio_snd.rs"
+test = false
+bench = false
+
+[[bin]]
+# The virtio-i2c controller driver. Its request building is `src/i2c.rs` and the SMBus transactions it
+# composes are `src/smbus.rs`, both part of the library and host-tested; this binary is the queue and the
+# address-scoped connections.
+name = "virtio_i2c"
+path = "src/virtio_i2c.rs"
+test = false
+bench = false
+
+[[bin]]
+# The virtio-gpio controller driver. Each line's one-event cycle is `src/gpio.rs`, part of the library and
+# host-tested; this binary is the two queues and the line-scoped connections.
+name = "virtio_gpio"
+path = "src/virtio_gpio.rs"
 test = false
 bench = false
 

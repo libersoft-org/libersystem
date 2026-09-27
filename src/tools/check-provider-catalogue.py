@@ -23,6 +23,7 @@ FIXTURE = r'''
 extern crate alloc;
 use std::{cell::RefCell, collections::{HashMap, HashSet}};
 use driver_binding::{BindingId, ProviderId};
+use service_logic::catalogue_scope::Scope;
 use proto::system::provider_catalogue::Service;
 mod proto { pub mod system {
     pub use device_proto::generated::liber::device::v1::*;
@@ -82,7 +83,7 @@ fn recv_caps_blocking(_: u64, out: &mut [u8]) -> ReceivedCaps { RT.with_borrow(|
     out[..rt.request.len()].copy_from_slice(&rt.request);
     ReceivedCaps::Message { len: rt.request.len(), handles: wire::Handles::new() }
 }) }
-fn open_subscription(_: u64, _: &mut Catalogue, _: &[Node], _: &[u8], _: &mut wire::Handles) {
+fn open_subscription(_: u64, _: Scope, _: &mut Catalogue, _: &[Node], _: &[u8], _: &mut wire::Handles) {
     panic!("subscription is covered by the manager progress gate");
 }
 struct Entry { name: &'static [u8], provides: &'static [(u16, u16, u16)] }
@@ -94,7 +95,7 @@ static PORTS: Entry = Entry { name: b"ports", provides: &[(driver_protocol::prov
 struct Binding { channel: u64 }
 struct Node { id: BindingId, binding: Option<Binding>, declared: &'static Entry }
 impl Node { fn entry(&self) -> Option<&'static Entry> { Some(self.declared) } }
-struct CatalogueView<'a> { catalogue: &'a mut Catalogue, nodes: &'a [Node] }
+struct CatalogueView<'a> { catalogue: &'a mut Catalogue, nodes: &'a [Node], scope: Scope }
 impl Service for CatalogueView<'_> {
     fn bindings(&mut self) -> Vec<proto::system::BindingRecord> { vec![] }
     fn subscribe(&mut self, _: proto::system::ProviderKind) -> Vec<proto::system::ProviderInfo> { vec![] }
@@ -115,7 +116,11 @@ fn request_open(info: &proto::system::ProviderInfo, fail: bool) {
     RT.with_borrow_mut(|rt| { rt.request = request; rt.fail_reply = fail; });
 }
 fn serve(catalogue: &mut Catalogue, nodes: &[Node], clients: &mut CatalogueClients, root: bool) {
-    assert!(unsafe { serve_catalogue_once(1, root, clients, catalogue, nodes, &mut [0; 512]) });
+    // The root is served read-only, as production serves it, and a minted client with every kind, which
+    // is what these publication and delivery regressions ask of it: what a scope admits is the
+    // service-logic suite's to prove.
+    let scope = if root { Scope::inventory() } else { Scope::unrestricted() };
+    assert!(unsafe { serve_catalogue_once(1, root, scope, clients, catalogue, nodes, &mut [0; 512]) });
 }
 fn refund_departure(catalogue: &mut Catalogue, id: BindingId, token: u16, client: u64) {
     assert!(RT.with_borrow(|rt| rt.closed.contains(&client)), "the driver can observe departure only after the manager closes the undelivered client");
@@ -130,13 +135,13 @@ fn failed_offered_and_minted_replies_return_the_concurrent_allowance() {
         let (_, offered) = publish(&mut catalogue, nodes[0].id, entry, 7, driver_protocol::provider::BLOCK);
         let info = provider_info_wire(catalogue.entries[0].as_ref().unwrap(), true);
         if std::ptr::eq(entry, &DOUBLE) {
-            assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(info.clone()).is_ok());
+            assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(info.clone()).is_ok());
         }
         request_open(&info, true); serve(&mut catalogue, &nodes, &mut clients, false);
         let closed = RT.with_borrow(|rt| *rt.closed.last().expect("failed reply endpoint must be closed"));
         if std::ptr::eq(entry, &SINGLE) { assert_eq!(closed, offered); }
         refund_departure(&mut catalogue, nodes[0].id, 7, closed);
-        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(info).is_ok(), "the next client must reuse the allowance");
+        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(info).is_ok(), "the next client must reuse the allowance");
     }
 }
 #[test]
@@ -233,19 +238,19 @@ fn retired_departures_cannot_refund_replacement_or_new_generation() {
         let token = if unopened { 9 } else { 7 };
         let (_, offered) = publish(&mut catalogue, id, &SINGLE, token, driver_protocol::provider::BLOCK);
         let info = provider_info_wire(catalogue.entries[0].as_ref().unwrap(), true);
-        if !unopened { assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(info).is_ok()); }
+        if !unopened { assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(info).is_ok()); }
         unsafe { catalogue.withdraw(id, token); }
         if unopened { assert!(RT.with_borrow(|rt| rt.closed.contains(&offered))); }
         assert_eq!(publish(&mut catalogue, id, &SINGLE, token, driver_protocol::provider::BLOCK).0, 0);
         assert_eq!(publish(&mut catalogue, id, &SINGLE, token + 1, driver_protocol::provider::BLOCK).0, 1);
         let replacement = provider_info_wire(catalogue.entries[0].as_ref().unwrap(), true);
-        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(replacement.clone()).is_ok());
+        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(replacement.clone()).is_ok());
         if !unopened { close(offered); }
         catalogue.disconnected(id, token);
         assert_eq!(catalogue.entries[0].as_ref().unwrap().consumers, 1);
-        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(replacement.clone()).is_err());
+        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(replacement.clone()).is_err());
         catalogue.disconnected(id, token + 1);
-        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(replacement).is_ok());
+        assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(replacement).is_ok());
         unsafe { catalogue.withdraw_binding(id); }
         assert_eq!(publish(&mut catalogue, id, &SINGLE, token, driver_protocol::provider::BLOCK).0, 0);
     }
@@ -253,10 +258,10 @@ fn retired_departures_cannot_refund_replacement_or_new_generation() {
     nodes[0].id = BindingId::new(0, 1, 0, 2);
     assert_eq!(publish(&mut catalogue, nodes[0].id, &SINGLE, 7, driver_protocol::provider::BLOCK).0, 1);
     let replacement = provider_info_wire(catalogue.entries[0].as_ref().unwrap(), true);
-    assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(replacement.clone()).is_ok());
+    assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(replacement.clone()).is_ok());
     catalogue.disconnected(id, 7);
     assert!(unsafe { catalogue.withdraw(id, 7) }.is_none());
-    assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes }.open(replacement).is_err());
+    assert!(CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::unrestricted() }.open(replacement).is_err());
 }
 #[test]
 fn token_history_allocation_failure_closes_offer_without_spending_token_or_slot() {
@@ -312,7 +317,7 @@ def main() -> None:
     }
     with tempfile.TemporaryDirectory(prefix="liber-provider-catalogue-") as directory:
         path = Path(directory)
-        dependencies = {"driver-binding": "src/user/libs/driver/binding", "driver-protocol": "src/user/libs/driver/protocol", "device-proto": "src/user/libs/protocol/device-proto", "wire": "src/wire"}
+        dependencies = {"driver-binding": "src/user/libs/driver/binding", "driver-protocol": "src/user/libs/driver/protocol", "device-proto": "src/user/libs/protocol/device-proto", "wire": "src/wire", "service-logic": "src/user/services/logic"}
         manifest = '[package]\nname="provider-catalogue-regressions"\nedition="2024"\n[lib]\npath="tests.rs"\n[features]\ndevelopment=[]\n[dependencies]\n'
         manifest += "".join(f'{name}={{path="{ROOT / relative}"}}\n' for name, relative in dependencies.items())
         (path / "Cargo.toml").write_text(manifest)

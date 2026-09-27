@@ -419,6 +419,36 @@ pub mod tsc {
 	}
 }
 
+// ----------------------------------------------------------------------- ioports
+// PORT I/O: THIS MACHINE HAS NO PORT SPACE - every device register is memory - so no row ever carries a
+// port resource, nothing is ever granted, and there is no bitmap to load. The portable kernel calls these
+// on every port; each answers the one thing that is true here.
+pub mod ioports {
+	use crate::object::process::Process;
+
+	pub fn supported() -> bool {
+		false
+	}
+
+	pub fn switch_in(_process: &Process) {}
+
+	pub fn switch_to_idle() {}
+
+	pub fn service() {}
+
+	pub fn reload_if_running(_process: &Process) {}
+
+	pub fn firmware_blocks(_out: &mut [(u16, u16); 16]) -> usize {
+		0
+	}
+
+	pub fn function_ports(_bus: u8, _dev: u8, _func: u8, _vendor: u16, _product: u16, _out: &mut [abi::PortResource; abi::MAX_PORT_RESOURCES]) -> usize {
+		0
+	}
+
+	pub fn set_io_decode(_bus: u8, _dev: u8, _func: u8, _on: bool) {}
+}
+
 // --------------------------------------------------------------------- rtc
 pub mod rtc {
 	// QEMU virt exposes a Goldfish RTC (device tree "rtc@101000"): TIME_LOW then

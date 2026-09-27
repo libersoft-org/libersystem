@@ -14,6 +14,13 @@
 // streams transitions live without allowing client backpressure to stall input, and
 // synchronously suppresses the cooked console while the graphical surface has focus.
 //
+// GAMEPADS are followed rather than taken once: the catalogue subscription for the `gamepad` kind stays
+// open, every live provider of it is adopted (up to four) and every withdrawn one dropped, and each
+// gamepad on them gets an id of this service's own. Who sees them is decided here and nowhere else - a
+// graphical application holding display focus through `subscribe-gamepads`, or a console program granted
+// `input-gamepad` through `observe-gamepads` while no surface holds focus - and a protected session
+// closes both.
+//
 // When the supervisor that started it drops the bootstrap channel (no clients this
 // boot), the service exits.
 
@@ -22,14 +29,16 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use driver_protocol::gamepad as pad_wire;
 use ipc_client::ChannelTransport;
 use keys::KeyState;
 use proto::codec::Handles;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
 use proto::system::input_trusted;
-use proto::system::{ContactEvent, Error, KeyEvent, PointerEvent, ProviderKind, TrustedInput, TrustedInputKind, provider_catalogue};
+use proto::system::{ContactEvent, Error, Gamepad, GamepadAxis, GamepadEvent, GamepadState, KeyEvent, PointerEvent, ProviderInfo, ProviderKind, TrustedInput, TrustedInputKind, provider_catalogue};
 use rt::*;
 use service_logic::trusted_keys::{Arming, Seen, Watch};
 use services::capability_names::*;
@@ -57,6 +66,15 @@ const RAW_CONTACT_LEN: usize = 6;
 // not cannot hold this service - which DisplayService is synchronously waiting on. See
 // `notify_console`.
 const CONSOLE_NOTICE_TICKS: u64 = 10;
+// THE GAMEPAD BOUNDS: providers adopted, and gamepads tracked across all of them.
+const MAX_GAMEPAD_PROVIDERS: usize = 4;
+const MAX_GAMEPADS: usize = 8;
+// A STREAM'S PENDING STATES ARE RETRIED ON THIS DEADLINE, on a housekeeping wait: one tick. The loop cannot
+// wait for room in a channel it writes, and a reader that never drains must not keep a settling scheduler
+// from settling.
+const GAMEPAD_RETRY_TICKS: u64 = 1;
+// The largest frame of a gamepad stream - a `present` with every count at its most - with room over.
+const GAMEPAD_FRAME: usize = 256;
 
 // The recent pointer events, mapped to the text-cell grid - the bounded source a
 // `subscribe` stream snapshots.
@@ -77,6 +95,228 @@ struct Input {
 	/// A PROTECTED SESSION IS UP: nothing on the ordinary path is delivered anywhere - no key, no contact, no
 	/// pointer event - and the cooked console is suppressed, until AdminService ends it.
 	protected: bool,
+	gamepads: Gamepads,
+}
+
+// ONE GAMEPAD PROVIDER: its publication, and the connection its frames arrive on.
+struct PadSource {
+	info: ProviderInfo,
+	chan: u64,
+}
+
+// ONE GAMEPAD, keyed by the connection it arrived on and the publisher's handle for it - two controllers both
+// numbering from one cannot collide - and known to consumers by the id this service gave it.
+struct Pad {
+	id: u32,
+	source: u64,
+	handle: u32,
+	shape: pad_wire::Shape,
+	state: pad_wire::State,
+}
+
+impl Pad {
+	fn record(&self) -> Gamepad {
+		Gamepad { id: self.id, label: String::from_utf8_lossy(self.shape.label()).into_owned(), axes: self.shape.axes().iter().map(|axis| GamepadAxis { usage: axis.usage, minimum: axis.minimum, maximum: axis.maximum }).collect(), buttons: self.shape.buttons(), hats: self.shape.hats() }
+	}
+
+	fn event(&self, state: &pad_wire::State) -> GamepadEvent {
+		GamepadEvent::State(GamepadState { id: self.id, buttons: state.buttons, hats: state.hats[..self.shape.hats() as usize].to_vec(), axes: state.axes[..self.shape.axes().len()].to_vec() })
+	}
+
+	// What a reader is left holding when the stream goes: nothing pressed, every hat centred, the axes where
+	// they are.
+	fn released(&self) -> pad_wire::State {
+		pad_wire::State { buttons: 0, hats: [pad_wire::CENTRED; pad_wire::MAX_HATS as usize], axes: self.state.axes }
+	}
+
+	fn holds_anything(&self) -> bool {
+		self.state.buttons != 0 || self.state.hats.iter().any(|hat| *hat != pad_wire::CENTRED)
+	}
+}
+
+// THE GAMEPADS A STREAM IS OWED A STATE OF, oldest first: at most one entry per gamepad, so at most
+// `MAX_GAMEPADS`. A FIXED LIST AND NOT A VECTOR OF IDS: a `Vec<u32>`'s growth routine is a generic this program
+// would import from whichever shared library happens to export it first, which is a provider it does not
+// declare.
+#[derive(Default)]
+struct Owed {
+	ids: [u32; MAX_GAMEPADS],
+	len: usize,
+}
+
+impl Owed {
+	fn first(&self) -> Option<u32> {
+		(self.len > 0).then(|| self.ids[0])
+	}
+
+	fn contains(&self, id: u32) -> bool {
+		self.ids[..self.len].contains(&id)
+	}
+
+	fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+
+	fn push(&mut self, id: u32) {
+		if self.len < MAX_GAMEPADS && !self.contains(id) {
+			self.ids[self.len] = id;
+			self.len += 1;
+		}
+	}
+
+	fn pop_first(&mut self) {
+		if self.len > 0 {
+			self.ids.copy_within(1..self.len, 0);
+			self.len -= 1;
+		}
+	}
+
+	fn remove(&mut self, id: u32) {
+		if let Some(at) = self.ids[..self.len].iter().position(|held| *held == id) {
+			self.ids.copy_within(at + 1..self.len, at);
+			self.len -= 1;
+		}
+	}
+}
+
+// How one frame of a gamepad stream went.
+enum Fed {
+	Went,
+	Full,
+	Gone,
+}
+
+// ONE GAMEPAD STREAM, and the gamepads whose state it is owed: AT MOST ONE PER GAMEPAD, and what goes when
+// there is room is that gamepad's state at that moment - so a reader that falls behind is sent fewer
+// intermediate states and never a stale last one.
+struct PadStream {
+	owner: u64,
+	producer: u64,
+	seq: u32,
+	pending: Owed,
+}
+
+impl PadStream {
+	// One frame, never blocking. A full channel is not a gone reader: the caller decides what a full one means.
+	fn feed(&mut self, event: &GamepadEvent) -> Fed {
+		let mut frame: [u8; GAMEPAD_FRAME] = [0; GAMEPAD_FRAME];
+		let mut frame_handles = Handles::new();
+		let Some(len) = input::subscribe_gamepads_frame(self.seq, event, &mut frame, &mut frame_handles) else { return Fed::Gone };
+		match try_send_outcome(self.producer, &frame[..len], 0) {
+			SendOutcome::Delivered => {
+				self.seq = self.seq.wrapping_add(1);
+				Fed::Went
+			}
+			SendOutcome::Stalled => Fed::Full,
+			SendOutcome::Failed => Fed::Gone,
+		}
+	}
+
+	// What the stream is owed, oldest first, as room allows. `false` when its reader is gone.
+	fn flush(&mut self, pads: &[Pad]) -> bool {
+		while let Some(id) = self.pending.first() {
+			let Some(pad) = pads.iter().find(|pad| pad.id == id) else {
+				self.pending.pop_first();
+				continue;
+			};
+			match self.feed(&pad.event(&pad.state)) {
+				Fed::Went => {
+					self.pending.pop_first();
+				}
+				Fed::Full => return true,
+				Fed::Gone => return false,
+			}
+		}
+		true
+	}
+
+	// One gamepad's current state, after what the stream is owed - and owed itself when there is no room.
+	// `false` when the reader is gone.
+	fn offer_state(&mut self, pads: &[Pad], id: u32) -> bool {
+		if !self.flush(pads) {
+			return false;
+		}
+		if self.pending.contains(id) {
+			return true;
+		}
+		if !self.pending.is_empty() {
+			self.pending.push(id);
+			return true;
+		}
+		let Some(pad) = pads.iter().find(|pad| pad.id == id) else { return true };
+		match self.feed(&pad.event(&pad.state)) {
+			Fed::Went => true,
+			Fed::Full => {
+				self.pending.push(id);
+				true
+			}
+			Fed::Gone => false,
+		}
+	}
+
+	// A `present`, an `arrived` or a `departed`: NEVER COALESCED, and sent only after everything the stream is
+	// owed. `false` when it could not all go, and the stream then closes - a reader missing one of these holds
+	// the wrong set of gamepads.
+	fn offer_whole(&mut self, pads: &[Pad], event: &GamepadEvent) -> bool {
+		if !self.flush(pads) || !self.pending.is_empty() {
+			return false;
+		}
+		matches!(self.feed(event), Fed::Went)
+	}
+
+	// Close the stream - releasing to it first, when asked, every gamepad holding a button or a hat off centre
+	// and every one it is owed a state of: the release replaces that pending state. A reader that cannot take a
+	// release sees the stream close, and a closed stream means every gamepad it carried is released and gone.
+	fn close(mut self, pads: &[Pad], release: bool) {
+		if release {
+			for pad in pads {
+				if (self.pending.contains(pad.id) || pad.holds_anything()) && !matches!(self.feed(&pad.event(&pad.released())), Fed::Went) {
+					break;
+				}
+			}
+		}
+		close(self.producer);
+	}
+}
+
+// A new stream for `service`'s request `corr`: the reply, then a `present` and a `state` for every gamepad
+// there now. `None` when the reply could not go or the opening could not all be delivered.
+fn open_pad_stream(service: u64, corr: u32, pads: &[Pad]) -> Option<PadStream> {
+	let Some((producer, consumer)) = channel() else {
+		send_blocking(service, &corr.to_le_bytes(), 0);
+		return None;
+	};
+	if !send_blocking(service, &corr.to_le_bytes(), consumer) {
+		close(producer);
+		close(consumer);
+		return None;
+	}
+	let mut stream = PadStream { owner: service, producer, seq: 0, pending: Owed::default() };
+	for pad in pads {
+		if !stream.offer_whole(pads, &GamepadEvent::Present(pad.record())) || !stream.offer_state(pads, pad.id) {
+			close(stream.producer);
+			return None;
+		}
+	}
+	Some(stream)
+}
+
+// Two providers' publications are the same one.
+fn same_publication(a: &ProviderInfo, b: &ProviderInfo) -> bool {
+	a.slot == b.slot && a.provider_generation == b.provider_generation && a.binding_generation == b.binding_generation
+}
+
+// EVERY GAMEPAD, where it came from, and the two streams that may see them: a graphical application's, on its
+// focus proof, and a console program's, while no surface holds focus.
+struct Gamepads {
+	catalogue: u64,
+	/// The `gamepad` catalogue subscription, KEPT OPEN: publications after bootstrap are adopted from it.
+	subscription: u64,
+	sources: Vec<PadSource>,
+	pads: Vec<Pad>,
+	next_id: u32,
+	focused: Option<PadStream>,
+	console: Option<PadStream>,
 }
 
 // THE PROTECTED INPUT PATH: the trusted keyboard's own sink, what it is holding, the session AdminService
@@ -188,6 +428,8 @@ struct ContactStream {
 enum Scope {
 	Full,
 	Keys,
+	/// A console program granted `input-gamepad`: `observe-gamepads` and nothing else.
+	Gamepad,
 }
 
 struct Client {
@@ -205,11 +447,17 @@ impl AdminService for AdminCall<'_> {
 		self.clients.push(Client { chan: server, scope: Scope::Keys });
 		Ok(client)
 	}
+
+	fn open_gamepads(&mut self) -> Result<u64, Error> {
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
+		self.clients.push(Client { chan: server, scope: Scope::Gamepad });
+		Ok(client)
+	}
 }
 
 impl Input {
-	fn new(kill_control: u64) -> Input {
-		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, contact_stream: None, contacts_down: Vec::new(), proof_nonce: 0, chord_held: false, protected: false }
+	fn new(kill_control: u64, gamepads: Gamepads) -> Input {
+		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, contact_stream: None, contacts_down: Vec::new(), proof_nonce: 0, chord_held: false, protected: false, gamepads }
 	}
 
 	// SECURE ATTENTION WAS NOTICED: application key and contact focus is revoked - held keys and contacts
@@ -222,6 +470,9 @@ impl Input {
 		}
 		self.protected = true;
 		self.set_focus(0);
+		// AND BOTH GAMEPAD STREAMS, released and closed exactly as key and contact focus is revoked. The gamepads
+		// are still tracked, so nothing is stuck when the session ends.
+		self.close_console_pads();
 		self.recent.clear();
 		self.notify_console(false, forward);
 	}
@@ -363,10 +614,150 @@ impl Input {
 	fn set_focus(&mut self, peer: u64) {
 		self.close_contact_stream(true);
 		self.close_key_stream(true);
+		// THE FOCUSED GAMEPAD STREAM GOES WITH THE FOCUS, every held button and hat released to it first.
+		if let Some(stream) = self.gamepads.focused.take() {
+			stream.close(&self.gamepads.pads, true);
+		}
 		if self.focus_peer != 0 {
 			close(self.focus_peer);
 		}
 		self.focus_peer = peer;
+	}
+
+	// The console program's gamepad stream, released and closed: a surface took focus, or a protected session
+	// began.
+	fn close_console_pads(&mut self) {
+		if let Some(stream) = self.gamepads.console.take() {
+			stream.close(&self.gamepads.pads, true);
+		}
+	}
+
+	// Every wake: what the gamepad streams are owed, as room allows. A stream whose reader is gone is dropped.
+	fn flush_pads(&mut self) {
+		let pads = &self.gamepads.pads;
+		for slot in [&mut self.gamepads.focused, &mut self.gamepads.console] {
+			if let Some(stream) = slot.as_mut()
+				&& !stream.flush(pads)
+				&& let Some(gone) = slot.take()
+			{
+				close(gone.producer);
+			}
+		}
+	}
+
+	fn pads_pending(&self) -> bool {
+		self.gamepads.focused.as_ref().is_some_and(|stream| !stream.pending.is_empty()) || self.gamepads.console.as_ref().is_some_and(|stream| !stream.pending.is_empty())
+	}
+
+	// A PUBLISHED GAMEPAD PROVIDER, adopted - up to four, and never twice.
+	fn adopt_pad_source(&mut self, info: ProviderInfo) {
+		if self.gamepads.sources.iter().any(|source| same_publication(&source.info, &info)) {
+			return;
+		}
+		if self.gamepads.sources.len() >= MAX_GAMEPAD_PROVIDERS {
+			print(b"InputService: a gamepad provider was refused: this service adopts four\n");
+			return;
+		}
+		match provider_catalogue::Client::new(ChannelTransport { chan: self.gamepads.catalogue }).open(&info) {
+			Some(Ok(chan)) => self.gamepads.sources.push(PadSource { info, chan }),
+			_ => print(b"InputService: a published gamepad provider could not be opened\n"),
+		}
+	}
+
+	// A PROVIDER IS GONE - withdrawn, or its connection closed - and every one of its gamepads departs. A closed
+	// connection is not opened again: the publisher never closes one, so the driver's end is gone, and its
+	// replacement is a publication of its own.
+	fn lose_pad_source(&mut self, chan: u64) {
+		let Some(at) = self.gamepads.sources.iter().position(|source| source.chan == chan) else { return };
+		let source = self.gamepads.sources.remove(at);
+		close(source.chan);
+		// One at a time, because each departure changes the table it was found in.
+		while let Some(handle) = self.gamepads.pads.iter().find(|pad| pad.source == chan).map(|pad| pad.handle) {
+			self.pad_departed(chan, handle);
+		}
+	}
+
+	// One frame from a provider. A frame the wire refuses, a STATE for a gamepad this provider does not hold or
+	// of another shape, and a second ARRIVAL for a handle held change nothing.
+	fn pad_frame(&mut self, chan: u64, bytes: &[u8]) {
+		match pad_wire::decode(bytes) {
+			Some(pad_wire::Frame::Arrival { handle, shape }) => self.pad_arrived(chan, handle, shape),
+			Some(pad_wire::Frame::State(frame)) => self.pad_state(chan, &frame),
+			Some(pad_wire::Frame::Departure { handle }) => self.pad_departed(chan, handle),
+			None => {}
+		}
+	}
+
+	fn pad_arrived(&mut self, source: u64, handle: u32, shape: pad_wire::Shape) {
+		if self.gamepads.pads.iter().any(|pad| pad.source == source && pad.handle == handle) {
+			return;
+		}
+		if self.gamepads.pads.len() >= MAX_GAMEPADS {
+			print(b"InputService: a gamepad was refused: this service tracks eight\n");
+			return;
+		}
+		let id = self.gamepads.next_id;
+		self.gamepads.next_id = self.gamepads.next_id.wrapping_add(1).max(1);
+		// AT REST UNTIL ITS FIRST REPORT: no buttons, every hat centred, each axis at its midpoint.
+		let pad = Pad { id, source, handle, shape, state: shape.initial() };
+		let arrived = GamepadEvent::Arrived(pad.record());
+		self.gamepads.pads.push(pad);
+		if self.protected {
+			return;
+		}
+		let pads = &self.gamepads.pads;
+		for slot in [&mut self.gamepads.focused, &mut self.gamepads.console] {
+			if let Some(stream) = slot.as_mut()
+				&& !(stream.offer_whole(pads, &arrived) && stream.offer_state(pads, id))
+				&& let Some(stream) = slot.take()
+			{
+				stream.close(pads, true);
+			}
+		}
+	}
+
+	fn pad_state(&mut self, source: u64, frame: &pad_wire::StateFrame) {
+		let Some(at) = self.gamepads.pads.iter().position(|pad| pad.source == source && pad.handle == frame.handle) else { return };
+		let Some(state) = self.gamepads.pads[at].shape.state(frame) else { return };
+		if self.gamepads.pads[at].state == state {
+			return;
+		}
+		self.gamepads.pads[at].state = state;
+		// TRACKED WHILE A PROTECTED SESSION IS UP, and delivered nowhere.
+		if self.protected {
+			return;
+		}
+		let id = self.gamepads.pads[at].id;
+		let pads = &self.gamepads.pads;
+		for slot in [&mut self.gamepads.focused, &mut self.gamepads.console] {
+			if let Some(stream) = slot.as_mut()
+				&& !stream.offer_state(pads, id)
+				&& let Some(gone) = slot.take()
+			{
+				close(gone.producer);
+			}
+		}
+	}
+
+	fn pad_departed(&mut self, source: u64, handle: u32) {
+		let Some(at) = self.gamepads.pads.iter().position(|pad| pad.source == source && pad.handle == handle) else { return };
+		let pad = self.gamepads.pads.remove(at);
+		if self.protected {
+			return;
+		}
+		let pads = &self.gamepads.pads;
+		for slot in [&mut self.gamepads.focused, &mut self.gamepads.console] {
+			// A DEPARTING GAMEPAD'S PENDING STATE IS DROPPED FIRST: the reader releases it whole.
+			if let Some(stream) = slot.as_mut() {
+				stream.pending.remove(pad.id);
+			}
+			if let Some(stream) = slot.as_mut()
+				&& !stream.offer_whole(pads, &GamepadEvent::Departed(pad.id))
+				&& let Some(stream) = slot.take()
+			{
+				stream.close(pads, true);
+			}
+		}
 	}
 
 	// Tell ConsoleService whether the graphical surface holds the keyboard.
@@ -437,6 +828,19 @@ impl input::Service for Input {
 		if focus != 0 {
 			close(focus);
 		}
+		Vec::new()
+	}
+
+	// AND THE TWO GAMEPAD STREAMS, served live off the serve loop by `stream_subscribe_gamepads` and
+	// `stream_observe_gamepads` for the same reason.
+	fn subscribe_gamepads(&mut self, focus: u64) -> Vec<GamepadEvent> {
+		if focus != 0 {
+			close(focus);
+		}
+		Vec::new()
+	}
+
+	fn observe_gamepads(&mut self) -> Vec<GamepadEvent> {
 		Vec::new()
 	}
 }
@@ -707,6 +1111,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// A TOUCH SURFACE IS ITS OWN KIND, discovered the same way. A machine with none has none, which
 	// is what a zero handle already says.
 	let touch: u64 = take_published_pointer(catalogue, &ProviderKind::Touch);
+	// GAMEPADS ARE FOLLOWED, NOT TAKEN ONCE: this subscription stays open, and every gamepad provider it
+	// announces - at bootstrap or later - is adopted from it in the serve loop.
+	let pad_subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Gamepad).unwrap_or(0) } else { 0 };
 	// The Bluetooth slot starts empty and asks the broker once this service is online - see `Bluetooth`.
 	let mut bluetooth = Bluetooth { broker: bootstrap, profile: 0, stream: 0, pointer: service_logic::hogp::Pointer::new(), retry_at: clock(), resolving: false, refused: false };
 
@@ -716,7 +1123,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 3. serve until the client side closes.
-	let mut state: Input = Input::new(kill);
+	let mut state: Input = Input::new(kill, Gamepads { catalogue, subscription: pad_subscription, sources: Vec::new(), pads: Vec::new(), next_id: 1, focused: None, console: None });
 	let mut trusted = Trusted { watch: Watch::new(), arming: Arming::Off, producer: 0, seq: 0, protected: false };
 	serve(service, admin, [raw, raw2], touch, forward, keys, focus, [trusted_keys, trusted_root], &mut trusted, &mut bluetooth, &mut state);
 	exit();
@@ -737,7 +1144,10 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 	let mut focus_open: bool = focus != 0;
 	let mut trusted_keys_open: bool = trusted_keys != 0;
 	let mut trusted_open: bool = trusted_root != 0;
+	let mut pad_buf: [u8; GAMEPAD_FRAME] = [0; GAMEPAD_FRAME];
 	loop {
+		// EVERY WAKE SENDS WHAT THE GAMEPAD STREAMS ARE OWED, as room allows.
+		state.flush_pads();
 		let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 5);
 		if focus_open {
 			waitset.push(focus);
@@ -772,11 +1182,21 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 		if trusted.producer != 0 {
 			waitset.push(trusted.producer);
 		}
+		// THE GAMEPAD SUBSCRIPTION, EVERY GAMEPAD PROVIDER, and both gamepad streams - whose readers going away
+		// is noticed here rather than at the next frame.
+		if state.gamepads.subscription != 0 {
+			waitset.push(state.gamepads.subscription);
+		}
+		waitset.extend(state.gamepads.sources.iter().map(|source| source.chan));
+		waitset.extend(state.gamepads.focused.iter().chain(state.gamepads.console.iter()).map(|stream| stream.producer));
 		waitset.extend(clients.iter().map(|client| client.chan));
 		// A BLUETOOTH SLOT WITH NOTHING OPEN WAKES THIS LOOP ON ITS RETRY DEADLINE - unless a resolve is
 		// already in flight, whose answer wakes it instead, or the broker has refused the name.
 		let pending_retry: bool = bluetooth.stream == 0 && !bluetooth.resolving && bluetooth.wanted();
-		let ready: i64 = wait_any(&waitset, if pending_retry { bluetooth.retry_at } else { 0 });
+		// AND A GAMEPAD STREAM OWED A STATE WAKES IT A TICK LATER, on a HOUSEKEEPING wait: a reader that never
+		// drains must not keep a settling scheduler from settling.
+		let pad_retry: u64 = if state.pads_pending() { clock() + GAMEPAD_RETRY_TICKS } else { 0 };
+		let ready: i64 = if pad_retry != 0 && (!pending_retry || pad_retry < bluetooth.retry_at) { wait_any_periodic(&waitset, pad_retry) } else { wait_any(&waitset, if pending_retry { bluetooth.retry_at } else { 0 }) };
 		if pending_retry && clock() >= bluetooth.retry_at {
 			bluetooth.retry();
 		}
@@ -870,6 +1290,67 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 			bluetooth.answered();
 			continue;
 		}
+		if state.gamepads.subscription != 0 && ready_handle == state.gamepads.subscription {
+			loop {
+				let (len, handles) = match try_recv_caps(state.gamepads.subscription, &mut pad_buf) {
+					PolledCaps::Message { len, handles } => (len, handles),
+					PolledCaps::Empty => break,
+					PolledCaps::Closed => {
+						close(state.gamepads.subscription);
+						state.gamepads.subscription = 0;
+						break;
+					}
+				};
+				for &leftover in handles.as_slice() {
+					close(leftover);
+				}
+				let mut frame_handles = wire::Handles::new();
+				let Some(info) = provider_catalogue::subscribe_read(&pad_buf[..len], &mut frame_handles) else { continue };
+				if info.live {
+					state.adopt_pad_source(info);
+				} else if let Some(chan) = state.gamepads.sources.iter().find(|source| same_publication(&source.info, &info)).map(|source| source.chan) {
+					state.lose_pad_source(chan);
+				}
+			}
+			continue;
+		}
+		if state.gamepads.sources.iter().any(|source| source.chan == ready_handle) {
+			loop {
+				match try_recv(ready_handle, &mut pad_buf) {
+					Polled::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						state.pad_frame(ready_handle, &pad_buf[..len]);
+					}
+					Polled::Empty => break,
+					Polled::Closed => {
+						state.lose_pad_source(ready_handle);
+						break;
+					}
+				}
+			}
+			continue;
+		}
+		// A GAMEPAD STREAM'S READER WENT AWAY: the stream is dropped, with nobody left to release anything to.
+		let mut was_pad_stream = false;
+		for slot in [&mut state.gamepads.focused, &mut state.gamepads.console] {
+			if slot.as_ref().is_some_and(|stream| stream.producer == ready_handle) {
+				was_pad_stream = true;
+				match try_recv(ready_handle, &mut pad_buf) {
+					Polled::Closed => {
+						if let Some(gone) = slot.take() {
+							close(gone.producer);
+						}
+					}
+					Polled::Message { handle, .. } if handle != 0 => close(handle),
+					_ => {}
+				}
+			}
+		}
+		if was_pad_stream {
+			continue;
+		}
 		if bluetooth.stream != 0 && ready_handle == bluetooth.stream {
 			let mut frame_buf: [u8; 64] = [0u8; 64];
 			bluetooth.drain(state, forward, &mut frame_buf);
@@ -880,6 +1361,9 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 				Received::Message { len, handle } if len >= 3 && &req[..3] == b"SET" && handle != 0 => {
 					state.notify_console(false, forward);
 					state.set_focus(handle);
+					// A SURFACE TOOK FOCUS: a console program's gamepad stream is released and closed, so a
+					// background program cannot watch a game's input.
+					state.close_console_pads();
 					true
 				}
 				Received::Message { len, handle } if len >= 7 && &req[..7] == b"CONSOLE" => {
@@ -1012,10 +1496,14 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 					}
 				} else if op == input::OP_SUBSCRIBE && scope == Scope::Full {
 					stream_subscribe(client, &req[..len], state);
-				} else if op == input::OP_SUBSCRIBE_KEYS {
+				} else if op == input::OP_SUBSCRIBE_KEYS && scope != Scope::Gamepad {
 					stream_subscribe_keys(client, &req[..len], &mut handle, state);
-				} else if op == input::OP_SUBSCRIBE_CONTACTS {
+				} else if op == input::OP_SUBSCRIBE_CONTACTS && scope != Scope::Gamepad {
 					stream_subscribe_contacts(client, &req[..len], &mut handle, state);
+				} else if op == input::OP_SUBSCRIBE_GAMEPADS && scope != Scope::Gamepad {
+					stream_subscribe_gamepads(client, &req[..len], &mut handle, state);
+				} else if op == input::OP_OBSERVE_GAMEPADS && scope == Scope::Gamepad {
+					stream_observe_gamepads(client, &req[..len], state);
 				} else if len >= 6 {
 					send_blocking(client, &req[2..6], 0);
 				}
@@ -1029,6 +1517,13 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 				}
 				if state.key_stream.as_ref().is_some_and(|stream| stream.owner == client) {
 					state.close_key_stream(false);
+				}
+				for slot in [&mut state.gamepads.focused, &mut state.gamepads.console] {
+					if slot.as_ref().is_some_and(|stream| stream.owner == client)
+						&& let Some(gone) = slot.take()
+					{
+						close(gone.producer);
+					}
 				}
 				if client_index == 0 {
 					return;
@@ -1091,6 +1586,42 @@ fn stream_subscribe_contacts(service: u64, request: &[u8], request_handle: &mut 
 		close(producer);
 		close(consumer);
 	}
+}
+
+// THE GAMEPADS OF A GRAPHICAL APPLICATION, on the same one-shot proof `subscribe-keys` takes and with the
+// same refusal - the correlation id and no capability. One stream is live: a valid subscription replaces it,
+// the old one released first. Refused while a protected session is up.
+fn stream_subscribe_gamepads(service: u64, request: &[u8], request_handle: &mut u64, state: &mut Input) {
+	if request.len() != 10 || *request_handle == 0 {
+		return;
+	}
+	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+	let proof: u64 = core::mem::take(request_handle);
+	let valid: bool = !state.protected && state.validate_focus(proof);
+	close(proof);
+	if !valid {
+		send_blocking(service, &corr.to_le_bytes(), 0);
+		return;
+	}
+	if let Some(old) = state.gamepads.focused.take() {
+		old.close(&state.gamepads.pads, true);
+	}
+	state.gamepads.focused = open_pad_stream(service, corr, &state.gamepads.pads);
+}
+
+// THE GAMEPADS OF A CONSOLE PROGRAM, on its gamepad-scope connection: refused while a graphical surface holds
+// focus, while a protected session is up, and while another console stream is open - which it is never
+// displaced by.
+fn stream_observe_gamepads(service: u64, request: &[u8], state: &mut Input) {
+	if request.len() != 6 {
+		return;
+	}
+	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+	if state.protected || state.focus_peer != 0 || state.gamepads.console.is_some() {
+		send_blocking(service, &corr.to_le_bytes(), 0);
+		return;
+	}
+	state.gamepads.console = open_pad_stream(service, corr, &state.gamepads.pads);
 }
 
 // Serve one `subscribe` request: gather the bounded snapshot, then stream the mapped

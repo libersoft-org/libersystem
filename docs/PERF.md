@@ -4,6 +4,35 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## The port permission bitmap on every thread switch (2026-09-28)
+
+Port I/O became a capability: every core's TSS carries an 8 KiB I/O permission bitmap, and on every switch to
+a thread the core compares the incoming process and that process's generation with what it loaded last. A
+process with no mapped range gets the map base past the TSS limit and nothing is copied; a process holding a
+range has the bitmap's words up to its highest one copied (twelve words for the second UART at 0x2F8, sixteen
+for COM1), and every word an earlier copy wrote past them is set back to all ones.
+
+HOW IT WAS MEASURED. A thread ping-pong: two kernel threads of two processes on one core, each yielding to the
+other 20,000 times, so 40,000 switches, timed with the TSC; x86_64 under KVM, four vCPUs, the test kernel -
+which is built unoptimised, as the shipping kernel is (`build.sh` builds the kernel with plain `cargo build`),
+so these are the costs the product pays. BEFORE is the tree without any of this, five passes; AFTER is
+`kernel.object.port_range.a_thread_switch_is_measured_with_and_without_a_mapped_range`, the best of three.
+
+| | ns per switch |
+|---|---|
+| before the change | 667 (passes: 667, 667, 654, 683, 668) |
+| after, neither process holds a range | 733 |
+| after, one of the two holds eight ports at 0x2F8 | 1,119 |
+
+WHAT THE NUMBERS SAY. With no range anywhere the switch pays the comparison - about 60 ns, nine per cent, on
+an unoptimised kernel where every atomic load is a call. A first cut paid 113 ns; reading the per-core record
+through a GS-relative load instead of an RDMSR of the GS base, keeping the process's id beside its generation
+instead of reaching it through the object header, and forcing the few one-line helpers inline brought it to
+this. With a range held the ping-pong alternates between a switch that copies twelve words and one that sets
+the map base past the limit, which together cost about 770 ns more than two plain switches: the word loop is
+two atomic loads and a volatile store per word, none of them inlined at opt-level 0. Nothing runs that case
+but a process that drives ports; every other process pays the 60 ns.
+
 ## Where a 2D frame's time goes, layer by layer (2026-09-27)
 
 The live 2D demo at 640x480 drew in 79.6 ms and presented every 132.4 ms (the 2026-09-15 row below), and
@@ -46,8 +75,10 @@ which give each term its work and its wait; a drain to the debug serial; and the
 are the intervals between consecutive sites along it, each named by what happens there, so the named terms
 cover the interval and THE RESIDUE IS 0.00 % IN EVERY SHAPE OF EVERY RUN - and the check that the account is
 true is that its totals agree with the demo's own clock: draw and interval within 1 % of the demo's armed
-report in all four accounts. No drain refused, lost or left incomplete a record. NO POOLED ROW: the demo
-has no worker pool yet, so every draw here is soft2d's serial walk on the demo's own thread.
+report in all four accounts. No drain refused, lost or left incomplete a record. THE DRAW IS THE SERIAL
+WALK: these runs were taken before the demo had a worker pool, so every draw here is soft2d's serial walk on
+the demo's own thread - and since the pool is the demo's default, every run of the gate pins `--workers=1`
+and must report one lane, and the pooled row is recorded beside the account (below).
 
 **EACH LAYER'S BUILD PROFILE, from what the image staged** (`conditions-*.tsv` beside each run): the kernel
 and the virtio-gpu driver are `dev` builds at opt-level 0 (cargo's `debug` output, which `image.sh` and
@@ -241,6 +272,23 @@ which is invisible in a frame dominated by drawing and copying and plain in the 
 times longer. No term above five percent of a frame moves, so none is that cost. The primitives above are
 measured in both builds, as the plan requires.
 
+### The pooled row (2026-09-27)
+
+Since 2026-09-27 the demo draws on `rt::pool` by default - one lane per vCPU - so the gate pins every run to
+`--workers=1`, refuses a pinned run that reports more than one lane, and runs the dormant boot's 640x480
+frame once more at the default, whose draw, interval and lanes are recorded beside the account
+(`pooled-row.tsv`) and are not a term of it. The gate's run of 2026-09-27, four vCPUs:
+
+| run | workers | lanes / units | draw mean | interval mean |
+| --- | --- | ---: | ---: | ---: |
+| pinned, the account's serial walk | 1 | 1 / 8 | 60.8 ms | 103.6 ms |
+| pooled | the default | 4 / 80 | 61.9 ms | 104.7 ms |
+
+THE SAME FRAME, because the four lanes run on one vCPU. The pool hands a worker its share by sending it an
+order over a channel, and the kernel queues a woken thread on the WAKER's core and has no load balancer - so
+every worker is queued behind the demo on the demo's own core, and the lanes take turns. The live rows under
+"The 2D demo, live" below measure it directly, and the same holds for the 3D demo's pool.
+
 ### The verdict
 
 THE DOMINANT TERM IS THE DRAW: 62.8 ms, 52 % of a whole frame on the baseline's condition, 71 % of a
@@ -311,6 +359,10 @@ owes two whole frames, so 484 of the 600 frames presented the whole surface, 58 
 rectangles and 58 the two rectangles, every one of them onto the 1280x800 scanout's SCALED path. The account
 above takes it apart per damage shape.
 
+THIS ROW IS ONE LANE - the demo drew on its own thread until 2026-09-27 - and its vCPU count was not
+recorded: `lab.sh boot`'s default is the host's core count, which on this host brings 64 of its 100 cores
+online. The re-measure at both worker counts, with its vCPUs, is under "On the demo's worker pool" below.
+
 Re-measured 2026-09-15 after the three backend changes recorded under `soft2d` below; it was 88.3 ms
 mean and 116.4 ms worst, with a 141.4 ms interval. The demo's own scene gains less than the
 benchmark's does, and the reason is worth knowing: its background is a four-stop CONIC GRADIENT, so
@@ -330,6 +382,34 @@ conditions; this is a live figure with a real display, a real service and a real
 and it is reported separately for that reason. What it is good for beyond the number is the SHAPE:
 the draw is most of the interval, so what the loop waits for is the renderer rather than the display.
 
+### On the demo's worker pool (2026-09-27)
+
+The same command at `--workers=1` - the serial walk - and at the demo's default, one lane per vCPU, in one
+`SMP=4 ./lab.sh boot` guest (headless, x86_64 on KVM), three runs of each alternating over two boots of the
+same drawing code; the median of the three:
+
+| workers | vCPUs | lanes / units | draw mean | draw worst | interval mean | interval worst |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (the serial walk) | 4 | 1 / 8 | 60.1 ms | 80.9 ms | 112.3 ms | 140.9 ms |
+| the default | 4 | 4 / 80 | 61.5 ms | 88.4 ms | 113.4 ms | 151.2 ms |
+
+The runs: draw means 59.9, 60.1 and 61.3 ms on one worker and 62.1, 60.8 and 61.5 on four lanes; intervals
+112.1, 112.3 and 113.2 against 114.4, 112.5 and 113.4. The 2026-09-15 row's 79.6 ms predates the `soft2d`
+changes of 2026-09-19; the account's baseline re-measure above took the same command at 57.7 to 58.9 ms.
+
+**FOUR LANES DRAW NO FASTER THAN ONE, AND IT IS THE SCHEDULER, NOT THE RENDERER.** `rt::pool` gives a worker
+its share by sending it an order over a channel; the kernel queues a woken thread on the WAKER's run queue and
+has no load balancer - a runnable thread stays on the core it was placed on - so every worker of the demo is
+queued on the demo's own core, and the lanes take turns on one vCPU while the other three idle. Measured
+directly, in the same guest: `test2d-sw --offscreen --frames=160 --phase-frames=40 --size=640x480` draws in
+44.5 and 44.5 ms on one worker (8 bands), 44.2 ms on two lanes and 45.6 and 44.8 ms on four (80 tiles); and
+the 3D demo's pool does the same - `test3d-sw --fixed --frames 12 --no-input --width 320 --height 240
+--report` shades its scene in 186.7 ms on one worker and 185.0 ms on four. The picture is the same bits
+either way, which the guest suite checks frame by frame. The host benchmark's pool, whose threads the host
+kernel spreads over its cores, divides the same frames by up to sixteen ("soft2d on several cores", below);
+what would let the guest do the same is a placement decision in the kernel - a started or woken worker put
+on an idle core - which is not the 2D backend's to make.
+
 ### At a HiDPI scale
 
 **The same scene, the same logical layout, every edge resolved at more pixels.** `DisplayService`
@@ -342,6 +422,12 @@ admin channel is part of the harness, by the gate that already runs every phase 
 | --- | --- | --- | ---: | ---: |
 | scale 1:1 | 192x128 | 192x128 | 20.6 ms | 29.6 ms |
 | scale 2:1 | 192x128 | 384x256 | 28.1 ms | 31.0 ms |
+
+These rows and the two tables below were taken on 2026-09-15, when the demo drew on its own thread - ONE
+LANE, the serial walk - in the test harness's guests: four vCPUs on x86_64 and eight on aarch64 and
+riscv64. The same test on x86_64 on 2026-09-27, at the demo's default of four lanes on those four vCPUs,
+reported `draw-mean-us=21444` over its fifteen frames and `scale-draw-mean-us=29958` over the three at 2:1 -
+no faster than one lane, for the reason under "On the demo's worker pool" above: the lanes share one vCPU.
 
 The same pair on the two emulated ports, where four times the pixels costs about twice the time
 rather than 1.4 times - an emulator charges per instruction, and the terms that do not grow with
@@ -681,6 +767,122 @@ that size needs the two structural changes it names - a register-file interprete
 execution - rather than more measurement. Recording the number here, unmet, is what keeps the floor a
 floor.
 
+## soft2d on several cores (2026-09-27)
+
+`soft2d` replays a prepared frame on a WORKER POOL the caller supplies - `soft2d::Workers`, the shape
+`soft3d::frame::Workers` has, so an application holds one pool for both backends - and `Serial`, the
+caller's own thread, is the default and the scalar reference every pool is held to. A frame is cut into
+UNITS, disjoint parts of the target each replayed in the serial order of its own tiles, and every worker
+runs a LANE holding all the scratch a unit writes: the tile, the rasteriser, the layer and mask pools, the
+span buffers, the clip and layer stacks and a filter's node table, each reserved at `prepare` for the list
+it will replay. Lanes cost scratch, so they are charged against the profile's 64 MiB prepared-scratch
+ceiling IN AN ORDER THAT CANNOT CHANGE A PIXEL: the first lane is settled the way the one set of scratch
+always was, with the optional decoded image copies given back against it, and lanes beyond the first are
+fitted only into what is left. A lane never displaces a copy, because keeping or giving back a copy can move
+a pixel - the copy holds its texels at half precision and the direct path decodes each tap at single - so a
+frame can run on fewer lanes than the pool offers, and it says how many: `SoftPrepared::lanes()` and
+`units()`.
+
+So that the lanes share nothing mutable, the replay writes nothing but its lane. A glyph's cache key and
+device origin are worked out at `prepare`, an outline's edges are built there once per placed glyph, and a
+mask or bitmap is held by the prepared list itself - the cache's entries are shared, so an eviction cannot
+take a form a list still draws, and the replay never asks the cache or the provider for anything. Gradient
+ramps and blur kernels are resolved there too. THE REPLAY ALLOCATES NOTHING, and the host suite's counting
+allocator holds it to that: zero allocations in a warmed frame, through the serial walk and through four
+lanes.
+
+### Which unit, measured rather than chosen
+
+Three ways to cut a frame were built and measured:
+
+- BANDS of 64 rows. A band is one contiguous run of the row-major target and can be handed out whole - but a
+  480-row frame has eight (seven that draw, in `image-resample`), and a frame is only as parallel as its
+  units.
+- TILES THROUGH A TILE-MAJOR INTERMEDIATE. Each tile draws into a slot of its own while the target is only
+  read, and the slots are copied into the target once every unit has returned: as many units as tiles that
+  draw, for 16 KiB of intermediate per tile (1.2 MiB at 640x480, charged with the second lane) and a copy on
+  the caller's thread after the parallel part.
+- TILES IN PLACE, through a DISJOINT-RECTANGLE WRITER. Every row of the target is cut into the parts its
+  tiles cover, and each unit holds the parts of its own tile's rows, so it reads and writes its rectangle of
+  the target and no byte of another's: as many units, no intermediate and no copy, for a table of row parts
+  - about 1 KiB per tile, charged with the second lane - and the cut, once per row per frame.
+
+`soft2d-bench --scaling` runs the five frozen scenes at one to sixty-four workers with each kind. The pool is
+the benchmark's own, in `rt::pool`'s shape - threads made once and parked, the caller taking lane zero, units
+handed out by one atomic counter - so a frame's time is the renderer's and not the cost of making threads.
+Same host and build as the frozen table below (Xeon Platinum 8272CL, 100 logical CPUs, the host itself a KVM
+guest; `--release`, `rustc 1.93.1`); five warmup frames and thirty measured per cell with the median kept,
+and the whole run taken THREE TIMES, the table giving the median of the three medians. EVERY CELL'S PICTURE
+IS THE ONE-WORKER PICTURE TO THE BYTE, and the benchmark checks it rather than this file claiming it: a
+difference stops the run. Bold is the fastest of the three at that count; the last column is the in-place
+figure against the serial walk (bands, one worker).
+
+| scene | workers | bands: lanes / units | bands | tiles: lanes / units | through the intermediate | in place | in place, against one worker |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| UI-basic | 1 | 1 / 8 | 11.76 ms | 1 / 8 | 11.79 ms | 11.80 ms | 1.00x |
+|  | 2 | 2 / 8 | 6.34 ms | 2 / 80 | 6.41 ms | **6.13 ms** | 1.92x |
+|  | 4 | 4 / 8 | 3.30 ms | 4 / 80 | 3.94 ms | **3.24 ms** | 3.63x |
+|  | 8 | 8 / 8 | 3.76 ms | 8 / 80 | 2.11 ms | **1.76 ms** | 6.70x |
+|  | 16 | 8 / 8 | 3.99 ms | 16 / 80 | 2.18 ms | **1.57 ms** | 7.51x |
+|  | 32 | 8 / 8 | 4.70 ms | 32 / 80 | 2.42 ms | **2.08 ms** | 5.66x |
+|  | 64 | 8 / 8 | 6.24 ms | 64 / 80 | 2.12 ms | **2.05 ms** | 5.74x |
+| UI-effects | 1 | 1 / 8 | 143.87 ms | 1 / 8 | 144.36 ms | 143.70 ms | 1.00x |
+|  | 2 | 2 / 8 | 75.42 ms | 2 / 80 | **72.67 ms** | 72.75 ms | 1.98x |
+|  | 4 | 4 / 8 | 41.57 ms | 4 / 80 | 36.80 ms | **36.79 ms** | 3.91x |
+|  | 8 | 8 / 8 | 36.17 ms | 8 / 80 | 18.78 ms | **18.65 ms** | 7.72x |
+|  | 16 | 8 / 8 | 36.78 ms | 16 / 80 | 10.17 ms | **10.01 ms** | 14.37x |
+|  | 32 | 8 / 8 | 33.44 ms | 20 / 80 | 10.31 ms | **9.05 ms** | 15.90x |
+|  | 64 | 8 / 8 | 42.17 ms | 20 / 80 | 13.85 ms | **13.60 ms** | 10.58x |
+| vector-stress | 1 | 1 / 8 | 66.13 ms | 1 / 8 | 65.34 ms | 64.65 ms | 1.02x |
+|  | 2 | 2 / 8 | 36.73 ms | 2 / 80 | **33.10 ms** | 33.53 ms | 1.97x |
+|  | 4 | 4 / 8 | 20.76 ms | 4 / 80 | 17.61 ms | **17.30 ms** | 3.82x |
+|  | 8 | 8 / 8 | 20.83 ms | 8 / 80 | 10.62 ms | **9.43 ms** | 7.01x |
+|  | 16 | 8 / 8 | 13.39 ms | 16 / 80 | 5.91 ms | **5.16 ms** | 12.81x |
+|  | 32 | 8 / 8 | 24.74 ms | 32 / 80 | 5.88 ms | **5.09 ms** | 13.00x |
+|  | 64 | 8 / 8 | 25.81 ms | 64 / 80 | 6.83 ms | **6.57 ms** | 10.06x |
+| image-resample | 1 | 1 / 7 | 75.71 ms | 1 / 7 | 75.58 ms | 77.49 ms | 0.98x |
+|  | 2 | 2 / 7 | 41.56 ms | 2 / 70 | **38.86 ms** | 39.42 ms | 1.92x |
+|  | 4 | 4 / 7 | 22.07 ms | 4 / 70 | 20.54 ms | **20.07 ms** | 3.77x |
+|  | 8 | 7 / 7 | 14.29 ms | 8 / 70 | 11.90 ms | **10.98 ms** | 6.89x |
+|  | 16 | 7 / 7 | 17.31 ms | 16 / 70 | 7.98 ms | **7.12 ms** | 10.63x |
+|  | 32 | 7 / 7 | 22.81 ms | 32 / 70 | 11.74 ms | **10.48 ms** | 7.22x |
+|  | 64 | 7 / 7 | 30.84 ms | 64 / 70 | 12.05 ms | **10.81 ms** | 7.00x |
+| image-convert | 1 | 1 / 8 | 120.47 ms | 1 / 8 | 121.33 ms | 123.59 ms | 0.97x |
+|  | 2 | 2 / 8 | 65.62 ms | 2 / 80 | 62.39 ms | **61.96 ms** | 1.94x |
+|  | 4 | 4 / 8 | 33.98 ms | 4 / 80 | 31.91 ms | **31.71 ms** | 3.80x |
+|  | 8 | 8 / 8 | 27.41 ms | 8 / 80 | 16.45 ms | **15.84 ms** | 7.61x |
+|  | 16 | 8 / 8 | 32.81 ms | 16 / 80 | 9.87 ms | **9.54 ms** | 12.63x |
+|  | 32 | 8 / 8 | 27.56 ms | 32 / 80 | 9.03 ms | **8.50 ms** | 14.17x |
+|  | 64 | 8 / 8 | 36.86 ms | 64 / 80 | 13.14 ms | **11.18 ms** | 10.77x |
+
+**THE UNIT IS THE TILE, WRITTEN IN PLACE, and it is `soft2d`'s default.** It is the fastest at every count
+from four to sixty-four on every scene. At two workers the intermediate is ahead on three scenes, by at most
+1.4 %; at one worker the three columns are the same frame - a one-lane frame is cut into bands whatever the
+unit - and differ by up to 2.6 %, which is the run-to-run spread and not the unit. The only difference
+between the two tile units is the intermediate - every drawn pixel written twice, into a slot and then, on
+the caller's thread after the parallel part, into the target - and it is worth 0.6 ms of `UI-basic`'s frame
+at sixteen workers, 2.18 ms against 1.57. BANDS STOP AT THEIR UNITS: at eight workers every band has one and
+the frame is as long as its slowest band, and past eight the lanes are capped at the bands and nothing
+improves - 3.6x to 5.3x at best, against 7.5x to 15.9x for tiles in place.
+
+**WHERE THE LINE BENDS.** Tiles divide the frame almost exactly up to eight workers, and every scene is
+fastest at sixteen or thirty-two - 7.5x `UI-basic`, 15.9x `UI-effects`, 13.0x `vector-stress`, 10.6x
+`image-resample`, 14.2x `image-convert` - and slower at sixty-four. Eighty tiles over sixty-four workers is
+one or two each, so the frame is as long as its costliest tile, and every frame wakes sixty-three threads and
+waits for the last of them, which at `UI-basic`'s 1.6 ms is visible. It is the bend the 3D backend has, at a
+smaller count, because a 640x480 frame is eighty 2D units and three hundred 3D ones.
+
+**`UI-effects` RUNS ON TWENTY LANES WHATEVER THE POOL OFFERS**, which is the ceiling's doing and the
+arithmetic's prediction: its photo's decoded copy is kept first, and twenty lanes fit in what is left. At
+thirty-two and sixty-four workers the frame reports twenty lanes, and that is the row to expect rather than
+a scaling fault.
+
+**NOT FLOORS, AND NOT THE DEMO.** The floors are the frozen single-threaded rows below - `./bench.sh --suite
+soft2d` still measures the serial walk, `--workers 1` being its default - and a hundred-core host says
+nothing about the live demo in a four-vCPU guest, whose rows are under "The 2D demo, live" above: there,
+today, the pool's lanes all run on the demo's own vCPU, because the kernel queues a woken worker on the core
+that woke it and balances nothing, and four lanes draw no faster than one.
+
 ## soft2d, the CPU 2D backend (2026-09-12)
 
 `./bench.sh --suite soft2d` records five frozen scenes at 640x480 - four until 2026-09-19, when
@@ -690,7 +892,8 @@ bounded `DrawList` recorded once and replayed into an `OwnedImage`, which is wha
 person can get in a second on a host rather than a boot away.
 
 **The reference host.** Intel Xeon Platinum 8272CL at 2.60 GHz, 100 logical CPUs, single-threaded
-throughout - `soft2d` has no worker pool and Profile 1 does not ask for one. Built `--release` by
+throughout - the frozen rows are the serial walk. (`soft2d` has had a worker pool since 2026-09-27, measured
+in the section above; Profile 1 does not ask for one, and the benchmark's default stays one worker.) Built `--release` by
 `rustc 1.93.1 (01f6ddf75 2026-02-11)` with the workspace's own flags, run from `src/tools`. The clock
 is `std::time::Instant`. Five warmup frames are discarded and thirty are measured; the first replay
 of a list touches every page of the reservation and would otherwise be divided into every sample.

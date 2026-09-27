@@ -21,7 +21,7 @@ def main():
     source = SOURCE.read_text()
     definitions = '\n'.join(re.search(r'^' + pattern + r'.*?^}', source, re.M | re.S).group() for pattern in (
         'pub enum ProviderReady ', 'pub struct Serving ', 'impl Serving ', 'enum Control '))
-    functions = '\n'.join(function(source, name) for name in ('wait_providers_or_answer', 'drain_control_into', 'disconnected', 'pong'))
+    functions = '\n'.join(function(source, name) for name in ('wait_providers_or_answer', 'wait_providers', 'drain_control_into', 'disconnected', 'pong'))
     # THE STUBS ARE SAFE, LIKE THE `rt` CALLS THEY STAND IN FOR. They were `unsafe fn`, from a time
     # when `close`, `poll_ready`, `wait_any` and `try_recv` were - so the extracted production code,
     # which calls them from safe functions, stopped compiling the moment the runtime's did not. A
@@ -50,6 +50,7 @@ fn wait_any(set: &[u64], _: u64) -> i64 {
     QUEUED.lock().unwrap().append(&mut scheduled);
     0
 }
+fn wait_any_periodic(set: &[u64], deadline: u64) -> i64 { wait_any(set, deadline) }
 fn try_recv(channel: u64, out: &mut [u8]) -> Polled {
     assert_eq!(channel, 100);
     match QUEUED.lock().unwrap().pop_front() {

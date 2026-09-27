@@ -284,6 +284,21 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	common::set_intx_disabled::<Access>(bus, dev, func, disabled);
 }
 
+// One function's I/O BARs, sized with its I/O decode off - see `arch::common::pci::io_bars`.
+pub fn io_bars(bus: u8, dev: u8, func: u8, out: &mut [(u8, u16, u16); 6]) -> usize {
+	common::io_bars::<Access>(bus, dev, func, out)
+}
+
+// A function's I/O decode, which a claim of a row with an I/O BAR turns on and its release off.
+pub fn set_io_decode(bus: u8, dev: u8, func: u8, on: bool) {
+	common::set_io_decode::<Access>(bus, dev, func, on);
+}
+
+// One configuration dword, for the port derivation rows, which read a chipset block's base.
+pub fn config_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+	<Access as common::ConfigAccess>::read32(bus, dev, func, offset)
+}
+
 // Turn bus mastering on or off for one function. The only caller is `device`, which knows whether a
 // driver owns the device - see `arch::common::pci::set_bus_master`.
 pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {

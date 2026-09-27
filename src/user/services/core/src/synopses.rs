@@ -71,6 +71,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("lsirq", "lsirq [json] - print the device-interrupt vectors"),
 	("lspci", "lspci [json] - print the PCI bus scan"),
 	("lsusb", "lsusb [json] - print the USB bus inventory"),
+	("gamepad", "gamepad [--lines] - show which button is pressed on which gamepad"),
 	("lssvc", "lssvc [json] [prefix] - list the services and their state"),
 	// system / status tools
 	("ps", "ps [json] - list the running processes"),
@@ -101,6 +102,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("midihold", "midihold CASE - hold a MIDI receiver for the MIDI gate"),
 	("midiread", "midiread - list MIDI endpoints with inventory alone"),
 	("midifail", "midifail - a launch whose second grant cannot be minted"),
+	("gamepadcheck", "gamepadcheck - drive the gamepad tool's gate from `gamepad --lines` against the in-guest fixture"),
 	("admincheck", "admincheck CASE - drive the administrative-path gate as a requester"),
 	("adminhelper", "adminhelper CASE - hold another launch's endpoints for the administrative-path gate"),
 	("adminhostile", "adminhostile SECONDS - an ordinary client trying to cover the protected screen"),

@@ -261,7 +261,7 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 			// A VIRTIO DEVICE CARRIES ITS STRUCTURE OFFSETS, which is what tells this transport apart
 			// from the plain-PCI ones: the driver reaches the common configuration, the notify window
 			// and the device-specific config through them rather than at the base.
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -453,7 +453,7 @@ fn virtio_vsock_driver_echoes_bytes_off_the_host() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::VIRTIO_TYPE_VSOCK {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -643,7 +643,7 @@ fn hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_HDA {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -765,7 +765,7 @@ fn sdhci_driver_serves_a_write_and_reads_it_back() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_SDHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -911,7 +911,7 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_AHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			controllers.push((info, entry.1, entry.2, i));
 		}
 	}
@@ -1069,7 +1069,7 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_NVME {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 		}
 	}
@@ -1160,7 +1160,7 @@ fn bind_xhci_controller() -> (alloc::sync::Arc<object::channel::Channel>, u64, a
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_XHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -1945,7 +1945,7 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::VIRTIO_TYPE_SOUND {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], _pad2: [0; 3] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -2972,6 +2972,105 @@ fn usb_midi_delivers_each_cables_bytes_on_that_cable_in_order() {
 	assert_eq!(client_stop(&host_end, patience), Some(Ok(())), "and the endpoint stops");
 
 	crate::serial_println!("usb-midi: {} and {} byte(s) heard on two cables in {} batch(es)", heard[0].len(), heard[1].len(), batches);
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_gamepads_report_which_pad_pressed_what, [Drivers, Usb, Slow], id = "kernel.hardware.usb_gamepads_report_which_pad_pressed_what", covers = ["kernel", "drivers", "bin.xhci"]);
+fn usb_gamepads_report_which_pad_pressed_what() {
+	// TWO PLAYERS ON ONE DEVICE: the gadget is a composite device with a HID gamepad function per player, and
+	// `gamepad-source.py` holds a level on each - interface 0 button 1 with X at 0 and its hat at the null value,
+	// interface 1 button 16 with its hat east and Rz at 255 - then releases both and unplugs the device. This
+	// side plays InputService on the controller's `gamepad` publication and watches its `pointer` one beside it:
+	// every gamepad of every HID interface must arrive, report its own level and never the other's, and leave -
+	// and nothing may reach the pointer.
+	use driver_protocol::gamepad as pad_wire;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "hid-gamepad-pair" {
+		crate::serial_println!("usb-gamepad: NOT RUN - no gamepad-pair gadget on this run; build one with USB_GADGET=hid-gamepad-pair");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+	// THE GAMEPAD PUBLICATION, offered unconditionally: in the handshake, or - when the handshake was already
+	// carrying all it may - as a live offer right after it, under the same token. The offered channel is the
+	// publication's first connection either way.
+	let pads: alloc::sync::Arc<Channel> = match offer_of(&offers, driver_protocol::provider::GAMEPAD) {
+		Some(offered) => offered.into_any_arc().downcast::<Channel>().expect("the gamepad publication is a channel"),
+		None => {
+			let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::GAMEPAD, &[], patience).expect("the controller publishes its gamepads whether or not one is bound");
+			let (host_end, driver_end) = Channel::create();
+			send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+			host_end
+		}
+	};
+	let pointer = offer_of(&offers, driver_protocol::provider::POINTER).expect("the controller publishes its pointer").into_any_arc().downcast::<Channel>().expect("the pointer publication is a channel");
+
+	struct Heard {
+		handle: u32,
+		label: alloc::vec::Vec<u8>,
+		shape: pad_wire::Shape,
+		states: alloc::vec::Vec<pad_wire::State>,
+		departed: bool,
+	}
+	let mut heard: alloc::vec::Vec<Heard> = alloc::vec::Vec::new();
+	let mut pointer_frames: usize = 0;
+	let give_up = arch::apic::ticks() + patience * 3;
+	while !(heard.len() == 2 && heard.iter().all(|pad| pad.departed)) && arch::apic::ticks() < give_up {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		while pointer.recv().is_ok() {
+			pointer_frames += 1;
+		}
+		while let Ok(frame) = pads.recv() {
+			match pad_wire::decode(&frame.bytes).expect("every frame the controller publishes decodes") {
+				pad_wire::Frame::Arrival { handle, shape } => {
+					assert!(!heard.iter().any(|pad| pad.handle == handle), "a handle is never announced twice");
+					// AN ARRIVAL IMPLIES THE STATE BEFORE THE FIRST REPORT.
+					heard.push(Heard { handle, label: shape.label().to_vec(), shape, states: alloc::vec![shape.initial()], departed: false });
+				}
+				pad_wire::Frame::State(state) => {
+					let pad = heard.iter_mut().find(|pad| pad.handle == state.handle).expect("a state names a gamepad that arrived");
+					assert!(!pad.departed, "no state after a departure");
+					pad.states.push(pad.shape.state(&state).expect("a state fits its gamepad"));
+				}
+				pad_wire::Frame::Departure { handle } => {
+					let pad = heard.iter_mut().find(|pad| pad.handle == handle).expect("a departure names a gamepad that arrived");
+					pad.departed = true;
+				}
+			}
+		}
+	}
+	assert_eq!(heard.len(), 2, "two gamepads arrived, one per HID interface");
+	assert_ne!(heard[0].handle, heard[1].handle, "under two handles");
+	let by_interface = |interface: &[u8]| heard.iter().find(|pad| pad.label.ends_with(interface)).expect("a gamepad labelled by its interface");
+	let (first, second) = (by_interface(b" if 0"), by_interface(b" if 1"));
+	for pad in [first, second] {
+		assert!(pad.label.starts_with(b"usb "), "labelled by the device, its port and its interface: {:?}", core::str::from_utf8(&pad.label));
+		assert_eq!((pad.shape.buttons(), pad.shape.hats(), pad.shape.axes().len()), (16, 1, 4), "sixteen buttons, one hat and four axes");
+		assert!(pad.shape.axes().iter().all(|axis| (axis.minimum, axis.maximum) == (0, 255)), "each axis over 0..255");
+		// BEFORE ITS HELD LEVEL: no button and a centred hat - the initial state, never the north a zeroed hat reads.
+		let before = &pad.states[..pad.states.iter().position(|state| state.buttons != 0).expect("the held level arrived")];
+		assert!(!before.is_empty() && before.iter().all(|state| state.buttons == 0 && state.hats[0] == pad_wire::CENTRED), "the states before the held level are at rest");
+		// RELEASED WITH THE HAT CENTRED - the null value a range check would have refused.
+		let last = pad.states.last().expect("a last state");
+		assert_eq!((last.buttons, last.hats[0]), (0, pad_wire::CENTRED), "released, the hat centred");
+		assert!(pad.departed, "and it left with the device");
+	}
+	// THE HELD LEVELS ON THE RIGHT GAMEPAD AND NEVER ON THE OTHER.
+	assert!(first.states.iter().any(|state| state.buttons == 0x0001 && state.axes[0] == 0 && state.hats[0] == pad_wire::CENTRED), "interface 0 held button 1 with X at 0, its null hat centred");
+	assert!(second.states.iter().any(|state| state.buttons == 0x8000 && state.hats[0] == 2 && state.axes[3] == 255), "interface 1 held button 16 with its hat east and Rz at 255");
+	assert!(!first.states.iter().any(|state| state.buttons & 0x8000 != 0 || state.hats[0] == 2), "interface 1's level never reached interface 0's gamepad");
+	assert!(!second.states.iter().any(|state| state.buttons & 0x0001 != 0), "and interface 0's never reached interface 1's");
+	assert_eq!(pointer_frames, 0, "a gamepad is not a pointer: nothing reached the pointer publication");
+
+	crate::serial_println!("usb-gamepad: two gamepads on interfaces 0 and 1 reported their own levels in {} and {} state(s), released centred, and left with the device", first.states.len(), second.states.len());
 	driver.terminate();
 	sched::run_until_idle();
 	let _ = crate::device::release_claim(claim);

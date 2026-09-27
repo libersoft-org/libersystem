@@ -344,6 +344,19 @@ impl Tile {
 			// pixels the frame started with - which is what the serial walk reads, since no tile writes
 			// another's pixels.
 			Access::Slot { source, .. } => self.load_from(source, 0, bounds, working, table),
+			Access::Rect { rows, tile, layout } => {
+				let decoder = Decoder::new(&layout.semantics, working).map_err(from_core)?;
+				let part = part_layout(layout, tile)?;
+				let width = bounds.width as usize;
+				for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+					let Some(start) = self.index(bounds.x, y) else { continue };
+					let Some(row) = self.pixels.get_mut(start..start + width) else { continue };
+					let Some(bytes) = rows.get((y - tile.y) as usize) else { continue };
+					read_row(&ImageView::new(part, bytes).map_err(from_core)?, bounds.x - tile.x, 0, row);
+					decoder.decode_row(table, row);
+				}
+				Ok(())
+			}
 		}
 	}
 
@@ -367,6 +380,7 @@ impl Tile {
 		let layout = match access {
 			Access::Band { view, .. } => *view.layout(),
 			Access::Slot { source, .. } => *source.layout(),
+			Access::Rect { layout, .. } => *layout,
 		};
 		let encoder = Encoder::new_for_output(&layout.semantics, layout.storage, working, output).map_err(from_core)?;
 		let width = (bounds.width as usize).min(scratch.len());
@@ -393,9 +407,27 @@ impl Tile {
 					write_row(&mut view, bounds.x - tile.x, y - tile.y, &scratch[..width]);
 				}
 			}
+			Access::Rect { rows, tile, .. } => {
+				let part = part_layout(&layout, tile)?;
+				for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+					let Some(start) = self.index(bounds.x, y) else { continue };
+					let Some(row) = self.pixels.get(start..start + width) else { continue };
+					let Some(bytes) = rows.get_mut((y - tile.y) as usize) else { continue };
+					scratch[..width].copy_from_slice(row);
+					encoder.encode_row(table, &mut scratch[..width], bounds.x, y);
+					write_row(&mut ImageViewMut::new(part, bytes).map_err(from_core)?, bounds.x - tile.x, 0, &scratch[..width]);
+				}
+			}
 		}
 		Ok(())
 	}
+}
+
+/// ONE ROW PART OF A TILE AS AN IMAGE OF ITS OWN - a single row of the target's format, as wide as the
+/// tile - so the row reader and writer the target uses read and write it too.
+fn part_layout(layout: &ImageLayout, tile: &PixelRect) -> Result<ImageLayout, Error> {
+	let width = tile.width.max(1);
+	ImageLayout::new(Extent2D::new(width, 1), layout.storage.minimum_row_bytes(width).ok_or(Error::Allocation)?, layout.storage, RowOrigin::TopLeft, layout.semantics).map_err(from_core)
 }
 
 impl Raster for Tile {

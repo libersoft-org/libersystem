@@ -146,6 +146,15 @@ pub struct Virtio {
 	pub capability: u64,
 }
 
+// A descriptor that points at a TABLE of descriptors instead of a buffer (VIRTIO_RING_F_INDIRECT_DESC).
+const DESC_INDIRECT: u16 = 4;
+
+// The feature bit, in word 0.
+pub const FEATURE_INDIRECT_DESC: u32 = 1 << 28;
+
+// How many descriptors one indirect table holds, in `submit_chains`.
+pub const INDIRECT_TABLE_LEN: usize = 8;
+
 // One set-up split virtqueue: its rings (in a DMA page) and the address/value used
 // to notify the device of new work.
 pub struct Queue {
@@ -202,6 +211,35 @@ impl Queue {
 			w16(avail + 2, idx.wrapping_add(1));
 			self.posted = self.posted.saturating_add(1);
 		}
+	}
+
+	// A CHAIN THE DEVICE COMPLETES WHEN IT HAS SOMETHING TO SAY - an event buffer - posted at descriptors
+	// `head..head + bufs.len()`, which the caller keeps for this chain alone. Taken back with `take_used`, whose
+	// id is `head`. Call `notify` after a batch.
+	pub fn post_chain(&mut self, head: u16, bufs: &[(u64, u32, bool)]) -> bool {
+		if bufs.is_empty() || head as usize + bufs.len() > self.size as usize {
+			return false;
+		}
+		unsafe {
+			for (i, &(phys, len, device_writes)) in bufs.iter().enumerate() {
+				let d = self.virt + (head as u64 + i as u64) * 16;
+				w64(d, phys);
+				w32(d + 8, len);
+				let mut flags: u16 = if device_writes { DESC_WRITE } else { 0 };
+				if i + 1 < bufs.len() {
+					flags |= DESC_NEXT;
+				}
+				w16(d + 12, flags);
+				w16(d + 14, head + i as u16 + 1);
+			}
+			let avail = self.virt + self.avail_off;
+			let idx = r16(avail + 2);
+			w16(avail + 4 + (idx % self.size) as u64 * 2, head);
+			fence(Ordering::SeqCst);
+			w16(avail + 2, idx.wrapping_add(1));
+			self.posted = self.posted.saturating_add(1);
+		}
+		true
 	}
 
 	// The last refusal this queue made of what the device wrote into its used ring, if any.
@@ -617,6 +655,106 @@ impl Queue {
 			let elem = used + 4 + (old_used % self.size) as u64 * 8;
 			let (_, len) = check_used_element(r32(elem), r32(elem + 4), self.size, Some(0), most_used)?;
 			Ok(len)
+		}
+	}
+
+	// SEVERAL CHAINS, COMPLETED TOGETHER - for a device that performs a group of requests as one operation,
+	// as virtio-i2c performs a write then a read (two requests, the first flagged FAIL_NEXT) as one transfer
+	// with a repeated start. Every chain is posted, the heads are published in order, the device is notified
+	// ONCE and the call polls until every chain has completed. `used[k]` answers chain k's used length.
+	//
+	// THROUGH INDIRECT TABLES when `indirect` is given - `(virt, phys)` of a DMA area holding one table of
+	// `INDIRECT_TABLE_LEN` descriptors per chain - so each chain takes ONE ring slot: virtio-i2c's queue may be
+	// four entries long, and two three-descriptor requests do not fit in it directly. Without it the chains
+	// are laid out one after the other, which a ring with room for all of them takes.
+	pub fn submit_chains(&self, chains: &[&[(u64, u32, bool)]], indirect: Option<(u64, u64)>, used: &mut [u32]) -> Result<(), UsedFault> {
+		unsafe {
+			let count = chains.len();
+			if count == 0 || count > used.len() || count > self.size as usize {
+				return Err(UsedFault::Chain);
+			}
+			let direct_total: usize = chains.iter().map(|chain| chain.len()).sum();
+			if chains.iter().any(|chain| chain.is_empty() || chain.len() > INDIRECT_TABLE_LEN) || (indirect.is_none() && direct_total > self.size as usize) {
+				return Err(UsedFault::Chain);
+			}
+			let write_desc = |d: u64, phys: u64, len: u32, device_writes: bool, next: Option<u16>| {
+				w64(d, phys);
+				w32(d + 8, len);
+				let mut flags: u16 = if device_writes { DESC_WRITE } else { 0 };
+				if next.is_some() {
+					flags |= DESC_NEXT;
+				}
+				w16(d + 12, flags);
+				w16(d + 14, next.unwrap_or(0));
+			};
+			let mut heads = [0u16; 8];
+			let mut next_free: u16 = 0;
+			for (k, chain) in chains.iter().enumerate() {
+				match indirect {
+					Some((virt, phys)) => {
+						let table_virt = virt + (k * INDIRECT_TABLE_LEN * 16) as u64;
+						let table_phys = phys + (k * INDIRECT_TABLE_LEN * 16) as u64;
+						for (i, &(buf_phys, len, device_writes)) in chain.iter().enumerate() {
+							write_desc(table_virt + i as u64 * 16, buf_phys, len, device_writes, if i + 1 < chain.len() { Some((i + 1) as u16) } else { None });
+						}
+						let d = self.virt + k as u64 * 16;
+						w64(d, table_phys);
+						w32(d + 8, (chain.len() * 16) as u32);
+						w16(d + 12, DESC_INDIRECT);
+						w16(d + 14, 0);
+						heads[k] = k as u16;
+					}
+					None => {
+						heads[k] = next_free;
+						for (i, &(buf_phys, len, device_writes)) in chain.iter().enumerate() {
+							let at = next_free + i as u16;
+							write_desc(self.virt + at as u64 * 16, buf_phys, len, device_writes, if i + 1 < chain.len() { Some(at + 1) } else { None });
+						}
+						next_free += chain.len() as u16;
+					}
+				}
+			}
+			let used_ring = self.virt + self.used_off;
+			let old_used = r16(used_ring + 2);
+			let avail = self.virt + self.avail_off;
+			let old_avail = r16(avail + 2);
+			for (k, &head) in heads[..count].iter().enumerate() {
+				w16(avail + 4 + (old_avail.wrapping_add(k as u16) % self.size) as u64 * 2, head);
+			}
+			fence(Ordering::SeqCst);
+			w16(avail + 2, old_avail.wrapping_add(count as u16));
+			fence(Ordering::SeqCst);
+			w16(self.notify_addr, self.index);
+			let mut spins: u32 = 0;
+			loop {
+				fence(Ordering::SeqCst);
+				if r16(used_ring + 2).wrapping_sub(old_used) >= count as u16 {
+					break;
+				}
+				spins += 1;
+				if spins > 10_000_000 {
+					return Err(UsedFault::NoCompletion);
+				}
+				if spins % 4096 == 0 {
+					yield_now();
+				}
+			}
+			fence(Ordering::SeqCst);
+			check_used_advance(old_used, r16(used_ring + 2), count as u16)?;
+			let mut seen = [false; 8];
+			for n in 0..count as u16 {
+				let elem = used_ring + 4 + (old_used.wrapping_add(n) % self.size) as u64 * 8;
+				let id = r32(elem);
+				let Some(k) = heads[..count].iter().position(|&head| head as u32 == id) else { return Err(UsedFault::Chain) };
+				if seen[k] {
+					return Err(UsedFault::Chain);
+				}
+				seen[k] = true;
+				let writable: u32 = chains[k].iter().filter(|buf| buf.2).fold(0u32, |total, buf| total.saturating_add(buf.1));
+				let (_, len) = check_used_element(id, r32(elem + 4), self.size, Some(heads[k]), writable)?;
+				used[k] = len;
+			}
+			Ok(())
 		}
 	}
 

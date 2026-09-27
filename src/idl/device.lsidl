@@ -219,6 +219,19 @@ enum provider-kind {
 	/// high-risk operation, which AdminService alone consumes. A published executor is how an operation
 	/// becomes possible at all; no client can register one.
 	admin-executor = 20,
+	/// GAMEPADS, WHICH ARE NOT A POINTER: a set of axes, a button bitmap and hats, several gamepads on
+	/// one connection, each by its publisher's handle - the `gamepad` wire in `driver_protocol`.
+	/// InputService alone consumes it and decides whose focus a gamepad's input reaches. Published as
+	/// `pointer`, a stick would move the console cursor and its buttons would click.
+	gamepad = 21,
+	/// AN I2C/SMBUS CONTROLLER, the `liber:i2c-device` contract. NEVER OPENED WHOLE: no role or permission
+	/// row may name it and the catalogue's `open` refuses it; the only connections are the ones DeviceManager
+	/// mints with a SCOPED `CONNECT` naming one seven-bit address - for a child binding with its claim, and
+	/// for the ACPI service.
+	i2c-bus = 22,
+	/// A GPIO CONTROLLER'S INPUT LINES, the `liber:gpio-device` contract, under the same rule as `i2c-bus`:
+	/// only scoped connections, each naming one line with its trigger, or for level reads alone.
+	gpio-lines = 23,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

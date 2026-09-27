@@ -87,6 +87,10 @@
 #             after DIR, so a lifecycle gate's instance never touches a person's and is never
 #             refused by its lock.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
+#   I2C_FIXTURE=bus|hid  I2C_SOCKET=  GPIO_SOCKET=
+#             attach QEMU's vhost-user I2C and GPIO controllers at their pinned slots, their device side
+#             the `vhost-i2c-gpio.py` listening on the two sockets, with the guest's RAM on a shared memfd
+#             - see `qemu_attach_i2c_fixture`. `test-kernel.sh` starts the backend and sets all three.
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
 #   GIC=      aarch64: which interrupt controller the machine has - 2 (default: GICv2 with a
 #             GICv2m MSI frame), 3 (GICv3, ITS off: the timer/IPI core profile) or 3its (GICv3
@@ -885,6 +889,40 @@ qemu_attach_suite_devices() {
 	# line that says the slot was found is the evidence that the scan reaches it on that machine.
 	local -n slot_into="$into"
 	slot_into+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
+}
+
+# THE I2C AND GPIO CONTROLLERS, when a run asks for them with `I2C_FIXTURE`: QEMU's `vhost-user-i2c-pci` and
+# `vhost-user-gpio-pci`, whose DEVICE SIDE is `vhost-i2c-gpio.py`. `test-kernel.sh` starts and reaps that
+# process, the way it does swtpm, and its two sockets arrive here as `I2C_SOCKET` and `GPIO_SOCKET`.
+#
+# AT PINNED SLOTS, 0x15 and 0x16: below the 0x17..0x1e the development fixtures' `edu` functions hold, and
+# above what QEMU numbers in argument order on these machines, so a run that asks renumbers nothing.
+#
+# THE GUEST'S RAM ON A SHARED memfd, ON THIS RUN ONLY. A vhost-user backend maps the guest's memory, so the
+# memory has to be a file it can be handed; every other run keeps QEMU's private RAM.
+#
+# `iommu_platform=on` EXACTLY WHEN THE MACHINE HAS THE virtio-iommu, and never `disable-legacy`, which these
+# modern-only devices do not have - so neither of a machine's own option strings is used for them. On the
+# translated machine the backend serves the vhost-user IOTLB.
+qemu_attach_i2c_fixture() {
+	local -n fixture_into=$1
+	local iommu="$2"
+	local mem="$3"
+	[[ -n "${I2C_FIXTURE:-}" ]] || return 0
+	if [[ -z "${I2C_SOCKET:-}" || -z "${GPIO_SOCKET:-}" ]]; then
+		echo "qemu-run: I2C_FIXTURE=$I2C_FIXTURE names no backend sockets - the run that asks starts vhost-i2c-gpio.py and passes I2C_SOCKET and GPIO_SOCKET" >&2
+		exit 2
+	fi
+	local platform=""
+	[[ "$iommu" == "1" ]] && platform=",iommu_platform=on"
+	fixture_into+=(
+		-object "memory-backend-memfd,id=liberfixture,size=$mem,share=on"
+		-machine "memory-backend=liberfixture"
+		-chardev "socket,id=i2cfixture,path=$I2C_SOCKET"
+		-device "vhost-user-i2c-pci,chardev=i2cfixture,bus=pcie.0,addr=0x15$platform"
+		-chardev "socket,id=gpiofixture,path=$GPIO_SOCKET"
+		-device "vhost-user-gpio-pci,chardev=gpiofixture,bus=pcie.0,addr=0x16$platform"
+	)
 }
 
 vsock_echo_start() {
@@ -1915,6 +1953,7 @@ qemu_run_x86_64() {
 	# BEFORE THE ENDPOINTS IT TRANSLATES, which is the order the gate boots and the order QEMU
 	# realizes devices in.
 	[[ "$iommu" == "1" ]] && qemu_args+=(-device "virtio-iommu-pci,boot-bypass=on")
+	qemu_attach_i2c_fixture qemu_args "$iommu" "${MEM:-4G}"
 
 	# System volume disk: carries the LiberFS volume itself.
 	# The DMA test kernel enters its suite directly and reads fixtures from the boot archive.
@@ -2156,6 +2195,12 @@ qemu_run_x86_64() {
 	timing_event image end
 
 	if [[ "${TEST:-0}" == "1" ]]; then
+		# A SECOND UART, FOR THE PORT-RANGE SUITE: an `isa-serial` at COM2's address and interrupt with a
+		# null chardev behind it. Every test that drives a UART drives this one - in loopback, or observed
+		# through the test build's record of the kernel's accesses - so the oracle is read inside the guest
+		# and nothing reaches the serial log the suite is judged by. It masters nothing, so the DMA
+		# fixture's machine carries it as well.
+		qemu_args+=(-chardev "null,id=uart2" -device "isa-serial,iobase=0x2f8,irq=3,chardev=uart2")
 		# The development channel is present in the cold test configuration too: the same
 		# second port on every target is what lets a scenario runner drive a boot over
 		# identical framing, including where the persistent profile does not exist.
@@ -2353,6 +2398,10 @@ qemu_run_aarch64() {
 		virtio_opts="disable-legacy=on,iommu_platform=on"
 		qemu_args+=(-device "virtio-iommu-pci,boot-bypass=on")
 	fi
+	# ON THE BOOT COMMANDS AND NOT IN THE TREE'S DUMP: the two vhost-user devices add no node to QEMU's
+	# generated tree, and a dump that carried them would connect to the backend's sockets itself.
+	local -a fixture_args=()
+	qemu_attach_i2c_fixture fixture_args "$iommu" "$mem"
 
 	# System volume disk: virtio-blk holding the factory archive.
 	#
@@ -2561,6 +2610,7 @@ qemu_run_aarch64() {
 			-no-reboot \
 			"${test_args[@]}" \
 			"${qemu_args[@]}" \
+			"${fixture_args[@]}" \
 			${QEMU_EXTRA:-}
 	fi
 
@@ -2642,6 +2692,7 @@ qemu_run_aarch64() {
 		-no-reboot \
 		"${test_args[@]}" \
 		"${qemu_args[@]}" \
+		"${fixture_args[@]}" \
 		${QEMU_EXTRA:-} &
 	local qemu_pid=$!
 	wait "$qemu_pid" || qemu_status=$?
@@ -2706,6 +2757,9 @@ qemu_run_riscv64() {
 		virtio_opts="disable-legacy=on,iommu_platform=on"
 		iommu_args=(-device "virtio-iommu-pci,boot-bypass=on")
 	fi
+	# ON THE BOOT COMMANDS AND NOT IN THE TREE'S DUMP, as on aarch64, and after the controller.
+	local -a fixture_args=()
+	qemu_attach_i2c_fixture fixture_args "$iommu" "$mem"
 
 	# System volume disk: virtio-blk holding the factory archive.
 	#
@@ -2920,6 +2974,7 @@ qemu_run_riscv64() {
 			-no-reboot \
 			"${iommu_args[@]}" \
 			"${qemu_args[@]}" \
+			"${fixture_args[@]}" \
 			"${test_args[@]}" \
 			${QEMU_EXTRA:-}
 	fi
@@ -2996,6 +3051,7 @@ qemu_run_riscv64() {
 		-no-reboot \
 		"${iommu_args[@]}" \
 		"${qemu_args[@]}" \
+		"${fixture_args[@]}" \
 		"${test_args[@]}" \
 		${QEMU_EXTRA:-} &
 	local qemu_pid=$!

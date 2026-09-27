@@ -13,6 +13,7 @@
 use crate::arch;
 use crate::object::KernelObject;
 use crate::object::thread::Thread;
+#[cfg(not(test))]
 use crate::serial_println;
 use abi::{ERR_INVALID, ERR_UNSUPPORTED, PERF_CONTROL_ARM, PERF_CONTROL_DISARM, PERF_CONTROL_DRAIN, PERF_RECORD_REFUSED, PERF_RECORD_UNARMED};
 use perfbuf::{Buffer, Push, Record};
@@ -24,6 +25,7 @@ static BUFFER: Buffer = Buffer::new();
 // CONTIGUOUS AND THROUGH THE DIRECT MAP, because an append runs with interrupts masked inside the
 // scheduler and inside a syscall, and a slot address must be one addition away. A boot that cannot
 // spare the memory says so and runs unmeasured: the instrument is never a reason to fail a boot.
+#[cfg(not(test))]
 pub fn init() {
 	if arch::boot_profile() != Some("development-trace") {
 		return;

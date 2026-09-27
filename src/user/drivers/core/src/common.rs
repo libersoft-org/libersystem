@@ -44,6 +44,9 @@ pub struct Resources {
 	pub syspower: u64,
 	pub console: u64,
 	pub trusted_keys: u64,
+	// The row's port ranges, in the row's order: `port_ranges[i]` is `Bind::info.ports[i]`, unmapped.
+	pub port_ranges: [u64; proto::MAX_PORT_RANGES],
+	pub port_range_count: usize,
 }
 
 // Read one frame. Answers with the header, the payload length, and every capability it carried.
@@ -138,6 +141,17 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 			proto::ResourceKind::SysPower => &mut resources.syspower,
 			proto::ResourceKind::Console => &mut resources.console,
 			proto::ResourceKind::TrustedKeys => &mut resources.trusted_keys,
+			// PORT RANGES ARE SEVERAL OF ONE KIND, kept in the order they came - the row's order. One past
+			// what a row can carry is closed, as a duplicate is.
+			proto::ResourceKind::PortRange => {
+				if resources.port_range_count < resources.port_ranges.len() {
+					resources.port_ranges[resources.port_range_count] = handle;
+					resources.port_range_count += 1;
+				} else {
+					close(handle);
+				}
+				continue;
+			}
 		};
 		// A SECOND RESOURCE OF ONE KIND IS NOT A SPARE. Overwriting the slot would leak the
 		// first capability silently; this keeps the first and closes the second, which is the
@@ -609,6 +623,13 @@ pub enum ProviderReady {
 // Keep accepting connections while all consumers are gone, alongside a device's IRQs. A newly
 // accepted endpoint is returned before its traffic so a provider can send its initial metadata.
 pub fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64]) -> Option<ProviderReady> {
+	wait_providers(bootstrap, bind, serving, devices, false)
+}
+
+// The same wait, for a driver whose `devices` carry a RETRY TIMER: with `housekeeping`, the deadline an armed
+// timer gives the wait is a housekeeping one, which the scheduler may settle across - a publisher retrying a
+// consumer that never drains must not keep a settling scheduler from settling.
+pub fn wait_providers(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool) -> Option<ProviderReady> {
 	loop {
 		match drain_control_into(bootstrap, bind, Some(serving)) {
 			Control::Continue => {}
@@ -639,7 +660,8 @@ pub fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Servi
 		set[..live.len()].copy_from_slice(live);
 		set[live.len()..live.len() + devices.len()].copy_from_slice(devices);
 		set[live.len() + devices.len()] = bootstrap;
-		if wait_any(&set[..live.len() + devices.len() + 1], 0) < 0 {
+		let waited = if housekeeping { wait_any_periodic(&set[..live.len() + devices.len() + 1], 0) } else { wait_any(&set[..live.len() + devices.len() + 1], 0) };
+		if waited < 0 {
 			return None;
 		}
 	}
@@ -719,6 +741,9 @@ pub struct Serving {
 	// consumer of THAT provider. A driver may publish several, and the manager's count is per
 	// provider - "somebody left" is not an answer it can apply.
 	tokens: [u16; MAX_PROVIDER_CLIENTS],
+	// WHAT EACH ENDPOINT MAY REACH: the whole publication, or - for a bus provider - the one address or line its
+	// scoped `CONNECT` named, which the driver serves and enforces.
+	scopes: [proto::Scope; MAX_PROVIDER_CLIENTS],
 	new: [bool; MAX_PROVIDER_CLIENTS],
 	// Publication identity survives an empty client set, so reconnect cannot change its kind.
 	publications: [u16; MAX_PROVIDER_CLIENTS],
@@ -735,11 +760,11 @@ impl Serving {
 
 	pub fn from_offers(offers: &[(u16, u64)]) -> Self {
 		assert!(offers.len() <= MAX_PROVIDER_CLIENTS);
-		let mut serving = Self { ends: [0; MAX_PROVIDER_CLIENTS], tokens: [0; MAX_PROVIDER_CLIENTS], new: [false; MAX_PROVIDER_CLIENTS], publications: [0; MAX_PROVIDER_CLIENTS], publication_count: offers.len(), count: 0 };
+		let mut serving = Self { ends: [0; MAX_PROVIDER_CLIENTS], tokens: [0; MAX_PROVIDER_CLIENTS], scopes: [proto::Scope::Whole; MAX_PROVIDER_CLIENTS], new: [false; MAX_PROVIDER_CLIENTS], publications: [0; MAX_PROVIDER_CLIENTS], publication_count: offers.len(), count: 0 };
 		for (index, &(token, end)) in offers.iter().enumerate() {
 			serving.publications[index] = token;
 			if end != 0 {
-				serving.accept(end, token);
+				serving.accept(end, token, proto::Scope::Whole);
 			}
 		}
 		serving
@@ -755,6 +780,11 @@ impl Serving {
 
 	pub fn token_at(&self, index: usize) -> u16 {
 		self.tokens[index]
+	}
+
+	// What the endpoint at `index` may reach: the scope its `CONNECT` named.
+	pub fn scope_at(&self, index: usize) -> proto::Scope {
+		self.scopes[index]
 	}
 
 	pub fn first_for(&self, token: u16) -> u64 {
@@ -779,9 +809,11 @@ impl Serving {
 		self.count -= 1;
 		self.ends[index] = self.ends[self.count];
 		self.tokens[index] = self.tokens[self.count];
+		self.scopes[index] = self.scopes[self.count];
 		self.new[index] = self.new[self.count];
 		self.ends[self.count] = 0;
 		self.tokens[self.count] = 0;
+		self.scopes[self.count] = proto::Scope::Whole;
 		self.new[self.count] = false;
 		token
 	}
@@ -795,7 +827,7 @@ impl Serving {
 		}
 		self.publications[self.publication_count] = token;
 		self.publication_count += 1;
-		self.accept(first, token)
+		self.accept(first, token, proto::Scope::Whole)
 	}
 
 	// A PUBLICATION THIS DRIVER WITHDREW, taken out of the set with every connection to it closed: its device
@@ -824,12 +856,13 @@ impl Serving {
 
 	// One more, from a `CONNECT`, under the token that frame named. False when this driver is already
 	// serving as many as it will.
-	fn accept(&mut self, end: u64, token: u16) -> bool {
+	fn accept(&mut self, end: u64, token: u16, scope: proto::Scope) -> bool {
 		if end == 0 || self.count >= MAX_PROVIDER_CLIENTS || !self.publications[..self.publication_count].contains(&token) {
 			return false;
 		}
 		self.ends[self.count] = end;
 		self.tokens[self.count] = token;
+		self.scopes[self.count] = scope;
 		self.new[self.count] = true;
 		self.count += 1;
 		true
@@ -884,8 +917,10 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 				// THE TOKEN THE FRAME NAMES, kept with the endpoint. A frame whose payload does
 				// not decode is not a connection this driver can ever report the end of, so it
 				// is refused rather than served under a token nobody chose.
-				let token = proto::decode_connect(header.payload(&buf)).ok();
-				let accepted = handle != 0 && token.is_some_and(|token| serving.as_deref_mut().is_some_and(|serving| serving.accept(handle, token)));
+				// AND ITS SCOPE, when it names one: the driver serves that address or line alone.
+				let connect = proto::decode_connect_scoped(header.payload(&buf)).ok();
+				let token = connect.map(|(token, _)| token);
+				let accepted = handle != 0 && connect.is_some_and(|(token, scope)| serving.as_deref_mut().is_some_and(|serving| serving.accept(handle, token, scope)));
 				if !accepted && handle != 0 {
 					// Full, or a loop that serves no provider. Closed rather than kept, so the
 					// consumer learns its connection ended instead of waiting on a server that

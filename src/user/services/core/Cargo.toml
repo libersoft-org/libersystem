@@ -248,6 +248,13 @@ path = "src/midicheck.rs"
 required-features = ["development"]
 
 [[bin]]
+# THE GAMEPAD TOOL GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the gamepad fixture's control
+# endpoint, which only a development image has, and reads the tool's lines on its standard input.
+name = "gamepadcheck"
+path = "src/gamepadcheck.rs"
+required-features = ["development"]
+
+[[bin]]
 # The MIDI gate's second receiver.
 name = "midihold"
 path = "src/midihold.rs"

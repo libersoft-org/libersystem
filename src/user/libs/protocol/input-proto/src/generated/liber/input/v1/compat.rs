@@ -26,6 +26,38 @@ fn contact_event_wire_is_stable() {
 	assert_eq!(ContactEvent::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn gamepad_axis_wire_is_stable() {
+	let sample = GamepadAxis { usage: 7, minimum: 7, maximum: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(GamepadAxis::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn gamepad_wire_is_stable() {
+	let sample = Gamepad { id: 7, label: String::from("x"), axes: alloc::vec![GamepadAxis { usage: 7, minimum: 7, maximum: 7 }], buttons: 7, hats: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 120, 1, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(Gamepad::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn gamepad_state_wire_is_stable() {
+	let sample = GamepadState { id: 7, buttons: 7, hats: alloc::vec![7], axes: alloc::vec![7] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 7, 1, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(GamepadState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn gamepad_event_wire_is_stable() {
+	let sample = GamepadEvent::Present(Gamepad { id: 7, label: String::from("x"), axes: alloc::vec![GamepadAxis { usage: 7, minimum: 7, maximum: 7 }], buttons: 7, hats: 7 });
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0, 7, 0, 0, 0, 1, 0, 120, 1, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(GamepadEvent::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn trusted_input_kind_wire_is_stable() {
 	let sample = TrustedInputKind::Attention;
 	let bytes = sample.encode_vec().expect("encode");

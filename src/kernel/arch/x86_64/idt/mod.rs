@@ -190,6 +190,12 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, e
 	// A #GP taken in ring 3 is a userspace bug: terminate that process and return
 	// to the kernel. The low two bits of the saved code selector are the CPL.
 	if frame.code_segment & 3 == 3 {
+		// A PORT THIS CORE HAS NOT LOADED YET is not a bug: a sibling thread mapped a range after this
+		// core copied the process's bitmap. The core copies again and the instruction retries; only a
+		// fault against a current bitmap is the process's own.
+		if super::ioports::pull_on_gp() {
+			return;
+		}
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_GENERAL_PROTECTION, error_code, address: 0, instruction_pointer: frame.instruction_pointer });
 	}
 	// In ring 0 it is a kernel bug; halt loudly.

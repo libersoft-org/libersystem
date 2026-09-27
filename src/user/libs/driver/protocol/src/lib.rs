@@ -336,7 +336,13 @@ pub enum ResourceKind {
 	// THE TRUSTED KEY SINK: a second raw-key channel, to InputService's protected path alone, handed only to
 	// the physical keyboard drivers. Nothing else holds a producer for it.
 	TrustedKeys = 6,
+	// ONE PORT RANGE OF THE ROW - one frame per port resource the device's row carries, in the row's order,
+	// as the register window is passed. Mapping it grants the driver's process those ports and no other.
+	PortRange = 7,
 }
+
+// How many `PortRange` resources one bind can carry: one per port resource a row can record.
+pub const MAX_PORT_RANGES: usize = abi::MAX_PORT_RESOURCES;
 
 impl ResourceKind {
 	pub fn from_u16(value: u16) -> Option<Self> {
@@ -347,6 +353,7 @@ impl ResourceKind {
 			4 => Some(ResourceKind::SysPower),
 			5 => Some(ResourceKind::Console),
 			6 => Some(ResourceKind::TrustedKeys),
+			7 => Some(ResourceKind::PortRange),
 			_ => None,
 		}
 	}
@@ -373,6 +380,10 @@ pub mod stream;
 // THE AUDIO WIRE an `audio` provider serves, here for the same reason and one worse: it was not
 // copied at all, so the two servers of that provider kind spoke different protocols.
 pub mod audio;
+
+// THE GAMEPAD WIRE a `gamepad` provider serves, and the publisher table whose rules every driver of it
+// follows - the xHCI driver, the development fixture and InputService read one layout.
+pub mod gamepad;
 
 pub mod provider {
 	pub const BLOCK: u16 = 1;
@@ -424,6 +435,15 @@ pub mod provider {
 	pub const PTP_TRANSPORT: u16 = 19;
 	/// An administrative executor: the private executor contract AdminService alone consumes.
 	pub const ADMIN_EXECUTOR: u16 = 20;
+	/// GAMEPADS, which are not a pointer: a consumer of `POINTER` is handed one cursor and a consumer of
+	/// `INPUT` keystrokes, and a gamepad is a set of axes, buttons and hats - several gamepads on one
+	/// connection, each by its own handle. The wire is `gamepad`; InputService alone consumes it.
+	pub const GAMEPAD: u16 = 21;
+	/// AN I2C/SMBUS CONTROLLER - never opened whole: every connection is a scoped `CONNECT` naming one
+	/// address, and the endpoint an `OFFER` of this kind carries serves nothing.
+	pub const I2C_BUS: u16 = 22;
+	/// A GPIO CONTROLLER'S INPUT LINES, under the same rule: every connection names one line.
+	pub const GPIO_LINES: u16 = 23;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.
@@ -728,6 +748,89 @@ pub fn decode_disconnect(payload: &[u8]) -> Result<u16, FrameError> {
 // consumer goes, WHICH provider is serving one fewer.
 pub fn decode_connect(payload: &[u8]) -> Result<u16, FrameError> {
 	decode_u16(payload)
+}
+
+// A SCOPED `CONNECT`: the endpoint it carries serves ONE address or ONE line of a bus provider, never the
+// whole controller - the only connections an `i2c-bus` or a `gpio-lines` publication ever gets. The scope
+// follows the token in the same frame, so the change is additive and the protocol's version is what it was:
+// an unscoped `CONNECT` is the two-byte payload it always was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+	// The whole publication, as every `CONNECT` before scopes.
+	Whole,
+	// One seven-bit I2C address.
+	I2cAddress(u8),
+	// One GPIO line: events on this trigger, or its level alone.
+	GpioLine { line: u32, trigger: GpioTrigger },
+}
+
+// How a scoped GPIO line fires - or `Level`, for level reads alone and no event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GpioTrigger {
+	Level = 0,
+	Rising = 1,
+	Falling = 2,
+	Both = 3,
+	High = 4,
+	Low = 5,
+}
+
+impl GpioTrigger {
+	pub fn from_u8(value: u8) -> Option<Self> {
+		match value {
+			0 => Some(GpioTrigger::Level),
+			1 => Some(GpioTrigger::Rising),
+			2 => Some(GpioTrigger::Falling),
+			3 => Some(GpioTrigger::Both),
+			4 => Some(GpioTrigger::High),
+			5 => Some(GpioTrigger::Low),
+			_ => None,
+		}
+	}
+}
+
+const SCOPE_I2C_ADDRESS: u8 = 1;
+const SCOPE_GPIO_LINE: u8 = 2;
+
+// The longest `CONNECT` payload: the token, the scope's kind, a line and its trigger.
+pub const CONNECT_PAYLOAD_MAX: usize = 2 + 1 + 4 + 1;
+
+pub fn encode_connect(token: u16, scope: Scope, out: &mut [u8; CONNECT_PAYLOAD_MAX]) -> usize {
+	out[0..2].copy_from_slice(&token.to_le_bytes());
+	match scope {
+		Scope::Whole => 2,
+		Scope::I2cAddress(address) => {
+			out[2] = SCOPE_I2C_ADDRESS;
+			out[3] = address;
+			4
+		}
+		Scope::GpioLine { line, trigger } => {
+			out[2] = SCOPE_GPIO_LINE;
+			out[3..7].copy_from_slice(&line.to_le_bytes());
+			out[7] = trigger as u8;
+			8
+		}
+	}
+}
+
+// The token and the scope. A scope of a kind this build does not know, an address past seven bits, a trigger
+// outside the set or a byte past the scope is refused whole: a connection whose scope cannot be read is not
+// one a controller may serve as if it were unscoped.
+pub fn decode_connect_scoped(payload: &[u8]) -> Result<(u16, Scope), FrameError> {
+	if payload.len() < U16_PAYLOAD_LEN {
+		return Err(FrameError::PayloadShape);
+	}
+	let token = u16::from_le_bytes([payload[0], payload[1]]);
+	let scope = match &payload[2..] {
+		[] => Scope::Whole,
+		[SCOPE_I2C_ADDRESS, address] if *address <= 0x7F => Scope::I2cAddress(*address),
+		[SCOPE_GPIO_LINE, a, b, c, d, trigger] => match GpioTrigger::from_u8(*trigger) {
+			Some(trigger) => Scope::GpioLine { line: u32::from_le_bytes([*a, *b, *c, *d]), trigger },
+			None => return Err(FrameError::UnknownValue(*trigger as u16)),
+		},
+		_ => return Err(FrameError::PayloadShape),
+	};
+	Ok((token, scope))
 }
 
 pub fn decode_resource(payload: &[u8]) -> Result<ResourceKind, FrameError> {

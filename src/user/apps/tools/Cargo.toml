@@ -339,6 +339,11 @@ name = "lsusb"
 path = "src/lsusb.rs"
 
 [[bin]]
+# WHICH BUTTON IS PRESSED ON WHICH GAMEPAD: InputService's console gamepad stream, full-screen or as lines.
+name = "gamepad"
+path = "src/gamepad.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

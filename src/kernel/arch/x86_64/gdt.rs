@@ -47,6 +47,19 @@ const RSP0_STACK_SIZE: usize = 4096 * 5;
 // this core's own TSS descriptor.
 const GDT_ENTRIES: usize = 6 + 2;
 
+// THE I/O PERMISSION BITMAP, one bit per port of the 64 KiB port space, directly after the TSS and
+// followed by the byte of ones the processor requires after it: an access is checked against every bit
+// it covers, and a two- or four-byte access at the top of the space reads the byte past the last one.
+// A SET BIT REFUSES ITS PORT. What each core's bitmap holds is loaded by `ioports` on every switch.
+pub const IO_BITMAP_BYTES: usize = 0x1_0000 / 8;
+
+// Where the bitmap starts, as the TSS's I/O map base names it: right after the 104-byte TSS.
+pub const IOMAP_OFFSET: u16 = size_of::<Tss>() as u16;
+
+// An I/O map base PAST THE TSS'S LIMIT, which the processor reads as "there is no bitmap": every port
+// is refused and nothing needs copying. A core runs a process with no mapped range this way.
+pub const IOMAP_REFUSE: u16 = u16::MAX;
+
 #[repr(C, packed)]
 struct Tss {
 	reserved0: u32,
@@ -60,7 +73,7 @@ struct Tss {
 
 impl Tss {
 	const fn new() -> Self {
-		Self { reserved0: 0, privilege_stack_table: [0; 3], reserved1: 0, interrupt_stack_table: [0; 7], reserved2: 0, reserved3: 0, iomap_base: size_of::<Tss>() as u16 }
+		Self { reserved0: 0, privilege_stack_table: [0; 3], reserved1: 0, interrupt_stack_table: [0; 7], reserved2: 0, reserved3: 0, iomap_base: IOMAP_REFUSE }
 	}
 }
 
@@ -71,13 +84,20 @@ impl Tss {
 struct CpuArea {
 	gdt: [u64; GDT_ENTRIES],
 	tss: Tss,
+	// The bitmap and the trailing byte of ones, which must follow the TSS with nothing in between: the
+	// processor finds it at the TSS base plus `IOMAP_OFFSET`.
+	io_bitmap: [u8; IO_BITMAP_BYTES + 1],
 	double_fault_stack: [u8; IST_STACK_SIZE],
 	rsp0_stack: [u8; RSP0_STACK_SIZE],
 }
 
+const _: () = assert!(core::mem::offset_of!(CpuArea, io_bitmap) == core::mem::offset_of!(CpuArea, tss) + IOMAP_OFFSET as usize);
+// Eight-byte aligned, so `ioports` writes it a word at a time.
+const _: () = assert!(core::mem::offset_of!(CpuArea, io_bitmap) % 8 == 0);
+
 impl CpuArea {
 	const fn new() -> Self {
-		Self { gdt: [0; GDT_ENTRIES], tss: Tss::new(), double_fault_stack: [0; IST_STACK_SIZE], rsp0_stack: [0; RSP0_STACK_SIZE] }
+		Self { gdt: [0; GDT_ENTRIES], tss: Tss::new(), io_bitmap: [0xFF; IO_BITMAP_BYTES + 1], double_fault_stack: [0; IST_STACK_SIZE], rsp0_stack: [0; RSP0_STACK_SIZE] }
 	}
 }
 
@@ -108,12 +128,16 @@ unsafe fn install(area: *mut CpuArea) {
 		(*area).tss.interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = stack_base + IST_STACK_SIZE as u64;
 		let rsp0_base = addr_of!((*area).rsp0_stack) as u64;
 		(*area).tss.privilege_stack_table[0] = rsp0_base + RSP0_STACK_SIZE as u64;
-		// No I/O permission bitmap: point past the TSS limit (set explicitly - a
-		// heap-allocated area arrives zeroed, not through Tss::new).
-		(*area).tss.iomap_base = size_of::<Tss>() as u16;
+		// EVERY PORT REFUSED until a process that holds a range runs here: the bitmap all ones and the
+		// map base past the limit. Both set explicitly - a heap-allocated area arrives ZEROED, and a
+		// zeroed bitmap allows every port.
+		core::ptr::write_bytes(addr_of_mut!((*area).io_bitmap) as *mut u8, 0xFF, IO_BITMAP_BYTES + 1);
+		(*area).tss.iomap_base = IOMAP_REFUSE;
 
+		// THE LIMIT COVERS THE BITMAP AND ITS TRAILING BYTE. The processor caches it in TR at `ltr`, so it
+		// is sized here, before the load.
 		let tss_base = addr_of!((*area).tss) as u64;
-		let (low, high) = tss_descriptor(tss_base, (size_of::<Tss>() - 1) as u32);
+		let (low, high) = tss_descriptor(tss_base, (size_of::<Tss>() + IO_BITMAP_BYTES + 1 - 1) as u32);
 		gdt[6] = low;
 		gdt[7] = high;
 
@@ -173,6 +197,13 @@ pub fn rsp0_slot_addr() -> u64 {
 	let high = unsafe { gdt.add(7).read() };
 	let tss_base = ((low >> 16) & 0xFF_FFFF) | (((low >> 56) & 0xFF) << 24) | ((high & 0xFFFF_FFFF) << 32);
 	tss_base + 4
+}
+
+// Where the running core's bitmap and its TSS's I/O map base field are, found the way `rsp0_slot_addr`
+// finds the RSP0 slot. The per-CPU block keeps both so the switch path reaches them without the GDT.
+pub fn io_slots() -> (u64, u64) {
+	let tss_base = rsp0_slot_addr() - 4;
+	(tss_base + IOMAP_OFFSET as u64, tss_base + core::mem::offset_of!(Tss, iomap_base) as u64)
 }
 
 // Build the two 64-bit halves of a 64-bit TSS system descriptor.

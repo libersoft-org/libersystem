@@ -2731,6 +2731,66 @@ pub fn device_msix_acquire(claim: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, claim, 0, 0, 0) as i64 }
 }
 
+// ONE RESOURCE OF A CLAIMED ROW, by kind and index - see `SYS_DEVICE_RESOURCE_ACQUIRE`. The one kind so far
+// is `RESOURCE_KIND_PORT_RANGE`, whose index is a position in the row's `DeviceInfo::ports`.
+pub fn device_resource_acquire(claim: u64, kind: u64, index: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_RESOURCE_ACQUIRE, claim, kind, index, 0) as i64 }
+}
+
+// Grant a port range to this process: its threads may use those ports from their next access. 0, or a
+// negative error (`ERR_UNSUPPORTED` on a machine with no port space).
+pub fn port_range_map(range: u64) -> i64 {
+	unsafe { syscall(SYS_PORT_RANGE_MAP, range, 0, 0, 0) as i64 }
+}
+
+// Take it back: 1 when every core confirmed, 0 when one did not answer in time (the ports are then retired
+// for the boot), or a negative error.
+pub fn port_range_unmap(range: u64) -> i64 {
+	unsafe { syscall(SYS_PORT_RANGE_UNMAP, range, 0, 0, 0) as i64 }
+}
+
+// THE PORT INSTRUCTIONS, for a driver whose process mapped a range covering the port. A port outside every
+// mapped range is a general protection fault that ends the process: the processor's own check, against the
+// permission bitmap the kernel loads for this process on every core it runs on.
+#[cfg(target_arch = "x86_64")]
+pub mod port {
+	#[inline]
+	pub fn inb(port: u16) -> u8 {
+		let value: u8;
+		unsafe { core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags)) };
+		value
+	}
+
+	#[inline]
+	pub fn inw(port: u16) -> u16 {
+		let value: u16;
+		unsafe { core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags)) };
+		value
+	}
+
+	#[inline]
+	pub fn inl(port: u16) -> u32 {
+		let value: u32;
+		unsafe { core::arch::asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags)) };
+		value
+	}
+
+	#[inline]
+	pub fn outb(port: u16, value: u8) {
+		unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)) };
+	}
+
+	#[inline]
+	pub fn outw(port: u16, value: u16) {
+		unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags)) };
+	}
+
+	#[inline]
+	pub fn outl(port: u16, value: u32) {
+		unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)) };
+	}
+}
+
 // Reboot or power off the machine: `action` is POWER_REBOOT or POWER_OFF. On success
 // the machine resets / powers off and this never returns; a negative error otherwise.
 // Reboot or power the machine off. `power` must be a handle to the ROOT Domain carrying

@@ -29,14 +29,13 @@ use crate::target::Surface;
 /// THE SOURCE IS THE THING BEING FILTERED and the graph's `Source` node is where it enters. A graph
 /// with no `Source` is a legal graph that ignores its input - a flood, a gradient of nodes, an image
 /// composited on its own - and it is not an error.
-#[allow(clippy::too_many_arguments)]
 ///
 /// THE NODE TABLE IS THE LANE'S AND THE KERNELS ARE THE PREPARED LIST'S. `results` holds one entry per
 /// node while the graph runs and is reserved at `prepare` for the list's largest graph, and a blur's
 /// weights were computed there with the graph (`kernels`), so evaluating a filter in a tile allocates
 /// nothing - it used to build both, in every tile the filtered layer reached.
 #[allow(clippy::too_many_arguments)]
-pub fn evaluate(graph: &FilterGraph, kernels: &[Option<(Vec<f32>, Vec<f32>)>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
+pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
 	results.clear();
 	let mut outcome: Result<Surface, Error> = Err(Error::Allocation);
 	for (index, node) in graph.nodes().iter().enumerate() {
@@ -343,10 +342,11 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 	}
 }
 
-/// A normalised Gaussian kernel out to three standard deviations, which is the reach the profile's
-/// bounds map promises.
+/// A blur's weights across and down.
+pub type BlurKernel = (Vec<f32>, Vec<f32>);
+
 /// Every blur node's two kernels, in node order, for `prepare` to hold with the graph.
-pub fn kernels(graph: &FilterGraph) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
+pub fn kernels(graph: &FilterGraph) -> Vec<Option<BlurKernel>> {
 	graph
 		.nodes()
 		.iter()
@@ -357,6 +357,8 @@ pub fn kernels(graph: &FilterGraph) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
 		.collect()
 }
 
+/// A normalised Gaussian kernel out to three standard deviations, which is the reach the profile's
+/// bounds map promises.
 fn kernel(sigma: f32) -> Vec<f32> {
 	let sigma = sigma.abs();
 	if !(sigma.is_finite() && sigma > 0.0) {

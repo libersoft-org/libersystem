@@ -1,0 +1,9 @@
+package liber:gpio-device@1
+enum gpio-trigger(none=0,rising=1,falling=2,both=3,high=4,low=5)
+record gpio-line(line:u32,name:string:bound=64,trigger:gpio-trigger)
+record gpio-event(level:bool,sequence:u32)
+interface gpio-device
+method gpio-device.line op=1 () -> result<gpio-line, liber:base@1::error>
+method gpio-device.level op=2 () -> result<bool, liber:base@1::error>
+method gpio-device.events op=3 () -> stream<gpio-event>
+method gpio-device.acknowledge op=4 () -> result<unit, liber:base@1::error>

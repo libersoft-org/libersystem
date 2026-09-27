@@ -592,7 +592,7 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			"sdhci" => DmaPolicy::TrustedUntranslated,
 			// THE IN-GUEST FIXTURES MASTER NOTHING: each binds a QEMU test function only to hold a
 			// binding, never maps it, and publishes what it emulates over ordinary channels.
-			"bt_fixture" | "power_fixture" | "smartcard_fixture" | "modem_fixture" | "camera_fixture" | "midi_fixture" | "admin_fixture" => DmaPolicy::None,
+			"bt_fixture" | "power_fixture" | "smartcard_fixture" | "modem_fixture" | "camera_fixture" | "midi_fixture" | "admin_fixture" | "gamepad_fixture" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");
@@ -693,6 +693,19 @@ fn a_minted_connection_names_at_most_the_interfaces_own_bound() {
 	let over = with_role(&format!("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [{kinds}]\n"));
 	let error = Manifest::parse(&over, &root).unwrap_err().to_string();
 	assert!(error.contains(&format!("may name at most {MAX_ROLE_KINDS} kinds")), "{error}");
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+// A BUS IS NEVER OPENED WHOLE: no role may be minted a connection that reaches every device on an I2C
+// controller or every line of a GPIO controller - DeviceManager scopes each of their connections to one.
+fn no_role_names_a_whole_bus() {
+	let root = fixture_workspace();
+	for (kind, name) in [("i2c-bus", "I2cBus"), ("gpio-lines", "GpioLines")] {
+		let role = with_role(&format!("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [\"{kind}\"]\n"));
+		let error = Manifest::parse(&role, &root).unwrap_err().to_string();
+		assert!(error.contains(&format!("no service is minted a connection to a whole {name} controller")), "{error}");
+	}
 	fs::remove_dir_all(root).unwrap();
 }
 

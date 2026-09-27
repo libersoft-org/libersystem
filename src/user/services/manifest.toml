@@ -461,6 +461,16 @@ path = "user/libs/protocol/midi-proto"
 owner = "midi-device-proto"
 path = "user/libs/protocol/midi-device-proto"
 
+# THE TWO BUS CONTRACTS: an I2C/SMBus controller's and a GPIO controller's, each served on connections scoped
+# to one address or one line.
+[[sources]]
+owner = "i2c-device-proto"
+path = "user/libs/protocol/i2c-device-proto"
+
+[[sources]]
+owner = "gpio-device-proto"
+path = "user/libs/protocol/gpio-device-proto"
+
 [[sources]]
 owner = "spool-proto"
 path = "user/libs/protocol/spool-proto"
@@ -1522,6 +1532,18 @@ destination = "libexec/midifail.lsexe"
 providers = []
 development = true
 
+# THE GAMEPAD TOOL GATE'S PROBE: the second half of `gamepad --lines | gamepadcheck`, holding the gamepad
+# fixture's control endpoint and nothing else. Development-only, like the fixture it drives.
+[[programs]]
+name = "gamepadcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/gamepadcheck.lsexe"
+providers = []
+development = true
+
 # THE SPOOL PROBE: a real client of SpoolService holding `spool` and nothing else. The kernel's sink scenario
 # runs it against the production service and a harness-served printer, which is why it ships in the test
 # image rather than behind the development feature.
@@ -1621,6 +1643,16 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsusb.lsexe"
 providers = ["base-proto", "device-client", "device-proto", "wire", "lsrt"]
+
+# WHICH BUTTON IS PRESSED ON WHICH GAMEPAD, from the console: `input-gamepad` and nothing else.
+[[programs]]
+name = "gamepad"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/gamepad.lsexe"
+providers = ["base-proto", "input-proto", "ipc-client", "lico", "wire", "lsrt"]
 
 [[programs]]
 name = "lsvol"
@@ -2851,6 +2883,33 @@ provides = [
 ]
 heartbeat-deadline = 100
 
+# THE IN-GUEST GAMEPAD FIXTURE: gamepads of the harness's shape - X, Y, Z and Rz over 0..255, sixteen buttons and
+# one hat - published over the production `gamepad` wire through the same publisher table the xHCI driver uses,
+# attached, reported and detached by the gamepad tool gate's probe through its control endpoint. It is not a claim
+# about USB: it delivers the frames a driver would, which is the half the USB proof does not reach.
+#
+# DEVELOPMENT-ONLY AND BOUND BY ADDRESS, like the other fixtures: QEMU's `edu` test function at a pinned
+# address only the gamepad tool's gate adds.
+[[programs]]
+name = "gamepad_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/gamepad_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 23, func = 0 } },
+]
+priority = "quirk"
+provides = [{ kind = "gamepad", most = 1 }, { kind = "fixture-control", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
 # THE IN-GUEST ADMINISTRATIVE EXECUTOR, for the administrative-path gate alone: a bounded probe write over two
 # target generations behind an `admin-executor` publication only AdminService's catalogue connection admits,
 # and a read-only witness behind `fixture-control`. A shipping image has neither the program nor the device.
@@ -2887,6 +2946,26 @@ destination = "libexec/dev_agent.lsexe"
 providers = []
 development = true
 
+# A GPIO CONTROLLER, and never the whole controller to anyone. Its one `gpio-lines` publication is
+# reached only through the LINE-SCOPED connections DeviceManager mints - for a child binding and for the
+# ACPI service's event lines - and no role or permission row may name the kind. Sixteen at once: the lines
+# the firmware lists for its own events, and one per child.
+[[programs]]
+name = "virtio_gpio"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_gpio.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 41 }]
+provides = [{ kind = "gpio-lines", most = 1, consumers = 16 }]
+heartbeat-deadline = 100
+
 [[programs]]
 name = "virtio_gpu"
 owner = "drivers"
@@ -2901,6 +2980,25 @@ lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 16 }]
 provides = [{ kind = "display", most = 1 }]
+heartbeat-deadline = 100
+
+# AN I2C CONTROLLER, and never the whole bus to anyone. Its one `i2c-bus` publication is reached only
+# through the ADDRESS-SCOPED connections DeviceManager mints - for a child binding and for the ACPI
+# service's operation regions - and no role or permission row may name the kind. Eight at once.
+[[programs]]
+name = "virtio_i2c"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_i2c.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 34 }]
+provides = [{ kind = "i2c-bus", most = 1, consumers = 8 }]
 heartbeat-deadline = 100
 
 [[programs]]
@@ -3124,6 +3222,10 @@ provides = [
 	{ kind = "modem", most = 1, consumers = 1 },
 	{ kind = "camera", most = 1, consumers = 1 },
 	{ kind = "admin-executor", most = 1, consumers = 1 },
+	# AND GAMEPADS, WHICH ARE NOT A POINTER: every gamepad of every HID interface this controller binds, on
+	# one standing publication made at the handshake whether or not one is plugged in, with InputService its
+	# one consumer. LAST, because an offer's token is its position.
+	{ kind = "gamepad", most = 1 },
 ]
 heartbeat-deadline = 100
 
@@ -3737,6 +3839,10 @@ interface = "liber:input@1/input-admin"
 # COUNT compiled into the manager: a third pointing device had nowhere to go. This service asks the
 # catalogue for the input and pointer kinds instead, and takes what it finds.
 #
+# AND FOR GAMEPADS, whose subscription it KEEPS OPEN - a second controller, the fixture, a restarted
+# driver's replacement are adopted as they are published and dropped as they are withdrawn - where the
+# input, pointer and touch kinds are taken once, at bootstrap.
+#
 # LAST, like every addition to a role list: these are read POSITIONALLY from the generated
 # `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.
 [[services.roles]]
@@ -3745,7 +3851,7 @@ kind = "factory"
 provider = "device_manager"
 source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
-kinds = ["input", "pointer", "touch"]
+kinds = ["input", "pointer", "touch", "gamepad"]
 presence = "optional"
 
 # THE TRUSTED KEYBOARD'S OWN SINK, apart from the merged `KEYS`: DeviceManager hands its producer to the
@@ -5344,6 +5450,20 @@ providers = ["event-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 name = "midi-device-proto"
 owner = "midi-device-proto"
 destination = "lib/protocol/midi-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "i2c-device-proto"
+owner = "i2c-device-proto"
+destination = "lib/protocol/i2c-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "gpio-device-proto"
+owner = "gpio-device-proto"
+destination = "lib/protocol/gpio-device-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 

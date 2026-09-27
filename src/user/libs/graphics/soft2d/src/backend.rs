@@ -13,8 +13,9 @@
 //! and the same target therefore costs what the drawing costs and nothing else.
 //!
 //! AND THE REPLAY IS CUT INTO UNITS that the caller's `Workers` run on its lanes - bands of tile rows,
-//! or tiles through a tile-major intermediate - each replayed in the serial order of its own tiles,
-//! so every schedule draws the pixels the serial walk draws.
+//! tiles through a tile-major intermediate, or tiles written in place through their rows' parts - each
+//! replayed in the serial order of its own tiles, so every schedule draws the pixels the serial walk
+//! draws.
 //!
 //! AND THE REPLAY IS TILED. Each tile decodes its own rectangle of the target once, replays the
 //! commands binned to it, and encodes once - so the conversion is at the edges of a tile rather than
@@ -170,7 +171,7 @@ pub struct SoftPrepared {
 	ramps: Vec<Option<Ramp>>,
 	filters: Vec<render2d::filter::FilterGraph>,
 	/// Each filter graph's blur kernels, in node order, computed with the graph.
-	kernels: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
+	kernels: Vec<Vec<Option<crate::filter::BlurKernel>>>,
 	working: Working,
 	target_transfer: graphics_profile::image::Transfer,
 	/// What the destination said it can show, carried from the description to the one place that
@@ -302,11 +303,11 @@ impl Default for Soft2d<'_> {
 impl<'a> Soft2d<'a> {
 	/// A backend for a drawing that references no images and no glyphs.
 	pub fn new() -> Self {
-		// TILES BY DEFAULT, BECAUSE THEY WERE MEASURED FASTER: at every worker count from two to sixty-four
-		// on the five frozen scenes, bands capping at eight units of a 480-row frame while tiles went on
-		// to eighty (the numbers are in `docs/PERF.md`). A frame on one lane is cut into bands whatever
-		// this says, since only several lanes need the intermediate.
-		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Tiles, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), tables: Vec::new() }
+		// TILES WRITTEN IN PLACE BY DEFAULT, BECAUSE THEY WERE MEASURED FASTEST: on the five frozen scenes
+		// at four to sixty-four workers they beat bands, which stop at eight units of a 480-row frame, and
+		// tiles through the intermediate, which copy what was drawn after every unit has returned (the
+		// numbers are in `docs/PERF.md`). A frame on one lane is cut into bands whatever this says.
+		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Rectangles, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), tables: Vec::new() }
 	}
 
 	/// Replay a frame's units on `workers`' lanes. `Serial` - this thread, unit after unit - is the
@@ -316,8 +317,8 @@ impl<'a> Soft2d<'a> {
 		self
 	}
 
-	/// Cut frames into units of this kind. MEASURED, NOT PREFERRED: the two kinds are what the choice of
-	/// the unit was measured between, and a benchmark asks for each.
+	/// Cut frames into units of this kind. MEASURED, NOT PREFERRED: the three kinds are what the choice
+	/// of the unit was measured between, and a benchmark asks for each.
 	pub fn with_units(mut self, kind: UnitKind) -> Self {
 		self.unit_kind = kind;
 		self
@@ -811,38 +812,44 @@ impl<'a> Backend for Soft2d<'a> {
 		// LANES BEYOND THE FIRST ARE FITTED ONLY INTO WHAT IS LEFT, up to the lanes the pool offers and
 		// the units there are to share out - so a lane never displaces a copy, and every worker count
 		// keeps the copies the one-lane frame keeps. A COST THAT EXISTS ONLY WITH SEVERAL LANES - the
+		// table of a frame cut into tiles, whose every entry can hold a tile's row parts, and the
 		// tile-major intermediate - is charged together with the second lane, and a frame with no room
 		// for both runs on one lane without it.
 		let tile_units = cut(&tiling, &bins, UnitKind::Tiles);
 		let band_units = cut(&tiling, &bins, UnitKind::Bands);
 		let slot_bytes = (TILE_SIZE as usize) * (TILE_SIZE as usize) * target.format.bytes_per_pixel() as usize;
-		let (wanted_units, intermediate_bytes) = match self.unit_kind {
-			UnitKind::Tiles => (tile_units.len(), (tile_units.len() * slot_bytes) as u64),
+		let table_bytes = (tile_units.len() * core::mem::size_of::<Unit<'static>>()) as u64;
+		let (wanted_units, several_lanes_bytes) = match self.unit_kind {
+			UnitKind::Tiles => (tile_units.len(), table_bytes + (tile_units.len() * slot_bytes) as u64),
+			UnitKind::Rectangles => (tile_units.len(), table_bytes),
 			UnitKind::Bands => (band_units.len(), 0),
 		};
 		let offered = self.workers.lanes().max(1).min(wanted_units.max(1));
 		let mut lanes = 1usize;
 		while lanes < offered {
-			let extra = lane_bytes + if lanes == 1 { intermediate_bytes } else { 0 };
+			let extra = lane_bytes + if lanes == 1 { several_lanes_bytes } else { 0 };
 			if scratch_bytes + extra > ceiling {
 				break;
 			}
 			scratch_bytes += extra;
 			lanes += 1;
 		}
-		// ONE LANE IS THE SERIAL WALK, whatever the units were going to be: tiles need the intermediate
-		// only to be written from several lanes at once, and a frame on one lane is cut into bands.
-		let (unit_kind, units) = if lanes > 1 && self.unit_kind == UnitKind::Tiles { (UnitKind::Tiles, tile_units) } else { (UnitKind::Bands, band_units) };
+		// ONE LANE IS THE SERIAL WALK, whatever the units were going to be: tiles are cut only to be drawn
+		// from several lanes at once, and a frame on one lane is cut into bands.
+		let (unit_kind, units) = if lanes > 1 && self.unit_kind != UnitKind::Bands { (self.unit_kind, tile_units) } else { (UnitKind::Bands, band_units) };
 		while self.lanes.len() < lanes {
 			self.lanes.push(Lane::default());
 		}
 		for lane in self.lanes.iter_mut().take(lanes).skip(1) {
 			shape.reserve(lane)?;
 		}
-		if unit_kind == UnitKind::Tiles {
+		// GROWN AND NEVER SHRUNK, as the lanes are: a list prepared earlier may still be rendered.
+		if unit_kind == UnitKind::Tiles && self.intermediate.len() < units.len() * slot_bytes {
 			self.intermediate.resize(units.len() * slot_bytes, 0);
 		}
-		self.finished.resize(units.len(), false);
+		if self.finished.len() < units.len() {
+			self.finished.resize(units.len(), false);
+		}
 		// THE FRAME'S OWN TABLES, sized here so the replay only fills them.
 		self.unit_table.reserve(units.len().saturating_sub(self.unit_table.len()));
 		self.shader_table.reserve(steps.len().saturating_sub(self.shader_table.len()));
@@ -959,6 +966,14 @@ impl<'a> Backend for Soft2d<'a> {
 				assemble(target, prepared, intermediate, finished);
 				outcome
 			}
+			UnitKind::Rectangles => {
+				let mut units: Vec<Unit<'_>> = recycle(core::mem::take(unit_table));
+				rectangle_units(&mut units, target, &prepared.tiling, &prepared.units)?;
+				workers.run(lanes, &mut units, &work);
+				let outcome = verdict(&units, lanes, &stopped);
+				*unit_table = recycle(units);
+				outcome
+			}
 		};
 		*shader_table = recycle(shaders);
 		outcome
@@ -1009,7 +1024,7 @@ fn cut(tiling: &Tiling, bins: &Bins, kind: UnitKind) -> Vec<(u32, u32)> {
 				}
 			}
 		}
-		UnitKind::Tiles => {
+		UnitKind::Tiles | UnitKind::Rectangles => {
 			for index in 0..tiling.count() {
 				if draws(index) {
 					units.push((index as u32, 1));
@@ -1055,6 +1070,51 @@ fn band_units<'u>(units: &mut Vec<Unit<'u>>, target: &'u mut ImageViewMut<'_>, t
 	}
 	if bottom_left {
 		units.reverse();
+	}
+	Ok(())
+}
+
+/// The rectangle units of a frame: each tile that draws, holding the parts of the target's rows it
+/// covers.
+///
+/// EVERY ROW OF THE TARGET IS CUT INTO ITS TILES' PARTS, in memory order, and each part goes to the unit
+/// whose tile it is - so no two units hold a byte in common, and a unit reads and writes its own
+/// rectangle of the target and nothing else, with no intermediate between it and the target.
+fn rectangle_units<'u>(units: &mut Vec<Unit<'u>>, target: &'u mut ImageViewMut<'_>, tiling: &Tiling, wanted: &[(u32, u32)]) -> Result<(), Error> {
+	let layout = *target.layout();
+	let pitch = layout.pitch as usize;
+	let height = layout.extent.height;
+	let visible = layout.minimum_row_bytes().ok_or(Error::Allocation)? as usize;
+	let part_bytes = TILE_SIZE as usize * layout.storage.bytes_per_pixel() as usize;
+	let bottom_left = layout.origin == graphics_core::layout::RowOrigin::BottomLeft;
+	for (index, &(first_tile, tiles)) in wanted.iter().enumerate() {
+		let tile = tiling.tile(first_tile as usize);
+		units.push(Unit { index, first_tile, tiles, access: Access::Rect { rows: core::array::from_fn(|_| <&mut [u8]>::default()), tile, layout }, ran: false, whole: false });
+	}
+	for (memory_row, row) in target.bytes_mut().chunks_mut(pitch).take(height as usize).enumerate() {
+		// The row's place in the picture, which a bottom-left image counts from the bottom.
+		let y = if bottom_left { height - 1 - memory_row as u32 } else { memory_row as u32 };
+		let first = (y / tiling.size) * tiling.columns;
+		// THE UNITS OF THIS TILE ROW, a contiguous run of them: units are in tile order.
+		let from = units.partition_point(|unit| unit.first_tile < first);
+		let to = units.partition_point(|unit| unit.first_tile < first + tiling.columns);
+		let length = visible.min(row.len());
+		let mut rest: &'u mut [u8] = &mut row[..length];
+		let mut column = 0u32;
+		for unit in &mut units[from..to] {
+			// Past the parts of the tiles that draw nothing, to this unit's.
+			let skip = (unit.first_tile - first - column) as usize * part_bytes;
+			let taken = core::mem::take(&mut rest);
+			let (_, after_skip) = taken.split_at_mut(skip.min(taken.len()));
+			let (part, after) = after_skip.split_at_mut(part_bytes.min(after_skip.len()));
+			rest = after;
+			column = unit.first_tile - first + 1;
+			if let Access::Rect { rows, tile, .. } = &mut unit.access
+				&& let Some(slot) = rows.get_mut((y - tile.y) as usize)
+			{
+				*slot = part;
+			}
+		}
 	}
 	Ok(())
 }

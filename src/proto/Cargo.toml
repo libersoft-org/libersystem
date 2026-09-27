@@ -30,6 +30,8 @@ channel-client-impl = [
 	"event-proto/channel-client-impl",
 	"midi-proto/channel-client-impl",
 	"midi-device-proto/channel-client-impl",
+	"i2c-device-proto/channel-client-impl",
+	"gpio-device-proto/channel-client-impl",
 	"spool-proto/channel-client-impl",
 	"printer-device-proto/channel-client-impl",
 	"import-proto/channel-client-impl",
@@ -65,6 +67,8 @@ shared-image = [
 	"event-proto/shared-image",
 	"midi-proto/shared-image",
 	"midi-device-proto/shared-image",
+	"i2c-device-proto/shared-image",
+	"gpio-device-proto/shared-image",
 	"spool-proto/shared-image",
 	"printer-device-proto/shared-image",
 	"import-proto/shared-image",
@@ -109,6 +113,8 @@ camera-device-proto = { path = "../user/libs/protocol/camera-device-proto" }
 event-proto = { path = "../user/libs/protocol/event-proto" }
 midi-proto = { path = "../user/libs/protocol/midi-proto" }
 midi-device-proto = { path = "../user/libs/protocol/midi-device-proto" }
+i2c-device-proto = { path = "../user/libs/protocol/i2c-device-proto" }
+gpio-device-proto = { path = "../user/libs/protocol/gpio-device-proto" }
 spool-proto = { path = "../user/libs/protocol/spool-proto" }
 printer-device-proto = { path = "../user/libs/protocol/printer-device-proto" }
 import-proto = { path = "../user/libs/protocol/import-proto" }

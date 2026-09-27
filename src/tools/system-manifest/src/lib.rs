@@ -204,6 +204,13 @@ pub enum ProviderKindName {
 	PtpTransport,
 	/// AN ADMINISTRATIVE EXECUTOR, with AdminService its one consumer.
 	AdminExecutor,
+	/// GAMEPADS - axes, buttons and hats, several on one connection - with InputService its one consumer.
+	Gamepad,
+	/// AN I2C/SMBUS CONTROLLER, reached only through connections DeviceManager mints scoped to one address -
+	/// which is why no role or permission row may name it.
+	I2cBus,
+	/// A GPIO CONTROLLER'S INPUT LINES, reached only through connections scoped to one line.
+	GpioLines,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -246,6 +253,9 @@ impl ProviderKindName {
 			ProviderKindName::Printer => 18,
 			ProviderKindName::PtpTransport => 19,
 			ProviderKindName::AdminExecutor => 20,
+			ProviderKindName::Gamepad => 21,
+			ProviderKindName::I2cBus => 22,
+			ProviderKindName::GpioLines => 23,
 		}
 	}
 }
@@ -1404,6 +1414,15 @@ impl Manifest {
 				// a role naming it would put a test authority into the configuration that ships.
 				if raw_role.kinds.contains(&ProviderKindName::FixtureControl) {
 					push_error(&mut errors, format!("{where_role}.kinds"), "no service is minted a connection that reaches a fixture's control endpoint");
+				}
+				// A BUS IS NEVER OPENED WHOLE. An I2C controller's or a GPIO controller's only connections are
+				// the ones DeviceManager mints scoped to ONE address or ONE line - for a child binding with its
+				// claim, and for the ACPI service - so a role naming the kind would be a connection to every
+				// device on the bus, which is exactly what the scope exists to rule out.
+				for bus in [ProviderKindName::I2cBus, ProviderKindName::GpioLines] {
+					if raw_role.kinds.contains(&bus) {
+						push_error(&mut errors, format!("{where_role}.kinds"), format!("no service is minted a connection to a whole {bus:?} controller: its connections are scoped to one address or line by DeviceManager"));
+					}
 				}
 				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive, handed_on: raw_role.handed_on, kinds: raw_role.kinds.clone() });
 			}

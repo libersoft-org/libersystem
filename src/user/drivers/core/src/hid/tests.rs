@@ -344,3 +344,260 @@ fn an_absolute_axis_is_read_in_the_signedness_its_descriptor_declared() {
 	assert!(signed.pointer_fold(0, &[0xF0], &mut x, &mut y, &mut buttons, &mut wheel));
 	assert!(x < NORM_MAX / 2, "0xF0 of -127..127 is minus sixteen, near the low end: {x}");
 }
+
+// ------------------------------------------------------------------ gamepads
+//
+// A GAMEPAD IS A GAME PAD OR JOYSTICK APPLICATION COLLECTION CARRYING A MAPPED CONTROL, one per collection,
+// and none of its fields reaches the pointer, key, consumer or contact paths.
+
+use driver_protocol::gamepad::{CENTRED, State as PadState};
+
+/// THE HARNESS GADGET'S GAMEPAD, byte for byte what `usb-gadget.sh` writes for `hid-gamepad`: X, Y, Z and Rz
+/// over 0..255, sixteen buttons, and a four-bit Hat Switch over 0..7 (physical 0..315 degrees) with the NULL
+/// STATE flag, then four bits of padding - a seven-byte report.
+#[rustfmt::skip]
+pub(crate) fn gadget_gamepad_descriptor() -> Vec<u8> {
+	alloc::vec![
+		0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, // generic desktop, game pad, application
+		0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, // X, Y, Z, Rz
+		0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, // 0..255, four bytes
+		0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02, // buttons 1..16
+		0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3b, 0x01, 0x65, 0x14, // hat 0..7, 0..315 degrees
+		0x75, 0x04, 0x95, 0x01, 0x81, 0x42, // four bits, with null state
+		0x65, 0x00, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03, // four bits of padding
+		0xc0,
+	]
+}
+
+fn pad_state(shape: &driver_protocol::gamepad::Shape) -> PadState {
+	shape.initial()
+}
+
+#[test]
+// THE GADGET'S GAMEPAD, as the driver will see it: one gamepad of four axes, sixteen buttons and one hat;
+// its held level maps to the right buttons, the hat and the axes' own values; and its released hat - the
+// null value 15 - is CENTRED rather than refused.
+fn the_gadgets_gamepad_maps_onto_axes_buttons_and_a_hat() {
+	let layout = parse(&gadget_gamepad_descriptor());
+	assert!(layout.has_gamepad());
+	assert!(layout.is_useful(), "a gamepad is a device the system consumes");
+	assert!(!layout.has_pointer() && !layout.has_keyboard() && !layout.has_consumer() && !layout.has_digitizer(), "and it is none of the other things");
+	assert_eq!(layout.report_bytes(), 7, "four axes, sixteen buttons and a hat nibble with its padding");
+	let pads = layout.gamepads();
+	assert_eq!(pads.len(), 1);
+	assert_eq!((pads[0].application, pads[0].occurrence), (USAGE_GAME_PAD, 0));
+	let shape = pads[0].shape(b"usb 1d6b:0104 port 3 if 0").expect("a shape the wire takes");
+	assert_eq!(shape.buttons(), 16);
+	assert_eq!(shape.hats(), 1);
+	let usages: Vec<u32> = shape.axes().iter().map(|axis| axis.usage).collect();
+	assert_eq!(usages, [0x0001_0030, 0x0001_0031, 0x0001_0032, 0x0001_0035], "X, Y, Z and Rz, in bit order");
+	assert!(shape.axes().iter().all(|axis| (axis.minimum, axis.maximum) == (0, 255)));
+
+	// THE HELD LEVEL: X at 0, Z at 128, Rz at 255, buttons 1 and 16, the hat east.
+	let mut state = pad_state(&shape);
+	assert_eq!(state.hats[0], CENTRED, "before the first report the hat is centred and never north");
+	let applied = pads[0].apply(0, &[0, 128, 128, 255, 0x01, 0x80, 0x02], &mut state);
+	assert!(!applied.refused);
+	assert_eq!(state.buttons, 0x8001, "button 1 is bit 0 and button 16 is bit 15");
+	assert_eq!(state.hats[0], 2, "east is the third eighth");
+	assert_eq!(&state.axes[..4], &[0, 128, 128, 255], "the device's own values, never rescaled");
+
+	// RELEASED: nothing pressed, and the hat at the null value 15 - which a range check would refuse.
+	let applied = pads[0].apply(0, &[128, 128, 128, 128, 0, 0, 0x0f], &mut state);
+	assert!(!applied.refused, "a null hat is centred, not an error");
+	assert_eq!(state.buttons, 0);
+	assert_eq!(state.hats[0], CENTRED);
+
+	// NO POINTER AND NO KEY, whatever the report says.
+	let (mut x, mut y, mut buttons, mut wheel) = (0i32, 0i32, 0u8, 0i32);
+	assert!(!layout.pointer_fold(0, &[0, 128, 128, 255, 0xff, 0xff, 0x02], &mut x, &mut y, &mut buttons, &mut wheel), "the stick does not move a cursor");
+	assert_eq!((x, y, buttons, wheel), (0, 0, 0, 0), "and the buttons do not click");
+	let mut keys = 0;
+	layout.keys_diff(0, &[0u8; 7], &[0, 128, 128, 255, 0xff, 0xff, 0x02], &mut |_, _| keys += 1);
+	assert_eq!(keys, 0, "and nothing is a key");
+}
+
+#[test]
+#[rustfmt::skip]
+// A JOYSTICK WITH A THROTTLE AND A RUDDER ON THE SIMULATION PAGE: signed sixteen-bit X and Y read signed,
+// the Simulation axes after them in bit order, and four buttons.
+fn a_joystick_maps_its_simulation_axes_after_its_desktop_ones() {
+	let d: Vec<u8> = alloc::vec![
+		0x05, 0x01, 0x09, 0x04, 0xa1, 0x01, // generic desktop, joystick, application
+		0x09, 0x30, 0x09, 0x31, 0x16, 0x00, 0xfc, 0x26, 0xff, 0x03, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, // X, Y: -1024..1023
+		0x05, 0x02, 0x09, 0xbb, 0x09, 0xba, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, // throttle, rudder
+		0x05, 0x09, 0x19, 0x01, 0x29, 0x04, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x04, 0x81, 0x02, // buttons 1..4
+		0x75, 0x04, 0x95, 0x01, 0x81, 0x03, // padding
+		0xc0,
+	];
+	let layout = parse(&d);
+	let pads = layout.gamepads();
+	assert_eq!(pads.len(), 1);
+	assert_eq!(pads[0].application, USAGE_JOYSTICK);
+	let shape = pads[0].shape(b"stick").expect("a shape");
+	let usages: Vec<u32> = shape.axes().iter().map(|axis| axis.usage).collect();
+	assert_eq!(usages, [0x0001_0030, 0x0001_0031, 0x0002_00bb, 0x0002_00ba], "desktop X and Y, then the throttle and the rudder");
+	assert_eq!(shape.buttons(), 4);
+	assert_eq!(shape.hats(), 0);
+	let mut state = pad_state(&shape);
+	assert_eq!(&state.axes[..4], &[-1, -1, 127, 127], "each axis at its midpoint before the first report");
+	let x = (-500i16).to_le_bytes();
+	let y = 1023i16.to_le_bytes();
+	pads[0].apply(0, &[x[0], x[1], y[0], y[1], 200, 7, 0x05], &mut state);
+	assert_eq!(&state.axes[..4], &[-500, 1023, 200, 7], "a negative reading of a signed field is negative");
+	assert_eq!(state.buttons, 0b0101);
+	assert!(!layout.has_pointer(), "a joystick's X is not a pointer's X");
+}
+
+#[test]
+#[rustfmt::skip]
+// TWO PLAYERS IN ONE DESCRIPTOR: two Game Pad collections under two report ids are two gamepads, and a report
+// of one never moves the other.
+fn two_game_pad_collections_are_two_gamepads() {
+	let player = |id: u8| -> Vec<u8> { alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, id, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xc0] };
+	let mut d = player(1);
+	d.extend_from_slice(&player(2));
+	let layout = parse(&d);
+	assert!(layout.uses_ids());
+	let pads = layout.gamepads();
+	assert_eq!(pads.len(), 2, "one gamepad per collection");
+	assert_eq!((pads[0].occurrence, pads[1].occurrence), (0, 1));
+	assert!(pads[0].reads(1) && !pads[0].reads(2));
+	assert!(pads[1].reads(2) && !pads[1].reads(1));
+	let shape = pads[0].shape(b"one").expect("a shape");
+	let (mut first, mut second) = (pad_state(&shape), pad_state(&shape));
+	pads[0].apply(1, &[10, 20, 0x01], &mut first);
+	pads[1].apply(1, &[10, 20, 0x01], &mut second);
+	assert_eq!(first.buttons, 1, "player one's report is player one's");
+	assert_eq!(second, pad_state(&shape), "and player two did not move");
+	pads[1].apply(2, &[30, 40, 0x80], &mut second);
+	assert_eq!((second.buttons, second.axes[0], second.axes[1]), (0x80, 30, 40));
+}
+
+#[test]
+#[rustfmt::skip]
+// HOSTILE AND ODD GAMEPADS: past eight axes, past thirty-two buttons, a five-position hat, a Game Pad
+// collection with nothing mapped, and values outside their declared ranges with and without a null state.
+fn a_gamepad_is_mapped_within_its_bounds_and_its_ranges_are_not_stretched() {
+	// NINE AXES: the first eight in bit order, and the ninth costs nothing.
+	let d: Vec<u8> = alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x19, 0x30, 0x29, 0x38, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x09, 0x81, 0x02, 0xc0];
+	let shape = parse(&d).gamepads()[0].shape(b"nine").expect("a shape");
+	assert_eq!(shape.axes().len(), 8);
+	assert_eq!(shape.axes()[7].usage, 0x0001_0037, "Dial is the eighth and Wheel, the ninth, is not mapped");
+
+	// FORTY BUTTONS: buttons 1..=32 mapped, the rest not.
+	let d: Vec<u8> = alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x28, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x28, 0x81, 0x02, 0xc0];
+	let pads = parse(&d).gamepads();
+	let shape = pads[0].shape(b"forty").expect("a shape");
+	assert_eq!(shape.buttons(), 32);
+	let mut state = pad_state(&shape);
+	pads[0].apply(0, &[0xff, 0xff, 0xff, 0xff, 0xff], &mut state);
+	assert_eq!(state.buttons, u32::MAX, "every one of the thirty-two, and button thirty-three nowhere");
+
+	// A FIVE-POSITION HAT is not a hat this module maps; the collection's axis still is.
+	let d: Vec<u8> = alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x09, 0x30, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x09, 0x39, 0x15, 0x00, 0x25, 0x04, 0x75, 0x08, 0x95, 0x01, 0x81, 0x42, 0xc0];
+	let shape = parse(&d).gamepads()[0].shape(b"five").expect("a shape");
+	assert_eq!((shape.hats(), shape.axes().len()), (0, 1));
+
+	// A FOUR-POSITION HAT counts in quarters, which are twice the eighths.
+	let d: Vec<u8> = alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x09, 0x39, 0x15, 0x01, 0x25, 0x04, 0x75, 0x08, 0x95, 0x01, 0x81, 0x42, 0xc0];
+	let pads = parse(&d).gamepads();
+	let shape = pads[0].shape(b"four").expect("a shape");
+	let mut state = pad_state(&shape);
+	pads[0].apply(0, &[2], &mut state);
+	assert_eq!(state.hats[0], 2, "the second of four positions is east");
+
+	// A GAME PAD COLLECTION WITH NOTHING MAPPED - array-form buttons - is not a gamepad, and not useful.
+	let d: Vec<u8> = alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08, 0x15, 0x01, 0x25, 0x08, 0x75, 0x08, 0x95, 0x01, 0x81, 0x00, 0xc0];
+	let layout = parse(&d);
+	assert!(!layout.has_gamepad());
+	assert!(layout.gamepads().is_empty());
+	assert!(!layout.is_useful());
+
+	// AN AXIS OUTSIDE ITS RANGE: with a null state it is "no value" and keeps its last; without one it is
+	// refused - that field keeps its last, the report's other fields apply, and the answer says so.
+	let axis = |flags: u8| -> Vec<u8> { alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x09, 0x30, 0x15, 0x00, 0x25, 0x64, 0x75, 0x08, 0x95, 0x01, 0x81, flags, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xc0] };
+	for (flags, refused) in [(0x42u8, false), (0x02, true)] {
+		let pads = parse(&axis(flags)).gamepads();
+		let shape = pads[0].shape(b"range").expect("a shape");
+		let mut state = pad_state(&shape);
+		assert!(!pads[0].apply(0, &[40, 0], &mut state).refused);
+		assert_eq!(state.axes[0], 40);
+		let applied = pads[0].apply(0, &[200, 0x03], &mut state);
+		assert_eq!(applied.refused, refused, "flags {flags:#x}");
+		assert_eq!(state.axes[0], 40, "flags {flags:#x}: an out-of-range value is not clamped into a plausible one");
+		assert_eq!(state.buttons, 0x03, "flags {flags:#x}: and the rest of the report still applies");
+	}
+
+	// A HAT OUTSIDE ITS RANGE WITHOUT A NULL STATE is centred all the same: a released hat is such a value,
+	// and devices that omit the flag send it too.
+	let d: Vec<u8> = alloc::vec![0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x02, 0x75, 0x04, 0x81, 0x03, 0xc0];
+	let pads = parse(&d).gamepads();
+	let shape = pads[0].shape(b"hat").expect("a shape");
+	let mut state = pad_state(&shape);
+	pads[0].apply(0, &[0x03], &mut state);
+	assert_eq!(state.hats[0], 3);
+	assert!(!pads[0].apply(0, &[0x0f], &mut state).refused, "a centred hat is not an error");
+	assert_eq!(state.hats[0], CENTRED);
+}
+
+/// A THREE-BUTTON RELATIVE MOUSE with a wheel, as the boot mouse arranges one.
+#[rustfmt::skip]
+fn relative_mouse_descriptor() -> Vec<u8> {
+	alloc::vec![
+		0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, // mouse, pointer
+		0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, // buttons
+		0x95, 0x01, 0x75, 0x05, 0x81, 0x01, // padding
+		0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, // X, Y, wheel: relative
+		0xc0, 0xc0,
+	]
+}
+
+/// QEMU'S `usb-tablet`: three buttons, absolute X and Y over 0..0x7fff, a relative wheel.
+#[rustfmt::skip]
+fn qemu_tablet_descriptor() -> Vec<u8> {
+	alloc::vec![
+		0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, // mouse, pointer
+		0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, // buttons
+		0x95, 0x01, 0x75, 0x05, 0x81, 0x01, // padding
+		0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff, 0x7f, 0x35, 0x00, 0x46, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, // X, Y
+		0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, // wheel
+		0xc0, 0xc0,
+	]
+}
+
+#[test]
+// THE REGRESSION BAR, ASSERTED RATHER THAN ASSUMED: the boot keyboard, a relative mouse and QEMU's tablet
+// decode exactly as they did - none of them is a gamepad - and the gamepad descriptor folds into no pointer
+// and no key.
+fn the_keyboard_the_mouse_and_the_tablet_decode_as_before() {
+	let keyboard = parse(&boot_keyboard_descriptor());
+	assert!(keyboard.has_keyboard() && !keyboard.has_gamepad() && keyboard.gamepads().is_empty());
+	let mut pressed: Vec<(u32, bool)> = Vec::new();
+	keyboard.keys_diff(0, &[0u8; 8], &[0x02, 0, 0x04, 0, 0, 0, 0, 0], &mut |usage, down| pressed.push((usage, down)));
+	assert_eq!(pressed, [((PAGE_KEYBOARD as u32) << 16 | 0xe1, true), ((PAGE_KEYBOARD as u32) << 16 | 0x04, true)]);
+
+	let mouse = parse(&relative_mouse_descriptor());
+	assert!(mouse.has_pointer() && !mouse.has_gamepad());
+	let (mut x, mut y, mut buttons, mut wheel) = (1000i32, 1000i32, 0u8, 0i32);
+	assert!(mouse.pointer_fold(0, &[0x05, 10, (-4i8) as u8, 1], &mut x, &mut y, &mut buttons, &mut wheel));
+	assert_eq!((x, y, buttons, wheel), (1010, 996, 0x05, 1), "a relative mouse moves by its deltas, clicks and scrolls");
+
+	let tablet = parse(&qemu_tablet_descriptor());
+	assert!(tablet.has_pointer() && !tablet.has_gamepad());
+	let (mut x, mut y, mut buttons, mut wheel) = (0i32, 0i32, 0u8, 0i32);
+	let half = 0x3fffu16.to_le_bytes();
+	assert!(tablet.pointer_fold(0, &[0x01, half[0], half[1], 0xff, 0x7f, 0], &mut x, &mut y, &mut buttons, &mut wheel));
+	assert_eq!(buttons, 0x01);
+	assert!((x - NORM_MAX / 2).abs() <= 1, "an absolute axis at half its range is half the grid: {x}");
+	assert_eq!(y, NORM_MAX);
+
+	let gamepad = parse(&gadget_gamepad_descriptor());
+	let (mut x, mut y, mut buttons, mut wheel) = (0i32, 0i32, 0u8, 0i32);
+	assert!(!gamepad.pointer_fold(0, &[255, 255, 0, 0, 0xff, 0xff, 0x01], &mut x, &mut y, &mut buttons, &mut wheel));
+	let mut keys = 0;
+	gamepad.keys_diff(0, &[0u8; 7], &[255, 255, 0, 0, 0xff, 0xff, 0x01], &mut |_, _| keys += 1);
+	assert_eq!((x, y, buttons, keys), (0, 0, 0, 0), "the gamepad folds into no pointer and no key");
+	let mut contacts = [Contact::default(); MAX_CONTACTS];
+	assert_eq!(gamepad.contacts(0, &[255, 255, 0, 0, 0xff, 0xff, 0x01], &mut contacts), 0, "and no contact");
+}

@@ -134,7 +134,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 45] = [
+const VOCABULARY: [Capability; 46] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -221,6 +221,9 @@ const VOCABULARY: [Capability; 45] = [
 	Capability::AdminRequest,
 	Capability::AdminAudit,
 	Capability::AdminTest,
+	// WATCHING THE GAMEPADS FROM THE CONSOLE: a connection of InputService's gamepad scope, minted per launch.
+	// Position is free: the `gamepad` tool is granted it alone.
+	Capability::InputGamepad,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -405,6 +408,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"midihold" => Some(granted("midihold", alloc::vec![Capability::MidiInput])),
 		b"midiread" => Some(granted("midiread", alloc::vec![Capability::Midi])),
 		b"midifail" => Some(granted("midifail", alloc::vec![Capability::MidiInput, Capability::ModemIdentity])),
+		// THE GAMEPAD TOOL'S GATE PROBE, development-only like the fixture it drives: the fixture's control
+		// endpoint and nothing else - it reads the tool's own lines on its standard input.
+		b"gamepadcheck" => Some(granted("gamepadcheck", alloc::vec![Capability::FixtureControl])),
 		// THE ADMINISTRATIVE-PATH GATE'S PROBES, development-only like the executor they drive. `admincheck` is a
 		// requester - the probe write on the probe executor's targets, and no other action - with the
 		// executor's witness, the operator's journal view and AdminService's test controls; `adminhelper` is a
@@ -480,6 +486,8 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"lssvc" => Some(granted("lssvc", alloc::vec![Capability::Services])),
 		b"lsblk" => Some(granted("lsblk", alloc::vec![Capability::Volumes])),
 		b"lsusb" => Some(granted("lsusb", alloc::vec![Capability::Usb])),
+		// WHICH GAMEPAD PRESSED WHAT, from the console: the gamepad scope and nothing else.
+		b"gamepad" => Some(granted("gamepad", alloc::vec![Capability::InputGamepad])),
 		b"ping" => Some(granted("ping", alloc::vec![Capability::Network])),
 		b"ip" => Some(granted("ip", alloc::vec![Capability::Network])),
 		b"nslookup" => Some(granted("nslookup", alloc::vec![Capability::Network])),
@@ -588,6 +596,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::AdminRequest => b"ADMINREQUEST",
 		Capability::AdminAudit => CAP_ADMIN_AUDIT,
 		Capability::AdminTest => CAP_ADMIN_TEST,
+		Capability::InputGamepad => b"INPUT_GAMEPAD",
 	}
 }
 
@@ -739,6 +748,8 @@ impl Clients {
 			Capability::AdminRequest => 0,
 			Capability::AdminAudit => self.admin_audit,
 			Capability::AdminTest => self.admin_test,
+			// Minted per launch through InputService's admin root: see `grant_for_task`.
+			Capability::InputGamepad => 0,
 		}
 	}
 }
@@ -773,6 +784,17 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 				return 0;
 			}
 			match input_admin::Client::new(ChannelTransport { chan: clients.input_admin }).open_keys() {
+				Some(Ok(input)) => input,
+				_ => 0,
+			}
+		}
+		// THE GAMEPAD SCOPE, from the same admin root and not the same grant: the connection this mints
+		// answers `observe-gamepads` and refuses every other operation - no keys, no contacts, no pointer.
+		Capability::InputGamepad => {
+			if clients.input_admin == 0 {
+				return 0;
+			}
+			match input_admin::Client::new(ChannelTransport { chan: clients.input_admin }).open_gamepads() {
 				Some(Ok(input)) => input,
 				_ => 0,
 			}

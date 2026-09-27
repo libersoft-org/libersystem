@@ -37,6 +37,11 @@
 //                   set_intx_disabled, msix_enable
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel
 //       rtc:        read_unix                     random:   fill
+//       ioports:    supported, switch_in, switch_to_idle, service, reload_if_running, firmware_blocks,
+//                   function_ports, set_io_decode - the port space's permission bitmap and the sources
+//                   of a row's port resources. Only x86_64 HAS a port space; the other two answer
+//                   "unsupported", record no port and load nothing, which is the truth about them
+//                   rather than an unfinished port.
 //
 // (2) WHAT ONLY THE x86_64 BOOTLOADER HAND-OFF CALLS, AND ONLY x86_64 COMPILES.
 //     `main::kmain` is the UEFI-loader entry and only x86_64 arrives through it; aarch64 enters at

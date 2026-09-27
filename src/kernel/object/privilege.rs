@@ -42,6 +42,11 @@ pub enum PrivilegeKind {
 	// IOMMU, a process holding both DMA buffers and physical addresses reaches memory the page
 	// tables were meant to isolate.
 	DeviceManager,
+	// May be granted a range of I/O ports BY ADDRESS, for the SystemIO operation regions a firmware
+	// interpreter holds - the one mint that takes a base and a length from its caller, held to the same
+	// reserved set and exclusivity as a claim's range. The ACPI service's; minted for it by whatever
+	// starts that service.
+	FirmwareInterpreter,
 }
 
 impl PrivilegeKind {}

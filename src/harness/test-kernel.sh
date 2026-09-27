@@ -358,7 +358,7 @@ STAGED_TEST_KERNEL="$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.elf"
 	# THE BUILT BINARY'S PATH, ASKED FOR RATHER THAN GUESSED. `--message-format=json` names the
 	# executable cargo produced; the last `compiler-artifact` line carrying one for the `kernel`
 	# target is this selection's test binary.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
 	built="$(
 		python3 - "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" <<'PYEOF'
 import json, sys
@@ -436,7 +436,7 @@ source "$ROOT/tools/evidence.sh"
 SUITE_OUTCOME=failed
 publish_suite_evidence() {
 	evidence_active || return 0
-	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" && -z "${USB_GADGET:-}" ]] || return 0
+	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" && -z "${USB_GADGET:-}" && -z "${I2C_FIXTURE:-}" ]] || return 0
 	local discharges medium
 	discharges="$(mktemp)"
 	grep -ahoE '^kernel\.[a-z_.0-9]+\.\.\.[[:space:]]*\[ok\]' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | sed -E 's/\.\.\..*$//' | sort -u | sed "s| *\$| / $ARCH / test-guest / test|" >"$discharges" || true
@@ -484,6 +484,16 @@ usb_gadget_teardown() {
 	if [[ -n "${TPM_DIR:-}" && "$TPM_DIR" == */liber-swtpm.* && -d "$TPM_DIR" ]]; then
 		rm -rf -- "$TPM_DIR"
 		TPM_DIR=""
+	fi
+	# AND THE I2C AND GPIO BACKEND: its process, then the directory its sockets are in - this run's, by its name.
+	if [[ -n "${I2C_BACKEND_PID:-}" ]]; then
+		kill "$I2C_BACKEND_PID" 2>/dev/null || true
+		wait "$I2C_BACKEND_PID" 2>/dev/null || true
+		I2C_BACKEND_PID=""
+	fi
+	if [[ -n "${I2C_DIR:-}" && "$I2C_DIR" == */liber-i2c.* && -d "$I2C_DIR" ]]; then
+		rm -rf -- "$I2C_DIR"
+		I2C_DIR=""
 	fi
 	[[ -n "${USB_GADGET:-}" && "${USB_GADGET:-}" != "mtp" && -z "${USB_REDIR_SOCKET:-}" ]] || return 0
 	# THE ECHO FIRST, because it holds the tty the gadget owns: a teardown that removed the gadget
@@ -612,11 +622,17 @@ elif [[ -n "${USB_GADGET:-}" ]]; then
 			python3 "$ROOT/harness/ups-sim.py" >&2 &
 			SERIAL_ECHO_PIDS="$!"
 			;;
+		hid-gamepad-pair)
+			# THE TWO PLAYERS: once the guest has configured the device, a held level on each gamepad, both
+			# released, and then the device unplugged - both gamepads leave at once.
+			python3 "$ROOT/harness/gamepad-source.py" >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
 		esac
 		# THE SERVICE-BACKED CLASSES GO ON A ROOT PORT, because their oracles unplug the device and a
 		# device behind the hub leaves without the driver hearing it. See `qemu_attach_xhci`.
 		case "$USB_GADGET" in
-		printer | midi | midi-echo | ups | ccid | dfu | bt | mbim | uvc) export USB_GADGET_PORT=3 ;;
+		printer | midi | midi-echo | ups | ccid | dfu | bt | mbim | uvc | hid-gamepad-pair) export USB_GADGET_PORT=3 ;;
 		esac
 	else
 		# REFUSED RATHER THAN FORCED, and the run goes on without it: the tests that wanted the
@@ -649,6 +665,35 @@ if [[ -n "${TPM_FRONTEND:-}" ]]; then
 	else
 		echo "[test-$ARCH] swtpm did not start; the TPM test is unavailable" >&2
 		TPM_SOCKET=""
+	fi
+fi
+
+# THE I2C AND GPIO CONTROLLERS' DEVICE SIDE, when a run asks for it: `I2C_FIXTURE=bus` (the register device at
+# 0x50 and the lines it raises) or `hid`. `vhost-i2c-gpio.py` listens on two vhost-user sockets and a control
+# socket in this run's own directory, QEMU connects to the first two, and the exit trap stops the process and
+# removes the directory. `I2C_FIXTURE` is also compile-time: the oracles that need the devices say so when
+# the run did not ask, rather than failing on a machine that simply has none.
+if [[ -n "${I2C_FIXTURE:-}" ]]; then
+	if [[ "$I2C_FIXTURE" != "bus" && "$I2C_FIXTURE" != "hid" ]]; then
+		echo "[test-$ARCH] I2C_FIXTURE is bus or hid, not '$I2C_FIXTURE'" >&2
+		exit 2
+	fi
+	I2C_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liber-i2c.XXXXXX")"
+	I2C_SOCKET="$I2C_DIR/i2c.sock"
+	GPIO_SOCKET="$I2C_DIR/gpio.sock"
+	python3 "$ROOT/harness/vhost-i2c-gpio.py" --i2c "$I2C_SOCKET" --gpio "$GPIO_SOCKET" --control "$I2C_DIR/control.sock" --ready "$I2C_DIR/ready" >"$I2C_DIR/backend.log" 2>&1 &
+	I2C_BACKEND_PID="$!"
+	for _ in $(seq 1 100); do
+		[[ -e "$I2C_DIR/ready" ]] && break
+		sleep 0.05
+	done
+	if [[ -e "$I2C_DIR/ready" ]]; then
+		export I2C_SOCKET GPIO_SOCKET I2C_FIXTURE
+		echo "[test-$ARCH] vhost-i2c-gpio.py serves the I2C and GPIO controllers ($I2C_FIXTURE)"
+	else
+		echo "[test-$ARCH] vhost-i2c-gpio.py did not start; the I2C tests are unavailable" >&2
+		cat "$I2C_DIR/backend.log" >&2 || true
+		exit 1
 	fi
 fi
 
@@ -690,7 +735,7 @@ set +e
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

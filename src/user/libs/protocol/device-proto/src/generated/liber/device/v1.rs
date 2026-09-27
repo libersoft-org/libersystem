@@ -905,6 +905,19 @@ pub enum ProviderKind {
 	/// high-risk operation, which AdminService alone consumes. A published executor is how an operation
 	/// becomes possible at all; no client can register one.
 	AdminExecutor = 20,
+	/// GAMEPADS, WHICH ARE NOT A POINTER: a set of axes, a button bitmap and hats, several gamepads on
+	/// one connection, each by its publisher's handle - the `gamepad` wire in `driver_protocol`.
+	/// InputService alone consumes it and decides whose focus a gamepad's input reaches. Published as
+	/// `pointer`, a stick would move the console cursor and its buttons would click.
+	Gamepad = 21,
+	/// AN I2C/SMBUS CONTROLLER, the `liber:i2c-device` contract. NEVER OPENED WHOLE: no role or permission
+	/// row may name it and the catalogue's `open` refuses it; the only connections are the ones DeviceManager
+	/// mints with a SCOPED `CONNECT` naming one seven-bit address - for a child binding with its claim, and
+	/// for the ACPI service.
+	I2cBus = 22,
+	/// A GPIO CONTROLLER'S INPUT LINES, the `liber:gpio-device` contract, under the same rule as `i2c-bus`:
+	/// only scoped connections, each naming one line with its trigger, or for level reads alone.
+	GpioLines = 23,
 }
 
 impl ProviderKind {
@@ -967,6 +980,9 @@ impl ProviderKind {
 			18 => Some(ProviderKind::Printer),
 			19 => Some(ProviderKind::PtpTransport),
 			20 => Some(ProviderKind::AdminExecutor),
+			21 => Some(ProviderKind::Gamepad),
+			22 => Some(ProviderKind::I2cBus),
+			23 => Some(ProviderKind::GpioLines),
 			_ => None,
 		}
 	}
@@ -4478,6 +4494,9 @@ impl ProviderKind {
 			ProviderKind::Printer => out.push_str("\"printer\""),
 			ProviderKind::PtpTransport => out.push_str("\"ptp-transport\""),
 			ProviderKind::AdminExecutor => out.push_str("\"admin-executor\""),
+			ProviderKind::Gamepad => out.push_str("\"gamepad\""),
+			ProviderKind::I2cBus => out.push_str("\"i2c-bus\""),
+			ProviderKind::GpioLines => out.push_str("\"gpio-lines\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4502,6 +4521,9 @@ impl ProviderKind {
 			ProviderKind::Printer => out.push_str("printer"),
 			ProviderKind::PtpTransport => out.push_str("ptp-transport"),
 			ProviderKind::AdminExecutor => out.push_str("admin-executor"),
+			ProviderKind::Gamepad => out.push_str("gamepad"),
+			ProviderKind::I2cBus => out.push_str("i2c-bus"),
+			ProviderKind::GpioLines => out.push_str("gpio-lines"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -4526,6 +4548,9 @@ impl ProviderKind {
 			ProviderKind::Printer => crate::codec::cbor::text(out, "printer"),
 			ProviderKind::PtpTransport => crate::codec::cbor::text(out, "ptp-transport"),
 			ProviderKind::AdminExecutor => crate::codec::cbor::text(out, "admin-executor"),
+			ProviderKind::Gamepad => crate::codec::cbor::text(out, "gamepad"),
+			ProviderKind::I2cBus => crate::codec::cbor::text(out, "i2c-bus"),
+			ProviderKind::GpioLines => crate::codec::cbor::text(out, "gpio-lines"),
 		}
 	}
 }

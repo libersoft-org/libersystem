@@ -257,6 +257,14 @@ name = "inflate"
 version = "0.0.0"
 
 [[package]]
+name = "input-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -288,6 +296,7 @@ dependencies = [
  "gif",
  "graphics-core",
  "graphics-proto",
+ "input-proto",
  "liberfs",
  "midi-device-proto",
  "modem-device-proto",

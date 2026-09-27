@@ -51,7 +51,7 @@ use proto::system::{Error as UsbError, UsbDevice as UsbEntry};
 use rt::*;
 
 use crate::usb_audio::configure_audio;
-use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, TOUCH_SINK, configure_hid, handle_hid_event, post_reports};
+use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, TOUCH_SINK, configure_hid, depart, handle_hid_event, post_reports};
 use crate::usb_net::{NOTIFY_WINDOW, Net, configure_network, handle_net_event, handle_notification, post_notification, post_receive, transmit};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
 use crate::usb_uas::{Uas, configure_uas};
@@ -593,6 +593,9 @@ const KIND_BLUETOOTH: u8 = 15;
 const KIND_MODEM: u8 = 16;
 const KIND_CAMERA: u8 = 17;
 const KIND_DFU: u8 = 18;
+// A GAMEPAD, which is not a pointer: ranked below a keyboard and a touch surface and above a pointer when one
+// device is several.
+const KIND_GAMEPAD: u8 = 19;
 
 // The addressed devices, by root port - the state hot-plug works against and the
 // inventory `usb.list` serves. An attach enumerates a root port only when no slot
@@ -736,6 +739,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let (serial_server, serial_client): (u64, u64) = channel().unwrap_or_else(|| exit());
 		let (serial2_server, serial2_client): (u64, u64) = channel().unwrap_or_else(|| exit());
 		let (touch_server, touch_client): (u64, u64) = channel().unwrap_or_else(|| exit());
+		// AND THE GAMEPADS', published whether or not one is plugged in, as the pointer is: every gamepad of
+		// every HID interface this controller binds - at boot or later - is a frame on this one standing
+		// connection.
+		let (gamepad_server, gamepad_client): (u64, u64) = channel().unwrap_or_else(|| exit());
 		// report in, then serve the bus for the life of the system: HID reports,
 		// block requests, and runtime attach / detach.
 		// Assembled through a writer that cannot overrun rather than by indexing a fixed
@@ -791,6 +798,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if touching(&hids) {
 			report.push(b" (touch)");
 		}
+		if hids.any_gamepad() {
+			report.push(b" (gamepad)");
+		}
 		// EACH SERVICE-BACKED CLASS BY ITS ROLE, which is the inventory's word for it.
 		for role in classes.roles() {
 			report.push(b" (");
@@ -824,45 +834,64 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// nor the handshake can select between them - and for a byte stream that is not refused
 		// anywhere: the bytes simply arrive somewhere else. Every other entry keeps the empty name it
 		// had, which is what `online` passed for it.
-		common::online_named(
-			bootstrap,
-			&bind,
-			report.as_bytes(),
-			&[
-				(driver_protocol::provider::BLOCK, blk_client, &[][..]),
-				(driver_protocol::provider::USB_BUS, usbq_client, &[]),
-				(driver_protocol::provider::POINTER, ptr_client, &[]),
-				(driver_protocol::provider::NET, if network.is_some() { net_client } else { 0 }, &[]),
-				(driver_protocol::provider::BLOCK, if uas.is_some() { uas_client } else { 0 }, &[]),
-				// THE AUDIO SINK, WHICH IS PUBLISHED ONLY WHEN ONE IS BOUND. A provider offered by
-				// a controller with no audio device is a provider AudioService opens and then
-				// cannot drive - and this wire's refusal is an empty reply, not a status, so there
-				// is no way for the service to tell "no device" from "the device said no".
-				(driver_protocol::provider::AUDIO, if audio.is_empty() { 0 } else { audio_client }, &[]),
-				// THE BYTE STREAM, and it is LAST because a token is a POSITION in this list: an
-				// entry inserted among the others renames a publication the manager already holds.
-				(driver_protocol::provider::CONSOLE_BYTES, if !serials.ports.is_empty() { serial_client } else { 0 }, driver_protocol::provider::USB_SERIAL_NAME),
-				// AND THE TOUCH SURFACE, PUBLISHED ONLY WHEN A DEVICE REPORTS CONTACTS. A pointer is
-				// published unconditionally because the factory is worth keeping for a mouse that
-				// arrives later, and a touch surface is not the same case: one offered by a
-				// controller with no digitizer is a surface InputService opens and never hears from,
-				// which is indistinguishable from a surface nobody is touching.
-				(driver_protocol::provider::TOUCH, if touching(&hids) { touch_client } else { 0 }, &[]),
-				// THE SECOND BYTE STREAM, AND IT IS LAST FOR THE REASON THE FIRST ONE GIVES. A
-				// token is a POSITION in this list, so a second serial port appended here leaves
-				// every token before it exactly where it was - and an entry inserted beside the
-				// first one would rename seven publications to add one.
-				//
-				// THE NAME SAYS WHICH PORT AND NOT WHICH DEVICE, which is a limit worth stating:
-				// it is the order this controller bound them in, so a machine whose two adapters
-				// enumerate in the other order gets them the other way round. A consumer that needs
-				// a PARTICULAR piece of hardware asks the USB bus provider what is where; this name
-				// is how it asks for the second port rather than the first.
-				(driver_protocol::provider::CONSOLE_BYTES, if serials.len() >= 2 { serial2_client } else { 0 }, driver_protocol::provider::USB_SERIAL_SECOND_NAME),
-			],
-		);
+		let mut offers: [(u16, u64, &[u8]); 10] = [
+			(driver_protocol::provider::BLOCK, blk_client, &[][..]),
+			(driver_protocol::provider::USB_BUS, usbq_client, &[]),
+			(driver_protocol::provider::POINTER, ptr_client, &[]),
+			(driver_protocol::provider::NET, if network.is_some() { net_client } else { 0 }, &[]),
+			(driver_protocol::provider::BLOCK, if uas.is_some() { uas_client } else { 0 }, &[]),
+			// THE AUDIO SINK, WHICH IS PUBLISHED ONLY WHEN ONE IS BOUND. A provider offered by
+			// a controller with no audio device is a provider AudioService opens and then
+			// cannot drive - and this wire's refusal is an empty reply, not a status, so there
+			// is no way for the service to tell "no device" from "the device said no".
+			(driver_protocol::provider::AUDIO, if audio.is_empty() { 0 } else { audio_client }, &[]),
+			// THE BYTE STREAM, and it is LAST because a token is a POSITION in this list: an
+			// entry inserted among the others renames a publication the manager already holds.
+			(driver_protocol::provider::CONSOLE_BYTES, if !serials.ports.is_empty() { serial_client } else { 0 }, driver_protocol::provider::USB_SERIAL_NAME),
+			// AND THE TOUCH SURFACE, PUBLISHED ONLY WHEN A DEVICE REPORTS CONTACTS. A pointer is
+			// published unconditionally because the factory is worth keeping for a mouse that
+			// arrives later, and a touch surface is not the same case: one offered by a
+			// controller with no digitizer is a surface InputService opens and never hears from,
+			// which is indistinguishable from a surface nobody is touching.
+			(driver_protocol::provider::TOUCH, if touching(&hids) { touch_client } else { 0 }, &[]),
+			// THE SECOND BYTE STREAM, AND IT IS LAST FOR THE REASON THE FIRST ONE GIVES. A
+			// token is a POSITION in this list, so a second serial port appended here leaves
+			// every token before it exactly where it was - and an entry inserted beside the
+			// first one would rename seven publications to add one.
+			//
+			// THE NAME SAYS WHICH PORT AND NOT WHICH DEVICE, which is a limit worth stating:
+			// it is the order this controller bound them in, so a machine whose two adapters
+			// enumerate in the other order gets them the other way round. A consumer that needs
+			// a PARTICULAR piece of hardware asks the USB bus provider what is where; this name
+			// is how it asks for the second port rather than the first.
+			(driver_protocol::provider::CONSOLE_BYTES, if serials.len() >= 2 { serial2_client } else { 0 }, driver_protocol::provider::USB_SERIAL_SECOND_NAME),
+			// AND THE GAMEPADS, UNCONDITIONALLY, LAST FOR THE REASON THE BYTE STREAMS GIVE: a token is a
+			// position in this list.
+			(driver_protocol::provider::GAMEPAD, gamepad_client, &[]),
+		];
+		// THE HANDSHAKE CARRIES AT MOST `MAX_INITIAL_OFFERS` AND THE MANAGER DROPS ANY PAST IT WITHOUT A WORD,
+		// and this list has ten positions, of which the gamepads' and three others are always taken. An offer
+		// past the bound keeps its token and is made right after READY instead, as a live offer - the post-READY
+		// half of the same handshake a device plugged in later is published through.
+		let mut late: Vec<(u16, u16, u64, &[u8])> = Vec::new();
+		let mut carried: usize = 0;
+		for (token, offer) in offers.iter_mut().enumerate() {
+			if offer.1 == 0 {
+				continue;
+			}
+			if carried == driver_protocol::MAX_INITIAL_OFFERS {
+				late.push((token as u16, offer.0, offer.1, offer.2));
+				offer.1 = 0;
+			} else {
+				carried += 1;
+			}
+		}
+		common::online_named(bootstrap, &bind, report.as_bytes(), &offers);
+		for (token, kind, handle, name) in late {
+			common::offer_named(bootstrap, &bind, kind, token, name, handle);
+		}
 		let pending = Unpublished { net: if network.is_some() { 0 } else { net_client }, uas: if uas.is_some() { 0 } else { uas_client }, touch: if touching(&hids) { 0 } else { touch_client } };
-		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, network, uas, audio, serials, classes, blk_server, usbq_server, ptr_server, net_server, uas_server, audio_server, serial_server, serial2_server, touch_server, pending, irq);
+		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, network, uas, audio, serials, classes, blk_server, usbq_server, ptr_server, net_server, uas_server, audio_server, serial_server, serial2_server, touch_server, gamepad_server, pending, irq);
 	}
 }
 
@@ -1233,7 +1262,7 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			let slot = dev.slot;
 			slots.keep(slot, dev);
 		} else if admits(hc, ClassKind::Hid, dev.class)
-			&& let Some(h) = configure_hid(hc, &mut dev)
+			&& let Some(interfaces) = configure_hid(hc, &mut dev, &mut hids.pads)
 		{
 			// THE CHARGE IS TAKEN WHEN THE MODULE TAKES THE DEVICE and not when the admission was
 			// asked for: `configure_hid` answers `None` for a device that is not a HID at all, and
@@ -1242,18 +1271,22 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			let _ = hc.budget.admit(ClassKind::Hid);
 			// A SURFACE THAT REPORTS CONTACTS IS NOT A POINTER IN THE INVENTORY EITHER. It carries
 			// desktop axes, so the pointer test is true of it - and an inventory that called it a
-			// pointer would be the same flattening the provider kinds exist to stop, one layer up.
+			// pointer would be the same flattening the provider kinds exist to stop, one layer up. NOR IS
+			// A GAMEPAD, for the same reason: it is ranked below a keyboard and a touch surface and above a
+			// pointer, over every interface the device was bound on.
 			slots.set_kind(
 				dev.slot,
-				if h.layout.has_keyboard() {
+				if interfaces.iter().any(|h| h.layout.has_keyboard()) {
 					KIND_KEYBOARD
-				} else if h.layout.has_digitizer() {
+				} else if interfaces.iter().any(|h| h.layout.has_digitizer()) {
 					KIND_TOUCH
+				} else if interfaces.iter().any(|h| h.has_gamepad()) {
+					KIND_GAMEPAD
 				} else {
 					KIND_POINTER
 				},
 			);
-			hids.entries.push((dev, h));
+			hids.entries.push((dev, interfaces));
 		} else if storage.is_none()
 			&& admits(hc, ClassKind::Storage, dev.class)
 			&& let Some(st) = configure_storage(hc, &mut dev)
@@ -1739,11 +1772,14 @@ struct Unpublished {
 // Whether any bound HID reports on the digitizer page, which is what makes a touch surface a thing
 // this controller HAS rather than one it could have.
 fn touching(hids: &Hids) -> bool {
-	hids.entries.iter().any(|(_, h)| h.layout.has_digitizer())
+	hids.any_digitizer()
 }
 
+// The token the gamepad publication holds: its position in the handshake's offer list.
+const GAMEPAD_TOKEN: u16 = 9;
+
 #[allow(clippy::too_many_arguments)]
-fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, mut network: Option<(UsbDevice, Net)>, mut uas: Option<(UsbDevice, Uas)>, mut audio: usb_audio::Devices, mut serials: usb_serial::Serials, mut classes: classes::Classes, blk_server: u64, usbq: u64, pointer: u64, net_server: u64, uas_server: u64, audio_server: u64, serial_server: u64, serial2_server: u64, touch_server: u64, mut pending: Unpublished, irq: u64) -> ! {
+fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, mut network: Option<(UsbDevice, Net)>, mut uas: Option<(UsbDevice, Uas)>, mut audio: usb_audio::Devices, mut serials: usb_serial::Serials, mut classes: classes::Classes, blk_server: u64, usbq: u64, pointer: u64, net_server: u64, uas_server: u64, audio_server: u64, serial_server: u64, serial2_server: u64, touch_server: u64, gamepad_server: u64, mut pending: Unpublished, irq: u64) -> ! {
 	unsafe {
 		post_reports(hc, &mut hids);
 		if let Some((dev, net)) = network.as_mut() {
@@ -1768,7 +1804,28 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 		// the second `open` for a port nobody had attached to.
 		let mut sessions: [drivers::serial_port::Session; usb_serial::MAX_PORTS] = core::array::from_fn(|_| drivers::serial_port::Session::new());
 		let mut buffers: [drivers::serial_port::Buffers; usb_serial::MAX_PORTS] = core::array::from_fn(|_| drivers::serial_port::Buffers::default());
-		let mut serving = common::Serving::from_offers(&[(0, blk_server), (1, usbq), (2, pointer), (3, net_server), (4, uas_server), (5, audio_server), (6, serial_server), (7, touch_server), (8, serial2_server)]);
+		let mut serving = common::Serving::from_offers(&[
+			(0, blk_server),
+			(1, usbq),
+			(2, pointer),
+			(3, net_server),
+			(4, uas_server),
+			(5, audio_server),
+			(6, serial_server),
+			(7, touch_server),
+			(8, serial2_server),
+			(GAMEPAD_TOKEN, gamepad_server),
+		]);
+		// THE GAMEPAD PUBLICATION'S RETRY: while a frame is owed, the loop wakes a tick later on this timer, on a
+		// HOUSEKEEPING wait - a consumer that never drains must not keep a settling scheduler from settling.
+		let pad_retry: u64 = match timer_create() {
+			timer if timer > 0 => timer as u64,
+			_ => exit(),
+		};
+		// THE OFFERED CONNECTION IS WRITTEN FROM THE FIRST PASS, although InputService has not opened it yet: it
+		// holds what it can take - every gamepad bound at boot, at its initial state, since no report has been
+		// reaped - and is owed the rest.
+		hids.pads.follow(serving.first_for(GAMEPAD_TOKEN));
 		// THE CLASS DEVICES FOUND AT BOOT ARE PUBLISHED NOW, after the handshake: their tokens are fresh ones and
 		// not positions in the list above, so they are live offers like a device plugged in later.
 		classes.settle(hc, &mut hids, bootstrap, bind, &mut serving);
@@ -1820,15 +1877,28 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 					}
 				}
 			}
-			// THE CONTROLLER'S INTERRUPT FIRST, then the channels class modules wait on - a modem's transmit channel.
+			// THE CONTROLLER'S INTERRUPT FIRST, then the channels class modules wait on - a modem's transmit channel -
+			// and last the gamepad publication's retry, ARMED EVERY PASS: a tick away while a frame is owed, and
+			// never otherwise, because a timer stays expired until it is armed again.
+			hids.pads.flush();
+			let owed = hids.pads.owes();
+			timer_set(pad_retry, if owed { clock() + 1 } else { u64::MAX });
 			let mut waiting: Vec<u64> = alloc::vec![irq];
 			waiting.extend(classes.waits());
-			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &waiting) else {
+			let retry_at = waiting.len();
+			waiting.push(pad_retry);
+			let Some(ready) = common::wait_providers(bootstrap, bind, &mut serving, &waiting, owed) else {
 				common::finish_stop(bootstrap, bind, device(), hc.halt());
 				exit();
 			};
 			PTR_SINK.store(serving.first_for(2), Ordering::Relaxed);
 			TOUCH_SINK.store(serving.first_for(7), Ordering::Relaxed);
+			hids.pads.follow(serving.first_for(GAMEPAD_TOKEN));
+			if let common::ProviderReady::Device(index) = ready
+				&& index == retry_at
+			{
+				continue;
+			}
 			if let common::ProviderReady::Connected(at) = ready {
 				// EVERY CONNECTION STARTS WITH THE MAC AND THE MTU, including one made after a
 				// consumer restarted: NetworkService builds its stack from that message and refuses
@@ -2219,6 +2289,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				let token = serving.close_at(at);
 				PTR_SINK.store(serving.first_for(2), Ordering::Relaxed);
 				TOUCH_SINK.store(serving.first_for(7), Ordering::Relaxed);
+				hids.pads.follow(serving.first_for(GAMEPAD_TOKEN));
 				common::disconnected(bootstrap, bind, token);
 			}
 		}
@@ -2272,6 +2343,7 @@ fn kind_name(kind: u8) -> &'static str {
 		KIND_MODEM => "modem",
 		KIND_CAMERA => "camera",
 		KIND_DFU => "dfu",
+		KIND_GAMEPAD => "gamepad",
 		_ => "device",
 	}
 }
@@ -2287,15 +2359,21 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		// holds it: the ones bound to a role live in their own structures, and the rest live
 		// in the inventory. Disabling the slot without closing the pages - which is what this
 		// did - leaks three pages per attach on a port somebody plugs and unplugs.
-		for (dev, hid) in hids.entries.iter_mut().filter(|(dev, _)| dev.port == port) {
-			hid.release();
+		let Hids { entries, pads } = hids;
+		for (dev, interfaces) in entries.iter_mut().filter(|(dev, _)| dev.port == port) {
+			// EVERY GAMEPAD OF EVERY INTERFACE DEPARTS FIRST, before its rings and pages are released: the
+			// detach used to release the device and tell nobody.
+			depart(pads, interfaces);
+			for hid in interfaces.iter_mut() {
+				hid.release();
+			}
 			dev.release(hc);
-			// AND THE CHARGE GOES BACK WITH THE PAGES. A release that gave the memory back and
-			// kept the budget would turn a port somebody plugs and unplugs into a controller
-			// that stops accepting keyboards.
+			// AND THE CHARGE GOES BACK WITH THE PAGES, ONCE PER DEVICE. A release that gave the memory back
+			// and kept the budget would turn a port somebody plugs and unplugs into a controller that stops
+			// accepting keyboards.
 			hc.budget.release(ClassKind::Hid);
 		}
-		hids.entries.retain(|(dev, _)| dev.port != port);
+		entries.retain(|(dev, _)| dev.port != port);
 		if let Some((dev, st)) = storage.as_mut()
 			&& dev.port == port
 		{

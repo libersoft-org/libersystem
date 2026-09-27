@@ -555,6 +555,66 @@ pub const PERF_CONTROL_DRAIN: u64 = 3;
 pub const PERF_RECORD_UNARMED: i64 = 1;
 pub const PERF_RECORD_REFUSED: i64 = 2;
 
+// PORT I/O AS A CAPABILITY. x86_64 reaches a device's registers through the separate 64 KiB port space
+// as well as through memory, and ring 3 may execute `in` and `out` only for the ports its task-state
+// segment's permission bitmap allows. The authority to a RANGE of ports is an object, `PortRange`, and
+// holding one grants nothing until its holder maps it: mapping sets the range's bits in the holder's
+// process, and a thread of that process may then use those ports and no others. ARM and RISC-V have no
+// port space, so every call below answers `ERR_UNSUPPORTED` there and no row ever carries a port
+// resource.
+//
+// `SYS_DEVICE_RESOURCE_ACQUIRE(claim, kind, index)` mints ONE RESOURCE OF A CLAIMED ROW, named by its
+// kind and its index on that row and never by address, for a claim handle carrying `RIGHT_MANAGE` (as
+// `SYS_DEVICE_MSIX_ACQUIRE` takes it). The one kind so far is `RESOURCE_KIND_PORT_RANGE`, whose index is
+// a position in `DeviceInfo::ports`; it answers a `PortRange` handle with `RIGHT_MAP | RIGHT_TRANSFER`
+// and registers it as a derived object of the claim, so the claim's release revokes it. A range whose
+// ports are reserved to the kernel, are in another live grant, or were retired this boot is refused.
+//
+// `SYS_PORT_RANGE_MAP(range)` grants the range to the CALLER's process - a range is mapped into at most
+// one process at a time - and answers 0. `SYS_PORT_RANGE_UNMAP(range)` takes it back from the caller and
+// answers 1 when every core confirmed it no longer lets the caller use those ports, or 0 when one did not
+// answer in time: the range is then out of the caller's process all the same, and its ports stay out of
+// every later grant this boot.
+//
+// `SYS_PORT_RANGE_FIRMWARE(privilege, base, len)` is the ONE call that takes a base and a length from its
+// caller, for the firmware interpreter's SystemIO operation regions, gated by the `FirmwareInterpreter`
+// privilege and held to the same reserved set and exclusivity as a claim's range.
+pub const SYS_DEVICE_RESOURCE_ACQUIRE: u64 = 91;
+pub const SYS_PORT_RANGE_MAP: u64 = 92;
+pub const SYS_PORT_RANGE_UNMAP: u64 = 93;
+pub const SYS_PORT_RANGE_FIRMWARE: u64 = 94;
+
+// The kinds `SYS_DEVICE_RESOURCE_ACQUIRE` mints.
+pub const RESOURCE_KIND_PORT_RANGE: u64 = 1;
+
+// Where a row's port resource came from.
+//
+// AN I/O BAR of the function, recorded by the boot scan; minted with the ordinary claim, which enables
+// the function's I/O decode and whose release disables it.
+pub const PORT_SOURCE_IO_BAR: u8 = 1;
+// A CHIPSET SUB-RANGE the kernel derived from a configuration register of the function (a block's base)
+// and a derivation row. It never toggles the function's decode: the block is the chipset's.
+pub const PORT_SOURCE_DERIVED: u8 = 2;
+// A PLATFORM DEVICE's resource: a static table the kernel parses, its own declaration of a port it
+// drives, or a firmware-reported `_CRS` descriptor.
+pub const PORT_SOURCE_PLATFORM: u8 = 3;
+
+// How many port resources one row can record: a function's six BARs and the sub-ranges and platform
+// descriptors beside them.
+pub const MAX_PORT_RESOURCES: usize = 8;
+
+// One port resource of a row: `len` ports from `base`, where it came from, and its index in that source
+// (the BAR number for an I/O BAR, the sub-range for a derived one).
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct PortResource {
+	pub base: u16,
+	pub len: u16,
+	pub source: u8,
+	pub index: u8,
+	pub _pad: [u8; 2],
+}
+
 // What a platform event's one byte says.
 pub const PLATFORM_EVENT_POWER_BUTTON: u8 = 1;
 pub const PLATFORM_EVENT_SLEEP_BUTTON: u8 = 2;
@@ -678,6 +738,10 @@ pub const VIRTIO_TYPE_SOUND: u32 = 25;
 // by context id and port, with no routing and no addressing of its own, which is why the driver
 // publishes `local-stream` and deliberately not `net`.
 pub const VIRTIO_TYPE_VSOCK: u32 = 19;
+// AN I2C CONTROLLER and A GPIO CONTROLLER, whose device side is a vhost-user process in this system's
+// harness: the controllers laptops carry have no emulation, and these are what the bus contracts are proved on.
+pub const VIRTIO_TYPE_I2C: u32 = 34;
+pub const VIRTIO_TYPE_GPIO: u32 = 41;
 
 // virtio-pci modern wire format, shared by the kernel's minimal boot driver and the
 // userspace drivers so the register offsets, status bits and ring flags have one
@@ -809,6 +873,8 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_INPUT => "virtio-input",
 		VIRTIO_TYPE_SOUND => "virtio-snd",
 		VIRTIO_TYPE_VSOCK => "virtio-vsock",
+		VIRTIO_TYPE_I2C => "virtio-i2c",
+		VIRTIO_TYPE_GPIO => "virtio-gpio",
 		DEVICE_TYPE_XHCI => "xhci",
 		DEVICE_TYPE_NVME => "nvme",
 		DEVICE_TYPE_AHCI => "ahci",
@@ -940,7 +1006,13 @@ pub struct DeviceInfo {
 	// `_pad0` is: this struct is copied to userspace with `size_of::<T>()` from a value built on the
 	// kernel stack, and Rust does not promise that padding in an otherwise initialised value is
 	// initialised.
-	pub _pad2: [u8; 3],
+	//
+	// HOW MANY OF `ports` THE ROW CARRIES, which took the first of the three tail bytes.
+	pub port_count: u8,
+	pub _pad2: [u8; 2],
+	// THE ROW'S PORT RESOURCES, in the order `SYS_DEVICE_RESOURCE_ACQUIRE` indexes them. Empty on every
+	// row of aarch64 and riscv64, which have no port space.
+	pub ports: [PortResource; MAX_PORT_RESOURCES],
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the
@@ -1012,6 +1084,7 @@ pub const OBJECT_TYPE_PROCESS_GROUP: u64 = 11;
 pub const OBJECT_TYPE_PRIVILEGE: u64 = 12;
 pub const OBJECT_TYPE_WAIT_SET: u64 = 13;
 pub const OBJECT_TYPE_CLAIM: u64 = 14;
+pub const OBJECT_TYPE_PORT_RANGE: u64 = 15;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

@@ -1,0 +1,53 @@
+//! LiberSystem GPIO lines - the contract a `gpio-lines` controller serves on one LINE-SCOPED connection.
+//!
+//! INPUT LINES ONLY, AND NEVER THE WHOLE CONTROLLER. The only connections to a `gpio-lines` provider are the
+//! ones DeviceManager mints with a SCOPED `CONNECT` naming one line - with its trigger, or for level reads
+//! alone - so every operation below is about that line. The controller holds each line for one connection at
+//! a time.
+//!
+//! AN EVENT IS DELIVERED ONCE, AND THE LINE STAYS MASKED UNTIL IT IS ACKNOWLEDGED. So a level-triggered line
+//! that stays asserted cannot storm: it is delivered again after the acknowledgement, and not before. A
+//! connection scoped for level reads alone - an input `GpioIo`, a `GeneralPurposeIo` field's connection -
+//! answers the level and is delivered no event.
+
+package liber:gpio-device@1;
+
+use liber:base@1.{error};
+
+/// How the scoped line fires.
+enum gpio-trigger {
+	/// Scoped for level reads alone: no event.
+	none,
+	rising,
+	falling,
+	both,
+	high,
+	low,
+}
+
+/// The line this connection is scoped to.
+record gpio-line {
+	line:            u32,
+	/// The controller's name for it; empty when it has none.
+	@bound(64) name: string,
+	trigger:         gpio-trigger,
+}
+
+/// One event on the line: the level when it was taken, and how many events the line has delivered on this
+/// connection, counting this one.
+record gpio-event {
+	level:    bool,
+	sequence: u32,
+}
+
+/// THE CONTRACT a `gpio-lines` publication serves on each line-scoped connection.
+interface gpio-device {
+	/// What this connection is scoped to.
+	@op(1) line:        func() -> result<gpio-line, error>;
+	/// The line's level now.
+	@op(2) level:       func() -> result<bool, error>;
+	/// The line's events. Refused - no stream - on a connection scoped for level reads alone.
+	@op(3) events:      func() -> stream<gpio-event>;
+	/// The event delivered last is handled: the line may fire again. Refused when none is outstanding.
+	@op(4) acknowledge: func() -> result<unit, error>;
+}

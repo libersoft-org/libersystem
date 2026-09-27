@@ -140,9 +140,10 @@ fn a_payload_of_the_wrong_shape_is_refused_for_every_opcode_that_has_one() {
 #[test]
 fn a_field_outside_its_closed_set_is_refused_and_the_number_is_reported() {
 	// EACH SET IS PROBED ONE PAST ITS OWN END, the number its next member would take: the resource kinds end at
-	// the trusted key sink, the failure codes at five.
+	// the port range, the failure codes at five.
 	assert_eq!(decode_resource(&6u16.to_le_bytes()), Ok(ResourceKind::TrustedKeys), "the trusted key sink is a member");
-	for raw in [0u16, 7, 0xffff] {
+	assert_eq!(decode_resource(&7u16.to_le_bytes()), Ok(ResourceKind::PortRange), "and so is the port range");
+	for raw in [0u16, 8, 0xffff] {
 		assert_eq!(decode_resource(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "resource kind {raw}");
 	}
 	for raw in [0u16, 6, 0xffff] {
@@ -446,4 +447,27 @@ fn note_bytes_for(version: u16) -> [u8; NOTE_LEN] {
 	let mut note = PROTOCOL_NOTE;
 	note[28..30].copy_from_slice(&version.to_le_bytes());
 	note
+}
+
+#[test]
+fn a_scoped_connect_carries_its_scope_after_the_token_and_an_unscoped_one_is_unchanged() {
+	let mut out = [0u8; CONNECT_PAYLOAD_MAX];
+	// UNSCOPED IS THE TWO BYTES IT ALWAYS WAS, which both decoders read.
+	let len = encode_connect(7, Scope::Whole, &mut out);
+	assert_eq!(&out[..len], &7u16.to_le_bytes());
+	assert_eq!(decode_connect(&out[..len]), Ok(7));
+	assert_eq!(decode_connect_scoped(&out[..len]), Ok((7, Scope::Whole)));
+	// AN ADDRESS and A LINE, round trip.
+	let len = encode_connect(3, Scope::I2cAddress(0x50), &mut out);
+	assert_eq!(decode_connect_scoped(&out[..len]), Ok((3, Scope::I2cAddress(0x50))));
+	assert_eq!(decode_connect(&out[..len]), Err(FrameError::PayloadShape), "the old decoder refuses a scope rather than dropping it");
+	let line = Scope::GpioLine { line: 17, trigger: GpioTrigger::Low };
+	let len = encode_connect(4, line, &mut out);
+	assert_eq!(decode_connect_scoped(&out[..len]), Ok((4, line)));
+	// REFUSED WHOLE: an address past seven bits, an unknown trigger, an unknown kind, a byte too many.
+	assert_eq!(decode_connect_scoped(&[3, 0, 1, 0x80]), Err(FrameError::PayloadShape));
+	assert_eq!(decode_connect_scoped(&[4, 0, 2, 17, 0, 0, 0, 9]), Err(FrameError::UnknownValue(9)));
+	assert_eq!(decode_connect_scoped(&[4, 0, 3, 1]), Err(FrameError::PayloadShape));
+	assert_eq!(decode_connect_scoped(&[3, 0, 1, 0x50, 0]), Err(FrameError::PayloadShape));
+	assert_eq!(decode_connect_scoped(&[3]), Err(FrameError::PayloadShape));
 }

@@ -200,6 +200,325 @@ impl ContactEvent {
 	}
 }
 
+/// ONE AXIS OF A GAMEPAD: its usage PAGE-EXTENDED - the usage page in the high sixteen bits, so Generic
+/// Desktop X is 0x00010030 and the Simulation page's rudder 0x000200BA - and the logical range the device
+/// declared. Its values are in that range and are never rescaled from it: a consumer that wants a ratio
+/// divides by a range it can see.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GamepadAxis {
+	pub usage: u32,
+	pub minimum: i32,
+	pub maximum: i32,
+}
+
+impl GamepadAxis {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<GamepadAxis> {
+		let mut r = Reader::new(bytes);
+		let value = GamepadAxis::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<GamepadAxis> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = GamepadAxis::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.usage)?;
+		w.i32(self.minimum)?;
+		w.i32(self.maximum)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<GamepadAxis> {
+		let usage = r.u32()?;
+		let minimum = r.i32()?;
+		let maximum = r.i32()?;
+		Some(GamepadAxis { usage, minimum, maximum })
+	}
+}
+
+/// A GAMEPAD AS INPUTSERVICE KNOWS IT. The id is InputService's own, given at each arrival and never
+/// reused while the service runs - so a gamepad unplugged and plugged back is a new gamepad. The label says
+/// where it is; `axes` is the order every `gamepad-state` of it carries its values in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gamepad {
+	pub id: u32,
+	pub label: String,
+	pub axes: Vec<GamepadAxis>,
+	/// Buttons 1..=this, at most 32.
+	pub buttons: u8,
+	/// Hats, at most 2.
+	pub hats: u8,
+}
+
+impl Gamepad {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Gamepad> {
+		let mut r = Reader::new(bytes);
+		let value = Gamepad::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Gamepad> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = Gamepad::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.id)?;
+		w.bytes_lp(self.label.as_bytes())?;
+		if self.axes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.axes.len() as u16)?;
+		for v0 in self.axes.iter() {
+			v0.write(w)?;
+		}
+		w.u8(self.buttons)?;
+		w.u8(self.hats)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<Gamepad> {
+		let id = r.u32()?;
+		let label = {
+			let v1 = r.string_lp()?;
+			(v1.len() <= 32).then_some(v1)?
+		};
+		let axes = {
+			let v2 = r.u16()? as usize;
+			let v2 = (v2 <= 8).then_some(v2)?;
+			let mut v3 = Vec::new();
+			v3.try_reserve_exact(v2).ok()?;
+			for _ in 0..v2 {
+				v3.push(GamepadAxis::read(r)?);
+			}
+			v3
+		};
+		let buttons = r.u8()?;
+		let hats = r.u8()?;
+		Some(Gamepad { id, label, axes, buttons, hats })
+	}
+}
+
+/// WHERE ONE GAMEPAD IS. Bit n-1 of `buttons` is Button-page button n; a hat is 0..7 for north and then
+/// clockwise in eighths, or 8 for CENTRED; the axes are the device's own logical values in the order of its
+/// `axes`. BEFORE ITS FIRST REPORT a gamepad is at rest: no buttons, every hat centred and each axis at the
+/// midpoint of its range - never a zeroed hat, which would read as north.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GamepadState {
+	pub id: u32,
+	pub buttons: u32,
+	pub hats: Vec<u8>,
+	pub axes: Vec<i32>,
+}
+
+impl GamepadState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<GamepadState> {
+		let mut r = Reader::new(bytes);
+		let value = GamepadState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<GamepadState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = GamepadState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.id)?;
+		w.u32(self.buttons)?;
+		if self.hats.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.hats.len() as u16)?;
+		for v4 in self.hats.iter() {
+			w.u8(*v4)?;
+		}
+		if self.axes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.axes.len() as u16)?;
+		for v5 in self.axes.iter() {
+			w.i32(*v5)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<GamepadState> {
+		let id = r.u32()?;
+		let buttons = r.u32()?;
+		let hats = {
+			let v6 = r.u16()? as usize;
+			let v6 = (v6 <= 2).then_some(v6)?;
+			let mut v7 = Vec::new();
+			v7.try_reserve_exact(v6).ok()?;
+			for _ in 0..v6 {
+				v7.push(r.u8()?);
+			}
+			v7
+		};
+		let axes = {
+			let v8 = r.u16()? as usize;
+			let v8 = (v8 <= 8).then_some(v8)?;
+			let mut v9 = Vec::new();
+			v9.try_reserve_exact(v8).ok()?;
+			for _ in 0..v8 {
+				v9.push(r.i32()?);
+			}
+			v9
+		};
+		Some(GamepadState { id, buttons, hats, axes })
+	}
+}
+
+/// ONE EVENT OF A GAMEPAD STREAM, and a stream's order: it opens with a `present` and then a `state` for
+/// every gamepad there at that moment; afterwards it carries a `state` for every change of a gamepad's
+/// buttons, hats or axes, an `arrived` and its first `state` for each new one, and a `departed` for each one
+/// that leaves - so a consumer always knows WHICH gamepad pressed WHAT. A reader that falls behind is sent
+/// fewer intermediate states and never a stale last one; an `arrived` or `departed` it cannot take closes
+/// the stream, and a closed stream means every gamepad it carried is released and gone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GamepadEvent {
+	Present(Gamepad),
+	Arrived(Gamepad),
+	State(GamepadState),
+	Departed(u32),
+}
+
+impl GamepadEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<GamepadEvent> {
+		let mut r = Reader::new(bytes);
+		let value = GamepadEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<GamepadEvent> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = GamepadEvent::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			GamepadEvent::Present(v10) => {
+				w.u8(0)?;
+				v10.write(w)?;
+			}
+			GamepadEvent::Arrived(v11) => {
+				w.u8(1)?;
+				v11.write(w)?;
+			}
+			GamepadEvent::State(v12) => {
+				w.u8(2)?;
+				v12.write(w)?;
+			}
+			GamepadEvent::Departed(v13) => {
+				w.u8(3)?;
+				w.u32(*v13)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<GamepadEvent> {
+		match r.u8()? {
+			0 => Some(GamepadEvent::Present(Gamepad::read(r)?)),
+			1 => Some(GamepadEvent::Arrived(Gamepad::read(r)?)),
+			2 => Some(GamepadEvent::State(GamepadState::read(r)?)),
+			3 => Some(GamepadEvent::Departed(r.u32()?)),
+			_ => None,
+		}
+	}
+}
+
 /// InputService: typed pointer/button events from the virtio-input pointer device,
 /// mapped to the text-cell grid. `subscribe` hands back a wait-drained event stream of
 /// the recent pointer events (the bounded-snapshot form; a continuously live
@@ -219,6 +538,8 @@ pub mod input {
 	pub const OP_SUBSCRIBE: u16 = 1;
 	pub const OP_SUBSCRIBE_KEYS: u16 = 2;
 	pub const OP_SUBSCRIBE_CONTACTS: u16 = 3;
+	pub const OP_SUBSCRIBE_GAMEPADS: u16 = 4;
+	pub const OP_OBSERVE_GAMEPADS: u16 = 5;
 
 	pub trait Service {
 		fn subscribe(&mut self) -> Vec<PointerEvent>;
@@ -229,6 +550,15 @@ pub mod input {
 		/// every contact still down before closing the stream, so a new foreground
 		/// application cannot inherit a finger.
 		fn subscribe_contacts(&mut self, focus: u64) -> Vec<ContactEvent>;
+		/// THE GAMEPADS OF A GRAPHICAL APPLICATION, on the same one-shot focus proof `subscribe-keys` takes, on
+		/// any connection that may call that. One such stream is live: a new valid subscription replaces it, and
+		/// on focus loss every held button and every hat off centre is released to it before it closes.
+		fn subscribe_gamepads(&mut self, focus: u64) -> Vec<GamepadEvent>;
+		/// THE GAMEPADS OF A CONSOLE PROGRAM, on a connection `input-admin.open-gamepads` minted and on no
+		/// other. Delivered only while no graphical surface holds display focus - a surface taking focus
+		/// releases held buttons to this stream and closes it, and the call is refused while one holds it - and
+		/// to ONE stream at a time: a second is refused while the first is open.
+		fn observe_gamepads(&mut self) -> Vec<GamepadEvent>;
 	}
 
 	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
@@ -349,6 +679,84 @@ pub mod input {
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = ContactEvent::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	pub fn subscribe_gamepads_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<GamepadEvent>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let focus = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
+		r.finish()?;
+		request_handles.clear();
+		let items = service.subscribe_gamepads(focus);
+		Some((corr, items))
+	}
+	pub fn subscribe_gamepads_frame(seq: u32, item: &GamepadEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn subscribe_gamepads_read(msg: &[u8], frame_handles: &mut Handles) -> Option<GamepadEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = GamepadEvent::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	pub fn observe_gamepads_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<GamepadEvent>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.observe_gamepads();
+		Some((corr, items))
+	}
+	pub fn observe_gamepads_frame(seq: u32, item: &GamepadEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn observe_gamepads_read(msg: &[u8], frame_handles: &mut Handles) -> Option<GamepadEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = GamepadEvent::read(r)?;
 		reader.finish()?;
 		frame_handles.clear();
 		Some(value)
@@ -508,6 +916,58 @@ pub mod input {
 			}
 			Some(reply_handles.first())
 		}
+		pub fn subscribe_gamepads(&mut self, focus: &u64) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUBSCRIBE_GAMEPADS)?;
+			w.u32(corr)?;
+			w.set_handle(*focus)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+		pub fn observe_gamepads(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OBSERVE_GAMEPADS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -532,6 +992,22 @@ pub mod input {
 	fn channel_invoke_subscribe_contacts(chan: u64, focus: &u64) -> Option<u64> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.subscribe_contacts(focus)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_subscribe_gamepads")]
+	fn channel_invoke_subscribe_gamepads(chan: u64, focus: &u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.subscribe_gamepads(focus)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_observe_gamepads")]
+	fn channel_invoke_observe_gamepads(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.observe_gamepads()
 	}
 }
 
@@ -708,12 +1184,12 @@ pub mod input_trusted {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v0) => {
+						Ok(v14) => {
 							w.u8(1)?;
 						}
-						Err(v1) => {
+						Err(v15) => {
 							w.u8(0)?;
-							v1.write(w)?;
+							v15.write(w)?;
 						}
 					}
 					Some(())
@@ -744,12 +1220,12 @@ pub mod input_trusted {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v2) => {
+						Ok(v16) => {
 							w.u8(1)?;
 						}
-						Err(v3) => {
+						Err(v17) => {
 							w.u8(0)?;
-							v3.write(w)?;
+							v17.write(w)?;
 						}
 					}
 					Some(())
@@ -1019,9 +1495,13 @@ pub mod input_admin {
 	use alloc::vec::Vec;
 
 	pub const OP_OPEN_KEYS: u16 = 1;
+	pub const OP_OPEN_GAMEPADS: u16 = 2;
 
 	pub trait Service {
 		fn open_keys(&mut self) -> Result<u64, Error>;
+		/// A connection of the GAMEPAD scope, minted per launch for a program granted `input-gamepad`: only
+		/// `input.observe-gamepads` works on it, and every other operation is refused.
+		fn open_gamepads(&mut self) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1052,14 +1532,51 @@ pub mod input_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v4) => {
+						Ok(v18) => {
 							w.u8(1)?;
-							w.set_handle(*v4)?;
+							w.set_handle(*v18)?;
 							w.u32(0)?;
 						}
-						Err(v5) => {
+						Err(v19) => {
 							w.u8(0)?;
-							v5.write(w)?;
+							v19.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OPEN_GAMEPADS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_gamepads();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v20) => {
+							w.u8(1)?;
+							w.set_handle(*v20)?;
+							w.u32(0)?;
+						}
+						Err(v21) => {
+							w.u8(0)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -1204,6 +1721,45 @@ pub mod input_admin {
 			}
 			decoded
 		}
+		pub fn open_gamepads(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_GAMEPADS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1212,6 +1768,400 @@ pub mod input_admin {
 	fn channel_invoke_open_keys(chan: u64) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.open_keys()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_admin_open_gamepads")]
+	fn channel_invoke_open_gamepads(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_gamepads()
+	}
+}
+
+/// The in-guest gamepad fixture's control endpoint. DEVELOPMENT ONLY: it exists on a development fixture
+/// bound to a QEMU test device, reached through PermissionManager in a development build for a probe whose
+/// policy row grants `fixture-control`. Every gamepad it makes has the harness's shape - X, Y, Z and Rz over
+/// 0..255, sixteen buttons and one hat - and it publishes them on the production `gamepad` wire.
+// interface `gamepad-fixture` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod gamepad_fixture {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_ATTACH: u16 = 1;
+	pub const OP_REPORT: u16 = 2;
+	pub const OP_DETACH: u16 = 3;
+
+	pub trait Service {
+		/// A new gamepad under this label; its handle on the wire.
+		fn attach(&mut self, label: String) -> Result<u32, Error>;
+		/// Its buttons, its hat (0..7, or 8 for centred) and its four axes, as the next report.
+		fn report(&mut self, handle: u32, buttons: u32, hat: u8, axes: Vec<i32>) -> Result<(), Error>;
+		/// Unplug it.
+		fn detach(&mut self, handle: u32) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:input")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ATTACH => {
+				let label = {
+					let v22 = r.string_lp()?;
+					(v22.len() <= 32).then_some(v22)?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.attach(label);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v23) => {
+							w.u8(1)?;
+							w.u32(*v23)?;
+						}
+						Err(v24) => {
+							w.u8(0)?;
+							v24.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_REPORT => {
+				let handle = r.u32()?;
+				let buttons = r.u32()?;
+				let hat = r.u8()?;
+				let axes = {
+					let v25 = r.u16()? as usize;
+					let v25 = (v25 <= 4).then_some(v25)?;
+					let mut v26 = Vec::new();
+					v26.try_reserve_exact(v25).ok()?;
+					for _ in 0..v25 {
+						v26.push(r.i32()?);
+					}
+					v26
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.report(handle, buttons, hat, axes);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v27) => {
+							w.u8(1)?;
+						}
+						Err(v28) => {
+							w.u8(0)?;
+							v28.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_DETACH => {
+				let handle = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.detach(handle);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v29) => {
+							w.u8(1)?;
+						}
+						Err(v30) => {
+							w.u8(0)?;
+							v30.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn attach(&mut self, label: &str) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ATTACH)?;
+			w.u32(corr)?;
+			w.bytes_lp(label.as_bytes())?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn report(&mut self, handle: &u32, buttons: &u32, hat: &u8, axes: &[i32]) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_REPORT)?;
+			w.u32(corr)?;
+			w.u32(*handle)?;
+			w.u32(*buttons)?;
+			w.u8(*hat)?;
+			if axes.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(axes.len() as u16)?;
+			for v31 in axes.iter() {
+				w.i32(*v31)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn detach(&mut self, handle: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DETACH)?;
+			w.u32(corr)?;
+			w.u32(*handle)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_gamepad_fixture_attach")]
+	fn channel_invoke_attach(chan: u64, label: &str) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.attach(label)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_gamepad_fixture_report")]
+	fn channel_invoke_report(chan: u64, handle: &u32, buttons: &u32, hat: &u8, axes: &[i32]) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.report(handle, buttons, hat, axes)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_gamepad_fixture_detach")]
+	fn channel_invoke_detach(chan: u64, handle: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.detach(handle)
 	}
 }
 
@@ -1381,6 +2331,336 @@ impl ContactEvent {
 		crate::codec::cbor::uint(out, self.x as u64);
 		crate::codec::cbor::text(out, "y");
 		crate::codec::cbor::uint(out, self.y as u64);
+	}
+}
+
+impl GamepadAxis {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"usage\":");
+		let _ = write!(out, "{}", self.usage);
+		out.push(',');
+		out.push_str("\"minimum\":");
+		let _ = write!(out, "{}", self.minimum);
+		out.push(',');
+		out.push_str("\"maximum\":");
+		let _ = write!(out, "{}", self.maximum);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("usage=");
+		let _ = write!(out, "{}", self.usage);
+		out.push_str(", ");
+		out.push_str("minimum=");
+		let _ = write!(out, "{}", self.minimum);
+		out.push_str(", ");
+		out.push_str("maximum=");
+		let _ = write!(out, "{}", self.maximum);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "usage");
+		crate::codec::cbor::uint(out, self.usage as u64);
+		crate::codec::cbor::text(out, "minimum");
+		crate::codec::cbor::int(out, self.minimum as i64);
+		crate::codec::cbor::text(out, "maximum");
+		crate::codec::cbor::int(out, self.maximum as i64);
+	}
+}
+
+impl Gamepad {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"label\":");
+		crate::codec::json_escape(&self.label, out);
+		out.push(',');
+		out.push_str("\"axes\":");
+		out.push('[');
+		let mut v33 = true;
+		for v32 in self.axes.iter() {
+			if !v33 {
+				out.push(',');
+			}
+			v33 = false;
+			v32.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"buttons\":");
+		let _ = write!(out, "{}", self.buttons);
+		out.push(',');
+		out.push_str("\"hats\":");
+		let _ = write!(out, "{}", self.hats);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("label=");
+		out.push_str(&self.label);
+		out.push_str(", ");
+		out.push_str("axes=");
+		out.push('[');
+		let mut v35 = true;
+		for v34 in self.axes.iter() {
+			if !v35 {
+				out.push_str(", ");
+			}
+			v35 = false;
+			v34.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("buttons=");
+		let _ = write!(out, "{}", self.buttons);
+		out.push_str(", ");
+		out.push_str("hats=");
+		let _ = write!(out, "{}", self.hats);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "label");
+		crate::codec::cbor::text(out, &self.label);
+		crate::codec::cbor::text(out, "axes");
+		crate::codec::cbor::array(out, self.axes.len());
+		for v36 in self.axes.iter() {
+			v36.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "buttons");
+		crate::codec::cbor::uint(out, self.buttons as u64);
+		crate::codec::cbor::text(out, "hats");
+		crate::codec::cbor::uint(out, self.hats as u64);
+	}
+}
+
+impl GamepadState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"buttons\":");
+		let _ = write!(out, "{}", self.buttons);
+		out.push(',');
+		out.push_str("\"hats\":");
+		out.push('[');
+		let mut v38 = true;
+		for v37 in self.hats.iter() {
+			if !v38 {
+				out.push(',');
+			}
+			v38 = false;
+			let _ = write!(out, "{}", v37);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"axes\":");
+		out.push('[');
+		let mut v40 = true;
+		for v39 in self.axes.iter() {
+			if !v40 {
+				out.push(',');
+			}
+			v40 = false;
+			let _ = write!(out, "{}", v39);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("buttons=");
+		let _ = write!(out, "{}", self.buttons);
+		out.push_str(", ");
+		out.push_str("hats=");
+		out.push('[');
+		let mut v42 = true;
+		for v41 in self.hats.iter() {
+			if !v42 {
+				out.push_str(", ");
+			}
+			v42 = false;
+			let _ = write!(out, "{}", v41);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("axes=");
+		out.push('[');
+		let mut v44 = true;
+		for v43 in self.axes.iter() {
+			if !v44 {
+				out.push_str(", ");
+			}
+			v44 = false;
+			let _ = write!(out, "{}", v43);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "buttons");
+		crate::codec::cbor::uint(out, self.buttons as u64);
+		crate::codec::cbor::text(out, "hats");
+		crate::codec::cbor::array(out, self.hats.len());
+		for v45 in self.hats.iter() {
+			crate::codec::cbor::uint(out, *v45 as u64);
+		}
+		crate::codec::cbor::text(out, "axes");
+		crate::codec::cbor::array(out, self.axes.len());
+		for v46 in self.axes.iter() {
+			crate::codec::cbor::int(out, *v46 as i64);
+		}
+	}
+}
+
+impl GamepadEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			GamepadEvent::Present(v47) => {
+				out.push_str("{\"present\":");
+				v47.to_json_into(out);
+				out.push('}');
+			}
+			GamepadEvent::Arrived(v48) => {
+				out.push_str("{\"arrived\":");
+				v48.to_json_into(out);
+				out.push('}');
+			}
+			GamepadEvent::State(v49) => {
+				out.push_str("{\"state\":");
+				v49.to_json_into(out);
+				out.push('}');
+			}
+			GamepadEvent::Departed(v50) => {
+				out.push_str("{\"departed\":");
+				let _ = write!(out, "{}", v50);
+				out.push('}');
+			}
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			GamepadEvent::Present(v51) => {
+				out.push_str("present(");
+				v51.to_text_into(out);
+				out.push(')');
+			}
+			GamepadEvent::Arrived(v52) => {
+				out.push_str("arrived(");
+				v52.to_text_into(out);
+				out.push(')');
+			}
+			GamepadEvent::State(v53) => {
+				out.push_str("state(");
+				v53.to_text_into(out);
+				out.push(')');
+			}
+			GamepadEvent::Departed(v54) => {
+				out.push_str("departed(");
+				let _ = write!(out, "{}", v54);
+				out.push(')');
+			}
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			GamepadEvent::Present(v55) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "present");
+				v55.to_cbor_into(out);
+			}
+			GamepadEvent::Arrived(v56) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "arrived");
+				v56.to_cbor_into(out);
+			}
+			GamepadEvent::State(v57) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "state");
+				v57.to_cbor_into(out);
+			}
+			GamepadEvent::Departed(v58) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "departed");
+				crate::codec::cbor::uint(out, *v58 as u64);
+			}
+		}
 	}
 }
 

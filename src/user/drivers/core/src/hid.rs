@@ -10,8 +10,14 @@
 // fields (X / Y / Wheel with the Button page) fold into a normalized pointer
 // state. Everything else (vendor pages, LEDs, feature reports) parses for its
 // bit width only, so the offsets that follow it stay correct.
+//
+// A GAMEPAD IS NONE OF THOSE. A Game Pad or Joystick application collection that carries a control this
+// module maps is a gamepad - one per collection, so a two-player adapter is two - and its fields are kept
+// out of every pointer, key, consumer and contact path: its stick does not move a cursor and its buttons do
+// not click. `Layout::gamepads` maps each one onto the `gamepad` wire's axes, buttons and hats.
 
 use alloc::vec::Vec;
+use driver_protocol::gamepad;
 
 // The usage pages decoded into events; every other page only advances the bit
 // cursor. Usages are handled page-extended (page << 16 | usage) throughout.
@@ -49,6 +55,12 @@ const USAGE_X: u16 = 0x30;
 const USAGE_Y: u16 = 0x31;
 const USAGE_WHEEL: u16 = 0x38;
 
+/// The Generic-Desktop application usages that make a collection a gamepad, page-extended.
+pub const USAGE_JOYSTICK: u32 = 0x0001_0004;
+pub const USAGE_GAME_PAD: u32 = 0x0001_0005;
+/// A hat switch, on the Generic-Desktop page.
+const USAGE_HAT_SWITCH: u16 = 0x39;
+
 // The normalized pointer coordinate range (matching the virtio pointer driver):
 // absolute axes scale their logical range into it, relative ones accumulate
 // clamped to it.
@@ -59,6 +71,8 @@ pub const NORM_MAX: i32 = 0xffff;
 const INPUT_CONSTANT: u32 = 1 << 0;
 const INPUT_VARIABLE: u32 = 1 << 1;
 const INPUT_RELATIVE: u32 = 1 << 2;
+// Bit 6: the field has a NULL STATE - a value outside its logical range means "no value" rather than an error.
+const INPUT_NULL_STATE: u32 = 1 << 6;
 
 // A report no wider than this decodes; a descriptor asking for more marks its
 // report id oversized and its segments are dropped (the previous-report state
@@ -95,6 +109,14 @@ struct Segment {
 	/// which is what most devices say and is different from declaring a dimensionless one.
 	unit: u32,
 	unit_exponent: i8,
+	/// THE APPLICATION COLLECTION the field is in - its usage, page-extended, and which occurrence of that usage
+	/// it is - the rule `fields` applies. Zero when the field is in none.
+	application: u32,
+	occurrence: u16,
+	/// The Input item declared a null state.
+	null_state: bool,
+	/// The field is in a GAMEPAD collection, and so in no pointer, key, consumer or contact path.
+	gamepad: bool,
 }
 
 impl Segment {
@@ -191,19 +213,30 @@ impl Layout {
 		self.max_bytes
 	}
 
+	// The segments the pointer, key, consumer and contact paths may read: every one outside a gamepad.
+	fn input_segs(&self) -> impl Iterator<Item = &Segment> {
+		self.segs.iter().filter(|s| !s.gamepad)
+	}
+
 	// Whether the device reports keyboard-page keys.
 	pub fn has_keyboard(&self) -> bool {
-		self.segs.iter().any(|s| s.page == PAGE_KEYBOARD)
+		self.input_segs().any(|s| s.page == PAGE_KEYBOARD)
 	}
 
 	// Whether the device reports a pointer (a Generic-Desktop X axis).
 	pub fn has_pointer(&self) -> bool {
-		self.segs.iter().any(|s| s.page == PAGE_GENERIC_DESKTOP && (0..s.count).any(|i| s.usage_for(i) & 0xffff == USAGE_X as u32))
+		self.input_segs().any(|s| s.page == PAGE_GENERIC_DESKTOP && (0..s.count).any(|i| s.usage_for(i) & 0xffff == USAGE_X as u32))
 	}
 
 	// Whether the device reports Consumer-page controls.
 	pub fn has_consumer(&self) -> bool {
-		self.segs.iter().any(|s| s.page == PAGE_CONSUMER)
+		self.input_segs().any(|s| s.page == PAGE_CONSUMER)
+	}
+
+	// Whether the device declares a gamepad: a Game Pad or Joystick application collection carrying at least
+	// one control `gamepads` maps.
+	pub fn has_gamepad(&self) -> bool {
+		self.segs.iter().any(|s| s.gamepad)
 	}
 
 	// Whether any segment decodes into an event the system consumes.
@@ -217,7 +250,7 @@ impl Layout {
 	// function rather than by a device failing, which is why it is written as a gap and not as a
 	// measurement.
 	pub fn is_useful(&self) -> bool {
-		self.has_keyboard() || self.has_pointer() || self.has_consumer() || self.has_digitizer()
+		self.has_keyboard() || self.has_pointer() || self.has_consumer() || self.has_digitizer() || self.has_gamepad()
 	}
 
 	// Diff the keyboard- and Consumer-page fields of report `id` between two
@@ -225,7 +258,7 @@ impl Layout {
 	// Variable fields diff bit-for-bit; array fields diff as usage sets, exactly
 	// like the boot keyboard's six-key array.
 	pub fn keys_diff(&self, id: u8, prev: &[u8], cur: &[u8], emit: &mut dyn FnMut(u32, bool)) {
-		for seg in self.segs.iter().filter(|s| s.report_id == id && (s.page == PAGE_KEYBOARD || s.page == PAGE_CONSUMER)) {
+		for seg in self.input_segs().filter(|s| s.report_id == id && (s.page == PAGE_KEYBOARD || s.page == PAGE_CONSUMER)) {
 			if seg.variable {
 				for i in 0..seg.count {
 					let bit: u32 = seg.bit_offset + i * seg.size;
@@ -258,7 +291,7 @@ impl Layout {
 	// Whether this device reports on the digitizer page at all - a tablet, a touch surface, or a
 	// pen. Asked before the contacts are read, so a device with none costs no walk.
 	pub fn has_digitizer(&self) -> bool {
-		self.segs.iter().any(|s| s.page == PAGE_DIGITIZER)
+		self.input_segs().any(|s| s.page == PAGE_DIGITIZER)
 	}
 
 	// The deepest collection this descriptor declared, which is what the depth bound is about.
@@ -293,7 +326,7 @@ impl Layout {
 		let mut count: Option<usize> = None;
 		// IN BIT ORDER AND NOT DECLARATION ORDER, because what groups a contact's fields is where
 		// they sit in the report, and a descriptor may declare the pieces in any order it likes.
-		let mut ordered: Vec<&Segment> = self.segs.iter().filter(|s| s.report_id == id && s.variable && matches!(s.page, PAGE_DIGITIZER | PAGE_GENERIC_DESKTOP)).collect();
+		let mut ordered: Vec<&Segment> = self.input_segs().filter(|s| s.report_id == id && s.variable && matches!(s.page, PAGE_DIGITIZER | PAGE_GENERIC_DESKTOP)).collect();
 		ordered.sort_by_key(|s| s.bit_offset);
 		for seg in ordered {
 			for i in 0..seg.count {
@@ -354,7 +387,7 @@ impl Layout {
 	// any pointer field at all.
 	pub fn pointer_fold(&self, id: u8, body: &[u8], x: &mut i32, y: &mut i32, buttons: &mut u8, wheel: &mut i32) -> bool {
 		let mut matched: bool = false;
-		for seg in self.segs.iter().filter(|s| s.report_id == id && s.variable) {
+		for seg in self.input_segs().filter(|s| s.report_id == id && s.variable) {
 			if seg.page == PAGE_BUTTON {
 				matched = true;
 				for i in 0..seg.count.min(8) {
@@ -393,6 +426,183 @@ impl Layout {
 		}
 		matched
 	}
+
+	/// EVERY GAMEPAD THIS DESCRIPTOR DECLARES, in the order its collections were declared, each with its
+	/// controls mapped.
+	pub fn gamepads(&self) -> Vec<GamepadMap> {
+		let mut maps: Vec<GamepadMap> = Vec::new();
+		for seg in self.segs.iter().filter(|s| s.gamepad) {
+			let at = match maps.iter().position(|map| map.application == seg.application && map.occurrence == seg.occurrence) {
+				Some(at) => at,
+				None => {
+					maps.push(GamepadMap { application: seg.application, occurrence: seg.occurrence, axes: Vec::new(), buttons: Vec::new(), hats: Vec::new() });
+					maps.len() - 1
+				}
+			};
+			let map = &mut maps[at];
+			for i in 0..seg.count {
+				let bit = seg.bit_offset + i * seg.size;
+				let signed = seg.logical_min < 0;
+				match control(seg, i) {
+					Some(Control::Axis(usage)) => map.axes.push(AxisField { report_id: seg.report_id, bit, size: seg.size, signed, usage, minimum: seg.logical_min, maximum: seg.logical_max, null_state: seg.null_state }),
+					Some(Control::Button(number)) => {
+						if !map.buttons.iter().any(|button| button.number == number) {
+							map.buttons.push(ButtonField { report_id: seg.report_id, bit, number });
+						}
+					}
+					Some(Control::Hat(positions)) => map.hats.push(HatField { report_id: seg.report_id, bit, size: seg.size, signed, minimum: seg.logical_min, maximum: seg.logical_max, positions }),
+					None => {}
+				}
+			}
+		}
+		// AXES IN BIT ORDER AND AT MOST EIGHT, HATS AT MOST TWO: what a state carries, in the order it carries it.
+		for map in maps.iter_mut() {
+			map.axes.sort_by_key(|axis| (axis.report_id, axis.bit));
+			map.axes.truncate(gamepad::MAX_AXES);
+			map.hats.sort_by_key(|hat| (hat.report_id, hat.bit));
+			map.hats.truncate(gamepad::MAX_HATS as usize);
+		}
+		maps
+	}
+}
+
+// What one field of a gamepad collection maps to, if anything.
+enum Control {
+	/// A Generic-Desktop X..=Wheel or a Simulation-page usage, page-extended.
+	Axis(u32),
+	/// Button n, 1..=32.
+	Button(u8),
+	/// A hat of this many positions, 8 or 4.
+	Hat(u8),
+}
+
+// Field `i` of a segment as a gamepad control: AXES are variable Generic-Desktop X through Wheel and every
+// variable Simulation-page field; BUTTONS are variable one-bit Button-page fields for buttons 1..=32; HATS are
+// variable Hat Switch fields whose range has eight positions or four. Anything else - array-form buttons,
+// buttons past 32, a hat of any other range, the Game page's own controls - is not mapped and costs nothing.
+fn control(seg: &Segment, i: u32) -> Option<Control> {
+	if !seg.variable {
+		return None;
+	}
+	let usage = seg.usage_for(i);
+	let (page, id) = ((usage >> 16) as u16, (usage & 0xffff) as u16);
+	match page {
+		PAGE_GENERIC_DESKTOP if (USAGE_X..=USAGE_WHEEL).contains(&id) => Some(Control::Axis(usage)),
+		PAGE_GENERIC_DESKTOP if id == USAGE_HAT_SWITCH => {
+			let positions = seg.logical_max as i64 - seg.logical_min as i64 + 1;
+			matches!(positions, 4 | 8).then_some(Control::Hat(positions as u8))
+		}
+		PAGE_SIMULATION if id != 0 => Some(Control::Axis(usage)),
+		PAGE_BUTTON if seg.size == 1 && (1..=gamepad::MAX_BUTTONS as u16).contains(&id) => Some(Control::Button(id as u8)),
+		_ => None,
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AxisField {
+	report_id: u8,
+	bit: u32,
+	size: u32,
+	signed: bool,
+	usage: u32,
+	minimum: i32,
+	maximum: i32,
+	null_state: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ButtonField {
+	report_id: u8,
+	bit: u32,
+	number: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HatField {
+	report_id: u8,
+	bit: u32,
+	size: u32,
+	signed: bool,
+	minimum: i32,
+	maximum: i32,
+	positions: u8,
+}
+
+/// ONE GAMEPAD a descriptor declares: an application collection and the controls in it this module maps.
+#[derive(Clone, Debug)]
+pub struct GamepadMap {
+	/// The collection's usage (Game Pad or Joystick, page-extended) and which occurrence of it this is.
+	pub application: u32,
+	pub occurrence: u16,
+	axes: Vec<AxisField>,
+	buttons: Vec<ButtonField>,
+	hats: Vec<HatField>,
+}
+
+/// What one report did to a gamepad's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Applied {
+	/// An axis WITHOUT a null state reported a value outside its declared range: that field kept its previous
+	/// value, and the report's other fields applied.
+	pub refused: bool,
+}
+
+impl GamepadMap {
+	/// The gamepad's shape on the wire, under `label`: its axes in bit order, as many buttons as its highest
+	/// mapped button's number, and its hats.
+	pub fn shape(&self, label: &[u8]) -> Option<gamepad::Shape> {
+		let axes: Vec<gamepad::Axis> = self.axes.iter().map(|axis| gamepad::Axis { usage: axis.usage, minimum: axis.minimum, maximum: axis.maximum }).collect();
+		let buttons = self.buttons.iter().map(|button| button.number).max().unwrap_or(0);
+		gamepad::Shape::new(label, buttons, self.hats.len() as u8, &axes)
+	}
+
+	/// Whether report `id` carries any of this gamepad's controls.
+	pub fn reads(&self, id: u8) -> bool {
+		self.axes.iter().any(|axis| axis.report_id == id) || self.buttons.iter().any(|button| button.report_id == id) || self.hats.iter().any(|hat| hat.report_id == id)
+	}
+
+	/// Apply report `id`'s body to `state`.
+	///
+	/// VALUES OUTSIDE A FIELD'S DECLARED RANGE ARE NOT CLAMPED INTO PLAUSIBLE ONES. A HAT outside its range is
+	/// CENTRED, whether or not the descriptor set Null State - a released hat is exactly such a value, and
+	/// devices that omit the flag send it too. An AXIS in a Null State field outside its range is "no value"
+	/// and keeps its previous value. An AXIS without Null State outside its range is REFUSED: that field keeps
+	/// its previous value, the rest of the report applies, and the answer says so.
+	pub fn apply(&self, id: u8, body: &[u8], state: &mut gamepad::State) -> Applied {
+		let mut applied = Applied::default();
+		for (index, axis) in self.axes.iter().enumerate() {
+			if axis.report_id != id {
+				continue;
+			}
+			let value = reading(body, axis.bit, axis.size, axis.signed);
+			if (axis.minimum..=axis.maximum).contains(&value) {
+				state.axes[index] = value;
+			} else if !axis.null_state {
+				applied.refused = true;
+			}
+		}
+		for button in self.buttons.iter().filter(|button| button.report_id == id) {
+			let bit = 1u32 << (button.number - 1);
+			if field(body, button.bit, 1) != 0 {
+				state.buttons |= bit;
+			} else {
+				state.buttons &= !bit;
+			}
+		}
+		for (index, hat) in self.hats.iter().enumerate() {
+			if hat.report_id != id {
+				continue;
+			}
+			let value = reading(body, hat.bit, hat.size, hat.signed);
+			state.hats[index] = if (hat.minimum..=hat.maximum).contains(&value) { ((value as i64 - hat.minimum as i64) as u8) * (8 / hat.positions) } else { gamepad::CENTRED };
+		}
+		applied
+	}
+}
+
+// A field in the signedness its descriptor declared - see `Segment::reading`.
+fn reading(body: &[u8], bit: u32, size: u32, signed: bool) -> i32 {
+	if signed { signed_field(body, bit, size) } else { field(body, bit, size) as i32 }
 }
 
 // Parse a report descriptor into its decodable input layout. Unknown items and
@@ -424,6 +634,10 @@ pub fn parse(desc: &[u8]) -> Layout {
 	// descriptor refused: what was declared before the runaway is still what the device said.
 	let mut depth: u8 = 0;
 	let mut over_nested: bool = false;
+	// The open collections - their kind, their usage and which occurrence of it - and every usage seen, for the
+	// application a field is in: the rule `fields` applies.
+	let mut collections: Vec<(u32, u32, u16)> = Vec::new();
+	let mut seen: Vec<(u32, u16)> = Vec::new();
 	let mut i: usize = 0;
 	while i < desc.len() {
 		let prefix: u8 = desc[i];
@@ -463,8 +677,24 @@ pub fn parse(desc: &[u8]) -> Layout {
 					depth = depth.saturating_add(1);
 					if depth > MAX_COLLECTION_DEPTH {
 						over_nested = true;
+					} else {
+						let usage = usages.first().copied().unwrap_or(0);
+						let occurrence = match seen.iter_mut().find(|(seen_usage, _)| *seen_usage == usage) {
+							Some((_, count)) => {
+								*count = count.saturating_add(1);
+								*count
+							}
+							None => {
+								seen.push((usage, 0));
+								0
+							}
+						};
+						collections.push((data, usage, occurrence));
 					}
 				} else if tag == 12 {
+					if depth <= MAX_COLLECTION_DEPTH {
+						collections.pop();
+					}
 					depth = depth.saturating_sub(1);
 				}
 				if tag == 8 && !over_nested {
@@ -482,7 +712,8 @@ pub fn parse(desc: &[u8]) -> Layout {
 					let end: u32 = cursor.saturating_add(bits);
 					if data & INPUT_CONSTANT == 0 && interesting && g.size >= 1 && g.size <= 32 && end <= MAX_REPORT_BYTES * 8 {
 						let logical_max: i32 = if g.logical_min >= 0 && g.logical_max < g.logical_min { g.logical_max_raw as i32 } else { g.logical_max };
-						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max, depth, unit: g.unit, unit_exponent: g.unit_exponent });
+						let (application, occurrence) = collections.iter().find(|&&(kind, _, _)| kind == 1).map_or((0, 0), |&(_, usage, occurrence)| (usage, occurrence));
+						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max, depth, unit: g.unit, unit_exponent: g.unit_exponent, application, occurrence, null_state: data & INPUT_NULL_STATE != 0, gamepad: false });
 					}
 					*cursor = cursor.saturating_add(bits);
 				}
@@ -541,6 +772,13 @@ pub fn parse(desc: &[u8]) -> Layout {
 	let mut max_bytes: u32 = max_bits.div_ceil(8);
 	if uses_ids && max_bytes != 0 {
 		max_bytes += 1;
+	}
+	// A GAMEPAD IS A GAME PAD OR JOYSTICK APPLICATION COLLECTION CARRYING A MAPPED CONTROL, and every field in
+	// one leaves the pointer, key, consumer and contact paths. One without a mapped control is not a gamepad,
+	// and its fields are whatever they were.
+	let pads: Vec<(u32, u16)> = segs.iter().filter(|s| matches!(s.application, USAGE_GAME_PAD | USAGE_JOYSTICK) && (0..s.count).any(|i| control(s, i).is_some())).map(|s| (s.application, s.occurrence)).collect();
+	for seg in segs.iter_mut() {
+		seg.gamepad = pads.contains(&(seg.application, seg.occurrence));
 	}
 	Layout { segs, uses_ids, max_bytes }
 }

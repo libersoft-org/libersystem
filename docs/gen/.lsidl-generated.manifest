@@ -22,8 +22,12 @@ liber/event/v1.abi
 liber/event/v1.md
 liber/font/v1.abi
 liber/font/v1.md
+liber/gpio_device/v1.abi
+liber/gpio_device/v1.md
 liber/graphics/v1.abi
 liber/graphics/v1.md
+liber/i2c_device/v1.abi
+liber/i2c_device/v1.md
 liber/import/v1.abi
 liber/import/v1.md
 liber/input/v1.abi

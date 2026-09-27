@@ -882,6 +882,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// one surface per client, and an object model nobody opened twice is a claim: this opens a second
 	// one, presents to it while it owns the screen, and closes it - and the first one's resources and
 	// generation survive that.
+	// THE LANES AND UNITS OF THE FRAMES ABOVE, taken before the second surface - the screen's own size -
+	// draws with the same backend: the report line below is about the main loop's frames.
+	let (lanes, units) = (drawn.lanes, drawn.units);
 	let mut second_presents = 0u32;
 	if controls.second_surface {
 		match FrameLoop::open(&client, WIDTH, HEIGHT, 2) {
@@ -968,10 +971,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		(b" scale-draw-worst-us=", (scaled_draw_worst_ns / 1_000) as u32),
 		(b" interval-mean-us=", (interval_total_ns / interval_count.max(1) / 1_000) as u32),
 		(b" interval-worst-us=", (interval_worst_ns / 1_000) as u32),
-		// THE LANES AND UNITS THE FRAMES RAN WITH, as the last frame reported them - what the ceiling
-		// and the frame's size gave, which is not the pool's threads plus one.
-		(b" lanes=", drawn.lanes as u32),
-		(b" units=", drawn.units as u32),
+		// THE LANES AND UNITS THE FRAMES RAN WITH, as the main loop's last frame reported them - what
+		// the ceiling and the frame's size gave, which is not the pool's threads plus one.
+		(b" lanes=", lanes as u32),
+		(b" units=", units as u32),
 	] {
 		line.extend_from_slice(name);
 		push_number(&mut line, value);

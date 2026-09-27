@@ -177,6 +177,12 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// answer `ERR_UNSUPPORTED` on every boot but a `development-trace` one.
 	(SYS_PERF_RECORD, 89),
 	(SYS_PERF_CONTROL, 90),
+	// PORT I/O AS A CAPABILITY: a claimed row's resource by kind and index, a range's map and unmap in
+	// the caller, and the firmware interpreter's one call that names ports by address.
+	(SYS_DEVICE_RESOURCE_ACQUIRE, 91),
+	(SYS_PORT_RANGE_MAP, 92),
+	(SYS_PORT_RANGE_UNMAP, 93),
+	(SYS_PORT_RANGE_FIRMWARE, 94),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -344,6 +350,7 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(OBJECT_TYPE_PRIVILEGE, 12),
 		(OBJECT_TYPE_WAIT_SET, 13),
 		(OBJECT_TYPE_CLAIM, 14),
+		(OBJECT_TYPE_PORT_RANGE, 15),
 	];
 	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
 	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.
@@ -636,7 +643,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	// them - the same completeness argument the syscall snapshot is built on.
 	let mut covered: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 	assert_layout!(
-		covered, DeviceInfo, 56, 8,
+		covered, DeviceInfo, 120, 8,
 		device_type => 0,
 		// The explicit padding must stay where the implicit padding was.
 		_pad0 => 4,
@@ -679,7 +686,20 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		// is the one thing an operator asking what is in this machine must not be told. It took one
 		// of the four tail bytes, so nothing before it moved and the struct is still 56.
 		on_bus => 52,
-		_pad2 => 53,
+		// THE PORT RESOURCES: their count took the first of the three tail bytes, and the list itself
+		// takes the struct from 56 bytes to 120.
+		port_count => 53,
+		_pad2 => 54,
+		ports => 56,
+	);
+
+	assert_layout!(
+		covered, PortResource, 8, 2,
+		base => 0,
+		len => 2,
+		source => 4,
+		index => 5,
+		_pad => 6,
 	);
 
 	assert_layout!(

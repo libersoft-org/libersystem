@@ -532,6 +532,20 @@ pub fn start_thread_on(cpu: usize, thread: &Arc<Thread>) -> bool {
 	start_and_enqueue(cpu, thread.clone())
 }
 
+// HOLD core `cpu`'s scheduler lock until `release` is raised, answering TLB shootdowns meanwhile as any
+// spin with interrupts masked must. For the test that proves a port range's revocation round needs no
+// lock of the core it revokes on: its service step reads only that core's own record.
+#[cfg(test)]
+pub fn hold_run_queue_lock(cpu: usize, held: &core::sync::atomic::AtomicBool, release: &core::sync::atomic::AtomicBool) {
+	let guard = cpu_sched(cpu).inner.lock();
+	held.store(true, Ordering::Release);
+	while !release.load(Ordering::Acquire) {
+		crate::mem::tlb::service_pending();
+		core::hint::spin_loop();
+	}
+	drop(guard);
+}
+
 // Release a prepared thread onto the run queue.
 #[cfg(test)]
 pub fn start_thread(thread: &Arc<Thread>) {
@@ -1447,6 +1461,7 @@ fn reschedule_as(disp: Disposition, why: u8) {
 		drop(guard);
 		// The idle context runs on this core's boot stack, which no Thread describes.
 		arch::percpu::use_idle_stack();
+		arch::ioports::switch_to_idle();
 		check_switch_target("IDLE", new_sp);
 		switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 		unsafe { arch::context::switch_context(old_sp, new_sp) };
@@ -1476,9 +1491,14 @@ fn reschedule_as(disp: Disposition, why: u8) {
 			// between this and `switch_context` would judge the outgoing stack pointer against the
 			// incoming thread's bounds, so the two cannot be separated.
 			let new_stack = next.kstack_region();
+			// AND WHICH PORTS ITS PROCESS MAY USE. The pointer stays valid while the thread is current,
+			// and the thread holds its process alive.
+			let new_process: *const crate::object::process::Process = Arc::as_ptr(next.process());
 			guard.current = Some(next);
 			drop(guard);
 			arch::percpu::set_stack_bounds(new_stack.0, new_stack.1);
+			// SAFETY: `new_process` is the incoming thread's own, and that thread is now `current`.
+			arch::ioports::switch_in(unsafe { &*new_process });
 			check_switch_target("THREAD", new_sp);
 			arch::percpu::set_kernel_rsp(new_syscall_rsp);
 			// Point TSS.RSP0 at the same parked position, so a ring-3 interrupt taken
@@ -1516,6 +1536,7 @@ fn reschedule_as(disp: Disposition, why: u8) {
 					// so the exception entry's stack check is told it does not know, rather than
 					// left judging against the bounds of a thread that has just exited.
 					arch::percpu::use_idle_stack();
+					arch::ioports::switch_to_idle();
 					check_switch_target("IDLE", new_sp);
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
@@ -1543,6 +1564,7 @@ fn reschedule_as(disp: Disposition, why: u8) {
 					// Same as the retire path: the idle stack is not a thread's, so the check is
 					// disabled rather than aimed at the blocked thread's stack.
 					arch::percpu::use_idle_stack();
+					arch::ioports::switch_to_idle();
 					check_switch_target("IDLE", new_sp);
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };

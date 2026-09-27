@@ -141,6 +141,11 @@ enum capability {
 	/// LAST AND NOT BESIDE `midi-input`, because a capability's number is its position and every one after it
 	/// would move.
 	midi-output,
+	/// WATCHING EVERY GAMEPAD FROM THE CONSOLE, minted per launch as a connection of InputService's gamepad
+	/// scope, on which only `input.observe-gamepads` works - and it delivers only while no graphical surface
+	/// holds display focus, so a background program cannot watch a game's input. Appended last, for the reason
+	/// `midi-output` states.
+	input-gamepad,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

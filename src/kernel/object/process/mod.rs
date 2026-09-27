@@ -190,6 +190,9 @@ pub struct Process {
 	// the biases rather than in them because a bias is a slot reservation that exists before the
 	// image is known to be good, and this is a fact about an image that loaded.
 	lifecycle: SpinLock<Vec<abi::ModuleLifecycle>>,
+	// THE PORTS THIS PROCESS MAY USE: its permission bitmap and the ranges mapped into it. See
+	// `port_range`; every core copies the bitmap when it switches to one of this process's threads.
+	io_ports: super::port_range::IoPorts,
 }
 
 impl Process {
@@ -201,7 +204,9 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), lifecycle: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
+		let header = ObjectHeader::new();
+		let koid = header.koid();
+		let process = crate::mem::heap::try_arc(Self { header, address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), lifecycle: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()), io_ports: super::port_range::IoPorts::new(koid) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -213,6 +218,12 @@ impl Process {
 
 	pub fn address_space(&self) -> &Arc<AddressSpace> {
 		&self.address_space
+	}
+
+	// The ports this process may use, and the ranges that grant them.
+	#[inline(always)]
+	pub fn io_ports(&self) -> &super::port_range::IoPorts {
+		&self.io_ports
 	}
 
 	// The process-wide handle table (shared across the process's threads).
@@ -937,6 +948,10 @@ impl Process {
 		for object in core::mem::take(&mut *self.mapped_dma.lock()) {
 			object.remove_mapping(&self.address_space);
 		}
+		// AND EVERY PORT RANGE, through the same cross-core round an unmap runs: a thread of this process
+		// may still be running on another core until its next switch, and a range handed on before every
+		// core stopped letting it through is two holders at once.
+		super::port_range::give_back_all(self);
 	}
 
 	// Terminate this process: mark it killed and close all its handles, refunding
@@ -1016,6 +1031,9 @@ impl Drop for Process {
 			// leaving a process's worth of memory quarantined until somebody else fills the queue.
 			crate::mem::frame::drain_quarantine();
 		}
+		// The port bitmap goes with it. No core can be copying it: a copy reads the bitmap of a process
+		// one of whose threads is current, and every thread holds its process alive.
+		self.io_ports.release();
 	}
 }
 
