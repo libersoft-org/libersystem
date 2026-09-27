@@ -744,3 +744,46 @@ Re-check of the whole plan:
 - **Format.** The file is ASCII, cites no audit and keeps its `Status:` line. The new lines are at most 110 columns; the seven longer lines are HEAD's.
 
 Only `docs/todo/P02M0196.md` was edited and this response appended. No source, test, script or other plan was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0196 (2026-09-27T04:19:38Z):
+
+**Rating: 10/10.** The last re-audit's finding is fully corrected. A new instance's walk is now reconciled with what the dead instance published, by identity, and the kernel withdraws what the walk did not report again before it passes the report. No unresolved issue, contradiction or new material defect remains.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-27T04:12:27Z;
+- the plan in the working tree, whole, and its diff against `3604e0a6` (the plan is identical to `eb26732d`, committed during this re-audit);
+- the working-tree P02M0195 (the ACPI service's grants, and a controller's one connection per line or address), P02M0198 (ProcessorPowerService's client of the ACPI service), and what P02M0197, P02M0199, P02M0200, P02M0201 and P02M0202 say about restarts;
+- in the tree:
+  - `depart`, `arrive` and `open_claim_slot` in `src/kernel/device.rs`, on which the reconciliation rule is modelled;
+  - ServiceManager's transparent-restart broker, through which a client of a restarted service re-resolves.
+
+The correction holds:
+- **Reconciliation by identity.** Step 1 has ONE ROW PER IDENTITY ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:58)), so the merge rule never sees a re-report. NAMESPACE DEVICES states the rule for every walk ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:300)):
+  - a report under a published path is that row, with no event;
+  - a differing report is logged, and the row keeps what it was published with;
+  - a withdrawn row is refilled with a new generation and an arrival;
+  - what a walk does not report again is withdrawn, by the service for a re-walked subtree and by the kernel at each instance's report;
+  - a static or kernel row loses only the namespace description merged into it.
+
+  The tree matches the model. `depart` keeps the row and its index and clears `on_bus` ([device.rs](/data/yellow/libersystem/src/kernel/device.rs:285)). `arrive` refills the row its address had ([device.rs](/data/yellow/libersystem/src/kernel/device.rs:330)), with a generation moved by `open_claim_slot` ([device.rs](/data/yellow/libersystem/src/kernel/device.rs:438)).
+- **The restart sentence** ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:197)). What the dead instance published outlives it, and the new walk is reconciled with it. The kernel withdraws first and then passes the report. The stage paragraph, the firmware-held admission, the new calls, NAMESPACE DEVICES and the x86_64 gate now describe the same order.
+- **The planner's five additions are necessary, not overengineering:**
+  - the device-check re-walk had the same gap;
+  - the firmware-held admission had to include "firmware-held already" ([policy](/data/yellow/libersystem/docs/todo/P02M0196.md:220)); otherwise the new instance's own ivshmem region, and with it the fixture, would be refused;
+  - a static row has to survive the sweep;
+  - a waiting node-channel request needs an answer when its node is withdrawn;
+  - the difference between a live row and a re-report has to be decided.
+
+  Both rejected alternatives are rightly rejected. Withdrawing everything at the death would rebind every ACPI driver on each crash. The new instance cannot run the sweep itself, because only the kernel holds the published set.
+- **The gate now fails on each omission** ([gate](/data/yellow/libersystem/docs/todo/P02M0196.md:481)):
+  - `LSFX0002` has no `_CRS`, so the merge rule cannot hide a missing identity match, and a second row would bring a second test binding.
+  - `_UID` 1 catches a missing sweep.
+  - A firmware-held function that refused the new instance's region would make both `_STA`s unreadable. Whichever way the interpreter treats that error, one of the two checks fails.
+- **The consumers agree:**
+  - their drivers take the node channel with the claim and keep their bindings across the restart;
+  - a child's connections are minted through the controller for the child, so they do not close with the service (P02M0195);
+  - ProcessorPowerService's client re-resolves through the broker ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1189)), as every client of a transparent service does.
+
+No findings.
+
+Validation: read-only inspection of the audit history, the plan and its diff against HEAD, the working-tree sibling plans, and the sources named above. The plan was also checked for non-ASCII text, audit references and lines over 112 columns, and none were found. No plan or source file was modified, existing audit content was left unchanged, and nothing was built, tested, benchmarked or booted.
