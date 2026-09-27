@@ -21,12 +21,18 @@ use graphics_core::view::{ImageView, ImageViewMut};
 use graphics_core::{AlphaMode, ColorSpace, Error as CoreError, OwnedImage, PixelFormat, PixelStorage};
 use render2d::Error;
 
+use crate::workers::Access;
+
 /// Where a list's referenced images actually are.
 ///
 /// A `DrawList` CARRIES AN IDENTITY AND NOT A POINTER, which is what makes it cacheable and hashable.
 /// The pixels are supplied here, by whoever owns them, at the moment they are needed - so a list that
 /// outlives an image is a lookup that answers `None` rather than a dangling reference.
-pub trait ImageSource {
+///
+/// `Sync`, BECAUSE A LANE READS IT. A frame replayed on several workers consults the source from each of
+/// them at once, and every source in the tree is plain data already - a supertrait says so where the
+/// compiler can check it, rather than in a comment it cannot.
+pub trait ImageSource: Sync {
 	fn image(&self, identity: u64) -> Option<ImageView<'_>>;
 
 	/// The same image as PLANES, for a decoder or a camera that hands over `NV12`, `I420` or `P010`.
@@ -330,49 +336,63 @@ impl Tile {
 	}
 
 	/// Decode a rectangle of a target image into this tile.
-	pub fn load(&mut self, target: &ImageViewMut<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>) -> Result<(), Error> {
-		let source = target.as_view();
+	/// Decode `bounds` of the target into the tile, through the unit's part of the target.
+	pub(crate) fn load(&mut self, access: &Access<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>) -> Result<(), Error> {
+		match access {
+			Access::Band { view, top } => self.load_from(&view.as_view(), *top, bounds, working, table),
+			// THE WHOLE TARGET, READ ONLY: nothing writes it while the units run, so every tile reads the
+			// pixels the frame started with - which is what the serial walk reads, since no tile writes
+			// another's pixels.
+			Access::Slot { source, .. } => self.load_from(source, 0, bounds, working, table),
+		}
+	}
+
+	fn load_from(&mut self, source: &ImageView<'_>, top: u32, bounds: PixelRect, working: Working, table: Option<&TransferTable>) -> Result<(), Error> {
 		let decoder = Decoder::new(&source.layout().semantics, working).map_err(from_core)?;
 		let width = bounds.width as usize;
 		for y in bounds.y..bounds.y.saturating_add(bounds.height) {
 			let Some(start) = self.index(bounds.x, y) else { continue };
 			let Some(row) = self.pixels.get_mut(start..start + width) else { continue };
-			read_row(&source, bounds.x, y, row);
-			// THE WHOLE RUN, for the reason `store` beside it gives: this was `decode_tabled` per
-			// pixel, which asks whether there is a usable table and whether the working space is
-			// linear once for every pixel instead of once for the row. `Decoder::decode_row` takes
-			// both decisions at the top and is what the other surface type has always called.
+			read_row(source, bounds.x, y.saturating_sub(top), row);
 			decoder.decode_row(table, row);
 		}
 		Ok(())
 	}
 
-	/// Encode this tile back into a rectangle of a target image.
+	/// Encode `bounds` of the tile into the unit's part of the target: its band's rows, or its slot.
 	///
-	/// THE DITHER PHASE IS THE TARGET'S x AND y, which is why they are passed through rather than the
-	/// tile's own: a tile-relative phase makes the ordered pattern restart at every tile boundary, and
-	/// that is the artefact that looks like a seam.
-	pub fn store(&self, target: &mut ImageViewMut<'_>, bounds: PixelRect, working: Working, output: OutputLuminance, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
-		let (semantics, storage) = (target.layout().semantics, target.layout().storage);
-		let encoder = Encoder::new_for_output(&semantics, storage, working, output).map_err(from_core)?;
+	/// THE ENCODER IS TOLD THE ABSOLUTE POSITION either way, because its dither is a function of where a
+	/// pixel is on the target - a slot's own coordinates would dither every tile alike.
+	pub(crate) fn store(&self, access: &mut Access<'_>, bounds: PixelRect, working: Working, output: OutputLuminance, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
+		let layout = match access {
+			Access::Band { view, .. } => *view.layout(),
+			Access::Slot { source, .. } => *source.layout(),
+		};
+		let encoder = Encoder::new_for_output(&layout.semantics, layout.storage, working, output).map_err(from_core)?;
 		let width = (bounds.width as usize).min(scratch.len());
-		for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-			let Some(start) = self.index(bounds.x, y) else { continue };
-			let Some(row) = self.pixels.get(start..start + width) else { continue };
-			// THE WHOLE RUN AND NOT A PIXEL AT A TIME. This was `encode_tabled` called per pixel, which
-			// takes every decision the encode makes - the transfer, whether there is a table, the
-			// premultiply, the dither - once for each of them instead of once for the row. It is the
-			// hot path: `replay` stores every tile it touched, so a full-screen frame runs this over
-			// every pixel of the frame, and it was **91 percent of the cost of a solid full-screen
-			// fill** - 12.95 of its 14.29 milliseconds, measured by emptying the loop.
-			//
-			// `Surface::store` beside it has always used the run form; this one had the same loop
-			// written out by hand. The dither phase is the TARGET's x and y and `encode_row` takes the
-			// row's first column for exactly that reason, so the pattern is the same one - a
-			// tile-relative phase would restart at every tile boundary and look like a seam.
-			scratch[..width].copy_from_slice(row);
-			encoder.encode_row(table, &mut scratch[..width], bounds.x, y);
-			write_row(target, bounds.x, y, &scratch[..width]);
+		match access {
+			Access::Band { view, top } => {
+				for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+					let Some(start) = self.index(bounds.x, y) else { continue };
+					let Some(row) = self.pixels.get(start..start + width) else { continue };
+					scratch[..width].copy_from_slice(row);
+					encoder.encode_row(table, &mut scratch[..width], bounds.x, y);
+					write_row(view, bounds.x, y.saturating_sub(*top), &scratch[..width]);
+				}
+			}
+			Access::Slot { slot, tile, pitch, .. } => {
+				// THE SLOT IS AN IMAGE OF ITS OWN, one tile of the target's format with no padding past
+				// its rows, so the one row writer the target uses writes it too.
+				let slot_layout = ImageLayout::new(Extent2D::new(tile.width.max(1), tile.height.max(1)), *pitch as u32, layout.storage, RowOrigin::TopLeft, layout.semantics).map_err(from_core)?;
+				let mut view = ImageViewMut::new(slot_layout, slot).map_err(from_core)?;
+				for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+					let Some(start) = self.index(bounds.x, y) else { continue };
+					let Some(row) = self.pixels.get(start..start + width) else { continue };
+					scratch[..width].copy_from_slice(row);
+					encoder.encode_row(table, &mut scratch[..width], bounds.x, y);
+					write_row(&mut view, bounds.x - tile.x, y - tile.y, &scratch[..width]);
+				}
+			}
 		}
 		Ok(())
 	}

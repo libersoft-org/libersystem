@@ -5,17 +5,26 @@
 //! refuses BEFORE any pixel is written - a frame that fails halfway through a filter chain leaves a
 //! half-drawn picture on the screen, which is worse than not drawing it.
 //!
-//! `render` REPLAYS AND ALLOCATES NOTHING. Every buffer it uses came out of the reservation: the
-//! coverage row, the clip masks, the layer surfaces and the tile's working copy. A frame that repeats
-//! with the same list and the same target therefore costs what the drawing costs and nothing else.
+//! `render` REPLAYS AND ALLOCATES NOTHING, and a counting allocator holds it to that rather than this
+//! sentence. Every buffer it uses came out of the reservation: the coverage row, the clip masks, the
+//! clip and layer stacks, the layer surfaces, a filter's node table and the tile's working copy are a
+//! LANE's, a gradient's ramp, a blur's kernel and every glyph's edges are the prepared list's, and the
+//! shader table keeps its storage from one frame to the next. A frame that repeats with the same list
+//! and the same target therefore costs what the drawing costs and nothing else.
+//!
+//! AND THE REPLAY IS CUT INTO UNITS that the caller's `Workers` run on its lanes - bands of tile rows,
+//! or tiles through a tile-major intermediate - each replayed in the serial order of its own tiles,
+//! so every schedule draws the pixels the serial walk draws.
 //!
 //! AND THE REPLAY IS TILED. Each tile decodes its own rectangle of the target once, replays the
 //! commands binned to it, and encodes once - so the conversion is at the edges of a tile rather than
 //! inside its command loop, and the working set is a tile rather than a surface.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use graphics_core::geom::{PixelRect, PointF, RectF};
+use graphics_core::geom::{Extent2D, PixelRect, PointF, RectF};
 use graphics_core::pixel::TransferTable;
 use graphics_core::pixel::{Rgba, Working};
 use graphics_core::sample::Pyramid;
@@ -30,14 +39,15 @@ use render2d::prepared::PreparedKey;
 use render2d::transform::Transform;
 use render2d::{Error, resource::FilterHandle};
 
-use crate::clip::{ClipLevel, ClipStack, MaskPool, write_mask_row};
+use crate::clip::{ClipLevel, ClipStack, write_mask_row};
 use crate::glyph::{GlyphImage, GlyphProvider, GlyphRaster, NoGlyphs};
-use crate::layer::{Layer, Pool, layer_bounds};
-use crate::paint::{ImageLookup, Shader, shader, to_working};
+use crate::layer::{Layer, layer_bounds};
+use crate::paint::{ImageLookup, Ramp, Shader, ramp_for, shader, to_working};
 use crate::raster::Rasteriser;
 use crate::stroke::{StrokeParameters, dashed, outline};
-use crate::target::{ImageSource, NoImages, Raster, Tile};
+use crate::target::{ImageSource, NoImages, Raster};
 use crate::tile::{Bins, Tiling, cover};
+use crate::workers::{Access, Lane, Serial, Unit, UnitKind, Workers};
 use crate::{BACKEND_NAME, BACKEND_VERSION, TILE_SIZE};
 
 /// Whether a frame should stop.
@@ -45,7 +55,9 @@ use crate::{BACKEND_NAME, BACKEND_VERSION, TILE_SIZE};
 /// A SURFACE THAT WAS CLOSED OR RESIZED MID-FRAME IS A FRAME NOBODY WILL SEE. Finishing it costs the
 /// whole drawing for nothing, and on a resize it costs it at the wrong size - so the loop asks
 /// between tiles, which is often enough to stop promptly and rare enough to cost nothing.
-pub trait Cancellation {
+///
+/// `Sync`, BECAUSE EVERY LANE ASKS IT before each unit it takes, from whichever worker runs the lane.
+pub trait Cancellation: Sync {
 	fn cancelled(&self) -> bool;
 }
 
@@ -69,8 +81,11 @@ enum Step {
 		operator: Operator,
 		opacity: f32,
 	},
+	/// A RUN'S GLYPHS, DECODED AND PLACED AT `prepare`: the replay reads only these and never the
+	/// cache or the provider, so a lane needs neither - and two lanes meeting the same glyph is not a
+	/// race, because nobody writes the cache while a frame replays.
 	Glyphs {
-		run: u32,
+		placed: Vec<Placed>,
 		paint: Paint,
 		transform: Transform,
 		blend: BlendMode,
@@ -126,6 +141,21 @@ enum Step {
 	EndLayer,
 }
 
+/// One glyph of a run, where it lands on the target and in the form it is drawn in.
+///
+/// AN OUTLINE OR A COLOUR LAYER IS FLATTENED AT ITS PLACED ORIGIN AND EDGE-BUILT THERE, once per placed
+/// glyph - exactly what a tile did with it before, moved and not changed - so its edges and its pixels
+/// are the same; like a fill's edges they are the prepared form and not scratch. A MASK OR A BITMAP is
+/// held by reference, sharing the cache's entry, with the arithmetic that placed it done here.
+/// NOTHING IS PRE-RASTERISED: an outline turned into a mask would composite through the coverage gamma
+/// that masks go through and outlines do not, and every text pixel would move.
+enum Placed {
+	Outline(crate::raster::Edges),
+	Layers(Vec<(crate::raster::Edges, Rgba)>),
+	Mask { form: Arc<GlyphImage>, x: i64, y: i64 },
+	Bitmap { form: Arc<GlyphImage>, x: i64, y: i64 },
+}
+
 /// What `prepare` produced.
 pub struct SoftPrepared {
 	key: PreparedKey,
@@ -135,9 +165,12 @@ pub struct SoftPrepared {
 	tiling: Tiling,
 	pyramids: Vec<(u32, Pyramid)>,
 	images: Vec<ImageRecord>,
-	stops: Vec<Vec<render2d::paint::GradientStop>>,
+	/// Each command's gradient ramp, resolved into the working space here - `None` for a paint that is
+	/// not a gradient.
+	ramps: Vec<Option<Ramp>>,
 	filters: Vec<render2d::filter::FilterGraph>,
-	glyph_runs: Vec<render2d::list::RecordedGlyphRun>,
+	/// Each filter graph's blur kernels, in node order, computed with the graph.
+	kernels: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
 	working: Working,
 	target_transfer: graphics_profile::image::Transfer,
 	/// What the destination said it can show, carried from the description to the one place that
@@ -152,6 +185,14 @@ pub struct SoftPrepared {
 	/// Worked out here rather than per frame, because it is a function of the list and the target
 	/// and a prepared list is already bound to both.
 	no_backdrop: Vec<bool>,
+	/// THE LANES THIS FRAME RUNS WITH - what the ceiling left room for, at most what the pool offered
+	/// and at most the units it is cut into - and HOW IT IS CUT: each unit a run of tiles, in serial
+	/// order.
+	lanes: usize,
+	unit_kind: UnitKind,
+	units: Vec<(u32, u32)>,
+	/// One tile-major slot's length in bytes, when the units are tiles on more than one lane.
+	slot_bytes: usize,
 }
 
 impl SoftPrepared {
@@ -187,6 +228,28 @@ impl SoftPrepared {
 	pub fn tiles(&self) -> usize {
 		self.tiling.count()
 	}
+
+	/// THE LANES THIS FRAME RUNS WITH: what the prepared-scratch ceiling left room for beside the one
+	/// lane every frame has, up to the lanes the pool offered and the units the frame is cut into.
+	pub fn lanes(&self) -> usize {
+		self.lanes
+	}
+
+	/// HOW MANY UNITS THE FRAME IS CUT INTO - bands or tiles that have something to draw.
+	pub fn units(&self) -> usize {
+		self.units.len()
+	}
+
+	/// What the units are.
+	pub fn unit_kind(&self) -> UnitKind {
+		self.unit_kind
+	}
+
+	/// HOW MANY IMAGES THIS FRAME SAMPLES THROUGH A DECODED COPY OR A PYRAMID, which a fixture asserts to
+	/// know which copies the ceiling left a frame.
+	pub fn decoded_images(&self) -> usize {
+		self.pyramids.len()
+	}
 }
 
 impl Prepared for SoftPrepared {
@@ -204,17 +267,31 @@ pub struct Soft2d<'a> {
 	images: &'a dyn ImageSource,
 	glyphs: &'a dyn GlyphProvider,
 	cancellation: Option<&'a dyn Cancellation>,
+	/// WHO RUNS A FRAME'S UNITS, held from construction as the image source is: the `Backend` trait's
+	/// `prepare` and `render` carry no pool, and `prepare` is where the lanes are reserved.
+	workers: &'a dyn Workers,
+	unit_kind: UnitKind,
 	cache: GlyphRaster,
-	raster: Rasteriser,
-	pool: Pool,
-	masks: MaskPool,
-	spans: Spans,
-	tile: Option<Tile>,
+	/// One lane per worker the last `prepare` reserved, the first of which every frame has.
+	lanes: Vec<Lane>,
+	/// STORAGE KEPT FROM ONE FRAME TO THE NEXT while nothing it held is: the shaders and the units borrow
+	/// the frame, so they cannot outlive it - but their capacity can, which is the difference between a
+	/// replay that allocates nothing and one that allocates per frame.
+	shader_table: Vec<Shader<'static>>,
+	unit_table: Vec<Unit<'static>>,
+	/// Which units ran to their end, for the tile-major copy - one per unit.
+	finished: Vec<bool>,
+	/// THE TILE-MAJOR INTERMEDIATE, when a frame's units are tiles on more than one lane: one slot per
+	/// unit, each a tile of the target's format.
+	intermediate: Vec<u8>,
 	/// THE TRANSFER FUNCTIONS THIS DRAWING NEEDS, built once in `prepare`. One per distinct function
 	/// rather than one per image: four images in sRGB share one table, and building a table per image
 	/// would spend more on the tables than the powers they replace.
 	tables: Vec<(graphics_profile::image::Transfer, TransferTable)>,
 }
+
+/// The pool a backend nobody gave one runs on.
+static SERIAL: Serial = Serial;
 
 impl Default for Soft2d<'_> {
 	fn default() -> Self {
@@ -225,7 +302,21 @@ impl Default for Soft2d<'_> {
 impl<'a> Soft2d<'a> {
 	/// A backend for a drawing that references no images and no glyphs.
 	pub fn new() -> Self {
-		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, cache: GlyphRaster::default(), raster: Rasteriser::new(), pool: Pool::new(), masks: MaskPool::new(), spans: Spans::default(), tile: None, tables: Vec::new() }
+		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Bands, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), tables: Vec::new() }
+	}
+
+	/// Replay a frame's units on `workers`' lanes. `Serial` - this thread, unit after unit - is the
+	/// default and the scalar reference.
+	pub fn with_workers(mut self, workers: &'a dyn Workers) -> Self {
+		self.workers = workers;
+		self
+	}
+
+	/// Cut frames into units of this kind. MEASURED, NOT PREFERRED: the two kinds are what the choice of
+	/// the unit was measured between, and a benchmark asks for each.
+	pub fn with_units(mut self, kind: UnitKind) -> Self {
+		self.unit_kind = kind;
+		self
 	}
 
 	pub fn with_images(mut self, images: &'a dyn ImageSource) -> Self {
@@ -557,7 +648,13 @@ impl<'a> Backend for Soft2d<'a> {
 				}
 				Command::DrawGlyphRun { run, paint, transform, blend, operator, opacity } => {
 					let bound = glyph_run_bounds(resources, run.0, transform).map(|rect| rect.intersection(&target_rect));
-					(Step::Glyphs { run: run.0, paint: *paint, transform: *transform, blend: *blend, operator: *operator, opacity: *opacity }, bound)
+					// THE RUN IS DECODED AND PLACED HERE, and every distinct glyph is resolved through the
+					// cache once - a miss decoded by the provider - so the replay touches neither.
+					let placed = match resources.glyph_runs.get(run.0 as usize) {
+						Some(recorded) => place_glyphs(&mut self.cache, self.glyphs, recorded, transform, working, &mut widest_edges),
+						None => Vec::new(),
+					};
+					(Step::Glyphs { placed, paint: *paint, transform: *transform, blend: *blend, operator: *operator, opacity: *opacity }, bound)
 				}
 				Command::PushClipMask { image, transform, inverse } => (Step::PushClipMask { image: *image, transform: *transform, inverse: *inverse }, None),
 				Command::PushClip { path, rule, transform, antialias, inverse } => {
@@ -674,36 +771,88 @@ impl<'a> Backend for Soft2d<'a> {
 		let layers_wanted = list.commands().iter().filter(|command| matches!(command, Command::BeginLayer { .. })).count();
 		let filter_nodes = resources.filters.iter().map(|graph| graph.nodes().len()).max().unwrap_or(0);
 		let surfaces = layers_wanted + filter_nodes + 2;
-		self.pool.reserve(surfaces, scratch_extent, target.color_space)?;
 		// A RECTANGLE CLIP RESERVES NO MASK, because it never takes one - see `Step::PushClipRect`.
 		// Counting it would be scratch nothing reads, charged against the prepared-scratch ceiling.
 		let clips_wanted = steps.iter().filter(|step| matches!(step, Step::PushClip { .. } | Step::PushClipMask { .. })).count();
-		self.masks.reserve(clips_wanted, scratch_extent.0 as usize * scratch_extent.1 as usize);
-		self.raster.reserve(scratch_extent.0 as usize, widest_edges);
-		self.spans.reserve(scratch_extent.0 as usize);
-		if self.tile.is_none() {
-			self.tile = Some(Tile::new(TILE_SIZE));
-		}
+		// EVERY CLIP LEVEL a tile can push, rectangles included: what a lane's clip stack is reserved to.
+		let clip_levels = steps.iter().filter(|step| matches!(step, Step::PushClip { .. } | Step::PushClipRect { .. } | Step::PushClipMask { .. })).count();
+		let shape = LaneShape { surfaces, extent: scratch_extent, space: target.color_space, masks: clips_wanted, edges: widest_edges, clips: clip_levels, layers: layers_wanted, nodes: filter_nodes };
 
-		let fixed = self.pool.scratch_bytes() + self.masks.scratch_bytes() + self.raster.scratch_bytes() + self.spans.scratch_bytes() + bins.scratch_bytes() + self.tile.as_ref().map(|tile| tile.scratch_bytes()).unwrap_or(0);
+		// THE FIRST LANE IS SETTLED THE WAY THE ONE SET OF SCRATCH ALWAYS WAS, and every frame has it.
+		if self.lanes.is_empty() {
+			self.lanes.push(Lane::default());
+		}
+		shape.reserve(&mut self.lanes[0])?;
+		let lane_bytes = self.lanes[0].scratch_bytes();
+		let fixed = lane_bytes + bins.scratch_bytes();
 		let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
-		// THE OPTIONAL COPIES ARE GIVEN BACK BEFORE ANYTHING IS REFUSED, newest first. Each is a
-		// decoded source that only makes an image sample faster, so dropping one costs time and
-		// nothing else - and a frame that fitted before this optimisation existed still fits.
+		// THE OPTIONAL COPIES ARE GIVEN BACK BEFORE ANYTHING IS REFUSED, newest first, against the list's
+		// own scratch and ONE lane's - so a frame that fitted before this optimisation existed still fits.
+		// Each is a decoded source that makes an image sample faster, and giving one back is NOT free of
+		// consequence: the copy holds its texels at half precision and the direct path decodes each tap
+		// at single precision, so it can move an output pixel. Which is why the copies are settled here,
+		// before a second lane is considered, and never displaced by one.
 		while fixed + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>() > ceiling {
 			let Some(last) = optional.iter().rposition(|entry| *entry) else { break };
 			pyramids.remove(last);
 			optional.remove(last);
 		}
-		let scratch_bytes = fixed + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>();
+		let mut scratch_bytes = fixed + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>();
 		if scratch_bytes > ceiling {
 			// A FRAME THAT CANNOT FIT SAYS SO BEFORE IT STARTS DRAWING. Discovering it halfway through
 			// a filter chain leaves a half-drawn frame, which is worse than an honest refusal.
 			return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling });
 		}
 
+		// LANES BEYOND THE FIRST ARE FITTED ONLY INTO WHAT IS LEFT, up to the lanes the pool offers and
+		// the units there are to share out - so a lane never displaces a copy, and every worker count
+		// keeps the copies the one-lane frame keeps. A COST THAT EXISTS ONLY WITH SEVERAL LANES - the
+		// tile-major intermediate - is charged together with the second lane, and a frame with no room
+		// for both runs on one lane without it.
+		let tile_units = cut(&tiling, &bins, UnitKind::Tiles);
+		let band_units = cut(&tiling, &bins, UnitKind::Bands);
+		let slot_bytes = (TILE_SIZE as usize) * (TILE_SIZE as usize) * target.format.bytes_per_pixel() as usize;
+		let (wanted_units, intermediate_bytes) = match self.unit_kind {
+			UnitKind::Tiles => (tile_units.len(), (tile_units.len() * slot_bytes) as u64),
+			UnitKind::Bands => (band_units.len(), 0),
+		};
+		let offered = self.workers.lanes().max(1).min(wanted_units.max(1));
+		let mut lanes = 1usize;
+		while lanes < offered {
+			let extra = lane_bytes + if lanes == 1 { intermediate_bytes } else { 0 };
+			if scratch_bytes + extra > ceiling {
+				break;
+			}
+			scratch_bytes += extra;
+			lanes += 1;
+		}
+		// ONE LANE IS THE SERIAL WALK, whatever the units were going to be: tiles need the intermediate
+		// only to be written from several lanes at once, and a frame on one lane is cut into bands.
+		let (unit_kind, units) = if lanes > 1 && self.unit_kind == UnitKind::Tiles { (UnitKind::Tiles, tile_units) } else { (UnitKind::Bands, band_units) };
+		while self.lanes.len() < lanes {
+			self.lanes.push(Lane::default());
+		}
+		for lane in self.lanes.iter_mut().take(lanes).skip(1) {
+			shape.reserve(lane)?;
+		}
+		if unit_kind == UnitKind::Tiles {
+			self.intermediate.resize(units.len() * slot_bytes, 0);
+		}
+		self.finished.resize(units.len(), false);
+		// THE FRAME'S OWN TABLES, sized here so the replay only fills them.
+		self.unit_table.reserve(units.len().saturating_sub(self.unit_table.len()));
+		self.shader_table.reserve(steps.len().saturating_sub(self.shader_table.len()));
+
+		let ramps = steps
+			.iter()
+			.map(|step| match step {
+				Step::Fill { paint, .. } | Step::Image { paint, .. } | Step::Glyphs { paint, .. } | Step::AliasedLines { paint, .. } => ramp_for(paint, working, &resources.stops),
+				_ => None,
+			})
+			.collect();
+		let kernels = resources.filters.iter().map(crate::filter::kernels).collect();
 		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
-		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop, regions })
+		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), ramps, filters: resources.filters.clone(), kernels, working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop, regions, lanes, unit_kind, units, slot_bytes })
 	}
 
 	fn render(&mut self, prepared: &Self::Prepared, target: &mut ImageViewMut<'_>) -> Result<(), Error> {
@@ -712,71 +861,229 @@ impl<'a> Backend for Soft2d<'a> {
 			return Err(Error::LimitExceeded { limit: "target extent", ceiling: prepared.tiling.extent.width as u64 });
 		}
 		// THE BACKEND IS TAKEN APART INTO ITS FIELDS so the shaders can borrow the image table while
-		// the tile loop borrows the scratch. Both are `self`, and only disjoint field borrows let one
-		// be read while the other is written.
-		let Soft2d { images, glyphs, cancellation, cache, raster, pool, masks, spans, tile: tile_surface, tables } = self;
-		let lookup = Lookup { source: *images, records: &prepared.images, pyramids: &prepared.pyramids, tables };
-		// EVERY SHADER IS BUILT ONCE PER FRAME AND NOT ONCE PER TILE. A solid paint's colour has to be
-		// converted into the working space, a gradient's stops have to be resolved into a ramp, and an
-		// image's sampler has to derive a colour-space matrix - and a drawing of two hundred commands
-		// over eighty tiles built every one of those sixteen thousand times.
-		let shaders: Vec<Shader<'_>> = prepared
-			.steps
-			.iter()
-			.map(|step| match step {
-				Step::Fill { paint, transform, .. } | Step::Image { paint, transform, .. } | Step::Glyphs { paint, transform, .. } | Step::AliasedLines { paint, transform, .. } => shader(paint, transform, prepared.working, &prepared.stops, &lookup),
-				_ => Shader::Nothing,
-			})
-			.collect();
-		let target_table = tables.iter().find(|(kind, _)| *kind == prepared.target_transfer).map(|(_, table)| table);
-		let mut surface = tile_surface.take().ok_or(Error::Allocation)?;
-		let mut outcome = Ok(());
-		for index in 0..prepared.tiling.count() {
-			// THE CANCELLATION IS ASKED BETWEEN TILES: often enough to stop promptly, rare enough to
-			// cost nothing, and at a point where what has been drawn is whole tiles rather than a
-			// shape cut in half.
-			if cancellation.map(|cancellation| cancellation.cancelled()).unwrap_or(false) {
-				outcome = Err(Error::Cancelled);
-				break;
-			}
-			let tile = prepared.tiling.tile(index);
-			if tile.is_empty() {
-				continue;
-			}
-			// A TILE NOTHING DRAWS INTO IS NOT REPLAYED. Replaying an empty bin still DECODED the tile
-			// into the working space and RE-ENCODED it - for the eight-bit sRGB target that round trip
-			// happens to be lossless, so what it cost was time and not pixels: an empty draw list cost
-			// 21 ms of it, which was the largest single term in the simplest scene, and a compositor
-			// redrawing one damaged corner paid it for every other tile of the frame.
-			if prepared.bins.commands(index).is_empty() {
-				continue;
-			}
-			surface.rebase((tile.x, tile.y));
-			let scratch = Scratch { raster, pool, masks, spans, cache, glyphs: *glyphs };
-			if let Err(error) = replay(prepared, target, tile, index, &mut surface, &shaders, &lookup, target_table, scratch) {
-				outcome = Err(error);
-				break;
-			}
+		// the lanes borrow the scratch. Both are `self`, and only disjoint field borrows let one be read
+		// while the other is written.
+		let Soft2d { images, cancellation, workers, lanes, shader_table, unit_table, finished, intermediate, tables, .. } = self;
+		// A PREPARED LIST FROM ANOTHER BACKEND reserved lanes this one does not have.
+		if lanes.len() < prepared.lanes.max(1) || finished.len() < prepared.units.len() || (prepared.unit_kind == UnitKind::Tiles && intermediate.len() < prepared.units.len() * prepared.slot_bytes) {
+			return Err(Error::Allocation);
 		}
-		*tile_surface = Some(surface);
+		let lookup = Lookup { source: *images, records: &prepared.images, pyramids: &prepared.pyramids, tables };
+		// EVERY SHADER IS BUILT ONCE PER FRAME AND NOT ONCE PER TILE, into storage kept from the last
+		// frame. A solid paint's colour has to be converted into the working space and an image's
+		// sampler has to derive a colour-space matrix - and a drawing of two hundred commands over eighty
+		// tiles built every one of those sixteen thousand times. A gradient's ramp is the prepared
+		// list's, resolved once.
+		let mut shaders: Vec<Shader<'_>> = recycle(core::mem::take(shader_table));
+		shaders.extend(prepared.steps.iter().zip(prepared.ramps.iter()).map(|(step, ramp)| match step {
+			Step::Fill { paint, transform, .. } | Step::Image { paint, transform, .. } | Step::Glyphs { paint, transform, .. } | Step::AliasedLines { paint, transform, .. } => shader(paint, transform, prepared.working, ramp.as_ref(), &lookup),
+			_ => Shader::Nothing,
+		}));
+		let table = tables.iter().find(|(kind, _)| *kind == prepared.target_transfer).map(|(_, table)| table);
+		let lanes = &mut lanes[..prepared.lanes.max(1)];
+		for lane in lanes.iter_mut() {
+			lane.failure = None;
+		}
+		let failed = AtomicUsize::new(usize::MAX);
+		let stopped = AtomicBool::new(false);
+		let cancellation = *cancellation;
+		let shaders_ref: &[Shader<'_>] = &shaders;
+		let work = |lane: &mut Lane, unit: &mut Unit<'_>| {
+			// A UNIT HANDED OUT TWICE IS REPLAYED ONCE, and a unit after the lowest that failed is not
+			// replayed at all: the serial walk would never have reached it.
+			if unit.ran {
+				return;
+			}
+			unit.ran = true;
+			if unit.index > failed.load(Ordering::Relaxed) {
+				return;
+			}
+			// THE CANCELLATION IS ASKED BEFORE EVERY UNIT, by every lane: often enough to stop promptly,
+			// rare enough to cost nothing, and at a point where what has been drawn is whole units rather
+			// than a shape cut in half. Once one lane has seen it, every lane stops at its next unit.
+			if stopped.load(Ordering::Relaxed) || cancellation.is_some_and(|cancellation| cancellation.cancelled()) {
+				stopped.store(true, Ordering::Relaxed);
+				return;
+			}
+			for index in unit.first_tile as usize..(unit.first_tile + unit.tiles) as usize {
+				let tile = prepared.tiling.tile(index);
+				// A TILE NOTHING DRAWS INTO IS NOT REPLAYED. Replaying an empty bin still DECODED the tile
+				// into the working space and RE-ENCODED it - for the eight-bit sRGB target that round trip
+				// happens to be lossless, so what it cost was time and not pixels: an empty draw list cost
+				// 21 ms of it, which was the largest single term in the simplest scene, and a compositor
+				// redrawing one damaged corner paid it for every other tile of the frame.
+				if tile.is_empty() || prepared.bins.commands(index).is_empty() {
+					continue;
+				}
+				lane.tile.rebase((tile.x, tile.y));
+				if let Err(error) = replay(prepared, &mut unit.access, tile, index, lane, shaders_ref, &lookup, table) {
+					failed.fetch_min(unit.index, Ordering::Relaxed);
+					if lane.failure.as_ref().is_none_or(|(at, _)| unit.index < *at) {
+						lane.failure = Some((unit.index, error));
+					}
+					return;
+				}
+			}
+			unit.whole = true;
+		};
+		let outcome = match prepared.unit_kind {
+			UnitKind::Bands => {
+				let mut units: Vec<Unit<'_>> = recycle(core::mem::take(unit_table));
+				band_units(&mut units, target, &prepared.tiling, &prepared.units)?;
+				workers.run(lanes, &mut units, &work);
+				let outcome = verdict(&units, lanes, &stopped);
+				*unit_table = recycle(units);
+				outcome
+			}
+			UnitKind::Tiles => {
+				let source = target.as_view();
+				let mut units: Vec<Unit<'_>> = recycle(core::mem::take(unit_table));
+				for ((index, &(first_tile, tiles)), slot) in prepared.units.iter().enumerate().zip(intermediate.chunks_mut(prepared.slot_bytes)) {
+					let tile = prepared.tiling.tile(first_tile as usize);
+					let pitch = TILE_SIZE as usize * source.layout().storage.bytes_per_pixel() as usize;
+					units.push(Unit { index, first_tile, tiles, access: Access::Slot { source: &source, slot, tile, pitch }, ran: false, whole: false });
+				}
+				workers.run(lanes, &mut units, &work);
+				let outcome = verdict(&units, lanes, &stopped);
+				for (flag, unit) in finished.iter_mut().zip(units.iter()) {
+					*flag = unit.whole;
+				}
+				*unit_table = recycle(units);
+				// THE SLOTS ARE COPIED INTO THE TARGET ONCE EVERY UNIT HAS RETURNED, each unit's whole or
+				// not at all - a unit a cancellation or a failure cut short left its slot, and nothing of it
+				// reaches the target.
+				assemble(target, prepared, intermediate, finished);
+				outcome
+			}
+		};
+		*shader_table = recycle(shaders);
 		outcome
 	}
 }
 
-/// The mutable scratch one tile's replay needs, gathered so the loop can hand it over in one move.
-struct Scratch<'a, 'b> {
-	raster: &'a mut Rasteriser,
-	pool: &'a mut Pool,
-	masks: &'a mut MaskPool,
-	spans: &'a mut Spans,
-	cache: &'a mut GlyphRaster,
-	glyphs: &'b dyn GlyphProvider,
+/// A vector's storage, kept from one frame to the next while nothing it held is.
+///
+/// THE SHADERS AND THE UNITS BORROW THE FRAME, so they cannot outlive it - but their capacity can, and
+/// that is the difference between a replay that allocates nothing and one that allocates per frame.
+/// Emptied and collected again, a vector keeps its allocation: `Vec`'s in-place collection reuses it
+/// when the element layout is unchanged, and a change of lifetime cannot change a layout. That is an
+/// optimisation of the standard library and not a promise, so the counting allocator's warmed-frame
+/// test is what holds it - a toolchain that stopped doing it fails there, and nothing here becomes
+/// unsound either way.
+fn recycle<T, U>(mut vector: Vec<T>) -> Vec<U> {
+	vector.clear();
+	vector.into_iter().map(|_| unreachable!("an emptied vector yields nothing")).collect()
 }
 
+/// How a frame's units went: refused if the pool returned before running every one, cancelled if a lane
+/// was told to stop, and otherwise the lowest failing unit's error - the one the serial walk meets first.
+fn verdict(units: &[Unit<'_>], lanes: &[Lane], stopped: &AtomicBool) -> Result<(), Error> {
+	let failure = lanes.iter().filter_map(|lane| lane.failure.as_ref()).min_by_key(|(at, _)| *at);
+	if let Some((_, error)) = failure {
+		return Err(*error);
+	}
+	if stopped.load(Ordering::Relaxed) {
+		return Err(Error::Cancelled);
+	}
+	if units.iter().any(|unit| !unit.ran) {
+		return Err(Error::IncompletePool);
+	}
+	Ok(())
+}
+
+/// Cut a frame into units: the tile rows that have something to draw (BANDS), or the tiles that do
+/// (TILES), each a run of tile indices in serial order.
+fn cut(tiling: &Tiling, bins: &Bins, kind: UnitKind) -> Vec<(u32, u32)> {
+	let draws = |index: usize| !tiling.tile(index).is_empty() && !bins.commands(index).is_empty();
+	let mut units = Vec::new();
+	match kind {
+		UnitKind::Bands => {
+			for row in 0..tiling.rows {
+				let first = row * tiling.columns;
+				if (first..first + tiling.columns).any(|index| draws(index as usize)) {
+					units.push((first, tiling.columns));
+				}
+			}
+		}
+		UnitKind::Tiles => {
+			for index in 0..tiling.count() {
+				if draws(index) {
+					units.push((index as u32, 1));
+				}
+			}
+		}
+	}
+	units
+}
+
+/// The band units of a frame, each a view of its own rows of the target.
+///
+/// THE TARGET IS LAID OUT BY ROWS, so a band of rows is one contiguous run of its bytes and can be handed
+/// out whole: split in memory order, which is the rows' order from the top for a top-left image and from
+/// the bottom for a bottom-left one, and then put in the serial order.
+fn band_units<'u>(units: &mut Vec<Unit<'u>>, target: &'u mut ImageViewMut<'_>, tiling: &Tiling, wanted: &[(u32, u32)]) -> Result<(), Error> {
+	let layout = *target.layout();
+	let pitch = layout.pitch as usize;
+	let height = layout.extent.height;
+	let bottom_left = layout.origin == graphics_core::layout::RowOrigin::BottomLeft;
+	let mut rest: &'u mut [u8] = target.bytes_mut();
+	let mut consumed = 0usize;
+	for step in 0..tiling.rows {
+		// The tile rows in MEMORY order.
+		let row = if bottom_left { tiling.rows - 1 - step } else { step };
+		let top = row * tiling.size;
+		let rows = tiling.size.min(height.saturating_sub(top));
+		// Where this band's rows start in memory, and how far the next one starts.
+		let start = if bottom_left { (height - top - rows) as usize * pitch } else { top as usize * pitch };
+		let end = (start + rows as usize * pitch).min(consumed + rest.len());
+		let skip = start.saturating_sub(consumed);
+		let taken = core::mem::take(&mut rest);
+		let (_, after_skip) = taken.split_at_mut(skip.min(taken.len()));
+		let length = (end - start).min(after_skip.len());
+		let (band, after) = after_skip.split_at_mut(length);
+		rest = after;
+		consumed = end;
+		let first = row * tiling.columns;
+		let Some(position) = wanted.iter().position(|(unit_first, _)| *unit_first == first) else { continue };
+		let band_layout = graphics_core::layout::ImageLayout::new(Extent2D::new(layout.extent.width, rows), layout.pitch, layout.storage, layout.origin, layout.semantics).map_err(crate::target::from_core)?;
+		let view = ImageViewMut::new(band_layout, band).map_err(crate::target::from_core)?;
+		units.push(Unit { index: position, first_tile: first, tiles: tiling.columns, access: Access::Band { view, top }, ran: false, whole: false });
+	}
+	if bottom_left {
+		units.reverse();
+	}
+	Ok(())
+}
+
+/// Copy every finished unit's slot into the target: the part of each tile its replay wrote.
+fn assemble(target: &mut ImageViewMut<'_>, prepared: &SoftPrepared, intermediate: &[u8], finished: &[bool]) {
+	let bytes_per_pixel = target.layout().storage.bytes_per_pixel() as usize;
+	let pitch = TILE_SIZE as usize * bytes_per_pixel;
+	for ((&(first_tile, _), slot), whole) in prepared.units.iter().zip(intermediate.chunks(prepared.slot_bytes)).zip(finished.iter()) {
+		if !*whole {
+			continue;
+		}
+		let tile = prepared.tiling.tile(first_tile as usize);
+		let region = prepared.regions.get(first_tile as usize).copied().unwrap_or(tile);
+		let width = region.width as usize * bytes_per_pixel;
+		for y in region.y..region.y.saturating_add(region.height) {
+			let from = (y - tile.y) as usize * pitch + (region.x - tile.x) as usize * bytes_per_pixel;
+			let Some(source) = slot.get(from..from + width) else { continue };
+			let Some(row) = target.row_mut(y) else { continue };
+			let at = region.x as usize * bytes_per_pixel;
+			if let Some(destination) = row.get_mut(at..at + width) {
+				destination.copy_from_slice(source);
+			}
+		}
+	}
+}
+
+/// Replay one tile: every command binned to it, in bin order, into the lane's tile surface - then
+/// encoded into the unit's part of the target.
 #[allow(clippy::too_many_arguments)]
-fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRect, index: usize, surface: &mut Tile, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>, scratch: Scratch<'_, '_>) -> Result<(), Error> {
+fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, index: usize, lane: &mut Lane, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>) -> Result<(), Error> {
 	{
-		let Scratch { raster, pool, masks, spans, cache, glyphs } = scratch;
+		let Lane { raster, pool, masks, spans, tile: surface, clips, layers, nodes, .. } = lane;
 		// THE DECODE IS SKIPPED FOR A TILE SOMETHING OVERWRITES WHOLE. See `tiles_without_backdrop`:
 		// the scratch then still holds the previous tile's pixels, every one of which the covering
 		// command replaces, and the encode on the way out writes a full tile either way.
@@ -784,11 +1091,11 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 		// whenever anything in it is not a plain draw.
 		let region = prepared.regions.get(index).copied().unwrap_or(tile);
 		if !prepared.no_backdrop.get(index).copied().unwrap_or(false) {
-			surface.load(target, region, prepared.working, table)?;
+			surface.load(access, region, prepared.working, table)?;
 		}
-		let mut clips = ClipStack::new();
+		// THE STACKS ARE THE LANE'S, reserved at `prepare` to the depths the list reaches.
 		clips.reset(tile);
-		let mut layers: Vec<Layer> = Vec::new();
+		layers.clear();
 		for command in prepared.bins.commands(index) {
 			let Some(step) = prepared.steps.get(*command as usize) else { continue };
 			match step {
@@ -813,17 +1120,16 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						None => (&mut *surface, tile),
 					};
 					let bounds = bounds.intersection(&clips.bounds());
-					fill_edges(raster, spans, edges, rule, antialias, bounds, into, shader, &clips, *opacity, *blend, *operator);
+					fill_edges(raster, spans, edges, rule, antialias, bounds, into, shader, clips, *opacity, *blend, *operator);
 				}
-				Step::Glyphs { run, transform, blend, operator, opacity, .. } => {
-					let Some(recorded) = prepared.glyph_runs.get(*run as usize) else { continue };
+				Step::Glyphs { placed, blend, operator, opacity, .. } => {
 					let Some(shader) = shaders.get(*command as usize) else { continue };
 					let (into, bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
 						Some(layer) => (&mut layer.surface, layer.bounds),
 						None => (&mut *surface, tile),
 					};
 					let bounds = bounds.intersection(&clips.bounds());
-					draw_glyphs(raster, spans, cache, glyphs, recorded, transform, bounds, into, shader, &clips, *opacity, *blend, *operator, prepared.working);
+					draw_placed(raster, spans, placed, bounds, into, shader, clips, *opacity, *blend, *operator, prepared.working);
 				}
 				Step::AliasedLines { points, blend, operator, opacity, .. } => {
 					let Some(shader) = shaders.get(*command as usize) else { continue };
@@ -832,7 +1138,7 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						None => (&mut *surface, tile),
 					};
 					let bounds = bounds.intersection(&clips.bounds());
-					draw_aliased_lines(points, bounds, into, shader, &clips, *opacity, *blend, *operator);
+					draw_aliased_lines(points, bounds, into, shader, clips, *opacity, *blend, *operator);
 				}
 				Step::PushClip { edges, rule, antialias, bounds, inverse } => {
 					let parent = match layers.last() {
@@ -941,7 +1247,8 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 								Some(parent) => &parent.surface,
 								None => &*surface,
 							};
-							Some(crate::filter::evaluate(graph, &layer.surface, backdrop, layer.bounds, pool, spans, prepared.working, lookup)?)
+							let kernels = layer.filter.and_then(|handle| prepared.kernels.get(handle.0 as usize)).map_or(&[][..], |kernels| kernels.as_slice());
+							Some(crate::filter::evaluate(graph, kernels, &layer.surface, backdrop, layer.bounds, pool, spans, nodes, prepared.working, lookup)?)
 						}
 						None => None,
 					};
@@ -976,11 +1283,36 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 		}
 		// AN UNCLOSED LAYER CANNOT HAPPEN - the list refused it - but the storage is returned anyway,
 		// because a tile that kept one would exhaust the pool on the next tile rather than here.
-		for layer in layers {
+		for layer in layers.drain(..) {
 			pool.give(layer.surface);
 		}
 		clips.drain_into(masks);
-		surface.store(target, region, prepared.working, prepared.output, table, &mut spans.filter_input)
+		surface.store(access, region, prepared.working, prepared.output, table, &mut spans.filter_input)
+	}
+}
+
+/// What one lane is reserved to for a list: the same shape for every lane of a frame.
+struct LaneShape {
+	surfaces: usize,
+	extent: (u32, u32),
+	space: graphics_core::ColorSpace,
+	masks: usize,
+	edges: usize,
+	clips: usize,
+	layers: usize,
+	nodes: usize,
+}
+
+impl LaneShape {
+	fn reserve(&self, lane: &mut Lane) -> Result<(), Error> {
+		lane.pool.reserve(self.surfaces, self.extent, self.space)?;
+		lane.masks.reserve(self.masks, self.extent.0 as usize * self.extent.1 as usize);
+		lane.raster.reserve(self.extent.0 as usize, self.edges);
+		lane.spans.reserve(self.extent.0 as usize);
+		lane.clips.reserve(self.clips);
+		lane.layers.reserve(self.layers.saturating_sub(lane.layers.len()));
+		lane.nodes.reserve(self.nodes.saturating_sub(lane.nodes.len()));
+		Ok(())
 	}
 }
 
@@ -1002,7 +1334,7 @@ pub struct Spans {
 }
 
 impl Spans {
-	fn reserve(&mut self, width: usize) {
+	pub(crate) fn reserve(&mut self, width: usize) {
 		if self.source.len() < width {
 			self.source.resize(width, Rgba::TRANSPARENT);
 			self.destination.resize(width, Rgba::TRANSPARENT);
@@ -1012,7 +1344,7 @@ impl Spans {
 		}
 	}
 
-	fn scratch_bytes(&self) -> u64 {
+	pub(crate) fn scratch_bytes(&self) -> u64 {
 		((self.source.capacity() + self.destination.capacity() + self.filter_input.capacity() + self.filter_output.capacity()) * core::mem::size_of::<Rgba>() + self.weights.capacity() * core::mem::size_of::<f32>()) as u64
 	}
 }
@@ -1142,9 +1474,14 @@ fn polyline_bounds(points: &[(i32, i32)]) -> Option<PixelRect> {
 	Some(PixelRect::new(x, y, right.saturating_sub(x) + 1, bottom.saturating_sub(y) + 1))
 }
 
-/// Draw one recorded run, glyph by glyph, through the cache.
-#[allow(clippy::too_many_arguments)]
-fn draw_glyphs(raster: &mut Rasteriser, spans: &mut Spans, cache: &mut GlyphRaster, provider: &dyn GlyphProvider, run: &render2d::list::RecordedGlyphRun, transform: &Transform, bounds: PixelRect, into: &mut dyn Raster, shader: &Shader<'_>, clips: &ClipStack, opacity: f32, blend: BlendMode, operator: Operator, working: Working) {
+/// Place one recorded run's glyphs, at `prepare`.
+///
+/// EVERY GLYPH'S CACHE KEY AND DEVICE ORIGIN are the arithmetic a tile did in the replay - moved here
+/// and not changed - and each distinct key is resolved through the cache once, a miss decoded by the
+/// provider. An outline or a colour layer is flattened at its placed origin and its edges built there,
+/// once per placed glyph where a tile used to do it in every tile the run reached.
+fn place_glyphs(cache: &mut GlyphRaster, provider: &dyn GlyphProvider, run: &render2d::list::RecordedGlyphRun, transform: &Transform, working: Working, widest_edges: &mut usize) -> Vec<Placed> {
+	let mut placed = Vec::with_capacity(run.glyphs.len());
 	let mut pen_x = run.origin_x;
 	let mut pen_y = run.origin_y;
 	for glyph in &run.glyphs {
@@ -1161,26 +1498,50 @@ fn draw_glyphs(raster: &mut Rasteriser, spans: &mut Spans, cache: &mut GlyphRast
 		// aligned is exactly the drift subpixel positioning exists to remove.
 		let device = |value: f32| font_contract::Fixed266::from_raw((value * 64.0) as i32);
 		let key = font_contract::cache::GlyphCacheKey { face: run.face.face, generation: run.face.generation, glyph: glyph.glyph, size: run.size, variation: run.variation, transform: font_contract::glyph::TransformKey::new([transform.m[0][0], transform.m[1][0], transform.m[0][1], transform.m[1][1], 0.0, 0.0]).unwrap_or(font_contract::glyph::TransformKey::IDENTITY), phase: font_contract::glyph::SubpixelPhase::of(device(origin.x), device(origin.y)), kind: glyph.kind, selection: glyph.selection, mode: run.mode };
-		match cache.get(&key, provider) {
+		let form = cache.shared(&key, provider);
+		match &*form {
 			GlyphImage::Missing => {}
 			GlyphImage::Outline(path) => {
-				let placed = Transform::translate(origin.x, origin.y);
-				let contours = render2d::flatten::flatten(path, Some(&placed));
-				fill_edges(raster, spans, &crate::raster::Edges::build(&contours), FillRule::NonZero, Antialias::On, bounds, into, shader, clips, opacity, blend, operator);
+				let contours = render2d::flatten::flatten(path, Some(&Transform::translate(origin.x, origin.y)));
+				*widest_edges = (*widest_edges).max(edge_count(&contours));
+				placed.push(Placed::Outline(crate::raster::Edges::build(&contours)));
 			}
 			GlyphImage::Layers(layers) => {
 				// `COLR` LAYERS ARE DRAWN IN ORDER, each with its own palette colour - which is what
 				// makes an emoji an emoji rather than a silhouette.
-				let placed = Transform::translate(origin.x, origin.y);
+				let at = Transform::translate(origin.x, origin.y);
+				let mut built = Vec::with_capacity(layers.len());
 				for (path, colour) in layers {
-					let contours = render2d::flatten::flatten(path, Some(&placed));
-					let solid = Shader::Solid(to_working(*colour, working));
-					fill_edges(raster, spans, &crate::raster::Edges::build(&contours), FillRule::NonZero, Antialias::On, bounds, into, &solid, clips, opacity, blend, operator);
+					let contours = render2d::flatten::flatten(path, Some(&at));
+					*widest_edges = (*widest_edges).max(edge_count(&contours));
+					built.push((crate::raster::Edges::build(&contours), to_working(*colour, working)));
+				}
+				placed.push(Placed::Layers(built));
+			}
+			GlyphImage::Mask { left, top, .. } => placed.push(Placed::Mask { x: origin.x as i64 + *left as i64, y: origin.y as i64 + *top as i64, form: form.clone() }),
+			GlyphImage::Bitmap { left, top, .. } => placed.push(Placed::Bitmap { x: origin.x as i64 + *left as i64, y: origin.y as i64 + *top as i64, form: form.clone() }),
+		}
+		pen_x = add_fixed(pen_x, glyph.x_advance);
+		pen_y = add_fixed(pen_y, glyph.y_advance);
+	}
+	placed
+}
+
+/// Draw a run's placed glyphs into a tile, from the prepared list alone.
+#[allow(clippy::too_many_arguments)]
+fn draw_placed(raster: &mut Rasteriser, spans: &mut Spans, placed: &[Placed], bounds: PixelRect, into: &mut dyn Raster, shader: &Shader<'_>, clips: &ClipStack, opacity: f32, blend: BlendMode, operator: Operator, working: Working) {
+	for glyph in placed {
+		match glyph {
+			Placed::Outline(edges) => fill_edges(raster, spans, edges, FillRule::NonZero, Antialias::On, bounds, into, shader, clips, opacity, blend, operator),
+			Placed::Layers(layers) => {
+				for (edges, colour) in layers {
+					let solid = Shader::Solid(*colour);
+					fill_edges(raster, spans, edges, FillRule::NonZero, Antialias::On, bounds, into, &solid, clips, opacity, blend, operator);
 				}
 			}
-			GlyphImage::Mask { left, top, width, height, coverage, mode } => {
-				let base_x = origin.x as i64 + *left as i64;
-				let base_y = origin.y as i64 + *top as i64;
+			Placed::Mask { form, x: base_x, y: base_y } => {
+				let GlyphImage::Mask { width, height, coverage, mode, .. } = &**form else { continue };
+				let (base_x, base_y) = (*base_x, *base_y);
 				let subpixel = !matches!(mode, font_contract::glyph::RasterisationMode::Grayscale);
 				for row in 0..*height {
 					for column in 0..*width {
@@ -1213,9 +1574,9 @@ fn draw_glyphs(raster: &mut Rasteriser, spans: &mut Spans, cache: &mut GlyphRast
 					}
 				}
 			}
-			GlyphImage::Bitmap { left, top, image } => {
-				let base_x = origin.x as i64 + *left as i64;
-				let base_y = origin.y as i64 + *top as i64;
+			Placed::Bitmap { form, x: base_x, y: base_y } => {
+				let GlyphImage::Bitmap { image, .. } = &**form else { continue };
+				let (base_x, base_y) = (*base_x, *base_y);
 				let view = image.view();
 				let Ok(sampler) = graphics_core::sample::Sampler::new(view, working, graphics_core::sample::Spread::Clamp) else { continue };
 				let extent = image.layout().extent;
@@ -1236,8 +1597,6 @@ fn draw_glyphs(raster: &mut Rasteriser, spans: &mut Spans, cache: &mut GlyphRast
 				}
 			}
 		}
-		pen_x = add_fixed(pen_x, glyph.x_advance);
-		pen_y = add_fixed(pen_y, glyph.y_advance);
 	}
 }
 

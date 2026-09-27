@@ -76,7 +76,7 @@ impl Ramp {
 pub enum Shader<'a> {
 	Solid(Rgba),
 	Linear {
-		ramp: Ramp,
+		ramp: &'a Ramp,
 		from: PointF,
 		/// THE AXIS AND ITS SQUARED LENGTH, TAKEN ONCE. They are `to - from` and its dot product with
 		/// itself - a function of two fields of this shader, and the shader is built once per frame -
@@ -88,7 +88,7 @@ pub enum Shader<'a> {
 		inverse: Transform,
 	},
 	Radial {
-		ramp: Ramp,
+		ramp: &'a Ramp,
 		from: PointF,
 		from_radius: f32,
 		to: PointF,
@@ -97,7 +97,7 @@ pub enum Shader<'a> {
 		inverse: Transform,
 	},
 	Conic {
-		ramp: Ramp,
+		ramp: &'a Ramp,
 		centre: PointF,
 		start_angle: f32,
 		end_angle: f32,
@@ -360,11 +360,22 @@ pub fn to_working(color: Color, working: Working) -> Rgba {
 	}
 }
 
+/// THE RAMP A GRADIENT PAINT RESOLVES TO, worked out ONCE, in `prepare`, and held by the prepared list:
+/// its stops converted into the working space and ordered. Resolving it per frame allocated a vector
+/// per gradient per frame on the path that is meant to allocate nothing, and the ramp is a function of
+/// the list and the target's working space, which a prepared list is already bound to.
+pub fn ramp_for(paint: &Paint, working: Working, stops: &[Vec<GradientStop>]) -> Option<Ramp> {
+	match paint {
+		Paint::Linear { stops: handle, .. } | Paint::Radial { stops: handle, .. } | Paint::Conic { stops: handle, .. } => stops.get(handle.0 as usize).map(|list| Ramp::new(list, working)),
+		_ => None,
+	}
+}
+
 /// Build the shader a command's paint implies.
 ///
 /// THE INVERSE IS COMPUTED ONCE PER DRAW, not per pixel: it is a 3x3 adjugate, and a drawing that
 /// inverted its transform per pixel would spend more time on the inverse than on the paint.
-pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops: &[Vec<GradientStop>], images: &'a dyn ImageLookup) -> Shader<'a> {
+pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, ramp: Option<&'a Ramp>, images: &'a dyn ImageLookup) -> Shader<'a> {
 	let combined = transform.concat(&paint.transform());
 	let Some(inverse) = combined.inverse() else {
 		// A SINGULAR TRANSFORM COLLAPSES THE PAINT'S SPACE ONTO A LINE. There is no point to evaluate
@@ -374,19 +385,21 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 	};
 	match paint {
 		Paint::Solid(color) => Shader::Solid(to_working(*color, working)),
-		Paint::Linear { from, to, stops: handle, spread, .. } => match stops.get(handle.0 as usize) {
-			Some(list) => {
+		// A GRADIENT WITH NO RAMP names a stop list the list does not have, which `ramp_for` answered with
+		// nothing - and paints nothing, as it did when the lookup was made here.
+		Paint::Linear { from, to, spread, .. } => match ramp {
+			Some(ramp) => {
 				let axis = (to.x - from.x, to.y - from.y);
-				Shader::Linear { ramp: Ramp::new(list, working), from: *from, axis, length_squared: axis.0 * axis.0 + axis.1 * axis.1, spread: *spread, inverse }
+				Shader::Linear { ramp, from: *from, axis, length_squared: axis.0 * axis.0 + axis.1 * axis.1, spread: *spread, inverse }
 			}
 			None => Shader::Nothing,
 		},
-		Paint::Radial { from, from_radius, to, to_radius, stops: handle, spread, .. } => match stops.get(handle.0 as usize) {
-			Some(list) => Shader::Radial { ramp: Ramp::new(list, working), from: *from, from_radius: *from_radius, to: *to, to_radius: *to_radius, spread: *spread, inverse },
+		Paint::Radial { from, from_radius, to, to_radius, spread, .. } => match ramp {
+			Some(ramp) => Shader::Radial { ramp, from: *from, from_radius: *from_radius, to: *to, to_radius: *to_radius, spread: *spread, inverse },
 			None => Shader::Nothing,
 		},
-		Paint::Conic { centre, start_angle, end_angle, stops: handle, spread, .. } => match stops.get(handle.0 as usize) {
-			Some(list) => Shader::Conic { ramp: Ramp::new(list, working), centre: *centre, start_angle: *start_angle, end_angle: *end_angle, spread: *spread, inverse },
+		Paint::Conic { centre, start_angle, end_angle, spread, .. } => match ramp {
+			Some(ramp) => Shader::Conic { ramp, centre: *centre, start_angle: *start_angle, end_angle: *end_angle, spread: *spread, inverse },
 			None => Shader::Nothing,
 		},
 		// PLANES FIRST, because a source that has them has them INSTEAD: a video frame handed over as
@@ -410,11 +423,14 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 		},
 		Paint::Image { image, source, quality, spread, .. } => match images.lookup(image.0) {
 			Some((view, pyramid, table)) => {
-				// A DECODED SOURCE IS SAMPLED INSTEAD OF THE ENCODED ONE WHEN THERE IS ONE, and it is
-				// the same picture: a pyramid's level zero IS the source in the working format, built
-				// by decoding each texel through this same decoder and table, so a tap reads the value
-				// the encoded path would have computed for it. What changes is that it was computed
-				// ONCE rather than once per tap of every pixel that reaches it.
+				// A DECODED SOURCE IS SAMPLED INSTEAD OF THE ENCODED ONE WHEN THERE IS ONE: a pyramid's
+				// level zero is the source in the working format, built by decoding each texel through
+				// this same decoder and table, and it was computed ONCE rather than once per tap of every
+				// pixel that reaches it. IT IS NOT THE SAME PICTURE TO THE BIT: the copy holds each texel
+				// as a half-precision float, while the direct path decodes every tap through a
+				// single-precision table, so keeping or giving back a copy can move an output pixel. That
+				// is why `prepare` decides which copies a frame keeps before it decides how many lanes it
+				// runs on, and never the other way round.
 				//
 				// NOT FOR A MIPMAPPED DRAW, which samples the pyramid itself a few lines below and
 				// needs the level of detail rather than level zero.
@@ -433,7 +449,8 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 }
 
 /// What a shader needs to find an image: the pixels, and the pyramid `prepare` built for them.
-pub trait ImageLookup {
+/// `Sync`, because every lane of a frame reads it at once.
+pub trait ImageLookup: Sync {
 	fn lookup(&self, handle: u32) -> Option<(ImageView<'_>, Option<&Pyramid>, Option<&graphics_core::pixel::TransferTable>)>;
 
 	/// The same handle as PLANES, when the source has them.

@@ -847,18 +847,15 @@ fn the_wide_span_path_agrees_with_the_scalar_reference_exactly() {
 }
 
 /// A cancellation that fires after a stated number of questions.
+///
+/// IT COUNTS THROUGH AN ATOMIC, because every lane of a frame asks it and a `Cell` could not be shared.
 struct StopAfter {
-	limit: core::cell::Cell<u32>,
+	limit: core::sync::atomic::AtomicU32,
 }
 
 impl backend::Cancellation for StopAfter {
 	fn cancelled(&self) -> bool {
-		let left = self.limit.get();
-		if left == 0 {
-			return true;
-		}
-		self.limit.set(left - 1);
-		false
+		self.limit.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |left| left.checked_sub(1)).is_err()
 	}
 }
 
@@ -871,15 +868,16 @@ fn a_cancelled_frame_stops_and_says_so() {
 	let mut canvas = Canvas::new();
 	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 256.0, 256.0)), red(), FillRule::NonZero).expect("a fill");
 	let list = canvas.finish().expect("a list");
-	let stop = StopAfter { limit: core::cell::Cell::new(2) };
+	let stop = StopAfter { limit: core::sync::atomic::AtomicU32::new(2) };
 	let mut backend = Soft2d::new().with_cancellation(&stop);
 	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
 	{
 		let mut view = image.view_mut();
 		assert_eq!(backend.render(&prepared, &mut view).err(), Some(render2d::Error::Cancelled));
 	}
-	// WHAT WAS DRAWN STAYS DRAWN, in whole tiles: the first two tiles are complete and the rest are
-	// untouched, which is a stop at a boundary rather than a shape cut in half.
+	// WHAT WAS DRAWN STAYS DRAWN, in whole units: the first two - bands of tile rows, on this one lane -
+	// are complete and the rest are untouched, which is a stop at a boundary rather than a shape cut in
+	// half.
 	assert_eq!(pixel(&image, 4, 4)[3], 255, "the first tile was finished");
 	assert_eq!(pixel(&image, 200, 200)[3], 0, "and the last was never started");
 }
@@ -1564,5 +1562,372 @@ fn only_the_part_of_a_tile_that_can_change_makes_the_round_trip() {
 			let expected = before[(y * tile + x) as usize];
 			assert_eq!(pixel(&image, x, y), expected, "the target outside the drawing is untouched at ({x}, {y})");
 		}
+	}
+}
+
+// ------------------------------------------------------------------ several workers
+//
+// EVERY SCHEDULE DRAWS THE SERIAL WALK'S PIXELS, TO THE BIT. The units run one algorithm over disjoint
+// pixels, so any difference between a pool's frame and the serial one is a defect - not a tolerance, which
+// is what the profile uses to measure an implementation against the analytic answer and not what two
+// schedules of one implementation are allowed to differ by.
+
+use crate::workers::{Lane, Serial, Unit, UnitKind, Workers};
+
+/// Real threads, each running one lane and taking the next unit off a shared queue.
+struct Threads(usize);
+
+impl Workers for Threads {
+	fn lanes(&self) -> usize {
+		self.0
+	}
+
+	fn run<'u>(&self, lanes: &mut [Lane], units: &mut [Unit<'u>], work: &(dyn Fn(&mut Lane, &mut Unit<'u>) + Sync)) {
+		let queue = std::sync::Mutex::new(units.iter_mut());
+		std::thread::scope(|scope| {
+			for lane in lanes.iter_mut() {
+				let queue = &queue;
+				// A SMALL STACK, on purpose: a unit's replay is what a guest worker runs on the stack it
+				// is given, and a frame that needed more than this would find out there.
+				std::thread::Builder::new()
+					.stack_size(128 * 1024)
+					.spawn_scoped(scope, move || {
+						loop {
+							let Some(unit) = queue.lock().unwrap().next() else { break };
+							work(lane, unit);
+						}
+					})
+					.unwrap();
+			}
+		});
+	}
+}
+
+/// One thread, every unit, last to first: the order furthest from the serial one.
+struct Backwards;
+
+impl Workers for Backwards {
+	fn lanes(&self) -> usize {
+		2
+	}
+
+	fn run<'u>(&self, lanes: &mut [Lane], units: &mut [Unit<'u>], work: &(dyn Fn(&mut Lane, &mut Unit<'u>) + Sync)) {
+		let count = lanes.len();
+		for (index, unit) in units.iter_mut().rev().enumerate() {
+			work(&mut lanes[index % count], unit);
+		}
+	}
+}
+
+/// One thread handing unit `n` to lane `n % lanes`: several lanes and no thread, which is what lets
+/// the counting allocator - a THREAD-LOCAL counter - measure a frame that went through a pool.
+struct Rotating(usize);
+
+impl Workers for Rotating {
+	fn lanes(&self) -> usize {
+		self.0
+	}
+
+	fn run<'u>(&self, lanes: &mut [Lane], units: &mut [Unit<'u>], work: &(dyn Fn(&mut Lane, &mut Unit<'u>) + Sync)) {
+		let count = lanes.len();
+		for (index, unit) in units.iter_mut().enumerate() {
+			work(&mut lanes[index % count], unit);
+		}
+	}
+}
+
+/// A pool that hands every unit out twice, to two lanes.
+struct Twice;
+
+impl Workers for Twice {
+	fn lanes(&self) -> usize {
+		2
+	}
+
+	fn run<'u>(&self, lanes: &mut [Lane], units: &mut [Unit<'u>], work: &(dyn Fn(&mut Lane, &mut Unit<'u>) + Sync)) {
+		let last = lanes.len() - 1;
+		for unit in units.iter_mut() {
+			work(&mut lanes[0], unit);
+			work(&mut lanes[last], unit);
+		}
+	}
+}
+
+/// A pool that returns one unit short.
+struct Short;
+
+impl Workers for Short {
+	fn lanes(&self) -> usize {
+		2
+	}
+
+	fn run<'u>(&self, lanes: &mut [Lane], units: &mut [Unit<'u>], work: &(dyn Fn(&mut Lane, &mut Unit<'u>) + Sync)) {
+		let keep = units.len().saturating_sub(1);
+		for unit in units.iter_mut().take(keep) {
+			work(&mut lanes[0], unit);
+		}
+	}
+}
+
+/// The images and glyphs the crowded scene draws.
+struct Crowd {
+	images: OneImage,
+}
+
+/// A list of everything a tile can meet: rectangular, masked and inverse clips, nested layers, a
+/// filtered layer reading the backdrop, an image at three qualities, three gradients, and text of every
+/// glyph kind - spread over a frame of SEVEN bands and fifty-six tiles, so every pool below has at least
+/// as many units as it has lanes, whichever unit is chosen.
+fn crowded_list() -> DrawList {
+	use font_contract::glyph::{GlyphKind, RasterisationMode, SubpixelLayout};
+	let record = render2d::list::ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 };
+	let mut canvas = Canvas::new();
+	let stops = canvas
+		.resources()
+		.add_stops(alloc::vec![
+			render2d::paint::GradientStop { offset: 0.0, color: Color::new(0.9, 0.2, 0.1, 1.0, ColorSpace::Srgb) },
+			render2d::paint::GradientStop { offset: 0.4, color: Color::new(0.1, 0.8, 0.3, 1.0, ColorSpace::Srgb) },
+			render2d::paint::GradientStop { offset: 1.0, color: Color::new(0.2, 0.3, 0.9, 1.0, ColorSpace::Srgb) },
+		])
+		.expect("stops");
+	let identity = render2d::transform::Transform::IDENTITY;
+	// A CONIC BACKGROUND over the whole frame, so no tile is covered by an opaque fill.
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 512.0, 448.0)), Paint::Conic { centre: PointF { x: 256.0, y: 224.0 }, start_angle: 0.0, end_angle: core::f32::consts::TAU, stops, spread: graphics_core::sample::Spread::Repeat, transform: identity }, FillRule::NonZero).expect("a background");
+	canvas.fill_path(rect_path(RectF::new(20.5, 30.25, 200.0, 90.0)), Paint::Linear { from: PointF { x: 20.0, y: 0.0 }, to: PointF { x: 220.0, y: 0.0 }, stops, spread: graphics_core::sample::Spread::Mirror, transform: identity }, FillRule::NonZero).expect("a linear fill");
+	canvas.fill_path(rect_path(RectF::new(300.0, 40.0, 180.0, 160.0)), Paint::Radial { from: PointF { x: 390.0, y: 120.0 }, from_radius: 0.0, to: PointF { x: 390.0, y: 120.0 }, to_radius: 90.0, stops, spread: graphics_core::sample::Spread::Clamp, transform: identity }, FillRule::NonZero).expect("a radial fill");
+	// THE IMAGE AT THREE QUALITIES: a decoded copy (bilinear), a pyramid (mipmapped) and neither.
+	canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(40.0, 150.0, 120.0, 100.0), render2d::paint::ImageQuality::Bilinear).expect("an image");
+	canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(180.0, 160.0, 20.0, 20.0), render2d::paint::ImageQuality::Mipmapped).expect("an image");
+	canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(230.0, 150.0, 64.0, 64.0), render2d::paint::ImageQuality::Nearest).expect("an image");
+	// A RECTANGULAR CLIP, then a MASKED one inside it, then an INVERSE one.
+	canvas.save().expect("a save");
+	canvas.set_clip(rect_path(RectF::new(64.0, 256.0, 192.0, 128.0)), FillRule::NonZero).expect("a rectangular clip");
+	let mut star = PathBuilder::new();
+	star.move_to(PointF { x: 160.0, y: 250.0 }).expect("a start");
+	for step in 1..10 {
+		let angle = step as f32 * core::f32::consts::TAU / 10.0;
+		let radius = if step % 2 == 0 { 90.0 } else { 40.0 };
+		star.line_to(PointF { x: 160.0 + radius * libm::sinf(angle), y: 320.0 - radius * libm::cosf(angle) }).expect("a point");
+	}
+	star.close().expect("closed");
+	canvas.set_clip(star.finish(), FillRule::EvenOdd).expect("a masked clip");
+	canvas.fill_path(rect_path(RectF::new(0.0, 200.0, 300.0, 248.0)), Paint::Solid(Color::new(1.0, 1.0, 0.2, 0.8, ColorSpace::Srgb)), FillRule::NonZero).expect("a clipped fill");
+	canvas.restore().expect("a restore");
+	canvas.save().expect("a save");
+	canvas.set_clip_inverse(rect_path(RectF::new(330.3, 260.7, 90.0, 70.0)), FillRule::NonZero).expect("an inverse clip");
+	canvas.fill_path(rect_path(RectF::new(300.0, 240.0, 180.0, 130.0)), Paint::Solid(Color::new(0.2, 0.9, 0.9, 0.7, ColorSpace::Srgb)), FillRule::NonZero).expect("a fill around a hole");
+	canvas.restore().expect("a restore");
+	// NESTED LAYERS, the inner one filtered through a blur of the BACKDROP.
+	let mut graph = render2d::filter::FilterGraph::default();
+	let backdrop = graph.push(render2d::filter::FilterNode::Backdrop).expect("a node");
+	graph.push(render2d::filter::FilterNode::Blur { input: backdrop, x: 3.0, y: 2.0 }).expect("a blur");
+	let filter = canvas.resources().add_filter(graph).expect("a graph");
+	canvas.begin_layer(Some(RectF::new(96.0, 60.0, 320.0, 300.0)), 0.8, BlendMode::Normal, None).expect("an outer layer");
+	canvas.fill_path(rect_path(RectF::new(100.0, 70.0, 160.0, 80.0)), Paint::Solid(Color::new(0.8, 0.1, 0.6, 0.6, ColorSpace::Srgb)), FillRule::NonZero).expect("a fill in a layer");
+	canvas.begin_layer(Some(RectF::new(200.0, 180.0, 200.0, 140.0)), 1.0, BlendMode::Normal, Some(filter)).expect("a filtered layer");
+	canvas.fill_path(rect_path(RectF::new(210.0, 190.0, 180.0, 120.0)), Paint::Solid(Color::new(1.0, 1.0, 1.0, 0.15, ColorSpace::Srgb)), FillRule::NonZero).expect("a pane");
+	canvas.end_layer().expect("closed");
+	canvas.end_layer().expect("closed");
+	// TEXT OF EVERY GLYPH KIND, across several tiles.
+	let run = |kind: GlyphKind, mode: RasterisationMode, x: i16, y: i16| render2d::list::RecordedGlyphRun { face: font_contract::FaceRef { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity([7u8; 32]), index: 0 }, generation: font_contract::face::Generation(1) }, size: font_contract::Fixed266::from_pixels(8), variation: font_contract::VariationCoordinates::default(), script: font_contract::ScriptTag::from_bytes(*b"latn"), direction: font_contract::Direction::LeftToRight, mode, origin_x: font_contract::Fixed266::from_pixels(x), origin_y: font_contract::Fixed266::from_pixels(y), glyphs: (0..24).map(|index| font_contract::PositionedGlyph { glyph: 40 + (index % 5), x_offset: font_contract::Fixed266::ZERO, y_offset: font_contract::Fixed266::ZERO, x_advance: font_contract::Fixed266::from_pixels(7), y_advance: font_contract::Fixed266::ZERO, kind, selection: font_contract::cache::KindSelection { strike: None, palette: None } }).collect(), clusters: alloc::vec![] };
+	let modes = [
+		(GlyphKind::Outline, RasterisationMode::Grayscale),
+		(GlyphKind::GrayscaleMask, RasterisationMode::Grayscale),
+		(GlyphKind::SubpixelMask, RasterisationMode::Subpixel(SubpixelLayout::RgbHorizontal)),
+		(GlyphKind::BitmapStrike, RasterisationMode::Grayscale),
+		(GlyphKind::ColrLayers, RasterisationMode::Grayscale),
+	];
+	for (row, (kind, mode)) in modes.into_iter().enumerate() {
+		canvas.draw_glyph_run(run(kind, mode, 12 + row as i16 * 9, 390 + row as i16 * 11), red()).expect("a run");
+	}
+	canvas.finish().expect("a list")
+}
+
+/// Draw a list through a pool, with units of one kind, onto a fresh target; the target and the frame's
+/// lanes and units.
+fn drawn_with(list: &DrawList, workers: &dyn Workers, kind: UnitKind, crowd: &Crowd) -> Result<(OwnedImage, usize, usize), render2d::Error> {
+	let mut image = target(512, 448);
+	let mut backend = Soft2d::new().with_images(&crowd.images).with_glyphs(&EveryKind).with_workers(workers).with_units(kind);
+	let prepared = backend.prepare(list, &description(&image))?;
+	{
+		let mut view = image.view_mut();
+		backend.render(&prepared, &mut view)?;
+	}
+	Ok((image, prepared.lanes(), prepared.units()))
+}
+
+fn crowd() -> Crowd {
+	Crowd { images: OneImage { identity: 7, image: checkerboard(32) } }
+}
+
+#[test]
+// THE SCALAR REFERENCE HOLDS IT: the crowded scene through the serial walk and through every pool - real
+// threads at several counts, backwards, and handing every unit out twice - with both kinds of unit, is
+// the same target to the byte. THE FLOOR ON THE UNITS is asserted, because a one-unit frame runs on the
+// caller's thread alone and running it backwards or twice would reorder nothing.
+fn every_schedule_draws_the_serial_walks_pixels() {
+	let crowd = crowd();
+	let list = crowded_list();
+	let (reference, lanes, units) = drawn_with(&list, &Serial, UnitKind::Bands, &crowd).expect("the serial walk");
+	assert_eq!((lanes, units), (1, 7), "the serial walk is one lane over seven bands");
+	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+		for (name, pool) in [
+			("threads(2)", &Threads(2) as &dyn Workers),
+			("threads(4)", &Threads(4)),
+			("threads(6)", &Threads(6)),
+			("backwards", &Backwards),
+			("twice", &Twice),
+			("rotating(3)", &Rotating(3)),
+		] {
+			let (image, lanes, units) = drawn_with(&list, pool, kind, &crowd).unwrap_or_else(|error| panic!("{name} {kind:?}: {error:?}"));
+			assert!(units >= pool.lanes(), "{name} {kind:?}: the frame is cut into {units} units, fewer than the pool's {} lanes", pool.lanes());
+			assert_eq!(lanes, pool.lanes(), "{name} {kind:?}: the frame runs on every lane the pool offered");
+			assert!(image.bytes() == reference.bytes(), "{name} {kind:?}: the target differs from the serial walk's");
+		}
+	}
+	// And the tiles are what the tile unit counts.
+	let (_, _, tiles) = drawn_with(&list, &Threads(4), UnitKind::Tiles, &crowd).expect("tiles");
+	assert_eq!(tiles, 56, "every tile of the frame draws something, under the conic background");
+}
+
+#[test]
+// A POOL THAT RETURNS BEFORE RUNNING EVERY UNIT IS REFUSED, rather than a picture nobody finished being
+// presented.
+fn a_pool_that_returns_early_is_refused() {
+	let crowd = crowd();
+	let list = crowded_list();
+	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+		assert_eq!(drawn_with(&list, &Short, kind, &crowd).err(), Some(render2d::Error::IncompletePool), "{kind:?}");
+	}
+}
+
+#[test]
+// A WARMED FRAME ASKS THE ALLOCATOR FOR NOTHING, MEASURED RATHER THAN CLAIMED: the crowded scene prepared
+// once and rendered three times, the third counted - through the serial walk, and through a pool that
+// runs FOUR LANES ON THIS THREAD (the counter is thread-local, and a pool that spawned threads would be
+// counting its own allocations, not the frame's) - with the third frame the first frame's bytes.
+fn a_warmed_frame_asks_the_allocator_for_nothing() {
+	let crowd = crowd();
+	let list = crowded_list();
+	for (name, pool, kind) in [("serial", &Serial as &dyn Workers, UnitKind::Bands), ("rotating(4) bands", &Rotating(4), UnitKind::Bands), ("rotating(4) tiles", &Rotating(4), UnitKind::Tiles)] {
+		let mut image = target(512, 448);
+		let mut backend = Soft2d::new().with_images(&crowd.images).with_glyphs(&EveryKind).with_workers(pool).with_units(kind);
+		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+		let mut frame = |image: &mut OwnedImage| {
+			image.bytes_mut().fill(0);
+			let mut view = image.view_mut();
+			backend.render(&prepared, &mut view).expect("a frame");
+		};
+		frame(&mut image);
+		let first = image.bytes().to_vec();
+		frame(&mut image);
+		let before = crate::counted::count();
+		frame(&mut image);
+		let after = crate::counted::count();
+		assert_eq!(after - before, 0, "{name}: a warmed frame allocated {} times", after - before);
+		assert!(image.bytes() == first.as_slice(), "{name}: and drew exactly the first frame's pixels");
+	}
+}
+
+#[test]
+// THE CEILING IS SPENT IN AN ORDER THAT CANNOT CHANGE A PIXEL: the decoded copy is settled against one
+// lane, and lanes beyond the first fit only into what is left. The image here is sized so its copy fits
+// beside TWO lanes and not three, on a frame cut into more units than the pool's six lanes - so the lane
+// count held down is the ceiling's doing and not a cap at the units - and every worker count keeps the
+// copy and draws the one-lane frame's pixels.
+fn a_second_lane_never_displaces_a_decoded_copy() {
+	let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
+	let draw_image = |size: u32| {
+		let record = render2d::list::ImageRecord { identity: 9, layout_generation: 1, content_generation: 1 };
+		let mut canvas = Canvas::new();
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 512.0, 448.0)), Paint::Solid(Color::new(0.3, 0.3, 0.3, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a ground");
+		canvas.draw_image(record, RectF::new(0.0, 0.0, size as f32, size as f32), RectF::new(10.0, 10.0, 480.0, 420.0), render2d::paint::ImageQuality::Bilinear).expect("an image");
+		canvas.finish().expect("a list")
+	};
+	let source = |size: u32| OneImage { identity: 9, image: checkerboard(size) };
+	// A small copy first, to learn what the frame and one lane cost without it.
+	let small = source(8);
+	let mut probe = Soft2d::new().with_images(&small);
+	let prepared = probe.prepare(&draw_image(8), &description(&target(512, 448))).expect("a small preparation");
+	let base = render2d::backend::Prepared::scratch_bytes(&prepared) - 8 * 8 * 8;
+	let lane = {
+		let mut two = Soft2d::new().with_images(&small).with_workers(&Rotating(2));
+		render2d::backend::Prepared::scratch_bytes(&two.prepare(&draw_image(8), &description(&target(512, 448))).expect("two lanes")) - 8 * 8 * 8 - base
+	};
+	assert!(lane > 0, "a second lane costs scratch");
+	// A copy that leaves room for one and a half lanes beside the first: two lanes fit, three do not.
+	let texels = (ceiling - base - lane - lane / 2) / 8;
+	let size = libm::sqrt(texels as f64) as u32;
+	let big = source(size);
+	let list = draw_image(size);
+	let mut serial = Soft2d::new().with_images(&big);
+	let one = serial.prepare(&list, &description(&target(512, 448))).expect("a preparation that fits");
+	assert_eq!(one.decoded_images(), 1, "the copy fits beside one lane");
+	let mut reference = target(512, 448);
+	serial.render(&one, &mut reference.view_mut()).expect("the serial frame");
+	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+		let pool = Threads(6);
+		let mut backend = Soft2d::new().with_images(&big).with_workers(&pool).with_units(kind);
+		let prepared = backend.prepare(&list, &description(&target(512, 448))).expect("a preparation with a pool");
+		assert_eq!(prepared.decoded_images(), 1, "{kind:?}: the pool's lanes did not displace the copy");
+		assert!(prepared.units() >= pool.lanes() || kind == UnitKind::Bands, "{kind:?}: the frame has at least as many units as the pool has lanes");
+		assert!(prepared.lanes() < pool.lanes(), "{kind:?}: the ceiling held the lanes below the pool's six: {}", prepared.lanes());
+		if kind == UnitKind::Bands {
+			assert_eq!(prepared.lanes(), 2, "the lanes are what the ceiling left room for");
+		}
+		let mut image = target(512, 448);
+		backend.render(&prepared, &mut image.view_mut()).expect("a frame");
+		assert!(image.bytes() == reference.bytes(), "{kind:?}: the pixels are the one-lane frame's");
+	}
+}
+
+/// A cancellation that fires after a stated number of questions, and counts the questions asked.
+struct StopAfterUnits {
+	left: core::sync::atomic::AtomicU32,
+}
+
+impl backend::Cancellation for StopAfterUnits {
+	fn cancelled(&self) -> bool {
+		self.left.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |left| left.checked_sub(1)).is_err()
+	}
+}
+
+#[test]
+// CANCELLATION STOPS EVERY LANE AT ITS NEXT UNIT and leaves every unit whole or untouched: several lanes
+// on a frame cut into more units than it has lanes, cancelled mid-frame, and each unit of the target
+// compared with the same unit of the finished frame and of the untouched one - never a mixture.
+fn a_cancelled_frame_leaves_every_unit_whole_or_untouched() {
+	let crowd = crowd();
+	let list = crowded_list();
+	let (finished, _, _) = drawn_with(&list, &Serial, UnitKind::Bands, &crowd).expect("the finished frame");
+	for kind in [UnitKind::Bands, UnitKind::Tiles] {
+		let stop = StopAfterUnits { left: core::sync::atomic::AtomicU32::new(3) };
+		let mut image = target(512, 448);
+		let pool = Threads(3);
+		let mut backend = Soft2d::new().with_images(&crowd.images).with_glyphs(&EveryKind).with_workers(&pool).with_units(kind).with_cancellation(&stop);
+		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+		assert!(prepared.units() > prepared.lanes(), "{kind:?}: more units than lanes");
+		assert_eq!(backend.render(&prepared, &mut image.view_mut()).err(), Some(render2d::Error::Cancelled), "{kind:?}");
+		let (unit_width, unit_height) = match kind {
+			UnitKind::Bands => (512, TILE_SIZE),
+			UnitKind::Tiles => (TILE_SIZE, TILE_SIZE),
+		};
+		let (mut whole, mut untouched) = (0, 0);
+		for top in (0..448).step_by(unit_height as usize) {
+			for left in (0..512).step_by(unit_width as usize) {
+				let rows = top..(top + unit_height).min(448);
+				let span = (left as usize * 4)..((left + unit_width).min(512) as usize * 4);
+				let same_as = |other: &OwnedImage| rows.clone().all(|y| image.view().row(y).expect("a row")[span.clone()] == other.view().row(y).expect("a row")[span.clone()]);
+				let blank = rows.clone().all(|y| image.view().row(y).expect("a row")[span.clone()].iter().all(|byte| *byte == 0));
+				if same_as(&finished) {
+					whole += 1;
+				} else if blank {
+					untouched += 1;
+				} else {
+					panic!("{kind:?}: the unit at ({left}, {top}) is half drawn");
+				}
+			}
+		}
+		assert!(whole >= 1 && untouched >= 1, "{kind:?}: the frame was stopped part way: {whole} whole, {untouched} untouched");
 	}
 }

@@ -83,6 +83,9 @@ pub enum Error {
 	/// wrong size. What was already written stays written - a backend stops at a boundary of its own
 	/// choosing rather than leaving a shape cut in half.
 	Cancelled,
+	/// A WORKER POOL THAT RETURNED BEFORE IT HAD RUN EVERY PART OF A FRAME. The pool is the caller's and
+	/// the defect is the pool's, so the frame refuses it rather than presenting a picture nobody finished.
+	IncompletePool,
 }
 
 #[cfg(test)]

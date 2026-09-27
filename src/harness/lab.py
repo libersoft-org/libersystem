@@ -297,6 +297,10 @@ PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
 # prints a prompt-shaped line from ending someone else's command.
 PROMPT_SETTLE = 0.25
 
+# How long a BOOT's wait lets the guest stay quiet, with the shell attached and no prompt at the end of
+# its output, before it types one empty line to have the prompt printed again. See `serve_request`.
+BOOT_NUDGE_QUIET = 5.0
+
 # The broker's reply frame. `<magic> <outcome> <length>\n` then exactly `<length>` bytes.
 #
 # There was no frame at all: the reply was the collected bytes, so the caller could not tell a
@@ -570,6 +574,16 @@ def broker(serial, ctl_path=CTL_SOCK, log_path=SERIAL_LOG, console_path=None):
 		os.unlink(console_path)
 
 
+# Whether the guest's shell has taken the console, which is when an empty line typed at it comes back as
+# a prompt and not as input to anything else.
+def shell_attached(log_path):
+	try:
+		with open(log_path, 'rb') as handle:
+			return b'shell attached' in handle.read()
+	except OSError:
+		return False
+
+
 def serial_tail(log_path, size=256):
 	try:
 		with open(log_path, 'rb') as handle:
@@ -598,6 +612,7 @@ def serve_request(state, conn):
 		broker_reply(conn, 'status', f'writer={1 if state["writer"] else 0} readers={readers}\n'.encode())
 		return True
 	collected = b''
+	nudge = False
 	if parts[0] == 'RUN' and len(parts) == 3:
 		timeout, command = float(parts[1]), parts[2]
 		serial.sendall(command.encode() + b'\n')
@@ -610,6 +625,15 @@ def serve_request(state, conn):
 		# log makes waiting on an already-idle guest return at once; without it the wait
 		# can only see bytes yet to come, and an idle guest sends none.
 		collected = serial_tail(state['log_path'])
+		# A BOOT'S WAIT MAY ASK FOR ITS PROMPT AGAIN. The prompt counts only as the last thing the guest
+		# printed, and a boot is not always done printing when the shell first prompts: lines that
+		# arrive on their own clock - the network's address configuration among them - land after it,
+		# and nothing prints another prompt. A kernel built at opt-level 2 reaches the shell in 7 s
+		# instead of 22 s, before those lines, and its boot wait timed out at 240 s with the prompt in
+		# the log. So `lab boot` - and only it, on the instance it has just started, where no person's
+		# half-typed line can be sitting in the console - types ONE empty line once the guest has been
+		# quiet a while with the shell attached, and the shell answers it with a prompt.
+		nudge = len(parts) == 3 and parts[2] == 'nudge'
 	else:
 		# A request this broker does not implement is answered, not dropped. Silence reaches the
 		# caller as an empty read that looks like every other empty read.
@@ -636,6 +660,7 @@ def serve_request(state, conn):
 	deadline = time.time() + timeout
 	outcome = 'timeout'
 	settled_at = None
+	quiet_since = time.time()
 	while time.time() < deadline:
 		ready, _, _ = select.select([serial], [], [], 0.2)
 		if serial in ready:
@@ -646,6 +671,10 @@ def serve_request(state, conn):
 			broker_absorb(state, data)
 			collected += data
 			settled_at = None
+			quiet_since = time.time()
+		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and shell_attached(state['log_path']):
+			serial.sendall(b'\n')
+			nudge = False
 		if has_prompt(collected[-256:]):
 			if settled_at is None:
 				settled_at = time.time()
@@ -3172,7 +3201,7 @@ def cmd_boot(args):
 			os._exit(0)
 	serial.close()
 	time.sleep(0.2)
-	reply = ctl_request(f'WAIT {timeout}', timeout)
+	reply = ctl_request(f'WAIT {timeout} nudge', timeout)
 	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s (see {SERIAL_LOG})')
 	print(f'lab: booted in {time.time() - started:.1f} s' + (' (fresh volume)' if fresh else ''))

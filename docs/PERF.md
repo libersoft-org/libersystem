@@ -4,17 +4,312 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## Where a 2D frame's time goes, layer by layer (2026-09-27)
+
+The live 2D demo at 640x480 drew in 79.6 ms and presented every 132.4 ms (the 2026-09-15 row below), and
+nothing in the tree said where the other 52.8 ms went. This section is the account: every millisecond of a
+frame belongs to a named layer, each layer's time is split into computing and waiting, and the numbers are
+taken again by one gate. It MEASURES; it changes no layer's speed.
+
+**THE ANSWER, FIRST.** The largest term is the renderer after all - the draw is 52 % of a whole frame on the
+old baseline's condition and 86 % at 1280x800 - but a quarter of the draw is not the renderer: it is the
+core coming back from idle (16.5 ms, below). Of the rest of the frame, the old "52.8 ms" is now 58.1 ms and
+is two things: DisplayService SCALING the frame one pixel at a time through a float conversion (34.7 ms),
+and the frame loop's own pacing wait (20.6 ms, of which 16.9 ms is a wait the program chose). The
+transport, DisplayService's dispatch, the driver and the device together are 2.0 ms.
+
+### How it was measured
+
+`./check.sh --gate qemu-2d-account` (`src/tools/check-qemu-2d-account.sh`) - one development ISO, image
+`b45cbcc040f208bbd6251352a5376ecd857a9997f4e2d1ccbc760835942c192f`, booted three times, headless, `-smp 4`,
+KVM `-cpu host`, `virtio-vga,iommu_platform=on` behind the translating virtio-iommu (`dma: boot DMA mode
+enforcing-required`), QEMU 10.0.11 (Debian), host CPU Intel Xeon Platinum 8272CL @ 2.60 GHz - a machine that
+is itself a KVM guest (`systemd-detect-virt` answers `kvm`, and it has no cpufreq), which matters below.
+Calibrated TSC 2.597 to 2.598 GHz; the site clock (`rdtsc` behind `lfence`) resolves 32 to 36 cycles, 12 to 14 ns,
+so no term below is a rounding.
+
+- Boot 1, `development-trace` on the default 1280x800 scanout: `test2d-sw --account --no-input
+  --no-second-surface --frames=160 --phase-frames=40` at `--size=640x480` (SCALED onto a 1066x800 output -
+  the 2026-09-15 condition), at the screen's own size (DIRECT, 1280x800), and at 640x480 with fifteen hidden
+  surfaces; then `--offscreen` at 640x480 and 1280x800.
+- Boot 2, the same profile with `GPU_SIZE=640x480`: the account at the screen's own size (direct, 640x480).
+- Boot 3, `development` (every site dormant): the 640x480 run without the account, the same run with
+  `--warm-core=60`, and `--primitives`.
+
+In `--account` mode the demo arms the kernel's record buffer after its eighth present and drains it at the
+end: 152 armed presents per run - 76 of the whole surface, 38 of the partial phase's rectangles, 38 of the
+two rectangles. THE INSTRUMENT: a kernel buffer of 262,144 records of 32 bytes attached only on a
+`development-trace` boot; `SYS_PERF_RECORD` sites in the demo, the frame loop, DisplayService, the virtio-gpu
+driver and the shared virtio queue; a SWITCH record at every context switch and a WAKE record at every wake,
+which give each term its work and its wait; a drain to the debug serial; and the collector
+(`perf-trace.py --frame-account`). A frame is the time from one present returning to the next; its terms
+are the intervals between consecutive sites along it, each named by what happens there, so the named terms
+cover the interval and THE RESIDUE IS 0.00 % IN EVERY SHAPE OF EVERY RUN - and the check that the account is
+true is that its totals agree with the demo's own clock: draw and interval within 1 % of the demo's armed
+report in all four accounts. No drain refused, lost or left incomplete a record. NO POOLED ROW: the demo
+has no worker pool yet, so every draw here is soft2d's serial walk on the demo's own thread.
+
+**EACH LAYER'S BUILD PROFILE, from what the image staged** (`conditions-*.tsv` beside each run): the kernel
+and the virtio-gpu driver are `dev` builds at opt-level 0 (cargo's `debug` output, which `image.sh` and
+`mkpackages` stage); DisplayService and the demo are release PIEs from `build-shared`, and so are their
+libraries. Kernel `71a1a067...`, driver `cec46961...`, DisplayService `cca80ed6...`, demo `d76bdeb5...`.
+
+### The baseline, re-measured first
+
+On ff08ea18, before any instrument code, 04:53Z:
+
+| command | runs | draw mean | interval mean | frames by shape |
+| --- | --- | --- | --- | --- |
+| 2026-09-15's, `lab.sh`'s default cores (64 of 100 online) | 3 | 58.9 / 57.7 / 57.8 ms | 111.9 / 110.3 / 110.3 ms | 484 whole, 58 partial, 58 two-rectangle |
+| the gate's dormant run, 4 cores | 3 | 54.5 / 56.4 / 59.5 ms | 97.1 / 99.0 / 102.2 ms | 84 whole, 38, 38 |
+
+The 2026-09-15 row (below) had the same shape: 484 of its 600 frames presented the whole surface. Its
+"record + replay" label was wrong - the demo's draw clock times `prepare` and `render` only; recording the
+scene and acquiring the image lie outside it - and is corrected there.
+
+### The instrument's own cost
+
+- DORMANT, as a primitive: 0.63 ns per site against a 0.59 ns empty loop (`--primitives`, a million sites),
+  and a frame passes about forty - so an ordinary boot pays tens of nanoseconds a frame for the sites. THE
+  FIRST SITE A PROCESS PASSES costs 29.2 ms once: it resolves the cached flag through `SYS_BOOT_PROFILE`, and
+  that call is slow for a reason of its own (the findings below). No process on the path passes its first
+  site inside a measured window.
+- DORMANT, as a whole run: the dormant interval was checked against the tree without the instrument under
+  the same host conditions, because the host drifts. Built from `git archive` at other paths and booted in
+  turn, three runs a boot, two rounds (16:51Z - 17:04Z): ff08ea18 at `/data/yellow/lsref` 103.54 ms mean (102.83 to
+  104.23), the instrumented source at `/data/yellow/lsins` 103.85 ms (102.69 to 104.37), the same source at
+  the repository's path 104.32 ms (103.75 to 105.20). THE INSTRUMENT'S DORMANT RUN IS INSIDE THE REFERENCE'S
+  RUN-TO-RUN SPREAD at a path of the same length; the repository's own path moves it another 0.47 ms, because
+  the build path enters every binary (crate disambiguators, path strings) and so their layout - which is
+  why the draw, which holds no site, moves with both.
+- ARMED: the scaled run's interval in the trace boot (104.5 ms over the armed frames, 105.1 ms over the whole
+  run) against the dormant run's in the third boot (104.8 ms): no difference past the spread. A run appends
+  about 11,000 records.
+
+### The account: the old baseline's condition (640x480 scaled onto 1280x800)
+
+Per frame, the mean over each shape's frames; "blocked" and "runnable" are the waiting half of a term,
+split by the scheduler's records.
+
+| term | whole (76) | work / blocked / runnable | partial (38) | two rectangles (38) |
+| --- | ---: | --- | ---: | ---: |
+| **interval** | **120.95 ms** | | **88.57 ms** | **87.64 ms** |
+| application: pacing wait and loop step | 20.61 | 0.24 / 19.64 / 0.73 | 22.29 | 22.02 |
+| - of it, the fallback interval the loop chose | 16.91 | | 15.97 | 18.26 |
+| - of it, the 10 ms tick's rounding beyond it | 3.63 | | 6.26 | 3.67 |
+| application: acquire (a call to DisplayService) | 0.75 | 0.16 / 0.41 / 0.18 | 0.53 | 0.47 |
+| application: record the scene | 0.06 | 0.06 / 0 / 0 | 0.06 | 0.06 |
+| application: draw (prepare and render) | 62.81 | 62.81 / 0 / 0 | 62.61 | 62.65 |
+| application: the rest (lookup, damage, ready signal) | 0.04 | all work | 0.04 | 0.04 |
+| transport: the present to DisplayService | 0.08 | 0.06 / 0.01 / 0.01 | 0.10 | 0.09 |
+| DisplayService: dispatch, accept, completion, reply | 0.04 | all work | 0.04 | 0.04 |
+| DisplayService: blit | 34.67 | 34.67 / 0 / 0 | 1.82 | 1.21 |
+| transport: the device call to the driver and back | 0.16 | 0.09 / 0.04 / 0.04 | 0.15 | 0.16 |
+| driver: build the commands, reply | 0.03 | all work | 0.04 | 0.05 |
+| device: acknowledgement, notify to observed completion | 1.62 | spin 1.42 / 0 / 0.20 | 0.81 | 0.80 |
+| transport: the reply back to the application | 0.08 | 0.04 / 0.01 / 0.04 | 0.08 | 0.08 |
+| **residue** | **0.00** | | **0.00** | **0.00** |
+
+The device's acknowledgement is DEVICE TIME - QEMU's work on the host - and the driver's thread spins on the
+used ring while it waits: 2.0 commands per whole frame (a transfer and a flush), 48,387 polls and 11.0 yields;
+4.2 commands for the partial phase's rectangles after the driver merges them. The transport terms are the
+channel wake and the switch of the receiving thread; each is under 0.1 ms.
+
+### The same path at two sizes, with the scanout and the surface varied together
+
+| condition | shape | interval | draw | blit | device | pacing (chosen / rounding) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| 640x480 surface, 640x480 scanout (direct) | whole | 86.92 | 62.28 | 0.23 | 0.88 | 22.53 (17.56 / 4.88) |
+| | partial | 87.69 | 63.34 | 0.03 | 0.80 | 22.58 |
+| | two rectangles | 86.12 | 62.55 | 0.03 | 0.79 | 21.81 |
+| 1280x800 surface, 1280x800 scanout (direct) | whole | 170.72 | 146.35 | 0.96 | 1.90 | 20.45 (16.62 / 3.75) |
+| | partial | 166.69 | 145.30 | 0.10 | 0.86 | 19.28 |
+| | two rectangles | 169.96 | 146.53 | 0.09 | 0.86 | 21.44 |
+| 640x480 surface scaled onto 1280x800 | whole | 120.95 | 62.81 | 34.67 | 1.62 | 20.61 (16.91 / 3.63) |
+
+WHAT SCALES WITH THE PICTURE: the draw (84 ms more for 3.3 times the pixels, 117 ns a pixel), the direct
+blit (0.23 to 0.96 ms, a memory copy at about 4 GB/s) and the device's transfer (0.88 to 1.90 ms). WHAT DOES
+NOT, and is therefore not paying for the picture: the pacing wait (20 to 22.5 ms at every size), the
+transport and dispatch (0.4 ms), and 26 ms of the draw itself - the draw is 26 ms plus 117 ns a pixel through
+the path, and 10 ms plus 119 ns a pixel offscreen. That fixed 16 ms is the next section.
+
+### The draw pays for the core it starts on
+
+Drawn offscreen - the same scene, binary and phase walk into private memory, with no DisplayService, no
+present and no pacing - a 640x480 frame costs 46.3 ms and a 1280x800 one 131.5 ms; through the path the
+same draws cost 62.3 to 62.8 ms and 146.4 ms. The difference is about the same at both sizes (16.0 to
+16.5 ms and 14.9 ms), so it is not the pixels, and the draw's thread is on a CPU throughout (no switch-out,
+no runnable wait), so it is not the scheduler. `--warm-core=60`, which spins 60 ms on the core before each
+draw and outside the draw's clock, brings the draw down to 45.7 ms - the offscreen figure - IN THE SAME
+PROCESS, DRAWING INTO THE SAME ACQUIRED IMAGE, so it is neither the surface's memory nor the process's state
+- and in one boot of the same image, `--warm-core=` 0, 5, 20 and 60 draw in 61.6, 58.4, 49.6 and
+45.7 ms. A CORE THAT
+HAS BEEN IDLE RUNS THE NEXT DRAW SLOWER, recovering over tens of milliseconds of busy time - the behaviour of
+this machine's physical core after the guest's vCPU halts, on a host that is itself virtualised. The frame
+loop idles the core every frame (the pacing wait, and the synchronous present), so every draw pays it.
+
+### Copies of the frame, and the mappings
+
+| path | the application | DisplayService | the device |
+| --- | --- | --- | --- |
+| scaled, whole | draws in place into the surface image (no copy) | reads 307,200 pixels, writes 852,800 (2.78 times), ONE PIXEL AT A TIME: a 64-bit division for the source column, a bounds check, the target's channel masks derived again, each channel through a float conversion and a quantise, and byte stores | `TRANSFER_TO_HOST_2D` of the 1066x800 rectangle (3.4 MB, QEMU's copy into the host resource), then `RESOURCE_FLUSH` |
+| direct, whole | in place | 1,024,000 pixels as 800 row copies (4 MB) | a 4 MB transfer and a flush |
+| a damaged rectangle | in place | that rectangle, scaled or row by row | the rectangles after the driver merges them |
+
+So a whole frame's pixels move twice after they are drawn: DisplayService's copy into its one scanout buffer,
+and the device's copy into the host's resource. The scaled copy is the dearest term after the draw; the direct
+copy runs at memory speed. MAPPINGS: none per frame. The application creates, maps and zero-fills its two
+images at each surface generation; DisplayService maps each imported image once per generation and the
+scanout buffer at start and on a replaced backing; the driver maps its rings and its one-page command and
+response buffers at start. An acquire is a lookup of an address already mapped.
+
+### DisplayService's loop against the surfaces it waits on
+
+With ConsoleService's hidden surface and the demo's own, DisplayService waits on 14 handles; with fifteen
+hidden surfaces more, on 29. Entering a blocking `wait_any` (the loop's site to the switch-out) costs
+0.074 ms and 0.106 ms, leaving it (switch-in to the site after the wait) 0.090 ms and 0.106 ms: about 2.1 us
+and 1.1 us per handle on top of some 44 us and 73 us that do not depend on the count, in an opt-level-0
+kernel. The loop passes twice per frame, so fifteen hidden surfaces cost about 0.1 ms a frame. Nothing is
+composed, and no other term moved (whole frames 120.28 ms against 120.95 ms).
+
+### The primitives underneath
+
+| primitive | value | from |
+| --- | --- | --- |
+| one syscall (`SYS_DEBUG_NOOP`) | 36 ns | `--primitives`, 100,000 calls |
+| a MemoryObject of one 640x480 image (300 pages): create / map / touch / copy / unmap | 0.95 / 0.20 / 0.07 / 0.10 / 0.14 ms | `--primitives`, 20 rounds |
+| the same for 1280x800 (1,000 pages) | 2.40 / 0.69 / 0.31 / 0.38 / 0.45 ms | the same |
+| the site clock's resolution | 32 to 36 cycles (12 to 14 ns) | back-to-back reads |
+| an IPC round trip, `acquire` / `present`, less DisplayService's own handling | 0.47 / 0.16 ms median | the account's records |
+| a channel wake, the message to the woken thread running | 0.024 ms median, 0.10 ms mean | 945 wakes |
+| a deadline wake, the tick to the woken thread running | 0.14 ms median, 0.36 ms mean | 198 wakes |
+
+Creating and mapping an image costs a millisecond or more, and it is paid per surface generation, not per
+frame. The deadline wake's long mean is the woken thread waiting behind whatever runs on the core that
+checks deadlines - the driver's spin among them.
+
+### The comparison that makes the number mean something
+
+The same drawing work in one process (`--offscreen`: record and draw, no DisplayService, no present, no
+pacing) against the real path with one application:
+
+| condition | offscreen frame | through the path | what the system charges | without the chosen wait |
+| --- | ---: | ---: | --- | --- |
+| 640x480 scaled onto 1280x800, whole | 46.3 ms | 120.95 ms | +74.7 ms, 2.61 times | +57.8 ms, 2.25 times |
+| 640x480 scaled, partial | 46.3 ms | 88.57 ms | +42.3 ms, 1.91 times | +26.3 ms, 1.57 times |
+| 640x480 direct (640x480 scanout), whole | 46.3 ms | 86.92 ms | +40.6 ms, 1.88 times | +23.1 ms, 1.50 times |
+| 1280x800 direct, whole | 131.5 ms | 170.72 ms | +39.2 ms, 1.30 times | +22.6 ms, 1.17 times |
+
+The 74.7 ms of the baseline's condition: the scaled blit 34.7, the pacing wait 20.6 (16.9 chosen, 3.6 the
+tick, 0.1 the loop), the idle core's slower draw 16.5, the device 1.6, the acquire 0.75, everything else
+0.5. With the unoptimised build's cost taken out (the optimised
+comparison below), the charge is 73.7 ms and the ratio 2.61 - that cost is about 1 ms of it.
+
+### The optimised comparison
+
+The same gate on the same tree with `CARGO_PROFILE_DEV_OPT_LEVEL=2` exported for the whole run: kernel
+`4933537b...` and driver `48a27444...` differ from the ordinary run's, DisplayService and the demo are the
+same bytes (the gate refuses the row otherwise), image `efe5ca33...`. Per whole frame, 640x480 scaled:
+
+| term | opt-level 0 (the account) | opt-level 2 | |
+| --- | ---: | ---: | --- |
+| interval | 120.95 ms | 119.58 ms | |
+| draw | 62.81 | 62.57 | release PIE either way |
+| DisplayService's blit | 34.67 | 34.64 | release PIE either way |
+| pacing wait (chosen / rounding) | 20.61 (16.91 / 3.63) | 20.26 (16.33 / 3.92) | |
+| device, notify to completion | 1.62 | 1.89 | QEMU's time, and the driver's spin polls faster |
+| acquire | 0.75 | 0.07 | |
+| the four transport crossings | 0.32 | 0.06 | |
+| DisplayService's dispatch and completion, the driver's own | 0.07 | 0.02 | |
+
+| primitive | opt-level 0 | opt-level 2 |
+| --- | ---: | ---: |
+| IPC round trip, `acquire` / `present` (median) | 0.47 / 0.16 ms | 0.06 / 0.03 ms |
+| channel wake (median / mean) | 24 / 100 us | 5 / 12 us |
+| deadline wake (median / mean) | 143 / 359 us | 121 / 341 us |
+| DisplayService entering / leaving a blocking wait, 14 handles | 74 / 90 us | 8.4 / 9.9 us |
+| the same, 29 handles | 106 / 106 us | 16.8 / 19.7 us |
+| one syscall | 36 ns | 33 ns |
+| 640x480 MemoryObject: create / map / unmap | 0.95 / 0.20 / 0.14 ms | 0.05 / 0.05 / 0.05 ms |
+| 1280x800 MemoryObject: create / map / unmap | 2.40 / 0.69 / 0.45 ms | 0.18 / 0.26 / 0.19 ms |
+| the boot's service chain settled in | 2201 ticks | 752 to 766 ticks |
+
+THE UNOPTIMISED BUILD'S COST ON A FRAME IS ABOUT ONE MILLISECOND - 0.99 ms of a scaled whole frame, 0.77 to
+0.79 ms of the others, under one percent everywhere - and it is all in the kernel's IPC, wake and wait paths
+and the driver: an opt-level-0 kernel makes a channel round trip six to eight times dearer and a wake five times,
+which is invisible in a frame dominated by drawing and copying and plain in the boot, which it makes three
+times longer. No term above five percent of a frame moves, so none is that cost. The primitives above are
+measured in both builds, as the plan requires.
+
+### The verdict
+
+THE DOMINANT TERM IS THE DRAW: 62.8 ms, 52 % of a whole frame on the baseline's condition, 71 % of a
+640x480 direct frame and 86 % of a 1280x800 one. Every term above five percent of a frame, and which of the
+six things it is:
+
+| term | share | what it is |
+| --- | --- | --- |
+| the draw's own work, 46.3 ms of 62.8 (whole frames) | 38 % of 120.95 | WORK THAT HAS TO HAPPEN for this renderer: the whole picture changes in the whole-surface phases |
+| the same draw on the partial and two-rectangle frames | 52 % of 88.57 | WORK THAT HAPPENS MORE OFTEN THAN IT HAS TO: 15,304 source pixels of 307,200 changed, and every tile is replayed - nothing lets the renderer draw only the damage |
+| the idle core's slower draw, 14.9 to 16.5 ms | 14 % scaled whole, 18 % partial, 18 % direct 640x480, 9 % direct 1280x800 | WAITING THAT IS A SCHEDULING CONSEQUENCE, of an unusual kind: the frame loop leaves the core idle between frames and this host's core comes back slow; the mechanism is the machine's, measured by `--warm-core`, and a guest removes it only by not idling |
+| DisplayService's scaled blit, 34.7 ms | 29 % | WORK THIS SYSTEM DOES THE LONG WAY for want of a primitive: a same-format nearest-neighbour scale done through a per-pixel float conversion (follow-up 1) |
+| the fallback interval, 16 to 18 ms | 10 to 21 % | A WAIT A PROGRAM CHOSE: the frame loop's `UNPACED_INTERVAL_NS`, because DisplayService reports no frame timing - reported, not charged |
+| the tick's rounding, 3.6 to 6.3 ms | 7.1 % scaled partial, 5.5 to 5.6 % direct 640x480, under 5 % elsewhere | WAITING THAT IS A SCHEDULING CONSEQUENCE: a deadline in 10 ms ticks, rounded up, and the woken thread's wait for its core |
+| the unoptimised build's cost, 0.77 to 0.99 ms | under 1 % | THE UNOPTIMISED BUILD'S COST, from the optimised comparison; no term above five percent moves between the two builds (draw 62.81 against 62.57 ms, blit 34.67 against 34.64, chosen wait 16.91 against 16.33, idle core 16.5 against 16.7) |
+
+Nothing on the path between the application and the device - the transport, DisplayService's dispatch and
+completion, the driver - reaches half a percent of a frame. THE HYPOTHESIS THIS MEASUREMENT OPENED ON, that
+the system around the renderer is where the time goes, holds for 30 % of a scaled whole frame - DisplayService,
+the driver, the device and the transport together - and that is almost all
+one copy loop; on the direct path it holds for 2 %.
+
+FOLLOW-UPS, each a missing primitive or a copy this account names and does not build:
+
+1. A SAME-FORMAT SCALED COPY in `pix`: nearest-neighbour through a precomputed column map with four-byte
+   copies and no float round trip. The direct copy moves 1,024,000 pixels in 0.96 ms; this would bring the
+   scaled path's 34.7 ms toward that.
+2. DIRECT SCANOUT OF THE ONE VISIBLE SURFACE: the device scanning out (or the resource backed by) the client's
+   image instead of DisplayService copying it into its one scanout buffer - which removes the blit on the
+   direct path, and on the scaled one together with scaling done by the display.
+3. GUEST-MEMORY RESOURCES ON THE DEVICE (virtio-gpu blob resources), so `TRANSFER_TO_HOST_2D` - QEMU's copy of
+   the frame - disappears from the device's 1.6 to 1.9 ms.
+4. A DAMAGE-LIMITED REPLAY in soft2d, drawing only the tiles a frame's damage reaches: the partial and
+   two-rectangle frames replay all eighty tiles for five percent of the pixels.
+
+### Disproofs, and what was found on the way
+
+- The IPC TRANSPORT, the SCHEDULER and the DRIVER were each suspected of a share of the missing 52.8 ms. They
+  hold 0.32, about 1 and 0.03 ms of a 121 ms frame.
+- The DRAW'S EXCESS through the path is NOT the surface's memory and NOT the process's heap or state (a warm
+  core draws into the same image, in the same process, at the offscreen speed), and NOT a per-pixel cost (it
+  is about the same at both sizes).
+- Fifteen HIDDEN SURFACES cost DisplayService's loop about 0.1 ms a frame, not the linear slowdown the
+  wait-vector rebuild suggested.
+- A DORMANT SITE looked fifty times dearer than a flag test (29.8 ns): the loop that measured it carried the
+  process's first site, which resolves the boot profile. Measured apart, a dormant site is 0.63 ns.
+- FOUND AND LEFT ALONE: `SYS_BOOT_PROFILE` costs about 29 ms, because the x86_64 kernel re-reads fw_cfg's file
+  directory on every call, one port read per byte of each 64-byte entry and each a VM exit; and that reader
+  has one selector and cursor shared by all cores with no lock. Every process that asks for the boot profile
+  pays it once.
+
 ## The 2D demo, live, at 640x480 (2026-09-15)
 
 `test2d-sw --frames=600 --phase-frames=60 --size=640x480` inside a booted guest, reporting its own
-two numbers: what a FRAME COSTS - record the list and replay it into the surface's image - and what
-the loop's present INTERVAL came to with the display's pacing in it. They are different claims, and a
-demo that reported only the second would look fast on a machine that throttled it.
+two numbers: what a FRAME COSTS - the backend's `prepare` and `render` of the recorded list into the
+surface's image - and what the loop's present INTERVAL came to with the display's pacing in it. They are
+different claims, and a demo that reported only the second would look fast on a machine that throttled it.
 
 | what | mean | worst |
 | --- | ---: | ---: |
-| draw (record + replay) | 79.6 ms | 104.3 ms |
+| draw (prepare and render) | 79.6 ms | 104.3 ms |
 | present interval | 132.4 ms | 174.7 ms |
+
+CORRECTED 2026-09-27: this row was labelled "record + replay", and the demo's draw clock times `prepare`
+and `render` alone - acquiring the image and recording the scene lie outside it, in the interval. And it is
+not one kind of frame: under these arguments the phase counter stops at `full-again` and each phase change
+owes two whole frames, so 484 of the 600 frames presented the whole surface, 58 the partial phase's
+rectangles and 58 the two rectangles, every one of them onto the 1280x800 scanout's SCALED path. The account
+above takes it apart per damage shape.
 
 Re-measured 2026-09-15 after the three backend changes recorded under `soft2d` below; it was 88.3 ms
 mean and 116.4 ms worst, with a 141.4 ms interval. The demo's own scene gains less than the

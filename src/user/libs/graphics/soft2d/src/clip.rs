@@ -78,6 +78,18 @@ impl ClipStack {
 		Self::default()
 	}
 
+	/// Room for `depth` levels, so a tile's pushes never grow the stack: a lane's clip stack is reserved
+	/// at `prepare` to the deepest nesting the list reaches.
+	pub fn reserve(&mut self, depth: usize) {
+		self.levels.reserve(depth.saturating_sub(self.levels.len()));
+		self.bounds.reserve((depth + 1).saturating_sub(self.bounds.len()));
+	}
+
+	/// What the reservation costs, charged with the lane that holds it.
+	pub fn reserved_bytes(&self) -> u64 {
+		(self.levels.capacity() * core::mem::size_of::<ClipLevel>() + self.bounds.capacity() * core::mem::size_of::<PixelRect>()) as u64
+	}
+
 	pub fn reset(&mut self, bounds: PixelRect) {
 		self.levels.clear();
 		self.bounds.clear();

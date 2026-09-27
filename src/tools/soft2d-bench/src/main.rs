@@ -29,7 +29,12 @@ use render2d::paint::{Color, GradientStop, ImageQuality, Paint};
 use render2d::path::{Cap, FillRule, Join, PathBuilder, StrokeStyle};
 use render2d::transform::Transform;
 use render2d::{Canvas, Error};
-use soft2d::{ImageSource, Soft2d};
+use soft2d::{ImageSource, Soft2d, UnitKind};
+
+mod pool;
+
+/// The worker counts `--scaling` measures, the frozen scenes at each.
+const SCALING: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 /// THE MEASURED EXTENT. The profile's own benchmark size, so two measurements are comparable.
 const WIDTH: u32 = 640;
@@ -134,9 +139,99 @@ impl ImageSource for Images {
 	}
 }
 
+/// `--workers N` (the frozen report on a pool of N lanes, one by default) and `--units bands|tiles` (how
+/// a frame is cut; tiles by default) from the command line.
+fn workers_and_units() -> (usize, UnitKind) {
+	let arguments: Vec<String> = std::env::args().collect();
+	let value = |flag: &str| arguments.iter().position(|argument| argument == flag).and_then(|at| arguments.get(at + 1)).cloned();
+	let workers = value("--workers").map(|text| text.parse::<usize>().expect("--workers takes a count")).unwrap_or(1).max(1);
+	let units = match value("--units").as_deref() {
+		None | Some("tiles") => UnitKind::Tiles,
+		Some("bands") => UnitKind::Bands,
+		Some(other) => panic!("--units takes bands or tiles, not {other}"),
+	};
+	(workers, units)
+}
+
+/// Replay one list WARMUP + SAMPLES times into `target`: the median and the 99th percentile of the
+/// kept samples, in milliseconds.
+fn replay(backend: &mut Soft2d<'_>, prepared: &soft2d::SoftPrepared, target: &mut OwnedImage) -> (f64, f64) {
+	let mut samples = Vec::with_capacity(SAMPLES);
+	for index in 0..WARMUP + SAMPLES {
+		let started = Instant::now();
+		{
+			let mut view = target.view_mut();
+			backend.render(prepared, &mut view).expect("a frame");
+		}
+		let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+		if index >= WARMUP {
+			samples.push(elapsed);
+		}
+	}
+	samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+	// THE NINETY-NINTH PERCENTILE AND NOT THE MAXIMUM. One sample interrupted by the scheduler is
+	// not the renderer's cost, and a floor set on a maximum is a floor set on the busiest machine
+	// that ever ran it.
+	(samples[samples.len() / 2], samples[((samples.len() as f64 * 0.99) as usize).min(samples.len() - 1)])
+}
+
+/// `--scaling`: every frozen scene at one to sixty-four workers, with both kinds of unit - the lanes each
+/// frame ran with, its units, its replay median, and whether its picture is the one-worker frame's to
+/// the byte. A picture that is not is a defect, and the run stops on it.
+fn scaling(images: &Images) {
+	println!("scene	units_kind	workers	lanes	units	replay_median_ms	speedup	identical");
+	for scene in SCENES.iter() {
+		let list = scene_list(scene.name);
+		let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
+		let mut reference: Option<Vec<u8>> = None;
+		let mut one_worker = 0.0f64;
+		for kind in [UnitKind::Bands, UnitKind::Tiles] {
+			for &workers in SCALING.iter() {
+				let pool = pool::HostPool::new(workers);
+				let mut backend = Soft2d::new().with_images(images).with_workers(&pool).with_units(kind);
+				let prepared = backend.prepare(&list, &description).expect("a preparation");
+				let mut target = target();
+				let (median, _) = replay(&mut backend, &prepared, &mut target);
+				let bytes = target.bytes().to_vec();
+				let identical = match &reference {
+					None => {
+						reference = Some(bytes);
+						true
+					}
+					Some(reference) => *reference == bytes,
+				};
+				if workers == 1 && kind == UnitKind::Bands {
+					one_worker = median;
+				}
+				let kind_name = if kind == UnitKind::Bands { "bands" } else { "tiles" };
+				println!("{}	{kind_name}	{workers}	{}	{}	{median:.3}	{:.2}	{}", scene.name, prepared.lanes(), prepared.units(), one_worker / median, if identical { "yes" } else { "NO" });
+				assert!(identical, "{} at {workers} workers ({kind_name}): the picture differs from one worker's", scene.name);
+			}
+		}
+	}
+}
+
+/// A frozen scene by name.
+fn scene_list(name: &str) -> DrawList {
+	match name {
+		"UI-basic" => ui_basic(),
+		"UI-effects" => ui_effects(),
+		"vector-stress" => vector_stress(),
+		"image-resample" => image_resample(),
+		_ => image_convert(),
+	}
+	.expect("a fixture this program records")
+}
+
 fn main() {
 	let check = std::env::args().any(|argument| argument == "--check");
 	let images = build_images();
+	if std::env::args().any(|argument| argument == "--scaling") {
+		scaling(&images);
+		return;
+	}
+	let (workers, units) = workers_and_units();
+	let pool = pool::HostPool::new(workers);
 	if std::env::var("SOFT2D_BENCH_PROBE").is_ok() {
 		println!("probe\tcommands\tprepare_ms\treplay_median_ms");
 		for (name, list) in probes() {
@@ -163,17 +258,10 @@ fn main() {
 		}
 		return;
 	}
-	println!("scene\tcommands\tresources\tprepare_ms\treplay_median_ms\treplay_p99_ms\tbudget_ms\tceiling_ms\tverdict");
+	println!("scene\tcommands\tresources\tprepare_ms\treplay_median_ms\treplay_p99_ms\tbudget_ms\tceiling_ms\tverdict\tworkers\tlanes\tunits");
 	let mut failed = false;
 	for scene in SCENES.iter() {
-		let list = match scene.name {
-			"UI-basic" => ui_basic(),
-			"UI-effects" => ui_effects(),
-			"vector-stress" => vector_stress(),
-			"image-resample" => image_resample(),
-			_ => image_convert(),
-		}
-		.expect("a fixture this program records");
+		let list = scene_list(scene.name);
 		// THE FROZEN SHAPE IS CHECKED BEFORE THE CLOCK STARTS. A fixture that lost half its commands
 		// would otherwise report a comfortable number against a scene nobody agreed to.
 		if std::env::var("SOFT2D_BENCH_FREEZE").is_ok() {
@@ -188,33 +276,15 @@ fn main() {
 
 		let mut target = target();
 		let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
-		let mut backend = Soft2d::new().with_images(&images);
+		let mut backend = Soft2d::new().with_images(&images).with_workers(&pool).with_units(units);
 		let started = Instant::now();
 		let prepared = backend.prepare(&list, &description).expect("a preparation");
 		let prepare_ms = started.elapsed().as_secs_f64() * 1_000.0;
-
-		let mut samples = Vec::with_capacity(SAMPLES);
-		for index in 0..WARMUP + SAMPLES {
-			let started = Instant::now();
-			{
-				let mut view = target.view_mut();
-				backend.render(&prepared, &mut view).expect("a frame");
-			}
-			let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-			if index >= WARMUP {
-				samples.push(elapsed);
-			}
-		}
-		samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-		let median = samples[samples.len() / 2];
-		// THE NINETY-NINTH PERCENTILE AND NOT THE MAXIMUM. One sample interrupted by the scheduler is
-		// not the renderer's cost, and a floor set on a maximum is a floor set on the busiest machine
-		// that ever ran it.
-		let percentile = samples[((samples.len() as f64 * 0.99) as usize).min(samples.len() - 1)];
+		let (median, percentile) = replay(&mut backend, &prepared, &mut target);
 		let allowed = scene.budget_ms.min(scene.ceiling_ms);
 		let met = median <= allowed;
 		failed |= check && !met;
-		println!("{}\t{}\t{}\t{prepare_ms:.3}\t{median:.3}\t{percentile:.3}\t{:.1}\t{:.1}\t{}", scene.name, scene.commands, scene.resources, scene.budget_ms, scene.ceiling_ms, if met { "met" } else { "OVER" });
+		println!("{}\t{}\t{}\t{prepare_ms:.3}\t{median:.3}\t{percentile:.3}\t{:.1}\t{:.1}\t{}\t{workers}\t{}\t{}", scene.name, scene.commands, scene.resources, scene.budget_ms, scene.ceiling_ms, if met { "met" } else { "OVER" }, prepared.lanes(), prepared.units());
 	}
 	if failed {
 		eprintln!("soft2d-bench: a scene is over its frozen budget");

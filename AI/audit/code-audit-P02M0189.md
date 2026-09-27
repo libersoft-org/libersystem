@@ -148,7 +148,7 @@ top of it.
 
 ### The runs
 
-- `ordinary-1` (08:02Z, before the changes above) and `ordinary-2` (16:30Z, the final instrument):
+- `ordinary-1` (06:02Z, before the changes above) and `ordinary-2` (16:30Z, the final instrument):
   `./check.sh --gate qemu-2d-account` PASSED both times (ordinary-2: 491 s). Results under
   `.build/logs/qemu-2d-account/ordinary-2`.
 - THE DORMANT COMPARISON NEEDED A REFERENCE TAKEN UNDER THE SAME HOST CONDITIONS. The morning re-measure
@@ -163,3 +163,56 @@ top of it.
   because the build path enters the binaries (crate disambiguators and path strings), so the two trees also
   differ in code layout. A third tree, the instrumented source at the same-length path `/data/yellow/lsins`,
   is being built to separate the instrument from the path (result below).
+- THE THIRD TREE SEPARATED THE TWO (16:51Z - 17:04Z, second A/B session, three trees alternating, three runs per boot,
+  two rounds; the commands and every line in `scratchpad/ab3/summary.txt` of this session):
+  | tree | interval runs (ms) | mean | draw mean |
+  | --- | --- | ---: | ---: |
+  | ff08ea18 at `/data/yellow/lsref` (no instrument) | 103.91 104.23 103.71 102.83 103.48 103.07 | 103.54 | 60.75 |
+  | instrument at `/data/yellow/lsins` (same path length) | 104.28 103.77 104.37 103.68 104.32 102.69 | 103.85 | 61.38 |
+  | instrument at `/data/yellow/libersystem` (the repository) | 104.20 104.40 103.75 103.81 105.20 104.55 | 104.32 | 61.80 |
+  The instrument at a path of the same length is +0.31 ms and inside the reference's run-to-run spread
+  (102.83 - 104.23); the same instrumented source moved to the repository's path is another +0.47 ms. So the
+  dormant instrument is within the reference's spread, and the path, not the instrument, is the larger term -
+  the draw, which carries no site, moves with both, which is code layout.
+- THE OPTIMISED RUN'S FIRST ATTEMPT (about 17:05Z) FAILED IN THE HARNESS, NOT IN THE GUEST: the kernel at opt-level 2
+  settled the boot chain in 739 ticks instead of 2201, so the shell prompted BEFORE the network's
+  asynchronous `ipv6: link-local ...` lines, which then followed the prompt; `lab`'s boot wait accepts a
+  prompt only as the log's last bytes and timed out at 240 s with the prompt in the log. The CHANGE MADE FOR
+  MEASUREMENT (the plan's exception: the optimised comparison is impossible without it), minimal and in the
+  harness only: `lab.py` - the broker's `WAIT` takes an optional `nudge`, which `cmd_boot` alone passes; with
+  it, after `BOOT_NUDGE_QUIET` (5 s) of guest silence with no prompt at the end and `shell attached` in the
+  log, the broker types ONE empty line, which the shell answers with a prompt. No other `WAIT` (the
+  persistent development instance's, `lab.sh wait`) changes, since a person may have a half-typed line there.
+- AND THE GATE LEFT THAT GUEST RUNNING: `boot()` set `BOOTED=1` only after `lab.sh boot` succeeded, so a boot
+  whose wait failed skipped the exit handler's `lab.sh quit`. `BOOTED=1` is now set before the boot.
+- THE OPTIMISED RUN: after the harness fix, its provenance check itself failed once on a relative
+  `ACCOUNT_REFERENCE` (the gate runs from `src/`); the reference is now resolved against the repository as
+  RESULTS is. The rerun PASSED (17:19Z - 17:25Z, 354 s): all four accounts closed, and "the optimised row is from
+  another image: kernel and driver differ, DisplayService and the demo do not" (image `efe5ca33...`, kernel
+  `4933537b...`, driver `48a27444...`). The unoptimised build's cost on a frame is 0.77 - 0.99 ms (acquire
+  0.75 -> 0.07, the four transport crossings 0.32 -> 0.06, DisplayService's dispatch and the driver 0.07 ->
+  0.02); no term above 5 % moves. The primitives in both builds are in the account.
+- THE RAMP, re-measured with the tree's own mode in one boot of the ordinary image (`b45cbc...` again - the
+  build is reproducible): `--warm-core=` 0 / 5 / 20 / 60 -> draw 61.6 / 58.4 / 49.6 / 45.7 ms.
+
+### Written, and the state at this point (2026-09-27, 17:30Z)
+
+- `docs/PERF.md`: the new section "Where a 2D frame's time goes, layer by layer (2026-09-27)" - conditions,
+  profiles and staged artifacts, the re-measure, the instrument's dormant and armed cost with the A/B, the
+  per-shape term table with work / blocked / runnable, the two sizes and the scaled row, the idle-core
+  finding, copies and mappings, the dispatch loop against its handle count, the primitives, the offscreen
+  comparison as ratio and cost with and without the chosen wait and the unoptimised build's cost, the
+  optimised comparison, the verdict with every term above 5 % classified, four follow-ups, disproofs; and the
+  2026-09-15 row's label corrected with its frame-shape counts.
+- `docs/todo/P02M0189.md`: 36 items ticked; open are the x86_64-first/ports item, the one-tree item, the
+  serial-walk item (the pooled row and the `--workers=1` pin come with P02M0193), the emulated ports' check
+  and the "no item closed by an argument" item - all five wait for the end of the job, where the ports'
+  check must be taken with a fresh x86_64 row on the tree it runs on, since P02M0193 and later milestones
+  change code on the path. Follow-ups named there. `TODO.md` row updated.
+- Checks run: `rustfmt --check` on `test2d_sw.rs` clean; `shfmt -d` on the gate clean; `python3 -c ast.parse`
+  on `lab.py`; the collector fixtures (13) inside every gate run. `./check.sh --gate source-hygiene` FAILS,
+  on seven harness files this work did not touch (`midi-source.py`, `mtp-root.py`, `printer-sink.py`,
+  `ups-sim.py`, `usb_ffs.py`, `usb_gadgetfs.py`, `usbredir_device.py` - a shebang with mode 644 in git since
+  an earlier commit); none of this work's files is in its list.
+- The reference trees `/data/yellow/lsref` and `/data/yellow/lsins` were removed after the measurement (8 GB);
+  `git archive ff08ea18` / `git archive HEAD` recreate them.

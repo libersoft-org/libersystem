@@ -143,7 +143,12 @@ impl Rasteriser {
 		if self.area.len() < width {
 			self.area.resize(width, 0.0);
 		}
-		self.crossings.reserve(edges.saturating_sub(self.crossings.capacity()));
+		// RELATIVE TO THE LENGTH, which is what `reserve` measures from: both lists are empty between
+		// rows, so this is room for `edges` of each. The active list is the other one a row fills - an
+		// edge list's every edge can be active at once - and it was not reserved at all, so a wide list
+		// grew it inside the replay.
+		self.crossings.reserve(edges.saturating_sub(self.crossings.len()));
+		self.active.reserve(edges.saturating_sub(self.active.len()));
 	}
 
 	/// What the reservation costs, which a caller compares against a budget.

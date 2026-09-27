@@ -112,9 +112,11 @@ boot() {
 	local name="$1"
 	shift
 	"$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true
+	# THE GUEST IS OURS FROM THE MOMENT IT IS STARTED, not from the moment it answers: a boot whose wait
+	# fails leaves its QEMU running, and the exit handler has to take that one down as well.
+	BOOTED=1
 	# Headless and four cores, whatever the caller's environment says.
 	env -u DISPLAYS "$@" SMP=4 "$REPO_ROOT/lab.sh" boot >"$RESULTS/boot-$name.log" 2>&1 || die "boot $name failed - see $RESULTS/boot-$name.log"
-	BOOTED=1
 	record_conditions "$name"
 }
 
@@ -167,6 +169,8 @@ account small-direct "$RESULTS/serial-small.log" 1
 
 # THE OPTIMISED ROW'S PROVENANCE, when this run is the optimised one.
 if [[ -n "${CARGO_PROFILE_DEV_OPT_LEVEL:-}" && -n "${ACCOUNT_REFERENCE:-}" ]]; then
+	# The repository's, as RESULTS is: `check.sh` runs this from `src/`.
+	[[ "$ACCOUNT_REFERENCE" == /* ]] || ACCOUNT_REFERENCE="$REPO_ROOT/$ACCOUNT_REFERENCE"
 	reference="$ACCOUNT_REFERENCE/conditions-trace.tsv"
 	[[ -f "$reference" ]] || die "ACCOUNT_REFERENCE names no ordinary run's conditions ($reference)"
 	digest_of() { awk -F'\t' -v key="$1" '$1 == key { print ($1 == "image") ? $2 : $3 }' "$2"; }

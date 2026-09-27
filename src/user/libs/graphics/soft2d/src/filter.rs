@@ -30,8 +30,14 @@ use crate::target::Surface;
 /// with no `Source` is a legal graph that ignores its input - a flood, a gradient of nodes, an image
 /// composited on its own - and it is not an error.
 #[allow(clippy::too_many_arguments)]
-pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
-	let mut results: Vec<Option<Surface>> = Vec::with_capacity(graph.nodes().len());
+///
+/// THE NODE TABLE IS THE LANE'S AND THE KERNELS ARE THE PREPARED LIST'S. `results` holds one entry per
+/// node while the graph runs and is reserved at `prepare` for the list's largest graph, and a blur's
+/// weights were computed there with the graph (`kernels`), so evaluating a filter in a tile allocates
+/// nothing - it used to build both, in every tile the filtered layer reached.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate(graph: &FilterGraph, kernels: &[Option<(Vec<f32>, Vec<f32>)>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
+	results.clear();
 	let mut outcome: Result<Surface, Error> = Err(Error::Allocation);
 	for (index, node) in graph.nodes().iter().enumerate() {
 		let Some(mut into) = pool.take(bounds) else {
@@ -57,18 +63,19 @@ pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::tar
 					}
 				}
 			}
-			FilterNode::Blur { input: slot, x, y } => {
+			FilterNode::Blur { input: slot, .. } => {
 				// THE SEPARABLE BLUR NEEDS ONE MORE SURFACE, for what the horizontal pass wrote and
 				// the vertical pass reads. Borrowing it from the pool rather than from the stack is
 				// what keeps a tall tile from being a stack overflow.
 				let horizontal = pool.take(bounds);
-				match (input(*slot), horizontal) {
-					(Some(from), Some(mut horizontal)) => {
-						blur(from, &mut horizontal, &mut into, bounds, *x, *y, spans);
+				let weights = kernels.get(index).and_then(|entry| entry.as_ref());
+				match (input(*slot), horizontal, weights) {
+					(Some(from), Some(mut horizontal), Some((across, down))) => {
+						blur(from, &mut horizontal, &mut into, bounds, across, down, spans);
 						pool.give(horizontal);
 					}
-					(_, Some(horizontal)) => pool.give(horizontal),
-					(_, None) => {
+					(_, Some(horizontal), _) => pool.give(horizontal),
+					(_, None, _) => {
 						pool.give(into);
 						give_back(pool, results);
 						return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes });
@@ -232,8 +239,8 @@ pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::tar
 	outcome
 }
 
-fn give_back(pool: &mut Pool, results: Vec<Option<Surface>>) {
-	for surface in results.into_iter().flatten() {
+fn give_back(pool: &mut Pool, results: &mut Vec<Option<Surface>>) {
+	for surface in results.drain(..).flatten() {
 		pool.give(surface);
 	}
 }
@@ -260,9 +267,7 @@ fn copy(from: &Surface, into: &mut Surface, bounds: PixelRect) {
 /// turns a radius-squared kernel into two radius-sized ones - at three standard deviations and a
 /// twenty-pixel blur that is the difference between four thousand taps a pixel and a hundred and
 /// twenty.
-fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bounds: PixelRect, sigma_x: f32, sigma_y: f32, spans: &mut crate::backend::Spans) {
-	let horizontal = kernel(sigma_x);
-	let vertical = kernel(sigma_y);
+fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bounds: PixelRect, horizontal: &[f32], vertical: &[f32], spans: &mut crate::backend::Spans) {
 	let (left, top) = (bounds.x, bounds.y);
 	let (width, height) = (bounds.width as usize, bounds.height as usize);
 	let reach = |kernel: &[f32]| (kernel.len() as i64 - 1) / 2;
@@ -270,7 +275,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 	// surface would fetch one pixel at a time through a bounds check, a row lookup and a half-float
 	// decode - twenty-five times per pixel for a four-pixel blur.
 	if width > 0 && spans.filter_input.len() >= width {
-		let offset = reach(&horizontal);
+		let offset = reach(horizontal);
 		for y in top..top + bounds.height {
 			from.read_span(left, y, &mut spans.filter_input[..width]);
 			// THE INTERIOR HAS NO EDGE TO TEST FOR, and it is nearly all of the row. Every tap of
@@ -307,7 +312,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 		}
 	}
 	if height > 0 && spans.filter_input.len() >= height {
-		let offset = reach(&vertical);
+		let offset = reach(vertical);
 		for x in left..left + bounds.width {
 			// THE COLUMN IS READ AND WRITTEN AS A RUN, which is what the first pass already did for
 			// its rows. Walking it with `get` and `set` recomputed the local coordinates, the bounds
@@ -340,6 +345,18 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 
 /// A normalised Gaussian kernel out to three standard deviations, which is the reach the profile's
 /// bounds map promises.
+/// Every blur node's two kernels, in node order, for `prepare` to hold with the graph.
+pub fn kernels(graph: &FilterGraph) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
+	graph
+		.nodes()
+		.iter()
+		.map(|node| match node {
+			FilterNode::Blur { x, y, .. } => Some((kernel(*x), kernel(*y))),
+			_ => None,
+		})
+		.collect()
+}
+
 fn kernel(sigma: f32) -> Vec<f32> {
 	let sigma = sigma.abs();
 	if !(sigma.is_finite() && sigma > 0.0) {

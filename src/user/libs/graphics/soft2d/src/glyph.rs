@@ -14,6 +14,7 @@
 //! produces coloured fringes on every stem; with a different filter it produces different fringes,
 //! which is why the taps are the profile's and not this file's.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use font_contract::cache::GlyphCacheKey;
@@ -89,8 +90,14 @@ impl GlyphProvider for NoGlyphs {
 /// deterministic: a cache whose eviction depends on a clock or on a hash iteration order makes two
 /// runs of one drawing produce different work, and the profile requires a given input to produce a
 /// given output.
+///
+/// ITS ENTRIES ARE SHARED, because a prepared list holds the forms it draws: `prepare` resolves every
+/// glyph a list places, and the list keeps its own reference to each mask and bitmap it will read. An
+/// eviction drops only the cache's reference, so a form stays alive while a list that draws it does -
+/// the profile's "a live prepared snapshot retains its own resources" - and the replay never meets a
+/// miss. The byte bound counts what the cache holds; what a list holds is released with the list.
 pub struct GlyphRaster {
-	entries: Vec<(GlyphCacheKey, GlyphImage)>,
+	entries: Vec<(GlyphCacheKey, Arc<GlyphImage>)>,
 	bytes: u64,
 	ceiling: u64,
 	/// Bumped when the cache is cleared, which is what a prepared list is bound to.
@@ -135,8 +142,20 @@ impl GlyphRaster {
 
 	/// The cached form for a key, decoding it through the provider on a miss.
 	pub fn get(&mut self, key: &GlyphCacheKey, provider: &dyn GlyphProvider) -> &GlyphImage {
+		let position = self.resolve(key, provider);
+		&self.entries[position].1
+	}
+
+	/// The same form as a reference the caller keeps: what `prepare` holds a placed glyph's form by.
+	pub(crate) fn shared(&mut self, key: &GlyphCacheKey, provider: &dyn GlyphProvider) -> Arc<GlyphImage> {
+		let position = self.resolve(key, provider);
+		self.entries[position].1.clone()
+	}
+
+	/// Where the entry for a key is, decoding it through the provider on a miss.
+	fn resolve(&mut self, key: &GlyphCacheKey, provider: &dyn GlyphProvider) -> usize {
 		if let Some(position) = self.entries.iter().position(|(cached, _)| cached == key) {
-			return &self.entries[position].1;
+			return position;
 		}
 		let image = provider.glyph(key);
 		let cost = image.bytes();
@@ -147,8 +166,8 @@ impl GlyphRaster {
 			self.bytes = self.bytes.saturating_sub(evicted.bytes());
 		}
 		self.bytes += cost;
-		self.entries.push((*key, image));
-		&self.entries[self.entries.len() - 1].1
+		self.entries.push((*key, Arc::new(image)));
+		self.entries.len() - 1
 	}
 }
 
