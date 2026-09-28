@@ -43,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_IDLE_INFO, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PERF_CONTROL, SYS_PERF_RECORD, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_IDLE_INFO, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_PROPERTIES, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PERF_CONTROL, SYS_PERF_RECORD, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -611,6 +611,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_MEMMAP_GET => sys_memmap_get(a0, a1, a2),
 		SYS_IRQ_INFO => sys_irq_info(a0, a1, a2),
 		SYS_CPU_IDLE_INFO => sys_cpu_idle_info(a0, a1, a2),
+		SYS_DEVICE_PROPERTIES => sys_device_properties(a0, a1, a2),
 		SYS_PCI_INFO => sys_pci_info(a0, a1, a2),
 		SYS_CHANNEL_PEEK => sys_channel_peek(a0),
 		SYS_ABI_CHECK => sys_abi_check(a0),
@@ -1252,7 +1253,7 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, transport: d.transport, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad0: 0, _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports });
+	let info = device::info(index as usize);
 	match info {
 		Some(info) => {
 			if let Err(e) = write_user(buf_ptr, info) {
@@ -1644,25 +1645,12 @@ fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 // the caller's table. A driver waits on the handle; the kernel marks it pending
 // and wakes the driver when the vector fires. ERR_INVALID for a non-bindable
 // vector, ERR_RESOURCE_EXHAUSTED if the vector is already bound.
-fn sys_interrupt_bind(vector: u64, privilege: u64) -> i64 {
-	// And a legacy interrupt line, for the same reason.
-	if let Err(error) = holds_privilege(privilege, PrivilegeKind::DeviceManager) {
-		return error;
-	}
-	let thread = current_thread!();
-	// The bound is the identifier's width, and the backend decides what is bindable inside it -
-	// a byte was the x86 IDT's limit standing in for every architecture's (KERN-ARCH-017).
-	if vector > u32::MAX as u64 || !arch::interrupts::is_bindable(vector as u32) {
-		return ERR_INVALID;
-	}
-	let v = vector as u32;
-	let Some(interrupt) = Interrupt::new(v) else { return ERR_RESOURCE_EXHAUSTED };
-	if !arch::interrupts::bind(v, &interrupt) {
-		return ERR_RESOURCE_EXHAUSTED;
-	}
-	// On a failed install the Interrupt is dropped here, and its Drop unbinds the
-	// vector, so no explicit rollback is needed.
-	install_object(&thread, interrupt, Rights::ALL)
+// RETIRED. It bound a bare legacy vector for whoever held the DeviceManager privilege, with no claim behind it
+// - so nothing revoked the binding when a driver went, and nothing said which device the line belonged to. A
+// wired line is a platform row's resource now, minted from its claim (`RESOURCE_KIND_LINE`), and nothing in
+// userspace ever called this. The number stays taken; the call answers that it is not supported.
+fn sys_interrupt_bind(_vector: u64, _privilege: u64) -> i64 {
+	ERR_UNSUPPORTED
 }
 
 // Acquire an MSI-X Interrupt for the discovered device at `index`: allocate a
@@ -1920,11 +1908,14 @@ fn port_refusal(refusal: crate::object::port_range::grants::Refusal) -> i64 {
 // ONE RESOURCE OF A CLAIMED ROW, BY KIND AND INDEX - see the ABI's note. The claim is the authority and it
 // names the row; the index names the resource on it, never an address.
 fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 {
+	match kind {
+		abi::RESOURCE_KIND_PORT_RANGE => {}
+		abi::RESOURCE_KIND_MMIO => return platform_mmio_acquire(claim_handle, which),
+		abi::RESOURCE_KIND_LINE => return platform_line_acquire(claim_handle, which),
+		_ => return ERR_INVALID,
+	}
 	if !arch::ioports::supported() {
 		return ERR_UNSUPPORTED;
-	}
-	if kind != abi::RESOURCE_KIND_PORT_RANGE {
-		return ERR_INVALID;
 	}
 	let thread = current_thread!();
 	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
@@ -1957,6 +1948,93 @@ fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 
 		return ERR_ACCESS_DENIED;
 	}
 	thread.handles().lock().insert_reserved(Capability::new(range, Rights::MAP | Rights::TRANSFER)).raw() as i64
+}
+
+// ONE MORE MMIO RANGE OF A CLAIMED PLATFORM ROW, as a `DeviceMemory` derived from the claim - range 0 is the
+// claim's own memory, so `which` counts from 1. The same rights and the same publication order as the claim's
+// own mint: registered as derived before the handle exists, so the release revokes it.
+fn platform_mmio_acquire(claim_handle: u64, which: u64) -> i64 {
+	let thread = current_thread!();
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let key = claim.key();
+	let Some((base, len)) = device::platform_mmio(key.device_index as usize, which) else { return ERR_INVALID };
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	let Some(memory) = DeviceMemory::for_claim(key, base, len as usize) else {
+		thread.handles().lock().release_reservation(1);
+		return ERR_RESOURCE_EXHAUSTED;
+	};
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
+	thread.handles().lock().insert_reserved(Capability::new(memory as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)).raw() as i64
+}
+
+// ONE WIRED LINE OF A CLAIMED PLATFORM ROW, as an `Interrupt` bound to it on its controller - configured, routed
+// to the boot core and enabled - and derived from the claim, so the release masks the line and gives its vector
+// back. A line the architecture refuses is said, with the row and the reason.
+fn platform_line_acquire(claim_handle: u64, which: u64) -> i64 {
+	let thread = current_thread!();
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let key = claim.key();
+	let Some(line) = device::platform_line(key.device_index as usize, which) else { return ERR_INVALID };
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	let interrupt = match arch::interrupts::bind_wired(&line) {
+		Ok(interrupt) => interrupt,
+		Err(why) => {
+			crate::serial_println!("device: line {which} of row {} is not bound - {why}", key.device_index);
+			thread.handles().lock().release_reservation(1);
+			return ERR_RESOURCE_EXHAUSTED;
+		}
+	};
+	// DERIVED BEFORE THE HANDLE EXISTS; a claim that ended meanwhile drops the Interrupt, whose `Drop` masks
+	// the line and gives the vector back.
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
+	thread.handles().lock().insert_reserved(Capability::new(interrupt as alloc::sync::Arc<dyn KernelObject>, Rights::ALL)).raw() as i64
+}
+
+// A CLAIMED PLATFORM ROW'S PROPERTY BLOCK, copied into the caller's buffer as far as it fits; its whole length,
+// or ERR_UNSUPPORTED for a row that has none. The claim is the authority: its holder is the device's driver.
+fn sys_device_properties(claim_handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::READ) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let len = (buf_len as usize).min(abi::MAX_DEVICE_PROPERTIES);
+	if len != 0 && !user_buf_ok(buf_ptr, len as u64) {
+		return ERR_INVALID;
+	}
+	let mut block = alloc::vec![0u8; len];
+	let Some(total) = device::properties(claim.key().device_index as usize, &mut block) else { return ERR_UNSUPPORTED };
+	let copied = total.min(len);
+	if copied != 0
+		&& let Err(error) = copy_to_user_exact(buf_ptr, block.as_ptr(), copied)
+	{
+		return error;
+	}
+	total as i64
 }
 
 // MAP A PORT RANGE INTO THE CALLER'S PROCESS: its threads may use those ports from their next access.
@@ -2035,6 +2113,9 @@ fn sys_interrupt_ack(handle: u64) -> i64 {
 	};
 	interrupt.clear();
 	arch::interrupts::eoi(interrupt.vector());
+	// A LEVEL LINE WAS MASKED WHEN IT FIRED, so its source - still asserted until the driver ran - could not
+	// re-fire in the meantime; the driver saying it is done is what unmasks it.
+	arch::interrupts::acknowledge(interrupt.vector());
 	0
 }
 

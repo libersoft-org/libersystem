@@ -38,6 +38,7 @@ fn v3() -> bool {
 
 const GICD_CTLR: usize = 0x000; // distributor control
 const GICD_ISENABLER: usize = 0x100; // set-enable (1 bit per INTID)
+const GICD_ICENABLER: usize = 0x180; // clear-enable (1 bit per INTID)
 const GICD_IPRIORITYR: usize = 0x400; // priority (1 byte per INTID)
 const GICD_ITARGETSR: usize = 0x800; // CPU targets (1 byte per INTID, SPIs only)
 const GICD_ICFGR: usize = 0xc00; // trigger config (2 bits per INTID)
@@ -424,7 +425,8 @@ pub fn handle_irq(from_user: bool) {
 		// function in this binary rather than a bound driver - so it is offered here before the MSI
 		// registry, which would find no slot for it and report nothing. The two windows cannot
 		// overlap: an SPI the registry hands out is one this kernel allocated for a device.
-		if !super::interrupts::dispatch_wired(intid) {
+		// THEN A CLAIMED PLATFORM LINE, whose driver is woken and - a level line - held off until it answers.
+		if !super::interrupts::dispatch_wired(intid) && !super::interrupts::signal_line(intid) {
 			// A device MSI - a GICv2m SPI or an ITS LPI: wake the bound userspace driver, if any.
 			super::interrupts::dispatch_msi(intid);
 		}
@@ -507,11 +509,8 @@ pub fn enable_msi_spi(spi: u32) {
 pub enum Trigger {
 	/// A GICv2m MSI: the device WRITES, and there is nothing left asserted afterwards.
 	Edge,
-	/// A PCI INTx line or a UART's: the device holds it asserted until something tells it to stop.
-	///
-	/// `not(test)` for the reason the whole arming pass is: the only sources this kernel configures
-	/// as level are a hot-plug slot's INTx and the console UART's line, and a test build arms neither.
-	#[cfg(not(test))]
+	/// A PCI INTx line, a UART's, or a claimed platform device's level line: the device holds it
+	/// asserted until something tells it to stop.
 	Level,
 }
 
@@ -556,6 +555,21 @@ pub fn enable_spi(spi: u32, trigger: Trigger) {
 		core::ptr::write_volatile(icfgr, cfg);
 		// Enable the SPI.
 		core::ptr::write_volatile(gicd(GICD_ISENABLER + (spi / 32) * 4), 1 << (spi % 32));
+	}
+}
+
+// STOP A SHARED PERIPHERAL INTERRUPT BEING DELIVERED, leaving its configuration: how a claimed level line is
+// held off between firing and its driver's acknowledgement, and how a released one is silenced.
+pub fn disable_spi(intid: u32) {
+	if (32..1020).contains(&intid) {
+		unsafe { core::ptr::write_volatile(gicd(GICD_ICENABLER + (intid as usize / 32) * 4), 1 << (intid % 32)) };
+	}
+}
+
+// And let it be delivered again, as it was configured: the driver has acknowledged its level line.
+pub fn unmask_spi(intid: u32) {
+	if (32..1020).contains(&intid) {
+		unsafe { core::ptr::write_volatile(gicd(GICD_ISENABLER + (intid as usize / 32) * 4), 1 << (intid % 32)) };
 	}
 }
 

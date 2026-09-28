@@ -1587,8 +1587,8 @@ fn every_predicate_a_rule_states_has_to_hold() {
 	// THE CONJUNCTION, one predicate at a time. A matcher that stopped checking any one of these
 	// would bind a driver to a function it was not written for, and each is asserted by making the
 	// function differ in that field ALONE.
-	let rule = Match { transport: Some(VIRTIO_PCI), virtio_type: Some(2), class: Some(0x01), subclass: Some(0x08), prog_if: Some(0x02), vendor: Some(0x1af4), product: Some(0x1042), address: Some((0, 4, 0)) };
-	let exact = Discovered { transport: VIRTIO_PCI, virtio_type: 2, class: 0x01, subclass: 0x08, prog_if: 0x02, vendor: 0x1af4, product: 0x1042, bus: 0, dev: 4, func: 0 };
+	let rule = Match { transport: Some(VIRTIO_PCI), virtio_type: Some(2), class: Some(0x01), subclass: Some(0x08), prog_if: Some(0x02), vendor: Some(0x1af4), product: Some(0x1042), address: Some((0, 4, 0)), platform: None };
+	let exact = Discovered { transport: VIRTIO_PCI, virtio_type: 2, class: 0x01, subclass: 0x08, prog_if: 0x02, vendor: 0x1af4, product: 0x1042, bus: 0, dev: 4, func: 0, ..Discovered::default() };
 	assert!(rule.matches(&exact), "the function the rule describes matches it");
 
 	assert!(!rule.matches(&Discovered { transport: PLAIN_PCI, ..exact }), "transport");
@@ -1606,7 +1606,7 @@ fn a_predicate_a_rule_does_not_state_is_not_asked() {
 	// `None` is "do not ask", not "must be absent" - a generic rule matching on class alone has to
 	// match a function that also carries a vendor and a product, or no generic rule ever binds.
 	let generic = Match { class: Some(0x0c), subclass: Some(0x03), prog_if: Some(0x30), ..Match::default() };
-	let xhci = Discovered { transport: PLAIN_PCI, virtio_type: 0, class: 0x0c, subclass: 0x03, prog_if: 0x30, vendor: 0x8086, product: 0x1e31, bus: 0, dev: 20, func: 0 };
+	let xhci = Discovered { transport: PLAIN_PCI, virtio_type: 0, class: 0x0c, subclass: 0x03, prog_if: 0x30, vendor: 0x8086, product: 0x1e31, bus: 0, dev: 20, func: 0, ..Discovered::default() };
 	assert!(generic.matches(&xhci), "a rule that names only the standards identity matches by it");
 
 	// And a rule that states NOTHING matches everything, which is why `system-manifest` refuses one.
@@ -2001,4 +2001,30 @@ fn a_bus_provider_is_reached_only_through_counted_scoped_connections() {
 	// EVERY OTHER KIND keeps its offered endpoint, is opened by the catalogue, and is never minted scoped.
 	assert!(!scoped_only(BLOCK) && keeps_offered_endpoint(BLOCK) && openable(BLOCK));
 	assert!(!admits_scoped(BLOCK, 0, 4));
+}
+
+// A PLATFORM DEVICE IS MATCHED BY ANY ID IT ANSWERS TO, and by nothing PCI: a node's `compatible` list is
+// a list of names for one device, and a merged row carries a table's signature beside a namespace node's
+// hardware id.
+#[test]
+fn a_platform_rule_matches_any_id_the_device_answers_to_and_its_kind_counts() {
+	let mut tpm = Discovered { transport: TRANSPORT_PLATFORM, ..Discovered::default() };
+	tpm.add_platform_id(PLATFORM_ID_TABLE, b"TPM2");
+	tpm.add_platform_id(PLATFORM_ID_HID, b"MSFT0101");
+	let by_table = Match { transport: Some(TRANSPORT_PLATFORM), platform: PlatformId::new(PLATFORM_ID_TABLE, b"TPM2"), ..Match::default() };
+	let by_hid = Match { transport: Some(TRANSPORT_PLATFORM), platform: PlatformId::new(PLATFORM_ID_HID, b"MSFT0101"), ..Match::default() };
+	assert!(by_table.matches(&tpm) && by_hid.matches(&tpm), "either of the ids the merged row carries");
+	let same_text_other_kind = Match { transport: Some(TRANSPORT_PLATFORM), platform: PlatformId::new(PLATFORM_ID_CID, b"MSFT0101"), ..Match::default() };
+	assert!(!same_text_other_kind.matches(&tpm), "a hardware id is not a compatible id with the same spelling");
+	let mut node = Discovered { transport: TRANSPORT_PLATFORM, ..Discovered::default() };
+	node.add_platform_id(PLATFORM_ID_COMPATIBLE, b"tcg,tpm-tis-mmio");
+	node.add_platform_id(PLATFORM_ID_COMPATIBLE, b"tcg,tpm_tis");
+	let second = Match { transport: Some(TRANSPORT_PLATFORM), platform: PlatformId::new(PLATFORM_ID_COMPATIBLE, b"tcg,tpm_tis"), ..Match::default() };
+	assert!(second.matches(&node), "the second string of a compatible list is still the device's");
+	// And a platform rule never matches a PCI function, whatever its numbers.
+	let pci = Discovered { transport: VIRTIO_PCI, virtio_type: 2, ..Discovered::default() };
+	assert!(!by_table.matches(&pci));
+	// The const form a generated registry uses is the same id.
+	assert_eq!(PlatformId::from_bytes(PLATFORM_ID_TABLE, b"TPM2"), PlatformId::new(PLATFORM_ID_TABLE, b"TPM2").unwrap());
+	assert_eq!(PlatformId::new(PLATFORM_ID_HID, &[b'x'; 47]), None, "past the bound");
 }

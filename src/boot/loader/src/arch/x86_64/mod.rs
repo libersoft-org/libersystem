@@ -240,6 +240,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		let (dma_mode, dma_provenance) = crate::dma_mode::handoff_words();
 		(*boot_info).dma_mode = dma_mode;
 		(*boot_info).dma_provenance = dma_provenance;
+		(*boot_info).smbios = crate::smbios_entry();
 	}
 
 	// Snapshot the memory map and exit boot services. GetMemoryMap must be the

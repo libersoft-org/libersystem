@@ -251,4 +251,11 @@ pub struct BootInfo {
 	// which is why `VERSION` is 3.
 	pub dma_mode: u32,
 	pub dma_provenance: u32,
+
+	// THE FIRMWARE'S SMBIOS ENTRY POINT, physical: SMBIOS 3.x's 64-bit entry point where the firmware
+	// publishes one, else 2.x's, and zero when it publishes neither - as on a direct device-tree boot,
+	// which has no firmware to ask. The kernel reads the entry point and the structure table it names
+	// with a bounded parser and names the system on the boot log. Appended, and `VERSION` is unchanged:
+	// nothing is versioned before the first release, and a loader and a kernel are built together.
+	pub smbios: u64,
 }

@@ -12,7 +12,7 @@ use bootproto::dma_mode::{Handoff, Mode};
 
 // The device the synthetic table rows are declared for - see `device::add_synthetic_device`.
 fn synthetic_device(dev: u8) -> driver_binding::Discovered {
-	driver_binding::Discovered { transport: abi::TRANSPORT_PLAIN_PCI, virtio_type: u16::MAX as u32, class: 0xff, subclass: 0xff, prog_if: 0xff, vendor: 0xffff, product: 0xffff, bus: 0xff, dev, func: 0 }
+	driver_binding::Discovered { transport: abi::TRANSPORT_PLAIN_PCI, virtio_type: u16::MAX as u32, class: 0xff, subclass: 0xff, prog_if: 0xff, vendor: 0xffff, product: 0xffff, bus: 0xff, dev, func: 0, ..driver_binding::Discovered::default() }
 }
 
 // What the machine was before a test stated its own, so it can be put back.
@@ -117,7 +117,7 @@ fn an_unknown_or_mismatched_entry_is_refused_by_name_whatever_the_mode() {
 	// says virtio-pci type 2, and the synthetic device is neither. The kernel refuses the selection
 	// by name rather than trusting that the manager matched.
 	assert_eq!(verdict(b"virtio_blk", &device), Err(Refusal::EntryDoesNotMatchDevice));
-	let blk = driver_binding::Discovered { transport: abi::TRANSPORT_VIRTIO_PCI, virtio_type: abi::VIRTIO_TYPE_BLOCK, class: 1, subclass: 0, prog_if: 0, vendor: 0x1af4, product: 0x1042, bus: 0, dev: 3, func: 0 };
+	let blk = driver_binding::Discovered { transport: abi::TRANSPORT_VIRTIO_PCI, virtio_type: abi::VIRTIO_TYPE_BLOCK, class: 1, subclass: 0, prog_if: 0, vendor: 0x1af4, product: 0x1042, bus: 0, dev: 3, func: 0, ..driver_binding::Discovered::default() };
 	assert_eq!(verdict(b"virtio_blk", &blk), Ok(Admission::Translated), "and the same entry admits the device it is declared for");
 	assert_eq!(verdict(TRUSTED, &blk), Err(Refusal::EntryDoesNotMatchDevice), "while the synthetic entry is not declared for a real disk");
 	// THE IDENTITY CHECK COMES FIRST. A mode that would refuse everything still answers "unknown

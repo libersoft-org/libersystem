@@ -73,6 +73,7 @@ pub fn device_tree() -> Option<fdt::Fdt> {
 	unsafe { dtb::located(hint) }
 }
 
+pub mod platform;
 pub mod serial;
 pub mod traps;
 pub mod usercopy;

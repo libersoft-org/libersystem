@@ -35,10 +35,15 @@ acpi = { path = "../acpi" }
 # the line form the drain writes are what a collector on the host depends on, so they are host-tested
 # there and the kernel only gives the buffer its storage and its hooks.
 perfbuf = { path = "../perfbuf" }
-# THE TPM 2.0 TRANSPORTS AND OPERATIONS, for the in-guest fixture test only: the one oracle that drives the
-# library's FIFO and CRB state machines over QEMU's real front-ends, with swtpm behind them. The shipping kernel
-# calls none of it - no binding exists for a TPM until the firmware-node identity does.
+# THE TPM 2.0 TRANSPORTS AND OPERATIONS: the `TPM2` table's reader, which publishes the TPM's row, and for the
+# in-guest fixture test the library's FIFO and CRB state machines over QEMU's real front-ends, with swtpm
+# behind them.
 tpm = { path = "../tpm" }
+# WHERE A FIRMWARE DESCRIPTION OF A PLATFORM DEVICE GOES in the device table - a row of its own, the row
+# already carrying its identity, merged, or refused - host-tested as pure functions, and the bounded reader
+# of the firmware's SMBIOS tables the boot names the system with.
+platform = { path = "../platform" }
+smbios = { path = "../smbios" }
 # THE BINDING MATCHER, so the kernel validates a claim's registry entry against the concrete device
 # with the SAME host-tested predicate DeviceManager selects with. A second copy of the rule here is
 # a second thing to keep in step, and the one that is not tested is the one that drifts.

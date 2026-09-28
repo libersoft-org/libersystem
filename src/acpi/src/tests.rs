@@ -695,3 +695,103 @@ fn a_system_io_address_that_does_not_fit_a_port_is_refused() {
 	assert_eq!(event.io_port(), None);
 	assert_eq!(event.enable_port(), None);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The static tables step 1 of the platform identity reads: every I/O APIC, and the descriptions of
+// devices - SPCR, DBG2, HPET, WDAT - and the boot logo's BGRT.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn every_io_apic_is_listed_with_its_own_base_and_range() {
+	// Two controllers, the second answering from GSI 24, with a local APIC and an override between them.
+	let bytes = MadtBuilder::new().local_apic(0).raw(1, 12, &[0, 0, 0x00, 0x00, 0xc0, 0xfe, 0, 0, 0, 0]).isa_override(0, 2, 0).raw(1, 12, &[1, 0, 0x00, 0x10, 0xc0, 0xfe, 24, 0, 0, 0]).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	let found: Vec<IoApic> = madt.io_apics().collect();
+	assert_eq!(found, vec![IoApic { id: 0, address: 0xfec0_0000, gsi_base: 0 }, IoApic { id: 1, address: 0xfec0_1000, gsi_base: 24 }]);
+	// One declaring fewer bytes than its fields is stepped over, not read into its neighbour.
+	let short = MadtBuilder::new().raw(1, 8, &[2, 0, 0, 0, 0xc0, 0xfe]).raw(1, 12, &[3, 0, 0, 0x20, 0xc0, 0xfe, 48, 0, 0, 0]).finish();
+	let found: Vec<IoApic> = Madt::new(&short).expect("a MADT").io_apics().collect();
+	assert_eq!(found, vec![IoApic { id: 3, address: 0xfec0_2000, gsi_base: 48 }]);
+}
+
+#[test]
+fn spcr_names_its_uart_and_its_interrupt() {
+	let bytes = Builder::new(b"SPCR", 2, 80).u8(36, 0).gas(40, 1, 8, 0, 1, 0x3f8).u8(52, 0b11).u8(53, 4).u32(54, 4).finish();
+	let spcr = Spcr::new(&bytes).expect("an SPCR");
+	assert_eq!((spcr.interface, spcr.base.space, spcr.base.address, spcr.irq, spcr.gsi), (0, AddressSpace::SystemIo, 0x3f8, 4, 4));
+	let truncated = Builder::new(b"SPCR", 2, 48).finish();
+	assert_eq!(Spcr::new(&truncated), Err(Error::TooShort));
+}
+
+// One DBG2 device information structure: a single register at `base`, `name` in the namespace.
+fn dbg2(devices: &[(u16, u16, u8, u64, &[u8])]) -> Vec<u8> {
+	let mut body: Vec<u8> = Vec::new();
+	for &(port_type, subtype, space, base, name) in devices {
+		let name_len = name.len() + 1;
+		let length = 22 + GAS_LEN + 4 + name_len;
+		let start = body.len();
+		body.resize(start + length, 0);
+		let s = &mut body[start..];
+		s[0] = 0;
+		s[1..3].copy_from_slice(&(length as u16).to_le_bytes());
+		s[3] = 1;
+		s[4..6].copy_from_slice(&(name_len as u16).to_le_bytes());
+		s[6..8].copy_from_slice(&((22 + GAS_LEN + 4) as u16).to_le_bytes());
+		s[12..14].copy_from_slice(&port_type.to_le_bytes());
+		s[14..16].copy_from_slice(&subtype.to_le_bytes());
+		s[18..20].copy_from_slice(&22u16.to_le_bytes());
+		s[20..22].copy_from_slice(&((22 + GAS_LEN) as u16).to_le_bytes());
+		s[22] = space;
+		s[23] = 8;
+		s[25] = 1;
+		s[26..34].copy_from_slice(&base.to_le_bytes());
+		s[34..38].copy_from_slice(&0x1000u32.to_le_bytes());
+		s[38..38 + name.len()].copy_from_slice(name);
+	}
+	let mut builder = Builder::new(b"DBG2", 0, 44 + body.len()).u32(36, 44).u32(40, devices.len() as u32);
+	builder.bytes[44..].copy_from_slice(&body);
+	builder.finish()
+}
+
+#[test]
+fn dbg2_lists_each_debug_port_with_its_register_and_namespace_path() {
+	let bytes = dbg2(&[(DBG2_TYPE_SERIAL, 3, 0, 0x0900_0000, b"\\_SB.COM0"), (DBG2_TYPE_SERIAL, 0, 1, 0x2f8, b".")]);
+	let mut seen = Vec::new();
+	dbg2_devices(&bytes, |device| seen.push((device.port_type, device.port_subtype, device.base.address, device.size, device.namespace.to_vec()))).expect("a DBG2");
+	assert_eq!(seen, vec![(DBG2_TYPE_SERIAL, 3, 0x0900_0000, 0x1000, b"\\_SB.COM0".to_vec()), (DBG2_TYPE_SERIAL, 0, 0x2f8, 0x1000, Vec::new())]);
+	// A structure whose own length does not cover its namespace string is skipped, and the walk goes on.
+	let mut broken = dbg2(&[(DBG2_TYPE_SERIAL, 3, 0, 0x0900_0000, b"\\_SB.COM0"), (DBG2_TYPE_SERIAL, 0, 1, 0x2f8, b".")]);
+	broken[44 + 4] = 200;
+	let fixed = Builder { bytes: broken }.finish();
+	let mut seen = Vec::new();
+	dbg2_devices(&fixed, |device| seen.push(device.base.address)).expect("a DBG2");
+	assert_eq!(seen, vec![0x2f8]);
+}
+
+#[test]
+fn hpet_names_its_register_window() {
+	let bytes = Builder::new(b"HPET", 1, 56).u32(36, 0x8086_a201).gas(40, 0, 64, 0, 0, 0xfed0_0000).u8(52, 0).finish();
+	let hpet = Hpet::new(&bytes).expect("an HPET");
+	assert_eq!((hpet.base.space, hpet.base.address, hpet.number), (AddressSpace::SystemMemory, 0xfed0_0000, 0));
+}
+
+#[test]
+fn wdat_lists_its_instructions_and_stops_at_what_fits() {
+	let mut builder = Builder::new(b"WDAT", 1, 68 + 2 * 24).u32(48, 1000).u32(52, 0x3ff).u32(56, 2).u8(60, 0x81).u32(64, 3);
+	// Two entries fit; the table declares three.
+	builder = builder.u8(68, 1).u8(69, 0x82).gas(72, 1, 16, 0, 2, 0x0660).u32(84, 0).u32(88, 0x3ff);
+	builder = builder.u8(92, 9).u8(93, 0x83).gas(96, 0, 32, 0, 3, 0xfed1_f410).u32(108, 0x20).u32(112, 0x20);
+	let bytes = builder.finish();
+	let wdat = Wdat::new(&bytes).expect("a WDAT");
+	assert_eq!((wdat.timer_period_ms, wdat.maximum_count, wdat.minimum_count, wdat.flags, wdat.instructions), (1000, 0x3ff, 2, 0x81, 3));
+	let mut seen = Vec::new();
+	wdat_instructions(&bytes, |entry| seen.push(entry.map(|entry| (entry.action, entry.register.space, entry.register.address)))).expect("a WDAT");
+	assert_eq!(seen, vec![Ok((1, AddressSpace::SystemIo, 0x0660)), Ok((9, AddressSpace::SystemMemory, 0xfed1_f410))], "the third declared entry is not in the table");
+}
+
+#[test]
+fn bgrt_says_where_the_boot_logo_is() {
+	let bytes = Builder::new(b"BGRT", 1, 56).u16(36, 1).u8(38, 1).u8(39, 0).u64(40, 0x7e00_0000).u32(48, 400).u32(52, 300).finish();
+	let bgrt = Bgrt::new(&bytes).expect("a BGRT");
+	assert_eq!((bgrt.status, bgrt.image_address, bgrt.x, bgrt.y), (1, 0x7e00_0000, 400, 300));
+}

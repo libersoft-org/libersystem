@@ -7,6 +7,10 @@
 // The handler table is lock-free (an array of atomics): registration only stores
 // a function pointer, and dispatch only loads one, so it is safe to call from
 // interrupt context without risking a deadlock against a held lock.
+//
+// A DRIVER'S INTERRUPT IS AN MSI OR A CLAIMED LINE. A wired line reaches a driver only as a platform row's
+// resource, minted from its claim (`bind_wired`); the bare legacy-vector binding that preceded it had no claim
+// behind it and is gone.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -42,18 +46,119 @@ pub const MSI_COUNT: usize = 192;
 // idle loop then finds the queued thread.
 pub const WAKE_VECTOR: u8 = 0xf0;
 
+// THE WIRED POOL: the vectors a claimed line above GSI 15 is given, since `IRQ_BASE + GSI` names a vector only
+// for the sixteen legacy lines. Fourteen, between the wake IPI and the spurious vector.
+pub const WIRED_BASE: u8 = 0xf1;
+pub const WIRED_COUNT: usize = 14;
+
 pub type HandlerFn = fn(u32);
 
 static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_COUNT];
 
-// Userspace-driver bindings: the Interrupt object to wake when each device vector
-// fires. Held weakly, so closing the driver's handle (its Interrupt's Drop) clears
-// the binding and the kernel stops delivering to a gone driver.
-static BOUND: [SpinLock<Option<Weak<Interrupt>>>; IRQ_COUNT] = [const { SpinLock::new(None) }; IRQ_COUNT];
-
 // MSI-X driver bindings (reserve / bind / dispatch / free bookkeeping, shared with
 // aarch64 via arch::common::msi): slot index i maps to vector MSI_BASE + i.
 static REGISTRY: MsiRegistry<MSI_COUNT> = MsiRegistry::new();
+
+// A CLAIMED WIRED LINE: the Global System Interrupt it arrives on, whether it is level-triggered, and the
+// `Interrupt` its driver waits on - held weakly, so the driver letting go (its Interrupt's `Drop`) is what
+// unbinds it. One per vector - the sixteen legacy vectors, then the wired pool.
+//
+// A SLOT IS FREE ONLY WHEN IT IS EMPTY. An `Interrupt` whose last reference is gone still holds its slot until
+// its `Drop` has run `unbind`, and a bind that took the slot in between would have that `unbind` mask and empty
+// the replacement's line.
+struct Line {
+	gsi: u32,
+	level: bool,
+	intr: Weak<Interrupt>,
+}
+
+static LINES: [SpinLock<Option<Line>>; IRQ_COUNT + WIRED_COUNT] = [const { SpinLock::new(None) }; IRQ_COUNT + WIRED_COUNT];
+
+// Binds one at a time, so two cannot choose the same free vector.
+static BINDING: SpinLock<()> = SpinLock::new(());
+
+// The `LINES` slot a vector names: the legacy window first, then the wired pool.
+fn line_slot(vector: u32) -> Option<usize> {
+	if vector >= IRQ_BASE as u32 && vector < IRQ_BASE as u32 + IRQ_COUNT as u32 {
+		return Some((vector - IRQ_BASE as u32) as usize);
+	}
+	if vector >= WIRED_BASE as u32 && vector < WIRED_BASE as u32 + WIRED_COUNT as u32 {
+		return Some(IRQ_COUNT + (vector - WIRED_BASE as u32) as usize);
+	}
+	None
+}
+
+// BIND A PLATFORM ROW'S WIRED LINE to a new `Interrupt`: a GSI of 15 or below at `IRQ_BASE + GSI`, one above
+// it at a vector of the wired pool, routed to the boot core with the row's trigger and polarity and unmasked.
+// Refused, in words: a line of another controller, a GSI no I/O APIC answers for, a legacy line the kernel
+// answers itself, one another claim holds, or a full pool.
+pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str> {
+	if line.controller != abi::LINE_CONTROLLER_IOAPIC {
+		return Err("its line is not an I/O APIC's");
+	}
+	let gsi = line.number;
+	if !super::ioapic::handles(gsi) {
+		return Err("no I/O APIC answers for its Global System Interrupt");
+	}
+	let _binding = BINDING.lock();
+	// ONE CLAIM PER LINE: a second claim on a held line - level or edge - is refused by name, since a shared
+	// level line masked by one driver's interrupt would starve the other's.
+	if LINES.iter().any(|slot| slot.lock().as_ref().is_some_and(|held| held.gsi == gsi)) {
+		return Err("another claim holds that line");
+	}
+	let vector: u8 = if gsi < IRQ_COUNT as u32 {
+		let vector = IRQ_BASE + gsi as u8;
+		// THE KERNEL'S OWN LEGACY LINES ARE NOT A CLAIM'S: the timer's dedicated gate, and any vector a kernel
+		// handler answers (the console UART, the SCI, a hot-plug slot).
+		if vector == TIMER_VECTOR || HANDLERS[gsi as usize].load(Ordering::SeqCst) != 0 {
+			return Err("the kernel answers that legacy line itself");
+		}
+		vector
+	} else {
+		let Some(free) = (0..WIRED_COUNT).find(|&at| LINES[IRQ_COUNT + at].lock().is_none()) else {
+			return Err("the wired vector pool is exhausted");
+		};
+		WIRED_BASE + free as u8
+	};
+	let Some(intr) = Interrupt::new(vector as u32) else { return Err("the Interrupt object could not be allocated") };
+	let Some(slot) = line_slot(vector as u32) else { return Err("the vector is outside the wired windows") };
+	let level = line.trigger == abi::LINE_TRIGGER_LEVEL;
+	*LINES[slot].lock() = Some(Line { gsi, level, intr: Arc::downgrade(&intr) });
+	intr.mark_bound();
+	if !super::ioapic::route_line(gsi, vector, crate::smp::lapic_id(0), level, line.polarity == abi::LINE_POLARITY_LOW) {
+		*LINES[slot].lock() = None;
+		let _ = intr.disown();
+		return Err("its redirection entry could not be written");
+	}
+	Ok(intr)
+}
+
+// A CLAIMED LINE FIRED: its `Interrupt` is signalled, and a LEVEL line is masked at its I/O APIC before the
+// end of interrupt - its source stays asserted until the driver has run, and an unmasked level line would
+// re-fire for as long as that takes. The driver's acknowledgement unmasks it. False when no claim holds it.
+fn signal_line(vector: u32) -> bool {
+	let Some(slot) = line_slot(vector) else { return false };
+	let held = LINES[slot].lock();
+	let Some(line) = held.as_ref() else { return false };
+	if line.level {
+		super::ioapic::mask(line.gsi);
+	}
+	if let Some(intr) = line.intr.upgrade() {
+		intr.signal();
+	}
+	true
+}
+
+// THE DRIVER ACKNOWLEDGED: a level line masked when it fired is unmasked. Nothing for an edge line, an MSI or
+// a vector no claim holds.
+pub fn acknowledge(vector: u32) {
+	let Some(slot) = line_slot(vector) else { return };
+	if let Some(line) = LINES[slot].lock().as_ref()
+		&& line.level
+	{
+		super::ioapic::unmask(line.gsi);
+	}
+}
 
 // Kernel virtual base for mapping device MSI-X tables (uncacheable), clear of the
 // LAPIC (0xffff_f100) / IOAPIC (0xffff_f200) MMIO windows. TWO pages per MSI slot (see
@@ -95,28 +200,6 @@ fn is_msi(vector: u32) -> bool {
 	vector >= MSI_BASE as u32 && (vector as usize) < MSI_BASE as usize + MSI_COUNT
 }
 
-// Whether `vector` is a device-IRQ vector a driver may bind. The timer vector
-// (IRQ_BASE) is the kernel's own and is never handed out.
-pub fn is_bindable(vector: u32) -> bool {
-	vector > IRQ_BASE as u32 && vector < IRQ_BASE as u32 + IRQ_COUNT as u32
-}
-
-// Bind `intr` to `vector` so the dispatch path wakes it when the vector fires.
-// Returns false if the vector is already bound to a live Interrupt.
-pub fn bind(vector: u32, intr: &Arc<Interrupt>) -> bool {
-	if !is_bindable(vector) {
-		return false;
-	}
-	let index = (vector - IRQ_BASE as u32) as usize;
-	let mut slot = BOUND[index].lock();
-	if slot.as_ref().and_then(Weak::upgrade).is_some() {
-		return false;
-	}
-	*slot = Some(Arc::downgrade(intr));
-	intr.mark_bound();
-	true
-}
-
 // Remove any binding for `vector` (called from an Interrupt's Drop).
 // Returns whether the teardown CONFIRMED, which on this port it always does: masking an MSI-X table
 // entry and freeing the slot are local writes with no remote agreement to wait for. riscv64 is the
@@ -142,9 +225,13 @@ pub fn unbind(vector: u32) -> bool {
 		REGISTRY.retire(slot);
 		return true;
 	}
-	let index = vector.wrapping_sub(IRQ_BASE as u32) as usize;
-	if index < IRQ_COUNT {
-		*BOUND[index].lock() = None;
+	// A CLAIMED WIRED LINE: masked at its controller, and only then its vector given back.
+	if let Some(slot) = line_slot(vector) {
+		let mut held = LINES[slot].lock();
+		if let Some(line) = held.as_ref() {
+			super::ioapic::mask(line.gsi);
+		}
+		*held = None;
 	}
 	true
 }
@@ -357,17 +444,13 @@ pub fn bind_msi(vector: u32, intr: &Arc<Interrupt>) -> bool {
 // the portable SYS_INTERRUPT_ACK path (the riscv PLIC completes its level source here).
 pub fn eoi(_vector: u32) {}
 
-// Whether `vector` currently has a live driver binding. Used to confirm that a
-// crashed driver's IRQ was detached during cleanup.
+// Whether `vector` currently has a live driver binding - an MSI or a claimed line. Used to confirm that a
+// crashed driver's interrupt was detached during cleanup.
 pub fn is_bound(vector: u32) -> bool {
 	if is_msi(vector) {
 		return REGISTRY.is_bound((vector - MSI_BASE as u32) as usize);
 	}
-	let index = vector.wrapping_sub(IRQ_BASE as u32) as usize;
-	if index >= IRQ_COUNT {
-		return false;
-	}
-	BOUND[index].lock().as_ref().and_then(Weak::upgrade).is_some()
+	line_slot(vector).is_some_and(|slot| LINES[slot].lock().as_ref().is_some_and(|line| line.intr.strong_count() != 0))
 }
 
 // Register `handler` for a device-interrupt `vector` (IRQ_BASE..IRQ_BASE+IRQ_COUNT).
@@ -389,10 +472,16 @@ fn dispatch(vector: u8) {
 		let handler: HandlerFn = unsafe { core::mem::transmute::<usize, HandlerFn>(raw) };
 		handler(vector as u32);
 	}
-	// Deliver to a userspace driver bound to this vector, if any.
-	if let Some(intr) = BOUND[index].lock().as_ref().and_then(Weak::upgrade) {
-		intr.signal();
-	}
+	// Deliver to the driver whose claim holds this line, if any - a level line masked until it acknowledges.
+	signal_line(vector as u32);
+	apic::eoi();
+}
+
+// A vector of the wired pool: a claimed line above GSI 15.
+fn dispatch_wired(vector: u8) {
+	super::paging::clac_on_entry();
+	crate::idle::interrupt(crate::idle::Cause::Device(vector as u32));
+	signal_line(vector as u32);
 	apic::eoi();
 }
 
@@ -460,6 +549,23 @@ const MSI_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); MSI_COUNT] = m
 	224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239,
 ];
 
+// The wired pool's stubs, one per vector for the reason the MSI ones are.
+macro_rules! wired_stubs {
+	($($v:literal),* $(,)?) => {
+		[$({
+			extern "x86-interrupt" fn stub(_frame: InterruptStackFrame) {
+				dispatch_wired($v);
+			}
+			stub as extern "x86-interrupt" fn(InterruptStackFrame)
+		}),*]
+	};
+}
+
+#[rustfmt::skip]
+const WIRED_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); WIRED_COUNT] = wired_stubs![
+	241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254,
+];
+
 // Spurious LAPIC interrupts must not signal EOI, so they bypass the dispatcher.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
@@ -503,6 +609,10 @@ pub fn init() {
 	// MSI-X vectors get their own edge-triggered stubs in the band above the INTx window.
 	for (i, stub) in MSI_STUBS.iter().enumerate() {
 		idt::set_gate(MSI_BASE as usize + i, *stub);
+	}
+	// The wired pool, for claimed lines above GSI 15.
+	for (i, stub) in WIRED_STUBS.iter().enumerate() {
+		idt::set_gate(WIRED_BASE as usize + i, *stub);
 	}
 	// The cross-core wake IPI: delivery is the message, the handler only EOIs.
 	idt::set_gate(WAKE_VECTOR as usize, wake_ipi);

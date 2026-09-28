@@ -261,7 +261,7 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 			// A VIRTIO DEVICE CARRIES ITS STRUCTURE OFFSETS, which is what tells this transport apart
 			// from the plain-PCI ones: the driver reaches the common configuration, the notify window
 			// and the device-specific config through them rather than at the base.
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -453,7 +453,7 @@ fn virtio_vsock_driver_echoes_bytes_off_the_host() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::VIRTIO_TYPE_VSOCK {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -643,7 +643,7 @@ fn hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_HDA {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -765,7 +765,7 @@ fn sdhci_driver_serves_a_write_and_reads_it_back() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_SDHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -911,7 +911,7 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_AHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			controllers.push((info, entry.1, entry.2, i));
 		}
 	}
@@ -1069,7 +1069,7 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_NVME {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 		}
 	}
@@ -1160,7 +1160,7 @@ fn bind_xhci_controller() -> (alloc::sync::Arc<object::channel::Channel>, u64, a
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_XHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -1945,7 +1945,7 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::VIRTIO_TYPE_SOUND {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: 0x1af4, product: 0, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -4227,7 +4227,7 @@ fn bind_bus_controller(elf: &[u8], virtio_type: u32, interrupt_driven: bool, pro
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == virtio_type {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: abi::PlatformPart::default() }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}

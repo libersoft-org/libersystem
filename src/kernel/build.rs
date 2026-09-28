@@ -51,7 +51,11 @@ fn generate_dma_registry(manifest: &system_manifest::Manifest) {
 					Some(address) => format!("Some(({}, {}, {}))", address.bus, address.dev, address.func),
 					None => String::from("None"),
 				};
-				format!("driver_binding::Match {{ transport: {}, virtio_type: {}, class: {}, subclass: {}, prog_if: {}, vendor: {}, product: {}, address: {address} }}", option(rule.transport.map(u64::from)), option(rule.virtio_type.map(u64::from)), option(rule.pci_class.map(u64::from)), option(rule.pci_subclass.map(u64::from)), option(rule.pci_interface.map(u64::from)), option(rule.pci_vendor.map(u64::from)), option(rule.pci_product.map(u64::from)),)
+				let platform = match rule.platform {
+					Some(id) => format!("Some(driver_binding::PlatformId::from_bytes({}, b\"{}\"))", id.kind, id.text()),
+					None => String::from("None"),
+				};
+				format!("driver_binding::Match {{ transport: {}, virtio_type: {}, class: {}, subclass: {}, prog_if: {}, vendor: {}, product: {}, address: {address}, platform: {platform} }}", option(rule.transport.map(u64::from)), option(rule.virtio_type.map(u64::from)), option(rule.pci_class.map(u64::from)), option(rule.pci_subclass.map(u64::from)), option(rule.pci_interface.map(u64::from)), option(rule.pci_vendor.map(u64::from)), option(rule.pci_product.map(u64::from)),)
 			})
 			.collect::<Vec<_>>()
 			.join(", ");

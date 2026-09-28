@@ -65,11 +65,11 @@ const TEST_ENTRIES: [DmaEntry; 4] = [
 ];
 
 #[cfg(test)]
-const SYNTHETIC_RULE: driver_binding::Match = driver_binding::Match { transport: Some(abi::TRANSPORT_PLAIN_PCI), virtio_type: None, class: Some(0xff), subclass: None, prog_if: None, vendor: Some(0xffff), product: Some(0xffff), address: None };
+const SYNTHETIC_RULE: driver_binding::Match = driver_binding::Match { transport: Some(abi::TRANSPORT_PLAIN_PCI), virtio_type: None, class: Some(0xff), subclass: None, prog_if: None, vendor: Some(0xffff), product: Some(0xffff), address: None, platform: None };
 
 // QEMU's `edu` device: vendor 0x1234, device 0x11e8, whatever class it reports.
 #[cfg(test)]
-const EDU_RULE: driver_binding::Match = driver_binding::Match { transport: None, virtio_type: None, class: None, subclass: None, prog_if: None, vendor: Some(0x1234), product: Some(0x11e8), address: None };
+const EDU_RULE: driver_binding::Match = driver_binding::Match { transport: None, virtio_type: None, class: None, subclass: None, prog_if: None, vendor: Some(0x1234), product: Some(0x11e8), address: None, platform: None };
 
 // The 64-byte claim field for one of the synthetic entries - `synthetic-trusted` unless a test
 // names another - so a test claims the way DeviceManager does, by name.

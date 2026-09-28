@@ -61,7 +61,11 @@ fn generate_driver_registry(manifest: &Manifest) {
 					Some(address) => format!("Some(Address {{ bus: {}, dev: {}, func: {} }})", address.bus, address.dev, address.func),
 					None => String::from("None"),
 				};
-				format!("Rule {{ transport: {}, virtio_type: {}, pci_class: {}, pci_subclass: {}, pci_interface: {}, pci_vendor: {}, pci_product: {}, pci_address: {address} }}", option(rule.transport), option32(rule.virtio_type), option(rule.pci_class), option(rule.pci_subclass), option(rule.pci_interface), option16(rule.pci_vendor), option16(rule.pci_product),)
+				let platform = match rule.platform {
+					Some(id) => format!("Some(driver_binding::PlatformId::from_bytes({}, b\"{}\"))", id.kind, id.text()),
+					None => String::from("None"),
+				};
+				format!("Rule {{ transport: {}, virtio_type: {}, pci_class: {}, pci_subclass: {}, pci_interface: {}, pci_vendor: {}, pci_product: {}, pci_address: {address}, platform: {platform} }}", option(rule.transport), option32(rule.virtio_type), option(rule.pci_class), option(rule.pci_subclass), option(rule.pci_interface), option16(rule.pci_vendor), option16(rule.pci_product),)
 			})
 			.collect::<Vec<_>>()
 			.join(", ");

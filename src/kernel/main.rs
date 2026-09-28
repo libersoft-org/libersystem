@@ -54,7 +54,7 @@ use bootproto::BootInfo;
 static BOOT_INFO: AtomicPtr<BootInfo> = AtomicPtr::new(core::ptr::null_mut());
 
 // The published BootInfo. Only valid after kmain has stored the loader's pointer.
-fn boot_info() -> &'static BootInfo {
+pub(crate) fn boot_info() -> &'static BootInfo {
 	let ptr = BOOT_INFO.load(Ordering::Acquire);
 	debug_assert!(!ptr.is_null(), "boot info read before it was published");
 	unsafe { &*ptr }

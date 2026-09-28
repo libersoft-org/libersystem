@@ -551,7 +551,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
-	let (serve_root, catalogue) = (roles[0], roles[1]);
+	let (mut serve_root, catalogue) = (roles[0], roles[1]);
 	// NO PRINTER IS NOT AN ERROR. With no catalogue, or nothing published, the service serves an empty list.
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Printer).unwrap_or(0) } else { 0 };
 	let mut drawn = [0u8; 8];
@@ -577,7 +577,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let deadline = service.next_deadline().map_or(0, |deadline| deadline.max(now + 1));
 		let ready = wait_any(&waitset, deadline);
 		if ready >= 0 {
-			serve(&mut service, waitset[ready as usize], serve_root, subscription, &mut subscribed, &mut buf, &mut reply_buf);
+			serve(&mut service, waitset[ready as usize], &mut serve_root, subscription, &mut subscribed, &mut buf, &mut reply_buf);
 		}
 		service.tick();
 		service.pump();
@@ -585,7 +585,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 }
 
-fn serve(service: &mut Service, handle: u64, serve_root: u64, subscription: u64, subscribed: &mut bool, buf: &mut [u8], reply_buf: &mut [u8]) {
+fn serve(service: &mut Service, handle: u64, serve_root: &mut u64, subscription: u64, subscribed: &mut bool, buf: &mut [u8], reply_buf: &mut [u8]) {
 	if let Some(key) = service.printers.iter().find(|printer| printer.chan == handle).map(|printer| printer.key) {
 		if let Err(why) = service.on_answer(key, buf) {
 			service.lose(key, why);
@@ -647,12 +647,19 @@ fn serve(service: &mut Service, handle: u64, serve_root: u64, subscription: u64,
 		}
 		return;
 	}
-	if handle != serve_root {
+	if handle != *serve_root {
 		return;
 	}
 	let (len, handles) = match try_recv_caps(handle, buf) {
 		PolledCaps::Message { len, handles } => (len, handles),
-		PolledCaps::Empty | PolledCaps::Closed => return,
+		PolledCaps::Empty => return,
+		// A CLOSED ROOT IS NOT WAITED ON AGAIN. It stays readable for ever, so waiting on it returned at once
+		// and this loop spun a core; the clients it already minted are still served.
+		PolledCaps::Closed => {
+			close(handle);
+			*serve_root = 0;
+			return;
+		}
 	};
 	for &leftover in handles.as_slice() {
 		close(leftover);

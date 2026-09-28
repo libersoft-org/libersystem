@@ -750,3 +750,56 @@ fn the_manifests_catalogue_connections_fit_the_catalogues_client_table() {
 	}
 	fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_platform_rule_names_one_id_and_nothing_pci() {
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let with = |rule: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"none\"\nmatch = [{{ {rule} }}]\n", valid_fixture()) };
+
+	// The shapes it is for: a table, an ACPI hardware id and a tree `compatible`, each alone.
+	for rule in ["transport = \"platform\", table = \"TPM2\"", "transport = \"platform\", hid = \"MSFT0101\"", "transport = \"platform\", compatible = \"tcg,tpm-tis-mmio\""] {
+		assert_eq!(errors(&with(rule)), "", "{rule} validates");
+	}
+	let manifest = Manifest::parse(&with("transport = \"platform\", compatible = \"tcg,tpm-tis-mmio\""), &root).expect("a platform rule parses");
+	let driver = manifest.programs.values().find_map(|program| program.driver.as_ref().filter(|_| program.name.as_str() == "a_driver")).expect("the driver");
+	let predicate = driver.rules[0].platform.expect("its platform id");
+	assert_eq!((driver.rules[0].transport, predicate.kind, predicate.text()), (Some(TRANSPORT_PLATFORM), PLATFORM_ID_COMPATIBLE, "tcg,tpm-tis-mmio"));
+
+	// Two ids in one rule: a rule is a conjunction, and a device need not answer to both.
+	let two = with("transport = \"platform\", hid = \"MSFT0101\", table = \"TPM2\"");
+	assert!(errors(&two).contains("exactly one id"), "{}", errors(&two));
+	// None at all.
+	let bare = with("transport = \"platform\"");
+	assert!(errors(&bare).contains("exactly one id"), "{}", errors(&bare));
+	// A PCI predicate beside one: the device is on no PCI bus.
+	let mixed = with("transport = \"platform\", hid = \"PNP0501\", pci-class = 7");
+	assert!(errors(&mixed).contains("not a PCI function"), "{}", errors(&mixed));
+	// An id without the transport that gives it meaning.
+	let loose = with("compatible = \"arm,pl011\"");
+	assert!(errors(&loose).contains("transport = \"platform\""), "{}", errors(&loose));
+	// An id the kernel's rows could never carry.
+	let long = with(&format!("transport = \"platform\", compatible = \"{}\"", "x".repeat(47)));
+	assert!(errors(&long).contains("printable characters"), "{}", errors(&long));
+	// And a transport this system does not discover is still a parse failure, not a rule.
+	assert!(!errors(&with("transport = \"isa\", hid = \"PNP0501\"")).is_empty());
+}
+
+#[test]
+fn two_platform_rules_overlap_when_they_name_the_same_id() {
+	let rule = |kind: u8, text: &str| MatchRule {
+		transport: Some(TRANSPORT_PLATFORM),
+		platform: Some({
+			let mut buffer = [0u8; PLATFORM_ID_TEXT];
+			buffer[..text.len()].copy_from_slice(text.as_bytes());
+			PlatformPredicate { kind, len: text.len() as u8, text: buffer }
+		}),
+		..MatchRule::default()
+	};
+	assert!(rule(PLATFORM_ID_HID, "PNP0501").overlaps(rule(PLATFORM_ID_HID, "PNP0501")));
+	assert!(!rule(PLATFORM_ID_HID, "PNP0501").overlaps(rule(PLATFORM_ID_HID, "PNP0500")));
+	assert!(!rule(PLATFORM_ID_HID, "PNP0501").overlaps(rule(PLATFORM_ID_CID, "PNP0501")), "a kind is part of an id");
+	let pci = MatchRule { transport: Some(TRANSPORT_VIRTIO_PCI), virtio_type: Some(2), ..MatchRule::default() };
+	assert!(!rule(PLATFORM_ID_TABLE, "TPM2").overlaps(pci), "a platform rule and a PCI rule differ on the transport");
+	assert_eq!(serde_json::to_string(&rule(PLATFORM_ID_TABLE, "TPM2").platform).unwrap(), "{\"table\":\"TPM2\"}");
+}

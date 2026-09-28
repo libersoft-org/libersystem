@@ -339,11 +339,13 @@ dependencies = [
  "pcm",
  "perfbuf",
  "pix",
+ "platform",
  "png",
  "power-proto",
  "printer-device-proto",
  "ptp-transport-proto",
  "smartcard-proto",
+ "smbios",
  "smpboot",
  "storage-proto",
  "system-manifest",
@@ -463,6 +465,13 @@ name = "pix"
 version = "0.0.0"
 dependencies = [
  "graphics-core",
+]
+
+[[package]]
+name = "platform"
+version = "0.0.0"
+dependencies = [
+ "abi",
 ]
 
 [[package]]
@@ -601,6 +610,10 @@ dependencies = [
  "process-proto",
  "wire",
 ]
+
+[[package]]
+name = "smbios"
+version = "0.0.0"
 
 [[package]]
 name = "smpboot"

@@ -75,6 +75,11 @@ impl<const N: usize> Wired<N> {
 		false
 	}
 
+	/// Whether this kernel answers `number` itself - which makes it a line no claim may take.
+	pub fn holds(&self, number: u32) -> bool {
+		number != EMPTY && (0..N).any(|row| self.number[row].load(Ordering::Acquire) == number)
+	}
+
 	/// Run the handler for `number`, and say whether there was one. `false` is what lets a caller
 	/// go on and offer the same interrupt to the MSI path, which is where every other one belongs.
 	pub fn dispatch(&self, number: u32) -> bool {
@@ -162,5 +167,15 @@ mod tests {
 		// wrong: a table that overwrote a row to make space would refuse and lose a line at once.
 		assert!(wired.dispatch(35) && wired.dispatch(36));
 		assert_eq!(SEEN.load(Ordering::SeqCst), (1 << 35) + (1 << 36));
+	}
+
+	// A LINE THE KERNEL ANSWERS IS NOT A CLAIM'S: `holds` is what a claimed line is refused by.
+	crate::tagged_test!(a_line_the_kernel_answers_is_held_and_zero_never_is, [Kernel, Interrupt], id = "kernel.arch.common.wired.a_line_the_kernel_answers_is_held", covers = ["kernel"]);
+	fn a_line_the_kernel_answers_is_held_and_zero_never_is() {
+		let wired: Wired<2> = Wired::new();
+		assert!(!wired.holds(35));
+		assert!(wired.register(35, record));
+		assert!(wired.holds(35) && !wired.holds(36));
+		assert!(!wired.holds(0), "zero is no line");
 	}
 }

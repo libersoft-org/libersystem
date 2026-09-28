@@ -1490,8 +1490,67 @@ impl Heartbeat {
 // Deleting the transport check here would have left every named test green while an ordinary PCI
 // function whose class byte happens to equal a virtio type was offered to a virtio driver.
 
+// THE TRANSPORT OF A PLATFORM DEVICE: one the firmware describes rather than one that announces itself.
+// The same number `abi::TRANSPORT_PLATFORM` is, written here for the reason the struct below gives.
+pub const TRANSPORT_PLATFORM: u8 = 2;
+
+// The kinds of platform id a rule may name - `abi::MATCH_ID_*`'s numbers.
+pub const PLATFORM_ID_HID: u8 = 1;
+pub const PLATFORM_ID_CID: u8 = 2;
+pub const PLATFORM_ID_COMPATIBLE: u8 = 3;
+pub const PLATFORM_ID_TABLE: u8 = 4;
+pub const PLATFORM_ID_CLASS: u8 = 5;
+
+// How many ids a platform device carries, and how long one may be - the ABI's bounds.
+pub const PLATFORM_IDS: usize = 8;
+pub const PLATFORM_ID_TEXT: usize = 46;
+
+// ONE ID A PLATFORM DEVICE ANSWERS TO: ACPI's hardware or compatible id, a tree's `compatible` string, a
+// static table's signature, a method-only device's class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlatformId {
+	pub kind: u8,
+	pub len: u8,
+	pub text: [u8; PLATFORM_ID_TEXT],
+}
+
+impl Default for PlatformId {
+	fn default() -> Self {
+		PlatformId { kind: 0, len: 0, text: [0; PLATFORM_ID_TEXT] }
+	}
+}
+
+impl PlatformId {
+	// For a generated registry: a `const` id, which fails the BUILD when the text is past the bound -
+	// `system-manifest` refuses such a manifest first, so this is the second wall and not the first.
+	pub const fn from_bytes(kind: u8, text: &[u8]) -> Self {
+		assert!(!text.is_empty() && text.len() <= PLATFORM_ID_TEXT, "a platform id is 1 to 46 bytes");
+		let mut id = PlatformId { kind, len: text.len() as u8, text: [0; PLATFORM_ID_TEXT] };
+		let mut at = 0;
+		while at < text.len() {
+			id.text[at] = text[at];
+			at += 1;
+		}
+		id
+	}
+
+	pub fn new(kind: u8, text: &[u8]) -> Option<Self> {
+		if text.is_empty() || text.len() > PLATFORM_ID_TEXT {
+			return None;
+		}
+		let mut id = PlatformId { kind, len: text.len() as u8, text: [0; PLATFORM_ID_TEXT] };
+		id.text[..text.len()].copy_from_slice(text);
+		Some(id)
+	}
+
+	pub fn text(&self) -> &[u8] {
+		&self.text[..(self.len as usize).min(PLATFORM_ID_TEXT)]
+	}
+}
+
 // What a discovered function IS, as the matcher reads it. The fields the kernel's inventory carries,
-// named here so this crate does not depend on the ABI for a match it performs on integers.
+// named here so this crate does not depend on the ABI for a match it performs on integers - and, for a
+// platform device, the ids it answers to.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Discovered {
 	pub transport: u8,
@@ -1504,6 +1563,26 @@ pub struct Discovered {
 	pub bus: u8,
 	pub dev: u8,
 	pub func: u8,
+	pub platform_ids: [PlatformId; PLATFORM_IDS],
+	pub platform_count: u8,
+}
+
+impl Discovered {
+	// Add an id a platform device answers to; ids past the bound are not kept, which the kernel's own bound
+	// makes unreachable.
+	pub fn add_platform_id(&mut self, kind: u8, text: &[u8]) {
+		let at = self.platform_count as usize;
+		if at < PLATFORM_IDS
+			&& let Some(id) = PlatformId::new(kind, text)
+		{
+			self.platform_ids[at] = id;
+			self.platform_count += 1;
+		}
+	}
+
+	pub fn platform_ids(&self) -> &[PlatformId] {
+		&self.platform_ids[..(self.platform_count as usize).min(PLATFORM_IDS)]
+	}
 }
 
 // One registry rule. Every predicate that is PRESENT must hold; `None` is "do not ask", which is not
@@ -1519,6 +1598,9 @@ pub struct Match {
 	pub product: Option<u16>,
 	// bus, dev, func - a rule pinning one function by where it is plugged in.
 	pub address: Option<(u8, u8, u8)>,
+	// ONE ID A PLATFORM DEVICE MUST ANSWER TO - its kind and text, matched against every id the device
+	// carries, so a node listing several `compatible` strings is matched by any of them.
+	pub platform: Option<PlatformId>,
 }
 
 impl Match {
@@ -1550,6 +1632,11 @@ impl Match {
 		}
 		if let Some((bus, dev, func)) = self.address
 			&& (found.bus != bus || found.dev != dev || found.func != func)
+		{
+			return false;
+		}
+		if let Some(want) = self.platform
+			&& !found.platform_ids().iter().any(|id| id.kind == want.kind && id.text() == want.text())
 		{
 			return false;
 		}

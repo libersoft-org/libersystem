@@ -822,7 +822,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
-	let (catalogue, serve_root, admin_root) = (roles[0], roles[1], roles[2]);
+	let (catalogue, mut serve_root, mut admin_root) = (roles[0], roles[1], roles[2]);
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Midi).unwrap_or(0) } else { 0 };
 	let mut drawn = [0u8; 8];
 	random_get(&mut drawn);
@@ -858,13 +858,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let ready = wait_any(&waitset, deadline);
 		service.tick();
 		if ready >= 0 {
-			serve(&mut service, waitset[ready as usize], serve_root, admin_root, subscription, &mut subscribed, &mut buf, &mut reply_buf);
+			serve(&mut service, waitset[ready as usize], &mut serve_root, &mut admin_root, subscription, &mut subscribed, &mut buf, &mut reply_buf);
 		}
 	}
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve(service: &mut Service, handle: u64, serve_root: u64, admin_root: u64, subscription: u64, subscribed: &mut bool, buf: &mut [u8], reply_buf: &mut [u8]) {
+fn serve(service: &mut Service, handle: u64, serve_root: &mut u64, admin_root: &mut u64, subscription: u64, subscribed: &mut bool, buf: &mut [u8], reply_buf: &mut [u8]) {
 	if let Some(key) = service.providers.iter().find(|provider| provider.chan == handle).map(|provider| provider.key) {
 		if let Err(why) = service.on_reply(key, buf) {
 			service.lose(key, why);
@@ -993,8 +993,8 @@ fn serve(service: &mut Service, handle: u64, serve_root: u64, admin_root: u64, s
 		}
 		return;
 	}
-	let is_serve = handle == serve_root;
-	let is_admin_root = handle == admin_root;
+	let is_serve = handle == *serve_root;
+	let is_admin_root = handle == *admin_root;
 	if !is_serve && !is_admin_root && !service.admins.contains(&handle) {
 		return;
 	}
@@ -1002,10 +1002,16 @@ fn serve(service: &mut Service, handle: u64, serve_root: u64, admin_root: u64, s
 		PolledCaps::Message { len, handles } => (len, handles),
 		PolledCaps::Empty => return,
 		PolledCaps::Closed => {
-			if !is_serve && !is_admin_root {
+			// A CLOSED ROOT IS NOT WAITED ON AGAIN. It stays readable for ever, so waiting on it returned at
+			// once and this loop spun a core; the connections it already minted are still served.
+			if is_serve {
+				*serve_root = 0;
+			} else if is_admin_root {
+				*admin_root = 0;
+			} else {
 				service.admins.retain(|&admin| admin != handle);
-				close(handle);
 			}
+			close(handle);
 			return;
 		}
 	};

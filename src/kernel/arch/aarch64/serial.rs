@@ -10,7 +10,7 @@ use super::paging::phys_to_virt;
 use core::fmt::{self, Write};
 
 // UART0 on QEMU virt.
-const UART_BASE: u64 = 0x0900_0000;
+pub(crate) const UART_BASE: u64 = 0x0900_0000;
 const UARTDR: u64 = 0x00; // data register
 const UARTFR: u64 = 0x18; // flag register
 #[cfg(not(test))]

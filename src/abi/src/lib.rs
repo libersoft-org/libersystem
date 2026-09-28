@@ -586,6 +586,18 @@ pub const SYS_PORT_RANGE_FIRMWARE: u64 = 94;
 
 // The kinds `SYS_DEVICE_RESOURCE_ACQUIRE` mints.
 pub const RESOURCE_KIND_PORT_RANGE: u64 = 1;
+// ONE MMIO RANGE OF A PLATFORM ROW, `index` a position in `PlatformPart::mmio`, answered as a
+// `DeviceMemory` with `RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER` and registered as derived
+// from the claim. Range 0 is the claim's own memory - `ClaimGrant::memory` - so this kind answers
+// indices from 1, and refuses 0 rather than minting the same registers twice.
+pub const RESOURCE_KIND_MMIO: u64 = 2;
+// ONE WIRED INTERRUPT LINE OF A PLATFORM ROW, `index` a position in `PlatformPart::lines`, answered as an
+// `Interrupt` carrying the rights an MSI's does, bound to the line on its controller - configured with
+// the row's trigger and polarity, routed to the boot core and enabled - and registered as derived from
+// the claim, whose release masks the line and gives its vector or identity back. A LEVEL line is masked
+// at its controller when it fires and unmasked by `SYS_INTERRUPT_ACK`, so a source that stays asserted
+// until its driver runs fires once rather than for ever. A line another live claim holds is refused.
+pub const RESOURCE_KIND_LINE: u64 = 3;
 
 // Where a row's port resource came from.
 //
@@ -808,6 +820,10 @@ pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 pub const TRANSPORT_PLAIN_PCI: u8 = 0;
 // A virtio-pci function, so `device_type` is the virtio specification's own device type.
 pub const TRANSPORT_VIRTIO_PCI: u8 = 1;
+// A PLATFORM DEVICE - one the firmware describes rather than one that announces itself on a bus: the
+// kernel declares it, a static table names it, the device tree has a node for it, or the ACPI namespace
+// does. Its identity is `DeviceInfo::platform`, and `device_type` is `DEVICE_TYPE_PLATFORM`.
+pub const TRANSPORT_PLATFORM: u8 = 2;
 
 // Non-virtio device type codes live above the virtio id space (modern virtio types
 // are below 0x40), so one `device_type` field classifies every discovered device.
@@ -856,6 +872,9 @@ pub const DEVICE_TYPE_SDHCI: u32 = 0x104;
 // can match one and nothing can claim what it does not have.
 pub const DEVICE_TYPE_UNKNOWN: u32 = 0x101;
 
+// A platform row: its identity is the row's platform part, not a number this table assigns.
+pub const DEVICE_TYPE_PLATFORM: u32 = 0x106;
+
 // The name for a device-type code, beside the codes it names.
 //
 // It lived in `lsirq` and nowhere else, so every other reporter of a device printed the raw number:
@@ -881,9 +900,201 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		DEVICE_TYPE_SDHCI => "sdhci",
 		DEVICE_TYPE_HDA => "hda",
 		DEVICE_TYPE_UNKNOWN => "unresolved-pci-function",
+		DEVICE_TYPE_PLATFORM => "platform",
 		// A code this build does not classify. The NUMBER is kept, because a reader chasing an
 		// unrecognised device needs it and "unknown" alone sends them back to the source.
 		_ => "unknown",
+	}
+}
+
+// ------------------------------------------------------------------ platform rows
+//
+// A ROW OF THE DEVICE TABLE IS A PCI FUNCTION OR A PLATFORM DEVICE, and the two are told apart by
+// `PlatformPart::kind` rather than by squeezing one into the other: a platform device has several MMIO
+// ranges, wired lines with a trigger and a polarity, connections on another controller, and an identity
+// that is a NAME - `kernel:com1`, `table:TPM2#0`, `dt:/soc/serial@10000000`, `acpi:\_SB_.COM0` - where a
+// PCI function has a bus address. A PCI row's platform part is all zeros.
+
+pub const ROW_KIND_PCI: u8 = 0;
+pub const ROW_KIND_PLATFORM: u8 = 1;
+
+// Where a platform row's first description came from, which is also its identity's form.
+pub const PLATFORM_SOURCE_KERNEL: u8 = 1;
+pub const PLATFORM_SOURCE_TABLE: u8 = 2;
+pub const PLATFORM_SOURCE_TREE: u8 = 3;
+pub const PLATFORM_SOURCE_ACPI: u8 = 4;
+
+// WHO MAY TAKE A PLATFORM ROW. Only a CLAIMABLE one can be claimed. A KERNEL-HELD row is a device the
+// kernel drives itself - an interrupt controller, a timer, its console until a handoff releases it -
+// published so every device is accounted for. A FIRMWARE-HELD row is one the firmware keeps for its own
+// methods. A RESERVATION is a range a description holds back (`PNP0C01`/`PNP0C02`), never a device.
+pub const PLATFORM_STATE_CLAIMABLE: u8 = 1;
+pub const PLATFORM_STATE_KERNEL_HELD: u8 = 2;
+pub const PLATFORM_STATE_FIRMWARE_HELD: u8 = 3;
+pub const PLATFORM_STATE_RESERVATION: u8 = 4;
+
+// WHAT A DRIVER MATCHES A PLATFORM ROW BY. `HID` and `CID` are ACPI's hardware and compatible ids (a
+// `PRP0001` node's `_DSD` `compatible` strings are `COMPATIBLE`, so a driver matches the same way on
+// ACPI and the tree); `TABLE` is a static table's signature; `CLASS` is a method-only device's class.
+// `IDENTITY` is a further identity a merged description brought (`acpi:\_SB_.TPM` joining
+// `table:TPM2#0`), and `SMBIOS` is the SMBIOS record an IPMI row agrees with (`smbios:38#n`).
+pub const MATCH_ID_HID: u8 = 1;
+pub const MATCH_ID_CID: u8 = 2;
+pub const MATCH_ID_COMPATIBLE: u8 = 3;
+pub const MATCH_ID_TABLE: u8 = 4;
+pub const MATCH_ID_CLASS: u8 = 5;
+pub const MATCH_ID_IDENTITY: u8 = 6;
+pub const MATCH_ID_SMBIOS: u8 = 7;
+
+// The bounds of a platform row. The identity is a bounded name; the rest are the counts a firmware
+// description of one device needs, and a description past them is refused whole rather than cut.
+pub const PLATFORM_NAME_LEN: usize = 64;
+pub const MATCH_ID_TEXT_LEN: usize = 46;
+pub const MAX_MATCH_IDS: usize = 8;
+pub const MAX_PLATFORM_MMIO: usize = 6;
+pub const MAX_PLATFORM_LINES: usize = 4;
+pub const MAX_PLATFORM_CONNECTIONS: usize = 4;
+
+// One match id: its kind and up to `MATCH_ID_TEXT_LEN` bytes of text.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MatchId {
+	pub kind: u8,
+	pub len: u8,
+	pub text: [u8; MATCH_ID_TEXT_LEN],
+}
+
+impl Default for MatchId {
+	fn default() -> Self {
+		MatchId { kind: 0, len: 0, text: [0; MATCH_ID_TEXT_LEN] }
+	}
+}
+
+impl MatchId {
+	// A match id from `text`, or None past the bound.
+	pub fn new(kind: u8, text: &[u8]) -> Option<Self> {
+		if text.is_empty() || text.len() > MATCH_ID_TEXT_LEN {
+			return None;
+		}
+		let mut id = MatchId { kind, len: text.len() as u8, text: [0; MATCH_ID_TEXT_LEN] };
+		id.text[..text.len()].copy_from_slice(text);
+		Some(id)
+	}
+
+	pub fn text(&self) -> &[u8] {
+		&self.text[..(self.len as usize).min(MATCH_ID_TEXT_LEN)]
+	}
+}
+
+// One MMIO range of a platform row, in physical addresses.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct MmioResource {
+	pub base: u64,
+	pub len: u64,
+}
+
+// How a wired line asserts, and which controller the kernel reaches it through.
+pub const LINE_TRIGGER_EDGE: u8 = 1;
+pub const LINE_TRIGGER_LEVEL: u8 = 2;
+pub const LINE_POLARITY_HIGH: u8 = 1;
+pub const LINE_POLARITY_LOW: u8 = 2;
+// An I/O APIC's Global System Interrupt (x86_64), a GIC shared peripheral interrupt by INTID (aarch64),
+// an APLIC wired source by number (riscv64).
+pub const LINE_CONTROLLER_IOAPIC: u8 = 1;
+pub const LINE_CONTROLLER_GIC: u8 = 2;
+pub const LINE_CONTROLLER_APLIC: u8 = 3;
+
+// One wired interrupt line of a platform row.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct WiredLine {
+	pub number: u32,
+	pub trigger: u8,
+	pub polarity: u8,
+	pub controller: u8,
+	pub _pad: u8,
+}
+
+// A CONNECTION: a resource on ANOTHER device - a GPIO line of a GPIO controller, an address on an I2C
+// or SPI bus - which the device's driver reaches through that controller's driver, never directly.
+pub const CONNECTION_GPIO_LINE: u8 = 1;
+pub const CONNECTION_I2C: u8 = 2;
+pub const CONNECTION_SPI: u8 = 3;
+
+// One connection: its kind, the controller it is on - that controller's ROW INDEX, or `u32::MAX` while the
+// description naming it has not been joined to a row - the line or the bus address, the trigger and
+// polarity a GPIO interrupt line uses, and `extra`: for a device-tree GPIO line the controller's phandle,
+// which is what the join finds its row by.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Connection {
+	pub kind: u8,
+	pub trigger: u8,
+	pub polarity: u8,
+	pub _pad: u8,
+	pub controller: u32,
+	pub value: u32,
+	pub extra: u32,
+}
+
+// `PlatformPart::flags`.
+// The row names a DMA stream id (`dma_stream`), which a claim attaches like a PCI endpoint where this
+// kernel's IOMMU driver serves the stream's controller and refuses by name where it does not.
+pub const PLATFORM_FLAG_DMA_STREAM: u8 = 1 << 0;
+// The row's property block lists references the kernel did not resolve - a clock that is not a
+// `fixed-clock`, a reset, a regulator, a pinctrl state - so a driver refuses rather than guesses.
+pub const PLATFORM_FLAG_UNRESOLVED: u8 = 1 << 1;
+
+// A PLATFORM ROW'S OWN DESCRIPTION, appended to `DeviceInfo`. All zeros for a PCI row.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlatformPart {
+	pub kind: u8,
+	pub source: u8,
+	pub state: u8,
+	pub flags: u8,
+	pub match_count: u8,
+	pub mmio_count: u8,
+	pub line_count: u8,
+	pub connection_count: u8,
+	pub dma_stream: u32,
+	// The length of the row's property block, which `SYS_DEVICE_PROPERTIES` copies to its claimant.
+	pub properties_len: u32,
+	pub identity: [u8; PLATFORM_NAME_LEN],
+	pub match_ids: [MatchId; MAX_MATCH_IDS],
+	pub mmio: [MmioResource; MAX_PLATFORM_MMIO],
+	pub lines: [WiredLine; MAX_PLATFORM_LINES],
+	pub connections: [Connection; MAX_PLATFORM_CONNECTIONS],
+}
+
+impl Default for PlatformPart {
+	fn default() -> Self {
+		PlatformPart { kind: ROW_KIND_PCI, source: 0, state: 0, flags: 0, match_count: 0, mmio_count: 0, line_count: 0, connection_count: 0, dma_stream: 0, properties_len: 0, identity: [0; PLATFORM_NAME_LEN], match_ids: [MatchId::default(); MAX_MATCH_IDS], mmio: [MmioResource::default(); MAX_PLATFORM_MMIO], lines: [WiredLine::default(); MAX_PLATFORM_LINES], connections: [Connection::default(); MAX_PLATFORM_CONNECTIONS] }
+	}
+}
+
+impl PlatformPart {
+	// The identity as bytes, without the NUL padding.
+	pub fn identity(&self) -> &[u8] {
+		let end = self.identity.iter().position(|byte| *byte == 0).unwrap_or(PLATFORM_NAME_LEN);
+		&self.identity[..end]
+	}
+
+	pub fn match_ids(&self) -> &[MatchId] {
+		&self.match_ids[..(self.match_count as usize).min(MAX_MATCH_IDS)]
+	}
+
+	pub fn mmio(&self) -> &[MmioResource] {
+		&self.mmio[..(self.mmio_count as usize).min(MAX_PLATFORM_MMIO)]
+	}
+
+	pub fn lines(&self) -> &[WiredLine] {
+		&self.lines[..(self.line_count as usize).min(MAX_PLATFORM_LINES)]
+	}
+
+	pub fn connections(&self) -> &[Connection] {
+		&self.connections[..(self.connection_count as usize).min(MAX_PLATFORM_CONNECTIONS)]
 	}
 }
 
@@ -1013,6 +1224,9 @@ pub struct DeviceInfo {
 	// THE ROW'S PORT RESOURCES, in the order `SYS_DEVICE_RESOURCE_ACQUIRE` indexes them. Empty on every
 	// row of aarch64 and riscv64, which have no port space.
 	pub ports: [PortResource; MAX_PORT_RESOURCES],
+	// A PLATFORM ROW'S DESCRIPTION, appended: its kind, identity, match ids and resources. All zeros for
+	// a PCI row, whose identity is the fields above.
+	pub platform: PlatformPart,
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the
@@ -1235,6 +1449,25 @@ pub struct IrqInfo {
 // vector on x86_64 (a legacy IRQ n is `0x20 + n`), the INTID on aarch64, the interrupt-file identity on
 // riscv64. Wakes per second are two of these readings and the time between them.
 pub const SYS_CPU_IDLE_INFO: u64 = 95;
+// THE PROPERTY BLOCK OF A CLAIMED PLATFORM ROW - `SYS_DEVICE_PROPERTIES(claim, buf, len)` - for a claim
+// handle carrying `RIGHT_READ`: the device-tree node's properties and its child nodes' (bounded), with
+// every `fixed-clock` reference resolved to its frequency and every other reference listed unresolved,
+// in the record format `DEVICE_PROPERTY_*` describes. Answers the block's length, copying what fits;
+// ERR_UNSUPPORTED for a row that has none. Its holder is the device's driver; nothing else reads it.
+pub const SYS_DEVICE_PROPERTIES: u64 = 96;
+
+// The records of a property block, each `[kind u8][depth u8][name_len u16][value_len u32][name][value]`
+// with the value padded to four bytes: a NODE opens a child at `depth` (the device's own node is depth 0
+// and is not a record), a PROPERTY belongs to the last node opened at its depth, a CLOCK is a resolved
+// `clocks` entry (value: the frequency in hertz as a little-endian u64) and an UNRESOLVED names a
+// reference property the kernel could not turn into a value.
+pub const DEVICE_PROPERTY_NODE: u8 = 1;
+pub const DEVICE_PROPERTY_VALUE: u8 = 2;
+pub const DEVICE_PROPERTY_CLOCK: u8 = 3;
+pub const DEVICE_PROPERTY_UNRESOLVED: u8 = 4;
+// The most a property block holds; a node whose block would exceed it is published with the block cut at
+// a record boundary and `PLATFORM_FLAG_UNRESOLVED` set.
+pub const MAX_DEVICE_PROPERTIES: usize = 4096;
 
 // How many device identities one core's record keeps.
 pub const CPU_IDLE_SOURCES: usize = 8;

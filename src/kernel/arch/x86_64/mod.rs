@@ -12,6 +12,7 @@ pub mod paging;
 pub mod pci;
 pub mod percpu;
 mod pit;
+pub mod platform;
 mod port;
 pub mod random;
 pub mod rtc;

@@ -36,6 +36,7 @@ pub mod fwcfg;
 pub mod msi;
 pub mod paging;
 pub mod pci;
+pub mod platform;
 pub mod rng;
 pub mod time;
 // The kernel's own wired-interrupt handlers, on the backends whose controller delivers a NUMBER

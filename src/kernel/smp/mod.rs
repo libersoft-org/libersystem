@@ -523,10 +523,10 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 	};
 	let madt = if revision >= 2 && extended_ok {
 		let xsdt = unsafe { core::ptr::read_unaligned(rsdp.add(24) as *const u64) };
-		find_table(hhdm, xsdt, 8, b"APIC")
+		find_table(hhdm, xsdt, 8, b"APIC", 0)
 	} else {
 		let rsdt = unsafe { core::ptr::read_unaligned(rsdp.add(16) as *const u32) } as u64;
-		find_table(hhdm, rsdt, 4, b"APIC")
+		find_table(hhdm, rsdt, 4, b"APIC", 0)
 	};
 	let Some(madt) = madt else {
 		return out;
@@ -544,6 +544,13 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 // firmware would produce.
 #[cfg(target_arch = "x86_64")]
 pub fn acpi_table(rsdp_phys: u64, want: &[u8; 4]) -> Option<&'static [u8]> {
+	acpi_table_instance(rsdp_phys, want, 0)
+}
+
+// THE `instance`-TH TABLE OF A SIGNATURE, in the order the root table lists them - so a machine with two
+// SSDTs, or a firmware that publishes two descriptions of one kind, has each reachable rather than only its
+// first. `table:SIG#n` names what this answers for `n`.
+pub fn acpi_table_instance(rsdp_phys: u64, want: &[u8; 4], instance: usize) -> Option<&'static [u8]> {
 	if rsdp_phys == 0 || !mem::within_direct_map(rsdp_phys, 36) {
 		return None;
 	}
@@ -566,10 +573,10 @@ pub fn acpi_table(rsdp_phys: u64, want: &[u8; 4]) -> Option<&'static [u8]> {
 	};
 	let found = if revision >= 2 && extended_ok {
 		let xsdt = unsafe { core::ptr::read_unaligned(rsdp.add(24) as *const u64) };
-		find_table(hhdm, xsdt, 8, want)
+		find_table(hhdm, xsdt, 8, want, instance)
 	} else {
 		let rsdt = unsafe { core::ptr::read_unaligned(rsdp.add(16) as *const u32) } as u64;
-		find_table(hhdm, rsdt, 4, want)
+		find_table(hhdm, rsdt, 4, want, instance)
 	}?;
 	// `find_table` accepted it, so the length is sane and the whole table is inside the direct map.
 	let len = table_length(hhdm, found)? as usize;
@@ -641,7 +648,7 @@ fn table_length(hhdm: u64, phys: u64) -> Option<u32> {
 // Scan an RSDT/XSDT (entry pointers are `ptr_size` bytes each, after the 36-byte
 // header) for the MADT (signature "APIC"), returning its physical address.
 #[cfg(target_arch = "x86_64")]
-fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize, want: &[u8; 4]) -> Option<u64> {
+fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize, want: &[u8; 4], instance: usize) -> Option<u64> {
 	if sdt_phys == 0 {
 		return None;
 	}
@@ -653,6 +660,7 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize, want: &[u8; 4]) -> Opti
 	let len = table_length(hhdm, sdt_phys).unwrap_or(0) as usize;
 	let base = (hhdm + sdt_phys + 36) as *const u8;
 	let count = (len - 36) / ptr_size;
+	let mut seen = 0usize;
 	for i in 0..count {
 		let entry = unsafe { base.add(i * ptr_size) };
 		let phys = if ptr_size == 8 { unsafe { core::ptr::read_unaligned(entry as *const u64) } } else { unsafe { core::ptr::read_unaligned(entry as *const u32) as u64 } };
@@ -660,7 +668,10 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize, want: &[u8; 4]) -> Opti
 		// be, and the checksum says whether to believe it - in that order, because the first two
 		// are reads of the thing the third is about.
 		if table_signature(hhdm, phys) == Some(*want) && table_ok(hhdm, phys) {
-			return Some(phys);
+			if seen == instance {
+				return Some(phys);
+			}
+			seen += 1;
 		}
 	}
 	None

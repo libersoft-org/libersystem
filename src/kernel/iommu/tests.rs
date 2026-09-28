@@ -53,7 +53,7 @@ fn a_controller_that_did_not_come_up_is_not_a_machine_without_one() {
 	let was_handoff = crate::dma_policy::handoff();
 	let was_enforcing = crate::dma_policy::enforcing();
 	let protected = crate::dma_policy::entry_field(b"synthetic-protected");
-	let device = driver_binding::Discovered { transport: abi::TRANSPORT_PLAIN_PCI, virtio_type: u16::MAX as u32, class: 0xff, subclass: 0xff, prog_if: 0xff, vendor: 0xffff, product: 0xffff, bus: 0xff, dev: 2, func: 0 };
+	let device = driver_binding::Discovered { transport: abi::TRANSPORT_PLAIN_PCI, virtio_type: u16::MAX as u32, class: 0xff, subclass: 0xff, prog_if: 0xff, vendor: 0xffff, product: 0xffff, bus: 0xff, dev: 2, func: 0, ..driver_binding::Discovered::default() };
 
 	// A controller on the bus that did not come up, on an enforcing boot: the driver that declared
 	// it needs translation does not run. This is the state that used to be recorded as "no

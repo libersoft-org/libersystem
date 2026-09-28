@@ -953,5 +953,190 @@ fn trigger_of(flags: u16) -> Trigger {
 	}
 }
 
+/// An I/O APIC the MADT describes: type 1, twelve bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IoApic {
+	pub id: u8,
+	/// The physical base of its register window.
+	pub address: u32,
+	/// The first Global System Interrupt its redirection entries answer for.
+	pub gsi_base: u32,
+}
+
+const MADT_IO_APIC: u8 = 1;
+const MADT_IO_APIC_LEN: usize = 12;
+
+impl<'a> Madt<'a> {
+	/// Every I/O APIC the table describes, in the order the firmware wrote them - so the kernel routes a
+	/// Global System Interrupt through the controller whose range holds it rather than through one fixed
+	/// base. The walk ends where an entry does not fit, as the overrides' does.
+	pub fn io_apics(&self) -> impl Iterator<Item = IoApic> + '_ {
+		let mut offset = MADT_ENTRIES;
+		core::iter::from_fn(move || {
+			loop {
+				let kind = self.table.u8_at(offset)?;
+				let len = self.table.u8_at(offset + 1)? as usize;
+				if len < 2 || offset.checked_add(len)? > self.table.len() {
+					return None;
+				}
+				let here = offset;
+				offset += len;
+				if kind == MADT_IO_APIC && len >= MADT_IO_APIC_LEN {
+					return Some(IoApic { id: self.table.u8_at(here + 2)?, address: self.table.u32_at(here + 4)?, gsi_base: self.table.u32_at(here + 8)? });
+				}
+			}
+		})
+	}
+}
+
+/// THE SERIAL PORT CONSOLE REDIRECTION TABLE: the UART the firmware says the console is on. A
+/// DESCRIPTION of a device, which the kernel merges into the row of the UART it names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Spcr {
+	/// The interface type - the same numbering as DBG2's serial subtypes (0 a full 16550, 3 an ARM PL011).
+	pub interface: u8,
+	pub base: Gas,
+	/// Bit 0 a PC-AT IRQ, bit 1 an I/O APIC GSI, bit 3 an ARM GIC interrupt.
+	pub interrupt_type: u8,
+	pub irq: u8,
+	pub gsi: u32,
+}
+
+impl Spcr {
+	pub fn new(bytes: &[u8]) -> Result<Self, Error> {
+		let table = Table::with_signature(bytes, b"SPCR")?;
+		let base = table.gas_at(40).ok_or(Error::TooShort)??;
+		Ok(Spcr { interface: table.u8_at(36).ok_or(Error::TooShort)?, base, interrupt_type: table.u8_at(52).ok_or(Error::TooShort)?, irq: table.u8_at(53).ok_or(Error::TooShort)?, gsi: table.u32_at(54).ok_or(Error::TooShort)? })
+	}
+}
+
+/// One device of the DEBUG PORT TABLE 2: a debug port's type, its first register window and the ACPI
+/// namespace path it names (empty when the firmware wrote ".", the "no namespace device" path).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Dbg2Device<'a> {
+	pub port_type: u16,
+	pub port_subtype: u16,
+	pub base: Gas,
+	pub size: u32,
+	pub namespace: &'a [u8],
+}
+
+/// The serial debug port type, the one DBG2 type this kernel merges into a row.
+pub const DBG2_TYPE_SERIAL: u16 = 0x8000;
+
+/// DBG2's device information structures, each checked against the table before it is decoded; a
+/// structure that does not fit ends the walk.
+pub fn dbg2_devices<'a>(bytes: &'a [u8], mut visit: impl FnMut(Dbg2Device<'a>)) -> Result<(), Error> {
+	let table = Table::with_signature(bytes, b"DBG2")?;
+	let first = table.u32_at(36).ok_or(Error::TooShort)? as usize;
+	let count = table.u32_at(40).ok_or(Error::TooShort)? as usize;
+	let mut offset = first;
+	for _ in 0..count.min(64) {
+		let Some(length) = table.u16_at(offset + 1).map(usize::from) else { break };
+		if length < 22 || offset.checked_add(length).is_none_or(|end| end > table.len()) {
+			break;
+		}
+		let (registers, name_len, name_at, port_type, port_subtype, base_at, size_at) = (table.u8_at(offset + 3), table.u16_at(offset + 4), table.u16_at(offset + 6), table.u16_at(offset + 12), table.u16_at(offset + 14), table.u16_at(offset + 18), table.u16_at(offset + 20));
+		let (Some(registers), Some(name_len), Some(name_at), Some(port_type), Some(port_subtype), Some(base_at), Some(size_at)) = (registers, name_len, name_at, port_type, port_subtype, base_at, size_at) else { break };
+		// EVERY OFFSET IS RELATIVE TO THE STRUCTURE AND HAS TO LAND INSIDE IT: a namespace string or a
+		// register array the structure's own length does not cover is something another structure owns.
+		let inside = |at: usize, len: usize| at.checked_add(len).is_some_and(|end| end <= length);
+		if registers == 0 || !inside(base_at as usize, GAS_LEN) || !inside(size_at as usize, 4) || !inside(name_at as usize, name_len as usize) {
+			offset += length;
+			continue;
+		}
+		let base = match table.gas_at(offset + base_at as usize) {
+			Some(Ok(gas)) => gas,
+			_ => {
+				offset += length;
+				continue;
+			}
+		};
+		let size = table.u32_at(offset + size_at as usize).unwrap_or(0);
+		let name = &table.bytes()[offset + name_at as usize..offset + name_at as usize + name_len as usize];
+		let name = name.split(|byte| *byte == 0).next().unwrap_or(&[]);
+		visit(Dbg2Device { port_type, port_subtype, base, size, namespace: if name == b"." { &[] } else { name } });
+		offset += length;
+	}
+	Ok(())
+}
+
+/// THE HPET TABLE: the event timer block's register window and its number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Hpet {
+	pub block_id: u32,
+	pub base: Gas,
+	pub number: u8,
+}
+
+impl Hpet {
+	pub fn new(bytes: &[u8]) -> Result<Self, Error> {
+		let table = Table::with_signature(bytes, b"HPET")?;
+		Ok(Hpet { block_id: table.u32_at(36).ok_or(Error::TooShort)?, base: table.gas_at(40).ok_or(Error::TooShort)??, number: table.u8_at(52).ok_or(Error::TooShort)? })
+	}
+}
+
+/// ONE WDAT INSTRUCTION: an action, how it is performed, the register it touches, and the value and mask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WdatInstruction {
+	pub action: u8,
+	pub instruction: u8,
+	pub register: Gas,
+	pub value: u32,
+	pub mask: u32,
+}
+
+/// THE WATCHDOG ACTION TABLE's fixed fields.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Wdat {
+	pub timer_period_ms: u32,
+	pub maximum_count: u32,
+	pub minimum_count: u32,
+	pub flags: u8,
+	pub instructions: u32,
+}
+
+const WDAT_ENTRIES: usize = 68;
+const WDAT_ENTRY_LEN: usize = 24;
+
+impl Wdat {
+	pub fn new(bytes: &[u8]) -> Result<Self, Error> {
+		let table = Table::with_signature(bytes, b"WDAT")?;
+		Ok(Wdat { timer_period_ms: table.u32_at(48).ok_or(Error::TooShort)?, maximum_count: table.u32_at(52).ok_or(Error::TooShort)?, minimum_count: table.u32_at(56).ok_or(Error::TooShort)?, flags: table.u8_at(60).ok_or(Error::TooShort)?, instructions: table.u32_at(64).ok_or(Error::TooShort)? })
+	}
+}
+
+/// Every WDAT instruction, in table order: the count the table declares, bounded by what fits in it. A
+/// register that is not a structure is an `Err` for that entry, and the walk goes on.
+pub fn wdat_instructions(bytes: &[u8], mut visit: impl FnMut(Result<WdatInstruction, Error>)) -> Result<(), Error> {
+	let table = Table::with_signature(bytes, b"WDAT")?;
+	let declared = table.u32_at(64).ok_or(Error::TooShort)? as usize;
+	let fits = table.len().saturating_sub(WDAT_ENTRIES) / WDAT_ENTRY_LEN;
+	for entry in 0..declared.min(fits) {
+		let at = WDAT_ENTRIES + entry * WDAT_ENTRY_LEN;
+		let (Some(action), Some(instruction), Some(register), Some(value), Some(mask)) = (table.u8_at(at), table.u8_at(at + 1), table.gas_at(at + 4), table.u32_at(at + 16), table.u32_at(at + 20)) else { break };
+		visit(register.map(|register| WdatInstruction { action, instruction, register, value, mask }));
+	}
+	Ok(())
+}
+
+/// THE BOOT GRAPHICS RESOURCE TABLE: where the firmware left its boot logo. A fact about the boot, never
+/// a device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Bgrt {
+	pub status: u8,
+	pub image_type: u8,
+	pub image_address: u64,
+	pub x: u32,
+	pub y: u32,
+}
+
+impl Bgrt {
+	pub fn new(bytes: &[u8]) -> Result<Self, Error> {
+		let table = Table::with_signature(bytes, b"BGRT")?;
+		Ok(Bgrt { status: table.u8_at(38).ok_or(Error::TooShort)?, image_type: table.u8_at(39).ok_or(Error::TooShort)?, image_address: table.u64_at(40).ok_or(Error::TooShort)?, x: table.u32_at(48).ok_or(Error::TooShort)?, y: table.u32_at(52).ok_or(Error::TooShort)? })
+	}
+}
+
 #[cfg(test)]
 mod tests;

@@ -78,6 +78,7 @@ mod exceptions;
 mod gic;
 // The GICv3 ITS: the MSI controller a GICv3 machine has instead of a v2m frame.
 mod its;
+pub mod platform;
 pub mod psci;
 pub mod serial;
 pub mod usercopy;

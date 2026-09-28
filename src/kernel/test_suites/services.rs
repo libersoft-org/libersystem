@@ -4023,6 +4023,16 @@ mod spool_sink {
 		pub(super) service: Arc<Process>,
 	}
 
+	// THE SERVICE GOES WITH ITS RIG. A test that leaves its service process running leaves the next test a
+	// machine with one more process on it - and one whose peers have all closed is a process whose waits
+	// can all answer at once, which is how a leftover media-import service came to take the boot core from
+	// the modem test that ran after it.
+	impl Drop for Rig {
+		fn drop(&mut self) {
+			self.service.terminate();
+		}
+	}
+
 	impl Rig {
 		pub(super) fn start(sinks: Vec<Sink>) -> Rig {
 			let init = init_package_bytes().expect("init package module not found");
@@ -4728,6 +4738,16 @@ mod import_rig {
 		pub(super) storage: StorageHarness,
 	}
 
+	// THE SERVICE GOES WITH ITS RIG. A test that leaves its service process running leaves the next test a
+	// machine with one more process on it - and one whose peers have all closed is a process whose waits
+	// can all answer at once, which is how a leftover media-import service came to take the boot core from
+	// the modem test that ran after it.
+	impl Drop for Rig {
+		fn drop(&mut self) {
+			self.service.terminate();
+		}
+	}
+
 	impl Rig {
 		pub(super) fn start(storage: StorageHarness, camera: Responder) -> Rig {
 			let init = init_package_bytes().expect("init package module not found");
@@ -5075,6 +5095,16 @@ mod modem_rig {
 		seq: u32,
 		pub(super) modems: Vec<Modem>,
 		_service: Arc<Process>,
+	}
+
+	// THE SERVICE GOES WITH ITS RIG. A test that leaves its service process running leaves the next test a
+	// machine with one more process on it - and one whose peers have all closed is a process whose waits
+	// can all answer at once, which is how a leftover media-import service came to take the boot core from
+	// the modem test that ran after it.
+	impl Drop for Rig {
+		fn drop(&mut self) {
+			self._service.terminate();
+		}
 	}
 
 	impl Rig {

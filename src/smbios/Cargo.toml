@@ -1,0 +1,14 @@
+[package]
+name = "smbios"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "A bounded reader of the firmware's SMBIOS tables - the entry point, the structure table, system identity and IPMI records - that a host can drive"
+
+[lib]
+path = "src/lib.rs"
+
+# A WARNING IS AN ERROR HERE: every byte this crate reads was written by firmware, and a warning is a
+# place its bounds were not thought about.
+[lints.rust]
+warnings = "deny"

@@ -125,6 +125,9 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	#[cfg(target_arch = "riscv64")]
 	uefi::memory::set_alloc_ceiling(8 * 1024 * 1024 * 1024 - 1);
 	console::adopt(system_table);
+	// WHERE THE FIRMWARE'S SMBIOS TABLES ARE, read now while the configuration table is readable, and
+	// handed to the kernel in `BootInfo::smbios`.
+	record_smbios(system_table);
 	// And ask the machine where its console is, while the configuration table is still readable.
 	// What comes out of this is what the loader prints to AFTER `ExitBootServices` - or nothing,
 	// on a machine that names no console this loader can drive.
@@ -601,6 +604,32 @@ static mut ROOT_SELECTION: bootproto::RootSelection = bootproto::RootSelection {
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub(crate) fn withholds_device_tree() -> bool {
 	option_env!("LIBER_NO_DT_PROFILE").is_some_and(|value| value == "1")
+}
+
+// THE SMBIOS ENTRY POINT the firmware published, physical: 3.x's where there is one, else 2.x's, else 0.
+static SMBIOS_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn record_smbios(system_table: *mut SystemTable) {
+	let (mut v3, mut v2) = (0u64, 0u64);
+	unsafe {
+		// A null table with a zero count is a firmware with nothing to publish, and not a slice.
+		let table = (*system_table).configuration_table;
+		let count = (*system_table).number_of_table_entries;
+		let entries: &[uefi::ConfigurationTable] = if table.is_null() || count == 0 { &[] } else { core::slice::from_raw_parts(table, count) };
+		for entry in entries {
+			if entry.vendor_guid == uefi::SMBIOS3_TABLE_GUID {
+				v3 = entry.vendor_table as u64;
+			} else if entry.vendor_guid == uefi::SMBIOS_TABLE_GUID {
+				v2 = entry.vendor_table as u64;
+			}
+		}
+	}
+	SMBIOS_ENTRY.store(if v3 != 0 { v3 } else { v2 }, core::sync::atomic::Ordering::Relaxed);
+}
+
+// The entry point, for the hand-off.
+pub(crate) fn smbios_entry() -> u64 {
+	SMBIOS_ENTRY.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // What the loader chose, for the hand-off.

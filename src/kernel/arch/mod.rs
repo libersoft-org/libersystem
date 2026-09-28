@@ -22,8 +22,9 @@
 //                   riscv64)
 //       percpu:     PerCpu (cpu_id, lapic_id), allocate, init, this_cpu, set_kernel_rsp,
 //                   set_stack_bounds, in_user_syscall
-//       interrupts: bind, unbind, is_bound, is_bindable, acquire_msi_unique, bind_msi, eoi,
-//                   irq_info, irq_info_len
+//       interrupts: bind_wired, acknowledge, unbind, is_bound, acquire_msi_unique, bind_msi, eoi,
+//                   irq_info, irq_info_len   (`bind_wired` binds a platform row's claimed line and
+//                   `acknowledge` unmasks a level one its driver has serviced - see each port's `Line`)
 //                   `IRQ_BASE`, `HandlerFn` and `register` ARE NOT HERE. They are the x86 INTx
 //                   registry and exist only under `x86_64` - part (2) says so and this list said
 //                   the opposite, which put back in the contract exactly the obligation the

@@ -68,11 +68,43 @@ pub struct DeviceEntry {
 	// again at every mint. Empty on the two ports with no port space.
 	pub port_count: u8,
 	pub ports: [abi::PortResource; abi::MAX_PORT_RESOURCES],
+	// A PLATFORM ROW'S OWN DESCRIPTION - its identity, match ids, MMIO ranges, wired lines and connections -
+	// and the property block its driver reads through the claim. None for a PCI function, whose identity is
+	// the fields above and whose config space every PCI path writes.
+	pub platform: Option<alloc::boxed::Box<PlatformRow>>,
+}
+
+// A platform row's description, as published.
+pub struct PlatformRow {
+	pub part: abi::PlatformPart,
+	pub properties: Vec<u8>,
+}
+
+// A DESCRIPTION WAITING TO BE PUBLISHED: what the architecture found - its kernel-held set, what the
+// static tables and the device tree describe - and the property block the tree gave it.
+pub struct Described {
+	pub description: platform::Description,
+	pub properties: Vec<u8>,
+	// Each connection's controller by that controller's identity: (the connection's index, the identity),
+	// joined to a row index once every description is published.
+	pub targets: Vec<(u8, Vec<u8>)>,
 }
 
 const NO_PORTS: [abi::PortResource; abi::MAX_PORT_RESOURCES] = [abi::PortResource { base: 0, len: 0, source: 0, index: 0, _pad: [0; 2] }; abi::MAX_PORT_RESOURCES];
 
 impl DeviceEntry {
+	// WHETHER THIS ROW HAS A CONFIG SPACE TO WRITE: a PCI function that is on the bus. A platform row is
+	// present and is not a PCI function, so nothing that writes a function's command register, its MSI-X
+	// capability or its I/O decode may reach it.
+	fn has_config_space(&self) -> bool {
+		self.on_bus && self.platform.is_none()
+	}
+
+	// Whether this row is a PCI function at `bus:dev.func` - the one question a bus address may answer.
+	fn is_function(&self, bus: u8, dev: u8, func: u8) -> bool {
+		self.platform.is_none() && self.bus == bus && self.dev == dev && self.func == func
+	}
+
 	// Whether any of the row's ports is one of the function's own I/O BARs - which makes the claim the
 	// owner of the function's I/O decode.
 	fn has_io_bar(&self) -> bool {
@@ -109,6 +141,9 @@ pub fn init() {
 	// THE FIRMWARE'S PART OF THE RESERVED PORT SET, BEFORE ANY ROW IS RECORDED: a row's ports are checked
 	// against the set as the scan below records them.
 	crate::object::port_range::reserve_firmware_ports();
+	// WHAT THE FIRMWARE DESCRIBES, read before the table is taken: the architecture's kernel-held set, what
+	// its static tables name and every device node of its tree, in the order they are published.
+	let described = crate::arch::platform::describe();
 	let mut functions = PCI_FUNCTIONS.lock();
 	functions.clear();
 	for p in crate::arch::pci::scan() {
@@ -139,7 +174,7 @@ pub fn init() {
 		// I/O APIC by construction.
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS });
+		table.push(DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS, platform: None });
 	}
 	for x in crate::arch::pci::scan_resourced() {
 		// Every resourced plain-PCI function joins the same table: its whole register file lives in
@@ -149,7 +184,7 @@ pub fn init() {
 		// is what stopped this being one loop per family.
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: x.device_type as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS });
+		table.push(DeviceEntry { device_type: x.device_type as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS, platform: None });
 	}
 	// AND EVERY OTHER FUNCTION ON THE BUS, so the inventory is the machine rather than the two
 	// families this kernel happens to resolve.
@@ -177,18 +212,127 @@ pub fn init() {
 			continue;
 		}
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_UNKNOWN as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: p.vendor, product: p.device_id, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: p.bus, dev: p.dev, func: p.func, class: p.class, subclass: p.subclass, prog_if: p.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS });
+		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_UNKNOWN as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: p.vendor, product: p.device_id, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: p.bus, dev: p.dev, func: p.func, class: p.class, subclass: p.subclass, prog_if: p.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS, platform: None });
 	}
 	// AND EVERY ROW'S PORT RESOURCES, once the rows exist - on a function the kernel resolved or not, since
 	// a function nothing here resolves may still decode ports a driver needs.
 	for entry in table.iter_mut() {
 		record_ports(entry);
 	}
+	// AND THE DEVICES NOTHING ANNOUNCES, after every PCI function so the functions keep the indices the
+	// scan gave them: each description placed against the rows already published - a row of its own, the
+	// row already carrying its identity, merged into one, or refused and said so.
+	let forbidden = forbidden_ranges(&table);
+	let mut pending: Vec<(usize, u8, Vec<u8>)> = Vec::new();
+	for mut item in described {
+		let targets = core::mem::take(&mut item.targets);
+		let before = table.len();
+		if let Some(row) = publish_locked(&mut table, item, &forbidden)
+			&& row >= before
+		{
+			for (connection, identity) in targets {
+				// ALLOC-OK: boot, one per connection a published description names.
+				pending.push((row, connection, identity));
+			}
+		}
+	}
+	// AND EACH CONNECTION JOINED TO ITS CONTROLLER'S ROW, now that every row exists: an I2C device to its
+	// bus, a GPIO line to its controller. One whose controller no row carries stays unjoined, and says so.
+	for (row, connection, identity) in pending {
+		let found = table.iter().position(|entry| entry.platform.as_ref().is_some_and(|held| held.part.identity() == identity.as_slice()));
+		match (found, table[row].platform.as_mut()) {
+			(Some(controller), Some(held)) => held.part.connections[connection as usize].controller = controller as u32,
+			(None, Some(held)) => crate::serial_println!("device: {} names a controller {} that no row carries - that connection is not joined", alloc::string::String::from_utf8_lossy(held.part.identity()), alloc::string::String::from_utf8_lossy(&identity)),
+			_ => {}
+		}
+	}
 	// One claim slot per device, all `Free`: nothing is driving anything yet, and enumeration left
 	// every device with bus mastering off.
 	let len = table.len();
 	drop(table);
 	reset_claims(len);
+}
+
+// WHAT NO PLATFORM ROW MAY OWN: the memory the machine has - every region the memory map reports except
+// the ones it merely reserves, which is where firmware puts device windows like the TPM's - and every
+// PCI function's BAR. What the kernel holds is published as rows of its own, and `place` refuses an
+// overlap with one.
+fn forbidden_ranges(table: &[DeviceEntry]) -> Vec<(u64, u64)> {
+	let mut ranges = Vec::new();
+	for index in 0..crate::mem::memmap_len() {
+		let Some(region) = crate::mem::memmap_get(index) else { continue };
+		if region.kind != abi::MEMMAP_RESERVED && region.length != 0 {
+			// ALLOC-OK: built once at boot, one row per memory-map region and per resolved BAR.
+			ranges.push((region.base, region.length));
+		}
+	}
+	for entry in table.iter().filter(|entry| entry.platform.is_none() && entry.bar_len != 0) {
+		// ALLOC-OK: as above.
+		ranges.push((entry.bar_phys, entry.bar_len));
+	}
+	ranges
+}
+
+// Why the placement refused a description, in words.
+fn overlap_name(what: platform::Overlap) -> &'static str {
+	match what {
+		platform::Overlap::Mmio => "MMIO",
+		platform::Overlap::Ports => "ports",
+	}
+}
+
+// PUBLISH ONE DESCRIPTION: its ranges checked against what no platform row may own, its ports against the
+// reserved set when it is claimable, then placed. Answers the row it became or joined, None when refused -
+// every refusal a line naming the description and the reason.
+fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u64, u64)]) -> Option<usize> {
+	let Described { description, properties } = item;
+	let name = core::str::from_utf8(description.identity()).unwrap_or("?");
+	for range in description.part.mmio() {
+		if let Some(at) = platform::over(range.base, range.len, forbidden) {
+			crate::serial_println!("device: {name} is not published - its MMIO {:#x}..{:#x} lies over {} {:#x}..{:#x}, which no platform device may own", range.base, range.base + range.len - 1, if at < crate::mem::memmap_len() { "memory" } else { "a PCI function's BAR" }, forbidden[at].0, forbidden[at].0 + forbidden[at].1 - 1);
+			return None;
+		}
+	}
+	// A CLAIMABLE ROW'S PORTS ARE CHECKED AGAINST THE RESERVED SET AND THE LIVE GRANTS, as a PCI row's are.
+	// A kernel-held row's ports ARE the reserved set: publishing them accounts for them.
+	if description.part.state == abi::PLATFORM_STATE_CLAIMABLE {
+		for port in description.ports() {
+			if let Err(refusal) = crate::object::port_range::grants::recordable(port.base, port.len) {
+				crate::serial_println!("device: {name} is not published - its ports {:#06x}..{:#06x} are {refusal:?}", port.base, port.base as u32 + port.len as u32 - 1);
+				return None;
+			}
+		}
+	}
+	let placement = {
+		let views: Vec<platform::RowView<'_>> = table.iter().map(|entry| entry.platform.as_ref().map(|row| (&row.part, &entry.ports[..entry.port_count as usize]))).collect();
+		platform::place(&views, &description)
+	};
+	match placement {
+		platform::Placement::Same(row) => Some(row),
+		platform::Placement::Merge(row) => {
+			let merged = table[row].platform.as_mut().is_some_and(|held| platform::merge(&mut held.part, &description));
+			if !merged {
+				crate::serial_println!("device: {name} describes row {row} again and its ids do not fit beside that row's - not merged");
+				return None;
+			}
+			crate::serial_println!("device: {name} is the device row {row} already names, and is merged into it");
+			Some(row)
+		}
+		platform::Placement::Refuse { row, what } => {
+			let other = table[row].platform.as_ref().map(|held| alloc::string::String::from_utf8_lossy(held.part.identity()).into_owned()).unwrap_or_default();
+			crate::serial_println!("device: {name} is not published - its {} overlap {other} (row {row}) without starting where it does", overlap_name(what));
+			None
+		}
+		platform::Placement::New => {
+			let index = table.len();
+			let (bar_phys, bar_len) = description.part.mmio().first().map_or((0, 0), |range| (range.base, range.len));
+			let mut part = description.part;
+			part.properties_len = properties.len() as u32;
+			// ALLOC-OK: the device inventory is built once at boot from what the firmware describes.
+			table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys, bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(alloc::boxed::Box::new(PlatformRow { part, properties })) });
+			Some(index)
+		}
+	}
 }
 
 // The number of discovered devices.
@@ -204,7 +348,7 @@ pub fn init() {
 // containment. Answers the index it contained, so the caller can say which device it was.
 pub fn contain_faulting_endpoint(bus: u8, dev: u8, func: u8) -> Option<usize> {
 	let table = DEVICES.lock();
-	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
+	let index = table.iter().position(|entry| entry.is_function(bus, dev, func))?;
 	bus_master(&table[index], false);
 	Some(index)
 }
@@ -226,7 +370,7 @@ pub fn contain_faulting_endpoint(bus: u8, dev: u8, func: u8) -> Option<usize> {
 pub fn contain_faulting_endpoint_of_a_live_binding(bus: u8, dev: u8, func: u8, generation: u64) -> Option<usize> {
 	let table = DEVICES.lock();
 	let claims = CLAIMS.lock();
-	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
+	let index = table.iter().position(|entry| entry.is_function(bus, dev, func))?;
 	let slot = claims.get(index)?;
 	if slot.state != ClaimState::Claimed {
 		return None;
@@ -262,7 +406,7 @@ pub fn contain_faulting_endpoint_of_a_live_binding(bus: u8, dev: u8, func: u8, g
 pub fn binding_of_faulting_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Option<(usize, bool)> {
 	let table = DEVICES.lock();
 	let claims = CLAIMS.lock();
-	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
+	let index = table.iter().position(|entry| entry.is_function(bus, dev, func))?;
 	let current = claims.get(index).is_some_and(|slot| slot.state == ClaimState::Claimed && slot.generation == generation);
 	Some((index, current))
 }
@@ -325,7 +469,7 @@ fn report(kind: u8, index: usize) {
 pub fn depart(bus: u8, dev: u8, func: u8) -> Option<usize> {
 	let index = {
 		let mut table = DEVICES.lock();
-		let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func && entry.on_bus)?;
+		let index = table.iter().position(|entry| entry.is_function(bus, dev, func) && entry.on_bus)?;
 		// THE BUS-MASTER BIT IS NOT TURNED OFF HERE, because there is nothing to turn it off IN: the
 		// function is gone and a config write goes to a bus that answers all ones. What the entry
 		// says now is that it is not on the bus, and `bus_master` refuses on that alone.
@@ -353,7 +497,7 @@ pub fn depart(bus: u8, dev: u8, func: u8) -> Option<usize> {
 pub fn fault(bus: u8, dev: u8, func: u8) -> Option<usize> {
 	let index = {
 		let table = DEVICES.lock();
-		table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func && entry.on_bus)?
+		table.iter().position(|entry| entry.is_function(bus, dev, func) && entry.on_bus)?
 	};
 	// OUTSIDE THE TABLE LOCK, because a config write is a bus transaction and the table's lock is
 	// taken from an interrupt handler.
@@ -377,7 +521,7 @@ pub fn arrive(bus: u8, dev: u8, func: u8) -> Option<usize> {
 	record_ports(&mut entry);
 	let index = {
 		let mut table = DEVICES.lock();
-		match table.iter().position(|row| row.bus == bus && row.dev == dev && row.func == func) {
+		match table.iter().position(|row| row.is_function(bus, dev, func)) {
 			Some(index) => {
 				table[index] = entry;
 				index
@@ -466,13 +610,13 @@ pub fn retire_requested_slots() -> Vec<(u8, u8, u8)> {
 /// here would be a device that binds differently depending on when it was plugged in.
 fn resolve_entry(function: &crate::arch::pci::PciDevice) -> DeviceEntry {
 	if let Some(v) = crate::arch::pci::resolve_virtio_function(function) {
-		return DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS };
+		return DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS, platform: None };
 	}
 	if let Some(x) = crate::arch::pci::resolve_endpoint_function(function) {
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
-		return DeviceEntry { device_type: x.device_type as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS };
+		return DeviceEntry { device_type: x.device_type as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS, platform: None };
 	}
-	DeviceEntry { device_type: abi::DEVICE_TYPE_UNKNOWN as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: function.vendor, product: function.device_id, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: function.bus, dev: function.dev, func: function.func, class: function.class, subclass: function.subclass, prog_if: function.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS }
+	DeviceEntry { device_type: abi::DEVICE_TYPE_UNKNOWN as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: function.vendor, product: function.device_id, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: function.bus, dev: function.dev, func: function.func, class: function.class, subclass: function.subclass, prog_if: function.prog_if, on_bus: true, port_count: 0, ports: NO_PORTS, platform: None }
 }
 
 /// Give an index a FREE claim slot with a generation that has moved past every message in flight.
@@ -505,6 +649,58 @@ pub fn pci_get(index: usize) -> Option<abi::PciInfo> {
 pub fn with<R>(index: usize, f: impl FnOnce(&DeviceEntry) -> R) -> Option<R> {
 	let table = DEVICES.lock();
 	table.get(index).map(f)
+}
+
+// THE WHOLE RECORD `SYS_DEVICE_INFO` ANSWERS for one row: a PCI function's resolved layout and identity,
+// or a platform row's description in its platform part.
+pub fn info(index: usize) -> Option<abi::DeviceInfo> {
+	with(index, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, transport: d.transport, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad0: 0, _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: d.platform.as_ref().map_or_else(abi::PlatformPart::default, |row| row.part) })
+}
+
+// What the binding predicates read of a row: a PCI function's identity, or a platform row's match ids.
+fn discovered(entry: &DeviceEntry) -> driver_binding::Discovered {
+	let mut found = driver_binding::Discovered { transport: entry.transport, virtio_type: entry.device_type as u32, class: entry.class, subclass: entry.subclass, prog_if: entry.prog_if, vendor: entry.vendor, product: entry.product, bus: entry.bus, dev: entry.dev, func: entry.func, ..driver_binding::Discovered::default() };
+	if let Some(row) = entry.platform.as_ref() {
+		for id in row.part.match_ids() {
+			found.add_platform_id(id.kind, id.text());
+		}
+	}
+	found
+}
+
+// MMIO range `which` of a platform row - from 1, range 0 being the claim's own memory.
+pub fn platform_mmio(index: usize, which: u64) -> Option<(u64, u64)> {
+	with(index, |entry| {
+		let row = entry.platform.as_ref()?;
+		let range = row.part.mmio().get(which as usize).filter(|_| which != 0)?;
+		Some((range.base, range.len))
+	})
+	.flatten()
+}
+
+// Wired line `which` of a platform row.
+pub fn platform_line(index: usize, which: u64) -> Option<abi::WiredLine> {
+	with(index, |entry| entry.platform.as_ref()?.part.lines().get(which as usize).copied()).flatten()
+}
+
+// A platform row's property block, copied into `out` as far as it fits; its whole length, or None for a
+// row that has none.
+pub fn properties(index: usize, out: &mut [u8]) -> Option<usize> {
+	with(index, |entry| {
+		let row = entry.platform.as_ref()?;
+		if row.properties.is_empty() {
+			return None;
+		}
+		let take = row.properties.len().min(out.len());
+		out[..take].copy_from_slice(&row.properties[..take]);
+		Some(row.properties.len())
+	})
+	.flatten()
+}
+
+// Whether the row is a platform row, and its state - for the claim and the listing.
+pub fn platform_state(index: usize) -> Option<u8> {
+	with(index, |entry| entry.platform.as_ref().map(|row| row.part.state)).flatten()
 }
 
 // ------------------------------------------------------------------- the claim
@@ -755,12 +951,45 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 	// memory on its own. The entry the manager named is checked against this device and the boot's
 	// mode, and a refusal is a refusal: there is no fall-back to untranslated DMA, because falling
 	// back is the failure the isolation claim names in as many words.
-	let discovered = driver_binding::Discovered { transport: entry.transport, virtio_type: entry.device_type as u32, class: entry.class, subclass: entry.subclass, prog_if: entry.prog_if, vendor: entry.vendor, product: entry.product, bus: entry.bus, dev: entry.dev, func: entry.func };
-	let (admission, policy) = match crate::dma_policy::admit(entry_name, &discovered, entry.device_type) {
+	// A PLATFORM ROW IS CLAIMABLE ONLY IN ITS CLAIMABLE STATE. The kernel's own devices, the firmware's and
+	// a reservation are published so the machine is accounted for, and taking one would be a second driver
+	// for hardware something already drives.
+	if let Some(row) = entry.platform.as_ref() {
+		let name = alloc::string::String::from_utf8_lossy(row.part.identity()).into_owned();
+		match row.part.state {
+			abi::PLATFORM_STATE_CLAIMABLE => {}
+			abi::PLATFORM_STATE_KERNEL_HELD => {
+				crate::serial_println!("device: {name} is held by the kernel and is not claimable");
+				return Err(ClaimError::Refused);
+			}
+			abi::PLATFORM_STATE_FIRMWARE_HELD => {
+				crate::serial_println!("device: {name} is held by the firmware and is not claimable");
+				return Err(ClaimError::Refused);
+			}
+			_ => {
+				crate::serial_println!("device: {name} is a reservation, not a device, and is never claimable");
+				return Err(ClaimError::Refused);
+			}
+		}
+		// A DMA STREAM THIS KERNEL CANNOT TRANSLATE IS REFUSED BY NAME: its IOMMU driver serves PCI
+		// endpoints, and a platform master attached nowhere would be an untranslated one.
+		if row.part.flags & abi::PLATFORM_FLAG_DMA_STREAM != 0 {
+			crate::serial_println!("device: {name} names DMA stream {:#x}, which no IOMMU driver of this kernel serves - not claimed", row.part.dma_stream);
+			return Err(ClaimError::Refused);
+		}
+	}
+	let found = discovered(entry);
+	let (admission, policy) = match crate::dma_policy::admit(entry_name, &found, entry.device_type) {
 		Ok(admitted) => admitted,
 		Err(_) => return Err(ClaimError::Refused),
 	};
 	let masters = admission != crate::dma_policy::Admission::NonMastering;
+	// AND A PLATFORM CLAIM MASTERS NOTHING: the entry that takes one declares `dma = "none"`, or it is not an
+	// entry for this device.
+	if masters && entry.platform.is_some() {
+		crate::serial_println!("device: {index} is a platform device, which masters nothing, and entry `{}` declares DMA - not claimed", core::str::from_utf8(abi::entry_name_of(entry_name)).unwrap_or("?"));
+		return Err(ClaimError::Refused);
+	}
 	// ATTACHED BEFORE IT CAN MASTER THE BUS, and refused if the attach does not confirm. The window
 	// between "this device can reach memory" and "this device is translated" is the one place
 	// untranslated DMA could happen under an enforcing profile, and the way to have no such window
@@ -1220,7 +1449,7 @@ pub fn publish_msi_if_current(key: abi::ClaimKey, vector: u32, table_phys: u64) 
 // function that is not on the bus has no config space to write. A device with no MSI-X capability
 // has nothing to turn off, and `msix_cap` of zero is how the scan says so.
 fn msix_off(entry: &DeviceEntry) {
-	if !entry.on_bus || entry.msix_cap == 0 {
+	if !entry.has_config_space() || entry.msix_cap == 0 {
 		return;
 	}
 	crate::arch::pci::msix_disable(entry.bus, entry.dev, entry.func, entry.msix_cap);
@@ -1231,8 +1460,9 @@ fn msix_off(entry: &DeviceEntry) {
 // ONE PLACE, so that the one kind of entry that must not be written to config space can be excluded
 // in exactly one place rather than at each of the three call sites.
 fn bus_master(entry: &DeviceEntry, on: bool) {
-	// AN ENTRY THAT IS NOT ON THE BUS HAS NO CONFIG SPACE TO WRITE. See `DeviceEntry::on_bus`.
-	if !entry.on_bus {
+	// AN ENTRY THAT IS NOT ON THE BUS HAS NO CONFIG SPACE TO WRITE. See `DeviceEntry::on_bus` - and a
+	// platform row has none at all.
+	if !entry.has_config_space() {
 		return;
 	}
 	crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, on);
@@ -1240,7 +1470,7 @@ fn bus_master(entry: &DeviceEntry, on: bool) {
 
 // The same for the function's I/O decode.
 fn io_decode(entry: &DeviceEntry, on: bool) {
-	if !entry.on_bus {
+	if !entry.has_config_space() {
 		return;
 	}
 	crate::arch::ioports::set_io_decode(entry.bus, entry.dev, entry.func, on);
@@ -1330,7 +1560,7 @@ pub fn add_synthetic_device() -> usize {
 	let mut table = DEVICES.lock();
 	let index = table.len();
 	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
-	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: (index & 0x1f) as u8, func: ((index >> 5) & 7) as u8, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false, port_count: 0, ports: NO_PORTS });
+	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: (index & 0x1f) as u8, func: ((index >> 5) & 7) as u8, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false, port_count: 0, ports: NO_PORTS, platform: None });
 	drop(table);
 	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
 	// itself - the two are one entry and a table with a device and no slot for it is worse than a

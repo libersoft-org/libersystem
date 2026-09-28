@@ -184,6 +184,7 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_PORT_RANGE_UNMAP, 93),
 	(SYS_PORT_RANGE_FIRMWARE, 94),
 	(SYS_CPU_IDLE_INFO, 95),
+	(SYS_DEVICE_PROPERTIES, 96),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -644,7 +645,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	// them - the same completeness argument the syscall snapshot is built on.
 	let mut covered: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 	assert_layout!(
-		covered, DeviceInfo, 120, 8,
+		covered, DeviceInfo, 776, 8,
 		device_type => 0,
 		// The explicit padding must stay where the implicit padding was.
 		_pad0 => 4,
@@ -692,6 +693,61 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		port_count => 53,
 		_pad2 => 54,
 		ports => 56,
+		// A PLATFORM ROW'S DESCRIPTION, appended whole after the port list: the struct from 120 bytes to
+		// 776, and nothing before it moved.
+		platform => 120,
+	);
+
+	assert_layout!(
+		covered, PlatformPart, 656, 8,
+		kind => 0,
+		source => 1,
+		state => 2,
+		flags => 3,
+		match_count => 4,
+		mmio_count => 5,
+		line_count => 6,
+		connection_count => 7,
+		dma_stream => 8,
+		properties_len => 12,
+		identity => 16,
+		match_ids => 80,
+		mmio => 464,
+		lines => 560,
+		connections => 592,
+	);
+
+	assert_layout!(
+		covered, MatchId, 48, 1,
+		kind => 0,
+		len => 1,
+		text => 2,
+	);
+
+	assert_layout!(
+		covered, MmioResource, 16, 8,
+		base => 0,
+		len => 8,
+	);
+
+	assert_layout!(
+		covered, WiredLine, 8, 4,
+		number => 0,
+		trigger => 4,
+		polarity => 5,
+		controller => 6,
+		_pad => 7,
+	);
+
+	assert_layout!(
+		covered, Connection, 16, 4,
+		kind => 0,
+		trigger => 1,
+		polarity => 2,
+		_pad => 3,
+		controller => 4,
+		value => 8,
+		extra => 12,
 	);
 
 	assert_layout!(

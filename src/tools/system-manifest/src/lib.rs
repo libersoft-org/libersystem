@@ -294,7 +294,7 @@ struct RawProvides {
 // field this system does not discover fails to parse rather than never matching.
 //
 // Every field is optional and at least one must be present; an empty rule would select everything.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawMatchRule {
 	// THE TRANSPORT AND THE VIRTIO TYPE, together or not at all.
@@ -333,6 +333,43 @@ struct RawMatchRule {
 	// that already has a driver.
 	#[serde(default)]
 	pci_address: Option<RawPciAddress>,
+	// A PLATFORM DEVICE'S IDS - a device the firmware describes rather than one that announces itself. A
+	// rule names EXACTLY ONE, under `transport = "platform"`: ACPI's hardware id (`hid`) or compatible id
+	// (`cid`), a device-tree `compatible` string (a `PRP0001` node's `_DSD` strings are the same kind, so
+	// a driver matches the same way on ACPI and the tree), a static table's signature (`table`), or a
+	// method-only device's class (`class`).
+	#[serde(default)]
+	hid: Option<String>,
+	#[serde(default)]
+	cid: Option<String>,
+	#[serde(default)]
+	compatible: Option<String>,
+	#[serde(default)]
+	table: Option<String>,
+	#[serde(default)]
+	class: Option<String>,
+}
+
+impl RawMatchRule {
+	// The platform id the rule names, with its kind, or None; and how many it names.
+	fn platform_ids(&self) -> (Option<(u8, &str)>, usize) {
+		let named = [
+			(PLATFORM_ID_HID, &self.hid),
+			(PLATFORM_ID_CID, &self.cid),
+			(PLATFORM_ID_COMPATIBLE, &self.compatible),
+			(PLATFORM_ID_TABLE, &self.table),
+			(PLATFORM_ID_CLASS, &self.class),
+		];
+		let mut first = None;
+		let mut count = 0;
+		for (kind, text) in named {
+			if let Some(text) = text {
+				count += 1;
+				first.get_or_insert((kind, text.as_str()));
+			}
+		}
+		(first, count)
+	}
 }
 
 // THE TRANSPORTS THIS SYSTEM DISCOVERS, as a closed set rather than a string.
@@ -349,6 +386,8 @@ enum RawTransport {
 	// can match a virtio function AND a plain one - which is what made every virtio row overlap the
 	// xHCI row the first time this vocabulary was checked. Naming it is what separates them.
 	PlainPci,
+	// A platform device: one the firmware describes. Its identity is the id the rule names.
+	Platform,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -711,6 +750,51 @@ pub struct MatchRule {
 	pub pci_vendor: Option<u16>,
 	pub pci_product: Option<u16>,
 	pub pci_address: Option<PciAddress>,
+	// The one platform id a `transport = "platform"` rule names.
+	pub platform: Option<PlatformPredicate>,
+}
+
+// THE KINDS OF PLATFORM ID - `abi::MATCH_ID_*`'s numbers, written here for the reason the transports are.
+pub const PLATFORM_ID_HID: u8 = 1;
+pub const PLATFORM_ID_CID: u8 = 2;
+pub const PLATFORM_ID_COMPATIBLE: u8 = 3;
+pub const PLATFORM_ID_TABLE: u8 = 4;
+pub const PLATFORM_ID_CLASS: u8 = 5;
+// The ABI's bound on one id.
+pub const PLATFORM_ID_TEXT: usize = 46;
+
+// One platform id a rule names: its kind and text, in a fixed buffer so the rule stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlatformPredicate {
+	pub kind: u8,
+	pub len: u8,
+	pub text: [u8; PLATFORM_ID_TEXT],
+}
+
+impl PlatformPredicate {
+	pub fn text(&self) -> &str {
+		core::str::from_utf8(&self.text[..self.len as usize]).unwrap_or("")
+	}
+
+	pub fn key(&self) -> &'static str {
+		match self.kind {
+			PLATFORM_ID_HID => "hid",
+			PLATFORM_ID_CID => "cid",
+			PLATFORM_ID_COMPATIBLE => "compatible",
+			PLATFORM_ID_TABLE => "table",
+			_ => "class",
+		}
+	}
+}
+
+// Serialized as the manifest spells it: `{ "hid": "PNP0501" }`.
+impl Serialize for PlatformPredicate {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		use serde::ser::SerializeMap;
+		let mut map = serializer.serialize_map(Some(1))?;
+		map.serialize_entry(self.key(), self.text())?;
+		map.end()
+	}
 }
 
 // What `transport = "virtio-pci"` becomes. The same number `abi::TRANSPORT_VIRTIO_PCI` is, written
@@ -718,6 +802,7 @@ pub struct MatchRule {
 // kept in step by `check-declared-interfaces`, which reads both.
 pub const TRANSPORT_VIRTIO_PCI: u8 = 1;
 pub const TRANSPORT_PLAIN_PCI: u8 = 0;
+pub const TRANSPORT_PLATFORM: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct PciAddress {
@@ -747,6 +832,14 @@ impl MatchRule {
 			&& optional_overlaps16(self.pci_vendor, other.pci_vendor)
 			&& optional_overlaps16(self.pci_product, other.pci_product)
 			&& match (self.pci_address, other.pci_address) {
+				(Some(left), Some(right)) => left == right,
+				_ => true,
+			}
+			// TWO PLATFORM RULES OVERLAP WHEN THEY NAME THE SAME ID. A device can answer to several - a
+			// node's `compatible` list, a merged row's ids - so two rules naming different ids could still
+			// meet on one; which ids a firmware puts together is not something a build can know, and the
+			// registry's order decides that case the way the priority decides this one.
+			&& match (self.platform, other.platform) {
 				(Some(left), Some(right)) => left == right,
 				_ => true,
 			}
@@ -1170,6 +1263,15 @@ impl Manifest {
 						transport: rule.transport.map(|transport| match transport {
 							RawTransport::VirtioPci => TRANSPORT_VIRTIO_PCI,
 							RawTransport::PlainPci => TRANSPORT_PLAIN_PCI,
+							RawTransport::Platform => TRANSPORT_PLATFORM,
+						}),
+						platform: rule.platform_ids().0.and_then(|(kind, text)| {
+							let bytes = text.as_bytes();
+							(bytes.len() <= PLATFORM_ID_TEXT).then(|| {
+								let mut buffer = [0u8; PLATFORM_ID_TEXT];
+								buffer[..bytes.len()].copy_from_slice(bytes);
+								PlatformPredicate { kind, len: bytes.len() as u8, text: buffer }
+							})
 						}),
 						virtio_type: rule.virtio_type,
 						pci_class: rule.pci_class,
@@ -1790,7 +1892,25 @@ fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativeP
 			//    that address to the console driver".
 			let names_a_standard: bool = rule.virtio_type.is_some() || rule.pci_class.is_some();
 			if !names_a_standard && (rule.pci_vendor.is_some() || rule.pci_product.is_some() || rule.pci_address.is_some()) {
-				push_error(errors, at, "pci-vendor, pci-product and pci-address may only NARROW a rule that already names a standard identity - a virtio type or a PCI class - because none of them says what a device is");
+				push_error(errors, at.clone(), "pci-vendor, pci-product and pci-address may only NARROW a rule that already names a standard identity - a virtio type or a PCI class - because none of them says what a device is");
+			}
+			// 6. A PLATFORM RULE NAMES ONE ID AND NOTHING PCI. The ids are the whole of a platform device's
+			//    identity, and a PCI predicate beside one names a bus the device is not on.
+			let (platform_id, platform_count) = rule.platform_ids();
+			if rule.transport == Some(RawTransport::Platform) {
+				if platform_count != 1 {
+					push_error(errors, at.clone(), "a platform rule names exactly one id - hid, cid, compatible, table or class - because an id is the whole of what a platform device answers to");
+				}
+				if rule.virtio_type.is_some() || rule.pci_class.is_some() || rule.pci_vendor.is_some() || rule.pci_product.is_some() || rule.pci_address.is_some() {
+					push_error(errors, at.clone(), "a platform device is not a PCI function, so no virtio or pci predicate can describe it");
+				}
+			} else if platform_count != 0 {
+				push_error(errors, at.clone(), "hid, cid, compatible, table and class are a platform device's ids, so the rule must say `transport = \"platform\"`");
+			}
+			if let Some((_, text)) = platform_id
+				&& (text.is_empty() || text.len() > PLATFORM_ID_TEXT || !text.bytes().all(|byte| byte.is_ascii_graphic()))
+			{
+				push_error(errors, at, format!("the platform id {text:?} is not 1 to {PLATFORM_ID_TEXT} printable characters, which is what the kernel's rows carry"));
 			}
 		}
 		// Two rules in ONE entry that overlap are a declaration written twice, which is harmless at

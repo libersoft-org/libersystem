@@ -7037,6 +7037,8 @@ struct Rule {
 	pci_vendor: Option<u16>,
 	pci_product: Option<u16>,
 	pci_address: Option<Address>,
+	// The one id a platform rule names.
+	platform: Option<driver_binding::PlatformId>,
 }
 
 impl Rule {
@@ -7045,12 +7047,21 @@ impl Rule {
 	// here would be a second thing to keep in step, and the one that is not tested is the one that
 	// drifts. See the note beside `Match` for why the conjunction could not be checked before.
 	fn matches(self, info: &DeviceInfo) -> bool {
-		self.as_match().matches(&driver_binding::Discovered { transport: info.transport, virtio_type: info.device_type, class: info.class, subclass: info.subclass, prog_if: info.prog_if, vendor: info.vendor, product: info.product, bus: info.bus, dev: info.dev, func: info.func })
+		self.as_match().matches(&discovered(info))
 	}
 
 	fn as_match(self) -> driver_binding::Match {
-		driver_binding::Match { transport: self.transport, virtio_type: self.virtio_type, class: self.pci_class, subclass: self.pci_subclass, prog_if: self.pci_interface, vendor: self.pci_vendor, product: self.pci_product, address: self.pci_address.map(|address| (address.bus, address.dev, address.func)) }
+		driver_binding::Match { transport: self.transport, virtio_type: self.virtio_type, class: self.pci_class, subclass: self.pci_subclass, prog_if: self.pci_interface, vendor: self.pci_vendor, product: self.pci_product, address: self.pci_address.map(|address| (address.bus, address.dev, address.func)), platform: self.platform }
 	}
+}
+
+// WHAT THE MATCHER READS OF A ROW: a PCI function's identity, or the ids a platform device answers to.
+fn discovered(info: &DeviceInfo) -> driver_binding::Discovered {
+	let mut found = driver_binding::Discovered { transport: info.transport, virtio_type: info.device_type, class: info.class, subclass: info.subclass, prog_if: info.prog_if, vendor: info.vendor, product: info.product, bus: info.bus, dev: info.dev, func: info.func, ..driver_binding::Discovered::default() };
+	for id in info.platform.match_ids() {
+		found.add_platform_id(id.kind, id.text());
+	}
+	found
 }
 
 struct Entry {

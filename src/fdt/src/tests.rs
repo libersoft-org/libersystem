@@ -2777,3 +2777,147 @@ fn a_specifier_shorter_than_its_controllers_binding_is_refused() {
 	));
 	assert_eq!(empty.console_interrupt(), None, "an `interrupts-extended` with nothing in it");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Every device node, as the kernel publishes them.
+// ---------------------------------------------------------------------------------------------
+//
+// THE COUNTS AND FACTS ARE THE FIXTURES', decoded with the same independent reader the console's
+// interrupt was: 47 nodes with a `compatible` on aarch64 `virt` and 41 on riscv64 `virt,aia=aplic-imsic`,
+// the root among them - which is the machine and not a device, so the walk reports one fewer.
+
+fn devices_of(tree: &Fdt) -> Vec<(Vec<u8>, DeviceNode)> {
+	let mut found = Vec::new();
+	assert!(tree.devices(|node| found.push((node.path().to_vec(), *node))), "the walk completes");
+	found
+}
+
+fn device<'a>(found: &'a [(Vec<u8>, DeviceNode)], path: &[u8]) -> &'a DeviceNode {
+	&found.iter().find(|(at, _)| at == path).unwrap_or_else(|| panic!("{} is published", String::from_utf8_lossy(path))).1
+}
+
+#[test]
+fn every_aarch64_virt_device_node_is_published_with_its_translated_reg_and_its_interrupt() {
+	let tree = at(AARCH64);
+	let found = devices_of(&tree);
+	assert_eq!(found.len(), 46, "every node with a compatible but the root");
+	let uart = device(&found, b"/pl011@9000000");
+	assert!(uart.is_compatible(b"arm,pl011") && uart.is_compatible(b"arm,primecell"));
+	assert_eq!((uart.bus, uart.regs()), (NodeBus::Memory, &[(0x0900_0000, 0x1000)][..]));
+	assert_eq!(uart.interrupts(), &[NodeInterrupt::Controller(IntxRoute { controller: 0x8002, cells: 3, spec: [0, 1, 4, 0] })]);
+	let rtc = device(&found, b"/pl031@9010000");
+	assert_eq!(rtc.interrupts(), &[NodeInterrupt::Controller(IntxRoute { controller: 0x8002, cells: 3, spec: [0, 2, 4, 0] })]);
+	let fw_cfg = device(&found, b"/fw-cfg@9020000");
+	assert_eq!((fw_cfg.regs(), fw_cfg.interrupts().len()), (&[(0x0902_0000, 0x18)][..], 0));
+	let gpio = device(&found, b"/pl061@9030000");
+	assert!(gpio.gpio_controller && !gpio.interrupt_controller);
+	let gic = device(&found, b"/intc@8000000");
+	assert!(gic.interrupt_controller);
+	assert_eq!(gic.regs(), &[(0x0800_0000, 0x1_0000), (0x0801_0000, 0x1_0000)], "both of the controller's ranges");
+}
+
+#[test]
+fn every_riscv64_aia_device_node_is_published_under_its_bus() {
+	let tree = at(RISCV64_AIA);
+	let found = devices_of(&tree);
+	assert_eq!(found.len(), 40);
+	let uart = device(&found, b"/soc/serial@10000000");
+	assert_eq!(uart.regs(), &[(0x1000_0000, 0x100)]);
+	assert_eq!(uart.interrupts(), &[NodeInterrupt::Controller(IntxRoute { controller: 0x14, cells: 2, spec: [10, 4, 0, 0] })]);
+	let rtc = device(&found, b"/soc/rtc@101000");
+	assert!(rtc.is_compatible(b"google,goldfish-rtc"));
+	assert_eq!(rtc.interrupts(), &[NodeInterrupt::Controller(IntxRoute { controller: 0x14, cells: 2, spec: [11, 4, 0, 0] })]);
+	let test = device(&found, b"/soc/test@100000");
+	assert!(test.is_compatible(b"sifive,test1") && test.is_compatible(b"sifive,test0"));
+	assert_eq!((test.regs(), test.interrupts().len()), (&[(0x0010_0000, 0x1000)][..], 0));
+}
+
+// A tree the fixtures cannot express: a TPM node under a `simple-bus` whose `ranges` move it, an I2C
+// controller with a child at an address on it, a GPIO controller that is also an interrupt controller
+// with a node whose interrupt is one of its lines, a disabled node, a clock tree with a `fixed-clock`
+// and one that is not, and references the kernel cannot resolve.
+fn platform_bus_tree() -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop_u32("interrupt-parent", 1);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("intc@8000000").prop_u32("phandle", 1).prop_u32("#interrupt-cells", 3).prop("interrupt-controller", b"").prop_str("compatible", "arm,cortex-a15-gic").prop_reg64(0x0800_0000, 0x1_0000).end();
+	builder.begin("osc").prop_str("compatible", "fixed-clock").prop_u32("#clock-cells", 0).prop_u32("clock-frequency", 24_000_000).prop_u32("phandle", 7).end();
+	builder.begin("pll").prop_str("compatible", "vendor,pll").prop_u32("#clock-cells", 1).prop_u32("phandle", 8).end();
+	// The platform bus: its children at 0..0x2000000 land at 0x0c00_0000.
+	builder.begin("platform-bus@c000000").prop_str("compatible", "qemu,platform").prop_u32("#address-cells", 1).prop_u32("#size-cells", 1).prop("ranges", &be_cells(&[0, 0, 0x0c00_0000, 0x0200_0000]));
+	builder.begin("tpm@0").prop("compatible", b"tcg,tpm-tis-mmio\0tcg,tpm_tis\0").prop("reg", &be_cells(&[0, 0x5000])).end();
+	builder.begin("gpio@10000").prop_str("compatible", "vendor,gpio").prop("reg", &be_cells(&[0x10000, 0x1000])).prop("gpio-controller", b"").prop("interrupt-controller", b"").prop_u32("#interrupt-cells", 2).prop_u32("phandle", 9).end();
+	builder.begin("button@20000").prop_str("compatible", "vendor,button").prop("reg", &be_cells(&[0x20000, 0x100])).prop_u32("interrupt-parent", 9).prop("interrupts", &be_cells(&[5, 2])).prop("clocks", &be_cells(&[7, 8, 3])).prop_u32("vdd-supply", 11).prop_str("label", "power").end();
+	builder.begin("i2c@30000").prop_str("compatible", "vendor,i2c").prop("reg", &be_cells(&[0x30000, 0x1000])).prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	builder.begin("touchpad@2c").prop_str("compatible", "hid-over-i2c").prop_u32("reg", 0x2c).prop("interrupts-extended", &be_cells(&[9, 17, 8])).end();
+	builder.end();
+	builder.begin("gone@40000").prop_str("compatible", "vendor,gone").prop("reg", &be_cells(&[0x40000, 0x100])).prop_str("status", "disabled").end();
+	builder.end();
+	builder.end();
+	builder.finish()
+}
+
+#[test]
+fn a_node_behind_a_simple_bus_is_published_at_the_address_its_ranges_translate_it_to() {
+	let tree = at(platform_bus_tree());
+	let found = devices_of(&tree);
+	let tpm = device(&found, b"/platform-bus@c000000/tpm@0");
+	assert_eq!((tpm.bus, tpm.regs()), (NodeBus::Memory, &[(0x0c00_0000, 0x5000)][..]));
+	assert!(tpm.is_compatible(b"tcg,tpm-tis-mmio") && tpm.is_compatible(b"tcg,tpm_tis"));
+	assert!(!found.iter().any(|(path, _)| path.ends_with(b"gone@40000")), "a disabled node is not published");
+	assert!(found.iter().position(|(path, _)| path == b"/platform-bus@c000000/tpm@0") < found.iter().position(|(path, _)| path == b"/platform-bus@c000000"), "a node's children come before it");
+}
+
+#[test]
+fn an_interrupt_on_a_gpio_controller_is_a_line_of_it_and_an_i2c_child_is_an_address_on_its_bus() {
+	let tree = at(platform_bus_tree());
+	let found = devices_of(&tree);
+	let button = device(&found, b"/platform-bus@c000000/button@20000");
+	assert_eq!(button.interrupts(), &[NodeInterrupt::GpioLine { controller: 9, line: 5, flags: 2 }]);
+	let touchpad = device(&found, b"/platform-bus@c000000/i2c@30000/touchpad@2c");
+	assert_eq!((touchpad.bus, touchpad.regs()), (NodeBus::I2c, &[(0x2c, 0)][..]));
+	assert_eq!(touchpad.interrupts(), &[NodeInterrupt::GpioLine { controller: 9, line: 17, flags: 8 }], "interrupts-extended names its own controller");
+	let gpio = device(&found, b"/platform-bus@c000000/gpio@10000");
+	assert!(gpio.gpio_controller && gpio.interrupt_controller);
+}
+
+// Take a property block apart into (kind, depth, name, value) records.
+fn records(block: &[u8]) -> Vec<(u8, u8, Vec<u8>, Vec<u8>)> {
+	let mut out = Vec::new();
+	let mut at = 0;
+	while at + 8 <= block.len() {
+		let name_len = u16::from_le_bytes([block[at + 2], block[at + 3]]) as usize;
+		let value_len = u32::from_le_bytes(block[at + 4..at + 8].try_into().unwrap()) as usize;
+		let name = block[at + 8..at + 8 + name_len].to_vec();
+		let value = block[at + 8 + name_len..at + 8 + name_len + value_len].to_vec();
+		out.push((block[at], block[at + 1], name, value));
+		at += 8 + name_len + ((value_len + 3) & !3);
+	}
+	out
+}
+
+#[test]
+fn a_property_block_resolves_a_fixed_clock_and_names_what_it_cannot_resolve() {
+	let tree = at(platform_bus_tree());
+	let found = devices_of(&tree);
+	let button = device(&found, b"/platform-bus@c000000/button@20000");
+	let mut out = [0u8; 1024];
+	let block = tree.property_block(button, &mut out);
+	assert!(block.unresolved, "a clock that is not fixed and a supply are named, so the block says so");
+	let seen = records(&out[..block.len]);
+	assert!(seen.contains(&(3, 0, b"clocks".to_vec(), 24_000_000u64.to_le_bytes().to_vec())), "the fixed clock, resolved to its frequency");
+	assert!(seen.contains(&(4, 0, b"clocks".to_vec(), Vec::new())), "the PLL, which is not a fixed clock");
+	assert!(seen.contains(&(4, 0, b"vdd-supply".to_vec(), Vec::new())), "a regulator reference");
+	assert!(seen.contains(&(2, 0, b"label".to_vec(), b"power\0".to_vec())), "an ordinary property, copied");
+	// And child nodes with their own properties: the I2C controller's block carries the touchpad.
+	let i2c = device(&found, b"/platform-bus@c000000/i2c@30000");
+	let block = tree.property_block(i2c, &mut out);
+	let seen = records(&out[..block.len]);
+	assert!(seen.contains(&(1, 1, b"touchpad@2c".to_vec(), Vec::new())), "the child node opens at depth one");
+	assert!(seen.contains(&(2, 1, b"compatible".to_vec(), b"hid-over-i2c\0".to_vec())), "and its properties are at its depth");
+	// A block cut at its bound says so.
+	let mut small = [0u8; 40];
+	let cut = tree.property_block(button, &mut small);
+	assert!(cut.unresolved && cut.len <= 40);
+}

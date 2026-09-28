@@ -24,7 +24,7 @@ use super::paging::phys_to_virt;
 use core::fmt::{self, Write};
 
 // The NS16550 on QEMU virt. Byte-wide registers, no shift.
-const UART_BASE: u64 = 0x1000_0000;
+pub(crate) const UART_BASE: u64 = 0x1000_0000;
 const RBR_THR: u64 = 0x00; // receive buffer (read) / transmit holding (write)
 #[cfg(not(test))]
 const IER: u64 = 0x01; // interrupt enable

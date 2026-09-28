@@ -1,0 +1,16 @@
+[package]
+name = "platform"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "Where a firmware description of a platform device goes in the device table - a row of its own, the row that already carries its identity, merged into one, or refused - as pure functions a host can drive"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+abi = { path = "../abi" }
+
+# A WARNING IS AN ERROR HERE: this is the rule that decides which description owns which registers.
+[lints.rust]
+warnings = "deny"

@@ -131,10 +131,29 @@ fn loader_root_selection(arg: u64) -> Option<bootproto::RootSelection> {
 }
 
 // The boot argument, kept so a module can be looked up after the early boot has moved on.
-static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(super) static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // The loader's DMA-mode words, read the same way the root selection is: physically, before this
 // kernel publishes anything, and only when the boot argument really is a `BootInfo`.
+// THE SMBIOS ENTRY POINT THE LOADER FOUND, read the way the DMA mode is: physically, before this kernel
+// publishes anything, and only from a `BootInfo` this kernel reads - a direct device-tree boot has no
+// firmware to have asked, and answers 0.
+pub(crate) fn loader_smbios(arg: u64) -> u64 {
+	if arg == 0 {
+		return 0;
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return 0;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	let version = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).version)) };
+	if version != bootproto::VERSION {
+		return 0;
+	}
+	unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).smbios)) }
+}
+
 fn loader_dma_mode(arg: u64) -> Option<(u32, u32)> {
 	if arg == 0 {
 		return None;
@@ -733,7 +752,7 @@ fn publish_embedded_boot_info() {
 	// boot path that builds the structure the rest of the kernel reads; there is no userspace yet
 	// to reach it, no caller to refuse, and nothing to fall back to if it failed - a machine that
 	// cannot allocate its own boot description has not started.
-	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] }, dma_mode, dma_provenance }));
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] }, dma_mode, dma_provenance, smbios: loader_smbios(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst)) }));
 	crate::publish_boot_info(bi);
 }
 

@@ -2487,6 +2487,9 @@ pub unsafe fn scan(start: u64, end: u64, step: u64, phys_to_virt: fn(u64) -> u64
 	None
 }
 
+mod devices;
+pub use devices::{DeviceNode, MAX_COMPATIBLE, MAX_NODE_INTERRUPTS, MAX_NODE_REGS, NodeBus, NodeInterrupt, PropertyBlock};
+
 #[cfg(test)]
 mod tests;
 

@@ -186,7 +186,9 @@ def qmp(path, command, arguments, timeout):
 
 
 def build(target):
-	env = dict(os.environ, LIBER_DEVELOPMENT='1', STRIP='none')
+	# THE DEVELOPMENT PROFILE, and the ordinary strip: `STRIP=none` re-stages every library unstripped over
+	# a tree whose consumers recorded the stripped ones, and the build then refuses the mix.
+	env = dict(os.environ, LIBER_DEVELOPMENT='1')
 	note(f'building {target} with the development profile')
 	if subprocess.run(lab.build_command(target), cwd=SRC, env=env).returncode != 0:
 		raise GateError(f'the {target} system did not build')
@@ -209,7 +211,7 @@ def drive(target):
 		os.unlink(serial_path)
 	# THE COLD SCENARIO RUNNER'S GUEST, with the serial line on a socket this gate holds rather than in a
 	# file: `server` without `nowait`, so QEMU waits for the connection and no boot byte is lost.
-	env = dict(os.environ, LIBER_DEVELOPMENT='1', STRIP='none', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development')
+	env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development')
 	if target != 'x86_64':
 		env['UEFI'] = '1'
 	note(f'booting {target}; serial log {os.path.relpath(log_path, SRC)}')
@@ -257,29 +259,40 @@ def check(target, serial, qmp_path, scale):
 	identity = int(armed.group(1))
 	# AN IDLE MACHINE, which is the claim: the boot's own output has stopped before anything is typed.
 	serial.settle(2.0 * scale, 120 * scale)
+	# THE CONTROL: two reads with nothing typed between them but the second `graph`. Typing that command is
+	# typing too, and its own wakes are in every later read - so they are measured here and taken off.
+	first = cores(serial, 60 * scale)
 	before = cores(serial, 60 * scale)
+	control = wakes_on(before, identity) - wakes_on(first, identity)
 	latencies = []
 	for burst in range(BURSTS):
-		# Idle again before each burst, so each one lands on a halted boot processor.
+		# Idle again before each burst, so it lands on a machine with nothing to do.
 		serial.settle(1.0 * scale, 30 * scale)
 		text = f'echo tickless-{burst}'
-		mark = len(serial.data)
-		written = time.monotonic()
-		serial.type(text.encode())
-		serial.wait_for(mark, lambda seen, want=text.encode(): want in seen, 30 * scale, f'the echo of {text!r}')
-		latency = time.monotonic() - written
-		latencies.append(latency)
-		if latency > ECHO_BOUND:
-			raise GateError(f'{text!r} was echoed {latency * 1000:.0f} ms after the host wrote it, past the {ECHO_BOUND * 1000:.0f} ms bound')
+		# TYPED AS A PERSON TYPES IT, a key at a time, each timed from the host's write to the shell's echo:
+		# the interval the host can observe. A whole line written at once lands in the UART's FIFO as one
+		# interrupt, and whether that one found the boot processor halted is a coin the housekeeping it
+		# still wakes for tosses; fifteen keys are fifteen interrupts.
+		for typed in range(1, len(text) + 1):
+			mark = len(serial.data)
+			written = time.monotonic()
+			serial.type(text[typed - 1].encode())
+			serial.wait_for(mark, lambda seen, want=text[typed - 1].encode(): want in seen, 30 * scale, f'the echo of key {typed} of {text!r}')
+			latency = time.monotonic() - written
+			latencies.append(latency)
+			if latency > ECHO_BOUND:
+				raise GateError(f'key {typed} of {text!r} was echoed {latency * 1000:.0f} ms after the host wrote it, past the {ECHO_BOUND * 1000:.0f} ms bound')
+			# A person's pace, so the machine is idle again between keys.
+			serial.settle(0.05 * scale, 1.0 * scale)
 		mark = len(serial.data)
 		serial.type(b'\n')
 		serial.wait_prompt(mark, 30 * scale, f'`{text}`')
 	after = cores(serial, 60 * scale)
-	raised = wakes_on(after, identity) - wakes_on(before, identity)
+	raised = wakes_on(after, identity) - wakes_on(before, identity) - control
 	if raised < BURSTS:
-		raise GateError(f'{BURSTS} typed bursts woke the idle machine {raised} time(s) on interrupt {identity}: typed input is being found by a poll, not raised by the UART')
-	echoes = ', '.join(f'{latency * 1000:.0f}' for latency in latencies)
-	note(f'{target}: {BURSTS} typed bursts echoed in {echoes} ms, and woke the idle machine {raised} time(s) on the UART\'s interrupt {identity}')
+		raise GateError(f'{BURSTS} typed bursts woke the idle machine {raised} time(s) on interrupt {identity} beyond what typing `graph` does ({control}): typed input is being found by a poll, not raised by the UART')
+	slowest = max(latencies)
+	note(f'{target}: {BURSTS} bursts, {len(latencies)} keys, each echoed within {slowest * 1000:.0f} ms (median {sorted(latencies)[len(latencies) // 2] * 1000:.0f} ms), and they woke the idle machine {raised} time(s) on the UART\'s interrupt {identity} (typing `graph` alone: {control})')
 	# THE IDLE RATE, from the same records: each core's wakes over a quiet interval. The `graph` read that
 	# closes the interval wakes the machine too and is counted in, so the rate is an upper bound.
 	serial.settle(2.0 * scale, 30 * scale)

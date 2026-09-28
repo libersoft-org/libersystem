@@ -15,12 +15,12 @@
 // which LPI to raise and where. So a vector here is an SPI INTID on one machine and an LPI INTID on
 // the other, and the slot bookkeeping below is the same either way.
 //
-// This mirrors x86 interrupts.rs, minus the legacy-INTx window: every aarch64 driver
+// This mirrors x86 interrupts.rs, minus the legacy-INTx window: every aarch64 PCI driver
 // that needs an interrupt (virtio-net/input/snd, xhci, virtio-gpu) uses MSI-X, and
-// the polled drivers (virtio-blk/console) need none - so is_bindable is always false
-// and only the MSI window is live. The MSI-X table lives in a device BAR reachable
-// through the higher-half physical direct map (phys_to_virt), so - unlike x86 - no
-// separate uncacheable mapping is set up here.
+// the polled drivers (virtio-blk/console) need none. A wired line reaches a driver only
+// as a platform row's claimed line (`bind_wired`). The MSI-X table lives in a device BAR
+// reachable through the higher-half physical direct map (phys_to_virt), so - unlike x86 -
+// no separate uncacheable mapping is set up here.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -204,18 +204,84 @@ pub fn dispatch_wired(intid: u32) -> bool {
 	WIRED.dispatch(intid)
 }
 
-// No legacy-INTx binding on aarch64 FOR A USERSPACE DRIVER: every driver that needs an interrupt
-// uses MSI-X, and the wired lines above are the kernel's own.
-pub fn is_bindable(_vector: u32) -> bool {
-	false
+// A CLAIMED WIRED LINE: a shared peripheral interrupt by INTID, whether it is level-triggered, and the
+// `Interrupt` its driver waits on - held weakly, so the driver letting go (its Interrupt's `Drop`) is what
+// unbinds it. A slot is free only when it is empty - see the x86_64 `Line`.
+struct Line {
+	intid: u32,
+	level: bool,
+	intr: alloc::sync::Weak<Interrupt>,
 }
 
-// The INTx bind path is unused on aarch64 (see is_bindable); it always refuses.
-pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
-	false
+const MAX_LINES: usize = 32;
+static LINES: [crate::sync::SpinLock<Option<Line>>; MAX_LINES] = [const { crate::sync::SpinLock::new(None) }; MAX_LINES];
+
+// Binds one at a time, so two cannot choose the same free slot.
+static BINDING: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+fn line_slot(intid: u32) -> Option<usize> {
+	LINES.iter().position(|slot| slot.lock().as_ref().is_some_and(|line| line.intid == intid))
 }
 
-// Remove any binding for `vector` (called from an Interrupt's Drop).
+// BIND A PLATFORM ROW'S WIRED LINE to a new `Interrupt`: its SPI configured with the row's trigger, routed to
+// the boot core and enabled. Refused, in words: a line of another controller, an INTID that is not a shared
+// peripheral interrupt, one in the MSI frame's window, one the kernel answers itself, one another claim holds,
+// or a full table.
+pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str> {
+	if line.controller != abi::LINE_CONTROLLER_GIC {
+		return Err("its line is not a GIC's");
+	}
+	let intid = line.number;
+	if !(32..1020).contains(&intid) {
+		return Err("its INTID is not a shared peripheral interrupt");
+	}
+	if spi_slot(intid).is_some() {
+		return Err("that SPI belongs to the MSI frame");
+	}
+	if WIRED.holds(intid) {
+		return Err("the kernel answers that line itself");
+	}
+	let _binding = BINDING.lock();
+	if line_slot(intid).is_some() {
+		return Err("another claim holds that line");
+	}
+	let Some(free) = LINES.iter().position(|slot| slot.lock().is_none()) else {
+		return Err("this kernel's table of claimed lines is full");
+	};
+	let Some(intr) = Interrupt::new(intid) else { return Err("the Interrupt object could not be allocated") };
+	let level = line.trigger == abi::LINE_TRIGGER_LEVEL;
+	*LINES[free].lock() = Some(Line { intid, level, intr: Arc::downgrade(&intr) });
+	intr.mark_bound();
+	super::gic::enable_spi(intid, if level { super::gic::Trigger::Level } else { super::gic::Trigger::Edge });
+	Ok(intr)
+}
+
+// A CLAIMED LINE FIRED: its driver is woken, and a LEVEL line is disabled at the distributor until the driver
+// acknowledges - its source stays asserted until the driver has run. False when no claim holds `intid`.
+pub fn signal_line(intid: u32) -> bool {
+	let Some(at) = line_slot(intid) else { return false };
+	let held = LINES[at].lock();
+	let Some(line) = held.as_ref() else { return false };
+	if line.level {
+		super::gic::disable_spi(intid);
+	}
+	if let Some(intr) = line.intr.upgrade() {
+		intr.signal();
+	}
+	true
+}
+
+// THE DRIVER ACKNOWLEDGED: a level line disabled when it fired is enabled again.
+pub fn acknowledge(vector: u32) {
+	if let Some(at) = line_slot(vector)
+		&& let Some(line) = LINES[at].lock().as_ref()
+		&& line.level
+	{
+		super::gic::unmask_spi(line.intid);
+	}
+}
+
+// Remove any binding for `vector` (called from an Interrupt's Drop, or its claim's revocation).
 //
 // The SPI is retired rather than freed, for the reason the x86 backend spells out: the device's
 // MSI-X entry was programmed to write the GICv2m frame, and nothing here can prove a write already
@@ -225,6 +291,15 @@ pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 // shared with riscv64, where the answer can be false, so a caller can fold it into a claim's
 // terminal state without asking which architecture it is on.
 pub fn unbind(vector: u32) -> bool {
+	// A CLAIMED WIRED LINE: disabled at the distributor, and only then its slot given back.
+	if let Some(at) = line_slot(vector) {
+		let mut held = LINES[at].lock();
+		if let Some(line) = held.as_ref() {
+			super::gic::disable_spi(line.intid);
+		}
+		*held = None;
+		return true;
+	}
 	if let Some(slot) = spi_slot(vector) {
 		release_translation(slot, vector);
 		REGISTRY.retire(slot);
@@ -403,6 +478,9 @@ pub fn bind_msi(vector: u32, intr: &Arc<Interrupt>) -> bool {
 // Whether `vector` currently has a live driver binding. Used to confirm a crashed
 // driver's IRQ was detached during cleanup.
 pub fn is_bound(vector: u32) -> bool {
+	if let Some(at) = line_slot(vector) {
+		return LINES[at].lock().as_ref().is_some_and(|line| line.intr.strong_count() != 0);
+	}
 	match spi_slot(vector) {
 		Some(slot) => REGISTRY.is_bound(slot),
 		None => false,

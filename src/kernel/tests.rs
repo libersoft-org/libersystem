@@ -3116,7 +3116,7 @@ pub(crate) fn claim_device_as(index: u64, entry: &[u8; abi::ENTRY_NAME_LEN]) -> 
 // Which registry entry a test would claim the device at `index` under. The synthetic devices are
 // declared for by the synthetic entries; a real device by the manifest's rows.
 pub(crate) fn entry_for_device(index: u64) -> Option<[u8; abi::ENTRY_NAME_LEN]> {
-	let discovered = device::with(index as usize, |d| driver_binding::Discovered { transport: d.transport, virtio_type: d.device_type as u32, class: d.class, subclass: d.subclass, prog_if: d.prog_if, vendor: d.vendor, product: d.product, bus: d.bus, dev: d.dev, func: d.func })?;
+	let discovered = device::with(index as usize, |d| driver_binding::Discovered { transport: d.transport, virtio_type: d.device_type as u32, class: d.class, subclass: d.subclass, prog_if: d.prog_if, vendor: d.vendor, product: d.product, bus: d.bus, dev: d.dev, func: d.func, ..driver_binding::Discovered::default() })?;
 	dma_policy::entry_matching(&discovered)
 }
 
@@ -4686,6 +4686,16 @@ fn spawn_harness(storage_elf: &[u8], boot_user: alloc::sync::Arc<dyn object::Ker
 	}
 }
 
+// THE SERVICE GOES WITH ITS HARNESS, for the reason the service suites' rigs give: a test that leaves its
+// StorageService running leaves the next one a process whose peers have all closed.
+impl Drop for StorageHarness {
+	fn drop(&mut self) {
+		if let Some(process) = self.process.take() {
+			process.terminate();
+		}
+	}
+}
+
 impl StorageHarness {
 	// Start a StorageService over a disk carrying `image` verbatim: a FAT, ISO or UDF medium, or
 	// any other fixture that is already a filesystem image.
@@ -4846,11 +4856,11 @@ impl StorageHarness {
 		let (block, block_child) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		spawn_harness(storage_elf, boot_user);
+		let process = spawn_harness(storage_elf, boot_user);
 		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk, capacity, process: None, backing: Backing::Disk { tag: tag.to_vec() } };
+		let mut harness = Self { boot, block, client, admin, disk, capacity, process: Some(process), backing: Backing::Disk { tag: tag.to_vec() } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -4905,7 +4915,7 @@ impl StorageHarness {
 		let (block, _unused) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		spawn_harness(storage_elf, boot_user);
+		let process = spawn_harness(storage_elf, boot_user);
 		let ramdisk = MemoryObject::create(volume.len()).expect("no memory for the archive");
 		copy_into_object(&ramdisk, volume);
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
@@ -4918,7 +4928,7 @@ impl StorageHarness {
 		// Restarting this one is not expressible: the volume is a MemoryObject handed over at
 		// bootstrap, not a backing this harness can rebuild. No test asks, and `restart` would need
 		// the archive bytes to try.
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64, process: None, backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64, process: Some(process), backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -5282,7 +5292,7 @@ impl StorageHarness {
 		let (block, block_user) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		spawn_harness(storage_elf, boot_user);
+		let process = spawn_harness(storage_elf, boot_user);
 		let buffer = MemoryObject::create(image.len().max(1)).expect("no memory for the live image");
 		copy_into_object(&buffer, image);
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
@@ -5300,7 +5310,7 @@ impl StorageHarness {
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
 		// As above: the live image arrives as a MemoryObject, so there is no backing to restart from.
-		let mut harness = Self { boot, block, client, admin, disk: if probes { Self::build_tiny_fixture() } else { alloc::collections::BTreeMap::new() }, capacity: 512 * 1024, process: None, backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
+		let mut harness = Self { boot, block, client, admin, disk: if probes { Self::build_tiny_fixture() } else { alloc::collections::BTreeMap::new() }, capacity: 512 * 1024, process: Some(process), backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
