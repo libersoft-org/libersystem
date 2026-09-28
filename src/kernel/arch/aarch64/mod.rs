@@ -53,11 +53,8 @@ pub fn device_tree_boot_info() -> Option<fdt::BootInfo> {
 
 // The tree itself, for a reader that wants a question answered rather than the bring-up summary.
 //
-// `not(test)` BECAUSE ITS ONLY READER IS THE BOOT'S ARMING PASS, which is `not(test)` too - a kernel
-// test drives a fake config space and never asks a board where a PCI pin goes. The production build
-// cannot see this and the test build turns it into a dead function, which is the whole reason the
-// test kernel is a second build.
-#[cfg(not(test))]
+// IN EVERY BUILD: the boot's arming pass and describe pass read it, and so does the suite's claimed-line
+// test, which asks the board where the `edu` function's INTx pin goes exactly as a hot-plug port's is asked.
 //
 // THE SUMMARY IS NOT A SUBSTITUTE, and the hot-plug arming is what showed it. `BootInfo` is a fixed
 // set of fields decided at boot; which controller input a given PCI function's INTx pin reaches is a

@@ -47,6 +47,15 @@ pub struct Resources {
 	// The row's port ranges, in the row's order: `port_ranges[i]` is `Bind::info.ports[i]`, unmapped.
 	pub port_ranges: [u64; proto::MAX_PORT_RANGES],
 	pub port_range_count: usize,
+	// A platform row's further register windows, in the row's order: `mmio[i]` is range `i + 1` of
+	// `Bind::info.platform` - range 0 is `device`.
+	pub mmio: [u64; proto::MAX_PLATFORM_WINDOWS],
+	pub mmio_count: usize,
+	// A platform row's wired lines, as interrupts, in the row's order: `lines[i]` is its line `i`.
+	pub lines: [u64; proto::MAX_PLATFORM_LINES],
+	pub line_count: usize,
+	// The kernel console's tap, for the console UART's driver alone.
+	pub console_tap: u64,
 }
 
 // Read one frame. Answers with the header, the payload length, and every capability it carried.
@@ -141,15 +150,20 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 			proto::ResourceKind::SysPower => &mut resources.syspower,
 			proto::ResourceKind::Console => &mut resources.console,
 			proto::ResourceKind::TrustedKeys => &mut resources.trusted_keys,
+			proto::ResourceKind::ConsoleTap => &mut resources.console_tap,
 			// PORT RANGES ARE SEVERAL OF ONE KIND, kept in the order they came - the row's order. One past
 			// what a row can carry is closed, as a duplicate is.
 			proto::ResourceKind::PortRange => {
-				if resources.port_range_count < resources.port_ranges.len() {
-					resources.port_ranges[resources.port_range_count] = handle;
-					resources.port_range_count += 1;
-				} else {
-					close(handle);
-				}
+				keep_in_order(&mut resources.port_ranges, &mut resources.port_range_count, handle);
+				continue;
+			}
+			// AND SO ARE A PLATFORM ROW'S FURTHER WINDOWS AND ITS LINES.
+			proto::ResourceKind::Mmio => {
+				keep_in_order(&mut resources.mmio, &mut resources.mmio_count, handle);
+				continue;
+			}
+			proto::ResourceKind::Line => {
+				keep_in_order(&mut resources.lines, &mut resources.line_count, handle);
 				continue;
 			}
 		};
@@ -163,6 +177,17 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 		}
 	}
 	(Bind { info, generation, resource_count }, resources)
+}
+
+// One more resource of a kind that comes several at a time, kept in the order it arrived - the row's order. One
+// past what a row can carry is closed, as a duplicate of a single kind is.
+fn keep_in_order(slots: &mut [u64], count: &mut usize, handle: u64) {
+	if *count < slots.len() {
+		slots[*count] = handle;
+		*count += 1;
+	} else {
+		close(handle);
+	}
 }
 
 // Offer a provider this driver serves. HELD UNPUBLISHED by the manager until `ready`, and closed on

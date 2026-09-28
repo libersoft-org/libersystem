@@ -43,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_IDLE_INFO, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_PROPERTIES, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PERF_CONTROL, SYS_PERF_RECORD, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CONSOLE_TAP_READ, SYS_CPU_IDLE_INFO, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_PROPERTIES, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PERF_CONTROL, SYS_PERF_RECORD, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -208,6 +208,7 @@ const DEBUG_WRITE_MAX: u64 = 16384;
 fn sys_debug_write(arg: u64, len: u64) -> i64 {
 	if len == 0 {
 		crate::_print_byte(arg as u8);
+		arch::serial::console_deliver();
 		return 0;
 	}
 	if len > DEBUG_WRITE_MAX || !user_buf_ok(arg, len) {
@@ -222,7 +223,10 @@ fn sys_debug_write(arg: u64, len: u64) -> i64 {
 	};
 	// Report how many bytes the transmit ring accepted: a caller pacing a mirror
 	// backlog resumes from there on its next pass instead of losing the tail.
-	crate::_print_bytes(&bytes) as i64
+	let accepted = crate::_print_bytes(&bytes) as i64;
+	// AND A DRIVER HOLDING THE CONSOLE IS TOLD ITS RING HOLDS BYTES, from here, where no lock is held.
+	arch::serial::console_deliver();
+	accepted
 }
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects. It is global because the
@@ -612,6 +616,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_IRQ_INFO => sys_irq_info(a0, a1, a2),
 		SYS_CPU_IDLE_INFO => sys_cpu_idle_info(a0, a1, a2),
 		SYS_DEVICE_PROPERTIES => sys_device_properties(a0, a1, a2),
+		SYS_CONSOLE_TAP_READ => sys_console_tap_read(a0, a1, a2, a3),
+		// A DEVELOPMENT BUILD'S KERNEL REQUESTS, and no other build's: elsewhere the number is unknown.
+		#[cfg(liber_development)]
+		abi::SYS_DEV_CONSOLE => sys_dev_console(a0, a1),
 		SYS_PCI_INFO => sys_pci_info(a0, a1, a2),
 		SYS_CHANNEL_PEEK => sys_channel_peek(a0),
 		SYS_ABI_CHECK => sys_abi_check(a0),
@@ -1641,10 +1649,6 @@ fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 	filled as i64
 }
 
-// Bind a device IRQ vector to a new Interrupt object and install a handle to it in
-// the caller's table. A driver waits on the handle; the kernel marks it pending
-// and wakes the driver when the vector fires. ERR_INVALID for a non-bindable
-// vector, ERR_RESOURCE_EXHAUSTED if the vector is already bound.
 // RETIRED. It bound a bare legacy vector for whoever held the DeviceManager privilege, with no claim behind it
 // - so nothing revoked the binding when a driver went, and nothing said which device the line belonged to. A
 // wired line is a platform row's resource now, minted from its claim (`RESOURCE_KIND_LINE`), and nothing in
@@ -1912,6 +1916,7 @@ fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 
 		abi::RESOURCE_KIND_PORT_RANGE => {}
 		abi::RESOURCE_KIND_MMIO => return platform_mmio_acquire(claim_handle, which),
 		abi::RESOURCE_KIND_LINE => return platform_line_acquire(claim_handle, which),
+		abi::RESOURCE_KIND_CONSOLE_TAP => return console_tap_acquire(claim_handle, which),
 		_ => return ERR_INVALID,
 	}
 	if !arch::ioports::supported() {
@@ -1932,8 +1937,19 @@ fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 
 		return ERR_RESOURCE_EXHAUSTED;
 	}
 	// CHECKED AGAIN AT THE MINT, against the reserved set and every live grant, as it was when the row was
-	// recorded: a run-time install or another grant may have taken a port since.
-	let range = match crate::object::port_range::PortRange::mint(resource.base, resource.len, Some(key)) {
+	// recorded: a run-time install or another grant may have taken a port since. THE CONSOLE UART'S RANGE is
+	// the one mint the reserved set admits, and only while this claim holds the UART: its ports move out of
+	// the kernel console's install into this grant in one step, and back when the grant ends.
+	let console = device::console_row(key.device_index as usize).filter(|&base| base == resource.base as u64);
+	let minted = match console {
+		Some(base) if !arch::serial::console_held_by(base, key.generation) => {
+			thread.handles().lock().release_reservation(1);
+			return ERR_ACCESS_DENIED;
+		}
+		Some(_) => crate::object::port_range::PortRange::mint_from_install(crate::object::port_range::grants::KERNEL_CONSOLE, resource.base, resource.len, key),
+		None => crate::object::port_range::PortRange::mint(resource.base, resource.len, Some(key)),
+	};
+	let range = match minted {
 		Ok(range) => range,
 		Err(refusal) => {
 			thread.handles().lock().release_reservation(1);
@@ -1948,6 +1964,97 @@ fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 
 		return ERR_ACCESS_DENIED;
 	}
 	thread.handles().lock().insert_reserved(Capability::new(range, Rights::MAP | Rights::TRANSFER)).raw() as i64
+}
+
+// THE CONSOLE TAP OF THE CONSOLE UART'S CLAIM - index 0 - derived from the claim, attached to the UART's ring
+// while the claim holds it, and revoked by its release. Any other row has none.
+fn console_tap_acquire(claim_handle: u64, which: u64) -> i64 {
+	let thread = current_thread!();
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let key = claim.key();
+	let Some(base) = device::console_row(key.device_index as usize) else { return ERR_INVALID };
+	if which != 0 {
+		return ERR_INVALID;
+	}
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	let Some(tap) = crate::object::console_tap::ConsoleTap::new(base, key.generation) else {
+		thread.handles().lock().release_reservation(1);
+		return ERR_NO_MEMORY;
+	};
+	// DERIVED BEFORE IT IS ATTACHED, so a release that raced this call revokes it; attached only while this
+	// claim holds the UART.
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(tap.clone() as alloc::sync::Arc<dyn KernelObject>))) || !arch::serial::console_attach_tap(base, key.generation, &tap) {
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
+	thread.handles().lock().insert_reserved(Capability::new(tap as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WAIT | Rights::TRANSFER)).raw() as i64
+}
+
+// THE KERNEL CONSOLE'S OUTPUT, OUT OF ITS RING through a tap - see `abi::SYS_CONSOLE_TAP_READ`. At most one
+// kernel buffer a call; the dropped count goes to `dropped_ptr` when the caller gave one.
+fn sys_console_tap_read(handle: u64, buf_ptr: u64, buf_len: u64, dropped_ptr: u64) -> i64 {
+	const CHUNK: usize = 1024;
+	let tap = match current_typed::<crate::object::console_tap::ConsoleTap>(handle, ObjectType::ConsoleTap, Rights::READ) {
+		Ok(tap) => tap,
+		Err(e) => return e,
+	};
+	let len = (buf_len as usize).min(CHUNK);
+	if len == 0 || !user_buf_writable(buf_ptr, len as u64) {
+		return ERR_INVALID;
+	}
+	let mut chunk = [0u8; CHUNK];
+	let Some((n, dropped)) = tap.read(&mut chunk[..len]) else { return ERR_ACCESS_DENIED };
+	if n != 0
+		&& let Err(error) = copy_to_user_exact(buf_ptr, chunk.as_ptr(), n)
+	{
+		return error;
+	}
+	if dropped_ptr != 0
+		&& let Err(error) = write_user(dropped_ptr, dropped)
+	{
+		return error;
+	}
+	n as i64
+}
+
+// THE DEVELOPMENT BUILD'S CONSOLE REQUESTS, for the development agent's `ConsoleInputSource` privilege - see
+// `abi::SYS_DEV_CONSOLE`.
+#[cfg(liber_development)]
+fn sys_dev_console(privilege: u64, request: u64) -> i64 {
+	// Lines until the ring has dropped bytes, at most this many.
+	const MOST_LINES: u64 = 4096;
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::ConsoleInputSource) {
+		return error;
+	}
+	match request {
+		abi::DEV_CONSOLE_HOLD_AND_FLOOD => {
+			// A console with no transmit ring - the ports' synchronous UARTs - has nothing to fill.
+			if arch::serial::console_dropped().is_none() {
+				return ERR_UNSUPPORTED;
+			}
+			crate::object::console_tap::hold_reads(true);
+			let mut lines = 0u64;
+			while lines < MOST_LINES && arch::serial::console_dropped() != Some(true) {
+				crate::serial_println!("console: development filler line {lines} - written while every console tap's reads are held, to carry the ring past its bound");
+				lines += 1;
+			}
+			lines as i64
+		}
+		abi::DEV_CONSOLE_PANIC => panic!("a panic asked for over the development channel"),
+		abi::DEV_CONSOLE_KILL_HOLDER => match device::console_holder() {
+			Some(process) => deliver_signal(&process, SIG_KILL),
+			None => ERR_INVALID,
+		},
+		_ => ERR_INVALID,
+	}
 }
 
 // ONE MORE MMIO RANGE OF A CLAIMED PLATFORM ROW, as a `DeviceMemory` derived from the claim - range 0 is the
@@ -2013,21 +2120,38 @@ fn platform_line_acquire(claim_handle: u64, which: u64) -> i64 {
 }
 
 // A CLAIMED PLATFORM ROW'S PROPERTY BLOCK, copied into the caller's buffer as far as it fits; its whole length,
-// or ERR_UNSUPPORTED for a row that has none. The claim is the authority: its holder is the device's driver.
-fn sys_device_properties(claim_handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::READ) {
-		Ok(c) => c,
-		Err(e) => return e,
+// or ERR_UNSUPPORTED for a row that has none.
+//
+// THE CLAIM IS THE AUTHORITY, AND SO IS WHAT IT DERIVED. DeviceManager holds the claim and cannot hand it on - a
+// claim handle carries neither TRANSFER nor DUPLICATE - and the DRIVER is who reads the block. So the handle is
+// the claim, or the `DeviceMemory` minted from it (every platform claim mints one, its first range or none),
+// whose binding must still be the device's current one: a window from an ended binding speaks for nobody.
+fn sys_device_properties(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let index = match current_typed::<Claim>(handle, ObjectType::Claim, Rights::READ) {
+		Ok(claim) => {
+			if claim.is_settled() {
+				return ERR_ACCESS_DENIED;
+			}
+			claim.key().device_index
+		}
+		Err(_) => {
+			let memory = match current_typed::<DeviceMemory>(handle, ObjectType::DeviceMemory, Rights::READ) {
+				Ok(memory) => memory,
+				Err(e) => return e,
+			};
+			let Some(key) = memory.claim() else { return ERR_ACCESS_DENIED };
+			if !device::claim_is_current(key) {
+				return ERR_ACCESS_DENIED;
+			}
+			key.device_index
+		}
 	};
-	if claim.is_settled() {
-		return ERR_ACCESS_DENIED;
-	}
 	let len = (buf_len as usize).min(abi::MAX_DEVICE_PROPERTIES);
 	if len != 0 && !user_buf_ok(buf_ptr, len as u64) {
 		return ERR_INVALID;
 	}
 	let mut block = alloc::vec![0u8; len];
-	let Some(total) = device::properties(claim.key().device_index as usize, &mut block) else { return ERR_UNSUPPORTED };
+	let Some(total) = device::properties(index as usize, &mut block) else { return ERR_UNSUPPORTED };
 	let copied = total.min(len);
 	if copied != 0
 		&& let Err(error) = copy_to_user_exact(buf_ptr, block.as_ptr(), copied)
@@ -2114,8 +2238,11 @@ fn sys_interrupt_ack(handle: u64) -> i64 {
 	interrupt.clear();
 	arch::interrupts::eoi(interrupt.vector());
 	// A LEVEL LINE WAS MASKED WHEN IT FIRED, so its source - still asserted until the driver ran - could not
-	// re-fire in the meantime; the driver saying it is done is what unmasks it.
-	arch::interrupts::acknowledge(interrupt.vector());
+	// re-fire in the meantime; the driver saying it is done is what unmasks it. Only while this object owns the
+	// binding: a revoked one's vector may be another claim's line by now.
+	if interrupt.owns_binding() {
+		arch::interrupts::acknowledge(interrupt.vector());
+	}
 	0
 }
 
@@ -4078,6 +4205,10 @@ fn object_ready_for(object: &Arc<dyn KernelObject>, writable: bool) -> bool {
 	}
 	if let Some(interrupt) = any.downcast_ref::<Interrupt>() {
 		return interrupt.is_pending();
+	}
+	if let Some(tap) = any.downcast_ref::<crate::object::console_tap::ConsoleTap>() {
+		// Ready when the console's ring went from empty to holding bytes and has not been read since.
+		return tap.is_pending();
 	}
 	if let Some(claim) = any.downcast_ref::<Claim>() {
 		// A claim handle becomes ready once its release has SETTLED, so a manager parked in

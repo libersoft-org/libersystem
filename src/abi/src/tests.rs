@@ -185,6 +185,8 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_PORT_RANGE_FIRMWARE, 94),
 	(SYS_CPU_IDLE_INFO, 95),
 	(SYS_DEVICE_PROPERTIES, 96),
+	(SYS_CONSOLE_TAP_READ, 97),
+	(SYS_DEV_CONSOLE, 98),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -353,6 +355,7 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(OBJECT_TYPE_WAIT_SET, 13),
 		(OBJECT_TYPE_CLAIM, 14),
 		(OBJECT_TYPE_PORT_RANGE, 15),
+		(OBJECT_TYPE_CONSOLE_TAP, 16),
 	];
 	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
 	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.

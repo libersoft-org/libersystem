@@ -1243,7 +1243,8 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 		// stack would make every tool on the machine wait for a radio. It mints each grant from the
 		// resolved root, which also keeps its grants working across a restart of that service.
 		// POWERSERVICE'S STATE AND CONTROL ROOTS the same way, for the same two reasons.
-		// AND SMARTCARDSERVICE'S MINTING ROOT, from which every smart-card grant is minted per launch.
+		// AND SMARTCARDSERVICE'S MINTING ROOT, from which every smart-card grant is minted per launch, and
+		// TPMSERVICE'S, from which every TPM grant is.
 		// AND MODEMSERVICE'S OBSERVATION AND MINTING ROOTS.
 		// AND SPOOLSERVICE'S ROOT, from which every `spool` grant is a fresh connection, and MEDIAIMPORTSERVICE'S,
 		// from which every `media-import` grant is.
@@ -1258,6 +1259,7 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_POWER_STATE,
 			CAP_POWER_CONTROL,
 			CAP_SMARTCARD_ADMIN,
+			CAP_TPM_ADMIN,
 			CAP_MODEM_STATE,
 			CAP_MODEM_ADMIN,
 			CAP_CAMERA,
@@ -1292,6 +1294,7 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_INPUT => Some(b"input_service"),
 		CAP_POWER_STATE | CAP_POWER_CONTROL => Some(b"power_service"),
 		CAP_SMARTCARD_ADMIN => Some(b"smartcard_service"),
+		CAP_TPM_ADMIN => Some(b"tpm_service"),
 		CAP_MODEM_STATE | CAP_MODEM_ADMIN => Some(b"modem_service"),
 		CAP_CAMERA | CAP_CAMERA_ADMIN => Some(b"camera_service"),
 		CAP_MIDI | CAP_MIDI_ADMIN => Some(b"midi_service"),
@@ -1326,6 +1329,7 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_POWER_STATE => broker.kept.end_of(b"power_service", b"SERVE"),
 		CAP_POWER_CONTROL => broker.kept.end_of(b"power_service", b"CONTROL"),
 		CAP_SMARTCARD_ADMIN => broker.kept.end_of(b"smartcard_service", b"ADMIN"),
+		CAP_TPM_ADMIN => broker.kept.end_of(b"tpm_service", b"ADMIN"),
 		CAP_MODEM_STATE => broker.kept.end_of(b"modem_service", b"SERVE"),
 		CAP_MODEM_ADMIN => broker.kept.end_of(b"modem_service", b"ADMIN"),
 		CAP_CAMERA => broker.kept.end_of(b"camera_service", b"SERVE"),
@@ -1558,8 +1562,9 @@ fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 // PowerService, whose state is rebuilt from the catalogue, the second; SmartcardService, whose grants are
 // ephemeral and minted again after a restart, the third. AdminService's authority dies with the instance that
 // held it by design, and its journal is read back by the replacement - which is what makes it restartable.
+// TpmService's grants are minted per launch too, and the TPM's state is in the chip.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its

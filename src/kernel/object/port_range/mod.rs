@@ -237,6 +237,26 @@ impl PortRange {
 		Ok(range)
 	}
 
+	// THE CONSOLE HANDOFF'S MINT: the ports kernel item `item` installed - the console UART a claim has just
+	// taken from the kernel - moved into this range's grant in one step, and back into the reserved set when
+	// the grant ends. See `grants::grant_from_install`.
+	pub fn mint_from_install(item: u32, base: u16, len: u16, claim: abi::ClaimKey) -> Result<Arc<Self>, grants::Refusal> {
+		let range = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), base, len, claim: Some(claim), state: SpinLock::new(State::Ended) }).ok_or(grants::Refusal::NoMemory)?;
+		grants::grant_from_install(item, base, len, range.header.koid())?;
+		*range.state.lock() = State::Idle;
+		Ok(range)
+	}
+
+	// The process this range is mapped into, for the development request that kills the console UART's
+	// driver.
+	#[cfg(liber_development)]
+	pub fn holder(&self) -> Option<Arc<Process>> {
+		match &*self.state.lock() {
+			State::Mapped(holder) => holder.upgrade(),
+			State::Idle | State::Ended => None,
+		}
+	}
+
 	// MAP INTO `process`: its threads may use these ports from their next access on any core - a grant
 	// needs no cross-core round, because a core that has not loaded it yet faults once and loads it then.
 	pub fn map_into(self: &Arc<Self>, process: &Arc<Process>) -> Result<(), MapError> {

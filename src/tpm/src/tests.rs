@@ -573,3 +573,131 @@ fn an_unseal_the_policy_refuses_is_named_and_everything_it_loaded_is_flushed() {
 	let flushed: Vec<Vec<u8>> = tpm.transport.sent.iter().filter(|command| code_of(command) == CC_FLUSH_CONTEXT).map(|command| command[10..14].to_vec()).collect();
 	assert_eq!(flushed, vec![vec![0x03, 0, 0, 0], vec![0x80, 0, 0, 2], vec![0x80, 0, 0, 1]], "the session, the object and the primary, each flushed");
 }
+
+// ------------------------------------------------------------------ GetCapability, against hostile answers
+
+// A `GetCapability` answer: moreData, the capability, and its list of u32 words.
+fn capability(more: u8, cap: u32, count: u32, words: &[u32]) -> Vec<u8> {
+	let mut body = Writer::empty();
+	body.u8(more).u32(cap).u32(count);
+	for word in words {
+		body.u32(*word);
+	}
+	response(ST_NO_SESSIONS, RC_SUCCESS, &body.into_bytes())
+}
+
+fn asked(command: &[u8]) -> (u32, u32, u32) {
+	let word = |at: usize| u32::from_be_bytes([command[at], command[at + 1], command[at + 2], command[at + 3]]);
+	(word(10), word(14), word(18))
+}
+
+#[test]
+fn properties_are_read_within_the_range_asked_for_and_more_data_is_followed_only_until_it_is_covered() {
+	// Two answers: the first covers 0x200 and says more, the second 0x201 - and says more again, which is about the
+	// TPM's whole list and not about this range, so it is not followed.
+	let mut tpm = scripted(vec![capability(1, CAP_TPM_PROPERTIES, 1, &[PT_PERMANENT, 1]), capability(1, CAP_TPM_PROPERTIES, 1, &[PT_STARTUP_CLEAR, 0x8000_0007])]);
+	assert_eq!(tpm.properties(PT_PERMANENT, 2), Ok(vec![(PT_PERMANENT, 1), (PT_STARTUP_CLEAR, 0x8000_0007)]));
+	assert_eq!(tpm.transport.sent.iter().map(|command| asked(command)).collect::<Vec<_>>(), vec![(CAP_TPM_PROPERTIES, PT_PERMANENT, 2), (CAP_TPM_PROPERTIES, PT_STARTUP_CLEAR, 1)], "the second question starts where the first answer ended");
+	assert_eq!(scripted(vec![]).properties(0x100, ops::MAX_PROPERTIES + 1), Err(Error::Bounds), "no more than sixteen asked for");
+}
+
+#[test]
+fn a_capability_answer_that_says_more_than_was_asked_or_something_else_is_refused() {
+	let malformed = |answer: Vec<u8>| scripted(vec![answer]).properties(PT_PERMANENT, 2);
+	assert_eq!(malformed(capability(0, CAP_TPM_PROPERTIES, 3, &[PT_PERMANENT, 0, PT_STARTUP_CLEAR, 0, 0x202, 0])), Err(Error::Malformed(Refused::Length)), "three listed for two asked");
+	assert_eq!(malformed(capability(0, CAP_TPM_PROPERTIES, 1, &[0x1FF, 0])), Err(Error::Malformed(Refused::Value)), "a property below the range");
+	assert_eq!(malformed(capability(0, CAP_TPM_PROPERTIES, 1, &[0x205, 0])), Err(Error::Malformed(Refused::Value)), "a property past it");
+	assert_eq!(malformed(capability(0, CAP_TPM_PROPERTIES, 2, &[PT_STARTUP_CLEAR, 0, PT_PERMANENT, 0])), Err(Error::Malformed(Refused::Value)), "out of order");
+	assert_eq!(malformed(capability(0, CAP_HANDLES, 1, &[PT_PERMANENT, 0])), Err(Error::Malformed(Refused::Value)), "another capability's answer");
+	assert_eq!(malformed(capability(2, CAP_TPM_PROPERTIES, 1, &[PT_PERMANENT, 0])), Err(Error::Malformed(Refused::Value)), "a moreData that is neither yes nor no");
+	assert_eq!(malformed(capability(1, CAP_TPM_PROPERTIES, 0, &[])), Err(Error::Malformed(Refused::Value)), "more, and nothing given");
+	let mut trailing = capability(0, CAP_TPM_PROPERTIES, 1, &[PT_PERMANENT, 0, 7]);
+	let len = trailing.len();
+	trailing[2..6].copy_from_slice(&(len as u32).to_be_bytes());
+	assert_eq!(malformed(trailing), Err(Error::Malformed(Refused::Length)), "bytes past the list");
+}
+
+#[test]
+fn handles_are_one_range_in_order_and_a_tpm_that_never_stops_saying_more_is_bounded() {
+	let mut tpm = scripted(vec![capability(0, CAP_HANDLES, 2, &[0x8000_0000, 0x8000_0002])]);
+	assert_eq!(tpm.handles(HT_TRANSIENT), Ok(vec![0x8000_0000, 0x8000_0002]));
+	// Loaded sessions come back under their own kind's range - HMAC and policy - and both are the range asked for.
+	let mut tpm = scripted(vec![capability(0, CAP_HANDLES, 2, &[0x0200_0000, 0x0300_0001])]);
+	assert_eq!(tpm.handles(HT_LOADED_SESSION), Ok(vec![0x0200_0000, 0x0300_0001]));
+	assert_eq!(scripted(vec![capability(0, CAP_HANDLES, 1, &[0x8100_0000])]).handles(HT_TRANSIENT), Err(Error::Malformed(Refused::Value)), "a persistent handle is not a transient one");
+	assert_eq!(scripted(vec![capability(0, CAP_HANDLES, 2, &[0x8000_0002, 0x8000_0001])]).handles(HT_TRANSIENT), Err(Error::Malformed(Refused::Value)), "out of order");
+	assert_eq!(scripted(vec![capability(0, CAP_HANDLES, ops::MAX_HANDLES + 1, &[])]).handles(HT_TRANSIENT), Err(Error::Malformed(Refused::Length)), "more than sixty-four");
+	let endless: Vec<Vec<u8>> = (0..ops::MORE_DATA_ROUNDS as u32).map(|at| capability(1, CAP_HANDLES, 1, &[0x8000_0000 + at])).collect();
+	assert_eq!(scripted(endless).handles(HT_TRANSIENT), Err(Error::Bounds), "moreData is followed a bounded number of times");
+}
+
+#[test]
+fn leftovers_are_listed_and_each_one_flushed() {
+	let ok = response(ST_NO_SESSIONS, RC_SUCCESS, &[]);
+	let mut tpm = scripted(vec![capability(0, CAP_HANDLES, 2, &[0x8000_0000, 0x8000_0001]), ok.clone(), ok.clone(), capability(0, CAP_HANDLES, 1, &[0x0300_0002]), ok]);
+	assert_eq!(tpm.flush_leftovers(), Ok(3));
+	let flushed: Vec<Vec<u8>> = tpm.transport.sent.iter().filter(|command| code_of(command) == CC_FLUSH_CONTEXT).map(|command| command[10..14].to_vec()).collect();
+	assert_eq!(flushed, vec![vec![0x80, 0, 0, 0], vec![0x80, 0, 0, 1], vec![0x03, 0, 0, 2]], "both objects and the policy session");
+	// NOTHING LEFT OVER IS TWO QUESTIONS AND NO FLUSH.
+	let mut tpm = scripted(vec![capability(0, CAP_HANDLES, 0, &[]), capability(0, CAP_HANDLES, 0, &[])]);
+	assert_eq!(tpm.flush_leftovers(), Ok(0));
+}
+
+#[test]
+fn the_identity_and_the_owner_hierarchy_are_read_from_their_properties() {
+	let fixed = [
+		PT_FAMILY_INDICATOR,
+		0x322E_3000,
+		0x101,
+		0,
+		0x102,
+		0x9F,
+		0x103,
+		1,
+		0x104,
+		2026,
+		PT_MANUFACTURER,
+		0x4942_4D00,
+		0x106,
+		0x5357_2020,
+		0x107,
+		0x2054_504D,
+		0x108,
+		0,
+		0x109,
+		0,
+		0x10A,
+		1,
+		PT_FIRMWARE_VERSION_1,
+		0x2019_1023,
+		PT_FIRMWARE_VERSION_2,
+		0x0016_3636,
+	];
+	let mut tpm = scripted(vec![capability(1, CAP_TPM_PROPERTIES, 13, &fixed)]);
+	let identity = tpm.identity().expect("an identity");
+	assert_eq!((&identity.family, &identity.manufacturer), (b"2.0\0", b"IBM\0"));
+	assert_eq!(&identity.vendor[..8], b"SW   TPM");
+	assert_eq!(identity.firmware, (0x2019_1023, 0x0016_3636));
+	assert_eq!(scripted(vec![capability(0, CAP_TPM_PROPERTIES, 1, &[PT_FAMILY_INDICATOR, 0])]).identity(), Err(Error::Malformed(Refused::Value)), "an identity without its manufacturer");
+	let hierarchy = |permanent: u32, startup: u32| scripted(vec![capability(0, CAP_TPM_PROPERTIES, 2, &[PT_PERMANENT, permanent, PT_STARTUP_CLEAR, startup])]).hierarchy().expect("the attribute words");
+	assert!(hierarchy(0, 0x8000_0007).owner_usable(), "no owner authorization, owner hierarchy enabled");
+	assert_eq!(hierarchy(PERMANENT_OWNER_AUTH_SET, 0x8000_0007), ops::Hierarchy { owner_auth_set: true, owner_enabled: true });
+	assert!(!hierarchy(PERMANENT_OWNER_AUTH_SET, 0x8000_0007).owner_usable());
+	assert!(!hierarchy(0, 0x8000_0005).owner_usable(), "the owner hierarchy disabled");
+}
+
+#[test]
+fn a_sealed_object_round_trips_as_bytes_and_nothing_else_decodes() {
+	let sealed = ops::Sealed { pcr: 23, public: vec![1, 2, 3], private: vec![4, 5] };
+	let bytes = sealed.encode();
+	assert_eq!(ops::Sealed::decode(&bytes), Ok(sealed));
+	let mut other_version = bytes.clone();
+	other_version[0] = 2;
+	assert_eq!(ops::Sealed::decode(&other_version), Err(Refused::Value));
+	let mut past_23 = bytes.clone();
+	past_23[1] = 24;
+	assert_eq!(ops::Sealed::decode(&past_23), Err(Refused::Value));
+	assert_eq!(ops::Sealed::decode(&[&bytes[..], &[0]].concat()), Err(Refused::Value), "a byte after the private half");
+	assert_eq!(ops::Sealed::decode(&bytes[..bytes.len() - 1]), Err(Refused::Short), "a half cut short");
+	assert_eq!(ops::Sealed::decode(&vec![1; ops::MAX_SEALED_BYTES + 1]), Err(Refused::Length));
+}

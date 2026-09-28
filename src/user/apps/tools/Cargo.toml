@@ -193,6 +193,16 @@ name = "btctl"
 path = "src/btctl.rs"
 
 [[bin]]
+# THE TPM DEMONSTRATION TOOL: the one shipping holder of the three TPM grants, printing what the TPM answered.
+name = "tpm"
+path = "src/tpm.rs"
+
+[[bin]]
+# THE TPM GATE'S OTHER COMPONENT, development-only in the manifest: observation and sealing, never measurement.
+name = "tpmprobe"
+path = "src/tpmprobe.rs"
+
+[[bin]]
 # THE FIRMWARE-DOWNLOAD REQUESTER: the one shipping holder of an administrative request connection, scoped to
 # firmware download on DFU targets. It asks; a person on the protected screen decides.
 name = "dfu"
@@ -428,6 +438,8 @@ shared-image = [
 	"time-client-provider/shared-image",
 	"volume-client/shared-image",
 	"volume-client-provider/shared-image",
+	"tpm-client/shared-image",
+	"tpm-client-provider/shared-image",
 	"proto/shared-image",
 	"rt/shared-image",
 	"storage-proto/shared-image",
@@ -482,6 +494,9 @@ time-client = { path = "../../libs/clients/time-client", optional = true }
 time-client-provider = { path = "../../libs/clients/time-client-provider", optional = true }
 volume-client = { path = "../../libs/clients/volume-client" }
 volume-client-provider = { path = "../../libs/clients/volume-client-provider" }
+# THE TPM'S CLIENT, which the `tpm` tool links the way a third-party program would.
+tpm-client = { path = "../../libs/clients/tpm-client" }
+tpm-client-provider = { path = "../../libs/clients/tpm-client-provider" }
 
 bmp = { path = "../../libs/image/bmp" }
 keys = { path = "../../libs/input/keys" }

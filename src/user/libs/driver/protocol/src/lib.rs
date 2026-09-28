@@ -339,10 +339,25 @@ pub enum ResourceKind {
 	// ONE PORT RANGE OF THE ROW - one frame per port resource the device's row carries, in the row's order,
 	// as the register window is passed. Mapping it grants the driver's process those ports and no other.
 	PortRange = 7,
+	// ONE MORE MMIO RANGE OF A PLATFORM ROW - one frame per range after the first, which is the `Device` window,
+	// in the row's order. A device the firmware describes may own several register windows; a PCI row has one.
+	Mmio = 8,
+	// ONE WIRED LINE OF A PLATFORM ROW, as an interrupt - one frame per line, in the row's order. A LEVEL line
+	// is masked at its controller when it fires and unmasked by the driver's acknowledgement.
+	Line = 9,
+	// THE KERNEL CONSOLE'S TAP, for the row of the console's UART alone: the claim took the UART from the kernel,
+	// and the kernel's output - its own lines and every debug write - leaves the kernel's ring through this, in
+	// order, for the driver to put on the wire.
+	ConsoleTap = 10,
 }
 
 // How many `PortRange` resources one bind can carry: one per port resource a row can record.
 pub const MAX_PORT_RANGES: usize = abi::MAX_PORT_RESOURCES;
+
+// How many `Mmio` and `Line` resources one bind can carry: every range of a platform row after the first, which
+// is the `Device` window, and every one of its lines.
+pub const MAX_PLATFORM_WINDOWS: usize = abi::MAX_PLATFORM_MMIO - 1;
+pub const MAX_PLATFORM_LINES: usize = abi::MAX_PLATFORM_LINES;
 
 impl ResourceKind {
 	pub fn from_u16(value: u16) -> Option<Self> {
@@ -354,6 +369,9 @@ impl ResourceKind {
 			5 => Some(ResourceKind::Console),
 			6 => Some(ResourceKind::TrustedKeys),
 			7 => Some(ResourceKind::PortRange),
+			8 => Some(ResourceKind::Mmio),
+			9 => Some(ResourceKind::Line),
+			10 => Some(ResourceKind::ConsoleTap),
 			_ => None,
 		}
 	}
@@ -444,6 +462,9 @@ pub mod provider {
 	pub const I2C_BUS: u16 = 22;
 	/// A GPIO CONTROLLER'S INPUT LINES, under the same rule: every connection names one line.
 	pub const GPIO_LINES: u16 = 23;
+	/// A TPM 2.0'S TYPED OPERATIONS, the `tpm-device` contract. TpmService alone consumes it; applications
+	/// reach the TPM through minted `tpm` connections and never through this kind.
+	pub const TPM: u16 = 24;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.
@@ -469,6 +490,12 @@ pub mod provider {
 	// this system opens for itself; a serial adapter is somebody's hardware, and a consumer that
 	// confused the two would be attaching a diagnostic agent to whatever is plugged into a USB port.
 	pub const USB_SERIAL_NAME: &[u8] = b"org.libersystem.usb.serial";
+
+	// AND THE KERNEL CONSOLE'S UART, once a driver holds it: the wire `lab`, the serial shell and every
+	// scenario oracle read. ConsoleService attaches to this publication and to no other - its mirror goes out
+	// through it and what is typed on the wire comes in through it - so the name is the console's role, not the
+	// UART's, and a 16550 bound to any other port is not published under it.
+	pub const KERNEL_CONSOLE_NAME: &[u8] = b"org.libersystem.console";
 
 	// AND THE SECOND PORT'S, because one controller can carry two.
 	//

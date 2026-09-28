@@ -20,6 +20,10 @@ pub const MAX_SECRET: usize = 128;
 pub const MAX_NONCE: usize = 64;
 /// PCRs 0-23 exist; 17 to 22 belong to the dynamic root of trust and only localities 3 and 4 extend them.
 pub const PCRS: u32 = 24;
+/// The most properties and handles one `GetCapability` asks for, and how many times its `moreData` is followed.
+pub const MAX_PROPERTIES: u32 = 16;
+pub const MAX_HANDLES: u32 = 64;
+pub const MORE_DATA_ROUNDS: usize = 4;
 
 /// Whether locality 0 may extend `pcr`.
 pub fn extendable(pcr: u32) -> bool {
@@ -151,6 +155,42 @@ pub struct Sealed {
 	pub private: Vec<u8>,
 }
 
+/// The sealed object as bytes a caller keeps: a version, the PCR, then the public and private halves each by its
+/// own length. Nothing in it is secret - the private half is encrypted to this TPM's storage key.
+pub const SEALED_VERSION: u8 = 1;
+/// The most a sealed object's bytes may be: the service's bound, and far past what a 128-byte secret makes.
+pub const MAX_SEALED_BYTES: usize = 1024;
+
+impl Sealed {
+	pub fn encode(&self) -> Vec<u8> {
+		let mut writer = Writer::empty();
+		writer.u8(SEALED_VERSION).u8(self.pcr as u8).sized(&self.public).sized(&self.private);
+		writer.into_bytes()
+	}
+
+	/// Bytes `encode` made, and nothing else: another version, a PCR past 23, a half past its own length or bytes
+	/// after the private half are refused.
+	pub fn decode(bytes: &[u8]) -> Result<Sealed, Refused> {
+		if bytes.len() > MAX_SEALED_BYTES {
+			return Err(Refused::Length);
+		}
+		let mut reader = Reader::new(bytes);
+		if reader.u8()? != SEALED_VERSION {
+			return Err(Refused::Value);
+		}
+		let pcr = reader.u8()? as u32;
+		if pcr >= PCRS {
+			return Err(Refused::Value);
+		}
+		let public = reader.sized()?.to_vec();
+		let private = reader.sized()?.to_vec();
+		if public.is_empty() || private.is_empty() || reader.remaining() != 0 {
+			return Err(Refused::Value);
+		}
+		Ok(Sealed { pcr, public, private })
+	}
+}
+
 /// A quote: the attestation, its ECDSA signature, the public point of the key that made it, and the PCR digest
 /// the attestation carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +201,32 @@ pub struct Quote {
 	pub x: Vec<u8>,
 	pub y: Vec<u8>,
 	pub pcr_digest: Vec<u8>,
+}
+
+/// WHO THE TPM SAYS IT IS: its family ("2.0"), its manufacturer's four characters, its vendor string and its
+/// firmware version, from the fixed properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+	pub family: [u8; 4],
+	pub manufacturer: [u8; 4],
+	pub vendor: [u8; 16],
+	pub firmware: (u32, u32),
+}
+
+/// THE OWNER HIERARCHY'S STATE, from the two attribute words. Seal, unseal and quote each begin with a
+/// `CreatePrimary` under it with the empty password, so a TPM whose owner has an authorization value, or whose
+/// owner hierarchy is disabled, cannot do them - and says so here rather than with a code the caller must decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hierarchy {
+	pub owner_auth_set: bool,
+	pub owner_enabled: bool,
+}
+
+impl Hierarchy {
+	/// Whether seal, unseal and quote can run.
+	pub fn owner_usable(&self) -> bool {
+		!self.owner_auth_set && self.owner_enabled
+	}
 }
 
 pub struct Tpm<T: Transport> {
@@ -192,6 +258,142 @@ impl<T: Transport> Tpm<T> {
 		let mut writer = Writer::command(ST_NO_SESSIONS, CC_SELF_TEST);
 		writer.u8(1);
 		self.run(writer, KEY_MS).map(|_| ())
+	}
+
+	// ONE `GetCapability`: whether the TPM has more past this answer, and the data after the capability it names -
+	// which must be the one asked for.
+	fn get_capability(&mut self, capability: u32, property: u32, count: u32) -> Result<(bool, Vec<u8>), Error> {
+		let mut writer = Writer::command(ST_NO_SESSIONS, CC_GET_CAPABILITY);
+		writer.u32(capability).u32(property).u32(count);
+		let response = self.run(writer, SHORT_MS)?;
+		let mut reader = Reader::new(&response[10..]);
+		let more = match reader.u8()? {
+			0 => false,
+			1 => true,
+			_ => return Err(Error::Malformed(Refused::Value)),
+		};
+		if reader.u32()? != capability {
+			return Err(Error::Malformed(Refused::Value));
+		}
+		Ok((more, reader.rest().to_vec()))
+	}
+
+	/// TPM PROPERTIES `first` to `first + count - 1`, in order, as (property, value) - no more than
+	/// `MAX_PROPERTIES` asked for. An answer listing more than was asked for, or a property outside the range or
+	/// out of order, is refused as `Malformed`; `moreData` is followed at most `MORE_DATA_ROUNDS` times while
+	/// the range is not yet covered. A property the TPM does not have is simply not in the answer.
+	pub fn properties(&mut self, first: u32, count: u32) -> Result<Vec<(u32, u32)>, Error> {
+		if count == 0 || count > MAX_PROPERTIES {
+			return Err(Error::Bounds);
+		}
+		let end = first.checked_add(count).ok_or(Error::Bounds)?;
+		let mut out = Vec::new();
+		let mut next = first;
+		for _ in 0..MORE_DATA_ROUNDS {
+			let wanted = end - next;
+			let (more, data) = self.get_capability(CAP_TPM_PROPERTIES, next, wanted)?;
+			let mut reader = Reader::new(&data);
+			let listed = reader.u32()?;
+			if listed > wanted {
+				return Err(Error::Malformed(Refused::Length));
+			}
+			for _ in 0..listed {
+				let property = reader.u32()?;
+				let value = reader.u32()?;
+				if property < next || property >= end {
+					return Err(Error::Malformed(Refused::Value));
+				}
+				out.push((property, value));
+				next = property + 1;
+			}
+			if reader.remaining() != 0 {
+				return Err(Error::Malformed(Refused::Length));
+			}
+			// MORE DATA IS ABOUT THE TPM'S WHOLE LIST, not about the range asked for: it is followed only while
+			// the range is not covered, and an answer that says more and gives nothing cannot be followed.
+			if !more || next >= end {
+				return Ok(out);
+			}
+			if listed == 0 {
+				return Err(Error::Malformed(Refused::Value));
+			}
+		}
+		Ok(out)
+	}
+
+	/// EVERY LOADED HANDLE IN ONE RANGE: transient objects (`HT_TRANSIENT`) or loaded sessions
+	/// (`HT_LOADED_SESSION`, whose handles are HMAC or policy ones), `MAX_HANDLES` at a time, `moreData` followed at
+	/// most `MORE_DATA_ROUNDS` times. A handle of another range, or one not past the last, is refused as
+	/// `Malformed`; a TPM still saying more after the last round is answered `Bounds`.
+	pub fn handles(&mut self, first: u32) -> Result<Vec<u32>, Error> {
+		let sessions = first == HT_LOADED_SESSION;
+		let in_range = |handle: u32| if sessions { handle >> 24 == HT_LOADED_SESSION >> 24 || handle >> 24 == HT_POLICY_SESSION >> 24 } else { handle >> 24 == first >> 24 };
+		let mut out: Vec<u32> = Vec::new();
+		let mut next = first;
+		for _ in 0..MORE_DATA_ROUNDS {
+			let (more, data) = self.get_capability(CAP_HANDLES, next, MAX_HANDLES)?;
+			let mut reader = Reader::new(&data);
+			let listed = reader.u32()?;
+			if listed > MAX_HANDLES {
+				return Err(Error::Malformed(Refused::Length));
+			}
+			for _ in 0..listed {
+				let handle = reader.u32()?;
+				// IN ORDER WITHIN ITS RANGE: a session's number is its low 24 bits whichever kind it is.
+				if !in_range(handle) || handle & 0x00ff_ffff < next & 0x00ff_ffff {
+					return Err(Error::Malformed(Refused::Value));
+				}
+				out.push(handle);
+				next = (first & 0xff00_0000) | ((handle & 0x00ff_ffff) + 1);
+			}
+			if reader.remaining() != 0 {
+				return Err(Error::Malformed(Refused::Length));
+			}
+			if !more {
+				return Ok(out);
+			}
+			if listed == 0 {
+				return Err(Error::Malformed(Refused::Value));
+			}
+		}
+		Err(Error::Bounds)
+	}
+
+	/// The TPM's fixed identity. A TPM that does not report its family, manufacturer or firmware version is
+	/// refused as `Malformed`; a vendor string it leaves out is zeros.
+	pub fn identity(&mut self) -> Result<Identity, Error> {
+		let properties = self.properties(PT_FAMILY_INDICATOR, PT_FIRMWARE_VERSION_2 - PT_FAMILY_INDICATOR + 1)?;
+		let value = |property: u32| properties.iter().find(|(held, _)| *held == property).map(|(_, value)| *value);
+		let missing = Error::Malformed(Refused::Value);
+		let mut vendor = [0u8; 16];
+		for word in 0..4u32 {
+			vendor[word as usize * 4..word as usize * 4 + 4].copy_from_slice(&value(PT_VENDOR_STRING_1 + word).unwrap_or(0).to_be_bytes());
+		}
+		Ok(Identity { family: value(PT_FAMILY_INDICATOR).ok_or(missing)?.to_be_bytes(), manufacturer: value(PT_MANUFACTURER).ok_or(missing)?.to_be_bytes(), vendor, firmware: (value(PT_FIRMWARE_VERSION_1).ok_or(missing)?, value(PT_FIRMWARE_VERSION_2).ok_or(missing)?) })
+	}
+
+	/// The owner hierarchy's state, from `TPM_PT_PERMANENT` and `TPM_PT_STARTUP_CLEAR`.
+	pub fn hierarchy(&mut self) -> Result<Hierarchy, Error> {
+		let properties = self.properties(PT_PERMANENT, 2)?;
+		let value = |property: u32| properties.iter().find(|(held, _)| *held == property).map(|(_, value)| *value).ok_or(Error::Malformed(Refused::Value));
+		let permanent = value(PT_PERMANENT)?;
+		let startup = value(PT_STARTUP_CLEAR)?;
+		Ok(Hierarchy { owner_auth_set: permanent & PERMANENT_OWNER_AUTH_SET != 0, owner_enabled: startup & STARTUP_CLEAR_SH_ENABLE != 0 })
+	}
+
+	/// WHAT A KILLED PREDECESSOR LEFT LOADED, FLUSHED: every transient object and every loaded session, and how
+	/// many that was. A driver killed between a `CreatePrimary`, `Load` or `StartAuthSession` and its
+	/// `FlushContext` leaves them, and `Startup` cannot clear them on a TPM that has already started - so the one
+	/// owner of the TPM runs this at every start, when whatever is loaded belongs to no one.
+	pub fn flush_leftovers(&mut self) -> Result<usize, Error> {
+		let mut flushed = 0;
+		for first in [HT_TRANSIENT, HT_LOADED_SESSION] {
+			for handle in self.handles(first)? {
+				self.flush(handle)?;
+				flushed += 1;
+			}
+		}
+		Ok(flushed)
 	}
 
 	/// `count` bytes from the TPM's generator, asked for in pieces no longer than a digest.

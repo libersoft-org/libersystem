@@ -1,0 +1,310 @@
+# THE TPM, END TO END, THROUGH THE EMULATED KEYBOARD: the platform row, the shipping `tpm` tool, the other component's
+# refusals, a driver restart under a held connection, a TpmService restart, and a quote the gate verifies.
+#
+# `check-tpm-tool.sh` runs this with `swtpm` behind QEMU's CRB or TIS front-end - it writes the interface into the
+# copy it runs - and then checks on the host what the scenario cannot: that two draws differ, the PCR 16 chain, PCR 8
+# unchanged, and the quote's signature by OpenSSL. Run bare, there is no TPM.
+version = 1
+name = "tpm tool"
+description = "The shipping tpm command reaches a swtpm-backed TPM through its platform row, the driver and TpmService: identity, random bytes, PCRs, sealing, refusals by name, a driver and a service restart, and a quote."
+timeout = 1200
+
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+# THE ROW: one platform row, the `TPM2` table's, its one resource the 4 KiB locality-0 page at the platform's base
+# (0xFED40000) - and no interrupt, since the resource list ends after that one range.
+
+[[step]]
+do = "key"
+text = "lsdev"
+
+[[step]]
+do = "expect"
+contains = "identity=table:TPM2#0, ids=[{kind=table, text=TPM2}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]"
+timeout = 30
+
+# THE TOOL: the interface, swtpm's identity, and sealing available.
+
+[[step]]
+do = "key"
+text = "tpm info"
+
+[[step]]
+do = "expect"
+contains = "tpm: interface @IFACE@, manufacturer IBM"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "seal unseal and quote available"
+
+# TWO DRAWS, which the gate compares on the host.
+
+[[step]]
+do = "key"
+text = "tpm random 16"
+
+[[step]]
+do = "expect"
+contains = "tpm: random "
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm random 16"
+
+[[step]]
+do = "expect"
+contains = "tpm: random "
+timeout = 30
+
+# AN EXTEND OF PCR 16, whose chain the gate computes on the host from the text typed here.
+
+[[step]]
+do = "key"
+text = "tpm pcr 16"
+
+[[step]]
+do = "expect"
+contains = "tpm: pcr "
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm extend 16 liber-measure"
+
+[[step]]
+do = "expect"
+contains = "tpm: extended PCR 16 with "
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm pcr 16"
+
+[[step]]
+do = "expect"
+contains = "tpm: pcr "
+timeout = 30
+
+# PCR 8 IS THE SYSTEM'S OWN MEASURED BOOT'S: refused, and unchanged.
+
+[[step]]
+do = "key"
+text = "tpm pcr 8"
+
+[[step]]
+do = "expect"
+contains = "tpm: pcr "
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm extend 8 liber-measure"
+
+[[step]]
+do = "expect"
+contains = "tpm: extend refused: pcr-not-allowed"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm pcr 8"
+
+[[step]]
+do = "expect"
+contains = "tpm: pcr "
+timeout = 30
+
+# SEALED TO PCR 16, and opened.
+
+[[step]]
+do = "key"
+text = "tpm seal 16 liber-secret vol://tmp/sealed.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: sealed to PCR 16"
+timeout = 60
+
+[[step]]
+do = "key"
+text = "tpm unseal vol://tmp/sealed.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: unsealed: liber-secret"
+timeout = 60
+
+# THE OTHER COMPONENT: refused not-granted twice on PCR 23 - by the library and by the service - with PCR 23 unchanged;
+# refused other-component on the tool's secret; and its own secret opens for it.
+
+[[step]]
+do = "key"
+text = "tpmprobe extend23"
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: PASS an extend of PCR 23 is refused not-granted by tpm-client in this process"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: PASS an extend of PCR 23 is refused not-granted by TpmService on the observation connection"
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: PASS PCR 23 is unchanged"
+
+[[step]]
+do = "key"
+text = "tpmprobe other vol://tmp/sealed.bin"
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: PASS the tool's sealed secret is refused other-component"
+timeout = 60
+
+[[step]]
+do = "key"
+text = "tpmprobe own"
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: PASS its own sealed secret opens for it"
+timeout = 60
+
+# THE DRIVER RESTARTED under one held connection: a value before the disable, `unavailable` while the driver is
+# down (an `interrupted` admitted for the call the withdrawal overtook), and a value after the enable.
+
+[[step]]
+do = "key"
+text = "tpmprobe hold &"
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: hold a value"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "lsdev --disable table:TPM2#0"
+
+[[step]]
+do = "expect"
+contains = "accepted"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: hold unavailable"
+timeout = 60
+
+[[step]]
+do = "key"
+text = "tpm random 8"
+
+[[step]]
+do = "expect"
+contains = "tpm: random refused: unavailable"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "lsdev --enable table:TPM2#0"
+
+[[step]]
+do = "expect"
+contains = "accepted"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "driver.tpm: online"
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "tpmprobe: hold a value"
+timeout = 60
+
+[[step]]
+do = "key"
+text = "tpm unseal vol://tmp/sealed.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: unsealed: liber-secret"
+timeout = 60
+
+# TPMSERVICE STOPPED AND STARTED: a new launch is minted its grants again and answered.
+
+[[step]]
+do = "key"
+text = "stop tpm_service"
+
+[[step]]
+do = "expect"
+contains = "tpm_service stopped"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "start tpm_service"
+
+[[step]]
+do = "expect"
+contains = "started: tpm_service"
+timeout = 60
+
+[[step]]
+do = "key"
+text = "tpm random 8"
+
+[[step]]
+do = "expect"
+contains = "tpm: random "
+timeout = 60
+
+# PCR 16 MOVED: the sealed secret stays shut.
+
+[[step]]
+do = "key"
+text = "tpm extend 16 moved"
+
+[[step]]
+do = "expect"
+contains = "tpm: extended PCR 16 with "
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm unseal vol://tmp/sealed.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: unseal refused: policy-refused"
+timeout = 60
+
+# A QUOTE of PCR 16 over this nonce, which the gate verifies with OpenSSL on the host.
+
+[[step]]
+do = "key"
+text = "tpm pcr 16"
+
+[[step]]
+do = "expect"
+contains = "tpm: pcr "
+timeout = 30
+
+[[step]]
+do = "key"
+text = "tpm quote 16 liber-nonce vol://tmp/quote.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: quote written to"
+timeout = 120

@@ -1,0 +1,29 @@
+package liber:tpm@1
+enum outcome(done=1,not-granted=2,pcr-not-allowed=3,bounds=4,busy=5,policy-refused=6,owner-hierarchy-unavailable=7,other-component=8,interrupted=9,unavailable=10,tpm=11,fault=12)
+enum interface-kind(fifo=1,crb=2)
+record tpm-info(interface:interface-kind,manufacturer:string:bound=4,vendor:string:bound=16,firmware-1:u32,firmware-2:u32,sealing:bool)
+record info-answer(outcome:outcome,code:u32,info:option<tpm-info>)
+record bytes-answer(outcome:outcome,code:u32,bytes:list<u8>:bound=1024)
+record status(outcome:outcome,code:u32)
+record quote(attest:list<u8>:bound=512,signature-r:list<u8>:bound=32,signature-s:list<u8>:bound=32,point-x:list<u8>:bound=32,point-y:list<u8>:bound=32,pcr-digest:list<u8>:bound=32)
+record quote-answer(outcome:outcome,code:u32,quote:option<quote>)
+interface tpm
+method tpm.info op=1 () -> result<info-answer, liber:base@1::error>
+method tpm.random op=2 (count:u32:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm.pcr-read op=3 (pcr:u32:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm.pcr-extend op=4 (pcr:u32:rights=,digest:list<u8>:bound=32:rights=) -> result<status, liber:base@1::error>
+method tpm.seal op=5 (pcr:u32:rights=,secret:list<u8>:bound=96:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm.unseal op=6 (sealed:list<u8>:bound=1024:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm.quote op=7 (pcr:u32:rights=,nonce:list<u8>:bound=64:rights=) -> result<quote-answer, liber:base@1::error>
+enum grant(tpm=1,tpm-measure=2,tpm-seal=3)
+interface tpm-admin
+method tpm-admin.mint op=1 (kind:grant:rights=,component:string:bound=64:rights=,owner:handle<liber:process@1::task>:rights=) -> result<handle<channel>, liber:base@1::error>
+record device-description(outcome:outcome,code:u32,interface:interface-kind,manufacturer:string:bound=4,vendor:string:bound=16,firmware-1:u32,firmware-2:u32,owner-auth-set:bool,owner-enabled:bool)
+interface tpm-device
+method tpm-device.describe op=1 () -> result<device-description, liber:base@1::error>
+method tpm-device.random op=2 (count:u32:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm-device.pcr-read op=3 (pcr:u32:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm-device.pcr-extend op=4 (pcr:u32:rights=,digest:list<u8>:bound=32:rights=) -> result<status, liber:base@1::error>
+method tpm-device.seal op=5 (pcr:u32:rights=,secret:list<u8>:bound=128:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm-device.unseal op=6 (sealed:list<u8>:bound=1024:rights=) -> result<bytes-answer, liber:base@1::error>
+method tpm-device.quote op=7 (pcr:u32:rights=,nonce:list<u8>:bound=64:rights=) -> result<quote-answer, liber:base@1::error>

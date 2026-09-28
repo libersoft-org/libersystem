@@ -7,6 +7,10 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "acpi"
+version = "0.0.0"
+
+[[package]]
 name = "admin-proto"
 version = "0.0.0"
 dependencies = [
@@ -131,6 +135,7 @@ dependencies = [
  "proto",
  "rt",
  "smartcard-model",
+ "tpm",
  "wire",
 ]
 
@@ -424,6 +429,7 @@ dependencies = [
  "spool-proto",
  "storage-proto",
  "time-proto",
+ "tpm-proto",
  "wire",
 ]
 
@@ -692,6 +698,23 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "tpm"
+version = "0.0.0"
+dependencies = [
+ "acpi",
+]
+
+[[package]]
+name = "tpm-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
 
 [[package]]
 name = "unicode-ident"

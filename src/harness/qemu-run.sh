@@ -895,6 +895,10 @@ qemu_attach_suite_devices() {
 	# line that says the slot was found is the evidence that the scan reaches it on that machine.
 	local -n slot_into="$into"
 	slot_into+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
+	# AND AN `edu` FUNCTION AFTER IT, for the platform-row suite's level line - see the x86_64 test block, which
+	# attaches the same function for the same suite, and for why its DMA reaches all of memory. Nothing binds
+	# it, and last it moves nothing.
+	slot_into+=(-device edu,dma_mask=0xffffffffffffffff)
 }
 
 # THE I2C AND GPIO CONTROLLERS, when a run asks for them with `I2C_FIXTURE`: QEMU's `vhost-user-i2c-pci` and
@@ -2260,6 +2264,19 @@ qemu_run_x86_64() {
 			# than a model inside QEMU - which is why it is attached here and started below.
 			qemu_attach_vsock qemu_args
 		fi
+		# AN `edu` FUNCTION, FOR THE PLATFORM-ROW SUITE: its INTx is the LEVEL line that suite claims as a
+		# platform row's, raised and held from its registers until acknowledged - so a line left unmasked while its
+		# driver runs is a storm the suite counts. Nothing binds it. LAST OF THE PCI DEVICES and without an
+		# address, so QEMU gives it the next free slot and renumbers nothing; not on the DMA fixture's machine,
+		# whose `edu` functions are its own and arrive through `QEMU_EXTRA`.
+		#
+		# AND IT REACHES ALL OF MEMORY. The IOMMU suite's baseline case aims this function's DMA at a sentinel
+		# wherever the allocator put it, and `edu` masks a DMA address to 28 bits unless told otherwise - so a
+		# sentinel above 256 MiB was left untouched while the copy landed on whatever lay at the address's low
+		# bits.
+		if [[ "$dma_fixture" != "1" ]]; then
+			qemu_args+=(-device edu,dma_mask=0xffffffffffffffff)
+		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
 		set +e
@@ -2606,6 +2623,12 @@ qemu_run_aarch64() {
 			qemu_args+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
 		fi
 		qemu_attach_suite_devices qemu_args "$reduced"
+		# A TPM, WHEN A RUN ASKS FOR ONE: QEMU's `tpm-tis-device` on the `virt` machine's platform bus - which the device
+		# tree describes as a `tcg,tpm-tis-mmio` node under the bus's `simple-bus` - with the `swtpm` the run started
+		# behind it. TIS alone: `virt` offers no CRB.
+		if [[ -n "${TPM_SOCKET:-}" && "${TPM_FRONTEND:-}" == "tis" ]]; then
+			qemu_args+=(-chardev "socket,id=chrtpm,path=$TPM_SOCKET" -tpmdev "emulator,id=tpm0,chardev=chrtpm" -device "tpm-tis-device,tpmdev=tpm0")
+		fi
 		local -a independent=()
 		MACHINE_FOR_DUMP="$machine"
 		mapfile -t independent < <(dma_independent_dtb_args qemu-system-aarch64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
@@ -2969,6 +2992,12 @@ qemu_run_riscv64() {
 			qemu_args+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
 		fi
 		qemu_attach_suite_devices qemu_args "$reduced"
+		# A TPM, WHEN A RUN ASKS FOR ONE: QEMU's `tpm-tis-device` on the `virt` machine's platform bus - which the device
+		# tree describes as a `tcg,tpm-tis-mmio` node under the bus's `simple-bus` - with the `swtpm` the run started
+		# behind it. TIS alone: `virt` offers no CRB.
+		if [[ -n "${TPM_SOCKET:-}" && "${TPM_FRONTEND:-}" == "tis" ]]; then
+			qemu_args+=(-chardev "socket,id=chrtpm,path=$TPM_SOCKET" -tpmdev "emulator,id=tpm0,chardev=chrtpm" -device "tpm-tis-device,tpmdev=tpm0")
+		fi
 		local -a independent=()
 		MACHINE_FOR_DUMP="virt,aia=aplic-imsic"
 		mapfile -t independent < <(dma_independent_dtb_args qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")

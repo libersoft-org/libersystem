@@ -773,6 +773,10 @@ fn hpet_names_its_register_window() {
 	let bytes = Builder::new(b"HPET", 1, 56).u32(36, 0x8086_a201).gas(40, 0, 64, 0, 0, 0xfed0_0000).u8(52, 0).finish();
 	let hpet = Hpet::new(&bytes).expect("an HPET");
 	assert_eq!((hpet.base.space, hpet.base.address, hpet.number), (AddressSpace::SystemMemory, 0xfed0_0000, 0));
+	// AND AS QEMU WRITES IT: the base names the timer's whole block with a width of zero, which is a window and not
+	// half a register.
+	let qemu = Builder::new(b"HPET", 1, 56).u32(36, 0x8086_a201).gas(40, 0, 0, 0, 0, 0xfed0_0000).u8(52, 0).finish();
+	assert_eq!(Hpet::new(&qemu).map(|hpet| hpet.base.address), Ok(0xfed0_0000), "QEMU's own HPET table names its window");
 }
 
 #[test]
@@ -794,4 +798,43 @@ fn bgrt_says_where_the_boot_logo_is() {
 	let bytes = Builder::new(b"BGRT", 1, 56).u16(36, 1).u8(38, 1).u8(39, 0).u64(40, 0x7e00_0000).u32(48, 400).u32(52, 300).finish();
 	let bgrt = Bgrt::new(&bytes).expect("a BGRT");
 	assert_eq!((bgrt.status, bgrt.image_address, bgrt.x, bgrt.y), (1, 0x7e00_0000, 400, 300));
+}
+
+#[test]
+fn dmar_names_each_hardware_unit_and_its_window_and_skips_the_other_structures() {
+	// Two DRHDs - one of a single page, one of four (size 2) - around an RMRR, which is memory and no unit.
+	let mut builder = Builder::new(b"DMAR", 1, 48 + 16 + 24 + 16).u8(36, 38).u8(37, 1);
+	builder = builder.u16(48, 0).u16(50, 16).u8(52, 0).u8(53, 0).u16(54, 0).u64(56, 0xfed9_0000);
+	builder = builder.u16(64, 1).u16(66, 24).u64(72, 0x7c00_0000).u64(80, 0x7c0f_ffff);
+	builder = builder.u16(88, 0).u16(90, 16).u8(92, 1).u8(93, 2).u16(94, 1).u64(96, 0xfed9_1000);
+	let bytes = builder.finish();
+	let mut seen = Vec::new();
+	dmar_units(&bytes, |unit| seen.push((unit.base, unit.len, unit.segment))).expect("a DMAR");
+	assert_eq!(seen, vec![(0xfed9_0000, 0x1000, 0), (0xfed9_1000, 0x4000, 1)]);
+	// A LENGTH THAT RUNS PAST THE TABLE ends the walk with a refusal, after what could be read.
+	let mut broken = bytes.clone();
+	broken[90] = 0xff;
+	let broken = Builder { bytes: broken }.finish();
+	let mut seen = Vec::new();
+	assert_eq!(dmar_units(&broken, |unit| seen.push(unit.base)), Err(Error::TooShort));
+	assert_eq!(seen, vec![0xfed9_0000], "the unit before the broken structure was still named");
+	// And a length of zero cannot loop.
+	let mut zero = bytes.clone();
+	zero[50] = 0;
+	let zero = Builder { bytes: zero }.finish();
+	assert_eq!(dmar_units(&zero, |_| {}), Err(Error::TooShort));
+}
+
+#[test]
+fn ivrs_names_each_hardware_definition_and_skips_memory_definitions() {
+	// An IVHD of type 0x11, an IVMD (0x21), and an IVHD of type 0x40.
+	let mut builder = Builder::new(b"IVRS", 1, 48 + 40 + 32 + 40).u32(36, 0x0020_3041);
+	builder = builder.u8(48, 0x11).u8(49, 0).u16(50, 40).u16(52, 0x0002).u16(54, 0x40).u64(56, 0xfeb8_0000).u16(64, 0);
+	builder = builder.u8(88, 0x21).u16(90, 32);
+	builder = builder.u8(120, 0x40).u16(122, 40).u64(128, 0xfeb9_0000).u16(136, 1);
+	let bytes = builder.finish();
+	let mut seen = Vec::new();
+	ivrs_units(&bytes, |unit| seen.push((unit.base, unit.len, unit.segment))).expect("an IVRS");
+	assert_eq!(seen, vec![(0xfeb8_0000, 0x4000, 0), (0xfeb9_0000, 0x4000, 1)]);
+	assert_eq!(ivrs_units(&Builder::new(b"DMAR", 1, 48).finish(), |_| {}).err(), Some(Error::Signature), "another table is not an IVRS");
 }

@@ -145,3 +145,95 @@ fn the_typed_operations_hold_against_a_real_tpm() {
 	assert!(!openssl_verifies(&swtpm.dir, &quote.x, &quote.y, &quote.r, &quote.s, &forged), "and refuses it over an attestation one bit different");
 	assert!(matches!(tpm.quote(&[0; 65], 16), Err(Error::Bounds)), "a nonce past the bound is not sent");
 }
+
+// A raw command the crate itself never sends, built here to put a TPM into the state a test needs: loaded objects
+// a killed driver left behind, an owner authorization, a disabled owner hierarchy. The crate's rule - nothing
+// passed through - is about what it offers; a test that provisions a TPM is not a caller of it.
+fn raw(tpm: &mut Tpm<Socket>, command: tpm::marshal::Writer) -> Result<Vec<u8>, Error> {
+	tpm::command::run(&mut tpm.transport, &command.finish().expect("a command within the bound"), tpm::ops::KEY_MS)
+}
+
+fn create_primary(tpm: &mut Tpm<Socket>) -> Result<Vec<u8>, Error> {
+	let mut writer = tpm::marshal::Writer::command(tpm::ST_SESSIONS, tpm::CC_CREATE_PRIMARY);
+	writer.u32(tpm::RH_OWNER);
+	tpm::command::password_authorization(&mut writer);
+	writer.u16(4).u16(0).u16(0);
+	writer.sized(&tpm::ops::storage_template());
+	writer.sized(&[]);
+	writer.u32(0);
+	raw(tpm, writer)
+}
+
+fn start_session(tpm: &mut Tpm<Socket>) -> Result<Vec<u8>, Error> {
+	let mut writer = tpm::marshal::Writer::command(tpm::ST_NO_SESSIONS, tpm::CC_START_AUTH_SESSION);
+	writer.u32(tpm::RH_NULL).u32(tpm::RH_NULL);
+	writer.sized(&[7; 32]);
+	writer.sized(&[]);
+	writer.u8(tpm::SE_POLICY);
+	writer.u16(tpm::ALG_NULL);
+	writer.u16(tpm::ALG_SHA256);
+	raw(tpm, writer)
+}
+
+#[test]
+fn a_killed_predecessors_leftovers_stop_an_unseal_until_they_are_flushed() {
+	let (_swtpm, stream) = start("leftovers");
+	let mut tpm = Tpm::new(Socket(stream));
+	tpm.startup().expect("Startup(CLEAR)");
+	let sealed = tpm.seal(b"survives the leftovers", 16).expect("sealed on a clean TPM");
+	assert_eq!(tpm.flush_leftovers(), Ok(0), "a clean TPM has nothing left over");
+	// WHAT A DRIVER KILLED MID-OPERATION LEAVES: transient objects and sessions loaded and never flushed, up to
+	// the TPM's limit - which the TPM itself reports by refusing the next one.
+	let mut objects = 0;
+	while create_primary(&mut tpm).is_ok() {
+		objects += 1;
+		assert!(objects <= 16, "a TPM holds a handful of objects, not an unbounded number");
+	}
+	let mut sessions = 0;
+	while start_session(&mut tpm).is_ok() {
+		sessions += 1;
+		assert!(sessions <= 64, "and a bounded number of sessions");
+	}
+	assert!(objects >= 3 && sessions >= 3, "the PC Client minimum is three of each ({objects} objects, {sessions} sessions)");
+	assert_eq!(tpm.unseal(&sealed), Err(Error::Tpm(tpm::RC_OBJECT_MEMORY)), "the unseal cannot load its primary - the TPM's object-memory warning");
+	assert_eq!(tpm.flush_leftovers(), Ok(objects + sessions), "every object and every session is flushed");
+	assert_eq!(tpm.unseal(&sealed).as_deref(), Ok(&b"survives the leftovers"[..]), "and the same unseal returns the secret");
+	assert_eq!(tpm.flush_leftovers(), Ok(0), "and the unseal left nothing behind");
+}
+
+#[test]
+fn the_owner_hierarchy_state_is_reported_and_the_rest_keeps_working() {
+	// AN OWNER AUTHORIZATION SET, as another system would have set it.
+	let (_swtpm, stream) = start("owner-auth");
+	let mut tpm = Tpm::new(Socket(stream));
+	tpm.startup().expect("Startup(CLEAR)");
+	let before = tpm.hierarchy().expect("the attribute words");
+	assert!(before.owner_usable(), "a fresh TPM's owner hierarchy is usable: {before:?}");
+	let identity = tpm.identity().expect("the fixed identity");
+	assert_eq!(&identity.family, b"2.0\0", "a TPM 2.0 says so");
+	assert_ne!(identity.manufacturer, [0; 4], "and names its manufacturer");
+	let mut change = tpm::marshal::Writer::command(tpm::ST_SESSIONS, tpm::CC_HIERARCHY_CHANGE_AUTH);
+	change.u32(tpm::RH_OWNER);
+	tpm::command::password_authorization(&mut change);
+	change.sized(b"someone else's");
+	raw(&mut tpm, change).expect("HierarchyChangeAuth on the owner hierarchy");
+	let set = tpm.hierarchy().expect("the attribute words again");
+	assert!(set.owner_auth_set && set.owner_enabled && !set.owner_usable(), "the owner authorization is reported: {set:?}");
+	assert!(tpm.random(8).is_ok() && tpm.pcr_read(16).is_ok(), "random and PCR read keep working");
+	tpm.pcr_extend(16, &sha256(&[b"still measured"])).expect("and extend");
+	assert!(matches!(tpm.seal(b"x", 16), Err(Error::Tpm(_))), "while a seal under the owner hierarchy cannot run");
+
+	// THE OWNER HIERARCHY DISABLED, under the platform hierarchy's empty authorization.
+	let (_swtpm, stream) = start("owner-disabled");
+	let mut tpm = Tpm::new(Socket(stream));
+	tpm.startup().expect("Startup(CLEAR)");
+	let mut control = tpm::marshal::Writer::command(tpm::ST_SESSIONS, tpm::CC_HIERARCHY_CONTROL);
+	control.u32(tpm::RH_PLATFORM);
+	tpm::command::password_authorization(&mut control);
+	control.u32(tpm::RH_OWNER).u8(0);
+	raw(&mut tpm, control).expect("HierarchyControl disabling the owner hierarchy");
+	let disabled = tpm.hierarchy().expect("the attribute words");
+	assert!(!disabled.owner_auth_set && !disabled.owner_enabled && !disabled.owner_usable(), "the disabled owner hierarchy is reported: {disabled:?}");
+	assert!(tpm.random(8).is_ok() && tpm.pcr_read(23).is_ok(), "random and PCR read keep working");
+	tpm.pcr_extend(23, &sha256(&[b"still measured"])).expect("and extend");
+}

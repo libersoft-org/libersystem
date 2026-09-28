@@ -1,0 +1,167 @@
+//! LiberSystem TPM 2.0 - random bytes, PCRs read and extended, secrets sealed to a PCR's value, and quotes,
+//! as typed operations over the machine's one TPM.
+//!
+//! THREE PARTIES, THREE INTERFACES. An APPLICATION holds a `tpm` connection minted for ONE of three grants and
+//! carrying that grant's operations only. PERMISSIONMANAGER holds the private `tpm-admin` endpoint that mints
+//! those connections. The TPM DRIVER serves `tpm-device`, and TpmService is its one consumer.
+//!
+//! NOTHING RAW CROSSES ANY OF THEM. There is no command passthrough: a raw TPM command interface is an
+//! authority over every session and every hierarchy of the machine, which is exactly what a third-party API
+//! must not be. Every operation below is built by the driver's library from typed arguments.
+//!
+//! WHAT A CALL COSTS. `seal`, `unseal` and `quote` each generate a primary key in the TPM, which takes a
+//! TPM tens to hundreds of milliseconds; `random`, `pcr-read` and `pcr-extend` are one short command each.
+//! One call is outstanding per connection and sixteen in all, and the TPM runs one at a time.
+
+package liber:tpm@1;
+
+use liber:base@1.{error};
+use liber:process@1.{task};
+
+/// HOW A CALL ENDED. Every answer carries one: `done` with its value, or the refusal by name.
+enum outcome {
+	done                        = 1,
+	/// The connection's grant does not carry this operation.
+	not-granted                 = 2,
+	/// `pcr-extend` of a PCR other than 16 or 23, or any operation naming a PCR past 23.
+	pcr-not-allowed             = 3,
+	/// A count, secret or nonce past its bound.
+	bounds                      = 4,
+	/// A call is already outstanding on this connection, or sixteen are waiting in all.
+	busy                        = 5,
+	/// `unseal` of a secret whose PCR no longer holds the value it was sealed to.
+	policy-refused              = 6,
+	/// The owner hierarchy has an authorization value or is disabled, so `seal`, `unseal` and `quote` cannot run.
+	owner-hierarchy-unavailable = 7,
+	/// `unseal` of a secret another component sealed.
+	other-component             = 8,
+	/// The call reached the driver and the driver went away before answering. It is NEVER replayed: an extend
+	/// may have reached the TPM, and a replay would extend twice. A caller that must know reads the PCR.
+	interrupted                 = 9,
+	/// No TPM is being served: none was found, or its driver is restarting.
+	unavailable                 = 10,
+	/// The TPM answered with its own response code, in `code`.
+	tpm                         = 11,
+	/// The TPM's interface failed or its answer could not be read.
+	fault                       = 12,
+}
+
+/// The interface the TPM is reached through.
+enum interface-kind {
+	fifo = 1,
+	crb  = 2,
+}
+
+record tpm-info {
+	interface:              interface-kind,
+	/// The manufacturer's four characters (`IBM `, `INTC`, `MSFT`), as the TPM reports them.
+	@bound(4)  manufacturer: string,
+	/// The vendor string, as the TPM reports it.
+	@bound(16) vendor:       string,
+	/// The two firmware-version words.
+	firmware-1:             u32,
+	firmware-2:             u32,
+	/// Whether `seal`, `unseal` and `quote` can run: false when the owner hierarchy has an authorization value
+	/// or is disabled.
+	sealing:                bool,
+}
+
+record info-answer {
+	outcome: outcome,
+	code:    u32,
+	info:    option<tpm-info>,
+}
+
+record bytes-answer {
+	outcome:            outcome,
+	code:               u32,
+	@bound(1024) bytes: list<u8>,
+}
+
+record status {
+	outcome: outcome,
+	code:    u32,
+}
+
+/// A QUOTE: the attestation the TPM made, its ECDSA P-256 signature (r, s), the public point (x, y) of the key
+/// that signed it for verification elsewhere, and the PCR digest the attestation carries. The key is not
+/// certified by the TPM's endorsement key, so a verifier learns it on first use.
+record quote {
+	@bound(512) attest:     list<u8>,
+	@bound(32) signature-r: list<u8>,
+	@bound(32) signature-s: list<u8>,
+	@bound(32) point-x:     list<u8>,
+	@bound(32) point-y:     list<u8>,
+	@bound(32) pcr-digest:  list<u8>,
+}
+
+record quote-answer {
+	outcome: outcome,
+	code:    u32,
+	quote:   option<quote>,
+}
+
+/// THE APPLICATION'S CONNECTION, carrying the operations of the one grant it was minted for.
+interface tpm {
+	/// The interface, the TPM's identity, and whether sealing works. Every grant.
+	@op(1) info:       func() -> result<info-answer, error>;
+	/// At most 1024 bytes from the TPM's generator. The `tpm` grant.
+	@op(2) random:     func(count: u32) -> result<bytes-answer, error>;
+	/// PCR 0-23 of the SHA-256 bank. The `tpm` grant.
+	@op(3) pcr-read:   func(pcr: u32) -> result<bytes-answer, error>;
+	/// Extend PCR 16 or 23 with a SHA-256 digest: the PC Client profile's debug and application PCRs. 0-7 are
+	/// the firmware's, 8-15 are this system's own measured boot's, 17-22 the dynamic root of trust's. PCRs are
+	/// SHARED by the whole machine. The `tpm-measure` grant.
+	@op(4) pcr-extend: func(pcr: u32, @bound(32) digest: list<u8>) -> result<status, error>;
+	/// Seal at most 96 bytes to PCR 0-23's present value; the sealed object opens only on this TPM, only while
+	/// that PCR holds that value, and only for the component that sealed it. The `tpm-seal` grant.
+	@op(5) seal:       func(pcr: u32, @bound(96) secret: list<u8>) -> result<bytes-answer, error>;
+	/// The secret a sealed object holds. The `tpm-seal` grant.
+	@op(6) unseal:     func(@bound(1024) sealed: list<u8>) -> result<bytes-answer, error>;
+	/// A quote of PCR 0-23 over a nonce of at most 64 bytes. The `tpm` grant.
+	@op(7) quote:      func(pcr: u32, @bound(64) nonce: list<u8>) -> result<quote-answer, error>;
+}
+
+/// WHAT A MINTED CONNECTION MAY DO, split by what it can hurt: `tpm` observes (info, random, PCR read, quote),
+/// `tpm-measure` changes what every later quote and unseal answers (PCR extend), `tpm-seal` seals and unseals.
+enum grant {
+	tpm         = 1,
+	tpm-measure = 2,
+	tpm-seal    = 3,
+}
+
+/// THE MINTING ENDPOINT, PermissionManager's alone. The connection carries one grant's operations for the
+/// named component, and lives as long as `owner` does and no longer, however it is copied.
+interface tpm-admin {
+	@op(1) mint: func(kind: grant, @bound(64) component: string, owner: handle<task>) -> result<handle<channel>, error>;
+}
+
+// ------------------------------------------------------------------ the provider contract
+
+/// What the driver found: the interface, the identity, and the owner hierarchy's state, read afresh.
+record device-description {
+	outcome:         outcome,
+	code:            u32,
+	interface:       interface-kind,
+	@bound(4)  manufacturer: string,
+	@bound(16) vendor:       string,
+	firmware-1:      u32,
+	firmware-2:      u32,
+	owner-auth-set:  bool,
+	owner-enabled:   bool,
+}
+
+/// THE PROVIDER CONTRACT a `tpm` publication serves - to TpmService alone. It executes ONE OPERATION AT A TIME,
+/// WHOLE, in the order received: a TPM runs one command at a time, and an operation interleaved between
+/// another's `CreatePrimary` and its `FlushContext` would exhaust the objects the first one needs. It decides
+/// nothing about who may do what; the bounds are the library's own.
+interface tpm-device {
+	@op(1) describe:   func() -> result<device-description, error>;
+	@op(2) random:     func(count: u32) -> result<bytes-answer, error>;
+	@op(3) pcr-read:   func(pcr: u32) -> result<bytes-answer, error>;
+	@op(4) pcr-extend: func(pcr: u32, @bound(32) digest: list<u8>) -> result<status, error>;
+	/// A secret of at most 128 bytes sealed to a PCR's present value, as the sealed object's bytes.
+	@op(5) seal:       func(pcr: u32, @bound(128) secret: list<u8>) -> result<bytes-answer, error>;
+	@op(6) unseal:     func(@bound(1024) sealed: list<u8>) -> result<bytes-answer, error>;
+	@op(7) quote:      func(pcr: u32, @bound(64) nonce: list<u8>) -> result<quote-answer, error>;
+}

@@ -735,17 +735,29 @@ impl BindingQueue {
 // rebound after its driver died keeps its BDF and takes a NEW claim, and P02M0098 gives that claim a
 // new generation - so a message stamped with the previous one is refused by arithmetic rather than
 // by anyone remembering to check.
+//
+// A DEVICE THE FIRMWARE DESCRIBES HAS NO BUS ADDRESS, so a binding names one of two kinds of device: a PCI
+// function by bus/device/function, or a PLATFORM device by the kernel's platform number - its row, which a
+// platform device keeps for the boot as a function keeps its address. `platform` is that number, and None
+// for a function. Without it a platform row read as function 00:00.0 - the host bridge on every PC.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct BindingId {
 	pub bus: u8,
 	pub dev: u8,
 	pub func: u8,
+	pub platform: Option<u32>,
 	pub generation: u64,
 }
 
 impl BindingId {
+	// A PCI function's binding.
 	pub const fn new(bus: u8, dev: u8, func: u8, generation: u64) -> Self {
-		Self { bus, dev, func, generation }
+		Self { bus, dev, func, platform: None, generation }
+	}
+
+	// A platform device's binding, by the kernel's platform number.
+	pub const fn platform(number: u32, generation: u64) -> Self {
+		Self { bus: 0, dev: 0, func: 0, platform: Some(number), generation }
 	}
 
 	// Whether this names the same FUNCTION as `other`, whatever binding either is about.
@@ -753,9 +765,10 @@ impl BindingId {
 	// The question a rebind asks: "is this the device I was driving", which is about the location
 	// and not about the binding. `==` answers the other question - "is this the same binding" - and
 	// the two must not be one operator, because a rebind that compared whole identities would
-	// conclude a device it just rebound is a different device.
+	// conclude a device it just rebound is a different device. A platform device is the same device
+	// by its number, and never the same device as any function.
 	pub fn same_function(self, other: BindingId) -> bool {
-		self.bus == other.bus && self.dev == other.dev && self.func == other.func
+		self.platform == other.platform && self.bus == other.bus && self.dev == other.dev && self.func == other.func
 	}
 
 	// The same function, one binding later.
@@ -852,8 +865,9 @@ pub fn next_handoff_slot<T>(entries: &[Option<T>], eligible: impl Fn(&T) -> bool
 	best
 }
 
-fn provider_address(id: ProviderId) -> (u8, u8, u8) {
-	(id.binding.bus, id.binding.dev, id.binding.func)
+// Every PCI function by its address, then every platform device by its number.
+fn provider_address(id: ProviderId) -> (bool, u32, u8, u8, u8) {
+	(id.binding.platform.is_some(), id.binding.platform.unwrap_or(0), id.binding.bus, id.binding.dev, id.binding.func)
 }
 
 // THE WITHDRAWAL ITSELF, over any slot array, so the model and the production catalogue run ONE
@@ -1125,11 +1139,12 @@ impl IncidentWindow {
 // thing a machine checks.
 
 // The most resources one bind hands over: the device MMIO, an MSI vector, a key sink, the trusted key
-// sink, a power connection and a console feed - the six a physical keyboard's driver is given - and one
-// port range for each port resource a row can carry. A ledger that is full refuses the next entry, and
-// DeviceManager does not look: at five, the trusted key sink pushed the console feed out of every
-// keyboard's bind, and nothing a person typed reached the console.
-pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES;
+// sink, a power connection and a console feed - the six a physical keyboard's driver is given - one
+// port range for each port resource a row can carry, a platform row's further register windows and its
+// wired lines, and the console UART's tap. A ledger that is full refuses the next entry, and DeviceManager does not look: at five,
+// the trusted key sink pushed the console feed out of every keyboard's bind, and nothing a person typed
+// reached the console.
+pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES + driver_protocol::MAX_PLATFORM_WINDOWS + driver_protocol::MAX_PLATFORM_LINES + 1;
 
 // What a rollback does to the world. Separated from the ledger so the ledger can be driven.
 //

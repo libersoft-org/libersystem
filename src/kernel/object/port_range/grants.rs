@@ -82,7 +82,8 @@ const TEST_EXIT: (u16, u16) = (0xF4, 4);
 pub const COM1: (u16, u16) = (0x3F8, 8);
 
 // The kernel items that install ports at run time. The console holds COM1 from before the boot scan until
-// the COM1 handoff moves its ports into the claim's grant.
+// the COM1 handoff moves its ports into the claim's grant, and takes them back when that grant ends; the
+// suite's second UART is installed under the same item while the suite has the kernel drive it.
 pub const KERNEL_CONSOLE: u32 = 1;
 
 // The ports the kernel writes on its terminal paths alone: MINTABLE, and written on those paths without
@@ -112,6 +113,9 @@ struct Span {
 	end: u32,
 	// The grant's owner, or `RETIRED`.
 	owner: u64,
+	// The kernel install this grant was moved out of, and its hold count: when the grant ends, the ports go
+	// back into the reserved set under it, in the same step.
+	returns: Option<(u32, u32)>,
 }
 
 const RETIRED: u64 = 0;
@@ -201,7 +205,37 @@ pub fn grant(base: u16, len: u16, owner: u64) -> Result<(), Refusal> {
 	if table.spans.try_reserve(1).is_err() {
 		return Err(Refusal::NoMemory);
 	}
-	table.spans.push(Span { base, end, owner });
+	table.spans.push(Span { base, end, owner, returns: None });
+	Ok(())
+}
+
+// THE CONSOLE HANDOFF'S MINT: `len` ports from `base`, installed by kernel item `item` - the console UART the
+// kernel has driven until a claim took it - MOVED out of the reserved set into `owner`'s grant in ONE STEP,
+// under the lock every mint checks, so no other mint can take them in between. Every other part of the set,
+// every live grant and every retired span refuses it as they refuse any mint; a range the item has not
+// installed is refused as the reserved set would refuse it. The grant's end puts them back under the item.
+pub fn grant_from_install(item: u32, base: u16, len: u16, owner: u64) -> Result<(), Refusal> {
+	let Some(end) = end_of(base, len) else { return Err(Refusal::OutOfRange) };
+	debug_assert!(owner != RETIRED, "an object id is never zero");
+	let mut table = TABLE.lock();
+	let Some(at) = table.installs.iter().position(|install| install.item == item && install.base == base && install.end == end) else {
+		return Err(match table.taken(base, end) {
+			Some(refusal) => refusal,
+			None => Refusal::Reserved(table.reserved(base, end).unwrap_or(Part::Installed)),
+		});
+	};
+	if table.spans.try_reserve(1).is_err() {
+		return Err(Refusal::NoMemory);
+	}
+	let install = table.installs.swap_remove(at);
+	let refused = table.reserved(base, end).map(Refusal::Reserved).or_else(|| table.taken(base, end));
+	if let Some(refusal) = refused {
+		// ALLOC-OK: the slot this install was just taken out of - `swap_remove` keeps the capacity.
+		table.installs.push(install);
+		return Err(refusal);
+	}
+	// ALLOC-OK: reserved above.
+	table.spans.push(Span { base, end, owner, returns: Some((install.item, install.count)) });
 	Ok(())
 }
 
@@ -211,6 +245,23 @@ pub fn grant(base: u16, len: u16, owner: u64) -> Result<(), Refusal> {
 pub fn end(owner: u64, confirmed: bool) {
 	let mut table = TABLE.lock();
 	let Some(at) = table.spans.iter().position(|span| span.owner == owner) else { return };
+	// A GRANT MOVED OUT OF A KERNEL INSTALL GOES BACK INTO IT, confirmed or not, in the same step: the kernel
+	// drives those ports again, and a holder a revocation could not reach can at worst interleave bytes with
+	// it. The install refuses every later mint as a retired span would.
+	if let Some((item, count)) = table.spans[at].returns {
+		let (base, stop) = (table.spans[at].base, table.spans[at].end);
+		if table.installs.try_reserve(1).is_ok() {
+			table.spans.swap_remove(at);
+			// ALLOC-OK: reserved on the line above.
+			table.installs.push(Install { item, base, end: stop, count });
+		} else {
+			// No room to put the install back: the span stays, retired, and refuses every mint as the install
+			// would.
+			table.spans[at].owner = RETIRED;
+			crate::serial_println!("ports: {base:#06x}..{:#06x} could not rejoin the reserved set - no memory - and are retired for this boot instead", stop - 1);
+		}
+		return;
+	}
 	if confirmed {
 		table.spans.swap_remove(at);
 	} else {
@@ -246,8 +297,8 @@ pub fn install(item: u32, base: u16, len: u16) -> Result<(), Refusal> {
 }
 
 // The matching uninstall. The ports leave the set only with this item's last hold of them; answers
-// whether the item held them at all. Its first kernel caller is the COM1 handoff; until then the tests
-// are.
+// whether the item held them at all. The COM1 handoff does not uninstall - it moves the install into the
+// claim's grant (`grant_from_install`) and the grant's end moves it back - so the tests are its callers.
 #[cfg(test)]
 pub fn uninstall(item: u32, base: u16, len: u16) -> bool {
 	let Some(end) = end_of(base, len) else { return false };

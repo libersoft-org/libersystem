@@ -24,9 +24,9 @@ const KERNEL_HELD: &[&[u8]] = &[
 ];
 
 // A GIC specifier as a wired line: a SHARED peripheral interrupt, by INTID, with the binding's flags - 1 and 2
-// edges, 4 and 8 levels, 2 and 8 active low. A PPI is a core's own and never a device's line.
-#[cfg(not(test))]
-fn gic_line(route: &fdt::IntxRoute) -> Option<abi::WiredLine> {
+// edges, 4 and 8 levels, 2 and 8 active low. A PPI is a core's own and never a device's line. The suite reads
+// its claimed line through this too.
+pub fn wired_line(_tree: &fdt::Fdt, route: &fdt::IntxRoute) -> Option<abi::WiredLine> {
 	if route.cells != 3 || route.spec[0] != 0 {
 		return None;
 	}
@@ -40,7 +40,7 @@ fn gic_line(route: &fdt::IntxRoute) -> Option<abi::WiredLine> {
 pub fn describe() -> Vec<Described> {
 	#[cfg(not(test))]
 	{
-		let out = super::device_tree().map(|tree| crate::arch::common::platform::from_tree(&tree, KERNEL_HELD, super::serial::UART_BASE, gic_line)).unwrap_or_default();
+		let out = super::device_tree().map(|tree| crate::arch::common::platform::from_tree(&tree, KERNEL_HELD, super::serial::UART_BASE, |route| wired_line(&tree, route))).unwrap_or_default();
 		crate::arch::common::platform::report_smbios(super::boot::loader_smbios(super::boot::BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst)), super::paging::phys_to_virt);
 		out
 	}

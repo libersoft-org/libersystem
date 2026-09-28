@@ -155,6 +155,15 @@ pub enum Capability {
 	/// holds display focus, so a background program cannot watch a game's input. Appended last, for the reason
 	/// `midi-output` states.
 	InputGamepad = 45,
+	/// THE TPM, OBSERVED: its identity, random bytes, PCR reads and quotes, on a connection minted per launch
+	/// for the component and the life of it. Appended last, for the reason `midi-output` states.
+	Tpm = 46,
+	/// THE TPM'S PCRS 16 AND 23 EXTENDED, which changes what every later quote and unseal answers - the whole
+	/// machine's, not this component's. Denied by default.
+	TpmMeasure = 47,
+	/// SEALING TO A PCR AND UNSEALING, each sealed object bound to the component that sealed it. Denied by
+	/// default.
+	TpmSeal = 48,
 }
 
 impl Capability {
@@ -243,6 +252,9 @@ impl Capability {
 			43 => Some(Capability::AdminTest),
 			44 => Some(Capability::MidiOutput),
 			45 => Some(Capability::InputGamepad),
+			46 => Some(Capability::Tpm),
+			47 => Some(Capability::TpmMeasure),
+			48 => Some(Capability::TpmSeal),
 			_ => None,
 		}
 	}
@@ -1406,6 +1418,9 @@ impl Capability {
 			Capability::AdminTest => out.push_str("\"admin-test\""),
 			Capability::MidiOutput => out.push_str("\"midi-output\""),
 			Capability::InputGamepad => out.push_str("\"input-gamepad\""),
+			Capability::Tpm => out.push_str("\"tpm\""),
+			Capability::TpmMeasure => out.push_str("\"tpm-measure\""),
+			Capability::TpmSeal => out.push_str("\"tpm-seal\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1456,6 +1471,9 @@ impl Capability {
 			Capability::AdminTest => out.push_str("admin-test"),
 			Capability::MidiOutput => out.push_str("midi-output"),
 			Capability::InputGamepad => out.push_str("input-gamepad"),
+			Capability::Tpm => out.push_str("tpm"),
+			Capability::TpmMeasure => out.push_str("tpm-measure"),
+			Capability::TpmSeal => out.push_str("tpm-seal"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1506,6 +1524,9 @@ impl Capability {
 			Capability::AdminTest => crate::codec::cbor::text(out, "admin-test"),
 			Capability::MidiOutput => crate::codec::cbor::text(out, "midi-output"),
 			Capability::InputGamepad => crate::codec::cbor::text(out, "input-gamepad"),
+			Capability::Tpm => crate::codec::cbor::text(out, "tpm"),
+			Capability::TpmMeasure => crate::codec::cbor::text(out, "tpm-measure"),
+			Capability::TpmSeal => crate::codec::cbor::text(out, "tpm-seal"),
 		}
 	}
 }

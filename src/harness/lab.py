@@ -1725,6 +1725,8 @@ OP_FIXTURE_PUT = 0x28
 OP_FIXTURE_ACK = 0x29
 OP_FIXTURE_CLEAR = 0x2a
 OP_FIXTURE_CLEAR_ACK = 0x2b
+OP_KERNEL_CONSOLE = 0x2c
+OP_KERNEL_CONSOLE_ACK = 0x2d
 OP_ERROR = 0xff
 
 # Each rejection the guest can name. They exist so a failure is explained by the frame that
@@ -2156,6 +2158,35 @@ def cmd_dev_reset(args):
 # old agent accepted the request, not that a new one is serving; a caller that returned there
 # would hand the next command to a port with nobody behind it yet. So this asks for a
 # handshake until one answers, which is exactly the condition the caller cares about.
+# A DEVELOPMENT KERNEL'S CONSOLE REQUEST, for the serial handoff gate: `kill-holder` kills the driver holding
+# COM1 the way DeviceManager's SIG_KILL does, `hold-and-flood` holds every console tap's reads and writes kernel
+# lines until the kernel's transmit ring has dropped bytes at its bound, and `panic` panics the kernel - whose
+# terminal-path writer then puts the dropped count and the panic on the wire however the driver holding COM1
+# left it. A kernel built for any other image refuses all three.
+KERNEL_CONSOLE_REQUESTS = {'hold-and-flood': 1, 'panic': 2, 'kill-holder': 3}
+
+
+def cmd_dev_kernel_console(args):
+	timeout, rest = take_arg(args, '--timeout', 30)
+	if len(rest) != 1 or rest[0] not in KERNEL_CONSOLE_REQUESTS:
+		die(f'usage: lab dev-kernel-console {"|".join(KERNEL_CONSOLE_REQUESTS)}')
+	which = rest[0]
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		if which == 'panic':
+			# THE KERNEL ANSWERS WITH ITS PANIC, on the serial log, and nothing comes back on this wire.
+			sock.sendall(proto_frame(OP_KERNEL_CONSOLE, 2, bytes([KERNEL_CONSOLE_REQUESTS[which]])))
+			print('lab: a kernel panic was asked for - its text is on the serial log')
+			return
+		opcode, _, body = proto_request(sock, buffer, 2, OP_KERNEL_CONSOLE, bytes([KERNEL_CONSOLE_REQUESTS[which]]), timeout=timeout, what=f'the kernel console request {which}')
+		if opcode != OP_KERNEL_CONSOLE_ACK or len(body) < 8:
+			die(f'{which} answered with opcode {opcode:#04x} and {len(body)} B')
+		answer = struct.unpack("<Q", body[:8])[0]
+		print(f'lab: {which} - {answer} kernel line(s) written' if which == 'hold-and-flood' else f'lab: {which} - done')
+	finally:
+		sock.close()
+
+
 def cmd_dev_restart(args):
 	timeout = arg_value(args, '--timeout', 30)
 	seen_at = serial_size()
@@ -3259,7 +3290,8 @@ def cmd_log(args):
 # The monitor sendkey names for the characters the shell needs; letters pass
 # through (uppercase via shift-), so only the specials are listed.
 # `&` and `|` because a scenario starts background jobs and pipelines as a person would, by typing them.
-KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '\n': 'ret'}
+# `#` because a platform device's stable identity carries one (`table:TPM2#0`), and a scenario names it.
+KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '#': 'shift-3', '\n': 'ret'}
 
 # The key names a scenario or a command may name directly, beyond letters and digits. A fixed
 # vocabulary rather than a string handed through to QEMU: this is the one place where what a
@@ -3739,7 +3771,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down, 'scenario-cold': cmd_scenario_cold}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-kernel-console': cmd_dev_kernel_console, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down, 'scenario-cold': cmd_scenario_cold}
 
 
 def main():

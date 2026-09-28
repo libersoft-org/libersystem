@@ -2737,10 +2737,33 @@ pub fn device_msix_acquire(claim: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, claim, 0, 0, 0) as i64 }
 }
 
-// ONE RESOURCE OF A CLAIMED ROW, by kind and index - see `SYS_DEVICE_RESOURCE_ACQUIRE`. The one kind so far
-// is `RESOURCE_KIND_PORT_RANGE`, whose index is a position in the row's `DeviceInfo::ports`.
+// ONE RESOURCE OF A CLAIMED ROW, by kind and index - see `SYS_DEVICE_RESOURCE_ACQUIRE`: a port range by its
+// position in the row's `DeviceInfo::ports`, a platform row's further MMIO range (`RESOURCE_KIND_MMIO`, from 1 -
+// range 0 is the claim's own memory) or its wired line (`RESOURCE_KIND_LINE`, as an interrupt).
 pub fn device_resource_acquire(claim: u64, kind: u64, index: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_RESOURCE_ACQUIRE, claim, kind, index, 0) as i64 }
+}
+
+// A CLAIMED PLATFORM ROW'S PROPERTY BLOCK into `buf`, through the claim or the register window minted from it -
+// see `SYS_DEVICE_PROPERTIES`. The block's whole length (copying what fits), or a negative error:
+// `ERR_UNSUPPORTED` for a row that has none.
+pub fn device_properties(handle: u64, buf: &mut [u8]) -> i64 {
+	unsafe { syscall(SYS_DEVICE_PROPERTIES, handle, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as i64 }
+}
+
+// THE KERNEL CONSOLE'S OUTPUT through its tap - see `SYS_CONSOLE_TAP_READ`: at most `buf.len()` bytes out of
+// the kernel's ring, in order, answered with how many and how many the ring's bound dropped since the last read;
+// a negative error once the claim the tap came from was released or no longer holds the console's UART.
+pub fn console_tap_read(tap: u64, buf: &mut [u8]) -> (i64, u64) {
+	let mut dropped: u64 = 0;
+	let n = unsafe { syscall(SYS_CONSOLE_TAP_READ, tap, buf.as_mut_ptr() as u64, buf.len() as u64, &mut dropped as *mut u64 as u64) as i64 };
+	(n, dropped)
+}
+
+// A DEVELOPMENT BUILD'S KERNEL CONSOLE REQUEST - see `SYS_DEV_CONSOLE` - for a holder of the console input
+// privilege. `ERR_BAD_SYSCALL` from a kernel built for any other image.
+pub fn dev_console(privilege: u64, request: u64) -> i64 {
+	unsafe { syscall(SYS_DEV_CONSOLE, privilege, request, 0, 0) as i64 }
 }
 
 // Grant a port range to this process: its threads may use those ports from their next access. 0, or a

@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lico::TerminalWriter;
 use proto::system::{Error, FileInfo, FileType, OpenOpts, volume};
-use rt::{ReceivedVecCaps, close, map_object, recv_tagged, recv_vec_caps_blocking, send_blocking, unmap_object};
+use rt::{BOOTSTRAP_READY, Received, ReceivedVecCaps, close, map_object, recv_blocking, recv_tagged, recv_vec_caps_blocking, send_blocking, unmap_object};
 use storage_proto::path;
 use volume_client::VolumeClient;
 
@@ -62,6 +62,26 @@ impl VolumeSet {
 	#[inline(always)]
 	pub fn receive(bootstrap: u64, buffer: &mut [u8]) -> VolumeSet {
 		VolumeSet { system: recv_tagged(bootstrap, buffer, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buffer, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buffer, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buffer, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buffer, b"USB").unwrap_or(0), ram: recv_tagged(bootstrap, buffer, b"RAM").unwrap_or(0), tmp: recv_tagged(bootstrap, buffer, b"TMP").unwrap_or(0) }
+	}
+
+	/// A GRANT HANDED AFTER THE VOLUMES, read by its exact tag. PermissionManager ends the volume bundle with the
+	/// bootstrap terminator when it hands a tool its grants, so the first message after the bundle can be that
+	/// terminator rather than the grant; it is passed over here, and anything else is not this grant.
+	#[inline(always)]
+	pub fn recv_grant(bootstrap: u64, buffer: &mut [u8], tag: &[u8]) -> Option<u64> {
+		loop {
+			match recv_blocking(bootstrap, buffer) {
+				Received::Message { len, handle } if &buffer[..len] == BOOTSTRAP_READY && handle == 0 => continue,
+				Received::Message { len, handle } if &buffer[..len] == tag && handle != 0 => return Some(handle),
+				Received::Message { handle, .. } => {
+					if handle != 0 {
+						close(handle);
+					}
+					return None;
+				}
+				Received::Closed => return None,
+			}
+		}
 	}
 
 	/// Route one path argument to its already-granted volume client.

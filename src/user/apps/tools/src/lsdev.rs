@@ -46,7 +46,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let config: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or(0);
 	// A verb, or the listing. `lsdev` with no verb reads and changes nothing, which is what a
 	// command called `ls` had better do.
-	if let Some(request) = parse_verb(&args) {
+	if let Some(mut request) = parse_verb(&args) {
+		if let Some(identity) = request.identity.as_deref() {
+			match row_of_identity(devsvc, identity) {
+				Some(index) => request.index = index,
+				None => {
+					eprint(b"lsdev: no platform device has that identity\n");
+					exit();
+				}
+			}
+		}
 		apply_verb(policy, config, devsvc, request);
 		exit();
 	}
@@ -61,6 +70,19 @@ struct VerbRequest {
 	index: u32,
 	verb: PolicyVerb,
 	artifact: String,
+	// A DEVICE NAMED BY ITS STABLE IDENTITY rather than by its row - `table:TPM2#0`, `dt:/soc/serial@10000000` -
+	// resolved against the kernel's table before the verb is applied, because the row number is whatever this
+	// boot's table held.
+	identity: Option<String>,
+}
+
+// The row a platform identity names, read from the kernel's table through the device service.
+fn row_of_identity(devsvc: u64, identity: &str) -> Option<u32> {
+	if devsvc == 0 {
+		return None;
+	}
+	let entries = DeviceClient::new(devsvc).list()?.ok()?;
+	entries.iter().find(|entry| entry.kind == proto::system::RowKind::Platform && entry.identity == identity).map(|entry| entry.index)
 }
 
 // `--disable N`, `--enable N`, `--retry N`, `--select N ARTIFACT`. None for a plain listing.
@@ -78,19 +100,28 @@ fn parse_verb(args: &[u8]) -> Option<VerbRequest> {
 		// THE DISPLAY, not a verb: it changes nothing and is here because it asks the same
 		// endpoint. `--incident N` prints the bounded capture P02M0165 took.
 		"--incident" => {
-			let index: u32 = parts.next()?.parse().ok()?;
-			return Some(VerbRequest { index, verb: PolicyVerb::Retry, artifact: String::from("\u{0}incident") });
+			let (index, identity) = device_word(parts.next()?)?;
+			return Some(VerbRequest { index, verb: PolicyVerb::Retry, artifact: String::from("\u{0}incident"), identity });
 		}
 		_ => return None,
 	};
-	let index: u32 = parts.next()?.parse().ok()?;
+	let (index, identity) = device_word(parts.next()?)?;
 	// `select` is the only one that names an artifact, and it must: a preference with nothing
 	// preferred is not a preference.
 	let artifact = match verb {
 		PolicyVerb::Select => String::from(parts.next()?),
 		_ => String::new(),
 	};
-	Some(VerbRequest { index, verb, artifact })
+	Some(VerbRequest { index, verb, artifact, identity })
+}
+
+// A device on the command line: a row number, or a platform device's identity - which has a colon in it and a
+// number never does.
+fn device_word(word: &str) -> Option<(u32, Option<String>)> {
+	if word.contains(':') {
+		return Some((0, Some(String::from(word))));
+	}
+	Some((word.parse().ok()?, None))
 }
 
 // Apply one verb and say what happened, in the words the outcome carries.
@@ -176,6 +207,13 @@ fn resolved_address(devsvc: u64, index: u32) -> Option<String> {
 	}
 	let entry = DeviceClient::new(devsvc).get(&index)?.ok()?;
 	let mut address = String::new();
+	// A DEVICE THE FIRMWARE DESCRIBES HAS NO ADDRESS: its records are kept under its identity, as DeviceManager
+	// keeps them.
+	if entry.kind == proto::system::RowKind::Platform {
+		address.push_str("platform.");
+		address.push_str(&entry.identity);
+		return Some(address);
+	}
 	for (at, part) in [entry.bus, entry.dev, entry.func].iter().enumerate() {
 		if at != 0 {
 			address.push('.');
@@ -266,7 +304,8 @@ fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 
 // THE INCIDENT AS CONFIGSERVICE HOLDS IT, for when the manager that served the live one is gone.
 //
-// DeviceManager writes each incident under `device.policy.incident.<bus>.<dev>.<func>` with the
+// DeviceManager writes each incident under `device.policy.incident.<bus>.<dev>.<func>` - or, for a device the
+// firmware describes, `device.policy.incident.platform.<identity>` - with the
 // whole record - cause, state, generation, attempts, last opcode, silence, the device's address and
 // the Domain's counters. It used to write a summary of that, so the persisted copy could not answer
 // what the live endpoint answered and "the snapshot outlives the manager" was true of a summary.

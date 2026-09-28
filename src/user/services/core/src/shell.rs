@@ -775,6 +775,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"modemswap", Shape::Rest),
 	(b"modemdata", Shape::Rest),
 	(b"modemfail", Shape::Rest),
+	(b"tpmprobe", Shape::Rest),
 	(b"camcheck", Shape::Rest),
 	(b"camhold", Shape::Rest),
 	(b"camread", Shape::Rest),
@@ -792,8 +793,12 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"dmesg", Shape::Bare),
 	(b"ps", Shape::Json),
 	(b"free", Shape::Bare),
-	(b"lsdev", Shape::Json),
+	// `Rest` rather than `Json`: besides its `json` sub-forms it takes the operator's verbs - `--disable`,
+	// `--enable`, `--retry`, `--select`, `--incident` with a row number or a platform device's identity - and
+	// those are typed at a prompt like any other command.
+	(b"lsdev", Shape::Rest),
 	(b"btctl", Shape::Rest),
+	(b"tpm", Shape::Rest),
 	(b"dfu", Shape::Rest),
 	(b"perm", Shape::Json),
 	(b"usage", Shape::Json),

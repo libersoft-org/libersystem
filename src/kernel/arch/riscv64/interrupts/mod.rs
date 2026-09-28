@@ -7,23 +7,29 @@
 // device's MSI-X table entry to write it to the acquiring hart's IMSIC file, enables the
 // EID there, and imsic::handle_external wakes the bound Interrupt when that EID fires.
 //
-// This mirrors the x86 (LAPIC-MSI) and aarch64 (GICv2m) backends: every driver that needs
-// an interrupt uses MSI-X, the polled drivers (virtio-blk) need none, so is_bindable is
-// always false and only the MSI window is live. Unlike the old PLIC INTx path, EIDs are
-// per-device and edge-triggered - no shared line, no mask/complete dance, reliable
-// delivery. The MSI-X table lives in a device BAR reached through the higher-half direct
-// map (phys_to_virt), so no separate uncacheable mapping is needed.
+// This mirrors the x86 (LAPIC-MSI) and aarch64 (GICv2m) backends: every PCI driver that needs
+// an interrupt uses MSI-X and the polled drivers (virtio-blk) need none; a wired line reaches a
+// driver only as a platform row's claimed line (`bind_wired`), which the APLIC turns into an
+// identity of its own. Unlike the old PLIC INTx path, EIDs are per-device - no shared
+// identity, reliable delivery. The MSI-X table lives in a device BAR reached through the
+// higher-half direct map (phys_to_virt), so no separate uncacheable mapping is needed.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use crate::arch::common::msi::MsiRegistry;
 use crate::object::interrupt::Interrupt;
+use crate::sync::SpinLock;
 
 // Device EIDs run 1..=MAX_MSI (EID 0 is "no interrupt"; the IMSIC EIE0 register holds
 // EIDs 0..63 on RV64, so a single register covers them). Slot i (in the registry) maps
 // to EID EID_BASE + i.
 const EID_BASE: u32 = 1;
-const MAX_MSI: usize = 62; // EIDs 1..=62, all within IMSIC EIE0
+const MAX_MSI: usize = 54; // EIDs 1..=54, all within IMSIC EIE0
+
+// THE CLAIMED LINES' IDENTITIES, 55..=62: between the device window and `WIRED_EID`, one per claimed line,
+// so a line's driver is woken by the identity its line was armed with rather than by a sweep.
+const LINE_EID_BASE: u32 = EID_BASE + MAX_MSI as u32;
+const MAX_LINES: usize = 8;
 
 // The per-device MSI slot bindings (reserve / bind / dispatch / free bookkeeping, shared
 // with x86/aarch64 via arch::common::msi). Slot i maps to EID EID_BASE + i.
@@ -36,7 +42,8 @@ fn eid_slot(eid: u32) -> Option<usize> {
 
 // THE IDENTITY THIS KERNEL'S OWN WIRED LINES ARRIVE UNDER.
 //
-// The device window above is EIDs 1..=62, which is what `MAX_MSI` says and what `eid_slot` maps.
+// The device window above is EIDs 1..=54, which is what `MAX_MSI` says and what `eid_slot` maps, and
+// the claimed lines' 55..=62 follow it.
 // The IMSIC's `EIE0` register holds identities 0..63 on RV64, so 63 is the one identity inside the
 // register this kernel can address and outside everything it hands to a device. A wired line armed
 // on it can never collide with a driver's vector, and the two paths never have to agree about
@@ -72,20 +79,149 @@ pub fn register(eid: u32, handler: HandlerFn) -> bool {
 }
 
 /// Run this kernel's own handler for `eid`, and say whether there was one. `false` sends the
-/// identity on to the MSI registry, which is where every device's belongs.
+/// identity on to the claimed lines and the MSI registry, which is where every device's belongs.
 pub fn dispatch_wired(eid: u32) -> bool {
 	WIRED.dispatch(eid)
 }
 
-// No legacy-INTx binding on riscv FOR A USERSPACE DRIVER: every driver that needs an interrupt uses
-// MSI-X, and the wired lines above are the kernel's own.
-pub fn is_bindable(_vector: u32) -> bool {
-	false
+// THE KERNEL'S OWN SOURCES - the console UART's and each hot-plug slot's - which no claim may re-arm: a claim
+// that rewrote such a source's target would move the kernel's own line to a driver's identity without a word.
+// One bit per source the controller addresses.
+static KERNEL_SOURCES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// Record `source` as one the kernel armed for itself.
+#[cfg(not(test))]
+pub fn hold_source(source: u32) {
+	if let Some(word) = KERNEL_SOURCES.get((source / 64) as usize) {
+		word.fetch_or(1 << (source % 64), core::sync::atomic::Ordering::AcqRel);
+	}
 }
 
-// The INTx bind path is unused (see is_bindable); it always refuses.
-pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
-	false
+fn kernel_holds(source: u32) -> bool {
+	KERNEL_SOURCES.get((source / 64) as usize).is_some_and(|word| word.load(core::sync::atomic::Ordering::Acquire) & (1 << (source % 64)) != 0)
+}
+
+// A CLAIMED WIRED LINE: the APLIC source it is, whether it is level-triggered, and the `Interrupt` its driver
+// waits on - held weakly, so the driver letting go (its Interrupt's `Drop`) is what unbinds it. Its identity is
+// its slot's.
+struct Line {
+	source: u32,
+	level: bool,
+	intr: Weak<Interrupt>,
+}
+
+// A slot is FREE, HELD by a claim, or STRANDED: its line's teardown has not confirmed - the identity is still
+// enabled in a file whose hart did not answer, or is being disabled now - so it is not handed out, since the
+// hart that owes the disable would clear the next owner's enable when it finally ran it.
+enum LineSlot {
+	Free,
+	Held(Line),
+	Stranded,
+}
+
+static LINES: [SpinLock<LineSlot>; MAX_LINES] = [const { SpinLock::new(LineSlot::Free) }; MAX_LINES];
+
+// Binds one at a time, so two cannot choose the same free identity.
+static BINDING: SpinLock<()> = SpinLock::new(());
+
+// The `LINES` slot an identity names.
+fn line_slot(eid: u32) -> Option<usize> {
+	(eid >= LINE_EID_BASE && ((eid - LINE_EID_BASE) as usize) < MAX_LINES).then(|| (eid - LINE_EID_BASE) as usize)
+}
+
+// BIND A PLATFORM ROW'S WIRED LINE to a new `Interrupt`: its APLIC source armed with the row's trigger and
+// polarity, in the adopted domain, to an identity of the claimed-line window in THIS hart's interrupt file -
+// the file an MSI acquired here would target. Refused, in words: a line of another controller, a machine whose
+// tree named no APLIC domain (one without AIA among them), a source the kernel armed for itself, one another
+// claim holds, a hart with no file, or a full table.
+pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str> {
+	if line.controller != abi::LINE_CONTROLLER_APLIC {
+		return Err("its line is not an APLIC's");
+	}
+	let source = line.number;
+	let Some(base) = super::aplic::domain() else { return Err("this machine described no APLIC domain to arm it through") };
+	if kernel_holds(source) {
+		return Err("the kernel answers that line itself");
+	}
+	if !super::imsic::usable() {
+		return Err("this machine's interrupt files are out of service");
+	}
+	let level = line.trigger == abi::LINE_TRIGGER_LEVEL;
+	let trigger = super::aplic::trigger_type(level, line.polarity == abi::LINE_POLARITY_LOW);
+	// THE HART IS READ UNDER THE LOCK, which masks interrupts: the identity is enabled in the file of the hart
+	// the controller is pointed at, and a migration between the two would split them.
+	let _binding = BINDING.lock();
+	let hart = super::percpu::this_cpu().lapic_id();
+	if !super::imsic::has_file(hart) {
+		return Err("this hart has no interrupt file to deliver it to");
+	}
+	if LINES.iter().any(|slot| matches!(&*slot.lock(), LineSlot::Held(held) if held.source == source)) {
+		return Err("another claim holds that line");
+	}
+	let Some(free) = LINES.iter().position(|slot| matches!(&*slot.lock(), LineSlot::Free)) else {
+		return Err("this kernel's table of claimed lines is full");
+	};
+	let eid = LINE_EID_BASE + free as u32;
+	let Some(intr) = Interrupt::new(eid) else { return Err("the Interrupt object could not be allocated") };
+	*LINES[free].lock() = LineSlot::Held(Line { source, level, intr: Arc::downgrade(&intr) });
+	intr.mark_bound();
+	super::imsic::enable_eid(eid);
+	// SAFETY: `base` is the domain the boot's own tree named as the platform nodes' interrupt parent, inside
+	// the direct map.
+	if !unsafe { super::aplic::arm_source(base, source, trigger, hart, eid) } {
+		let _ = intr.disown();
+		// SAFETY: as above.
+		unsafe { super::aplic::disarm_source(base, source) };
+		let confirmed = super::imsic::disable_eid_on_owner(eid);
+		*LINES[free].lock() = if confirmed { LineSlot::Free } else { LineSlot::Stranded };
+		return Err("the controller did not take its source");
+	}
+	// A LEVEL LINE ALREADY ASSERTED is pended by no edge: asked for once, so a device waiting since before the
+	// claim is heard.
+	if level {
+		// SAFETY: as above.
+		unsafe { super::aplic::unmask_source(base, source, true) };
+	}
+	Ok(intr)
+}
+
+// Whether a claimed line is live at its controller - for the suite, as on x86_64.
+#[cfg(test)]
+pub fn line_armed(line: &abi::WiredLine) -> bool {
+	// SAFETY: the adopted domain, as in `bind_wired`.
+	super::aplic::domain().is_some_and(|base| unsafe { super::aplic::source_armed(base, line.number) })
+}
+
+// A CLAIMED LINE FIRED: its driver is woken, and a LEVEL line is disabled at the controller until the driver
+// acknowledges. True for any identity of the window - a stranded slot's late message is consumed here, with
+// nobody to wake.
+pub fn signal_line(eid: u32) -> bool {
+	let Some(at) = line_slot(eid) else { return false };
+	let held = LINES[at].lock();
+	let LineSlot::Held(line) = &*held else { return true };
+	if line.level
+		&& let Some(base) = super::aplic::domain()
+	{
+		// SAFETY: the adopted domain, as in `bind_wired`.
+		unsafe { super::aplic::mask_source(base, line.source) };
+	}
+	if let Some(intr) = line.intr.upgrade() {
+		intr.signal();
+	}
+	true
+}
+
+// THE DRIVER ACKNOWLEDGED: a level line disabled when it fired is enabled again, and asked for again in case it
+// is still asserted - see `aplic::unmask_source`.
+pub fn acknowledge(vector: u32) {
+	let Some(at) = line_slot(vector) else { return };
+	if let LineSlot::Held(line) = &*LINES[at].lock()
+		&& line.level
+		&& let Some(base) = super::aplic::domain()
+	{
+		// SAFETY: as in `signal_line`.
+		unsafe { super::aplic::unmask_source(base, line.source, true) };
+	}
 }
 
 // Remove any binding for `vector` (an EID; called from an Interrupt's Drop). The EID's IMSIC enable
@@ -102,6 +238,30 @@ pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 // state can include it, instead of being decided by the IOMMU alone while a still-armed vector is
 // charged to the claim.
 pub fn unbind(vector: u32) -> bool {
+	// A CLAIMED WIRED LINE: its source disarmed, then its identity disabled where it was enabled - outside the
+	// slot's lock, since the owning hart may be in `signal_line` for this very slot and must be able to take it
+	// to reach its mailbox - and only then the slot given back. An unanswered disable strands it.
+	if let Some(at) = line_slot(vector) {
+		let source = {
+			let mut held = LINES[at].lock();
+			match core::mem::replace(&mut *held, LineSlot::Stranded) {
+				LineSlot::Held(line) => line.source,
+				other => {
+					*held = other;
+					return true;
+				}
+			}
+		};
+		if let Some(base) = super::aplic::domain() {
+			// SAFETY: as in `bind_wired`.
+			unsafe { super::aplic::disarm_source(base, source) };
+		}
+		let confirmed = super::imsic::disable_eid_on_owner(vector);
+		if confirmed {
+			*LINES[at].lock() = LineSlot::Free;
+		}
+		return confirmed;
+	}
 	let Some(slot) = eid_slot(vector) else { return true };
 	if super::imsic::disable_eid_on_owner(vector) {
 		REGISTRY.retire(slot);
@@ -206,8 +366,11 @@ pub fn bind_msi(vector: u32, intr: &Arc<Interrupt>) -> bool {
 	}
 }
 
-// Whether `vector` (an EID) currently has a live driver binding.
+// Whether `vector` (an EID) currently has a live driver binding - an MSI or a claimed line.
 pub fn is_bound(vector: u32) -> bool {
+	if let Some(at) = line_slot(vector) {
+		return matches!(&*LINES[at].lock(), LineSlot::Held(line) if line.intr.strong_count() != 0);
+	}
 	match eid_slot(vector) {
 		Some(slot) => REGISTRY.is_bound(slot),
 		None => false,

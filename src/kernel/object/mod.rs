@@ -8,6 +8,7 @@
 pub mod address_space;
 pub mod channel;
 pub mod claim;
+pub mod console_tap;
 pub mod device_memory;
 pub mod dma_buffer;
 pub mod domain;
@@ -65,6 +66,8 @@ pub enum ObjectType {
 	WaitSet,
 	// The authority to a range of x86 I/O ports. See `port_range`.
 	PortRange,
+	// The kernel console's output, for the driver that holds its UART. See `console_tap`.
+	ConsoleTap,
 }
 
 impl ObjectType {
@@ -90,6 +93,7 @@ impl ObjectType {
 			ObjectType::Privilege => abi::OBJECT_TYPE_PRIVILEGE,
 			ObjectType::WaitSet => abi::OBJECT_TYPE_WAIT_SET,
 			ObjectType::PortRange => abi::OBJECT_TYPE_PORT_RANGE,
+			ObjectType::ConsoleTap => abi::OBJECT_TYPE_CONSOLE_TAP,
 		}
 	}
 }

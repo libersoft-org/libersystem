@@ -37,34 +37,41 @@ fn device_memory_maps_mmio_region() {
 
 tagged_test!(
 	#[cfg(target_arch = "x86_64")]
-	interrupt_bind_delivers_to_driver,
-	[Drivers, ArchX86_64],
+	a_claimed_line_delivers_to_its_driver,
+	[Drivers, Interrupt, ArchX86_64],
 	id = "kernel.hardware.interrupt_bind_delivers_to_driver",
 	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
-fn interrupt_bind_delivers_to_driver() {
+fn a_claimed_line_delivers_to_its_driver() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
-	// Vector 0x2c (IRQ 12) is a bindable device-IRQ vector (not the timer at 0x20).
-	const VECTOR: u64 = 0x2c;
-	extern "C" fn body(_arg: u64) {
+	// ISA IRQ 12 at vector 0x2c, as a platform row's line: a wired line reaches a driver only through a claim.
+	const VECTOR: u32 = 0x2c;
+	extern "C" fn body(row: u64) {
+		let grant = crate::tests::claim_device(row).expect("the line's row is claimed");
 		unsafe {
-			let h = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, device_privilege(), 0, 0);
-			assert!(!syscall::sys_is_err(h), "interrupt_bind failed");
+			let h = arch::syscall::invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_LINE, 0, 0);
+			assert!(!syscall::sys_is_err(h), "the claim's line did not bind");
 			// Simulate the device IRQ firing with a software interrupt; the dispatch
 			// path marks the bound Interrupt pending and wakes any waiter.
 			core::arch::asm!("int 0x2c");
 			// The interrupt is now pending, so a wait observes it and returns.
 			let r = arch::syscall::invoke(syscall::SYS_WAIT, h, 0, 0, 0);
 			assert_eq!(r as i64, 0, "wait did not observe the delivered interrupt");
-			// Binding the same vector again while ours lives is refused.
-			let again = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, device_privilege(), 0, 0);
+			// Binding the same line again while ours lives is refused.
+			let again = arch::syscall::invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_LINE, 0, 0);
 			assert_eq!(again as i64, syscall::ERR_RESOURCE_EXHAUSTED);
 		}
+		// And the release takes the line away with the claim.
+		crate::tests::release_device(&grant);
+		assert!(!arch::interrupts::is_bound(VECTOR), "the release unbound the claim's line");
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn(body, 0);
+	let mut description = crate::tests::synthetic_platform_description(b"kernel:test-line-irq12");
+	assert!(description.add_line(arch::platform::isa_irq_line(12)));
+	let row = crate::tests::publish_synthetic_platform(description).expect("the line's row is published");
+	sched::spawn(body, row as u64);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
 }
@@ -1639,14 +1646,17 @@ fn a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing() {
 	// two things share.
 	let mut same_kind: alloc::vec::Vec<(u16, u8, u8, u8)> = alloc::vec::Vec::new();
 	for index in 0..count {
-		if let Some(row) = crate::device::with(index, |d| (d.device_type, d.bus, d.dev, d.func)) {
+		if let Some((row, platform)) = crate::device::with(index, |d| ((d.device_type, d.bus, d.dev, d.func), d.platform.is_some())) {
 			// SYNTHETIC ROWS ARE NOT BUS FUNCTIONS, and this is about bus functions. `add_synthetic_device`
 			// appends a table entry with `device_type: u16::MAX` at the non-address `ff:1f.7` so a
 			// test can drive claim mechanics without a device; several tests in this suite make one,
 			// and in a whole-suite run there is more than one - which is two rows carrying the same
 			// non-address, not two rows naming one PCI function. Asserted per tag ran, and this only
 			// showed up on the full suite.
-			if row.0 != u16::MAX {
+			//
+			// NOR ARE PLATFORM ROWS: a device the firmware describes has no bus address, its fields read
+			// zero, and its identity is its platform identity - which the placement keeps unique.
+			if row.0 != u16::MAX && !platform {
 				same_kind.push(row);
 			}
 		}
@@ -1710,14 +1720,16 @@ tagged_test!(
 fn driver_crash_is_cleaned_up_and_notified() {
 	use object::KernelObject;
 	use object::domain::Domain;
-	// A "driver" process binds an IRQ and creates a DMA buffer, then faults. The
-	// kernel must detach the IRQ, refund the DMA, remove the caps, and deliver a
-	// crash record naming the process - all without cooperation from the driver.
+	// A "driver" process claims its device, binds the device's line and creates a DMA
+	// buffer, then faults. The kernel must release the claim, detach the line, refund the
+	// DMA, remove the caps, and deliver a crash record naming the process - all without
+	// cooperation from the driver.
+	let row = driver_crash_row();
 	let (notify_tx, notify_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(notify_tx);
 	let domain = Domain::new(1 << 20, 8, 4);
 	let koid = {
-		let driver = sched::spawn_in(domain.clone(), driver_crash_thread_body, 0).expect("spawn driver");
+		let driver = sched::spawn_in(domain.clone(), driver_crash_thread_body, row).expect("spawn driver");
 		// Capture the process identity, then drop the Arc so reaping the thread can
 		// tear the process down and run the crash cleanup.
 		driver.process().header().koid()
@@ -1725,7 +1737,8 @@ fn driver_crash_is_cleaned_up_and_notified() {
 	sched::run_until_idle();
 	// The IRQ binding is gone, and the DMA and handle quotas are back to zero: the
 	// crashed driver's resources were reclaimed by the kernel.
-	assert!(!arch::interrupts::is_bound(DRIVER_IRQ_VECTOR as u32), "the driver's IRQ should be detached");
+	assert!(!arch::interrupts::is_bound(DRIVER_IRQ_VECTOR as u32), "the driver's line should be detached");
+	assert_eq!(device::claim_state(row as usize), Some(device::ClaimState::Free), "and its claim released");
 	assert_eq!(domain.account().dma().used(), 0, "the driver's DMA should be refunded");
 	assert_eq!(domain.account().handles().used(), 0, "the driver's handles should be removed");
 	// A crash record naming the driver process was delivered to the supervisor.
@@ -1758,12 +1771,13 @@ fn device_manager_reacts_to_a_driver_crash() {
 		Online,
 		Offline,
 	}
+	let row = driver_crash_row();
 	let (notify_tx, notify_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(notify_tx);
 	let mut device0 = DeviceState::Online;
 	let domain = Domain::new(1 << 20, 8, 4);
 	let driver_koid = {
-		let driver = sched::spawn_in(domain.clone(), driver_crash_thread_body, 0).expect("spawn driver");
+		let driver = sched::spawn_in(domain.clone(), driver_crash_thread_body, row).expect("spawn driver");
 		driver.process().header().koid()
 	};
 	sched::run_until_idle();
@@ -1830,7 +1844,10 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 			let out = &mut grant as *mut _ as u64;
 			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_CLAIM, 0, 0, out, 0) as i64, syscall::ERR_BAD_HANDLE, "a device may not be claimed without the authority");
 			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_MSIX_ACQUIRE, 0, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor its MSI-X vectors");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, 0x41, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor an interrupt line");
+			assert_eq!(arch::syscall::invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, 0, abi::RESOURCE_KIND_LINE, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor an interrupt line");
+			// THE BARE LEGACY BIND IS RETIRED: a line is a claim's resource, and the old call answers that it
+			// is not supported rather than binding anything for anyone.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, 0x41, 0, 0, 0) as i64, syscall::ERR_UNSUPPORTED, "the retired bind binds nothing");
 
 			// A privilege of the WRONG kind is refused too: holding one authority is not holding
 			// another, which is the whole point of them being separate objects.

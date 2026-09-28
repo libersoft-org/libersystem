@@ -2222,7 +2222,10 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+		// A DEVICE THE FIRMWARE DESCRIBES IS NAMED BY ITS PLATFORM NUMBER - its row - and never by the zero
+		// address it reports, which is the host bridge's.
+		let id = if info.platform.kind == ROW_KIND_PLATFORM { BindingId::platform(index as u32, 0) } else { BindingId::new(info.bus, info.dev, info.func, 0) };
+		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
 	}
 
 	// A manual grant is separate from the automatic count and survives only until one claim.
@@ -2593,7 +2596,7 @@ fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize
 
 // One provider, as the wire describes it. `live` is what tells a publication from a withdrawal.
 fn provider_info_wire(provider: &Provider, live: bool) -> proto::system::ProviderInfo {
-	proto::system::ProviderInfo { kind: provider_kind_from_wire(provider.kind), bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live, name: alloc::string::String::from_utf8_lossy(provider.name()).into_owned().into() }
+	proto::system::ProviderInfo { kind: provider_kind_from_wire(provider.kind), bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live, name: alloc::string::String::from_utf8_lossy(provider.name()).into_owned().into(), platform: provider.id.binding.platform }
 }
 
 // One frame on one subscription. Answers false when the endpoint would not take it, which is a
@@ -3662,14 +3665,20 @@ fn report_incident(driver_name: &[u8], report: &Diagnostic) {
 	print(b"DeviceManager: incident ");
 	print_driver_name(driver_name);
 	print(b" at ");
-	let n = decimal(report.binding.bus as u64, &mut number);
-	print(&number[..n]);
-	print(b":");
-	let n = decimal(report.binding.dev as u64, &mut number);
-	print(&number[..n]);
-	print(b".");
-	let n = decimal(report.binding.func as u64, &mut number);
-	print(&number[..n]);
+	if let Some(platform) = report.binding.platform {
+		print(b"platform device ");
+		let n = decimal(u64::from(platform), &mut number);
+		print(&number[..n]);
+	} else {
+		let n = decimal(report.binding.bus as u64, &mut number);
+		print(&number[..n]);
+		print(b":");
+		let n = decimal(report.binding.dev as u64, &mut number);
+		print(&number[..n]);
+		print(b".");
+		let n = decimal(report.binding.func as u64, &mut number);
+		print(&number[..n]);
+	}
 	print(b" generation ");
 	let n = decimal(report.binding.generation, &mut number);
 	print(&number[..n]);
@@ -4230,6 +4239,38 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 		}
 		txn.holds(driver_protocol::ResourceKind::PortRange as u16, range as u64);
 	}
+	// AND A PLATFORM ROW'S EVERY OTHER RESOURCE, by the same rule: each MMIO range after the first - which is the
+	// claim's own window, passed as `Device` - and each wired line, as an interrupt the kernel masks while the
+	// driver services a level one. What the firmware described is what the driver gets, all of it or none.
+	if info.platform.kind == ROW_KIND_PLATFORM {
+		for which in 1..info.platform.mmio_count as u64 {
+			let memory: i64 = device_resource_acquire(grant.claim, abi::RESOURCE_KIND_MMIO, which);
+			if memory < 0 {
+				refused(b"a register window - the kernel would not mint one the row carries");
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+			}
+			txn.holds(driver_protocol::ResourceKind::Mmio as u16, memory as u64);
+		}
+		for which in 0..info.platform.line_count as u64 {
+			let line: i64 = device_resource_acquire(grant.claim, abi::RESOURCE_KIND_LINE, which);
+			if line < 0 {
+				refused(b"a wired line - the kernel would not bind one the row carries");
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+			}
+			txn.holds(driver_protocol::ResourceKind::Line as u16, line as u64);
+		}
+		// AND THE CONSOLE UART'S TAP: the claim above took the kernel console's UART, and the kernel's output
+		// leaves its ring through the tap from now on. A driver of that row without it would hold a UART the
+		// kernel can no longer write to.
+		if info.platform.flags & abi::PLATFORM_FLAG_CONSOLE != 0 {
+			let tap: i64 = device_resource_acquire(grant.claim, abi::RESOURCE_KIND_CONSOLE_TAP, 0);
+			if tap < 0 {
+				refused(b"the console tap - the kernel would not mint the console UART's");
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+			}
+			txn.holds(driver_protocol::ResourceKind::ConsoleTap as u16, tap as u64);
+		}
+	}
 	let resource_count: usize = txn.held.resources().len();
 	node.granted_resources = resource_count as u32;
 	// WHICH RULE CHOSE THIS DRIVER, recorded where the choice is still in hand. An entry may
@@ -4732,8 +4773,8 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 		// stored and is not.
 		if self.config != 0 {
 			let key = match decision.slot {
-				PolicySlot::Disable => policy_key(node.id),
-				PolicySlot::Select => select_key(node.id),
+				PolicySlot::Disable => policy_key(node),
+				PolicySlot::Select => select_key(node),
 			};
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: self.config });
 			// AND THE ANSWER INSIDE THE ANSWER IS READ (2026-09-03). These generated methods return
@@ -4768,10 +4809,10 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 		// wrong here" is a fact an operator asked for; an error would read as "the question could
 		// not be answered", which is a different thing.
 		let Some(report) = node.incident_report else {
-			return Ok(proto::system::IncidentReport { present: false, bus: 0, dev: 0, func: 0, generation: 0, state: proto::system::BindingState::Unbound, cause: proto::system::FailureCause::None, last_opcode: 0, silent_for: 0, attempts: 0, domain_known: false, memory_used: 0, memory_peak: 0, handles_used: 0, threads_used: 0, dma_used: 0 });
+			return Ok(proto::system::IncidentReport { present: false, bus: 0, dev: 0, func: 0, generation: 0, state: proto::system::BindingState::Unbound, cause: proto::system::FailureCause::None, last_opcode: 0, silent_for: 0, attempts: 0, domain_known: false, memory_used: 0, memory_peak: 0, handles_used: 0, threads_used: 0, dma_used: 0, platform: None });
 		};
 		let domain = report.domain.unwrap_or_default();
-		Ok(proto::system::IncidentReport { present: true, bus: report.binding.bus as u32, dev: report.binding.dev as u32, func: report.binding.func as u32, generation: report.binding.generation, state: binding_state_wire(report.state), cause: failure_cause_wire(Some(report.cause)), last_opcode: report.last_opcode as u32, silent_for: report.silent_for, attempts: report.attempts, domain_known: report.domain.is_some(), memory_used: domain.memory_used, memory_peak: domain.memory_peak, handles_used: domain.handles_used, threads_used: domain.threads_used, dma_used: domain.dma_used })
+		Ok(proto::system::IncidentReport { present: true, bus: report.binding.bus as u32, dev: report.binding.dev as u32, func: report.binding.func as u32, generation: report.binding.generation, state: binding_state_wire(report.state), cause: failure_cause_wire(Some(report.cause)), last_opcode: report.last_opcode as u32, silent_for: report.silent_for, attempts: report.attempts, domain_known: report.domain.is_some(), memory_used: domain.memory_used, memory_peak: domain.memory_peak, handles_used: domain.handles_used, threads_used: domain.threads_used, dma_used: domain.dma_used, platform: report.binding.platform })
 	}
 
 	fn stored(&mut self, index: u32) -> Result<alloc::string::String, proto::system::Error> {
@@ -4790,11 +4831,11 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 		let mut client = proto::system::config::Client::new(ChannelTransport { chan: self.config });
 		// A DEVICE WITH NO RECORD ANSWERS EMPTY, not an error: "nothing is stored" is a fact an
 		// operator asked for, and an error would read as "the question could not be answered".
-		let disabled: Option<alloc::string::String> = match client.get(&policy_key(node.id)) {
+		let disabled: Option<alloc::string::String> = match client.get(&policy_key(node)) {
 			Some(Ok(value)) if !value.is_empty() => Some(value),
 			_ => None,
 		};
-		let selected: Option<alloc::string::String> = match client.get(&select_key(node.id)) {
+		let selected: Option<alloc::string::String> = match client.get(&select_key(node)) {
 			Some(Ok(value)) if !value.is_empty() => Some(value),
 			_ => None,
 		};
@@ -5553,6 +5594,7 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 				rule: node.matched_rule,
 				providers: self.catalogue.count_for_binding(node.id) as u32,
 				resources: node.granted_resources,
+				platform: node.id.platform,
 			})
 			.collect()
 	}
@@ -5647,7 +5689,7 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 
 	fn subscribe(&mut self, kind: proto::system::ProviderKind) -> Vec<proto::system::ProviderInfo> {
 		let wire: u16 = provider_kind_wire(kind);
-		self.catalogue.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live: true, name: alloc::string::String::from_utf8_lossy(provider.name()).into_owned().into() }).collect()
+		self.catalogue.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live: true, name: alloc::string::String::from_utf8_lossy(provider.name()).into_owned().into(), platform: provider.id.binding.platform }).collect()
 	}
 }
 
@@ -5809,10 +5851,10 @@ fn load_stored_policy(nodes: &mut [Node], config: u64) {
 		// TWO RECORDS, READ INDEPENDENTLY, because they are written independently: a device can
 		// be disabled AND have a preferred driver, and reading one key could only ever restore
 		// whichever verb was used last.
-		if let Some(Ok(entry)) = client.get(&select_key(node.id)) {
+		if let Some(Ok(entry)) = client.get(&select_key(node)) {
 			apply_stored_selection(node, entry.as_bytes());
 		}
-		let key = policy_key(node.id);
+		let key = policy_key(node);
 		let Some(Ok(entry)) = client.get(&key) else { continue };
 		let value = entry.as_bytes();
 		if value == b"disabled" {
@@ -5932,11 +5974,15 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			// path where the manager is gone. Where the manager is alive it answers by index itself,
 			// from the live inventory that gives the number meaning.
 			value.push_str(" at=");
-			push_number(&mut value, report.binding.bus as u64);
-			value.push(':');
-			push_number(&mut value, report.binding.dev as u64);
-			value.push('.');
-			push_number(&mut value, report.binding.func as u64);
+			if report.binding.platform.is_some() {
+				value.push_str(&alloc::string::String::from_utf8_lossy(node.info.platform.identity()));
+			} else {
+				push_number(&mut value, report.binding.bus as u64);
+				value.push(':');
+				push_number(&mut value, report.binding.dev as u64);
+				value.push('.');
+				push_number(&mut value, report.binding.func as u64);
+			}
 			// `domain=` is absent when the Domain was already gone or never made, which is itself
 			// worth recording rather than reporting zeros - the same distinction the live report
 			// carries as `domain_known`.
@@ -5954,7 +6000,7 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			} else {
 				value.push_str(" domain=0");
 			}
-			let key = incident_key(node.id);
+			let key = incident_key(node);
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
 			// A REFUSED WRITE IS NOT A WRITE, AND THIS COUNTED IT AS ONE (corrected 2026-09-04).
 			// The generated client answers `Option<Result<(), Error>>`: the outer `None` is "the call
@@ -6014,7 +6060,7 @@ fn forget_absent_incidents(nodes: &[Node], config: u64) {
 			continue;
 		}
 		let Some(rest) = entry.key.strip_prefix("device.policy.incident.") else { continue };
-		if !nodes.iter().any(|node| incident_key(node.id).ends_with(rest) && incident_key(node.id).len() == "device.policy.incident.".len() + rest.len()) {
+		if !nodes.iter().any(|node| incident_key(node).strip_prefix("device.policy.incident.") == Some(rest)) {
 			stale.push(entry.key.clone());
 		}
 	}
@@ -6026,39 +6072,46 @@ fn forget_absent_incidents(nodes: &[Node], config: u64) {
 
 // Where one device's last incident is kept, under the same reserved prefix as its policy so both are
 // the records this program owns.
-fn incident_key(id: BindingId) -> alloc::string::String {
+fn incident_key(node: &Node) -> alloc::string::String {
 	let mut key = alloc::string::String::from("device.policy.incident.");
-	let mut number = [0u8; 20];
-	for (at, part) in [id.bus as u64, id.dev as u64, id.func as u64].into_iter().enumerate() {
-		if at > 0 {
-			key.push('.');
-		}
-		let n = decimal(part, &mut number);
-		key.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
-	}
+	key.push_str(&device_name(node));
 	key
 }
 
-// The config key one device's policy lives under. The BDF, because that is the device's identity -
-// a row number would name whatever the table happened to hold this boot.
+// WHAT A DEVICE'S RECORDS ARE KEPT UNDER, which is its identity across boots: a PCI function's BDF, and a platform
+// device's stable identity name (`platform.dt:/soc/serial@10000000`) - never its platform number, which is the
+// row this boot's table happened to give it.
+fn device_name(node: &Node) -> alloc::string::String {
+	let mut name = alloc::string::String::new();
+	if node.id.platform.is_some() {
+		name.push_str("platform.");
+		name.push_str(&alloc::string::String::from_utf8_lossy(node.info.platform.identity()));
+		return name;
+	}
+	let mut number = [0u8; 20];
+	for (at, part) in [node.id.bus as u64, node.id.dev as u64, node.id.func as u64].into_iter().enumerate() {
+		if at > 0 {
+			name.push('.');
+		}
+		let n = decimal(part, &mut number);
+		name.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
+	}
+	name
+}
+
+// The config key one device's policy lives under. Its identity, because a row number would name whatever the
+// table happened to hold this boot.
 // The device's stored SELECTION, which is a different preference from its disable and outlives it.
 // Under the same reserved prefix, so the same authority rule covers both.
-fn select_key(id: BindingId) -> alloc::string::String {
-	let mut key = policy_key(id);
+fn select_key(node: &Node) -> alloc::string::String {
+	let mut key = policy_key(node);
 	key.push_str(".select");
 	key
 }
 
-fn policy_key(id: BindingId) -> alloc::string::String {
+fn policy_key(node: &Node) -> alloc::string::String {
 	let mut key = alloc::string::String::from_utf8_lossy(DEVICE_POLICY_PREFIX).into_owned();
-	let mut number = [0u8; 20];
-	for (at, part) in [id.bus as u64, id.dev as u64, id.func as u64].into_iter().enumerate() {
-		if at > 0 {
-			key.push('.');
-		}
-		let n = decimal(part, &mut number);
-		key.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
-	}
+	key.push_str(&device_name(node));
 	key
 }
 
@@ -6131,6 +6184,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::GAMEPAD => proto::system::ProviderKind::Gamepad,
 		provider::I2C_BUS => proto::system::ProviderKind::I2cBus,
 		provider::GPIO_LINES => proto::system::ProviderKind::GpioLines,
+		provider::TPM => proto::system::ProviderKind::Tpm,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6160,6 +6214,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Gamepad => driver_protocol::provider::GAMEPAD,
 		proto::system::ProviderKind::I2cBus => driver_protocol::provider::I2C_BUS,
 		proto::system::ProviderKind::GpioLines => driver_protocol::provider::GPIO_LINES,
+		proto::system::ProviderKind::Tpm => driver_protocol::provider::TPM,
 	}
 }
 
@@ -7121,6 +7176,13 @@ fn registry_entry(info: &DeviceInfo) -> Option<&'static Entry> {
 // entries cannot overlap at one priority, so this cannot fire - and it stays here because a proof
 // that nothing checks is a comment.
 fn registry_candidates(info: &DeviceInfo) -> Vec<&'static Entry> {
+	// A PLATFORM DEVICE THAT IS NOT CLAIMABLE HAS NO CANDIDATE, whatever a rule would say of its ids: the kernel
+	// drives it, the firmware owns it, or it is a reservation and no device at all. Listed, never bound - and
+	// never attempted, since the kernel refuses the claim by name and an attempt would be an incident for a
+	// device nothing was ever going to drive.
+	if info.platform.kind == ROW_KIND_PLATFORM && info.platform.state != PLATFORM_STATE_CLAIMABLE {
+		return Vec::new();
+	}
 	let mut candidates: Vec<&'static Entry> = DRIVER_REGISTRY.iter().filter(|entry| entry.rules.iter().any(|rule| rule.matches(info))).collect();
 	candidates.sort_by(|left, right| right.priority.cmp(&left.priority));
 	for pair in candidates.windows(2) {

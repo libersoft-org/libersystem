@@ -183,3 +183,9 @@ pub fn unmask(gsi: u32) {
 		write(base, lo, read(base, lo) & !MASKED);
 	}
 }
+
+// Whether `gsi`'s redirection entry is unmasked - for the suite, which checks that a release silenced a line.
+#[cfg(test)]
+pub fn unmasked(gsi: u32) -> bool {
+	locate(gsi).is_some_and(|(base, pin)| read(base, REG_REDTBL + 2 * pin) & MASKED == 0)
+}

@@ -247,7 +247,7 @@ pub fn catalogue_scope_denial() {
 	let mut catalogue = Catalogue::new();
 	catalogue.entries.push(Some(Provider { id: ProviderId::new(binding, 0, 1), kind: driver_protocol::provider::BLOCK, token: 1, handle: 0, consumers: 0, name: [0; driver_protocol::MAX_PROVIDER_NAME], name_len: 0 }));
 	catalogue.entries.push(Some(Provider { id: ProviderId::new(binding, 1, 1), kind: driver_protocol::provider::NET, token: 2, handle: 0, consumers: 0, name: [0; driver_protocol::MAX_PROVIDER_NAME], name_len: 0 }));
-	let info = |kind: proto::system::ProviderKind, slot: u32| proto::system::ProviderInfo { kind, bus: 0, dev: 0, func: 0, binding_generation: 1, slot, provider_generation: 1, live: true, name: alloc::string::String::new() };
+	let info = |kind: proto::system::ProviderKind, slot: u32| proto::system::ProviderInfo { kind, bus: 0, dev: 0, func: 0, binding_generation: 1, slot, provider_generation: 1, live: true, name: alloc::string::String::new(), platform: None };
 	let nodes: [Node; 0] = [];
 	{
 		// Minted for the network and nothing else.

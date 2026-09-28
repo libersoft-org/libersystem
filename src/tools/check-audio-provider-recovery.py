@@ -85,7 +85,7 @@ fn announce(live: bool, generation: u64) {
     // AN UNNAMED PUBLICATION, which is what a device with one provider of a kind publishes: the name
     // selects among several of one kind and this machine's audio device has exactly one.
     let info = ProviderInfo { kind: ProviderKind::Audio, bus: 0, dev: 1, func: 0,
-        binding_generation: generation, slot: 0, provider_generation: generation as u32, live, name: String::new() };
+        binding_generation: generation, slot: 0, provider_generation: generation as u32, live, name: String::new(), platform: None };
     let mut frame = [0; 128]; let mut handles = wire::Handles::new();
     let len = provider_catalogue::subscribe_frame(0, &info, &mut frame, &mut handles).unwrap();
     RT.with_borrow_mut(|rt| rt.messages.entry(80).or_default().push_back(frame[..len].to_vec()));

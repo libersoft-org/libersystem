@@ -256,6 +256,12 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 	Ok(intr)
 }
 
+// Whether a claimed line is live at its controller - for the suite, as on x86_64.
+#[cfg(test)]
+pub fn line_armed(line: &abi::WiredLine) -> bool {
+	super::gic::spi_enabled(line.number)
+}
+
 // A CLAIMED LINE FIRED: its driver is woken, and a LEVEL line is disabled at the distributor until the driver
 // acknowledges - its source stays asserted until the driver has run. False when no claim holds `intid`.
 pub fn signal_line(intid: u32) -> bool {

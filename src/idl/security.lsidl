@@ -146,6 +146,15 @@ enum capability {
 	/// holds display focus, so a background program cannot watch a game's input. Appended last, for the reason
 	/// `midi-output` states.
 	input-gamepad,
+	/// THE TPM, OBSERVED: its identity, random bytes, PCR reads and quotes, on a connection minted per launch
+	/// for the component and the life of it. Appended last, for the reason `midi-output` states.
+	tpm,
+	/// THE TPM'S PCRS 16 AND 23 EXTENDED, which changes what every later quote and unseal answers - the whole
+	/// machine's, not this component's. Denied by default.
+	tpm-measure,
+	/// SEALING TO A PCR AND UNSEALING, each sealed object bound to the component that sealed it. Denied by
+	/// default.
+	tpm-seal,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

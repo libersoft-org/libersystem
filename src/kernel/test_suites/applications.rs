@@ -900,7 +900,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 // enumerated stops being denied out loud - so each new one is added here, once, rather than to every string.
 macro_rules! later_denials {
 	() => {
-		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny input-gamepad=deny"
+		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny input-gamepad=deny tpm=deny tpm-measure=deny tpm-seal=deny"
 	};
 }
 

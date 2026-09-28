@@ -15,6 +15,10 @@
 // does is the half the IMSIC cannot: tell the APLIC which wire, how it asserts, and what identity
 // to send when it does.
 //
+// A CLAIMED LINE IS A SOURCE LIKE ANY OTHER, armed by the same function to an identity of its own, and it is
+// the one kind that is masked and unmasked after arming: a level line is disabled when it fires and enabled
+// again when its driver acknowledges (see `interrupts::bind_wired`).
+//
 // ONLY THE REGISTERS A WIRED SOURCE NEEDS ARE NAMED. The rest of the domain's configuration belongs
 // to M-mode, which sets the MSI address registers this domain delivers through before it hands the
 // machine over; a supervisor that wrote them would be writing registers it does not own.
@@ -23,7 +27,11 @@
 // from ONE - source 0 does not exist - so each is addressed as `base + (source - 1) * 4`.
 const DOMAINCFG: u64 = 0x0000;
 const SOURCECFG: u64 = 0x0004;
+const SETIPNUM: u64 = 0x1cdc;
+#[cfg(test)]
+const SETIE: u64 = 0x1e00;
 const SETIENUM: u64 = 0x1edc;
+const CLRIENUM: u64 = 0x1fdc;
 const TARGET: u64 = 0x3004;
 
 // `domaincfg`: deliver interrupts at all, and deliver them as MSIs.
@@ -45,6 +53,75 @@ const TARGET_EIID_MASK: u32 = 0x7ff;
 // The highest source an APLIC addresses.
 const MAX_SOURCE: u32 = 1023;
 
+// THE DOMAIN A CLAIMED LINE IS ARMED THROUGH: the S-mode APLIC the device tree's nodes name as their interrupt
+// parent, recorded by the boot's describe pass. Zero until then - and on a machine whose nodes name none, which
+// has no line to claim.
+static DOMAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record `base` as the domain claimed lines are armed through. `false` when another domain was recorded
+/// first: a line of a second domain is one this kernel does not arm, and says so rather than arming it in the
+/// wrong register block.
+pub fn adopt_domain(base: u64) -> bool {
+	use core::sync::atomic::Ordering;
+	match DOMAIN.compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire) {
+		Ok(_) => true,
+		Err(recorded) => recorded == base,
+	}
+}
+
+/// The domain claimed lines are armed through, if one was described.
+pub fn domain() -> Option<u64> {
+	let base = DOMAIN.load(core::sync::atomic::Ordering::Acquire);
+	(base != 0).then_some(base)
+}
+
+// One write of `value` to the register at `offset`.
+//
+// SAFETY: `base` is a domain this kernel adopted, inside the direct map.
+unsafe fn write(base: u64, offset: u64, value: u32) {
+	unsafe { core::ptr::write_volatile(super::paging::phys_to_virt(base + offset) as *mut u32, value) };
+}
+
+/// Stop forwarding `source`, leaving its configuration: a level line disabled when it fired. An assertion
+/// while it is disabled still pends it, and enabling it again forwards that.
+///
+/// # Safety
+/// `base` is the domain `domain` answers.
+pub unsafe fn mask_source(base: u64, source: u32) {
+	unsafe { write(base, CLRIENUM, source) };
+}
+
+/// Forward `source` again - and for a LEVEL line, ask for it again. In MSI delivery mode a level source is
+/// pended by its rising edge and its pending bit is cleared by the forward, so a line still asserted when its
+/// driver acknowledges has no new edge and would never be forwarded again. Writing its number to `setipnum`
+/// pends it if - and only if - it is still asserted, which is the level semantics the driver was promised.
+///
+/// # Safety
+/// As `mask_source`.
+pub unsafe fn unmask_source(base: u64, source: u32, level: bool) {
+	unsafe {
+		write(base, SETIENUM, source);
+		if level {
+			write(base, SETIPNUM, source);
+		}
+	}
+}
+
+/// Take `source` out of service: disabled, and its mode inactive, so it forwards nothing until it is armed
+/// again.
+///
+/// # Safety
+/// As `mask_source`.
+pub unsafe fn disarm_source(base: u64, source: u32) {
+	if source == 0 || source > MAX_SOURCE {
+		return;
+	}
+	unsafe {
+		write(base, CLRIENUM, source);
+		write(base, SOURCECFG + (source as u64 - 1) * 4, SM_INACTIVE);
+	}
+}
+
 // The trigger types a device tree states, which are the standard `IRQ_TYPE_*` values every binding
 // uses. A PCI INTx line is level-sensitive; the other two are here because the tree may say so and
 // a reader that only understood one would arm the others wrongly rather than refuse them.
@@ -52,6 +129,16 @@ const IRQ_TYPE_EDGE_RISING: u32 = 1;
 const IRQ_TYPE_EDGE_FALLING: u32 = 2;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const IRQ_TYPE_LEVEL_LOW: u32 = 8;
+
+/// The device-tree trigger type a claimed line's trigger and polarity are.
+pub fn trigger_type(level: bool, active_low: bool) -> u32 {
+	match (level, active_low) {
+		(false, false) => IRQ_TYPE_EDGE_RISING,
+		(false, true) => IRQ_TYPE_EDGE_FALLING,
+		(true, false) => IRQ_TYPE_LEVEL_HIGH,
+		(true, true) => IRQ_TYPE_LEVEL_LOW,
+	}
+}
 
 /// This controller's source mode for a trigger type the device tree stated, or `None` for one it
 /// does not describe - which is a board this kernel refuses to arm rather than one it guesses at.
@@ -101,5 +188,23 @@ pub unsafe fn arm_source(base: u64, source: u32, trigger: u32, hart: u64, eid: u
 		// one failure a hot-plug path must not have, because nothing else would ever say so.
 		let settled = core::ptr::read_volatile(at(SOURCECFG + index));
 		settled != SM_INACTIVE && settled == mode
+	}
+}
+
+/// Whether `source` is active and enabled - for the suite, which checks that a level line is disabled while
+/// its driver runs and that a release took it out of service.
+///
+/// # Safety
+/// As `mask_source`.
+#[cfg(test)]
+pub unsafe fn source_armed(base: u64, source: u32) -> bool {
+	if source == 0 || source > MAX_SOURCE {
+		return false;
+	}
+	unsafe {
+		let at = |offset: u64| super::paging::phys_to_virt(base + offset) as *const u32;
+		let mode = core::ptr::read_volatile(at(SOURCECFG + (source as u64 - 1) * 4));
+		let enabled = core::ptr::read_volatile(at(SETIE + (source as u64 / 32) * 4)) & (1 << (source % 32)) != 0;
+		mode != SM_INACTIVE && enabled
 	}
 }

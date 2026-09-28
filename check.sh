@@ -120,6 +120,14 @@ declare -A GATES=(
 	# THE SHIPPING FIRMWARE REQUESTER against a runtime DFU target played over `usb-redir`: `dfu` asks, a person
 	# confirms on the protected screen, the executor follows the target into DFU mode and writes the image once.
 	["qemu-dfu-tool"]="tools/check-dfu-tool.sh"
+	# THE TPM FOR APPLICATIONS behind `swtpm`, over QEMU's CRB and then its TIS front-end: the `TPM2` table's platform
+	# row, the driver, TpmService, the shipping `tpm` tool and the probe's refusals, a driver and a service restart,
+	# and a quote OpenSSL verifies on the host.
+	["qemu-tpm-tool"]="tools/check-tpm-tool.sh"
+	# THE COM1 HANDOFF on a development instance of its own: the kernel hands COM1 to its userspace driver and
+	# takes it back on a kill and on a disable, counting zero stray register accesses each time; `lab sh` answers
+	# through both paths; and a panic reaches the wire past a driver that stopped draining a full ring.
+	["serial-handoff"]="tools/check-serial-handoff.sh"
 	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
 	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
 	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three

@@ -45,6 +45,8 @@ pub const ST_ATTEST_QUOTE: u16 = 0x8018;
 pub const GENERATED_VALUE: u32 = 0xff54_4347;
 
 /// Command codes.
+pub const CC_HIERARCHY_CONTROL: u32 = 0x121;
+pub const CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
 pub const CC_CREATE_PRIMARY: u32 = 0x131;
 pub const CC_SELF_TEST: u32 = 0x143;
 pub const CC_STARTUP: u32 = 0x144;
@@ -54,6 +56,7 @@ pub const CC_QUOTE: u32 = 0x158;
 pub const CC_UNSEAL: u32 = 0x15E;
 pub const CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const CC_START_AUTH_SESSION: u32 = 0x176;
+pub const CC_GET_CAPABILITY: u32 = 0x17A;
 pub const CC_GET_RANDOM: u32 = 0x17B;
 pub const CC_PCR_READ: u32 = 0x17E;
 pub const CC_POLICY_PCR: u32 = 0x17F;
@@ -64,6 +67,30 @@ pub const CC_POLICY_GET_DIGEST: u32 = 0x189;
 pub const RH_OWNER: u32 = 0x4000_0001;
 pub const RH_NULL: u32 = 0x4000_0007;
 pub const RS_PW: u32 = 0x4000_0009;
+pub const RH_PLATFORM: u32 = 0x4000_000C;
+
+/// The first handle of each range `GetCapability` lists: transient objects, and loaded sessions - whose own
+/// handles are in the HMAC (0x02) or the policy (0x03) range by the session's kind.
+pub const HT_TRANSIENT: u32 = 0x8000_0000;
+pub const HT_LOADED_SESSION: u32 = 0x0200_0000;
+pub const HT_POLICY_SESSION: u32 = 0x0300_0000;
+
+/// Capabilities, and the properties this crate reads.
+pub const CAP_HANDLES: u32 = 1;
+pub const CAP_TPM_PROPERTIES: u32 = 6;
+/// The fixed properties: the family ("2.0"), the manufacturer (four ASCII characters), the four vendor-string
+/// words and the two firmware-version words, 0x100 to 0x10C.
+pub const PT_FAMILY_INDICATOR: u32 = 0x100;
+pub const PT_MANUFACTURER: u32 = 0x105;
+pub const PT_VENDOR_STRING_1: u32 = 0x106;
+pub const PT_FIRMWARE_VERSION_1: u32 = 0x10B;
+pub const PT_FIRMWARE_VERSION_2: u32 = 0x10C;
+/// The two attribute words: what is permanently set, and what was set since the last Startup(CLEAR).
+pub const PT_PERMANENT: u32 = 0x200;
+pub const PT_STARTUP_CLEAR: u32 = 0x201;
+/// `TPMA_PERMANENT.ownerAuthSet` and `TPMA_STARTUP_CLEAR.shEnable`.
+pub const PERMANENT_OWNER_AUTH_SET: u32 = 1 << 0;
+pub const STARTUP_CLEAR_SH_ENABLE: u32 = 1 << 1;
 
 /// Algorithms and the one curve.
 pub const ALG_AES: u16 = 0x0006;
@@ -103,6 +130,9 @@ pub const RC_RETRY: u32 = 0x922;
 pub const RC_POLICY_FAIL: u32 = 0x01D;
 /// The warning for a PCR that changed after a policy session recorded it.
 pub const RC_PCR_CHANGED: u32 = 0x928;
+/// The warnings for a TPM out of room for another loaded object, or another session.
+pub const RC_OBJECT_MEMORY: u32 = 0x902;
+pub const RC_SESSION_MEMORY: u32 = 0x903;
 
 /// What went wrong, from the register to the response code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

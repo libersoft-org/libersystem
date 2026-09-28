@@ -133,6 +133,13 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 	Ok(intr)
 }
 
+// Whether a claimed line is live at its controller - for the suite, which checks that a level line is masked
+// while its driver runs and that a release silenced it.
+#[cfg(test)]
+pub fn line_armed(line: &abi::WiredLine) -> bool {
+	super::ioapic::unmasked(line.number)
+}
+
 // A CLAIMED LINE FIRED: its `Interrupt` is signalled, and a LEVEL line is masked at its I/O APIC before the
 // end of interrupt - its source stays asserted until the driver has run, and an unmasked level line would
 // re-fire for as long as that takes. The driver's acknowledgement unmasks it. False when no claim holds it.
@@ -457,6 +464,14 @@ pub fn is_bound(vector: u32) -> bool {
 pub fn register(vector: u32, handler: HandlerFn) {
 	let index = (vector - IRQ_BASE as u32) as usize;
 	HANDLERS[index].store(handler as usize, Ordering::SeqCst);
+}
+
+// Take the kernel's handler off a device-interrupt `vector`: the console UART's, when a claim takes COM1 and
+// its line becomes the claim's to bind. The reacquisition registers it again.
+#[cfg(not(test))]
+pub fn unregister(vector: u32) {
+	let index = (vector - IRQ_BASE as u32) as usize;
+	HANDLERS[index].store(0, Ordering::SeqCst);
 }
 
 // Common interrupt path: invoke the registered handler (if any), then EOI.

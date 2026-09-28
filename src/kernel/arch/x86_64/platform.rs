@@ -2,8 +2,8 @@
 // publishes, in the order it publishes them: what the kernel declares because it drives it - the legacy
 // chipset, the interrupt controllers, the PCI host, COM1 - then what the static ACPI tables name.
 //
-// THE KERNEL-HELD SET IS PUBLISHED SO THE MACHINE IS ACCOUNTED FOR, and is never claimable. COM1 is held
-// until its handoff releases it. The ISA DMA controller's channel registers are held and its page
+// THE KERNEL-HELD SET IS PUBLISHED SO THE MACHINE IS ACCOUNTED FOR, and is never claimable. COM1 is the one
+// kernel-declared row a claim may take: that claim is the console's handoff to a driver. The ISA DMA controller's channel registers are held and its page
 // registers (0x80..0x8F) are not: they master nothing and firmware methods use them.
 
 use alloc::vec::Vec;
@@ -99,8 +99,39 @@ pub fn describe() -> Vec<Described> {
 			push(&mut out, description);
 		}
 	}
+	// EVERY IOMMU UNIT THE FIRMWARE NAMES - Intel's DMAR hardware units and AMD's IVRS hardware definitions -
+	// each a device that remaps DMA and that no driver may take, accounted for by its register window.
+	for signature in [b"DMAR", b"IVRS"] {
+		let Some(bytes) = crate::smp::acpi_table(rsdp, signature) else { continue };
+		let mut units: Vec<acpi::IommuUnit> = Vec::new();
+		// ALLOC-OK: boot, once per unit the firmware names.
+		let walked = if signature == b"DMAR" { acpi::dmar_units(bytes, |unit| units.push(unit)) } else { acpi::ivrs_units(bytes, |unit| units.push(unit)) };
+		let table = core::str::from_utf8(signature).unwrap_or("?");
+		if walked.is_err() {
+			crate::serial_println!("device: the {table} table ends in a structure that cannot be read - the units before it are published");
+		}
+		for (index, unit) in units.iter().enumerate() {
+			let mut name = [0u8; abi::PLATFORM_NAME_LEN];
+			let body = alloc::format!("{table}#0.{index}");
+			if let Some(len) = platform::identity(b"table:", body.as_bytes(), &mut name)
+				&& let Some(mut description) = platform::Description::new(abi::PLATFORM_SOURCE_TABLE, abi::PLATFORM_STATE_KERNEL_HELD, &name[..len])
+			{
+				description.add_match(abi::MATCH_ID_TABLE, signature);
+				description.add_mmio(unit.base, unit.len);
+				push(&mut out, description);
+			}
+		}
+	}
 	// COM1, the kernel's console: its ports and ISA IRQ 4 at the Global System Interrupt the MADT moves it to.
-	if let Some(mut com1) = held(b"kernel:com1") {
+	// THE ONE KERNEL-DECLARED ROW THAT IS CLAIMABLE, and its claim is the console's handoff to a driver: the
+	// kernel drives it until then and takes it back at the release. The test build keeps it the kernel's - the
+	// suite is judged by what COM1 carries, and it exercises the handoff on its second UART instead.
+	#[cfg(not(test))]
+	let com1_state = abi::PLATFORM_STATE_CLAIMABLE;
+	#[cfg(test)]
+	let com1_state = abi::PLATFORM_STATE_KERNEL_HELD;
+	if let Some(mut com1) = platform::Description::new(abi::PLATFORM_SOURCE_KERNEL, com1_state, b"kernel:com1") {
+		com1.part.flags |= abi::PLATFORM_FLAG_CONSOLE;
 		com1.add_match(abi::MATCH_ID_HID, b"PNP0501");
 		com1.add_port(0x3f8, 8);
 		com1.add_line(isa_line(madt.as_ref(), 4));
@@ -119,6 +150,26 @@ fn isa_line(madt: Option<&acpi::Madt<'_>>, irq: u8) -> abi::WiredLine {
 	let level = over.is_some_and(|over| over.trigger == acpi::Trigger::Level);
 	let low = over.is_some_and(|over| over.polarity == acpi::Polarity::ActiveLow);
 	abi::WiredLine { number: gsi, trigger: if level { abi::LINE_TRIGGER_LEVEL } else { abi::LINE_TRIGGER_EDGE }, polarity: if low { abi::LINE_POLARITY_LOW } else { abi::LINE_POLARITY_HIGH }, controller: abi::LINE_CONTROLLER_IOAPIC, _pad: 0 }
+}
+
+// An ISA IRQ's wired line on this machine, and a PCI function's INTx line by the ISA IRQ its firmware wrote in
+// its interrupt-line register - LEVEL, active low unless the MADT's override for that IRQ says high - for the
+// suite, which claims both as platform rows' lines.
+#[cfg(test)]
+fn test_madt() -> Option<acpi::Madt<'static>> {
+	crate::smp::acpi_table(crate::boot_info().rsdp, b"APIC").and_then(|bytes| acpi::Madt::new(bytes).ok())
+}
+
+#[cfg(test)]
+pub fn isa_irq_line(irq: u8) -> abi::WiredLine {
+	isa_line(test_madt().as_ref(), irq)
+}
+
+#[cfg(test)]
+pub fn pci_intx_line(irq: u8) -> abi::WiredLine {
+	let over = test_madt().and_then(|madt| madt.isa_override(irq));
+	let high = over.is_some_and(|over| over.polarity == acpi::Polarity::ActiveHigh);
+	abi::WiredLine { number: over.map_or(u32::from(irq), |over| over.gsi), trigger: abi::LINE_TRIGGER_LEVEL, polarity: if high { abi::LINE_POLARITY_HIGH } else { abi::LINE_POLARITY_LOW }, controller: abi::LINE_CONTROLLER_IOAPIC, _pad: 0 }
 }
 
 // A register window a table describes, added to `description` in its own address space.

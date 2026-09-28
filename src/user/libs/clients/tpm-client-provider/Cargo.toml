@@ -1,0 +1,19 @@
+[package]
+# The product version lives only in /product.conf; Cargo's optional package version is unused here and
+# omitted.
+name = "tpm-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem TPM channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["tpm-proto/shared-image"]
+
+[dependencies]
+tpm-proto = { path = "../../protocol/tpm-proto" }
+
+[lints.rust]
+warnings = "deny"

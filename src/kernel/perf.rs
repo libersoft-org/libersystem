@@ -125,22 +125,25 @@ pub fn sys_control(op: u64) -> i64 {
 
 // THE DRAIN GOES OUT ON THE DEBUG SERIAL AND NOT A BYTE OF IT MAY BE LOST. The ordinary debug write
 // is best-effort - it drops what the transmit ring cannot hold, which is right for a console mirror
-// and fatal for a record stream whose last line is the count a collector checks - so each line is
-// pushed until the ring has taken all of it, draining the UART synchronously whenever it is full.
-// The console mirror is left out: megabytes of record lines are addressed to a program.
+// and fatal for a record stream whose last line is the count a collector checks - so each line waits
+// until the ring takes ALL of it, under the print lock so no other line lands inside it: the ring is
+// drained synchronously while the kernel drives the UART, and by the driver that holds it otherwise,
+// which this thread lets run between attempts. The console mirror is left out: megabytes of record lines
+// are addressed to a program.
 fn drain() -> u64 {
 	let drained = perfbuf::drain_lines(&BUFFER, &mut |line: &[u8]| {
-		let _guard = crate::print_lock();
-		let mut rest = line;
-		while !rest.is_empty() {
-			let taken = arch::serial::write_bytes(rest);
-			rest = &rest[taken..];
-			if !rest.is_empty() {
-				arch::serial::flush_sync();
+		loop {
+			let taken = {
+				let _guard = crate::print_lock();
+				arch::serial::write_whole(line)
+			};
+			if taken {
+				break;
 			}
+			arch::serial::make_room();
 		}
 	});
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	drained.records
 }
 

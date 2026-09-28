@@ -444,8 +444,35 @@ fn one_function_at_one_generation_is_one_binding_however_it_is_reached() {
 	// The identity has no row number in it, so two paths that reach the same function agree without
 	// anyone having to map one table's index onto another's.
 	let reached_one_way = BindingId::new(0, 9, 0, 5);
-	let reached_another = BindingId { bus: 0, dev: 9, func: 0, generation: 5 };
+	let reached_another = BindingId { bus: 0, dev: 9, func: 0, platform: None, generation: 5 };
 	assert!(reached_one_way == reached_another);
+}
+
+#[test]
+fn a_platform_device_is_never_the_function_at_the_zero_address() {
+	// A DEVICE THE FIRMWARE DESCRIBES HAS NO BUS ADDRESS, and its binding's address fields are zero - which is
+	// the host bridge's on every PC. It is the same device by its platform number and never by an address.
+	let bridge = BindingId::new(0, 0, 0, 1);
+	let uart = BindingId::platform(7, 1);
+	assert!(!uart.same_function(bridge), "a platform device is not function 00:00.0");
+	assert!(uart != bridge);
+	assert!(!uart.same_function(BindingId::platform(8, 1)), "two platform devices are two devices");
+	let rebound = uart.rebound(2);
+	assert!(uart.same_function(rebound) && rebound.platform == Some(7), "a rebind keeps the platform number");
+	assert!(uart != rebound, "and is another binding");
+}
+
+#[test]
+fn providers_hand_off_by_address_then_by_platform_number() {
+	// The handoff order is a total one over both kinds: every function by its address, then every platform
+	// device by its number - so a platform device's publication never sorts among the functions at 00:00.0.
+	let entries = [
+		Some(ProviderId::new(BindingId::platform(3, 1), 0, 1)),
+		Some(ProviderId::new(BindingId::new(0, 5, 0, 1), 1, 1)),
+		Some(ProviderId::new(BindingId::platform(1, 1), 2, 1)),
+	];
+	assert_eq!(next_handoff_slot(&entries, |_| true, |id| *id), Some(1), "the function first");
+	assert_eq!(next_handoff_slot(&entries, |id| id.binding.platform.is_some(), |id| *id), Some(2), "then the lower platform number");
 }
 
 #[test]

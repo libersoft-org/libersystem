@@ -81,6 +81,18 @@ impl<T> SpinLock<T> {
 		self.locked.load(Ordering::Relaxed)
 	}
 
+	// THE DATA WITHOUT THE LOCK, for a path that ends the machine and has waited for the lock as long as it
+	// will: the console's terminal-path writer, whose holder may be this very core, interrupted inside the
+	// section.
+	//
+	// # Safety
+	// The caller must be on a path that never returns to the code the holder was running, and must accept
+	// that a holder on another core may still be touching the data.
+	#[allow(clippy::mut_from_ref)]
+	pub unsafe fn get_unlocked(&self) -> &mut T {
+		unsafe { &mut *self.data.get() }
+	}
+
 	pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
 		let was_enabled = arch::interrupts_enabled();
 		arch::disable_interrupts();

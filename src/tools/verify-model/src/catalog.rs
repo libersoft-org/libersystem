@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 143] = [
+const GATES: [(&str, &str); 145] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -395,6 +395,14 @@ const GATES: [(&str, &str); 143] = [
 	// executor against a runtime target the harness plays over `usb-redir`. Its subject is userspace - the tool, the
 	// service and the driver - and it boots a development image through the emulated keyboard.
 	("qemu-dfu-tool", "userspace.build"),
+	// THE TPM FOR APPLICATIONS, end to end: the platform row, the TPM driver, TpmService, the `tpm` tool and its probe
+	// over `swtpm` behind QEMU's two front-ends. Its subject is the driver and the service above the library, and it
+	// boots a development image through the emulated keyboard.
+	("qemu-tpm-tool", "userspace.build"),
+	// THE COM1 HANDOFF, on a development instance of its own: the kernel lets COM1 go to its userspace driver, takes
+	// it back on a kill and on a disable with zero stray register accesses, and gets a panic onto the wire past a
+	// driver that stopped draining. Its subject is the kernel's console and the driver above it.
+	("serial-handoff", "kernel"),
 	// The lifecycle contract, end to end. Its subject is the runtime's init/fini runner, the kernel's
 	// per-image lifecycle table and the two fixtures that exercise them - a userspace or kernel
 	// change selects it, and it boots a guest because a constructor is only observable from inside
@@ -837,7 +845,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 48] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 50] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -857,6 +865,10 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 48] = [
 	"qemu-admin-path",
 	// And the firmware requester's, which runs its own against the runtime DFU target.
 	"qemu-dfu-tool",
+	// And the TPM's, over swtpm.
+	"qemu-tpm-tool",
+	// And the COM1 handoff's, on a development instance of its own.
+	"serial-handoff",
 	"virtio-multiport",
 	"qemu-2d-demo",
 	"qemu-2d-account",

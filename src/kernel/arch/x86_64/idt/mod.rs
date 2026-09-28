@@ -155,7 +155,11 @@ fn user_fault_or_halt(frame: &InterruptStackFrame, kind: u64, error_code: u64, a
 	if from_ring_three(frame) {
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code, address, instruction_pointer: frame.instruction_pointer });
 	}
+	// A KERNEL-FATAL EXCEPTION IS A TERMINAL PATH: the writer takes the console before the first line, so the
+	// line reaches the wire whoever held the UART, and the halt below cannot strand it in the ring.
+	super::serial::flush_sync();
 	crate::serial_println!("EXCEPTION: {name} (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
+	super::serial::flush_sync();
 	super::halt_loop();
 }
 
@@ -179,7 +183,9 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u64) -> ! {
+	super::serial::flush_sync();
 	crate::serial_println!("EXCEPTION: DOUBLE FAULT (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
+	super::serial::flush_sync();
 	super::halt_loop();
 }
 
@@ -198,8 +204,10 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, e
 		}
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_GENERAL_PROTECTION, error_code, address: 0, instruction_pointer: frame.instruction_pointer });
 	}
-	// In ring 0 it is a kernel bug; halt loudly.
+	// In ring 0 it is a kernel bug; halt loudly - through the terminal-path writer, as every fatal path does.
+	super::serial::flush_sync();
 	crate::serial_println!("EXCEPTION: general protection fault (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
+	super::serial::flush_sync();
 	super::halt_loop();
 }
 
@@ -252,7 +260,9 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, error_code:
 	if crate::fault::smap_probe_trip(cr2, error_code) {
 		crate::sched::exit();
 	}
+	super::serial::flush_sync();
 	crate::serial_println!("EXCEPTION: page fault (code {:#x}) at {:#x}, CR2 = {:#x}", error_code, frame.instruction_pointer, cr2);
+	super::serial::flush_sync();
 	super::halt_loop();
 }
 

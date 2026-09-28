@@ -573,6 +573,12 @@ pub fn unmask_spi(intid: u32) {
 	}
 }
 
+// Whether a shared peripheral interrupt is enabled at the distributor - for the suite.
+#[cfg(test)]
+pub fn spi_enabled(intid: u32) -> bool {
+	(32..1020).contains(&intid) && unsafe { core::ptr::read_volatile(gicd(GICD_ISENABLER + (intid as usize / 32) * 4)) } & (1 << (intid % 32)) != 0
+}
+
 // This core's redistributor frame, for a caller that has to name it to something else - the ITS
 // targets a collection at a redistributor ADDRESS.
 pub fn redistributor() -> Option<u64> {

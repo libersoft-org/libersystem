@@ -45,3 +45,16 @@ NOT DONE / NOT RUN:
 - Source (a) of the mint (platform rows) - P02M0196a publishes them; the milestone does not close before it is wired.
 - P02M0191c (the COM1 handoff) and P02M0191d's handoff tests and `serial-handoff` gate - after P02M0196a, with P02M0099's 16550 item, in the agreed order.
 - aarch64 and riscv64 builds and their one portable test (`a_machine_with_no_port_space_mints_nothing`) - at the end of the job with the other cross-architecture work.
+
+ADDENDUM (2026-09-28, recorded during P02M0196a): source (a)'s static half is wired. P02M0196a's platform rows
+carry port resources (the kernel's declarations, `SPCR`, `DBG2`, `WDAT`), checked against the reserved set and
+the live grants at publication (`device::publish_locked`, claimable rows only) and again at the mint
+(`sys_device_resource_acquire`, unchanged), and DeviceManager's existing loop hands them to the driver. Verified
+on x86_64 by `kernel.platform_rows.a_platform_row_is_claimed_with_its_resources_and_a_release_takes_every_one_back`
+(COM2's range minted from a platform row claim, revoked by the release) and by
+`kernel.platform_rows.a_kernel_held_device_an_overlap_and_memory_or_a_bar_are_refused` (a claimable row over
+COM1's ports refused at publication). The `_CRS` half waits for the ACPI service (P02M0196b).
+
+### P02M0191c and P02M0191d's handoff parts, with P02M0099's 16550 item - started 2026-09-28T14:16:57Z
+Begun after P02M0196a (the platform claim and claim-scoped wired lines) and P02M0190, in the owner's agreed order.
+The record of what was built and verified follows below when it is.

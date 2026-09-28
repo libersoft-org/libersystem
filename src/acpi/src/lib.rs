@@ -329,6 +329,18 @@ impl Gas {
 		Ok(gas)
 	}
 
+	/// Decode twelve bytes that name a register WINDOW rather than one register - the HPET table's base, which
+	/// QEMU and much firmware write with a width of zero, because what it names is the timer's whole block and
+	/// not a register of it. The access size is still checked; the half-register rule is not the window's.
+	pub fn decode_window(bytes: &[u8]) -> Result<Self, Error> {
+		if bytes.len() < GAS_LEN {
+			return Err(Error::GasTruncated);
+		}
+		let access = AccessSize::decode(bytes[3]).ok_or(Error::GasAccessSize)?;
+		let address = u64::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11]]);
+		Ok(Gas { space: AddressSpace::decode(bytes[0]), bit_width: bytes[1], bit_offset: bytes[2], access, address })
+	}
+
 	/// Whether the structure describes no register at all.
 	pub const fn is_absent(&self) -> bool {
 		self.address == 0 && self.bit_width == 0 && self.bit_offset == 0
@@ -1072,7 +1084,8 @@ pub struct Hpet {
 impl Hpet {
 	pub fn new(bytes: &[u8]) -> Result<Self, Error> {
 		let table = Table::with_signature(bytes, b"HPET")?;
-		Ok(Hpet { block_id: table.u32_at(36).ok_or(Error::TooShort)?, base: table.gas_at(40).ok_or(Error::TooShort)??, number: table.u8_at(52).ok_or(Error::TooShort)? })
+		let base = Gas::decode_window(table.bytes().get(40..40 + GAS_LEN).ok_or(Error::TooShort)?)?;
+		Ok(Hpet { block_id: table.u32_at(36).ok_or(Error::TooShort)?, base, number: table.u8_at(52).ok_or(Error::TooShort)? })
 	}
 }
 
@@ -1136,6 +1149,65 @@ impl Bgrt {
 		let table = Table::with_signature(bytes, b"BGRT")?;
 		Ok(Bgrt { status: table.u8_at(38).ok_or(Error::TooShort)?, image_type: table.u8_at(39).ok_or(Error::TooShort)?, image_address: table.u64_at(40).ok_or(Error::TooShort)?, x: table.u32_at(48).ok_or(Error::TooShort)?, y: table.u32_at(52).ok_or(Error::TooShort)? })
 	}
+}
+
+/// ONE IOMMU UNIT THE FIRMWARE NAMES: its register window. An Intel DMAR hardware unit (DRHD) or an AMD IVRS
+/// hardware definition (IVHD) - each a device on the machine that remaps DMA, and one this kernel accounts for
+/// whether or not it drives it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IommuUnit {
+	pub base: u64,
+	pub len: u64,
+	pub segment: u16,
+}
+
+// Where the remapping structures of a DMAR and the blocks of an IVRS begin: past the header and each
+// table's own twelve bytes of fixed fields.
+const IOMMU_STRUCTURES: usize = 48;
+
+// A DRHD states its register window as 2^N pages in the low four bits of its size byte.
+const DMAR_DRHD: u16 = 0;
+
+// The IVHD block types: the original, the one with extended features, and the one with variable-length entries.
+const IVHD_TYPES: [u8; 3] = [0x10, 0x11, 0x40];
+// An AMD IOMMU's register window, which the specification fixes at 16 KiB.
+const IVHD_WINDOW: u64 = 0x4000;
+
+/// EVERY HARDWARE UNIT A DMAR NAMES, in table order. A structure whose length is shorter than its own header,
+/// or runs past the table, ends the walk: the rest cannot be read without trusting a length that was wrong.
+pub fn dmar_units(bytes: &[u8], mut visit: impl FnMut(IommuUnit)) -> Result<(), Error> {
+	let table = Table::with_signature(bytes, b"DMAR")?;
+	let mut at = IOMMU_STRUCTURES;
+	while let (Some(kind), Some(length)) = (table.u16_at(at), table.u16_at(at + 2)) {
+		let length = length as usize;
+		if length < 4 || at + length > table.len() {
+			return Err(Error::TooShort);
+		}
+		if kind == DMAR_DRHD && length >= 16 {
+			let (Some(size), Some(segment), Some(base)) = (table.u8_at(at + 5), table.u16_at(at + 6), table.u64_at(at + 8)) else { return Err(Error::TooShort) };
+			visit(IommuUnit { base, len: 0x1000u64 << (size & 0xf), segment });
+		}
+		at += length;
+	}
+	Ok(())
+}
+
+/// EVERY HARDWARE DEFINITION AN IVRS NAMES, in table order, by the same rule.
+pub fn ivrs_units(bytes: &[u8], mut visit: impl FnMut(IommuUnit)) -> Result<(), Error> {
+	let table = Table::with_signature(bytes, b"IVRS")?;
+	let mut at = IOMMU_STRUCTURES;
+	while let (Some(kind), Some(length)) = (table.u8_at(at), table.u16_at(at + 2)) {
+		let length = length as usize;
+		if length < 4 || at + length > table.len() {
+			return Err(Error::TooShort);
+		}
+		if IVHD_TYPES.contains(&kind) && length >= 24 {
+			let (Some(base), Some(segment)) = (table.u64_at(at + 8), table.u16_at(at + 16)) else { return Err(Error::TooShort) };
+			visit(IommuUnit { base, len: IVHD_WINDOW, segment });
+		}
+		at += length;
+	}
+	Ok(())
 }
 
 #[cfg(test)]

@@ -88,7 +88,7 @@ fn a_timeout_armed_on_another_core_expires_on_time_while_the_boot_processor_slee
 	WOKE.store(0, Ordering::SeqCst);
 	// Output left in the ring caps an idle core's sleep at a tick, which would wake the BSP on time for
 	// nothing: emptied first, and nothing is printed until the drain returns.
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	let ipi_before = super::info(0).map_or(0, |record| record.wakes_ipi);
 	sched::spawn(holder, 0);
 	let waiter_thread = sched::spawn_on(1, waiter, 0);
@@ -160,7 +160,7 @@ fn a_thread_made_runnable_between_the_last_check_and_the_halt_runs_within_a_tick
 	FINISHED.store(false, Ordering::SeqCst);
 	let thread = prepared(stamp);
 	*THREAD.lock() = Some(thread.clone());
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	sched::spawn(holder, 0);
 	let placer_thread = sched::spawn_on(1, placer, 0);
 	// THE NEXT HALT THE BOOT PROCESSOR MAKES is the drain's deadline wait below, with the holder parked.
@@ -225,7 +225,7 @@ fn a_one_shot_that_expires_between_the_last_check_and_the_halt_ends_the_halt() {
 	RAN.store(0, Ordering::SeqCst);
 	RESCUED.store(false, Ordering::SeqCst);
 	FINISHED.store(false, Ordering::SeqCst);
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	let sleeper_thread = sched::spawn(sleeper, 0);
 	let rescuer_thread = sched::spawn_on(1, rescuer, 0);
 	super::in_the_next_window(0, in_the_window);
@@ -269,7 +269,7 @@ fn a_transmit_burst_from_a_core_that_goes_idle_reaches_the_wire_whole() {
 	}
 	ACCEPTED.store(0, Ordering::SeqCst);
 	WRITTEN.store(false, Ordering::SeqCst);
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	arch::serial::pace(true);
 	let thread = sched::spawn_on(1, writer, 0);
 	let saved = arch::interrupts_enabled();
@@ -283,7 +283,7 @@ fn a_transmit_burst_from_a_core_that_goes_idle_reaches_the_wire_whole() {
 	}
 	arch::serial::pace(false);
 	gone(thread);
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	assert!(written, "the writer on core 1 never ran");
 	assert_eq!(ACCEPTED.load(Ordering::SeqCst), BURST.len() as u64, "the ring took the whole burst");
 	assert!(emptied, "a burst of {} bytes stayed in the ring for 100 ticks after its core went idle", BURST.len());

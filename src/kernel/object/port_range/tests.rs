@@ -169,6 +169,12 @@ const LOOPBACK: u64 = 0;
 const LOOP: u64 = 1;
 #[cfg(target_arch = "x86_64")]
 const WAIT: u64 = 2;
+#[cfg(target_arch = "x86_64")]
+const SCRIPT: u64 = 3;
+
+// The most port writes one script carries.
+#[cfg(target_arch = "x86_64")]
+const SCRIPT_WORDS: usize = 32;
 
 // One ring-3 probe: what it runs, the ports it reaches, the range it maps before it drops to ring 3, and
 // what came back.
@@ -178,6 +184,8 @@ struct Probe {
 	port: AtomicU64,
 	last: AtomicU64,
 	range: SpinLock<Option<Arc<PortRange>>>,
+	// The script probe's port writes: (port << 8) | byte, and how many.
+	script: SpinLock<([u64; SCRIPT_WORDS], usize)>,
 	data: AtomicU64,
 	fault: AtomicU64,
 	read: AtomicU64,
@@ -188,7 +196,21 @@ struct Probe {
 #[cfg(target_arch = "x86_64")]
 impl Probe {
 	const fn new() -> Self {
-		Self { program: AtomicU64::new(0), port: AtomicU64::new(0), last: AtomicU64::new(0), range: SpinLock::new(None), data: AtomicU64::new(0), fault: AtomicU64::new(0), read: AtomicU64::new(0), count: AtomicU64::new(0), done: AtomicBool::new(false) }
+		Self { program: AtomicU64::new(0), port: AtomicU64::new(0), last: AtomicU64::new(0), range: SpinLock::new(None), script: SpinLock::new(([0; SCRIPT_WORDS], 0)), data: AtomicU64::new(0), fault: AtomicU64::new(0), read: AtomicU64::new(0), count: AtomicU64::new(0), done: AtomicBool::new(false) }
+	}
+
+	// A SCRIPT PROBE: `writes` - (port, byte) - made in ring 3 through `range`, and then the probe holds the range,
+	// touching no port, until it is released.
+	fn arm_script(&self, writes: &[(u16, u8)], range: Arc<PortRange>) {
+		assert!(writes.len() <= SCRIPT_WORDS, "a script fits the probe's page");
+		{
+			let mut script = self.script.lock();
+			for (at, &(port, byte)) in writes.iter().enumerate() {
+				script.0[at] = ((port as u64) << 8) | byte as u64;
+			}
+			script.1 = writes.len();
+		}
+		self.arm(SCRIPT, 0, 0, Some(range));
 	}
 
 	fn arm(&self, program: u64, port: u16, last: u16, range: Option<Arc<PortRange>>) {
@@ -266,6 +288,11 @@ extern "C" fn probe_body(slot: u64) {
 		core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE as usize);
 		page.write_volatile(probe.port.load(Ordering::SeqCst));
 		page.add(4).write_volatile(probe.last.load(Ordering::SeqCst));
+		let script = probe.script.lock();
+		page.add(8).write_volatile(script.1 as u64);
+		for at in 0..script.1 {
+			page.add(9 + at).write_volatile(script.0[at]);
+		}
 	}
 	let flags = PRESENT | WRITABLE | USER;
 	crate::arch::paging::map_page(code_va, code, flags);
@@ -274,6 +301,7 @@ extern "C" fn probe_body(slot: u64) {
 	let program = match probe.program.load(Ordering::SeqCst) {
 		LOOPBACK => crate::arch::usermode::program_port_loopback_bytes(),
 		LOOP => crate::arch::usermode::program_port_loop_bytes(),
+		SCRIPT => crate::arch::usermode::program_port_script_bytes(),
 		_ => crate::arch::usermode::program_port_wait_bytes(),
 	};
 	unsafe { crate::arch::paging::copy_to_user_page(code_va, program) };
@@ -670,3 +698,7 @@ fn a_thread_switch_is_measured_with_and_without_a_mapped_range() {
 		crate::serial_println!("switch-cost: {label}: {best} ns per switch (best of three, {} switches each)", 2 * ROUNDS);
 	}
 }
+
+// THE COM1 HANDOFF'S MACHINERY, on the second UART as a second instance of the kernel's 16550 code.
+#[cfg(target_arch = "x86_64")]
+mod handoff;

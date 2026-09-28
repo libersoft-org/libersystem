@@ -55,6 +55,45 @@ pub fn tx_pending() -> bool {
 
 pub fn flush_sync() {}
 
+// THE CONSOLE HANDOFF'S SURFACE, which this port does not have yet. Only x86_64's COM1 is handed to a driver
+// (its claim-scoped row is the one that carries `PLATFORM_FLAG_CONSOLE`), so no row here ever asks; the
+// handoff of this port's own console UART reuses the tap and these rules when it is built, and adds the
+// transmit ring this port's synchronous writer does not have. Every answer below is that refusal.
+pub fn drain_sync() {}
+
+// Nothing to make room in: writes are synchronous.
+pub fn make_room() {}
+
+pub fn write_whole(bytes: &[u8]) -> bool {
+	write_bytes(bytes) == bytes.len()
+}
+
+pub fn console_hand_over(_base: u64, _row: usize, _generation: u64) -> bool {
+	false
+}
+
+pub fn console_hand_back(_base: u64, _quarantined: bool) {}
+
+pub fn console_held_by(_base: u64, _generation: u64) -> bool {
+	false
+}
+
+pub fn console_attach_tap(_base: u64, _generation: u64, _tap: &alloc::sync::Arc<crate::object::console_tap::ConsoleTap>) -> bool {
+	false
+}
+
+pub fn console_tap_read(_base: u64, _generation: u64, _buf: &mut [u8]) -> Option<(usize, u64, usize)> {
+	None
+}
+
+pub fn console_deliver() {}
+
+// No transmit ring, so nothing for the development request to fill.
+#[cfg(liber_development)]
+pub fn console_dropped() -> Option<bool> {
+	None
+}
+
 fn put_byte(b: u8) {
 	unsafe {
 		while core::ptr::read_volatile(reg(LSR)) & LSR_THR_EMPTY == 0 {
@@ -129,6 +168,7 @@ pub fn arm_rx_interrupt(handler: super::interrupts::HandlerFn) -> Result<u32, &'
 		}
 		return Err("the controller did not take the source the device tree names");
 	}
+	super::interrupts::hold_source(route.spec[0]);
 	Ok(eid)
 }
 

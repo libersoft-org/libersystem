@@ -156,8 +156,9 @@ fn the_kernel_registry_is_the_manifest_migration_table() {
 	// (corrected 2026-09-16, corrected again 2026-09-19). `sdhci` was the first and only driver to
 	// declare `none` - its first slice moved every block through the controller's data port, so it
 	// never handed the controller a physical address. ADMA2 took that away: a descriptor table is
-	// memory the CONTROLLER reads, so the entry declares `trusted-untranslated` now and the registry
-	// has no `none` row at all.
+	// memory the CONTROLLER reads, so the entry declares `trusted-untranslated` now. The `none` row is
+	// back with the first driver of a platform row, the TPM's: a platform claim masters nothing, and the
+	// kernel refuses one whose entry declares DMA.
 	//
 	// THAT DOES NOT LEAVE THE POLICY UNTESTED, WHICH IS THE QUESTION AN EMPTY ROW RAISES. What
 	// `none` means is held by `every_mode_and_policy_combination_answers_as_the_matrix_says`, which
@@ -178,6 +179,8 @@ fn the_kernel_registry_is_the_manifest_migration_table() {
 	for name in names {
 		let expected = match name {
 			b"virtio_net" => abi::DMA_POLICY_IOMMU_REQUIRED,
+			// A platform row's driver masters nothing - the kernel refuses a platform claim whose entry declares DMA.
+			b"tpm_driver" | b"uart16550" => abi::DMA_POLICY_NONE,
 			_ => abi::DMA_POLICY_TRUSTED_UNTRANSLATED,
 		};
 		assert_eq!(registry_policy(name), Some(expected as u8), "{} carries the policy it declares", core::str::from_utf8(name).unwrap());

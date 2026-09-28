@@ -23,6 +23,7 @@ channel-client-impl = [
 	"bluetooth-proto/channel-client-impl",
 	"power-proto/channel-client-impl",
 	"smartcard-proto/channel-client-impl",
+	"tpm-proto/channel-client-impl",
 	"modem-proto/channel-client-impl",
 	"modem-device-proto/channel-client-impl",
 	"camera-proto/channel-client-impl",
@@ -60,6 +61,7 @@ shared-image = [
 	"bluetooth-proto/shared-image",
 	"power-proto/shared-image",
 	"smartcard-proto/shared-image",
+	"tpm-proto/shared-image",
 	"modem-proto/shared-image",
 	"modem-device-proto/shared-image",
 	"camera-proto/shared-image",
@@ -106,6 +108,7 @@ base-proto = { path = "../user/libs/protocol/base-proto" }
 bluetooth-proto = { path = "../user/libs/protocol/bluetooth-proto" }
 power-proto = { path = "../user/libs/protocol/power-proto" }
 smartcard-proto = { path = "../user/libs/protocol/smartcard-proto" }
+tpm-proto = { path = "../user/libs/protocol/tpm-proto" }
 modem-proto = { path = "../user/libs/protocol/modem-proto" }
 modem-device-proto = { path = "../user/libs/protocol/modem-device-proto" }
 camera-proto = { path = "../user/libs/protocol/camera-proto" }

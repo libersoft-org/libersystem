@@ -19,7 +19,8 @@
 use ipc_client::ChannelTransport;
 use rt::*;
 
-use proto::system::{config, network, process};
+use proto::codec::Handles;
+use proto::system::{Error, ProviderInfo, ProviderKind, config, console_stream, network, process, provider_catalogue};
 use services::executable;
 use surface::{Client as DisplayClient, Rect, Surface as DisplaySurfaceHandle};
 
@@ -41,6 +42,10 @@ use alloc::vec::Vec;
 // console shares the same `Term`.
 use graphics_core::layout::ImageLayout;
 use term::{CELL_H, CELL_W, Echo, EchoBuf, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
+
+// The console-stream decisions, host-tested in the one crate both ends read: which publication to follow, how a
+// write is cut to the provider's bound, what a refused write means.
+use driver_protocol::console::{self, Follow, Identity, WIRE_VERSION, WriteAnswer, Wrote};
 
 // A DisplayService surface: the raster writes a SHADOW the console owns, and each present acquires
 // an image of the present queue, brings it up to date and submits it.
@@ -269,6 +274,160 @@ const SERIAL_PENDING_MAX: usize = 32768;
 // What the serial mirror prints in place of output it had to drop (see above).
 const SERIAL_GAP_MARKER: &[u8] = b"\n[serial mirror: behind - older output dropped]\n";
 
+// The catalogue connection this service follows the kernel console's UART through: minted for `console-bytes`
+// alone.
+const CAP_CONSOLE_BYTES: &[u8] = b"CONSOLEBYTES";
+
+// THE KERNEL CONSOLE'S UART, WHILE A DRIVER HOLDS IT: its `ConsoleBytes` publication, found through the
+// catalogue under the kernel console's name and no other.
+//
+// The kernel drives COM1 until its driver claims it, and from then on the wire `lab`, the serial shell and
+// every scenario oracle read is the driver's. So the mirror of the foreground terminal goes out as console-
+// stream writes to that driver - each newline as CR LF, as the kernel's own write path puts it on the wire -
+// and what is typed on the wire comes back as received chunks, handled as the serial input the kernel used to
+// feed. When the provider goes away the mirror returns to `SYS_DEBUG_WRITE`, its gap marker first, and the
+// input to the kernel's console channel, which this service never stopped reading.
+//
+// Every field is one attachment and they go together, as the development agent's wire does: a withdrawn
+// provider takes its connection, its stream and its bound with it.
+struct SerialWire {
+	catalogue: u64,
+	subscription: u64,
+	provider: Option<ProviderInfo>,
+	control: u64,
+	stream: u64,
+	max_frame: usize,
+}
+
+// How a mirror write through the driver ended.
+enum Mirrored {
+	All,
+	// The wire stopped taking bytes for now: the backlog stays for a later pass.
+	Again,
+	// The driver went: the attachment is over and the mirror goes back to the kernel.
+	Lost,
+}
+
+impl SerialWire {
+	fn new(catalogue: u64) -> SerialWire {
+		let subscription: u64 = if catalogue == 0 { 0 } else { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::ConsoleBytes).unwrap_or(0) };
+		SerialWire { catalogue, subscription, provider: None, control: 0, stream: 0, max_frame: 0 }
+	}
+
+	fn attached(&self) -> bool {
+		self.control != 0
+	}
+
+	fn held(&self) -> Option<Identity> {
+		self.provider.as_ref().map(|held| Identity { slot: held.slot, provider_generation: held.provider_generation, binding_generation: held.binding_generation })
+	}
+
+	fn detach(&mut self) {
+		if self.stream != 0 {
+			close(self.stream);
+			self.stream = 0;
+		}
+		if self.control != 0 {
+			close(self.control);
+			self.control = 0;
+		}
+		self.provider = None;
+		self.max_frame = 0;
+	}
+
+	// Open the publication, settle the contract's version, and ask for its receive stream.
+	fn attach_to(&mut self, info: &ProviderInfo) -> bool {
+		if self.catalogue == 0 || self.control != 0 || !info.live {
+			return false;
+		}
+		let Some(Ok(control)) = provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(info) else {
+			print(b"ConsoleService: the catalogue refused a connection to the kernel console's UART\n");
+			return false;
+		};
+		let max_frame: usize = match console_stream::Client::new(ChannelTransport { chan: control }).attach(&WIRE_VERSION) {
+			Some(Ok(attachment)) if console::attach(WIRE_VERSION, attachment.version, attachment.max_frame) == (console::Attach::Speak { version: WIRE_VERSION, max_frame: attachment.max_frame }) => attachment.max_frame as usize,
+			_ => {
+				print(b"ConsoleService: the kernel console's UART would not speak this wire version\n");
+				close(control);
+				return false;
+			}
+		};
+		let Some(Ok(stream)) = console_stream::Client::new(ChannelTransport { chan: control }).receive() else {
+			print(b"ConsoleService: the kernel console's UART granted no receive stream\n");
+			close(control);
+			return false;
+		};
+		self.control = control;
+		self.stream = stream;
+		self.max_frame = max_frame;
+		self.provider = Some(info.clone());
+		print(b"ConsoleService: the serial mirror and input go through the kernel console's UART driver\n");
+		true
+	}
+
+	// Every publication the subscription has queued: the kernel console's attached to, its withdrawal
+	// followed. Answers whether the one held was lost.
+	fn poll_catalogue(&mut self, buf: &mut [u8]) -> bool {
+		let mut lost: bool = false;
+		while self.subscription != 0 {
+			let (len, handles) = match try_recv_caps(self.subscription, buf) {
+				PolledCaps::Message { len, handles } => (len, handles),
+				PolledCaps::Empty => break,
+				PolledCaps::Closed => {
+					close(self.subscription);
+					self.subscription = 0;
+					break;
+				}
+			};
+			for &handle in handles.as_slice() {
+				close(handle);
+			}
+			let mut frame_handles: Handles = Handles::new();
+			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else { continue };
+			if info.kind != ProviderKind::ConsoleBytes || !console::selects(info.name.as_bytes(), driver_protocol::provider::KERNEL_CONSOLE_NAME) {
+				continue;
+			}
+			let seen: Identity = Identity { slot: info.slot, provider_generation: info.provider_generation, binding_generation: info.binding_generation };
+			match console::follow(self.held(), seen, info.live) {
+				Follow::Attach => {
+					self.attach_to(&info);
+				}
+				Follow::Detach => {
+					self.detach();
+					lost = true;
+				}
+				Follow::Ignore => {}
+			}
+		}
+		lost
+	}
+
+	// Write `bytes` through the driver in as many calls as its bound needs.
+	fn write(&mut self, bytes: &[u8]) -> Mirrored {
+		let mut at: usize = 0;
+		while let Some((from, to)) = console::write_span(at, bytes.len(), self.max_frame as u32) {
+			if self.control == 0 {
+				return Mirrored::Lost;
+			}
+			let answer: WriteAnswer = match console_stream::Client::new(ChannelTransport { chan: self.control }).write(&bytes[from..to]) {
+				Some(Ok(taken)) => WriteAnswer::Took(taken),
+				Some(Err(Error::Again)) => WriteAnswer::Again,
+				Some(Err(_)) => WriteAnswer::Refused,
+				None => WriteAnswer::NoAnswer,
+			};
+			match console::classify_write(answer, to - from) {
+				Wrote::All => at = to,
+				Wrote::SessionOver => return Mirrored::Again,
+				Wrote::ProviderLost => {
+					self.detach();
+					return Mirrored::Lost;
+				}
+			}
+		}
+		Mirrored::All
+	}
+}
+
 // One virtual terminal: its render state (a cell grid; None when headless), the service
 // end of the console channel its shell writes output to and reads keys from, and the
 // tty line discipline that cooks its keyboard input.
@@ -483,6 +642,8 @@ struct Console {
 	// Set when the serial mirror had to drop old backlog (SERIAL_PENDING_MAX): the next
 	// drain writes the gap marker where the dropped output would have been.
 	serial_gap: bool,
+	// The kernel console's UART driver, while one holds it: where the mirror goes and typed input comes from.
+	wire: SerialWire,
 	// The Tab-completion vocabulary: the shell builtins plus the system volume's bin/
 	// listing (bash's builtins + $PATH), fetched lazily on the first Tab through a fresh
 	// storage connection and cached for the session (None until then; an unreachable
@@ -541,6 +702,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// shell gets its own from the supervisor, and that one dies with it - so without this a
 		// `shutdown` after `exit` had nothing to ask.
 		let admin: u64 = caps.take(CAP_ADMIN);
+		let console_bytes: u64 = caps.take(CAP_CONSOLE_BYTES);
 		drop(caps);
 
 		// 2. Acquire one native-size logical surface for all display VTs. DisplayService
@@ -596,7 +758,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), admin, facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), admin, facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, wire: SerialWire::new(console_bytes), vocab: None };
 		run(&mut console);
 	}
 }
@@ -688,6 +850,17 @@ unsafe fn run(console: &mut Console) -> ! {
 			if have_pointer {
 				waits.push(console.pointer);
 			}
+			// AND THE KERNEL CONSOLE'S UART, while a driver holds it: its publications, and the bytes typed on it.
+			let catalogue_idx: usize = ptr_idx + have_pointer as usize;
+			let have_catalogue: bool = console.wire.subscription != 0;
+			if have_catalogue {
+				waits.push(console.wire.subscription);
+			}
+			let stream_idx: usize = catalogue_idx + have_catalogue as usize;
+			let have_stream: bool = console.wire.stream != 0;
+			if have_stream {
+				waits.push(console.wire.stream);
+			}
 			// Block (~0% CPU) until a channel is ready - a keystroke, VT output, a gpu
 			// RESIZE, or a program-hosted PTY's traffic - or until the caret's blink phase
 			// elapses. The blink deadline is a housekeeping wake (WAIT_PERIODIC): it recurs
@@ -741,6 +914,12 @@ unsafe fn run(console: &mut Console) -> ! {
 						}
 						handle_keys(console, key_bytes, serial_input);
 					}
+				} else if have_catalogue && r == catalogue_idx {
+					if console.wire.poll_catalogue(&mut out) {
+						serial_lost(console);
+					}
+				} else if have_stream && r == stream_idx {
+					serial_input(console);
 				} else if have_display_events && r == display_idx {
 					handle_display_resize(console);
 				} else if have_pointer && r == ptr_idx {
@@ -917,6 +1096,9 @@ fn drain_serial(console: &mut Console) {
 	if console.serial.is_empty() {
 		return;
 	}
+	if console.wire.attached() && drain_through_wire(console) {
+		return;
+	}
 	if console.serial_gap {
 		debug_write(SERIAL_GAP_MARKER);
 		console.serial_gap = false;
@@ -926,6 +1108,77 @@ fn drain_serial(console: &mut Console) {
 		console.serial.consume(accepted);
 		if accepted == 0 || console.serial.is_empty() {
 			break;
+		}
+	}
+}
+
+// THE MIRROR THROUGH THE CONSOLE UART'S DRIVER: the backlog in pieces, each newline as CR LF. Answers false
+// when the driver went, so the caller mirrors the rest through the kernel.
+fn drain_through_wire(console: &mut Console) -> bool {
+	// The most source bytes one piece carries, and so the most one write waits on.
+	const PIECE: usize = 2048;
+	let mut wire: Vec<u8> = Vec::with_capacity(PIECE * 2 + SERIAL_GAP_MARKER.len() * 2);
+	if console.serial_gap {
+		crlf(SERIAL_GAP_MARKER, &mut wire);
+		console.serial_gap = false;
+	}
+	while !console.serial.is_empty() || !wire.is_empty() {
+		let take: usize = console.serial.as_bytes().len().min(PIECE);
+		crlf(&console.serial.as_bytes()[..take], &mut wire);
+		match console.wire.write(&wire) {
+			Mirrored::All => {
+				console.serial.consume(take);
+				wire.clear();
+			}
+			// NOTHING WAS WRITTEN and the bytes stay for the next pass, as a partial debug write's do.
+			Mirrored::Again => return true,
+			Mirrored::Lost => {
+				serial_lost(console);
+				return false;
+			}
+		}
+	}
+	true
+}
+
+// Each newline as CR LF, appended to `out`.
+fn crlf(bytes: &[u8], out: &mut Vec<u8>) {
+	for &byte in bytes {
+		if byte == b'\n' {
+			out.push(b'\r');
+		}
+		out.push(byte);
+	}
+}
+
+// THE DRIVER WENT: the mirror goes back to the kernel's write path, its gap marker first - what was on its way
+// to the driver may not have reached the wire - and input goes back to the kernel's console channel, which this
+// service never stopped reading.
+fn serial_lost(console: &mut Console) {
+	console.wire.detach();
+	debug_write(SERIAL_GAP_MARKER);
+}
+
+// WHAT WAS TYPED ON THE WIRE, from the driver's receive stream: every chunk handled as the serial input the
+// kernel used to feed. A frame that does not decode, or a stream that closed, ends the attachment.
+fn serial_input(console: &mut Console) {
+	while console.wire.stream != 0 && channel_peek(console.wire.stream) >= 0 {
+		match recv_vec_blocking(console.wire.stream) {
+			ReceivedVec::Message { bytes, .. } => {
+				let mut frame_handles: Handles = Handles::new();
+				match console_stream::receive_read(&bytes, &mut frame_handles) {
+					Some(chunk) => handle_keys(console, &chunk.bytes, true),
+					None => {
+						print(b"ConsoleService: a chunk from the kernel console's UART did not decode; the attachment ends\n");
+						serial_lost(console);
+						return;
+					}
+				}
+			}
+			ReceivedVec::Closed | ReceivedVec::Failed => {
+				serial_lost(console);
+				return;
+			}
 		}
 	}
 }

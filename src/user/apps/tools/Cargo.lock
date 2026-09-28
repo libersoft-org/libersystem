@@ -811,6 +811,7 @@ dependencies = [
  "spool-proto",
  "storage-proto",
  "time-proto",
+ "tpm-proto",
  "wire",
 ]
 
@@ -1200,12 +1201,39 @@ dependencies = [
  "text-pipeline",
  "time-client",
  "time-client-provider",
+ "tpm-client",
+ "tpm-client-provider",
  "unicode-bidi",
  "volume-client",
  "volume-client-provider",
  "vorbis",
  "wav",
  "wavpack",
+]
+
+[[package]]
+name = "tpm-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "tpm-proto",
+]
+
+[[package]]
+name = "tpm-client-provider"
+version = "0.0.0"
+dependencies = [
+ "tpm-proto",
+]
+
+[[package]]
+name = "tpm-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
 ]
 
 [[package]]

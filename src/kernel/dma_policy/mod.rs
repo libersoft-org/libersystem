@@ -56,13 +56,24 @@ include!(concat!(env!("OUT_DIR"), "/dma_registry.rs"));
 // manager would, so the claim boundary is the one under test. `edu` has no manifest row and never
 // binds in a shipping system; this entry exists only in a test kernel and declares it
 // `iommu-required`, which is the policy the fixture is about.
+//
+// AND THE PLATFORM ROWS THE SUITE PUBLISHES, which answer to the hardware id `LSKT0001` and to nothing a real
+// machine describes. A platform claim masters nothing, so its entry declares `none`.
 #[cfg(test)]
-const TEST_ENTRIES: [DmaEntry; 4] = [
+const TEST_ENTRIES: [DmaEntry; 5] = [
 	DmaEntry { name: b"synthetic-trusted", policy: abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8, rules: &[SYNTHETIC_RULE] },
 	DmaEntry { name: b"synthetic-none", policy: abi::DMA_POLICY_NONE as u8, rules: &[SYNTHETIC_RULE] },
 	DmaEntry { name: b"synthetic-protected", policy: abi::DMA_POLICY_IOMMU_REQUIRED as u8, rules: &[SYNTHETIC_RULE] },
 	DmaEntry { name: b"edu-fixture", policy: abi::DMA_POLICY_IOMMU_REQUIRED as u8, rules: &[EDU_RULE] },
+	DmaEntry { name: b"synthetic-platform", policy: abi::DMA_POLICY_NONE as u8, rules: &[SYNTHETIC_PLATFORM_RULE] },
 ];
+
+// The hardware id every platform row the suite publishes carries.
+#[cfg(test)]
+pub const SYNTHETIC_PLATFORM_HID: &[u8] = b"LSKT0001";
+
+#[cfg(test)]
+const SYNTHETIC_PLATFORM_RULE: driver_binding::Match = driver_binding::Match { transport: Some(abi::TRANSPORT_PLATFORM), virtio_type: None, class: None, subclass: None, prog_if: None, vendor: None, product: None, address: None, platform: Some(driver_binding::PlatformId::from_bytes(driver_binding::PLATFORM_ID_HID, SYNTHETIC_PLATFORM_HID)) };
 
 #[cfg(test)]
 const SYNTHETIC_RULE: driver_binding::Match = driver_binding::Match { transport: Some(abi::TRANSPORT_PLAIN_PCI), virtio_type: None, class: Some(0xff), subclass: None, prog_if: None, vendor: Some(0xffff), product: Some(0xffff), address: None, platform: None };

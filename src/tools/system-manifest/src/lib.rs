@@ -211,6 +211,8 @@ pub enum ProviderKindName {
 	I2cBus,
 	/// A GPIO CONTROLLER'S INPUT LINES, reached only through connections scoped to one line.
 	GpioLines,
+	/// A TPM 2.0's typed operations, with TpmService its one consumer.
+	Tpm,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -256,6 +258,7 @@ impl ProviderKindName {
 			ProviderKindName::Gamepad => 21,
 			ProviderKindName::I2cBus => 22,
 			ProviderKindName::GpioLines => 23,
+			ProviderKindName::Tpm => 24,
 		}
 	}
 }

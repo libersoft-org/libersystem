@@ -7,6 +7,10 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "acpi"
+version = "0.0.0"
+
+[[package]]
 name = "admin-proto"
 version = "0.0.0"
 dependencies = [
@@ -115,6 +119,7 @@ dependencies = [
  "proto",
  "rt",
  "smartcard-model",
+ "tpm",
  "wire",
 ]
 
@@ -310,6 +315,7 @@ dependencies = [
  "spool-proto",
  "storage-proto",
  "time-proto",
+ "tpm-proto",
  "wire",
 ]
 
@@ -389,6 +395,22 @@ name = "time-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "tpm"
+version = "0.0.0"
+dependencies = [
+ "acpi",
+]
+
+[[package]]
+name = "tpm-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
  "wire",
 ]
 

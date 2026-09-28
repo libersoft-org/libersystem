@@ -232,7 +232,7 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	// THE CONTROL. Nothing else may wake core 1 meanwhile: output left in the serial ring caps an idle
 	// core's sleep at a tick, so the ring is emptied first and core 1 given time to settle into a halt
 	// with no timer at all - and nothing is printed until the control is over.
-	arch::serial::flush_sync();
+	arch::serial::drain_sync();
 	let settle = arch::apic::ticks() + 3;
 	while arch::apic::ticks() < settle {
 		core::hint::spin_loop();

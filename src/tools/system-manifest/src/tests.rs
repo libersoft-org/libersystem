@@ -593,6 +593,10 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// THE IN-GUEST FIXTURES MASTER NOTHING: each binds a QEMU test function only to hold a
 			// binding, never maps it, and publishes what it emulates over ordinary channels.
 			"bt_fixture" | "power_fixture" | "smartcard_fixture" | "modem_fixture" | "camera_fixture" | "midi_fixture" | "admin_fixture" | "gamepad_fixture" => DmaPolicy::None,
+			// A PLATFORM ROW'S DRIVER MASTERS NOTHING, and the kernel refuses a platform claim whose entry declares
+			// DMA: the TPM driver moves every command through the interface's own buffer registers, and the
+			// console UART's driver every byte through its data register.
+			"tpm_driver" | "uart16550" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");

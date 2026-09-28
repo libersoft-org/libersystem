@@ -8,6 +8,11 @@ use std::path::PathBuf;
 
 fn main() {
 	println!("cargo:rerun-if-env-changed=TEST_TAGS");
+	// THE DEVELOPMENT BUILD'S KERNEL REQUESTS are compiled into that build alone: `cfg(liber_development)`.
+	println!("cargo:rustc-check-cfg=cfg(liber_development)");
+	if development_configuration() {
+		println!("cargo:rustc-cfg=liber_development");
+	}
 	select_linker_script();
 	let conf: Vec<(String, String)> = read_product_conf();
 	export_product_metadata(&conf);

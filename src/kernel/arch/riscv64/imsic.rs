@@ -366,11 +366,12 @@ pub fn handle_external() {
 			break;
 		}
 		crate::idle::interrupt(crate::idle::Cause::Device(eid));
-		// THE KERNEL'S OWN WIRED LINES FIRST. An APLIC in MSI delivery mode writes a wired
-		// source's identity into this same file, so a hot-plug port's INTx and a device's MSI-X
-		// arrive by one path and are told apart only by the identity - see `interrupts::WIRED_EID`,
-		// which is outside the window any device is ever given.
-		if !super::interrupts::dispatch_wired(eid) {
+		// THE KERNEL'S OWN WIRED LINES FIRST, THEN THE CLAIMED ONES. An APLIC in MSI delivery mode
+		// writes a wired source's identity into this same file, so a hot-plug port's INTx, a claimed
+		// platform line and a device's MSI-X arrive by one path and are told apart only by the
+		// identity - see `interrupts::WIRED_EID` and the claimed-line window below it, both outside
+		// the window any device's MSI is given.
+		if !super::interrupts::dispatch_wired(eid) && !super::interrupts::signal_line(eid) {
 			super::interrupts::dispatch_msi(eid);
 		}
 	}

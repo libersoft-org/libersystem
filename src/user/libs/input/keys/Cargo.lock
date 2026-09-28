@@ -276,6 +276,7 @@ dependencies = [
  "spool-proto",
  "storage-proto",
  "time-proto",
+ "tpm-proto",
  "wire",
 ]
 
@@ -343,6 +344,15 @@ name = "time-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "tpm-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
  "wire",
 ]
 

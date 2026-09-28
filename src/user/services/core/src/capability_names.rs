@@ -22,6 +22,9 @@ pub const CAP_SMARTCARD_ADMIN: &[u8] = b"SMARTCARDADMIN";
 // which PermissionManager alone resolves for the three minted authorities.
 pub const CAP_MODEM_STATE: &[u8] = b"MODEMSTATE";
 pub const CAP_MODEM_ADMIN: &[u8] = b"MODEMADMIN";
+// TPMSERVICE'S MINTING ROOT, which PermissionManager alone resolves: every TPM grant - observation, measurement
+// or sealing - is a connection minted from it for one component and one task.
+pub const CAP_TPM_ADMIN: &[u8] = b"TPMADMIN";
 pub const CAP_CAMERA: &[u8] = b"CAMERA";
 pub const CAP_CAMERA_ADMIN: &[u8] = b"CAMERAADMIN";
 pub const CAP_MIDI: &[u8] = b"MIDI";

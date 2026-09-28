@@ -485,7 +485,7 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 		// A gamepad provider published - now, or on the kept subscription later - and the driver end of it.
 		fn publish(&mut self, slot: u32) -> alloc::sync::Arc<Channel> {
 			let (driver, client) = Channel::create();
-			let info = device::ProviderInfo { kind: device::ProviderKind::Gamepad, bus: 0, dev: 20, func: 0, binding_generation: 1, slot, provider_generation: 1, name: alloc::string::String::new().into(), live: true };
+			let info = device::ProviderInfo { kind: device::ProviderKind::Gamepad, bus: 0, dev: 20, func: 0, binding_generation: 1, slot, provider_generation: 1, name: alloc::string::String::new().into(), live: true, platform: None };
 			self.providers.push((info.clone(), Some(client)));
 			if self.gamepads.is_some() {
 				self.frame(&info);
@@ -3951,7 +3951,7 @@ mod spool_sink {
 
 	impl Sink {
 		pub(super) fn new(slot: u32, generation: u32, id: &str, details: Option<bool>) -> Sink {
-			let info = device::ProviderInfo { kind: device::ProviderKind::Printer, bus: 0, dev: 9, func: 0, binding_generation: u64::from(generation), slot, provider_generation: generation, name: String::new(), live: true };
+			let info = device::ProviderInfo { kind: device::ProviderKind::Printer, bus: 0, dev: 9, func: 0, binding_generation: u64::from(generation), slot, provider_generation: generation, name: String::new(), live: true, platform: None };
 			Sink { info, device_id: device_id(id), details, server: None, attachment: 0, attached: false, received: Vec::new(), accept: 4096, again: 0, stalled: false, bits: 0x18, fail_write: false, fail_reset: false, resets: 0 }
 		}
 
@@ -4592,7 +4592,7 @@ mod import_rig {
 
 	impl Responder {
 		pub(super) fn new(generation: u32) -> Responder {
-			let info = device::ProviderInfo { kind: device::ProviderKind::PtpTransport, bus: 0, dev: 10, func: 0, binding_generation: u64::from(generation), slot: 5, provider_generation: generation, name: String::new(), live: true };
+			let info = device::ProviderInfo { kind: device::ProviderKind::PtpTransport, bus: 0, dev: 10, func: 0, binding_generation: u64::from(generation), slot: 5, provider_generation: generation, name: String::new(), live: true, platform: None };
 			Responder { info, server: None, events: None, event_seq: 0, attachment: 0, session: None, outbox: None, operations: Vec::new(), cancels: 0, resets: 0, photo_pulls: 0, attached: false }
 		}
 
@@ -5007,7 +5007,7 @@ mod modem_rig {
 
 	impl Modem {
 		pub(super) fn new(slot: u32) -> Modem {
-			let info = device::ProviderInfo { kind: device::ProviderKind::Modem, bus: 0, dev: 28, func: 0, binding_generation: 1, slot, provider_generation: 1, name: String::from("org.libersystem.modem-rig"), live: true };
+			let info = device::ProviderInfo { kind: device::ProviderKind::Modem, bus: 0, dev: 28, func: 0, binding_generation: 1, slot, provider_generation: 1, name: String::from("org.libersystem.modem-rig"), live: true, platform: None };
 			Modem { info, server: None, kept: Vec::new() }
 		}
 

@@ -91,7 +91,10 @@ pub mod gpio;
 pub mod i2c;
 pub mod sdhci;
 pub mod serial_port;
+// THE 16550 REGISTER ENGINE, apart from where the UART is and what clocks it - the console UART's driver is the
+// platform glue around it.
 pub mod snd;
+pub mod uart;
 // THE USB ATTACHED SCSI INFORMATION UNITS: the same SCSI command set as the Bulk-Only path, carried
 // over four pipes joined by a tag instead of two strictly in order. The tag is where a UAS driver is
 // wrong, and it is big-endian in a transport that is little-endian everywhere else.

@@ -19,7 +19,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::device::{self, Service};
-use proto::system::{BindingRecord, DeviceEntry, DeviceType, Error, provider_catalogue};
+use proto::system::{BindingRecord, DeviceEntry, DeviceType, Error, PlatformId, PlatformIdKind, PlatformResource, PlatformResourceKind, PlatformSource, PlatformState, RowKind, provider_catalogue};
 use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/roles_device_service.rs"));
@@ -68,7 +68,68 @@ fn device_entry(i: u64) -> Option<DeviceEntry> {
 	}
 	// The address comes straight from the kernel table, which is what makes a row number
 	// resolvable to a device without asking any service. See `device-entry`.
-	Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, present: info.on_bus != 0, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32 })
+	let mut entry = DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, present: info.on_bus != 0, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32, kind: RowKind::Pci, source: PlatformSource::None, state: PlatformState::None, identity: alloc::string::String::new(), ids: Vec::new(), resources: Vec::new(), unresolved: false };
+	if info.platform.kind == ROW_KIND_PLATFORM {
+		describe_platform(&info, &mut entry);
+	}
+	Some(entry)
+}
+
+// A PLATFORM ROW, AS THE FIRMWARE DESCRIBED IT: where the description came from, who may take the device, its
+// identity and ids, and what a claim of it mints - its MMIO ranges, port ranges and wired lines, then its
+// connections - in the row's order, which is the order a driver is handed them in.
+fn describe_platform(info: &DeviceInfo, entry: &mut DeviceEntry) {
+	let part = &info.platform;
+	entry.kind = RowKind::Platform;
+	entry.source = match part.source {
+		PLATFORM_SOURCE_KERNEL => PlatformSource::Kernel,
+		PLATFORM_SOURCE_TABLE => PlatformSource::Table,
+		PLATFORM_SOURCE_TREE => PlatformSource::Tree,
+		PLATFORM_SOURCE_ACPI => PlatformSource::Acpi,
+		_ => PlatformSource::None,
+	};
+	entry.state = match part.state {
+		PLATFORM_STATE_CLAIMABLE => PlatformState::Claimable,
+		PLATFORM_STATE_KERNEL_HELD => PlatformState::KernelHeld,
+		PLATFORM_STATE_FIRMWARE_HELD => PlatformState::FirmwareHeld,
+		PLATFORM_STATE_RESERVATION => PlatformState::Reservation,
+		_ => PlatformState::None,
+	};
+	entry.identity = alloc::string::String::from_utf8_lossy(part.identity()).into_owned();
+	for id in part.match_ids() {
+		let kind = match id.kind {
+			MATCH_ID_HID => PlatformIdKind::Hid,
+			MATCH_ID_CID => PlatformIdKind::Cid,
+			MATCH_ID_COMPATIBLE => PlatformIdKind::Compatible,
+			MATCH_ID_TABLE => PlatformIdKind::Table,
+			MATCH_ID_CLASS => PlatformIdKind::Class,
+			MATCH_ID_IDENTITY => PlatformIdKind::Identity,
+			MATCH_ID_SMBIOS => PlatformIdKind::Smbios,
+			_ => PlatformIdKind::None,
+		};
+		entry.ids.push(PlatformId { kind, text: alloc::string::String::from_utf8_lossy(id.text()).into_owned() });
+	}
+	let resource = |kind, base: u64, length: u64, level: bool, active_low: bool, controller: u32| PlatformResource { kind, base, length, level, active_low, controller };
+	for range in part.mmio() {
+		entry.resources.push(resource(PlatformResourceKind::Mmio, range.base, range.len, false, false, u32::MAX));
+	}
+	for port in &info.ports[..(info.port_count as usize).min(info.ports.len())] {
+		entry.resources.push(resource(PlatformResourceKind::Ports, u64::from(port.base), u64::from(port.len), false, false, u32::MAX));
+	}
+	for line in part.lines() {
+		entry.resources.push(resource(PlatformResourceKind::Line, u64::from(line.number), 0, line.trigger == LINE_TRIGGER_LEVEL, line.polarity == LINE_POLARITY_LOW, u32::MAX));
+	}
+	for connection in part.connections() {
+		let kind = match connection.kind {
+			CONNECTION_I2C => PlatformResourceKind::I2c,
+			CONNECTION_SPI => PlatformResourceKind::Spi,
+			_ => PlatformResourceKind::GpioLine,
+		};
+		// A GPIO line's trigger is the device tree's own flags: 4 and 8 are levels, 2 and 8 active low.
+		let gpio = connection.kind == CONNECTION_GPIO_LINE;
+		entry.resources.push(resource(kind, u64::from(connection.value), 0, gpio && connection.trigger & 0xc != 0, gpio && connection.trigger & 0xa != 0, connection.controller));
+	}
+	entry.unresolved = part.flags & PLATFORM_FLAG_UNRESOLVED != 0;
 }
 
 // Map a kernel device-type code to the typed device type.

@@ -100,6 +100,24 @@ pub struct DeviceEntry {
 	/// listing shows a disk somebody pulled out as though it were still there, which is the one
 	/// thing an operator asking "what is in this machine" must not be told.
 	pub present: bool,
+	/// WHICH KIND OF ROW THIS IS: a function on the bus, or a device the firmware describes - which has no bus
+	/// address, so its `bus`, `dev` and `func` are zero - and what the firmware says of it. Every field from here
+	/// is a platform row's, and empty for a function. Appended.
+	pub kind: RowKind,
+	pub source: PlatformSource,
+	pub state: PlatformState,
+	/// Its stable name: `kernel:com1`, `table:TPM2#0`, `dt:/soc/serial@10000000`. What a policy is kept
+	/// under, because the row number names whatever the table held this boot.
+	pub identity: String,
+	/// The ids a driver's rule matches it by.
+	pub ids: Vec<PlatformId>,
+	/// What a claim of it mints, in the row's order: its MMIO ranges, port ranges and wired lines, then its
+	/// connections.
+	pub resources: Vec<PlatformResource>,
+	/// Whether its description names something the kernel could not resolve - a clock, reset or regulator
+	/// reference, or an interrupt whose parent is neither the controller it drives nor a GPIO controller - so
+	/// a driver refuses rather than guesses.
+	pub unresolved: bool,
 }
 
 impl DeviceEntry {
@@ -145,6 +163,25 @@ impl DeviceEntry {
 		w.u32(self.dev)?;
 		w.u32(self.func)?;
 		w.boolean(self.present)?;
+		self.kind.write(w)?;
+		self.source.write(w)?;
+		self.state.write(w)?;
+		w.bytes_lp(self.identity.as_bytes())?;
+		if self.ids.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.ids.len() as u16)?;
+		for v0 in self.ids.iter() {
+			v0.write(w)?;
+		}
+		if self.resources.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.resources.len() as u16)?;
+		for v1 in self.resources.iter() {
+			v1.write(w)?;
+		}
+		w.boolean(self.unresolved)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<DeviceEntry> {
@@ -155,7 +192,477 @@ impl DeviceEntry {
 		let dev = r.u32()?;
 		let func = r.u32()?;
 		let present = r.boolean()?;
-		Some(DeviceEntry { index, r#type, mmio_len, bus, dev, func, present })
+		let kind = RowKind::read(r)?;
+		let source = PlatformSource::read(r)?;
+		let state = PlatformState::read(r)?;
+		let identity = {
+			let v2 = r.string_lp()?;
+			(v2.len() <= 64).then_some(v2)?
+		};
+		let ids = {
+			let v3 = r.u16()? as usize;
+			let v3 = (v3 <= 8).then_some(v3)?;
+			let mut v4 = Vec::new();
+			v4.try_reserve_exact(v3).ok()?;
+			for _ in 0..v3 {
+				v4.push(PlatformId::read(r)?);
+			}
+			v4
+		};
+		let resources = {
+			let v5 = r.u16()? as usize;
+			let v5 = (v5 <= 26).then_some(v5)?;
+			let mut v6 = Vec::new();
+			v6.try_reserve_exact(v5).ok()?;
+			for _ in 0..v5 {
+				v6.push(PlatformResource::read(r)?);
+			}
+			v6
+		};
+		let unresolved = r.boolean()?;
+		Some(DeviceEntry { index, r#type, mmio_len, bus, dev, func, present, kind, source, state, identity, ids, resources, unresolved })
+	}
+}
+
+/// A row of the kernel's device table: a PCI function, or a platform device the firmware describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RowKind {
+	Pci = 0,
+	Platform = 1,
+}
+
+impl RowKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<RowKind> {
+		let mut r = Reader::new(bytes);
+		let value = RowKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<RowKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = RowKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<RowKind> {
+		match r.u8()? {
+			0 => Some(RowKind::Pci),
+			1 => Some(RowKind::Platform),
+			_ => None,
+		}
+	}
+}
+
+/// Where a platform device's description came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlatformSource {
+	None = 0,
+	/// The kernel declares it, because it already drives it.
+	Kernel = 1,
+	/// A static ACPI table: `TPM2`, `SPCR`, `DBG2`, `HPET`, `WDAT`.
+	Table = 2,
+	/// The device tree.
+	Tree = 3,
+	/// The ACPI namespace.
+	Acpi = 4,
+}
+
+impl PlatformSource {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PlatformSource> {
+		let mut r = Reader::new(bytes);
+		let value = PlatformSource::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PlatformSource> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PlatformSource::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PlatformSource> {
+		match r.u8()? {
+			0 => Some(PlatformSource::None),
+			1 => Some(PlatformSource::Kernel),
+			2 => Some(PlatformSource::Table),
+			3 => Some(PlatformSource::Tree),
+			4 => Some(PlatformSource::Acpi),
+			_ => None,
+		}
+	}
+}
+
+/// Who may take a platform device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlatformState {
+	None = 0,
+	/// A driver may claim it.
+	Claimable = 1,
+	/// The kernel drives it itself.
+	KernelHeld = 2,
+	/// The firmware owns it.
+	FirmwareHeld = 3,
+	/// A range the firmware reserves, which is never a device.
+	Reservation = 4,
+}
+
+impl PlatformState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PlatformState> {
+		let mut r = Reader::new(bytes);
+		let value = PlatformState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PlatformState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PlatformState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PlatformState> {
+		match r.u8()? {
+			0 => Some(PlatformState::None),
+			1 => Some(PlatformState::Claimable),
+			2 => Some(PlatformState::KernelHeld),
+			3 => Some(PlatformState::FirmwareHeld),
+			4 => Some(PlatformState::Reservation),
+			_ => None,
+		}
+	}
+}
+
+/// The kinds of id a platform device answers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlatformIdKind {
+	None = 0,
+	Hid = 1,
+	Cid = 2,
+	Compatible = 3,
+	Table = 4,
+	Class = 5,
+	/// Another description's identity, merged into this row.
+	Identity = 6,
+	/// The SMBIOS record that agrees with it.
+	Smbios = 7,
+}
+
+impl PlatformIdKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PlatformIdKind> {
+		let mut r = Reader::new(bytes);
+		let value = PlatformIdKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PlatformIdKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PlatformIdKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PlatformIdKind> {
+		match r.u8()? {
+			0 => Some(PlatformIdKind::None),
+			1 => Some(PlatformIdKind::Hid),
+			2 => Some(PlatformIdKind::Cid),
+			3 => Some(PlatformIdKind::Compatible),
+			4 => Some(PlatformIdKind::Table),
+			5 => Some(PlatformIdKind::Class),
+			6 => Some(PlatformIdKind::Identity),
+			7 => Some(PlatformIdKind::Smbios),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlatformId {
+	pub kind: PlatformIdKind,
+	pub text: String,
+}
+
+impl PlatformId {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PlatformId> {
+		let mut r = Reader::new(bytes);
+		let value = PlatformId::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PlatformId> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PlatformId::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.bytes_lp(self.text.as_bytes())?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<PlatformId> {
+		let kind = PlatformIdKind::read(r)?;
+		let text = {
+			let v7 = r.string_lp()?;
+			(v7.len() <= 46).then_some(v7)?
+		};
+		Some(PlatformId { kind, text })
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlatformResourceKind {
+	Mmio = 0,
+	Ports = 1,
+	Line = 2,
+	I2c = 3,
+	Spi = 4,
+	GpioLine = 5,
+}
+
+impl PlatformResourceKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PlatformResourceKind> {
+		let mut r = Reader::new(bytes);
+		let value = PlatformResourceKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PlatformResourceKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PlatformResourceKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PlatformResourceKind> {
+		match r.u8()? {
+			0 => Some(PlatformResourceKind::Mmio),
+			1 => Some(PlatformResourceKind::Ports),
+			2 => Some(PlatformResourceKind::Line),
+			3 => Some(PlatformResourceKind::I2c),
+			4 => Some(PlatformResourceKind::Spi),
+			5 => Some(PlatformResourceKind::GpioLine),
+			_ => None,
+		}
+	}
+}
+
+/// One resource of a platform device.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlatformResource {
+	pub kind: PlatformResourceKind,
+	/// A range's base; a line's number (its GSI, INTID or APLIC source); a connection's bus address or line.
+	pub base: u64,
+	/// A range's length in bytes or ports; zero for a line or a connection.
+	pub length: u64,
+	/// A line's trigger and polarity, and a GPIO line connection's.
+	pub level: bool,
+	pub active_low: bool,
+	/// A connection's controller, by its row; `u32::MAX` where no row carries it.
+	pub controller: u32,
+}
+
+impl PlatformResource {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PlatformResource> {
+		let mut r = Reader::new(bytes);
+		let value = PlatformResource::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PlatformResource> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PlatformResource::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.u64(self.base)?;
+		w.u64(self.length)?;
+		w.boolean(self.level)?;
+		w.boolean(self.active_low)?;
+		w.u32(self.controller)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<PlatformResource> {
+		let kind = PlatformResourceKind::read(r)?;
+		let base = r.u64()?;
+		let length = r.u64()?;
+		let level = r.boolean()?;
+		let active_low = r.boolean()?;
+		let controller = r.u32()?;
+		Some(PlatformResource { kind, base, length, level, active_low, controller })
 	}
 }
 
@@ -367,6 +874,9 @@ pub struct BindingRecord {
 	/// How many resources the bind granted it - the MMIO window, an interrupt, and whatever its
 	/// registry entry asked for.
 	pub resources: u32,
+	/// A PLATFORM DEVICE'S NUMBER - the kernel's row for a device the firmware describes - and none for a PCI
+	/// function, whose identity is `bus`, `dev` and `func`. Appended.
+	pub platform: Option<u32>,
 }
 
 impl BindingRecord {
@@ -417,6 +927,15 @@ impl BindingRecord {
 		w.u32(self.rule)?;
 		w.u32(self.providers)?;
 		w.u32(self.resources)?;
+		match &self.platform {
+			Some(v8) => {
+				w.u8(1)?;
+				w.u32(*v8)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<BindingRecord> {
@@ -432,7 +951,8 @@ impl BindingRecord {
 		let rule = r.u32()?;
 		let providers = r.u32()?;
 		let resources = r.u32()?;
-		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources })
+		let platform = if r.tag()? { Some(r.u32()?) } else { None };
+		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources, platform })
 	}
 }
 
@@ -487,19 +1007,19 @@ pub mod device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v0) => {
+						Ok(v9) => {
 							w.u8(1)?;
-							if v0.len() > u16::MAX as usize {
+							if v9.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v0.len() as u16)?;
-							for v2 in v0.iter() {
-								v2.write(w)?;
+							w.u16(v9.len() as u16)?;
+							for v11 in v9.iter() {
+								v11.write(w)?;
 							}
 						}
-						Err(v1) => {
+						Err(v10) => {
 							w.u8(0)?;
-							v1.write(w)?;
+							v10.write(w)?;
 						}
 					}
 					Some(())
@@ -530,13 +1050,13 @@ pub mod device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v3) => {
+						Ok(v12) => {
 							w.u8(1)?;
-							v3.write(w)?;
+							v12.write(w)?;
 						}
-						Err(v4) => {
+						Err(v13) => {
 							w.u8(0)?;
-							v4.write(w)?;
+							v13.write(w)?;
 						}
 					}
 					Some(())
@@ -566,19 +1086,19 @@ pub mod device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v5) => {
+						Ok(v14) => {
 							w.u8(1)?;
-							if v5.len() > u16::MAX as usize {
+							if v14.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v5.len() as u16)?;
-							for v7 in v5.iter() {
-								v7.write(w)?;
+							w.u16(v14.len() as u16)?;
+							for v16 in v14.iter() {
+								v16.write(w)?;
 							}
 						}
-						Err(v6) => {
+						Err(v15) => {
 							w.u8(0)?;
-							v6.write(w)?;
+							v15.write(w)?;
 						}
 					}
 					Some(())
@@ -708,13 +1228,13 @@ pub mod device {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v8 = r.u16()? as usize;
-						let mut v9 = Vec::new();
-						v9.try_reserve_exact(v8).ok()?;
-						for _ in 0..v8 {
-							v9.push(DeviceEntry::read(r)?);
+						let v17 = r.u16()? as usize;
+						let mut v18 = Vec::new();
+						v18.try_reserve_exact(v17).ok()?;
+						for _ in 0..v17 {
+							v18.push(DeviceEntry::read(r)?);
 						}
-						v9
+						v18
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -785,13 +1305,13 @@ pub mod device {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v10 = r.u16()? as usize;
-						let mut v11 = Vec::new();
-						v11.try_reserve_exact(v10).ok()?;
-						for _ in 0..v10 {
-							v11.push(BindingRecord::read(r)?);
+						let v19 = r.u16()? as usize;
+						let mut v20 = Vec::new();
+						v20.try_reserve_exact(v19).ok()?;
+						for _ in 0..v19 {
+							v20.push(BindingRecord::read(r)?);
 						}
-						v11
+						v20
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -918,6 +1438,9 @@ pub enum ProviderKind {
 	/// A GPIO CONTROLLER'S INPUT LINES, the `liber:gpio-device` contract, under the same rule as `i2c-bus`:
 	/// only scoped connections, each naming one line with its trigger, or for level reads alone.
 	GpioLines = 23,
+	/// A TPM 2.0'S TYPED OPERATIONS, the `liber:tpm` `tpm-device` contract, which TpmService alone consumes.
+	/// Applications reach the TPM through minted `tpm` connections and never through this kind.
+	Tpm = 24,
 }
 
 impl ProviderKind {
@@ -983,6 +1506,7 @@ impl ProviderKind {
 			21 => Some(ProviderKind::Gamepad),
 			22 => Some(ProviderKind::I2cBus),
 			23 => Some(ProviderKind::GpioLines),
+			24 => Some(ProviderKind::Tpm),
 			_ => None,
 		}
 	}
@@ -1019,6 +1543,8 @@ pub struct ProviderInfo {
 	/// called `org.libersystem.diag`" a thing a consumer can ASK for rather than discover by
 	/// connecting to each in turn.
 	pub name: String,
+	/// A PLATFORM DEVICE'S NUMBER, and none for a PCI function - as in `binding-record`. Appended.
+	pub platform: Option<u32>,
 }
 
 impl ProviderInfo {
@@ -1066,6 +1592,15 @@ impl ProviderInfo {
 		w.u32(self.provider_generation)?;
 		w.boolean(self.live)?;
 		w.bytes_lp(self.name.as_bytes())?;
+		match &self.platform {
+			Some(v21) => {
+				w.u8(1)?;
+				w.u32(*v21)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ProviderInfo> {
@@ -1078,10 +1613,11 @@ impl ProviderInfo {
 		let provider_generation = r.u32()?;
 		let live = r.boolean()?;
 		let name = {
-			let v12 = r.string_lp()?;
-			(v12.len() <= 48).then_some(v12)?
+			let v22 = r.string_lp()?;
+			(v22.len() <= 48).then_some(v22)?
 		};
-		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation, live, name })
+		let platform = if r.tag()? { Some(r.u32()?) } else { None };
+		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation, live, name, platform })
 	}
 }
 
@@ -1276,6 +1812,8 @@ pub struct IncidentReport {
 	pub handles_used: u64,
 	pub threads_used: u64,
 	pub dma_used: u64,
+	/// A PLATFORM DEVICE'S NUMBER, and none for a PCI function - as in `binding-record`. Appended.
+	pub platform: Option<u32>,
 }
 
 impl IncidentReport {
@@ -1330,6 +1868,15 @@ impl IncidentReport {
 		w.u64(self.handles_used)?;
 		w.u64(self.threads_used)?;
 		w.u64(self.dma_used)?;
+		match &self.platform {
+			Some(v23) => {
+				w.u8(1)?;
+				w.u32(*v23)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<IncidentReport> {
@@ -1349,7 +1896,8 @@ impl IncidentReport {
 		let handles_used = r.u64()?;
 		let threads_used = r.u64()?;
 		let dma_used = r.u64()?;
-		Some(IncidentReport { present, bus, dev, func, generation, state, cause, last_opcode, silent_for, attempts, domain_known, memory_used, memory_peak, handles_used, threads_used, dma_used })
+		let platform = if r.tag()? { Some(r.u32()?) } else { None };
+		Some(IncidentReport { present, bus, dev, func, generation, state, cause, last_opcode, silent_for, attempts, domain_known, memory_used, memory_peak, handles_used, threads_used, dma_used, platform })
 	}
 }
 
@@ -1405,13 +1953,13 @@ pub mod device_policy_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v13) => {
+						Ok(v24) => {
 							w.u8(1)?;
-							v13.write(w)?;
+							v24.write(w)?;
 						}
-						Err(v14) => {
+						Err(v25) => {
 							w.u8(0)?;
-							v14.write(w)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -1442,13 +1990,13 @@ pub mod device_policy_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v15) => {
+						Ok(v26) => {
 							w.u8(1)?;
-							w.bytes_lp(v15.as_bytes())?;
+							w.bytes_lp(v26.as_bytes())?;
 						}
-						Err(v16) => {
+						Err(v27) => {
 							w.u8(0)?;
-							v16.write(w)?;
+							v27.write(w)?;
 						}
 					}
 					Some(())
@@ -1479,13 +2027,13 @@ pub mod device_policy_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v17) => {
+						Ok(v28) => {
 							w.u8(1)?;
-							v17.write(w)?;
+							v28.write(w)?;
 						}
-						Err(v18) => {
+						Err(v29) => {
 							w.u8(0)?;
-							v18.write(w)?;
+							v29.write(w)?;
 						}
 					}
 					Some(())
@@ -1785,8 +2333,8 @@ pub mod provider_catalogue {
 						return None;
 					}
 					w.u16(result.len() as u16)?;
-					for v19 in result.iter() {
-						v19.write(w)?;
+					for v30 in result.iter() {
+						v30.write(w)?;
 					}
 					Some(())
 				})();
@@ -1809,14 +2357,14 @@ pub mod provider_catalogue {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v20) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							w.set_handle(*v20)?;
+							w.set_handle(*v31)?;
 							w.u32(0)?;
 						}
-						Err(v21) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v21.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -2010,13 +2558,13 @@ pub mod provider_catalogue {
 					return None;
 				}
 				let value = {
-					let v22 = r.u16()? as usize;
-					let mut v23 = Vec::new();
-					v23.try_reserve_exact(v22).ok()?;
-					for _ in 0..v22 {
-						v23.push(BindingRecord::read(r)?);
+					let v33 = r.u16()? as usize;
+					let mut v34 = Vec::new();
+					v34.try_reserve_exact(v33).ok()?;
+					for _ in 0..v33 {
+						v34.push(BindingRecord::read(r)?);
 					}
-					v23
+					v34
 				};
 				r.finish()?;
 				Some(value)
@@ -2151,14 +2699,14 @@ pub mod provider_catalogue_admin {
 		match op {
 			OP_OPEN_CONSUMER => {
 				let kinds = {
-					let v24 = r.u16()? as usize;
-					let v24 = (v24 <= 16).then_some(v24)?;
-					let mut v25 = Vec::new();
-					v25.try_reserve_exact(v24).ok()?;
-					for _ in 0..v24 {
-						v25.push(ProviderKind::read(r)?);
+					let v35 = r.u16()? as usize;
+					let v35 = (v35 <= 16).then_some(v35)?;
+					let mut v36 = Vec::new();
+					v36.try_reserve_exact(v35).ok()?;
+					for _ in 0..v35 {
+						v36.push(ProviderKind::read(r)?);
 					}
-					v25
+					v36
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2167,14 +2715,14 @@ pub mod provider_catalogue_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v26) => {
+						Ok(v37) => {
 							w.u8(1)?;
-							w.set_handle(*v26)?;
+							w.set_handle(*v37)?;
 							w.u32(0)?;
 						}
-						Err(v27) => {
+						Err(v38) => {
 							w.u8(0)?;
-							v27.write(w)?;
+							v38.write(w)?;
 						}
 					}
 					Some(())
@@ -2290,8 +2838,8 @@ pub mod provider_catalogue_admin {
 				return None;
 			}
 			w.u16(kinds.len() as u16)?;
-			for v28 in kinds.iter() {
-				v28.write(w)?;
+			for v39 in kinds.iter() {
+				v39.write(w)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -2551,8 +3099,8 @@ impl HciPacket {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v29 in self.bytes.iter() {
-			w.u8(*v29)?;
+		for v40 in self.bytes.iter() {
+			w.u8(*v40)?;
 		}
 		Some(())
 	}
@@ -2560,14 +3108,14 @@ impl HciPacket {
 		let kind = HciPacketKind::read(r)?;
 		let epoch = r.u32()?;
 		let bytes = {
-			let v30 = r.u16()? as usize;
-			let v30 = (v30 <= 4100).then_some(v30)?;
-			let mut v31 = Vec::new();
-			v31.try_reserve_exact(v30).ok()?;
-			for _ in 0..v30 {
-				v31.push(r.u8()?);
+			let v41 = r.u16()? as usize;
+			let v41 = (v41 <= 4100).then_some(v41)?;
+			let mut v42 = Vec::new();
+			v42.try_reserve_exact(v41).ok()?;
+			for _ in 0..v41 {
+				v42.push(r.u8()?);
 			}
-			v31
+			v42
 		};
 		Some(HciPacket { kind, epoch, bytes })
 	}
@@ -2764,13 +3312,13 @@ pub mod hci_transport {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v32) => {
+						Ok(v43) => {
 							w.u8(1)?;
-							v32.write(w)?;
+							v43.write(w)?;
 						}
-						Err(v33) => {
+						Err(v44) => {
 							w.u8(0)?;
-							v33.write(w)?;
+							v44.write(w)?;
 						}
 					}
 					Some(())
@@ -2795,14 +3343,14 @@ pub mod hci_transport {
 			OP_SEND => {
 				let kind = HciPacketKind::read(r)?;
 				let bytes = {
-					let v34 = r.u16()? as usize;
-					let v34 = (v34 <= 4100).then_some(v34)?;
-					let mut v35 = Vec::new();
-					v35.try_reserve_exact(v34).ok()?;
-					for _ in 0..v34 {
-						v35.push(r.u8()?);
+					let v45 = r.u16()? as usize;
+					let v45 = (v45 <= 4100).then_some(v45)?;
+					let mut v46 = Vec::new();
+					v46.try_reserve_exact(v45).ok()?;
+					for _ in 0..v45 {
+						v46.push(r.u8()?);
 					}
-					v35
+					v46
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2811,13 +3359,13 @@ pub mod hci_transport {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v36) => {
+						Ok(v47) => {
 							w.u8(1)?;
-							w.u32(*v36)?;
+							w.u32(*v47)?;
 						}
-						Err(v37) => {
+						Err(v48) => {
 							w.u8(0)?;
-							v37.write(w)?;
+							v48.write(w)?;
 						}
 					}
 					Some(())
@@ -2847,13 +3395,13 @@ pub mod hci_transport {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v38) => {
+						Ok(v49) => {
 							w.u8(1)?;
-							w.u32(*v38)?;
+							w.u32(*v49)?;
 						}
-						Err(v39) => {
+						Err(v50) => {
 							w.u8(0)?;
-							v39.write(w)?;
+							v50.write(w)?;
 						}
 					}
 					Some(())
@@ -3077,8 +3625,8 @@ pub mod hci_transport {
 				return None;
 			}
 			w.u16(bytes.len() as u16)?;
-			for v40 in bytes.iter() {
-				w.u8(*v40)?;
+			for v51 in bytes.iter() {
+				w.u8(*v51)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -3346,21 +3894,21 @@ impl ConsoleChunk {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v41 in self.bytes.iter() {
-			w.u8(*v41)?;
+		for v52 in self.bytes.iter() {
+			w.u8(*v52)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ConsoleChunk> {
 		let bytes = {
-			let v42 = r.u16()? as usize;
-			let v42 = (v42 <= 4096).then_some(v42)?;
-			let mut v43 = Vec::new();
-			v43.try_reserve_exact(v42).ok()?;
-			for _ in 0..v42 {
-				v43.push(r.u8()?);
+			let v53 = r.u16()? as usize;
+			let v53 = (v53 <= 4096).then_some(v53)?;
+			let mut v54 = Vec::new();
+			v54.try_reserve_exact(v53).ok()?;
+			for _ in 0..v53 {
+				v54.push(r.u8()?);
 			}
-			v43
+			v54
 		};
 		Some(ConsoleChunk { bytes })
 	}
@@ -3431,13 +3979,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v44) => {
+						Ok(v55) => {
 							w.u8(1)?;
-							v44.write(w)?;
+							v55.write(w)?;
 						}
-						Err(v45) => {
+						Err(v56) => {
 							w.u8(0)?;
-							v45.write(w)?;
+							v56.write(w)?;
 						}
 					}
 					Some(())
@@ -3461,14 +4009,14 @@ pub mod console_stream {
 			}
 			OP_WRITE => {
 				let bytes = {
-					let v46 = r.u16()? as usize;
-					let v46 = (v46 <= 65535).then_some(v46)?;
-					let mut v47 = Vec::new();
-					v47.try_reserve_exact(v46).ok()?;
-					for _ in 0..v46 {
-						v47.push(r.u8()?);
+					let v57 = r.u16()? as usize;
+					let v57 = (v57 <= 65535).then_some(v57)?;
+					let mut v58 = Vec::new();
+					v58.try_reserve_exact(v57).ok()?;
+					for _ in 0..v57 {
+						v58.push(r.u8()?);
 					}
-					v47
+					v58
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -3477,13 +4025,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v48) => {
+						Ok(v59) => {
 							w.u8(1)?;
-							w.u32(*v48)?;
+							w.u32(*v59)?;
 						}
-						Err(v49) => {
+						Err(v60) => {
 							w.u8(0)?;
-							v49.write(w)?;
+							v60.write(w)?;
 						}
 					}
 					Some(())
@@ -3685,8 +4233,8 @@ pub mod console_stream {
 				return None;
 			}
 			w.u16(bytes.len() as u16)?;
-			for v50 in bytes.iter() {
-				w.u8(*v50)?;
+			for v61 in bytes.iter() {
+				w.u8(*v61)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -3895,19 +4443,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v51) => {
+						Ok(v62) => {
 							w.u8(1)?;
-							if v51.len() > u16::MAX as usize {
+							if v62.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v51.len() as u16)?;
-							for v53 in v51.iter() {
-								v53.write(w)?;
+							w.u16(v62.len() as u16)?;
+							for v64 in v62.iter() {
+								v64.write(w)?;
 							}
 						}
-						Err(v52) => {
+						Err(v63) => {
 							w.u8(0)?;
-							v52.write(w)?;
+							v63.write(w)?;
 						}
 					}
 					Some(())
@@ -4037,13 +4585,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v54 = r.u16()? as usize;
-						let mut v55 = Vec::new();
-						v55.try_reserve_exact(v54).ok()?;
-						for _ in 0..v54 {
-							v55.push(UsbDevice::read(r)?);
+						let v65 = r.u16()? as usize;
+						let mut v66 = Vec::new();
+						v66.try_reserve_exact(v65).ok()?;
+						for _ in 0..v65 {
+							v66.push(UsbDevice::read(r)?);
 						}
-						v55
+						v66
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -4155,6 +4703,49 @@ impl DeviceEntry {
 		} else {
 			out.push_str("false");
 		}
+		out.push(',');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"source\":");
+		self.source.to_json_into(out);
+		out.push(',');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"identity\":");
+		crate::codec::json_escape(&self.identity, out);
+		out.push(',');
+		out.push_str("\"ids\":");
+		out.push('[');
+		let mut v68 = true;
+		for v67 in self.ids.iter() {
+			if !v68 {
+				out.push(',');
+			}
+			v68 = false;
+			v67.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"resources\":");
+		out.push('[');
+		let mut v70 = true;
+		for v69 in self.resources.iter() {
+			if !v70 {
+				out.push(',');
+			}
+			v70 = false;
+			v69.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"unresolved\":");
+		if self.unresolved {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4183,10 +4774,53 @@ impl DeviceEntry {
 		} else {
 			out.push_str("false");
 		}
+		out.push_str(", ");
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("source=");
+		self.source.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("identity=");
+		out.push_str(&self.identity);
+		out.push_str(", ");
+		out.push_str("ids=");
+		out.push('[');
+		let mut v72 = true;
+		for v71 in self.ids.iter() {
+			if !v72 {
+				out.push_str(", ");
+			}
+			v72 = false;
+			v71.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("resources=");
+		out.push('[');
+		let mut v74 = true;
+		for v73 in self.resources.iter() {
+			if !v74 {
+				out.push_str(", ");
+			}
+			v74 = false;
+			v73.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("unresolved=");
+		if self.unresolved {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::map(out, 14);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "type");
@@ -4201,6 +4835,388 @@ impl DeviceEntry {
 		crate::codec::cbor::uint(out, self.func as u64);
 		crate::codec::cbor::text(out, "present");
 		crate::codec::cbor::boolean(out, self.present);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "source");
+		self.source.to_cbor_into(out);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "identity");
+		crate::codec::cbor::text(out, &self.identity);
+		crate::codec::cbor::text(out, "ids");
+		crate::codec::cbor::array(out, self.ids.len());
+		for v75 in self.ids.iter() {
+			v75.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "resources");
+		crate::codec::cbor::array(out, self.resources.len());
+		for v76 in self.resources.iter() {
+			v76.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "unresolved");
+		crate::codec::cbor::boolean(out, self.unresolved);
+	}
+}
+
+impl RowKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			RowKind::Pci => out.push_str("\"pci\""),
+			RowKind::Platform => out.push_str("\"platform\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			RowKind::Pci => out.push_str("pci"),
+			RowKind::Platform => out.push_str("platform"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			RowKind::Pci => crate::codec::cbor::text(out, "pci"),
+			RowKind::Platform => crate::codec::cbor::text(out, "platform"),
+		}
+	}
+}
+
+impl PlatformSource {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			PlatformSource::None => out.push_str("\"none\""),
+			PlatformSource::Kernel => out.push_str("\"kernel\""),
+			PlatformSource::Table => out.push_str("\"table\""),
+			PlatformSource::Tree => out.push_str("\"tree\""),
+			PlatformSource::Acpi => out.push_str("\"acpi\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			PlatformSource::None => out.push_str("none"),
+			PlatformSource::Kernel => out.push_str("kernel"),
+			PlatformSource::Table => out.push_str("table"),
+			PlatformSource::Tree => out.push_str("tree"),
+			PlatformSource::Acpi => out.push_str("acpi"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PlatformSource::None => crate::codec::cbor::text(out, "none"),
+			PlatformSource::Kernel => crate::codec::cbor::text(out, "kernel"),
+			PlatformSource::Table => crate::codec::cbor::text(out, "table"),
+			PlatformSource::Tree => crate::codec::cbor::text(out, "tree"),
+			PlatformSource::Acpi => crate::codec::cbor::text(out, "acpi"),
+		}
+	}
+}
+
+impl PlatformState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			PlatformState::None => out.push_str("\"none\""),
+			PlatformState::Claimable => out.push_str("\"claimable\""),
+			PlatformState::KernelHeld => out.push_str("\"kernel-held\""),
+			PlatformState::FirmwareHeld => out.push_str("\"firmware-held\""),
+			PlatformState::Reservation => out.push_str("\"reservation\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			PlatformState::None => out.push_str("none"),
+			PlatformState::Claimable => out.push_str("claimable"),
+			PlatformState::KernelHeld => out.push_str("kernel-held"),
+			PlatformState::FirmwareHeld => out.push_str("firmware-held"),
+			PlatformState::Reservation => out.push_str("reservation"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PlatformState::None => crate::codec::cbor::text(out, "none"),
+			PlatformState::Claimable => crate::codec::cbor::text(out, "claimable"),
+			PlatformState::KernelHeld => crate::codec::cbor::text(out, "kernel-held"),
+			PlatformState::FirmwareHeld => crate::codec::cbor::text(out, "firmware-held"),
+			PlatformState::Reservation => crate::codec::cbor::text(out, "reservation"),
+		}
+	}
+}
+
+impl PlatformIdKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			PlatformIdKind::None => out.push_str("\"none\""),
+			PlatformIdKind::Hid => out.push_str("\"hid\""),
+			PlatformIdKind::Cid => out.push_str("\"cid\""),
+			PlatformIdKind::Compatible => out.push_str("\"compatible\""),
+			PlatformIdKind::Table => out.push_str("\"table\""),
+			PlatformIdKind::Class => out.push_str("\"class\""),
+			PlatformIdKind::Identity => out.push_str("\"identity\""),
+			PlatformIdKind::Smbios => out.push_str("\"smbios\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			PlatformIdKind::None => out.push_str("none"),
+			PlatformIdKind::Hid => out.push_str("hid"),
+			PlatformIdKind::Cid => out.push_str("cid"),
+			PlatformIdKind::Compatible => out.push_str("compatible"),
+			PlatformIdKind::Table => out.push_str("table"),
+			PlatformIdKind::Class => out.push_str("class"),
+			PlatformIdKind::Identity => out.push_str("identity"),
+			PlatformIdKind::Smbios => out.push_str("smbios"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PlatformIdKind::None => crate::codec::cbor::text(out, "none"),
+			PlatformIdKind::Hid => crate::codec::cbor::text(out, "hid"),
+			PlatformIdKind::Cid => crate::codec::cbor::text(out, "cid"),
+			PlatformIdKind::Compatible => crate::codec::cbor::text(out, "compatible"),
+			PlatformIdKind::Table => crate::codec::cbor::text(out, "table"),
+			PlatformIdKind::Class => crate::codec::cbor::text(out, "class"),
+			PlatformIdKind::Identity => crate::codec::cbor::text(out, "identity"),
+			PlatformIdKind::Smbios => crate::codec::cbor::text(out, "smbios"),
+		}
+	}
+}
+
+impl PlatformId {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"text\":");
+		crate::codec::json_escape(&self.text, out);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("text=");
+		out.push_str(&self.text);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "text");
+		crate::codec::cbor::text(out, &self.text);
+	}
+}
+
+impl PlatformResourceKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			PlatformResourceKind::Mmio => out.push_str("\"mmio\""),
+			PlatformResourceKind::Ports => out.push_str("\"ports\""),
+			PlatformResourceKind::Line => out.push_str("\"line\""),
+			PlatformResourceKind::I2c => out.push_str("\"i2c\""),
+			PlatformResourceKind::Spi => out.push_str("\"spi\""),
+			PlatformResourceKind::GpioLine => out.push_str("\"gpio-line\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			PlatformResourceKind::Mmio => out.push_str("mmio"),
+			PlatformResourceKind::Ports => out.push_str("ports"),
+			PlatformResourceKind::Line => out.push_str("line"),
+			PlatformResourceKind::I2c => out.push_str("i2c"),
+			PlatformResourceKind::Spi => out.push_str("spi"),
+			PlatformResourceKind::GpioLine => out.push_str("gpio-line"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PlatformResourceKind::Mmio => crate::codec::cbor::text(out, "mmio"),
+			PlatformResourceKind::Ports => crate::codec::cbor::text(out, "ports"),
+			PlatformResourceKind::Line => crate::codec::cbor::text(out, "line"),
+			PlatformResourceKind::I2c => crate::codec::cbor::text(out, "i2c"),
+			PlatformResourceKind::Spi => crate::codec::cbor::text(out, "spi"),
+			PlatformResourceKind::GpioLine => crate::codec::cbor::text(out, "gpio-line"),
+		}
+	}
+}
+
+impl PlatformResource {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"base\":");
+		let _ = write!(out, "{}", self.base);
+		out.push(',');
+		out.push_str("\"length\":");
+		let _ = write!(out, "{}", self.length);
+		out.push(',');
+		out.push_str("\"level\":");
+		if self.level {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"active-low\":");
+		if self.active_low {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"controller\":");
+		let _ = write!(out, "{}", self.controller);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("base=");
+		let _ = write!(out, "{}", self.base);
+		out.push_str(", ");
+		out.push_str("length=");
+		let _ = write!(out, "{}", self.length);
+		out.push_str(", ");
+		out.push_str("level=");
+		if self.level {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("active-low=");
+		if self.active_low {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("controller=");
+		let _ = write!(out, "{}", self.controller);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "base");
+		crate::codec::cbor::uint(out, self.base as u64);
+		crate::codec::cbor::text(out, "length");
+		crate::codec::cbor::uint(out, self.length as u64);
+		crate::codec::cbor::text(out, "level");
+		crate::codec::cbor::boolean(out, self.level);
+		crate::codec::cbor::text(out, "active-low");
+		crate::codec::cbor::boolean(out, self.active_low);
+		crate::codec::cbor::text(out, "controller");
+		crate::codec::cbor::uint(out, self.controller as u64);
 	}
 }
 
@@ -4386,6 +5402,16 @@ impl BindingRecord {
 		out.push(',');
 		out.push_str("\"resources\":");
 		let _ = write!(out, "{}", self.resources);
+		out.push(',');
+		out.push_str("\"platform\":");
+		match &self.platform {
+			Some(v77) => {
+				let _ = write!(out, "{}", v77);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4425,10 +5451,20 @@ impl BindingRecord {
 		out.push_str(", ");
 		out.push_str("resources=");
 		let _ = write!(out, "{}", self.resources);
+		out.push_str(", ");
+		out.push_str("platform=");
+		match &self.platform {
+			Some(v78) => {
+				let _ = write!(out, "{}", v78);
+			}
+			None => {
+				out.push('-');
+			}
+		}
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 12);
+		crate::codec::cbor::map(out, 13);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "bus");
@@ -4453,6 +5489,15 @@ impl BindingRecord {
 		crate::codec::cbor::uint(out, self.providers as u64);
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::uint(out, self.resources as u64);
+		crate::codec::cbor::text(out, "platform");
+		match &self.platform {
+			Some(v79) => {
+				crate::codec::cbor::uint(out, *v79 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
 	}
 }
 
@@ -4497,6 +5542,7 @@ impl ProviderKind {
 			ProviderKind::Gamepad => out.push_str("\"gamepad\""),
 			ProviderKind::I2cBus => out.push_str("\"i2c-bus\""),
 			ProviderKind::GpioLines => out.push_str("\"gpio-lines\""),
+			ProviderKind::Tpm => out.push_str("\"tpm\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4524,6 +5570,7 @@ impl ProviderKind {
 			ProviderKind::Gamepad => out.push_str("gamepad"),
 			ProviderKind::I2cBus => out.push_str("i2c-bus"),
 			ProviderKind::GpioLines => out.push_str("gpio-lines"),
+			ProviderKind::Tpm => out.push_str("tpm"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -4551,6 +5598,7 @@ impl ProviderKind {
 			ProviderKind::Gamepad => crate::codec::cbor::text(out, "gamepad"),
 			ProviderKind::I2cBus => crate::codec::cbor::text(out, "i2c-bus"),
 			ProviderKind::GpioLines => crate::codec::cbor::text(out, "gpio-lines"),
+			ProviderKind::Tpm => crate::codec::cbor::text(out, "tpm"),
 		}
 	}
 }
@@ -4603,6 +5651,16 @@ impl ProviderInfo {
 		out.push(',');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"platform\":");
+		match &self.platform {
+			Some(v80) => {
+				let _ = write!(out, "{}", v80);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4637,10 +5695,20 @@ impl ProviderInfo {
 		out.push_str(", ");
 		out.push_str("name=");
 		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("platform=");
+		match &self.platform {
+			Some(v81) => {
+				let _ = write!(out, "{}", v81);
+			}
+			None => {
+				out.push('-');
+			}
+		}
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 9);
+		crate::codec::cbor::map(out, 10);
 		crate::codec::cbor::text(out, "kind");
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bus");
@@ -4659,6 +5727,15 @@ impl ProviderInfo {
 		crate::codec::cbor::boolean(out, self.live);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "platform");
+		match &self.platform {
+			Some(v82) => {
+				crate::codec::cbor::uint(out, *v82 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
 	}
 }
 
@@ -4828,6 +5905,16 @@ impl IncidentReport {
 		out.push(',');
 		out.push_str("\"dma-used\":");
 		let _ = write!(out, "{}", self.dma_used);
+		out.push(',');
+		out.push_str("\"platform\":");
+		match &self.platform {
+			Some(v83) => {
+				let _ = write!(out, "{}", v83);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4887,10 +5974,20 @@ impl IncidentReport {
 		out.push_str(", ");
 		out.push_str("dma-used=");
 		let _ = write!(out, "{}", self.dma_used);
+		out.push_str(", ");
+		out.push_str("platform=");
+		match &self.platform {
+			Some(v84) => {
+				let _ = write!(out, "{}", v84);
+			}
+			None => {
+				out.push('-');
+			}
+		}
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 16);
+		crate::codec::cbor::map(out, 17);
 		crate::codec::cbor::text(out, "present");
 		crate::codec::cbor::boolean(out, self.present);
 		crate::codec::cbor::text(out, "bus");
@@ -4923,6 +6020,15 @@ impl IncidentReport {
 		crate::codec::cbor::uint(out, self.threads_used as u64);
 		crate::codec::cbor::text(out, "dma-used");
 		crate::codec::cbor::uint(out, self.dma_used as u64);
+		crate::codec::cbor::text(out, "platform");
+		match &self.platform {
+			Some(v85) => {
+				crate::codec::cbor::uint(out, *v85 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
 	}
 }
 
@@ -5109,13 +6215,13 @@ impl HciPacket {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v57 = true;
-		for v56 in self.bytes.iter() {
-			if !v57 {
+		let mut v87 = true;
+		for v86 in self.bytes.iter() {
+			if !v87 {
 				out.push(',');
 			}
-			v57 = false;
-			let _ = write!(out, "{}", v56);
+			v87 = false;
+			let _ = write!(out, "{}", v86);
 		}
 		out.push(']');
 		out.push('}');
@@ -5130,13 +6236,13 @@ impl HciPacket {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v59 = true;
-		for v58 in self.bytes.iter() {
-			if !v59 {
+		let mut v89 = true;
+		for v88 in self.bytes.iter() {
+			if !v89 {
 				out.push_str(", ");
 			}
-			v59 = false;
-			let _ = write!(out, "{}", v58);
+			v89 = false;
+			let _ = write!(out, "{}", v88);
 		}
 		out.push(']');
 		out.push('}');
@@ -5149,8 +6255,8 @@ impl HciPacket {
 		crate::codec::cbor::uint(out, self.epoch as u64);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v60 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v60 as u64);
+		for v90 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v90 as u64);
 		}
 	}
 }
@@ -5300,13 +6406,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v62 = true;
-		for v61 in self.bytes.iter() {
-			if !v62 {
+		let mut v92 = true;
+		for v91 in self.bytes.iter() {
+			if !v92 {
 				out.push(',');
 			}
-			v62 = false;
-			let _ = write!(out, "{}", v61);
+			v92 = false;
+			let _ = write!(out, "{}", v91);
 		}
 		out.push(']');
 		out.push('}');
@@ -5315,13 +6421,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v64 = true;
-		for v63 in self.bytes.iter() {
-			if !v64 {
+		let mut v94 = true;
+		for v93 in self.bytes.iter() {
+			if !v94 {
 				out.push_str(", ");
 			}
-			v64 = false;
-			let _ = write!(out, "{}", v63);
+			v94 = false;
+			let _ = write!(out, "{}", v93);
 		}
 		out.push(']');
 		out.push('}');
@@ -5330,8 +6436,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v65 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v65 as u64);
+		for v95 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v95 as u64);
 		}
 	}
 }

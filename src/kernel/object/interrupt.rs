@@ -30,12 +30,24 @@ pub struct Interrupt {
 	// REVOKED: the claim this was derived from has been released, and this object's authority ended
 	// with it. Set by `revoke`, never cleared - a revoked interrupt does not come back.
 	revoked: AtomicBool,
+	// Every delivery the dispatch path made, revoked or not - what lets the suite see a level line that
+	// was not masked re-fire, and a released line that was not silenced fire at all.
+	#[cfg(test)]
+	signals: core::sync::atomic::AtomicU32,
 }
 
 impl Interrupt {
 	// FALLIBLY: `SYS_IRQ_BIND` and `SYS_DEVICE_MSIX_ACQUIRE` reach this.
 	pub fn new(vector: u32) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), vector, pending: AtomicBool::new(false), bound: AtomicBool::new(false), revoked: AtomicBool::new(false) })
+		crate::mem::heap::try_arc(Self {
+			header: ObjectHeader::new(),
+			vector,
+			pending: AtomicBool::new(false),
+			bound: AtomicBool::new(false),
+			revoked: AtomicBool::new(false),
+			#[cfg(test)]
+			signals: core::sync::atomic::AtomicU32::new(0),
+		})
 	}
 
 	pub fn vector(&self) -> u32 {
@@ -50,6 +62,8 @@ impl Interrupt {
 	// Mark the interrupt pending and wake any thread blocked waiting on it. Called
 	// from the interrupt-dispatch path when the bound vector fires.
 	pub fn signal(&self) {
+		#[cfg(test)]
+		self.signals.fetch_add(1, Ordering::AcqRel);
 		// A REVOKED INTERRUPT IS NOT SIGNALLED. The dispatch table holds this weakly and a driver
 		// that is still running - or a wait that already resolved the object - holds it strongly, so
 		// revoking the capability alone left a live path from a released device's vector into the
@@ -60,6 +74,19 @@ impl Interrupt {
 		}
 		self.pending.store(true, Ordering::Release);
 		sched::wake_object(self.header.koid());
+	}
+
+	// How many times the dispatch path delivered to this object.
+	#[cfg(test)]
+	pub fn signals(&self) -> u32 {
+		self.signals.load(Ordering::Acquire)
+	}
+
+	// WHETHER THIS OBJECT STILL OWNS ITS BINDING: false once a release revoked it or its `Drop` began. An
+	// acknowledgement through an object that no longer owns its vector must not reach the controller - the
+	// vector may be another claim's line by now, and unmasking it would be acknowledging for that driver.
+	pub fn owns_binding(&self) -> bool {
+		self.bound.load(Ordering::Acquire)
 	}
 
 	// Clear the pending flag, re-arming for the next IRQ.

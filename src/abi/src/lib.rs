@@ -598,6 +598,13 @@ pub const RESOURCE_KIND_MMIO: u64 = 2;
 // at its controller when it fires and unmasked by `SYS_INTERRUPT_ACK`, so a source that stays asserted
 // until its driver runs fires once rather than for ever. A line another live claim holds is refused.
 pub const RESOURCE_KIND_LINE: u64 = 3;
+// THE KERNEL CONSOLE'S TAP, for a platform row carrying `PLATFORM_FLAG_CONSOLE` - `index` 0 - answered as a
+// `ConsoleTap` with `RIGHT_READ | RIGHT_WAIT | RIGHT_TRANSFER` and registered as derived from the claim. The
+// claim of such a row took the console UART from the kernel; the kernel's output still goes into its
+// transmit ring, and the tap is how it leaves: `SYS_CONSOLE_TAP_READ` moves it out in order. The tap is
+// ready to wait on when the ring goes from empty to holding bytes. The release revokes it and gives the
+// UART back to the kernel.
+pub const RESOURCE_KIND_CONSOLE_TAP: u64 = 4;
 
 // Where a row's port resource came from.
 //
@@ -1045,6 +1052,10 @@ pub const PLATFORM_FLAG_DMA_STREAM: u8 = 1 << 0;
 // The row's property block lists references the kernel did not resolve - a clock that is not a
 // `fixed-clock`, a reset, a regulator, a pinctrl state - so a driver refuses rather than guesses.
 pub const PLATFORM_FLAG_UNRESOLVED: u8 = 1 << 1;
+// The row is the KERNEL CONSOLE'S UART, which the kernel drives from its first line: claiming it takes the
+// console from the kernel - its ports leave the reserved set for the claim's range and its output leaves
+// through the claim's `RESOURCE_KIND_CONSOLE_TAP` - and the release gives it back.
+pub const PLATFORM_FLAG_CONSOLE: u8 = 1 << 2;
 
 // A PLATFORM ROW'S OWN DESCRIPTION, appended to `DeviceInfo`. All zeros for a PCI row.
 #[repr(C)]
@@ -1299,6 +1310,7 @@ pub const OBJECT_TYPE_PRIVILEGE: u64 = 12;
 pub const OBJECT_TYPE_WAIT_SET: u64 = 13;
 pub const OBJECT_TYPE_CLAIM: u64 = 14;
 pub const OBJECT_TYPE_PORT_RANGE: u64 = 15;
+pub const OBJECT_TYPE_CONSOLE_TAP: u64 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1449,12 +1461,32 @@ pub struct IrqInfo {
 // vector on x86_64 (a legacy IRQ n is `0x20 + n`), the INTID on aarch64, the interrupt-file identity on
 // riscv64. Wakes per second are two of these readings and the time between them.
 pub const SYS_CPU_IDLE_INFO: u64 = 95;
-// THE PROPERTY BLOCK OF A CLAIMED PLATFORM ROW - `SYS_DEVICE_PROPERTIES(claim, buf, len)` - for a claim
-// handle carrying `RIGHT_READ`: the device-tree node's properties and its child nodes' (bounded), with
-// every `fixed-clock` reference resolved to its frequency and every other reference listed unresolved,
-// in the record format `DEVICE_PROPERTY_*` describes. Answers the block's length, copying what fits;
-// ERR_UNSUPPORTED for a row that has none. Its holder is the device's driver; nothing else reads it.
+// THE PROPERTY BLOCK OF A CLAIMED PLATFORM ROW - `SYS_DEVICE_PROPERTIES(handle, buf, len)` - for the claim
+// handle, or the `DeviceMemory` minted from a claim that is still the device's current binding, carrying
+// `RIGHT_READ`: the device-tree node's properties and its child nodes' (bounded), with every `fixed-clock`
+// reference resolved to its frequency and every other reference listed unresolved, in the record format
+// `DEVICE_PROPERTY_*` describes. Answers the block's length, copying what fits; ERR_UNSUPPORTED for a row
+// that has none. The driver reads it through the register window it was given - the claim stays its manager's.
 pub const SYS_DEVICE_PROPERTIES: u64 = 96;
+// THE CONSOLE TAP'S READ - `SYS_CONSOLE_TAP_READ(tap, buf, len, dropped)` - for a tap handle carrying
+// `RIGHT_READ`: moves at most `len` bytes of the kernel console's output out of its transmit ring into `buf`,
+// in order, answers how many, and writes to `dropped` (a u64, or 0 for none) how many bytes the ring's bound
+// dropped since the last read, which the driver reports on the wire in their place. The release of the claim
+// the tap was minted from revokes it - ERR_BAD_HANDLE from then on - and a tap whose claim no longer holds the
+// UART reads nothing, ERR_ACCESS_DENIED.
+pub const SYS_CONSOLE_TAP_READ: u64 = 97;
+// DEVELOPMENT-BUILD KERNEL REQUESTS - `SYS_DEV_CONSOLE(privilege, request)`, for a holder of the
+// `ConsoleInputSource` privilege, which the development agent holds. A kernel built for any other image has
+// no such call and answers ERR_BAD_SYSCALL. `DEV_CONSOLE_HOLD_AND_FLOOD` holds every console tap's reads and
+// writes kernel lines until the transmit ring has dropped bytes at its bound, answering how many lines it
+// wrote; `DEV_CONSOLE_PANIC` panics the kernel. Together they are the handoff gate's proof that the
+// terminal-path writer puts a panic on the wire while a driver holds the console and does not drain it.
+// `DEV_CONSOLE_KILL_HOLDER` kills the process that has the console UART's ports mapped - its driver - the
+// way DeviceManager's SIG_KILL does, answering 0, or ERR_INVALID when no process holds them.
+pub const SYS_DEV_CONSOLE: u64 = 98;
+pub const DEV_CONSOLE_HOLD_AND_FLOOD: u64 = 1;
+pub const DEV_CONSOLE_PANIC: u64 = 2;
+pub const DEV_CONSOLE_KILL_HOLDER: u64 = 3;
 
 // The records of a property block, each `[kind u8][depth u8][name_len u16][value_len u32][name][value]`
 // with the value padded to four bytes: a NODE opens a child at `depth` (the device's own node is depth 0

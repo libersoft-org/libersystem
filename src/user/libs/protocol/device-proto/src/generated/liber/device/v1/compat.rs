@@ -11,11 +11,132 @@ fn device_type_wire_is_stable() {
 }
 #[test]
 fn device_entry_wire_is_stable() {
-	let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7, bus: 7, dev: 7, func: 7, present: true };
+	let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7, bus: 7, dev: 7, func: 7, present: true, kind: RowKind::Pci, source: PlatformSource::None, state: PlatformState::None, identity: String::from("x"), ids: alloc::vec![PlatformId { kind: PlatformIdKind::None, text: String::from("x") }], resources: alloc::vec![PlatformResource { kind: PlatformResourceKind::Mmio, base: 7, length: 7, level: true, active_low: true, controller: 7 }], unresolved: true };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1];
+	let golden: &[u8] = &[
+		7,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		0,
+		0,
+		1,
+		0,
+		120,
+		1,
+		0,
+		0,
+		1,
+		0,
+		120,
+		1,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		1,
+		7,
+		0,
+		0,
+		0,
+		1,
+	];
 	assert_eq!(bytes, golden);
 	assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn row_kind_wire_is_stable() {
+	let sample = RowKind::Pci;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(RowKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn platform_source_wire_is_stable() {
+	let sample = PlatformSource::None;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PlatformSource::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn platform_state_wire_is_stable() {
+	let sample = PlatformState::None;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PlatformState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn platform_id_kind_wire_is_stable() {
+	let sample = PlatformIdKind::None;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PlatformIdKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn platform_id_wire_is_stable() {
+	let sample = PlatformId { kind: PlatformIdKind::None, text: String::from("x") };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0, 1, 0, 120];
+	assert_eq!(bytes, golden);
+	assert_eq!(PlatformId::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn platform_resource_kind_wire_is_stable() {
+	let sample = PlatformResourceKind::Mmio;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PlatformResourceKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn platform_resource_wire_is_stable() {
+	let sample = PlatformResource { kind: PlatformResourceKind::Mmio, base: 7, length: 7, level: true, active_low: true, controller: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 1, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PlatformResource::decode(&bytes).unwrap(), sample);
 }
 #[test]
 fn binding_state_wire_is_stable() {
@@ -35,9 +156,9 @@ fn failure_cause_wire_is_stable() {
 }
 #[test]
 fn binding_record_wire_is_stable() {
-	let sample = BindingRecord { index: 7, bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, attempts: 7, artifact: String::from("x"), rule: 7, providers: 7, resources: 7 };
+	let sample = BindingRecord { index: 7, bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, attempts: 7, artifact: String::from("x"), rule: 7, providers: 7, resources: 7, platform: Some(7) };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(BindingRecord::decode(&bytes).unwrap(), sample);
 }
@@ -51,9 +172,9 @@ fn provider_kind_wire_is_stable() {
 }
 #[test]
 fn provider_info_wire_is_stable() {
-	let sample = ProviderInfo { kind: ProviderKind::Block, bus: 7, dev: 7, func: 7, binding_generation: 7, slot: 7, provider_generation: 7, live: true, name: String::from("x") };
+	let sample = ProviderInfo { kind: ProviderKind::Block, bus: 7, dev: 7, func: 7, binding_generation: 7, slot: 7, provider_generation: 7, live: true, name: String::from("x"), platform: Some(7) };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 1, 0, 120];
+	let golden: &[u8] = &[1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 1, 0, 120, 1, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(ProviderInfo::decode(&bytes).unwrap(), sample);
 }
@@ -75,7 +196,7 @@ fn policy_outcome_wire_is_stable() {
 }
 #[test]
 fn incident_report_wire_is_stable() {
-	let sample = IncidentReport { present: true, bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, last_opcode: 7, silent_for: 7, attempts: 7, domain_known: true, memory_used: 7, memory_peak: 7, handles_used: 7, threads_used: 7, dma_used: 7 };
+	let sample = IncidentReport { present: true, bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, last_opcode: 7, silent_for: 7, attempts: 7, domain_known: true, memory_used: 7, memory_peak: 7, handles_used: 7, threads_used: 7, dma_used: 7, platform: Some(7) };
 	let bytes = sample.encode_vec().expect("encode");
 	let golden: &[u8] = &[
 		1,
@@ -155,6 +276,11 @@ fn incident_report_wire_is_stable() {
 		0,
 		0,
 		0,
+		0,
+		0,
+		0,
+		1,
+		7,
 		0,
 		0,
 		0,

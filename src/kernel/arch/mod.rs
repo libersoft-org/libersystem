@@ -37,11 +37,17 @@
 //                   held pending and ends the halt rather than being taken before it.
 //       tsc:        now, init, hz, cycles_to_ns   (the fine cycle clock; x86 compiles `cycles_to_ns` for
 //                   the suite alone, the ports' boot lines print through theirs)
-//       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync, write_bytes, read_byte,
+//       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync (the terminal-path writer, entered
+//                   before the first line of a panic or a fatal exception and before a reset, a power-off or
+//                   the test exit), drain_sync, make_room, write_bytes, write_whole, read_byte,
 //                   tx_pending (false where writes are synchronous: only x86 keeps a transmit ring),
 //                   arm_rx_interrupt (the console UART's receive line - COM1's IRQ 4 through the I/O
 //                   APIC, the PL011's SPI or the 16550's APLIC source as the device tree names it -
-//                   answered by the handler the boot tail passes, or refused in words)
+//                   answered by the handler the boot tail passes, or refused in words), and the console
+//                   handoff: console_hand_over, console_hand_back, console_held_by, console_attach_tap,
+//                   console_tap_read, console_deliver, console_dropped (development build). Only x86_64's
+//                   COM1 is handed to a driver so far; the other two answer every handoff call with a
+//                   refusal, and no row of theirs asks.
 //       pci:        PciDevice / VirtioDevice / ResourcedDevice, scan, scan_virtio, scan_resourced,
 //                   set_intx_disabled, msix_enable
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel

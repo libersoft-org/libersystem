@@ -26,6 +26,7 @@ pub use crate::generated::liber::printer_device::v1::*;
 pub use crate::generated::liber::ptp_transport::v1::*;
 pub use crate::generated::liber::smartcard::v1::*;
 pub use crate::generated::liber::spool::v1::*;
+pub use crate::generated::liber::tpm::v1::*;
 // The DEVICE side of the display, which is a different contract from the application side: the
 // service calls it and a driver serves it.
 pub use crate::generated::liber::display_device::v1::*;

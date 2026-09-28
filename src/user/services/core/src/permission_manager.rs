@@ -66,6 +66,7 @@ use proto::system::smartcard_admin;
 use proto::system::{AdminAction, AdminScope, admin_factory};
 use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, Operations, PipelineResult, PipelineStage, SelectedFile, StartResult, config, process, volume, volume_admin};
 use proto::system::{DataPolicy, GrantKind, camera_admin, midi_admin, modem_admin};
+use proto::system::{Grant as TpmGrant, tpm_admin};
 use rt::*;
 use services::capability_names::*;
 use services::executable;
@@ -134,7 +135,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 46] = [
+const VOCABULARY: [Capability; 49] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -224,6 +225,10 @@ const VOCABULARY: [Capability; 46] = [
 	// WATCHING THE GAMEPADS FROM THE CONSOLE: a connection of InputService's gamepad scope, minted per launch.
 	// Position is free: the `gamepad` tool is granted it alone.
 	Capability::InputGamepad,
+	// THE TPM'S THREE GRANTS, each minted per launch for the component. Their holders read them by tag.
+	Capability::Tpm,
+	Capability::TpmMeasure,
+	Capability::TpmSeal,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -332,6 +337,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// no component receives by default. The READ comes with it for the reason `lsdev` holds both: listing
 		// and scanning are how an operator finds what to pair.
 		b"btctl" => Some(granted("btctl", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator])),
+		// THE TPM DEMONSTRATION TOOL, and the one shipping row that holds any TPM grant: all three, and the files
+		// it keeps sealed objects and quotes in. There is one TPM and no alias, so this row IS the policy.
+		b"tpm" => Some(granted("tpm", alloc::vec![Capability::Tpm, Capability::TpmMeasure, Capability::TpmSeal, Capability::Volumes])),
+		// THE TPM GATE'S PROBE, development-only: observation and sealing, and the files it reads the tool's sealed
+		// object from - and NOT measurement, which is its half of the gate.
+		b"tpmprobe" => Some(granted("tpmprobe", alloc::vec![Capability::Tpm, Capability::TpmSeal, Capability::Volumes])),
 		// THE FIRMWARE-DOWNLOAD REQUESTER: the files it reads its image from, and ONE administrative request
 		// connection whose scope `admin_policy` fixes - firmware download, on `dfu:` targets, nothing else. Neither
 		// writes anything: a person on the protected screen does, or nothing does.
@@ -597,6 +608,9 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::AdminAudit => CAP_ADMIN_AUDIT,
 		Capability::AdminTest => CAP_ADMIN_TEST,
 		Capability::InputGamepad => b"INPUT_GAMEPAD",
+		Capability::Tpm => b"TPM",
+		Capability::TpmMeasure => b"TPMMEASURE",
+		Capability::TpmSeal => b"TPMSEAL",
 	}
 }
 
@@ -674,6 +688,8 @@ struct Clients {
 	fixture_providers: ProviderWatch,
 	// SMARTCARDSERVICE'S MINTING ROOT, zero until the first smart-card grant resolves it by name.
 	smartcard_admin: u64,
+	// TPMSERVICE'S MINTING ROOT, the same way.
+	tpm_admin: u64,
 	// MODEMSERVICE'S OBSERVATION AND MINTING ROOTS, the same way.
 	modem_state: u64,
 	modem_admin: u64,
@@ -750,6 +766,8 @@ impl Clients {
 			Capability::AdminTest => self.admin_test,
 			// Minted per launch through InputService's admin root: see `grant_for_task`.
 			Capability::InputGamepad => 0,
+			// Minted per launch through TpmService's admin root, for the component: see `grant_for_task`.
+			Capability::Tpm | Capability::TpmMeasure | Capability::TpmSeal => 0,
 		}
 	}
 }
@@ -843,6 +861,34 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 					clients.grant_detail = detail;
 					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
 					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
+		// THE TPM, for this component and this task: observation, measurement or sealing, each a separate grant.
+		// There is one TPM and no alias to resolve, so the component's row IS the policy. The service tags every
+		// secret this connection seals with the component's name as it is minted here, and the connection dies
+		// with the task however it is copied.
+		Capability::Tpm | Capability::TpmMeasure | Capability::TpmSeal => {
+			let kind = match cap {
+				Capability::Tpm => TpmGrant::Tpm,
+				Capability::TpmMeasure => TpmGrant::TpmMeasure,
+				_ => TpmGrant::TpmSeal,
+			};
+			let Some(admin) = connect_or_resolve(&mut clients.tpm_admin, clients.broker, CAP_TPM_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = tpm_admin::Client::new(ChannelTransport { chan: admin }).mint(&kind, component, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(connection)) => {
+					clients.grant_detail = alloc::format!("tpm grant for {component}");
+					let narrowed = duplicate(connection, GRANT_RIGHTS);
+					close(connection);
 					if narrowed > 0 { narrowed as u64 } else { 0 }
 				}
 				_ => 0,
@@ -2503,7 +2549,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, grant_detail: String::new() };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, grant_detail: String::new() };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

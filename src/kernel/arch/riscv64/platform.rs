@@ -28,10 +28,16 @@ const KERNEL_HELD: &[&[u8]] = &[
 ];
 
 // An APLIC specifier as a wired line: a source and its trigger (1 and 2 edges, 4 and 8 levels, 2 and 8 low). A
-// PLIC's one cell is a controller this kernel does not drive, and is not a line.
-#[cfg(not(test))]
-fn aplic_line(route: &fdt::IntxRoute) -> Option<abi::WiredLine> {
+// PLIC's one cell is a controller this kernel does not drive, and is not a line - and neither is a source of an
+// APLIC domain other than the one the first line named, which is the domain a claim arms through. The suite
+// reads its claimed line through this too, which is how a test kernel - which runs no describe pass - adopts
+// the domain.
+pub fn wired_line(tree: &fdt::Fdt, route: &fdt::IntxRoute) -> Option<abi::WiredLine> {
 	if route.cells != 2 || route.spec[0] == 0 {
+		return None;
+	}
+	let (base, size) = tree.interrupt_controller_reg(route.controller)?;
+	if !crate::mem::within_direct_map(base, size) || !super::aplic::adopt_domain(base) {
 		return None;
 	}
 	let flags = route.spec[1];
@@ -43,7 +49,7 @@ fn aplic_line(route: &fdt::IntxRoute) -> Option<abi::WiredLine> {
 pub fn describe() -> Vec<Described> {
 	#[cfg(not(test))]
 	{
-		let out = super::device_tree().map(|tree| crate::arch::common::platform::from_tree(&tree, KERNEL_HELD, super::serial::UART_BASE, aplic_line)).unwrap_or_default();
+		let out = super::device_tree().map(|tree| crate::arch::common::platform::from_tree(&tree, KERNEL_HELD, super::serial::UART_BASE, |route| wired_line(&tree, route))).unwrap_or_default();
 		crate::arch::common::platform::report_smbios(super::boot::loader_smbios(super::boot::BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst)), super::paging::phys_to_virt);
 		out
 	}

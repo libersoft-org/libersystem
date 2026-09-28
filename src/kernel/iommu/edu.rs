@@ -24,6 +24,9 @@ const DEVICE: u16 = 0x11e8;
 // Its register window, as QEMU documents it.
 const REG_IDENT: u64 = 0x00;
 const REG_LIVENESS: u64 = 0x04;
+const REG_INTERRUPT_STATUS: u64 = 0x24;
+const REG_INTERRUPT_RAISE: u64 = 0x60;
+const REG_INTERRUPT_ACKNOWLEDGE: u64 = 0x64;
 const REG_DMA_SOURCE: u64 = 0x80;
 const REG_DMA_DESTINATION: u64 = 0x88;
 const REG_DMA_COUNT: u64 = 0x90;
@@ -114,6 +117,26 @@ impl Edu {
 		}
 	}
 
+	// RAISE ITS INTERRUPT: the status bits `bits` set, and - with MSI off, as a claimed-line test leaves it -
+	// its INTx pin asserted, and held asserted until every status bit is acknowledged. A LEVEL source that
+	// stays up is exactly what a line that is not masked while its driver runs turns into a storm.
+	pub fn raise_interrupt(&self, bits: u32) {
+		// SAFETY: this fixture's own register window.
+		unsafe { write32(self.registers + REG_INTERRUPT_RAISE, bits) };
+	}
+
+	// Clear status bits `bits`; the pin drops when none is left.
+	pub fn acknowledge_interrupt(&self, bits: u32) {
+		// SAFETY: as above.
+		unsafe { write32(self.registers + REG_INTERRUPT_ACKNOWLEDGE, bits) };
+	}
+
+	// The status bits still set.
+	pub fn interrupt_status(&self) -> u32 {
+		// SAFETY: as above.
+		unsafe { read32(self.registers + REG_INTERRUPT_STATUS) }
+	}
+
 	// Let the device master the bus, or stop it. The fixture does this itself rather than through
 	// the driver-binding path: `edu` has no driver and no device-table entry, which is the point of
 	// it being a fixture.
@@ -137,15 +160,23 @@ impl Edu {
 			write64(self.registers + REG_DMA_COMMAND, DMA_START | if from_device { DMA_FROM_DEVICE } else { 0 });
 		}
 		// The command register clears its start bit when the transfer ends.
-		for _ in 0..2_000_000u64 {
+		//
+		// BOUNDED BY TIME, NOT BY A COUNT OF READS. QEMU's `edu` performs the copy from a timer a hundred
+		// milliseconds after the command, so a bound of two million reads ended before the transfer on a
+		// fast host and the case read an untouched sentinel as a device that could not reach it. A second
+		// is ten times the device's own delay and still an end.
+		let until = crate::arch::apic::ticks() + u64::from(crate::arch::common::time::TICK_HZ);
+		loop {
 			// SAFETY: as above.
 			let command = unsafe { read32(self.registers + REG_DMA_COMMAND) } as u64;
 			if command & DMA_START == 0 {
 				return true;
 			}
+			if crate::arch::apic::ticks() >= until {
+				return false;
+			}
 			core::hint::spin_loop();
 		}
-		false
 	}
 }
 

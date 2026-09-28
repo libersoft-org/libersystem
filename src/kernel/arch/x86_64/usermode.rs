@@ -75,6 +75,8 @@ unsafe extern "C" {
 	fn user_port_loop_program_end();
 	fn user_port_wait_program_start();
 	fn user_port_wait_program_end();
+	fn user_port_script_program_start();
+	fn user_port_script_program_end();
 }
 
 // Drop the calling thread into ring 3 at `entry` with `user_stack` and `arg` (the
@@ -200,6 +202,16 @@ pub fn program_spin_bytes() -> &'static [u8] {
 //   read back into [16], loopback off - and then one read of [32].
 // - loop: read [0] until [8] is raised, counting into [24]; then read [32] once, into [16].
 // - wait: spin until [8] is raised, touching no port; then read [0] into [16] and set [24].
+// - script: [64] writes, each a word at [72 + 8 * i] naming the port in its bits 8..24 and the byte in its low
+//   eight - a driver leaving a UART in whatever state the words say - then set [24] and spin until [8] is
+//   raised, touching no port; then exit.
+#[cfg(test)]
+pub fn program_port_script_bytes() -> &'static [u8] {
+	let start = user_port_script_program_start as *const () as usize;
+	let end = user_port_script_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
 #[cfg(test)]
 pub fn program_port_loopback_bytes() -> &'static [u8] {
 	let start = user_port_loopback_program_start as *const () as usize;
@@ -548,5 +560,37 @@ global_asm!(
 	"jmp 3b",
 	".global user_port_wait_program_end",
 	"user_port_wait_program_end:",
+	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+#[cfg(test)]
+global_asm!(
+	".text",
+	".global user_port_script_program_start",
+	"user_port_script_program_start:",
+	"mov rcx, qword ptr [rdi + 64]",
+	"lea rsi, [rdi + 72]",
+	"2:",
+	"test rcx, rcx",
+	"jz 3f",
+	"mov rax, qword ptr [rsi]",
+	"mov rdx, rax",
+	"shr rdx, 8",
+	"out dx, al",
+	"add rsi, 8",
+	"dec rcx",
+	"jmp 2b",
+	"3:",
+	"mov qword ptr [rdi + 24], 1",
+	"4:",
+	"mov rax, qword ptr [rdi + 8]",
+	"test rax, rax",
+	"jz 4b",
+	"mov eax, {exit}",
+	"syscall",
+	"5:",
+	"jmp 5b",
+	".global user_port_script_program_end",
+	"user_port_script_program_end:",
 	exit = const crate::syscall::SYS_USER_EXIT,
 );

@@ -60,7 +60,7 @@ enum PolledCaps { Empty, Closed }
 fn try_recv_caps(_: u64, _: &mut [u8]) -> PolledCaps { PolledCaps::Empty }
 mod wire { pub struct Handles; impl Handles { pub fn new() -> Self { Self } pub fn as_slice(&self) -> &[u64] { &[] } } }
 mod proto { pub mod system {
-    pub struct ProviderInfo { pub kind: u16, pub bus: u32, pub dev: u32, pub func: u32, pub binding_generation: u64, pub slot: u32, pub provider_generation: u32, pub live: bool, pub name: alloc::string::String }
+    pub struct ProviderInfo { pub kind: u16, pub bus: u32, pub dev: u32, pub func: u32, pub binding_generation: u64, pub slot: u32, pub provider_generation: u32, pub live: bool, pub name: alloc::string::String, pub platform: Option<u32> }
     pub mod provider_catalogue {
         pub fn subscribe_frame(_: u32, _: &super::ProviderInfo, _: &mut [u8], _: &mut crate::wire::Handles) -> Option<usize> { Some(1) }
         pub fn subscribe_open(_: &mut crate::CatalogueView, _: &[u8], _: &mut crate::wire::Handles) -> Option<(u32, ())> { Some((7, ())) }

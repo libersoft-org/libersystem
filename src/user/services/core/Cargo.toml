@@ -89,6 +89,10 @@ name = "smartcard_service"
 path = "src/smartcard_service.rs"
 
 [[bin]]
+name = "tpm_service"
+path = "src/tpm_service.rs"
+
+[[bin]]
 name = "modem_service"
 path = "src/modem_service.rs"
 

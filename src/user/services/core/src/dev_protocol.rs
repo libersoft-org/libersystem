@@ -166,6 +166,12 @@ pub const OP_FIXTURE_PUT: u8 = 0x28;
 pub const OP_FIXTURE_ACK: u8 = 0x29;
 pub const OP_FIXTURE_CLEAR: u8 = 0x2a;
 pub const OP_FIXTURE_CLEAR_ACK: u8 = 0x2b;
+// THE KERNEL CONSOLE REQUESTS of a development kernel, for the serial handoff gate: one byte naming the request
+// (`SYS_DEV_CONSOLE`'s `DEV_CONSOLE_HOLD_AND_FLOOD`, `DEV_CONSOLE_PANIC` or `DEV_CONSOLE_KILL_HOLDER`). The
+// flood is answered with the number of kernel lines it wrote and a kill with zero, as a u64; a panic is
+// answered by the kernel's panic on the serial log and by nothing on this wire.
+pub const OP_KERNEL_CONSOLE: u8 = 0x2c;
+pub const OP_KERNEL_CONSOLE_ACK: u8 = 0x2d;
 pub const OP_ERROR: u8 = 0xff;
 
 // Statuses. Every rejection names one of these, so a failure is explained by the frame that
@@ -638,6 +644,7 @@ impl Session {
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
 			OP_MEM_STATS => memory_stats(request, sink),
+			OP_KERNEL_CONSOLE => kernel_console(request, payload, sink),
 			OP_FIXTURE_PUT => self.fixture_put(request, payload, sink),
 			OP_FIXTURE_CLEAR => self.fixture_clear(request, sink),
 			OP_RESTART => self.request_restart(request, sink),
@@ -1012,6 +1019,18 @@ fn memory_stats(request: u32, sink: &mut impl Sink) -> bool {
 	reply.extend_from_slice(&stats.heap_free.to_le_bytes());
 	reply.extend_from_slice(&stats.heap_total.to_le_bytes());
 	sink.send(OP_MEM_STATS_REPLY, request, 0, ST_OK, &reply)
+}
+
+// A KERNEL CONSOLE REQUEST, under the console input privilege the kernel gates it on. A kernel built for any
+// other image does not know the call, and the refusal says so.
+fn kernel_console(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
+	let [which] = payload else { return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]) };
+	let privilege = CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed);
+	let answer: i64 = rt::dev_console(privilege, *which as u64);
+	if answer < 0 {
+		return sink.send(OP_ERROR, request, 0, ST_TERM_REFUSED, &answer.to_le_bytes());
+	}
+	sink.send(OP_KERNEL_CONSOLE_ACK, request, 0, ST_OK, &(answer as u64).to_le_bytes())
 }
 
 // The ConsoleInputSource capability this agent was handed at bootstrap, which

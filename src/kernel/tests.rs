@@ -18,6 +18,8 @@ mod dynamic;
 mod hardware;
 #[path = "test_suites/kernel.rs"]
 mod kernel;
+#[path = "test_suites/platform_rows.rs"]
+mod platform_rows;
 #[path = "test_suites/services.rs"]
 mod services;
 #[path = "test_suites/volume_layout.rs"]
@@ -149,7 +151,7 @@ fn serve_provider_catalogue(server: &object::channel::Channel, kind: device_prot
 	use object::channel::{Channel, Message};
 	use object::handle::Capability;
 	use object::rights::Rights;
-	let info = device::ProviderInfo { kind, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, name: alloc::string::String::new().into(), live: true };
+	let info = device::ProviderInfo { kind, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, name: alloc::string::String::new().into(), live: true, platform: None };
 
 	// 1. THE SUBSCRIPTION. The reply is the correlation number and one handle - the stream - and
 	//    nothing else; the client checks exactly that.
@@ -2910,10 +2912,33 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 	unsafe { frame::deallocate(stack) };
 }
 
-// A bindable test IRQ vector (33..47, distinct from the interrupt_bind test's) a
-// crashing "driver" holds before it faults. x86-only (legacy INTx; aarch64 is MSI-only).
+// The vector a crashing "driver" holds before it faults: its platform row's line, ISA IRQ 13 - which nothing on
+// the test machine raises - at `IRQ_BASE + 13`.
 #[cfg(target_arch = "x86_64")]
 const DRIVER_IRQ_VECTOR: u64 = 0x2d;
+
+// The crashing driver's device: a platform row whose one resource is that line. Published once; the second
+// crash test finds the same row by its identity.
+#[cfg(target_arch = "x86_64")]
+fn driver_crash_row() -> u64 {
+	let mut description = synthetic_platform_description(b"kernel:test-crash-line");
+	assert!(description.add_line(arch::platform::isa_irq_line(13)), "the line fits the row");
+	publish_synthetic_platform(description).expect("the crashing driver's row is published") as u64
+}
+
+// A PLATFORM DESCRIPTION THE SUITE PUBLISHES: claimable, and answering to the hardware id the suite's DMA entry
+// declares for - so a test claims it by name the way DeviceManager would.
+pub(crate) fn synthetic_platform_description(identity: &[u8]) -> platform::Description {
+	let mut description = platform::Description::new(abi::PLATFORM_SOURCE_KERNEL, abi::PLATFORM_STATE_CLAIMABLE, identity).expect("a test identity fits the bound");
+	assert!(description.add_match(abi::MATCH_ID_HID, dma_policy::SYNTHETIC_PLATFORM_HID), "the test id fits the row");
+	description
+}
+
+// Publish it through the checks and the placement a boot's description goes through: the row it became or
+// joined, or None where it was refused.
+pub(crate) fn publish_synthetic_platform(description: platform::Description) -> Option<usize> {
+	device::add_synthetic_platform_row(device::Described { description, properties: Vec::new(), targets: Vec::new() })
+}
 
 // Where the no-execute probe's recorded fault lands (mirrors the FAULT_* statics).
 static NX_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
@@ -3079,8 +3104,8 @@ extern "C" fn user_exception_thread_body(arg: u64) {
 
 // A DeviceManager privilege in the calling thread's handle table.
 //
-// `SYS_DEVICE_ACQUIRE`, `SYS_DEVICE_MSIX_ACQUIRE` and `SYS_INTERRUPT_BIND` require one: ungated,
-// they minted a capability to any device's BAR for any caller that named an index. The suite drives
+// `SYS_DEVICE_CLAIM` and `SYS_DEVICE_MSIX_ACQUIRE` require one: ungated, they minted a capability to any
+// device's BAR for any caller that named an index. The suite drives
 // syscalls from kernel threads and there is no ring-0 exemption - a gate every test walks around is
 // a gate nobody has walked through - so a test that means to acquire a device holds the authority
 // like the one program that legitimately does.
@@ -3116,7 +3141,7 @@ pub(crate) fn claim_device_as(index: u64, entry: &[u8; abi::ENTRY_NAME_LEN]) -> 
 // Which registry entry a test would claim the device at `index` under. The synthetic devices are
 // declared for by the synthetic entries; a real device by the manifest's rows.
 pub(crate) fn entry_for_device(index: u64) -> Option<[u8; abi::ENTRY_NAME_LEN]> {
-	let discovered = device::with(index as usize, |d| driver_binding::Discovered { transport: d.transport, virtio_type: d.device_type as u32, class: d.class, subclass: d.subclass, prog_if: d.prog_if, vendor: d.vendor, product: d.product, bus: d.bus, dev: d.dev, func: d.func, ..driver_binding::Discovered::default() })?;
+	let discovered = device::discovered_at(index as usize)?;
 	dma_policy::entry_matching(&discovered)
 }
 
@@ -3128,17 +3153,17 @@ pub(crate) fn release_device(grant: &abi::ClaimGrant) {
 	unsafe { arch::syscall::invoke(syscall::SYS_DEVICE_RELEASE, grant.claim, 0, 0, 0) };
 }
 
-// Kernel-thread body for the driver-crash test: it acquires real driver resources
-// - a bound IRQ and a DMA buffer - then drops to ring 3 and faults, leaving both
-// open so the kernel's crash cleanup is what detaches the IRQ and refunds the DMA.
-// Mirrors user_fault_thread_body's ring-3 fault, plus the held driver resources.
-// x86-only: it binds a legacy INTx vector, which aarch64 (MSI-only) does not offer.
+// Kernel-thread body for the driver-crash test: it claims its device (`row`) and acquires real driver
+// resources - the row's wired line and a DMA buffer - then drops to ring 3 and faults, leaving all of it open
+// so the kernel's crash cleanup is what releases the claim, silences the line and refunds the DMA. Mirrors
+// user_fault_thread_body's ring-3 fault, plus the held driver resources. x86-only: its line is an ISA IRQ.
 #[cfg(target_arch = "x86_64")]
-extern "C" fn driver_crash_thread_body(_arg: u64) {
+extern "C" fn driver_crash_thread_body(row: u64) {
 	use mem::frame::{self, PAGE_SIZE};
+	let grant = claim_device(row).expect("the driver claims its device");
 	unsafe {
-		let irq = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, DRIVER_IRQ_VECTOR, device_privilege(), 0, 0);
-		assert!((irq as i64) > 0, "driver should bind its IRQ");
+		let irq = arch::syscall::invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_LINE, 0, 0);
+		assert!((irq as i64) > 0, "driver should bind its line");
 		let dma = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, PAGE_SIZE, 0, 0, 0);
 		assert!((dma as i64) > 0, "driver should create its DMA buffer");
 	}
@@ -3152,7 +3177,7 @@ extern "C" fn driver_crash_thread_body(_arg: u64) {
 		arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
 	}
-	// Back from the crash: drop the raw code/stack mappings. The IRQ and DMA handles
+	// Back from the crash: drop the raw code/stack mappings. The claim, line and DMA handles
 	// stay open, so the kernel's process teardown is what releases them.
 	arch::paging::unmap_page(USER_CODE_VA);
 	arch::paging::unmap_page(USER_STACK_VA);

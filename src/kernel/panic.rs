@@ -3,6 +3,11 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+	// THE TERMINAL-PATH WRITER FIRST, before a byte of the panic is printed: it takes the console UART back
+	// from whoever drives it - a driver may hold it and have stopped draining - re-initialises it, writes out
+	// the ring's backlog and what its bound dropped, and from then on every line goes to the wire
+	// synchronously, so this text cannot be lost at a full ring.
+	crate::arch::serial::flush_sync();
 	crate::serial_println!();
 	crate::serial_println!("*** KERNEL PANIC ***");
 	crate::serial_println!("{}", info);
@@ -13,7 +18,7 @@ fn panic(info: &PanicInfo) -> ! {
 	// hook at all, so this is where the answer gets printed while there is still a wire to print
 	// it on. It costs nothing on a system that does not panic.
 	crate::sched::dump_blocked("at panic");
-	// Drain the panic message to the wire before halting (serial is asynchronous).
+	// Everything above went to the wire synchronously; this lets the last of it leave the UART.
 	crate::arch::serial::flush_sync();
 	crate::arch::halt_loop();
 }
@@ -22,6 +27,7 @@ fn panic(info: &PanicInfo) -> ! {
 #[cfg(test)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+	crate::arch::serial::flush_sync();
 	crate::serial_println!("[failed]");
 	crate::serial_println!("{}", info);
 	crate::arch::serial::flush_sync();

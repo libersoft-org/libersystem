@@ -144,6 +144,8 @@ keys = [
 	"gate.qemu-virtio-iommu-x86_64 / host / host / default",
 	"gate.qemu-admin-path / host / host / default",
 	"gate.qemu-dfu-tool / host / host / default",
+	"gate.qemu-tpm-tool / host / host / default",
+	"gate.serial-handoff / host / host / default",
 	"gate.qemu-2d-demo / host / host / default",
 	"gate.qemu-2d-account / host / host / default",
 	"gate.qemu-3d-demo / host / host / default",

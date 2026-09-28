@@ -205,6 +205,24 @@ test = false
 bench = false
 
 [[bin]]
+# THE TPM 2.0 DRIVER: the platform device the firmware describes - the `TPM2` table's on x86_64, a
+# `tcg,tpm-tis-mmio` node on the device-tree ports - driven over its FIFO or CRB interface by `src/tpm`, and
+# published as the one `tpm` provider TpmService consumes.
+name = "tpm_driver"
+path = "src/tpm_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE KERNEL CONSOLE'S UART: the kernel-declared COM1 row, whose claim takes the console from the kernel -
+# its ports, its IRQ 4 and the kernel's console tap - published as `ConsoleBytes` under the kernel console's
+# name. The 16550 register engine is `src/uart.rs`, in the library and host-tested.
+name = "uart16550"
+path = "src/uart16550.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "xhci"
 path = "src/xhci.rs"
 test = false
@@ -250,6 +268,8 @@ smartcard-model = { path = "../../libs/smartcard/model" }
 # SHA-256, for the digest an administrative executor takes of the payload it copied at preparation - the
 # digest a person confirms. The same implementation the boot chain verifies images with.
 bootproto = { path = "../../../boot/protocol" }
+# TPM 2.0 below the binding - the two transports and the typed operations - which the TPM driver runs.
+tpm = { path = "../../../tpm" }
 
 
 # THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are

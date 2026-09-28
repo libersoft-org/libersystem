@@ -68,3 +68,5 @@ liber/storage/v1.abi
 liber/storage/v1.md
 liber/time/v1.abi
 liber/time/v1.md
+liber/tpm/v1.abi
+liber/tpm/v1.md

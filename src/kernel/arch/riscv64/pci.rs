@@ -219,7 +219,16 @@ pub fn arm_slot_interrupt(port: &common::HotPlugPort, handler: crate::arch::inte
 		crate::serial_println!("pci: the controller did not take source {} for hot-plug port {:02x}:{:02x}.{} - its slot is polled only", route.spec[0], port.bus, port.dev, port.func);
 		return None;
 	}
+	crate::arch::interrupts::hold_source(route.spec[0]);
 	Some(route.spec[0])
+}
+
+// A function's interrupt pin and line bytes (config 0x3D and 0x3C) - for the suite's claimed-line test, which
+// routes the `edu` function's INTx pin as a platform row's line.
+#[cfg(test)]
+pub fn intx_pin_and_line(bus: u8, dev: u8, func: u8) -> (u8, u8) {
+	let word = <Access as common::ConfigAccess>::read32(bus, dev, func, 0x3c);
+	((word >> 8) as u8, word as u8)
 }
 
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10).

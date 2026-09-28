@@ -285,7 +285,7 @@ fn overlap_name(what: platform::Overlap) -> &'static str {
 // reserved set when it is claimable, then placed. Answers the row it became or joined, None when refused -
 // every refusal a line naming the description and the reason.
 fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u64, u64)]) -> Option<usize> {
-	let Described { description, properties } = item;
+	let Described { description, properties, .. } = item;
 	let name = core::str::from_utf8(description.identity()).unwrap_or("?");
 	for range in description.part.mmio() {
 		if let Some(at) = platform::over(range.base, range.len, forbidden) {
@@ -294,8 +294,9 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 		}
 	}
 	// A CLAIMABLE ROW'S PORTS ARE CHECKED AGAINST THE RESERVED SET AND THE LIVE GRANTS, as a PCI row's are.
-	// A kernel-held row's ports ARE the reserved set: publishing them accounts for them.
-	if description.part.state == abi::PLATFORM_STATE_CLAIMABLE {
+	// A kernel-held row's ports ARE the reserved set: publishing them accounts for them - and so are the
+	// console UART's, whose claim is the one mint the set admits them to (`grants::grant_from_install`).
+	if description.part.state == abi::PLATFORM_STATE_CLAIMABLE && description.part.flags & abi::PLATFORM_FLAG_CONSOLE == 0 {
 		for port in description.ports() {
 			if let Err(refusal) = crate::object::port_range::grants::recordable(port.base, port.len) {
 				crate::serial_println!("device: {name} is not published - its ports {:#06x}..{:#06x} are {refusal:?}", port.base, port.base as u32 + port.len as u32 - 1);
@@ -304,7 +305,17 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 		}
 	}
 	let placement = {
-		let views: Vec<platform::RowView<'_>> = table.iter().map(|entry| entry.platform.as_ref().map(|row| (&row.part, &entry.ports[..entry.port_count as usize]))).collect();
+		// The suite's own console row is not placed against: it sits over a UART other suites publish rows for,
+		// and a description merged into it would become a console claim. See `synthetic_console_row`.
+		let placed = |entry: &DeviceEntry| -> bool {
+			#[cfg(test)]
+			if entry.platform.as_ref().is_some_and(|row| row.part.identity() == SYNTHETIC_CONSOLE_IDENTITY) {
+				return false;
+			}
+			let _ = entry;
+			true
+		};
+		let views: Vec<platform::RowView<'_>> = table.iter().map(|entry| entry.platform.as_ref().filter(|_| placed(entry)).map(|row| (&row.part, &entry.ports[..entry.port_count as usize]))).collect();
 		platform::place(&views, &description)
 	};
 	match placement {
@@ -668,6 +679,13 @@ fn discovered(entry: &DeviceEntry) -> driver_binding::Discovered {
 	found
 }
 
+// What the binding predicates read of the row at `index` - how a test names the entry a manager would claim it
+// under.
+#[cfg(test)]
+pub fn discovered_at(index: usize) -> Option<driver_binding::Discovered> {
+	with(index, discovered)
+}
+
 // MMIO range `which` of a platform row - from 1, range 0 being the claim's own memory.
 pub fn platform_mmio(index: usize, which: u64) -> Option<(u64, u64)> {
 	with(index, |entry| {
@@ -696,11 +714,6 @@ pub fn properties(index: usize, out: &mut [u8]) -> Option<usize> {
 		Some(row.properties.len())
 	})
 	.flatten()
-}
-
-// Whether the row is a platform row, and its state - for the claim and the listing.
-pub fn platform_state(index: usize) -> Option<u8> {
-	with(index, |entry| entry.platform.as_ref().map(|row| row.part.state)).flatten()
 }
 
 // ------------------------------------------------------------------- the claim
@@ -1030,6 +1043,16 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 	if entry.has_io_bar() {
 		io_decode(entry, true);
 	}
+	// THE CONSOLE UART'S CLAIM TAKES IT FROM THE KERNEL, before anything is minted from the claim: the
+	// kernel's owner flips to this claim under the ring's lock first and its receive handler goes, and only
+	// then does the caller get a key to mint the port range, the line and the tap with. Refused when the
+	// kernel does not drive it now - a terminal path took it.
+	if let Some(base) = console_base(entry)
+		&& !crate::arch::serial::console_hand_over(base, index, generation)
+	{
+		crate::serial_println!("device: {index} is the console UART, and the kernel could not hand it over - not claimed");
+		return Err(ClaimError::Refused);
+	}
 	slot.state = ClaimState::Claimed;
 	slot.generation = generation;
 	slot.entry = *entry_name;
@@ -1082,6 +1105,8 @@ fn finish_release(index: usize, confirmed: bool) -> ClaimState {
 	// already declared terminal, which is two authorities over one device.
 	if slot.state == ClaimState::Quarantined {
 		crate::serial_println!("device: {index} finished its teardown after the deadline had already quarantined it - the completion is recorded and releases nothing");
+		drop(claims);
+		hand_back_console(index, true);
 		return ClaimState::Quarantined;
 	}
 	slot.state = if confirmed { ClaimState::Free } else { ClaimState::Quarantined };
@@ -1106,7 +1131,46 @@ fn finish_release(index: usize, confirmed: bool) -> ClaimState {
 	if released != 0 {
 		crate::serial_println!("device: {index} released - {released} MSI vector(s) given back");
 	}
+	hand_back_console(index, state == ClaimState::Quarantined);
 	state
+}
+
+// The console UART's base when `entry` is its row: a platform row carrying `PLATFORM_FLAG_CONSOLE`, whose first
+// port range is the UART's registers.
+fn console_base(entry: &DeviceEntry) -> Option<u64> {
+	let row = entry.platform.as_ref()?;
+	(row.part.flags & abi::PLATFORM_FLAG_CONSOLE != 0 && entry.port_count > 0).then(|| entry.ports[0].base as u64)
+}
+
+// THE CONSOLE UART'S ROW, by index: its base, or `None` for any other row.
+pub fn console_row(index: usize) -> Option<u64> {
+	DEVICES.lock().get(index).and_then(console_base)
+}
+
+// THE PROCESS HOLDING THE CONSOLE UART - the one its claim's port range is mapped into - for the development
+// request that kills it.
+#[cfg(liber_development)]
+pub fn console_holder() -> Option<alloc::sync::Arc<crate::object::process::Process>> {
+	let index = DEVICES.lock().iter().position(|entry| console_base(entry).is_some())?;
+	let key = {
+		let claims = CLAIMS.lock();
+		let slot = claims.get(index)?;
+		if slot.state != ClaimState::Claimed {
+			return None;
+		}
+		abi::ClaimKey { device_index: index as u32, _pad: 0, generation: slot.generation }
+	};
+	let derived: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()).collect();
+	derived.iter().filter_map(|weak| weak.upgrade()).find_map(|object| object.as_any().downcast_ref::<crate::object::port_range::PortRange>().and_then(|range| range.holder()))
+}
+
+// A RELEASED CONSOLE CLAIM GIVES THE UART BACK TO THE KERNEL - after its port range, line and tap were revoked
+// and its ports rejoined the reserved set - confirmed or quarantined: the kernel is not a claimant, and a
+// quarantined row is simply never claimed again this boot.
+fn hand_back_console(index: usize, quarantined: bool) {
+	if let Some(base) = console_row(index) {
+		crate::arch::serial::console_hand_back(base, quarantined);
+	}
 }
 
 // WHAT A NEW MANAGER NEEDS TO KNOW ABOUT ONE DEVICE, in one read.
@@ -1562,11 +1626,32 @@ pub fn add_synthetic_device() -> usize {
 	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
 	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: (index & 0x1f) as u8, func: ((index >> 5) & 7) as u8, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false, port_count: 0, ports: NO_PORTS, platform: None });
 	drop(table);
-	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
-	// itself - the two are one entry and a table with a device and no slot for it is worse than a
-	// test that could not allocate.
-	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+	push_free_claim_slot();
 	index
+}
+
+// ALLOC-OK: the claim slot for a row just appended, on the same `#[cfg(test)]` terms as the row itself - the
+// two are one entry and a table with a device and no slot for it is worse than a test that could not allocate.
+#[cfg(test)]
+fn push_free_claim_slot() {
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+}
+
+// A TEST'S PLATFORM DESCRIPTION, published through the checks and the placement a boot's goes through - so a
+// refusal the boot would make is the refusal a test sees - and given a claim slot when it became a row of its
+// own. Answers the row it became or joined, or None where it was refused.
+#[cfg(test)]
+pub fn add_synthetic_platform_row(item: Described) -> Option<usize> {
+	let mut table = DEVICES.lock();
+	let forbidden = forbidden_ranges(&table);
+	let before = table.len();
+	let row = publish_locked(&mut table, item, &forbidden)?;
+	let appended = table.len() > before;
+	drop(table);
+	if appended {
+		push_free_claim_slot();
+	}
+	Some(row)
 }
 
 // Start a teardown without running it, so a test can hold a claim in `Releasing` and look at what
@@ -1583,6 +1668,44 @@ pub fn expire_release_for_test(index: usize) {
 	let mut claims = CLAIMS.lock();
 	if let Some(slot) = claims.get_mut(index) {
 		slot.release_deadline = 1;
+	}
+}
+
+#[cfg(test)]
+const SYNTHETIC_CONSOLE_IDENTITY: &[u8] = b"test:console-uart";
+
+// A CONSOLE UART'S ROW OF THE SUITE'S OWN - claimable, carrying `PLATFORM_FLAG_CONSOLE`, eight ports at `base`
+// and the suite's hardware id - APPENDED WITHOUT THE PLACEMENT: other suites publish rows over the same UART, and
+// the placement would merge them into one row whose flags are the first description's. Answers the row, the
+// same one every time for the same base.
+#[cfg(test)]
+pub fn synthetic_console_row(base: u16) -> usize {
+	let mut table = DEVICES.lock();
+	if let Some(index) = table.iter().position(|entry| entry.platform.as_ref().is_some_and(|row| row.part.flags & abi::PLATFORM_FLAG_CONSOLE != 0) && entry.port_count > 0 && entry.ports[0].base == base) {
+		return index;
+	}
+	let mut description = platform::Description::new(abi::PLATFORM_SOURCE_KERNEL, abi::PLATFORM_STATE_CLAIMABLE, SYNTHETIC_CONSOLE_IDENTITY).expect("a test identity fits the bound");
+	description.part.flags |= abi::PLATFORM_FLAG_CONSOLE;
+	assert!(description.add_match(abi::MATCH_ID_HID, crate::dma_policy::SYNTHETIC_PLATFORM_HID) && description.add_port(base, 8), "a console row fits a description");
+	let index = table.len();
+	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
+	table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(alloc::boxed::Box::new(PlatformRow { part: description.part, properties: Vec::new() })) });
+	drop(table);
+	push_free_claim_slot();
+	index
+}
+
+// A QUARANTINED SLOT MADE FREE AGAIN, for the suite alone: a row a test quarantined on purpose would otherwise
+// be unclaimable by every later test that needs the same hardware - the console handoff's second UART is one
+// row, whatever identity a test gives it.
+#[cfg(test)]
+pub fn forget_quarantine_for_test(index: usize) {
+	let mut claims = CLAIMS.lock();
+	if let Some(slot) = claims.get_mut(index)
+		&& slot.state == ClaimState::Quarantined
+	{
+		slot.state = ClaimState::Free;
+		slot.release_deadline = 0;
 	}
 }
 
@@ -1729,6 +1852,11 @@ fn revoke_effects_of(object: &alloc::sync::Arc<dyn crate::object::KernelObject>)
 	// the round confirmed - an unconfirmed one quarantines the claim, as an unconfirmed MMIO flush does.
 	if let Some(range) = object.as_any().downcast_ref::<crate::object::port_range::PortRange>() {
 		return range.revoke();
+	}
+	// A CONSOLE TAP reads nothing more and wakes nobody; the UART goes back to the kernel at the end of the
+	// release.
+	if let Some(tap) = object.as_any().downcast_ref::<crate::object::console_tap::ConsoleTap>() {
+		tap.revoke();
 	}
 	true
 }
