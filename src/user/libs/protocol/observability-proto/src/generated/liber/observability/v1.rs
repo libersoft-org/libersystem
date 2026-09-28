@@ -1185,6 +1185,212 @@ pub mod supervisor {
 	}
 }
 
+/// THE ONE LIVENESS EXCHANGE THE HARDWARE WATCHDOG IS FED BY.
+///
+/// ServiceManager serves it from its STANDING supervise loop's wait set, on a channel it hands the watchdog
+/// service at each of that service's starts. An answer proves that the kernel schedules and delivers messages,
+/// that ServiceManager's standing loop is not deadlocked, and - because the watchdog service asked - that its own
+/// loop runs; the watchdog service pets its hardware only after an answer within its deadline. The loop answers
+/// nothing while it runs a sequence - an orderly shutdown, a sleep transaction - and each of those carries a
+/// step of its own for the watchdog.
+// interface `supervisor-liveness` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod supervisor_liveness {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_ALIVE: u16 = 1;
+
+	pub trait Service {
+		/// Answer `sequence`, which proves this answer is to this question.
+		fn alive(&mut self, sequence: u64) -> Result<u64, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:observability")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ALIVE => {
+				let sequence = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.alive(sequence);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v25) => {
+							w.u8(1)?;
+							w.u64(*v25)?;
+						}
+						Err(v26) => {
+							w.u8(0)?;
+							v26.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn alive(&mut self, sequence: &u64) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ALIVE)?;
+			w.u32(corr)?;
+			w.u64(*sequence)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u64()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_observability_supervisor_liveness_alive")]
+	fn channel_invoke_alive(chan: u64, sequence: &u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.alive(sequence)
+	}
+}
+
 impl ComponentType {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1432,13 +1638,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v26 = true;
-		for v25 in self.deps.iter() {
-			if !v26 {
+		let mut v28 = true;
+		for v27 in self.deps.iter() {
+			if !v28 {
 				out.push(',');
 			}
-			v26 = false;
-			crate::codec::json_escape(v25, out);
+			v28 = false;
+			crate::codec::json_escape(v27, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -1447,13 +1653,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"resources\":");
 		out.push('[');
-		let mut v28 = true;
-		for v27 in self.resources.iter() {
-			if !v28 {
+		let mut v30 = true;
+		for v29 in self.resources.iter() {
+			if !v30 {
 				out.push(',');
 			}
-			v28 = false;
-			v27.to_json_into(out);
+			v30 = false;
+			v29.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1471,13 +1677,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v30 = true;
-		for v29 in self.deps.iter() {
-			if !v30 {
+		let mut v32 = true;
+		for v31 in self.deps.iter() {
+			if !v32 {
 				out.push_str(", ");
 			}
-			v30 = false;
-			out.push_str(v29);
+			v32 = false;
+			out.push_str(v31);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -1486,13 +1692,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("resources=");
 		out.push('[');
-		let mut v32 = true;
-		for v31 in self.resources.iter() {
-			if !v32 {
+		let mut v34 = true;
+		for v33 in self.resources.iter() {
+			if !v34 {
 				out.push_str(", ");
 			}
-			v32 = false;
-			v31.to_text_into(out);
+			v34 = false;
+			v33.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1507,15 +1713,15 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v33 in self.deps.iter() {
-			crate::codec::cbor::text(out, v33);
+		for v35 in self.deps.iter() {
+			crate::codec::cbor::text(out, v35);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::array(out, self.resources.len());
-		for v34 in self.resources.iter() {
-			v34.to_cbor_into(out);
+		for v36 in self.resources.iter() {
+			v36.to_cbor_into(out);
 		}
 	}
 }
@@ -1647,13 +1853,13 @@ impl CoreIdle {
 		out.push(',');
 		out.push_str("\"sources\":");
 		out.push('[');
-		let mut v36 = true;
-		for v35 in self.sources.iter() {
-			if !v36 {
+		let mut v38 = true;
+		for v37 in self.sources.iter() {
+			if !v38 {
 				out.push(',');
 			}
-			v36 = false;
-			v35.to_json_into(out);
+			v38 = false;
+			v37.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1683,13 +1889,13 @@ impl CoreIdle {
 		out.push_str(", ");
 		out.push_str("sources=");
 		out.push('[');
-		let mut v38 = true;
-		for v37 in self.sources.iter() {
-			if !v38 {
+		let mut v40 = true;
+		for v39 in self.sources.iter() {
+			if !v40 {
 				out.push_str(", ");
 			}
-			v38 = false;
-			v37.to_text_into(out);
+			v40 = false;
+			v39.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1712,8 +1918,8 @@ impl CoreIdle {
 		crate::codec::cbor::uint(out, self.wakes_device as u64);
 		crate::codec::cbor::text(out, "sources");
 		crate::codec::cbor::array(out, self.sources.len());
-		for v39 in self.sources.iter() {
-			v39.to_cbor_into(out);
+		for v41 in self.sources.iter() {
+			v41.to_cbor_into(out);
 		}
 	}
 }
@@ -1738,20 +1944,8 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v41 = true;
-		for v40 in self.components.iter() {
-			if !v41 {
-				out.push(',');
-			}
-			v41 = false;
-			v40.to_json_into(out);
-		}
-		out.push(']');
-		out.push(',');
-		out.push_str("\"spans\":");
-		out.push('[');
 		let mut v43 = true;
-		for v42 in self.spans.iter() {
+		for v42 in self.components.iter() {
 			if !v43 {
 				out.push(',');
 			}
@@ -1760,15 +1954,27 @@ impl Graph {
 		}
 		out.push(']');
 		out.push(',');
-		out.push_str("\"cores\":");
+		out.push_str("\"spans\":");
 		out.push('[');
 		let mut v45 = true;
-		for v44 in self.cores.iter() {
+		for v44 in self.spans.iter() {
 			if !v45 {
 				out.push(',');
 			}
 			v45 = false;
 			v44.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"cores\":");
+		out.push('[');
+		let mut v47 = true;
+		for v46 in self.cores.iter() {
+			if !v47 {
+				out.push(',');
+			}
+			v47 = false;
+			v46.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1777,20 +1983,8 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v47 = true;
-		for v46 in self.components.iter() {
-			if !v47 {
-				out.push_str(", ");
-			}
-			v47 = false;
-			v46.to_text_into(out);
-		}
-		out.push(']');
-		out.push_str(", ");
-		out.push_str("spans=");
-		out.push('[');
 		let mut v49 = true;
-		for v48 in self.spans.iter() {
+		for v48 in self.components.iter() {
 			if !v49 {
 				out.push_str(", ");
 			}
@@ -1799,15 +1993,27 @@ impl Graph {
 		}
 		out.push(']');
 		out.push_str(", ");
-		out.push_str("cores=");
+		out.push_str("spans=");
 		out.push('[');
 		let mut v51 = true;
-		for v50 in self.cores.iter() {
+		for v50 in self.spans.iter() {
 			if !v51 {
 				out.push_str(", ");
 			}
 			v51 = false;
 			v50.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("cores=");
+		out.push('[');
+		let mut v53 = true;
+		for v52 in self.cores.iter() {
+			if !v53 {
+				out.push_str(", ");
+			}
+			v53 = false;
+			v52.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1816,18 +2022,18 @@ impl Graph {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v52 in self.components.iter() {
-			v52.to_cbor_into(out);
+		for v54 in self.components.iter() {
+			v54.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v53 in self.spans.iter() {
-			v53.to_cbor_into(out);
+		for v55 in self.spans.iter() {
+			v55.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "cores");
 		crate::codec::cbor::array(out, self.cores.len());
-		for v54 in self.cores.iter() {
-			v54.to_cbor_into(out);
+		for v56 in self.cores.iter() {
+			v56.to_cbor_into(out);
 		}
 	}
 }

@@ -4271,6 +4271,16 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 			txn.holds(driver_protocol::ResourceKind::ConsoleTap as u16, tap as u64);
 		}
 	}
+	// AND THE ROW'S DECLARED REGISTERS, where it declares any - a PCI function's arming registers, a chipset or
+	// firmware register in memory. The kernel answers `invalid` for a row that declares none, which is every other
+	// row; any other refusal ends the attempt, since a driver of a row that declares registers needs them.
+	let registers: i64 = device_resource_acquire(grant.claim, abi::RESOURCE_KIND_REGISTERS, 0);
+	if registers >= 0 {
+		txn.holds(driver_protocol::ResourceKind::Registers as u16, registers as u64);
+	} else if registers != ERR_INVALID {
+		refused(b"its declared registers - the kernel would not mint them");
+		return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+	}
 	let resource_count: usize = txn.held.resources().len();
 	node.granted_resources = resource_count as u32;
 	// WHICH RULE CHOSE THIS DRIVER, recorded where the choice is still in hand. An entry may
@@ -6185,6 +6195,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::I2C_BUS => proto::system::ProviderKind::I2cBus,
 		provider::GPIO_LINES => proto::system::ProviderKind::GpioLines,
 		provider::TPM => proto::system::ProviderKind::Tpm,
+		provider::WATCHDOG => proto::system::ProviderKind::Watchdog,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6215,6 +6226,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::I2cBus => driver_protocol::provider::I2C_BUS,
 		proto::system::ProviderKind::GpioLines => driver_protocol::provider::GPIO_LINES,
 		proto::system::ProviderKind::Tpm => driver_protocol::provider::TPM,
+		proto::system::ProviderKind::Watchdog => driver_protocol::provider::WATCHDOG,
 	}
 }
 

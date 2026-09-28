@@ -95,6 +95,10 @@ pub mod serial_port;
 // platform glue around it.
 pub mod snd;
 pub mod uart;
+// THE WATCHDOG DRIVERS' ARITHMETIC: one timeout divided across each device's stages and units.
+pub mod watchdog;
+// THE WATCHDOG ACTION TABLE, run as the register reads and writes it lists against what the kernel minted.
+pub mod wdat;
 // THE USB ATTACHED SCSI INFORMATION UNITS: the same SCSI command set as the Bulk-Only path, carried
 // over four pipes joined by a tag instead of two strictly in order. The tag is where a UAS driver is
 // wrong, and it is big-endian in a transport that is little-endian everywhere else.

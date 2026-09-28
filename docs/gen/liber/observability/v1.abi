@@ -13,3 +13,5 @@ method system-graph.snapshot op=1 () -> result<graph, liber:base@1::error>
 record supervisor-stat(name:string,state:string,desired:string,epoch:u64,last-reason:string,restarts:u32,watchdog-trips:u32,last-failure:string)
 interface supervisor
 method supervisor.status op=1 () -> result<list<supervisor-stat>, liber:base@1::error>
+interface supervisor-liveness
+method supervisor-liveness.alive op=1 (sequence:u64:rights=) -> result<u64, liber:base@1::error>

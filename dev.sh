@@ -16,7 +16,7 @@ declare -A SPECIAL=(
 	["gpu-restart"]="harness/dev-gpu-restart.py"
 )
 
-LAB_VERBS=(up down status console log ping publish generations type reset reboot restart stop key pointer clean loop rollback test launch)
+LAB_VERBS=(up down status console log ping publish generations type reset reboot restart stop key pointer clean loop rollback test launch kernel-console)
 
 help() {
 	usage_and_exit <<EOF

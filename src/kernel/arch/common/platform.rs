@@ -185,7 +185,7 @@ pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line
 			description.part.flags |= abi::PLATFORM_FLAG_UNRESOLVED;
 		}
 		// ALLOC-OK: boot, once per published node; the block is bounded by `MAX_DEVICE_PROPERTIES`.
-		out.push(Described { description, properties: properties[..block.len].to_vec(), targets });
+		out.push(Described { description, properties: properties[..block.len].to_vec(), targets, registers: Vec::new() });
 	}
 	out
 }

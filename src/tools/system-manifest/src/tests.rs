@@ -597,6 +597,8 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// DMA: the TPM driver moves every command through the interface's own buffer registers, and the
 			// console UART's driver every byte through its data register.
 			"tpm_driver" | "uart16550" => DmaPolicy::None,
+			// THE WATCHDOGS MASTER NOTHING: a timer is armed and fed through its registers.
+			"i6300esb" | "tco" | "wdat" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");

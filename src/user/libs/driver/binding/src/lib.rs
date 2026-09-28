@@ -1141,10 +1141,10 @@ impl IncidentWindow {
 // The most resources one bind hands over: the device MMIO, an MSI vector, a key sink, the trusted key
 // sink, a power connection and a console feed - the six a physical keyboard's driver is given - one
 // port range for each port resource a row can carry, a platform row's further register windows and its
-// wired lines, and the console UART's tap. A ledger that is full refuses the next entry, and DeviceManager does not look: at five,
+// wired lines, the console UART's tap, and a row's declared registers. A ledger that is full refuses the next entry, and DeviceManager does not look: at five,
 // the trusted key sink pushed the console feed out of every keyboard's bind, and nothing a person typed
 // reached the console.
-pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES + driver_protocol::MAX_PLATFORM_WINDOWS + driver_protocol::MAX_PLATFORM_LINES + 1;
+pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES + driver_protocol::MAX_PLATFORM_WINDOWS + driver_protocol::MAX_PLATFORM_LINES + 2;
 
 // What a rollback does to the world. Separated from the ledger so the ledger can be driven.
 //

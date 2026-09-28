@@ -51,6 +51,51 @@ fn cfg_phys(bus: u8, dev: u8, func: u8, off: u16) -> u64 {
 	(ECAM_BASE.load(Ordering::Relaxed) + ((bus as usize) << 20) + ((dev as usize) << 15) + ((func as usize) << 12) + off as usize) as u64
 }
 
+// ONE CONFIGURATION REGISTER AT EXACTLY ITS WIDTH - 1, 2 or 4 bytes, naturally aligned - for a claim holder's
+// declared register: a volatile access of that width at the register's own ECAM address, never a dword
+// read-modify-write, which a device that answers only the exact width answers by doing nothing. `None` for a
+// width or an alignment no register has, or before the window is known.
+pub fn config_read_exact(bus: u8, dev: u8, func: u8, off: u16, width: u8) -> Option<u32> {
+	if !exact(off, width) || ECAM_BASE.load(Ordering::Relaxed) == 0 || bus as u16 >= ECAM_BUSES {
+		return None;
+	}
+	let at = super::paging::phys_to_virt(cfg_phys(bus, dev, func, off));
+	// SAFETY: the ECAM window, reached through the direct map, at an aligned offset inside the function's page.
+	Some(unsafe {
+		match width {
+			1 => core::ptr::read_volatile(at as *const u8) as u32,
+			2 => core::ptr::read_volatile(at as *const u16) as u32,
+			_ => core::ptr::read_volatile(at as *const u32),
+		}
+	})
+}
+
+pub fn config_write_exact(bus: u8, dev: u8, func: u8, off: u16, width: u8, value: u32) -> bool {
+	if !exact(off, width) || ECAM_BASE.load(Ordering::Relaxed) == 0 || bus as u16 >= ECAM_BUSES {
+		return false;
+	}
+	let at = super::paging::phys_to_virt(cfg_phys(bus, dev, func, off));
+	// SAFETY: as in `config_read_exact`.
+	unsafe {
+		match width {
+			1 => core::ptr::write_volatile(at as *mut u8, value as u8),
+			2 => core::ptr::write_volatile(at as *mut u16, value as u16),
+			_ => core::ptr::write_volatile(at as *mut u32, value),
+		}
+	}
+	true
+}
+
+// A CHIPSET MEMORY REGISTER, which no row of this port declares - the rows that declare one (the ICH9's GCS, a
+// WDAT's system-memory registers) are x86_64's. So there is no window to map it in.
+pub fn map_declared(_phys: u64) -> Option<u64> {
+	None
+}
+
+fn exact(off: u16, width: u8) -> bool {
+	matches!(width, 1 | 2 | 4) && off % width as u16 == 0 && off as u32 + width as u32 <= 0x1000
+}
+
 // The config-space access mechanism: dword reads/writes through the ECAM MMIO window
 // (reached via the physical direct map, since the kernel runs higher-half). The
 // byte/word reads and every enumeration routine come from `common` unchanged.

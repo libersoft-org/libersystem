@@ -56,6 +56,8 @@ pub struct Resources {
 	pub line_count: usize,
 	// The kernel console's tap, for the console UART's driver alone.
 	pub console_tap: u64,
+	// The row's declared registers, for a row that declares any.
+	pub registers: u64,
 }
 
 // Read one frame. Answers with the header, the payload length, and every capability it carried.
@@ -151,6 +153,7 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 			proto::ResourceKind::Console => &mut resources.console,
 			proto::ResourceKind::TrustedKeys => &mut resources.trusted_keys,
 			proto::ResourceKind::ConsoleTap => &mut resources.console_tap,
+			proto::ResourceKind::Registers => &mut resources.registers,
 			// PORT RANGES ARE SEVERAL OF ONE KIND, kept in the order they came - the row's order. One past
 			// what a row can carry is closed, as a duplicate is.
 			proto::ResourceKind::PortRange => {

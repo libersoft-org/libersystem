@@ -2760,6 +2760,16 @@ pub fn console_tap_read(tap: u64, buf: &mut [u8]) -> (i64, u64) {
 	(n, dropped)
 }
 
+// ONE DECLARED REGISTER of a claimed row, by its index in the row's declaration, at exactly its width - see
+// `SYS_DEVICE_REGISTER_READ` / `_WRITE`. The value, or a negative error.
+pub fn device_register_read(registers: u64, which: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_REGISTER_READ, registers, which, 0, 0) as i64 }
+}
+
+pub fn device_register_write(registers: u64, which: u64, value: u32) -> i64 {
+	unsafe { syscall(SYS_DEVICE_REGISTER_WRITE, registers, which, value as u64, 0) as i64 }
+}
+
 // A DEVELOPMENT BUILD'S KERNEL CONSOLE REQUEST - see `SYS_DEV_CONSOLE` - for a holder of the console input
 // privilege. `ERR_BAD_SYSCALL` from a kernel built for any other image.
 pub fn dev_console(privilege: u64, request: u64) -> i64 {

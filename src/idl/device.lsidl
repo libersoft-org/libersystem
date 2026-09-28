@@ -330,6 +330,11 @@ enum provider-kind {
 	/// A TPM 2.0'S TYPED OPERATIONS, the `liber:tpm` `tpm-device` contract, which TpmService alone consumes.
 	/// Applications reach the TPM through minted `tpm` connections and never through this kind.
 	tpm = 24,
+	/// A HARDWARE WATCHDOG - a timer outside the processor that resets the machine unless it is told in time that
+	/// the system is alive - the `watchdog` contract below, published under the device's name (`wdat`, `tco`,
+	/// `i6300esb`, `bmc`). The watchdog service alone consumes it, and pets it only while ServiceManager's
+	/// standing loop answers.
+	watchdog = 25,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by
@@ -696,4 +701,42 @@ record usb-device {
 /// devices come and go from the list. The `lsusb` inventory reads this.
 interface usb {
 	@op(1) list: func() -> result<list<usb-device>, error>;
+}
+
+/// WHAT A WATCHDOG IS, as its driver read it at bind.
+///
+/// THE TIMEOUT IS ONE NUMBER: the time from the last pet to the reset. Each driver divides it across its device's
+/// stages; a request is rounded DOWN to `granularity-ms` and refused below `min-timeout-ms`.
+record watchdog-description {
+	/// The device, as its publication is named - what the policy key `watchdog.device` names.
+	@bound(16) device:         string,
+	min-timeout-ms:            u32,
+	max-timeout-ms:            u32,
+	granularity-ms:            u32,
+	/// False for a timer that cannot be stopped once it runs - a locked one.
+	can-disarm:                bool,
+	/// True for a timer that keeps counting across the platform's reset - a BMC's.
+	survives-reset:            bool,
+	/// Whether the device stops counting in suspend to idle, and in S3.
+	stops-in-suspend-to-idle:  bool,
+	stops-in-s3:               bool,
+	/// The timer was running when the driver bound - left by the firmware or by a driver that died.
+	running-at-bind:           bool,
+	/// The LAST reset was this watchdog's, read and cleared by the driver at bind.
+	last-reset-was-watchdog:   bool,
+}
+
+/// THE DEVICE-SIDE CONTRACT A `watchdog` PROVIDER SERVES, to one consumer.
+///
+/// THE DRIVER PETS ONLY WHEN ITS CONSUMER ASKS - never on a timer of its own, except the bounded takeover of a
+/// timer found running at bind - and DOES NOT DISARM when its consumer's channel closes: a watchdog nobody feeds is
+/// a watchdog doing its work.
+interface watchdog {
+	@op(1) describe: func() -> result<watchdog-description, error>;
+	/// Arm with a timeout, answering the effective one. The count starts at the arm, so an arm is also a pet.
+	/// `unsupported` from a device that cannot reset the machine as it stands - a TCO whose No-Reboot stays set.
+	@op(2) arm:      func(timeout-ms: u32) -> result<u32, error>;
+	@op(3) pet:      func() -> result<unit, error>;
+	/// `unsupported` where the device cannot stop.
+	@op(4) disarm:   func() -> result<unit, error>;
 }

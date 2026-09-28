@@ -2937,7 +2937,7 @@ pub(crate) fn synthetic_platform_description(identity: &[u8]) -> platform::Descr
 // Publish it through the checks and the placement a boot's description goes through: the row it became or
 // joined, or None where it was refused.
 pub(crate) fn publish_synthetic_platform(description: platform::Description) -> Option<usize> {
-	device::add_synthetic_platform_row(device::Described { description, properties: Vec::new(), targets: Vec::new() })
+	device::add_synthetic_platform_row(device::Described { description, properties: Vec::new(), targets: Vec::new(), registers: Vec::new() })
 }
 
 // Where the no-execute probe's recorded fault lands (mirrors the FAULT_* statics).

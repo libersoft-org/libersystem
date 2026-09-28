@@ -223,6 +223,28 @@ test = false
 bench = false
 
 [[bin]]
+# THE HARDWARE WATCHDOGS, each a `watchdog` provider published under its device's name: the Intel 6300ESB on the
+# PCI bus of all three targets, the ICH9 chipset's TCO on x86_64 q35, and the ACPI WDAT's, run as the register
+# accesses its table lists. Their shared arithmetic, provider and WDAT interpreter are `src/watchdog.rs` and
+# `src/wdat.rs`, in the library and host-tested.
+name = "i6300esb"
+path = "src/i6300esb.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "tco"
+path = "src/tco.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "wdat"
+path = "src/wdat_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "xhci"
 path = "src/xhci.rs"
 test = false
@@ -270,6 +292,8 @@ smartcard-model = { path = "../../libs/smartcard/model" }
 bootproto = { path = "../../../boot/protocol" }
 # TPM 2.0 below the binding - the two transports and the typed operations - which the TPM driver runs.
 tpm = { path = "../../../tpm" }
+# THE ACPI TABLE READER, for the WDAT a watchdog driver runs: the same bounded reader the kernel parses it with.
+acpi = { path = "../../../acpi" }
 
 
 # THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are

@@ -19,3 +19,6 @@ method process.launch-prepared-limited op=11 (name:string:rights=,limits:resourc
 interface system-power
 method system-power.reboot op=1 () -> result<unit, liber:base@1::error>
 method system-power.power-off op=2 () -> result<unit, liber:base@1::error>
+enum shutdown-action(power-off=1,reboot=2)
+interface shutdown-notice
+method shutdown-notice.prepare op=1 (action:shutdown-action:rights=) -> result<unit, liber:base@1::error>

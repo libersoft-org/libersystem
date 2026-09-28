@@ -605,6 +605,13 @@ pub const RESOURCE_KIND_LINE: u64 = 3;
 // ready to wait on when the ring goes from empty to holding bytes. The release revokes it and gives the
 // UART back to the kernel.
 pub const RESOURCE_KIND_CONSOLE_TAP: u64 = 4;
+// A CLAIMED ROW'S DECLARED REGISTERS - `index` 0 - for a row that declares any: a PCI function whose (vendor,
+// device) row names configuration registers (the i6300esb's 0x60 as a word and 0x68 as a byte) or a chipset
+// register in memory (the ICH9's GCS), and a platform row whose firmware names system-memory registers (a WDAT's).
+// Answered as a `Registers` capability with `RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER`, derived from the claim;
+// `SYS_DEVICE_REGISTER_READ` and `SYS_DEVICE_REGISTER_WRITE` reach one register at a time, by its index in the
+// row's declaration, at EXACTLY its declared width. ERR_INVALID for a row that declares none.
+pub const RESOURCE_KIND_REGISTERS: u64 = 5;
 
 // Where a row's port resource came from.
 //
@@ -1311,6 +1318,7 @@ pub const OBJECT_TYPE_WAIT_SET: u64 = 13;
 pub const OBJECT_TYPE_CLAIM: u64 = 14;
 pub const OBJECT_TYPE_PORT_RANGE: u64 = 15;
 pub const OBJECT_TYPE_CONSOLE_TAP: u64 = 16;
+pub const OBJECT_TYPE_REGISTERS: u64 = 17;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1462,11 +1470,13 @@ pub struct IrqInfo {
 // riscv64. Wakes per second are two of these readings and the time between them.
 pub const SYS_CPU_IDLE_INFO: u64 = 95;
 // THE PROPERTY BLOCK OF A CLAIMED PLATFORM ROW - `SYS_DEVICE_PROPERTIES(handle, buf, len)` - for the claim
-// handle, or the `DeviceMemory` minted from a claim that is still the device's current binding, carrying
-// `RIGHT_READ`: the device-tree node's properties and its child nodes' (bounded), with every `fixed-clock`
-// reference resolved to its frequency and every other reference listed unresolved, in the record format
-// `DEVICE_PROPERTY_*` describes. Answers the block's length, copying what fits; ERR_UNSUPPORTED for a row
-// that has none. The driver reads it through the register window it was given - the claim stays its manager's.
+// handle, or the `DeviceMemory` or declared `Registers` minted from a claim that is still the device's current
+// binding, carrying `RIGHT_READ`: the device-tree node's properties and its child nodes' (bounded), with every
+// `fixed-clock` reference resolved to its frequency and every other reference listed unresolved, in the record
+// format `DEVICE_PROPERTY_*` describes; for a static table's row, the table itself as one VALUE record named by
+// its signature - a WDAT's instructions, which its driver runs. Answers the block's length, copying what fits;
+// ERR_UNSUPPORTED for a row that has none. The driver reads it through the register window or the declared
+// registers it was given - the claim stays its manager's.
 pub const SYS_DEVICE_PROPERTIES: u64 = 96;
 // THE CONSOLE TAP'S READ - `SYS_CONSOLE_TAP_READ(tap, buf, len, dropped)` - for a tap handle carrying
 // `RIGHT_READ`: moves at most `len` bytes of the kernel console's output out of its transmit ring into `buf`,
@@ -1487,6 +1497,13 @@ pub const SYS_DEV_CONSOLE: u64 = 98;
 pub const DEV_CONSOLE_HOLD_AND_FLOOD: u64 = 1;
 pub const DEV_CONSOLE_PANIC: u64 = 2;
 pub const DEV_CONSOLE_KILL_HOLDER: u64 = 3;
+// ONE DECLARED REGISTER - `SYS_DEVICE_REGISTER_READ(registers, index)` answers its value (as a non-negative i64),
+// `SYS_DEVICE_REGISTER_WRITE(registers, index, value)` writes it and answers 0 - for a `Registers` handle carrying
+// `RIGHT_READ` or `RIGHT_WRITE`. The access is at exactly the register's declared width, and a write changes only the
+// bits of its declared mask. ERR_INVALID for an index the row does not declare; ERR_ACCESS_DENIED once the claim the
+// capability was minted from is not the device's current binding.
+pub const SYS_DEVICE_REGISTER_READ: u64 = 99;
+pub const SYS_DEVICE_REGISTER_WRITE: u64 = 100;
 
 // The records of a property block, each `[kind u8][depth u8][name_len u16][value_len u32][name][value]`
 // with the value padded to four bytes: a NODE opens a child at `depth` (the device's own node is depth 0

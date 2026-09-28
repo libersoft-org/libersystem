@@ -3035,6 +3035,63 @@ heartbeat-deadline = 100
 # no DMA - a UART moves every byte through its data register. ONE publication, under the kernel console's name,
 # for ConsoleService alone. Bound by the row's `PNP0501` id, which only the console's row carries while the
 # namespace is not enumerated.
+# THE HARDWARE WATCHDOGS: timers outside the processor that reset the machine unless told in time that the system is
+# alive, each ONE `watchdog` provider under its device's name for the watchdog service alone, and each masters
+# nothing. The Intel 6300ESB, a PCI function on every target, reached through BAR 0 and its two declared
+# configuration registers; the ICH9 chipset's TCO, through the LPC/TCO derivation's port range and GCS as a declared
+# register - refused on a machine with a WDAT; and the WDAT's, run as the register accesses its table lists.
+[[programs]]
+name = "i6300esb"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/i6300esb.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x08, pci-subclass = 0x80, pci-vendor = 0x8086, pci-product = 0x25ab },
+]
+provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
+[[programs]]
+name = "tco"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/tco.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x06, pci-subclass = 0x01, pci-vendor = 0x8086, pci-product = 0x2918 },
+]
+provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
+[[programs]]
+name = "wdat"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/wdat.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", table = "WDAT" }]
+provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
 [[programs]]
 name = "uart16550"
 owner = "drivers"

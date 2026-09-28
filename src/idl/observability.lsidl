@@ -160,3 +160,16 @@ record supervisor-stat {
 interface supervisor {
 	@op(1) status: func() -> result<list<supervisor-stat>, error>;
 }
+
+/// THE ONE LIVENESS EXCHANGE THE HARDWARE WATCHDOG IS FED BY.
+///
+/// ServiceManager serves it from its STANDING supervise loop's wait set, on a channel it hands the watchdog
+/// service at each of that service's starts. An answer proves that the kernel schedules and delivers messages,
+/// that ServiceManager's standing loop is not deadlocked, and - because the watchdog service asked - that its own
+/// loop runs; the watchdog service pets its hardware only after an answer within its deadline. The loop answers
+/// nothing while it runs a sequence - an orderly shutdown, a sleep transaction - and each of those carries a
+/// step of its own for the watchdog.
+interface supervisor-liveness {
+	/// Answer `sequence`, which proves this answer is to this question.
+	@op(1) alive: func(sequence: u64) -> result<u64, error>;
+}

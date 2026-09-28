@@ -222,16 +222,21 @@ struct Derivation {
 	suppressed_by: Option<[u8; 4]>,
 }
 
-// THE TABLE SHIPS WITH NO ROWS. Each consumer writes its own, with its own milestone.
-#[cfg(not(test))]
-const DERIVATIONS: &[Derivation] = &[];
+// THE ICH9 LPC BRIDGE'S TCO WATCHDOG - the table's first production row, the watchdog milestone's. Over q35's ICH9
+// LPC bridge and its ACPI PM block (PMBASE, config 0x40, bits 15:7; ACPI_EN, config 0x44 bit 7; the block agreeing
+// with the FADT's PM1a event block at its start), EXACTLY PM base + 0x60..0x7F and nothing else of the block: PM1,
+// the PM timer, GPE0 and SMI_EN stay the kernel's. WHEN A WDAT IS PRESENT THE ROW IS NOT APPLIED - the ACPI
+// watchdog wins, as it does in Linux's `lpc_ich` - and the function's claim is refused (`crate::declared`).
+const ICH9_TCO: Derivation = Derivation { name: "ich9-tco", vendor: 0x8086, device: 0x2918, base_register: 0x40, base_mask: 0xFF80, block_len: 128, sub_ranges: &[(0x60, 32)], decode_enable: Some((0x44, 0x80)), agrees_with: Some((acpi::Fadt::pm1a_event, 0)), suppressed_by: Some(*b"WDAT") };
 
-// The test build's two, over q35's ICH9 LPC bridge and its ACPI PM block (PMBASE, config 0x40, bits
-// 15:7; ACPI_EN, config 0x44 bit 7; the block agreeing with the FADT's PM1a event block at its start):
-// the TCO sub-range, which the reserved set admits, and PM1's, which it refuses at the boot scan.
+#[cfg(not(test))]
+const DERIVATIONS: &[Derivation] = &[ICH9_TCO];
+
+// The test build adds one row over the same block whose sub-range is PM1's, which the reserved set refuses at the
+// boot scan.
 #[cfg(test)]
 const DERIVATIONS: &[Derivation] = &[
-	Derivation { name: "test:ich9-tco", vendor: 0x8086, device: 0x2918, base_register: 0x40, base_mask: 0xFF80, block_len: 128, sub_ranges: &[(0x60, 32)], decode_enable: Some((0x44, 0x80)), agrees_with: Some((acpi::Fadt::pm1a_event, 0)), suppressed_by: None },
+	ICH9_TCO,
 	Derivation { name: "test:ich9-pm1", vendor: 0x8086, device: 0x2918, base_register: 0x40, base_mask: 0xFF80, block_len: 128, sub_ranges: &[(0x00, 4)], decode_enable: Some((0x44, 0x80)), agrees_with: Some((acpi::Fadt::pm1a_event, 0)), suppressed_by: None },
 ];
 

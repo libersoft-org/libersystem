@@ -213,6 +213,8 @@ pub enum ProviderKindName {
 	GpioLines,
 	/// A TPM 2.0's typed operations, with TpmService its one consumer.
 	Tpm,
+	/// A hardware watchdog, with the watchdog service its one consumer.
+	Watchdog,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -259,6 +261,7 @@ impl ProviderKindName {
 			ProviderKindName::I2cBus => 22,
 			ProviderKindName::GpioLines => 23,
 			ProviderKindName::Tpm => 24,
+			ProviderKindName::Watchdog => 25,
 		}
 	}
 }

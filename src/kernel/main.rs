@@ -14,6 +14,7 @@ extern crate alloc;
 mod arch;
 mod console;
 mod console_input;
+mod declared;
 mod device;
 mod dma_policy;
 mod elf;

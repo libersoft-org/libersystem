@@ -140,13 +140,14 @@ fn a_payload_of_the_wrong_shape_is_refused_for_every_opcode_that_has_one() {
 #[test]
 fn a_field_outside_its_closed_set_is_refused_and_the_number_is_reported() {
 	// EACH SET IS PROBED ONE PAST ITS OWN END, the number its next member would take: the resource kinds end at
-	// the kernel console's tap, the failure codes at five.
+	// a row's declared registers, the failure codes at five.
 	assert_eq!(decode_resource(&6u16.to_le_bytes()), Ok(ResourceKind::TrustedKeys), "the trusted key sink is a member");
 	assert_eq!(decode_resource(&7u16.to_le_bytes()), Ok(ResourceKind::PortRange), "and so is the port range");
 	assert_eq!(decode_resource(&8u16.to_le_bytes()), Ok(ResourceKind::Mmio), "and a platform row's further register window");
 	assert_eq!(decode_resource(&9u16.to_le_bytes()), Ok(ResourceKind::Line), "and its wired line");
 	assert_eq!(decode_resource(&10u16.to_le_bytes()), Ok(ResourceKind::ConsoleTap), "and the kernel console's tap");
-	for raw in [0u16, 11, 0xffff] {
+	assert_eq!(decode_resource(&11u16.to_le_bytes()), Ok(ResourceKind::Registers), "and a row's declared registers");
+	for raw in [0u16, 12, 0xffff] {
 		assert_eq!(decode_resource(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "resource kind {raw}");
 	}
 	for raw in [0u16, 6, 0xffff] {

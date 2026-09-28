@@ -17,3 +17,11 @@ fn resource_limits_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(ResourceLimits::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn shutdown_action_wire_is_stable() {
+	let sample = ShutdownAction::PowerOff;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(ShutdownAction::decode(&bytes).unwrap(), sample);
+}

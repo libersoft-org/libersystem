@@ -1441,6 +1441,11 @@ pub enum ProviderKind {
 	/// A TPM 2.0'S TYPED OPERATIONS, the `liber:tpm` `tpm-device` contract, which TpmService alone consumes.
 	/// Applications reach the TPM through minted `tpm` connections and never through this kind.
 	Tpm = 24,
+	/// A HARDWARE WATCHDOG - a timer outside the processor that resets the machine unless it is told in time that
+	/// the system is alive - the `watchdog` contract below, published under the device's name (`wdat`, `tco`,
+	/// `i6300esb`, `bmc`). The watchdog service alone consumes it, and pets it only while ServiceManager's
+	/// standing loop answers.
+	Watchdog = 25,
 }
 
 impl ProviderKind {
@@ -1507,6 +1512,7 @@ impl ProviderKind {
 			22 => Some(ProviderKind::I2cBus),
 			23 => Some(ProviderKind::GpioLines),
 			24 => Some(ProviderKind::Tpm),
+			25 => Some(ProviderKind::Watchdog),
 			_ => None,
 		}
 	}
@@ -4616,6 +4622,533 @@ pub mod usb {
 	}
 }
 
+/// WHAT A WATCHDOG IS, as its driver read it at bind.
+///
+/// THE TIMEOUT IS ONE NUMBER: the time from the last pet to the reset. Each driver divides it across its device's
+/// stages; a request is rounded DOWN to `granularity-ms` and refused below `min-timeout-ms`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatchdogDescription {
+	/// The device, as its publication is named - what the policy key `watchdog.device` names.
+	pub device: String,
+	pub min_timeout_ms: u32,
+	pub max_timeout_ms: u32,
+	pub granularity_ms: u32,
+	/// False for a timer that cannot be stopped once it runs - a locked one.
+	pub can_disarm: bool,
+	/// True for a timer that keeps counting across the platform's reset - a BMC's.
+	pub survives_reset: bool,
+	/// Whether the device stops counting in suspend to idle, and in S3.
+	pub stops_in_suspend_to_idle: bool,
+	pub stops_in_s3: bool,
+	/// The timer was running when the driver bound - left by the firmware or by a driver that died.
+	pub running_at_bind: bool,
+	/// The LAST reset was this watchdog's, read and cleared by the driver at bind.
+	pub last_reset_was_watchdog: bool,
+}
+
+impl WatchdogDescription {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<WatchdogDescription> {
+		let mut r = Reader::new(bytes);
+		let value = WatchdogDescription::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<WatchdogDescription> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = WatchdogDescription::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.device.as_bytes())?;
+		w.u32(self.min_timeout_ms)?;
+		w.u32(self.max_timeout_ms)?;
+		w.u32(self.granularity_ms)?;
+		w.boolean(self.can_disarm)?;
+		w.boolean(self.survives_reset)?;
+		w.boolean(self.stops_in_suspend_to_idle)?;
+		w.boolean(self.stops_in_s3)?;
+		w.boolean(self.running_at_bind)?;
+		w.boolean(self.last_reset_was_watchdog)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<WatchdogDescription> {
+		let device = {
+			let v67 = r.string_lp()?;
+			(v67.len() <= 16).then_some(v67)?
+		};
+		let min_timeout_ms = r.u32()?;
+		let max_timeout_ms = r.u32()?;
+		let granularity_ms = r.u32()?;
+		let can_disarm = r.boolean()?;
+		let survives_reset = r.boolean()?;
+		let stops_in_suspend_to_idle = r.boolean()?;
+		let stops_in_s3 = r.boolean()?;
+		let running_at_bind = r.boolean()?;
+		let last_reset_was_watchdog = r.boolean()?;
+		Some(WatchdogDescription { device, min_timeout_ms, max_timeout_ms, granularity_ms, can_disarm, survives_reset, stops_in_suspend_to_idle, stops_in_s3, running_at_bind, last_reset_was_watchdog })
+	}
+}
+
+/// THE DEVICE-SIDE CONTRACT A `watchdog` PROVIDER SERVES, to one consumer.
+///
+/// THE DRIVER PETS ONLY WHEN ITS CONSUMER ASKS - never on a timer of its own, except the bounded takeover of a
+/// timer found running at bind - and DOES NOT DISARM when its consumer's channel closes: a watchdog nobody feeds is
+/// a watchdog doing its work.
+// interface `watchdog` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod watchdog {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_DESCRIBE: u16 = 1;
+	pub const OP_ARM: u16 = 2;
+	pub const OP_PET: u16 = 3;
+	pub const OP_DISARM: u16 = 4;
+
+	pub trait Service {
+		fn describe(&mut self) -> Result<WatchdogDescription, Error>;
+		/// Arm with a timeout, answering the effective one. The count starts at the arm, so an arm is also a pet.
+		/// `unsupported` from a device that cannot reset the machine as it stands - a TCO whose No-Reboot stays set.
+		fn arm(&mut self, timeout_ms: u32) -> Result<u32, Error>;
+		fn pet(&mut self) -> Result<(), Error>;
+		/// `unsupported` where the device cannot stop.
+		fn disarm(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:device")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_DESCRIBE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.describe();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v68) => {
+							w.u8(1)?;
+							v68.write(w)?;
+						}
+						Err(v69) => {
+							w.u8(0)?;
+							v69.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_ARM => {
+				let timeout_ms = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.arm(timeout_ms);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v70) => {
+							w.u8(1)?;
+							w.u32(*v70)?;
+						}
+						Err(v71) => {
+							w.u8(0)?;
+							v71.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_PET => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.pet();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v72) => {
+							w.u8(1)?;
+						}
+						Err(v73) => {
+							w.u8(0)?;
+							v73.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_DISARM => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.disarm();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v74) => {
+							w.u8(1)?;
+						}
+						Err(v75) => {
+							w.u8(0)?;
+							v75.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn describe(&mut self) -> Option<Result<WatchdogDescription, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DESCRIBE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(WatchdogDescription::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn arm(&mut self, timeout_ms: &u32) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ARM)?;
+			w.u32(corr)?;
+			w.u32(*timeout_ms)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn pet(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_PET)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn disarm(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DISARM)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_watchdog_describe")]
+	fn channel_invoke_describe(chan: u64) -> Option<Result<WatchdogDescription, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.describe()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_watchdog_arm")]
+	fn channel_invoke_arm(chan: u64, timeout_ms: &u32) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.arm(timeout_ms)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_watchdog_pet")]
+	fn channel_invoke_pet(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.pet()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_watchdog_disarm")]
+	fn channel_invoke_disarm(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.disarm()
+	}
+}
+
 impl DeviceType {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -4718,25 +5251,25 @@ impl DeviceEntry {
 		out.push(',');
 		out.push_str("\"ids\":");
 		out.push('[');
-		let mut v68 = true;
-		for v67 in self.ids.iter() {
-			if !v68 {
+		let mut v77 = true;
+		for v76 in self.ids.iter() {
+			if !v77 {
 				out.push(',');
 			}
-			v68 = false;
-			v67.to_json_into(out);
+			v77 = false;
+			v76.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"resources\":");
 		out.push('[');
-		let mut v70 = true;
-		for v69 in self.resources.iter() {
-			if !v70 {
+		let mut v79 = true;
+		for v78 in self.resources.iter() {
+			if !v79 {
 				out.push(',');
 			}
-			v70 = false;
-			v69.to_json_into(out);
+			v79 = false;
+			v78.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -4789,25 +5322,25 @@ impl DeviceEntry {
 		out.push_str(", ");
 		out.push_str("ids=");
 		out.push('[');
-		let mut v72 = true;
-		for v71 in self.ids.iter() {
-			if !v72 {
+		let mut v81 = true;
+		for v80 in self.ids.iter() {
+			if !v81 {
 				out.push_str(", ");
 			}
-			v72 = false;
-			v71.to_text_into(out);
+			v81 = false;
+			v80.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("resources=");
 		out.push('[');
-		let mut v74 = true;
-		for v73 in self.resources.iter() {
-			if !v74 {
+		let mut v83 = true;
+		for v82 in self.resources.iter() {
+			if !v83 {
 				out.push_str(", ");
 			}
-			v74 = false;
-			v73.to_text_into(out);
+			v83 = false;
+			v82.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4845,13 +5378,13 @@ impl DeviceEntry {
 		crate::codec::cbor::text(out, &self.identity);
 		crate::codec::cbor::text(out, "ids");
 		crate::codec::cbor::array(out, self.ids.len());
-		for v75 in self.ids.iter() {
-			v75.to_cbor_into(out);
+		for v84 in self.ids.iter() {
+			v84.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::array(out, self.resources.len());
-		for v76 in self.resources.iter() {
-			v76.to_cbor_into(out);
+		for v85 in self.resources.iter() {
+			v85.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "unresolved");
 		crate::codec::cbor::boolean(out, self.unresolved);
@@ -5405,8 +5938,8 @@ impl BindingRecord {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v77) => {
-				let _ = write!(out, "{}", v77);
+			Some(v86) => {
+				let _ = write!(out, "{}", v86);
 			}
 			None => {
 				out.push_str("null");
@@ -5454,8 +5987,8 @@ impl BindingRecord {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v78) => {
-				let _ = write!(out, "{}", v78);
+			Some(v87) => {
+				let _ = write!(out, "{}", v87);
 			}
 			None => {
 				out.push('-');
@@ -5491,8 +6024,8 @@ impl BindingRecord {
 		crate::codec::cbor::uint(out, self.resources as u64);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v79) => {
-				crate::codec::cbor::uint(out, *v79 as u64);
+			Some(v88) => {
+				crate::codec::cbor::uint(out, *v88 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5543,6 +6076,7 @@ impl ProviderKind {
 			ProviderKind::I2cBus => out.push_str("\"i2c-bus\""),
 			ProviderKind::GpioLines => out.push_str("\"gpio-lines\""),
 			ProviderKind::Tpm => out.push_str("\"tpm\""),
+			ProviderKind::Watchdog => out.push_str("\"watchdog\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -5571,6 +6105,7 @@ impl ProviderKind {
 			ProviderKind::I2cBus => out.push_str("i2c-bus"),
 			ProviderKind::GpioLines => out.push_str("gpio-lines"),
 			ProviderKind::Tpm => out.push_str("tpm"),
+			ProviderKind::Watchdog => out.push_str("watchdog"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -5599,6 +6134,7 @@ impl ProviderKind {
 			ProviderKind::I2cBus => crate::codec::cbor::text(out, "i2c-bus"),
 			ProviderKind::GpioLines => crate::codec::cbor::text(out, "gpio-lines"),
 			ProviderKind::Tpm => crate::codec::cbor::text(out, "tpm"),
+			ProviderKind::Watchdog => crate::codec::cbor::text(out, "watchdog"),
 		}
 	}
 }
@@ -5654,8 +6190,8 @@ impl ProviderInfo {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v80) => {
-				let _ = write!(out, "{}", v80);
+			Some(v89) => {
+				let _ = write!(out, "{}", v89);
 			}
 			None => {
 				out.push_str("null");
@@ -5698,8 +6234,8 @@ impl ProviderInfo {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v81) => {
-				let _ = write!(out, "{}", v81);
+			Some(v90) => {
+				let _ = write!(out, "{}", v90);
 			}
 			None => {
 				out.push('-');
@@ -5729,8 +6265,8 @@ impl ProviderInfo {
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v82) => {
-				crate::codec::cbor::uint(out, *v82 as u64);
+			Some(v91) => {
+				crate::codec::cbor::uint(out, *v91 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5908,8 +6444,8 @@ impl IncidentReport {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v83) => {
-				let _ = write!(out, "{}", v83);
+			Some(v92) => {
+				let _ = write!(out, "{}", v92);
 			}
 			None => {
 				out.push_str("null");
@@ -5977,8 +6513,8 @@ impl IncidentReport {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v84) => {
-				let _ = write!(out, "{}", v84);
+			Some(v93) => {
+				let _ = write!(out, "{}", v93);
 			}
 			None => {
 				out.push('-');
@@ -6022,8 +6558,8 @@ impl IncidentReport {
 		crate::codec::cbor::uint(out, self.dma_used as u64);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v85) => {
-				crate::codec::cbor::uint(out, *v85 as u64);
+			Some(v94) => {
+				crate::codec::cbor::uint(out, *v94 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -6215,13 +6751,13 @@ impl HciPacket {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v87 = true;
-		for v86 in self.bytes.iter() {
-			if !v87 {
+		let mut v96 = true;
+		for v95 in self.bytes.iter() {
+			if !v96 {
 				out.push(',');
 			}
-			v87 = false;
-			let _ = write!(out, "{}", v86);
+			v96 = false;
+			let _ = write!(out, "{}", v95);
 		}
 		out.push(']');
 		out.push('}');
@@ -6236,13 +6772,13 @@ impl HciPacket {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v89 = true;
-		for v88 in self.bytes.iter() {
-			if !v89 {
+		let mut v98 = true;
+		for v97 in self.bytes.iter() {
+			if !v98 {
 				out.push_str(", ");
 			}
-			v89 = false;
-			let _ = write!(out, "{}", v88);
+			v98 = false;
+			let _ = write!(out, "{}", v97);
 		}
 		out.push(']');
 		out.push('}');
@@ -6255,8 +6791,8 @@ impl HciPacket {
 		crate::codec::cbor::uint(out, self.epoch as u64);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v90 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v90 as u64);
+		for v99 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v99 as u64);
 		}
 	}
 }
@@ -6406,13 +6942,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v92 = true;
-		for v91 in self.bytes.iter() {
-			if !v92 {
+		let mut v101 = true;
+		for v100 in self.bytes.iter() {
+			if !v101 {
 				out.push(',');
 			}
-			v92 = false;
-			let _ = write!(out, "{}", v91);
+			v101 = false;
+			let _ = write!(out, "{}", v100);
 		}
 		out.push(']');
 		out.push('}');
@@ -6421,13 +6957,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v94 = true;
-		for v93 in self.bytes.iter() {
-			if !v94 {
+		let mut v103 = true;
+		for v102 in self.bytes.iter() {
+			if !v103 {
 				out.push_str(", ");
 			}
-			v94 = false;
-			let _ = write!(out, "{}", v93);
+			v103 = false;
+			let _ = write!(out, "{}", v102);
 		}
 		out.push(']');
 		out.push('}');
@@ -6436,8 +6972,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v95 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v95 as u64);
+		for v104 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v104 as u64);
 		}
 	}
 }
@@ -6514,6 +7050,161 @@ impl UsbDevice {
 		crate::codec::cbor::uint(out, self.class as u64);
 		crate::codec::cbor::text(out, "type");
 		crate::codec::cbor::text(out, &self.r#type);
+	}
+}
+
+impl WatchdogDescription {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"device\":");
+		crate::codec::json_escape(&self.device, out);
+		out.push(',');
+		out.push_str("\"min-timeout-ms\":");
+		let _ = write!(out, "{}", self.min_timeout_ms);
+		out.push(',');
+		out.push_str("\"max-timeout-ms\":");
+		let _ = write!(out, "{}", self.max_timeout_ms);
+		out.push(',');
+		out.push_str("\"granularity-ms\":");
+		let _ = write!(out, "{}", self.granularity_ms);
+		out.push(',');
+		out.push_str("\"can-disarm\":");
+		if self.can_disarm {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"survives-reset\":");
+		if self.survives_reset {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"stops-in-suspend-to-idle\":");
+		if self.stops_in_suspend_to_idle {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"stops-in-s3\":");
+		if self.stops_in_s3 {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"running-at-bind\":");
+		if self.running_at_bind {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"last-reset-was-watchdog\":");
+		if self.last_reset_was_watchdog {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("device=");
+		out.push_str(&self.device);
+		out.push_str(", ");
+		out.push_str("min-timeout-ms=");
+		let _ = write!(out, "{}", self.min_timeout_ms);
+		out.push_str(", ");
+		out.push_str("max-timeout-ms=");
+		let _ = write!(out, "{}", self.max_timeout_ms);
+		out.push_str(", ");
+		out.push_str("granularity-ms=");
+		let _ = write!(out, "{}", self.granularity_ms);
+		out.push_str(", ");
+		out.push_str("can-disarm=");
+		if self.can_disarm {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("survives-reset=");
+		if self.survives_reset {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("stops-in-suspend-to-idle=");
+		if self.stops_in_suspend_to_idle {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("stops-in-s3=");
+		if self.stops_in_s3 {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("running-at-bind=");
+		if self.running_at_bind {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("last-reset-was-watchdog=");
+		if self.last_reset_was_watchdog {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 10);
+		crate::codec::cbor::text(out, "device");
+		crate::codec::cbor::text(out, &self.device);
+		crate::codec::cbor::text(out, "min-timeout-ms");
+		crate::codec::cbor::uint(out, self.min_timeout_ms as u64);
+		crate::codec::cbor::text(out, "max-timeout-ms");
+		crate::codec::cbor::uint(out, self.max_timeout_ms as u64);
+		crate::codec::cbor::text(out, "granularity-ms");
+		crate::codec::cbor::uint(out, self.granularity_ms as u64);
+		crate::codec::cbor::text(out, "can-disarm");
+		crate::codec::cbor::boolean(out, self.can_disarm);
+		crate::codec::cbor::text(out, "survives-reset");
+		crate::codec::cbor::boolean(out, self.survives_reset);
+		crate::codec::cbor::text(out, "stops-in-suspend-to-idle");
+		crate::codec::cbor::boolean(out, self.stops_in_suspend_to_idle);
+		crate::codec::cbor::text(out, "stops-in-s3");
+		crate::codec::cbor::boolean(out, self.stops_in_s3);
+		crate::codec::cbor::text(out, "running-at-bind");
+		crate::codec::cbor::boolean(out, self.running_at_bind);
+		crate::codec::cbor::text(out, "last-reset-was-watchdog");
+		crate::codec::cbor::boolean(out, self.last_reset_was_watchdog);
 	}
 }
 

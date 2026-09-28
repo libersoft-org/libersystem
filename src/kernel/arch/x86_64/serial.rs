@@ -187,6 +187,8 @@ pub struct Uart {
 	inner: SpinLock<Inner>,
 	// Accesses an ordinary kernel path made while a driver held the port - refused, and counted.
 	stray: AtomicU64,
+	// Whether a driver holds the UART now: the owner as the access path reads it, lock-free.
+	driving: AtomicBool,
 	// The receive handler the kernel armed, re-registered at a reacquisition (0: none armed).
 	handler: AtomicUsize,
 	// Whether the kernel enables the receive interrupt when it drives this UART.
@@ -224,6 +226,7 @@ impl Uart {
 			console,
 			inner: SpinLock::new(Inner { ring: TxRing::new(), owner: Owner::Kernel, dropped: 0, tap: None, signal_due: false, window: false, lost: false }),
 			stray: AtomicU64::new(0),
+			driving: AtomicBool::new(false),
 			handler: AtomicUsize::new(0),
 			receive: AtomicBool::new(false),
 			terminal: AtomicBool::new(false),
@@ -236,18 +239,25 @@ impl Uart {
 
 	// ------------------------------------------------------------------ the one access path
 
-	// Whether `path` may reach the registers while `owner` holds the UART. An ordinary kernel path while a
-	// driver holds it may not, and is counted.
-	fn admitted(&self, owner: Owner, path: Path) -> bool {
-		if matches!(owner, Owner::Driver(_)) && path == Path::Kernel {
+	// Whether `path` may reach the registers now. An ordinary kernel path while a driver holds the UART may not,
+	// and is counted. THE OWNER IS READ HERE, from the mirror every change of owner writes - not taken from the
+	// caller - so a path that believed it owned the UART and did not is caught rather than trusted.
+	fn admitted(&self, path: Path) -> bool {
+		if self.driving.load(Ordering::Acquire) && path == Path::Kernel {
 			self.stray.fetch_add(1, Ordering::Relaxed);
 			return false;
 		}
 		true
 	}
 
-	fn read(&self, owner: Owner, path: Path, offset: u16) -> u8 {
-		if !self.admitted(owner, path) {
+	// EVERY CHANGE OF OWNER, under the ring's lock, and the mirror the access path reads with it.
+	fn set_owner(&self, inner: &mut Inner, owner: Owner) {
+		inner.owner = owner;
+		self.driving.store(matches!(owner, Owner::Driver(_)), Ordering::Release);
+	}
+
+	fn read(&self, path: Path, offset: u16) -> u8 {
+		if !self.admitted(path) {
 			return 0;
 		}
 		// SAFETY: this instance's own registers; every caller holds the owner it passes.
@@ -257,8 +267,8 @@ impl Uart {
 		value
 	}
 
-	fn write(&self, owner: Owner, path: Path, offset: u16, value: u8) {
-		if !self.admitted(owner, path) {
+	fn write(&self, path: Path, offset: u16, value: u8) {
+		if !self.admitted(path) {
 			return;
 		}
 		// SAFETY: as `read`.
@@ -278,35 +288,35 @@ impl Uart {
 		record.len = at + 1;
 	}
 
-	fn transmit_empty(&self, owner: Owner, path: Path) -> bool {
-		self.read(owner, path, LSR) & LSR_THR_EMPTY != 0
+	fn transmit_empty(&self, path: Path) -> bool {
+		self.read(path, LSR) & LSR_THR_EMPTY != 0
 	}
 
 	// Write one byte to the wire, polling the holding register first - bounded, so a UART that never
 	// empties cannot hang a terminal path.
-	fn put_sync(&self, owner: Owner, path: Path, byte: u8) {
+	fn put_sync(&self, path: Path, byte: u8) {
 		let mut polls = 0u32;
-		while !self.transmit_empty(owner, path) && polls < THRE_POLLS {
+		while !self.transmit_empty(path) && polls < THRE_POLLS {
 			core::hint::spin_loop();
 			polls += 1;
 		}
-		self.write(owner, path, RBR_THR, byte);
+		self.write(path, RBR_THR, byte);
 	}
 
 	// THE BOOT INITIALISATION, whole: interrupt enables off, 38400 baud and 8N1 with the divisor latch
 	// closed again, the FIFOs enabled and cleared, modem control with the interrupt output on and loopback
 	// off - and the receive interrupt after it, when asked. Every register a driver could have left in any
 	// state is written.
-	fn boot_init(&self, owner: Owner, path: Path, receive_interrupt: bool) {
-		self.write(owner, path, IER, 0x00);
-		self.write(owner, path, LCR, LCR_DLAB);
-		self.write(owner, path, RBR_THR, 0x03);
-		self.write(owner, path, IER, 0x00);
-		self.write(owner, path, LCR, LCR_8N1);
-		self.write(owner, path, FCR, 0xC7);
-		self.write(owner, path, MCR, 0x0B);
+	fn boot_init(&self, path: Path, receive_interrupt: bool) {
+		self.write(path, IER, 0x00);
+		self.write(path, LCR, LCR_DLAB);
+		self.write(path, RBR_THR, 0x03);
+		self.write(path, IER, 0x00);
+		self.write(path, LCR, LCR_8N1);
+		self.write(path, FCR, 0xC7);
+		self.write(path, MCR, 0x0B);
 		if receive_interrupt {
-			self.write(owner, path, IER, IER_RX_AVAILABLE);
+			self.write(path, IER, IER_RX_AVAILABLE);
 		}
 	}
 
@@ -319,11 +329,11 @@ impl Uart {
 		if inner.owner != Owner::Kernel {
 			return;
 		}
-		while inner.ring.len != 0 && self.transmit_empty(Owner::Kernel, Path::Kernel) {
+		while inner.ring.len != 0 && self.transmit_empty(Path::Kernel) {
 			let n: usize = inner.ring.len.min(FIFO_DEPTH);
 			for _ in 0..n {
 				let byte: u8 = inner.ring.pop();
-				self.write(Owner::Kernel, Path::Kernel, RBR_THR, byte);
+				self.write(Path::Kernel, RBR_THR, byte);
 			}
 			#[cfg(test)]
 			if self.paced.load(Ordering::Relaxed) {
@@ -349,9 +359,9 @@ impl Uart {
 		}
 		inner.lost = false;
 		match inner.owner {
-			Owner::Kernel => self.boot_init(Owner::Kernel, Path::Sleep, self.receive.load(Ordering::Relaxed)),
+			Owner::Kernel => self.boot_init(Path::Sleep, self.receive.load(Ordering::Relaxed)),
 			#[cfg(test)]
-			Owner::Sleep(generation) => self.boot_init(Owner::Sleep(generation), Path::Sleep, false),
+			Owner::Sleep(_) => self.boot_init(Path::Sleep, false),
 			Owner::Driver(_) | Owner::Terminal => {}
 		}
 	}
@@ -360,25 +370,25 @@ impl Uart {
 	// while a driver does, synchronous in a sleep window and on the terminal path.
 	pub fn write_byte(&self, byte: u8) {
 		if self.terminal.load(Ordering::Acquire) {
-			self.put_sync(Owner::Terminal, Path::Terminal, byte);
+			self.put_sync(Path::Terminal, byte);
 			return;
 		}
 		let mut inner = self.inner.lock();
 		match inner.owner {
-			Owner::Terminal => self.put_sync(Owner::Terminal, Path::Terminal, byte),
+			Owner::Terminal => self.put_sync(Path::Terminal, byte),
 			#[cfg(test)]
-			Owner::Sleep(generation) => {
+			Owner::Sleep(_) => {
 				self.restore_after_sleep(&mut inner);
-				self.put_sync(Owner::Sleep(generation), Path::Sleep, byte);
+				self.put_sync(Path::Sleep, byte);
 			}
 			Owner::Kernel if inner.window => {
 				self.restore_after_sleep(&mut inner);
-				self.put_sync(Owner::Kernel, Path::Sleep, byte);
+				self.put_sync(Path::Sleep, byte);
 			}
 			Owner::Kernel if !ASYNC.load(Ordering::Acquire) => {
 				// Early boot: straight to the wire so logs appear immediately, before the timer and idle
 				// loop that service the ring are running.
-				self.put_sync(Owner::Kernel, Path::Kernel, byte);
+				self.put_sync(Path::Kernel, byte);
 			}
 			Owner::Kernel => {
 				if inner.ring.len == TX_RING_CAP {
@@ -492,12 +502,12 @@ impl Uart {
 			return;
 		}
 		while inner.ring.len != 0 {
-			while !self.transmit_empty(Owner::Kernel, Path::Kernel) {
+			while !self.transmit_empty(Path::Kernel) {
 				core::hint::spin_loop();
 			}
 			self.drain_locked(&mut inner);
 		}
-		while !self.transmit_empty(Owner::Kernel, Path::Kernel) {
+		while !self.transmit_empty(Path::Kernel) {
 			core::hint::spin_loop();
 		}
 	}
@@ -530,7 +540,7 @@ impl Uart {
 		if inner.owner != Owner::Kernel {
 			return None;
 		}
-		if self.read(Owner::Kernel, Path::Kernel, LSR) & LSR_DATA_READY != 0 { Some(self.read(Owner::Kernel, Path::Kernel, RBR_THR)) } else { None }
+		if self.read(Path::Kernel, LSR) & LSR_DATA_READY != 0 { Some(self.read(Path::Kernel, RBR_THR)) } else { None }
 	}
 
 	// ------------------------------------------------------------------ the handoff
@@ -544,7 +554,7 @@ impl Uart {
 			if inner.owner != Owner::Kernel {
 				return false;
 			}
-			inner.owner = Owner::Driver(generation);
+			self.set_owner(&mut inner, Owner::Driver(generation));
 			inner.signal_due = inner.ring.len != 0;
 		}
 		// The kernel's receive handler goes, so the claim can bind the line; the suite arms none.
@@ -633,15 +643,15 @@ impl Uart {
 			if inner.owner.claim().is_none() {
 				return;
 			}
-			inner.owner = Owner::Kernel;
+			self.set_owner(&mut inner, Owner::Kernel);
 			inner.tap = None;
 			inner.signal_due = false;
-			self.write(Owner::Kernel, Path::Kernel, LCR, LCR_8N1);
-			while count < RX_READ_OUT && self.read(Owner::Kernel, Path::Kernel, LSR) & LSR_DATA_READY != 0 {
-				bytes[count] = self.read(Owner::Kernel, Path::Kernel, RBR_THR);
+			self.write(Path::Kernel, LCR, LCR_8N1);
+			while count < RX_READ_OUT && self.read(Path::Kernel, LSR) & LSR_DATA_READY != 0 {
+				bytes[count] = self.read(Path::Kernel, RBR_THR);
 				count += 1;
 			}
-			self.boot_init(Owner::Kernel, Path::Kernel, receive);
+			self.boot_init(Path::Kernel, receive);
 			dropped = core::mem::take(&mut inner.dropped);
 		}
 		#[cfg(not(test))]
@@ -690,7 +700,7 @@ impl Uart {
 	pub fn terminal(&self) {
 		if self.terminal.load(Ordering::Acquire) {
 			// Entered again on the same path: what was written is let out before the machine stops.
-			self.wait_idle(Owner::Terminal, Path::Terminal);
+			self.wait_idle(Path::Terminal);
 			return;
 		}
 		let mut spins = 0u32;
@@ -712,15 +722,15 @@ impl Uart {
 		};
 		// The kernel's own bytes already in the FIFO go out before the initialisation clears it.
 		if inner.owner == Owner::Kernel {
-			self.wait_idle(Owner::Terminal, Path::Terminal);
+			self.wait_idle(Path::Terminal);
 		}
-		self.boot_init(Owner::Terminal, Path::Terminal, false);
+		self.boot_init(Path::Terminal, false);
 		while inner.ring.len != 0 {
 			let byte = inner.ring.pop();
-			self.put_sync(Owner::Terminal, Path::Terminal, byte);
+			self.put_sync(Path::Terminal, byte);
 		}
 		let dropped = core::mem::take(&mut inner.dropped);
-		inner.owner = Owner::Terminal;
+		self.set_owner(inner, Owner::Terminal);
 		inner.tap = None;
 		inner.signal_due = false;
 		self.terminal.store(true, Ordering::Release);
@@ -729,16 +739,16 @@ impl Uart {
 			let mut line = LineBuf::new();
 			let _ = write!(line, "\r\nconsole: {dropped} byte(s) of kernel output were dropped at the ring's bound before this point\r\n");
 			for &byte in line.bytes() {
-				self.put_sync(Owner::Terminal, Path::Terminal, byte);
+				self.put_sync(Path::Terminal, byte);
 			}
 		}
-		self.wait_idle(Owner::Terminal, Path::Terminal);
+		self.wait_idle(Path::Terminal);
 	}
 
 	// Poll until the transmitter has sent everything - bounded.
-	fn wait_idle(&self, owner: Owner, path: Path) {
+	fn wait_idle(&self, path: Path) {
 		let mut polls = 0u32;
-		while self.read(owner, path, LSR) & LSR_TX_IDLE == 0 && polls < THRE_POLLS {
+		while self.read(path, LSR) & LSR_TX_IDLE == 0 && polls < THRE_POLLS {
 			core::hint::spin_loop();
 			polls += 1;
 		}
@@ -765,15 +775,15 @@ impl Uart {
 				inner.window = true;
 				while inner.ring.len != 0 {
 					let byte = inner.ring.pop();
-					self.put_sync(Owner::Kernel, Path::Sleep, byte);
+					self.put_sync(Path::Sleep, byte);
 				}
 			}
 			Owner::Driver(generation) => {
-				inner.owner = Owner::Sleep(generation);
-				self.boot_init(Owner::Sleep(generation), Path::Sleep, false);
+				self.set_owner(&mut inner, Owner::Sleep(generation));
+				self.boot_init(Path::Sleep, false);
 				while inner.ring.len != 0 {
 					let byte = inner.ring.pop();
-					self.put_sync(Owner::Sleep(generation), Path::Sleep, byte);
+					self.put_sync(Path::Sleep, byte);
 				}
 				inner.signal_due = false;
 			}
@@ -801,7 +811,7 @@ impl Uart {
 		self.restore_after_sleep(&mut inner);
 		inner.window = false;
 		if let Owner::Sleep(generation) = inner.owner {
-			inner.owner = Owner::Driver(generation);
+			self.set_owner(&mut inner, Owner::Driver(generation));
 		}
 	}
 
@@ -832,15 +842,14 @@ impl Uart {
 	// gate reads.
 	#[cfg(test)]
 	pub fn stray_read_for_test(&self, offset: u16) -> u8 {
-		let owner = self.inner.lock().owner;
-		self.read(owner, Path::Kernel, offset)
+		self.read(Path::Kernel, offset)
 	}
 
 	// The instance driven by the kernel from scratch, as the console is at boot: every setting programmed, the
 	// receive interrupt as `set_receive` left it.
 	#[cfg(test)]
 	pub fn init_for_test(&self) {
-		self.boot_init(Owner::Kernel, Path::Kernel, self.receive.load(Ordering::Relaxed));
+		self.boot_init(Path::Kernel, self.receive.load(Ordering::Relaxed));
 	}
 
 	#[cfg(test)]
@@ -873,7 +882,7 @@ impl Uart {
 	pub fn reset_for_test(&self) {
 		assert!(!self.console, "the console's terminal owner is never left");
 		let mut inner = self.inner.lock();
-		inner.owner = Owner::Kernel;
+		self.set_owner(&mut inner, Owner::Kernel);
 		inner.ring = TxRing::new();
 		inner.dropped = 0;
 		inner.tap = None;
@@ -914,7 +923,7 @@ impl Write for LineBuf {
 
 // UART init: 38400 baud, 8N1, FIFO enabled.
 pub fn init() {
-	COM1.boot_init(Owner::Kernel, Path::Kernel, false);
+	COM1.boot_init(Path::Kernel, false);
 }
 
 // THE CONSOLE UART'S RECEIVE INTERRUPT, answered by `handler`: COM1's legacy IRQ 4, routed to the boot
@@ -933,7 +942,7 @@ pub fn arm_rx_interrupt(handler: super::interrupts::HandlerFn) -> Result<u32, &'
 	COM1.receive.store(true, Ordering::Relaxed);
 	super::interrupts::register(vector as u32, handler);
 	super::ioapic::route(COM1.irq as u32, vector, crate::smp::lapic_id(0), super::ioapic::Kind::IsaEdge);
-	COM1.write(Owner::Kernel, Path::Kernel, IER, IER_RX_AVAILABLE);
+	COM1.write(Path::Kernel, IER, IER_RX_AVAILABLE);
 	drop(inner);
 	Ok(vector as u32)
 }

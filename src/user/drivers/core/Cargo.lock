@@ -111,6 +111,7 @@ dependencies = [
 name = "drivers"
 version = "0.0.0"
 dependencies = [
+ "acpi",
  "bootproto",
  "display-device-proto",
  "driver-protocol",

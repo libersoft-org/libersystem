@@ -43,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CONSOLE_TAP_READ, SYS_CPU_IDLE_INFO, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_PROPERTIES, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PERF_CONTROL, SYS_PERF_RECORD, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CONSOLE_TAP_READ, SYS_CPU_IDLE_INFO, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_PROPERTIES, SYS_DEVICE_QUIESCED, SYS_DEVICE_REGISTER_READ, SYS_DEVICE_REGISTER_WRITE, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PERF_CONTROL, SYS_PERF_RECORD, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -617,6 +617,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CPU_IDLE_INFO => sys_cpu_idle_info(a0, a1, a2),
 		SYS_DEVICE_PROPERTIES => sys_device_properties(a0, a1, a2),
 		SYS_CONSOLE_TAP_READ => sys_console_tap_read(a0, a1, a2, a3),
+		SYS_DEVICE_REGISTER_READ => sys_device_register_read(a0, a1),
+		SYS_DEVICE_REGISTER_WRITE => sys_device_register_write(a0, a1, a2),
 		// A DEVELOPMENT BUILD'S KERNEL REQUESTS, and no other build's: elsewhere the number is unknown.
 		#[cfg(liber_development)]
 		abi::SYS_DEV_CONSOLE => sys_dev_console(a0, a1),
@@ -1917,6 +1919,7 @@ fn sys_device_resource_acquire(claim_handle: u64, kind: u64, which: u64) -> i64 
 		abi::RESOURCE_KIND_MMIO => return platform_mmio_acquire(claim_handle, which),
 		abi::RESOURCE_KIND_LINE => return platform_line_acquire(claim_handle, which),
 		abi::RESOURCE_KIND_CONSOLE_TAP => return console_tap_acquire(claim_handle, which),
+		abi::RESOURCE_KIND_REGISTERS => return registers_acquire(claim_handle, which),
 		_ => return ERR_INVALID,
 	}
 	if !arch::ioports::supported() {
@@ -1996,6 +1999,67 @@ fn console_tap_acquire(claim_handle: u64, which: u64) -> i64 {
 		return ERR_ACCESS_DENIED;
 	}
 	thread.handles().lock().insert_reserved(Capability::new(tap as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WAIT | Rights::TRANSFER)).raw() as i64
+}
+
+// THE CLAIMED ROW'S DECLARED REGISTERS - index 0 - as one capability derived from the claim, for a row that declares
+// any. See `crate::declared`.
+fn registers_acquire(claim_handle: u64, which: u64) -> i64 {
+	let thread = current_thread!();
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let key = claim.key();
+	if which != 0 || crate::declared::count(key.device_index as usize) == 0 {
+		return ERR_INVALID;
+	}
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	let Some(registers) = crate::object::registers::Registers::new(key) else {
+		thread.handles().lock().release_reservation(1);
+		return ERR_NO_MEMORY;
+	};
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(registers.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
+	thread.handles().lock().insert_reserved(Capability::new(registers as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WRITE | Rights::TRANSFER)).raw() as i64
+}
+
+// ONE DECLARED REGISTER, read at its width - see `abi::SYS_DEVICE_REGISTER_READ`.
+fn sys_device_register_read(handle: u64, which: u64) -> i64 {
+	let registers = match current_typed::<crate::object::registers::Registers>(handle, ObjectType::Registers, Rights::READ) {
+		Ok(registers) => registers,
+		Err(e) => return e,
+	};
+	let key = registers.key();
+	if !device::claim_is_current(key) {
+		return ERR_ACCESS_DENIED;
+	}
+	match crate::declared::read(key.device_index as usize, which as usize) {
+		Some(value) => value as i64,
+		None => ERR_INVALID,
+	}
+}
+
+// ONE DECLARED REGISTER, written at its width through its mask - see `abi::SYS_DEVICE_REGISTER_WRITE`.
+fn sys_device_register_write(handle: u64, which: u64, value: u64) -> i64 {
+	let registers = match current_typed::<crate::object::registers::Registers>(handle, ObjectType::Registers, Rights::WRITE) {
+		Ok(registers) => registers,
+		Err(e) => return e,
+	};
+	let key = registers.key();
+	if !device::claim_is_current(key) {
+		return ERR_ACCESS_DENIED;
+	}
+	if value > u32::MAX as u64 || !crate::declared::write(key.device_index as usize, which as usize, value as u32) {
+		return ERR_INVALID;
+	}
+	0
 }
 
 // THE KERNEL CONSOLE'S OUTPUT, OUT OF ITS RING through a tap - see `abi::SYS_CONSOLE_TAP_READ`. At most one
@@ -2135,11 +2199,16 @@ fn sys_device_properties(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 			claim.key().device_index
 		}
 		Err(_) => {
-			let memory = match current_typed::<DeviceMemory>(handle, ObjectType::DeviceMemory, Rights::READ) {
-				Ok(memory) => memory,
-				Err(e) => return e,
+			// THE REGISTER WINDOW OR THE DECLARED REGISTERS the claim minted: a driver holds one of them and never
+			// the claim, and a row with no memory window - a WDAT's - reaches its block through its registers.
+			let key = match current_typed::<DeviceMemory>(handle, ObjectType::DeviceMemory, Rights::READ) {
+				Ok(memory) => memory.claim(),
+				Err(_) => match current_typed::<crate::object::registers::Registers>(handle, ObjectType::Registers, Rights::READ) {
+					Ok(registers) => Some(registers.key()),
+					Err(e) => return e,
+				},
 			};
-			let Some(key) = memory.claim() else { return ERR_ACCESS_DENIED };
+			let Some(key) = key else { return ERR_ACCESS_DENIED };
 			if !device::claim_is_current(key) {
 				return ERR_ACCESS_DENIED;
 			}

@@ -349,6 +349,10 @@ pub enum ResourceKind {
 	// and the kernel's output - its own lines and every debug write - leaves the kernel's ring through this, in
 	// order, for the driver to put on the wire.
 	ConsoleTap = 10,
+	// THE CLAIMED ROW'S DECLARED REGISTERS, for a row that declares any: the few registers the driver reaches one
+	// at a time at exactly their width through the kernel - a PCI function's arming registers in configuration
+	// space, a chipset register in memory, a WDAT's system-memory registers.
+	Registers = 11,
 }
 
 // How many `PortRange` resources one bind can carry: one per port resource a row can record.
@@ -372,6 +376,7 @@ impl ResourceKind {
 			8 => Some(ResourceKind::Mmio),
 			9 => Some(ResourceKind::Line),
 			10 => Some(ResourceKind::ConsoleTap),
+			11 => Some(ResourceKind::Registers),
 			_ => None,
 		}
 	}
@@ -465,6 +470,9 @@ pub mod provider {
 	/// A TPM 2.0'S TYPED OPERATIONS, the `tpm-device` contract. TpmService alone consumes it; applications
 	/// reach the TPM through minted `tpm` connections and never through this kind.
 	pub const TPM: u16 = 24;
+	/// A HARDWARE WATCHDOG, the `watchdog` contract, published under the device's name. The watchdog service alone
+	/// consumes it, and pets it only while ServiceManager's standing loop answers.
+	pub const WATCHDOG: u16 = 25;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

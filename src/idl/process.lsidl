@@ -191,3 +191,18 @@ interface system-power {
 	/// Power the machine off. Returns only if the request was refused.
 	@op(2) power-off: func() -> result<unit, error>;
 }
+
+/// What an orderly shutdown is about to do.
+enum shutdown-action {
+	power-off = 1,
+	reboot    = 2,
+}
+
+/// THE ORDERLY SHUTDOWN'S NOTICE, beside `system-power` and not inside it: that interface's client can stop the
+/// machine and nothing else, and this is the other direction - ServiceManager telling the services whose manifest
+/// rows declare the notice what is coming, on the control channel it holds for each, all at once, and waiting
+/// for their answers under one bound before its reverse-dependency kills. A service that does not answer in time
+/// is killed with the rest. Immediate `system-power` calls stay notice-free by design.
+interface shutdown-notice {
+	@op(1) prepare: func(action: shutdown-action) -> result<unit, error>;
+}

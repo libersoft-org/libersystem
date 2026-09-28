@@ -101,9 +101,16 @@ mod console {
 			Ok(())
 		}
 
-		// THE LINE FIRED: the interrupt identified (which clears a transmit-empty one) and every received byte
-		// read and kept for the consumer, then the line acknowledged.
+		// THE LINE FIRED: acknowledged FIRST, then the interrupt identified (which clears a transmit-empty one)
+		// and every received byte read and kept for the consumer.
+		//
+		// THE ORDER IS THE WHOLE OF IT. The line is an ISA edge and the UART's output stays high while a byte waits:
+		// a byte that arrives after the receiver's last read raises a new edge, and an acknowledgement made AFTER
+		// the read clears the notice of that edge - leaving the byte unread, the output high and no edge ever again.
+		// Measured: `lab sh` typed "echo fir" of "echo first" and the console took nothing more for the rest of
+		// the boot. Acknowledged first, a byte that lands during the read is either read by it or signals again.
 		pub fn service_line(&mut self) {
+			interrupt_ack(self.irq);
 			let _ = self.uart.acknowledge();
 			let mut chunk = [0u8; RX_CHUNK];
 			loop {
@@ -113,7 +120,6 @@ mod console {
 				}
 				self.held.push(&chunk[..n]);
 			}
-			interrupt_ack(self.irq);
 		}
 
 		// EMPTY THE TAP ONTO THE WIRE, oldest first, with the marker where the ring's bound dropped bytes.

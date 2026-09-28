@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::port::{inl, outl};
+use super::port::{inb, inl, inw, outb, outl, outw};
 use crate::arch::common::pci as common;
 use crate::sync::SpinLock;
 
@@ -300,6 +300,104 @@ pub fn io_bars(bus: u8, dev: u8, func: u8, out: &mut [(u8, u16, u16); 6]) -> usi
 // A function's I/O decode, which a claim of a row with an I/O BAR turns on and its release off.
 pub fn set_io_decode(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_io_decode::<Access>(bus, dev, func, on);
+}
+
+// ONE CONFIGURATION REGISTER AT EXACTLY ITS WIDTH - 1, 2 or 4 bytes, naturally aligned - for a claim holder's
+// declared register: a device that answers only the exact width (the i6300esb's 0x60 as a word, 0x68 as a byte)
+// must never see a dword read-modify-write, which it answers by doing nothing. The address goes to CONFIG_ADDRESS
+// and the access of that width to CONFIG_DATA + (offset & 3), under the lock that serialises the pair; past the
+// first 256 bytes, the ECAM window at that width. `None` for a width or an alignment no register has.
+pub fn config_read_exact(bus: u8, dev: u8, func: u8, off: u16, width: u8) -> Option<u32> {
+	if !exact(off, width) {
+		return None;
+	}
+	if off >= 0x100 {
+		let at = ecam_virt(bus, dev, func)? + (off as u64 & 0xFFF);
+		// SAFETY: inside the window mapped uncached at boot, at the function's own page and an aligned offset.
+		return Some(unsafe {
+			match width {
+				1 => core::ptr::read_volatile(at as *const u8) as u32,
+				2 => core::ptr::read_volatile(at as *const u16) as u32,
+				_ => core::ptr::read_volatile(at as *const u32),
+			}
+		});
+	}
+	let _serialised = CONFIG_PORTS.lock();
+	let data = CONFIG_DATA + (off & 3);
+	// SAFETY: the configuration mechanism, which the kernel alone drives, under its lock.
+	unsafe {
+		outl(CONFIG_ADDRESS, address(bus, dev, func, off));
+		Some(match width {
+			1 => inb(data) as u32,
+			2 => inw(data) as u32,
+			_ => inl(data),
+		})
+	}
+}
+
+pub fn config_write_exact(bus: u8, dev: u8, func: u8, off: u16, width: u8, value: u32) -> bool {
+	if !exact(off, width) {
+		return false;
+	}
+	if off >= 0x100 {
+		let Some(base) = ecam_virt(bus, dev, func) else { return false };
+		let at = base + (off as u64 & 0xFFF);
+		// SAFETY: as in `config_read_exact`.
+		unsafe {
+			match width {
+				1 => core::ptr::write_volatile(at as *mut u8, value as u8),
+				2 => core::ptr::write_volatile(at as *mut u16, value as u16),
+				_ => core::ptr::write_volatile(at as *mut u32, value),
+			}
+		}
+		return true;
+	}
+	let _serialised = CONFIG_PORTS.lock();
+	let data = CONFIG_DATA + (off & 3);
+	// SAFETY: as in `config_read_exact`.
+	unsafe {
+		outl(CONFIG_ADDRESS, address(bus, dev, func, off));
+		match width {
+			1 => outb(data, value as u8),
+			2 => outw(data, value as u16),
+			_ => outl(data, value),
+		}
+	}
+	true
+}
+
+// THE CHIPSET MEMORY REGISTERS A CLAIM HOLDER IS DECLARED - the ICH9's GCS, a WDAT's system-memory registers - on
+// pages of a kernel window mapped uncached at the boot scan, BEFORE ANY PROCESS ADDRESS SPACE EXISTS: a later
+// address space copies the kernel half. The page is the kernel's; a claim holder reaches ONE register through it
+// and never the page, because the page holds others - GCS's holds the interrupt-routing registers. Answers the
+// register's kernel address, or `None` when the window is full.
+const DECLARED_VIRT_BASE: u64 = 0xffff_f500_0000_0000;
+const DECLARED_PAGES: usize = 16;
+static DECLARED: SpinLock<([u64; DECLARED_PAGES], usize)> = SpinLock::new(([0; DECLARED_PAGES], 0));
+
+pub fn map_declared(phys: u64) -> Option<u64> {
+	let page = phys & !0xfff;
+	let mut declared = DECLARED.lock();
+	let slot = match declared.0[..declared.1].iter().position(|&held| held == page) {
+		Some(slot) => slot,
+		None => {
+			let slot = declared.1;
+			if slot == DECLARED_PAGES {
+				return None;
+			}
+			super::paging::reserve_kernel_top_level(DECLARED_VIRT_BASE, (DECLARED_PAGES * 0x1000) as u64);
+			super::paging::map_page(DECLARED_VIRT_BASE + slot as u64 * 0x1000, page, super::paging::WRITABLE | super::paging::NO_CACHE | super::paging::NO_EXECUTE);
+			declared.0[slot] = page;
+			declared.1 = slot + 1;
+			slot
+		}
+	};
+	Some(DECLARED_VIRT_BASE + slot as u64 * 0x1000 + (phys & 0xfff))
+}
+
+// A width a register has, at an offset aligned to it, inside the function's four kilobytes.
+fn exact(off: u16, width: u8) -> bool {
+	matches!(width, 1 | 2 | 4) && off % width as u16 == 0 && off as u32 + width as u32 <= 0x1000
 }
 
 // One configuration dword, for the port derivation rows, which read a chipset block's base.

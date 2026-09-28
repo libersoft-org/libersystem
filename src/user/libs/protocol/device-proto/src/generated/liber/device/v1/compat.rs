@@ -352,3 +352,11 @@ fn usb_device_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(UsbDevice::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn watchdog_description_wire_is_stable() {
+	let sample = WatchdogDescription { device: String::from("x"), min_timeout_ms: 7, max_timeout_ms: 7, granularity_ms: 7, can_disarm: true, survives_reset: true, stops_in_suspend_to_idle: true, stops_in_s3: true, running_at_bind: true, last_reset_was_watchdog: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 1, 1, 1, 1, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(WatchdogDescription::decode(&bytes).unwrap(), sample);
+}

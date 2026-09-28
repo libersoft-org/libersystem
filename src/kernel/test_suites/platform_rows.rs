@@ -434,7 +434,7 @@ fn a_driver_reads_its_property_block_through_the_window_its_claim_minted() {
 	}
 	let mut description = synthetic_platform_description(b"kernel:test-properties");
 	assert!(description.add_mmio(free_window(0x30000), 0x1000));
-	let row = device::add_synthetic_platform_row(device::Described { description, properties: BLOCK.to_vec(), targets: Vec::new() }).expect("the row is published");
+	let row = device::add_synthetic_platform_row(device::Described { description, properties: BLOCK.to_vec(), targets: Vec::new(), registers: Vec::new() }).expect("the row is published");
 	assert_eq!(device::info(row).map(|info| info.platform.properties_len), Some(BLOCK.len() as u32), "the information record states the block's length");
 	in_thread(body, row as u64, &DONE);
 }

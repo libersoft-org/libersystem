@@ -32,7 +32,7 @@ fn held(identity: &[u8]) -> Option<platform::Description> {
 
 fn push(out: &mut Vec<Described>, description: platform::Description) {
 	// ALLOC-OK: boot, once per device the firmware describes.
-	out.push(Described { description, properties: Vec::new(), targets: Vec::new() });
+	out.push(Described { description, properties: Vec::new(), targets: Vec::new(), registers: Vec::new() });
 }
 
 // Every description this machine's firmware gives, in publication order.
@@ -235,23 +235,30 @@ fn tables(out: &mut Vec<Described>, rsdp: u64, madt: Option<&acpi::Madt<'_>>) {
 	}
 	// THE WATCHDOG ACTION TABLE: a device whose resources are the registers its instructions name. Its I/O
 	// registers are port ranges, merged where they touch. A memory register is NEVER a mapping - the page
-	// that holds it can hold the chipset's interrupt routing too - so it is left out of the row and said.
+	// that holds it can hold the chipset's interrupt routing too - so it is a DECLARED register of the row,
+	// reached one access at a time at its width.
 	if let Some(bytes) = crate::smp::acpi_table(rsdp, b"WDAT") {
 		let len = platform::table_identity(b"WDAT", 0, &mut name);
 		if let Some(mut description) = platform::Description::new(abi::PLATFORM_SOURCE_TABLE, abi::PLATFORM_STATE_CLAIMABLE, &name[..len]) {
 			description.add_match(abi::MATCH_ID_TABLE, b"WDAT");
 			let mut ports: Vec<(u16, u16)> = Vec::new();
-			let mut memory = 0usize;
+			let mut memory: Vec<(u64, u8)> = Vec::new();
 			let _ = acpi::wdat_instructions(bytes, |entry| {
 				let Ok(entry) = entry else { return };
 				match entry.register.space {
 					acpi::AddressSpace::SystemIo if entry.register.address <= 0xffff => {
 						let base = entry.register.address as u16;
-						let width = entry.register.access.bytes().unwrap_or(u64::from(entry.register.bit_width.div_ceil(8)).max(1)) as u16;
+						let width = u16::from(acpi::wdat_register_width(&entry.register));
 						// ALLOC-OK: boot, bounded by the instructions the table declares.
 						ports.push((base, width));
 					}
-					acpi::AddressSpace::SystemMemory => memory += 1,
+					acpi::AddressSpace::SystemMemory => {
+						let width = acpi::wdat_register_width(&entry.register);
+						if !memory.contains(&(entry.register.address, width)) {
+							// ALLOC-OK: boot, bounded by the instructions the table declares.
+							memory.push((entry.register.address, width));
+						}
+					}
 					_ => {}
 				}
 			});
@@ -265,11 +272,25 @@ fn tables(out: &mut Vec<Described>, rsdp: u64, madt: Option<&acpi::Madt<'_>>) {
 				}
 			}
 			let whole = merged.iter().all(|&(base, width)| description.add_port(base, width));
-			if memory != 0 {
-				crate::serial_println!("device: the WDAT table names {memory} memory register(s), which are never mapped for a claimant - a page such as the chipset's also holds its interrupt routing - so they are not in its row");
+			// THE TABLE ITSELF IS THE ROW'S PROPERTY BLOCK, one VALUE record named `WDAT`: its driver runs the
+			// instructions, and nothing else carries them to userspace.
+			let padded = (bytes.len() + 3) & !3;
+			let mut block: Vec<u8> = Vec::new();
+			if 12 + padded <= abi::MAX_DEVICE_PROPERTIES {
+				// ALLOC-OK: boot, once, bounded by the block's limit above.
+				block.push(abi::DEVICE_PROPERTY_VALUE);
+				block.push(0);
+				block.extend_from_slice(&4u16.to_le_bytes());
+				block.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+				block.extend_from_slice(b"WDAT");
+				block.extend_from_slice(bytes);
+				block.resize(12 + padded, 0);
 			}
-			if whole {
-				push(out, description);
+			if block.is_empty() {
+				crate::serial_println!("device: the WDAT table is longer than a row's property block - not published");
+			} else if whole {
+				// ALLOC-OK: boot, once per device the firmware describes.
+				out.push(Described { description, properties: block, targets: Vec::new(), registers: memory });
 			} else {
 				crate::serial_println!("device: the WDAT table names more port ranges than a row carries - not published");
 			}

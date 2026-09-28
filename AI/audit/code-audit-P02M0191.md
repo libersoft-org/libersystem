@@ -58,3 +58,129 @@ COM1's ports refused at publication). The `_CRS` half waits for the ACPI service
 ### P02M0191c and P02M0191d's handoff parts, with P02M0099's 16550 item - started 2026-09-28T14:16:57Z
 Begun after P02M0196a (the platform claim and claim-scoped wired lines) and P02M0190, in the owner's agreed order.
 The record of what was built and verified follows below when it is.
+
+#### What was implemented - P02M0191c, P02M0191d's handoff parts, and P02M0099's 16550 item
+- THE UART AS AN INSTANCE (`src/kernel/arch/x86_64/serial.rs`): `Uart { base, irq, console, inner: SpinLock<Inner> }`
+  with the transmit ring, the OWNER (`Kernel`, `Driver(gen)`, `Sleep(gen)` - test build only until P02M0197b's
+  sleep entry calls it - and `Terminal`), the bound's dropped count, the claim's tap and the sleep window. `COM1`
+  is the console; the test build adds `COM2` over the test machine's second UART, whose every register access
+  is recorded (a ring of the last 8192, `record_from`). Every register access goes through `read`/`write`, which
+  refuse AND COUNT (`stray`) an access by `Path::Kernel` while a driver holds the port; the owner they check is
+  an atomic mirror every owner change writes (`set_owner`), not what the caller believes. Every path checks the
+  owner first: the timer and idle drains, the receive poll (`read_byte` answers `None` while a driver holds the
+  UART, so no COM1 byte reaches the console channel), the lossless path's full-ring drain (drops and counts
+  instead), `drain_sync`, `tx_pending`.
+- THE HANDOFF IS THE CLAIM: `kernel:com1` is published CLAIMABLE with `PLATFORM_FLAG_CONSOLE` (kernel-held in
+  the test build, whose wire is the suite's); `device::claim` calls `arch::serial::console_hand_over` before
+  the claim commits - the owner flips under the ring's lock first, then the kernel's IRQ 4 handler is
+  unregistered (`interrupts::unregister`), and a line names the row and generation. The claim's port range is
+  minted through `PortRange::mint_from_install` / `grants::grant_from_install`, which MOVES the console item's
+  install into the grant in one step under the table's lock, and `grants::end` moves it back, confirmed or not.
+- THE TAP (`src/kernel/object/console_tap.rs`, `ObjectType::ConsoleTap`, `abi::RESOURCE_KIND_CONSOLE_TAP`,
+  `SYS_CONSOLE_TAP_READ` = 97): a derived object of the console claim, minted by DeviceManager from the claim
+  (`device_resource_acquire(.., RESOURCE_KIND_CONSOLE_TAP, 0)`) and passed as the new `ConsoleTap` resource
+  frame; reads move bytes out of the ring in order and report what the bound dropped; it is pending when the
+  ring goes from empty to holding bytes, signalled from contexts that hold no other lock (the timer tick, the
+  idle loop, the debug-write syscall - `deliver_tap_signal`), because waking its reader takes the scheduler's
+  locks and a kernel line may be printed under any lock. The release revokes it.
+- REACQUISITION (`Uart::hand_back`, from `device::finish_release` on both of its exits, so a quarantined release
+  returns the UART too): owner KERNEL under the lock, DLAB cleared, the receiver read out (at most 64 bytes)
+  BEFORE the boot sequence resets the FIFO, the boot initialisation, the IRQ 4 handler re-registered and
+  re-routed, the bytes fed to the console channel, and one line - with the stray count in the development and
+  test builds - plus the bound's drops when there were any.
+- THE TERMINAL-PATH WRITER (`flush_sync` -> `Uart::terminal`): the ring's lock with a bounded wait
+  (`SpinLock::get_unlocked` past it), the whole boot initialisation, the backlog by polling, the dropped count
+  line, owner TERMINAL (never left; later lines go to the wire synchronously, lock-free). Entered before the
+  first line of the panic handler (both builds), the double fault, every ring-0 fatal exception (#GP, #PF,
+  the generic vectors), and before reset, power-off and the test exit. `drain_sync` is the non-terminal
+  drain the suite and the perf drain use; the perf drain waits for whole lines (`write_whole`, `make_room`,
+  which yields to the driver while one holds the UART).
+- THE SLEEP ENTRY RULE (`sleep_begin`, `sleep_wake(lost_settings)`, `sleep_end`), implemented to the item's
+  words and exercised by the suite; `#[cfg(test)]` until P02M0197b's kernel sleep entry is its production
+  caller (the item gives the wiring to whichever lands second - P02M0197b).
+- The HAL contract (`arch/mod.rs`) names the new serial surface; aarch64 and riscv64 answer every handoff call
+  with a refusal and keep their synchronous writers.
+- DEVELOPMENT-BUILD KERNEL REQUESTS: the kernel's `build.rs` emits `cfg(liber_development)` for the
+  development build; `SYS_DEV_CONSOLE` (98) exists only there, gated by the `ConsoleInputSource` privilege:
+  `DEV_CONSOLE_HOLD_AND_FLOOD` (every tap's reads held, kernel lines written until the ring drops),
+  `DEV_CONSOLE_PANIC`, and `DEV_CONSOLE_KILL_HOLDER` (SIG_KILL to the process holding the console's port range
+  - the gate's "driver killed"; nothing else in this tree can kill a driver from the host). The development
+  agent serves them as `OP_KERNEL_CONSOLE` (0x2c); `lab dev-kernel-console hold-and-flood|panic|kill-holder`.
+- THE 16550 DRIVER (P02M0099's item): `drivers::uart` - the register engine over a `Registers` trait (program,
+  quiet, the transmit interrupt, FIFO-load transmit, receive with the line-status errors counted), the line
+  description (`Line::new(clock, baud)`), the bounded held input (512, newest dropped and counted) and the
+  dropped-output marker, all host-tested (7 tests) - and `uart16550` (manifest: platform rule `hid = PNP0501`,
+  `dma = "none"`, one `console-bytes` provider): maps the port range, programs the UART whole, drains the tap
+  before anything else, publishes `ConsoleBytes` under `driver_protocol::provider::KERNEL_CONSOLE_NAME`
+  (`org.libersystem.console`) through `serial_port::Session`, serves IRQ 4 (every received byte kept until a
+  consumer is listening), empties the tap before every console-stream write, waits for the transmitter's
+  interrupt rather than spinning when the FIFO is full, and on a planned stop leaves every interrupt enable off.
+  On the ports it refuses its bind in words: no port space.
+- CONSOLESERVICE: a `CONSOLEBYTES` catalogue role (`console-bytes`, optional) and `SerialWire`, following the
+  publication named `KERNEL_CONSOLE_NAME` with `driver_protocol::console`'s host-tested decisions (the
+  development agent's): while attached, the mirror goes out as console-stream writes with each newline as
+  CR LF (as the kernel's write path puts it) and an `again` keeps the backlog; received chunks enter
+  `handle_keys` as serial input; when the provider goes, the gap marker is written through `SYS_DEBUG_WRITE`
+  and both directions fall back to the kernel's paths, whose console channel it never stopped reading.
+- THE KERNEL TESTS (`src/kernel/object/port_range/tests/handoff.rs`, six, on `COM2` with a console row of the
+  suite's own appended without placement - `device::synthetic_console_row` - so other suites' rows over the
+  same UART never merge into it): the tap in order with the bound's drops counted and nothing on the UART;
+  the ports reserved while the kernel drives the UART, the claim's range the one mint admitted, back in the set
+  after the release (firmware path included); a ring-3 script probe holding the UART with DLAB set and bytes in
+  its receiver while every kernel path runs - the record still, the stray count zero, one deliberate stray
+  access counted and refused - and the release reading the bytes out with DLAB cleared before the FIFO reset,
+  in the record's order, then the queued backlog drained; a quarantined release returning the UART and the row
+  refusing a new claim; the sleep rule on both owners with an S3 wake re-running the boot initialisation
+  before the resumed line (receive interrupt on for the kernel, off while lent); and the terminal writer after
+  a probe broke the UART every way, then on a fresh instance past its bound - backlog, count, marker. The
+  probe program is new (`program_port_script_bytes`).
+- THE GATE `serial-handoff` (`src/tools/check-serial-handoff.sh`, registered in `check.sh`, the verify-model
+  catalog as a guest-booting gate and `release-required.toml`): a private development instance; the handoff
+  line; `lab sh` through the driver; the driver killed - the reacquisition with a zero count, DeviceManager's
+  restart, the next handoff, ConsoleService attached again, `lab sh`; the binding disabled - reacquisition,
+  `lab sh` through the kernel; enabled - the next handoff, `lab sh`; the flood with `lab sh` still answering;
+  the panic - the dropped count, then `*** KERNEL PANIC ***` and its message.
+- `lab` learned to type `#` (P02M0190's gate needed it) - unrelated here.
+
+#### Verification - P02M0191c/d and the 16550 driver (2026-09-28)
+- `./check.sh --gate serial-handoff`: PASS (exit 0, 319 s) - boot handoff line and the driver online; `lab sh`
+  through the driver; the driver killed (`dev.sh kernel-console kill-holder`): "COM1 is the kernel's again - 0
+  kernel access(es)", DeviceManager's restart, the next handoff, ConsoleService attached again, `lab sh`; the
+  binding disabled with `lsdev --disable kernel:com1`: the reacquisition, `lab sh` through the kernel's own path;
+  enabled: the next handoff, `lab sh` through the driver; the flood (135 kernel lines while the taps' reads were
+  held) with `lab sh` still answering; the panic: "console: N byte(s) of kernel output were dropped at the
+  ring's bound before this point" and then "*** KERNEL PANIC ***" and its message. Every reacquisition line
+  counted 0. After that pass the gate's `all_counts_zero` was rewritten for the source-hygiene gate (no pipe into
+  `grep -q` under pipefail) - the same check, not re-run since.
+- THE GATE FOUND A DRIVER DEFECT, fixed and then passed: the driver acknowledged its edge-triggered IRQ 4 after
+  draining the receiver, so a byte arriving in between left the UART's output high with no further edge -
+  reproduced on a private instance ("echo fir" of `lab sh echo first`, then no input for the rest of the boot;
+  single keystrokes and bursts through the console socket worked once the timing missed the window); the
+  driver now acknowledges first. Two earlier runs failed on the gate's own plumbing (the development image
+  build needed `foreign-audit-link.py --check` after the `rt` change, and `dev-*` requests go through
+  `./dev.sh`, which gained the `kernel-console` verb).
+- Kernel, x86_64: `TEST_SELECTION=<the six handoff tests, every port_range, platform_rows and idle test,
+  kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick,
+  kernel.dma_policy.the_kernel_registry_is_the_manifest_migration_table> ./test.sh --arch x86_64`: 31 passed.
+  The first run failed on its own expectation (a released claim's tap answers ERR_BAD_HANDLE - the release
+  revokes the capability - not ERR_ACCESS_DENIED); test and ABI text corrected.
+- WATCHED FAILING: `Uart::read_byte` without its owner check (a receive poll left running) makes
+  `while_a_probe_holds_the_console_uart_no_kernel_path_touches_it_and_its_release_reads_out_before_the_reset`
+  fail - "and none tried", the stray count 1; restored. The access path's owner is an atomic mirror written by
+  every owner change, so a path that believes it owns the UART cannot hide from the count.
+- Also verified: the production, development (`LIBER_DEVELOPMENT=1`) and test kernels compile; `./build.sh
+  --arch x86_64` ok; host suites `drivers --lib` 402 (the engine's 7 among them), driver protocol 76, binding
+  89, abi 28, system-manifest 27; rustfmt clean on every changed file; `shfmt -d` clean on `dev.sh` and the
+  gate; `./check.sh --gate source-hygiene` clean (after the fix above), `--gate arch-surface` ok, `./gen.sh
+  --check` ok; `python3 src/tools/foreign-audit-link.py --check` reproduces after the `rt` change.
+- REGRESSION: `./check.sh --gate qemu-tpm-tool` passes again (445 s) with the handoff live - its serial log shows
+  the handoff, the driver online and ConsoleService attached, so its keyboard-driven scenario and serial
+  oracles ran over the driver's wire.
+- NOT RUN: the aarch64 and riscv64 builds (the portable surface answering "unsupported"), at the end of the job;
+  `src/tools/verify-model`'s suite, which cannot load the model while the stale port test binaries name the
+  replaced clock test (pre-existing; the end-of-job port rebuild clears it), so the new gate's catalog entry is
+  not checked by it yet.
+
+#### Open after this record
+- Source (a)'s `_CRS` ranges (P02M0196b); the cross-builds; the sleep entry's production wiring (P02M0197b);
+  the 16550's `RESUME` reprogramming with P02M0197's suspend and resume exchange.

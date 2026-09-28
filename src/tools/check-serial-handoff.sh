@@ -93,8 +93,10 @@ all_counts_zero() {
 	local lines
 	lines="$(grep -a -- "COM1 is the kernel's again" "$(serial_log)" 2>/dev/null || true)"
 	[[ -n "$lines" ]] || return 0
-	if grep -v -- "- 0 kernel access(es) to its registers while the driver held it" <<<"$lines" | grep -q .; then
-		grep -v -- "- 0 kernel access(es)" <<<"$lines" >&2
+	local counted
+	counted="$(grep -v -- "- 0 kernel access(es) to its registers while the driver held it" <<<"$lines" || true)"
+	if [[ -n "$counted" ]]; then
+		echo "$counted" >&2
 		fail "a reacquisition counted kernel accesses to COM1 while the driver held it"
 	fi
 }
@@ -110,6 +112,7 @@ round_trip() {
 HANDED="console: COM1 (IRQ 4) is handed to row"
 ONLINE="driver.uart16550: online"
 BACK="console: COM1 is the kernel's again"
+ATTACHED="go through the kernel console's UART driver"
 
 echo "serial-handoff: state $state, host port $HOSTFWD_PORT - bringing a development instance up"
 if ! ./dev.sh up --timeout 300 >"$state/up.log" 2>&1; then
@@ -120,7 +123,7 @@ fi
 # 1. THE HANDOFF, AT BOOT.
 await_line "$HANDED" "the kernel never handed COM1 to a claim" 0
 await_line "$ONLINE" "the console UART's driver never came online" 0
-await_line "go through the kernel console's UART driver" "ConsoleService never attached to the console UART's driver" 0
+await_line "$ATTACHED" "ConsoleService never attached to the console UART's driver" 0
 all_counts_zero
 
 # 2. THROUGH THE DRIVER.
@@ -130,16 +133,18 @@ round_trip "handoff-through-the-driver" "through the driver"
 back=$(seen "$BACK")
 restarted=$(seen "DeviceManager: restarting")
 handed=$(seen "$HANDED")
-lab dev-kernel-console kill-holder >/dev/null || fail "the development kernel would not kill the console UART's driver"
+attached=$(seen "$ATTACHED")
+./dev.sh kernel-console kill-holder >/dev/null || fail "the development kernel would not kill the console UART's driver"
 await_line "$BACK" "the kernel never took COM1 back after its driver was killed" "$back"
 await_line "DeviceManager: restarting" "DeviceManager never reported the killed driver and restarted it" "$restarted"
 await_line "$HANDED" "COM1 was never handed to the restarted driver" "$handed"
+await_line "$ATTACHED" "ConsoleService never attached to the restarted driver" "$attached"
 all_counts_zero
 round_trip "handoff-after-the-restart" "through the restarted driver"
 
 # 4. DISABLED: nobody restarts the driver, and the kernel's own path answers.
 back=$(seen "$BACK")
-out="$(lab dev-launch --timeout 60 lsdev --disable kernel:com1 2>&1)" || fail "the disable was not run: $out"
+out="$(./dev.sh launch --timeout 60 lsdev --disable kernel:com1 2>&1)" || fail "the disable was not run: $out"
 grep -q "accepted" <<<"$out" || fail "the disable was not accepted: $out"
 await_line "$BACK" "the kernel never took COM1 back when the binding was disabled" "$back"
 all_counts_zero
@@ -147,20 +152,21 @@ round_trip "handoff-through-the-kernel" "through the kernel's own path"
 
 # 5. ENABLED AGAIN: the next handoff, and the driver answers.
 handed=$(seen "$HANDED")
-out="$(lab dev-launch --timeout 60 lsdev --enable kernel:com1 2>&1)" || fail "the enable was not run: $out"
+attached=$(seen "$ATTACHED")
+out="$(./dev.sh launch --timeout 60 lsdev --enable kernel:com1 2>&1)" || fail "the enable was not run: $out"
 grep -q "accepted" <<<"$out" || fail "the enable was not accepted: $out"
 await_line "$HANDED" "COM1 was never handed to the driver after the enable" "$handed"
-await_line "go through the kernel console's UART driver" "ConsoleService never attached again after the enable" 1
+await_line "$ATTACHED" "ConsoleService never attached again after the enable" "$attached"
 round_trip "handoff-after-the-enable" "through the driver after the enable"
 all_counts_zero
 
 # 6. THE CASE THE TERMINAL PATH EXISTS FOR: a driver holding COM1 and not draining a full ring, then a panic.
-out="$(lab dev-kernel-console hold-and-flood 2>&1)" || fail "the flood was refused: $out"
+out="$(./dev.sh kernel-console hold-and-flood 2>&1)" || fail "the flood was refused: $out"
 echo "serial-handoff: $out"
 round_trip "handoff-while-the-ring-is-full" "through the driver while the kernel's ring is past its bound"
 dropped=$(seen "byte(s) of kernel output were dropped at the ring's bound before this point")
 panicked=$(seen "\*\*\* KERNEL PANIC \*\*\*")
-lab dev-kernel-console panic >/dev/null || fail "the panic request was not sent"
+./dev.sh kernel-console panic >/dev/null || fail "the panic request was not sent"
 await_line "byte(s) of kernel output were dropped at the ring's bound before this point" "the terminal-path writer did not put the dropped count on the wire" "$dropped" 60
 await_line "\*\*\* KERNEL PANIC \*\*\*" "the panic did not reach the wire" "$panicked" 60
 await_line "a panic asked for over the development channel" "the panic's message did not reach the wire" 0 60

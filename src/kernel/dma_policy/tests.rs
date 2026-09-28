@@ -180,7 +180,7 @@ fn the_kernel_registry_is_the_manifest_migration_table() {
 		let expected = match name {
 			b"virtio_net" => abi::DMA_POLICY_IOMMU_REQUIRED,
 			// A platform row's driver masters nothing - the kernel refuses a platform claim whose entry declares DMA.
-			b"tpm_driver" | b"uart16550" => abi::DMA_POLICY_NONE,
+			b"tpm_driver" | b"uart16550" | b"i6300esb" | b"tco" | b"wdat" => abi::DMA_POLICY_NONE,
 			_ => abi::DMA_POLICY_TRUSTED_UNTRANSLATED,
 		};
 		assert_eq!(registry_policy(name), Some(expected as u8), "{} carries the policy it declares", core::str::from_utf8(name).unwrap());

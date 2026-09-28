@@ -1119,6 +1119,12 @@ impl Wdat {
 	}
 }
 
+/// HOW WIDE ONE WDAT REGISTER IS: its access size, or its bit width in whole bytes - the one rule the kernel that
+/// declares a WDAT's registers and the driver that runs its instructions both apply, so they name the same one.
+pub fn wdat_register_width(register: &Gas) -> u8 {
+	register.access.bytes().unwrap_or(u64::from(register.bit_width.div_ceil(8)).max(1)).min(8) as u8
+}
+
 /// Every WDAT instruction, in table order: the count the table declares, bounded by what fits in it. A
 /// register that is not a structure is an `Err` for that entry, and the walk goes on.
 pub fn wdat_instructions(bytes: &[u8], mut visit: impl FnMut(Result<WdatInstruction, Error>)) -> Result<(), Error> {

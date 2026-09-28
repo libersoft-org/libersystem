@@ -18,6 +18,7 @@ pub mod interrupt;
 pub mod memory_object;
 pub mod port_range;
 pub mod privilege;
+pub mod registers;
 // What the implementation DID, in the vocabulary the model speaks. The sink is the conformance
 // fixture replayed against `docs/spec/capability`; in a production build every record is an
 // empty function and the storage does not exist.
@@ -68,6 +69,8 @@ pub enum ObjectType {
 	PortRange,
 	// The kernel console's output, for the driver that holds its UART. See `console_tap`.
 	ConsoleTap,
+	// A claim's declared registers. See `registers`.
+	Registers,
 }
 
 impl ObjectType {
@@ -94,6 +97,7 @@ impl ObjectType {
 			ObjectType::WaitSet => abi::OBJECT_TYPE_WAIT_SET,
 			ObjectType::PortRange => abi::OBJECT_TYPE_PORT_RANGE,
 			ObjectType::ConsoleTap => abi::OBJECT_TYPE_CONSOLE_TAP,
+			ObjectType::Registers => abi::OBJECT_TYPE_REGISTERS,
 		}
 	}
 }

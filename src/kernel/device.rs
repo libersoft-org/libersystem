@@ -88,6 +88,9 @@ pub struct Described {
 	// Each connection's controller by that controller's identity: (the connection's index, the identity),
 	// joined to a row index once every description is published.
 	pub targets: Vec<(u8, Vec<u8>)>,
+	// The system-memory registers the firmware names for the device - a WDAT's - as (address, width): never a
+	// mapping, declared registers of the row (`declared`), each checked like a range the row would own.
+	pub registers: Vec<(u64, u8)>,
 }
 
 const NO_PORTS: [abi::PortResource; abi::MAX_PORT_RESOURCES] = [abi::PortResource { base: 0, len: 0, source: 0, index: 0, _pad: [0; 2] }; abi::MAX_PORT_RESOURCES];
@@ -219,6 +222,11 @@ pub fn init() {
 	for entry in table.iter_mut() {
 		record_ports(entry);
 	}
+	// AND WHAT A (vendor, device) ROW RESOLVES beyond the class: a BAR, and the registers it declares.
+	let functions = crate::arch::pci::scan();
+	for (index, entry) in table.iter_mut().enumerate() {
+		apply_declared(index, entry, &functions);
+	}
 	// AND THE DEVICES NOTHING ANNOUNCES, after every PCI function so the functions keep the indices the
 	// scan gave them: each description placed against the rows already published - a row of its own, the
 	// row already carrying its identity, merged into one, or refused and said so.
@@ -285,7 +293,7 @@ fn overlap_name(what: platform::Overlap) -> &'static str {
 // reserved set when it is claimable, then placed. Answers the row it became or joined, None when refused -
 // every refusal a line naming the description and the reason.
 fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u64, u64)]) -> Option<usize> {
-	let Described { description, properties, .. } = item;
+	let Described { description, properties, registers, .. } = item;
 	let name = core::str::from_utf8(description.identity()).unwrap_or("?");
 	for range in description.part.mmio() {
 		if let Some(at) = platform::over(range.base, range.len, forbidden) {
@@ -341,6 +349,21 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 			part.properties_len = properties.len() as u32;
 			// ALLOC-OK: the device inventory is built once at boot from what the firmware describes.
 			table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys, bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(alloc::boxed::Box::new(PlatformRow { part, properties })) });
+			// ITS SYSTEM-MEMORY REGISTERS, declared rather than mapped - each refused, and said, where it lies over
+			// something no platform row may own.
+			let mut declared: Vec<crate::declared::Register> = Vec::new();
+			for &(phys, width) in &registers {
+				if platform::over(phys, u64::from(width), forbidden).is_some() {
+					crate::serial_println!("device: {name} names a register at {phys:#x} over memory no platform row may own - not declared");
+					continue;
+				}
+				match crate::declared::memory(phys, width) {
+					// ALLOC-OK: boot, bounded by the registers one description names.
+					Some(register) => declared.push(register),
+					None => crate::serial_println!("device: {name} names a register at {phys:#x} ({width} bytes) this kernel cannot declare - not declared"),
+				}
+			}
+			crate::declared::record(index, declared);
 			Some(index)
 		}
 	}
@@ -530,9 +553,10 @@ pub fn arrive(bus: u8, dev: u8, func: u8) -> Option<usize> {
 	}
 	let mut entry = resolve_entry(&function);
 	record_ports(&mut entry);
+	let functions = crate::arch::pci::scan();
 	let index = {
 		let mut table = DEVICES.lock();
-		match table.iter().position(|row| row.is_function(bus, dev, func)) {
+		let index = match table.iter().position(|row| row.is_function(bus, dev, func)) {
 			Some(index) => {
 				table[index] = entry;
 				index
@@ -546,7 +570,9 @@ pub fn arrive(bus: u8, dev: u8, func: u8) -> Option<usize> {
 				table.push(entry);
 				table.len() - 1
 			}
-		}
+		};
+		apply_declared(index, &mut table[index], &functions);
+		index
 	};
 	// A DEVICE PLUGGED INTO A LIVE MACHINE REPORTS ERRORS LIKE ANY OTHER, and the list of functions
 	// that do was built at the boot scan - so one added afterwards would be the only function in the
@@ -612,6 +638,42 @@ pub fn retire_requested_slots() -> Vec<(u8, u8, u8)> {
 		}
 	}
 	done
+}
+
+// A (vendor, device) ROW APPLIED TO A FUNCTION'S ENTRY: the BAR the row names when the class resolved none - only
+// when no other function's BAR shares its page, since a claim hands the driver pages - and the registers it
+// declares. A row whose suppressing table is present is not applied, and says so; the claim refuses the function.
+fn apply_declared(index: usize, entry: &mut DeviceEntry, functions: &[crate::arch::pci::PciDevice]) {
+	if entry.transport != abi::TRANSPORT_PLAIN_PCI || entry.platform.is_some() {
+		return;
+	}
+	let Some(row) = crate::declared::row_for(entry.vendor, entry.product) else { return };
+	let (bus, dev, func) = (entry.bus, entry.dev, entry.func);
+	if crate::declared::suppressed(row) {
+		let table = row.suppressed_by.map(|signature| alloc::string::String::from_utf8_lossy(&signature).into_owned()).unwrap_or_default();
+		crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) is driven through the {table} table on this machine - its row is not applied and it is not claimed", row.name);
+		return;
+	}
+	if let Some(bar) = row.bar
+		&& entry.bar_len == 0
+	{
+		match crate::arch::pci::function_bar(bus, dev, func, bar) {
+			Some((base, len)) if !page_shared(base, len, (bus, dev, func), functions) => {
+				entry.bar_phys = base;
+				entry.bar_len = len;
+			}
+			Some((base, _)) => crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) has BAR {bar} at {base:#x} in a page another function's BAR shares - no window is handed over", row.name),
+			None => crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) has no BAR {bar} assigned - no window is handed over", row.name),
+		}
+	}
+	crate::declared::record(index, crate::declared::resolve(row, bus, dev, func));
+}
+
+// Whether any page of `base..base+len` holds another function's BAR.
+fn page_shared(base: u64, len: u64, own: (u8, u8, u8), functions: &[crate::arch::pci::PciDevice]) -> bool {
+	let first = base & !0xfff;
+	let last = (base + len.max(1) - 1) | 0xfff;
+	functions.iter().filter(|function| (function.bus, function.dev, function.func) != own && function.header_type & 0x7F == 0).any(|function| (0..6).filter_map(|bar| crate::arch::pci::function_bar(function.bus, function.dev, function.func, bar)).any(|(other, other_len)| other <= last && other + other_len.max(1) - 1 >= first))
 }
 
 /// Build the inventory row for one function, resolving whatever this kernel resolves for it.
@@ -990,6 +1052,16 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 			crate::serial_println!("device: {name} names DMA stream {:#x}, which no IOMMU driver of this kernel serves - not claimed", row.part.dma_stream);
 			return Err(ClaimError::Refused);
 		}
+	}
+	// A FUNCTION A FIRMWARE TABLE DRIVES INSTEAD is not claimed: the ICH9 LPC bridge on a machine with a WDAT, whose
+	// TCO the WDAT names - its row is not applied, and a TCO driver bound to it would hold a timer the ACPI watchdog
+	// arms.
+	if entry.platform.is_none()
+		&& let Some(row) = crate::declared::row_for(entry.vendor, entry.product)
+		&& crate::declared::suppressed(row)
+	{
+		crate::serial_println!("device: {index} ({}) is driven through a firmware table on this machine and is not claimable", row.name);
+		return Err(ClaimError::Refused);
 	}
 	let found = discovered(entry);
 	let (admission, policy) = match crate::dma_policy::admit(entry_name, &found, entry.device_type) {

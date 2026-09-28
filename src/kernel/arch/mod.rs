@@ -49,7 +49,9 @@
 //                   COM1 is handed to a driver so far; the other two answer every handoff call with a
 //                   refusal, and no row of theirs asks.
 //       pci:        PciDevice / VirtioDevice / ResourcedDevice, scan, scan_virtio, scan_resourced,
-//                   set_intx_disabled, msix_enable
+//                   set_intx_disabled, msix_enable, config_read_exact, config_write_exact (one declared
+//                   configuration register at exactly its width), map_declared (a chipset memory register's
+//                   kernel mapping - x86_64 alone declares one, the other two answer none)
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel
 //       rtc:        read_unix                     random:   fill
 //       ioports:    supported, switch_in, switch_to_idle, service, reload_if_running, firmware_blocks,
