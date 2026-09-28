@@ -446,6 +446,8 @@ struct RawService {
 	state_scope: StateScope,
 	#[serde(default)]
 	state_storage: String,
+	#[serde(default)]
+	notices: Vec<Notice>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -641,6 +643,28 @@ pub enum FactoryFileKind {
 pub enum Restart {
 	Transparent,
 	Escalate,
+}
+
+/// A NOTICE SERVICEMANAGER SENDS A SERVICE BEFORE A SEQUENCE THAT ENDS OR PAUSES IT: `shutdown` is
+/// the orderly power-off or reboot's `prepare`, sent before the reverse-dependency kills; `sleep` is
+/// the suspend transaction's announcement. Both travel on the control channel ServiceManager holds
+/// for the service, and only a service whose row declares one is told - every other service's
+/// orderly stop is still a kill.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum Notice {
+	Shutdown,
+	Sleep,
+}
+
+impl Notice {
+	/// The bit the generated service table carries for this notice.
+	pub fn bit(self) -> u8 {
+		match self {
+			Notice::Shutdown => 1,
+			Notice::Sleep => 2,
+		}
+	}
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -894,6 +918,8 @@ pub struct Service {
 	/// Where durable state lives. Empty for every other class - a path on a service that keeps
 	/// nothing is a claim nobody checks.
 	pub state_storage: String,
+	/// The notices ServiceManager sends this service before a sequence that ends or pauses it.
+	pub notices: Vec<Notice>,
 }
 
 /// What a restart of the process, and a reboot of the guest, do to a service's state.
@@ -1543,7 +1569,13 @@ impl Manifest {
 			if raw_service.state_class != StateClass::Durable && !raw_service.state_storage.is_empty() {
 				push_error(&mut errors, format!("{location}.state_storage"), "only durable state has a place - this service keeps nothing across a restart");
 			}
-			if services.insert(name.clone(), Service { name, program, restart: raw_service.restart, dependencies, roles, state_class: raw_service.state_class, state_scope: raw_service.state_scope, state_storage: raw_service.state_storage }).is_some() {
+			// A NOTICE NAMED TWICE is a row somebody edited without reading, as a kind named twice is.
+			for (at, notice) in raw_service.notices.iter().enumerate() {
+				if raw_service.notices[..at].contains(notice) {
+					push_error(&mut errors, format!("{location}.notices"), format!("{notice:?} is named twice"));
+				}
+			}
+			if services.insert(name.clone(), Service { name, program, restart: raw_service.restart, dependencies, roles, state_class: raw_service.state_class, state_scope: raw_service.state_scope, state_storage: raw_service.state_storage, notices: raw_service.notices }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate service name");
 			}
 		}
@@ -2332,7 +2364,9 @@ pub fn service_manifest_source(manifest: &Manifest) -> String {
 			})
 			.collect::<Vec<_>>()
 			.join(", ");
-		entries.push_str(&format!("\tService {{ name: b\"{}\", program: b\"{}\", pinned: {}, restart: {restart}, deps: &[{dependencies}] }},\n", service.name, service.program, program.stage == Stage::Pinned));
+		// THE NOTICES AS BITS - `Notice::bit` - so a notice nobody sends yet costs the supervisor no field it never reads.
+		let notices = service.notices.iter().fold(0u8, |bits, notice| bits | notice.bit());
+		entries.push_str(&format!("\tService {{ name: b\"{}\", program: b\"{}\", pinned: {}, restart: {restart}, notices: {notices}, deps: &[{dependencies}] }},\n", service.name, service.program, program.stage == Stage::Pinned));
 		plans.push_str(&format!("\t&[{roles}],\n"));
 	}
 	// THE PLAN IS INDEXED THE SAME WAY THE MANIFEST IS, deliberately: two arrays over one order

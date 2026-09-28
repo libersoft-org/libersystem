@@ -340,6 +340,57 @@ pub mod ioports {
 	pub fn set_io_decode(_bus: u8, _dev: u8, _func: u8, _on: bool) {}
 }
 
+// ------------------------------------------------------------------ firmware
+// NO ACPI ON THIS PORT: the machine describes itself with a device tree, which the kernel reads itself. The firmware
+// interpreter's calls answer that there is nothing to interpret.
+pub mod firmware {
+	pub fn available() -> bool {
+		false
+	}
+
+	pub fn table(_signature: &[u8; 4], _instance: usize) -> Option<&'static [u8]> {
+		None
+	}
+
+	pub fn smi_command(_value: u8) -> i64 {
+		abi::ERR_UNSUPPORTED
+	}
+
+	pub fn pm_timer() -> Option<u32> {
+		None
+	}
+
+	pub fn global_lock_release() -> i64 {
+		abi::ERR_UNSUPPORTED
+	}
+
+	pub fn nvram_read(_index: u64) -> i64 {
+		abi::ERR_UNSUPPORTED
+	}
+
+	pub fn nvram_write(_index: u64, _value: u64) -> i64 {
+		abi::ERR_UNSUPPORTED
+	}
+
+	pub fn gpe_request(_operation: u64, _gpe: u64) -> i64 {
+		abi::ERR_UNSUPPORTED
+	}
+
+	pub fn gpe_instance_ended() {}
+
+	#[cfg(not(test))]
+	pub fn take_events(_out: &mut dyn FnMut(u8, u16)) {}
+
+	// No line of a device-tree machine is the firmware's: its interrupt controllers are kernel-held rows.
+	pub fn kernel_lines() -> alloc::vec::Vec<u32> {
+		alloc::vec::Vec::new()
+	}
+
+	pub fn chipset_registers(_vendor: u16, _device: u16) -> &'static [(u16, u16)] {
+		&[]
+	}
+}
+
 // --------------------------------------------------------------------- rtc
 // The PL031 real-time clock (QEMU virt at 0x0901_0000): its data register holds
 // the current time as seconds since the Unix epoch. Reached through the physical

@@ -1,0 +1,170 @@
+# THE i6300ESB WATCHDOG, END TO END, THROUGH THE EMULATED KEYBOARD - the case every target runs. `check-watchdog.sh`
+# runs the x86_64 cases on development instances of its own; this is the same i6300esb case as one cold boot, for
+# aarch64 and riscv64:
+#
+#   QEMU_EXTRA="-device i6300esb" ./lab.sh scenario-cold src/harness/scenarios/watchdog-i6300esb.toml --target ARCH
+#
+# THE ORACLE IS QEMU'S RUN STATE: every boot with a QMP socket passes `-action watchdog=pause`, so an expiry leaves the
+# guest in `watchdog` - a `run-state` hold of `running` is a stretch with no expiry in it. The timing is wider than
+# the x86_64 gate's for the emulated cores - timeout 30 s, a question every 8 s, an answer within 4 s - and the
+# i6300esb divides 30 s into two preloads of 15258 units, 29998 ms.
+version = 1
+name = "watchdog i6300esb"
+description = "The i6300esb, armed by policy, is fed through three timeouts, a watchdog service crash and a driver kill, and expires once ServiceManager stops answering alive."
+timeout = 1800
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+# THE POLICY, read by a restarted watchdog service - its arm at 29998 ms is what says every key reached it.
+
+[[step]]
+do = "key"
+text = "set watchdog.enabled on"
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "set watchdog.device i6300esb"
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "set watchdog.timeout-ms 30000"
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "set watchdog.period-ms 8000"
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "set watchdog.deadline-ms 4000"
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "stop watchdog_service"
+
+[[step]]
+do = "expect"
+contains = "watchdog_service"
+timeout = 30
+
+[[step]]
+do = "key"
+text = "start watchdog_service"
+
+[[step]]
+do = "expect"
+contains = "started: watchdog_service"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "WatchdogService: armed i6300esb at 29998 ms"
+timeout = 60
+
+# THREE TIMEOUTS OF A HEALTHY SYSTEM.
+
+[[step]]
+do = "run-state"
+state = "running"
+hold = 90
+
+# THE SERVICE KILLED: restarted, and the replacement arms the i6300esb again.
+
+[[step]]
+do = "key"
+text = "stop !crash watchdog_service"
+
+[[step]]
+do = "expect"
+contains = "CRASHED"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "supervisor: watchdog_service restarted"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "WatchdogService: armed i6300esb at 29998 ms"
+timeout = 60
+
+[[step]]
+do = "run-state"
+state = "running"
+hold = 90
+
+# THE DRIVER KILLED: rebound, the running timer taken over at bind, and taken again by the service.
+
+[[step]]
+do = "kill-driver"
+function = "8086:25ab"
+
+[[step]]
+do = "expect"
+contains = "driver.i6300esb: online - running at bind"
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "WatchdogService: armed i6300esb at 29998 ms"
+timeout = 60
+
+[[step]]
+do = "run-state"
+state = "running"
+hold = 90
+
+# THE SILENCE: ServiceManager stops answering `alive` at T0. `running` until T0 + T - P - D less a 3 s margin
+# (15 s), and `watchdog` by T0 + T + D plus it (37 s).
+
+[[step]]
+do = "key"
+text = "stop !liveness-silence"
+
+[[step]]
+do = "expect"
+contains = "LIVENESS SILENT"
+timeout = 30
+
+[[step]]
+do = "run-state"
+state = "running"
+hold = 15
+
+[[step]]
+do = "run-state"
+state = "watchdog"
+timeout = 22
+
+# AND THE GUEST GIVEN BACK, so the teardown has a system to drive: the expiry reset the i6300esb, which is stopped.
+
+[[step]]
+do = "monitor"
+command = "cont"
+
+[[step]]
+do = "run-state"
+state = "running"
+timeout = 10

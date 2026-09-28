@@ -1072,6 +1072,46 @@ class RefusedStepTest(unittest.TestCase):
 			scenario.validate(document, 'test.toml')
 
 
+# THE WATCHDOG GATE'S ORACLE: a run state reached within a bound, or held over a stretch - and a hold fails at the
+# first sample that is anything else, since `running` held is the claim that no expiry happened in it.
+class RunStateStepTest(unittest.TestCase):
+	def guest(self, states):
+		class Guest(ScriptedGuest):
+			def run_state(self, timeout=5):
+				self.calls.append('run_state')
+				return states.pop(0) if len(states) > 1 else states[0]
+
+		return Guest()
+
+	def drive(self, step, guest, limit=5):
+		scenario.run_step(step, scenario.Guest(guest), guest, limit, 0)
+
+	def test_a_state_reached_within_the_bound_passes(self):
+		self.drive({'do': 'run-state', 'state': 'watchdog'}, self.guest(['running', 'running', 'watchdog']))
+
+	def test_a_state_never_reached_fails(self):
+		with self.assertRaises(scenario.ScenarioError) as caught:
+			self.drive({'do': 'run-state', 'state': 'watchdog'}, self.guest(['running']), 1)
+		self.assertIn('not watchdog', str(caught.exception))
+
+	def test_a_hold_fails_at_the_first_other_state(self):
+		with self.assertRaises(scenario.ScenarioError) as caught:
+			self.drive({'do': 'run-state', 'state': 'running', 'hold': 5}, self.guest(['running', 'watchdog']))
+		self.assertIn('was watchdog, not running', str(caught.exception))
+
+	def test_an_unanswered_query_fails_a_hold(self):
+		with self.assertRaises(scenario.ScenarioError):
+			self.drive({'do': 'run-state', 'state': 'running', 'hold': 2}, self.guest([None]))
+
+	def test_the_fields_are_validated(self):
+		for step in ({'do': 'run-state', 'state': 'asleep'}, {'do': 'run-state', 'state': 'running', 'hold': 0}, {'do': 'run-state', 'state': 'running', 'hold': True}, {'do': 'kill-driver', 'function': '8086-25ab'}):
+			document = {'version': scenario.SCENARIO_VERSION, 'name': 'x', 'step': [step]}
+			with self.assertRaises(scenario.ScenarioError, msg=repr(step)):
+				scenario.validate(document, 'test.toml')
+		document = {'version': scenario.SCENARIO_VERSION, 'name': 'x', 'step': [{'do': 'run-state', 'state': 'running', 'hold': 45}, {'do': 'kill-driver', 'function': '8086:25ab'}]}
+		scenario.validate(document, 'test.toml')
+
+
 # BOOT-007's other half: the claim that a child which ignores TERM is killed, and that its whole
 # GROUP goes with it. Asserted in a comment when it was written; exercised here, because a cleanup
 # that quietly fails to clean is worse than none - the next run inherits whatever survived.

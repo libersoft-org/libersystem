@@ -93,6 +93,14 @@ name = "tpm_service"
 path = "src/tpm_service.rs"
 
 [[bin]]
+name = "watchdog_service"
+path = "src/watchdog_service.rs"
+
+[[bin]]
+name = "acpi_service"
+path = "src/acpi_service.rs"
+
+[[bin]]
 name = "modem_service"
 path = "src/modem_service.rs"
 
@@ -386,6 +394,12 @@ bootproto = { path = "../../../boot/protocol" }
 # it offers. Linked statically, as `service-logic` is.
 smartcard-model = { path = "../../libs/smartcard/model" }
 abi = { path = "../../../abi" }
+# THE ACPI SERVICE'S INTERPRETER AND ITS DECISIONS: the AML interpreter, what each node is and the row it is reported
+# as, the report encoding the kernel reads, and the FADT reader. Linked statically into that one program.
+aml = { path = "../../../aml" }
+acpi-model = { path = "../../libs/acpi/model" }
+platform = { path = "../../../platform" }
+acpi = { path = "../../../acpi" }
 
 # The graphics-free terminal model (L2): the cell grid, escape parser, and text
 # serialization that ConsoleService renders to the framebuffer.

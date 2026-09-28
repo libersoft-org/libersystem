@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 145] = [
+const GATES: [(&str, &str); 147] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -376,6 +376,8 @@ const GATES: [(&str, &str); 145] = [
 	("i2c-bus", "userspace.build"),
 	// THE BUS GATE'S DEVICE SIDE, on the host: the vhost-user backend's own suite.
 	("i2c-backend", "harness.tools"),
+	// The AML emitter the fixture SSDTs are built with: its encodings and its sample, which the interpreter loads.
+	("aml-emitter", "harness.tools"),
 	// MEDIAIMPORTSERVICE, against a PTP responder the kernel harness plays: exact pages, the over-limit storage,
 	// scoped and stale identities, validated completion into a transactional destination, removal as a partial
 	// ending, and the production grant. Its subject is the service, the PTP parser and the decisions leaf, the
@@ -403,6 +405,10 @@ const GATES: [(&str, &str); 145] = [
 	// it back on a kill and on a disable with zero stray register accesses, and gets a panic onto the wire past a
 	// driver that stopped draining. Its subject is the kernel's console and the driver above it.
 	("serial-handoff", "kernel"),
+	// THE HARDWARE WATCHDOG, on development instances of its own: the declared registers, the three drivers, the
+	// watchdog service's choice and schedule, ServiceManager's liveness answer and its shutdown notice - with QEMU's
+	// run state as the oracle. Its subject is the kernel mechanism and the drivers and services above it.
+	("watchdog", "kernel"),
 	// The lifecycle contract, end to end. Its subject is the runtime's init/fini runner, the kernel's
 	// per-image lifecycle table and the two fixtures that exercise them - a userspace or kernel
 	// change selects it, and it boots a guest because a constructor is only observable from inside
@@ -845,7 +851,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 50] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 51] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -869,6 +875,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 50] = [
 	"qemu-tpm-tool",
 	// And the COM1 handoff's, on a development instance of its own.
 	"serial-handoff",
+	// And the hardware watchdog's, which boots four in turn.
+	"watchdog",
 	"virtio-multiport",
 	"qemu-2d-demo",
 	"qemu-2d-account",

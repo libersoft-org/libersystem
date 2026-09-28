@@ -17,6 +17,9 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 
+#[cfg(test)]
+mod tests;
+
 // Where a declared register lives, resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Space {
@@ -92,11 +95,7 @@ pub fn resolve(row: &Row, bus: u8, dev: u8, func: u8) -> Vec<Register> {
 			Declaration::Config { offset, width, mask } => Some(Register { space: Space::Config { bus, dev, func, offset }, width, mask }),
 			Declaration::ChipsetMemory { base_register, base_mask, enable, offset, width, mask } => {
 				let raw = crate::arch::pci::config_read_exact(bus, dev, func, base_register, 4).unwrap_or(0);
-				let base = u64::from(raw & base_mask);
-				if raw & enable != enable || base == 0 {
-					crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) declares a register at a base its configuration does not enable - not declared", row.name);
-					None
-				} else {
+				if let Some(base) = chipset_base(raw, base_mask, enable) {
 					let phys = base + u64::from(offset);
 					match crate::arch::pci::map_declared(phys) {
 						Some(virt) => Some(Register { space: Space::Memory { phys, virt }, width, mask }),
@@ -105,6 +104,9 @@ pub fn resolve(row: &Row, bus: u8, dev: u8, func: u8) -> Vec<Register> {
 							None
 						}
 					}
+				} else {
+					crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) declares a register at a base its configuration does not enable - not declared", row.name);
+					None
 				}
 			}
 		};
@@ -114,6 +116,12 @@ pub fn resolve(row: &Row, bus: u8, dev: u8, func: u8) -> Vec<Register> {
 		}
 	}
 	out
+}
+
+// A CHIPSET BASE a configuration register holds: its masked bits, while its enable bits are set and it is not zero.
+fn chipset_base(raw: u32, base_mask: u32, enable: u32) -> Option<u64> {
+	let base = u64::from(raw & base_mask);
+	(raw & enable == enable && base != 0).then_some(base)
 }
 
 // A system-memory register a firmware table names, mapped for the row that describes it: `None` when the window

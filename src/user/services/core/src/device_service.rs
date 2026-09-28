@@ -68,11 +68,30 @@ fn device_entry(i: u64) -> Option<DeviceEntry> {
 	}
 	// The address comes straight from the kernel table, which is what makes a row number
 	// resolvable to a device without asking any service. See `device-entry`.
-	let mut entry = DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, present: info.on_bus != 0, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32, kind: RowKind::Pci, source: PlatformSource::None, state: PlatformState::None, identity: alloc::string::String::new(), ids: Vec::new(), resources: Vec::new(), unresolved: false };
+	let mut entry = DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, present: info.on_bus != 0, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32, kind: RowKind::Pci, source: PlatformSource::None, state: PlatformState::None, identity: alloc::string::String::new(), ids: Vec::new(), resources: Vec::new(), unresolved: false, companion: alloc::string::String::new(), parent: alloc::string::String::new() };
 	if info.platform.kind == ROW_KIND_PLATFORM {
 		describe_platform(&info, &mut entry);
+	} else if info.platform.state == PLATFORM_STATE_FIRMWARE_HELD {
+		// A FUNCTION THE ACPI SERVICE'S REGIONS HOLD: no driver may take it.
+		entry.state = PlatformState::FirmwareHeld;
 	}
+	attach_firmware_node(i, &mut entry);
 	Some(entry)
+}
+
+// WHAT THE NAMESPACE ATTACHED TO THE ROW: a companion's path, a parent function.
+fn attach_firmware_node(index: u64, entry: &mut DeviceEntry) {
+	let mut node = FirmwareNode::default();
+	let answer = unsafe { syscall(SYS_DEVICE_NODE, index, &mut node as *mut FirmwareNode as u64, core::mem::size_of::<FirmwareNode>() as u64, 0) } as i64;
+	if answer != 0 {
+		return;
+	}
+	if node.flags & FIRMWARE_NODE_COMPANION != 0 {
+		entry.companion = alloc::string::String::from_utf8_lossy(node.path()).into_owned();
+	}
+	if node.flags & FIRMWARE_NODE_PARENT != 0 {
+		entry.parent = alloc::format!("{:02x}:{:02x}.{}", node.parent_bus, node.parent_dev, node.parent_func);
+	}
 }
 
 // A PLATFORM ROW, AS THE FIRMWARE DESCRIBED IT: where the description came from, who may take the device, its

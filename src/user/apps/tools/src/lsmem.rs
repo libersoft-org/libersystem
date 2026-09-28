@@ -67,6 +67,7 @@ fn kind_name(kind: u32) -> &'static str {
 		MEMMAP_RESERVED => "reserved",
 		MEMMAP_ACPI_RECLAIMABLE => "acpi reclaimable",
 		MEMMAP_ACPI_NVS => "acpi nvs",
+		MEMMAP_MMIO => "mmio",
 		MEMMAP_BAD => "bad",
 		MEMMAP_BOOTLOADER => "bootloader",
 		MEMMAP_KERNEL => "kernel",

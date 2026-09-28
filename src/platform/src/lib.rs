@@ -20,6 +20,11 @@
 
 use abi::{Connection, MatchId, MmioResource, PlatformPart, PortResource, WiredLine};
 
+pub mod policy;
+pub mod report;
+
+#[cfg(test)]
+mod firmware_tests;
 #[cfg(test)]
 mod tests;
 

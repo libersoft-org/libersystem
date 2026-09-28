@@ -6,10 +6,11 @@
 // reaches a register the kernel did not mint: an action naming one is dropped, and a table whose required actions
 // cannot run is not a watchdog.
 //
-// WHAT IT DOES. At bind: the status read and cleared (the last reset was the watchdog's), `SET_REBOOT` run - which on
-// a WDAT over q35's TCO is the action that clears No-Reboot - and the running state read. A running timer is taken
-// over as every watchdog driver takes one over. Arming sets the countdown to the timeout divided by the table's
-// period, starts the timer and pets it; a pet is `RESET`; a disarm is `SET_STOPPED` where the table has it.
+// WHAT IT DOES. At bind: the status read and cleared (the last reset was the watchdog's), then the timer as it was
+// found - whether it runs and whether it can reset the machine - with a running timer that can taken over as every
+// watchdog driver takes one over and one that cannot stopped; then `SET_REBOOT` - which on a WDAT over q35's TCO is
+// the action that clears No-Reboot. Arming sets the countdown to the timeout divided by the table's period, starts
+// the timer and pets it; a pet is `RESET`; a disarm is `SET_STOPPED` where the table has it.
 
 #![no_std]
 #![no_main]
@@ -124,15 +125,15 @@ impl Timer for Wdat {
 
 // The table, out of the row's property block: one VALUE record named `WDAT`.
 fn table_bytes(handle: u64) -> Option<Vec<u8>> {
-	let mut block = alloc::vec![0u8; abi::MAX_DEVICE_PROPERTIES];
+	let mut block = alloc::vec![0u8; rt::MAX_DEVICE_PROPERTIES];
 	let len = device_properties(handle, &mut block);
 	if len < 12 {
 		return None;
 	}
-	let block = &block[..(len as usize).min(abi::MAX_DEVICE_PROPERTIES)];
+	let block = &block[..(len as usize).min(rt::MAX_DEVICE_PROPERTIES)];
 	let name_len = u16::from_le_bytes([block[2], block[3]]) as usize;
 	let value_len = u32::from_le_bytes([block[4], block[5], block[6], block[7]]) as usize;
-	if block[0] != abi::DEVICE_PROPERTY_VALUE || name_len != 4 || &block[8..12] != b"WDAT" || 12 + value_len > block.len() {
+	if block[0] != rt::DEVICE_PROPERTY_VALUE || name_len != 4 || &block[8..12] != b"WDAT" || 12 + value_len > block.len() {
 		return None;
 	}
 	Some(block[12..12 + value_len].to_vec())
@@ -182,10 +183,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			let _ = driver.table.run(wdat::SET_STATUS, 0, &mut driver.bus);
 		}
 	}
-	// `SET_REBOOT` AT EVERY BIND: the reset is this contract's action.
-	if driver.table.has(wdat::SET_REBOOT) {
-		let _ = driver.table.run(wdat::SET_REBOOT, 0, &mut driver.bus);
-	}
+	// THE TIMER AS IT WAS FOUND, read BEFORE this driver changes anything: whether it runs, and whether it can reset
+	// the machine. Read after `SET_REBOOT`, a WDAT over q35's TCO - whose halt bit is clear from reset and whose
+	// No-Reboot is set - read as a timer running and able to reset, and the takeover's pet then STARTED a count
+	// nobody had armed; with the bridge over and the policy's consumer not yet up, it expired.
 	driver.running_at_bind = driver.table.run(wdat::QUERY_RUNNING, 0, &mut driver.bus) == Some(1);
 	let can_reset = !driver.table.has(wdat::QUERY_REBOOT) || driver.table.run(wdat::QUERY_REBOOT, 0, &mut driver.bus) == Some(1);
 	let bridge = driver.running_at_bind && can_reset;
@@ -194,6 +195,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	} else if driver.running_at_bind && driver.table.has(wdat::SET_STOPPED) {
 		// A running count that cannot reset the machine records expiries that reset nothing: it is stopped.
 		let _ = driver.table.run(wdat::SET_STOPPED, 0, &mut driver.bus);
+	}
+	// `SET_REBOOT` AT EVERY BIND, after the takeover: the reset is this contract's action, and a timer stopped above
+	// stays stopped until it is armed.
+	if driver.table.has(wdat::SET_REBOOT) {
+		let _ = driver.table.run(wdat::SET_REBOOT, 0, &mut driver.bus);
 	}
 	let mut report = common::Bounded::<200>::new();
 	report.push(b"driver.wdat: online - ");

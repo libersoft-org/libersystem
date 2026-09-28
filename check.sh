@@ -109,6 +109,9 @@ declare -A GATES=(
 	# AND THE DEVICE SIDE ITSELF, on the host in milliseconds: the backend's memory table, its IOTLB's updates,
 	# misses and invalidations, indirect descriptor tables, the register device's PEC, and the GPIO model.
 	["i2c-backend"]="python3 harness/vhost-i2c-gpio.py --self-test"
+	# THE HARNESS'S AML EMITTER, which the fixture SSDTs are built with: every encoding checked, and its sample
+	# byte-for-byte the one the interpreter's own suite loads.
+	["aml-emitter"]="python3 harness/aml_emitter.py --self-test"
 	# MEDIAIMPORTSERVICE AGAINST A CAMERA THE KERNEL HARNESS PLAYS: exact pages out of a 40 000-handle snapshot,
 	# the over-limit storage refused explicitly, scoped and stale identities, validated completion into a
 	# transactional destination, removal as an explicit partial ending, and the grant. Not USB Still Image.
@@ -128,6 +131,11 @@ declare -A GATES=(
 	# takes it back on a kill and on a disable, counting zero stray register accesses each time; `lab sh` answers
 	# through both paths; and a panic reaches the wire past a driver that stopped draining a full ring.
 	["serial-handoff"]="tools/check-serial-handoff.sh"
+	# THE HARDWARE WATCHDOG on development instances of its own, one device at a time: the i6300esb, q35's TCO and a
+	# WDAT over it each armed by name and fed through three timeouts, and each expiring - `watchdog` in QEMU's run
+	# state under `-action watchdog=pause` - once ServiceManager stops answering `alive`; the i6300esb also through a
+	# service kill, a driver kill, an orderly reboot whose notice is answered first, and a real reset it alone reports.
+	["watchdog"]="tools/check-watchdog.sh"
 	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
 	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
 	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three

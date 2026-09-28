@@ -510,6 +510,7 @@ pub fn stand(bootstrap: u64, bind: &Bind, device: u64) -> ! {
 					exit();
 				}
 			}
+			proto::Opcode::Node | proto::Opcode::NodeAbsent => take_node(bind, header.opcode, handle),
 			// A STOP IS ANSWERED, AFTER THE DEVICE IS QUIET. `stand` treated every opcode other
 			// than `PING` as terminal and exited, so a driver standing on its channel -
 			// `virtio_console` is one - never sent `STOPPED` at all and the manager waited out
@@ -917,6 +918,12 @@ fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
 // its handle closed rather than silently dropped.
 fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> Control {
 	let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	// A NODE CHANNEL WHOSE SERVICE ENDED - the ACPI service restarted - is given up and asked for again.
+	let node = NODE.load(core::sync::atomic::Ordering::Acquire);
+	if node != 0 && matches!(try_recv(node, &mut buf), Polled::Closed) && NODE.compare_exchange(node, 0, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire).is_ok() {
+		close(node);
+		let _ = request_node(bootstrap, bind);
+	}
 	loop {
 		let (len, handle) = match try_recv(bootstrap, &mut buf) {
 			Polled::Message { len, handle } => (len, handle),
@@ -967,6 +974,8 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 					return Control::Ended;
 				}
 			}
+			// THE FIRMWARE NODE THIS DRIVER ASKED FOR, or word that there is none - see `request_node`.
+			proto::Opcode::Node | proto::Opcode::NodeAbsent => take_node(bind, header.opcode, handle),
 			// ASKED TO STOP, AND IT MEANS ALL OF IT. A driver reaching here has nothing in
 			// flight it can finish - the loops that call this are between units of work - so
 			// what it owes is the answer and then its own exit. A driver with something to
@@ -980,6 +989,45 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 			}
 		}
 	}
+}
+
+// THE FIRMWARE NODE'S CHANNEL, as the manager last answered this driver's request: 0 until it has, and 0 again after
+// `NodeAbsent`. A newer answer replaces an older one, whose channel is closed.
+static NODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// Whether an answer - either one - has arrived since the last request.
+static NODE_ANSWERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn take_node(bind: &Bind, opcode: proto::Opcode, handle: u64) {
+	let mut line = Bounded::<96>::new();
+	line.push(b"driver ");
+	line.push(&hex2(bind.info.bus));
+	line.push(b":");
+	line.push(&hex2(bind.info.dev));
+	line.push(b".");
+	line.push(&[b'0' + (bind.info.func & 7)]);
+	line.push(if opcode == proto::Opcode::Node { b": its firmware node channel arrived\n" } else { b": the firmware describes no node for it\n" });
+	print(line.as_bytes());
+	let old = NODE.swap(if opcode == proto::Opcode::Node { handle } else { 0 }, core::sync::atomic::Ordering::AcqRel);
+	if old != 0 {
+		close(old);
+	}
+	if opcode == proto::Opcode::NodeAbsent && handle != 0 {
+		close(handle);
+	}
+	NODE_ANSWERED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// ASK THE MANAGER FOR THIS DEVICE'S FIRMWARE NODE - a namespace device's own, or its PCI function's companion. The
+// answer arrives on the control channel whenever the manager can give it: at once, or at the ACPI service's "namespace
+// loaded" report; `node()` reads it. Asked again when the channel it was answered with closes.
+pub fn request_node(bootstrap: u64, bind: &Bind) -> bool {
+	NODE_ANSWERED.store(false, core::sync::atomic::Ordering::Release);
+	send_frame(bootstrap, proto::Opcode::NodeRequest, bind.generation, &[])
+}
+
+// The node channel the manager answered with, if it has: `Some(0)` for "there is none", `None` while unanswered.
+pub fn node() -> Option<u64> {
+	NODE_ANSWERED.load(core::sync::atomic::Ordering::Acquire).then(|| NODE.load(core::sync::atomic::Ordering::Acquire))
 }
 
 // Answer one `PING` that is already waiting on `bootstrap`, for a loop that does its own waiting.

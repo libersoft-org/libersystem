@@ -11,7 +11,7 @@ fn device_type_wire_is_stable() {
 }
 #[test]
 fn device_entry_wire_is_stable() {
-	let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7, bus: 7, dev: 7, func: 7, present: true, kind: RowKind::Pci, source: PlatformSource::None, state: PlatformState::None, identity: String::from("x"), ids: alloc::vec![PlatformId { kind: PlatformIdKind::None, text: String::from("x") }], resources: alloc::vec![PlatformResource { kind: PlatformResourceKind::Mmio, base: 7, length: 7, level: true, active_low: true, controller: 7 }], unresolved: true };
+	let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7, bus: 7, dev: 7, func: 7, present: true, kind: RowKind::Pci, source: PlatformSource::None, state: PlatformState::None, identity: String::from("x"), ids: alloc::vec![PlatformId { kind: PlatformIdKind::None, text: String::from("x") }], resources: alloc::vec![PlatformResource { kind: PlatformResourceKind::Mmio, base: 7, length: 7, level: true, active_low: true, controller: 7 }], unresolved: true, companion: String::from("x"), parent: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");
 	let golden: &[u8] = &[
 		7,
@@ -78,6 +78,12 @@ fn device_entry_wire_is_stable() {
 		0,
 		0,
 		1,
+		1,
+		0,
+		120,
+		1,
+		0,
+		120,
 	];
 	assert_eq!(bytes, golden);
 	assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
@@ -359,4 +365,20 @@ fn watchdog_description_wire_is_stable() {
 	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 1, 1, 1, 1, 1];
 	assert_eq!(bytes, golden);
 	assert_eq!(WatchdogDescription::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn acpi_notification_wire_is_stable() {
+	let sample = AcpiNotification { value: 7, sequence: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(AcpiNotification::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn acpi_connection_kind_wire_is_stable() {
+	let sample = AcpiConnectionKind::EventLine;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(AcpiConnectionKind::decode(&bytes).unwrap(), sample);
 }

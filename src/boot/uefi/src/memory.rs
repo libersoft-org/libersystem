@@ -310,6 +310,7 @@ fn region_kind(ty: u32) -> u32 {
 		uefi::ACPI_RECLAIM_MEMORY => bootproto::MEM_ACPI_RECLAIMABLE,
 		uefi::ACPI_MEMORY_NVS => bootproto::MEM_ACPI_NVS,
 		uefi::UNUSABLE_MEMORY => bootproto::MEM_BAD,
+		uefi::MEMORY_MAPPED_IO | uefi::MEMORY_MAPPED_IO_PORT_SPACE => bootproto::MEM_MMIO,
 		_ => bootproto::MEM_RESERVED,
 	}
 }

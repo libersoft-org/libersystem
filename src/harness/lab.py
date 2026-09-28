@@ -1301,6 +1301,16 @@ def dev_profile_logged():
 		return False
 
 
+# THE GUEST'S RUN STATE AS QEMU HOLDS IT - `query-status`'s `status`: `running`, or `watchdog` once an expiry under
+# `-action watchdog=pause` has stopped it. The watchdog gate's oracle: durable, so a state read at any time says
+# whether an expiry happened at any point before it.
+def cmd_dev_run_state(args):
+	answer = qmp_command('query-status', timeout=arg_value(args, '--timeout', 5))
+	if not isinstance(answer, dict) or 'status' not in answer:
+		die('query-status answered without a status')
+	print(answer['status'])
+
+
 def cmd_dev_status(args):
 	state, identity = dev_state()
 	print(f'lab: development instance {state}')
@@ -2162,15 +2172,23 @@ def cmd_dev_reset(args):
 # COM1 the way DeviceManager's SIG_KILL does, `hold-and-flood` holds every console tap's reads and writes kernel
 # lines until the kernel's transmit ring has dropped bytes at its bound, and `panic` panics the kernel - whose
 # terminal-path writer then puts the dropped count and the panic on the wire however the driver holding COM1
-# left it. A kernel built for any other image refuses all three.
-KERNEL_CONSOLE_REQUESTS = {'hold-and-flood': 1, 'panic': 2, 'kill-holder': 3}
+# left it; `kill-driver VENDOR:DEVICE` kills the driver that has that claimed PCI function's BAR mapped, as
+# DeviceManager's SIG_KILL does - the watchdog gate's driver death. A kernel built for any other image refuses them.
+KERNEL_CONSOLE_REQUESTS = {'hold-and-flood': 1, 'panic': 2, 'kill-holder': 3, 'kill-driver': 4}
 
 
 def cmd_dev_kernel_console(args):
 	timeout, rest = take_arg(args, '--timeout', 30)
-	if len(rest) != 1 or rest[0] not in KERNEL_CONSOLE_REQUESTS:
-		die(f'usage: lab dev-kernel-console {"|".join(KERNEL_CONSOLE_REQUESTS)}')
+	if not rest or rest[0] not in KERNEL_CONSOLE_REQUESTS or len(rest) != (2 if rest[0] == 'kill-driver' else 1):
+		die(f'usage: lab dev-kernel-console {"|".join(KERNEL_CONSOLE_REQUESTS)} (kill-driver VENDOR:DEVICE, in hex)')
 	which = rest[0]
+	payload = bytes([KERNEL_CONSOLE_REQUESTS[which]])
+	if which == 'kill-driver':
+		try:
+			vendor, device = (int(part, 16) for part in rest[1].split(':'))
+		except ValueError:
+			die(f'kill-driver names a function as VENDOR:DEVICE in hex, not {rest[1]!r}')
+		payload += struct.pack('<HH', vendor, device)
 	sock, buffer, _ = proto_session(timeout)
 	try:
 		if which == 'panic':
@@ -2178,7 +2196,7 @@ def cmd_dev_kernel_console(args):
 			sock.sendall(proto_frame(OP_KERNEL_CONSOLE, 2, bytes([KERNEL_CONSOLE_REQUESTS[which]])))
 			print('lab: a kernel panic was asked for - its text is on the serial log')
 			return
-		opcode, _, body = proto_request(sock, buffer, 2, OP_KERNEL_CONSOLE, bytes([KERNEL_CONSOLE_REQUESTS[which]]), timeout=timeout, what=f'the kernel console request {which}')
+		opcode, _, body = proto_request(sock, buffer, 2, OP_KERNEL_CONSOLE, payload, timeout=timeout, what=f'the kernel console request {which}')
 		if opcode != OP_KERNEL_CONSOLE_ACK or len(body) < 8:
 			die(f'{which} answered with opcode {opcode:#04x} and {len(body)} B')
 		answer = struct.unpack("<Q", body[:8])[0]
@@ -2893,6 +2911,22 @@ class LabGuest:
 	def restart(self, timeout):
 		return self.scenario_child(['dev-restart', '--timeout', str(timeout)], timeout)
 
+	# THE RUN STATE QEMU HOLDS - `query-status`'s `status` - or None when QMP does not answer three times running: its
+	# socket takes one client at a time, so a reading can land while the last one is still being let go, and a missed
+	# reading loses nothing since `watchdog` stays until `cont`.
+	def run_state(self, timeout=5):
+		for _ in range(3):
+			try:
+				answer = qmp_command('query-status', timeout=timeout)
+			except SystemExit:
+				time.sleep(0.5)
+				continue
+			return answer.get('status') if isinstance(answer, dict) else None
+		return None
+
+	def kill_driver(self, function, timeout):
+		return self.scenario_child(['dev-kernel-console', 'kill-driver', function, '--timeout', str(timeout)], timeout)
+
 
 def cmd_dev_test(args):
 	import scenario
@@ -3291,7 +3325,8 @@ def cmd_log(args):
 # through (uppercase via shift-), so only the specials are listed.
 # `&` and `|` because a scenario starts background jobs and pipelines as a person would, by typing them.
 # `#` because a platform device's stable identity carries one (`table:TPM2#0`), and a scenario names it.
-KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '#': 'shift-3', '\n': 'ret'}
+# `!` because ServiceManager's reserved admin names begin with one, and a development scenario types them.
+KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '#': 'shift-3', '!': 'shift-1', '\n': 'ret'}
 
 # The key names a scenario or a command may name directly, beyond letters and digits. A fixed
 # vocabulary rather than a string handed through to QEMU: this is the one place where what a
@@ -3771,7 +3806,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-kernel-console': cmd_dev_kernel_console, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down, 'scenario-cold': cmd_scenario_cold}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-kernel-console': cmd_dev_kernel_console, 'dev-run-state': cmd_dev_run_state, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down, 'scenario-cold': cmd_scenario_cold}
 
 
 def main():

@@ -653,6 +653,10 @@ pub const DEVICE_EVENT_DEPARTED: u8 = 2;
 /// still valid and nothing has been unplugged, and distinct from a driver fault because the DEVICE is
 /// what stopped being trustworthy.
 pub const DEVICE_EVENT_FAULTED: u8 = 3;
+/// THE ACPI SERVICE'S WALK IS PUBLISHED: every row, reservation and companion it reported, and every withdrawal of
+/// what it did not report again, came before this. The eight bytes after the kind are the instance's number, not a
+/// device index. DeviceManager reads again the row of every live binding at it (`SYS_DEVICE_NODE`).
+pub const DEVICE_EVENT_NAMESPACE_LOADED: u8 = 4;
 
 // The largest submission `SYS_ENTROPY_ADD` will read in one call. A bound rather than a buffer size:
 // the credit is capped far below this anyway, so a larger call would be a larger copy for no more
@@ -1442,6 +1446,11 @@ pub const MEMMAP_BAD: u32 = 4;
 pub const MEMMAP_BOOTLOADER: u32 = 5;
 pub const MEMMAP_KERNEL: u32 = 6;
 pub const MEMMAP_FRAMEBUFFER: u32 = 7;
+// Loader scratch whose life ended at the hand-off (usable to the kernel).
+pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u32 = 8;
+// MEMORY-MAPPED I/O the firmware reports - its device windows - kept apart from reserved memory so a firmware
+// mapping of it is uncached where reserved memory is write-back.
+pub const MEMMAP_MMIO: u32 = 9;
 
 // One device-interrupt vector's state irq_info writes into the caller's buffer: the
 // vector number, its window (IRQ_KIND_FIXED for the legacy INTx window, IRQ_KIND_MSI
@@ -1493,10 +1502,13 @@ pub const SYS_CONSOLE_TAP_READ: u64 = 97;
 // terminal-path writer puts a panic on the wire while a driver holds the console and does not drain it.
 // `DEV_CONSOLE_KILL_HOLDER` kills the process that has the console UART's ports mapped - its driver - the
 // way DeviceManager's SIG_KILL does, answering 0, or ERR_INVALID when no process holds them.
+// `DEV_CONSOLE_KILL_DRIVER`, with a PCI vendor in bits 16..32 of the request and a device in bits 32..48, kills the
+// process that has the BAR of that claimed function mapped - its driver - the same way, or answers ERR_INVALID.
 pub const SYS_DEV_CONSOLE: u64 = 98;
 pub const DEV_CONSOLE_HOLD_AND_FLOOD: u64 = 1;
 pub const DEV_CONSOLE_PANIC: u64 = 2;
 pub const DEV_CONSOLE_KILL_HOLDER: u64 = 3;
+pub const DEV_CONSOLE_KILL_DRIVER: u64 = 4;
 // ONE DECLARED REGISTER - `SYS_DEVICE_REGISTER_READ(registers, index)` answers its value (as a non-negative i64),
 // `SYS_DEVICE_REGISTER_WRITE(registers, index, value)` writes it and answers 0 - for a `Registers` handle carrying
 // `RIGHT_READ` or `RIGHT_WRITE`. The access is at exactly the register's declared width, and a write changes only the
@@ -1504,6 +1516,135 @@ pub const DEV_CONSOLE_KILL_HOLDER: u64 = 3;
 // capability was minted from is not the device's current binding.
 pub const SYS_DEVICE_REGISTER_READ: u64 = 99;
 pub const SYS_DEVICE_REGISTER_WRITE: u64 = 100;
+
+// THE ACPI SERVICE'S CALLS, every one behind a `FirmwareInterpreter` privilege handle in `a0`. The service
+// DESCRIBES; the kernel decides what is minted, under its policy.
+//
+// `SYS_FIRMWARE_TABLE(privilege, selector, buf, len)` - `selector` a table signature's four bytes in its low 32
+// bits (little-endian, "DSDT" is 0x54445344) and the instance in its high 32 - copies the table into `buf` when
+// `len` holds it and answers its whole length either way (so a `len` of 0 asks the size); the DSDT and the FACS
+// come through the FADT, and a table whose checksum fails is not answered. ERR_INVALID for no such table,
+// ERR_UNSUPPORTED on a machine with no ACPI.
+pub const SYS_FIRMWARE_TABLE: u64 = 101;
+// `SYS_FIRMWARE_MAP(privilege, request)` maps a SystemMemory operation region: `request` a `FirmwareMapRequest`.
+// Answers a `DeviceMemory` handle (`RIGHT_READ | RIGHT_WRITE | RIGHT_MAP`) - mapped write-back for ACPI NVS,
+// ACPI-reclaimable and firmware-reserved memory, uncached for MMIO - or ERR_ACCESS_DENIED where the policy refuses
+// the range, saying why on the console. A BAR admitted as the companion's makes its function firmware-held.
+pub const SYS_FIRMWARE_MAP: u64 = 102;
+// `SYS_FIRMWARE_MEDIATED(privilege, operation, a, b)`: the accesses the kernel performs itself - the SMI command
+// port (`a` the value; the FADT's ACPI-disable value refused), a CMOS NVRAM byte from 0x0E up (the clock's
+// registers and the century byte stay the kernel's), the PM timer, and the global lock's release bit.
+pub const SYS_FIRMWARE_MEDIATED: u64 = 103;
+pub const FIRMWARE_SMI_COMMAND: u64 = 1;
+pub const FIRMWARE_CMOS_READ: u64 = 2;
+pub const FIRMWARE_CMOS_WRITE: u64 = 3;
+pub const FIRMWARE_PM_TIMER: u64 = 4;
+pub const FIRMWARE_GLOBAL_LOCK_RELEASE: u64 = 5;
+// `SYS_FIRMWARE_PCI(privilege, address, access, value)`: one PCI configuration access the kernel performs.
+// `address` is `segment << 32 | bus << 16 | device << 8 | function`; `access` is `offset | width << 16 |
+// write << 24` (width 1, 2 or 4, naturally aligned). A read of any function answers the value; a write is refused
+// below 0x40, inside an MSI or MSI-X capability, to a function a driver holds and to a register the kernel's
+// chipset rows own, and answers 0.
+pub const SYS_FIRMWARE_PCI: u64 = 104;
+pub const FIRMWARE_PCI_WRITE: u64 = 1 << 24;
+// `SYS_FIRMWARE_REPORT(privilege, buf, len)`: one report in `platform::report`'s encoding - a namespace device or
+// reservation, a withdrawal, a companion, a host bridge's `_OSC` answer, or "namespace loaded". Answers the row the
+// report is about (device, companion) or 0; ERR_INVALID for a malformed report, ERR_ACCESS_DENIED for one the
+// kernel refuses (said on the console), ERR_UNSUPPORTED when no instance is attached.
+pub const SYS_FIRMWARE_REPORT: u64 = 105;
+// `SYS_FIRMWARE_EVENTS(privilege, channel)`: attach the caller as the running instance, its events delivered on
+// `channel` (the kernel holds a copy and sends on it). Answers the instance's number, from 1. Every general-purpose
+// event the previous instance had enabled was disabled when it ended. The messages: `[FIRMWARE_EVENT_GPE][u16]` an
+// event latched and masked, `[FIRMWARE_EVENT_STORM][u16]` one left disabled for the rest of the boot, and
+// `[FIRMWARE_EVENT_GLOBAL_LOCK]` the firmware released the global lock the service waits on.
+pub const SYS_FIRMWARE_EVENTS: u64 = 106;
+pub const FIRMWARE_EVENT_GPE: u8 = 1;
+pub const FIRMWARE_EVENT_STORM: u8 = 2;
+pub const FIRMWARE_EVENT_GLOBAL_LOCK: u8 = 3;
+// `SYS_FIRMWARE_GPE(privilege, operation, gpe)`: the service's requests on one general-purpose event.
+// `GPE_COUNT` answers how many events the FADT's blocks number (`gpe` ignored).
+pub const SYS_FIRMWARE_GPE: u64 = 107;
+pub const GPE_ENABLE: u64 = 1;
+pub const GPE_DISABLE: u64 = 2;
+pub const GPE_WAKE_SET: u64 = 3;
+pub const GPE_WAKE_CLEAR: u64 = 4;
+pub const GPE_ACKNOWLEDGE: u64 = 5;
+pub const GPE_REARM: u64 = 6;
+pub const GPE_COUNT: u64 = 7;
+// `SYS_DEVICE_NODE(index, buf, len)`: what the firmware's namespace attached to row `index` - a PCI function's
+// companion node, a namespace child's parent function, and a GPIO or serial-bus controller's `_AEI` lines and
+// field lines and addresses - as a `FirmwareNode`. ERR_INVALID for no such row; a row with nothing attached
+// answers a node with no flags.
+pub const SYS_DEVICE_NODE: u64 = 108;
+
+// What `SYS_FIRMWARE_MAP` reads: the range, the node whose `OperationRegion` it is (its row identity, `acpi:` and
+// the absolute path), and the PCI function that node is the companion of (`FIRMWARE_NO_FUNCTION` for none).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareMapRequest {
+	pub base: u64,
+	pub len: u64,
+	// `segment << 32 | bus << 16 | device << 8 | function`, as `SYS_FIRMWARE_PCI`'s address.
+	pub companion: u64,
+	pub node_len: u32,
+	pub _pad: u32,
+	pub node: [u8; PLATFORM_NAME_LEN],
+}
+pub const FIRMWARE_NO_FUNCTION: u64 = u64::MAX;
+
+impl Default for FirmwareMapRequest {
+	fn default() -> Self {
+		FirmwareMapRequest { base: 0, len: 0, companion: FIRMWARE_NO_FUNCTION, node_len: 0, _pad: 0, node: [0; PLATFORM_NAME_LEN] }
+	}
+}
+
+// The most lines or addresses a `FirmwareNode` carries in each list.
+pub const FIRMWARE_NODE_LISTED: usize = 32;
+pub const FIRMWARE_NODE_COMPANION: u8 = 1 << 0;
+pub const FIRMWARE_NODE_PARENT: u8 = 1 << 1;
+pub const FIRMWARE_NODE_FIRMWARE_HELD: u8 = 1 << 2;
+
+// What `SYS_DEVICE_NODE` answers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareNode {
+	pub flags: u8,
+	pub path_len: u8,
+	pub aei_count: u8,
+	pub field_line_count: u8,
+	pub field_address_count: u8,
+	pub parent_bus: u8,
+	pub parent_dev: u8,
+	pub parent_func: u8,
+	pub parent_segment: u16,
+	pub _pad: [u8; 6],
+	// The companion node's identity (`acpi:` and its path).
+	pub path: [u8; PLATFORM_NAME_LEN],
+	pub aei: [u32; FIRMWARE_NODE_LISTED],
+	pub field_lines: [u32; FIRMWARE_NODE_LISTED],
+	pub field_addresses: [u32; FIRMWARE_NODE_LISTED],
+}
+
+impl Default for FirmwareNode {
+	fn default() -> Self {
+		FirmwareNode { flags: 0, path_len: 0, aei_count: 0, field_line_count: 0, field_address_count: 0, parent_bus: 0, parent_dev: 0, parent_func: 0, parent_segment: 0, _pad: [0; 6], path: [0; PLATFORM_NAME_LEN], aei: [0; FIRMWARE_NODE_LISTED], field_lines: [0; FIRMWARE_NODE_LISTED], field_addresses: [0; FIRMWARE_NODE_LISTED] }
+	}
+}
+
+impl FirmwareNode {
+	pub fn path(&self) -> &[u8] {
+		&self.path[..(self.path_len as usize).min(PLATFORM_NAME_LEN)]
+	}
+	pub fn aei(&self) -> &[u32] {
+		&self.aei[..(self.aei_count as usize).min(FIRMWARE_NODE_LISTED)]
+	}
+	pub fn field_lines(&self) -> &[u32] {
+		&self.field_lines[..(self.field_line_count as usize).min(FIRMWARE_NODE_LISTED)]
+	}
+	pub fn field_addresses(&self) -> &[u32] {
+		&self.field_addresses[..(self.field_address_count as usize).min(FIRMWARE_NODE_LISTED)]
+	}
+}
 
 // The records of a property block, each `[kind u8][depth u8][name_len u16][value_len u32][name][value]`
 // with the value padded to four bytes: a NODE opens a child at `depth` (the device's own node is depth 0

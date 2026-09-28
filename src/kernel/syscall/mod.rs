@@ -533,6 +533,14 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		abi::SYS_PORT_RANGE_MAP => sys_port_range_map(a0),
 		abi::SYS_PORT_RANGE_UNMAP => sys_port_range_unmap(a0),
 		abi::SYS_PORT_RANGE_FIRMWARE => sys_port_range_firmware(a0, a1, a2),
+		abi::SYS_FIRMWARE_TABLE => firmware::sys_firmware_table(a0, a1, a2, a3),
+		abi::SYS_FIRMWARE_MAP => firmware::sys_firmware_map(a0, a1),
+		abi::SYS_FIRMWARE_MEDIATED => firmware::sys_firmware_mediated(a0, a1, a2, a3),
+		abi::SYS_FIRMWARE_PCI => firmware::sys_firmware_pci(a0, a1, a2, a3),
+		abi::SYS_FIRMWARE_REPORT => firmware::sys_firmware_report(a0, a1, a2),
+		abi::SYS_FIRMWARE_EVENTS => firmware::sys_firmware_events(a0, a1),
+		abi::SYS_FIRMWARE_GPE => firmware::sys_firmware_gpe(a0, a1, a2),
+		abi::SYS_DEVICE_NODE => firmware::sys_device_node(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
 		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
@@ -1209,7 +1217,11 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 		device.release_claim();
 		return ERR_NO_MEMORY;
 	}
-	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_CACHE | arch::paging::NO_EXECUTE;
+	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE;
+	// UNCACHED FOR REGISTERS, write-back for the firmware's memory - one type per range, decided when it was minted.
+	if !device.write_back() {
+		flags |= arch::paging::NO_CACHE;
+	}
 	if user {
 		flags |= arch::paging::USER;
 	}
@@ -1386,8 +1398,8 @@ fn claim_errno(error: device::ClaimError) -> i64 {
 		// Somebody has it, or is giving it back. WORTH WAITING ON, which is the whole reason this
 		// is not the ERR_INVALID everything used to collapse into.
 		device::ClaimError::AlreadyClaimed => abi::ERR_ALREADY_CLAIMED,
-		// Not worth waiting on: both of these last the rest of the boot.
-		device::ClaimError::Quarantined | device::ClaimError::Retired => ERR_UNSUPPORTED,
+		// Not worth waiting on: these last the rest of the boot.
+		device::ClaimError::Quarantined | device::ClaimError::Retired | device::ClaimError::FirmwareDriven => ERR_UNSUPPORTED,
 		// The DMA policy would not admit it, or the IOMMU would not confirm the attach. A policy
 		// refusal rather than a malformed request, and the caller cannot fix it by asking again or
 		// by asking for less.
@@ -2098,7 +2110,9 @@ fn sys_dev_console(privilege: u64, request: u64) -> i64 {
 	if let Err(error) = holds_privilege(privilege, PrivilegeKind::ConsoleInputSource) {
 		return error;
 	}
-	match request {
+	// A driver kill names its function in the request's upper bits: the vendor at 16, the device at 32.
+	let (vendor, product) = ((request >> 16) as u16, (request >> 32) as u16);
+	match request & 0xFFFF {
 		abi::DEV_CONSOLE_HOLD_AND_FLOOD => {
 			// A console with no transmit ring - the ports' synchronous UARTs - has nothing to fill.
 			if arch::serial::console_dropped().is_none() {
@@ -2114,6 +2128,10 @@ fn sys_dev_console(privilege: u64, request: u64) -> i64 {
 		}
 		abi::DEV_CONSOLE_PANIC => panic!("a panic asked for over the development channel"),
 		abi::DEV_CONSOLE_KILL_HOLDER => match device::console_holder() {
+			Some(process) => deliver_signal(&process, SIG_KILL),
+			None => ERR_INVALID,
+		},
+		abi::DEV_CONSOLE_KILL_DRIVER => match device::bar_holder(vendor, product) {
 			Some(process) => deliver_signal(&process, SIG_KILL),
 			None => ERR_INVALID,
 		},
@@ -4508,3 +4526,6 @@ fn sys_timer_poll(handle: u64) -> i64 {
 	};
 	i64::from(timer.is_expired())
 }
+
+// THE ACPI SERVICE'S CALLS, after the macros they use.
+mod firmware;

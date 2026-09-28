@@ -809,3 +809,27 @@ fn two_platform_rules_overlap_when_they_name_the_same_id() {
 	assert!(!rule(PLATFORM_ID_TABLE, "TPM2").overlaps(pci), "a platform rule and a PCI rule differ on the transport");
 	assert_eq!(serde_json::to_string(&rule(PLATFORM_ID_TABLE, "TPM2").platform).unwrap(), "{\"table\":\"TPM2\"}");
 }
+
+#[test]
+// A NOTICE IS DECLARED ONCE, AND IT REACHES THE SUPERVISOR AS BITS: the orderly shutdown's `prepare` goes to exactly
+// the rows that declare it, so the generated table is what decides who is told.
+fn a_service_notice_is_declared_once_and_generated_as_its_bits() {
+	let root = fixture_workspace();
+	let declared = valid_fixture().replace("dependencies = []\n", "dependencies = []\nnotices = [\"shutdown\", \"sleep\"]\n");
+	let manifest = Manifest::parse(&declared, &root).expect("a row declaring both notices is valid");
+	assert_eq!(manifest.services.values().next().map(|service| service.notices.clone()), Some(vec![Notice::Shutdown, Notice::Sleep]));
+	assert!(service_manifest_source(&manifest).contains("restart: Restart::Escalate, notices: 3, deps: &[]"), "{}", service_manifest_source(&manifest));
+	let twice = valid_fixture().replace("dependencies = []\n", "dependencies = []\nnotices = [\"shutdown\", \"shutdown\"]\n");
+	let error = Manifest::parse(&twice, &root).unwrap_err().to_string();
+	assert!(error.contains("services.tool_service.notices") && error.contains("named twice"), "{error}");
+	let unknown = valid_fixture().replace("dependencies = []\n", "dependencies = []\nnotices = [\"hibernate\"]\n");
+	assert!(Manifest::parse(&unknown, &root).is_err(), "a notice nobody sends is refused");
+	let plain = Manifest::parse(valid_fixture(), &root).expect("the fixture");
+	assert!(service_manifest_source(&plain).contains("notices: 0,"), "a row declaring none is told nothing");
+	// THE WATCHDOG SERVICE IS TOLD BOTH, in the production manifest.
+	let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+	let production = Manifest::load_workspace(&workspace).expect("the production manifest must validate");
+	let row = service_manifest_source(&production).lines().find(|line| line.contains("name: b\"watchdog_service\"")).map(String::from).unwrap_or_default();
+	assert!(row.contains("notices: 3,"), "{row}");
+	let _ = fs::remove_dir_all(root);
+}

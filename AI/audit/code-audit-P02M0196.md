@@ -163,3 +163,31 @@ x86_64 and the host, all PASSED unless stated; aarch64 and riscv64 NOT RUN (the 
   joined before it.
 - The host test of the TPM node cut to its page lives with P02M0196d's hostile trees; the cut itself is in
   `from_tree` and runs on the ports.
+
+P02M0196b AND P02M0196d - STARTED 2026-09-28T21:24:58Z, after P02M0200 in the owner's agreed order.
+
+OWNER QUESTIONS THE PLAN ASKS "WHEN P02M0196b STARTS", NOT ANSWERED YET: whether `acpica-tools` may be installed
+(ACPICA's AML test suite is ASL source) - built WITHOUT it, as the plan's fallback states: the interpreter's
+conformance suite is the specification's constructs encoded by the tests' own encoder and the harness's emitter,
+plus in-tree fixtures; and the laptop for the embedded controller's recorded run - the EC transport is a host-tested
+library against a register model until then.
+
+FIRST PIECE: `src/aml`, the interpreter (host-testable, no_std + alloc): the namespace (`namespace.rs`), names and
+the search rule (`name.rs`), the object model with shared mutable objects and references (`object.rs`), the
+implicit and explicit conversions (`convert.rs`), the evaluator (`interp.rs`: table load and method execution fused,
+declarations, control flow, every expression opcode of the specification's table but `Unload`, which is refused;
+`_OSI`/`\_OS`/`\_REV` as decided; the bounds - opcodes, time, calls, nesting, memory, loop iterations, package
+depth, tables, nodes), fields (`field.rs`: region, index and bank fields, buffer fields, the access widths and
+update rules, PCI_Config through `_SEG`/`_BBN`/`_ADR` and the bridges between, GeneralPurposeIo input reads only,
+GenericSerialBus in its protocols), the host interface (`host.rs`), resource descriptors (`resource.rs`), `_DSD`
+(`dsd.rs`) and the device helpers (`devices.rs`: the `_STA`/`_INI` walk in the specification's order, identity,
+`_CRS`, `_DSD`, `_OSC`, `_DSM`, `run_reg`). `cargo test --manifest-path src/aml/Cargo.toml`: 37 passed - the
+conformance suite (arithmetic, control flow, conversions, stores and CopyObject, references, method calls and
+temporaries, the search rule, aliases and External, `_OSI`, memory/index/bank/buffer fields with update rules,
+PCI_Config, Notify, mutexes, events, the global lock, Load/LoadTable, the walk, identity, resources, `_DSD` with a
+hierarchical child, `_OSC` and `_DSM` by UUID, GenericSerialBus and GPIO fields, ConcatenateResTemplate and BCD,
+`_REG`) and the hostile suite (an endless loop, a sleeping loop, deep recursion, a package past the depth bound,
+allocations past the memory bound, the step bound, a region outside the policy, a field past its region, a bad
+table given to Load, Unload, unknown opcodes and malformed lengths, Fatal, a name declared twice, a Wait nothing can
+end). Found by the suite and fixed: the address-space descriptors' length offsets and their consumer bit (set is a
+consumer).

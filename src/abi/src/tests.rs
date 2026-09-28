@@ -189,6 +189,15 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_DEV_CONSOLE, 98),
 	(SYS_DEVICE_REGISTER_READ, 99),
 	(SYS_DEVICE_REGISTER_WRITE, 100),
+	// THE ACPI SERVICE'S CALLS, and DeviceManager's read of what the namespace attached to a row.
+	(SYS_FIRMWARE_TABLE, 101),
+	(SYS_FIRMWARE_MAP, 102),
+	(SYS_FIRMWARE_MEDIATED, 103),
+	(SYS_FIRMWARE_PCI, 104),
+	(SYS_FIRMWARE_REPORT, 105),
+	(SYS_FIRMWARE_EVENTS, 106),
+	(SYS_FIRMWARE_GPE, 107),
+	(SYS_DEVICE_NODE, 108),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -374,6 +383,8 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(MEMMAP_BOOTLOADER, 5),
 		(MEMMAP_KERNEL, 6),
 		(MEMMAP_FRAMEBUFFER, 7),
+		(MEMMAP_BOOTLOADER_RECLAIMABLE, 8),
+		(MEMMAP_MMIO, 9),
 	];
 	const IRQ_KINDS: &[(u32, u32, &str)] = named![(IRQ_KIND_FIXED, 0), (IRQ_KIND_MSI, 1)];
 
@@ -702,6 +713,35 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		// A PLATFORM ROW'S DESCRIPTION, appended whole after the port list: the struct from 120 bytes to
 		// 776, and nothing before it moved.
 		platform => 120,
+	);
+
+	// THE ACPI SERVICE'S MAP REQUEST and the node a row's firmware data answers as.
+	assert_layout!(
+		covered, FirmwareMapRequest, 96, 8,
+		base => 0,
+		len => 8,
+		companion => 16,
+		node_len => 24,
+		_pad => 28,
+		node => 32,
+	);
+
+	assert_layout!(
+		covered, FirmwareNode, 464, 4,
+		flags => 0,
+		path_len => 1,
+		aei_count => 2,
+		field_line_count => 3,
+		field_address_count => 4,
+		parent_bus => 5,
+		parent_dev => 6,
+		parent_func => 7,
+		parent_segment => 8,
+		_pad => 10,
+		path => 16,
+		aei => 80,
+		field_lines => 208,
+		field_addresses => 336,
 	);
 
 	assert_layout!(

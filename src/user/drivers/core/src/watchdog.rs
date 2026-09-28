@@ -86,9 +86,9 @@ use rt::*;
 // until its consumer's first pet (an arm is one) or disarm - for at most this long, 120 s, the boot bound, which a
 // boot must beat from the driver's bind to its consumer's first pet. After it the driver stops feeding, so a boot
 // that never brings the watchdog service up still resets the machine.
-pub const BRIDGE_TICKS: u64 = 120 * abi::TICKS_PER_SECOND;
+pub const BRIDGE_TICKS: u64 = 120 * rt::TICKS_PER_SECOND;
 // How often the bridge pets: once a second, far inside any timeout a device takes.
-pub const BRIDGE_PET_TICKS: u64 = abi::TICKS_PER_SECOND;
+pub const BRIDGE_PET_TICKS: u64 = rt::TICKS_PER_SECOND;
 
 // ONE WATCHDOG, as its driver drives it.
 pub trait Timer {
@@ -111,9 +111,11 @@ impl<T: Timer> watchdog::Service for Provider<'_, T> {
 		Ok(self.timer.describe())
 	}
 
+	// AN ARM OR A DISARM THAT DID NOT HAPPEN ENDS NOTHING: the timer is as it was, and a bridged one stays bridged.
 	fn arm(&mut self, timeout_ms: u32) -> Result<u32, Error> {
-		self.consumer_acted = true;
-		self.timer.arm(timeout_ms)
+		let armed = self.timer.arm(timeout_ms);
+		self.consumer_acted |= armed.is_ok();
+		armed
 	}
 
 	fn pet(&mut self) -> Result<(), Error> {
@@ -122,8 +124,9 @@ impl<T: Timer> watchdog::Service for Provider<'_, T> {
 	}
 
 	fn disarm(&mut self) -> Result<(), Error> {
-		self.consumer_acted = true;
-		self.timer.disarm()
+		let disarmed = self.timer.disarm();
+		self.consumer_acted |= disarmed.is_ok();
+		disarmed
 	}
 }
 

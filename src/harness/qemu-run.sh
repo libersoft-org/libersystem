@@ -161,6 +161,24 @@ qemu_parse_displays() {
 	fi
 }
 
+# THE WATCHDOG'S ACTION ON EVERY BOOT WITH A QMP SOCKET: `pause`, so an expiry stops the guest in the run state
+# `watchdog` - which `query-status` names at any time after, with no listener standing - rather than resetting it
+# silently. `WATCHDOG_ACTION=reset` is the watchdog gate's reset case. TEST-MODE BOOTS KEEP QEMU'S DEFAULT `reset`:
+# they have no QMP socket, and under `-no-reboot` a reset is QEMU's exit, which the kernel test runner reports at
+# once as a `GUEST RESET`.
+qemu_append_watchdog_action() {
+	local -n args_ref="$1"
+	local action="${WATCHDOG_ACTION:-pause}"
+	case "$action" in
+	pause | reset | poweroff | shutdown | none | inject-nmi) ;;
+	*)
+		echo "qemu-run: WATCHDOG_ACTION must be one of pause, reset, poweroff, shutdown, none or inject-nmi, not '$action'" >&2
+		exit 2
+		;;
+	esac
+	args_ref+=(-action "watchdog=$action")
+}
+
 # The nameref is deliberately not called `arr`: this is called from helpers whose own array
 # nameref is, and bash refuses a nameref that points at itself - it warns and appends nothing,
 # which left the sound card on the command line with the audio backend it names missing, and
@@ -899,6 +917,9 @@ qemu_attach_suite_devices() {
 	# attaches the same function for the same suite, and for why its DMA reaches all of memory. Nothing binds
 	# it, and last it moves nothing.
 	slot_into+=(-device edu,dma_mask=0xffffffffffffffff)
+	# AND AN `i6300esb` WATCHDOG, for the declared-register suite, as on x86_64: nothing arms it in a test boot, and
+	# last, it moves nothing.
+	slot_into+=(-device i6300esb)
 }
 
 # THE I2C AND GPIO CONTROLLERS, when a run asks for them with `I2C_FIXTURE`: QEMU's `vhost-user-i2c-pci` and
@@ -2274,8 +2295,13 @@ qemu_run_x86_64() {
 		# wherever the allocator put it, and `edu` masks a DMA address to 28 bits unless told otherwise - so a
 		# sentinel above 256 MiB was left untouched while the copy landed on whatever lay at the address's low
 		# bits.
+		#
+		# AND AN `i6300esb` WATCHDOG AFTER IT, for the declared-register suite: its arming registers answer only at
+		# their exact widths, which is what that suite reaches. Nothing arms it - a test boot's watchdog policy is off
+		# - and last, it renumbers nothing.
 		if [[ "$dma_fixture" != "1" ]]; then
 			qemu_args+=(-device edu,dma_mask=0xffffffffffffffff)
+			qemu_args+=(-device i6300esb)
 		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
@@ -2355,6 +2381,7 @@ qemu_run_x86_64() {
 	rm -f "$monitor_socket" "$qmp_socket"
 	qemu_args+=(-monitor "unix:$monitor_socket,server,nowait")
 	qemu_args+=(-qmp "unix:$qmp_socket,server,nowait")
+	qemu_append_watchdog_action qemu_args
 
 	harness_hold
 	exec "$qemu_bin" "${qemu_args[@]}" ${QEMU_EXTRA:-}
@@ -2566,6 +2593,7 @@ qemu_run_aarch64() {
 				rm -f "$dev_monitor" "$dev_qmp"
 				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
 				qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
+				qemu_append_watchdog_action qemu_args
 			fi
 		fi
 	fi
@@ -2926,6 +2954,7 @@ qemu_run_riscv64() {
 				rm -f "$dev_monitor" "$dev_qmp"
 				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
 				qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
+				qemu_append_watchdog_action qemu_args
 			fi
 		fi
 	fi

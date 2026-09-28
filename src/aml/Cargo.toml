@@ -1,0 +1,18 @@
+[package]
+name = "aml"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "A bounded ACPI Machine Language interpreter: the namespace, method evaluation, operation regions through a host, and the resource and device-property decoders"
+
+[lib]
+path = "src/lib.rs"
+
+# THE TEST TOOLING - the AML encoder and the host made of maps - for the crates that decide on what this one evaluates.
+# Never enabled by a service.
+[features]
+testing = []
+
+# A WARNING IS AN ERROR HERE, as in every crate of this tree: `[lints]` denies in this package only.
+[lints.rust]
+warnings = "deny"

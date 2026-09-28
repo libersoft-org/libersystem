@@ -287,7 +287,18 @@ STEP_FIELDS = {
 	# comment is not an assertion, and the behaviour it describes is the manifest being the
 	# authority for what may run - which is worth an executable check rather than a sentence.
 	'refused': {'required': ('program',), 'optional': ('args', 'cwd', 'status', 'timeout')},
+	# THE RUN STATE QEMU HOLDS, from `query-status`: with `hold`, the state is sampled every second for that many
+	# seconds and must be `state` at each; without it, the step waits up to its timeout for `state`. The watchdog
+	# gate's oracle - under `-action watchdog=pause` an expiry leaves the guest in `watchdog`, so `running` held
+	# over a stretch proves no expiry happened in it.
+	'run-state': {'required': ('state',), 'optional': ('hold', 'timeout')},
+	# A development kernel's driver kill: the driver that has the claimed PCI function `function` (VENDOR:DEVICE
+	# in hex) mapped is SIG_KILLed as DeviceManager would.
+	'kill-driver': {'required': ('function',), 'optional': ('timeout',)},
 }
+
+# The run states a `run-state` step may name: QEMU's own.
+RUN_STATES = ('running', 'watchdog', 'paused', 'shutdown', 'guest-panicked', 'internal-error', 'prelaunch', 'suspended')
 
 
 def load(path):
@@ -430,6 +441,13 @@ def validate_step(step, index, path):
 		raise ScenarioError(f'{where} ({kind}): args is {len(step["args"].encode())} B, at most {MAX_ARGS_BYTES}')
 	if kind == 'launch' and not PROGRAM_NAME.fullmatch(step['program']):
 		raise ScenarioError(f'{where} (launch): program {step["program"]!r} is not a plain component name')
+	if kind == 'run-state':
+		if step['state'] not in RUN_STATES:
+			raise ScenarioError(f'{where} (run-state): {step["state"]!r} is not a run state, expected one of {sorted(RUN_STATES)}')
+		if 'hold' in step and (not isinstance(step['hold'], int) or isinstance(step['hold'], bool) or not 1 <= step['hold'] <= MAX_STEP_SECONDS):
+			raise ScenarioError(f'{where} (run-state): hold must be 1..{MAX_STEP_SECONDS} seconds')
+	if kind == 'kill-driver' and not (isinstance(step['function'], str) and re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{4}', step['function'])):
+		raise ScenarioError(f'{where} (kill-driver): function must be VENDOR:DEVICE in hex, as 8086:25ab')
 
 
 # The guest, as the runner sees it: terminal input and artifact publication over the control
@@ -761,6 +779,31 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'restart':
 		if not lab.restart(int(limit)):
 			raise ScenarioError(f'{where}: the development agent did not restart')
+	elif kind == 'run-state':
+		wanted = step['state']
+		if 'hold' in step:
+			end = time.monotonic() + step['hold']
+			while True:
+				state = lab.run_state()
+				if state != wanted:
+					raise ScenarioError(f'{where}: the guest was {state or "unanswered"}, not {wanted}, {int(end - time.monotonic())} s before the hold ended')
+				if time.monotonic() >= end:
+					return
+				time.sleep(1)
+		# NOT SCALED FOR A SLOW GUEST: the bound is the device's - a watchdog counts QEMU's clock, which runs at the
+		# host's pace however slowly the emulated cores do - so the step's own timeout is the window, as written.
+		bound = min(step.get('timeout', 30), limit)
+		end = time.monotonic() + bound
+		while True:
+			state = lab.run_state()
+			if state == wanted:
+				return
+			if time.monotonic() >= end:
+				raise ScenarioError(f'{where}: the guest was {state or "unanswered"}, not {wanted}, after {int(bound)} s')
+			time.sleep(0.5)
+	elif kind == 'kill-driver':
+		if not lab.kill_driver(step['function'], int(limit)):
+			raise ScenarioError(f'{where}: the development kernel killed no driver of {step["function"]}')
 	elif kind == 'prompt':
 		if not lab.wait_prompt(int(limit)):
 			raise ScenarioError(f'{where}: no shell prompt within {int(limit)} s')

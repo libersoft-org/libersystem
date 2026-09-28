@@ -228,6 +228,12 @@ pub struct PortRange {
 impl PortRange {
 	// MINT: grant `len` ports from `base` and wrap the grant in an object, or refuse - against the reserved
 	// set, every live grant and every retired span, in one step.
+	// The ports it grants, for the suites outside this module.
+	#[cfg(test)]
+	pub fn span(&self) -> (u16, u16) {
+		(self.base, self.len)
+	}
+
 	pub fn mint(base: u16, len: u16, claim: Option<abi::ClaimKey>) -> Result<Arc<Self>, grants::Refusal> {
 		// THE OBJECT FIRST, so the grant is taken with nothing left to allocate - and its id is the grant's
 		// owner.

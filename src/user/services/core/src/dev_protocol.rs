@@ -1024,9 +1024,15 @@ fn memory_stats(request: u32, sink: &mut impl Sink) -> bool {
 // A KERNEL CONSOLE REQUEST, under the console input privilege the kernel gates it on. A kernel built for any
 // other image does not know the call, and the refusal says so.
 fn kernel_console(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
-	let [which] = payload else { return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]) };
+	// ONE BYTE naming the request, or five: the request, then the PCI vendor and device a driver kill names - which
+	// the kernel reads from the request word's upper bits.
+	let which: u64 = match payload {
+		[which] => *which as u64,
+		[which, vendor_low, vendor_high, device_low, device_high] => *which as u64 | (u16::from_le_bytes([*vendor_low, *vendor_high]) as u64) << 16 | (u16::from_le_bytes([*device_low, *device_high]) as u64) << 32,
+		_ => return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]),
+	};
 	let privilege = CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed);
-	let answer: i64 = rt::dev_console(privilege, *which as u64);
+	let answer: i64 = rt::dev_console(privilege, which);
 	if answer < 0 {
 		return sink.send(OP_ERROR, request, 0, ST_TERM_REFUSED, &answer.to_le_bytes());
 	}

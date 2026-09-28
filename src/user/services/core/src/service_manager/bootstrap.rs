@@ -641,6 +641,10 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
 			let pointer_forward: u64 = *pointer_console;
 			let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
+				// THE ROLES ONLY THIS SUPERVISOR CAN FILL, answered by the one function the relaunch calls too.
+				if let Some(filled) = super::supervisor_role(name, role) {
+					return Some(filled);
+				}
 				// The shell's session is minted ONCE and reused for the life of the system, so its
 				// working directory survives a logout and a reload; a fresh connection per shell
 				// would lose it silently. The plan says the role is a factory of SessionService,

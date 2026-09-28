@@ -556,7 +556,7 @@ pub fn scan<A: ConfigAccess>() -> Vec<PciDevice> {
 fn note_error_reporters<A: ConfigAccess>(devices: &[PciDevice]) {
 	let first: bool = !REPORTERS_SAID.swap(true, core::sync::atomic::Ordering::AcqRel);
 	let mut found = 0;
-	for function in devices {
+	for function in devices.iter().filter(|function| controls(function.bus, OSC_AER)) {
 		if note_error_reporter::<A>(function.bus, function.dev, function.func) {
 			found += 1;
 			if first {
@@ -571,6 +571,66 @@ fn note_error_reporters<A: ConfigAccess>(devices: &[PciDevice]) {
 
 // Whether the error reporters have been said. The bus is scanned several times in a boot.
 static REPORTERS_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// ON AN ACPI MACHINE, NATIVE CONTROL IS WHAT `_OSC` GRANTED. The firmware owns a host bridge's hot-plug slots and its
+// error reporting until its `_OSC` hands them over - a slot armed natively while the firmware also drives it through a
+// GPE is two owners of one register - so on such a machine the scan arms a slot and watches an error reporter only on
+// a bus a grant covers, and a bridge without `_OSC` grants nothing. A device-tree machine, and the test kernel, keep
+// native control as always.
+static OSC_GATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// The grants: (first bus, last bus, the control bits granted). One per host bridge.
+const MAX_OSC_GRANTS: usize = 8;
+static OSC_GRANTS: SpinLock<([(u8, u8, u32); MAX_OSC_GRANTS], usize)> = SpinLock::new(([(0, 0, 0); MAX_OSC_GRANTS], 0));
+
+// `_OSC`'s control bits this file acts on.
+pub const OSC_HOT_PLUG: u32 = 1 << 0;
+pub const OSC_AER: u32 = 1 << 3;
+
+// Wait for the firmware's grant before arming anything native. Called before the first scan on an ACPI machine.
+pub fn gate_on_osc() {
+	OSC_GATED.store(true, core::sync::atomic::Ordering::Release);
+	crate::serial_println!("pci: native hot-plug and error reporting wait for the firmware's _OSC grant");
+}
+
+// RECORD ONE HOST BRIDGE'S GRANT, answering whether it changed what this kernel controls - the caller scans again
+// and arms what it now may. The slot and reporter lines are said again for what the grant brought.
+pub fn apply_grant(bus_start: u8, bus_end: u8, granted: u32) -> bool {
+	let mut grants = OSC_GRANTS.lock();
+	let count = grants.1;
+	if grants.0[..count].contains(&(bus_start, bus_end, granted)) {
+		return false;
+	}
+	if let Some(slot) = grants.0[..count].iter_mut().find(|grant| grant.0 == bus_start && grant.1 == bus_end) {
+		*slot = (bus_start, bus_end, granted);
+	} else if count < MAX_OSC_GRANTS {
+		grants.0[count] = (bus_start, bus_end, granted);
+		grants.1 += 1;
+	} else {
+		crate::serial_println!("pci: more than {MAX_OSC_GRANTS} host bridges answered _OSC - buses {bus_start:#04x}..{bus_end:#04x} keep firmware control");
+		return false;
+	}
+	drop(grants);
+	for (bit, what) in [(OSC_HOT_PLUG, "hot-plug"), (OSC_AER, "error reporting")] {
+		if granted & bit == 0 {
+			crate::serial_println!("pci: the firmware keeps {what} control of buses {bus_start:#04x}..{bus_end:#04x} (_OSC) - left unarmed");
+		} else {
+			crate::serial_println!("pci: _OSC grants native {what} on buses {bus_start:#04x}..{bus_end:#04x}");
+		}
+	}
+	SLOTS_REPORTED.store(false, core::sync::atomic::Ordering::Release);
+	REPORTERS_SAID.store(false, core::sync::atomic::Ordering::Release);
+	true
+}
+
+// Whether this kernel controls `bit` for a function on `bus`.
+fn controls(bus: u8, bit: u32) -> bool {
+	if !OSC_GATED.load(core::sync::atomic::Ordering::Acquire) {
+		return true;
+	}
+	let grants = OSC_GRANTS.lock();
+	grants.0[..grants.1].iter().any(|&(start, end, granted)| (start..=end).contains(&bus) && granted & bit != 0)
+}
 
 // Whether the slots have been reported. The bus is scanned SEVERAL TIMES in a boot - the device
 // table, the virtio pass, and whatever asks later - and a machine does not have three hot-plug slots
@@ -761,7 +821,7 @@ fn arm_hot_plug_slots<A: ConfigAccess>(devices: &[PciDevice]) {
 	let first: bool = !SLOTS_REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel);
 	let mut ports = PORTS.lock();
 	ports.1 = 0;
-	for function in devices {
+	for function in devices.iter().filter(|function| controls(function.bus, OSC_HOT_PLUG)) {
 		let Some(slot) = resolve_slot::<A>(function) else { continue };
 		slot_arm::<A>(function, slot);
 		slot_acknowledge::<A>(function, slot);
@@ -844,6 +904,70 @@ pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 // Decode a memory BAR's assigned physical base (read live from config space, so it
 // is correct after `assign_bars` reprograms it), handling 64-bit BARs (which occupy
 // two adjacent slots). Returns None for an I/O BAR or an out-of-range index.
+// ONE MEMORY RANGE THE BUS DECODES: a function's BAR, or a bridge's memory or prefetchable window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedRange {
+	pub base: u64,
+	pub len: u64,
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	/// A bridge's window rather than a function's own BAR.
+	pub window: bool,
+}
+
+// EVERY MEMORY RANGE THE BUS DECODES - each function's BARs, sized, and each bridge's memory and prefetchable windows -
+// what no firmware region and no platform row may take. Read once, at the boot scan: sizing a BAR writes to it, which
+// is safe only before a driver holds the function.
+pub fn decoded_ranges<A: ConfigAccess>(devices: &[PciDevice]) -> Vec<DecodedRange> {
+	let mut out = Vec::new();
+	for d in devices {
+		let bridge = d.header_type & 0x7F == 1;
+		let bars = if bridge { 2 } else { 6 };
+		// MEMORY DECODE OFF WHILE THE BARS ARE SIZED: an all-ones BAR with decode on answers at an address nobody placed
+		// it, and the boot framebuffer lives in one. Restored as it was.
+		let command = A::read32(d.bus, d.dev, d.func, 0x04);
+		if command & 0x2 != 0 {
+			A::write32(d.bus, d.dev, d.func, 0x04, command & 0xFFFF & !0x2);
+		}
+		let mut index = 0usize;
+		while index < bars {
+			let raw = A::read32(d.bus, d.dev, d.func, 0x10 + (index as u16) * 4);
+			let wide = raw & 1 == 0 && (raw >> 1) & 3 == 2;
+			if let (Some(base), Some(len)) = (bar_address::<A>(d, index), bar_size::<A>(d, index)) {
+				// ALLOC-OK: boot, bounded by the functions on the bus.
+				out.push(DecodedRange { base, len, bus: d.bus, dev: d.dev, func: d.func, window: false });
+			}
+			index += if wide { 2 } else { 1 };
+		}
+		if command & 0x2 != 0 {
+			A::write32(d.bus, d.dev, d.func, 0x04, command & 0xFFFF);
+		}
+		if !bridge {
+			continue;
+		}
+		// THE MEMORY WINDOW: base and limit in 1 MiB units, bits 31:20 of each 16-bit half.
+		let memory = A::read32(d.bus, d.dev, d.func, 0x20);
+		let (base, limit) = (((memory & 0xFFF0) as u64) << 16, (((memory >> 16) & 0xFFF0) as u64) << 16 | 0xF_FFFF);
+		if limit > base {
+			// ALLOC-OK: as above.
+			out.push(DecodedRange { base, len: limit - base + 1, bus: d.bus, dev: d.dev, func: d.func, window: true });
+		}
+		// THE PREFETCHABLE WINDOW, 64-bit where bit 0 of the base says so.
+		let prefetch = A::read32(d.bus, d.dev, d.func, 0x24);
+		let wide = prefetch & 0xF == 1;
+		let upper_base = if wide { A::read32(d.bus, d.dev, d.func, 0x28) as u64 } else { 0 };
+		let upper_limit = if wide { A::read32(d.bus, d.dev, d.func, 0x2C) as u64 } else { 0 };
+		let base = upper_base << 32 | ((prefetch & 0xFFF0) as u64) << 16;
+		let limit = upper_limit << 32 | (((prefetch >> 16) & 0xFFF0) as u64) << 16 | 0xF_FFFF;
+		if limit > base {
+			// ALLOC-OK: as above.
+			out.push(DecodedRange { base, len: limit - base + 1, bus: d.bus, dev: d.dev, func: d.func, window: true });
+		}
+	}
+	out
+}
+
 pub fn bar_address<A: ConfigAccess>(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 	if bar_idx >= 6 {
 		return None;

@@ -62,10 +62,11 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	// 1 through 12 are allocated - `DISCONNECT` took 12 (2026-08-31) - so 13 is the next one that is
-	// not. The list is written out rather than derived, which is what makes adding an opcode a
-	// decision somebody makes here rather than a number that quietly starts being accepted.
-	for raw in [0u16, 13, 14, 0xffff] {
+	// 1 through 15 are allocated - `DISCONNECT` took 12 (2026-08-31), the firmware node's request and its two
+	// answers 13 to 15 - so 16 is the next one that is not. The list is written out rather than derived, which is
+	// what makes adding an opcode a decision somebody makes here rather than a number that quietly starts being
+	// accepted.
+	for raw in [0u16, 16, 17, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}
@@ -474,4 +475,20 @@ fn a_scoped_connect_carries_its_scope_after_the_token_and_an_unscoped_one_is_unc
 	assert_eq!(decode_connect_scoped(&[4, 0, 3, 1]), Err(FrameError::PayloadShape));
 	assert_eq!(decode_connect_scoped(&[3, 0, 1, 0x50, 0]), Err(FrameError::PayloadShape));
 	assert_eq!(decode_connect_scoped(&[3]), Err(FrameError::PayloadShape));
+}
+
+// A DRIVER ASKS FOR ITS FIRMWARE NODE AND THE MANAGER ANSWERS: the request carries nothing, the answer one channel or
+// nothing at all - each counted exactly, and none of the three ends the handshake or the binding.
+#[test]
+fn the_node_request_and_its_two_answers() {
+	assert_eq!(Opcode::from_u16(13), Some(Opcode::NodeRequest));
+	assert_eq!(Opcode::from_u16(14), Some(Opcode::Node));
+	assert_eq!(Opcode::from_u16(15), Some(Opcode::NodeAbsent));
+	assert_eq!(Opcode::from_u16(16), None);
+	assert_eq!((Opcode::NodeRequest.handle_count(), Opcode::Node.handle_count(), Opcode::NodeAbsent.handle_count()), (0, 1, 0));
+	for opcode in [Opcode::NodeRequest, Opcode::Node, Opcode::NodeAbsent] {
+		assert!(!opcode.is_terminal() && !opcode.ends_the_binding());
+		let bytes = header(opcode, 7, 0).encode();
+		assert_eq!(Header::decode(&bytes).map(|header| header.opcode), Ok(opcode), "a {opcode:?} frame round-trips");
+	}
 }

@@ -1,4 +1,5 @@
 use super::*;
+use wire::Sink;
 
 // Whether component `i` depends on any component currently in the teardown scope.
 pub(super) fn depends_on_scoped(i: usize, scope: &[bool; N]) -> bool {
@@ -21,24 +22,34 @@ fn index_of_dep(j: usize, i: usize) -> bool {
 	false
 }
 
+// WHAT DIES WITH THE MACHINE rather than before it: the shell - the issuing terminal, which holds no supervised
+// Process here - and the ConsoleService that hosts it. Killing the console host ends the shell's attachment to the
+// kernel console, and the kernel's console loop takes a shell that attached and went away for the operator typing
+// `exit`: it halts. So a teardown that killed ConsoleService stopped the machine THERE - the rest of the services
+// never stopped and the power request was never made; the orderly `reboot` left a halted guest.
+fn dies_with_the_machine(node: usize) -> bool {
+	Some(node) == index_of(b"shell") || Some(node) == index_of(b"console_service")
+}
+
 // The reverse-dependency teardown order for a graceful shutdown: every currently
-// Running service (the shell exempted - it is the issuing terminal and holds no
-// supervised Process here), ordered so a dependent always precedes every dependency it
-// declares. Computed by repeatedly taking the current leaves of the scoped subgraph.
+// Running service but the two that die with the machine, ordered so a dependent always
+// precedes every dependency it declares. Computed by repeatedly taking the current
+// leaves of the scoped subgraph.
 pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
-	let shell = index_of(b"shell");
-	services::service_lifecycle::reverse_dependency_order(N, |node| state[node] == State::Ready && Some(node) != shell, index_of_dep).unwrap_or_default()
+	services::service_lifecycle::reverse_dependency_order(N, |node| state[node] == State::Ready && !dies_with_the_machine(node), index_of_dep).unwrap_or_default()
 }
 
 // Tear the whole service tree down for a graceful power-off. LogService flushes first;
-// every other service then stops in reverse-dependency order. The issuing shell is
-// excluded from the order and dies with the machine.
-pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) {
+// every service whose row declares the shutdown notice is told next, under one bound; every
+// other service then stops in reverse-dependency order. The issuing shell and the console
+// that hosts it are excluded from the order and die with the machine.
+pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, action: proto::system::ShutdownAction, notice_ticks: u64, buf: &mut [u8]) {
 	if let Some(log) = index_of(b"log_service") {
 		if state[log] == State::Ready && channels[log] != 0 {
 			send_blocking(channels[log], b"FLUSH", 0);
 		}
 	}
+	notify_shutdown(state, channels, action, notice_ticks, buf);
 	let order: Vec<usize> = shutdown_order(state);
 	for &idx in &order {
 		if state[idx] != State::Ready {
@@ -47,7 +58,9 @@ pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup:
 		if procs[idx] != 0 {
 			signal(procs[idx], SIG_KILL);
 		}
-		drain_closed(channels[idx], buf);
+		if !drain_closed_within(channels[idx], KILL_DRAIN_TICKS, buf) {
+			console_report(MANIFEST[idx].name, b"did not end within its bound after SIG_KILL - it is left behind");
+		}
 		if channels[idx] != 0 {
 			close(channels[idx]);
 			channels[idx] = 0;
@@ -62,8 +75,7 @@ pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup:
 // Verify the selftest shutdown ordering: every Running non-shell service is present,
 // and each dependent appears before every dependency that is also in the order.
 pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool {
-	let shell: Option<usize> = index_of(b"shell");
-	services::service_lifecycle::verify_reverse_dependency_order(order, N, |node| state[node] == State::Ready && Some(node) != shell, index_of_dep)
+	services::service_lifecycle::verify_reverse_dependency_order(order, N, |node| state[node] == State::Ready && !dies_with_the_machine(node), index_of_dep)
 }
 
 // Answer one request on a supervisor stats channel. Returns false once the peer is
@@ -163,5 +175,58 @@ impl supervisor::Service for StatsApi<'_> {
 			out.push(SupervisorStat { name: String::from_utf8_lossy(name).into_owned(), state: String::from(if online { "running" } else { "pending" }), desired: String::new(), epoch: 0, last_reason: String::new(), restarts: 0, watchdog_trips: 0, last_failure: String::new() });
 		}
 		Ok(out)
+	}
+}
+
+// THE ORDERLY SHUTDOWN NOTICE: `prepare(action)` of `shutdown-notice`, sent at once to every running service whose row
+// declares the notice - on the control channel held for it, the one LogService's `FLUSH` travels on - and the answers
+// waited for under ONE bound, `notice_ticks`. A service that has not answered by then is killed with the rest; a
+// message on a control channel that is not the answer is not served while the sequence runs.
+//
+// Only this orderly sequence tells anybody: the immediate power paths - the Power key, Ctrl+Alt+Delete, the power
+// button DeviceManager handles - reach SystemManager's `system-power` directly and stay notice-free by design.
+pub(super) fn notify_shutdown(state: &[State; N], channels: &[u64; N], action: proto::system::ShutdownAction, notice_ticks: u64, buf: &mut [u8]) {
+	// One correlation for the whole sequence: each service is asked exactly once.
+	const CORRELATION: u32 = 1;
+	let mut writer = wire::VecWriter::new();
+	let encoded: Option<()> = (|| {
+		writer.u16(proto::system::shutdown_notice::OP_PREPARE)?;
+		writer.u32(CORRELATION)?;
+		action.write(&mut writer)
+	})();
+	let Some(request) = encoded.and_then(|()| writer.into_inner()) else { return };
+	let mut waiting: Vec<usize> = Vec::new();
+	for idx in 0..N {
+		if MANIFEST[idx].notices & NOTICE_SHUTDOWN != 0 && state[idx] == State::Ready && channels[idx] != 0 && try_send(channels[idx], &request, 0) {
+			waiting.push(idx);
+		}
+	}
+	let deadline: u64 = clock() + notice_ticks;
+	while !waiting.is_empty() {
+		let handles: Vec<u64> = waiting.iter().map(|&idx| channels[idx]).collect();
+		let ready: i64 = wait_any(&handles, deadline);
+		if ready < 0 {
+			break;
+		}
+		let at: usize = ready as usize;
+		let idx: usize = waiting[at];
+		match try_recv(channels[idx], buf) {
+			Polled::Message { len, handle } => {
+				if handle != 0 {
+					close(handle);
+				}
+				if len >= 5 && buf[..4] == CORRELATION.to_le_bytes() {
+					console_report(MANIFEST[idx].name, if buf[4] == 1 { b"answered the shutdown notice" } else { b"refused the shutdown notice" });
+					waiting.remove(at);
+				}
+			}
+			Polled::Closed => {
+				waiting.remove(at);
+			}
+			Polled::Empty => {}
+		}
+	}
+	for &idx in &waiting {
+		console_report(MANIFEST[idx].name, b"did not answer the shutdown notice within its bound");
 	}
 }

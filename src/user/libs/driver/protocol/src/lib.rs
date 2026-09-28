@@ -263,6 +263,20 @@ pub enum Opcode {
 	// generation, including after withdrawal: a late departure for a retired token must not refund
 	// a replacement. A later generation may use the same number. Not terminal or a withdrawal.
 	Disconnect = 12,
+	// driver -> manager, after the handshake. Empty: "the firmware node my device has, when there is one" - a
+	// namespace device's own node, or the companion of a PCI function.
+	//
+	// ASKED, NOT PUSHED, and asked again whenever the channel it was answered with closes - the ACPI service that
+	// served it restarted. A node a driver does not ask for is never sent, so a driver that has no use for one is
+	// never handed a frame it does not read; and one receive path serves the claim, a restart and a companion joined
+	// after the bind alike, because the manager answers whenever it can: at once, or at the service's "namespace
+	// loaded" report.
+	NodeRequest = 13,
+	// manager -> driver, the answer. ONE CAPABILITY: a node-scoped channel of the ACPI service's
+	// (`liber:device@1/acpi-node`).
+	Node = 14,
+	// manager -> driver, the other answer. Empty: the namespace describes no node for this device, or withdrew it.
+	NodeAbsent = 15,
 }
 
 impl Opcode {
@@ -282,6 +296,9 @@ impl Opcode {
 			10 => Some(Opcode::Stopped),
 			11 => Some(Opcode::Connect),
 			12 => Some(Opcode::Disconnect),
+			13 => Some(Opcode::NodeRequest),
+			14 => Some(Opcode::Node),
+			15 => Some(Opcode::NodeAbsent),
 			_ => None,
 		}
 	}
@@ -295,8 +312,8 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped => 0,
-			Opcode::Resource | Opcode::Offer | Opcode::Connect => 1,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped | Opcode::NodeRequest | Opcode::NodeAbsent => 0,
+			Opcode::Resource | Opcode::Offer | Opcode::Connect | Opcode::Node => 1,
 		}
 	}
 

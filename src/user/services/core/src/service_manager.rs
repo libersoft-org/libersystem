@@ -58,8 +58,13 @@ struct Service {
 	program: &'static [u8],
 	pinned: bool,
 	restart: Restart,
+	// The notices the row declares, as `system_manifest::Notice::bit` numbers them.
+	notices: u8,
 	deps: &'static [&'static [u8]],
 }
+
+// The orderly shutdown's `prepare`, sent before the reverse-dependency kills to a service whose row declares it.
+const NOTICE_SHUTDOWN: u8 = 1;
 
 // The supervisor's crash policy for a managed service (the manifest `restart`
 // column): Transparent restarts it per the ladder - its clients re-resolve through
@@ -299,13 +304,18 @@ const RESTART_BACKOFF_TICKS: u64 = 10;
 struct Policy {
 	watchdog_ticks: u64,
 	restart_budget: u32,
+	// The one bound the orderly shutdown waits for its notices' answers under (`service.shutdown-notice-ticks`).
+	shutdown_notice_ticks: u64,
 }
+
+// Two seconds at the monotonic clock's hundred ticks: the shutdown notice's bound when the config tree does not answer.
+const SHUTDOWN_NOTICE_TICKS: u64 = 200;
 
 // Read the supervision policy (`service.watchdog-ticks`, `service.restart-budget`)
 // over the supervisor's ConfigService client; defaults stand when the tree is not
 // up (config_client 0) or a key does not parse.
 fn read_policy(config_client: u64) -> Policy {
-	let mut policy: Policy = Policy { watchdog_ticks: WATCHDOG_TICKS, restart_budget: MAX_RESTARTS };
+	let mut policy: Policy = Policy { watchdog_ticks: WATCHDOG_TICKS, restart_budget: MAX_RESTARTS, shutdown_notice_ticks: SHUTDOWN_NOTICE_TICKS };
 	if config_client == 0 {
 		return policy;
 	}
@@ -320,6 +330,11 @@ fn read_policy(config_client: u64) -> Policy {
 	if let Some(Ok(value)) = client.get("service.restart-budget") {
 		if let Ok(budget) = value.parse::<u32>() {
 			policy.restart_budget = budget;
+		}
+	}
+	if let Some(Ok(value)) = client.get("service.shutdown-notice-ticks") {
+		if let Ok(ticks) = value.parse::<u64>() {
+			policy.shutdown_notice_ticks = ticks;
 		}
 	}
 	policy
@@ -386,6 +401,113 @@ static ROOT_UUID_HIGH: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 pub(crate) static TRUSTED_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BOOT_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BOOT_WINDOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE BOOT MODE AS THE KERNEL SENT IT: a test boot runs the bring-up drills. Kept for the roles only this supervisor
+// fills, which hand the mode on at every start of the service that reads it.
+static SELFTEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// THE FIRMWARE INTERPRETER'S PRIVILEGE, as the boot chain handed it over: the one copy the ACPI service's are
+// duplicated from. Zero when the kernel sent none.
+static FIRMWARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE `supervisor-liveness` END THIS SUPERVISOR ANSWERS ON, in the standing loop's wait set. Minted again at every
+// start of the watchdog service, the new end replacing the old one - see `supervisor_role`.
+static LIVENESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// A development build's hook: `alive` goes unanswered, and nothing else changes - what the watchdog gate needs to see
+// the machine reset by the hardware rather than by anything this supervisor does.
+#[cfg(feature = "development")]
+static LIVENESS_SILENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// The boot mode's name, as the watchdog service's policy defaults follow it: a test boot, a development image, or a
+// shipping one.
+fn boot_mode() -> &'static [u8] {
+	if SELFTEST.load(core::sync::atomic::Ordering::Relaxed) {
+		b"test"
+	} else if cfg!(feature = "development") {
+		b"development"
+	} else {
+		b"shipping"
+	}
+}
+
+// THE ROLES ONLY THIS SUPERVISOR CAN FILL - one function, called by the first start's role delivery and by
+// `relaunch_planned` alike, so a relaunched instance is handed exactly what the first start gave: a payload's bytes
+// built again, a client of an interface this supervisor serves minted afresh. `None` for every other role, which
+// then resolves as the plan says.
+//
+// The watchdog service's two: the boot mode's bytes, since a payload the plan resolves arrives as its bare tag and a
+// relaunched instance in a test boot would otherwise read no mode at all; and its `supervisor-liveness` channel,
+// whose near end REPLACES the one the standing loop answered on - the old one died with the instance that held its
+// peer.
+fn supervisor_role(service: &[u8], role: &Role) -> Option<(Vec<u8>, u64)> {
+	// THE ACPI SERVICE'S PRIVILEGE, duplicated from the copy kept here - so a relaunched instance holds it as the
+	// first did. None kept, the tag goes carrying nothing, and the service says so.
+	if service == b"acpi_service" && role.tag == ROLE_FIRMWARE {
+		let kept = FIRMWARE.load(core::sync::atomic::Ordering::Relaxed);
+		if kept == 0 {
+			return Some((Vec::from(role.tag), 0));
+		}
+		let copy: i64 = duplicate(kept, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+		return (copy > 0).then(|| (Vec::from(role.tag), copy as u64));
+	}
+	if service != b"watchdog_service" {
+		return None;
+	}
+	if role.tag == ROLE_MODE {
+		let mut message: Vec<u8> = Vec::from(role.tag);
+		message.extend_from_slice(boot_mode());
+		return Some((message, 0));
+	}
+	if role.tag == ROLE_LIVENESS {
+		let (near, far): (u64, u64) = channel()?;
+		let narrowed: i64 = duplicate(far, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		close(far);
+		if narrowed <= 0 {
+			close(near);
+			return None;
+		}
+		let old: u64 = LIVENESS.swap(near, core::sync::atomic::Ordering::Relaxed);
+		if old != 0 {
+			close(old);
+		}
+		return Some((Vec::from(role.tag), narrowed as u64));
+	}
+	None
+}
+
+// `alive`, answered with the sequence it asked about: an answer is the proof - the kernel schedules and delivers, and
+// this supervisor's standing loop runs.
+struct Liveness;
+
+impl proto::system::supervisor_liveness::Service for Liveness {
+	fn alive(&mut self, sequence: u64) -> Result<u64, Error> {
+		Ok(sequence)
+	}
+}
+
+// One `alive` request off the liveness channel. False when the channel's peer is gone - the watchdog service ended,
+// and its next start mints the channel again.
+fn serve_liveness(chan: u64, buf: &mut [u8]) -> bool {
+	let (len, mut handles) = match try_recv_caps(chan, buf) {
+		PolledCaps::Message { len, handles } => (len, handles),
+		PolledCaps::Empty => return true,
+		PolledCaps::Closed => return false,
+	};
+	#[cfg(feature = "development")]
+	if LIVENESS_SILENT.load(core::sync::atomic::Ordering::Relaxed) {
+		for &handle in handles.as_slice() {
+			close(handle);
+		}
+		return true;
+	}
+	let mut reply: [u8; 64] = [0u8; 64];
+	let mut reply_handles = wire::Handles::new();
+	let request: Vec<u8> = buf[..len].to_vec();
+	if let Some(written) = proto::system::supervisor_liveness::dispatch(&mut Liveness, &request, &mut handles, &mut reply, &mut reply_handles) {
+		let _ = try_send(chan, &reply[..written], 0);
+	}
+	for &handle in handles.as_slice().iter().chain(reply_handles.as_slice()) {
+		close(handle);
+	}
+	true
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -446,6 +568,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, .. } if len == 5 && &buf[..4] == b"MODE" => buf[4] == 1,
 		_ => exit(),
 	};
+	SELFTEST.store(selftest, core::sync::atomic::Ordering::Relaxed);
 
 	// 1d. receive the three console/display capabilities, in the kernel's order:
 	//     DisplayController, ConsoleInputSource, ConsoleSink. This supervisor holds none of
@@ -496,6 +619,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		ROOT_HEAD.store(word(7), core::sync::atomic::Ordering::Relaxed);
 		ROOT_UUID_LOW.store(word(15), core::sync::atomic::Ordering::Relaxed);
 		ROOT_UUID_HIGH.store(word(23), core::sync::atomic::Ordering::Relaxed);
+	}
+
+	// 1g. the firmware interpreter's privilege, KEPT for the life of this supervisor: the ACPI service is given a
+	//     duplicate of it at every start - the first and every relaunch - by `supervisor_role`.
+	if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf)
+		&& len >= 8
+		&& &buf[..8] == b"FIRMWARE"
+	{
+		FIRMWARE.store(handle, core::sync::atomic::Ordering::Relaxed);
 	}
 
 	// 2. bring the services up in dependency order. Each pass starts every pending
@@ -738,6 +870,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						registry_far = 0;
 					}
 				}
+			}
+			// THE ACPI SERVICE'S ADMIN ROOT, a connection of it for DeviceManager - which started long before this service
+			// and so holds no role on it: the same late hand-off `DEVPERM` takes. Again at every relaunch.
+			if MANIFEST[i].name == b"acpi_service" && started == State::Ready {
+				hand_acpi_admin(&kept, &channels);
 			}
 			// Once the system StorageService is up, drive DeviceManager's phase
 			// 2 - it now loads the non-bootstrap drivers from the volume, which is only
@@ -1186,6 +1323,36 @@ fn drain_closed(channel: u64, buf: &mut [u8]) {
 	}
 }
 
+// How long a SIG_KILLed service's control channel is given to report its peer gone, in a stop or a shutdown.
+const KILL_DRAIN_TICKS: u64 = 200;
+
+// THE SAME DRAIN, BOUNDED - for a service this supervisor has just SIG_KILLed. A process whose channel does not close
+// within the bound has not ended, and waiting on it without one stopped the whole orderly shutdown at that service:
+// the machine never powered off, and every request that needed this supervisor waited behind it. So the stop goes on,
+// and the caller says which service it left behind. True when the channel reported its peer gone.
+fn drain_closed_within(channel: u64, ticks: u64, buf: &mut [u8]) -> bool {
+	if channel == 0 {
+		return true;
+	}
+	let deadline: u64 = clock() + ticks;
+	loop {
+		match try_recv(channel, buf) {
+			Polled::Message { handle, .. } => {
+				if handle != 0 {
+					close(handle);
+				}
+			}
+			Polled::Closed => return true,
+			Polled::Empty => {
+				if clock() >= deadline {
+					return false;
+				}
+				wait(channel, deadline);
+			}
+		}
+	}
+}
+
 // ---- the transparent-restart broker (the Resolver) ---------------------------------
 //
 // The durable reference a client holds to a service is the capability NAME, not the
@@ -1554,6 +1721,24 @@ fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 	}
 }
 
+// A CONNECTION OF THE ACPI SERVICE'S ADMIN ROOT, sent on DeviceManager's control channel as `ACPI`: through it
+// DeviceManager asks for node channels and hands over the connections the service holds. After every start of the
+// service, the first and each relaunch, since each instance serves a root of its own.
+fn hand_acpi_admin(kept: &Kept, channels: &[u64; N]) {
+	let (Some(dm), root) = (index_of(b"device_manager"), kept.end_of(b"acpi_service", b"ADMIN")) else { return };
+	if root == 0 || channels[dm] == 0 {
+		return;
+	}
+	match service_connect(root) {
+		Some(client) if client != 0 => {
+			if !send_blocking(channels[dm], b"ACPI", client) {
+				print(b"ServiceManager: the ACPI service's admin connection could not reach DeviceManager\n");
+			}
+		}
+		_ => print(b"ServiceManager: the ACPI service's admin root minted no connection\n"),
+	}
+}
+
 // The services whose bootstrap is the plan and nothing else, so a restart can re-run it as it stands.
 //
 // A SHORT LIST ON PURPOSE. The three older restartable services each have a hand-written bootstrap
@@ -1562,9 +1747,11 @@ fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 // PowerService, whose state is rebuilt from the catalogue, the second; SmartcardService, whose grants are
 // ephemeral and minted again after a restart, the third. AdminService's authority dies with the instance that
 // held it by design, and its journal is read back by the replacement - which is what makes it restartable.
-// TpmService's grants are minted per launch too, and the TPM's state is in the chip.
+// TpmService's grants are minted per launch too, and the TPM's state is in the chip. The watchdog service's two roles
+// the plan cannot carry - its liveness channel and the boot mode - are `supervisor_role`'s, and its timers are in the
+// hardware. The ACPI service's privilege is `supervisor_role`'s too, and what it published is the kernel's to keep.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its
@@ -1585,6 +1772,10 @@ fn relaunch_planned(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 	// exactly as it was for the first start - never the admin root the factory arm would otherwise mint from.
 	let storage_admin: u64 = broker.storage_admin;
 	let mut external = |role: &Role| -> Option<(Vec<u8>, u64)> {
+		// THE ROLES ONLY THIS SUPERVISOR CAN FILL, answered as the first start answered them.
+		if let Some(filled) = supervisor_role(MANIFEST[idx].name, role) {
+			return Some(filled);
+		}
 		if MANIFEST[idx].name == b"admin_service" && role.tag == b"JOURNAL" {
 			let scoped: u64 = bootstrap::open_storage_directory(storage_admin, bootstrap::ADMIN_JOURNAL_DIRECTORY);
 			let narrowed: i64 = if scoped != 0 { duplicate(scoped, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER) } else { 0 };
@@ -1615,6 +1806,9 @@ fn relaunch_planned(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 	let epoch: u64 = unsafe { epoch_of(procs[idx]) };
 	broker.lifecycle.record(idx, State::Starting, State::Ready, epoch, Reason::ReportedReady);
 	state[idx] = State::Ready;
+	if MANIFEST[idx].name == b"acpi_service" {
+		hand_acpi_admin(&broker.kept, channels);
+	}
 	true
 }
 
@@ -1723,10 +1917,11 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 		let mut stats: u64 = stats_server;
 		let mut stats2: u64 = stats_server2;
 		loop {
-			// N services, the canary, and the four supervisor channels plus the console's.
-			let mut handles: [u64; N + 6] = [0u64; N + 6];
-			let mut kinds: [u8; N + 6] = [0u8; N + 6];
-			let mut idxs: [usize; N + 6] = [0usize; N + 6];
+			// N services, the canary, the four supervisor channels plus the console's, and the watchdog service's
+			// liveness channel.
+			let mut handles: [u64; N + 7] = [0u64; N + 7];
+			let mut kinds: [u8; N + 7] = [0u8; N + 7];
+			let mut idxs: [usize; N + 7] = [0usize; N + 7];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
@@ -1766,6 +1961,13 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 			if admin3 != 0 {
 				handles[count] = admin3;
 				kinds[count] = 6;
+				count += 1;
+			}
+			// THE LIVENESS CHANNEL, loaded afresh each round: a relaunch of the watchdog service replaces it.
+			let liveness: u64 = LIVENESS.load(core::sync::atomic::Ordering::Relaxed);
+			if liveness != 0 {
+				handles[count] = liveness;
+				kinds[count] = 7;
 				count += 1;
 			}
 			if count == 0 {
@@ -1866,7 +2068,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				}
 				2 => {
 					// The shell asked to stop a service; tear down its dependents first.
-					if !handle_admin(admin, power, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin, power, policy.shutdown_notice_ticks, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin = 0;
 					}
 				}
@@ -1879,7 +2081,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				4 => {
 					// The sandboxed `stop` tool (granted the supervisor capability) asked to
 					// stop a service over its own admin channel; tear down its dependents first.
-					if !handle_admin(admin2, power, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin2, power, policy.shutdown_notice_ticks, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin2 = 0;
 					}
 				}
@@ -1890,11 +2092,18 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 						stats2 = 0;
 					}
 				}
-				_ => {
+				6 => {
 					// A shell ConsoleService spawned - the replacement a logout puts on the primary
 					// VT - asking to stop a service or to stop the machine.
-					if !handle_admin(admin3, power, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin3, power, policy.shutdown_notice_ticks, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin3 = 0;
+					}
+				}
+				_ => {
+					// The watchdog service asked whether this loop runs: answered at once. Its channel closing is the
+					// service ending - the end is dropped unless a relaunch already replaced it.
+					if !serve_liveness(liveness, buf) && LIVENESS.compare_exchange(liveness, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+						close(liveness);
 					}
 				}
 			}
@@ -1907,7 +2116,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 // its dependents are torn down and the newline-joined list of what stopped is replied
 // for the shell to print. Returns false once the admin channel's peer (the shell) is
 // gone, so the supervisor drops it from its wait set.
-fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
+fn handle_admin(admin: u64, power: u64, notice_ticks: u64, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
 	let len: usize = match recv_blocking(admin, buf) {
 		Received::Message { len, .. } => len,
 		Received::Closed => return false,
@@ -1923,9 +2132,35 @@ fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State;
 	// last journal batch first - then power the machine off (or reboot) from here, so no
 	// service is killed while a dependent still needs it. system_power does not return;
 	// if it somehow does (an unsupported machine), the loop stays alive.
+	// THE WATCHDOG GATE'S HOOK, in a development build alone: `alive` goes unanswered from here on and nothing else
+	// changes, so the timer's expiry is the hardware's doing. A shipping build does not have the verb, and the name
+	// falls through to the not-found answer below.
+	#[cfg(feature = "development")]
+	if name == b"!liveness-silence" {
+		LIVENESS_SILENT.store(true, core::sync::atomic::Ordering::Relaxed);
+		debug_write(b"service_manager: supervisor-liveness answers stopped (development hook)\n");
+		send_blocking(admin, b"LIVENESS SILENT", 0);
+		return true;
+	}
+	// AND ITS CRASH: `!crash <service>` SIG_KILLs a running service's process, so the standing loop sees its
+	// control channel close and restarts it as it restarts any crash - the watchdog gate's service death.
+	#[cfg(feature = "development")]
+	if let Some(wanted) = name.strip_prefix(b"!crash ") {
+		match index_of(wanted) {
+			Some(target) if state[target] == State::Ready && procs[target] != 0 => {
+				signal(procs[target], SIG_KILL);
+				send_blocking(admin, b"CRASHED", 0);
+			}
+			_ => {
+				send_blocking(admin, b"NOTFOUND", 0);
+			}
+		}
+		return true;
+	}
 	if name == b"!poweroff" || name == b"!reboot" {
 		let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
-		shutdown_all(state, channels, sup, procs, log_client, buf);
+		let notice: proto::system::ShutdownAction = if action == POWER_REBOOT { proto::system::ShutdownAction::Reboot } else { proto::system::ShutdownAction::PowerOff };
+		shutdown_all(state, channels, sup, procs, log_client, notice, notice_ticks, buf);
 		// Say so before doing it. Powering off destroys the evidence of why: the machine
 		// stops, QEMU exits 0 with no reset and no fault, and from outside that is
 		// indistinguishable from a clean shutdown - which is how a suite came to end
@@ -2040,7 +2275,9 @@ fn stop_subtree(target: usize, state: &mut [State; N], desired: &mut [Desired; N
 					if procs[i] != 0 {
 						signal(procs[i], SIG_KILL);
 					}
-					drain_closed(channels[i], buf);
+					if !drain_closed_within(channels[i], KILL_DRAIN_TICKS, buf) {
+						console_report(MANIFEST[i].name, b"did not end within its bound after SIG_KILL - it is left behind");
+					}
 					if channels[i] != 0 {
 						close(channels[i]);
 						channels[i] = 0;

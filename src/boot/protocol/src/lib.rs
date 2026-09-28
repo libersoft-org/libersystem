@@ -104,6 +104,9 @@ pub const MEM_FRAMEBUFFER: u32 = 7;
 // usable, unlike `MEM_BOOTLOADER`, which holds the kernel image, the packages, the page tables,
 // `BootInfo`, the boot stack and the AP trampoline.
 pub const MEM_BOOTLOADER_RECLAIMABLE: u32 = 8;
+// MEMORY-MAPPED I/O the firmware reports (EFI `MemoryMappedIO` and `MemoryMappedIOPortSpace`), appended rather than
+// folded into reserved: a firmware mapping of it is uncached, of reserved memory write-back.
+pub const MEM_MMIO: u32 = 9;
 
 // One physical memory-map region: its physical base, byte length, and kind (a
 // MEM_* code above). The loader sorts these ascending by base and coalesces

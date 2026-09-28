@@ -313,6 +313,26 @@ pub fn msi_doorbell() -> Option<(u64, u64)> {
 // NOT TEST-ONLY ANY MORE (P02M0173): the bypass transition quiesces every firmware-touched
 // function by its class before it clears bus mastering, and an NVMe controller - the riscv64 UEFI
 // boot's ESP - is admitted to the table without a BAR, so its registers are resolved here.
+// EVERY MEMORY RANGE THE BUS DECODES - see `common::decoded_ranges`. At the boot scan only.
+pub fn decoded_ranges() -> alloc::vec::Vec<common::DecodedRange> {
+	common::decoded_ranges::<Access>(&scan())
+}
+
+// NATIVE CONTROL WAITS FOR `_OSC` on an ACPI machine - see `common::gate_on_osc`.
+pub fn gate_on_osc() {
+	common::gate_on_osc();
+}
+
+// ONE HOST BRIDGE'S `_OSC` GRANT - see `common::apply_grant` - and the bus scanned again when it changed what this
+// kernel may arm, which arms the granted slots and watches the granted reporters.
+pub fn apply_grant(bus_start: u8, bus_end: u8, granted: u32) -> bool {
+	let changed = common::apply_grant(bus_start, bus_end, granted);
+	if changed {
+		let _ = scan();
+	}
+	changed
+}
+
 pub fn function_bar(bus: u8, dev: u8, func: u8, index: usize) -> Option<(u64, u64)> {
 	let device = common::probe_function::<Access>(bus, dev, func)?;
 	// AND THIS PORT IS WHAT PLACES THE WINDOW, because nothing else does. There is no firmware here

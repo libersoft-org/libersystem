@@ -272,38 +272,92 @@ pub fn function_ports(bus: u8, dev: u8, func: u8, vendor: u16, product: u16, out
 	count
 }
 
-// A derivation row's block base, or `None` - with a line - when a condition refuses the row.
-fn derive_base(row: &Derivation, bus: u8, dev: u8, func: u8) -> Option<u16> {
-	if let Some(signature) = row.suppressed_by
-		&& crate::smp::acpi_table(crate::boot_info().rsdp, &signature).is_some()
-	{
-		crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} is suppressed by this machine's {} table", row.name, core::str::from_utf8(&signature).unwrap_or("?"));
-		return None;
+// Why a derivation row is not applied on a machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+	// The table that suppresses it is present.
+	Suppressed,
+	// The block's decode is not enabled.
+	DecodeOff,
+	// The base register holds something that is no port.
+	NotAPort(u32),
+	// The block has no base.
+	NoBase,
+	// The base does not agree with the firmware's block.
+	Disagrees(u16),
+}
+
+// THE ROW'S DECISION, from what the machine says: whether the suppressing table is present, the function's
+// configuration registers, and the port of the FADT block the base must agree with. Pure, so a fixture machine can
+// be put through it.
+fn decide(row: &Derivation, suppressed: bool, config: impl Fn(u16) -> u32, firmware_port: Option<u16>) -> Result<u16, Refusal> {
+	if row.suppressed_by.is_some() && suppressed {
+		return Err(Refusal::Suppressed);
 	}
 	if let Some((offset, mask)) = row.decode_enable
-		&& pci::config_read32(bus, dev, func, offset) & mask == 0
+		&& config(offset) & mask == 0
 	{
-		crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - the block's decode is not enabled", row.name);
-		return None;
+		return Err(Refusal::DecodeOff);
 	}
-	let raw = pci::config_read32(bus, dev, func, row.base_register) & row.base_mask;
-	let Ok(base) = u16::try_from(raw) else {
-		crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - its base {raw:#x} is no port", row.name);
-		return None;
-	};
+	let raw = config(row.base_register) & row.base_mask;
+	let base = u16::try_from(raw).map_err(|_| Refusal::NotAPort(raw))?;
 	if base == 0 {
-		crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - its block has no base", row.name);
-		return None;
+		return Err(Refusal::NoBase);
 	}
-	if let Some((block, offset)) = row.agrees_with {
-		let firmware = fadt().and_then(|fadt| block(&fadt));
-		let agrees = firmware.and_then(|block| block.io_port()).is_some_and(|port| port as u32 == base as u32 + offset as u32);
-		if !agrees {
-			crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - its base {base:#06x} does not agree with the FADT", row.name);
-			return None;
+	if let Some((_, offset)) = row.agrees_with
+		&& firmware_port.map(u32::from) != Some(base as u32 + offset as u32)
+	{
+		return Err(Refusal::Disagrees(base));
+	}
+	Ok(base)
+}
+
+// A derivation row's block base, or `None` - with a line - when a condition refuses the row.
+fn derive_base(row: &Derivation, bus: u8, dev: u8, func: u8) -> Option<u16> {
+	let suppressed = row.suppressed_by.is_some_and(|signature| crate::smp::acpi_table(crate::boot_info().rsdp, &signature).is_some());
+	let firmware_port = row.agrees_with.and_then(|(block, _)| fadt().and_then(|fadt| block(&fadt)).and_then(|block| block.io_port()));
+	match decide(row, suppressed, |offset| pci::config_read32(bus, dev, func, offset), firmware_port) {
+		Ok(base) => Some(base),
+		Err(refusal) => {
+			match refusal {
+				Refusal::Suppressed => crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} is suppressed by this machine's {} table", row.name, row.suppressed_by.as_ref().and_then(|signature| core::str::from_utf8(signature).ok()).unwrap_or("?")),
+				Refusal::DecodeOff => crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - the block's decode is not enabled", row.name),
+				Refusal::NotAPort(raw) => crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - its base {raw:#x} is no port", row.name),
+				Refusal::NoBase => crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - its block has no base", row.name),
+				Refusal::Disagrees(base) => crate::serial_println!("ports: derivation {} for {bus:02x}:{dev:02x}.{func} refused - its base {base:#06x} does not agree with the FADT", row.name),
+			}
+			None
 		}
 	}
-	Some(base)
+}
+
+// THE ICH9 TCO ROW AGAINST FIXTURE MACHINES: the one q35 is, and each way a machine refuses it.
+#[cfg(test)]
+crate::tagged_test!(the_ich9_tco_row_is_refused_by_a_foreign_base_a_decode_left_off_and_a_wdat, [Kernel, Pci, ArchX86_64], id = "kernel.arch.x86_64.ioports.the_ich9_tco_row_is_refused_by_a_foreign_base_a_decode_left_off_and_a_wdat", covers = ["kernel"]);
+#[cfg(test)]
+fn the_ich9_tco_row_is_refused_by_a_foreign_base_a_decode_left_off_and_a_wdat() {
+	// LPC configuration: PMBASE at 0x40 (bit 0 is the I/O indicator), ACPI_EN at 0x44 bit 7.
+	let machine = |acpi_enabled: bool, pm_base: u32| {
+		move |offset: u16| match offset {
+			0x40 => pm_base | 1,
+			0x44 => {
+				if acpi_enabled {
+					0x80
+				} else {
+					0
+				}
+			}
+			_ => 0,
+		}
+	};
+	assert_eq!(decide(&ICH9_TCO, false, machine(true, 0x600), Some(0x600)), Ok(0x600), "q35 as OVMF leaves it");
+	assert_eq!(decide(&ICH9_TCO, false, machine(true, 0x600), Some(0x400)), Err(Refusal::Disagrees(0x600)), "a PM base that is not the FADT's PM1a event block");
+	assert_eq!(decide(&ICH9_TCO, false, machine(true, 0x600), None), Err(Refusal::Disagrees(0x600)), "a FADT with no PM1a event block");
+	assert_eq!(decide(&ICH9_TCO, false, machine(false, 0x600), Some(0x600)), Err(Refusal::DecodeOff), "ACPI decode off");
+	assert_eq!(decide(&ICH9_TCO, true, machine(true, 0x600), Some(0x600)), Err(Refusal::Suppressed), "a WDAT present");
+	assert_eq!(decide(&ICH9_TCO, false, machine(true, 0), Some(0)), Err(Refusal::NoBase), "no base programmed");
+	// AND THE SUB-RANGE IT YIELDS is the TCO block alone: nothing of PM1, the PM timer or GPE0.
+	assert_eq!(ICH9_TCO.sub_ranges, &[(0x60, 32)]);
 }
 
 // A function's I/O decode: on for a claim of a row with an I/O BAR, off at its release.

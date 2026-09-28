@@ -1,6 +1,7 @@
 pub mod apboot;
 pub mod apic;
 pub mod context;
+pub mod firmware;
 mod fwcfg;
 pub mod gdt;
 pub mod idt;

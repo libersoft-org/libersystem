@@ -419,6 +419,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if !common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::GPIO_LINES, far)]) {
 			exit();
 		}
+		// THE CONTROLLER'S FIRMWARE NODE - its companion, whose `_AEI` lines and fields the ACPI service holds connections
+		// through - asked for once online; the manager answers when the namespace has one.
+		let _ = common::request_node(bootstrap, &bind);
 		close(near);
 		let mut serving = common::Serving::from_offers(&[(LINES_TOKEN, 0)]);
 		let mut buf = alloc::vec![0u8; 512];

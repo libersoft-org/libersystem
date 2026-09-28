@@ -524,6 +524,12 @@ path = "user/libs/smartcard/model"
 owner = "power-model"
 path = "user/libs/power/model"
 
+# THE ACPI SERVICE'S DECISIONS: what each namespace node is, the row it is reported as, the handshakes, the node
+# channel's admission and the event methods. A SOURCE ROW AND NO LIBRARY ROW - the service links it statically.
+[[sources]]
+owner = "acpi-model"
+path = "user/libs/acpi/model"
+
 [[sources]]
 owner = "input-proto"
 path = "user/libs/protocol/input-proto"
@@ -2545,6 +2551,27 @@ role = "service"
 linkage = "static"
 stage = "volume"
 destination = "libexec/tpm_service.lsexe"
+providers = []
+
+# STATIC, FOR THE REASON `smartcard_service` IS: its decisions are `service-logic`'s, which no staged library publishes.
+[[programs]]
+name = "watchdog_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/watchdog_service.lsexe"
+providers = []
+
+# STATIC, FOR THE REASON `watchdog_service` IS: the interpreter and its decisions are `aml`'s and `acpi-model`'s, which no
+# staged library publishes.
+[[programs]]
+name = "acpi_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/acpi_service.lsexe"
 providers = []
 
 [[programs]]
@@ -5021,6 +5048,83 @@ tag = "ADMIN"
 kind = "serve-root"
 provider = "self"
 interface = "liber:tpm@1/tpm-admin"
+
+# THE HARDWARE WATCHDOG'S ONE CONSUMER. It takes every `watchdog` publication through a catalogue connection minted
+# for that kind alone - optional, so a machine with no watchdog runs it idle - and pets only after ServiceManager's
+# standing loop has answered `alive` on the `supervisor-liveness` channel within the deadline. Whether it arms is the
+# policy's (`watchdog.enabled`, whose default follows the boot mode): off for a development image and a test boot.
+#
+# LIVENESS AND MODE ARE SERVICEMANAGER'S TO FILL, at the first start and at every relaunch alike: the channel is one
+# end of a pair the supervisor answers on, and the mode is bytes a payload the plan resolves would not carry. MODE IS
+# LAST, because the service reads it by hand - the plan's reader drops a payload's bytes.
+#
+# TRANSPARENT: a replacement takes the providers again and chooses as the first instance did; the timers are in the
+# hardware. It is told the orderly shutdown before the kills, and the suspend transaction's sleep announcement.
+[[services]]
+name = "watchdog_service"
+program = "watchdog_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager", "config_service"]
+notices = ["shutdown", "sleep"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["watchdog"]
+presence = "optional"
+
+[[services.roles]]
+tag = "CONFIG"
+kind = "client"
+provider = "config_service"
+interface = "liber:config@1/config"
+presence = "optional"
+
+[[services.roles]]
+tag = "LIVENESS"
+kind = "client"
+provider = "service_manager"
+interface = "liber:observability@1/supervisor-liveness"
+
+[[services.roles]]
+tag = "MODE"
+kind = "payload"
+provider = "service_manager"
+
+# THE FIRMWARE'S INTERPRETER. AML is firmware code and it can be wrong, so it runs here, where a defect costs a
+# restart: the `FirmwareInterpreter` privilege is ServiceManager's to hand on, at every start - `supervisor_role`
+# duplicates it from the copy the boot chain gave ServiceManager - and every authority the service has is minted by the
+# kernel under its policy. ADMIN is DeviceManager's root and nobody else's: ServiceManager mints DeviceManager a
+# connection after each start, the late hand-off DEVPERM already takes, since a role's provider must start first and
+# DeviceManager starts long before this service.
+#
+# VOLUME-STAGED AND TRANSPARENT: launched through ProcessService once that is up, relaunched from the volume. A crash
+# costs the namespace and nothing it published - its rows, reservations, companions and firmware-held functions stay,
+# and the next instance's walk is reconciled with them by identity.
+[[services]]
+name = "acpi_service"
+program = "acpi_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service"]
+
+[[services.roles]]
+tag = "FIRMWARE"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:device@1/acpi-admin"
 
 # MODEMS: SIM, registration and the one data context this system supports. It consumes every `modem`
 # publication through a catalogue connection minted for that kind alone, and serves two roots: SERVE,

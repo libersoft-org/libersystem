@@ -36,6 +36,11 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+/// General-purpose events: the kernel's state machine over the FADT's GPE blocks.
+pub mod gpe;
+
 /// Why a table, or a structure inside one, was refused.
 ///
 /// ONE ERROR TYPE FOR THE CRATE, and each variant names a DIFFERENT way a real table is wrong -

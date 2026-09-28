@@ -555,6 +555,7 @@ impl Process {
 		self.record_in_groups();
 		sched::wake_object(self.header.koid());
 		crate::idle::process_ended(self.header.koid());
+		crate::firmware::process_ended(self.header.koid());
 	}
 
 	// Take note of a group this process belongs to. Called by `ProcessGroup::create`, which is the
@@ -987,6 +988,7 @@ impl Process {
 		// observe it - the same process-terminated signal a clean exit delivers.
 		sched::wake_object(self.header.koid());
 		crate::idle::process_ended(self.header.koid());
+		crate::firmware::process_ended(self.header.koid());
 	}
 }
 

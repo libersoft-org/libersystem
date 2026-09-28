@@ -1,6 +1,6 @@
 package liber:device@1
 enum device-type(unknown=0,net=1,block=2,console=3,usb=4)
-record device-entry(index:u32,type:device-type,mmio-len:u64,bus:u32,dev:u32,func:u32,present:bool,kind:row-kind,source:platform-source,state:platform-state,identity:string:bound=64,ids:list<platform-id>:bound=8,resources:list<platform-resource>:bound=26,unresolved:bool)
+record device-entry(index:u32,type:device-type,mmio-len:u64,bus:u32,dev:u32,func:u32,present:bool,kind:row-kind,source:platform-source,state:platform-state,identity:string:bound=64,ids:list<platform-id>:bound=8,resources:list<platform-resource>:bound=26,unresolved:bool,companion:string:bound=64,parent:string:bound=16)
 enum row-kind(pci=0,platform=1)
 enum platform-source(none=0,kernel=1,table=2,tree=3,acpi=4)
 enum platform-state(none=0,claimable=1,kernel-held=2,firmware-held=3,reservation=4)
@@ -56,3 +56,14 @@ method watchdog.describe op=1 () -> result<watchdog-description, liber:base@1::e
 method watchdog.arm op=2 (timeout-ms:u32:rights=) -> result<u32, liber:base@1::error>
 method watchdog.pet op=3 () -> result<unit, liber:base@1::error>
 method watchdog.disarm op=4 () -> result<unit, liber:base@1::error>
+record acpi-notification(value:u32,sequence:u32)
+interface acpi-node
+method acpi-node.path op=1 () -> result<string, liber:base@1::error>
+method acpi-node.evaluate op=2 (name:string:bound=64:rights=,arguments:list<u8>:bound=4096:rights=) -> result<list<u8>, liber:base@1::error>
+method acpi-node.properties op=3 () -> result<list<u8>, liber:base@1::error>
+method acpi-node.dsm op=4 (uuid:list<u8>:bound=16:rights=,revision:u64:rights=,function:u64:rights=,arguments:list<u8>:bound=4096:rights=) -> result<list<u8>, liber:base@1::error>
+method acpi-node.notifications op=5 () -> stream<acpi-notification>
+enum acpi-connection-kind(event-line=0,field-line=1,field-address=2)
+interface acpi-admin
+method acpi-admin.open-node op=1 (identity:string:bound=64:rights=) -> result<handle<channel>, liber:base@1::error>
+method acpi-admin.connection op=2 (controller:string:bound=64:rights=,kind:acpi-connection-kind:rights=,value:u32:rights=,connection:handle<channel>:rights=) -> result<unit, liber:base@1::error>

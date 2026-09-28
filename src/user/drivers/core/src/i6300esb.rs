@@ -138,7 +138,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		print(b"driver.i6300esb: its BAR 0 window could not be mapped\n");
 		common::failed(bootstrap, &bind, unusable);
 	}
-	let window = mapped + (bind.info.bar_phys & 0xfff);
+	// THE WINDOW AS MAPPED: the kernel maps from the page and answers the BAR's own address within it.
+	let window = mapped;
 	let mut esb = Esb { registers: resources.registers, window, running_at_bind: false, last_reset: false };
 	// THE LAST RESET, read and cleared: bit 9 of the reload register survives the reset it caused.
 	esb.last_reset = esb.read16(RELOAD) & TIMEOUT_BIT != 0;

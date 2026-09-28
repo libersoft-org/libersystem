@@ -22,6 +22,7 @@ mod elf;
 mod entropy;
 mod extable;
 mod fault;
+mod firmware;
 #[cfg(test)]
 mod graph;
 mod idle;
@@ -224,6 +225,8 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	// neither do the two ports that reach config space through a device-tree ECAM window already.
 	#[cfg(all(not(test), target_arch = "x86_64"))]
 	init_extended_config(bi);
+	// ON AN ACPI MACHINE, NATIVE HOT-PLUG AND ERROR REPORTING WAIT FOR `_OSC` - decided before the first scan arms any.
+	firmware::init();
 	device::init();
 	// THE BOOT'S DMA MODE, FROM THE LOADER'S HAND-OFF, BEFORE POLICY INIT. UEFI admission consumes
 	// the validated `BootInfo` extension and nothing else; on this port the loader relayed the
@@ -523,6 +526,8 @@ fn serial_console_pump() {
 	// channel takes locks an ordinary thread can be holding when a hardware interrupt arrives, so
 	// the ACPI SCI handler records the press and this pass delivers it. See `platform_event`.
 	platform_event::deliver();
+	// AND THE GENERAL-PURPOSE EVENTS THE SAME HANDLER LATCHED, for the ACPI service. See `firmware::deliver`.
+	firmware::deliver();
 }
 
 // Drive the interactive userspace shell. The boot chain has already started it as
@@ -890,6 +895,15 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	// ALLOC-OK: as above
 	root_msg.extend_from_slice(&root.uuid);
 	kernel_ep.send(Message::new(root_msg, alloc::vec::Vec::new())).map_err(|_| "failed to hand SystemManager the root selection")?;
+
+	// THE FIRMWARE INTERPRETER'S PRIVILEGE, the fifth and last minted: what the ACPI service runs AML under - every
+	// table read, region mapping, mediated access and report it makes is checked against it. Its own message
+	// because `CONSOLECAPS` carries the most capabilities one message can, and last in the sequence like every
+	// addition. ServiceManager keeps it and duplicates its copy for each start of the one service given it.
+	// ALLOC-OK: boot, before userspace exists.
+	let firmware = Capability::new(Privilege::create(PrivilegeKind::FirmwareInterpreter).expect("the firmware privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
+	// ALLOC-OK: as above
+	kernel_ep.send(Message::new(b"FIRMWARE".to_vec(), alloc::vec![firmware])).map_err(|_| "failed to hand SystemManager the firmware privilege")?;
 	Ok((kernel_ep, process))
 }
 
@@ -1237,7 +1251,7 @@ fn init_extended_config(bi: &'static BootInfo) {
 // nowhere - and either way the slot is still read on the idle pass, so a machine that arms nothing
 // notices an arrival a pass later rather than not at all.
 #[cfg(not(test))]
-fn arm_hot_plug_interrupts() {
+pub(crate) fn arm_hot_plug_interrupts() {
 	let mut ports: [Option<arch::pci::HotPlugPort>; arch::pci::MAX_HOT_PLUG_PORTS] = [None; arch::pci::MAX_HOT_PLUG_PORTS];
 	let count = arch::pci::hot_plug_ports(&mut ports);
 	for port in ports.iter().take(count).flatten() {

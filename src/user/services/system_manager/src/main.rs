@@ -118,6 +118,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		root_selection.copy_from_slice(&buf[7..31]);
 	}
 
+	// 1g. the firmware interpreter's privilege, relayed down like the console capabilities: this process holds it
+	//     only to pass it on. Zero when the kernel sent none.
+	let firmware: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"FIRMWARE" => handle,
+		_ => 0,
+	};
+
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
@@ -197,6 +204,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		root_msg[..7].copy_from_slice(b"ROOTSEL");
 		root_msg[7..].copy_from_slice(&root_selection);
 		send_blocking(sm_side, &root_msg, 0);
+		// The firmware privilege, last, in the position it arrived in - sent carrying none when none came.
+		send_blocking(sm_side, b"FIRMWARE", firmware);
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's

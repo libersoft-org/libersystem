@@ -1,0 +1,21 @@
+[package]
+name = "acpi-model"
+edition = "2024"
+description = "The ACPI service's decisions: what each namespace node is, the row it is reported as, the handshakes, the node channel's admission and the event methods"
+
+# THE DECISIONS AND NOTHING THAT REACHES THE RUNTIME. The ACPI service links this and makes the syscalls; a host test
+# runs every decision against scripted namespaces - the interpreter is `aml`, and the report the kernel reads is
+# `platform`'s - because the runtime and `std` both define `panic_impl`.
+[dependencies]
+abi = { path = "../../../../abi" }
+aml = { path = "../../../../aml" }
+platform = { path = "../../../../platform" }
+
+[dev-dependencies]
+# The interpreter's encoder and its host made of maps, for the scripted namespaces the suites run.
+aml = { path = "../../../../aml", features = ["testing"] }
+
+# A WARNING IS AN ERROR HERE, as in every crate of this tree that states it: `[lints]` rather than `RUSTFLAGS`, so the
+# denial is this package's alone and not `build-std`'s.
+[lints.rust]
+warnings = "deny"

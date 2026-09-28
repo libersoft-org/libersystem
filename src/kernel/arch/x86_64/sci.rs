@@ -22,9 +22,16 @@
 // EVENT on `platform_event`'s channel. What acts on the event is somebody else's, and holds no
 // authority over this register.
 //
-// **WHAT IT DOES NOT DO.** It arms no general-purpose event, enters no sleep state and touches
-// neither the PM timer nor the reset register. GPEs are AML's - a GPE's meaning is a control method
-// in a namespace this kernel does not have - and the rest are their own items.
+// **GENERAL-PURPOSE EVENTS ARE SPLIT WITH THE ACPI SERVICE.** A GPE's meaning is a control method in a
+// namespace this kernel does not have, so the kernel keeps the registers - the FADT's GPE0 and GPE1 blocks - and
+// the service keeps the meaning: at init every enable bit is cleared and every status bit acknowledged before the
+// SCI is routed; in the handler each asserted ENABLED event is masked and its number latched for the service, whose
+// event channel `firmware::deliver` feeds from the idle pass; an event is enabled again only when the service has
+// run its `_Lxx` or `_Exx` and asks. Storms are per event (`acpi::gpe`). PM1's `GBL_STS` - the firmware released the
+// global lock the service waits on - is decoded and delivered the same way.
+//
+// **WHAT IT DOES NOT DO.** It enters no sleep state and touches neither the PM timer nor the reset register - those
+// are their own items.
 
 use acpi::{Fadt, Madt, Polarity, Trigger};
 
@@ -40,6 +47,8 @@ struct Blocks {
 	/// PM1b's, on the machines that have a second block. Most do not.
 	b_status: Option<u16>,
 	b_enable: Option<u16>,
+	/// The GSI the SCI arrives at, which a storm masks.
+	gsi: u32,
 }
 
 static BLOCKS: SpinLock<Option<Blocks>> = SpinLock::new(None);
@@ -48,6 +57,34 @@ static BLOCKS: SpinLock<Option<Blocks>> = SpinLock::new(None);
 /// "acknowledge what was enabled" expressible at all.
 const PWRBTN: u16 = 1 << 8;
 const SLPBTN: u16 = 1 << 9;
+/// The firmware released the global lock while this system's pending bit was set: the waiter tries again.
+const GBL: u16 = 1 << 5;
+
+/// THE GENERAL-PURPOSE EVENT BLOCKS, as the port of each block's status half: its enable half follows it.
+struct GpeIo {
+	status: [u16; 2],
+}
+
+impl acpi::gpe::Registers for GpeIo {
+	fn read(&mut self, block: usize, offset: u16) -> u8 {
+		// SAFETY: a byte of the FADT's GPE block, which the kernel alone drives.
+		unsafe { port::inb(self.status[block] + offset) }
+	}
+
+	fn write(&mut self, block: usize, offset: u16, value: u8) {
+		// SAFETY: as above.
+		unsafe { port::outb(self.status[block] + offset, value) }
+	}
+}
+
+static GPES: SpinLock<Option<(acpi::gpe::Gpes, GpeIo)>> = SpinLock::new(None);
+
+/// THE EVENTS THE HANDLER LATCHED FOR THE SERVICE, as bitmaps over the event number: delivered on the idle pass,
+/// never from the handler (see `platform_event::report`). A latched event is masked until the service asks, so
+/// each number is pending at most once.
+const MAX_GPES: usize = 1024;
+static PENDING: SpinLock<([u64; MAX_GPES / 64], [u64; MAX_GPES / 64])> = SpinLock::new(([0; MAX_GPES / 64], [0; MAX_GPES / 64]));
+static GLOBAL_LOCK_RELEASED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// PM1 control bit 0: the machine is in ACPI mode and events arrive as an SCI rather than an SMI.
 const SCI_EN: u16 = 1;
@@ -125,7 +162,11 @@ pub fn init(rsdp_phys: u64) {
 		},
 		None => (None, None),
 	};
-	let blocks = Blocks { a_status: a, a_enable, b_status, b_enable };
+	// THE SCI'S GSI, resolved before the blocks are stored so a storm can mask it.
+	let gsi = sci_gsi(&fadt, rsdp_phys).map_or(u32::MAX, |(gsi, _)| gsi);
+	let blocks = Blocks { a_status: a, a_enable, b_status, b_enable, gsi };
+	// THE GLOBAL LOCK'S EVENT ARMED WITH THE BUTTONS where the firmware has a FACS to hold the lock in.
+	let armed = if fadt.facs().is_some() { PWRBTN | SLPBTN | GBL } else { PWRBTN | SLPBTN };
 
 	// **THE ORDER OF THE FOUR STEPS BELOW IS THE WHOLE OF WHAT CAN GO WRONG HERE**, and each pair of
 	// them is wrong in a different way round:
@@ -149,22 +190,26 @@ pub fn init(rsdp_phys: u64) {
 	enter_acpi_mode(&fadt);
 	*BLOCKS.lock() = Some(blocks);
 	unsafe {
-		port::outw(blocks.a_status, PWRBTN | SLPBTN);
+		port::outw(blocks.a_status, armed);
 		if let Some(b) = blocks.b_status {
-			port::outw(b, PWRBTN | SLPBTN);
+			port::outw(b, armed);
 		}
 	}
+	// AND THE GENERAL-PURPOSE EVENT BLOCKS, BEFORE THE SCI IS ROUTED: every enable bit cleared and every status bit
+	// acknowledged, so an event the firmware left enabled cannot raise the line before its owner exists.
+	init_gpes(&fadt);
 	let Some(vector) = route_sci_with_handler(&fadt, rsdp_phys) else {
 		// NOTHING IS ARMED AND NOTHING IS LISTENING. The blocks are dropped so the handler - which
 		// is registered on no vector here - could not act on a machine whose SCI this kernel
 		// declined to route.
 		*BLOCKS.lock() = None;
+		*GPES.lock() = None;
 		return;
 	};
 	unsafe {
-		port::outw(blocks.a_enable, PWRBTN | SLPBTN);
+		port::outw(blocks.a_enable, armed);
 		if let Some(b) = blocks.b_enable {
-			port::outw(b, PWRBTN | SLPBTN);
+			port::outw(b, armed);
 		}
 	}
 	crate::serial_println!("acpi: power and sleep buttons armed on PM1 status {a:#06x}, enable {a_enable:#06x}, vector {vector}");
@@ -203,6 +248,63 @@ fn enter_acpi_mode(fadt: &Fadt<'_>) {
 		core::hint::spin_loop();
 	}
 	crate::serial_println!("acpi: the machine did not enter ACPI mode after the SMI command - fixed-hardware events may not arrive");
+}
+
+/// THE FADT'S GPE BLOCKS, taken over: each a status half and an enable half of the declared length, in system I/O -
+/// a block in any other space, or of an odd length, is refused and said.
+fn init_gpes(fadt: &Fadt<'_>) {
+	let mut layouts = [acpi::gpe::Layout { half_bytes: 0, base: 0 }; 2];
+	let mut io = GpeIo { status: [0; 2] };
+	let mut count = 0usize;
+	for (name, block) in [("GPE0", fadt.gpe0()), ("GPE1", fadt.gpe1())] {
+		let Some(block) = block else { continue };
+		let Some(status) = block.block.io_port() else {
+			crate::serial_println!("acpi: the {name} block is not a system-I/O register block - its events are not handled");
+			continue;
+		};
+		let bytes = block.block.declared_bytes as u16;
+		if bytes < 2 || bytes % 2 != 0 {
+			crate::serial_println!("acpi: the {name} block declares {bytes} byte(s), which is not two halves - its events are not handled");
+			continue;
+		}
+		if block.base as usize + 4 * bytes as usize > MAX_GPES {
+			crate::serial_println!("acpi: the {name} block numbers events past {MAX_GPES} - its events are not handled");
+			continue;
+		}
+		layouts[count] = acpi::gpe::Layout { half_bytes: bytes / 2, base: block.base };
+		io.status[count] = status;
+		count += 1;
+	}
+	if count == 0 {
+		return;
+	}
+	let mut gpes = acpi::gpe::Gpes::new(&layouts[..count]);
+	gpes.initialize(&mut io);
+	crate::serial_println!("acpi: {} general-purpose event(s) in {count} block(s), every one disabled until the ACPI service enables it", gpes.len());
+	*GPES.lock() = Some((gpes, io));
+}
+
+/// The GSI the SCI arrives at, and the trigger and polarity it has there - see `route_sci_with_handler`.
+fn sci_gsi(fadt: &Fadt<'_>, rsdp_phys: u64) -> Option<(u32, super::ioapic::Kind)> {
+	let source = u8::try_from(fadt.sci_interrupt()?).ok()?;
+	let mut gsi = source as u32;
+	let mut kind = super::ioapic::Kind::LevelLow;
+	if let Some(bytes) = crate::smp::acpi_table(rsdp_phys, b"APIC")
+		&& let Ok(madt) = Madt::new(bytes)
+		&& let Some(entry) = madt.isa_override(source)
+	{
+		gsi = entry.gsi;
+		kind = match (entry.polarity, entry.trigger) {
+			(Polarity::ActiveHigh, Trigger::Edge) => super::ioapic::Kind::IsaEdge,
+			_ => super::ioapic::Kind::LevelLow,
+		};
+	}
+	Some((gsi, kind))
+}
+
+/// The SCI's line number, for the `_CRS` check that no namespace device takes a line the kernel uses.
+pub fn sci_line() -> Option<u32> {
+	BLOCKS.lock().map(|blocks| blocks.gsi).filter(|gsi| *gsi != u32::MAX)
 }
 
 /// Route the SCI and return the vector it lands on.
@@ -274,7 +376,7 @@ fn handle(_vector: u32) {
 		// A STATUS REGISTER IS ACKNOWLEDGED BY WRITING BACK THE BITS THAT WERE SET, and only those.
 		// Writing ones everywhere would acknowledge events this kernel did not decode - a wake
 		// status, a timer rollover - and their owners would never see them.
-		let raised = unsafe { port::inw(status) } & (PWRBTN | SLPBTN);
+		let raised = unsafe { port::inw(status) } & (PWRBTN | SLPBTN | GBL);
 		if raised != 0 {
 			unsafe { port::outw(status, raised) };
 			seen |= raised;
@@ -294,6 +396,22 @@ fn handle(_vector: u32) {
 	if seen & SLPBTN != 0 {
 		crate::serial_println!("acpi: the sleep button was pressed");
 		crate::platform_event::report(crate::platform_event::SLEEP_BUTTON);
+	}
+	if seen & GBL != 0 {
+		GLOBAL_LOCK_RELEASED.store(true, core::sync::atomic::Ordering::Release);
+	}
+	// AND THE GENERAL-PURPOSE EVENTS: each asserted enabled one masked and latched for the service.
+	if let Some((gpes, io)) = GPES.lock().as_mut() {
+		let mut pending = PENDING.lock();
+		gpes.handle_into(io, super::apic::ticks(), &mut |gpe, storm| {
+			let (word, bit) = (gpe as usize / 64, gpe as usize % 64);
+			if storm {
+				pending.1[word] |= 1 << bit;
+			} else {
+				pending.0[word] |= 1 << bit;
+			}
+			seen |= 1 << 15;
+		});
 	}
 	// NOTHING THIS HANDLER KNOWS ABOUT WAS SET, WHICH IS THE DANGEROUS CASE. The line is shared, so
 	// an interrupt that decodes to nothing is ordinary once - another source on the same pin - and
@@ -326,6 +444,73 @@ fn storm(blocks: Blocks) {
 			port::outw(b, 0);
 		}
 	}
+	// AND THE REDIRECTION ENTRY MASKED, as the comment above always said: a source still asserted on the pin - one no
+	// enable register here controls - would otherwise keep raising the line with nothing left to decode it.
+	if blocks.gsi != u32::MAX {
+		super::ioapic::mask(blocks.gsi);
+	}
 	*BLOCKS.lock() = None;
-	crate::serial_println!("acpi: the SCI raised {STORM_LIMIT} interrupts this kernel could not account for in one window - it is disarmed, and fixed-hardware events stop here");
+	crate::serial_println!("acpi: the SCI raised {STORM_LIMIT} interrupts this kernel could not account for in one window - it is disarmed and its line masked, and fixed-hardware and general-purpose events stop here");
+}
+
+/// THE SERVICE'S REQUESTS on one event - see `abi::SYS_FIRMWARE_GPE`.
+pub fn gpe_request(operation: u64, gpe: u64) -> i64 {
+	let mut held = GPES.lock();
+	let Some((gpes, io)) = held.as_mut() else { return abi::ERR_UNSUPPORTED };
+	if operation == abi::GPE_COUNT {
+		return gpes.len() as i64;
+	}
+	let Ok(gpe) = u16::try_from(gpe) else { return abi::ERR_INVALID };
+	let result = match operation {
+		abi::GPE_ENABLE => gpes.set_runtime(io, gpe, true),
+		abi::GPE_DISABLE => gpes.set_runtime(io, gpe, false),
+		abi::GPE_WAKE_SET => gpes.set_wake(gpe, true),
+		abi::GPE_WAKE_CLEAR => gpes.set_wake(gpe, false),
+		abi::GPE_ACKNOWLEDGE => gpes.acknowledge(io, gpe),
+		abi::GPE_REARM => gpes.rearm(io, gpe),
+		_ => return abi::ERR_INVALID,
+	};
+	match result {
+		Ok(()) => 0,
+		Err(acpi::gpe::Refusal::NoSuchEvent) => abi::ERR_INVALID,
+		Err(acpi::gpe::Refusal::Stormed) | Err(acpi::gpe::Refusal::NotRuntime) => abi::ERR_ACCESS_DENIED,
+	}
+}
+
+/// THE INSTANCE THAT ENABLED THEM ENDED: every runtime event disabled and every latch dropped, and what it had not
+/// yet been told dropped with it - the next instance enables what its own namespace handles.
+pub fn gpe_instance_ended() {
+	if let Some((gpes, io)) = GPES.lock().as_mut() {
+		gpes.reset_runtime(io);
+	}
+	let mut pending = PENDING.lock();
+	pending.0 = [0; MAX_GPES / 64];
+	GLOBAL_LOCK_RELEASED.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Hand every latched event to `out` - (`abi::FIRMWARE_EVENT_*`, the event's number) - and forget it. Called from
+/// the idle pass; a storm is said on the console as it is handed on.
+pub fn take_events(out: &mut dyn FnMut(u8, u16)) {
+	let (delivered, stormed) = {
+		let mut pending = PENDING.lock();
+		let taken = *pending;
+		*pending = ([0; MAX_GPES / 64], [0; MAX_GPES / 64]);
+		taken
+	};
+	for (words, kind) in [(stormed, abi::FIRMWARE_EVENT_STORM), (delivered, abi::FIRMWARE_EVENT_GPE)] {
+		for (word, bits) in words.iter().enumerate() {
+			for bit in 0..64 {
+				if bits & 1 << bit != 0 {
+					let gpe = (word * 64 + bit) as u16;
+					if kind == abi::FIRMWARE_EVENT_STORM {
+						crate::serial_println!("acpi: general-purpose event {gpe:#04x} asserted past its bound within one window - left disabled for the rest of the boot, every other event unaffected");
+					}
+					out(kind, gpe);
+				}
+			}
+		}
+	}
+	if GLOBAL_LOCK_RELEASED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+		out(abi::FIRMWARE_EVENT_GLOBAL_LOCK, 0);
+	}
 }

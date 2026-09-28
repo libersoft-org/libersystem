@@ -97,7 +97,7 @@ mod tco {
 	pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let (bind, resources) = common::handshake(bootstrap);
 		let unusable = driver_protocol::DriverFailureCode::ResourceUnusable;
-		let block = (0..bind.info.port_count as usize).map(|at| bind.info.ports[at]).find(|port| port.source == abi::PORT_SOURCE_DERIVED && port.len == 32);
+		let block = (0..bind.info.port_count as usize).map(|at| bind.info.ports[at]).find(|port| port.source == rt::PORT_SOURCE_DERIVED && port.len == 32);
 		let (Some(block), true) = (block, resources.registers != 0 && resources.port_range_count != 0) else {
 			print(b"driver.tco: it was not handed the TCO block and GCS\n");
 			common::failed(bootstrap, &bind, unusable)

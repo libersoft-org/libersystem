@@ -147,6 +147,9 @@ pub fn init() {
 	// WHAT THE FIRMWARE DESCRIBES, read before the table is taken: the architecture's kernel-held set, what
 	// its static tables name and every device node of its tree, in the order they are published.
 	let described = crate::arch::platform::describe();
+	// EVERY BAR AND WINDOW THE BUS DECODES, sized now - before any driver holds a function - for the checks every
+	// platform row and every firmware region is held to.
+	crate::firmware::record_decoded(crate::arch::pci::decoded_ranges());
 	let mut functions = PCI_FUNCTIONS.lock();
 	functions.clear();
 	for p in crate::arch::pci::scan() {
@@ -269,7 +272,7 @@ fn forbidden_ranges(table: &[DeviceEntry]) -> Vec<(u64, u64)> {
 	let mut ranges = Vec::new();
 	for index in 0..crate::mem::memmap_len() {
 		let Some(region) = crate::mem::memmap_get(index) else { continue };
-		if region.kind != abi::MEMMAP_RESERVED && region.length != 0 {
+		if region.kind != abi::MEMMAP_RESERVED && region.kind != abi::MEMMAP_MMIO && region.length != 0 {
 			// ALLOC-OK: built once at boot, one row per memory-map region and per resolved BAR.
 			ranges.push((region.base, region.length));
 		}
@@ -278,6 +281,9 @@ fn forbidden_ranges(table: &[DeviceEntry]) -> Vec<(u64, u64)> {
 		// ALLOC-OK: as above.
 		ranges.push((entry.bar_phys, entry.bar_len));
 	}
+	// AND EVERY BAR AND BRIDGE WINDOW THE BUS DECODES, which the boot scan recorded for every function - a function
+	// outside the resolved families has a row with no BAR, and its BAR is no less the function's.
+	crate::firmware::decoded_ranges(&mut |base, len| ranges.push((base, len)));
 	ranges
 }
 
@@ -344,11 +350,8 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 		}
 		platform::Placement::New => {
 			let index = table.len();
-			let (bar_phys, bar_len) = description.part.mmio().first().map_or((0, 0), |range| (range.base, range.len));
-			let mut part = description.part;
-			part.properties_len = properties.len() as u32;
 			// ALLOC-OK: the device inventory is built once at boot from what the firmware describes.
-			table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys, bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(alloc::boxed::Box::new(PlatformRow { part, properties })) });
+			table.push(platform_entry(&description, properties));
 			// ITS SYSTEM-MEMORY REGISTERS, declared rather than mapped - each refused, and said, where it lies over
 			// something no platform row may own.
 			let mut declared: Vec<crate::declared::Register> = Vec::new();
@@ -367,6 +370,14 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 			Some(index)
 		}
 	}
+}
+
+// A platform description as a row of the table.
+fn platform_entry(description: &platform::Description, properties: Vec<u8>) -> DeviceEntry {
+	let (bar_phys, bar_len) = description.part.mmio().first().map_or((0, 0), |range| (range.base, range.len));
+	let mut part = description.part;
+	part.properties_len = properties.len() as u32;
+	DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys, bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(alloc::boxed::Box::new(PlatformRow { part, properties })) }
 }
 
 // The number of discovered devices.
@@ -480,7 +491,7 @@ pub fn attach_events(channel: alloc::sync::Arc<crate::object::channel::Channel>)
 /// short heap: the send is fallible and so is the message, exactly as the console's input is. What
 /// makes this recoverable is that the INVENTORY is the truth and the event is the prompt - a manager
 /// that missed one and later has reason to look finds the same answer.
-fn report(kind: u8, index: usize) {
+pub(crate) fn report(kind: u8, index: usize) {
 	// ALLOC-OK: an `Option<Arc<Channel>>` out of the guard - a refcount bump, not a copy. Taken out
 	// of the lock because the send below must not run under it.
 	let channel = DEVICE_EVENTS.lock().clone();
@@ -727,7 +738,16 @@ pub fn with<R>(index: usize, f: impl FnOnce(&DeviceEntry) -> R) -> Option<R> {
 // THE WHOLE RECORD `SYS_DEVICE_INFO` ANSWERS for one row: a PCI function's resolved layout and identity,
 // or a platform row's description in its platform part.
 pub fn info(index: usize) -> Option<abi::DeviceInfo> {
-	with(index, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, transport: d.transport, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad0: 0, _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: d.platform.as_ref().map_or_else(abi::PlatformPart::default, |row| row.part) })
+	with(index, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, transport: d.transport, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad0: 0, _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports, platform: d.platform.as_ref().map_or_else(|| pci_part(d), |row| row.part) })
+}
+
+// A PCI FUNCTION'S PART: no description of its own, and FIRMWARE-HELD when the ACPI service's regions hold it.
+fn pci_part(entry: &DeviceEntry) -> abi::PlatformPart {
+	let mut part = abi::PlatformPart::default();
+	if crate::firmware::firmware_held(entry.bus, entry.dev, entry.func) {
+		part.state = abi::PLATFORM_STATE_FIRMWARE_HELD;
+	}
+	part
 }
 
 // What the binding predicates read of a row: a PCI function's identity, or a platform row's match ids.
@@ -838,6 +858,9 @@ pub enum ClaimError {
 	// The key names a generation that is no longer current: it belongs to a PREVIOUS binding of this
 	// device, and applying it would reach whoever holds the device now.
 	Stale,
+	// A firmware table drives this function instead - the ICH9 LPC bridge on a machine with a WDAT. For the rest of
+	// the boot, and not a DMA-policy refusal.
+	FirmwareDriven,
 }
 
 struct ClaimSlot {
@@ -1053,6 +1076,17 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 			return Err(ClaimError::Refused);
 		}
 	}
+	// A ROW THE NAMESPACE'S WALK WITHDREW is a device that left: nothing is claimed on it until a walk reports it again.
+	if entry.platform.is_some() && !entry.on_bus {
+		crate::serial_println!("device: {index} was withdrawn by the firmware's namespace and is not claimable until it is reported again");
+		return Err(ClaimError::Refused);
+	}
+	// WHAT THE FIRMWARE'S INTERPRETER HOLDS: a function its regions made firmware-held, and any range another node's
+	// region maps - refused whichever came first, and said.
+	if let Some(reason) = crate::firmware::claim_refusal(entry) {
+		crate::serial_println!("device: {index} is not claimed - {reason}");
+		return Err(ClaimError::FirmwareDriven);
+	}
 	// A FUNCTION A FIRMWARE TABLE DRIVES INSTEAD is not claimed: the ICH9 LPC bridge on a machine with a WDAT, whose
 	// TCO the WDAT names - its row is not applied, and a TCO driver bound to it would hold a timer the ACPI watchdog
 	// arms.
@@ -1061,7 +1095,7 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 		&& crate::declared::suppressed(row)
 	{
 		crate::serial_println!("device: {index} ({}) is driven through a firmware table on this machine and is not claimable", row.name);
-		return Err(ClaimError::Refused);
+		return Err(ClaimError::FirmwareDriven);
 	}
 	let found = discovered(entry);
 	let (admission, policy) = match crate::dma_policy::admit(entry_name, &found, entry.device_type) {
@@ -1234,6 +1268,59 @@ pub fn console_holder() -> Option<alloc::sync::Arc<crate::object::process::Proce
 	};
 	let derived: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()).collect();
 	derived.iter().filter_map(|weak| weak.upgrade()).find_map(|object| object.as_any().downcast_ref::<crate::object::port_range::PortRange>().and_then(|range| range.holder()))
+}
+
+// THE PROCESS HOLDING A CLAIMED PCI FUNCTION'S BAR - the one its claim's window is mapped into - for the development
+// request that kills a driver the way DeviceManager's SIG_KILL does. The first function of that vendor and device
+// whose claim is held.
+#[cfg(liber_development)]
+pub fn bar_holder(vendor: u16, product: u16) -> Option<alloc::sync::Arc<crate::object::process::Process>> {
+	let rows: Vec<usize> = DEVICES.lock().iter().enumerate().filter(|(_, entry)| entry.vendor == vendor && entry.product == product).map(|(index, _)| index).collect();
+	for index in rows {
+		let key = {
+			let claims = CLAIMS.lock();
+			let Some(slot) = claims.get(index) else { continue };
+			if slot.state != ClaimState::Claimed {
+				continue;
+			}
+			abi::ClaimKey { device_index: index as u32, _pad: 0, generation: slot.generation }
+		};
+		let derived: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()).collect();
+		let space = derived.iter().filter_map(|weak| weak.upgrade()).find_map(|object| object.as_any().downcast_ref::<crate::object::device_memory::DeviceMemory>().and_then(|memory| memory.mapped_space()));
+		if let Some(space) = space {
+			return process_in(&crate::sched::root_domain(), &space);
+		}
+	}
+	None
+}
+
+// The process whose address space is `space`, anywhere under `domain`.
+#[cfg(liber_development)]
+fn process_in(domain: &alloc::sync::Arc<crate::object::domain::Domain>, space: &alloc::sync::Arc<crate::object::address_space::AddressSpace>) -> Option<alloc::sync::Arc<crate::object::process::Process>> {
+	let mut at = 0usize;
+	loop {
+		let mut batch: [Option<alloc::sync::Arc<crate::object::process::Process>>; 8] = Default::default();
+		let (written, next) = domain.processes_from(at, &mut batch);
+		if let Some(found) = batch[..written].iter().flatten().find(|process| alloc::sync::Arc::ptr_eq(process.address_space(), space)) {
+			return Some(found.clone());
+		}
+		if written == 0 {
+			break;
+		}
+		at = next;
+	}
+	let mut at = 0usize;
+	loop {
+		let mut batch: [Option<alloc::sync::Arc<crate::object::domain::Domain>>; 8] = Default::default();
+		let (written, next) = domain.children_from(at, &mut batch);
+		if let Some(found) = batch[..written].iter().flatten().find_map(|child| process_in(child, space)) {
+			return Some(found);
+		}
+		if written == 0 {
+			return None;
+		}
+		at = next;
+	}
 }
 
 // A RELEASED CONSOLE CLAIM GIVES THE UART BACK TO THE KERNEL - after its port range, line and tap were revoked
@@ -1677,6 +1764,174 @@ pub fn disable_bus_master_for(key: abi::ClaimKey) {
 // are as distinguishable as two real ones. `on_bus: false` is still what keeps config space out of
 // reach - the address was never what did that.
 // A SYNTHETIC ROW CARRYING PORT RESOURCES, for the port-range tests: (base, length, source) each. Recorded
+// ------------------------------------------------------------------- the namespace's rows
+//
+// WHAT THE ACPI SERVICE'S WALK REPORTS, published while the machine runs: `firmware` decodes the report and keeps
+// the bookkeeping, and these are the table operations - under the table's lock and the claims', in that order, with
+// the firmware state taken inside them when it is needed.
+
+// The table as the firmware policy reads it, under both locks.
+pub(crate) struct Tables<'a> {
+	rows: &'a [DeviceEntry],
+	claims: &'a [ClaimSlot],
+}
+
+impl Tables<'_> {
+	pub fn rows(&self) -> &[DeviceEntry] {
+		self.rows
+	}
+
+	// Whether a driver holds row `index`: claimed, releasing, or quarantined with its teardown unanswered.
+	pub fn driver_held(&self, index: usize) -> bool {
+		self.claims.get(index).is_some_and(|slot| slot.state != ClaimState::Free)
+	}
+
+	// The PCI function's row at `bus:dev.func`, on the bus.
+	pub fn function_row(&self, bus: u8, dev: u8, func: u8) -> Option<usize> {
+		self.rows.iter().position(|entry| entry.is_function(bus, dev, func) && entry.on_bus)
+	}
+}
+
+pub(crate) fn with_tables<R>(f: impl FnOnce(&Tables<'_>) -> R) -> R {
+	let table = DEVICES.lock();
+	let claims = CLAIMS.lock();
+	f(&Tables { rows: &table, claims: &claims })
+}
+
+// What one namespace report came to.
+pub(crate) enum Published {
+	// The row a live identity already had: nothing changes and no event is sent.
+	Same(usize),
+	// A new row, or a withdrawn one refilled: an arrival has been sent.
+	Arrived(usize),
+	// Merged into an earlier row; the ids it added, so a withdrawal can take them out again.
+	Merged(usize, Vec<abi::MatchId>),
+}
+
+// PUBLISH WHAT THE WALK REPORTED, RECONCILED BY IDENTITY: the same row for an identity a live row carries, a
+// withdrawn row refilled with a new generation and an arrival, and otherwise placed as any description is - a
+// RESERVATION as a row of its own, never merged, and every other row kept out of the reservations' ranges and held
+// to `admit` (the `_CRS` policy) before it becomes a row; a merged description adds no resource, so neither refuses
+// it. `targets` join each connection to its controller's row once the row exists; `companion_function` answers the
+// PCI function a companion node's identity names. Answers what it came to, or the refusal in words.
+pub(crate) fn publish_namespace(description: platform::Description, properties: Vec<u8>, targets: &[(u8, Vec<u8>)], admit: impl Fn(&Tables<'_>, &platform::Description) -> Result<(), alloc::string::String>, companion_function: impl Fn(&[u8]) -> Option<(u8, u8, u8)>) -> Result<Published, alloc::string::String> {
+	use alloc::format;
+	let name = alloc::string::String::from_utf8_lossy(description.identity()).into_owned();
+	let mut table = DEVICES.lock();
+	let mut claims = CLAIMS.lock();
+	let decided = {
+		let states: Vec<Option<platform::policy::RowState<'_>>> = table.iter().map(|entry| entry.platform.as_ref().map(|row| platform::policy::RowState { part: &row.part, withdrawn: !entry.on_bus })).collect();
+		platform::policy::reconcile(&states, &description)
+	};
+	let reservation = description.part.state == abi::PLATFORM_STATE_RESERVATION;
+	let index = match decided {
+		platform::policy::Reconcile::Same { row, differs } => {
+			if differs {
+				crate::serial_println!("device: {name} is reported again unlike row {row} was published - the row keeps what it was published with");
+			}
+			return Ok(Published::Same(row));
+		}
+		platform::policy::Reconcile::Refill(row) => {
+			if claims.get(row).is_some_and(|slot| slot.state != ClaimState::Free) {
+				return Err(format!("row {row} is still held by the binding its withdrawal ended - reported again once released"));
+			}
+			if !reservation {
+				admit(&Tables { rows: &table, claims: &claims }, &description)?;
+			}
+			table[row] = platform_entry(&description, properties);
+			let generation = claims.get(row).map_or(0, |slot| slot.generation).wrapping_add(1);
+			if let Some(slot) = claims.get_mut(row) {
+				*slot = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 };
+			}
+			row
+		}
+		platform::policy::Reconcile::Place => {
+			if !reservation {
+				// PLACED AGAINST THE LIVE ROWS THAT ARE NOT RESERVATIONS: a reservation is never merged into.
+				let placement = {
+					let views: Vec<platform::RowView<'_>> = table.iter().map(|entry| entry.platform.as_ref().filter(|row| entry.on_bus && row.part.state != abi::PLATFORM_STATE_RESERVATION).map(|row| (&row.part, &entry.ports[..entry.port_count as usize]))).collect();
+					platform::place(&views, &description)
+				};
+				match placement {
+					platform::Placement::Same(row) => return Ok(Published::Same(row)),
+					platform::Placement::Merge(row) => {
+						let Some(held) = table[row].platform.as_mut() else { return Err(format!("row {row} is not a platform row")) };
+						let before = held.part.match_count as usize;
+						if !platform::merge(&mut held.part, &description) {
+							return Err(format!("it describes row {row} again and its ids do not fit beside that row's"));
+						}
+						let added = held.part.match_ids[before..held.part.match_count as usize].to_vec();
+						crate::serial_println!("device: {name} is the device row {row} already names, and is merged into it");
+						return Ok(Published::Merged(row, added));
+					}
+					platform::Placement::Refuse { row, what } => {
+						let other = table[row].platform.as_ref().map(|held| alloc::string::String::from_utf8_lossy(held.part.identity()).into_owned()).unwrap_or_default();
+						return Err(format!("its {} overlap {other} (row {row}) without starting where it does", overlap_name(what)));
+					}
+					platform::Placement::New => {}
+				}
+				admit(&Tables { rows: &table, claims: &claims }, &description)?;
+				// A RESERVATION KEEPS EVERY NEW ROW OUT OF ITS RANGES.
+				for (row, entry) in table.iter().enumerate() {
+					let Some(held) = entry.platform.as_ref().filter(|held| entry.on_bus && held.part.state == abi::PLATFORM_STATE_RESERVATION) else { continue };
+					if platform::policy::reserved_against(&held.part, &entry.ports[..entry.port_count as usize], &description) {
+						return Err(format!("its ranges lie in the reservation {} (row {row})", alloc::string::String::from_utf8_lossy(held.part.identity())));
+					}
+				}
+			}
+			if table.try_reserve(1).is_err() || claims.try_reserve(1).is_err() {
+				return Err(alloc::string::String::from("no memory for a row"));
+			}
+			table.push(platform_entry(&description, properties));
+			claims.push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+			table.len() - 1
+		}
+	};
+	// EACH CONNECTION JOINED TO ITS CONTROLLER'S ROW: a platform row carrying the identity, or the PCI function whose
+	// companion node it names. One no row carries stays unjoined, and says so.
+	for (connection, identity) in targets {
+		let found = table.iter().position(|entry| entry.on_bus && entry.platform.as_ref().is_some_and(|held| held.part.identity() == identity.as_slice())).or_else(|| companion_function(identity).and_then(|(bus, dev, func)| table.iter().position(|entry| entry.is_function(bus, dev, func) && entry.on_bus)));
+		match (found, table[index].platform.as_mut()) {
+			(Some(controller), Some(held)) if (*connection as usize) < held.part.connection_count as usize => held.part.connections[*connection as usize].controller = controller as u32,
+			_ => crate::serial_println!("device: {name} names a controller {} that no row carries - that connection is not joined", alloc::string::String::from_utf8_lossy(identity)),
+		}
+	}
+	drop(claims);
+	drop(table);
+	report(DEVICE_ARRIVED, index);
+	Ok(Published::Arrived(index))
+}
+
+// WITHDRAW the namespace row `identity` names - its own row, on the bus - as a departed PCI function is: the row and
+// its index stay, a departure is sent. Answers the row, or None when no live row of the namespace's carries it.
+pub(crate) fn withdraw_namespace(identity: &[u8]) -> Option<usize> {
+	let index = {
+		let mut table = DEVICES.lock();
+		let index = table.iter().position(|entry| entry.on_bus && entry.platform.as_ref().is_some_and(|held| held.part.source == abi::PLATFORM_SOURCE_ACPI && held.part.identity() == identity))?;
+		table[index].on_bus = false;
+		index
+	};
+	report(DEVICE_DEPARTED, index);
+	Some(index)
+}
+
+// Take the ids a merged namespace description added back out of row `row`: the row a static table or the kernel
+// published keeps its place and loses only what was merged into it.
+pub(crate) fn unmerge(row: usize, ids: &[abi::MatchId]) {
+	let mut table = DEVICES.lock();
+	let Some(held) = table.get_mut(row).and_then(|entry| entry.platform.as_mut()) else { return };
+	let kept: Vec<abi::MatchId> = held.part.match_ids().iter().filter(|id| !ids.iter().any(|gone| gone.kind == id.kind && gone.text() == id.text())).copied().collect();
+	held.part.match_ids = [abi::MatchId::default(); abi::MAX_MATCH_IDS];
+	held.part.match_ids[..kept.len()].copy_from_slice(&kept);
+	held.part.match_count = kept.len() as u8;
+}
+
+// The identities of every live row the namespace published, for the withdrawal at "namespace loaded".
+pub(crate) fn namespace_rows() -> Vec<(usize, Vec<u8>)> {
+	let table = DEVICES.lock();
+	table.iter().enumerate().filter(|(_, entry)| entry.on_bus).filter_map(|(index, entry)| entry.platform.as_ref().filter(|held| held.part.source == abi::PLATFORM_SOURCE_ACPI).map(|held| (index, held.part.identity().to_vec()))).collect()
+}
+
 // WITHOUT the record-time check, so a test can put a reserved or already-granted range on a row and see
 // the MINT refuse it - the check under test is the one every mint makes.
 #[cfg(test)]

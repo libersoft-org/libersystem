@@ -58,6 +58,23 @@ unsafe fn read_reg(reg: u8) -> u8 {
 	}
 }
 
+// ONE CMOS NVRAM BYTE, for the firmware interpreter's `SystemCMOS` regions: under the same lock as every clock read.
+// The caller has checked the index is not the clock's.
+pub fn nvram_read(index: u8) -> u8 {
+	let _held = CMOS.lock();
+	// SAFETY: an index below 0x80, selected and read under the lock.
+	unsafe { read_reg(index) }
+}
+
+pub fn nvram_write(index: u8, value: u8) {
+	let _held = CMOS.lock();
+	// SAFETY: as above; bit 7 of the index port stays clear, so NMI stays enabled.
+	unsafe {
+		outb(0x70, index & 0x7f);
+		outb(0x71, value);
+	}
+}
+
 // Decode a BCD byte (each nibble a decimal digit) to binary.
 fn bcd_to_bin(v: u8) -> u8 {
 	(v & 0x0f) + (v >> 4) * 10

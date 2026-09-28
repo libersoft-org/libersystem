@@ -873,6 +873,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					soonest = rotate_at;
 				}
 			}
+			// THE ACPI SERVICE'S NEWS: a "namespace loaded" report, the node requests it lets this program answer, and the
+			// connections it grants the service. See `acpi_pass`.
+			acpi_pass(&mut nodes, &mut catalogue);
 			// Transitions above can start a new bind/backoff/teardown on this very pass.
 			// Include its deadline before sleeping, even if no existing driver will wake us.
 			soonest = tick_handshakes(&mut nodes, soonest);
@@ -1141,6 +1144,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// The operator endpoint and this program's own ConfigService connection, both
 				// arriving after ConfigService exists - which cannot be at this program's own
 				// bootstrap, because ConfigService depends on the block driver this program binds.
+				// THE ACPI SERVICE'S ADMIN CONNECTION, after each of its starts: the one before it served an instance that ended.
+				Received::Message { len, handle } if len == 4 && &buf[..4] == b"ACPI" => {
+					let old: u64 = ACPI_ADMIN.swap(handle, core::sync::atomic::Ordering::AcqRel);
+					if old != 0 {
+						close(old);
+					}
+					print(b"DeviceManager: the ACPI service's admin connection arrived\n");
+				}
 				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"POLICY" && len < 9 => {
 					policy_service = handle;
 				}
@@ -1371,6 +1382,14 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 // THE TRUSTED KEY SINK'S PRODUCER, which only the physical keyboard drivers are handed - see `begin_bind`.
 // Its consumer goes to InputService's protected path alone, under `TRUSTEDKEYS`.
 static TRUSTED_KEY_PRODUCER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE ACPI SERVICE, as ServiceManager handed it over after the service's start: a connection of its `acpi-admin` root,
+// through which this program asks for node channels and hands over the connections the service holds. Replaced at every
+// relaunch; 0 when there is none.
+static ACPI_ADMIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// AN INSTANCE'S "NAMESPACE LOADED" REPORT not yet acted on - it may arrive before that instance's connection does, and
+// is acted on once both have - and the instance acted on last.
+static ACPI_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ACPI_LOADED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TRUSTED_KEY_CONSUMER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery) {
@@ -2078,6 +2097,10 @@ struct Node {
 	preferred: Option<usize>,
 	// One ordered queue. Two nodes are independent; one node never handles two events at once.
 	queue: BindingQueue,
+	// THE BINDING THAT ASKED FOR ITS FIRMWARE NODE and is not answered yet, by generation (0: none waiting).
+	node_request: u64,
+	// The ACPI instance and binding generation this node's controller connections were last granted for.
+	acpi_granted: (u64, u64),
 	// The heartbeat, armed when this node comes `Online` and only for an entry that declared a
 	// deadline.
 	beat: Heartbeat,
@@ -2225,7 +2248,7 @@ impl Node {
 		// A DEVICE THE FIRMWARE DESCRIBES IS NAMED BY ITS PLATFORM NUMBER - its row - and never by the zero
 		// address it reports, which is the host bridge's.
 		let id = if info.platform.kind == ROW_KIND_PLATFORM { BindingId::platform(index as u32, 0) } else { BindingId::new(info.bus, info.dev, info.func, 0) };
-		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
 	}
 
 	// A manual grant is separate from the automatic count and survives only until one claim.
@@ -2592,6 +2615,205 @@ fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize
 		held.consumers = held.consumers.saturating_add(1);
 	}
 	client
+}
+
+// ---------------------------------------------------------------------------------------------- the ACPI service
+//
+// THE NAMESPACE IS BOUND AS IT ARRIVES: its rows reach this program as arrivals, and no bind round waits for it. What
+// the arrivals cannot say is what the namespace attached to rows already bound - a companion joined to a function that
+// bound before the service existed, and the lines and addresses the service holds through a controller - and that is
+// read at each instance's "namespace loaded" report, once this program also holds that instance's connection.
+
+// What the namespace attached to row `index` (`SYS_DEVICE_NODE`).
+fn firmware_node(index: u64) -> Option<abi::FirmwareNode> {
+	let mut node = abi::FirmwareNode::default();
+	let answer = unsafe { syscall(abi::SYS_DEVICE_NODE, index, &mut node as *mut abi::FirmwareNode as u64, core::mem::size_of::<abi::FirmwareNode>() as u64, 0) } as i64;
+	(answer == 0).then_some(node)
+}
+
+// THE IDENTITY A NODE'S FIRMWARE NODE HAS: a namespace row's own, or its PCI function's companion's path. `None` for a
+// row the namespace describes nothing for.
+fn firmware_identity(node: &Node) -> Option<alloc::string::String> {
+	let part = &node.info.platform;
+	if part.kind == abi::ROW_KIND_PLATFORM {
+		return (part.source == abi::PLATFORM_SOURCE_ACPI).then(|| alloc::string::String::from_utf8_lossy(part.identity()).into_owned());
+	}
+	let attached = firmware_node(node.index)?;
+	(attached.flags & abi::FIRMWARE_NODE_COMPANION != 0).then(|| alloc::string::String::from_utf8_lossy(attached.path()).into_owned())
+}
+
+fn acpi_admin_client() -> Option<proto::system::acpi_admin::Client<ipc_client::ChannelTransport>> {
+	let chan = ACPI_ADMIN.load(core::sync::atomic::Ordering::Acquire);
+	(chan != 0).then(|| proto::system::acpi_admin::Client::with_deadline(ipc_client::ChannelTransport { chan }, clock() + TICKS_PER_SECOND * 2))
+}
+
+// A connection that did not answer is an instance that ended: given up, and the next start's hand-off awaited.
+fn acpi_admin_lost() {
+	let old: u64 = ACPI_ADMIN.swap(0, core::sync::atomic::Ordering::AcqRel);
+	if old != 0 {
+		close(old);
+		print(b"DeviceManager: the ACPI service's connection did not answer - its next instance's is awaited\n");
+	}
+}
+
+fn say_acpi(parts: &[&[u8]]) {
+	print(b"DeviceManager: ");
+	for part in parts {
+		print(part);
+	}
+	print(b"\n");
+}
+
+// ANSWER A DRIVER'S REQUEST FOR ITS NODE: the service's node channel, or word that there is none. False while nothing
+// can be answered yet - no connection, or no namespace loaded.
+fn answer_node_request(node: &mut Node, loaded_now: bool) -> bool {
+	let Some((channel, generation)) = node.binding.as_ref().map(|binding| (binding.channel, node.id.generation)) else { return true };
+	let Some(identity) = firmware_identity(node) else {
+		if !send_frame(channel, driver_protocol::Opcode::NodeAbsent, generation, &[], 0, u32::MAX) {
+			return true;
+		}
+		print(b"DeviceManager: ");
+		print_driver_name(node.driver_name());
+		print(b" asked for its firmware node - the namespace describes none\n");
+		return true;
+	};
+	let Some(mut client) = acpi_admin_client() else { return false };
+	match client.open_node(&identity) {
+		Some(Ok(chan)) => {
+			if !send_frame(channel, driver_protocol::Opcode::Node, generation, &[], chan, u32::MAX) {
+				close(chan);
+				return true;
+			}
+			print(b"DeviceManager: handed ");
+			print_driver_name(node.driver_name());
+			print(b" its node channel (");
+			print(identity.as_bytes());
+			print(if loaded_now { b") at the ACPI service's namespace-loaded report\n" } else { b")\n" });
+			true
+		}
+		Some(Err(proto::system::Error::NotFound)) => {
+			let _ = send_frame(channel, driver_protocol::Opcode::NodeAbsent, generation, &[], 0, u32::MAX);
+			say_acpi(&[b"the ACPI service has no node ", identity.as_bytes(), b" - its driver is told there is none"]);
+			true
+		}
+		Some(Err(_)) => false,
+		None => {
+			acpi_admin_lost();
+			false
+		}
+	}
+}
+
+// THE CONNECTIONS A CONTROLLER'S FIRMWARE NODE LISTS, minted scoped through its published bus provider and handed to the
+// service: each `_AEI` line with its trigger, each line a field reads (for level reads alone) and each address a field
+// reaches.
+#[derive(PartialEq, Eq)]
+enum Granted {
+	// Granted, or nothing to grant.
+	Done,
+	// The controller has not published the bus provider yet: asked again on a later pass.
+	NotYet,
+	// The service could not be reached.
+	Lost,
+}
+
+fn grant_acpi_connections(nodes: &[Node], catalogue: &mut Catalogue, at: usize) -> Granted {
+	let node = &nodes[at];
+	if node.info.platform.kind == abi::ROW_KIND_PLATFORM {
+		return Granted::Done;
+	}
+	let Some(attached) = firmware_node(node.index) else { return Granted::Done };
+	if attached.flags & abi::FIRMWARE_NODE_COMPANION == 0 || attached.aei().len() + attached.field_lines().len() + attached.field_addresses().len() == 0 {
+		return Granted::Done;
+	}
+	let controller = alloc::string::String::from_utf8_lossy(attached.path()).into_owned();
+	let slot_of = |kind: u16| catalogue.entries.iter().position(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind && provider.id.binding.same_function(node.id) && provider.id.binding.generation == node.id.generation));
+	let mut wanted: Vec<(proto::system::AcpiConnectionKind, u32, u16, driver_protocol::Scope)> = Vec::new();
+	for &value in attached.aei() {
+		let trigger = driver_protocol::GpioTrigger::from_u8((value >> 24) as u8).unwrap_or(driver_protocol::GpioTrigger::Both);
+		wanted.push((proto::system::AcpiConnectionKind::EventLine, value & 0xFFFF, driver_protocol::provider::GPIO_LINES, driver_protocol::Scope::GpioLine { line: value & 0xFFFF, trigger }));
+	}
+	for &line in attached.field_lines() {
+		// A LINE `_AEI` ALREADY HOLDS is served on that connection: a controller grants each line once.
+		if attached.aei().iter().any(|value| value & 0xFFFF == line) {
+			continue;
+		}
+		wanted.push((proto::system::AcpiConnectionKind::FieldLine, line, driver_protocol::provider::GPIO_LINES, driver_protocol::Scope::GpioLine { line, trigger: driver_protocol::GpioTrigger::Level }));
+	}
+	for &address in attached.field_addresses() {
+		let Ok(address) = u8::try_from(address) else { continue };
+		wanted.push((proto::system::AcpiConnectionKind::FieldAddress, address as u32, driver_protocol::provider::I2C_BUS, driver_protocol::Scope::I2cAddress(address)));
+	}
+	for (kind, value, provider, scope) in wanted {
+		let Some(slot) = slot_of(provider) else { return Granted::NotYet };
+		let connection = mint_scoped_connection(catalogue, nodes, slot, scope);
+		if connection == 0 {
+			say_acpi(&[b"a connection of ", controller.as_bytes(), b" for the ACPI service could not be minted"]);
+			continue;
+		}
+		let Some(mut client) = acpi_admin_client() else {
+			close(connection);
+			return Granted::Lost;
+		};
+		match client.connection(&controller, &kind, value, connection) {
+			Some(Ok(())) => {}
+			Some(Err(_)) => say_acpi(&[b"the ACPI service refused a connection of ", controller.as_bytes()]),
+			None => {
+				acpi_admin_lost();
+				return Granted::Lost;
+			}
+		}
+	}
+	let mut line = [0u8; 20];
+	let n = decimal((attached.aei().len() + attached.field_lines().len() + attached.field_addresses().len()) as u64, &mut line);
+	say_acpi(&[b"granted the ACPI service ", &line[..n], b" connection(s) of ", controller.as_bytes()]);
+	Granted::Done
+}
+
+// ONE PASS: a new "namespace loaded" report acted on once this program holds a connection; every live binding that asked
+// for its node answered; every controller's connections granted to the running instance - at the report, and for a
+// controller bound after it, when it is.
+fn acpi_pass(nodes: &mut [Node], catalogue: &mut Catalogue) {
+	if ACPI_ADMIN.load(core::sync::atomic::Ordering::Acquire) == 0 {
+		return;
+	}
+	let report: u64 = ACPI_REPORT.swap(0, core::sync::atomic::Ordering::AcqRel);
+	let loaded_now = report != 0;
+	if loaded_now {
+		ACPI_LOADED.store(report, core::sync::atomic::Ordering::Release);
+		let mut line = [0u8; 20];
+		let n = decimal(report, &mut line);
+		say_acpi(&[b"the ACPI service's instance ", &line[..n], b" loaded its namespace - reading the rows of every live binding again"]);
+	}
+	let loaded: u64 = ACPI_LOADED.load(core::sync::atomic::Ordering::Acquire);
+	if loaded == 0 {
+		return;
+	}
+	for at in 0..nodes.len() {
+		let live = nodes[at].binding.is_some() && nodes[at].record.state == BindingState::Online;
+		if !live {
+			continue;
+		}
+		let generation = nodes[at].id.generation;
+		if nodes[at].node_request != 0 && nodes[at].node_request == generation {
+			if !answer_node_request(&mut nodes[at], loaded_now) {
+				if ACPI_ADMIN.load(core::sync::atomic::Ordering::Acquire) == 0 {
+					// The instance is gone; its successor's report will be acted on.
+					ACPI_REPORT.store(0, core::sync::atomic::Ordering::Release);
+					return;
+				}
+				continue;
+			}
+			nodes[at].node_request = 0;
+		}
+		if nodes[at].acpi_granted != (loaded, generation) {
+			match grant_acpi_connections(nodes, catalogue, at) {
+				Granted::Done => nodes[at].acpi_granted = (loaded, generation),
+				Granted::NotYet => {}
+				Granted::Lost => return,
+			}
+		}
+	}
 }
 
 // One provider, as the wire describes it. `live` is what tells a publication from a withdrawal.
@@ -3629,8 +3851,13 @@ fn drain_frames(node: &mut Node, buf: &mut [u8]) {
 					node.push(BindingEvent::Disconnected { generation, token });
 				}
 			}
+			// THE DRIVER ASKS FOR ITS FIRMWARE NODE. Answered by `acpi_pass` when it can be - at once, or at the ACPI
+			// service's "namespace loaded" report.
+			driver_protocol::Opcode::NodeRequest => {
+				node.node_request = generation;
+			}
 			// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
-			driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
+			driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource | driver_protocol::Opcode::Node | driver_protocol::Opcode::NodeAbsent => refuse(&handles),
 		}
 	}
 }
@@ -5083,6 +5310,11 @@ unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &Catal
 				abi::DEVICE_EVENT_ARRIVED => admit_arrival(index, nodes, catalogue, power, console_input, device_privilege, recovery),
 				abi::DEVICE_EVENT_DEPARTED => begin_removal(index, nodes),
 				abi::DEVICE_EVENT_FAULTED => begin_quarantine(index, nodes),
+				// THE EIGHT BYTES ARE AN INSTANCE'S NUMBER here, not a row: acted on by `acpi_pass` once that instance's
+				// connection is held too.
+				abi::DEVICE_EVENT_NAMESPACE_LOADED => {
+					ACPI_REPORT.store(index, core::sync::atomic::Ordering::Release);
+				}
 				_ => {}
 			}
 		}

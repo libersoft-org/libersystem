@@ -50,6 +50,9 @@ pub struct DeviceMemory {
 	// to the pool while it was still mapped.
 	mapped_at: AtomicU64,
 	mapped_in: SpinLock<Option<Arc<AddressSpace>>>,
+	// MAPPED WRITE-BACK rather than uncached: the firmware interpreter's region over ACPI NVS, ACPI-reclaimable or
+	// firmware-reserved memory, which is memory and not registers - one memory type per range, the policy's.
+	write_back: bool,
 }
 
 impl DeviceMemory {
@@ -57,12 +60,23 @@ impl DeviceMemory {
 	// FALLIBLY, here and in `for_device`: `sys_device_acquire` mints them.
 	#[cfg(test)]
 	pub fn new(phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None), write_back: false })
 	}
 
 	// The real one: minted under a claim, and stamped with it - what `SYS_DEVICE_CLAIM` hands out.
 	pub fn for_claim(key: abi::ClaimKey, phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None), write_back: false })
+	}
+
+	// THE FIRMWARE INTERPRETER'S REGION, derived from no claim: the policy admitted the range, and chose its memory
+	// type. It lives while the service holds it - a restart revokes it with the rest of the dead instance's handles.
+	pub fn for_firmware(phys_base: u64, len: usize, write_back: bool) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None), write_back })
+	}
+
+	// Whether the mapping is write-back memory rather than uncached registers.
+	pub fn write_back(&self) -> bool {
+		self.write_back
 	}
 
 	// The binding this capability was derived from, if it was derived from one.
@@ -118,6 +132,13 @@ impl DeviceMemory {
 	//
 	// `false` means the mapping must be torn down by its builder, because nothing else will: the
 	// sweep that set the tombstone had nothing to find.
+	// The address space this window is mapped in, if it is - for the development request that finds the driver
+	// holding a claimed function's BAR.
+	#[cfg(liber_development)]
+	pub fn mapped_space(&self) -> Option<Arc<AddressSpace>> {
+		self.mapped_in.lock().clone()
+	}
+
 	pub fn commit_mapping(&self, virt: u64, space: Arc<AddressSpace>) -> bool {
 		*self.mapped_in.lock() = Some(space);
 		// THE COUNT IS RAISED BEFORE THE MAPPING BECOMES OBSERVABLE, NOT AFTER (corrected
