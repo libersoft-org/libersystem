@@ -187,6 +187,14 @@ path = "user/libs/display/edid"
 owner = "hid-i2c"
 path = "user/libs/driver/hid-i2c"
 
+# The I2C bus contract's CLIENT SIDE: `hid-i2c`'s bus trait over one address-scoped connection, and the SMBus
+# transactions as a second client type. A SOURCE ROW AND NO LIBRARY ROW, like `hid-i2c`: the consumers that
+# will link it statically - the HID-over-I2C driver, SSIF - are not in the image yet, and the kernel suite's
+# I2C oracle drives the controller through it.
+[[sources]]
+owner = "i2c-client"
+path = "user/libs/driver/i2c-client"
+
 # The entropy pool's policy - what a seed submission is credited and what the pool refuses below its
 # threshold. A kernel dependency that lives outside the kernel for the reason `driver-binding` does:
 # the kernel is not host-testable and these are decisions a test has to be able to watch refuse.

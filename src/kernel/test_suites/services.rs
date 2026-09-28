@@ -2306,7 +2306,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	let give_up = arch::apic::ticks() + 500;
 	while renewal.is_none() && arch::apic::ticks() < give_up {
 		sched::run_until_idle();
-		arch::idle_halt();
+		crate::idle::halt(Some(give_up), sched::runnable);
 		renewal = next_ipv4!().ok();
 	}
 	let renewal = renewal.expect("the T1 renewal REQUEST should arrive unprompted");
@@ -2329,7 +2329,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	let give_up = acked_at + 500;
 	while second.is_none() && arch::apic::ticks() < give_up {
 		sched::run_until_idle();
-		arch::idle_halt();
+		crate::idle::halt(Some(give_up), sched::runnable);
 		second = next_ipv4!().ok();
 	}
 	let second = second.expect("the next T1 renewal should arrive");

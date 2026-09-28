@@ -511,9 +511,11 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// before there is an allocator. Doing it here worked for as long as a v2m frame was the only
 	// MSI controller this port knew.
 	super::enable_interrupts();
-	let start = super::gic::ticks();
+	// THE INTERRUPTS THEMSELVES ARE COUNTED, NOT TICKS: the tick is computed from the counter now and
+	// advances whether or not a single timer interrupt ever arrives, so five ticks would prove nothing.
+	let start = super::gic::timer_interrupts();
 	let mut spins: u64 = 0;
-	while super::gic::ticks() < start + 5 && spins < 2_000_000_000 {
+	while super::gic::timer_interrupts() < start + 5 && spins < 2_000_000_000 {
 		super::idle_halt();
 		spins += 1;
 	}
@@ -522,7 +524,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// exactly like a boot that delivered five. What follows on this machine - every timeout, every
 	// preemption, every sleep - is then measured against a clock that does not tick, and the only
 	// evidence of it was a number nobody was reading.
-	let delivered = super::gic::ticks() - start;
+	let delivered = super::gic::timer_interrupts() - start;
 	if delivered == 0 {
 		// AND IT IS FATAL, which is what M2 says and what printing it was not.
 		//
@@ -538,9 +540,9 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 		// count of zero on a valid one is a different fault in the same place.
 		panic!("aarch64: NO TIMER IRQ WAS DELIVERED in {spins} spins - the interrupt path is not carrying the generic timer, and everything timed on this machine would be on a clock that does not tick");
 	} else if delivered < 5 {
-		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} ticks, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
+		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} interrupts, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
 	} else {
-		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} ticks");
+		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} interrupts");
 	}
 
 	// The tree read above, reused: the RAM size and CPU count come from the same parse that named

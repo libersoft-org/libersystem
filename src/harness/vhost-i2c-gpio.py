@@ -12,7 +12,8 @@ line, turns the register device's PEC on, or picks a script:
 
     raise LINE | lower LINE | level LINE 0|1 | pec on|off | status
 
-and each answers one line, `ok ...` or `error ...`.
+and each answers one line, `ok ...` or `error ...`. The same commands reach it IN-BAND, through the register
+device's control mailbox (register 0xE0 at 0x50), for a test in the guest, which cannot reach a host socket.
 
 THE IOMMU. Each device is attached with `iommu_platform=on` whenever the machine has a virtio-iommu, so the
 backend offers VIRTIO_F_ACCESS_PLATFORM with the reply-ack and backend-request protocol features (QEMU refuses
@@ -33,7 +34,18 @@ import select
 import socket
 import struct
 import sys
+import time
 import unittest
+
+# One line per request and per control-plane message, on stderr, with `--trace`: the device side's half of any
+# bus failure, which the guest cannot see.
+TRACE = False
+
+
+def trace(message):
+    if TRACE:
+        print(f"{time.monotonic():.6f} {message}", file=sys.stderr, flush=True)
+
 
 # ------------------------------------------------------------------------------------------ vhost-user
 
@@ -212,10 +224,10 @@ class Vring:
     def chains(self, space):
         """Every descriptor chain the driver made available since the last call: (head, [(addr, len,
         writable)])."""
-        avail_idx = struct.unpack_from("<H", space.ring(self.avail + 2, 2))[0]
+        avail_idx = load_u16(space.ring(self.avail + 2, 2))
         while self.last_avail != avail_idx:
             slot = self.last_avail % self.num
-            head = struct.unpack_from("<H", space.ring(self.avail + 4 + 2 * slot, 2))[0]
+            head = load_u16(space.ring(self.avail + 4 + 2 * slot, 2))
             parts = []
             index = head
             for _ in range(self.num):
@@ -240,14 +252,30 @@ class Vring:
             yield head, parts
 
     def put_used(self, space, head, written):
-        used_idx = struct.unpack_from("<H", space.ring(self.used + 2, 2))[0]
+        used_idx = load_u16(space.ring(self.used + 2, 2))
         slot = used_idx % self.num
-        struct.pack_into("<II", space.ring(self.used + 4 + 8 * slot, 8, True), 0, head, written)
-        struct.pack_into("<H", space.ring(self.used + 2, 2, True), 0, (used_idx + 1) & 0xFFFF)
+        element = space.ring(self.used + 4 + 8 * slot, 8, True).cast("I")
+        element[0] = head
+        element[1] = written
+        # THE INDEX LAST, AND IN ONE STORE: the driver polls it.
+        store_u16(space.ring(self.used + 2, 2, True), (used_idx + 1) & 0xFFFF)
 
     def signal(self):
         if self.call >= 0:
             os.write(self.call, struct.pack("<Q", 1))
+
+
+# A RING INDEX IS READ AND WRITTEN IN ONE ACCESS. The driver polls the used index while this process writes it,
+# and writes the available index while this process reads it; `struct.pack_into` ZERO-FILLS its destination
+# before it writes the value a byte at a time, so a driver polling the used index saw it fall to zero between
+# two completions and - rightly - refused the completion as more than it had asked for. A memoryview cast to
+# `H` moves the two bytes with one 16-bit access (both indexes are 2-byte aligned).
+def load_u16(view):
+    return view.cast("H")[0]
+
+
+def store_u16(view, value):
+    view.cast("H")[0] = value
 
 
 def recv_message(sock):
@@ -286,6 +314,8 @@ class Device:
         self.backend = None
         self.rings = [Vring() for _ in range(model.queues)]
         self.space = Space(self.memory, self.iotlb, False, self.ask)
+        # Rings a message asked to have drained, drained once its reply is out.
+        self.pending = []
 
     def offered(self):
         return F_VERSION_1 | F_ACCESS_PLATFORM | F_PROTOCOL_FEATURES | F_INDIRECT_DESC | self.model.features
@@ -294,19 +324,27 @@ class Device:
         self.sock.sendall(HEADER.pack(request, FLAG_VERSION | FLAG_REPLY, len(payload)) + payload)
 
     def ask(self, miss):
-        """AN IOTLB MISS: ask on the backend channel, then serve the main channel until the translation is
-        there - the update QEMU sends in answer arrives on the main channel."""
+        """AN IOTLB MISS: ask on the backend channel, then serve the main channels until the translation is
+        there - the update QEMU sends in answer arrives on this device's main channel.
+
+        EVERY DEVICE'S MAIN CHANNEL, not only this one's: QEMU's one thread may be blocked waiting for another
+        device's reply, and it reads no backend channel until it has that reply - so serving only this socket
+        would wait for an update QEMU cannot send. A message served here never drains a ring (`pending`), which
+        is also why a ring is never drained inside the handling of a message QEMU waits on."""
         if self.backend is None:
             raise RuntimeError(f"{self.name}: an IOTLB miss at {miss.iova:#x} and no backend channel to ask on")
         perm = PERM_WO if miss.write else PERM_RO
         body = struct.pack("<QQQBB6x", miss.iova, 1, 0, perm, IOTLB_MISS)
+        trace(f"{self.name}: IOTLB miss at {miss.iova:#x}")
         self.backend.sendall(HEADER.pack(BACKEND_IOTLB_MSG, FLAG_VERSION, len(body)) + body)
         for _ in range(1000):
-            ready, _, _ = select.select([self.sock], [], [], 5.0)
+            peers = [device for device in DEVICES.values() if device.sock is not None] or [self]
+            ready, _, _ = select.select([device.sock for device in peers], [], [], 5.0)
             if not ready:
                 break
-            if not self.serve_one():
-                raise EOFError(f"{self.name}: the front end went away during an IOTLB miss")
+            for device in peers:
+                if device.sock in ready and not device.serve_one():
+                    raise EOFError(f"{device.name}: the front end went away during an IOTLB miss")
             try:
                 self.iotlb.translate(miss.iova, 1, miss.write)
                 return
@@ -314,12 +352,18 @@ class Device:
                 continue
         raise RuntimeError(f"{self.name}: no IOTLB update arrived for {miss.iova:#x}")
 
+    def run_pending(self):
+        """The drains a message asked for, now that its reply is sent."""
+        while self.pending:
+            self.drain(self.pending.pop(0))
+
     def serve_one(self):
         """Handle one message on the main channel; False when the connection ended."""
         message = recv_message(self.sock)
         if message is None:
             return False
         request, flags, body, fds = message
+        trace(f"{self.name}: message {request} ({len(body)} bytes, {len(fds)} fd(s))")
         ack = bool(flags & FLAG_NEED_REPLY) and self.protocol & PROTOCOL_REPLY_ACK
         answered = self.handle(request, body, fds)
         if ack and not answered:
@@ -362,6 +406,7 @@ class Device:
             return False
         if request == IOTLB_MSG:
             iova, size, uaddr, perm, kind = struct.unpack_from("<QQQBB", body)
+            trace(f"{self.name}: IOTLB {'update' if kind == IOTLB_UPDATE else 'invalidate' if kind == IOTLB_INVALIDATE else kind} {iova:#x}+{size:#x} -> {uaddr:#x} perm {perm}")
             if kind == IOTLB_UPDATE:
                 self.iotlb.update(iova, size, uaddr, perm)
             elif kind == IOTLB_INVALIDATE:
@@ -379,10 +424,17 @@ class Device:
             index = struct.unpack_from("<I", body)[0]
             ring = self.rings[index]
             ring.ready = False
+            # A STOPPED DEVICE KEEPS NO TRANSLATION. QEMU sends no invalidation for the mappings a driver's domain
+            # loses once the device's vhost side is stopped - the reset that ends a binding stops it first - so
+            # the next binding, in a new domain at the same IOVAs, would read the last one's freed pages. The
+            # IOTLB is a cache: emptied here, every access after the next start misses and QEMU answers it.
+            self.iotlb.entries = []
+            trace(f"{self.name}: ring {index} stopped, IOTLB emptied")
             self.reply(request, struct.pack("<II", index, ring.last_avail))
             return True
         if request == SET_VRING_ADDR:
             index, _flags, desc, used, avail, _log = struct.unpack_from("<IIQQQQ", body)
+            trace(f"{self.name}: ring {index} at desc {desc:#x} avail {avail:#x} used {used:#x}")
             ring = self.rings[index]
             ring.desc, ring.used, ring.avail = desc, used, avail
             ring.ready = True
@@ -409,8 +461,10 @@ class Device:
         if request == SET_VRING_ENABLE:
             index, enable = struct.unpack_from("<II", body)
             self.rings[index].enabled = bool(enable)
-            if enable:
-                self.drain(index)
+            # DRAINED AFTER THE REPLY, never here: a buffer's address may miss the IOTLB, and QEMU answers a
+            # miss only once it has the reply to this message.
+            if enable and index not in self.pending:
+                self.pending.append(index)
             return False
         if request == GET_CONFIG:
             offset, size, flags = struct.unpack_from("<III", body)
@@ -435,6 +489,7 @@ class Device:
         signalled = False
         for head, parts in ring.chains(self.space):
             written = self.model.serve(index, head, parts, self.space)
+            trace(f"{self.name}: ring {index} chain {head} of {len(parts)} part(s) -> {'held' if written is None else f'{written} byte(s) written'}")
             if written is None:
                 # Held: the model completes this chain later (a GPIO event buffer).
                 continue
@@ -476,20 +531,31 @@ class RegisterDevice:
     Register 0xFE is the PEC MODE, so a test in the guest can drive it without the control socket: 0 no PEC,
     1 PEC (every write's last byte is checked, and a wrong one is refused; every read answers one more byte,
     the CRC-8 of the transaction as it crossed the bus), 2 the same with every read's PEC WRONG. A write to it
-    is never checked, since it is what turns the checking on or off."""
+    is never checked, since it is what turns the checking on or off.
+
+    Register 0xE0 is the CONTROL MAILBOX: the control socket's own commands, carried in-band for a test in the
+    guest, which has no way to reach a socket on the host. A write of `0xE0` and then a command's text runs
+    that command through the same `command` the socket does - so a line the guest raises this way is raised
+    by the same code a gate's is - and a read from 0xE0 answers the reply's text. Never checked for PEC,
+    like the mode."""
 
     BLOCK = 0xF0
     MODE = 0xFE
+    CONTROL = 0xE0
 
-    def __init__(self, address):
+    def __init__(self, address, control=None):
         self.address = address
         self.registers = bytearray(range(256))
         self.pointer = 0
         self.pec = 0
         self.block = b"LIBER"
         self.last_write = b""
+        self.control = control
+        self.reply = b""
 
-    def write(self, data):
+    def write(self, data, combined=False):
+        """`combined` is the write half of a write-then-read: SMBus puts that transaction's PEC at the end of
+        its read, so the write carries none to check."""
         if not data:
             return True
         if data[0] == self.MODE and len(data) >= 2:
@@ -497,7 +563,13 @@ class RegisterDevice:
             self.pointer = self.MODE
             self.last_write = bytes(data[:1])
             return True
-        if self.pec:
+        if data[0] == self.CONTROL:
+            text = bytes(data[1:]).decode(errors="replace").strip()
+            self.reply = (self.control(text) if self.control else "error no control").encode()
+            self.pointer = self.CONTROL
+            self.last_write = bytes(data[:1])
+            return True
+        if self.pec and not combined:
             if len(data) < 2 or data[-1] != crc8(bytes([self.address << 1]) + bytes(data[:-1])):
                 return False
             data = data[:-1]
@@ -509,6 +581,8 @@ class RegisterDevice:
 
     def read(self, length, after_write):
         wanted = length - 1 if self.pec else length
+        if self.pointer == self.CONTROL:
+            return self.reply.ljust(length, b"\0")[:length]
         if self.pointer == self.BLOCK:
             body = (bytes([len(self.block)]) + self.block).ljust(wanted, b"\xff")[:wanted]
         else:
@@ -550,14 +624,17 @@ class I2cModel:
                 space.view(addr, length, True)[:] = data
                 written = length
             elif not writable:
-                ok = device.write(bytes(space.view(addr, length)))
+                ok = device.write(bytes(space.view(addr, length)), combined=bool(flags & I2C_FLAG_FAIL_NEXT))
         if ok and buffer is None and device is not None:
             ok = True
-        self._previous_was_write = bool(ok and buffer is not None and not flags & I2C_FLAG_READ)
+        # A READ AFTER A WRITE IN THE SAME TRANSFER - a repeated start, which FAIL_NEXT on the write says - is
+        # what the PEC of a write-then-read covers both halves of; a read on its own covers itself alone.
+        self._previous_was_write = bool(ok and buffer is not None and not flags & I2C_FLAG_READ and flags & I2C_FLAG_FAIL_NEXT)
         # FAIL_NEXT: a failed request fails the one after it; a request that does not carry the flag ends the
         # transfer.
         self.failed_next = (not ok) and bool(flags & I2C_FLAG_FAIL_NEXT)
         space.view(status_addr, 1, True)[0] = I2C_OK if ok else I2C_ERR
+        trace(f"i2c: {address:#04x} flags {flags:#x} {'no buffer' if buffer is None else f'{buffer[1]} byte(s)'} -> {'ok' if ok else 'failed'}")
         return written + status_len
 
     _previous_was_write = False
@@ -643,6 +720,7 @@ class GpioModel:
             status = GPIO_ERR
         answer = bytes([status]) + reply
         space.view(answer_addr, answer_len, True)[:] = answer.ljust(answer_len, b"\0")[:answer_len]
+        trace(f"gpio: request {kind} line {line} value {value:#x} -> status {status}, {answer_len} byte(s)")
         return answer_len
 
     def level_met(self, line):
@@ -669,6 +747,9 @@ class GpioModel:
 
 # ------------------------------------------------------------------------------------------ the loop
 
+# Every connected device, by name - which an IOTLB miss serves while it waits (see `Device.ask`).
+DEVICES = {}
+
 
 def listen(path):
     try:
@@ -682,7 +763,8 @@ def listen(path):
 
 
 def serve(args):
-    register = RegisterDevice(0x50)
+    devices = DEVICES
+    register = RegisterDevice(0x50, control=lambda text: command(text, register, gpio_model, devices))
     i2c_model = I2cModel([register])
     gpio_model = GpioModel(["hid-touchpad", "hid-touchscreen", "acpi-aei", "spare-3", "spare-4", "spare-5", "spare-6", "spare-7"])
     listeners = {"i2c": listen(args.i2c), "gpio": listen(args.gpio)}
@@ -690,7 +772,6 @@ def serve(args):
     if args.ready:
         with open(args.ready, "w") as ready:
             ready.write("ready\n")
-    devices = {}
     control_clients = []
     while True:
         watched = list(listeners.values()) + [control] + control_clients
@@ -702,6 +783,10 @@ def serve(args):
                 watched.append(fd)
         ready, _, _ = select.select(watched, [], [])
         for item in ready:
+            # STILL READY? An IOTLB miss served earlier in this pass may have read a socket's message already, and
+            # a read of it now would block until QEMU sent another.
+            if not select.select([item], [], [], 0)[0]:
+                continue
             if item in listeners.values():
                 name = next(key for key, value in listeners.items() if value is item)
                 conn, _ = item.accept()
@@ -722,12 +807,18 @@ def serve(args):
             elif isinstance(item, int):
                 name, index = kicks[item]
                 os.read(item, 8)
+                trace(f"{name}: kick on ring {index}")
                 devices[name].drain(index)
             else:
-                device = next(d for d in devices.values() if d.sock is item)
+                device = next((d for d in devices.values() if d.sock is item), None)
+                if device is None:
+                    continue
                 if not device.serve_one():
                     device.memory.close()
                     del devices[device.name]
+                    continue
+            for device in list(devices.values()):
+                device.run_pending()
 
 
 def command(text, register, gpio, devices):
@@ -842,6 +933,8 @@ class SelfTest(unittest.TestCase):
         answer = device.read(2, after_write=True)
         self.assertEqual(answer[0], 0xAA)
         self.assertEqual(answer[1], crc8(bytes([0xA0, 0x10, 0xA1, 0xAA])), "the PEC covers both address bytes")
+        self.assertTrue(device.write(bytes([0x10]), combined=True), "a write-then-read's write half carries no PEC to check")
+        self.assertEqual(device.read(2, after_write=True)[1], crc8(bytes([0xA0, 0x10, 0xA1, 0xAA])), "and the read's PEC covers both halves")
         device.write(bytes([RegisterDevice.MODE, 2]))
         device.write(bytes([0x10, crc8(bytes([0xA0, 0x10]))]))
         self.assertNotEqual(device.read(2, after_write=True)[1], crc8(bytes([0xA0, 0x10, 0xA1, 0xAA])), "mode 2 answers a wrong PEC")
@@ -880,6 +973,58 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(space.data[80], EVENT_VALID)
         self.assertFalse(model.set_level(1, 0, space), "no buffer queued: nothing to complete")
 
+    def test_a_stopped_ring_empties_the_iotlb(self):
+        device = Device("i2c", None, I2cModel([]))
+        sent = []
+        device.reply = lambda request, payload: sent.append(request)
+        device.iotlb.update(0x2000, 0x1000, 0x7F0000000000, PERM_RW)
+        self.assertTrue(device.handle(GET_VRING_BASE, struct.pack("<I", 0), []))
+        self.assertEqual(sent, [GET_VRING_BASE])
+        with self.assertRaises(Miss):
+            device.iotlb.translate(0x2000, 8, False)
+
+    def test_a_ring_enabled_by_a_message_is_drained_after_the_reply_and_not_inside_it(self):
+        # QEMU answers an IOTLB miss only once it has the reply to the message it is waiting on, so a drain -
+        # which may miss - inside the handling of SET_VRING_ENABLE would wait for an update that cannot come.
+        device = Device("gpio", None, GpioModel(["a"]))
+        drained = []
+        device.drain = drained.append
+        self.assertFalse(device.handle(SET_VRING_ENABLE, struct.pack("<II", 1, 1), []))
+        self.assertTrue(device.rings[1].enabled)
+        self.assertEqual(drained, [], "nothing is drained while the message is being handled")
+        self.assertEqual(device.pending, [1])
+        device.run_pending()
+        self.assertEqual(drained, [1], "and the ring is drained once the reply is out")
+        self.assertEqual(device.pending, [])
+
+    def test_the_control_mailbox_runs_the_control_sockets_own_commands(self):
+        gpio = GpioModel(["a", "b", "c"])
+        completed = []
+
+        class Recorder:
+            space = FakeSpace()
+
+            def complete(self, index, head, written):
+                completed.append((index, head))
+
+        devices = {"gpio": Recorder()}
+        gpio.device = devices["gpio"]
+        register = RegisterDevice(0x50, control=lambda text: command(text, register, gpio, devices))
+        # Line 2 armed for a rising edge, with its event buffer held.
+        space = devices["gpio"].space
+        space.data[0:8] = struct.pack("<HHI", GPIO_SET_IRQ_TYPE, 2, IRQ_RISING)
+        gpio.serve(0, 0, [(0, 8, False), (64, 1, True)], space)
+        space.data[16:18] = struct.pack("<H", 2)
+        self.assertIsNone(gpio.serve(1, 9, [(16, 2, False), (80, 1, True)], space))
+        # PEC on does not check the mailbox, as it does not check the mode.
+        register.write(bytes([RegisterDevice.MODE, 1]))
+        self.assertTrue(register.write(bytes([RegisterDevice.CONTROL]) + b"raise 2"))
+        self.assertEqual(gpio.levels[2], 1, "the command ran")
+        self.assertEqual(completed, [(1, 9)], "and fired the line through the same path the socket's does")
+        self.assertTrue(register.read(32, after_write=True).startswith(b"ok line 2 level 1 fired"), "the reply is read back from the mailbox")
+        self.assertTrue(register.write(bytes([RegisterDevice.CONTROL]) + b"bogus"))
+        self.assertTrue(register.read(32, after_write=True).startswith(b"error unknown command"), "and a refusal is read back the same way")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -888,7 +1033,10 @@ def main():
     parser.add_argument("--control", help="the control socket to listen on")
     parser.add_argument("--ready", help="a file written once every socket listens")
     parser.add_argument("--self-test", action="store_true", help="run the host suite and exit")
+    parser.add_argument("--trace", action="store_true", help="one line per request and control message, on stderr")
     args = parser.parse_args()
+    global TRACE
+    TRACE = args.trace
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
         result = unittest.TextTestRunner(verbosity=2).run(suite)

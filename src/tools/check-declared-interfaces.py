@@ -75,7 +75,9 @@ if os.path.isfile(protocol):
 	text = open(protocol, encoding="utf-8").read()
 	block = re.search(r"pub mod provider \{(.*?)\n\}", text, re.S)
 	if block:
-		for name, value in re.findall(r"pub const ([A-Z_]+): u16 = (\d+);", block.group(1)):
+		# A DIGIT IS PART OF A NAME: `I2C_BUS` is the first kind with one, and a pattern without them read it as
+		# absent from the wire.
+		for name, value in re.findall(r"pub const ([A-Z][A-Z0-9_]*): u16 = (\d+);", block.group(1)):
 			wire_kinds[name] = int(value)
 
 if idl_kinds and wire_kinds and idl_kinds != wire_kinds:

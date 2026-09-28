@@ -349,6 +349,14 @@ fn send_connect(channel: &object::channel::Channel, generation: u64, token: u16,
 	send_frame(channel, driver_protocol::Opcode::Connect, generation, &payload, Some(endpoint), object::rights::Rights::ALL)
 }
 
+// The same `CONNECT`, SCOPED: a connection to ONE address or ONE line of a bus provider, which is the only kind
+// DeviceManager mints to an `i2c-bus` or a `gpio-lines` publication. The scope follows the token in the frame.
+fn send_scoped_connect(channel: &object::channel::Channel, generation: u64, token: u16, scope: driver_protocol::Scope, endpoint: alloc::sync::Arc<dyn object::KernelObject>) -> Result<(), &'static str> {
+	let mut payload = [0u8; driver_protocol::CONNECT_PAYLOAD_MAX];
+	let len = driver_protocol::encode_connect(token, scope, &mut payload);
+	send_frame(channel, driver_protocol::Opcode::Connect, generation, &payload[..len], Some(endpoint), object::rights::Rights::ALL)
+}
+
 // Create a ramdisk MemoryObject from `volume`, fill it, and hand it to a service's
 // bootstrap channel as "RAMDISK" + the volume's byte length, with a read+map cap.
 fn send_ramdisk(channel: &object::channel::Channel, volume: &[u8]) -> Result<(), &'static str> {
@@ -3217,6 +3225,7 @@ define_test_tags! {
 	Filesystem => "filesystem",
 	Frame => "frame",
 	Handle => "handle",
+	I2c => "i2c",
 	Image => "image",
 	Idt => "idt",
 	Imgview => "imgview",
@@ -6591,7 +6600,8 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				if host.presents >= before_repeat + 2 {
 					break;
 				}
-				arch::idle_halt();
+				// A loop by count: one tick each pass.
+				crate::idle::halt(Some(arch::apic::ticks().saturating_add(1)), sched::runnable);
 			}
 			assert!(host.presents >= before_repeat + 2, "held arrow must produce repeated pan redraws");
 			send_key(0x4f, false);

@@ -9,10 +9,11 @@
 // ExitBootServices with no kernel output" was diagnosed for a day as a hang. It was not: the
 // kernel was running, with a console nobody could hear.
 //
-// A polled driver, like the aarch64 PL011 beside it: wait for the holding register to empty, write
-// the byte. The kernel runs in the higher half, so the MMIO is reached through the physical direct
-// map (`phys_to_virt`) - which the boot stub installs before it branches here, so this is usable
-// from the kernel's first line.
+// A polled transmitter, like the aarch64 PL011 beside it: wait for the holding register to empty,
+// write the byte. The receive side raises its interrupt once the boot tail arms it
+// (`arm_rx_interrupt`). The kernel runs in the higher half, so the MMIO is reached through the
+// physical direct map (`phys_to_virt`) - which the boot stub installs before it branches here, so
+// this is usable from the kernel's first line.
 //
 // The base is QEMU `virt`'s, stated rather than discovered, exactly as the aarch64 port states
 // UART0's. The device tree carries it (`/soc/serial@10000000`, `ns16550a`) and reading it from
@@ -25,7 +26,11 @@ use core::fmt::{self, Write};
 // The NS16550 on QEMU virt. Byte-wide registers, no shift.
 const UART_BASE: u64 = 0x1000_0000;
 const RBR_THR: u64 = 0x00; // receive buffer (read) / transmit holding (write)
+#[cfg(not(test))]
+const IER: u64 = 0x01; // interrupt enable
 const LSR: u64 = 0x05; // line status
+#[cfg(not(test))]
+const IER_RX_AVAILABLE: u8 = 1 << 0;
 #[cfg(not(test))]
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
@@ -42,6 +47,11 @@ pub fn init() {}
 pub fn enable_async() {}
 
 pub fn drain_tx() {}
+
+// Transmit is synchronous here, so nothing is ever left for an idle hart to drain.
+pub fn tx_pending() -> bool {
+	false
+}
 
 pub fn flush_sync() {}
 
@@ -75,6 +85,51 @@ pub fn read_byte() -> Option<u8> {
 		}
 		Some(core::ptr::read_volatile(reg(RBR_THR)))
 	}
+}
+
+// THE CONSOLE UART'S RECEIVE INTERRUPT, armed on the source the device tree names for the 16550 - through
+// the APLIC, delivered to this hart's interrupt file as `WIRED_EID` - and answered by `handler`, so a typed
+// byte wakes an idle machine that takes no periodic tick to find it by.
+//
+// ONE IDENTITY FOR EVERY WIRED LINE, AND REGISTERING IT AGAIN REPLACES ITS HANDLER: a hot-plug slot's line
+// arrives under the same number, so `handler` has to be the one kernel handler that answers both, and the
+// boot tail passes the same function to both armings - in whichever order they run.
+//
+// Answers the identity an idle core's record names it by; `Err` says why the UART's input stays polled.
+#[cfg(not(test))]
+pub fn arm_rx_interrupt(handler: super::interrupts::HandlerFn) -> Result<u32, &'static str> {
+	let tree = super::device_tree().ok_or("the machine handed over no device tree")?;
+	// THE NODE THE LINE IS READ FROM IS THE UART THIS DRIVER WRITES TO, or it is some other device's line.
+	if tree.console().map(|console| console.base) != Some(UART_BASE) {
+		return Err("the device tree's console is not the UART this kernel writes to");
+	}
+	let route = tree.console_interrupt().ok_or("the device tree names no line for it")?;
+	// TWO CELLS IS THE APLIC BINDING and one a PLIC's, which this kernel does not drive - as for a slot.
+	if route.cells != 2 {
+		return Err("its line goes to a controller this kernel does not drive");
+	}
+	let (base, _size) = tree.interrupt_controller_reg(route.controller).ok_or("the device tree does not place its controller")?;
+	let hart: u64 = super::percpu::this_cpu().lapic_id();
+	if !super::imsic::usable() || !super::imsic::has_file(hart) {
+		return Err("this hart has no interrupt file to deliver it to");
+	}
+	let eid: u32 = super::interrupts::WIRED_EID;
+	if !super::interrupts::register(eid, handler) {
+		return Err("this kernel answers as many wired lines as it carries rows for");
+	}
+	super::imsic::enable_eid(eid);
+	unsafe {
+		core::ptr::write_volatile(reg(IER), IER_RX_AVAILABLE);
+	}
+	// SAFETY: `base` is where this machine's own device tree places the controller the route names, and
+	// the direct map covers the device window it lies in.
+	if !unsafe { super::aplic::arm_source(base, route.spec[0], route.spec[1], hart, eid) } {
+		unsafe {
+			core::ptr::write_volatile(reg(IER), 0);
+		}
+		return Err("the controller did not take the source the device tree names");
+	}
+	Ok(eid)
 }
 
 pub struct SerialWriter;

@@ -1854,16 +1854,148 @@ impl Fdt {
 		// the same contract every other walk in this file relies on.
 		unsafe {
 			let mut path = [0u8; MAX_PATH];
-			let mut len = self.stdout_path(&mut path)?;
+			let len = self.console_path(&mut path)?;
+			self.console_at(&path[..len])
+		}
+	}
+
+	/// The console's own interrupt: where the line of the UART `console` answers for lands, in its
+	/// controller's own words - `(type, number, flags)` on a GIC, `(source, trigger)` on an APLIC,
+	/// `(source)` on a PLIC - UNINTERPRETED and in the shape a PCI route comes back in, because what
+	/// the cells mean is the controller's binding, and the port that drives it turns them into a
+	/// number.
+	///
+	/// THE CONTROLLER IS THE ONE THE NODE NAMES, and a node that names none takes the nearest
+	/// ancestor's `interrupt-parent`, up to the root - which is where aarch64 `virt` names its GIC,
+	/// the PL011 declaring nothing of its own. An `interrupts-extended` names its controller in its
+	/// first cell and wins over the pair, as the specification says.
+	///
+	/// `None` is a console that raises nothing, or one whose controller the tree does not describe
+	/// well enough to read a specifier against; such a console is polled, which is what it was.
+	pub fn console_interrupt(&self) -> Option<IntxRoute> {
+		if !self.is_valid() {
+			return None;
+		}
+		// SAFETY: the header was validated, as for `console`.
+		unsafe {
+			let mut path = [0u8; MAX_PATH];
+			let len = self.console_path(&mut path)?;
+			let (parts, count) = path_parts(&path[..len])?;
+			let facts = self.interrupt_facts(&parts[..count])?;
+			let (controller, at, spec_len) = match facts.extended {
+				Some((value, len)) if len >= 4 => (self.be32(value), value + 4, len - 4),
+				Some(_) => return None,
+				None => {
+					let (value, len) = facts.interrupts?;
+					(facts.parent, value, len)
+				}
+			};
+			let (_, cells) = self.node_cells_by_phandle(controller)?;
+			// A specifier shorter than its controller's binding is a tree contradicting itself, and
+			// reading past it would take the next property's bytes for the trigger.
+			if cells == 0 || cells as usize > MAX_INTERRUPT_CELLS || spec_len < cells * 4 {
+				return None;
+			}
+			let mut spec = [0u32; MAX_INTERRUPT_CELLS];
+			for (index, cell) in spec.iter_mut().enumerate().take(cells as usize) {
+				*cell = self.be32(at + index as u64 * 4);
+			}
+			Some(IntxRoute { controller, cells, spec })
+		}
+	}
+
+	// The console's node path: `/chosen/stdout-path`, through one alias where it names one. Returns
+	// how many bytes of `path` it fills.
+	unsafe fn console_path(&self, path: &mut [u8; MAX_PATH]) -> Option<usize> {
+		unsafe {
+			let mut len = self.stdout_path(path)?;
 			// An alias rather than a path: `stdout-path = "serial0:115200n8"` is how riscv64's virt
 			// tree names it, and `/aliases/serial0` is where the path itself lives. One level of
 			// indirection, which is all the specification defines.
 			if path[0] != b'/' {
 				let mut resolved = [0u8; MAX_PATH];
 				len = self.alias(&path[..len], &mut resolved)?;
-				path = resolved;
+				*path = resolved;
 			}
-			self.console_at(&path[..len])
+			Some(len)
+		}
+	}
+
+	// What the node named by `parts` says about its interrupt: its `interrupts` and
+	// `interrupts-extended`, and the `interrupt-parent` in force for it - its own, or the nearest
+	// ancestor's. `None` for a path naming no node.
+	unsafe fn interrupt_facts(&self, parts: &[&[u8]]) -> Option<InterruptFacts> {
+		if parts.is_empty() {
+			return None;
+		}
+		let b = self.bounds()?;
+		unsafe {
+			let mut p = b.struct_start;
+			// The `interrupt-parent` in force at each depth of the path, inherited downward: a node's
+			// properties precede its children, so by the time the console's are read every ancestor's
+			// has been.
+			let mut parent = [0u32; MAX_DEPTH + 1];
+			let mut depth: i32 = -1;
+			// The depth of the deepest node on `parts` we are currently inside; 0 is the root.
+			let mut matched: i32 = -1;
+			let mut facts = InterruptFacts { interrupts: None, extended: None, parent: 0 };
+			loop {
+				let token = self.be32_in(p, b.struct_end)?;
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						let (name, next) = self.node_name_in(p, &b)?;
+						p = next;
+						if depth as usize > MAX_DEPTH {
+							return None;
+						}
+						if depth == 0 {
+							matched = 0;
+							parent[0] = 0;
+						} else {
+							parent[depth as usize] = parent[depth as usize - 1];
+							let index = depth as usize - 1;
+							if matched == depth - 1 && index < parts.len() && self.name_matches(name, parts[index]) {
+								matched = depth;
+							}
+						}
+					}
+					FDT_END_NODE => {
+						if matched == depth && depth as usize == parts.len() {
+							// Every property of the node is read, so whatever it named - or inherited -
+							// is what it has.
+							facts.parent = parent[depth as usize];
+							return Some(facts);
+						}
+						if matched == depth {
+							matched = depth - 1;
+						}
+						depth -= 1;
+						if depth < 0 {
+							return None;
+						}
+					}
+					FDT_PROP => {
+						let (pname, len, value, next) = self.prop_in(p, &b)?;
+						p = next;
+						if depth < 0 || depth as usize > MAX_DEPTH || matched != depth {
+							continue;
+						}
+						if len == 4 && self.str_eq(pname, "interrupt-parent") {
+							parent[depth as usize] = self.be32(value);
+						} else if depth as usize == parts.len() {
+							if self.str_eq(pname, "interrupts") {
+								facts.interrupts = Some((value, len));
+							} else if self.str_eq(pname, "interrupts-extended") {
+								facts.extended = Some((value, len));
+							}
+						}
+					}
+					FDT_NOP => {}
+					_ => return None,
+				}
+			}
 		}
 	}
 
@@ -2013,22 +2145,7 @@ impl Fdt {
 
 	// Read `compatible`, `reg` and `reg-shift` off the node at `path` and decide what it is.
 	unsafe fn console_at(&self, path: &[u8]) -> Option<Console> {
-		// The path split into components, without allocating. `/soc/serial@10000000` is two.
-		let mut parts: [&[u8]; MAX_DEPTH] = [b""; MAX_DEPTH];
-		let mut count = 0usize;
-		for component in path.split(|byte| *byte == b'/') {
-			if component.is_empty() {
-				continue;
-			}
-			if count == MAX_DEPTH {
-				return None;
-			}
-			parts[count] = component;
-			count += 1;
-		}
-		if count == 0 {
-			return None;
-		}
+		let (parts, count) = path_parts(path)?;
 
 		let mut uart: Option<Uart> = None;
 		let mut base: Option<u64> = None;
@@ -2913,7 +3030,33 @@ struct NodeFacts {
 const UNDECLARED: u32 = u32::MAX;
 const DEFAULT_CELLS: u32 = 2;
 
-/// Where a PCI function's INTx pin lands, in the interrupt controller's own words.
+// A node path split into its components, without allocating: `/soc/serial@10000000` is two. `None`
+// for the root alone, or a path deeper than this reader walks.
+fn path_parts(path: &[u8]) -> Option<([&[u8]; MAX_DEPTH], usize)> {
+	let mut parts: [&[u8]; MAX_DEPTH] = [b""; MAX_DEPTH];
+	let mut count = 0usize;
+	for component in path.split(|byte| *byte == b'/') {
+		if component.is_empty() {
+			continue;
+		}
+		if count == MAX_DEPTH {
+			return None;
+		}
+		parts[count] = component;
+		count += 1;
+	}
+	(count != 0).then_some((parts, count))
+}
+
+// What one node says about its interrupt - see `interrupt_facts`.
+struct InterruptFacts {
+	interrupts: Option<(u64, u32)>,
+	extended: Option<(u64, u32)>,
+	parent: u32,
+}
+
+/// Where a line lands on an interrupt controller, in the controller's own words: a PCI function's
+/// INTx pin (`pci_intx_route`) or the console UART's line (`console_interrupt`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntxRoute {
 	/// The phandle of the controller the line reaches, so a port can refuse a row that names a

@@ -101,14 +101,31 @@ fn usb_connections_keep_their_publication_identity_across_removal_and_reopen() {
 #[test]
 fn refused_connections_return_allowance_and_stale_handles_are_closed() {
     reset(); let bind = Bind { generation: 4 }; let mut serving = Serving::new(10, 0);
-    for end in 11..18 { assert!(serving.accept(end, 0)); }
+    for end in 11..18 { assert!(serving.accept(end, 0, proto::Scope::Whole)); }
     QUEUED.lock().unwrap().push_back(connect(0, 99, 4));
     QUEUED.lock().unwrap().push_back(connect(0, 98, 3));
     assert!(matches!(drain_control_into(100, &bind, Some(&mut serving)), Control::Continue));
     assert_eq!(*CLOSED.lock().unwrap(), [99, 98]);
     assert_eq!(SENT.lock().unwrap().len(), 1, "a stale generation cannot refund a current binding's allowance");
     assert_eq!(SENT.lock().unwrap()[0].0, proto::Opcode::Disconnect);
-    assert!(!serving.accept(97, 9), "an unoffered token cannot change a provider's kind");
+    assert!(!serving.accept(97, 9, proto::Scope::Whole), "an unoffered token cannot change a provider's kind");
+}
+#[test]
+fn a_scoped_connection_is_served_under_the_scope_its_connect_named() {
+    // A BUS PROVIDER'S SHAPE: a publication with no endpoint of its own, and connections scoped by their CONNECT.
+    reset(); let bind = Bind { generation: 4 }; let mut serving = Serving::from_offers(&[(0, 0)]);
+    let mut payload = [0u8; proto::CONNECT_PAYLOAD_MAX];
+    let len = proto::encode_connect(0, proto::Scope::I2cAddress(0x50), &mut payload);
+    let mut bytes = proto::Header { version: proto::VERSION, opcode: proto::Opcode::Connect, generation: 4, payload_len: len as u32 }.encode().to_vec();
+    bytes.extend_from_slice(&payload[..len]);
+    QUEUED.lock().unwrap().push_back((bytes, 41));
+    assert!(matches!(wait_providers_or_answer(100, &bind, &mut serving, &[200]), Some(ProviderReady::Connected(0))));
+    assert_eq!((serving.at(0), serving.scope_at(0)), (41, proto::Scope::I2cAddress(0x50)), "the endpoint is served for the one address its CONNECT named");
+    QUEUED.lock().unwrap().push_back(connect(0, 42, 4));
+    assert!(matches!(wait_providers_or_answer(100, &bind, &mut serving, &[200]), Some(ProviderReady::Connected(1))));
+    assert_eq!(serving.scope_at(1), proto::Scope::Whole, "an unscoped CONNECT is the two-byte payload it always was");
+    serving.close_at(0);
+    assert_eq!((serving.at(0), serving.scope_at(0)), (42, proto::Scope::Whole), "removal keeps each remaining endpoint's own scope");
 }
 #[test]
 fn an_idle_provider_still_services_device_work_and_stop() {
@@ -128,13 +145,14 @@ fn an_idle_provider_still_services_device_work_and_stop() {
         command = ['cargo', 'test', '--offline', '--quiet', '--manifest-path', str(path / 'Cargo.toml'), '--lib', '--', '--test-threads=1']
         (path / 'tests.rs').write_text(program)
         result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or '4 passed' not in result.stdout:
+        if result.returncode or '5 passed' not in result.stdout:
             raise SystemExit(result.stdout)
-        print('driver-connections: 4 production connection and control-wait regressions passed')
+        print('driver-connections: 5 production connection and control-wait regressions passed')
         mutations = {
             'discarded CONNECT while idle': program.replace('drain_control_into(bootstrap, bind, Some(serving))', 'drain_control_into(bootstrap, bind, None)'),
             'lost DISCONNECT refund': program.replace('send_frame(bootstrap, proto::Opcode::Disconnect, bind.generation, &payload)', 'true'),
             'lost publication token during removal': program.replace('self.tokens[index] = self.tokens[self.count];', ''),
+            'lost connection scope': program.replace('self.scopes[self.count] = scope;', 'self.scopes[self.count] = proto::Scope::Whole;'),
         }
         for name, mutant in mutations.items():
             if mutant == program:

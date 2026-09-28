@@ -432,13 +432,161 @@ impl TraceSpan {
 	}
 }
 
+/// One device interrupt identity that woke a core, and how many times it did: the IDT vector on
+/// x86_64 (a legacy IRQ n is 0x20 + n), the INTID on aarch64, the interrupt-file identity on
+/// riscv64.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoreWakeSource {
+	pub source: u32,
+	pub count: u64,
+}
+
+impl CoreWakeSource {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CoreWakeSource> {
+		let mut r = Reader::new(bytes);
+		let value = CoreWakeSource::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CoreWakeSource> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CoreWakeSource::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.source)?;
+		w.u64(self.count)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CoreWakeSource> {
+		let source = r.u32()?;
+		let count = r.u64()?;
+		Some(CoreWakeSource { source, count })
+	}
+}
+
+/// HOW ONE CORE RESTS, from the kernel's own record: the time it spent halted, how many times it
+/// halted, and each wake under what ended it - its timer, an IPI, the housekeeping bound, or a
+/// device's interrupt, in total and per identity. Wakes per second are two snapshots and the time
+/// between them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoreIdle {
+	pub cpu: u32,
+	pub idle_ns: u64,
+	pub halts: u64,
+	pub wakes_timer: u64,
+	pub wakes_ipi: u64,
+	pub wakes_housekeeping: u64,
+	pub wakes_device: u64,
+	pub sources: Vec<CoreWakeSource>,
+}
+
+impl CoreIdle {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CoreIdle> {
+		let mut r = Reader::new(bytes);
+		let value = CoreIdle::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CoreIdle> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CoreIdle::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.cpu)?;
+		w.u64(self.idle_ns)?;
+		w.u64(self.halts)?;
+		w.u64(self.wakes_timer)?;
+		w.u64(self.wakes_ipi)?;
+		w.u64(self.wakes_housekeeping)?;
+		w.u64(self.wakes_device)?;
+		if self.sources.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.sources.len() as u16)?;
+		for v6 in self.sources.iter() {
+			v6.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CoreIdle> {
+		let cpu = r.u32()?;
+		let idle_ns = r.u64()?;
+		let halts = r.u64()?;
+		let wakes_timer = r.u64()?;
+		let wakes_ipi = r.u64()?;
+		let wakes_housekeeping = r.u64()?;
+		let wakes_device = r.u64()?;
+		let sources = {
+			let v7 = r.u16()? as usize;
+			let v7 = (v7 <= 8).then_some(v7)?;
+			let mut v8 = Vec::new();
+			v8.try_reserve_exact(v7).ok()?;
+			for _ in 0..v7 {
+				v8.push(CoreWakeSource::read(r)?);
+			}
+			v8
+		};
+		Some(CoreIdle { cpu, idle_ns, halts, wakes_timer, wakes_ipi, wakes_housekeeping, wakes_device, sources })
+	}
+}
+
 /// The whole live System Graph: every component node (services, drivers, devices) with
-/// its edges, state and counters, plus the trace spans the snapshot recorded. The one
-/// typed value an edge node's observability serves, rendered as CLI / JSON / CBOR.
+/// its edges, state and counters, plus the trace spans the snapshot recorded and each
+/// core's idle record. The one typed value an edge node's observability serves, rendered
+/// as CLI / JSON / CBOR.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Graph {
 	pub components: Vec<Component>,
 	pub spans: Vec<TraceSpan>,
+	pub cores: Vec<CoreIdle>,
 }
 
 impl Graph {
@@ -481,38 +629,55 @@ impl Graph {
 			return None;
 		}
 		w.u16(self.components.len() as u16)?;
-		for v6 in self.components.iter() {
-			v6.write(w)?;
+		for v9 in self.components.iter() {
+			v9.write(w)?;
 		}
 		if self.spans.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.spans.len() as u16)?;
-		for v7 in self.spans.iter() {
-			v7.write(w)?;
+		for v10 in self.spans.iter() {
+			v10.write(w)?;
+		}
+		if self.cores.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.cores.len() as u16)?;
+		for v11 in self.cores.iter() {
+			v11.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Graph> {
 		let components = {
-			let v8 = r.u16()? as usize;
-			let mut v9 = Vec::new();
-			v9.try_reserve_exact(v8).ok()?;
-			for _ in 0..v8 {
-				v9.push(Component::read(r)?);
+			let v12 = r.u16()? as usize;
+			let mut v13 = Vec::new();
+			v13.try_reserve_exact(v12).ok()?;
+			for _ in 0..v12 {
+				v13.push(Component::read(r)?);
 			}
-			v9
+			v13
 		};
 		let spans = {
-			let v10 = r.u16()? as usize;
-			let mut v11 = Vec::new();
-			v11.try_reserve_exact(v10).ok()?;
-			for _ in 0..v10 {
-				v11.push(TraceSpan::read(r)?);
+			let v14 = r.u16()? as usize;
+			let mut v15 = Vec::new();
+			v15.try_reserve_exact(v14).ok()?;
+			for _ in 0..v14 {
+				v15.push(TraceSpan::read(r)?);
 			}
-			v11
+			v15
 		};
-		Some(Graph { components, spans })
+		let cores = {
+			let v16 = r.u16()? as usize;
+			let v16 = (v16 <= 64).then_some(v16)?;
+			let mut v17 = Vec::new();
+			v17.try_reserve_exact(v16).ok()?;
+			for _ in 0..v16 {
+				v17.push(CoreIdle::read(r)?);
+			}
+			v17
+		};
+		Some(Graph { components, spans, cores })
 	}
 }
 
@@ -560,13 +725,13 @@ pub mod system_graph {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v12) => {
+						Ok(v18) => {
 							w.u8(1)?;
-							v12.write(w)?;
+							v18.write(w)?;
 						}
-						Err(v13) => {
+						Err(v19) => {
 							w.u8(0)?;
-							v13.write(w)?;
+							v19.write(w)?;
 						}
 					}
 					Some(())
@@ -847,19 +1012,19 @@ pub mod supervisor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v14) => {
+						Ok(v20) => {
 							w.u8(1)?;
-							if v14.len() > u16::MAX as usize {
+							if v20.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v14.len() as u16)?;
-							for v16 in v14.iter() {
-								v16.write(w)?;
+							w.u16(v20.len() as u16)?;
+							for v22 in v20.iter() {
+								v22.write(w)?;
 							}
 						}
-						Err(v15) => {
+						Err(v21) => {
 							w.u8(0)?;
-							v15.write(w)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -989,13 +1154,13 @@ pub mod supervisor {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v17 = r.u16()? as usize;
-						let mut v18 = Vec::new();
-						v18.try_reserve_exact(v17).ok()?;
-						for _ in 0..v17 {
-							v18.push(SupervisorStat::read(r)?);
+						let v23 = r.u16()? as usize;
+						let mut v24 = Vec::new();
+						v24.try_reserve_exact(v23).ok()?;
+						for _ in 0..v23 {
+							v24.push(SupervisorStat::read(r)?);
 						}
-						v18
+						v24
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1267,13 +1432,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v20 = true;
-		for v19 in self.deps.iter() {
-			if !v20 {
+		let mut v26 = true;
+		for v25 in self.deps.iter() {
+			if !v26 {
 				out.push(',');
 			}
-			v20 = false;
-			crate::codec::json_escape(v19, out);
+			v26 = false;
+			crate::codec::json_escape(v25, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -1282,13 +1447,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"resources\":");
 		out.push('[');
-		let mut v22 = true;
-		for v21 in self.resources.iter() {
-			if !v22 {
+		let mut v28 = true;
+		for v27 in self.resources.iter() {
+			if !v28 {
 				out.push(',');
 			}
-			v22 = false;
-			v21.to_json_into(out);
+			v28 = false;
+			v27.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1306,13 +1471,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v24 = true;
-		for v23 in self.deps.iter() {
-			if !v24 {
+		let mut v30 = true;
+		for v29 in self.deps.iter() {
+			if !v30 {
 				out.push_str(", ");
 			}
-			v24 = false;
-			out.push_str(v23);
+			v30 = false;
+			out.push_str(v29);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -1321,13 +1486,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("resources=");
 		out.push('[');
-		let mut v26 = true;
-		for v25 in self.resources.iter() {
-			if !v26 {
+		let mut v32 = true;
+		for v31 in self.resources.iter() {
+			if !v32 {
 				out.push_str(", ");
 			}
-			v26 = false;
-			v25.to_text_into(out);
+			v32 = false;
+			v31.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1342,15 +1507,15 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v27 in self.deps.iter() {
-			crate::codec::cbor::text(out, v27);
+		for v33 in self.deps.iter() {
+			crate::codec::cbor::text(out, v33);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::array(out, self.resources.len());
-		for v28 in self.resources.iter() {
-			v28.to_cbor_into(out);
+		for v34 in self.resources.iter() {
+			v34.to_cbor_into(out);
 		}
 	}
 }
@@ -1398,6 +1563,161 @@ impl TraceSpan {
 	}
 }
 
+impl CoreWakeSource {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"source\":");
+		let _ = write!(out, "{}", self.source);
+		out.push(',');
+		out.push_str("\"count\":");
+		let _ = write!(out, "{}", self.count);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("source=");
+		let _ = write!(out, "{}", self.source);
+		out.push_str(", ");
+		out.push_str("count=");
+		let _ = write!(out, "{}", self.count);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "source");
+		crate::codec::cbor::uint(out, self.source as u64);
+		crate::codec::cbor::text(out, "count");
+		crate::codec::cbor::uint(out, self.count as u64);
+	}
+}
+
+impl CoreIdle {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"cpu\":");
+		let _ = write!(out, "{}", self.cpu);
+		out.push(',');
+		out.push_str("\"idle-ns\":");
+		let _ = write!(out, "{}", self.idle_ns);
+		out.push(',');
+		out.push_str("\"halts\":");
+		let _ = write!(out, "{}", self.halts);
+		out.push(',');
+		out.push_str("\"wakes-timer\":");
+		let _ = write!(out, "{}", self.wakes_timer);
+		out.push(',');
+		out.push_str("\"wakes-ipi\":");
+		let _ = write!(out, "{}", self.wakes_ipi);
+		out.push(',');
+		out.push_str("\"wakes-housekeeping\":");
+		let _ = write!(out, "{}", self.wakes_housekeeping);
+		out.push(',');
+		out.push_str("\"wakes-device\":");
+		let _ = write!(out, "{}", self.wakes_device);
+		out.push(',');
+		out.push_str("\"sources\":");
+		out.push('[');
+		let mut v36 = true;
+		for v35 in self.sources.iter() {
+			if !v36 {
+				out.push(',');
+			}
+			v36 = false;
+			v35.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("cpu=");
+		let _ = write!(out, "{}", self.cpu);
+		out.push_str(", ");
+		out.push_str("idle-ns=");
+		let _ = write!(out, "{}", self.idle_ns);
+		out.push_str(", ");
+		out.push_str("halts=");
+		let _ = write!(out, "{}", self.halts);
+		out.push_str(", ");
+		out.push_str("wakes-timer=");
+		let _ = write!(out, "{}", self.wakes_timer);
+		out.push_str(", ");
+		out.push_str("wakes-ipi=");
+		let _ = write!(out, "{}", self.wakes_ipi);
+		out.push_str(", ");
+		out.push_str("wakes-housekeeping=");
+		let _ = write!(out, "{}", self.wakes_housekeeping);
+		out.push_str(", ");
+		out.push_str("wakes-device=");
+		let _ = write!(out, "{}", self.wakes_device);
+		out.push_str(", ");
+		out.push_str("sources=");
+		out.push('[');
+		let mut v38 = true;
+		for v37 in self.sources.iter() {
+			if !v38 {
+				out.push_str(", ");
+			}
+			v38 = false;
+			v37.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 8);
+		crate::codec::cbor::text(out, "cpu");
+		crate::codec::cbor::uint(out, self.cpu as u64);
+		crate::codec::cbor::text(out, "idle-ns");
+		crate::codec::cbor::uint(out, self.idle_ns as u64);
+		crate::codec::cbor::text(out, "halts");
+		crate::codec::cbor::uint(out, self.halts as u64);
+		crate::codec::cbor::text(out, "wakes-timer");
+		crate::codec::cbor::uint(out, self.wakes_timer as u64);
+		crate::codec::cbor::text(out, "wakes-ipi");
+		crate::codec::cbor::uint(out, self.wakes_ipi as u64);
+		crate::codec::cbor::text(out, "wakes-housekeeping");
+		crate::codec::cbor::uint(out, self.wakes_housekeeping as u64);
+		crate::codec::cbor::text(out, "wakes-device");
+		crate::codec::cbor::uint(out, self.wakes_device as u64);
+		crate::codec::cbor::text(out, "sources");
+		crate::codec::cbor::array(out, self.sources.len());
+		for v39 in self.sources.iter() {
+			v39.to_cbor_into(out);
+		}
+	}
+}
+
 impl Graph {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1418,25 +1738,37 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v30 = true;
-		for v29 in self.components.iter() {
-			if !v30 {
+		let mut v41 = true;
+		for v40 in self.components.iter() {
+			if !v41 {
 				out.push(',');
 			}
-			v30 = false;
-			v29.to_json_into(out);
+			v41 = false;
+			v40.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"spans\":");
 		out.push('[');
-		let mut v32 = true;
-		for v31 in self.spans.iter() {
-			if !v32 {
+		let mut v43 = true;
+		for v42 in self.spans.iter() {
+			if !v43 {
 				out.push(',');
 			}
-			v32 = false;
-			v31.to_json_into(out);
+			v43 = false;
+			v42.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"cores\":");
+		out.push('[');
+		let mut v45 = true;
+		for v44 in self.cores.iter() {
+			if !v45 {
+				out.push(',');
+			}
+			v45 = false;
+			v44.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1445,40 +1777,57 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v34 = true;
-		for v33 in self.components.iter() {
-			if !v34 {
+		let mut v47 = true;
+		for v46 in self.components.iter() {
+			if !v47 {
 				out.push_str(", ");
 			}
-			v34 = false;
-			v33.to_text_into(out);
+			v47 = false;
+			v46.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("spans=");
 		out.push('[');
-		let mut v36 = true;
-		for v35 in self.spans.iter() {
-			if !v36 {
+		let mut v49 = true;
+		for v48 in self.spans.iter() {
+			if !v49 {
 				out.push_str(", ");
 			}
-			v36 = false;
-			v35.to_text_into(out);
+			v49 = false;
+			v48.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("cores=");
+		out.push('[');
+		let mut v51 = true;
+		for v50 in self.cores.iter() {
+			if !v51 {
+				out.push_str(", ");
+			}
+			v51 = false;
+			v50.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v37 in self.components.iter() {
-			v37.to_cbor_into(out);
+		for v52 in self.components.iter() {
+			v52.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v38 in self.spans.iter() {
-			v38.to_cbor_into(out);
+		for v53 in self.spans.iter() {
+			v53.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "cores");
+		crate::codec::cbor::array(out, self.cores.len());
+		for v54 in self.cores.iter() {
+			v54.to_cbor_into(out);
 		}
 	}
 }

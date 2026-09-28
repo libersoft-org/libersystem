@@ -206,6 +206,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpio-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "graphics-core"
 version = "0.0.0"
 dependencies = [
@@ -241,6 +249,26 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "hid-i2c"
+version = "0.0.0"
+
+[[package]]
+name = "i2c-client"
+version = "0.0.0"
+dependencies = [
+ "hid-i2c",
+ "i2c-device-proto",
+]
+
+[[package]]
+name = "i2c-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
 
 [[package]]
 name = "indexmap"
@@ -294,8 +322,12 @@ dependencies = [
  "flac",
  "fscore",
  "gif",
+ "gpio-device-proto",
  "graphics-core",
  "graphics-proto",
+ "hid-i2c",
+ "i2c-client",
+ "i2c-device-proto",
  "input-proto",
  "liberfs",
  "midi-device-proto",
@@ -317,6 +349,7 @@ dependencies = [
  "system-manifest",
  "term",
  "tga",
+ "tickclock",
  "topology",
  "tpm",
  "vorbis",
@@ -615,6 +648,10 @@ version = "0.0.0"
 dependencies = [
  "pix",
 ]
+
+[[package]]
+name = "tickclock"
+version = "0.0.0"
 
 [[package]]
 name = "tinyvec"

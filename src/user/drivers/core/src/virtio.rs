@@ -155,6 +155,9 @@ pub const FEATURE_INDIRECT_DESC: u32 = 1 << 28;
 // How many descriptors one indirect table holds, in `submit_chains`.
 pub const INDIRECT_TABLE_LEN: usize = 8;
 
+// How long `submit_chains` waits for its chains to complete: one second, in scheduler ticks.
+pub const SUBMIT_BUDGET_TICKS: u64 = 100;
+
 // One set-up split virtqueue: its rings (in a DMA page) and the address/value used
 // to notify the device of new work.
 pub struct Queue {
@@ -667,6 +670,12 @@ impl Queue {
 	// `INDIRECT_TABLE_LEN` descriptors per chain - so each chain takes ONE ring slot: virtio-i2c's queue may be
 	// four entries long, and two three-descriptor requests do not fit in it directly. Without it the chains
 	// are laid out one after the other, which a ring with room for all of them takes.
+	//
+	// THE WAIT IS BOUNDED IN TIME, NOT IN SPINS: `SUBMIT_BUDGET_TICKS`. A spin count is a different time on every
+	// machine and in every build, and the device side of these queues may be a process on the host - a
+	// vhost-user backend answers when the host schedules it - which a budget of ten million spins in an
+	// unoptimised driver (tens of milliseconds) timed out under an ordinary scheduling delay, and the request
+	// the device then did answer was one its driver had already given up on.
 	pub fn submit_chains(&self, chains: &[&[(u64, u32, bool)]], indirect: Option<(u64, u64)>, used: &mut [u32]) -> Result<(), UsedFault> {
 		unsafe {
 			let count = chains.len();
@@ -725,22 +734,26 @@ impl Queue {
 			w16(avail + 2, old_avail.wrapping_add(count as u16));
 			fence(Ordering::SeqCst);
 			w16(self.notify_addr, self.index);
+			let give_up = clock().saturating_add(SUBMIT_BUDGET_TICKS);
 			let mut spins: u32 = 0;
+			let mut seen_idx: u16;
 			loop {
 				fence(Ordering::SeqCst);
-				if r16(used_ring + 2).wrapping_sub(old_used) >= count as u16 {
+				seen_idx = r16(used_ring + 2);
+				if seen_idx.wrapping_sub(old_used) >= count as u16 {
 					break;
 				}
-				spins += 1;
-				if spins > 10_000_000 {
-					return Err(UsedFault::NoCompletion);
-				}
+				spins = spins.wrapping_add(1);
 				if spins % 4096 == 0 {
+					if clock() >= give_up {
+						return Err(UsedFault::NoCompletion);
+					}
 					yield_now();
 				}
 			}
 			fence(Ordering::SeqCst);
-			check_used_advance(old_used, r16(used_ring + 2), count as u16)?;
+			// THE INDEX THAT ENDED THE WAIT is the one the completions are counted against.
+			check_used_advance(old_used, seen_idx, count as u16)?;
 			let mut seen = [false; 8];
 			for n in 0..count as u16 {
 				let elem = used_ring + 4 + (old_used.wrapping_add(n) % self.size) as u64 * 8;

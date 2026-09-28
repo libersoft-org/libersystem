@@ -1780,6 +1780,8 @@ pub fn note_error_reporter<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> bool 
 	table[count] = Some((bus, dev, func));
 	count += 1;
 	*ERROR_REPORTERS.lock() = (table, count);
+	// AN ERROR REPORTER IS POLLED, so the idle boot processor wakes for it at the housekeeping bound.
+	crate::idle::add_housekeeping(crate::idle::HOUSEKEEPING_PCI_ERRORS);
 	true
 }
 

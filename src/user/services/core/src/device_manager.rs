@@ -558,6 +558,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		#[cfg(feature = "development")]
 		{
 			tests::unopened_provider_withdrawal();
+			tests::scoped_bus_publication();
 			tests::catalogue_scope_denial();
 			tests::catalogue_cap_refusal();
 			tests::pending_shutdown_outcomes();

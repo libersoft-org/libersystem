@@ -230,6 +230,8 @@ def main():
 		fail("the production pending-shutdown outcome checks did not pass")
 	if "DeviceManager: unopened provider withdrawal closed its real channel" not in boot_log:
 		fail("the production unopened-provider channel-close check did not pass")
+	if "DeviceManager: a bus provider's offered endpoint was closed at publication and counted nothing" not in boot_log:
+		fail("the production bus-publication check did not pass - an i2c-bus or gpio-lines offer kept its whole-controller endpoint")
 	if "DeviceManager: boot attempt budget and one-shot operator retry verified" not in boot_log:
 		fail("the production boot-attempt budget and operator-retry checks did not pass")
 	if 'dma: every bus-mastering device is translated' not in boot_log:

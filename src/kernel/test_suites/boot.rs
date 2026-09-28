@@ -262,7 +262,8 @@ fn init_package_starts_system_manager() {
 		if passes % 500 == 0 {
 			crate::serial_println!("boot: {} online report(s) and {} lifecycle report(s) after {passes} pass(es)", actual_online_reports.len(), actual_lifecycle_reports.len());
 		}
-		arch::idle_halt();
+		// A loop by count: one tick each pass.
+		crate::idle::halt(Some(arch::apic::ticks().saturating_add(1)), sched::runnable);
 	}
 	// WHICH PROVIDER GIVES THIS BOOT ITS LINK, WHICH IS NO LONGER ONE ANSWER. This line used to say
 	// "with a link only where virtio_net is admitted", and that stopped being true the moment a

@@ -4195,3 +4195,399 @@ fn usb_dfu_follows_a_runtime_target_into_dfu_mode_and_survives_it_leaving() {
 	sched::run_until_idle();
 	let _ = crate::device::release_claim(claim);
 }
+
+// ------------------------------------------------------------------------ the I2C and GPIO controllers
+//
+// THE DEVICE SIDE IS A PROCESS ON THE HOST: `vhost-i2c-gpio.py` behind QEMU's `vhost-user-i2c-pci` and
+// `vhost-user-gpio-pci`, which `test-kernel.sh` starts when a run asks with `I2C_FIXTURE=bus` - a register
+// device at 0x50 and eight named input lines. So every answer below is a device model's, and none of them is
+// the driver describing itself.
+//
+// THIS HARNESS PLAYS DEVICEMANAGER, and plays it the way a bus provider is served: the endpoint the offer
+// carries is closed unread - it would be an unscoped connection to the whole controller - and every
+// connection is minted with a SCOPED `CONNECT` naming one address or one line.
+
+// One controller of the bus fixture, bound the way DeviceManager binds it.
+struct BusController {
+	kernel_ep: alloc::sync::Arc<object::channel::Channel>,
+	generation: u64,
+	token: u16,
+	driver: alloc::sync::Arc<object::process::Process>,
+	claim: abi::ClaimKey,
+	interrupt: Option<(alloc::sync::Arc<object::interrupt::Interrupt>, u32)>,
+}
+
+// Bind the controller of `virtio_type` to the driver `elf`: the device taken, its BAR recorded as derived from
+// the claim, its MSI-X vector minted for an interrupt-driven driver, and its handshake read. The offered
+// endpoint is dropped here, as DeviceManager closes it at publication.
+fn bind_bus_controller(elf: &[u8], virtio_type: u32, interrupt_driven: bool, provider: u16) -> BusController {
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == virtio_type {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, on_bus: u8::from(d.on_bus), _pad1: [0; 1], port_count: d.port_count, _pad2: [0; 2], ports: d.ports }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the controller the I2C fixture attaches");
+	// Its MSI-X vector, minted the way `SYS_DEVICE_MSIX_ACQUIRE` mints one - see the virtio-snd oracle.
+	let interrupt = interrupt_driven.then(|| {
+		let (msix_cap, table_phys, bus, dev, func) = device::with(index, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)).unwrap();
+		assert!(msix_cap != 0, "the controller exposes MSI-X");
+		let dest = arch::percpu::this_cpu().lapic_id() as u8;
+		let vector = arch::interrupts::acquire_msi(table_phys, dest, index as u32).expect("an MSI vector should be free");
+		let interrupt = object::interrupt::Interrupt::new(vector).expect("a test interrupt");
+		assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
+		arch::interrupts::unmask_msi(vector, table_phys);
+		arch::pci::msix_enable(bus, dev, func, msix_cap);
+		(interrupt, vector)
+	});
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	let driver = loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the controller's driver should load");
+	let claim = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the controller")).expect("the controller is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, claim.generation, if interrupt.is_some() { 2 } else { 1 }).expect("the BIND should send");
+	let device_memory = DeviceMemory::for_claim(claim, bar_phys, bar_len as usize).expect("a test device memory");
+	assert!(device::register_derived(claim, alloc::sync::Arc::downgrade(&(device_memory.clone() as alloc::sync::Arc<dyn object::KernelObject>))), "the device memory is recorded as derived from this claim");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, claim.generation, device_memory, Rights::ALL).expect("the DEVICE resource should send");
+	if let Some((interrupt, _)) = &interrupt {
+		send_resource(&kernel_ep, driver_protocol::ResourceKind::Irq, claim.generation, interrupt.clone(), Rights::ALL).expect("the IRQ resource should send");
+	}
+	sched::run_until_idle();
+	let offers = recv_offers(&kernel_ep, claim.generation).expect("the controller's driver should report READY");
+	assert_eq!(offers.len(), 1, "one bus publication");
+	let token = offer_token_of(&offers, provider).expect("the driver publishes its bus provider");
+	// THE OFFERED ENDPOINT IS CLOSED UNREAD: the driver kept no end of it, and nothing may reach the whole bus.
+	drop(offers);
+	BusController { kernel_ep, generation: claim.generation, token, driver, claim, interrupt }
+}
+
+impl BusController {
+	// ONE SCOPED CONNECTION, minted as DeviceManager mints it: the consumer's end, or None when the driver
+	// refused it - which it says by closing the connection, since `CONNECT` is one-way.
+	fn connect(&self, scope: driver_protocol::Scope) -> Option<alloc::sync::Arc<object::channel::Channel>> {
+		let (host_end, driver_end) = object::channel::Channel::create();
+		send_scoped_connect(&self.kernel_ep, self.generation, self.token, scope, driver_end).expect("the scoped CONNECT should send");
+		sched::run_until_idle();
+		(!host_end.is_peer_closed()).then_some(host_end)
+	}
+
+	// How many `DISCONNECT`s under this publication's token the driver has sent since the last look.
+	fn departures(&self) -> usize {
+		let mut count = 0;
+		while let Ok(message) = self.kernel_ep.recv() {
+			let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
+			if header.generation != self.generation || !matches!(header.opcode, driver_protocol::Opcode::Disconnect) {
+				continue;
+			}
+			let payload = header.payload(&message.bytes);
+			if payload.len() == driver_protocol::U16_PAYLOAD_LEN && u16::from_le_bytes([payload[0], payload[1]]) == self.token {
+				count += 1;
+			}
+		}
+		count
+	}
+
+	// THE CONTROLLER'S PROCESS KILLED, as DeviceManager kills a driver - SIG_KILL, which terminates it and wakes
+	// every thread, so one parked in a wait lets go of what it holds: every connection it served closes with
+	// it. Then the vector and the claim are given back.
+	fn kill(self, connections: &[&object::channel::Channel]) {
+		assert_eq!(crate::syscall::deliver_signal(&self.driver, abi::SIG_KILL), 0, "the kill is delivered");
+		sched::run_until_idle();
+		for connection in connections {
+			assert!(connection.is_peer_closed(), "a scoped connection outlived the controller that served it");
+		}
+		if let Some((interrupt, vector)) = &self.interrupt {
+			assert!(interrupt.revoke(), "the architecture did not confirm the vector's teardown");
+			assert!(!arch::interrupts::is_bound(*vector), "the revoked vector is still bound");
+		}
+		let _ = device::release_claim(self.claim);
+	}
+}
+
+#[cfg(target_arch = "x86_64")]
+const BUS_PATIENCE: u64 = 1000;
+#[cfg(not(target_arch = "x86_64"))]
+const BUS_PATIENCE: u64 = 1000 * 13;
+
+// A COMMAND TO THE FIXTURE through the register device's control mailbox (register 0xE0 at 0x50): the control
+// socket's own commands, carried in-band because a test in the guest cannot reach a socket on the host.
+// Answers the fixture's reply, which must be `ok`.
+fn i2c_fixture(bus: &mut i2c_client::ScopedBus<KernelTransport<'_>>, command: &str) -> alloc::string::String {
+	use hid_i2c::I2cBus;
+	let at = hid_i2c::SlaveAddress::new(0x50).unwrap();
+	let mut text = alloc::vec![0xE0u8];
+	text.extend_from_slice(command.as_bytes());
+	bus.write(at, &text).expect("the mailbox write reached the fixture");
+	let mut reply = [0u8; 48];
+	bus.read(at, &mut reply).expect("the mailbox reply was read");
+	let end = reply.iter().position(|&byte| byte == 0).unwrap_or(reply.len());
+	let reply = alloc::string::String::from_utf8_lossy(&reply[..end]).into_owned();
+	assert!(reply.starts_with("ok"), "the fixture refused {command:?}: {reply}");
+	reply
+}
+
+tagged_test!(virtio_i2c_serves_one_address_per_connection_and_every_transaction_it_declares, [Drivers, I2c], id = "kernel.hardware.virtio_i2c_serves_one_address_per_connection_and_every_transaction_it_declares", covers = ["kernel", "bin.virtio_i2c", "i2c-device-proto", "i2c-client"]);
+fn virtio_i2c_serves_one_address_per_connection_and_every_transaction_it_declares() {
+	use driver_protocol::Scope;
+	use hid_i2c::{BusError, I2cBus, SlaveAddress};
+	use i2c_client::{Refusal, ScopedBus, Smbus, SmbusError};
+	use i2c_device_proto::generated::liber::i2c_device::v1::{I2cFunctionality, I2cStatus, i2c_device::Client};
+
+	let asked = option_env!("I2C_FIXTURE").unwrap_or("");
+	if asked != "bus" {
+		crate::serial_println!("virtio-i2c: NOT RUN - no I2C fixture on this run; attach one with I2C_FIXTURE=bus");
+		return;
+	}
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_i2c.lsexe")).expect("the virtio_i2c driver should be staged on the volume under drivers/");
+	let controller = bind_bus_controller(elf, abi::VIRTIO_TYPE_I2C, false, driver_protocol::provider::I2C_BUS);
+	let at_50 = SlaveAddress::new(0x50).unwrap();
+	let at_51 = SlaveAddress::new(0x51).unwrap();
+
+	// 1. THE CONNECTION FOR 0x50, AND WHAT THE CONTROLLER DECLARES ON IT.
+	let first = controller.connect(Scope::I2cAddress(0x50)).expect("a connection scoped to 0x50 is served");
+	let mut client = Client::new(KernelTransport::new(&first, BUS_PATIENCE));
+	let declared = client.functionality().expect("the controller answered").expect("and declared what it serves");
+	assert_eq!(declared, I2cFunctionality { plain: true, max_transfer: 2048, quick: true, byte: true, byte_data: true, word_data: true, block_write: true, block_read: false, i2c_block_read: true, pec: true }, "plain I2C, and every SMBus transaction that composes from it - not the block read with the device's count");
+	assert_eq!(client.address(), Some(Ok(0x50)), "the connection reaches the address it was scoped to");
+
+	// 2. PLAIN I2C, through `hid-i2c`'s bus over the connection - the client side a HID driver uses.
+	let mut bus = ScopedBus::new(client).expect("a controller serving plain I2C is taken");
+	bus.write(at_50, &[0x10, 0xAA, 0xBB, 0xCC]).expect("a write reaches the register device");
+	let mut three = [0u8; 3];
+	assert_eq!(bus.write_read(at_50, &[0x10], &mut three), Ok(3), "a register read: the write and the read as ONE transfer");
+	assert_eq!(three, [0xAA, 0xBB, 0xCC], "what was written comes back");
+	let mut two = [0u8; 2];
+	assert_eq!(bus.read(at_50, &mut two), Ok(2));
+	assert_eq!(two, [0xAA, 0xBB], "and a plain read answers from the pointer the last write left");
+
+	// 3. 0x51 IS REFUSED ON THE 0x50 CONNECTION, before anything is sent: the register it names is unchanged.
+	assert_eq!(bus.write(at_51, &[0x10, 0xEE]), Err(BusError::NoDevice), "an address other than the connection's own");
+	assert_eq!(bus.write_read(at_50, &[0x10], &mut two), Ok(2));
+	assert_eq!(two, [0xAA, 0xBB], "the refused write reached no device - not even the connection's own");
+
+	// 4. THE BOUND: a transfer past it is refused, by the controller as well as by the client.
+	assert_eq!(bus.write(at_50, &alloc::vec![0u8; 2049]), Err(BusError::TooLong), "the client refuses a message past the controller's maximum");
+	let mut client = bus.into_client();
+	assert_eq!(client.read(&2049).map(|reply| reply.map(|reply| reply.status)), Some(Ok(I2cStatus::TooLong)), "and the controller refuses a read past its maximum");
+	assert_eq!(client.i2c_block_read(&0x10, &33, &false).map(|reply| reply.map(|reply| reply.status)), Some(Ok(I2cStatus::TooLong)), "and a block past SMBus's 32 bytes");
+
+	// 5. THE BLOCK READ WITH THE DEVICE'S COUNT, which a virtio-i2c controller cannot carry: `unsupported`, and a
+	// consumer that needs it is refused at bind.
+	assert_eq!(client.block_read(&0xF0, &false).map(|reply| reply.map(|reply| reply.status)), Some(Ok(I2cStatus::Unsupported)), "a read's length is fixed when it is queued, so the count byte cannot choose it");
+	let none = I2cFunctionality { plain: false, max_transfer: 0, quick: false, byte: false, byte_data: false, word_data: false, block_write: false, block_read: false, i2c_block_read: false, pec: false };
+	let refused = Smbus::new(client, I2cFunctionality { block_read: true, ..none.clone() });
+	assert_eq!(refused.as_ref().err(), Some(&Refusal::Unsupported), "an SSIF-shaped consumer is refused on this controller at bind");
+	drop(refused);
+	let client = Client::new(KernelTransport::new(&first, BUS_PATIENCE));
+
+	// 6. EVERY SMBUS TRANSACTION IT DECLARES, without a PEC and then with one.
+	let every = I2cFunctionality { quick: true, byte: true, byte_data: true, word_data: true, block_write: true, i2c_block_read: true, ..none.clone() };
+	let mut smbus = Smbus::new(client, every.clone()).expect("the SMBus client is taken for what the controller declares");
+	assert_eq!(smbus.quick(false), Ok(()), "a quick write: the address alone");
+	assert_eq!(smbus.quick(true), Ok(()), "and a quick read");
+	smbus.write_byte_data(0x20, 0x42).expect("write byte data");
+	assert_eq!(smbus.read_byte_data(0x20), Ok(0x42), "read byte data");
+	smbus.send_byte(0x20).expect("send byte, which sets the pointer");
+	assert_eq!(smbus.receive_byte(), Ok(0x42), "receive byte, from it");
+	smbus.write_word_data(0x30, 0xBEEF).expect("write word data");
+	assert_eq!(smbus.read_word_data(0x30), Ok(0xBEEF), "read word data, low byte first");
+	smbus.block_write(0x40, b"hello").expect("block write");
+	assert_eq!(smbus.i2c_block_read(0x40, 6), Ok(b"\x05hello".to_vec()), "the block went out with its count, which an I2C block read of six reads back");
+	let mut client = smbus.into_client();
+	// THE DEVICE CHECKS THE PEC NOW, through its mode register: every write's last byte, and every read answers one.
+	assert_eq!(client.write(&[0xFE, 1]).map(|reply| reply.map(|reply| reply.status)), Some(Ok(I2cStatus::Ok)));
+	let mut plain = Smbus::new(client, every.clone()).unwrap();
+	assert_eq!(plain.write_byte_data(0x20, 0x43), Err(SmbusError::Interrupted), "a write without its PEC is refused by a device that checks");
+	let client = plain.into_client();
+	let mut checked = Smbus::new(client, I2cFunctionality { pec: true, quick: false, ..every.clone() }).expect("PEC is declared, so a consumer that needs it is taken");
+	checked.write_byte_data(0x20, 0x43).expect("with its PEC the write is taken");
+	assert_eq!(checked.read_byte_data(0x20), Ok(0x43), "and the read's PEC, over both halves of the transfer, is right");
+	checked.send_byte(0x20).expect("send byte with PEC");
+	assert_eq!(checked.receive_byte(), Ok(0x43), "receive byte with PEC");
+	checked.write_word_data(0x30, 0x1234).expect("write word with PEC");
+	assert_eq!(checked.read_word_data(0x30), Ok(0x1234), "read word with PEC");
+	checked.block_write(0x40, b"pec").expect("block write with PEC");
+	assert_eq!(checked.i2c_block_read(0x40, 4), Ok(b"\x03pec".to_vec()), "I2C block read with PEC");
+	// AND A WRONG ONE: the device answers every read's PEC wrong, and the transaction fails as a PEC failure.
+	let mut client = checked.into_client();
+	assert_eq!(client.write(&[0xFE, 2]).map(|reply| reply.map(|reply| reply.status)), Some(Ok(I2cStatus::Ok)));
+	let mut wrong = Smbus::new(client, I2cFunctionality { pec: true, quick: false, ..every }).unwrap();
+	assert_eq!(wrong.read_byte_data(0x20), Err(SmbusError::Pec), "a PEC that does not match its bytes");
+	assert_eq!(wrong.read_word_data(0x30), Err(SmbusError::Pec));
+	assert_eq!(wrong.i2c_block_read(0x40, 4), Err(SmbusError::Pec));
+	let mut client = wrong.into_client();
+	assert_eq!(client.write(&[0xFE, 0]).map(|reply| reply.map(|reply| reply.status)), Some(Ok(I2cStatus::Ok)), "and the device goes back to no PEC");
+
+	// 7. AN UNOCCUPIED ADDRESS FAILS: its connection is served, and nothing answers at the far end.
+	let empty = controller.connect(Scope::I2cAddress(0x51)).expect("a connection scoped to an address nothing is at is still a connection");
+	let mut nobody = ScopedBus::new(Client::new(KernelTransport::new(&empty, BUS_PATIENCE))).unwrap();
+	assert_eq!(nobody.address(), 0x51);
+	assert_eq!(nobody.write(at_51, &[0x00]), Err(BusError::Interrupted), "nothing acknowledged, and a virtio-i2c device says only that the transfer failed");
+	drop(nobody);
+
+	// 8. EACH ADDRESS IS HELD BY ONE CONNECTION: a second for 0x50 is refused on the connection itself, and so are
+	// an unscoped one and one scoped to a line.
+	controller.departures();
+	assert!(controller.connect(Scope::I2cAddress(0x50)).is_none(), "a second connection for a held address is refused");
+	assert!(controller.connect(Scope::Whole).is_none(), "an unscoped connection to a bus is refused");
+	assert!(controller.connect(Scope::GpioLine { line: 0, trigger: driver_protocol::GpioTrigger::Level }).is_none(), "and one scoped to a line");
+	assert_eq!(controller.departures(), 3, "each refusal gives its place back to the manager");
+	// AND 0x50 IS SERVED AGAIN once its first connection is gone.
+	drop(client);
+	drop(first);
+	sched::run_until_idle();
+	assert_eq!(controller.departures(), 1, "the departed consumer is reported");
+	let again = controller.connect(Scope::I2cAddress(0x50)).expect("0x50 is served again after its first connection disconnected");
+	let mut bus = ScopedBus::new(Client::new(KernelTransport::new(&again, BUS_PATIENCE))).unwrap();
+	assert_eq!(bus.write_read(at_50, &[0x10], &mut three), Ok(3));
+	assert_eq!(three, [0xAA, 0xBB, 0xCC], "by the same device, whose registers are what the first connection left");
+	drop(bus);
+
+	// 9. THE CONTROLLER KILLED: its scoped connections close with its process.
+	crate::serial_println!("virtio-i2c: one address per connection, plain I2C, every declared SMBus transaction with and without PEC, the block read refused, the bound held, and a killed controller's connections closed");
+	controller.kill(&[&*again, &*empty]);
+}
+
+// The next event on a line's stream, or None when none arrives within `patience`.
+fn gpio_event(stream: &object::channel::Channel, patience: u64) -> Option<gpio_device_proto::generated::liber::gpio_device::v1::GpioEvent> {
+	let give_up = arch::apic::ticks() + patience;
+	loop {
+		sched::run_until_idle();
+		if let Ok(frame) = stream.recv() {
+			let mut handles = gpio_device_proto::codec::Handles::new();
+			return Some(gpio_device_proto::generated::liber::gpio_device::v1::gpio_device::events_read(&frame.bytes, &mut handles).expect("a stream frame decodes"));
+		}
+		if arch::apic::ticks() >= give_up {
+			return None;
+		}
+	}
+}
+
+// How long a line is watched for an event that must NOT arrive: long enough for the fixture's completion, the
+// interrupt and the driver's pass to have happened had it been sent.
+#[cfg(target_arch = "x86_64")]
+const GPIO_QUIET: u64 = 30;
+#[cfg(not(target_arch = "x86_64"))]
+const GPIO_QUIET: u64 = 30 * 13;
+
+tagged_test!(virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged, [Drivers, I2c], id = "kernel.hardware.virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged", covers = ["kernel", "bin.virtio_gpio", "bin.virtio_i2c", "gpio-device-proto"]);
+fn virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged() {
+	use driver_protocol::{GpioTrigger as Trigger, Scope};
+	use gpio_device_proto::generated::liber::gpio_device::v1::{self as gpio, gpio_device};
+	use i2c_client::ScopedBus;
+	use i2c_device_proto::generated::liber::i2c_device::v1::i2c_device;
+
+	let asked = option_env!("I2C_FIXTURE").unwrap_or("");
+	if asked != "bus" {
+		crate::serial_println!("virtio-gpio: NOT RUN - no I2C fixture on this run; attach one with I2C_FIXTURE=bus");
+		return;
+	}
+	// THE LINES ARE MOVED THROUGH THE FIXTURE'S MAILBOX, which is on the I2C bus - so both controllers are bound.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let i2c_elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_i2c.lsexe")).expect("the virtio_i2c driver should be staged on the volume under drivers/");
+	let gpio_elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_gpio.lsexe")).expect("the virtio_gpio driver should be staged on the volume under drivers/");
+	let i2c = bind_bus_controller(i2c_elf, abi::VIRTIO_TYPE_I2C, false, driver_protocol::provider::I2C_BUS);
+	let mailbox_end = i2c.connect(Scope::I2cAddress(0x50)).expect("the fixture's address is served");
+	let mut mailbox = ScopedBus::new(i2c_device::Client::new(KernelTransport::new(&mailbox_end, BUS_PATIENCE))).expect("the mailbox's bus");
+	let controller = bind_bus_controller(gpio_elf, abi::VIRTIO_TYPE_GPIO, true, driver_protocol::provider::GPIO_LINES);
+
+	// ONE CONNECTION PER LINE, with its events stream.
+	struct Held<'a> {
+		client: gpio_device::Client<KernelTransport<'a>>,
+		stream: alloc::sync::Arc<object::channel::Channel>,
+	}
+	fn open(end: &object::channel::Channel) -> Held<'_> {
+		let mut client = gpio_device::Client::new(KernelTransport::new(end, BUS_PATIENCE));
+		let handle = client.events().expect("an interrupt line hands over its events stream");
+		let mut transport = client.into_transport();
+		let stream = transport.take(handle).expect("the stream was handed over").into_any_arc().downcast::<object::channel::Channel>().expect("the stream is a channel");
+		Held { client: gpio_device::Client::new(transport), stream }
+	}
+
+	// 1. THE LINE NAMES, read by the driver at bind, and each line's scope as the connection sees it.
+	let named = controller.connect(Scope::GpioLine { line: 0, trigger: Trigger::Level }).expect("a level connection for line 0");
+	let mut level_client = gpio_device::Client::new(KernelTransport::new(&named, BUS_PATIENCE));
+	assert_eq!(level_client.line(), Some(Ok(gpio::GpioLine { line: 0, name: "hid-touchpad".into(), trigger: gpio::GpioTrigger::None })), "the controller's own name for the line, and a level scope");
+
+	// 2. A LINE SCOPED FOR LEVEL READS: the level the fixture sets, and no event and no stream.
+	i2c_fixture(&mut mailbox, "level 0 1");
+	assert_eq!(level_client.level(), Some(Ok(true)), "the level the fixture set");
+	i2c_fixture(&mut mailbox, "level 0 0");
+	assert_eq!(level_client.level(), Some(Ok(false)), "and set again");
+	assert_eq!(level_client.events(), None, "a level connection is refused a stream");
+	assert_eq!(level_client.acknowledge(), Some(Err(gpio::Error::Invalid)), "and has nothing to acknowledge");
+
+	// 3. EVERY TRIGGER, each on its own line, each delivered ONCE and silent until acknowledged. The lines start
+	// where the trigger has not been met.
+	let triggers = [
+		(3u32, Trigger::Rising, "spare-3", "raise 3", true),
+		(4, Trigger::Falling, "spare-4", "lower 4", false),
+		(5, Trigger::Both, "spare-5", "raise 5", true),
+		(6, Trigger::High, "spare-6", "raise 6", true),
+		(7, Trigger::Low, "spare-7", "lower 7", false),
+	];
+	for &(line, .., fires_high) in &triggers {
+		i2c_fixture(&mut mailbox, &alloc::format!("level {line} {}", u8::from(!fires_high)));
+	}
+	let ends: alloc::vec::Vec<_> = triggers.iter().map(|&(line, trigger, ..)| controller.connect(Scope::GpioLine { line, trigger }).expect("an interrupt connection for its line")).collect();
+	let mut held: alloc::vec::Vec<Held<'_>> = ends.iter().map(|end| open(end)).collect();
+	for (held, &(line, _, name, raise, level)) in held.iter_mut().zip(&triggers) {
+		let scoped = held.client.line().expect("the line answered").expect("and named itself");
+		assert_eq!((scoped.line, scoped.name.as_str()), (line, name));
+		assert!(gpio_event(&held.stream, GPIO_QUIET).is_none(), "line {line} is armed and has not fired");
+		assert_eq!(held.client.acknowledge(), Some(Err(gpio::Error::Invalid)), "nothing to acknowledge before an event");
+		i2c_fixture(&mut mailbox, raise);
+		let event = gpio_event(&held.stream, BUS_PATIENCE).unwrap_or_else(|| panic!("line {line} fired and nothing was delivered"));
+		assert_eq!(event, gpio::GpioEvent { level, sequence: 1 }, "line {line}: the first event, at the level it was taken at");
+		// THE LINE IS MASKED: it moves again and nothing is delivered until the acknowledgement.
+		i2c_fixture(&mut mailbox, &alloc::format!("level {line} {}", u8::from(!level)));
+		i2c_fixture(&mut mailbox, &alloc::format!("level {line} {}", u8::from(level)));
+		assert!(gpio_event(&held.stream, GPIO_QUIET).is_none(), "line {line} is silent until its event is acknowledged");
+	}
+	// 4. THE ACKNOWLEDGEMENT: a level line still asserted is delivered AGAIN, and an edge line is not until it moves.
+	for (held, &(line, trigger, ..)) in held.iter_mut().zip(&triggers) {
+		assert_eq!(held.client.acknowledge(), Some(Ok(())), "line {line}'s event is acknowledged");
+		if matches!(trigger, Trigger::High | Trigger::Low) {
+			// STILL ASSERTED, so the buffer the acknowledgement gave back is completed at once - which is why a
+			// second acknowledgement is not asked for here: it would be acknowledging THIS event.
+			let again = gpio_event(&held.stream, BUS_PATIENCE).unwrap_or_else(|| panic!("line {line} is still asserted and was not delivered again after the acknowledgement"));
+			assert_eq!(again.sequence, 2, "line {line}: the second event on this connection");
+			assert_eq!(held.client.acknowledge(), Some(Ok(())));
+		} else {
+			assert_eq!(held.client.acknowledge(), Some(Err(gpio::Error::Invalid)), "line {line}: acknowledged once");
+			assert!(gpio_event(&held.stream, GPIO_QUIET).is_none(), "line {line} is an edge line that has not moved since it was acknowledged");
+		}
+	}
+	// And an edge line fires again when it moves after the acknowledgement.
+	i2c_fixture(&mut mailbox, "lower 3");
+	i2c_fixture(&mut mailbox, "raise 3");
+	assert_eq!(gpio_event(&held[0].stream, BUS_PATIENCE), Some(gpio::GpioEvent { level: true, sequence: 2 }), "a rising edge after the acknowledgement is delivered");
+	assert_eq!(held[0].client.acknowledge(), Some(Ok(())));
+	// The level lines are released so they stop firing.
+	i2c_fixture(&mut mailbox, "lower 6");
+	i2c_fixture(&mut mailbox, "raise 7");
+
+	// 5. EACH LINE IS HELD BY ONE CONNECTION: a second for a held line is refused, and so are an unscoped
+	// connection and one scoped to an address.
+	controller.departures();
+	assert!(controller.connect(Scope::GpioLine { line: 3, trigger: Trigger::Rising }).is_none(), "a second connection for a held line is refused");
+	assert!(controller.connect(Scope::GpioLine { line: 0, trigger: Trigger::Level }).is_none(), "a held line is refused even for level reads");
+	assert!(controller.connect(Scope::Whole).is_none(), "an unscoped connection to a GPIO controller is refused");
+	assert!(controller.connect(Scope::I2cAddress(0x50)).is_none(), "and one scoped to an address");
+	assert!(controller.connect(Scope::GpioLine { line: 8, trigger: Trigger::Level }).is_none(), "and a line the controller does not have");
+	assert_eq!(controller.departures(), 5, "each refusal gives its place back to the manager");
+
+	// 6. THE CONTROLLER KILLED: every line's connection closes with its process.
+	crate::serial_println!("virtio-gpio: line names, a level connection, every trigger delivered once and masked until acknowledged, a level line delivered again, one connection per line, and a killed controller's connections closed");
+	let mut closed: alloc::vec::Vec<&object::channel::Channel> = ends.iter().map(|end| &**end).collect();
+	closed.push(&named);
+	drop(level_client);
+	drop(held);
+	controller.kill(&closed);
+	drop(mailbox);
+	i2c.kill(&[&*mailbox_end]);
+}

@@ -183,6 +183,7 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_PORT_RANGE_MAP, 92),
 	(SYS_PORT_RANGE_UNMAP, 93),
 	(SYS_PORT_RANGE_FIRMWARE, 94),
+	(SYS_CPU_IDLE_INFO, 95),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -769,6 +770,19 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	assert_layout!(covered, MemmapRegion, 24, 8, base => 0, length => 8, kind => 16, _pad => 20);
 	assert_layout!(covered, ModuleLifecycle, 40, 8, init_array => 0, init_count => 8, fini_array => 16, fini_count => 24, is_main_image => 32);
 	assert_layout!(covered, IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);
+	assert_layout!(covered, CpuIdleSource, 16, 8, source => 0, _pad => 4, count => 8);
+	assert_layout!(
+		covered, CpuIdleInfo, 184, 8,
+		cpu => 0,
+		source_count => 4,
+		idle_ns => 8,
+		halts => 16,
+		wakes_timer => 24,
+		wakes_ipi => 32,
+		wakes_housekeeping => 40,
+		wakes_device => 48,
+		sources => 56,
+	);
 	assert_layout!(
 		covered, PciInfo, 12, 2,
 		vendor => 0,

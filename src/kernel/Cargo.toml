@@ -101,10 +101,21 @@ modem-proto = { path = "../user/libs/protocol/modem-proto" }
 # AND THE INPUT WIRE, for the gamepad scenario: it reads InputService's gamepad streams through the generated
 # decoder, so a stream that drifted from its interface fails to compile rather than being misread.
 input-proto = { path = "../user/libs/protocol/input-proto" }
+# AND THE I2C AND GPIO WIRES, for the bus oracle: it drives both controllers the way their consumers will - the
+# I2C one through the contract's own client side, `hid-i2c`'s bus over an address-scoped connection and the
+# SMBus client - so a harness that drifted from either fails to compile rather than passing on its own copy.
+i2c-device-proto = { path = "../user/libs/protocol/i2c-device-proto" }
+gpio-device-proto = { path = "../user/libs/protocol/gpio-device-proto" }
+i2c-client = { path = "../user/libs/driver/i2c-client" }
+hid-i2c = { path = "../user/libs/driver/hid-i2c" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
 # can drive tens of millions of operations through - which is what the one unexplained
 # double allocation needed and could never get from a guest boot.
 buddy = { path = "../buddy" }
+# The monotonic tick, computed from the free-running counter with the sleep offset. In a crate for the
+# same reason `buddy` is: the cases that matter - a counter that kept running across a sleep and one that
+# restarted, a reading behind the anchor - are arithmetic a host can drive and a booted guest cannot.
+tickclock = { path = "../tickclock" }
 # The flattened device tree reader, shared with the loader. It was `arch::common::dtb`; moving it
 # out is what let a real QEMU device tree be handed to it on a host, which immediately found that
 # `timebase_frequency` had never once returned a value.

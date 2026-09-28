@@ -48,56 +48,66 @@ fn a_firmware_pointer_outside_the_direct_map_is_refused_before_it_is_dereference
 	assert!(!mem::within_direct_map(ceiling - 4096, 8192), "a table that starts inside and ends outside is not");
 }
 
-crate::tagged_test!(the_global_clock_advances_once_per_period_however_many_cores_tick, [Smp, Kernel], id = "kernel.smp.the_global_clock_advances_once_per_period_however_many_cores_tick", covers = ["kernel"]);
-fn the_global_clock_advances_once_per_period_however_many_cores_tick() {
-	// KERN-ARCH-007. The scheduler tick is a PER-CORE timer on all three architectures, and aarch64
-	// and riscv64 answered each core's interrupt with `TICKS.fetch_add(1)` - so the monotonic clock
-	// advanced once per core per period. On the machine this suite runs on that is eight cores, so
-	// time ran eight times fast and every deadline in the system - a sleep, a timeout, the caret
-	// blink - was wrong by that factor.
-	//
-	// Asserted on the MECHANISM rather than by timing a window, because a rate measured against a
-	// wall clock on an emulated guest under load is a flaky test and this is a fact about
-	// arithmetic: the same instant, seen by any number of cores, is one tick.
-	use crate::arch::common::time::{TICK_HZ, TickClock};
-
-	// A thousand cycles per tick, so the numbers below are readable.
-	let hz = 1_000 * TICK_HZ as u64;
-	let clock = TickClock::new();
-
-	// Eight cores take their first interrupt at the same instant. The first one anchors the clock
-	// and counts; the other seven find nothing due.
-	for _ in 0..8 {
-		clock.advance(1_000_000, hz);
+crate::tagged_test!(the_clock_never_goes_backwards_across_cores, [Smp, Kernel], id = "kernel.smp.the_clock_never_goes_backwards_across_cores", covers = ["kernel", "tickclock"]);
+fn the_clock_never_goes_backwards_across_cores() {
+	// THE TICK IS COMPUTED FROM EACH CORE'S OWN COUNTER READING, and counters on different cores are not
+	// promised to agree to the cycle: a core a little behind would read a tick below one another core had
+	// already answered, which is time running backwards for anything that compares the two. The clock keeps
+	// one atomic maximum over every tick it answers; this is that promise, on the live clock, on every core at
+	// once. (`kernel.smp.the_global_clock_advances_once_per_period_however_many_cores_tick` asserted the
+	// counter gate this replaced; the arithmetic itself - the anchor, the sleep offset, a reading behind the
+	// anchor - is the host suite `host.tickclock`.)
+	use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+	const READINGS: u64 = 200_000;
+	static LATEST: AtomicU64 = AtomicU64::new(0);
+	static BACKWARDS: AtomicU64 = AtomicU64::new(0);
+	static DONE: AtomicUsize = AtomicUsize::new(0);
+	extern "C" fn read(_argument: u64) {
+		let mut mine = 0u64;
+		for _ in 0..READINGS {
+			// A VALUE ANOTHER CORE PUBLISHED BEFORE THIS READING BEGAN is one the reading may not be below: that
+			// core's own reading raised the clock's maximum before it published.
+			let before = LATEST.load(Ordering::SeqCst);
+			let now = crate::arch::apic::ticks();
+			if now < before || now < mine {
+				BACKWARDS.fetch_add(1, Ordering::SeqCst);
+			}
+			mine = now;
+			LATEST.fetch_max(now, Ordering::SeqCst);
+		}
+		DONE.fetch_add(1, Ordering::SeqCst);
 	}
-	assert_eq!(clock.ticks(), 1, "the instant that starts the clock is one tick, not eight");
-
-	// One full period later, all eight again.
-	for _ in 0..8 {
-		clock.advance(1_001_000, hz);
+	LATEST.store(crate::arch::apic::ticks(), Ordering::SeqCst);
+	BACKWARDS.store(0, Ordering::SeqCst);
+	DONE.store(0, Ordering::SeqCst);
+	let cores = crate::smp::cpu_count();
+	let mut readers = alloc::vec::Vec::new();
+	for cpu in 1..cores {
+		let event = crate::object::event::Event::create().expect("a test event");
+		let thread = crate::sched::prepare_with_object_for(read, event, crate::object::rights::Rights::ALL, Some(cpu));
+		assert!(crate::sched::start_thread_on(cpu, &thread), "a reader was queued on cpu {cpu}");
+		readers.push(thread);
 	}
-	assert_eq!(clock.ticks(), 2, "one period is one tick, whatever the core count");
-
-	// A stall: ten periods have passed by the time anyone looks. The backlog is claimed ONCE, in
-	// one step - replaying it a tick per interrupt would run time fast in bursts, at the interrupt
-	// rate times the core count, and fire every pending deadline in a rush.
-	for _ in 0..8 {
-		clock.advance(1_011_000, hz);
+	// And the core running this test reads beside them.
+	read(0);
+	let mut spins = 0u64;
+	while DONE.load(Ordering::SeqCst) < cores {
+		core::hint::spin_loop();
+		spins += 1;
+		assert!(spins < 20_000_000_000, "the readers on the other cores did not finish");
 	}
-	assert_eq!(clock.ticks(), 12, "a ten-period backlog is ten ticks, claimed by one core");
-
-	// Less than a period is not a tick, however many cores ask.
-	for _ in 0..8 {
-		clock.advance(1_011_999, hz);
+	// And every reader is gone - dropped by its core - before this returns, so the next test's Domain counts
+	// are its own.
+	for thread in readers {
+		let mut spins = 0u64;
+		while alloc::sync::Arc::strong_count(&thread) > 1 {
+			core::hint::spin_loop();
+			spins += 1;
+			assert!(spins < 20_000_000_000, "a finished reader was never reaped by its core");
+		}
 	}
-	assert_eq!(clock.ticks(), 12, "part of a period is not a tick");
-
-	// AND AN UNCALIBRATED COUNTER COUNTS NOTHING, rather than guessing a period: a frequency of
-	// zero is a machine whose cycle clock is not up yet, and inventing a rate there is how a clock
-	// ends up wrong in a way nobody can see.
-	let cold = TickClock::new();
-	cold.advance(1_000_000, 0);
-	assert_eq!(cold.ticks(), 0, "no frequency, no ticks");
+	assert_eq!(BACKWARDS.load(Ordering::SeqCst), 0, "a reading on some core was below one already answered");
+	crate::serial_println!("clock: {cores} core(s) x {READINGS} readings, none below one already answered");
 }
 
 crate::tagged_test!(

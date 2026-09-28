@@ -102,6 +102,12 @@ impl Pending {
 
 static PENDING: SpinLock<Pending> = SpinLock::new(Pending::new());
 
+// WHETHER INPUT IS HELD FOR A CONSOLE THAT HAS NOT TAKEN IT: an idle boot processor then sleeps one tick
+// at most, since its idle hook is what delivers the rest.
+pub fn held() -> bool {
+	PENDING.lock().len != 0
+}
+
 // Register the channel the kernel feeds console input to (set by
 // SYS_CONSOLE_ATTACH). Replaces any previous registration.
 //
@@ -114,9 +120,14 @@ static PENDING: SpinLock<Pending> = SpinLock::new(Pending::new());
 // interrupt arriving mid-swap finds either the old console or the new one, never the new
 // registration beside the old console's leftovers.
 pub fn attach(channel: Arc<Channel>) {
-	let mut console = CONSOLE.lock();
-	PENDING.lock().clear();
-	*console = Some(channel);
+	{
+		let mut console = CONSOLE.lock();
+		PENDING.lock().clear();
+		*console = Some(channel);
+	}
+	// A SHELL STARTED LISTENING, which the boot processor's readiness wait and idle hook act on - and which
+	// no longer takes a tick it would have noticed it on.
+	crate::idle::wake_bsp();
 }
 
 // Whether a shell is attached and still listening (its peer endpoint is alive). False once the

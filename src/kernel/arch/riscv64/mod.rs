@@ -294,12 +294,6 @@ pub mod apic {
 	use crate::arch::common::time::TICK_HZ;
 	use core::sync::atomic::{AtomicU64, Ordering};
 
-	// Monotonic scheduler-tick counter (advanced by the timer interrupt).
-	// COUNTER-GATED, NOT ONE-PER-CORE (KERN-ARCH-007). Every hart takes its own CLINT timer
-	// interrupt, and this was `TICKS.fetch_add(1)` in the handler - so the monotonic clock advanced
-	// once per hart per period and time ran at the hart count times `TICK_HZ`. See
-	// `arch::common::time::TickClock`.
-	static CLOCK: crate::arch::common::time::TickClock = crate::arch::common::time::TickClock::new();
 	// The boot hart id, captured at init (the local "apic" id).
 	static BOOT_HART: AtomicU64 = AtomicU64::new(0);
 
@@ -315,10 +309,56 @@ pub mod apic {
 		}
 	}
 
+	// WHETHER EVERY HART HAS Sstc, read from the device tree at init: `stimecmp` is then this supervisor's own
+	// compare register and a timer is one CSR write rather than a call into the firmware.
+	static SSTC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+	// The next S-mode timer interrupt at counter reading `when` - `u64::MAX` for none - which also clears the
+	// pending timer bit.
+	fn set_timer(when: u64) {
+		if SSTC.load(Ordering::Relaxed) {
+			// `stimecmp` is CSR 0x14D.
+			unsafe { core::arch::asm!("csrw 0x14d, {}", in(reg) when, options(nostack, preserves_flags)) };
+		} else {
+			sbi_set_timer(when);
+		}
+	}
+
+	// EVERY TIMER INTERRUPT THE MACHINE TAKES, on any hart. The clock is computed from the `time` CSR and
+	// advances without one, so the prologue proves the interrupt path by counting these rather than ticks.
+	static TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+
+	pub fn timer_interrupts() -> u64 {
+		TIMER_INTERRUPTS.load(Ordering::Relaxed)
+	}
+
+	// Which harts' timers are a one-shot for a halt, so their interrupt clears the timer instead of re-arming
+	// the tick.
+	static ONE_SHOT: [core::sync::atomic::AtomicBool; crate::smp::MAX_CPUS] = [const { core::sync::atomic::AtomicBool::new(false) }; crate::smp::MAX_CPUS];
+
 	// Arm the next periodic tick: now + timebase / TICK_HZ.
 	pub fn arm_timer() {
 		let interval = super::tsc::hz() / TICK_HZ as u64;
-		sbi_set_timer(super::tsc::now() + interval);
+		set_timer(super::tsc::now() + interval);
+	}
+
+	// THIS HART'S TIMER AS A ONE-SHOT for a halt, at tick `deadline` - never, for `None` or a tick too far
+	// away to express. The compare value is absolute on the same `time` CSR the clock reads, converted
+	// through the sleep offset. False when the clock cannot convert a tick yet, and the tick then stays.
+	pub fn timer_one_shot(deadline: Option<u64>) -> bool {
+		let clock = &crate::arch::common::time::CLOCK;
+		if !clock.anchored() {
+			return false;
+		}
+		ONE_SHOT[crate::sched::current_cpu_id()].store(true, Ordering::Relaxed);
+		set_timer(deadline.and_then(|tick| clock.counter_at(tick)).unwrap_or(u64::MAX));
+		true
+	}
+
+	// THIS HART'S PERIODIC TICK, back after a halt.
+	pub fn timer_periodic() {
+		ONE_SHOT[crate::sched::current_cpu_id()].store(false, Ordering::Relaxed);
+		arm_timer();
 	}
 
 	pub fn send_wake_ipi(dest: u64) {
@@ -339,7 +379,7 @@ pub mod apic {
 
 	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
-		let base = CLOCK.ticks();
+		let base = crate::arch::common::time::CLOCK.ticks(super::tsc::now());
 		#[cfg(test)]
 		{
 			base + crate::tests::clock_skew()
@@ -353,10 +393,15 @@ pub mod apic {
 	// Advance the tick counter and re-arm the timer. Called from the S-mode timer
 	// interrupt (traps.rs).
 	pub fn on_timer_tick() {
-		// EVERY hart re-arms - that is what drives preemption on it - and only the shared clock is
-		// gated, so the rate is the machine's and not the hart count's.
-		CLOCK.advance(super::tsc::now(), super::tsc::hz());
-		arm_timer();
+		TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+		// A ONE-SHOT FOR A HALT FIRES ONCE: the timer is cleared and the halt restores the tick. Otherwise EVERY
+		// hart re-arms - that is what drives preemption on it. The clock is not moved here: it is computed from
+		// the `time` CSR when read (`arch::common::time::CLOCK`).
+		if crate::idle::ready() && ONE_SHOT[crate::sched::current_cpu_id()].load(Ordering::Relaxed) {
+			set_timer(u64::MAX);
+		} else {
+			arm_timer();
+		}
 	}
 
 	// Enable the S-mode timer interrupt (SIE.STIE, bit 5), the software interrupt
@@ -365,6 +410,12 @@ pub mod apic {
 	pub fn init() {
 		unsafe {
 			core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 1) | (1u64 << 9), options(nostack, preserves_flags));
+		}
+		// THE CLOCK STARTS WITH THE FIRST HART'S TIMER, the timebase frequency being the device tree's and
+		// known by now; anchoring is once, so every later hart's call changes nothing.
+		if crate::arch::common::time::CLOCK.anchor(super::tsc::now(), super::tsc::hz()) {
+			// And the boot hart reads, once, whether every hart has Sstc.
+			SSTC.store(unsafe { super::dtb::has_isa_extension(super::DEVICE_TREE.load(Ordering::Acquire), b"sstc") }, Ordering::Relaxed);
 		}
 		arm_timer();
 	}
@@ -415,7 +466,7 @@ pub mod tsc {
 		}
 	}
 	pub fn cycles_to_ns(cycles: u64) -> u64 {
-		crate::arch::common::time::cycles_to_ns(cycles, hz())
+		tickclock::cycles_to_ns(cycles, hz())
 	}
 }
 

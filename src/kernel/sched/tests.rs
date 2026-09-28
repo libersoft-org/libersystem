@@ -183,113 +183,70 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	extern "C" fn stamp(_arg: u64) {
 		RAN_AT.store(1, Ordering::SeqCst);
 	}
-	// WHAT TWENTY REMOTE SPAWNS COST IN CYCLES, with or without the wake.
-	//
-	// TICKS CANNOT RESOLVE THIS AND CYCLES CAN. Counting tick boundaries replaced a 4 ms wall-clock
-	// bound, and it discriminates only while a trip is SHORTER than a tick: at 100 Hz that is 10 ms,
-	// and a cross-core spawn under TCG can exceed it - measured on aarch64 at 8 cores on 2026-08-27,
-	// where the woken trip and the suppressed one BOTH crossed exactly one boundary and there was
-	// nothing left to compare. The generic timer counts at tens of megahertz on every port, so the
-	// difference the tick rounds away is thousands of cycles wide.
-	//
-	// THE SUM, NOT THE BEST. Best-of-twenty is wrong for the control: without the wake a trip waits
-	// for the target core's next interrupt, so the LUCKIEST of twenty is the one where that
-	// interrupt was about to fire anyway - which measures nothing. Summed over twenty, an unwoken
-	// trip pays half a tick period on average and a woken one pays none, and that difference is
-	// large next to what the emulator adds to both.
-	fn cycles_over_twenty(wake: bool) -> u64 {
-		use core::sync::atomic::Ordering;
-		let mut total: u64 = 0;
-		for _ in 0..20 {
-			RAN_AT.store(0, Ordering::SeqCst);
-			let start = arch::tsc::now();
-			if wake {
-				sched::spawn_on(1, stamp, 0);
-			} else {
-				sched::spawn_on_unwoken(1, stamp, 0);
-			}
-			while RAN_AT.load(Ordering::SeqCst) == 0 {
-				core::hint::spin_loop();
-			}
-			total = total.saturating_add(arch::tsc::now().wrapping_sub(start));
+	// THE THREAD IS GONE, not merely finished: its core has dropped it, so its Domain charge is back and the
+	// next test starts from a machine this one left as it found it.
+	fn gone(thread: alloc::sync::Arc<crate::object::thread::Thread>) {
+		let mut spins = 0u64;
+		while alloc::sync::Arc::strong_count(&thread) > 1 {
+			core::hint::spin_loop();
+			spins += 1;
+			assert!(spins < 20_000_000_000, "a finished remote spawn was never reaped by its core");
 		}
-		total
 	}
-
+	// Spin until the stamp, for at most `ticks` ticks; whether it came.
+	fn ran_within(ticks: u64) -> bool {
+		let give_up = arch::apic::ticks() + ticks;
+		while RAN_AT.load(Ordering::SeqCst) == 0 {
+			if arch::apic::ticks() >= give_up {
+				return false;
+			}
+			core::hint::spin_loop();
+		}
+		true
+	}
 	if smp::cpu_count() < 2 {
 		return;
 	}
-	// MEASURED IN TICKS, NOT NANOSECONDS.
-	//
-	// The property is "a queued thread does not wait for the next tick", and it used to be checked
-	// by timing the trip and comparing against 4 ms - a number chosen because a halted core without
-	// the IPI waits for its next 100 Hz tick, so its trips average about 5 ms, while a woken one is
-	// microseconds. That gap is real on x86_64 and aarch64 and it CLOSES under emulation: measured
-	// on riscv64 on 2026-08-20, a woken trip costs 3.3-3.6 ms with excursions past 5.7, because
-	// every guest instruction costs about twenty-five times what it does natively. Against a 4 ms
-	// bound that is a coin toss, and the coin decides whether 165 later tests run at all.
-	//
-	// Counting TICK BOUNDARIES instead measures the property directly and cares nothing for how
-	// long the emulator takes to get there: a trip that crossed no tick boundary did not wait for
-	// one. Without the IPI every trip waits for the next tick and therefore crosses one, so the
-	// discrimination is exact rather than a margin - which is what the old bound had stopped being.
-	//
-	// The IPI itself was verified separately and works on all three: instrumenting
-	// `sbi_send_ipi` and the `code == 1` handler on riscv64 showed 203 sent, 0 errors, 203 received.
+	// THE WAKE IS THE ONLY THING THAT BRINGS AN IDLE CORE TO QUEUED WORK NOW. It used to be the faster of two:
+	// a halted core without the IPI picked the thread up at its next 100 Hz tick, so this test measured the
+	// IPI's saving against half a tick period - which emulation made a coin toss, and the history of this test
+	// is three attempts at a threshold. An idle core's timer is a one-shot for nothing at all now, so the
+	// property is exact rather than a margin: WITH the wake the thread runs, and WITHOUT it it does not run
+	// until the wake is sent.
 	//
 	// A warmup trip whose result is not counted: the first cross-core spawn pays one-time costs.
 	RAN_AT.store(0, Ordering::SeqCst);
-	sched::spawn_on(1, stamp, 0);
-	while RAN_AT.load(Ordering::SeqCst) == 0 {
+	let warmup = sched::spawn_on(1, stamp, 0);
+	assert!(ran_within(1_000), "a woken remote spawn ran");
+	gone(warmup);
+	// Twenty woken trips, each of which must arrive.
+	let start = arch::tsc::now();
+	for _ in 0..20 {
+		RAN_AT.store(0, Ordering::SeqCst);
+		let thread = sched::spawn_on(1, stamp, 0);
+		assert!(ran_within(1_000), "every woken remote spawn runs");
+		gone(thread);
+	}
+	let woken = arch::tsc::now().wrapping_sub(start);
+	crate::serial_println!("    twenty woken remote spawns: {woken} cycles");
+	// THE CONTROL. Nothing else may wake core 1 meanwhile: output left in the serial ring caps an idle
+	// core's sleep at a tick, so the ring is emptied first and core 1 given time to settle into a halt
+	// with no timer at all - and nothing is printed until the control is over.
+	arch::serial::flush_sync();
+	let settle = arch::apic::ticks() + 3;
+	while arch::apic::ticks() < settle {
 		core::hint::spin_loop();
 	}
-	// The BEST of twenty, not every one of them. A trip that costs a third of a tick period crosses
-	// a boundary about a third of the time by luck alone, and this suite runs under emulation on a
-	// shared host where that fraction is not stable. Twenty trips make "every single one of them
-	// happened to straddle a tick" the only way to pass wrongly, and that is what a broken IPI
-	// looks like: without it, crossing is not luck but the mechanism.
-	// AND A CONTROL, BECAUSE THE ABSOLUTE NUMBER DOES NOT SURVIVE EMULATION.
-	//
-	// The same twenty trips are measured twice on the same machine, in the same run, differing only
-	// in whether the wake is sent - so the emulator, the host load and the scheduler are paid by both
-	// sides and cancel. What is left is the IPI: without it the target core sits halted until its
-	// next interrupt, which costs half a tick period per trip on average and nothing at all with it.
-	//
-	// A warmup first, whose result is not counted: the first cross-core spawn pays one-time costs.
 	RAN_AT.store(0, Ordering::SeqCst);
-	sched::spawn_on(1, stamp, 0);
-	while RAN_AT.load(Ordering::SeqCst) == 0 {
-		core::hint::spin_loop();
-	}
-	// THREE MEASUREMENTS, BECAUSE TWO CANNOT SAY WHAT THE THIRD IS FOR.
-	//
-	// The woken trip is measured TWICE. The spread between those two is this machine's noise floor,
-	// measured on the machine, in the run, under whatever load it happens to be under - and the
-	// signal has to beat it. A threshold derived only from the tick period is a guess about noise;
-	// this is not.
-	//
-	// It was three attempts to learn that. A fixed 4 ms bound became a coin toss under emulation;
-	// counting tick boundaries could not resolve a trip longer than a tick; cycles with a derived
-	// threshold passed at 12,802,144 against 12,896,476 and then FAILED the next run at 15,238,936
-	// against 12,820,216 - the same machine, the same kernel, the noise landing the other way and
-	// tripping the "the wake made it worse" branch. Noise larger than the threshold makes both
-	// verdicts luck.
-	let woken_first = cycles_over_twenty(true);
-	let unwoken = cycles_over_twenty(false);
-	let woken_second = cycles_over_twenty(true);
-	let woken = (woken_first + woken_second) / 2;
-	let noise = woken_first.abs_diff(woken_second);
-	// The floor a HALTED core would cost: twenty trips waiting half a tick period each is ten tick
-	// periods, a tenth of a second, `hz / 10` cycles. A quarter of it leaves room for a real signal
-	// that is not perfect. Whichever of the two is larger is what the signal must beat.
-	let expected = arch::tsc::hz() / 10;
-	let floor = core::cmp::max(noise, expected / 4);
-	crate::serial_println!("    twenty remote spawns: {woken} cycles woken (noise {noise}), {unwoken} suppressed; a halted core would cost about {expected} more");
-	if unwoken > woken.saturating_add(floor) {
-		return;
-	}
-	assert!(woken <= unwoken.saturating_add(floor), "twenty woken remote spawns cost {woken} cycles against {unwoken} with the wake suppressed, a gap wider than this machine's own noise of {noise}: the wake made it WORSE, which no scheduling accident explains");
-	crate::serial_println!("    the gap is inside a floor of {floor} - this machine's idle cores do not stay halted long enough for the wake to save anything, so there is nothing here to measure");
+	let control = sched::spawn_on_unwoken(1, stamp, 0);
+	let unwoken_ran = ran_within(10);
+	// AND NOW THE WAKE, which is all that is missing.
+	crate::idle::wake_core(1);
+	let woken_ran = ran_within(1_000);
+	gone(control);
+	assert!(!unwoken_ran, "a thread queued on an idle core without the wake ran within ten ticks - the core is still taking a tick it should not");
+	assert!(woken_ran, "and it ran once the wake was sent");
+	crate::serial_println!("    an unwoken remote spawn waited ten ticks unrun on an idle core, and ran once woken");
 }
 
 crate::tagged_test!(a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself, [Scheduler, Kernel], id = "kernel.sched.a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself", covers = ["kernel"]);

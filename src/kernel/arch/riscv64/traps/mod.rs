@@ -286,6 +286,7 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 		// scheduler preempt the running thread. External (PLIC) interrupts are wired
 		// in a later increment.
 		if code == 5 {
+			crate::idle::timer_interrupt();
 			super::apic::on_timer_tick();
 			let from_user = unsafe { *frame.add(FRAME_SSTATUS) } & SSTATUS_SPP == 0;
 			crate::sched::on_timer_preempt(from_user);
@@ -293,6 +294,7 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 			// S-mode software interrupt: a cross-hart wake IPI. Clear the pending bit
 			// (SIP.SSIP); the hart is now awake and will re-check the run queue.
 			unsafe { core::arch::asm!("csrci sip, 2", options(nostack, preserves_flags)) };
+			crate::idle::interrupt(crate::idle::Cause::Ipi);
 			// And run any IMSIC disable this hart was asked for. An interrupt file can only be
 			// written by the hart that owns it, so a teardown running elsewhere asks through this
 			// mailbox - and the requester is waiting on a bound for the answer.

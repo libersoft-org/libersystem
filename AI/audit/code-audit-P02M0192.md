@@ -68,3 +68,18 @@ NOT YET PERFORMED (end of the job, with the other cross-architecture work):
 Status: implemented; open only for the two end-of-job items above.
 
 ADDENDUM (2026-09-28, found while working on P02M0195a): the `system-manifest` host suite was not among the checks run above, and one of its cases failed on this milestone's manifest - `the_production_manifest_classifies_every_staged_driver` lists the in-guest fixtures that master nothing (`dma = "none"`) and did not name `gamepad_fixture`. It now does (`src/tools/system-manifest/src/tests.rs`); `cargo test` in `src/tools/system-manifest`: 25 passed.
+
+ADDENDUM (2026-09-28, found while verifying P02M0195a): `./check.sh --gate component-oracles` listed
+`gamepad_fixture` - added to the manifest by this milestone - as a staged driver with neither a kernel-test
+oracle nor a stated reason. Its oracle is the `qemu-gamepad-tool` gate on the development image, which the census
+(it reads kernel `covers` declarations only) cannot see; `src/tools/component-oracle-exceptions.txt` now says so.
+The gate still fails, for 14 other staged drivers and services that are not this milestone's.
+
+ADDENDUM (2026-09-28, found while verifying P02M0198a): the kernel test
+`kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy` pins the whole capability
+vocabulary each probe is denied, and `input-gamepad` - appended to the vocabulary by this milestone - was
+missing from its `later_denials!` list, so the test failed on x86_64 (`--tags process`) with the summary ending
+`... admin-test=deny input-gamepad=deny` against an expectation ending at `admin-test=deny`. Fixed in
+`src/kernel/test_suites/applications.rs` (`later_denials!` gains ` input-gamepad=deny`); the other probe
+summaries in that file use the same macro. No other pinned copy of the vocabulary exists in the tree
+(`grep admin-test=deny`). Re-verification: the same tag run, recorded in the P02M0198 record.

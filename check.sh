@@ -102,6 +102,13 @@ declare -A GATES=(
 	# acknowledged prefix, stalls, every ending, withdrawal, reset and failed recovery, and PermissionManager's
 	# grant of `spool`. The service - not USB printer transport.
 	["spool-service"]="tools/check-spool-service.sh"
+	# THE I2C AND GPIO BUS CONTRACTS ON THE TRANSLATED MACHINE: the kernel suite's two bus oracles, booted with the
+	# virtio-iommu, so the vhost-user controllers' every ring and buffer address crosses the backend's IOTLB -
+	# one address and one line per scoped connection, every declared I2C transaction, each GPIO event once.
+	["i2c-bus"]="tools/check-i2c-bus.sh"
+	# AND THE DEVICE SIDE ITSELF, on the host in milliseconds: the backend's memory table, its IOTLB's updates,
+	# misses and invalidations, indirect descriptor tables, the register device's PEC, and the GPIO model.
+	["i2c-backend"]="python3 harness/vhost-i2c-gpio.py --self-test"
 	# MEDIAIMPORTSERVICE AGAINST A CAMERA THE KERNEL HARNESS PLAYS: exact pages out of a 40 000-handle snapshot,
 	# the over-limit storage refused explicitly, scoped and stale identities, validated completion into a
 	# transactional destination, removal as an explicit partial ending, and the grant. Not USB Still Image.
@@ -182,6 +189,11 @@ declare -A GATES=(
 	# slot goes down. The gate reads those two lines in order, because a log that only counted them
 	# would pass for a surprise removal too.
 	["qemu-pcie-hotplug"]="tools/check-qemu-pcie-hotplug.sh"
+	# AN IDLE MACHINE THAT TAKES NO TICK, on all three targets, one guest at a time: bytes typed on the
+	# UART echoed within a second, the per-core idle records crediting the wakes to the UART's receive
+	# line rather than to a poll, a device plugged over QMP into the idle machine seen - and how often
+	# each idle core woke. The paths it drives are the production kernel's alone.
+	["tickless-idle"]="python3 tools/check-tickless-idle.py"
 	# A PCIe FUNCTION REPORTING AN ERROR ON A LIVE MACHINE, which is the only place that path happens
 	# at all: hardware sets a status bit, the kernel reads it through the window ACPI described and
 	# says what happened, and a FATAL one stops the function mastering the bus and takes its binding to

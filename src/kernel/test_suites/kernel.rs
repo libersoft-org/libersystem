@@ -532,7 +532,8 @@ fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 	let give_up = arch::apic::ticks() + 100;
 	while TICKS.load(Ordering::SeqCst) < target && arch::apic::ticks() < give_up {
 		sched::run_until_idle();
-		arch::idle_halt();
+		// Its bound, or the periodic wait's own deadline - which the boot processor wakes for.
+		crate::idle::halt(Some(give_up), sched::runnable);
 	}
 	assert!(TICKS.load(Ordering::SeqCst) >= target, "the periodic wait keeps ticking across settles");
 }

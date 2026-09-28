@@ -42,6 +42,48 @@ pub fn unopened_provider_withdrawal() {
 	debug_write(b"DeviceManager: unopened provider withdrawal closed its real channel\n");
 }
 
+// A BUS PROVIDER'S OFFERED ENDPOINT IS CLOSED AT PUBLICATION AND NEVER COUNTED, which the host-tested rule in
+// `driver-binding` cannot show: that is about numbers, and this is about the real handle. An `i2c-bus` and a
+// `gpio-lines` provider go through the real `publish_all` with real channels, and the far end of each offered
+// endpoint is found closed, each entry holding no handle and counting no consumer - and the catalogue's `open`
+// refuses both, since a bus is only ever reached through a connection scoped to one address or one line.
+pub fn scoped_bus_publication() {
+	static BUS: Entry = Entry { name: b"bus-publication-fixture", artifact: b"", boot_critical: false, priority: 0, requires: &[], provides: &[(driver_protocol::provider::I2C_BUS, 1, 8), (driver_protocol::provider::GPIO_LINES, 1, 16)], heartbeat_deadline: None, rules: &[] };
+	let binding = BindingId::new(0, 0, 0, 1);
+	let mut catalogue = Catalogue::new();
+	let mut offers = Offers::new();
+	let (i2c_far, i2c_offered) = channel().expect("i2c-bus fixture channel");
+	let (gpio_far, gpio_offered) = channel().expect("gpio-lines fixture channel");
+	assert!(offers.push(driver_protocol::provider::I2C_BUS, 0, &[], i2c_offered));
+	assert!(offers.push(driver_protocol::provider::GPIO_LINES, 1, &[], gpio_offered));
+	assert_eq!(catalogue.publish_all(binding, &BUS, &mut offers), 2, "both bus providers are published");
+	let mut bytes = [0; 128];
+	for far in [i2c_far, gpio_far] {
+		let closed = matches!(try_recv(far, &mut bytes), Polled::Closed);
+		if !closed {
+			debug_write(b"DeviceManager: a bus provider's offered endpoint was kept at publication\n");
+		}
+		assert!(closed, "a bus provider's offered endpoint is closed at publication: it would reach the whole controller");
+		close(far);
+	}
+	for provider in catalogue.entries.iter().flatten() {
+		assert_eq!(provider.handle, 0, "the offered endpoint is not kept");
+		assert_eq!(outstanding(provider), 0, "and not counted against `consumers`");
+	}
+	let infos: Vec<proto::system::ProviderInfo> = catalogue.entries.iter().flatten().map(|provider| provider_info_wire(provider, true)).collect();
+	{
+		let nodes: [Node; 0] = [];
+		let both = Scope::of(&[driver_protocol::provider::I2C_BUS, driver_protocol::provider::GPIO_LINES]).expect("two kinds are a subset");
+		let mut view = CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: both };
+		use proto::system::provider_catalogue::Service;
+		for info in infos {
+			assert_eq!(view.open(info), Err(proto::system::Error::Denied), "a bus is never opened whole, whatever the connection's scope admits");
+		}
+	}
+	assert_eq!(catalogue.withdraw_binding(binding), 2);
+	debug_write(b"DeviceManager: a bus provider's offered endpoint was closed at publication and counted nothing\n");
+}
+
 // Real waitable handles drive the production shutdown composition. The ready endpoint represents
 // a process-exit event without spawning another driver or touching a real device in this fixture.
 pub fn pending_shutdown_outcomes() {

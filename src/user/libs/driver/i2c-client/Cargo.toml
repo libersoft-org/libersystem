@@ -1,0 +1,15 @@
+[package]
+name = "i2c-client"
+edition = "2024"
+description = "The I2C bus contract's client side: hid-i2c's bus over an address-scoped connection, and the SMBus transactions"
+
+# THE CONTRACT'S CLIENT AND THE BUS TRAIT IT IMPLEMENTS, and nothing that reaches the runtime: every call
+# goes through a transport the caller supplies, so a host test drives both client types against the
+# generated dispatch in the same process, a kernel test drives them over a kernel channel, and a driver
+# over its own.
+[dependencies]
+hid-i2c = { path = "../hid-i2c" }
+i2c-device-proto = { path = "../../protocol/i2c-device-proto" }
+
+[lints.rust]
+warnings = "deny"

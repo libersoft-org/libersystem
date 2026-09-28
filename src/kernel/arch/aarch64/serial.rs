@@ -1,10 +1,10 @@
 // PL011 UART - the console on QEMU's `virt` machine (UART0 at 0x0900_0000).
 //
-// This is a minimal polled driver, enough for the bring-up: transmit a byte
-// (wait while the TX FIFO is full, then write UARTDR) and read one (if the RX
-// FIFO is not empty). The kernel runs in the higher half, so the device's MMIO is
-// reached through the physical direct map (`phys_to_virt`). Interrupt-driven RX +
-// the async TX ring come later with the GIC.
+// A minimal driver: transmit a byte (wait while the TX FIFO is full, then write
+// UARTDR) and read one (if the RX FIFO is not empty), the receive side raising its
+// interrupt once the boot tail arms it (`arm_rx_interrupt`). The kernel runs in the
+// higher half, so the device's MMIO is reached through the physical direct map
+// (`phys_to_virt`). Transmit stays synchronous: there is no async TX ring here.
 
 use super::paging::phys_to_virt;
 use core::fmt::{self, Write};
@@ -14,8 +14,18 @@ const UART_BASE: u64 = 0x0900_0000;
 const UARTDR: u64 = 0x00; // data register
 const UARTFR: u64 = 0x18; // flag register
 #[cfg(not(test))]
+const UARTIMSC: u64 = 0x38; // interrupt mask set/clear
+#[cfg(not(test))]
+const UARTICR: u64 = 0x44; // interrupt clear
+#[cfg(not(test))]
 const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
 const FR_TXFF: u32 = 1 << 5; // transmit FIFO full
+// The two receive interrupts: RX, the FIFO holds bytes at its trigger level, and RT, bytes have sat in
+// it below that level for 32 bit periods.
+#[cfg(not(test))]
+const INT_RX: u32 = 1 << 4;
+#[cfg(not(test))]
+const INT_RT: u32 = 1 << 6;
 
 #[inline]
 fn reg(off: u64) -> *mut u32 {
@@ -46,9 +56,50 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
 	bytes.len()
 }
 
+// Read one received byte without waiting. AN EMPTY FIFO ALSO ENDS A RECEIVE TIMEOUT, which is cleared
+// here: RT stays raised until it is, and the interrupt that reported it has been answered by the read
+// that found nothing left.
 #[cfg(not(test))]
 pub fn read_byte() -> Option<u8> {
-	unsafe { if core::ptr::read_volatile(reg(UARTFR)) & FR_RXFE != 0 { None } else { Some(core::ptr::read_volatile(reg(UARTDR)) as u8) } }
+	unsafe {
+		if core::ptr::read_volatile(reg(UARTFR)) & FR_RXFE != 0 {
+			core::ptr::write_volatile(reg(UARTICR), INT_RT);
+			return None;
+		}
+		Some(core::ptr::read_volatile(reg(UARTDR)) as u8)
+	}
+}
+
+// THE CONSOLE UART'S RECEIVE INTERRUPT, armed on the line the device tree names for the PL011 - an SPI
+// through the GIC this kernel drives - and answered by `handler`, so a typed byte wakes an idle machine
+// that takes no periodic tick to find it by. Answers the INTID an idle core's record names it by; `Err`
+// says why the UART's input stays polled.
+#[cfg(not(test))]
+pub fn arm_rx_interrupt(handler: super::interrupts::HandlerFn) -> Result<u32, &'static str> {
+	let tree = super::device_tree().ok_or("the machine handed over no device tree")?;
+	// THE NODE THE LINE IS READ FROM IS THE UART THIS DRIVER WRITES TO, or it is some other device's line.
+	if tree.console().map(|console| console.base) != Some(UART_BASE) {
+		return Err("the device tree's console is not the UART this kernel writes to");
+	}
+	let route = tree.console_interrupt().ok_or("the device tree names no line for it")?;
+	// Three cells whose first is zero is the GIC binding saying "an SPI", as for a hot-plug port's line.
+	if route.cells != 3 || route.spec[0] != 0 {
+		return Err("its line goes to a controller this kernel does not drive");
+	}
+	let intid: u32 = route.spec[1].checked_add(32).ok_or("the device tree names an SPI past the controller")?;
+	// The binding's flags: 1 and 2 are edges, 4 and 8 levels.
+	let trigger = if route.spec[2] & 0x3 != 0 { super::gic::Trigger::Edge } else { super::gic::Trigger::Level };
+	// REGISTERED BEFORE THE SOURCE IS ENABLED, as a slot's is: a byte typed during the boot is already
+	// waiting, and the enable below would otherwise take its interrupt with no handler behind it.
+	if !super::interrupts::register(intid, handler) {
+		return Err("this kernel answers as many wired lines as it carries rows for");
+	}
+	unsafe {
+		core::ptr::write_volatile(reg(UARTICR), INT_RX | INT_RT);
+		core::ptr::write_volatile(reg(UARTIMSC), INT_RX | INT_RT);
+	}
+	super::gic::enable_spi(intid, trigger);
+	Ok(intid)
 }
 
 // The interrupt / async-TX surface (used by the portable console path); these
@@ -56,6 +107,11 @@ pub fn read_byte() -> Option<u8> {
 pub fn enable_async() {}
 
 pub fn drain_tx() {}
+
+// Transmit is synchronous here, so nothing is ever left for an idle core to drain.
+pub fn tx_pending() -> bool {
+	false
+}
 
 pub fn flush_sync() {}
 

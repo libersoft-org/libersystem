@@ -17,6 +17,17 @@ fn the_pec_is_smbus_s_crc_8() {
 }
 
 #[test]
+fn a_published_read_word_checks_with_the_pec_its_device_sent() {
+	// A REAL TRANSACTION AS A DEVICE'S DATASHEET PRINTS IT: Melexis's MLX90614, an SMBus thermometer at 0x5A,
+	// read word from RAM 0x07 - on the bus 0xB4 0x07, a repeated start, 0xB5, then 0xD2 0x3A and the PEC 0x30.
+	assert_eq!(crc8(0, &[0xB4, 0x07, 0xB5, 0xD2, 0x3A]), 0x30);
+	let composed = compose(0x5A, Transaction::ReadWordData { command: 0x07 }, true).expect("composes with a PEC");
+	assert_eq!((composed.shape, composed.write(), composed.read_len), (Shape::WriteRead, &[0x07][..], 3), "the command, then two bytes and the PEC");
+	assert_eq!(composed.finish(&[0xD2, 0x3A, 0x30]), Ok(&[0xD2, 0x3A][..]), "the word, its PEC checked over both halves of the transfer");
+	assert_eq!(composed.finish(&[0xD2, 0x3A, 0x31]), Err(Refusal::Pec), "and a PEC one bit off is refused");
+}
+
+#[test]
 fn every_write_carries_its_pec_over_the_address_byte_and_what_it_writes() {
 	for (transaction, bytes) in [
 		(Transaction::SendByte(0x42), &[0x42][..]),

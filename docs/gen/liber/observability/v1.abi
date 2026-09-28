@@ -5,7 +5,9 @@ record counters(messages-sent:u64,messages-received:u64,handles:u64,memory-bytes
 record resource-count(name:string,live:u64,bound:u64)
 record component(name:string,type:component-type,state:component-state,deps:list<string>,counters:counters,resources:list<resource-count>)
 record trace-span(name:string,duration-ns:u64)
-record graph(components:list<component>,spans:list<trace-span>)
+record core-wake-source(source:u32,count:u64)
+record core-idle(cpu:u32,idle-ns:u64,halts:u64,wakes-timer:u64,wakes-ipi:u64,wakes-housekeeping:u64,wakes-device:u64,sources:list<core-wake-source>:bound=8)
+record graph(components:list<component>,spans:list<trace-span>,cores:list<core-idle>:bound=64)
 interface system-graph
 method system-graph.snapshot op=1 () -> result<graph, liber:base@1::error>
 record supervisor-stat(name:string,state:string,desired:string,epoch:u64,last-reason:string,restarts:u32,watchdog-trips:u32,last-failure:string)

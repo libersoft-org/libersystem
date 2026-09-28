@@ -1223,6 +1223,44 @@ pub struct IrqInfo {
 	pub device: u32,
 }
 
+// HOW EACH CORE RESTS: `SYS_CPU_IDLE_INFO(index, buf, len)` writes core `index`'s record into the caller's
+// buffer and answers the core count - ERR_INVALID past the end. A free read, like `SYS_IRQ_INFO`: what a
+// core did while it had nothing to run is a number, or "the processor rests when there is nothing to do"
+// is only a claim.
+//
+// `idle_ns` is the time the core spent halted, `halts` how many times it halted, and each wake is counted
+// under what ended it: its timer, an IPI, the housekeeping bound (the idle boot processor's timer, when
+// polled housekeeping was what set it), or a device's interrupt - in total, and per interrupt identity in
+// `sources`, first come first kept. The identity is the one the architecture dispatches under: the IDT
+// vector on x86_64 (a legacy IRQ n is `0x20 + n`), the INTID on aarch64, the interrupt-file identity on
+// riscv64. Wakes per second are two of these readings and the time between them.
+pub const SYS_CPU_IDLE_INFO: u64 = 95;
+
+// How many device identities one core's record keeps.
+pub const CPU_IDLE_SOURCES: usize = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CpuIdleSource {
+	pub source: u32,
+	pub _pad: u32,
+	pub count: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CpuIdleInfo {
+	pub cpu: u32,
+	pub source_count: u32,
+	pub idle_ns: u64,
+	pub halts: u64,
+	pub wakes_timer: u64,
+	pub wakes_ipi: u64,
+	pub wakes_housekeeping: u64,
+	pub wakes_device: u64,
+	pub sources: [CpuIdleSource; CPU_IDLE_SOURCES],
+}
+
 // Vector windows reported in IrqInfo::kind.
 pub const IRQ_KIND_FIXED: u32 = 0;
 pub const IRQ_KIND_MSI: u32 = 1;

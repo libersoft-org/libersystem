@@ -23,6 +23,7 @@ mod extable;
 mod fault;
 #[cfg(test)]
 mod graph;
+mod idle;
 mod iommu;
 mod loader;
 mod mem;
@@ -455,16 +456,11 @@ fn boot_main() {
 	// `boot OK` is kept verbatim at the front: `screenshot.sh` waits for it and `perf-trace.py`
 	// anchors on it, and both are looking for exactly this moment.
 	serial_println!("boot OK - kernel is up, starting userspace");
-	// Serial input goes interrupt-driven HERE, in this port's prologue, because it is the machine
-	// and not the policy: route the UART's legacy IRQ (COM1 = ISA IRQ 4) to the BSP and enable the
-	// receive interrupt, so a typed byte reaches the shell at once rather than on the next
-	// tick-quantized poll. The other two ports poll their UART and arrange nothing here.
-	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
-	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0), arch::ioapic::Kind::IsaEdge);
-	arch::serial::enable_rx_irq();
-	// AND THE SAME IS TRUE OF THE ACPI SCI, for the same reason and one more: a device-tree machine
-	// describes its power button as a node with its own interrupt, which is a different mechanism
-	// with a different owner. This is the FIXED-HARDWARE path and it exists on x86 alone.
+	// THE ACPI SCI IS ARMED HERE, in this port's prologue, because it is the machine and not the
+	// policy: a device-tree machine describes its power button as a node with its own interrupt,
+	// which is a different mechanism with a different owner. This is the FIXED-HARDWARE path and it
+	// exists on x86 alone. (The console UART's receive interrupt is armed by every port, in the boot
+	// tail - see `arm_console_interrupt`.)
 	#[cfg(target_arch = "x86_64")]
 	arch::sci::init(boot_info().rsdp);
 	// THREE THOUSAND TICKS - THIRTY SECONDS - AND THE NUMBER IS A MEASUREMENT.
@@ -617,12 +613,17 @@ pub(crate) fn console_shell_loop() {
 		// `drain_tx` because it is the same kind of thing: work the BSP owes the rest of the machine
 		// before it goes back round.
 		crate::iommu::service_faults_if_due();
+		// AND THE IDLE HOOK, ON EVERY PASS: what it polls - the housekeeping among it - is what the
+		// housekeeping bound wakes this core for, so it has to run on the wake that bound produces.
+		sched::run_idle_hook_now();
 		// AND THE HALT IS ONLY FOR A SETTLED MACHINE. A drain cut short by the deadline above left
 		// runnable threads on the queue, and halting on top of them would park work that is ready to
 		// run until the next interrupt - trading the defect this bound fixes for a worse one. The
 		// loop re-enters instead, which is the same thing it does after any other unfinished pass.
+		// No bound of its own: the boot processor wakes for the earliest deadline, the housekeeping
+		// bound and held input or output, and an interrupt ends it before any of them.
 		if settled {
-			arch::idle_halt();
+			crate::idle::halt(None, sched::runnable);
 		}
 	}
 }
@@ -734,6 +735,9 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	// Kept so the ending can be seen. Replaced on each attempt of the pre-online ladder, so what is
 	// watched afterwards is the instance that actually came up.
 	*RESIDENT_MANAGER.lock() = Some(process.clone());
+	// AND ITS ENDING WAKES THE BOOT PROCESSOR, whose idle hook is what notices a lost control plane - and
+	// which no longer takes a tick it would otherwise have noticed it on.
+	idle::watch_process(process.header().koid());
 
 	// Hand SystemManager the init package as a read-only shared buffer: the kernel
 	// copies the package bytes into a MemoryObject and sends "PACKAGE" + length
@@ -916,8 +920,10 @@ fn drive_slice(bound: u64) {
 	while arch::apic::ticks() < bound {
 		let settled: bool = sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
 		crate::iommu::service_faults_if_due();
+		// Settled: a one-shot for the end of this slice, or earlier for whatever the boot processor wakes
+		// for anyway.
 		if settled {
-			arch::idle_halt();
+			crate::idle::halt(Some(bound), sched::runnable);
 		}
 	}
 }
@@ -1114,7 +1120,8 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			if arch::apic::ticks() >= deadline {
 				break;
 			}
-			arch::idle_halt();
+			// ONE SLICE AT MOST, AND NEVER PAST THE WINDOW: the readiness question is asked again then.
+			crate::idle::halt(Some(settle_slice(deadline)), sched::runnable);
 		}
 		if listening {
 			// WHAT THE WINDOW ACTUALLY COST, printed every boot rather than measured once.
@@ -1233,9 +1240,13 @@ fn arm_hot_plug_interrupts() {
 	let mut ports: [Option<arch::pci::HotPlugPort>; arch::pci::MAX_HOT_PLUG_PORTS] = [None; arch::pci::MAX_HOT_PLUG_PORTS];
 	let count = arch::pci::hot_plug_ports(&mut ports);
 	for port in ports.iter().take(count).flatten() {
-		match arch::pci::arm_slot_interrupt(port, hot_plug_interrupt) {
+		match arch::pci::arm_slot_interrupt(port, wired_line_interrupt) {
 			Some(number) => serial_println!("pci: hot-plug port {:02x}:{:02x}.{} raises interrupt {number}", port.bus, port.dev, port.func),
-			None => serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed to no interrupt - its slot is polled only", port.bus, port.dev, port.func),
+			None => {
+				serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed to no interrupt - its slot is polled only", port.bus, port.dev, port.func);
+				// POLLED ONLY, so the idle boot processor wakes for it at the housekeeping bound.
+				idle::add_housekeeping(idle::HOUSEKEEPING_HOT_PLUG);
+			}
 		}
 	}
 }
@@ -1296,13 +1307,21 @@ fn settle_pci_faults() {
 	}
 }
 
-// A hot-plug port asserted: read every slot and act on what changed.
+// A WIRED LINE THIS KERNEL ANSWERS ITSELF: the console UART's receive interrupt, a hot-plug port's, or -
+// where a port delivers them under one number, as riscv64 delivers every wired line as `WIRED_EID` -
+// both at once. So ONE handler answers them all and every arming passes it: registering it again for
+// the same number replaces it with itself, whichever arming ran first. Each half costs a register read
+// when it has nothing to do.
 //
-// EVERY SLOT AND NOT THE ONE THAT ASSERTED, because a legacy line is SHARED: two root ports on one
-// line are indistinguishable from here, and reading them all is both correct and cheap - there are
-// at most eight, and each is two config reads.
+// It drains the UART's receive FIFO into the console input, and reads EVERY SLOT AND NOT THE ONE THAT
+// ASSERTED, because a legacy line is SHARED: two root ports on one line are indistinguishable from
+// here, and reading them all is both correct and cheap - there are at most eight, and each is two
+// config reads.
 #[cfg(not(test))]
-fn hot_plug_interrupt(_number: u32) {
+fn wired_line_interrupt(_number: u32) {
+	while let Some(byte) = arch::serial::read_byte() {
+		console_input::feed_serial(byte);
+	}
 	settle_hot_plug();
 }
 
@@ -1367,16 +1386,24 @@ fn settle_hot_plug() {
 	}
 }
 
-// Serial receive interrupt: drain the UART FIFO into the console input the moment
-// bytes arrive, so typed input wakes the shell immediately instead of waiting for
-// the next 100 Hz idle-hook poll (the poll stays as a fallback and for the first-
-// prompt nudge). Runs on the BSP (the UART's legacy IRQ is routed there); the
-// channel send inside feed() wakes the shell's waiter on this same core.
+// THE CONSOLE UART'S RECEIVE INTERRUPT, on every port: a typed byte reaches the shell at once, and wakes
+// an idle machine that takes no periodic tick to find it by. Each port arms the line its machine gives
+// the UART it writes to - COM1's IRQ 4 through the I/O APIC, the PL011's SPI through the GIC, the 16550's
+// APLIC source - and answers the identity an idle core's record names it by, which the line below says.
+// A port that finds no line keeps the poll, and its idle boot processor then sleeps one tick at most,
+// the latency the poll had while every core took a tick.
+//
+// THE LINE IS THE KERNEL'S UNTIL A HANDOFF TAKES THE PORT - COM1 through its claim, the ports' UARTs
+// through their drivers' - and the handler below reaches the UART only through `read_byte`, which is
+// where such a handoff leaves the port alone.
 #[cfg(not(test))]
-#[cfg(target_arch = "x86_64")]
-fn serial_rx_interrupt(_vector: u32) {
-	while let Some(byte) = arch::serial::read_byte() {
-		console_input::feed_serial(byte);
+fn arm_console_interrupt() {
+	match arch::serial::arm_rx_interrupt(wired_line_interrupt) {
+		Ok(identity) => serial_println!("console: typed input raises interrupt {identity}"),
+		Err(why) => {
+			serial_println!("console: typed input is polled - {why}");
+			idle::console_polled();
+		}
 	}
 }
 
@@ -1463,6 +1490,7 @@ pub(crate) fn boot_userspace(window_ticks: u64) {
 	// which on a shared line is a case every port has. Arming after the device inventory is built
 	// and before userspace exists means the first slot event a running machine can produce already
 	// has somewhere to go.
+	arm_console_interrupt();
 	arm_hot_plug_interrupts();
 	sched::set_idle_hook(serial_console_pump);
 	let (crash_tx, crash_rx) = object::channel::Channel::create();

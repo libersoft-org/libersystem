@@ -21,6 +21,12 @@
 #             is why this is not x86_64-only. Refused together with TEST.
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
+#   TSC_DEADLINE=on|off
+#             x86_64: whether the CPU offers the TSC-deadline timer (default on). An idle core's
+#             one-shot is the deadline MSR where CPUID offers it and a local APIC count otherwise,
+#             and KVM with the in-kernel local APIC always offers it - so the count is exercised only
+#             by a boot that says `off`. A NAMED KNOB RATHER THAN A QEMU_EXTRA RECIPE, because which
+#             timer an idle core programmed is what such a run is for.
 #   GPU_SIZE=WxH  the x86_64 interactive `virtio-vga`'s scanout size (its xres and yres)
 #   MEM=      override RAM (default varies by arch)
 #   STRIP=    none | debug | all for a harness-created boot medium (default: all)
@@ -2189,6 +2195,14 @@ qemu_run_x86_64() {
 	if [[ "${TEST:-0}" == "1" ]]; then smp="${SMP:-4}"; else smp="${SMP:-$(nproc)}"; fi
 	local cpu_args=()
 	qemu_select_cpu cpu_args x86_64 qemu64,+rdrand,+smep,+smap
+	case "${TSC_DEADLINE:-on}" in
+	on) ;;
+	off) cpu_args[${#cpu_args[@]} - 1]+=",-tsc-deadline" ;;
+	*)
+		echo "qemu-run: TSC_DEADLINE is on or off, got '${TSC_DEADLINE}'" >&2
+		exit 1
+		;;
+	esac
 	qemu_args+=("${cpu_args[@]}" -smp "$smp")
 
 	qemu_append_debug_args qemu_args

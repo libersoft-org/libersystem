@@ -100,11 +100,17 @@ fn timer_intid() -> u32 {
 // 100 Hz tick (the shared scheduler-tick policy).
 use crate::arch::common::time::TICK_HZ;
 
-// COUNTER-GATED, NOT ONE-PER-CORE (KERN-ARCH-007). Every core takes its own CNTP interrupt, and
-// this was `TICKS.fetch_add(1)` in the handler - so the monotonic clock advanced once per core per
-// period and time ran at the core count times `TICK_HZ`. See `arch::common::time::TickClock`.
-static CLOCK: crate::arch::common::time::TickClock = crate::arch::common::time::TickClock::new();
 static INTERVAL: AtomicU64 = AtomicU64::new(0); // timer down-count per tick
+// Which cores' timers are a one-shot for a halt, so their interrupt switches the timer off instead of
+// re-arming the tick.
+static ONE_SHOT: [AtomicBool; crate::smp::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::smp::MAX_CPUS];
+// EVERY TIMER INTERRUPT THE MACHINE TAKES, on any core. The clock is computed from the counter and advances
+// without one, so the prologue proves the interrupt path by counting these rather than ticks.
+static TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn timer_interrupts() -> u64 {
+	TIMER_INTERRUPTS.load(Ordering::Relaxed)
+}
 // Whether the first device-originated LPI has been reported. See the acknowledge path.
 static REPORTED_DEVICE_LPI: AtomicBool = AtomicBool::new(false);
 
@@ -324,10 +330,43 @@ fn init_cpu_local_v3() -> bool {
 fn arm_local_timer() {
 	let interval = cntfrq() / TICK_HZ as u64;
 	INTERVAL.store(interval, Ordering::Relaxed);
+	// THE CLOCK STARTS WITH THE FIRST CORE'S TIMER: the counter's frequency is known from the first
+	// instruction here, and anchoring is once - every later core's call is refused, and changes nothing.
+	crate::arch::common::time::CLOCK.anchor(super::tsc::now(), super::tsc::hz());
 	arm_timer(interval);
 	unsafe {
 		core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
 	}
+}
+
+// THIS CORE'S TIMER AS A ONE-SHOT for a halt, at tick `deadline` - never, for `None` or a tick too far away
+// to express. False when the clock cannot convert a tick yet, and the periodic tick then stays.
+//
+// THROUGH TVAL, RELATIVE TO NOW: the clock reads the virtual count and CNTP compares the physical one, and
+// what the two agree on is a DISTANCE. TVAL is 32 bits, so a longer wait ends early and is simply halted
+// again - re-armed in steps.
+pub fn timer_one_shot(deadline: Option<u64>) -> bool {
+	let clock = &crate::arch::common::time::CLOCK;
+	if !clock.anchored() {
+		return false;
+	}
+	ONE_SHOT[crate::sched::current_cpu_id()].store(true, Ordering::Relaxed);
+	match deadline.and_then(|tick| clock.counter_at(tick)) {
+		None => unsafe { core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack, preserves_flags)) },
+		Some(counter) => {
+			let distance = (counter.wrapping_sub(super::tsc::now()) as i64).clamp(1, i32::MAX as i64) as u64;
+			arm_timer(distance);
+			unsafe { core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags)) };
+		}
+	}
+	true
+}
+
+// THIS CORE'S PERIODIC TICK, back after a halt.
+pub fn timer_periodic() {
+	ONE_SHOT[crate::sched::current_cpu_id()].store(false, Ordering::Relaxed);
+	arm_timer(INTERVAL.load(Ordering::Relaxed));
+	unsafe { core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags)) };
 }
 
 // Acknowledge and dispatch a pending interrupt (called from the IRQ vector).
@@ -347,15 +386,24 @@ pub fn handle_irq(from_user: bool) {
 	// SGI 0 is the wake IPI, and it now also carries the TLB shootdown - see
 	// `mem::tlb`. Servicing it before the dispatch below keeps the answer prompt.
 	if intid == 0 {
+		crate::idle::interrupt(crate::idle::Cause::Ipi);
 		crate::mem::tlb::service_pending();
 	}
 	if intid == timer_intid() {
-		// Re-arm for the next tick (clears the timer's level-asserted condition). EVERY core does
-		// this - it is what drives preemption on that core - and only the shared clock below is
-		// gated, so the rate is the machine's and not the core count's.
-		arm_timer(INTERVAL.load(Ordering::Relaxed));
-		CLOCK.advance(super::tsc::now(), super::tsc::hz());
+		TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+		crate::idle::timer_interrupt();
+		// A ONE-SHOT FOR A HALT FIRES ONCE: the timer is switched off, which also drops its level, and the
+		// halt restores the periodic tick. Otherwise re-arm for the next tick (clears the timer's
+		// level-asserted condition). EVERY core does this - it is what drives preemption on that core.
+		if crate::idle::ready() && ONE_SHOT[crate::sched::current_cpu_id()].load(Ordering::Relaxed) {
+			unsafe { core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack, preserves_flags)) };
+		} else {
+			arm_timer(INTERVAL.load(Ordering::Relaxed));
+		}
 	} else {
+		if intid != 0 {
+			crate::idle::interrupt(crate::idle::Cause::Device(intid));
+		}
 		// A DEVICE-ORIGINATED LPI, SAID ONCE, AND SAID HERE BECAUSE HERE IS THE ONLY PLACE THAT CAN.
 		//
 		// P02M0151's checkpoint asks for a message a DEVICE sent through the ITS, and every report
@@ -459,10 +507,10 @@ pub fn enable_msi_spi(spi: u32) {
 pub enum Trigger {
 	/// A GICv2m MSI: the device WRITES, and there is nothing left asserted afterwards.
 	Edge,
-	/// A PCI INTx line: the device holds it asserted until something tells it to stop.
+	/// A PCI INTx line or a UART's: the device holds it asserted until something tells it to stop.
 	///
-	/// `not(test)` for the reason the whole arming pass is: the only source this kernel configures
-	/// as level is a hot-plug slot's INTx, and a test build arms no slots.
+	/// `not(test)` for the reason the whole arming pass is: the only sources this kernel configures
+	/// as level are a hot-plug slot's INTx and the console UART's line, and a test build arms neither.
 	#[cfg(not(test))]
 	Level,
 }
@@ -551,9 +599,9 @@ pub fn enable_lpis(frame: u64, config: u64, id_bits: u64, pending: u64) -> bool 
 	true
 }
 
-// Ticks counted since the timer started (the monotonic tick, 100 Hz).
+// The monotonic tick, computed from the counter - see `arch::common::time::CLOCK`.
 pub fn ticks() -> u64 {
-	CLOCK.ticks()
+	crate::arch::common::time::CLOCK.ticks(super::tsc::now())
 }
 
 // The generic-timer frequency (Hz), for the boot log.

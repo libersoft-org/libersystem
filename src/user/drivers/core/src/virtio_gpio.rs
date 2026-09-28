@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use driver_protocol::GpioTrigger as ScopedTrigger;
 use drivers::common;
 use drivers::gpio::{self, Event, Lines, Request, Scope, Step, Trigger};
-use drivers::virtio::{Queue, Virtio};
+use drivers::virtio::{self, Queue, Virtio};
 use proto::system::{Error, GpioEvent, GpioLine, GpioTrigger, gpio_device};
 use rt::*;
 
@@ -98,10 +98,27 @@ impl Controller {
 			core::ptr::copy_nonoverlapping(request.encode().as_ptr(), virt as *mut u8, 8);
 			((virt + RESPONSE) as *mut u8).write_volatile(0xFF);
 		}
-		self.requests.submit_checked(&[(phys, 8, false), (phys + RESPONSE, 2, true)]).ok()?;
+		let mut used = [0u32; 1];
+		if let Err(fault) = self.requests.submit_chains(&[&[(phys, 8, false), (phys + RESPONSE, 2, true)]], None, &mut used) {
+			unanswered(
+				request,
+				match fault {
+					virtio::UsedFault::NoCompletion => b"no completion within the request budget",
+					virtio::UsedFault::Id => b"a completion naming another descriptor",
+					virtio::UsedFault::Length => b"a completion claiming more bytes than it was given",
+					virtio::UsedFault::Index => b"more completions than requests",
+					virtio::UsedFault::Chain => b"a chain the queue cannot hold",
+				},
+			);
+			return None;
+		}
 		// SAFETY: the device gave the chain back, so the response is written.
 		let (status, value) = unsafe { (((virt + RESPONSE) as *const u8).read_volatile(), ((virt + RESPONSE + 1) as *const u8).read_volatile()) };
-		(status == gpio::STATUS_OK).then_some(value)
+		if status != gpio::STATUS_OK {
+			unanswered(request, b"the device's error status");
+			return None;
+		}
+		Some(value)
 	}
 
 	// Queue `line`'s event buffer: the device completes it when the line fires, or at once when it is disarmed.
@@ -173,9 +190,9 @@ impl Controller {
 		}
 	}
 
-	// TAKE `line` FOR a new connection, scoped with `trigger`. False when it cannot be had.
-	fn take(&mut self, channel: u64, line: u32, trigger: ScopedTrigger) -> bool {
-		let Ok(line) = u16::try_from(line) else { return false };
+	// TAKE `line` FOR a new connection, scoped with `trigger`. The reason, when it cannot be had.
+	fn take(&mut self, channel: u64, line: u32, trigger: ScopedTrigger) -> Result<(), &'static [u8]> {
+		let Ok(line) = u16::try_from(line) else { return Err(b"the controller has no such line") };
 		let (scope, wire) = match trigger {
 			ScopedTrigger::Level => (Scope::Level, GpioTrigger::None),
 			ScopedTrigger::Rising => (Scope::Interrupt(Trigger::Rising), GpioTrigger::Rising),
@@ -185,18 +202,21 @@ impl Controller {
 			ScopedTrigger::Low => (Scope::Interrupt(Trigger::Low), GpioTrigger::Low),
 		};
 		if matches!(scope, Scope::Interrupt(_)) && line >= self.event_lines {
-			return false;
+			return Err(b"the controller delivers no events for it");
 		}
 		let mut steps = Vec::new();
-		if self.lines.take(line, scope, &mut steps).is_err() {
-			return false;
+		match self.lines.take(line, scope, &mut steps) {
+			Ok(()) => {}
+			Err(gpio::Refusal::NoSuchLine) => return Err(b"the controller has no such line"),
+			Err(gpio::Refusal::Held) => return Err(b"another connection holds it"),
+			Err(gpio::Refusal::NoEvents) => return Err(b"the controller delivers no events for it"),
 		}
 		if !self.run(&steps) {
 			self.release(line);
-			return false;
+			return Err(b"the device refused to set it up");
 		}
 		self.held.push(Held { channel, line, trigger: wire, events: 0, frames: 0, sequence: 0, delivery: Delivery::Idle, level: false });
-		true
+		Ok(())
 	}
 
 	// The connection on `channel` is over: its line disarmed and deactivated.
@@ -316,6 +336,35 @@ fn serve(controller: &mut Controller, serving: &common::Serving, index: usize, b
 	true
 }
 
+// A REQUEST THE DEVICE DID NOT ANSWER, SAID: which one, and what came back instead.
+fn unanswered(request: Request, what: &[u8]) {
+	let mut out = common::Bounded::<128>::new();
+	out.push(b"driver.virtio-gpio: request ");
+	out.decimal(request.kind as u64);
+	out.push(b" for line ");
+	out.decimal(request.line as u64);
+	out.push(b" got ");
+	out.push(what);
+	out.push(b"\n");
+	print(out.as_bytes());
+}
+
+// A REFUSED CONNECTION, SAID: the one line a person reading the log needs when a consumer finds its connection
+// closed.
+fn refused(line: Option<u32>, why: &[u8]) {
+	let mut out = common::Bounded::<128>::new();
+	out.push(b"driver.virtio-gpio: a connection ");
+	if let Some(line) = line {
+		out.push(b"for line ");
+		out.decimal(line as u64);
+		out.push(b" ");
+	}
+	out.push(b"was refused - ");
+	out.push(why);
+	out.push(b"\n");
+	print(out.as_bytes());
+}
+
 // A consumer has gone, or was refused: its line is given back, and the manager is told.
 fn part(controller: &mut Controller, serving: &mut common::Serving, bootstrap: u64, bind: &common::Bind, index: usize) -> bool {
 	controller.give_back(serving.at(index));
@@ -358,7 +407,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if names_size != 0 && names_size <= NAMES_MAX {
 			let request = Request { kind: gpio::MSG_GET_NAMES, line: 0, value: 0 };
 			core::ptr::copy_nonoverlapping(request.encode().as_ptr(), request_page.0 as *mut u8, 8);
-			if controller.requests.submit_checked(&[(request_page.1, 8, false), (names_page.1, 1 + names_size as u32, true)]).is_ok() && (names_page.0 as *const u8).read_volatile() == gpio::STATUS_OK {
+			let mut used = [0u32; 1];
+			if controller.requests.submit_chains(&[&[(request_page.1, 8, false), (names_page.1, 1 + names_size as u32, true)]], None, &mut used).is_ok() && (names_page.0 as *const u8).read_volatile() == gpio::STATUS_OK {
 				controller.names.extend_from_slice(core::slice::from_raw_parts((names_page.0 + 1) as *const u8, names_size));
 			}
 		}
@@ -385,8 +435,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				Some(common::ProviderReady::Connected(index)) => {
 					// ONE LINE, HELD BY ONE CONNECTION. Anything else is refused on the connection itself.
 					let admitted = match serving.scope_at(index) {
-						driver_protocol::Scope::GpioLine { line, trigger } => controller.take(serving.at(index), line, trigger),
-						_ => false,
+						driver_protocol::Scope::GpioLine { line, trigger } => controller.take(serving.at(index), line, trigger).map_err(|why| refused(Some(line), why)).is_ok(),
+						_ => {
+							refused(None, b"its scope names no line");
+							false
+						}
 					};
 					if !admitted && !part(&mut controller, &mut serving, bootstrap, &bind, index) {
 						exit();

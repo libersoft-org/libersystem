@@ -52,7 +52,9 @@ pub fn hz() -> u64 {
 }
 
 // Convert a TSC cycle count to nanoseconds using the calibrated frequency.
-// Returns 0 if the TSC has not been calibrated.
+// Returns 0 if the TSC has not been calibrated. The suite's timings are its only callers: the
+// monotonic clock converts through `arch::common::time::CLOCK`.
+#[cfg(test)]
 pub fn cycles_to_ns(cycles: u64) -> u64 {
-	crate::arch::common::time::cycles_to_ns(cycles, TSC_HZ.load(Ordering::Relaxed))
+	tickclock::cycles_to_ns(cycles, TSC_HZ.load(Ordering::Relaxed))
 }

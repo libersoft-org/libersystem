@@ -8,6 +8,7 @@
 # this census reads kernel declarations only.
 
 dev_channel	its oracle is a DEV-GUEST check, not a kernel test: dev-selftest.py drives publication, refusal and rollback through this driver, and that guest cannot share a boot with the suite - qemu-run.sh refuses DEV_PROFILE together with TEST. Covered, elsewhere.
+gamepad_fixture	its oracle is the qemu-gamepad-tool GATE, not a kernel test: the gate boots the development image with the fixture's QEMU test device, and `gamepadcheck` reads the `gamepad` tool's own lines for every pad the fixture plays - a press, a range's ends, a hat, a departure and a replug. This census reads kernel declarations only. Covered, elsewhere.
 dev_agent	the same: dev-selftest.py IS the oracle for this agent and runs on the development guest. The check above ranges over kernel tests and cannot see a dev-guest one.
 session_service	NO ORACLE. Nothing in the suite fails when this service breaks. It is staged, it starts, and no test asserts an effect of it - so a change to it selects builds and nothing that would catch a regression. This line is the record of that, not a decision that it needs none.
 time_service	NO ORACLE. The RTC tests assert what the KERNEL reads off the clock hardware; nothing asserts what this service answers to a client. Same shape as session_service and recorded for the same reason.

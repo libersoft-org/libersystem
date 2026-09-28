@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::{ChannelTransport, SvcTransport};
-use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, device, display_stats, provider_catalogue, supervisor, system_graph};
+use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, CoreIdle, CoreWakeSource, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, device, display_stats, provider_catalogue, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -222,8 +222,34 @@ impl system_graph::Service for GraphService {
 			spans.push(TraceSpan { name: String::from("display.resources"), duration_ns: clock_ns().wrapping_sub(display_start) });
 		}
 
-		Ok(Graph { components, spans })
+		// HOW EACH CORE RESTS, from the kernel's own per-core record: a free read, one core at a time.
+		let cores_start: u64 = clock_ns();
+		let cores = idle_rows();
+		spans.push(TraceSpan { name: String::from("cpu.idle"), duration_ns: clock_ns().wrapping_sub(cores_start) });
+
+		Ok(Graph { components, spans, cores })
 	}
+}
+
+// Every online core's idle record, as the graph carries it.
+fn idle_rows() -> Vec<CoreIdle> {
+	let mut rows: Vec<CoreIdle> = Vec::new();
+	let mut index: u64 = 0;
+	loop {
+		let mut info = CpuIdleInfo::default();
+		let count = cpu_idle_info(index, &mut info);
+		if count < 0 {
+			break;
+		}
+		let used = (info.source_count as usize).min(info.sources.len());
+		let sources: Vec<CoreWakeSource> = info.sources[..used].iter().map(|source| CoreWakeSource { source: source.source, count: source.count }).collect();
+		rows.push(CoreIdle { cpu: info.cpu, idle_ns: info.idle_ns, halts: info.halts, wakes_timer: info.wakes_timer, wakes_ipi: info.wakes_ipi, wakes_housekeeping: info.wakes_housekeeping, wakes_device: info.wakes_device, sources });
+		index += 1;
+		if index >= count as u64 {
+			break;
+		}
+	}
+	rows
 }
 
 // The display service's own counts, as the graph's generic `live` / `bound` rows.

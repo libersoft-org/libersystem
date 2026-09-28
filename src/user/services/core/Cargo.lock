@@ -158,6 +158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpio-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "graphics-core"
 version = "0.0.0"
 dependencies = [
@@ -183,6 +192,15 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "i2c-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "import-proto"
@@ -382,7 +400,9 @@ dependencies = [
  "display-proto",
  "event-proto",
  "font-proto",
+ "gpio-device-proto",
  "graphics-proto",
+ "i2c-device-proto",
  "import-proto",
  "input-proto",
  "ipc-client",

@@ -239,6 +239,22 @@ fn serve(controller: &mut Controller, serving: &common::Serving, index: usize, b
 	true
 }
 
+// A REFUSED CONNECTION, SAID: the one line a person reading the log needs when a consumer finds its connection
+// closed.
+fn refused(address: Option<u8>, why: &[u8]) {
+	let mut out = common::Bounded::<128>::new();
+	out.push(b"driver.virtio-i2c: a connection ");
+	if let Some(address) = address {
+		out.push(b"for address 0x");
+		out.push(&common::hex2(address));
+		out.push(b" ");
+	}
+	out.push(b"was refused - ");
+	out.push(why);
+	out.push(b"\n");
+	print(out.as_bytes());
+}
+
 // A consumer has gone, or was refused: its address is free again, and the manager is told.
 fn part(controller: &mut Controller, serving: &mut common::Serving, bootstrap: u64, bind: &common::Bind, index: usize) -> bool {
 	let channel = serving.at(index);
@@ -292,7 +308,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 							controller.held.push((channel, address));
 							true
 						}
-						_ => false,
+						driver_protocol::Scope::I2cAddress(address) => {
+							refused(Some(address), b"another connection holds it");
+							false
+						}
+						_ => {
+							refused(None, b"its scope names no address");
+							false
+						}
 					};
 					if !admitted && !part(&mut controller, &mut serving, bootstrap, &bind, index) {
 						exit();

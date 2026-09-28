@@ -268,6 +268,8 @@ pub fn init() -> bool {
 	match bring_up(index) {
 		Ok(controller) => {
 			*CONTROLLER.lock() = Some(controller);
+			// ITS FAULT QUEUE IS POLLED, so the idle boot processor wakes for it at the housekeeping bound.
+			crate::idle::add_housekeeping(crate::idle::HOUSEKEEPING_IOMMU_FAULTS);
 			crate::serial_println!("iommu: virtio-iommu is translating - bypass is off and read back as off");
 			true
 		}

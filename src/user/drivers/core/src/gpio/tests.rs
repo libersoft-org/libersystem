@@ -3,16 +3,17 @@ use alloc::vec::Vec;
 use super::*;
 
 #[test]
-fn an_interrupt_line_is_armed_with_its_buffer_before_its_trigger() {
+fn an_interrupt_line_is_armed_with_its_trigger_before_its_buffer() {
 	let mut lines = Lines::new(8, true);
 	let mut steps = Vec::new();
 	assert_eq!(lines.take(3, Scope::Interrupt(Trigger::Low), &mut steps), Ok(()));
+	// THE TRIGGER FIRST: a buffer queued while the line's interrupt type is none comes straight back invalid.
 	assert_eq!(
 		steps,
 		[
 			Step::Send(Request { kind: MSG_SET_DIRECTION, line: 3, value: DIRECTION_IN }),
-			Step::QueueEvent(3),
-			Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line: 3, value: 0x08 })
+			Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line: 3, value: 0x08 }),
+			Step::QueueEvent(3)
 		]
 	);
 	// The request as the device reads it: type, line, value, little-endian.

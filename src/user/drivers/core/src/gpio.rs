@@ -138,8 +138,9 @@ impl Lines {
 	}
 
 	// TAKE `line` FOR A CONNECTION with `scope`, and the steps that set it up, in order: input direction, then
-	// for an interrupt the event buffer and only then the trigger, so an event right after arming has a
-	// buffer to complete.
+	// for an interrupt the trigger and only then the event buffer - a device returns a buffer queued for a line
+	// whose interrupt type is still none at once, as invalid, and the line would then have no buffer to report
+	// on. A level trigger already met completes the buffer as soon as it is queued.
 	pub fn take(&mut self, line: u16, scope: Scope, steps: &mut Vec<Step>) -> Result<(), Refusal> {
 		if line >= self.count {
 			return Err(Refusal::NoSuchLine);
@@ -154,8 +155,8 @@ impl Lines {
 		let held = match scope {
 			Scope::Level => Held::Level,
 			Scope::Interrupt(trigger) => {
-				steps.push(Step::QueueEvent(line));
 				steps.push(Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line, value: trigger as u32 }));
+				steps.push(Step::QueueEvent(line));
 				Held::Armed(trigger)
 			}
 		};

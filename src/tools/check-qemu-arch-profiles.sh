@@ -81,17 +81,19 @@ timer_ticked() {
 		grep -a "NO TIMER IRQ" "$log" >&2
 		return 1
 	fi
-	line="$(grep -a -m 1 -o 'timer IRQs delivered - [0-9]* ticks' "$log" || true)"
+	# INTERRUPTS, NOT TICKS: the tick is computed from the counter and advances with no interrupt at all, so
+	# the prologue counts the timer interrupts themselves.
+	line="$(grep -a -m 1 -o 'timer IRQs delivered - [0-9]* interrupts' "$log" || true)"
 	[[ -n "$line" ]] || {
-		echo "arch-profiles: the boot never reported a timer tick count at all" >&2
+		echo "arch-profiles: the boot never reported a timer interrupt count at all" >&2
 		return 1
 	}
 	ticks="$(sed 's/[^0-9]*\([0-9]*\).*/\1/' <<<"$line")"
 	[[ "$ticks" -ge 5 ]] || {
-		echo "arch-profiles: the timer delivered $ticks tick(s), fewer than the 5 this profile requires" >&2
+		echo "arch-profiles: the timer delivered $ticks interrupt(s), fewer than the 5 this profile requires" >&2
 		return 1
 	}
-	echo "arch-profiles:     timer delivered $ticks ticks"
+	echo "arch-profiles:     timer delivered $ticks interrupts"
 }
 
 # WHAT EACH PROFILE MUST BE SEEN TO DO, over and above coming up.

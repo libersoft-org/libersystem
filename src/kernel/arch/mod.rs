@@ -28,11 +28,19 @@
 //                   registry and exist only under `x86_64` - part (2) says so and this list said
 //                   the opposite, which put back in the contract exactly the obligation the
 //                   milestone removed from the other two ports.
-//       apic:       local_id, send_wake_ipi, ticks   (the interrupt controller + timer; GIC on
-//                   aarch64, PLIC/CLINT + IMSIC on riscv64 - keeps the `apic` name for now)
-//       tsc:        now, init, hz, cycles_to_ns   (the fine cycle clock)
-//       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync, write_bytes, read_byte
-//                   (`enable_rx_irq` is x86-only too, for the same reason: it arms an INTx line.)
+//       apic:       local_id, send_wake_ipi, ticks, timer_one_shot, timer_periodic   (the interrupt
+//                   controller + timer; GIC on aarch64, PLIC/CLINT + IMSIC on riscv64 - keeps the
+//                   `apic` name for now). `ticks` is computed from the counter (`common::time::CLOCK`),
+//                   and `idle_halt` is ENTERED MASKED and wakes on an interrupt pending under the mask:
+//                   `idle::halt` checks for work after masking, so a wake landing after that check is
+//                   held pending and ends the halt rather than being taken before it.
+//       tsc:        now, init, hz, cycles_to_ns   (the fine cycle clock; x86 compiles `cycles_to_ns` for
+//                   the suite alone, the ports' boot lines print through theirs)
+//       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync, write_bytes, read_byte,
+//                   tx_pending (false where writes are synchronous: only x86 keeps a transmit ring),
+//                   arm_rx_interrupt (the console UART's receive line - COM1's IRQ 4 through the I/O
+//                   APIC, the PL011's SPI or the 16550's APLIC source as the device tree names it -
+//                   answered by the handler the boot tail passes, or refused in words)
 //       pci:        PciDevice / VirtioDevice / ResourcedDevice, scan, scan_virtio, scan_resourced,
 //                   set_intx_disabled, msix_enable
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel

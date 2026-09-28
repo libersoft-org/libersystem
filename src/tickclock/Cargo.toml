@@ -1,0 +1,14 @@
+[package]
+name = "tickclock"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "The monotonic tick computed from the free-running counter, with the sleep offset, in a crate a host can drive"
+
+[lib]
+path = "src/lib.rs"
+
+# A WARNING IS AN ERROR HERE, for the same reason it is in `buddy`: this crate is the one place the clock's
+# arithmetic is written, and every deadline in the system is read against it.
+[lints.rust]
+warnings = "deny"

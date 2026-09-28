@@ -376,6 +376,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpio-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "graphics-app"
 version = "0.0.0"
 dependencies = [
@@ -416,6 +425,15 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+]
+
+[[package]]
+name = "i2c-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
 ]
 
 [[package]]
@@ -769,7 +787,9 @@ dependencies = [
  "display-proto",
  "event-proto",
  "font-proto",
+ "gpio-device-proto",
  "graphics-proto",
+ "i2c-device-proto",
  "import-proto",
  "input-proto",
  "ipc-client",

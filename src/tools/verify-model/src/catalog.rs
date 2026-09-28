@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 140] = [
+const GATES: [(&str, &str); 143] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -369,6 +369,13 @@ const GATES: [(&str, &str); 140] = [
 	// `spool`. Its subject is the service, its pure leaves, the protocols and the grant plumbing - a userspace
 	// change selects it - and it boots the test kernel, because the sink is a kernel harness.
 	("spool-service", "userspace.build"),
+	// THE I2C AND GPIO BUS CONTRACTS, on the translated machine: the kernel suite's two bus oracles booted with the
+	// virtio-iommu, so the vhost-user controllers' addresses cross the backend's IOTLB. Its subject is the two
+	// drivers, the scoped connection and the contracts' client side - a userspace change selects it - and it
+	// boots the test kernel.
+	("i2c-bus", "userspace.build"),
+	// THE BUS GATE'S DEVICE SIDE, on the host: the vhost-user backend's own suite.
+	("i2c-backend", "harness.tools"),
 	// MEDIAIMPORTSERVICE, against a PTP responder the kernel harness plays: exact pages, the over-limit storage,
 	// scoped and stale identities, validated completion into a transactional destination, removal as a partial
 	// ending, and the production grant. Its subject is the service, the PTP parser and the decisions leaf, the
@@ -431,6 +438,10 @@ const GATES: [(&str, &str); 140] = [
 	// reads extended config space through, the capability walk over it, and the quarantine that
 	// follows a fatal record are all the kernel's.
 	("qemu-pcie-aer", "kernel"),
+	// AN IDLE MACHINE THAT TAKES NO TICK. Its subject is the kernel: the one-shot an idle core programs, the
+	// console UART's receive line armed on every port, the one wired handler riscv64 shares with the slots,
+	// and the per-core idle records the system graph reads.
+	("tickless-idle", "kernel"),
 	// THE VIRTIO-SERIAL CONTROL QUEUE, whose subject is the driver that negotiates it: a generic port
 	// exists for a driver with MULTIPORT and for no other, so a change to this driver is what can
 	// break it.
@@ -826,7 +837,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 46] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 48] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -839,6 +850,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 46] = [
 	"qemu-gamepad-tool",
 	// And the spool gate, which boots the test kernel with its sink scenario rather than a development image.
 	"spool-service",
+	// And the bus gate, which boots the test kernel on the translated machine with the vhost-user controllers.
+	"i2c-bus",
 	"media-import-service",
 	// And the administrative path, which runs its cold development scenario through the emulated keyboard.
 	"qemu-admin-path",
@@ -850,6 +863,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 46] = [
 	"qemu-3d-demo",
 	"qemu-pcie-hotplug",
 	"qemu-pcie-aer",
+	"tickless-idle",
 	"iommu-ports",
 	"iommu-aarch64-direct-gicv2",
 	"iommu-aarch64-direct-gicv2-hostile",

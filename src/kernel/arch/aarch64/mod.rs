@@ -125,10 +125,14 @@ pub fn interrupts_enabled() -> bool {
 	daif & (1 << 7) == 0
 }
 
-// idle the core until an interrupt (enable IRQs, then wait-for-interrupt)
+// Idle the core until an interrupt, and take it. WFI FIRST AND THE UNMASK AFTER: WFI wakes on an interrupt
+// that is pending even while IRQs are masked, so entered masked - which is how every halt that checks for
+// work first enters it - an interrupt that arrived after the check ends the wait at once and is taken by the
+// unmask. The other order let it be taken first (QEMU ends the translation block after DAIFClr to take it)
+// and then slept until the NEXT interrupt, losing the wake. Entered unmasked it is the plain wait it was.
 pub fn idle_halt() {
 	unsafe {
-		core::arch::asm!("msr daifclr, #2", "wfi", options(nomem, nostack, preserves_flags));
+		core::arch::asm!("wfi", "msr daifclr, #2", options(nomem, nostack, preserves_flags));
 	}
 }
 
@@ -261,6 +265,13 @@ pub mod apic {
 		// it and the core's idle loop picks up the enqueued work.
 		super::gic::send_sgi(dest, 0);
 	}
+	// A halt's one-shot and the periodic tick after it - see `gic::timer_one_shot`.
+	pub fn timer_one_shot(deadline: Option<u64>) -> bool {
+		super::gic::timer_one_shot(deadline)
+	}
+	pub fn timer_periodic() {
+		super::gic::timer_periodic()
+	}
 	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
 		let base = super::gic::ticks();
@@ -297,7 +308,7 @@ pub mod tsc {
 		f
 	}
 	pub fn cycles_to_ns(cycles: u64) -> u64 {
-		crate::arch::common::time::cycles_to_ns(cycles, hz())
+		tickclock::cycles_to_ns(cycles, hz())
 	}
 }
 

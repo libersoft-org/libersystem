@@ -2538,6 +2538,12 @@ pub fn irq_info(index: u64, info: &mut IrqInfo) -> i64 {
 	unsafe { syscall(SYS_IRQ_INFO, index, info as *mut IrqInfo as u64, core::mem::size_of::<IrqInfo>() as u64, 0) as i64 }
 }
 
+// Read core `index`'s idle record into `info`, returning the core count (negative past the end). A free
+// syscall feeding the System Graph's per-core rows.
+pub fn cpu_idle_info(index: u64, info: &mut CpuIdleInfo) -> i64 {
+	unsafe { syscall(SYS_CPU_IDLE_INFO, index, info as *mut CpuIdleInfo as u64, core::mem::size_of::<CpuIdleInfo>() as u64, 0) as i64 }
+}
+
 // Read the retained PCI function at `index` into `info`, returning the function
 // count (negative past the end). A free syscall feeding the `lspci` command.
 pub fn pci_info(index: u64, info: &mut PciInfo) -> i64 {

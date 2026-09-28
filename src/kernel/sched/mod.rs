@@ -176,6 +176,15 @@ fn enqueue_on(cpu: usize, thread: Arc<Thread>) {
 	// to the previous span. That is why this line was flagged while the identical push at the bottom
 	// of this file was not.
 	cpu_sched(cpu).inner.lock().run_queue.push_back(thread);
+	// WORK PLACED ON ANOTHER CORE COMES WITH A WAKE: that core's timer is a one-shot while it is idle, so
+	// its tick is no longer the backstop that picks up work nobody told it about.
+	crate::idle::wake_core(cpu);
+}
+
+// The same placement WITHOUT the wake, for the remote-spawn test's control alone.
+#[cfg(test)]
+fn enqueue_on_unwoken(cpu: usize, thread: Arc<Thread>) {
+	cpu_sched(cpu).inner.lock().run_queue.push_back(thread);
 }
 
 // Allocate the per-core scheduler slots for `count` cores, sized by the MP
@@ -360,6 +369,8 @@ pub fn init() {
 	*ROOT_DOMAIN.lock() = Some(Domain::root());
 	// Per-CPU state and the scheduler are now up: the timer ISR may preempt.
 	PREEMPTION_ENABLED.store(true, Ordering::Release);
+	// And an interrupt can say which core it landed on, so each core's idle record starts here.
+	crate::idle::init();
 	// The timer tick and idle loop now drain the serial ring, so switch serial
 	// transmit from synchronous (immediate boot logs) to the asynchronous ring.
 	arch::serial::enable_async();
@@ -446,9 +457,10 @@ fn spawn_on_maybe_waking(cpu: usize, entry: extern "C" fn(u64), arg: u64, wake: 
 	// out-of-frames says so and stops. The userspace-reachable path is `thread_create`
 	// below, and that one returns None.
 	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
-	start_and_enqueue(cpu, thread.clone());
-	if wake && cpu != current_cpu_id() {
-		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
+	if wake {
+		start_and_enqueue(cpu, thread.clone());
+	} else if thread.try_start() {
+		enqueue_on_unwoken(cpu, thread.clone());
 	}
 	thread
 }
@@ -527,6 +539,9 @@ pub fn prepare_in_process_on(cpu: usize, entry: extern "C" fn(u64), argument: u6
 // thread on the current core, which is what ordinary spawning does and keeps doing. A caller that
 // wants a specific core has to say so, which is what makes "this thread ran on node 1" checkable
 // rather than hoped for.
+//
+// AND THE CORE IS WOKEN (`enqueue_on`): its timer is a one-shot while it is idle, so the tick is no longer
+// the backstop that picks up work nobody told it about.
 #[cfg(test)]
 pub fn start_thread_on(cpu: usize, thread: &Arc<Thread>) -> bool {
 	start_and_enqueue(cpu, thread.clone())
@@ -770,6 +785,10 @@ pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: boo
 		if timed.try_reserve(1).is_ok() {
 			timed.push(TimedWaiter { thread: thread.clone(), deadline, periodic });
 		}
+		drop(timed);
+		// ON THE LIST FIRST, then the BSP asked: it is the one core that expires deadlines, and it may be
+		// asleep past this one.
+		crate::idle::deadline_armed(deadline);
 		// A deadline that cannot be recorded is a wait without a timeout rather than a dead kernel.
 		// The waiter is registered on the object either way, so a wake still arrives; only the
 		// timeout is lost, and the caller's loop is written to re-check regardless.
@@ -855,6 +874,8 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 		if timed.try_reserve(1).is_ok() {
 			timed.push(TimedWaiter { thread: thread.clone(), deadline, periodic });
 		}
+		drop(timed);
+		crate::idle::deadline_armed(deadline);
 	}
 	// Register-then-recheck, closing the wait/wake race across the whole set (see
 	// block_on_flagged): if any object became ready in the window since the caller's
@@ -1024,6 +1045,13 @@ fn min_deadline() -> Option<u64> {
 	TIMED_WAITERS.lock().iter().filter(|w: &&TimedWaiter| !w.periodic).map(|w: &TimedWaiter| w.deadline).min()
 }
 
+// THE EARLIEST DEADLINE OF ANY KIND, progress and housekeeping alike: what the halted BSP's one-shot must
+// wake for, since it is the one core that runs `check_deadlines`. `min_deadline` still decides what counts
+// as progress; this decides when the BSP wakes.
+pub fn earliest_deadline() -> Option<u64> {
+	TIMED_WAITERS.lock().iter().map(|w: &TimedWaiter| w.deadline).min()
+}
+
 // Make a woken thread runnable again on the current core.
 fn enqueue(thread: Arc<Thread>, cause: u8) {
 	// A freshly claimed thread may still be completing its switch away: the block
@@ -1123,6 +1151,18 @@ pub fn set_idle_hook(hook: fn()) {
 	IDLE_HOOK.store(hook as usize as u64, Ordering::Release);
 }
 
+// WHETHER THIS CORE HAS A THREAD TO RUN - the last check every halt makes with interrupts masked.
+pub fn runnable() -> bool {
+	!cpu_sched(current_cpu_id()).inner.lock().run_queue.is_empty()
+}
+
+// The idle hook, for the boot processor's console loop: it runs on every wake of that loop, so what the
+// hook polls - the housekeeping among it - runs at the bound that woke it.
+#[cfg(not(test))]
+pub fn run_idle_hook_now() {
+	run_idle_hook();
+}
+
 // Run the registered idle hook, if any.
 fn run_idle_hook() {
 	let raw = IDLE_HOOK.load(Ordering::Acquire);
@@ -1207,13 +1247,14 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 				// the serial UART (an `inb` on the LSR) every pass - floods KVM with port-I/O
 				// VM-exits that each grab the QEMU big lock, starving the device-emulation /
 				// display-encode thread and making the framebuffer console feel laggy. Halting
-				// yields the vCPU; the 100 Hz LAPIC timer (and any device IRQ) wakes us within
-				// one tick to re-check the run queue, so an IRQ-woken driver (e.g. a virtio RX
-				// completion) still runs promptly. The run-queue check drops its lock each pass
-				// so the ISR that enqueues the woken thread can run between checks, the idle
-				// hook runs each wake so the BSP keeps draining serial TX and polling serial
-				// input, and check_deadlines runs each wake so a periodic wait due inside this
-				// window still wakes on time.
+				// yields the vCPU; the halt's one-shot (the window's end, or the earliest
+				// deadline of any kind) and any device IRQ or wake IPI end it to re-check the
+				// run queue, so an IRQ-woken driver (e.g. a virtio RX completion) still runs
+				// promptly. The run-queue check drops its lock each pass so the ISR that
+				// enqueues the woken thread can run between checks, the idle hook runs each
+				// wake so the BSP keeps draining serial TX and polling serial input, and
+				// check_deadlines runs each wake so a periodic wait due inside this window
+				// still wakes on time.
 				while arch::apic::ticks() < deadline && cpu_sched(cpu).inner.lock().run_queue.is_empty() {
 					// ANSWER TLB SHOOTDOWNS HERE TOO, for the reason `cpu_idle_loop` gives and this
 					// loop did not: a core that requested a shootdown waits for every other core to
@@ -1232,7 +1273,10 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 					run_idle_hook();
 					arch::serial::drain_tx();
 					check_deadlines();
-					arch::idle_halt();
+					// A ONE-SHOT FOR THE WINDOW'S END - or earlier, for a deadline, the housekeeping bound or
+					// held output - with the run queue checked under the mask, so a thread an interrupt or
+					// `check_deadlines` made runnable in the gap ends the halt at once.
+					crate::idle::halt(Some(deadline), || !cpu_sched(cpu).inner.lock().run_queue.is_empty());
 				}
 				check_deadlines();
 			}
@@ -1245,12 +1289,11 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 }
 
 // Idle loop for application processors: run any ready thread, otherwise HALT until
-// the next interrupt and re-check. Each AP runs a periodic LAPIC timer (set up in
-// arch::init_ap) only to wake it from the halt within one tick, so an idle core
-// yields its physical CPU instead of busy-spinning - which, under virtualization,
-// would steal host time from the cores doing real work and from the host's own device
-// emulation. Work another core enqueues onto this core's run queue (rare - wakeups
-// land on the waker's core, not here) is picked up at the next wake.
+// the next interrupt and re-check. An idle core yields its physical CPU instead of
+// busy-spinning - which, under virtualization, would steal host time from the cores
+// doing real work and from the host's own device emulation - and takes no periodic
+// tick while it halts: work another core enqueues onto this core's run queue (rare -
+// wakeups land on the waker's core, not here) comes with a wake IPI (`enqueue_on`).
 //
 // APs deliberately do NOT drive the wait registry's DEADLINES: expiry is checked by
 // `check_deadlines`, which only the BSP's bounded drain (`run_until_idle_until`) runs, so a
@@ -1261,26 +1304,24 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 pub fn cpu_idle_loop() -> ! {
 	loop {
 		reschedule(Disposition::Requeue);
+		// A THREAD THAT EXITED HERE IS DROPPED NOW, not at this core's next reschedule: that used to be at
+		// most a tick away, and an idle core with no tick may not reschedule again for a long time - holding
+		// the dead thread, and its Domain's charge, all that while. This is the idle context, so the dead
+		// thread's stack is no longer in use.
+		reap(cpu_sched(current_cpu_id()));
 		// Answer any TLB shootdown before settling. The interrupt handlers service these
 		// too; this is the path for a core that was already awake and looping, and on
 		// RISC-V it is the only one - its wake IPI has no handler of its own.
 		crate::mem::tlb::service_pending();
 		// An idle core has nothing better to do than push the serial ring to the wire.
 		arch::serial::drain_tx();
-		// Lost-wakeup-safe idle: mask interrupts, re-check the run queue under the mask,
-		// and only wait if it is still empty. arch::idle_halt is entered with interrupts
-		// masked and re-enables them across the wait (x86 `sti; hlt`, aarch64 / riscv WFI
-		// wakes on a pending-but-masked interrupt), so a wake event - a cross-core IPI or
-		// the timer - that arrives after this check is held pending and delivered by the
-		// wait, rather than consumed (and lost) in the gap before it. Without the mask the
-		// IPI could run its handler between the check and the wait, and the wait would
-		// then sleep until the next tick despite the queued work.
-		arch::disable_interrupts();
-		if cpu_sched(current_cpu_id()).inner.lock().run_queue.is_empty() {
-			arch::idle_halt();
-		} else {
-			arch::enable_interrupts();
-		}
+		// Lost-wakeup-safe idle: `idle::halt` masks interrupts, re-checks the run queue under the
+		// mask, and only waits if it is still empty - entered masked, so a wake event (a cross-core
+		// IPI, the timer) that arrives after the check is held pending and ends the wait rather than
+		// being consumed in the gap before it. AND WITHOUT A TICK: this core's timer is a one-shot for
+		// nothing at all unless held output caps it, because work placed here comes with a wake IPI
+		// and deadlines are the boot processor's.
+		crate::idle::halt(None, || !cpu_sched(current_cpu_id()).inner.lock().run_queue.is_empty());
 	}
 }
 

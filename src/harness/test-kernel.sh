@@ -492,6 +492,8 @@ usb_gadget_teardown() {
 		I2C_BACKEND_PID=""
 	fi
 	if [[ -n "${I2C_DIR:-}" && "$I2C_DIR" == */liber-i2c.* && -d "$I2C_DIR" ]]; then
+		# ITS LOG OUTLIVES IT, beside the guest's: what the device side saw is half of any bus failure.
+		[[ -s "$I2C_DIR/backend.log" ]] && cp "$I2C_DIR/backend.log" "$LOG_DIR/$LOG_STEM-i2c-backend.log" 2>/dev/null || true
 		rm -rf -- "$I2C_DIR"
 		I2C_DIR=""
 	fi
@@ -681,7 +683,7 @@ if [[ -n "${I2C_FIXTURE:-}" ]]; then
 	I2C_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liber-i2c.XXXXXX")"
 	I2C_SOCKET="$I2C_DIR/i2c.sock"
 	GPIO_SOCKET="$I2C_DIR/gpio.sock"
-	python3 "$ROOT/harness/vhost-i2c-gpio.py" --i2c "$I2C_SOCKET" --gpio "$GPIO_SOCKET" --control "$I2C_DIR/control.sock" --ready "$I2C_DIR/ready" >"$I2C_DIR/backend.log" 2>&1 &
+	python3 "$ROOT/harness/vhost-i2c-gpio.py" --i2c "$I2C_SOCKET" --gpio "$GPIO_SOCKET" --control "$I2C_DIR/control.sock" --ready "$I2C_DIR/ready" --trace >"$I2C_DIR/backend.log" 2>&1 &
 	I2C_BACKEND_PID="$!"
 	for _ in $(seq 1 100); do
 		[[ -e "$I2C_DIR/ready" ]] && break

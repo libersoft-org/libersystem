@@ -2627,3 +2627,153 @@ fn a_phandle_no_node_carries_places_nothing() {
 		assert_eq!(tree.interrupt_controller_reg(phandle), None, "phandle {phandle:#x}");
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// The console's own interrupt: which controller input the UART the kernel writes to raises.
+// ---------------------------------------------------------------------------------------------
+//
+// THE ANSWERS ARE THE TREES', taken out of each fixture with an independent decoder before a line
+// of `console_interrupt` existed, as the INTx answers above were.
+
+// aarch64 `virt`: the PL011 names no controller of its own, so the ROOT's `interrupt-parent` - the
+// GIC - is the one in force. SPI 1, level-high, on all three GIC machines.
+#[test]
+fn the_aarch64_console_raises_spi_one_through_the_gic_the_root_names() {
+	for (tree, gic) in [(at(AARCH64), 0x8002u32), (at(AARCH64_GICV3), 0x8009), (at(AARCH64_GICV3_ITS), 0x8009)] {
+		let route = tree.console_interrupt().expect("the PL011 has an interrupt");
+		assert_eq!(route, IntxRoute { controller: gic, cells: 3, spec: [0, 1, 4, 0] });
+		assert_eq!(tree.interrupt_controller_reg(route.controller).map(|(base, _)| base), Some(0x0800_0000), "the GIC's distributor");
+	}
+}
+
+// riscv64 `virt` with AIA, the machine the harness runs: the 16550 names the supervisor-level APLIC
+// itself, in two cells - source 10, level-high.
+#[test]
+fn the_riscv64_aia_console_raises_source_ten_through_the_aplic_it_names() {
+	let tree = at(RISCV64_AIA);
+	let route = tree.console_interrupt().expect("the 16550 has an interrupt");
+	assert_eq!(route, IntxRoute { controller: 0x14, cells: 2, spec: [10, 4, 0, 0] });
+	assert_eq!(tree.interrupt_controller_reg(route.controller).map(|(base, _)| base), Some(0x0d00_0000), "the supervisor-level APLIC");
+}
+
+// And without AIA, the PLIC in one cell - kept for the reason the INTx routes keep it: a reader that
+// handled only the two-cell shape would pass the AIA tree by accident.
+#[test]
+fn the_riscv64_plic_console_raises_source_ten_in_one_cell() {
+	let tree = at(RISCV64);
+	let route = tree.console_interrupt().expect("the 16550 has an interrupt");
+	assert_eq!(route, IntxRoute { controller: 0x3, cells: 1, spec: [10, 0, 0, 0] });
+	assert_eq!(tree.interrupt_controller_reg(route.controller).map(|(base, _)| base), Some(0x0c00_0000), "the PLIC");
+}
+
+// A console at `/serial@9000000` beside two controllers - a three-cell GIC at phandle 7 and a
+// two-cell APLIC at phandle 9 - with whatever `serial` and `root` add to the two nodes.
+fn console_with(serial: impl FnOnce(&mut Builder), root: impl FnOnce(&mut Builder)) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	root(&mut builder);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("chosen").prop_str("stdout-path", "/serial@9000000").end();
+	builder.begin("intc@8000000").prop_u32("phandle", 7).prop_u32("#interrupt-cells", 3).prop("interrupt-controller", b"").prop_reg64(0x0800_0000, 0x1_0000).end();
+	builder.begin("aplic@d000000").prop_u32("phandle", 9).prop_u32("#interrupt-cells", 2).prop("interrupt-controller", b"").prop_reg64(0x0d00_0000, 0x8000).end();
+	builder.begin("mute@e000000").prop_u32("phandle", 11).prop("interrupt-controller", b"").prop_reg64(0x0e00_0000, 0x1000).end();
+	builder.begin("serial@9000000").prop_str("compatible", "arm,pl011").prop_reg64(0x0900_0000, 0x1000);
+	serial(&mut builder);
+	builder.end();
+	builder.end();
+	builder.finish()
+}
+
+// The node's own `interrupt-parent` is the one in force, whatever the root says - and it may come
+// after `interrupts` in the node, which is why the parent is settled only once the node is read.
+#[test]
+fn a_consoles_own_interrupt_parent_wins_over_the_roots() {
+	let tree = at(console_with(
+		|serial| {
+			serial.prop("interrupts", &be_cells(&[5, 1])).prop_u32("interrupt-parent", 9);
+		},
+		|root| {
+			root.prop_u32("interrupt-parent", 7);
+		},
+	));
+	assert_eq!(tree.console_interrupt(), Some(IntxRoute { controller: 9, cells: 2, spec: [5, 1, 0, 0] }));
+}
+
+// `interrupts-extended` names its controller in its first cell, and the specification gives it
+// precedence over `interrupts` with the inherited parent.
+#[test]
+fn an_interrupts_extended_names_its_own_controller_and_wins() {
+	let tree = at(console_with(
+		|serial| {
+			serial.prop("interrupts", &be_cells(&[0, 1, 4])).prop("interrupts-extended", &be_cells(&[9, 33, 4]));
+		},
+		|root| {
+			root.prop_u32("interrupt-parent", 7);
+		},
+	));
+	assert_eq!(tree.console_interrupt(), Some(IntxRoute { controller: 9, cells: 2, spec: [33, 4, 0, 0] }));
+}
+
+// A console with no interrupt at all, or none whose controller can be named, raises nothing this
+// reader can describe - and is polled, which is what it was.
+#[test]
+fn a_console_whose_line_cannot_be_named_answers_none() {
+	let silent = at(console_with(
+		|_| {},
+		|root| {
+			root.prop_u32("interrupt-parent", 7);
+		},
+	));
+	assert_eq!(silent.console_interrupt(), None, "no `interrupts`");
+	let orphan = at(console_with(
+		|serial| {
+			serial.prop("interrupts", &be_cells(&[0, 1, 4]));
+		},
+		|_| {},
+	));
+	assert_eq!(orphan.console_interrupt(), None, "no `interrupt-parent` anywhere up the path");
+	let unknown = at(console_with(
+		|serial| {
+			serial.prop("interrupts", &be_cells(&[0, 1, 4])).prop_u32("interrupt-parent", 0x77);
+		},
+		|_| {},
+	));
+	assert_eq!(unknown.console_interrupt(), None, "a phandle no node carries");
+	let mute = at(console_with(
+		|serial| {
+			serial.prop("interrupts", &be_cells(&[0, 1, 4])).prop_u32("interrupt-parent", 11);
+		},
+		|_| {},
+	));
+	assert_eq!(mute.console_interrupt(), None, "a controller declaring no `#interrupt-cells` has no specifier to read against");
+}
+
+// A specifier shorter than its controller's binding is the tree contradicting itself: reading on
+// would take the next property's bytes for the trigger.
+#[test]
+fn a_specifier_shorter_than_its_controllers_binding_is_refused() {
+	let short = at(console_with(
+		|serial| {
+			serial.prop("interrupts", &be_cells(&[0, 1]));
+		},
+		|root| {
+			root.prop_u32("interrupt-parent", 7);
+		},
+	));
+	assert_eq!(short.console_interrupt(), None, "two cells against a three-cell GIC");
+	let bare = at(console_with(
+		|serial| {
+			serial.prop("interrupts-extended", &be_cells(&[9]));
+		},
+		|_| {},
+	));
+	assert_eq!(bare.console_interrupt(), None, "a controller named with no specifier after it");
+	let empty = at(console_with(
+		|serial| {
+			serial.prop("interrupts-extended", &[]);
+		},
+		|_| {},
+	));
+	assert_eq!(empty.console_interrupt(), None, "an `interrupts-extended` with nothing in it");
+}

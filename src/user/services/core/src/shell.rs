@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, JobTarget, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{Component, CoreIdle, EnvVar, Error, JobEntry, JobInfo, JobTarget, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
 use services::shell_language::{ExpandedStage, Expansion, ParseError, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
@@ -1954,6 +1954,7 @@ fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
 			GraphFmt::Text => {
 				print_text_lines(&graph.components, |c: &Component| -> String { c.to_text() });
 				print_text_lines(&graph.spans, |s: &TraceSpan| -> String { s.to_text() });
+				print_text_lines(&graph.cores, |c: &CoreIdle| -> String { c.to_text() });
 			}
 			GraphFmt::Json(mode) => {
 				print(mode.render(graph.to_json()).as_bytes());

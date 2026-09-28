@@ -382,6 +382,7 @@ fn dispatch(vector: u8) {
 	// AC so the handler runs with SMAP enforced; iretq restores the interrupted
 	// context's own AC.
 	super::paging::clac_on_entry();
+	crate::idle::interrupt(crate::idle::Cause::Device(vector as u32));
 	let index = (vector - IRQ_BASE) as usize;
 	let raw = HANDLERS[index].load(Ordering::SeqCst);
 	if raw != 0 {
@@ -399,6 +400,7 @@ fn dispatch(vector: u8) {
 // mask/unmask dance (there is no shared level line to gate, unlike the INTx path).
 fn dispatch_msi(vector: u8) {
 	super::paging::clac_on_entry();
+	crate::idle::interrupt(crate::idle::Cause::Device(vector as u32));
 	REGISTRY.dispatch((vector - MSI_BASE) as usize);
 	apic::eoi();
 }
@@ -468,6 +470,7 @@ extern "x86-interrupt" fn wake_ipi(_frame: InterruptStackFrame) {
 	// The wake IPI carries two errands now: bounce a halted core into its run queue, and
 	// answer a TLB shootdown. Both are "look at something you were told about", and one
 	// interrupt is cheaper than two vectors.
+	crate::idle::interrupt(crate::idle::Cause::Ipi);
 	crate::mem::tlb::service_pending();
 	apic::eoi();
 }
@@ -484,6 +487,7 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
 	// the interrupted context (ring-3 code may set it freely) would leak into the
 	// next thread's kernel execution, suspending SMAP there.
 	super::paging::clac_on_entry();
+	crate::idle::timer_interrupt();
 	apic::on_timer_tick();
 	apic::eoi();
 	crate::sched::on_timer_preempt(frame.code_segment & 3 == 3);

@@ -661,20 +661,23 @@ fn decode_boot_arg(arg: u64) -> (u64, Option<BootFb>) {
 //
 // Zero is named for what it is. A boot that delivered no timer interrupt looked, on the port that did
 // report, exactly like one that delivered five - which is the defect this wording exists to remove.
+//
+// THE INTERRUPTS THEMSELVES ARE COUNTED, NOT TICKS: the tick is computed from the `time` CSR and advances
+// whether or not a single timer interrupt ever arrives, so five ticks would prove nothing.
 fn report_timer() {
-	let start = super::apic::ticks();
+	let start = super::apic::timer_interrupts();
 	let mut spins: u64 = 0;
-	while super::apic::ticks() < start + 5 && spins < 2_000_000_000 {
+	while super::apic::timer_interrupts() < start + 5 && spins < 2_000_000_000 {
 		super::idle_halt();
 		spins += 1;
 	}
-	let delivered = super::apic::ticks() - start;
+	let delivered = super::apic::timer_interrupts() - start;
 	if delivered == 0 {
 		crate::serial_println!("riscv64: NO TIMER IRQ WAS DELIVERED in {spins} spins - the interrupt path is not carrying the S-mode timer, and everything timed on this machine is on a clock that does not tick");
 	} else if delivered < 5 {
-		crate::serial_println!("riscv64: timer IRQs delivered - {delivered} ticks, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
+		crate::serial_println!("riscv64: timer IRQs delivered - {delivered} interrupts, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
 	} else {
-		crate::serial_println!("riscv64: timer IRQs delivered - {delivered} ticks");
+		crate::serial_println!("riscv64: timer IRQs delivered - {delivered} interrupts");
 	}
 }
 

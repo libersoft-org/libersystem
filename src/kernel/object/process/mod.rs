@@ -554,6 +554,7 @@ impl Process {
 		self.exited.store(true, Ordering::Release);
 		self.record_in_groups();
 		sched::wake_object(self.header.koid());
+		crate::idle::process_ended(self.header.koid());
 	}
 
 	// Take note of a group this process belongs to. Called by `ProcessGroup::create`, which is the
@@ -985,6 +986,7 @@ impl Process {
 		// A kill is a terminal state, so wake anything blocked on this process handle to
 		// observe it - the same process-terminated signal a clean exit delivers.
 		sched::wake_object(self.header.koid());
+		crate::idle::process_ended(self.header.koid());
 	}
 }
 

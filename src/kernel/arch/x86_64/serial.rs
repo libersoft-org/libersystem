@@ -72,10 +72,23 @@ static ASYNC: AtomicBool = AtomicBool::new(false);
 // IRQ instead of waiting for the next poll. Called once the kernel has routed that IRQ; transmit
 // stays poll-driven (the async ring). The routing is the boot tail's, so a test build never asks.
 #[cfg(not(test))]
-pub fn enable_rx_irq() {
+fn enable_rx_irq() {
 	unsafe {
 		outb(COM1 + 1, 0x01);
 	}
+}
+
+// THE CONSOLE UART'S RECEIVE INTERRUPT, answered by `handler`: COM1's legacy IRQ 4, routed to the boot
+// processor through the I/O APIC, and the UART told to raise it - so a typed byte reaches the shell at
+// once, and wakes an idle machine that takes no periodic tick to find it by. Answers the number an idle
+// core's record names it by, which on this port is the IDT vector.
+#[cfg(not(test))]
+pub fn arm_rx_interrupt(handler: super::interrupts::HandlerFn) -> Result<u32, &'static str> {
+	let vector = super::interrupts::IRQ_BASE + 4;
+	super::interrupts::register(vector as u32, handler);
+	super::ioapic::route(4, vector, crate::smp::lapic_id(0), super::ioapic::Kind::IsaEdge);
+	enable_rx_irq();
+	Ok(vector as u32)
 }
 
 pub fn init() {
@@ -101,6 +114,18 @@ fn transmit_empty() -> bool {
 	unsafe { (inb(COM1 + 5) & 0x20) != 0 }
 }
 
+// A UART AT ITS BAUD RATE, for the test that needs one. QEMU's 16550 hands every byte to its backend the
+// moment it is written, so THRE is set again at once and one drain empties the whole ring: no burst ever
+// waits for a later drain, and whether an idle core still comes back for the rest cannot be seen. Paced,
+// a drain pushes one FIFO load and stops, as it does on a UART whose FIFO is still going out.
+#[cfg(test)]
+static PACED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub fn pace(paced: bool) {
+	PACED.store(paced, Ordering::SeqCst);
+}
+
 // Push as much of the ring to the UART as the holding register will take right now:
 // one FIFO load if THRE is set, then return (writing more would need another empty
 // FIFO). Non-blocking. The caller holds the TX lock, serializing the port access.
@@ -113,12 +138,17 @@ fn drain_locked(ring: &mut TxRing) {
 				outb(COM1, byte);
 			}
 		}
+		#[cfg(test)]
+		if PACED.load(Ordering::Relaxed) {
+			return;
+		}
 	}
 }
 
-// Background drain: called from the timer ISR (every core) and each core's idle
-// loop. `try_lock` so it never spins in an interrupt handler when another core
-// holds the ring; it simply tries again on the next tick.
+// Background drain: called from a busy core's timer tick and from each core's idle
+// loop, whose halt sleeps one tick at most while the ring holds bytes (`tx_pending`).
+// `try_lock` so it never spins in an interrupt handler when another core holds the
+// ring; it simply tries again on the next tick.
 pub fn drain_tx() {
 	if let Some(mut ring) = TX.try_lock() {
 		drain_locked(&mut ring);
@@ -207,6 +237,13 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
 		ring.push(byte);
 	}
 	bytes.len()
+}
+
+// WHETHER THE TRANSMIT RING HOLDS BYTES THE WIRE HAS NOT TAKEN: an idle core then sleeps one tick at most,
+// the latency the ring had while every core's periodic tick drained it. A ring another core is draining
+// right now counts as holding bytes.
+pub fn tx_pending() -> bool {
+	ASYNC.load(Ordering::Acquire) && TX.try_lock().is_none_or(|ring| ring.len != 0)
 }
 
 // True if the UART has a received byte waiting (Line Status Register, DR bit).

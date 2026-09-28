@@ -383,6 +383,13 @@ fn a_late_acknowledgement_does_not_count_for_the_next_request() {
 	// whole-buffer: a core that has served a newer request has necessarily flushed for this one.
 	crate::mem::tlb::acknowledge_for_test(other, stale + 2);
 	assert!(crate::mem::tlb::acknowledged_for_test(other, stale + 1), "a later flush covers an earlier request");
+	// AND THE MACHINE IS LEFT AS IT WAS FOUND. The injected acknowledgement is for a generation nobody has
+	// requested yet, so the next two REAL rounds would count `other` as done without it flushing - and
+	// without it copying its port bitmap again, which is how the port-range test after this one waited
+	// for ever on a range its core still let through. Two real rounds bring the requests level with it.
+	while crate::mem::tlb::request_generation() < stale + 2 {
+		crate::mem::tlb::shootdown();
+	}
 }
 
 crate::tagged_test!(a_machine_with_more_cores_than_the_shootdown_tracks_is_refused, [Frame, Memory, Smp], id = "kernel.mem.frame.a_machine_with_more_cores_than_the_shootdown_tracks_is_refused", covers = ["kernel"]);

@@ -54,6 +54,9 @@ pub fn init_interrupts() {
 	interrupts::init();
 	apic::init();
 	ioapic::init();
+	// WHICH ONE-SHOT AN IDLE CORE'S HALT ARMS, said once: the two are different code, and a run meant to
+	// exercise the other (`-cpu ...,-tsc-deadline`) is only evidence if the log says it did.
+	crate::serial_println!("idle: an idle core's timer is a one-shot - {}", if apic::tsc_deadline() { "the TSC deadline" } else { "a local APIC count, re-armed in steps" });
 }
 
 // Enable the fast `syscall` instruction on the current core (per-core MSRs).
@@ -65,6 +68,9 @@ pub fn init_syscalls() {
 // interrupts disabled so no timer ISR distorts the calibration window.
 pub fn init_tsc() {
 	tsc::init();
+	// AND THE CLOCK STARTS HERE, the moment the counter's frequency is known: tick zero is now. Before this
+	// it answers zero, which nothing between the kernel's first line and here waits on.
+	crate::arch::common::time::CLOCK.anchor(tsc::now(), tsc::hz());
 }
 
 // Initialize per-CPU data for the bootstrap processor (CPU id 0). The BSP's
