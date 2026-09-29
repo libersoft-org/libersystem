@@ -40,3 +40,5 @@ pub const CAP_MEDIA_IMPORT: &[u8] = b"IMPORT";
 pub const CAP_ADMIN_FACTORY: &[u8] = b"ADMINFACTORY";
 pub const CAP_ADMIN_AUDIT: &[u8] = b"ADMINAUDIT";
 pub const CAP_ADMIN_TEST: &[u8] = b"ADMINTEST";
+// THE BMC SERVICE'S ONE ROOT: every `bmc` grant is a fresh connection from it.
+pub const CAP_BMC: &[u8] = b"BMC";

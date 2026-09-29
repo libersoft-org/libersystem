@@ -53,7 +53,9 @@ pub fn report_smbios(entry: u64, phys_to_virt: fn(u64) -> u64) {
 		Err(refusal) => crate::serial_println!("smbios: {}.{} - the structure table is refused - {refusal:?}", point.major, point.minor),
 	}
 	let _ = smbios::ipmi_records(table, &point, |record| {
-		crate::firmware::note_ipmi_record(record.instance as usize, record.interface, record.address());
+		// AN SSIF RECORD IS KEPT BY ITS SEVEN-BIT ADDRESS, the form an `IPI0001` node's `I2cSerialBusV2` names.
+		let address = if record.interface == smbios::IPMI_SSIF { u64::from(record.ssif_address()) } else { record.address() };
+		crate::firmware::note_ipmi_record(record.instance as usize, record.interface, address);
 		let interface = match record.interface {
 			smbios::IPMI_KCS => "KCS",
 			smbios::IPMI_SMIC => "SMIC",

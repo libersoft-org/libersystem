@@ -181,6 +181,11 @@ fn the_smbios_type_38_record_an_ipmi_node_agrees_with() {
 	assert_eq!(smbios_ipmi(&records, 2, 0xE4), Some(1));
 	assert_eq!(smbios_ipmi(&records, 1, 0xCA3), Some(0), "the I/O-space bit of the base address is not part of it");
 	assert_eq!(smbios_ipmi(&records, 3, 0xCA2), None);
+	// SSIF: THE SEVEN-BIT ADDRESS, EXACTLY - bit 0 of a bus address is an address bit, not a flag.
+	let ssif = [(1u8, 0xCA2u64), (4, 0x10)];
+	assert_eq!(smbios_ssif(&ssif, 0x10), Some(1));
+	assert_eq!(smbios_ssif(&ssif, 0x11), None, "0x11 is another device on the bus");
+	assert_eq!(smbios_ssif(&records, 0x10), None, "no SSIF record");
 }
 
 #[test]

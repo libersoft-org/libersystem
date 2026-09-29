@@ -1,0 +1,76 @@
+# A POWER CYCLE THROUGH THE BMC, confirmed on the protected screen - which QEMU's simulated BMC refuses with 0xD5.
+#
+# So the case is the refusal's: the tool reports the BMC refused it, the administrative outcome is `failed`, and the
+# machine keeps running. The BMC is given no GUID, so the request names it by its fallback identity - its device and
+# its binding. One simulated BMC on ISA KCS. Run bare there is no BMC, and the first wait fails.
+version = 1
+name = "ipmi power cycle"
+description = "A BMC power cycle the BMC refuses is reported as the refusal, fails administratively and leaves the machine running."
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "key"
+text = "bmccheck booted"
+
+[[step]]
+do = "expect"
+contains = "bmccheck: the boot's event is in the log of bmc:00000-"
+timeout = 200
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc chassis power-cycle &"
+
+[[step]]
+do = "expect"
+contains = " - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "bmc: confirmed - asking the BMC"
+
+[[step]]
+do = "expect"
+contains = "the BMC refused the chassis PowerCycle with 0xd5"
+timeout = 60
+unordered = true
+
+[[step]]
+do = "expect"
+contains = "bmc: failed - the BMC refused it, and nothing was done"
+timeout = 60
+
+[[step]]
+do = "run-state"
+state = "running"
+hold = 10
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"

@@ -82,6 +82,14 @@ const GAMEPAD_FRAME: usize = 256;
 const MAX_POINTER_PROVIDERS: usize = 4;
 const MAX_TOUCH_SURFACES: usize = 1;
 
+// A publication as a line names it: the device that published it, and the catalogue's slot and generation.
+fn publication_text(info: &ProviderInfo) -> String {
+	match info.platform {
+		Some(row) => format!("platform device {row}, slot {} generation {}", info.slot, info.provider_generation),
+		None => format!("{:02x}:{:02x}.{}, slot {} generation {}", info.bus, info.dev, info.func, info.slot, info.provider_generation),
+	}
+}
+
 // ONE KIND OF PROVIDER, FOLLOWED - `pointer` or `touch`. The catalogue subscription stays OPEN for this service's life,
 // and every live provider it announces, at bootstrap or later, is attached up to the kind's bound; one past it waits,
 // said once, and is attached when one of its kind is detached. A provider is detached on its withdrawal or when its
@@ -167,8 +175,9 @@ impl Followed {
 		}
 		match provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(&info) {
 			Some(Ok(chan)) => {
+				let named = publication_text(&info);
 				self.attached.push((info, chan));
-				print(format!("InputService: a {} provider is attached ({} attached)\n", self.what, self.attached.len()).as_bytes());
+				print(format!("InputService: a {} provider is attached - {named} ({} attached)\n", self.what, self.attached.len()).as_bytes());
 			}
 			Some(Err(_)) => print(format!("InputService: the catalogue refused a connection to a {} provider it published\n", self.what).as_bytes()),
 			None => print(format!("InputService: the catalogue did not answer the connection to a {} provider\n", self.what).as_bytes()),
@@ -178,9 +187,9 @@ impl Followed {
 	// A provider detached - withdrawn, or its connection closed - and the first one waiting attached in its place.
 	fn detach(&mut self, chan: u64) {
 		let Some(at) = self.attached.iter().position(|(_, held)| *held == chan) else { return };
-		self.attached.remove(at);
+		let (info, _) = self.attached.remove(at);
 		close(chan);
-		print(format!("InputService: a {} provider is detached ({} attached)\n", self.what, self.attached.len()).as_bytes());
+		print(format!("InputService: a {} provider is detached - {} ({} attached)\n", self.what, publication_text(&info), self.attached.len()).as_bytes());
 		while self.attached.len() < self.bound && !self.waiting.is_empty() {
 			let next = self.waiting.remove(0);
 			self.adopt(next);

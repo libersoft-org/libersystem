@@ -1,0 +1,65 @@
+# A SOFT SHUTDOWN THROUGH THE BMC, confirmed on the protected screen: the BMC presses the power button.
+#
+# QEMU's simulated BMC answers it with an ACPI power-button press, so DeviceManager's power-button line comes before
+# the stop, and the machine ends in QEMU's run state `shutdown` under the run's `-no-shutdown`. One simulated BMC on
+# ISA KCS. Run bare there is no BMC, and the first wait fails.
+version = 1
+name = "ipmi soft shutdown"
+description = "A BMC soft shutdown, confirmed on the protected screen, presses the power button and the machine powers off."
+ends = "powered-off"
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "key"
+text = "bmccheck booted"
+
+[[step]]
+do = "expect"
+contains = "bmccheck: the boot's event is in the log of bmc:"
+timeout = 200
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc chassis soft-shutdown &"
+
+[[step]]
+do = "expect"
+contains = " - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "the chassis SoftShutdown is sent to the BMC"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "DeviceManager: the power button was pressed"
+timeout = 60
+
+[[step]]
+do = "run-state"
+state = "shutdown"
+timeout = 120

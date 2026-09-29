@@ -106,6 +106,21 @@ fn attach_smbios(description: &mut platform::Description, properties: &[u8]) {
 		return;
 	}
 	let Some(interface) = property_integer(properties, b"_IFT") else { return };
+	// SSIF: the SMBus address its `I2cSerialBusV2` names, held against the SSIF records' seven-bit addresses.
+	if interface == u64::from(policy::SMBIOS_IPMI_SSIF) {
+		let Some(address) = description.part.connections().iter().find(|connection| connection.kind == abi::CONNECTION_I2C).map(|connection| connection.value as u16) else { return };
+		let records = STATE.lock().ipmi.clone();
+		match policy::smbios_ssif(&records, address) {
+			Some(at) => {
+				let text = alloc::format!("smbios:38#{at}");
+				if description.add_match(abi::MATCH_ID_SMBIOS, text.as_bytes()) {
+					crate::serial_println!("firmware: {} agrees with {text}", String::from_utf8_lossy(description.identity()));
+				}
+			}
+			None => crate::serial_println!("firmware: {} names an SSIF interface at SMBus address {address:#04x}, which no SMBIOS record describes", String::from_utf8_lossy(description.identity())),
+		}
+		return;
+	}
 	let base = description.ports().first().map(|port| port.base as u64).or_else(|| description.part.mmio().first().map(|range| range.base));
 	let Some(base) = base else { return };
 	let records = STATE.lock().ipmi.clone();

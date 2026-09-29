@@ -1079,6 +1079,12 @@ pub fn node() -> Option<u64> {
 // Whether an answer to a node request arrived since `wait_node_or_answer` last said so.
 static NODE_FRESH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// THE NODE CHANNEL A NEWER ANSWER HANDED OVER, once: `Some(0)` for "there is none" - for a loop that waits in
+// `wait_or_answer_until` rather than here, and takes a restarted ACPI service's node when it is handed again.
+pub fn fresh_node() -> Option<u64> {
+	NODE_FRESH.swap(false, core::sync::atomic::Ordering::AcqRel).then(|| NODE.load(core::sync::atomic::Ordering::Acquire))
+}
+
 // THE SAME WAIT AS `wait_or_answer`, ANSWERING `Some(handles.len())` WHEN THE MANAGER ANSWERED THIS DRIVER'S NODE REQUEST
 // meanwhile - for a driver whose loop acts on its firmware node, which arrives on the control channel this wait drains.
 pub fn wait_node_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<usize> {

@@ -39,6 +39,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmc-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "camera-device-proto"
 version = "0.0.0"
 dependencies = [
@@ -238,6 +246,7 @@ dependencies = [
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "bmc-proto",
  "camera-device-proto",
  "camera-proto",
  "config-proto",

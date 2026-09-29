@@ -27,7 +27,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth power smartcard modem modem-device camera camera-device event midi midi-device spool printer-device import ptp-transport admin i2c-device gpio-device tpm)
+PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth power smartcard modem modem-device camera camera-device event midi midi-device spool printer-device import ptp-transport admin i2c-device gpio-device tpm bmc)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -91,11 +91,12 @@ declare -A EXTERNAL=(
 	# THE TPM: the application's connection, the private minting endpoint and the driver's provider contract,
 	# in one package - a TPM has one driver and one consumer, and no device contract anyone else implements.
 	[tpm]="base process"
+	[bmc]="base"
 )
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(admin audio base bluetooth camera camera-device config device display display-device event font gpio-device graphics i2c-device import input log midi midi-device network observability modem modem-device power printer-device process ptp-transport resources security session smartcard spool storage time tpm)
+AGGREGATE_EXTERNAL=(admin audio base bluetooth bmc camera camera-device config device display display-device event font gpio-device graphics i2c-device import input log midi midi-device network observability modem modem-device power printer-device process ptp-transport resources security session smartcard spool storage time tpm)
 
 help() {
 	usage_and_exit <<EOF

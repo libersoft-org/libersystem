@@ -3,6 +3,7 @@ pub use admin_proto::generated::liber::admin;
 pub use audio_proto::generated::liber::audio;
 pub use base_proto::generated::liber::base;
 pub use bluetooth_proto::generated::liber::bluetooth;
+pub use bmc_proto::generated::liber::bmc;
 pub use camera_device_proto::generated::liber::camera_device;
 pub use camera_proto::generated::liber::camera;
 pub use config_proto::generated::liber::config;

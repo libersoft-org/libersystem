@@ -6,6 +6,10 @@
 //! an executor that answered another action, other parameters or another payload length has not prepared
 //! the operation the requester asked for, and nothing it answered is shown.
 //!
+//! WHAT AN ACTION DOES IS SAID IN THE SERVICE'S WORDS. An action whose parameters say what it will do - a BMC's log
+//! erased, its chassis stopped - gets an `Operation:` line rendered from the action and its parameters by a fixed
+//! table, and parameters the table cannot render are refused before anything reaches an executor.
+//!
 //! THE LABEL IS THE REQUESTER'S WORDS, NEVER IDENTITY. It is bounded to 128 UTF-8 bytes and every control
 //! and bidirectional-formatting character is escaped, so it cannot move the cursor, recolour the screen or
 //! reorder the lines around it; and it is rendered inside the service's own template, marked as unverified,
@@ -26,6 +30,8 @@ pub const DIGEST: usize = 32;
 pub enum Action {
 	FirmwareDownload,
 	ProbeWrite,
+	BmcSelClear,
+	BmcChassisControl,
 }
 
 impl Action {
@@ -33,6 +39,8 @@ impl Action {
 		match self {
 			Action::FirmwareDownload => "firmware-download",
 			Action::ProbeWrite => "probe-write",
+			Action::BmcSelClear => "bmc-sel-clear",
+			Action::BmcChassisControl => "bmc-chassis-control",
 		}
 	}
 
@@ -40,6 +48,8 @@ impl Action {
 		match self {
 			Action::FirmwareDownload => 1,
 			Action::ProbeWrite => 2,
+			Action::BmcSelClear => 3,
+			Action::BmcChassisControl => 4,
 		}
 	}
 }
@@ -76,6 +86,33 @@ pub enum Refusal {
 	Mismatch,
 	/// A version, a digest or a name this service does not accept.
 	Malformed,
+	/// Parameters the operation table cannot say in words: a person would be asked to confirm what they cannot read.
+	Unrenderable,
+}
+
+/// THE OPERATION TABLE: what an action with these parameters does, in the service's words - `None` for an action
+/// the table has no row for, whose parameters are shown as bytes alone, and `Err` for parameters its row cannot
+/// render.
+pub fn operation(action: Action, parameters: &[u8]) -> Result<Option<String>, Refusal> {
+	const PAYLOAD: &str = "the payload is the target's name";
+	match action {
+		Action::FirmwareDownload | Action::ProbeWrite => Ok(None),
+		Action::BmcSelClear => match parameters {
+			[low, high] => Ok(Some(format!("erase all {} records of the BMC's event log; an event that arrives first cancels it; {PAYLOAD}", u16::from_le_bytes([*low, *high])))),
+			_ => Err(Refusal::Unrenderable),
+		},
+		Action::BmcChassisControl => {
+			const HARD: &str = "the machine stops at once: no service is stopped and nothing is flushed";
+			let said = match parameters {
+				[0] => format!("POWER DOWN - {HARD}"),
+				[2] => format!("POWER CYCLE - {HARD}"),
+				[3] => format!("HARD RESET - {HARD}"),
+				[5] => String::from("SOFT SHUTDOWN: the BMC presses the power button"),
+				_ => return Err(Refusal::Unrenderable),
+			};
+			Ok(Some(format!("{said}; {PAYLOAD}")))
+		}
+	}
 }
 
 /// A request's own bounds, before anything is sent to an executor.
@@ -83,7 +120,7 @@ pub fn check_asked(asked: &Asked) -> Result<(), Refusal> {
 	if asked.label.len() > MAX_LABEL || asked.parameters.len() > MAX_PARAMETERS || asked.target.len() > MAX_NAME || asked.target.is_empty() {
 		return Err(Refusal::Bounds);
 	}
-	Ok(())
+	operation(asked.action, &asked.parameters).map(|_| ())
 }
 
 /// The executor's answer against the request: the same action, parameters and payload length, a version
@@ -143,11 +180,12 @@ pub fn prompt(descriptor: &Descriptor, requester: &str, label: &str) -> Vec<Stri
 	if descriptor.parameters.len() > shown {
 		parameters.push_str("...");
 	}
-	alloc::vec![
-		String::from("ADMINISTRATIVE CONFIRMATION"),
-		String::new(),
-		format!("Requested by:  {requester}"),
-		format!("Action:        {}", descriptor.action.name()),
+	let mut lines = alloc::vec![String::from("ADMINISTRATIVE CONFIRMATION"), String::new(), format!("Requested by:  {requester}"), format!("Action:        {}", descriptor.action.name())];
+	// THE OPERATION IN WORDS, where the table has a row: a descriptor that got this far has parameters it renders.
+	if let Ok(Some(said)) = operation(descriptor.action, &descriptor.parameters) {
+		lines.push(format!("Operation:     {said}"));
+	}
+	lines.extend([
 		format!("Executor:      {} (epoch {})", descriptor.executor, descriptor.executor_epoch),
 		format!("Target:        {} (generation {})", descriptor.target, descriptor.target_generation),
 		format!("Parameters:    {} bytes {}", descriptor.parameters.len(), parameters),
@@ -155,7 +193,8 @@ pub fn prompt(descriptor: &Descriptor, requester: &str, label: &str) -> Vec<Stri
 		format!("Label:         \"{}\" (the requester's words, not verified)", escape_label(label)),
 		String::new(),
 		String::from("Enter approves this one operation. Escape declines."),
-	]
+	]);
+	lines
 }
 
 /// The protected screen with nothing waiting.

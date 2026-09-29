@@ -6585,6 +6585,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::GPIO_LINES => proto::system::ProviderKind::GpioLines,
 		provider::TPM => proto::system::ProviderKind::Tpm,
 		provider::WATCHDOG => proto::system::ProviderKind::Watchdog,
+		provider::IPMI => proto::system::ProviderKind::Ipmi,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6616,6 +6617,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::GpioLines => driver_protocol::provider::GPIO_LINES,
 		proto::system::ProviderKind::Tpm => driver_protocol::provider::TPM,
 		proto::system::ProviderKind::Watchdog => driver_protocol::provider::WATCHDOG,
+		proto::system::ProviderKind::Ipmi => driver_protocol::provider::IPMI,
 	}
 }
 
@@ -6686,7 +6688,10 @@ fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients
 // them was at the ceiling with nothing left for a restart, and the log line this refusal prints was
 // observed during bring-up. The services arriving above this one each need theirs, and a bound that
 // a normal boot reaches is a bound that describes the image rather than protecting it.
-const MAX_CATALOGUE_CLIENTS: usize = 32;
+//
+// SIXTY-FOUR (2026-09-29), WITH THE MANIFEST'S OWN: the BMC service's role took the manifest's combined demand -
+// every minting role, a replacement for each one a restart replaces, and the development agent's - to 34.
+const MAX_CATALOGUE_CLIENTS: usize = 64;
 
 /// How long this program may sleep while it holds a channel the kernel pushes platform events to.
 ///

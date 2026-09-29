@@ -141,6 +141,45 @@ class SerialCursorTest(unittest.TestCase):
 			self.assertEqual(seen, handle.read(), 'the reads reassemble the file exactly')
 
 
+class ColdPromptTest(unittest.TestCase):
+	def setUp(self):
+		self.directory = tempfile.TemporaryDirectory()
+		self.log = SerialLog(self.directory.name)
+		self.addCleanup(self.directory.cleanup)
+		self.addCleanup(setattr, lab, 'SERIAL_OVERRIDE', None)
+		self.addCleanup(setattr, lab, 'LAST_INPUT_AT', 0)
+		self.addCleanup(setattr, lab, 'BOOT_NUDGE_QUIET', lab.BOOT_NUDGE_QUIET)
+		lab.BOOT_NUDGE_QUIET = 0.3
+		self.typed = []
+		original = lab.LabGuest.type_text
+
+		def fake(guest, text, enter, timeout):
+			lab.note_input()
+			self.typed.append((text, enter))
+			self.log.write('\r\n\x1b[1;32mvol://system> \x1b[0m')
+			return True
+
+		lab.LabGuest.type_text = fake
+		self.addCleanup(setattr, lab.LabGuest, 'type_text', original)
+
+	# A service's line after the shell's prompt - the watchdog service's first answered `alive` - left the prompt
+	# not the last thing printed, and a cold run's first `prompt` step waited out its whole timeout on a shell that
+	# was waiting. Broken version: the wait had no nudge, and this returned False.
+	def test_a_prompt_the_guests_own_lines_buried_is_asked_for_again(self):
+		self.log.write('shell attached\r\n\x1b[1;32mvol://system> \x1b[0mWatchdogService: ServiceManager answered\r\n')
+		self.assertTrue(lab.LabGuest(5).wait_prompt(5), 'the prompt printed again answers the wait')
+		self.assertEqual(self.typed, [('', True)], 'one empty line, and nothing else, was typed')
+
+	# And never while a command the runner typed may still be running: output after the last input with no prompt
+	# past it is the command's, and an Enter would reach the command.
+	def test_output_past_the_last_input_is_never_nudged(self):
+		self.log.write('\x1b[1;32mvol://system> \x1b[0m')
+		lab.note_input()
+		self.log.write('bmc sel\r\n1 entries, 2032 bytes free\r\n')
+		self.assertFalse(lab.LabGuest(1).wait_prompt(1))
+		self.assertEqual(self.typed, [], 'nothing was typed into a running command')
+
+
 class AbsentTest(unittest.TestCase):
 	def setUp(self):
 		self.directory = tempfile.TemporaryDirectory()

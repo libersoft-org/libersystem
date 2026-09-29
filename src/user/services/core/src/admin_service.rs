@@ -62,6 +62,10 @@ const EXECUTE_MARGIN_TICKS: u64 = 100;
 // then that action is declined. The probe's exists in a development image alone - the executor that serves
 // it is a development fixture - and a shipping build does not name it at all.
 const DFU_EXECUTOR: &[u8] = b"org.libersystem.admin-dfu";
+// THE BMC'S TWO SLOTS: erasing its event log, and its chassis control - each ONE action, so the rule that keeps the
+// first executor published for an action, and refuses every later one, makes one BMC per machine administrable.
+const BMC_SEL_EXECUTOR: &[u8] = b"org.libersystem.admin-bmc-sel";
+const BMC_CHASSIS_EXECUTOR: &[u8] = b"org.libersystem.admin-bmc-chassis";
 #[cfg(feature = "development")]
 const PROBE_EXECUTOR: &[u8] = b"org.libersystem.admin-probe";
 
@@ -70,7 +74,12 @@ fn action_of(name: &[u8]) -> Option<Action> {
 	if name == PROBE_EXECUTOR {
 		return Some(Action::ProbeWrite);
 	}
-	if name == DFU_EXECUTOR { Some(Action::FirmwareDownload) } else { None }
+	match name {
+		DFU_EXECUTOR => Some(Action::FirmwareDownload),
+		BMC_SEL_EXECUTOR => Some(Action::BmcSelClear),
+		BMC_CHASSIS_EXECUTOR => Some(Action::BmcChassisControl),
+		_ => None,
+	}
 }
 
 // ------------------------------------------------------------------ the wire, sent without waiting
@@ -172,6 +181,8 @@ fn action_wire(action: Action) -> AdminAction {
 	match action {
 		Action::FirmwareDownload => AdminAction::FirmwareDownload,
 		Action::ProbeWrite => AdminAction::ProbeWrite,
+		Action::BmcSelClear => AdminAction::BmcSelClear,
+		Action::BmcChassisControl => AdminAction::BmcChassisControl,
 	}
 }
 
@@ -179,6 +190,8 @@ fn action_from(action: AdminAction) -> Action {
 	match action {
 		AdminAction::FirmwareDownload => Action::FirmwareDownload,
 		AdminAction::ProbeWrite => Action::ProbeWrite,
+		AdminAction::BmcSelClear => Action::BmcSelClear,
+		AdminAction::BmcChassisControl => Action::BmcChassisControl,
 	}
 }
 

@@ -313,3 +313,53 @@ THE FIXTURES:
 
 NOT IN THIS STEP, BY THE PLAN'S OWN RULE: ACROSS A SLEEP (the suspend and resume exchange and the gate's sleep half) is
 carried by whichever of P02M0197 and this half lands second - P02M0197 does.
+
+## P02M0195b - found and fixed on the way (2026-09-29)
+
+- THE WALK ORDER. The first boot with the HID SSDT published `TPAD` and `TSCR` before the ACPI service had reported
+  `SB0_` (the GPIO controller's companion - it comes after `SA8_` in the namespace), so the kernel left each device's
+  GPIO connection unjoined ("names a controller acpi:\_SB_.PCI0.SB0_ that no row carries") and DeviceManager refused the
+  bind by name ("connection 1 is refused: a connection joined to no controller" - the child-binding path doing its job).
+  The service's walk now reports reservations, then COMPANIONS, then everything else (`acpi_service.rs`, `publish`).
+- READY BEFORE THE NODE. The driver first asked for its node channel before READY, and DeviceManager answers node
+  requests only for an online binding, with a 2 s bind window: it now reports READY right after the handshake and
+  publishes nothing until its descriptor, RESET and report descriptor are through - so a malformed descriptor still
+  fails the binding with nothing published.
+- DeviceManager's new lines are printed WHOLE (`say_line`, and `say_acpi` built on it): printed in pieces, they landed
+  inside other programs' lines.
+- THE TABLET. The gate's "the tablet still moves the cursor" failed while every other case passed. Isolated on a
+  development instance: a probe polled 150 times in 30 s and was served the same ring throughout, a separate client's
+  one-shot view (`hidcheck ring`) showed the same, and QMP `input-send-event` with ABSOLUTE axes moved the tablet at once
+  (the ring grew from 1 event to 7). The monitor's `mouse_move` queues RELATIVE motion, which QEMU routes to the PS/2
+  mouse - nothing here drives it - and never to a tablet; its `mouse_button` does reach the tablet, which is why a
+  button-only check had looked like movement. The gate drives the tablet through QMP. THE BLUETOOTH GATE'S "unrelated
+  pointer" helper uses the monitor's `mouse_move` too, so its "moved" can only have come from the click reports' own
+  positions - reported to the owner, not changed here.
+- The test's column helper rounded down (column 11 mapped into cell 10); it rounds up now.
+
+## P02M0195b - verification (2026-09-29)
+
+COMMANDS AND RESULTS (PASSED unless said):
+- Gate `i2c-hid` (`./check.sh --gate i2c-hid`, the development ISO from `LIBER_DEVELOPMENT=1 ./image.sh --format iso`):
+  PASS, 601 s - both devices bound as children (`acpi:\_SB_.PCI0.SA8_.TPAD`/`TSCR`), their descriptors read at 0x20 and
+  0x01, the touchpad publishing `pointer` alone and the touchscreen `touch` alone, InputService attaching both beside the
+  tablet; `hidcheck watch` (the moves and click in order, the two-finger contact and lift), `storm` (each driver's one
+  reset on a held line, then delivering), `cycle` (virtio-i2c disabled: both bindings stopped as lost dependencies, their
+  publications - platform devices 36 and 37 - detached with the tablet still attached and moving the cursor; enabled:
+  both bound again, re-publications attached, delivering), `malformed` (the touchscreen's binding failed, "its HID
+  descriptor at register 0x1 is refused", nothing published). Logs: `.build/logs/i2c-hid/`.
+- Kernel, x86_64: `TEST_SELECTION=<the five InputService services tests> ./test.sh --arch x86_64 --timeout 1800` - 5
+  passed, `kernel.services.pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn` among them.
+- Host suites: drivers 415 (the `i2c_hid` module's 5 tests and the parser's new contact test), fdt 121, driver protocol
+  78, driver binding 89, hid-i2c 13, i2c-client 6, system-manifest 28, acpi-model 7, aml 45.
+- Gates: `source-hygiene`, `arch-surface`, `test-tags`, `i2c-backend` (the backend's suite, the HID model's test
+  included), `firmware-fixtures` (`fdt_edit.py` and `acpi-fixture.py` self-tests), `aml-emitter` PASS; `./gen.sh
+  --check` exit 0 after `connection-refused`.
+- The development boot of the gate showed DeviceManager's `scoped_bus_publication` self-test passing ("a bus provider's
+  offered endpoint was closed at publication and counted nothing"), the run P02M0195a's host-suite item waited for.
+- NOT RUN: aarch64 and riscv64 (the tree fixture's dump and edit, the gate through the tree, every build), by the
+  standing order, at the end of the job; the sleep half (P02M0197's). `verify-model`'s own suite cannot load the model
+  in this tree ("kernel test `the_global_clock_advances_once_per_period_however_many_cores_tick` ... has no
+  `tagged_test!` declaration") - the pre-existing failure recorded before this step; the catalogue and release list
+  were updated by hand in step with `check.sh`.
+- After the walk-order change in the ACPI service: gate `acpi` PASS again (481 s), every case as before.

@@ -24,6 +24,7 @@ pub mod acpi;
 pub mod canon;
 pub mod convert;
 pub mod hid;
+pub mod ipmi;
 
 /// The canonical vocabulary, as `liber:power@1` defines it.
 pub use power_proto::generated::liber::power::v1 as schema;

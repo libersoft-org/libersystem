@@ -164,6 +164,10 @@ pub enum Capability {
 	/// SEALING TO A PCR AND UNSEALING, each sealed object bound to the component that sealed it. Denied by
 	/// default.
 	TpmSeal = 48,
+	/// THE BMCS, READ: each baseboard management controller's identity, sensors, event log, FRU inventory, chassis status
+	/// and LAN configuration, and its identify light. It erases nothing and stops nothing - those are administrative
+	/// requests, which need `admin-request` and a person. Appended last, for the reason `midi-output` states.
+	Bmc = 49,
 }
 
 impl Capability {
@@ -255,6 +259,7 @@ impl Capability {
 			46 => Some(Capability::Tpm),
 			47 => Some(Capability::TpmMeasure),
 			48 => Some(Capability::TpmSeal),
+			49 => Some(Capability::Bmc),
 			_ => None,
 		}
 	}
@@ -1421,6 +1426,7 @@ impl Capability {
 			Capability::Tpm => out.push_str("\"tpm\""),
 			Capability::TpmMeasure => out.push_str("\"tpm-measure\""),
 			Capability::TpmSeal => out.push_str("\"tpm-seal\""),
+			Capability::Bmc => out.push_str("\"bmc\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1474,6 +1480,7 @@ impl Capability {
 			Capability::Tpm => out.push_str("tpm"),
 			Capability::TpmMeasure => out.push_str("tpm-measure"),
 			Capability::TpmSeal => out.push_str("tpm-seal"),
+			Capability::Bmc => out.push_str("bmc"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1527,6 +1534,7 @@ impl Capability {
 			Capability::Tpm => crate::codec::cbor::text(out, "tpm"),
 			Capability::TpmMeasure => crate::codec::cbor::text(out, "tpm-measure"),
 			Capability::TpmSeal => crate::codec::cbor::text(out, "tpm-seal"),
+			Capability::Bmc => crate::codec::cbor::text(out, "bmc"),
 		}
 	}
 }

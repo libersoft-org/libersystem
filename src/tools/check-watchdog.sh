@@ -24,8 +24,15 @@
 #      NO TCO driver in that boot (the table suppresses the LPC row), armed, three timeouts `running`, and the
 #      silence ends in `watchdog`.
 #
-# ACROSS A SLEEP is the sleep milestone's to add - there is no sleep entry to drive yet - and the BMC's watchdog comes with its
-# transport driver. The i6300esb on aarch64 and riscv64 runs as the scenario `watchdog-i6300esb` under
+#   5. THE BMC'S, through the IPMI driver on ISA KCS and QEMU's simulated BMC, beside q35's TCO. Its expiry is a
+#      chassis reset - no QEMU watchdog action - so the oracle is the BMC's own record, Get Watchdog Timer as the next
+#      boot's driver reads it at bind (the bind line names the initial countdown and the expiration flag) with the
+#      serial log's boot count: an orderly `reboot` gives it the boot bound, which the next bind finds running; the
+#      same reboot with the notice skipped by ServiceManager's development hook leaves the short timeout - the next bind
+#      finds it, running or expired; and the silence expires it - the machine resets and the next boot's driver reports
+#      the watchdog as the cause, the TCO's reporting none.
+#
+# ACROSS A SLEEP is the sleep milestone's to add - there is no sleep entry to drive yet. The i6300esb on aarch64 and riscv64 runs as the scenario `watchdog-i6300esb` under
 # `./lab.sh scenario-cold --target ARCH`, with `QEMU_EXTRA=-device i6300esb`.
 #
 # IT BOOTS ITS OWN INSTANCES in private state, as the development lifecycle gate does, one at a time, and takes the
@@ -300,4 +307,93 @@ await_line "WatchdogService: armed wdat at" "the service did not arm the WDAT" "
 t="$(effective wdat)"
 hold_running $((3 * t)) "a healthy system with the WDAT armed"
 silence_expires wdat
-echo "watchdog: PASS - the i6300esb, the TCO and a WDAT over the TCO each armed by name and fed through three timeouts; the i6300esb through a service kill, a driver kill and an orderly reboot; each expired once ServiceManager stopped answering, and the i6300esb's reset was reported by it alone in the next boot"
+take_down
+
+# ------------------------------------------------------------------ 5. the BMC's
+
+# The effective timeout of the last arm of `device`, in milliseconds as the service said it.
+effective_ms() {
+	local ms
+	ms="$(grep -a -o -- "WatchdogService: armed $1 at [0-9]* ms" "$(serial_log)" | tail -1 | grep -o '[0-9]* ms' | grep -o '[0-9]*')"
+	[[ -n "$ms" ]] || fail "no arm of $1 was reported"
+	echo "$ms"
+}
+
+# The first bind line of the IPMI driver's watchdog past `baseline`, waited for.
+next_bind() {
+	local baseline="$1"
+	await_line "watchdog [a-z]* at bind, initial countdown" "no boot's IPMI driver read its BMC's watchdog at bind" "$baseline" 300
+	grep -a -o -- "watchdog [a-z]* at bind, initial countdown [0-9]* ms.*" "$(serial_log)" | sed -n "$((baseline + 1))p"
+}
+
+binds() {
+	seen "watchdog [a-z]* at bind, initial countdown"
+}
+
+# THE BMC ARMED SHORT: the policy naming it, the TCO disarmed beside it.
+arm_bmc() {
+	local armed disarmed
+	armed=$(seen "WatchdogService: armed bmc at")
+	disarmed=$(seen "WatchdogService: disarmed tco")
+	policy bmc
+	await_line "WatchdogService: armed bmc at" "the service did not arm the BMC's watchdog" "$armed"
+	await_line "WatchdogService: disarmed tco" "the service did not disarm the TCO beside the BMC's" "$disarmed"
+}
+
+export QEMU_EXTRA="-device ipmi-bmc-sim,id=bmc0,guid=11111111-2222-3333-4444-00000000b0c0 -device isa-ipmi-kcs,bmc=bmc0,irq=0"
+export WATCHDOG_ACTION=pause
+boot bmc
+await_line "watchdog [a-z]* at bind, initial countdown" "the IPMI driver never read its BMC's watchdog at bind" 0
+await_line "driver.tco: online" "the TCO's driver never came online beside the BMC" 0
+
+# THE ORDERLY REBOOT: the notice gives the BMC the boot bound, and the next bind finds it running with it.
+arm_bmc
+hold_running 2 "the BMC's watchdog armed"
+before="$(wc -l <"$(serial_log)")"
+baseline="$(binds)"
+./lab.sh sh --timeout 20 reboot >/dev/null 2>&1 || true
+bind="$(next_bind "$baseline")"
+after="$(tail -n +"$((before + 1))" "$(serial_log)")"
+grep -q "WatchdogService: gave bmc 120000 ms and a last pet for the shutdown" <<<"$after" || fail "the orderly reboot did not give the BMC's watchdog the boot bound"
+[[ "$bind" == "watchdog running at bind, initial countdown 120000 ms" ]] || fail "after the orderly reboot the BMC's watchdog must be found running with the boot bound and no expiry (read: $bind)"
+echo "watchdog: the orderly reboot gave the BMC's watchdog the boot bound, and the next bind found it running with it"
+
+# THE SAME REBOOT WITHOUT THE NOTICE: the short timeout survives - found running, or expired first.
+./dev.sh reboot --timeout 300 >"$state/reboot-bmc.log" 2>&1 || fail "the instance was not recorded again after the orderly reboot (see $kept/reboot-bmc.log)"
+arm_bmc
+short="$(effective_ms bmc)"
+hold_running 2 "the BMC's watchdog armed again"
+before="$(wc -l <"$(serial_log)")"
+baseline="$(binds)"
+launch stop '!reboot-without-notice' >/dev/null 2>&1 || true
+bind="$(next_bind "$baseline")"
+after="$(tail -n +"$((before + 1))" "$(serial_log)")"
+grep -q "service_manager: the shutdown notice is skipped (development hook)" <<<"$after" || fail "the development hook did not skip the notice"
+if grep -q "WatchdogService: gave bmc .* for the shutdown" <<<"$after"; then
+	fail "the watchdog service was told of a reboot whose notice was skipped"
+fi
+case "$bind" in
+"watchdog running at bind, initial countdown $short ms") echo "watchdog: without the notice the next bind found the short timeout ($short ms) still running" ;;
+"watchdog stopped at bind, initial countdown $short ms, the last reset was its own") echo "watchdog: without the notice the short timeout ($short ms) ran out first, and the next bind found its expiry" ;;
+*) fail "without the notice the next bind must find the short timeout of $short ms, running or expired (read: $bind)" ;;
+esac
+
+# THE EXPIRY: the silence, a chassis reset, and the next boot naming the BMC's watchdog - the TCO's naming none.
+./dev.sh reboot --timeout 300 >"$state/reboot-bmc2.log" 2>&1 || fail "the instance was not recorded again (see $kept/reboot-bmc2.log)"
+arm_bmc
+hold_running 2 "the BMC's watchdog armed for the silence"
+boots=$(seen "driver.tco: online")
+first_boot_ends="$(wc -l <"$(serial_log)")"
+baseline="$(binds)"
+out="$(launch stop '!liveness-silence')" || fail "the liveness hook was not reached: $out"
+grep -q "LIVENESS SILENT" <<<"$out" || fail "the development hook did not silence ServiceManager: $out"
+bind="$(next_bind "$baseline")"
+await_line "driver.tco: online" "the TCO's driver never came online in the boot after the expiry" "$boots" 120
+[[ "$(run_state)" == "running" ]] || fail "the BMC's expiry must reset the machine, not stop it"
+second="$(tail -n +"$((first_boot_ends + 1))" "$(serial_log)")"
+[[ "$bind" == *", the last reset was its own" ]] || fail "the next boot's IPMI driver did not report that the last reset was its BMC watchdog's (read: $bind)"
+if grep -q "driver.tco: online - .*the last reset was its own" <<<"$second"; then
+	fail "the TCO reported a reset the BMC caused"
+fi
+echo "watchdog: the BMC's expiry reset the machine, and only its driver said so in the next boot"
+echo "watchdog: PASS - the i6300esb, the TCO, a WDAT over the TCO and the BMC's each armed by name; the chipset timers fed through three timeouts, the i6300esb through a service kill, a driver kill and an orderly reboot, each expiring once ServiceManager stopped answering with the i6300esb's reset reported by it alone; the BMC's given the boot bound by an orderly reboot, keeping its short timeout through one without the notice, and its expiry reported by its own driver alone"

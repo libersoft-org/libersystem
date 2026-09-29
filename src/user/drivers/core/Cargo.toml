@@ -221,6 +221,14 @@ test = false
 bench = false
 
 [[bin]]
+# THE ACPI BATTERY, AC ADAPTER AND THERMAL ZONE: one binding per namespace node, its methods read over the node channel
+# and published as a `power-source`. Its pure parts are `src/acpi_power.rs`, in the library and host-tested.
+name = "acpi_power"
+path = "src/acpi_power_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 # HID OVER I2C: a touchpad or touchscreen on another driver's bus, bound as a child through the address and the
 # interrupt line DeviceManager scoped on its controllers. Its pure parts are `src/i2c_hid.rs`, in the library and
 # host-tested.
@@ -251,6 +259,18 @@ bench = false
 [[bin]]
 name = "tco"
 path = "src/tco.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "smbus_ich9"
+path = "src/smbus_ich9.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "ipmi"
+path = "src/ipmi_driver.rs"
 test = false
 bench = false
 
@@ -314,7 +334,11 @@ acpi = { path = "../../../acpi" }
 # contract's client that connection speaks - linked statically into the one driver that uses them.
 hid-i2c = { path = "../../libs/driver/hid-i2c" }
 i2c-client = { path = "../../libs/driver/i2c-client" }
+ipmi = { path = "../../libs/driver/ipmi" }
 i2c-device-proto = { path = "../../libs/protocol/i2c-device-proto" }
+# THE NODE CHANNEL'S VALUE ENCODING, for the ACPI battery, AC and thermal zone driver: the one bounded decoder of what
+# a method answered - depth and size bounded - and nothing of the interpreter.
+aml = { path = "../../../aml" }
 
 
 # THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are

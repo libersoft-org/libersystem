@@ -77,6 +77,18 @@ declare -A GATES=(
 	# control, coherent bounded subscriptions, a withheld reply and a restart. Service and
 	# normalisation coverage - the fixture's data is decoded HID and ACPI written out, not a device.
 	["power-service"]="tools/check-power-service.sh"
+	# AND A REAL HID PRODUCER THROUGH IT: a USB UPS the host builds, bound by the xHCI driver's HID Power Device
+	# class, read and driven through PowerService by a live client - its reports reach the subscriber, and an
+	# operator's turn-off and cancel reach the device.
+	["power-ups"]="tools/check-power-ups.sh"
+	# IPMI ON x86_64 q35: the five system interfaces against QEMU's simulated BMCs, a pair, the harness's own BMC with
+	# its hostile modes, malformed records and an orderly reboot - through the drivers, the BMC service and the tool.
+	["ipmi"]="tools/check-ipmi.sh"
+	# AND THE HARNESS BMC ITSELF, on the host: the SDR and FRU encodings and the external-BMC framing.
+	["ipmi-harness"]="python3 harness/ipmi-harness-bmc.py --self-test"
+	# AND THE BMC'S ADMINISTRATIVE ACTIONS through the protected screen, cold, one BMC a boot: the log's erasure
+	# declined, approved and cancelled by an event, and the chassis stops, each with its durable oracle.
+	["qemu-ipmi-admin"]="tools/check-ipmi-admin.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

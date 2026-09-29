@@ -42,14 +42,17 @@ pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
 // Tear the whole service tree down for a graceful power-off. LogService flushes first;
 // every service whose row declares the shutdown notice is told next, under one bound; every
 // other service then stops in reverse-dependency order. The issuing shell and the console
-// that hosts it are excluded from the order and die with the machine.
-pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, action: proto::system::ShutdownAction, notice_ticks: u64, buf: &mut [u8]) {
+// that hosts it are excluded from the order and die with the machine. `notice_ticks` is the
+// notice's bound; `None` leaves the notice out, which only a development hook asks for.
+pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, action: proto::system::ShutdownAction, notice_ticks: Option<u64>, buf: &mut [u8]) {
 	if let Some(log) = index_of(b"log_service") {
 		if state[log] == State::Ready && channels[log] != 0 {
 			send_blocking(channels[log], b"FLUSH", 0);
 		}
 	}
-	notify_shutdown(state, channels, action, notice_ticks, buf);
+	if let Some(notice_ticks) = notice_ticks {
+		notify_shutdown(state, channels, action, notice_ticks, buf);
+	}
 	let order: Vec<usize> = shutdown_order(state);
 	for &idx in &order {
 		if state[idx] != State::Ready {
@@ -78,6 +81,9 @@ pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool
 	services::service_lifecycle::verify_reverse_dependency_order(order, N, |node| state[node] == State::Ready && !dies_with_the_machine(node), index_of_dep)
 }
 
+// The status answer's bound: every row with room to spare, and far inside a message's.
+const STATUS_REPLY_BYTES: usize = 32 * 1024;
+
 // Answer one request on a supervisor stats channel. Returns false once the peer is
 // gone, so the standing supervisor drops that channel from its wait set.
 pub(super) fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desired; N], procs: &[u64; N], lifecycle: &LifecycleLog, sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
@@ -86,7 +92,10 @@ pub(super) fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desire
 		ReceivedCaps::Closed => return false,
 	};
 	let mut api = StatsApi { state, desired, procs, lifecycle, sup, reason, canary_sup, drivers };
-	let mut reply: [u8; 4096] = [0u8; 4096];
+	// ONE ROW PER SERVICE, THE CANARY AND ONE PER MANIFEST DRIVER - which outgrew 4 KiB as the drivers grew, when the
+	// answer became `again` and `lssvc` and the BMC service's settled test both read nothing. On the heap, since the
+	// standing loop's stack holds the rest.
+	let mut reply: Vec<u8> = alloc::vec![0u8; STATUS_REPLY_BYTES];
 	let mut reply_handle = proto::codec::Handles::new();
 	if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], &mut handle, &mut reply, &mut reply_handle) {
 		if !send_caps_blocking(stats, &reply[..n], reply_handle.as_slice()) {

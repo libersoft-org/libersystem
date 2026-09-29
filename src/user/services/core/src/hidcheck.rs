@@ -14,6 +14,7 @@
 //                       and delivering
 //   hidcheck malformed  the touchscreen bound again over a descriptor the gate made malformed: the binding fails,
 //                       and nothing is published for it
+//   hidcheck ring       one view of the pointer ring - a second client's answer beside a phase that is watching
 
 #![no_std]
 #![no_main]
@@ -269,11 +270,23 @@ fn cycle(device_client: u64, policy: u64, input_client: u64, focus: &Focus) {
 	// after the controller is enabled again, so a failure here does not leave the controller disabled for what follows.
 	let mut pointer = Pointer::start(input_client);
 	say(b"the controller is disabled - move the tablet now");
-	let deadline = clock() + WINDOW_TICKS;
+	let opened = clock();
+	let deadline = opened + WINDOW_TICKS;
+	// EACH DISTINCT VIEW OF THE RING, said - at most eight, with how many polls and ticks into the window - so a
+	// window that sees nothing says what it saw instead.
+	let mut views: Vec<(usize, Option<(u16, u16, u8)>)> = Vec::new();
+	let mut polls = 0u32;
 	while clock() < deadline && !pointer.moved {
 		sleep_until(clock() + TICKS / 5);
 		pointer.poll(input_client);
+		polls += 1;
+		let view = (pointer.last.len(), pointer.last.last().copied());
+		if views.len() < 8 && views.last() != Some(&view) {
+			views.push(view);
+			say(alloc::format!("the ring holds {} event(s), the last {:?} - poll {polls}, tick {}", view.0, view.1, clock() - opened).as_bytes());
+		}
 	}
+	say(alloc::format!("the window closed after {polls} poll(s) and {} tick(s)", clock() - opened).as_bytes());
 	let tablet = pointer.moved;
 	if tablet {
 		say(b"the tablet still moves the cursor");
@@ -334,6 +347,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail(b"a grant this probe needs was not delivered");
 	}
 	let phase = args.split(|&b| b == b' ').next().unwrap_or(&[]);
+	// ONE VIEW OF THE POINTER RING, and nothing else: a second client's answer beside a phase that is watching.
+	if phase == b"ring" {
+		let view = snapshot(input_client);
+		say(alloc::format!("ring: {} event(s), the last {:?}", view.len(), view.last()).as_bytes());
+		exit();
+	}
 	if phase == b"malformed" {
 		malformed(device_client, policy);
 		exit();
@@ -343,7 +362,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"watch" => verdict(b"watch", watch(input_client, &held, b"watching - raise the reports now")),
 		b"storm" => verdict(b"storm", watch(input_client, &held, b"hold the lines now, then raise the reports")),
 		b"cycle" => cycle(device_client, policy, input_client, &held),
-		_ => fail(b"usage: hidcheck watch | storm | cycle | malformed"),
+		_ => fail(b"usage: hidcheck watch | storm | cycle | malformed | ring"),
 	}
 	exit();
 }

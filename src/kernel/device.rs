@@ -1160,6 +1160,10 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 		crate::serial_println!("device: {index} is the console UART, and the kernel could not hand it over - not claimed");
 		return Err(ClaimError::Refused);
 	}
+	// THE CONFIGURATION A ROW HAS THE KERNEL WRITE FOR A CLAIM, after the last refusal: the ICH9 SMBus function's HOSTC.
+	if entry.has_config_space() && entry.platform.is_none() {
+		crate::declared::claim_writes(index, entry.vendor, entry.product, entry.bus, entry.dev, entry.func);
+	}
 	slot.state = ClaimState::Claimed;
 	slot.generation = generation;
 	slot.entry = *entry_name;
@@ -1405,6 +1409,9 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 		msix_off(entry);
 		if entry.has_io_bar() {
 			io_decode(entry, false);
+		}
+		if entry.has_config_space() {
+			crate::declared::release_writes(index, entry.bus, entry.dev, entry.func);
 		}
 	});
 	// WHAT THIS DEVICE HAD ALREADY STRANDED WHEN THIS BINDING TOOK IT - read off the slot, where

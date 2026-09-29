@@ -37,6 +37,10 @@ pub enum AdminAction {
 	FirmwareDownload = 1,
 	/// The test executor's bounded write. Development images only.
 	ProbeWrite = 2,
+	/// Erase a BMC's event log - only the records counted when the request was prepared.
+	BmcSelClear = 3,
+	/// A BMC chassis control: power down, power cycle, hard reset or soft shutdown.
+	BmcChassisControl = 4,
 }
 
 impl AdminAction {
@@ -81,6 +85,8 @@ impl AdminAction {
 		match r.u8()? {
 			1 => Some(AdminAction::FirmwareDownload),
 			2 => Some(AdminAction::ProbeWrite),
+			3 => Some(AdminAction::BmcSelClear),
+			4 => Some(AdminAction::BmcChassisControl),
 			_ => None,
 		}
 	}
@@ -3164,18 +3170,24 @@ impl AdminAction {
 		match self {
 			AdminAction::FirmwareDownload => out.push_str("\"firmware-download\""),
 			AdminAction::ProbeWrite => out.push_str("\"probe-write\""),
+			AdminAction::BmcSelClear => out.push_str("\"bmc-sel-clear\""),
+			AdminAction::BmcChassisControl => out.push_str("\"bmc-chassis-control\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			AdminAction::FirmwareDownload => out.push_str("firmware-download"),
 			AdminAction::ProbeWrite => out.push_str("probe-write"),
+			AdminAction::BmcSelClear => out.push_str("bmc-sel-clear"),
+			AdminAction::BmcChassisControl => out.push_str("bmc-chassis-control"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			AdminAction::FirmwareDownload => crate::codec::cbor::text(out, "firmware-download"),
 			AdminAction::ProbeWrite => crate::codec::cbor::text(out, "probe-write"),
+			AdminAction::BmcSelClear => crate::codec::cbor::text(out, "bmc-sel-clear"),
+			AdminAction::BmcChassisControl => crate::codec::cbor::text(out, "bmc-chassis-control"),
 		}
 	}
 }

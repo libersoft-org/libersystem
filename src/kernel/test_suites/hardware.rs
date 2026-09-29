@@ -3244,7 +3244,11 @@ fn usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises() {
 	assert_eq!((state.runtime.state, state.runtime.value), (power::ValueState::Known, 3600));
 	assert_eq!((state.voltage.state, state.voltage.value), (power::ValueState::Known, 13_800_000), "13.80 V from the feature report, in microvolts");
 	assert_eq!((state.controls.schedule_off, state.controls.cancel_off, state.controls.set_output), (true, true, false), "the controls the descriptor has, and only those");
-	assert_eq!(next(&stream).kind, power::ProviderUpdateKind::SnapshotEnd);
+	let end = next(&stream);
+	assert_eq!(end.kind, power::ProviderUpdateKind::SnapshotEnd);
+	// THE REVISIONS AS POWERSERVICE HOLDS THEM: a snapshot and its end name one revision, and every change after
+	// it a later one - a provider that does otherwise is ended by the service, whatever its states say.
+	assert_eq!(end.revision, snapshot.revision, "a snapshot and its end describe one revision");
 
 	// 2. A CONTROL IT DOES NOT HAVE is refused before anything is sent.
 	let switch = power::ProviderCommand { kind: power::ProviderCommandKind::SetOutput, local: 0, outlet: 0, on: false, delay_seconds: 0 };
@@ -3255,6 +3259,7 @@ fn usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises() {
 	assert_eq!(client.command(&schedule), Some(Ok(power::ControlOutcome::Done)), "the device acknowledged the scheduled turn-off");
 	let on_battery = next(&stream);
 	assert_eq!(on_battery.kind, power::ProviderUpdateKind::Updated);
+	assert!(on_battery.revision > end.revision, "a change advances the revision past the snapshot's");
 	let state = on_battery.source.expect("an update carries its source").state;
 	assert_eq!((state.online, state.charge), (power::Tristate::No, power::ChargeState::Discharging), "mains gone and discharging - the firmware received the command");
 	assert!(state.alarms.iter().any(|alarm| alarm.kind == power::AlarmKind::OnBattery && alarm.state == power::Tristate::Yes), "and the on-battery alarm is reported");
@@ -3262,7 +3267,9 @@ fn usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises() {
 	// 4. AND CANCELLED: back on mains.
 	let cancel = power::ProviderCommand { kind: power::ProviderCommandKind::CancelOutputOff, local: 0, outlet: 0, on: false, delay_seconds: 0 };
 	assert_eq!(client.command(&cancel), Some(Ok(power::ControlOutcome::Done)));
-	let back = next(&stream).source.expect("an update carries its source").state;
+	let back = next(&stream);
+	assert!(back.revision > on_battery.revision, "and the next change past that");
+	let back = back.source.expect("an update carries its source").state;
 	assert_eq!((back.online, back.charge), (power::Tristate::Yes, power::ChargeState::Charging), "back on mains after the cancel");
 
 	// 5. A FRESH QUERY reads the device again and agrees.

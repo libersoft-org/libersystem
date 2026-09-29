@@ -389,6 +389,27 @@ def has_prompt(tail):
 	return PROMPT.search(strip_ansi(tail)) is not None
 
 
+# WHERE THE LOG STOOD when this runner last sent the guest anything - a key, a pointer event, terminal input. A cold
+# prompt wait reads it: a prompt printed past it answers the last thing sent, so whatever the guest printed behind
+# that prompt is its own, on its own clock, and the shell is waiting (see `LabGuest.wait_prompt`).
+LAST_INPUT_AT = 0
+
+# A prompt as the shell prints it, found anywhere in the raw log - the colour codes sit around it, not inside.
+PROMPT_ANYWHERE = re.compile(rb'vol://[^\r\n>]*> ')
+
+
+def note_input():
+	global LAST_INPUT_AT
+	LAST_INPUT_AT = serial_size()
+
+
+def prompt_past_input(raw):
+	last = None
+	for last in PROMPT_ANYWHERE.finditer(raw):
+		pass
+	return last is not None and last.end() > LAST_INPUT_AT
+
+
 def die(message):
 	print(f'lab: {message}', file=sys.stderr)
 	sys.exit(1)
@@ -1267,7 +1288,10 @@ def cmd_dev_up(args):
 	})
 	os.close(lock_fd)
 	time.sleep(0.2)
-	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
+	# THE BOOT'S NUDGE, as `lab boot` asks for it and for the same reason: this command has just started the guest,
+	# so no person's line can be half-typed in its console, and a line a service prints after the shell's first
+	# prompt - a BMC bound late, its binding reported - would otherwise leave no prompt at the end of the output.
+	reply = ctl_request(f'WAIT {timeout} nudge', timeout, DEV_CTL_SOCK)
 	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s (see {DEV_SERIAL_LOG})')
 	# Record which boot this is, now that the guest is up and its agent can answer. Every
@@ -2135,7 +2159,8 @@ def cmd_dev_reboot(args):
 		die(f'the development instance is {state}; a reboot needs one this worktree owns and is running')
 	started = time.time()
 	qmp_command('system_reset')
-	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
+	# The boot's nudge, as `dev-up` asks for it: this command reset the guest, so nothing is half-typed.
+	reply = ctl_request(f'WAIT {timeout} nudge', timeout, DEV_CTL_SOCK)
 	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s of the reset (see {DEV_SERIAL_LOG})')
 	# The registry went with the reboot, because it was the agent's memory. Recording the new
@@ -2647,12 +2672,14 @@ class LabGuest:
 	# its driver, InputService, the session and the foreground program. Typed input over the
 	# protocol reaches the console directly and proves none of that.
 	def send_keys(self, keys, timeout=None):
+		note_input()
 		try:
 			return send_keys(keys, None if timeout is None else time.monotonic() + timeout)
 		except SystemExit:
 			return False
 
 	def send_pointer(self, x, y, button, action, timeout=None):
+		note_input()
 		try:
 			return send_pointer(x, y, button, action, timeout)
 		except SystemExit:
@@ -2686,9 +2713,16 @@ class LabGuest:
 			#
 			# A prompt that is still being written past is not a prompt to type at: a match has to
 			# survive PROMPT_SETTLE seconds with the file not growing.
+			#
+			# AND A PROMPT THE GUEST'S OWN LINES BURIED IS ASKED FOR AGAIN. Services print on their own clock - the
+			# watchdog service's first answered `alive`, the network's addresses, a BMC's binding - and a line
+			# after the prompt leaves it not the last thing printed, with nothing to print another. When the last
+			# prompt in the log came AFTER the last thing this runner sent, the shell is waiting and those lines are
+			# not a command's: once the log has been quiet a while, one empty line has the prompt printed again.
 			deadline = time.time() + timeout
 			settled_at = None
 			size = -1
+			quiet_since = time.time()
 			while time.time() < deadline:
 				try:
 					with open(SERIAL_OVERRIDE, 'rb') as handle:
@@ -2698,6 +2732,7 @@ class LabGuest:
 				if len(raw) != size:
 					size = len(raw)
 					settled_at = None
+					quiet_since = time.time()
 				if has_prompt(raw[-256:]):
 					if settled_at is None:
 						settled_at = time.time()
@@ -2705,6 +2740,12 @@ class LabGuest:
 						return True
 				else:
 					settled_at = None
+					if time.time() - quiet_since >= BOOT_NUDGE_QUIET and prompt_past_input(raw):
+						try:
+							self.type_text('', True, 10)
+						except (SystemExit, OSError):
+							pass
+						quiet_since = time.time()
 				time.sleep(0.2)
 			return False
 		try:
@@ -2715,8 +2756,12 @@ class LabGuest:
 	# Terminal input, resuming from the count the guest reports: the console queue is short,
 	# so anything past a keystroke or two is accepted in pieces.
 	def type_text(self, text, enter, timeout):
+		at = serial_size()
 		payload = text.encode() + (b'\r' if enter else b'')
 		sock, buffer, bounds = proto_session(timeout, announce=False)
+		# Input may reach the guest from here on; a session that was never opened sent nothing.
+		global LAST_INPUT_AT
+		LAST_INPUT_AT = at
 		try:
 			if len(payload) > bounds['max_term_input']:
 				return False
@@ -3141,15 +3186,32 @@ def cmd_scenario_cold(args):
 		# readiness check that cannot succeed is worse than none. Progress is printed while
 		# waiting, because an emulated guest takes minutes and silence for minutes is
 		# indistinguishable from a hang to whoever is watching.
+		#
+		# AND A BOOT MAY ASK FOR ITS PROMPT AGAIN, as `lab boot`'s wait does: the prompt counts only as the last thing
+		# the guest printed, and lines on their own clock - the network's address configuration, a BMC bound late,
+		# the watchdog service's first answered `alive` - land after the shell's prompt and nothing prints another.
+		# So once the log has been quiet a while with the shell attached and a prompt past the last thing sent (at
+		# first nothing has been), one empty line goes through the channel's terminal input and the shell answers it
+		# with a prompt - and again if another late line buries that one. Nothing has been typed into this guest.
 		said = 0.0
+		size, quiet_since = -1, time.time()
 		while time.time() < deadline:
 			try:
 				with open(log, 'rb') as handle:
-					tail = handle.read()[-4096:]
+					whole = handle.read()
 			except OSError:
-				tail = b''
+				whole = b''
+			tail = whole[-4096:]
 			if PROMPT.search(strip_ansi(tail)):
 				break
+			if len(whole) != size:
+				size, quiet_since = len(whole), time.time()
+			elif time.time() - quiet_since >= BOOT_NUDGE_QUIET and b'shell attached' in whole and prompt_past_input(whole):
+				try:
+					LabGuest(10).type_text('', True, 10)
+				except (SystemExit, OSError):
+					pass
+				quiet_since = time.time()
 			if guest.poll() is not None:
 				die(f'the {target} guest exited while booting (see {log})')
 			if time.time() - said >= 30:

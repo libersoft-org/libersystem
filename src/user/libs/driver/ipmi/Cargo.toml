@@ -1,0 +1,15 @@
+[package]
+name = "ipmi"
+edition = "2024"
+description = "IPMI below the binding: the KCS, BT and SSIF system interfaces, one message layer over them, and the SDR, SEL, FRU, identity, watchdog, chassis and LAN encodings"
+
+# NOTHING THAT REACHES THE RUNTIME, AND THAT IS WHAT MAKES IT TESTABLE. Every answer here is a function of bytes, of
+# registers the caller reaches and of a bus the caller supplies, so a host test drives each interface against a
+# scripted model in the same process. The `ipmi` driver links it and supplies port I/O, a mapped BAR or the SMBus
+# client. `power-model` is the one dependency: a sensor's linear conversion exists once, there, for the thermal zones
+# PowerService publishes and for every other threshold sensor this crate reads.
+[dependencies]
+power-model = { path = "../../power/model" }
+
+[lints.rust]
+warnings = "deny"

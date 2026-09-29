@@ -15,7 +15,13 @@ extern crate alloc;
 // deleted before the move, not carried across by it.
 // THE AHCI DECISIONS, with no controller behind them: the port bitmap, the port state rules, the
 // scatter-gather arithmetic and the capacity parse, which is where an AHCI driver is actually wrong.
+// ACPI BATTERY, AC AND THERMAL ZONE, the driver's parts a host can test: the class a node is, its methods' results read
+// at the specification's offsets, and the bound on a storm of notifications.
+pub mod acpi_power;
+// THE BMC AS AN `ipmi` BINDING READS AND DRIVES IT: identity, the SDR repository, readings, the SEL, FRU, LAN, and the
+// two administrative executors' rules - every sequence of transactions, over one transaction at a time.
 pub mod ahci;
+pub mod ipmi_bmc;
 // AN ADMINISTRATIVE EXECUTOR'S PREPARED OPERATIONS: the payload copied and digested at preparation, the live
 // target generation frozen with it, and the start guard that admits at most one attempt. The probe fixture
 // uses it now and the DFU class module will.

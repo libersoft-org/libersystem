@@ -12,6 +12,13 @@
 //
 // TWO SOURCES OF DECLARATIONS: the rows below, keyed by a PCI function's (vendor, device) - recorded at the boot
 // scan - and a platform row's firmware-described system-memory registers - a WDAT's - recorded at its publication.
+//
+// AND A ROW MAY NAME CONFIGURATION THE KERNEL ITSELF WRITES FOR A CLAIM (`claim_config`): a register without which the
+// claimed window decodes nothing, which no claim holder may reach. The claim saves it and writes the row's bits; the
+// release writes the saved value back. The ICH9 SMBus function's HOSTC is the one: its SMBus base (BAR 4) decodes only
+// while HST_EN is set, and I2C_EN turns its block transactions into plain I2C ones - so the claim sets the first and
+// clears the second, as Linux's `i2c-i801` does. A SLEEP MAY LOSE IT on hardware with the rest of the function's
+// configuration, so the claim's value is owed again after an S3, beside the resume's restore of the function's header.
 
 use alloc::vec::Vec;
 
@@ -58,6 +65,17 @@ pub struct Row {
 	pub bar: Option<usize>,
 	pub registers: &'static [Declaration],
 	pub suppressed_by: Option<[u8; 4]>,
+	pub claim_config: &'static [ClaimWrite],
+}
+
+// A CONFIGURATION REGISTER THE KERNEL WRITES FOR A CLAIM: saved at the claim, `set` set and `clear` cleared, and the
+// saved value written back at the release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimWrite {
+	pub offset: u16,
+	pub width: u8,
+	pub set: u32,
+	pub clear: u32,
 }
 
 // THE i6300ESB: BAR 0 (the stage preloads and the reload register behind an unlock sequence), and its two arming
@@ -65,10 +83,60 @@ pub struct Row {
 // as a BYTE.
 // THE ICH9 LPC BRIDGE: GCS at the root-complex base (configuration 0xF0, bits 31:14, enabled by bit 0) + 0x3410,
 // whose No-Reboot bit (5) alone is writable - the TCO's own registers are the LPC/TCO derivation's port range.
+// THE ICH9 SMBUS FUNCTION: its SMBus base is BAR 4, an I/O BAR the claim mints as a port range like any other, and
+// HOSTC (configuration 0x40) is written by the claim - HST_EN (bit 0) set, I2C_EN (bit 2) clear - and restored by the
+// release. Keyed by vendor and device, not by class: other SMBus hosts share the class and not the registers.
 pub const ROWS: &[Row] = &[
-	Row { name: "i6300esb", vendor: 0x8086, device: 0x25ab, bar: Some(0), registers: &[Declaration::Config { offset: 0x60, width: 2, mask: 0xFFFF }, Declaration::Config { offset: 0x68, width: 1, mask: 0xFF }], suppressed_by: None },
-	Row { name: "ich9-lpc", vendor: 0x8086, device: 0x2918, bar: None, registers: &[Declaration::ChipsetMemory { base_register: 0xF0, base_mask: 0xFFFF_C000, enable: 1, offset: 0x3410, width: 4, mask: 1 << 5 }], suppressed_by: Some(*b"WDAT") },
+	Row { name: "i6300esb", vendor: 0x8086, device: 0x25ab, bar: Some(0), registers: &[Declaration::Config { offset: 0x60, width: 2, mask: 0xFFFF }, Declaration::Config { offset: 0x68, width: 1, mask: 0xFF }], suppressed_by: None, claim_config: &[] },
+	Row { name: "ich9-lpc", vendor: 0x8086, device: 0x2918, bar: None, registers: &[Declaration::ChipsetMemory { base_register: 0xF0, base_mask: 0xFFFF_C000, enable: 1, offset: 0x3410, width: 4, mask: 1 << 5 }], suppressed_by: Some(*b"WDAT"), claim_config: &[] },
+	Row { name: "ich9-smbus", vendor: 0x8086, device: 0x2930, bar: None, registers: &[], suppressed_by: None, claim_config: &[ClaimWrite { offset: HOSTC, width: 1, set: HOSTC_HST_EN, clear: HOSTC_I2C_EN }] },
 ];
+
+// The ICH9 SMBus function's host configuration register and its two bits.
+pub const HOSTC: u16 = 0x40;
+pub const HOSTC_HST_EN: u32 = 1 << 0;
+pub const HOSTC_I2C_EN: u32 = 1 << 2;
+
+// What each live claim's writes replaced, by device index: what its release writes back.
+static SAVED: SpinLock<Vec<(usize, Vec<(ClaimWrite, u32)>)>> = SpinLock::new(Vec::new());
+
+// THE CLAIM'S WRITES for the function at `bus:dev.func`, device `index`: each register saved, then written with its
+// row's bits. A register the configuration mechanism cannot reach at its width is said and skipped - the window then
+// decodes nothing, which the driver finds and reports.
+pub fn claim_writes(index: usize, vendor: u16, device: u16, bus: u8, dev: u8, func: u8) {
+	let Some(row) = row_for(vendor, device).filter(|row| !row.claim_config.is_empty()) else { return };
+	let mut saved = Vec::new();
+	for write in row.claim_config {
+		let Some(before) = crate::arch::pci::config_read_exact(bus, dev, func, write.offset, write.width) else {
+			crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) configuration {:#x} could not be read - not written", row.name, write.offset);
+			continue;
+		};
+		let after = (before | write.set) & !write.clear;
+		if crate::arch::pci::config_write_exact(bus, dev, func, write.offset, write.width, after) {
+			crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} ({}) configuration {:#x} is {after:#x} for the claim (was {before:#x})", row.name, write.offset);
+			// ALLOC-OK: bounded by the row's writes, one claim at a time per function.
+			saved.push((*write, before));
+		}
+	}
+	let mut table = SAVED.lock();
+	table.retain(|(held, _)| *held != index);
+	// ALLOC-OK: one entry per claimed function with such a row.
+	table.push((index, saved));
+}
+
+// THE RELEASE'S WRITE-BACK: every register the claim wrote, as it was before.
+pub fn release_writes(index: usize, bus: u8, dev: u8, func: u8) {
+	let saved = {
+		let mut table = SAVED.lock();
+		let Some(at) = table.iter().position(|(held, _)| *held == index) else { return };
+		table.swap_remove(at).1
+	};
+	for (write, before) in saved {
+		if !crate::arch::pci::config_write_exact(bus, dev, func, write.offset, write.width, before) {
+			crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} configuration {:#x} could not be restored at the release", write.offset);
+		}
+	}
+}
 
 pub fn row_for(vendor: u16, device: u16) -> Option<&'static Row> {
 	ROWS.iter().find(|row| row.vendor == vendor && row.device == device)

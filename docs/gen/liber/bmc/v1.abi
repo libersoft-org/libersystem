@@ -1,0 +1,46 @@
+package liber:bmc@1
+enum outcome(answered=1,refused=2,unavailable=3,malformed=4)
+record status(outcome:outcome,cc:u8)
+enum interface-kind(kcs=1,bt=2,ssif=3)
+record device(device-id:u8,device-revision:u8,firmware-major:u8,firmware-minor:u8,ipmi-major:u8,ipmi-minor:u8,manufacturer:u32,product:u16,support:u8)
+record binding-info(name:string:bound=160,guid:bool,administrable:bool,interface:interface-kind,binding:string:bound=96,available:bool,device:device,sensor-count:u16,sdr-truncated:bool,watchdog:bool)
+enum reading-state(known=1,unknown=2,unsupported=3,invalid=4,event-only=5,not-owned=6)
+enum record-kind(full=1,compact=2,event-only=3)
+record sensor(number:u8,lun:u8,name:string:bound=32,kind:record-kind,sensor-type:u8,event-type:u8,entity-id:u8,entity-instance:u8,units:u8,base-unit:u8,modifier-unit:u8,state:reading-state,raw:u8,value:i64,bits:u16,upper-non-recoverable:option<i64>,upper-critical:option<i64>,upper-non-critical:option<i64>,lower-non-critical:option<i64>,lower-critical:option<i64>,lower-non-recoverable:option<i64>)
+record sensors(status:status,sensors:list<sensor>:bound=256,truncated:bool,refused:u32)
+record sel-info(status:status,version:u8,entries:u16,free:u16,last-addition:u32,last-erase:u32,overflow:bool,reserve:bool)
+enum ours(none=0,boot=1,shutdown=2)
+record sel-entry(id:u16,record-type:u8,timestamp:u32,generator:u16,sensor-type:u8,sensor:u8,event-type:u8,deassertion:bool,data:list<u8>:bound=13,ours:ours)
+record sel-refused(id:u16,record-type:u8)
+record sel-page(status:status,entries:list<sel-entry>:bound=16,next:u16,refused:list<sel-refused>:bound=16)
+record fru-device(device:u8,name:string:bound=32,status:status,chassis-type:u8,chassis-part:option<string>:bound=64,chassis-serial:option<string>:bound=64,manufactured:u32,board-manufacturer:option<string>:bound=64,board-product:option<string>:bound=64,board-serial:option<string>:bound=64,board-part:option<string>:bound=64,product-manufacturer:option<string>:bound=64,product-name:option<string>:bound=64,product-part:option<string>:bound=64,product-version:option<string>:bound=64,product-serial:option<string>:bound=64,product-asset:option<string>:bound=64,multirecord:bool,refused:list<string>:bound=4)
+record fru(status:status,devices:list<fru-device>:bound=8)
+record chassis(status:status,power-on:bool,overload:bool,interlock:bool,power-fault:bool,control-fault:bool,restore-policy:u8,last-event:u8,intrusion:bool,drive-fault:bool,cooling-fault:bool,identify:option<u8>)
+record lan-user(id:u8,name:string:bound=16,enabled:bool,privilege:u8)
+record lan-channel(channel:u8,source:option<u8>,address:list<u8>:bound=4,mask:list<u8>:bound=4,gateway:list<u8>:bound=4,mac:list<u8>:bound=6,vlan:option<u16>,users:list<lan-user>:bound=16)
+record lan(status:status,channels:list<lan-channel>:bound=11)
+enum system-event-kind(boot-completed=1,graceful-shutdown=2)
+enum change-kind(available=1,unavailable=2,replaced=3)
+record change(kind:change-kind,name:string:bound=160)
+interface ipmi-provider
+method ipmi-provider.describe op=1 () -> result<binding-info, liber:base@1::error>
+method ipmi-provider.changes op=2 () -> stream<change>
+method ipmi-provider.sensors op=3 () -> result<sensors, liber:base@1::error>
+method ipmi-provider.sel-info op=4 () -> result<sel-info, liber:base@1::error>
+method ipmi-provider.sel-page op=5 (first:u16:rights=) -> result<sel-page, liber:base@1::error>
+method ipmi-provider.fru op=6 () -> result<fru, liber:base@1::error>
+method ipmi-provider.chassis op=7 () -> result<chassis, liber:base@1::error>
+method ipmi-provider.identify op=8 (seconds:u8:rights=) -> result<status, liber:base@1::error>
+method ipmi-provider.lan op=9 () -> result<lan, liber:base@1::error>
+method ipmi-provider.system-event op=10 (kind:system-event-kind:rights=) -> result<status, liber:base@1::error>
+record bmc-summary(name:string:bound=160,administrable:bool,available:bool,device:device,bindings:list<binding-info>:bound=4,paired:bool)
+interface bmc
+method bmc.list op=1 () -> result<list<bmc-summary>, liber:base@1::error>
+method bmc.sensors op=2 (name:string:bound=160:rights=) -> result<sensors, liber:base@1::error>
+method bmc.sel-info op=3 (name:string:bound=160:rights=) -> result<sel-info, liber:base@1::error>
+method bmc.sel-page op=4 (name:string:bound=160:rights=,first:u16:rights=) -> result<sel-page, liber:base@1::error>
+method bmc.sel-follow op=5 (name:string:bound=160:rights=) -> stream<sel-entry>
+method bmc.fru op=6 (name:string:bound=160:rights=) -> result<fru, liber:base@1::error>
+method bmc.chassis op=7 (name:string:bound=160:rights=) -> result<chassis, liber:base@1::error>
+method bmc.identify op=8 (name:string:bound=160:rights=,seconds:u8:rights=) -> result<status, liber:base@1::error>
+method bmc.lan op=9 (name:string:bound=160:rights=) -> result<lan, liber:base@1::error>

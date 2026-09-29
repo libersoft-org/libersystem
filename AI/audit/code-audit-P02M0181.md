@@ -638,3 +638,102 @@ this round.
 
 The three open items stay open until P02M0099's producers land, as the plan requires. By its own terms, the
 milestone is not complete until then.
+
+---
+
+IMPLEMENTER'S CONTINUATION ON P02M0181 (2026-09-29T06:48:03Z):
+
+## What this round is
+
+The three items that waited on P02M0099's real producers. Both producers have now landed in P02M0099: the USB HID
+Power Device class (2026-09-25) and the ACPI battery, AC and thermal classes (2026-09-29, the `acpi_power`
+driver). This round runs each through the real PowerService with a live client and keeps the evidence in a gate.
+
+## Implemented
+
+- THE ACPI PRODUCER'S EVIDENCE is the `acpi` gate (`src/tools/check-acpi.sh`), extended with P02M0099's item:
+  - the fixture SSDT's battery, AC adapter and thermal zone, their methods reading the harness pages, bound by
+    `acpi_power` and published to PowerService;
+  - `acpipower` (`src/user/services/core/src/acpipower.rs`), a client holding the read authority alone:
+    - `list`: exact canonical units;
+    - `watch`: subscribed while the gate changes the pages and raises the power line - a METHOD CHANGE reaching
+      the service and the live client as updates;
+    - `storm`: sixty-odd `Notify` events coalesced by the driver, the last reading delivered;
+  - and the values read again after the ACPI service restarts. The details are in P02M0099's audit.
+- THE HID PRODUCER'S EVIDENCE is a new gate, `power-ups` (`src/tools/check-power-ups.sh`):
+  - The device is a USB UPS the host builds - `usb-gadget.sh setup ups` under the owner's gadget permission of
+    2026-09-21 and its rules, with `ups-sim.py` as its firmware - on root port 3 of the development guest's xHCI
+    controller.
+  - It is bound by the xHCI driver's HID Power Device class and published to the real PowerService.
+  - It is read and driven by a new probe, `upscheck` (`src/user/services/core/src/upscheck.rs`), which holds the
+    read and control authorities:
+    - `list`: the one UPS with the device's first report in exact units - 80 % as 8000 bp, 3600 s, 13.80 V from
+      the feature report - and exactly the controls its descriptor carries;
+    - `control`: subscribed, it sends three commands through PowerService's operator interface:
+      - an output switch the UPS does not advertise: refused `unsupported` by the service;
+      - a scheduled turn-off: `done`, and the device's next REPORT - mains gone, discharging, 79 %, 1800 s, the
+        on-battery alarm - arrives at the subscriber as an update after the snapshot's revision;
+      - the cancel: `done`, and the device back on mains arrives the same way.
+  - The gate also reads what the DEVICE received, from its firmware's log: one turn-off and one cancel, and no
+    request it has no control for (so the refused switch was never sent).
+  - The gadget is torn down and `usb-gadget.sh verify` checked on every exit.
+  - The gate FAILS, rather than skips, without root or the host's gadget modules.
+- REGISTRATION:
+  - `check.sh` `["power-ups"]`;
+  - the verify-model catalogue `("power-ups", "userspace.build")` - `GATES` 151 and `GATES_THAT_BOOT_A_GUEST` 54;
+  - `release-required.toml` `gate.power-ups`;
+  - `upscheck` and `acpipower` in the shell table, the synopses, PermissionManager (`upscheck`:
+    `PowerState` + `PowerControl`; `acpipower`: `PowerState`), the services crate (development-only bins) and
+    the manifest (probe rows, development).
+
+## Found and fixed
+
+THE HID PRODUCER NEVER REACHED THE SERVICE ON A REAL SYSTEM:
+- The first `power-ups` run failed: "PowerService: a provider is gone: it broke the provider protocol", then no UPS.
+- The cause: `class_power.rs` advanced its revision on every frame, so its snapshot and the snapshot's end named
+  two revisions, and the registry refuses that (`Refusal::Order`) and ends the provider.
+- The kernel oracle plays PowerService itself and never read revisions.
+- Fixed in P02M0099's class: a change alone advances the revision. The oracle now asserts the revisions.
+- This is exactly the gap the final integration item exists to close.
+
+## Verification (2026-09-29, x86_64; commands from the repository root)
+
+`./check.sh --gate acpi` - PASS, 383 s:
+- exact units;
+- the live client's three updates after the power line;
+- 61 storm events reaching the client as 7 zone updates;
+- the values read again after the service restart.
+
+`./check.sh --gate power-ups`:
+- FAILED on the first run (the defect above);
+- PASS after the fix, 483 s:
+  - the probe's lines `updated ups online 0 discharging 1 soc 7900 bp runtime 1800 s voltage 13800000 uV
+    on-battery 1` and `... online 1 discharging 0 ... runtime 3600 s ... on-battery 0`;
+  - the firmware's log: one turn-off, one cancel;
+  - the host left carrying nothing of the gadget's.
+
+The UPS kernel oracle with `USB_GADGET=ups` - PASS, 1 passed (37 s), with the new revision assertions.
+
+Host suites and checks:
+- drivers 419 and system-manifest 28;
+- `cargo check` of `upscheck`, `acpipower` and `xhci`;
+- the test kernel's build;
+- `bash -n`/`shfmt -d` of both gate scripts.
+
+`cargo test` of verify-model:
+- compiles with the new catalogue sizes;
+- its tests fail as before this round, all on the model load ("kernel test
+  `the_global_clock_advances_once_per_period_however_many_cores_tick` ... has no `tagged_test!` declaration"),
+  which no change of this round touches.
+
+NOT RUN:
+- the aarch64 and riscv64 cross-builds of the new probes and the fixed class (the end of the job, with the
+  other slow-target work);
+- the dynamic report;
+- `verify.sh`.
+
+## Blockers
+
+None for the three items.
+
+The milestone's own text keeps no suspend or platform policy. It stays open only for the cross-builds above.

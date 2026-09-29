@@ -497,6 +497,9 @@ pub mod provider {
 	/// A HARDWARE WATCHDOG, the `watchdog` contract, published under the device's name. The watchdog service alone
 	/// consumes it, and pets it only while ServiceManager's standing loop answers.
 	pub const WATCHDOG: u16 = 25;
+	/// A BASEBOARD MANAGEMENT CONTROLLER through one IPMI system interface, the `liber:bmc@1` `ipmi-provider`
+	/// contract, which the BMC service alone consumes.
+	pub const IPMI: u16 = 26;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.
@@ -554,6 +557,15 @@ pub mod provider {
 	// THE DFU SLOT ADMINSERVICE ROUTES `firmware-download` TO, and the name is ITS: the administrative path
 	// reserves it, and a DFU function is the executor that fills it.
 	pub const USB_DFU_NAME: &[u8] = b"org.libersystem.admin-dfu";
+	// THE BMC'S TWO EXECUTOR SLOTS, each AdminService routes one action to: erasing its event log, and its chassis
+	// control. An `ipmi` binding publishes both beside its `ipmi` provider, which is published as `IPMI_NAME`.
+	pub const BMC_SEL_NAME: &[u8] = b"org.libersystem.admin-bmc-sel";
+	pub const BMC_CHASSIS_NAME: &[u8] = b"org.libersystem.admin-bmc-chassis";
+	pub const IPMI_NAME: &[u8] = b"org.libersystem.ipmi";
+	// The BMC's thermal zones, published to PowerService, and its watchdog, published under the device name the
+	// policy key `watchdog.device` names.
+	pub const BMC_POWER_NAME: &[u8] = b"org.libersystem.ipmi.sensors";
+	pub const BMC_WATCHDOG_NAME: &[u8] = b"bmc";
 }
 
 // WHAT A DRIVER CAN HONESTLY KNOW ABOUT ITSELF.

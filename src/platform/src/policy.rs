@@ -340,3 +340,13 @@ pub fn reserved_against(reservation: &abi::PlatformPart, reservation_ports: &[ab
 pub fn smbios_ipmi(records: &[(u8, u64)], interface_type: u8, base: u64) -> Option<usize> {
 	records.iter().position(|&(kind, address)| kind == interface_type && address & !1 == base & !1)
 }
+
+/// The SMBIOS interface type of SSIF.
+pub const SMBIOS_IPMI_SSIF: u8 = 4;
+
+/// THE TYPE-38 RECORD AN SSIF NODE AGREES WITH: an SSIF record whose seven-bit address - the record's base shifted right
+/// by one, as the boot recorded it - is the node's `I2cSerialBusV2` address. Every bit of a bus address is part of it:
+/// there is no I/O-space flag to ignore here. The record names no controller, so the address is all there is.
+pub fn smbios_ssif(records: &[(u8, u64)], address: u16) -> Option<usize> {
+	records.iter().position(|&(kind, recorded)| kind == SMBIOS_IPMI_SSIF && recorded == u64::from(address))
+}

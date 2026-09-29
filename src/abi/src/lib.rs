@@ -883,6 +883,13 @@ pub const DEVICE_TYPE_AHCI: u32 = 0x103;
 pub const DEVICE_TYPE_HDA: u32 = 0x105;
 // An SD/eMMC host controller conforming to the SD Host Controller specification.
 pub const DEVICE_TYPE_SDHCI: u32 = 0x104;
+// An IPMI system interface on PCI (class 0x0C, subclass 0x07): KCS (interface 0x01) or BT (0x02). Its register file
+// is BAR 0 - resolved here when BAR 0 is memory; an I/O BAR 0 reaches its driver as a port range like any I/O BAR.
+pub const PCI_SUBCLASS_IPMI: u8 = 0x07;
+pub const PCI_PROG_IF_IPMI_KCS: u8 = 0x01;
+pub const PCI_PROG_IF_IPMI_BT: u8 = 0x02;
+pub const DEVICE_TYPE_IPMI_KCS: u32 = 0x107;
+pub const DEVICE_TYPE_IPMI_BT: u32 = 0x108;
 
 // A FUNCTION THIS KERNEL RESOLVED NO PROFILE FOR, and that is a device type of its own rather than an
 // absence. Every PCI function is in the inventory; the ones outside the two resolvers carry their
@@ -917,6 +924,8 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		DEVICE_TYPE_AHCI => "ahci",
 		DEVICE_TYPE_SDHCI => "sdhci",
 		DEVICE_TYPE_HDA => "hda",
+		DEVICE_TYPE_IPMI_KCS => "ipmi-kcs",
+		DEVICE_TYPE_IPMI_BT => "ipmi-bt",
 		DEVICE_TYPE_UNKNOWN => "unresolved-pci-function",
 		DEVICE_TYPE_PLATFORM => "platform",
 		// A code this build does not classify. The NUMBER is kept, because a reader chasing an

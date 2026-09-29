@@ -166,6 +166,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmc-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "bmc-proto",
+]
+
+[[package]]
+name = "bmc-client-provider"
+version = "0.0.0"
+dependencies = [
+ "bmc-proto",
+]
+
+[[package]]
+name = "bmc-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "bmp"
 version = "0.0.0"
 dependencies = [
@@ -779,6 +803,7 @@ dependencies = [
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "bmc-proto",
  "camera-device-proto",
  "camera-proto",
  "config-proto",
@@ -1146,6 +1171,8 @@ dependencies = [
  "audiorec",
  "bluetooth-client",
  "bluetooth-client-provider",
+ "bmc-client",
+ "bmc-client-provider",
  "bmp",
  "cli",
  "config-client",

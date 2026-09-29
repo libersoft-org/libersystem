@@ -35,6 +35,10 @@ enum admin-action {
 	firmware-download = 1,
 	/// The test executor's bounded write. Development images only.
 	probe-write       = 2,
+	/// Erase a BMC's event log - only the records counted when the request was prepared.
+	bmc-sel-clear     = 3,
+	/// A BMC chassis control: power down, power cycle, hard reset or soft shutdown.
+	bmc-chassis-control = 4,
 }
 
 /// THE OPERATION EXACTLY AS THE EXECUTOR FROZE IT, and all that a confirmation authorizes.

@@ -1,0 +1,318 @@
+//! LiberSystem BMC - what a baseboard management controller holds, read through the system's IPMI interfaces: its
+//! identity, its sensors, its event log, its FRU inventory, its chassis and its LAN configuration.
+//!
+//! TWO INTERFACES FOR TWO PARTIES. The `ipmi-provider` contract is what one `ipmi` driver binding serves to the BMC
+//! service - the only consumer of the `ipmi` provider kind. The `bmc` interface is what the BMC service serves to the
+//! `bmc` tool. NEITHER CARRIES A RAW COMMAND, AND NEITHER CAN STOP THE MACHINE OR ERASE THE LOG: those are
+//! administrative actions, carried by the driver's executor publications, which only AdminService reaches. The
+//! provider contract's only writes are `system-event` - one of the two events below, built by the driver - and the
+//! identify light.
+//!
+//! A BMC ANSWERS WITH A COMPLETION CODE, and every reply that asked the BMC carries a `status` saying what it did: it
+//! answered, it refused with a code, it is unavailable, or its answer was refused as malformed. `error` is kept for
+//! the call itself failing - a BMC this service does not hold, a request out of bounds.
+
+package liber:bmc@1;
+
+use liber:base@1.{error};
+
+/// What happened when the BMC was asked.
+enum outcome {
+	answered    = 1,
+	/// The BMC answered with a completion code other than success: `cc` says which.
+	refused     = 2,
+	/// The BMC is unavailable - three transactions in a row timed out - or the interface did not answer.
+	unavailable = 3,
+	/// The answer arrived and was refused: too long, the wrong length, not the request's.
+	malformed   = 4,
+}
+
+record status {
+	outcome: outcome,
+	cc:      u8,
+}
+
+/// Which system interface a binding speaks.
+enum interface-kind {
+	kcs  = 1,
+	bt   = 2,
+	ssif = 3,
+}
+
+/// Get Device ID, decoded.
+record device {
+	device-id:       u8,
+	device-revision: u8,
+	firmware-major:  u8,
+	/// BCD, as the BMC sends it.
+	firmware-minor:  u8,
+	ipmi-major:      u8,
+	ipmi-minor:      u8,
+	/// The IANA enterprise number.
+	manufacturer:    u32,
+	product:         u16,
+	/// Additional device support: bit 0 sensors, 1 SDR repository, 2 SEL, 3 FRU, 7 chassis.
+	support:         u8,
+}
+
+/// One binding's description of the BMC it reaches.
+record binding-info {
+	/// The BMC's name: `bmc:` and its GUID's 32 hex digits, or `bmc:` and the fallback of its manufacturer, product and
+	/// device ID with this binding.
+	@bound(160) name:          string,
+	/// Whether the BMC answered a GUID - only such BMCs can be reached twice.
+	guid:                      bool,
+	/// Whether the name fits the administrative selector's 64 bytes.
+	administrable:             bool,
+	interface:                 interface-kind,
+	/// The PCI address or the firmware path of the device the interface is bound to.
+	@bound(96) binding:        string,
+	available:                 bool,
+	device:                    device,
+	/// The sensors the SDR repository declared, and whether the repository was cut at its bound.
+	sensor-count:              u16,
+	sdr-truncated:             bool,
+	/// Whether this binding publishes the BMC's watchdog.
+	watchdog:                  bool,
+}
+
+/// What a sensor's reading is.
+enum reading-state {
+	known       = 1,
+	/// The BMC said the reading is unavailable, or its scanning is disabled.
+	unknown     = 2,
+	/// Not a linear threshold sensor this layer converts, or no analog reading at all.
+	unsupported = 3,
+	/// A conversion that overflowed.
+	invalid     = 4,
+	/// An event-only record: nothing to read.
+	event-only  = 5,
+	/// A sensor another controller owns, which this layer does not bridge to.
+	not-owned   = 6,
+}
+
+enum record-kind {
+	full       = 1,
+	compact    = 2,
+	event-only = 3,
+}
+
+record sensor {
+	number:                     u8,
+	lun:                        u8,
+	@bound(32) name:            string,
+	kind:                       record-kind,
+	sensor-type:                u8,
+	/// The event/reading type code: 0x01 is a threshold sensor.
+	event-type:                 u8,
+	entity-id:                  u8,
+	entity-instance:            u8,
+	/// Sensor Units 1, and the base and modifier unit codes.
+	units:                      u8,
+	base-unit:                  u8,
+	modifier-unit:              u8,
+	state:                      reading-state,
+	raw:                        u8,
+	/// The reading in milli-units of its base unit, when `state` is known.
+	value:                      i64,
+	/// The threshold comparison or the discrete state bits the BMC sent with the reading.
+	bits:                       u16,
+	upper-non-recoverable:      option<i64>,
+	upper-critical:             option<i64>,
+	upper-non-critical:         option<i64>,
+	lower-non-critical:         option<i64>,
+	lower-critical:             option<i64>,
+	lower-non-recoverable:      option<i64>,
+}
+
+record sensors {
+	status:                      status,
+	@bound(256) sensors:         list<sensor>,
+	/// The repository was cut at its bound.
+	truncated:                   bool,
+	/// Records refused as malformed while the rest were read.
+	refused:                     u32,
+}
+
+record sel-info {
+	status:        status,
+	version:       u8,
+	entries:       u16,
+	free:          u16,
+	last-addition: u32,
+	last-erase:    u32,
+	overflow:      bool,
+	/// Whether the BMC supports Reserve SEL - which clearing it requires.
+	reserve:       bool,
+}
+
+/// Which of the system's own events an entry is.
+enum ours {
+	none     = 0,
+	boot     = 1,
+	shutdown = 2,
+}
+
+record sel-entry {
+	id:                 u16,
+	record-type:        u8,
+	timestamp:          u32,
+	generator:          u16,
+	sensor-type:        u8,
+	sensor:             u8,
+	event-type:         u8,
+	deassertion:        bool,
+	/// A system event's three data bytes; an OEM record's own bytes.
+	@bound(13) data:    list<u8>,
+	ours:               ours,
+}
+
+/// A record refused: its ID and the type the specification does not define.
+record sel-refused {
+	id:          u16,
+	record-type: u8,
+}
+
+record sel-page {
+	status:                     status,
+	@bound(16) entries:         list<sel-entry>,
+	/// The record to ask for next, 0xFFFF at the end.
+	next:                       u16,
+	/// Records of a type the specification does not define, refused while the rest were read.
+	@bound(16) refused:         list<sel-refused>,
+}
+
+record fru-device {
+	device:                             u8,
+	@bound(32) name:                    string,
+	status:                             status,
+	chassis-type:                       u8,
+	@bound(64) chassis-part:            option<string>,
+	@bound(64) chassis-serial:          option<string>,
+	/// Minutes since 1996-01-01 00:00.
+	manufactured:                       u32,
+	@bound(64) board-manufacturer:      option<string>,
+	@bound(64) board-product:           option<string>,
+	@bound(64) board-serial:            option<string>,
+	@bound(64) board-part:              option<string>,
+	@bound(64) product-manufacturer:    option<string>,
+	@bound(64) product-name:            option<string>,
+	@bound(64) product-part:            option<string>,
+	@bound(64) product-version:         option<string>,
+	@bound(64) product-serial:          option<string>,
+	@bound(64) product-asset:           option<string>,
+	multirecord:                        bool,
+	/// Each area refused, by what was wrong with it, while the others were read.
+	@bound(4) refused:                  list<string>,
+}
+
+record fru {
+	status:                  status,
+	@bound(8) devices:       list<fru-device>,
+}
+
+record chassis {
+	status:         status,
+	power-on:       bool,
+	overload:       bool,
+	interlock:      bool,
+	power-fault:    bool,
+	control-fault:  bool,
+	restore-policy: u8,
+	last-event:     u8,
+	intrusion:      bool,
+	drive-fault:    bool,
+	cooling-fault:  bool,
+	/// 0 off, 1 timed on, 2 on indefinitely - when the BMC reports it.
+	identify:       option<u8>,
+}
+
+record lan-user {
+	id:                u8,
+	@bound(16) name:   string,
+	enabled:           bool,
+	privilege:         u8,
+}
+
+record lan-channel {
+	channel:                u8,
+	/// 0 unspecified, 1 static, 2 DHCP, 3 the BIOS, 4 other.
+	source:                 option<u8>,
+	@bound(4) address:      list<u8>,
+	@bound(4) mask:         list<u8>,
+	@bound(4) gateway:      list<u8>,
+	@bound(6) mac:          list<u8>,
+	vlan:                   option<u16>,
+	@bound(16) users:       list<lan-user>,
+}
+
+record lan {
+	status:                  status,
+	@bound(11) channels:     list<lan-channel>,
+}
+
+/// The system's own events, which the driver builds.
+enum system-event-kind {
+	/// OS Boot, boot completed.
+	boot-completed    = 1,
+	/// OS Stop/Shutdown, an orderly shutdown.
+	graceful-shutdown = 2,
+}
+
+/// What changed about a binding's BMC.
+enum change-kind {
+	/// It answered again after being unavailable.
+	available   = 1,
+	unavailable = 2,
+	/// It answered with a different identity: a different BMC, whose repositories were read again.
+	replaced    = 3,
+}
+
+record change {
+	kind:             change-kind,
+	@bound(160) name: string,
+}
+
+/// THE DRIVER'S CONTRACT, to the BMC service alone.
+interface ipmi-provider {
+	@op(1)  describe:     func() -> result<binding-info, error>;
+	/// Availability and identity changes, as they happen.
+	@op(2)  changes:      func() -> stream<change>;
+	/// Every sensor the repository declares, each read now.
+	@op(3)  sensors:      func() -> result<sensors, error>;
+	@op(4)  sel-info:     func() -> result<sel-info, error>;
+	/// Up to sixteen entries from record `first`.
+	@op(5)  sel-page:     func(first: u16) -> result<sel-page, error>;
+	@op(6)  fru:          func() -> result<fru, error>;
+	@op(7)  chassis:      func() -> result<chassis, error>;
+	/// The identify light, on for 1 to 255 seconds, or off with 0.
+	@op(8)  identify:     func(seconds: u8) -> result<status, error>;
+	@op(9)  lan:          func() -> result<lan, error>;
+	/// One of the system's own events into the BMC's log.
+	@op(10) system-event: func(kind: system-event-kind) -> result<status, error>;
+}
+
+/// One BMC as the service holds it: its name, and every binding that reaches it.
+record bmc-summary {
+	@bound(160) name:                  string,
+	administrable:                     bool,
+	available:                         bool,
+	device:                            device,
+	@bound(4) bindings:                list<binding-info>,
+	/// Reached through more than one interface - a pair an operator may reduce with DeviceManager's `disable`.
+	paired:                            bool,
+}
+
+/// THE TOOL'S INTERFACE, served by the BMC service. Every operation but `list` names the BMC by its name.
+interface bmc {
+	@op(1)  list:       func() -> result<list<bmc-summary>, error>;
+	@op(2)  sensors:    func(@bound(160) name: string) -> result<sensors, error>;
+	@op(3)  sel-info:   func(@bound(160) name: string) -> result<sel-info, error>;
+	@op(4)  sel-page:   func(@bound(160) name: string, first: u16) -> result<sel-page, error>;
+	/// The log FOLLOWED: each entry the BMC adds from now on, found by polling its most recent addition.
+	@op(5)  sel-follow: func(@bound(160) name: string) -> stream<sel-entry>;
+	@op(6)  fru:        func(@bound(160) name: string) -> result<fru, error>;
+	@op(7)  chassis:    func(@bound(160) name: string) -> result<chassis, error>;
+	@op(8)  identify:   func(@bound(160) name: string, seconds: u8) -> result<status, error>;
+	@op(9)  lan:        func(@bound(160) name: string) -> result<lan, error>;
+}

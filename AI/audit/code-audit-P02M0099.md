@@ -3534,3 +3534,147 @@ does catch it is the one on the clip itself, `width.min(extent.0 - x)` losing th
 
 The whole gate runs in 77 seconds, which is what makes it worth running on every driver change
 rather than at the end of a milestone.
+
+
+## ACPI battery, AC and thermal classes - implemented (2026-09-29)
+
+IMPLEMENTER'S RECORD of the item "ACPI battery, AC and thermal classes", taken in the owner's agreed order after
+P02M0195b. The three blocks the item names are gone: the firmware-node identity and the node-scoped channel
+(P02M0196a/b), the AML interpreter (P02M0196) and the platform power-state service (P02M0181's PowerService, whose
+`power-source` provider contract and `power_model::acpi` adapters were already in the tree). What this item adds is
+the driver that joins them, and its evidence.
+
+WHAT WAS IMPLEMENTED
+
+- `src/user/drivers/core/src/acpi_power.rs` (the host-testable half, `pub mod acpi_power` in the drivers crate):
+  `Class` and `class_of` (the row's match ids, `_HID` first: `PNP0C0A`, `ACPI0003`, `THERMALZONE`); `Refusal`
+  (`Shape`, `NotInteger`) and `integer`; `Information` with `bix` (revision, then the unit at 1, the capacities at 2
+  and 3, the warning and low levels at 6 and 7, at least twenty elements) and `bif` (thirteen elements, the same
+  fields at 0, 1, 2, 5 and 6); `Status` and `bst` (at least four elements); `battery` (the input
+  `power_model::acpi::battery` takes); `Zone` and `Zone::thermal`; a 64-bit integer past 32 bits reads as
+  0xFFFFFFFF, the specification's "unknown", never as its low half. THE STORM BOUND: `Coalescer` (`notified`,
+  `due_at`, `take_due`, `coalesced`) - a notification refreshes at once when the last refresh is at least
+  `REFRESH_TICKS` (a tenth of a second) old, and otherwise is owed and folded into one refresh when the bar lifts,
+  however many arrive meanwhile. Four host tests in `acpi_power/tests.rs`.
+- `src/user/drivers/core/src/acpi_power_driver.rs` (bin `acpi_power`): one binding per namespace node. Online first
+  with nothing published (the node channel is answered only to an online binding), then the node through
+  `common::request_node`; the state read (`_STA`, `_BIX` or `_BIF`, `_BST` only when the battery is present; `_STA`
+  and `_PSR`; `_TMP`, `_RTV`, `_CRT`, `_HOT`, `_PSV` and `_AC0`..`_AC9` up to the first absent), every value decoded
+  with `aml::wire::decode` - which bounds the depth and the size, the item's "validate package/object depth" - and
+  a result of the wrong shape refused by name and not published. ONE `power-source` provider per binding, served
+  like `power_fixture`'s (snapshot at the stream's open, `Updated` only when the state read differs from the last
+  published, `query` reads again, `command` is `Unsupported` - read-only sources advertise no control). The node's
+  `Notify` stream: 0x80 reads the state again, 0x81 also the battery's information, both through the `Coalescer`;
+  a thermal zone with `_TZP` is polled at that interval, never faster than once a second. An AC adapter without
+  `_STA` is taken to answer 0x0F (ACPI 6.5, 6.3.7); a battery without one stays `Unknown` - its presence is bit 4,
+  which that default does not set. THE STORM IS REPORTED in bounded lines: "N notification(s) coalesced into later
+  readings" at the first coalesced one and at each doubling. WHEN THE ACPI SERVICE RESTARTS the notification stream
+  closes: the binding keeps what it published, `drivers::common` asks for the node again when its channel closes,
+  and the node the new instance hands over is subscribed to and read at once ("its node is handed again - reading
+  it"). New in `drivers::common`: `fresh_node()`, the answer `wait_node_or_answer` reports, for a loop that waits in
+  `wait_or_answer_until` (it looks once a second while its node is gone).
+- `src/user/services/manifest.toml`: the `acpi_power` row (platform `hid` `PNP0C0A`, `ACPI0003`, `THERMALZONE`; dma
+  none; `power-source` at most one, one consumer). `src/tools/system-manifest/src/tests.rs`: its DMA entry.
+- `src/user/services/core/src/acpipower.rs` (bin `acpipower`, development): the gate's live power client with the
+  read authority ALONE (`PowerState`) - `list` (awaits the three sources and their exact first values for thirty
+  seconds, since after a service restart the bindings read the nodes handed again a moment later), `watch`
+  (subscribed, cues the host, then requires the battery discharging, the adapter off line and the zone at
+  45050 mC as `Updated` changes with revisions after the snapshot's), `storm` (subscribed, cues the host, counts the
+  zone's updates until the reading the host wrote last - 56850 mC - arrives). Registered in the shell table, the
+  synopses, PermissionManager (`PowerState` only), the services crate (`required-features = ["development"]`) and
+  the manifest (probe, development).
+- THE FIXTURE (`src/harness/acpi-fixture.py`): the harness pages gain the battery's `_STA` byte (0x20), its `_BST`
+  dwords (0x24..0x33), the adapter's `_PSR` byte (0x34) and the zone's `_TMP` dword (0x38), with first values
+  written by `--memory`; `\_SB.BAT0` (`PNP0C0A`, `_STA` from the pages, a static revision 1 `_BIX` in mWh, `_BST`
+  stored into a named package from the pages - a package's elements are data, not expressions, so firmware fills
+  one that way); `\_SB.ADP0` (`ACPI0003`, `_PSR` only); `\_TZ.TZ00` (`_TMP` from the pages, `_CRT` 3682, `_HOT`
+  3632, `_PSV` 3532, `_AC0` 3432); the GPIO controller's `_AEI` gains line 3 (edge), whose `_E03` notifies all three
+  with 0x80. `--set FILE NAME=VALUE...` writes the named values; `--power-storm FILE CONTROL` is the host's half of
+  the storm (the line lowered and raised as fast as the backend answers, the zone's reading changed before each
+  rise, until sixty events fired or thirty seconds; then the last reading, 3300, and the line raised until one more
+  event fires, so a notification always follows the last write). `src/harness/aml_emitter.py`: `thermal_zone`
+  (`ThermalZoneOp`, 0x5B 0x85) with a self-test check of its encoding.
+- THE GATE (`src/tools/check-acpi.sh`): the companion's lists and the grant count follow the second `_AEI` line
+  (`_AEI lines [0x1000002,0x1000003]`, three connections of `SB0_`); the three nodes published (two method-only
+  devices and a thermal zone) and each binding publishing before lsdev's first snapshot; `acpipower list`; `watch`
+  answered by `--set` and line 3; `storm` answered by `--power-storm`, with the zone's updates required to be FEWER
+  than the events fired, the zone's driver required to say it coalesced, and no `Notify` for the zone dropped at its
+  stream; the first values written back unraised before the service is killed, and after the restart each binding
+  required to take its node again and `acpipower list` to find the first values again.
+
+DECISIONS
+
+- ONE DRIVER, THREE CLASSES, as the plan's owner note says ("each class a driver bound to its namespace node"): one
+  program with one binding per node, since the three share the node channel, the provider loop and the storm bound,
+  and differ only in which methods they read - `Class` decides that.
+- THE STORM IS BOUNDED IN THE DRIVER, NOT IN THE SERVICE: the ACPI service delivers every `Notify` (its stream is 32
+  deep and says when one is not taken); the driver decides how often a notification costs a reading. PowerService's
+  own subscriber coalescing is a separate thing and is not what the gate's "coalesced" line proves - the driver's
+  line is.
+- THE COOLING HALF IS NOT HERE: a `thermal-zone` publication for cooling devices and the `_CRT` fallback are
+  P02M0198's, to be built into this driver in that milestone. This item publishes the zone's STATE (reading, trips,
+  derived over-temperature alarm) to PowerService.
+- FDT PLATFORMS: nothing here pretends ACPI is universal - the driver matches ACPI ids only, and what it publishes is
+  the firmware-agnostic `power-source` contract `power_fixture` also publishes. No device-tree battery or charger
+  driver exists in this tree, and no QEMU machine the harness boots describes one.
+
+VERIFICATION (2026-09-29, x86_64 and the host; every command from the repository root)
+
+- `python3 - <<scratch crate>>` - NOT A GATE, a one-off check before any guest ran: the fixture SSDT loaded into the
+  `aml` interpreter (`aml::testing::Model`, a DSDT declaring the three companions) answered `_STA` 31, the `_BIX`
+  package of 21 elements, `_BST` (2, 5000, 24000, 11100), `_PSR` 1, `_TMP` 3002, `_CRT` 3682 and `_AC0` 3432; `_BST`
+  followed a change in the pages; `_E03` raised `Notify` 0x80 on `\_SB_.BAT0`, `\_SB_.ADP0` and `\_TZ_.TZ00`. The crate
+  lived in the session's scratch directory and is not in the tree.
+- `python3 src/harness/acpi-fixture.py --self-test` - PASS ("the SSDT builds (1527 bytes)").
+  `python3 src/harness/aml_emitter.py --self-test` - PASS (with the new `ThermalZone` encoding check).
+  `acpi-fixture.py --set` wrote the named values at their offsets and refused an unknown name.
+- `cargo test --manifest-path src/user/drivers/core/Cargo.toml --lib` - PASS, 419 (415 before, plus the four
+  `acpi_power` tests).
+- `cargo test --manifest-path src/tools/system-manifest/Cargo.toml` - PASS, 28.
+- `cargo check --bin acpi_power --bin i2c_hid --bin acpi_fixture --features development` (drivers) and
+  `cargo check --features development --bin acpipower` (services) - clean.
+- `./check.sh --gate source-hygiene`, `--gate firmware-fixtures`, `--gate aml-emitter` - PASS each.
+- `bash -n` and `shfmt -d src/tools/check-acpi.sh` - clean.
+- `LIBER_DEVELOPMENT=1 ./image.sh --format iso` - exit 0; then `./check.sh --gate acpi` - PASS in 383 s, first run:
+  "the battery, the adapter and the zone read through PowerService in exact canonical units"; "a live client saw the
+  battery discharge, the adapter go off line and the zone warm after the power line rose" (the client's lines:
+  battery remaining 20000000 uWh, soc 4166 bp, power -7000000 uW; ac online 0; zone 45050 mC); "the storm raised the
+  line 250 or more times and 61 events fired" and "a storm of 61 events on the power line reached the client as 7
+  zone update(s), the last reading among them"; each of the three bindings said it coalesced 1 (or 2) through 32
+  notifications; after the service was killed each said "its node is handed again - reading it" and `acpipower
+  list` found the first values again; 49 rows kept across the restart; every earlier assertion of the gate still
+  passes. Logs kept in `.build/logs/acpi/`.
+
+NOT PERFORMED HERE: aarch64 and riscv64 builds of the new driver and probe (the owner's rule: slow targets run once,
+at the end of the job - the driver is ACPI-only, but it is built for every target); the dynamic report; `verify.sh`.
+
+BLOCKERS: none for the item. Left to other milestones by the plan itself: the zone's cooling half (a `thermal-zone`
+publication for cooling devices and the `_CRT` fallback, P02M0198) and board embedded-controller methods, fan
+curves and vendor power policy (Phase 5). An embedded controller behind `_BST` is not exercised: QEMU emulates none
+(as the `acpi` gate already states).
+
+## USB HID Power Device class: a snapshot PowerService refused, found by P02M0181's integration (2026-09-29)
+
+WHAT WAS WRONG. `class_power.rs`'s `Power::frame` advanced the provider revision on EVERY frame, so the snapshot
+went out at revision r+1 and its end at r+2. PowerService's registry (`service_logic::power_registry::frame`)
+requires a snapshot and its end to name ONE revision and ends a provider that does otherwise - so on a real
+system the UPS never reached PowerService: the first full-system boot with the UPS gadget printed
+"driver.xhci: HID power device bound" and then "PowerService: a provider is gone: it broke the provider
+protocol", and `upscheck list` found no UPS. The kernel oracle had not caught it because it plays PowerService
+itself and read the kinds and states of the frames, never their revisions.
+
+THE FIX. `Power::frame` advances the revision for a change (`Updated`) only; a snapshot and its end carry the
+revision the source is at. The oracle
+(`kernel.hardware.usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises`) now asserts the
+revisions as PowerService holds them: the snapshot's end names the snapshot's revision, the on-battery update a
+later one, and the back-on-mains update a later one still - so the same mistake fails it.
+
+VERIFICATION (2026-09-29, x86_64):
+- `cargo check --bin xhci` (drivers) and `cd src/kernel && TEST=1 TEST_TAGS="" cargo build --tests` - clean.
+- `./build.sh --arch x86_64` - exit 0; then `USB_GADGET=ups TEST_SELECTION="kernel.hardware.usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises" ./test.sh --arch x86_64 --timeout 1800`
+  - PASS, "1 passed (37s)", the oracle's line "usb-power: a UPS reported, went onto battery when a turn-off was
+  scheduled and back when it was cancelled"; `usb-gadget.sh verify` afterwards: "the host carries nothing of this
+  harness's".
+- `LIBER_DEVELOPMENT=1 ./image.sh --format iso` then `./check.sh --gate power-ups` (P02M0181's new gate) - FAILED
+  before the fix as described above, PASS after it (483 s).
+- NOT RUN: the oracle on aarch64 and riscv64 (the end of the job).

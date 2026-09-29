@@ -215,6 +215,8 @@ pub enum ProviderKindName {
 	Tpm,
 	/// A hardware watchdog, with the watchdog service its one consumer.
 	Watchdog,
+	/// A BMC through one IPMI system interface, with the BMC service its one consumer.
+	Ipmi,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -225,7 +227,11 @@ pub const MAX_ROLE_KINDS: usize = 16;
 /// every connection its roots mint - scoped through the admin root or inventory-only through the
 /// catalogue's own - holds one slot until its channel closes. Written here so the manifest's combined
 /// demand can be checked against it before a boot finds the ceiling.
-pub const MAX_CATALOGUE_CLIENTS: usize = 32;
+///
+/// SIXTY-FOUR (2026-09-29): the BMC service's catalogue role took the demand from 32 to 34 - twenty-one minting roles,
+/// twelve of them for services a restart replaces, and DeviceManager's own - and DeviceManager's table is raised with
+/// it in the same change.
+pub const MAX_CATALOGUE_CLIENTS: usize = 64;
 
 /// What DeviceManager mints for itself, outside every role: the development agent's catalogue
 /// connection. Counted in every configuration, because the shipping one is the smaller.
@@ -262,6 +268,7 @@ impl ProviderKindName {
 			ProviderKindName::GpioLines => 23,
 			ProviderKindName::Tpm => 24,
 			ProviderKindName::Watchdog => 25,
+			ProviderKindName::Ipmi => 26,
 		}
 	}
 }

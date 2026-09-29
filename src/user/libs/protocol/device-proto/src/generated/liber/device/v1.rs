@@ -1465,6 +1465,10 @@ pub enum ProviderKind {
 	/// `i6300esb`, `bmc`). The watchdog service alone consumes it, and pets it only while ServiceManager's
 	/// standing loop answers.
 	Watchdog = 25,
+	/// A BASEBOARD MANAGEMENT CONTROLLER reached through one IPMI system interface - KCS, BT or SSIF - the
+	/// `liber:bmc@1` `ipmi-provider` contract, which the BMC service alone consumes. It carries no raw command:
+	/// the BMC's log is erased and its chassis controlled only through the driver's administrative executors.
+	Ipmi = 26,
 }
 
 impl ProviderKind {
@@ -1532,6 +1536,7 @@ impl ProviderKind {
 			23 => Some(ProviderKind::GpioLines),
 			24 => Some(ProviderKind::Tpm),
 			25 => Some(ProviderKind::Watchdog),
+			26 => Some(ProviderKind::Ipmi),
 			_ => None,
 		}
 	}
@@ -7165,6 +7170,7 @@ impl ProviderKind {
 			ProviderKind::GpioLines => out.push_str("\"gpio-lines\""),
 			ProviderKind::Tpm => out.push_str("\"tpm\""),
 			ProviderKind::Watchdog => out.push_str("\"watchdog\""),
+			ProviderKind::Ipmi => out.push_str("\"ipmi\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -7194,6 +7200,7 @@ impl ProviderKind {
 			ProviderKind::GpioLines => out.push_str("gpio-lines"),
 			ProviderKind::Tpm => out.push_str("tpm"),
 			ProviderKind::Watchdog => out.push_str("watchdog"),
+			ProviderKind::Ipmi => out.push_str("ipmi"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -7223,6 +7230,7 @@ impl ProviderKind {
 			ProviderKind::GpioLines => crate::codec::cbor::text(out, "gpio-lines"),
 			ProviderKind::Tpm => crate::codec::cbor::text(out, "tpm"),
 			ProviderKind::Watchdog => crate::codec::cbor::text(out, "watchdog"),
+			ProviderKind::Ipmi => crate::codec::cbor::text(out, "ipmi"),
 		}
 	}
 }

@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 150] = [
+const GATES: [(&str, &str); 154] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -337,6 +337,19 @@ const GATES: [(&str, &str); 150] = [
 	// the protocol and the provider and grant plumbing - a userspace change selects it - and it boots
 	// a development image because the fixture is development-only.
 	("power-service", "userspace.build"),
+	// AND A REAL HID PRODUCER THROUGH IT: a USB UPS the host builds (the gadget kind `ups`), bound by the xHCI
+	// driver's HID Power Device class and read and driven through PowerService by a live client. Its subject is the
+	// class, the service and the control path - a userspace change selects it - and it boots a development guest.
+	("power-ups", "userspace.build"),
+	// IPMI, on development guests: the five system interfaces against QEMU's simulated BMCs, a pair, the harness BMC and
+	// its hostile modes, malformed records and an orderly reboot. Its subject is the transports, the driver, the BMC
+	// service and the tool - a userspace change selects it - and it boots guests.
+	("ipmi", "userspace.build"),
+	// The harness BMC's own encodings and framing, on the host.
+	("ipmi-harness", "harness.tools"),
+	// The BMC's administrative actions through the protected screen, cold: the tool, AdminService's path and the
+	// driver's executors - a userspace change selects it - and it boots development images through the keyboard.
+	("qemu-ipmi-admin", "userspace.build"),
 	// SMARTCARDSERVICE, against the in-guest smart-card fixture: reader-scoped grants, the PIV allowlist, the
 	// pinpad policy, transactions, removal and recovery, events and a restart, with the authentication
 	// signature verified by OpenSSL on the host. Its subject is the service, its pure leaves, the protocol,
@@ -861,12 +874,14 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 53] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 56] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
 	"bluetooth-service",
 	"power-service",
+	"power-ups",
+	"ipmi",
 	"smartcard-service",
 	"qemu-modem-service",
 	"qemu-camera-service",
@@ -883,6 +898,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 53] = [
 	"qemu-dfu-tool",
 	// And the TPM's, over swtpm.
 	"qemu-tpm-tool",
+	// And the BMC's administrative actions, one cold scenario a case.
+	"qemu-ipmi-admin",
 	// And the COM1 handoff's, on a development instance of its own.
 	"serial-handoff",
 	// And the hardware watchdog's, which boots four in turn.

@@ -410,6 +410,9 @@ static FIRMWARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 // THE `supervisor-liveness` END THIS SUPERVISOR ANSWERS ON, in the standing loop's wait set. Minted again at every
 // start of the watchdog service, the new end replacing the old one - see `supervisor_role`.
 static LIVENESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE `supervisor` STATUS END THE BMC SERVICE READS, in the standing loop's wait set: minted again at every start of the
+// BMC service, the new end replacing the old one, as the liveness channel is.
+static STATUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 // A development build's hook: `alive` goes unanswered, and nothing else changes - what the watchdog gate needs to see
 // the machine reset by the hardware rather than by anything this supervisor does.
 #[cfg(feature = "development")]
@@ -446,6 +449,22 @@ fn supervisor_role(service: &[u8], role: &Role) -> Option<(Vec<u8>, u64)> {
 		}
 		let copy: i64 = duplicate(kept, RIGHT_TRANSFER | RIGHT_DUPLICATE);
 		return (copy > 0).then(|| (Vec::from(role.tag), copy as u64));
+	}
+	// THE BMC SERVICE'S STATUS CHANNEL: the `supervisor` interface's `status`, served from the standing loop on the near
+	// end, which replaces the one a dead instance held the peer of.
+	if service == b"bmc_service" && role.tag == ROLE_STATUS {
+		let (near, far): (u64, u64) = channel()?;
+		let narrowed: i64 = duplicate(far, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		close(far);
+		if narrowed <= 0 {
+			close(near);
+			return None;
+		}
+		let old: u64 = STATUS.swap(near, core::sync::atomic::Ordering::Relaxed);
+		if old != 0 {
+			close(old);
+		}
+		return Some((Vec::from(role.tag), narrowed as u64));
 	}
 	if service != b"watchdog_service" {
 		return None;
@@ -1438,6 +1457,7 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_ADMIN_FACTORY,
 			CAP_ADMIN_AUDIT,
 			CAP_ADMIN_TEST,
+			CAP_BMC,
 		],
 		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
 		// over at bring-up went with the instance that ended.
@@ -1468,6 +1488,7 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_SPOOL => Some(b"spool_service"),
 		CAP_MEDIA_IMPORT => Some(b"media_import_service"),
 		CAP_ADMIN_FACTORY | CAP_ADMIN_AUDIT | CAP_ADMIN_TEST => Some(b"admin_service"),
+		CAP_BMC => Some(b"bmc_service"),
 		_ => None,
 	}
 }
@@ -1508,6 +1529,7 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_ADMIN_FACTORY => broker.kept.end_of(b"admin_service", b"FACTORY"),
 		CAP_ADMIN_AUDIT => broker.kept.end_of(b"admin_service", b"AUDIT"),
 		CAP_ADMIN_TEST => broker.kept.end_of(b"admin_service", b"TEST"),
+		CAP_BMC => broker.kept.end_of(b"bmc_service", b"SERVE"),
 		_ => 0,
 	};
 	let alive: bool = match service_of_cap(name).and_then(index_of) {
@@ -1751,7 +1773,7 @@ fn hand_acpi_admin(kept: &Kept, channels: &[u64; N]) {
 // the plan cannot carry - its liveness channel and the boot mode - are `supervisor_role`'s, and its timers are in the
 // hardware. The ACPI service's privilege is `supervisor_role`'s too, and what it published is the kernel's to keep.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its
@@ -1919,9 +1941,9 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 		loop {
 			// N services, the canary, the four supervisor channels plus the console's, and the watchdog service's
 			// liveness channel.
-			let mut handles: [u64; N + 7] = [0u64; N + 7];
-			let mut kinds: [u8; N + 7] = [0u8; N + 7];
-			let mut idxs: [usize; N + 7] = [0usize; N + 7];
+			let mut handles: [u64; N + 8] = [0u64; N + 8];
+			let mut kinds: [u8; N + 8] = [0u8; N + 8];
+			let mut idxs: [usize; N + 8] = [0usize; N + 8];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
@@ -1968,6 +1990,13 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 			if liveness != 0 {
 				handles[count] = liveness;
 				kinds[count] = 7;
+				count += 1;
+			}
+			// AND THE BMC SERVICE'S STATUS CHANNEL, loaded afresh each round for the same reason.
+			let status: u64 = STATUS.load(core::sync::atomic::Ordering::Relaxed);
+			if status != 0 {
+				handles[count] = status;
+				kinds[count] = 8;
 				count += 1;
 			}
 			if count == 0 {
@@ -2099,11 +2128,18 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 						admin3 = 0;
 					}
 				}
-				_ => {
+				7 => {
 					// The watchdog service asked whether this loop runs: answered at once. Its channel closing is the
 					// service ending - the end is dropped unless a relaunch already replaced it.
 					if !serve_liveness(liveness, buf) && LIVENESS.compare_exchange(liveness, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
 						close(liveness);
+					}
+				}
+				_ => {
+					// The BMC service asked for the status - whether the boot has settled. Its channel closing is that
+					// service ending, and the end is dropped unless a relaunch already replaced it.
+					if !serve_stats_once(status, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) && STATUS.compare_exchange(status, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+						close(status);
 					}
 				}
 			}
@@ -2157,10 +2193,19 @@ fn handle_admin(admin: u64, power: u64, notice_ticks: u64, broker: &mut Broker, 
 		}
 		return true;
 	}
-	if name == b"!poweroff" || name == b"!reboot" {
-		let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
+	// AND THE REBOOT WITHOUT ITS NOTICE: `!reboot-without-notice` is the orderly reboot with the shutdown notice left
+	// out, so a timer that survives the reset keeps what it was armed with - the BMC watchdog gate's case that can fail.
+	#[cfg(feature = "development")]
+	let without_notice = name == b"!reboot-without-notice";
+	#[cfg(not(feature = "development"))]
+	let without_notice = false;
+	if name == b"!poweroff" || name == b"!reboot" || without_notice {
+		let action: u64 = if name == b"!poweroff" { POWER_OFF } else { POWER_REBOOT };
 		let notice: proto::system::ShutdownAction = if action == POWER_REBOOT { proto::system::ShutdownAction::Reboot } else { proto::system::ShutdownAction::PowerOff };
-		shutdown_all(state, channels, sup, procs, log_client, notice, notice_ticks, buf);
+		if without_notice {
+			debug_write(b"service_manager: the shutdown notice is skipped (development hook)\n");
+		}
+		shutdown_all(state, channels, sup, procs, log_client, notice, if without_notice { None } else { Some(notice_ticks) }, buf);
 		// Say so before doing it. Powering off destroys the evidence of why: the machine
 		// stops, QEMU exits 0 with no reset and no fault, and from outside that is
 		// indistinguishable from a clean shutdown - which is how a suite came to end

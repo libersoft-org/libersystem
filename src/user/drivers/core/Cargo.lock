@@ -20,6 +20,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aml"
+version = "0.0.0"
+
+[[package]]
 name = "audio-proto"
 version = "0.0.0"
 dependencies = [
@@ -36,6 +40,14 @@ dependencies = [
 
 [[package]]
 name = "bluetooth-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "bmc-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
@@ -112,6 +124,7 @@ name = "drivers"
 version = "0.0.0"
 dependencies = [
  "acpi",
+ "aml",
  "bootproto",
  "display-device-proto",
  "driver-protocol",
@@ -119,6 +132,7 @@ dependencies = [
  "i2c-client",
  "i2c-device-proto",
  "ipc-client",
+ "ipmi",
  "power-model",
  "proto",
  "rt",
@@ -199,6 +213,13 @@ version = "0.0.0"
 dependencies = [
  "rt",
  "wire",
+]
+
+[[package]]
+name = "ipmi"
+version = "0.0.0"
+dependencies = [
+ "power-model",
 ]
 
 [[package]]
@@ -300,6 +321,7 @@ dependencies = [
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "bmc-proto",
  "camera-device-proto",
  "camera-proto",
  "config-proto",

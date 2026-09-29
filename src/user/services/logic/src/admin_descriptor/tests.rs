@@ -62,3 +62,32 @@ fn a_line_too_long_for_the_screen_continues_on_the_next_row_and_loses_nothing() 
 	assert_eq!(wrap(&lines, VALUE_COLUMN), None, "no room beside the indent");
 	assert_eq!(wrap(&idle_prompt(), 76), Some(idle_prompt()), "lines that fit are left alone");
 }
+
+// THE BMC'S TWO ACTIONS SAY WHAT THEY DO: the log's count, and each chassis stop by name with what a hard stop means
+// - and parameters the table cannot say are refused before anything reaches an executor.
+#[test]
+fn the_operation_table_says_what_a_bmc_action_does_and_refuses_what_it_cannot_say() {
+	assert_eq!(operation(Action::BmcSelClear, &[3, 0]), Ok(Some("erase all 3 records of the BMC's event log; an event that arrives first cancels it; the payload is the target's name".to_string())));
+	let reset = operation(Action::BmcChassisControl, &[3]).unwrap().unwrap();
+	assert!(reset.starts_with("HARD RESET - the machine stops at once: no service is stopped and nothing is flushed"));
+	assert!(operation(Action::BmcChassisControl, &[0]).unwrap().unwrap().starts_with("POWER DOWN"));
+	assert!(operation(Action::BmcChassisControl, &[2]).unwrap().unwrap().starts_with("POWER CYCLE"));
+	assert_eq!(operation(Action::BmcChassisControl, &[5]), Ok(Some("SOFT SHUTDOWN: the BMC presses the power button; the payload is the target's name".to_string())));
+	assert_eq!(operation(Action::BmcChassisControl, &[1]), Err(Refusal::Unrenderable), "power up is not an operation a person approves here");
+	assert_eq!(operation(Action::BmcChassisControl, &[4]), Err(Refusal::Unrenderable), "nor the diagnostic interrupt");
+	assert_eq!(operation(Action::BmcChassisControl, &[3, 0]), Err(Refusal::Unrenderable));
+	assert_eq!(operation(Action::BmcSelClear, &[3]), Err(Refusal::Unrenderable));
+	assert_eq!(operation(Action::ProbeWrite, &[0xab]), Ok(None), "an action without a row shows its bytes alone");
+	let asked = Asked { action: Action::BmcSelClear, target: "bmc:000102030405060708090a0b0c0d0e0f".to_string(), parameters: alloc::vec![3], payload_length: 36, label: String::new() };
+	assert_eq!(check_asked(&asked), Err(Refusal::Unrenderable));
+	assert_eq!(check_asked(&Asked { parameters: alloc::vec![3, 0], ..asked }), Ok(()));
+	// ON THE SCREEN, beside the action and above the executor - and absent for an action without a row.
+	let descriptor = Descriptor { version: VERSION, action: Action::BmcChassisControl, executor: "org.libersystem.admin-bmc-chassis".to_string(), executor_epoch: 1, target: "bmc:00".to_string(), target_generation: 1, parameters: alloc::vec![3], payload_length: 6, payload_digest: alloc::vec![0; 32] };
+	let lines = prompt(&descriptor, "bmc, launch 7", "");
+	let at = lines.iter().position(|line| line.starts_with("Operation:     HARD RESET")).expect("an Operation line");
+	assert_eq!(lines[at - 1], "Action:        bmc-chassis-control");
+	assert!(lines[at + 1].starts_with("Executor:"));
+	let probe = prompt(&Descriptor { action: Action::ProbeWrite, parameters: alloc::vec![0xab], ..descriptor }, "adminreq", "");
+	assert!(!probe.iter().any(|line| line.starts_with("Operation:")));
+	assert_eq!((Action::BmcSelClear.wire(), Action::BmcChassisControl.wire(), Action::BmcChassisControl.name()), (3, 4, "bmc-chassis-control"));
+}

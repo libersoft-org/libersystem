@@ -192,6 +192,13 @@ path = "user/libs/driver/hid-i2c"
 owner = "i2c-client"
 path = "user/libs/driver/i2c-client"
 
+# IPMI below the binding: the KCS, BT and SSIF system interfaces, the message layer over them, and the SDR, SEL, FRU,
+# identity, watchdog, chassis and LAN encodings. A SOURCE ROW AND NO LIBRARY ROW, like `hid-i2c`: the `ipmi` driver
+# links it statically, and it is proved on the host against scripted interface models.
+[[sources]]
+owner = "ipmi"
+path = "user/libs/driver/ipmi"
+
 # The entropy pool's policy - what a seed submission is credited and what the pool refuses below its
 # threshold. A kernel dependency that lives outside the kernel for the reason `driver-binding` does:
 # the kernel is not host-testable and these are decisions a test has to be able to watch refuse.
@@ -395,6 +402,14 @@ owner = "bluetooth-client-provider"
 path = "user/libs/clients/bluetooth-client-provider"
 
 [[sources]]
+owner = "bmc-client"
+path = "user/libs/clients/bmc-client"
+
+[[sources]]
+owner = "bmc-client-provider"
+path = "user/libs/clients/bmc-client-provider"
+
+[[sources]]
 owner = "tpm-client"
 path = "user/libs/clients/tpm-client"
 
@@ -449,6 +464,10 @@ path = "user/libs/protocol/smartcard-proto"
 [[sources]]
 owner = "tpm-proto"
 path = "user/libs/protocol/tpm-proto"
+
+[[sources]]
+owner = "bmc-proto"
+path = "user/libs/protocol/bmc-proto"
 
 [[sources]]
 owner = "modem-proto"
@@ -1378,6 +1397,42 @@ destination = "libexec/powerread.lsexe"
 providers = []
 development = true
 
+# THE ACPI GATE'S LIVE POWER CLIENT, development-only: it reads the fixture SSDT's battery, adapter and thermal
+# zone through PowerService with the read authority alone, while the gate changes what their methods answer.
+[[programs]]
+name = "acpipower"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/acpipower.lsexe"
+providers = []
+development = true
+
+# THE IPMI GATE'S PROBE, development-only: a BMC's thermal zones as a PowerService subscriber sees them, and the BMC
+# service's followed log.
+[[programs]]
+name = "bmccheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/bmccheck.lsexe"
+providers = []
+development = true
+
+# THE UPS GATE'S PROBE, development-only: a live client and the operator of the UPS a USB device the host
+# builds publishes through the xHCI driver - PowerService's read and control authorities.
+[[programs]]
+name = "upscheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/upscheck.lsexe"
+providers = []
+development = true
+
 # THE SMART-CARD GATE'S FOUR PROBES, development-only. `cardcheck` drives the scenario with a grant on
 # fixture reader A, the fixture's control endpoint and the supervisor's admin channel its restart phase
 # stops and starts the service through; `cardhold` is the second client a queue, an inherited endpoint and
@@ -1674,6 +1729,17 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/tpm.lsexe"
 providers = ["base-proto", "tpm-client", "volume-client", "storage-proto", "service-util", "lsrt"]
+
+# THE BMC TOOL: each BMC's identity, sensors, log, inventory, chassis and LAN configuration through the BMC service, and
+# the log's erasure and the chassis operations asked of AdminService - a person confirms each on the protected screen.
+[[programs]]
+name = "bmc"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/bmc.lsexe"
+providers = ["base-proto", "bmc-client", "admin-client", "lsrt"]
 
 # THE FIRMWARE-DOWNLOAD REQUESTER, the one shipping holder of an administrative request connection: PermissionManager
 # scopes it to firmware download on `dfu:` targets, and every request it makes waits for a person on the protected
@@ -2590,6 +2656,16 @@ destination = "libexec/tpm_service.lsexe"
 providers = []
 
 # STATIC, FOR THE REASON `smartcard_service` IS: its decisions are `service-logic`'s, which no staged library publishes.
+# STATIC, FOR THE REASON `smartcard_service` IS: it links nothing a staged library publishes that it could import whole.
+[[programs]]
+name = "bmc_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/bmc_service.lsexe"
+providers = []
+
 [[programs]]
 name = "watchdog_service"
 owner = "services"
@@ -3055,6 +3131,29 @@ provides = [
 ]
 heartbeat-deadline = 100
 
+# THE ACPI BATTERY, AC ADAPTER AND THERMAL ZONE: one binding per namespace node, its methods read over the node channel
+# the ACPI service serves and normalised by the power model, published as a `power-source` to PowerService alone. It
+# masters nothing and reaches no register: every value comes from the firmware's methods.
+[[programs]]
+name = "acpi_power"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_power.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "platform", hid = "PNP0C0A" },
+	{ transport = "platform", hid = "ACPI0003" },
+	{ transport = "platform", hid = "THERMALZONE" },
+]
+provides = [{ kind = "power-source", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
 # THE ACPI GATE'S FIXTURE DRIVER: bound to the fixture SSDT's `LSFX0001` node through the ACPI service's namespace, it
 # asks for its node channel and runs the gate's probes on every `Notify`. A shipping image has neither the program nor
 # the node.
@@ -3156,6 +3255,58 @@ match = [
 	{ transport = "plain-pci", pci-class = 0x06, pci-subclass = 0x01, pci-vendor = 0x8086, pci-product = 0x2918 },
 ]
 provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
+# THE ICH9 SMBUS HOST CONTROLLER: the `liber:i2c-device` contract on address-scoped connections, declaring the SMBus
+# block write, the block read with the device's count, and PEC - what an IPMI SSIF interface below it speaks. Keyed by
+# vendor and product under the SMBus class, because other SMBus hosts share the class and not the registers. It masters
+# nothing: its registers are its I/O BAR, and the kernel enables the host (HOSTC) for the claim.
+[[programs]]
+name = "smbus_ich9"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/smbus_ich9.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x0C, pci-subclass = 0x05, pci-interface = 0x00, pci-vendor = 0x8086, pci-product = 0x2930 },
+]
+provides = [{ kind = "i2c-bus", most = 1, consumers = 8 }]
+heartbeat-deadline = 100
+
+# ONE IPMI SYSTEM INTERFACE TO A BMC: KCS or BT on PCI by their class, KCS, BT or SSIF by the `IPI0001` namespace device
+# whose `_IFT` says which - SSIF a child of the SMBus controller its `I2cSerialBusV2` names. It publishes the `ipmi`
+# provider to the BMC service, the BMC's temperatures to PowerService, its watchdog (never from SSIF) to the watchdog
+# service, and two administrative executors - erasing the event log and the chassis control - to AdminService. It
+# masters nothing: every form polls its registers or its SMBus address.
+[[programs]]
+name = "ipmi"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/ipmi.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x0C, pci-subclass = 0x07, pci-interface = 0x01 },
+	{ transport = "plain-pci", pci-class = 0x0C, pci-subclass = 0x07, pci-interface = 0x02 },
+	{ transport = "platform", hid = "IPI0001" },
+]
+provides = [
+	{ kind = "ipmi", most = 1, consumers = 1 },
+	{ kind = "power-source", most = 1, consumers = 1 },
+	{ kind = "watchdog", most = 1, consumers = 1 },
+	{ kind = "admin-executor", most = 2, consumers = 1 },
+]
 heartbeat-deadline = 100
 
 [[programs]]
@@ -5152,6 +5303,45 @@ tag = "MODE"
 kind = "payload"
 provider = "service_manager"
 
+# THE BMCS THE SYSTEM'S IPMI INTERFACES REACH. It consumes every `ipmi` publication through a catalogue connection
+# minted for that kind alone, holds no claim and publishes nothing, and serves the `bmc` tool's reads on SERVE. It
+# writes the system's own events into each BMC's log: the boot's, once every row of ServiceManager's status with a
+# wanted state is running or stopped - read on STATUS, the `supervisor` channel ServiceManager fills and mints again
+# for a replacement - and an orderly shutdown's, on the notice. Neither the log's erasure nor the chassis is here:
+# those are the drivers' executors, which only AdminService reaches.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance reads every provider again from the catalogue's snapshot, and
+# writes no second boot event: its own row shows the restart.
+[[services]]
+name = "bmc_service"
+program = "bmc_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+notices = ["shutdown"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["ipmi"]
+presence = "optional"
+
+[[services.roles]]
+tag = "STATUS"
+kind = "client"
+provider = "service_manager"
+interface = "liber:observability@1/supervisor"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bmc@1/bmc"
+
 # THE FIRMWARE'S INTERPRETER. AML is firmware code and it can be wrong, so it runs here, where a defect costs a
 # restart: the `FirmwareInterpreter` privilege is ServiceManager's to hand on, at every start - `supervisor_role`
 # duplicates it from the copy the boot chain gave ServiceManager - and every authority the service has is minted by the
@@ -5723,6 +5913,13 @@ features = ["shared-image"]
 providers = ["bluetooth-proto"]
 
 [[libraries]]
+name = "bmc-client"
+owner = "bmc-client-provider"
+destination = "lib/clients/bmc-client.lslib"
+features = ["shared-image"]
+providers = ["bmc-proto"]
+
+[[libraries]]
 name = "tpm-client"
 owner = "tpm-client-provider"
 destination = "lib/clients/tpm-client.lslib"
@@ -5754,6 +5951,13 @@ providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 name = "bluetooth-proto"
 owner = "bluetooth-proto"
 destination = "lib/protocol/bluetooth-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "bmc-proto"
+owner = "bmc-proto"
+destination = "lib/protocol/bmc-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 

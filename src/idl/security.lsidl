@@ -155,6 +155,10 @@ enum capability {
 	/// SEALING TO A PCR AND UNSEALING, each sealed object bound to the component that sealed it. Denied by
 	/// default.
 	tpm-seal,
+	/// THE BMCS, READ: each baseboard management controller's identity, sensors, event log, FRU inventory, chassis status
+	/// and LAN configuration, and its identify light. It erases nothing and stops nothing - those are administrative
+	/// requests, which need `admin-request` and a person. Appended last, for the reason `midi-output` states.
+	bmc,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

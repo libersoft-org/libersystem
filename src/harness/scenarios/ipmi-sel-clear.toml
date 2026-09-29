@@ -1,0 +1,147 @@
+# THE BMC'S EVENT LOG ERASED THROUGH THE PROTECTED SCREEN, THROUGH THE EMULATED KEYBOARD - declined, then approved.
+#
+# `bmc sel clear` asks with the entry count it has just read; AdminService shows the frozen operation on the protected
+# screen and a key through QEMU's keyboard decides. One simulated BMC on ISA KCS, and every request made once this
+# boot's event is in its log - a record added after the preparation cancels the clear, which is the other scenario's
+# case. Declined, the log keeps its records; approved, nothing written before the clear is left in it.
+#
+# `check-ipmi-admin.sh` runs this with the simulated BMC in place and reads AdminService's journal lines and the
+# driver's; run bare, there is no BMC and the first wait fails.
+version = 1
+name = "ipmi sel clear"
+description = "A BMC's event log erased through the protected screen: a decline leaves every record, an approval leaves none."
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "key"
+text = "bmccheck booted"
+
+[[step]]
+do = "expect"
+contains = "bmccheck: the boot's event is in the log of bmc:"
+timeout = 200
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc sel"
+
+[[step]]
+do = "expect"
+contains = "this system's boot completed"
+
+[[step]]
+do = "prompt"
+
+# DECLINED: nothing is erased.
+[[step]]
+do = "key"
+text = "bmc sel clear &"
+
+[[step]]
+do = "expect"
+contains = " - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["esc"]
+
+[[step]]
+do = "expect"
+contains = "bmc: declined - nothing was done"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc sel"
+
+[[step]]
+do = "expect"
+contains = "this system's boot completed"
+
+[[step]]
+do = "prompt"
+
+# APPROVED: the log is erased under the preparation's reservation.
+[[step]]
+do = "key"
+text = "bmc sel clear &"
+
+[[step]]
+do = "expect"
+contains = " - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "bmc: confirmed - asking the BMC"
+
+[[step]]
+do = "expect"
+contains = "completed: the log is erased"
+timeout = 60
+unordered = true
+
+[[step]]
+do = "expect"
+contains = "bmc: completed"
+timeout = 60
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc sel"
+
+[[step]]
+do = "expect"
+contains = "0 entries"
+
+[[step]]
+do = "absent"
+contains = "this system's"
+until = "prompt"

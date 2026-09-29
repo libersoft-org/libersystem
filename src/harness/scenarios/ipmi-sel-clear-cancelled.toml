@@ -1,0 +1,110 @@
+# A BMC'S LOG ERASURE CANCELLED BY AN EVENT BETWEEN ITS PREPARATION AND ITS APPROVAL.
+#
+# The preparation reserved the log; a record the BMC adds afterwards cancels that reservation, as the specification
+# requires, and the clear the approval then sends is refused - so nothing is erased, the new record included. The BMC
+# is the harness's, behind `ipmi-bmc-extern`: once the protected screen is ready for a decision, `check-ipmi-admin.sh`
+# has it add a record, which this scenario sees arrive through `bmc sel --follow` before it approves.
+#
+# Run bare there is no BMC, and the first wait fails.
+version = 1
+name = "ipmi sel clear cancelled"
+description = "An event added between a clear's preparation and its approval cancels the reservation: the approved clear fails and erases nothing."
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "key"
+text = "bmccheck booted"
+
+[[step]]
+do = "expect"
+contains = "bmccheck: the boot's event is in the log of bmc:"
+timeout = 200
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc sel --follow &"
+
+[[step]]
+do = "expect"
+contains = "bmc: following "
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc sel clear &"
+
+[[step]]
+do = "expect"
+contains = " - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+# THE EVENT: the gate's host side adds it now, and the follow prints it.
+[[step]]
+do = "expect"
+contains = "generator 0x0020 sensor type 0x01 sensor 0x30"
+timeout = 60
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "bmc: confirmed - asking the BMC"
+
+[[step]]
+do = "expect"
+contains = "failed: the BMC refused it, and nothing was erased"
+timeout = 60
+unordered = true
+
+[[step]]
+do = "expect"
+contains = "bmc: failed - the BMC refused it, and nothing was done"
+timeout = 60
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc sel"
+
+[[step]]
+do = "expect"
+contains = "this system's boot completed"
+
+[[step]]
+do = "expect"
+contains = "generator 0x0020 sensor type 0x01 sensor 0x30"
+
+[[step]]
+do = "prompt"

@@ -46,6 +46,10 @@ const RESOURCED: &[(u8, u8, u8, u32, usize)] = &[
 	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_SATA, abi::PCI_PROG_IF_AHCI, abi::DEVICE_TYPE_AHCI, 5),
 	(abi::PCI_CLASS_BASE_PERIPHERAL, abi::PCI_SUBCLASS_SD_HOST, abi::PCI_PROG_IF_SD_HOST, abi::DEVICE_TYPE_SDHCI, 0),
 	(abi::PCI_CLASS_MULTIMEDIA, abi::PCI_SUBCLASS_AUDIO_DEVICE, abi::PCI_PROG_IF_HDA, abi::DEVICE_TYPE_HDA, 0),
+	// AN IPMI SYSTEM INTERFACE, KCS or BT: BAR 0 is its register file. Resolved when it is a memory BAR; an I/O BAR 0
+	// resolves no window here, and its function reaches the driver through its recorded port range instead.
+	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_IPMI, abi::PCI_PROG_IF_IPMI_KCS, abi::DEVICE_TYPE_IPMI_KCS, 0),
+	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_IPMI, abi::PCI_PROG_IF_IPMI_BT, abi::DEVICE_TYPE_IPMI_BT, 0),
 ];
 
 // PCI status register bit 4: a capability list is present (pointer at offset 0x34).

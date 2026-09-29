@@ -343,6 +343,10 @@ enum provider-kind {
 	/// `i6300esb`, `bmc`). The watchdog service alone consumes it, and pets it only while ServiceManager's
 	/// standing loop answers.
 	watchdog = 25,
+	/// A BASEBOARD MANAGEMENT CONTROLLER reached through one IPMI system interface - KCS, BT or SSIF - the
+	/// `liber:bmc@1` `ipmi-provider` contract, which the BMC service alone consumes. It carries no raw command:
+	/// the BMC's log is erased and its chassis controlled only through the driver's administrative executors.
+	ipmi = 26,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

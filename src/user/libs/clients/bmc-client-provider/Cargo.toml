@@ -1,0 +1,17 @@
+[package]
+name = "bmc-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem BMC channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["bmc-proto/shared-image"]
+
+[dependencies]
+bmc-proto = { path = "../../protocol/bmc-proto" }
+
+[lints.rust]
+warnings = "deny"

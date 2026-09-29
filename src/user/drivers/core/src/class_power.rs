@@ -145,7 +145,11 @@ impl Power {
 		if self.stream == 0 {
 			return false;
 		}
-		self.revision += 1;
+		// A SNAPSHOT AND ITS END DESCRIBE ONE REVISION - the one the source is at - and only a change advances it:
+		// PowerService refuses a snapshot whose end names another revision, and ends the provider for it.
+		if !matches!(kind, ProviderUpdateKind::Snapshot | ProviderUpdateKind::SnapshotEnd) {
+			self.revision += 1;
+		}
 		let update = ProviderUpdate { revision: self.revision, kind, source: state.map(|state| ProviderSource { local: LOCAL, state }), gone: None };
 		let mut frame = [0u8; 2048];
 		let mut handles = wire::Handles::new();

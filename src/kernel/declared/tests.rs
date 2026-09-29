@@ -138,6 +138,52 @@ fn through_the_lpc_bridge() {
 	assert_eq!(crate::arch::pci::config_read32(bus, dev, func, 0x04) & 0x3, command & 0x3, "and the release changed no decode bit either");
 }
 
+// THE ICH9 SMBUS FUNCTION'S HOSTC, WRITTEN BY THE CLAIM AND RESTORED BY THE RELEASE: seeded here with HST_EN clear and
+// I2C_EN set, so both bits have to move - and come back - for this to pass. With the host enabled the SMBus base, BAR
+// 4, decodes: its host status register reads as a register rather than as nothing.
+crate::tagged_test!(the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc, [Object, Kernel, Pci, Syscall, ArchX86_64], id = "kernel.declared.the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc", covers = ["kernel"]);
+#[cfg(target_arch = "x86_64")]
+fn the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc() {
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_: u64) {
+		through_the_smbus_host();
+		DONE.store(true, Ordering::SeqCst);
+	}
+	in_thread(body, &DONE);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn through_the_smbus_host() {
+	use super::{HOSTC, HOSTC_HST_EN, HOSTC_I2C_EN};
+	use crate::object::ObjectType;
+	use crate::object::handle::Handle;
+	use crate::object::port_range::PortRange;
+	use crate::object::rights::Rights;
+	let row = row_of(0x8086, 0x2930).expect("q35 carries an ICH9 SMBus function");
+	let (bus, dev, func) = device::with(row, |row| (row.bus, row.dev, row.func)).expect("the row");
+	let found = crate::arch::pci::config_read_exact(bus, dev, func, HOSTC, 1).expect("HOSTC reads");
+	let seeded = (found & !HOSTC_HST_EN) | HOSTC_I2C_EN;
+	assert!(crate::arch::pci::config_write_exact(bus, dev, func, HOSTC, 1, seeded), "HOSTC is seeded");
+	let grant = crate::tests::claim_device(row as u64).expect("the SMBus function is claimed under the smbus_ich9 entry");
+	let claimed = crate::arch::pci::config_read_exact(bus, dev, func, HOSTC, 1).expect("HOSTC reads");
+	assert_eq!(claimed & (HOSTC_HST_EN | HOSTC_I2C_EN), HOSTC_HST_EN, "the claim set HST_EN and cleared I2C_EN");
+	// THE BASE, minted from the claim, and decoding.
+	let base = invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_PORT_RANGE, 0);
+	assert!(base > 0, "the claim mints the SMBus base ({base})");
+	let (first, len) = {
+		let thread = sched::current_thread().expect("a current thread");
+		let object = thread.handles().lock().lookup_typed(Handle::from_raw(base as u64), ObjectType::PortRange, Rights::MAP).expect("a port-range handle");
+		object.into_any_arc().downcast::<PortRange>().ok().expect("a PortRange").span()
+	};
+	assert!(len >= 16, "BAR 4's span ({first:#x}, {len})");
+	// SAFETY: the claimed function's own SMBus base, which the kernel may read like any port.
+	let aux_ctl = unsafe { crate::arch::port::inb(first + 0x0D) };
+	assert_ne!(aux_ctl, 0xFF, "the host's auxiliary control reads as a register - the base decodes");
+	crate::tests::release_device(&grant);
+	assert_eq!(crate::arch::pci::config_read_exact(bus, dev, func, HOSTC, 1), Some(seeded), "the release wrote back what the claim found");
+	assert!(crate::arch::pci::config_write_exact(bus, dev, func, HOSTC, 1, found), "and HOSTC is left as the boot had it");
+}
+
 // THE CHIPSET BASE GCS IS FOUND AT, against fixture values of the LPC bridge's RCBA register (0xF0): enabled, it is
 // the base; disabled - bit 0 clear - or zero, GCS is not declared at all.
 crate::tagged_test!(a_chipset_register_is_declared_only_at_an_enabled_base, [Kernel, Pci], id = "kernel.declared.a_chipset_register_is_declared_only_at_an_enabled_base", covers = ["kernel"]);

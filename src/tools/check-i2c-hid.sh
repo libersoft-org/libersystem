@@ -115,25 +115,40 @@ host_side() {
 	sleep 1
 	reports
 	wait_for "hidcheck: the controller is disabled - move the tablet now" || return 0
-	# THE MACHINE'S OWN TABLET, through the monitor the runner gives every x86_64 guest: moved across the screen for a few
-	# seconds. Any failure is written down rather than ending this helper.
-	python3 - "$root/../.build/boot/qemu-monitor.sock" >>"$backend_dir/host.log" 2>&1 <<'EOF' || echo "the monitor could not be driven" >>"$backend_dir/host.log"
+	# THE MACHINE'S OWN TABLET, moved across the screen for a few seconds through QMP's `input-send-event`, as
+	# ABSOLUTE positions: the monitor's `mouse_move` queues relative motion, which QEMU hands to the one relative
+	# device - the PS/2 mouse nothing here drives - and never to a tablet. Any failure is written down rather than
+	# ending this helper.
+	python3 - "$root/../.build/boot/qemu-qmp.sock" >>"$backend_dir/host.log" 2>&1 <<'EOF' || echo "QMP could not be driven" >>"$backend_dir/host.log"
+import json
 import socket
 import sys
 import time
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.connect(sys.argv[1])
-client.settimeout(1)
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+f = s.makefile('rw')
+
+
+def answer():
+	while True:
+		line = json.loads(f.readline())
+		if 'event' not in line:
+			return line
+
+
+def command(execute, arguments=None):
+	f.write(json.dumps({'execute': execute, 'arguments': arguments or {}}) + '\n')
+	f.flush()
+	return answer()
+
+
+answer()
+command('qmp_capabilities')
 for step in range(12):
 	position = 2000 + step * 2500
-	client.sendall(f'mouse_move {position} {position}\n'.encode())
+	command('input-send-event', {'events': [{'type': 'abs', 'data': {'axis': 'x', 'value': position}}, {'type': 'abs', 'data': {'axis': 'y', 'value': position}}]})
 	time.sleep(0.3)
-	try:
-		client.recv(4096)
-	except OSError:
-		pass
 print('moved the tablet twelve times')
-client.close()
 EOF
 	wait_for "hidcheck: raise the reports again now" || return 0
 	reports
@@ -182,8 +197,9 @@ expect "driver\.i2c-hid: [^ ]*$touchpad: publishes pointer" "a touchpad's mouse 
 expect "driver\.i2c-hid: [^ ]*$touchscreen: publishes touch" "a touchscreen's collection publishes touch"
 refuse "driver\.i2c-hid: [^ ]*$touchpad: publishes touch" "a touchpad publishes no touch - its touch pad collection is silent without a mode switch"
 refuse "driver\.i2c-hid: [^ ]*$touchscreen: publishes pointer" "a touchscreen publishes no pointer"
-expect "InputService: a touch provider is attached \(1 attached\)" "InputService must attach the touchscreen"
-expect "InputService: a pointer provider is attached \(2 attached\)" "InputService must attach the touchpad beside the tablet"
+expect "InputService: a touch provider is attached - platform device [0-9]+, .* \(1 attached\)" "InputService must attach the touchscreen"
+expect "InputService: a pointer provider is attached - platform device [0-9]+, " "InputService must attach the touchpad"
+expect "InputService: a pointer provider is attached - .* \(2 attached\)" "and hold it beside the tablet"
 
 # THE PHASES.
 expect "hidcheck: PASS watch" "the moves and the click must arrive as pointer events and the contacts as contacts"
@@ -192,8 +208,8 @@ resets="$(grep -acF 'is asserted with no report behind it - resetting the device
 ((resets >= 2)) || fail "both drivers must reset their device once when the line is held with nothing behind it (saw $resets)"
 expect "DeviceManager: i2c-hid is connected through a controller whose binding ended; stopping it" "the HID bindings must stop as lost dependencies"
 expect "hidcheck: both HID bindings stopped as lost dependencies" "both HID bindings must be waiting on their controller"
-expect "InputService: a pointer provider is detached \(1 attached\)" "the touchpad's pointer must be detached while the tablet's stays"
-expect "InputService: a touch provider is detached \(0 attached\)" "the touchscreen's surface must be detached"
+expect "InputService: a pointer provider is detached - platform device [0-9]+, .* \(1 attached\)" "the touchpad's pointer must be detached while the tablet's stays"
+expect "InputService: a touch provider is detached - platform device [0-9]+, .* \(0 attached\)" "the touchscreen's surface must be detached"
 expect "hidcheck: the tablet still moves the cursor" "the tablet must keep moving the cursor"
 expect "hidcheck: PASS cycle" "both bindings must bind again and deliver"
 expect "driver\.i2c-hid: [^ ]*$touchscreen: its HID descriptor at register 0x1 is refused" "a malformed descriptor must be refused by name"

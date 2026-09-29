@@ -1,0 +1,61 @@
+# A POWER DOWN THROUGH THE BMC, confirmed on the protected screen: the machine stops at once, nothing flushed.
+#
+# The oracle is durable: the run holds `-no-shutdown`, so the machine that stopped stays in QEMU's run state
+# `shutdown`, read with `query-status`. `check-ipmi-admin.sh` also finds no power-button line - the BMC cut the power;
+# nobody pressed the button. One simulated BMC on ISA KCS. Run bare there is no BMC, and the first wait fails.
+version = 1
+name = "ipmi power down"
+description = "A BMC power down, confirmed on the protected screen, stops the machine at once."
+ends = "powered-off"
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "key"
+text = "bmccheck booted"
+
+[[step]]
+do = "expect"
+contains = "bmccheck: the boot's event is in the log of bmc:"
+timeout = 200
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "bmc chassis power-down &"
+
+[[step]]
+do = "expect"
+contains = " - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+# THE EXECUTOR REACHED: what the driver says next may never leave the machine it stops, so the oracle follows.
+[[step]]
+do = "expect"
+contains = "AdminService: request 1 consumed"
+timeout = 60
+
+[[step]]
+do = "run-state"
+state = "shutdown"
+timeout = 60

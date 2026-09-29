@@ -1,6 +1,6 @@
 package liber:admin@1
 resource admin-payload
-enum admin-action(firmware-download=1,probe-write=2)
+enum admin-action(firmware-download=1,probe-write=2,bmc-sel-clear=3,bmc-chassis-control=4)
 record admin-descriptor(version:u32,action:admin-action,executor:string:bound=64,executor-epoch:u64,target:string:bound=64,target-generation:u64,parameters:list<u8>:bound=256,payload-length:u32,payload-digest:list<u8>:bound=32)
 record admin-request-args(action:admin-action,target:string:bound=64,parameters:list<u8>:bound=256,payload-length:u32,label:string:bound=128)
 record admin-grant(grant:handle<channel>,descriptor:admin-descriptor)

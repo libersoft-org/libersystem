@@ -14,7 +14,7 @@ pub mod pci;
 pub mod percpu;
 mod pit;
 pub mod platform;
-mod port;
+pub(crate) mod port;
 pub mod random;
 pub mod rtc;
 // ACPI fixed-hardware event delivery: the SCI, the PM1 event block and what arrives on them.

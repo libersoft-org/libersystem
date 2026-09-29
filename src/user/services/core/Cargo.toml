@@ -93,6 +93,10 @@ name = "tpm_service"
 path = "src/tpm_service.rs"
 
 [[bin]]
+name = "bmc_service"
+path = "src/bmc_service.rs"
+
+[[bin]]
 name = "watchdog_service"
 path = "src/watchdog_service.rs"
 
@@ -176,6 +180,27 @@ required-features = ["development"]
 # The power gate's ordinary read client, which holds the read authority and nothing else.
 name = "powerread"
 path = "src/powerread.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE IPMI GATE'S LIVE CLIENTS, absent from a shipped image: a BMC's thermal zones through PowerService, and its log
+# through the BMC service's follow.
+name = "bmccheck"
+path = "src/bmccheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE ACPI GATE'S LIVE POWER CLIENT, absent from a shipped image: it reads what the ACPI battery, adapter and
+# thermal zone driver publishes from the fixture SSDT, with the read authority alone.
+name = "acpipower"
+path = "src/acpipower.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE UPS GATE'S LIVE CLIENT AND OPERATOR, absent from a shipped image: it reads and drives the UPS a USB device
+# the host builds publishes through the xHCI driver, with PowerService's read and control authorities.
+name = "upscheck"
+path = "src/upscheck.rs"
 required-features = ["development"]
 
 [[bin]]

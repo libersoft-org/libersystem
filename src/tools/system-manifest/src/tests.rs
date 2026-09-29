@@ -604,6 +604,10 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			"acpi_fixture" => DmaPolicy::None,
 			// HID OVER I2C: a child binding, whose every byte crosses its controller's scoped connection.
 			"i2c_hid" => DmaPolicy::None,
+			// THE ACPI POWER SOURCES: every value is a method's result on the node channel.
+			"acpi_power" => DmaPolicy::None,
+			// THE ICH9 SMBUS HOST AND THE IPMI INTERFACES: registers and an SMBus address, polled.
+			"smbus_ich9" | "ipmi" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");
