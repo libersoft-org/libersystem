@@ -837,6 +837,7 @@ dependencies = [
  "storage-proto",
  "time-proto",
  "tpm-proto",
+ "typec-proto",
  "wire",
 ]
 
@@ -1230,6 +1231,8 @@ dependencies = [
  "time-client-provider",
  "tpm-client",
  "tpm-client-provider",
+ "typec-client",
+ "typec-client-provider",
  "unicode-bidi",
  "volume-client",
  "volume-client-provider",
@@ -1260,6 +1263,30 @@ dependencies = [
  "base-proto",
  "ipc-client",
  "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "typec-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "typec-proto",
+]
+
+[[package]]
+name = "typec-client-provider"
+version = "0.0.0"
+dependencies = [
+ "typec-proto",
+]
+
+[[package]]
+name = "typec-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 

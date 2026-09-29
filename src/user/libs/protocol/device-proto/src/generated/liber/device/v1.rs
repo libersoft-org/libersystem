@@ -1469,6 +1469,10 @@ pub enum ProviderKind {
 	/// `liber:bmc@1` `ipmi-provider` contract, which the BMC service alone consumes. It carries no raw command:
 	/// the BMC's log is erased and its chassis controlled only through the driver's administrative executors.
 	Ipmi = 26,
+	/// A USB TYPE-C CONNECTOR, every connector of one `ucsi-acpi` or `tcpci` binding: the `liber:typec@1`
+	/// `typec-provider` contract - its partner, roles, contract, offers, cable and modes, and the operator's four
+	/// requests - which TypeCService alone consumes. A connector that can sink is ALSO a `power-source`.
+	TypecConnector = 27,
 }
 
 impl ProviderKind {
@@ -1537,6 +1541,7 @@ impl ProviderKind {
 			24 => Some(ProviderKind::Tpm),
 			25 => Some(ProviderKind::Watchdog),
 			26 => Some(ProviderKind::Ipmi),
+			27 => Some(ProviderKind::TypecConnector),
 			_ => None,
 		}
 	}
@@ -7171,6 +7176,7 @@ impl ProviderKind {
 			ProviderKind::Tpm => out.push_str("\"tpm\""),
 			ProviderKind::Watchdog => out.push_str("\"watchdog\""),
 			ProviderKind::Ipmi => out.push_str("\"ipmi\""),
+			ProviderKind::TypecConnector => out.push_str("\"typec-connector\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -7201,6 +7207,7 @@ impl ProviderKind {
 			ProviderKind::Tpm => out.push_str("tpm"),
 			ProviderKind::Watchdog => out.push_str("watchdog"),
 			ProviderKind::Ipmi => out.push_str("ipmi"),
+			ProviderKind::TypecConnector => out.push_str("typec-connector"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -7231,6 +7238,7 @@ impl ProviderKind {
 			ProviderKind::Tpm => crate::codec::cbor::text(out, "tpm"),
 			ProviderKind::Watchdog => crate::codec::cbor::text(out, "watchdog"),
 			ProviderKind::Ipmi => crate::codec::cbor::text(out, "ipmi"),
+			ProviderKind::TypecConnector => crate::codec::cbor::text(out, "typec-connector"),
 		}
 	}
 }

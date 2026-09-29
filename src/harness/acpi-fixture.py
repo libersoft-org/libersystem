@@ -9,8 +9,9 @@
 #   becoming the service's. A device an owner adds keeps its `_CRS` range OUTSIDE those pages and declares its own
 #   region over that range: `LSFX0001`'s is at 0x4000.
 #   THE NOTIFICATIONS. `_AEI` on the `vhost-user-gpio-pci` function's line 2 (the backend's `acpi-aei` line), through
-#   the GPIO controller's companion node `\_SB.PCI0.SB0`, whose `_E02` notifies `LSFX0001` with 0x80; and on its line 3,
-#   whose `_E03` notifies the battery, the adapter and the thermal zone with 0x80 - the power classes' status change.
+#   the GPIO controller's companion node `\_SB.PCI0.SB0`, whose `_E02` notifies `LSFX0001` with 0x80; on its line 3,
+#   whose `_E03` notifies the battery, the adapter and the thermal zone with 0x80 - the power classes' status change;
+#   and on its line 4, whose `_E04` is the UCSI PPM's notification (below).
 #   THE FIELDS. A `GeneralPurposeIo` field over line 5, for input reads only, and a `GenericSerialBus` field over the
 #   bus fixture's register device at 0x50 on the `vhost-user-i2c-pci` function's companion `\_SB.PCI0.SA8`.
 #
@@ -29,18 +30,31 @@
 #   ACPI0003 (`\_SB.ADP0`) - an AC adapter: `_PSR` from the pages.
 #   THERMALZONE (`\_TZ.TZ00`) - `_TMP` from the pages; `_CRT` 368.2 K, `_HOT` 363.2 K, `_PSV` 353.2 K, `_AC0` 343.2 K.
 #
+# THE UCSI DEVICE (`\_SB.UCSI`, `USBC000` with `_CID` `PNP0CA0`), present only when the memory was written with
+# `--ucsi-version` - the Type-C gate's, with `ucsi-ppm.py` as the platform's policy manager behind its `_DSM`, its
+# staging areas and line 4. Its mailbox layout follows the version the table is written for.
+#
 # THE HARNESS'S PAGES: 0x00 the dword `RDVL` answers, 0x10 and 0x11 the `_STA` bytes of `_UID` 0 and 1; the battery's
 # `_STA` byte at 0x20 and its `_BST` dwords from 0x24 (state, rate, remaining, voltage); the adapter's `_PSR` byte at
-# 0x34; the zone's `_TMP` dword at 0x38, in tenths of a kelvin.
+# 0x34; the zone's `_TMP` dword at 0x38, in tenths of a kelvin; from 0x1000 the UCSI device's presence byte, its three
+# counters (doorbell, function 2, notifications), the outbound CONTROL, the inbound VERSION and CCI, and the two
+# 256-byte message staging areas at 0x1100 and 0x1200.
 #
 # THE HID-OVER-I2C GATE'S SSDT (`--hid-out`), a table of its own: below the I2C controller's companion node, the
 # backend's two HID models as laptops describe theirs - a vendor `_HID` with `_CID` `PNP0C50`, the `I2cSerialBusV2`
 # address, a `GpioInt` (level, active low) naming the model's line on the GPIO controller's node, and a `_DSM` answering
 # the HID descriptor register.
 #
-#   acpi-fixture.py --out FILE         write the SSDT
+# THE TCPCI GATE'S SSDT (`--tcpc-out`), a table of its own: below the same companion node, the backend's port controller
+# (`vhost-i2c-gpio.py --tcpc`) as a `PRP0001` device whose `_DSD` names `compatible` `tcpci` - the `I2cSerialBusV2`
+# address, the alert's `GpioInt` (level, active low) - and the connector as the hierarchical data node `connector`:
+# `usb-c-connector`, a sink, Fixed 5 V at 3 A and 15 V at 2 A, operating at 15 W.
+#
+#   acpi-fixture.py --out FILE [--ucsi-version V]      write the SSDT, the UCSI mailbox laid out for V (default 2.1)
 #   acpi-fixture.py --hid-out FILE     write the HID-over-I2C SSDT
-#   acpi-fixture.py --memory FILE      create the ivshmem backing file (1 MiB) with both devices present
+#   acpi-fixture.py --tcpc-out FILE    write the TCPCI SSDT
+#   acpi-fixture.py --memory FILE [--ucsi-version V]   create the ivshmem backing file (1 MiB) with both devices
+#                                                    present - and the UCSI device, with VERSION V, when V is given
 #   acpi-fixture.py --poke FILE OFFSET BYTES-HEX   write bytes into the backing file
 #   acpi-fixture.py --set FILE NAME=VALUE...       write the power classes' named values (`POWER_FIELDS`)
 #   acpi-fixture.py --power-storm FILE CONTROL     raise the power line many times through the GPIO backend's control
@@ -61,6 +75,7 @@ I2C_SLOT = 0x15
 GPIO_SLOT = 0x16
 AEI_LINE = 2
 POWER_LINE = 3
+UCSI_LINE = 4
 FIELD_LINE = 5
 I2C_ADDRESS = 0x50
 I2C_REGISTER = 0x10
@@ -94,8 +109,34 @@ STORM_SECONDS = 30
 STORM_FINAL = 3300
 DSM_UUID = '5c3c6b2e-8d7a-4f5b-9a41-2e1d7f0a6b93'
 
+# THE UCSI DEVICE (`\_SB.UCSI`), absent until the harness's `UCPR` byte says a PPM is there: `_HID` `USBC000` and `_CID`
+# `PNP0CA0`, as shipping laptops name it, its mailbox `_CRS` range at UCSI_RANGE past the harness's pages and its own
+# region over it. Its `_DSM` behaves as firmware does: function 1 copies CONTROL and MESSAGE_OUT into the OUTBOUND
+# staging area and rings the doorbell (`ODBL`); function 2 copies the INBOUND staging area into VERSION, CCI and
+# MESSAGE_IN and counts itself (`LOG2`); line UCSI_LINE's `_E04` makes the same copy, counts the notification (`NCNT`)
+# and runs `Notify(0x80)`. The staging areas and the counters are in the harness's pages, which the ivshmem function's
+# companion declares - no other node's region covers the claimed range. `ucsi-ppm.py` is the PPM behind them.
+UCSI_UUID = '6f8398c2-7ca4-11e4-ad36-631042b5008f'
+UCSI_RANGE = 0x6000
+UCSI_PRESENT = 0x1000
+UCSI_DOORBELL = 0x1004
+UCSI_REFRESHES = 0x1008
+UCSI_NOTIFIES = 0x100C
+UCSI_CONTROL = 0x1010
+UCSI_VERSION = 0x1018
+UCSI_CCI = 0x101C
+UCSI_MESSAGE_OUT = 0x1100
+UCSI_MESSAGE_IN = 0x1200
 
-def ssdt_body():
+
+def ucsi_mailbox_units(version):
+	"""VERSION, CCI, CONTROL, MESSAGE_IN and MESSAGE_OUT as the version lays them out: 16-byte messages before 2.0,
+	256-byte ones from it."""
+	message = 128 if version < 0x0200 else 2048
+	return [E.unit('VER_', 16), E.offset_to(16), E.unit('CCI_', 32), E.unit('CTRL', 64), E.unit('MSGI', message), E.unit('MSGO', message)]
+
+
+def ssdt_body(ucsi_version=0x0210):
 	# THE NODES QEMU'S DSDT ALREADY HAS for the three functions - `S` and the slot times eight - opened with `Scope`: a
 	# second node with the same `_ADR` would be a second companion of one function.
 	ivsh = f'\\_SB.PCI0.S{IVSHMEM_SLOT << 3:02X}'
@@ -115,10 +156,18 @@ def ssdt_body():
 				E.unit('BSTS', 32), E.unit('BRAT', 32), E.unit('BREM', 32), E.unit('BVOL', 32),
 				E.unit('APSR', 8), E.offset_to((ZONE_TMP - AC_PSR - 1) * 8), E.unit('TTMP', 32),
 			], access='AnyAcc'),
+			# THE UCSI STAGING AREAS AND COUNTERS.
+			E.field('HPGS', [
+				E.offset_to(UCSI_PRESENT * 8), E.unit('UCPR', 8), E.offset_to((UCSI_DOORBELL - UCSI_PRESENT - 1) * 8),
+				E.unit('ODBL', 32), E.unit('LOG2', 32), E.unit('NCNT', 32), E.unit('OCTL', 64), E.unit('IVER', 16), E.offset_to(16), E.unit('ICCI', 32),
+				E.offset_to((UCSI_MESSAGE_OUT - UCSI_CCI - 4) * 8), E.unit('OMSG', 2048), E.unit('IMSG', 2048),
+			], access='AnyAcc'),
 		]),
 		E.scope(gpio, [
-			E.name('_AEI', E.buffer(E.resource_template(E.gpio_int([AEI_LINE], gpio, edge=True), E.gpio_int([POWER_LINE], gpio, edge=True)))),
+			E.name('_AEI', E.buffer(E.resource_template(E.gpio_int([AEI_LINE], gpio, edge=True), E.gpio_int([POWER_LINE], gpio, edge=True), E.gpio_int([UCSI_LINE], gpio, edge=True)))),
 			E.method(f'_E{AEI_LINE:02X}', 0, [E.notify('\\_SB.LSF1', 0x80)]),
+			# THE PPM'S NOTIFICATION, as a laptop's notification method makes it: the copy, then `Notify`.
+			E.method(f'_E{UCSI_LINE:02X}', 0, [E.call('\\_SB.UCSI.COPY'), E.increment(ivsh + '.NCNT'), E.notify('\\_SB.UCSI', 0x80)]),
 			E.method(f'_E{POWER_LINE:02X}', 0, [E.notify('\\_SB.BAT0', 0x80), E.notify('\\_SB.ADP0', 0x80), E.notify('\\_TZ.TZ00', 0x80)]),
 		]),
 		E.scope('\\_SB', [
@@ -175,6 +224,26 @@ def ssdt_body():
 					E.ret('PBST'),
 				], serialized=True),
 			]),
+			E.device('UCSI', [
+				E.name('_HID', E.string('USBC000')),
+				E.name('_CID', E.eisaid('PNP0CA0')),
+				E.name('_UID', 0),
+				E.method('_STA', 0, [E.if_(ivsh + '.UCPR', [E.ret(0x0F)]), E.ret(0)]),
+				E.method('_CRS', 0, [
+					E.name('RBUF', E.buffer(E.resource_template(E.memory32_fixed(0, 0x1000)))),
+					E.create_dword_field('RBUF', 4, 'MBAS'),
+					E.store(E.add(E.call(ivsh + '.BASE'), UCSI_RANGE), 'MBAS'),
+					E.ret('RBUF'),
+				], serialized=True),
+				# ITS OWN REGION OVER ITS OWN MAILBOX, which the claim shares with its driver.
+				E.operation_region('MBOX', 'SystemMemory', E.add(E.call(ivsh + '.BASE'), UCSI_RANGE), 0x1000),
+				E.field('MBOX', ucsi_mailbox_units(ucsi_version), access='AnyAcc'),
+				E.method('COPY', 0, [E.store(ivsh + '.IVER', 'VER_'), E.store(ivsh + '.ICCI', 'CCI_'), E.store(ivsh + '.IMSG', 'MSGI')], serialized=True),
+				E.dsm(UCSI_UUID, {
+					1: [E.store('CTRL', ivsh + '.OCTL'), E.store('MSGO', ivsh + '.OMSG'), E.increment(ivsh + '.ODBL'), E.ret(0)],
+					2: [E.call('COPY'), E.increment(ivsh + '.LOG2'), E.ret(0)],
+				}),
+			]),
 			E.device('ADP0', [
 				E.name('_HID', E.string('ACPI0003')),
 				E.method('_PSR', 0, [E.ret(ivsh + '.APSR')]),
@@ -192,8 +261,8 @@ def ssdt_body():
 	]
 
 
-def ssdt():
-	return E.table('SSDT', ssdt_body(), oem_table_id=b'LIBACPIF')
+def ssdt(ucsi_version=0x0210):
+	return E.table('SSDT', ssdt_body(ucsi_version), oem_table_id=b'LIBACPIF')
 
 
 HID_OVER_I2C = '3cdff6f7-4267-4555-ad05-b30a3d8938de'
@@ -221,8 +290,37 @@ def hid_ssdt():
 	return E.table('SSDT', hid_body(), oem_table_id=b'LIBHIDF ')
 
 
-def create_memory(path):
+# The backend's port controller (`vhost-i2c-gpio.py --tcpc`): its address and its alert line.
+TCPC_ADDRESS = 0x52
+TCPC_LINE = 5
+# THE BOARD: Fixed 5 V at 3 A and 15 V at 2 A - less at 15 V than the gate's charger offers - operating at 15 W.
+TCPC_SINK_PDOS = [(5000 // 50) << 10 | 3000 // 10, (15000 // 50) << 10 | 2000 // 10]
+TCPC_OPERATING_MICROWATTS = 15_000_000
+
+
+def tcpc_body():
+	i2cb = f'\\_SB.PCI0.S{I2C_SLOT << 3:02X}'
+	gpio = f'\\_SB.PCI0.S{GPIO_SLOT << 3:02X}'
+	return [E.scope(i2cb, [E.device('TCPC', [
+		E.name('_HID', E.string('PRP0001')),
+		E.name('_UID', 0),
+		E.method('_STA', 0, [E.ret(0x0F)]),
+		E.name('_CRS', E.buffer(E.resource_template(E.i2c_serial_bus_v2(TCPC_ADDRESS, i2cb, speed=400000), E.gpio_int([TCPC_LINE], gpio, edge=False, active_low=True)))),
+		E.name('_DSD', E.dsd({'compatible': E.string('tcpci')}, [('connector', 'CON0')])),
+		E.name('CON0', E.data_node({'compatible': E.string('usb-c-connector'), 'power-role': E.string('sink'), 'sink-pdos': E.package(*TCPC_SINK_PDOS), 'op-sink-microwatt': TCPC_OPERATING_MICROWATTS})),
+	])])]
+
+
+def tcpc_ssdt():
+	return E.table('SSDT', tcpc_body(), oem_table_id=b'LIBTCPC ')
+
+
+def create_memory(path, ucsi_version=None):
 	data = bytearray(MEMORY_SIZE)
+	# A PPM THERE, when the harness runs one: the device present, and the VERSION function 2 copies at bind.
+	if ucsi_version is not None:
+		data[UCSI_PRESENT] = 1
+		struct.pack_into('<H', data, UCSI_VERSION, ucsi_version)
 	for offset in PRESENT_OFFSETS:
 		data[offset] = 1
 	data[BATTERY_STA] = BATTERY_FIRST[0]
@@ -298,7 +396,7 @@ def self_test():
 		failures.append('the checksum')
 	if struct.unpack('<I', table[4:8])[0] != len(table):
 		failures.append('the length')
-	for needle in (b'LSFX0001', b'LSFX0002', b'LSFX0003', b'_AEI', b'_E02', b'_E03', b'SA0_', b'GSB0', b'ACPI0003', b'BAT0', b'_BIX', b'_BST', b'TZ00', b'_TZ_'):
+	for needle in (b'LSFX0001', b'LSFX0002', b'LSFX0003', b'_AEI', b'_E02', b'_E03', b'_E04', b'SA0_', b'GSB0', b'ACPI0003', b'BAT0', b'_BIX', b'_BST', b'TZ00', b'_TZ_', b'USBC000', b'UCSI', b'MBOX', b'ODBL', b'LOG2'):
 		if needle not in table:
 			failures.append(f'{needle!r} is missing')
 	hid = hid_ssdt()
@@ -307,6 +405,12 @@ def self_test():
 	for needle in (b'LSFX0C50', b'LSFX0C51', b'PNP0C50', b'SA8_', b'_DSM', E.i2c_serial_bus_v2(0x2C, f'\\_SB.PCI0.S{I2C_SLOT << 3:02X}', speed=400000), E.gpio_int([1], f'\\_SB.PCI0.S{GPIO_SLOT << 3:02X}', edge=False, active_low=True)):
 		if needle not in hid:
 			failures.append(f'the HID table lacks {needle!r}')
+	tcpc = tcpc_ssdt()
+	if sum(tcpc) & 0xFF or struct.unpack('<I', tcpc[4:8])[0] != len(tcpc):
+		failures.append('the TCPCI table\'s checksum or length')
+	for needle in (b'PRP0001', b'TCPC', b'CON0', b'tcpci', b'usb-c-connector', b'sink-pdos', b'op-sink-microwatt', E.i2c_serial_bus_v2(TCPC_ADDRESS, f'\\_SB.PCI0.S{I2C_SLOT << 3:02X}', speed=400000), E.gpio_int([TCPC_LINE], f'\\_SB.PCI0.S{GPIO_SLOT << 3:02X}', edge=False, active_low=True)):
+		if needle not in tcpc:
+			failures.append(f'the TCPCI table lacks {needle!r}')
 	if failures:
 		for failure in failures:
 			print(f'acpi-fixture: {failure}', file=sys.stderr)
@@ -319,22 +423,27 @@ def main():
 	parser = argparse.ArgumentParser(description='the ACPI gate fixture SSDT')
 	parser.add_argument('--out')
 	parser.add_argument('--hid-out')
+	parser.add_argument('--tcpc-out')
 	parser.add_argument('--memory')
 	parser.add_argument('--poke', nargs=3, metavar=('FILE', 'OFFSET', 'HEX'))
 	parser.add_argument('--set', nargs='+', metavar='FILE NAME=VALUE')
 	parser.add_argument('--power-storm', nargs=2, metavar=('FILE', 'CONTROL'))
+	parser.add_argument('--ucsi-version', type=lambda text: int(text, 0), help='a UCSI PPM is present, with this VERSION (0x0120, 0x0210)')
 	parser.add_argument('--self-test', action='store_true')
 	args = parser.parse_args()
 	if args.self_test:
 		return self_test()
 	if args.out:
 		with open(args.out, 'wb') as out:
-			out.write(ssdt())
+			out.write(ssdt(args.ucsi_version or 0x0210))
 	if args.hid_out:
 		with open(args.hid_out, 'wb') as out:
 			out.write(hid_ssdt())
+	if args.tcpc_out:
+		with open(args.tcpc_out, 'wb') as out:
+			out.write(tcpc_ssdt())
 	if args.memory:
-		create_memory(args.memory)
+		create_memory(args.memory, args.ucsi_version)
 	if args.poke:
 		poke(args.poke[0], int(args.poke[1], 0), bytes.fromhex(args.poke[2]))
 	if args.set:

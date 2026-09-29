@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 154] = [
+const GATES: [(&str, &str); 157] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -350,6 +350,14 @@ const GATES: [(&str, &str); 154] = [
 	// The BMC's administrative actions through the protected screen, cold: the tool, AdminService's path and the
 	// driver's executors - a userspace change selects it - and it boots development images through the keyboard.
 	("qemu-ipmi-admin", "userspace.build"),
+	// USB Type-C over UCSI on development guests: the `ucsi-acpi` driver, TypeCService and the tool against the fixture's
+	// harness PPM - a userspace change selects it - and it boots guests.
+	("typec-ucsi", "userspace.build"),
+	// The harness PPM's own answers and discipline checks, on the host.
+	("ucsi-ppm", "harness.tools"),
+	// A port controller's Power Delivery sink on a development guest: the `tcpci` driver and its engine against the
+	// backend's controller and source partner - a userspace change selects it - and it boots a guest.
+	("typec-tcpci", "userspace.build"),
 	// SMARTCARDSERVICE, against the in-guest smart-card fixture: reader-scoped grants, the PIV allowlist, the
 	// pinpad policy, transactions, removal and recovery, events and a restart, with the authentication
 	// signature verified by OpenSSL on the host. Its subject is the service, its pure leaves, the protocol,
@@ -874,7 +882,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 56] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 58] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -900,6 +908,10 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 56] = [
 	"qemu-tpm-tool",
 	// And the BMC's administrative actions, one cold scenario a case.
 	"qemu-ipmi-admin",
+	// And UCSI's, four PPM profiles a boot each.
+	"typec-ucsi",
+	// And the port controller's, one development instance.
+	"typec-tcpci",
 	// And the COM1 handoff's, on a development instance of its own.
 	"serial-handoff",
 	// And the hardware watchdog's, which boots four in turn.

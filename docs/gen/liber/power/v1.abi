@@ -1,5 +1,5 @@
 package liber:power@1
-enum source-kind(ac=1,battery=2,ups=3,load=4,thermal-zone=5)
+enum source-kind(ac=1,battery=2,ups=3,load=4,thermal-zone=5,usb-c=6)
 enum value-state(known=1,unknown=2,unsupported=3,invalid=4)
 enum invalid-reason(none=0,sentinel=1,overflow=2,contradiction=3,unit=4,range=5)
 enum tristate(unknown=0,no=1,yes=2)

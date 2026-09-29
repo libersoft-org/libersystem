@@ -275,6 +275,20 @@ test = false
 bench = false
 
 [[bin]]
+# UCSI OVER ACPI: a platform policy manager's connectors, read through the shared mailbox, `_DSM` and `Notify`.
+name = "ucsi_acpi"
+path = "src/ucsi_acpi.rs"
+test = false
+bench = false
+
+[[bin]]
+# A TYPE-C PORT CONTROLLER on I2C with its alert on a GPIO line, and the Power Delivery sink the system runs over it.
+name = "tcpci"
+path = "src/tcpci_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "wdat"
 path = "src/wdat_driver.rs"
 test = false
@@ -335,6 +349,11 @@ acpi = { path = "../../../acpi" }
 hid-i2c = { path = "../../libs/driver/hid-i2c" }
 i2c-client = { path = "../../libs/driver/i2c-client" }
 ipmi = { path = "../../libs/driver/ipmi" }
+# UCSI: the mailbox layouts, the commands and the command discipline, linked statically into `ucsi-acpi`.
+ucsi = { path = "../../libs/driver/ucsi" }
+# USB POWER DELIVERY for a sink the system runs itself: the codec, the selection rule, the timers and the engines,
+# linked statically into `tcpci`.
+usb-pd = { path = "../../libs/driver/usb-pd" }
 i2c-device-proto = { path = "../../libs/protocol/i2c-device-proto" }
 # THE NODE CHANNEL'S VALUE ENCODING, for the ACPI battery, AC and thermal zone driver: the one bounded decoder of what
 # a method answered - depth and size bounded - and nothing of the interpreter.

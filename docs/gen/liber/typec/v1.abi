@@ -1,0 +1,38 @@
+package liber:typec@1
+enum power-role(sink=1,source=2)
+enum data-role(device=1,host=2)
+enum transport(ucsi=1,tcpci=2)
+record capabilities(transport:transport,sink:bool,source:bool,data-device:bool,data-host:bool,power-delivery:bool,ucsi-version:u16,ucsi-features:u32,alternate-mode-override:bool)
+enum partner-kind(none=0,charger=1,device=2,host=3,powered-cable=4,audio-accessory=5,debug-accessory=6)
+enum orientation(unknown=0,normal=1,flipped=2)
+enum operation-mode(unknown=0,default-usb=1,bc12=2,typec-1-5a=3,typec-3a=4,power-delivery=5)
+enum typec-current(none=0,default=1,medium=2,high=3)
+record offer(position:u8,object:u32)
+record contract(offer:offer,operating:u32,maximum:u32,capability-mismatch:bool,in-transition:bool)
+record cable(speed:u16,current:u16,vbus:bool,active:bool,directional:bool,plug-end:u8,alternate-modes:bool,pd-revision:u8)
+record alternate-mode(svid:u16,vdo:u32,entered:bool)
+record displayport(pin-assignment:u8,hot-plug:option<bool>)
+enum request-kind(data-role-swap=1,power-role-swap=2,enter-mode=3,exit-mode=4)
+enum refusal(connector-cannot=1,not-offered=2,platform-enters-modes=3,refused-by-platform=4,transport-does-not=5,busy=6)
+record refused-request(kind:request-kind,reason:refusal,error:u32)
+record connector(number:u8,capabilities:capabilities,partner:partner-kind,orientation:orientation,power-role:option<power-role>,data-role:option<data-role>,operation-mode:operation-mode,contract:option<contract>,typec-current:typec-current,offers:list<offer>:bound=11,cable:option<cable>,modes:list<alternate-mode>:bound=16,displayport:option<displayport>,last-refusal:option<refused-request>,answering:bool)
+enum update-kind(snapshot=1,snapshot-end=2,added=3,updated=4,removed=5)
+record provider-update(revision:u64,kind:update-kind,connector:option<connector>,gone:option<u8>)
+record request(kind:request-kind,connector:u8,data-role:option<data-role>,power-role:option<power-role>,svid:u16,vdo:u32)
+enum outcome(done=1,refused=2,indeterminate=3)
+record answer(outcome:outcome,reason:option<refusal>,error:u32)
+interface typec-provider
+method typec-provider.updates op=1 () -> stream<provider-update>
+method typec-provider.request op=2 (request:request:rights=) -> result<answer, liber:base@1::error>
+record connector-id(slot:u32,generation:u32,binding-generation:u64,number:u8)
+record connector-snapshot(id:connector-id,received:u64,connector:connector)
+enum change-kind(snapshot=1,snapshot-end=2,added=3,updated=4,removed=5)
+record typec-change(epoch:u64,revision:u64,kind:change-kind,connector:option<connector-snapshot>,gone:option<connector-id>)
+interface typec
+method typec.connectors op=1 () -> result<list<connector-snapshot>, liber:base@1::error>
+method typec.subscribe op=2 () -> result<stream<typec-change>, liber:base@1::error>
+interface typec-control
+method typec-control.data-role-swap op=1 (connector:connector-id:rights=,role:data-role:rights=) -> result<answer, liber:base@1::error>
+method typec-control.power-role-swap op=2 (connector:connector-id:rights=,role:power-role:rights=) -> result<answer, liber:base@1::error>
+method typec-control.enter-mode op=3 (connector:connector-id:rights=,svid:u16:rights=,vdo:u32:rights=) -> result<answer, liber:base@1::error>
+method typec-control.exit-mode op=4 (connector:connector-id:rights=,svid:u16:rights=,vdo:u32:rights=) -> result<answer, liber:base@1::error>

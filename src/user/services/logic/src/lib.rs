@@ -78,6 +78,7 @@ pub mod tcp_transmit;
 pub mod tcp_window;
 pub mod tpm;
 pub mod trusted_keys;
+pub mod typec_requests;
 pub mod uplink;
 pub mod watchdog;
 pub mod world_errors;

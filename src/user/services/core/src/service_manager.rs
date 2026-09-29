@@ -1458,6 +1458,8 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_ADMIN_AUDIT,
 			CAP_ADMIN_TEST,
 			CAP_BMC,
+			CAP_TYPEC,
+			CAP_TYPEC_CONTROL,
 		],
 		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
 		// over at bring-up went with the instance that ended.
@@ -1489,6 +1491,7 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_MEDIA_IMPORT => Some(b"media_import_service"),
 		CAP_ADMIN_FACTORY | CAP_ADMIN_AUDIT | CAP_ADMIN_TEST => Some(b"admin_service"),
 		CAP_BMC => Some(b"bmc_service"),
+		CAP_TYPEC | CAP_TYPEC_CONTROL => Some(b"typec_service"),
 		_ => None,
 	}
 }
@@ -1530,6 +1533,8 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_ADMIN_AUDIT => broker.kept.end_of(b"admin_service", b"AUDIT"),
 		CAP_ADMIN_TEST => broker.kept.end_of(b"admin_service", b"TEST"),
 		CAP_BMC => broker.kept.end_of(b"bmc_service", b"SERVE"),
+		CAP_TYPEC => broker.kept.end_of(b"typec_service", b"SERVE"),
+		CAP_TYPEC_CONTROL => broker.kept.end_of(b"typec_service", b"CONTROL"),
 		_ => 0,
 	};
 	let alive: bool = match service_of_cap(name).and_then(index_of) {
@@ -1773,7 +1778,7 @@ fn hand_acpi_admin(kept: &Kept, channels: &[u64; N]) {
 // the plan cannot carry - its liveness channel and the boot mode - are `supervisor_role`'s, and its timers are in the
 // hardware. The ACPI service's privilege is `supervisor_role`'s too, and what it published is the kernel's to keep.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its

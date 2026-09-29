@@ -177,6 +177,37 @@ impl Described {
 	}
 }
 
+/// The id a node takes to be matched by its `_DSD`'s `compatible`, as a device-tree node is.
+pub const PRP0001: &str = "PRP0001";
+
+/// THE `compatible` STRINGS of a property block's own node (depth 0): one string, or a package of them in order. A
+/// value of any other shape names nothing.
+pub fn compatibles(block: &[u8]) -> Vec<String> {
+	let mut at = 0usize;
+	while at + 8 <= block.len() {
+		let (kind, depth) = (block[at], block[at + 1]);
+		let name_len = u16::from_le_bytes([block[at + 2], block[at + 3]]) as usize;
+		let value_len = u32::from_le_bytes([block[at + 4], block[at + 5], block[at + 6], block[at + 7]]) as usize;
+		let value_at = at + 8 + name_len;
+		let Some(end) = value_at.checked_add(value_len).filter(|end| *end <= block.len()) else { break };
+		if kind == abi::DEVICE_PROPERTY_VALUE && depth == 0 && &block[at + 8..value_at] == b"compatible" {
+			return match aml::wire::decode(&block[value_at..end]) {
+				Ok(aml::wire::Value::String(text)) => alloc::vec![text],
+				Ok(aml::wire::Value::Package(elements)) => elements
+					.into_iter()
+					.map_while(|element| match element {
+						aml::wire::Value::String(text) => Some(text),
+						_ => None,
+					})
+					.collect(),
+				_ => Vec::new(),
+			};
+		}
+		at = value_at + ((value_len + 3) & !3);
+	}
+	Vec::new()
+}
+
 /// THE ROW A NODE IS REPORTED AS: its identity, the state its role puts it in, `_HID` and each `_CID` (or its class),
 /// and its `_CRS` resources - memory, ports, wired lines, and the GPIO and I2C connections by their controllers'
 /// identities (`resolve` turns a resource source into one). A `GpioIo` restricted to output is refused by name, as a
@@ -199,6 +230,12 @@ pub fn describe(path: &aml::Path, role: &Role, identity: &Identity, resources: &
 	}
 	for cid in &identity.cids {
 		whole &= description.add_match(abi::MATCH_ID_CID, cid.as_bytes());
+	}
+	// A `PRP0001` NODE IS MATCHED AS THE TREE MATCHES ITS NODE: by its `_DSD`'s `compatible` strings.
+	if identity.hid.as_deref() == Some(PRP0001) || identity.cids.iter().any(|cid| cid == PRP0001) {
+		for compatible in compatibles(&properties) {
+			whole &= description.add_match(abi::MATCH_ID_COMPATIBLE, compatible.as_bytes());
+		}
 	}
 	let parent = match role {
 		Role::Device { parent, class } => {

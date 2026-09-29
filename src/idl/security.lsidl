@@ -159,6 +159,12 @@ enum capability {
 	/// and LAN configuration, and its identify light. It erases nothing and stops nothing - those are administrative
 	/// requests, which need `admin-request` and a person. Appended last, for the reason `midi-output` states.
 	bmc,
+	/// THE TYPE-C CONNECTORS, READ: each connector's partner, roles, contract, offers, cable and modes, enumerated
+	/// and subscribed. Nothing it holds changes a connector. Appended last, for the reason `midi-output` states.
+	typec,
+	/// THE TYPE-C OPERATOR: a data-role or power-role swap, and an alternate mode entered or left, on a connector
+	/// whose platform offers it. Granted to no shipping program by default.
+	typec-control,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

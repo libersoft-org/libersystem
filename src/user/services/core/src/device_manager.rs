@@ -6586,6 +6586,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::TPM => proto::system::ProviderKind::Tpm,
 		provider::WATCHDOG => proto::system::ProviderKind::Watchdog,
 		provider::IPMI => proto::system::ProviderKind::Ipmi,
+		provider::TYPEC_CONNECTOR => proto::system::ProviderKind::TypecConnector,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6618,6 +6619,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Tpm => driver_protocol::provider::TPM,
 		proto::system::ProviderKind::Watchdog => driver_protocol::provider::WATCHDOG,
 		proto::system::ProviderKind::Ipmi => driver_protocol::provider::IPMI,
+		proto::system::ProviderKind::TypecConnector => driver_protocol::provider::TYPEC_CONNECTOR,
 	}
 }
 

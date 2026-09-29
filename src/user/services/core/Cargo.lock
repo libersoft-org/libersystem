@@ -164,6 +164,8 @@ dependencies = [
  "rt",
  "smartcard-model",
  "tpm",
+ "ucsi",
+ "usb-pd",
  "wire",
 ]
 
@@ -485,6 +487,7 @@ dependencies = [
  "storage-proto",
  "time-proto",
  "tpm-proto",
+ "typec-proto",
  "wire",
 ]
 
@@ -776,10 +779,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "typec-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "ucsi"
+version = "0.0.0"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "usb-pd"
+version = "0.0.0"
 
 [[package]]
 name = "wasm"

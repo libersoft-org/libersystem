@@ -12,6 +12,9 @@ line, turns the register device's PEC on, or picks a script:
 
     raise LINE | lower LINE | level LINE 0|1 | pec on|off | status
     hid script|hold|lose|status NAME | hid malformed NAME on|off      (with --hid)
+    tcpc attach PROFILE [flipped] | tcpc detach | tcpc script NAME | tcpc caps [less] | tcpc hard-reset
+    tcpc vbus MV | tcpc send MESSAGE | tcpc malformed KIND | tcpc negotiate N | tcpc timing | tcpc mark
+    tcpc status | tcpc requests | tcpc answers | tcpc hard-resets | tcpc responses | tcpc violations  (with --tcpc)
 
 and each answers one line, `ok ...` or `error ...`. The same commands reach it IN-BAND, through the register
 device's control mailbox (register 0xE0 at 0x50), for a test in the guest, which cannot reach a host socket.
@@ -23,8 +26,12 @@ entries QEMU sends - each update and invalidation acknowledged - and on a miss a
 and serves the main channel until the update arrives. Without the IOMMU the addresses are the guest's own and
 the memory table translates them.
 
+`--tcpc` adds A TYPE-C PORT CONTROLLER at 0x52, its alert on line 5, and the Power Delivery source on its cable
+(`tcpc_partner.py`): the TCPCI gate's fixture, whose partner the `tcpc` commands drive. `--stretch F` multiplies the
+source's two timers that wait on the sink, for the emulated ports.
+
 `--self-test` runs the host suite of the parts a host can check without QEMU: the memory table's
-translation, the IOTLB's updates, misses and invalidations, and the two device models.
+translation, the IOTLB's updates, misses and invalidations, and the device models.
 """
 
 import argparse
@@ -37,6 +44,8 @@ import struct
 import sys
 import time
 import unittest
+
+import tcpc_partner
 
 # One line per request and per control-plane message, on stderr, with `--trace`: the device side's half of any
 # bus failure, which the guest cannot see.
@@ -959,7 +968,7 @@ def listen(path):
 def serve(args):
     devices = DEVICES
     register = RegisterDevice(0x50, control=lambda text: command(text, register, gpio_model, devices, hid))
-    gpio_model = GpioModel(["hid-touchpad", "hid-touchscreen", "acpi-aei", "spare-3", "spare-4", "spare-5", "spare-6", "spare-7"])
+    gpio_model = GpioModel(["hid-touchpad", "hid-touchscreen", "acpi-aei", "spare-3", "spare-4", "tcpc-alert", "spare-6", "spare-7"])
 
     def set_line(line, level):
         space = devices["gpio"].space if "gpio" in devices else None
@@ -972,7 +981,19 @@ def serve(args):
     hid = hid_devices(set_line) if args.hid else []
     for device in hid:
         gpio_model.levels[device.line] = 1
-    i2c_model = I2cModel([register] + hid)
+    # `--tcpc`: THE PORT CONTROLLER AND ITS PARTNER, the alert released.
+    tcpc, scheduler = None, None
+    if args.tcpc:
+        log = open(args.tcpc_log, "a", buffering=1) if args.tcpc_log else sys.stderr
+        started = time.monotonic()
+
+        def tcpc_log(text):
+            log.write(f"{time.monotonic() - started:10.4f} {text}\n")
+
+        tcpc, scheduler = tcpc_partner.build(TCPC_ADDRESS, TCPC_LINE, set_line, tcpc_log, stretch=args.stretch)
+        gpio_model.levels[TCPC_LINE] = 1
+    TCPC_MODEL[0] = tcpc
+    i2c_model = I2cModel([register] + hid + ([tcpc] if tcpc else []))
     listeners = {"i2c": listen(args.i2c), "gpio": listen(args.gpio)}
     control = listen(args.control)
     if args.ready:
@@ -987,7 +1008,12 @@ def serve(args):
             for fd, index in device.kicks():
                 kicks[fd] = (name, index)
                 watched.append(fd)
-        ready, _, _ = select.select(watched, [], [])
+        # THE PARTNER'S TIMERS bound the wait, and run once the wait is over.
+        due = scheduler.next_due() if scheduler else None
+        timeout = None if due is None else max(0.0, due - time.monotonic())
+        ready, _, _ = select.select(watched, [], [], timeout)
+        if scheduler:
+            scheduler.run_due()
         for item in ready:
             # STILL READY? An IOTLB miss served earlier in this pass may have read a socket's message already, and
             # a read of it now would block until QEMU sent another.
@@ -1025,6 +1051,14 @@ def serve(args):
                     continue
             for device in list(devices.values()):
                 device.run_pending()
+        if scheduler:
+            scheduler.run_due()
+
+
+# THE PORT CONTROLLER, when `--tcpc` made one: its address, its alert line, and the model the control commands reach.
+TCPC_ADDRESS = 0x52
+TCPC_LINE = 5
+TCPC_MODEL = [None]
 
 
 def command(text, register, gpio, devices, hid=()):
@@ -1032,6 +1066,12 @@ def command(text, register, gpio, devices, hid=()):
     try:
         if not words:
             return "error empty"
+        if words[0] == "tcpc":
+            if TCPC_MODEL[0] is None:
+                return "error no port controller - the backend runs without --tcpc"
+            if len(words) < 2:
+                return "error tcpc takes a command"
+            return TCPC_MODEL[0].partner.command(words[1:])
         if words[0] == "hid":
             device = next((device for device in hid if device.name == words[2]), None)
             if device is None:
@@ -1306,6 +1346,181 @@ class SelfTest(unittest.TestCase):
         self.assertTrue(register.read(32, after_write=True).startswith(b"error unknown command"), "and a refusal is read back the same way")
 
 
+class TcpcRig:
+    """THE PORT CONTROLLER AND ITS PARTNER under a virtual clock, with a scripted sink that reaches them only as the
+    driver does - register writes and write-then-reads."""
+
+    def __init__(self, stretch=1.0):
+        self.now = 0.0
+        self.levels = {}
+        self.said = []
+        self.tcpc, self.scheduler = tcpc_partner.build(0x52, 5, lambda line, level: self.levels.__setitem__(line, level), self.said.append, stretch=stretch, clock=lambda: self.now)
+        self.partner = self.tcpc.partner
+
+    def advance(self, seconds):
+        end = self.now + seconds
+        while self.now < end:
+            due = self.scheduler.next_due()
+            self.now = min(end, due) if due is not None and due > self.now else (self.now if due is not None and due <= self.now else end)
+            self.scheduler.run_due()
+
+    def write(self, register, *values):
+        return self.tcpc.write(bytes([register, *values]))
+
+    def read(self, register, length):
+        self.tcpc.write(bytes([register]), combined=True)
+        return self.tcpc.read(length, True)
+
+    def alert(self):
+        return struct.unpack("<H", self.read(tcpc_partner.ALERT, 2))[0]
+
+    def clear(self, bits):
+        self.write(tcpc_partner.ALERT, bits & 0xFF, bits >> 8)
+
+    def sink_ready(self):
+        """What the driver writes at bind, and RECEIVE_DETECT as the engine sets it at attach."""
+        self.write(tcpc_partner.ALERT_MASK, 0xFF, 0x07)
+        self.write(tcpc_partner.POWER_CONTROL, tcpc_partner.CONTROL_DISABLE_ALARMS)
+        self.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_ENABLE_VBUS_DETECT)
+        self.write(tcpc_partner.POWER_STATUS_MASK, tcpc_partner.POWER_VBUS_PRESENT)
+        self.write(tcpc_partner.RECEIVE_DETECT, tcpc_partner.DETECT_SOP | tcpc_partner.DETECT_HARD_RESET)
+
+    def received(self):
+        """The message in the receive buffer, taken and its alert cleared."""
+        frame = self.read(tcpc_partner.RECEIVE_BUFFER, 32)
+        message = frame[2:1 + frame[0]]
+        self.clear(tcpc_partner.ALERT_RX_STATUS)
+        return tcpc_partner.parse(message)
+
+    def send(self, data):
+        self.tcpc.write(bytes([tcpc_partner.TRANSMIT_BUFFER, len(data)]) + data)
+        self.write(tcpc_partner.TRANSMIT, 0x30)
+
+    def request(self, position, milliamps, message_id=0):
+        rdo = position << 28 | 1 << 24 | (milliamps // 10) << 10 | milliamps // 10
+        self.send(struct.pack("<HI", 2 | 2 << 6 | (message_id & 7) << 9 | 1 << 12, rdo))
+
+
+class TcpcTest(unittest.TestCase):
+    def attached(self, profile="charger31"):
+        """Attached, and the first capabilities just in the receive buffer - VBUS on after 150 ms, the capabilities
+        100 ms later, and SenderResponseTimer not yet run out."""
+        rig = TcpcRig()
+        rig.sink_ready()
+        rig.partner.command(["attach", profile])
+        rig.advance(0.26)
+        return rig
+
+    def test_a_charger_offers_its_capabilities_and_moves_its_supply_only_after_accept(self):
+        rig = self.attached()
+        self.assertEqual(rig.partner.vbus_mv, 5000)
+        self.assertEqual(rig.levels[5], 0, "the alert asserted, active low")
+        alert = rig.alert()
+        self.assertTrue(alert & tcpc_partner.ALERT_CC_STATUS and alert & tcpc_partner.ALERT_POWER_STATUS and alert & tcpc_partner.ALERT_RX_STATUS)
+        self.assertEqual(rig.read(tcpc_partner.CC_STATUS, 1)[0] & 0xF, 3, "Rp 3.0 A on CC1")
+        kind, is_data, count, _, revision, objects = rig.received()
+        self.assertEqual((kind, is_data, count, revision), (tcpc_partner.SOURCE_CAPABILITIES, True, 6, tcpc_partner.REVISION_3))
+        rig.clear(0x7FF)
+        alerted = rig.partner.pending_caps_alert
+        rig.now += 0.004
+        rig.request(4, 2000)
+        self.assertTrue(rig.alert() & tcpc_partner.ALERT_TX_SUCCESS, "GoodCRC")
+        rig.clear(0x7FF)
+        rig.advance(0.01)
+        self.assertEqual(rig.received()[0], tcpc_partner.ACCEPT)
+        self.assertEqual(rig.partner.vbus_mv, 5000, "not before tSrcTransition")
+        rig.advance(0.1)
+        self.assertEqual(rig.partner.vbus_mv, 15000)
+        self.assertEqual(rig.received()[0], tcpc_partner.PS_RDY)
+        self.assertEqual(rig.partner.contract, (4, 15000))
+        self.assertEqual(rig.partner.requests, [(4, 15000, 2000, 2000, 0)])
+        # FROM THE CAPABILITIES' ALERT TO THE REQUEST'S TRANSMIT: the rig stood 10 ms past the alert, then took 4 ms.
+        self.assertAlmostEqual(alerted, 0.25, places=6)
+        self.assertAlmostEqual(rig.partner.responses[0], 14.0, places=3)
+        self.assertEqual(struct.unpack("<H", rig.read(tcpc_partner.VBUS_VOLTAGE, 2))[0], 600, "15 V in 25 mV units")
+        self.assertEqual(rig.partner.violations, [])
+
+    def test_what_a_sink_must_never_do_is_a_violation(self):
+        rig = self.attached()
+        rig.received()
+        rig.request(6, 2000)
+        rig.advance(0.01)
+        rig.request(4, 3500, message_id=1)
+        rig.advance(0.01)
+        rig.request(7, 1000, message_id=2)
+        rig.advance(0.01)
+        self.assertEqual(len(rig.partner.violations), 3, rig.partner.violations)
+        self.assertIn("not fixed", rig.partner.violations[0])
+        self.assertIn("3500/3500 mA", rig.partner.violations[1])
+        self.assertIn("position 7", rig.partner.violations[2])
+        rig.partner.command(["detach"])
+        rig.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_SINK_VBUS)
+        self.assertEqual(rig.partner.violations[3:], ["the sink path enabled with VBUS at 0 mV"])
+
+    def test_a_hard_reset_takes_vbus_to_zero_and_back_or_keeps_it_off(self):
+        rig = self.attached()
+        rig.received()
+        rig.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_SINK_VBUS)
+        rig.write(tcpc_partner.TRANSMIT, 5)
+        self.assertIn("the sink sent a hard reset with its sink path on", rig.partner.violations)
+        self.assertEqual(rig.alert() & 0x50, 0x50, "a hard reset sent: both transmission bits")
+        self.assertEqual(rig.read(tcpc_partner.RECEIVE_DETECT, 1)[0], 0, "detection reset")
+        rig.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_DISABLE_SINK_VBUS)
+        rig.advance(0.05)
+        self.assertEqual(rig.partner.vbus_mv, 0)
+        rig.advance(0.75)
+        self.assertEqual(rig.partner.vbus_mv, 5000, "back after tSrcRecover")
+        rig.partner.command(["script", "vbus-stays-off"])
+        rig.write(tcpc_partner.TRANSMIT, 5)
+        rig.advance(2.0)
+        self.assertEqual(rig.partner.vbus_mv, 0, "kept off")
+        # A SOURCE WITHOUT POWER DELIVERY never sees it.
+        plain = self.attached("typec15")
+        plain.write(tcpc_partner.TRANSMIT, 5)
+        plain.advance(1.0)
+        self.assertEqual(plain.partner.vbus_mv, 5000)
+        self.assertEqual(plain.read(tcpc_partner.CC_STATUS, 1)[0] & 0xF, 2, "Rp 1.5 A")
+
+    def test_the_alarms_fire_outside_the_thresholds_the_sink_set(self):
+        rig = self.attached()
+        rig.clear(0x7FF)
+        rig.write(tcpc_partner.VBUS_VOLTAGE_ALARM_HI, 5750 // 25 & 0xFF, 5750 // 25 >> 8)
+        rig.write(tcpc_partner.VBUS_VOLTAGE_ALARM_LO, 3750 // 25 & 0xFF, 3750 // 25 >> 8)
+        rig.write(tcpc_partner.POWER_CONTROL, 0)
+        self.assertEqual(rig.alert() & 0x180, 0, "5 V is inside")
+        rig.partner.command(["vbus", "9000"])
+        self.assertTrue(rig.alert() & tcpc_partner.ALERT_VBUS_ALARM_HI)
+        rig.clear(0x7FF)
+        rig.partner.command(["vbus", "3000"])
+        self.assertTrue(rig.alert() & tcpc_partner.ALERT_VBUS_ALARM_LO)
+
+    def test_capabilities_unanswered_bring_a_hard_reset_and_the_stretch_widens_the_wait(self):
+        for stretch, answered in ((1.0, False), (100.0, True)):
+            rig = TcpcRig(stretch)
+            rig.sink_ready()
+            rig.partner.command(["attach", "charger31"])
+            rig.advance(0.26)
+            rig.received()
+            rig.advance(0.05)
+            self.assertEqual(rig.partner.response_timeouts == 0, answered, f"stretch {stretch}")
+            self.assertEqual(bool(rig.alert() & tcpc_partner.ALERT_RX_HARD_RESET), not answered)
+
+    def test_nothing_is_acknowledged_until_the_sink_receives_and_the_capabilities_are_sent_again(self):
+        rig = TcpcRig()
+        rig.write(tcpc_partner.COMMAND, tcpc_partner.COMMAND_ENABLE_VBUS_DETECT)
+        rig.partner.command(["attach", "charger20"])
+        rig.advance(0.5)
+        self.assertGreaterEqual(rig.partner.caps_count, 2, "sent every SourceCapabilityTimer, unacknowledged")
+        rig.write(tcpc_partner.RECEIVE_DETECT, tcpc_partner.DETECT_SOP)
+        rig.advance(0.06)
+        self.assertEqual(rig.received()[4], tcpc_partner.REVISION_2)
+        for kind in ("count", "reserved", "extended"):
+            self.assertTrue(rig.partner.malformed(kind).startswith("ok"))
+            frame = rig.read(tcpc_partner.RECEIVE_BUFFER, 32)
+            rig.clear(tcpc_partner.ALERT_RX_STATUS)
+            self.assertTrue(frame[0] >= 3)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--i2c", help="the virtio-i2c vhost-user socket to listen on")
@@ -1313,13 +1528,16 @@ def main():
     parser.add_argument("--control", help="the control socket to listen on")
     parser.add_argument("--ready", help="a file written once every socket listens")
     parser.add_argument("--hid", action="store_true", help="the HID-over-I2C models: a touchpad at 0x2C and a touchscreen at 0x10")
+    parser.add_argument("--tcpc", action="store_true", help="a Type-C port controller at 0x52, its alert on line 5, and the Power Delivery source on its cable")
+    parser.add_argument("--tcpc-log", help="the port controller's and its partner's record")
+    parser.add_argument("--stretch", type=float, default=1.0, help="the factor on the source's SenderResponseTimer and tSrcTransition (emulated ports)")
     parser.add_argument("--self-test", action="store_true", help="run the host suite and exit")
     parser.add_argument("--trace", action="store_true", help="one line per request and control message, on stderr")
     args = parser.parse_args()
     global TRACE
     TRACE = args.trace
     if args.self_test:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
+        suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest), unittest.defaultTestLoader.loadTestsFromTestCase(TcpcTest)])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         sys.exit(0 if result.wasSuccessful() else 1)
     if not (args.i2c and args.gpio and args.control):

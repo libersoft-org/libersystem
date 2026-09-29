@@ -72,3 +72,5 @@ liber/time/v1.abi
 liber/time/v1.md
 liber/tpm/v1.abi
 liber/tpm/v1.md
+liber/typec/v1.abi
+liber/typec/v1.md

@@ -93,14 +93,15 @@
 #             after DIR, so a lifecycle gate's instance never touches a person's and is never
 #             refused by its lock.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
-#   I2C_FIXTURE=bus|hid  I2C_SOCKET=  GPIO_SOCKET=
+#   I2C_FIXTURE=bus|hid|tcpc  I2C_SOCKET=  GPIO_SOCKET=
 #             attach QEMU's vhost-user I2C and GPIO controllers at their pinned slots, their device side
 #             the `vhost-i2c-gpio.py` listening on the two sockets, with the guest's RAM on a shared memfd
 #             - see `qemu_attach_i2c_fixture`. `test-kernel.sh` starts the backend and sets all three.
 #             With `hid`, the firmware also DESCRIBES the backend's two HID-over-I2C models: on x86_64 an SSDT
 #             (`acpi-fixture.py --hid-out`, loaded with `-acpitable`), on aarch64 and riscv64 through UEFI the
 #             machine's tree dumped, given the `hid-over-i2c` nodes (`fdt_edit.py hid-fixture`) and handed back
-#             with `-dtb` - see `qemu_attach_hid_table` and `i2c_hid_dtb_args`.
+#             with `-dtb` - see `qemu_attach_hid_table` and `i2c_hid_dtb_args`. With `tcpc`, the same for the
+#             backend's port controller (`--tcpc`): `acpi-fixture.py --tcpc-out`, `fdt_edit.py tcpc-fixture`.
 #   ACPI_FIXTURE=SSDT  ACPI_FIXTURE_MEMORY=FILE
 #             x86_64: the ACPI gate's fixture - `SSDT` (`acpi-fixture.py --out`) through `-acpitable`, and an
 #             `ivshmem-plain` function at slot 0x14 over the 1 MiB `FILE` the harness reads and writes - see
@@ -971,14 +972,29 @@ qemu_attach_i2c_fixture() {
 # (`I2C_FIXTURE=hid`) on x86_64: an SSDT - built here with the emitter, no `iasl` - whose two devices sit below the
 # virtio-i2c function's node, each with `_CID` `PNP0C50`, its `I2cSerialBusV2` address, a `GpioInt` on the virtio-gpio
 # function's node and a `_DSM` answering its descriptor register.
+#
+# AND THE PORT CONTROLLER (`I2C_FIXTURE=tcpc`) THE SAME WAY: a `PRP0001` device below the same node, `compatible`
+# `tcpci` in its `_DSD`, and its connector as the hierarchical data node `connector`.
 qemu_attach_hid_table() {
 	local -n hid_into=$1
-	[[ "${I2C_FIXTURE:-}" == "hid" ]] || return 0
-	local table="$QEMU_BUILD_DIR/i2c-hid-fixture.aml"
-	python3 "$HERE/acpi-fixture.py" --hid-out "$table" || {
-		echo "qemu-run: the HID-over-I2C SSDT could not be built" >&2
-		exit 1
-	}
+	local table
+	case "${I2C_FIXTURE:-}" in
+	hid)
+		table="$QEMU_BUILD_DIR/i2c-hid-fixture.aml"
+		python3 "$HERE/acpi-fixture.py" --hid-out "$table" || {
+			echo "qemu-run: the HID-over-I2C SSDT could not be built" >&2
+			exit 1
+		}
+		;;
+	tcpc)
+		table="$QEMU_BUILD_DIR/tcpc-fixture.aml"
+		python3 "$HERE/acpi-fixture.py" --tcpc-out "$table" || {
+			echo "qemu-run: the TCPCI SSDT could not be built" >&2
+			exit 1
+		}
+		;;
+	*) return 0 ;;
+	esac
 	hid_into+=(-acpitable "file=$table")
 }
 
@@ -989,9 +1005,9 @@ qemu_attach_hid_table() {
 i2c_hid_dtb_args() {
 	local qemu="$1"
 	shift
-	[[ "${I2C_FIXTURE:-}" == "hid" ]] || return 0
+	[[ "${I2C_FIXTURE:-}" == "hid" || "${I2C_FIXTURE:-}" == "tcpc" ]] || return 0
 	if [[ "${DMA_DTB_NODE:-0}" == "1" ]]; then
-		echo "qemu-run: I2C_FIXTURE=hid and DMA_DTB_NODE=1 each hand the guest an edited tree - one run asks for one" >&2
+		echo "qemu-run: I2C_FIXTURE=$I2C_FIXTURE and DMA_DTB_NODE=1 each hand the guest an edited tree - one run asks for one" >&2
 		exit 1
 	fi
 	local dumped edited
@@ -1001,8 +1017,8 @@ i2c_hid_dtb_args() {
 		echo "qemu-run: the machine's device tree could not be dumped for the HID-over-I2C fixture" >&2
 		exit 1
 	}
-	python3 "$HERE/fdt_edit.py" hid-fixture "$dumped" "$edited" --i2c-slot 0x15 --gpio-slot 0x16 || {
-		echo "qemu-run: the HID-over-I2C nodes could not be added to the device tree" >&2
+	python3 "$HERE/fdt_edit.py" "$I2C_FIXTURE-fixture" "$dumped" "$edited" --i2c-slot 0x15 --gpio-slot 0x16 || {
+		echo "qemu-run: the $I2C_FIXTURE fixture's nodes could not be added to the device tree" >&2
 		exit 1
 	}
 	printf -- '-dtb\n%s\n' "$edited"

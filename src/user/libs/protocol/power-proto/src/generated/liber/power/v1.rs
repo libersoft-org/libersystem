@@ -29,6 +29,13 @@ pub enum SourceKind {
 	Ups = 3,
 	Load = 4,
 	ThermalZone = 5,
+	/// THE PARTNER ON ONE USB TYPE-C CONNECTOR, as a supply. `present` - a partner is attached; `online` - this
+	/// machine sinks from it. Voltage, current and power carry ONLY what the connector measures (negative delivered
+	/// out of the partner into this machine), and nothing while no partner is attached. No capacity, charge state,
+	/// runtime, load, temperature, trips or controls. The contract and the offers are a LIMIT, not a measurement,
+	/// and are `liber:typec@1`'s. A laptop's ACPI AC adapter is a separate report of line power: a reader must not
+	/// add the two.
+	UsbC = 6,
 }
 
 impl SourceKind {
@@ -76,6 +83,7 @@ impl SourceKind {
 			3 => Some(SourceKind::Ups),
 			4 => Some(SourceKind::Load),
 			5 => Some(SourceKind::ThermalZone),
+			6 => Some(SourceKind::UsbC),
 			_ => None,
 		}
 	}
@@ -3795,6 +3803,7 @@ impl SourceKind {
 			SourceKind::Ups => out.push_str("\"ups\""),
 			SourceKind::Load => out.push_str("\"load\""),
 			SourceKind::ThermalZone => out.push_str("\"thermal-zone\""),
+			SourceKind::UsbC => out.push_str("\"usb-c\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3804,6 +3813,7 @@ impl SourceKind {
 			SourceKind::Ups => out.push_str("ups"),
 			SourceKind::Load => out.push_str("load"),
 			SourceKind::ThermalZone => out.push_str("thermal-zone"),
+			SourceKind::UsbC => out.push_str("usb-c"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -3813,6 +3823,7 @@ impl SourceKind {
 			SourceKind::Ups => crate::codec::cbor::text(out, "ups"),
 			SourceKind::Load => crate::codec::cbor::text(out, "load"),
 			SourceKind::ThermalZone => crate::codec::cbor::text(out, "thermal-zone"),
+			SourceKind::UsbC => crate::codec::cbor::text(out, "usb-c"),
 		}
 	}
 }

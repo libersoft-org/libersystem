@@ -1,0 +1,304 @@
+//! LiberSystem Type-C - what a USB Type-C connector reports: its partner, its roles, the Power Delivery contract it
+//! made, the offers it was made from, its cable and its alternate modes - and the four requests an operator may make.
+//!
+//! THREE INTERFACES FOR THREE PARTIES. A READER enumerates and subscribes; an OPERATOR swaps a role or enters and
+//! leaves a mode; a PROVIDER - the `ucsi-acpi` or `tcpci` driver - publishes what its connectors report. None of them
+//! reaches the others' operations, because what separates them is who holds them.
+//!
+//! WHAT IS HERE AND NOWHERE ELSE. The data role and DisplayPort are reported here: no USB driver knows a data role,
+//! nothing maps a connector to a root-hub port, and no display controller takes an alternate mode. A partner as a
+//! SUPPLY is `liber:power@1`'s `usb-c` source, carrying only what is measured; the contract and the offers are a
+//! LIMIT, not a measurement, and are here.
+
+package liber:typec@1;
+
+use liber:base@1.{error};
+
+enum power-role {
+	sink   = 1,
+	source = 2,
+}
+
+enum data-role {
+	/// Upstream facing: this machine is the USB device.
+	device = 1,
+	/// Downstream facing: this machine is the USB host.
+	host   = 2,
+}
+
+/// How the connector is driven.
+enum transport {
+	/// The platform's policy manager runs Power Delivery; the system reads and configures it through UCSI.
+	ucsi  = 1,
+	/// The system runs Power Delivery itself, over a port controller.
+	tcpci = 2,
+}
+
+/// What a connector can do, as its transport reports it.
+record capabilities {
+	transport:               transport,
+	sink:                    bool,
+	source:                  bool,
+	data-device:             bool,
+	data-host:               bool,
+	power-delivery:          bool,
+	/// UCSI's version, binary-coded (0x0210 is 2.1); 0 on a port controller.
+	ucsi-version:            u16,
+	/// UCSI's optional features, as GET_CAPABILITY's bmOptionalFeatures carries them; 0 on a port controller.
+	ucsi-features:           u32,
+	/// Whether the platform lets the system choose alternate modes (UCSI's alternate-mode override).
+	alternate-mode-override: bool,
+}
+
+/// Who is at the other end.
+enum partner-kind {
+	none            = 0,
+	/// A supply this machine sinks from, which offers no USB data.
+	charger         = 1,
+	/// An upstream-facing partner: this machine is its host.
+	device          = 2,
+	/// A downstream-facing partner that offers USB data: this machine is its device.
+	host            = 3,
+	powered-cable   = 4,
+	audio-accessory = 5,
+	debug-accessory = 6,
+}
+
+enum orientation {
+	unknown = 0,
+	normal  = 1,
+	flipped = 2,
+}
+
+/// How power is being negotiated on the connector.
+enum operation-mode {
+	unknown        = 0,
+	default-usb    = 1,
+	/// USB Battery Charging 1.2.
+	bc12           = 2,
+	typec-1-5a     = 3,
+	typec-3a       = 4,
+	power-delivery = 5,
+}
+
+/// The Type-C current a source advertises on CC, where there is no Power Delivery contract.
+enum typec-current {
+	none    = 0,
+	default = 1,
+	/// 1.5 A.
+	medium  = 2,
+	/// 3 A.
+	high    = 3,
+}
+
+/// One Power Delivery power data object, as the partner or the connector offered it.
+record offer {
+	/// Its position in the capabilities message it came from, from 1.
+	position: u8,
+	object:   u32,
+}
+
+/// THE CONTRACT: the offer selected, and what the request named.
+record contract {
+	offer:               offer,
+	/// The request's operating and maximum current in milliamps - or, against a battery offer, milliwatts.
+	operating:           u32,
+	maximum:             u32,
+	capability-mismatch: bool,
+	/// Accepted and not yet ready: between the source's Accept and its PS_RDY, the old voltage may still be on the
+	/// wire and the new one is not yet promised.
+	in-transition:       bool,
+}
+
+/// The cable, where the transport knows it.
+record cable {
+	/// UCSI's bmSpeedSupported, as the PPM reported it.
+	speed:          u16,
+	/// The current the cable carries, in milliamps.
+	current:        u16,
+	vbus:           bool,
+	active:         bool,
+	directional:    bool,
+	/// 0 Type-A, 1 Type-B, 2 Type-C, 3 other.
+	plug-end:       u8,
+	alternate-modes: bool,
+	/// The Power Delivery revision the cable speaks, 0 when not known.
+	pd-revision:    u8,
+}
+
+/// One alternate mode the partner offers: its standard or vendor ID and its mode object.
+record alternate-mode {
+	svid:    u16,
+	vdo:     u32,
+	entered: bool,
+}
+
+/// DisplayPort's state, where the transport reports it.
+record displayport {
+	/// The pin assignment in use, one of C, D or E as DisplayPort's bit for it; 0 when not reported.
+	pin-assignment: u8,
+	/// Hot-plug detect, when the partner reported it.
+	hot-plug:       option<bool>,
+}
+
+enum request-kind {
+	data-role-swap  = 1,
+	power-role-swap = 2,
+	enter-mode      = 3,
+	exit-mode       = 4,
+}
+
+/// Why a request was refused.
+enum refusal {
+	/// The connector cannot: it does not have the role, or the mode is not the partner's.
+	connector-cannot       = 1,
+	/// The platform does not offer the command.
+	not-offered            = 2,
+	/// The platform enters and leaves modes itself: no alternate-mode override.
+	platform-enters-modes  = 3,
+	/// The policy manager refused, with the error it gave.
+	refused-by-platform    = 4,
+	/// The transport does not do it: a port controller's engine takes no swap and no mode.
+	transport-does-not     = 5,
+	/// A request for this connector is already outstanding.
+	busy                   = 6,
+}
+
+/// The last request refused on a connector, and why.
+record refused-request {
+	kind:   request-kind,
+	reason: refusal,
+	/// The policy manager's error, as UCSI's GET_ERROR_STATUS gave it; 0 otherwise.
+	error:  u32,
+}
+
+/// ONE CONNECTOR. Everything a reader learns about it; nothing an operator can change is carried as a field.
+record connector {
+	/// From 1.
+	number:            u8,
+	capabilities:      capabilities,
+	partner:           partner-kind,
+	orientation:       orientation,
+	power-role:        option<power-role>,
+	data-role:         option<data-role>,
+	operation-mode:    operation-mode,
+	contract:          option<contract>,
+	typec-current:     typec-current,
+	/// The partner's source offers, at most eleven: Power Delivery's seven standard positions and four extended.
+	@bound(11) offers: list<offer>,
+	cable:             option<cable>,
+	@bound(16) modes:  list<alternate-mode>,
+	displayport:       option<displayport>,
+	last-refusal:      option<refused-request>,
+	/// Whether the transport is answering. False while a policy manager is silent or being reset: what is carried
+	/// is the last that was read.
+	answering:         bool,
+}
+
+// ------------------------------------------------------------------ the provider contract
+
+enum update-kind {
+	snapshot     = 1,
+	snapshot-end = 2,
+	added        = 3,
+	updated      = 4,
+	removed      = 5,
+}
+
+/// One frame of a provider's stream, carrying the provider's own monotonic revision.
+record provider-update {
+	revision:  u64,
+	kind:      update-kind,
+	connector: option<connector>,
+	/// For `removed`, the connector's number.
+	gone:      option<u8>,
+}
+
+/// One request, as TypeCService sends it to the connector's provider.
+record request {
+	kind:       request-kind,
+	connector:  u8,
+	/// For a data-role swap, the role asked for.
+	data-role:  option<data-role>,
+	/// For a power-role swap, the role asked for.
+	power-role: option<power-role>,
+	/// For a mode, which: its SVID and its mode object.
+	svid:       u16,
+	vdo:        u32,
+}
+
+enum outcome {
+	done          = 1,
+	refused       = 2,
+	/// The platform may have acted and did not say. NEVER RETRIED.
+	indeterminate = 3,
+}
+
+record answer {
+	outcome: outcome,
+	/// For `refused`, why.
+	reason:  option<refusal>,
+	/// The policy manager's error, when it refused with one.
+	error:   u32,
+}
+
+/// THE PROVIDER CONTRACT a `typec-connector` publication serves - to TypeCService alone.
+interface typec-provider {
+	@op(1) updates: func() -> stream<provider-update>;
+	@op(2) request: func(request: request) -> result<answer, error>;
+}
+
+// ------------------------------------------------------------------ the reader's and the operator's
+
+/// A connector's identity: which publication, which generation of it, which connector. A connector of a replacement
+/// publication is a DIFFERENT connector, and a stale identity names nothing.
+record connector-id {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+	number:             u8,
+}
+
+record connector-snapshot {
+	id:        connector-id,
+	/// When this service received the state, on its monotonic clock.
+	received:  u64,
+	connector: connector,
+}
+
+enum change-kind {
+	snapshot     = 1,
+	snapshot-end = 2,
+	added        = 3,
+	updated      = 4,
+	removed      = 5,
+}
+
+/// One frame of a subscription. REVISIONS MAY SKIP; a gap is not a loss. A loss is a closed subscription, which a
+/// client answers by subscribing again for a fresh snapshot.
+record typec-change {
+	epoch:     u64,
+	revision:  u64,
+	kind:      change-kind,
+	connector: option<connector-snapshot>,
+	gone:      option<connector-id>,
+}
+
+/// THE READ AUTHORITY: enumerate, and subscribe.
+interface typec {
+	/// Every live connector, sorted. Informational: a subscription is correct without it.
+	@op(1) connectors: func() -> result<list<connector-snapshot>, error>;
+	/// One atomic snapshot at (epoch, revision), then live changes after it. REFUSED with `exhausted` at the
+	/// service's subscriber limit.
+	@op(2) subscribe:  func() -> result<stream<typec-change>, error>;
+}
+
+/// THE OPERATOR AUTHORITY: one request outstanding per connector, answered within fifteen seconds - `done`,
+/// `refused` with its reason, or `indeterminate`, which is never retried. Granted to no shipping program by
+/// default.
+interface typec-control {
+	@op(1) data-role-swap:  func(connector: connector-id, role: data-role) -> result<answer, error>;
+	@op(2) power-role-swap: func(connector: connector-id, role: power-role) -> result<answer, error>;
+	@op(3) enter-mode:      func(connector: connector-id, svid: u16, vdo: u32) -> result<answer, error>;
+	@op(4) exit-mode:       func(connector: connector-id, svid: u16, vdo: u32) -> result<answer, error>;
+}

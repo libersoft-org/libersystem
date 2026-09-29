@@ -138,6 +138,8 @@ dependencies = [
  "rt",
  "smartcard-model",
  "tpm",
+ "ucsi",
+ "usb-pd",
  "wire",
 ]
 
@@ -354,6 +356,7 @@ dependencies = [
  "storage-proto",
  "time-proto",
  "tpm-proto",
+ "typec-proto",
  "wire",
 ]
 
@@ -451,6 +454,22 @@ dependencies = [
  "process-proto",
  "wire",
 ]
+
+[[package]]
+name = "typec-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "ucsi"
+version = "0.0.0"
+
+[[package]]
+name = "usb-pd"
+version = "0.0.0"
 
 [[package]]
 name = "wire"

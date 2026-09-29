@@ -1,0 +1,13 @@
+[package]
+name = "usb-pd"
+edition = "2024"
+description = "USB Power Delivery for a sink in the Standard Power Range: the message codec, the power and request data objects, the timer table, and the Type-C sink and sink policy engines as transition functions, with a port controller's register map"
+
+# NOTHING THAT REACHES THE RUNTIME, AND THAT IS WHAT MAKES IT TESTABLE. Every decision here is a function of the
+# events a port controller reports and of the time, so a host test drives the whole engine under a virtual clock -
+# every safety invariant and every timer's minimum at the 10 ms tick. The `tcpci` driver links it and supplies the bus,
+# the alert line and the clock.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

@@ -602,12 +602,13 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// THE ACPI GATE'S FIXTURE DRIVER: a namespace device's platform row, reached through its window and its
 			// node channel.
 			"acpi_fixture" => DmaPolicy::None,
-			// HID OVER I2C: a child binding, whose every byte crosses its controller's scoped connection.
-			"i2c_hid" => DmaPolicy::None,
+			// HID OVER I2C AND A TYPE-C PORT CONTROLLER: child bindings, whose every byte crosses their controller's scoped
+			// connection.
+			"i2c_hid" | "tcpci" => DmaPolicy::None,
 			// THE ACPI POWER SOURCES: every value is a method's result on the node channel.
 			"acpi_power" => DmaPolicy::None,
-			// THE ICH9 SMBUS HOST AND THE IPMI INTERFACES: registers and an SMBus address, polled.
-			"smbus_ich9" | "ipmi" => DmaPolicy::None,
+			// THE ICH9 SMBUS HOST, THE IPMI INTERFACES AND UCSI: registers, an SMBus address and a shared mailbox.
+			"smbus_ich9" | "ipmi" | "ucsi_acpi" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");

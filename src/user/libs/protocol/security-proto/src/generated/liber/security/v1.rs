@@ -168,6 +168,12 @@ pub enum Capability {
 	/// and LAN configuration, and its identify light. It erases nothing and stops nothing - those are administrative
 	/// requests, which need `admin-request` and a person. Appended last, for the reason `midi-output` states.
 	Bmc = 49,
+	/// THE TYPE-C CONNECTORS, READ: each connector's partner, roles, contract, offers, cable and modes, enumerated
+	/// and subscribed. Nothing it holds changes a connector. Appended last, for the reason `midi-output` states.
+	Typec = 50,
+	/// THE TYPE-C OPERATOR: a data-role or power-role swap, and an alternate mode entered or left, on a connector
+	/// whose platform offers it. Granted to no shipping program by default.
+	TypecControl = 51,
 }
 
 impl Capability {
@@ -260,6 +266,8 @@ impl Capability {
 			47 => Some(Capability::TpmMeasure),
 			48 => Some(Capability::TpmSeal),
 			49 => Some(Capability::Bmc),
+			50 => Some(Capability::Typec),
+			51 => Some(Capability::TypecControl),
 			_ => None,
 		}
 	}
@@ -1427,6 +1435,8 @@ impl Capability {
 			Capability::TpmMeasure => out.push_str("\"tpm-measure\""),
 			Capability::TpmSeal => out.push_str("\"tpm-seal\""),
 			Capability::Bmc => out.push_str("\"bmc\""),
+			Capability::Typec => out.push_str("\"typec\""),
+			Capability::TypecControl => out.push_str("\"typec-control\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1481,6 +1491,8 @@ impl Capability {
 			Capability::TpmMeasure => out.push_str("tpm-measure"),
 			Capability::TpmSeal => out.push_str("tpm-seal"),
 			Capability::Bmc => out.push_str("bmc"),
+			Capability::Typec => out.push_str("typec"),
+			Capability::TypecControl => out.push_str("typec-control"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1535,6 +1547,8 @@ impl Capability {
 			Capability::TpmMeasure => crate::codec::cbor::text(out, "tpm-measure"),
 			Capability::TpmSeal => crate::codec::cbor::text(out, "tpm-seal"),
 			Capability::Bmc => crate::codec::cbor::text(out, "bmc"),
+			Capability::Typec => crate::codec::cbor::text(out, "typec"),
+			Capability::TypecControl => crate::codec::cbor::text(out, "typec-control"),
 		}
 	}
 }

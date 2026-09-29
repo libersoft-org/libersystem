@@ -42,3 +42,6 @@ pub const CAP_ADMIN_AUDIT: &[u8] = b"ADMINAUDIT";
 pub const CAP_ADMIN_TEST: &[u8] = b"ADMINTEST";
 // THE BMC SERVICE'S ONE ROOT: every `bmc` grant is a fresh connection from it.
 pub const CAP_BMC: &[u8] = b"BMC";
+// TYPECSERVICE'S TWO ROOTS: the read, and the operator's requests.
+pub const CAP_TYPEC: &[u8] = b"TYPEC";
+pub const CAP_TYPEC_CONTROL: &[u8] = b"TYPECCONTROL";

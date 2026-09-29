@@ -97,6 +97,10 @@ name = "bmc_service"
 path = "src/bmc_service.rs"
 
 [[bin]]
+name = "typec_service"
+path = "src/typec_service.rs"
+
+[[bin]]
 name = "watchdog_service"
 path = "src/watchdog_service.rs"
 
@@ -187,6 +191,11 @@ required-features = ["development"]
 # through the BMC service's follow.
 name = "bmccheck"
 path = "src/bmccheck.rs"
+required-features = ["development"]
+
+[[bin]]
+name = "typeccheck"
+path = "src/typeccheck.rs"
 required-features = ["development"]
 
 [[bin]]

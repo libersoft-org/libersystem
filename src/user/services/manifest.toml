@@ -199,6 +199,14 @@ path = "user/libs/driver/i2c-client"
 owner = "ipmi"
 path = "user/libs/driver/ipmi"
 
+[[sources]]
+owner = "ucsi"
+path = "user/libs/driver/ucsi"
+
+[[sources]]
+owner = "usb-pd"
+path = "user/libs/driver/usb-pd"
+
 # The entropy pool's policy - what a seed submission is credited and what the pool refuses below its
 # threshold. A kernel dependency that lives outside the kernel for the reason `driver-binding` does:
 # the kernel is not host-testable and these are decisions a test has to be able to watch refuse.
@@ -410,6 +418,14 @@ owner = "bmc-client-provider"
 path = "user/libs/clients/bmc-client-provider"
 
 [[sources]]
+owner = "typec-client"
+path = "user/libs/clients/typec-client"
+
+[[sources]]
+owner = "typec-client-provider"
+path = "user/libs/clients/typec-client-provider"
+
+[[sources]]
 owner = "tpm-client"
 path = "user/libs/clients/tpm-client"
 
@@ -468,6 +484,10 @@ path = "user/libs/protocol/tpm-proto"
 [[sources]]
 owner = "bmc-proto"
 path = "user/libs/protocol/bmc-proto"
+
+[[sources]]
+owner = "typec-proto"
+path = "user/libs/protocol/typec-proto"
 
 [[sources]]
 owner = "modem-proto"
@@ -1421,6 +1441,18 @@ destination = "libexec/bmccheck.lsexe"
 providers = []
 development = true
 
+# THE TYPE-C GATES' PROBE, development-only: the connectors as TypeCService's subscribers see them, their `usb-c`
+# sources as PowerService's do, and the operator's requests - it is the one holder of that grant.
+[[programs]]
+name = "typeccheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/typeccheck.lsexe"
+providers = []
+development = true
+
 # THE UPS GATE'S PROBE, development-only: a live client and the operator of the UPS a USB device the host
 # builds publishes through the xHCI driver - PowerService's read and control authorities.
 [[programs]]
@@ -1740,6 +1772,17 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/bmc.lsexe"
 providers = ["base-proto", "bmc-client", "admin-client", "lsrt"]
+
+# THE TYPE-C TOOL: every connector's partner, roles, contract, offers, cable, modes and last refusal, through
+# TypeCService's read root. It holds the read and nothing else.
+[[programs]]
+name = "typec"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/typec.lsexe"
+providers = ["base-proto", "typec-client", "lsrt"]
 
 # THE FIRMWARE-DOWNLOAD REQUESTER, the one shipping holder of an administrative request connection: PermissionManager
 # scopes it to firmware download on `dfu:` targets, and every request it makes waits for a person on the protected
@@ -2656,7 +2699,6 @@ destination = "libexec/tpm_service.lsexe"
 providers = []
 
 # STATIC, FOR THE REASON `smartcard_service` IS: its decisions are `service-logic`'s, which no staged library publishes.
-# STATIC, FOR THE REASON `smartcard_service` IS: it links nothing a staged library publishes that it could import whole.
 [[programs]]
 name = "bmc_service"
 owner = "services"
@@ -2664,6 +2706,17 @@ role = "service"
 linkage = "static"
 stage = "volume"
 destination = "libexec/bmc_service.lsexe"
+providers = []
+
+# STATIC, FOR THE REASON `smartcard_service` IS: its registry and its requests are `service-logic`'s, which no staged
+# library publishes.
+[[programs]]
+name = "typec_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/typec_service.lsexe"
 providers = []
 
 [[programs]]
@@ -3306,6 +3359,52 @@ provides = [
 	{ kind = "power-source", most = 1, consumers = 1 },
 	{ kind = "watchdog", most = 1, consumers = 1 },
 	{ kind = "admin-executor", most = 2, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# UCSI OVER ACPI: the platform device whose `_HID` OR `_CID` is `PNP0CA0` - firmware on Intel's reference design gives it
+# its own `_HID`, `USBC000`, and names UCSI by `_CID`, so both rows are needed, as Linux's driver matches it. Its claim
+# maps the mailbox its `_CRS` names; its node channel carries the `_DSM` and the `Notify`. It publishes every
+# connector to TypeCService, and every connector that can sink to PowerService as a `usb-c` source. No DMA.
+[[programs]]
+name = "ucsi_acpi"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/ucsi_acpi.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", hid = "PNP0CA0" }, { transport = "platform", cid = "PNP0CA0" }]
+provides = [
+	{ kind = "typec-connector", most = 1, consumers = 1 },
+	{ kind = "power-source", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# A TYPE-C PORT CONTROLLER (TCPCI), A CHILD BINDING as HID over I2C is: the tree's `tcpci` node, or a namespace device
+# matched by `PRP0001` with that `compatible` in `_DSD`. It reaches the controller only through the I2C address and the
+# alert line DeviceManager mints on its controllers' publications, runs the Power Delivery sink engine itself, and
+# publishes its one connector to TypeCService and, as a `usb-c` source, to PowerService. No DMA.
+[[programs]]
+name = "tcpci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/tcpci.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", compatible = "tcpci" }]
+provides = [
+	{ kind = "typec-connector", most = 1, consumers = 1 },
+	{ kind = "power-source", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
 
@@ -5342,6 +5441,43 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:bmc@1/bmc"
 
+# THE TYPE-C CONNECTORS. It consumes every `typec-connector` publication through a catalogue connection minted for that
+# kind alone, holds no claim and publishes nothing, and serves two roots: SERVE, which enumerates and subscribes and
+# changes nothing, and CONTROL, which asks a connector's provider for a role swap or an alternate mode - one request
+# outstanding per connector, fifteen seconds, never retried. A connector's supply is PowerService's, from the same
+# driver.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance takes a fresh snapshot from every provider and starts a new
+# epoch, and its subscribers, whose streams closed with the old instance, subscribe again.
+[[services]]
+name = "typec_service"
+program = "typec_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["typec-connector"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:typec@1/typec"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:typec@1/typec-control"
+
 # THE FIRMWARE'S INTERPRETER. AML is firmware code and it can be wrong, so it runs here, where a defect costs a
 # restart: the `FirmwareInterpreter` privilege is ServiceManager's to hand on, at every start - `supervisor_role`
 # duplicates it from the copy the boot chain gave ServiceManager - and every authority the service has is minted by the
@@ -5920,6 +6056,13 @@ features = ["shared-image"]
 providers = ["bmc-proto"]
 
 [[libraries]]
+name = "typec-client"
+owner = "typec-client-provider"
+destination = "lib/clients/typec-client.lslib"
+features = ["shared-image"]
+providers = ["typec-proto"]
+
+[[libraries]]
 name = "tpm-client"
 owner = "tpm-client-provider"
 destination = "lib/clients/tpm-client.lslib"
@@ -5958,6 +6101,13 @@ providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 name = "bmc-proto"
 owner = "bmc-proto"
 destination = "lib/protocol/bmc-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "typec-proto"
+owner = "typec-proto"
+destination = "lib/protocol/typec-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 

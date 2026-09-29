@@ -220,6 +220,33 @@ pub fn validate(state: &SourceState) -> Result<(), InvalidReason> {
 	if state.controls.set_output != (state.controls.outlets > 0) {
 		return Err(InvalidReason::Contradiction);
 	}
+	if state.kind == crate::schema::SourceKind::UsbC {
+		usb_c(state)?;
+	}
+	Ok(())
+}
+
+/// A known VBUS above this is not a reading of any contract: Extended Power Range's highest, 48 V, reads up to
+/// 50.9 V within its tolerance, and a measurement adds its own error - 60 V stands well clear of both.
+pub const USB_C_MAX_MICROVOLTS: u64 = 60_000_000;
+
+// A `usb-c` SOURCE CARRIES ONLY WHAT THE KIND HAS: presence, the online state, measured voltage, current and power,
+// and a reported source fault. A capacity, a charge state, a runtime, a load, a temperature, a trip, a control or
+// another alarm is a field the kind does not have; a known voltage past the bound is no reading.
+fn usb_c(state: &SourceState) -> Result<(), InvalidReason> {
+	let lacking = [state.state_of_charge.state, state.runtime.state, state.load.state, state.remaining.state, state.full.state, state.design.state, state.temperature.state];
+	if lacking.iter().any(|value| *value != ValueState::Unsupported) || state.charge != crate::schema::ChargeState::Unknown || !state.trips.is_empty() {
+		return Err(InvalidReason::Contradiction);
+	}
+	if state.controls.set_output || state.controls.schedule_off || state.controls.cancel_off || state.controls.outlets != 0 {
+		return Err(InvalidReason::Contradiction);
+	}
+	if state.alarms.iter().any(|alarm| alarm.kind != AlarmKind::SourceFault || alarm.provenance != Provenance::Reported) {
+		return Err(InvalidReason::Contradiction);
+	}
+	if state.voltage.state == ValueState::Known && state.voltage.value > USB_C_MAX_MICROVOLTS {
+		return Err(InvalidReason::Range);
+	}
 	Ok(())
 }
 

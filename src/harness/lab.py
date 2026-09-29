@@ -297,8 +297,8 @@ PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
 # prints a prompt-shaped line from ending someone else's command.
 PROMPT_SETTLE = 0.25
 
-# How long a BOOT's wait lets the guest stay quiet, with the shell attached and no prompt at the end of
-# its output, before it types one empty line to have the prompt printed again. See `serve_request`.
+# How long a BOOT's wait lets the guest stay quiet, with a prompt the shell printed buried under later lines,
+# before it types one empty line to have the prompt printed again. See `serve_request`.
 BOOT_NUDGE_QUIET = 5.0
 
 # The broker's reply frame. `<magic> <outcome> <length>\n` then exactly `<length>` bytes.
@@ -595,16 +595,6 @@ def broker(serial, ctl_path=CTL_SOCK, log_path=SERIAL_LOG, console_path=None):
 		os.unlink(console_path)
 
 
-# Whether the guest's shell has taken the console, which is when an empty line typed at it comes back as
-# a prompt and not as input to anything else.
-def shell_attached(log_path):
-	try:
-		with open(log_path, 'rb') as handle:
-			return b'shell attached' in handle.read()
-	except OSError:
-		return False
-
-
 def serial_tail(log_path, size=256):
 	try:
 		with open(log_path, 'rb') as handle:
@@ -651,9 +641,10 @@ def serve_request(state, conn):
 		# arrive on their own clock - the network's address configuration among them - land after it,
 		# and nothing prints another prompt. A kernel built at opt-level 2 reaches the shell in 7 s
 		# instead of 22 s, before those lines, and its boot wait timed out at 240 s with the prompt in
-		# the log. So `lab boot` - and only it, on the instance it has just started, where no person's
-		# half-typed line can be sitting in the console - types ONE empty line once the guest has been
-		# quiet a while with the shell attached, and the shell answers it with a prompt.
+		# the log. So a boot's wait - `lab boot`, `dev-up` and `dev-reboot`, each on the instance it has
+		# just started or reset, where no person's half-typed line can be sitting in the console - types
+		# an empty line once the guest has been quiet a while with the shell's prompt buried, and the
+		# shell answers it with a prompt (the loop below says when).
 		nudge = len(parts) == 3 and parts[2] == 'nudge'
 	else:
 		# A request this broker does not implement is answered, not dropped. Silence reaches the
@@ -678,10 +669,17 @@ def serve_request(state, conn):
 	# prompt shape and keeps running no longer ends the request. A program that prints one and then
 	# blocks in silence still does, and closing that needs an unforgeable per-request sentinel from
 	# the guest shell, which is guest-side work this cannot do alone.
+	#
+	# THE NUDGE ANSWERS A PROMPT THE SHELL PRINTED IN THIS WAIT, and only that: the log's own "shell attached" is
+	# the PREVIOUS boot's after a reset, and a nudge taken on it was typed into a machine still booting and spent -
+	# after which the real prompt, buried by the next late line, was never asked for again. So a nudge is sent
+	# once the wait has seen the shell prompt, the output has buried it and gone quiet, and again each time
+	# another late line buries the prompt that nudge produced.
 	deadline = time.time() + timeout
 	outcome = 'timeout'
 	settled_at = None
 	quiet_since = time.time()
+	nudge_from = len(collected)
 	while time.time() < deadline:
 		ready, _, _ = select.select([serial], [], [], 0.2)
 		if serial in ready:
@@ -693,9 +691,10 @@ def serve_request(state, conn):
 			collected += data
 			settled_at = None
 			quiet_since = time.time()
-		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and shell_attached(state['log_path']):
+		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and PROMPT_ANYWHERE.search(collected, nudge_from):
 			serial.sendall(b'\n')
-			nudge = False
+			nudge_from = len(collected)
+			quiet_since = time.time()
 		if has_prompt(collected[-256:]):
 			if settled_at is None:
 				settled_at = time.time()

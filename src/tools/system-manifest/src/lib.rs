@@ -217,6 +217,8 @@ pub enum ProviderKindName {
 	Watchdog,
 	/// A BMC through one IPMI system interface, with the BMC service its one consumer.
 	Ipmi,
+	/// Every Type-C connector of one binding, with TypeCService its one consumer.
+	TypecConnector,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -269,6 +271,7 @@ impl ProviderKindName {
 			ProviderKindName::Tpm => 24,
 			ProviderKindName::Watchdog => 25,
 			ProviderKindName::Ipmi => 26,
+			ProviderKindName::TypecConnector => 27,
 		}
 	}
 }

@@ -1,0 +1,17 @@
+[package]
+name = "typec-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem Type-C channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["typec-proto/shared-image"]
+
+[dependencies]
+typec-proto = { path = "../../protocol/typec-proto" }
+
+[lints.rust]
+warnings = "deny"

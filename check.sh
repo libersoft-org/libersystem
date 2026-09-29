@@ -89,6 +89,17 @@ declare -A GATES=(
 	# AND THE BMC'S ADMINISTRATIVE ACTIONS through the protected screen, cold, one BMC a boot: the log's erasure
 	# declined, approved and cancelled by an event, and the chassis stops, each with its durable oracle.
 	["qemu-ipmi-admin"]="tools/check-ipmi-admin.sh"
+	# USB TYPE-C OVER UCSI: the fixture SSDT's `PNP0CA0` device and a harness PPM in four profiles, through the
+	# `ucsi-acpi` driver, TypeCService, PowerService, the `typec` tool and the probe - the PPM failing any break of the
+	# command discipline.
+	["typec-ucsi"]="tools/check-typec-ucsi.sh"
+	# AND THE HARNESS PPM ITSELF, on the host: its answers, its profiles and its discipline checks.
+	["ucsi-ppm"]="python3 harness/ucsi-ppm.py --self-test"
+	# A TYPE-C PORT CONTROLLER AND THE POWER DELIVERY SINK THE SYSTEM RUNS: the backend's TCPCI register file and a
+	# source partner written from the source side, described by the SSDT, through the `tcpci` driver bound as a child -
+	# every safety invariant, every timer's bound, a lost controller renegotiated through Soft_Reset, and the response
+	# budget over 200 negotiations under KVM. The partner's model is `i2c-backend`'s suite.
+	["typec-tcpci"]="tools/check-typec-tcpci.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

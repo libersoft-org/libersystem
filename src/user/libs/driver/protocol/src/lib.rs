@@ -500,6 +500,9 @@ pub mod provider {
 	/// A BASEBOARD MANAGEMENT CONTROLLER through one IPMI system interface, the `liber:bmc@1` `ipmi-provider`
 	/// contract, which the BMC service alone consumes.
 	pub const IPMI: u16 = 26;
+	/// A USB TYPE-C CONNECTOR, every connector of one `ucsi-acpi` or `tcpci` binding, the `liber:typec@1`
+	/// `typec-provider` contract, which TypeCService alone consumes.
+	pub const TYPEC_CONNECTOR: u16 = 27;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.
@@ -566,6 +569,10 @@ pub mod provider {
 	// policy key `watchdog.device` names.
 	pub const BMC_POWER_NAME: &[u8] = b"org.libersystem.ipmi.sensors";
 	pub const BMC_WATCHDOG_NAME: &[u8] = b"bmc";
+	// A TYPE-C BINDING'S TWO PUBLICATIONS: its connectors to TypeCService, and the partners that can supply it to
+	// PowerService as `usb-c` sources.
+	pub const TYPEC_NAME: &[u8] = b"org.libersystem.typec";
+	pub const TYPEC_POWER_NAME: &[u8] = b"org.libersystem.typec.power";
 }
 
 // WHAT A DRIVER CAN HONESTLY KNOW ABOUT ITSELF.

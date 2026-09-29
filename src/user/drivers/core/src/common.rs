@@ -701,6 +701,21 @@ pub fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Servi
 // consumer that never drains must not keep a settling scheduler from settling.
 pub fn wait_providers(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool) -> Option<ProviderReady> {
 	loop {
+		if let Some(ready) = wait_providers_inner(bootstrap, bind, serving, devices, housekeeping, 0)? {
+			return Some(ready);
+		}
+	}
+}
+
+// THE SAME WAIT, BOUNDED: `Some(None)` once `deadline` passes with nothing ready - for a provider whose own timers run
+// beside its consumers and its device, a port controller's engine among them.
+pub fn wait_providers_until(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], deadline: u64) -> Option<Option<ProviderReady>> {
+	wait_providers_inner(bootstrap, bind, serving, devices, false, deadline)
+}
+
+// Zero for `deadline` waits unbounded.
+fn wait_providers_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool, deadline: u64) -> Option<Option<ProviderReady>> {
+	loop {
 		match drain_control_into(bootstrap, bind, Some(serving)) {
 			Control::Continue => {}
 			Control::Stop => {
@@ -710,17 +725,20 @@ pub fn wait_providers(bootstrap: u64, bind: &Bind, serving: &mut Serving, device
 			Control::Ended => return None,
 		}
 		if let Some(index) = serving.take_new() {
-			return Some(ProviderReady::Connected(index));
+			return Some(Some(ProviderReady::Connected(index)));
 		}
 		for (index, &end) in serving.as_slice().iter().enumerate() {
 			if poll_ready(end) {
-				return Some(ProviderReady::Consumer(index));
+				return Some(Some(ProviderReady::Consumer(index)));
 			}
 		}
 		for (index, &device) in devices.iter().enumerate() {
 			if poll_ready(device) {
-				return Some(ProviderReady::Device(index));
+				return Some(Some(ProviderReady::Device(index)));
 			}
+		}
+		if deadline != 0 && clock() >= deadline {
+			return Some(None);
 		}
 		let mut set = [0u64; MAX_PROVIDER_CLIENTS + 8];
 		let live = serving.as_slice();
@@ -730,8 +748,8 @@ pub fn wait_providers(bootstrap: u64, bind: &Bind, serving: &mut Serving, device
 		set[..live.len()].copy_from_slice(live);
 		set[live.len()..live.len() + devices.len()].copy_from_slice(devices);
 		set[live.len() + devices.len()] = bootstrap;
-		let waited = if housekeeping { wait_any_periodic(&set[..live.len() + devices.len() + 1], 0) } else { wait_any(&set[..live.len() + devices.len() + 1], 0) };
-		if waited < 0 {
+		let waited = if housekeeping { wait_any_periodic(&set[..live.len() + devices.len() + 1], deadline) } else { wait_any(&set[..live.len() + devices.len() + 1], deadline) };
+		if waited < 0 && !(deadline != 0 && waited == ERR_TIMED_OUT) {
 			return None;
 		}
 	}

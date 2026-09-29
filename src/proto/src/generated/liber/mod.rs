@@ -36,3 +36,4 @@ pub use spool_proto::generated::liber::spool;
 pub use storage_proto::generated::liber::storage;
 pub use time_proto::generated::liber::time;
 pub use tpm_proto::generated::liber::tpm;
+pub use typec_proto::generated::liber::typec;

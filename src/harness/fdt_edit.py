@@ -8,10 +8,13 @@
 # `virtio,device29` child - a GPIO controller and an interrupt controller - and a fixture node whose
 # `interrupts-extended` names a line of that child; and the HID-over-I2C fixture (`hid-fixture`): the virtio-i2c
 # function's node with its `virtio,device22` child, the two `hid-over-i2c` devices on it, and their interrupts, level
-# and active low, on lines of the virtio-gpio function's child - the bindings Linux documents.
+# and active low, on lines of the virtio-gpio function's child - the bindings Linux documents; and the TCPCI fixture
+# (`tcpc-fixture`): the same bus with a `tcpci` port controller on it, its alert a line of the same child, and its
+# `usb-c-connector` child describing the gate's sink.
 #
 #   fdt_edit.py tree-fixture IN OUT --slot N [--line L]             write the firmware fixture tree
 #   fdt_edit.py hid-fixture IN OUT --i2c-slot N --gpio-slot M       write the HID-over-I2C fixture tree
+#   fdt_edit.py tcpc-fixture IN OUT --i2c-slot N --gpio-slot M      write the TCPCI fixture tree
 #   fdt_edit.py --self-test                                          build, edit and re-read a tree, writing nothing
 
 import struct
@@ -275,6 +278,26 @@ def hid_fixture(tree, i2c_slot, gpio_slot):
 	return tree
 
 
+# THE PORT CONTROLLER the backend models (`vhost-i2c-gpio.py --tcpc`): its address and its alert line; and THE BOARD, as
+# the TCPCI gate's SSDT describes it - Fixed 5 V at 3 A and 15 V at 2 A, operating at 15 W.
+TCPC_ADDRESS = 0x52
+TCPC_LINE = 5
+TCPC_SINK_PDOS = [(5000 // 50) << 10 | 3000 // 10, (15000 // 50) << 10 | 2000 // 10]
+TCPC_OPERATING_MICROWATTS = 15_000_000
+
+
+def tcpc_fixture(tree, i2c_slot, gpio_slot):
+	"""THE TCPCI FIXTURE: the virtio-i2c function's `virtio,device22` child, and on it a `tcpci` node - `reg` its address,
+	its alert a line of the virtio-gpio function's child, level and active low - whose `connector` child is the
+	`usb-c-connector` Linux's binding describes: a sink, its sink PDOs and its operating power."""
+	phandle = gpio_controller(tree, gpio_slot)
+	bus = virtio_function(tree, i2c_slot, VIRTIO_I2C, 'i2c')
+	bus.set('#address-cells', cells(1)).set('#size-cells', cells(0))
+	controller = bus.add(Node(f'tcpc@{TCPC_ADDRESS:x}', [('compatible', text('tcpci')), ('reg', cells(TCPC_ADDRESS)), ('interrupts-extended', cells(phandle, TCPC_LINE, IRQ_TYPE_LEVEL_LOW))]))
+	controller.add(Node('connector', [('compatible', text('usb-c-connector')), ('power-role', text('sink')), ('sink-pdos', cells(*TCPC_SINK_PDOS)), ('op-sink-microwatt', cells(TCPC_OPERATING_MICROWATTS))]))
+	return tree
+
+
 def self_test():
 	failures = []
 
@@ -314,6 +337,13 @@ def self_test():
 	screen = both.find('/pcie@10000000/i2c@4,0/i2c/touchscreen@10')
 	check('the touchscreen', (screen.prop('reg'), screen.prop('hid-descr-addr'), screen.prop('interrupts-extended')) if screen else None, (cells(0x10), cells(0x01), cells(6, 1, 8)))
 	check('one GPIO function', len([c for c in both.find('/pcie@10000000').children if c.name.startswith('gpio@')]), 1)
+	# THE TCPCI FIXTURE ON THE SAME TREE: the controller on the one bus, its connector below it.
+	tcpc_fixture(both, 4, 3)
+	three = parse(serialize(both))
+	controller = three.find('/pcie@10000000/i2c@4,0/i2c/tcpc@52')
+	check('the port controller', (controller.prop('compatible'), controller.prop('reg'), controller.prop('interrupts-extended')) if controller else None, (text('tcpci'), cells(0x52), cells(6, 5, 8)))
+	connector = three.find('/pcie@10000000/i2c@4,0/i2c/tcpc@52/connector')
+	check('its connector', (connector.prop('compatible'), connector.prop('power-role'), connector.prop('sink-pdos'), connector.prop('op-sink-microwatt')) if connector else None, (text('usb-c-connector'), text('sink'), cells(0x1912C, 0x4B0C8), cells(15_000_000)))
 	try:
 		tree.root.add(Node('liber-fixture'))
 		failures.append('a second node of one name was added')
@@ -330,13 +360,14 @@ def self_test():
 def main(argv):
 	if argv == ['--self-test']:
 		return self_test()
-	if len(argv) >= 3 and argv[0] == 'hid-fixture':
+	if len(argv) >= 3 and argv[0] in ('hid-fixture', 'tcpc-fixture'):
 		i2c_slot = int(argv[argv.index('--i2c-slot') + 1], 0) if '--i2c-slot' in argv else 0x15
 		gpio_slot = int(argv[argv.index('--gpio-slot') + 1], 0) if '--gpio-slot' in argv else 0x16
+		edit = hid_fixture if argv[0] == 'hid-fixture' else tcpc_fixture
 		with open(argv[1], 'rb') as source:
 			tree = parse(source.read())
 		with open(argv[2], 'wb') as destination:
-			destination.write(serialize(hid_fixture(tree, i2c_slot, gpio_slot)))
+			destination.write(serialize(edit(tree, i2c_slot, gpio_slot)))
 		return 0
 	if len(argv) >= 3 and argv[0] == 'tree-fixture':
 		slot = 3
@@ -350,7 +381,7 @@ def main(argv):
 		with open(argv[2], 'wb') as destination:
 			destination.write(serialize(tree_fixture(tree, slot, line)))
 		return 0
-	print('usage: fdt_edit.py tree-fixture IN OUT [--slot N] [--line L] | hid-fixture IN OUT [--i2c-slot N] [--gpio-slot M] | --self-test', file=sys.stderr)
+	print('usage: fdt_edit.py tree-fixture IN OUT [--slot N] [--line L] | hid-fixture|tcpc-fixture IN OUT [--i2c-slot N] [--gpio-slot M] | --self-test', file=sys.stderr)
 	return 2
 
 

@@ -135,7 +135,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 50] = [
+const VOCABULARY: [Capability; 52] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -231,6 +231,9 @@ const VOCABULARY: [Capability; 50] = [
 	Capability::TpmSeal,
 	// THE BMCS, READ: a fresh connection to the BMC service per launch. Its holder reads it by tag.
 	Capability::Bmc,
+	// THE TYPE-C CONNECTORS, read and operated: a fresh connection to TypeCService's root per launch, each read by tag.
+	Capability::Typec,
+	Capability::TypecControl,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -352,6 +355,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// THE BMC TOOL: the BMC service's read root, and a request connection its `admin_policy` row scopes to the BMC's
 		// two actions on `bmc:` targets.
 		b"bmc" => Some(granted("bmc", alloc::vec![Capability::AdminRequest, Capability::Bmc])),
+		// THE TYPE-C TOOL HOLDS THE READ ONLY. The operator grant goes to no shipping program: `typeccheck` is its
+		// one holder, as `powercheck` is `power-control`'s.
+		b"typec" => Some(granted("typec", alloc::vec![Capability::Typec])),
 		// THE CONFORMANCE RUN HOLDS THE READ AND NOTHING ELSE. It reaches its face through the
 		// catalogue, draws into memory it allocated itself, and prints its verdict on the console it
 		// was handed - so it needs no volume, no display and no scan authority.
@@ -398,6 +404,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"upscheck" => Some(granted("upscheck", alloc::vec![Capability::PowerState, Capability::PowerControl])),
 		// THE IPMI GATE'S PROBE: a live PowerService subscriber for a BMC's thermal zones, and the BMC service's read root.
 		b"bmccheck" => Some(granted("bmccheck", alloc::vec![Capability::PowerState, Capability::Bmc])),
+		// THE TYPE-C GATES' PROBE: a live PowerService subscriber for the connectors' `usb-c` sources, TypeCService's
+		// read root, and its operator root - the requests the gates make - and the device registry and policy through
+		// which it cycles the port controller's I2C controller, as `hidcheck` cycles the same controller.
+		b"typeccheck" => Some(granted("typeccheck", alloc::vec![Capability::Device, Capability::DevicePolicy, Capability::PowerState, Capability::Typec, Capability::TypecControl])),
 		// THE SMART-CARD GATE'S PROBES, development-only like the fixture they drive. `cardcheck` holds a
 		// grant on fixture reader A with every operation and the fixture's control endpoint; `cardhold` is
 		// the second client a queue needs; `cardread` holds a read-only grant, which is what its half of the
@@ -628,6 +638,8 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::TpmMeasure => b"TPMMEASURE",
 		Capability::TpmSeal => b"TPMSEAL",
 		Capability::Bmc => CAP_BMC,
+		Capability::Typec => CAP_TYPEC,
+		Capability::TypecControl => CAP_TYPEC_CONTROL,
 	}
 }
 
@@ -726,6 +738,9 @@ struct Clients {
 	admin_test: u64,
 	// THE BMC SERVICE'S ROOT, resolved by name like the others: every `bmc` grant is a fresh connection from it.
 	bmc: u64,
+	// TYPECSERVICE'S TWO ROOTS, resolved by name: every grant is a fresh connection from one of them.
+	typec: u64,
+	typec_control: u64,
 	// What the last grant resolved a selection to, for its audit entry: the exact reader a smart-card
 	// grant was minted for. Taken by the audit line that follows the grant, so it never outlives it.
 	grant_detail: String,
@@ -788,6 +803,8 @@ impl Clients {
 			// Minted per launch through TpmService's admin root, for the component: see `grant_for_task`.
 			Capability::Tpm | Capability::TpmMeasure | Capability::TpmSeal => 0,
 			Capability::Bmc => self.bmc,
+			Capability::Typec => self.typec,
+			Capability::TypecControl => self.typec_control,
 		}
 	}
 }
@@ -1300,6 +1317,9 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		Capability::AdminTest => (&mut clients.admin_test, CAP_ADMIN_TEST),
 		// A FRESH CONNECTION PER LAUNCH to the BMC service, which mints nothing per component.
 		Capability::Bmc => (&mut clients.bmc, CAP_BMC),
+		// A FRESH CONNECTION PER LAUNCH from TypeCService's read root or its operator root.
+		Capability::Typec => (&mut clients.typec, CAP_TYPEC),
+		Capability::TypecControl => (&mut clients.typec_control, CAP_TYPEC_CONTROL),
 		_ => {
 			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
 			return if dup >= 0 { dup as u64 } else { 0 };
@@ -2574,7 +2594,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, grant_detail: String::new() };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, grant_detail: String::new() };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

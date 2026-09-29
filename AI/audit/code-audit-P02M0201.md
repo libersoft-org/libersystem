@@ -131,3 +131,52 @@ DEFECTS FOUND AND FIXED ON THE WAY:
   pointer event or terminal input, all of which now record the log's size (`note_input`) - so an Enter never
   reaches a command that may still be running. Two harness tests (`ColdPromptTest`); the first was run against
   the version without the nudge and fails there.
+- THE PROPOSED 120 s BOOT BOUND DID NOT COVER THIS MACHINE'S DEVELOPMENT BOOT. The watchdog gate's BMC case, first
+  run: the orderly reboot gave the BMC 120000 ms at the notice (correct), and the next boot - its shell not
+  attached within the 30 s boot window, the drivers still binding - was reset by the BMC before the `ipmi`
+  driver bound; the boot after it found "stopped at bind, initial countdown 120000 ms, the last reset was its
+  own". The bound is armed at the notice, so it has to cover the shutdown sequence, the firmware and the boot
+  to the IPMI bind. The case is that the notice arms the CONFIGURED bound, so the gate now sets
+  `watchdog.boot-bound-ms` to 600000 for it; whether the shipping default of 120 s should be larger is added to
+  the owner's pending watchdog decisions (T/P/D, the default, the order, the notice bound).
+- The watchdog gate's other four cases (i6300esb, the reset, TCO, WDAT) passed in that run (2022 s in all).
+- AND THE BROKER'S NUDGE (`lab boot`, and now `dev-up`/`dev-reboot`) was spent on the log's "shell attached" -
+  after `dev-reboot`'s reset that is the PREVIOUS boot's line, so the one nudge went into a machine still booting
+  and the real prompt, buried by the BMC service's and the watchdog service's late lines, was never asked for
+  again (`dev.sh reboot` timed out at 300 s in the watchdog gate's BMC case). The broker now nudges only once
+  the wait has seen the shell's prompt and it has been buried, and again after each nudge's prompt is buried;
+  `shell_attached`, left unused, is removed. Harness host tests: 88 pass.
+
+## Verification (2026-09-29, x86_64)
+
+PASSED:
+- `./check.sh --gate ipmi` - 1886 s, eight development boots (ISA KCS alone, SSIF alone, ISA BT alone, PCI KCS
+  beside PCI BT, the pair, the harness BMC, malformed records, the orderly reboot).
+- `./check.sh --gate qemu-ipmi-admin` - 1645 s, six cold scenarios: the SEL clear declined then approved (journal
+  `requested declined requested granted consumed completed`), cancelled by an event (the harness record: Reserve
+  SEL at line 47, the event at 48, Clear SEL refused 0xC5 at 54; journal `failed`), hard reset (two boots), power
+  down (`shutdown`, no power-button line), soft shutdown (the power-button line after the request, `shutdown`),
+  power cycle (the driver's "refused ... with 0xd5", the tool's refusal, journal `failed`, running held 10 s, the
+  target `bmc:00000-0055-20@acpi:...`).
+- `./check.sh --gate watchdog` - the i6300esb, reset, TCO and WDAT cases passed (the run failed at the new BMC
+  case, found above); the BMC case alone, from the same script with cases 1-4 cut (a scratch copy), then PASSED
+  after the boot bound, carriage return and broker nudge fixes.
+- The kernel test `kernel.declared.the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc`:
+  `TEST_SELECTION=... ./test.sh --arch x86_64` after `./build.sh --arch x86_64` - 1 passed (28 s). The test
+  kernel also builds (`cd src/kernel && TEST=1 TEST_TAGS="" cargo build --tests`).
+- Host suites: `ipmi` 27, `power-model` 44, drivers 426, services logic 691, platform 17, system-manifest 28,
+  i2c-client 6; `ipmi-harness-bmc.py --self-test`; `harness/harness-test.py` 88.
+- `./gen.sh --check`, `./check.sh --gate source-hygiene` (after replacing three `said | grep -q` pipelines under
+  pipefail), `--gate grant-vocabulary`; `cargo check` of `service_manager`, `bmc_service` and `bmccheck` with and
+  without `development`.
+
+FAILED, NOT THIS MILESTONE'S: `--gate bootstrap-plan` - only `font_catalogue`, as before this work; the
+verify-model suite - its model load refuses a kernel test id (`the_global_clock_advances_once_per_period_however_
+many_cores_tick`) that a stale aarch64/riscv64 test binary still carries; rebuilt at the end of the job with the
+slow-arch builds.
+
+NOT RUN: the aarch64 and riscv64 cross-builds (the end of the job); the out-of-band cross-check (needs the owner's
+yes to install `openipmi` and `ipmitool`); the sleep case and the drivers' sleep exchange (P02M0197's).
+
+BLOCKERS AND QUESTIONS FOR THE OWNER: installing Debian's `openipmi` and `ipmitool` for the cross-check; whether the
+watchdog's 120 s boot bound should be larger (see the watchdog finding above).

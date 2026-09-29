@@ -10,11 +10,11 @@
 //! integer arithmetic wide enough to hold it exactly, truncating toward zero once, at the canonical
 //! unit. An overflow is an INVALID value with a reason, never a clamped healthy one.
 //!
-//! WHO CALLS WHAT. A producer decodes its own format - a HID report, an AML method's package - and
-//! hands `acpi` or `hid` the decoded numbers; those adapters are the only route from a source's units
-//! to `schema::SourceState`. PowerService calls `canon::validate` on what a provider publishes and
-//! never converts anything itself, so a producer that skipped the adapters is refused rather than
-//! translated twice.
+//! WHO CALLS WHAT. A producer decodes its own format - a HID report, an AML method's package, an IPMI
+//! sensor record, a Type-C connector's status - and hands `acpi`, `hid`, `ipmi` or `usbc` the decoded
+//! numbers; those adapters are the only route from a source's units to `schema::SourceState`.
+//! PowerService calls `canon::validate` on what a provider publishes and never converts anything
+//! itself, so a producer that skipped the adapters is refused rather than translated twice.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -25,6 +25,7 @@ pub mod canon;
 pub mod convert;
 pub mod hid;
 pub mod ipmi;
+pub mod usbc;
 
 /// The canonical vocabulary, as `liber:power@1` defines it.
 pub use power_proto::generated::liber::power::v1 as schema;

@@ -1,0 +1,12 @@
+[package]
+name = "ucsi"
+edition = "2024"
+description = "UCSI below the binding: the mailbox layouts, CCI, the commands and their answers, and the command discipline over a policy manager the caller reaches"
+
+# NOTHING THAT REACHES THE RUNTIME, AND THAT IS WHAT MAKES IT TESTABLE. Every answer here is a function of the mailbox's
+# bytes and of the order a policy manager answers in, so a host test drives the discipline against a scripted PPM in
+# the same process. The `ucsi-acpi` driver links it and supplies the mapped mailbox, `_DSM` and `Notify`.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

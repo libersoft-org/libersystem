@@ -209,6 +209,12 @@ name = "bmc"
 path = "src/bmc.rs"
 
 [[bin]]
+# THE TYPE-C TOOL: the one shipping holder of TypeCService's read grant. It reads every connector; no shipping program
+# holds the operator's requests.
+name = "typec"
+path = "src/typec.rs"
+
+[[bin]]
 # THE FIRMWARE-DOWNLOAD REQUESTER: the one shipping holder of an administrative request connection, scoped to
 # firmware download on DFU targets. It asks; a person on the protected screen decides.
 name = "dfu"
@@ -420,6 +426,8 @@ shared-image = [
 	"bluetooth-client-provider/shared-image",
 	"bmc-client/shared-image",
 	"bmc-client-provider/shared-image",
+	"typec-client/shared-image",
+	"typec-client-provider/shared-image",
 	"admin-client/shared-image",
 	"admin-client-provider/shared-image",
 	"config-client/shared-image",
@@ -480,6 +488,8 @@ bluetooth-client = { path = "../../libs/clients/bluetooth-client", optional = tr
 bluetooth-client-provider = { path = "../../libs/clients/bluetooth-client-provider", optional = true }
 bmc-client = { path = "../../libs/clients/bmc-client", optional = true }
 bmc-client-provider = { path = "../../libs/clients/bmc-client-provider", optional = true }
+typec-client = { path = "../../libs/clients/typec-client", optional = true }
+typec-client-provider = { path = "../../libs/clients/typec-client-provider", optional = true }
 admin-client = { path = "../../libs/clients/admin-client", optional = true }
 admin-client-provider = { path = "../../libs/clients/admin-client-provider", optional = true }
 network-client = { path = "../../libs/clients/network-client", optional = true }

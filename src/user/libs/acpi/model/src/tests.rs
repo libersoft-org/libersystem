@@ -234,6 +234,27 @@ fn a_device_is_described_with_its_resources_and_its_connections() {
 }
 
 #[test]
+fn a_prp0001_node_is_matched_by_its_dsd_compatible_strings() {
+	let properties = |compatible: aml::dsd::Value| aml::dsd::Properties { values: vec![(String::from("compatible"), compatible)], children: Vec::new() };
+	let path = aml::Path(vec![aml::Seg(*b"_SB_"), aml::Seg(*b"TCPC")]);
+	let prp = Identity { hid: Some(String::from("PRP0001")), cids: Vec::new(), uid: None, adr: None };
+	let one = properties::block(None, &properties(aml::dsd::Value::String(String::from("tcpci"))));
+	let described = node::describe(&path, &Role::Device { parent: None, class: None }, &prp, &[], one.bytes, &mut |_| None).expect("described");
+	assert_eq!(described.description.part.match_ids().iter().map(|id| (id.kind, id.text().to_vec())).collect::<Vec<_>>(), vec![(abi::MATCH_ID_HID, b"PRP0001".to_vec()), (abi::MATCH_ID_COMPATIBLE, b"tcpci".to_vec())]);
+	// A LIST, IN ORDER, and `PRP0001` as a `_CID` beside a vendor `_HID`.
+	let beside = Identity { hid: Some(String::from("LSFX0202")), cids: vec![String::from("PRP0001")], uid: None, adr: None };
+	let list = properties::block(None, &properties(aml::dsd::Value::Package(vec![aml::dsd::Value::String(String::from("nxp,ptn5110")), aml::dsd::Value::String(String::from("tcpci"))])));
+	let described = node::describe(&path, &Role::Device { parent: None, class: None }, &beside, &[], list.bytes, &mut |_| None).expect("described");
+	let compatibles: Vec<Vec<u8>> = described.description.part.match_ids().iter().filter(|id| id.kind == abi::MATCH_ID_COMPATIBLE).map(|id| id.text().to_vec()).collect();
+	assert_eq!(compatibles, vec![b"nxp,ptn5110".to_vec(), b"tcpci".to_vec()]);
+	// WITHOUT `PRP0001` the property matches nothing, and a compatible of another shape names nothing.
+	let plain = Identity { hid: Some(String::from("LSFX0202")), cids: Vec::new(), uid: None, adr: None };
+	let described = node::describe(&path, &Role::Device { parent: None, class: None }, &plain, &[], properties::block(None, &properties(aml::dsd::Value::String(String::from("tcpci")))).bytes, &mut |_| None).expect("described");
+	assert!(described.description.part.match_ids().iter().all(|id| id.kind != abi::MATCH_ID_COMPATIBLE));
+	assert!(node::compatibles(&properties::block(None, &properties(aml::dsd::Value::Integer(5))).bytes).is_empty());
+}
+
+#[test]
 fn a_row_past_its_bounds_is_refused_whole() {
 	let cids: Vec<String> = (0..abi::MAX_MATCH_IDS).map(|at| std::format!("LSFX{at:04}")).collect();
 	let identity = Identity { hid: Some(String::from("LSFX9999")), cids, uid: None, adr: None };

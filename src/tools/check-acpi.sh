@@ -316,7 +316,7 @@ has "AcpiService: acpi:\\_SB_.DRAC is a reservation (row" "q35's DRAC is not a r
 has "firmware: acpi:\\_SB_.PCI0.SA0_ is the companion of 0000:00:14.0" "the ivshmem function's companion was not joined"
 has "firmware: acpi:\\_SB_.PCI0.SA8_ is the companion of 0000:00:15.0" "the virtio-i2c function's companion was not joined"
 grep -a -q -F -- "firmware: acpi:\\_SB_.PCI0.SB0_ is the companion of 0000:00:16.0" "$log" || fail "the virtio-gpio function's companion was not joined"
-grep -a -q -F -- "_AEI lines [0x1000002,0x1000003], field lines [0x5]" "$log" || fail "the GPIO controller's companion does not list its two _AEI lines and its field line"
+grep -a -q -F -- "_AEI lines [0x1000002,0x1000003,0x1000004], field lines [0x5]" "$log" || fail "the GPIO controller's companion does not list its three _AEI lines and its field line"
 has "firmware: 0000:00:14.0 is now FIRMWARE-HELD" "the ivshmem function was not made firmware-held"
 has "AcpiService: acpi:\\_SB_.LSF1 is a platform device (row" "the fixture device LSFX0001 was not published"
 has "AcpiService: acpi:\\_SB_.LSF4 is a method-only device (row" "LSFX0002 _UID 0 was not published"
@@ -332,7 +332,7 @@ echo "acpi: every node of the DSDT and the fixture SSDT is accounted for"
 # THE BINDINGS FROM BEFORE THE NAMESPACE, handed their companions' node channels at the report; the grants.
 has "DeviceManager: handed virtio-i2c its node channel (acpi:\\_SB_.PCI0.SA8_) at the ACPI service's namespace-loaded report" "the virtio-i2c binding was not handed its companion's node channel at the report"
 grep -a -q -F -- "DeviceManager: handed virtio-gpio its node channel (" "$log" || fail "the virtio-gpio binding was not handed its companion's node channel"
-has "DeviceManager: granted the ACPI service 3 connection(s) of acpi:\\_SB_.PCI0.SB0_" "the GPIO controller's two _AEI lines and field line were not granted"
+has "DeviceManager: granted the ACPI service 4 connection(s) of acpi:\\_SB_.PCI0.SB0_" "the GPIO controller's three _AEI lines and field line were not granted"
 has "DeviceManager: granted the ACPI service 1 connection(s) of acpi:\\_SB_.PCI0.SA8_" "the I2C controller's field address was not granted"
 has "acpi-fixture: its node is acpi:\\_SB_.LSF1" "the fixture driver was not handed its node channel with its claim"
 # THE POWER CLASSES' BINDINGS, each publishing - settled before lsdev's first snapshot, so every row's state is too.
@@ -411,7 +411,7 @@ grep -a -q -E -- "firmware: the ACPI service's instance 2 has loaded its namespa
 now=$(grep -a -c -E -- "firmware: acpi:[^ ]+ is row [0-9]+" "$log" || true)
 ((now == arrivals)) || fail "the new instance's walk added rows ($now arrivals, $arrivals before)"
 [[ "$(grep -a -c -F -- "$drac" "$log")" == "2" ]] || fail "DRAC was not reported again as the same reservation ($drac)"
-await_line "DeviceManager: granted the ACPI service 3 connection(s) of acpi:\\_SB_.PCI0.SB0_" "the new instance was not granted the GPIO lines" 1 60
+await_line "DeviceManager: granted the ACPI service 4 connection(s) of acpi:\\_SB_.PCI0.SB0_" "the new instance was not granted the GPIO lines" 1 60
 await_line "acpi-fixture: its node is acpi:\\_SB_.LSF1" "the fixture driver was not handed its node again" 1 60
 rows >"$state/rows-after.log"
 cp "$state/rows-after.log" "$kept/"

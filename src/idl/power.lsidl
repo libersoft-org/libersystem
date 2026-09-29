@@ -21,6 +21,13 @@ enum source-kind {
 	ups          = 3,
 	load         = 4,
 	thermal-zone = 5,
+	/// THE PARTNER ON ONE USB TYPE-C CONNECTOR, as a supply. `present` - a partner is attached; `online` - this
+	/// machine sinks from it. Voltage, current and power carry ONLY what the connector measures (negative delivered
+	/// out of the partner into this machine), and nothing while no partner is attached. No capacity, charge state,
+	/// runtime, load, temperature, trips or controls. The contract and the offers are a LIMIT, not a measurement,
+	/// and are `liber:typec@1`'s. A laptop's ACPI AC adapter is a separate report of line power: a reader must not
+	/// add the two.
+	usb-c        = 6,
 }
 
 /// WHETHER A MEASUREMENT IS A MEASUREMENT. Every value below carries one of these, and none of them is

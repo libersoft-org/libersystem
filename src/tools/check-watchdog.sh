@@ -323,18 +323,25 @@ effective_ms() {
 next_bind() {
 	local baseline="$1"
 	await_line "watchdog [a-z]* at bind, initial countdown" "no boot's IPMI driver read its BMC's watchdog at bind" "$baseline" 300
-	grep -a -o -- "watchdog [a-z]* at bind, initial countdown [0-9]* ms.*" "$(serial_log)" | sed -n "$((baseline + 1))p"
+	grep -a -o -- "watchdog [a-z]* at bind, initial countdown [0-9]* ms.*" "$(serial_log)" | tr -d '\r' | sed -n "$((baseline + 1))p"
 }
 
 binds() {
 	seen "watchdog [a-z]* at bind, initial countdown"
 }
 
-# THE BMC ARMED SHORT: the policy naming it, the TCO disarmed beside it.
+# THE BOOT BOUND the orderly reboot arms, set for this case: the proposed 120 s did not cover this machine's development
+# image - its shutdown sequence and the next boot to the IPMI driver's bind - and the BMC reset the booting machine.
+# The case is that the notice arms the CONFIGURED bound, so it configures one the boot fits in.
+BOOT_BOUND_MS=600000
+
+# THE BMC ARMED SHORT: the policy naming it, the boot bound set, the TCO disarmed beside it.
 arm_bmc() {
-	local armed disarmed
+	local armed disarmed out
 	armed=$(seen "WatchdogService: armed bmc at")
 	disarmed=$(seen "WatchdogService: disarmed tco")
+	out="$(launch set watchdog.boot-bound-ms "$BOOT_BOUND_MS")" || fail "set watchdog.boot-bound-ms was not run: $out"
+	grep -q "ok" <<<"$out" || fail "set watchdog.boot-bound-ms was refused: $out"
 	policy bmc
 	await_line "WatchdogService: armed bmc at" "the service did not arm the BMC's watchdog" "$armed"
 	await_line "WatchdogService: disarmed tco" "the service did not disarm the TCO beside the BMC's" "$disarmed"
@@ -354,8 +361,8 @@ baseline="$(binds)"
 ./lab.sh sh --timeout 20 reboot >/dev/null 2>&1 || true
 bind="$(next_bind "$baseline")"
 after="$(tail -n +"$((before + 1))" "$(serial_log)")"
-grep -q "WatchdogService: gave bmc 120000 ms and a last pet for the shutdown" <<<"$after" || fail "the orderly reboot did not give the BMC's watchdog the boot bound"
-[[ "$bind" == "watchdog running at bind, initial countdown 120000 ms" ]] || fail "after the orderly reboot the BMC's watchdog must be found running with the boot bound and no expiry (read: $bind)"
+grep -q "WatchdogService: gave bmc $BOOT_BOUND_MS ms and a last pet for the shutdown" <<<"$after" || fail "the orderly reboot did not give the BMC's watchdog the boot bound"
+[[ "$bind" == "watchdog running at bind, initial countdown $BOOT_BOUND_MS ms" ]] || fail "after the orderly reboot the BMC's watchdog must be found running with the boot bound and no expiry (read: $bind)"
 echo "watchdog: the orderly reboot gave the BMC's watchdog the boot bound, and the next bind found it running with it"
 
 # THE SAME REBOOT WITHOUT THE NOTICE: the short timeout survives - found running, or expired first.
