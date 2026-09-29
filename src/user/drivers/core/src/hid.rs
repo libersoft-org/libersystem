@@ -115,6 +115,10 @@ struct Segment {
 	occurrence: u16,
 	/// The Input item declared a null state.
 	null_state: bool,
+	/// WHICH LOGICAL COLLECTION THE FIELD IS IN - the innermost one, numbered in the order collections were opened; zero
+	/// in none. A multi-touch report declares each finger as one, so this is what groups a contact's fields,
+	/// whichever order the device declared them in.
+	logical: u32,
 	/// The field is in a GAMEPAD collection, and so in no pointer, key, consumer or contact path.
 	gamepad: bool,
 }
@@ -308,10 +312,17 @@ impl Layout {
 
 	// Decode the contacts of report `id`, answering how many were written.
 	//
-	// A NEW CONTACT BEGINS AT EACH CONTACT IDENTIFIER, which is how a multi-touch report says where
-	// one finger's fields end and the next one's begin: the identifier, its tip switch and its pair
-	// of axes are declared together inside one collection, repeated per finger. A reader that took
-	// every X on the page would take the LAST finger's for all of them.
+	// A NEW CONTACT BEGINS WHERE A FINGER'S LOGICAL COLLECTION BEGINS, which is how a multi-touch
+	// report says where one finger's fields end and the next one's begin: the identifier, its tip
+	// switch and its pair of axes are declared together inside one collection, repeated per finger.
+	// A reader that took every X on the page would take the LAST finger's for all of them.
+	//
+	// AND NOT AT THE IDENTIFIER, which is where this began (corrected 2026-09-29): most digitizers
+	// declare the tip switch BEFORE the identifier, so a contact begun at the identifier took each
+	// finger's tip for the finger before it - the first finger touching as the second, the last one
+	// never touching at all. Found by the HID-over-I2C touchscreen's descriptor, which declares
+	// them in that order. A descriptor that declares its contacts flat, in no logical collection
+	// each, still begins one at each identifier: nothing else says where a finger begins.
 	//
 	// AND CONTACT COUNT IS WHAT SAYS HOW MANY ARE REAL. A digitizer declares slots for every finger
 	// it can ever report and fills the unused ones with whatever was there before - so a reader that
@@ -322,7 +333,8 @@ impl Layout {
 			return 0;
 		}
 		let mut written: usize = 0;
-		let mut open: Option<Contact> = None;
+		// The contact being read, and the logical collection it is (zero for a flat one).
+		let mut open: Option<(Contact, u32)> = None;
 		let mut count: Option<usize> = None;
 		// IN BIT ORDER AND NOT DECLARATION ORDER, because what groups a contact's fields is where
 		// they sit in the report, and a descriptor may declare the pieces in any order it likes.
@@ -332,41 +344,35 @@ impl Layout {
 			for i in 0..seg.count {
 				let bit: u32 = seg.bit_offset + i * seg.size;
 				let usage: u16 = (seg.usage_for(i) & 0xffff) as u16;
-				if seg.page == PAGE_DIGITIZER {
-					match usage {
-						USAGE_CONTACT_COUNT => {
-							count = Some(field(body, bit, seg.size) as usize);
-							continue;
-						}
-						USAGE_CONTACT_IDENTIFIER => {
-							if let Some(done) = open.take()
-								&& written < out.len()
-							{
-								out[written] = done;
-								written += 1;
-							}
-							open = Some(Contact { id: field(body, bit, seg.size) as u8, tip: false, x: 0, y: 0 });
-							continue;
-						}
-						USAGE_TIP_SWITCH => {
-							if let Some(contact) = open.as_mut() {
-								contact.tip = field(body, bit, seg.size) != 0;
-							}
-							continue;
-						}
-						_ => continue,
-					}
+				let digitizer = seg.page == PAGE_DIGITIZER;
+				if digitizer && usage == USAGE_CONTACT_COUNT {
+					count = Some(field(body, bit, seg.size) as usize);
+					continue;
 				}
-				let Some(contact) = open.as_mut() else { continue };
-				let axis: &mut i32 = match usage {
-					USAGE_X => &mut contact.x,
-					USAGE_Y => &mut contact.y,
-					_ => continue,
-				};
-				*axis = scale(seg.reading(body, bit), seg.logical_min, seg.logical_max);
+				if !(digitizer && matches!(usage, USAGE_CONTACT_IDENTIFIER | USAGE_TIP_SWITCH) || !digitizer && matches!(usage, USAGE_X | USAGE_Y)) {
+					continue;
+				}
+				let begins = if seg.logical != 0 { open.as_ref().is_none_or(|(_, at)| *at != seg.logical) } else { digitizer && usage == USAGE_CONTACT_IDENTIFIER };
+				if begins {
+					if let Some((done, _)) = open.take()
+						&& written < out.len()
+					{
+						out[written] = done;
+						written += 1;
+					}
+					open = Some((Contact::default(), seg.logical));
+				}
+				let Some((contact, _)) = open.as_mut() else { continue };
+				match (digitizer, usage) {
+					(true, USAGE_CONTACT_IDENTIFIER) => contact.id = field(body, bit, seg.size) as u8,
+					(true, USAGE_TIP_SWITCH) => contact.tip = field(body, bit, seg.size) != 0,
+					(false, USAGE_X) => contact.x = scale(seg.reading(body, bit), seg.logical_min, seg.logical_max),
+					(false, USAGE_Y) => contact.y = scale(seg.reading(body, bit), seg.logical_min, seg.logical_max),
+					_ => {}
+				}
 			}
 		}
-		if let Some(done) = open.take()
+		if let Some((done, _)) = open.take()
 			&& written < out.len()
 		{
 			out[written] = done;
@@ -425,6 +431,23 @@ impl Layout {
 			}
 		}
 		matched
+	}
+
+	/// THE APPLICATION COLLECTION report `id`'s input fields are declared in, page-extended - `None` for an id no input
+	/// field carries, or whose fields lie in no application collection.
+	pub fn application_of(&self, id: u8) -> Option<u32> {
+		self.segs.iter().find(|s| s.report_id == id && s.application != 0).map(|s| s.application)
+	}
+
+	/// Every application collection an input field is declared in, page-extended, each once, in declaration order.
+	pub fn applications(&self) -> Vec<u32> {
+		let mut out: Vec<u32> = Vec::new();
+		for seg in self.segs.iter().filter(|s| s.application != 0) {
+			if !out.contains(&seg.application) {
+				out.push(seg.application);
+			}
+		}
+		out
 	}
 
 	/// EVERY GAMEPAD THIS DESCRIPTOR DECLARES, in the order its collections were declared, each with its
@@ -636,7 +659,9 @@ pub fn parse(desc: &[u8]) -> Layout {
 	let mut over_nested: bool = false;
 	// The open collections - their kind, their usage and which occurrence of it - and every usage seen, for the
 	// application a field is in: the rule `fields` applies.
-	let mut collections: Vec<(u32, u32, u16)> = Vec::new();
+	let mut collections: Vec<(u32, u32, u16, u32)> = Vec::new();
+	// Every collection opened so far, which numbers the next one.
+	let mut opened: u32 = 0;
 	let mut seen: Vec<(u32, u16)> = Vec::new();
 	let mut i: usize = 0;
 	while i < desc.len() {
@@ -689,7 +714,8 @@ pub fn parse(desc: &[u8]) -> Layout {
 								0
 							}
 						};
-						collections.push((data, usage, occurrence));
+						opened = opened.saturating_add(1);
+						collections.push((data, usage, occurrence, opened));
 					}
 				} else if tag == 12 {
 					if depth <= MAX_COLLECTION_DEPTH {
@@ -712,8 +738,9 @@ pub fn parse(desc: &[u8]) -> Layout {
 					let end: u32 = cursor.saturating_add(bits);
 					if data & INPUT_CONSTANT == 0 && interesting && g.size >= 1 && g.size <= 32 && end <= MAX_REPORT_BYTES * 8 {
 						let logical_max: i32 = if g.logical_min >= 0 && g.logical_max < g.logical_min { g.logical_max_raw as i32 } else { g.logical_max };
-						let (application, occurrence) = collections.iter().find(|&&(kind, _, _)| kind == 1).map_or((0, 0), |&(_, usage, occurrence)| (usage, occurrence));
-						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max, depth, unit: g.unit, unit_exponent: g.unit_exponent, application, occurrence, null_state: data & INPUT_NULL_STATE != 0, gamepad: false });
+						let (application, occurrence) = collections.iter().find(|&&(kind, _, _, _)| kind == 1).map_or((0, 0), |&(_, usage, occurrence, _)| (usage, occurrence));
+						let logical = collections.iter().rev().find(|&&(kind, _, _, _)| kind == 2).map_or(0, |&(_, _, _, number)| number);
+						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max, depth, unit: g.unit, unit_exponent: g.unit_exponent, application, occurrence, null_state: data & INPUT_NULL_STATE != 0, gamepad: false, logical });
 					}
 					*cursor = cursor.saturating_add(bits);
 				}

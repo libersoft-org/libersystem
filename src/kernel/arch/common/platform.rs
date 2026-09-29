@@ -53,6 +53,7 @@ pub fn report_smbios(entry: u64, phys_to_virt: fn(u64) -> u64) {
 		Err(refusal) => crate::serial_println!("smbios: {}.{} - the structure table is refused - {refusal:?}", point.major, point.minor),
 	}
 	let _ = smbios::ipmi_records(table, &point, |record| {
+		crate::firmware::note_ipmi_record(record.instance as usize, record.interface, record.address());
 		let interface = match record.interface {
 			smbios::IPMI_KCS => "KCS",
 			smbios::IPMI_SMIC => "SMIC",
@@ -112,6 +113,15 @@ pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line
 			continue;
 		};
 		let name = alloc::string::String::from_utf8_lossy(&identity[..len]).into_owned();
+		// A PCI FUNCTION'S NODE is its companion - joined to the function's row the bus scan made, never a row of its
+		// own - and what its children describe is the function's.
+		if node.bus == fdt::NodeBus::Pci {
+			match node.pci_function() {
+				Some((bus, dev, func)) => crate::firmware::tree_companion(&identity[..len], bus, dev, func),
+				None => crate::serial_println!("device: {name} is a PCI child whose reg names no function - not joined"),
+			}
+			continue;
+		}
 		if node.reg_refused {
 			crate::serial_println!("device: {name} is not published - its reg could not be read or translated to a physical address");
 			continue;

@@ -599,6 +599,11 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			"tpm_driver" | "uart16550" => DmaPolicy::None,
 			// THE WATCHDOGS MASTER NOTHING: a timer is armed and fed through its registers.
 			"i6300esb" | "tco" | "wdat" => DmaPolicy::None,
+			// THE ACPI GATE'S FIXTURE DRIVER: a namespace device's platform row, reached through its window and its
+			// node channel.
+			"acpi_fixture" => DmaPolicy::None,
+			// HID OVER I2C: a child binding, whose every byte crosses its controller's scoped connection.
+			"i2c_hid" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");

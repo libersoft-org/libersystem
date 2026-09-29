@@ -57,10 +57,10 @@ const NOTIFY_EJECT: u64 = 3;
 // How long a GPIO or serial-bus controller has to answer one transaction.
 const CONTROLLER_TICKS: u64 = TICKS_PER_SECOND / 2;
 
+// ONE LINE, WRITTEN WHOLE, so another process's output never lands inside it.
 fn say(text: &str) {
-	print(b"AcpiService: ");
-	print(text.as_bytes());
-	print(b"\n");
+	let line = format!("AcpiService: {text}\n");
+	print(line.as_bytes());
 }
 
 fn now_ns() -> u64 {
@@ -114,8 +114,11 @@ fn errno_text(errno: i64) -> &'static str {
 
 // ---------------------------------------------------------------------------------------------- the host
 
-// One SystemMemory region the kernel mapped for this instance.
+// One SystemMemory region the kernel mapped for this instance, and the node whose region it is: a mapping is reached
+// only by the node it was minted for - the kernel's policy decides by node, and a second node's region over the same
+// memory is asked for in its own right.
 struct Mapped {
+	node: String,
 	base: u64,
 	len: u64,
 	virt: u64,
@@ -184,6 +187,8 @@ struct Firmware {
 	// Companion nodes by identity, so a region a companion declares names its function.
 	companions: Vec<(String, Function)>,
 	ec: Option<aml::ec::Ec<EcPorts>>,
+	// The embedded controller's `_GLK` said 1: every access to it holds the firmware's global lock.
+	ec_glk: bool,
 	held: Vec<Held>,
 	notifications: Vec<(Path, u64)>,
 	facs_lock: Option<u64>,
@@ -206,12 +211,12 @@ impl Firmware {
 
 	// THE MAPPING an address is in, mapping the announced region first when it covers the address.
 	fn memory(&mut self, address: u64, bytes: u64) -> Result<u64, HostError> {
-		if let Some(mapped) = self.regions.iter().find(|mapped| address >= mapped.base && address + bytes <= mapped.base + mapped.len) {
-			return Ok(mapped.virt + (address - mapped.base));
-		}
 		let Some((node, Space::SystemMemory, base, len)) = self.current.clone() else {
 			return Err(self.refuse(format!("a SystemMemory access at {address:#x} outside any region")));
 		};
+		if let Some(mapped) = self.regions.iter().find(|mapped| mapped.node == node && address >= mapped.base && address + bytes <= mapped.base + mapped.len) {
+			return Ok(mapped.virt + (address - mapped.base));
+		}
 		if address < base || address + bytes > base + len {
 			return Err(self.refuse(format!("a SystemMemory access at {address:#x} outside {node}'s region")));
 		}
@@ -233,7 +238,7 @@ impl Firmware {
 			return Err(HostError::Failed(format!("{node}'s region could not be mapped")));
 		}
 		// THE HANDLE STAYS OPEN: the mapping lives while this instance does, and goes with it.
-		self.regions.push(Mapped { base, len, virt: virt as u64 });
+		self.regions.push(Mapped { node, base, len, virt: virt as u64 });
 		Ok(virt as u64 + (address - base))
 	}
 
@@ -310,6 +315,34 @@ impl Firmware {
 	}
 }
 
+impl Firmware {
+	// ONE EMBEDDED CONTROLLER TRANSACTION, under the global lock when the controller's `_GLK` asks for it - taken with a
+	// bound, since the firmware holds it for SMM work of its own.
+	fn ec_access<R>(&mut self, access: impl FnOnce(&mut aml::ec::Ec<EcPorts>) -> Result<R, aml::ec::EcError>) -> Result<R, HostError> {
+		if self.ec.is_none() {
+			return Err(HostError::Unavailable(String::from("no embedded controller transport")));
+		}
+		let locked = self.ec_glk;
+		if locked {
+			let until = now_ns() + 100_000_000;
+			while !self.global_lock(true) {
+				if now_ns() > until {
+					return Err(HostError::Failed(String::from("the global lock the embedded controller needs was not released")));
+				}
+				core::hint::spin_loop();
+			}
+		}
+		let answer = match self.ec.as_mut() {
+			Some(ec) => access(ec).map_err(|error| HostError::Failed(format!("the embedded controller: {error:?}"))),
+			None => Err(HostError::Unavailable(String::from("no embedded controller transport"))),
+		};
+		if locked {
+			self.global_lock(false);
+		}
+		answer
+	}
+}
+
 // A resource source's path as a row identity, when it is absolute.
 fn absolute_identity(text: &str) -> Option<String> {
 	let name = aml::NameString::parse(text)?;
@@ -371,13 +404,14 @@ impl Host for Firmware {
 				Ok(value)
 			}
 			Space::EmbeddedControl => {
-				let Some(ec) = self.ec.as_mut() else { return Err(HostError::Unavailable(String::from("no embedded controller transport"))) };
-				let mut value = 0u64;
-				for at in 0..access.width as u64 / 8 {
-					let byte = ec.read((access.address + at) as u8).map_err(|error| HostError::Failed(format!("the embedded controller: {error:?}")))?;
-					value |= (byte as u64) << (8 * at);
-				}
-				Ok(value)
+				let (address, bytes) = (access.address, access.width as u64 / 8);
+				self.ec_access(|ec| {
+					let mut value = 0u64;
+					for at in 0..bytes {
+						value |= (ec.read((address + at) as u8)? as u64) << (8 * at);
+					}
+					Ok(value)
+				})
 			}
 			other => Err(self.refuse(format!("a {} access", other.name()))),
 		}
@@ -422,11 +456,13 @@ impl Host for Firmware {
 				Ok(())
 			}
 			Space::EmbeddedControl => {
-				let Some(ec) = self.ec.as_mut() else { return Err(HostError::Unavailable(String::from("no embedded controller transport"))) };
-				for at in 0..access.width as u64 / 8 {
-					ec.write((access.address + at) as u8, (value >> (8 * at)) as u8).map_err(|error| HostError::Failed(format!("the embedded controller: {error:?}")))?;
-				}
-				Ok(())
+				let (address, bytes) = (access.address, access.width as u64 / 8);
+				self.ec_access(|ec| {
+					for at in 0..bytes {
+						ec.write((address + at) as u8, (value >> (8 * at)) as u8)?;
+					}
+					Ok(())
+				})
 			}
 			// A GENERALPURPOSEIO WRITE IS REFUSED BY NAME: output lines are not supported.
 			Space::GeneralPurposeIo => Err(self.refuse(String::from("a GeneralPurposeIo write - output lines are not supported"))),
@@ -441,21 +477,21 @@ impl Host for Firmware {
 		let mut client = i2c_device::Client::with_deadline(ChannelTransport { chan }, clock() + CONTROLLER_TICKS);
 		let command = command as u8;
 		let answered = match (protocol, write) {
-			(aml::host::protocol::QUICK, write) => client.quick(write.is_none()),
-			(aml::host::protocol::SEND_RECEIVE, Some(bytes)) => client.send_byte(bytes.first().copied().unwrap_or(0), false),
-			(aml::host::protocol::SEND_RECEIVE, None) => client.receive_byte(false),
-			(aml::host::protocol::BYTE, Some(bytes)) => client.write_byte_data(command, bytes.first().copied().unwrap_or(0), false),
-			(aml::host::protocol::BYTE, None) => client.read_byte_data(command, false),
-			(aml::host::protocol::WORD, Some(bytes)) => client.write_word_data(command, u16::from_le_bytes([bytes.first().copied().unwrap_or(0), bytes.get(1).copied().unwrap_or(0)]), false),
-			(aml::host::protocol::WORD, None) => client.read_word_data(command, false),
-			(aml::host::protocol::BLOCK, Some(bytes)) => client.block_write(command, bytes, false),
-			(aml::host::protocol::BLOCK, None) => client.block_read(command, false),
+			(aml::host::protocol::QUICK, write) => client.quick(&write.is_none()),
+			(aml::host::protocol::SEND_RECEIVE, Some(bytes)) => client.send_byte(&bytes.first().copied().unwrap_or(0), &false),
+			(aml::host::protocol::SEND_RECEIVE, None) => client.receive_byte(&false),
+			(aml::host::protocol::BYTE, Some(bytes)) => client.write_byte_data(&command, &bytes.first().copied().unwrap_or(0), &false),
+			(aml::host::protocol::BYTE, None) => client.read_byte_data(&command, &false),
+			(aml::host::protocol::WORD, Some(bytes)) => client.write_word_data(&command, &u16::from_le_bytes([bytes.first().copied().unwrap_or(0), bytes.get(1).copied().unwrap_or(0)]), &false),
+			(aml::host::protocol::WORD, None) => client.read_word_data(&command, &false),
+			(aml::host::protocol::BLOCK, Some(bytes)) => client.block_write(&command, bytes, &false),
+			(aml::host::protocol::BLOCK, None) => client.block_read(&command, &false),
 			(aml::host::protocol::BYTES, Some(bytes)) => {
 				let mut data = vec![command];
 				data.extend_from_slice(&bytes[..bytes.len().min(length as usize)]);
 				client.write(&data)
 			}
-			(aml::host::protocol::BYTES, None) => client.i2c_block_read(command, length, false),
+			(aml::host::protocol::BYTES, None) => client.i2c_block_read(&command, &length, &false),
 			_ => return Err(self.refuse(format!("serial-bus protocol {protocol:#04x} at {address:#04x}"))),
 		};
 		match answered {
@@ -657,27 +693,23 @@ impl Service {
 			let has = |aml: &Aml, node: NodeId, name: &[u8; 4]| aml.ns.child(node, Seg(*name)).is_some();
 			let objects = node::Objects { bcl: has(&self.aml, item.node, b"_BCL"), bcm: has(&self.aml, item.node, b"_BCM"), parent_dod: has(&self.aml, parent, b"_DOD"), parent_dos: has(&self.aml, parent, b"_DOS") };
 			let role = node::role(item.kind, &identity, inherited, &objects);
-			// A BRIDGE'S COMPANION roots the functions behind it at its secondary bus, read from the bridge itself.
-			let (segment, bbn) = match role {
-				Role::HostBridge => (self.integer(item.node, b"_SEG").unwrap_or(0) as u16, self.integer(item.node, b"_BBN").unwrap_or(0) as u8),
-				_ => (0, 0),
-			};
-			let secondary = match role {
-				Role::Companion { segment, bus, device, function } => {
-					let function = Function { segment, bus, device, function };
-					let header = pci_read(self.host.privilege, function, 0x0E, 1).unwrap_or(0xFF);
-					if header & 0x7F == 1 { pci_read(self.host.privilege, function, 0x19, 1).map(|bus| bus as u8) } else { None }
-				}
-				_ => None,
-			};
-			scopes.push((item.node, node::scope_for(&role, segment, bbn, secondary, inherited)));
+			let scope = self.role_scope(item.node, &role, inherited);
+			scopes.push((item.node, scope));
 			classified.push((item, identity, role));
 		}
 		let mut reported = Vec::new();
-		// RESERVATIONS FIRST, so every new row of the walk is kept out of their ranges.
-		for pass in [true, false] {
+		// RESERVATIONS FIRST, so every new row of the walk is kept out of their ranges; THEN THE COMPANIONS, so a device's
+		// connection that names a controller's companion joins that controller's row even where the walk reaches the
+		// controller after the device - a touchpad below the I2C controller's node names a GPIO controller whose node
+		// comes later in the namespace; then everything else.
+		let pass_of = |role: &Role| match role {
+			Role::Reservation => 0,
+			Role::Companion { .. } => 1,
+			_ => 2,
+		};
+		for pass in 0..3 {
 			for (item, identity, role) in classified.iter() {
-				if (*role == Role::Reservation) != pass {
+				if pass_of(role) != pass {
 					continue;
 				}
 				if let Some(identity_text) = self.account(item, identity, role) {
@@ -689,6 +721,58 @@ impl Service {
 			say(&format!("the walk found {} node(s)", classified.len()));
 		}
 		reported
+	}
+
+	// THE SCOPE A ROLE MAKES FOR WHAT IS BELOW IT: a host bridge's bus from its `_SEG` and `_BBN`; a bridge's companion
+	// roots the functions behind it at its secondary bus, read from the bridge itself.
+	fn role_scope(&mut self, node: NodeId, role: &Role, inherited: Option<Scope>) -> Option<Scope> {
+		let (segment, bbn) = match role {
+			Role::HostBridge => (self.integer(node, b"_SEG").unwrap_or(0) as u16, self.integer(node, b"_BBN").unwrap_or(0) as u8),
+			_ => (0, 0),
+		};
+		let secondary = match *role {
+			Role::Companion { segment, bus, device, function } => {
+				let function = Function { segment, bus, device, function };
+				let header = pci_read(self.host.privilege, function, 0x0E, 1).unwrap_or(0xFF);
+				if header & 0x7F == 1 { pci_read(self.host.privilege, function, 0x19, 1).map(|bus| bus as u8) } else { None }
+			}
+			_ => None,
+		};
+		node::scope_for(role, segment, bbn, secondary, inherited)
+	}
+
+	// THE COMPANIONS, KNOWN BEFORE THE WALK RUNS ANY `_STA`: a region a companion node declares names its function when
+	// the kernel is asked to map it - the firmware-held rule - and the walk's own `_STA` methods may reach one.
+	fn pre_companions(&mut self) {
+		let mut scopes: Vec<(NodeId, Option<Scope>)> = Vec::new();
+		for node in self.aml.ns.descendants(aml::ROOT) {
+			if self.aml.kind(node) != aml::Kind::Device {
+				continue;
+			}
+			let Ok(identity) = self.aml.identity(node, &mut self.host) else { continue };
+			let inherited = {
+				let mut at = self.aml.ns.parent(node);
+				let mut scope = None;
+				while let Some(parent) = at {
+					if let Some((_, known)) = scopes.iter().find(|(seen, _)| *seen == parent) {
+						scope = *known;
+						break;
+					}
+					at = self.aml.ns.parent(parent);
+				}
+				scope
+			};
+			let role = node::role(aml::Kind::Device, &identity, inherited, &node::Objects::default());
+			let scope = self.role_scope(node, &role, inherited);
+			scopes.push((node, scope));
+			if let Role::Companion { segment, bus, device, function } = role {
+				let name = node::identity(&self.aml.ns.path(node));
+				if !self.host.companions.iter().any(|(held, _)| *held == name) {
+					self.host.companions.push((name, Function { segment, bus, device, function }));
+				}
+			}
+		}
+		self.host.notifications.clear();
 	}
 
 	fn integer(&mut self, node: NodeId, name: &[u8; 4]) -> Option<u64> {
@@ -770,8 +854,25 @@ impl Service {
 			say(&format!("{name} names {:02x}:{:02x}.{}, which is not on the bus", function.bus, function.device, function.function));
 			return false;
 		}
-		// THE LINES AND ADDRESSES THE SERVICE HOLDS THROUGH THIS CONTROLLER: its `_AEI` lines, and those its own fields
-		// name.
+		let (aei, field_lines, field_addresses) = self.lists_for(node, name);
+		let path = name.as_bytes();
+		let companion = report::CompanionReport { path, function, aei_lines: aei, field_lines, field_addresses };
+		let mut out = [0u8; 1024];
+		let Some(len) = report::encode_companion(&companion, &mut out) else { return false };
+		let row = self.report(&out[..len], name);
+		if row < 0 {
+			return false;
+		}
+		if !self.host.companions.iter().any(|(held, _)| held == name) {
+			self.host.companions.push((String::from(name), function));
+		}
+		self.remember(node, name, Role::Companion { segment: function.segment, bus: function.bus, device: function.device, function: function.function });
+		true
+	}
+
+	// THE LINES AND ADDRESSES THE SERVICE HOLDS THROUGH A CONTROLLER: its `_AEI` lines - each with its trigger in the top
+	// byte, as DeviceManager scopes the connection - and those its own fields name.
+	fn lists_for(&mut self, node: NodeId, name: &str) -> (List, List, List) {
 		let mut aei = List::default();
 		if let Ok(Some(Object::Buffer(bytes))) = self.aml.child_value(node, b"_AEI", &mut self.host)
 			&& let Ok(resources) = aml::resource::decode(&bytes)
@@ -791,19 +892,7 @@ impl Service {
 			}
 		}
 		let (field_lines, field_addresses) = self.field_connections(name);
-		let path = name.as_bytes();
-		let companion = report::CompanionReport { path, function, aei_lines: aei, field_lines, field_addresses };
-		let mut out = [0u8; 1024];
-		let Some(len) = report::encode_companion(&companion, &mut out) else { return false };
-		let row = self.report(&out[..len], name);
-		if row < 0 {
-			return false;
-		}
-		if !self.host.companions.iter().any(|(held, _)| held == name) {
-			self.host.companions.push((String::from(name), function));
-		}
-		self.remember(node, name, Role::Companion { segment: function.segment, bus: function.bus, device: function.device, function: function.function });
-		true
+		(aei, field_lines, field_addresses)
 	}
 
 	// THE FIELDS' CONNECTIONS to the controller `controller` names: GPIO lines and serial-bus addresses.
@@ -841,7 +930,13 @@ impl Service {
 				return false;
 			}
 		};
-		let dsd = self.aml.properties(node, &mut self.host).unwrap_or_default();
+		let mut dsd = self.aml.properties(node, &mut self.host).unwrap_or_default();
+		// AN IPMI NODE'S INTERFACE TYPE, for the kernel's check against SMBIOS's type-38 records.
+		if identity.hid.as_deref() == Some("IPI0001")
+			&& let Some(interface) = self.integer(node, b"_IFT")
+		{
+			dsd.values.push((String::from("_IFT"), aml::dsd::Value::Integer(interface)));
+		}
 		let block = properties::block(identity.uid.as_deref(), &dsd);
 		if block.cut {
 			say(&format!("{name}'s properties are past the block's bound - cut at a record"));
@@ -882,6 +977,15 @@ impl Service {
 		};
 		say(&format!("{name} is {what} (row {row})"));
 		self.remember(node, name, role.clone());
+		// A CONTROLLER ROW'S LINES AND ADDRESSES, as a companion's are.
+		let (aei, field_lines, field_addresses) = self.lists_for(node, name);
+		if aei.count + field_lines.count + field_addresses.count != 0 {
+			let lists = report::ListsReport { identity: name.as_bytes(), aei_lines: aei, field_lines, field_addresses };
+			let mut out = [0u8; 1024];
+			if let Some(len) = report::encode_lists(&lists, &mut out) {
+				self.report(&out[..len], name);
+			}
+		}
 		true
 	}
 
@@ -977,6 +1081,8 @@ impl Service {
 		let answer = gpe(privilege, GPE_REARM, number);
 		if answer < 0 {
 			say(&format!("general-purpose event {number:#04x} could not be enabled again - {}", errno_text(answer)));
+		} else {
+			say(&format!("general-purpose event {number:#04x} is enabled again"));
 		}
 	}
 
@@ -1242,6 +1348,8 @@ fn start_ec(service: &mut Service, command: u16, data: u16, gpe_bit: Option<u16>
 	service.host.ec = Some(aml::ec::Ec::new(EcPorts { data, command }));
 	service.ec_gpe = gpe_bit;
 	service.ec_node = node;
+	// `_GLK`: the firmware shares the controller with SMM code, and every access holds the global lock.
+	service.host.ec_glk = node.and_then(|node| service.integer(node, b"_GLK")).is_some_and(|glk| glk != 0);
 	for (path, error) in service.aml.run_reg(Space::EmbeddedControl, true, &mut service.host) {
 		say(&format!("{path}'s _REG for the embedded controller failed - {error:?}"));
 	}
@@ -1313,7 +1421,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let (privilege, admin_root) = (roles[0], roles[1]);
-	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None };
+	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None };
 	if privilege == 0 {
 		say("no FirmwareInterpreter privilege was handed over - the namespace is not loaded");
 		send_blocking(bootstrap, b"AcpiService: online - no firmware privilege", 0);
@@ -1354,6 +1462,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Err(error) => say(&format!("\\_SB._OSC failed - {error:?}")),
 		}
 	}
+	service.pre_companions();
 	let walk = service.aml.initialize(&mut service.host);
 	for (path, error) in &walk.failures {
 		say(&format!("{path} did not initialise - {error:?}"));

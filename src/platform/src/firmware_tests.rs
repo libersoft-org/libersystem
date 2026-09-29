@@ -219,6 +219,11 @@ fn every_report_round_trips_and_a_hostile_one_is_refused() {
 	assert!(matches!(report::decode(&buffer[..length]), Some(Report::Osc { granted, bus_end: 0xFF, .. }) if granted == 9));
 	let length = report::encode_loaded(7, &mut buffer).unwrap();
 	assert!(matches!(report::decode(&buffer[..length]), Some(Report::Loaded { instance: 7 })));
+	let mut lines = List::default();
+	assert!(lines.push(9));
+	let lists = report::ListsReport { identity: b"acpi:\\_SB_.GPI0", aei_lines: aei, field_lines: lines, field_addresses: List::default() };
+	let length = report::encode_lists(&lists, &mut buffer).unwrap();
+	assert!(matches!(report::decode(&buffer[..length]), Some(Report::Lists(decoded)) if decoded.identity == lists.identity && decoded.aei_lines.as_slice() == [2] && decoded.field_lines.as_slice() == [9]));
 	// HOSTILE: a count past a bound, a truncated report, trailing bytes, an unknown kind.
 	let length = report::encode_device(&device, &mut buffer).unwrap();
 	assert!(report::decode(&buffer[..length - 1]).is_none(), "truncated");

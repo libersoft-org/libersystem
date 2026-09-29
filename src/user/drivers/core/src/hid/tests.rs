@@ -193,6 +193,27 @@ fn each_contact_identifier_begins_a_contact_and_its_axes_are_its_own() {
 	assert!(out[0].y < out[1].y);
 }
 
+// A CONTACT BEGINS WHERE ITS FINGER'S COLLECTION BEGINS, whichever field the device declared first. Most digitizers declare
+// the tip switch BEFORE the identifier, and a contact begun at the identifier gave each finger's tip to the one before it.
+#[test]
+fn a_contact_begins_where_its_finger_s_collection_begins_whichever_field_comes_first() {
+	let mut d: Vec<u8> = alloc::vec![0x05, 0x0d, 0x09, 0x04, 0xa1, 0x01]; // digitizer, touch screen, application
+	for _ in 0..2 {
+		d.extend_from_slice(&[0x09, 0x22, 0xa1, 0x02]); //   finger, logical
+		d.extend_from_slice(&[0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02]); //     tip switch FIRST
+		d.extend_from_slice(&[0x09, 0x51, 0x25, 0x0f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02]); //     then the identifier
+		d.extend_from_slice(&[0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0x05, 0x0d]); //     x, y
+		d.push(0xc0);
+	}
+	d.push(0xc0);
+	let layout = parse(&d);
+	let mut out = [Contact::default(); MAX_CONTACTS];
+	// finger 7 down at (0x10, 0x20), finger 9 UP at (0xF0, 0x80)
+	assert_eq!(layout.contacts(0, &[1, 7, 0x10, 0x20, 0, 9, 0xF0, 0x80], &mut out), 2);
+	assert_eq!((out[0].id, out[0].tip, out[1].id, out[1].tip), (7, true, 9, false), "each finger keeps its own tip");
+	assert!(out[0].x < out[1].x);
+}
+
 #[test]
 fn contact_count_bounds_what_is_reported_so_an_untouched_slot_is_not_a_phantom_finger() {
 	// A digitizer declares slots for every finger it can ever report and leaves the unused ones

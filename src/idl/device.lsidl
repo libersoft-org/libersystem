@@ -191,6 +191,9 @@ enum failure-cause {
 	/// shutdown was told the driver had crashed. A state and a cause are two halves of one answer, so
 	/// the honest half needed a value of its own.
 	stopped                 = 12,
+	/// A CONNECTION THE DEVICE'S FIRMWARE NAMES CANNOT BE GRANTED - a ten-bit I2C address, an SPI device, a line the
+	/// ACPI service holds for the firmware's `_AEI` events, a connection joined to no controller. Not retried.
+	connection-refused      = 13,
 }
 
 /// One device node's binding, as DeviceManager holds it.

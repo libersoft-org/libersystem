@@ -36,6 +36,7 @@
 # not all have: the tree's structure block gains one node before the root's end, its strings block
 # gains two names, and the header's offsets are recomputed. The memory reservation block and every
 # existing node are copied verbatim.
+import os
 import struct
 import sys
 
@@ -73,99 +74,31 @@ def record(mode, shape="ok"):
 	return MAGIC + bytes([VERSION, code, PROVENANCE_HARNESS, 0])
 
 
+# THE TREE EDITING IS THE SHARED EDITOR'S (`fdt_edit`): this program adds one node and reads it back.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fdt_edit  # noqa: E402
+
+
 def align4(n):
-	return (n + 3) & ~3
+	return fdt_edit.align4(n)
 
 
 def read_header(blob):
-	if len(blob) < 40:
-		die("not a flattened device tree: shorter than its header")
-	fields = struct.unpack(">10I", blob[:40])
-	if fields[0] != FDT_MAGIC:
-		die("not a flattened device tree: bad magic")
-	names = ["magic", "totalsize", "off_dt_struct", "off_dt_strings", "off_mem_rsvmap", "version", "last_comp_version", "boot_cpuid_phys", "size_dt_strings", "size_dt_struct"]
-	return dict(zip(names, fields))
-
-
-def string_offset(strings, name):
-	# The strings block is NUL-terminated names; an existing one is reused, a new one appended.
-	at = 0
-	while at < len(strings):
-		end = strings.index(b"\0", at)
-		if strings[at:end] == name:
-			return at, strings
-		at = end + 1
-	return len(strings), strings + name + b"\0"
-
-
-def prop_token(nameoff, value):
-	return struct.pack(">III", FDT_PROP, len(value), nameoff) + value + b"\0" * (align4(len(value)) - len(value))
-
-
-def node_token(name):
-	return struct.pack(">I", FDT_BEGIN_NODE) + name + b"\0" + b"\0" * (align4(len(name) + 1) - len(name) - 1)
-
-
-def reserved_block(blob, header):
-	# Every (address, size) pair through the (0, 0) terminator, wherever the header put the block.
-	at = header["off_mem_rsvmap"]
-	out = b""
-	while at + 16 <= len(blob):
-		pair = blob[at : at + 16]
-		out += pair
-		at += 16
-		if pair == b"\0" * 16:
-			return out
-	die("the memory reservation block has no terminator")
+	try:
+		return fdt_edit.read_header(blob)
+	except fdt_edit.TreeError as error:
+		die(str(error))
 
 
 def add_node(blob, rec, shape):
-	h = read_header(blob)
-	struct_block = blob[h["off_dt_struct"] : h["off_dt_struct"] + h["size_dt_struct"]]
-	strings = blob[h["off_dt_strings"] : h["off_dt_strings"] + h["size_dt_strings"]]
-	# The root node's END_NODE is where the new node goes. Found by walking the tokens, so a tree
-	# whose tail carries NOPs is handled rather than guessed at.
-	at = 0
-	depth = 0
-	root_end = None
-	while at < len(struct_block):
-		token = struct.unpack(">I", struct_block[at : at + 4])[0]
-		at += 4
-		if token == FDT_BEGIN_NODE:
-			depth += 1
-			end = struct_block.index(b"\0", at)
-			at = align4(end + 1)
-		elif token == FDT_END_NODE:
-			depth -= 1
-			if depth == 0:
-				root_end = at - 4
-		elif token == FDT_PROP:
-			length = struct.unpack(">I", struct_block[at : at + 4])[0]
-			at += 8 + align4(length)
-		elif token == FDT_NOP:
-			pass
-		elif token == FDT_END:
-			break
-		else:
-			die(f"unknown structure token {token:#x}")
-	if root_end is None:
-		die("the tree has no root node to append to")
-	compat_off, strings = string_offset(strings, b"compatible")
-	prop_off, strings = string_offset(strings, PROPERTY)
-	compatible = b"libersystem,something-else" if shape == "wrong-compatible" else COMPATIBLE
-	name = b"policy" if shape == "other-node-name" else NODE
-	node = node_token(name) + prop_token(compat_off, compatible + b"\0") + prop_token(prop_off, rec) + struct.pack(">I", FDT_END_NODE)
-	new_struct = struct_block[:root_end] + node + struct_block[root_end:]
-	rsv = reserved_block(blob, h)
-	# Layout: header, the reservation block (8-byte aligned), the structure block (4-byte aligned),
-	# the strings block. Every offset is recomputed from the blocks rather than adjusted, which is
-	# what keeps this correct for a tree whose blocks were not in this order.
-	off_rsv = 40
-	off_struct = align4(off_rsv + len(rsv))
-	off_strings = off_struct + len(new_struct)
-	total = off_strings + len(strings)
-	header = struct.pack(">10I", FDT_MAGIC, total, off_struct, off_strings, off_rsv, h["version"], h["last_comp_version"], h["boot_cpuid_phys"], len(strings), len(new_struct))
-	return header + rsv + b"\0" * (off_struct - off_rsv - len(rsv)) + new_struct + strings
+	try:
+		tree = fdt_edit.parse(blob)
+		compatible = b"libersystem,something-else" if shape == "wrong-compatible" else COMPATIBLE
+		name = "policy" if shape == "other-node-name" else NODE.decode()
+		tree.root.add(fdt_edit.Node(name, [("compatible", compatible + b"\0"), (PROPERTY.decode(), rec)]))
+		return fdt_edit.serialize(tree)
+	except fdt_edit.TreeError as error:
+		die(str(error))
 
 
 def find_record(blob):

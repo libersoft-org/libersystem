@@ -84,6 +84,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	// The destination services' gate probes, in a development image.
 	("btcheck", "btcheck CASE - drive the Bluetooth gate against the in-guest fixture"),
 	("btread", "btread - read Bluetooth state with the read authority alone"),
+	("hidcheck", "hidcheck CASE - drive the HID-over-I2C gate: a live pointer and contact client with a focused surface"),
 	("powercheck", "powercheck CASE - drive the power gate against the in-guest fixture"),
 	("powerread", "powerread - read power state with the read authority alone"),
 	("cardcheck", "cardcheck CASE - drive the smart-card gate against the in-guest fixture"),

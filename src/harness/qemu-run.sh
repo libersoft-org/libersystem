@@ -97,6 +97,17 @@
 #             attach QEMU's vhost-user I2C and GPIO controllers at their pinned slots, their device side
 #             the `vhost-i2c-gpio.py` listening on the two sockets, with the guest's RAM on a shared memfd
 #             - see `qemu_attach_i2c_fixture`. `test-kernel.sh` starts the backend and sets all three.
+#             With `hid`, the firmware also DESCRIBES the backend's two HID-over-I2C models: on x86_64 an SSDT
+#             (`acpi-fixture.py --hid-out`, loaded with `-acpitable`), on aarch64 and riscv64 through UEFI the
+#             machine's tree dumped, given the `hid-over-i2c` nodes (`fdt_edit.py hid-fixture`) and handed back
+#             with `-dtb` - see `qemu_attach_hid_table` and `i2c_hid_dtb_args`.
+#   ACPI_FIXTURE=SSDT  ACPI_FIXTURE_MEMORY=FILE
+#             x86_64: the ACPI gate's fixture - `SSDT` (`acpi-fixture.py --out`) through `-acpitable`, and an
+#             `ivshmem-plain` function at slot 0x14 over the 1 MiB `FILE` the harness reads and writes - see
+#             `qemu_attach_acpi_fixture`.
+#   PCIE_HOTPLUG=acpi
+#             x86_64 interactive: leave q35's ACPI-based PCIe hot-plug on (no
+#             `acpi-pci-hotplug-with-bridge-support=off`), so the firmware keeps hot-plug and `_OSC` refuses it.
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
 #   GIC=      aarch64: which interrupt controller the machine has - 2 (default: GICv2 with a
 #             GICv2m MSI frame), 3 (GICv3, ITS off: the timer/IPI core profile) or 3its (GICv3
@@ -953,6 +964,67 @@ qemu_attach_i2c_fixture() {
 		-device "vhost-user-i2c-pci,chardev=i2cfixture,bus=pcie.0,addr=0x15$platform"
 		-chardev "socket,id=gpiofixture,path=$GPIO_SOCKET"
 		-device "vhost-user-gpio-pci,chardev=gpiofixture,bus=pcie.0,addr=0x16$platform"
+	)
+}
+
+# THE HID-OVER-I2C DEVICES, DESCRIBED AS A LAPTOP'S FIRMWARE DESCRIBES THEM, when a run asks for the HID models
+# (`I2C_FIXTURE=hid`) on x86_64: an SSDT - built here with the emitter, no `iasl` - whose two devices sit below the
+# virtio-i2c function's node, each with `_CID` `PNP0C50`, its `I2cSerialBusV2` address, a `GpioInt` on the virtio-gpio
+# function's node and a `_DSM` answering its descriptor register.
+qemu_attach_hid_table() {
+	local -n hid_into=$1
+	[[ "${I2C_FIXTURE:-}" == "hid" ]] || return 0
+	local table="$QEMU_BUILD_DIR/i2c-hid-fixture.aml"
+	python3 "$HERE/acpi-fixture.py" --hid-out "$table" || {
+		echo "qemu-run: the HID-over-I2C SSDT could not be built" >&2
+		exit 1
+	}
+	hid_into+=(-acpitable "file=$table")
+}
+
+# THE SAME DEVICES IN A DEVICE TREE, on aarch64 and riscv64 through UEFI: the machine's tree dumped - without the two
+# vhost-user devices, which add no node to it - given the virtio-i2c and virtio-gpio functions' nodes, their
+# `virtio,device22` and `virtio,device29` children and the two `hid-over-i2c` nodes, and handed back with `-dtb`, the
+# round trip the independent-producer fixture makes. One edited tree per run: refused beside that fixture.
+i2c_hid_dtb_args() {
+	local qemu="$1"
+	shift
+	[[ "${I2C_FIXTURE:-}" == "hid" ]] || return 0
+	if [[ "${DMA_DTB_NODE:-0}" == "1" ]]; then
+		echo "qemu-run: I2C_FIXTURE=hid and DMA_DTB_NODE=1 each hand the guest an edited tree - one run asks for one" >&2
+		exit 1
+	fi
+	local dumped edited
+	dumped="$(mktemp "$QEMU_BUILD_DIR/i2c-hid-XXXXXX.dtb")"
+	edited="${dumped%.dtb}.hid.dtb"
+	"$qemu" "$@" -machine "$MACHINE_FOR_DUMP,dumpdtb=$dumped" -display none >/dev/null 2>&1 || {
+		echo "qemu-run: the machine's device tree could not be dumped for the HID-over-I2C fixture" >&2
+		exit 1
+	}
+	python3 "$HERE/fdt_edit.py" hid-fixture "$dumped" "$edited" --i2c-slot 0x15 --gpio-slot 0x16 || {
+		echo "qemu-run: the HID-over-I2C nodes could not be added to the device tree" >&2
+		exit 1
+	}
+	printf -- '-dtb\n%s\n' "$edited"
+}
+
+# THE ACPI GATE'S FIXTURE, when a run asks for it with `ACPI_FIXTURE` (the SSDT) and `ACPI_FIXTURE_MEMORY` (the backing
+# file): the table through `-acpitable`, and an `ivshmem-plain` function at the pinned slot 0x14 - below the I2C
+# fixture's 0x15 and 0x16 - whose BAR2 is the file, shared, so the harness writes what the firmware's methods read.
+qemu_attach_acpi_fixture() {
+	local -n acpi_into=$1
+	[[ -n "${ACPI_FIXTURE:-}" ]] || return 0
+	if [[ ! -f "$ACPI_FIXTURE" || -z "${ACPI_FIXTURE_MEMORY:-}" || ! -f "$ACPI_FIXTURE_MEMORY" ]]; then
+		echo "qemu-run: ACPI_FIXTURE=$ACPI_FIXTURE needs the SSDT and ACPI_FIXTURE_MEMORY naming its backing file - acpi-fixture.py writes both" >&2
+		exit 2
+	fi
+	# AND NO 64-BIT MMIO APERTURE, so the firmware places the BAR below 4 GiB: q35's DSDT is revision 1, and a
+	# namespace of 32-bit integers cannot name a region above it.
+	acpi_into+=(
+		-fw_cfg "name=opt/ovmf/X-PciMmio64Mb,string=0"
+		-acpitable "file=$ACPI_FIXTURE"
+		-object "memory-backend-file,id=acpifixture,size=1M,mem-path=$ACPI_FIXTURE_MEMORY,share=on"
+		-device "ivshmem-plain,memdev=acpifixture,bus=pcie.0,addr=0x14"
 	)
 }
 
@@ -1985,6 +2057,8 @@ qemu_run_x86_64() {
 	# realizes devices in.
 	[[ "$iommu" == "1" ]] && qemu_args+=(-device "virtio-iommu-pci,boot-bypass=on")
 	qemu_attach_i2c_fixture qemu_args "$iommu" "${MEM:-4G}"
+	qemu_attach_hid_table qemu_args
+	qemu_attach_acpi_fixture qemu_args
 
 	# System volume disk: carries the LiberFS volume itself.
 	# The DMA test kernel enters its suite directly and reads fixtures from the boot archive.
@@ -2208,7 +2282,12 @@ qemu_run_x86_64() {
 	# port reports through - sees nothing at all. Everything looks correct on both sides and the
 	# device simply never arrives. Turning the ACPI path off is what makes the port behave the way its
 	# capability says it does.
-	qemu_args+=(-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off)
+	#
+	# UNLESS A RUN ASKS FOR THE FIRMWARE'S HOT-PLUG (`PCIE_HOTPLUG=acpi`), which is how the ACPI gate sees `_OSC` refuse
+	# native hot-plug and the kernel leave the slots unarmed.
+	if [[ "${PCIE_HOTPLUG:-native}" != "acpi" ]]; then
+		qemu_args+=(-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off)
+	fi
 	qemu_args+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
 
 	# Display backends: parse DISPLAYS env for vnc/spice.
@@ -2660,6 +2739,9 @@ qemu_run_aarch64() {
 		local -a independent=()
 		MACHINE_FOR_DUMP="$machine"
 		mapfile -t independent < <(dma_independent_dtb_args qemu-system-aarch64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		local -a hid_tree=()
+		mapfile -t hid_tree < <(i2c_hid_dtb_args qemu-system-aarch64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		independent+=("${hid_tree[@]}")
 		harness_hold
 		vsock_echo_start
 		exec "$qemu_bin" \
@@ -3030,6 +3112,9 @@ qemu_run_riscv64() {
 		local -a independent=()
 		MACHINE_FOR_DUMP="virt,aia=aplic-imsic"
 		mapfile -t independent < <(dma_independent_dtb_args qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		local -a hid_tree=()
+		mapfile -t hid_tree < <(i2c_hid_dtb_args qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		independent+=("${hid_tree[@]}")
 		harness_hold
 		vsock_echo_start
 		exec "$qemu_bin" \

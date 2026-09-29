@@ -371,6 +371,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 			],
 		)),
 		b"btread" => Some(granted("btread", alloc::vec![Capability::Bluetooth])),
+		// THE HID-OVER-I2C GATE'S PROBE, development-only: the device list and its policy verbs - it disables and
+		// enables the I2C controller's binding and the touchscreen's - the pointer and contact streams, and a display
+		// surface whose input focus is the proof the contact stream asks for.
+		b"hidcheck" => Some(granted("hidcheck", alloc::vec![Capability::Device, Capability::DevicePolicy, Capability::Input, Capability::Display])),
 		// THE POWER GATE'S PROBES, and the first of the rows naming a fixture's control endpoint.
 		//
 		// NOT `cfg`-GATED, and neither is any row after it: this program is built once, into the shared

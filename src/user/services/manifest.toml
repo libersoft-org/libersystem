@@ -178,19 +178,16 @@ path = "user/libs/driver/binding"
 owner = "edid"
 path = "user/libs/display/edid"
 
-# The HID-over-I2C descriptor and register protocol. A SOURCE ROW AND NO LIBRARY ROW, deliberately:
-# nothing links it yet. There is no I2C controller driver in this tree and no provider kind for one,
-# so the protocol half is a parser proved on the host while the binding half waits for a controller
-# item with a real fixture - and staging a library nothing imports would put an artifact in the image
-# for no consumer.
+# The HID-over-I2C descriptor and register protocol. A SOURCE ROW AND NO LIBRARY ROW: its one consumer, the
+# `i2c_hid` driver, links it statically, so there is no shared library to stage. An SMBus consumer - IPMI's SSIF -
+# does not use its `I2cBus`: it speaks the I2C contract's SMBus transactions through `i2c-client`.
 [[sources]]
 owner = "hid-i2c"
 path = "user/libs/driver/hid-i2c"
 
 # The I2C bus contract's CLIENT SIDE: `hid-i2c`'s bus trait over one address-scoped connection, and the SMBus
-# transactions as a second client type. A SOURCE ROW AND NO LIBRARY ROW, like `hid-i2c`: the consumers that
-# will link it statically - the HID-over-I2C driver, SSIF - are not in the image yet, and the kernel suite's
-# I2C oracle drives the controller through it.
+# transactions as a second client type. A SOURCE ROW AND NO LIBRARY ROW, like `hid-i2c`: the `i2c_hid` driver links
+# it statically, SSIF will, and the kernel suite's I2C oracle drives the controller through it.
 [[sources]]
 owner = "i2c-client"
 path = "user/libs/driver/i2c-client"
@@ -1146,6 +1143,33 @@ match = [{ transport = "plain-pci", pci-class = 0x04, pci-subclass = 0x03, pci-i
 provides = [{ kind = "audio", most = 1 }]
 heartbeat-deadline = 100
 
+# HID OVER I2C, A CHILD BINDING: a touchpad or touchscreen on another driver's bus - the firmware's `PNP0C50` or
+# `ACPI0C50` node (as its `_HID`, or as the `_CID` laptops declare beside a vendor `_HID`) or the tree's `hid-over-i2c`
+# node. It reaches its device only through the two connections DeviceManager mints on its controllers' publications -
+# the I2C address and the interrupt line - and its report descriptor's collections decide which kind it publishes:
+# a mouse collection `pointer`, a touch screen collection `touch`.
+[[programs]]
+name = "i2c_hid"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/i2c_hid.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "platform", hid = "PNP0C50" },
+	{ transport = "platform", cid = "PNP0C50" },
+	{ transport = "platform", hid = "ACPI0C50" },
+	{ transport = "platform", cid = "ACPI0C50" },
+	{ transport = "platform", compatible = "hid-over-i2c" },
+]
+provides = [{ kind = "pointer", most = 1 }, { kind = "touch", most = 1 }]
+heartbeat-deadline = 100
+
 [[programs]]
 name = "httpd"
 owner = "tools"
@@ -1316,6 +1340,18 @@ role = "probe"
 linkage = "static"
 stage = "volume"
 destination = "libexec/btread.lsexe"
+providers = []
+development = true
+
+# THE HID-OVER-I2C GATE'S PROBE, development-only: a live pointer and contact client of InputService with a focused
+# surface, and the device policy it disables and enables the controller's and the touchscreen's bindings with.
+[[programs]]
+name = "hidcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/hidcheck.lsexe"
 providers = []
 development = true
 
@@ -3019,6 +3055,25 @@ provides = [
 ]
 heartbeat-deadline = 100
 
+# THE ACPI GATE'S FIXTURE DRIVER: bound to the fixture SSDT's `LSFX0001` node through the ACPI service's namespace, it
+# asks for its node channel and runs the gate's probes on every `Notify`. A shipping image has neither the program nor
+# the node.
+[[programs]]
+name = "acpi_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", hid = "LSFX0001" }]
+heartbeat-deadline = 100
+
 [[programs]]
 name = "dev_agent"
 owner = "services"
@@ -4037,9 +4092,10 @@ interface = "liber:input@1/input-admin"
 # COUNT compiled into the manager: a third pointing device had nowhere to go. This service asks the
 # catalogue for the input and pointer kinds instead, and takes what it finds.
 #
-# AND FOR GAMEPADS, whose subscription it KEEPS OPEN - a second controller, the fixture, a restarted
-# driver's replacement are adopted as they are published and dropped as they are withdrawn - where the
-# input, pointer and touch kinds are taken once, at bootstrap.
+# AND IT KEEPS THREE SUBSCRIPTIONS OPEN - pointer, touch and gamepad: a HID-over-I2C touchpad beside xHCI's
+# tablet, a rebound driver's replacement, a second controller are attached as they are published and detached as
+# they are withdrawn (four pointers, one touch surface, four gamepad providers at a time). Only the `input` kind is
+# taken once, at bootstrap.
 #
 # LAST, like every addition to a role list: these are read POSITIONALLY from the generated
 # `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.

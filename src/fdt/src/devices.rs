@@ -24,6 +24,10 @@ pub enum NodeBus {
 	Memory,
 	I2c,
 	Spi,
+	// A FUNCTION ON A PCI BUS: a child of a node whose `device_type` is `pci`, its `reg` a configuration-space address
+	// - the first cell's bus, device and function (`pci_function`) - never MMIO. The node describes the function the
+	// bus scan finds there: its companion, not a device of its own.
+	Pci,
 	Other,
 }
 
@@ -84,6 +88,16 @@ impl DeviceNode {
 	pub fn interrupts(&self) -> &[NodeInterrupt] {
 		&self.interrupts[..self.interrupt_count]
 	}
+
+	// A PCI child's function - (bus, device, function) from its `reg`'s first cell (`phys.hi`: bus in bits 23..16,
+	// device in 15..11, function in 10..8) - or `None` for a node on any other bus.
+	pub fn pci_function(&self) -> Option<(u8, u8, u8)> {
+		if self.bus != NodeBus::Pci || self.reg_count == 0 {
+			return None;
+		}
+		let hi = self.regs[0].0 as u32;
+		Some(((hi >> 16) as u8, ((hi >> 11) & 0x1F) as u8, ((hi >> 8) & 0x07) as u8))
+	}
 }
 
 // What one depth of the walk knows about the node open there.
@@ -99,12 +113,14 @@ struct Open {
 	phandle: u32,
 	interrupt_controller: bool,
 	gpio_controller: bool,
+	// `device_type = "pci"`: its children are functions on its bus.
+	pci: bool,
 	start: u64,
 }
 
 impl Open {
 	const fn empty() -> Self {
-		Open { path_len: 0, name: 0, compatible: None, enabled: true, reg: None, interrupts: None, extended: None, phandle: 0, interrupt_controller: false, gpio_controller: false, start: 0 }
+		Open { path_len: 0, name: 0, compatible: None, enabled: true, reg: None, interrupts: None, extended: None, phandle: 0, interrupt_controller: false, gpio_controller: false, pci: false, start: 0 }
 	}
 }
 
@@ -238,6 +254,8 @@ impl Fdt {
 							open[at].interrupt_controller = true;
 						} else if self.str_eq(pname, "gpio-controller") {
 							open[at].gpio_controller = true;
+						} else if len >= 4 && self.str_eq(pname, "device_type") && self.str_eq(value, "pci") {
+							open[at].pci = true;
 						}
 					}
 					FDT_NOP => {}
@@ -252,6 +270,9 @@ impl Fdt {
 	// numbers its children in its own space - an I2C or SPI controller by its node name, anything else not
 	// at all as far as this reader can say.
 	unsafe fn bus_of(&self, parent: &Open, cells: (u32, u32)) -> NodeBus {
+		if parent.pci {
+			return NodeBus::Pci;
+		}
 		if cells.1 != 0 {
 			return NodeBus::Memory;
 		}
@@ -298,6 +319,15 @@ impl Fdt {
 			NodeBus::I2c | NodeBus::Spi => {
 				// AN ADDRESS ON THE BUS, never MMIO: one cell per child on both.
 				if cells.0 == 1 && len >= 4 {
+					device.regs[0] = (u64::from(unsafe { self.be32(value) }), 0);
+					device.reg_count = 1;
+				} else {
+					device.reg_refused = true;
+				}
+			}
+			NodeBus::Pci => {
+				// THE CONFIGURATION ADDRESS, kept as the first cell: three address cells per child on a PCI bus.
+				if cells.0 == 3 && len >= 12 {
 					device.regs[0] = (u64::from(unsafe { self.be32(value) }), 0);
 					device.reg_count = 1;
 				} else {

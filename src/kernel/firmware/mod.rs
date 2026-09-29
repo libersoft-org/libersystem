@@ -72,6 +72,8 @@ struct State {
 	holder: Option<u64>,
 	events: Option<Arc<Channel>>,
 	decoded: Vec<Decoded>,
+	// Every bridge's I/O window, from the boot scan.
+	io_windows: Vec<(u16, u16)>,
 	mappings: Vec<Mapping>,
 	held: Vec<Function>,
 	companions: Vec<Companion>,
@@ -80,9 +82,60 @@ struct State {
 	// What the running instance's walk reported: identities of rows, reservations, merged descriptions, companions.
 	reported: Vec<Vec<u8>>,
 	grants: Vec<(u16, u8, u8, u32)>,
+	// A namespace row that is itself a controller: its identity and the lines and addresses the service holds through it.
+	lists: Vec<(Vec<u8>, List, List, List)>,
+	// SMBIOS's IPMI records (type 38), by instance: the interface type and the base address.
+	ipmi: Vec<(u8, u64)>,
 }
 
-static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None, events: None, decoded: Vec::new(), mappings: Vec::new(), held: Vec::new(), companions: Vec::new(), parents: Vec::new(), merged: Vec::new(), reported: Vec::new(), grants: Vec::new() });
+static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None, events: None, decoded: Vec::new(), io_windows: Vec::new(), mappings: Vec::new(), held: Vec::new(), companions: Vec::new(), parents: Vec::new(), merged: Vec::new(), reported: Vec::new(), grants: Vec::new(), lists: Vec::new(), ipmi: Vec::new() });
+
+// SMBIOS'S IPMI RECORD `instance`, as the boot read it: what an `IPI0001` node is checked against.
+pub fn note_ipmi_record(instance: usize, interface: u8, address: u64) {
+	let mut state = STATE.lock();
+	if state.ipmi.len() <= instance {
+		state.ipmi.resize(instance + 1, (0, 0));
+	}
+	state.ipmi[instance] = (interface, address);
+}
+
+// THE IPMI NODE'S SMBIOS RECORD: an `IPI0001` description whose `_IFT` (in its property block) and base address - its
+// first port or memory range - agree with a type-38 record is given that record's id, `smbios:38#n`.
+fn attach_smbios(description: &mut platform::Description, properties: &[u8]) {
+	if !description.part.match_ids().iter().any(|id| id.kind == abi::MATCH_ID_HID && id.text() == b"IPI0001") {
+		return;
+	}
+	let Some(interface) = property_integer(properties, b"_IFT") else { return };
+	let base = description.ports().first().map(|port| port.base as u64).or_else(|| description.part.mmio().first().map(|range| range.base));
+	let Some(base) = base else { return };
+	let records = STATE.lock().ipmi.clone();
+	if let Some(at) = policy::smbios_ipmi(&records, interface as u8, base) {
+		let text = alloc::format!("smbios:38#{at}");
+		if description.add_match(abi::MATCH_ID_SMBIOS, text.as_bytes()) {
+			crate::serial_println!("firmware: {} agrees with {text}", String::from_utf8_lossy(description.identity()));
+		}
+	} else {
+		crate::serial_println!("firmware: {} names IPMI interface {interface} at {base:#x}, which no SMBIOS record describes", String::from_utf8_lossy(description.identity()));
+	}
+}
+
+// An integer property of a depth-0 record in a property block, in the node channel's value encoding.
+fn property_integer(block: &[u8], wanted: &[u8]) -> Option<u64> {
+	let mut at = 0usize;
+	while at + 8 <= block.len() {
+		let kind = block[at];
+		let depth = block[at + 1];
+		let name_len = u16::from_le_bytes([block[at + 2], block[at + 3]]) as usize;
+		let value_len = u32::from_le_bytes(block[at + 4..at + 8].try_into().ok()?) as usize;
+		let name = block.get(at + 8..at + 8 + name_len)?;
+		let value = block.get(at + 8 + name_len..at + 8 + name_len + value_len)?;
+		if kind == abi::DEVICE_PROPERTY_VALUE && depth == 0 && name == wanted && value.len() == 9 && value[0] == 0x01 {
+			return Some(u64::from_le_bytes(value[1..9].try_into().ok()?));
+		}
+		at += 8 + name_len + ((value_len + 3) & !3);
+	}
+	None
+}
 
 // ON AN ACPI MACHINE, native hot-plug and error reporting wait for `_OSC`. Before the first scan; the test kernel
 // keeps native control, as its fixtures are the bus's own.
@@ -92,10 +145,12 @@ pub fn init() {
 	}
 }
 
-// THE BUS'S BARS AND WINDOWS, from the boot scan - every function's, resolved family or not.
-pub fn record_decoded(ranges: Vec<crate::arch::common::pci::DecodedRange>) {
+// THE BUS'S BARS AND WINDOWS, from the boot scan - every function's, resolved family or not - and every bridge's I/O
+// window.
+pub fn record_decoded(ranges: Vec<crate::arch::common::pci::DecodedRange>, io_windows: Vec<(u16, u16)>) {
 	let mut state = STATE.lock();
 	state.decoded = ranges.iter().map(|range| Decoded { base: range.base, len: range.len, function: Function { segment: 0, bus: range.bus, device: range.dev, function: range.func }, window: range.window }).collect();
+	state.io_windows = io_windows;
 }
 
 pub fn decoded_ranges(out: &mut dyn FnMut(u64, u64)) {
@@ -116,9 +171,24 @@ pub fn firmware_held(bus: u8, dev: u8, func: u8) -> bool {
 	STATE.lock().held.iter().any(|held| held.bus == bus && held.device == dev && held.function == func)
 }
 
-// The companion node `identity` names, as the function it describes - how a connection names a PCI controller.
+// The companion node `identity` names, as the function it describes - how a connection names a PCI controller. A
+// device tree's node BELOW a function's node names that function too: its `virtio,device29` child is the virtio-gpio
+// function's GPIO controller.
 pub fn companion_function(identity: &[u8]) -> Option<(u8, u8, u8)> {
-	STATE.lock().companions.iter().find(|companion| companion.path == identity).map(|companion| (companion.function.bus, companion.function.device, companion.function.function))
+	let state = STATE.lock();
+	let within = |companion: &&Companion| companion.path == identity || (identity.starts_with(b"dt:") && identity.len() > companion.path.len() && identity.starts_with(&companion.path) && identity[companion.path.len()] == b'/');
+	state.companions.iter().find(within).map(|companion| (companion.function.bus, companion.function.device, companion.function.function))
+}
+
+// A DEVICE TREE'S PCI CHILD NODE, joined at the boot scan to the function its `reg` names - as the ACPI service joins a
+// node with `_ADR`. Its path is the companion node every reader sees.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub fn tree_companion(identity: &[u8], bus: u8, dev: u8, func: u8) {
+	let function = Function { segment: 0, bus, device: dev, function: func };
+	crate::serial_println!("firmware: {} is the companion of {}", String::from_utf8_lossy(identity), function_text(function));
+	let mut state = STATE.lock();
+	state.companions.retain(|companion| companion.function != function);
+	state.companions.push(Companion { function, path: identity.to_vec(), aei: List::default(), field_lines: List::default(), field_addresses: List::default() });
 }
 
 // ---------------------------------------------------------------------------------------------- the memory view
@@ -228,6 +298,14 @@ pub fn map(request: &abi::FirmwareMapRequest) -> Result<Arc<DeviceMemory>, i64> 
 		{
 			crate::serial_println!("firmware: {} is now FIRMWARE-HELD - the region {name} declares is in its BAR, and no driver may take it", function_text(function));
 			state.held.push(function);
+			// ITS MEMORY DECODED, and nothing else: firmware that owns a function reaches its BAR, and the function never
+			// masters the bus for it.
+			let (bus, dev, func) = (function.bus, function.device, function.function);
+			if let Some(command) = crate::arch::pci::config_read_exact(bus, dev, func, 0x04, 2)
+				&& command & 0x2 == 0
+			{
+				let _ = crate::arch::pci::config_write_exact(bus, dev, func, 0x04, 2, command | 0x2);
+			}
 		}
 		state.mappings.retain(|mapping| mapping.object.strong_count() != 0);
 		state.mappings.push(Mapping { base: request.base, len: request.len, node: node.to_vec(), object: Arc::downgrade(&object) });
@@ -386,7 +464,9 @@ fn wired_lines_the_kernel_uses(tables: &crate::device::Tables<'_>) -> Vec<u32> {
 fn admit(tables: &crate::device::Tables<'_>, description: &platform::Description) -> Result<(), String> {
 	let state = STATE.lock();
 	let view = View::build(tables, &state);
-	let io_bars: Vec<(u16, u16)> = tables.rows().iter().filter(|entry| entry.platform.is_none()).flat_map(|entry| entry.ports[..entry.port_count as usize].iter().filter(|port| port.source == abi::PORT_SOURCE_IO_BAR).map(|port| (port.base, port.len))).collect();
+	// EVERY FUNCTION'S I/O BARS AND EVERY BRIDGE'S I/O WINDOW.
+	let mut io_bars: Vec<(u16, u16)> = tables.rows().iter().filter(|entry| entry.platform.is_none()).flat_map(|entry| entry.ports[..entry.port_count as usize].iter().filter(|port| port.source == abi::PORT_SOURCE_IO_BAR).map(|port| (port.base, port.len))).collect();
+	io_bars.extend(state.io_windows.iter().copied());
 	let lines = wired_lines_the_kernel_uses(tables);
 	let checked = view.with(|view| policy::crs(description, view, |base, len| crate::object::port_range::grants::recordable(base, len).is_ok(), &io_bars, &lines));
 	checked.map_err(|refusal| match refusal {
@@ -394,7 +474,7 @@ fn admit(tables: &crate::device::Tables<'_>, description: &platform::Description
 		policy::CrsRefusal::MmioKernelHeld => String::from("its MMIO is a range the kernel holds"),
 		policy::CrsRefusal::MmioOverBar(function) => alloc::format!("its MMIO lies over a BAR or window of {}", function_text(function)),
 		policy::CrsRefusal::PortsReserved => String::from("its ports are in the reserved set or granted"),
-		policy::CrsRefusal::PortsOverBar => String::from("its ports are a PCI function's I/O BAR"),
+		policy::CrsRefusal::PortsOverBar => String::from("its ports are a PCI function's I/O BAR or a bridge's I/O window"),
 		policy::CrsRefusal::KernelLine(line) => alloc::format!("its line {line} is one the kernel uses"),
 	})
 }
@@ -423,7 +503,8 @@ pub fn report(process: u64, bytes: &[u8]) -> i64 {
 	}
 	let Some(decoded) = platform::report::decode(bytes) else { return abi::ERR_INVALID };
 	match decoded {
-		Report::Device(device) => {
+		Report::Device(mut device) => {
+			attach_smbios(&mut device.description, device.properties);
 			let identity = device.description.identity().to_vec();
 			let name = String::from_utf8_lossy(&identity).into_owned();
 			let targets: Vec<(u8, Vec<u8>)> = device.targets[..device.target_count].iter().map(|(at, target)| (*at, target.to_vec())).collect();
@@ -504,6 +585,14 @@ pub fn report(process: u64, bytes: &[u8]) -> i64 {
 			0
 		}
 		Report::Loaded { instance } => loaded(instance),
+		Report::Lists(lists) => {
+			let identity = lists.identity.to_vec();
+			let mut state = STATE.lock();
+			state.lists.retain(|(held, ..)| *held != identity);
+			crate::serial_println!("firmware: {} is a controller the service holds _AEI lines [{}], field lines [{}] and addresses [{}] through", String::from_utf8_lossy(&identity), list_text(&lists.aei_lines), list_text(&lists.field_lines), list_text(&lists.field_addresses));
+			state.lists.push((identity, lists.aei_lines, lists.field_lines, lists.field_addresses));
+			0
+		}
 	}
 }
 
@@ -563,9 +652,28 @@ fn loaded(instance: u64) -> i64 {
 // WHAT THE NAMESPACE ATTACHED TO ROW `index`, for DeviceManager: a PCI function's companion and its lists, a
 // namespace child's parent function, and whether the function is firmware-held.
 pub fn node(index: usize) -> Option<abi::FirmwareNode> {
-	let (function, platform) = crate::device::with(index, |entry| (Function { segment: 0, bus: entry.bus, device: entry.dev, function: entry.func }, entry.platform.is_some()))?;
+	let (function, platform, identity) = crate::device::with(index, |entry| (Function { segment: 0, bus: entry.bus, device: entry.dev, function: entry.func }, entry.platform.is_some(), entry.platform.as_ref().map(|row| row.part.identity().to_vec())))?;
 	let state = STATE.lock();
 	let mut node = abi::FirmwareNode::default();
+	// A CONTROLLER ROW'S LISTS, under its own identity.
+	if let Some(identity) = identity.as_ref()
+		&& let Some((_, aei, lines, addresses)) = state.lists.iter().find(|(held, ..)| held == identity)
+	{
+		let len = identity.len().min(abi::PLATFORM_NAME_LEN);
+		node.flags |= abi::FIRMWARE_NODE_LISTS;
+		node.path_len = len as u8;
+		node.path[..len].copy_from_slice(&identity[..len]);
+		for (list, (out, count)) in [
+			(aei, (&mut node.aei, &mut node.aei_count)),
+			(lines, (&mut node.field_lines, &mut node.field_line_count)),
+			(addresses, (&mut node.field_addresses, &mut node.field_address_count)),
+		] {
+			let values = list.as_slice();
+			let take = values.len().min(abi::FIRMWARE_NODE_LISTED);
+			out[..take].copy_from_slice(&values[..take]);
+			*count = take as u8;
+		}
+	}
 	if !platform {
 		if let Some(companion) = state.companions.iter().find(|companion| companion.function == function) {
 			let len = companion.path.len().min(abi::PLATFORM_NAME_LEN);
@@ -610,4 +718,5 @@ pub fn forget_for_test() {
 	state.parents.clear();
 	state.merged.clear();
 	state.reported.clear();
+	state.lists.clear();
 }

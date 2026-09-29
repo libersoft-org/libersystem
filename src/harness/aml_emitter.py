@@ -320,6 +320,18 @@ def create_dword_field(source, at, n):
 	return Raw(b'\x8a' + term(source) + term(at) + namestring(n))
 
 
+def create_byte_field(source, at, n):
+	return Raw(b'\x8c' + term(source) + term(at) + namestring(n))
+
+
+def create_qword_field(source, at, n):
+	return Raw(b'\x8f' + term(source) + term(at) + namestring(n))
+
+
+def shift_right(a, b, target=NULL):
+	return _binary(0x7A, a, b, target)
+
+
 def call(n, *args):
 	"""A method invocation."""
 	return Raw(namestring(n) + b''.join(term(a) for a in args))
@@ -367,6 +379,11 @@ def memory32_fixed(base, length, writable=True):
 	return struct.pack('<BHBII', 0x86, 9, 1 if writable else 0, base, length)
 
 
+def qword_memory(base, length, writable=True):
+	"""`QWordMemory (ResourceConsumer, ...)`: a 64-bit memory range the device consumes."""
+	return struct.pack('<BHBBB', 0x8A, 43, 0, 1, 1 if writable else 0) + struct.pack('<QQQQQ', 0, base, base + length - 1 if length else base, 0, length)
+
+
 def io(base, length):
 	return struct.pack('<BBHHBB', 0x47, 0x01, base, base, 1, length)
 
@@ -378,10 +395,12 @@ def interrupt(lines, level=True, active_low=False, consumer=True):
 
 
 def _gpio(interrupt_, flags, pins, controller, pull=0, debounce=0):
+	# THE GENERAL FLAGS' BIT 0 SAYS "THIS DEVICE CONSUMES THE LINE" - `ResourceConsumer`, what a device's own `_CRS` and
+	# a field's connection both are.
 	pin_offset = 23
 	source_offset = pin_offset + 2 * len(pins)
 	end = source_offset + len(controller) + 1
-	body = struct.pack('<BBHHBHHHBHHH', 1, 0 if interrupt_ else 1, 0, flags, pull, 0, debounce, pin_offset, 0, source_offset, end, 0)
+	body = struct.pack('<BBHHBHHHBHHH', 1, 0 if interrupt_ else 1, 1, flags, pull, 0, debounce, pin_offset, 0, source_offset, end, 0)
 	body += b''.join(struct.pack('<H', pin) for pin in pins) + controller.encode() + b'\x00'
 	return struct.pack('<BH', 0x8C, len(body)) + body
 
@@ -410,6 +429,20 @@ def crs_patched(base_name, length, writable=True):
 		name('RBUF', buffer(template)),
 		create_dword_field('RBUF', 4, 'BASE'),
 		store(band(base_name, 0xFFFFFFF0), 'BASE'),
+		ret('RBUF'),
+	], serialized=True)
+
+
+def crs_patched64(base, length, writable=True):
+	"""The same over a `QWordMemory`, for a BAR the firmware placed above 4 GiB: `base` an expression - a method's
+	value - read at run time."""
+	template = resource_template(qword_memory(0, length, writable))
+	return method('_CRS', 0, [
+		name('RBUF', buffer(template)),
+		create_qword_field('RBUF', 14, 'MIN_'),
+		create_qword_field('RBUF', 22, 'MAX_'),
+		store(base, 'MIN_'),
+		store(add('MIN_', length - 1), 'MAX_'),
 		ret('RBUF'),
 	], serialized=True)
 
@@ -448,9 +481,48 @@ def self_test():
 	sample = table('SSDT', sample_body())
 	check('the checksum', sum(sample) & 0xFF, 0)
 	check('the length', struct.unpack('<I', sample[4:8])[0], len(sample))
-	check('an I2C connection', i2c_serial_bus_v2(0x50, '\\_SB.I2C0')[5], 1)
-	check('a GpioInt connection type', gpio_int([3], '\\_SB.GPI0')[4], 0)
-	check('a GpioIo pin table', struct.unpack('<H', gpio_io([7], '\\_SB.GPI0')[23:25])[0], 7)
+	# THE CONNECTION DESCRIPTORS, FIELD BY FIELD AT THE SPECIFICATION'S OFFSETS (ACPI 6.5, 6.4.3.8.1 and 6.4.3.8.2.1).
+	source = '\\_SB.PCI0.SA8_'
+	i2c = i2c_serial_bus_v2(0x2C, source, speed=400000)
+	check('I2cSerialBusV2: the tag', i2c[0], 0x8E)
+	check('I2cSerialBusV2: the length after the header', struct.unpack('<H', i2c[1:3])[0], len(i2c) - 3)
+	check('I2cSerialBusV2: revision 2', i2c[3], 2)
+	check('I2cSerialBusV2: resource source index', i2c[4], 0)
+	check('I2cSerialBusV2: serial bus type I2C', i2c[5], 1)
+	check('I2cSerialBusV2: general flags - controller-initiated, consumer, exclusive', i2c[6], 0x02)
+	check('I2cSerialBusV2: type flags - seven-bit', struct.unpack('<H', i2c[7:9])[0], 0)
+	check('I2cSerialBusV2: ten-bit when asked', struct.unpack('<H', i2c_serial_bus_v2(0x2C, source, ten_bit=True)[7:9])[0], 1)
+	check('I2cSerialBusV2: type revision', i2c[9], 1)
+	check('I2cSerialBusV2: type data length', struct.unpack('<H', i2c[10:12])[0], 6)
+	check('I2cSerialBusV2: connection speed', struct.unpack('<I', i2c[12:16])[0], 400000)
+	check('I2cSerialBusV2: the address', struct.unpack('<H', i2c[16:18])[0], 0x2C)
+	check('I2cSerialBusV2: the controller, NUL-terminated', i2c[18:], source.encode() + b'\x00')
+	controller = '\\_SB.PCI0.SB0_'
+	line = gpio_int([1], controller, edge=False, active_low=True)
+	check('GpioInt: the tag', line[0], 0x8C)
+	check('GpioInt: the length after the header', struct.unpack('<H', line[1:3])[0], len(line) - 3)
+	check('GpioInt: revision 1', line[3], 1)
+	check('GpioInt: an interrupt connection', line[4], 0)
+	check('GpioInt: general flags - consumer', struct.unpack('<H', line[5:7])[0], 1)
+	check('GpioInt: level, active low, exclusive, not wake', struct.unpack('<H', line[7:9])[0], 0x02)
+	check('GpioInt: edge, active high, shared and wake', struct.unpack('<H', gpio_int([1], controller, edge=True, shared=True, wake=True)[7:9])[0], 0x19)
+	check('GpioInt: default pull', line[9], 0)
+	check('GpioInt: the pin table offset', struct.unpack('<H', line[14:16])[0], 23)
+	check('GpioInt: resource source index', line[16], 0)
+	check('GpioInt: the source name offset', struct.unpack('<H', line[17:19])[0], 25)
+	check('GpioInt: the vendor data offset, past the name', struct.unpack('<H', line[19:21])[0], 25 + len(controller) + 1)
+	check('GpioInt: no vendor data', struct.unpack('<H', line[21:23])[0], 0)
+	check('GpioInt: the pin', struct.unpack('<H', line[23:25])[0], 1)
+	check('GpioInt: the controller, NUL-terminated', line[25:], controller.encode() + b'\x00')
+	check('GpioIo: an I/O connection', gpio_io([7], controller)[4], 1)
+	check('GpioIo: input-only restriction', struct.unpack('<H', gpio_io([7], controller)[7:9])[0], 1)
+	check('GpioIo: the pin table', struct.unpack('<H', gpio_io([7], controller)[23:25])[0], 7)
+	# A `_DSM` ANSWERING AN INTEGER - HID over I2C's descriptor register: function 0's bitmap, function 1 a Return of it.
+	hid = dsm('3cdff6f7-4267-4555-ad05-b30a3d8938de', {1: [ret(0x20)]})
+	check('a _DSM returning an integer', bytes(hid).endswith(bytes(ret(buffer([0])))) and bytes(if_(lequal(arg(2), 1), [ret(0x20)])) in bytes(hid), True)
+	check('its function 0 bitmap names function 1', bytes(if_(lequal(arg(2), 0), [ret(buffer([0b11]))])) in bytes(hid), True)
+	check('a QWordMemory length at its offset', struct.unpack('<Q', qword_memory(0x800000000, 0x1000)[38:46])[0], 0x1000)
+	check('a QWordMemory minimum', struct.unpack('<Q', qword_memory(0x800000000, 0x1000)[14:22])[0], 0x800000000)
 	# THE INTERPRETER'S SUITE LOADS THE SAMPLE FROM ITS OWN COPY: any byte this emitter now makes differently is drift.
 	import os
 	committed = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'aml', 'src', 'tests', 'fixtures', 'emitter-sample.aml')

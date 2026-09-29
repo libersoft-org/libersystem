@@ -1039,11 +1039,15 @@ pub struct WiredLine {
 pub const CONNECTION_GPIO_LINE: u8 = 1;
 pub const CONNECTION_I2C: u8 = 2;
 pub const CONNECTION_SPI: u8 = 3;
+// An I2C connection's `trigger` bit: the address is a ten-bit one.
+pub const CONNECTION_I2C_TEN_BIT: u8 = 1;
 
 // One connection: its kind, the controller it is on - that controller's ROW INDEX, or `u32::MAX` while the
 // description naming it has not been joined to a row - the line or the bus address, the trigger and
-// polarity a GPIO interrupt line uses, and `extra`: for a device-tree GPIO line the controller's phandle,
-// which is what the join finds its row by.
+// polarity a GPIO interrupt line uses (an ACPI line's `LINE_TRIGGER_*` and `LINE_POLARITY_*`, zero for a
+// line read for its level alone; a tree line's interrupt-type cell in `trigger`), for an I2C address
+// `CONNECTION_I2C_TEN_BIT` in `trigger`, and `extra`: for a device-tree GPIO line the controller's phandle,
+// which is what the join finds its row by, and for an ACPI I2C address the bus speed.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Connection {
@@ -1603,6 +1607,9 @@ pub const FIRMWARE_NODE_LISTED: usize = 32;
 pub const FIRMWARE_NODE_COMPANION: u8 = 1 << 0;
 pub const FIRMWARE_NODE_PARENT: u8 = 1 << 1;
 pub const FIRMWARE_NODE_FIRMWARE_HELD: u8 = 1 << 2;
+// A namespace row that is itself a GPIO or serial-bus controller, with the lines and addresses the ACPI service holds
+// through it: `path` is the row's identity and the lists are filled, as a companion's are.
+pub const FIRMWARE_NODE_LISTS: u8 = 1 << 3;
 
 // What `SYS_DEVICE_NODE` answers.
 #[repr(C)]

@@ -1179,8 +1179,9 @@ fn every_state_and_every_cause_has_exactly_one_name() {
 		FailureCause::DriverReported(DriverFailureCode::InternalError),
 		FailureCause::TeardownUnconfirmed,
 		FailureCause::Hung,
+		FailureCause::ConnectionRefused,
 	];
-	let mut names: [&[u8]; 11] = [b""; 11];
+	let mut names: [&[u8]; 12] = [b""; 12];
 	for (at, cause) in causes.iter().enumerate() {
 		let name = cause.name();
 		assert!(!name.is_empty());

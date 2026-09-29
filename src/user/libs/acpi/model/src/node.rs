@@ -113,8 +113,13 @@ pub fn role(kind: Kind, identity: &Identity, scope: Option<Scope>, objects: &Obj
 	if named(identity, &["PNP0C01", "PNP0C02"]) {
 		return Role::Reservation;
 	}
-	if named(identity, &["ACPI0007"]) {
+	// A PROCESSOR, and a processor container holding them: the power half's, never a driver's.
+	if named(identity, &["ACPI0007", "ACPI0010"]) {
 		return Role::Processor;
+	}
+	// A PCI INTERRUPT LINK: unused, since INTx is disabled and every function interrupts by MSI.
+	if named(identity, &["PNP0C0F"]) {
+		return Role::NotADevice("a PCI interrupt link - unused, INTx is disabled");
 	}
 	if named(identity, &["PNP0C09"]) {
 		return Role::EmbeddedController;
@@ -235,13 +240,15 @@ pub fn describe(path: &aml::Path, role: &Role, identity: &Identity, resources: &
 					targets.push((at, target.clone()));
 				}
 			}
-			Resource::I2c { address, speed, controller, .. } => {
+			Resource::I2c { address, speed, ten_bit, controller, .. } => {
 				let Some(target) = resolve(controller) else {
 					refused.push(format!("an I2C connection names {controller}, which is no node"));
 					continue;
 				};
 				let at = description.part.connection_count;
-				whole &= description.add_connection(abi::Connection { kind: abi::CONNECTION_I2C, trigger: 0, polarity: 0, _pad: 0, controller: u32::MAX, value: *address as u32, extra: *speed });
+				// A TEN-BIT ADDRESS IS CARRIED AS ONE, so the binding refuses it by name rather than reach a seven-bit neighbour.
+				let flags = if *ten_bit { abi::CONNECTION_I2C_TEN_BIT } else { 0 };
+				whole &= description.add_connection(abi::Connection { kind: abi::CONNECTION_I2C, trigger: flags, polarity: 0, _pad: 0, controller: u32::MAX, value: *address as u32, extra: *speed });
 				targets.push((at, target));
 			}
 			Resource::SerialBus { kind, controller, .. } => refused.push(format!("a serial bus of type {kind} on {controller} is not supported")),

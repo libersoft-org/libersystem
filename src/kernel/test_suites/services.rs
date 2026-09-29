@@ -298,6 +298,256 @@ fn a_touch_surface_reports_contacts_and_not_a_cursor() {
 	core::mem::drop(kill_display);
 }
 
+tagged_test!(pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn, [Service, Input, Display], id = "kernel.services.pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn", covers = ["kernel", "bin.input_service"]);
+// INPUTSERVICE FOLLOWS EVERY POINTER AND TOUCH PROVIDER: both subscriptions stay open, up to four pointers are merged
+// into the one cursor and one touch surface is attached at a time, a provider past its kind's bound waits and is
+// attached when one of its kind goes, and a surface that goes lifts the finger it held. This plays the catalogue - the
+// two kept subscriptions, publications and withdrawals on them later, and each `open` answered with a driver end it
+// holds - and every driver, on the production six-byte frames.
+fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn() {
+	use device_proto::codec as wire;
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+
+	// THE CATALOGUE: the pointer and touch subscriptions kept, the input and gamepad ones answered empty.
+	struct Catalogue {
+		server: alloc::sync::Arc<Channel>,
+		pointer: Option<alloc::sync::Arc<Channel>>,
+		touch: Option<alloc::sync::Arc<Channel>>,
+		seq: u32,
+		providers: alloc::vec::Vec<(device::ProviderInfo, Option<alloc::sync::Arc<Channel>>)>,
+		empties: alloc::vec::Vec<alloc::sync::Arc<Channel>>,
+		opened: alloc::vec::Vec<(device::ProviderKind, u32, u32)>,
+	}
+	impl Catalogue {
+		fn answer(&mut self) {
+			while let Ok(request) = self.server.recv() {
+				let op = u16::from_le_bytes([request.bytes[0], request.bytes[1]]);
+				let corr = request.bytes[2..6].to_vec();
+				match op {
+					1 => {
+						let (stream, stream_client) = Channel::create();
+						self.server.send(Message::new(corr, alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the subscribe answer");
+						let kind = request.bytes[6];
+						if kind == device::ProviderKind::Pointer as u8 || kind == device::ProviderKind::Touch as u8 {
+							if kind == device::ProviderKind::Pointer as u8 {
+								self.pointer = Some(stream);
+							} else {
+								self.touch = Some(stream);
+							}
+							for at in 0..self.providers.len() {
+								let info = self.providers[at].0.clone();
+								if info.kind as u8 == kind {
+									self.frame(&info);
+								}
+							}
+						} else {
+							self.empties.push(stream);
+						}
+					}
+					3 => {
+						let mut handles = wire::Handles::new();
+						let mut reader = wire::Reader::with_handles(&request.bytes[6..], &mut handles);
+						let info = device::ProviderInfo::read(&mut reader).expect("an open names a publication");
+						let client = self.providers.iter_mut().find(|(held, _)| held.kind == info.kind && held.slot == info.slot && held.provider_generation == info.provider_generation).and_then(|(_, client)| client.take()).expect("an open named a published provider, once");
+						self.opened.push((info.kind, info.slot, info.provider_generation));
+						let mut answer = corr;
+						answer.push(1);
+						answer.extend_from_slice(&0u32.to_le_bytes());
+						self.server.send(Message::new(answer, alloc::vec![Capability::new(client, Rights::ALL)])).expect("the open answer");
+					}
+					_ => panic!("InputService asked the catalogue for op {op}"),
+				}
+			}
+		}
+
+		fn frame(&mut self, info: &device::ProviderInfo) {
+			let mut frame = [0u8; 128];
+			let mut handles = wire::Handles::new();
+			let len = device::provider_catalogue::subscribe_frame(self.seq, info, &mut frame, &mut handles).expect("a publication frame encodes");
+			self.seq += 1;
+			let stream = if info.kind == device::ProviderKind::Pointer { &self.pointer } else { &self.touch };
+			if let Some(stream) = stream {
+				stream.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).expect("a catalogue frame");
+			}
+		}
+
+		fn info(kind: device::ProviderKind, slot: u32, generation: u32, live: bool) -> device::ProviderInfo {
+			device::ProviderInfo { kind, bus: 0, dev: 20 + slot, func: 0, binding_generation: 1, slot, provider_generation: generation, name: alloc::string::String::new().into(), live, platform: None }
+		}
+
+		// A provider published - before the subscription, or on it later - and the driver end of it.
+		fn publish(&mut self, kind: device::ProviderKind, slot: u32, generation: u32) -> alloc::sync::Arc<Channel> {
+			let (driver, client) = Channel::create();
+			let info = Self::info(kind, slot, generation, true);
+			self.providers.push((info.clone(), Some(client)));
+			self.frame(&info);
+			driver
+		}
+
+		fn withdraw(&mut self, kind: device::ProviderKind, slot: u32, generation: u32) {
+			self.frame(&Self::info(kind, slot, generation, false));
+		}
+
+		fn was_opened(&self, kind: device::ProviderKind, slot: u32, generation: u32) -> bool {
+			self.opened.contains(&(kind, slot, generation))
+		}
+	}
+
+	fn raw_pointer(x: u16, y: u16) -> Message {
+		let mut bytes = alloc::vec::Vec::new();
+		bytes.extend_from_slice(&x.to_le_bytes());
+		bytes.extend_from_slice(&y.to_le_bytes());
+		bytes.push(0);
+		Message::new(bytes, alloc::vec::Vec::new())
+	}
+	fn raw_contact(id: u8, tip: bool, x: u16, y: u16) -> Message {
+		let mut bytes = alloc::vec![id, tip as u8];
+		bytes.extend_from_slice(&x.to_le_bytes());
+		bytes.extend_from_slice(&y.to_le_bytes());
+		Message::new(bytes, alloc::vec::Vec::new())
+	}
+	// Every mapped pointer event the service's ring holds now, as (column, row).
+	fn cursor(client: &Channel, corr: u32) -> alloc::vec::Vec<(u16, u16)> {
+		let mut req = alloc::vec::Vec::new();
+		req.extend_from_slice(&1u16.to_le_bytes());
+		req.extend_from_slice(&corr.to_le_bytes());
+		client.send(Message::new(req, alloc::vec::Vec::new())).expect("subscribe request");
+		sched::run_until_idle();
+		let reply = client.recv().expect("subscribe reply");
+		let stream = reply.caps.first().expect("the stream").object().into_any_arc().downcast::<Channel>().expect("a channel");
+		let mut out = alloc::vec::Vec::new();
+		while let Ok(frame) = stream.recv() {
+			out.push((le_u16(&frame.bytes, 4), le_u16(&frame.bytes, 6)));
+		}
+		out
+	}
+	// A column of its own for each driver: the smallest x the service maps into that column, x * 80 / 0x10000 rounded
+	// down - so x rounds UP.
+	fn at_column(column: u16) -> u16 {
+		((column as u32 * 0x1_0000).div_ceil(80)) as u16
+	}
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"input_service").expect("input_service in the package or volume");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	let (_console_focus, forward_b) = Channel::create();
+	let (_keys_driver, keys_input) = Channel::create();
+	let (focus_display, focus_input) = Channel::create();
+	let (kill_display, kill_input) = Channel::create();
+	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	send_cap(&boot_kernel, b"FORWARD", forward_b, Rights::ALL).expect("forward bootstrap");
+	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
+	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
+	send_cap(&boot_kernel, b"KILL", kill_input, Rights::ALL).expect("kill bootstrap");
+	let (_input_admin, admin) = Channel::create();
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
+	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
+	let mut catalogue = Catalogue { server: catalogue_server, pointer: None, touch: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new(), opened: alloc::vec::Vec::new() };
+	let pump = |catalogue: &mut Catalogue| {
+		for _ in 0..8 {
+			sched::run_until_idle();
+			catalogue.answer();
+		}
+		sched::run_until_idle();
+	};
+	// TWO POINTERS AND ONE SURFACE PUBLISHED BEFORE THE SERVICE ASKS, and a second surface too.
+	let pointer = device::ProviderKind::Pointer;
+	let touch = device::ProviderKind::Touch;
+	let p1 = catalogue.publish(pointer, 1, 1);
+	let p2 = catalogue.publish(pointer, 2, 1);
+	let t1 = catalogue.publish(touch, 10, 1);
+	let t2 = catalogue.publish(touch, 11, 1);
+	pump(&mut catalogue);
+	let online = boot_kernel.recv().expect("InputService online report");
+	assert_eq!(&online.bytes[..], b"InputService: online");
+	assert!(catalogue.pointer.is_some() && catalogue.touch.is_some(), "both kinds were subscribed");
+	assert!(catalogue.was_opened(pointer, 1, 1) && catalogue.was_opened(pointer, 2, 1), "both pointers published at the start were attached");
+	assert!(catalogue.was_opened(touch, 10, 1) && !catalogue.was_opened(touch, 11, 1), "one surface is attached and the second waits");
+
+	// BOTH POINTERS MOVE THE ONE CURSOR, and a third published later does too.
+	p1.send(raw_pointer(at_column(10), 0)).expect("the first pointer");
+	p2.send(raw_pointer(at_column(20), 0)).expect("the second pointer");
+	let p3 = catalogue.publish(pointer, 3, 1);
+	pump(&mut catalogue);
+	assert!(catalogue.was_opened(pointer, 3, 1), "a pointer published later is attached");
+	p3.send(raw_pointer(at_column(30), 0)).expect("the third pointer");
+	sched::run_until_idle();
+	let seen = cursor(&service_client, 1);
+	for column in [10, 20, 30] {
+		assert!(seen.contains(&(column, 0)), "the cursor moved for the pointer at column {column}: {seen:?}");
+	}
+
+	// ONE WITHDRAWN: its connection closed, the others still delivering - and its re-publication attached.
+	catalogue.withdraw(pointer, 2, 1);
+	pump(&mut catalogue);
+	assert!(p2.send(raw_pointer(at_column(21), 0)).is_err(), "the withdrawn pointer's connection is closed");
+	p1.send(raw_pointer(at_column(11), 0)).expect("the first pointer still delivers");
+	let p2_again = catalogue.publish(pointer, 2, 2);
+	pump(&mut catalogue);
+	assert!(catalogue.was_opened(pointer, 2, 2), "the re-publication is attached");
+	p2_again.send(raw_pointer(at_column(22), 0)).expect("the republished pointer");
+	sched::run_until_idle();
+	let seen = cursor(&service_client, 2);
+	assert!(seen.contains(&(11, 0)) && seen.contains(&(22, 0)), "the staying pointer and the re-publication both moved the cursor: {seen:?}");
+	assert!(!seen.contains(&(21, 0)));
+
+	// FOUR ATTACHED, A FIFTH WAITS - and is attached when one is withdrawn.
+	let p4 = catalogue.publish(pointer, 4, 1);
+	let p5 = catalogue.publish(pointer, 5, 1);
+	pump(&mut catalogue);
+	assert!(catalogue.was_opened(pointer, 4, 1), "the fourth is attached");
+	assert!(!catalogue.was_opened(pointer, 5, 1), "the fifth waits");
+	p4.send(raw_pointer(at_column(40), 0)).expect("the fourth pointer");
+	catalogue.withdraw(pointer, 1, 1);
+	pump(&mut catalogue);
+	assert!(catalogue.was_opened(pointer, 5, 1), "the fifth is attached once one of four is withdrawn");
+	p5.send(raw_pointer(at_column(50), 0)).expect("the fifth pointer");
+	sched::run_until_idle();
+	let seen = cursor(&service_client, 3);
+	assert!(seen.contains(&(40, 0)) && seen.contains(&(50, 0)), "the fourth and the fifth moved the cursor: {seen:?}");
+	assert!(p1.send(raw_pointer(at_column(12), 0)).is_err(), "and the withdrawn first is closed");
+
+	// THE SURFACES: a finger down on the first, the first withdrawn - the finger lifted - and the second attached.
+	let (proof, registered) = Channel::create();
+	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("register focus peer");
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&3u16.to_le_bytes());
+	request.extend_from_slice(&4u32.to_le_bytes());
+	request.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&service_client, &request, proof, Rights::ALL).expect("contact subscription request");
+	sched::run_until_idle();
+	let reply = service_client.recv().expect("contact subscription reply");
+	let contacts = reply.caps.first().expect("the contact stream").object().into_any_arc().downcast::<Channel>().expect("a channel");
+	let ack = focus_display.recv().expect("focus acknowledgement");
+	assert_eq!(&ack.bytes[..], b"OK");
+	t1.send(raw_contact(7, true, 0x1000, 0x2000)).expect("a finger down on the first surface");
+	sched::run_until_idle();
+	let down = contacts.recv().expect("the contact");
+	assert_eq!((down.bytes[4], down.bytes[5]), (7, 1));
+	catalogue.withdraw(touch, 10, 1);
+	pump(&mut catalogue);
+	let lifted = contacts.recv().expect("the withdrawn surface's finger is lifted");
+	assert_eq!((lifted.bytes[4], lifted.bytes[5]), (7, 0), "the finger the first surface held is lifted");
+	assert!(t1.send(raw_contact(7, false, 0, 0)).is_err(), "the first surface's connection is closed");
+	assert!(catalogue.was_opened(touch, 11, 1), "the waiting surface is attached");
+	t2.send(raw_contact(3, true, 0x3000, 0x4000)).expect("a finger on the second surface");
+	sched::run_until_idle();
+	let second = contacts.recv().expect("the second surface delivers");
+	assert_eq!((second.bytes[4], second.bytes[5], le_u16(&second.bytes, 6)), (3, 1, 0x3000));
+
+	core::mem::drop(kill_display);
+}
+
 tagged_test!(input_service_streams_keys_only_with_display_focus, [Service, Input, Display], id = "kernel.services.input_service_streams_keys_only_with_display_focus", covers = ["kernel"]);
 fn input_service_streams_keys_only_with_display_focus() {
 	use object::channel::{Channel, Message};

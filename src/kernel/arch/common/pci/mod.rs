@@ -916,6 +916,30 @@ pub struct DecodedRange {
 	pub window: bool,
 }
 
+// EVERY BRIDGE'S I/O WINDOW, as (first port, length): what a namespace device's `_CRS` ports may not overlap, beside the
+// functions' own I/O BARs. A bridge with its I/O decode off forwards no port, whatever its registers hold - an
+// unprogrammed base and limit of 0 would otherwise read as the whole legacy range - and a window above the 16-bit port
+// space is out of every port's reach.
+pub fn io_windows<A: ConfigAccess>(devices: &[PciDevice]) -> Vec<(u16, u16)> {
+	let mut out = Vec::new();
+	for d in devices.iter().filter(|d| d.header_type & 0x7F == 1) {
+		if A::read32(d.bus, d.dev, d.func, 0x04) & 0x1 == 0 {
+			continue;
+		}
+		let window = A::read32(d.bus, d.dev, d.func, 0x1C);
+		let (base_low, limit_low) = (window & 0xFF, (window >> 8) & 0xFF);
+		let upper = if base_low & 0x0F == 1 { A::read32(d.bus, d.dev, d.func, 0x30) } else { 0 };
+		let base = (upper & 0xFFFF) << 16 | (base_low & 0xF0) << 8;
+		let limit = (upper >> 16) << 16 | (limit_low & 0xF0) << 8 | 0xFFF;
+		if limit > base && base <= 0xFFFF {
+			let end = limit.min(0xFFFF);
+			// ALLOC-OK: boot, one per bridge.
+			out.push((base as u16, (end - base + 1).min(0xFFFF) as u16));
+		}
+	}
+	out
+}
+
 // EVERY MEMORY RANGE THE BUS DECODES - each function's BARs, sized, and each bridge's memory and prefetchable windows -
 // what no firmware region and no platform row may take. Read once, at the boot scan: sizing a BAR writes to it, which
 // is safe only before a driver holds the function.

@@ -1,7 +1,8 @@
 // THE ACPI SERVICE'S KERNEL SIDE, driven through its syscalls from a thread with a handle table, as the service
 // drives it: the privilege every call needs; the tables and the mediated accesses on x86_64; configuration writes
 // held to the policy; SystemMemory regions mapped as the memory they are, a companion's BAR making its function
-// firmware-held; a claim and another node's region refusing each other whichever comes first; a walk reconciled by
+// firmware-held; a claim and another node's region refusing each other whichever comes first; a namespace row's ports
+// minted from its claim and refused over an I/O BAR or a bridge's I/O window; a walk reconciled by
 // identity across two instances, with "namespace loaded" withdrawing what the second did not report again; and an
 // ended instance leaving no general-purpose event enabled.
 
@@ -65,6 +66,14 @@ fn free_window(offset: u64) -> u64 {
 	#[cfg(target_arch = "riscv64")]
 	let base = 0x0510_0000;
 	base + offset
+}
+
+// THE TEST MACHINE'S i6300esb: a PCI function with a memory BAR that a suite entry declares, so a test can claim it -
+// its row and its `SYS_FIRMWARE_PCI` address.
+fn watchdog_function() -> (usize, u64) {
+	let row = (0..device::count()).find(|&index| device::with(index, |entry| entry.platform.is_none() && (entry.vendor, entry.product) == (0x8086, 0x25ab)).unwrap_or(false)).expect("the test machine carries an i6300esb");
+	let (bus, dev, func) = device::with(row, |entry| (entry.bus, entry.dev, entry.func)).expect("its row");
+	(row, (bus as u64) << 16 | (dev as u64) << 8 | func as u64)
 }
 
 fn map_request(base: u64, len: u64, node: &[u8], companion: Option<Function>) -> abi::FirmwareMapRequest {
@@ -264,10 +273,11 @@ fn a_configuration_write_is_held_to_the_policy() {
 		}
 		let msi = msi.expect("the edu function has an MSI capability");
 		assert_eq!(invoke(abi::SYS_FIRMWARE_PCI, firmware, address, access(msi as u64 + 4, 4, true), 0), syscall::ERR_ACCESS_DENIED, "the MSI address register");
-		// A FUNCTION A DRIVER HOLDS is not written at all: claimed, then released.
-		let row = (0..device::count()).find(|&index| device::with(index, |entry| entry.platform.is_none() && (entry.bus, entry.dev, entry.func) == (edu.bus, edu.dev, edu.func)).unwrap_or(false)).expect("the edu function's row");
-		let grant = crate::tests::claim_device(row as u64).expect("the edu function is claimed");
-		assert_eq!(invoke(abi::SYS_FIRMWARE_PCI, firmware, address, access(0x40, 4, true), 0), syscall::ERR_ACCESS_DENIED, "a driver holds it");
+		// A FUNCTION A DRIVER HOLDS is not written at all: the test machine's i6300esb, claimed under the entry that
+		// declares it, then released.
+		let (row, esb) = watchdog_function();
+		let grant = crate::tests::claim_device(row as u64).expect("the i6300esb is claimed");
+		assert_eq!(invoke(abi::SYS_FIRMWARE_PCI, firmware, esb, access(0x6C, 1, true), 0), syscall::ERR_ACCESS_DENIED, "a driver holds it");
 		crate::tests::release_device(&grant);
 		// THE KERNEL'S CHIPSET REGISTERS: q35's ECAM base.
 		#[cfg(target_arch = "x86_64")]
@@ -306,16 +316,15 @@ fn a_region_is_mapped_as_the_memory_it_is_and_a_companion_bar_is_held_by_the_fir
 		}
 		// A BAR: refused to any node but the function's companion; admitted to the companion, whose function becomes
 		// FIRMWARE-HELD - shown in its row, answered by its node, and never claimed.
-		let edu = crate::iommu::edu::find().expect("the edu function");
-		let function = Function { segment: 0, bus: edu.bus, device: edu.dev, function: edu.func };
-		let (bar, _) = crate::arch::pci::function_bar(edu.bus, edu.dev, edu.func, 0).expect("the edu BAR");
-		assert_eq!(map(firmware, &map_request(bar, 0x100, b"acpi:\\TST_", None)), syscall::ERR_ACCESS_DENIED, "another node's BAR");
-		let row = (0..device::count()).find(|&index| device::with(index, |entry| entry.platform.is_none() && (entry.bus, entry.dev, entry.func) == (edu.bus, edu.dev, edu.func)).unwrap_or(false)).expect("the edu function's row");
+		let (row, address) = watchdog_function();
+		let function = Function { segment: 0, bus: (address >> 16) as u8, device: (address >> 8) as u8, function: address as u8 };
+		let (bar, _) = crate::arch::pci::function_bar(function.bus, function.device, function.function, 0).expect("the i6300esb's BAR");
+		assert_eq!(map(firmware, &map_request(bar, 0x10, b"acpi:\\TST_", None)), syscall::ERR_ACCESS_DENIED, "another node's BAR");
 		// A DRIVER HOLDS IT FIRST: refused even to the companion.
-		let grant = crate::tests::claim_device(row as u64).expect("the edu function is claimed");
-		assert_eq!(map(firmware, &map_request(bar, 0x100, b"acpi:\\_SB_.PCI0.EDU_", Some(function))), syscall::ERR_ACCESS_DENIED, "a driver holds the function");
+		let grant = crate::tests::claim_device(row as u64).expect("the i6300esb is claimed");
+		assert_eq!(map(firmware, &map_request(bar, 0x10, b"acpi:\\_SB_.PCI0.WDT_", Some(function))), syscall::ERR_ACCESS_DENIED, "a driver holds the function");
 		crate::tests::release_device(&grant);
-		let held = map(firmware, &map_request(bar, 0x100, b"acpi:\\_SB_.PCI0.EDU_", Some(function)));
+		let held = map(firmware, &map_request(bar, 0x10, b"acpi:\\_SB_.PCI0.WDT_", Some(function)));
 		assert!(held > 0, "the companion maps its own function's BAR ({held})");
 		assert_eq!(device::info(row).map(|info| info.platform.state), Some(abi::PLATFORM_STATE_FIRMWARE_HELD), "the row says firmware-held");
 		assert_ne!(device_node(row).flags & abi::FIRMWARE_NODE_FIRMWARE_HELD, 0, "and so does its node");
@@ -324,7 +333,7 @@ fn a_region_is_mapped_as_the_memory_it_is_and_a_companion_bar_is_held_by_the_fir
 		close(held);
 		assert_eq!(crate::tests::claim_device(row as u64).err(), Some(syscall::ERR_UNSUPPORTED), "still held with the region gone");
 		super::forget_for_test();
-		let again = crate::tests::claim_device(row as u64).expect("the fixture gives the function back");
+		let again = crate::tests::claim_device(row as u64).expect("the suite's reset gives the function back");
 		crate::tests::release_device(&again);
 		DONE.store(true, Ordering::SeqCst);
 	}
@@ -355,6 +364,45 @@ fn a_claim_and_another_node_s_region_refuse_each_other_whichever_came_first() {
 		assert!(own > 0, "the device's own node shares its memory with its driver ({own})");
 		close(own);
 		crate::tests::release_device(&grant);
+		super::forget_for_test();
+		DONE.store(true, Ordering::SeqCst);
+	}
+	in_thread(body, &DONE);
+}
+
+#[cfg(target_arch = "x86_64")]
+crate::tagged_test!(a_namespace_row_s_ports_are_minted_from_its_claim_and_never_over_a_bar_or_a_bridge_window, [Drivers, Kernel, Pci, Syscall, ArchX86_64], id = "kernel.firmware.a_namespace_row_s_ports_are_minted_from_its_claim_and_never_over_a_bar_or_a_bridge_window", covers = ["kernel"]);
+#[cfg(target_arch = "x86_64")]
+fn a_namespace_row_s_ports_are_minted_from_its_claim_and_never_over_a_bar_or_a_bridge_window() {
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_: u64) {
+		let firmware = privilege(PrivilegeKind::FirmwareInterpreter);
+		let (_, _events) = attach(firmware);
+		// A `_CRS` WITH PORTS NOTHING HOLDS - COM3's, which the test machine does not carry - claimable under the suite's
+		// test id: the claim mints them by index, as it mints a static row's, and the release takes them back.
+		let mut description = namespace_description(b"acpi:\\_SB_.TST_.COM3", abi::PLATFORM_STATE_CLAIMABLE, crate::dma_policy::SYNTHETIC_PLATFORM_HID);
+		assert!(description.add_port(0x3e8, 8), "a port range fits");
+		let row = device_report(firmware, description);
+		assert!(row > 0, "the device is published ({row})");
+		let grant = crate::tests::claim_device(row as u64).expect("the row is claimed under the entry that declares it");
+		let ports = invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_PORT_RANGE, 0, 0);
+		assert!(ports > 0, "the claim mints the row's ports ({ports})");
+		assert_eq!(invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_PORT_RANGE, 1, 0), syscall::ERR_INVALID, "an index past the row's port ranges");
+		crate::tests::release_device(&grant);
+		{
+			let thread = sched::current_thread().expect("a current thread");
+			assert!(thread.handles().lock().lookup_typed(Handle::from_raw(ports as u64), crate::object::ObjectType::PortRange, Rights::NONE).is_err(), "the release revoked the range");
+		}
+		// A FUNCTION'S I/O BAR AND A BRIDGE'S I/O WINDOW are the bus's, and never a namespace device's.
+		let bar = (0..device::count()).find_map(|index| device::with(index, |entry| if entry.platform.is_none() { entry.ports[..entry.port_count as usize].iter().find(|port| port.source == abi::PORT_SOURCE_IO_BAR).map(|port| port.base) } else { None }).flatten()).expect("a function of the test machine decodes an I/O BAR");
+		let mut over_bar = namespace_description(b"acpi:\\_SB_.TST_.BAR_", abi::PLATFORM_STATE_CLAIMABLE, crate::dma_policy::SYNTHETIC_PLATFORM_HID);
+		assert!(over_bar.add_port(bar, 4));
+		assert_eq!(device_report(firmware, over_bar), syscall::ERR_ACCESS_DENIED, "ports over the I/O BAR at {bar:#x} are refused");
+		let window = super::STATE.lock().io_windows.first().copied().expect("the test machine's hot-plug root port forwards an I/O window");
+		let mut over_window = namespace_description(b"acpi:\\_SB_.TST_.WIN_", abi::PLATFORM_STATE_CLAIMABLE, crate::dma_policy::SYNTHETIC_PLATFORM_HID);
+		assert!(over_window.add_port(window.0 + 0x10, 4));
+		assert_eq!(device_report(firmware, over_window), syscall::ERR_ACCESS_DENIED, "ports inside the bridge window at {:#x} are refused", window.0);
+		super::process_ended(koid());
 		super::forget_for_test();
 		DONE.store(true, Ordering::SeqCst);
 	}
@@ -412,6 +460,14 @@ fn a_walk_is_reconciled_by_identity_and_loaded_withdraws_what_it_did_not_report(
 		let node = device_node(function_row as usize);
 		assert_eq!((node.flags & abi::FIRMWARE_NODE_COMPANION != 0, node.path(), node.aei()), (true, &b"acpi:\\_SB_.PCI0.EDU_"[..], &[7u32][..]));
 		assert_eq!(send_report(firmware, &out[..len]), function_row, "joined again it is the same companion");
+		// A NAMESPACE ROW THAT IS ITSELF A CONTROLLER carries its lists under its own identity.
+		let mut lines = List::default();
+		assert!(lines.push(5));
+		let lists = report::ListsReport { identity: b"acpi:\\_SB_.LSF0", aei_lines: List::default(), field_lines: lines, field_addresses: List::default() };
+		let len = report::encode_lists(&lists, &mut out).expect("the lists encode");
+		assert_eq!(send_report(firmware, &out[..len]), 0);
+		let node = device_node(kept as usize);
+		assert_eq!((node.flags & abi::FIRMWARE_NODE_LISTS != 0, node.path(), node.field_lines()), (true, &b"acpi:\\_SB_.LSF0"[..], &[5u32][..]));
 		// THE FIRST INSTANCE'S NAMESPACE IS LOADED: an arrival for each new row, then the report - and the report
 		// named by a number that is not the instance's is refused.
 		assert_eq!(loaded_report(firmware, first + 7), syscall::ERR_INVALID);

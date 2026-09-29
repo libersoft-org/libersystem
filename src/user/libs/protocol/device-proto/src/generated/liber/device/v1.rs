@@ -791,6 +791,9 @@ pub enum FailureCause {
 	/// shutdown was told the driver had crashed. A state and a cause are two halves of one answer, so
 	/// the honest half needed a value of its own.
 	Stopped = 12,
+	/// A CONNECTION THE DEVICE'S FIRMWARE NAMES CANNOT BE GRANTED - a ten-bit I2C address, an SPI device, a line the
+	/// ACPI service holds for the firmware's `_AEI` events, a connection joined to no controller. Not retried.
+	ConnectionRefused = 13,
 }
 
 impl FailureCause {
@@ -846,6 +849,7 @@ impl FailureCause {
 			10 => Some(FailureCause::TeardownUnconfirmed),
 			11 => Some(FailureCause::Hung),
 			12 => Some(FailureCause::Stopped),
+			13 => Some(FailureCause::ConnectionRefused),
 			_ => None,
 		}
 	}
@@ -6925,6 +6929,7 @@ impl FailureCause {
 			FailureCause::TeardownUnconfirmed => out.push_str("\"teardown-unconfirmed\""),
 			FailureCause::Hung => out.push_str("\"hung\""),
 			FailureCause::Stopped => out.push_str("\"stopped\""),
+			FailureCause::ConnectionRefused => out.push_str("\"connection-refused\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -6942,6 +6947,7 @@ impl FailureCause {
 			FailureCause::TeardownUnconfirmed => out.push_str("teardown-unconfirmed"),
 			FailureCause::Hung => out.push_str("hung"),
 			FailureCause::Stopped => out.push_str("stopped"),
+			FailureCause::ConnectionRefused => out.push_str("connection-refused"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -6959,6 +6965,7 @@ impl FailureCause {
 			FailureCause::TeardownUnconfirmed => crate::codec::cbor::text(out, "teardown-unconfirmed"),
 			FailureCause::Hung => crate::codec::cbor::text(out, "hung"),
 			FailureCause::Stopped => crate::codec::cbor::text(out, "stopped"),
+			FailureCause::ConnectionRefused => crate::codec::cbor::text(out, "connection-refused"),
 		}
 	}
 }

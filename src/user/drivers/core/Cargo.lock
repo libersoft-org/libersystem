@@ -115,6 +115,9 @@ dependencies = [
  "bootproto",
  "display-device-proto",
  "driver-protocol",
+ "hid-i2c",
+ "i2c-client",
+ "i2c-device-proto",
  "ipc-client",
  "power-model",
  "proto",
@@ -152,6 +155,18 @@ name = "graphics-proto"
 version = "0.0.0"
 dependencies = [
  "wire",
+]
+
+[[package]]
+name = "hid-i2c"
+version = "0.0.0"
+
+[[package]]
+name = "i2c-client"
+version = "0.0.0"
+dependencies = [
+ "hid-i2c",
+ "i2c-device-proto",
 ]
 
 [[package]]

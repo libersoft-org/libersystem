@@ -370,6 +370,10 @@ pub enum ResourceKind {
 	// at a time at exactly their width through the kernel - a PCI function's arming registers in configuration
 	// space, a chipset register in memory, a WDAT's system-memory registers.
 	Registers = 11,
+	// ONE CONNECTION OF A PLATFORM ROW - one frame per connection the row names, in the row's order: a channel to the
+	// controller that serves it, SCOPED to the one I2C address or the one GPIO line (with its trigger) the connection
+	// is. What a child binding reaches its bus through; the controller serves that scope and nothing beside it.
+	Connection = 12,
 }
 
 // How many `PortRange` resources one bind can carry: one per port resource a row can record.
@@ -379,6 +383,8 @@ pub const MAX_PORT_RANGES: usize = abi::MAX_PORT_RESOURCES;
 // is the `Device` window, and every one of its lines.
 pub const MAX_PLATFORM_WINDOWS: usize = abi::MAX_PLATFORM_MMIO - 1;
 pub const MAX_PLATFORM_LINES: usize = abi::MAX_PLATFORM_LINES;
+// How many `Connection` resources one bind can carry: one per connection a platform row can name.
+pub const MAX_CONNECTIONS: usize = abi::MAX_PLATFORM_CONNECTIONS;
 
 impl ResourceKind {
 	pub fn from_u16(value: u16) -> Option<Self> {
@@ -394,6 +400,7 @@ impl ResourceKind {
 			9 => Some(ResourceKind::Line),
 			10 => Some(ResourceKind::ConsoleTap),
 			11 => Some(ResourceKind::Registers),
+			12 => Some(ResourceKind::Connection),
 			_ => None,
 		}
 	}
@@ -838,6 +845,56 @@ impl GpioTrigger {
 			5 => Some(GpioTrigger::Low),
 			_ => None,
 		}
+	}
+}
+
+// The tree's interrupt-type cell, whose values virtio-gpio's trigger types share.
+const TREE_EDGE_RISING: u8 = 1;
+const TREE_EDGE_FALLING: u8 = 2;
+const TREE_EDGE_BOTH: u8 = 3;
+const TREE_LEVEL_HIGH: u8 = 4;
+const TREE_LEVEL_LOW: u8 = 8;
+
+// THE SCOPE A PLATFORM ROW'S CONNECTION IS MINTED WITH, from the row's source and the connection as its firmware
+// described it - or why it cannot be. An ACPI `GpioInt`'s mode and polarity and a tree specifier's interrupt-type cell
+// become ONE line trigger; an ACPI line with neither (an input `GpioIo`) is read for its level alone; a ten-bit I2C
+// address, an SPI device and a tree line with no trigger are refused by name.
+pub fn connection_scope(source: u8, connection: &abi::Connection) -> Result<Scope, &'static str> {
+	match connection.kind {
+		abi::CONNECTION_I2C => {
+			if connection.trigger & abi::CONNECTION_I2C_TEN_BIT != 0 {
+				return Err("a ten-bit I2C address - not supported");
+			}
+			match u8::try_from(connection.value) {
+				Ok(address) if address <= 0x7F => Ok(Scope::I2cAddress(address)),
+				_ => Err("an I2C address past seven bits"),
+			}
+		}
+		abi::CONNECTION_GPIO_LINE => {
+			let trigger = if source == abi::PLATFORM_SOURCE_TREE {
+				match connection.trigger {
+					TREE_EDGE_RISING => GpioTrigger::Rising,
+					TREE_EDGE_FALLING => GpioTrigger::Falling,
+					TREE_EDGE_BOTH => GpioTrigger::Both,
+					TREE_LEVEL_HIGH => GpioTrigger::High,
+					TREE_LEVEL_LOW => GpioTrigger::Low,
+					_ => return Err("a tree interrupt with no trigger this contract has"),
+				}
+			} else {
+				let low = connection.polarity == abi::LINE_POLARITY_LOW;
+				match connection.trigger {
+					0 => GpioTrigger::Level,
+					abi::LINE_TRIGGER_LEVEL if low => GpioTrigger::Low,
+					abi::LINE_TRIGGER_LEVEL => GpioTrigger::High,
+					abi::LINE_TRIGGER_EDGE if low => GpioTrigger::Falling,
+					abi::LINE_TRIGGER_EDGE => GpioTrigger::Rising,
+					_ => return Err("a GPIO line with an unknown trigger"),
+				}
+			};
+			Ok(Scope::GpioLine { line: connection.value, trigger })
+		}
+		abi::CONNECTION_SPI => Err("an SPI device - no SPI contract exists"),
+		_ => Err("a connection of an unknown kind"),
 	}
 }
 

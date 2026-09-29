@@ -1,19 +1,15 @@
 //! HID over I2C: the descriptor a device publishes, the register protocol that reaches its reports,
 //! and the bounded bus contract both are spoken over.
 //!
-//! WHAT THIS IS AND IS NOT. It is a PARSER AND A PROTOCOL and it binds nothing. There is no I2C
-//! controller driver in this tree and no provider kind for one, so there is no bus to bind to and no
-//! device model to bind against - which is exactly what makes this half a shared library rather than
-//! a driver, and what lets it close on host tests over a fake bus while the hardware half waits for a
-//! controller item with a real fixture.
+//! WHAT THIS IS AND IS NOT. It is a PARSER AND A PROTOCOL and it binds nothing: the `i2c_hid` driver binds, links this
+//! statically, and supplies the bus - `i2c-client`'s `ScopedBus`, the I2C contract's client over the one
+//! address-scoped connection DeviceManager minted on the controller. Which is what lets this close on host tests over
+//! a fake bus.
 //!
-//! THE BUS CONTRACT IS OWNED HERE BECAUSE THIS IS THE FIRST IMPLEMENTED CONSUMER, which is the rule
-//! the milestone states rather than a claim on the abstraction: an IPMI SSIF transport consumes the
-//! same bus class and is independently ordered, and whichever of the two is written first states the
-//! contract. It is deliberately the smallest thing that serves both - an address, a write, a read,
-//! and the write-then-read that every register access is - with no controller vocabulary in it at
-//! all: no clock rate, no bus number, no pin, no arbitration. A controller item will implement this;
-//! it will not have to be described by it.
+//! THE BUS TRAIT IS THE SMALLEST THING A REGISTER PROTOCOL NEEDS - an address, a write, a read, and the write-then-read
+//! that every register access is - with no controller vocabulary in it at all: no clock rate, no bus number, no pin, no
+//! arbitration. It is this protocol's alone: an IPMI SSIF transport speaks the I2C contract's SMBus transactions through
+//! `i2c-client`'s second client type, and not this trait.
 //!
 //! WHY A DEVICE ON A SLOW SERIAL BUS NEEDS A PARSER THIS DEFENSIVE. Every field below arrives from a
 //! peripheral over two wires: the length of a report, the register a report descriptor lives at, the

@@ -58,6 +58,9 @@ pub mod hid;
 // THE HID POWER DEVICE CLASS OVER THE COMMON HID FIELD TABLE: which fields carry a UPS's values, what the latest
 // reports say, and how a control is written back.
 pub mod hid_power;
+// HID OVER I2C, the driver's parts a host can test: which collections publish what, which report goes where, the
+// reset handshake's bound and the interrupt-storm rule.
+pub mod i2c_hid;
 pub mod input;
 pub mod keys;
 pub mod mbim;

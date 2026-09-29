@@ -30,6 +30,8 @@ fn each_kind_of_node_is_said_not_guessed() {
 	assert_eq!(node::role(Kind::Device, &id(Some("PNP0C09"), &[], None), None, &none), Role::EmbeddedController);
 	assert_eq!(node::role(Kind::Device, &id(Some("ACPI0007"), &[], None), None, &none), Role::Processor);
 	assert_eq!(node::role(Kind::Processor, &id(None, &[], None), None, &none), Role::Processor);
+	assert_eq!(node::role(Kind::Device, &id(Some("ACPI0010"), &[], None), None, &none), Role::Processor, "a processor container");
+	assert!(matches!(node::role(Kind::Device, &id(Some("PNP0C0F"), &[], None), None, &none), Role::NotADevice(_)), "a PCI interrupt link");
 	assert_eq!(node::role(Kind::ThermalZone, &id(None, &[], None), None, &none), Role::ThermalZone);
 	assert!(matches!(node::role(Kind::PowerResource, &id(None, &[], None), None, &none), Role::NotADevice(_)));
 	assert!(matches!(node::role(Kind::Device, &id(None, &[], None), None, &none), Role::NotADevice(_)), "neither _HID nor _ADR");

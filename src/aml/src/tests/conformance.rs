@@ -641,3 +641,25 @@ fn the_harness_emitters_sample_table_loads_and_runs() {
 		other => panic!("{other:?}"),
 	}
 }
+
+#[test]
+fn the_root_and_a_parent_prefix_alone_open_a_scope() {
+	// Scope (\) { Name (RTNM, 0x11) }  Device (DEV0) { Scope (^) { Name (UPNM, 0x22) } }  - as q35's DSDT opens the root.
+	let body = cat(&[
+		scope("\\", name_obj("RTNM", int(0x11))),
+		device("DEV0", scope("^", name_obj("UPNM", int(0x22)))),
+		method("READ", 0, ret(add(name("\\RTNM"), name("\\UPNM"), vec![0x00]))),
+	]);
+	let (mut aml, mut model) = load(&body);
+	assert_eq!(integer(eval(&mut aml, &mut model, "\\READ", &[])), 0x33);
+}
+
+#[test]
+fn a_region_is_announced_with_the_node_that_declared_it() {
+	// Device (DEV0) { OperationRegion (REG0, SystemMemory, 0x5000, 0x10); Field (REG0) { VAL0, 32 } Method (RD) { Return (VAL0) } }
+	let body = device("DEV0", cat(&[op_region("REG0", 0, int(0x5000), int(0x10)), field("REG0", 0x03, &[named_field("VAL0", 32)]), method("RD__", 0, ret(name("VAL0")))]));
+	let (mut aml, mut model) = load(&body);
+	model.memory.insert(0x5000, 0x7A);
+	assert_eq!(integer(eval(&mut aml, &mut model, "\\DEV0.RD__", &[])), 0x7A);
+	assert_eq!(model.regions.last().map(|(node, space, base, length)| (node.as_str(), *space, *base, *length)), Some(("\\DEV0", Space::SystemMemory, 0x5000, 0x10)), "the host was told the region and its declaring node before the access");
+}

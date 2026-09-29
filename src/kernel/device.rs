@@ -149,7 +149,7 @@ pub fn init() {
 	let described = crate::arch::platform::describe();
 	// EVERY BAR AND WINDOW THE BUS DECODES, sized now - before any driver holds a function - for the checks every
 	// platform row and every firmware region is held to.
-	crate::firmware::record_decoded(crate::arch::pci::decoded_ranges());
+	crate::firmware::record_decoded(crate::arch::pci::decoded_ranges(), crate::arch::pci::io_windows());
 	let mut functions = PCI_FUNCTIONS.lock();
 	functions.clear();
 	for p in crate::arch::pci::scan() {
@@ -250,7 +250,8 @@ pub fn init() {
 	// AND EACH CONNECTION JOINED TO ITS CONTROLLER'S ROW, now that every row exists: an I2C device to its
 	// bus, a GPIO line to its controller. One whose controller no row carries stays unjoined, and says so.
 	for (row, connection, identity) in pending {
-		let found = table.iter().position(|entry| entry.platform.as_ref().is_some_and(|held| held.part.identity() == identity.as_slice()));
+		// A ROW CARRYING THE IDENTITY, or the PCI function whose companion node - or a node below it - it names.
+		let found = table.iter().position(|entry| entry.platform.as_ref().is_some_and(|held| held.part.identity() == identity.as_slice())).or_else(|| crate::firmware::companion_function(&identity).and_then(|(bus, dev, func)| table.iter().position(|entry| entry.is_function(bus, dev, func))));
 		match (found, table[row].platform.as_mut()) {
 			(Some(controller), Some(held)) => held.part.connections[connection as usize].controller = controller as u32,
 			(None, Some(held)) => crate::serial_println!("device: {} names a controller {} that no row carries - that connection is not joined", alloc::string::String::from_utf8_lossy(held.part.identity()), alloc::string::String::from_utf8_lossy(&identity)),

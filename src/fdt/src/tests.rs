@@ -2921,3 +2921,52 @@ fn a_property_block_resolves_a_fixed_clock_and_names_what_it_cannot_resolve() {
 	let cut = tree.property_block(button, &mut small);
 	assert!(cut.unresolved && cut.len <= 40);
 }
+
+// A PCI HOST'S CHILD NODES: the virtio-gpio function at device 3 with its `virtio,device29` child, which is both a GPIO
+// controller and an interrupt controller; the virtio-i2c function at device 5 with its `virtio,device22` child, a bus of
+// seven-bit addresses carrying a `hid-over-i2c` device whose interrupt is a line of the GPIO child, level and active low;
+// and a fixture node elsewhere whose `interrupts-extended` names that child - the bindings Linux documents.
+fn pci_child_tree() -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("pcie@10000000").prop_str("compatible", "pci-host-ecam-generic").prop_str("device_type", "pci").prop_u32("#address-cells", 3).prop_u32("#size-cells", 2).prop_reg64(0x4010_0000_0000, 0x1000_0000);
+	builder.begin("gpio@3,0").prop_str("compatible", "pci1af4,1069").prop("reg", &be_cells(&[0x1800, 0, 0, 0, 0]));
+	builder.begin("gpio").prop_str("compatible", "virtio,device29").prop("gpio-controller", b"").prop("interrupt-controller", b"").prop_u32("#interrupt-cells", 2).prop_u32("phandle", 0x40).end();
+	builder.end();
+	builder.begin("bad@4,0").prop_str("compatible", "pci1af4,1069").prop_u32("reg", 0x2000).end();
+	builder.begin("i2c@5,0").prop_str("compatible", "pci1af4,1062").prop("reg", &be_cells(&[0x2800, 0, 0, 0, 0]));
+	builder.begin("i2c").prop_str("compatible", "virtio,device22").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	builder.begin("touchpad@2c").prop_str("compatible", "hid-over-i2c").prop_u32("reg", 0x2c).prop_u32("hid-descr-addr", 0x20).prop("interrupts-extended", &be_cells(&[0x40, 0, 8])).end();
+	builder.end();
+	builder.end();
+	builder.end();
+	builder.begin("fixture").prop_str("compatible", "liber,acpi-fixture").prop("interrupts-extended", &be_cells(&[0x40, 2, 1])).end();
+	builder.end();
+	builder.finish()
+}
+
+#[test]
+fn a_pci_child_node_names_its_function_and_a_line_of_its_child_is_a_connection() {
+	let tree = at(pci_child_tree());
+	let found = devices_of(&tree);
+	let function = device(&found, b"/pcie@10000000/gpio@3,0");
+	assert_eq!((function.bus, function.pci_function()), (NodeBus::Pci, Some((0, 3, 0))), "bus, device and function from the reg's first cell");
+	assert!(!function.reg_refused);
+	let bad = device(&found, b"/pcie@10000000/bad@4,0");
+	assert!(bad.reg_refused && bad.pci_function().is_none(), "a reg that is not three address cells is refused");
+	let virtio = device(&found, b"/pcie@10000000/gpio@3,0/gpio");
+	assert!(virtio.gpio_controller && virtio.interrupt_controller);
+	assert_eq!(virtio.pci_function(), None, "a node below a function is not a function");
+	// A DEVICE ON THE VIRTIO-I2C FUNCTION'S BUS: its address, never MMIO, and its interrupt a line of the GPIO child with
+	// the tree's level-low flags.
+	let i2c = device(&found, b"/pcie@10000000/i2c@5,0");
+	assert_eq!(i2c.pci_function(), Some((0, 5, 0)));
+	let touchpad = device(&found, b"/pcie@10000000/i2c@5,0/i2c/touchpad@2c");
+	assert_eq!((touchpad.bus, touchpad.regs()), (NodeBus::I2c, &[(0x2c, 0)][..]), "an address on the bus");
+	assert_eq!(touchpad.interrupts(), &[NodeInterrupt::GpioLine { controller: 0x40, line: 0, flags: 8 }]);
+	let fixture = device(&found, b"/fixture");
+	assert_eq!(fixture.interrupts(), &[NodeInterrupt::GpioLine { controller: 0x40, line: 2, flags: 1 }]);
+	let host = device(&found, b"/pcie@10000000");
+	assert_eq!(host.bus, NodeBus::Memory, "the host itself sits on the memory bus");
+}

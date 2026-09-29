@@ -191,3 +191,186 @@ allocations past the memory bound, the step bound, a region outside the policy, 
 table given to Load, Unload, unknown opcodes and malformed lengths, Fatal, a name declared twice, a Wait nothing can
 end). Found by the suite and fixed: the address-space descriptors' length offsets and their consumer bit (set is a
 consumer).
+
+## P02M0196b - what was implemented (2026-09-29)
+
+THE KERNEL SIDE (`src/kernel`):
+- `firmware/mod.rs` (new): the ACPI service's kernel state - the running instance (by process koid) and its event
+  channel; every BAR and bridge window the bus decodes, recorded at the boot scan for EVERY function (`record_decoded`,
+  from `arch::common::pci::decoded_ranges`, which now sizes a BAR with memory decode off and restores it); the
+  service's SystemMemory mappings (by node, as `Weak<DeviceMemory>` - live while the service holds the handle);
+  firmware-held functions; companions (a PCI function's node, with its `_AEI` lines and field lines/addresses);
+  controller rows' lists; parent functions of nodes below a companion; merged descriptions and the ids they added;
+  the identities the running instance reported; `_OSC` grants; SMBIOS's type-38 records. `map` (the SystemMemory
+  policy through `platform::policy::system_memory`, write-back for firmware memory, uncached for MMIO, a companion's
+  BAR making its function FIRMWARE-HELD and its memory decode on), `claim_refusal` (a firmware-held function; a range
+  another node's live region maps - `policy::claim_blocked`), `pci` (reads of any function; writes held to
+  `policy::config_write` with the function's MSI/MSI-X capability ranges walked, the driver-held test and the chipset
+  rows), `attach`, `process_ended` (GPEs disabled, the channel dropped, what was published kept), `deliver` (the idle
+  pass sends latched GPEs), `report` (device - reconciled through `device::publish_namespace`, IPI0001 checked against
+  SMBIOS type 38 -, withdraw, companion, `_OSC` grant - applied through `arch::pci::apply_grant` and the hot-plug
+  interrupts armed -, lists, and "namespace loaded" - which withdraws every namespace row, merged description and
+  companion the instance did not report again, then sends `DEVICE_EVENT_NAMESPACE_LOADED`), `node` (what
+  `SYS_DEVICE_NODE` answers), `tree_companion` (a device tree's PCI child node joined at the boot scan).
+- `syscall/firmware.rs` (new): `SYS_FIRMWARE_TABLE` 101, `_MAP` 102, `_MEDIATED` 103, `_PCI` 104, `_REPORT` 105,
+  `_EVENTS` 106, `_GPE` 107 (instance-only but the count), all behind `FirmwareInterpreter`; `SYS_DEVICE_NODE` 108.
+  SystemIO regions use P02M0191's `SYS_PORT_RANGE_FIRMWARE`.
+- `device.rs`: `publish_namespace` (reconcile by identity: `Same` - logged when it differs -, `Refill` with a new
+  generation and an arrival, otherwise placed; a reservation a row of its own and never merged; a new row held to the
+  `_CRS` check and kept out of every reservation's ranges; connections joined to a row or a companion's function),
+  `withdraw_namespace`, `unmerge`, `namespace_rows`, `with_tables`; `claim` refuses a withdrawn namespace row and
+  whatever `firmware::claim_refusal` says (`FirmwareDriven`); `info` shows a firmware-held function's state; the
+  boot's forbidden ranges include every decoded BAR and window; a boot connection whose controller is a companion
+  (or a node below one) joins to the function's row.
+- `object/device_memory.rs`: `for_firmware` and `write_back`; `SYS_DEVICE_MEMORY_MAP` maps write-back where minted so.
+- `arch/x86_64/sci.rs`: the GPE0/GPE1 blocks (`acpi::gpe`) initialised - enables cleared, statuses acknowledged -
+  before the SCI is routed; the handler masks and latches every asserted enabled event into a bitmap (allocation-free
+  `Gpes::handle_into`), decodes `GBL_STS`; the idle pass delivers; requests `gpe_request`; `gpe_instance_ended`
+  (`Gpes::reset_runtime`); the storm path now MASKS the SCI's redirection entry. `arch/x86_64/firmware.rs`: tables,
+  SMI, PM timer, `GBL_RLS`, CMOS NVRAM, the kernel's wired lines and the chipset rows (MCH PCIEXBAR, ICH9 PMBASE and
+  ACPI_CNTL); stubs on aarch64/riscv64.
+- `arch/common/pci/mod.rs`: `_OSC` gating - on an ACPI machine (not the test kernel) the scan arms slots and watches
+  error reporters only on buses a grant covers (`gate_on_osc`, `apply_grant`, `controls`); `main.rs` calls
+  `firmware::init` before the first scan and `firmware::deliver` on the idle pass; `arm_hot_plug_interrupts` is
+  `pub(crate)` for the grant.
+- `process/mod.rs`: `firmware::process_ended` beside `idle::process_ended` on both ends of a process.
+- Kernel tests `firmware/tests.rs` (7): the privilege gate; tables and mediated accesses on x86_64 (DSDT, FACS, APIC
+  instances, a short buffer, the CMOS clock/century/bank refusals and a written byte, the SMI disable value, the PM
+  timer counting); configuration writes (header, MSI, driver-held i6300esb, q35's PCIEXBAR); regions (RAM refused, a
+  hole uncached, NVS/reclaimable write-back, a BAR refused to another node and to the companion while a driver holds
+  it, then admitted and the function firmware-held - in its row, its node, and refused to a claim, past the mapping);
+  a claim and another node's region refusing each other; a walk reconciled across two instances (same row, differing
+  report kept, reservation and the reservation rule, a merge into a static row taken out, a companion with lists,
+  a controller row's lists, loaded refused for the wrong instance, arrivals then the report last, a second instance's
+  withdrawal of what it did not report, refill with a new generation, an explicit withdrawal); only the running
+  instance asks for GPEs.
+
+THE ABI (`src/abi`): the eight syscall numbers, `FirmwareMapRequest`, `FirmwareNode` (with `_COMPANION`, `_PARENT`,
+`_FIRMWARE_HELD`, `_LISTS`), the GPE operations, the mediated operations, the event kinds, `DEVICE_EVENT_NAMESPACE_LOADED`.
+
+THE PLATFORM CRATE: `report` gained `LISTS` (a controller row's lines and addresses).
+
+THE INTERPRETER (`src/aml`): `\` alone and `^` alone name a node (q35's DSDT opens `Scope (\)` - found on the first real
+boot); `Host::region` - the declaring node, space, base and length announced before every SystemMemory/SystemIO access,
+so the host maps a region whole and the kernel decides by node; `dsm_bytes`; the test tooling (`build`, the map-backed
+host) moved to `aml::testing` behind a `testing` feature for the ACPI model's suites. 45 host tests.
+
+THE ACPI MODEL (`src/user/libs/acpi/model`, new, host-tested): `node` - each node's role (reservation, host bridge,
+companion - on a host bridge's bus or a bridge's secondary bus -, a device below an endpoint's companion carrying its
+function, the `video-output` class rule, embedded controller, processor and processor container, thermal zone under
+`THERMALZONE`, PCI interrupt links and everything else "not a device" with the reason) and the row it is described as
+(identity `acpi:` + path, state, `_HID`/`_CID`/class ids, memory/ports/wired lines, GPIO and I2C connections by their
+controllers' identities, an output `GpioIo` refused by name); `properties` - `_UID` and `_DSD` as a property block in
+the node channel's value encoding; `handshake` - `_OSC` for host bridges (hot-plug, PME, AER, capability, LTR),
+`\_SB._OSC` (CPPC, CPPC v2, `_OST`, `_PR3`, platform-coordinated `_LPI`), processors (`_OSC`/`_PDC` - C1 halt, MWAIT
+hints, software coordination, `_PPC` notification, never the MSR P/T-state forms); `admission` - what a node channel
+may evaluate (the node, its own objects, the class row's parent methods - `_DOS` for a video output -; platform methods
+and other nodes refused); `events` - `_Lxx`/`_Exx`/`_EVT`. 7 host tests over scripted namespaces.
+
+THE SERVICE (`src/user/services/core/src/acpi_service.rs`, new, static, volume-staged, transparent): roles FIRMWARE
+(privilege, `supervisor_role`) and ADMIN (`liber:device@1/acpi-admin` serve root); attaches the instance; loads the
+DSDT and every SSDT; `_REG` for SystemMemory, SystemIO, PCI_Config and SystemCMOS; maps the FACS for the global lock
+(the FACS protocol, `GBL_RLS` through the kernel when the firmware was pending); the embedded controller from the ECDT
+(early) or `PNP0C09`'s `_CRS`, `_REG`, `_GLK` honoured with a bounded global-lock take, queries drained to `_Qxx`;
+companions found before the walk (a region a companion declares must name its function); `\_SB._OSC`; the `_STA`/
+`_INI` walk; every node accounted for - reservations reported first, host bridges' `_OSC` reported, processors'
+handshakes, companions with their lists, devices with `_CRS`/`_DSD`/`_UID` (and `_IFT` for IPI0001), controller rows'
+lists; "namespace loaded"; every `\_GPE` event enabled. The loop: GPE events (edge acknowledged before, level after,
+then re-enabled; the EC's by its queries), `_AEI` line events (`_Exx`/`_Lxx`/`_EVT` in the controller's scope, then the
+line acknowledged), `Notify` delivered to node channels and a device/bus check or eject re-walking the subtree and
+withdrawing what left, the admin root (node channels; connections), node channels (path, evaluate, `_DSD`, `_DSM`,
+notifications). The host: SystemMemory mapped per region AND per declaring node (found by the gate: a mapping reused
+across nodes had let another node's region over a claimed range through without asking the kernel), SystemIO through
+`PortRange`s, the SMI port and PM timer through the kernel, PCI_Config and CMOS through the kernel, GenericSerialBus
+through an address-scoped `i2c-device` connection, GeneralPurposeIo reads through a line-scoped `gpio-device`
+connection (a write refused by name).
+
+THE IDL (`device.lsidl`): `acpi-node`, `acpi-notification`, `acpi-connection-kind`, `acpi-admin`; `device-entry` gained
+`companion` and `parent` (a pre-release record change, `gen.sh --accept-breaking`).
+
+SERVICEMANAGER: the `acpi_service` manifest row (after LogService and ProcessService), `supervisor_role`'s FIRMWARE arm
+(from P02M0200), `plan_relaunchable`, and `hand_acpi_admin` - a connection of the ADMIN root sent on DeviceManager's
+control channel as `ACPI` after the first start and after every relaunch.
+
+DEVICEMANAGER: `ACPI` hand-off; `DEVICE_EVENT_NAMESPACE_LOADED` acted on once the instance's connection is held too
+(whichever arrives first); `acpi_pass` every loop: a driver's `NodeRequest` answered with `Node` (the service's node
+channel) or `NodeAbsent`, at once or at the report; the lines and addresses a controller's companion or row lists minted
+as scoped connections through its published `gpio-lines`/`i2c-bus` provider and handed to the service - at each
+instance's report, and for a controller bound after it when it publishes.
+
+THE DRIVER PROTOCOL: `NodeRequest` 13 (driver->manager), `Node` 14 (one channel), `NodeAbsent` 15. The wire revision
+constant is NOT bumped: the owner's standing rule that nothing is versioned before the first release; every artifact of
+a build agrees by construction. Drivers' `common`: `request_node`, `node`, `wait_node_or_answer`, the node frames taken
+on every control drain, and a node channel whose service ended given up and asked for again. virtio-gpio and
+virtio-i2c ask once online.
+
+LSDEV: a firmware-held function's state and every row's companion/parent (DeviceService fills them from
+`SYS_DEVICE_NODE`).
+
+THE FIXTURE AND THE GATE: `harness/acpi-fixture.py` (the SSDT through the emitter - `Scope` into QEMU's `SA0`/`SA8`/`SB0`
+for the ivshmem/virtio-i2c/virtio-gpio functions, since q35's DSDT already declares a node per present slot; the
+ivshmem BAR below 4 GiB, because q35's DSDT is revision 1 and every integer in the namespace is 32 bits - both found on
+the first fixture boot); the emitter's `qword_memory`, `crs_patched64`, `create_byte_field`, `create_qword_field`,
+`shift_right`; `qemu-run.sh` `ACPI_FIXTURE`/`ACPI_FIXTURE_MEMORY` (the SSDT, `ivshmem-plain` at 0x14 over the file,
+`X-PciMmio64Mb=0`) and `PCIE_HOTPLUG=acpi`; the development-only `acpi_fixture` driver (LSFX0001's probes on every
+`Notify`); `tools/check-acpi.sh` (gate `acpi`); `harness/fdt_edit.py` (the shared device-tree editor,
+`dma-mode-record.py` now built on it, and the ports' tree fixture); gate `firmware-fixtures`.
+
+THE DEVICE TREE: `fdt` reads a child of a `device_type = "pci"` node as `NodeBus::Pci` with `pci_function()`; the
+kernel's `from_tree` joins such a node to its function as a companion (`firmware::tree_companion`) instead of
+publishing it, and a connection naming a node below a companion joins to the function's row.
+
+DECISIONS AND WHAT IS NOT HERE:
+- THE CHILD BINDING (a namespace or tree device bound through scoped connections to its controller, the controller a
+  dependency, the connections as `RESOURCE` frames) is P02M0195b's, next in the agreed order; this step publishes the
+  child's connections joined to the controller's row and grants the SERVICE's connections. The ports' check that a
+  fixture node is bound through a line connection runs with it.
+- THE SECOND FIXTURE CARVE-OUT (a processor table's registers the install check names) waits for P02M0198's install
+  check, which does not exist yet; the first carve-out (a `_CRS` range in the firmware-held ivshmem BAR) is here.
+- THE SLEEP-TYPE REGISTRATION the privilege admits is P02M0197b's call.
+- A HOST BRIDGE'S I/O WINDOWS are not recorded, so a `_CRS` port range is checked against the reserved set, live
+  grants and the functions' I/O BARs, not against a bridge's I/O window.
+- HPET: q35's `\_SB.HPET._STA` reads the HPET's registers, which the kernel holds - the region is refused and the node
+  "did not initialise", which is the policy working; the HPET row is the kernel's.
+
+## P02M0196b/d - verification (2026-09-29)
+
+ADDED AFTER THE SECTION ABOVE, before verifying: the `_CRS` port check now covers every PCI-to-PCI bridge's I/O window
+as well as the functions' I/O BARs (`arch::common::pci::io_windows` - a bridge with its I/O decode off forwards no
+port and is skipped, so an unprogrammed base and limit of zero cannot read as the whole legacy range; recorded at the
+boot scan beside the decoded ranges by `firmware::record_decoded`, joined to the I/O BARs in `admit`). This replaces
+the "A HOST BRIDGE'S I/O WINDOWS are not recorded" point in the decisions above for the bridges the scan sees. The
+refusal now reads "its ports are a PCI function's I/O BAR or a bridge's I/O window". A kernel test was added for it
+(below).
+
+COMMANDS AND RESULTS (x86_64 and the host; PASSED unless said):
+- Kernel, x86_64: `./build.sh --arch x86_64` (ok, 392 s), then `TEST_SELECTION=<30 ids> ./test.sh --arch x86_64
+  --timeout 1800` - 30 passed (81 s): the eight `kernel.firmware.*` tests (the seven above and
+  `a_namespace_row_s_ports_are_minted_from_its_claim_and_never_over_a_bar_or_a_bridge_window` - COM3's ports on a
+  namespace row minted by index from its claim and revoked by the release; ports over a function's I/O BAR and inside
+  the hot-plug root port's I/O window refused), the seven `kernel.platform_rows.*`, the three `kernel.declared.*` and
+  the twelve x86_64 `kernel.object.port_range.*` (logs `.build/logs/test/x86_64-20260929T020010Z-392104-*`). The first
+  attempt named `a_machine_with_no_port_space_mints_nothing`, which is compiled on aarch64 and riscv64 only, and was
+  refused by the selection before anything ran; it is not a failure of the code.
+- Test kernel: `cd src/kernel && TEST=1 TEST_TAGS="" cargo build --tests` - clean after every kernel change.
+- Host suites (`cargo test --manifest-path ...`): abi 28, platform 17, aml 45 (again after the emitter's `GpioInt`
+  consumer bit changed the committed sample), acpi 49, acpi-model 7, fdt 121, driver protocol 77, driver binding 89,
+  system-manifest 28, smbios 11.
+- Gates: `acpi` PASS (346 s: the fixture boot with every node accounted for, lsdev's rows, round 1 of the probes, two
+  hot-added CPUs through `_E02`, `_OSC`, SMBIOS, the service killed and restarted with its rows kept, LSF5 withdrawn,
+  the line granted again and round 2, then the firmware-hot-plug boot where `_OSC` refused native hot-plug and the
+  slots stayed unarmed); `firmware-fixtures`, `aml-emitter`, `source-hygiene`, `arch-surface`, `test-tags` PASS;
+  `capability-model` PASS (1434 s); `./gen.sh --check` exit 0.
+- `qemu-pcie-hotplug` FAILS - AND FAILS THE SAME WAY WITHOUT THIS WORK. On the current tree: twice, and once more with
+  the ACPI service stopped before the gate ("the slot was powered down at line 1, before the driver let go at line 2").
+  On a tree extracted from `c19b8c1d` (`git archive`, before this step and before P02M0200), built from scratch in its
+  own directory (two rustc crashes - SIGILL, then SIGSEGV compiling `core` - before the third build went through):
+  the same failure, with the same sequence line for line. The kernel's `device: N released` follows the driver's
+  exit, the idle pass then powers the slot down, and DeviceManager records an incident "it exited without saying
+  anything" TWICE for a driver whose last frame was `STOPPED` (last opcode 10), before its `stopped cleanly` and `the
+  node is removed from the bus` lines arrive - so the gate's order check reads the removal after the power-down. A
+  pre-existing defect in the removal path (DeviceManager's handling of an answered stop whose exit arrives first, and
+  the gate's use of a line that comes after the release), not introduced here; reported to the owner, not fixed in
+  this step.
+- NOT RUN: aarch64 and riscv64 (every build and test - at the end of the job, by the standing order), the device
+  tree's PCI child join and the tree fixture on the ports, the embedded controller on a laptop.

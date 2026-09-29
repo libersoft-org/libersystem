@@ -689,7 +689,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// some unrelated message to arrive before anything tried again.
 				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at && recovery.armed() {
 					nodes[at].retry_at = 0;
-					start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+					start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
 				}
 				// AND A PLANNED STOP THAT RAN OUT OF ITS SLICE IS FORCED, AND SAYS SO (added
 				// 2026-09-04). M3: the deadline that expires forces the revocation and never claims
@@ -708,7 +708,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if nodes[at].restart_requested && recovery.armed() {
 					nodes[at].restart_requested = false;
 					if nodes[at].binding.is_none() && nodes[at].teardown.is_none() {
-						start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+						start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
 					}
 				}
 				// THE ANSWER IS ACTED ON. This discarded the `Step`, so a driver that crashed after
@@ -720,7 +720,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// so a node whose backoff has not passed is simply skipped this time - which is
 					// what "one node's delay is not every node's" means in the loop that has others.
 					Step::Again if recovery.armed() && clock() >= nodes[at].retry_at => {
-						start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+						start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
 					}
 					Step::NextCandidate if recovery.armed() => {
 						spend_candidate(&mut nodes[at]);
@@ -731,7 +731,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
-							start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+							start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
 						}
 					}
 					_ => {}
@@ -970,7 +970,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						continue;
 					}
 					if bus_events != 0 && at == bus_events_at {
-						serve_bus_events(bus_events, &mut nodes, &catalogue, power, console_input, device_privilege, &mut recovery, &mut buf);
+						serve_bus_events(bus_events, &mut nodes, &mut catalogue, power, console_input, device_privilege, &mut recovery, &mut buf);
 						continue;
 					}
 					if platform_events != 0 && at == platform_events_at {
@@ -1231,7 +1231,7 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 		// like any other node in `Stopping`.
 		if gate_on_requirements(&mut node, entry, catalogue) {
 			if let Some(elf) = package.lookup(entry.artifact) {
-				begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege);
+				begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege, None);
 			} else {
 				node.record.record_failure(FailureCause::DriverMissing);
 			}
@@ -1269,7 +1269,7 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 				continue;
 			};
 			let info = nodes[at].info;
-			begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
+			begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege, None);
 		}
 		for at in first_node..nodes.len() {
 			let name: &[u8] = nodes[at].driver_name();
@@ -1297,7 +1297,7 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 					}
 					let Some(elf) = package.lookup(entry.artifact) else { continue };
 					let info = nodes[at].info;
-					begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
+					begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege, None);
 				}
 				// RESTING IS NOT A VERDICT THIS PHASE ACTS ON either: a boot driver an operator
 				// disabled, or one parked on a provider that went away, keeps its cursor and is
@@ -1448,7 +1448,7 @@ fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &
 		// opened falls through to the next one in the loop below, exactly as it did when this was
 		// sequential.
 		for at in first_node..nodes.len() {
-			start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+			start_candidate_at(nodes, at, storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 		}
 		while pump(nodes, first_node, catalogue, buf) {
 			// WHAT ARRIVED AND WHAT WENT AWAY - see `settle_dependencies`. A node it wakes asks for
@@ -1458,13 +1458,13 @@ fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &
 			for at in first_node..nodes.len() {
 				if nodes[at].restart_requested && nodes[at].binding.is_none() && nodes[at].teardown.is_none() {
 					nodes[at].restart_requested = false;
-					start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+					start_candidate_at(nodes, at, storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 				}
 				// AND THE OTHER REASON A NODE IS WAITING TO BE LOOKED AT AGAIN - see
 				// `Node::waiting_for_claim`. The same re-read phase one performs, reached through
 				// the ordinary candidate path because this phase has the volume to read from.
 				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at {
-					start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+					start_candidate_at(nodes, at, storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 				}
 			}
 			for at in first_node..nodes.len() {
@@ -1481,7 +1481,7 @@ fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &
 						if clock() < nodes[at].retry_at {
 							continue;
 						}
-						start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+						start_candidate_at(nodes, at, storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 					}
 					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
 					// last is gone - which the rollback has just guaranteed. Every rejection is
@@ -1499,7 +1499,7 @@ fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &
 						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
-							start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+							start_candidate_at(nodes, at, storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 						}
 					}
 					Step::Done | Step::Resting => {}
@@ -1544,7 +1544,15 @@ fn print_driver_name(name: &[u8]) {
 // duration of one syscall - not, as it was, for the whole handshake. That is what makes a dozen
 // devices coming up at once cost one mapping at a time rather than a dozen.
 #[allow(clippy::too_many_arguments)]
-unsafe fn start_candidate(node: &mut Node, storage: u64, package: Option<&[u8]>, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
+// `start_candidate` for `nodes[at]`, with the live controllers its connections are on.
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_candidate_at(nodes: &mut [Node], at: usize, storage: u64, package: Option<&[u8]>, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &mut Catalogue, state: &mut [u8]) {
+	let publishers = publishers_for(nodes, &nodes[at]);
+	unsafe { start_candidate(&mut nodes[at], storage, package, key_producer, power, console_input, device_privilege, catalogue, &publishers, state) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_candidate(node: &mut Node, storage: u64, package: Option<&[u8]>, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &mut Catalogue, publishers: &[Publisher], state: &mut [u8]) {
 	unsafe {
 		// A STORED DISABLE PARKS THE NODE; IT DOES NOT SPEND A CANDIDATE.
 		//
@@ -1628,7 +1636,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, package: Option<&[u8]>,
 					print_driver_name(driver_name);
 					print(b" is not readable on the volume; starting it from the init package this boot came up on\n");
 					let info = node.info;
-					let started = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege);
+					let started = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege, Some((&mut *catalogue, publishers)));
 					if matches!(started, BindStart::Opened | BindStart::WaitingForTheClaim) || node.teardown.is_some() {
 						return;
 					}
@@ -1656,7 +1664,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, package: Option<&[u8]>,
 			};
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 			let info = node.info;
-			let started = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege);
+			let started = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege, Some((&mut *catalogue, publishers)));
 			unmap_object(file);
 			close(file);
 			// A TEARDOWN IN FLIGHT IS NOT A CANDIDATE THAT FAILED YET. Moving to the next entry here
@@ -2101,6 +2109,8 @@ struct Node {
 	node_request: u64,
 	// The ACPI instance and binding generation this node's controller connections were last granted for.
 	acpi_granted: (u64, u64),
+	// WHAT ITS CONNECTIONS REQUIRE, for a platform row whose firmware names any - see `Need`.
+	needs: Vec<Need>,
 	// The heartbeat, armed when this node comes `Online` and only for an entry that declared a
 	// deadline.
 	beat: Heartbeat,
@@ -2248,7 +2258,7 @@ impl Node {
 		// A DEVICE THE FIRMWARE DESCRIBES IS NAMED BY ITS PLATFORM NUMBER - its row - and never by the zero
 		// address it reports, which is the host bridge's.
 		let id = if info.platform.kind == ROW_KIND_PLATFORM { BindingId::platform(index as u32, 0) } else { BindingId::new(info.bus, info.dev, info.func, 0) };
-		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), needs: needs_of(info), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
 	}
 
 	// A manual grant is separate from the automatic count and survives only until one claim.
@@ -2571,6 +2581,32 @@ fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u6
 // service. A scoped connection to any other kind, and an unscoped one to a bus, is refused here: the scope is
 // what makes a bus connection safe to hand out, and a scope on anything else is a word with nothing behind it.
 fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize, scope: driver_protocol::Scope) -> u64 {
+	let Some(binding) = catalogue.entries[slot].as_ref().map(|provider| provider.id.binding) else {
+		return 0;
+	};
+	let Some(publisher) = nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation).and_then(Publisher::of) else {
+		return 0;
+	};
+	mint_on(catalogue, &publisher, slot, scope)
+}
+
+// A PUBLISHER'S LIVE BINDING, as a mint needs it: taken from its node - by `mint_scoped_connection`, or for a child's bind
+// before it starts, since the bind holds only its own node.
+#[derive(Clone, Copy)]
+struct Publisher {
+	id: BindingId,
+	control: u64,
+	entry: Option<&'static Entry>,
+}
+
+impl Publisher {
+	fn of(node: &Node) -> Option<Publisher> {
+		node.binding.as_ref().map(|live| Publisher { id: node.id, control: live.channel, entry: node.entry() })
+	}
+}
+
+// THE MINT ITSELF, on the publisher of the provider in `slot`.
+fn mint_on(catalogue: &mut Catalogue, publisher: &Publisher, slot: usize, scope: driver_protocol::Scope) -> u64 {
 	let Some((binding, token, kind, taken)) = catalogue.entries[slot].as_ref().map(|provider| (provider.id.binding, provider.token, provider.kind, outstanding(provider))) else {
 		return 0;
 	};
@@ -2578,9 +2614,9 @@ fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize
 		print(b"DeviceManager: a connection was asked for with the wrong scope for its provider's kind; refused\n");
 		return 0;
 	}
-	let Some(node) = nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation) else {
+	if !(publisher.id.same_function(binding) && publisher.id.generation == binding.generation) {
 		return 0;
-	};
+	}
 	// AND THE BOOT'S OWN CONNECTIONS ARE CHECKED AGAINST THE DECLARATION TOO.
 	//
 	// This minted without consulting or incrementing anything, so a declared bound was already
@@ -2592,7 +2628,7 @@ fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize
 	// FROM THE ENTRY THE PUBLISHER IS RUNNING, not the cursor - see `Node::entry`. A provider
 	// belongs to a live binding, so its declared consumer bound is that driver's declaration and
 	// not whichever candidate an operator has since selected for the next bind.
-	let admits = node.entry().and_then(|entry| entry.provides.iter().find(|&&(declared, _, _)| declared == kind)).map_or(1, |&(_, _, consumers)| consumers);
+	let admits = publisher.entry.and_then(|entry| entry.provides.iter().find(|&&(declared, _, _)| declared == kind)).map_or(1, |&(_, _, consumers)| consumers);
 	// A BUS'S SCOPED CONNECTIONS BY THE SHARED RULE (`driver_binding::admits_scoped`, host-tested); every other
 	// kind by the one it always had.
 	let refused = if driver_binding::scoped_only(kind) { !driver_binding::admits_scoped(kind, taken, admits) } else { taken >= admits };
@@ -2600,9 +2636,7 @@ fn mint_scoped_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize
 		print(b"DeviceManager: a provider was asked for one more connection than its driver declares it admits; refused\n");
 		return 0;
 	}
-	let Some((control, generation)) = node.binding.as_ref().map(|live| (live.channel, node.id.generation)) else {
-		return 0;
-	};
+	let (control, generation) = (publisher.control, publisher.id.generation);
 	let Some((server, client)) = channel() else { return 0 };
 	let mut payload = [0u8; driver_protocol::CONNECT_PAYLOAD_MAX];
 	let len = driver_protocol::encode_connect(token, scope, &mut payload);
@@ -2657,11 +2691,23 @@ fn acpi_admin_lost() {
 }
 
 fn say_acpi(parts: &[&[u8]]) {
-	print(b"DeviceManager: ");
+	say_line(parts);
+}
+
+// ONE LINE, PRINTED WHOLE: `DeviceManager: `, the parts, and the newline in one write, so another program's output
+// never lands inside it.
+fn say_line(parts: &[&[u8]]) {
+	let mut line: Vec<u8> = Vec::from(&b"DeviceManager: "[..]);
 	for part in parts {
-		print(part);
+		line.extend_from_slice(part);
 	}
-	print(b"\n");
+	line.push(b'\n');
+	print(&line);
+}
+
+// A driver's name as a line says it: underscores as dashes.
+fn driver_text(name: &[u8]) -> Vec<u8> {
+	name.iter().map(|byte| if *byte == b'_' { b'-' } else { *byte }).collect()
 }
 
 // ANSWER A DRIVER'S REQUEST FOR ITS NODE: the service's node channel, or word that there is none. False while nothing
@@ -2669,26 +2715,26 @@ fn say_acpi(parts: &[&[u8]]) {
 fn answer_node_request(node: &mut Node, loaded_now: bool) -> bool {
 	let Some((channel, generation)) = node.binding.as_ref().map(|binding| (binding.channel, node.id.generation)) else { return true };
 	let Some(identity) = firmware_identity(node) else {
-		if !send_frame(channel, driver_protocol::Opcode::NodeAbsent, generation, &[], 0, u32::MAX) {
-			return true;
-		}
-		print(b"DeviceManager: ");
-		print_driver_name(node.driver_name());
-		print(b" asked for its firmware node - the namespace describes none\n");
+		let mut line: Vec<u8> = Vec::from(&b"DeviceManager: "[..]);
+		line.extend(node.driver_name().iter().map(|byte| if *byte == b'_' { b'-' } else { *byte }));
+		line.extend_from_slice(b" asked for its firmware node - the namespace describes none\n");
+		print(&line);
+		let _ = send_frame(channel, driver_protocol::Opcode::NodeAbsent, generation, &[], 0, u32::MAX);
 		return true;
 	};
 	let Some(mut client) = acpi_admin_client() else { return false };
 	match client.open_node(&identity) {
 		Some(Ok(chan)) => {
+			// ONE LINE, written whole: the driver it goes to prints as soon as the frame arrives.
+			let mut line: Vec<u8> = Vec::from(&b"DeviceManager: handed "[..]);
+			line.extend(node.driver_name().iter().map(|byte| if *byte == b'_' { b'-' } else { *byte }));
+			line.extend_from_slice(b" its node channel (");
+			line.extend_from_slice(identity.as_bytes());
+			line.extend_from_slice(if loaded_now { b") at the ACPI service's namespace-loaded report\n" } else { b")\n" });
+			print(&line);
 			if !send_frame(channel, driver_protocol::Opcode::Node, generation, &[], chan, u32::MAX) {
 				close(chan);
-				return true;
 			}
-			print(b"DeviceManager: handed ");
-			print_driver_name(node.driver_name());
-			print(b" its node channel (");
-			print(identity.as_bytes());
-			print(if loaded_now { b") at the ACPI service's namespace-loaded report\n" } else { b")\n" });
 			true
 		}
 		Some(Err(proto::system::Error::NotFound)) => {
@@ -2719,15 +2765,13 @@ enum Granted {
 
 fn grant_acpi_connections(nodes: &[Node], catalogue: &mut Catalogue, at: usize) -> Granted {
 	let node = &nodes[at];
-	if node.info.platform.kind == abi::ROW_KIND_PLATFORM {
-		return Granted::Done;
-	}
 	let Some(attached) = firmware_node(node.index) else { return Granted::Done };
-	if attached.flags & abi::FIRMWARE_NODE_COMPANION == 0 || attached.aei().len() + attached.field_lines().len() + attached.field_addresses().len() == 0 {
+	// A PCI FUNCTION'S COMPANION, or a namespace row that is itself the controller.
+	if attached.flags & (abi::FIRMWARE_NODE_COMPANION | abi::FIRMWARE_NODE_LISTS) == 0 || attached.aei().len() + attached.field_lines().len() + attached.field_addresses().len() == 0 {
 		return Granted::Done;
 	}
 	let controller = alloc::string::String::from_utf8_lossy(attached.path()).into_owned();
-	let slot_of = |kind: u16| catalogue.entries.iter().position(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind && provider.id.binding.same_function(node.id) && provider.id.binding.generation == node.id.generation));
+	let slot_of = |catalogue: &Catalogue, kind: u16| catalogue.entries.iter().position(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind && provider.id.binding.same_function(node.id) && provider.id.binding.generation == node.id.generation));
 	let mut wanted: Vec<(proto::system::AcpiConnectionKind, u32, u16, driver_protocol::Scope)> = Vec::new();
 	for &value in attached.aei() {
 		let trigger = driver_protocol::GpioTrigger::from_u8((value >> 24) as u8).unwrap_or(driver_protocol::GpioTrigger::Both);
@@ -2745,7 +2789,7 @@ fn grant_acpi_connections(nodes: &[Node], catalogue: &mut Catalogue, at: usize) 
 		wanted.push((proto::system::AcpiConnectionKind::FieldAddress, address as u32, driver_protocol::provider::I2C_BUS, driver_protocol::Scope::I2cAddress(address)));
 	}
 	for (kind, value, provider, scope) in wanted {
-		let Some(slot) = slot_of(provider) else { return Granted::NotYet };
+		let Some(slot) = slot_of(catalogue, provider) else { return Granted::NotYet };
 		let connection = mint_scoped_connection(catalogue, nodes, slot, scope);
 		if connection == 0 {
 			say_acpi(&[b"a connection of ", controller.as_bytes(), b" for the ACPI service could not be minted"]);
@@ -2755,7 +2799,7 @@ fn grant_acpi_connections(nodes: &[Node], catalogue: &mut Catalogue, at: usize) 
 			close(connection);
 			return Granted::Lost;
 		};
-		match client.connection(&controller, &kind, value, connection) {
+		match client.connection(&controller, &kind, &value, &connection) {
 			Some(Ok(())) => {}
 			Some(Err(_)) => say_acpi(&[b"the ACPI service refused a connection of ", controller.as_bytes()]),
 			None => {
@@ -3000,6 +3044,11 @@ impl Catalogue {
 	// Answers how many were published. A handle the catalogue has no room for is CLOSED rather than
 	// dropped: a handle this service keeps and never serves is a channel the driver waits on
 	// forever, and one it silently discards is a provider the machine has and cannot see.
+	// THE LIVE PROVIDER OF `kind` THE FUNCTION `controller` PUBLISHES - whichever binding of it is live.
+	fn serving(&self, controller: BindingId, kind: u16) -> Option<usize> {
+		self.entries.iter().position(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind && provider.id.binding.same_function(controller)))
+	}
+
 	fn publish_all(&mut self, binding: BindingId, entry: &'static Entry, offers: &mut Offers) -> usize {
 		let mut published: usize = 0;
 		for index in 0..offers.count {
@@ -3969,6 +4018,7 @@ fn cause_name(cause: FailureCause) -> &'static [u8] {
 		FailureCause::Hung => b"it came up and then stopped answering its control path",
 		FailureCause::DriverExited => b"it exited without saying anything",
 		FailureCause::Stopped => b"it was asked to stop and it did",
+		FailureCause::ConnectionRefused => b"a connection its firmware names cannot be granted",
 		FailureCause::DriverReported(code) => code.name(),
 		FailureCause::TeardownUnconfirmed => b"the release did not confirm, so the device may still be live",
 	}
@@ -4000,6 +4050,91 @@ fn requirements_met(entry: &'static Entry, catalogue: &Catalogue) -> bool {
 	entry.requires.iter().all(|&kind| catalogue.count_of(kind) > 0)
 }
 
+// ---------------------------------------------------------------------------------------------- child bindings
+//
+// A DEVICE ON ANOTHER DRIVER'S BUS - a HID-over-I2C touchpad on a virtio-i2c controller, its interrupt a line of a
+// virtio-gpio controller - is a platform row of its own whose CONNECTIONS its firmware names: each an address or a line
+// on a controller's row. Each connection is a REQUIREMENT of the node beside its entry's `requires`, and it names the
+// controller's FUNCTION, so a controller rebound under a new generation satisfies it again. The wait and the
+// dependency-lost stop are `requires`'s own; at bind each connection is minted SCOPED on the controller's live
+// publication and handed over as a `Connection` resource, in the row's order, and the child's binding ending closes
+// them, which gives the address and the line back.
+
+// ONE CONNECTION'S REQUIREMENT: the controller function it is on, and the provider kind that serves it.
+#[derive(Clone, Copy)]
+struct Need {
+	controller: BindingId,
+	kind: u16,
+}
+
+// The requirements a platform row's connections make. A connection joined to no controller, or of a kind nothing
+// serves, makes none: its bind refuses it by name (`child_connection`).
+fn needs_of(info: &DeviceInfo) -> Vec<Need> {
+	let mut out: Vec<Need> = Vec::new();
+	if info.platform.kind != ROW_KIND_PLATFORM {
+		return out;
+	}
+	for connection in info.platform.connections() {
+		let kind = match connection.kind {
+			abi::CONNECTION_I2C => driver_protocol::provider::I2C_BUS,
+			abi::CONNECTION_GPIO_LINE => driver_protocol::provider::GPIO_LINES,
+			_ => continue,
+		};
+		if let Some(controller) = controller_function(connection.controller) {
+			out.push(Need { controller, kind });
+		}
+	}
+	out
+}
+
+// THE BINDING IDENTITY OF ROW `index` AS A CONTROLLER - its PCI function, or its platform number.
+fn controller_function(index: u32) -> Option<BindingId> {
+	if index == u32::MAX {
+		return None;
+	}
+	let mut info: DeviceInfo = DeviceInfo::default();
+	if !device_info(index as u64, &mut info) {
+		return None;
+	}
+	Some(if info.platform.kind == ROW_KIND_PLATFORM { BindingId::platform(index, 0) } else { BindingId::new(info.bus, info.dev, info.func, 0) })
+}
+
+fn needs_met(node: &Node, catalogue: &Catalogue) -> bool {
+	node.needs.iter().all(|need| catalogue.serving(need.controller, need.kind).is_some())
+}
+
+// Every live controller `child`'s connections are on - nothing, and no allocation, for a node with none.
+fn publishers_for(nodes: &[Node], child: &Node) -> Vec<Publisher> {
+	if child.needs.is_empty() {
+		return Vec::new();
+	}
+	nodes.iter().filter(|node| child.needs.iter().any(|need| node.id.same_function(need.controller))).filter_map(Publisher::of).collect()
+}
+
+// ONE CONNECTION OF A CHILD'S ROW, minted scoped on its controller's live publication - or the cause and the words it
+// is refused with.
+fn child_connection(catalogue: &mut Catalogue, publishers: &[Publisher], info: &DeviceInfo, connection: &abi::Connection) -> Result<u64, (FailureCause, &'static [u8])> {
+	let scope = driver_protocol::connection_scope(info.platform.source, connection).map_err(|why| (FailureCause::ConnectionRefused, why.as_bytes()))?;
+	let kind = match scope {
+		driver_protocol::Scope::I2cAddress(_) => driver_protocol::provider::I2C_BUS,
+		driver_protocol::Scope::GpioLine { .. } => driver_protocol::provider::GPIO_LINES,
+		driver_protocol::Scope::Whole => return Err((FailureCause::ConnectionRefused, b"a connection with no scope" as &[u8])),
+	};
+	let controller = controller_function(connection.controller).ok_or((FailureCause::ConnectionRefused, b"a connection joined to no controller" as &[u8]))?;
+	// A LINE THE ACPI SERVICE HOLDS FOR `_AEI` IS NOT A CHILD'S: the firmware answers that line's events itself.
+	if let driver_protocol::Scope::GpioLine { line, .. } = scope
+		&& firmware_node(connection.controller as u64).is_some_and(|node| node.aei().iter().any(|value| value & 0xFFFF == line))
+	{
+		return Err((FailureCause::ConnectionRefused, b"a line the ACPI service holds for the firmware's own _AEI events" as &[u8]));
+	}
+	let slot = catalogue.serving(controller, kind).ok_or((FailureCause::ResourceExhausted, b"a connection whose controller publishes nothing to mint it on" as &[u8]))?;
+	let publisher = publishers.iter().find(|publisher| publisher.id.same_function(controller)).ok_or((FailureCause::ResourceExhausted, b"a connection whose controller has no live binding" as &[u8]))?;
+	match mint_on(catalogue, publisher, slot, scope) {
+		0 => Err((FailureCause::ResourceExhausted, b"a connection its controller would not take" as &[u8])),
+		handle => Ok(handle),
+	}
+}
+
 // Start this node's current candidate, or park it waiting for what it declared.
 //
 // THE QUESTION IS ASKED AT EVERY ATTEMPT AND NOT ONLY THE FIRST. Reacting to a withdrawal EVENT
@@ -4008,13 +4143,13 @@ fn requirements_met(entry: &'static Entry, catalogue: &Catalogue) -> bool {
 // would proceed into a bind gated on a condition that no longer holds. One rule, asked every time,
 // instead of an edge per way of getting there.
 fn gate_on_requirements(node: &mut Node, entry: &'static Entry, catalogue: &Catalogue) -> bool {
-	if requirements_met(entry, catalogue) {
+	let declared = requirements_met(entry, catalogue);
+	if declared && needs_met(node, catalogue) {
 		return true;
 	}
 	if node.record.move_to(BindingState::DependencyPending, None) {
-		print(b"DeviceManager: ");
-		print(entry.name);
-		print(b" is waiting for a provider it declares in `requires`\n");
+		let why: &[u8] = if declared { b" is waiting for the controllers its firmware connections are on" } else { b" is waiting for a provider it declares in `requires`" };
+		say_line(&[&driver_text(entry.name), why]);
 	}
 	false
 }
@@ -4161,7 +4296,8 @@ enum BindStart {
 	WaitingForTheClaim,
 }
 
-fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64) -> BindStart {
+#[allow(clippy::too_many_arguments)]
+fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64, children: Option<(&mut Catalogue, &[Publisher])>) -> BindStart {
 	// A STORED DISABLE IS CONSULTED BEFORE EVERY BIND, not applied once when it was read.
 	//
 	// This is the other half of `load_stored_policy`: the record is a desire that outlives any
@@ -4507,6 +4643,25 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	} else if registers != ERR_INVALID {
 		refused(b"its declared registers - the kernel would not mint them");
 		return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+	}
+	// AND THE ROW'S CONNECTIONS, a child binding's: each minted SCOPED on its controller's live publication, in the row's
+	// order - the controller serves that one address or line and nothing beside it.
+	if info.platform.kind == ROW_KIND_PLATFORM && !info.platform.connections().is_empty() {
+		let Some((catalogue, publishers)) = children else {
+			refused(b"its connections - they are minted only where the controllers' bindings are in hand");
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+		};
+		for (at, connection) in info.platform.connections().iter().enumerate() {
+			match child_connection(catalogue, publishers, info, connection) {
+				Ok(handle) => txn.holds(driver_protocol::ResourceKind::Connection as u16, handle),
+				Err((cause, why)) => {
+					let mut number = [0u8; 20];
+					let n = decimal(at as u64, &mut number);
+					say_line(&[&driver_text(driver_name), b"'s connection ", &number[..n], b" is refused: ", why]);
+					return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, cause, driver_name, attempts_left));
+				}
+			}
+		}
 	}
 	let resource_count: usize = txn.held.resources().len();
 	node.granted_resources = resource_count as u32;
@@ -5129,10 +5284,10 @@ fn settle_dependencies(nodes: &mut [Node], catalogue: &mut Catalogue) -> usize {
 		// from the cursor, an operator selecting a future driver applied THAT driver's
 		// `requires` to the running one, which stops a binding whose own requirements are met.
 		let Some(entry) = node.entry() else { continue };
-		if entry.requires.is_empty() {
+		if entry.requires.is_empty() && node.needs.is_empty() {
 			continue;
 		}
-		let met: bool = requirements_met(entry, catalogue);
+		let met: bool = requirements_met(entry, catalogue) && needs_met(node, catalogue);
 		match node.record.state {
 			// WAITING, AND WHAT IT WAS WAITING FOR IS HERE. Asked for exactly one attempt - the
 			// same mechanism an operator's retry uses, so a node woken by a publication and one
@@ -5162,12 +5317,8 @@ fn settle_dependencies(nodes: &mut [Node], catalogue: &mut Catalogue) -> usize {
 				node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
 				node.retry_at = 0;
 				node.restart_requested = true;
-				print(b"DeviceManager: ");
-				print_driver_name(entry.name);
-				print(
-					b" was waiting for a provider it declares in `requires`, and it is here now
-",
-				);
+				let why: &[u8] = if entry.requires.is_empty() { b" was waiting for the controllers its firmware connections are on, and they are here now" } else { b" was waiting for a provider it declares in `requires`, and it is here now" };
+				say_line(&[&driver_text(entry.name), why]);
 				moved += 1;
 			}
 			// ONLINE, AND WHAT IT DECLARED IS GONE - handled by
@@ -5226,7 +5377,7 @@ fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalog
 	// every catalogue query, every teardown confirmation, every deadline - and on all but a
 	// handful of them no node has lost anything. The closure below needs two vectors; asking the
 	// cheap question first means they are allocated on the passes that are going to use them.
-	if !nodes.iter().any(|node| stoppable_on_a_lost_dependency(node) && node.entry().is_some_and(|entry| !entry.requires.is_empty() && !requirements_met(entry, catalogue))) {
+	if !nodes.iter().any(|node| stoppable_on_a_lost_dependency(node) && (node.entry().is_some_and(|entry| !entry.requires.is_empty() && !requirements_met(entry, catalogue)) || !needs_met(node, catalogue))) {
 		return 0;
 	}
 	// THE CLOSURE. A node is doomed when a kind it requires is provided by nothing that is
@@ -5234,6 +5385,8 @@ fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalog
 	// that kind. Every pass can only add to the set, so `nodes.len()` passes is the worst case
 	// and the fixed point is reached however the nodes happen to be enumerated.
 	let mut doomed: Vec<bool> = alloc::vec![false; nodes.len()];
+	// Doomed by a controller its connections are on, rather than by a kind it declares.
+	let mut by_connection: Vec<bool> = alloc::vec![false; nodes.len()];
 	let mut any = false;
 	for _ in 0..nodes.len() {
 		let mut grew = false;
@@ -5242,15 +5395,18 @@ fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalog
 				continue;
 			}
 			let Some(entry) = nodes[at].entry() else { continue };
-			if entry.requires.is_empty() {
+			if entry.requires.is_empty() && nodes[at].needs.is_empty() {
 				continue;
 			}
 			let lost = entry.requires.iter().any(|&kind| {
 				let leaving: usize = (0..nodes.len()).filter(|&other| doomed[other]).map(|other| catalogue.count_for(nodes[other].id, kind)).sum();
 				catalogue.count_of(kind) <= leaving
 			});
-			if lost {
+			// A CONNECTION'S CONTROLLER serves its kind no more, or is itself leaving.
+			let cut = nodes[at].needs.iter().any(|need| catalogue.serving(need.controller, need.kind).is_none() || (0..nodes.len()).any(|other| doomed[other] && nodes[other].id.same_function(need.controller)));
+			if lost || cut {
 				doomed[at] = true;
+				by_connection[at] = cut && !lost;
 				grew = true;
 				any = true;
 			}
@@ -5269,9 +5425,8 @@ fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalog
 	order.sort_by_key(|&at| (core::cmp::Reverse(depth[at]), at));
 	let mut moved: usize = 0;
 	for at in order {
-		print(b"DeviceManager: ");
-		print_driver_name(nodes[at].driver_name());
-		print(b" declares a provider in `requires` that has been withdrawn; stopping it\n");
+		let why: &[u8] = if by_connection[at] { b" is connected through a controller whose binding ended; stopping it" } else { b" declares a provider in `requires` that has been withdrawn; stopping it" };
+		say_line(&[&driver_text(nodes[at].driver_name()), why]);
 		nodes[at].stop_intent = driver_binding::StopIntent::DependencyLost;
 		begin_dependency_stop(&mut nodes[at], catalogue);
 		moved += 1;
@@ -5291,7 +5446,7 @@ fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalog
 // sentence - "coordinate safe driver stop before resource removal" - and it is why `Removed` is
 // reachable only from `Stopping`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &Catalogue, power: u64, console_input: u64, device_privilege: u64, recovery: &mut Recovery, buf: &mut [u8]) {
+unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &mut Catalogue, power: u64, console_input: u64, device_privilege: u64, recovery: &mut Recovery, buf: &mut [u8]) {
 	unsafe {
 		// DRAINED AND NOT READ ONCE. Two devices unplugged together are two messages, and a loop that
 		// took one per wake would leave the second sitting behind a channel that is readable - which
@@ -5455,7 +5610,7 @@ fn serve_platform_events(events: u64, power: u64, buf: &mut [u8]) -> bool {
 // path for a hot-plugged device would be a device that binds by different rules depending on when it
 // was plugged in - which is exactly the class of difference nobody finds until it matters.
 #[allow(clippy::too_many_arguments)]
-unsafe fn admit_arrival(index: u64, nodes: &mut Vec<Node>, catalogue: &Catalogue, power: u64, console_input: u64, device_privilege: u64, recovery: &mut Recovery) {
+unsafe fn admit_arrival(index: u64, nodes: &mut Vec<Node>, catalogue: &mut Catalogue, power: u64, console_input: u64, device_privilege: u64, recovery: &mut Recovery) {
 	unsafe {
 		let mut info: DeviceInfo = DeviceInfo::default();
 		if !device_info(index, &mut info) {
@@ -5487,7 +5642,8 @@ unsafe fn admit_arrival(index: u64, nodes: &mut Vec<Node>, catalogue: &Catalogue
 		if recovery.state.len() <= index as usize {
 			recovery.state.resize(index as usize + 1, STATE_UNKNOWN);
 		}
-		start_candidate(&mut node, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, catalogue, &mut recovery.state);
+		let publishers = publishers_for(nodes, &node);
+		start_candidate(&mut node, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, catalogue, &publishers, &mut recovery.state);
 		nodes.push(node);
 	}
 }
@@ -6391,6 +6547,7 @@ fn failure_cause_wire(cause: Option<FailureCause>) -> proto::system::FailureCaus
 		Some(FailureCause::TeardownUnconfirmed) => proto::system::FailureCause::TeardownUnconfirmed,
 		Some(FailureCause::Hung) => proto::system::FailureCause::Hung,
 		Some(FailureCause::Stopped) => proto::system::FailureCause::Stopped,
+		Some(FailureCause::ConnectionRefused) => proto::system::FailureCause::ConnectionRefused,
 	}
 }
 
@@ -6996,8 +7153,22 @@ fn dependency_depths(nodes: &[Node]) -> Vec<usize> {
 	for _ in 0..nodes.len() {
 		let mut moved = false;
 		for at in 0..nodes.len() {
-			let Some(entry) = nodes[at].entry() else { continue };
 			let mut want = 0usize;
+			// A CHILD STANDS ONE LEVEL ABOVE EACH CONTROLLER ITS CONNECTIONS ARE ON.
+			for need in &nodes[at].needs {
+				for other in 0..nodes.len() {
+					if other != at && nodes[other].id.same_function(need.controller) {
+						want = want.max(depth[other] + 1);
+					}
+				}
+			}
+			let Some(entry) = nodes[at].entry() else {
+				if want != depth[at] {
+					depth[at] = want;
+					moved = true;
+				}
+				continue;
+			};
 			for kind in entry.requires {
 				// Whoever publishes that kind: this node stands one level above the deepest of them.
 				// A requirement nothing in this image provides cannot occur - the manifest validator

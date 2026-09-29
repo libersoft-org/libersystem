@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 147] = [
+const GATES: [(&str, &str); 150] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -374,10 +374,16 @@ const GATES: [(&str, &str); 147] = [
 	// drivers, the scoped connection and the contracts' client side - a userspace change selects it - and it
 	// boots the test kernel.
 	("i2c-bus", "userspace.build"),
+	// HID OVER I2C, on a development guest: the backend's HID models described by the firmware, bound as children through
+	// scoped connections, delivering to InputService. Its subject is the child binding, the driver and the service's
+	// following - a userspace change selects it - and it boots a guest.
+	("i2c-hid", "userspace.build"),
 	// THE BUS GATE'S DEVICE SIDE, on the host: the vhost-user backend's own suite.
 	("i2c-backend", "harness.tools"),
 	// The AML emitter the fixture SSDTs are built with: its encodings and its sample, which the interpreter loads.
 	("aml-emitter", "harness.tools"),
+	// The firmware fixtures: the ACPI gate's SSDT, and the shared device-tree editor.
+	("firmware-fixtures", "harness.tools"),
 	// MEDIAIMPORTSERVICE, against a PTP responder the kernel harness plays: exact pages, the over-limit storage,
 	// scoped and stale identities, validated completion into a transactional destination, removal as a partial
 	// ending, and the production grant. Its subject is the service, the PTP parser and the decisions leaf, the
@@ -409,6 +415,10 @@ const GATES: [(&str, &str); 147] = [
 	// watchdog service's choice and schedule, ServiceManager's liveness answer and its shutdown notice - with QEMU's
 	// run state as the oracle. Its subject is the kernel mechanism and the drivers and services above it.
 	("watchdog", "kernel"),
+	// THE FIRMWARE'S NAMESPACE, on development instances of its own: the ACPI service over QEMU's DSDT and the fixture
+	// SSDT, the kernel's publication and policy, DeviceManager's node channels and grants and the fixture driver's
+	// probes. Its subject is the kernel mechanism and the services and drivers above it.
+	("acpi", "kernel"),
 	// The lifecycle contract, end to end. Its subject is the runtime's init/fini runner, the kernel's
 	// per-image lifecycle table and the two fixtures that exercise them - a userspace or kernel
 	// change selects it, and it boots a guest because a constructor is only observable from inside
@@ -851,7 +861,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 51] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 53] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -877,6 +887,10 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 51] = [
 	"serial-handoff",
 	// And the hardware watchdog's, which boots four in turn.
 	"watchdog",
+	// And the firmware namespace's, which boots two.
+	"acpi",
+	// And HID over I2C's.
+	"i2c-hid",
 	"virtio-multiport",
 	"qemu-2d-demo",
 	"qemu-2d-account",

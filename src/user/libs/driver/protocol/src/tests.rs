@@ -141,14 +141,15 @@ fn a_payload_of_the_wrong_shape_is_refused_for_every_opcode_that_has_one() {
 #[test]
 fn a_field_outside_its_closed_set_is_refused_and_the_number_is_reported() {
 	// EACH SET IS PROBED ONE PAST ITS OWN END, the number its next member would take: the resource kinds end at
-	// a row's declared registers, the failure codes at five.
+	// a platform row's scoped connection, the failure codes at five.
 	assert_eq!(decode_resource(&6u16.to_le_bytes()), Ok(ResourceKind::TrustedKeys), "the trusted key sink is a member");
 	assert_eq!(decode_resource(&7u16.to_le_bytes()), Ok(ResourceKind::PortRange), "and so is the port range");
 	assert_eq!(decode_resource(&8u16.to_le_bytes()), Ok(ResourceKind::Mmio), "and a platform row's further register window");
 	assert_eq!(decode_resource(&9u16.to_le_bytes()), Ok(ResourceKind::Line), "and its wired line");
 	assert_eq!(decode_resource(&10u16.to_le_bytes()), Ok(ResourceKind::ConsoleTap), "and the kernel console's tap");
 	assert_eq!(decode_resource(&11u16.to_le_bytes()), Ok(ResourceKind::Registers), "and a row's declared registers");
-	for raw in [0u16, 12, 0xffff] {
+	assert_eq!(decode_resource(&12u16.to_le_bytes()), Ok(ResourceKind::Connection), "and one scoped connection of a platform row");
+	for raw in [0u16, 13, 0xffff] {
 		assert_eq!(decode_resource(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "resource kind {raw}");
 	}
 	for raw in [0u16, 6, 0xffff] {
@@ -491,4 +492,29 @@ fn the_node_request_and_its_two_answers() {
 		let bytes = header(opcode, 7, 0).encode();
 		assert_eq!(Header::decode(&bytes).map(|header| header.opcode), Ok(opcode), "a {opcode:?} frame round-trips");
 	}
+}
+
+// A ROW'S CONNECTION BECOMES THE SCOPE IT IS MINTED WITH: an ACPI `GpioInt`'s mode and polarity, and a tree specifier's
+// interrupt-type cell, into one line trigger; an input `GpioIo` for its level alone; the refusals by name.
+#[test]
+fn a_row_s_connection_becomes_the_scope_it_is_minted_with() {
+	let line = |trigger: u8, polarity: u8| abi::Connection { kind: abi::CONNECTION_GPIO_LINE, trigger, polarity, _pad: 0, controller: 3, value: 17, extra: 0 };
+	let acpi = abi::PLATFORM_SOURCE_ACPI;
+	assert_eq!(connection_scope(acpi, &line(abi::LINE_TRIGGER_LEVEL, abi::LINE_POLARITY_LOW)), Ok(Scope::GpioLine { line: 17, trigger: GpioTrigger::Low }), "GpioInt (Level, ActiveLow) - HID over I2C's");
+	assert_eq!(connection_scope(acpi, &line(abi::LINE_TRIGGER_LEVEL, abi::LINE_POLARITY_HIGH)), Ok(Scope::GpioLine { line: 17, trigger: GpioTrigger::High }));
+	assert_eq!(connection_scope(acpi, &line(abi::LINE_TRIGGER_EDGE, abi::LINE_POLARITY_LOW)), Ok(Scope::GpioLine { line: 17, trigger: GpioTrigger::Falling }));
+	assert_eq!(connection_scope(acpi, &line(abi::LINE_TRIGGER_EDGE, abi::LINE_POLARITY_HIGH)), Ok(Scope::GpioLine { line: 17, trigger: GpioTrigger::Rising }));
+	assert_eq!(connection_scope(acpi, &line(0, abi::LINE_POLARITY_HIGH)), Ok(Scope::GpioLine { line: 17, trigger: GpioTrigger::Level }), "an input GpioIo: its level alone");
+	assert!(connection_scope(acpi, &line(7, 0)).is_err());
+	let tree = abi::PLATFORM_SOURCE_TREE;
+	for (cell, trigger) in [(1, GpioTrigger::Rising), (2, GpioTrigger::Falling), (3, GpioTrigger::Both), (4, GpioTrigger::High), (8, GpioTrigger::Low)] {
+		assert_eq!(connection_scope(tree, &line(cell, 0)), Ok(Scope::GpioLine { line: 17, trigger }), "the tree's cell {cell}");
+	}
+	assert!(connection_scope(tree, &line(0, 0)).is_err(), "a tree interrupt with no trigger");
+	let i2c = |value: u32, flags: u8| abi::Connection { kind: abi::CONNECTION_I2C, trigger: flags, polarity: 0, _pad: 0, controller: 3, value, extra: 400_000 };
+	assert_eq!(connection_scope(acpi, &i2c(0x2C, 0)), Ok(Scope::I2cAddress(0x2C)));
+	assert_eq!(connection_scope(tree, &i2c(0x10, 0)), Ok(Scope::I2cAddress(0x10)));
+	assert!(connection_scope(acpi, &i2c(0x2C, abi::CONNECTION_I2C_TEN_BIT)).is_err(), "ten-bit addressing is refused");
+	assert!(connection_scope(acpi, &i2c(0x2C0, 0)).is_err(), "and an address past seven bits");
+	assert!(connection_scope(tree, &abi::Connection { kind: abi::CONNECTION_SPI, ..i2c(0, 0) }).is_err(), "and SPI");
 }

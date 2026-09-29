@@ -318,6 +318,11 @@ pub fn decoded_ranges() -> alloc::vec::Vec<common::DecodedRange> {
 	common::decoded_ranges::<Access>(&scan())
 }
 
+// EVERY BRIDGE'S I/O WINDOW - see `common::io_windows`. At the boot scan only.
+pub fn io_windows() -> alloc::vec::Vec<(u16, u16)> {
+	common::io_windows::<Access>(&scan())
+}
+
 // NATIVE CONTROL WAITS FOR `_OSC` on an ACPI machine - see `common::gate_on_osc`.
 pub fn gate_on_osc() {
 	common::gate_on_osc();

@@ -764,6 +764,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// image stages none of them, and there the launch is refused like any other unknown program.
 	(b"btcheck", Shape::Rest),
 	(b"btread", Shape::Rest),
+	(b"hidcheck", Shape::Rest),
 	(b"powercheck", Shape::Rest),
 	(b"powerread", Shape::Rest),
 	(b"cardcheck", Shape::Rest),

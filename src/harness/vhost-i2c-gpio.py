@@ -11,6 +11,7 @@ ONE PROCESS, BOTH SOCKETS, AND A CONTROL SOCKET through which a gate or another 
 line, turns the register device's PEC on, or picks a script:
 
     raise LINE | lower LINE | level LINE 0|1 | pec on|off | status
+    hid script|hold|lose|status NAME | hid malformed NAME on|off      (with --hid)
 
 and each answers one line, `ok ...` or `error ...`. The same commands reach it IN-BAND, through the register
 device's control mailbox (register 0xE0 at 0x50), for a test in the guest, which cannot reach a host socket.
@@ -594,6 +595,199 @@ class RegisterDevice:
         return body
 
 
+# ------------------------------------------------------------------------------------------ HID over I2C
+
+HID_RESET = 0x01
+HID_GET_REPORT = 0x02
+HID_SET_REPORT = 0x03
+HID_SET_POWER = 0x08
+HID_FEATURE = 3
+
+# A PRECISION TOUCHPAD'S REPORT DESCRIPTOR: a Mouse collection (report 1: two buttons, relative X and Y), a Touch Pad
+# collection (report 2: one finger's tip, contact id and absolute X and Y, and the contact count) and a Device
+# Configuration collection (feature report 3: Input Mode). It powers on in mouse mode and reports through report 1
+# alone; Input Mode 3 moves it to report 2 and 0 back.
+TOUCHPAD_REPORT_DESCRIPTOR = bytes([
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,  # Generic Desktop, Mouse, Application
+    0x85, 0x01,  # Report ID 1
+    0x09, 0x01, 0xA1, 0x00,  # Pointer, Physical
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02,  # buttons 1-2
+    0x95, 0x06, 0x81, 0x03,  # padding
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,  # X, Y relative
+    0xC0, 0xC0,
+    0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01,  # Digitizers, Touch Pad, Application
+    0x85, 0x02,  # Report ID 2
+    0x09, 0x22, 0xA1, 0x02,  # Finger, Logical
+    0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,  # Tip Switch
+    0x95, 0x07, 0x81, 0x03,  # padding
+    0x09, 0x51, 0x25, 0x0F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,  # Contact Identifier
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xFF, 0x0F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,  # X, Y 0..4095
+    0xC0,
+    0x05, 0x0D, 0x09, 0x54, 0x15, 0x00, 0x25, 0x05, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,  # Contact Count
+    0xC0,
+    0x05, 0x0D, 0x09, 0x0E, 0xA1, 0x01,  # Digitizers, Device Configuration, Application
+    0x85, 0x03,  # Report ID 3
+    0x09, 0x22, 0xA1, 0x02,  # Finger, Logical
+    0x09, 0x52, 0x15, 0x00, 0x25, 0x0A, 0x75, 0x08, 0x95, 0x01, 0xB1, 0x02,  # Input Mode, Feature
+    0xC0, 0xC0,
+])
+
+# A TOUCHSCREEN'S: a Touch Screen collection (report 1: two fingers, each a tip, a contact id and absolute X and Y, and
+# the contact count), reporting its contacts in the mode it powers on in.
+_FINGER = [
+    0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02,  # Digitizers, Finger, Logical
+    0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,  # Tip Switch
+    0x95, 0x07, 0x81, 0x03,  # padding
+    0x09, 0x51, 0x25, 0x0F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,  # Contact Identifier
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xFF, 0x0F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,  # X, Y 0..4095
+    0xC0,
+]
+TOUCHSCREEN_REPORT_DESCRIPTOR = bytes([0x05, 0x0D, 0x09, 0x04, 0xA1, 0x01, 0x85, 0x01] + _FINGER + _FINGER + [0x05, 0x0D, 0x09, 0x54, 0x15, 0x00, 0x25, 0x02, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0xC0])
+
+
+def finger(tip, contact, x, y):
+    return struct.pack("<BBHH", 1 if tip else 0, contact, x, y)
+
+
+class HidDevice:
+    """A HID-OVER-I2C DEVICE at an I2C address, speaking the register protocol: its HID descriptor at the register the
+    firmware names, the report descriptor, the command and data registers, and the input register a plain read
+    empties. Its interrupt is a GPIO line, SIGNALLED BY LEVEL AND ACTIVE LOW: asserted (0) while an input report - or
+    the reset indication - waits, released (1) once the last is read.
+
+    It honours RESET (the zero-length reset indication, then mouse mode, powered on), SET_POWER (asleep, it reports
+    nothing until it is set on) and SET_REPORT of its Input Mode feature where it has one. `lose` is a POWER LOSS - as a
+    device across an S3 - after which it reports nothing until a RESET; `hold` asserts its line with no report behind
+    it, until a RESET; `malformed` corrupts its HID descriptor's version."""
+
+    def __init__(self, name, address, registers, report_descriptor, line, script, set_line):
+        self.name = name
+        self.address = address
+        self.descriptor_register, self.report_descriptor_register, self.input_register, self.output_register, self.command_register, self.data_register = registers
+        self.report_descriptor = report_descriptor
+        self.line = line
+        self.script = script
+        self.set_line = set_line
+        self.max_input = 2 + 1 + 16
+        self.powered = True
+        self.lost = False
+        self.held = False
+        self.malformed = False
+        self.mode = 0
+        self.queue = []
+        self.resets = 0
+        self.pointer = None
+        self.feature = None
+
+    def descriptor(self):
+        version = 0x0200 if self.malformed else 0x0100
+        return struct.pack("<HHHHHHHHHHHHHI", 30, version, len(self.report_descriptor), self.report_descriptor_register, self.input_register, self.max_input, self.output_register, 0, self.command_register, self.data_register, 0x1D6B, 0x4C00 + self.address, 1, 0)
+
+    def signal(self):
+        """The line follows what waits: asserted (0) while a report, the reset indication or a hold does."""
+        self.set_line(self.line, 0 if (self.queue or self.held) else 1)
+
+    def deliverable(self):
+        return self.powered and not self.lost
+
+    def run_script(self):
+        if not self.deliverable():
+            return f"ok {self.name} reports nothing - {'its power was lost' if self.lost else 'it is asleep'}"
+        for report in self.script(self):
+            self.queue.append(struct.pack("<H", 2 + len(report)) + report)
+        self.signal()
+        return f"ok {self.name} queued {len(self.queue)} report(s) in mode {self.mode}"
+
+    def reset(self):
+        self.resets += 1
+        self.powered = True
+        self.lost = False
+        self.held = False
+        self.mode = 0
+        self.queue = [b"\0\0"]
+        self.signal()
+
+    def lose_power(self):
+        self.lost = True
+        self.queue = []
+        self.held = False
+        self.signal()
+
+    def write(self, data, combined=False):
+        if len(data) < 2:
+            return True
+        register = data[0] | data[1] << 8
+        if combined:
+            # THE WRITE HALF OF A REGISTER READ: the register, or a GET_REPORT command and the data register after it.
+            self.pointer = register
+            if register == self.command_register and len(data) >= 6 and data[3] & 0x0F == HID_GET_REPORT:
+                self.pointer = ("get", (data[2] >> 4) & 0x3, data[2] & 0x0F)
+            return True
+        if register != self.command_register or len(data) < 4:
+            return True
+        opcode = data[3] & 0x0F
+        if opcode == HID_RESET:
+            self.reset()
+        elif opcode == HID_SET_POWER:
+            self.powered = (data[2] & 0x03) == 0
+            if self.powered:
+                self.signal()
+        elif opcode == HID_SET_REPORT:
+            kind, report = (data[2] >> 4) & 0x3, data[2] & 0x0F
+            at = 4
+            if report == 0x0F:
+                report = data[at]
+                at += 1
+            body = data[at + 2 + 2:]
+            if kind == HID_FEATURE and report == 3 and self.name == "touchpad" and len(body) >= 2:
+                self.mode = body[1]
+        return True
+
+    def read(self, length, after_write):
+        if after_write and self.pointer == self.descriptor_register:
+            return self.descriptor().ljust(length, b"\0")[:length]
+        if after_write and self.pointer == self.report_descriptor_register:
+            return self.report_descriptor.ljust(length, b"\0")[:length]
+        if after_write and isinstance(self.pointer, tuple):
+            _, kind, report = self.pointer
+            answer = struct.pack("<HBB", 4, report, self.mode) if (kind == HID_FEATURE and report == 3 and self.name == "touchpad") else b"\0\0"
+            return answer.ljust(length, b"\0")[:length]
+        # THE INPUT REGISTER: the oldest report waiting, or a zero length when none does.
+        report = self.queue.pop(0) if self.queue else b"\0\0"
+        self.signal()
+        return report.ljust(length, b"\0")[:length]
+
+
+# THE TOUCHPAD'S MOVES: sixteen reports of (+127, +64) counts, which a relative pointer folds into the normalised
+# grid as a move of a few text cells - enough for a client to see the cursor go somewhere.
+TOUCHPAD_MOVES = 16
+
+
+def touchpad_script(device):
+    """Moves and a click, through the ONE collection the mode selects: the mouse report in mouse mode, the finger
+    report in touch pad mode - so a driver that switched the mode sees no moves."""
+    if device.mode == 3:
+        return [bytes([2]) + finger(True, 0, 1000 + 40 * step, 1000 + 20 * step) + bytes([1]) for step in range(3)] + [bytes([2]) + finger(False, 0, 1080, 1040) + bytes([0])]
+    return [bytes([1, 0, 127, 64])] * TOUCHPAD_MOVES + [bytes([1, 1, 0, 0]), bytes([1, 0, 0, 0])]
+
+
+def touchscreen_script(_device):
+    """A two-finger contact, and the lift."""
+    return [bytes([1]) + finger(True, 0, 1024, 1024) + finger(True, 1, 3072, 3072) + bytes([2]), bytes([1]) + finger(False, 0, 1024, 1024) + finger(False, 1, 3072, 3072) + bytes([2])]
+
+
+# THE TWO MODELS: (name, address, registers - descriptor, report descriptor, input, output, command, data - report
+# descriptor, GPIO line, script).
+HID_MODELS = [
+    ("touchpad", 0x2C, (0x20, 0x21, 0x22, 0x23, 0x24, 0x25), TOUCHPAD_REPORT_DESCRIPTOR, 0, touchpad_script),
+    ("touchscreen", 0x10, (0x01, 0x02, 0x03, 0x04, 0x05, 0x06), TOUCHSCREEN_REPORT_DESCRIPTOR, 1, touchscreen_script),
+]
+
+
+def hid_devices(set_line):
+    return [HidDevice(name, address, registers, descriptor, line, script, set_line) for name, address, registers, descriptor, line, script in HID_MODELS]
+
+
 class I2cModel:
     """Virtio-i2c's one request queue, over the models at each address."""
 
@@ -764,9 +958,21 @@ def listen(path):
 
 def serve(args):
     devices = DEVICES
-    register = RegisterDevice(0x50, control=lambda text: command(text, register, gpio_model, devices))
-    i2c_model = I2cModel([register])
+    register = RegisterDevice(0x50, control=lambda text: command(text, register, gpio_model, devices, hid))
     gpio_model = GpioModel(["hid-touchpad", "hid-touchscreen", "acpi-aei", "spare-3", "spare-4", "spare-5", "spare-6", "spare-7"])
+
+    def set_line(line, level):
+        space = devices["gpio"].space if "gpio" in devices else None
+        if space is not None:
+            gpio_model.set_level(line, level, space)
+        else:
+            gpio_model.levels[line] = level
+
+    # `--hid`: THE TWO HID MODELS beside the register device, their lines released - high, since they are active low.
+    hid = hid_devices(set_line) if args.hid else []
+    for device in hid:
+        gpio_model.levels[device.line] = 1
+    i2c_model = I2cModel([register] + hid)
     listeners = {"i2c": listen(args.i2c), "gpio": listen(args.gpio)}
     control = listen(args.control)
     if args.ready:
@@ -803,7 +1009,7 @@ def serve(args):
                     control_clients.remove(item)
                     item.close()
                     continue
-                item.sendall((command(line.decode().strip(), register, gpio_model, devices) + "\n").encode())
+                item.sendall((command(line.decode().strip(), register, gpio_model, devices, hid) + "\n").encode())
             elif isinstance(item, int):
                 name, index = kicks[item]
                 os.read(item, 8)
@@ -821,11 +1027,30 @@ def serve(args):
                 device.run_pending()
 
 
-def command(text, register, gpio, devices):
+def command(text, register, gpio, devices, hid=()):
     words = text.split()
     try:
         if not words:
             return "error empty"
+        if words[0] == "hid":
+            device = next((device for device in hid if device.name == words[2]), None)
+            if device is None:
+                return f"error no HID model {words[2]}"
+            if words[1] == "script":
+                return device.run_script()
+            if words[1] == "hold":
+                device.held = True
+                device.signal()
+                return f"ok {device.name} line {device.line} held asserted with no report"
+            if words[1] == "lose":
+                device.lose_power()
+                return f"ok {device.name} lost its power"
+            if words[1] == "malformed":
+                device.malformed = words[3] == "on"
+                return f"ok {device.name} descriptor {'malformed' if device.malformed else 'well-formed'}"
+            if words[1] == "status":
+                return f"ok {device.name} power {'on' if device.powered else 'sleep'} lost {int(device.lost)} mode {device.mode} resets {device.resets} queued {len(device.queue)} held {int(device.held)}"
+            return f"error unknown hid command {words[1]}"
         if words[0] in ("raise", "lower", "level"):
             line = int(words[1])
             level = 1 if words[0] == "raise" else 0 if words[0] == "lower" else int(words[2])
@@ -997,6 +1222,61 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(drained, [1], "and the ring is drained once the reply is out")
         self.assertEqual(device.pending, [])
 
+    def test_a_hid_model_speaks_the_register_protocol_and_its_line_follows_what_waits(self):
+        lines = {}
+        pad, screen = hid_devices(lambda line, level: lines.__setitem__(line, level))
+        # THE DESCRIPTOR at the register the firmware names, read with a repeated start.
+        self.assertTrue(pad.write(bytes([0x20, 0x00]), combined=True))
+        descriptor = pad.read(30, after_write=True)
+        length, version, report_len, report_reg, input_reg, max_input = struct.unpack_from("<HHHHHH", descriptor)
+        self.assertEqual((length, version, report_len, report_reg, input_reg), (30, 0x0100, len(TOUCHPAD_REPORT_DESCRIPTOR), 0x21, 0x22))
+        pad.write(bytes([0x21, 0x00]), combined=True)
+        self.assertEqual(pad.read(report_len, after_write=True), TOUCHPAD_REPORT_DESCRIPTOR)
+        # RESET: the zero-length indication waits on an asserted line, and reading it releases the line.
+        pad.write(bytes([0x24, 0x00, 0x00, HID_RESET]))
+        self.assertEqual((lines[0], pad.resets), (0, 1))
+        self.assertEqual(pad.read(max_input, after_write=False)[:2], b"\0\0")
+        self.assertEqual(lines[0], 1)
+        # THE SCRIPT IN MOUSE MODE: four mouse reports, the line asserted until the last is read.
+        self.assertTrue(pad.run_script().startswith(f"ok touchpad queued {TOUCHPAD_MOVES + 2}"))
+        reports = []
+        while lines[0] == 0:
+            reports.append(pad.read(max_input, after_write=False))
+        self.assertEqual([r[:6] for r in reports], [bytes([6, 0, 1, 0, 127, 64])] * TOUCHPAD_MOVES + [bytes([6, 0, 1, 1, 0, 0]), bytes([6, 0, 1, 0, 0, 0])])
+        # INPUT MODE 3 through SET_REPORT: the same script now goes out through the touch pad collection alone.
+        pad.write(bytes([0x24, 0x00, 0x33, HID_SET_REPORT, 0x25, 0x00, 0x04, 0x00, 0x03, 0x03]))
+        self.assertEqual(pad.mode, 3)
+        self.assertTrue(pad.run_script().startswith("ok touchpad queued 4 report(s) in mode 3"))
+        self.assertEqual({pad.read(max_input, after_write=False)[2] for _ in range(4)}, {2})
+        # ASLEEP IT REPORTS NOTHING; after a power loss nothing until a RESET.
+        pad.write(bytes([0x24, 0x00, 0x01, HID_SET_POWER]))
+        self.assertIn("asleep", pad.run_script())
+        pad.write(bytes([0x24, 0x00, 0x00, HID_SET_POWER]))
+        pad.lose_power()
+        self.assertIn("power was lost", pad.run_script())
+        pad.write(bytes([0x24, 0x00, 0x00, HID_SET_POWER]))
+        self.assertIn("power was lost", pad.run_script(), "SET_POWER on does not bring back a device that lost its power")
+        pad.write(bytes([0x24, 0x00, 0x00, HID_RESET]))
+        pad.read(max_input, after_write=False)
+        self.assertEqual(pad.mode, 0, "a RESET is mouse mode again")
+        # A HELD LINE stays asserted with nothing behind it, until a RESET.
+        pad.held = True
+        pad.signal()
+        self.assertEqual(pad.read(max_input, after_write=False)[:2], b"\0\0")
+        self.assertEqual(lines[0], 0)
+        pad.write(bytes([0x24, 0x00, 0x00, HID_RESET]))
+        pad.read(max_input, after_write=False)
+        self.assertEqual(lines[0], 1)
+        # A MALFORMED DESCRIPTOR names a version this protocol does not define.
+        screen.malformed = True
+        screen.write(bytes([0x01, 0x00]), combined=True)
+        self.assertEqual(struct.unpack_from("<H", screen.read(30, after_write=True), 2)[0], 0x0200)
+        # THE TOUCHSCREEN'S SCRIPT: a two-finger contact and the lift, on its own line.
+        screen.run_script()
+        self.assertEqual(lines[1], 0)
+        down = screen.read(19, after_write=False)
+        self.assertEqual((down[2], down[3], down[9], down[15]), (1, 1, 1, 2))
+
     def test_the_control_mailbox_runs_the_control_sockets_own_commands(self):
         gpio = GpioModel(["a", "b", "c"])
         completed = []
@@ -1032,6 +1312,7 @@ def main():
     parser.add_argument("--gpio", help="the virtio-gpio vhost-user socket to listen on")
     parser.add_argument("--control", help="the control socket to listen on")
     parser.add_argument("--ready", help="a file written once every socket listens")
+    parser.add_argument("--hid", action="store_true", help="the HID-over-I2C models: a touchpad at 0x2C and a touchscreen at 0x10")
     parser.add_argument("--self-test", action="store_true", help="run the host suite and exit")
     parser.add_argument("--trace", action="store_true", help="one line per request and control message, on stderr")
     args = parser.parse_args()

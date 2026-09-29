@@ -199,3 +199,117 @@ DEFECTS FOUND BY THE ORACLES AND FIXED (each in this milestone's own new code):
 Also added while diagnosing, and kept: each driver says why it refused a connection and which request its
 device did not answer; the backend takes `--trace` (one timestamped line per message, request and IOTLB entry),
 and `test-kernel.sh` keeps its log beside the guest's as `<run>-i2c-backend.log`.
+
+## P02M0195b - started (2026-09-29T02:02:54Z)
+
+P02M0196b is in (the namespace's devices with their connections joined to the controllers' rows, node channels,
+`_DSM`), so P02M0195b begins in the agreed order. The plan's assumptions, checked against the code before writing:
+- DeviceManager has NO child binding: a requirement is a provider KIND satisfied by any publication (`requirements_met`),
+  the dependency closure and the depth order work on kinds, DeviceManager never reads a row's `connections`, and no
+  `RESOURCE` kind carries a connection - scoped mints existed only for the ACPI service. All of it is this step's.
+- The generic HID parser (`drivers::hid`) records each field's application collection, so routing a report by its
+  collection needs only accessors; it had NO usage constants for Mouse, Pointer, Touch Screen or Touch Pad.
+- InputService takes the first live `pointer` and `touch` provider at bootstrap and closes both subscriptions; the
+  `gamepad` subscription it keeps open is the pattern to follow. Its services tests answer the four subscriptions in
+  the order input, pointer, touch, gamepad, which is kept.
+- The emitter has `I2cSerialBusV2`, `GpioInt` and `_DSM`; the backend names line 0 `hid-touchpad` and line 1
+  `hid-touchscreen` already; `fdt` reads a `hid-over-i2c` node under a `virtio,device22` child as an I2C device with its
+  address and a `GpioLine` interrupt (checked by an extended fdt test before anything was changed there).
+- The sleep exchange (SUSPEND/RESUME) does not exist yet: P02M0197 lands after this half, so by the plan's own rule
+  ("carried by whichever of P02M0197 and this half lands second") that item is P02M0197's to carry.
+
+## P02M0195b - what was implemented (2026-09-29)
+
+THE CHILD BINDING (DeviceManager, `src/user/services/core/src/device_manager.rs`):
+- `Need` - one connection's requirement: the controller's FUNCTION (a PCI function or a platform number, generation
+  0, so a controller rebound under a new generation satisfies it again) and the provider kind that serves it (`i2c-bus`
+  for an I2C address, `gpio-lines` for a GPIO line). `needs_of` reads them off a platform row's `connections` at
+  `Node::new`; `controller_function` turns the controller's row index into its binding identity.
+- `needs_met` beside `requirements_met`: `gate_on_requirements` parks a child in `DependencyPending` until both
+  controllers publish ("waiting for the controllers its firmware connections are on"); `settle_dependencies` wakes it;
+  `stop_nodes_that_lost_a_dependency` dooms a child whose controller serves its kind no more or is itself being
+  stopped (`StopIntent::DependencyLost`, "connected through a controller whose binding ended"); `dependency_depths`
+  puts a child one level above each controller, so dependents stop first. No restart budget is spent - the existing
+  dependency path.
+- THE MINT AT BIND: `begin_bind` takes `children: Option<(&mut Catalogue, &[Publisher])>`; for a platform row with
+  connections each is minted through `child_connection` - `driver_protocol::connection_scope` (below), the controller's
+  row, the `_AEI` exclusion (a GPIO line the controller's firmware node lists in `aei()` is refused: "a line the ACPI
+  service holds for the firmware's own _AEI events"), the provider slot (`Catalogue::serving`), the live publisher -
+  and handed over as a `Connection` resource in the row's order. `mint_scoped_connection` is split into a lookup and
+  `mint_on(catalogue, &Publisher, slot, scope)`, so a bind that holds only its own node mints on a snapshot of the live
+  controllers (`publishers_for`, empty and allocation-free for a node with no connections) taken by
+  `start_candidate_at`. `start_candidate`, `admit_arrival` and `serve_bus_events` take the catalogue mutably; the
+  boot phase's binds (boot-critical drivers only) pass `None`.
+- A refused connection fails the bind under the new cause `connection-refused` (not retryable: a ten-bit address, an
+  SPI device, a line held for `_AEI`, a connection joined to no controller); a controller that will not take one more
+  connection is `resource-exhausted`. The IDL enum gained `connection-refused = 13` (pre-release, `gen.sh
+  --accept-breaking`), with the binding library's name and retry column, DeviceManager's text and wire mapping and the
+  system graph's name.
+- THE PROTOCOL: `ResourceKind::Connection = 12`, `MAX_CONNECTIONS`, `MAX_BIND_RESOURCES` grown by it; the drivers'
+  `common::Resources` keeps `connections` in the row's order. `connection_scope(source, &abi::Connection)`: an ACPI
+  `GpioInt`'s mode and polarity (level low -> `Low`, level high -> `High`, edge low -> `Falling`, edge high -> `Rising`,
+  neither -> `Level` for level reads) and a tree specifier's interrupt-type cell (1/2/3/4/8 -> rising/falling/both/high/
+  low; anything else refused) into ONE line trigger; an I2C address with `CONNECTION_I2C_TEN_BIT` or past seven bits
+  refused; SPI refused. The ABI gained `CONNECTION_I2C_TEN_BIT`, and the ACPI model's `describe` now carries a ten-bit
+  address as one instead of dropping the flag.
+
+THE DRIVER (`src/user/drivers/core/src/i2c_hid_driver.rs`, bin `i2c_hid`; pure parts `src/i2c_hid.rs`):
+- The connections by kind; the descriptor register from the node's `_DSM` (UUID 3CDFF6F7-4267-4555-AD05-B30A3D8938DE,
+  revision 1, function 1, through the node channel it asks DeviceManager for) or the tree's `hid-descr-addr`
+  (`tree_descriptor_register` over the property block its claim's window reads); `_PS0` where the node has it;
+  `hid_i2c::Device::probe` over `i2c_client::ScopedBus` (refused, and the binding failed with nothing published, on a
+  malformed descriptor); READY there, because the bind window is 2 s and the reset bound 5 s; SET_POWER on, RESET, the
+  reset indication awaited on the line within `RESET_BOUND_TICKS`, RESET once more, then `DeviceNotResponding`
+  (`ResetHandshake`); the report descriptor to `drivers::hid`; `publications` - a Mouse or Pointer application
+  collection publishes `pointer`, a Touch Screen `touch`, a Touch Pad or anything else nothing - each offered late with
+  a `Serving` publication; no Input Mode or Device Mode report is ever sent. The loop: on the line's event, input
+  reports read until the line is quiet (its level against the scoped trigger's asserted level), each routed by the
+  application collection its report id belongs to (`route`) - a pointer frame (`Pointer::feed`) or contact frames
+  (`contact_frames`) to that publication's consumers, non-blocking - then the event acknowledged; an event with nothing
+  behind it resets the device once (`Storm`), the next fails the binding. STOP: SET_POWER sleep, `_PS3`.
+- `common::wait_or_answer_until` (new): the combined wait with a deadline and, optionally, the provider set.
+- `drivers::hid`: `Layout::application_of` and `Layout::applications`. AND A DEFECT FOUND BY THIS DRIVER'S TOUCHSCREEN:
+  `Layout::contacts` began a contact at each Contact Identifier, so a descriptor declaring the tip switch BEFORE the
+  identifier - the common order - gave each finger's tip to the finger before it. A contact now begins where its
+  finger's logical collection begins (`Segment::logical`, the innermost logical collection, numbered as opened); a
+  flat descriptor still begins one at each identifier. A regression test in the parser's own suite.
+- `hid-i2c`'s module comment and the manifest's `hid-i2c` and `i2c-client` source-row comments now name the consumer
+  and say SSIF uses the contract's SMBus transactions, not `I2cBus`. Manifest row `i2c_hid`: `transport = "platform"`,
+  `PNP0C50` and `ACPI0C50` as `_HID` and `_CID`, the `hid-over-i2c` compatible, `dma = "none"`, `pointer` and `touch`
+  at most one each. The system-manifest test's DMA table names it.
+
+INPUTSERVICE (`input_service.rs`): `Followed` - the `pointer` and `touch` subscriptions KEPT OPEN (two of the
+catalogue's subscriber places), every live provider attached up to its kind's bound (four pointers merged into the one
+cursor, one touch surface), one past the bound waiting (said once) and attached when one of its kind detaches; a
+provider detached on its withdrawal or when its connection closes and not opened again until published again; a
+detached surface's contacts lifted (`Input::lift_contacts`), as focus loss lifts them; each attach and detach said.
+The `input` kind keeps its bootstrap-only discovery. The subscription order (input, pointer, touch, gamepad) is
+unchanged, so the existing services tests answer it as before. Manifest comment corrected.
+
+THE FIXTURES:
+- `vhost-i2c-gpio.py --hid`: `HidDevice`, the HID-over-I2C register protocol (descriptor, report descriptor, command and
+  data registers, the input register a plain read empties), its line level and active low (asserted while a report,
+  the reset indication or a hold waits), RESET, SET_POWER (asleep: nothing reported), SET_REPORT of the touchpad's Input
+  Mode, a power loss (nothing until a RESET), a held line, a malformed descriptor; the precision touchpad at 0x2C
+  (descriptor register 0x20; mouse, touch pad and configuration collections; sixteen moves and a click through the ONE
+  collection its mode selects) and the touchscreen at 0x10 (register 0x01; two fingers down and the lift); control
+  commands `hid script|hold|lose|status NAME` and `hid malformed NAME on|off`; lines 0 and 1 idle high. A host test.
+- `acpi-fixture.py --hid-out`: the HID SSDT - below the virtio-i2c function's `SA8_`, `TPAD`/`TSCR` with vendor `_HID`,
+  `_CID` `PNP0C50`, `I2cSerialBusV2` (0x2C/0x10), `GpioInt` (level, active low) on `SB0_` lines 0/1, `_DSM` answering
+  0x20/0x01. `aml_emitter.py`: `GpioInt`'s consumer bit set, and the host tests now check `I2cSerialBusV2`,
+  `GpioInt`/`GpioIo` and a `_DSM` returning an integer field by field against the specification's offsets (the
+  committed sample regenerated; the interpreter's suite passes on it).
+- `fdt_edit.py hid-fixture`: the virtio-i2c function's node with its `virtio,device22` `i2c` child (seven-bit
+  addresses), the two `hid-over-i2c` nodes (`reg`, `hid-descr-addr`, `interrupts-extended` level-low on the virtio-gpio
+  function's `gpio` child). The firmware fixture's GPIO node corrected to Linux's binding: PCI id `pci1af4,1069`
+  (virtio 0x29 is 0x1040 + 41) and a child named `gpio`. The fdt crate's PCI-child test extended to the I2C child.
+- `qemu-run.sh`: `qemu_attach_hid_table` (x86_64: the SSDT built by the run and loaded with `-acpitable`) and
+  `i2c_hid_dtb_args` (aarch64/riscv64 through UEFI: the dumped tree edited and handed back with `-dtb`; refused beside
+  `DMA_DTB_NODE`).
+- `hidcheck` (development probe; grants Device, DevicePolicy, Input, Display): `watch`, `storm`, `cycle`, `malformed`,
+  each cueing the gate first. Gate `i2c-hid` (`tools/check-i2c-hid.sh`, registered in `check.sh`, the verification
+  model's catalogue and the release-required list).
+- Kernel services test `kernel.services.pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn`.
+
+NOT IN THIS STEP, BY THE PLAN'S OWN RULE: ACROSS A SLEEP (the suspend and resume exchange and the gate's sleep half) is
+carried by whichever of P02M0197 and this half lands second - P02M0197 does.

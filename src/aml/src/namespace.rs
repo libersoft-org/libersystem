@@ -102,8 +102,10 @@ impl Namespace {
 	/// RESOLVE a name string used from `scope`: a bare single segment searched in the scope and each enclosing one,
 	/// anything else walked exactly.
 	pub fn resolve(&self, name: &NameString, scope: NodeId) -> Option<NodeId> {
+		// `\` ALONE AND `^` ALONE NAME A NODE: the root, and the scope's parent - `Scope (\)` is how firmware opens the
+		// root. Only the null name names nothing.
 		if name.segs.is_empty() {
-			return None;
+			return if name.root || name.parents > 0 { self.anchor(name, scope) } else { None };
 		}
 		if name.searches() {
 			let mut at = Some(scope);

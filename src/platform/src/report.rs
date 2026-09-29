@@ -14,6 +14,7 @@ pub const WITHDRAW: u8 = 2;
 pub const COMPANION: u8 = 3;
 pub const OSC: u8 = 4;
 pub const LOADED: u8 = 5;
+pub const LISTS: u8 = 6;
 
 /// The most lines or addresses a companion report carries in each list.
 pub const MAX_LISTED: usize = 32;
@@ -82,6 +83,16 @@ pub struct CompanionReport<'a> {
 	pub field_addresses: List,
 }
 
+/// A namespace row that is itself a GPIO or serial-bus controller: its identity, and the `_AEI` lines and the lines and
+/// addresses the service's own fields name through it.
+#[derive(Clone, Copy, Debug)]
+pub struct ListsReport<'a> {
+	pub identity: &'a [u8],
+	pub aei_lines: List,
+	pub field_lines: List,
+	pub field_addresses: List,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Report<'a> {
 	Device(DeviceReport<'a>),
@@ -98,6 +109,7 @@ pub enum Report<'a> {
 	Loaded {
 		instance: u64,
 	},
+	Lists(ListsReport<'a>),
 }
 
 /// `_OSC` control bits for a PCI Express host bridge, as the dword the service passed and firmware answered.
@@ -258,6 +270,19 @@ pub fn encode_companion(report: &CompanionReport<'_>, out: &mut [u8]) -> Option<
 	Some(w.at)
 }
 
+pub fn encode_lists(report: &ListsReport<'_>, out: &mut [u8]) -> Option<usize> {
+	let mut w = Writer { out, at: 0 };
+	w.u8(LISTS)?;
+	w.short(report.identity)?;
+	for list in [&report.aei_lines, &report.field_lines, &report.field_addresses] {
+		w.u8(list.count as u8)?;
+		for value in list.as_slice() {
+			w.put(&value.to_le_bytes())?;
+		}
+	}
+	Some(w.at)
+}
+
 pub fn encode_osc(segment: u16, bus_start: u8, bus_end: u8, granted: u32, out: &mut [u8]) -> Option<usize> {
 	let mut w = Writer { out, at: 0 };
 	w.u8(OSC)?;
@@ -365,6 +390,13 @@ pub fn decode(bytes: &[u8]) -> Option<Report<'_>> {
 			Report::Osc { segment, bus_start, bus_end, granted }
 		}
 		LOADED => Report::Loaded { instance: r.u64()? },
+		LISTS => {
+			let identity = r.short()?;
+			let aei_lines = r.list()?;
+			let field_lines = r.list()?;
+			let field_addresses = r.list()?;
+			Report::Lists(ListsReport { identity, aei_lines, field_lines, field_addresses })
+		}
 		_ => return None,
 	};
 	(r.at == bytes.len()).then_some(report)

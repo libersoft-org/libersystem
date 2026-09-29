@@ -447,6 +447,10 @@ pub enum FailureCause {
 	// The release did not confirm. NOT IN EITHER COLUMN: it never reaches the question, because it
 	// ends at `Quarantined`.
 	TeardownUnconfirmed,
+	// A CONNECTION THE DEVICE'S FIRMWARE NAMES CANNOT BE GRANTED: a ten-bit I2C address, an SPI device, a line the
+	// ACPI service holds for the firmware's own `_AEI` events, a connection joined to no controller. NOT RETRYABLE:
+	// the firmware says the same thing next time.
+	ConnectionRefused,
 }
 
 impl FailureCause {
@@ -454,7 +458,7 @@ impl FailureCause {
 		match self {
 			FailureCause::HandshakeTimeout | FailureCause::DriverExited | FailureCause::SpawnFailed | FailureCause::Hung => true,
 			FailureCause::DriverReported(code) => code.retryable(),
-			FailureCause::DriverMissing | FailureCause::ProtocolMismatch | FailureCause::ClaimRefused | FailureCause::IommuRequired | FailureCause::ResourceExhausted => false,
+			FailureCause::DriverMissing | FailureCause::ProtocolMismatch | FailureCause::ClaimRefused | FailureCause::IommuRequired | FailureCause::ResourceExhausted | FailureCause::ConnectionRefused => false,
 			// A stop that was ASKED FOR is not a thing to retry. See the variant.
 			FailureCause::Stopped => false,
 			// Asked and answered `false` so the match is total, but the state machine never gets
@@ -477,6 +481,7 @@ impl FailureCause {
 			FailureCause::Hung => b"hung",
 			FailureCause::TeardownUnconfirmed => b"teardown-unconfirmed",
 			FailureCause::Stopped => b"stopped",
+			FailureCause::ConnectionRefused => b"connection-refused",
 		}
 	}
 }
@@ -1144,7 +1149,7 @@ impl IncidentWindow {
 // wired lines, the console UART's tap, and a row's declared registers. A ledger that is full refuses the next entry, and DeviceManager does not look: at five,
 // the trusted key sink pushed the console feed out of every keyboard's bind, and nothing a person typed
 // reached the console.
-pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES + driver_protocol::MAX_PLATFORM_WINDOWS + driver_protocol::MAX_PLATFORM_LINES + 2;
+pub const MAX_BIND_RESOURCES: usize = 6 + driver_protocol::MAX_PORT_RANGES + driver_protocol::MAX_PLATFORM_WINDOWS + driver_protocol::MAX_PLATFORM_LINES + 2 + driver_protocol::MAX_CONNECTIONS;
 
 // What a rollback does to the world. Separated from the ledger so the ledger can be driven.
 //

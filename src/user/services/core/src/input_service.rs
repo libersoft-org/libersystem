@@ -29,6 +29,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use driver_protocol::gamepad as pad_wire;
@@ -75,6 +76,117 @@ const MAX_GAMEPADS: usize = 8;
 const GAMEPAD_RETRY_TICKS: u64 = 1;
 // The largest frame of a gamepad stream - a `present` with every count at its most - with room over.
 const GAMEPAD_FRAME: usize = 256;
+// THE POINTER AND TOUCH BOUNDS: four pointer providers attached at once, their events merged into the one cursor; ONE
+// touch surface at a time, because a contact event names no surface and each surface normalises its axes across itself -
+// two surfaces in one stream would be contacts in two coordinate spaces under colliding identities.
+const MAX_POINTER_PROVIDERS: usize = 4;
+const MAX_TOUCH_SURFACES: usize = 1;
+
+// ONE KIND OF PROVIDER, FOLLOWED - `pointer` or `touch`. The catalogue subscription stays OPEN for this service's life,
+// and every live provider it announces, at bootstrap or later, is attached up to the kind's bound; one past it waits,
+// said once, and is attached when one of its kind is detached. A provider is detached on its withdrawal or when its
+// connection closes, and is not opened again until it is published again.
+struct Followed {
+	catalogue: u64,
+	subscription: u64,
+	what: &'static str,
+	bound: usize,
+	attached: Vec<(ProviderInfo, u64)>,
+	waiting: Vec<ProviderInfo>,
+	// A provider waited past the bound, and that was said.
+	told: bool,
+}
+
+impl Followed {
+	// Subscribed, and what is published already attached - polled, never blocked: the catalogue sends a new subscriber
+	// everything published in the same step, and a machine with nothing of the kind must not hang this service's start.
+	fn subscribe(catalogue: u64, kind: &ProviderKind, what: &'static str, bound: usize) -> Followed {
+		let subscription = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(kind).unwrap_or(0) } else { 0 };
+		if catalogue != 0 && subscription == 0 {
+			print(format!("InputService: the catalogue refused the {what} subscription\n").as_bytes());
+		}
+		let mut followed = Followed { catalogue, subscription, what, bound, attached: Vec::new(), waiting: Vec::new(), told: false };
+		followed.drain();
+		followed
+	}
+
+	fn connections(&self) -> impl Iterator<Item = u64> + '_ {
+		self.attached.iter().map(|(_, chan)| *chan)
+	}
+
+	fn holds(&self, chan: u64) -> bool {
+		self.attached.iter().any(|(_, held)| *held == chan)
+	}
+
+	// Every frame the subscription holds: a publication attached or waiting, a withdrawal detached. Answers whether
+	// anything was detached.
+	fn drain(&mut self) -> bool {
+		let mut detached = false;
+		let mut buf = [0u8; 256];
+		while self.subscription != 0 {
+			let (len, handles) = match try_recv_caps(self.subscription, &mut buf) {
+				PolledCaps::Message { len, handles } => (len, handles),
+				PolledCaps::Empty => break,
+				PolledCaps::Closed => {
+					close(self.subscription);
+					self.subscription = 0;
+					break;
+				}
+			};
+			for &leftover in handles.as_slice() {
+				close(leftover);
+			}
+			let mut frame_handles = wire::Handles::new();
+			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+				print(b"InputService: a provider frame did not decode\n");
+				continue;
+			};
+			if info.live {
+				self.adopt(info);
+			} else if let Some(chan) = self.attached.iter().find(|(held, _)| same_publication(held, &info)).map(|(_, chan)| *chan) {
+				self.detach(chan);
+				detached = true;
+			} else {
+				self.waiting.retain(|held| !same_publication(held, &info));
+			}
+		}
+		detached
+	}
+
+	fn adopt(&mut self, info: ProviderInfo) {
+		if self.attached.iter().any(|(held, _)| same_publication(held, &info)) || self.waiting.iter().any(|held| same_publication(held, &info)) {
+			return;
+		}
+		if self.attached.len() >= self.bound {
+			if !self.told {
+				print(format!("InputService: a {} provider waits - this service attaches {} at a time\n", self.what, self.bound).as_bytes());
+				self.told = true;
+			}
+			self.waiting.push(info);
+			return;
+		}
+		match provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(&info) {
+			Some(Ok(chan)) => {
+				self.attached.push((info, chan));
+				print(format!("InputService: a {} provider is attached ({} attached)\n", self.what, self.attached.len()).as_bytes());
+			}
+			Some(Err(_)) => print(format!("InputService: the catalogue refused a connection to a {} provider it published\n", self.what).as_bytes()),
+			None => print(format!("InputService: the catalogue did not answer the connection to a {} provider\n", self.what).as_bytes()),
+		}
+	}
+
+	// A provider detached - withdrawn, or its connection closed - and the first one waiting attached in its place.
+	fn detach(&mut self, chan: u64) {
+		let Some(at) = self.attached.iter().position(|(_, held)| *held == chan) else { return };
+		self.attached.remove(at);
+		close(chan);
+		print(format!("InputService: a {} provider is detached ({} attached)\n", self.what, self.attached.len()).as_bytes());
+		while self.attached.len() < self.bound && !self.waiting.is_empty() {
+			let next = self.waiting.remove(0);
+			self.adopt(next);
+		}
+	}
+}
 
 // The recent pointer events, mapped to the text-cell grid - the bounded source a
 // `subscribe` stream snapshots.
@@ -595,6 +707,16 @@ impl Input {
 		self.send_contact(event);
 	}
 
+	// A DETACHED SURFACE'S CONTACTS STILL DOWN ARE LIFTED, as focus loss lifts them: the fingers of a surface that is gone
+	// can never lift themselves.
+	fn lift_contacts(&mut self) {
+		for id in core::mem::take(&mut self.contacts_down) {
+			if !self.send_contact(ContactEvent { id, tip: false, x: 0, y: 0 }) {
+				break;
+			}
+		}
+	}
+
 	fn close_contact_stream(&mut self, release_held: bool) {
 		if release_held {
 			// EVERY FINGER STILL DOWN IS LIFTED BEFORE THE STREAM GOES, which is the contact half of
@@ -868,9 +990,9 @@ fn contact_from(raw: &[u8]) -> Option<ContactEvent> {
 // catalogue that refuses the subscription, and for a machine with nothing of that kind published -
 // all three of which are the state a zero handle used to be, and none of which is a failure.
 //
-// The subscription is CLOSED before returning. This service takes what exists at bootstrap and does
-// not follow a replacement, so an open stream would be a handle nothing reads and a subscriber slot
-// the catalogue could not give to a consumer that does.
+// The subscription is CLOSED before returning. The `input` kind is the one this service still takes at bootstrap
+// alone - `pointer` and `touch` are followed, see `Followed` - so an open stream would be a handle nothing reads and a
+// subscriber slot the catalogue could not give to a consumer that does.
 fn take_published_pointer(catalogue: u64, kind: &ProviderKind) -> u64 {
 	if catalogue == 0 {
 		return 0;
@@ -1107,10 +1229,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 	let trusted_root: u64 = recv_tagged(bootstrap, &mut buf, b"TRUSTED").unwrap_or(0);
 	let raw: u64 = take_published_pointer(catalogue, &ProviderKind::Input);
-	let raw2: u64 = take_published_pointer(catalogue, &ProviderKind::Pointer);
-	// A TOUCH SURFACE IS ITS OWN KIND, discovered the same way. A machine with none has none, which
-	// is what a zero handle already says.
-	let touch: u64 = take_published_pointer(catalogue, &ProviderKind::Touch);
+	// POINTERS AND TOUCH SURFACES ARE FOLLOWED: both subscriptions stay open, and every provider they announce - at
+	// bootstrap or later - is attached, up to four pointers and one surface. Two of the catalogue's subscriber places,
+	// held for this service's life, as the gamepad subscription below holds its own.
+	let pointers = Followed::subscribe(catalogue, &ProviderKind::Pointer, "pointer", MAX_POINTER_PROVIDERS);
+	let touch = Followed::subscribe(catalogue, &ProviderKind::Touch, "touch", MAX_TOUCH_SURFACES);
 	// GAMEPADS ARE FOLLOWED, NOT TAKEN ONCE: this subscription stays open, and every gamepad provider it
 	// announces - at bootstrap or later - is adopted from it in the serve loop.
 	let pad_subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Gamepad).unwrap_or(0) } else { 0 };
@@ -1125,7 +1248,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new(kill, Gamepads { catalogue, subscription: pad_subscription, sources: Vec::new(), pads: Vec::new(), next_id: 1, focused: None, console: None });
 	let mut trusted = Trusted { watch: Watch::new(), arming: Arming::Off, producer: 0, seq: 0, protected: false };
-	serve(service, admin, [raw, raw2], touch, forward, keys, focus, [trusted_keys, trusted_root], &mut trusted, &mut bluetooth, &mut state);
+	serve(service, admin, raw, pointers, touch, forward, keys, focus, [trusted_keys, trusted_root], &mut trusted, &mut bluetooth, &mut state);
 	exit();
 }
 
@@ -1135,12 +1258,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
 #[allow(clippy::too_many_arguments)]
-fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root]: [u64; 2], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input) {
+fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: Followed, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root]: [u64; 2], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input) {
 	let mut req: [u8; 64] = [0u8; 64];
-	let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
+	let mut raw_open: bool = raw != 0;
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
 	let mut keys_open: bool = keys != 0;
-	let mut touch_open: bool = touch != 0;
 	let mut focus_open: bool = focus != 0;
 	let mut trusted_keys_open: bool = trusted_keys != 0;
 	let mut trusted_open: bool = trusted_root != 0;
@@ -1155,12 +1277,15 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 		if keys_open {
 			waitset.push(keys);
 		}
-		if touch_open {
-			waitset.push(touch);
+		// EVERY ATTACHED SURFACE AND POINTER, and both subscriptions, which announce the next.
+		waitset.extend(touch.connections());
+		if raw_open {
+			waitset.push(raw);
 		}
-		for (i, &raw) in raws.iter().enumerate() {
-			if open[i] {
-				waitset.push(raw);
+		waitset.extend(pointers.connections());
+		for subscription in [pointers.subscription, touch.subscription] {
+			if subscription != 0 {
+				waitset.push(subscription);
 			}
 		}
 		if admin != 0 {
@@ -1393,9 +1518,20 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 			}
 			continue;
 		}
-		if touch_open && ready_handle == touch {
+		// A PUBLICATION OR A WITHDRAWAL: a pointer attached or detached; a surface detached lifts what it held.
+		if pointers.subscription != 0 && ready_handle == pointers.subscription {
+			pointers.drain();
+			continue;
+		}
+		if touch.subscription != 0 && ready_handle == touch.subscription {
+			if touch.drain() {
+				state.lift_contacts();
+			}
+			continue;
+		}
+		if touch.holds(ready_handle) {
 			loop {
-				match try_recv(touch, &mut req) {
+				match try_recv(ready_handle, &mut req) {
 					Polled::Message { len, handle } => {
 						if handle != 0 {
 							close(handle);
@@ -1406,7 +1542,8 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
-						touch_open = false;
+						touch.detach(ready_handle);
+						state.lift_contacts();
 						break;
 					}
 				}
@@ -1431,12 +1568,10 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 			}
 			continue;
 		}
-		for (i, &raw) in raws.iter().enumerate() {
-			if !open[i] || ready_handle != raw {
-				continue;
-			}
+		// A POINTER'S EVENTS - the `input` kind's or any attached pointer's - merged into the one cursor.
+		if (raw_open && ready_handle == raw) || pointers.holds(ready_handle) {
 			loop {
-				match try_recv(raw, &mut req) {
+				match try_recv(ready_handle, &mut req) {
 					Polled::Message { len, .. } => {
 						if let Some(event) = map_event(&req[..len]) {
 							state.record(event);
@@ -1447,7 +1582,11 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
-						open[i] = false;
+						if ready_handle == raw {
+							raw_open = false;
+						} else {
+							pointers.detach(ready_handle);
+						}
 						break;
 					}
 				}

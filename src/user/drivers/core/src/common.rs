@@ -58,6 +58,10 @@ pub struct Resources {
 	pub console_tap: u64,
 	// The row's declared registers, for a row that declares any.
 	pub registers: u64,
+	// A platform row's connections, in the row's order: `connections[i]` is connection `i` of `Bind::info.platform` - a
+	// channel to its controller, scoped to that one address or line.
+	pub connections: [u64; proto::MAX_CONNECTIONS],
+	pub connection_count: usize,
 }
 
 // Read one frame. Answers with the header, the payload length, and every capability it carried.
@@ -167,6 +171,10 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 			}
 			proto::ResourceKind::Line => {
 				keep_in_order(&mut resources.lines, &mut resources.line_count, handle);
+				continue;
+			}
+			proto::ResourceKind::Connection => {
+				keep_in_order(&mut resources.connections, &mut resources.connection_count, handle);
 				continue;
 			}
 		};
@@ -567,6 +575,39 @@ pub fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<us
 			}
 		}
 		if wait_any(&set[..count + 1], 0) < 0 {
+			return None;
+		}
+	}
+}
+
+// THE SAME WAIT, BOUNDED: `Some(Some(index))` for a ready handle, `Some(None)` once `deadline` passes first, and `None`
+// when the manager asked for a stop (latched, as above) or dropped the channel - for a driver that awaits its device's
+// answer within a bound while the manager may still be asking whether it is alive. With `serving`, a consumer that
+// connects meanwhile is accepted as the provider loops accept one.
+pub fn wait_or_answer_until(bootstrap: u64, bind: &Bind, handles: &[u64], deadline: u64, mut serving: Option<&mut Serving>) -> Option<Option<usize>> {
+	let mut set: [u64; 8] = [0; 8];
+	let count: usize = handles.len().min(set.len() - 1);
+	set[..count].copy_from_slice(&handles[..count]);
+	set[count] = bootstrap;
+	loop {
+		match drain_control_into(bootstrap, bind, serving.as_deref_mut()) {
+			Control::Continue => {}
+			Control::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+				return None;
+			}
+			Control::Ended => return None,
+		}
+		for (at, &handle) in handles[..count].iter().enumerate() {
+			if poll_ready(handle) {
+				return Some(Some(at));
+			}
+		}
+		if clock() >= deadline {
+			return Some(None);
+		}
+		let woke = wait_any(&set[..count + 1], deadline);
+		if woke < 0 && woke != ERR_TIMED_OUT {
 			return None;
 		}
 	}
@@ -998,13 +1039,17 @@ static NODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 static NODE_ANSWERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn take_node(bind: &Bind, opcode: proto::Opcode, handle: u64) {
-	let mut line = Bounded::<96>::new();
+	let mut line = Bounded::<160>::new();
 	line.push(b"driver ");
-	line.push(&hex2(bind.info.bus));
-	line.push(b":");
-	line.push(&hex2(bind.info.dev));
-	line.push(b".");
-	line.push(&[b'0' + (bind.info.func & 7)]);
+	if bind.info.platform.kind == ROW_KIND_PLATFORM {
+		line.push(bind.info.platform.identity());
+	} else {
+		line.push(&hex2(bind.info.bus));
+		line.push(b":");
+		line.push(&hex2(bind.info.dev));
+		line.push(b".");
+		line.push(&[b'0' + (bind.info.func & 7)]);
+	}
 	line.push(if opcode == proto::Opcode::Node { b": its firmware node channel arrived\n" } else { b": the firmware describes no node for it\n" });
 	print(line.as_bytes());
 	let old = NODE.swap(if opcode == proto::Opcode::Node { handle } else { 0 }, core::sync::atomic::Ordering::AcqRel);
@@ -1015,6 +1060,7 @@ fn take_node(bind: &Bind, opcode: proto::Opcode, handle: u64) {
 		close(handle);
 	}
 	NODE_ANSWERED.store(true, core::sync::atomic::Ordering::Release);
+	NODE_FRESH.store(true, core::sync::atomic::Ordering::Release);
 }
 
 // ASK THE MANAGER FOR THIS DEVICE'S FIRMWARE NODE - a namespace device's own, or its PCI function's companion. The
@@ -1028,6 +1074,39 @@ pub fn request_node(bootstrap: u64, bind: &Bind) -> bool {
 // The node channel the manager answered with, if it has: `Some(0)` for "there is none", `None` while unanswered.
 pub fn node() -> Option<u64> {
 	NODE_ANSWERED.load(core::sync::atomic::Ordering::Acquire).then(|| NODE.load(core::sync::atomic::Ordering::Acquire))
+}
+
+// Whether an answer to a node request arrived since `wait_node_or_answer` last said so.
+static NODE_FRESH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// THE SAME WAIT AS `wait_or_answer`, ANSWERING `Some(handles.len())` WHEN THE MANAGER ANSWERED THIS DRIVER'S NODE REQUEST
+// meanwhile - for a driver whose loop acts on its firmware node, which arrives on the control channel this wait drains.
+pub fn wait_node_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<usize> {
+	let mut set: [u64; 8] = [0; 8];
+	let count: usize = handles.len().min(set.len() - 1);
+	set[..count].copy_from_slice(&handles[..count]);
+	set[count] = bootstrap;
+	loop {
+		match drain_control(bootstrap, bind) {
+			Control::Continue => {}
+			Control::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+				return None;
+			}
+			Control::Ended => return None,
+		}
+		if NODE_FRESH.swap(false, core::sync::atomic::Ordering::AcqRel) {
+			return Some(count);
+		}
+		for (at, &handle) in handles[..count].iter().enumerate() {
+			if poll_ready(handle) {
+				return Some(at);
+			}
+		}
+		if wait_any(&set[..count + 1], 0) < 0 {
+			return None;
+		}
+	}
 }
 
 // Answer one `PING` that is already waiting on `bootstrap`, for a loop that does its own waiting.

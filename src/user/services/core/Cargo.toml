@@ -145,6 +145,13 @@ path = "src/adminhostile.rs"
 required-features = ["development"]
 
 [[bin]]
+# THE HID-OVER-I2C GATE'S SCENARIO DRIVER, absent from a shipped image: a live pointer and contact client of
+# InputService, holding a focused surface and the device policy it disables and enables bindings with.
+name = "hidcheck"
+path = "src/hidcheck.rs"
+required-features = ["development"]
+
+[[bin]]
 # THE BLUETOOTH GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the operator authority
 # and talks to a fixture only a development image has.
 name = "btcheck"

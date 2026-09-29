@@ -106,12 +106,19 @@ declare -A GATES=(
 	# virtio-iommu, so the vhost-user controllers' every ring and buffer address crosses the backend's IOTLB -
 	# one address and one line per scoped connection, every declared I2C transaction, each GPIO event once.
 	["i2c-bus"]="tools/check-i2c-bus.sh"
+	# HID OVER I2C ON A DEVELOPMENT GUEST: a touchpad and a touchscreen the backend models, described by the firmware,
+	# bound as children through scoped connections, delivering to a live InputService client - a storm reset, the
+	# controller disabled and enabled, a malformed descriptor refused.
+	["i2c-hid"]="tools/check-i2c-hid.sh"
 	# AND THE DEVICE SIDE ITSELF, on the host in milliseconds: the backend's memory table, its IOTLB's updates,
 	# misses and invalidations, indirect descriptor tables, the register device's PEC, and the GPIO model.
 	["i2c-backend"]="python3 harness/vhost-i2c-gpio.py --self-test"
 	# THE HARNESS'S AML EMITTER, which the fixture SSDTs are built with: every encoding checked, and its sample
 	# byte-for-byte the one the interpreter's own suite loads.
 	["aml-emitter"]="python3 harness/aml_emitter.py --self-test"
+	# THE FIRMWARE FIXTURES built with it and beside it: the ACPI gate's SSDT, and the shared device-tree editor the
+	# ports' fixture tree and the DMA-mode carrier are written with.
+	["firmware-fixtures"]="python3 harness/acpi-fixture.py --self-test && python3 harness/fdt_edit.py --self-test"
 	# MEDIAIMPORTSERVICE AGAINST A CAMERA THE KERNEL HARNESS PLAYS: exact pages out of a 40 000-handle snapshot,
 	# the over-limit storage refused explicitly, scoped and stale identities, validated completion into a
 	# transactional destination, removal as an explicit partial ending, and the grant. Not USB Still Image.
@@ -136,6 +143,10 @@ declare -A GATES=(
 	# state under `-action watchdog=pause` - once ServiceManager stops answering `alive`; the i6300esb also through a
 	# service kill, a driver kill, an orderly reboot whose notice is answered first, and a real reset it alone reports.
 	["watchdog"]="tools/check-watchdog.sh"
+	# THE FIRMWARE'S NAMESPACE, on development instances of its own: the ACPI service over QEMU's DSDT and the fixture
+	# SSDT, the kernel's publication and policy, DeviceManager's node channels and grants, the fixture driver's probes,
+	# the CPU hot-plug GPE, a restart reconciled by identity, and `_OSC` granting and refusing native hot-plug.
+	["acpi"]="tools/check-acpi.sh"
 	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
 	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
 	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three

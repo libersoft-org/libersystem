@@ -85,6 +85,13 @@ name = "admin_fixture"
 path = "src/admin_fixture.rs"
 test = false
 bench = false
+
+# THE ACPI GATE'S FIXTURE DRIVER, bound to the fixture SSDT's `LSFX0001` node in a development image alone.
+[[bin]]
+name = "acpi_fixture"
+path = "src/acpi_fixture.rs"
+test = false
+bench = false
 required-features = ["development"]
 
 [[bin]]
@@ -214,6 +221,15 @@ test = false
 bench = false
 
 [[bin]]
+# HID OVER I2C: a touchpad or touchscreen on another driver's bus, bound as a child through the address and the
+# interrupt line DeviceManager scoped on its controllers. Its pure parts are `src/i2c_hid.rs`, in the library and
+# host-tested.
+name = "i2c_hid"
+path = "src/i2c_hid_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 # THE KERNEL CONSOLE'S UART: the kernel-declared COM1 row, whose claim takes the console from the kernel -
 # its ports, its IRQ 4 and the kernel's console tap - published as `ConsoleBytes` under the kernel console's
 # name. The 16550 register engine is `src/uart.rs`, in the library and host-tested.
@@ -294,6 +310,11 @@ bootproto = { path = "../../../boot/protocol" }
 tpm = { path = "../../../tpm" }
 # THE ACPI TABLE READER, for the WDAT a watchdog driver runs: the same bounded reader the kernel parses it with.
 acpi = { path = "../../../acpi" }
+# HID OVER I2C: the descriptor and register protocol, the bus trait over one address-scoped connection, and the I2C
+# contract's client that connection speaks - linked statically into the one driver that uses them.
+hid-i2c = { path = "../../libs/driver/hid-i2c" }
+i2c-client = { path = "../../libs/driver/i2c-client" }
+i2c-device-proto = { path = "../../libs/protocol/i2c-device-proto" }
 
 
 # THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are
