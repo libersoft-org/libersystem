@@ -217,3 +217,51 @@ FOUND BY THE GATE (P02M0202c/d, 2026-09-29)
   for it) BEFORE feeding the engine, and printing "hard reset sent" before sending it: a console line costs
   milliseconds on the path an invariant is timed on. The driver now acts, then says - the alarm, a received hard
   reset and a sent one alike.
+- Runs 2 and 4 failed at `cycle` for a reason the offers' order did not explain, so it was MEASURED on a manual
+  instance with the partner counting register transfers: a normal response is 5 transfers and 4-7 ms (200
+  negotiations: p50 4.219 ms, p99 7.378 ms, max 7.698 ms, no timeout), and after the rebind the sink DID answer in
+  2.2 ms - but its Request carried MessageID 0, the ID of its own Soft_Reset, which the source had stored and
+  discarded again as a retry, as the specification's receiver must. A DEFECT OF THE ENGINE the independent partner
+  caught and the host suite did not: `wait_caps` reset both message counters, which is right after an attach or a hard
+  reset and wrong when the Accept of the sink's own Soft_Reset arrives or after a Reject or Wait with no contract.
+  The counters now reset only at an attach, a hard reset and a Soft_Reset sent (`soft_reset`) or received; test
+  `message_ids_count_on_from_a_soft_reset_and_never_repeat_one_the_source_stored`, seen failing with the old reset
+  restored. usb-pd: 25 tests. The partner now logs every message each way and the transfers each response took.
+
+VERIFICATION: `./check.sh --gate typec-tcpci` PASSED (607 s, one development instance on x86_64 under KVM, the
+partner's stretch 1), its fifth run; the four before failed as above and each failure was fixed at its cause, none by
+relaxing a bound. Every case the plan names, with what was measured:
+- a revision 3.1 charger: the contract at offer 4, 15 V, 2000 mA of 3000 mA offered; the one request the partner saw
+  was that one (no 9, 12, 20 V or PPS request); no alarm through the 5 V to 15 V transition; the tool showing the
+  port controller, the contract and all six offers;
+- PR_Swap, DR_Swap, VCONN_Swap and Discover_Identity answered Not_Supported and the contract kept; Get_Sink_Cap
+  answered `0001912c 0004b0c8` (the board's two PDOs);
+- the three malformed messages not believed (the driver named Length, Reserved and Extended) with no reset of any
+  kind following;
+- Wait then Accept (the request repeated after tSinkRequest); Reject with the contract kept; less power (a request at
+  5 V) and back (15 V) with no alarm;
+- VBUS driven to 17.5 V in the 15 V contract and a 5 V to 15 V transition overshooting to 18 V: each the sink path
+  off before the hard reset (the partner checks it at the hard reset), `source-fault` reported (voltage known at
+  17.5 and 18 V), the contract made anew;
+- a hard reset the partner sent, VBUS to 0 and back: attached throughout (`steady`, 5 s), no detach line, the
+  contract anew;
+- no answer to a Request: the hard reset 47.3 ms after its GoodCRC (not before 24), "hard resets so far: 1" when VBUS
+  came back - the count kept through the reset - and the contract anew;
+- Accept without PS_RDY: the hard reset 467.9 ms after Accept reached the sink (not before 450);
+- a hard reset after which VBUS stays off: detached 1560 ms after it (not before 1275);
+- a detach mid-negotiation: detached, the supply offline; no violation;
+- a revision 2.0 charger: 15 V, said as 2.0, its PR_Swap answered Reject;
+- a charger below the operating power: offer 1, 5 V at 2000 mA, capability mismatch;
+- non-PD chargers at 1.5 A and 3 A: both hard resets sent, then the Type-C current standing (`power by Type-C current,
+  1.5 A` / `3 A`);
+- a Power Delivery source sending no Source_Capabilities: the two hard resets 324.0 and 320.6 ms after the sink began
+  receiving (not before 310), then the Type-C current;
+- the virtio-i2c binding disabled and enabled during the 15 V contract: `tcpci` stopped as a lost dependency and
+  bound again, "bound with VBUS present and the sink path on - no contract is trusted; it is negotiated anew through
+  Soft_Reset", the contract made anew with no alarm; the partner recorded no hard reset, no sink path off, one
+  Soft_Reset and VBUS never below 15000 mV;
+- THE TIMING RUN: 200 negotiations, p50 4.499 ms, p99 7.879 ms, max 8.190 ms, no SenderResponseTimer run out, 5 to 6
+  register transfers each - inside the budget (at most 15 ms at p99, never 24 ms);
+- the partner's violation list empty at every check.
+Not run here: the ports' tree description (aarch64 and riscv64, their emulated sweep at the job's end); the sleep case
+(P02M0197); a real port controller.

@@ -234,6 +234,8 @@ class Tcpc:
         self.buffer = None
         self.transmit_buffer = b''
         self.pointer = 0
+        # Register transfers the sink made, counted so a response can be told in them.
+        self.transfers = 0
         # Its initialisation, reported for the first reads of POWER_STATUS.
         self.initialising = 2
         self.partner = None
@@ -356,6 +358,7 @@ class Tcpc:
         return view
 
     def read(self, length, after_write):
+        self.transfers += 1
         view = self.register_bytes()
         if self.pointer == POWER_STATUS and self.initialising:
             self.initialising -= 1
@@ -364,6 +367,8 @@ class Tcpc:
     def write(self, data, combined=False):
         if not data:
             return True
+        if not combined:
+            self.transfers += 1
         self.pointer = data[0]
         if combined or len(data) == 1:
             return True
@@ -477,6 +482,8 @@ class Source:
         self.violations = []
         self.requests = []
         self.responses = []
+        self.response_transfers = []
+        self.transfers_at_caps = 0
         self.response_timeouts = 0
         self.hard_resets_from_sink = []
         self.hard_resets_to_sink = 0
@@ -572,6 +579,8 @@ class Source:
     def send(self, kind, objects=()):
         data = message(kind, self.revision, self.message_id, objects)
         acknowledged = self.tcpc.deliver(data)
+        if self.negotiation_target == 0:
+            self.say(f'to the sink: {name_of(kind, bool(objects))}{"" if acknowledged else " - not acknowledged"}')
         if acknowledged:
             self.message_id = (self.message_id + 1) % 8
         return acknowledged
@@ -606,6 +615,7 @@ class Source:
         parsed = parse(data)
         if parsed and parsed[0] == SOURCE_CAPABILITIES and parsed[1]:
             self.pending_caps_alert = self.now()
+            self.transfers_at_caps = self.tcpc.transfers
         if parsed and parsed[0] == ACCEPT and not parsed[1]:
             self.marks['accept'] = self.now()
 
@@ -637,6 +647,8 @@ class Source:
             self.violation(f'the sink sent {data.hex()}, which is no message')
             return True
         kind, is_data, count, message_id, revision, objects = parsed
+        if self.negotiation_target == 0:
+            self.say(f'from the sink: {name_of(kind, is_data)}')
         self.timers.at(0, 'handle', lambda: self.handle(kind, is_data, message_id, revision, objects))
         return True
 
@@ -682,6 +694,9 @@ class Source:
         if self.pending_caps_alert is not None:
             response = (now - self.pending_caps_alert) * 1000
             self.responses.append(response)
+            self.response_transfers.append(self.tcpc.transfers - self.transfers_at_caps)
+            if self.negotiation_target == 0:
+                self.say(f'the request came {response:.1f} ms and {self.response_transfers[-1]} register transfers after the capabilities\' alert')
             self.pending_caps_alert = None
         position = (rdo >> 28) & 7
         operating, maximum = ((rdo >> 10) & 0x3FF) * 10, (rdo & 0x3FF) * 10
@@ -861,7 +876,8 @@ class Source:
         def at(fraction):
             return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
 
-        return f'responses {len(ordered)} p50 {at(0.5):.3f} ms p99 {at(0.99):.3f} ms max {ordered[-1]:.3f} ms timeouts {self.response_timeouts}'
+        transfers = sorted(self.response_transfers) or [0]
+        return f'responses {len(ordered)} p50 {at(0.5):.3f} ms p99 {at(0.99):.3f} ms max {ordered[-1]:.3f} ms timeouts {self.response_timeouts} transfers {transfers[len(transfers) // 2]}-{transfers[-1]}'
 
     def command(self, words):
         what = words[0]
@@ -904,6 +920,7 @@ class Source:
             return self.malformed(words[1])
         if what == 'negotiate':
             self.responses = []
+            self.response_transfers = []
             self.response_timeouts = 0
             self.negotiations_done = 0
             self.negotiation_target = int(words[1])

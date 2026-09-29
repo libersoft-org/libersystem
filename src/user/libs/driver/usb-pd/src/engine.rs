@@ -248,6 +248,8 @@ impl Engine {
 
 	fn attach(&mut self, out: &mut Vec<Action>) {
 		self.attach = Attach::Attached;
+		self.tx_id = 0;
+		self.rx_id = None;
 		self.sink_path(true, out);
 		out.push(Action::AutoDischarge(true));
 		self.alarms(Some(window(SAFE_5V)), out);
@@ -258,11 +260,20 @@ impl Engine {
 		out.push(Action::Publish);
 	}
 
+	// THE MESSAGE COUNTERS ARE NOT RESET HERE: only an attach, a hard reset and a Soft_Reset sent or received reset
+	// them, and a Request after the Accept of this sink's own Soft_Reset carrying that Soft_Reset's MessageID again is
+	// discarded by the source as a retry.
 	fn wait_caps(&mut self, out: &mut Vec<Action>) {
 		self.policy = Policy::WaitCaps;
+		out.push(Action::Arm(Timer::SinkWaitCap));
+	}
+
+	// THE PROTOCOL LAYER RESET a Soft_Reset sent by this sink begins with: both counters, then the message.
+	fn soft_reset(&mut self, out: &mut Vec<Action>) {
+		self.policy = Policy::SoftReset;
 		self.tx_id = 0;
 		self.rx_id = None;
-		out.push(Action::Arm(Timer::SinkWaitCap));
+		self.transmit(Kind::Control(Control::SoftReset), &[], true, out);
 	}
 
 	fn detach(&mut self, out: &mut Vec<Action>) {
@@ -472,9 +483,7 @@ impl Engine {
 		if matches!(self.policy, Policy::Transition(_)) {
 			self.hard_reset(true, out);
 		} else {
-			self.policy = Policy::SoftReset;
-			self.tx_id = 0;
-			self.transmit(Kind::Control(Control::SoftReset), &[], true, out);
+			self.soft_reset(out);
 		}
 	}
 
@@ -497,9 +506,7 @@ impl Engine {
 						let highest = self.sink.pdos.iter().map(|pdo| pdo.max_millivolts()).max().unwrap_or(SAFE_5V);
 						self.alarms(Some((window(SAFE_5V).0, window(highest).1)), &mut out);
 						out.push(Action::Receive(true));
-						self.policy = Policy::SoftReset;
-						self.tx_id = 0;
-						self.transmit(Kind::Control(Control::SoftReset), &[], true, &mut out);
+						self.soft_reset(&mut out);
 						out.push(Action::Publish);
 					}
 					// WITHOUT POWER DELIVERY nothing can be renegotiated: a path found on is left on at vSafe5V's alarms;
@@ -577,9 +584,7 @@ impl Engine {
 						self.hard_reset(true, &mut out);
 					} else {
 						// A MESSAGE THAT EXPECTED NO ANSWER WENT UNACKNOWLEDGED: the protocol is reset softly.
-						self.policy = Policy::SoftReset;
-						self.tx_id = 0;
-						self.transmit(Kind::Control(Control::SoftReset), &[], true, &mut out);
+						self.soft_reset(&mut out);
 					}
 				}
 				Transmitted::Failed => {}

@@ -365,6 +365,39 @@ fn swaps_and_vdms_are_not_supported_from_3_and_rejected_or_ignored_from_2() {
 }
 
 #[test]
+fn message_ids_count_on_from_a_soft_reset_and_never_repeat_one_the_source_stored() {
+	// A BIND'S Soft_Reset goes with the counter reset, and the Request after its Accept is the next ID - the source
+	// stored the Soft_Reset's and discards the same again as a retry.
+	let mut run = Run::new();
+	run.event(Event::Bound { cc: Cc::Rp(Rp::High), vbus: true, sinking: true });
+	assert_eq!((run.last_sent().kind, run.last_sent().id), (Kind::Control(Control::SoftReset), 0));
+	run.event(Event::Transmitted(Transmitted::Success));
+	run.tx_id_from_source = 0;
+	run.from_source(Kind::Control(Control::Accept), &[]);
+	run.from_source(Kind::Data(Data::SourceCapabilities), &charger());
+	assert_eq!((run.last_sent().kind, run.last_sent().id), (Kind::Data(Data::Request), 1));
+	// A Reject with no contract awaits capabilities again, and resets nothing.
+	let mut run = Run::new();
+	run.attach();
+	run.from_source(Kind::Data(Data::SourceCapabilities), &charger());
+	assert_eq!(run.last_sent().id, 0, "the first message after attach");
+	run.event(Event::Transmitted(Transmitted::Success));
+	run.from_source(Kind::Control(Control::Reject), &[]);
+	run.from_source(Kind::Data(Data::SourceCapabilities), &charger());
+	assert_eq!((run.last_sent().kind, run.last_sent().id), (Kind::Data(Data::Request), 1));
+	// A SOFT RESET RECEIVED resets this sink's counter: its Accept goes as 0, the Request after as 1.
+	let mut run = Run::new();
+	run.attach();
+	run.contract_at_15v();
+	run.tx_id_from_source = 0;
+	run.from_source(Kind::Control(Control::SoftReset), &[]);
+	assert_eq!((run.last_sent().kind, run.last_sent().id), (Kind::Control(Control::Accept), 0));
+	run.event(Event::Transmitted(Transmitted::Success));
+	run.from_source(Kind::Data(Data::SourceCapabilities), &charger());
+	assert_eq!((run.last_sent().kind, run.last_sent().id), (Kind::Data(Data::Request), 1));
+}
+
+#[test]
 fn a_repeated_message_id_is_discarded_and_a_malformed_message_changes_nothing() {
 	let mut run = Run::new();
 	run.attach();
