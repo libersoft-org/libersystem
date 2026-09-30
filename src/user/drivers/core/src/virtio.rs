@@ -139,6 +139,9 @@ pub struct Virtio {
 	// The word-0 (device-specific) feature bits the negotiation accepted: the
 	// intersection of what the device offered and what the driver wanted.
 	features_word0: u32,
+	// And word 1 as it was written - `VERSION_1` and `ACCESS_PLATFORM` where offered - so a device that lost its state
+	// in a sleep is negotiated back to exactly what its driver is driving (`restore`).
+	features_word1: u32,
 	// This device's DeviceMemory capability, kept so every DMA buffer whose physical address is
 	// handed to it can NAME it (`dma_buffer_for`). That is what lets the kernel keep those frames
 	// out of circulation if this driver dies with a descriptor still live - there is no IOMMU, so
@@ -165,6 +168,8 @@ pub struct Queue {
 	notify_addr: u64,
 	size: u16,
 	virt: u64,
+	// The rings' device address, so a device that lost its state in a sleep is pointed back at them (`restore`).
+	phys: u64,
 	avail_off: u64,
 	used_off: u64,
 	// The used-ring index consumed so far, so `take_used` knows what is new (the RX
@@ -188,7 +193,20 @@ pub struct Queue {
 impl Queue {
 	pub(crate) fn over(virt: u64, size: u16, notify_addr: u64) -> Queue {
 		let (avail_off, used_off, _) = ring_layout(size);
-		Queue { index: 0, notify_addr, size, virt, avail_off, used_off, last_used: 0, posted: 0, fault: None, capability: 0 }
+		Queue { index: 0, notify_addr, size, virt, phys: 0, avail_off, used_off, last_used: 0, posted: 0, fault: None, capability: 0 }
+	}
+
+	// A queue at device address `phys`, for the restore's test.
+	pub(crate) fn over_at(virt: u64, phys: u64, size: u16, notify_addr: u64) -> Queue {
+		Queue { phys, ..Queue::over(virt, size, notify_addr) }
+	}
+}
+
+// A device whose common configuration is a buffer the test owns.
+#[cfg(test)]
+impl Virtio {
+	pub(crate) fn over(common: u64, features_word0: u32, features_word1: u32, msix_vector: u16) -> Virtio {
+		Virtio { common, device: 0, notify: 0, notify_multiplier: 0, isr: 0, msix_vector, bus: 0, dev: 0, func: 0, features_word0, features_word1, capability: 0 }
 	}
 }
 
@@ -409,8 +427,9 @@ pub fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: u32) ->
 		// it negotiates exactly what it did before.
 		w32(common + CFG_DEVICE_FEATURE_SELECT, 1);
 		let features_word1: u32 = r32(common + CFG_DEVICE_FEATURE) & FEATURE_ACCESS_PLATFORM;
+		let features_word1: u32 = FEATURE_VERSION_1 | features_word1;
 		w32(common + CFG_DRIVER_FEATURE_SELECT, 1);
-		w32(common + CFG_DRIVER_FEATURE, FEATURE_VERSION_1 | features_word1);
+		w32(common + CFG_DRIVER_FEATURE, features_word1);
 
 		// lock the features in and confirm the device accepted them.
 		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
@@ -418,7 +437,7 @@ pub fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: u32) ->
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, bus: info.bus, dev: info.dev, func: info.func, features_word0, capability: 0 })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, bus: info.bus, dev: info.dev, func: info.func, features_word0, features_word1, capability: 0 })
 	}
 }
 
@@ -487,7 +506,7 @@ impl Virtio {
 			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
 			w16(self.common + CFG_QUEUE_ENABLE, 1);
 
-			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, posted: 0, fault: None, capability: self.capability })
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, phys, avail_off, used_off, last_used: 0, posted: 0, fault: None, capability: self.capability })
 		}
 	}
 
@@ -510,6 +529,65 @@ impl Virtio {
 	// still be live, so its driver must NOT report a clean stop - see `common::finish_stop`.
 	pub fn quiesce(&self) -> bool {
 		quiesce_at(self.common)
+	}
+
+	// NEGOTIATE A DEVICE THAT LOST ITS STATE BACK TO WHAT ITS DRIVER IS DRIVING - after a sleep that cut its power, or
+	// a reset this driver made for one: the reset, the same feature words, `FEATURES_OK` and the configuration
+	// interrupt's vector. The caller then restores each queue (`Queue::restore`) and calls `driver_ok`. False when the
+	// device does not come back to those features, which is a device that did not come back.
+	pub fn restore(&self) -> bool {
+		if !self.quiesce() {
+			return false;
+		}
+		unsafe {
+			w8(self.common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
+			w8(self.common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+			w32(self.common + CFG_DEVICE_FEATURE_SELECT, 0);
+			let offered0: u32 = r32(self.common + CFG_DEVICE_FEATURE);
+			w32(self.common + CFG_DEVICE_FEATURE_SELECT, 1);
+			let offered1: u32 = r32(self.common + CFG_DEVICE_FEATURE);
+			if offered0 & self.features_word0 != self.features_word0 || offered1 & self.features_word1 != self.features_word1 {
+				w8(self.common + CFG_DEVICE_STATUS, STATUS_FAILED);
+				return false;
+			}
+			w32(self.common + CFG_DRIVER_FEATURE_SELECT, 0);
+			w32(self.common + CFG_DRIVER_FEATURE, self.features_word0);
+			w32(self.common + CFG_DRIVER_FEATURE_SELECT, 1);
+			w32(self.common + CFG_DRIVER_FEATURE, self.features_word1);
+			w8(self.common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+			if r8(self.common + CFG_DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
+				w8(self.common + CFG_DEVICE_STATUS, STATUS_FAILED);
+				return false;
+			}
+			if self.msix_vector != VIRTIO_MSI_NO_VECTOR {
+				w16(self.common + CFG_CONFIG_MSIX_VECTOR, self.msix_vector);
+			}
+		}
+		true
+	}
+
+	// THE SLEEP'S HALF, FOR A DRIVER WITH NOTHING IN FLIGHT BETWEEN REQUESTS: a sleep that cuts the power stops the device
+	// first - the transport's reset, so nothing is written into memory about to stop being refreshed - and a suspend to
+	// idle leaves it as it is, powered and holding its state. Answers whether this stopped it; None for a device that
+	// did not confirm the stop, whose sleep is refused.
+	pub fn sleep(&self, request: &driver_protocol::SuspendRequest) -> Option<bool> {
+		if !request.state.loses_power() {
+			return Some(false);
+		}
+		self.quiesce().then_some(true)
+	}
+
+	// AND ITS WAY BACK: a device this step stopped, or one that lost its power, negotiated back and pointed at its rings
+	// again, emptied; one that kept both is as it was. False for a device that did not come back.
+	pub fn wake(&self, queues: &mut [&mut Queue], lost_power: bool, stopped: bool) -> bool {
+		if !lost_power && !stopped {
+			return true;
+		}
+		if !self.restore() || !queues.iter_mut().all(|queue| queue.restore(self)) {
+			return false;
+		}
+		self.driver_ok();
+		true
 	}
 
 	// The common-configuration address, for the stop path that has to reach this device from a loop
@@ -542,6 +620,34 @@ impl Virtio {
 impl Queue {
 	pub fn size(&self) -> u16 {
 		self.size
+	}
+
+	// POINT A RESTORED DEVICE BACK AT THIS QUEUE'S RINGS, emptied: the device starts again from index zero, so the driver
+	// does too - whatever was posted is gone and a driver that keeps buffers posted posts them again. The rings stay
+	// where they are in memory, which the sleep kept. Whether the device interrupts on this queue is kept too. Between
+	// `Virtio::restore` and `driver_ok`.
+	pub fn restore(&mut self, device: &Virtio) -> bool {
+		unsafe {
+			let flags: u16 = r16(self.virt + self.avail_off);
+			let (_, _, ring_bytes) = ring_layout(self.size);
+			w16(device.common + CFG_QUEUE_SELECT, self.index);
+			if r16(device.common + CFG_QUEUE_SIZE) < self.size {
+				return false;
+			}
+			w16(device.common + CFG_QUEUE_SIZE, self.size);
+			w16(device.common + CFG_QUEUE_MSIX_VECTOR, device.msix_vector);
+			core::ptr::write_bytes(self.virt as *mut u8, 0, ring_bytes as usize);
+			w16(self.virt + self.avail_off, flags);
+			fence(Ordering::SeqCst);
+			w64(device.common + CFG_QUEUE_DESC, self.phys);
+			w64(device.common + CFG_QUEUE_DRIVER, self.phys + self.avail_off);
+			w64(device.common + CFG_QUEUE_DEVICE, self.phys + self.used_off);
+			w16(device.common + CFG_QUEUE_ENABLE, 1);
+		}
+		self.last_used = 0;
+		self.posted = 0;
+		self.fault = None;
+		true
 	}
 
 	// Submit a descriptor chain to this queue and wait (by polling the used ring) for

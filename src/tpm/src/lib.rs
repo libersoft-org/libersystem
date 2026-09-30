@@ -37,6 +37,9 @@ mod tests;
 /// PC Client TPM's maximum is 4096; nothing an operation here sends or expects comes near either.
 pub const MAX_MESSAGE: usize = 3968;
 
+/// Startup and Shutdown types: CLEAR starts afresh, STATE saves and restores the state a sleep must keep.
+pub const SU_CLEAR: u16 = 0x0000;
+pub const SU_STATE: u16 = 0x0001;
 /// Structure tags.
 pub const ST_NO_SESSIONS: u16 = 0x8001;
 pub const ST_SESSIONS: u16 = 0x8002;
@@ -50,6 +53,7 @@ pub const CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
 pub const CC_CREATE_PRIMARY: u32 = 0x131;
 pub const CC_SELF_TEST: u32 = 0x143;
 pub const CC_STARTUP: u32 = 0x144;
+pub const CC_SHUTDOWN: u32 = 0x145;
 pub const CC_CREATE: u32 = 0x153;
 pub const CC_LOAD: u32 = 0x157;
 pub const CC_QUOTE: u32 = 0x158;

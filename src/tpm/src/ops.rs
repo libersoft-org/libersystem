@@ -246,7 +246,35 @@ impl<T: Transport> Tpm<T> {
 	/// Startup(CLEAR). A TPM that has already started says so, and that is what the caller wanted.
 	pub fn startup(&mut self) -> Result<(), Error> {
 		let mut writer = Writer::command(ST_NO_SESSIONS, CC_STARTUP);
-		writer.u16(0x0000);
+		writer.u16(SU_CLEAR);
+		match self.run(writer, SHORT_MS) {
+			Ok(_) | Err(Error::Tpm(RC_INITIALIZE)) => Ok(()),
+			Err(error) => Err(error),
+		}
+	}
+
+	/// SHUTDOWN(STATE), BEFORE A SLEEP THAT CUTS THE TPM'S POWER: the TPM saves what a Startup(STATE) restores, so the
+	/// firmware's Startup(STATE) at the wake finds its PCRs as they were. Without it that Startup fails, the firmware falls
+	/// back to Startup(CLEAR) and extends an error separator into PCRs 0 to 7.
+	pub fn shutdown_state(&mut self) -> Result<(), Error> {
+		let mut writer = Writer::command(ST_NO_SESSIONS, CC_SHUTDOWN);
+		writer.u16(SU_STATE);
+		self.run(writer, SHORT_MS).map(|_| ())
+	}
+
+	/// WHETHER THE TPM HAS STARTED, asked without starting it: before Startup every command is answered INITIALIZE.
+	pub fn started(&mut self) -> Result<bool, Error> {
+		match self.get_capability(CAP_TPM_PROPERTIES, PT_MANUFACTURER, 1) {
+			Ok(_) => Ok(true),
+			Err(Error::Tpm(RC_INITIALIZE)) => Ok(false),
+			Err(error) => Err(error),
+		}
+	}
+
+	/// Startup(STATE), after a sleep the firmware did not start the TPM from: what Shutdown(STATE) saved is restored.
+	pub fn startup_state(&mut self) -> Result<(), Error> {
+		let mut writer = Writer::command(ST_NO_SESSIONS, CC_STARTUP);
+		writer.u16(SU_STATE);
 		match self.run(writer, SHORT_MS) {
 			Ok(_) | Err(Error::Tpm(RC_INITIALIZE)) => Ok(()),
 			Err(error) => Err(error),

@@ -108,9 +108,7 @@ pub enum Owner {
 	Kernel,
 	// A driver, through the claim of this generation.
 	Driver(u64),
-	// The sleep entry's loan of a driver's UART to the kernel, for the claim of this generation. Only the
-	// suite lends it until P02M0197b's sleep entry lands - see `sleep_begin`.
-	#[cfg(test)]
+	// The sleep entry's loan of a driver's UART to the kernel, for the claim of this generation - see `sleep_begin`.
 	Sleep(u64),
 	// The terminal-path writer's, never left.
 	Terminal,
@@ -121,7 +119,6 @@ impl Owner {
 	fn claim(self) -> Option<u64> {
 		match self {
 			Owner::Driver(generation) => Some(generation),
-			#[cfg(test)]
 			Owner::Sleep(generation) => Some(generation),
 			Owner::Kernel | Owner::Terminal => None,
 		}
@@ -360,7 +357,6 @@ impl Uart {
 		inner.lost = false;
 		match inner.owner {
 			Owner::Kernel => self.boot_init(Path::Sleep, self.receive.load(Ordering::Relaxed)),
-			#[cfg(test)]
 			Owner::Sleep(_) => self.boot_init(Path::Sleep, false),
 			Owner::Driver(_) | Owner::Terminal => {}
 		}
@@ -376,7 +372,6 @@ impl Uart {
 		let mut inner = self.inner.lock();
 		match inner.owner {
 			Owner::Terminal => self.put_sync(Path::Terminal, byte),
-			#[cfg(test)]
 			Owner::Sleep(_) => {
 				self.restore_after_sleep(&mut inner);
 				self.put_sync(Path::Sleep, byte);
@@ -428,7 +423,6 @@ impl Uart {
 			let inner = self.inner.lock();
 			match inner.owner {
 				Owner::Terminal => true,
-				#[cfg(test)]
 				Owner::Sleep(_) => true,
 				Owner::Kernel => inner.window || !ASYNC.load(Ordering::Acquire),
 				Owner::Driver(_) => false,
@@ -525,7 +519,6 @@ impl Uart {
 				Owner::Kernel => inner.ring.len != 0,
 				Owner::Driver(_) => inner.signal_due,
 				Owner::Terminal => false,
-				#[cfg(test)]
 				Owner::Sleep(_) => false,
 			},
 		}
@@ -765,9 +758,7 @@ impl Uart {
 	// its port range, its line and its tap are untouched throughout, and nothing the entry does is counted
 	// against the driver's hold, since the owner is not DRIVER while it is done.
 	//
-	// P02M0197b's kernel sleep entry is the production caller, and wiring it is that item's; until it lands
-	// the kernel always owns COM1 when nothing sleeps, and the suite is the caller.
-	#[cfg(test)]
+	// The kernel's sleep entry is the production caller (`crate::sleep`), and the suite the other.
 	pub fn sleep_begin(&self) {
 		let mut inner = self.inner.lock();
 		match inner.owner {
@@ -795,7 +786,6 @@ impl Uart {
 	// machine, a suspend to idle resets nothing. When it did, the boot initialisation runs again before the
 	// next line's first byte, with the receive interrupt enabled while the kernel owns the UART and left off
 	// while it is lent.
-	#[cfg(test)]
 	pub fn sleep_wake(&self, lost_settings: bool) {
 		let mut inner = self.inner.lock();
 		if lost_settings && matches!(inner.owner, Owner::Kernel | Owner::Sleep(_)) {
@@ -805,7 +795,6 @@ impl Uart {
 
 	// THE ENTRY'S LAST ACT: the window closes, and a lent UART goes back to its driver - later lines queue
 	// for the tap again.
-	#[cfg(test)]
 	pub fn sleep_end(&self) {
 		let mut inner = self.inner.lock();
 		self.restore_after_sleep(&mut inner);
@@ -1013,6 +1002,19 @@ fn instance(base: u64) -> Option<&'static Uart> {
 		return Some(&COM2);
 	}
 	None
+}
+
+// THE SLEEP ENTRY'S WINDOW ON THE CONSOLE UART - see `Uart::sleep_begin`.
+pub fn sleep_begin() {
+	COM1.sleep_begin();
+}
+
+pub fn sleep_wake(lost_settings: bool) {
+	COM1.sleep_wake(lost_settings);
+}
+
+pub fn sleep_end() {
+	COM1.sleep_end();
 }
 
 pub fn console_hand_over(base: u64, row: usize, generation: u64) -> bool {

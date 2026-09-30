@@ -104,6 +104,8 @@ struct Provider<'a, T: Timer> {
 	timer: &'a mut T,
 	// The consumer has petted, armed or disarmed: the bridge is over.
 	consumer_acted: bool,
+	// The timeout the timer runs with while it is armed, None while it is not.
+	armed_ms: Option<u32>,
 }
 
 impl<T: Timer> watchdog::Service for Provider<'_, T> {
@@ -115,6 +117,9 @@ impl<T: Timer> watchdog::Service for Provider<'_, T> {
 	fn arm(&mut self, timeout_ms: u32) -> Result<u32, Error> {
 		let armed = self.timer.arm(timeout_ms);
 		self.consumer_acted |= armed.is_ok();
+		if let Ok(effective) = armed {
+			self.armed_ms = Some(effective);
+		}
 		armed
 	}
 
@@ -126,7 +131,71 @@ impl<T: Timer> watchdog::Service for Provider<'_, T> {
 	fn disarm(&mut self) -> Result<(), Error> {
 		let disarmed = self.timer.disarm();
 		self.consumer_acted |= disarmed.is_ok();
+		if disarmed.is_ok() {
+			self.armed_ms = None;
+		}
 		disarmed
+	}
+}
+
+// THE WATCHDOG'S STEP IN A SLEEP. This binding publishes a `watchdog`, so it is the LAST suspended and the FIRST resumed.
+// A timer that is not armed is left alone - a timeout set on it would start it. An armed one is disarmed where the
+// device allows it; otherwise it is set to its longest timeout and petted a last time, and the step answers that
+// timeout as the latest the machine must be awake by - unless the device stops counting in the state asked for, when
+// there is no bound. The resume arms it again with the timeout it had, which catches a resume that hangs until the
+// watchdog service restores its own; one that was not armed is disarmed again, since a device that lost its power may
+// come back counting.
+struct Sleep<'a, 'b, T: Timer> {
+	provider: &'a mut Provider<'b, T>,
+	serving: &'a mut common::Serving,
+	// The timeout the timer ran with before the sleep, None for one that was not armed.
+	slept_ms: Option<u32>,
+}
+
+impl<T: Timer> common::SleepStep for Sleep<'_, '_, T> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let done = |awake_by_ms: u64| driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms };
+		self.slept_ms = self.provider.armed_ms;
+		if self.slept_ms.is_none() {
+			return done(0);
+		}
+		let described = self.provider.timer.describe();
+		if described.can_disarm && self.provider.timer.disarm().is_ok() {
+			print(b"driver.watchdog: disarmed for the sleep\n");
+			return done(0);
+		}
+		let longest = match self.provider.timer.arm(described.max_timeout_ms) {
+			Ok(longest) if self.provider.timer.pet().is_ok() => longest,
+			_ => {
+				print(b"driver.watchdog: the sleep is refused - the timer can neither be disarmed nor set to its longest timeout\n");
+				return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+			}
+		};
+		let stops = if request.state.loses_power() { described.stops_in_s3 } else { described.stops_in_suspend_to_idle };
+		if stops {
+			print(b"driver.watchdog: it cannot be disarmed, and it stops counting in this sleep - no bound\n");
+			done(0)
+		} else {
+			print(b"driver.watchdog: it cannot be disarmed - set to its longest timeout, which bounds the sleep\n");
+			done(u64::from(longest))
+		}
+	}
+
+	fn resume(&mut self, _lost_power: bool) -> bool {
+		match self.slept_ms.take() {
+			Some(timeout) => match self.provider.timer.arm(timeout) {
+				Ok(_) => print(b"driver.watchdog: armed again after the sleep\n"),
+				Err(_) => print(b"driver.watchdog: it did not take its arm again after the sleep\n"),
+			},
+			None => {
+				let _ = self.provider.timer.disarm();
+			}
+		}
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
 	}
 }
 
@@ -141,7 +210,10 @@ pub fn serve<T: Timer>(bootstrap: u64, bind: &common::Bind, report: &[u8], name:
 		exit();
 	}
 	let mut serving = common::Serving::from_offers(&[(0, mine)]);
-	let mut provider = Provider { timer, consumer_acted: false };
+	// A TIMER FOUND RUNNING is armed as far as a sleep is concerned, at a timeout its bind did not choose: its longest.
+	let found = if bridge { Some(timer.describe().max_timeout_ms) } else { None };
+	let mut provider = Provider { timer, consumer_acted: false, armed_ms: found };
+	common::takes_sleep();
 	// THE BRIDGE'S CLOCK: a timer object woken once a second while it lasts.
 	let bridge_until = if bridge { clock() + BRIDGE_TICKS } else { 0 };
 	let alarm = timer_create();
@@ -159,15 +231,23 @@ pub fn serve<T: Timer>(bootstrap: u64, bind: &common::Bind, report: &[u8], name:
 			timer_set(alarm, next_pet.min(bridge_until));
 		}
 		let devices: &[u64] = if bridging && alarm != 0 { core::slice::from_ref(&alarm) } else { &[] };
-		match common::wait_providers(bootstrap, bind, &mut serving, devices, true) {
+		match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, devices, true) {
 			None => {
 				if common::stop_requested() {
 					common::finish_stop(bootstrap, bind, device, true);
 				}
 				exit();
 			}
-			Some(common::ProviderReady::Connected(_)) | Some(common::ProviderReady::Device(_)) => {}
-			Some(common::ProviderReady::Consumer(index)) => {
+			Some(None) => {
+				if !common::take_sleep_step(bootstrap, bind, &mut Sleep { provider: &mut provider, serving: &mut serving, slept_ms: None }) {
+					if common::stop_requested() {
+						common::finish_stop(bootstrap, bind, device, true);
+					}
+					exit();
+				}
+			}
+			Some(Some(common::ProviderReady::Connected(_))) | Some(Some(common::ProviderReady::Device(_))) => {}
+			Some(Some(common::ProviderReady::Consumer(index))) => {
 				let Some((len, handle)) = common::recv_from_consumer(bootstrap, bind, &mut serving, index, &mut buf) else { continue };
 				if handle != 0 {
 					close(handle);

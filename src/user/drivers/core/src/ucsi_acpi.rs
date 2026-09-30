@@ -22,6 +22,11 @@
 // RECOVERY. A command or an acknowledgement not completed within ten seconds is a silent PPM: every connector is
 // reported as not answering, the PPM is reset and configured and every connector read again. Two failed resets in a
 // row end the binding with a driver-reported failure, and DeviceManager's restart policy takes over.
+//
+// THE SLEEP. A `SUSPEND` arriving while a command waits is held until that command completes within its ten-second
+// bound; then no command is sent until `RESUME`. The resume reports every connector as not answering, enables the
+// notifications again - a PPM that lost its power lost them - and reads every connector again, each answering again
+// as it is read; a PPM that does not answer is recovered as above.
 
 #![no_std]
 #![no_main]
@@ -221,6 +226,23 @@ impl Ucsi {
 		self.changes.clear();
 		for at in 0..self.ports.len() {
 			self.read_port(at, false)?;
+		}
+		Ok(())
+	}
+
+	// BACK FROM A SLEEP: see the head of this file.
+	fn wake(&mut self) -> Result<(), Failure> {
+		// Whatever the PPM said while the machine slept is read again below, as a whole.
+		let mut buf = [0u8; 64];
+		while self.notify != 0 && matches!(try_recv_caps(self.notify, &mut buf), PolledCaps::Message { .. }) {}
+		match self.run(command::set_notification_enable(command::NOTIFY_ALL), false)?.completion {
+			Completion::Answered(_) => {}
+			_ => return Err(Failure::Malformed),
+		}
+		self.changes.clear();
+		for at in 0..self.ports.len() {
+			self.read_port(at, false)?;
+			self.publish_port(at);
 		}
 		Ok(())
 	}
@@ -560,6 +582,30 @@ impl Ucsi {
 	}
 }
 
+// THE SLEEP - see the head of this file. `SUSPEND` reaches this only between commands.
+impl common::SleepStep for Ucsi {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		self.say("suspended - no command is sent until the resume");
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, _lost_power: bool) -> bool {
+		for port in self.ports.iter_mut() {
+			port.answering = false;
+		}
+		self.publish();
+		match self.wake() {
+			Ok(()) => self.say("resumed - notifications enabled again and every connector read again"),
+			Err(failure) => self.recover(failure),
+		}
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(&mut self.serving)
+	}
+}
+
 // THE PPM AS THE DISCIPLINE REACHES IT.
 impl Ppm for Ucsi {
 	fn send(&mut self, control: u64, message_out: &[u8]) -> Result<(), Failure> {
@@ -828,7 +874,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 	ucsi.say(&format!("publishes typec-connector{}", if sinks { " and power-source" } else { "" }));
+	common::takes_sleep();
 	loop {
+		// THE SLEEP, between commands - a `SUSPEND` a command's wait took is held until that command completed.
+		let (bootstrap, bind) = (ucsi.bootstrap, ucsi.bind);
+		if !common::take_sleep_step(bootstrap, &bind, &mut ucsi) {
+			if common::stop_requested() {
+				common::finish_stop(ucsi.bootstrap, &ucsi.bind, 0, true);
+			}
+			exit();
+		}
 		// A node handed again - the ACPI service restarted - is taken, and its notifications with it.
 		if let Some(fresh) = common::fresh_node()
 			&& fresh != 0
@@ -846,16 +901,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		}
 		let devices: Vec<u64> = if ucsi.notify != 0 { alloc::vec![ucsi.notify] } else { Vec::new() };
-		match common::wait_providers_or_answer(ucsi.bootstrap, &ucsi.bind, &mut ucsi.serving, &devices) {
+		match common::wait_providers_until(ucsi.bootstrap, &ucsi.bind, &mut ucsi.serving, &devices, 0) {
 			None => {
 				if common::stop_requested() {
 					common::finish_stop(ucsi.bootstrap, &ucsi.bind, 0, true);
 				}
 				exit();
 			}
-			Some(common::ProviderReady::Connected(_)) => {}
-			Some(common::ProviderReady::Device(_)) => ucsi.on_notify(),
-			Some(common::ProviderReady::Consumer(index)) => {
+			// The sleep's `SUSPEND`, taken at the top of the loop.
+			Some(None) | Some(Some(common::ProviderReady::Connected(_))) => {}
+			Some(Some(common::ProviderReady::Device(_))) => ucsi.on_notify(),
+			Some(Some(common::ProviderReady::Consumer(index))) => {
 				if !serve(&mut ucsi, index) {
 					let token = ucsi.serving.close_at(index);
 					if token == TOKEN_TYPEC && ucsi.typec_stream != 0 {

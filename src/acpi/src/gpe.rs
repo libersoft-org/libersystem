@@ -200,6 +200,28 @@ impl Gpes {
 		Ok(())
 	}
 
+	/// THE SLEEP PATH'S PART, AT THE ENTRY: the enable registers hold the wake mask alone - every runtime enable off -
+	/// and a wake event's stale status is acknowledged first, so an old assertion does not end the sleep at once.
+	pub fn enter_sleep(&mut self, registers: &mut dyn Registers) {
+		for gpe in 0..self.count {
+			if self.wake[gpe] && !self.stormed[gpe] {
+				if let Some((block, byte, bit)) = self.locate(gpe as u16) {
+					registers.write(block, byte, 1 << bit);
+				}
+				self.set_enable(registers, gpe as u16, true);
+			} else {
+				self.set_enable(registers, gpe as u16, false);
+			}
+		}
+	}
+
+	/// AND AT THE RESUME: the runtime mask as it was, an event latched meanwhile left masked for the service to take.
+	pub fn leave_sleep(&mut self, registers: &mut dyn Registers) {
+		for gpe in 0..self.count {
+			self.set_enable(registers, gpe as u16, self.runtime[gpe] && !self.latched[gpe] && !self.stormed[gpe]);
+		}
+	}
+
 	/// THE INSTANCE THAT ENABLED THEM IS GONE: every runtime enable cleared in the register and in the mask, and every
 	/// latch dropped - the next instance enables what its namespace handles. A stormed event stays stormed, and the
 	/// wake mask stays as the sleep path armed it.
@@ -384,5 +406,27 @@ mod tests {
 		gpes.set_wake(0x03, false).unwrap();
 		assert_eq!(gpes.wake_armed(), vec![0x22]);
 		assert_eq!(gpes.set_wake(0x40, true), Err(Refusal::NoSuchEvent));
+	}
+
+	#[test]
+	fn a_sleep_enables_the_wake_mask_alone_and_the_resume_gives_the_runtime_mask_back() {
+		let (mut gpes, mut blocks) = setup();
+		gpes.set_runtime(&mut blocks, 0x01, true).unwrap();
+		gpes.set_runtime(&mut blocks, 0x21, true).unwrap();
+		gpes.set_wake(0x0A, true).unwrap();
+		// A stale assertion of the wake event, from before the sleep.
+		blocks.assert_event(0, 1, 2);
+		gpes.enter_sleep(&mut blocks);
+		assert_eq!((blocks.enable(0, 0), blocks.enable(0, 1), blocks.enable(1, 0)), (0, 1 << 2, 0), "the wake event enabled, every runtime one off");
+		assert_eq!(blocks.bytes[0][1] & (1 << 2), 0, "its stale status acknowledged");
+		gpes.leave_sleep(&mut blocks);
+		assert_eq!((blocks.enable(0, 0), blocks.enable(0, 1), blocks.enable(1, 0)), (1 << 1, 0, 1 << 1), "the runtime mask back, the wake event off");
+		// AN EVENT LATCHED BEFORE THE SLEEP STAYS MASKED for the service to take.
+		blocks.assert_event(0, 0, 1);
+		let (delivered, _) = gpes.handle(&mut blocks, 0);
+		assert_eq!(delivered, vec![0x01]);
+		gpes.enter_sleep(&mut blocks);
+		gpes.leave_sleep(&mut blocks);
+		assert_eq!(blocks.enable(0, 0), 0, "latched, not re-enabled by the resume");
 	}
 }

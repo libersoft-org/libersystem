@@ -154,6 +154,11 @@ fn property_integer(block: &[u8], wanted: &[u8]) -> Option<u64> {
 
 // ON AN ACPI MACHINE, native hot-plug and error reporting wait for `_OSC`. Before the first scan; the test kernel
 // keeps native control, as its fixtures are the bus's own.
+// THE SLEEP-TYPE REGISTRATION REFUSED, on a development boot whose switch says so - soft-off's fallback half.
+pub fn sleep_registration_refused() -> bool {
+	crate::arch::absent_named(b"sleep-types")
+}
+
 pub fn init() {
 	if !cfg!(test) && crate::arch::firmware::available() {
 		crate::arch::pci::gate_on_osc();

@@ -184,8 +184,48 @@ pub fn unmask(gsi: u32) {
 	}
 }
 
-// Whether `gsi`'s redirection entry is unmasked - for the suite, which checks that a release silenced a line.
-#[cfg(test)]
+// Whether `gsi`'s redirection entry is unmasked - for the suite, which checks that a release silenced a line, and for
+// the sleep entry, which masks what is live and unmasks the same after.
 pub fn unmasked(gsi: u32) -> bool {
 	locate(gsi).is_some_and(|(base, pin)| read(base, REG_REDTBL + 2 * pin) & MASKED == 0)
+}
+
+// ------------------------------------------------------------------ across S3
+
+// EVERY REDIRECTION ENTRY OF EVERY CONTROLLER, as the kernel left it, taken before an S3 - which resets them with the
+// machine - and written back at the resume: the high dword first, while the low dword still holds the reset's mask.
+static SAVED: crate::sync::SpinLock<alloc::vec::Vec<(usize, u32, u32, u32)>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
+pub fn save_all() {
+	let mut saved = SAVED.lock();
+	saved.clear();
+	for slot in 0..MAX_IOAPICS {
+		let base = BASES[slot].load(Ordering::Acquire);
+		if base == 0 {
+			continue;
+		}
+		for pin in 0..PINS[slot].load(Ordering::Relaxed) {
+			let lo = REG_REDTBL + 2 * pin;
+			// ALLOC-OK: the S3 entry, before the machine sleeps - a machine that cannot hold its interrupt routing
+			// in memory is refused the sleep rather than resumed without it.
+			if saved.try_reserve(1).is_err() {
+				return;
+			}
+			saved.push((slot, pin, read(base, lo), read(base, lo + 1)));
+		}
+	}
+}
+
+pub fn restore_all() {
+	let saved = SAVED.lock();
+	for &(slot, pin, low, high) in saved.iter() {
+		let base = BASES[slot].load(Ordering::Acquire);
+		if base == 0 {
+			continue;
+		}
+		let lo = REG_REDTBL + 2 * pin;
+		write(base, lo, read(base, lo) | MASKED);
+		write(base, lo + 1, high);
+		write(base, lo, low);
+	}
 }

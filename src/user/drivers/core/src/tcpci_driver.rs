@@ -21,6 +21,11 @@
 //
 // ON STOP, the port is left as it is - the sink path among it - since a stop for a lost controller cannot reach it
 // anyway, and the next bind reads the port afresh as above.
+//
+// THE SLEEP IS REFUSED WHILE THE SINK PATH IS ENABLED, naming the connector: a sink path nobody watches is one no alarm
+// turns off. With no partner - or one the sink path is not on for - the port suspends with the sink path off and the
+// alert unwatched, and its resume reads the port afresh, as a bind does: a charger attached in the sleep finds the sink
+// path off, and the contract is made after the resume.
 
 #![no_std]
 #![no_main]
@@ -109,6 +114,8 @@ struct Port {
 	power_seq: u32,
 	published: Option<SourceState>,
 	buf: Vec<u8>,
+	// What the board describes, kept for the engine a resume starts again.
+	sink: Sink,
 }
 
 fn say(name: &str, text: &str) {
@@ -141,7 +148,16 @@ impl Port {
 	// A TRANSFER THAT FAILED: a lost controller brings a stop, which is waited for briefly and taken; otherwise the
 	// controller stopped answering, and the binding fails.
 	fn lost(&mut self, what: &str, error: BusError) -> ! {
-		if common::wait_or_answer_until(self.bootstrap, &self.bind, &[], clock() + LOST_TICKS, Some(&mut self.serving)).is_none() || common::stop_requested() {
+		let deadline = clock() + LOST_TICKS;
+		loop {
+			match common::wait_or_answer_until(self.bootstrap, &self.bind, &[], deadline, Some(&mut self.serving)) {
+				None => self.stop(),
+				// A `SUSPEND` handed back is not the stop being waited for, nor the end of the wait.
+				Some(None) if clock() < deadline => {}
+				_ => break,
+			}
+		}
+		if common::stop_requested() {
 			self.stop();
 		}
 		self.say(&format!("the controller did not answer ({what}: {error:?})"));
@@ -512,6 +528,68 @@ impl Port {
 		common::finish_stop(self.bootstrap, &self.bind, 0, true);
 		exit()
 	}
+
+	// THE REGISTERS, alerts masked while they are set - at the bind, and again at a resume.
+	fn configure(&mut self) {
+		self.write16(tcpci::ALERT_MASK, 0);
+		self.write16(tcpci::ALERT, 0xFFFF);
+		self.write8(tcpci::FAULT_STATUS, 0xFF);
+		if self.read8(tcpci::ROLE_CONTROL) != tcpci::ROLE_SINK {
+			self.write8(tcpci::ROLE_CONTROL, tcpci::ROLE_SINK);
+		}
+		let control = self.read8(tcpci::POWER_CONTROL);
+		self.power_control = if self.measures { (control & !tcpci::POWER_DISABLE_MONITORING) | tcpci::POWER_DISABLE_ALARMS } else { control | tcpci::POWER_DISABLE_ALARMS };
+		let control = self.power_control;
+		self.write8(tcpci::POWER_CONTROL, control);
+		self.write8(tcpci::COMMAND, tcpci::COMMAND_ENABLE_VBUS_DETECT);
+		self.write8(tcpci::POWER_STATUS_MASK, tcpci::POWER_VBUS_PRESENT);
+		self.header = tcpci::header_info(2);
+		let header = self.header;
+		self.write8(tcpci::MESSAGE_HEADER_INFO, header);
+		self.write8(tcpci::RECEIVE_DETECT, 0);
+		self.write16(tcpci::ALERT_MASK, tcpci::ALERT_ALL);
+	}
+
+	// THE PORT AS FOUND, told to an engine that starts from nothing: a bind's, and a resume's. VBUS present trusts no
+	// contract this engine did not see made.
+	fn bind_afresh(&mut self) {
+		self.engine = Engine::new(self.sink.clone());
+		self.deadlines = [0; TIMERS.len()];
+		self.cc_status = self.read8(tcpci::CC_STATUS);
+		let status = self.read8(tcpci::POWER_STATUS);
+		let (cc, vbus, sinking) = (tcpci::cc(self.cc_status), status & tcpci::POWER_VBUS_PRESENT != 0, status & tcpci::POWER_SINKING_VBUS != 0);
+		if vbus && matches!(cc, usb_pd::engine::Cc::Rp(_)) {
+			self.say(&format!("bound with VBUS present and the sink path {} - no contract is trusted{}", if sinking { "on" } else { "off" }, if self.runs_pd { "; it is negotiated anew through Soft_Reset" } else { "" }));
+		}
+		self.event(Event::Bound { cc, vbus, sinking });
+	}
+}
+
+// THE SLEEP - see the head of this file.
+impl common::SleepStep for Port {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if self.read8(tcpci::POWER_STATUS) & tcpci::POWER_SINKING_VBUS != 0 {
+			self.say(&format!("the sleep is refused: connector {CONNECTOR} has its sink path enabled, and a sink path left unwatched is one no alarm can turn off"));
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::Busy), awake_by_ms: 0 };
+		}
+		self.write8(tcpci::COMMAND, tcpci::COMMAND_DISABLE_SINK_VBUS);
+		self.write8(tcpci::RECEIVE_DETECT, 0);
+		self.write16(tcpci::ALERT_MASK, 0);
+		self.deadlines = [0; TIMERS.len()];
+		self.say(&format!("suspended - connector {CONNECTOR}'s sink path is off and its alert unwatched until the resume"));
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, _lost_power: bool) -> bool {
+		self.say("resumed - the port is read afresh, as a bind reads it");
+		self.configure();
+		self.bind_afresh();
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(&mut self.serving)
+	}
 }
 
 // ------------------------------------------------------------------ the two publications' views
@@ -683,7 +761,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(why) => say(&name, &format!("{why} - it runs no Power Delivery and sinks at the Type-C current only")),
 	}
 	let said = Engine::new(Sink { pdos: Vec::new(), operational_microwatts: 0 }).report();
-	let mut port = Port { name, bootstrap, bind, bus, address, line, events, engine: Engine::new(sink), runs_pd, measures: false, deadlines: [0; TIMERS.len()], cc_status: 0, header: 0, power_control: 0, last_refusal: None, said, said_contract: None, said_transition: None, dirty: false, serving: common::Serving::from_offers(&[]), revision: 1, typec_stream: 0, typec_seq: 0, power_revision: 1, power_stream: 0, power_seq: 0, published: None, buf: alloc::vec![0u8; 8192] };
+	let kept = sink.clone();
+	let mut port = Port { name, bootstrap, bind, bus, address, line, events, engine: Engine::new(sink), runs_pd, measures: false, deadlines: [0; TIMERS.len()], cc_status: 0, header: 0, power_control: 0, last_refusal: None, said, said_contract: None, said_transition: None, dirty: false, serving: common::Serving::from_offers(&[]), revision: 1, typec_stream: 0, typec_seq: 0, power_revision: 1, power_stream: 0, power_seq: 0, published: None, buf: alloc::vec![0u8; 8192], sink: kept };
 	// THE CONTROLLER: who it is, its initialisation awaited, and what it can do.
 	let (vendor, product, tc, pd) = (port.read16(tcpci::VENDOR_ID), port.read16(tcpci::PRODUCT_ID), port.read16(tcpci::TC_REVISION), port.read16(tcpci::PD_REVISION));
 	let started = clock();
@@ -703,28 +782,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	port.measures = capabilities & tcpci::CAPABILITY_VBUS_MEASUREMENT != 0;
 	port.say(&format!("controller {vendor:04x}:{product:04x}, Type-C revision {tc:#06x}, Power Delivery revision {pd:#06x}{}", if port.measures { ", VBUS measured with alarms" } else { ", VBUS not measured" }));
-	// THE REGISTERS, alerts masked while they are set.
-	port.write16(tcpci::ALERT_MASK, 0);
-	port.write16(tcpci::ALERT, 0xFFFF);
-	port.write8(tcpci::FAULT_STATUS, 0xFF);
-	if port.read8(tcpci::ROLE_CONTROL) != tcpci::ROLE_SINK {
-		port.write8(tcpci::ROLE_CONTROL, tcpci::ROLE_SINK);
-	}
-	let control = port.read8(tcpci::POWER_CONTROL);
-	port.power_control = if port.measures { (control & !tcpci::POWER_DISABLE_MONITORING) | tcpci::POWER_DISABLE_ALARMS } else { control | tcpci::POWER_DISABLE_ALARMS };
-	let control = port.power_control;
-	port.write8(tcpci::POWER_CONTROL, control);
-	port.write8(tcpci::COMMAND, tcpci::COMMAND_ENABLE_VBUS_DETECT);
-	port.write8(tcpci::POWER_STATUS_MASK, tcpci::POWER_VBUS_PRESENT);
-	port.header = tcpci::header_info(2);
-	let header = port.header;
-	port.write8(tcpci::MESSAGE_HEADER_INFO, header);
-	port.write8(tcpci::RECEIVE_DETECT, 0);
-	port.write16(tcpci::ALERT_MASK, tcpci::ALERT_ALL);
-	// THE PORT AS FOUND.
-	port.cc_status = port.read8(tcpci::CC_STATUS);
-	let status = port.read8(tcpci::POWER_STATUS);
-	let (cc, vbus, sinking) = (tcpci::cc(port.cc_status), status & tcpci::POWER_VBUS_PRESENT != 0, status & tcpci::POWER_SINKING_VBUS != 0);
+	port.configure();
 	// THE PUBLICATIONS FIRST, before the engine starts: a negotiation the bind begins must not wait on the offers -
 	// a source runs its SenderResponseTimer from its capabilities, and the offers are the manager's to answer.
 	let mut ends: Vec<(u16, u64)> = Vec::new();
@@ -744,17 +802,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 	port.say("publishes typec-connector and power-source");
-	if vbus && matches!(cc, usb_pd::engine::Cc::Rp(_)) {
-		port.say(&format!("bound with VBUS present and the sink path {} - no contract is trusted{}", if sinking { "on" } else { "off" }, if runs_pd { "; it is negotiated anew through Soft_Reset" } else { "" }));
-	}
-	port.event(Event::Bound { cc, vbus, sinking });
+	// THE PORT AS FOUND.
+	port.bind_afresh();
+	common::takes_sleep();
 	// THE LOOP: the alert, the timers and the consumers.
 	loop {
 		let deadline = port.next_deadline();
 		let events = port.events;
 		match common::wait_providers_until(port.bootstrap, &port.bind, &mut port.serving, &[events], deadline) {
 			None => port.stop(),
-			Some(None) => port.expire(),
+			// A TIMER, or the sleep's `SUSPEND` handed back.
+			Some(None) => {
+				let (bootstrap, bind) = (port.bootstrap, port.bind);
+				if !common::take_sleep_step(bootstrap, &bind, &mut port) {
+					port.stop();
+				}
+				port.expire();
+			}
 			Some(Some(common::ProviderReady::Connected(_))) => {}
 			Some(Some(common::ProviderReady::Device(_))) => {
 				if !port.drain_events() {

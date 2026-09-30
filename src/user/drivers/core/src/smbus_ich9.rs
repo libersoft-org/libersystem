@@ -14,6 +14,10 @@
 // for the claim, without which the base decodes nothing, and restores HOSTC at the release. EVERY TRANSACTION POLLS the
 // host status register - no interrupt, no SMBus alert - within `TRANSACTION_TICKS`, and one still busy then is killed.
 // Idle, it touches no register at all: it binds on every q35 boot, since QEMU always has the function.
+//
+// THE SLEEP: a transfer is never in flight where a `SUSPEND` is read, and no register is touched until `RESUME`. The
+// resume finds the base decoding again - the kernel writes HOSTC again for the claim after an S3 - and clears whatever
+// status the reset left.
 
 #![no_std]
 #![no_main]
@@ -71,6 +75,32 @@ mod smbus {
 		base: u16,
 		// Each admitted connection and the address it reaches.
 		held: Vec<(u64, u8)>,
+	}
+
+	// THE SLEEP - see the head of this file.
+	struct Sleep<'a> {
+		controller: &'a Controller,
+		serving: &'a mut common::Serving,
+	}
+
+	impl common::SleepStep for Sleep<'_> {
+		fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+			driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+		}
+
+		fn resume(&mut self, _lost_power: bool) -> bool {
+			if self.controller.inb(HST_STS) == 0xFF && self.controller.inb(AUX_CTL) == 0xFF {
+				print(b"driver.smbus-ich9: its SMBus base decodes nothing after the sleep\n");
+				return false;
+			}
+			self.controller.outb(HST_STS, STS_CLEAR);
+			self.controller.outb(AUX_STS, AUX_STS_CRCE);
+			true
+		}
+
+		fn serving(&mut self) -> Option<&mut common::Serving> {
+			Some(self.serving)
+		}
 	}
 
 	fn reply(status: I2cStatus, bytes: Vec<u8>) -> I2cReply {
@@ -346,15 +376,24 @@ mod smbus {
 		close(near);
 		let mut serving = common::Serving::from_offers(&[(BUS_TOKEN, 0)]);
 		let mut buf = alloc::vec![0u8; 512];
+		common::takes_sleep();
 		loop {
-			match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, &[]) {
+			match common::wait_providers_until(bootstrap, &bind, &mut serving, &[], 0) {
 				None => {
 					if common::stop_requested() {
 						common::finish_stop(bootstrap, &bind, 0, true);
 					}
 					exit();
 				}
-				Some(common::ProviderReady::Connected(index)) => {
+				Some(None) => {
+					if !common::take_sleep_step(bootstrap, &bind, &mut Sleep { controller: &controller, serving: &mut serving }) {
+						if common::stop_requested() {
+							common::finish_stop(bootstrap, &bind, 0, true);
+						}
+						exit();
+					}
+				}
+				Some(Some(common::ProviderReady::Connected(index))) => {
 					let channel = serving.at(index);
 					let admitted = match serving.scope_at(index) {
 						driver_protocol::Scope::I2cAddress(address) if !controller.held.iter().any(|(_, held)| *held == address) => {
@@ -374,12 +413,12 @@ mod smbus {
 						exit();
 					}
 				}
-				Some(common::ProviderReady::Consumer(index)) => {
+				Some(Some(common::ProviderReady::Consumer(index))) => {
 					if !serve(&mut controller, &serving, index, &mut buf) && !part(&mut controller, &mut serving, bootstrap, &bind, index) {
 						exit();
 					}
 				}
-				Some(common::ProviderReady::Device(_)) => {}
+				Some(Some(common::ProviderReady::Device(_))) => {}
 			}
 		}
 	}

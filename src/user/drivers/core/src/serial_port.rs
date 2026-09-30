@@ -436,6 +436,22 @@ impl<'a> Stream<'a> {
 		}
 	}
 
+	// BACK FROM A SLEEP THAT RESET THE DEVICE, between `Virtio::restore` and `driver_ok`: both queues pointed at their
+	// rings again, emptied, and the receive pool posted again. A transmit in flight when the device stopped went with
+	// it, so the buffer is free; what the attached consumer was told stands.
+	pub fn rearm(&mut self) -> bool {
+		let device = self.port.device;
+		if !self.rx.restore(device) || !self.port.tx.restore(device) {
+			return false;
+		}
+		for id in 0..RX_SLOTS {
+			self.rx.post_recv(id, self.rx_phys[id as usize], RX_SLOT as u32);
+		}
+		self.rx.notify();
+		self.port.busy = false;
+		true
+	}
+
 	// The device capability behind this port's queues, which is what `finish_stop` hands to the
 	// kernel so the frames and masked vectors this binding held can be reclaimed.
 	pub fn capability(&self) -> u64 {

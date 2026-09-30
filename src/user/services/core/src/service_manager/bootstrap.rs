@@ -970,7 +970,9 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 				}
 				b"config_service" => *config_client = kept.end_of(name, CAP_SERVE),
 				b"resource_manager" => *res_client = kept.end_of(name, CAP_SERVE),
-				b"process_service" => *process_client = kept.end_of(name, CAP_SERVE),
+				// THE SUPERVISOR ROOT, for this supervisor's own launches: a service it starts or restarts keeps the
+				// control-plane Domain and is never frozen. Every other launcher holds the client root.
+				b"process_service" => *process_client = kept.end_of(name, b"SUPERVISE"),
 				b"console_service" => {
 					*console_client = kept.end_of(name, CAP_CLIENT);
 					*console_control = kept.end_of(name, CAP_CONTROL);
@@ -994,7 +996,7 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 		// that root would reach it on a channel it does not know, and one end cannot be owned twice.
 		let font_root: u64 = kept.end_of(b"font_catalogue", CAP_SERVE);
 		let font_admin_root: u64 = kept.take_end_of(b"font_catalogue", CAP_ADMIN);
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", b"CATADMIN"), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", b"CATADMIN"), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, kept.end_of(b"process_service", CAP_SERVE), session_client, session1, perm_client, admin_server2, stats_server2) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		let report_buf: &mut [u8] = if name == b"storage_service" { &mut system_report } else { buf };

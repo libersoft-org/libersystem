@@ -48,7 +48,7 @@ pub fn unopened_provider_withdrawal() {
 // endpoint is found closed, each entry holding no handle and counting no consumer - and the catalogue's `open`
 // refuses both, since a bus is only ever reached through a connection scoped to one address or one line.
 pub fn scoped_bus_publication() {
-	static BUS: Entry = Entry { name: b"bus-publication-fixture", artifact: b"", boot_critical: false, priority: 0, requires: &[], provides: &[(driver_protocol::provider::I2C_BUS, 1, 8), (driver_protocol::provider::GPIO_LINES, 1, 16)], heartbeat_deadline: None, rules: &[] };
+	static BUS: Entry = Entry { name: b"bus-publication-fixture", artifact: b"", boot_critical: false, priority: 0, requires: &[], provides: &[(driver_protocol::provider::I2C_BUS, 1, 8), (driver_protocol::provider::GPIO_LINES, 1, 16)], heartbeat_deadline: None, suspend_deadline: None, rules: &[] };
 	let binding = BindingId::new(0, 0, 0, 1);
 	let mut catalogue = Catalogue::new();
 	let mut offers = Offers::new();

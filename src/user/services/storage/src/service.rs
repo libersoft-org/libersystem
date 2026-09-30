@@ -51,7 +51,7 @@ use liberfs::{BlockDevice, FsError, LiberFs, MountError};
 use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
 use proto::codec::{Handles, Sink, SliceWriter};
-use proto::system::{Error, FileEvent, FileEventKind, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, WriterMode, volume, volume_admin, writer};
+use proto::system::{Error, FileEvent, FileEventKind, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SleepState, SnapshotInfo, VolumeStatus, WriterMode, sleep_notice, volume, volume_admin, writer};
 use rt::*;
 use udf::Udf;
 
@@ -301,7 +301,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						print(b"StorageService: the volume this instance mounted is not the one the loader chose - refusing to serve it as the system volume\n");
 						exit();
 					}
-					Volume::new(alloc::boxed::Box::new(DiskFs { fs }))
+					Volume::new(alloc::boxed::Box::new(DiskFs { fs, chan: serving }))
 				}
 				Err(reason) => {
 					print(match reason {
@@ -416,7 +416,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Err(reason) => rt::fail_bootstrap(bootstrap, b"classification report", reason),
 	};
 	send_blocking(bootstrap, &report, 0);
-	serve_volume(&mut vol, service, admin, usb);
+	serve_volume(&mut vol, service, admin, usb, bootstrap);
 }
 
 // Build the entire report or fail; an announced classification tail is never optional.
@@ -1363,7 +1363,190 @@ impl UsbProviders {
 	}
 }
 
-fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<UsbProviders>) -> ! {
+// ONE CLIENT REQUEST, received whole: answered, or registered for a stream or a listing that answers later. Answers
+// whether the client would not take its reply within the bound - see `serve_volume`, which drops it then. Called as the
+// request arrives, and for a request the sleep held, once the writes are released.
+#[allow(clippy::too_many_arguments)]
+fn serve_client_request(vol: &mut Volume, clients: &mut Vec<Client>, set: u64, chan: u64, scope: &Scope, quiet: bool, request: &[u8], handle: &mut proto::codec::Handles, reply: &mut [u8; 4096], listing: &mut Option<PendingList>, pending: &mut Option<PendingWrite>, watchers: &mut Vec<Watcher>, index: usize) -> bool {
+	// Set when a client would not take its reply within the bound. It is dropped by the caller:
+	// a client that has stopped reading is gone for every practical purpose, and the
+	// alternative is holding the whole service for it.
+	let mut stalled = false;
+	let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+	// A WRITER SESSION SPEAKS `writer` AND NOTHING ELSE, and it is asked first because
+	// the two interfaces number their ops from one: `writer.write-at` is 2 and so is
+	// `volume.list`, so a session's positioned write was being answered by the
+	// directory streamer. Deciding by the CLIENT rather than by the op is the only
+	// arrangement that cannot collide, and it is what the contract says anyway - the
+	// channel `open-writer` returns speaks one interface.
+	//
+	// Its path was checked when the session opened, so `scope` is not consulted again:
+	// there is one path this client can write to and it cannot name another.
+	if clients[index].writer.is_some() {
+		let mut reply_handle = proto::codec::Handles::new();
+		let reply_len: Option<usize> = {
+			let session = clients[index].writer.as_mut().expect("checked");
+			let mut call = WriterCall { vol, session };
+			writer::dispatch(&mut call, request, handle, reply, &mut reply_handle)
+		};
+		if let Some(reply_len) = reply_len {
+			stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
+		} else {
+			for &leftover in reply_handle.as_slice() {
+				close(leftover);
+			}
+		}
+	} else if op == HEARTBEAT_OP {
+		stalled = reply_to(chan, b"PONG", &[], !quiet);
+	} else if op == CONNECT_OP {
+		// An empty reply with no handle is this call's refusal form, and a table that is
+		// full uses it like a channel that could not be created.
+		match channel() {
+			Some((server, client)) if admit_client(set, clients, Client { chan: server, koid: 0, scope: scope.clone(), quiet: false, writer: None }) => {
+				stalled = reply_to(chan, &[], &[client], !quiet);
+			}
+			Some((server, client)) => {
+				close(server);
+				close(client);
+				stalled = reply_to(chan, &[], &[], !quiet);
+			}
+			None => stalled = reply_to(chan, &[], &[], !quiet),
+		}
+	} else {
+		// Stamp mutations before authorization and dispatch. The clock is a no-op on
+		// read-only backends, while denied requests never reach their filesystem.
+		vol.fs.set_clock(clock_rtc());
+		if op == volume::OP_LIST {
+			// A second listing while one is in flight is refused, like a second stream.
+			if listing.is_some() {
+				let corr = if request.len() >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { 0 };
+				// `again`, and it now SAYS `again`: one listing at a time is a statement
+				// about this moment and the caller may retry. It used to be a bare
+				// correlation id, which the client could not tell from a directory that
+				// is not there.
+				let mut body: [u8; 32] = [0u8; 32];
+				stalled = match volume::list_reply_err(corr, &Error::Again, &mut body) {
+					Some(n) => reply_to(chan, &body[..n], &[], !quiet),
+					None => false,
+				};
+			} else {
+				match stream_list(vol, chan, scope, quiet, request, handle) {
+					ListStart::Started(started) => *listing = Some(started),
+					ListStart::Done => {}
+					ListStart::ClientStalled => stalled = true,
+				}
+			}
+		} else if op == volume::OP_WRITE_STREAM {
+			// Registered rather than received. `begin_stream` answers the client only
+			// when it refuses; otherwise the reply waits until the stream ends, and the
+			// loop goes straight back to serving everyone else.
+			match begin_stream(vol, chan, scope, request, handle, pending.is_some()) {
+				Ok(entry) => *pending = Some(entry),
+				Err((corr, e)) => {
+					if let Some(reply_len) = write_stream_reply(corr, Err(e), reply) {
+						stalled = reply_to(chan, &reply[..reply_len], &[], !quiet);
+					}
+				}
+			}
+		} else if op == volume::OP_WATCH {
+			match start_watch(vol, chan, scope, quiet, request, handle, watchers) {
+				ListStart::ClientStalled => stalled = true,
+				ListStart::Started(_) | ListStart::Done => {}
+			}
+		} else {
+			let mut reply_handle = proto::codec::Handles::new();
+			let reply_len: Option<usize> = if scope.allows_request(vol.name(), request) {
+				let mut call = VolumeCall { vol, clients, set, scope: scope.clone() };
+				volume::dispatch(&mut call, request, handle, reply, &mut reply_handle)
+			} else {
+				denied_reply(request, reply)
+			};
+			if let Some(reply_len) = reply_len {
+				// Bounded, and a client that will not take its answer is dropped below
+				// rather than waited for.
+				stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
+			} else {
+				for &leftover in reply_handle.as_slice() {
+					close(leftover);
+				}
+			}
+		}
+	}
+	stalled
+}
+
+// WHETHER A REQUEST WRITES THE VOLUME, which the sleep holds: every mutation of the volume contract, and a writer
+// session's commit - the one writer operation that reaches the medium; its staged writes stay in memory until then.
+fn mutates(writer: bool, request: &[u8]) -> bool {
+	let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+	if writer {
+		return op == writer::OP_COMMIT;
+	}
+	matches!(op, volume::OP_WRITE | volume::OP_REMOVE | volume::OP_SNAP_CREATE | volume::OP_SNAP_DELETE | volume::OP_MKDIR | volume::OP_RMDIR | volume::OP_SET_COMPRESSION | volume::OP_RESTORE | volume::OP_WRITE_STREAM | volume::OP_RENAME | volume::OP_TRUNCATE | volume::OP_TOUCH)
+}
+
+// AFTER A REQUEST: a client that would not take its answer is dropped - never the root client, whose dropping ends the
+// service and which is marked quiet instead, so the rest of its backlog is answered without waiting - and one that took
+// its answer is reading again.
+fn settle_client(set: u64, vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Option<PendingWrite>, index: usize, chan: u64, stalled: bool) {
+	if stalled {
+		if index != 0 {
+			abandon_pending(set, vol, pending, chan);
+			// The set FIRST, the handle after - `release_client` keeps that order, and removal by
+			// koid means a closed handle can no longer make a member unnameable.
+			release_client(set, clients, index);
+			close(chan);
+		} else {
+			clients[0].quiet = true;
+		}
+	} else if let Some(client) = clients.get_mut(index) {
+		// It took its answer, so it is reading again. Cleared on the way through rather
+		// than probed for: the send is the probe.
+		if client.chan == chan {
+			client.quiet = false;
+		}
+	}
+}
+
+// THE SLEEP'S NOTICE, as this instance answers it: nothing at the announcement or the resume; at `hold-writes` the
+// device's volatile cache flushed - everything accepted is committed to it already - and the hold set; at
+// `release-writes` the hold lifted, and the requests it held served in the order they came.
+struct Notice<'a> {
+	vol: &'a mut Volume,
+	held: &'a mut bool,
+	released: bool,
+}
+
+impl sleep_notice::Service for Notice<'_> {
+	fn announce(&mut self, _state: SleepState) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn hold_writes(&mut self) -> Result<(), Error> {
+		self.vol.fs.flush_device()?;
+		*self.held = true;
+		Ok(())
+	}
+
+	fn release_writes(&mut self) -> Result<(), Error> {
+		*self.held = false;
+		self.released = true;
+		Ok(())
+	}
+
+	fn resumed(&mut self, _state: SleepState) -> Result<(), Error> {
+		Ok(())
+	}
+}
+
+// A REQUEST THE SLEEP HELD: the client it came from, and the message as it arrived, capabilities included.
+struct HeldRequest {
+	chan: u64,
+	request: Vec<u8>,
+	handles: proto::codec::Handles,
+}
+
+fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<UsbProviders>, mut control: u64) -> ! {
 	// The admin's own `quiet`, for the reason the clients have one.
 	//
 	// The admin channel is never dropped: there is one of it, it is the operator's way in, and
@@ -1402,6 +1585,19 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		}
 	}
 
+	// THE SLEEP'S HOLD, on the control channel ServiceManager holds for this instance: while it is set, a request that
+	// would write waits in `held_requests`, whole, until the writes are released.
+	let mut held: bool = false;
+	let mut held_requests: Vec<HeldRequest> = Vec::new();
+	let mut control_koid: u64 = 0;
+	if control != 0 {
+		let koid = waitset_add(set, control);
+		if koid > 0 {
+			control_koid = koid as u64;
+		} else {
+			control = 0;
+		}
+	}
 	let mut clients: Vec<Client> = Vec::new();
 	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false, writer: None }) {
 		print(b"storage: cannot admit the root client; the service cannot serve\n");
@@ -1563,6 +1759,44 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				continue;
 			}
 		}
+		// THE CONTROL CHANNEL: the sleep's notices.
+		if control != 0 && ready == control_koid {
+			match recv_caps_blocking(control, &mut request) {
+				ReceivedCaps::Message { len, handles: mut caps } => {
+					let mut notice = Notice { vol: &mut *vol, held: &mut held, released: false };
+					let mut answer = [0u8; 64];
+					let mut answer_handles = proto::codec::Handles::new();
+					let written = sleep_notice::dispatch(&mut notice, &request[..len], &mut caps, &mut answer, &mut answer_handles);
+					let released = notice.released;
+					for &leftover in caps.as_slice().iter().chain(answer_handles.as_slice()) {
+						close(leftover);
+					}
+					// THE HELD REQUESTS, in the order they arrived, before the release is answered.
+					if released {
+						for held_request in core::mem::take(&mut held_requests) {
+							let mut handles = held_request.handles;
+							if let Some(index) = clients.iter().position(|client| client.chan == held_request.chan) {
+								let (scope, quiet) = (clients[index].scope.clone(), clients[index].quiet);
+								let stalled = serve_client_request(vol, &mut clients, set, held_request.chan, &scope, quiet, &held_request.request, &mut handles, &mut reply, &mut listing, &mut pending, &mut watchers, index);
+								settle_client(set, vol, &mut clients, &mut pending, index, held_request.chan, stalled);
+							}
+							for &unclaimed in handles.as_slice() {
+								close(unclaimed);
+							}
+						}
+					}
+					if let Some(written) = written {
+						let _ = try_send(control, &answer[..written], 0);
+					}
+				}
+				ReceivedCaps::Closed => {
+					let _ = waitset_remove(set, control_koid);
+					control = 0;
+					control_koid = 0;
+				}
+			}
+			continue;
+		}
 		if admin != 0 && ready == admin_koid {
 			match recv_caps_blocking(admin, &mut request) {
 				ReceivedCaps::Message { len, handles: caps } => {
@@ -1640,132 +1874,13 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				// over the single-handle receive, which keeps the first and drops the rest - so a
 				// client sending stdin, stdout and stderr had two destroyed before dispatch.
 				let mut handle = caps;
-				// Set when a client would not take its reply within the bound. It is dropped below:
-				// a client that has stopped reading is gone for every practical purpose, and the
-				// alternative is holding the whole service for it.
-				let mut stalled = false;
-				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-				// A WRITER SESSION SPEAKS `writer` AND NOTHING ELSE, and it is asked first because
-				// the two interfaces number their ops from one: `writer.write-at` is 2 and so is
-				// `volume.list`, so a session's positioned write was being answered by the
-				// directory streamer. Deciding by the CLIENT rather than by the op is the only
-				// arrangement that cannot collide, and it is what the contract says anyway - the
-				// channel `open-writer` returns speaks one interface.
-				//
-				// Its path was checked when the session opened, so `scope` is not consulted again:
-				// there is one path this client can write to and it cannot name another.
-				if clients[index].writer.is_some() {
-					let mut reply_handle = proto::codec::Handles::new();
-					let reply_len: Option<usize> = {
-						let session = clients[index].writer.as_mut().expect("checked");
-						let mut call = WriterCall { vol, session };
-						writer::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle)
-					};
-					if let Some(reply_len) = reply_len {
-						stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
-					} else {
-						for &leftover in reply_handle.as_slice() {
-							close(leftover);
-						}
-					}
-				} else if op == HEARTBEAT_OP {
-					stalled = reply_to(chan, b"PONG", &[], !quiet);
-				} else if op == CONNECT_OP {
-					// An empty reply with no handle is this call's refusal form, and a table that is
-					// full uses it like a channel that could not be created.
-					match channel() {
-						Some((server, client)) if admit_client(set, &mut clients, Client { chan: server, koid: 0, scope, quiet: false, writer: None }) => {
-							stalled = reply_to(chan, &[], &[client], !quiet);
-						}
-						Some((server, client)) => {
-							close(server);
-							close(client);
-							stalled = reply_to(chan, &[], &[], !quiet);
-						}
-						None => stalled = reply_to(chan, &[], &[], !quiet),
-					}
-				} else {
-					// Stamp mutations before authorization and dispatch. The clock is a no-op on
-					// read-only backends, while denied requests never reach their filesystem.
-					vol.fs.set_clock(clock_rtc());
-					if op == volume::OP_LIST {
-						// A second listing while one is in flight is refused, like a second stream.
-						if listing.is_some() {
-							let corr = if len >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { 0 };
-							// `again`, and it now SAYS `again`: one listing at a time is a statement
-							// about this moment and the caller may retry. It used to be a bare
-							// correlation id, which the client could not tell from a directory that
-							// is not there.
-							let mut body: [u8; 32] = [0u8; 32];
-							stalled = match volume::list_reply_err(corr, &Error::Again, &mut body) {
-								Some(n) => reply_to(chan, &body[..n], &[], !quiet),
-								None => false,
-							};
-						} else {
-							match stream_list(vol, chan, &scope, quiet, &request[..len], &mut handle) {
-								ListStart::Started(started) => listing = Some(started),
-								ListStart::Done => {}
-								ListStart::ClientStalled => stalled = true,
-							}
-						}
-					} else if op == volume::OP_WRITE_STREAM {
-						// Registered rather than received. `begin_stream` answers the client only
-						// when it refuses; otherwise the reply waits until the stream ends, and the
-						// loop goes straight back to serving everyone else.
-						match begin_stream(vol, chan, &scope, &request[..len], &mut handle, pending.is_some()) {
-							Ok(entry) => pending = Some(entry),
-							Err((corr, e)) => {
-								if let Some(reply_len) = write_stream_reply(corr, Err(e), &mut reply) {
-									stalled = reply_to(chan, &reply[..reply_len], &[], !quiet);
-								}
-							}
-						}
-					} else if op == volume::OP_WATCH {
-						match start_watch(vol, chan, &scope, quiet, &request[..len], &mut handle, &mut watchers) {
-							ListStart::ClientStalled => stalled = true,
-							ListStart::Started(_) | ListStart::Done => {}
-						}
-					} else {
-						let mut reply_handle = proto::codec::Handles::new();
-						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) {
-							let mut call = VolumeCall { vol, clients: &mut clients, set, scope: scope.clone() };
-							volume::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle)
-						} else {
-							denied_reply(&request[..len], &mut reply)
-						};
-						if let Some(reply_len) = reply_len {
-							// Bounded, and a client that will not take its answer is dropped below
-							// rather than waited for.
-							stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
-						} else {
-							for &leftover in reply_handle.as_slice() {
-								close(leftover);
-							}
-						}
-					}
+				// THE SLEEP'S HOLD: a request that would write waits, whole, until the writes are released.
+				if held && mutates(clients[index].writer.is_some(), &request[..len]) {
+					held_requests.push(HeldRequest { chan, request: request[..len].to_vec(), handles: handle });
+					continue;
 				}
-				if stalled {
-					// Never the root client: dropping that ends the service, and a stalled root is
-					// the boot chain's problem rather than something to resolve by exiting. What it
-					// gets instead is the quiet flag, so the REST of its backlog is answered without
-					// waiting and nobody else pays for it.
-					if index != 0 {
-						abandon_pending(set, vol, &mut pending, chan);
-						// The set FIRST, the handle after - `release_client` keeps that order, and removal by
-						// koid means a closed handle can no longer make a member unnameable. See the note at
-						// the first of these.
-						release_client(set, &mut clients, index);
-						close(chan);
-					} else {
-						clients[0].quiet = true;
-					}
-				} else if let Some(client) = clients.get_mut(index) {
-					// It took its answer, so it is reading again. Cleared on the way through rather
-					// than probed for: the send is the probe.
-					if client.chan == chan {
-						client.quiet = false;
-					}
-				}
+				let stalled = serve_client_request(vol, &mut clients, set, chan, &scope, quiet, &request[..len], &mut handle, &mut reply, &mut listing, &mut pending, &mut watchers, index);
+				settle_client(set, vol, &mut clients, &mut pending, index, chan, stalled);
 				for &unclaimed in handle.as_slice() {
 					close(unclaimed);
 				}
@@ -2315,6 +2430,12 @@ trait FileSystem {
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error>;
 	// The byte size of the backing block device (for the `lsblk` inventory).
 	fn capacity(&mut self) -> Result<u64, Error>;
+
+	// MAKE WHAT IS ON THE MEDIUM DURABLE: the device's volatile write cache flushed, for the sleep's hold. Every write
+	// this service accepted was committed to the device already; a backing with no device of its own has nothing to do.
+	fn flush_device(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
 
 	// Write a file from a buffer the caller hands over.
 	//
@@ -2914,9 +3035,15 @@ fn try_collect(items: impl ExactSizeIterator<Item = Result<FileInfo, Error>>) ->
 // and fsck. The one backend that implements every operation.
 struct DiskFs {
 	fs: LiberFs<ChannelBlockDevice>,
+	// The block channel it was mounted over, for the sleep's flush of the device's volatile cache.
+	chan: u64,
 }
 
 impl FileSystem for DiskFs {
+	fn flush_device(&mut self) -> Result<(), Error> {
+		if block_flush(self.chan) { Ok(()) } else { Err(Error::Io) }
+	}
+
 	// Writable unless the mount itself is read-only (a snapshot, or a volume degraded by a corrupt
 	// snapshot table). No ceiling before the write: free blocks are a lower bound on what fits
 	// because this filesystem compresses, so quoting them as a maximum would refuse writes that
@@ -3063,6 +3190,11 @@ impl FileSystem for DiskFs {
 // delete files), but no directory writes, snapshots, compression or fsck - so it uses the
 // trait defaults for those. Mounting is lazy and self-healing (see `FatBacking::run`).
 impl FileSystem for FatBacking {
+	// A volume nothing mounted yet has nothing written; one that is mounted flushes its device.
+	fn flush_device(&mut self) -> Result<(), Error> {
+		if self.fs.is_none() || block_flush(self.chan) { Ok(()) } else { Err(Error::Io) }
+	}
+
 	// Writable, with no ceiling to give before the write: the FAT backend decides at commit time.
 	// The destination is checked for the same reason as on the disk backend - a stream to a path
 	// that cannot exist should cost a lookup, not a transfer.

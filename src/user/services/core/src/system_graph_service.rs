@@ -84,6 +84,9 @@ fn component_state(state: BindingState) -> ComponentState {
 		// put a red row on a graph for a disk somebody unplugged on purpose - and would make it
 		// indistinguishable from `Quarantined`, which is the one that IS a problem.
 		BindingState::Removed => ComponentState::Stopped,
+		// SUSPENDED FOR A SLEEP is stopped for the moment and not failed: the binding survives, and the resume returns it
+		// to running with nothing rebound.
+		BindingState::Suspended => ComponentState::Stopped,
 	}
 }
 

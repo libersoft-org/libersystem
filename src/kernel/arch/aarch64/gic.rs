@@ -351,8 +351,17 @@ pub fn timer_one_shot(deadline: Option<u64>) -> bool {
 	if !clock.anchored() {
 		return false;
 	}
+	timer_at_counter(deadline.and_then(|tick| clock.counter_at(tick)))
+}
+
+// THIS CORE'S TIMER AS A ONE-SHOT AT A RAW COUNTER READING - the sleep entry's timed wake, while the clock is held.
+pub fn timer_at_counter(target: Option<u64>) -> bool {
+	let clock = &crate::arch::common::time::CLOCK;
+	if !clock.anchored() {
+		return false;
+	}
 	ONE_SHOT[crate::sched::current_cpu_id()].store(true, Ordering::Relaxed);
-	match deadline.and_then(|tick| clock.counter_at(tick)) {
+	match target {
 		None => unsafe { core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack, preserves_flags)) },
 		Some(counter) => {
 			let distance = (counter.wrapping_sub(super::tsc::now()) as i64).clamp(1, i32::MAX as i64) as u64;

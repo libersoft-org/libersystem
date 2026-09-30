@@ -25,3 +25,75 @@ fn shutdown_action_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(ShutdownAction::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn sleep_state_wire_is_stable() {
+	let sample = SleepState::Idle;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(SleepState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn sleep_step_wire_is_stable() {
+	let sample = SleepStep::None;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(SleepStep::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn sleep_reason_wire_is_stable() {
+	let sample = SleepReason::Requested;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(SleepReason::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn sleep_outcome_wire_is_stable() {
+	let sample = SleepOutcome::Running;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(SleepOutcome::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn wake_reason_wire_is_stable() {
+	let sample = WakeReason::Unknown;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(WakeReason::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn core_park_wire_is_stable() {
+	let sample = CorePark { cpu: 7, timer: 7, ipi: 7, device: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(CorePark::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn sleep_record_wire_is_stable() {
+	let sample = SleepRecord { state: SleepState::Idle, reason: SleepReason::Requested, outcome: SleepOutcome::Running, step: SleepStep::None, who: String::from("x"), why: String::from("x"), requested: 7, slept: 7, wake: WakeReason::Unknown, wake_detail: 7, cores: alloc::vec![CorePark { cpu: 7, timer: 7, ipi: 7, device: 7 }] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 1, 1, 0, 1, 0, 120, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(SleepRecord::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn drivers_suspended_wire_is_stable() {
+	let sample = DriversSuspended { failed: String::from("x"), why: String::from("x"), wake_nodes: alloc::vec![String::from("x")], awake_by_ms: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 1, 0, 120, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(DriversSuspended::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn woke_wire_is_stable() {
+	let sample = Woke { wake: WakeReason::Unknown, detail: 7, slept: 7, cores: alloc::vec![CorePark { cpu: 7, timer: 7, ipi: 7, device: 7 }] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(Woke::decode(&bytes).unwrap(), sample);
+}

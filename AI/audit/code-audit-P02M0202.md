@@ -265,3 +265,15 @@ relaxing a bound. Every case the plan names, with what was measured:
 - the partner's violation list empty at every check.
 Not run here: the ports' tree description (aarch64 and riscv64, their emulated sweep at the job's end); the sleep case
 (P02M0197); a real port controller.
+
+RE-RUN AFTER THE TCPCI CHANGES: `typeccheck` gained grants and two cases and its await line changed, and
+`common::wait_providers` - which `ucsi_acpi` waits in - was rebuilt around a bounded inner loop, so
+`./check.sh --gate typec-ucsi` was run again: PASSED (970 s, four boots, every case as before, no break of the PPM's
+discipline). Also re-run and passed after the last change: `usb-pd` (25), `i2c-backend` (17), `firmware-fixtures`,
+`grant-vocabulary`, `source-hygiene`.
+
+WHAT REMAINS OPEN IN P02M0202 (none of it passed, none claimed): the owner's confirmation of the proposed UCSI
+configuration, TCPCI selection rule and the tool's operator grant; the sleep exchange in both drivers and the sleep
+case (P02M0197 carries both, recorded there); the TCPCI tree description on aarch64 and riscv64 (their emulated sweep
+at the job's end - `fdt_edit.py tcpc-fixture` and `qemu-run.sh`'s `I2C_FIXTURE=tcpc` are built and self-tested, not
+booted); the three cross-builds; a hardware run.

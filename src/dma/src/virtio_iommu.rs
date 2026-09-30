@@ -463,6 +463,23 @@ impl<T: Transport> VirtioIommu<T> {
 	}
 }
 
+impl<T: Transport> VirtioIommu<T> {
+	// A CONTROLLER RESET WITH THE MACHINE: the transport replaced by the re-initialised one, and every recorded
+	// attachment sent again - a virtio-iommu domain exists through its first attach, so this is also what re-creates
+	// it. The record is not grown: these are the attachments it already holds.
+	pub fn replace_transport(&mut self, transport: T) {
+		self.transport = transport;
+	}
+
+	pub fn reattach_all(&mut self) -> Result<(), Fault> {
+		for at in 0..self.attached.len() {
+			let (domain, endpoint) = self.attached[at];
+			self.send(&encode_attach(domain.0, endpoint.0, 0))?;
+		}
+		Ok(())
+	}
+}
+
 impl<T: Transport> Backend for VirtioIommu<T> {
 	fn domain_create(&mut self) -> Result<(DomainId, Confirmed), Fault> {
 		// A DOMAIN IS CREATED BY BEING ATTACHED TO. The device has no create request: the first

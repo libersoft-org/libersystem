@@ -515,6 +515,25 @@ fn a_tpm_that_already_started_is_started() {
 	assert_eq!(tpm.startup(), Err(Error::Tpm(0x0101)));
 }
 
+// THE SLEEP'S THREE: Shutdown(STATE) before a sleep that cuts the power; whether the firmware already started the TPM at
+// the wake, asked without starting it; and Startup(STATE) where it did not.
+#[test]
+fn a_sleep_saves_the_state_and_the_wake_starts_the_tpm_only_where_the_firmware_did_not() {
+	let mut tpm = scripted(vec![response(ST_NO_SESSIONS, RC_SUCCESS, &[])]);
+	assert_eq!(tpm.shutdown_state(), Ok(()));
+	assert_eq!(code_of(&tpm.transport.sent[0]), CC_SHUTDOWN);
+	assert_eq!(&tpm.transport.sent[0][10..12], &SU_STATE.to_be_bytes(), "STATE, not CLEAR");
+	assert_eq!(scripted(vec![response(ST_NO_SESSIONS, 0x0101, &[])]).shutdown_state(), Err(Error::Tpm(0x0101)));
+	let mut tpm = scripted(vec![capability(0, CAP_TPM_PROPERTIES, 1, &[PT_MANUFACTURER, 0x4942_4d00])]);
+	assert_eq!(tpm.started(), Ok(true));
+	assert_eq!(code_of(&tpm.transport.sent[0]), CC_GET_CAPABILITY, "asked, not started");
+	assert_eq!(scripted(vec![response(ST_NO_SESSIONS, RC_INITIALIZE, &[])]).started(), Ok(false));
+	let mut tpm = scripted(vec![response(ST_NO_SESSIONS, RC_SUCCESS, &[])]);
+	assert_eq!(tpm.startup_state(), Ok(()));
+	assert_eq!((code_of(&tpm.transport.sent[0]), &tpm.transport.sent[0][10..12]), (CC_STARTUP, &SU_STATE.to_be_bytes()[..]));
+	assert_eq!(scripted(vec![response(ST_NO_SESSIONS, 0x01C4, &[])]).startup_state(), Err(Error::Tpm(0x01C4)), "no saved state is the caller's to fall back from");
+}
+
 #[test]
 fn random_bytes_are_asked_for_in_digest_sized_pieces_and_a_retry_is_asked_again() {
 	let piece = |count: usize| response(ST_NO_SESSIONS, RC_SUCCESS, &[&(count as u16).to_be_bytes()[..], &vec![0x5A; count]].concat());

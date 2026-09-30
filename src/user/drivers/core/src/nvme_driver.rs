@@ -674,6 +674,32 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 	}
 }
 
+// THE SLEEP, between two requests: the controller's volatile write cache is flushed, so a battery that dies in the
+// sleep loses nothing this driver accepted. A controller that lost its power is not reprogrammed here - its queues are
+// the bind's to create - so its resume answers it did not come back, and it is bound again.
+struct Sleep<'a> {
+	controller: &'a mut Controller,
+	serving: &'a mut common::Serving,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if unsafe { self.controller.flush() }.is_err() {
+			print(b"driver.nvme: the sleep is refused - the controller did not complete the flush it requires\n");
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		}
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		!lost_power
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
 // Serve the block wire until the manager stops this driver.
 //
 // THE SAME SHAPE AS `driver.virtio-blk`, deliberately: every consumer of this disk gets its own
@@ -685,8 +711,15 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 		// TOKEN ZERO, because `online` names its offers by their position in its own list and this
 		// driver publishes exactly one. The token is what a `DISCONNECT` names.
 		let mut serving = common::Serving::new(blk_server, 0);
+		common::takes_sleep();
 		loop {
-			let Some(at) = common::serve_any_or_answer(bootstrap, bind, &mut serving) else {
+			let ready = common::serve_any_or_sleep(bootstrap, bind, &mut serving);
+			if let Some(None) = ready {
+				if common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, serving: &mut serving }) {
+					continue;
+				}
+			}
+			let Some(Some(at)) = ready.filter(|_| !common::stop_requested()) else {
 				// THE FLUSH IS WHAT `STOPPED` CERTIFIES. A controller with writes still in its cache
 				// that reported a clean stop would be making a certificate about something that has
 				// not happened, so the flush's own answer is part of it.

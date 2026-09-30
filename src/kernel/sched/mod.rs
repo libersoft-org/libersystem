@@ -336,6 +336,12 @@ static ROOT_DOMAIN: SpinLock<Option<Arc<Domain>>> = SpinLock::new(None);
 // idle so a dead process's page tables are freed while off their own CR3.
 static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
+// The kernel's own page-table root - what an S3 entry runs on, since every other root lacks the identity map it
+// reinstates.
+pub fn kernel_cr3() -> u64 {
+	KERNEL_CR3.load(Ordering::Acquire)
+}
+
 // Whether the timer ISR may preempt. False until init() completes, so the timer
 // fires (and counts ticks) before per-CPU state and the scheduler are ready
 // without the preempt path touching either. Set once on the BSP at the end of
@@ -721,6 +727,37 @@ fn reserve_buckets(koids: &[u64]) -> bool {
 		}
 	}
 	true
+}
+
+// HOW MANY FREEZES ARE IN EFFECT: the syscall return path reads the current process's flag only while this is not
+// zero, so the thread that is not frozen pays one load for a sleep that is not happening.
+static FREEZES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn freeze_began() {
+	FREEZES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn freeze_ended() {
+	FREEZES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+// PARK THE CURRENT THREAD WHILE ITS PROCESS IS FROZEN - until the thaw wakes it on the process's koid, or a kill ends
+// it. Holds no lock and is called only where the caller holds none: the syscall return and the preemption point.
+pub fn park_if_frozen() {
+	if FREEZES.load(core::sync::atomic::Ordering::Acquire) == 0 {
+		return;
+	}
+	let Some(thread) = current_thread() else { return };
+	let process = thread.process().clone();
+	drop(thread);
+	let koid = process.header().koid();
+	while process.is_frozen() && !process.is_killed() {
+		let ready = {
+			let process = process.clone();
+			move || !process.is_frozen() || process.is_killed()
+		};
+		block_on_flagged(koid, NO_DEADLINE, false, ready);
+	}
 }
 
 pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: bool, ready: F) {
@@ -1409,18 +1446,24 @@ pub fn on_timer_preempt(from_user: bool) {
 		// never-syscalling loop cannot dodge, and `from_user` means it holds no kernel locks.
 		//
 		// Parked on the process's own koid, which is exactly what `SIG_CONT` wakes.
-		let stopped = sched.inner.lock().current.as_ref().is_some_and(|t| t.process().is_stopped());
-		if stopped {
+		// AND A FREEZE FOR A SLEEP, which parks here the same way on a flag of its own.
+		let held = sched.inner.lock().current.as_ref().is_some_and(|t| t.process().is_held());
+		if held {
 			let parked = current_thread().map(|t| (t.process().clone(), t.process().header().koid()));
 			if let Some((process, koid)) = parked {
 				// The Arc is released before the park: `block_on_flagged` does not return until the
 				// thread is woken, and holding it would pin the process for that whole time.
 				let ready = {
 					let process = process.clone();
-					move || !process.is_stopped()
+					move || !process.is_held()
 				};
+				let frozen = process.is_frozen();
 				drop(process);
 				block_on_flagged(koid, NO_DEADLINE, false, ready);
+				// A FROZEN THREAD DOES NOT GO BACK TO USER MODE ON A SPURIOUS WAKE: the freeze promised none would.
+				if frozen {
+					park_if_frozen();
+				}
 			}
 			return;
 		}

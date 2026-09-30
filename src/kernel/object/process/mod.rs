@@ -133,6 +133,10 @@ pub struct Process {
 	// Set while the process is suspended (SIGSTOP); its threads park at their next
 	// scheduling point until resumed (SIGCONT).
 	stopped: AtomicBool,
+	// SET WHILE ITS DOMAIN'S SUBTREE IS FROZEN FOR A SLEEP (`SYS_DOMAIN_FREEZE`): its threads park at their next
+	// return to user mode. A flag of its own, beside `stopped` and not it - `SIG_CONT` does not clear this and the
+	// thaw does not clear that, so a job a person stopped before the sleep is still stopped after it.
+	frozen: AtomicBool,
 	// Set when the process has armed itself to catch SIG_INT (SYS_SIGNAL_CATCH). While
 	// armed, a delivered SIG_INT sets `int_pending` instead of terminating the process,
 	// so a long-running tool can stop cleanly on Ctrl+C rather than being killed.
@@ -206,7 +210,7 @@ impl Process {
 		table.set_domain(domain.clone());
 		let header = ObjectHeader::new();
 		let koid = header.koid();
-		let process = crate::mem::heap::try_arc(Self { header, address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), lifecycle: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()), io_ports: super::port_range::IoPorts::new(koid) })?;
+		let process = crate::mem::heap::try_arc(Self { header, address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), frozen: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), lifecycle: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()), io_ports: super::port_range::IoPorts::new(koid) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -781,6 +785,20 @@ impl Process {
 	// Set or clear the suspended state (SIGSTOP sets, SIGCONT clears).
 	pub fn set_stopped(&self, stopped: bool) {
 		self.stopped.store(stopped, Ordering::Release);
+	}
+
+	// Whether the process is frozen for a sleep - see `frozen`.
+	pub fn is_frozen(&self) -> bool {
+		self.frozen.load(Ordering::Acquire)
+	}
+
+	pub fn set_frozen(&self, frozen: bool) {
+		self.frozen.store(frozen, Ordering::Release);
+	}
+
+	// Whether its threads are to stay parked: stopped by job control or frozen for a sleep.
+	pub fn is_held(&self) -> bool {
+		self.is_stopped() || self.is_frozen()
 	}
 
 	// Arm the process to catch SIG_INT: a subsequent SIG_INT sets the pending flag

@@ -42,6 +42,16 @@ pub fn cr3_is_reachable(cr3: u64) -> bool {
 	cr3 <= u32::MAX as u64
 }
 
+// Point the mailbox's entry and page-table root at a new use of the trampoline - an S3 resume, then each core's
+// restart after it. `dst` is the HHDM address of the low page the blob was installed into at boot.
+pub unsafe fn set_entry(dst: *mut u8, entry: u64) {
+	unsafe { (dst.add(mailbox_offset() + 8) as *mut u64).write_volatile(entry) };
+}
+
+pub unsafe fn set_root(dst: *mut u8, cr3: u64) {
+	unsafe { (dst.add(mailbox_offset()) as *mut u64).write_volatile(cr3) };
+}
+
 // Copy the trampoline blob to `dst` (the HHDM virtual address of the reserved low
 // page) and fill the constant mailbox fields (CR3 and the 64-bit entry). The
 // per-AP stack is written separately before each wake.

@@ -572,12 +572,40 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 	}
 }
 
+// THE SLEEP, between two transfers: an SD card has no write cache this driver can flush - every write is complete when
+// its transfer is - so nothing is outstanding. A card that lost its power is initialised again only by a bind, so its
+// resume answers it did not come back.
+struct Sleep<'a> {
+	serving: &'a mut common::Serving,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		!lost_power
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
 unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: Controller, blk_server: u64) -> ! {
 	unsafe {
 		let mut request = [0u8; block::REQUEST_LEN];
 		let mut serving = common::Serving::new(blk_server, 0);
+		common::takes_sleep();
 		loop {
-			let Some(at) = common::serve_any_or_answer(bootstrap, bind, &mut serving) else {
+			let ready = common::serve_any_or_sleep(bootstrap, bind, &mut serving);
+			if let Some(None) = ready {
+				if common::take_sleep_step(bootstrap, bind, &mut Sleep { serving: &mut serving }) {
+					continue;
+				}
+			}
+			let Some(Some(at)) = ready.filter(|_| !common::stop_requested()) else {
 				// AN SD CARD HAS NO WRITE CACHE THIS DRIVER CAN FLUSH. Every write is complete when
 				// its transfer is, which the transfer wait already proves, so a clean stop is claimed
 				// because nothing is outstanding rather than because a flush was answered.

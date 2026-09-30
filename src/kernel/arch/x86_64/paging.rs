@@ -298,9 +298,46 @@ pub fn remove_bootstrap_identity() {
 	unsafe {
 		let pml4 = table_ptr(cr3);
 		for i in 0..256 {
+			// KEPT, NOT FORGOTTEN: an S3 resume and the application processors it restarts come back through the same
+			// real-mode trampoline, which needs the same identity map for the instruction after paging is enabled.
+			BOOTSTRAP_IDENTITY[i].store(pml4.add(i).read_volatile(), core::sync::atomic::Ordering::Relaxed);
 			pml4.add(i).write_volatile(0);
 		}
 		asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+	}
+}
+
+// The lower half of the kernel's PML4 as the loader handed it over - the identity map the trampoline runs on. Its
+// tables are bootloader-reserved memory that never enters the pool, so they are still there to point at.
+static BOOTSTRAP_IDENTITY: [core::sync::atomic::AtomicU64; 256] = [const { core::sync::atomic::AtomicU64::new(0) }; 256];
+
+// THE IDENTITY MAP BACK, IN THE KERNEL'S OWN PML4, for an S3 resume and the restart of every other core. Only the
+// kernel's table: every user address space copies the kernel half alone, so none of them ever sees it. Answers false
+// when there is none to put back.
+pub fn reinstate_bootstrap_identity(kernel_pml4: u64) -> bool {
+	let mut any = false;
+	unsafe {
+		let pml4 = table_ptr(kernel_pml4);
+		for (i, entry) in BOOTSTRAP_IDENTITY.iter().enumerate() {
+			let value = entry.load(core::sync::atomic::Ordering::Relaxed);
+			if value != 0 {
+				any = true;
+				pml4.add(i).write_volatile(value);
+			}
+		}
+	}
+	any
+}
+
+// And removed again once every core is back, the TLB flushed by the CR3 reload.
+pub fn remove_reinstated_identity(kernel_pml4: u64) {
+	unsafe {
+		let pml4 = table_ptr(kernel_pml4);
+		for i in 0..256 {
+			pml4.add(i).write_volatile(0);
+		}
+		let active = active_pml4_phys();
+		asm!("mov cr3, {}", in(reg) active, options(nostack, preserves_flags));
 	}
 }
 
@@ -341,7 +378,11 @@ pub fn reserve_kernel_top_level(base: u64, len: u64) {
 // becomes visible when CR3 is loaded with it (which flushes the TLB anyway), so
 // the invlpg here is harmless for a non-active space.
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
-	try_map_page_in(pml4_phys, virt, phys, flags).expect("out of frames: page table");
+	if try_map_page_in(pml4_phys, virt, phys, flags).is_err() {
+		// A WALK THAT STOPPED is out of frames, or it met a large leaf where a table should be - which is not the same
+		// defect, and the address says which one this was.
+		panic!("out of frames: page table - mapping {virt:#x} to {phys:#x} in the space rooted at {pml4_phys:#x} stopped part way (no frame, or a large leaf on the walk)");
+	}
 }
 
 // Fallible counterpart of `map_page_in`: returns Err when an intermediate table

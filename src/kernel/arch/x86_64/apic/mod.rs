@@ -195,6 +195,14 @@ pub fn init_ap() {
 	write(REG_TIMER_INITIAL, TIMER_INITIAL.load(Ordering::Relaxed));
 }
 
+// THE BOOT CORE'S LAPIC AFTER S3, which reset it with the machine: the legacy PIC masked again - the firmware's
+// resume may have programmed it - and the LAPIC enabled as an application processor's is, on the calibration and
+// the timer mode boot measured.
+pub fn resume_boot_core() {
+	disable_pic();
+	init_ap();
+}
+
 // Service the serial ring on a timer interrupt. Called from the timer ISR on every core. The clock is
 // not moved here any more - it is computed from the TSC when read (`arch::common::time::CLOCK`) - so a
 // core whose timer is a one-shot, or silent, stops nobody's time.
@@ -222,7 +230,17 @@ pub fn timer_one_shot(deadline: Option<u64>) -> bool {
 	if !clock.anchored() {
 		return false;
 	}
-	let target = deadline.and_then(|tick| clock.counter_at(tick));
+	timer_at_counter(deadline.and_then(|tick| clock.counter_at(tick)))
+}
+
+// THIS CORE'S TIMER AS A ONE-SHOT AT A RAW COUNTER READING - never, for `None`. The sleep entry's timed wake, which is
+// a deadline on the counter while the clock is held and no tick converts; `timer_one_shot` for a tick. False when the
+// clock has no rate yet.
+pub fn timer_at_counter(target: Option<u64>) -> bool {
+	let clock = &crate::arch::common::time::CLOCK;
+	if !clock.anchored() {
+		return false;
+	}
 	if TSC_DEADLINE.load(Ordering::Relaxed) {
 		write(REG_LVT_TIMER, LVT_TIMER_TSC_DEADLINE | super::interrupts::TIMER_VECTOR as u32);
 		// THE MODE BEFORE THE DEADLINE: an MSR write is not ordered after an MMIO write by itself, and a

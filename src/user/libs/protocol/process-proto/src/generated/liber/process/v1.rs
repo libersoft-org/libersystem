@@ -1920,6 +1920,2789 @@ pub mod shutdown_notice {
 	}
 }
 
+/// A sleep the system can enter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SleepState {
+	/// SUSPEND TO IDLE: the transaction with no firmware transition - every core parked, the timed wake the only
+	/// timer.
+	Idle = 1,
+	/// SUSPEND TO RAM: ACPI S3, the firmware's transition, memory kept in self-refresh.
+	Ram = 2,
+	/// HIBERNATION: the image written to disk and the machine off.
+	Disk = 3,
+}
+
+impl SleepState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SleepState> {
+		let mut r = Reader::new(bytes);
+		let value = SleepState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SleepState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SleepState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<SleepState> {
+		match r.u8()? {
+			1 => Some(SleepState::Idle),
+			2 => Some(SleepState::Ram),
+			3 => Some(SleepState::Disk),
+			_ => None,
+		}
+	}
+}
+
+/// The steps of the suspend transaction, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SleepStep {
+	None = 0,
+	/// Every service whose manifest entry declares the sleep notice, told.
+	Announce = 1,
+	/// The applications frozen.
+	Freeze = 2,
+	/// Every StorageService instance written back and holding new writes.
+	Flush = 3,
+	/// Every driver binding suspended.
+	Drivers = 4,
+	/// The platform prepared for the state: wake armed, `_PTS` and `_SST`.
+	Platform = 5,
+	/// The kernel's entry.
+	Enter = 6,
+}
+
+impl SleepStep {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SleepStep> {
+		let mut r = Reader::new(bytes);
+		let value = SleepStep::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SleepStep> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SleepStep::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<SleepStep> {
+		match r.u8()? {
+			0 => Some(SleepStep::None),
+			1 => Some(SleepStep::Announce),
+			2 => Some(SleepStep::Freeze),
+			3 => Some(SleepStep::Flush),
+			4 => Some(SleepStep::Drivers),
+			5 => Some(SleepStep::Platform),
+			6 => Some(SleepStep::Enter),
+			_ => None,
+		}
+	}
+}
+
+/// WHO ASKED FOR A SLEEP: an inhibitor delays an IDLE sleep by its bounded amount, and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SleepReason {
+	/// A person, through a tool - `sleepctl`.
+	Requested = 1,
+	/// A sleep button, fixed or control-method.
+	SleepButton = 2,
+	/// The lid closed.
+	Lid = 3,
+	/// The policy's idle timeout.
+	Idle = 4,
+	/// A critical battery, where hibernation is set up.
+	Critical = 5,
+}
+
+impl SleepReason {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SleepReason> {
+		let mut r = Reader::new(bytes);
+		let value = SleepReason::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SleepReason> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SleepReason::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<SleepReason> {
+		match r.u8()? {
+			1 => Some(SleepReason::Requested),
+			2 => Some(SleepReason::SleepButton),
+			3 => Some(SleepReason::Lid),
+			4 => Some(SleepReason::Idle),
+			5 => Some(SleepReason::Critical),
+			_ => None,
+		}
+	}
+}
+
+/// How the last sleep ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SleepOutcome {
+	/// Accepted and running now.
+	Running = 1,
+	/// Slept and woke.
+	Resumed = 2,
+	/// Refused before anything was frozen.
+	Refused = 3,
+	/// A step failed, and the steps already taken were unwound.
+	Unwound = 4,
+}
+
+impl SleepOutcome {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SleepOutcome> {
+		let mut r = Reader::new(bytes);
+		let value = SleepOutcome::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SleepOutcome> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SleepOutcome::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<SleepOutcome> {
+		match r.u8()? {
+			1 => Some(SleepOutcome::Running),
+			2 => Some(SleepOutcome::Resumed),
+			3 => Some(SleepOutcome::Refused),
+			4 => Some(SleepOutcome::Unwound),
+			_ => None,
+		}
+	}
+}
+
+/// What woke the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WakeReason {
+	Unknown = 0,
+	/// The sleep's own timed wake.
+	Timer = 1,
+	PowerButton = 2,
+	SleepButton = 3,
+	/// A device's interrupt the wake set holds.
+	Device = 4,
+	/// The CMOS alarm (S3's timed wake).
+	Rtc = 5,
+	/// The platform woke it and said nothing more (QEMU's `system_wakeup`).
+	Platform = 6,
+}
+
+impl WakeReason {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<WakeReason> {
+		let mut r = Reader::new(bytes);
+		let value = WakeReason::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<WakeReason> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = WakeReason::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<WakeReason> {
+		match r.u8()? {
+			0 => Some(WakeReason::Unknown),
+			1 => Some(WakeReason::Timer),
+			2 => Some(WakeReason::PowerButton),
+			3 => Some(WakeReason::SleepButton),
+			4 => Some(WakeReason::Device),
+			5 => Some(WakeReason::Rtc),
+			6 => Some(WakeReason::Platform),
+			_ => None,
+		}
+	}
+}
+
+/// One core's wakeups while it was parked in a suspend to idle, by cause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorePark {
+	pub cpu: u32,
+	pub timer: u32,
+	pub ipi: u32,
+	pub device: u32,
+}
+
+impl CorePark {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CorePark> {
+		let mut r = Reader::new(bytes);
+		let value = CorePark::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CorePark> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CorePark::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.cpu)?;
+		w.u32(self.timer)?;
+		w.u32(self.ipi)?;
+		w.u32(self.device)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CorePark> {
+		let cpu = r.u32()?;
+		let timer = r.u32()?;
+		let ipi = r.u32()?;
+		let device = r.u32()?;
+		Some(CorePark { cpu, timer, ipi, device })
+	}
+}
+
+/// THE LAST SLEEP'S RECORD - what a requester reads after its request was accepted, since `suspend` answers at
+/// acceptance and never at the resume.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SleepRecord {
+	pub state: SleepState,
+	pub reason: SleepReason,
+	pub outcome: SleepOutcome,
+	/// The step that failed or refused, and who: a service or a binding by name, or the orderly sequence's door.
+	pub step: SleepStep,
+	pub who: String,
+	pub why: String,
+	/// The boot-time clock at the request and the sleep's length, in nanoseconds; zero for a sleep that did not
+	/// enter.
+	pub requested: u64,
+	pub slept: u64,
+	pub wake: WakeReason,
+	/// The device's interrupt identity, for `device`.
+	pub wake_detail: u32,
+	/// Each core's wakeups while parked, for a suspend to idle.
+	pub cores: Vec<CorePark>,
+}
+
+impl SleepRecord {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SleepRecord> {
+		let mut r = Reader::new(bytes);
+		let value = SleepRecord::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SleepRecord> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SleepRecord::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.state.write(w)?;
+		self.reason.write(w)?;
+		self.outcome.write(w)?;
+		self.step.write(w)?;
+		w.bytes_lp(self.who.as_bytes())?;
+		w.bytes_lp(self.why.as_bytes())?;
+		w.u64(self.requested)?;
+		w.u64(self.slept)?;
+		self.wake.write(w)?;
+		w.u32(self.wake_detail)?;
+		if self.cores.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.cores.len() as u16)?;
+		for v37 in self.cores.iter() {
+			v37.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<SleepRecord> {
+		let state = SleepState::read(r)?;
+		let reason = SleepReason::read(r)?;
+		let outcome = SleepOutcome::read(r)?;
+		let step = SleepStep::read(r)?;
+		let who = r.string_lp()?;
+		let why = r.string_lp()?;
+		let requested = r.u64()?;
+		let slept = r.u64()?;
+		let wake = WakeReason::read(r)?;
+		let wake_detail = r.u32()?;
+		let cores = {
+			let v38 = r.u16()? as usize;
+			let v38 = (v38 <= 64).then_some(v38)?;
+			let mut v39 = Vec::new();
+			v39.try_reserve_exact(v38).ok()?;
+			for _ in 0..v38 {
+				v39.push(CorePark::read(r)?);
+			}
+			v39
+		};
+		Some(SleepRecord { state, reason, outcome, step, who, why, requested, slept, wake, wake_detail, cores })
+	}
+}
+
+/// THE AUTHORITY TO PUT THE MACHINE TO SLEEP - beside `system-power` and not inside it, because a client of that
+/// interface can stop the machine and nothing else. Served by ServiceManager; clients reach it through manifest
+/// roles and PermissionManager grants.
+///
+/// `suspend` AND `hibernate` ANSWER WHEN SERVICEMANAGER ACCEPTS OR REFUSES THE REQUEST, before any step runs and
+/// without waiting on any participant - never at the resume: a requester may itself be a participant the
+/// transaction waits on. Everything after acceptance is read from `last-sleep`.
+// interface `system-sleep` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod system_sleep {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SUSPEND: u16 = 1;
+	pub const OP_HIBERNATE: u16 = 2;
+	pub const OP_INHIBIT: u16 = 3;
+	pub const OP_RELEASE: u16 = 4;
+	pub const OP_LAST_SLEEP: u16 = 5;
+
+	pub trait Service {
+		/// Suspend to idle or to RAM, with a timed wake `timed-wake-ms` from now, or none for zero.
+		fn suspend(&mut self, state: SleepState, timed_wake_ms: u64, reason: SleepReason) -> Result<(), Error>;
+		/// Hibernate: refused until the machine is set up for it.
+		fn hibernate(&mut self, reason: SleepReason) -> Result<(), Error>;
+		/// Delay an IDLE sleep by at most `milliseconds` - a download, a call. Nothing delays a lid, sleep-button or
+		/// critical-battery sleep past its bound.
+		fn inhibit(&mut self, milliseconds: u32, reason: String) -> Result<(), Error>;
+		/// End this client's inhibition early.
+		fn release(&mut self) -> Result<(), Error>;
+		fn last_sleep(&mut self) -> Result<SleepRecord, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_SUSPEND => {
+				let state = SleepState::read(r)?;
+				let timed_wake_ms = r.u64()?;
+				let reason = SleepReason::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.suspend(state, timed_wake_ms, reason);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v40) => {
+							w.u8(1)?;
+						}
+						Err(v41) => {
+							w.u8(0)?;
+							v41.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_HIBERNATE => {
+				let reason = SleepReason::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.hibernate(reason);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v42) => {
+							w.u8(1)?;
+						}
+						Err(v43) => {
+							w.u8(0)?;
+							v43.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_INHIBIT => {
+				let milliseconds = r.u32()?;
+				let reason = r.string_lp()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.inhibit(milliseconds, reason);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v44) => {
+							w.u8(1)?;
+						}
+						Err(v45) => {
+							w.u8(0)?;
+							v45.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RELEASE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.release();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v46) => {
+							w.u8(1)?;
+						}
+						Err(v47) => {
+							w.u8(0)?;
+							v47.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_LAST_SLEEP => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.last_sleep();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v48) => {
+							w.u8(1)?;
+							v48.write(w)?;
+						}
+						Err(v49) => {
+							w.u8(0)?;
+							v49.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn suspend(&mut self, state: &SleepState, timed_wake_ms: &u64, reason: &SleepReason) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUSPEND)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			w.u64(*timed_wake_ms)?;
+			reason.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn hibernate(&mut self, reason: &SleepReason) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_HIBERNATE)?;
+			w.u32(corr)?;
+			reason.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn inhibit(&mut self, milliseconds: &u32, reason: &str) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_INHIBIT)?;
+			w.u32(corr)?;
+			w.u32(*milliseconds)?;
+			w.bytes_lp(reason.as_bytes())?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn release(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RELEASE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn last_sleep(&mut self) -> Option<Result<SleepRecord, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LAST_SLEEP)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(SleepRecord::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_sleep_suspend")]
+	fn channel_invoke_suspend(chan: u64, state: &SleepState, timed_wake_ms: &u64, reason: &SleepReason) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.suspend(state, timed_wake_ms, reason)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_sleep_hibernate")]
+	fn channel_invoke_hibernate(chan: u64, reason: &SleepReason) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.hibernate(reason)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_sleep_inhibit")]
+	fn channel_invoke_inhibit(chan: u64, milliseconds: &u32, reason: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.inhibit(milliseconds, reason)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_sleep_release")]
+	fn channel_invoke_release(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.release()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_sleep_last_sleep")]
+	fn channel_invoke_last_sleep(chan: u64) -> Option<Result<SleepRecord, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.last_sleep()
+	}
+}
+
+/// THE SLEEP NOTICE, on the control channel ServiceManager holds for every service whose manifest entry declares
+/// it - the one the shutdown notice travels on. `announce` at the transaction's first step; `hold-writes` and
+/// `release-writes` to StorageService alone, once the applications are frozen and at the resume; `resumed` after
+/// the drivers are back.
+///
+/// ITS OPERATIONS ARE NUMBERED APART from `shutdown-notice`'s and from every other interface a control channel carries, so
+/// one channel can carry them all without a frame being read as another's.
+// interface `sleep-notice` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod sleep_notice {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_ANNOUNCE: u16 = 16;
+	pub const OP_HOLD_WRITES: u16 = 17;
+	pub const OP_RELEASE_WRITES: u16 = 18;
+	pub const OP_RESUMED: u16 = 19;
+
+	pub trait Service {
+		fn announce(&mut self, state: SleepState) -> Result<(), Error>;
+		fn hold_writes(&mut self) -> Result<(), Error>;
+		fn release_writes(&mut self) -> Result<(), Error>;
+		fn resumed(&mut self, state: SleepState) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ANNOUNCE => {
+				let state = SleepState::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.announce(state);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v50) => {
+							w.u8(1)?;
+						}
+						Err(v51) => {
+							w.u8(0)?;
+							v51.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_HOLD_WRITES => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.hold_writes();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v52) => {
+							w.u8(1)?;
+						}
+						Err(v53) => {
+							w.u8(0)?;
+							v53.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RELEASE_WRITES => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.release_writes();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v54) => {
+							w.u8(1)?;
+						}
+						Err(v55) => {
+							w.u8(0)?;
+							v55.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RESUMED => {
+				let state = SleepState::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.resumed(state);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v56) => {
+							w.u8(1)?;
+						}
+						Err(v57) => {
+							w.u8(0)?;
+							v57.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn announce(&mut self, state: &SleepState) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ANNOUNCE)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn hold_writes(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_HOLD_WRITES)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn release_writes(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RELEASE_WRITES)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn resumed(&mut self, state: &SleepState) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RESUMED)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_sleep_notice_announce")]
+	fn channel_invoke_announce(chan: u64, state: &SleepState) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.announce(state)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_sleep_notice_hold_writes")]
+	fn channel_invoke_hold_writes(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.hold_writes()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_sleep_notice_release_writes")]
+	fn channel_invoke_release_writes(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.release_writes()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_sleep_notice_resumed")]
+	fn channel_invoke_resumed(chan: u64, state: &SleepState) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.resumed(state)
+	}
+}
+
+/// What DeviceManager answers for its step. `failed` is empty when every binding suspended; otherwise it names the
+/// binding that refused or did not answer within its scaled bound, `why` says which, and every binding the step had
+/// already suspended has been resumed - the step unwinds itself before it answers. On success, the companion nodes
+/// of the bindings whose `SUSPENDED` said wake armed, and the latest time the machine must be awake by, for a device
+/// that cannot be stopped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DriversSuspended {
+	pub failed: String,
+	pub why: String,
+	pub wake_nodes: Vec<String>,
+	/// Milliseconds from the answer; zero for no bound.
+	pub awake_by_ms: u64,
+}
+
+impl DriversSuspended {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<DriversSuspended> {
+		let mut r = Reader::new(bytes);
+		let value = DriversSuspended::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<DriversSuspended> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = DriversSuspended::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.failed.as_bytes())?;
+		w.bytes_lp(self.why.as_bytes())?;
+		if self.wake_nodes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.wake_nodes.len() as u16)?;
+		for v58 in self.wake_nodes.iter() {
+			w.bytes_lp(v58.as_bytes())?;
+		}
+		w.u64(self.awake_by_ms)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<DriversSuspended> {
+		let failed = r.string_lp()?;
+		let why = r.string_lp()?;
+		let wake_nodes = {
+			let v59 = r.u16()? as usize;
+			let v59 = (v59 <= 64).then_some(v59)?;
+			let mut v60 = Vec::new();
+			v60.try_reserve_exact(v59).ok()?;
+			for _ in 0..v59 {
+				v60.push(r.string_lp()?);
+			}
+			v60
+		};
+		let awake_by_ms = r.u64()?;
+		Some(DriversSuspended { failed, why, wake_nodes, awake_by_ms })
+	}
+}
+
+/// THE DRIVERS' STEP, asked of DeviceManager on the control channel ServiceManager holds for it. Each answer comes
+/// when the step is done - one binding at a time, each under its own scaled bound - and DeviceManager keeps serving
+/// meanwhile, so the answer is correlated rather than awaited in line.
+// interface `device-sleep` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod device_sleep {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_CHECK: u16 = 20;
+	pub const OP_SUSPEND: u16 = 21;
+	pub const OP_RESUME: u16 = 22;
+
+	pub trait Service {
+		/// THE BINDINGS THE SLEEP CANNOT SUSPEND, asked before anything is frozen: every `Online` binding whose entry
+		/// declares no `suspend-deadline`, and every bind or stop in flight - each as its driver, its device and why.
+		/// Empty when the sleep may go ahead.
+		fn check(&mut self) -> Result<Vec<String>, Error>;
+		fn suspend(&mut self, state: SleepState, arm_wake: bool, timed_wake_ms: u64) -> Result<DriversSuspended, Error>;
+		/// Every suspended binding resumed; the answer names the devices that did not come back, which are being torn
+		/// down and rebound.
+		fn resume(&mut self, state: SleepState) -> Result<Vec<String>, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_CHECK => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.check();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v61) => {
+							w.u8(1)?;
+							if v61.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v61.len() as u16)?;
+							for v63 in v61.iter() {
+								w.bytes_lp(v63.as_bytes())?;
+							}
+						}
+						Err(v62) => {
+							w.u8(0)?;
+							v62.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SUSPEND => {
+				let state = SleepState::read(r)?;
+				let arm_wake = r.boolean()?;
+				let timed_wake_ms = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.suspend(state, arm_wake, timed_wake_ms);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v64) => {
+							w.u8(1)?;
+							v64.write(w)?;
+						}
+						Err(v65) => {
+							w.u8(0)?;
+							v65.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RESUME => {
+				let state = SleepState::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.resume(state);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v66) => {
+							w.u8(1)?;
+							if v66.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v66.len() as u16)?;
+							for v68 in v66.iter() {
+								w.bytes_lp(v68.as_bytes())?;
+							}
+						}
+						Err(v67) => {
+							w.u8(0)?;
+							v67.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn check(&mut self) -> Option<Result<Vec<String>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CHECK)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v69 = r.u16()? as usize;
+						let mut v70 = Vec::new();
+						v70.try_reserve_exact(v69).ok()?;
+						for _ in 0..v69 {
+							v70.push(r.string_lp()?);
+						}
+						v70
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn suspend(&mut self, state: &SleepState, arm_wake: &bool, timed_wake_ms: &u64) -> Option<Result<DriversSuspended, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUSPEND)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			w.boolean(*arm_wake)?;
+			w.u64(*timed_wake_ms)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(DriversSuspended::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn resume(&mut self, state: &SleepState) -> Option<Result<Vec<String>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RESUME)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v71 = r.u16()? as usize;
+						let mut v72 = Vec::new();
+						v72.try_reserve_exact(v71).ok()?;
+						for _ in 0..v71 {
+							v72.push(r.string_lp()?);
+						}
+						v72
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_device_sleep_check")]
+	fn channel_invoke_check(chan: u64) -> Option<Result<Vec<String>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.check()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_device_sleep_suspend")]
+	fn channel_invoke_suspend(chan: u64, state: &SleepState, arm_wake: &bool, timed_wake_ms: &u64) -> Option<Result<DriversSuspended, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.suspend(state, arm_wake, timed_wake_ms)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_device_sleep_resume")]
+	fn channel_invoke_resume(chan: u64, state: &SleepState) -> Option<Result<Vec<String>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.resume(state)
+	}
+}
+
+/// THE PLATFORM'S STEP, served by the ACPI service on the control channel ServiceManager holds for it: `prepare`
+/// evaluates `_PRW` and `_DSW` or `_PSW` on the wake nodes, arms their wake GPEs, then runs `_PTS` and `_SST`;
+/// `wake` runs `_WAK` and `_SST` and disarms what `prepare` armed.
+// interface `platform-sleep` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod platform_sleep {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_PREPARE: u16 = 24;
+	pub const OP_WAKE: u16 = 25;
+
+	pub trait Service {
+		fn prepare(&mut self, state: SleepState, wake_nodes: Vec<String>) -> Result<(), Error>;
+		fn wake(&mut self, state: SleepState) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_PREPARE => {
+				let state = SleepState::read(r)?;
+				let wake_nodes = {
+					let v73 = r.u16()? as usize;
+					let v73 = (v73 <= 64).then_some(v73)?;
+					let mut v74 = Vec::new();
+					v74.try_reserve_exact(v73).ok()?;
+					for _ in 0..v73 {
+						v74.push(r.string_lp()?);
+					}
+					v74
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.prepare(state, wake_nodes);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v75) => {
+							w.u8(1)?;
+						}
+						Err(v76) => {
+							w.u8(0)?;
+							v76.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_WAKE => {
+				let state = SleepState::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.wake(state);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v77) => {
+							w.u8(1)?;
+						}
+						Err(v78) => {
+							w.u8(0)?;
+							v78.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn prepare(&mut self, state: &SleepState, wake_nodes: &[String]) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_PREPARE)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			if wake_nodes.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(wake_nodes.len() as u16)?;
+			for v79 in wake_nodes.iter() {
+				w.bytes_lp(v79.as_bytes())?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn wake(&mut self, state: &SleepState) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WAKE)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_platform_sleep_prepare")]
+	fn channel_invoke_prepare(chan: u64, state: &SleepState, wake_nodes: &[String]) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.prepare(state, wake_nodes)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_platform_sleep_wake")]
+	fn channel_invoke_wake(chan: u64, state: &SleepState) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.wake(state)
+	}
+}
+
+/// THE APPLICATIONS' FREEZE, on ProcessService's supervisor root - which ServiceManager alone holds, and on which
+/// every launch keeps the control-plane Domain and is never held.
+// interface `application-freeze` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod application_freeze {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_FREEZE: u16 = 32;
+	pub const OP_THAW: u16 = 33;
+
+	pub trait Service {
+		fn freeze(&mut self) -> Result<(), Error>;
+		fn thaw(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_FREEZE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.freeze();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v80) => {
+							w.u8(1)?;
+						}
+						Err(v81) => {
+							w.u8(0)?;
+							v81.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_THAW => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.thaw();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v82) => {
+							w.u8(1)?;
+						}
+						Err(v83) => {
+							w.u8(0)?;
+							v83.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn freeze(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_FREEZE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn thaw(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_THAW)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_application_freeze_freeze")]
+	fn channel_invoke_freeze(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.freeze()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_application_freeze_thaw")]
+	fn channel_invoke_thaw(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.thaw()
+	}
+}
+
+/// What the kernel's entry answered.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Woke {
+	pub wake: WakeReason,
+	pub detail: u32,
+	/// The sleep's length, in nanoseconds.
+	pub slept: u64,
+	pub cores: Vec<CorePark>,
+}
+
+impl Woke {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Woke> {
+		let mut r = Reader::new(bytes);
+		let value = Woke::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Woke> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = Woke::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.wake.write(w)?;
+		w.u32(self.detail)?;
+		w.u64(self.slept)?;
+		if self.cores.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.cores.len() as u16)?;
+		for v84 in self.cores.iter() {
+			v84.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<Woke> {
+		let wake = WakeReason::read(r)?;
+		let detail = r.u32()?;
+		let slept = r.u64()?;
+		let cores = {
+			let v85 = r.u16()? as usize;
+			let v85 = (v85 <= 64).then_some(v85)?;
+			let mut v86 = Vec::new();
+			v86.try_reserve_exact(v85).ok()?;
+			for _ in 0..v85 {
+				v86.push(CorePark::read(r)?);
+			}
+			v86
+		};
+		Some(Woke { wake, detail, slept, cores })
+	}
+}
+
+/// THE ENTRY, asked of SystemManager - the one holder of MANAGE on the root Domain, which the kernel's sleep entry
+/// requires - by ServiceManager over the channel they already share. It answers when the machine is awake again.
+// interface `sleep-entry` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod sleep_entry {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_ENTER: u16 = 28;
+
+	pub trait Service {
+		fn enter(&mut self, state: SleepState, timed_wake_ms: u64) -> Result<Woke, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ENTER => {
+				let state = SleepState::read(r)?;
+				let timed_wake_ms = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.enter(state, timed_wake_ms);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v87) => {
+							w.u8(1)?;
+							v87.write(w)?;
+						}
+						Err(v88) => {
+							w.u8(0)?;
+							v88.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn enter(&mut self, state: &SleepState, timed_wake_ms: &u64) -> Option<Result<Woke, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENTER)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			w.u64(*timed_wake_ms)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(Woke::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_sleep_entry_enter")]
+	fn channel_invoke_enter(chan: u64, state: &SleepState, timed_wake_ms: &u64) -> Option<Result<Woke, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.enter(state, timed_wake_ms)
+	}
+}
+
 impl ProcessInfo {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -2113,6 +4896,589 @@ impl ShutdownAction {
 		match self {
 			ShutdownAction::PowerOff => crate::codec::cbor::text(out, "power-off"),
 			ShutdownAction::Reboot => crate::codec::cbor::text(out, "reboot"),
+		}
+	}
+}
+
+impl SleepState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			SleepState::Idle => out.push_str("\"idle\""),
+			SleepState::Ram => out.push_str("\"ram\""),
+			SleepState::Disk => out.push_str("\"disk\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			SleepState::Idle => out.push_str("idle"),
+			SleepState::Ram => out.push_str("ram"),
+			SleepState::Disk => out.push_str("disk"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			SleepState::Idle => crate::codec::cbor::text(out, "idle"),
+			SleepState::Ram => crate::codec::cbor::text(out, "ram"),
+			SleepState::Disk => crate::codec::cbor::text(out, "disk"),
+		}
+	}
+}
+
+impl SleepStep {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			SleepStep::None => out.push_str("\"none\""),
+			SleepStep::Announce => out.push_str("\"announce\""),
+			SleepStep::Freeze => out.push_str("\"freeze\""),
+			SleepStep::Flush => out.push_str("\"flush\""),
+			SleepStep::Drivers => out.push_str("\"drivers\""),
+			SleepStep::Platform => out.push_str("\"platform\""),
+			SleepStep::Enter => out.push_str("\"enter\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			SleepStep::None => out.push_str("none"),
+			SleepStep::Announce => out.push_str("announce"),
+			SleepStep::Freeze => out.push_str("freeze"),
+			SleepStep::Flush => out.push_str("flush"),
+			SleepStep::Drivers => out.push_str("drivers"),
+			SleepStep::Platform => out.push_str("platform"),
+			SleepStep::Enter => out.push_str("enter"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			SleepStep::None => crate::codec::cbor::text(out, "none"),
+			SleepStep::Announce => crate::codec::cbor::text(out, "announce"),
+			SleepStep::Freeze => crate::codec::cbor::text(out, "freeze"),
+			SleepStep::Flush => crate::codec::cbor::text(out, "flush"),
+			SleepStep::Drivers => crate::codec::cbor::text(out, "drivers"),
+			SleepStep::Platform => crate::codec::cbor::text(out, "platform"),
+			SleepStep::Enter => crate::codec::cbor::text(out, "enter"),
+		}
+	}
+}
+
+impl SleepReason {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			SleepReason::Requested => out.push_str("\"requested\""),
+			SleepReason::SleepButton => out.push_str("\"sleep-button\""),
+			SleepReason::Lid => out.push_str("\"lid\""),
+			SleepReason::Idle => out.push_str("\"idle\""),
+			SleepReason::Critical => out.push_str("\"critical\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			SleepReason::Requested => out.push_str("requested"),
+			SleepReason::SleepButton => out.push_str("sleep-button"),
+			SleepReason::Lid => out.push_str("lid"),
+			SleepReason::Idle => out.push_str("idle"),
+			SleepReason::Critical => out.push_str("critical"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			SleepReason::Requested => crate::codec::cbor::text(out, "requested"),
+			SleepReason::SleepButton => crate::codec::cbor::text(out, "sleep-button"),
+			SleepReason::Lid => crate::codec::cbor::text(out, "lid"),
+			SleepReason::Idle => crate::codec::cbor::text(out, "idle"),
+			SleepReason::Critical => crate::codec::cbor::text(out, "critical"),
+		}
+	}
+}
+
+impl SleepOutcome {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			SleepOutcome::Running => out.push_str("\"running\""),
+			SleepOutcome::Resumed => out.push_str("\"resumed\""),
+			SleepOutcome::Refused => out.push_str("\"refused\""),
+			SleepOutcome::Unwound => out.push_str("\"unwound\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			SleepOutcome::Running => out.push_str("running"),
+			SleepOutcome::Resumed => out.push_str("resumed"),
+			SleepOutcome::Refused => out.push_str("refused"),
+			SleepOutcome::Unwound => out.push_str("unwound"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			SleepOutcome::Running => crate::codec::cbor::text(out, "running"),
+			SleepOutcome::Resumed => crate::codec::cbor::text(out, "resumed"),
+			SleepOutcome::Refused => crate::codec::cbor::text(out, "refused"),
+			SleepOutcome::Unwound => crate::codec::cbor::text(out, "unwound"),
+		}
+	}
+}
+
+impl WakeReason {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			WakeReason::Unknown => out.push_str("\"unknown\""),
+			WakeReason::Timer => out.push_str("\"timer\""),
+			WakeReason::PowerButton => out.push_str("\"power-button\""),
+			WakeReason::SleepButton => out.push_str("\"sleep-button\""),
+			WakeReason::Device => out.push_str("\"device\""),
+			WakeReason::Rtc => out.push_str("\"rtc\""),
+			WakeReason::Platform => out.push_str("\"platform\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			WakeReason::Unknown => out.push_str("unknown"),
+			WakeReason::Timer => out.push_str("timer"),
+			WakeReason::PowerButton => out.push_str("power-button"),
+			WakeReason::SleepButton => out.push_str("sleep-button"),
+			WakeReason::Device => out.push_str("device"),
+			WakeReason::Rtc => out.push_str("rtc"),
+			WakeReason::Platform => out.push_str("platform"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			WakeReason::Unknown => crate::codec::cbor::text(out, "unknown"),
+			WakeReason::Timer => crate::codec::cbor::text(out, "timer"),
+			WakeReason::PowerButton => crate::codec::cbor::text(out, "power-button"),
+			WakeReason::SleepButton => crate::codec::cbor::text(out, "sleep-button"),
+			WakeReason::Device => crate::codec::cbor::text(out, "device"),
+			WakeReason::Rtc => crate::codec::cbor::text(out, "rtc"),
+			WakeReason::Platform => crate::codec::cbor::text(out, "platform"),
+		}
+	}
+}
+
+impl CorePark {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"cpu\":");
+		let _ = write!(out, "{}", self.cpu);
+		out.push(',');
+		out.push_str("\"timer\":");
+		let _ = write!(out, "{}", self.timer);
+		out.push(',');
+		out.push_str("\"ipi\":");
+		let _ = write!(out, "{}", self.ipi);
+		out.push(',');
+		out.push_str("\"device\":");
+		let _ = write!(out, "{}", self.device);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("cpu=");
+		let _ = write!(out, "{}", self.cpu);
+		out.push_str(", ");
+		out.push_str("timer=");
+		let _ = write!(out, "{}", self.timer);
+		out.push_str(", ");
+		out.push_str("ipi=");
+		let _ = write!(out, "{}", self.ipi);
+		out.push_str(", ");
+		out.push_str("device=");
+		let _ = write!(out, "{}", self.device);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "cpu");
+		crate::codec::cbor::uint(out, self.cpu as u64);
+		crate::codec::cbor::text(out, "timer");
+		crate::codec::cbor::uint(out, self.timer as u64);
+		crate::codec::cbor::text(out, "ipi");
+		crate::codec::cbor::uint(out, self.ipi as u64);
+		crate::codec::cbor::text(out, "device");
+		crate::codec::cbor::uint(out, self.device as u64);
+	}
+}
+
+impl SleepRecord {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"reason\":");
+		self.reason.to_json_into(out);
+		out.push(',');
+		out.push_str("\"outcome\":");
+		self.outcome.to_json_into(out);
+		out.push(',');
+		out.push_str("\"step\":");
+		self.step.to_json_into(out);
+		out.push(',');
+		out.push_str("\"who\":");
+		crate::codec::json_escape(&self.who, out);
+		out.push(',');
+		out.push_str("\"why\":");
+		crate::codec::json_escape(&self.why, out);
+		out.push(',');
+		out.push_str("\"requested\":");
+		let _ = write!(out, "{}", self.requested);
+		out.push(',');
+		out.push_str("\"slept\":");
+		let _ = write!(out, "{}", self.slept);
+		out.push(',');
+		out.push_str("\"wake\":");
+		self.wake.to_json_into(out);
+		out.push(',');
+		out.push_str("\"wake-detail\":");
+		let _ = write!(out, "{}", self.wake_detail);
+		out.push(',');
+		out.push_str("\"cores\":");
+		out.push('[');
+		let mut v90 = true;
+		for v89 in self.cores.iter() {
+			if !v90 {
+				out.push(',');
+			}
+			v90 = false;
+			v89.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("reason=");
+		self.reason.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("outcome=");
+		self.outcome.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("step=");
+		self.step.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("who=");
+		out.push_str(&self.who);
+		out.push_str(", ");
+		out.push_str("why=");
+		out.push_str(&self.why);
+		out.push_str(", ");
+		out.push_str("requested=");
+		let _ = write!(out, "{}", self.requested);
+		out.push_str(", ");
+		out.push_str("slept=");
+		let _ = write!(out, "{}", self.slept);
+		out.push_str(", ");
+		out.push_str("wake=");
+		self.wake.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("wake-detail=");
+		let _ = write!(out, "{}", self.wake_detail);
+		out.push_str(", ");
+		out.push_str("cores=");
+		out.push('[');
+		let mut v92 = true;
+		for v91 in self.cores.iter() {
+			if !v92 {
+				out.push_str(", ");
+			}
+			v92 = false;
+			v91.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 11);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "reason");
+		self.reason.to_cbor_into(out);
+		crate::codec::cbor::text(out, "outcome");
+		self.outcome.to_cbor_into(out);
+		crate::codec::cbor::text(out, "step");
+		self.step.to_cbor_into(out);
+		crate::codec::cbor::text(out, "who");
+		crate::codec::cbor::text(out, &self.who);
+		crate::codec::cbor::text(out, "why");
+		crate::codec::cbor::text(out, &self.why);
+		crate::codec::cbor::text(out, "requested");
+		crate::codec::cbor::uint(out, self.requested as u64);
+		crate::codec::cbor::text(out, "slept");
+		crate::codec::cbor::uint(out, self.slept as u64);
+		crate::codec::cbor::text(out, "wake");
+		self.wake.to_cbor_into(out);
+		crate::codec::cbor::text(out, "wake-detail");
+		crate::codec::cbor::uint(out, self.wake_detail as u64);
+		crate::codec::cbor::text(out, "cores");
+		crate::codec::cbor::array(out, self.cores.len());
+		for v93 in self.cores.iter() {
+			v93.to_cbor_into(out);
+		}
+	}
+}
+
+impl DriversSuspended {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"failed\":");
+		crate::codec::json_escape(&self.failed, out);
+		out.push(',');
+		out.push_str("\"why\":");
+		crate::codec::json_escape(&self.why, out);
+		out.push(',');
+		out.push_str("\"wake-nodes\":");
+		out.push('[');
+		let mut v95 = true;
+		for v94 in self.wake_nodes.iter() {
+			if !v95 {
+				out.push(',');
+			}
+			v95 = false;
+			crate::codec::json_escape(v94, out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"awake-by-ms\":");
+		let _ = write!(out, "{}", self.awake_by_ms);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("failed=");
+		out.push_str(&self.failed);
+		out.push_str(", ");
+		out.push_str("why=");
+		out.push_str(&self.why);
+		out.push_str(", ");
+		out.push_str("wake-nodes=");
+		out.push('[');
+		let mut v97 = true;
+		for v96 in self.wake_nodes.iter() {
+			if !v97 {
+				out.push_str(", ");
+			}
+			v97 = false;
+			out.push_str(v96);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("awake-by-ms=");
+		let _ = write!(out, "{}", self.awake_by_ms);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "failed");
+		crate::codec::cbor::text(out, &self.failed);
+		crate::codec::cbor::text(out, "why");
+		crate::codec::cbor::text(out, &self.why);
+		crate::codec::cbor::text(out, "wake-nodes");
+		crate::codec::cbor::array(out, self.wake_nodes.len());
+		for v98 in self.wake_nodes.iter() {
+			crate::codec::cbor::text(out, v98);
+		}
+		crate::codec::cbor::text(out, "awake-by-ms");
+		crate::codec::cbor::uint(out, self.awake_by_ms as u64);
+	}
+}
+
+impl Woke {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"wake\":");
+		self.wake.to_json_into(out);
+		out.push(',');
+		out.push_str("\"detail\":");
+		let _ = write!(out, "{}", self.detail);
+		out.push(',');
+		out.push_str("\"slept\":");
+		let _ = write!(out, "{}", self.slept);
+		out.push(',');
+		out.push_str("\"cores\":");
+		out.push('[');
+		let mut v100 = true;
+		for v99 in self.cores.iter() {
+			if !v100 {
+				out.push(',');
+			}
+			v100 = false;
+			v99.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("wake=");
+		self.wake.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("detail=");
+		let _ = write!(out, "{}", self.detail);
+		out.push_str(", ");
+		out.push_str("slept=");
+		let _ = write!(out, "{}", self.slept);
+		out.push_str(", ");
+		out.push_str("cores=");
+		out.push('[');
+		let mut v102 = true;
+		for v101 in self.cores.iter() {
+			if !v102 {
+				out.push_str(", ");
+			}
+			v102 = false;
+			v101.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "wake");
+		self.wake.to_cbor_into(out);
+		crate::codec::cbor::text(out, "detail");
+		crate::codec::cbor::uint(out, self.detail as u64);
+		crate::codec::cbor::text(out, "slept");
+		crate::codec::cbor::uint(out, self.slept as u64);
+		crate::codec::cbor::text(out, "cores");
+		crate::codec::cbor::array(out, self.cores.len());
+		for v103 in self.cores.iter() {
+			v103.to_cbor_into(out);
 		}
 	}
 }

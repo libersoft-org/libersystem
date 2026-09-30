@@ -483,6 +483,26 @@ fn a_heartbeat_deadline_of_zero_or_past_the_ceiling_is_refused() {
 }
 
 #[test]
+fn a_suspend_deadline_of_zero_or_past_the_ceiling_is_refused_and_every_shipped_driver_declares_one() {
+	// ABSENT IS A DRIVER WITHOUT THE EXCHANGE, which DeviceManager names when it refuses a sleep; ZERO would hold a
+	// sleep for ever on a driver that never answered; the ceiling is the protocol's, not the entry's.
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"trusted-untranslated\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
+	assert_eq!(errors(&driver("")), "");
+	assert_eq!(errors(&driver("suspend-deadline = 1\n")), "");
+	assert_eq!(errors(&driver("suspend-deadline = 1000\n")), "", "the ceiling itself is legal");
+	assert!(errors(&driver("suspend-deadline = 0\n")).contains("hold the sleep for ever"), "{}", errors(&driver("suspend-deadline = 0\n")));
+	assert!(errors(&driver("suspend-deadline = 1001\n")).contains("past the ceiling"), "{}", errors(&driver("suspend-deadline = 1001\n")));
+	// EVERY DRIVER THE IMAGE SHIPS CARRIES THE EXCHANGE - through its own step or the common one - so every entry says
+	// how long it may take; one without it would refuse every sleep on a machine that binds it.
+	let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+	let manifest = Manifest::load_workspace(&workspace).expect("the production manifest must validate");
+	let silent: Vec<String> = manifest.programs.iter().filter_map(|(name, program)| program.driver.as_ref().filter(|driver| driver.suspend_deadline.is_none()).map(|_| name.to_string())).collect();
+	assert!(silent.is_empty(), "drivers without a suspend-deadline: {silent:?}");
+}
+
+#[test]
 fn generated_volume_services_wait_for_storage_despite_name_order() {
 	let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
 	let manifest = Manifest::load_workspace(&workspace).expect("the production manifest must validate");

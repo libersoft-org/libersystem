@@ -162,6 +162,121 @@ fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 	}
 }
 
+// ------------------------------------------------------------------ the sleep mode
+
+// THE MACHINE IS IN A SUSPEND TO IDLE: every halt parks with no timer at all - no deadline, no housekeeping bound and
+// no one-tick cap, which the sleep suspends with the rest - and the entry's own core parks in `crate::sleep` with the
+// timed wake as its one-shot.
+static SLEEPING: AtomicBool = AtomicBool::new(false);
+
+pub fn sleeping() -> bool {
+	SLEEPING.load(Ordering::Acquire)
+}
+
+// EACH CORE'S WAKEUPS WHILE PARKED, by cause, for the last sleep's record.
+struct Park {
+	timer: AtomicU32,
+	ipi: AtomicU32,
+	device: AtomicU32,
+}
+
+static PARKED: [Park; MAX_CPUS] = [const { Park { timer: AtomicU32::new(0), ipi: AtomicU32::new(0), device: AtomicU32::new(0) } }; MAX_CPUS];
+
+// Every other core woken, to halt again - in the sleep mode, or out of it.
+fn wake_every_other_core() {
+	let this = crate::sched::current_cpu_id();
+	for cpu in 0..crate::smp::cpu_count() {
+		if cpu != this {
+			arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
+		}
+	}
+}
+
+// THE SLEEP BEGINS: the counts cleared, the mode set, and every other core woken to park in it.
+pub fn begin_sleep() {
+	for park in PARKED.iter() {
+		park.timer.store(0, Ordering::Relaxed);
+		park.ipi.store(0, Ordering::Relaxed);
+		park.device.store(0, Ordering::Relaxed);
+	}
+	SLEEPING.store(true, Ordering::SeqCst);
+	wake_every_other_core();
+}
+
+// ONE CORE'S PARK COUNTS FORGOTTEN - for the entry's own core, once a tick raised before its timer changed mode has
+// been taken, so the record counts the sleep and not the moment before it.
+pub fn forget_park(cpu: usize) {
+	let park = &PARKED[cpu];
+	park.timer.store(0, Ordering::Relaxed);
+	park.ipi.store(0, Ordering::Relaxed);
+	park.device.store(0, Ordering::Relaxed);
+}
+
+// AND ENDS: every parked core woken, and its periodic tick back.
+pub fn end_sleep() {
+	SLEEPING.store(false, Ordering::SeqCst);
+	wake_every_other_core();
+}
+
+// ONE PARK OF CORE `cpu`, entered with interrupts masked: the halt a pending interrupt ends at once, and what ended it
+// counted. The caller has programmed the timer it wants - none, or the timed wake.
+pub fn park_once(cpu: usize) {
+	let core = &CORES[cpu];
+	core.last.store(LAST_NONE, Ordering::Relaxed);
+	let started = arch::tsc::now();
+	arch::idle_halt();
+	let ended = arch::tsc::now();
+	core.idle_ns.fetch_add(tickclock::cycles_to_ns(ended.wrapping_sub(started), arch::common::time::CLOCK.hz()), Ordering::Relaxed);
+	let park = &PARKED[cpu];
+	match core.last.load(Ordering::Relaxed) {
+		LAST_NONE => {}
+		LAST_TIMER => {
+			park.timer.fetch_add(1, Ordering::Relaxed);
+		}
+		LAST_IPI => {
+			park.ipi.fetch_add(1, Ordering::Relaxed);
+		}
+		_ => {
+			park.device.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+}
+
+// AN S3'S HOLD: every core but the boot core parked in the sleep mode and KEPT there - never back to its scheduler -
+// until the hold ends, since the S3 takes every core's context and the boot core saves nothing a running core could
+// still be changing. Each held core says so, for the entry to wait on.
+static HOLD: AtomicBool = AtomicBool::new(false);
+static HELD: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+pub fn begin_hold() {
+	for held in HELD.iter() {
+		held.store(false, Ordering::Relaxed);
+	}
+	HOLD.store(true, Ordering::SeqCst);
+	begin_sleep();
+}
+
+// Whether every online core but the caller's is held.
+pub fn all_others_held() -> bool {
+	let this = crate::sched::current_cpu_id();
+	(0..crate::smp::cpu_count()).all(|cpu| cpu == this || HELD[cpu].load(Ordering::Acquire))
+}
+
+pub fn end_hold() {
+	HOLD.store(false, Ordering::SeqCst);
+	end_sleep();
+}
+
+// Each online core's wakeups while parked, into `out`; how many were written.
+pub fn park_report(out: &mut [abi::CorePark]) -> usize {
+	let count = crate::smp::cpu_count().min(out.len());
+	for (cpu, slot) in out.iter_mut().enumerate().take(count) {
+		let park = &PARKED[cpu];
+		*slot = abi::CorePark { cpu: cpu as u32, timer: park.timer.load(Ordering::Relaxed), ipi: park.ipi.load(Ordering::Relaxed), device: park.device.load(Ordering::Relaxed) };
+	}
+	count
+}
+
 // HALT THIS CORE until an interrupt, its timer a one-shot for `until` - an absolute tick, or `None` for
 // no bound of the caller's own - or the earlier of what this core must wake for anyway. `ready` is the
 // LAST CHECK, made with interrupts masked and before anything is programmed: true when there is work,
@@ -169,6 +284,11 @@ fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 pub fn halt(until: Option<u64>, ready: impl FnOnce() -> bool) {
 	let cpu = crate::sched::current_cpu_id();
 	let bsp = cpu == 0;
+	// A SUSPEND TO RAM WAITS FOR THE BOOT CORE'S IDLE CONTEXT, which is the one context the firmware resumes.
+	if bsp && arch::sleep::s3_pending() {
+		arch::sleep::run_pending();
+		return;
+	}
 	arch::disable_interrupts();
 	// HALTING BEFORE THE DEADLINES ARE READ: a deadline another core arms after this reads the list sees
 	// a wake it is earlier than, and sends the IPI that the pending-under-mask halt then answers at once.
@@ -180,6 +300,29 @@ pub fn halt(until: Option<u64>, ready: impl FnOnce() -> bool) {
 			BSP_WAKE.store(AWAKE, Ordering::SeqCst);
 		}
 		arch::enable_interrupts();
+		return;
+	}
+	// IN A SLEEP: parked with the timer off, and the periodic tick back only once the sleep has ended.
+	if sleeping() {
+		if bsp {
+			BSP_WAKE.store(AWAKE, Ordering::SeqCst);
+		}
+		arch::apic::timer_at_counter(None);
+		// HELD FOR AN S3: parked, and never back to the scheduler until the hold ends.
+		if HOLD.load(Ordering::Acquire) && !bsp {
+			HELD[cpu].store(true, Ordering::Release);
+			while HOLD.load(Ordering::Acquire) {
+				park_once(cpu);
+				arch::disable_interrupts();
+			}
+			HELD[cpu].store(false, Ordering::Release);
+			arch::enable_interrupts();
+		} else {
+			park_once(cpu);
+		}
+		if !sleeping() {
+			arch::apic::timer_periodic();
+		}
 		return;
 	}
 	let now = arch::apic::ticks();

@@ -708,6 +708,9 @@ pub enum BindingState {
 	/// under a device that is no longer there to ask - and lands at `quarantined` like every other
 	/// unconfirmed teardown. Reaching `removed` is a claim about the resources, not about the bus.
 	Removed = 9,
+	/// SUSPENDED FOR A SLEEP: the binding, its generation, its publications and its consumers' connections all
+	/// survive - which is what `stopping` cannot give - and a `resume` returns it to `online`.
+	Suspended = 10,
 }
 
 impl BindingState {
@@ -760,6 +763,7 @@ impl BindingState {
 			7 => Some(BindingState::Quarantined),
 			8 => Some(BindingState::Disabled),
 			9 => Some(BindingState::Removed),
+			10 => Some(BindingState::Suspended),
 			_ => None,
 		}
 	}
@@ -6876,6 +6880,7 @@ impl BindingState {
 			BindingState::Quarantined => out.push_str("\"quarantined\""),
 			BindingState::Disabled => out.push_str("\"disabled\""),
 			BindingState::Removed => out.push_str("\"removed\""),
+			BindingState::Suspended => out.push_str("\"suspended\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -6890,6 +6895,7 @@ impl BindingState {
 			BindingState::Quarantined => out.push_str("quarantined"),
 			BindingState::Disabled => out.push_str("disabled"),
 			BindingState::Removed => out.push_str("removed"),
+			BindingState::Suspended => out.push_str("suspended"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -6904,6 +6910,7 @@ impl BindingState {
 			BindingState::Quarantined => crate::codec::cbor::text(out, "quarantined"),
 			BindingState::Disabled => crate::codec::cbor::text(out, "disabled"),
 			BindingState::Removed => crate::codec::cbor::text(out, "removed"),
+			BindingState::Suspended => crate::codec::cbor::text(out, "suspended"),
 		}
 	}
 }

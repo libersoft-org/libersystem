@@ -17,6 +17,10 @@
 // with a repeated start. They go out together through indirect tables when the device offers them - its queue
 // may be four entries long - and the device reports only success or failure, so every failure is
 // `interrupted` to a consumer.
+//
+// THE SLEEP, between two transfers: nothing is in flight. A sleep that cuts the power stops the device first, and its
+// resume negotiates it back and points it at the same ring, under the same binding - the children on this bus keep
+// their connections.
 
 #![no_std]
 #![no_main]
@@ -255,6 +259,33 @@ fn refused(address: Option<u8>, why: &[u8]) {
 	print(out.as_bytes());
 }
 
+struct Sleep<'a> {
+	device: &'a Virtio,
+	queue: &'a mut Queue,
+	serving: &'a mut common::Serving,
+	stopped: bool,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		match self.device.sleep(request) {
+			Some(stopped) => {
+				self.stopped = stopped;
+				driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+			}
+			None => driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 },
+		}
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		self.device.wake(&mut [&mut *self.queue], lost_power, core::mem::take(&mut self.stopped))
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
 // A consumer has gone, or was refused: its address is free again, and the manager is told.
 fn part(controller: &mut Controller, serving: &mut common::Serving, bootstrap: u64, bind: &common::Bind, index: usize) -> bool {
 	let channel = serving.at(index);
@@ -295,15 +326,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		close(near);
 		let mut serving = common::Serving::from_offers(&[(BUS_TOKEN, 0)]);
 		let mut buf = alloc::vec![0u8; 2200];
+		common::takes_sleep();
 		loop {
-			match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, &[]) {
+			match common::wait_providers_until(bootstrap, &bind, &mut serving, &[], 0) {
 				None => {
 					if common::stop_requested() {
 						common::finish_stop(bootstrap, &bind, device.capability, common::quiesce_virtio());
 					}
 					exit();
 				}
-				Some(common::ProviderReady::Connected(index)) => {
+				Some(None) => {
+					if !common::take_sleep_step(bootstrap, &bind, &mut Sleep { device: &device, queue: &mut controller.queue, serving: &mut serving, stopped: false }) {
+						if common::stop_requested() {
+							common::finish_stop(bootstrap, &bind, device.capability, common::quiesce_virtio());
+						}
+						exit();
+					}
+				}
+				Some(Some(common::ProviderReady::Connected(index))) => {
 					// ONE ADDRESS, HELD BY ONE CONNECTION. Anything else is refused on the connection itself.
 					let channel = serving.at(index);
 					let admitted = match serving.scope_at(index) {
@@ -324,12 +364,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						exit();
 					}
 				}
-				Some(common::ProviderReady::Consumer(index)) => {
+				Some(Some(common::ProviderReady::Consumer(index))) => {
 					if !serve(&mut controller, &serving, index, &mut buf) && !part(&mut controller, &mut serving, bootstrap, &bind, index) {
 						exit();
 					}
 				}
-				Some(common::ProviderReady::Device(_)) => {}
+				Some(Some(common::ProviderReady::Device(_))) => {}
 			}
 		}
 	}

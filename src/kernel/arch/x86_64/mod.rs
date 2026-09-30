@@ -27,6 +27,7 @@ pub mod rtc;
 #[cfg(not(test))]
 pub mod sci;
 pub mod serial;
+pub mod sleep;
 pub mod syscall;
 pub mod tsc;
 pub mod usercopy;
@@ -102,6 +103,42 @@ pub fn init_ap(cpu_id: usize, lapic_id: u64) {
 	syscall::init();
 }
 
+// AN APPLICATION PROCESSOR BACK FROM S3, run on that core: every step `init_ap` takes, except that the core's own
+// descriptor area is RELOADED - its TSS and I/O bitmap are in memory as the sleep left them.
+pub fn resume_ap(cpu_id: usize, lapic_id: u64) {
+	context::enable_fpu();
+	paging::enable_nx();
+	paging::enable_smap_smep();
+	paging::establish_cr4_policy();
+	gdt::resume(cpu_id);
+	idt::load();
+	percpu::init(cpu_id, lapic_id);
+	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
+	percpu::set_io_slots(gdt::io_slots());
+	apic::init_ap();
+	syscall::init();
+}
+
+// THE BOOT CORE BACK FROM S3, from the resume trampoline on its resume stack: its per-CPU block's address first -
+// nothing after may ask which core it is on before that - then the same steps, and its LAPIC with the legacy PIC
+// masked again.
+pub fn resume_boot_core() {
+	percpu::init(0, crate::smp::lapic_id(0));
+	context::enable_fpu();
+	paging::enable_nx();
+	paging::enable_smap_smep();
+	paging::establish_cr4_policy();
+	gdt::resume(0);
+	idt::load();
+	// AND AGAIN, NOW THE SEGMENTS ARE RELOADED: loading GS takes its base from the descriptor, which zeroes the per-CPU
+	// block's address the first call wrote.
+	percpu::init(0, crate::smp::lapic_id(0));
+	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
+	percpu::set_io_slots(gdt::io_slots());
+	apic::resume_boot_core();
+	syscall::init();
+}
+
 // enable / disable maskable interrupts on the current core
 pub fn enable_interrupts() {
 	unsafe {
@@ -165,6 +202,14 @@ pub fn idle_halt() {
 // two paths a real machine takes needed it just as much.
 pub fn reset() -> ! {
 	serial::flush_sync();
+	// THE FADT'S RESET REGISTER FIRST, where the firmware describes one in port I/O - so a reset works on a chipset
+	// that is not one of QEMU's two - then the fixed ports.
+	if let Some(reset) = firmware::fadt().and_then(|fadt| fadt.reset())
+		&& reset.register.space == acpi::AddressSpace::SystemIo
+		&& let Ok(port) = u16::try_from(reset.register.address)
+	{
+		unsafe { outb(port, reset.value) };
+	}
 	unsafe {
 		// 0xCF9: set SYS_RST, then pulse RST_CPU|SYS_RST (the rising edge resets).
 		outb(0xcf9, 0x02);
@@ -183,15 +228,50 @@ pub fn reset() -> ! {
 // Power the machine off via ACPI S5 (soft-off): write SLP_EN to the PM1a control
 // register. QEMU's q35 (ICH9) decodes it at 0x604, i440fx (PIIX4) at 0xB004; 0x600
 // is written too as a harmless fallback. (Real-hardware ACPI comes later.)
+//
+// THE REGISTERED `\_S5` FIRST: the pair the ACPI service registered, written with SLP_EN into the FADT's PM1a and
+// PM1b control blocks - so power-off works on a chipset that is not one of QEMU's two. Until a `\_S5` is registered
+// (the ACPI service absent, not started yet, or dead before it registered) the fixed ports stay the path, so power-off
+// never depends on AML. THE PATH IS NAMED among the last words: on q35 the two write the same value to the same port.
 pub fn poweroff() -> ! {
-	// THE SAME FLUSH AS `reset`, AND THE NOTE ON IT SAYS WHY.
-	serial::flush_sync();
-	unsafe {
-		outw(0x604, 0x2000);
-		outw(0xb004, 0x2000);
-		outw(0x600, 0x2000);
+	let registered = crate::sleep::sleep_type(5).and_then(|pair| Some((pair, firmware::fadt()?)));
+	match registered {
+		Some(((typ_a, typ_b), fadt)) if fadt.pm1a_control().and_then(|block| block.io_port()).is_some() => {
+			crate::serial_println!("power-off: the registered \\_S5 ({typ_a}, {typ_b}) into PM1 control");
+			// THE SAME FLUSH AS `reset`, AND THE NOTE ON IT SAYS WHY.
+			serial::flush_sync();
+			let a = fadt.pm1a_control().and_then(|block| block.io_port()).unwrap_or(0);
+			let b = fadt.pm1b_control().and_then(|block| block.io_port());
+			unsafe {
+				outw(a, u16::from(typ_a) << 10 | 0x2000);
+				if let Some(b) = b {
+					outw(b, u16::from(typ_b) << 10 | 0x2000);
+				}
+			}
+		}
+		_ => {
+			crate::serial_println!("power-off: the fixed ports (no \\_S5 registered)");
+			serial::flush_sync();
+			unsafe {
+				outw(0x604, 0x2000);
+				outw(0xb004, 0x2000);
+				outw(0x600, 0x2000);
+			}
+		}
 	}
 	halt_loop()
+}
+
+// WHETHER THE DEVELOPMENT SWITCH NAMES `word` AS ABSENT - a fw_cfg file of its own, read as the boot profile is, and
+// honoured only on a development profile: the CMOS RTC (`rtc`) or the sleep-type registration (`sleep-types`), the
+// two cases q35 cannot otherwise reach. A shipping boot names no profile, so it is never consulted there.
+pub fn absent_named(word: &[u8]) -> bool {
+	if boot_profile().is_none() {
+		return false;
+	}
+	let mut names = [0u8; 64];
+	let Some(len) = fwcfg::read_file(b"opt/org.libersystem/absent", &mut names) else { return false };
+	names[..len].split(|byte| matches!(byte, b' ' | b',' | b'\n' | 0)).any(|name| name == word)
 }
 
 // Name the boot profile the host selected, or `None` for an ordinary boot. The profile

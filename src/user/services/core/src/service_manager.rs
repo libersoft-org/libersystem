@@ -47,6 +47,8 @@ mod bootstrap;
 mod lifecycle;
 #[path = "service_manager/provider_checks.rs"]
 mod provider_checks;
+#[path = "service_manager/sleep.rs"]
+mod sleep;
 
 use bootstrap::{Kept, bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
 use lifecycle::{depends_on_scoped, has_running_dependent, serve_stats_once, shutdown_all, shutdown_order, verify_shutdown_order};
@@ -1228,7 +1230,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// rather than threaded out through `start_service`: the end is recorded there when the role
 	// is delivered, and this is the only place that needs it.
 	let admin_server3: u64 = broker.kept.end_of(b"console_service", b"ADMIN");
-	supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut device_manager_domain, &mut buf);
+	supervise(power, bootstrap, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut device_manager_domain, &mut buf);
 	exit();
 }
 
@@ -1460,6 +1462,7 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_BMC,
 			CAP_TYPEC,
 			CAP_TYPEC_CONTROL,
+			CAP_SLEEP,
 		],
 		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
 		// over at bring-up went with the instance that ended.
@@ -1503,6 +1506,18 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 	let name: &[u8] = &request[2..];
 	if !cap_grants(requester).iter().any(|&g| g == name) {
 		send_blocking(chan, b"DENIED", 0);
+		return;
+	}
+	// THIS SUPERVISOR'S OWN AUTHORITY: minted here, since it serves the interface itself.
+	if name == CAP_SLEEP {
+		match sleep::mint() {
+			Some(minted) => {
+				send_blocking(chan, b"OK", minted);
+			}
+			None => {
+				send_blocking(chan, b"DOWN", 0);
+			}
+		}
 		return;
 	}
 	let root: u64 = match name {
@@ -1933,8 +1948,16 @@ fn sleep_ticks(park: u64, ticks: u64) {
 // dropped from the wait set. The canary is restarted per policy; an admin message
 // drives a reverse-dependency stop; a stats request is answered over the `supervisor`
 // interface. Returns when nothing is left to watch.
-fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) {
+fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) {
 	unsafe {
+		// THE SLEEP: served here, its transaction driven from this loop's one wait - see `sleep`. Its connection to
+		// ProcessService's supervisor root is minted once, now that ProcessService is up; SystemManager is the channel
+		// this process was started with.
+		let freeze_client: u64 = if broker.process != 0 { service_connect(broker.process).unwrap_or(0) } else { 0 };
+		let mut sleeper = sleep::Sleeper::new(freeze_client, system);
+		// AN ANSWER THE SLEEP AWAITS CAN OUTGROW `buf`: the entry's report lists every core, DeviceManager's lists name
+		// bindings. Received whole here.
+		let mut answer_buf: Vec<u8> = alloc::vec![0u8; 16 * 1024];
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
 		// The console's, which every shell it spawns holds a duplicate of. One request at a time
@@ -1946,9 +1969,10 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 		loop {
 			// N services, the canary, the four supervisor channels plus the console's, and the watchdog service's
 			// liveness channel.
-			let mut handles: [u64; N + 8] = [0u64; N + 8];
-			let mut kinds: [u8; N + 8] = [0u8; N + 8];
-			let mut idxs: [usize; N + 8] = [0usize; N + 8];
+			let mut handles: [u64; N + 10 + sleep::MAX_SLEEP_CLIENTS] = [0u64; N + 10 + sleep::MAX_SLEEP_CLIENTS];
+			let mut kinds: [u8; N + 10 + sleep::MAX_SLEEP_CLIENTS] = [0u8; N + 10 + sleep::MAX_SLEEP_CLIENTS];
+			let mut idxs: [usize; N + 10 + sleep::MAX_SLEEP_CLIENTS] = [0usize; N + 10 + sleep::MAX_SLEEP_CLIENTS];
+			let mut targets: [sleep::Target; 2] = [sleep::Target::Process; 2];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
@@ -1990,9 +2014,10 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				kinds[count] = 6;
 				count += 1;
 			}
-			// THE LIVENESS CHANNEL, loaded afresh each round: a relaunch of the watchdog service replaces it.
+			// THE LIVENESS CHANNEL, loaded afresh each round: a relaunch of the watchdog service replaces it. NO `alive` IS
+			// ANSWERED WHILE A SLEEP'S TRANSACTION RUNS - the watchdog service set its longest timeouts at the announcement.
 			let liveness: u64 = LIVENESS.load(core::sync::atomic::Ordering::Relaxed);
-			if liveness != 0 {
+			if liveness != 0 && !sleeper.running() {
 				handles[count] = liveness;
 				kinds[count] = 7;
 				count += 1;
@@ -2004,10 +2029,32 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				kinds[count] = 8;
 				count += 1;
 			}
+			// THE SLEEP'S CLIENTS, and the channels its transaction awaits an answer on that are not control channels.
+			for (slot, client) in sleep::SLEEP_CLIENTS.iter().enumerate() {
+				let near: u64 = client.load(core::sync::atomic::Ordering::Relaxed);
+				if near != 0 {
+					handles[count] = near;
+					kinds[count] = 9;
+					idxs[count] = slot;
+					count += 1;
+				}
+			}
+			for (at, (channel, target)) in sleeper.wait_handles().into_iter().take(2).enumerate() {
+				handles[count] = channel;
+				kinds[count] = 10;
+				idxs[count] = at;
+				targets[at] = target;
+				count += 1;
+			}
 			if count == 0 {
 				return;
 			}
-			let ready: i64 = wait_any(&handles[..count], 0);
+			let ready: i64 = wait_any(&handles[..count], sleeper.deadline());
+			if ready == ERR_TIMED_OUT {
+				sleeper.expire();
+				settle_sleep(&mut sleeper, power, policy, broker, state, channels, sup, procs, &mut stats, log_client, park, device_manager_domain, buf);
+				continue;
+			}
 			if ready < 0 {
 				return;
 			}
@@ -2020,6 +2067,38 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 					// ladder (its clients reconnect through the broker), any other is
 					// recorded Failed and dropped from the wait set.
 					let idx: usize = idxs[r];
+					// A CHANNEL THE SLEEP AWAITS AN ANSWER ON is read into the larger buffer, and only its answer is taken
+					// here - a RESOLVE or a goodbye arriving meanwhile goes the ordinary way on the next pass.
+					if sleeper.awaits(sleep::Target::Service(idx)) {
+						match try_recv(channels[idx], &mut answer_buf) {
+							Polled::Message { len, handle } if !is_resolve(&answer_buf[..len]) && !is_goodbye(&answer_buf[..len]) => {
+								if handle != 0 {
+									close(handle);
+								}
+								let answer: Vec<u8> = answer_buf[..len].to_vec();
+								sleeper.answer(sleep::Target::Service(idx), &answer);
+								settle_sleep(&mut sleeper, power, policy, broker, state, channels, sup, procs, &mut stats, log_client, park, device_manager_domain, buf);
+								continue;
+							}
+							Polled::Message { len, handle } => {
+								// Not the answer: served as the ordinary loop serves it.
+								let n = len.min(buf.len());
+								buf[..n].copy_from_slice(&answer_buf[..n]);
+								if is_resolve(&buf[..n]) {
+									let mut req: [u8; 64] = [0u8; 64];
+									let rlen: usize = n.min(req.len());
+									req[..rlen].copy_from_slice(&buf[..rlen]);
+									serve_resolve(channels[idx], MANIFEST[idx].name, &req[..rlen], broker, state);
+								} else if handle != 0 {
+									close(handle);
+								}
+								continue;
+							}
+							Polled::Empty => continue,
+							// A close is the crash the arms below handle, read again there.
+							Polled::Closed => {}
+						}
+					}
 					match try_recv(channels[idx], buf) {
 						Polled::Message { len, .. } if is_resolve(&buf[..len]) => {
 							// Copy the request out of `buf`: serve_resolve reuses it.
@@ -2037,6 +2116,21 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 							desired[idx] = Desired::Stopped;
 							state[idx] = State::Stopped;
 							channels[idx] = 0;
+						}
+						// A SERVICE THAT DIES WHILE A SLEEP'S TRANSACTION RUNS is not restarted until the transaction has ended:
+						// every launch reads the volume, and the volume's driver may be suspended. An answer it owed fails
+						// its step.
+						Polled::Closed if sleeper.running() => {
+							emit_event(log_client, MANIFEST[idx].name, b"crashed");
+							console_report(MANIFEST[idx].name, b"crashed during a sleep's transaction - restarted once it has ended");
+							sleeper.lost(sleep::Target::Service(idx));
+							broker.lifecycle.record(idx, state[idx], State::Failed, epoch_of(procs[idx]), Reason::Faulted);
+							state[idx] = State::Failed;
+							sup[idx].failure = Failure::Crashed;
+							channels[idx] = 0;
+							if MANIFEST[idx].restart == Restart::Transparent {
+								sleeper.deferred.push(idx);
+							}
 						}
 						Polled::Closed => {
 							emit_event(log_client, MANIFEST[idx].name, b"crashed");
@@ -2102,7 +2196,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				}
 				2 => {
 					// The shell asked to stop a service; tear down its dependents first.
-					if !handle_admin(admin, power, policy.shutdown_notice_ticks, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin, power, policy.shutdown_notice_ticks, &mut sleeper, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin = 0;
 					}
 				}
@@ -2115,7 +2209,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				4 => {
 					// The sandboxed `stop` tool (granted the supervisor capability) asked to
 					// stop a service over its own admin channel; tear down its dependents first.
-					if !handle_admin(admin2, power, policy.shutdown_notice_ticks, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin2, power, policy.shutdown_notice_ticks, &mut sleeper, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin2 = 0;
 					}
 				}
@@ -2129,7 +2223,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 				6 => {
 					// A shell ConsoleService spawned - the replacement a logout puts on the primary
 					// VT - asking to stop a service or to stop the machine.
-					if !handle_admin(admin3, power, policy.shutdown_notice_ticks, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin3, power, policy.shutdown_notice_ticks, &mut sleeper, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin3 = 0;
 					}
 				}
@@ -2140,6 +2234,26 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 						close(liveness);
 					}
 				}
+				9 => {
+					// A `system-sleep` request - or a client that closed.
+					let near: u64 = handles[r];
+					sleep::serve(near, &mut sleeper, buf);
+				}
+				10 => {
+					// AN ANSWER THE SLEEP'S TRANSACTION AWAITS from ProcessService's supervisor root or SystemManager.
+					let target = targets[idxs[r]];
+					match try_recv(handles[r], &mut answer_buf) {
+						Polled::Message { len, handle } => {
+							if handle != 0 {
+								close(handle);
+							}
+							let answer: Vec<u8> = answer_buf[..len].to_vec();
+							sleeper.answer(target, &answer);
+						}
+						Polled::Closed => sleeper.lost(target),
+						Polled::Empty => {}
+					}
+				}
 				_ => {
 					// The BMC service asked for the status - whether the boot has settled. Its channel closing is that
 					// service ending, and the end is dropped unless a relaunch already replaced it.
@@ -2148,7 +2262,28 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 					}
 				}
 			}
+			// THE SLEEP'S TRANSACTION, as far as the answers in allow - and what its end owes.
+			settle_sleep(&mut sleeper, power, policy, broker, state, channels, sup, procs, &mut stats, log_client, park, device_manager_domain, buf);
 		}
+	}
+}
+
+// ADVANCE THE SLEEP'S TRANSACTION, and when it has ended: the services it kept from restarting are restarted, and an
+// orderly sequence it was ended by runs now.
+#[allow(clippy::too_many_arguments)]
+fn settle_sleep(sleeper: &mut sleep::Sleeper, power: u64, policy: &Policy, broker: &mut Broker, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats: &mut u64, log_client: u64, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) {
+	let Some(ended) = sleeper.drive(state, channels) else { return };
+	for idx in core::mem::take(&mut sleeper.deferred) {
+		if restart_service(broker, idx, state, channels, procs, sup, stats, policy.restart_budget, park, device_manager_domain, buf) {
+			emit_event(log_client, MANIFEST[idx].name, b"restarted");
+			console_report(MANIFEST[idx].name, b"restarted");
+		} else {
+			emit_event(log_client, MANIFEST[idx].name, b"escalated");
+			console_report(MANIFEST[idx].name, b"escalated");
+		}
+	}
+	if let Some(door) = ended.door {
+		run_power_verb(door.action, false, power, policy.shutdown_notice_ticks, state, channels, sup, procs, log_client, buf);
 	}
 }
 
@@ -2157,7 +2292,7 @@ fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], cha
 // its dependents are torn down and the newline-joined list of what stopped is replied
 // for the shell to print. Returns false once the admin channel's peer (the shell) is
 // gone, so the supervisor drops it from its wait set.
-fn handle_admin(admin: u64, power: u64, notice_ticks: u64, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
+fn handle_admin(admin: u64, power: u64, notice_ticks: u64, sleeper: &mut sleep::Sleeper, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
 	let len: usize = match recv_blocking(admin, buf) {
 		Received::Message { len, .. } => len,
 		Received::Closed => return false,
@@ -2167,6 +2302,18 @@ fn handle_admin(admin: u64, power: u64, notice_ticks: u64, broker: &mut Broker, 
 	let nlen: usize = len.min(namebuf.len()).min(buf.len());
 	namebuf[..nlen].copy_from_slice(&buf[..nlen]);
 	let name: &[u8] = &namebuf[..nlen];
+	// A SLEEP'S TRANSACTION IS RUNNING: the orderly sequence is taken at once and ends it at its next step - it runs
+	// once the transaction has ended - and any other request that would start, stop or restart a service is refused as
+	// a transaction already running.
+	if sleeper.running() {
+		if name == b"!poweroff" || name == b"!reboot" {
+			let action: u64 = if name == b"!poweroff" { POWER_OFF } else { POWER_REBOOT };
+			sleeper.end_by(sleep::Door { name: alloc::format!("the admin channel's {}", core::str::from_utf8(name).unwrap_or("power verb")), action });
+		} else {
+			send_blocking(admin, b"SLEEPING", 0);
+		}
+		return true;
+	}
 	// A power verb (the shell's graceful `poweroff` / `reboot`): the reserved names
 	// `!poweroff` / `!reboot` (a real service name can never start with `!`) mean tear
 	// the whole service tree down in reverse-dependency order - flushing LogService's
@@ -2206,37 +2353,7 @@ fn handle_admin(admin: u64, power: u64, notice_ticks: u64, broker: &mut Broker, 
 	let without_notice = false;
 	if name == b"!poweroff" || name == b"!reboot" || without_notice {
 		let action: u64 = if name == b"!poweroff" { POWER_OFF } else { POWER_REBOOT };
-		let notice: proto::system::ShutdownAction = if action == POWER_REBOOT { proto::system::ShutdownAction::Reboot } else { proto::system::ShutdownAction::PowerOff };
-		if without_notice {
-			debug_write(b"service_manager: the shutdown notice is skipped (development hook)\n");
-		}
-		shutdown_all(state, channels, sup, procs, log_client, notice, if without_notice { None } else { Some(notice_ticks) }, buf);
-		// Say so before doing it. Powering off destroys the evidence of why: the machine
-		// stops, QEMU exits 0 with no reset and no fault, and from outside that is
-		// indistinguishable from a clean shutdown - which is how a suite came to end
-		// mid-run with nothing naming who ended it. The comment on the self-test path
-		// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
-		// just never reached the log.
-		debug_write(b"service_manager: power verb - shutting down\n");
-		// THROUGH THE SERVICE THAT HOLDS THE AUTHORITY, not through the syscall.
-		//
-		// `power` is a CLIENT CHANNEL of the `system_power` service SystemManager serves - it
-		// stopped being a root-Domain handle when that authority became a service. The syscall
-		// this used to call looks its argument up as a Domain carrying MANAGE, so it answered
-		// with an error every time: every `shutdown` tore the whole service tree down and then
-		// LEFT THE MACHINE RUNNING, with the kernel printing `halting` and QEMU still alive.
-		// The keyboard driver's Power key has always gone through the client and has always
-		// worked, which is how one of the two holders of this authority stayed correct.
-		//
-		// The call RETURNS ONLY WHEN IT FAILED - a machine that stops does not come back - so
-		// what follows is the refusal path, and this process is the last thing running: if it
-		// does not say so, nothing will.
-		let stopped = if action == POWER_REBOOT { system_power::Client::new(ChannelTransport { chan: power }).reboot() } else { system_power::Client::new(ChannelTransport { chan: power }).power_off() };
-		match stopped {
-			Some(Ok(())) => debug_write(b"service_manager: the machine did not stop, and the power service reported no error\n"),
-			Some(Err(_)) => debug_write(b"service_manager: the power service refused to stop the machine\n"),
-			None => debug_write(b"service_manager: the power service did not answer; the machine is still running\n"),
-		};
+		run_power_verb(action, without_notice, power, notice_ticks, state, channels, sup, procs, log_client, buf);
 		return true;
 	}
 	// `+name` starts a service that was stopped, the inverse of the bare name below. The
@@ -2279,6 +2396,44 @@ fn handle_admin(admin: u64, power: u64, notice_ticks: u64, broker: &mut Broker, 
 		}
 	}
 	true
+}
+
+// THE ORDERLY SEQUENCE: the service tree torn down in reverse-dependency order - the shutdown notice first, unless the
+// development hook leaves it out - and the machine powered off or rebooted through SystemManager's service. Whichever
+// door it came in by: an admin channel's verb at once, or one a sleep's transaction took, once that has ended.
+#[allow(clippy::too_many_arguments)]
+fn run_power_verb(action: u64, without_notice: bool, power: u64, notice_ticks: u64, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], log_client: u64, buf: &mut [u8]) {
+	let notice: proto::system::ShutdownAction = if action == POWER_REBOOT { proto::system::ShutdownAction::Reboot } else { proto::system::ShutdownAction::PowerOff };
+	if without_notice {
+		debug_write(b"service_manager: the shutdown notice is skipped (development hook)\n");
+	}
+	shutdown_all(state, channels, sup, procs, log_client, notice, if without_notice { None } else { Some(notice_ticks) }, buf);
+	// Say so before doing it. Powering off destroys the evidence of why: the machine
+	// stops, QEMU exits 0 with no reset and no fault, and from outside that is
+	// indistinguishable from a clean shutdown - which is how a suite came to end
+	// mid-run with nothing naming who ended it. The comment on the self-test path
+	// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
+	// just never reached the log.
+	debug_write(b"service_manager: power verb - shutting down\n");
+	// THROUGH THE SERVICE THAT HOLDS THE AUTHORITY, not through the syscall.
+	//
+	// `power` is a CLIENT CHANNEL of the `system_power` service SystemManager serves - it
+	// stopped being a root-Domain handle when that authority became a service. The syscall
+	// this used to call looks its argument up as a Domain carrying MANAGE, so it answered
+	// with an error every time: every `shutdown` tore the whole service tree down and then
+	// LEFT THE MACHINE RUNNING, with the kernel printing `halting` and QEMU still alive.
+	// The keyboard driver's Power key has always gone through the client and has always
+	// worked, which is how one of the two holders of this authority stayed correct.
+	//
+	// The call RETURNS ONLY WHEN IT FAILED - a machine that stops does not come back - so
+	// what follows is the refusal path, and this process is the last thing running: if it
+	// does not say so, nothing will.
+	let stopped = if action == POWER_REBOOT { system_power::Client::new(ChannelTransport { chan: power }).reboot() } else { system_power::Client::new(ChannelTransport { chan: power }).power_off() };
+	match stopped {
+		Some(Ok(())) => debug_write(b"service_manager: the machine did not stop, and the power service reported no error\n"),
+		Some(Err(_)) => debug_write(b"service_manager: the power service refused to stop the machine\n"),
+		None => debug_write(b"service_manager: the power service did not answer; the machine is still running\n"),
+	};
 }
 
 // Tear down a service and every component that transitively depends on it, dependents

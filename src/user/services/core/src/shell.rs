@@ -768,6 +768,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"powercheck", Shape::Rest),
 	(b"powerread", Shape::Rest),
 	(b"acpipower", Shape::Rest),
+	(b"sleepcheck", Shape::Rest),
 	(b"upscheck", Shape::Rest),
 	(b"bmccheck", Shape::Rest),
 	(b"typeccheck", Shape::Rest),
@@ -803,6 +804,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// those are typed at a prompt like any other command.
 	(b"lsdev", Shape::Rest),
 	(b"btctl", Shape::Rest),
+	(b"sleepctl", Shape::Rest),
 	(b"tpm", Shape::Rest),
 	(b"dfu", Shape::Rest),
 	(b"bmc", Shape::Rest),

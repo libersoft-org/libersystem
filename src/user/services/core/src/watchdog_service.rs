@@ -22,6 +22,12 @@
 //
 // A RESTART CHANGES NOTHING the hardware holds: the replacement takes the providers again and chooses as the first
 // instance did, at its first answered `alive`.
+//
+// THE SLEEP'S ANNOUNCEMENT, on the same control channel: every running timer it holds is set to its longest timeout and
+// petted once - a disarmed one is left alone, since a timeout set on it would start it - because ServiceManager, running
+// the transaction, answers no `alive` until the resume notice. Nothing is asked or petted between the two. The resume
+// notice restores the configured timeout on each of them, and the questions start again. The devices' own steps in the
+// sleep - disarmed, or bounding it - are their drivers'.
 
 #![no_std]
 #![no_main]
@@ -31,7 +37,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{Error, ProviderInfo, ProviderKind, ShutdownAction, WatchdogDescription, config, provider_catalogue, shutdown_notice, supervisor_liveness, watchdog};
+use proto::system::{Error, ProviderInfo, ProviderKind, ShutdownAction, SleepState, WatchdogDescription, config, provider_catalogue, shutdown_notice, sleep_notice, supervisor_liveness, watchdog};
 use rt::*;
 use service_logic::watchdog as wl;
 use wire::{Handles, Reader, Transport, TransportError};
@@ -74,6 +80,8 @@ struct Service {
 	started: bool,
 	// Set by the shutdown notice: nothing is asked, armed or petted after it.
 	shutting_down: bool,
+	// Set between the sleep's announcement and its resume notice: nothing is asked or petted.
+	sleeping: bool,
 	named_reported: bool,
 }
 
@@ -238,7 +246,7 @@ impl Service {
 	fn answered(&mut self, reply: &[u8]) {
 		let mut reader = Reader::new(reply);
 		let (Some(_corr), Some(true), Some(sequence)) = (reader.u32(), reader.tag(), reader.u64()) else { return };
-		if self.shutting_down || !self.schedule.answered(sequence, now_ms()) {
+		if self.shutting_down || self.sleeping || !self.schedule.answered(sequence, now_ms()) {
 			return;
 		}
 		if !self.started {
@@ -282,8 +290,63 @@ impl Service {
 	}
 }
 
+impl Service {
+	// ------------------------------------------------------------------ the sleep
+
+	fn announce(&mut self) {
+		self.sleeping = true;
+		let running: Vec<usize> = self.choice.petted().collect();
+		for at in running {
+			let longest = self.timers[at].description.max_timeout_ms;
+			match self.client(at).arm(&longest) {
+				Some(Ok(effective)) => say(&[b"gave ", self.name(at), b" ", decimal(effective as u64).as_bytes(), b" ms and a last pet for the sleep"]),
+				_ => say(&[self.name(at), b" refused its longest timeout for the sleep - petted as it is"]),
+			}
+			let _ = self.client(at).pet();
+		}
+	}
+
+	fn resumed(&mut self) {
+		if !self.sleeping {
+			return;
+		}
+		self.sleeping = false;
+		let timeout = self.policy.timeout_ms;
+		let running: Vec<usize> = self.choice.petted().collect();
+		for at in running {
+			match self.client(at).arm(&timeout) {
+				Some(Ok(effective)) => say(&[b"restored ", self.name(at), b" to ", decimal(effective as u64).as_bytes(), b" ms after the sleep"]),
+				_ => say(&[self.name(at), b" refused its configured timeout after the sleep"]),
+			}
+			let _ = self.client(at).pet();
+		}
+		// THE QUESTIONS START AGAIN, one period from now: the ones asked before the sleep are not answers to wait for.
+		self.schedule = wl::Schedule::new(&self.policy, now_ms());
+	}
+}
+
 struct Notice<'a> {
 	service: &'a mut Service,
+}
+
+impl sleep_notice::Service for Notice<'_> {
+	fn announce(&mut self, _state: SleepState) -> Result<(), Error> {
+		self.service.announce();
+		Ok(())
+	}
+
+	fn hold_writes(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn release_writes(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn resumed(&mut self, _state: SleepState) -> Result<(), Error> {
+		self.service.resumed();
+		Ok(())
+	}
 }
 
 impl shutdown_notice::Service for Notice<'_> {
@@ -369,7 +432,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		close(config_client);
 	}
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Watchdog).unwrap_or(0) } else { 0 };
-	let mut service = Service { schedule: wl::Schedule::new(&policy, now_ms()), policy, boot_bound_ms, choice: wl::Choice::default(), timers: Vec::new(), liveness, next_corr: 1, started: false, shutting_down: false, named_reported: false };
+	let mut service = Service { schedule: wl::Schedule::new(&policy, now_ms()), policy, boot_bound_ms, choice: wl::Choice::default(), timers: Vec::new(), liveness, next_corr: 1, started: false, shutting_down: false, sleeping: false, named_reported: false };
 	let mut report: Vec<u8> = Vec::from(&b"WatchdogService: online - "[..]);
 	report.extend_from_slice(if service.policy.enabled { b"armed by policy" } else { b"the policy is off" });
 	report.extend_from_slice(match mode {
@@ -388,7 +451,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut control = bootstrap;
 	let mut subscribed = subscription != 0;
 	loop {
-		let deadline_ms = match service.shutting_down {
+		let deadline_ms = match service.shutting_down || service.sleeping {
 			true => 0,
 			false => match service.schedule.tick(now_ms()) {
 				wl::Tick::Ask(sequence) => {
@@ -475,7 +538,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		};
 		let mut reply_handles = Handles::new();
-		let written = shutdown_notice::dispatch(&mut Notice { service: &mut service }, &buf[..len], &mut handles, &mut reply_buf, &mut reply_handles);
+		let op = if len >= 2 { u16::from_le_bytes([buf[0], buf[1]]) } else { 0 };
+		let written = if matches!(op, sleep_notice::OP_ANNOUNCE | sleep_notice::OP_HOLD_WRITES | sleep_notice::OP_RELEASE_WRITES | sleep_notice::OP_RESUMED) { sleep_notice::dispatch(&mut Notice { service: &mut service }, &buf[..len], &mut handles, &mut reply_buf, &mut reply_handles) } else { shutdown_notice::dispatch(&mut Notice { service: &mut service }, &buf[..len], &mut handles, &mut reply_buf, &mut reply_handles) };
 		for &leftover in handles.as_slice().iter().chain(reply_handles.as_slice()) {
 			close(leftover);
 		}

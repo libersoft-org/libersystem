@@ -20,6 +20,14 @@
 //
 // A CRASH COSTS A RESTART: the kernel disables every event it enabled and the regions go with its handles; what it
 // published stays, and the next instance's walk is reconciled with it by identity.
+//
+// THE SLEEP STATES. At each start it evaluates `\_S3`, `\_S4` and `\_S5` and registers each sleep-type pair with the
+// kernel, which writes them into PM1 control with SLP_EN - so power-off and S3 use what this machine's firmware
+// describes. A registered pair outlives this instance: it is firmware data, and a restarted instance registers the
+// same. THE PLATFORM'S STEP of the suspend transaction, `platform-sleep`, is served on the control channel ServiceManager
+// holds for this service, beside the sleep notice: `prepare` evaluates `_PRW` and `_DSW` (or `_PSW`) on each wake node
+// and arms its wake GPE, then runs `_PTS` and `_SST`; `wake` runs `_WAK` and `_SST` and disarms what `prepare` armed.
+// The node channels still refuse `_PTS` and `_WAK`.
 
 #![no_std]
 #![no_main]
@@ -38,7 +46,7 @@ use aml::host::{Access, Host, HostError, TableBytes};
 use aml::{Aml, Limits, NodeId, Object, Path, Seg, Space};
 use ipc_client::ChannelTransport;
 use platform::report::{self, Function, List};
-use proto::system::{AcpiConnectionKind, AcpiNotification, Error, acpi_admin, acpi_node, gpio_device, i2c_device};
+use proto::system::{AcpiConnectionKind, AcpiNotification, Error, SleepState, acpi_admin, acpi_node, gpio_device, i2c_device, platform_sleep, sleep_notice};
 use rt::*;
 use wire::Handles;
 
@@ -620,6 +628,8 @@ struct Service {
 	// The event this instance's embedded controller raises, and its node.
 	ec_gpe: Option<u16>,
 	ec_node: Option<NodeId>,
+	// The wake GPEs `prepare` armed for the sleep in progress, which `wake` disarms.
+	wake_armed: Vec<u16>,
 }
 
 impl Service {
@@ -1403,6 +1413,147 @@ fn enable_events(service: &mut Service) {
 	say(&format!("{count} general-purpose event(s); enabled: {}", if enabled.is_empty() { String::from("none") } else { enabled.join(" ") }));
 }
 
+// THE SLEEP TYPES THIS FIRMWARE DESCRIBES, registered with the kernel: `\_S3`, `\_S4` and `\_S5`, each a package whose
+// first two integers are SLP_TYPa and SLP_TYPb. A state the namespace does not describe is not registered, and the
+// kernel refuses to enter it.
+fn register_sleep_types(service: &mut Service) {
+	let mut registered: Vec<&str> = Vec::new();
+	for (path, state, name) in [("\\_S3_", SLEEP_STATE_RAM, "S3"), ("\\_S4_", SLEEP_STATE_DISK, "S4"), ("\\_S5_", SLEEP_STATE_SOFT_OFF, "S5")] {
+		let Some(node) = service.aml.lookup(path) else { continue };
+		let Some(Object::Package(elements)) = service.evaluate(node, &[], "the sleep type") else {
+			say(&format!("{path} is not a package - {name} is not registered"));
+			continue;
+		};
+		let integer = |at: usize| elements.get(at).and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None });
+		let (Some(a), b) = (integer(0), integer(1)) else {
+			say(&format!("{path} names no sleep type - {name} is not registered"));
+			continue;
+		};
+		let answer = unsafe { syscall(SYS_FIRMWARE_SLEEP_TYPE, service.host.privilege, state, a & 7, b.unwrap_or(a) & 7) } as i64;
+		if answer == 0 {
+			registered.push(name);
+		} else {
+			say(&format!("the kernel refused {name}'s sleep type - {}", errno_text(answer)));
+		}
+	}
+	say(&format!("sleep types registered: {}", if registered.is_empty() { String::from("none") } else { registered.join(" ") }));
+}
+
+// `_SST`'S VALUES: working, waking, sleeping, sleeping with its context saved.
+const SST_WORKING: u64 = 1;
+const SST_WAKING: u64 = 2;
+const SST_SLEEPING: u64 = 3;
+const SST_HIBERNATING: u64 = 4;
+
+impl Service {
+	// A METHOD BY ITS ABSOLUTE PATH, where the namespace has it: `_PTS`, `_WAK`, `\_SI._SST`. One it does not have is
+	// no failure - most machines have no `\_SI`.
+	fn root_method(&mut self, path: &str, argument: u64) {
+		if let Some(node) = self.aml.lookup(path) {
+			let _ = self.evaluate(node, &[Object::Integer(argument)], "the sleep method");
+		}
+	}
+
+	// ONE WAKE NODE ARMED: `_PRW`'s event - an index into the FADT's GPE blocks; an event on a GPE block device is not
+	// one this service can arm - then `_DSW` (or `_PSW`, where there is no `_DSW`), then the event set for wake.
+	fn arm_wake(&mut self, identity: &str, target: u64) {
+		let Some(node) = self.node_of_identity(identity) else {
+			say(&format!("{identity} is not in the namespace - its wake is not armed"));
+			return;
+		};
+		let prw = match self.aml.child_value(node, b"_PRW", &mut self.host) {
+			Ok(Some(Object::Package(elements))) => elements,
+			_ => {
+				say(&format!("{identity} has no _PRW - it cannot wake the machine"));
+				return;
+			}
+		};
+		let number = prw.first().and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None });
+		let Some(number) = number else {
+			say(&format!("{identity}'s _PRW names an event on a GPE block device - its wake is not armed"));
+			return;
+		};
+		let deepest = prw.get(1).and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None }).unwrap_or(0);
+		if deepest < target {
+			say(&format!("{identity} wakes from S{deepest} at the deepest - not from S{target}; its wake is not armed"));
+			return;
+		}
+		if !self.run(node, b"_DSW", &[Object::Integer(1), Object::Integer(target), Object::Integer(0)]) {
+			self.run(node, b"_PSW", &[Object::Integer(1)]);
+		}
+		let number = number as u16;
+		if gpe(self.host.privilege, GPE_WAKE_SET, number) == 0 {
+			self.wake_armed.push(number);
+			say(&format!("{identity} armed to wake the machine on general-purpose event {number:#04x}"));
+		} else {
+			say(&format!("general-purpose event {number:#04x} could not be set for {identity}'s wake"));
+		}
+	}
+}
+
+// THE PLATFORM'S STEP - see the head of this file. `_PTS` for a sleep the firmware enters; suspend to idle is no
+// firmware transition, so it runs `_SST` alone.
+impl platform_sleep::Service for Service {
+	fn prepare(&mut self, state: SleepState, wake_nodes: Vec<String>) -> Result<(), Error> {
+		let target: u64 = match state {
+			SleepState::Idle => 0,
+			SleepState::Ram => 3,
+			SleepState::Disk => 4,
+		};
+		self.wake_armed.clear();
+		for identity in &wake_nodes {
+			self.arm_wake(identity, target);
+		}
+		if target != 0 {
+			self.root_method("\\_PTS", target);
+		}
+		self.root_method("\\_SI_._SST", if state == SleepState::Disk { SST_HIBERNATING } else { SST_SLEEPING });
+		say(&format!(
+			"the platform is prepared for {}",
+			match state {
+				SleepState::Idle => "suspend to idle",
+				SleepState::Ram => "S3",
+				SleepState::Disk => "S4",
+			}
+		));
+		Ok(())
+	}
+
+	fn wake(&mut self, state: SleepState) -> Result<(), Error> {
+		self.root_method("\\_SI_._SST", SST_WAKING);
+		match state {
+			SleepState::Idle => {}
+			SleepState::Ram => self.root_method("\\_WAK", 3),
+			SleepState::Disk => self.root_method("\\_WAK", 4),
+		}
+		for number in core::mem::take(&mut self.wake_armed) {
+			let _ = gpe(self.host.privilege, GPE_WAKE_CLEAR, number);
+		}
+		self.root_method("\\_SI_._SST", SST_WORKING);
+		say("the platform is awake again");
+		Ok(())
+	}
+}
+
+// THE SLEEP NOTICE: nothing is asked of this service at the announcement or the resume; its step is `platform-sleep`.
+impl sleep_notice::Service for Service {
+	fn announce(&mut self, _state: SleepState) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn hold_writes(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn release_writes(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn resumed(&mut self, _state: SleepState) -> Result<(), Error> {
+		Ok(())
+	}
+}
+
 // THE GLOBAL LOCK'S DWORD, in the FACS mapped for this instance.
 fn map_facs(service: &mut Service) {
 	let Some(facs) = service.host.fixed.facs else { return };
@@ -1421,7 +1572,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let (privilege, admin_root) = (roles[0], roles[1]);
-	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None };
+	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, wake_armed: Vec::new() };
 	if privilege == 0 {
 		say("no FirmwareInterpreter privilege was handed over - the namespace is not loaded");
 		send_blocking(bootstrap, b"AcpiService: online - no firmware privilege", 0);
@@ -1476,6 +1627,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		service.report(&out[..len], "the namespace");
 	}
 	enable_events(&mut service);
+	register_sleep_types(&mut service);
 	let online = format!("AcpiService: online - instance {}, {loaded} table(s), {} node(s) reported", service.instance, reported.len());
 	print(online.as_bytes());
 	print(b"\n");
@@ -1539,11 +1691,18 @@ fn serve(service: &mut Service, bootstrap: u64) -> ! {
 			service.gpio_event(at);
 			continue;
 		}
+		// THE CONTROL CHANNEL: ServiceManager's sleep notice and the platform's step.
 		if handle == control {
 			match try_recv_caps(control, &mut buf) {
-				PolledCaps::Message { handles, .. } => {
-					for &leftover in handles.as_slice() {
+				PolledCaps::Message { len, mut handles } => {
+					let op = if len >= 2 { u16::from_le_bytes([buf[0], buf[1]]) } else { 0 };
+					let mut reply_handles = Handles::new();
+					let written = if matches!(op, platform_sleep::OP_PREPARE | platform_sleep::OP_WAKE) { platform_sleep::dispatch(service, &buf[..len], &mut handles, &mut reply, &mut reply_handles) } else { sleep_notice::dispatch(service, &buf[..len], &mut handles, &mut reply, &mut reply_handles) };
+					for &leftover in handles.as_slice().iter().chain(reply_handles.as_slice()) {
 						close(leftover);
+					}
+					if let Some(written) = written {
+						let _ = try_send(control, &reply[..written], 0);
 					}
 				}
 				PolledCaps::Empty => {}

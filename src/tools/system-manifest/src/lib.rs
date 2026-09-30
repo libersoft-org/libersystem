@@ -120,6 +120,12 @@ struct RawDriver {
 	// that can opt out.
 	#[serde(default, rename = "heartbeat-deadline")]
 	heartbeat_deadline: Option<u32>,
+	// HOW LONG THIS DRIVER MAY TAKE TO ANSWER `SUSPEND` AND `RESUME`, in ticks before the port's scale - its
+	// declaration that it carries the sleep exchange at all. Absent means it does not, and while a binding without
+	// one is online every sleep is refused before anything is frozen, naming it. `0 < deadline <=
+	// MAX_SUSPEND_DEADLINE` where present, for the heartbeat's two reasons.
+	#[serde(default, rename = "suspend-deadline")]
+	suspend_deadline: Option<u32>,
 	// WHAT THIS DRIVER DOES TO MEMORY ON ITS OWN, declared rather than defaulted. REQUIRED: absence
 	// is a parse failure, not `trusted-untranslated` by omission, because a driver that masters the
 	// bus without saying so is exactly the silent default this field exists to remove. A closed
@@ -751,6 +757,8 @@ pub struct Driver {
 	pub requires: Vec<ProviderKindName>,
 	pub provides: Vec<Provides>,
 	pub heartbeat_deadline: Option<u32>,
+	// How long it may take to answer `SUSPEND` and `RESUME` - see `RawDriver::suspend_deadline`.
+	pub suspend_deadline: Option<u32>,
 	// The declared DMA policy. Present on every driver that validated - see `RawDriver::dma`.
 	pub dma: DmaPolicy,
 }
@@ -759,6 +767,10 @@ pub struct Driver {
 // `driver_protocol::MAX_HEARTBEAT_DEADLINE` is, and the same one ServiceManager's watchdog already
 // uses for services - one question about two subjects, not two constants that drift.
 pub const MAX_HEARTBEAT_DEADLINE: u32 = 100;
+
+// The longest a driver may declare for answering `SUSPEND` or `RESUME`: `driver_protocol::MAX_SUSPEND_DEADLINE`,
+// ten seconds - a UCSI command's bound, the longest step any driver has to finish.
+pub const MAX_SUSPEND_DEADLINE: u32 = 1_000;
 
 // HOW MANY PROVIDER CONNECTIONS ONE DRIVER SERVES AT ONCE.
 //
@@ -1298,6 +1310,7 @@ impl Manifest {
 				requires: raw.requires.clone(),
 				provides: raw.provides.iter().map(|entry| Provides { kind: entry.kind, most: entry.most, consumers: entry.consumers.unwrap_or(1).max(1) }).collect(),
 				heartbeat_deadline: raw.heartbeat_deadline,
+				suspend_deadline: raw.suspend_deadline,
 				rules: raw
 					.rules
 					.iter()
@@ -1900,6 +1913,11 @@ fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativeP
 		match driver.heartbeat_deadline {
 			Some(0) => push_error(errors, format!("{location}.driver.heartbeat-deadline"), "a deadline of 0 is read by `wait_any` as NO timeout, so this driver would not be supervised strictly - it would not be supervised at all, and would look like the most responsive driver in the machine. Leave the key out to say it is not heartbeat-supervised"),
 			Some(deadline) if deadline > MAX_HEARTBEAT_DEADLINE => push_error(errors, format!("{location}.driver.heartbeat-deadline"), format!("{deadline} ticks is past the shared ceiling of {MAX_HEARTBEAT_DEADLINE}; an entry that may name any deadline it likes is an entry that can opt out")),
+			_ => {}
+		}
+		match driver.suspend_deadline {
+			Some(0) => push_error(errors, format!("{location}.driver.suspend-deadline"), "a deadline of 0 is read by `wait_any` as NO timeout, so a suspend this driver never answered would hold the sleep for ever. Leave the key out to say it does not carry the exchange"),
+			Some(deadline) if deadline > MAX_SUSPEND_DEADLINE => push_error(errors, format!("{location}.driver.suspend-deadline"), format!("{deadline} ticks is past the ceiling of {MAX_SUSPEND_DEADLINE}")),
 			_ => {}
 		}
 		for (index, rule) in driver.rules.iter().enumerate() {

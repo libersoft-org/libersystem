@@ -202,6 +202,11 @@ fn msix_pages_for_entry(offset: u64) -> u64 {
 const NO_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static MSIX_ENTRY_OFFSET: [core::sync::atomic::AtomicU32; MSI_COUNT] = [NO_OFFSET; MSI_COUNT];
 
+// WHAT EACH SLOT'S ENTRY WAS PROGRAMMED WITH - the destination, and whether it was made deliverable - kept because an
+// S3 resets the table with the device and no driver knows the message the kernel wrote there.
+static MSIX_DEST: [core::sync::atomic::AtomicU8; MSI_COUNT] = [const { core::sync::atomic::AtomicU8::new(0) }; MSI_COUNT];
+static MSIX_LIVE: [core::sync::atomic::AtomicBool; MSI_COUNT] = [const { core::sync::atomic::AtomicBool::new(false) }; MSI_COUNT];
+
 // Whether `vector` is a kernel MSI-X vector.
 fn is_msi(vector: u32) -> bool {
 	vector >= MSI_BASE as u32 && (vector as usize) < MSI_BASE as usize + MSI_COUNT
@@ -378,6 +383,8 @@ fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 	// the entry need not be at offset 0, and a mask written at a guessed offset would corrupt
 	// whatever the device keeps there instead.
 	MSIX_ENTRY_OFFSET[slot].store(offset as u32, Ordering::Release);
+	MSIX_DEST[slot].store(dest, Ordering::Release);
+	MSIX_LIVE[slot].store(false, Ordering::Release);
 	let flags = super::paging::WRITABLE | super::paging::NO_CACHE | super::paging::NO_EXECUTE;
 	for page in 0..msix_pages_for_entry(offset) {
 		super::paging::map_page(virt + page * 0x1000, (table_phys & !0xfff) + page * 0x1000, flags);
@@ -408,6 +415,91 @@ pub fn unmask_msi(vector: u32, _table_phys: u64) {
 		let entry = (virt + offset) as *mut u32;
 		// SAFETY: the same entry `program_msix_entry` wrote, through the same mapping.
 		unsafe { entry.add(3).write_volatile(0) };
+		MSIX_LIVE[slot].store(true, Ordering::Release);
+	}
+}
+
+// EVERY ENTRY THE KERNEL PROGRAMMED, WRITTEN AGAIN after an S3 reset the tables: the message address and data as
+// programmed, and deliverable exactly where it was. A slot with no mapped page holds no entry.
+pub fn restore_msix_entries() {
+	for slot in 0..MSI_COUNT {
+		let virt = msix_virt(slot);
+		if super::paging::translate(virt).is_none() {
+			continue;
+		}
+		let offset = MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64;
+		let entry = (virt + offset) as *mut u32;
+		let dest = MSIX_DEST[slot].load(Ordering::Acquire);
+		let vector = MSI_BASE + slot as u8;
+		// SAFETY: the entry `program_msix_entry` wrote, through the mapping it made, which is still there.
+		unsafe {
+			entry.add(3).write_volatile(1);
+			entry.add(0).write_volatile(0xFEE0_0000 | ((dest as u32) << 12));
+			entry.add(1).write_volatile(0);
+			entry.add(2).write_volatile(vector as u32);
+			if MSIX_LIVE[slot].load(Ordering::Acquire) {
+				entry.add(3).write_volatile(0);
+			}
+		}
+	}
+}
+
+// THE CLAIMED WIRED LINES A SUSPEND TO IDLE MASKED - every line a driver holds, whose device that driver has
+// quiesced - so none can end the sleep; the ones that were live, unmasked again after.
+static SLEEP_MASKED: [core::sync::atomic::AtomicBool; IRQ_COUNT + WIRED_COUNT] = [const { core::sync::atomic::AtomicBool::new(false) }; IRQ_COUNT + WIRED_COUNT];
+
+pub fn mask_claimed_lines() {
+	for (at, slot) in LINES.iter().enumerate() {
+		let gsi = slot.lock().as_ref().map(|line| line.gsi);
+		if let Some(gsi) = gsi
+			&& super::ioapic::unmasked(gsi)
+		{
+			super::ioapic::mask(gsi);
+			SLEEP_MASKED[at].store(true, Ordering::Release);
+		}
+	}
+}
+
+// AND EVERY LIVE MSI-X ENTRY THE KERNEL PROGRAMMED, masked the same way for a suspend to idle - a message is an
+// interrupt like a wired line, and its device's driver has quiesced it - and unmasked again after. The wake set's are a
+// driver's to mark (the wake set has no such entry yet), so none is left live here.
+static SLEEP_MSIX_MASKED: [core::sync::atomic::AtomicBool; MSI_COUNT] = [const { core::sync::atomic::AtomicBool::new(false) }; MSI_COUNT];
+
+pub fn mask_msix_entries() {
+	for slot in 0..MSI_COUNT {
+		let virt = msix_virt(slot);
+		if !MSIX_LIVE[slot].load(Ordering::Acquire) || super::paging::translate(virt).is_none() {
+			continue;
+		}
+		let entry = (virt + MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64) as *mut u32;
+		// SAFETY: the entry `program_msix_entry` wrote, through the mapping it made, which is still there.
+		unsafe { entry.add(3).write_volatile(1) };
+		SLEEP_MSIX_MASKED[slot].store(true, Ordering::Release);
+	}
+}
+
+pub fn unmask_msix_entries() {
+	for slot in 0..MSI_COUNT {
+		if !SLEEP_MSIX_MASKED[slot].swap(false, Ordering::AcqRel) {
+			continue;
+		}
+		let virt = msix_virt(slot);
+		if !MSIX_LIVE[slot].load(Ordering::Acquire) || super::paging::translate(virt).is_none() {
+			continue;
+		}
+		let entry = (virt + MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64) as *mut u32;
+		// SAFETY: as above.
+		unsafe { entry.add(3).write_volatile(0) };
+	}
+}
+
+pub fn unmask_claimed_lines() {
+	for (at, slot) in LINES.iter().enumerate() {
+		if SLEEP_MASKED[at].swap(false, Ordering::AcqRel)
+			&& let Some(gsi) = slot.lock().as_ref().map(|line| line.gsi)
+		{
+			super::ioapic::unmask(gsi);
+		}
 	}
 }
 
@@ -429,6 +521,7 @@ fn mask_and_unmap_msix_entry(slot: usize) {
 			// stops the next one, which is all this can promise without the driver's cooperation.
 			entry.add(3).write_volatile(1);
 		}
+		MSIX_LIVE[slot].store(false, Ordering::Release);
 		// EVERY PAGE THIS SLOT MAPPED, in reverse - the mask above is written through the second
 		// one when the entry straddles, so it has to go last.
 		for page in (0..msix_pages_for_entry(offset)).rev() {

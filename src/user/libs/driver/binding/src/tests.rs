@@ -2056,3 +2056,88 @@ fn a_platform_rule_matches_any_id_the_device_answers_to_and_its_kind_counts() {
 	assert_eq!(PlatformId::from_bytes(PLATFORM_ID_TABLE, b"TPM2"), PlatformId::new(PLATFORM_ID_TABLE, b"TPM2").unwrap());
 	assert_eq!(PlatformId::new(PLATFORM_ID_HID, &[b'x'; 47]), None, "past the bound");
 }
+
+// A SLEEP SUSPENDS AN ONLINE BINDING AND NOTHING ELSE, and a suspended one goes back online or through the teardown.
+#[test]
+fn a_binding_is_suspended_only_from_online_and_leaves_only_for_online_or_the_teardown() {
+	assert!(BindingState::Online.may_move_to(BindingState::Suspended));
+	assert!(BindingState::Suspended.may_move_to(BindingState::Online));
+	assert!(BindingState::Suspended.may_move_to(BindingState::Stopping), "a device that did not come back is torn down");
+	for from in [
+		BindingState::Unbound,
+		BindingState::Binding,
+		BindingState::Stopping,
+		BindingState::Backoff,
+		BindingState::Failed,
+		BindingState::Quarantined,
+		BindingState::Disabled,
+		BindingState::DependencyPending,
+		BindingState::Removed,
+	] {
+		assert!(!from.may_move_to(BindingState::Suspended), "{} cannot be suspended", core::str::from_utf8(from.name()).unwrap_or("?"));
+	}
+	for to in [
+		BindingState::Unbound,
+		BindingState::Binding,
+		BindingState::Backoff,
+		BindingState::Failed,
+		BindingState::Quarantined,
+		BindingState::Disabled,
+		BindingState::Removed,
+	] {
+		assert!(!BindingState::Suspended.may_move_to(to), "a suspended binding does not go to {}", core::str::from_utf8(to.name()).unwrap_or("?"));
+	}
+}
+
+// THE SLEEP'S ANSWERS MOVE THE BINDING ONLY IN THE STATE THEIR QUESTION WAS ASKED IN: `SUSPENDED` from `Online`, a
+// refusal leaving it there, `RESUMED` from `Suspended` - back to `Online`, or through the teardown as a retryable
+// failure for a device that did not come back.
+#[test]
+fn the_sleep_answers_move_a_binding_only_where_they_were_asked() {
+	use driver_protocol::{SuspendOutcome, Suspended};
+	let done = BindingEvent::Suspended { generation: 7, answer: Suspended { outcome: SuspendOutcome::Done, awake_by_ms: 0 } };
+	let armed = BindingEvent::Suspended { generation: 7, answer: Suspended { outcome: SuspendOutcome::DoneWakeArmed, awake_by_ms: 0 } };
+	let refused = BindingEvent::Suspended { generation: 7, answer: Suspended { outcome: SuspendOutcome::Refused(DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 } };
+	for event in [done, armed] {
+		assert!(reduce_event(BindingState::Online, event) == EventDecision::Admitted { event, next_state: Some(BindingState::Suspended), cause: None, planned_stop: false });
+	}
+	assert!(reduce_event(BindingState::Online, refused) == EventDecision::Admitted { event: refused, next_state: None, cause: None, planned_stop: false }, "a refusal fails the suspend and leaves the driver online");
+	for state in [BindingState::Binding, BindingState::Stopping, BindingState::Suspended] {
+		assert!(reduce_event(state, done) == EventDecision::Refused, "a SUSPENDED outside Online is refused");
+	}
+	let back = BindingEvent::Resumed { generation: 7, back: true };
+	let lost = BindingEvent::Resumed { generation: 7, back: false };
+	assert!(reduce_event(BindingState::Suspended, back) == EventDecision::Admitted { event: back, next_state: Some(BindingState::Online), cause: None, planned_stop: false });
+	let cause = FailureCause::DriverReported(DriverFailureCode::DeviceNotResponding);
+	assert!(reduce_event(BindingState::Suspended, lost) == EventDecision::Admitted { event: lost, next_state: Some(BindingState::Stopping), cause: Some(cause), planned_stop: false });
+	assert!(cause.retryable(), "a device that did not come back is rebound");
+	assert!(reduce_event(BindingState::Online, back) == EventDecision::Refused, "a RESUMED outside Suspended is refused");
+	assert_eq!(done.generation(), 7);
+	assert_eq!(lost.generation(), 7);
+	// A suspended binding is asked to stop at a shutdown like an online one: its control path is live.
+	assert!(shutdown_step(BindingState::Suspended, true, false) == ShutdownStep::AskItToStop);
+	// And a crash while suspended is a crash: the teardown takes it.
+	assert!(reduce_event(BindingState::Suspended, BindingEvent::Exited { generation: 7 }) == EventDecision::Admitted { event: BindingEvent::Exited { generation: 7 }, next_state: Some(BindingState::Stopping), cause: Some(FailureCause::DriverExited), planned_stop: false });
+}
+
+// THE WATCHDOG AFTER A SLEEP starts again a whole period away and counts nothing: a PING outstanding when the binding
+// suspended is forgotten rather than expired against the sleep.
+#[test]
+fn a_watchdog_restarted_after_a_sleep_forgets_the_outstanding_ping_and_counts_no_miss() {
+	let mut beat = Heartbeat::default();
+	beat.arm(Some(100), 0, 50);
+	let Beat::Ask(_) = beat.tick(50) else { panic!("a ping is due at the period") };
+	beat.asked(50);
+	assert!(beat.awaiting());
+	// The sleep: nothing ticks it, and the outstanding ping's deadline passes long before the resume.
+	beat.restart(10_000, 50);
+	assert!(!beat.awaiting(), "the outstanding ping is forgotten");
+	assert_eq!(beat.missed(), 0, "a sleep is not a miss");
+	assert!(!beat.expire(10_001), "nothing expires against the sleep");
+	assert!(beat.tick(10_001) == Beat::Idle, "the next ping is a whole period away");
+	assert!(matches!(beat.tick(10_050), Beat::Ask(_)));
+	// An unsupervised watchdog stays unsupervised.
+	let mut none = Heartbeat::default();
+	none.restart(10, 50);
+	assert!(!none.supervised());
+}

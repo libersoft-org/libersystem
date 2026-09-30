@@ -229,6 +229,9 @@ pub struct Domain {
 	// Set once the Domain is killed; its processes' threads observe this at their
 	// next scheduling point and exit.
 	killed: AtomicBool,
+	// SET WHILE THE SUBTREE IS FROZEN FOR A SLEEP: a child created under a frozen Domain starts frozen, and so does
+	// a process registered with one - so nothing escapes a freeze by being created during it.
+	frozen: AtomicBool,
 }
 
 impl Domain {
@@ -238,7 +241,7 @@ impl Domain {
 		// A parentless Domain is built at boot only; `new_child` is the syscall path and it is
 		// fallible.
 		// ALLOC-OK: boot only - the root Domain and the test Domains, before any syscall runs.
-		Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: None, children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) })
+		Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: None, children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false), frozen: AtomicBool::new(false) })
 	}
 
 	// The root Domain: no caps, no parent. Kernel threads live here so existing
@@ -257,7 +260,7 @@ impl Domain {
 	// enforcing anything.
 	pub fn new_child(parent: &Arc<Domain>, memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Option<Arc<Self>> {
 		// FALLIBLY: `SYS_DOMAIN_CREATE` reaches this.
-		let child = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) })?;
+		let child = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false), frozen: AtomicBool::new(false) })?;
 		// The check is UNDER the same lock as the push, which is what `register_process` was taught
 		// and this was not - the doc comment already claimed it. A kill takes a snapshot of the
 		// children and then walks it, so a child pushed after the snapshot and before the flag is
@@ -266,6 +269,9 @@ impl Domain {
 		if parent.killed.load(Ordering::Acquire) {
 			return None;
 		}
+		// UNDER THE SAME LOCK THE FREEZE'S WALK READS THE CHILDREN UNDER: a child added after the walk read the
+		// list takes the flag here, and one added before it is reached by the walk.
+		child.frozen.store(parent.frozen.load(Ordering::Acquire), Ordering::Release);
 		// BOOKED, NOT BOUNDED. This carried `ALLOC-OK: bounded by the Domain quota`, and a quota says
 		// the list will never hold a millionth entry - it says nothing about whether the heap can add
 		// the first one under pressure. That is the argument this milestone rejected for the
@@ -305,6 +311,10 @@ impl Domain {
 			return false;
 		}
 		list.retain(|weak| weak.strong_count() > 0);
+		// A PROCESS CREATED IN A FROZEN SUBTREE STARTS FROZEN - under the list's lock, for `new_child`'s reason.
+		if self.frozen.load(Ordering::Acquire) {
+			process.set_frozen(true);
+		}
 		// The same correction as `new_child`: dropping dead entries first makes a growth less likely
 		// and does not make it impossible, and a bound is not a booking. `false` is the refusal this
 		// function already returns, and `Thread::build` already declines to construct a thread into a
@@ -357,6 +367,105 @@ impl Domain {
 			at += 1;
 		}
 		(written, at)
+	}
+
+	// FREEZE OR THAW THIS DOMAIN'S SUBTREE: every Domain's flag and every process's, in batches as `kill` walks
+	// them. A thaw wakes each process's parked threads, which park on its koid.
+	pub fn set_frozen(&self, on: bool) {
+		{
+			// The flag is set under the process list's lock, which `register_process` reads it under.
+			let _list = self.processes.lock();
+			self.frozen.store(on, Ordering::Release);
+		}
+		let mut at = 0;
+		loop {
+			let mut batch: [Option<Arc<Process>>; 8] = [const { None }; _];
+			let (written, next) = self.processes_from(at, &mut batch);
+			for slot in batch.iter_mut().take(written) {
+				if let Some(process) = slot.take() {
+					process.set_frozen(on);
+					if !on {
+						crate::sched::wake_object(process.header().koid());
+					}
+				}
+			}
+			if written == 0 && next == at {
+				break;
+			}
+			at = next;
+		}
+		let mut at = 0;
+		loop {
+			let mut batch: [Option<Arc<Domain>>; 8] = [const { None }; _];
+			let (written, next) = {
+				// Read under the children's lock, which `new_child` sets a new child's flag under.
+				self.children_from(at, &mut batch)
+			};
+			for slot in batch.iter_mut().take(written) {
+				if let Some(child) = slot.take() {
+					child.set_frozen(on);
+				}
+			}
+			if written == 0 && next == at {
+				break;
+			}
+			at = next;
+		}
+	}
+
+	pub fn is_frozen(&self) -> bool {
+		self.frozen.load(Ordering::Acquire)
+	}
+
+	// WHETHER NO THREAD OF THE SUBTREE IS EXECUTING USER CODE: every live thread blocked - in a wait, or parked by the
+	// freeze - or exited. A thread Running or Ready may still reach user mode before its next preemption parks it.
+	pub fn quiescent(&self) -> bool {
+		use crate::object::thread::ThreadState;
+		let mut at = 0;
+		loop {
+			let mut batch: [Option<Arc<Process>>; 8] = [const { None }; _];
+			let (written, next) = self.processes_from(at, &mut batch);
+			for slot in batch.iter_mut().take(written) {
+				let Some(process) = slot.take() else { continue };
+				let mut from = 0;
+				loop {
+					let mut threads: [Option<Arc<crate::object::thread::Thread>>; 8] = [const { None }; _];
+					let (count, after) = process.live_threads_from(from, &mut threads);
+					for thread in threads.iter_mut().take(count) {
+						if let Some(thread) = thread.take()
+							&& matches!(thread.state(), ThreadState::Running | ThreadState::Ready)
+						{
+							return false;
+						}
+					}
+					if count == 0 && after == from {
+						break;
+					}
+					from = after;
+				}
+			}
+			if written == 0 && next == at {
+				break;
+			}
+			at = next;
+		}
+		let mut at = 0;
+		loop {
+			let mut batch: [Option<Arc<Domain>>; 8] = [const { None }; _];
+			let (written, next) = self.children_from(at, &mut batch);
+			for slot in batch.iter_mut().take(written) {
+				if let Some(child) = slot.take()
+					&& !child.quiescent()
+				{
+					return false;
+				}
+			}
+			if written == 0 && next == at {
+				break;
+			}
+			at = next;
+		}
+		true
 	}
 
 	// Kill this Domain and its entire subtree: mark every Domain killed and

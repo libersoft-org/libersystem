@@ -103,9 +103,46 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // bounded; the port recovers by itself once the host reads again, precisely because the
 // descriptor was never reused behind the device's back.
 
+// THE SLEEP: the development wire must outlive it - the host on its other end is waiting for the answers to what it
+// asked before the machine slept - so a device that lost its state is set up again under the same binding: stopped for
+// a sleep that cuts the power, negotiated back and its queues and receive pool restored at the resume.
+struct Sleep<'a, 'b> {
+	stream: &'a mut Stream<'b>,
+	serving: &'a mut common::Serving,
+	stopped: bool,
+}
+
+impl common::SleepStep for Sleep<'_, '_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		match self.stream.device().sleep(request) {
+			Some(stopped) => {
+				self.stopped = stopped;
+				driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+			}
+			None => driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 },
+		}
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		if !lost_power && !self.stopped {
+			return true;
+		}
+		if !self.stream.device().restore() || !self.stream.rearm() {
+			return false;
+		}
+		self.stream.device().driver_ok();
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
 fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, stream: &mut Stream) -> ! {
 	let mut serving: common::Serving = common::Serving::from_offers(&[(CONSOLE_TOKEN, bytes)]);
 	let mut buffers: serial_port::Buffers = serial_port::Buffers::default();
+	common::takes_sleep();
 	loop {
 		// Anything the device has already handed back goes out before this thread parks, so a
 		// completion that arrived with an interrupt somebody else consumed is not left waiting
@@ -113,14 +150,20 @@ fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, stream: &mut 
 		if stream.drain(bind, bootstrap, &mut buffers) {
 			continue;
 		}
-		match common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) {
+		match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &[irq], false) {
 			None => ended(bootstrap, bind, stream.capability()),
+			// THE SLEEP, between two exchanges.
+			Some(None) => {
+				if !common::take_sleep_step(bootstrap, bind, &mut Sleep { stream: &mut *stream, serving: &mut serving, stopped: false }) {
+					ended(bootstrap, bind, stream.capability());
+				}
+			}
 			// A REPLACEMENT CONSUMER, and the session before it is over. This is the whole of
 			// what used to be the `BYTES` tag and the `adopt` loop underneath it: the manager
 			// mints the pair, the driver is told, and nothing here has to know that the process
 			// above it was restarted.
-			Some(common::ProviderReady::Connected(_)) => stream.reset(),
-			Some(common::ProviderReady::Consumer(index)) => {
+			Some(Some(common::ProviderReady::Connected(_))) => stream.reset(),
+			Some(Some(common::ProviderReady::Consumer(index))) => {
 				if !stream.serve(&mut serving, index, bind, bootstrap, &mut buffers) {
 					let token: u16 = serving.close_at(index);
 					stream.reset();
@@ -134,7 +177,7 @@ fn pump(bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, stream: &mut 
 					}
 				}
 			}
-			Some(common::ProviderReady::Device(_)) => {
+			Some(Some(common::ProviderReady::Device(_))) => {
 				// Read the ISR to deassert the device's level-triggered INTx line before
 				// acking (a harmless zero read on MSI-X, which is edge-triggered).
 				let _ = stream.device().read_isr();

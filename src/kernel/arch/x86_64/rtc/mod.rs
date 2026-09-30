@@ -182,3 +182,84 @@ pub fn read_unix() -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+// ------------------------------------------------------------------ the alarm an S3 wakes on
+
+// The alarm registers, and Status B's alarm-interrupt enable. Status C is read to clear what fired.
+const REG_ALARM_SECONDS: u8 = 0x01;
+const REG_ALARM_MINUTES: u8 = 0x03;
+const REG_ALARM_HOURS: u8 = 0x05;
+const REG_STATUS_C: u8 = 0x0c;
+const STATUS_B_ALARM: u8 = 0x20;
+
+fn bin_to_bcd(v: u8) -> u8 {
+	(v / 10) << 4 | (v % 10)
+}
+
+unsafe fn write_reg(reg: u8, value: u8) {
+	unsafe {
+		outb(0x70, reg & 0x7f);
+		outb(0x71, value);
+	}
+}
+
+// ARM THE CMOS ALARM `after` SECONDS FROM NOW - the S3 timed wake, which the chipset raises as RTC_STS with RTC_EN
+// set. The alarm compares seconds, minutes and hours, so it reaches a day ahead and no further: `false` for more
+// than that, or a clock that will not read. The time of day is read and the alarm written in the registers' own
+// format - binary or BCD, 24-hour or 12-hour - as Status B says.
+pub fn arm_alarm(after: u64) -> bool {
+	if after == 0 || after >= 24 * 3600 {
+		return false;
+	}
+	let _cmos = CMOS.lock();
+	unsafe {
+		let mut spins = 0;
+		while read_reg(REG_STATUS_A) & STATUS_A_UPDATING != 0 {
+			spins += 1;
+			if spins > UIP_SPINS {
+				return false;
+			}
+		}
+		let status_b = read_reg(REG_STATUS_B);
+		let binary = status_b & STATUS_B_BINARY != 0;
+		let twenty_four = status_b & STATUS_B_24H != 0;
+		let decode = |v: u8| if binary { v } else { bcd_to_bin(v) };
+		let encode = |v: u8| if binary { v } else { bin_to_bcd(v) };
+		let hours_raw = read_reg(REG_HOURS);
+		let mut hours = decode(hours_raw & 0x7F);
+		if !twenty_four {
+			hours %= 12;
+			if hours_raw & HOURS_PM != 0 {
+				hours += 12;
+			}
+		}
+		let now = u64::from(hours) * 3600 + u64::from(decode(read_reg(REG_MINUTES))) * 60 + u64::from(decode(read_reg(REG_SECONDS)));
+		let at = (now + after) % (24 * 3600);
+		let (hour, minute, second) = ((at / 3600) as u8, ((at / 60) % 60) as u8, (at % 60) as u8);
+		let hour_field = if twenty_four {
+			encode(hour)
+		} else {
+			let twelve = match hour % 12 {
+				0 => 12,
+				h => h,
+			};
+			encode(twelve) | if hour >= 12 { HOURS_PM } else { 0 }
+		};
+		write_reg(REG_ALARM_SECONDS, encode(second));
+		write_reg(REG_ALARM_MINUTES, encode(minute));
+		write_reg(REG_ALARM_HOURS, hour_field);
+		let _ = read_reg(REG_STATUS_C);
+		write_reg(REG_STATUS_B, status_b | STATUS_B_ALARM);
+	}
+	true
+}
+
+// And disarmed after the wake: the enable cleared and what fired read away.
+pub fn disarm_alarm() {
+	let _cmos = CMOS.lock();
+	unsafe {
+		let status_b = read_reg(REG_STATUS_B);
+		write_reg(REG_STATUS_B, status_b & !STATUS_B_ALARM);
+		let _ = read_reg(REG_STATUS_C);
+	}
+}

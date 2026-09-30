@@ -518,3 +518,118 @@ pub fn correctable_name(bits: u32) -> &'static str {
 pub fn note_error_reporter(bus: u8, dev: u8, func: u8) -> bool {
 	common::note_error_reporter::<Access>(bus, dev, func)
 }
+
+// ------------------------------------------------------------------ across S3
+
+// ONE FUNCTION'S CONFIGURATION, its first 256 bytes, as the kernel and its drivers left it before an S3 - which resets
+// every function with the machine (QEMU's wakeup reset included), root ports and bridges among them.
+struct SavedFunction {
+	bus: u8,
+	dev: u8,
+	func: u8,
+	dwords: [u32; 64],
+}
+
+static SAVED: crate::sync::SpinLock<alloc::vec::Vec<SavedFunction>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
+// Every function the boot scan found, saved - in bus order, which is the order the restore needs: a bridge's bus
+// numbers and windows go back before anything behind it is reachable.
+pub fn save_config_all() -> bool {
+	let mut addresses = crate::device::pci_addresses();
+	addresses.sort_unstable();
+	let mut saved = SAVED.lock();
+	saved.clear();
+	if saved.try_reserve(addresses.len()).is_err() {
+		return false;
+	}
+	for (bus, dev, func) in addresses {
+		let mut dwords = [0u32; 64];
+		for (at, dword) in dwords.iter_mut().enumerate() {
+			*dword = config_read_exact(bus, dev, func, (at * 4) as u16, 4).unwrap_or(0);
+		}
+		saved.push(SavedFunction { bus, dev, func, dwords });
+	}
+	true
+}
+
+// A saved word or byte of one function.
+fn saved_word(saved: &SavedFunction, offset: u16) -> u16 {
+	(saved.dwords[(offset / 4) as usize] >> ((offset % 4) * 8)) as u16
+}
+
+// THE CONFIGURATION WRITTEN BACK, the command register last so no BAR decodes before it holds its address:
+//   a bridge's bus numbers, I/O, memory and prefetchable windows, ROM and bridge control; an endpoint's six BARs and
+//   ROM; the interrupt line;
+//   the capabilities the kernel and its drivers set - MSI's message, MSI-X's control (the table entries are the
+//   kernel's `restore_msix_entries`, after this), and PCI Express's device, link, SLOT and root controls, which is
+//   where a hot-plug port's presence and attention enables, its power and its indicators live.
+pub fn restore_config_all() {
+	let saved = SAVED.lock();
+	for function in saved.iter() {
+		let (bus, dev, func) = (function.bus, function.dev, function.func);
+		if function.dwords[0] == 0xFFFF_FFFF || function.dwords[0] == 0 {
+			continue;
+		}
+		// The command register off while the addresses go back.
+		config_write_exact(bus, dev, func, 0x04, 2, 0);
+		let header = (function.dwords[3] >> 16) & 0x7F;
+		let range: &[u16] = if header == 1 { &[0x10, 0x14, 0x18, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x38] } else { &[0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x30] };
+		for &offset in range {
+			config_write_exact(bus, dev, func, offset, 4, function.dwords[(offset / 4) as usize]);
+		}
+		if header == 1 {
+			// I/O base and limit, not the secondary status beside them, whose bits clear on a write of one.
+			config_write_exact(bus, dev, func, 0x1C, 2, saved_word(function, 0x1C) as u32);
+			config_write_exact(bus, dev, func, 0x3E, 2, saved_word(function, 0x3E) as u32);
+		}
+		config_write_exact(bus, dev, func, 0x3C, 1, function.dwords[0x3C / 4] & 0xFF);
+		// THE CAPABILITIES, walked in the saved image.
+		if (function.dwords[1] >> 16) & 0x10 != 0 {
+			let mut at = (function.dwords[0x34 / 4] & 0xFC) as u16;
+			let mut hops = 0;
+			while at >= 0x40 && at < 0x100 && hops < 48 {
+				hops += 1;
+				let id = (function.dwords[(at / 4) as usize] >> ((at % 4) * 8)) as u8;
+				match id {
+					// MSI: the message address, data and control, in that order.
+					0x05 => {
+						let control = saved_word(function, at + 2);
+						let wide = control & (1 << 7) != 0;
+						config_write_exact(bus, dev, func, at + 4, 4, function.dwords[((at + 4) / 4) as usize]);
+						if wide {
+							config_write_exact(bus, dev, func, at + 8, 4, function.dwords[((at + 8) / 4) as usize]);
+							config_write_exact(bus, dev, func, at + 12, 2, saved_word(function, at + 12) as u32);
+						} else {
+							config_write_exact(bus, dev, func, at + 8, 2, saved_word(function, at + 8) as u32);
+						}
+						config_write_exact(bus, dev, func, at + 2, 2, control as u32);
+					}
+					// MSI-X: its control, the function mask kept until the kernel has written the entries again.
+					0x11 => {
+						config_write_exact(bus, dev, func, at + 2, 2, saved_word(function, at + 2) as u32);
+					}
+					// PCI EXPRESS: device, link, slot and root control, and the second device and link controls.
+					0x10 => {
+						let flags = saved_word(function, at + 2);
+						config_write_exact(bus, dev, func, at + 0x08, 2, saved_word(function, at + 0x08) as u32);
+						config_write_exact(bus, dev, func, at + 0x10, 2, saved_word(function, at + 0x10) as u32 & !(1 << 5));
+						if flags & (1 << 8) != 0 {
+							config_write_exact(bus, dev, func, at + 0x18, 2, saved_word(function, at + 0x18) as u32);
+						}
+						let port = (flags >> 4) & 0xF;
+						if port == 4 || port == 0xA {
+							config_write_exact(bus, dev, func, at + 0x1C, 2, saved_word(function, at + 0x1C) as u32);
+						}
+						if flags & 0xF >= 2 {
+							config_write_exact(bus, dev, func, at + 0x28, 2, saved_word(function, at + 0x28) as u32);
+							config_write_exact(bus, dev, func, at + 0x30, 2, saved_word(function, at + 0x30) as u32);
+						}
+					}
+					_ => {}
+				}
+				at = ((function.dwords[(at / 4) as usize] >> ((at % 4) * 8 + 8)) & 0xFC) as u16;
+			}
+		}
+		config_write_exact(bus, dev, func, 0x04, 2, saved_word(function, 0x04) as u32);
+	}
+}

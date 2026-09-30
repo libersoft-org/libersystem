@@ -277,6 +277,20 @@ pub enum Opcode {
 	Node = 14,
 	// manager -> driver, the other answer. Empty: the namespace describes no node for this device, or withdrew it.
 	NodeAbsent = 15,
+	// manager -> driver, after the handshake. A `SuspendRequest`: the machine is going to sleep. NOT TERMINAL - the
+	// binding, its generation, its publications and its consumers' connections survive, which is what `STOP` cannot
+	// give. The driver takes no new work, finishes or holds what it accepted, stops DMA, masks its interrupts, puts
+	// the device in its lowest state, arms wake if asked, and answers `SUSPENDED`.
+	Suspend = 16,
+	// driver -> manager, the answer: a `Suspended` - done, done with wake armed, or refused with a failure code - and,
+	// for a device that cannot be stopped, the latest time the machine must be awake by.
+	Suspended = 17,
+	// manager -> driver. One byte: whether the device may have lost power (S3 and hibernation: yes). The driver
+	// reprograms from its saved state and answers `RESUMED`.
+	Resume = 18,
+	// driver -> manager. One byte: back, or a device that did not come back - which the manager tears down and
+	// rebinds through the route it already has.
+	Resumed = 19,
 }
 
 impl Opcode {
@@ -299,6 +313,10 @@ impl Opcode {
 			13 => Some(Opcode::NodeRequest),
 			14 => Some(Opcode::Node),
 			15 => Some(Opcode::NodeAbsent),
+			16 => Some(Opcode::Suspend),
+			17 => Some(Opcode::Suspended),
+			18 => Some(Opcode::Resume),
+			19 => Some(Opcode::Resumed),
 			_ => None,
 		}
 	}
@@ -312,7 +330,7 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped | Opcode::NodeRequest | Opcode::NodeAbsent => 0,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped | Opcode::NodeRequest | Opcode::NodeAbsent | Opcode::Suspend | Opcode::Suspended | Opcode::Resume | Opcode::Resumed => 0,
 			Opcode::Resource | Opcode::Offer | Opcode::Connect | Opcode::Node => 1,
 		}
 	}
@@ -596,6 +614,9 @@ pub enum DriverFailureCode {
 	UnsupportedDevice = 4,
 	// The driver does not know what went wrong, so nothing says a second try differs.
 	InternalError = 5,
+	// ITS DEVICE CANNOT BE LEFT IN THE STATE ASKED FOR NOW - a `SUSPEND` refused while a Type-C sink path is enabled.
+	// Retryable: the condition is the device's present one, and it passes.
+	Busy = 6,
 }
 
 impl DriverFailureCode {
@@ -608,6 +629,7 @@ impl DriverFailureCode {
 			DriverFailureCode::OutOfMemory => b"the driver says it is out of memory",
 			DriverFailureCode::UnsupportedDevice => b"the driver read the device and will not drive it",
 			DriverFailureCode::InternalError => b"the driver does not know what went wrong",
+			DriverFailureCode::Busy => b"the driver says its device cannot be left now",
 		}
 	}
 
@@ -618,12 +640,13 @@ impl DriverFailureCode {
 			3 => Some(DriverFailureCode::OutOfMemory),
 			4 => Some(DriverFailureCode::UnsupportedDevice),
 			5 => Some(DriverFailureCode::InternalError),
+			6 => Some(DriverFailureCode::Busy),
 			_ => None,
 		}
 	}
 
 	pub fn retryable(self) -> bool {
-		matches!(self, DriverFailureCode::DeviceNotResponding | DriverFailureCode::OutOfMemory)
+		matches!(self, DriverFailureCode::DeviceNotResponding | DriverFailureCode::OutOfMemory | DriverFailureCode::Busy)
 	}
 }
 
@@ -788,6 +811,151 @@ pub fn decode_sequence(payload: &[u8]) -> Result<u32, FrameError> {
 	}
 	Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
 }
+
+// ------------------------------------------------------------------ suspend and resume
+
+// The sleep a `SUSPEND` asks for, as `liber:process@1/sleep-state` numbers it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SleepState {
+	Idle = 1,
+	Ram = 2,
+	Disk = 3,
+}
+
+impl SleepState {
+	pub fn from_u8(value: u8) -> Option<Self> {
+		match value {
+			1 => Some(SleepState::Idle),
+			2 => Some(SleepState::Ram),
+			3 => Some(SleepState::Disk),
+			_ => None,
+		}
+	}
+
+	// Whether a device may lose its power in this state - S3 and hibernation do, suspend to idle does not.
+	pub fn loses_power(self) -> bool {
+		!matches!(self, SleepState::Idle)
+	}
+}
+
+// `SUSPEND`'s payload: the state, whether the device is to arm wake, and the sleep's timed wake in milliseconds
+// from now - zero for none - which a device that cannot be stopped compares with its own bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SuspendRequest {
+	pub state: SleepState,
+	pub arm_wake: bool,
+	pub timed_wake_ms: u64,
+}
+
+pub const SUSPEND_PAYLOAD_LEN: usize = 12;
+
+pub fn encode_suspend(request: &SuspendRequest, out: &mut [u8]) -> usize {
+	out[0] = request.state as u8;
+	out[1] = u8::from(request.arm_wake);
+	out[2..4].copy_from_slice(&[0, 0]);
+	out[4..12].copy_from_slice(&request.timed_wake_ms.to_le_bytes());
+	SUSPEND_PAYLOAD_LEN
+}
+
+pub fn decode_suspend(payload: &[u8]) -> Result<SuspendRequest, FrameError> {
+	if payload.len() != SUSPEND_PAYLOAD_LEN {
+		return Err(FrameError::PayloadShape);
+	}
+	let state = SleepState::from_u8(payload[0]).ok_or(FrameError::UnknownValue(u16::from(payload[0])))?;
+	let arm_wake = match payload[1] {
+		0 => false,
+		1 => true,
+		other => return Err(FrameError::UnknownValue(u16::from(other))),
+	};
+	if payload[2..4] != [0, 0] {
+		return Err(FrameError::PayloadShape);
+	}
+	Ok(SuspendRequest { state, arm_wake, timed_wake_ms: u64::from_le_bytes(payload[4..12].try_into().unwrap_or([0; 8])) })
+}
+
+// What a driver answers to `SUSPEND`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SuspendOutcome {
+	Done,
+	// Done, and the device will wake the machine: its companion's wake is armed by the platform's step.
+	DoneWakeArmed,
+	Refused(DriverFailureCode),
+}
+
+// `SUSPENDED`'s payload: the outcome and, for a device that cannot be stopped, the latest time the machine must be
+// awake by in milliseconds from now - zero for no bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Suspended {
+	pub outcome: SuspendOutcome,
+	pub awake_by_ms: u64,
+}
+
+pub const SUSPENDED_PAYLOAD_LEN: usize = 12;
+
+pub fn encode_suspended(answer: &Suspended, out: &mut [u8]) -> usize {
+	let (outcome, failure) = match answer.outcome {
+		SuspendOutcome::Done => (0u8, 0u16),
+		SuspendOutcome::DoneWakeArmed => (1, 0),
+		SuspendOutcome::Refused(code) => (2, code as u16),
+	};
+	out[0] = outcome;
+	out[1] = 0;
+	out[2..4].copy_from_slice(&failure.to_le_bytes());
+	out[4..12].copy_from_slice(&answer.awake_by_ms.to_le_bytes());
+	SUSPENDED_PAYLOAD_LEN
+}
+
+pub fn decode_suspended(payload: &[u8]) -> Result<Suspended, FrameError> {
+	if payload.len() != SUSPENDED_PAYLOAD_LEN || payload[1] != 0 {
+		return Err(FrameError::PayloadShape);
+	}
+	let failure = u16::from_le_bytes([payload[2], payload[3]]);
+	let outcome = match (payload[0], failure) {
+		(0, 0) => SuspendOutcome::Done,
+		(1, 0) => SuspendOutcome::DoneWakeArmed,
+		(2, code) => SuspendOutcome::Refused(DriverFailureCode::from_u16(code).ok_or(FrameError::UnknownValue(code))?),
+		(other, _) => return Err(FrameError::UnknownValue(u16::from(other))),
+	};
+	Ok(Suspended { outcome, awake_by_ms: u64::from_le_bytes(payload[4..12].try_into().unwrap_or([0; 8])) })
+}
+
+// `RESUME`'s payload: whether the device may have lost power.
+pub const RESUME_PAYLOAD_LEN: usize = 1;
+
+pub fn encode_resume(lost_power: bool, out: &mut [u8]) -> usize {
+	out[0] = u8::from(lost_power);
+	RESUME_PAYLOAD_LEN
+}
+
+pub fn decode_resume(payload: &[u8]) -> Result<bool, FrameError> {
+	match payload {
+		[0] => Ok(false),
+		[1] => Ok(true),
+		[other] => Err(FrameError::UnknownValue(u16::from(*other))),
+		_ => Err(FrameError::PayloadShape),
+	}
+}
+
+// `RESUMED`'s payload: whether the device came back.
+pub const RESUMED_PAYLOAD_LEN: usize = 1;
+
+pub fn encode_resumed(back: bool, out: &mut [u8]) -> usize {
+	out[0] = if back { 0 } else { 1 };
+	RESUMED_PAYLOAD_LEN
+}
+
+pub fn decode_resumed(payload: &[u8]) -> Result<bool, FrameError> {
+	match payload {
+		[0] => Ok(true),
+		[1] => Ok(false),
+		[other] => Err(FrameError::UnknownValue(u16::from(*other))),
+		_ => Err(FrameError::PayloadShape),
+	}
+}
+
+// The longest a driver's entry may declare for answering `SUSPEND` or `RESUME`, in ticks before the port's scale:
+// ten seconds - a UCSI command's bound, the longest step any driver in the tree has to finish.
+pub const MAX_SUSPEND_DEADLINE: u32 = 1_000;
 
 // The longest a driver may be given to answer a `PING`, in monotonic ticks.
 //

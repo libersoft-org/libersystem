@@ -135,7 +135,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 52] = [
+const VOCABULARY: [Capability; 53] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -234,6 +234,8 @@ const VOCABULARY: [Capability; 52] = [
 	// THE TYPE-C CONNECTORS, read and operated: a fresh connection to TypeCService's root per launch, each read by tag.
 	Capability::Typec,
 	Capability::TypecControl,
+	// THE SLEEP: a fresh `system-sleep` connection per launch, minted by ServiceManager itself. Read by tag.
+	Capability::SystemSleep,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -342,6 +344,8 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// no component receives by default. The READ comes with it for the reason `lsdev` holds both: listing
 		// and scanning are how an operator finds what to pair.
 		b"btctl" => Some(granted("btctl", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator])),
+		// THE SLEEP'S OPERATOR TOOL: suspend now, the inhibitors and the last sleep - `system-sleep` and nothing else.
+		b"sleepctl" => Some(granted("sleepctl", alloc::vec![Capability::SystemSleep])),
 		// THE TPM DEMONSTRATION TOOL, and the one shipping row that holds any TPM grant: all three, and the files
 		// it keeps sealed objects and quotes in. There is one TPM and no alias, so this row IS the policy.
 		b"tpm" => Some(granted("tpm", alloc::vec![Capability::Tpm, Capability::TpmMeasure, Capability::TpmSeal, Capability::Volumes])),
@@ -399,6 +403,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"powerread" => Some(granted("powerread", alloc::vec![Capability::PowerState])),
 		// THE ACPI GATE'S LIVE POWER CLIENT: the read authority alone, as any client reading a battery would hold.
 		b"acpipower" => Some(granted("acpipower", alloc::vec![Capability::PowerState])),
+		// THE SLEEP GATE'S PROBE: an application and nothing more - no authority at all, which is what its counter and
+		// Timer are about: the freeze reaches whatever runs, however little it holds.
+		b"sleepcheck" => Some(granted("sleepcheck", alloc::vec![])),
 		// THE UPS GATE'S PROBE: a live client and the operator of a real device's controls - the second
 		// holder of the control authority, and development-only like the first.
 		b"upscheck" => Some(granted("upscheck", alloc::vec![Capability::PowerState, Capability::PowerControl])),
@@ -640,6 +647,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Bmc => CAP_BMC,
 		Capability::Typec => CAP_TYPEC,
 		Capability::TypecControl => CAP_TYPEC_CONTROL,
+		Capability::SystemSleep => CAP_SLEEP,
 	}
 }
 
@@ -741,6 +749,7 @@ struct Clients {
 	// TYPECSERVICE'S TWO ROOTS, resolved by name: every grant is a fresh connection from one of them.
 	typec: u64,
 	typec_control: u64,
+	sleep: u64,
 	// What the last grant resolved a selection to, for its audit entry: the exact reader a smart-card
 	// grant was minted for. Taken by the audit line that follows the grant, so it never outlives it.
 	grant_detail: String,
@@ -805,6 +814,7 @@ impl Clients {
 			Capability::Bmc => self.bmc,
 			Capability::Typec => self.typec,
 			Capability::TypecControl => self.typec_control,
+			Capability::SystemSleep => self.sleep,
 		}
 	}
 }
@@ -1320,6 +1330,8 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		// A FRESH CONNECTION PER LAUNCH from TypeCService's read root or its operator root.
 		Capability::Typec => (&mut clients.typec, CAP_TYPEC),
 		Capability::TypecControl => (&mut clients.typec_control, CAP_TYPEC_CONTROL),
+		// A FRESH CONNECTION PER LAUNCH, minted by ServiceManager, which serves the interface.
+		Capability::SystemSleep => (&mut clients.sleep, CAP_SLEEP),
 		_ => {
 			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
 			return if dup >= 0 { dup as u64 } else { 0 };
@@ -2594,7 +2606,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, grant_detail: String::new() };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, sleep: 0, grant_detail: String::new() };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

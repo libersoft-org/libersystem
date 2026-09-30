@@ -267,6 +267,9 @@ pub mod apic {
 	pub fn timer_one_shot(deadline: Option<u64>) -> bool {
 		super::gic::timer_one_shot(deadline)
 	}
+	pub fn timer_at_counter(target: Option<u64>) -> bool {
+		super::gic::timer_at_counter(target)
+	}
 	pub fn timer_periodic() {
 		super::gic::timer_periodic()
 	}

@@ -147,10 +147,32 @@ unsafe fn install(area: *mut CpuArea) {
 	}
 }
 
+// EACH CORE'S AREA, kept so a resume from S3 RELOADS it rather than installing one afresh: `install` rewrites the TSS
+// and its I/O bitmap, and a core coming back from a sleep has both in memory already, as they were.
+static AREAS: [core::sync::atomic::AtomicPtr<CpuArea>; crate::smp::MAX_CPUS] = [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; crate::smp::MAX_CPUS];
+
 // BSP bring-up (called once, before any allocator): install the static area.
 pub fn init() {
 	unsafe {
 		install(addr_of_mut!(BSP_AREA));
+		AREAS[0].store(addr_of_mut!(BSP_AREA), core::sync::atomic::Ordering::Release);
+	}
+}
+
+// A CORE BACK FROM S3: its own area's GDT loaded, the segments reloaded, and its TSS marked available again before
+// `ltr` - the descriptor still says BUSY from before the sleep, and loading a busy TSS faults.
+pub fn resume(cpu: usize) {
+	let area = AREAS.get(cpu).map_or(core::ptr::null_mut(), |slot| slot.load(core::sync::atomic::Ordering::Acquire));
+	if area.is_null() {
+		panic!("cpu {cpu} has no descriptor area to resume with");
+	}
+	unsafe {
+		// The TSS descriptor's type: 0xB busy, 0x9 available.
+		let gdt = &mut (*area).gdt;
+		gdt[6] &= !(0x2u64 << 40);
+		load_gdt(area);
+		reload_segments();
+		load_tss();
 	}
 }
 
@@ -159,13 +181,16 @@ pub fn init() {
 // allocation is raw and zeroed on purpose - a Box::new would construct the ~41 kB
 // value on the AP's small bootstrap stack first and overflow it. The area is
 // leaked deliberately: a core's GDT/TSS live for the life of the machine.
-pub fn load_ap(_cpu: usize) {
+pub fn load_ap(cpu: usize) {
 	let area = unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<CpuArea>()) } as *mut CpuArea;
 	if area.is_null() {
 		panic!("out of memory: AP GDT/TSS area");
 	}
 	unsafe {
 		install(area);
+	}
+	if let Some(slot) = AREAS.get(cpu) {
+		slot.store(area, core::sync::atomic::Ordering::Release);
 	}
 }
 

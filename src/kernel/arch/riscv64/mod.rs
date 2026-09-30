@@ -344,8 +344,17 @@ pub mod apic {
 		if !clock.anchored() {
 			return false;
 		}
+		timer_at_counter(deadline.and_then(|tick| clock.counter_at(tick)))
+	}
+
+	// THIS HART'S TIMER AS A ONE-SHOT AT A RAW `time` READING - the sleep entry's timed wake, while the clock is
+	// held and no tick converts.
+	pub fn timer_at_counter(target: Option<u64>) -> bool {
+		if !crate::arch::common::time::CLOCK.anchored() {
+			return false;
+		}
 		ONE_SHOT[crate::sched::current_cpu_id()].store(true, Ordering::Relaxed);
-		set_timer(deadline.and_then(|tick| clock.counter_at(tick)).unwrap_or(u64::MAX));
+		set_timer(target.unwrap_or(u64::MAX));
 		true
 	}
 

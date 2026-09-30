@@ -324,6 +324,8 @@ pub fn init(boot_info: &BootInfo) {
 			}
 			let cpu_id = online; // contiguous id for the next core to report in
 			let stack = alloc_ap_stack();
+			#[cfg(target_arch = "x86_64")]
+			AP_STACK_TOPS[cpu_id].store(stack, Ordering::Release);
 			// close whatever was open, write the new identity, then publish it. A late
 			// AP from the previous round can be anywhere in here and will fail its claim.
 			AP_INVITE.store(0, Ordering::SeqCst);
@@ -404,6 +406,71 @@ extern "C" fn ap_entry() -> ! {
 	// The same pairing the device-tree ports make in `mark_online`: a core that came online after
 	// the topology sweep binds itself rather than staying on no node for the boot.
 	numa::bind_self(cpu_id);
+	crate::sched::cpu_idle_loop()
+}
+
+// ------------------------------------------------------------------ the restart after an S3
+
+// EACH APPLICATION PROCESSOR'S STACK TOP, kept from its bring-up: an S3 takes every core's context, and a core
+// restarted afterwards runs its idle loop afresh on the same stack - the frames it was parked in are gone with it.
+#[cfg(target_arch = "x86_64")]
+static AP_STACK_TOPS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+// The core being restarted, and how many have come back. One at a time, as the boot brings them up.
+#[cfg(target_arch = "x86_64")]
+static RESUME_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[cfg(target_arch = "x86_64")]
+static RESUMED: AtomicUsize = AtomicUsize::new(0);
+
+// EVERY APPLICATION PROCESSOR BACK AFTER AN S3, through the trampoline - the caller has pointed its mailbox at the
+// kernel's page tables with the identity map reinstated - each running `ap_resume_entry` on its own stack. Answers
+// how many came back; a core that did not is said and left out of every IPI that follows, as at boot.
+#[cfg(target_arch = "x86_64")]
+pub fn restart_after_resume(trampoline: *mut u8, vector: u8) -> usize {
+	let total = cpu_count();
+	let mut back = 0usize;
+	for cpu in 1..total {
+		let stack = AP_STACK_TOPS[cpu].load(Ordering::Acquire);
+		if stack == 0 {
+			continue;
+		}
+		let lapic = lapic_id(cpu) as u32;
+		let before = RESUMED.load(Ordering::Acquire);
+		RESUME_CPU.store(cpu, Ordering::SeqCst);
+		unsafe {
+			arch::apboot::set_entry(trampoline, ap_resume_entry as *const () as u64);
+			arch::apboot::set_stack(trampoline, stack);
+		}
+		arch::apic::send_init(lapic);
+		udelay(10_000);
+		arch::apic::send_startup(lapic, vector);
+		udelay(200);
+		arch::apic::send_startup(lapic, vector);
+		let mut waited = 0;
+		while RESUMED.load(Ordering::Acquire) == before && waited < 100_000 {
+			udelay(10);
+			waited += 1;
+		}
+		if RESUMED.load(Ordering::Acquire) != before {
+			back += 1;
+		} else {
+			crate::serial_println!("smp: WARNING: cpu {cpu} (lapic_id {lapic}) did not come back from the sleep");
+		}
+	}
+	RESUME_CPU.store(usize::MAX, Ordering::SeqCst);
+	back
+}
+
+// A CORE BACK FROM S3: its own descriptor area reloaded rather than a new one made, its per-CPU block and LAPIC and
+// syscall entry established again, and its idle loop run afresh.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn ap_resume_entry() -> ! {
+	let cpu = RESUME_CPU.load(Ordering::SeqCst);
+	if cpu == usize::MAX {
+		arch::halt_loop();
+	}
+	arch::resume_ap(cpu, lapic_id(cpu));
+	RESUMED.fetch_add(1, Ordering::Release);
 	crate::sched::cpu_idle_loop()
 }
 

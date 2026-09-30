@@ -915,6 +915,23 @@ impl<B: Backend> Iommu<B> {
 		&self.faults
 	}
 
+	// AFTER THE CONTROLLER WAS RESET WITH THE MACHINE - an S3 - every live attachment and every LIVE mapping is sent to
+	// it again from what this side kept, because the controller forgot them all and the kernel is the only record
+	// there is. `reattach` is the backend's own replay of its attachments (it knows what it attached, and a domain on
+	// some controllers exists only through its first attach); the mappings follow, in the order they were made.
+	// A QUARANTINED MAPPING STAYS QUARANTINED: its address was never trusted again before the reset, and nothing about
+	// the reset makes it trustworthy. The first refusal ends the replay and is the answer - a controller that took
+	// half of it is one the caller must not believe.
+	pub fn replay_after_reset(&mut self, reattach: impl FnOnce(&mut B) -> Result<(), Fault>) -> Result<(), Fault> {
+		reattach(&mut self.backend)?;
+		for mapping in self.mappings.values() {
+			if mapping.state == MappingState::Live {
+				self.backend.map(mapping.domain, mapping.iova, mapping.physical, mapping.len, mapping.direction)?;
+			}
+		}
+		Ok(())
+	}
+
 	// One domain per exclusive binding. `generation` is the binding's, taken from the device
 	// registry rather than invented here - a mapping bound to a generation that cannot change is a
 	// weaker claim than one bound to a generation that can, and this crate does not pretend to own

@@ -10,7 +10,7 @@
 
 use rt::*;
 
-use crate::virtio::Queue;
+use crate::virtio::{Queue, Virtio};
 use drivers::{common, virtio};
 
 // One disk sector.
@@ -66,6 +66,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// virtio-blk has a single request queue (queue 0).
 		let queue = device.setup_queue(0);
+		// THE SLEEP IS THIS DRIVER'S OWN: the cache is flushed in its step, and a disk that lost its state comes back
+		// under the same binding - the system volume stands on it, and a rebind would take the volume away.
+		common::takes_sleep();
 		device.driver_ok();
 		let queue: Queue = match queue {
 			Some(q) => q,
@@ -109,7 +112,51 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		for i in 0..8u64 {
 			capacity_sectors |= (device.config_read(i) as u64) << (i * 8);
 		}
-		serve_blocks(bootstrap, &bind, &queue, blk_server, capacity_sectors, has_flush, size_max)
+		serve_blocks(bootstrap, &bind, &device, queue, blk_server, capacity_sectors, has_flush, size_max)
+	}
+}
+
+// THE DISK'S STEP. SUSPEND flushes the device's volatile write cache - so a battery that dies in the sleep loses
+// nothing this driver accepted - and, for a state that cuts the power, stops the device (the transport's reset: no DMA
+// into memory about to stop being refreshed; the driver has nothing in flight, since it answers one request at a
+// time). RESUME negotiates a device that lost its state back to the same features and points it at the same ring,
+// emptied - under the same binding, with every consumer's connection kept.
+struct Sleep<'a> {
+	device: &'a Virtio,
+	queue: &'a mut Queue,
+	serving: &'a mut common::Serving,
+	virt: u64,
+	phys: u64,
+	has_flush: bool,
+	// Whether this step reset the device, which a resume that lost no power must undo all the same.
+	stopped: bool,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		// SAFETY: the control page is this driver's, and nothing else is in flight on the queue.
+		if self.has_flush && !unsafe { flush_request(self.queue, self.virt, self.phys) } {
+			print(b"driver.virtio-blk: the device did not complete the flush the sleep requires - the sleep is refused\n");
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		}
+		let Some(stopped) = self.device.sleep(request) else {
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		};
+		self.stopped = stopped;
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		let reset = lost_power || self.stopped;
+		let back = self.device.wake(&mut [&mut *self.queue], lost_power, core::mem::take(&mut self.stopped));
+		if reset {
+			print(if back { b"driver.virtio-blk: the disk is back from the sleep\n" } else { b"driver.virtio-blk: the disk did not come back from the sleep\n" });
+		}
+		back
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
 	}
 }
 
@@ -231,7 +278,7 @@ impl Span {
 // negotiated the flush feature and trivially (write-through cache) when it did not;
 // the reply is [status u32]. The data crosses as a shared buffer handle, never
 // copied through the channel.
-unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_server: u64, capacity_sectors: u64, has_flush: bool, size_max: u64) -> ! {
+unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, device: &Virtio, mut queue: Queue, blk_server: u64, capacity_sectors: u64, has_flush: bool, size_max: u64) -> ! {
 	unsafe {
 		// the fixed control page (header + status) and the growable data span.
 		let dma: i64 = dma_buffer_create_for(queue.capability, 4096);
@@ -258,7 +305,15 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 			// THE MANAGER'S PING IS ANSWERED BY THIS LOOP, not by a second one. An idle driver
 			// parked in `recv_blocking` would otherwise look exactly like a wedged one, which is
 			// the distinction the whole mechanism exists to make.
-			let Some(at) = common::serve_any_or_answer(bootstrap, bind, &mut serving) else {
+			let ready = common::serve_any_or_sleep(bootstrap, bind, &mut serving);
+			// THE SLEEP, between two requests.
+			if let Some(None) = ready {
+				let mut step = Sleep { device, queue: &mut queue, serving: &mut serving, virt, phys, has_flush, stopped: false };
+				if common::take_sleep_step(bootstrap, bind, &mut step) {
+					continue;
+				}
+			}
+			let Some(Some(at)) = ready.filter(|_| !common::stop_requested()) else {
 				// THE FLUSH IS WHAT `STOPPED` CERTIFIES, and this path used to exit without it: the
 				// helper answered the stop the instant it read one, so a disk with writes still in
 				// its device's cache reported that everything it had accepted was finished.
@@ -311,11 +366,11 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 						_ => None,
 					};
 					match op {
-						OP_READ => serve_read(queue, blk_server, virt, phys, &mut span, lba, admitted.unwrap_or(0)),
-						OP_WRITE => serve_write(queue, blk_server, virt, phys, &mut span, lba, admitted.unwrap_or(0), handle),
+						OP_READ => serve_read(&queue, blk_server, virt, phys, &mut span, lba, admitted.unwrap_or(0)),
+						OP_WRITE => serve_write(&queue, blk_server, virt, phys, &mut span, lba, admitted.unwrap_or(0), handle),
 						OP_CAPACITY => reply_capacity(blk_server, capacity_sectors * SECTOR as u64, max_sectors),
 						OP_FLUSH => {
-							let ok: bool = !has_flush || flush_request(queue, virt, phys);
+							let ok: bool = !has_flush || flush_request(&queue, virt, phys);
 							reply_block(blk_server, if ok { STATUS_OK } else { STATUS_ERR }, 0);
 						}
 						_ => {

@@ -26,6 +26,10 @@ include!(concat!(env!("OUT_DIR"), "/program_path.rs"));
 #[path = "device_manager/tests.rs"]
 mod tests;
 
+#[path = "device_manager/sleep.rs"]
+mod sleep;
+use sleep::{SleepAnswer, SleepAsked};
+
 // The state DeviceManager tracks per discovered device.
 // PRESENCE IS NOT ACTIVATION, and the states say which is which.
 //
@@ -634,6 +638,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// Rotate the node portion when all live bindings do not fit beside the service handles.
 		let mut wait_node_cursor: usize = 0;
+		// THE SLEEP'S DRIVER STEP, while one runs or holds the drivers suspended - see `sleep`. While it is here nothing
+		// is bound, and neither a policy verb nor a bus arrival is served: each would start a driver, and a bind reads a
+		// volume whose own driver may be suspended.
+		let mut sleep_run: Option<sleep::SleepRun> = None;
 		// 4. stand until ServiceManager drives phase 2 (a "DRIVERS" message carrying a
 		//    StorageService client, once the volume is up: we load the non-bootstrap drivers
 		//    from vol://system/drivers/ and hand their channels up) or asks us to stop (which
@@ -687,7 +695,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// `Backoff` raises none, so without this a deferred attempt - a retryable failure, or
 				// a device that was still being released when this manager looked - would wait for
 				// some unrelated message to arrive before anything tried again.
-				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at && recovery.armed() {
+				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at && recovery.armed() && sleep_run.is_none() {
 					nodes[at].retry_at = 0;
 					start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
 				}
@@ -705,7 +713,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// running. `Online -> Binding` is not an edge, so every attempt failed and
 				// `start_candidate` advanced the cursor for it, walking the list to exhaustion on a
 				// device that was working the whole time.
-				if nodes[at].restart_requested && recovery.armed() {
+				if nodes[at].restart_requested && recovery.armed() && sleep_run.is_none() {
 					nodes[at].restart_requested = false;
 					if nodes[at].binding.is_none() && nodes[at].teardown.is_none() {
 						start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
@@ -719,7 +727,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// THE STANDING LOOP DOES NOT WAIT AT ALL. It comes round on its own bounded wait,
 					// so a node whose backoff has not passed is simply skipped this time - which is
 					// what "one node's delay is not every node's" means in the loop that has others.
-					Step::Again if recovery.armed() && clock() >= nodes[at].retry_at => {
+					Step::Again if recovery.armed() && clock() >= nodes[at].retry_at && sleep_run.is_none() => {
 						start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
 					}
 					Step::NextCandidate if recovery.armed() => {
@@ -731,14 +739,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
-							start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
+							if sleep_run.is_some() {
+								// Started once the sleep's step has ended, by the request the loop already honours.
+								nodes[at].restart_requested = true;
+							} else {
+								start_candidate_at(&mut nodes, at, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &mut catalogue, &mut recovery.state);
+							}
 						}
 					}
 					_ => {}
 				}
 			}
-			// AND ANY NEW INCIDENT IS WRITTEN DOWN, so it outlives this program - see `persist_incidents`.
-			persist_incidents(&mut nodes, policy_config);
+			// THE SLEEP'S STEP, AS FAR AS THE ANSWERS ALREADY IN ALLOW - after `advance`, so every answer's state move is
+			// applied before the step reads it.
+			if let Some(run) = sleep_run.as_mut() {
+				let (answer, done) = sleep::step(run, &mut nodes);
+				if let Some(answer) = answer
+					&& !send_with_room(bootstrap, &answer, 0)
+				{
+					print(b"DeviceManager: the sleep step's answer could not reach ServiceManager\n");
+				}
+				if done {
+					sleep_run = None;
+				}
+			}
+			// AND ANY NEW INCIDENT IS WRITTEN DOWN, so it outlives this program - see `persist_incidents`. NOT WHILE A
+			// SLEEP'S STEP RUNS: the volume's writes are held from before the drivers suspend until after they resume,
+			// and a write waited on here would hold the very answer that releases them. Those incidents are written
+			// once the step has answered.
+			if sleep_run.is_none() {
+				persist_incidents(&mut nodes, policy_config);
+			}
 			// ONE WAIT, AND ONLY A READY BOOTSTRAP FALLS THROUGH TO THE RECEIVE.
 			//
 			// Anything else goes round: a catalogue query is answered and a DEADLINE means the
@@ -801,15 +832,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waiting[waiting_count] = dev.bootstrap;
 				waiting_count += 1;
 			}
+			// NOT WHILE THE SLEEP HOLDS THE DRIVERS: a verb would bind or stop one. The request waits for the resume.
+			let policy_waited: bool = policy_service != 0 && sleep_run.is_none();
 			let policy_at: usize = waiting_count;
-			if policy_service != 0 {
+			if policy_waited {
 				waiting[waiting_count] = policy_service;
 				waiting_count += 1;
 			}
 			let policy_clients_at: usize = waiting_count;
-			for &client in policy_clients.live() {
-				waiting[waiting_count] = client;
-				waiting_count += 1;
+			if policy_waited {
+				for &client in policy_clients.live() {
+					waiting[waiting_count] = client;
+					waiting_count += 1;
+				}
 			}
 			let catalogue_clients_at: usize = waiting_count;
 			for &client in catalogue_clients.live() {
@@ -818,8 +853,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			// THE KERNEL'S BUS NEWS, IN THE ONE WAIT. A second wait in front of this one is what the
 			// note above already refuses; an arrival is a message like any other and belongs here.
+			// AND NOT A BUS ARRIVAL WHILE THE SLEEP HOLDS THE DRIVERS: it stays queued until the resume.
+			let bus_waited: bool = bus_events != 0 && sleep_run.is_none();
 			let bus_events_at: usize = waiting_count;
-			if bus_events != 0 {
+			if bus_waited {
 				waiting[waiting_count] = bus_events;
 				waiting_count += 1;
 			}
@@ -916,6 +953,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// ONLY WHEN THE POLL IS THE ONLY REASON TO WAKE, though. A retry, a stop deadline or a teardown
 			// IS work in flight and has to stay visible as such; when one of those is pending this wait is
 			// an ordinary one whose deadline the poll may only shorten.
+			if let Some(run) = &sleep_run {
+				let due: u64 = run.wake_at();
+				if due != 0 && (soonest == 0 || due < soonest) {
+					soonest = due;
+				}
+			}
 			let mut housekeeping: bool = false;
 			if platform_events != 0 {
 				if !serve_platform_events(platform_events, power, &mut buf) {
@@ -969,7 +1012,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						dev.supervise(&mut buf, &mut catalogue_clients);
 						continue;
 					}
-					if bus_events != 0 && at == bus_events_at {
+					if bus_waited && at == bus_events_at {
 						serve_bus_events(bus_events, &mut nodes, &mut catalogue, power, console_input, device_privilege, &mut recovery, &mut buf);
 						continue;
 					}
@@ -981,7 +1024,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						}
 						continue;
 					}
-					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
+					if policy_waited && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
 						let is_root: bool = at == policy_at;
 						if !serve_policy_once(waiting[at], is_root, &mut policy_clients, &mut nodes, &mut catalogue, policy_config, &mut buf) && !is_root {
 							print(b"DeviceManager: a device-policy client closed its connection; the slot is given back\n");
@@ -1162,6 +1205,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// AND THE RECORDS THAT NO LONGER DESCRIBE ANYTHING GO. The one moment this
 					// program has both the inventory and somewhere to write - see the function.
 					forget_absent_incidents(&nodes, policy_config);
+				}
+				// THE SLEEP'S DRIVER STEP, asked by ServiceManager: answered at once for a check and for a resume with nothing
+				// suspended, and by the step itself, once it is over, for the rest.
+				Received::Message { len, handle } if sleep::is_request(&buf[..len]) => {
+					if handle != 0 {
+						close(handle);
+					}
+					if let Some(answer) = sleep::request(&mut sleep_run, &mut nodes, &buf[..len])
+						&& !send_with_room(bootstrap, &answer, 0)
+					{
+						print(b"DeviceManager: a sleep answer could not reach ServiceManager\n");
+					}
 				}
 				Received::Message { .. } => {
 					// THE DRIVERS GO DOWN BEFORE THIS PROGRAM DOES, and in reverse dependency
@@ -2172,6 +2227,10 @@ struct Node {
 	// its Domain and its charged resources in `Stopping` for the rest of the boot, and the device
 	// could not be enabled again.
 	stop_deadline: u64,
+	// THE SLEEP'S QUESTION OUTSTANDING ON THIS BINDING, and its answer once it came - see `sleep`. An answer nobody
+	// asked for is refused, as an unasked `STOPPED` is.
+	sleep_asked: SleepAsked,
+	sleep_answer: Option<SleepAnswer>,
 	// A TEARDOWN WAITING FOR ITS CONFIRMATIONS. See `Teardown`.
 	teardown: Option<Teardown>,
 	// AN OPERATOR DISABLED THIS DEVICE, AND THAT IS A DESIRE RATHER THAN A STATE.
@@ -2258,7 +2317,7 @@ impl Node {
 		// A DEVICE THE FIRMWARE DESCRIBES IS NAMED BY ITS PLATFORM NUMBER - its row - and never by the zero
 		// address it reports, which is the host bridge's.
 		let id = if info.platform.kind == ROW_KIND_PLATFORM { BindingId::platform(index as u32, 0) } else { BindingId::new(info.bus, info.dev, info.func, 0) };
-		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), needs: needs_of(info), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), needs: needs_of(info), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, sleep_asked: SleepAsked::None, sleep_answer: None, disabled_by_policy: false }
 	}
 
 	// A manual grant is separate from the automatic count and survives only until one claim.
@@ -3905,8 +3964,38 @@ fn drain_frames(node: &mut Node, buf: &mut [u8]) {
 			driver_protocol::Opcode::NodeRequest => {
 				node.node_request = generation;
 			}
+			// THE SUSPEND EXCHANGE'S ANSWERS, taken only where this manager asked - a driver announcing a suspend or a
+			// resume nobody requested is describing a conversation that did not happen, as an unasked STOPPED is.
+			driver_protocol::Opcode::Suspended => match driver_protocol::decode_suspended(header.payload(buf)) {
+				Ok(answer) if node.sleep_asked == SleepAsked::Suspend => {
+					node.sleep_asked = SleepAsked::None;
+					node.sleep_answer = Some(SleepAnswer::Suspended(answer));
+					node.push(BindingEvent::Suspended { generation, answer });
+				}
+				_ => {
+					print(b"DeviceManager: ");
+					print_driver_name(node.driver_name());
+					print(b" said it had suspended and nothing had asked it to; the frame is refused\n");
+				}
+			},
+			driver_protocol::Opcode::Resumed => match driver_protocol::decode_resumed(header.payload(buf)) {
+				Ok(back) if node.sleep_asked == SleepAsked::Resume => {
+					node.sleep_asked = SleepAsked::None;
+					node.sleep_answer = Some(SleepAnswer::Resumed(back));
+					// A binding the unwind resumes after it did not answer its suspend is still `Online`: its answer is
+					// the step's to read and moves nothing.
+					if node.record.state == BindingState::Suspended {
+						node.push(BindingEvent::Resumed { generation, back });
+					}
+				}
+				_ => {
+					print(b"DeviceManager: ");
+					print_driver_name(node.driver_name());
+					print(b" said it had resumed and nothing had asked it to; the frame is refused\n");
+				}
+			},
 			// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
-			driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource | driver_protocol::Opcode::Node | driver_protocol::Opcode::NodeAbsent => refuse(&handles),
+			driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource | driver_protocol::Opcode::Node | driver_protocol::Opcode::NodeAbsent | driver_protocol::Opcode::Suspend | driver_protocol::Opcode::Resume => refuse(&handles),
 		}
 	}
 }
@@ -4905,6 +4994,34 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 					continue;
 				}
 			}
+			// THE SLEEP'S ANSWERS. Not outcomes: a suspended binding keeps everything a stop would take, and the step
+			// that asked reads the answer itself (`sleep::step`). A refusal moves nothing.
+			BindingEvent::Suspended { .. } => {
+				if let Some(next) = next_state
+					&& !node.record.move_to(next, None)
+				{
+					print(b"DeviceManager: the admitted binding transition was refused\n");
+				}
+				continue;
+			}
+			// BACK: online again, and supervised again a whole period from now - a `PING` outstanding when it suspended
+			// is forgotten, not expired against the sleep. NOT BACK falls through to the teardown a crash takes, as a
+			// retryable failure, and is bound again once the step has ended.
+			BindingEvent::Resumed { back: true, .. } => {
+				if let Some(next) = next_state
+					&& !node.record.move_to(next, None)
+				{
+					print(b"DeviceManager: the admitted binding transition was refused\n");
+					continue;
+				}
+				node.beat.restart(clock(), driver_protocol::heartbeat_period(node.beat.deadline()));
+				continue;
+			}
+			BindingEvent::Resumed { back: false, .. } => {
+				print(b"DeviceManager: ");
+				print_driver_name(driver_name);
+				print(b" says its device did not come back from the sleep\n");
+			}
 			// A CLAIM SETTLING WHEN NO TEARDOWN IS OUTSTANDING. The teardown arm above consumes
 			// these; one arriving here belongs to a teardown that has already been resolved -
 			// its deadline passed and the late confirmation came anyway - and a node that has
@@ -5061,7 +5178,7 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 		// questions: a bind attempt that fails after its chain's window ran out MUST end the
 		// chain, and reopening there would make the absolute deadline unreachable. What starts a
 		// new chain is a binding that had come up.
-		if node.record.state == BindingState::Online {
+		if matches!(node.record.state, BindingState::Online | BindingState::Suspended) {
 			node.incident = Incident::open();
 			// The time window is fresh; previously admitted automatic attempts remain spent.
 		}
@@ -6527,6 +6644,7 @@ fn binding_state_wire(state: BindingState) -> proto::system::BindingState {
 		BindingState::Quarantined => proto::system::BindingState::Quarantined,
 		BindingState::Disabled => proto::system::BindingState::Disabled,
 		BindingState::Removed => proto::system::BindingState::Removed,
+		BindingState::Suspended => proto::system::BindingState::Suspended,
 	}
 }
 
@@ -7567,6 +7685,10 @@ struct Entry {
 	// supervised", which is the honest state for a driver that stands on its channel and does
 	// nothing else - and the registry refuses 0, because `wait_any` reads that as no timeout at all.
 	heartbeat_deadline: Option<u32>,
+	// How long this driver may take to answer `SUSPEND` and `RESUME`, in ticks before the port's scale. `None` is a
+	// driver that does not carry the sleep exchange, and while one of its bindings is online every sleep is refused
+	// before anything is frozen, naming it.
+	suspend_deadline: Option<u32>,
 	rules: &'static [Rule],
 }
 

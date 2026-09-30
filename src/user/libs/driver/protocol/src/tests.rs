@@ -62,11 +62,11 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	// 1 through 15 are allocated - `DISCONNECT` took 12 (2026-08-31), the firmware node's request and its two
-	// answers 13 to 15 - so 16 is the next one that is not. The list is written out rather than derived, which is
-	// what makes adding an opcode a decision somebody makes here rather than a number that quietly starts being
-	// accepted.
-	for raw in [0u16, 16, 17, 0xffff] {
+	// 1 through 19 are allocated - `DISCONNECT` took 12 (2026-08-31), the firmware node's request and its two
+	// answers 13 to 15, suspend and resume with their answers 16 to 19 (2026-09-29) - so 20 is the next one that is
+	// not. The list is written out rather than derived, which is what makes adding an opcode a decision somebody
+	// makes here rather than a number that quietly starts being accepted.
+	for raw in [0u16, 20, 21, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}
@@ -141,7 +141,7 @@ fn a_payload_of_the_wrong_shape_is_refused_for_every_opcode_that_has_one() {
 #[test]
 fn a_field_outside_its_closed_set_is_refused_and_the_number_is_reported() {
 	// EACH SET IS PROBED ONE PAST ITS OWN END, the number its next member would take: the resource kinds end at
-	// a platform row's scoped connection, the failure codes at five.
+	// a platform row's scoped connection, the failure codes at six - `busy`, which a refused `SUSPEND` carries.
 	assert_eq!(decode_resource(&6u16.to_le_bytes()), Ok(ResourceKind::TrustedKeys), "the trusted key sink is a member");
 	assert_eq!(decode_resource(&7u16.to_le_bytes()), Ok(ResourceKind::PortRange), "and so is the port range");
 	assert_eq!(decode_resource(&8u16.to_le_bytes()), Ok(ResourceKind::Mmio), "and a platform row's further register window");
@@ -152,7 +152,8 @@ fn a_field_outside_its_closed_set_is_refused_and_the_number_is_reported() {
 	for raw in [0u16, 13, 0xffff] {
 		assert_eq!(decode_resource(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "resource kind {raw}");
 	}
-	for raw in [0u16, 6, 0xffff] {
+	assert_eq!(decode_failed(&6u16.to_le_bytes()), Ok(DriverFailureCode::Busy));
+	for raw in [0u16, 7, 0xffff] {
 		assert_eq!(decode_failed(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "failure code {raw}");
 	}
 }
@@ -206,6 +207,18 @@ fn retryability_is_read_off_the_code_rather_than_decided_at_the_call_site() {
 	assert!(!DriverFailureCode::ResourceUnusable.retryable(), "a second attempt hands it the same thing");
 	assert!(!DriverFailureCode::UnsupportedDevice.retryable(), "it read the device and will not drive it");
 	assert!(!DriverFailureCode::InternalError.retryable(), "nothing says a second try differs");
+	assert!(DriverFailureCode::Busy.retryable(), "the device's present condition passes");
+	for code in [
+		DriverFailureCode::ResourceUnusable,
+		DriverFailureCode::DeviceNotResponding,
+		DriverFailureCode::OutOfMemory,
+		DriverFailureCode::UnsupportedDevice,
+		DriverFailureCode::InternalError,
+		DriverFailureCode::Busy,
+	] {
+		assert_eq!(DriverFailureCode::from_u16(code as u16), Some(code), "every code survives the wire");
+	}
+	assert_eq!(DriverFailureCode::from_u16(7), None);
 }
 
 #[test]
@@ -485,7 +498,7 @@ fn the_node_request_and_its_two_answers() {
 	assert_eq!(Opcode::from_u16(13), Some(Opcode::NodeRequest));
 	assert_eq!(Opcode::from_u16(14), Some(Opcode::Node));
 	assert_eq!(Opcode::from_u16(15), Some(Opcode::NodeAbsent));
-	assert_eq!(Opcode::from_u16(16), None);
+	assert_eq!(Opcode::from_u16(16), Some(Opcode::Suspend), "the next opcode is suspend's");
 	assert_eq!((Opcode::NodeRequest.handle_count(), Opcode::Node.handle_count(), Opcode::NodeAbsent.handle_count()), (0, 1, 0));
 	for opcode in [Opcode::NodeRequest, Opcode::Node, Opcode::NodeAbsent] {
 		assert!(!opcode.is_terminal() && !opcode.ends_the_binding());
@@ -517,4 +530,44 @@ fn a_row_s_connection_becomes_the_scope_it_is_minted_with() {
 	assert!(connection_scope(acpi, &i2c(0x2C, abi::CONNECTION_I2C_TEN_BIT)).is_err(), "ten-bit addressing is refused");
 	assert!(connection_scope(acpi, &i2c(0x2C0, 0)).is_err(), "and an address past seven bits");
 	assert!(connection_scope(tree, &abi::Connection { kind: abi::CONNECTION_SPI, ..i2c(0, 0) }).is_err(), "and SPI");
+}
+
+// SUSPEND AND RESUME ARE NOT TERMINAL, carry no handle, and refuse every payload that is not exactly theirs.
+#[test]
+fn suspend_and_resume_round_trip_and_refuse_what_is_not_theirs() {
+	for opcode in [Opcode::Suspend, Opcode::Suspended, Opcode::Resume, Opcode::Resumed] {
+		assert!(!opcode.is_terminal() && !opcode.ends_the_binding(), "{opcode:?} ends nothing");
+		assert_eq!(opcode.handle_count(), 0);
+		assert_eq!(Opcode::from_u16(opcode as u16), Some(opcode));
+	}
+	assert_eq!(Opcode::from_u16(20), None);
+	let mut out = [0u8; 16];
+	let request = SuspendRequest { state: SleepState::Ram, arm_wake: true, timed_wake_ms: 90_000 };
+	let len = encode_suspend(&request, &mut out);
+	assert_eq!(decode_suspend(&out[..len]), Ok(request));
+	assert_eq!(decode_suspend(&out[..len - 1]), Err(FrameError::PayloadShape));
+	let mut bad = out;
+	bad[0] = 4;
+	assert_eq!(decode_suspend(&bad[..len]), Err(FrameError::UnknownValue(4)), "no fourth state");
+	let mut bad = out;
+	bad[1] = 2;
+	assert_eq!(decode_suspend(&bad[..len]), Err(FrameError::UnknownValue(2)), "wake is yes or no");
+	for outcome in [SuspendOutcome::Done, SuspendOutcome::DoneWakeArmed, SuspendOutcome::Refused(DriverFailureCode::DeviceNotResponding)] {
+		let answer = Suspended { outcome, awake_by_ms: 1_500 };
+		let len = encode_suspended(&answer, &mut out);
+		assert_eq!(decode_suspended(&out[..len]), Ok(answer));
+	}
+	let mut refused = [0u8; SUSPENDED_PAYLOAD_LEN];
+	refused[0] = 2;
+	refused[2] = 9;
+	assert_eq!(decode_suspended(&refused), Err(FrameError::UnknownValue(9)), "a refusal names a failure code the set has");
+	refused[0] = 0;
+	assert_eq!(decode_suspended(&refused), Err(FrameError::UnknownValue(0)), "a done answer carries no failure");
+	let len = encode_resume(true, &mut out);
+	assert_eq!(decode_resume(&out[..len]), Ok(true));
+	assert_eq!(decode_resume(&[2]), Err(FrameError::UnknownValue(2)));
+	let len = encode_resumed(false, &mut out);
+	assert_eq!(decode_resumed(&out[..len]), Ok(false));
+	assert_eq!(decode_resumed(&[]), Err(FrameError::PayloadShape));
+	assert!(SleepState::Ram.loses_power() && SleepState::Disk.loses_power() && !SleepState::Idle.loses_power());
 }

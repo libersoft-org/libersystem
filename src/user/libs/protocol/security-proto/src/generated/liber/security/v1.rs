@@ -174,6 +174,10 @@ pub enum Capability {
 	/// THE TYPE-C OPERATOR: a data-role or power-role swap, and an alternate mode entered or left, on a connector
 	/// whose platform offers it. Granted to no shipping program by default.
 	TypecControl = 51,
+	/// PUTTING THE MACHINE TO SLEEP: suspend to idle or to RAM, a bounded inhibition of an idle sleep, and the last
+	/// sleep's record - ServiceManager's `system-sleep`, a fresh connection per launch. Not the authority to stop the
+	/// machine, which is `system-power`'s. Granted to `sleepctl`. Appended last, for the reason `midi-output` states.
+	SystemSleep = 52,
 }
 
 impl Capability {
@@ -268,6 +272,7 @@ impl Capability {
 			49 => Some(Capability::Bmc),
 			50 => Some(Capability::Typec),
 			51 => Some(Capability::TypecControl),
+			52 => Some(Capability::SystemSleep),
 			_ => None,
 		}
 	}
@@ -1437,6 +1442,7 @@ impl Capability {
 			Capability::Bmc => out.push_str("\"bmc\""),
 			Capability::Typec => out.push_str("\"typec\""),
 			Capability::TypecControl => out.push_str("\"typec-control\""),
+			Capability::SystemSleep => out.push_str("\"system-sleep\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1493,6 +1499,7 @@ impl Capability {
 			Capability::Bmc => out.push_str("bmc"),
 			Capability::Typec => out.push_str("typec"),
 			Capability::TypecControl => out.push_str("typec-control"),
+			Capability::SystemSleep => out.push_str("system-sleep"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1549,6 +1556,7 @@ impl Capability {
 			Capability::Bmc => crate::codec::cbor::text(out, "bmc"),
 			Capability::Typec => crate::codec::cbor::text(out, "typec"),
 			Capability::TypecControl => crate::codec::cbor::text(out, "typec-control"),
+			Capability::SystemSleep => crate::codec::cbor::text(out, "system-sleep"),
 		}
 	}
 }

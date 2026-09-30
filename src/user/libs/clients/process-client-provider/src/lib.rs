@@ -27,3 +27,8 @@ forward!("liber_channel_liber_process_process_start", "liber_channel_impl_liber_
 forward!("liber_channel_liber_process_process_list", "liber_channel_impl_liber_process_process_list");
 forward!("liber_channel_liber_process_process_launch", "liber_channel_impl_liber_process_process_launch");
 forward!("liber_channel_liber_process_process_launch_bounded", "liber_channel_impl_liber_process_process_launch_bounded");
+forward!("liber_channel_liber_process_system_sleep_suspend", "liber_channel_impl_liber_process_system_sleep_suspend");
+forward!("liber_channel_liber_process_system_sleep_hibernate", "liber_channel_impl_liber_process_system_sleep_hibernate");
+forward!("liber_channel_liber_process_system_sleep_inhibit", "liber_channel_impl_liber_process_system_sleep_inhibit");
+forward!("liber_channel_liber_process_system_sleep_release", "liber_channel_impl_liber_process_system_sleep_release");
+forward!("liber_channel_liber_process_system_sleep_last_sleep", "liber_channel_impl_liber_process_system_sleep_last_sleep");

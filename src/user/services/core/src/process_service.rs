@@ -19,6 +19,14 @@
 //
 // When the supervisor that started it drops the bootstrap channel, the service
 // exits.
+//
+// TWO ROOTS, AND WHO ASKS DECIDES WHERE A LAUNCH LANDS. The client root (`SERVE`) is every manifest role's and
+// PermissionManager's: each launch on it - a `start`, a `launch`, a prepared one, the bounded and limited forms - lands
+// in ONE applications Domain this service creates at start, a per-launch Domain becoming its child, so every job, every
+// tool `run` starts and every shell but VT 1's is in one subtree. The supervisor root (`SUPERVISE`) is ServiceManager's
+// alone - no role is minted from it - and a launch on it keeps the control-plane Domain, as every launch did before;
+// it also carries `application-freeze`, which freezes and thaws the applications Domain for a sleep. A client's launch
+// during the freeze is not refused: its process, created in the frozen subtree, starts frozen and runs at the thaw.
 
 #![no_std]
 #![no_main]
@@ -28,6 +36,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
+use proto::system::application_freeze;
 use proto::system::process::{self, Service};
 use proto::system::volume;
 use proto::system::{Budget, Error, OpenOpts, ProcessInfo, ResourceLimits, ResourceType, ResourceUsage, StartResult};
@@ -566,6 +575,30 @@ struct Processes<'a> {
 	// The channel the request being dispatched arrived on, set by the serve loop before dispatch.
 	// Zero means "no client" - a self-call or a test - which owns nothing and can release nothing.
 	client: u64,
+	// THE APPLICATIONS DOMAIN, where a launch on the client root lands - see the head of this file.
+	apps: u64,
+	// Whether the request being dispatched arrived through the supervisor root, set with `client`.
+	supervised: bool,
+}
+
+// THE APPLICATIONS' FREEZE, for ServiceManager's sleep: the kernel parks every thread of the subtree and answers once
+// none runs user code, within its bound. A thaw leaves a job a person stopped stopped.
+struct Freezer {
+	apps: u64,
+}
+
+impl application_freeze::Service for Freezer {
+	fn freeze(&mut self) -> Result<(), Error> {
+		match domain_freeze(self.apps, true) {
+			0 => Ok(()),
+			ERR_TIMED_OUT => Err(Error::TimedOut),
+			_ => Err(Error::Io),
+		}
+	}
+
+	fn thaw(&mut self) -> Result<(), Error> {
+		if domain_freeze(self.apps, false) == 0 { Ok(()) } else { Err(Error::Io) }
+	}
 }
 
 // One launched process, and the handle that lets this service find out whether it is still
@@ -679,7 +712,7 @@ impl<'a> Processes<'a> {
 	// keyed by a number has no idea when the last user is gone. One per launch is handed to the
 	// process and forgotten, and the kernel frees it when the process does.
 	fn bounded_domain(&mut self, memory_limit: u64) -> Result<u64, Error> {
-		let domain = domain_create(memory_limit, u64::MAX, u64::MAX);
+		let domain = self.new_domain(memory_limit, u64::MAX, u64::MAX);
 		if domain < 0 {
 			return Err(Error::Again);
 		}
@@ -709,7 +742,7 @@ impl<'a> Processes<'a> {
 		if limits.dma == u64::MAX {
 			return Err(Error::Invalid);
 		}
-		let domain = domain_create(limits.memory, limits.handles, limits.threads);
+		let domain = self.new_domain(limits.memory, limits.handles, limits.threads);
 		if domain < 0 {
 			return Err(Error::Again);
 		}
@@ -743,7 +776,20 @@ impl<'a> Processes<'a> {
 		self.registry_armed
 	}
 
+	// A PER-LAUNCH DOMAIN, a child of the applications Domain for a client's launch and of this service's own for the
+	// supervisor's.
+	fn new_domain(&self, memory: u64, handles: u64, threads: u64) -> i64 {
+		if self.supervised { domain_create(memory, handles, threads) } else { domain_create_in(self.apps, memory, handles, threads) }
+	}
+
+	// WHERE A LAUNCH WITH NO DOMAIN OF ITS OWN RUNS: the applications Domain for a client, this service's own - the
+	// control plane's - for the supervisor.
+	fn home(&self, domain: u64) -> u64 {
+		if domain != 0 || self.supervised { domain } else { self.apps }
+	}
+
 	fn spawn_program(&mut self, name: &str, bootstrap: u64, domain: u64) -> Option<(Spawned, String)> {
+		let domain = self.home(domain);
 		if let Some((path, basename)) = executable::explicit_path(name) {
 			if self.storage == 0 {
 				return None;
@@ -1365,8 +1411,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     it started serving; an unanswered end simply means every launch reads the volume.
 	let registry: u64 = recv_tagged(bootstrap, &mut buf, b"REGISTRY").unwrap_or(0);
 
-	// 3. wait for the serve channel clients reach us on.
+	// 3. wait for the serve channel clients reach us on, and the supervisor's beside it.
 	let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
+	let supervise: u64 = recv_tagged(bootstrap, &mut buf, b"SUPERVISE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"supervise", b"missing supervisor root"));
+	// THE APPLICATIONS DOMAIN, a child of this service's own: unlimited, since each launch that is bounded is bounded by a
+	// Domain of its own beneath it.
+	let apps: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
+	if apps < 0 {
+		fail_bootstrap(bootstrap, b"applications", b"the applications Domain could not be created");
+	}
 
 	// 4. report in to the supervisor that started us.
 	{
@@ -1374,14 +1427,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 5. serve generated start/list requests until the client side closes.
-	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), prepared: Vec::new(), client: 0 };
+	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), prepared: Vec::new(), client: 0, apps: apps as u64, supervised: false };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	serve_multi(service, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+	serve_multi_rooted(&[service, supervise], &mut request, &mut reply, |origin, chan, req, handle, out, reply_handle| -> Option<usize> {
 		// The client's identity, carried into the dispatch that cannot take an extra argument:
 		// the generated trait's shape is fixed, and the serve loop is the only place that knows
 		// which channel a request arrived on.
 		procs.client = chan;
+		procs.supervised = origin == 1;
+		// THE FREEZE, on the supervisor root alone: a client's frame with these numbers is one the process contract does
+		// not carry, and is answered as such below.
+		if procs.supervised && req.len() >= 2 && matches!(u16::from_le_bytes([req[0], req[1]]), application_freeze::OP_FREEZE | application_freeze::OP_THAW) {
+			return application_freeze::dispatch(&mut Freezer { apps: procs.apps }, req, handle, out, reply_handle);
+		}
 		// A CLIENT THAT SIMPLY GOES (IDL-001). `serve_multi` synthesises this when a client's
 		// channel closes; everything that client prepared and never released is abandoned here,
 		// which is the difference between a transaction that was dropped and a process loaded,

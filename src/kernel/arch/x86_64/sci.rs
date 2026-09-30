@@ -53,6 +53,9 @@ struct Blocks {
 
 static BLOCKS: SpinLock<Option<Blocks>> = SpinLock::new(None);
 
+/// The PM1 enable bits `init` armed, for the re-arm after an S3.
+static ARMED: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
 /// PM1 status and enable bits. The two registers share a layout, which is what makes
 /// "acknowledge what was enabled" expressible at all.
 const PWRBTN: u16 = 1 << 8;
@@ -189,6 +192,7 @@ pub fn init(rsdp_phys: u64) {
 	//   asserted when the entry is unmasked - which delivers a press nobody made.
 	enter_acpi_mode(&fadt);
 	*BLOCKS.lock() = Some(blocks);
+	ARMED.store(armed, core::sync::atomic::Ordering::Relaxed);
 	unsafe {
 		port::outw(blocks.a_status, armed);
 		if let Some(b) = blocks.b_status {
@@ -368,6 +372,39 @@ fn route_sci_with_handler(fadt: &Fadt<'_>, rsdp_phys: u64) -> Option<u8> {
 	Some(vector)
 }
 
+/// WHETHER A FIXED BUTTON'S STATUS IS ALREADY SET: a wake the sleep entry would miss, which refuses it.
+pub fn button_pending() -> bool {
+	let Some(blocks) = *BLOCKS.lock() else { return false };
+	[Some(blocks.a_status), blocks.b_status].into_iter().flatten().any(|status| unsafe { port::inw(status) } & (PWRBTN | SLPBTN) != 0)
+}
+
+/// THE GENERAL-PURPOSE EVENTS FOR A SLEEP: the wake mask alone enabled at the entry, the runtime mask back after.
+pub fn gpes_enter_sleep() {
+	if let Some((gpes, io)) = GPES.lock().as_mut() {
+		gpes.enter_sleep(io);
+	}
+}
+
+pub fn gpes_leave_sleep() {
+	if let Some((gpes, io)) = GPES.lock().as_mut() {
+		gpes.leave_sleep(io);
+	}
+}
+
+/// PM1's enables and the SCI's routing again, after an S3 reset the chipset: the same arming `init` made.
+pub fn rearm_after_reset() {
+	let Some(blocks) = *BLOCKS.lock() else { return };
+	let armed = ARMED.load(core::sync::atomic::Ordering::Relaxed);
+	for (status, enable) in [(Some(blocks.a_status), Some(blocks.a_enable)), (blocks.b_status, blocks.b_enable)] {
+		if let (Some(status), Some(enable)) = (status, enable) {
+			unsafe {
+				port::outw(status, armed);
+				port::outw(enable, armed);
+			}
+		}
+	}
+}
+
 /// The SCI handler: decode what is set, acknowledge it, and report it.
 fn handle(_vector: u32) {
 	let Some(blocks) = *BLOCKS.lock() else { return };
@@ -389,13 +426,26 @@ fn handle(_vector: u32) {
 	// arrived" from "it arrived and the consumer did nothing with it" - and those are two different
 	// defects with two different owners. The press is a fact about the MACHINE and belongs in the
 	// machine's own log.
+	// WHILE THE MACHINE SLEEPS A BUTTON IS WHAT WOKE IT, reported as the wake and NOT delivered as a press: QEMU's
+	// `system_wakeup` itself sets the power button's status, and a delivered press would power the machine off.
+	let sleeping = crate::sleep::sleeping();
 	if seen & PWRBTN != 0 {
-		crate::serial_println!("acpi: the power button was pressed");
-		crate::platform_event::report(crate::platform_event::POWER_BUTTON);
+		if sleeping {
+			crate::serial_println!("acpi: the power button woke the machine");
+			crate::sleep::woke_by(abi::WAKE_POWER_BUTTON, 0);
+		} else {
+			crate::serial_println!("acpi: the power button was pressed");
+			crate::platform_event::report(crate::platform_event::POWER_BUTTON);
+		}
 	}
 	if seen & SLPBTN != 0 {
-		crate::serial_println!("acpi: the sleep button was pressed");
-		crate::platform_event::report(crate::platform_event::SLEEP_BUTTON);
+		if sleeping {
+			crate::serial_println!("acpi: the sleep button woke the machine");
+			crate::sleep::woke_by(abi::WAKE_SLEEP_BUTTON, 0);
+		} else {
+			crate::serial_println!("acpi: the sleep button was pressed");
+			crate::platform_event::report(crate::platform_event::SLEEP_BUTTON);
+		}
 	}
 	if seen & GBL != 0 {
 		GLOBAL_LOCK_RELEASED.store(true, core::sync::atomic::Ordering::Release);
@@ -404,6 +454,10 @@ fn handle(_vector: u32) {
 	if let Some((gpes, io)) = GPES.lock().as_mut() {
 		let mut pending = PENDING.lock();
 		gpes.handle_into(io, super::apic::ticks(), &mut |gpe, storm| {
+			// In a sleep only the wake mask is enabled: an event asserted is a wake, and latched for the service too.
+			if sleeping {
+				crate::sleep::woke_by(abi::WAKE_DEVICE, u32::from(gpe));
+			}
 			let (word, bit) = (gpe as usize / 64, gpe as usize % 64);
 			if storm {
 				pending.1[word] |= 1 << bit;

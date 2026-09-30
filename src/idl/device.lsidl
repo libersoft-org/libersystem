@@ -165,6 +165,9 @@ enum binding-state {
 	/// under a device that is no longer there to ask - and lands at `quarantined` like every other
 	/// unconfirmed teardown. Reaching `removed` is a claim about the resources, not about the bus.
 	removed            = 9,
+	/// SUSPENDED FOR A SLEEP: the binding, its generation, its publications and its consumers' connections all
+	/// survive - which is what `stopping` cannot give - and a `resume` returns it to `online`.
+	suspended          = 10,
 }
 
 /// Why a binding is not up. A STATE and a CAUSE are not alternatives - "quarantined" and "hung" are

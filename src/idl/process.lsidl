@@ -206,3 +206,194 @@ enum shutdown-action {
 interface shutdown-notice {
 	@op(1) prepare: func(action: shutdown-action) -> result<unit, error>;
 }
+
+// ------------------------------------------------------------------ sleep
+
+/// A sleep the system can enter.
+enum sleep-state {
+	/// SUSPEND TO IDLE: the transaction with no firmware transition - every core parked, the timed wake the only
+	/// timer.
+	idle = 1,
+	/// SUSPEND TO RAM: ACPI S3, the firmware's transition, memory kept in self-refresh.
+	ram  = 2,
+	/// HIBERNATION: the image written to disk and the machine off.
+	disk = 3,
+}
+
+/// The steps of the suspend transaction, in order.
+enum sleep-step {
+	none     = 0,
+	/// Every service whose manifest entry declares the sleep notice, told.
+	announce = 1,
+	/// The applications frozen.
+	freeze   = 2,
+	/// Every StorageService instance written back and holding new writes.
+	flush    = 3,
+	/// Every driver binding suspended.
+	drivers  = 4,
+	/// The platform prepared for the state: wake armed, `_PTS` and `_SST`.
+	platform = 5,
+	/// The kernel's entry.
+	enter    = 6,
+}
+
+/// WHO ASKED FOR A SLEEP: an inhibitor delays an IDLE sleep by its bounded amount, and nothing else.
+enum sleep-reason {
+	/// A person, through a tool - `sleepctl`.
+	requested     = 1,
+	/// A sleep button, fixed or control-method.
+	sleep-button  = 2,
+	/// The lid closed.
+	lid           = 3,
+	/// The policy's idle timeout.
+	idle          = 4,
+	/// A critical battery, where hibernation is set up.
+	critical      = 5,
+}
+
+/// How the last sleep ended.
+enum sleep-outcome {
+	/// Accepted and running now.
+	running  = 1,
+	/// Slept and woke.
+	resumed  = 2,
+	/// Refused before anything was frozen.
+	refused  = 3,
+	/// A step failed, and the steps already taken were unwound.
+	unwound  = 4,
+}
+
+/// What woke the machine.
+enum wake-reason {
+	unknown      = 0,
+	/// The sleep's own timed wake.
+	timer        = 1,
+	power-button = 2,
+	sleep-button = 3,
+	/// A device's interrupt the wake set holds.
+	device       = 4,
+	/// The CMOS alarm (S3's timed wake).
+	rtc          = 5,
+	/// The platform woke it and said nothing more (QEMU's `system_wakeup`).
+	platform     = 6,
+}
+
+/// One core's wakeups while it was parked in a suspend to idle, by cause.
+record core-park {
+	cpu:    u32,
+	timer:  u32,
+	ipi:    u32,
+	device: u32,
+}
+
+/// THE LAST SLEEP'S RECORD - what a requester reads after its request was accepted, since `suspend` answers at
+/// acceptance and never at the resume.
+record sleep-record {
+	state:     sleep-state,
+	reason:    sleep-reason,
+	outcome:   sleep-outcome,
+	/// The step that failed or refused, and who: a service or a binding by name, or the orderly sequence's door.
+	step:      sleep-step,
+	who:       string,
+	why:       string,
+	/// The boot-time clock at the request and the sleep's length, in nanoseconds; zero for a sleep that did not
+	/// enter.
+	requested: u64,
+	slept:     u64,
+	wake:      wake-reason,
+	/// The device's interrupt identity, for `device`.
+	wake-detail: u32,
+	/// Each core's wakeups while parked, for a suspend to idle.
+	@bound(64) cores: list<core-park>,
+}
+
+/// THE AUTHORITY TO PUT THE MACHINE TO SLEEP - beside `system-power` and not inside it, because a client of that
+/// interface can stop the machine and nothing else. Served by ServiceManager; clients reach it through manifest
+/// roles and PermissionManager grants.
+///
+/// `suspend` AND `hibernate` ANSWER WHEN SERVICEMANAGER ACCEPTS OR REFUSES THE REQUEST, before any step runs and
+/// without waiting on any participant - never at the resume: a requester may itself be a participant the
+/// transaction waits on. Everything after acceptance is read from `last-sleep`.
+interface system-sleep {
+	/// Suspend to idle or to RAM, with a timed wake `timed-wake-ms` from now, or none for zero.
+	@op(1) suspend:    func(state: sleep-state, timed-wake-ms: u64, reason: sleep-reason) -> result<unit, error>;
+	/// Hibernate: refused until the machine is set up for it.
+	@op(2) hibernate:  func(reason: sleep-reason) -> result<unit, error>;
+	/// Delay an IDLE sleep by at most `milliseconds` - a download, a call. Nothing delays a lid, sleep-button or
+	/// critical-battery sleep past its bound.
+	@op(3) inhibit:    func(milliseconds: u32, reason: string) -> result<unit, error>;
+	/// End this client's inhibition early.
+	@op(4) release:    func() -> result<unit, error>;
+	@op(5) last-sleep: func() -> result<sleep-record, error>;
+}
+
+/// THE SLEEP NOTICE, on the control channel ServiceManager holds for every service whose manifest entry declares
+/// it - the one the shutdown notice travels on. `announce` at the transaction's first step; `hold-writes` and
+/// `release-writes` to StorageService alone, once the applications are frozen and at the resume; `resumed` after
+/// the drivers are back.
+///
+/// ITS OPERATIONS ARE NUMBERED APART from `shutdown-notice`'s and from every other interface a control channel carries, so
+/// one channel can carry them all without a frame being read as another's.
+interface sleep-notice {
+	@op(16) announce:       func(state: sleep-state) -> result<unit, error>;
+	@op(17) hold-writes:    func() -> result<unit, error>;
+	@op(18) release-writes: func() -> result<unit, error>;
+	@op(19) resumed:        func(state: sleep-state) -> result<unit, error>;
+}
+
+/// What DeviceManager answers for its step. `failed` is empty when every binding suspended; otherwise it names the
+/// binding that refused or did not answer within its scaled bound, `why` says which, and every binding the step had
+/// already suspended has been resumed - the step unwinds itself before it answers. On success, the companion nodes
+/// of the bindings whose `SUSPENDED` said wake armed, and the latest time the machine must be awake by, for a device
+/// that cannot be stopped.
+record drivers-suspended {
+	failed: string,
+	why:    string,
+	@bound(64) wake-nodes: list<string>,
+	/// Milliseconds from the answer; zero for no bound.
+	awake-by-ms: u64,
+}
+
+/// THE DRIVERS' STEP, asked of DeviceManager on the control channel ServiceManager holds for it. Each answer comes
+/// when the step is done - one binding at a time, each under its own scaled bound - and DeviceManager keeps serving
+/// meanwhile, so the answer is correlated rather than awaited in line.
+interface device-sleep {
+	/// THE BINDINGS THE SLEEP CANNOT SUSPEND, asked before anything is frozen: every `Online` binding whose entry
+	/// declares no `suspend-deadline`, and every bind or stop in flight - each as its driver, its device and why.
+	/// Empty when the sleep may go ahead.
+	@op(20) check:   func() -> result<list<string>, error>;
+	@op(21) suspend: func(state: sleep-state, arm-wake: bool, timed-wake-ms: u64) -> result<drivers-suspended, error>;
+	/// Every suspended binding resumed; the answer names the devices that did not come back, which are being torn
+	/// down and rebound.
+	@op(22) resume:  func(state: sleep-state) -> result<list<string>, error>;
+}
+
+/// THE PLATFORM'S STEP, served by the ACPI service on the control channel ServiceManager holds for it: `prepare`
+/// evaluates `_PRW` and `_DSW` or `_PSW` on the wake nodes, arms their wake GPEs, then runs `_PTS` and `_SST`;
+/// `wake` runs `_WAK` and `_SST` and disarms what `prepare` armed.
+interface platform-sleep {
+	@op(24) prepare: func(state: sleep-state, @bound(64) wake-nodes: list<string>) -> result<unit, error>;
+	@op(25) wake:    func(state: sleep-state) -> result<unit, error>;
+}
+
+/// THE APPLICATIONS' FREEZE, on ProcessService's supervisor root - which ServiceManager alone holds, and on which
+/// every launch keeps the control-plane Domain and is never held.
+interface application-freeze {
+	@op(32) freeze: func() -> result<unit, error>;
+	@op(33) thaw:   func() -> result<unit, error>;
+}
+
+/// What the kernel's entry answered.
+record woke {
+	wake:   wake-reason,
+	detail: u32,
+	/// The sleep's length, in nanoseconds.
+	slept:  u64,
+	@bound(64) cores: list<core-park>,
+}
+
+/// THE ENTRY, asked of SystemManager - the one holder of MANAGE on the root Domain, which the kernel's sleep entry
+/// requires - by ServiceManager over the channel they already share. It answers when the machine is awake again.
+interface sleep-entry {
+	@op(28) enter: func(state: sleep-state, timed-wake-ms: u64) -> result<woke, error>;
+}

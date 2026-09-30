@@ -22,6 +22,7 @@ use crate::virtio::{self, Virtio};
 // say "this went wrong" other than exiting.
 
 // What `BIND` said: the device, which binding of it this is, and how many resources follow.
+#[derive(Clone, Copy)]
 pub struct Bind {
 	pub info: DeviceInfo,
 	// P02M0098's claim generation. It goes on every frame this driver sends back, so a message from
@@ -536,6 +537,23 @@ pub fn stand(bootstrap: u64, bind: &Bind, device: u64) -> ! {
 				finish_stop(bootstrap, bind, device, quiesce_virtio());
 				exit();
 			}
+			// THE SLEEP, by the common step: a driver that stands has no work to hold.
+			proto::Opcode::Suspend => {
+				let Ok(request) = proto::decode_suspend(header.payload(&buf)) else { exit() };
+				match common_sleep_step(bootstrap, bind, &request, None) {
+					Control::Continue | Control::Sleep => {}
+					Control::Stop => {
+						finish_stop(bootstrap, bind, device, quiesce_virtio());
+						exit();
+					}
+					Control::Ended => exit(),
+				}
+			}
+			proto::Opcode::Resume => {
+				if !resumed(bootstrap, bind, true) {
+					exit();
+				}
+			}
 			// Anything else on this channel ends the stand, which is what dropping the channel
 			// has always meant.
 			_ => exit(),
@@ -560,7 +578,7 @@ pub fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<us
 		// first ready index, so a handle that is always ready starves everything after it - and
 		// what comes after it here is the channel a watchdog is asking on.
 		match drain_control(bootstrap, bind) {
-			Control::Continue => {}
+			Control::Continue | Control::Sleep => {}
 			Control::Stop => {
 				// LATCHED, NOT ANSWERED - see `finish_stop`. The caller unwinds and answers once
 				// its own work is finished or abandoned, which is what `STOPPED` certifies.
@@ -590,8 +608,10 @@ pub fn wait_or_answer_until(bootstrap: u64, bind: &Bind, handles: &[u64], deadli
 	set[..count].copy_from_slice(&handles[..count]);
 	set[count] = bootstrap;
 	loop {
-		match drain_control_into(bootstrap, bind, serving.as_deref_mut()) {
+		match drain_control_into(bootstrap, bind, serving.as_deref_mut(), true) {
 			Control::Continue => {}
+			// "Nothing ready": the driver's loop reads the request with `suspend_requested`.
+			Control::Sleep => return Some(None),
 			Control::Stop => {
 				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
@@ -639,7 +659,7 @@ pub fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
 	// TOKEN ZERO AND NEVER READ: this set does not accept, so no endpoint in it is ever a
 	// provider connection whose end has to be reported. See `accepts` below.
 	let mut one = Serving::new(server, 0);
-	serve_any_or_answer_inner(bootstrap, bind, &mut one, false).is_some()
+	serve_any_or_answer_inner(bootstrap, bind, &mut one, false, false).is_some()
 }
 
 // THE SAME, OVER EVERY CONSUMER THIS PROVIDER HAS. Answers WHICH endpoint has work, or `None` when
@@ -649,7 +669,13 @@ pub fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
 // a provider - a driver's own control path - and so a caller that will never see a `CONNECT` does
 // not have to hold a set to say so.
 pub fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving) -> Option<usize> {
-	serve_any_or_answer_inner(bootstrap, bind, serving, true)
+	serve_any_or_answer_inner(bootstrap, bind, serving, true, false).flatten()
+}
+
+// THE SAME, FOR A PROVIDER THAT TAKES THE SLEEP ITSELF (`takes_sleep`): `Some(None)` hands it a `SUSPEND`, which its loop
+// runs through `take_sleep_step`.
+pub fn serve_any_or_sleep(bootstrap: u64, bind: &Bind, serving: &mut Serving) -> Option<Option<usize>> {
+	serve_any_or_answer_inner(bootstrap, bind, serving, true, true)
 }
 
 /// Receive one consumer's request, or drop the consumer that has gone.
@@ -701,23 +727,30 @@ pub fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Servi
 // consumer that never drains must not keep a settling scheduler from settling.
 pub fn wait_providers(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool) -> Option<ProviderReady> {
 	loop {
-		if let Some(ready) = wait_providers_inner(bootstrap, bind, serving, devices, housekeeping, 0)? {
+		if let Some(ready) = wait_providers_inner(bootstrap, bind, serving, devices, housekeeping, 0, false)? {
 			return Some(ready);
 		}
 	}
 }
 
 // THE SAME WAIT, BOUNDED: `Some(None)` once `deadline` passes with nothing ready - for a provider whose own timers run
-// beside its consumers and its device, a port controller's engine among them.
+// beside its consumers and its device, a port controller's engine among them. Zero for `deadline` waits unbounded, and
+// `Some(None)` is then a `SUSPEND` for a driver that takes the sleep itself.
 pub fn wait_providers_until(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], deadline: u64) -> Option<Option<ProviderReady>> {
-	wait_providers_inner(bootstrap, bind, serving, devices, false, deadline)
+	wait_providers_inner(bootstrap, bind, serving, devices, false, deadline, true)
+}
+
+// THE UNBOUNDED WAIT, FOR A PROVIDER THAT TAKES THE SLEEP ITSELF: `Some(None)` hands it a `SUSPEND`.
+pub fn wait_providers_or_sleep(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool) -> Option<Option<ProviderReady>> {
+	wait_providers_inner(bootstrap, bind, serving, devices, housekeeping, 0, true)
 }
 
 // Zero for `deadline` waits unbounded.
-fn wait_providers_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool, deadline: u64) -> Option<Option<ProviderReady>> {
+fn wait_providers_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64], housekeeping: bool, deadline: u64, surfaces: bool) -> Option<Option<ProviderReady>> {
 	loop {
-		match drain_control_into(bootstrap, bind, Some(serving)) {
+		match drain_control_into(bootstrap, bind, Some(serving), surfaces) {
 			Control::Continue => {}
+			Control::Sleep => return Some(None),
 			Control::Stop => {
 				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
@@ -758,7 +791,7 @@ fn wait_providers_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, devi
 // The two shapes above, with the one thing that differs between them named: whether a `CONNECT` may
 // be ACCEPTED into `serving`. A caller whose set outlives the call may; one whose set is a local may
 // not, because accepting into a set that is about to be dropped loses the endpoint.
-fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, accepts: bool) -> Option<usize> {
+fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, accepts: bool, surfaces: bool) -> Option<Option<usize>> {
 	loop {
 		// THE MANAGER'S CHANNEL IS DRAINED FIRST, EVERY PASS, and that is not a nicety.
 		//
@@ -767,8 +800,9 @@ fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving,
 		// which is precisely the driver a watchdog must not kill. Measured: every virtio-blk in
 		// the machine was declared wedged while serving StorageService as fast as it could.
 		let placed = if accepts { Some(&mut *serving) } else { None };
-		match drain_control_into(bootstrap, bind, placed) {
+		match drain_control_into(bootstrap, bind, placed, surfaces) {
 			Control::Continue => {}
+			Control::Sleep => return Some(None),
 			Control::Stop => {
 				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
@@ -778,7 +812,7 @@ fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving,
 		// THE FIRST WITH WORK, and a set that grew while this was parked is waited on next pass.
 		for index in 0..serving.as_slice().len() {
 			if poll_ready(serving.at(index)) {
-				return Some(index);
+				return Some(Some(index));
 			}
 		}
 		// Nothing on any of them: park until one speaks. The manager's channel goes LAST so a
@@ -965,17 +999,22 @@ enum Control {
 	Stop,
 	// The manager dropped the channel or sent something that ends this driver.
 	Ended,
+	// A DRIVER THAT TAKES THE SLEEP ITSELF WAS ASKED TO SUSPEND: `suspend_requested` holds the request. Only a wait
+	// that can say "nothing ready" surfaces it - see `takes_sleep`.
+	Sleep,
 }
 
 // Answer every `PING` waiting on `bootstrap` right now, without blocking.
 fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
-	drain_control_into(bootstrap, bind, None)
+	drain_control_into(bootstrap, bind, None, false)
 }
 
 // The same, for a loop that serves a provider: a `CONNECT` carries an endpoint and there has to be
 // somewhere to put it. `None` is a caller that serves none, and one arriving there is refused with
 // its handle closed rather than silently dropped.
-fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> Control {
+// `surfaces`: whether the caller can hand a `SUSPEND` back to a driver that takes the sleep itself. One that cannot -
+// a wait with no "nothing ready" answer - runs the common step here instead, so the exchange completes either way.
+fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>, surfaces: bool) -> Control {
 	let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
 	// A NODE CHANNEL WHOSE SERVICE ENDED - the ACPI service restarted - is given up and asked for again.
 	let node = NODE.load(core::sync::atomic::Ordering::Acquire);
@@ -1040,6 +1079,29 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 			// what it owes is the answer and then its own exit. A driver with something to
 			// drain overrides `Control::Stop` rather than letting this decide for it.
 			proto::Opcode::Stop => return Control::Stop,
+			// THE MACHINE IS GOING TO SLEEP. A driver that takes the sleep itself is handed the request; every other
+			// is suspended here, by the common step, and waits out the sleep in `hold` - the loop that called this is
+			// between units of work, so holding here is taking no new work.
+			proto::Opcode::Suspend => {
+				let Ok(request) = proto::decode_suspend(header.payload(&buf)) else {
+					return Control::Ended;
+				};
+				if surfaces && OWN_SLEEP.load(core::sync::atomic::Ordering::Acquire) {
+					SUSPEND_ASKED.store(encode_request(&request), core::sync::atomic::Ordering::Release);
+					return Control::Sleep;
+				}
+				match common_sleep_step(bootstrap, bind, &request, serving.as_deref_mut()) {
+					Control::Continue => {}
+					other => return other,
+				}
+			}
+			// A RESUME WITH NOTHING SUSPENDED: the unwind of a suspend this driver answered too late, or never saw. It
+			// is running, so it is back.
+			proto::Opcode::Resume => {
+				if !resumed(bootstrap, bind, true) {
+					return Control::Ended;
+				}
+			}
 			_ => {
 				if handle != 0 {
 					close(handle);
@@ -1104,15 +1166,17 @@ pub fn fresh_node() -> Option<u64> {
 }
 
 // THE SAME WAIT AS `wait_or_answer`, ANSWERING `Some(handles.len())` WHEN THE MANAGER ANSWERED THIS DRIVER'S NODE REQUEST
-// meanwhile - for a driver whose loop acts on its firmware node, which arrives on the control channel this wait drains.
+// meanwhile - for a driver whose loop acts on its firmware node, which arrives on the control channel this wait drains -
+// or asked a driver that takes the sleep itself to suspend (`suspend_requested`).
 pub fn wait_node_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<usize> {
 	let mut set: [u64; 8] = [0; 8];
 	let count: usize = handles.len().min(set.len() - 1);
 	set[..count].copy_from_slice(&handles[..count]);
 	set[count] = bootstrap;
 	loop {
-		match drain_control(bootstrap, bind) {
+		match drain_control_into(bootstrap, bind, None, true) {
 			Control::Continue => {}
+			Control::Sleep => return Some(count),
 			Control::Stop => {
 				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
@@ -1135,10 +1199,11 @@ pub fn wait_node_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Opti
 
 // Answer one `PING` that is already waiting on `bootstrap`, for a loop that does its own waiting.
 //
-// False when the manager dropped the channel or sent anything else, which ends the driver.
+// False when the manager dropped the channel or sent anything else, which ends the driver. True with a `SUSPEND`
+// latched for a driver that takes the sleep itself, whose loop reads it with `suspend_requested`.
 pub fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
-	match drain_control(bootstrap, bind) {
-		Control::Continue => true,
+	match drain_control_into(bootstrap, bind, None, true) {
+		Control::Continue | Control::Sleep => true,
 		Control::Stop => {
 			STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 			false
@@ -1153,6 +1218,205 @@ pub fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
 // that a PLANNED stop completed, which is what makes it different from a channel that simply closed.
 pub fn stopped(bootstrap: u64, bind: &Bind) -> bool {
 	send_frame(bootstrap, proto::Opcode::Stopped, bind.generation, &[])
+}
+
+// ------------------------------------------------------------------ the sleep
+
+// THE SUSPEND EXCHANGE, the driver's half. `SUSPEND` and `RESUME` are not terminal: the binding, its publications and its
+// consumers' connections survive the sleep, which is what `STOP` cannot give.
+//
+// EVERY DRIVER CARRIES IT, through the common step, unless it takes it itself. The common step holds the driver's work
+// - the loop that read the frame is between units of work, and it serves nothing until the resume - and leaves the
+// device as it is, which a suspend to idle keeps powered with its state: its `RESUME` answers back. For a state that
+// loses power it first stops a virtio device (the transport's reset: no DMA into memory about to stop being
+// refreshed), and it cannot reprogram a device that lost its power, so that `RESUME` answers a device that did not come
+// back - the manager tears the binding down and binds it again, through the route a crash takes.
+//
+// A DRIVER WHOSE DEVICE NEEDS A STEP OF ITS OWN says so once with `takes_sleep`, before its loop, and waits with a
+// helper that can answer "nothing ready" - `wait_or_answer_until`, `wait_providers_until`, `wait_node_or_answer`,
+// `answer_ping` - which then hands it the `SUSPEND`: its loop runs `take_sleep_step` with its `SleepStep`. A wait with
+// no such answer runs the common step instead, so the exchange completes whichever wait the frame arrives in.
+static OWN_SLEEP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// The `SUSPEND` handed to such a driver and not yet taken: `1 << 63 | state << 56 | arm_wake << 48 | timed wake in ms`.
+static SUSPEND_ASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// Whether the common step stopped this driver's virtio device for the sleep, so its `RESUME` - an unwind's, which says
+// nothing lost power, included - answers a device that did not come back.
+static STOPPED_FOR_SLEEP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+const ASKED: u64 = 1 << 63;
+const TIMED_MASK: u64 = (1 << 48) - 1;
+
+fn encode_request(request: &proto::SuspendRequest) -> u64 {
+	ASKED | (request.state as u64) << 56 | u64::from(request.arm_wake) << 48 | request.timed_wake_ms.min(TIMED_MASK)
+}
+
+fn decode_request(value: u64) -> Option<proto::SuspendRequest> {
+	if value & ASKED == 0 {
+		return None;
+	}
+	let state = proto::SleepState::from_u8(((value >> 56) & 0x7F) as u8)?;
+	Some(proto::SuspendRequest { state, arm_wake: (value >> 48) & 1 == 1, timed_wake_ms: value & TIMED_MASK })
+}
+
+// THIS DRIVER TAKES THE SLEEP ITSELF - see the section's note. Called once, before the loop.
+pub fn takes_sleep() {
+	OWN_SLEEP.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// The `SUSPEND` a bounded wait handed back, taken once.
+pub fn suspend_requested() -> Option<proto::SuspendRequest> {
+	decode_request(SUSPEND_ASKED.swap(0, core::sync::atomic::Ordering::AcqRel))
+}
+
+// "Suspended": done, done with wake armed, or refused - and, for a device that cannot be stopped, the latest the
+// machine must be awake by.
+pub fn suspended(bootstrap: u64, bind: &Bind, answer: &proto::Suspended) -> bool {
+	let mut payload = [0u8; proto::SUSPENDED_PAYLOAD_LEN];
+	let len = proto::encode_suspended(answer, &mut payload);
+	send_frame(bootstrap, proto::Opcode::Suspended, bind.generation, &payload[..len])
+}
+
+// "Resumed": back, or a device that did not come back.
+pub fn resumed(bootstrap: u64, bind: &Bind, back: bool) -> bool {
+	let mut payload = [0u8; proto::RESUMED_PAYLOAD_LEN];
+	let len = proto::encode_resumed(back, &mut payload);
+	send_frame(bootstrap, proto::Opcode::Resumed, bind.generation, &payload[..len])
+}
+
+// How a hold ended.
+pub enum Held {
+	// `RESUME`, and whether the device may have lost power.
+	Resume(bool),
+	// The manager asked this driver to stop while it was suspended - latched, as every wait latches it.
+	Stop,
+	// The manager dropped the channel.
+	Ended,
+}
+
+// WAIT OUT THE SLEEP on the control channel alone: the driver takes no work until the manager's `RESUME`. A consumer
+// connecting meanwhile is accepted into `serving` and served after the resume; a `PING`, which the manager does not
+// send to a suspended binding, is answered anyway; a second `SUSPEND` is answered as done, since the driver is.
+pub fn hold(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> Held {
+	let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	loop {
+		let (len, handle) = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } => (len, handle),
+			Received::Closed => return Held::Ended,
+		};
+		let Ok(header) = proto::Header::decode(&buf[..len]) else {
+			if handle != 0 {
+				close(handle);
+			}
+			continue;
+		};
+		if header.generation != bind.generation {
+			if handle != 0 {
+				close(handle);
+			}
+			continue;
+		}
+		match header.opcode {
+			proto::Opcode::Resume => return Held::Resume(proto::decode_resume(header.payload(&buf)).unwrap_or(true)),
+			proto::Opcode::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+				return Held::Stop;
+			}
+			proto::Opcode::Ping => {
+				let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
+				if !pong(bootstrap, bind, sequence) {
+					return Held::Ended;
+				}
+			}
+			proto::Opcode::Connect => {
+				let connect = proto::decode_connect_scoped(header.payload(&buf)).ok();
+				let accepted = handle != 0 && connect.is_some_and(|(token, scope)| serving.as_deref_mut().is_some_and(|serving| serving.accept(handle, token, scope)));
+				if !accepted && handle != 0 {
+					close(handle);
+					if let Some((token, _)) = connect
+						&& !disconnected(bootstrap, bind, token)
+					{
+						return Held::Ended;
+					}
+				}
+			}
+			proto::Opcode::Node | proto::Opcode::NodeAbsent => take_node(bind, header.opcode, handle),
+			proto::Opcode::Suspend => {
+				if !suspended(bootstrap, bind, &proto::Suspended { outcome: proto::SuspendOutcome::Done, awake_by_ms: 0 }) {
+					return Held::Ended;
+				}
+			}
+			_ => {
+				if handle != 0 {
+					close(handle);
+				}
+				return Held::Ended;
+			}
+		}
+	}
+}
+
+// A DRIVER'S OWN STEP: what its device needs to be left for the sleep, and to come back from it.
+pub trait SleepStep {
+	// Take no new work, finish or hold what was accepted, stop DMA, mask the interrupts, put the device in its lowest
+	// state and arm wake if asked; answer the outcome.
+	fn suspend(&mut self, request: &proto::SuspendRequest) -> proto::Suspended;
+	// Reprogram the device from what was saved; answer whether it came back.
+	fn resume(&mut self, lost_power: bool) -> bool;
+	// Where a consumer connecting during the sleep is accepted, for a provider.
+	fn serving(&mut self) -> Option<&mut Serving> {
+		None
+	}
+}
+
+// RUN THE EXCHANGE for a driver that takes the sleep itself, if a `SUSPEND` was handed back: its step, the answer, the
+// hold, its resume and that answer. False when the driver must end - asked to stop while suspended (latched: its stop
+// path answers it) or the channel dropped. A refused suspend leaves the driver running, holding nothing.
+pub fn take_sleep_step<S: SleepStep>(bootstrap: u64, bind: &Bind, step: &mut S) -> bool {
+	let Some(request) = suspend_requested() else { return true };
+	let answer = step.suspend(&request);
+	if !suspended(bootstrap, bind, &answer) {
+		return false;
+	}
+	if matches!(answer.outcome, proto::SuspendOutcome::Refused(_)) {
+		return true;
+	}
+	match hold(bootstrap, bind, step.serving()) {
+		Held::Resume(lost_power) => {
+			let back = step.resume(lost_power);
+			resumed(bootstrap, bind, back)
+		}
+		Held::Stop | Held::Ended => false,
+	}
+}
+
+// THE COMMON STEP - see the section's note. Answers `Continue` once the driver is running again.
+fn common_sleep_step(bootstrap: u64, bind: &Bind, request: &proto::SuspendRequest, serving: Option<&mut Serving>) -> Control {
+	let stop = request.state.loses_power() && VIRTIO_COMMON.load(core::sync::atomic::Ordering::Acquire) != 0;
+	let outcome = if stop && !quiesce_virtio() {
+		// A device that does not confirm it stopped may still be mastering the bus: the sleep is refused rather than
+		// taken with it running.
+		proto::SuspendOutcome::Refused(proto::DriverFailureCode::DeviceNotResponding)
+	} else {
+		STOPPED_FOR_SLEEP.store(stop, core::sync::atomic::Ordering::Release);
+		proto::SuspendOutcome::Done
+	};
+	if !suspended(bootstrap, bind, &proto::Suspended { outcome, awake_by_ms: 0 }) {
+		return Control::Ended;
+	}
+	if !matches!(outcome, proto::SuspendOutcome::Done) {
+		return Control::Continue;
+	}
+	match hold(bootstrap, bind, serving) {
+		Held::Resume(lost_power) => {
+			let back = !lost_power && !STOPPED_FOR_SLEEP.swap(false, core::sync::atomic::Ordering::AcqRel);
+			if !back {
+				print(b"driver: its device lost its state in the sleep and this driver cannot reprogram it - it is bound again\n");
+			}
+			if resumed(bootstrap, bind, back) { Control::Continue } else { Control::Ended }
+		}
+		Held::Stop => Control::Stop,
+		Held::Ended => Control::Ended,
+	}
 }
 
 // A STOP WAS READ AND NOT YET ANSWERED.

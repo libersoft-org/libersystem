@@ -11,9 +11,11 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 // The ring-3 entry stub, syscall wrapper, panic handler, spawn/IPC helpers, and
 // ABI constants all come from the shared userspace runtime crate.
-use proto::system::{Error, system_power};
+use proto::system::{CorePark as WireCorePark, Error, SleepState, WakeReason, Woke, sleep_entry, system_power};
 use rt::*;
 
 // `rt`'s `_start` enters here with the bootstrap channel handle in rdi.
@@ -297,6 +299,17 @@ fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, domain: u
 			// blocking-receive loop this replaced did by construction.
 			match try_recv(branch, buf) {
 				Polled::Closed => return,
+				// THE SLEEP'S ENTRY, asked by ServiceManager on the channel they share: made here, because this process
+				// alone holds MANAGE on the root Domain. It answers when the machine is awake again.
+				Polled::Message { len, .. } if is_sleep_entry(&buf[..len]) => {
+					let request: alloc::vec::Vec<u8> = buf[..len].to_vec();
+					let mut answer = alloc::vec![0u8; 2048];
+					let mut handles = proto::codec::Handles::new();
+					let mut answer_handles = proto::codec::Handles::new();
+					if let Some(written) = sleep_entry::dispatch(&mut Entry { power }, &request, &mut handles, &mut answer, &mut answer_handles) {
+						send_blocking(branch, &answer[..written], 0);
+					}
+				}
 				Polled::Message { len, .. } => {
 					let report: &[u8] = &buf[..len];
 					let terminal: bool = report == b"ServiceManager: online";
@@ -330,6 +343,50 @@ fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, domain: u
 				}
 			}
 		}
+	}
+}
+
+// WHETHER A MESSAGE ON THE BRANCH IS THE SLEEP'S ENTRY rather than a boot report to relay: every report is text, and
+// the entry's frame opens with its operation number.
+fn is_sleep_entry(message: &[u8]) -> bool {
+	message.len() >= 6 && u16::from_le_bytes([message[0], message[1]]) == sleep_entry::OP_ENTER
+}
+
+// THE KERNEL'S SLEEP ENTRY, with the timed wake turned into a deadline on the boot-time clock.
+struct Entry {
+	power: u64,
+}
+
+impl sleep_entry::Service for Entry {
+	fn enter(&mut self, state: SleepState, timed_wake_ms: u64) -> Result<Woke, Error> {
+		let state: u64 = match state {
+			SleepState::Idle => SLEEP_STATE_IDLE,
+			SleepState::Ram => SLEEP_STATE_RAM,
+			SleepState::Disk => SLEEP_STATE_DISK,
+		};
+		let deadline: u64 = if timed_wake_ms == 0 { 0 } else { clock_boot_ns().saturating_add(timed_wake_ms.saturating_mul(1_000_000)) };
+		let mut report = SleepReport::default();
+		let answer: i64 = unsafe { syscall(SYS_SYSTEM_SLEEP, self.power, state, deadline, &mut report as *mut SleepReport as u64) } as i64;
+		match answer {
+			0 => {}
+			ERR_UNSUPPORTED => return Err(Error::Unsupported),
+			// A wake already pending, or the forced power-off deadline armed: the entry did not sleep.
+			ERR_INTERRUPTED => return Err(Error::Cancelled),
+			ERR_ACCESS_DENIED => return Err(Error::Denied),
+			_ => return Err(Error::Invalid),
+		}
+		let wake = match report.wake {
+			WAKE_TIMER => WakeReason::Timer,
+			WAKE_POWER_BUTTON => WakeReason::PowerButton,
+			WAKE_SLEEP_BUTTON => WakeReason::SleepButton,
+			WAKE_DEVICE => WakeReason::Device,
+			WAKE_RTC => WakeReason::Rtc,
+			WAKE_PLATFORM => WakeReason::Platform,
+			_ => WakeReason::Unknown,
+		};
+		let count = (report.core_count as usize).min(SLEEP_REPORT_CORES);
+		let cores = report.cores[..count].iter().map(|core| WireCorePark { cpu: core.cpu, timer: core.timer, ipi: core.ipi, device: core.device }).collect();
+		Ok(Woke { wake, detail: report.detail, slept: report.slept_ns, cores })
 	}
 }
 

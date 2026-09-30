@@ -804,6 +804,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "plain-pci", pci-class = 0x01, pci-subclass = 0x06, pci-interface = 0x01 }]
 provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
+suspend-deadline = 500
 
 [[programs]]
 name = "arp"
@@ -1181,6 +1182,7 @@ match = [{ transport = "plain-pci", pci-class = 0x04, pci-subclass = 0x03, pci-i
 # how two servers came to disagree about what a refusal means.
 provides = [{ kind = "audio", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # HID OVER I2C, A CHILD BINDING: a touchpad or touchscreen on another driver's bus - the firmware's `PNP0C50` or
 # `ACPI0C50` node (as its `_HID`, or as the `_CID` laptops declare beside a vendor `_HID`) or the tree's `hid-over-i2c`
@@ -1208,6 +1210,7 @@ match = [
 ]
 provides = [{ kind = "pointer", most = 1 }, { kind = "touch", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 200
 
 [[programs]]
 name = "httpd"
@@ -1426,6 +1429,18 @@ role = "probe"
 linkage = "static"
 stage = "volume"
 destination = "libexec/acpipower.lsexe"
+providers = []
+development = true
+
+# THE SLEEP GATE'S PROBE, development-only: an application with no authority - a counter on the monotonic clock's
+# deadlines, a Timer and the two clocks, each line read by the host against the kernel's sleep lines.
+[[programs]]
+name = "sleepcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/sleepcheck.lsexe"
 providers = []
 development = true
 
@@ -1751,6 +1766,17 @@ stage = "volume"
 destination = "bin/btctl.lsexe"
 providers = ["base-proto", "bluetooth-client", "lsrt"]
 
+# THE SLEEP'S OPERATOR TOOL, the one shipping holder of `system-sleep`: suspend now, hibernate now, an idle sleep's
+# inhibition and the last sleep's record, through `process-client`'s sleep client.
+[[programs]]
+name = "sleepctl"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/sleepctl.lsexe"
+providers = ["base-proto", "process-client", "lsrt"]
+
 # THE TPM DEMONSTRATION TOOL, the one shipping holder of the three TPM grants: it prints what the TPM answered, through
 # `tpm-client` - the library a third-party program links.
 [[programs]]
@@ -1952,6 +1978,7 @@ match = [{ transport = "plain-pci", pci-class = 0x01, pci-subclass = 0x08, pci-i
 # expressible in one, so the driver picks the namespace and the provider is the controller's.
 provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
+suspend-deadline = 500
 
 [[programs]]
 name = "nslookup"
@@ -2478,6 +2505,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "plain-pci", pci-class = 0x08, pci-subclass = 0x05, pci-interface = 0x01 }]
 provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
+suspend-deadline = 500
 
 [[programs]]
 name = "service_manager"
@@ -2841,7 +2869,7 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/time_service.lsexe"
-providers = ["network-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+providers = ["network-proto", "process-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
 name = "uname"
@@ -2885,6 +2913,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 2 }]
 provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
+suspend-deadline = 500
 
 [[programs]]
 name = "virtio_console"
@@ -2923,6 +2952,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 3 }]
 provides = [{ kind = "console-bytes", most = 4, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "dev_channel"
@@ -2948,6 +2978,7 @@ match = [
 priority = "quirk"
 provides = [{ kind = "console-bytes", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST BLUETOOTH FIXTURE, and the reason the Bluetooth host stack can be proved at all: an
 # emulated controller and the LE boot mouse on the far side of its radio, published as a
@@ -2977,6 +3008,7 @@ match = [
 priority = "quirk"
 provides = [{ kind = "bluetooth-hci", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST POWER FIXTURE: a HID-shaped UPS and ACPI-shaped battery, adapter and thermal zone, from
 # decoded data written out in the program, published as two `power-source` providers over the
@@ -3008,6 +3040,7 @@ provides = [
 	{ kind = "fixture-control", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST SMART-CARD FIXTURE: two readers - A with two slots and a secure-verification pinpad, B
 # with one slot and none - and the PIV cards in them, published as `smartcard-reader` providers over the
@@ -3038,6 +3071,7 @@ provides = [
 	{ kind = "fixture-control", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST MODEM FIXTURE: a modem with a SIM, one data context and the network behind it - a gateway
 # that answers echo and a resolver that answers one name - published as a `modem` provider over the
@@ -3069,6 +3103,7 @@ provides = [
 	{ kind = "fixture-control", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST CAMERA FIXTURE: a camera whose synthetic UVC descriptors go through the staged normalizer -
 # a YUY2 format with two sizes and a Motion-JPEG format with a continuous interval range - writing
@@ -3100,6 +3135,7 @@ provides = [
 	{ kind = "fixture-control", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST MIDI FIXTURE: a MIDI device with two receive endpoints - two cables and one - delivering the raw
 # USB-MIDI 1.0 packet batches the MIDI gate's probe scripts, and the control endpoint it drives. It decodes
@@ -3130,6 +3166,7 @@ provides = [
 	{ kind = "fixture-control", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST GAMEPAD FIXTURE: gamepads of the harness's shape - X, Y, Z and Rz over 0..255, sixteen buttons and
 # one hat - published over the production `gamepad` wire through the same publisher table the xHCI driver uses,
@@ -3157,6 +3194,7 @@ match = [
 priority = "quirk"
 provides = [{ kind = "gamepad", most = 1 }, { kind = "fixture-control", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE IN-GUEST ADMINISTRATIVE EXECUTOR, for the administrative-path gate alone: a bounded probe write over two
 # target generations behind an `admin-executor` publication only AdminService's catalogue connection admits,
@@ -3183,6 +3221,7 @@ provides = [
 	{ kind = "fixture-control", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE ACPI BATTERY, AC ADAPTER AND THERMAL ZONE: one binding per namespace node, its methods read over the node channel
 # the ACPI service serves and normalised by the power model, published as a `power-source` to PowerService alone. It
@@ -3206,6 +3245,7 @@ match = [
 ]
 provides = [{ kind = "power-source", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE ACPI GATE'S FIXTURE DRIVER: bound to the fixture SSDT's `LSFX0001` node through the ACPI service's namespace, it
 # asks for its node channel and runs the gate's probes on every `Notify`. A shipping image has neither the program nor
@@ -3225,6 +3265,7 @@ lifecycle = "function"
 dma = "none"
 match = [{ transport = "platform", hid = "LSFX0001" }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "dev_agent"
@@ -3262,6 +3303,7 @@ match = [
 ]
 provides = [{ kind = "tpm", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 500
 
 # THE KERNEL CONSOLE'S UART: the kernel-declared COM1 row, the one kernel row a claim may take - and the claim IS
 # the console's handoff: the kernel stops driving COM1 before the claim's resources are minted, its output leaves
@@ -3291,6 +3333,7 @@ match = [
 ]
 provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "tco"
@@ -3309,6 +3352,7 @@ match = [
 ]
 provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE ICH9 SMBUS HOST CONTROLLER: the `liber:i2c-device` contract on address-scoped connections, declaring the SMBus
 # block write, the block read with the device's count, and PEC - what an IPMI SSIF interface below it speaks. Keyed by
@@ -3331,6 +3375,7 @@ match = [
 ]
 provides = [{ kind = "i2c-bus", most = 1, consumers = 8 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # ONE IPMI SYSTEM INTERFACE TO A BMC: KCS or BT on PCI by their class, KCS, BT or SSIF by the `IPI0001` namespace device
 # whose `_IFT` says which - SSIF a child of the SMBus controller its `I2cSerialBusV2` names. It publishes the `ipmi`
@@ -3361,6 +3406,7 @@ provides = [
 	{ kind = "admin-executor", most = 2, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 600
 
 # UCSI OVER ACPI: the platform device whose `_HID` OR `_CID` is `PNP0CA0` - firmware on Intel's reference design gives it
 # its own `_HID`, `USBC000`, and names UCSI by `_CID`, so both rows are needed, as Linux's driver matches it. Its claim
@@ -3384,6 +3430,7 @@ provides = [
 	{ kind = "power-source", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 1000
 
 # A TYPE-C PORT CONTROLLER (TCPCI), A CHILD BINDING as HID over I2C is: the tree's `tcpci` node, or a namespace device
 # matched by `PRP0001` with that `compatible` in `_DSD`. It reaches the controller only through the I2C address and the
@@ -3407,6 +3454,7 @@ provides = [
 	{ kind = "power-source", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "wdat"
@@ -3423,6 +3471,7 @@ dma = "none"
 match = [{ transport = "platform", table = "WDAT" }]
 provides = [{ kind = "watchdog", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "uart16550"
@@ -3439,6 +3488,7 @@ dma = "none"
 match = [{ transport = "platform", hid = "PNP0501" }]
 provides = [{ kind = "console-bytes", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "virtio_gpio"
@@ -3455,6 +3505,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 41 }]
 provides = [{ kind = "gpio-lines", most = 1, consumers = 16 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "virtio_gpu"
@@ -3471,6 +3522,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 16 }]
 provides = [{ kind = "display", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # AN I2C CONTROLLER, and never the whole bus to anyone. Its one `i2c-bus` publication is reached only
 # through the ADDRESS-SCOPED connections DeviceManager mints - for a child binding and for the ACPI
@@ -3490,6 +3542,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 34 }]
 provides = [{ kind = "i2c-bus", most = 1, consumers = 8 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "virtio_input"
@@ -3506,6 +3559,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 18 }]
 provides = [{ kind = "input", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "virtio_net"
@@ -3528,6 +3582,7 @@ dma = "iommu-required"
 match = [{ transport = "virtio-pci", virtio-type = 1 }]
 provides = [{ kind = "net", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 # THE ENTROPY SOURCE. It publishes no provider, and that is the entry's most important line: what it
 # produces goes to the kernel's pool through a syscall whose authority is this device's own
@@ -3549,6 +3604,7 @@ lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 4 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "virtio_scsi"
@@ -3586,6 +3642,7 @@ match = [{ transport = "virtio-pci", virtio-type = 8 }]
 # each, and the walk has somewhere to put what it already looked for.
 provides = [{ kind = "block", most = 4, consumers = 4 }]
 heartbeat-deadline = 100
+suspend-deadline = 500
 
 # THE HOST STREAM TRANSPORT, and the entry's `provides` line is the item's own requirement: it
 # publishes `local-stream` and NOT `net`. A host channel published as `net` would be an ambient path
@@ -3612,6 +3669,7 @@ match = [{ transport = "virtio-pci", virtio-type = 19 }]
 # "connection limits" asks for: a bound kept by a table rather than a bound of one.
 provides = [{ kind = "local-stream", most = 4, consumers = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "virtio_snd"
@@ -3628,6 +3686,7 @@ dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 25 }]
 provides = [{ kind = "audio", most = 1 }]
 heartbeat-deadline = 100
+suspend-deadline = 100
 
 [[programs]]
 name = "volume"
@@ -3718,6 +3777,7 @@ provides = [
 	{ kind = "gamepad", most = 1 },
 ]
 heartbeat-deadline = 100
+suspend-deadline = 300
 
 [[factory_files]]
 name = "audio-demo"
@@ -4404,6 +4464,7 @@ state_class = "durable"
 state_scope = "external"
 state_storage = "vol://system"
 dependencies = ["log_service", "device_manager"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "BLOCK"
@@ -4431,6 +4492,7 @@ state_class = "durable"
 state_scope = "external"
 state_storage = "vol://iso"
 dependencies = ["log_service", "device_manager", "storage_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "ISOBLOCK"
@@ -4467,6 +4529,7 @@ state_class = "durable"
 state_scope = "external"
 state_storage = "vol://media"
 dependencies = ["log_service", "device_manager", "storage_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "FATBLOCK"
@@ -4793,6 +4856,15 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:process@1/process"
 
+# THE SUPERVISOR ROOT, ServiceManager's alone - no role is minted from it. A launch on it keeps the control-plane
+# Domain, as every service's first start and restart does; a launch on SERVE lands in the applications Domain, which
+# this root's `application-freeze` freezes for a sleep. LAST, for the positional read.
+[[services.roles]]
+tag = "SUPERVISE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:process@1/application-freeze"
+
 [[services]]
 name = "resource_manager"
 program = "resource_manager"
@@ -5092,6 +5164,7 @@ restart = "escalate"
 state_class = "reconstructible"
 state_scope = "external"
 dependencies = ["log_service", "network_service", "process_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "NET"
@@ -5117,6 +5190,7 @@ state_class = "durable"
 state_scope = "external"
 state_storage = "vol://udf"
 dependencies = ["log_service", "device_manager", "storage_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "UDFBLOCK"
@@ -5140,6 +5214,7 @@ restart = "escalate"
 state_class = "ephemeral"
 state_scope = "service"
 dependencies = ["log_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "RAMVOL"
@@ -5159,6 +5234,7 @@ restart = "escalate"
 state_class = "ephemeral"
 state_scope = "service"
 dependencies = ["log_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "TMPVOL"
@@ -5179,6 +5255,7 @@ state_class = "durable"
 state_scope = "external"
 state_storage = "vol://usb"
 dependencies = ["log_service", "storage_service", "device_manager"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "CATALOGUE"
@@ -5495,6 +5572,7 @@ restart = "transparent"
 state_class = "reconstructible"
 state_scope = "service"
 dependencies = ["log_service", "process_service"]
+notices = ["sleep"]
 
 [[services.roles]]
 tag = "FIRMWARE"

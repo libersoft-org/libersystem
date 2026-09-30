@@ -621,13 +621,47 @@ enum Took {
 	Departed,
 }
 
+// THE SLEEP, between two batches - every tag is free where a `SUSPEND` is read: the disk's write cache is flushed, so
+// a battery that dies in the sleep loses nothing this driver accepted. A disk that lost its power is not reprogrammed
+// here - its link, its port and its command lists are the bind's to set up - so its resume answers it did not come
+// back, and it is bound again.
+struct Sleep<'a> {
+	controller: &'a mut Controller,
+	serving: &'a mut common::Serving,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if unsafe { self.controller.flush() }.is_err() {
+			print(b"driver.ahci: the sleep is refused - the disk did not complete the flush it requires\n");
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		}
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		!lost_power
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
 unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller, blk_server: u64) -> ! {
 	unsafe {
 		let mut request = [0u8; block::REQUEST_LEN];
 		let mut serving = common::Serving::new(blk_server, 0);
 		let mut flight = [FREE; QUEUED_TAGS];
+		common::takes_sleep();
 		loop {
-			let Some(at) = common::serve_any_or_answer(bootstrap, bind, &mut serving) else {
+			let ready = common::serve_any_or_sleep(bootstrap, bind, &mut serving);
+			if let Some(None) = ready {
+				if common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, serving: &mut serving }) {
+					continue;
+				}
+			}
+			let Some(Some(at)) = ready.filter(|_| !common::stop_requested()) else {
 				let flushed = controller.flush().is_ok();
 				if !flushed {
 					print(b"driver.ahci: the disk did not complete the flush this stop requires - no clean stop is claimed for it\n");

@@ -2238,6 +2238,79 @@ where
 	}
 }
 
+// SERVE SEVERAL ROOTS FROM ONE LOOP, telling the handler which root each request's connection descends from: a
+// service whose authority differs by the root a client reached it through - ProcessService's supervisor root beside its
+// client root - learns it from `origin`, the index into `roots` a `CONNECT` was minted under. The FIRST root closing
+// ends the service; any other closing is dropped with the connections it minted left serving.
+pub fn serve_multi_rooted<F>(roots: &[u64], request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+where
+	F: FnMut(usize, u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
+{
+	let mut chans: alloc::vec::Vec<u64> = roots.to_vec();
+	let mut origins: alloc::vec::Vec<usize> = (0..roots.len()).collect();
+	let is_root = |chan: u64| roots.contains(&chan);
+	while !chans.is_empty() {
+		let ready: i64 = wait_any(&chans, 0);
+		if ready < 0 {
+			continue;
+		}
+		let idx: usize = ready as usize;
+		let (chan, origin): (u64, usize) = (chans[idx], origins[idx]);
+		let closed: bool = match recv_caps_blocking(chan, request) {
+			ReceivedCaps::Message { len, .. } if len == 0 => true,
+			ReceivedCaps::Message { len, mut handles } => {
+				if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
+					send_blocking(chan, b"PONG", 0);
+				} else if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == CONNECT_OP {
+					match channel() {
+						Some((mine, theirs)) => {
+							chans.push(mine);
+							origins.push(origin);
+							send_blocking(chan, &[], theirs);
+						}
+						None => {
+							send_blocking(chan, &[], 0);
+						}
+					}
+				} else {
+					let mut reply_handles = wire::Handles::new();
+					if let Some(n) = handle_request(origin, chan, &request[..len], &mut handles, reply, &mut reply_handles) {
+						if !send_caps_blocking(chan, &reply[..n], reply_handles.as_slice()) {
+							for &leftover in reply_handles.as_slice() {
+								close(leftover);
+							}
+						}
+					} else {
+						for &leftover in reply_handles.as_slice() {
+							close(leftover);
+						}
+					}
+					for &unclaimed in handles.as_slice() {
+						if unclaimed != 0 {
+							close(unclaimed);
+						}
+					}
+				}
+				false
+			}
+			ReceivedCaps::Closed => true,
+		};
+		if !closed {
+			continue;
+		}
+		if chan == roots[0] {
+			break;
+		}
+		if !is_root(chan) {
+			let mut disconnect = |c: u64, r: &[u8], h: &mut wire::Handles, o: &mut [u8], rh: &mut wire::Handles| handle_request(origin, c, r, h, o, rh);
+			announce_disconnect(chan, request, reply, &mut disconnect);
+		}
+		close(chan);
+		chans.swap_remove(idx);
+		origins.swap_remove(idx);
+	}
+}
+
 // Tell the handler that `chan`'s client is gone, before the channel is closed (IDL-001).
 //
 // A service that keeps per-client state - a prepared launch, a lease, a scope - could not learn
@@ -2443,6 +2516,12 @@ pub fn clock_rtc() -> u64 {
 // measuring latencies finer than a `clock()` tick - an IPC round-trip, a ping RTT.
 pub fn clock_ns() -> u64 {
 	unsafe { syscall(SYS_CLOCK_MONO_NS, 0, 0, 0, 0) }
+}
+
+// THE BOOT-TIME CLOCK: nanoseconds since boot, every sleep included - the monotonic clock above excludes them. Read-only,
+// with no timers on it: a wall clock counted forward across a sleep counts on this one.
+pub fn clock_boot_ns() -> u64 {
+	unsafe { syscall(SYS_CLOCK_BOOT_NS, 0, 0, 0, 0) }
 }
 
 // Fill `bytes` with kernel-provided randomness, returning how many bytes were written. Used
@@ -3487,6 +3566,17 @@ pub fn spawn_prepared_in(elf: &[u8], bootstrap: u64, domain: u64) -> Option<(u64
 // with `domain_set_limit` and observes usage with `domain_stats`.
 pub fn domain_create(memory: u64, handles: u64, threads: u64) -> i64 {
 	unsafe { syscall(SYS_DOMAIN_CREATE, memory, handles, threads, 0) as i64 }
+}
+
+// The same, as a child of `parent` - a Domain the caller holds MANAGE on - rather than of the caller's own.
+pub fn domain_create_in(parent: u64, memory: u64, handles: u64, threads: u64) -> i64 {
+	unsafe { syscall(SYS_DOMAIN_CREATE, memory, handles, threads, parent) as i64 }
+}
+
+// FREEZE (or thaw) a Domain's whole subtree: every thread parked where job control's stop is enforced, on a flag of its
+// own. Answers once no thread of the subtree runs user code, within the kernel's bound; MANAGE on the Domain.
+pub fn domain_freeze(domain: u64, on: bool) -> i64 {
+	unsafe { syscall(SYS_DOMAIN_FREEZE, domain, u64::from(on), 0, 0) as i64 }
 }
 
 // Kill a Domain and everything beneath it: every process accounted to it and to its child

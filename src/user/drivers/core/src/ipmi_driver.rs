@@ -19,6 +19,12 @@
 // THE BMC UNAVAILABLE: three transactions in a row that time out mark it so - the `ipmi` provider says it, the thermal
 // zones become unknown - and Get Device ID every ten seconds brings it back; a different identity on return is a
 // different BMC, whose repository is read again and whose preparations are no longer valid.
+//
+// THE SLEEP. A transaction is never in flight where a `SUSPEND` is read, and the queue is held until `RESUME`. The
+// watchdog's half, when this binding publishes one: the BMC's timer is disarmed - the BMC allows it, and it counts on
+// standby power through any sleep - and re-armed at the resume with the timeout it had, which catches a resume that
+// hangs until the watchdog service restores its own. The resume aborts a KCS interface left busy, reads BT's or SSIF's
+// capabilities again and identifies the BMC again, as bind does.
 
 #![no_std]
 #![no_main]
@@ -225,6 +231,11 @@ struct Wd {
 	// Until when the driver itself pets a timer it found running, and the next pet.
 	bridge_until: Option<u64>,
 	next_pet: u64,
+	// The countdown the timer runs with while it is armed, and None while it is not - what a sleep disarms and its
+	// resume arms again.
+	armed_ms: Option<u64>,
+	// Disarmed for the sleep, with this countdown: armed again at the resume.
+	slept_ms: Option<u64>,
 }
 
 struct Driver {
@@ -530,6 +541,7 @@ impl watchdog::Service for WatchdogView<'_> {
 		ipmi_bmc::data(self.driver, &ipmi::watchdog::pet()).map_err(bmc_error)?;
 		if let Some(wd) = self.driver.watchdog.as_mut() {
 			wd.bridge_until = None;
+			wd.armed_ms = Some(effective);
 		}
 		Ok(effective as u32)
 	}
@@ -545,8 +557,54 @@ impl watchdog::Service for WatchdogView<'_> {
 		ipmi_bmc::data(self.driver, &ipmi::watchdog::disarm(0)).map_err(bmc_error)?;
 		if let Some(wd) = self.driver.watchdog.as_mut() {
 			wd.bridge_until = None;
+			wd.armed_ms = None;
 		}
 		Ok(())
+	}
+}
+
+// ------------------------------------------------------------------ the sleep
+
+impl common::SleepStep for Driver {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let armed = self.watchdog.as_ref().and_then(|wd| wd.armed_ms);
+		if let Some(timeout) = armed {
+			self.in_watchdog = true;
+			let disarmed = ipmi_bmc::data(self, &ipmi::watchdog::disarm(0));
+			self.in_watchdog = false;
+			if disarmed.is_err() {
+				self.say("the sleep is refused: the BMC's watchdog did not take the disarm, and a timer left counting would reset the machine in its sleep");
+				return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+			}
+			if let Some(wd) = self.watchdog.as_mut() {
+				wd.slept_ms = Some(timeout);
+				wd.bridge_until = None;
+			}
+			self.say(&format!("suspended - the BMC's watchdog is disarmed for the sleep (it ran with {timeout} ms)"));
+		} else {
+			self.say("suspended - the queue is held until the resume");
+		}
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, _lost_power: bool) -> bool {
+		match self.interface.prepare() {
+			Ok(found) => self.say(&format!("resumed - the interface is {found}")),
+			Err(failure) => self.say(&format!("resumed - the interface did not prepare ({failure:?}); the BMC is asked again as it answers")),
+		}
+		// THE WATCHDOG FIRST, with the countdown it had: a resume that hangs is caught by it.
+		if let Some(timeout) = self.watchdog.as_mut().and_then(|wd| wd.slept_ms.take()) {
+			self.in_watchdog = true;
+			let armed = ipmi::watchdog::arm(timeout, 0).map(|request| ipmi_bmc::data(self, &request).is_ok() && ipmi_bmc::data(self, &ipmi::watchdog::pet()).is_ok());
+			self.in_watchdog = false;
+			self.say(if armed == Some(true) { "the BMC's watchdog is armed again" } else { "the BMC's watchdog did not take its arm again" });
+		}
+		self.came_back();
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(&mut self.serving)
 	}
 }
 
@@ -1060,7 +1118,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(state) => {
 				let running = state.running;
 				let flags = state.expiration_flags;
-				let mut wd = Wd { running_at_bind: running, last_reset: state.expired(), bridge_until: None, next_pet: 0 };
+				let mut wd = Wd { running_at_bind: running, last_reset: state.expired(), bridge_until: None, next_pet: 0, armed_ms: running.then_some(state.initial_ms.max(ipmi::watchdog::MIN_TIMEOUT_MS)), slept_ms: None };
 				if running {
 					// TAKEN OVER: its own countdown kept, its flags cleared, and petted at once - then fed until the watchdog
 					// service's first pet, at most the bridge bound.
@@ -1108,6 +1166,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 	driver.next_poll = clock() + POLL_TICKS;
+	common::takes_sleep();
 	loop {
 		// THE NEXT THING DUE: a zone poll, a bridge pet, the look for a BMC that went away.
 		let mut due = if driver.zones.is_empty() { u64::MAX } else { driver.next_poll };
@@ -1120,7 +1179,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			due = due.min(driver.next_probe);
 		}
 		timer_set(timer, due);
-		match common::wait_providers_or_answer(bootstrap, &bind, &mut driver.serving, &[timer]) {
+		match common::wait_providers_until(bootstrap, &bind, &mut driver.serving, &[timer], 0) {
 			None => {
 				// A PLANNED STOP WRITES NOTHING TO THE WATCHDOG: a watchdog nobody feeds is a watchdog doing its work.
 				if common::stop_requested() {
@@ -1128,8 +1187,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				exit();
 			}
-			Some(common::ProviderReady::Connected(_)) | Some(common::ProviderReady::Device(_)) => {}
-			Some(common::ProviderReady::Consumer(index)) => {
+			// THE SLEEP, between transactions.
+			Some(None) => {
+				if !common::take_sleep_step(bootstrap, &bind, &mut driver) {
+					if common::stop_requested() {
+						common::finish_stop(bootstrap, &bind, 0, true);
+					}
+					exit();
+				}
+			}
+			Some(Some(common::ProviderReady::Connected(_))) | Some(Some(common::ProviderReady::Device(_))) => {}
+			Some(Some(common::ProviderReady::Consumer(index))) => {
 				if !serve(&mut driver, index) {
 					let token = driver.serving.close_at(index);
 					if token == TOKEN_POWER && driver.power_stream != 0 {

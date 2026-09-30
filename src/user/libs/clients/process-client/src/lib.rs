@@ -4,7 +4,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use process_proto::generated::liber::process::v1::{ProcessInfo, StartResult};
+use process_proto::generated::liber::process::v1::{ProcessInfo, SleepReason, SleepRecord, SleepState, StartResult};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_process_process_start"]
@@ -15,6 +15,16 @@ unsafe extern "Rust" {
 	fn process_launch(chan: u64, name: &str, bootstrap: &u64) -> Option<Result<StartResult, Error>>;
 	#[link_name = "liber_channel_liber_process_process_launch_bounded"]
 	fn process_launch_bounded(chan: u64, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_suspend"]
+	fn sleep_suspend(chan: u64, state: &SleepState, timed_wake_ms: &u64, reason: &SleepReason) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_hibernate"]
+	fn sleep_hibernate(chan: u64, reason: &SleepReason) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_inhibit"]
+	fn sleep_inhibit(chan: u64, milliseconds: &u32, reason: &str) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_release"]
+	fn sleep_release(chan: u64) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_last_sleep"]
+	fn sleep_last(chan: u64) -> Option<Result<SleepRecord, Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -47,5 +57,45 @@ impl ProcessClient {
 	#[inline(always)]
 	pub fn launch_bounded(&mut self, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
 		unsafe { process_launch_bounded(self.chan, name, memory_limit, bootstrap) }
+	}
+}
+
+/// SERVICEMANAGER'S `system-sleep`: a sleep asked for - answered at acceptance, never at the resume - an idle sleep's
+/// bounded inhibition, and the last sleep's record.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct SleepClient {
+	chan: u64,
+}
+
+impl SleepClient {
+	#[inline(always)]
+	pub const fn new(chan: u64) -> Self {
+		Self { chan }
+	}
+
+	#[inline(always)]
+	pub fn suspend(&mut self, state: &SleepState, timed_wake_ms: &u64, reason: &SleepReason) -> Option<Result<(), Error>> {
+		unsafe { sleep_suspend(self.chan, state, timed_wake_ms, reason) }
+	}
+
+	#[inline(always)]
+	pub fn hibernate(&mut self, reason: &SleepReason) -> Option<Result<(), Error>> {
+		unsafe { sleep_hibernate(self.chan, reason) }
+	}
+
+	#[inline(always)]
+	pub fn inhibit(&mut self, milliseconds: &u32, reason: &str) -> Option<Result<(), Error>> {
+		unsafe { sleep_inhibit(self.chan, milliseconds, reason) }
+	}
+
+	#[inline(always)]
+	pub fn release(&mut self) -> Option<Result<(), Error>> {
+		unsafe { sleep_release(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn last_sleep(&mut self) -> Option<Result<SleepRecord, Error>> {
+		unsafe { sleep_last(self.chan) }
 	}
 }

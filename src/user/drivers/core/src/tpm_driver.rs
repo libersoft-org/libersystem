@@ -15,6 +15,12 @@
 // interleaved between another's `CreatePrimary` and its `FlushContext` would exhaust the objects the first one
 // needs. It decides nothing about who may do what; the bounds are `src/tpm`'s own, and nothing it sends is a
 // command a caller chose.
+//
+// THE SLEEP. Before a sleep that cuts the TPM's power it sends Shutdown(STATE), so the firmware's Startup(STATE) at
+// the wake restores PCRs 0 to 15 - without it that Startup fails, the firmware falls back to Startup(CLEAR) and extends
+// an error separator into PCRs 0 to 7, and every secret sealed to them stays shut until the next boot; a TPM that does
+// not take it refuses the sleep. The resume sends no Startup when the firmware has already started the TPM - which is
+// asked, not assumed - and Startup(STATE) where it has not. A suspend to idle keeps the TPM powered and sends nothing.
 
 #![no_std]
 #![no_main]
@@ -284,8 +290,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut serving = common::Serving::from_offers(&[(0, mine)]);
 	let mut buf = alloc::vec![0u8; 4096];
 	let mut reply = alloc::vec![0u8; 4096];
+	common::takes_sleep();
 	loop {
-		match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, &[]) {
+		match common::wait_providers_until(bootstrap, &bind, &mut serving, &[], 0) {
 			None => {
 				// NOTHING IS IN FLIGHT WHEN THE STOP IS READ - every operation runs whole before the next request
 				// is - and a TPM masters nothing, so the device is quiet by construction.
@@ -294,8 +301,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				exit();
 			}
-			Some(common::ProviderReady::Connected(_)) | Some(common::ProviderReady::Device(_)) => {}
-			Some(common::ProviderReady::Consumer(index)) => {
+			// THE SLEEP, between two operations.
+			Some(None) => {
+				if !common::take_sleep_step(bootstrap, &bind, &mut Sleep { driver: &mut driver, serving: &mut serving }) {
+					if common::stop_requested() {
+						common::finish_stop(bootstrap, &bind, device, true);
+					}
+					exit();
+				}
+			}
+			Some(Some(common::ProviderReady::Connected(_))) | Some(Some(common::ProviderReady::Device(_))) => {}
+			Some(Some(common::ProviderReady::Consumer(index))) => {
 				let chan = serving.at(index);
 				if !serve(&mut driver, chan, &mut buf, &mut reply) {
 					let token = serving.close_at(index);
@@ -305,6 +321,56 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
+	}
+}
+
+// THE SLEEP - see the head of this file.
+struct Sleep<'a> {
+	driver: &'a mut Driver,
+	serving: &'a mut common::Serving,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if request.state.loses_power() {
+			if let Err(error) = self.driver.tpm.shutdown_state() {
+				let mut line: Vec<u8> = Vec::from(&b"driver.tpm: the sleep is refused - Shutdown(STATE) failed ("[..]);
+				hex(outcome(error).1, &mut line);
+				line.extend_from_slice(b"), and without it the wake would clear PCRs 0 to 7\n");
+				print(&line);
+				return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+			}
+			print(b"driver.tpm: suspended - Shutdown(STATE) sent\n");
+		}
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		if !lost_power {
+			// The TPM kept its power: after an unwound Shutdown(STATE) it runs on, and nothing is sent.
+			return true;
+		}
+		match self.driver.tpm.started() {
+			Ok(true) => print(b"driver.tpm: resumed - the firmware started the TPM with its saved state; no Startup is sent\n"),
+			Ok(false) => match self.driver.tpm.startup_state() {
+				Ok(()) => print(b"driver.tpm: resumed - Startup(STATE) restored what Shutdown(STATE) saved\n"),
+				Err(_) => {
+					print(b"driver.tpm: resumed - Startup(STATE) was refused, so the TPM starts afresh (CLEAR) and its PCRs are reset\n");
+					if self.driver.tpm.startup().is_err() {
+						return false;
+					}
+				}
+			},
+			Err(_) => {
+				print(b"driver.tpm: the TPM does not answer after the sleep\n");
+				return false;
+			}
+		}
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
 	}
 }
 

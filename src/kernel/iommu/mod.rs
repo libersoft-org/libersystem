@@ -355,13 +355,66 @@ pub(crate) fn map_registers(physical: u64, len: u64) -> u64 {
 	let last = (physical + len - 1) & !(PAGE_SIZE - 1);
 	let mut at = first;
 	while at <= last {
-		crate::arch::paging::map_page(hhdm + at, at, PRESENT | WRITABLE | NO_CACHE);
+		// A PAGE ALREADY MAPPED IS LEFT AS IT IS: the transport is started again after an S3, over the registers its
+		// first start mapped - and a large leaf the walk would meet is a mapping too, which a second map cannot cut.
+		if crate::arch::paging::translate(hhdm + at).is_none() {
+			crate::arch::paging::map_page(hhdm + at, at, PRESENT | WRITABLE | NO_CACHE);
+		}
 		at += PAGE_SIZE;
 	}
 	hhdm + physical
 }
 
 fn bring_up(index: usize) -> Result<Controller, Fault> {
+	let (wire, config, accepted, common, device_config) = start_transport(index, true)?;
+	// NO GENERATION HERE ANY MORE. The backend used to be built with one and keep it as a
+	// controller-wide value; binding identity belongs to the domain, which `attach_endpoint` creates
+	// with the claim's generation.
+	let backend = VirtioIommu::new(wire, config, accepted)?;
+	Ok(Controller { iommu: dma::Iommu::new(backend, 64), common, device_config })
+}
+
+// THE CONTROLLER AFTER AN S3, which reset it with the machine: its transport started again - reset, features,
+// queues, bypass off and read back - WITHOUT quiescing the other endpoints, which the boot does before the first
+// transition: every one of them was reset by the same S3, and their restored bus mastering belongs to drivers that
+// are suspended. Then every live attachment and mapping is sent to it again (`Iommu::replay_after_reset`). A
+// controller that does not come back leaves translation refused, as at a failed boot.
+pub fn resume_after_reset() -> bool {
+	if !PRESENT.load(Ordering::Acquire) {
+		return true;
+	}
+	let Some(index) = find_controller() else { return false };
+	let started = start_transport(index, false);
+	let mut controller = CONTROLLER.lock();
+	let Some(controller) = controller.as_mut() else { return false };
+	match started {
+		Ok((wire, _config, _accepted, common, device_config)) => {
+			controller.common = common;
+			controller.device_config = device_config;
+			match controller.iommu.replay_after_reset(|backend| {
+				backend.replace_transport(wire);
+				backend.reattach_all()
+			}) {
+				Ok(()) => {
+					crate::serial_println!("iommu: virtio-iommu is translating again after the resume - every live attachment and mapping sent again");
+					true
+				}
+				Err(reason) => {
+					crate::serial_println!("iommu: the resumed controller refused the replay ({reason:?}) - translation is not trusted");
+					false
+				}
+			}
+		}
+		Err(reason) => {
+			crate::serial_println!("iommu: the controller did not come back after the resume ({reason:?})");
+			false
+		}
+	}
+}
+
+// THE CONTROLLER'S TRANSPORT: reset, features negotiated, the configuration parsed, the two queues made, and bypass
+// written off and read back - with every other endpoint quiesced first when `quiesce` says so.
+fn start_transport(index: usize, quiesce: bool) -> Result<(Wire, Config, u64, u64, u64), Fault> {
 	let Some((bar, common_offset, device_offset, device_len, notify_offset, notify_multiplier, bus, dev, func)) = crate::device::with(index, |entry| (entry.bar_phys, entry.common_offset, entry.device_offset, entry.device_len, entry.notify_offset, entry.notify_multiplier, entry.bus, entry.dev, entry.func)) else {
 		return Err(Fault::Unconfirmed);
 	};
@@ -443,7 +496,9 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 	// point: an endpoint still mastering when translation turns on is an endpoint whose in-flight
 	// DMA lands wherever it was already aimed. Quiescing them first makes the transition a moment
 	// with no traffic across it rather than one that races whatever the firmware left running.
-	quiesce_other_endpoints(index)?;
+	if quiesce {
+		quiesce_other_endpoints(index)?;
+	}
 
 	// The transition, and the read-back that is the only reason to believe it.
 	if accepted & dma::virtio_iommu::F_BYPASS_CONFIG == 0 {
@@ -463,11 +518,7 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 	}
 
 	let wire = Wire { requests, events, event_buffer, event_physical, event_descriptor };
-	// NO GENERATION HERE ANY MORE. The backend used to be built with one and keep it as a
-	// controller-wide value; binding identity belongs to the domain, which `attach_endpoint` creates
-	// with the claim's generation.
-	let backend = VirtioIommu::new(wire, config, accepted)?;
-	Ok(Controller { iommu: dma::Iommu::new(backend, 64), common, device_config })
+	Ok((wire, config, accepted, common, device_config))
 }
 
 // Stop every endpoint that is not the controller from mastering the bus.

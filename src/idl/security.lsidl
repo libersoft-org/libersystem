@@ -165,6 +165,10 @@ enum capability {
 	/// THE TYPE-C OPERATOR: a data-role or power-role swap, and an alternate mode entered or left, on a connector
 	/// whose platform offers it. Granted to no shipping program by default.
 	typec-control,
+	/// PUTTING THE MACHINE TO SLEEP: suspend to idle or to RAM, a bounded inhibition of an idle sleep, and the last
+	/// sleep's record - ServiceManager's `system-sleep`, a fresh connection per launch. Not the authority to stop the
+	/// machine, which is `system-power`'s. Granted to `sleepctl`. Appended last, for the reason `midi-output` states.
+	system-sleep,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

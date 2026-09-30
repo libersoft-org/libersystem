@@ -206,6 +206,13 @@ path = "src/acpipower.rs"
 required-features = ["development"]
 
 [[bin]]
+# THE SLEEP GATE'S PROBE, absent from a shipped image: an application with no authority, whose counter, Timer and
+# clocks show the freeze and the clocks across a sleep.
+name = "sleepcheck"
+path = "src/sleepcheck.rs"
+required-features = ["development"]
+
+[[bin]]
 # THE UPS GATE'S LIVE CLIENT AND OPERATOR, absent from a shipped image: it reads and drives the UPS a USB device
 # the host builds publishes through the xHCI driver, with PowerService's read and control authorities.
 name = "upscheck"

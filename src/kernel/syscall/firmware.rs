@@ -132,3 +132,11 @@ pub(super) fn sys_device_node(index: u64, buf: u64, len: u64) -> i64 {
 		Err(error) => error,
 	}
 }
+
+// THE SLEEP TYPES THE FIRMWARE DESCRIBES, registered by the ACPI service - see `abi::SYS_FIRMWARE_SLEEP_TYPE`.
+pub(super) fn sys_firmware_sleep_type(privilege: u64, state: u64, typ_a: u64, typ_b: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::FirmwareInterpreter) {
+		return error;
+	}
+	crate::sleep::register(state, typ_a, typ_b)
+}

@@ -98,6 +98,12 @@ const PORTSC_PRC: u32 = 1 << 21; // port reset change (RW1C)
 const PORTSC_PLC: u32 = 1 << 22; // port link state change (RW1C)
 const PORTSC_CEC: u32 = 1 << 23; // config error change (RW1C)
 const PORTSC_RW1C: u32 = PORTSC_PED | PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
+// The port's link state (bits 8:5) and the strobe that makes a write of it take (LWS).
+const PORTSC_PLS_SHIFT: u32 = 5;
+const PORTSC_PLS: u32 = 0xF << PORTSC_PLS_SHIFT;
+const PORTSC_LWS: u32 = 1 << 16;
+const PLS_U0: u32 = 0;
+const PLS_U3: u32 = 3;
 
 // Port speed ids (PORTSC bits 13:10); full/low speed take the default packet size.
 const SPEED_HIGH: u32 = 3;
@@ -1021,6 +1027,97 @@ fn wait_clear(addr: u64, mask: u32) -> Option<()> {
 	}
 }
 
+// THE SLEEP, between two passes of the loop. THE DEVICES FIRST, THEN THE CONTROLLER: every enabled port whose device is
+// active has its link sent to U3 - the USB suspend, the devices' own lowest state - and only then does the controller
+// halt, having stopped fetching from every ring. A suspend to idle keeps the controller's power and its state, so the
+// resume runs it again and signals each suspended port back to U0; a controller that lost its power lost its rings and
+// its device contexts, which only a bind sets up, so that resume answers it did not come back.
+struct Sleep<'a> {
+	hc: &'a Xhci,
+	serving: &'a mut common::Serving,
+	// The ports this step sent to U3.
+	suspended: Vec<u32>,
+}
+
+fn portsc(hc: &Xhci, port: u32) -> u32 {
+	unsafe { r32(hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10) }
+}
+
+// ASK A PORT'S LINK FOR `state`: the link-state field replaced, not OR-ed into - `portsc_write` keeps the field as it
+// is read, and U0 is all zeros - with the strobe that makes the write take.
+fn set_link(hc: &Xhci, port: u32, state: u32) {
+	unsafe {
+		let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
+		let value: u32 = r32(addr) & !PORTSC_RW1C & !PORTSC_PLS;
+		w32(addr, value | PORTSC_LWS | state << PORTSC_PLS_SHIFT);
+	}
+}
+
+// Wait, bounded, for a port's link to reach `state`.
+fn wait_link(hc: &Xhci, port: u32, state: u32) -> bool {
+	let deadline = clock() + TICKS_PER_SECOND / 10;
+	while (portsc(hc, port) & PORTSC_PLS) >> PORTSC_PLS_SHIFT != state {
+		if clock() >= deadline {
+			return false;
+		}
+		yield_now();
+	}
+	true
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		for port in 1..=self.hc.ports {
+			let status = portsc(self.hc, port);
+			if status & (PORTSC_CCS | PORTSC_PED) == PORTSC_CCS | PORTSC_PED && (status & PORTSC_PLS) >> PORTSC_PLS_SHIFT == PLS_U0 {
+				set_link(self.hc, port, PLS_U3);
+				self.suspended.push(port);
+			}
+		}
+		let settled = self.suspended.iter().all(|&port| wait_link(self.hc, port, PLS_U3));
+		if !settled || !self.hc.halt() {
+			print(b"driver.xhci: the sleep is refused - a port did not suspend or the controller did not halt\n");
+			self.wake_ports();
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		}
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		if lost_power {
+			print(b"driver.xhci: the controller lost its rings in the sleep - it is bound again\n");
+			return false;
+		}
+		unsafe {
+			w32(self.hc.op + OP_USBCMD, r32(self.hc.op + OP_USBCMD) | CMD_RUN | CMD_INTE);
+		}
+		if wait_clear(self.hc.op + OP_USBSTS, STS_HCHALTED).is_none() {
+			print(b"driver.xhci: the controller did not run again after the sleep\n");
+			return false;
+		}
+		self.wake_ports();
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
+impl Sleep<'_> {
+	// Every port this step suspended, signalled back to U0 - at the resume, or when the suspend is refused half way.
+	fn wake_ports(&mut self) {
+		for port in core::mem::take(&mut self.suspended) {
+			if (portsc(self.hc, port) & PORTSC_PLS) >> PORTSC_PLS_SHIFT != PLS_U0 {
+				set_link(self.hc, port, PLS_U0);
+				if !wait_link(self.hc, port, PLS_U0) {
+					print(b"driver.xhci: a port did not come back to U0 after the sleep\n");
+				}
+			}
+		}
+	}
+}
+
 // Write PORTSC preserving its state: the RW1C change bits are masked out (so the
 // read-modify-write cannot clear them by accident) and `set` is OR-ed in.
 fn portsc_write(hc: &Xhci, port: u32, set: u32) {
@@ -1816,6 +1913,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			(8, serial2_server),
 			(GAMEPAD_TOKEN, gamepad_server),
 		]);
+		common::takes_sleep();
 		// THE GAMEPAD PUBLICATION'S RETRY: while a frame is owed, the loop wakes a tick later on this timer, on a
 		// HOUSEKEEPING wait - a consumer that never drains must not keep a settling scheduler from settling.
 		let pad_retry: u64 = match timer_create() {
@@ -1887,7 +1985,17 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			waiting.extend(classes.waits());
 			let retry_at = waiting.len();
 			waiting.push(pad_retry);
-			let Some(ready) = common::wait_providers(bootstrap, bind, &mut serving, &waiting, owed) else {
+			let ready = match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &waiting, owed) {
+				Some(Some(ready)) => Some(ready),
+				Some(None) => {
+					if common::take_sleep_step(bootstrap, bind, &mut Sleep { hc: &hc, serving: &mut serving, suspended: Vec::new() }) {
+						continue;
+					}
+					None
+				}
+				None => None,
+			};
+			let Some(ready) = ready else {
 				common::finish_stop(bootstrap, bind, device(), hc.halt());
 				exit();
 			};

@@ -97,8 +97,9 @@ pub const HOSTC: u16 = 0x40;
 pub const HOSTC_HST_EN: u32 = 1 << 0;
 pub const HOSTC_I2C_EN: u32 = 1 << 2;
 
-// What each live claim's writes replaced, by device index: what its release writes back.
-static SAVED: SpinLock<Vec<(usize, Vec<(ClaimWrite, u32)>)>> = SpinLock::new(Vec::new());
+// What each live claim's writes replaced, by device index and function: what its release writes back, and what an S3
+// resume writes again.
+static SAVED: SpinLock<Vec<(usize, (u8, u8, u8), Vec<(ClaimWrite, u32)>)>> = SpinLock::new(Vec::new());
 
 // THE CLAIM'S WRITES for the function at `bus:dev.func`, device `index`: each register saved, then written with its
 // row's bits. A register the configuration mechanism cannot reach at its width is said and skipped - the window then
@@ -119,17 +120,33 @@ pub fn claim_writes(index: usize, vendor: u16, device: u16, bus: u8, dev: u8, fu
 		}
 	}
 	let mut table = SAVED.lock();
-	table.retain(|(held, _)| *held != index);
+	table.retain(|(held, _, _)| *held != index);
 	// ALLOC-OK: one entry per claimed function with such a row.
-	table.push((index, saved));
+	table.push((index, (bus, dev, func), saved));
+}
+
+// AFTER AN S3, WHICH RESET THE FUNCTION: every live claim's writes made again, from the bits its row names - the
+// value the release restores stays the one saved at the claim.
+pub fn replay_claim_writes() {
+	let table = SAVED.lock();
+	for (_, (bus, dev, func), writes) in table.iter() {
+		for (write, _) in writes {
+			if let Some(now) = crate::arch::pci::config_read_exact(*bus, *dev, *func, write.offset, write.width) {
+				let after = (now | write.set) & !write.clear;
+				if !crate::arch::pci::config_write_exact(*bus, *dev, *func, write.offset, write.width, after) {
+					crate::serial_println!("device: {bus:02x}:{dev:02x}.{func} configuration {:#x} could not be written again after the resume", write.offset);
+				}
+			}
+		}
+	}
 }
 
 // THE RELEASE'S WRITE-BACK: every register the claim wrote, as it was before.
 pub fn release_writes(index: usize, bus: u8, dev: u8, func: u8) {
 	let saved = {
 		let mut table = SAVED.lock();
-		let Some(at) = table.iter().position(|(held, _)| *held == index) else { return };
-		table.swap_remove(at).1
+		let Some(at) = table.iter().position(|(held, _, _)| *held == index) else { return };
+		table.swap_remove(at).2
 	};
 	for (write, before) in saved {
 		if !crate::arch::pci::config_write_exact(bus, dev, func, write.offset, write.width, before) {

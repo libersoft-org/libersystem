@@ -1,6 +1,6 @@
 // The ring's device half, driven by a fake controller: a buffer this test owns, laid out the way
 // `setup_queue` lays a ring out, with the device's fields written by hand.
-use super::{Queue, UsedFault, check_used_advance, check_used_element, ring_layout};
+use super::{Queue, UsedFault, Virtio, check_used_advance, check_used_element, ring_layout};
 use rt::{VIRTIO_DESC_F_NEXT as DESC_NEXT, VIRTIO_DESC_F_WRITE as DESC_WRITE};
 
 struct Ring {
@@ -239,4 +239,54 @@ fn two_chains_go_out_together_through_indirect_tables_and_complete_together() {
 	// written.
 	assert_eq!(queue.submit_chains(&[&first, &second], None, &mut used), Err(UsedFault::Chain));
 	drop(tables);
+}
+
+// A DEVICE THAT LOST ITS STATE IN A SLEEP is negotiated back to the same features and pointed at the same rings,
+// emptied, and the driver's half of the ring starts again from zero with it; a device that no longer offers what its
+// driver drives does not come back.
+#[test]
+fn a_restored_device_gets_its_features_back_and_its_rings_emptied_at_the_same_address() {
+	use rt::{VIRTIO_CFG_CONFIG_MSIX_VECTOR as MSIX, VIRTIO_CFG_DEVICE_FEATURE as OFFERED, VIRTIO_CFG_DEVICE_STATUS as STATUS, VIRTIO_CFG_DRIVER_FEATURE as ACCEPTED, VIRTIO_CFG_QUEUE_DESC as DESC, VIRTIO_CFG_QUEUE_DEVICE as USED, VIRTIO_CFG_QUEUE_DRIVER as AVAIL, VIRTIO_CFG_QUEUE_ENABLE as ENABLE, VIRTIO_CFG_QUEUE_MSIX_VECTOR as QUEUE_MSIX, VIRTIO_CFG_QUEUE_SIZE as SIZE, VIRTIO_STATUS_FEATURES_OK};
+	let common: Vec<u64> = vec![0u64; 16];
+	let base = common.as_ptr() as u64;
+	let read16 = |offset: u64| unsafe { ((base + offset) as *const u16).read_volatile() };
+	let read32 = |offset: u64| unsafe { ((base + offset) as *const u32).read_volatile() };
+	let write32 = |offset: u64, value: u32| unsafe { ((base + offset) as *mut u32).write_volatile(value) };
+	let write16 = |offset: u64, value: u16| unsafe { ((base + offset) as *mut u16).write_volatile(value) };
+	// The device offers everything, and its queue holds as many as before.
+	write32(OFFERED, u32::MAX);
+	write16(SIZE, 8);
+	let device = Virtio::over(base, 0x0000_0200, 1, 3);
+	let ring = Ring::new(8);
+	let mut queue = Queue::over_at(ring.base(), 0x4000_0000, 8, ring.notify());
+	// Work the driver had in flight: two buffers posted, one taken back, interrupts on.
+	queue.post_recv(0, 0x1000, 64);
+	queue.post_recv(1, 0x2000, 64);
+	ring.set_used_element(0, 0, 10);
+	ring.set_used_index(1);
+	assert_eq!(queue.take_used(), Some((0, 10)));
+	queue.enable_interrupts();
+	assert!(device.restore(), "the device takes its features back");
+	assert!(read16(STATUS) as u8 & VIRTIO_STATUS_FEATURES_OK != 0);
+	assert_eq!(read32(ACCEPTED), 1, "the last word written is word 1, as the negotiation wrote it");
+	assert_eq!(read16(MSIX), 3, "the configuration interrupt's vector is set again");
+	assert!(queue.restore(&device));
+	let (avail_off, used_off, _) = ring_layout(8);
+	assert_eq!(unsafe { ((base + DESC) as *const u64).read_volatile() }, 0x4000_0000, "the same ring");
+	assert_eq!(unsafe { ((base + AVAIL) as *const u64).read_volatile() }, 0x4000_0000 + avail_off);
+	assert_eq!(unsafe { ((base + USED) as *const u64).read_volatile() }, 0x4000_0000 + used_off);
+	assert_eq!(read16(ENABLE), 1);
+	assert_eq!(read16(QUEUE_MSIX), 3);
+	assert_eq!(ring.available_index(), 0, "the driver's half starts again from zero");
+	assert_eq!(ring.descriptor(1), (0, 0, 0, 0), "what was posted is gone");
+	assert_eq!(unsafe { ((ring.base() + avail_off) as *const u16).read_volatile() }, 0, "interrupts stay on");
+	assert_eq!(queue.take_used(), None, "nothing is outstanding");
+	queue.post_recv(0, 0x1000, 64);
+	assert_eq!(ring.available_index(), 1, "posting starts from zero again");
+	// A queue the device now holds fewer of is not the ring the driver drives.
+	write16(SIZE, 4);
+	assert!(!queue.restore(&device));
+	// And a device that no longer offers a feature its driver took does not come back.
+	write32(OFFERED, 0x0000_0100);
+	assert!(!device.restore());
 }

@@ -45,3 +45,6 @@ pub const CAP_BMC: &[u8] = b"BMC";
 // TYPECSERVICE'S TWO ROOTS: the read, and the operator's requests.
 pub const CAP_TYPEC: &[u8] = b"TYPEC";
 pub const CAP_TYPEC_CONTROL: &[u8] = b"TYPECCONTROL";
+// SERVICEMANAGER'S SLEEP AUTHORITY: every `system-sleep` grant is a fresh connection it mints itself - it serves the
+// interface, so no service's root stands behind the name.
+pub const CAP_SLEEP: &[u8] = b"SLEEP";

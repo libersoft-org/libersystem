@@ -68,6 +68,10 @@ pub enum BindingState {
 	// A USB OR SD CHILD DISAPPEARING IS NOT ANY OF THIS: it withdraws a provider and its parent
 	// controller stays `Online`.
 	Removed,
+	// SUSPENDED FOR A SLEEP. NOT A STOP: the binding, its generation, its publications and its consumers'
+	// connections survive, and `RESUMED` returns it to `Online`. It is not pinged - supervision pauses for a node
+	// that is not `Online` - and its control path stays live to answer `RESUME`.
+	Suspended,
 }
 
 impl BindingState {
@@ -85,6 +89,7 @@ impl BindingState {
 			BindingState::Failed => b"failed",
 			BindingState::Quarantined => b"quarantined",
 			BindingState::Removed => b"removed from the bus",
+			BindingState::Suspended => b"suspended for a sleep",
 		}
 	}
 
@@ -107,6 +112,9 @@ impl BindingState {
 	// | `Backoff` | `Failed` | the absolute TIME budget expired |
 	// | `Failed` | `Binding` | an operator retry |
 	// | `Quarantined` | - | terminal for the boot |
+	// | `Online` | `Suspended` | `SUSPENDED` arrives with the current generation |
+	// | `Suspended` | `Online` | `RESUMED` says the device came back |
+	// | `Suspended` | `Stopping` | the driver exited, a stop came during the sleep, or the device did not come back |
 	// Whether a TERMINAL HANDSHAKE FRAME - `READY` or `FAILED` - may still be acted on.
 	//
 	// The handshake ends in exactly one of the two, and a second is refused. That rule lived at one
@@ -147,6 +155,11 @@ impl BindingState {
 				| (BindingState::Binding, BindingState::Failed)
 				| (BindingState::Binding, BindingState::Stopping)
 				| (BindingState::Online, BindingState::Stopping)
+				// THE SLEEP'S EDGES: into `Suspended` only from `Online`, out of it to `Online` at a resume and to
+				// `Stopping` for everything that ends a binding - a driver that exited, a device that did not come back.
+				| (BindingState::Online, BindingState::Suspended)
+				| (BindingState::Suspended, BindingState::Online)
+				| (BindingState::Suspended, BindingState::Stopping)
 				| (BindingState::Stopping, BindingState::Backoff)
 				| (BindingState::Stopping, BindingState::Failed)
 				| (BindingState::Stopping, BindingState::Quarantined)
@@ -340,7 +353,8 @@ pub fn shutdown_step(state: BindingState, holds_the_device: bool, teardown_in_fl
 		return if teardown_in_flight { ShutdownStep::WaitForTheTeardownToSettle } else { ShutdownStep::Nothing };
 	}
 	match state {
-		BindingState::Online | BindingState::Binding => ShutdownStep::AskItToStop,
+		// A SUSPENDED DRIVER IS ASKED TOO: its control path stays live through the sleep, for `RESUME` and for this.
+		BindingState::Online | BindingState::Binding | BindingState::Suspended => ShutdownStep::AskItToStop,
 		BindingState::Stopping => ShutdownStep::WaitForTheStopAlreadySent,
 		_ => ShutdownStep::Nothing,
 	}
@@ -605,12 +619,17 @@ pub enum BindingEvent {
 	// exit and the claim reaching `Free` ARRIVE, separately, on this node's queue: `state` is one of
 	// `abi::CLAIM_STATE_*`, and anything that is not `Free` is a device that is not back.
 	ClaimSettled { generation: u64, state: u32 },
+	// IT ANSWERED A `SUSPEND`: done, done with wake armed, or refused. NOT terminal - a suspended binding keeps its
+	// generation, its publications and its consumers' connections.
+	Suspended { generation: u64, answer: driver_protocol::Suspended },
+	// IT ANSWERED A `RESUME`: back, or a device that did not come back, which is torn down and rebound.
+	Resumed { generation: u64, back: bool },
 }
 
 impl BindingEvent {
 	pub fn generation(self) -> u64 {
 		match self {
-			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Disconnected { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } | BindingEvent::ClaimSettled { generation, .. } => generation,
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Disconnected { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } | BindingEvent::ClaimSettled { generation, .. } | BindingEvent::Suspended { generation, .. } | BindingEvent::Resumed { generation, .. } => generation,
 		}
 	}
 }
@@ -648,6 +667,25 @@ pub fn reduce_event(state: BindingState, event: BindingEvent) -> EventDecision {
 		BindingEvent::Wedged { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::Hung), false),
 		BindingEvent::Offered { .. } | BindingEvent::Withdrawn { .. } | BindingEvent::Disconnected { .. } | BindingEvent::Ponged { .. } => (None, None, false),
 		BindingEvent::ClaimSettled { .. } => return EventDecision::Refused,
+		// THE SLEEP'S ANSWERS, each only in the state its question was asked in. A refusal leaves the binding
+		// `Online`: the suspend is what fails, not the driver.
+		BindingEvent::Suspended { answer, .. } => {
+			if state != BindingState::Online {
+				return EventDecision::Refused;
+			}
+			match answer.outcome {
+				driver_protocol::SuspendOutcome::Done | driver_protocol::SuspendOutcome::DoneWakeArmed => (Some(BindingState::Suspended), None, false),
+				driver_protocol::SuspendOutcome::Refused(_) => (None, None, false),
+			}
+		}
+		// A DEVICE THAT DID NOT COME BACK is the case a rebind exists for, so it is `device-not-responding`: retryable,
+		// and torn down through the route a crash takes.
+		BindingEvent::Resumed { back, .. } => {
+			if state != BindingState::Suspended {
+				return EventDecision::Refused;
+			}
+			if back { (Some(BindingState::Online), None, false) } else { (Some(BindingState::Stopping), Some(FailureCause::DriverReported(DriverFailureCode::DeviceNotResponding)), false) }
+		}
 	};
 	EventDecision::Admitted { event, next_state, cause, planned_stop }
 }
@@ -1402,6 +1440,20 @@ impl Heartbeat {
 		self.expiry_pending = false;
 		self.due = now.saturating_add(period as u64);
 		self.missed
+	}
+
+	/// PUT THE WATCHDOG BACK TO WORK AFTER A SLEEP, counting nothing: supervision paused while the binding was not
+	/// `Online`, so a `PING` outstanding when it suspended is forgotten rather than expired against the sleep, and
+	/// the next one is a whole period away.
+	pub fn restart(&mut self, now: u64, period: u32) {
+		if !self.supervised() {
+			return;
+		}
+		self.spent = false;
+		self.awaiting = false;
+		self.expiry_pending = false;
+		self.expires = 0;
+		self.due = now.saturating_add(period as u64);
 	}
 
 	/// How many deadlines this binding has missed.

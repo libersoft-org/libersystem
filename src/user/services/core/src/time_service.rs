@@ -14,6 +14,11 @@
 // client-facing "set the clock" - the only authority that moves wall time is
 // TimeService's own RTC/NTP logic, which holds the network capability it needs - so
 // no ambient authority can set the clock.
+//
+// THE WALL CLOCK COUNTS ON THE BOOT-TIME CLOCK, which takes every sleep in, and not on the monotonic ticks, which leave
+// it out: a machine asleep all night wakes with its wall clock a night later without anyone telling it. The resume
+// notice - this service declares the sleep notice - reads the RTC again to correct the drift, and a service that read no
+// time at its start reads again at each request until the kernel answers one.
 
 #![no_std]
 #![no_main]
@@ -22,39 +27,71 @@ extern crate alloc;
 
 use ipc_client::ChannelTransport;
 use proto::system::time::{self, Service};
-use proto::system::{Error, Timestamp, network};
+use proto::system::{Error, SleepState, Timestamp, network, sleep_notice};
 use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/roles_time_service.rs"));
 
-// The LAPIC monotonic clock runs at 100 Hz (ticks per second).
-const TICKS_PER_SEC: u64 = 100;
+const NANOS_PER_SEC: u64 = 1_000_000_000;
 // The NTP server TimeService disciplines against (resolved via DNS, queried over UDP).
 const NTP_SERVER: &str = "time.cloudflare.com";
 
-// TimeService state: the Unix epoch (seconds, UTC) at monotonic tick 0, so the
-// current wall time is this plus the monotonic clock. Seeded at boot from the RTC,
-// then refined by an SNTP query.
+// TimeService state: the Unix epoch (seconds, UTC) at boot, so the current wall time is this plus the boot-time clock.
+// Seeded at boot from the RTC, then refined by an SNTP query.
 struct Time {
-	epoch_at_tick0: u64,
+	epoch_at_boot: u64,
+	// Whether a time has been read at all: the kernel answers 0 for an RTC it cannot read yet.
+	seeded: bool,
 }
 
 impl Time {
-	// The wall clock now: the epoch at tick 0 plus the monotonic seconds since.
+	// The wall clock now: the epoch at boot plus the seconds since, sleeps included.
 	fn now_unix(&self) -> u64 {
-		self.epoch_at_tick0 + clock() / TICKS_PER_SEC
+		self.epoch_at_boot + clock_boot_ns() / NANOS_PER_SEC
 	}
 
 	// Reset the offset so the wall clock reads `unix` at this instant.
 	fn set_now(&mut self, unix: u64) {
-		self.epoch_at_tick0 = unix.saturating_sub(clock() / TICKS_PER_SEC);
+		self.epoch_at_boot = unix.saturating_sub(clock_boot_ns() / NANOS_PER_SEC);
+		self.seeded = true;
+	}
+
+	// THE RTC, READ AGAIN: at the resume, and at each request while nothing has been read.
+	fn read_rtc(&mut self) {
+		let unix = clock_rtc();
+		if unix != 0 {
+			self.set_now(unix);
+		}
 	}
 }
 
 impl Service for Time {
 	// The current wall-clock instant.
 	fn now(&mut self) -> Result<Timestamp, Error> {
+		if !self.seeded {
+			self.read_rtc();
+		}
 		Ok(Timestamp { unix_secs: self.now_unix() })
+	}
+}
+
+// THE SLEEP NOTICE: the resume reads the RTC again, and nothing else asks anything of this service.
+impl sleep_notice::Service for Time {
+	fn announce(&mut self, _state: SleepState) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn hold_writes(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn release_writes(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn resumed(&mut self, _state: SleepState) -> Result<(), Error> {
+		self.read_rtc();
+		Ok(())
 	}
 }
 
@@ -75,8 +112,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let (netsvc, service): (u64, u64) = (roles[0], roles[1]);
 
 	// 2. seed the offset from the hardware RTC (an immediate, network-free UTC).
-	let mut time = Time { epoch_at_tick0: 0 };
-	time.set_now(clock_rtc());
+	let mut time = Time { epoch_at_boot: 0, seeded: false };
+	time.read_rtc();
 
 	// 3. report in - boot does not wait on the network - then discipline against
 	//    SNTP best-effort; on failure the RTC seeding stands.
@@ -86,10 +123,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		close(netsvc);
 	}
 
-	// 4. serve now() until the client side closes.
+	// 4. serve now() until the client side closes, and ServiceManager's notices on the control channel beside it.
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 256] = [0u8; 256];
-	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { time::dispatch(&mut time, req, handle, out, reply_handle) });
+	serve_multi_rooted(&[service, bootstrap], &mut request, &mut reply, |origin, _chan, req, handle, out, reply_handle| -> Option<usize> {
+		if origin == 1 {
+			return sleep_notice::dispatch(&mut time, req, handle, out, reply_handle);
+		}
+		time::dispatch(&mut time, req, handle, out, reply_handle)
+	});
 	exit();
 }
 

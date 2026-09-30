@@ -89,6 +89,21 @@ impl Fake {
 		self.pending_faults.push(event);
 	}
 
+	// THE HARDWARE FORGOT EVERYTHING - a controller reset with the machine - and the record of what was attached is the
+	// only thing kept, as a real backend keeps it.
+	pub fn reset_hardware(&mut self) {
+		self.installed.clear();
+	}
+
+	// Every recorded attachment sent again, as `VirtioIommu::reattach_all` sends them.
+	pub fn reattach_all(&mut self) -> Result<(), Fault> {
+		let attached = self.attached.clone();
+		for (domain, endpoint) in attached {
+			self.calls.push(Call::Attach(domain, endpoint));
+		}
+		Ok(())
+	}
+
 	pub fn calls(&self) -> &[Call] {
 		&self.calls
 	}

@@ -17,6 +17,10 @@
 // report id belongs to - a pointer frame, or contact frames - and sent to that provider's consumers; then the event is
 // acknowledged, so the line may fire again. A line event with nothing behind it resets the device once, and the next
 // fails the binding. On STOP: SET_POWER sleep, then the node's `_PS3` where it has one.
+//
+// THE SLEEP, between two line events: SET_POWER sleep and the node's `_PS3`, as a stop does, and the line unwatched; the
+// resume runs the node's `_PS0`, SET_POWER on and RESET with its indication awaited, as bind does - a device that lost
+// its power comes back through the same handshake - and a device that does not answer it did not come back.
 
 #![no_std]
 #![no_main]
@@ -131,15 +135,14 @@ impl Hid {
 	}
 
 	fn wait_line(&mut self, deadline: u64) -> Waited {
-		match common::wait_or_answer_until(self.bootstrap, &self.bind, &[self.events], deadline, Some(&mut self.serving)) {
-			None => Waited::Ended,
-			Some(None) => Waited::Timeout,
-			Some(Some(_)) => {
-				if self.drain_events() {
-					Waited::Event
-				} else {
-					Waited::LineLost
-				}
+		loop {
+			match common::wait_or_answer_until(self.bootstrap, &self.bind, &[self.events], deadline, Some(&mut self.serving)) {
+				None => return Waited::Ended,
+				// A `SUSPEND` handed back before the deadline is not the deadline: it is taken in the loop, once the
+				// handshake in hand is over.
+				Some(None) if clock() < deadline => {}
+				Some(None) => return Waited::Timeout,
+				Some(Some(_)) => return if self.drain_events() { Waited::Event } else { Waited::LineLost },
 			}
 		}
 	}
@@ -254,6 +257,16 @@ impl Hid {
 		self.reset()
 	}
 
+	// THE SLEEP'S HALF OF WHAT A STOP DOES, and its way back - see the head of this file.
+	fn sleep_now(&mut self) -> bool {
+		let asleep = self.device.set_power(&mut self.bus, PowerState::Sleep).is_ok();
+		if !asleep {
+			self.say("SET_POWER sleep could not be sent");
+		}
+		self.power_method("_PS3");
+		asleep
+	}
+
 	// THE STOP: the device put to sleep, then the node's `_PS3`.
 	fn stop(&mut self) -> ! {
 		let asleep = self.device.set_power(&mut self.bus, PowerState::Sleep).is_ok();
@@ -268,6 +281,34 @@ impl Hid {
 	fn fail(&mut self, why: &str, code: driver_protocol::DriverFailureCode) -> ! {
 		self.say(why);
 		common::failed(self.bootstrap, &self.bind, code)
+	}
+}
+
+impl common::SleepStep for Hid {
+	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if !self.sleep_now() {
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		}
+		self.say("suspended - SET_POWER sleep");
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, _lost_power: bool) -> bool {
+		self.power_method("_PS0");
+		match self.power_on_and_reset() {
+			Ok(()) => {
+				self.say("resumed - SET_POWER on and RESET answered");
+				true
+			}
+			Err(why) => {
+				self.say(&format!("did not come back from the sleep - {why}"));
+				false
+			}
+		}
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(&mut self.serving)
 	}
 }
 
@@ -406,8 +447,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	// THE LOOP.
 	let mut storm = Storm::default();
+	common::takes_sleep();
 	loop {
-		let Some(ready) = common::wait_providers_or_answer(bootstrap, &hid.bind, &mut hid.serving, &[hid.events]) else { hid.stop() };
+		let events = hid.events;
+		let Some(ready) = common::wait_providers_until(bootstrap, &hid.bind, &mut hid.serving, &[events], 0) else { hid.stop() };
+		let Some(ready) = ready else {
+			let bind = hid.bind;
+			if !common::take_sleep_step(bootstrap, &bind, &mut hid) {
+				hid.stop();
+			}
+			continue;
+		};
 		match ready {
 			common::ProviderReady::Consumer(at) => {
 				let mut unexpected = [0u8; 16];

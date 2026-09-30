@@ -768,3 +768,24 @@ fn a_previously_quarantined_close_cannot_become_a_clean_endpoint_release() {
 	assert_eq!(iommu.revoke_endpoint(domain, endpoint), Ok(Release::Quarantined));
 	assert_eq!(iommu.quarantined_addresses(domain), 1);
 }
+
+// A CONTROLLER RESET WITH THE MACHINE GETS EVERY LIVE ATTACHMENT AND MAPPING BACK, and nothing that was quarantined.
+#[test]
+fn a_reset_controller_is_given_back_every_live_attachment_and_mapping_and_no_quarantined_one() {
+	let (mut iommu, domain) = iommu();
+	iommu.attach(domain, EndpointId(0x10)).expect("attached");
+	let kept = iommu.map(domain, 0x20_0000, 0x2000, Direction::Bidirectional, &requirements()).expect("mapped");
+	iommu.backend_mut_for_test().inject(Injection::Map, Fault::Unconfirmed);
+	assert_eq!(iommu.map(domain, 0x30_0000, 0x1000, Direction::ToDevice, &requirements()), Err(Fault::Unconfirmed), "quarantined");
+	let before = iommu.backend().installed_ranges();
+	iommu.backend_mut_for_test().reset_hardware();
+	assert_eq!(iommu.backend().installed_ranges(), 0, "the reset forgot every translation");
+	iommu.replay_after_reset(|backend| backend.reattach_all()).expect("replayed");
+	assert_eq!(iommu.backend().installed_ranges(), before, "every live mapping is back, and only those");
+	assert!(iommu.backend().calls().iter().filter(|call| matches!(call, Call::Attach(d, EndpointId(0x10)) if *d == domain)).count() == 2, "attached, then attached again");
+	assert!(iommu.mapping(kept).is_some_and(|mapping| mapping.state == MappingState::Live));
+	// A REFUSAL ENDS THE REPLAY AND IS THE ANSWER.
+	iommu.backend_mut_for_test().reset_hardware();
+	iommu.backend_mut_for_test().inject(Injection::Map, Fault::OutOfRange);
+	assert_eq!(iommu.replay_after_reset(|backend| backend.reattach_all()), Err(Fault::OutOfRange));
+}

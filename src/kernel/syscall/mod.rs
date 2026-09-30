@@ -540,6 +540,9 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		abi::SYS_FIRMWARE_REPORT => firmware::sys_firmware_report(a0, a1, a2),
 		abi::SYS_FIRMWARE_EVENTS => firmware::sys_firmware_events(a0, a1),
 		abi::SYS_FIRMWARE_GPE => firmware::sys_firmware_gpe(a0, a1, a2),
+		abi::SYS_FIRMWARE_SLEEP_TYPE => firmware::sys_firmware_sleep_type(a0, a1, a2, a3),
+		abi::SYS_SYSTEM_SLEEP => sys_system_sleep(a0, a1, a2, a3),
+		abi::SYS_CLOCK_BOOT_NS => crate::sleep::boot_ns() as i64,
 		abi::SYS_DEVICE_NODE => firmware::sys_device_node(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
@@ -614,7 +617,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 			arch::usermode::exit_to_kernel()
 		}
 		SYS_FAULT_INFO_GET => sys_fault_info_get(a0, a1),
-		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2),
+		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2, a3),
+		abi::SYS_DOMAIN_FREEZE => sys_domain_freeze(a0, a1),
 		SYS_DOMAIN_KILL => sys_domain_kill(a0),
 		SYS_DOMAIN_STATS_GET => sys_domain_stats_get(a0, a1, a2),
 		SYS_CPU_INFO => sys_cpu_info(a0, a1),
@@ -643,6 +647,9 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_WAIT_ANY => sys_wait_any(a0, a1, a2, a3),
 		_ => ERR_BAD_SYSCALL,
 	};
+	// A FROZEN THREAD RETURNS TO USER MODE ONLY AT THE THAW, whatever its syscall was - a wait that ended, a send,
+	// a clock read. The flag is read only while some freeze is in effect, so every other syscall pays one load.
+	sched::park_if_frozen();
 	result as u64
 }
 
@@ -2363,6 +2370,25 @@ fn sys_system_power(handle: u64, action: u64) -> i64 {
 	}
 }
 
+// THE KERNEL'S SLEEP ENTRY - see `abi::SYS_SYSTEM_SLEEP` and `crate::sleep`. MANAGE on the root Domain, as
+// `sys_system_power`: whoever holds it can already stop the machine, and putting it to sleep is no new authority.
+fn sys_system_sleep(handle: u64, state: u64, timed_wake: u64, report: u64) -> i64 {
+	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::MANAGE) {
+		Ok(d) => d,
+		Err(e) => return e,
+	};
+	if !user_buf_writable(report, core::mem::size_of::<abi::SleepReport>() as u64) {
+		return ERR_INVALID;
+	}
+	match crate::sleep::sys_system_sleep(&domain, state, timed_wake) {
+		Ok(written) => match write_user(report, written) {
+			Ok(()) => 0,
+			Err(e) => e,
+		},
+		Err(e) => e,
+	}
+}
+
 // Inject one byte into the kernel console input - the path a userspace input driver
 // (the virtio-input keyboard) uses to feed the interactive shell. (Gating this to the
 // input driver is a PermissionManager concern, deferred.)
@@ -3981,7 +4007,7 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 			drop(object);
 			sched::exit();
 		}
-		if thread.process().is_stopped() {
+		if thread.process().is_held() {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
 			continue;
 		}
@@ -4096,7 +4122,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 			}
 			sched::exit();
 		}
-		if thread.process().is_stopped() {
+		if thread.process().is_held() {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
 			continue;
 		}
@@ -4218,7 +4244,7 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 		if thread.process().is_killed() {
 			sched::exit();
 		}
-		if thread.process().is_stopped() {
+		if thread.process().is_held() {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
 			continue;
 		}
@@ -4424,18 +4450,70 @@ fn sys_process_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	1
 }
 
-// Create a child Domain of the caller's Domain with the given resource caps and
-// install a handle to it in the caller's table. The child's limits bind in
-// addition to every ancestor's, so a subdomain can only subdivide its parent's
-// budget, never exceed it. a0/a1/a2 are the memory/handle/thread caps.
-fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> i64 {
+// Create a child Domain of the caller's Domain - or of `parent`, a Domain handle holding MANAGE - with the given
+// resource caps and install a handle to it in the caller's table. The child's limits bind in addition to every
+// ancestor's, so a subdomain can only subdivide its parent's budget, never exceed it. a0/a1/a2 are the
+// memory/handle/thread caps.
+//
+// THE PARENT ARGUMENT IS ADDITIVE: zero keeps "the caller's Domain". It exists so ProcessService can put every launch
+// a client asks for under ONE applications Domain, which a sleep freezes whole; MANAGE on the parent is the right
+// that already lets its holder kill the subtree, so placing a child in it is no new authority.
+fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64, parent: u64) -> i64 {
 	let thread = current_thread!();
+	let parent: alloc::sync::Arc<Domain> = if parent == 0 {
+		thread.domain().clone()
+	} else {
+		match current_typed::<Domain>(parent, ObjectType::Domain, Rights::MANAGE) {
+			Ok(domain) => domain,
+			Err(e) => return e,
+		}
+	};
 	// A parent that is being killed does not get new children: the kill walks a snapshot, so one
 	// created after it was taken would outlive the domain it belongs to.
-	let Some(child) = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit) else {
+	let Some(child) = Domain::new_child(&parent, memory_limit, handle_limit, thread_limit) else {
 		return ERR_INVALID;
 	};
 	install_object(&thread, child, Rights::ALL)
+}
+
+// How long a freeze may take to find no thread of the subtree executing user code: a second. A busy core keeps its
+// periodic tick, so a thread running user code is preempted and parked within a tick; a Ready one parks at its first
+// return to user mode.
+const FREEZE_TICKS: u64 = 100;
+
+// FREEZE OR THAW A DOMAIN'S SUBTREE - see `SYS_DOMAIN_FREEZE`.
+fn sys_domain_freeze(handle: u64, on: u64) -> i64 {
+	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	match on {
+		0 => {
+			if domain.is_frozen() {
+				domain.set_frozen(false);
+				sched::freeze_ended();
+			}
+			0
+		}
+		1 => {
+			if !domain.is_frozen() {
+				sched::freeze_began();
+			}
+			domain.set_frozen(true);
+			let deadline = arch::apic::ticks().saturating_add(FREEZE_TICKS);
+			loop {
+				if domain.quiescent() {
+					return 0;
+				}
+				let now = arch::apic::ticks();
+				if now >= deadline {
+					return ERR_TIMED_OUT;
+				}
+				sched::block_on(0, now + 1);
+			}
+		}
+		_ => ERR_INVALID,
+	}
 }
 
 // Read the live resource counters of the Domain named by `handle` into the caller's

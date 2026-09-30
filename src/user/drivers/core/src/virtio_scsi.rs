@@ -570,6 +570,47 @@ impl Span {
 	}
 }
 
+// THE SLEEP, between two commands: every present unit's cache synchronised, so a battery that dies in the sleep loses
+// nothing this driver accepted; for a sleep that cuts the power the device is also stopped (the transport's reset),
+// and a device that lost its state is set up again only by a bind, so that resume answers it did not come back.
+struct Sleep<'a> {
+	queue: &'a virtio::Queue,
+	units: &'a [Unit],
+	virt: u64,
+	phys: u64,
+	sense_size: u32,
+	cdb_size: u32,
+	serving: &'a mut common::Serving,
+	stopped: bool,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let refused = driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		for unit in self.units.iter().filter(|unit| unit.present) {
+			if !unsafe { command(self.queue, self.virt, self.phys, self.sense_size, self.cdb_size, &unit.lun, &scsi::synchronize_cache10(), None) }.ok() {
+				print(b"driver.virtio-scsi: the sleep is refused - a unit did not complete the cache synchronise it requires\n");
+				return refused;
+			}
+		}
+		if request.state.loses_power() {
+			if !common::quiesce_virtio() {
+				return refused;
+			}
+			self.stopped = true;
+		}
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		!lost_power && !self.stopped
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
+
 // SERVE EVERY PUBLISHED UNIT FROM ONE LOOP, AND WATCH THE BUS WHILE DOING IT.
 //
 // One loop and not a thread per unit: they share one device, one request queue and one interrupt, so
@@ -589,25 +630,35 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, queue: &virtio::Queue, mut 
 		let mut serving = common::Serving::from_offers(&offers);
 		let devices: [u64; 1] = [irq];
 		let waits: &[u64] = if irq != 0 { &devices } else { &[] };
+		common::takes_sleep();
 		loop {
-			let ready = match common::wait_providers_or_answer(bootstrap, bind, &mut serving, waits) {
-				Some(ready) => ready,
-				None => {
-					// THE FLUSH IS PER UNIT, because each has its own cache and a stop that
-					// synchronised one of four claims a clean stop for three it never asked.
-					let mut flushed = true;
-					for unit in units[..published].iter().filter(|unit| unit.present) {
-						if !command(queue, virt, phys, sense_size, cdb_size, &unit.lun, &scsi::synchronize_cache10(), None).ok() {
-							flushed = false;
-						}
+			let ready = match common::wait_providers_until(bootstrap, bind, &mut serving, waits, 0) {
+				Some(Some(ready)) => Some(ready),
+				// THE SLEEP, between two commands.
+				Some(None) => {
+					let mut step = Sleep { queue, units: &units[..published], virt, phys, sense_size, cdb_size, serving: &mut serving, stopped: false };
+					if common::take_sleep_step(bootstrap, bind, &mut step) {
+						continue;
 					}
-					if !flushed {
-						print(b"driver.virtio-scsi: a unit did not complete the cache synchronise this stop requires - no clean stop is claimed for it\n");
-					}
-					let quiet = common::quiesce_virtio();
-					common::finish_stop(bootstrap, bind, device, quiet && flushed);
-					exit();
+					None
 				}
+				None => None,
+			};
+			let Some(ready) = ready else {
+				// THE FLUSH IS PER UNIT, because each has its own cache and a stop that
+				// synchronised one of four claims a clean stop for three it never asked.
+				let mut flushed = true;
+				for unit in units[..published].iter().filter(|unit| unit.present) {
+					if !command(queue, virt, phys, sense_size, cdb_size, &unit.lun, &scsi::synchronize_cache10(), None).ok() {
+						flushed = false;
+					}
+				}
+				if !flushed {
+					print(b"driver.virtio-scsi: a unit did not complete the cache synchronise this stop requires - no clean stop is claimed for it\n");
+				}
+				let quiet = common::quiesce_virtio();
+				common::finish_stop(bootstrap, bind, device, quiet && flushed);
+				exit();
 			};
 			let at = match ready {
 				// A replacement consumer on one unit. The others are untouched.

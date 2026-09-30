@@ -39,6 +39,7 @@ mod perf;
 mod platform_event;
 mod product;
 mod sched;
+mod sleep;
 mod smp;
 mod sync;
 mod syscall;

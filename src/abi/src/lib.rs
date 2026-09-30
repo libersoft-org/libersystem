@@ -89,6 +89,8 @@ pub const SYS_TIMER_SET: u64 = 15;
 pub const SYS_TIMER_POLL: u64 = 16;
 pub const SYS_USER_EXIT: u64 = 17;
 pub const SYS_FAULT_INFO_GET: u64 = 18;
+// `SYS_DOMAIN_CREATE(memory, handles, threads, parent)`: a child Domain of `parent` - a Domain handle holding MANAGE -
+// or, for zero, of the caller's own Domain.
 pub const SYS_DOMAIN_CREATE: u64 = 19;
 pub const SYS_DOMAIN_KILL: u64 = 20;
 pub const SYS_YIELD: u64 = 21;
@@ -1589,6 +1591,78 @@ pub const GPE_COUNT: u64 = 7;
 // field lines and addresses - as a `FirmwareNode`. ERR_INVALID for no such row; a row with nothing attached
 // answers a node with no flags.
 pub const SYS_DEVICE_NODE: u64 = 108;
+
+// ------------------------------------------------------------------ sleep
+
+// `SYS_DOMAIN_FREEZE(domain, on)`: park every thread of the Domain's subtree at its next return to user mode, on a
+// FROZEN flag of its own - `SIG_CONT` does not clear it and the thaw does not clear `SIG_STOP`'s - or release them.
+// Requires MANAGE on the Domain, the right that already lets its holder kill the subtree. A freeze answers only when
+// no thread of the subtree is executing user code, and `ERR_TIMED_OUT` when that is not so within the kernel's bound
+// (the flags stay set, for the caller to thaw); a process created in a frozen subtree starts frozen.
+pub const SYS_DOMAIN_FREEZE: u64 = 109;
+// `SYS_SYSTEM_SLEEP(root domain, state, timed wake, report)`: the kernel's sleep entry - requires MANAGE on the
+// root Domain, as `SYS_SYSTEM_POWER` does. `timed wake` is a deadline on the boot-time clock in nanoseconds, zero
+// for none; the call answers when the machine is awake again, the `SleepReport` written to `report`. Refused:
+// `ERR_UNSUPPORTED` for a state this machine does not offer or nothing registered, `ERR_INTERRUPTED` for a wake event
+// already pending, `ERR_INVALID` for a timed wake already past or beyond what the state's alarm reaches.
+pub const SYS_SYSTEM_SLEEP: u64 = 110;
+// `SYS_FIRMWARE_SLEEP_TYPE(privilege, state, typ a, typ b)`: THE ACPI SERVICE REGISTERS a sleep state's `\_Sx`
+// pair, which the kernel writes into PM1a and PM1b control with SLP_EN - `SLEEP_STATE_RAM`, `SLEEP_STATE_DISK` or
+// `SLEEP_STATE_SOFT_OFF`. Requires the FirmwareInterpreter privilege. A registered value outlives the service: it is
+// firmware data. `ERR_UNSUPPORTED` when this build refuses the registration (the development switch).
+pub const SYS_FIRMWARE_SLEEP_TYPE: u64 = 111;
+// `SYS_CLOCK_BOOT_NS()`: nanoseconds since boot, SLEEP INCLUDED - read-only, with no timers on it. The monotonic
+// clock excludes every sleep, so a deadline armed before one has the rest of its time after it; this is the clock
+// a sleep's length and a wall clock are counted on.
+pub const SYS_CLOCK_BOOT_NS: u64 = 112;
+
+// The sleep states, as `liber:process@1/sleep-state` numbers them, and soft-off's registration.
+pub const SLEEP_STATE_IDLE: u64 = 1;
+pub const SLEEP_STATE_RAM: u64 = 2;
+pub const SLEEP_STATE_DISK: u64 = 3;
+pub const SLEEP_STATE_SOFT_OFF: u64 = 5;
+
+// What woke the machine, as `liber:process@1/wake-reason` numbers it.
+pub const WAKE_UNKNOWN: u32 = 0;
+pub const WAKE_TIMER: u32 = 1;
+pub const WAKE_POWER_BUTTON: u32 = 2;
+pub const WAKE_SLEEP_BUTTON: u32 = 3;
+pub const WAKE_DEVICE: u32 = 4;
+pub const WAKE_RTC: u32 = 5;
+pub const WAKE_PLATFORM: u32 = 6;
+
+// The most cores a sleep report carries.
+pub const SLEEP_REPORT_CORES: usize = 64;
+
+// One core's wakeups while parked in a suspend to idle, by cause.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CorePark {
+	pub cpu: u32,
+	pub timer: u32,
+	pub ipi: u32,
+	pub device: u32,
+}
+
+// What `SYS_SYSTEM_SLEEP` writes at the resume.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SleepReport {
+	pub wake: u32,
+	// The device's interrupt identity, for `WAKE_DEVICE`.
+	pub detail: u32,
+	// The sleep's length on the boot-time clock.
+	pub slept_ns: u64,
+	pub core_count: u32,
+	pub _pad: u32,
+	pub cores: [CorePark; SLEEP_REPORT_CORES],
+}
+
+impl Default for SleepReport {
+	fn default() -> Self {
+		SleepReport { wake: WAKE_UNKNOWN, detail: 0, slept_ns: 0, core_count: 0, _pad: 0, cores: [CorePark::default(); SLEEP_REPORT_CORES] }
+	}
+}
 
 // What `SYS_FIRMWARE_MAP` reads: the range, the node whose `OperationRegion` it is (its row identity, `acpi:` and
 // the absolute path), and the PCI function that node is the companion of (`FIRMWARE_NO_FUNCTION` for none).
