@@ -1349,6 +1349,8 @@ pub const OBJECT_TYPE_CLAIM: u64 = 14;
 pub const OBJECT_TYPE_PORT_RANGE: u64 = 15;
 pub const OBJECT_TYPE_CONSOLE_TAP: u64 = 16;
 pub const OBJECT_TYPE_REGISTERS: u64 = 17;
+// A latency request: held, it bounds every core's idle states - see `SYS_LATENCY_REQUEST`.
+pub const OBJECT_TYPE_LATENCY_REQUEST: u64 = 18;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1673,6 +1675,131 @@ pub const SYS_RESTORE_COMMIT: u64 = 121;
 // system image this kernel runs (its own code and the packages it booted with) and the hardware (the memory map's
 // classes, the cores, every PCI function).
 pub const SYS_SYSTEM_FINGERPRINT: u64 = 122;
+
+// PROCESSOR POWER - the kernel holds what runs at the scheduler's rate or needs ring 0 (the idle governor and the entry
+// into an idle state, the performance governor and the register writes that carry out its choice, idle injection and
+// the latency bound); ProcessorPowerService, the one holder of the `ProcessorPower` privilege every call here needs,
+// installs what the firmware describes. Every register a table names is checked at install and the table refused whole
+// for one refusal - `ERR_ACCESS_DENIED` for a register the kernel will not take (RAM, the reserved set, a grant, a
+// claim, a device's BAR), `ERR_INVALID` for a table `procpower` refuses (a model-specific register, the platform
+// channel, too many states, out of order) - and a refused table leaves the one it would have replaced standing.
+//
+// `SYS_PROCESSOR_IDLE_TABLE(privilege, cpu, states, count)`: core `cpu`'s idle states, `count` `ProcessorIdleState`s at
+// `states`, shallowest first; `count` zero uninstalls, leaving the halt.
+pub const SYS_PROCESSOR_IDLE_TABLE: u64 = 123;
+// `SYS_PROCESSOR_PERF_TABLE(privilege, cpu, table)`: core `cpu`'s performance table, a `ProcessorPerfTable` at `table`;
+// zero uninstalls. The window becomes the whole table.
+pub const SYS_PROCESSOR_PERF_TABLE: u64 = 124;
+// `SYS_PROCESSOR_PERF_WINDOW(privilege, cpu, cap, floor)`: the fastest level and the slowest the governor may choose,
+// obeyed at once.
+pub const SYS_PROCESSOR_PERF_WINDOW: u64 = 125;
+// `SYS_PROCESSOR_IDLE_INJECT(privilege, cpu, permille)`: the share of core `cpu`'s time the scheduler injects as idle,
+// at most `MAX_INJECT_PERMILLE`.
+pub const SYS_PROCESSOR_IDLE_INJECT: u64 = 126;
+// `SYS_LATENCY_REQUEST(privilege, bound_us)`: A LATENCY REQUEST, under the `IdleLatency` privilege - a handle to a
+// kernel object that holds every core's idle governor to states whose exit latency is at most `bound_us` for as long as
+// a handle to it lives. `ERR_RESOURCE_EXHAUSTED` past four per process or sixty-four in the system.
+pub const SYS_LATENCY_REQUEST: u64 = 127;
+// `SYS_PROCESSOR_PERF_PREFERENCE(privilege, cpu, value)`: CPPC's energy-performance preference, 0 (performance) to 255
+// (energy), written to core `cpu`'s preference register. `ERR_UNSUPPORTED` where its table names none.
+pub const SYS_PROCESSOR_PERF_PREFERENCE: u64 = 128;
+pub const MAX_INJECT_PERMILLE: u64 = 500;
+
+// A REGISTER a processor table names, as ACPI's Generic Address Structure gives it: the space (0 memory, 1 I/O, 0x0A the
+// platform channel, 0x7F functional fixed hardware), the width in bits and the address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessorRegister {
+	pub space: u8,
+	pub bits: u8,
+	pub _pad: [u8; 6],
+	pub address: u64,
+}
+
+// How an idle state is entered.
+pub const IDLE_ENTRY_HALT: u32 = 0;
+pub const IDLE_ENTRY_MWAIT: u32 = 1;
+pub const IDLE_ENTRY_REGISTER: u32 = 2;
+pub const IDLE_ENTRY_PSCI: u32 = 3;
+pub const IDLE_ENTRY_SBI: u32 = 4;
+// What an idle state costs beyond its latency.
+pub const IDLE_LOSES_CONTEXT: u32 = 1 << 0;
+pub const IDLE_STOPS_TIMER: u32 = 1 << 1;
+pub const IDLE_BUS_MASTER_ARBITRATION: u32 = 1 << 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessorIdleState {
+	pub entry: u32,
+	pub flags: u32,
+	// MWAIT's hint, PSCI's power state, the SBI's suspend type.
+	pub parameter: u32,
+	pub exit_latency_us: u32,
+	pub target_residency_us: u32,
+	pub _pad: u32,
+	pub register: ProcessorRegister,
+}
+
+pub const PROCESSOR_MAX_IDLE_STATES: usize = 8;
+pub const PROCESSOR_MAX_PERF_STATES: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessorPerfState {
+	pub core_mhz: u32,
+	pub power_mw: u32,
+	pub latency_us: u32,
+	pub control: u32,
+	pub status: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessorThrottleState {
+	pub percent: u32,
+	pub latency_us: u32,
+	pub control: u32,
+}
+
+// How a performance table is controlled.
+pub const PERF_TABLE_STATES: u32 = 1;
+pub const PERF_TABLE_CPPC: u32 = 2;
+
+// A CORE'S PERFORMANCE TABLE: `_PSS` states with `_PCT`'s control and status registers, or CPPC's desired register (and
+// its minimum and maximum where it has them) with its levels; `_PSD`'s domain where `coordination` is not zero; and the
+// throttling states with `_PTC`'s control register where `throttle_count` is not zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessorPerfTable {
+	pub control_kind: u32,
+	pub state_count: u32,
+	// `_PCT`'s control register, or CPPC's desired performance.
+	pub control: ProcessorRegister,
+	// `_PCT`'s status register, or CPPC's minimum performance (space 0, address 0 for none).
+	pub status: ProcessorRegister,
+	// CPPC's maximum performance (address 0 for none).
+	pub maximum: ProcessorRegister,
+	// CPPC's energy-performance preference (address 0 for none).
+	pub preference: ProcessorRegister,
+	pub highest: u32,
+	pub nominal: u32,
+	pub lowest: u32,
+	pub domain: u32,
+	// `_PSD`'s coordination type (0xFC, 0xFD, 0xFE), or zero for none.
+	pub coordination: u32,
+	pub processors: u32,
+	pub throttle_count: u32,
+	pub _pad: u32,
+	pub throttle_control: ProcessorRegister,
+	pub states: [ProcessorPerfState; PROCESSOR_MAX_PERF_STATES],
+	pub throttle: [ProcessorThrottleState; PROCESSOR_MAX_PERF_STATES],
+}
+
+impl Default for ProcessorPerfTable {
+	fn default() -> Self {
+		ProcessorPerfTable { control_kind: 0, state_count: 0, control: ProcessorRegister::default(), status: ProcessorRegister::default(), maximum: ProcessorRegister::default(), preference: ProcessorRegister::default(), highest: 0, nominal: 0, lowest: 0, domain: 0, coordination: 0, processors: 0, throttle_count: 0, _pad: 0, throttle_control: ProcessorRegister::default(), states: [ProcessorPerfState::default(); PROCESSOR_MAX_PERF_STATES], throttle: [ProcessorThrottleState::default(); PROCESSOR_MAX_PERF_STATES] }
+	}
+}
 // The most pages one read or write moves, and the resume context's size.
 pub const SNAPSHOT_BATCH: u64 = 256;
 pub const SNAPSHOT_CONTEXT: usize = 64;
@@ -1685,6 +1812,12 @@ pub struct SnapshotInfo {
 	pub context: [u8; SNAPSHOT_CONTEXT],
 	pub system: [u8; 32],
 	pub hardware: [u8; 32],
+}
+
+impl Default for SnapshotInfo {
+	fn default() -> Self {
+		SnapshotInfo { pages: 0, context: [0; SNAPSHOT_CONTEXT], system: [0; 32], hardware: [0; 32] }
+	}
 }
 
 // What `SYS_SYSTEM_FINGERPRINT` answers.
@@ -1849,7 +1982,7 @@ pub struct CpuIdleSource {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct CpuIdleInfo {
 	pub cpu: u32,
 	pub source_count: u32,
@@ -1860,6 +1993,50 @@ pub struct CpuIdleInfo {
 	pub wakes_housekeeping: u64,
 	pub wakes_device: u64,
 	pub sources: [CpuIdleSource; CPU_IDLE_SOURCES],
+	// THE PROCESSOR'S POWER: each idle state installed - the halt alone where none is - with its entries and residency;
+	// the performance level now, the time spent at each, the window; the idle injected; the live latency requests.
+	pub state_count: u32,
+	pub perf_levels: u32,
+	pub states: [CpuIdleStateInfo; PROCESSOR_MAX_IDLE_STATES],
+	pub perf_level: u32,
+	pub window_cap: u32,
+	pub window_floor: u32,
+	pub inject_permille: u32,
+	pub injected_ns: u64,
+	pub latency_requests: u32,
+	// The smallest live request's bound, `u32::MAX` for none.
+	pub latency_bound_us: u32,
+	pub level_ns: [u64; CPU_PERF_LEVELS],
+	// THE CORE'S INTERRUPT-CONTROLLER ID - its APIC id, MPIDR affinity or hart id - which names it to firmware: the ACPI
+	// service matches a processor's `_UID` through the MADT to it.
+	pub hardware_id: u64,
+}
+
+impl Default for CpuIdleInfo {
+	fn default() -> Self {
+		CpuIdleInfo { cpu: 0, source_count: 0, idle_ns: 0, halts: 0, wakes_timer: 0, wakes_ipi: 0, wakes_housekeeping: 0, wakes_device: 0, sources: [CpuIdleSource::default(); CPU_IDLE_SOURCES], state_count: 0, perf_levels: 0, states: [CpuIdleStateInfo::default(); PROCESSOR_MAX_IDLE_STATES], perf_level: 0, window_cap: 0, window_floor: 0, inject_permille: 0, injected_ns: 0, latency_requests: 0, latency_bound_us: u32::MAX, level_ns: [0; CPU_PERF_LEVELS], hardware_id: 0 }
+	}
+}
+
+// The levels whose time `CpuIdleInfo::level_ns` keeps: the performance states and the throttling states past T0.
+pub const CPU_PERF_LEVELS: usize = 2 * PROCESSOR_MAX_PERF_STATES;
+
+// Why an installed idle state is not entered on this core: 0 it is.
+pub const IDLE_ENTERABLE: u32 = 0;
+pub const IDLE_NO_MWAIT: u32 = 1;
+pub const IDLE_COUNTER_MAY_STOP: u32 = 2;
+pub const IDLE_TIMER_STOPS: u32 = 3;
+pub const IDLE_CONTEXT_LOST: u32 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CpuIdleStateInfo {
+	pub entry: u32,
+	pub unenterable: u32,
+	pub exit_latency_us: u32,
+	pub target_residency_us: u32,
+	pub entries: u64,
+	pub residency_ns: u64,
 }
 
 // Vector windows reported in IrqInfo::kind.

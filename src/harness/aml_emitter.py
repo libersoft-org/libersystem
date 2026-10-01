@@ -392,6 +392,11 @@ def qword_memory(base, length, writable=True):
 	return struct.pack('<BHBBB', 0x8A, 43, 0, 1, 1 if writable else 0) + struct.pack('<QQQQQ', 0, base, base + length - 1 if length else base, 0, length)
 
 
+def generic_register(space, bits, address, offset=0, access=0):
+	"""`Register (...)`: a Generic Register descriptor - ACPI's Generic Address Structure in a resource template."""
+	return struct.pack('<BHBBBBQ', 0x82, 12, space, bits, offset, access, address)
+
+
 def io(base, length):
 	return struct.pack('<BBHHBB', 0x47, 0x01, base, base, 1, length)
 

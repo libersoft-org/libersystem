@@ -21,7 +21,7 @@ def main():
     source = SOURCE.read_text()
     definitions = '\n'.join(re.search(r'^' + pattern + r'.*?^}', source, re.M | re.S).group() for pattern in (
         'pub enum ProviderReady ', 'pub struct Serving ', 'impl Serving ', 'enum Control '))
-    functions = '\n'.join(function(source, name) for name in ('wait_providers_or_answer', 'wait_providers', 'drain_control_into', 'disconnected', 'pong'))
+    functions = '\n'.join(function(source, name) for name in ('wait_providers_or_answer', 'wait_providers', 'wait_providers_inner', 'wait_or_answer_until', 'drain_control_into', 'disconnected', 'pong'))
     # THE STUBS ARE SAFE, LIKE THE `rt` CALLS THEY STAND IN FOR. They were `unsafe fn`, from a time
     # when `close`, `poll_ready`, `wait_any` and `try_recv` were - so the extracted production code,
     # which calls them from safe functions, stopped compiling the moment the runtime's did not. A
@@ -31,9 +31,21 @@ def main():
 use driver_protocol as proto;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const MAX_PROVIDER_CLIENTS: usize = 8;
+const ERR_TIMED_OUT: i64 = -11;
 static STOP_PENDING: AtomicBool = AtomicBool::new(false);
+// THE NODE AND THE SLEEP, as the production wait reads them: no node channel, and a driver that does not take the
+// sleep itself - so a `SUSPEND` would go to the common step, which these regressions never send.
+static NODE: AtomicU64 = AtomicU64::new(0);
+static OWN_SLEEP: AtomicBool = AtomicBool::new(false);
+static SUSPEND_ASKED: AtomicU64 = AtomicU64::new(0);
+fn request_node(_: u64, _: &Bind) -> bool { true }
+fn take_node(_: &Bind, _: proto::Opcode, handle: u64) { if handle != 0 { close(handle) } }
+fn encode_request(_: &proto::SuspendRequest) -> u64 { 0 }
+fn common_sleep_step(_: u64, _: &Bind, _: &proto::SuspendRequest, _: Option<&mut Serving>) -> Control { Control::Continue }
+fn resumed(_: u64, _: &Bind, _: bool) -> bool { true }
+fn clock() -> u64 { 0 }
 static QUEUED: Mutex<VecDeque<(Vec<u8>, u64)>> = Mutex::new(VecDeque::new());
 static SCHEDULED: Mutex<VecDeque<(Vec<u8>, u64)>> = Mutex::new(VecDeque::new());
 static CLOSED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -91,7 +103,7 @@ fn usb_connections_keep_their_publication_identity_across_removal_and_reopen() {
     assert_eq!(serving.at(1), 30); assert_eq!(serving.token_at(1), 2);
     assert_eq!(serving.first_for(2), 30);
     QUEUED.lock().unwrap().push_back(connect(1, 21, 4));
-    assert!(matches!(drain_control_into(100, &bind, Some(&mut serving)), Control::Continue));
+    assert!(matches!(drain_control_into(100, &bind, Some(&mut serving), false), Control::Continue));
     assert_eq!(serving.at(2), 21); assert_eq!(serving.token_at(2), 1);
     while !serving.as_slice().is_empty() { serving.close_at(0); }
     QUEUED.lock().unwrap().push_back(connect(2, 31, 4));
@@ -104,7 +116,7 @@ fn refused_connections_return_allowance_and_stale_handles_are_closed() {
     for end in 11..18 { assert!(serving.accept(end, 0, proto::Scope::Whole)); }
     QUEUED.lock().unwrap().push_back(connect(0, 99, 4));
     QUEUED.lock().unwrap().push_back(connect(0, 98, 3));
-    assert!(matches!(drain_control_into(100, &bind, Some(&mut serving)), Control::Continue));
+    assert!(matches!(drain_control_into(100, &bind, Some(&mut serving), false), Control::Continue));
     assert_eq!(*CLOSED.lock().unwrap(), [99, 98]);
     assert_eq!(SENT.lock().unwrap().len(), 1, "a stale generation cannot refund a current binding's allowance");
     assert_eq!(SENT.lock().unwrap()[0].0, proto::Opcode::Disconnect);
@@ -137,6 +149,16 @@ fn an_idle_provider_still_services_device_work_and_stop() {
     assert!(wait_providers_or_answer(100, &bind, &mut serving, &[200]).is_none());
     assert!(STOP_PENDING.load(Ordering::Relaxed));
 }
+#[test]
+fn a_consumer_accepted_during_a_wait_on_the_callers_set_is_handed_back_so_the_set_is_built_again() {
+    // THE RELAUNCHED CONSUMER: the first consumer's endpoint is what the caller waits on, and a second connects meanwhile.
+    // Kept in the wait it was accepted in, it would never be read - so it comes back as "nothing ready".
+    reset(); let bind = Bind { generation: 4 }; let mut serving = Serving::new(10, 0);
+    let handles = serving.as_slice().to_vec();
+    QUEUED.lock().unwrap().push_back(connect(0, 11, 4));
+    assert!(matches!(wait_or_answer_until(100, &bind, &handles, u64::MAX, Some(&mut serving)), Some(None)), "the accepted consumer is handed back for the caller to wait on");
+    assert_eq!(serving.as_slice(), &[10, 11]);
+}
 '''
     with tempfile.TemporaryDirectory(prefix='liber-driver-connections-') as directory:
         path = Path(directory)
@@ -145,11 +167,12 @@ fn an_idle_provider_still_services_device_work_and_stop() {
         command = ['cargo', 'test', '--offline', '--quiet', '--manifest-path', str(path / 'Cargo.toml'), '--lib', '--', '--test-threads=1']
         (path / 'tests.rs').write_text(program)
         result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or '5 passed' not in result.stdout:
+        if result.returncode or '6 passed' not in result.stdout:
             raise SystemExit(result.stdout)
-        print('driver-connections: 5 production connection and control-wait regressions passed')
+        print('driver-connections: 6 production connection and control-wait regressions passed')
         mutations = {
-            'discarded CONNECT while idle': program.replace('drain_control_into(bootstrap, bind, Some(serving))', 'drain_control_into(bootstrap, bind, None)'),
+            'discarded CONNECT while idle': program.replace('drain_control_into(bootstrap, bind, Some(serving), surfaces)', 'drain_control_into(bootstrap, bind, None, surfaces)'),
+            'an accepted consumer kept out of the wait': program.replace('if serving.as_deref().is_some_and(|serving| serving.as_slice().len() > serving_before) {', 'if false {'),
             'lost DISCONNECT refund': program.replace('send_frame(bootstrap, proto::Opcode::Disconnect, bind.generation, &payload)', 'true'),
             'lost publication token during removal': program.replace('self.tokens[index] = self.tokens[self.count];', ''),
             'lost connection scope': program.replace('self.scopes[self.count] = scope;', 'self.scopes[self.count] = proto::Scope::Whole;'),

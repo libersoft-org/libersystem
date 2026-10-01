@@ -625,8 +625,8 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// HID OVER I2C AND A TYPE-C PORT CONTROLLER: child bindings, whose every byte crosses their controller's scoped
 			// connection.
 			"i2c_hid" | "tcpci" => DmaPolicy::None,
-			// THE ACPI POWER SOURCES: every value is a method's result on the node channel.
-			"acpi_power" => DmaPolicy::None,
+			// THE ACPI POWER SOURCES AND THE FAN: every value is a method's result on the node channel.
+			"acpi_power" | "acpi_fan" => DmaPolicy::None,
 			// THE ACPI BUTTONS, THE LID AND THE TIME AND ALARM DEVICE: `Notify` values and methods on the node channel.
 			"acpi_button" | "acpi_tad" => DmaPolicy::None,
 			// THE SLEEP GATE'S FIXTURE: shared memory through its BAR, and nothing mastered.

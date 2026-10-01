@@ -184,6 +184,7 @@ fn enqueue_on(cpu: usize, thread: Arc<Thread>) {
 // The same placement WITHOUT the wake, for the remote-spawn test's control alone.
 #[cfg(test)]
 fn enqueue_on_unwoken(cpu: usize, thread: Arc<Thread>) {
+	// ALLOC-OK: the intrusive `RunQueue` moves pointers - the link lives in the `Thread`.
 	cpu_sched(cpu).inner.lock().run_queue.push_back(thread);
 }
 
@@ -338,6 +339,7 @@ static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
 // The kernel's own page-table root - what an S3 entry runs on, since every other root lacks the identity map it
 // reinstates.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn kernel_cr3() -> u64 {
 	KERNEL_CR3.load(Ordering::Acquire)
 }
@@ -556,7 +558,7 @@ pub fn start_thread_on(cpu: usize, thread: &Arc<Thread>) -> bool {
 // HOLD core `cpu`'s scheduler lock until `release` is raised, answering TLB shootdowns meanwhile as any
 // spin with interrupts masked must. For the test that proves a port range's revocation round needs no
 // lock of the core it revokes on: its service step reads only that core's own record.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn hold_run_queue_lock(cpu: usize, held: &core::sync::atomic::AtomicBool, release: &core::sync::atomic::AtomicBool) {
 	let guard = cpu_sched(cpu).inner.lock();
 	held.store(true, Ordering::Release);
@@ -1268,6 +1270,12 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 				arch::sleep::run_pending();
 				continue;
 			}
+			// INJECTED IDLE on this core, with the deadlines still checked at each wake.
+			if let Some(until) = injecting(cpu) {
+				crate::idle::halt(Some(until), || false);
+				check_deadlines();
+				continue;
+			}
 			reschedule(Disposition::Requeue);
 		}
 		// Wake anything already past its deadline - a periodic wait does not count as
@@ -1346,6 +1354,10 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 // deadline expiry is still a refinement, and the timer tick preempts without consulting it.
 pub fn cpu_idle_loop() -> ! {
 	loop {
+		// INJECTED IDLE: halted until it ends, whatever is runnable.
+		while let Some(until) = injecting(current_cpu_id()) {
+			crate::idle::halt(Some(until), || false);
+		}
 		reschedule(Disposition::Requeue);
 		// A THREAD THAT EXITED HERE IS DROPPED NOW, not at this core's next reschedule: that used to be at
 		// most a tick away, and an idle core with no tick may not reschedule again for a long time - holding
@@ -1474,13 +1486,36 @@ pub fn on_timer_preempt(from_user: bool) {
 			return;
 		}
 	}
+	// A BUSY CORE'S TICK is one of the performance governor's points, and where the idle its thermal limit injects is
+	// taken from.
+	let cpu = current_cpu_id();
+	let inject = crate::processor::on_tick(cpu) && {
+		let ticks = crate::processor::take_injection(cpu);
+		if ticks > 0 {
+			INJECT_UNTIL[cpu].store(arch::apic::ticks().saturating_add(ticks), Ordering::Release);
+		}
+		ticks > 0
+	};
 	{
 		let inner = sched.inner.lock();
-		if inner.current.is_none() || inner.run_queue.is_empty() {
+		// A SOLE THREAD KEEPS ITS CORE - but not the boot core while a request waits for that core's idle context, which
+		// a thread that never blocks would otherwise hold off for as long as it runs (see `reschedule_as`), and not a
+		// core owing injected idle.
+		let owed = cpu == 0 && arch::sleep::s3_pending();
+		if inner.current.is_none() || (inner.run_queue.is_empty() && !owed && !inject) {
 			return;
 		}
 	}
 	reschedule_as(Disposition::Requeue, perfbuf::LEFT_PREEMPTED);
+}
+
+// THE IDLE A CORE OWES ITS THERMAL LIMIT: until this tick it halts whatever is runnable. Zero: none.
+static INJECT_UNTIL: [AtomicU64; crate::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+// The tick core `cpu`'s injected idle ends at, while it is injecting.
+pub fn injecting(cpu: usize) -> Option<u64> {
+	let until = INJECT_UNTIL[cpu].load(Ordering::Acquire);
+	(until != 0 && until > arch::apic::ticks()).then_some(until)
 }
 
 // Load `want_cr3` into CR3 unless it is already active. All kernel code and
@@ -1543,7 +1578,10 @@ fn reschedule_as(disp: Disposition, why: u8) {
 	// reaching it, and nothing freezes a service before a restore. The thread is requeued, and runs again once the
 	// request has been answered.
 	let boot_core_owed = current_cpu_id() == 0 && arch::sleep::s3_pending();
-	if matches!(disp, Disposition::Requeue) && guard.current.is_some() && (sched.drain_expired() || boot_core_owed) {
+	// AND SO DOES THE IDLE THE PROCESSOR'S THERMAL LIMIT INJECTS (`processor::take_injection`): the thread is requeued
+	// and the core halts until the injection ends.
+	let injecting = injecting(current_cpu_id()).is_some();
+	if matches!(disp, Disposition::Requeue) && guard.current.is_some() && (sched.drain_expired() || boot_core_owed || injecting) {
 		let prev = guard.current.take().expect("checked on the line above");
 		let old_sp = prev.kstack_ptr_addr();
 		prev.set_state(ThreadState::Ready);

@@ -93,6 +93,7 @@
 #             after DIR, so a lifecycle gate's instance never touches a person's and is never
 #             refused by its lock.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
+#   IDLE_FIXTURE=1    aarch64 and riscv64: the machine's tree given `/cpus/idle-states` (`fdt_edit.py idle-fixture`)
 #   I2C_FIXTURE=bus|hid|tcpc  I2C_SOCKET=  GPIO_SOCKET=
 #             attach QEMU's vhost-user I2C and GPIO controllers at their pinned slots, their device side
 #             the `vhost-i2c-gpio.py` listening on the two sockets, with the guest's RAM on a shared memfd
@@ -649,6 +650,14 @@ qemu_attach_virtio_net() {
 	fi
 	local net_user="user,id=$net_id"
 	[[ -n "$hostfwd" ]] && net_user="$net_user,$hostfwd"
+	# A GUEST KEPT OFF THE OUTSIDE NETWORK, when a test needs a machine that reaches nothing beyond the host's user-mode
+	# stack: `NET_RESTRICT=1` makes it `restrict=on` - DHCP and the forwarded port still work, and no packet the guest sends
+	# leaves for the outside, DNS included. The sleep gate's TAD boot uses it, so TimeService's SNTP cannot replace the
+	# wall clock the TAD's clock gives.
+	if [[ "${NET_RESTRICT:-}" == 1 ]]; then
+		net_user="$net_user,restrict=on"
+		echo "qemu-run: user-mode networking is restricted - the guest reaches nothing outside (NET_RESTRICT=1)" >&2
+	fi
 	# A CONTROLLABLE PEER INSTEAD OF SLIRP, when one is asked for.
 	#
 	# User-mode networking is convenient and is not an oracle: it answers what it likes, it will not
@@ -1019,6 +1028,32 @@ i2c_hid_dtb_args() {
 	}
 	python3 "$HERE/fdt_edit.py" "$I2C_FIXTURE-fixture" "$dumped" "$edited" --i2c-slot 0x15 --gpio-slot 0x16 || {
 		echo "qemu-run: the $I2C_FIXTURE fixture's nodes could not be added to the device tree" >&2
+		exit 1
+	}
+	printf -- '-dtb\n%s\n' "$edited"
+}
+
+# THE IDLE STATES QEMU'S TREES DO NOT CARRY, when a run asks for them with `IDLE_FIXTURE=1` on aarch64 or riscv64: the
+# machine's tree dumped, given `/cpus/idle-states` - two retention states the firmware runs and one that loses the core's
+# context - and every cpu node's `cpu-idle-states` (`fdt_edit.py idle-fixture`), and handed back with `-dtb`. One edited
+# tree per run, as above.
+idle_dtb_args() {
+	local qemu="$1" binding="$2"
+	shift 2
+	[[ "${IDLE_FIXTURE:-0}" == "1" ]] || return 0
+	if [[ "${DMA_DTB_NODE:-0}" == "1" || "${I2C_FIXTURE:-}" == "hid" || "${I2C_FIXTURE:-}" == "tcpc" ]]; then
+		echo "qemu-run: IDLE_FIXTURE=1 and another fixture each hand the guest an edited tree - one run asks for one" >&2
+		exit 1
+	fi
+	local dumped edited
+	dumped="$(mktemp "$QEMU_BUILD_DIR/idle-XXXXXX.dtb")"
+	edited="${dumped%.dtb}.idle.dtb"
+	"$qemu" "$@" -machine "$MACHINE_FOR_DUMP,dumpdtb=$dumped" -display none >/dev/null 2>&1 || {
+		echo "qemu-run: the machine's device tree could not be dumped for the idle-state fixture" >&2
+		exit 1
+	}
+	python3 "$HERE/fdt_edit.py" idle-fixture "$dumped" "$edited" --binding "$binding" || {
+		echo "qemu-run: the idle states could not be added to the device tree" >&2
 		exit 1
 	}
 	printf -- '-dtb\n%s\n' "$edited"
@@ -2323,6 +2358,17 @@ qemu_run_x86_64() {
 		exit 1
 		;;
 	esac
+	# THE INVARIANT TSC, where a run asks for it (`INVTSC=on`): QEMU leaves it out of `-cpu host` as unmigratable and TCG
+	# never offers it, and an idle state deeper than C1 needs it, the clock being the counter. A host whose KVM cannot give
+	# it drops the flag with a warning, and the guest's CPUID says so.
+	case "${INVTSC:-off}" in
+	off) ;;
+	on) cpu_args[${#cpu_args[@]} - 1]+=",+invtsc" ;;
+	*)
+		echo "qemu-run: INVTSC is on or off, got '${INVTSC}'" >&2
+		exit 1
+		;;
+	esac
 	qemu_args+=("${cpu_args[@]}" -smp "$smp")
 
 	qemu_append_debug_args qemu_args
@@ -2758,6 +2804,9 @@ qemu_run_aarch64() {
 		local -a hid_tree=()
 		mapfile -t hid_tree < <(i2c_hid_dtb_args qemu-system-aarch64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
 		independent+=("${hid_tree[@]}")
+		local -a idle_tree=()
+		mapfile -t idle_tree < <(idle_dtb_args qemu-system-aarch64 arm "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		independent+=("${idle_tree[@]}")
 		harness_hold
 		vsock_echo_start
 		exec "$qemu_bin" \
@@ -3131,6 +3180,9 @@ qemu_run_riscv64() {
 		local -a hid_tree=()
 		mapfile -t hid_tree < <(i2c_hid_dtb_args qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
 		independent+=("${hid_tree[@]}")
+		local -a idle_tree=()
+		mapfile -t idle_tree < <(idle_dtb_args qemu-system-riscv64 riscv "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		independent+=("${idle_tree[@]}")
 		harness_hold
 		vsock_echo_start
 		exec "$qemu_bin" \

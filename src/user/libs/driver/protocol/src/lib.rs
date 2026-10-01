@@ -533,6 +533,11 @@ pub mod provider {
 	/// A PLATFORM SWITCH - a lid - the `liber:device@1` `platform-switch` contract: its state and every change, which
 	/// the power-state service alone consumes for its sleep policy.
 	pub const PLATFORM_SWITCH: u16 = 28;
+	/// A THERMAL ZONE'S COOLING HALF, the `liber:power@1` `thermal-zone` contract, which ProcessorPowerService alone
+	/// consumes.
+	pub const THERMAL_ZONE: u16 = 29;
+	/// A FAN, the `liber:power@1` `cooling-device` contract, which ProcessorPowerService alone consumes and commands.
+	pub const COOLING_DEVICE: u16 = 30;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

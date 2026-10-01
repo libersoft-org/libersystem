@@ -264,3 +264,275 @@ A KEY WAKE FROM S3 WAS CHECKED, NOT ASSUMED: with the guest in S3, a key through
 Runs so far: boot 1's suspend-to-idle case PASS (count 131 -> 132: monotonic +581 ms, boot-time +5498 ms; a 20 s Timer
 fired after 19994 ms awake and 24911 ms since boot; 64 cores parked, none woke for anything else; 4959 ms measured
 between the kernel's lines for a 5 s wake); the rest in progress.
+
+## Part c and d in the guest: faults the gates found (2026-09-30)
+
+- POWERSERVICE NEVER STARTED since its sleep roles were added: `supervisor_role` handed it the `SLEEP`, `SHUTDOWN` and
+  `SYSPOWER` clients with every right the minted channel carries, and `rt::receive_roles` refuses a client role above
+  its ceiling (`TooManyRights`), so the service failed its bootstrap - and with it every grant resolved from its roots:
+  `typeccheck` could not be launched ("the launcher refused the component") in both Type-C gates. The three are now
+  narrowed to the client ceiling (send, receive, wait, transfer) in `service_manager.rs` (`client_end`), at the role
+  only - a connection minted for a resolved GRANT keeps its rights, because PermissionManager narrows it again for the
+  component it grants it to. Evidence: `ServiceManager: power_service: FAILED to start` in the UCSI gate's serial log
+  before; the UCSI gate's `typeccheck list` and every later case passing after.
+- THE DISPLAY STAYED FROZEN AFTER AN S3 (the display driver torn down and bound again): the console followed a new
+  configuration only on a Configure EVENT, and DisplayService drops an event a full stream cannot take; the S3 resume
+  rebinding every driver prints a burst the console presents while the display provider is adopted again, the
+  Configure was dropped, and every acquire after it answered `out-of-date` - which the contract says the client
+  rebuilds on, and the console ignored. `console_service.rs`: an acquire answering `out-of-date` sets the presenter's
+  flag, and the loop follows the configuration (`follow_configuration`, shared with the event's path) before its next
+  wait. Evidence: check-sleep's idle, RAM and RTC cases each "a frame presented" after the fix.
+- A KILLED THREAD IN A WAIT SET LEAKED EVERY MEMBER: `sys_waitset_wait` called `sched::exit()` with the set's `Arc` held
+  in its frame, and `exit` never unwinds - so a StorageService killed at a reboot left its channels open and its peers
+  never saw it go ("left behind"). `syscall/mod.rs`: the set is dropped before the exit. Kernel test
+  `kernel.test_suites...a_thread_killed_in_a_wait_set_lets_go_of_every_member` (`test_suites/kernel.rs`): failed at
+  its peer-closed assertion without the fix, passes with it.
+- THE HARNESS'S GPIO BACKEND CRASHED ACROSS AN S3: after `GET_VRING_BASE` stopped the event queue, `vhost-i2c-gpio.py`
+  still held its buffers and answered a raise into them. `GpioModel.ring_stopped` drops what the stopped queue held;
+  self-test `test_a_stopped_event_queue_drops_its_held_buffers_and_a_raise_then_fires_nothing`.
+- THE PLATFORM PHASE'S NEEDLES: `seen` matched a basic regular expression, so every identity with a backslash
+  (`acpi:\_SB_.LID0`) could never match, and the sleep button's needle named `SLPB_:` where the driver says `SLPB:`.
+  `seen` is a fixed-string match now.
+- A CTRL+Z THAT STOPPED NOTHING: the stopped-job case typed `sleepcheck count 60` without `&`, and a governed tool run
+  in the foreground through PermissionManager (`run_tool`) is no job the shell tracks - the terminal is never handed it
+  (`SET_FG`), so Ctrl+Z reached no one and the counter ran on. The case now starts the job with `&`, brings it to the
+  foreground with `fg`, and waits for the terminal's `^Z` before the sleep.
+- THE SSIF BMC WAS RESUMED BEFORE ITS SMBUS CONTROLLER (the IPMI gate's sleep case: "ipmi (platform device 39) did
+  not answer the resume within its bound"): DeviceManager orders a binding whose ENTRY declares `watchdog` last at the
+  suspend and first at the resume, and the `ipmi` entry declares it for every form - so the SSIF child, which publishes
+  none, was resumed ahead of the controller its transactions go through. `service_logic::sleep_order`: the watchdog's
+  place is a leaf's - a publisher that consumes no provider; one that consumes is ordered by its depth. Host test
+  `a_watchdog_publisher_that_consumes_a_controller_goes_before_it_and_comes_back_after_it`: failed against the old
+  order, passes with the new.
+- THE ACPI GATE'S SERIAL-BUS FIELD AFTER THE SERVICE'S RESTART ("a GenericSerialBus field names a connection this
+  instance was not granted"): DeviceManager acts on the kernel's "namespace loaded" report before ServiceManager hands it
+  the new instance's admin connection, so the grant went out on the ended instance's connection; the generated client
+  answers a call that never reached a live server `again` (or `commit-uncertain`), which the grant took for a refusal
+  and marked done - never made again. `grant_acpi_connections`: those two answers are a lost instance's, the grant is
+  given up and made whole again on the hand-off.
+
+## Part e - hibernation (x86_64 implemented; the ports owe their `arch::sleep` half)
+
+THE OWNER'S QUESTION, asked and still open: whether a passphrase typed at resume is offered where TpmService cannot
+seal. Nothing here offers one; a machine without a sealing TPM reports hibernation "not set up" and is refused.
+
+- ABI (`src/abi/src/lib.rs`): `SYS_SNAPSHOT_INFO = 116`, `SYS_SNAPSHOT_READ = 117`, `SYS_SNAPSHOT_RELEASE = 118`,
+  `SYS_RESTORE_BEGIN = 119`, `SYS_RESTORE_WRITE = 120`, `SYS_RESTORE_COMMIT = 121`, `SYS_SYSTEM_FINGERPRINT = 122`;
+  `SNAPSHOT_BATCH` (256 pages a call), `SNAPSHOT_CONTEXT` (64 bytes), `SnapshotInfo`, `SystemFingerprint`;
+  `SLEEP_STATE_DISK_ENTER`, `WAKE_SNAPSHOT`, `WAKE_RESTORED`. Every call needs the new `Hibernation` privilege
+  (`object/privilege.rs`), which ServiceManager hands to the image component alone.
+- THE SNAPSHOT (`kernel/sleep/disk.rs`, new): `prepare` counts every page in use - the pool's frames that are not
+  free and the whole of the loader's, the kernel's and the firmware's ACPI tables and NVS, never reserved, device or
+  framebuffer memory - and allocates the copies, their list pages and the bitmap of frames the copy skips BEFORE the
+  copy, refusing with `ERR_RESOURCE_EXHAUSTED` when free memory cannot hold them; `copy_now` runs with every other core
+  held and interrupts off, takes no lock and allocates nothing; `taken`, `info`, `read` and `release`. The copies and
+  the bitmap are skipped; the list pages are copied, because the restored machine gives the copies back by reading
+  them. The system image's digest (`digest_of`: the kernel's code and read-only data between two new linker symbols,
+  each module's name and bytes in order, and the development variant) and the hardware's (the memory map by class,
+  the core count and every PCI function with its identity), computed by `fingerprint`.
+- THE ENTRY (`arch/x86_64/hibernate.rs`, new; `arch/x86_64/sleep.rs`): the snapshot is S3's entry up to the last step
+  - the same save (`s3_save_and_enter`) with `disk::copy_now` in place of SLP_EN - and returns twice: `WAKE_SNAPSHOT`
+  directly, `WAKE_RESTORED` through `s3_resume_entry` in a restored machine, which resumes as after an S3 and stirs the
+  random pool (`entropy::stir`, credited nothing) so nothing drawn after the copy is drawn again. `enter_disk` writes
+  the registered `\_S4` and powers off where none is registered, naming the path it took.
+- THE RESTORE (`disk::begin`, `write`, `abandon`, `commit`; `hibernate::replace_memory`): the image's frames are read
+  twice and held to the first reading, each a page of RAM of an image's class named once; every page is held in a
+  frame outside the image, the list pages too, and a frame the allocator answers that is a target is set aside. The
+  replacement runs on the boot core's idle context: every other core sent INIT, the loader's identity map reinstated,
+  a trampoline in a safe frame with page tables of its own (an identity map of all RAM in 2 MiB pages) copies every
+  page to its frame with global pages off, loads the image's tables and jumps to its `s3_resume_entry` on its resume
+  stack. The resume context (`hibernate::context`: magic, the kernel's page tables, the entry, the resume stack, the
+  direct map, the top of RAM, the kernel image's address) is checked before a restore begins.
+- THE BOOT CORE'S IDLE CONTEXT, REACHED UNDER LOAD (`sched/mod.rs`): a request waiting for it - an S3, the snapshot,
+  the replacement - used to wait until the boot core settled, and a thread that never blocks kept it from ever
+  settling: after `stop-all` the development agent spun on its closed stream, and the replacement never ran. The tick
+  now sends even a sole thread off the boot core while a request waits (`on_timer_preempt`, `reschedule_as`), and
+  `run_until_idle_bounded` runs the request between two threads' turns. The agent (`dev_agent.rs`) and the console
+  (`console_service.rs`) now end an attachment whose stream closed with nothing queued, which they waited on for ever.
+- THE IMAGE (`service_logic::hibernation`, `cmac`): a 4 KiB header (magic, version, state, the sealed key-encryption
+  key, the image key wrapped under it, the page count, the time, the system and hardware digests and the context,
+  authenticated with AES-CMAC under a key derived from the KEK) and 1 MiB chunks, each a head of frame numbers and a
+  CMAC tag over the index, the frames and the ciphertext, the pages AES-128-CTR under the image key. `Refusal` names
+  each way an image is refused. The KEK is 32 bytes, sealed through TpmService to PCR 4. `service-logic` is optimized in
+  the services' development profile, because the image is encrypted and authenticated page by page.
+- THE SPACE: a GPT partition of the LiberSystem hibernation type (`4C424653-0002-4000-8000-4C6962657246`,
+  `partition::HIBERNATION_TYPE_GUID`, `find_partition`, `holds_hibernation_image`). StorageService's system instance
+  finds it on the system disk at mount (`find_area`) and serves `liber:storage@1/hibernation-area` - describe, read,
+  write, flush and the verdict - to the image component alone; area writes are not filesystem writes and are never
+  held. An image header found at mount HOLDS every write to the system volume until the verdict (`image_hold`). WHERE
+  IT IS SET UP: `image.sh --format img --hibernation MIB` (`mkimage.sh img KERNEL SIZE MIB`) adds the partition at the
+  end of an installed disk.
+- THE IMAGE COMPONENT (`services/core/src/hibernation_service.rs`, new; restart transparent, plan-relaunchable):
+  `status` (set up where the partition is at least as large as memory and TpmService's `info` says the TPM seals),
+  `write-image` (fresh keys, the KEK sealed, every chunk read from the kernel, sealed and written, the header last and
+  flushed, the snapshot given back), `discard-image`; at every start, the image found at mount restored - frames first,
+  `restore_begin`, every chunk authenticated, decrypted and held to the frames the first pass read, the header
+  invalidated, the restore's door asked to stop every binding, memory replaced - or refused, invalidated, and the boot
+  let go on.
+- THE TRANSACTION (`sleep_transaction`, ServiceManager `sleep.rs`, `restore.rs`; SystemManager; DeviceManager): a
+  hibernation runs as a suspend up to the entry, which takes the snapshot; then `ImageDrivers` (DeviceManager's
+  `resume-for-image`: every suspended binding publishing `block` or `tpm`; one that does not come back is bound again
+  after the sleep, as any, and the write finds out whether the image's disk came back), `ImageWrite`, `DiskOff`
+  (SystemManager's `off-hibernated`) - or, hybrid, `ImageSuspend` and `RamEnter`. An image written owes its `Discard`,
+  run after the drivers are back and before the held writes go. The drivers suspend for what the machine enters: a
+  hybrid sleep's for S3. The TPM driver sends nothing for hibernation - its next start is a boot - so the TPM stays
+  usable for the seal after the snapshot. THE BRING-UP WAITS FOR THE VERDICT: until the image component starts only its
+  dependencies start, and then ServiceManager serves the restore's door (`prepare-replacement`, DeviceManager's
+  `stop-all`; `boot-continues`, LogService's journal handed over) until the verdict, bounded at fifteen minutes.
+- `sleepctl hibernate [hybrid]`; `sleepctl status` says whether hibernation is set up and what became of the image found
+  at this boot; PowerService's critical battery hibernates where it is set up and powers off in order where not.
+- THE GATE `check-hibernate.sh` (registered in `check.sh`, the verification model's catalog and `release-required`):
+  a GPT system disk with the paired volume and a hibernation partition, swtpm behind CRB, a held QMP connection for
+  `SUSPEND_DISK`; the restore with the counter going on; the boot after; S4 not offered; a modified image, another
+  system image (the development variant) and another machine (another core count) refused; hybrid both ways; no TPM.
+- Kernel tests (`sleep/disk/tests.rs`, new): `a_snapshot_holds_every_page_in_use_as_it_was_at_the_copy_and_gives_every_frame_back`,
+  `a_restore_refuses_a_foreign_context_and_frames_that_are_not_ram_or_named_twice`,
+  `a_restore_keeps_every_frame_it_takes_off_the_frames_the_image_goes_to`,
+  `the_system_digest_covers_the_kernel_and_every_module_by_name_bytes_and_order`: `TEST_SELECTION=<the four> ./test.sh
+  --arch x86_64` -> PASS, 4 passed (37 s), after the list-page change too. EACH WATCHED FAILING against a mutation of
+  its own, one run each: nothing copied (tests.rs:65, the page as it was at the copy), a frame named twice admitted
+  (:94), a target handed out as a holding frame (:144), the modules' names left out of the digest (:167).
+
+## Part e - the hibernation gate, run to the end (2026-10-01)
+
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate hibernate` (run 13, after the scheduler, agent, console, list-page, bootproto
+  and harness fixes above) -> PASS, ten boots: "an image written and entered S4 (SUSPEND_DISK), restored with the counter
+  going on; the boot after found none; powered off where S4 is not offered; a modified image, another system image and
+  another machine each refused with the header invalidated; hybrid discarded on the S3 resume and restored after the
+  power was lost; not set up without a TPM". The restore's own line: "count 79 then 80: monotonic +3035 ms, boot-time
+  +197035 ms" - the monotonic clock excludes the time the machine was off, the boot-time clock includes it.
+- AFTER IT, THE GATES THE HIBERNATION WORK TOUCHED, one guest at a time: `sleep` FAILED (exit 1, 866 s) - every case of
+  the first boot passed (suspend to idle, S3 by `system_wakeup` and by the RTC alarm, the hot-plug after S3, the stopped
+  job, the refusing fixture, the shutdown typed during a held sleep), and the PLATFORM boot (the fixture's sleep
+  devices, the CMOS RTC named absent, no TPM) never reached its shell: its serial log stops at "AcpiService: online -
+  instance 1, 2 table(s), 43 node(s) reported", with no "DeviceManager: the ACPI service's admin connection arrived"
+  after it. Under investigation; not claimed.
+
+## Faults found after the hibernation gate, and fixed (2026-10-01)
+
+- THE PLATFORM BOOT'S STALL WAS A DEADLOCK, reproduced alone (`.build`-independent script: the sleep fixture SSDT,
+  the TAD's clock running, `-global ICH9-LPC.disable_s3=0`; with and without the CMOS RTC, with and without swtpm - all
+  stalled; the plain ACPI fixture without the sleep devices booted). QMP showed every vCPU halted - no thread runnable,
+  so processes waiting on each other. DeviceManager, binding the control-method buttons (`acpi_button`, bound when the
+  ACPI service reports the fixture's rows), minted each driver's `system-sleep` connection with a blocking `CONNECT` on
+  the door ServiceManager handed it - and ServiceManager answers that door from its standing loop only, while during
+  its bring-up it was itself waiting on DeviceManager (the next services' catalogue connections). FIXED: ServiceManager
+  mints a few `system-sleep` connections ahead into a channel of their own, DeviceManager's new LAST role `SLEEPPOOL`
+  (`service_manager/bootstrap.rs`, `sleep::BUTTON_POOL` = 4); DeviceManager takes one per button bound
+  (`button_sleep_connection`) and asks the door only once they are gone, by when the bring-up is over. The repro then
+  reached its shell.
+- SYSTEMMANAGER'S POWER CONNECTIONS RAN OUT ("every power connection is taken; this caller gets none"), which failed the
+  zone's binding: the control-method buttons, each thermal zone's driver and both policies now hold one.
+  `MAX_POWER_CLIENTS` 8 -> 16 (`system_manager/src/main.rs`).
+- THE CONSOLE'S UART ACROSS S3: `uart16550`'s comment promised that its resume reprograms the UART, and the driver took
+  the common step instead - which, for a sleep that loses power, rebinds the driver: the kernel console changed hands
+  twice per S3, the old instance faulted on its revoked ports ("ring-3 general protection fault ... koid=986"), and the
+  serial mirror dropped output - which is how `ipmi`'s S3 case lost the KCS "the BMC answers again" line and failed.
+  FIXED: the driver takes the sleep itself (`console::Sleep`: the tap drained and the UART quiet at the suspend, the UART
+  programmed again whole at the resume).
+- `abi`'s HOST SUITE WAS RED: syscalls 109 to 122 (this milestone's and P02M0200's), `POWER_OFF_WITHIN`, and the layouts
+  of `CorePark`, `SleepReport`, `SnapshotInfo` and `SystemFingerprint` were never frozen in its snapshot. Frozen now,
+  with the sleep states, the wakes and the processor tables' codes as families; `SnapshotInfo` gained `Default`.
+  `driver-protocol`'s closed-set test named 13 (`SysSleep`) unknown: updated to the two kinds added (13 and 14).
+
+## The console across a sleep, the static gates, and the ports' entry (2026-10-01)
+
+- THE CONSOLE STOPPED ANSWERING AFTER EVERY WAKE. The gate batch of 2026-10-01 (after the fixes above): `sleep` failed
+  at "idle: a line typed at the serial console was not answered after the wake (waited 20 s ...)", every suspend-to-idle
+  check before it passing; `hibernate` wrote and entered its image, and the restore boot's serial log ends with
+  "ServiceManager: sleep: the transaction ended - slept and woke", the drivers bound again, and no prompt ("lab: no
+  shell prompt within 900 s"). CAUSE: `uart16550`'s serve loop called `session.reset()` after every sleep step it took
+  itself (`console::Sleep`, added the same day), and `serial_port::Attachment::reset` closes the receive stream's
+  producer and the end it granted - so ConsoleService's stream of typed input ended at every wake, though its
+  connection and the driver lived on. FIXED (`src/user/drivers/core/src/uart16550.rs`): the session is kept across the
+  step - the consumer's connection and its stream outlive the sleep; a new `CONNECT` or a closed consumer still resets
+  it, as before. No other driver taking its own sleep resets a consumer after the step (checked: `dev_channel`,
+  `watchdog`, `ucsi_acpi` and `ipmi_driver` close only on their failure arms).
+- `source-hygiene`: `kernel/sleep/disk.rs` beside `disk/tests.rs` - moved to `disk/mod.rs` (a plain move).
+- `kernel-allocations`: the snapshot's digests allocate nothing (`bootproto::sha256::Sha256`, streaming, fed the parts'
+  digests in turn; `arch::sleep::development_variant` fills a 64-byte buffer) and the restore's list and directory
+  frames are reserved before they are taken - with the rest of this goal's allocation fixes, recorded in P02M0198's
+  audit ("The static gates over this goal's changes").
+- THE GATES' OWN FAULT: `launch ... | grep -q` under `pipefail` fails a launch that printed after grep stopped reading.
+  `check-sleep.sh` and `check-hibernate.sh` (and `check-ipmi.sh`, `check-typec-tcpci.sh`, `check-typec-ucsi.sh`) keep
+  the output and search it after.
+
+THE PORTS' ENTRY (`src/kernel/arch/aarch64/sleep.rs` and `src/kernel/arch/riscv64/sleep.rs`, new - the `arch::sleep`
+half part b left owed on the ports):
+
+- SUSPEND TO IDLE is the ports' entry: the portable entry parks every core with the timed wake as the only timer, and
+  the port masks every claimed line (`interrupts::mask_claimed_lines`: the GIC distributor's enable on aarch64, the
+  APLIC source on riscv64 - the port's only wired-line controller, delivering to the IMSIC) and every MSI-X entry the
+  kernel programmed (`mask_msi_entries`, by the entry address each slot recorded at programming - `SLOT_TABLE`) but
+  the wake set's, and puts back exactly what it masked.
+  The serial window (`serial::sleep_begin`, `sleep_wake`, `sleep_end`): transmit is synchronous on both ports, so
+  nothing is drained; after a sleep that lost the settings the UART is programmed again.
+- WHAT THE FIRMWARE OFFERS IS SAID AT BOOT, checked rather than assumed: PSCI's SYSTEM_SUSPEND through
+  `PSCI_FEATURES` (`psci::system_suspend_offered`), the SBI's System Suspend extension through the SBI's probe
+  (`sbi_probe_extension(0x53555350)`). SUSPEND TO RAM AND HIBERNATION ARE NOT OFFERED ON THE PORTS
+  (`offers_ram`/`offers_disk` false, `SYS_SLEEP_STATES` names neither, a request is `ERR_UNSUPPORTED`): both need a
+  resume path for a machine whose cores lost their context - the warm-boot entry PSCI and the SBI jump to, and for
+  hibernation the image's kernel resumed on a core a fresh boot handed over - which neither port has. Neither QEMU
+  firmware here offers system suspend anyway (QEMU's TCG PSCI has no SYSTEM_SUSPEND; OpenSBI offers SUSP only with
+  its `system-suspend-test` or an RPMI platform), so the gate could not show one.
+- `check-tickless-idle.py` gains the ports' suspend-to-idle stage: `sleepctl suspend idle` with the timed wake, the
+  serial line's timing as the host's oracle (a 100 ms counter silent between `sleep: entered` and `sleep: resumed`,
+  that interval at least the wake less a margin, the monotonic clock moved by less than the sleep and the boot-time
+  clock by at least it) and the parking from `sleepctl last` (no core woke for a device, cpu0 at most once for the
+  timer, every other core at most once, for the IPI that ends its park).
+
+OPEN, FOR THE OWNER: suspend to RAM and hibernation on aarch64 and riscv64 - the per-core and per-machine resume path,
+and a firmware that offers system suspend to prove it on. Recorded as not done; the ports answer `ERR_UNSUPPORTED`.
+
+## The sleep gate's platform boot, run for the first time to its checks (2026-10-01)
+
+The platform boot (the fixture SSDT with the sleep devices, the CMOS RTC named absent) had never reached its checks:
+until the deadlock fix above it never reached its shell. Run from that boot onward (a scratch copy of the gate with
+boot 1 left out, so each round costs the platform boot alone; the gate itself unchanged in that respect), it found:
+
+- THE FIXTURE'S TAD READ NOTHING THE HARNESS WROTE: in `acpi-fixture.py`'s sleep field list `E.offset_to(TAD_GCP * 8)`
+  and `E.offset_to(TAD_GRT * 8)` named POSITIONS where `offset_to` is a reserved run - a LENGTH - so `TGCP` sat at
+  0x86 instead of 0x44 and `TGRT` at 0xA2 instead of 0x60 (and `STVN` over FAN1's call count). `_GCP` read 0 and the
+  driver said "has no clock, " with no wake timers. Shown on the host first: the fixture SSDT run through the
+  interpreter (`aml` with `testing`, a stub DSDT, the fixture's pages behind BAR2) answered `_GCP` 0 and `_GRT` sixteen
+  zero bytes; after the fix 7 and the clock's bytes. FIXED: the two runs are the distances from the unit before. AND A
+  REGRESSION FOR EVERY UNIT: `acpi-fixture.py --self-test` (the `firmware-fixtures` gate) decodes every `HPGS` field
+  list of the plain, sleep and processor tables (`page_units`) and holds each named unit to the byte offset the host's
+  readers and writers use (`PAGE_UNITS`) - 129 units in place; WATCHED FAILING with the old run restored: 21
+  misplacements reported (seven units in each of the three tables).
+- THE WALL CLOCK WAS THE NTP SERVER'S, NOT THE TAD'S: TimeService disciplines its offset by SNTP where the network
+  reaches a server, and this machine's does - so `date` read the host's time though the kernel answered the TAD's.
+  `qemu-run.sh` gains `NET_RESTRICT=1` (user-mode networking `restrict=on`: DHCP and the forwarded port still work,
+  nothing leaves for the outside), which the gate's fixture boots export.
+- A FILE ON THE LIVE SYSTEM VOLUME CARRIES NO TIME: a development ISO runs the system from `libermemfs`, which by
+  design stamps nothing (`MemFs` has no `set_clock`), and the FAT backend's listing reports no times either - checked
+  on a plain development instance with the CMOS RTC: a file written to `vol://system` and to `vol://usb` both list
+  `-`. The TAD check now writes its file to the run's USB stick (FAT32, stamped from `clock_rtc()` by StorageService)
+  and reads the entry's date and minute on the host from the stick's private copy (`mdir`), within two minutes of the
+  host's time plus the TAD's offset - an oracle outside the guest; a probe on the plain instance showed the entry
+  stamped with the kernel's time to the minute.
+- THE THIRD S3 OF A BOOT LEFT EVERY REBOUND DEVICE FAILED: a driver that sets its device up again only by a bind
+  answers `RESUMED` "not back" after an S3 (virtio-net, -console, -scsi, -gpu, -snd, xhci, nvme, ahci, sdhci, hda, the
+  `acpi-power` zone and battery, the fixture), and DeviceManager tore it down as a crash and bound it again - spending
+  one of the node's three automatic attempts per boot each time. On the platform boot's third S3 (the lid's, the TAD's
+  timed one, the fan's) every one of them reached "attempt 3" and "the node is failed": the network gone for the boot,
+  and the zone's publication withdrawn, so ProcessorPowerService set FAN1 to 0 and the fan's check read 0, not 60.
+  FIXED (`driver_binding::budget_for_a_sleep_rebind`, called from DeviceManager's `Resumed { back: false }` arm): the
+  rebind a sleep caused is given the attempt it spends back first - an attempt that then fails spends as any other, and
+  an operator's one attempt is left as it is. Host test
+  `a_device_lost_to_a_sleep_is_bound_again_however_many_sleeps_the_boot_has` (ten sleeps after a bring-up that spent
+  all three, every rebind admitted, the count unchanged; a failure after it charged), WATCHED FAILING with the refund
+  removed (`sleep 0's rebind was refused`), 93 `driver-binding` tests passing restored.
+- THE GATE'S OWN FAULTS: `await_end` read the transaction's last line past `baseline_lines`, a line count left by the
+  FIRST boot - the later boots truncate the log, so it named no line of theirs (in a run from the platform boot it was
+  unset); it now takes the last "the transaction ended" line, which the wait before it has seen arrive. And the fan's
+  needles named `acpi_fan` where DeviceManager says `acpi-fan`.
+- RUN SO FAR: the scratch copy (the gate from the platform boot onward, against this tree) PASSED whole on its seventh
+  round - the platform boot (the TAD's clock at boot, after the lid's S3 and after its own timed S3, each with a file
+  stamped with it; the power resources in each state; the TAD's timer at the sleep's 30 s; both fans across suspend to
+  idle and S3 with FAN1's cleared level applied again; the control-method sleep button; the relaunched policy's lid
+  suspend; the control-method power button through the registered `\_S5`), the critical battery (QEMU gone 10100 ms
+  after the 10 s deadline was armed, through the relaunched policy), the soft-off fallback through the fixed ports, and
+  the watchdog boot (a suspend to idle three times the i6300esb's timeout with the guest running throughout, and a
+  resume made to hang ending in the watchdog's expiry after 120 s). The gate itself, boot 1 included, is in the final
+  batch and is recorded when it ends.

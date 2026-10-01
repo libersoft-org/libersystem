@@ -22,6 +22,19 @@
 # And it says how often each idle core woke, per second, from the same records - the number the part is
 # for, which `docs/PERF.md` carries.
 #
+# ON aarch64 AND riscv64 THE TREE ALSO CARRIES IDLE STATES, which QEMU's own does not: the harness adds three
+# (`IDLE_FIXTURE=1`, `fdt_edit.py idle-fixture`) - two retention states the firmware takes as a wait and one that loses
+# the core's context. The kernel reads them itself at boot and installs every core's table; the gate reads the boot's
+# lines and the per-core records, and checks the retention states entered through the firmware over the idle sample -
+# PSCI's CPU_SUSPEND or the SBI's HART_SUSPEND, none refused - and the one that loses the context never.
+#
+# AND THE PORTS' SLEEP, which is suspend to idle (neither firmware here offers more - the kernel says what it found at
+# boot): `sleepctl suspend idle` with the timed wake, the host's oracle the serial line's timing as on x86_64 - a
+# counter printing every 100 ms SILENT between the kernel's `sleep: entered` and `sleep: resumed` lines, that interval
+# at least the wake less a margin, the counter's next value after with its monotonic clock moved by less than the sleep
+# and its boot-time clock by at least it - and the parking from the last sleep's record: no core woke for a device,
+# cpu0 at most once for the timer, every other core at most once, for the IPI that ends its park.
+#
 # ONE GUEST AT A TIME: each target is booted, driven and torn down before the next one boots.
 #
 # usage: check-tickless-idle.py [--no-build] [x86_64|aarch64|riscv64 ...]   (default: all three)
@@ -49,12 +62,29 @@ ECHO_BOUND = 1.0
 BURSTS = 3
 # How long the idle-rate sample runs.
 IDLE_SAMPLE = 10.0
+# The ports' suspend to idle: its timed wake, and how far the host's measurement of it may fall short.
+IDLE_WAKE_S = 5
+IDLE_MARGIN_MS = 300
+SLEEP_OFFERED = re.compile(rb'sleep: [^\r\n]* is (offered|not offered) by this firmware')
+COUNTER = re.compile(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)')
+PARKED = re.compile(r'cpu(\d+): woke (\d+) time\(s\) for the timer, (\d+) for an IPI, (\d+) for a device')
 
 ARMED = re.compile(rb'console: typed input raises interrupt (\d+)')
 POLLED = re.compile(rb'console: typed input is polled - ([^\r\n]*)')
-CORE_ROW = re.compile(r'\{cpu=(\d+), idle-ns=(\d+), halts=(\d+), wakes-timer=(\d+), wakes-ipi=(\d+), wakes-housekeeping=(\d+), wakes-device=(\d+), sources=\[([^\]]*)\]\}')
+# THE ROW'S WAKE FIELDS, which come first: the processor-power fields that follow them are not this gate's.
+CORE_ROW = re.compile(r'\{cpu=(\d+), idle-ns=(\d+), halts=(\d+), wakes-timer=(\d+), wakes-ipi=(\d+), wakes-housekeeping=(\d+), wakes-device=(\d+), sources=\[([^\]]*)\][,}]')
 SOURCE = re.compile(r'\{source=(\d+), count=(\d+)\}')
 ARRIVED = b'a device arrived in the slot behind'
+# THE TREE'S IDLE STATES, on the device-tree ports.
+TREE_TABLE = re.compile(rb"processor: core (\d+)'s idle table from the device tree - (\d+) state\(s\)")
+# THE STATE THAT LOSES THE CONTEXT is also `local-timer-stop`, as a power-down state is, and the timer is the reason checked first.
+TREE_LOST = re.compile(rb"processor: core (\d+)'s idle state (\d+) \((\d+) us out\) is not entered - it (?:stops the core's timer|loses the core's context)")
+FIRMWARE_REFUSED = re.compile(rb'processor: (PSCI refused CPU_SUSPEND|the SBI refused HART_SUSPEND)[^\r\n]*')
+CORE_STATES = re.compile(r'\{cpu=(\d+), idle-ns=\d+, [^\[]*sources=\[[^\]]*\], states=\[((?:\{[^}]*\}(?:, )?)*)\]')
+STATE = re.compile(r'\{entry=(\d+), unenterable=(\d+), exit-latency-us=(\d+), target-residency-us=(\d+), entries=(\d+), residency-ns=(\d+)\}')
+# The table each core installs from the fixture: the halt, then by wake latency - the retention state (20 + 40 us),
+# the one that loses the context (100 + 250 us), the deep retention state (500 + 1500 us).
+TREE_LATENCIES = [1, 60, 350, 2000]
 
 
 class GateError(Exception):
@@ -73,6 +103,8 @@ class Serial:
 		self.log = log
 		self.scale = scale
 		self.data = bytearray()
+		# (the length of `data` after a chunk, the host time it arrived) - what a line is timed by.
+		self.stamps = []
 
 	# Read what has arrived, waiting at most `wait` seconds for the first byte; whether anything came.
 	def pump(self, wait):
@@ -83,9 +115,26 @@ class Serial:
 		if not chunk:
 			raise GateError('the guest closed its serial line')
 		self.data += chunk
+		self.stamps.append((len(self.data), time.time()))
 		self.log.write(chunk)
 		self.log.flush()
 		return True
+
+	# EVERY LINE FROM `mark` ON, with the host time its last byte arrived.
+	def lines_since(self, mark):
+		out = []
+		start = mark
+		text = bytes(self.data)
+		for end, stamp in self.stamps:
+			if end <= mark:
+				continue
+			while True:
+				newline = text.find(b'\n', start, end)
+				if newline < 0:
+					break
+				out.append((stamp, lab.strip_ansi(text[start:newline]).decode(errors='replace')))
+				start = newline + 1
+		return out
 
 	def text_since(self, mark):
 		return lab.strip_ansi(bytes(self.data[mark:]))
@@ -144,6 +193,71 @@ def cores(serial, timeout):
 	if not rows:
 		raise GateError('`graph` printed no per-core idle record')
 	return rows
+
+
+def idle_states(serial, timeout):
+	output = serial.run('graph', timeout)
+	cores = {}
+	for match in CORE_STATES.finditer(output):
+		cores[int(match.group(1))] = [{'entry': int(m.group(1)), 'unenterable': int(m.group(2)), 'exit': int(m.group(3)), 'entries': int(m.group(5))} for m in STATE.finditer(match.group(2))]
+	if not cores:
+		raise GateError('`graph` printed no per-core idle state')
+	return cores
+
+
+def suspend_to_idle(target, serial, scale):
+	# WHAT THE FIRMWARE OFFERS, said at boot - checked, not assumed.
+	offered = SLEEP_OFFERED.search(bytes(serial.data))
+	if not offered:
+		raise GateError('the kernel never said what this firmware offers a sleep')
+	note(f'{target}: {lab.strip_ansi(offered.group(0)).decode(errors="replace")}')
+	mark = len(serial.data)
+	serial.type(b'sleepcheck count 30 &\n')
+	serial.wait_for(mark, lambda seen: b'sleepcheck: count 1 ' in seen, 60 * scale, 'the counter in the background')
+	serial.pump(2.0)
+	serial.type(f'sleepctl suspend idle {IDLE_WAKE_S}\n'.encode())
+	serial.wait_for(mark, lambda seen: b'ServiceManager: sleep: the transaction ended' in seen, 300 * scale, 'the suspend to idle')
+	serial.wait_for(mark, lambda seen: b'sleepcheck: count done' in seen, 120 * scale, 'the counter\'s end')
+	lines = serial.lines_since(mark)
+	entered = next((stamp for stamp, line in lines if 'sleep: entered (suspend to idle' in line), None)
+	resumed = next((stamp for stamp, line in lines if 'sleep: resumed (the timed wake' in line), None)
+	if entered is None or resumed is None:
+		raise GateError('suspend to idle: no `sleep: entered` or no `sleep: resumed` naming the timed wake')
+	slept = (resumed - entered) * 1000
+	if slept < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
+		raise GateError(f'suspend to idle: the host measured {slept:.0f} ms between the kernel\'s lines, under the {IDLE_WAKE_S} s wake')
+	rows = []
+	for stamp, line in lines:
+		found = COUNTER.search(line)
+		if found:
+			rows.append((stamp, int(found.group(1)), int(found.group(2)), int(found.group(3))))
+	inside = [row for row in rows if entered < row[0] < resumed]
+	if inside:
+		raise GateError(f'suspend to idle: {len(inside)} counter line(s) arrived while the machine slept, the first count {inside[0][1]}')
+	if len(rows) < 2 or [row[1] for row in rows] != list(range(rows[0][1], rows[0][1] + len(rows))):
+		raise GateError('suspend to idle: the counter skipped or repeated a value, or printed nothing')
+	if not (rows[0][0] < entered and rows[-1][0] > resumed):
+		raise GateError('suspend to idle: the counter did not run across the sleep')
+	gap = max(range(1, len(rows)), key=lambda at: rows[at][3] - rows[at - 1][3])
+	mono, boot = rows[gap][2] - rows[gap - 1][2], rows[gap][3] - rows[gap - 1][3]
+	if boot < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
+		raise GateError(f'suspend to idle: the boot-time clock moved {boot} ms across the sleep, under the {IDLE_WAKE_S} s wake')
+	if mono >= IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
+		raise GateError(f'suspend to idle: the monotonic clock moved {mono} ms across the sleep - it took the sleep in')
+	record = serial.run('sleepctl last', 60 * scale)
+	if 'woken by the timed wake' not in record:
+		raise GateError(f'suspend to idle: the record does not name the timed wake: {record}')
+	parked = 0
+	for found in PARKED.finditer(record):
+		parked += 1
+		cpu, timer, ipi, device = map(int, found.groups())
+		if device:
+			raise GateError(f'suspend to idle: cpu{cpu} woke {device} time(s) for a device')
+		if (cpu == 0 and (timer > 1 or ipi > 1)) or (cpu != 0 and (timer or ipi > 1)):
+			raise GateError(f'suspend to idle: cpu{cpu} woke {timer} time(s) for the timer and {ipi} for an IPI')
+	if not parked:
+		raise GateError('suspend to idle: the record lists no core')
+	note(f'{target}: suspend to idle - the host measured {slept:.0f} ms for a {IDLE_WAKE_S} s wake with the counter silent, count {rows[gap - 1][1]} then {rows[gap][1]} (monotonic +{mono} ms, boot-time +{boot} ms), {parked} cores parked with no wake but the wake')
 
 
 def wakes_on(rows, identity):
@@ -214,6 +328,7 @@ def drive(target):
 	env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{serial_path},server', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development')
 	if target != 'x86_64':
 		env['UEFI'] = '1'
+		env['IDLE_FIXTURE'] = '1'
 	note(f'booting {target}; serial log {os.path.relpath(log_path, SRC)}')
 	guest = subprocess.Popen(['bash', 'harness/qemu-run.sh', target, kernel], cwd=SRC, env=env, stdout=runner_log, stderr=runner_log, start_new_session=True)
 	try:
@@ -257,6 +372,16 @@ def check(target, serial, qmp_path, scale):
 	if not armed:
 		raise GateError('the kernel never said which interrupt typed input raises')
 	identity = int(armed.group(1))
+	smp = int(os.environ.get('SMP', '4'))
+	if target != 'x86_64':
+		# THE TREE'S TABLES, installed at boot on every core, and the state that loses the context held out on each.
+		tables = {int(cpu): int(count) for cpu, count in TREE_TABLE.findall(boot)}
+		if sorted(tables) != list(range(smp)) or any(count != len(TREE_LATENCIES) for count in tables.values()):
+			raise GateError(f'the kernel did not install the tree\'s idle states on every core: {tables} (wanted {len(TREE_LATENCIES)} states on cores 0..{smp - 1})')
+		lost = {int(cpu) for cpu, _index, _us in TREE_LOST.findall(boot)}
+		if lost != set(range(smp)):
+			raise GateError(f'the state that loses the core\'s context was not said held out on every core: {sorted(lost)}')
+		note(f'{target}: every core installed the tree\'s {len(TREE_LATENCIES)} idle states, the one that loses the context held out')
 	# AN IDLE MACHINE, which is the claim: the boot's own output has stopped before anything is typed.
 	serial.settle(2.0 * scale, 120 * scale)
 	# THE CONTROL: two reads with nothing typed between them but the second `graph`. Typing that command is
@@ -297,10 +422,28 @@ def check(target, serial, qmp_path, scale):
 	# closes the interval wakes the machine too and is counted in, so the rate is an upper bound.
 	serial.settle(2.0 * scale, 30 * scale)
 	first = cores(serial, 60 * scale)
+	states_first = idle_states(serial, 60 * scale) if target != 'x86_64' else {}
 	started = time.monotonic()
 	while time.monotonic() - started < IDLE_SAMPLE:
 		serial.pump(max(0.0, started + IDLE_SAMPLE - time.monotonic()))
 	last = cores(serial, 60 * scale)
+	if target != 'x86_64':
+		# THE STATES OVER THE SAME QUIET INTERVAL: the retention states entered through the firmware, the other never.
+		states_last = idle_states(serial, 60 * scale)
+		retained = 0
+		for cpu in sorted(states_last):
+			now, then = states_last[cpu], states_first.get(cpu, [])
+			if [state['exit'] for state in now] != TREE_LATENCIES or len(then) != len(now):
+				raise GateError(f'core {cpu}\'s record does not carry the tree\'s states: {now}')
+			if now[2]['unenterable'] == 0 or now[2]['entries'] != then[2]['entries']:
+				raise GateError(f'core {cpu} entered the state that loses its context, or did not hold it out: {now[2]}')
+			retained += (now[1]['entries'] - then[1]['entries']) + (now[3]['entries'] - then[3]['entries'])
+		if retained == 0:
+			raise GateError('over the idle sample no core entered either retention state')
+		refused = FIRMWARE_REFUSED.search(bytes(serial.data))
+		if refused:
+			raise GateError(f'the firmware refused a state: {refused.group(0).decode(errors="replace")}')
+		note(f'{target}: the idle cores entered the tree\'s retention states {retained} time(s) over the sample, through the firmware, and the state that loses the context never')
 	elapsed = time.monotonic() - started
 	rates = []
 	for cpu in sorted(last):
@@ -312,6 +455,9 @@ def check(target, serial, qmp_path, scale):
 	qmp(qmp_path, 'device_add', {'driver': 'virtio-serial-pci', 'bus': 'hotplug0', 'id': 'tickless0'}, 30)
 	took = serial.wait_for(mark, lambda seen: ARRIVED in seen, 60 * scale, 'the arrival of a device plugged into the idle machine')
 	note(f'{target}: a device plugged into the idle machine was seen {took * 1000:.0f} ms later')
+	if target != 'x86_64':
+		serial.settle(2.0 * scale, 120 * scale)
+		suspend_to_idle(target, serial, scale)
 	return True
 
 

@@ -212,6 +212,28 @@ fn an_operators_one_attempt_is_not_turned_back_into_the_automatic_budget() {
 }
 
 #[test]
+fn a_device_lost_to_a_sleep_is_bound_again_however_many_sleeps_the_boot_has() {
+	use crate::{admit_attempt, budget_for_a_sleep_rebind};
+	// THE BOOT'S THREE ATTEMPTS ALL SPENT on its bring-up, then ten sleeps that each lose the device: every rebind is
+	// admitted, and the count stays where the bring-up left it.
+	let mut spent = 3;
+	for sleep in 0..10 {
+		spent = budget_for_a_sleep_rebind(false, spent);
+		assert!(admit_attempt(&mut spent, 3, 100, 0, 0), "sleep {sleep}'s rebind was refused");
+		assert_eq!(spent, 3, "sleep {sleep}'s rebind spent the budget");
+	}
+	// A REBIND THAT THEN FAILS spends like any attempt: nothing is left after it.
+	assert!(!admit_attempt(&mut spent, 3, 100, 0, 0), "an attempt after the rebind is charged");
+	// One spent at bring-up: after the sleep's rebind it is still one, not two.
+	let mut spent = budget_for_a_sleep_rebind(false, 1);
+	assert!(admit_attempt(&mut spent, 3, 100, 0, 0));
+	assert_eq!(spent, 1);
+	// AN OPERATOR'S ONE ATTEMPT is not the automatic budget, and is left as it is; and nothing goes below zero.
+	assert_eq!(budget_for_a_sleep_rebind(true, 2), 2);
+	assert_eq!(budget_for_a_sleep_rebind(false, 0), 0);
+}
+
+#[test]
 fn no_state_has_an_edge_to_itself_so_a_duplicate_event_changes_nothing() {
 	// A DUPLICATE EVENT IS IDEMPOTENT, and it falls out of the table rather than needing a rule of
 	// its own: the second arrival of the event that already moved the node is refused like any other

@@ -173,6 +173,10 @@ enum capability {
 	/// wake the machine can empty its battery. A `system-sleep` connection minted with it may schedule; one without it
 	/// is refused. Granted to `sleepctl`. Appended last.
 	sleep-wake,
+	/// THE PROCESSORS' POWER, OPERATED: ProcessorPowerService's operator root - its status, the profile, and a fan's
+	/// curve where the platform leaves the fan to the operating system. Never `_CRT` or `_HOT`, which no verb reaches.
+	/// Granted to `powerctl`. Appended last.
+	processor-power,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

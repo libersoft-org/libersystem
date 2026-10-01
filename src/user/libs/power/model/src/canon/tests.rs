@@ -133,3 +133,25 @@ fn validation_refuses_what_a_canonical_record_cannot_be() {
 	// reported as one.
 	assert_eq!(refused(&|s| s.charge = ChargeState::Invalid), Ok(()));
 }
+
+#[test]
+fn the_supply_is_on_battery_only_with_line_power_known_absent() {
+	use crate::acpi::{Ac, ac};
+	let online = ac(&Ac { status: Some(0x0F), power_source: Some(1) });
+	let offline = ac(&Ac { status: Some(0x0F), power_source: Some(0) });
+	let unknown = ac(&Ac { status: None, power_source: None });
+	assert_eq!(supply([&online].into_iter()), Supply { on_battery: false, critical: false });
+	assert_eq!(supply([&offline].into_iter()), Supply { on_battery: true, critical: false });
+	assert_eq!(supply([&offline, &online].into_iter()).on_battery, false, "one adapter on line is line power");
+	assert_eq!(supply([&unknown].into_iter()).on_battery, false, "nothing known is no battery");
+	let mut battery = unknown.clone();
+	battery.kind = SourceKind::Battery;
+	battery.alarms = alloc::vec![
+		Alarm { kind: AlarmKind::CriticalCapacity, state: Tristate::Yes, provenance: Provenance::Reported },
+		Alarm { kind: AlarmKind::OnBattery, state: Tristate::Yes, provenance: Provenance::Reported }
+	];
+	assert_eq!(supply([&battery].into_iter()), Supply { on_battery: true, critical: true });
+	let mut ups = battery.clone();
+	ups.kind = SourceKind::Ups;
+	assert_eq!(supply([&ups].into_iter()).critical, false, "a UPS's critical capacity is not the machine's battery");
+}

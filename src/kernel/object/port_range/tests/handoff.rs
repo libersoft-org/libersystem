@@ -357,3 +357,72 @@ fn the_terminal_writer_takes_the_uart_from_a_probe_that_broke_it_and_puts_the_ba
 	assert_eq!(device::release_claim(key), Ok(device::ClaimState::Free));
 	give_up();
 }
+
+crate::tagged_test!(a_planned_end_waits_for_the_driver_to_take_the_ring_and_no_longer_than_its_bound, [Object, Kernel, Syscall, ArchX86_64], id = "kernel.object.port_range.handoff.a_planned_end_waits_for_the_driver_to_take_the_ring_and_no_longer_than_its_bound", covers = ["kernel"]);
+fn a_planned_end_waits_for_the_driver_to_take_the_ring_and_no_longer_than_its_bound() {
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(row: u64) {
+		settle_waits(row as usize);
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let row = adopt(false);
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(body, row as u64);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the test's thread ran to its end");
+	give_up();
+}
+
+fn now_ns() -> u64 {
+	crate::arch::common::time::CLOCK.nanos(crate::arch::tsc::now())
+}
+
+// THE DRIVER'S SIDE, on a thread of its own - a process of its own, so the claim's tap is read as the kernel reads it
+// for the syscall: once the time it is handed has passed, and when it was read written back.
+static READ_AT: AtomicU64 = AtomicU64::new(0);
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static READ_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn late_reader(after: u64) {
+	while now_ns() < after {
+		sched::yield_now();
+	}
+	let mut buf = [0u8; 64];
+	let read = crate::arch::serial::console_tap_read(COM2_BASE as u64, READ_GENERATION.load(Ordering::SeqCst), &mut buf);
+	READ_BYTES.store(read.map_or(0, |(n, _, _)| n as u64), Ordering::SeqCst);
+	READ_AT.store(now_ns(), Ordering::SeqCst);
+}
+
+fn settle_waits(row: usize) {
+	use crate::arch::serial::{SETTLE_BOUND_NS, SETTLE_QUIET_NS};
+	let grant = crate::tests::claim_device(row as u64).expect("the console row is claimed through the syscall");
+	let tap = unsafe { crate::arch::syscall::invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, grant.claim, abi::RESOURCE_KIND_CONSOLE_TAP, 0, 0) } as i64;
+	assert!(tap > 0, "the claim mints its tap ({tap})");
+	// A DRIVER THAT TAKES NOTHING: the settle ends at its bound, and the bytes are still the ring's.
+	assert_eq!(COM2.write_bytes(b"held\n"), 5);
+	let started = now_ns();
+	COM2.settle_driver();
+	let took = now_ns() - started;
+	assert!((SETTLE_BOUND_NS..SETTLE_BOUND_NS + 500_000_000).contains(&took), "a driver that reads nothing holds the end for the bound and no longer ({took} ns)");
+	let mut buf = [0u8; 64];
+	assert_eq!(tap_read(tap, &mut buf).0, 6, "and what the ring held is still there for the driver");
+	// A DRIVER THAT TAKES THE RING 50 ms LATE: the settle does not end before it has, and ends a quiet interval after.
+	assert_eq!(COM2.write_bytes(b"pressed\n"), 8);
+	READ_AT.store(0, Ordering::SeqCst);
+	READ_GENERATION.store(grant.key.generation, Ordering::SeqCst);
+	let started = now_ns();
+	sched::spawn(late_reader, started + 50_000_000);
+	COM2.settle_driver();
+	let ended = now_ns();
+	let read_at = READ_AT.load(Ordering::SeqCst);
+	assert!(read_at != 0, "the settle ended before the driver took the ring");
+	assert_eq!(READ_BYTES.load(Ordering::SeqCst), 9, "the driver took the line, its carriage return with it");
+	assert!(ended >= read_at + SETTLE_QUIET_NS, "the settle ended {} ns after the read, inside the quiet interval", ended - read_at);
+	assert!(ended - started < SETTLE_BOUND_NS, "and before the bound ({} ns)", ended - started);
+	// THE KERNEL DRIVING THE UART: nothing to wait for.
+	crate::tests::release_device(&grant);
+	let started = now_ns();
+	COM2.settle_driver();
+	assert!(now_ns() - started < 10_000_000, "with no driver holding the UART the settle returns at once");
+	close(tap);
+}

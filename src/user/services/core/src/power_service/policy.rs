@@ -13,7 +13,7 @@
 // stopped in order.
 
 use super::*;
-use proto::system::{ActivityEdge, AlarmKind, SleepReason, SleepState, SourceKind, SourceState, SwitchKind, Tristate, display_outputs, input_activity, platform_switch, system_power, system_shutdown, system_sleep};
+use proto::system::{ActivityEdge, SleepReason, SleepState, SwitchKind, display_outputs, input_activity, platform_switch, system_power, system_shutdown, system_sleep};
 use service_logic::sleep_policy::{Action, Event, Policy, Settings, Why};
 
 // How long one question to ServiceManager, SystemManager, DisplayService or a provider may take.
@@ -203,7 +203,8 @@ impl SleepPolicy {
 
 	// THE POWER SOURCES, READ AGAIN after every change this service took in.
 	pub(super) fn power_changed(&mut self, registry: &Registry<Held>) {
-		let facts = power_facts(registry.sources().iter().map(|(_, _, held)| &held.0));
+		let supply = power_model::canon::supply(registry.sources().iter().map(|(_, _, held)| &held.0));
+		let facts = (supply.on_battery, supply.critical);
 		if self.facts == Some(facts) {
 			return;
 		}
@@ -258,30 +259,4 @@ impl SleepPolicy {
 			}
 		}
 	}
-}
-
-// ON BATTERY when line power is known to be absent - an AC adapter or a Type-C supply off line with none on line - or a
-// battery says so; CRITICAL when a battery's critical-capacity alarm is on.
-fn power_facts<'a>(sources: impl Iterator<Item = &'a SourceState>) -> (bool, bool) {
-	let (mut line, mut unplugged, mut alarmed, mut critical) = (false, false, false, false);
-	for source in sources {
-		if matches!(source.kind, SourceKind::Ac | SourceKind::UsbC) {
-			match source.online {
-				Tristate::Yes => line = true,
-				Tristate::No => unplugged = true,
-				Tristate::Unknown => {}
-			}
-		}
-		for alarm in &source.alarms {
-			if alarm.state != Tristate::Yes {
-				continue;
-			}
-			match alarm.kind {
-				AlarmKind::OnBattery => alarmed = true,
-				AlarmKind::CriticalCapacity if source.kind == SourceKind::Battery => critical = true,
-				_ => {}
-			}
-		}
-	}
-	(!line && (unplugged || alarmed), critical)
 }

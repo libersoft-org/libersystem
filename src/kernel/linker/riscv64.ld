@@ -56,6 +56,9 @@ SECTIONS
 	/* The read-execute span, as higher-half addresses - `harden_direct_map` masks KOFF off, the way
 	 * `usable_region` already does for `__kernel_end`. */
 	__kernel_rx_start = .;
+	/* THE KERNEL'S CODE AND READ-ONLY DATA, from here to `__kernel_image_end`: what a hibernation image's system digest
+	 * reads of the kernel it was written by. */
+	__kernel_image_start = .;
 
 	.text : AT(ADDR(.text) - KOFF) {
 		*(.text .text.*)
@@ -80,6 +83,7 @@ SECTIONS
 		KEEP(*(.extable))
 		__extable_end = .;
 	} :rodata
+	__kernel_image_end = .;
 
 	/* And the second boundary: everything above here is written, so nothing above here may be
 	 * executable. */

@@ -108,6 +108,18 @@ pub fn enable_async() {}
 
 pub fn drain_tx() {}
 
+// THE SLEEP'S WINDOW. Transmit is synchronous here, so the line before the entry is already on the wire and there is
+// nothing to drain; after a sleep that lost power the UART is programmed again before the next line.
+pub fn sleep_begin() {}
+
+pub fn sleep_wake(lost_settings: bool) {
+	if lost_settings {
+		init();
+	}
+}
+
+pub fn sleep_end() {}
+
 // Transmit is synchronous here, so nothing is ever left for an idle core to drain.
 pub fn tx_pending() -> bool {
 	false
@@ -123,6 +135,9 @@ pub fn drain_sync() {}
 
 // Nothing to make room in: writes are synchronous.
 pub fn make_room() {}
+
+// Nothing to settle before a planned end: no driver takes this port's UART, and writes are synchronous.
+pub fn settle_driver() {}
 
 pub fn write_whole(bytes: &[u8]) -> bool {
 	write_bytes(bytes) == bytes.len()

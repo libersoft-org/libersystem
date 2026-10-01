@@ -38,8 +38,10 @@
 # THE PLATFORM BOOT: the fixture SSDT with the sleep gate's devices and the development switch naming the CMOS RTC absent.
 # Closing the lid suspends through the power-state service's policy; the Time and Alarm Device's clock - the harness plays
 # it five years ahead - is the wall clock, stamps files and measures an S3; its timer is what the driver programs from the
-# sleep's timed wake, and the host wakes the guest at it; the control-method sleep button suspends; the policy killed and
-# relaunched still suspends on the lid; and the control-method power button powers off through the registered `\_S5`.
+# sleep's timed wake, and the host wakes the guest at it; THE FANS' DRIVERS answer SUSPENDED and RESUMED across a suspend
+# to idle and an S3, and the level FAN1 was commanded through its curve - cleared in the pages by the host while the guest
+# is in S3 - is applied again at the resume; the control-method sleep button suspends; the policy killed and relaunched
+# still suspends on the lid; and the control-method power button powers off through the registered `\_S5`.
 # THE DEVICE POWER STATES, read from the fixture's pages - the lid and the TAD share one power resource in D0, and the
 # lid's wake needs another: after the boot the shared one is on, turned on ONCE for its two holders; while the lid's S3
 # is suspended both devices ran `_PS3`, the shared resource is off and the wake one on; while the TAD's timed S3 is
@@ -269,8 +271,10 @@ ms_between() {
 await_end() {
 	local baseline="$1" what="$2"
 	await_line "ServiceManager: sleep: the transaction ended" "$what: the transaction never ended" "$baseline" 180
+	# THE LAST ONE IS THIS TRANSACTION'S, the wait having seen it past `baseline` - and nothing else's line count: the
+	# boots after the first truncate the log, so a count kept from an earlier boot names no line of this one.
 	local ended
-	ended="$(tail -n +"$((baseline_lines + 1))" "$serial" | grep -a "ServiceManager: sleep: the transaction ended" | tail -n 1)"
+	ended="$(grep -a "ServiceManager: sleep: the transaction ended" "$serial" | tail -n 1)"
 	[[ "$ended" == *"slept and woke"* ]] || fail "$what: the transaction ended as: $ended"
 }
 
@@ -586,7 +590,8 @@ refused="$(tail -n +"$((baseline_lines + 1))" "$serial" | grep -a "ServiceManage
 grep -q "unwound at Drivers" <<<"$refused" || fail "the refusal did not unwind the drivers' step: $refused"
 grep -q "sleep_fixture\|01:00.0" <<<"$refused" || fail "the refusal did not name the fixture's binding: $refused"
 tail -n +"$((baseline_lines + 1))" "$serial" | grep -a -q "sleep: entered" && fail "a refused suspend entered the sleep anyway"
-launch uname | grep -q "LiberSystem" || fail "the system is not running after the refused suspend"
+out="$(launch uname)" || true
+grep -q "LiberSystem" <<<"$out" || fail "the system is not running after the refused suspend"
 say "a driver's refusal unwound the suspend, named: $refused"
 
 # 7. A PERSON'S SHUTDOWN DURING A SLEEP THAT WOULD OTHERWISE SUCCEED. The fixture holds its answer; `sleepctl` runs in the
@@ -660,6 +665,9 @@ EOF
 	export ACPI_FIXTURE="$fixture/fixture.aml" ACPI_FIXTURE_MEMORY="$fixture/ivshmem.bin"
 	export I2C_FIXTURE=bus I2C_SOCKET="$fixture/i2c.sock" GPIO_SOCKET="$fixture/gpio.sock"
 	export QEMU_EXTRA="-global ICH9-LPC.disable_s3=0 -fw_cfg name=opt/org.libersystem/absent,string=rtc"
+	# AND NOTHING OUTSIDE TO ASK: TimeService disciplines the wall clock against an NTP server where the network reaches
+	# one, which would replace the TAD's clock this boot checks the kernel reads.
+	export NET_RESTRICT=1
 }
 
 sleep_event() {
@@ -677,6 +685,22 @@ await_s3_and_wake() {
 	qmp system_wakeup >/dev/null || fail "QEMU refused system_wakeup"
 	await_state running 30 "$what after system_wakeup"
 	await_end "$ended" "$what"
+}
+
+# FAN1'S LEVEL IN THE PAGES, waited for.
+fan_await() {
+	local want="$1" what="$2" value=""
+	for _ in $(seq 1 60); do
+		value="$(python3 src/harness/acpi-fixture.py --processor-read "$fixture/ivshmem.bin" | python3 -c 'import json, sys; print(json.load(sys.stdin)["fan1"])')"
+		[[ "$value" == "$want" ]] && return 0
+		sleep 0.5
+	done
+	fail "$what (its level reads $value, not $want)"
+}
+
+# IN S3, FAN1'S LEVEL CLEARED in the pages - what firmware that resets a fan across a sleep leaves.
+fan_cleared() {
+	python3 src/harness/acpi-fixture.py --set "$fixture/ivshmem.bin" fan1=0
 }
 
 # THE POWER RESOURCES AND STATES THE PAGES HOLD, checked against a Python condition over them: `pslp_on`, `pslp_ons`,
@@ -704,13 +728,38 @@ tad_clock_check() {
 	[[ -n "$guest" ]] || fail "$label: date printed no time"
 	skew=$((host - $(date -u -d "$guest" +%s)))
 	((skew >= -2 && skew <= 3)) || fail "$label: the wall clock is ${skew} s from the TAD's ($guest) - the kernel is not reading the TAD's clock"
-	# A FILE WRITTEN NOW is stamped with the TAD's time, to the minute.
-	launch write "tad-$label.txt" "stamped by the TAD's clock" >/dev/null
-	local listed want
-	listed="$(launch ls | grep -a "tad-$label.txt" || true)"
-	want="$(date -u -d "@$host" +'%Y-%m-%d')"
-	grep -q "$want" <<<"$listed" || fail "$label: the file written is not stamped with the TAD's date $want: $listed"
+	# A FILE WRITTEN NOW is stamped with the TAD's time, to the minute: written to this run's USB stick - a FAT volume,
+	# whose entries StorageService stamps from the kernel's RTC read, where the live system volume carries no times - and
+	# its directory entry read back on the host from the stick's private copy.
+	launch write "vol://usb/tad-$label.txt" "stamped by the TAD's clock" >/dev/null
+	local stick entry
+	stick="$(run_stick)"
+	[[ -n "$stick" ]] || fail "$label: this run's USB stick was not found under .build/boot"
+	entry="$(MTOOLS_SKIP_CHECK=1 mdir -i "$stick" "::tad-$label.txt" 2>&1 || true)"
+	python3 - "$entry" "$host" "tad-$label.txt" <<'EOF' || fail "$label: the file written is not stamped with the TAD's time ($(date -u -d "@$host" +'%Y-%m-%d %H:%M')): $entry"
+import datetime, re, sys
+entry, host, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+found = re.search(r'(\d{4}-\d\d-\d\d) +(\d\d:\d\d) +' + re.escape(name), entry)
+if not found:
+	sys.exit(1)
+stamped = datetime.datetime.strptime(f'{found.group(1)} {found.group(2)}', '%Y-%m-%d %H:%M').replace(tzinfo=datetime.timezone.utc).timestamp()
+sys.exit(0 if abs(stamped - host) <= 120 else 1)
+EOF
 	say "platform: $label - the wall clock is the TAD's (${skew} s off), and a file written is stamped with it"
+}
+
+# THIS RUN'S USB STICK: the private copy `qemu-run.sh` made for the instance's QEMU (`usb-media-dev-STATE.KEY.PID.img`,
+# the PID its own, since the runner execs QEMU) - the QEMU whose command line names this gate's private state.
+run_stick() {
+	local pid sticks cmdline
+	for pid in $(ps -eo pid=,comm= | awk '$2 ~ /^qemu-system/ {print $1}'); do
+		cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+		if [[ "$cmdline" == *"$state/"* ]]; then
+			sticks=(.build/boot/usb-media*."$pid".img)
+			[[ -f "${sticks[0]}" ]] && printf '%s\n' "${sticks[0]}"
+			return 0
+		fi
+	done
 }
 
 run_platform() {
@@ -745,7 +794,8 @@ run_platform() {
 	await_line "PowerService: sleep policy: asks for a suspend (Lid)" "closing the lid asked for no suspend" "$asked" 30
 	await_s3_and_wake "the lid's suspend" "$ended" lid_s3_power
 	sleep_event lid-open
-	launch sleepctl last | grep -q "(Lid)" || fail "the last sleep's record does not name the lid"
+	out="$(launch sleepctl last)" || true
+	grep -q "(Lid)" <<<"$out" || fail "the last sleep's record does not name the lid"
 	power_check "after the lid's wake" "lid_ps == 0 and tad_ps == 0 and pslp_on == 1 and pslp_ons == 2 and pwak_on == 0 and pwak_offs == 1"
 	await_line "the clock's source says the sleep lasted" "the kernel took no sleep length from the TAD's clock" 0 30
 	tad_clock_check lid
@@ -777,12 +827,40 @@ EOF
 	power_check "after the TAD's wake" "lid_ps == 0 and tad_ps == 0 and pslp_on == 1 and pslp_offs == 1 and pwak_on == 0"
 	say "platform: the TAD's driver set its timer to the sleep's timed wake ($timers)"
 
+	# THE FAN ACROSS A SLEEP: FAN1 - left to the operating system in fine steps - set through its curve, then a suspend to
+	# idle and an S3 cycle, each answered SUSPENDED and RESUMED by both fans' drivers; in S3 the host clears FAN1's level
+	# in the pages, as firmware may, and the resume applies the level commanded before the sleep again.
+	# KEPT WHOLE, THEN SEARCHED: under pipefail a grep that stops reading early fails the launch it reads.
+	out="$(launch powerctl curve '\_SB_.FAN1' 20:60)" || true
+	grep -a -q "follows the curve" <<<"$out" || fail "fan: powerctl could not set FAN1's curve: $out"
+	fan_await 60 "fan: FAN1 was not set to its curve's 60 %"
+	local suspended resumed
+	suspended=$(seen "DeviceManager: suspended acpi-fan")
+	resumed=$(seen "DeviceManager: resumed acpi-fan")
+	ended=$(seen "ServiceManager: sleep: the transaction ended")
+	launch sleepctl suspend idle 5 >"$state/sleepctl-fan-idle.log" 2>&1 || true
+	await_end "$ended" "the fan's suspend to idle"
+	(($(seen "DeviceManager: suspended acpi-fan") >= suspended + 2 && $(seen "DeviceManager: resumed acpi-fan") >= resumed + 2)) || fail "fan: both fans' drivers did not answer SUSPENDED and RESUMED across the suspend to idle"
+	fan_await 60 "fan: after the suspend to idle FAN1 does not hold its level"
+	suspended=$(seen "DeviceManager: suspended acpi-fan")
+	resumed=$(seen "DeviceManager: resumed acpi-fan")
+	local found
+	found=$(seen "at the resume it was found at level 0 (0 rpm) - level 60 applied again")
+	ended=$(seen "ServiceManager: sleep: the transaction ended")
+	launch sleepctl suspend ram >"$state/sleepctl-fan-ram.log" 2>&1 &
+	await_s3_and_wake "the fan's S3" "$ended" fan_cleared
+	(($(seen "DeviceManager: suspended acpi-fan") >= suspended + 2 && $(seen "DeviceManager: resumed acpi-fan") >= resumed + 2)) || fail "fan: both fans' drivers did not answer SUSPENDED and RESUMED across S3"
+	await_line "at the resume it was found at level 0 (0 rpm) - level 60 applied again" "fan: FAN1's driver did not find the cleared level and apply its own again" "$found" 30
+	fan_await 60 "fan: after the S3 resume FAN1 does not hold the level commanded before the sleep"
+	say "fan: across a suspend to idle and S3 both fans' drivers answered SUSPENDED and RESUMED, and the level cleared in S3 was applied again"
+
 	# THE CONTROL-METHOD SLEEP BUTTON.
 	ended=$(seen "ServiceManager: sleep: the transaction ended")
 	sleep_event sleep-button
 	await_line "SLPB: pressed - asking ServiceManager for a suspend" "the sleep button's press asked for no suspend" 0 30
 	await_s3_and_wake "the sleep button's suspend" "$ended"
-	launch sleepctl last | grep -q "(SleepButton)" || fail "the last sleep's record does not name the sleep button"
+	out="$(launch sleepctl last)" || true
+	grep -q "(SleepButton)" <<<"$out" || fail "the last sleep's record does not name the sleep button"
 	say "platform: the control-method sleep button suspended the machine"
 
 	# THE POLICY KILLED AND RELAUNCHED: the lid still suspends, through the relaunched instance's own client.

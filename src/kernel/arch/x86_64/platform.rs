@@ -65,6 +65,7 @@ pub fn describe() -> Vec<Described> {
 	if let Some(madt) = madt.as_ref() {
 		for (at, io_apic) in madt.io_apics().enumerate() {
 			let mut name = [0u8; abi::PLATFORM_NAME_LEN];
+			// ALLOC-OK: boot, one name per I/O APIC the MADT lists, before userspace exists.
 			let body = alloc::format!("ioapic#{at}");
 			let Some(len) = platform::identity(b"kernel:", body.as_bytes(), &mut name) else { continue };
 			let Some(mut description) = held(&name[..len]) else { continue };
@@ -112,6 +113,7 @@ pub fn describe() -> Vec<Described> {
 		}
 		for (index, unit) in units.iter().enumerate() {
 			let mut name = [0u8; abi::PLATFORM_NAME_LEN];
+			// ALLOC-OK: boot, one name per unit the table lists, before userspace exists.
 			let body = alloc::format!("{table}#0.{index}");
 			if let Some(len) = platform::identity(b"table:", body.as_bytes(), &mut name)
 				&& let Some(mut description) = platform::Description::new(abi::PLATFORM_SOURCE_TABLE, abi::PLATFORM_STATE_KERNEL_HELD, &name[..len])
@@ -222,6 +224,7 @@ fn tables(out: &mut Vec<Described>, rsdp: u64, madt: Option<&acpi::Madt<'_>>) {
 		let mut index = 0u32;
 		let _ = acpi::dbg2_devices(bytes, |device| {
 			if device.port_type == acpi::DBG2_TYPE_SERIAL {
+				// ALLOC-OK: boot, one name per serial port the DBG2 tables list, before userspace exists.
 				let body = alloc::format!("DBG2#{instance}.{index}");
 				if let Some(len) = platform::identity(b"table:", body.as_bytes(), &mut name)
 					&& let Some(mut description) = platform::Description::new(abi::PLATFORM_SOURCE_TABLE, abi::PLATFORM_STATE_CLAIMABLE, &name[..len])
@@ -276,8 +279,8 @@ fn tables(out: &mut Vec<Described>, rsdp: u64, madt: Option<&acpi::Madt<'_>>) {
 			// instructions, and nothing else carries them to userspace.
 			let padded = (bytes.len() + 3) & !3;
 			let mut block: Vec<u8> = Vec::new();
-			if 12 + padded <= abi::MAX_DEVICE_PROPERTIES {
-				// ALLOC-OK: boot, once, bounded by the block's limit above.
+			// Boot, once, bounded by the block's limit - and the room asked for first, so a short heap leaves it unpublished.
+			if 12 + padded <= abi::MAX_DEVICE_PROPERTIES && block.try_reserve_exact(12 + padded).is_ok() {
 				block.push(abi::DEVICE_PROPERTY_VALUE);
 				block.push(0);
 				block.extend_from_slice(&4u16.to_le_bytes());
@@ -287,7 +290,7 @@ fn tables(out: &mut Vec<Described>, rsdp: u64, madt: Option<&acpi::Madt<'_>>) {
 				block.resize(12 + padded, 0);
 			}
 			if block.is_empty() {
-				crate::serial_println!("device: the WDAT table is longer than a row's property block - not published");
+				crate::serial_println!("device: the WDAT table is longer than a row's property block, or there is no memory for it - not published");
 			} else if whole {
 				// ALLOC-OK: boot, once per device the firmware describes.
 				out.push(Described { description, properties: block, targets: Vec::new(), registers: memory });

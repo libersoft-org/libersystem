@@ -49,3 +49,28 @@ method power-fixture.commands op=5 () -> result<list<fixture-command>, liber:bas
 method power-fixture.withhold op=6 (commands:u32:rights=,queries:u32:rights=) -> result<unit, liber:base@1::error>
 method power-fixture.offer-extra op=7 () -> result<unit, liber:base@1::error>
 method power-fixture.outlets op=8 () -> result<list<bool>, liber:base@1::error>
+record active-trip(level:u8,temperature:u32,devices:list<string>:bound=8)
+record zone-cooling(zone:string:bound=64,passive:option<u32>,critical:option<u32>,hot:option<u32>,tc1:u32,tc2:u32,tsp:u32,passive-processors:list<string>:bound=64,active:list<active-trip>:bound=10,scp:bool)
+record zone-reading(temperature:u32,sequence:u32)
+interface thermal-zone
+method thermal-zone.describe op=1 () -> result<zone-cooling, liber:base@1::error>
+method thermal-zone.readings op=2 () -> stream<zone-reading>
+method thermal-zone.sample-every op=3 (milliseconds:u32:rights=) -> result<unit, liber:base@1::error>
+method thermal-zone.cooling-policy op=4 (mode:u8:rights=) -> result<unit, liber:base@1::error>
+record fan-level(control:u32,speed-rpm:u32,noise:u32,power-mw:u32)
+record fan-description(path:string:bound=64,by-power-state:bool,fine-grain:bool,step-size:u32,levels:list<fan-level>:bound=16)
+record fan-status(control:u32,speed-rpm:u32)
+interface cooling-device
+method cooling-device.describe op=1 () -> result<fan-description, liber:base@1::error>
+method cooling-device.set-level op=2 (level:u32:rights=) -> result<fan-status, liber:base@1::error>
+method cooling-device.status op=3 () -> result<fan-status, liber:base@1::error>
+enum power-profile(performance=1,balanced=2,power-saving=3)
+record curve-point(temperature:u32,percent:u8)
+record core-power(cpu:u32,idle-states:u32,perf-levels:u32,perf-level:u32,window-cap:u32,window-floor:u32,inject-permille:u32,latency-requests:u32)
+record zone-power(zone:string:bound=64,temperature:u32,passive:option<u32>,critical:option<u32>,hot:option<u32>,passive-engaged:bool,cap-percent:u32)
+record fan-power(path:string:bound=64,control:u32,speed-rpm:u32,curve:list<curve-point>:bound=8)
+record processor-power-status(profile:power-profile,because:string:bound=64,cores:list<core-power>:bound=64,zones:list<zone-power>:bound=16,fans:list<fan-power>:bound=16)
+interface processor-power-admin
+method processor-power-admin.status op=1 () -> result<processor-power-status, liber:base@1::error>
+method processor-power-admin.set-profile op=2 (profile:power-profile:rights=) -> result<unit, liber:base@1::error>
+method processor-power-admin.set-fan-curve op=3 (fan:string:bound=64:rights=,curve:list<curve-point>:bound=8:rights=) -> result<unit, liber:base@1::error>

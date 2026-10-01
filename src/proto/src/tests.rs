@@ -904,8 +904,8 @@ fn graph_round_trips() {
 			Component { name: String::from("device-manager"), r#type: ComponentType::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") }, resources: alloc::vec![ResourceCount { name: String::from("surfaces"), live: 3, bound: 64 }] },
 		],
 		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
-		// AND A CORE'S IDLE RECORD, with one wake source, for the same reason.
-		cores: alloc::vec![CoreIdle { cpu: 1, idle_ns: 9_000_000, halts: 12, wakes_timer: 3, wakes_ipi: 4, wakes_housekeeping: 2, wakes_device: 3, sources: alloc::vec![CoreWakeSource { source: 36, count: 3 }] }],
+		// AND A CORE'S IDLE RECORD, with one wake source, one idle state and two levels, for the same reason.
+		cores: alloc::vec![CoreIdle { cpu: 1, idle_ns: 9_000_000, halts: 12, wakes_timer: 3, wakes_ipi: 4, wakes_housekeeping: 2, wakes_device: 3, sources: alloc::vec![CoreWakeSource { source: 36, count: 3 }], states: alloc::vec![CoreIdleState { entry: 2, unenterable: 2, exit_latency_us: 50, target_residency_us: 150, entries: 0, residency_ns: 0 }], perf_levels: 2, perf_level: 1, levels: alloc::vec![CoreLevel { level: 0, ns: 400 }, CoreLevel { level: 1, ns: 600 }], window_cap: 0, window_floor: 1, inject_permille: 250, injected_ns: 70, latency_requests: 1, latency_bound_us: 1000 }],
 	};
 	let bytes = g.encode_vec().expect("encode");
 	assert_eq!(Graph::decode(&bytes), Some(g));

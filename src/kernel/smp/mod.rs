@@ -617,6 +617,7 @@ pub fn acpi_table(rsdp_phys: u64, want: &[u8; 4]) -> Option<&'static [u8]> {
 // THE `instance`-TH TABLE OF A SIGNATURE, in the order the root table lists them - so a machine with two
 // SSDTs, or a firmware that publishes two descriptions of one kind, has each reachable rather than only its
 // first. `table:SIG#n` names what this answers for `n`.
+#[cfg(target_arch = "x86_64")]
 pub fn acpi_table_instance(rsdp_phys: u64, want: &[u8; 4], instance: usize) -> Option<&'static [u8]> {
 	if rsdp_phys == 0 || !mem::within_direct_map(rsdp_phys, 36) {
 		return None;

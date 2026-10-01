@@ -53,14 +53,11 @@ pub fn kernel_image() -> (u64, usize) {
 // `opt/org.libersystem/system-variant` are a part of the system image's digest - what a boot of another build of the
 // system changes. The hibernation gate cannot boot a second build of one tree, so it boots this one naming a variant; a
 // shipping boot names no profile, and the file is never read there.
-pub fn development_variant(out: &mut alloc::vec::Vec<u8>) {
+pub fn development_variant(out: &mut [u8; 64]) -> usize {
 	if super::boot_profile().is_none() {
-		return;
+		return 0;
 	}
-	let mut variant = [0u8; 64];
-	if let Some(len) = super::fwcfg::read_file(b"opt/org.libersystem/system-variant", &mut variant) {
-		out.extend_from_slice(&variant[..len]);
-	}
+	super::fwcfg::read_file(b"opt/org.libersystem/system-variant", out).unwrap_or(0)
 }
 
 // THE RESUME CONTEXT this kernel writes into a snapshot, and checks a restore's against.
@@ -342,7 +339,7 @@ pub fn replace_memory(restore: &mut disk::Restore) -> i64 {
 	let [_, image_cr3, entry, stack, _, top, _, _] = decode(&restore.context);
 	let gib = top.div_ceil(1 << 30);
 	let (lists, pages) = restore.pairs();
-	let list_pages: alloc::vec::Vec<u64> = lists.to_vec();
+	let Some(list_pages) = crate::mem::heap::try_to_vec(lists) else { return ERR_RESOURCE_EXHAUSTED };
 	let dir_count = (list_pages.len() as u64).div_ceil(PER_DIR);
 	if gib == 0 || gib > 512 || dir_count > MAX_DIRS {
 		return ERR_UNSUPPORTED;
@@ -354,10 +351,12 @@ pub fn replace_memory(restore: &mut disk::Restore) -> i64 {
 		let pml4 = take()?;
 		let pdpt = take()?;
 		let mut pds = alloc::vec::Vec::new();
+		pds.try_reserve_exact(gib as usize).map_err(|_| ERR_RESOURCE_EXHAUSTED)?;
 		for _ in 0..gib {
 			pds.push(take()?);
 		}
 		let mut dirs = alloc::vec::Vec::new();
+		dirs.try_reserve_exact(dir_count as usize).map_err(|_| ERR_RESOURCE_EXHAUSTED)?;
 		for _ in 0..dir_count {
 			dirs.push(take()?);
 		}

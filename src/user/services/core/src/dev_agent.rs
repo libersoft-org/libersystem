@@ -388,6 +388,14 @@ fn serve(catalogue: u64, bootstrap: u64, storage: u64, nonce: [u8; 8]) -> ! {
 				exit();
 			}
 		}
+		// A PROVIDER THAT WENT AWAY WITH NOTHING LEFT QUEUED: the peek above answers peer-closed, so the read that detaches
+		// never ran - and a closed stream left among the handles waited on below answers that wait at once, for ever, which
+		// kept a core busy for as long as the agent ran.
+		if wire.stream != 0 && channel_peek(wire.stream) == ERR_PEER_CLOSED {
+			wire.detach();
+			session.close();
+			pending.clear();
+		}
 		if arrived {
 			// Rearm the deadlines against what the parse left behind. The fragment deadline
 			// dates from when the fragment first appeared, not from the last byte of it, so

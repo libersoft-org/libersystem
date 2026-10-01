@@ -118,6 +118,7 @@ pub fn set_clock_base(unix: u64) -> i64 {
 }
 
 // A suspend to RAM with no RTC to measure it: its length comes with the next base.
+#[cfg(target_arch = "x86_64")]
 pub fn slept_unknown() {
 	SLEPT_UNKNOWN.store(true, Ordering::Release);
 }
@@ -196,6 +197,7 @@ fn take_woke() -> Option<(u32, u32)> {
 }
 
 // Whether the machine is in a sleep - for the handlers that report a wake rather than an event.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn sleeping() -> bool {
 	crate::idle::sleeping()
 }
@@ -254,8 +256,12 @@ pub fn prologue(what: &str) -> Result<u64, i64> {
 	Ok(suspended_at)
 }
 
-// THE COMMON EPILOGUE, after the rebase: the resume line, and the COM1 window closed.
+// THE COMMON EPILOGUE, after the rebase: the resume line, and the COM1 window closed - and after a sleep that lost power,
+// every core's performance level and preference written again, since firmware may have reset the registers.
 pub fn epilogue(report: &SleepReport, lost_settings: bool) {
+	if lost_settings {
+		crate::processor::resumed();
+	}
 	arch::serial::sleep_wake(lost_settings);
 	crate::serial_println!("sleep: resumed ({}, after {} ms, at tick {})", wake_name(report.wake), report.slept_ns / 1_000_000, arch::apic::ticks());
 	arch::serial::sleep_end();
@@ -269,6 +275,7 @@ fn wake_name(reason: u32) -> &'static str {
 		abi::WAKE_DEVICE => "a device",
 		abi::WAKE_RTC => "the RTC alarm",
 		abi::WAKE_PLATFORM => "the platform",
+		abi::WAKE_RESTORED => "the restore of a hibernation image",
 		_ => "an unknown wake",
 	}
 }

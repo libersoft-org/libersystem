@@ -66,6 +66,10 @@
 #   acpi-fixture.py --tad-clock FILE UNIX          set the Time and Alarm Device's clock to UNIX (UTC)
 #   acpi-fixture.py --tad-read FILE                print the timers the TAD's driver programmed, as JSON
 #   acpi-fixture.py --power-read FILE              print the sleep devices' power resources and states, as JSON
+#   acpi-fixture.py --processor-read FILE          print what the kernel wrote to the processors' registers, `_PPC`,
+#                                                  each fan's level and `_SCP`, as JSON
+#   acpi-fixture.py --raise CONTROL LINE           raise LINE through the GPIO backend's control socket until an event
+#                                                  fires - PROCESSOR_LINE notifies C000 with 0x80
 #   acpi-fixture.py --self-test        build the table and check it, writing nothing
 #
 # THE SLEEP GATE'S DEVICES (`--out FILE --sleep`, and `--memory FILE --sleep`), in the same table so their `Notify` has
@@ -75,6 +79,21 @@
 #   PNP0C0E  (`\_SB.SLPB`) - a control-method sleep button, and `_PRW`.
 #   ACPI000E (`\_SB.TAD0`) - a Time and Alarm Device: `_GCP` from the pages, `_GRT` the pages' sixteen bytes - the harness
 #            keeps them running - and `_STV`, `_TIV`, `_GWS` and `_CWS` over the pages' timers, `_STV` counted.
+# THE PROCESSOR-POWER GATE'S OBJECTS (`--out FILE --processors`, and `--memory FILE --processors`), in the same table so
+# their registers are in the same function's BAR and their `Notify` has the GPIO controller's `_AEI` to come from:
+#   `\_SB.CPUS.C000` - `_PSS` (3000, 2400, 1800 and 1200 MHz, control 0x10 to 0x13) through `_PCT`'s control and status
+#            registers, `_PPC` the pages' byte and `_PSD` software-all over itself; line PROCESSOR_LINE's `_E07`
+#            notifies it with 0x80. ITS `_OST` IS QEMU'S: the q35 DSDT declares one on every `\_SB.CPUS` processor for
+#            CPU hot-plug, it stands before this table's, and QEMU keeps what it was told (`query-acpi-ospm-status`).
+#   `\_SB.CPUS.C001` - CPPC: `_CPC` revision 3, 255 to 50, its desired-performance and energy-preference registers.
+#   `\_SB.CPUS.C002` - `_PSS` through a `_PCT` of model-specific registers, which the kernel refuses whole.
+#   Every one of them an `_LPI` of three states - the halt, then two entered by a read of the same two registers on every
+#   core, 50 and 400 us out. The kernel's registers - `_PCT`'s, `_CPC`'s and `_LPI`'s - are on PROCESSOR_PAGE, a page of
+#   their own past every node's range, which only the kernel maps (the development build's fixture exception).
+#   THE ZONE gains `_TC1` 4, `_TC2` 3, `_TSP` 1 s, `_PSL` naming C000 and C001, `_AL0` naming FAN0 and `_SCP`.
+# THE FANS, in the sleep table and the processor-power table: `\_SB.FAN0` (`PNP0C0B`, three `_FPS` levels - control 0, 50
+# and 100) and `\_SB.FAN1` (`PNP0C0B`, `_FIF`'s fine-grain control in steps of 5 %), `_FSL` and `_FST` over the pages.
+#
 # AND TWO POWER RESOURCES: `\_SB.PSLP` in the `_PR0` of both the lid and the TAD - on while either is in D0, off only
 # when both have left it - and `\_SB.PWAK` in the lid's `_PRW`, on while its wake is armed. Each resource's state and the
 # counts of its `_ON` and `_OFF` are in the pages, and so is the last `_PSx` each device ran; the lid says `_S0W` and
@@ -146,6 +165,28 @@ TAD_DISABLED = 0xFFFFFFFF
 POWER_PAGE = 0x70
 POWER_BYTES = ('pslp_on', 'pslp_ons', 'pslp_offs', 'pwak_on', 'pwak_ons', 'pwak_offs', 'lid_ps', 'tad_ps')
 SLEEP_EVENT_BITS = {'lid-close': 1, 'lid-open': 1, 'power-button': 2, 'sleep-button': 4}
+
+# THE PROCESSOR-POWER GATE'S PAGES: C000's `_PPC` byte, each fan's level and its `_FSL` count, and the zone's `_SCP`
+# mode and count.
+PROCESSOR_LINE = 7
+PROCESSOR_PPC = 0x80
+FAN_PAGE = 0x90
+ZONE_SCP = 0xA0
+# THE KERNEL'S REGISTERS, on a page of their own: `_PCT`'s control and status, `_CPC`'s desired performance and energy
+# preference, and the two `_LPI` entry registers.
+PROCESSOR_PAGE = 0x8000
+PCT_CONTROL = PROCESSOR_PAGE + 0x00
+PCT_STATUS = PROCESSOR_PAGE + 0x04
+CPC_DESIRED = PROCESSOR_PAGE + 0x08
+CPC_PREFERENCE = PROCESSOR_PAGE + 0x0C
+LPI_ENTRY = (PROCESSOR_PAGE + 0x10, PROCESSOR_PAGE + 0x14)
+PSS_STATES = [(3000, 15000, 10, 10, 0x10, 0x10), (2400, 10000, 10, 10, 0x11, 0x11), (1800, 6000, 10, 10, 0x12, 0x12), (1200, 3000, 10, 10, 0x13, 0x13)]
+# THE `_LPI` STATES past the halt: (residency, latency) in microseconds.
+LPI_STATES = [(150, 50), (1200, 400)]
+CPPC_LEVELS = (255, 200, 100, 50)
+SPACE_MEMORY = 0
+SPACE_FIXED_HARDWARE = 0x7F
+PROCESSOR_FIELDS = {'ppc': (PROCESSOR_PPC, 1), 'fan0': (FAN_PAGE, 4), 'fan1': (FAN_PAGE + 8, 4)}
 
 # THE UCSI DEVICE (`\_SB.UCSI`), absent until the harness's `UCPR` byte says a PPM is there: `_HID` `USBC000` and `_CID`
 # `PNP0CA0`, as shipping laptops name it, its mailbox `_CRS` range at UCSI_RANGE past the harness's pages and its own
@@ -228,7 +269,91 @@ def sleep_devices(ivsh):
 	]
 
 
-def ssdt_body(ucsi_version=0x0210, sleep=False):
+def patched(name_, buffers, ivsh):
+	"""A METHOD'S BODY that writes each `(index, offset, space, bits)` register - its address the BAR's base plus `offset` -
+	into the package `name_` at `index`, and answers the package: the register descriptors are data, and the base is
+	read at run time."""
+	body = []
+	for at, (index, offset, space, bits) in enumerate(buffers):
+		buffer_name = f'RB{at:02X}'
+		body += [
+			E.name(buffer_name, E.buffer(E.resource_template(E.generic_register(space, bits, 0)))),
+			E.create_dword_field(buffer_name, 7, f'RA{at:02X}'),
+			E.store(E.add(E.call(ivsh + '.BASE'), offset), f'RA{at:02X}'),
+			E.store(buffer_name, E.index(name_, index)),
+		]
+	return body + [E.ret(name_)]
+
+
+def lpi(ivsh):
+	"""`_LPI`: the halt, then the two states entered by a read of LPI_ENTRY - the same registers on every core."""
+	none = E.buffer(E.resource_template(E.generic_register(0, 0, 0)))
+	halt = E.package(1, 1, 1, 0, 0, 0, E.buffer(E.resource_template(E.generic_register(SPACE_FIXED_HARDWARE, 1, 0, offset=1))), none, none, E.string('C1'))
+	states = [E.package(residency, latency, 1, 0, 0, 0, 0, none, none, E.string(f'C{2 + at}')) for at, (residency, latency) in enumerate(LPI_STATES)]
+	body = [E.store('LPS0', E.index('PLPI', 3))]
+	for at, offset in enumerate(LPI_ENTRY):
+		state = f'LPS{at + 1}'
+		body += [
+			E.name(f'RB{at:02X}', E.buffer(E.resource_template(E.generic_register(SPACE_MEMORY, 32, 0)))),
+			E.create_dword_field(f'RB{at:02X}', 7, f'RA{at:02X}'),
+			E.store(E.add(E.call(ivsh + '.BASE'), offset), f'RA{at:02X}'),
+			E.store(f'RB{at:02X}', E.index(state, 6)),
+			E.store(state, E.index('PLPI', 4 + at)),
+		]
+	return [
+		E.name('LPS0', halt),
+		E.name('LPS1', states[0]),
+		E.name('LPS2', states[1]),
+		E.name('PLPI', E.package(0, 0, 1 + len(LPI_STATES), 0, 0, 0)),
+		E.method('_LPI', 0, body + [E.ret('PLPI')], serialized=True),
+	]
+
+
+def processor_objects(ivsh):
+	"""THE THREE PROCESSORS' POWER OBJECTS, added to the nodes QEMU's DSDT declares."""
+	pss = E.name('_PSS', E.package(*[E.package(*state) for state in PSS_STATES]))
+	highest, nominal, nonlinear, lowest = CPPC_LEVELS
+	cpc = [23, 3, highest, nominal, nonlinear, lowest, 0, 0, 0, 0] + [0] * 9 + [0, 0, 0, 0]
+	msr = lambda address: E.buffer(E.resource_template(E.generic_register(SPACE_FIXED_HARDWARE, 64, address)))
+	return [
+		E.scope('\\_SB.CPUS.C000', [
+			pss,
+			E.name('PPCT', E.package(0, 0)),
+			E.method('_PCT', 0, patched('PPCT', [(0, PCT_CONTROL, SPACE_MEMORY, 32), (1, PCT_STATUS, SPACE_MEMORY, 32)], ivsh), serialized=True),
+			E.method('_PPC', 0, [E.ret(ivsh + '.PPCV')]),
+			E.name('_PSD', E.package(E.package(5, 0, 0, 0xFC, 1))),
+		] + lpi(ivsh)),
+		E.scope('\\_SB.CPUS.C001', [
+			E.name('PCPC', E.package(*cpc)),
+			E.method('_CPC', 0, patched('PCPC', [(7, CPC_DESIRED, SPACE_MEMORY, 32), (19, CPC_PREFERENCE, SPACE_MEMORY, 32)], ivsh), serialized=True),
+		] + lpi(ivsh)),
+		E.scope('\\_SB.CPUS.C002', [
+			E.name('_PSS', E.package(*[E.package(*state) for state in PSS_STATES[:2]])),
+			E.name('_PCT', E.package(msr(0x199), msr(0x198))),
+		] + lpi(ivsh)),
+	]
+
+
+def fans(ivsh):
+	"""FAN0, WITH LEVELS, AND FAN1, LEFT TO THE OPERATING SYSTEM IN FINE STEPS: `_FSL` writes the level into the pages
+	and counts itself, `_FST` answers it with a speed of forty rpm per unit."""
+	def fan(n, uid, fif, fps, level, count):
+		return E.device(n, [
+			E.name('_HID', E.eisaid('PNP0C0B')),
+			E.name('_UID', uid),
+			E.name('_FIF', E.package(*fif)),
+			E.name('_FPS', E.package(0, *[E.package(control, 0xFFFFFFFF, speed, noise, power) for control, speed, noise, power in fps])),
+			E.method('_FSL', 1, [E.store(E.arg(0), ivsh + '.' + level), E.increment(ivsh + '.' + count)], serialized=True),
+			E.name('PFST', E.package(0, 0, 0)),
+			E.method('_FST', 0, [E.store(ivsh + '.' + level, E.index('PFST', 1)), E.store(E.multiply(ivsh + '.' + level, 40), E.index('PFST', 2)), E.ret('PFST')], serialized=True),
+		])
+	return [
+		fan('FAN0', 0, (0, 0, 0, 0), [(0, 0, 0, 0), (50, 2000, 30, 1500), (100, 4000, 45, 3000)], 'F0LV', 'F0LN'),
+		fan('FAN1', 1, (0, 1, 5, 0), [(0, 0, 0, 0), (100, 4000, 45, 3000)], 'F1LV', 'F1LN'),
+	]
+
+
+def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False):
 	# THE NODES QEMU'S DSDT ALREADY HAS for the three functions - `S` and the slot times eight - opened with `Scope`: a
 	# second node with the same `_ADR` would be a second companion of one function.
 	ivsh = f'\\_SB.PCI0.S{IVSHMEM_SLOT << 3:02X}'
@@ -255,9 +380,15 @@ def ssdt_body(ucsi_version=0x0210, sleep=False):
 			], access='AnyAcc'),
 			# THE SLEEP GATE'S BYTES, THE TAD'S TIMERS AND ITS CLOCK.
 			E.field('HPGS', [
-				E.offset_to(SLEEP_EVENTS * 8), E.unit('SLEV', 8), E.unit('LIDO', 8), E.offset_to(TAD_GCP * 8), E.unit('TGCP', 32),
-				E.unit('TACT', 32), E.unit('TDCT', 32), E.unit('TAST', 32), E.unit('TDST', 32), E.unit('STVN', 32),
-				E.offset_to(TAD_GRT * 8), E.unit('TGRT', 128),
+				E.offset_to(SLEEP_EVENTS * 8), E.unit('SLEV', 8), E.unit('LIDO', 8), E.offset_to((TAD_GCP - LID_OPEN - 1) * 8),
+				E.unit('TGCP', 32), E.unit('TACT', 32), E.unit('TDCT', 32), E.unit('TAST', 32), E.unit('TDST', 32), E.unit('STVN', 32),
+				E.offset_to((TAD_GRT - TAD_STV_CALLS - 4) * 8), E.unit('TGRT', 128),
+			], access='AnyAcc'),
+			# THE PROCESSOR-POWER GATE'S BYTES: `_PPC`, the fans and `_SCP`.
+			E.field('HPGS', [
+				E.offset_to(PROCESSOR_PPC * 8), E.unit('PPCV', 8),
+				E.offset_to((FAN_PAGE - PROCESSOR_PPC - 1) * 8), E.unit('F0LV', 32), E.unit('F0LN', 32), E.unit('F1LV', 32), E.unit('F1LN', 32),
+				E.offset_to((ZONE_SCP - FAN_PAGE - 16) * 8), E.unit('SCPM', 8), E.unit('SCPN', 8),
 			], access='AnyAcc'),
 			# THE UCSI STAGING AREAS AND COUNTERS.
 			E.field('HPGS', [
@@ -267,7 +398,7 @@ def ssdt_body(ucsi_version=0x0210, sleep=False):
 			], access='AnyAcc'),
 		]),
 		E.scope(gpio, [
-			E.name('_AEI', E.buffer(E.resource_template(*[E.gpio_int([line], gpio, edge=True) for line in [AEI_LINE, POWER_LINE, UCSI_LINE] + ([SLEEP_LINE] if sleep else [])]))),
+			E.name('_AEI', E.buffer(E.resource_template(*[E.gpio_int([line], gpio, edge=True) for line in [AEI_LINE, POWER_LINE, UCSI_LINE] + ([SLEEP_LINE] if sleep else []) + ([PROCESSOR_LINE] if processors else [])]))),
 			E.method(f'_E{AEI_LINE:02X}', 0, [E.notify('\\_SB.LSF1', 0x80)]),
 			# THE PPM'S NOTIFICATION, as a laptop's notification method makes it: the copy, then `Notify`.
 			E.method(f'_E{UCSI_LINE:02X}', 0, [E.call('\\_SB.UCSI.COPY'), E.increment(ivsh + '.NCNT'), E.notify('\\_SB.UCSI', 0x80)]),
@@ -280,7 +411,10 @@ def ssdt_body(ucsi_version=0x0210, sleep=False):
 				E.if_(E.band(ivsh + '.SLEV', 4), [E.notify('\\_SB.SLPB', 0x80)]),
 				E.store(0, ivsh + '.SLEV'),
 			], serialized=True),
-		] if sleep else [])),
+		] if sleep else []) + ([
+			# THE PROCESSOR'S PERFORMANCE LIMIT CHANGED: C000 notified, `_PPC` read again from the pages.
+			E.method(f'_E{PROCESSOR_LINE:02X}', 0, [E.notify('\\_SB.CPUS.C000', 0x80)]),
+		] if processors else [])),
 		E.scope('\\_SB', [
 			E.device('LSF1', [
 				E.name('_HID', E.string('LSFX0001')),
@@ -359,7 +493,7 @@ def ssdt_body(ucsi_version=0x0210, sleep=False):
 				E.name('_HID', E.string('ACPI0003')),
 				E.method('_PSR', 0, [E.ret(ivsh + '.APSR')]),
 			]),
-		] + (sleep_devices(ivsh) if sleep else [])),
+		] + (sleep_devices(ivsh) if sleep else []) + (fans(ivsh) if sleep or processors else [])),
 		E.scope('\\_TZ', [
 			E.thermal_zone('TZ00', [
 				E.method('_TMP', 0, [E.ret(ivsh + '.TTMP')]),
@@ -367,13 +501,20 @@ def ssdt_body(ucsi_version=0x0210, sleep=False):
 				E.name('_HOT', 3632),
 				E.name('_PSV', 3532),
 				E.name('_AC0', 3432),
-			]),
+			] + ([
+				E.name('_TC1', 4),
+				E.name('_TC2', 3),
+				E.name('_TSP', 10),
+				E.name('_PSL', E.package('\\_SB.CPUS.C000', '\\_SB.CPUS.C001')),
+				E.name('_AL0', E.package('\\_SB.FAN0')),
+				E.method('_SCP', 1, [E.store(E.arg(0), ivsh + '.SCPM'), E.increment(ivsh + '.SCPN')], serialized=True),
+			] if processors else [])),
 		]),
-	]
+	] + (processor_objects(ivsh) if processors else [])
 
 
-def ssdt(ucsi_version=0x0210, sleep=False):
-	return E.table('SSDT', ssdt_body(ucsi_version, sleep), oem_table_id=b'LIBACPIF')
+def ssdt(ucsi_version=0x0210, sleep=False, processors=False):
+	return E.table('SSDT', ssdt_body(ucsi_version, sleep, processors), oem_table_id=b'LIBACPIF')
 
 
 HID_OVER_I2C = '3cdff6f7-4267-4555-ad05-b30a3d8938de'
@@ -426,6 +567,56 @@ def tcpc_ssdt():
 	return E.table('SSDT', tcpc_body(), oem_table_id=b'LIBTCPC ')
 
 
+# WHERE EACH NAMED UNIT OF THE HARNESS PAGES' FIELDS SITS, at the byte offset the host's readers and writers use. A field
+# list places its units RELATIVELY - a reserved run is a length, not a position - so a list that names a position where
+# it means a length moves every unit after it, and the methods read bytes nobody writes: the TAD's `_GCP` once read
+# zero that way, and its driver said the device had no clock. The self-test decodes every `HPGS` list of each table and
+# holds each unit to this.
+PAGE_UNITS = {
+	'VAL0': VALUE_OFFSET, 'PRS0': PRESENT_OFFSETS[0], 'PRS1': PRESENT_OFFSETS[1], 'BSTA': BATTERY_STA, 'BSTS': BATTERY_BST,
+	'BRAT': BATTERY_BST + 4, 'BREM': BATTERY_BST + 8, 'BVOL': BATTERY_BST + 12, 'APSR': AC_PSR, 'TTMP': ZONE_TMP,
+	**{name: POWER_PAGE + at for at, name in enumerate(('PSST', 'PSON', 'PSOF', 'PWST', 'PWON', 'PWOF', 'LIDP', 'TADP'))},
+	'SLEV': SLEEP_EVENTS, 'LIDO': LID_OPEN, 'TGCP': TAD_GCP, 'TACT': TAD_AC_TIMER, 'TDCT': TAD_DC_TIMER, 'TAST': TAD_AC_STATUS,
+	'TDST': TAD_DC_STATUS, 'STVN': TAD_STV_CALLS, 'TGRT': TAD_GRT,
+	'PPCV': PROCESSOR_PPC, 'F0LV': FAN_PAGE, 'F0LN': FAN_PAGE + 4, 'F1LV': FAN_PAGE + 8, 'F1LN': FAN_PAGE + 12, 'SCPM': ZONE_SCP,
+	'SCPN': ZONE_SCP + 1,
+	'UCPR': UCSI_PRESENT, 'ODBL': UCSI_DOORBELL, 'LOG2': UCSI_REFRESHES, 'NCNT': UCSI_NOTIFIES, 'OCTL': UCSI_CONTROL,
+	'IVER': UCSI_VERSION, 'ICCI': UCSI_CCI, 'OMSG': UCSI_MESSAGE_OUT, 'IMSG': UCSI_MESSAGE_IN,
+}
+
+
+def page_units(table):
+	"""Every named unit of every `HPGS` field list in `table`, as (name, byte offset, bit remainder) in table order."""
+	def length(at):
+		lead = table[at]
+		if lead >> 6 == 0:
+			return lead & 0x3F, at + 1
+		value = lead & 0x0F
+		for i in range(lead >> 6):
+			value |= table[at + 1 + i] << (4 + 8 * i)
+		return value, at + 1 + (lead >> 6)
+
+	units = []
+	start = table.find(b'\x5b\x81', 36)
+	while start >= 0:
+		size, body = length(start + 2)
+		end = start + 2 + size
+		if table[body:body + 4] == b'HPGS' and end <= len(table):
+			at, bit = body + 5, 0
+			while at < end:
+				if table[at] == 0x00:
+					bits, at = length(at + 1)
+				elif table[at] in (0x01, 0x03):
+					at, bits = at + (3 if table[at] == 0x01 else 4), 0
+				else:
+					name = table[at:at + 4].decode('ascii', 'replace')
+					bits, at = length(at + 4)
+					units.append((name, bit // 8, bit % 8))
+				bit += bits
+		start = table.find(b'\x5b\x81', start + 2)
+	return units
+
+
 def grt_bytes(unix):
 	"""`_GRT`'s sixteen bytes for a Unix time: UTC, the zone unspecified, valid."""
 	import datetime
@@ -433,7 +624,7 @@ def grt_bytes(unix):
 	return struct.pack('<HBBBBBBHhB3x', at.year, at.month, at.day, at.hour, at.minute, at.second, 1, 0, 2047, 0)
 
 
-def create_memory(path, ucsi_version=None, sleep=False):
+def create_memory(path, ucsi_version=None, sleep=False, processors=False):
 	data = bytearray(MEMORY_SIZE)
 	# THE SLEEP DEVICES: the lid open, the TAD with its clock, both wake timers disabled, and its clock at the host's time
 	# until the gate sets another.
@@ -466,11 +657,12 @@ def poke(path, offset, data):
 
 
 def set_values(path, pairs):
+	fields = {**POWER_FIELDS, **PROCESSOR_FIELDS}
 	for pair in pairs:
 		name, _, value = pair.partition('=')
-		if name not in POWER_FIELDS or not value:
-			raise SystemExit(f'acpi-fixture: {pair!r} is not NAME=VALUE with a NAME of {", ".join(POWER_FIELDS)}')
-		offset, size = POWER_FIELDS[name]
+		if name not in fields or not value:
+			raise SystemExit(f'acpi-fixture: {pair!r} is not NAME=VALUE with a NAME of {", ".join(fields)}')
+		offset, size = fields[name]
 		poke(path, offset, int(value, 0).to_bytes(size, 'little'))
 
 
@@ -544,6 +736,45 @@ def sleep_event(path, control, name):
 		time.sleep(0.05)
 
 
+def processor_read(path):
+	"""WHAT THE KERNEL AND THE FIRMWARE WROTE: `_PCT`'s control and status, `_CPC`'s desired performance and preference,
+	`_PPC`, each fan's level and `_FSL` count, and `_SCP`'s mode and count."""
+	import json
+	with open(path, 'rb') as handle:
+		data = handle.read()
+	dword = lambda offset: struct.unpack_from('<I', data, offset)[0]
+	print(json.dumps({
+		'pct_control': dword(PCT_CONTROL), 'pct_status': dword(PCT_STATUS), 'cpc_desired': dword(CPC_DESIRED), 'cpc_preference': dword(CPC_PREFERENCE),
+		'ppc': data[PROCESSOR_PPC],
+		'fan0': dword(FAN_PAGE), 'fan0_calls': dword(FAN_PAGE + 4), 'fan1': dword(FAN_PAGE + 8), 'fan1_calls': dword(FAN_PAGE + 12),
+		'scp': data[ZONE_SCP], 'scp_calls': data[ZONE_SCP + 1],
+	}))
+	return 0
+
+
+def raise_line(control, line):
+	"""LINE `line` lowered and raised until the backend says an event fired - it fires only where the guest armed it."""
+	import socket
+	import time
+	sock = socket.socket(socket.AF_UNIX)
+	sock.connect(control)
+	sock.settimeout(5)
+
+	def ask(text):
+		sock.sendall((text + '\n').encode())
+		return sock.recv(4096).decode()
+
+	deadline = time.monotonic() + 10
+	while True:
+		ask(f'lower {line}')
+		if 'fired' in ask(f'raise {line}'):
+			print(f'acpi-fixture: line {line} raised')
+			return 0
+		if time.monotonic() >= deadline:
+			raise SystemExit(f'acpi-fixture: no event fired on line {line}')
+		time.sleep(0.05)
+
+
 def tad_read(path):
 	import json
 	with open(path, 'rb') as handle:
@@ -588,17 +819,38 @@ def self_test():
 			failures.append(f'the plain table carries the sleep gate\'s {needle!r}')
 	if len(grt_bytes(0)) != 16:
 		failures.append('_GRT is not sixteen bytes')
+	processors = ssdt(processors=True)
+	if sum(processors) & 0xFF or struct.unpack('<I', processors[4:8])[0] != len(processors):
+		failures.append('the processor table\'s checksum or length')
+	for needle in (b'C000', b'C001', b'C002', b'_PSS', b'_PCT', b'_PPC', b'_PSD', b'_CPC', b'_LPI', b'_PSL', b'_AL0', b'_TC1', b'_TC2', b'_TSP', b'_SCP', b'FAN0', b'FAN1', b'_FIF', b'_FPS', b'_FSL', b'_FST', b'_E07', E.generic_register(SPACE_FIXED_HARDWARE, 64, 0x199)):
+		if needle not in processors:
+			failures.append(f'the processor table lacks {needle!r}')
+		if needle in table and needle not in (b'C000',):
+			failures.append(f'the plain table carries the processor gate\'s {needle!r}')
+	if b'FAN0' not in sleep:
+		failures.append('the sleep table lacks the fans')
 	tcpc = tcpc_ssdt()
 	if sum(tcpc) & 0xFF or struct.unpack('<I', tcpc[4:8])[0] != len(tcpc):
 		failures.append('the TCPCI table\'s checksum or length')
 	for needle in (b'PRP0001', b'TCPC', b'CON0', b'tcpci', b'usb-c-connector', b'sink-pdos', b'op-sink-microwatt', E.i2c_serial_bus_v2(TCPC_ADDRESS, f'\\_SB.PCI0.S{I2C_SLOT << 3:02X}', speed=400000), E.gpio_int([TCPC_LINE], f'\\_SB.PCI0.S{GPIO_SLOT << 3:02X}', edge=False, active_low=True)):
 		if needle not in tcpc:
 			failures.append(f'the TCPCI table lacks {needle!r}')
+	# EVERY UNIT OF THE HARNESS PAGES WHERE THE HOST READS AND WRITES IT, in each table.
+	placed = 0
+	for label, built in (('plain', table), ('sleep', sleep), ('processor', processors)):
+		for name, offset, remainder in page_units(built):
+			placed += 1
+			if name not in PAGE_UNITS:
+				failures.append(f'the {label} table\'s harness pages name {name}, which PAGE_UNITS does not place')
+			elif (offset, remainder) != (PAGE_UNITS[name], 0):
+				failures.append(f'the {label} table places {name} at {offset:#x} (+{remainder} bits), not at {PAGE_UNITS[name]:#x}')
+	if not {name for name, _, _ in page_units(sleep)} >= {'TGCP', 'TGRT', 'SLEV', 'PSST'}:
+		failures.append('the sleep table\'s harness pages were not decoded')
 	if failures:
 		for failure in failures:
 			print(f'acpi-fixture: {failure}', file=sys.stderr)
 		return 1
-	print(f'acpi-fixture: the SSDT builds ({len(table)} bytes)')
+	print(f'acpi-fixture: the SSDT builds ({len(table)} bytes), {placed} harness-page units in place')
 	return 0
 
 
@@ -613,6 +865,9 @@ def main():
 	parser.add_argument('--power-storm', nargs=2, metavar=('FILE', 'CONTROL'))
 	parser.add_argument('--ucsi-version', type=lambda text: int(text, 0), help='a UCSI PPM is present, with this VERSION (0x0120, 0x0210)')
 	parser.add_argument('--sleep', action='store_true', help='the table and the memory carry the sleep gate\'s devices')
+	parser.add_argument('--processors', action='store_true', help='the table carries the processor-power gate\'s processors, fans and zone objects')
+	parser.add_argument('--processor-read', metavar='FILE')
+	parser.add_argument('--raise', nargs=2, metavar=('CONTROL', 'LINE'), dest='raise_')
 	parser.add_argument('--sleep-event', nargs=3, metavar=('FILE', 'CONTROL', 'NAME'))
 	parser.add_argument('--tad-clock', nargs=2, metavar=('FILE', 'UNIX'))
 	parser.add_argument('--tad-read', metavar='FILE')
@@ -623,7 +878,7 @@ def main():
 		return self_test()
 	if args.out:
 		with open(args.out, 'wb') as out:
-			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep))
+			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep, args.processors))
 	if args.hid_out:
 		with open(args.hid_out, 'wb') as out:
 			out.write(hid_ssdt())
@@ -631,7 +886,7 @@ def main():
 		with open(args.tcpc_out, 'wb') as out:
 			out.write(tcpc_ssdt())
 	if args.memory:
-		create_memory(args.memory, args.ucsi_version, args.sleep)
+		create_memory(args.memory, args.ucsi_version, args.sleep, args.processors)
 	if args.poke:
 		poke(args.poke[0], int(args.poke[1], 0), bytes.fromhex(args.poke[2]))
 	if args.set:
@@ -646,6 +901,10 @@ def main():
 		return tad_read(args.tad_read)
 	if args.power_read:
 		return power_read(args.power_read)
+	if args.processor_read:
+		return processor_read(args.processor_read)
+	if args.raise_:
+		return raise_line(args.raise_[0], int(args.raise_[1], 0))
 	return 0
 
 

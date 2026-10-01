@@ -246,6 +246,7 @@ pub fn init(regions: &[MemRegion], hhdm: u64) {
 	// mmap pool does later can add an entry the copies would miss.
 	heap::reserve_window();
 	crate::syscall::reserve_kernel_vmap();
+	crate::arch::processor::reserve_window();
 	let mut retained = MEMMAP.lock();
 	for region in regions {
 		// ALLOC-OK: the firmware memory map, read once at boot.

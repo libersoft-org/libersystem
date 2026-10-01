@@ -257,6 +257,8 @@ pub fn park_once(cpu: usize) {
 static HOLD: AtomicBool = AtomicBool::new(false);
 static HELD: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
+// THE HOLD IS x86_64'S S3 AND HIBERNATION ENTRY'S - the other ports' entry is suspend to idle alone.
+#[cfg(target_arch = "x86_64")]
 pub fn begin_hold() {
 	for held in HELD.iter() {
 		held.store(false, Ordering::Relaxed);
@@ -266,11 +268,13 @@ pub fn begin_hold() {
 }
 
 // Whether every online core but the caller's is held.
+#[cfg(target_arch = "x86_64")]
 pub fn all_others_held() -> bool {
 	let this = crate::sched::current_cpu_id();
 	(0..crate::smp::cpu_count()).all(|cpu| cpu == this || HELD[cpu].load(Ordering::Acquire))
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn end_hold() {
 	HOLD.store(false, Ordering::SeqCst);
 	end_sleep();
@@ -368,9 +372,12 @@ pub fn halt(until: Option<u64>, ready: impl FnOnce() -> bool) {
 	#[cfg(test)]
 	window(cpu, wake);
 	let started = arch::tsc::now();
-	// Entered masked: an interrupt pending since the check ends it at once.
-	arch::idle_halt();
+	// Entered masked: an interrupt pending since the check ends it at once - in the idle state the governor chose, the
+	// halt where this core has no table.
+	crate::processor::enter(cpu, wake);
 	let ended = arch::tsc::now();
+	// AN IDLE PERIOD'S END is one of the performance governor's points; idle owes the injection nothing.
+	let _ = crate::processor::on_tick(cpu);
 	if one_shot {
 		arch::apic::timer_periodic();
 	}
@@ -511,7 +518,10 @@ pub fn info(cpu: usize) -> Option<abi::CpuIdleInfo> {
 		*slot = abi::CpuIdleSource { source: held - 1, _pad: 0, count: count.load(Ordering::Relaxed) };
 		used += 1;
 	}
-	Some(abi::CpuIdleInfo { cpu: cpu as u32, source_count: used, idle_ns: core.idle_ns.load(Ordering::Relaxed), halts: core.halts.load(Ordering::Relaxed), wakes_timer: core.timer.load(Ordering::Relaxed), wakes_ipi: core.ipi.load(Ordering::Relaxed), wakes_housekeeping: core.housekeeping.load(Ordering::Relaxed), wakes_device: core.device.load(Ordering::Relaxed), sources })
+	let mut info = abi::CpuIdleInfo { cpu: cpu as u32, source_count: used, idle_ns: core.idle_ns.load(Ordering::Relaxed), halts: core.halts.load(Ordering::Relaxed), wakes_timer: core.timer.load(Ordering::Relaxed), wakes_ipi: core.ipi.load(Ordering::Relaxed), wakes_housekeeping: core.housekeeping.load(Ordering::Relaxed), wakes_device: core.device.load(Ordering::Relaxed), sources, ..abi::CpuIdleInfo::default() };
+	info.hardware_id = crate::smp::lapic_id(cpu);
+	crate::processor::fill_info(cpu, &mut info);
+	Some(info)
 }
 
 #[cfg(test)]

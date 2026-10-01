@@ -264,6 +264,8 @@ enum sleep-reason {
 	idle          = 4,
 	/// A critical battery, where hibernation is set up.
 	critical      = 5,
+	/// A thermal zone past `_HOT`, where hibernation is set up.
+	thermal       = 6,
 }
 
 /// How the last sleep ended.

@@ -198,14 +198,14 @@ name = "sleepctl"
 path = "src/sleepctl.rs"
 
 [[bin]]
+# THE PROCESSORS' AND THE THERMAL POLICY'S OPERATOR COMMAND: the one shipping holder of `processor-power`.
+name = "powerctl"
+path = "src/powerctl.rs"
+
+[[bin]]
 # THE TPM DEMONSTRATION TOOL: the one shipping holder of the three TPM grants, printing what the TPM answered.
 name = "tpm"
 path = "src/tpm.rs"
-
-[[bin]]
-# THE TPM GATE'S OTHER COMPONENT, development-only in the manifest: observation and sealing, never measurement.
-name = "tpmprobe"
-path = "src/tpmprobe.rs"
 
 [[bin]]
 # THE BMC TOOL: the one shipping holder of the `bmc` read grant and of an administrative request connection scoped to

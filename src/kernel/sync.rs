@@ -89,6 +89,7 @@ impl<T> SpinLock<T> {
 	// The caller must be on a path that never returns to the code the holder was running, and must accept
 	// that a holder on another core may still be touching the data.
 	#[allow(clippy::mut_from_ref)]
+	#[cfg(target_arch = "x86_64")]
 	pub unsafe fn get_unlocked(&self) -> &mut T {
 		unsafe { &mut *self.data.get() }
 	}

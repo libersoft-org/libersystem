@@ -553,7 +553,8 @@ for kind in idle ram; do
 		await_state running 30
 	fi
 	await_line "ServiceManager: sleep: the transaction ended" "sleep: the $kind sleep never ended" "$ended" 180
-	grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "sleep: the $kind sleep did not sleep and wake"
+	ended="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 || true)"
+	grep -q "slept and woke" <<<"$ended" || fail "sleep: the $kind sleep did not sleep and wake"
 	await_line "WatchdogService: restored bmc to" "sleep: the watchdog service did not restore its timeout after the $kind sleep" "$restored" 30
 	for binding in "driver.ipmi: " "driver.smbus-ich9: "; do
 		tail -n 400 "$(serial_log)" | grep -a -q "${binding}.*resumed" || fail "sleep: $binding did not answer the $kind sleep's resume"

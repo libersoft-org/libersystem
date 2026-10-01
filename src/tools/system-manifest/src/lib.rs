@@ -227,6 +227,10 @@ pub enum ProviderKindName {
 	TypecConnector,
 	/// A lid's state and its changes, with the power-state service its one consumer.
 	PlatformSwitch,
+	/// A thermal zone's cooling half, with ProcessorPowerService its one consumer.
+	ThermalZone,
+	/// A fan, with ProcessorPowerService its one consumer.
+	CoolingDevice,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -281,6 +285,8 @@ impl ProviderKindName {
 			ProviderKindName::Ipmi => 26,
 			ProviderKindName::TypecConnector => 27,
 			ProviderKindName::PlatformSwitch => 28,
+			ProviderKindName::ThermalZone => 29,
+			ProviderKindName::CoolingDevice => 30,
 		}
 	}
 }

@@ -109,6 +109,12 @@ declare -A GATES=(
 	# on, the boot after finding none, soft-off where S4 is not offered, a modified image, another system image and
 	# another machine each refused, hybrid sleep both ways, and a machine with no TPM not set up.
 	["hibernate"]="tools/check-hibernate.sh"
+	# PROCESSOR AND THERMAL POWER ON x86_64 q35 WITH THE FIXTURE'S PROCESSORS, ZONE AND FANS: every core's tables installed
+	# from the firmware's objects and C002's model-specific one refused, the state the governor asked for read from the
+	# registers at rest, under load, under `_PPC` and under each profile, the `_LPI` states entered or left unentered with
+	# the reason, a live latency request, a relaunch installing every table again; the zone heated past `_AC0`, `_PSV` and
+	# `_CRT` through the relaunched policy, and past `_CRT` again with it stopped.
+	["processor-power"]="tools/check-processor-power.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

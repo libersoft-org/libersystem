@@ -92,19 +92,50 @@ record core-wake-source {
 	count:  u64,
 }
 
+/// ONE IDLE STATE OF A CORE, as the kernel installed it: how it is entered (0 the halt, 1 MWAIT, 2 a register read, 3
+/// PSCI, 4 the SBI), why it is not entered on this core where it is not (0 it is), its costs in microseconds, and how
+/// many times and for how long it was entered.
+record core-idle-state {
+	entry:               u32,
+	unenterable:         u32,
+	exit-latency-us:     u32,
+	target-residency-us: u32,
+	entries:             u64,
+	residency-ns:        u64,
+}
+
+/// THE TIME A CORE SPENT AT ONE PERFORMANCE LEVEL, in nanoseconds - a record rather than a bare number, so the list
+/// shares no element type with another package's.
+record core-level {
+	level: u32,
+	ns:    u64,
+}
+
 /// HOW ONE CORE RESTS, from the kernel's own record: the time it spent halted, how many times it
 /// halted, and each wake under what ended it - its timer, an IPI, the housekeeping bound, or a
 /// device's interrupt, in total and per identity. Wakes per second are two snapshots and the time
-/// between them.
+/// between them. AND ITS POWER: each idle state with its entries and residency, the performance
+/// level now of the levels its table has and the time at each, the window its governor is held to,
+/// the idle injected, and the live latency requests with the smallest bound (`0xFFFFFFFF` for none).
 record core-idle {
-	cpu:                u32,
-	idle-ns:            u64,
-	halts:              u64,
-	wakes-timer:        u64,
-	wakes-ipi:          u64,
-	wakes-housekeeping: u64,
-	wakes-device:       u64,
-	@bound(8) sources:  list<core-wake-source>,
+	cpu:                  u32,
+	idle-ns:              u64,
+	halts:                u64,
+	wakes-timer:          u64,
+	wakes-ipi:            u64,
+	wakes-housekeeping:   u64,
+	wakes-device:         u64,
+	@bound(8) sources:    list<core-wake-source>,
+	@bound(8) states:     list<core-idle-state>,
+	perf-levels:          u32,
+	perf-level:           u32,
+	@bound(64) levels:    list<core-level>,
+	window-cap:           u32,
+	window-floor:         u32,
+	inject-permille:      u32,
+	injected-ns:          u64,
+	latency-requests:     u32,
+	latency-bound-us:     u32,
 }
 
 /// The whole live System Graph: every component node (services, drivers, devices) with

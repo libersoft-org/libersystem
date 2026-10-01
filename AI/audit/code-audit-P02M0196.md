@@ -374,3 +374,64 @@ COMMANDS AND RESULTS (x86_64 and the host; PASSED unless said):
   this step.
 - NOT RUN: aarch64 and riscv64 (every build and test - at the end of the job, by the standing order), the device
   tree's PCI child join and the tree fixture on the ports, the embedded controller on a laptop.
+
+## P02M0196c - the platform data of processor power (2026-10-01)
+
+WHAT WAS IMPLEMENTED - the third item of step 3 (the first two, the platform half of sleep and the device power
+states, landed with P02M0197a and b and are recorded in that milestone's audit):
+
+- `liber:device@1/processor-firmware` (`src/idl/device.lsidl`): `processors` (every processor by namespace path, its
+  UID and the kernel's core), `power(path)` (`processor-power`: the idle states - `_LPI` where the processor has one,
+  `_CST` otherwise - `_PSS` with `_PCT`'s registers, `_PPC`, `_PSD`, `_CPC` with its energy-preference register,
+  `_TSS` with `_PTC`'s control register, `_TPC`, `_TSD`, and each object that did not evaluate or read, by name),
+  `notifications` (a stream of `Notify` 0x80, 0x81 and 0x82) and `ost(path, event, status)` (`not-found` for a
+  processor without `_OST`). The records: `processor-register`, `processor-idle-state`, `processor-performance-state`,
+  `processor-throttling-state`, `processor-domain`, `processor-cppc`, `processor-id`, `processor-power`,
+  `processor-notification`. And `acpi-node.has(name)`, an object's presence with nothing evaluated - the zone's
+  driver asks it before `_SCP`, a method whose call changes the platform.
+- `acpi_model::processor` (`src/user/libs/acpi/model/src/processor.rs`): `gas`, `cst`, `lpi`, `pss`,
+  `control_status`, `domain`, `cpc` (with element 19, the energy-performance preference register), `tss`, `uid_of`
+  (a `Processor` object's processor ID, else `_UID` in decimal or `0x` hexadecimal) and `core_of` (the UID matched
+  against the MADT's, and the APIC ID that entry gives against each core's hardware ID). `acpi::Madt::processors`
+  (`src/acpi/src/lib.rs`) reads the local APIC and x2APIC entries; `CpuIdleInfo.hardware_id` (`src/abi`) carries each
+  core's APIC ID out of the kernel (`idle::info`).
+- THE SERVICE (`src/user/services/core/src/acpi_service.rs`): the PROCESSORS serve-root (`services/manifest.toml`,
+  `liber:device@1/processor-firmware`, CONNECT minting at most two connections - an instance and a replacement's),
+  each processor recorded by path and UID in the walk (`processor()`, after its `_OSC`/`_PDC` handshake), the MADT
+  read once at the start (`madt_processors`), `processor_power` evaluating and reading every object
+  (`processor_object`, `read_object`, `limit`), `processor_ost`, and `processor_notification` forwarding a processor's
+  0x80 to 0x82 to every connection's stream from `deliver_notifications`. `ProcessorView` is the
+  `processor_firmware::Service`; `serve_processors` the root's and the connections' loop.
+
+DECISIONS:
+
+- The processor is keyed by namespace path (`Path::text`, every segment four characters) and its UID; the core by the
+  MADT's APIC ID matched against the kernel's own per-core hardware ID, not by MADT order, so a MADT listing absent or
+  disabled processors before present ones still names the right core.
+- An object that is absent is absent, and one that did not evaluate or is not the shape the specification gives it is
+  named in `refused` and left out; the rest of the processor's power is still answered.
+- `_OST` for a processor without one answers `not-found`, which the policy treats as nothing to acknowledge.
+- A thermal zone's cooling methods are not served here: they reach ProcessorPowerService through the zone's own
+  driver and its node channel (P02M0198's thermal-zone publication), as the item says.
+- THE ROLE IS A FACTORY ROLE, NOT A `client` ROLE: a `client` role delivers a duplicate of the provider's kept root end,
+  which works only for a provider serving its requests on that root. The ACPI service answers CONNECT on the
+  PROCESSORS root and serves the connection it mints (as PowerService does on its root), so ProcessorPowerService's
+  `processors` role (and its `power-state` role) is `factory` in `services/manifest.toml`. With the `client` role
+  the first `describe` timed out. Still a manifest role, as the item asks; the mechanism is the one the service's
+  CONNECT needs.
+- THE GATE'S FIXTURE AND QEMU's `_OST`: q35's DSDT already declares `\_SB.CPUS.C000._OST` (CPU hot-plug), and the first
+  declaration stands - the fixture SSDT's `_OST`, which wrote the shared pages, was never run. The fixture no longer
+  declares one (`acpi-fixture.py`: no `_OST`, no `OSTE`/`OSTS`/`OSTN` fields, no `ost_*` keys), and the gate reads
+  QEMU's own record of what C000's `_OST` was told (QMP `query-acpi-ospm-status`), checking first that it does not
+  already read (0x80, 0) - so the acknowledgement the service sends after a `Notify` 0x80 is observed in QEMU, not in
+  pages an SSDT writes.
+
+VERIFICATION OF STEP 3's THIRD ITEM, so far:
+
+- Host: `acpi-model` 22 (the processor objects, `uid_of`, `core_of`), `acpi` 51 (`Madt::processors`), `proto` 53.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate processor-power` -> PASS twice on 2026-10-01, both with the `_OST`
+  change above in place: every core's `_LPI` installed and entered, `_PSS`/`_PCT`/`_PPC`/`_PSD` and CPPC with its
+  preference register installed, C002's model-specific `_PCT` refused whole, the profiles' windows, `Notify` 0x80 on
+  C000 (the fixture's `_E07`) read again and acknowledged - QEMU's OSPM record for C000 reads (0x80, 0) after it - and
+  the zone's and the fans' cooling. A rerun after the ports' processor changes are in the tree is in the gate batch of
+  2026-10-01 and is recorded below when it ends.

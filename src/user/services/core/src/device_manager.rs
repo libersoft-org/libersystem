@@ -555,6 +555,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		SLEEP_DOOR.store(sleep_door, core::sync::atomic::Ordering::Relaxed);
 		// 1b8. and the clock source's privilege, last: duplicated for a Time and Alarm Device's driver at bind.
 		CLOCK_SOURCE.store(recv_tagged(bootstrap, &mut buf, b"CLOCKSRC").unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+		// 1b9. and the buttons' sleep connections, minted ahead, last of all: taken at bind before the door is asked.
+		SLEEP_POOL.store(recv_tagged(bootstrap, &mut buf, b"SLEEPPOOL").unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager
@@ -1463,6 +1465,36 @@ static TRUSTED_KEY_PRODUCER: core::sync::atomic::AtomicU64 = core::sync::atomic:
 // button's driver is minted a `system-sleep` connection from the first, a Time and Alarm Device's driver a duplicate of
 // the second - see `begin_bind`. Zero when the boot granted none.
 static SLEEP_DOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE BUTTONS' SLEEP CONNECTIONS MINTED AHEAD by ServiceManager - see the manifest's `SLEEPPOOL`: one taken per button
+// bound, never waiting on ServiceManager, which may be waiting on this program.
+static SLEEP_POOL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// A `system-sleep` CONNECTION FOR A BUTTON'S DRIVER: one minted ahead while any is left, and from the door after - by then
+// ServiceManager's bring-up is long over and it answers the door from its standing loop.
+fn button_sleep_connection() -> Option<u64> {
+	let pool: u64 = SLEEP_POOL.load(core::sync::atomic::Ordering::Relaxed);
+	if pool != 0 {
+		let mut buf = [0u8; 8];
+		match try_recv_caps(pool, &mut buf) {
+			PolledCaps::Message { handles, .. } => {
+				let mut taken = handles.as_slice().iter().copied();
+				let first = taken.next();
+				for leftover in taken {
+					close(leftover);
+				}
+				if let Some(connection) = first.filter(|&handle| handle != 0) {
+					return Some(connection);
+				}
+			}
+			PolledCaps::Empty | PolledCaps::Closed => {
+				close(pool);
+				SLEEP_POOL.store(0, core::sync::atomic::Ordering::Relaxed);
+			}
+		}
+	}
+	let door: u64 = SLEEP_DOOR.load(core::sync::atomic::Ordering::Relaxed);
+	if door == 0 { None } else { service_connect(door) }
+}
 static CLOCK_SOURCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 // THE ACPI SERVICE, as ServiceManager handed it over after the service's start: a connection of its `acpi-admin` root,
 // through which this program asks for node channels and hands over the connections the service holds. Replaced at every
@@ -4712,22 +4744,33 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 		}
 	}
 	// THE CONTROL-METHOD BUTTONS carry out a press as the fixed ones do: the power button through a `system-power`
-	// connection of its own, as the keyboards do, and the sleep button through a `system-sleep` one minted from the door
-	// ServiceManager handed this program. A door this boot did not grant leaves the button saying so when pressed.
+	// connection of its own, as the keyboards do, and the sleep button through a `system-sleep` one - minted ahead by
+	// ServiceManager while any is left, from the door it handed this program after (`button_sleep_connection`). A boot
+	// that granted neither leaves the button saying so when pressed.
 	if driver_name == b"acpi_button" {
 		let Some(connection) = service_connect(power) else {
 			refused(b"a power connection - the power service minted none");
 			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 		};
 		txn.holds(driver_protocol::ResourceKind::SysPower as u16, connection);
-		let door: u64 = SLEEP_DOOR.load(core::sync::atomic::Ordering::Relaxed);
-		if door != 0 {
-			let Some(connection) = service_connect(door) else {
+		let granted = SLEEP_DOOR.load(core::sync::atomic::Ordering::Relaxed) != 0 || SLEEP_POOL.load(core::sync::atomic::Ordering::Relaxed) != 0;
+		if granted {
+			let Some(connection) = button_sleep_connection() else {
 				refused(b"a sleep connection - ServiceManager minted none");
 				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 			};
 			txn.holds(driver_protocol::ResourceKind::SysSleep as u16, connection);
 		}
+	}
+	// A THERMAL ZONE'S BINDING arms the kernel's forced power-off past `_CRT` when the thermal policy is not there to: a
+	// `system-power` connection of its own, as the buttons have - to a zone's binding alone, never to a battery's or an
+	// adapter's of the same program.
+	if driver_name == b"acpi_power" && info.platform.match_ids().iter().any(|id| id.text() == b"THERMALZONE") {
+		let Some(connection) = service_connect(power) else {
+			refused(b"a power connection - the power service minted none");
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+		};
+		txn.holds(driver_protocol::ResourceKind::SysPower as u16, connection);
 	}
 	// THE TIME AND ALARM DEVICE'S DRIVER hands the kernel the wall clock under the clock source's privilege - a
 	// duplicate of the one this program holds, to that driver alone.
@@ -5083,6 +5126,9 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 				print(b"DeviceManager: ");
 				print_driver_name(driver_name);
 				print(b" says its device did not come back from the sleep\n");
+				// ITS REBIND IS THE SLEEP'S, NOT A FAULT'S: the attempt it will spend is given back first, so a device that
+				// loses its state at every S3 is bound again after each of them, however many the boot has.
+				node.attempt = driver_binding::budget_for_a_sleep_rebind(node.retry_once, node.attempt);
 			}
 			// A CLAIM SETTLING WHEN NO TEARDOWN IS OUTSTANDING. The teardown arm above consumes
 			// these; one arriving here belongs to a teardown that has already been resolved -
@@ -6788,6 +6834,8 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::IPMI => proto::system::ProviderKind::Ipmi,
 		provider::TYPEC_CONNECTOR => proto::system::ProviderKind::TypecConnector,
 		provider::PLATFORM_SWITCH => proto::system::ProviderKind::PlatformSwitch,
+		provider::THERMAL_ZONE => proto::system::ProviderKind::ThermalZone,
+		provider::COOLING_DEVICE => proto::system::ProviderKind::CoolingDevice,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6822,6 +6870,8 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Ipmi => driver_protocol::provider::IPMI,
 		proto::system::ProviderKind::TypecConnector => driver_protocol::provider::TYPEC_CONNECTOR,
 		proto::system::ProviderKind::PlatformSwitch => driver_protocol::provider::PLATFORM_SWITCH,
+		proto::system::ProviderKind::ThermalZone => driver_protocol::provider::THERMAL_ZONE,
+		proto::system::ProviderKind::CoolingDevice => driver_protocol::provider::COOLING_DEVICE,
 	}
 }
 

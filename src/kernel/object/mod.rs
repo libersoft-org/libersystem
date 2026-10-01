@@ -15,6 +15,7 @@ pub mod domain;
 pub mod event;
 pub mod handle;
 pub mod interrupt;
+pub mod latency_request;
 pub mod memory_object;
 pub mod port_range;
 pub mod privilege;
@@ -71,6 +72,8 @@ pub enum ObjectType {
 	ConsoleTap,
 	// A claim's declared registers. See `registers`.
 	Registers,
+	// A bound on every core's idle states. See `latency_request`.
+	LatencyRequest,
 }
 
 impl ObjectType {
@@ -98,6 +101,7 @@ impl ObjectType {
 			ObjectType::PortRange => abi::OBJECT_TYPE_PORT_RANGE,
 			ObjectType::ConsoleTap => abi::OBJECT_TYPE_CONSOLE_TAP,
 			ObjectType::Registers => abi::OBJECT_TYPE_REGISTERS,
+			ObjectType::LatencyRequest => abi::OBJECT_TYPE_LATENCY_REQUEST,
 		}
 	}
 }

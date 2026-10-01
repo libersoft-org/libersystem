@@ -928,6 +928,12 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	}
 
 	crate::sched::init();
+	// THE TREE'S IDLE STATES, every core's, installed before any thread runs on it.
+	if let Some(states) = super::device_tree().and_then(|tree| tree.idle_states(fdt::IdleBinding::Arm)) {
+		crate::processor::install_tree_states(&states);
+	}
+	// WHAT THIS FIRMWARE OFFERS A SLEEP, checked rather than assumed.
+	super::sleep::report_offers();
 
 	// Under `cargo test`, the core subsystems (heap, paging, per-CPU, SMP, scheduler)
 	// are up: populate the device table + boot info, hand off to the kernel test
@@ -935,6 +941,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// interactive (non-test) bring-up.
 	#[cfg(test)]
 	{
+		crate::firmware::init();
 		crate::device::init();
 		// The DMA isolation state, once the devices that will master the bus are known. Outside
 		// `device::init` because that function holds the device table's lock while it fills it.
@@ -1085,6 +1092,9 @@ fn run_system_manager() {
 	// Populate the kernel device table from the PCI scan, so DeviceManager can
 	// enumerate the virtio devices and spawn their drivers (the same one-time boot
 	// scan the x86 kmain does before starting userspace).
+	// THE FIRMWARE'S PART FIRST, as on x86_64: on an ACPI machine native hot-plug and error reporting wait for `_OSC`
+	// - this port boots from the device tree, so nothing waits - and then the scan.
+	crate::firmware::init();
 	crate::device::init();
 	// The DMA isolation state, once the devices that will master the bus are known. Outside
 	// `device::init` because that function holds the device table's lock while it fills it.
@@ -1124,5 +1134,6 @@ fn run_system_manager() {
 	// WHAT WOULD FALSIFY IT: a run on this port that still ends with those seven drivers late. The
 	// window would then not be what bounds them, and the next place to look is the per-attempt
 	// deadline rather than the budget above it.
+	crate::announce_measurement();
 	crate::boot_userspace(40000);
 }

@@ -1069,3 +1069,187 @@ fn fixture_command_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(FixtureCommand::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn active_trip_wire_is_stable() {
+	let sample = ActiveTrip { level: 7, temperature: 7, devices: alloc::vec![String::from("x")] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 7, 0, 0, 0, 1, 0, 1, 0, 120];
+	assert_eq!(bytes, golden);
+	assert_eq!(ActiveTrip::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn zone_cooling_wire_is_stable() {
+	let sample = ZoneCooling { zone: String::from("x"), passive: Some(7), critical: Some(7), hot: Some(7), tc1: 7, tc2: 7, tsp: 7, passive_processors: alloc::vec![String::from("x")], active: alloc::vec![ActiveTrip { level: 7, temperature: 7, devices: alloc::vec![String::from("x")] }], scp: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 1, 7, 0, 0, 0, 1, 7, 0, 0, 0, 1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 1, 0, 120, 1, 0, 7, 7, 0, 0, 0, 1, 0, 1, 0, 120, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(ZoneCooling::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn zone_reading_wire_is_stable() {
+	let sample = ZoneReading { temperature: 7, sequence: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ZoneReading::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn fan_level_wire_is_stable() {
+	let sample = FanLevel { control: 7, speed_rpm: 7, noise: 7, power_mw: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FanLevel::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn fan_description_wire_is_stable() {
+	let sample = FanDescription { path: String::from("x"), by_power_state: true, fine_grain: true, step_size: 7, levels: alloc::vec![FanLevel { control: 7, speed_rpm: 7, noise: 7, power_mw: 7 }] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 1, 1, 7, 0, 0, 0, 1, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FanDescription::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn fan_status_wire_is_stable() {
+	let sample = FanStatus { control: 7, speed_rpm: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FanStatus::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn power_profile_wire_is_stable() {
+	let sample = PowerProfile::Performance;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(PowerProfile::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn curve_point_wire_is_stable() {
+	let sample = CurvePoint { temperature: 7, percent: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(CurvePoint::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn core_power_wire_is_stable() {
+	let sample = CorePower { cpu: 7, idle_states: 7, perf_levels: 7, perf_level: 7, window_cap: 7, window_floor: 7, inject_permille: 7, latency_requests: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(CorePower::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn zone_power_wire_is_stable() {
+	let sample = ZonePower { zone: String::from("x"), temperature: 7, passive: Some(7), critical: Some(7), hot: Some(7), passive_engaged: true, cap_percent: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 1, 7, 0, 0, 0, 1, 7, 0, 0, 0, 1, 7, 0, 0, 0, 1, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ZonePower::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn fan_power_wire_is_stable() {
+	let sample = FanPower { path: String::from("x"), control: 7, speed_rpm: 7, curve: alloc::vec![CurvePoint { temperature: 7, percent: 7 }] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 7, 0, 0, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(FanPower::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_power_status_wire_is_stable() {
+	let sample = ProcessorPowerStatus { profile: PowerProfile::Performance, because: String::from("x"), cores: alloc::vec![CorePower { cpu: 7, idle_states: 7, perf_levels: 7, perf_level: 7, window_cap: 7, window_floor: 7, inject_permille: 7, latency_requests: 7 }], zones: alloc::vec![ZonePower { zone: String::from("x"), temperature: 7, passive: Some(7), critical: Some(7), hot: Some(7), passive_engaged: true, cap_percent: 7 }], fans: alloc::vec![FanPower { path: String::from("x"), control: 7, speed_rpm: 7, curve: alloc::vec![CurvePoint { temperature: 7, percent: 7 }] }] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[
+		1,
+		1,
+		0,
+		120,
+		1,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		1,
+		0,
+		120,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		1,
+		0,
+		120,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+	];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorPowerStatus::decode(&bytes).unwrap(), sample);
+}

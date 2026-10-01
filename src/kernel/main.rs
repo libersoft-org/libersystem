@@ -38,6 +38,7 @@ mod perf;
 // Fixed-hardware platform events (the power button), and the channel they are delivered on.
 mod platform_event;
 mod power;
+mod processor;
 mod product;
 mod sched;
 mod sleep;
@@ -448,11 +449,7 @@ fn boot_main() {
 	// profile, which is what a PERSON boots for an interactive instance - so the one line in the
 	// report addressed to a program was shown to every operator who ever used that profile,
 	// uppercase and meaningless to them. `perf-trace.py` boots `development-trace`; nothing else does.
-	if arch::boot_profile() == Some("development-trace") {
-		serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
-	}
-	// AND THE FRAME ACCOUNT'S BUFFER, under the same condition and on no other boot.
-	perf::init();
+	announce_measurement();
 	// WHAT IS ACTUALLY TRUE AT THIS POINT. The line said "entering the userspace shell" and was
 	// followed by every driver binding, every service starting and the product banner before a
 	// prompt appeared - so the one line a reader takes as "the boot finished" was printed in the
@@ -919,6 +916,17 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	let hibernation = Capability::new(Privilege::create(PrivilegeKind::Hibernation).expect("the hibernation privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
 	// ALLOC-OK: as above
 	kernel_ep.send(Message::new(b"HIBERNATE".to_vec(), alloc::vec![hibernation])).map_err(|_| "failed to hand SystemManager the hibernation privilege")?;
+	// PROCESSOR POWER'S TWO, the eighth and the ninth: what ProcessorPowerService installs the processors' tables under,
+	// and what a service bounds every core's idle states under (AudioService, for playback). Last; ServiceManager keeps
+	// both and duplicates each for its service's every start.
+	// ALLOC-OK: boot, before userspace exists.
+	let processor_power = Capability::new(Privilege::create(PrivilegeKind::ProcessorPower).expect("the processor-power privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
+	// ALLOC-OK: as above
+	kernel_ep.send(Message::new(b"PROCPOWER".to_vec(), alloc::vec![processor_power])).map_err(|_| "failed to hand SystemManager the processor-power privilege")?;
+	// ALLOC-OK: boot, before userspace exists.
+	let idle_latency = Capability::new(Privilege::create(PrivilegeKind::IdleLatency).expect("the idle-latency privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
+	// ALLOC-OK: as above
+	kernel_ep.send(Message::new(b"IDLELATENCY".to_vec(), alloc::vec![idle_latency])).map_err(|_| "failed to hand SystemManager the idle-latency privilege")?;
 	Ok((kernel_ep, process))
 }
 
@@ -1498,6 +1506,17 @@ fn report_machine() {
 		serial_println!("numa: {bound} of {} core(s) bound to a node", smp::cpu_count());
 	}
 	mem::numa::report();
+}
+
+// THE MEASUREMENT'S ANCHOR AND ITS BUFFER, on the boot a trace tool asked for and no other - every port's, since the
+// account is checked on the emulated ports too: the calibrated counter frequency the host converts the ring-3 `\x1ePERF`
+// markers by, and the frame account's buffer.
+#[cfg(not(test))]
+pub(crate) fn announce_measurement() {
+	if arch::boot_profile() == Some("development-trace") {
+		serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
+	}
+	perf::init();
 }
 
 #[cfg(not(test))]

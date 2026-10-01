@@ -586,6 +586,12 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// The portable scheduler on top of the arch context/percpu contract.
 	crate::sched::allocate(cpu_count as usize);
 	crate::sched::init();
+	// THE TREE'S IDLE STATES, every core's, installed before any thread runs on it.
+	if let Some(states) = super::device_tree().and_then(|tree| tree.idle_states(fdt::IdleBinding::Riscv)) {
+		crate::processor::install_tree_states(&states);
+	}
+	// WHAT THIS FIRMWARE OFFERS A SLEEP, checked rather than assumed.
+	super::sleep::report_offers();
 
 	// Under `cargo test`, the core subsystems (heap, paging, per-CPU, SMP, scheduler)
 	// are up: arm the S-mode timer + enable interrupts (so the preemption tests can
@@ -599,6 +605,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		super::enable_interrupts();
 		report_timer();
 		super::syscall::init();
+		crate::firmware::init();
 		crate::device::init();
 		// The DMA isolation state, once the devices that will master the bus are known. Outside
 		// `device::init` because that function holds the device table's lock while it fills it.
@@ -769,6 +776,9 @@ fn run_system_manager() {
 
 	// Populate the kernel device table from the PCI scan so DeviceManager can enumerate
 	// the virtio devices (the same one-time boot scan the other kmains do).
+	// THE FIRMWARE'S PART FIRST, as on x86_64: on an ACPI machine native hot-plug and error reporting wait for `_OSC`
+	// - this port boots from the device tree, so nothing waits - and then the scan.
+	crate::firmware::init();
 	crate::device::init();
 	// The DMA isolation state, once the devices that will master the bus are known. Outside
 	// `device::init` because that function holds the device table's lock while it fills it.
@@ -782,5 +792,6 @@ fn run_system_manager() {
 	// TEN TIMES WHAT IT WAS, for the reason x86_64's call site records - and this port keeps its
 	// own ratio to that one, which has always been the largest of the three. Not measured here:
 	// what was measured is the x86_64 settle, and this is the old calibration carried across it.
+	crate::announce_measurement();
 	crate::boot_userspace(40000);
 }

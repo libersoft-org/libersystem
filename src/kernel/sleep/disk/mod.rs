@@ -8,13 +8,15 @@
 // that are not free, and the whole of what the loader handed over (the kernel, its tables, the packages), the
 // firmware's ACPI tables and its non-volatile storage, which the next boot's firmware fills again and the image's
 // kernel must find as it left it. Not the framebuffer, and never reserved or device memory. The copies, the lists
-// that say which page each is, and the bitmap of frames not to copy are allocated BEFORE the copy and are the one set
-// of frames it skips; the copy itself allocates nothing and takes no lock, so no lock is ever captured held.
+// that say which page each is, and the bitmap of frames not to copy are allocated BEFORE the copy; the copies and the
+// bitmap are the frames it skips, and the lists are copied with the rest, because the restored machine reads its copies
+// back from them; the copy itself allocates nothing and takes no lock, so no lock is ever captured held.
 //
 // A LIST PAGE holds `PAIRS` pairs: for a snapshot, (the page, its copy); for a restore, (the frame it goes to, the
 // frame holding it now).
 
 use alloc::vec::Vec;
+#[cfg(any(test, target_arch = "x86_64"))]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use abi::{ERR_INVALID, ERR_NO_MEMORY, ERR_RESOURCE_EXHAUSTED, SNAPSHOT_BATCH, SNAPSHOT_CONTEXT, SnapshotInfo, SystemFingerprint};
@@ -59,6 +61,7 @@ pub fn ram_top() -> u64 {
 
 // EVERY PAGE THE IMAGE HOLDS, in address order, until `visit` answers false: `skip` names the frames the snapshot set
 // aside for itself. Takes the allocator's lock per page and holds none between pages.
+#[cfg(any(test, target_arch = "x86_64"))]
 fn each_image_page(skip: &[u64], mut visit: impl FnMut(u64) -> bool) {
 	for index in 0..crate::mem::memmap_len() {
 		let Some(region) = crate::mem::memmap_get(index) else { continue };
@@ -201,20 +204,30 @@ impl Snapshot {
 static SNAPSHOT: SpinLock<Option<Snapshot>> = SpinLock::new(None);
 
 // THE COPY'S PLAN, READ BY THE ARCHITECTURE'S ENTRY WITH NO LOCK: the list pages' array and its length, the capacity,
-// the bitmap's array and its length; and the pages the copy filled, written after it.
+// the bitmap's array and its length; and the pages the copy filled, written after it. THE SNAPSHOT IS x86_64'S ENTRY's
+// alone today - the other ports have no resume path for the machine an image restores - so its half is compiled there
+// and for the suite.
+#[cfg(any(test, target_arch = "x86_64"))]
 static PLAN_LISTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, target_arch = "x86_64"))]
 static PLAN_LIST_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, target_arch = "x86_64"))]
 static PLAN_CAPACITY: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, target_arch = "x86_64"))]
 static PLAN_SKIP: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, target_arch = "x86_64"))]
 static PLAN_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, target_arch = "x86_64"))]
 static COPIED: AtomicU64 = AtomicU64::new(0);
 
 // The slack the copies are allocated with beyond the pages counted in use: what the kernel may still allocate between
 // the count and the copy.
+#[cfg(any(test, target_arch = "x86_64"))]
 const SLACK: u64 = 2048;
 
 // PREPARE A SNAPSHOT: the pages in use counted, and the copies, the lists and the bitmap of frames the copy skips
 // allocated. `ERR_RESOURCE_EXHAUSTED` - said by the caller - when free memory cannot hold the copy.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn prepare(context: [u8; SNAPSHOT_CONTEXT]) -> Result<u64, i64> {
 	if let Some(old) = SNAPSHOT.lock().take() {
 		old.release();
@@ -262,11 +275,14 @@ pub fn prepare(context: [u8; SNAPSHOT_CONTEXT]) -> Result<u64, i64> {
 			}
 		}
 	}
-	// THE FRAMES THE COPY SKIPS: every copy, every list page, and the bitmap's own.
+	// THE FRAMES THE COPY SKIPS: every copy and the bitmap's own. NOT THE LIST PAGES: the restored machine gives the
+	// copies back by reading which frames they are from those pages - its allocator holds them as the snapshot's, and
+	// no other record of them survives the replacement - so the pages go into the image like any other, each copied
+	// after the column of copies it holds was written here.
 	for index in 0..capacity {
 		skip.set(lists.get(index)[1]);
 	}
-	for &page in lists.pages.iter().chain(skip.frames.clone().iter()) {
+	for &page in skip.frames.clone().iter() {
 		skip.set(page);
 	}
 	PLAN_LISTS.store(lists.pages.as_ptr() as u64, Ordering::Release);
@@ -282,6 +298,7 @@ pub fn prepare(context: [u8; SNAPSHOT_CONTEXT]) -> Result<u64, i64> {
 // THE COPY ITSELF, from the architecture's entry with every other core held and interrupts off: every page in use to
 // its copy frame, in address order. Takes no lock of its own, allocates nothing, prints nothing. Answers false when the
 // pages outgrew the copies prepared.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn copy_now() -> bool {
 	let lists_ptr = PLAN_LISTS.load(Ordering::Acquire) as *const u64;
 	let list_count = PLAN_LIST_COUNT.load(Ordering::Acquire) as usize;
@@ -311,6 +328,7 @@ pub fn copy_now() -> bool {
 }
 
 // THE FIRST RETURN: the copy's page count recorded in the snapshot the image component reads.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn taken() -> u64 {
 	let pages = COPIED.load(Ordering::Acquire);
 	if let Some(snapshot) = SNAPSHOT.lock().as_mut() {
@@ -379,40 +397,41 @@ fn system_digest() -> [u8; 32] {
 	let info = crate::boot_info();
 	// SAFETY: the loader's module array, in the direct map for the kernel's whole life.
 	let modules = unsafe { core::slice::from_raw_parts(info.modules as *const bootproto::Module, info.modules_len as usize) };
-	let mut variant: Vec<u8> = Vec::new();
-	crate::arch::sleep::development_variant(&mut variant);
+	let mut variant = [0u8; 64];
+	let variant_len = crate::arch::sleep::development_variant(&mut variant);
 	// SAFETY: each module's bytes, as `module_bytes` reads them.
-	let digest = digest_of(image, modules.iter().map(|module| (&module.name[..], unsafe { core::slice::from_raw_parts(module.addr as *const u8, module.size as usize) })), &variant);
+	let digest = digest_of(image, modules.iter().map(|module| (&module.name[..], unsafe { core::slice::from_raw_parts(module.addr as *const u8, module.size as usize) })), &variant[..variant_len]);
 	*SYSTEM_DIGEST.lock() = Some(digest);
 	digest
 }
 
 // The digest itself: the kernel's bytes, each module's name and bytes in order, and the variant - each part hashed on its
-// own first, so no two different lists of parts run together into the same bytes.
+// own first, so no two different lists of parts run together into the same bytes. The parts' digests are fed to one
+// hasher in turn, so nothing is allocated to hold them.
 fn digest_of<'a>(kernel: &[u8], modules: impl Iterator<Item = (&'a [u8], &'a [u8])>, variant: &[u8]) -> [u8; 32] {
-	let mut parts: Vec<u8> = Vec::new();
-	parts.extend_from_slice(&bootproto::sha256::digest(kernel));
+	let mut parts = bootproto::sha256::Sha256::new();
+	parts.update(&bootproto::sha256::digest(kernel));
 	for (name, bytes) in modules {
-		parts.extend_from_slice(&bootproto::sha256::digest(name));
-		parts.extend_from_slice(&bootproto::sha256::digest(bytes));
+		parts.update(&bootproto::sha256::digest(name));
+		parts.update(&bootproto::sha256::digest(bytes));
 	}
 	if !variant.is_empty() {
-		parts.extend_from_slice(b"variant");
-		parts.extend_from_slice(&bootproto::sha256::digest(variant));
+		parts.update(b"variant");
+		parts.update(&bootproto::sha256::digest(variant));
 	}
-	bootproto::sha256::digest(&parts)
+	parts.finish()
 }
 
 // THE HARDWARE'S DIGEST: the memory map by class - every kind of RAM the loader or the kernel may take one class, each
 // other kind its own, adjacent ranges of one class merged, so what a boot's loader allocated does not move it - the
 // cores, and every PCI function the scan found with its identity.
 fn hardware_digest() -> [u8; 32] {
-	let mut parts: Vec<u8> = Vec::new();
+	let mut parts = bootproto::sha256::Sha256::new();
 	let mut last: Option<(u32, u64, u64)> = None;
-	let push = |parts: &mut Vec<u8>, range: (u32, u64, u64)| {
-		parts.extend_from_slice(&range.0.to_le_bytes());
-		parts.extend_from_slice(&range.1.to_le_bytes());
-		parts.extend_from_slice(&range.2.to_le_bytes());
+	let push = |parts: &mut bootproto::sha256::Sha256, range: (u32, u64, u64)| {
+		parts.update(&range.0.to_le_bytes());
+		parts.update(&range.1.to_le_bytes());
+		parts.update(&range.2.to_le_bytes());
 	};
 	for index in 0..crate::mem::memmap_len() {
 		let Some(region) = crate::mem::memmap_get(index) else { continue };
@@ -432,17 +451,17 @@ fn hardware_digest() -> [u8; 32] {
 	if let Some(range) = last {
 		push(&mut parts, range);
 	}
-	parts.extend_from_slice(&(crate::smp::cpu_count() as u64).to_le_bytes());
+	parts.update(&(crate::smp::cpu_count() as u64).to_le_bytes());
 	for index in 0..crate::device::count() {
 		let _ = crate::device::with(index, |entry| {
 			if entry.on_bus && entry.platform.is_none() {
-				parts.extend_from_slice(&[entry.bus, entry.dev, entry.func, entry.class, entry.subclass, entry.prog_if]);
-				parts.extend_from_slice(&entry.vendor.to_le_bytes());
-				parts.extend_from_slice(&entry.product.to_le_bytes());
+				parts.update(&[entry.bus, entry.dev, entry.func, entry.class, entry.subclass, entry.prog_if]);
+				parts.update(&entry.vendor.to_le_bytes());
+				parts.update(&entry.product.to_le_bytes());
 			}
 		});
 	}
-	bootproto::sha256::digest(&parts)
+	parts.finish()
 }
 
 pub fn fingerprint() -> SystemFingerprint {
@@ -459,6 +478,8 @@ pub struct Restore {
 	written: u64,
 	// Frames the allocator answered that are targets: held, never used, given back with the restore.
 	aside: Vec<u64>,
+	// The image's resume context, which x86_64's replacement jumps with.
+	#[cfg(target_arch = "x86_64")]
 	pub context: [u8; SNAPSHOT_CONTEXT],
 }
 
@@ -492,11 +513,13 @@ impl Restore {
 	}
 
 	// The pairs, for the architecture's copy: (the frame a page goes to, the frame holding it), `pages` of them.
+	#[cfg(target_arch = "x86_64")]
 	pub fn pairs(&self) -> (&[u64], u64) {
 		(&self.lists.pages, self.pages)
 	}
 
 	// Another frame outside the image, for the architecture's trampoline and its tables.
+	#[cfg(target_arch = "x86_64")]
 	pub fn frame(&mut self) -> Option<u64> {
 		Self::safe_frame(&self.targets, &mut self.aside)
 	}
@@ -560,7 +583,15 @@ pub fn begin(count: u64, context: [u8; SNAPSHOT_CONTEXT], mut frame_at: impl FnM
 		};
 		lists.put(index, [phys, 0]);
 	}
-	*RESTORE.lock() = Some(Restore { lists, targets, pages, written: 0, aside, context });
+	*RESTORE.lock() = Some(Restore {
+		lists,
+		targets,
+		pages,
+		written: 0,
+		aside,
+		#[cfg(target_arch = "x86_64")]
+		context,
+	});
 	Ok(())
 }
 
@@ -607,6 +638,7 @@ pub fn commit() -> i64 {
 
 // ON THE BOOT CORE: the replacement itself, with the restore taken out of its lock for it - nothing may hold that lock,
 // or any other, while memory is overwritten - and put back only when it did not happen.
+#[cfg(target_arch = "x86_64")]
 pub fn replace_now() -> i64 {
 	let Some(mut restore) = RESTORE.lock().take() else { return ERR_INVALID };
 	let error = crate::arch::sleep::replace_memory(&mut restore);

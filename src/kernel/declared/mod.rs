@@ -127,6 +127,7 @@ pub fn claim_writes(index: usize, vendor: u16, device: u16, bus: u8, dev: u8, fu
 
 // AFTER AN S3, WHICH RESET THE FUNCTION: every live claim's writes made again, from the bits its row names - the
 // value the release restores stays the one saved at the claim.
+#[cfg(target_arch = "x86_64")]
 pub fn replay_claim_writes() {
 	let table = SAVED.lock();
 	for (_, (bus, dev, func), writes) in table.iter() {
@@ -159,9 +160,16 @@ pub fn row_for(vendor: u16, device: u16) -> Option<&'static Row> {
 	ROWS.iter().find(|row| row.vendor == vendor && row.device == device)
 }
 
-// Whether a row is not applied on this machine: the table that suppresses it is present.
+// Whether a row is not applied on this machine: the table that suppresses it is present. A device-tree machine reads no
+// ACPI table, so on aarch64 and riscv64 none suppresses a row.
 pub fn suppressed(row: &Row) -> bool {
-	row.suppressed_by.is_some_and(|signature| crate::smp::acpi_table(crate::boot_info().rsdp, &signature).is_some())
+	#[cfg(target_arch = "x86_64")]
+	return row.suppressed_by.is_some_and(|signature| crate::smp::acpi_table(crate::boot_info().rsdp, &signature).is_some());
+	#[cfg(not(target_arch = "x86_64"))]
+	{
+		let _ = row;
+		false
+	}
 }
 
 // The most registers one row carries.

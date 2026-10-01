@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::{ChannelTransport, SvcTransport};
-use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, CoreIdle, CoreWakeSource, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, device, display_stats, provider_catalogue, supervisor, system_graph};
+use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, CoreIdle, CoreIdleState, CoreLevel, CoreWakeSource, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, device, display_stats, provider_catalogue, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -247,7 +247,9 @@ fn idle_rows() -> Vec<CoreIdle> {
 		}
 		let used = (info.source_count as usize).min(info.sources.len());
 		let sources: Vec<CoreWakeSource> = info.sources[..used].iter().map(|source| CoreWakeSource { source: source.source, count: source.count }).collect();
-		rows.push(CoreIdle { cpu: info.cpu, idle_ns: info.idle_ns, halts: info.halts, wakes_timer: info.wakes_timer, wakes_ipi: info.wakes_ipi, wakes_housekeeping: info.wakes_housekeeping, wakes_device: info.wakes_device, sources });
+		let states: Vec<CoreIdleState> = info.states.iter().take((info.state_count as usize).min(info.states.len())).map(|state| CoreIdleState { entry: state.entry, unenterable: state.unenterable, exit_latency_us: state.exit_latency_us, target_residency_us: state.target_residency_us, entries: state.entries, residency_ns: state.residency_ns }).collect();
+		let levels: Vec<CoreLevel> = info.level_ns.iter().take((info.perf_levels as usize).min(info.level_ns.len())).enumerate().map(|(level, &ns)| CoreLevel { level: level as u32, ns }).collect();
+		rows.push(CoreIdle { cpu: info.cpu, idle_ns: info.idle_ns, halts: info.halts, wakes_timer: info.wakes_timer, wakes_ipi: info.wakes_ipi, wakes_housekeeping: info.wakes_housekeeping, wakes_device: info.wakes_device, sources, states, perf_levels: info.perf_levels, perf_level: info.perf_level, levels, window_cap: info.window_cap, window_floor: info.window_floor, inject_permille: info.inject_permille, injected_ns: info.injected_ns, latency_requests: info.latency_requests, latency_bound_us: info.latency_bound_us });
 		index += 1;
 		if index >= count as u64 {
 			break;

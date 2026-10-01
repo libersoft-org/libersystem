@@ -71,7 +71,9 @@ pub fn device_tree() -> Option<fdt::Fdt> {
 }
 
 pub mod platform;
+pub mod processor;
 pub mod serial;
+pub mod sleep;
 pub mod traps;
 pub mod usercopy;
 
@@ -196,6 +198,39 @@ pub fn boot_profile() -> Option<&'static str> {
 	}
 }
 
+// ONE FW-CFG FILE, read into `out`: None with no fw-cfg node, or no such file.
+pub fn fwcfg_read(name: &[u8], out: &mut [u8]) -> Option<usize> {
+	let base = FWCFG_BASE.load(core::sync::atomic::Ordering::Relaxed);
+	crate::arch::common::fwcfg::read_file(base, name, out, super::paging::phys_to_virt)
+}
+
+// A PART OF THE MACHINE THE DEVELOPMENT HARNESS NAMES ABSENT, over the fw-cfg file `opt/org.libersystem/absent` - as on
+// x86_64. Only a boot with a profile reads it, so a shipping machine never does.
+pub fn absent_named(word: &[u8]) -> bool {
+	if boot_profile().is_none() {
+		return false;
+	}
+	let mut names = [0u8; 64];
+	let Some(len) = fwcfg_read(b"opt/org.libersystem/absent", &mut names) else { return false };
+	names[..len].split(|byte| matches!(byte, b' ' | b',' | b'\n' | 0)).any(|name| name == word)
+}
+
+// WHETHER THE KERNEL READS AN RTC OF ITS OWN: this port's is part of QEMU `virt` (see `rtc`), and the development harness
+// can name it absent, as the sleep gate's platform boot does on x86_64. Read once: every `SYS_CLOCK_RTC` asks, and fw-cfg's
+// directory is a walk.
+pub fn rtc_present() -> bool {
+	static PRESENT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+	match PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+		1 => true,
+		2 => false,
+		_ => {
+			let present = !absent_named(b"rtc");
+			PRESENT.store(if present { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+			present
+		}
+	}
+}
+
 // Write the CPU's model name into `out`, returning the byte count. The mvendorid /
 // marchid / mimpid identity registers are M-mode CSRs, unreadable from S-mode, so
 // query them through the SBI Base extension (EID 0x10, FIDs 4/5/6). QEMU's generic
@@ -212,6 +247,18 @@ pub fn cpu_brand(out: &mut [u8]) -> usize {
 	let n: usize = b.len().min(out.len());
 	out[..n].copy_from_slice(&b[..n]);
 	n
+}
+
+// WHETHER THE SBI IMPLEMENTS EXTENSION `eid` - the Base extension's probe (FID 3), whose answer is non-zero for one it
+// does.
+pub(crate) fn sbi_probe_extension(eid: usize) -> bool {
+	let error: isize;
+	let value: usize;
+	// SAFETY: the Base extension, which every SBI implements; it returns and touches no memory of this kernel's.
+	unsafe {
+		core::arch::asm!("ecall", in("a7") 0x10usize, in("a6") 3usize, inout("a0") eid => error, lateout("a1") value, options(nostack, nomem));
+	}
+	error == 0 && value != 0
 }
 
 // One SBI Base extension probe (EID 0x10): returns the value in a1 (a0 is the error
@@ -545,8 +592,8 @@ pub mod firmware {
 	pub fn take_events(_out: &mut dyn FnMut(u8, u16)) {}
 
 	// No line of a device-tree machine is the firmware's: its interrupt controllers are kernel-held rows.
-	pub fn kernel_lines() -> alloc::vec::Vec<u32> {
-		alloc::vec::Vec::new()
+	pub fn kernel_lines() -> ([u32; 3], usize) {
+		([0; 3], 0)
 	}
 
 	pub fn chipset_registers(_vendor: u16, _device: u16) -> &'static [(u16, u16)] {

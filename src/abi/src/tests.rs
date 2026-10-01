@@ -198,6 +198,31 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_FIRMWARE_EVENTS, 106),
 	(SYS_FIRMWARE_GPE, 107),
 	(SYS_DEVICE_NODE, 108),
+	// THE SLEEP: the application domains frozen, the system sleep, the firmware's sleep types, the boot-time clock, a
+	// line's wake, the states this machine's entry takes and the clock's base.
+	(SYS_DOMAIN_FREEZE, 109),
+	(SYS_SYSTEM_SLEEP, 110),
+	(SYS_FIRMWARE_SLEEP_TYPE, 111),
+	(SYS_CLOCK_BOOT_NS, 112),
+	(SYS_INTERRUPT_WAKE, 113),
+	(SYS_SLEEP_STATES, 114),
+	(SYS_CLOCK_BASE, 115),
+	// THE HIBERNATION IMAGE: the snapshot read and released, the restore written and committed, and the fingerprint an
+	// image is bound to.
+	(SYS_SNAPSHOT_INFO, 116),
+	(SYS_SNAPSHOT_READ, 117),
+	(SYS_SNAPSHOT_RELEASE, 118),
+	(SYS_RESTORE_BEGIN, 119),
+	(SYS_RESTORE_WRITE, 120),
+	(SYS_RESTORE_COMMIT, 121),
+	(SYS_SYSTEM_FINGERPRINT, 122),
+	// THE PROCESSOR'S POWER: the tables, the window, the injection, the latency request and CPPC's preference.
+	(SYS_PROCESSOR_IDLE_TABLE, 123),
+	(SYS_PROCESSOR_PERF_TABLE, 124),
+	(SYS_PROCESSOR_PERF_WINDOW, 125),
+	(SYS_PROCESSOR_IDLE_INJECT, 126),
+	(SYS_LATENCY_REQUEST, 127),
+	(SYS_PROCESSOR_PERF_PREFERENCE, 128),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -259,7 +284,7 @@ fn declared_names(prefix: &str) -> alloc::vec::Vec<alloc::string::String> {
 fn the_syscall_numbers_are_what_they_were() {
 	// 39 is deliberately absent: a retired call's number is not reused, because a stale binary
 	// calling it must get "no such syscall" rather than somebody else's handler.
-	let mut seen: [bool; 128] = [false; 128];
+	let mut seen: [bool; 256] = [false; 256];
 	for &(number, expected, _) in SYSCALLS {
 		assert_eq!(number, expected, "a syscall number moved");
 		let slot = number as usize;
@@ -368,12 +393,29 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(OBJECT_TYPE_PORT_RANGE, 15),
 		(OBJECT_TYPE_CONSOLE_TAP, 16),
 		(OBJECT_TYPE_REGISTERS, 17),
+		(OBJECT_TYPE_LATENCY_REQUEST, 18),
 	];
 	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
 	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.
 	const SIGNALS: &[(u64, u64, &str)] = named![(SIG_INT, 2), (SIG_KILL, 9), (SIG_TERM, 15), (SIG_CONT, 18), (SIG_STOP, 19)];
 	const PROPERTIES: &[(u64, u64, &str)] = named![(PROP_NAME, 0), (PROP_MEMORY_LIMIT, 1), (PROP_HANDLE_LIMIT, 2), (PROP_THREAD_LIMIT, 3), (PROP_DMA_LIMIT, 4), (PROP_IPC_QUEUE_LIMIT, 5), (PROP_STACK_LIMIT, 6),];
-	const POWER: &[(u64, u64, &str)] = named![(POWER_REBOOT, 0), (POWER_OFF, 1)];
+	const POWER: &[(u64, u64, &str)] = named![(POWER_REBOOT, 0), (POWER_OFF, 1), (POWER_OFF_WITHIN, 2)];
+	// THE SLEEP'S STATES AND WAKES, which `SYS_SYSTEM_SLEEP` takes and its report answers.
+	const SLEEP_STATES: &[(u64, u64, &str)] = named![(SLEEP_STATE_IDLE, 1), (SLEEP_STATE_RAM, 2), (SLEEP_STATE_DISK, 3), (SLEEP_STATE_DISK_ENTER, 4), (SLEEP_STATE_SOFT_OFF, 5)];
+	const WAKES: &[(u32, u32, &str)] = named![
+		(WAKE_UNKNOWN, 0),
+		(WAKE_TIMER, 1),
+		(WAKE_POWER_BUTTON, 2),
+		(WAKE_SLEEP_BUTTON, 3),
+		(WAKE_DEVICE, 4),
+		(WAKE_RTC, 5),
+		(WAKE_PLATFORM, 6),
+		(WAKE_SNAPSHOT, 7),
+		(WAKE_RESTORED, 8)
+	];
+	// THE PROCESSOR TABLES' CODES: how an idle state is entered, and how a performance table is controlled.
+	const IDLE_ENTRIES: &[(u32, u32, &str)] = named![(IDLE_ENTRY_HALT, 0), (IDLE_ENTRY_MWAIT, 1), (IDLE_ENTRY_REGISTER, 2), (IDLE_ENTRY_PSCI, 3), (IDLE_ENTRY_SBI, 4)];
+	const PERF_TABLES: &[(u32, u32, &str)] = named![(PERF_TABLE_STATES, 1), (PERF_TABLE_CPPC, 2)];
 	const MEMMAP: &[(u32, u32, &str)] = named![
 		(MEMMAP_USABLE, 0),
 		(MEMMAP_RESERVED, 1),
@@ -435,6 +477,14 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 	complete_u32("MEMMAP_", MEMMAP);
 	check_u32("IRQ_KIND", IRQ_KINDS);
 	complete_u32("IRQ_KIND_", IRQ_KINDS);
+	check_u64("SLEEP_STATE", SLEEP_STATES);
+	complete_u64("SLEEP_STATE_", SLEEP_STATES);
+	check_u32("WAKE", WAKES);
+	complete_u32("WAKE_", WAKES);
+	check_u32("IDLE_ENTRY", IDLE_ENTRIES);
+	complete_u32("IDLE_ENTRY_", IDLE_ENTRIES);
+	check_u32("PERF_TABLE", PERF_TABLES);
+	complete_u32("PERF_TABLE_", PERF_TABLES);
 }
 
 #[test]
@@ -874,7 +924,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	assert_layout!(covered, IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);
 	assert_layout!(covered, CpuIdleSource, 16, 8, source => 0, _pad => 4, count => 8);
 	assert_layout!(
-		covered, CpuIdleInfo, 184, 8,
+		covered, CpuIdleInfo, 1000, 8,
 		cpu => 0,
 		source_count => 4,
 		idle_ns => 8,
@@ -884,6 +934,50 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		wakes_housekeeping => 40,
 		wakes_device => 48,
 		sources => 56,
+		// THE PROCESSOR'S POWER, appended: nothing above moved.
+		state_count => 184,
+		perf_levels => 188,
+		states => 192,
+		perf_level => 448,
+		window_cap => 452,
+		window_floor => 456,
+		inject_permille => 460,
+		injected_ns => 464,
+		latency_requests => 472,
+		latency_bound_us => 476,
+		level_ns => 480,
+		hardware_id => 992,
+	);
+	assert_layout!(covered, CpuIdleStateInfo, 32, 8, entry => 0, unenterable => 4, exit_latency_us => 8, target_residency_us => 12, entries => 16, residency_ns => 24);
+	// THE SLEEP'S REPORT AND THE HIBERNATION IMAGE'S RECORDS.
+	assert_layout!(covered, CorePark, 16, 4, cpu => 0, timer => 4, ipi => 8, device => 12);
+	assert_layout!(covered, SleepReport, 1048, 8, wake => 0, detail => 4, slept_ns => 8, core_count => 16, _pad => 20, cores => 24);
+	assert_layout!(covered, SnapshotInfo, 136, 8, pages => 0, context => 8, system => 72, hardware => 104);
+	assert_layout!(covered, SystemFingerprint, 64, 1, system => 0, hardware => 32);
+	// THE PROCESSOR TABLES, as ProcessorPowerService hands them to the kernel.
+	assert_layout!(covered, ProcessorRegister, 16, 8, space => 0, bits => 1, _pad => 2, address => 8);
+	assert_layout!(covered, ProcessorIdleState, 40, 8, entry => 0, flags => 4, parameter => 8, exit_latency_us => 12, target_residency_us => 16, _pad => 20, register => 24);
+	assert_layout!(covered, ProcessorPerfState, 20, 4, core_mhz => 0, power_mw => 4, latency_us => 8, control => 12, status => 16);
+	assert_layout!(covered, ProcessorThrottleState, 12, 4, percent => 0, latency_us => 4, control => 8);
+	assert_layout!(
+		covered, ProcessorPerfTable, 1144, 8,
+		control_kind => 0,
+		state_count => 4,
+		control => 8,
+		status => 24,
+		maximum => 40,
+		preference => 56,
+		highest => 72,
+		nominal => 76,
+		lowest => 80,
+		domain => 84,
+		coordination => 88,
+		processors => 92,
+		throttle_count => 96,
+		_pad => 100,
+		throttle_control => 104,
+		states => 120,
+		throttle => 760,
 	);
 	assert_layout!(
 		covered, PciInfo, 12, 2,

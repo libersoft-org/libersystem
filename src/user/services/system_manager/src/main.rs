@@ -136,6 +136,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len >= 9 && &buf[..9] == b"HIBERNATE" => handle,
 		_ => 0,
 	};
+	// 1j. and processor power's two, relayed the same way: ServiceManager hands the first to ProcessorPowerService and
+	//     the second to the service that bounds idle latency.
+	let processor_power: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 9 && &buf[..9] == b"PROCPOWER" => handle,
+		_ => 0,
+	};
+	let idle_latency: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 11 && &buf[..11] == b"IDLELATENCY" => handle,
+		_ => 0,
+	};
 
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
@@ -220,8 +230,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(sm_side, b"FIRMWARE", firmware);
 		// The clock source's, likewise.
 		send_blocking(sm_side, b"CLOCKSRC", clock_source);
-		// Hibernation's, last, likewise.
+		// Hibernation's, likewise.
 		send_blocking(sm_side, b"HIBERNATE", hibernation);
+		// Processor power's two, last, likewise.
+		send_blocking(sm_side, b"PROCPOWER", processor_power);
+		send_blocking(sm_side, b"IDLELATENCY", idle_latency);
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's
@@ -447,10 +460,15 @@ impl Drop for BranchGuard {
 // refusal is a capability shortage inside this service and the word for it was the same word the
 // manager prints for a missing interrupt vector.
 //
-// Eight leaves room for a driver that is being restarted while its predecessor's connection has not
+// Eight left room for a driver that is being restarted while its predecessor's connection has not
 // yet been reclaimed - the slot comes back when the peer closes, which is one wake later than the
 // replacement's request.
-const MAX_POWER_CLIENTS: usize = 8;
+//
+// AND THEN THE MACHINE GREW MORE HOLDERS: each control-method button's driver (a lid, a power and a
+// sleep button on a laptop), each thermal zone's driver for the forced power-off past `_CRT`, and the
+// two policies that arm it - PowerService's critical battery and ProcessorPowerService's `_CRT`. A
+// laptop's firmware asks for about a dozen; sixteen keeps the restart's room on top of that.
+const MAX_POWER_CLIENTS: usize = 16;
 
 // The kernel object id behind a handle, which is what a wait set names its members by.
 unsafe fn koid_of(handle: u64) -> u64 {

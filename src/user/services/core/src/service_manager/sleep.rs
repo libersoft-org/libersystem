@@ -38,6 +38,8 @@ pub(super) const NOTICE_SLEEP: u8 = 2;
 // THE NEAR ENDS OF EVERY `system-sleep` CONNECTION, filled where a connection is minted and read by the standing loop's
 // wait set each round - a role delivered at a start, or a grant resolved by name.
 pub(super) const MAX_SLEEP_CLIENTS: usize = 16;
+// HOW MANY ARE MINTED AHEAD FOR DEVICEMANAGER'S CONTROL-METHOD BUTTONS: a lid, a power and a sleep button, and one more.
+pub(super) const BUTTON_POOL: usize = 4;
 pub(super) static SLEEP_CLIENTS: [AtomicU64; MAX_SLEEP_CLIENTS] = [const { AtomicU64::new(0) }; MAX_SLEEP_CLIENTS];
 // WHICH OF THEM MAY SCHEDULE A WAKE: minted for the `sleep-wake` grant, and every connection a `CONNECT` on one of them
 // mints - a holder narrows what it hands on, it never widens it.

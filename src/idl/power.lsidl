@@ -8,7 +8,11 @@
 //!
 //! THIS IS NOT MACHINE SHUTDOWN. Rebooting and powering off the host stay with SystemManager's
 //! `system-power`; this service holds no client of it. Turning a UPS's output off turns the UPS's
-//! output off. Suspend, fan curves and power policy are not here at all.
+//! output off. Suspend is `liber:process@1`'s.
+//!
+//! AND THE PROCESSORS' AND THE ZONES' COOLING, at the end: a thermal zone's cooling half and a fan as their drivers
+//! serve them to ProcessorPowerService, and that service's operator authority - the profile, the fan curves - which
+//! `powerctl` holds.
 
 package liber:power@1;
 
@@ -342,4 +346,143 @@ interface power-fixture {
 	@op(7) offer-extra: func() -> result<unit, error>;
 	/// The UPS's outlets, on or off, in order.
 	@op(8) outlets:     func() -> result<list<bool>, error>;
+}
+
+// ------------------------------------------------------------------ cooling: the zones, the fans, the policy's operator
+
+/// AN ACTIVE TRIP POINT: `_ACx`'s temperature in tenths of a kelvin and `_ALx`'s devices - the fans it switches on - by
+/// namespace path.
+record active-trip {
+	level:                 u8,
+	temperature:           u32,
+	@bound(8) devices:     list<string>,
+}
+
+/// A THERMAL ZONE'S COOLING HALF, as its driver read it: the zone; `_PSV`, `_CRT` and `_HOT` in tenths of a kelvin;
+/// `_TC1`, `_TC2` and `_TSP` (in tenths of a second) for passive cooling and `_PSL`'s processors; every `_ACx` with its
+/// `_ALx`; and whether it has `_SCP`.
+record zone-cooling {
+	@bound(64) zone:                  string,
+	passive:                          option<u32>,
+	critical:                         option<u32>,
+	hot:                              option<u32>,
+	tc1:                              u32,
+	tc2:                              u32,
+	tsp:                              u32,
+	@bound(64) passive-processors:    list<string>,
+	@bound(10) active:                list<active-trip>,
+	scp:                              bool,
+}
+
+/// One reading of a zone's `_TMP`, in tenths of a kelvin.
+record zone-reading {
+	temperature: u32,
+	sequence:    u32,
+}
+
+/// THE `thermal-zone` PROVIDER CONTRACT, which a zone's driver serves to ProcessorPowerService alone: the zone's cooling
+/// objects, its readings - at the zone's own `_TZP`, at every `Notify`, and as often as `sample-every` asks while passive
+/// cooling is engaged - and `_SCP`. The driver ALSO compares every reading with `_CRT` itself and, past it, arms the
+/// kernel's forced power-off - the fallback for a policy that is not there.
+interface thermal-zone {
+	@op(1) describe:       func() -> result<zone-cooling, error>;
+	@op(2) readings:       func() -> stream<zone-reading>;
+	/// Read `_TMP` every `milliseconds` (at least a hundred), until asked for zero: the zone's own period again.
+	@op(3) sample-every:   func(milliseconds: u32) -> result<unit, error>;
+	/// `_SCP`: 0 active cooling preferred, 1 passive.
+	@op(4) cooling-policy: func(mode: u8) -> result<unit, error>;
+}
+
+/// ONE `_FPS` LEVEL: the control value `_FSL` takes, and what the fan does at it.
+record fan-level {
+	control:   u32,
+	speed-rpm: u32,
+	noise:     u32,
+	power-mw:  u32,
+}
+
+/// A FAN, as its driver read it: its path; ACPI 4.0's `_FIF` and `_FPS` - fine-grain control, the step size and the
+/// levels - or, for an ACPI 1.0 fan, none, switched by its device power state.
+record fan-description {
+	@bound(64) path:        string,
+	by-power-state:         bool,
+	fine-grain:             bool,
+	step-size:              u32,
+	@bound(16) levels:      list<fan-level>,
+}
+
+/// `_FST`: the control value in force and the speed (zero where the fan does not say).
+record fan-status {
+	control:   u32,
+	speed-rpm: u32,
+}
+
+/// THE `cooling-device` PROVIDER CONTRACT, which a fan's driver serves to ProcessorPowerService alone: its description,
+/// a level set - `_FSL`, or D0 for any level above zero and D3hot for zero on a fan without it - and `_FST`.
+interface cooling-device {
+	@op(1) describe:  func() -> result<fan-description, error>;
+	@op(2) set-level: func(level: u32) -> result<fan-status, error>;
+	@op(3) status:    func() -> result<fan-status, error>;
+}
+
+/// The profiles a person chooses between.
+enum power-profile {
+	performance  = 1,
+	balanced     = 2,
+	power-saving = 3,
+}
+
+/// ONE POINT OF A FAN CURVE: at this temperature (tenths of a kelvin) and above, this share of the fan's range.
+record curve-point {
+	temperature: u32,
+	percent:     u8,
+}
+
+/// One core, as the kernel's record states it.
+record core-power {
+	cpu:                u32,
+	idle-states:        u32,
+	perf-levels:        u32,
+	perf-level:         u32,
+	window-cap:         u32,
+	window-floor:       u32,
+	inject-permille:    u32,
+	latency-requests:   u32,
+}
+
+/// One zone, as the policy reads it: its temperature, its trips and the cap passive cooling holds its processors to.
+record zone-power {
+	@bound(64) zone: string,
+	temperature:     u32,
+	passive:         option<u32>,
+	critical:        option<u32>,
+	hot:             option<u32>,
+	passive-engaged: bool,
+	cap-percent:     u32,
+}
+
+/// One fan, as the policy commands it.
+record fan-power {
+	@bound(64) path:       string,
+	control:               u32,
+	speed-rpm:             u32,
+	@bound(8) curve:       list<curve-point>,
+}
+
+/// THE POLICY NOW: the profile and why it is the one, every core, every zone and every fan.
+record processor-power-status {
+	profile:              power-profile,
+	@bound(64) because:   string,
+	@bound(64) cores:     list<core-power>,
+	@bound(16) zones:     list<zone-power>,
+	@bound(16) fans:      list<fan-power>,
+}
+
+/// THE OPERATOR AUTHORITY over ProcessorPowerService, granted as PowerService's `power-control` is: the status, the
+/// profile, and a fan's curve where the platform leaves the fan to the operating system (`_FIF`'s fine-grain control).
+/// NOTHING HERE REACHES `_CRT` OR `_HOT`, which no profile, curve or operator verb turns off.
+interface processor-power-admin {
+	@op(1) status:        func() -> result<processor-power-status, error>;
+	@op(2) set-profile:   func(profile: power-profile) -> result<unit, error>;
+	@op(3) set-fan-curve: func(@bound(64) fan: string, @bound(8) curve: list<curve-point>) -> result<unit, error>;
 }

@@ -50,3 +50,5 @@ pub const CAP_TYPEC_CONTROL: &[u8] = b"TYPECCONTROL";
 pub const CAP_SLEEP: &[u8] = b"SLEEP";
 // AND ITS SCHEDULED WAKE, a grant of its own: a `system-sleep` connection minted with it may schedule a wake.
 pub const CAP_SLEEP_WAKE: &[u8] = b"SLEEPWAKE";
+// PROCESSORPOWERSERVICE'S OPERATOR ROOT: every `processor-power` grant is a fresh connection from it.
+pub const CAP_PROCESSOR_POWER: &[u8] = b"PROCESSORPOWER";

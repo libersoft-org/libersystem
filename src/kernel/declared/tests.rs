@@ -141,6 +141,7 @@ fn through_the_lpc_bridge() {
 // THE ICH9 SMBUS FUNCTION'S HOSTC, WRITTEN BY THE CLAIM AND RESTORED BY THE RELEASE: seeded here with HST_EN clear and
 // I2C_EN set, so both bits have to move - and come back - for this to pass. With the host enabled the SMBus base, BAR
 // 4, decodes: its host status register reads as a register rather than as nothing.
+#[cfg(target_arch = "x86_64")]
 crate::tagged_test!(the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc, [Object, Kernel, Pci, Syscall, ArchX86_64], id = "kernel.declared.the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc", covers = ["kernel"]);
 #[cfg(target_arch = "x86_64")]
 fn the_ich9_smbus_claim_enables_its_host_and_the_release_restores_hostc() {

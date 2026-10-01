@@ -488,10 +488,135 @@ impl CoreWakeSource {
 	}
 }
 
+/// ONE IDLE STATE OF A CORE, as the kernel installed it: how it is entered (0 the halt, 1 MWAIT, 2 a register read, 3
+/// PSCI, 4 the SBI), why it is not entered on this core where it is not (0 it is), its costs in microseconds, and how
+/// many times and for how long it was entered.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoreIdleState {
+	pub entry: u32,
+	pub unenterable: u32,
+	pub exit_latency_us: u32,
+	pub target_residency_us: u32,
+	pub entries: u64,
+	pub residency_ns: u64,
+}
+
+impl CoreIdleState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CoreIdleState> {
+		let mut r = Reader::new(bytes);
+		let value = CoreIdleState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CoreIdleState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CoreIdleState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.entry)?;
+		w.u32(self.unenterable)?;
+		w.u32(self.exit_latency_us)?;
+		w.u32(self.target_residency_us)?;
+		w.u64(self.entries)?;
+		w.u64(self.residency_ns)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CoreIdleState> {
+		let entry = r.u32()?;
+		let unenterable = r.u32()?;
+		let exit_latency_us = r.u32()?;
+		let target_residency_us = r.u32()?;
+		let entries = r.u64()?;
+		let residency_ns = r.u64()?;
+		Some(CoreIdleState { entry, unenterable, exit_latency_us, target_residency_us, entries, residency_ns })
+	}
+}
+
+/// THE TIME A CORE SPENT AT ONE PERFORMANCE LEVEL, in nanoseconds - a record rather than a bare number, so the list
+/// shares no element type with another package's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoreLevel {
+	pub level: u32,
+	pub ns: u64,
+}
+
+impl CoreLevel {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CoreLevel> {
+		let mut r = Reader::new(bytes);
+		let value = CoreLevel::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CoreLevel> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CoreLevel::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.level)?;
+		w.u64(self.ns)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CoreLevel> {
+		let level = r.u32()?;
+		let ns = r.u64()?;
+		Some(CoreLevel { level, ns })
+	}
+}
+
 /// HOW ONE CORE RESTS, from the kernel's own record: the time it spent halted, how many times it
 /// halted, and each wake under what ended it - its timer, an IPI, the housekeeping bound, or a
 /// device's interrupt, in total and per identity. Wakes per second are two snapshots and the time
-/// between them.
+/// between them. AND ITS POWER: each idle state with its entries and residency, the performance
+/// level now of the levels its table has and the time at each, the window its governor is held to,
+/// the idle injected, and the live latency requests with the smallest bound (`0xFFFFFFFF` for none).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoreIdle {
 	pub cpu: u32,
@@ -502,6 +627,16 @@ pub struct CoreIdle {
 	pub wakes_housekeeping: u64,
 	pub wakes_device: u64,
 	pub sources: Vec<CoreWakeSource>,
+	pub states: Vec<CoreIdleState>,
+	pub perf_levels: u32,
+	pub perf_level: u32,
+	pub levels: Vec<CoreLevel>,
+	pub window_cap: u32,
+	pub window_floor: u32,
+	pub inject_permille: u32,
+	pub injected_ns: u64,
+	pub latency_requests: u32,
+	pub latency_bound_us: u32,
 }
 
 impl CoreIdle {
@@ -554,6 +689,28 @@ impl CoreIdle {
 		for v6 in self.sources.iter() {
 			v6.write(w)?;
 		}
+		if self.states.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.states.len() as u16)?;
+		for v7 in self.states.iter() {
+			v7.write(w)?;
+		}
+		w.u32(self.perf_levels)?;
+		w.u32(self.perf_level)?;
+		if self.levels.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.levels.len() as u16)?;
+		for v8 in self.levels.iter() {
+			v8.write(w)?;
+		}
+		w.u32(self.window_cap)?;
+		w.u32(self.window_floor)?;
+		w.u32(self.inject_permille)?;
+		w.u64(self.injected_ns)?;
+		w.u32(self.latency_requests)?;
+		w.u32(self.latency_bound_us)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<CoreIdle> {
@@ -565,16 +722,44 @@ impl CoreIdle {
 		let wakes_housekeeping = r.u64()?;
 		let wakes_device = r.u64()?;
 		let sources = {
-			let v7 = r.u16()? as usize;
-			let v7 = (v7 <= 8).then_some(v7)?;
-			let mut v8 = Vec::new();
-			v8.try_reserve_exact(v7).ok()?;
-			for _ in 0..v7 {
-				v8.push(CoreWakeSource::read(r)?);
+			let v9 = r.u16()? as usize;
+			let v9 = (v9 <= 8).then_some(v9)?;
+			let mut v10 = Vec::new();
+			v10.try_reserve_exact(v9).ok()?;
+			for _ in 0..v9 {
+				v10.push(CoreWakeSource::read(r)?);
 			}
-			v8
+			v10
 		};
-		Some(CoreIdle { cpu, idle_ns, halts, wakes_timer, wakes_ipi, wakes_housekeeping, wakes_device, sources })
+		let states = {
+			let v11 = r.u16()? as usize;
+			let v11 = (v11 <= 8).then_some(v11)?;
+			let mut v12 = Vec::new();
+			v12.try_reserve_exact(v11).ok()?;
+			for _ in 0..v11 {
+				v12.push(CoreIdleState::read(r)?);
+			}
+			v12
+		};
+		let perf_levels = r.u32()?;
+		let perf_level = r.u32()?;
+		let levels = {
+			let v13 = r.u16()? as usize;
+			let v13 = (v13 <= 64).then_some(v13)?;
+			let mut v14 = Vec::new();
+			v14.try_reserve_exact(v13).ok()?;
+			for _ in 0..v13 {
+				v14.push(CoreLevel::read(r)?);
+			}
+			v14
+		};
+		let window_cap = r.u32()?;
+		let window_floor = r.u32()?;
+		let inject_permille = r.u32()?;
+		let injected_ns = r.u64()?;
+		let latency_requests = r.u32()?;
+		let latency_bound_us = r.u32()?;
+		Some(CoreIdle { cpu, idle_ns, halts, wakes_timer, wakes_ipi, wakes_housekeeping, wakes_device, sources, states, perf_levels, perf_level, levels, window_cap, window_floor, inject_permille, injected_ns, latency_requests, latency_bound_us })
 	}
 }
 
@@ -629,53 +814,53 @@ impl Graph {
 			return None;
 		}
 		w.u16(self.components.len() as u16)?;
-		for v9 in self.components.iter() {
-			v9.write(w)?;
+		for v15 in self.components.iter() {
+			v15.write(w)?;
 		}
 		if self.spans.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.spans.len() as u16)?;
-		for v10 in self.spans.iter() {
-			v10.write(w)?;
+		for v16 in self.spans.iter() {
+			v16.write(w)?;
 		}
 		if self.cores.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.cores.len() as u16)?;
-		for v11 in self.cores.iter() {
-			v11.write(w)?;
+		for v17 in self.cores.iter() {
+			v17.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Graph> {
 		let components = {
-			let v12 = r.u16()? as usize;
-			let mut v13 = Vec::new();
-			v13.try_reserve_exact(v12).ok()?;
-			for _ in 0..v12 {
-				v13.push(Component::read(r)?);
+			let v18 = r.u16()? as usize;
+			let mut v19 = Vec::new();
+			v19.try_reserve_exact(v18).ok()?;
+			for _ in 0..v18 {
+				v19.push(Component::read(r)?);
 			}
-			v13
+			v19
 		};
 		let spans = {
-			let v14 = r.u16()? as usize;
-			let mut v15 = Vec::new();
-			v15.try_reserve_exact(v14).ok()?;
-			for _ in 0..v14 {
-				v15.push(TraceSpan::read(r)?);
+			let v20 = r.u16()? as usize;
+			let mut v21 = Vec::new();
+			v21.try_reserve_exact(v20).ok()?;
+			for _ in 0..v20 {
+				v21.push(TraceSpan::read(r)?);
 			}
-			v15
+			v21
 		};
 		let cores = {
-			let v16 = r.u16()? as usize;
-			let v16 = (v16 <= 64).then_some(v16)?;
-			let mut v17 = Vec::new();
-			v17.try_reserve_exact(v16).ok()?;
-			for _ in 0..v16 {
-				v17.push(CoreIdle::read(r)?);
+			let v22 = r.u16()? as usize;
+			let v22 = (v22 <= 64).then_some(v22)?;
+			let mut v23 = Vec::new();
+			v23.try_reserve_exact(v22).ok()?;
+			for _ in 0..v22 {
+				v23.push(CoreIdle::read(r)?);
 			}
-			v17
+			v23
 		};
 		Some(Graph { components, spans, cores })
 	}
@@ -725,13 +910,13 @@ pub mod system_graph {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v18) => {
+						Ok(v24) => {
 							w.u8(1)?;
-							v18.write(w)?;
+							v24.write(w)?;
 						}
-						Err(v19) => {
+						Err(v25) => {
 							w.u8(0)?;
-							v19.write(w)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -1012,19 +1197,19 @@ pub mod supervisor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v20) => {
+						Ok(v26) => {
 							w.u8(1)?;
-							if v20.len() > u16::MAX as usize {
+							if v26.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v20.len() as u16)?;
-							for v22 in v20.iter() {
-								v22.write(w)?;
+							w.u16(v26.len() as u16)?;
+							for v28 in v26.iter() {
+								v28.write(w)?;
 							}
 						}
-						Err(v21) => {
+						Err(v27) => {
 							w.u8(0)?;
-							v21.write(w)?;
+							v27.write(w)?;
 						}
 					}
 					Some(())
@@ -1154,13 +1339,13 @@ pub mod supervisor {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v23 = r.u16()? as usize;
-						let mut v24 = Vec::new();
-						v24.try_reserve_exact(v23).ok()?;
-						for _ in 0..v23 {
-							v24.push(SupervisorStat::read(r)?);
+						let v29 = r.u16()? as usize;
+						let mut v30 = Vec::new();
+						v30.try_reserve_exact(v29).ok()?;
+						for _ in 0..v29 {
+							v30.push(SupervisorStat::read(r)?);
 						}
-						v24
+						v30
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1235,13 +1420,13 @@ pub mod supervisor_liveness {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v25) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							w.u64(*v25)?;
+							w.u64(*v31)?;
 						}
-						Err(v26) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v26.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -1638,13 +1823,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v28 = true;
-		for v27 in self.deps.iter() {
-			if !v28 {
+		let mut v34 = true;
+		for v33 in self.deps.iter() {
+			if !v34 {
 				out.push(',');
 			}
-			v28 = false;
-			crate::codec::json_escape(v27, out);
+			v34 = false;
+			crate::codec::json_escape(v33, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -1653,13 +1838,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"resources\":");
 		out.push('[');
-		let mut v30 = true;
-		for v29 in self.resources.iter() {
-			if !v30 {
+		let mut v36 = true;
+		for v35 in self.resources.iter() {
+			if !v36 {
 				out.push(',');
 			}
-			v30 = false;
-			v29.to_json_into(out);
+			v36 = false;
+			v35.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1677,13 +1862,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v32 = true;
-		for v31 in self.deps.iter() {
-			if !v32 {
+		let mut v38 = true;
+		for v37 in self.deps.iter() {
+			if !v38 {
 				out.push_str(", ");
 			}
-			v32 = false;
-			out.push_str(v31);
+			v38 = false;
+			out.push_str(v37);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -1692,13 +1877,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("resources=");
 		out.push('[');
-		let mut v34 = true;
-		for v33 in self.resources.iter() {
-			if !v34 {
+		let mut v40 = true;
+		for v39 in self.resources.iter() {
+			if !v40 {
 				out.push_str(", ");
 			}
-			v34 = false;
-			v33.to_text_into(out);
+			v40 = false;
+			v39.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1713,15 +1898,15 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v35 in self.deps.iter() {
-			crate::codec::cbor::text(out, v35);
+		for v41 in self.deps.iter() {
+			crate::codec::cbor::text(out, v41);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::array(out, self.resources.len());
-		for v36 in self.resources.iter() {
-			v36.to_cbor_into(out);
+		for v42 in self.resources.iter() {
+			v42.to_cbor_into(out);
 		}
 	}
 }
@@ -1812,6 +1997,124 @@ impl CoreWakeSource {
 	}
 }
 
+impl CoreIdleState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"entry\":");
+		let _ = write!(out, "{}", self.entry);
+		out.push(',');
+		out.push_str("\"unenterable\":");
+		let _ = write!(out, "{}", self.unenterable);
+		out.push(',');
+		out.push_str("\"exit-latency-us\":");
+		let _ = write!(out, "{}", self.exit_latency_us);
+		out.push(',');
+		out.push_str("\"target-residency-us\":");
+		let _ = write!(out, "{}", self.target_residency_us);
+		out.push(',');
+		out.push_str("\"entries\":");
+		let _ = write!(out, "{}", self.entries);
+		out.push(',');
+		out.push_str("\"residency-ns\":");
+		let _ = write!(out, "{}", self.residency_ns);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("entry=");
+		let _ = write!(out, "{}", self.entry);
+		out.push_str(", ");
+		out.push_str("unenterable=");
+		let _ = write!(out, "{}", self.unenterable);
+		out.push_str(", ");
+		out.push_str("exit-latency-us=");
+		let _ = write!(out, "{}", self.exit_latency_us);
+		out.push_str(", ");
+		out.push_str("target-residency-us=");
+		let _ = write!(out, "{}", self.target_residency_us);
+		out.push_str(", ");
+		out.push_str("entries=");
+		let _ = write!(out, "{}", self.entries);
+		out.push_str(", ");
+		out.push_str("residency-ns=");
+		let _ = write!(out, "{}", self.residency_ns);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "entry");
+		crate::codec::cbor::uint(out, self.entry as u64);
+		crate::codec::cbor::text(out, "unenterable");
+		crate::codec::cbor::uint(out, self.unenterable as u64);
+		crate::codec::cbor::text(out, "exit-latency-us");
+		crate::codec::cbor::uint(out, self.exit_latency_us as u64);
+		crate::codec::cbor::text(out, "target-residency-us");
+		crate::codec::cbor::uint(out, self.target_residency_us as u64);
+		crate::codec::cbor::text(out, "entries");
+		crate::codec::cbor::uint(out, self.entries as u64);
+		crate::codec::cbor::text(out, "residency-ns");
+		crate::codec::cbor::uint(out, self.residency_ns as u64);
+	}
+}
+
+impl CoreLevel {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"level\":");
+		let _ = write!(out, "{}", self.level);
+		out.push(',');
+		out.push_str("\"ns\":");
+		let _ = write!(out, "{}", self.ns);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("level=");
+		let _ = write!(out, "{}", self.level);
+		out.push_str(", ");
+		out.push_str("ns=");
+		let _ = write!(out, "{}", self.ns);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "level");
+		crate::codec::cbor::uint(out, self.level as u64);
+		crate::codec::cbor::text(out, "ns");
+		crate::codec::cbor::uint(out, self.ns as u64);
+	}
+}
+
 impl CoreIdle {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1853,15 +2156,63 @@ impl CoreIdle {
 		out.push(',');
 		out.push_str("\"sources\":");
 		out.push('[');
-		let mut v38 = true;
-		for v37 in self.sources.iter() {
-			if !v38 {
+		let mut v44 = true;
+		for v43 in self.sources.iter() {
+			if !v44 {
 				out.push(',');
 			}
-			v38 = false;
-			v37.to_json_into(out);
+			v44 = false;
+			v43.to_json_into(out);
 		}
 		out.push(']');
+		out.push(',');
+		out.push_str("\"states\":");
+		out.push('[');
+		let mut v46 = true;
+		for v45 in self.states.iter() {
+			if !v46 {
+				out.push(',');
+			}
+			v46 = false;
+			v45.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"perf-levels\":");
+		let _ = write!(out, "{}", self.perf_levels);
+		out.push(',');
+		out.push_str("\"perf-level\":");
+		let _ = write!(out, "{}", self.perf_level);
+		out.push(',');
+		out.push_str("\"levels\":");
+		out.push('[');
+		let mut v48 = true;
+		for v47 in self.levels.iter() {
+			if !v48 {
+				out.push(',');
+			}
+			v48 = false;
+			v47.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"window-cap\":");
+		let _ = write!(out, "{}", self.window_cap);
+		out.push(',');
+		out.push_str("\"window-floor\":");
+		let _ = write!(out, "{}", self.window_floor);
+		out.push(',');
+		out.push_str("\"inject-permille\":");
+		let _ = write!(out, "{}", self.inject_permille);
+		out.push(',');
+		out.push_str("\"injected-ns\":");
+		let _ = write!(out, "{}", self.injected_ns);
+		out.push(',');
+		out.push_str("\"latency-requests\":");
+		let _ = write!(out, "{}", self.latency_requests);
+		out.push(',');
+		out.push_str("\"latency-bound-us\":");
+		let _ = write!(out, "{}", self.latency_bound_us);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1889,19 +2240,67 @@ impl CoreIdle {
 		out.push_str(", ");
 		out.push_str("sources=");
 		out.push('[');
-		let mut v40 = true;
-		for v39 in self.sources.iter() {
-			if !v40 {
+		let mut v50 = true;
+		for v49 in self.sources.iter() {
+			if !v50 {
 				out.push_str(", ");
 			}
-			v40 = false;
-			v39.to_text_into(out);
+			v50 = false;
+			v49.to_text_into(out);
 		}
 		out.push(']');
+		out.push_str(", ");
+		out.push_str("states=");
+		out.push('[');
+		let mut v52 = true;
+		for v51 in self.states.iter() {
+			if !v52 {
+				out.push_str(", ");
+			}
+			v52 = false;
+			v51.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("perf-levels=");
+		let _ = write!(out, "{}", self.perf_levels);
+		out.push_str(", ");
+		out.push_str("perf-level=");
+		let _ = write!(out, "{}", self.perf_level);
+		out.push_str(", ");
+		out.push_str("levels=");
+		out.push('[');
+		let mut v54 = true;
+		for v53 in self.levels.iter() {
+			if !v54 {
+				out.push_str(", ");
+			}
+			v54 = false;
+			v53.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("window-cap=");
+		let _ = write!(out, "{}", self.window_cap);
+		out.push_str(", ");
+		out.push_str("window-floor=");
+		let _ = write!(out, "{}", self.window_floor);
+		out.push_str(", ");
+		out.push_str("inject-permille=");
+		let _ = write!(out, "{}", self.inject_permille);
+		out.push_str(", ");
+		out.push_str("injected-ns=");
+		let _ = write!(out, "{}", self.injected_ns);
+		out.push_str(", ");
+		out.push_str("latency-requests=");
+		let _ = write!(out, "{}", self.latency_requests);
+		out.push_str(", ");
+		out.push_str("latency-bound-us=");
+		let _ = write!(out, "{}", self.latency_bound_us);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 8);
+		crate::codec::cbor::map(out, 18);
 		crate::codec::cbor::text(out, "cpu");
 		crate::codec::cbor::uint(out, self.cpu as u64);
 		crate::codec::cbor::text(out, "idle-ns");
@@ -1918,9 +2317,35 @@ impl CoreIdle {
 		crate::codec::cbor::uint(out, self.wakes_device as u64);
 		crate::codec::cbor::text(out, "sources");
 		crate::codec::cbor::array(out, self.sources.len());
-		for v41 in self.sources.iter() {
-			v41.to_cbor_into(out);
+		for v55 in self.sources.iter() {
+			v55.to_cbor_into(out);
 		}
+		crate::codec::cbor::text(out, "states");
+		crate::codec::cbor::array(out, self.states.len());
+		for v56 in self.states.iter() {
+			v56.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "perf-levels");
+		crate::codec::cbor::uint(out, self.perf_levels as u64);
+		crate::codec::cbor::text(out, "perf-level");
+		crate::codec::cbor::uint(out, self.perf_level as u64);
+		crate::codec::cbor::text(out, "levels");
+		crate::codec::cbor::array(out, self.levels.len());
+		for v57 in self.levels.iter() {
+			v57.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "window-cap");
+		crate::codec::cbor::uint(out, self.window_cap as u64);
+		crate::codec::cbor::text(out, "window-floor");
+		crate::codec::cbor::uint(out, self.window_floor as u64);
+		crate::codec::cbor::text(out, "inject-permille");
+		crate::codec::cbor::uint(out, self.inject_permille as u64);
+		crate::codec::cbor::text(out, "injected-ns");
+		crate::codec::cbor::uint(out, self.injected_ns as u64);
+		crate::codec::cbor::text(out, "latency-requests");
+		crate::codec::cbor::uint(out, self.latency_requests as u64);
+		crate::codec::cbor::text(out, "latency-bound-us");
+		crate::codec::cbor::uint(out, self.latency_bound_us as u64);
 	}
 }
 
@@ -1944,37 +2369,37 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v43 = true;
-		for v42 in self.components.iter() {
-			if !v43 {
+		let mut v59 = true;
+		for v58 in self.components.iter() {
+			if !v59 {
 				out.push(',');
 			}
-			v43 = false;
-			v42.to_json_into(out);
+			v59 = false;
+			v58.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"spans\":");
 		out.push('[');
-		let mut v45 = true;
-		for v44 in self.spans.iter() {
-			if !v45 {
+		let mut v61 = true;
+		for v60 in self.spans.iter() {
+			if !v61 {
 				out.push(',');
 			}
-			v45 = false;
-			v44.to_json_into(out);
+			v61 = false;
+			v60.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"cores\":");
 		out.push('[');
-		let mut v47 = true;
-		for v46 in self.cores.iter() {
-			if !v47 {
+		let mut v63 = true;
+		for v62 in self.cores.iter() {
+			if !v63 {
 				out.push(',');
 			}
-			v47 = false;
-			v46.to_json_into(out);
+			v63 = false;
+			v62.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1983,37 +2408,37 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v49 = true;
-		for v48 in self.components.iter() {
-			if !v49 {
+		let mut v65 = true;
+		for v64 in self.components.iter() {
+			if !v65 {
 				out.push_str(", ");
 			}
-			v49 = false;
-			v48.to_text_into(out);
+			v65 = false;
+			v64.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("spans=");
 		out.push('[');
-		let mut v51 = true;
-		for v50 in self.spans.iter() {
-			if !v51 {
+		let mut v67 = true;
+		for v66 in self.spans.iter() {
+			if !v67 {
 				out.push_str(", ");
 			}
-			v51 = false;
-			v50.to_text_into(out);
+			v67 = false;
+			v66.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("cores=");
 		out.push('[');
-		let mut v53 = true;
-		for v52 in self.cores.iter() {
-			if !v53 {
+		let mut v69 = true;
+		for v68 in self.cores.iter() {
+			if !v69 {
 				out.push_str(", ");
 			}
-			v53 = false;
-			v52.to_text_into(out);
+			v69 = false;
+			v68.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2022,18 +2447,18 @@ impl Graph {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v54 in self.components.iter() {
-			v54.to_cbor_into(out);
+		for v70 in self.components.iter() {
+			v70.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v55 in self.spans.iter() {
-			v55.to_cbor_into(out);
+		for v71 in self.spans.iter() {
+			v71.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "cores");
 		crate::codec::cbor::array(out, self.cores.len());
-		for v56 in self.cores.iter() {
-			v56.to_cbor_into(out);
+		for v72 in self.cores.iter() {
+			v72.to_cbor_into(out);
 		}
 	}
 }

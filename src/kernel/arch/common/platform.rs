@@ -15,6 +15,8 @@ use crate::device::Described;
 // the IPMI node the ACPI namespace describes is later checked against. `entry` is the entry point the loader
 // found, or zero; `phys_to_virt` reaches physical memory on this port. Nothing here is a device: it is what
 // the machine says it is.
+// A test kernel on the device-tree ports reads no SMBIOS - its rows are the suite's own.
+#[cfg(any(not(test), target_arch = "x86_64"))]
 pub fn report_smbios(entry: u64, phys_to_virt: fn(u64) -> u64) {
 	if entry == 0 {
 		crate::serial_println!("smbios: none - no firmware handed over an entry point");
@@ -39,6 +41,7 @@ pub fn report_smbios(entry: u64, phys_to_virt: fn(u64) -> u64) {
 	}
 	// SAFETY: as above, for the table's own stated length, which the entry point's parser bounded.
 	let table = unsafe { core::slice::from_raw_parts(phys_to_virt(point.table_address) as *const u8, point.table_length as usize) };
+	// ALLOC-OK: boot, the SMBIOS identity said once, before userspace exists.
 	let text = |bytes: Option<&[u8]>| -> alloc::string::String { bytes.map(|bytes| alloc::string::String::from_utf8_lossy(bytes).into_owned()).unwrap_or_else(|| alloc::string::String::from("-")) };
 	match smbios::system_identity(table, &point) {
 		Ok(Some(system)) => {
@@ -103,8 +106,10 @@ pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line
 	// Who carries which phandle, so a GPIO line names its controller's row by that row's identity.
 	let identity_of = |node: &fdt::DeviceNode| -> Option<Vec<u8>> {
 		let mut identity = [0u8; abi::PLATFORM_NAME_LEN];
+		// ALLOC-OK: boot, one identity per controller the device tree names, before userspace exists.
 		platform::identity(b"dt:", node.path(), &mut identity).map(|len| identity[..len].to_vec())
 	};
+	// ALLOC-OK: as above.
 	let controllers: Vec<(u32, Vec<u8>)> = nodes.iter().filter(|node| node.phandle != 0).filter_map(|node| identity_of(node).map(|identity| (node.phandle, identity))).collect();
 	let mut out: Vec<Described> = Vec::new();
 	let mut properties = [0u8; abi::MAX_DEVICE_PROPERTIES];
@@ -151,7 +156,8 @@ pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line
 					whole &= description.add_connection(abi::Connection { kind, trigger: 0, polarity: 0, _pad: 0, controller: u32::MAX, value: address as u32, extra: 0 });
 				}
 			}
-			fdt::NodeBus::Other => {}
+			// A PCI child was joined to its function above and never reaches here.
+			fdt::NodeBus::Pci | fdt::NodeBus::Other => {}
 		}
 		// THE CONTROLLER OF EACH CONNECTION, by identity: an I2C or SPI device's bus is the node containing it.
 		let mut targets: Vec<(u8, Vec<u8>)> = Vec::new();

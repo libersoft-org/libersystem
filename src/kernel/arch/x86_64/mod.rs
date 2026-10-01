@@ -25,6 +25,7 @@ pub mod rtc;
 // module is made of are elsewhere on purpose - which table field says what, in the host-tested
 // `acpi` crate, and what happens to an event nobody is listening for, in `platform_event`.
 pub mod hibernate;
+pub mod processor;
 #[cfg(not(test))]
 pub mod sci;
 pub mod serial;

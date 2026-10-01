@@ -34,6 +34,8 @@ const MAX_LINES: usize = 8;
 // The per-device MSI slot bindings (reserve / bind / dispatch / free bookkeeping, shared
 // with x86/aarch64 via arch::common::msi). Slot i maps to EID EID_BASE + i.
 static REGISTRY: MsiRegistry<MAX_MSI> = MsiRegistry::new();
+// THE MSI-X ENTRY EACH SLOT PROGRAMMED, by its physical address - 0 for none: what a sleep masks the slot's messages at.
+static SLOT_TABLE: [core::sync::atomic::AtomicU64; MAX_MSI] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_MSI];
 
 // The registry slot an EID maps to, or None if it is outside the MSI window.
 fn eid_slot(eid: u32) -> Option<usize> {
@@ -263,6 +265,7 @@ pub fn unbind(vector: u32) -> bool {
 		return confirmed;
 	}
 	let Some(slot) = eid_slot(vector) else { return true };
+	SLOT_TABLE[slot].store(0, core::sync::atomic::Ordering::Release);
 	if super::imsic::disable_eid_on_owner(vector) {
 		REGISTRY.retire(slot);
 		return true;
@@ -283,6 +286,7 @@ pub fn unbind(vector: u32) -> bool {
 // for why this is a free rather than a retire.
 pub fn release_unused_msi(vector: u32) {
 	if let Some(slot) = eid_slot(vector) {
+		SLOT_TABLE[slot].store(0, core::sync::atomic::Ordering::Release);
 		// Same rule as `unbind`: an identity that could not be disabled is not one to hand back,
 		// even though this vector never reached a driver.
 		if super::imsic::disable_eid_on_owner(vector) {
@@ -325,6 +329,7 @@ fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
 		return None;
 	}
 	program_msix_entry(table_phys, super::imsic::msi_address(hart), eid);
+	SLOT_TABLE[slot].store(table_phys, core::sync::atomic::Ordering::Release);
 	super::imsic::enable_eid(eid);
 	// The whole EID (KERN-ARCH-017): IMSIC identifiers are eleven bits, so narrowing one here
 	// would arm the hardware under an identifier the kernel never records.
@@ -461,3 +466,66 @@ pub fn irq_info_len() -> usize {
 
 #[cfg(test)]
 mod tests;
+
+// ------------------------------------------------------------------ a sleep's device lines
+
+// A SUSPEND TO IDLE MASKS EVERY CLAIMED LINE at the APLIC and every MSI-X entry it programmed at the device - each driver
+// has quiesced its device - but the wake set's, which its driver marked and whose firing is what ends the sleep; and
+// puts back exactly what it masked.
+static SLEEP_MASKED_LINES: [core::sync::atomic::AtomicBool; MAX_LINES] = [const { core::sync::atomic::AtomicBool::new(false) }; MAX_LINES];
+static SLEEP_MASKED_MSI: [core::sync::atomic::AtomicBool; MAX_MSI] = [const { core::sync::atomic::AtomicBool::new(false) }; MAX_MSI];
+
+pub fn mask_claimed_lines() {
+	let Some(base) = super::aplic::domain() else { return };
+	for (at, slot) in LINES.iter().enumerate() {
+		let source = match &*slot.lock() {
+			LineSlot::Held(line) => Some(line.source),
+			_ => None,
+		};
+		if let Some(source) = source
+			&& !crate::sleep::is_wake(LINE_EID_BASE + at as u32)
+		{
+			// SAFETY: the adopted domain, as in `bind_wired`.
+			unsafe { super::aplic::mask_source(base, source) };
+			SLEEP_MASKED_LINES[at].store(true, core::sync::atomic::Ordering::Release);
+		}
+	}
+}
+
+pub fn unmask_claimed_lines() {
+	let Some(base) = super::aplic::domain() else { return };
+	for (at, slot) in LINES.iter().enumerate() {
+		if !SLEEP_MASKED_LINES[at].swap(false, core::sync::atomic::Ordering::AcqRel) {
+			continue;
+		}
+		if let LineSlot::Held(line) = &*slot.lock() {
+			// SAFETY: as above - and asked for again if a level line is still asserted.
+			unsafe { super::aplic::unmask_source(base, line.source, line.level) };
+		}
+	}
+}
+
+pub fn mask_msi_entries() {
+	for slot in 0..MAX_MSI {
+		let table = SLOT_TABLE[slot].load(core::sync::atomic::Ordering::Acquire);
+		if table == 0 || !REGISTRY.is_bound(slot) || crate::sleep::is_wake(EID_BASE + slot as u32) {
+			continue;
+		}
+		let entry = super::paging::phys_to_virt(table) as *mut u32;
+		// SAFETY: the entry `program_msix_entry` wrote, through the same mapping.
+		unsafe { entry.add(3).write_volatile(1) };
+		SLEEP_MASKED_MSI[slot].store(true, core::sync::atomic::Ordering::Release);
+	}
+}
+
+pub fn unmask_msi_entries() {
+	for slot in 0..MAX_MSI {
+		let table = SLOT_TABLE[slot].load(core::sync::atomic::Ordering::Acquire);
+		if !SLEEP_MASKED_MSI[slot].swap(false, core::sync::atomic::Ordering::AcqRel) || table == 0 {
+			continue;
+		}
+		let entry = super::paging::phys_to_virt(table) as *mut u32;
+		// SAFETY: as above.
+		unsafe { entry.add(3).write_volatile(0) };
+	}
+}

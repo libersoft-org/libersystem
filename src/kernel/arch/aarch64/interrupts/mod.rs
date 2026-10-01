@@ -53,6 +53,8 @@ static USING_ITS: AtomicBool = AtomicBool::new(false);
 // The ITS DeviceID each live slot was mapped under, so a teardown can name the same device the
 // setup did. `u32::MAX` for a slot that holds none.
 static SLOT_DEVID: [AtomicU32; MAX_MSI] = [const { AtomicU32::new(u32::MAX) }; MAX_MSI];
+// THE MSI-X ENTRY EACH SLOT PROGRAMMED, by its physical address - 0 for none: what a sleep masks the slot's messages at.
+static SLOT_TABLE: [AtomicU64; MAX_MSI] = [const { AtomicU64::new(0) }; MAX_MSI];
 // Each mapped device's interrupt translation table, kept for the life of the boot: an ITT belongs
 // to the DeviceID it was mapped with, and a device that acquires a second vector must not be given
 // a second table under the same id.
@@ -308,6 +310,7 @@ pub fn unbind(vector: u32) -> bool {
 	}
 	if let Some(slot) = spi_slot(vector) {
 		release_translation(slot, vector);
+		SLOT_TABLE[slot].store(0, Ordering::Release);
 		REGISTRY.retire(slot);
 	}
 	true
@@ -350,7 +353,65 @@ pub fn msi_doorbell() -> Option<(u64, u64)> {
 pub fn release_unused_msi(vector: u32) {
 	if let Some(slot) = spi_slot(vector) {
 		release_translation(slot, vector);
+		SLOT_TABLE[slot].store(0, Ordering::Release);
 		REGISTRY.free(slot);
+	}
+}
+
+// ------------------------------------------------------------------ a sleep's device lines
+
+// A SUSPEND TO IDLE MASKS EVERY CLAIMED LINE at the distributor and every MSI-X entry it programmed at the device - each
+// driver has quiesced its device - but the wake set's, which its driver marked and whose firing is what ends the sleep;
+// and puts back exactly what it masked.
+static SLEEP_MASKED_LINES: [AtomicBool; MAX_LINES] = [const { AtomicBool::new(false) }; MAX_LINES];
+static SLEEP_MASKED_MSI: [AtomicBool; MAX_MSI] = [const { AtomicBool::new(false) }; MAX_MSI];
+
+pub fn mask_claimed_lines() {
+	for (at, slot) in LINES.iter().enumerate() {
+		let intid = slot.lock().as_ref().map(|line| line.intid);
+		if let Some(intid) = intid
+			&& !crate::sleep::is_wake(intid)
+			&& super::gic::spi_enabled(intid)
+		{
+			super::gic::disable_spi(intid);
+			SLEEP_MASKED_LINES[at].store(true, Ordering::Release);
+		}
+	}
+}
+
+pub fn unmask_claimed_lines() {
+	for (at, slot) in LINES.iter().enumerate() {
+		if SLEEP_MASKED_LINES[at].swap(false, Ordering::AcqRel)
+			&& let Some(intid) = slot.lock().as_ref().map(|line| line.intid)
+		{
+			super::gic::unmask_spi(intid);
+		}
+	}
+}
+
+pub fn mask_msi_entries() {
+	let base = if USING_ITS.load(Ordering::Relaxed) { super::its::LPI_BASE } else { BASE_SPI.load(Ordering::Relaxed) };
+	for slot in 0..MAX_MSI {
+		let table = SLOT_TABLE[slot].load(Ordering::Acquire);
+		if table == 0 || !REGISTRY.is_bound(slot) || crate::sleep::is_wake(base + slot as u32) {
+			continue;
+		}
+		let entry = super::paging::phys_to_virt(table) as *mut u32;
+		// SAFETY: the entry `program_msix_entry_at` wrote, through the same mapping.
+		unsafe { entry.add(3).write_volatile(1) };
+		SLEEP_MASKED_MSI[slot].store(true, Ordering::Release);
+	}
+}
+
+pub fn unmask_msi_entries() {
+	for slot in 0..MAX_MSI {
+		let table = SLOT_TABLE[slot].load(Ordering::Acquire);
+		if !SLEEP_MASKED_MSI[slot].swap(false, Ordering::AcqRel) || table == 0 {
+			continue;
+		}
+		let entry = super::paging::phys_to_virt(table) as *mut u32;
+		// SAFETY: as above.
+		unsafe { entry.add(3).write_volatile(0) };
 	}
 }
 
@@ -429,10 +490,12 @@ fn program_acquired(slot: usize, table_phys: u64, owner: u32) -> Option<u32> {
 		// The message address is the ONE translation register, and the data is the event id - the
 		// device says which of ITS events happened and the controller decides what that means.
 		program_msix_entry_at(table_phys, super::its::translater(), slot as u32);
+		SLOT_TABLE[slot].store(table_phys, Ordering::Release);
 		return Some(lpi);
 	}
 	let spi = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
 	program_msix_entry(table_phys, spi);
+	SLOT_TABLE[slot].store(table_phys, Ordering::Release);
 	super::gic::enable_msi_spi(spi);
 	// THE WHOLE SPI (KERN-ARCH-017). GICv2m's base and count are ten-bit fields, so a frame
 	// starting at SPI 256 or above returned an identifier that wrapped: the hardware stayed armed

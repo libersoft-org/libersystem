@@ -422,6 +422,20 @@ pub(crate) static CLOCK_SOURCE: core::sync::atomic::AtomicU64 = core::sync::atom
 // THE HIBERNATION PRIVILEGE, kept: the image component - the one holder, which reads the snapshot and replaces memory -
 // is given a duplicate at every start.
 pub(crate) static HIBERNATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// PROCESSOR POWER'S TWO PRIVILEGES, kept the same way: ProcessorPowerService's tables, and the idle-latency bound a
+// service such as AudioService holds - each duplicated for its service's every start.
+pub(crate) static PROCESSOR_POWER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static IDLE_LATENCY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// A KEPT PRIVILEGE'S DUPLICATE for a role - the role going carrying nothing where none was kept, which its service says.
+fn kept_privilege(kept: &core::sync::atomic::AtomicU64, tag: &[u8]) -> Option<(Vec<u8>, u64)> {
+	let held = kept.load(core::sync::atomic::Ordering::Relaxed);
+	if held == 0 {
+		return Some((Vec::from(tag), 0));
+	}
+	let copy: i64 = duplicate(held, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+	(copy > 0).then(|| (Vec::from(tag), copy as u64))
+}
 // THE `supervisor-liveness` END THIS SUPERVISOR ANSWERS ON, in the standing loop's wait set. Minted again at every
 // start of the watchdog service, the new end replacing the old one - see `supervisor_role`.
 static LIVENESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -542,6 +556,22 @@ fn supervisor_role(service: &[u8], role: &Role, proc: u64, tpm_admin: u64) -> Op
 			}
 			_ => None,
 		};
+	}
+	// PROCESSOR POWER: ProcessorPowerService's privilege and its three clients of what this supervisor serves or relays -
+	// `system-power` for the forced deadline, `system-shutdown` for the orderly power-off, `system-sleep` for `_HOT`'s
+	// hibernation - each filled again at every relaunch, so a relaunched policy still powers the machine off at `_CRT`.
+	if service == b"processor_power_service" {
+		return match role.tag {
+			b"PROCPOWER" => kept_privilege(&PROCESSOR_POWER, role.tag),
+			b"SLEEP" => Some((Vec::from(role.tag), client_end(sleep::mint()?)?)),
+			b"SHUTDOWN" => Some((Vec::from(role.tag), client_end(shutdown::mint()?)?)),
+			b"SYSPOWER" => Some((Vec::from(role.tag), client_end(service_connect(SYSTEM_POWER.load(core::sync::atomic::Ordering::Relaxed))?)?)),
+			_ => None,
+		};
+	}
+	// THE IDLE-LATENCY BOUND, for the services whose manifest row asks for it.
+	if role.tag == b"LATENCY" && service == b"audio_service" {
+		return kept_privilege(&IDLE_LATENCY, role.tag);
 	}
 	if service != b"watchdog_service" {
 		return None;
@@ -739,6 +769,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		&& &buf[..9] == b"HIBERNATE"
 	{
 		HIBERNATION.store(handle, core::sync::atomic::Ordering::Relaxed);
+	}
+	// 1j. and processor power's two, kept the same way: ProcessorPowerService's, and the idle-latency bound's.
+	if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf)
+		&& len >= 9
+		&& &buf[..9] == b"PROCPOWER"
+	{
+		PROCESSOR_POWER.store(handle, core::sync::atomic::Ordering::Relaxed);
+	}
+	if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf)
+		&& len >= 11
+		&& &buf[..11] == b"IDLELATENCY"
+	{
+		IDLE_LATENCY.store(handle, core::sync::atomic::Ordering::Relaxed);
 	}
 
 	// 2. bring the services up in dependency order. Each pass starts every pending
@@ -1552,6 +1595,7 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 		// from which every `media-import` grant is.
 		// AND ADMINSERVICE'S REQUEST FACTORY, which mints each `admin-request` connection bound to the task a
 		// launch prepared; its journal view; and its test controls, which only a development image serves.
+		// AND PROCESSORPOWERSERVICE'S OPERATOR ROOT, from which every `processor-power` grant is.
 		b"permission_manager" => &[
 			CAP_CONFIG,
 			CAP_DEVICE,
@@ -1578,6 +1622,7 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_TYPEC_CONTROL,
 			CAP_SLEEP,
 			CAP_SLEEP_WAKE,
+			CAP_PROCESSOR_POWER,
 		],
 		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
 		// over at bring-up went with the instance that ended.
@@ -1610,6 +1655,7 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_ADMIN_FACTORY | CAP_ADMIN_AUDIT | CAP_ADMIN_TEST => Some(b"admin_service"),
 		CAP_BMC => Some(b"bmc_service"),
 		CAP_TYPEC | CAP_TYPEC_CONTROL => Some(b"typec_service"),
+		CAP_PROCESSOR_POWER => Some(b"processor_power_service"),
 		_ => None,
 	}
 }
@@ -1665,6 +1711,7 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_BMC => broker.kept.end_of(b"bmc_service", b"SERVE"),
 		CAP_TYPEC => broker.kept.end_of(b"typec_service", b"SERVE"),
 		CAP_TYPEC_CONTROL => broker.kept.end_of(b"typec_service", b"CONTROL"),
+		CAP_PROCESSOR_POWER => broker.kept.end_of(b"processor_power_service", b"CONTROL"),
 		_ => 0,
 	};
 	let alive: bool = match service_of_cap(name).and_then(index_of) {
@@ -1907,8 +1954,10 @@ fn hand_acpi_admin(kept: &Kept, channels: &[u64; N]) {
 // TpmService's grants are minted per launch too, and the TPM's state is in the chip. The watchdog service's two roles
 // the plan cannot carry - its liveness channel and the boot mode - are `supervisor_role`'s, and its timers are in the
 // hardware. The ACPI service's privilege is `supervisor_role`'s too, and what it published is the kernel's to keep.
+// ProcessorPowerService's privilege and its three clients of this supervisor are `supervisor_role`'s, and what it
+// installed is the kernel's to keep.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service" || name == b"hibernation_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service" || name == b"hibernation_service" || name == b"processor_power_service"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its

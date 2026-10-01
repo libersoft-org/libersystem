@@ -635,13 +635,14 @@ pub fn wait_or_sleep(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<Opt
 // THE SAME WAIT, BOUNDED: `Some(Some(index))` for a ready handle, `Some(None)` once `deadline` passes first, and `None`
 // when the manager asked for a stop (latched, as above) or dropped the channel - for a driver that awaits its device's
 // answer within a bound while the manager may still be asking whether it is alive. With `serving`, a consumer that
-// connects meanwhile is accepted as the provider loops accept one.
+// connects meanwhile is accepted as the provider loops accept one - and handed back as `Some(None)`, "nothing ready".
 pub fn wait_or_answer_until(bootstrap: u64, bind: &Bind, handles: &[u64], deadline: u64, mut serving: Option<&mut Serving>) -> Option<Option<usize>> {
 	let mut set: [u64; 8] = [0; 8];
 	let count: usize = handles.len().min(set.len() - 1);
 	set[..count].copy_from_slice(&handles[..count]);
 	set[count] = bootstrap;
 	loop {
+		let serving_before = serving.as_deref().map_or(0, |serving| serving.as_slice().len());
 		match drain_control_into(bootstrap, bind, serving.as_deref_mut(), true) {
 			Control::Continue => {}
 			// "Nothing ready": the driver's loop reads the request with `suspend_requested`.
@@ -651,6 +652,13 @@ pub fn wait_or_answer_until(bootstrap: u64, bind: &Bind, handles: &[u64], deadli
 				return None;
 			}
 			Control::Ended => return None,
+		}
+		// A CONSUMER JUST ACCEPTED IS NOT IN `handles`, the caller's copy of the set, so this wait would never wake for
+		// its requests - a consumer that connected after the first (a policy service relaunched) asked and was never
+		// answered. Handed back as "nothing ready": the caller's loop builds its set again, with the new endpoint in it.
+		// The endpoint stays marked new, for a provider loop that reports a connection before its traffic.
+		if serving.as_deref().is_some_and(|serving| serving.as_slice().len() > serving_before) {
+			return Some(None);
 		}
 		for (at, &handle) in handles[..count].iter().enumerate() {
 			if poll_ready(handle) {

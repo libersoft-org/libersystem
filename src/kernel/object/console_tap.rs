@@ -19,6 +19,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
+#[cfg(target_arch = "x86_64")]
 use crate::sched;
 
 pub struct ConsoleTap {
@@ -48,7 +49,8 @@ impl ConsoleTap {
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), base, generation, pending: AtomicBool::new(false), revoked: AtomicBool::new(false) })
 	}
 
-	// The ring holds bytes: pending, and every waiter woken.
+	// The ring holds bytes: pending, and every waiter woken. COM1's tap, x86_64's alone.
+	#[cfg(target_arch = "x86_64")]
 	pub fn signal(&self) {
 		if self.revoked.load(Ordering::Acquire) {
 			return;

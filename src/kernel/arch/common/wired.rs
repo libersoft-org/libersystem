@@ -76,6 +76,7 @@ impl<const N: usize> Wired<N> {
 	}
 
 	/// Whether this kernel answers `number` itself - which makes it a line no claim may take.
+	#[cfg(any(test, not(target_arch = "riscv64")))]
 	pub fn holds(&self, number: u32) -> bool {
 		number != EMPTY && (0..N).any(|row| self.number[row].load(Ordering::Acquire) == number)
 	}

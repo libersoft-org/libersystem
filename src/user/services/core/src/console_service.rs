@@ -1177,6 +1177,12 @@ fn serial_lost(console: &mut Console) {
 // WHAT WAS TYPED ON THE WIRE, from the driver's receive stream: every chunk handled as the serial input the
 // kernel used to feed. A frame that does not decode, or a stream that closed, ends the attachment.
 fn serial_input(console: &mut Console) {
+	// A STREAM THAT CLOSED WITH NOTHING QUEUED is answered peer-closed by the peek, and the loop below would not run to see
+	// it: the attachment ends here, or the wait that woke for it wakes again at once.
+	if console.wire.stream != 0 && channel_peek(console.wire.stream) == ERR_PEER_CLOSED {
+		serial_lost(console);
+		return;
+	}
 	while console.wire.stream != 0 && channel_peek(console.wire.stream) >= 0 {
 		match recv_vec_blocking(console.wire.stream) {
 			ReceivedVec::Message { bytes, .. } => {

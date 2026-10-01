@@ -391,6 +391,347 @@ fn acpi_notification_wire_is_stable() {
 	assert_eq!(AcpiNotification::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn processor_register_wire_is_stable() {
+	let sample = ProcessorRegister { space: 7, bits: 7, address: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 7, 7, 0, 0, 0, 0, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorRegister::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_idle_state_wire_is_stable() {
+	let sample = ProcessorIdleState { entry: 7, hint: 7, register: ProcessorRegister { space: 7, bits: 7, address: 7 }, latency_us: 7, residency_us: 7, power_mw: 7, flags: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 7, 0, 0, 0, 7, 7, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorIdleState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_performance_state_wire_is_stable() {
+	let sample = ProcessorPerformanceState { core_mhz: 7, power_mw: 7, latency_us: 7, control: 7, status: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorPerformanceState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_throttling_state_wire_is_stable() {
+	let sample = ProcessorThrottlingState { percent: 7, power_mw: 7, latency_us: 7, control: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorThrottlingState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_domain_wire_is_stable() {
+	let sample = ProcessorDomain { domain: 7, coordination: 7, processors: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorDomain::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_cppc_wire_is_stable() {
+	let sample = ProcessorCppc { highest: 7, nominal: 7, lowest: 7, desired: ProcessorRegister { space: 7, bits: 7, address: 7 }, minimum: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), maximum: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), preference: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }) };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+	];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorCppc::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_id_wire_is_stable() {
+	let sample = ProcessorId { path: String::from("x"), uid: 7, cpu: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorId::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_power_wire_is_stable() {
+	let sample = ProcessorPower { id: ProcessorId { path: String::from("x"), uid: 7, cpu: 7 }, idle: alloc::vec![ProcessorIdleState { entry: 7, hint: 7, register: ProcessorRegister { space: 7, bits: 7, address: 7 }, latency_us: 7, residency_us: 7, power_mw: 7, flags: 7 }], performance: alloc::vec![ProcessorPerformanceState { core_mhz: 7, power_mw: 7, latency_us: 7, control: 7, status: 7 }], pct_control: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), pct_status: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), ppc: 7, psd: Some(ProcessorDomain { domain: 7, coordination: 7, processors: 7 }), cppc: Some(ProcessorCppc { highest: 7, nominal: 7, lowest: 7, desired: ProcessorRegister { space: 7, bits: 7, address: 7 }, minimum: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), maximum: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), preference: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }) }), throttling: alloc::vec![ProcessorThrottlingState { percent: 7, power_mw: 7, latency_us: 7, control: 7 }], ptc_control: Some(ProcessorRegister { space: 7, bits: 7, address: 7 }), tpc: 7, tsd: Some(ProcessorDomain { domain: 7, coordination: 7, processors: 7 }), refused: alloc::vec![String::from("x")] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[
+		1,
+		0,
+		120,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		7,
+		7,
+		0,
+		0,
+		0,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		1,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		7,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		1,
+		0,
+		120,
+	];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorPower::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn processor_notification_wire_is_stable() {
+	let sample = ProcessorNotification { path: String::from("x"), value: 7, sequence: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProcessorNotification::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn acpi_connection_kind_wire_is_stable() {
 	let sample = AcpiConnectionKind::EventLine;
 	let bytes = sample.encode_vec().expect("encode");

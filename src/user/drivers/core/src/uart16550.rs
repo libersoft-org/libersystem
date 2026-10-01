@@ -18,8 +18,8 @@
 //
 // WHEN IT GOES - killed, stopped, given up on - the release revokes the port range, the line and the tap, and
 // the kernel takes COM1 back and says so. ACROSS A SLEEP the kernel's sleep entry lends COM1 to the kernel and
-// leaves its own settings in it; this driver's RESUME reprograms the UART whatever the sleep state - wired with
-// the suspend and resume exchange that carries every driver across a sleep.
+// leaves its own settings in it; this driver takes the sleep itself (`console::Sleep`) and its RESUME reprograms the
+// UART whatever the sleep state, so the console is never rebound - and never changes hands - across a sleep.
 
 #![no_std]
 #![no_main]
@@ -167,6 +167,37 @@ mod console {
 		uart.program(line, true);
 		true
 	}
+
+	// THE SLEEP: the kernel's queued output put on the wire and the UART left quiet for the kernel's sleep entry, which
+	// lends COM1 to the kernel; at the resume the UART programmed again whole - whatever the sleep state left in it,
+	// power lost or not - and what the kernel queued meanwhile put out. The UART is never rebound for a sleep, so the
+	// kernel's console never changes hands across one.
+	pub struct Sleep<'a> {
+		pub console: &'a mut Console,
+		pub serving: &'a mut common::Serving,
+		pub bind: &'a common::Bind,
+		pub bootstrap: u64,
+	}
+
+	impl common::SleepStep for Sleep<'_> {
+		fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+			let _ = self.console.drain_tap(self.bind, self.bootstrap);
+			self.console.uart.quiet();
+			driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+		}
+
+		fn resume(&mut self, _lost_power: bool) -> bool {
+			if !program(&mut self.console.uart) {
+				return false;
+			}
+			let _ = self.console.drain_tap(self.bind, self.bootstrap);
+			true
+		}
+
+		fn serving(&mut self) -> Option<&mut common::Serving> {
+			Some(self.serving)
+		}
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -217,6 +248,8 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 	let n = hex16(ports.base, &mut digits);
 	report.push(&digits[..n]);
 	report.push(b", the kernel console's UART and its tap");
+	// THE SLEEP IS THIS DRIVER'S OWN: the UART is programmed again at the resume, never rebound.
+	common::takes_sleep();
 	if !common::online_named(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far, driver_protocol::provider::KERNEL_CONSOLE_NAME)]) {
 		exit();
 	}
@@ -225,7 +258,19 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 	let mut buffers = serial_port::Buffers::default();
 	loop {
 		console::deliver(&mut console, &mut session, &bind, bootstrap, &mut buffers);
-		match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, &[console.irq, console.tap]) {
+		match common::wait_providers_or_sleep(bootstrap, &bind, &mut serving, &[console.irq, console.tap], false) {
+			// A `SUSPEND`: the step taken here, and the loop goes on after the resume - WITH THE SAME CONSUMER. Its
+			// connection and its receive stream outlive the sleep, so the session is kept: resetting it closed the stream
+			// ConsoleService reads typed input from, and the console stopped answering after a wake.
+			Some(None) => {
+				if !common::take_sleep_step(bootstrap, &bind, &mut console::Sleep { console: &mut console, serving: &mut serving, bind: &bind, bootstrap }) {
+					console.uart.quiet();
+					if common::stop_requested() {
+						common::finish_stop(bootstrap, &bind, 0, true);
+					}
+					exit();
+				}
+			}
 			None => {
 				// A PLANNED STOP LEAVES THE UART QUIET - every interrupt enable off - and masters nothing; the
 				// kernel programs it again when it takes it back.
@@ -246,8 +291,8 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 				}
 				exit();
 			}
-			Some(common::ProviderReady::Connected(_)) => session.reset(),
-			Some(common::ProviderReady::Consumer(index)) => {
+			Some(Some(common::ProviderReady::Connected(_))) => session.reset(),
+			Some(Some(common::ProviderReady::Consumer(index))) => {
 				if !session.serve(&mut serving, index, &mut console, &bind, bootstrap, &mut buffers) {
 					let token = serving.close_at(index);
 					session.reset();
@@ -256,8 +301,8 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 					}
 				}
 			}
-			Some(common::ProviderReady::Device(0)) => console.service_line(),
-			Some(common::ProviderReady::Device(_)) => {
+			Some(Some(common::ProviderReady::Device(0))) => console.service_line(),
+			Some(Some(common::ProviderReady::Device(_))) => {
 				if console.drain_tap(&bind, bootstrap).is_err() {
 					// The tap was revoked: the release is under way and the manager's stop follows. Nothing
 					// more can be written for the kernel, and nothing is waited on here.

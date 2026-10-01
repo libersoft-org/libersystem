@@ -113,6 +113,10 @@ name = "acpi_service"
 path = "src/acpi_service.rs"
 
 [[bin]]
+name = "processor_power_service"
+path = "src/processor_power_service.rs"
+
+[[bin]]
 name = "modem_service"
 path = "src/modem_service.rs"
 
@@ -224,6 +228,12 @@ path = "src/upscheck.rs"
 required-features = ["development"]
 
 [[bin]]
+# THE PROCESSOR-POWER GATE'S LOAD AND IDLE PATTERN, absent from a shipped image: it holds no authority.
+name = "procprobe"
+path = "src/procprobe.rs"
+required-features = ["development"]
+
+[[bin]]
 # THE SMART-CARD GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the smart-card
 # fixture's control endpoint, which only a development image has.
 name = "cardcheck"
@@ -240,6 +250,12 @@ required-features = ["development"]
 # The smart-card gate's read-only client.
 name = "cardread"
 path = "src/cardread.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE TPM GATE'S OTHER COMPONENT: the observation and sealing grants and the files, and not measurement.
+name = "tpmprobe"
+path = "src/tpmprobe.rs"
 required-features = ["development"]
 
 [[bin]]
@@ -445,7 +461,15 @@ bootproto = { path = "../../../boot/protocol" }
 # THE ANSWER-TO-RESET PARSER, which SmartcardService reads every card's ATR with before its decisions see what
 # it offers. Linked statically, as `service-logic` is.
 smartcard-model = { path = "../../libs/smartcard/model" }
+# THE TPM'S CLIENT, for the TPM gate's development probe alone: the facade, its trampolines and the generated client they
+# jump to, linked statically.
+tpm-client = { path = "../../libs/clients/tpm-client" }
+tpm-client-provider = { path = "../../libs/clients/tpm-client-provider" }
+tpm-proto = { path = "../../libs/protocol/tpm-proto", features = ["channel-client-impl"] }
 abi = { path = "../../../abi" }
+# THE PROCESSOR TABLES' OWN READING - the levels a performance table has and what each writes - which the kernel
+# decides with too, so ProcessorPowerService computes its windows over the levels the kernel will have.
+procpower = { path = "../../../procpower" }
 # THE ACPI SERVICE'S INTERPRETER AND ITS DECISIONS: the AML interpreter, what each node is and the row it is reported
 # as, the report encoding the kernel reads, and the FADT reader. Linked statically into that one program.
 aml = { path = "../../../aml" }

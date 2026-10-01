@@ -8,7 +8,15 @@
 // again, 0x81 (information changed) also reads a battery's `_BIX`/`_BIF` again - with a storm bounded by
 // `drivers::acpi_power::Coalescer`; and at a thermal zone's `_TZP` interval where its firmware asks to be polled. A
 // method the node does not have is not a refusal (`_STA`, `_RTV`, the trips are optional); a result of the wrong shape
-// is said by name and that reading is not published. The cooling half of a thermal zone is not this driver's yet.
+// is said by name and that reading is not published.
+//
+// A THERMAL ZONE'S COOLING HALF is a second publication of the same binding, `thermal-zone`, served to
+// ProcessorPowerService alone: what passive and active cooling need - `_PSV`, `_CRT`, `_HOT`, `_TC1`, `_TC2`, `_TSP`,
+// `_PSL`, every `_ACx` with its `_ALx`, and whether there is `_SCP` - every reading of `_TMP` as it is taken, `_TMP`
+// read every `_TSP` while the policy asks for it, and `_SCP` set as the policy asks. AND THE FALLBACK: every reading is
+// compared with `_CRT` here too - the over-temperature alarm the power model derives - and at the crossing the kernel's
+// forced power-off is armed through the `system-power` connection DeviceManager hands a zone's binding, so a policy that
+// is dead, restarting or stopped still leaves the machine off within the bound.
 //
 // WHEN THE ACPI SERVICE RESTARTS its node channels end with it: what was published stays until it is read again, the
 // node is asked for again (`drivers::common`), and the one the new instance serves is subscribed to and read at once.
@@ -25,7 +33,7 @@ use aml::wire::Value;
 use drivers::acpi_power::{self, Class, Coalescer, Information, Status, Zone};
 use drivers::common;
 use ipc_client::ChannelTransport;
-use proto::system::{ControlOutcome, Error, ProviderCommand, ProviderSource, ProviderUpdate, ProviderUpdateKind, SourceState, acpi_node, power_provider};
+use proto::system::{ActiveTrip, AlarmKind, ControlOutcome, Error, ProviderCommand, ProviderSource, ProviderUpdate, ProviderUpdateKind, SourceState, Tristate, ZoneCooling, ZoneReading, acpi_node, power_provider, system_power, thermal_zone};
 use rt::*;
 use wire::Handles;
 
@@ -33,8 +41,15 @@ use wire::Handles;
 const TICKS: u64 = TICKS_PER_SECOND * 5;
 // Deep enough that a run of changes never waits on PowerService's reading.
 const STREAM_DEPTH: u64 = 64;
-// The one publication's token.
+// The power-source publication's token, and a zone's cooling half's.
 const TOKEN: u16 = 0;
+const TOKEN_COOLING: u16 = 1;
+// The fastest a policy may have `_TMP` read: every tenth of a second.
+const MIN_SAMPLE_MS: u32 = 100;
+// THE FORCED POWER-OFF'S BOUND past `_CRT`, the policy's own.
+const FORCED_BOUND_SECONDS: u32 = 10;
+// The most `_PSL` processors and `_ALx` fans a zone describes.
+const MOST_DEVICES: usize = 8;
 // The one source's local number.
 const LOCAL: u32 = 0;
 // `_TZP` is in tenths of a second; a zone asking for less than a second is polled once a second.
@@ -60,6 +75,15 @@ struct Power {
 	seq: u32,
 	// A thermal zone's polling interval, when its firmware asks for polling.
 	poll: Option<u64>,
+	// A ZONE'S COOLING HALF: the last `_TMP`, the readings stream the policy opened and its sequence, the period the policy
+	// asked `_TMP` to be read at (0 for the zone's own), the `system-power` connection the fallback arms through, and
+	// whether the last reading was past `_CRT`.
+	temperature: Option<u32>,
+	readings: u64,
+	reading_seq: u32,
+	sample_ms: u32,
+	syspower: u64,
+	past_critical: bool,
 }
 
 impl Power {
@@ -110,6 +134,7 @@ impl Power {
 			}
 			Class::ThermalZone => {
 				let temperature = self.integer("_TMP")?.ok_or_else(|| String::from("the zone has no _TMP"))?;
+				self.temperature = Some(temperature);
 				let mut zone = Zone { temperature, relative: self.integer("_RTV")?.is_some_and(|relative| relative != 0), critical: self.integer("_CRT")?, hot: self.integer("_HOT")?, passive: self.integer("_PSV")?, active: Vec::new() };
 				for index in 0..10u8 {
 					match self.integer(&format!("_AC{index}"))? {
@@ -141,13 +166,17 @@ impl Power {
 		}
 	}
 
-	// READ AGAIN, AND PUBLISH WHAT CHANGED - nothing while the node is gone, when the last reading stands.
+	// READ AGAIN, AND PUBLISH WHAT CHANGED - nothing while the node is gone, when the last reading stands. A zone's
+	// reading goes to the policy whatever else changed, and is checked against `_CRT`.
 	fn refresh(&mut self, information: bool) {
 		if self.node == 0 {
 			return;
 		}
 		match self.read(information) {
 			Ok(state) => {
+				if self.class == Class::ThermalZone {
+					self.cooling_reading(&state);
+				}
 				if self.state.as_ref() == Some(&state) {
 					return;
 				}
@@ -157,6 +186,48 @@ impl Power {
 				self.emit(&update);
 			}
 			Err(why) => say(&self.name, &format!("its state could not be read - {why}")),
+		}
+	}
+
+	// ONE READING FOR THE POLICY, and the fallback's comparison with `_CRT`.
+	fn cooling_reading(&mut self, state: &SourceState) {
+		let Some(temperature) = self.temperature else { return };
+		if self.readings != 0 {
+			self.reading_seq = self.reading_seq.wrapping_add(1);
+			let mut frame = [0u8; 64];
+			let mut handles = Handles::new();
+			if let Some(len) = thermal_zone::readings_frame(self.reading_seq, &ZoneReading { temperature, sequence: self.reading_seq }, &mut frame, &mut handles) {
+				match try_send_outcome(self.readings, &frame[..len], 0) {
+					SendOutcome::Delivered => {}
+					SendOutcome::Stalled => say(&self.name, "a reading was dropped: the policy's stream is full"),
+					SendOutcome::Failed => {
+						close(self.readings);
+						self.readings = 0;
+					}
+				}
+			}
+		}
+		// THE FALLBACK: at the crossing of `_CRT`, the forced power-off armed here, whatever the policy does.
+		let past = state.alarms.iter().any(|alarm| alarm.kind == AlarmKind::OverTemperature && alarm.state == Tristate::Yes);
+		if past && !self.past_critical {
+			if self.syspower == 0 {
+				say(&self.name, "the zone is past _CRT - and this binding holds no system-power connection to arm the forced power-off");
+			} else {
+				match system_power::Client::with_deadline(ChannelTransport { chan: self.syspower }, clock() + TICKS).power_off_within(&FORCED_BOUND_SECONDS) {
+					Some(Ok(())) => say(&self.name, &format!("the zone is past _CRT - the forced power-off is armed, the machine is off within {FORCED_BOUND_SECONDS} s")),
+					Some(Err(error)) => say(&self.name, &format!("the zone is past _CRT - the forced power-off was refused: {error:?}")),
+					None => say(&self.name, "the zone is past _CRT - SystemManager did not answer the forced power-off"),
+				}
+			}
+		}
+		self.past_critical = past;
+	}
+
+	// THE PERIOD `_TMP` IS READ AT: the policy's while it asks, else the zone's own.
+	fn interval(&self) -> Option<u64> {
+		match self.sample_ms {
+			0 => self.poll,
+			ms => Some((u64::from(ms) * TICKS_PER_SECOND / 1000).max(1)),
 		}
 	}
 
@@ -189,9 +260,107 @@ impl power_provider::Service for Power {
 	}
 }
 
+impl thermal_zone::Service for Power {
+	// THE ZONE'S COOLING OBJECTS, read now: an object the zone does not have is absent, one of the wrong shape refused.
+	fn describe(&mut self) -> Result<ZoneCooling, Error> {
+		let read = |power: &Power, method: &str| {
+			power.integer(method).map_err(|why| {
+				say(&power.name, &why);
+				Error::Io
+			})
+		};
+		let list = |power: &Power, method: &str| -> Result<Vec<String>, Error> {
+			match power.evaluate(method) {
+				Ok(Some(value)) => acpi_power::devices(&value, MOST_DEVICES).map_err(|refusal| {
+					say(&power.name, &format!("{method}: {refusal:?}"));
+					Error::Io
+				}),
+				Ok(None) => Ok(Vec::new()),
+				Err(why) => {
+					say(&power.name, &why);
+					Err(Error::Io)
+				}
+			}
+		};
+		let mut active = Vec::new();
+		for level in 0..10u8 {
+			let Some(temperature) = read(self, &format!("_AC{level}"))? else { break };
+			active.push(ActiveTrip { level, temperature, devices: list(self, &format!("_AL{level}"))? });
+		}
+		let scp = matches!(acpi_node::Client::with_deadline(ChannelTransport { chan: self.node }, clock() + TICKS).has("_SCP"), Some(Ok(true)));
+		let zone = self.name.strip_prefix("acpi:").unwrap_or(&self.name);
+		Ok(ZoneCooling { zone: acpi_power::namespace_path(zone), passive: read(self, "_PSV")?, critical: read(self, "_CRT")?, hot: read(self, "_HOT")?, tc1: read(self, "_TC1")?.unwrap_or(0), tc2: read(self, "_TC2")?.unwrap_or(0), tsp: read(self, "_TSP")?.unwrap_or(0), passive_processors: list(self, "_PSL")?, active, scp })
+	}
+
+	// THE READINGS FROM NOW ON, the last one first.
+	fn readings(&mut self) -> Vec<ZoneReading> {
+		self.temperature.map(|temperature| ZoneReading { temperature, sequence: self.reading_seq }).into_iter().collect()
+	}
+
+	fn sample_every(&mut self, milliseconds: u32) -> Result<(), Error> {
+		self.sample_ms = if milliseconds == 0 { 0 } else { milliseconds.max(MIN_SAMPLE_MS) };
+		say(&self.name, &if self.sample_ms == 0 { String::from("_TMP is read at the zone's own period again") } else { format!("_TMP is read every {} ms for the thermal policy", self.sample_ms) });
+		Ok(())
+	}
+
+	// `_SCP(mode)`: 0 active cooling preferred, 1 passive.
+	fn cooling_policy(&mut self, mode: u8) -> Result<(), Error> {
+		if mode > 1 {
+			return Err(Error::Invalid);
+		}
+		let arguments = aml::wire::encode(&Value::Package(alloc::vec![Value::Integer(u64::from(mode))])).map_err(|_| Error::Invalid)?;
+		match acpi_node::Client::with_deadline(ChannelTransport { chan: self.node }, clock() + TICKS).evaluate("_SCP", &arguments) {
+			Some(Ok(_)) => {
+				say(&self.name, if mode == 0 { "_SCP: active cooling preferred" } else { "_SCP: passive cooling preferred" });
+				Ok(())
+			}
+			Some(Err(Error::NotFound)) => Err(Error::Unsupported),
+			Some(Err(error)) => Err(error),
+			None => Err(Error::Io),
+		}
+	}
+}
+
 // THE NODE'S `Notify` STREAM, 0 when the node gives none.
 fn subscribe(node: u64) -> u64 {
 	acpi_node::Client::with_deadline(ChannelTransport { chan: node }, clock() + TICKS).notifications().unwrap_or(0)
+}
+
+// ONE REQUEST FROM PROCESSORPOWERSERVICE on the cooling half's connection: the readings stream opened, or a question
+// answered.
+fn serve_cooling(power: &mut Power, channel: u64, buf: &mut [u8]) -> bool {
+	let (len, mut handles) = match try_recv_caps(channel, buf) {
+		PolledCaps::Message { len, handles } => (len, handles),
+		PolledCaps::Empty => return true,
+		PolledCaps::Closed => return false,
+	};
+	if len < 2 {
+		return true;
+	}
+	let op = u16::from_le_bytes([buf[0], buf[1]]);
+	if op == thermal_zone::OP_READINGS {
+		let Some((corr, items)) = thermal_zone::readings_open(power, &buf[..len], &mut handles) else { return true };
+		let Some((producer, consumer)) = channel_with_depth(STREAM_DEPTH) else { return true };
+		if power.readings != 0 {
+			close(power.readings);
+		}
+		power.readings = producer;
+		let mut frame = [0u8; 64];
+		for item in &items {
+			let mut frame_handles = Handles::new();
+			if let Some(written) = thermal_zone::readings_frame(item.sequence, item, &mut frame, &mut frame_handles) {
+				let _ = try_send(producer, &frame[..written], 0);
+			}
+		}
+		send_caps_blocking(channel, &corr.to_le_bytes(), &[consumer]);
+		return true;
+	}
+	let mut reply = [0u8; 2048];
+	let mut reply_handles = Handles::new();
+	if let Some(written) = thermal_zone::dispatch(power, &buf[..len], &mut handles, &mut reply, &mut reply_handles) {
+		send_caps_blocking(channel, &reply[..written], reply_handles.as_slice());
+	}
+	true
 }
 
 // ONE REQUEST FROM POWERSERVICE on the publication's connection: the update stream opened, or a query answered.
@@ -229,7 +398,7 @@ fn serve(power: &mut Power, channel: u64, buf: &mut [u8]) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let (bind, _resources) = common::handshake(bootstrap);
+	let (bind, resources) = common::handshake(bootstrap);
 	let name = String::from_utf8_lossy(bind.info.platform.identity()).into_owned();
 	let Some(class) = acpi_power::class_of(bind.info.platform.match_ids().iter().map(|id| id.text())) else {
 		say(&name, "its ids name none of a battery, an AC adapter or a thermal zone");
@@ -251,7 +420,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		say(&name, "the firmware describes no node for it");
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
 	}
-	let mut power = Power { name, class, node, information: None, state: None, revision: 1, stream: 0, seq: 0, poll: None };
+	let mut power = Power { name, class, node, information: None, state: None, revision: 1, stream: 0, seq: 0, poll: None, temperature: None, readings: 0, reading_seq: 0, sample_ms: 0, syspower: resources.syspower, past_critical: false };
 	if let Err(why) = power.read(true).map(|state| power.state = Some(state)) {
 		say(&power.name, &format!("its state could not be read - {why}"));
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::DeviceNotResponding);
@@ -265,14 +434,32 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let mut notifications = subscribe(node);
 	let Some((producer, consumer)) = channel() else { exit() };
-	let mut serving = common::Serving::from_offers(&[(TOKEN, producer)]);
+	// A ZONE PUBLISHES ITS COOLING HALF TOO, under a token of its own.
+	let cooling = if class == Class::ThermalZone { channel() } else { None };
+	let mut offers = alloc::vec![(TOKEN, producer)];
+	if let Some((cooling_producer, _)) = cooling {
+		offers.push((TOKEN_COOLING, cooling_producer));
+	}
+	let mut serving = common::Serving::from_offers(&offers);
 	if !common::offer(bootstrap, &bind, driver_protocol::provider::POWER_SOURCE, TOKEN, consumer) {
 		exit();
 	}
-	say(&power.name, &format!("publishes its {:?} state", power.class));
+	if let Some((_, cooling_consumer)) = cooling
+		&& !common::offer(bootstrap, &bind, driver_protocol::provider::THERMAL_ZONE, TOKEN_COOLING, cooling_consumer)
+	{
+		exit();
+	}
+	say(&power.name, &format!("publishes its {:?} state{}", power.class, if cooling.is_some() { ", and its cooling half" } else { "" }));
+	// THE FIRST READING IS CHECKED AGAINST `_CRT` TOO: a zone already past it at bind is a crossing.
+	if let Some(state) = power.state.clone()
+		&& class == Class::ThermalZone
+	{
+		power.cooling_reading(&state);
+	}
 	let mut coalescer = Coalescer::default();
 	let mut owed_information = false;
-	let mut next_poll = power.poll.map(|interval| clock() + interval);
+	let mut next_poll = power.interval().map(|interval| clock() + interval);
+	let mut interval = power.interval();
 	// THE STORM REPORT, at one coalesced notification and at each doubling after: a storm is said, and bounded in lines.
 	let mut report_at = 1;
 	let mut buf = alloc::vec![0u8; 4096];
@@ -315,22 +502,34 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			&& now >= at
 		{
 			power.refresh(false);
-			next_poll = power.poll.map(|interval| now + interval);
+			next_poll = power.interval().map(|interval| now + interval);
 		}
 		match ready {
 			None => {}
 			Some(common::ProviderReady::Connected(_)) => {}
 			Some(common::ProviderReady::Consumer(index)) => {
 				let channel = serving.at(index);
-				if !serve(&mut power, channel, &mut buf) {
+				let cooling = serving.token_at(index) == TOKEN_COOLING;
+				let kept = if cooling { serve_cooling(&mut power, channel, &mut buf) } else { serve(&mut power, channel, &mut buf) };
+				if !kept {
 					let token = serving.close_at(index);
-					if power.stream != 0 {
-						close(power.stream);
-						power.stream = 0;
+					let stream = if cooling { &mut power.readings } else { &mut power.stream };
+					if *stream != 0 {
+						close(*stream);
+						*stream = 0;
+					}
+					// THE POLICY WENT: the zone's own period again.
+					if cooling {
+						power.sample_ms = 0;
 					}
 					if !common::disconnected(bootstrap, &bind, token) {
 						exit();
 					}
+				}
+				// A PERIOD THE POLICY ASKED FOR (or gave back) takes effect from now.
+				if power.interval() != interval {
+					interval = power.interval();
+					next_poll = interval.map(|interval| clock() + interval);
 				}
 			}
 			Some(common::ProviderReady::Device(_)) => 'drain: loop {

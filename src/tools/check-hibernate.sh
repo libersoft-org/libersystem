@@ -16,10 +16,10 @@
 #   2. THE BOOT AFTER A RESUME sees no image: the machine rebooted boots fresh, and `sleepctl status` says so.
 #   3. WHERE S4 IS NOT OFFERED hibernation powers the machine off, which the kernel names; then that image, ONE BYTE OF A
 #      CHUNK FLIPPED on the host, is refused as modified and the machine boots fresh.
-#   4. AN IMAGE FROM ANOTHER SYSTEM IMAGE is refused - the next boot names a development variant, which the kernel's
+#   4. AN IMAGE FROM ANOTHER MACHINE is refused - the next boot has another core count.
+#   5. AN IMAGE FROM ANOTHER SYSTEM IMAGE is refused - the next boot names a development variant, which the kernel's
 #      digest of the system image takes in (see the kernel's `development_variant`): this gate cannot boot a second build
 #      of one tree.
-#   5. AN IMAGE FROM ANOTHER MACHINE is refused - the next boot has another core count.
 #   6. HYBRID SLEEP: the image written, then S3 instead of the power-off. Woken by the host, the machine runs on and the
 #      image is discarded. Again, and QEMU killed while suspended - the battery that died in the night: the next boot
 #      restores the image, and the counter goes on.
@@ -328,48 +328,51 @@ hibernate() {
 refused() {
 	local label="$1" why="$2"
 	await_line "HibernationService: the image is refused, and the machine boots fresh - " "$label: the image was not refused" 0 600
-	grep -a -F "HibernationService: the image is refused" "$serial" | grep -q -F -- "$why" || fail "$label: the image was refused, but not as '$why': $(grep -a -F 'the image is refused' "$serial")"
+	refused="$(grep -a -F "HibernationService: the image is refused" "$serial" || true)"
+	grep -q -F -- "$why" <<<"$refused" || fail "$label: the image was refused, but not as '$why': $refused"
 	await_line "ServiceManager: restore: no image is restored - the boot goes on" "$label: the boot did not go on after the refusal" 0 60
 	[[ "$(header)" == empty ]] || fail "$label: the refused image's header was not invalidated ($(header))"
 	grep -q "the image found at this boot: refused: .*$why" <<<"$(status_line "$label")" || fail "$label: the status does not name the refusal: $(cat "$state/status-$label.log")"
 	say "$label: refused ($why), the machine booted fresh and the header is invalidated"
 }
 
-# THE COUNTER at the serial shell, in the background, for `seconds`.
+# THE COUNTER: started in the background at the serial shell, its lines REDIRECTED into a file - a line every 100 ms on
+# the serial console would keep the instance's readiness from ever seeing a quiet prompt - which the redirection
+# publishes only when the program ends, cleanly: one file for its whole life, before the time off and after it.
+COUNTER_S=60
 start_counter() {
-	local seconds="$1" first
-	first=$(seen "sleepcheck: count 1 ")
-	type_serial "sleepcheck count $seconds &" || fail "the serial console took no input"
-	await_line "sleepcheck: count 1 " "the counter did not start at the serial shell" "$first" 30
-	sleep 2
+	local name="$1"
+	type_serial "sleepcheck count $COUNTER_S > $name &" || fail "the serial console took no input"
+	sleep 5
 }
 
-# THE COUNTER ACROSS THE TIME OFF: `before` is the log it ran in, the current one where it goes on - the next value,
-# its monotonic clock moved by less than the time off, its boot-time clock by at least it.
+# THE COUNTER ACROSS THE TIME OFF, read from its file once it has ended: one unbroken run of values from 1 - the same
+# program, never started again - whose widest step of the boot-time clock is the time off, at least `off_ms`, while
+# the monotonic clock moved by less than five seconds across it.
 counter_goes_on() {
-	local label="$1" before="$2" off_ms="$3"
-	await_line "sleepcheck: count " "$label: the counter did not go on after the restore" 0 120
-	python3 - "$before" "$serial" "$off_ms" "$label" <<'EOF' || fail "$label: the counter across the time off"
+	local label="$1" name="$2" off_ms="$3" out
+	for _ in $(seq 1 $((COUNTER_S * 2 + 60))); do
+		out="$(launch cat "$name")"
+		grep -q "sleepcheck: count done" <<<"$out" && break
+		sleep 1
+	done
+	printf '%s\n' "$out" >"$state/counter-$label.log"
+	python3 - "$state/counter-$label.log" "$off_ms" "$label" <<'EOF' || fail "$label: the counter across the time off (see $kept/counter-$label.log)"
 import re, sys
-before, after, off_ms, label = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-def rows(path):
-	out = []
-	for line in open(path, 'rb').read().decode('utf-8', 'replace').splitlines():
-		found = re.search(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)', line)
-		if found:
-			out.append(tuple(int(value) for value in found.groups()))
-	return out
-last, first = rows(before), rows(after)
-if not last or not first:
-	sys.exit('no counter line before, or none after')
-if first[0][0] != last[-1][0] + 1:
-	sys.exit(f'the counter stopped at {last[-1][0]} and went on at {first[0][0]}')
-mono, boot = first[0][1] - last[-1][1], first[0][2] - last[-1][2]
+path, off_ms, label = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+text = open(path, 'rb').read().decode('utf-8', 'replace')
+if 'sleepcheck: count done' not in text:
+	sys.exit('the counter never finished, so its file was never published')
+rows = [tuple(int(value) for value in found) for found in re.findall(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)', text)]
+if not rows or [row[0] for row in rows] != list(range(1, len(rows) + 1)):
+	sys.exit('the counter did not run one unbroken sequence from 1 - it skipped, repeated or started again')
+gap = max(range(1, len(rows)), key=lambda at: rows[at][2] - rows[at - 1][2])
+mono, boot = rows[gap][1] - rows[gap - 1][1], rows[gap][2] - rows[gap - 1][2]
+if boot < off_ms:
+	sys.exit(f'the boot-time clock moved {boot} ms at its widest step, under the {off_ms} ms off')
 if mono > 5000:
 	sys.exit(f'the monotonic clock moved {mono} ms across the time off')
-if boot < off_ms:
-	sys.exit(f'the boot-time clock moved {boot} ms across {off_ms} ms off')
-print(f'hibernate: {label}: count {last[-1][0]} then {first[0][0]}: monotonic +{mono} ms, boot-time +{boot} ms')
+print(f'hibernate: {label}: count {rows[gap - 1][0]} then {rows[gap][0]}: monotonic +{mono} ms, boot-time +{boot} ms')
 EOF
 }
 
@@ -387,26 +390,25 @@ boot fresh "$S_OFFERED"
 status="$(status_line fresh)"
 grep -q "hibernation: set up" <<<"$status" || fail "hibernation is not set up on the disk set up for it: $status"
 grep -q "the image found at this boot: none" <<<"$status" || fail "a fresh disk's boot names an image: $status"
-start_counter 900
+start_counter counter-first.txt
 hibernate first
 grep -q '"SUSPEND_DISK"\|SUSPEND_DISK' "$state/qmp-first.log" || fail "first: QEMU reported no SUSPEND_DISK - the machine did not enter S4 (events: $(tr '\n' ' ' <"$state/qmp-first.log"))"
-grep -a -q "hibernate: the image is written - the registered \\\\_S4" "$serial" || fail "first: the kernel did not name the registered \\_S4"
+grep -a -q -F "hibernate: the image is written - the registered \\_S4" "$serial" || fail "first: the kernel did not name the registered \\_S4"
 off_started=$(date +%s%3N)
 say "hibernated - the image is written, QEMU reported SUSPEND_DISK and exited"
-cp -f "$serial" "$state/serial-first.log"
 boot restore "$S_OFFERED"
 await_line "HibernationService: the image is authenticated and in the kernel" "restore: the image was not restored" 0 600
 off_ms=$(($(date +%s%3N) - off_started))
 await_line "ServiceManager: sleep: the transaction ended - slept and woke" "restore: the restored machine's transaction did not end" 0 300
-grep -a -q "ServiceManager: sleep: resumed - woken by Restored" "$serial" || fail "restore: the transaction does not name the restore"
+grep -a -q -F "sleep: resumed (the restore of a hibernation image" "$serial" || fail "restore: the kernel did not resume as the image restored"
 [[ "$(header)" == empty ]] || fail "restore: the header was not invalidated before the jump ($(header))"
-counter_goes_on restore "$state/serial-first.log" "$((off_ms / 2))"
+counter_goes_on restore counter-first.txt "$((off_ms / 2))"
 say "restored - the same program, the same counter, and the header invalidated"
 
 # 2. THE BOOT AFTER A RESUME.
 boot after-restore "$S_OFFERED"
 grep -q "the image found at this boot: none" <<<"$(status_line after-restore)" || fail "after-restore: the boot after a resume found an image: $(cat "$state/status-after-restore.log")"
-(($(seen "an image of") == 0)) || fail "after-restore: the boot after a resume read an image"
+(($(seen "HibernationService: an image of") == 0)) || fail "after-restore: the boot after a resume read an image"
 say "the boot after the resume found no image to resume"
 
 # 3. S4 NOT OFFERED: powered off, and that image modified.
@@ -414,21 +416,23 @@ boot no-s4 "-global ICH9-LPC.disable_s3=0 -global ICH9-LPC.disable_s4=1"
 hibernate no-s4
 grep -q 'SUSPEND_DISK' "$state/qmp-no-s4.log" && fail "no-s4: QEMU reported SUSPEND_DISK where S4 is not offered"
 grep -q 'SHUTDOWN' "$state/qmp-no-s4.log" || fail "no-s4: QEMU reported no SHUTDOWN"
-grep -a -q "hibernate: the image is written - no \\_S4 registered, so the machine is powered off" "$serial" || fail "no-s4: the kernel did not name the power-off path"
+grep -a -q -F "hibernate: the image is written - no \\_S4 registered, so the machine is powered off" "$serial" || fail "no-s4: the kernel did not name the power-off path"
 say "where S4 is not offered the machine powered off with its image written"
 modify_image
 boot modified "$S_OFFERED"
 refused modified "modified"
 
-# 4. ANOTHER SYSTEM IMAGE.
-hibernate other-system-image
-boot other-system "$S_OFFERED -fw_cfg name=opt/org.libersystem/system-variant,string=other"
-refused other-system "another system image"
-
-# 5. ANOTHER MACHINE.
+# 4. ANOTHER MACHINE - an image written by this system image on four cores, booted on two. FIRST, because the header
+#    is held to the system image before the hardware: the image of the next case is written on the two cores this one
+#    boots, so the only difference it then meets is the system image's.
 hibernate other-machine-image
 boot other-machine "$S_OFFERED" "$tpm_state" "$((CORES / 2))"
 refused other-machine "other hardware"
+
+# 5. ANOTHER SYSTEM IMAGE - the same two cores, the development variant named.
+hibernate other-system-image
+boot other-system "$S_OFFERED -fw_cfg name=opt/org.libersystem/system-variant,string=other" "$tpm_state" "$((CORES / 2))"
+refused other-system "another system image"
 
 # 6. HYBRID SLEEP: woken, the image discarded; then the battery that died.
 boot hybrid "$S_OFFERED"
@@ -444,19 +448,18 @@ await_line "ServiceManager: sleep: the transaction ended - slept and woke" "hybr
 await_line "HibernationService: the image is discarded" "hybrid: the image was not discarded after the S3 resume" 0 60
 [[ "$(header)" == empty ]] || fail "hybrid: the image is still valid after the S3 resume ($(header))"
 say "hybrid: the image written, S3, and discarded once the machine ran on"
-start_counter 900
+start_counter counter-hybrid.txt
 written=$(seen "HibernationService: the image is written")
 launch sleepctl hibernate hybrid >"$state/sleepctl-hybrid-lost.log" 2>&1 &
 await_line "HibernationService: the image is written" "hybrid-lost: no image was written" "$written" 600
 await_state suspended 120 "hybrid-lost: S3 after the image"
 off_started=$(date +%s%3N)
 qmp quit >/dev/null 2>&1 || true
-cp -f "$serial" "$state/serial-hybrid-lost.log"
 boot hybrid-restore "$S_OFFERED"
 await_line "HibernationService: the image is authenticated and in the kernel" "hybrid-restore: the image was not restored" 0 600
 off_ms=$(($(date +%s%3N) - off_started))
 await_line "ServiceManager: sleep: the transaction ended - slept and woke" "hybrid-restore: the transaction did not end" 0 300
-counter_goes_on hybrid-restore "$state/serial-hybrid-lost.log" "$((off_ms / 2))"
+counter_goes_on hybrid-restore counter-hybrid.txt "$((off_ms / 2))"
 say "hybrid: the power lost in S3, the next boot restored the image"
 
 # 7. NOT SET UP.

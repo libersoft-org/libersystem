@@ -1592,6 +1592,49 @@ pub enum Uart {
 	Ns16550,
 }
 
+/// THE MOST STATES of a tree's `idle-states` read: the kernel's table holds eight, and its first is the halt.
+pub const MAX_TREE_IDLE_STATES: usize = 7;
+/// The most cpu nodes whose `cpu-idle-states` are read.
+pub const MAX_TREE_IDLE_CPUS: usize = 64;
+
+/// Which binding a tree's idle states are read under: PSCI's (`arm,idle-state`) or the SBI's (`riscv,idle-state`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleBinding {
+	Arm,
+	Riscv,
+}
+
+/// ONE STATE of `/cpus/idle-states`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeIdleState {
+	pub phandle: u32,
+	/// `arm,psci-suspend-param` or `riscv,sbi-suspend-param`.
+	pub parameter: u32,
+	pub entry_latency_us: u32,
+	pub exit_latency_us: u32,
+	pub min_residency_us: u32,
+	/// `local-timer-stop`: the core's timer stops in it.
+	pub local_timer_stop: bool,
+}
+
+/// THE TREE'S IDLE STATES, and per cpu node its `reg` - MPIDR's affinity, or the hart id - with the phandles its
+/// `cpu-idle-states` names, in its order.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeIdleStates {
+	pub states: [TreeIdleState; MAX_TREE_IDLE_STATES],
+	pub state_count: usize,
+	pub cpus: [(u64, [u32; MAX_TREE_IDLE_STATES], usize); MAX_TREE_IDLE_CPUS],
+	pub cpu_count: usize,
+}
+
+impl TreeIdleStates {
+	/// The states the cpu node whose `reg` is `reg` names, in its order - each found by phandle.
+	pub fn for_cpu(&self, reg: u64) -> impl Iterator<Item = &TreeIdleState> {
+		let names = self.cpus[..self.cpu_count].iter().find(|(held, _, _)| *held == reg).map_or(&[][..], |(_, names, count)| &names[..*count]);
+		names.iter().filter_map(|phandle| self.states[..self.state_count].iter().find(|state| state.phandle == *phandle))
+	}
+}
+
 // How a PSCI call reaches its implementation on this platform.
 //
 // A property of the PLATFORM and not of the exception level: what the caller runs at says nothing
@@ -2110,6 +2153,128 @@ impl Fdt {
 			b"smc" => Some(PsciConduit::Smc),
 			b"hvc" => Some(PsciConduit::Hvc),
 			_ => None,
+		}
+	}
+
+	// THE TREE'S IDLE STATES (`/cpus/idle-states`, the `arm,idle-state` or `riscv,idle-state` binding) and, for each cpu
+	// node, which of them its `cpu-idle-states` names - read in one walk. A state is kept when its node names every
+	// property the binding requires (the latencies, the residency and the suspend parameter), carries a phandle and is
+	// not disabled; a tree with no such node answers no states. `None` only for a tree that is not one.
+	pub fn idle_states(&self, binding: IdleBinding) -> Option<TreeIdleStates> {
+		if !self.is_valid() {
+			return None;
+		}
+		// SAFETY: the header was validated, so every read below is bounded by the blocks it declares.
+		unsafe { self.idle_states_inner(binding) }
+	}
+
+	unsafe fn idle_states_inner(&self, binding: IdleBinding) -> Option<TreeIdleStates> {
+		let b = self.bounds()?;
+		let (compatible, parameter_name) = match binding {
+			IdleBinding::Arm => (&b"arm,idle-state"[..], "arm,psci-suspend-param"),
+			IdleBinding::Riscv => (&b"riscv,idle-state"[..], "riscv,sbi-suspend-param"),
+		};
+		let mut out = TreeIdleStates { states: [TreeIdleState::default(); MAX_TREE_IDLE_STATES], state_count: 0, cpus: [(0, [0; MAX_TREE_IDLE_STATES], 0); MAX_TREE_IDLE_CPUS], cpu_count: 0 };
+		unsafe {
+			let mut p = b.struct_start;
+			// The root is depth 0, `/cpus` depth 1, a cpu node and `idle-states` depth 2, a state depth 3.
+			let mut depth = -1i32;
+			let mut in_cpus = false;
+			let mut in_idle = false;
+			let mut address_cells = 1u32;
+			// The node being read at depth 2 (a cpu) or 3 (a state), committed at its end - properties come in no order.
+			let mut cpu = false;
+			let mut reg: Option<u64> = None;
+			let mut names = [0u32; MAX_TREE_IDLE_STATES];
+			let mut name_count = 0usize;
+			let mut state = TreeIdleState::default();
+			let mut matched = false;
+			let mut disabled = false;
+			let mut required = 0u8;
+			loop {
+				let token = self.be32_in(p, b.struct_end)?;
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						let (name, next) = self.node_name_in(p, &b)?;
+						p = next;
+						if depth == 1 {
+							in_cpus = self.str_eq(name, "cpus");
+						} else if depth == 2 && in_cpus {
+							in_idle = self.str_eq(name, "idle-states");
+							(cpu, reg, name_count) = (false, None, 0);
+						} else if depth == 3 && in_idle {
+							(state, matched, disabled, required) = (TreeIdleState::default(), false, false, 0);
+						}
+					}
+					FDT_END_NODE => {
+						if depth == 3 && in_idle && matched && !disabled && required == 0b1111 && state.phandle != 0 && out.state_count < MAX_TREE_IDLE_STATES {
+							out.states[out.state_count] = state;
+							out.state_count += 1;
+						}
+						if let Some(reg) = reg.filter(|_| depth == 2 && in_cpus && !in_idle && cpu && out.cpu_count < MAX_TREE_IDLE_CPUS) {
+							out.cpus[out.cpu_count] = (reg, names, name_count);
+							out.cpu_count += 1;
+						}
+						if depth == 2 {
+							in_idle = false;
+						}
+						if depth == 1 {
+							in_cpus = false;
+						}
+						depth -= 1;
+						if depth < 0 {
+							return Some(out);
+						}
+					}
+					FDT_PROP => {
+						let (pname, len, value, next) = self.prop_in(p, &b)?;
+						p = next;
+						if depth == 1 && in_cpus && len == 4 && self.str_eq(pname, "#address-cells") {
+							address_cells = self.be32(value);
+						} else if depth == 2 && in_cpus && !in_idle {
+							if self.str_eq(pname, "device_type") {
+								cpu = self.stringlist_contains(value, len, b"cpu");
+							} else if self.str_eq(pname, "reg") && (address_cells == 1 || address_cells == 2) && len >= 4 * address_cells {
+								reg = Some(if address_cells == 2 { u64::from(self.be32(value)) << 32 | u64::from(self.be32(value + 4)) } else { u64::from(self.be32(value)) });
+							} else if self.str_eq(pname, "cpu-idle-states") {
+								name_count = ((len / 4) as usize).min(MAX_TREE_IDLE_STATES);
+								for (at, slot) in names.iter_mut().enumerate().take(name_count) {
+									*slot = self.be32(value + at as u64 * 4);
+								}
+							}
+						} else if depth == 3 && in_idle {
+							let word = if len == 4 { Some(self.be32(value)) } else { None };
+							if self.str_eq(pname, "compatible") {
+								matched = self.stringlist_contains(value, len, compatible);
+							} else if self.str_eq(pname, "status") {
+								disabled = !(self.stringlist_contains(value, len, b"okay") || self.stringlist_contains(value, len, b"ok"));
+							} else if self.str_eq(pname, "local-timer-stop") {
+								state.local_timer_stop = true;
+							} else if let Some(word) = word {
+								if self.str_eq(pname, "phandle") || self.str_eq(pname, "linux,phandle") {
+									state.phandle = word;
+								} else if self.str_eq(pname, "entry-latency-us") {
+									state.entry_latency_us = word;
+									required |= 1;
+								} else if self.str_eq(pname, "exit-latency-us") {
+									state.exit_latency_us = word;
+									required |= 2;
+								} else if self.str_eq(pname, "min-residency-us") {
+									state.min_residency_us = word;
+									required |= 4;
+								} else if self.str_eq(pname, parameter_name) {
+									state.parameter = word;
+									required |= 8;
+								}
+							}
+						}
+					}
+					FDT_NOP => {}
+					_ => return None,
+				}
+			}
 		}
 	}
 

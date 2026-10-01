@@ -140,3 +140,24 @@ This record is updated as the work proceeds; the final state is at its end.
 - The `MSFT0101` node's reconciliation onto the table's row - P02M0196b's namespace.
 
 Status: IMPLEMENTED; verified on x86_64 and the host; the ports' runs remain.
+
+## After P02M0196b and the static gates (2026-10-01)
+
+- THE PROBE SHIPPED: `tpmprobe` was a DYNAMIC program of the tools crate with `development = true`, and nothing kept it
+  out of a shipping image - `build-shared.sh` stages every dynamic volume row, and the manifest export is the same in
+  both configurations - against this milestone's "not staged in the shipping image". `development-gate` found it. It
+  is now a STATIC probe in the services crate behind `required-features = ["development"]`, as every other development
+  probe is: `src/user/services/core/src/tpmprobe.rs` (moved from `src/user/apps/tools/src/tpmprobe.rs`, which is gone),
+  its `[[bin]]` in `src/user/services/core/Cargo.toml` and out of `src/user/apps/tools/Cargo.toml`, its manifest row
+  `owner = "services"`, static, no providers; `tpm-client`, `tpm-client-provider` (named by `extern crate`, since only
+  its provider half is linked) and `tpm-proto` with `channel-client-impl` linked statically. The volume bundle, the
+  grants after it and the bounded file read are written there. (`admin_fixture`, another milestone's, lacked the same
+  `required-features` and has it now.)
+- THE ROW IS ONE DEVICE NOW: P02M0196b's namespace merges `MSFT0101` into the `TPM2` table's row - the open item above
+  ("the `MSFT0101` node's reconciliation onto the table's row") - so `lsdev` shows the row's ids as
+  `[{kind=table, text=TPM2}, {kind=identity, text=acpi:\_SB_.TPM_}, {kind=hid, text=MSFT0101}]` with its one resource
+  still the table's 4 KiB page. The gate's run of 2026-10-01 failed at step 3 on the old expectation
+  (`identity=table:TPM2#0, ids=[{kind=table, text=TPM2}], resources=[...]` did not appear within 30 s; the serial log
+  showed the merged row). `src/harness/scenarios/tpm-tool.toml` now expects the merged row - a TOML literal string, so
+  the path's backslash is the line's own - for both front-ends (QEMU's `_CRS` for TIS is 0x5000 and for CRB 0x1000 at
+  the same base, merged either way, the row keeping the table's page).

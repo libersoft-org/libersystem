@@ -140,6 +140,7 @@ static DEVICES: SpinLock<Vec<DeviceEntry>> = SpinLock::new(Vec::new());
 static PCI_FUNCTIONS: SpinLock<Vec<abi::PciInfo>> = SpinLock::new(Vec::new());
 
 // Every function the boot scan found, as (bus, device, function) - what an S3 saves and restores the configuration of.
+#[cfg(target_arch = "x86_64")]
 pub fn pci_addresses() -> Vec<(u8, u8, u8)> {
 	// ALLOC-OK: the S3 entry, before the machine sleeps, bounded by the functions the scan found.
 	PCI_FUNCTIONS.lock().iter().map(|info| (info.bus, info.dev, info.func)).collect()
@@ -290,6 +291,7 @@ fn forbidden_ranges(table: &[DeviceEntry]) -> Vec<(u64, u64)> {
 	}
 	// AND EVERY BAR AND BRIDGE WINDOW THE BUS DECODES, which the boot scan recorded for every function - a function
 	// outside the resolved families has a row with no BAR, and its BAR is no less the function's.
+	// ALLOC-OK: as above.
 	crate::firmware::decoded_ranges(&mut |base, len| ranges.push((base, len)));
 	ranges
 }
@@ -336,6 +338,7 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 			let _ = entry;
 			true
 		};
+		// ALLOC-OK: boot, one view per row of the inventory the firmware's description is placed against.
 		let views: Vec<platform::RowView<'_>> = table.iter().map(|entry| entry.platform.as_ref().filter(|_| placed(entry)).map(|row| (&row.part, &entry.ports[..entry.port_count as usize]))).collect();
 		platform::place(&views, &description)
 	};
@@ -351,14 +354,18 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 			Some(row)
 		}
 		platform::Placement::Refuse { row, what } => {
-			let other = table[row].platform.as_ref().map(|held| alloc::string::String::from_utf8_lossy(held.part.identity()).into_owned()).unwrap_or_default();
-			crate::serial_println!("device: {name} is not published - its {} overlap {other} (row {row}) without starting where it does", overlap_name(what));
+			let other = table[row].platform.as_ref().map_or(&[][..], |held| held.part.identity());
+			crate::serial_println!("device: {name} is not published - its {} overlap {} (row {row}) without starting where it does", overlap_name(what), crate::firmware::Text(other));
 			None
 		}
 		platform::Placement::New => {
 			let index = table.len();
+			let Some(entry) = platform_entry(&description, properties) else {
+				crate::serial_println!("device: {name} is not published - there is no memory for its row");
+				return None;
+			};
 			// ALLOC-OK: the device inventory is built once at boot from what the firmware describes.
-			table.push(platform_entry(&description, properties));
+			table.push(entry);
 			// ITS SYSTEM-MEMORY REGISTERS, declared rather than mapped - each refused, and said, where it lies over
 			// something no platform row may own.
 			let mut declared: Vec<crate::declared::Register> = Vec::new();
@@ -379,12 +386,13 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 	}
 }
 
-// A platform description as a row of the table.
-fn platform_entry(description: &platform::Description, properties: Vec<u8>) -> DeviceEntry {
+// A platform description as a row of the table - None where the heap cannot hold its record.
+fn platform_entry(description: &platform::Description, properties: Vec<u8>) -> Option<DeviceEntry> {
 	let (bar_phys, bar_len) = description.part.mmio().first().map_or((0, 0), |range| (range.base, range.len));
 	let mut part = description.part;
 	part.properties_len = properties.len() as u32;
-	DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys, bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(alloc::boxed::Box::new(PlatformRow { part, properties })) }
+	let platform = crate::mem::heap::try_box(PlatformRow { part, properties })?;
+	Some(DeviceEntry { device_type: abi::DEVICE_TYPE_PLATFORM as u16, transport: abi::TRANSPORT_PLATFORM, vendor: 0, product: 0, bar_phys, bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0, dev: 0, func: 0, class: 0, subclass: 0, prog_if: 0, on_bus: true, port_count: description.port_count, ports: description.ports, platform: Some(platform) })
 }
 
 // The number of discovered devices.
@@ -1277,7 +1285,9 @@ pub fn console_holder() -> Option<alloc::sync::Arc<crate::object::process::Proce
 		}
 		abi::ClaimKey { device_index: index as u32, _pad: 0, generation: slot.generation }
 	};
-	let derived: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()).collect();
+	// COPIED OUT FALLIBLY, upgraded after the lock is given back - a last reference dropped here must not run its
+	// object's teardown under `DERIVED`. A short heap finds no holder.
+	let derived = crate::mem::heap::try_collect(DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()))?;
 	derived.iter().filter_map(|weak| weak.upgrade()).find_map(|object| object.as_any().downcast_ref::<crate::object::port_range::PortRange>().and_then(|range| range.holder()))
 }
 
@@ -1286,7 +1296,7 @@ pub fn console_holder() -> Option<alloc::sync::Arc<crate::object::process::Proce
 // whose claim is held.
 #[cfg(liber_development)]
 pub fn bar_holder(vendor: u16, product: u16) -> Option<alloc::sync::Arc<crate::object::process::Process>> {
-	let rows: Vec<usize> = DEVICES.lock().iter().enumerate().filter(|(_, entry)| entry.vendor == vendor && entry.product == product).map(|(index, _)| index).collect();
+	let rows = crate::mem::heap::try_collect(DEVICES.lock().iter().enumerate().filter(|(_, entry)| entry.vendor == vendor && entry.product == product).map(|(index, _)| index))?;
 	for index in rows {
 		let key = {
 			let claims = CLAIMS.lock();
@@ -1296,7 +1306,7 @@ pub fn bar_holder(vendor: u16, product: u16) -> Option<alloc::sync::Arc<crate::o
 			}
 			abi::ClaimKey { device_index: index as u32, _pad: 0, generation: slot.generation }
 		};
-		let derived: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()).collect();
+		let derived = crate::mem::heap::try_collect(DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()))?;
 		let space = derived.iter().filter_map(|weak| weak.upgrade()).find_map(|object| object.as_any().downcast_ref::<crate::object::device_memory::DeviceMemory>().and_then(|memory| memory.mapped_space()));
 		if let Some(space) = space {
 			return process_in(&crate::sched::root_domain(), &space);
@@ -1813,6 +1823,41 @@ pub(crate) fn with_tables<R>(f: impl FnOnce(&Tables<'_>) -> R) -> R {
 }
 
 // What one namespace report came to.
+// WHY A NAMESPACE DESCRIPTION IS NOT PUBLISHED, said with nothing allocated: the names it carries are copied as far as a
+// platform name goes.
+pub(crate) enum Unpublished {
+	Crs(platform::policy::CrsRefusal),
+	StillHeld(usize),
+	NotPlatform(usize),
+	IdsDoNotFit(usize),
+	Overlap { what: platform::Overlap, other: [u8; abi::PLATFORM_NAME_LEN], other_len: usize, row: usize },
+	InReservation { reservation: [u8; abi::PLATFORM_NAME_LEN], reservation_len: usize, row: usize },
+	NoMemory,
+}
+
+// A name copied into a platform name's room.
+fn name_of(identity: &[u8]) -> ([u8; abi::PLATFORM_NAME_LEN], usize) {
+	let mut out = [0u8; abi::PLATFORM_NAME_LEN];
+	let len = identity.len().min(out.len());
+	out[..len].copy_from_slice(&identity[..len]);
+	(out, len)
+}
+
+impl core::fmt::Display for Unpublished {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		use crate::firmware::Text;
+		match self {
+			Unpublished::Crs(refusal) => write!(f, "{}", crate::firmware::CrsWhy(*refusal)),
+			Unpublished::StillHeld(row) => write!(f, "row {row} is still held by the binding its withdrawal ended - reported again once released"),
+			Unpublished::NotPlatform(row) => write!(f, "row {row} is not a platform row"),
+			Unpublished::IdsDoNotFit(row) => write!(f, "it describes row {row} again and its ids do not fit beside that row's"),
+			Unpublished::Overlap { what, other, other_len, row } => write!(f, "its {} overlap {} (row {row}) without starting where it does", overlap_name(*what), Text(&other[..*other_len])),
+			Unpublished::InReservation { reservation, reservation_len, row } => write!(f, "its ranges lie in the reservation {} (row {row})", Text(&reservation[..*reservation_len])),
+			Unpublished::NoMemory => f.write_str("there is no memory for its row"),
+		}
+	}
+}
+
 pub(crate) enum Published {
 	// The row a live identity already had: nothing changes and no event is sent.
 	Same(usize),
@@ -1828,13 +1873,13 @@ pub(crate) enum Published {
 // to `admit` (the `_CRS` policy) before it becomes a row; a merged description adds no resource, so neither refuses
 // it. `targets` join each connection to its controller's row once the row exists; `companion_function` answers the
 // PCI function a companion node's identity names. Answers what it came to, or the refusal in words.
-pub(crate) fn publish_namespace(description: platform::Description, properties: Vec<u8>, targets: &[(u8, Vec<u8>)], admit: impl Fn(&Tables<'_>, &platform::Description) -> Result<(), alloc::string::String>, companion_function: impl Fn(&[u8]) -> Option<(u8, u8, u8)>) -> Result<Published, alloc::string::String> {
-	use alloc::format;
-	let name = alloc::string::String::from_utf8_lossy(description.identity()).into_owned();
+pub(crate) fn publish_namespace(description: platform::Description, properties: Vec<u8>, targets: &[(u8, Vec<u8>)], admit: impl Fn(&Tables<'_>, &platform::Description) -> Result<(), Unpublished>, companion_function: impl Fn(&[u8]) -> Option<(u8, u8, u8)>) -> Result<Published, Unpublished> {
+	let (name_bytes, name_len) = name_of(description.identity());
+	let name = crate::firmware::Text(&name_bytes[..name_len]);
 	let mut table = DEVICES.lock();
 	let mut claims = CLAIMS.lock();
 	let decided = {
-		let states: Vec<Option<platform::policy::RowState<'_>>> = table.iter().map(|entry| entry.platform.as_ref().map(|row| platform::policy::RowState { part: &row.part, withdrawn: !entry.on_bus })).collect();
+		let states = crate::mem::heap::try_collect(table.iter().map(|entry| entry.platform.as_ref().map(|row| platform::policy::RowState { part: &row.part, withdrawn: !entry.on_bus }))).ok_or(Unpublished::NoMemory)?;
 		platform::policy::reconcile(&states, &description)
 	};
 	let reservation = description.part.state == abi::PLATFORM_STATE_RESERVATION;
@@ -1847,12 +1892,12 @@ pub(crate) fn publish_namespace(description: platform::Description, properties: 
 		}
 		platform::policy::Reconcile::Refill(row) => {
 			if claims.get(row).is_some_and(|slot| slot.state != ClaimState::Free) {
-				return Err(format!("row {row} is still held by the binding its withdrawal ended - reported again once released"));
+				return Err(Unpublished::StillHeld(row));
 			}
 			if !reservation {
 				admit(&Tables { rows: &table, claims: &claims }, &description)?;
 			}
-			table[row] = platform_entry(&description, properties);
+			table[row] = platform_entry(&description, properties).ok_or(Unpublished::NoMemory)?;
 			let generation = claims.get(row).map_or(0, |slot| slot.generation).wrapping_add(1);
 			if let Some(slot) = claims.get_mut(row) {
 				*slot = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 };
@@ -1863,24 +1908,30 @@ pub(crate) fn publish_namespace(description: platform::Description, properties: 
 			if !reservation {
 				// PLACED AGAINST THE LIVE ROWS THAT ARE NOT RESERVATIONS: a reservation is never merged into.
 				let placement = {
-					let views: Vec<platform::RowView<'_>> = table.iter().map(|entry| entry.platform.as_ref().filter(|row| entry.on_bus && row.part.state != abi::PLATFORM_STATE_RESERVATION).map(|row| (&row.part, &entry.ports[..entry.port_count as usize]))).collect();
+					let views = crate::mem::heap::try_collect(table.iter().map(|entry| entry.platform.as_ref().filter(|row| entry.on_bus && row.part.state != abi::PLATFORM_STATE_RESERVATION).map(|row| (&row.part, &entry.ports[..entry.port_count as usize])))).ok_or(Unpublished::NoMemory)?;
 					platform::place(&views, &description)
 				};
 				match placement {
 					platform::Placement::Same(row) => return Ok(Published::Same(row)),
 					platform::Placement::Merge(row) => {
-						let Some(held) = table[row].platform.as_mut() else { return Err(format!("row {row} is not a platform row")) };
+						let Some(held) = table[row].platform.as_mut() else { return Err(Unpublished::NotPlatform(row)) };
+						// THE ROOM FOR WHAT THE MERGE ADDS, before it is made: a merge the record of could not be kept could
+						// never be taken out again.
+						let mut added: Vec<abi::MatchId> = Vec::new();
+						if added.try_reserve_exact(abi::MAX_MATCH_IDS).is_err() {
+							return Err(Unpublished::NoMemory);
+						}
 						let before = held.part.match_count as usize;
 						if !platform::merge(&mut held.part, &description) {
-							return Err(format!("it describes row {row} again and its ids do not fit beside that row's"));
+							return Err(Unpublished::IdsDoNotFit(row));
 						}
-						let added = held.part.match_ids[before..held.part.match_count as usize].to_vec();
+						added.extend_from_slice(&held.part.match_ids[before..held.part.match_count as usize]);
 						crate::serial_println!("device: {name} is the device row {row} already names, and is merged into it");
 						return Ok(Published::Merged(row, added));
 					}
 					platform::Placement::Refuse { row, what } => {
-						let other = table[row].platform.as_ref().map(|held| alloc::string::String::from_utf8_lossy(held.part.identity()).into_owned()).unwrap_or_default();
-						return Err(format!("its {} overlap {other} (row {row}) without starting where it does", overlap_name(what)));
+						let (other, other_len) = name_of(table[row].platform.as_ref().map_or(&[][..], |held| held.part.identity()));
+						return Err(Unpublished::Overlap { what, other, other_len, row });
 					}
 					platform::Placement::New => {}
 				}
@@ -1889,14 +1940,16 @@ pub(crate) fn publish_namespace(description: platform::Description, properties: 
 				for (row, entry) in table.iter().enumerate() {
 					let Some(held) = entry.platform.as_ref().filter(|held| entry.on_bus && held.part.state == abi::PLATFORM_STATE_RESERVATION) else { continue };
 					if platform::policy::reserved_against(&held.part, &entry.ports[..entry.port_count as usize], &description) {
-						return Err(format!("its ranges lie in the reservation {} (row {row})", alloc::string::String::from_utf8_lossy(held.part.identity())));
+						let (reservation, reservation_len) = name_of(held.part.identity());
+						return Err(Unpublished::InReservation { reservation, reservation_len, row });
 					}
 				}
 			}
 			if table.try_reserve(1).is_err() || claims.try_reserve(1).is_err() {
-				return Err(alloc::string::String::from("no memory for a row"));
+				return Err(Unpublished::NoMemory);
 			}
-			table.push(platform_entry(&description, properties));
+			let entry = platform_entry(&description, properties).ok_or(Unpublished::NoMemory)?;
+			table.push(entry);
 			claims.push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
 			table.len() - 1
 		}
@@ -1907,7 +1960,7 @@ pub(crate) fn publish_namespace(description: platform::Description, properties: 
 		let found = table.iter().position(|entry| entry.on_bus && entry.platform.as_ref().is_some_and(|held| held.part.identity() == identity.as_slice())).or_else(|| companion_function(identity).and_then(|(bus, dev, func)| table.iter().position(|entry| entry.is_function(bus, dev, func) && entry.on_bus)));
 		match (found, table[index].platform.as_mut()) {
 			(Some(controller), Some(held)) if (*connection as usize) < held.part.connection_count as usize => held.part.connections[*connection as usize].controller = controller as u32,
-			_ => crate::serial_println!("device: {name} names a controller {} that no row carries - that connection is not joined", alloc::string::String::from_utf8_lossy(identity)),
+			_ => crate::serial_println!("device: {name} names a controller {} that no row carries - that connection is not joined", crate::firmware::Text(identity)),
 		}
 	}
 	drop(claims);
@@ -1934,16 +1987,27 @@ pub(crate) fn withdraw_namespace(identity: &[u8]) -> Option<usize> {
 pub(crate) fn unmerge(row: usize, ids: &[abi::MatchId]) {
 	let mut table = DEVICES.lock();
 	let Some(held) = table.get_mut(row).and_then(|entry| entry.platform.as_mut()) else { return };
-	let kept: Vec<abi::MatchId> = held.part.match_ids().iter().filter(|id| !ids.iter().any(|gone| gone.kind == id.kind && gone.text() == id.text())).copied().collect();
-	held.part.match_ids = [abi::MatchId::default(); abi::MAX_MATCH_IDS];
-	held.part.match_ids[..kept.len()].copy_from_slice(&kept);
-	held.part.match_count = kept.len() as u8;
+	// KEPT IN PLACE, in a row's own room: no list is built for what stays.
+	let mut kept = [abi::MatchId::default(); abi::MAX_MATCH_IDS];
+	let mut count = 0usize;
+	for id in held.part.match_ids().iter().filter(|id| !ids.iter().any(|gone| gone.kind == id.kind && gone.text() == id.text())) {
+		kept[count] = *id;
+		count += 1;
+	}
+	held.part.match_ids = kept;
+	held.part.match_count = count as u8;
 }
 
-// The identities of every live row the namespace published, for the withdrawal at "namespace loaded".
-pub(crate) fn namespace_rows() -> Vec<(usize, Vec<u8>)> {
+// The identities of every live row the namespace published, for the withdrawal at "namespace loaded" - None where the
+// heap cannot hold them.
+pub(crate) fn namespace_rows() -> Option<Vec<(usize, Vec<u8>)>> {
 	let table = DEVICES.lock();
-	table.iter().enumerate().filter(|(_, entry)| entry.on_bus).filter_map(|(index, entry)| entry.platform.as_ref().filter(|held| held.part.source == abi::PLATFORM_SOURCE_ACPI).map(|held| (index, held.part.identity().to_vec()))).collect()
+	let mut rows: Vec<(usize, Vec<u8>)> = Vec::new();
+	for (index, held) in table.iter().enumerate().filter(|(_, entry)| entry.on_bus).filter_map(|(index, entry)| entry.platform.as_ref().filter(|held| held.part.source == abi::PLATFORM_SOURCE_ACPI).map(|held| (index, held))) {
+		let identity = crate::mem::heap::try_to_vec(held.part.identity())?;
+		crate::mem::heap::try_push(&mut rows, (index, identity)).ok()?;
+	}
+	Some(rows)
 }
 
 // WITHOUT the record-time check, so a test can put a reserved or already-granted range on a row and see
@@ -1975,6 +2039,7 @@ pub fn add_synthetic_device() -> usize {
 // two are one entry and a table with a device and no slot for it is worse than a test that could not allocate.
 #[cfg(test)]
 fn push_free_claim_slot() {
+	// ALLOC-OK: `#[cfg(test)]`, as the comment above says.
 	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
 }
 
@@ -2019,7 +2084,7 @@ const SYNTHETIC_CONSOLE_IDENTITY: &[u8] = b"test:console-uart";
 // and the suite's hardware id - APPENDED WITHOUT THE PLACEMENT: other suites publish rows over the same UART, and
 // the placement would merge them into one row whose flags are the first description's. Answers the row, the
 // same one every time for the same base.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn synthetic_console_row(base: u16) -> usize {
 	let mut table = DEVICES.lock();
 	if let Some(index) = table.iter().position(|entry| entry.platform.as_ref().is_some_and(|row| row.part.flags & abi::PLATFORM_FLAG_CONSOLE != 0) && entry.port_count > 0 && entry.ports[0].base == base) {
@@ -2039,7 +2104,7 @@ pub fn synthetic_console_row(base: u16) -> usize {
 // A QUARANTINED SLOT MADE FREE AGAIN, for the suite alone: a row a test quarantined on purpose would otherwise
 // be unclaimable by every later test that needs the same hardware - the console handoff's second UART is one
 // row, whatever identity a test gives it.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn forget_quarantine_for_test(index: usize) {
 	let mut claims = CLAIMS.lock();
 	if let Some(slot) = claims.get_mut(index)

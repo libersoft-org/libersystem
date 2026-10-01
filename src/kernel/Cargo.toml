@@ -121,6 +121,7 @@ buddy = { path = "../buddy" }
 # same reason `buddy` is: the cases that matter - a counter that kept running across a sleep and one that
 # restarted, a reading behind the anchor - are arithmetic a host can drive and a booted guest cannot.
 tickclock = { path = "../tickclock" }
+procpower = { path = "../procpower" }
 # The flattened device tree reader, shared with the loader. It was `arch::common::dtb`; moving it
 # out is what let a real QEMU device tree be handed to it on a host, which immediately found that
 # `timebase_frequency` had never once returned a value.
@@ -200,6 +201,12 @@ webp = { path = "../user/libs/image/webp" }
 # was the only thing it did.
 [profile.release]
 lto = true
+
+# THE SYSTEM IMAGE'S DIGEST is SHA-256 over the kernel and every module the loader handed over - tens of megabytes in a
+# development build - taken while a hibernation's machine is frozen and again at the boot that restores it. Unoptimized,
+# it alone kept the snapshot's entry waiting some twenty seconds.
+[profile.dev.package.bootproto]
+opt-level = 3
 
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to

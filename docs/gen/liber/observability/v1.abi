@@ -6,7 +6,9 @@ record resource-count(name:string,live:u64,bound:u64)
 record component(name:string,type:component-type,state:component-state,deps:list<string>,counters:counters,resources:list<resource-count>)
 record trace-span(name:string,duration-ns:u64)
 record core-wake-source(source:u32,count:u64)
-record core-idle(cpu:u32,idle-ns:u64,halts:u64,wakes-timer:u64,wakes-ipi:u64,wakes-housekeeping:u64,wakes-device:u64,sources:list<core-wake-source>:bound=8)
+record core-idle-state(entry:u32,unenterable:u32,exit-latency-us:u32,target-residency-us:u32,entries:u64,residency-ns:u64)
+record core-level(level:u32,ns:u64)
+record core-idle(cpu:u32,idle-ns:u64,halts:u64,wakes-timer:u64,wakes-ipi:u64,wakes-housekeeping:u64,wakes-device:u64,sources:list<core-wake-source>:bound=8,states:list<core-idle-state>:bound=8,perf-levels:u32,perf-level:u32,levels:list<core-level>:bound=64,window-cap:u32,window-floor:u32,inject-permille:u32,injected-ns:u64,latency-requests:u32,latency-bound-us:u32)
 record graph(components:list<component>,spans:list<trace-span>,cores:list<core-idle>:bound=64)
 interface system-graph
 method system-graph.snapshot op=1 () -> result<graph, liber:base@1::error>

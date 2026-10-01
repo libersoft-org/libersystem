@@ -272,6 +272,74 @@ fn call_no_return(function: u64) -> bool {
 	false
 }
 
+// PSCI CPU_SUSPEND (SMC64), PSCI_FEATURES (PSCI 1.0) and SYSTEM_SUSPEND (SMC64).
+const PSCI_CPU_SUSPEND: u64 = 0xC400_0001;
+const PSCI_FEATURES: u64 = 0x8400_000A;
+const PSCI_SYSTEM_SUSPEND: u64 = 0xC400_000E;
+// PSCI's NOT_SUPPORTED, which is also what a machine with no conduit answers here.
+const NOT_SUPPORTED: i64 = -1;
+
+// One PSCI call that returns, with up to three arguments: its status, or NOT_SUPPORTED with no conduit below this kernel.
+// The arguments' registers are given up to the call, as the calling convention allows.
+fn call(function: u64, first: u64, second: u64, third: u64) -> i64 {
+	let conduit = resolved_conduit();
+	let ret: i64;
+	// SAFETY: a PSCI call on the conduit the platform named; it returns, and touches no memory of this kernel's.
+	unsafe {
+		match conduit {
+			bootproto::PSCI_SMC => core::arch::asm!("smc #0", inout("x0") function => ret, inout("x1") first => _, inout("x2") second => _, inout("x3") third => _, options(nostack)),
+			bootproto::PSCI_HVC => core::arch::asm!("hvc #0", inout("x0") function => ret, inout("x1") first => _, inout("x2") second => _, inout("x3") third => _, options(nostack)),
+			_ => return NOT_SUPPORTED,
+		}
+	}
+	ret
+}
+
+// A RETENTION STATE, ENTERED: PSCI CPU_SUSPEND with the tree's power-state parameter. The core waits as WFI does - an
+// interrupt pending, masked or not, ends it - and the call returns with its context kept. A power-down state
+// (`state_loses_context`) never reaches here: it loses the core's context, and this port has no per-core resume path,
+// so it is held out of the governor's choices at install. Answers PSCI's status: 0 entered and left.
+pub(crate) fn cpu_suspend(power_state: u32) -> i64 {
+	call(PSCI_CPU_SUSPEND, u64::from(power_state), 0, 0)
+}
+
+// WHETHER THE FIRMWARE OFFERS `function`, asked of PSCI_FEATURES: a PSCI before 1.0, or none at all, answers no.
+fn offers(function: u64) -> bool {
+	call(PSCI_FEATURES, function, 0, 0) >= 0
+}
+
+// WHETHER A POWER-STATE PARAMETER NAMES A STATE THAT LOSES THE CORE'S CONTEXT: its StateType bit - bit 30 in the
+// extended StateID format, bit 16 in the original one; PSCI_FEATURES(CPU_SUSPEND) says which this firmware takes (its
+// bit 1), and a firmware that cannot say takes the original.
+pub(crate) fn state_loses_context(power_state: u32) -> bool {
+	static EXTENDED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+	let extended = match EXTENDED.load(Ordering::Relaxed) {
+		1 => false,
+		2 => true,
+		_ => {
+			let features = call(PSCI_FEATURES, PSCI_CPU_SUSPEND, 0, 0);
+			let extended = features >= 0 && features & 0b10 != 0;
+			EXTENDED.store(if extended { 2 } else { 1 }, Ordering::Relaxed);
+			extended
+		}
+	};
+	power_state & (1 << if extended { 30 } else { 16 }) != 0
+}
+
+// SYSTEM_SUSPEND - the machine's suspend to RAM - offered, asked once.
+pub(crate) fn system_suspend_offered() -> bool {
+	static OFFERED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+	match OFFERED.load(Ordering::Relaxed) {
+		1 => true,
+		2 => false,
+		_ => {
+			let offered = offers(PSCI_SYSTEM_SUSPEND);
+			OFFERED.store(if offered { 1 } else { 2 }, Ordering::Relaxed);
+			offered
+		}
+	}
+}
+
 // Reboot the machine. Returns only if the platform has no PSCI conduit or refused the call.
 pub(crate) fn system_reset() -> bool {
 	call_no_return(PSCI_SYSTEM_RESET)

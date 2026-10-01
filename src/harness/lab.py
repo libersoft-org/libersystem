@@ -396,6 +396,8 @@ LAST_INPUT_AT = 0
 
 # A prompt as the shell prints it, found anywhere in the raw log - the colour codes sit around it, not inside.
 PROMPT_ANYWHERE = re.compile(rb'vol://[^\r\n>]*> ')
+# The kernel's line for a machine that a hibernation image replaced - see the boot nudge in `broker_wait`.
+RESTORED_MACHINE = re.compile(rb'sleep: resumed \(the restore of a hibernation image')
 
 
 def note_input():
@@ -635,7 +637,12 @@ def serve_request(state, conn):
 		# A prompt that arrived before this request is still a prompt. Seeding from the
 		# log makes waiting on an already-idle guest return at once; without it the wait
 		# can only see bytes yet to come, and an idle guest sends none.
-		collected = serial_tail(state['log_path'])
+		#
+		# EXCEPT AFTER A RESET (`fresh`, which `dev-reboot` asks for): the log's tail is then the PREVIOUS boot's, and
+		# whenever its last line was the shell's prompt the wait answered "prompt" a second after the reset - long
+		# before the firmware printed anything - and the agent asked next was not there for minutes.
+		flags = parts[2].split() if len(parts) == 3 else []
+		collected = b'' if 'fresh' in flags else serial_tail(state['log_path'])
 		# A BOOT'S WAIT MAY ASK FOR ITS PROMPT AGAIN. The prompt counts only as the last thing the guest
 		# printed, and a boot is not always done printing when the shell first prompts: lines that
 		# arrive on their own clock - the network's address configuration among them - land after it,
@@ -645,7 +652,7 @@ def serve_request(state, conn):
 		# just started or reset, where no person's half-typed line can be sitting in the console - types
 		# an empty line once the guest has been quiet a while with the shell's prompt buried, and the
 		# shell answers it with a prompt (the loop below says when).
-		nudge = len(parts) == 3 and parts[2] == 'nudge'
+		nudge = 'nudge' in flags
 	else:
 		# A request this broker does not implement is answered, not dropped. Silence reaches the
 		# caller as an empty read that looks like every other empty read.
@@ -674,7 +681,9 @@ def serve_request(state, conn):
 	# the PREVIOUS boot's after a reset, and a nudge taken on it was typed into a machine still booting and spent -
 	# after which the real prompt, buried by the next late line, was never asked for again. So a nudge is sent
 	# once the wait has seen the shell prompt, the output has buried it and gone quiet, and again each time
-	# another late line buries the prompt that nudge produced.
+	# another late line buries the prompt that nudge produced. A MACHINE RESTORED FROM A HIBERNATION IMAGE prints no
+	# prompt at all - its shell printed one before the image was written and waits on it - so the kernel's line naming
+	# the restore stands for the prompt the nudge answers.
 	deadline = time.time() + timeout
 	outcome = 'timeout'
 	settled_at = None
@@ -691,7 +700,7 @@ def serve_request(state, conn):
 			collected += data
 			settled_at = None
 			quiet_since = time.time()
-		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and PROMPT_ANYWHERE.search(collected, nudge_from):
+		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and (PROMPT_ANYWHERE.search(collected, nudge_from) or RESTORED_MACHINE.search(collected, nudge_from)):
 			serial.sendall(b'\n')
 			nudge_from = len(collected)
 			quiet_since = time.time()
@@ -2158,8 +2167,9 @@ def cmd_dev_reboot(args):
 		die(f'the development instance is {state}; a reboot needs one this worktree owns and is running')
 	started = time.time()
 	qmp_command('system_reset')
-	# The boot's nudge, as `dev-up` asks for it: this command reset the guest, so nothing is half-typed.
-	reply = ctl_request(f'WAIT {timeout} nudge', timeout, DEV_CTL_SOCK)
+	# The boot's nudge, as `dev-up` asks for it: this command reset the guest, so nothing is half-typed. And only this
+	# boot's prompt answers it (`fresh`): the log still ends with the previous boot's.
+	reply = ctl_request(f'WAIT {timeout} nudge fresh', timeout, DEV_CTL_SOCK)
 	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s of the reset (see {DEV_SERIAL_LOG})')
 	# The registry went with the reboot, because it was the agent's memory. Recording the new

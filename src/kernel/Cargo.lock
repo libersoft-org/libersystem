@@ -343,6 +343,7 @@ dependencies = [
  "png",
  "power-proto",
  "printer-device-proto",
+ "procpower",
  "ptp-transport-proto",
  "smartcard-proto",
  "smbios",
@@ -516,6 +517,13 @@ dependencies = [
  "base-proto",
  "resources-proto",
  "wire",
+]
+
+[[package]]
+name = "procpower"
+version = "0.0.0"
+dependencies = [
+ "abi",
 ]
 
 [[package]]

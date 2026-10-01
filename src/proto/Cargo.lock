@@ -42,6 +42,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmc-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "camera-device-proto"
 version = "0.0.0"
 dependencies = [
@@ -273,6 +282,7 @@ dependencies = [
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "bmc-proto",
  "camera-device-proto",
  "camera-proto",
  "config-proto",
@@ -305,6 +315,8 @@ dependencies = [
  "spool-proto",
  "storage-proto",
  "time-proto",
+ "tpm-proto",
+ "typec-proto",
  "wire",
 ]
 
@@ -384,6 +396,25 @@ dependencies = [
 
 [[package]]
 name = "time-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "tpm-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "typec-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",

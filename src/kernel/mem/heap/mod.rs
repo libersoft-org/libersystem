@@ -435,6 +435,42 @@ pub fn try_string(text: &str) -> Option<alloc::string::String> {
 	Some(unsafe { alloc::string::String::from_utf8_unchecked(out) })
 }
 
+// Collect an iterator FALLIBLY. `.collect()` reallocates as the vector grows and aborts on a short heap; this asks for
+// the room the iterator says it needs first, then grows with `try_reserve` - amortised, as `push` is.
+pub fn try_collect<T>(items: impl Iterator<Item = T>) -> Option<alloc::vec::Vec<T>> {
+	let mut out: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+	out.try_reserve(items.size_hint().0).ok()?;
+	for item in items {
+		out.try_reserve(1).ok()?;
+		out.push(item);
+	}
+	Some(out)
+}
+
+// Copy a slice onto the heap FALLIBLY. `to_vec` aborts.
+pub fn try_to_vec<T: Clone>(items: &[T]) -> Option<alloc::vec::Vec<T>> {
+	let mut out: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+	out.try_reserve_exact(items.len()).ok()?;
+	out.extend_from_slice(items);
+	Some(out)
+}
+
+// Format onto the heap FALLIBLY. `format!` aborts; this answers None when a piece does not fit.
+pub fn try_format(args: core::fmt::Arguments<'_>) -> Option<alloc::string::String> {
+	struct Fallible(alloc::vec::Vec<u8>);
+	impl core::fmt::Write for Fallible {
+		fn write_str(&mut self, text: &str) -> core::fmt::Result {
+			self.0.try_reserve(text.len()).map_err(|_| core::fmt::Error)?;
+			self.0.extend_from_slice(text.as_bytes());
+			Ok(())
+		}
+	}
+	let mut out = Fallible(alloc::vec::Vec::new());
+	core::fmt::write(&mut out, args).ok()?;
+	// SAFETY: every byte was written from a `&str`, so the whole is valid UTF-8.
+	Some(unsafe { alloc::string::String::from_utf8_unchecked(out.0) })
+}
+
 pub fn try_box<T>(value: T) -> Option<alloc::boxed::Box<T>> {
 	let mut room: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 	room.try_reserve_exact(1).ok()?;

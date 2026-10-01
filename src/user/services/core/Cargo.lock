@@ -450,6 +450,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "procpower"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 dependencies = [
@@ -623,6 +630,7 @@ dependencies = [
  "pix",
  "platform",
  "power-model",
+ "procpower",
  "proto",
  "rt",
  "service-logic",
@@ -631,6 +639,9 @@ dependencies = [
  "surface",
  "system-manifest",
  "term",
+ "tpm-client",
+ "tpm-client-provider",
+ "tpm-proto",
  "wasm",
  "wire",
 ]
@@ -771,6 +782,21 @@ name = "tpm"
 version = "0.0.0"
 dependencies = [
  "acpi",
+]
+
+[[package]]
+name = "tpm-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "tpm-proto",
+]
+
+[[package]]
+name = "tpm-client-provider"
+version = "0.0.0"
+dependencies = [
+ "tpm-proto",
 ]
 
 [[package]]

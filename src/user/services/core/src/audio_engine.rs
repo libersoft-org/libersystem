@@ -25,6 +25,9 @@ use proto::system::{ProviderInfo, ProviderKind, provider_catalogue};
 use rt::*;
 
 const PERIOD_FRAMES: usize = 512;
+// THE IDLE LATENCY THE DEVICE CAN TAKE while it plays or records: a tenth of one period (512 frames at 48 kHz, 10.7 ms),
+// so a core waking from the deepest state it may enter still answers the period's interrupt with the period to spare.
+const LATENCY_BOUND_US: u64 = 1_000;
 // The same number the wire states, and checked against it rather than restated: a service padding to
 // a different period than the driver negotiated sends a length no server has a shape for.
 const PERIOD_BYTES: usize = driver_protocol::audio::PERIOD_BYTES as usize;
@@ -182,6 +185,10 @@ struct Audio {
 	driver_refusals: u32,
 	capture_running: bool,
 	period: Vec<u8>,
+	// THE IDLE-LATENCY PRIVILEGE ServiceManager hands this service, and the request held while the device runs - every
+	// core's idle governor bounded by it, and released when the device stops or this instance ends.
+	latency_privilege: u64,
+	latency: u64,
 }
 
 // What a connection may ask for. `Full` is the service channel ServiceManager holds; the other two
@@ -204,7 +211,24 @@ struct Client {
 
 impl Audio {
 	fn new(snd: u64) -> Audio {
-		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, driver_refusals: 0, capture_running: false, period: alloc::vec![0; PERIOD_BYTES] }
+		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, driver_refusals: 0, capture_running: false, period: alloc::vec![0; PERIOD_BYTES], latency_privilege: 0, latency: 0 }
+	}
+
+	// THE LATENCY REQUEST, held exactly while the device plays or records. A request the kernel refuses - no privilege,
+	// or the system's sixty-four in use - is said once per start of the device and the sound plays regardless.
+	fn hold_latency(&mut self) {
+		let running = self.driver_running || self.capture_running;
+		if running && self.latency == 0 && self.latency_privilege != 0 {
+			let answer = unsafe { syscall(SYS_LATENCY_REQUEST, self.latency_privilege, LATENCY_BOUND_US, 0, 0) } as i64;
+			if answer > 0 {
+				self.latency = answer as u64;
+			} else {
+				print(b"AudioService: the kernel refused the idle-latency request - the device plays unbounded\n");
+			}
+		} else if !running && self.latency != 0 {
+			close(self.latency);
+			self.latency = 0;
+		}
 	}
 
 	fn has_audio(&self) -> bool {
@@ -697,6 +721,8 @@ pub fn run(bootstrap: u64) -> ! {
 	//
 	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
 	let catalogue: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"CATALOGUE").unwrap_or(0);
+	// THE IDLE-LATENCY PRIVILEGE, after the catalogue: a playing device is held to a bound no core's idle state exceeds.
+	let latency_privilege: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"LATENCY").unwrap_or(0);
 	send_blocking(bootstrap, b"AudioService: online", 0);
 	// The subscription is opened BEFORE anything is served, so the snapshot and the stream are
 	// one operation - a provider published between the two would otherwise be lost, which is the
@@ -708,7 +734,9 @@ pub fn run(bootstrap: u64) -> ! {
 		// built to report rather than to die of.
 		print(b"AudioService: no provider subscription - this instance serves no device\n");
 	}
-	serve(root, admin, catalogue, providers, Audio::new(0));
+	let mut audio = Audio::new(0);
+	audio.latency_privilege = latency_privilege;
+	serve(root, admin, catalogue, providers, audio);
 }
 
 // OPEN A CONNECTION TO ONE PUBLISHED PROVIDER, or answer zero.
@@ -754,6 +782,7 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 			state.pump();
 			state.stop_capture();
 		}
+		state.hold_latency();
 
 		// An idle driver's channel can close too. Observe that before a replacement publication
 		// is consumed, or the stale handle makes us discard the provider we could reconnect to.

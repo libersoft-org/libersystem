@@ -858,6 +858,21 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 					if role.tag == b"SLEEP" {
 						return Some((role.tag.to_vec(), super::sleep::mint()?));
 					}
+					// AND THE BUTTONS' CONNECTIONS, MINTED AHEAD into a channel of their own - see the manifest's row: a
+					// button bound during the bring-up takes one rather than asking this supervisor, which is busy with
+					// DeviceManager then.
+					if role.tag == b"SLEEPPOOL" {
+						let (near, far): (u64, u64) = channel()?;
+						for _ in 0..super::sleep::BUTTON_POOL {
+							let Some(minted) = super::sleep::mint() else { break };
+							if !try_send(near, &[], minted) {
+								close(minted);
+								break;
+							}
+						}
+						close(near);
+						return Some((role.tag.to_vec(), far));
+					}
 					// THE CLOCK SOURCE'S PRIVILEGE, duplicated from the copy kept: DeviceManager hands it to a Time and
 					// Alarm Device's driver at bind. None kept, the tag goes carrying nothing.
 					if role.tag == b"CLOCKSRC" {

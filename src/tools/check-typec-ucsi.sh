@@ -398,7 +398,8 @@ probe await 1 contract 9000
 ended=$(seen "ServiceManager: sleep: the transaction ended")
 ./dev.sh launch --timeout 120 sleepctl suspend idle 5 >"$state/sleepctl-idle.log" 2>&1 || true
 await_line "ServiceManager: sleep: the transaction ended" "the suspend to idle never ended" "$ended" 120
-grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "sleep: the suspend to idle did not sleep and wake"
+ended="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 || true)"
+grep -q "slept and woke" <<<"$ended" || fail "sleep: the suspend to idle did not sleep and wake"
 sleep 2
 ppm_across "suspend to idle"
 ended=$(seen "ServiceManager: sleep: the transaction ended")
@@ -410,7 +411,8 @@ sleep 2
 qmp system_wakeup >/dev/null
 await_state running 30
 await_line "ServiceManager: sleep: the transaction ended" "the S3 cycle never ended" "$ended" 180
-grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "sleep: the S3 cycle did not sleep and wake"
+ended="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 || true)"
+grep -q "slept and woke" <<<"$ended" || fail "sleep: the S3 cycle did not sleep and wake"
 sleep 2
 ppm_across "S3"
 probe await 1 detached

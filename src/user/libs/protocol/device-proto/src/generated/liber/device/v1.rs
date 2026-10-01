@@ -1480,6 +1480,13 @@ pub enum ProviderKind {
 	/// A PLATFORM SWITCH - a lid - the `platform-switch` contract below: its state and every change after it, which the
 	/// power-state service alone consumes for its sleep policy.
 	PlatformSwitch = 28,
+	/// A THERMAL ZONE'S COOLING HALF - `liber:power@1`'s `thermal-zone` contract: what the zone asks of its cooling, its
+	/// temperature and a sampling period - which ProcessorPowerService alone consumes. The zone's STATE stays a
+	/// `power-source` for PowerService's readers.
+	ThermalZone = 29,
+	/// A FAN - `liber:power@1`'s `cooling-device` contract: its levels and the level it runs at - which
+	/// ProcessorPowerService alone consumes and commands.
+	CoolingDevice = 30,
 }
 
 impl ProviderKind {
@@ -1550,6 +1557,8 @@ impl ProviderKind {
 			26 => Some(ProviderKind::Ipmi),
 			27 => Some(ProviderKind::TypecConnector),
 			28 => Some(ProviderKind::PlatformSwitch),
+			29 => Some(ProviderKind::ThermalZone),
+			30 => Some(ProviderKind::CoolingDevice),
 			_ => None,
 		}
 	}
@@ -5540,6 +5549,7 @@ pub mod acpi_node {
 	pub const OP_NOTIFICATIONS: u16 = 5;
 	pub const OP_SET_POWER_STATE: u16 = 6;
 	pub const OP_SLEEP_POWER_STATE: u16 = 7;
+	pub const OP_HAS: u16 = 8;
 
 	pub trait Service {
 		/// The node this connection is scoped to: its identity, `acpi:` and the absolute path.
@@ -5563,6 +5573,9 @@ pub mod acpi_node {
 		/// device is to wake the machine from it, from the node's `_SxD` and `_SxW` (`_S0W` alone for suspend to idle): the
 		/// deepest it may enter, and where it wakes, the deepest it still wakes from. Encoded as `set-power-state` takes it.
 		fn sleep_power_state(&mut self, target: u8, wake: bool) -> Result<u8, Error>;
+		/// WHETHER THE NODE HAS AN OBJECT by this name - admitted as `evaluate` admits it - with nothing evaluated: a method
+		/// whose call changes the platform (`_SCP`) is asked about before it is called.
+		fn has(&mut self, name: String) -> Result<bool, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -5857,6 +5870,46 @@ pub mod acpi_node {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_HAS => {
+				let name = {
+					let v100 = r.string_lp()?;
+					(v100.len() <= 4).then_some(v100)?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.has(name);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v101) => {
+							w.u8(1)?;
+							w.boolean(*v101)?;
+						}
+						Err(v102) => {
+							w.u8(0)?;
+							v102.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -6021,8 +6074,8 @@ pub mod acpi_node {
 				return None;
 			}
 			w.u16(arguments.len() as u16)?;
-			for v100 in arguments.iter() {
-				w.u8(*v100)?;
+			for v103 in arguments.iter() {
+				w.u8(*v103)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -6042,13 +6095,13 @@ pub mod acpi_node {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v101 = r.u16()? as usize;
-						let mut v102 = Vec::new();
-						v102.try_reserve_exact(v101).ok()?;
-						for _ in 0..v101 {
-							v102.push(r.u8()?);
+						let v104 = r.u16()? as usize;
+						let mut v105 = Vec::new();
+						v105.try_reserve_exact(v104).ok()?;
+						for _ in 0..v104 {
+							v105.push(r.u8()?);
 						}
-						v102
+						v105
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -6086,13 +6139,13 @@ pub mod acpi_node {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v103 = r.u16()? as usize;
-						let mut v104 = Vec::new();
-						v104.try_reserve_exact(v103).ok()?;
-						for _ in 0..v103 {
-							v104.push(r.u8()?);
+						let v106 = r.u16()? as usize;
+						let mut v107 = Vec::new();
+						v107.try_reserve_exact(v106).ok()?;
+						for _ in 0..v106 {
+							v107.push(r.u8()?);
 						}
-						v104
+						v107
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -6116,8 +6169,8 @@ pub mod acpi_node {
 				return None;
 			}
 			w.u16(uuid.len() as u16)?;
-			for v105 in uuid.iter() {
-				w.u8(*v105)?;
+			for v108 in uuid.iter() {
+				w.u8(*v108)?;
 			}
 			w.u64(*revision)?;
 			w.u64(*function)?;
@@ -6125,8 +6178,8 @@ pub mod acpi_node {
 				return None;
 			}
 			w.u16(arguments.len() as u16)?;
-			for v106 in arguments.iter() {
-				w.u8(*v106)?;
+			for v109 in arguments.iter() {
+				w.u8(*v109)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -6146,13 +6199,13 @@ pub mod acpi_node {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v107 = r.u16()? as usize;
-						let mut v108 = Vec::new();
-						v108.try_reserve_exact(v107).ok()?;
-						for _ in 0..v107 {
-							v108.push(r.u8()?);
+						let v110 = r.u16()? as usize;
+						let mut v111 = Vec::new();
+						v111.try_reserve_exact(v110).ok()?;
+						for _ in 0..v110 {
+							v111.push(r.u8()?);
 						}
-						v108
+						v111
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -6258,6 +6311,39 @@ pub mod acpi_node {
 			}
 			decoded
 		}
+		pub fn has(&mut self, name: &str) -> Option<Result<bool, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_HAS)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.boolean()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -6314,6 +6400,1198 @@ pub mod acpi_node {
 	fn channel_invoke_sleep_power_state(chan: u64, target: &u8, wake: &bool) -> Option<Result<u8, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.sleep_power_state(target, wake)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_acpi_node_has")]
+	fn channel_invoke_has(chan: u64, name: &str) -> Option<Result<bool, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.has(name)
+	}
+}
+
+/// A REGISTER a processor object names, as ACPI's Generic Address Structure gives it: the space (0 memory, 1 I/O, 0x0A
+/// the platform channel, 0x7F functional fixed hardware), the width in bits and the address.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorRegister {
+	pub space: u8,
+	pub bits: u8,
+	pub address: u64,
+}
+
+impl ProcessorRegister {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorRegister> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorRegister::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorRegister> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorRegister::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.space)?;
+		w.u8(self.bits)?;
+		w.u64(self.address)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorRegister> {
+		let space = r.u8()?;
+		let bits = r.u8()?;
+		let address = r.u64()?;
+		Some(ProcessorRegister { space, bits, address })
+	}
+}
+
+/// ONE IDLE STATE from `_CST` or `_LPI`: entered by a halt (0), by MWAIT with `hint` (1, a fixed-hardware entry) or by a
+/// read of `register` (2); its exit latency and its target residency (`_CST`'s latency counted for both where it states
+/// no residency); and the costs `flags` names - 1 the core's context is lost, 2 its timer stops, 4 bus-master
+/// arbitration is wanted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorIdleState {
+	pub entry: u8,
+	pub hint: u32,
+	pub register: ProcessorRegister,
+	pub latency_us: u32,
+	pub residency_us: u32,
+	pub power_mw: u32,
+	pub flags: u32,
+}
+
+impl ProcessorIdleState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorIdleState> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorIdleState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorIdleState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorIdleState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.entry)?;
+		w.u32(self.hint)?;
+		self.register.write(w)?;
+		w.u32(self.latency_us)?;
+		w.u32(self.residency_us)?;
+		w.u32(self.power_mw)?;
+		w.u32(self.flags)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorIdleState> {
+		let entry = r.u8()?;
+		let hint = r.u32()?;
+		let register = ProcessorRegister::read(r)?;
+		let latency_us = r.u32()?;
+		let residency_us = r.u32()?;
+		let power_mw = r.u32()?;
+		let flags = r.u32()?;
+		Some(ProcessorIdleState { entry, hint, register, latency_us, residency_us, power_mw, flags })
+	}
+}
+
+/// ONE `_PSS` STATE.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorPerformanceState {
+	pub core_mhz: u32,
+	pub power_mw: u32,
+	pub latency_us: u32,
+	pub control: u32,
+	pub status: u32,
+}
+
+impl ProcessorPerformanceState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorPerformanceState> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorPerformanceState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorPerformanceState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorPerformanceState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.core_mhz)?;
+		w.u32(self.power_mw)?;
+		w.u32(self.latency_us)?;
+		w.u32(self.control)?;
+		w.u32(self.status)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorPerformanceState> {
+		let core_mhz = r.u32()?;
+		let power_mw = r.u32()?;
+		let latency_us = r.u32()?;
+		let control = r.u32()?;
+		let status = r.u32()?;
+		Some(ProcessorPerformanceState { core_mhz, power_mw, latency_us, control, status })
+	}
+}
+
+/// ONE `_TSS` STATE: the share of full speed in percent, and the value `_PTC`'s control register takes for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorThrottlingState {
+	pub percent: u32,
+	pub power_mw: u32,
+	pub latency_us: u32,
+	pub control: u32,
+}
+
+impl ProcessorThrottlingState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorThrottlingState> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorThrottlingState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorThrottlingState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorThrottlingState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.percent)?;
+		w.u32(self.power_mw)?;
+		w.u32(self.latency_us)?;
+		w.u32(self.control)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorThrottlingState> {
+		let percent = r.u32()?;
+		let power_mw = r.u32()?;
+		let latency_us = r.u32()?;
+		let control = r.u32()?;
+		Some(ProcessorThrottlingState { percent, power_mw, latency_us, control })
+	}
+}
+
+/// `_PSD` or `_TSD`: the domain a processor is coordinated in - 0xFC software-all, 0xFD software-any, 0xFE hardware-all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorDomain {
+	pub domain: u32,
+	pub coordination: u32,
+	pub processors: u32,
+}
+
+impl ProcessorDomain {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorDomain> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorDomain::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorDomain> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorDomain::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.domain)?;
+		w.u32(self.coordination)?;
+		w.u32(self.processors)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorDomain> {
+		let domain = r.u32()?;
+		let coordination = r.u32()?;
+		let processors = r.u32()?;
+		Some(ProcessorDomain { domain, coordination, processors })
+	}
+}
+
+/// CPPC's levels and registers, from `_CPC`: the energy-performance preference register where it has one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorCppc {
+	pub highest: u32,
+	pub nominal: u32,
+	pub lowest: u32,
+	pub desired: ProcessorRegister,
+	pub minimum: Option<ProcessorRegister>,
+	pub maximum: Option<ProcessorRegister>,
+	pub preference: Option<ProcessorRegister>,
+}
+
+impl ProcessorCppc {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorCppc> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorCppc::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorCppc> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorCppc::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.highest)?;
+		w.u32(self.nominal)?;
+		w.u32(self.lowest)?;
+		self.desired.write(w)?;
+		match &self.minimum {
+			Some(v112) => {
+				w.u8(1)?;
+				v112.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.maximum {
+			Some(v113) => {
+				w.u8(1)?;
+				v113.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.preference {
+			Some(v114) => {
+				w.u8(1)?;
+				v114.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorCppc> {
+		let highest = r.u32()?;
+		let nominal = r.u32()?;
+		let lowest = r.u32()?;
+		let desired = ProcessorRegister::read(r)?;
+		let minimum = if r.tag()? { Some(ProcessorRegister::read(r)?) } else { None };
+		let maximum = if r.tag()? { Some(ProcessorRegister::read(r)?) } else { None };
+		let preference = if r.tag()? { Some(ProcessorRegister::read(r)?) } else { None };
+		Some(ProcessorCppc { highest, nominal, lowest, desired, minimum, maximum, preference })
+	}
+}
+
+/// WHICH PROCESSOR: its namespace path, its UID - a `Processor` object's processor ID, a processor device's `_UID` - and
+/// the kernel's core it is: the UID matched against the MADT's, and the APIC ID that entry gives against each core's.
+/// `0xFFFFFFFF` for a UID that names no number, and for a processor no running core is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorId {
+	pub path: String,
+	pub uid: u32,
+	pub cpu: u32,
+}
+
+impl ProcessorId {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorId> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorId::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorId> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorId::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.path.as_bytes())?;
+		w.u32(self.uid)?;
+		w.u32(self.cpu)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorId> {
+		let path = {
+			let v115 = r.string_lp()?;
+			(v115.len() <= 64).then_some(v115)?
+		};
+		let uid = r.u32()?;
+		let cpu = r.u32()?;
+		Some(ProcessorId { path, uid, cpu })
+	}
+}
+
+/// A PROCESSOR'S POWER, as its objects read now: its idle states (`_LPI` where it has one, `_CST` otherwise), its
+/// performance states with `_PCT`'s registers, `_PPC`'s limit and `_PSD`'s domain, or CPPC; its throttling states with
+/// `_PTC`'s register, `_TPC`'s limit and `_TSD`'s domain; and each object that could not be read, by name and why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorPower {
+	pub id: ProcessorId,
+	pub idle: Vec<ProcessorIdleState>,
+	pub performance: Vec<ProcessorPerformanceState>,
+	pub pct_control: Option<ProcessorRegister>,
+	pub pct_status: Option<ProcessorRegister>,
+	pub ppc: u32,
+	pub psd: Option<ProcessorDomain>,
+	pub cppc: Option<ProcessorCppc>,
+	pub throttling: Vec<ProcessorThrottlingState>,
+	pub ptc_control: Option<ProcessorRegister>,
+	pub tpc: u32,
+	pub tsd: Option<ProcessorDomain>,
+	pub refused: Vec<String>,
+}
+
+impl ProcessorPower {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorPower> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorPower::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorPower> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorPower::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.id.write(w)?;
+		if self.idle.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.idle.len() as u16)?;
+		for v116 in self.idle.iter() {
+			v116.write(w)?;
+		}
+		if self.performance.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.performance.len() as u16)?;
+		for v117 in self.performance.iter() {
+			v117.write(w)?;
+		}
+		match &self.pct_control {
+			Some(v118) => {
+				w.u8(1)?;
+				v118.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.pct_status {
+			Some(v119) => {
+				w.u8(1)?;
+				v119.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.u32(self.ppc)?;
+		match &self.psd {
+			Some(v120) => {
+				w.u8(1)?;
+				v120.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.cppc {
+			Some(v121) => {
+				w.u8(1)?;
+				v121.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		if self.throttling.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.throttling.len() as u16)?;
+		for v122 in self.throttling.iter() {
+			v122.write(w)?;
+		}
+		match &self.ptc_control {
+			Some(v123) => {
+				w.u8(1)?;
+				v123.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.u32(self.tpc)?;
+		match &self.tsd {
+			Some(v124) => {
+				w.u8(1)?;
+				v124.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		if self.refused.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.refused.len() as u16)?;
+		for v125 in self.refused.iter() {
+			w.bytes_lp(v125.as_bytes())?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorPower> {
+		let id = ProcessorId::read(r)?;
+		let idle = {
+			let v126 = r.u16()? as usize;
+			let v126 = (v126 <= 8).then_some(v126)?;
+			let mut v127 = Vec::new();
+			v127.try_reserve_exact(v126).ok()?;
+			for _ in 0..v126 {
+				v127.push(ProcessorIdleState::read(r)?);
+			}
+			v127
+		};
+		let performance = {
+			let v128 = r.u16()? as usize;
+			let v128 = (v128 <= 32).then_some(v128)?;
+			let mut v129 = Vec::new();
+			v129.try_reserve_exact(v128).ok()?;
+			for _ in 0..v128 {
+				v129.push(ProcessorPerformanceState::read(r)?);
+			}
+			v129
+		};
+		let pct_control = if r.tag()? { Some(ProcessorRegister::read(r)?) } else { None };
+		let pct_status = if r.tag()? { Some(ProcessorRegister::read(r)?) } else { None };
+		let ppc = r.u32()?;
+		let psd = if r.tag()? { Some(ProcessorDomain::read(r)?) } else { None };
+		let cppc = if r.tag()? { Some(ProcessorCppc::read(r)?) } else { None };
+		let throttling = {
+			let v130 = r.u16()? as usize;
+			let v130 = (v130 <= 32).then_some(v130)?;
+			let mut v131 = Vec::new();
+			v131.try_reserve_exact(v130).ok()?;
+			for _ in 0..v130 {
+				v131.push(ProcessorThrottlingState::read(r)?);
+			}
+			v131
+		};
+		let ptc_control = if r.tag()? { Some(ProcessorRegister::read(r)?) } else { None };
+		let tpc = r.u32()?;
+		let tsd = if r.tag()? { Some(ProcessorDomain::read(r)?) } else { None };
+		let refused = {
+			let v132 = r.u16()? as usize;
+			let v132 = (v132 <= 8).then_some(v132)?;
+			let mut v133 = Vec::new();
+			v133.try_reserve_exact(v132).ok()?;
+			for _ in 0..v132 {
+				v133.push(r.string_lp()?);
+			}
+			v133
+		};
+		Some(ProcessorPower { id, idle, performance, pct_control, pct_status, ppc, psd, cppc, throttling, ptc_control, tpc, tsd, refused })
+	}
+}
+
+/// A processor's `Notify`: 0x80 its performance limit changed (`_PPC`), 0x81 its idle states (`_CST`, `_LPI`), 0x82 its
+/// throttling limit (`_TPC`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorNotification {
+	pub path: String,
+	pub value: u32,
+	pub sequence: u32,
+}
+
+impl ProcessorNotification {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorNotification> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorNotification::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorNotification> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorNotification::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.path.as_bytes())?;
+		w.u32(self.value)?;
+		w.u32(self.sequence)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorNotification> {
+		let path = {
+			let v134 = r.string_lp()?;
+			(v134.len() <= 64).then_some(v134)?
+		};
+		let value = r.u32()?;
+		let sequence = r.u32()?;
+		Some(ProcessorNotification { path, value, sequence })
+	}
+}
+
+/// THE PROCESSORS' POWER, as the ACPI service reads it - served on a manifest client role to ProcessorPowerService
+/// alone, which decides what the kernel is to install. The processor handshake (`_OSC`, or `_PDC`) told the firmware
+/// the forms the kernel executes, so the tables read here are ones it can take.
+// interface `processor-firmware` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod processor_firmware {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_PROCESSORS: u16 = 1;
+	pub const OP_POWER: u16 = 2;
+	pub const OP_NOTIFICATIONS: u16 = 3;
+	pub const OP_OST: u16 = 4;
+
+	pub trait Service {
+		/// Every processor of the namespace.
+		fn processors(&mut self) -> Result<Vec<ProcessorId>, Error>;
+		/// One processor's objects, evaluated now - after a `Notify`, again.
+		fn power(&mut self, path: String) -> Result<ProcessorPower, Error>;
+		/// Every processor's `Notify` 0x80, 0x81 and 0x82, as the firmware raises them.
+		fn notifications(&mut self) -> Vec<ProcessorNotification>;
+		/// `_OST`: the notification `event` handled with `status` (0 success). `not-found` for a processor without one.
+		fn ost(&mut self, path: String, event: u32, status: u32) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:device")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_PROCESSORS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.processors();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v135) => {
+							w.u8(1)?;
+							if v135.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v135.len() as u16)?;
+							for v137 in v135.iter() {
+								v137.write(w)?;
+							}
+						}
+						Err(v136) => {
+							w.u8(0)?;
+							v136.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_POWER => {
+				let path = {
+					let v138 = r.string_lp()?;
+					(v138.len() <= 64).then_some(v138)?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.power(path);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v139) => {
+							w.u8(1)?;
+							v139.write(w)?;
+						}
+						Err(v140) => {
+							w.u8(0)?;
+							v140.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OST => {
+				let path = {
+					let v141 = r.string_lp()?;
+					(v141.len() <= 64).then_some(v141)?
+				};
+				let event = r.u32()?;
+				let status = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.ost(path, event, status);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v142) => {
+							w.u8(1)?;
+						}
+						Err(v143) => {
+							w.u8(0)?;
+							v143.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn notifications_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<ProcessorNotification>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.notifications();
+		Some((corr, items))
+	}
+	pub fn notifications_frame(seq: u32, item: &ProcessorNotification, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn notifications_read(msg: &[u8], frame_handles: &mut Handles) -> Option<ProcessorNotification> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = ProcessorNotification::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn processors(&mut self) -> Option<Result<Vec<ProcessorId>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_PROCESSORS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v144 = r.u16()? as usize;
+						let mut v145 = Vec::new();
+						v145.try_reserve_exact(v144).ok()?;
+						for _ in 0..v144 {
+							v145.push(ProcessorId::read(r)?);
+						}
+						v145
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn power(&mut self, path: &str) -> Option<Result<ProcessorPower, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_POWER)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(ProcessorPower::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn notifications(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_NOTIFICATIONS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+		pub fn ost(&mut self, path: &str, event: &u32, status: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OST)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			w.u32(*event)?;
+			w.u32(*status)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_processor_firmware_processors")]
+	fn channel_invoke_processors(chan: u64) -> Option<Result<Vec<ProcessorId>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.processors()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_processor_firmware_power")]
+	fn channel_invoke_power(chan: u64, path: &str) -> Option<Result<ProcessorPower, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.power(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_processor_firmware_notifications")]
+	fn channel_invoke_notifications(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.notifications()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_processor_firmware_ost")]
+	fn channel_invoke_ost(chan: u64, path: &str, event: &u32, status: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.ost(path, event, status)
 	}
 }
 
@@ -6420,8 +7698,8 @@ pub mod acpi_admin {
 		match op {
 			OP_OPEN_NODE => {
 				let identity = {
-					let v109 = r.string_lp()?;
-					(v109.len() <= 64).then_some(v109)?
+					let v146 = r.string_lp()?;
+					(v146.len() <= 64).then_some(v146)?
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -6430,14 +7708,14 @@ pub mod acpi_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v110) => {
+						Ok(v147) => {
 							w.u8(1)?;
-							w.set_handle(*v110)?;
+							w.set_handle(*v147)?;
 							w.u32(0)?;
 						}
-						Err(v111) => {
+						Err(v148) => {
 							w.u8(0)?;
-							v111.write(w)?;
+							v148.write(w)?;
 						}
 					}
 					Some(())
@@ -6461,8 +7739,8 @@ pub mod acpi_admin {
 			}
 			OP_CONNECTION => {
 				let controller = {
-					let v112 = r.string_lp()?;
-					(v112.len() <= 64).then_some(v112)?
+					let v149 = r.string_lp()?;
+					(v149.len() <= 64).then_some(v149)?
 				};
 				let kind = AcpiConnectionKind::read(r)?;
 				let value = r.u32()?;
@@ -6477,12 +7755,12 @@ pub mod acpi_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v113) => {
+						Ok(v150) => {
 							w.u8(1)?;
 						}
-						Err(v114) => {
+						Err(v151) => {
 							w.u8(0)?;
-							v114.write(w)?;
+							v151.write(w)?;
 						}
 					}
 					Some(())
@@ -6786,25 +8064,25 @@ impl DeviceEntry {
 		out.push(',');
 		out.push_str("\"ids\":");
 		out.push('[');
-		let mut v116 = true;
-		for v115 in self.ids.iter() {
-			if !v116 {
+		let mut v153 = true;
+		for v152 in self.ids.iter() {
+			if !v153 {
 				out.push(',');
 			}
-			v116 = false;
-			v115.to_json_into(out);
+			v153 = false;
+			v152.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"resources\":");
 		out.push('[');
-		let mut v118 = true;
-		for v117 in self.resources.iter() {
-			if !v118 {
+		let mut v155 = true;
+		for v154 in self.resources.iter() {
+			if !v155 {
 				out.push(',');
 			}
-			v118 = false;
-			v117.to_json_into(out);
+			v155 = false;
+			v154.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -6863,25 +8141,25 @@ impl DeviceEntry {
 		out.push_str(", ");
 		out.push_str("ids=");
 		out.push('[');
-		let mut v120 = true;
-		for v119 in self.ids.iter() {
-			if !v120 {
+		let mut v157 = true;
+		for v156 in self.ids.iter() {
+			if !v157 {
 				out.push_str(", ");
 			}
-			v120 = false;
-			v119.to_text_into(out);
+			v157 = false;
+			v156.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("resources=");
 		out.push('[');
-		let mut v122 = true;
-		for v121 in self.resources.iter() {
-			if !v122 {
+		let mut v159 = true;
+		for v158 in self.resources.iter() {
+			if !v159 {
 				out.push_str(", ");
 			}
-			v122 = false;
-			v121.to_text_into(out);
+			v159 = false;
+			v158.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -6925,13 +8203,13 @@ impl DeviceEntry {
 		crate::codec::cbor::text(out, &self.identity);
 		crate::codec::cbor::text(out, "ids");
 		crate::codec::cbor::array(out, self.ids.len());
-		for v123 in self.ids.iter() {
-			v123.to_cbor_into(out);
+		for v160 in self.ids.iter() {
+			v160.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::array(out, self.resources.len());
-		for v124 in self.resources.iter() {
-			v124.to_cbor_into(out);
+		for v161 in self.resources.iter() {
+			v161.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "unresolved");
 		crate::codec::cbor::boolean(out, self.unresolved);
@@ -7495,8 +8773,8 @@ impl BindingRecord {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v125) => {
-				let _ = write!(out, "{}", v125);
+			Some(v162) => {
+				let _ = write!(out, "{}", v162);
 			}
 			None => {
 				out.push_str("null");
@@ -7544,8 +8822,8 @@ impl BindingRecord {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v126) => {
-				let _ = write!(out, "{}", v126);
+			Some(v163) => {
+				let _ = write!(out, "{}", v163);
 			}
 			None => {
 				out.push('-');
@@ -7581,8 +8859,8 @@ impl BindingRecord {
 		crate::codec::cbor::uint(out, self.resources as u64);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v127) => {
-				crate::codec::cbor::uint(out, *v127 as u64);
+			Some(v164) => {
+				crate::codec::cbor::uint(out, *v164 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7637,6 +8915,8 @@ impl ProviderKind {
 			ProviderKind::Ipmi => out.push_str("\"ipmi\""),
 			ProviderKind::TypecConnector => out.push_str("\"typec-connector\""),
 			ProviderKind::PlatformSwitch => out.push_str("\"platform-switch\""),
+			ProviderKind::ThermalZone => out.push_str("\"thermal-zone\""),
+			ProviderKind::CoolingDevice => out.push_str("\"cooling-device\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -7669,6 +8949,8 @@ impl ProviderKind {
 			ProviderKind::Ipmi => out.push_str("ipmi"),
 			ProviderKind::TypecConnector => out.push_str("typec-connector"),
 			ProviderKind::PlatformSwitch => out.push_str("platform-switch"),
+			ProviderKind::ThermalZone => out.push_str("thermal-zone"),
+			ProviderKind::CoolingDevice => out.push_str("cooling-device"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -7701,6 +8983,8 @@ impl ProviderKind {
 			ProviderKind::Ipmi => crate::codec::cbor::text(out, "ipmi"),
 			ProviderKind::TypecConnector => crate::codec::cbor::text(out, "typec-connector"),
 			ProviderKind::PlatformSwitch => crate::codec::cbor::text(out, "platform-switch"),
+			ProviderKind::ThermalZone => crate::codec::cbor::text(out, "thermal-zone"),
+			ProviderKind::CoolingDevice => crate::codec::cbor::text(out, "cooling-device"),
 		}
 	}
 }
@@ -7756,8 +9040,8 @@ impl ProviderInfo {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v128) => {
-				let _ = write!(out, "{}", v128);
+			Some(v165) => {
+				let _ = write!(out, "{}", v165);
 			}
 			None => {
 				out.push_str("null");
@@ -7800,8 +9084,8 @@ impl ProviderInfo {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v129) => {
-				let _ = write!(out, "{}", v129);
+			Some(v166) => {
+				let _ = write!(out, "{}", v166);
 			}
 			None => {
 				out.push('-');
@@ -7831,8 +9115,8 @@ impl ProviderInfo {
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v130) => {
-				crate::codec::cbor::uint(out, *v130 as u64);
+			Some(v167) => {
+				crate::codec::cbor::uint(out, *v167 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8010,8 +9294,8 @@ impl IncidentReport {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v131) => {
-				let _ = write!(out, "{}", v131);
+			Some(v168) => {
+				let _ = write!(out, "{}", v168);
 			}
 			None => {
 				out.push_str("null");
@@ -8079,8 +9363,8 @@ impl IncidentReport {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v132) => {
-				let _ = write!(out, "{}", v132);
+			Some(v169) => {
+				let _ = write!(out, "{}", v169);
 			}
 			None => {
 				out.push('-');
@@ -8124,8 +9408,8 @@ impl IncidentReport {
 		crate::codec::cbor::uint(out, self.dma_used as u64);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v133) => {
-				crate::codec::cbor::uint(out, *v133 as u64);
+			Some(v170) => {
+				crate::codec::cbor::uint(out, *v170 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8317,13 +9601,13 @@ impl HciPacket {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v135 = true;
-		for v134 in self.bytes.iter() {
-			if !v135 {
+		let mut v172 = true;
+		for v171 in self.bytes.iter() {
+			if !v172 {
 				out.push(',');
 			}
-			v135 = false;
-			let _ = write!(out, "{}", v134);
+			v172 = false;
+			let _ = write!(out, "{}", v171);
 		}
 		out.push(']');
 		out.push('}');
@@ -8338,13 +9622,13 @@ impl HciPacket {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v137 = true;
-		for v136 in self.bytes.iter() {
-			if !v137 {
+		let mut v174 = true;
+		for v173 in self.bytes.iter() {
+			if !v174 {
 				out.push_str(", ");
 			}
-			v137 = false;
-			let _ = write!(out, "{}", v136);
+			v174 = false;
+			let _ = write!(out, "{}", v173);
 		}
 		out.push(']');
 		out.push('}');
@@ -8357,8 +9641,8 @@ impl HciPacket {
 		crate::codec::cbor::uint(out, self.epoch as u64);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v138 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v138 as u64);
+		for v175 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v175 as u64);
 		}
 	}
 }
@@ -8508,13 +9792,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v140 = true;
-		for v139 in self.bytes.iter() {
-			if !v140 {
+		let mut v177 = true;
+		for v176 in self.bytes.iter() {
+			if !v177 {
 				out.push(',');
 			}
-			v140 = false;
-			let _ = write!(out, "{}", v139);
+			v177 = false;
+			let _ = write!(out, "{}", v176);
 		}
 		out.push(']');
 		out.push('}');
@@ -8523,13 +9807,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v142 = true;
-		for v141 in self.bytes.iter() {
-			if !v142 {
+		let mut v179 = true;
+		for v178 in self.bytes.iter() {
+			if !v179 {
 				out.push_str(", ");
 			}
-			v142 = false;
-			let _ = write!(out, "{}", v141);
+			v179 = false;
+			let _ = write!(out, "{}", v178);
 		}
 		out.push(']');
 		out.push('}');
@@ -8538,8 +9822,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v143 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v143 as u64);
+		for v180 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v180 as u64);
 		}
 	}
 }
@@ -8902,6 +10186,906 @@ impl AcpiNotification {
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "value");
+		crate::codec::cbor::uint(out, self.value as u64);
+		crate::codec::cbor::text(out, "sequence");
+		crate::codec::cbor::uint(out, self.sequence as u64);
+	}
+}
+
+impl ProcessorRegister {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"space\":");
+		let _ = write!(out, "{}", self.space);
+		out.push(',');
+		out.push_str("\"bits\":");
+		let _ = write!(out, "{}", self.bits);
+		out.push(',');
+		out.push_str("\"address\":");
+		let _ = write!(out, "{}", self.address);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("space=");
+		let _ = write!(out, "{}", self.space);
+		out.push_str(", ");
+		out.push_str("bits=");
+		let _ = write!(out, "{}", self.bits);
+		out.push_str(", ");
+		out.push_str("address=");
+		let _ = write!(out, "{}", self.address);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "space");
+		crate::codec::cbor::uint(out, self.space as u64);
+		crate::codec::cbor::text(out, "bits");
+		crate::codec::cbor::uint(out, self.bits as u64);
+		crate::codec::cbor::text(out, "address");
+		crate::codec::cbor::uint(out, self.address as u64);
+	}
+}
+
+impl ProcessorIdleState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"entry\":");
+		let _ = write!(out, "{}", self.entry);
+		out.push(',');
+		out.push_str("\"hint\":");
+		let _ = write!(out, "{}", self.hint);
+		out.push(',');
+		out.push_str("\"register\":");
+		self.register.to_json_into(out);
+		out.push(',');
+		out.push_str("\"latency-us\":");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push(',');
+		out.push_str("\"residency-us\":");
+		let _ = write!(out, "{}", self.residency_us);
+		out.push(',');
+		out.push_str("\"power-mw\":");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push(',');
+		out.push_str("\"flags\":");
+		let _ = write!(out, "{}", self.flags);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("entry=");
+		let _ = write!(out, "{}", self.entry);
+		out.push_str(", ");
+		out.push_str("hint=");
+		let _ = write!(out, "{}", self.hint);
+		out.push_str(", ");
+		out.push_str("register=");
+		self.register.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("latency-us=");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push_str(", ");
+		out.push_str("residency-us=");
+		let _ = write!(out, "{}", self.residency_us);
+		out.push_str(", ");
+		out.push_str("power-mw=");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push_str(", ");
+		out.push_str("flags=");
+		let _ = write!(out, "{}", self.flags);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::text(out, "entry");
+		crate::codec::cbor::uint(out, self.entry as u64);
+		crate::codec::cbor::text(out, "hint");
+		crate::codec::cbor::uint(out, self.hint as u64);
+		crate::codec::cbor::text(out, "register");
+		self.register.to_cbor_into(out);
+		crate::codec::cbor::text(out, "latency-us");
+		crate::codec::cbor::uint(out, self.latency_us as u64);
+		crate::codec::cbor::text(out, "residency-us");
+		crate::codec::cbor::uint(out, self.residency_us as u64);
+		crate::codec::cbor::text(out, "power-mw");
+		crate::codec::cbor::uint(out, self.power_mw as u64);
+		crate::codec::cbor::text(out, "flags");
+		crate::codec::cbor::uint(out, self.flags as u64);
+	}
+}
+
+impl ProcessorPerformanceState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"core-mhz\":");
+		let _ = write!(out, "{}", self.core_mhz);
+		out.push(',');
+		out.push_str("\"power-mw\":");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push(',');
+		out.push_str("\"latency-us\":");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push(',');
+		out.push_str("\"control\":");
+		let _ = write!(out, "{}", self.control);
+		out.push(',');
+		out.push_str("\"status\":");
+		let _ = write!(out, "{}", self.status);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("core-mhz=");
+		let _ = write!(out, "{}", self.core_mhz);
+		out.push_str(", ");
+		out.push_str("power-mw=");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push_str(", ");
+		out.push_str("latency-us=");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push_str(", ");
+		out.push_str("control=");
+		let _ = write!(out, "{}", self.control);
+		out.push_str(", ");
+		out.push_str("status=");
+		let _ = write!(out, "{}", self.status);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "core-mhz");
+		crate::codec::cbor::uint(out, self.core_mhz as u64);
+		crate::codec::cbor::text(out, "power-mw");
+		crate::codec::cbor::uint(out, self.power_mw as u64);
+		crate::codec::cbor::text(out, "latency-us");
+		crate::codec::cbor::uint(out, self.latency_us as u64);
+		crate::codec::cbor::text(out, "control");
+		crate::codec::cbor::uint(out, self.control as u64);
+		crate::codec::cbor::text(out, "status");
+		crate::codec::cbor::uint(out, self.status as u64);
+	}
+}
+
+impl ProcessorThrottlingState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"percent\":");
+		let _ = write!(out, "{}", self.percent);
+		out.push(',');
+		out.push_str("\"power-mw\":");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push(',');
+		out.push_str("\"latency-us\":");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push(',');
+		out.push_str("\"control\":");
+		let _ = write!(out, "{}", self.control);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("percent=");
+		let _ = write!(out, "{}", self.percent);
+		out.push_str(", ");
+		out.push_str("power-mw=");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push_str(", ");
+		out.push_str("latency-us=");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push_str(", ");
+		out.push_str("control=");
+		let _ = write!(out, "{}", self.control);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "percent");
+		crate::codec::cbor::uint(out, self.percent as u64);
+		crate::codec::cbor::text(out, "power-mw");
+		crate::codec::cbor::uint(out, self.power_mw as u64);
+		crate::codec::cbor::text(out, "latency-us");
+		crate::codec::cbor::uint(out, self.latency_us as u64);
+		crate::codec::cbor::text(out, "control");
+		crate::codec::cbor::uint(out, self.control as u64);
+	}
+}
+
+impl ProcessorDomain {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"domain\":");
+		let _ = write!(out, "{}", self.domain);
+		out.push(',');
+		out.push_str("\"coordination\":");
+		let _ = write!(out, "{}", self.coordination);
+		out.push(',');
+		out.push_str("\"processors\":");
+		let _ = write!(out, "{}", self.processors);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("domain=");
+		let _ = write!(out, "{}", self.domain);
+		out.push_str(", ");
+		out.push_str("coordination=");
+		let _ = write!(out, "{}", self.coordination);
+		out.push_str(", ");
+		out.push_str("processors=");
+		let _ = write!(out, "{}", self.processors);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "domain");
+		crate::codec::cbor::uint(out, self.domain as u64);
+		crate::codec::cbor::text(out, "coordination");
+		crate::codec::cbor::uint(out, self.coordination as u64);
+		crate::codec::cbor::text(out, "processors");
+		crate::codec::cbor::uint(out, self.processors as u64);
+	}
+}
+
+impl ProcessorCppc {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"highest\":");
+		let _ = write!(out, "{}", self.highest);
+		out.push(',');
+		out.push_str("\"nominal\":");
+		let _ = write!(out, "{}", self.nominal);
+		out.push(',');
+		out.push_str("\"lowest\":");
+		let _ = write!(out, "{}", self.lowest);
+		out.push(',');
+		out.push_str("\"desired\":");
+		self.desired.to_json_into(out);
+		out.push(',');
+		out.push_str("\"minimum\":");
+		match &self.minimum {
+			Some(v181) => {
+				v181.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"maximum\":");
+		match &self.maximum {
+			Some(v182) => {
+				v182.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"preference\":");
+		match &self.preference {
+			Some(v183) => {
+				v183.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("highest=");
+		let _ = write!(out, "{}", self.highest);
+		out.push_str(", ");
+		out.push_str("nominal=");
+		let _ = write!(out, "{}", self.nominal);
+		out.push_str(", ");
+		out.push_str("lowest=");
+		let _ = write!(out, "{}", self.lowest);
+		out.push_str(", ");
+		out.push_str("desired=");
+		self.desired.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("minimum=");
+		match &self.minimum {
+			Some(v184) => {
+				v184.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("maximum=");
+		match &self.maximum {
+			Some(v185) => {
+				v185.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("preference=");
+		match &self.preference {
+			Some(v186) => {
+				v186.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::text(out, "highest");
+		crate::codec::cbor::uint(out, self.highest as u64);
+		crate::codec::cbor::text(out, "nominal");
+		crate::codec::cbor::uint(out, self.nominal as u64);
+		crate::codec::cbor::text(out, "lowest");
+		crate::codec::cbor::uint(out, self.lowest as u64);
+		crate::codec::cbor::text(out, "desired");
+		self.desired.to_cbor_into(out);
+		crate::codec::cbor::text(out, "minimum");
+		match &self.minimum {
+			Some(v187) => {
+				v187.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "maximum");
+		match &self.maximum {
+			Some(v188) => {
+				v188.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "preference");
+		match &self.preference {
+			Some(v189) => {
+				v189.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
+impl ProcessorId {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"path\":");
+		crate::codec::json_escape(&self.path, out);
+		out.push(',');
+		out.push_str("\"uid\":");
+		let _ = write!(out, "{}", self.uid);
+		out.push(',');
+		out.push_str("\"cpu\":");
+		let _ = write!(out, "{}", self.cpu);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("path=");
+		out.push_str(&self.path);
+		out.push_str(", ");
+		out.push_str("uid=");
+		let _ = write!(out, "{}", self.uid);
+		out.push_str(", ");
+		out.push_str("cpu=");
+		let _ = write!(out, "{}", self.cpu);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "path");
+		crate::codec::cbor::text(out, &self.path);
+		crate::codec::cbor::text(out, "uid");
+		crate::codec::cbor::uint(out, self.uid as u64);
+		crate::codec::cbor::text(out, "cpu");
+		crate::codec::cbor::uint(out, self.cpu as u64);
+	}
+}
+
+impl ProcessorPower {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		self.id.to_json_into(out);
+		out.push(',');
+		out.push_str("\"idle\":");
+		out.push('[');
+		let mut v191 = true;
+		for v190 in self.idle.iter() {
+			if !v191 {
+				out.push(',');
+			}
+			v191 = false;
+			v190.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"performance\":");
+		out.push('[');
+		let mut v193 = true;
+		for v192 in self.performance.iter() {
+			if !v193 {
+				out.push(',');
+			}
+			v193 = false;
+			v192.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"pct-control\":");
+		match &self.pct_control {
+			Some(v194) => {
+				v194.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"pct-status\":");
+		match &self.pct_status {
+			Some(v195) => {
+				v195.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"ppc\":");
+		let _ = write!(out, "{}", self.ppc);
+		out.push(',');
+		out.push_str("\"psd\":");
+		match &self.psd {
+			Some(v196) => {
+				v196.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"cppc\":");
+		match &self.cppc {
+			Some(v197) => {
+				v197.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"throttling\":");
+		out.push('[');
+		let mut v199 = true;
+		for v198 in self.throttling.iter() {
+			if !v199 {
+				out.push(',');
+			}
+			v199 = false;
+			v198.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"ptc-control\":");
+		match &self.ptc_control {
+			Some(v200) => {
+				v200.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"tpc\":");
+		let _ = write!(out, "{}", self.tpc);
+		out.push(',');
+		out.push_str("\"tsd\":");
+		match &self.tsd {
+			Some(v201) => {
+				v201.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"refused\":");
+		out.push('[');
+		let mut v203 = true;
+		for v202 in self.refused.iter() {
+			if !v203 {
+				out.push(',');
+			}
+			v203 = false;
+			crate::codec::json_escape(v202, out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		self.id.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("idle=");
+		out.push('[');
+		let mut v205 = true;
+		for v204 in self.idle.iter() {
+			if !v205 {
+				out.push_str(", ");
+			}
+			v205 = false;
+			v204.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("performance=");
+		out.push('[');
+		let mut v207 = true;
+		for v206 in self.performance.iter() {
+			if !v207 {
+				out.push_str(", ");
+			}
+			v207 = false;
+			v206.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("pct-control=");
+		match &self.pct_control {
+			Some(v208) => {
+				v208.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("pct-status=");
+		match &self.pct_status {
+			Some(v209) => {
+				v209.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("ppc=");
+		let _ = write!(out, "{}", self.ppc);
+		out.push_str(", ");
+		out.push_str("psd=");
+		match &self.psd {
+			Some(v210) => {
+				v210.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("cppc=");
+		match &self.cppc {
+			Some(v211) => {
+				v211.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("throttling=");
+		out.push('[');
+		let mut v213 = true;
+		for v212 in self.throttling.iter() {
+			if !v213 {
+				out.push_str(", ");
+			}
+			v213 = false;
+			v212.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("ptc-control=");
+		match &self.ptc_control {
+			Some(v214) => {
+				v214.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("tpc=");
+		let _ = write!(out, "{}", self.tpc);
+		out.push_str(", ");
+		out.push_str("tsd=");
+		match &self.tsd {
+			Some(v215) => {
+				v215.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("refused=");
+		out.push('[');
+		let mut v217 = true;
+		for v216 in self.refused.iter() {
+			if !v217 {
+				out.push_str(", ");
+			}
+			v217 = false;
+			out.push_str(v216);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 13);
+		crate::codec::cbor::text(out, "id");
+		self.id.to_cbor_into(out);
+		crate::codec::cbor::text(out, "idle");
+		crate::codec::cbor::array(out, self.idle.len());
+		for v218 in self.idle.iter() {
+			v218.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "performance");
+		crate::codec::cbor::array(out, self.performance.len());
+		for v219 in self.performance.iter() {
+			v219.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "pct-control");
+		match &self.pct_control {
+			Some(v220) => {
+				v220.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "pct-status");
+		match &self.pct_status {
+			Some(v221) => {
+				v221.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "ppc");
+		crate::codec::cbor::uint(out, self.ppc as u64);
+		crate::codec::cbor::text(out, "psd");
+		match &self.psd {
+			Some(v222) => {
+				v222.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "cppc");
+		match &self.cppc {
+			Some(v223) => {
+				v223.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "throttling");
+		crate::codec::cbor::array(out, self.throttling.len());
+		for v224 in self.throttling.iter() {
+			v224.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "ptc-control");
+		match &self.ptc_control {
+			Some(v225) => {
+				v225.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "tpc");
+		crate::codec::cbor::uint(out, self.tpc as u64);
+		crate::codec::cbor::text(out, "tsd");
+		match &self.tsd {
+			Some(v226) => {
+				v226.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "refused");
+		crate::codec::cbor::array(out, self.refused.len());
+		for v227 in self.refused.iter() {
+			crate::codec::cbor::text(out, v227);
+		}
+	}
+}
+
+impl ProcessorNotification {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"path\":");
+		crate::codec::json_escape(&self.path, out);
+		out.push(',');
+		out.push_str("\"value\":");
+		let _ = write!(out, "{}", self.value);
+		out.push(',');
+		out.push_str("\"sequence\":");
+		let _ = write!(out, "{}", self.sequence);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("path=");
+		out.push_str(&self.path);
+		out.push_str(", ");
+		out.push_str("value=");
+		let _ = write!(out, "{}", self.value);
+		out.push_str(", ");
+		out.push_str("sequence=");
+		let _ = write!(out, "{}", self.sequence);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "path");
+		crate::codec::cbor::text(out, &self.path);
 		crate::codec::cbor::text(out, "value");
 		crate::codec::cbor::uint(out, self.value as u64);
 		crate::codec::cbor::text(out, "sequence");

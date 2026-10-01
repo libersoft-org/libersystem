@@ -392,6 +392,15 @@ pub fn budget_after_nothing_ran(_retry_once: bool, attempt: u32) -> u32 {
 	attempt
 }
 
+// A BINDING WHOSE DEVICE DID NOT COME BACK FROM A SLEEP is bound again with the attempt its rebind will spend given back:
+// a device that lost its state with the machine's power is not a fault, and a driver that sets one up again only by a
+// bind answers so after EVERY such sleep - charged to the automatic budget, the third S3 of a boot left the device failed
+// for the rest of it. Only the rebind is free: an attempt that then fails spends as any other. An operator's one attempt
+// is not the automatic budget and is left as it is.
+pub fn budget_for_a_sleep_rebind(retry_once: bool, attempt: u32) -> u32 {
+	if retry_once { attempt } else { attempt.saturating_sub(1) }
+}
+
 // Count automatic attempts when admitted, across this node's candidates and incidents in the boot.
 // Missing artifacts and parked dependencies spend nothing; a fresh deadline does not reset spent.
 pub fn admit_attempt(spent: &mut u32, maximum: u32, now: u64, deadline: u64, reserve: u64) -> bool {

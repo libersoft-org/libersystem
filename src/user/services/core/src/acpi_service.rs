@@ -14,7 +14,8 @@
 //
 // WHAT IT SERVES. DeviceManager's `acpi-admin` root - node channels for claims and live bindings, and the GPIO and
 // serial-bus connections the service holds - and each node channel: evaluate, `_DSD`, `_DSM`, `Notify` and the device's
-// power state. A GPE is
+// power state. ProcessorPowerService's `processor-firmware` root: every processor by path, `_UID` and the kernel's core
+// its MADT entry is, each one's power objects read, their `Notify` 0x80, 0x81 and 0x82, and `_OST`. A GPE is
 // answered by `_Lxx` or `_Exx` (the embedded controller's by its query methods), a GPIO-signalled event by `_Exx`,
 // `_Lxx` or `_EVT` in the controller's scope; a device-check or eject `Notify` re-walks the subtree and withdraws what
 // left.
@@ -49,12 +50,13 @@ use alloc::vec::Vec;
 use acpi_model::events::{self, Trigger};
 use acpi_model::node::{self, Role, Scope};
 use acpi_model::power::{self, DState, Plan, Resource, Resources};
+use acpi_model::processor::{self as processor_objects, Entry, Gas};
 use acpi_model::{admission, handshake, properties};
 use aml::host::{Access, Host, HostError, TableBytes};
 use aml::{Aml, Limits, NodeId, Object, Path, Seg, Space};
 use ipc_client::ChannelTransport;
 use platform::report::{self, Function, List};
-use proto::system::{AcpiConnectionKind, AcpiNotification, Error, SleepState, acpi_admin, acpi_node, gpio_device, i2c_device, platform_sleep, sleep_notice};
+use proto::system::{AcpiConnectionKind, AcpiNotification, Error, ProcessorCppc, ProcessorDomain, ProcessorId, ProcessorIdleState, ProcessorNotification, ProcessorPerformanceState, ProcessorPower, ProcessorRegister, ProcessorThrottlingState, SleepState, acpi_admin, acpi_node, gpio_device, i2c_device, platform_sleep, processor_firmware, sleep_notice};
 use rt::*;
 use wire::Handles;
 
@@ -70,6 +72,11 @@ const NOTIFY_DEPTH: usize = 32;
 const NOTIFY_BUS_CHECK: u64 = 0;
 const NOTIFY_DEVICE_CHECK: u64 = 1;
 const NOTIFY_EJECT: u64 = 3;
+// A processor's: its performance limit (`_PPC`), its idle states (`_CST`, `_LPI`), its throttling limit (`_TPC`).
+const NOTIFY_PERFORMANCE: u64 = 0x80;
+const NOTIFY_THROTTLING: u64 = 0x82;
+// ProcessorPowerService's connections: its instance, and a replacement's while the old one's is closing.
+const MAX_PROCESSOR_CLIENTS: usize = 2;
 // How long a GPIO or serial-bus controller has to answer one transaction.
 const CONTROLLER_TICKS: u64 = TICKS_PER_SECOND / 2;
 
@@ -624,6 +631,20 @@ struct Published {
 	role: Role,
 }
 
+// A PROCESSOR THE WALK FOUND: its namespace path and the UID the MADT keys it by - a `Processor` object's processor ID,
+// a processor device's `_UID` - None where it has none that names a number.
+struct ProcessorNode {
+	path: String,
+	uid: Option<u32>,
+}
+
+// A `processor-firmware` connection, and its `Notify` stream once it opened one.
+struct ProcessorClient {
+	chan: u64,
+	stream: u64,
+	sequence: u32,
+}
+
 struct Service {
 	aml: Aml,
 	host: Firmware,
@@ -642,6 +663,12 @@ struct Service {
 	// for the sleep in progress, which `wake` lets go.
 	power: Resources,
 	wake_holders: Vec<String>,
+	// THE PROCESSORS' POWER: the root ServiceManager connects ProcessorPowerService through, its connections, every
+	// processor the walk found, and the MADT's (UID, APIC ID) for each processor it lists.
+	processors_root: u64,
+	processor_clients: Vec<ProcessorClient>,
+	processors: Vec<ProcessorNode>,
+	madt: Vec<(u32, u32)>,
 }
 
 impl Service {
@@ -813,7 +840,7 @@ impl Service {
 				None
 			}
 			Role::Processor => {
-				self.processor(item.node, &name);
+				self.processor(item.node, &name, identity.uid.as_deref());
 				None
 			}
 			Role::NotADevice(why) => {
@@ -855,7 +882,7 @@ impl Service {
 		}
 	}
 
-	fn processor(&mut self, node: NodeId, name: &str) {
+	fn processor(&mut self, node: NodeId, name: &str, uid: Option<&str>) {
 		let answered = if self.aml.ns.child(node, Seg(*b"_OSC")).is_some() {
 			let answer = self.aml.osc(node, handshake::PROCESSOR, 1, &handshake::processor_request(), &mut self.host);
 			matches!(answer, Ok(Some(_)))
@@ -867,6 +894,14 @@ impl Service {
 		};
 		self.deliver_notifications();
 		say(&format!("{name} is a processor - the service's own{}", if answered { ", told the forms the kernel executes" } else { "" }));
+		// RECORDED FOR ITS POWER: a re-walk finds it again, and keeps one record.
+		let processor_id = match self.aml.ns.object(node).map(|object| object.borrow().clone()) {
+			Some(Object::Processor { id, .. }) => Some(id),
+			_ => None,
+		};
+		let path = self.aml.ns.path(node).text();
+		self.processors.retain(|held| held.path != path);
+		self.processors.push(ProcessorNode { path, uid: processor_objects::uid_of(processor_id, uid) });
 	}
 
 	fn companion(&mut self, node: NodeId, name: &str, function: Function) -> bool {
@@ -1041,6 +1076,9 @@ impl Service {
 				{
 					say(&format!("a Notify for {identity} was not taken by its driver's stream"));
 				}
+			}
+			if (NOTIFY_PERFORMANCE..=NOTIFY_THROTTLING).contains(&value) {
+				self.processor_notification(&path.text(), value);
 			}
 			if matches!(value, NOTIFY_BUS_CHECK | NOTIFY_DEVICE_CHECK | NOTIFY_EJECT)
 				&& let Some(node) = self.aml.ns.lookup_path(&path)
@@ -1429,6 +1467,205 @@ impl Service {
 	}
 }
 
+// ---------------------------------------------------------------------------------------------- the processors' power
+
+// A GENERIC REGISTER as the contract carries it.
+fn register_record(gas: &Gas) -> ProcessorRegister {
+	ProcessorRegister { space: gas.space, bits: gas.bits, address: gas.address }
+}
+
+fn idle_record(state: &processor_objects::IdleState) -> ProcessorIdleState {
+	let none = ProcessorRegister { space: 0, bits: 0, address: 0 };
+	let (entry, hint, register) = match state.entry {
+		Entry::Halt => (0, 0, none),
+		Entry::Mwait { hint } => (1, hint, none),
+		Entry::Register(gas) => (2, 0, register_record(&gas)),
+	};
+	let flags = u32::from(state.loses_context) | u32::from(state.stops_timer) << 1 | u32::from(state.bus_master_arbitration) << 2;
+	ProcessorIdleState { entry, hint, register, latency_us: state.latency_us, residency_us: state.residency_us, power_mw: state.power_mw, flags }
+}
+
+fn domain_record(domain: processor_objects::Domain) -> ProcessorDomain {
+	ProcessorDomain { domain: domain.domain, coordination: domain.coordination, processors: domain.processors }
+}
+
+// THE HARDWARE ID EACH OF THE KERNEL'S CORES REPORTS, by core: its APIC ID on x86_64.
+fn core_hardware_ids() -> Vec<u64> {
+	let mut ids = Vec::new();
+	let mut info = CpuIdleInfo::default();
+	let mut index = 0u64;
+	while cpu_idle_info(index, &mut info) > 0 {
+		ids.push(info.hardware_id);
+		index += 1;
+	}
+	ids
+}
+
+// THE MADT'S (UID, APIC ID) for every processor it lists, enabled or not - a processor brought online later is listed
+// there too.
+fn madt_processors(privilege: u64) -> Vec<(u32, u32)> {
+	let Some(bytes) = table(privilege, b"APIC", 0) else { return Vec::new() };
+	match acpi::Madt::new(&bytes) {
+		Ok(madt) => madt.processors().map(|processor| (processor.uid, processor.apic_id)).collect(),
+		Err(_) => {
+			say("the MADT could not be read - no processor is matched to a core");
+			Vec::new()
+		}
+	}
+}
+
+// AN OBJECT'S PACKAGE READ, or the reason it is not - named, for `refused`.
+fn read_object<T>(name: &[u8; 4], value: Option<aml::wire::Value>, parse: fn(&aml::wire::Value) -> Result<T, processor_objects::Refusal>, refused: &mut Vec<String>) -> Option<T> {
+	match parse(&value?) {
+		Ok(read) => Some(read),
+		Err(why) => {
+			refused.push(format!("{} refused - {why:?}", seg_text(name)));
+			None
+		}
+	}
+}
+
+// `_PPC` and `_TPC`: a limit, as an index into the states.
+fn limit(value: &aml::wire::Value) -> Result<u32, processor_objects::Refusal> {
+	match value {
+		aml::wire::Value::Integer(value) => u32::try_from(*value).map_err(|_| processor_objects::Refusal::Element),
+		_ => Err(processor_objects::Refusal::Element),
+	}
+}
+
+impl Service {
+	fn processor_node(&self, path: &str) -> Result<NodeId, Error> {
+		if !self.processors.iter().any(|held| held.path == path) {
+			return Err(Error::NotFound);
+		}
+		self.aml.lookup(path).ok_or(Error::NotFound)
+	}
+
+	fn processor_ids(&self) -> Vec<ProcessorId> {
+		let cores = core_hardware_ids();
+		self.processors.iter().filter(|held| self.aml.lookup(&held.path).is_some()).map(|held| ProcessorId { path: held.path.clone(), uid: held.uid.unwrap_or(u32::MAX), cpu: held.uid.and_then(|uid| processor_objects::core_of(uid, &self.madt, &cores)).unwrap_or(u32::MAX) }).collect()
+	}
+
+	// ONE OF A PROCESSOR'S OBJECTS in the wire form `acpi_model::processor` reads: None where the processor has no such
+	// object - and, said by name, where it did not evaluate.
+	fn processor_object(&mut self, node: NodeId, name: &[u8; 4], refused: &mut Vec<String>) -> Option<aml::wire::Value> {
+		let answer = self.aml.child_value(node, name, &mut self.host);
+		self.deliver_notifications();
+		match answer {
+			Ok(Some(object)) => {
+				let aml = &self.aml;
+				Some(aml::wire::from_object(&object, &mut |element| aml.element_path(element).map(|path| path.text())))
+			}
+			Ok(None) => None,
+			Err(error) => {
+				refused.push(format!("{} did not evaluate - {error:?}", seg_text(name)));
+				None
+			}
+		}
+	}
+
+	// A PROCESSOR'S POWER, as its objects read now. An object it lacks is absent; one that did not evaluate, or whose
+	// package is not the shape the specification gives it, is named in `refused` and left out.
+	fn processor_power(&mut self, path: &str) -> Result<ProcessorPower, Error> {
+		let node = self.processor_node(path)?;
+		let id = self.processor_ids().into_iter().find(|id| id.path == path).ok_or(Error::NotFound)?;
+		let mut refused: Vec<String> = Vec::new();
+		// IDLE: `_LPI` where the processor has one, `_CST` otherwise.
+		let idle = match self.processor_object(node, b"_LPI", &mut refused) {
+			Some(value) => read_object(b"_LPI", Some(value), processor_objects::lpi, &mut refused),
+			None => {
+				let value = self.processor_object(node, b"_CST", &mut refused);
+				read_object(b"_CST", value, processor_objects::cst, &mut refused)
+			}
+		}
+		.unwrap_or_default();
+		let value = self.processor_object(node, b"_PSS", &mut refused);
+		let performance = read_object(b"_PSS", value, processor_objects::pss, &mut refused).unwrap_or_default();
+		let value = self.processor_object(node, b"_PCT", &mut refused);
+		let pct = read_object(b"_PCT", value, processor_objects::control_status, &mut refused);
+		let value = self.processor_object(node, b"_PPC", &mut refused);
+		let ppc = read_object(b"_PPC", value, limit, &mut refused).unwrap_or(0);
+		let value = self.processor_object(node, b"_PSD", &mut refused);
+		let psd = read_object(b"_PSD", value, processor_objects::domain, &mut refused);
+		let value = self.processor_object(node, b"_CPC", &mut refused);
+		let cppc = read_object(b"_CPC", value, processor_objects::cpc, &mut refused);
+		let value = self.processor_object(node, b"_TSS", &mut refused);
+		let throttling = read_object(b"_TSS", value, processor_objects::tss, &mut refused).unwrap_or_default();
+		let value = self.processor_object(node, b"_PTC", &mut refused);
+		let ptc = read_object(b"_PTC", value, processor_objects::control_status, &mut refused);
+		let value = self.processor_object(node, b"_TPC", &mut refused);
+		let tpc = read_object(b"_TPC", value, limit, &mut refused).unwrap_or(0);
+		let value = self.processor_object(node, b"_TSD", &mut refused);
+		let tsd = read_object(b"_TSD", value, processor_objects::domain, &mut refused);
+		for why in &refused {
+			say(&format!("{path}: {why}"));
+		}
+		refused.truncate(8);
+		Ok(ProcessorPower { id, idle: idle.iter().map(idle_record).collect(), performance: performance.iter().map(|state| ProcessorPerformanceState { core_mhz: state.core_mhz, power_mw: state.power_mw, latency_us: state.latency_us, control: state.control, status: state.status }).collect(), pct_control: pct.map(|(control, _)| register_record(&control)), pct_status: pct.map(|(_, status)| register_record(&status)), ppc, psd: psd.map(domain_record), cppc: cppc.map(|cppc| ProcessorCppc { highest: cppc.highest, nominal: cppc.nominal, lowest: cppc.lowest, desired: register_record(&cppc.desired), minimum: cppc.minimum.as_ref().map(register_record), maximum: cppc.maximum.as_ref().map(register_record), preference: cppc.preference.as_ref().map(register_record) }), throttling: throttling.iter().map(|state| ProcessorThrottlingState { percent: state.percent, power_mw: state.power_mw, latency_us: state.latency_us, control: state.control }).collect(), ptc_control: ptc.map(|(control, _)| register_record(&control)), tpc, tsd: tsd.map(domain_record), refused })
+	}
+
+	// `_OST(event, status, Buffer)`: how the operating system handled a processor's notification.
+	fn processor_ost(&mut self, path: &str, event: u32, status: u32) -> Result<(), Error> {
+		let node = self.processor_node(path)?;
+		let method = self.aml.ns.child(node, Seg(*b"_OST")).ok_or(Error::NotFound)?;
+		let answer = self.aml.evaluate(method, &[Object::Integer(u64::from(event)), Object::Integer(u64::from(status)), Object::Buffer(Vec::new())], &mut self.host);
+		self.deliver_notifications();
+		answer.map(|_| ()).map_err(|error| {
+			say(&format!("{path}._OST failed - {error:?}"));
+			Error::Io
+		})
+	}
+
+	// A PROCESSOR'S `Notify` 0x80, 0x81 OR 0x82, to every connection's stream.
+	fn processor_notification(&mut self, path: &str, value: u64) {
+		if !self.processors.iter().any(|held| held.path == path) {
+			return;
+		}
+		let mut frame = [0u8; 128];
+		for client in self.processor_clients.iter_mut().filter(|client| client.stream != 0) {
+			client.sequence = client.sequence.wrapping_add(1);
+			let mut handles = Handles::new();
+			if let Some(len) = processor_firmware::notifications_frame(client.sequence, &ProcessorNotification { path: String::from(path), value: value as u32, sequence: client.sequence }, &mut frame, &mut handles)
+				&& !try_send(client.stream, &frame[..len], 0)
+			{
+				say(&format!("a Notify for {path} was not taken by processor power's stream"));
+			}
+		}
+	}
+
+	fn processor_client_gone(&mut self, chan: u64) {
+		if let Some(at) = self.processor_clients.iter().position(|client| client.chan == chan) {
+			let gone = self.processor_clients.remove(at);
+			if gone.stream != 0 {
+				close(gone.stream);
+			}
+		}
+		close(chan);
+	}
+}
+
+struct ProcessorView<'a> {
+	service: &'a mut Service,
+}
+
+impl processor_firmware::Service for ProcessorView<'_> {
+	fn processors(&mut self) -> Result<Vec<ProcessorId>, Error> {
+		Ok(self.service.processor_ids())
+	}
+
+	fn power(&mut self, path: String) -> Result<ProcessorPower, Error> {
+		self.service.processor_power(&path)
+	}
+
+	fn notifications(&mut self) -> Vec<ProcessorNotification> {
+		Vec::new()
+	}
+
+	fn ost(&mut self, path: String, event: u32, status: u32) -> Result<(), Error> {
+		self.service.processor_ost(&path, event, status)
+	}
+}
+
 // A four-character name as text.
 fn seg_text(name: &[u8; 4]) -> &str {
 	core::str::from_utf8(name).unwrap_or("?")
@@ -1483,6 +1720,14 @@ impl acpi_node::Service for NodeView<'_> {
 	fn sleep_power_state(&mut self, target: u8, wake: bool) -> Result<u8, Error> {
 		let node = self.service.channels[self.at].node;
 		self.service.sleep_power_state(node, target, wake)
+	}
+
+	fn has(&mut self, name: String) -> Result<bool, Error> {
+		let channel = &self.service.channels[self.at];
+		match admission::admit(&name, channel.class).map_err(|_| Error::Denied)? {
+			admission::Target::Own(seg) => Ok(self.service.aml.ns.child(channel.node, Seg(seg)).is_some()),
+			_ => Err(Error::Invalid),
+		}
 	}
 }
 
@@ -1776,8 +2021,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
-	let (privilege, admin_root) = (roles[0], roles[1]);
-	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, wake_armed: Vec::new(), power: Resources::new(), wake_holders: Vec::new() };
+	let (privilege, admin_root, processors_root) = (roles[0], roles[1], roles[2]);
+	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, wake_armed: Vec::new(), power: Resources::new(), wake_holders: Vec::new(), processors_root, processor_clients: Vec::new(), processors: Vec::new(), madt: Vec::new() };
 	if privilege == 0 {
 		say("no FirmwareInterpreter privilege was handed over - the namespace is not loaded");
 		send_blocking(bootstrap, b"AcpiService: online - no firmware privilege", 0);
@@ -1802,6 +2047,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		serve(&mut service, bootstrap);
 	}
 	service.host.fixed = fixed(privilege);
+	service.madt = madt_processors(privilege);
 	let loaded = load_tables(&mut service.aml, &mut service.host);
 	// `_REG` FOR THE SPACES THIS SERVICE SERVES from the start; the embedded controller's once its transport exists.
 	for space in [Space::SystemMemory, Space::SystemIo, Space::PciConfig, Space::SystemCmos] {
@@ -1848,12 +2094,13 @@ fn serve(service: &mut Service, bootstrap: u64) -> ! {
 	let mut control = bootstrap;
 	loop {
 		let mut waitset: Vec<u64> = Vec::new();
-		for handle in [control, service.events, service.admin_root] {
+		for handle in [control, service.events, service.admin_root, service.processors_root] {
 			if handle != 0 {
 				waitset.push(handle);
 			}
 		}
 		waitset.extend(service.admins.iter().copied());
+		waitset.extend(service.processor_clients.iter().map(|client| client.chan));
 		waitset.extend(service.channels.iter().map(|channel| channel.chan));
 		waitset.extend(service.host.held.iter().filter(|held| held.events != 0).map(|held| held.events));
 		waitset.truncate(MAX_WAIT_HANDLES);
@@ -1917,6 +2164,10 @@ fn serve(service: &mut Service, bootstrap: u64) -> ! {
 		}
 		if let Some(at) = service.channels.iter().position(|channel| channel.chan == handle) {
 			serve_node(service, at, &mut buf, &mut reply);
+			continue;
+		}
+		if handle == service.processors_root || service.processor_clients.iter().any(|client| client.chan == handle) {
+			serve_processors(service, handle, &mut buf, &mut reply);
 			continue;
 		}
 		serve_admin(service, handle, &mut buf, &mut reply);
@@ -2027,5 +2278,68 @@ fn serve_admin(service: &mut Service, handle: u64, buf: &mut [u8], reply: &mut [
 			service.admins.retain(|&admin| admin != handle);
 			close(handle);
 		}
+	}
+}
+
+// THE PROCESSORS' ROOT AND ITS CONNECTIONS: ServiceManager connects ProcessorPowerService through the root at each of
+// its starts, and each connection is served `processor-firmware`.
+fn serve_processors(service: &mut Service, handle: u64, buf: &mut [u8], reply: &mut [u8]) {
+	let is_root = handle == service.processors_root;
+	let (len, mut handles) = match try_recv_caps(handle, buf) {
+		PolledCaps::Message { len, handles } => (len, handles),
+		PolledCaps::Empty => return,
+		PolledCaps::Closed => {
+			if is_root {
+				close(handle);
+				service.processors_root = 0;
+			} else {
+				service.processor_client_gone(handle);
+			}
+			return;
+		}
+	};
+	let op = if len >= 2 { u16::from_le_bytes([buf[0], buf[1]]) } else { 0 };
+	if is_root {
+		for &leftover in handles.as_slice() {
+			close(leftover);
+		}
+		if op == HEARTBEAT_OP {
+			send_blocking(handle, b"PONG", 0);
+		} else if op == CONNECT_OP {
+			let theirs = if service.processor_clients.len() < MAX_PROCESSOR_CLIENTS {
+				channel().map(|(mine, theirs)| {
+					service.processor_clients.push(ProcessorClient { chan: mine, stream: 0, sequence: 0 });
+					theirs
+				})
+			} else {
+				None
+			};
+			send_blocking(handle, &[], theirs.unwrap_or(0));
+		}
+		return;
+	}
+	if op == processor_firmware::OP_NOTIFICATIONS {
+		let request = buf[..len].to_vec();
+		let Some((corr, _)) = processor_firmware::notifications_open(&mut ProcessorView { service }, &request, &mut handles) else { return };
+		let Some((producer, consumer)) = channel_with_depth(NOTIFY_DEPTH as u64) else { return };
+		if let Some(client) = service.processor_clients.iter_mut().find(|client| client.chan == handle) {
+			if client.stream != 0 {
+				close(client.stream);
+			}
+			client.stream = producer;
+		}
+		send_caps_blocking(handle, &corr.to_le_bytes(), &[consumer]);
+		return;
+	}
+	let mut reply_handles = Handles::new();
+	let written = processor_firmware::dispatch(&mut ProcessorView { service }, &buf[..len], &mut handles, reply, &mut reply_handles);
+	for &leftover in handles.as_slice() {
+		close(leftover);
+	}
+	match written {
+		Some(written) => {
+			send_caps_blocking(handle, &reply[..written], reply_handles.as_slice());
+		}
+		None => service.processor_client_gone(handle),
 	}
 }

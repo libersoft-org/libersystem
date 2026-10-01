@@ -85,6 +85,8 @@ pub const COM1: (u16, u16) = (0x3F8, 8);
 // the COM1 handoff moves its ports into the claim's grant, and takes them back when that grant ends; the
 // suite's second UART is installed under the same item while the suite has the kernel drive it.
 pub const KERNEL_CONSOLE: u32 = 1;
+// Processor power: every port a processor table names, counted per table - see `crate::processor`.
+pub const PROCESSOR_POWER: u32 = 2;
 
 // The ports the kernel writes on its terminal paths alone: MINTABLE, and written on those paths without
 // asking the holder. The FADT's reset register joins them where it is a port. Nothing in the kernel
@@ -297,9 +299,9 @@ pub fn install(item: u32, base: u16, len: u16) -> Result<(), Refusal> {
 }
 
 // The matching uninstall. The ports leave the set only with this item's last hold of them; answers
-// whether the item held them at all. The COM1 handoff does not uninstall - it moves the install into the
-// claim's grant (`grant_from_install`) and the grant's end moves it back - so the tests are its callers.
-#[cfg(test)]
+// whether the item held them at all. Processor power's last table naming a port calls it; the COM1 handoff
+// does not - it moves the install into the claim's grant (`grant_from_install`) and the grant's end moves
+// it back.
 pub fn uninstall(item: u32, base: u16, len: u16) -> bool {
 	let Some(end) = end_of(base, len) else { return false };
 	let mut table = TABLE.lock();
@@ -313,7 +315,7 @@ pub fn uninstall(item: u32, base: u16, len: u16) -> bool {
 
 // How many spans are retired for the boot - for the tests, which must see a failed revocation retire
 // its ports and a confirmed one not.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn retired_covering(port: u16) -> bool {
 	TABLE.lock().spans.iter().any(|span| span.owner == RETIRED && (span.base as u32) <= port as u32 && (port as u32) < span.end)
 }

@@ -89,6 +89,64 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
 	out
 }
 
+/// SHA-256 OVER PARTS FED IN TURN: the digest `digest` gives their concatenation, with nothing allocated to hold it -
+/// for a caller hashing a list of parts on a path where a short heap must not halt.
+pub struct Sha256 {
+	state: [u32; 8],
+	block: [u8; 64],
+	filled: usize,
+	length: u64,
+}
+
+impl Default for Sha256 {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Sha256 {
+	pub const fn new() -> Self {
+		Self { state: INITIAL_STATE, block: [0; 64], filled: 0, length: 0 }
+	}
+
+	pub fn update(&mut self, mut bytes: &[u8]) {
+		self.length = self.length.wrapping_add(bytes.len() as u64);
+		if self.filled != 0 {
+			let take = (64 - self.filled).min(bytes.len());
+			self.block[self.filled..self.filled + take].copy_from_slice(&bytes[..take]);
+			self.filled += take;
+			bytes = &bytes[take..];
+			if self.filled < 64 {
+				return;
+			}
+			compress(&mut self.state, &self.block);
+		}
+		let chunks = bytes.chunks_exact(64);
+		let remainder = chunks.remainder();
+		for chunk in chunks {
+			compress(&mut self.state, chunk);
+		}
+		self.block[..remainder.len()].copy_from_slice(remainder);
+		self.filled = remainder.len();
+	}
+
+	pub fn finish(mut self) -> [u8; 32] {
+		let mut tail = [0u8; 128];
+		tail[..self.filled].copy_from_slice(&self.block[..self.filled]);
+		tail[self.filled] = 0x80;
+		let tail_len = if self.filled + 1 + 8 <= 64 { 64 } else { 128 };
+		tail[tail_len - 8..tail_len].copy_from_slice(&self.length.wrapping_mul(8).to_be_bytes());
+		for chunk in tail[..tail_len].chunks_exact(64) {
+			compress(&mut self.state, chunk);
+		}
+		let mut out = [0u8; 32];
+		for (index, word) in self.state.into_iter().enumerate() {
+			out[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+		}
+		out
+	}
+}
+
 fn compress(state: &mut [u32; 8], block: &[u8]) {
 	let mut schedule = [0u32; 64];
 	for index in 0..16 {

@@ -10,11 +10,14 @@
 # function's node with its `virtio,device22` child, the two `hid-over-i2c` devices on it, and their interrupts, level
 # and active low, on lines of the virtio-gpio function's child - the bindings Linux documents; and the TCPCI fixture
 # (`tcpc-fixture`): the same bus with a `tcpci` port controller on it, its alert a line of the same child, and its
-# `usb-c-connector` child describing the gate's sink.
+# `usb-c-connector` child describing the gate's sink; and the idle states (`idle-fixture`) QEMU's trees do not carry:
+# `/cpus/idle-states` with two retention states the firmware runs and one that loses the core's context, and every cpu
+# node's `cpu-idle-states` naming them - PSCI's binding on aarch64, the SBI's on riscv64.
 #
 #   fdt_edit.py tree-fixture IN OUT --slot N [--line L]             write the firmware fixture tree
 #   fdt_edit.py hid-fixture IN OUT --i2c-slot N --gpio-slot M       write the HID-over-I2C fixture tree
 #   fdt_edit.py tcpc-fixture IN OUT --i2c-slot N --gpio-slot M      write the TCPCI fixture tree
+#   fdt_edit.py idle-fixture IN OUT --binding arm|riscv              write the idle-state fixture tree
 #   fdt_edit.py --self-test                                          build, edit and re-read a tree, writing nothing
 
 import struct
@@ -298,6 +301,44 @@ def tcpc_fixture(tree, i2c_slot, gpio_slot):
 	return tree
 
 
+# THE IDLE STATES, per binding: (name, parameter, entry, exit, min-residency, local-timer-stop). Two the firmware takes as
+# a wait - PSCI's StateIDs 1 and 2 in the original power-state format (StateType 0, bit 16 clear), the SBI's default
+# retentive suspend - a shallow one and a deep one whose wake is past a 1000 us latency request; and one that loses the
+# core's context (StateType 1, a non-retentive type), which the kernel installs and holds out of its choices.
+IDLE_STATES = {
+	'arm': ('arm,idle-state', 'arm,psci-suspend-param', [('cpu-retention', 0x0000_0001, 20, 40, 80, False), ('cpu-sleep', 0x0000_0002, 500, 1500, 5000, False), ('cpu-power-down', 0x0001_0003, 100, 250, 1000, True)]),
+	'riscv': ('riscv,idle-state', 'riscv,sbi-suspend-param', [('cpu-retentive', 0x0000_0000, 20, 40, 80, False), ('cpu-sleep', 0x0000_0000, 500, 1500, 5000, False), ('cpu-non-retentive', 0x8000_0000, 100, 250, 1000, True)]),
+}
+
+
+def idle_fixture(tree, binding):
+	"""THE IDLE STATES QEMU'S TREES DO NOT CARRY: `/cpus/idle-states` with the binding's three states, and every cpu
+	node's `cpu-idle-states` naming them in that order."""
+	compatible, parameter, states = IDLE_STATES[binding]
+	cpus = tree.find('/cpus')
+	if cpus is None:
+		raise TreeError('the tree describes no /cpus')
+	idle = cpus.child('idle-states') or cpus.add(Node('idle-states', [('entry-method', text('psci'))] if binding == 'arm' else []))
+	phandles = []
+	for name, value, entry, exit_, residency, timer_stop in states:
+		node = idle.child(name)
+		if node is None:
+			props = [('compatible', text(compatible)), (parameter, cells(value)), ('entry-latency-us', cells(entry)), ('exit-latency-us', cells(exit_)), ('min-residency-us', cells(residency))]
+			if timer_stop:
+				props.append(('local-timer-stop', b''))
+			props.append(('phandle', cells(tree.new_phandle())))
+			node = idle.add(Node(name, props))
+		phandles.append(struct.unpack('>I', node.prop('phandle'))[0])
+	named = 0
+	for child in cpus.children:
+		if child.prop('device_type') == text('cpu'):
+			child.set('cpu-idle-states', cells(*phandles))
+			named += 1
+	if named == 0:
+		raise TreeError('no cpu node to name the idle states')
+	return tree
+
+
 def self_test():
 	failures = []
 
@@ -349,6 +390,24 @@ def self_test():
 		failures.append('a second node of one name was added')
 	except TreeError:
 		pass
+	# THE IDLE FIXTURE, on a tree with two cpus: both name every state, and a second run adds nothing.
+	for binding, compatible, parameter in (('arm', 'arm,idle-state', 'arm,psci-suspend-param'), ('riscv', 'riscv,idle-state', 'riscv,sbi-suspend-param')):
+		cpu_root = Node('', [('#address-cells', cells(2)), ('#size-cells', cells(2))])
+		cpu_node = cpu_root.add(Node('cpus', [('#address-cells', cells(1)), ('#size-cells', cells(0))]))
+		for index in range(2):
+			cpu_node.add(Node(f'cpu@{index}', [('device_type', text('cpu')), ('reg', cells(index))]))
+		cpu_tree = parse(serialize(Tree(b'\0' * 16, cpu_root)))
+		idle_fixture(cpu_tree, binding)
+		idle_fixture(cpu_tree, binding)
+		again = parse(serialize(cpu_tree))
+		states = again.find('/cpus/idle-states')
+		check(f'{binding}: three states', len(states.children) if states else None, 3)
+		first, second = (states.children[0], states.children[2]) if states and len(states.children) == 3 else (Node(''), Node(''))
+		check(f'{binding}: the binding', (first.prop('compatible'), second.prop('compatible')), (text(compatible), text(compatible)))
+		check(f'{binding}: the retention state keeps its timer, the other stops it', (first.prop('local-timer-stop'), second.prop('local-timer-stop')), (None, b''))
+		check(f'{binding}: each a parameter', (first.prop(parameter) is not None, second.prop(parameter) is not None), (True, True))
+		names = cells(*[struct.unpack('>I', child.prop('phandle'))[0] for child in states.children]) if states else None
+		check(f'{binding}: every cpu names all three, in order', [again.find(f'/cpus/cpu@{index}').prop('cpu-idle-states') for index in range(2)], [names, names])
 	if failures:
 		for failure in failures:
 			print(f'fdt_edit: {failure}', file=sys.stderr)
@@ -369,6 +428,16 @@ def main(argv):
 		with open(argv[2], 'wb') as destination:
 			destination.write(serialize(edit(tree, i2c_slot, gpio_slot)))
 		return 0
+	if len(argv) >= 3 and argv[0] == 'idle-fixture':
+		binding = argv[argv.index('--binding') + 1] if '--binding' in argv else ''
+		if binding not in IDLE_STATES:
+			print('fdt_edit: idle-fixture needs --binding arm or --binding riscv', file=sys.stderr)
+			return 2
+		with open(argv[1], 'rb') as source:
+			tree = parse(source.read())
+		with open(argv[2], 'wb') as destination:
+			destination.write(serialize(idle_fixture(tree, binding)))
+		return 0
 	if len(argv) >= 3 and argv[0] == 'tree-fixture':
 		slot = 3
 		line = 2
@@ -381,7 +450,7 @@ def main(argv):
 		with open(argv[2], 'wb') as destination:
 			destination.write(serialize(tree_fixture(tree, slot, line)))
 		return 0
-	print('usage: fdt_edit.py tree-fixture IN OUT [--slot N] [--line L] | hid-fixture|tcpc-fixture IN OUT [--i2c-slot N] [--gpio-slot M] | --self-test', file=sys.stderr)
+	print('usage: fdt_edit.py tree-fixture IN OUT [--slot N] [--line L] | hid-fixture|tcpc-fixture IN OUT [--i2c-slot N] [--gpio-slot M] | idle-fixture IN OUT --binding arm|riscv | --self-test', file=sys.stderr)
 	return 2
 
 

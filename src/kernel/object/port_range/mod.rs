@@ -54,7 +54,8 @@ pub struct IoBitmap {
 // `arch::ioports`. So a copy on the changing core cannot run inside a change, and a copy on another core
 // waits at most one.
 pub struct IoPorts {
-	// The process's object id, never reused - what a core's record names as loaded.
+	// The process's object id, never reused - what a core's record names as loaded (x86_64's TSS copy alone).
+	#[cfg(target_arch = "x86_64")]
 	owner: u64,
 	change: SpinLock<()>,
 	generation: AtomicU64,
@@ -69,17 +70,29 @@ pub struct IoPorts {
 
 impl IoPorts {
 	pub const fn new(owner: u64) -> Self {
-		Self { owner, change: SpinLock::new(()), generation: AtomicU64::new(0), words: AtomicU32::new(0), bits: AtomicPtr::new(core::ptr::null_mut()), mapped: SpinLock::new(Vec::new()) }
+		#[cfg(not(target_arch = "x86_64"))]
+		let _ = owner;
+		Self {
+			#[cfg(target_arch = "x86_64")]
+			owner,
+			change: SpinLock::new(()),
+			generation: AtomicU64::new(0),
+			words: AtomicU32::new(0),
+			bits: AtomicPtr::new(core::ptr::null_mut()),
+			mapped: SpinLock::new(Vec::new()),
+		}
 	}
 
 	// The process these ports belong to.
 	#[inline(always)]
+	#[cfg(target_arch = "x86_64")]
 	pub fn owner(&self) -> u64 {
 		self.owner
 	}
 
 	// The generation a copy is compared against. Odd while a change is running.
 	#[inline(always)]
+	#[cfg(target_arch = "x86_64")]
 	pub fn generation(&self) -> u64 {
 		self.generation.load(Ordering::Acquire)
 	}
@@ -87,6 +100,7 @@ impl IoPorts {
 	// THE START OF ONE COPY: the generation it is consistent with and how many words it needs, or `None`
 	// while a change is running.
 	#[inline(always)]
+	#[cfg(target_arch = "x86_64")]
 	pub fn begin_read(&self) -> Option<(u64, usize)> {
 		let generation = self.generation.load(Ordering::Acquire);
 		if generation & 1 != 0 {
@@ -98,6 +112,7 @@ impl IoPorts {
 	// Word `at` of the bitmap, within a copy that `begin_read` started with a non-zero word count - which
 	// only a mapped range produces, so the bitmap exists.
 	#[inline(always)]
+	#[cfg(target_arch = "x86_64")]
 	pub fn word(&self, at: usize) -> u64 {
 		let bits = self.bits.load(Ordering::Acquire);
 		if bits.is_null() {
@@ -110,6 +125,7 @@ impl IoPorts {
 
 	// THE END OF THAT COPY: whether it is consistent with `generation`.
 	#[inline(always)]
+	#[cfg(target_arch = "x86_64")]
 	pub fn end_read(&self, generation: u64) -> bool {
 		fence(Ordering::Acquire);
 		self.generation.load(Ordering::Relaxed) == generation
@@ -229,7 +245,7 @@ impl PortRange {
 	// MINT: grant `len` ports from `base` and wrap the grant in an object, or refuse - against the reserved
 	// set, every live grant and every retired span, in one step.
 	// The ports it grants, for the suites outside this module.
-	#[cfg(test)]
+	#[cfg(all(test, target_arch = "x86_64"))]
 	pub fn span(&self) -> (u16, u16) {
 		(self.base, self.len)
 	}

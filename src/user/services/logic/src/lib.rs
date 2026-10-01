@@ -60,6 +60,7 @@ pub mod open_sequence;
 pub mod piv;
 pub mod power_registry;
 pub mod printer_status;
+pub mod processor_policy;
 pub mod ptp;
 pub mod raw_ip;
 pub mod selection;

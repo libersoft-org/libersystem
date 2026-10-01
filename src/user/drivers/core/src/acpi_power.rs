@@ -10,6 +10,7 @@
 // A STORM OF NOTIFICATIONS IS BOUNDED: a `Notify` refreshes the node's state at most once per `REFRESH_TICKS`; one
 // arriving sooner is owed and coalesced into the refresh when it is due, however many arrive meanwhile.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use aml::wire::Value;
 
@@ -55,6 +56,37 @@ fn dword(value: &Value, what: &'static str) -> Result<u32, Refusal> {
 /// A method's integer result: `_STA`, `_PSR`, `_TMP`, a trip point.
 pub fn integer(value: &Value) -> Result<u32, Refusal> {
 	dword(value, "the method's result")
+}
+
+/// A NAMESPACE PATH as the processor contract and the fan publications carry it - `\_SB_.CPU0`, every segment four
+/// characters - from however a package element spelled it: a reference as the service sends it, or a name string,
+/// possibly with its trailing underscores left off.
+pub fn namespace_path(text: &str) -> String {
+	let body = text.trim_start_matches('\\');
+	let mut out = String::from("\\");
+	for (at, segment) in body.split('.').filter(|segment| !segment.is_empty()).enumerate() {
+		if at != 0 {
+			out.push('.');
+		}
+		out.push_str(segment);
+		for _ in segment.len()..4 {
+			out.push('_');
+		}
+	}
+	out
+}
+
+/// THE DEVICES A PACKAGE LISTS - `_PSL`'s processors, an `_ALx`'s fans - by namespace path. At most `most`.
+pub fn devices(value: &Value, most: usize) -> Result<Vec<String>, Refusal> {
+	let Value::Package(elements) = value else { return Err(Refusal::Shape("a device list")) };
+	let mut out = Vec::new();
+	for element in elements.iter().take(most) {
+		match element {
+			Value::Reference(path) | Value::String(path) => out.push(namespace_path(path)),
+			_ => return Err(Refusal::Shape("a device list's element")),
+		}
+	}
+	Ok(out)
 }
 
 /// A battery's static description, from `_BIX` or `_BIF` - the fields both carry.

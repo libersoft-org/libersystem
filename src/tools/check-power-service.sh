@@ -54,9 +54,12 @@ guest_gate_require_programs power_fixture powercheck powerread power_service
 # THE FIXTURE'S DEVICE, at the address its registry entry pins. A machine without it never binds the
 # fixture, which is what keeps it out of every image this gate did not build.
 export QEMU_EXTRA="-device edu,addr=0x1e"
-# The withheld reply alone is eleven seconds of waiting, and a restart follows it.
-export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-200}"
-export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-360}"
+# The withheld reply alone is eleven seconds of waiting, and a restart follows it. AND THE BOOT COMES OUT OF THE SAME
+# BUDGET: measured 2026-10-01 at 75 s from the kernel's first line to the shell on this machine (41 s of it StorageService
+# copying the live system volume into memory), 118 s from the firmware - so 200 s left a run that met a slow boot
+# with three of its fifteen lines typed.
+export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
+export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"
 
 expect() {
 	local lines="$1" line="$2" why="$3"

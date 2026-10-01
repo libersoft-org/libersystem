@@ -504,7 +504,8 @@ sleep 2
 [[ "$(status_of sinking)" == 0 ]] || fail "$case_name: the sink path was on while the guest slept"
 [[ "$(status_of contract)" == none ]] || fail "$case_name: a contract was made while the guest slept"
 await_line "ServiceManager: sleep: the transaction ended" "$case_name: the suspend to idle never ended" "$ended" 120
-grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "$case_name: the suspend to idle did not sleep and wake"
+ended="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 || true)"
+grep -q "slept and woke" <<<"$ended" || fail "$case_name: the suspend to idle did not sleep and wake"
 contracted 15000
 no_violations
 tcpc_ok detach >/dev/null

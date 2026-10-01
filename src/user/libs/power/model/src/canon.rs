@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 
 use crate::convert::Tagged;
-use crate::schema::{Alarm, AlarmKind, Capacity, InvalidReason, MeasureI64, MeasureU64, Provenance, Quantity, SourceState, Temperature, TemperatureReference, TripKind, TripPoint, Tristate, ValueState};
+use crate::schema::{Alarm, AlarmKind, Capacity, InvalidReason, MeasureI64, MeasureU64, Provenance, Quantity, SourceKind, SourceState, Temperature, TemperatureReference, TripKind, TripPoint, Tristate, ValueState};
 
 /// The most trip points one source carries: critical, hot, passive and ten active levels fit.
 pub const MAX_TRIPS: usize = 16;
@@ -138,6 +138,41 @@ pub fn derived(kind: AlarmKind, state: Tristate) -> Alarm {
 
 pub fn trip(kind: TripKind, index: u8, temperature: Temperature) -> TripPoint {
 	TripPoint { kind, index, temperature }
+}
+
+/// WHAT THE MACHINE RUNS ON, from every source it has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Supply {
+	/// Line power known to be absent - an AC adapter or a Type-C supply off line with none on line - or a battery says
+	/// it is on battery.
+	pub on_battery: bool,
+	/// A battery's critical-capacity alarm is on.
+	pub critical: bool,
+}
+
+/// THE SUPPLY, read from every source's state: what the sleep policy and the processors' profiles both follow.
+pub fn supply<'a>(sources: impl Iterator<Item = &'a SourceState>) -> Supply {
+	let (mut line, mut unplugged, mut alarmed, mut critical) = (false, false, false, false);
+	for source in sources {
+		if matches!(source.kind, SourceKind::Ac | SourceKind::UsbC) {
+			match source.online {
+				Tristate::Yes => line = true,
+				Tristate::No => unplugged = true,
+				Tristate::Unknown => {}
+			}
+		}
+		for alarm in &source.alarms {
+			if alarm.state != Tristate::Yes {
+				continue;
+			}
+			match alarm.kind {
+				AlarmKind::OnBattery => alarmed = true,
+				AlarmKind::CriticalCapacity if source.kind == SourceKind::Battery => critical = true,
+				_ => {}
+			}
+		}
+	}
+	Supply { on_battery: !line && (unplugged || alarmed), critical }
 }
 
 /// WHETHER AN UPDATE CHANGES AN ALARM: any alarm entering, leaving or changing state. Such an update is

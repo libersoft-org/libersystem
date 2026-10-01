@@ -277,6 +277,7 @@ const VIRTIO_CAP_ISR: u8 = 3;
 const VIRTIO_CAP_DEVICE: u8 = 4;
 
 // The command-register bits (config offset 0x04, low 16).
+#[cfg(target_arch = "x86_64")]
 const CMD_IO_SPACE: u16 = 1 << 0;
 const CMD_MEMORY_SPACE: u16 = 1 << 1;
 const CMD_BUS_MASTER: u16 = 1 << 2;
@@ -1783,6 +1784,7 @@ pub fn enable_memory_space<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
 //
 // A BAR nobody placed reads back zero and is not recorded; neither is one whose base or end lies past
 // 0xFFFF, which is no port.
+#[cfg(target_arch = "x86_64")]
 pub fn io_bars<A: ConfigAccess>(bus: u8, dev: u8, func: u8, out: &mut [(u8, u16, u16); 6]) -> usize {
 	// Endpoints only: a bridge's I/O window forwards for what is behind it and is nobody's to grant.
 	if (A::read32(bus, dev, func, 0x0C) >> 16) & 0x7F != 0 {
@@ -1842,6 +1844,7 @@ pub fn io_bars<A: ConfigAccess>(bus: u8, dev: u8, func: u8, out: &mut [(u8, u16,
 
 // Turn a function's I/O decode on or off - a claim of a row with an I/O BAR sets it, its release clears
 // it, exactly as bus mastering is handled.
+#[cfg(target_arch = "x86_64")]
 pub fn set_io_decode<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
 	A::update32(bus, dev, func, 0x04, |dword| {
 		let command = dword as u16;

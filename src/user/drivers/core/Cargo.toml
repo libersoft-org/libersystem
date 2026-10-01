@@ -95,6 +95,7 @@ name = "admin_fixture"
 path = "src/admin_fixture.rs"
 test = false
 bench = false
+required-features = ["development"]
 
 # THE ACPI GATE'S FIXTURE DRIVER, bound to the fixture SSDT's `LSFX0001` node in a development image alone.
 [[bin]]
@@ -235,6 +236,15 @@ bench = false
 # and published as a `power-source`. Its pure parts are `src/acpi_power.rs`, in the library and host-tested.
 name = "acpi_power"
 path = "src/acpi_power_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE ACPI FAN: one binding per `PNP0C0B` node, `_FIF`, `_FPS`, `_FSL` and `_FST` - or its device power state for an ACPI
+# 1.0 fan - over the node channel, published as a `cooling-device` to ProcessorPowerService. Its pure parts are
+# `src/acpi_fan.rs`, in the library and host-tested.
+name = "acpi_fan"
+path = "src/acpi_fan_driver.rs"
 test = false
 bench = false
 

@@ -54,6 +54,12 @@ pub enum PrivilegeKind {
 	// May read hibernation's snapshot - every byte memory held - and replace the whole of memory with an image
 	// (`SYS_SNAPSHOT_*`, `SYS_RESTORE_*`). The image component's alone: its holder is the machine.
 	Hibernation,
+	// May install a core's idle and performance tables, set its performance window and the idle injected into it
+	// (`SYS_PROCESSOR_*`). ProcessorPowerService's alone: the kernel writes every processor register, under this.
+	ProcessorPower,
+	// May bound every core's idle states for as long as a request it mints lives (`SYS_LATENCY_REQUEST`) - AudioService,
+	// for playback. Bounded: four live requests per process and sixty-four in the system.
+	IdleLatency,
 }
 
 impl PrivilegeKind {}

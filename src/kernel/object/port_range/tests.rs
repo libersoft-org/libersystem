@@ -6,12 +6,14 @@
 // into the serial log the suite is judged by. The probes that only need permission, not a device, loop on
 // ports nothing answers at: an access is what is being tested, not what comes back.
 
+#[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
 
 use super::grants::{self, Part, Refusal};
 use super::*;
 use crate::object::handle::Handle;
 use crate::object::rights::Rights;
+#[cfg(target_arch = "x86_64")]
 use crate::sync::SpinLock;
 use crate::{device, sched, syscall};
 
@@ -19,6 +21,7 @@ use crate::{device, sched, syscall};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // A handle in the calling thread's table, as the object behind it.
+#[cfg(target_arch = "x86_64")]
 fn range_of(handle: i64) -> Arc<PortRange> {
 	let thread = sched::current_thread().expect("a current thread");
 	let object = thread.handles().lock().lookup_typed(Handle::from_raw(handle as u64), ObjectType::PortRange, Rights::MAP).expect("a port-range handle");

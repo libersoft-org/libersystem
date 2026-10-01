@@ -379,6 +379,7 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 // transition: every one of them was reset by the same S3, and their restored bus mastering belongs to drivers that
 // are suspended. Then every live attachment and mapping is sent to it again (`Iommu::replay_after_reset`). A
 // controller that does not come back leaves translation refused, as at a failed boot.
+#[cfg(target_arch = "x86_64")]
 pub fn resume_after_reset() -> bool {
 	if !PRESENT.load(Ordering::Acquire) {
 		return true;

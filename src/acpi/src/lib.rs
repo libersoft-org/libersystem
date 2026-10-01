@@ -874,10 +874,12 @@ pub struct InterruptOverride {
 
 /// The Multiple APIC Description Table, read for the entries this system acts on.
 ///
-/// WHAT IT IS FOR HERE IS THE OVERRIDES AND NOT THE PROCESSORS. The kernel already walks this table
-/// for local APIC ids in its own boot path, where it runs before there is anything to test with; the
-/// entries below are DECISIONS about how a line is configured, and a decision belongs where a fixture
-/// can plant the mistake. A caller wanting the processors keeps its own walk.
+/// WHAT IT IS FOR HERE IS THE OVERRIDES, AND WHICH PROCESSOR UID IS WHICH APIC. The kernel walks this
+/// table for local APIC ids in its own boot path, where it runs before there is anything to test with;
+/// the overrides are DECISIONS about how a line is configured, and a decision belongs where a fixture
+/// can plant the mistake. `processors` is what the ACPI service reads to name the kernel's core a
+/// namespace processor is - its `_UID` against an entry's processor UID, the entry's APIC id against
+/// the id each core reports.
 #[derive(Clone, Copy)]
 pub struct Madt<'a> {
 	table: Table<'a>,
@@ -890,6 +892,19 @@ const MADT_ENTRIES: usize = 44;
 /// An Interrupt Source Override entry is type 2 and ten bytes.
 const MADT_OVERRIDE: u8 = 2;
 const MADT_OVERRIDE_LEN: usize = 10;
+/// A Processor Local APIC entry is type 0 and eight bytes; a Processor Local x2APIC entry is type 9 and sixteen.
+const MADT_LOCAL_APIC: u8 = 0;
+const MADT_LOCAL_APIC_LEN: usize = 8;
+const MADT_LOCAL_X2APIC: u8 = 9;
+const MADT_LOCAL_X2APIC_LEN: usize = 16;
+
+/// ONE PROCESSOR the MADT lists: its ACPI processor UID, its APIC id and whether it is enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MadtProcessor {
+	pub uid: u32,
+	pub apic_id: u32,
+	pub enabled: bool,
+}
 
 impl<'a> Madt<'a> {
 	/// Validate the bytes as an `APIC` table.
@@ -940,6 +955,33 @@ impl<'a> Madt<'a> {
 					let gsi = self.table.u32_at(here + 4)?;
 					let flags = self.table.u16_at(here + 8)?;
 					return Some(InterruptOverride { bus, source, gsi, polarity: polarity_of(flags), trigger: trigger_of(flags) });
+				}
+			}
+		})
+	}
+}
+
+impl<'a> Madt<'a> {
+	/// Every Processor Local APIC and Local x2APIC entry, in the order the firmware wrote them. An entry that does
+	/// not fit inside the table ends the walk, as in `overrides`.
+	pub fn processors(&self) -> impl Iterator<Item = MadtProcessor> + '_ {
+		let mut offset = MADT_ENTRIES;
+		core::iter::from_fn(move || {
+			loop {
+				let kind = self.table.u8_at(offset)?;
+				let len = self.table.u8_at(offset + 1)? as usize;
+				if len < 2 || offset.checked_add(len)? > self.table.len() {
+					return None;
+				}
+				let here = offset;
+				offset += len;
+				if kind == MADT_LOCAL_APIC && len >= MADT_LOCAL_APIC_LEN {
+					let flags = self.table.u32_at(here + 4)?;
+					return Some(MadtProcessor { uid: u32::from(self.table.u8_at(here + 2)?), apic_id: u32::from(self.table.u8_at(here + 3)?), enabled: flags & 1 != 0 });
+				}
+				if kind == MADT_LOCAL_X2APIC && len >= MADT_LOCAL_X2APIC_LEN {
+					let flags = self.table.u32_at(here + 8)?;
+					return Some(MadtProcessor { uid: self.table.u32_at(here + 12)?, apic_id: self.table.u32_at(here + 4)?, enabled: flags & 1 != 0 });
 				}
 			}
 		})

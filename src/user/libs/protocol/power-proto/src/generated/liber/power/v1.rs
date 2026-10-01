@@ -10,7 +10,11 @@
 //!
 //! THIS IS NOT MACHINE SHUTDOWN. Rebooting and powering off the host stay with SystemManager's
 //! `system-power`; this service holds no client of it. Turning a UPS's output off turns the UPS's
-//! output off. Suspend, fan curves and power policy are not here at all.
+//! output off. Suspend is `liber:process@1`'s.
+//!
+//! AND THE PROCESSORS' AND THE ZONES' COOLING, at the end: a thermal zone's cooling half and a fan as their drivers
+//! serve them to ProcessorPowerService, and that service's operator authority - the profile, the fan curves - which
+//! `powerctl` holds.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
 use crate::codec::{Handles, PROTOCOL_INFO_OP, Reader, Sink, SliceWriter, VecWriter};
@@ -3780,6 +3784,2096 @@ pub mod power_fixture {
 	}
 }
 
+/// AN ACTIVE TRIP POINT: `_ACx`'s temperature in tenths of a kelvin and `_ALx`'s devices - the fans it switches on - by
+/// namespace path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveTrip {
+	pub level: u8,
+	pub temperature: u32,
+	pub devices: Vec<String>,
+}
+
+impl ActiveTrip {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ActiveTrip> {
+		let mut r = Reader::new(bytes);
+		let value = ActiveTrip::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ActiveTrip> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ActiveTrip::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.level)?;
+		w.u32(self.temperature)?;
+		if self.devices.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.devices.len() as u16)?;
+		for v48 in self.devices.iter() {
+			w.bytes_lp(v48.as_bytes())?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ActiveTrip> {
+		let level = r.u8()?;
+		let temperature = r.u32()?;
+		let devices = {
+			let v49 = r.u16()? as usize;
+			let v49 = (v49 <= 8).then_some(v49)?;
+			let mut v50 = Vec::new();
+			v50.try_reserve_exact(v49).ok()?;
+			for _ in 0..v49 {
+				v50.push(r.string_lp()?);
+			}
+			v50
+		};
+		Some(ActiveTrip { level, temperature, devices })
+	}
+}
+
+/// A THERMAL ZONE'S COOLING HALF, as its driver read it: the zone; `_PSV`, `_CRT` and `_HOT` in tenths of a kelvin;
+/// `_TC1`, `_TC2` and `_TSP` (in tenths of a second) for passive cooling and `_PSL`'s processors; every `_ACx` with its
+/// `_ALx`; and whether it has `_SCP`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZoneCooling {
+	pub zone: String,
+	pub passive: Option<u32>,
+	pub critical: Option<u32>,
+	pub hot: Option<u32>,
+	pub tc1: u32,
+	pub tc2: u32,
+	pub tsp: u32,
+	pub passive_processors: Vec<String>,
+	pub active: Vec<ActiveTrip>,
+	pub scp: bool,
+}
+
+impl ZoneCooling {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ZoneCooling> {
+		let mut r = Reader::new(bytes);
+		let value = ZoneCooling::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ZoneCooling> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ZoneCooling::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.zone.as_bytes())?;
+		match &self.passive {
+			Some(v51) => {
+				w.u8(1)?;
+				w.u32(*v51)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.critical {
+			Some(v52) => {
+				w.u8(1)?;
+				w.u32(*v52)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.hot {
+			Some(v53) => {
+				w.u8(1)?;
+				w.u32(*v53)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.u32(self.tc1)?;
+		w.u32(self.tc2)?;
+		w.u32(self.tsp)?;
+		if self.passive_processors.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.passive_processors.len() as u16)?;
+		for v54 in self.passive_processors.iter() {
+			w.bytes_lp(v54.as_bytes())?;
+		}
+		if self.active.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.active.len() as u16)?;
+		for v55 in self.active.iter() {
+			v55.write(w)?;
+		}
+		w.boolean(self.scp)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ZoneCooling> {
+		let zone = {
+			let v56 = r.string_lp()?;
+			(v56.len() <= 64).then_some(v56)?
+		};
+		let passive = if r.tag()? { Some(r.u32()?) } else { None };
+		let critical = if r.tag()? { Some(r.u32()?) } else { None };
+		let hot = if r.tag()? { Some(r.u32()?) } else { None };
+		let tc1 = r.u32()?;
+		let tc2 = r.u32()?;
+		let tsp = r.u32()?;
+		let passive_processors = {
+			let v57 = r.u16()? as usize;
+			let v57 = (v57 <= 64).then_some(v57)?;
+			let mut v58 = Vec::new();
+			v58.try_reserve_exact(v57).ok()?;
+			for _ in 0..v57 {
+				v58.push(r.string_lp()?);
+			}
+			v58
+		};
+		let active = {
+			let v59 = r.u16()? as usize;
+			let v59 = (v59 <= 10).then_some(v59)?;
+			let mut v60 = Vec::new();
+			v60.try_reserve_exact(v59).ok()?;
+			for _ in 0..v59 {
+				v60.push(ActiveTrip::read(r)?);
+			}
+			v60
+		};
+		let scp = r.boolean()?;
+		Some(ZoneCooling { zone, passive, critical, hot, tc1, tc2, tsp, passive_processors, active, scp })
+	}
+}
+
+/// One reading of a zone's `_TMP`, in tenths of a kelvin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZoneReading {
+	pub temperature: u32,
+	pub sequence: u32,
+}
+
+impl ZoneReading {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ZoneReading> {
+		let mut r = Reader::new(bytes);
+		let value = ZoneReading::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ZoneReading> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ZoneReading::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.temperature)?;
+		w.u32(self.sequence)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ZoneReading> {
+		let temperature = r.u32()?;
+		let sequence = r.u32()?;
+		Some(ZoneReading { temperature, sequence })
+	}
+}
+
+/// THE `thermal-zone` PROVIDER CONTRACT, which a zone's driver serves to ProcessorPowerService alone: the zone's cooling
+/// objects, its readings - at the zone's own `_TZP`, at every `Notify`, and as often as `sample-every` asks while passive
+/// cooling is engaged - and `_SCP`. The driver ALSO compares every reading with `_CRT` itself and, past it, arms the
+/// kernel's forced power-off - the fallback for a policy that is not there.
+// interface `thermal-zone` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod thermal_zone {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_DESCRIBE: u16 = 1;
+	pub const OP_READINGS: u16 = 2;
+	pub const OP_SAMPLE_EVERY: u16 = 3;
+	pub const OP_COOLING_POLICY: u16 = 4;
+
+	pub trait Service {
+		fn describe(&mut self) -> Result<ZoneCooling, Error>;
+		fn readings(&mut self) -> Vec<ZoneReading>;
+		/// Read `_TMP` every `milliseconds` (at least a hundred), until asked for zero: the zone's own period again.
+		fn sample_every(&mut self, milliseconds: u32) -> Result<(), Error>;
+		/// `_SCP`: 0 active cooling preferred, 1 passive.
+		fn cooling_policy(&mut self, mode: u8) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:power")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_DESCRIBE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.describe();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v61) => {
+							w.u8(1)?;
+							v61.write(w)?;
+						}
+						Err(v62) => {
+							w.u8(0)?;
+							v62.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SAMPLE_EVERY => {
+				let milliseconds = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.sample_every(milliseconds);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v63) => {
+							w.u8(1)?;
+						}
+						Err(v64) => {
+							w.u8(0)?;
+							v64.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_COOLING_POLICY => {
+				let mode = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.cooling_policy(mode);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v65) => {
+							w.u8(1)?;
+						}
+						Err(v66) => {
+							w.u8(0)?;
+							v66.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn readings_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<ZoneReading>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.readings();
+		Some((corr, items))
+	}
+	pub fn readings_frame(seq: u32, item: &ZoneReading, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn readings_read(msg: &[u8], frame_handles: &mut Handles) -> Option<ZoneReading> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = ZoneReading::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn describe(&mut self) -> Option<Result<ZoneCooling, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DESCRIBE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(ZoneCooling::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn readings(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_READINGS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+		pub fn sample_every(&mut self, milliseconds: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SAMPLE_EVERY)?;
+			w.u32(corr)?;
+			w.u32(*milliseconds)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn cooling_policy(&mut self, mode: &u8) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_COOLING_POLICY)?;
+			w.u32(corr)?;
+			w.u8(*mode)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_thermal_zone_describe")]
+	fn channel_invoke_describe(chan: u64) -> Option<Result<ZoneCooling, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.describe()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_thermal_zone_readings")]
+	fn channel_invoke_readings(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.readings()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_thermal_zone_sample_every")]
+	fn channel_invoke_sample_every(chan: u64, milliseconds: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.sample_every(milliseconds)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_thermal_zone_cooling_policy")]
+	fn channel_invoke_cooling_policy(chan: u64, mode: &u8) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.cooling_policy(mode)
+	}
+}
+
+/// ONE `_FPS` LEVEL: the control value `_FSL` takes, and what the fan does at it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FanLevel {
+	pub control: u32,
+	pub speed_rpm: u32,
+	pub noise: u32,
+	pub power_mw: u32,
+}
+
+impl FanLevel {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FanLevel> {
+		let mut r = Reader::new(bytes);
+		let value = FanLevel::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FanLevel> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FanLevel::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.control)?;
+		w.u32(self.speed_rpm)?;
+		w.u32(self.noise)?;
+		w.u32(self.power_mw)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<FanLevel> {
+		let control = r.u32()?;
+		let speed_rpm = r.u32()?;
+		let noise = r.u32()?;
+		let power_mw = r.u32()?;
+		Some(FanLevel { control, speed_rpm, noise, power_mw })
+	}
+}
+
+/// A FAN, as its driver read it: its path; ACPI 4.0's `_FIF` and `_FPS` - fine-grain control, the step size and the
+/// levels - or, for an ACPI 1.0 fan, none, switched by its device power state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FanDescription {
+	pub path: String,
+	pub by_power_state: bool,
+	pub fine_grain: bool,
+	pub step_size: u32,
+	pub levels: Vec<FanLevel>,
+}
+
+impl FanDescription {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FanDescription> {
+		let mut r = Reader::new(bytes);
+		let value = FanDescription::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FanDescription> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FanDescription::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.path.as_bytes())?;
+		w.boolean(self.by_power_state)?;
+		w.boolean(self.fine_grain)?;
+		w.u32(self.step_size)?;
+		if self.levels.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.levels.len() as u16)?;
+		for v67 in self.levels.iter() {
+			v67.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<FanDescription> {
+		let path = {
+			let v68 = r.string_lp()?;
+			(v68.len() <= 64).then_some(v68)?
+		};
+		let by_power_state = r.boolean()?;
+		let fine_grain = r.boolean()?;
+		let step_size = r.u32()?;
+		let levels = {
+			let v69 = r.u16()? as usize;
+			let v69 = (v69 <= 16).then_some(v69)?;
+			let mut v70 = Vec::new();
+			v70.try_reserve_exact(v69).ok()?;
+			for _ in 0..v69 {
+				v70.push(FanLevel::read(r)?);
+			}
+			v70
+		};
+		Some(FanDescription { path, by_power_state, fine_grain, step_size, levels })
+	}
+}
+
+/// `_FST`: the control value in force and the speed (zero where the fan does not say).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FanStatus {
+	pub control: u32,
+	pub speed_rpm: u32,
+}
+
+impl FanStatus {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FanStatus> {
+		let mut r = Reader::new(bytes);
+		let value = FanStatus::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FanStatus> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FanStatus::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.control)?;
+		w.u32(self.speed_rpm)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<FanStatus> {
+		let control = r.u32()?;
+		let speed_rpm = r.u32()?;
+		Some(FanStatus { control, speed_rpm })
+	}
+}
+
+/// THE `cooling-device` PROVIDER CONTRACT, which a fan's driver serves to ProcessorPowerService alone: its description,
+/// a level set - `_FSL`, or D0 for any level above zero and D3hot for zero on a fan without it - and `_FST`.
+// interface `cooling-device` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod cooling_device {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_DESCRIBE: u16 = 1;
+	pub const OP_SET_LEVEL: u16 = 2;
+	pub const OP_STATUS: u16 = 3;
+
+	pub trait Service {
+		fn describe(&mut self) -> Result<FanDescription, Error>;
+		fn set_level(&mut self, level: u32) -> Result<FanStatus, Error>;
+		fn status(&mut self) -> Result<FanStatus, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:power")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_DESCRIBE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.describe();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v71) => {
+							w.u8(1)?;
+							v71.write(w)?;
+						}
+						Err(v72) => {
+							w.u8(0)?;
+							v72.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_LEVEL => {
+				let level = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_level(level);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v73) => {
+							w.u8(1)?;
+							v73.write(w)?;
+						}
+						Err(v74) => {
+							w.u8(0)?;
+							v74.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_STATUS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.status();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v75) => {
+							w.u8(1)?;
+							v75.write(w)?;
+						}
+						Err(v76) => {
+							w.u8(0)?;
+							v76.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn describe(&mut self) -> Option<Result<FanDescription, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DESCRIBE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(FanDescription::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_level(&mut self, level: &u32) -> Option<Result<FanStatus, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_LEVEL)?;
+			w.u32(corr)?;
+			w.u32(*level)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(FanStatus::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn status(&mut self) -> Option<Result<FanStatus, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STATUS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(FanStatus::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_cooling_device_describe")]
+	fn channel_invoke_describe(chan: u64) -> Option<Result<FanDescription, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.describe()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_cooling_device_set_level")]
+	fn channel_invoke_set_level(chan: u64, level: &u32) -> Option<Result<FanStatus, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_level(level)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_cooling_device_status")]
+	fn channel_invoke_status(chan: u64) -> Option<Result<FanStatus, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.status()
+	}
+}
+
+/// The profiles a person chooses between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PowerProfile {
+	Performance = 1,
+	Balanced = 2,
+	PowerSaving = 3,
+}
+
+impl PowerProfile {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PowerProfile> {
+		let mut r = Reader::new(bytes);
+		let value = PowerProfile::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PowerProfile> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PowerProfile::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PowerProfile> {
+		match r.u8()? {
+			1 => Some(PowerProfile::Performance),
+			2 => Some(PowerProfile::Balanced),
+			3 => Some(PowerProfile::PowerSaving),
+			_ => None,
+		}
+	}
+}
+
+/// ONE POINT OF A FAN CURVE: at this temperature (tenths of a kelvin) and above, this share of the fan's range.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurvePoint {
+	pub temperature: u32,
+	pub percent: u8,
+}
+
+impl CurvePoint {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CurvePoint> {
+		let mut r = Reader::new(bytes);
+		let value = CurvePoint::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CurvePoint> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CurvePoint::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.temperature)?;
+		w.u8(self.percent)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CurvePoint> {
+		let temperature = r.u32()?;
+		let percent = r.u8()?;
+		Some(CurvePoint { temperature, percent })
+	}
+}
+
+/// One core, as the kernel's record states it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorePower {
+	pub cpu: u32,
+	pub idle_states: u32,
+	pub perf_levels: u32,
+	pub perf_level: u32,
+	pub window_cap: u32,
+	pub window_floor: u32,
+	pub inject_permille: u32,
+	pub latency_requests: u32,
+}
+
+impl CorePower {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CorePower> {
+		let mut r = Reader::new(bytes);
+		let value = CorePower::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CorePower> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CorePower::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.cpu)?;
+		w.u32(self.idle_states)?;
+		w.u32(self.perf_levels)?;
+		w.u32(self.perf_level)?;
+		w.u32(self.window_cap)?;
+		w.u32(self.window_floor)?;
+		w.u32(self.inject_permille)?;
+		w.u32(self.latency_requests)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<CorePower> {
+		let cpu = r.u32()?;
+		let idle_states = r.u32()?;
+		let perf_levels = r.u32()?;
+		let perf_level = r.u32()?;
+		let window_cap = r.u32()?;
+		let window_floor = r.u32()?;
+		let inject_permille = r.u32()?;
+		let latency_requests = r.u32()?;
+		Some(CorePower { cpu, idle_states, perf_levels, perf_level, window_cap, window_floor, inject_permille, latency_requests })
+	}
+}
+
+/// One zone, as the policy reads it: its temperature, its trips and the cap passive cooling holds its processors to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZonePower {
+	pub zone: String,
+	pub temperature: u32,
+	pub passive: Option<u32>,
+	pub critical: Option<u32>,
+	pub hot: Option<u32>,
+	pub passive_engaged: bool,
+	pub cap_percent: u32,
+}
+
+impl ZonePower {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ZonePower> {
+		let mut r = Reader::new(bytes);
+		let value = ZonePower::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ZonePower> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ZonePower::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.zone.as_bytes())?;
+		w.u32(self.temperature)?;
+		match &self.passive {
+			Some(v77) => {
+				w.u8(1)?;
+				w.u32(*v77)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.critical {
+			Some(v78) => {
+				w.u8(1)?;
+				w.u32(*v78)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.hot {
+			Some(v79) => {
+				w.u8(1)?;
+				w.u32(*v79)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.boolean(self.passive_engaged)?;
+		w.u32(self.cap_percent)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ZonePower> {
+		let zone = {
+			let v80 = r.string_lp()?;
+			(v80.len() <= 64).then_some(v80)?
+		};
+		let temperature = r.u32()?;
+		let passive = if r.tag()? { Some(r.u32()?) } else { None };
+		let critical = if r.tag()? { Some(r.u32()?) } else { None };
+		let hot = if r.tag()? { Some(r.u32()?) } else { None };
+		let passive_engaged = r.boolean()?;
+		let cap_percent = r.u32()?;
+		Some(ZonePower { zone, temperature, passive, critical, hot, passive_engaged, cap_percent })
+	}
+}
+
+/// One fan, as the policy commands it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FanPower {
+	pub path: String,
+	pub control: u32,
+	pub speed_rpm: u32,
+	pub curve: Vec<CurvePoint>,
+}
+
+impl FanPower {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FanPower> {
+		let mut r = Reader::new(bytes);
+		let value = FanPower::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FanPower> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FanPower::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.path.as_bytes())?;
+		w.u32(self.control)?;
+		w.u32(self.speed_rpm)?;
+		if self.curve.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.curve.len() as u16)?;
+		for v81 in self.curve.iter() {
+			v81.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<FanPower> {
+		let path = {
+			let v82 = r.string_lp()?;
+			(v82.len() <= 64).then_some(v82)?
+		};
+		let control = r.u32()?;
+		let speed_rpm = r.u32()?;
+		let curve = {
+			let v83 = r.u16()? as usize;
+			let v83 = (v83 <= 8).then_some(v83)?;
+			let mut v84 = Vec::new();
+			v84.try_reserve_exact(v83).ok()?;
+			for _ in 0..v83 {
+				v84.push(CurvePoint::read(r)?);
+			}
+			v84
+		};
+		Some(FanPower { path, control, speed_rpm, curve })
+	}
+}
+
+/// THE POLICY NOW: the profile and why it is the one, every core, every zone and every fan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessorPowerStatus {
+	pub profile: PowerProfile,
+	pub because: String,
+	pub cores: Vec<CorePower>,
+	pub zones: Vec<ZonePower>,
+	pub fans: Vec<FanPower>,
+}
+
+impl ProcessorPowerStatus {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessorPowerStatus> {
+		let mut r = Reader::new(bytes);
+		let value = ProcessorPowerStatus::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProcessorPowerStatus> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessorPowerStatus::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.profile.write(w)?;
+		w.bytes_lp(self.because.as_bytes())?;
+		if self.cores.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.cores.len() as u16)?;
+		for v85 in self.cores.iter() {
+			v85.write(w)?;
+		}
+		if self.zones.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.zones.len() as u16)?;
+		for v86 in self.zones.iter() {
+			v86.write(w)?;
+		}
+		if self.fans.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.fans.len() as u16)?;
+		for v87 in self.fans.iter() {
+			v87.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProcessorPowerStatus> {
+		let profile = PowerProfile::read(r)?;
+		let because = {
+			let v88 = r.string_lp()?;
+			(v88.len() <= 64).then_some(v88)?
+		};
+		let cores = {
+			let v89 = r.u16()? as usize;
+			let v89 = (v89 <= 64).then_some(v89)?;
+			let mut v90 = Vec::new();
+			v90.try_reserve_exact(v89).ok()?;
+			for _ in 0..v89 {
+				v90.push(CorePower::read(r)?);
+			}
+			v90
+		};
+		let zones = {
+			let v91 = r.u16()? as usize;
+			let v91 = (v91 <= 16).then_some(v91)?;
+			let mut v92 = Vec::new();
+			v92.try_reserve_exact(v91).ok()?;
+			for _ in 0..v91 {
+				v92.push(ZonePower::read(r)?);
+			}
+			v92
+		};
+		let fans = {
+			let v93 = r.u16()? as usize;
+			let v93 = (v93 <= 16).then_some(v93)?;
+			let mut v94 = Vec::new();
+			v94.try_reserve_exact(v93).ok()?;
+			for _ in 0..v93 {
+				v94.push(FanPower::read(r)?);
+			}
+			v94
+		};
+		Some(ProcessorPowerStatus { profile, because, cores, zones, fans })
+	}
+}
+
+/// THE OPERATOR AUTHORITY over ProcessorPowerService, granted as PowerService's `power-control` is: the status, the
+/// profile, and a fan's curve where the platform leaves the fan to the operating system (`_FIF`'s fine-grain control).
+/// NOTHING HERE REACHES `_CRT` OR `_HOT`, which no profile, curve or operator verb turns off.
+// interface `processor-power-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod processor_power_admin {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_STATUS: u16 = 1;
+	pub const OP_SET_PROFILE: u16 = 2;
+	pub const OP_SET_FAN_CURVE: u16 = 3;
+
+	pub trait Service {
+		fn status(&mut self) -> Result<ProcessorPowerStatus, Error>;
+		fn set_profile(&mut self, profile: PowerProfile) -> Result<(), Error>;
+		fn set_fan_curve(&mut self, fan: String, curve: Vec<CurvePoint>) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:power")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_STATUS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.status();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v95) => {
+							w.u8(1)?;
+							v95.write(w)?;
+						}
+						Err(v96) => {
+							w.u8(0)?;
+							v96.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_PROFILE => {
+				let profile = PowerProfile::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_profile(profile);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v97) => {
+							w.u8(1)?;
+						}
+						Err(v98) => {
+							w.u8(0)?;
+							v98.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_FAN_CURVE => {
+				let fan = {
+					let v99 = r.string_lp()?;
+					(v99.len() <= 64).then_some(v99)?
+				};
+				let curve = {
+					let v100 = r.u16()? as usize;
+					let v100 = (v100 <= 8).then_some(v100)?;
+					let mut v101 = Vec::new();
+					v101.try_reserve_exact(v100).ok()?;
+					for _ in 0..v100 {
+						v101.push(CurvePoint::read(r)?);
+					}
+					v101
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_fan_curve(fan, curve);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v102) => {
+							w.u8(1)?;
+						}
+						Err(v103) => {
+							w.u8(0)?;
+							v103.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn status(&mut self) -> Option<Result<ProcessorPowerStatus, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STATUS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(ProcessorPowerStatus::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_profile(&mut self, profile: &PowerProfile) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_PROFILE)?;
+			w.u32(corr)?;
+			profile.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_fan_curve(&mut self, fan: &str, curve: &[CurvePoint]) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_FAN_CURVE)?;
+			w.u32(corr)?;
+			w.bytes_lp(fan.as_bytes())?;
+			if curve.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(curve.len() as u16)?;
+			for v104 in curve.iter() {
+				v104.write(w)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_processor_power_admin_status")]
+	fn channel_invoke_status(chan: u64) -> Option<Result<ProcessorPowerStatus, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.status()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_processor_power_admin_set_profile")]
+	fn channel_invoke_set_profile(chan: u64, profile: &PowerProfile) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_profile(profile)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_power_processor_power_admin_set_fan_curve")]
+	fn channel_invoke_set_fan_curve(chan: u64, fan: &str, curve: &[CurvePoint]) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_fan_curve(fan, curve)
+	}
+}
+
 impl SourceKind {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -4670,25 +6764,25 @@ impl SourceState {
 		out.push(',');
 		out.push_str("\"trips\":");
 		out.push('[');
-		let mut v49 = true;
-		for v48 in self.trips.iter() {
-			if !v49 {
+		let mut v106 = true;
+		for v105 in self.trips.iter() {
+			if !v106 {
 				out.push(',');
 			}
-			v49 = false;
-			v48.to_json_into(out);
+			v106 = false;
+			v105.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"alarms\":");
 		out.push('[');
-		let mut v51 = true;
-		for v50 in self.alarms.iter() {
-			if !v51 {
+		let mut v108 = true;
+		for v107 in self.alarms.iter() {
+			if !v108 {
 				out.push(',');
 			}
-			v51 = false;
-			v50.to_json_into(out);
+			v108 = false;
+			v107.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -4697,8 +6791,8 @@ impl SourceState {
 		out.push(',');
 		out.push_str("\"source-time\":");
 		match &self.source_time {
-			Some(v52) => {
-				let _ = write!(out, "{}", v52);
+			Some(v109) => {
+				let _ = write!(out, "{}", v109);
 			}
 			None => {
 				out.push_str("null");
@@ -4752,25 +6846,25 @@ impl SourceState {
 		out.push_str(", ");
 		out.push_str("trips=");
 		out.push('[');
-		let mut v54 = true;
-		for v53 in self.trips.iter() {
-			if !v54 {
+		let mut v111 = true;
+		for v110 in self.trips.iter() {
+			if !v111 {
 				out.push_str(", ");
 			}
-			v54 = false;
-			v53.to_text_into(out);
+			v111 = false;
+			v110.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("alarms=");
 		out.push('[');
-		let mut v56 = true;
-		for v55 in self.alarms.iter() {
-			if !v56 {
+		let mut v113 = true;
+		for v112 in self.alarms.iter() {
+			if !v113 {
 				out.push_str(", ");
 			}
-			v56 = false;
-			v55.to_text_into(out);
+			v113 = false;
+			v112.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4779,8 +6873,8 @@ impl SourceState {
 		out.push_str(", ");
 		out.push_str("source-time=");
 		match &self.source_time {
-			Some(v57) => {
-				let _ = write!(out, "{}", v57);
+			Some(v114) => {
+				let _ = write!(out, "{}", v114);
 			}
 			None => {
 				out.push('-');
@@ -4820,20 +6914,20 @@ impl SourceState {
 		self.temperature.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trips");
 		crate::codec::cbor::array(out, self.trips.len());
-		for v58 in self.trips.iter() {
-			v58.to_cbor_into(out);
+		for v115 in self.trips.iter() {
+			v115.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alarms");
 		crate::codec::cbor::array(out, self.alarms.len());
-		for v59 in self.alarms.iter() {
-			v59.to_cbor_into(out);
+		for v116 in self.alarms.iter() {
+			v116.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "controls");
 		self.controls.to_cbor_into(out);
 		crate::codec::cbor::text(out, "source-time");
 		match &self.source_time {
-			Some(v60) => {
-				crate::codec::cbor::uint(out, *v60 as u64);
+			Some(v117) => {
+				crate::codec::cbor::uint(out, *v117 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5026,8 +7120,8 @@ impl PowerChange {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v61) => {
-				v61.to_json_into(out);
+			Some(v118) => {
+				v118.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -5036,8 +7130,8 @@ impl PowerChange {
 		out.push(',');
 		out.push_str("\"gone\":");
 		match &self.gone {
-			Some(v62) => {
-				v62.to_json_into(out);
+			Some(v119) => {
+				v119.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -5058,8 +7152,8 @@ impl PowerChange {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v63) => {
-				v63.to_text_into(out);
+			Some(v120) => {
+				v120.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -5068,8 +7162,8 @@ impl PowerChange {
 		out.push_str(", ");
 		out.push_str("gone=");
 		match &self.gone {
-			Some(v64) => {
-				v64.to_text_into(out);
+			Some(v121) => {
+				v121.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -5087,8 +7181,8 @@ impl PowerChange {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v65) => {
-				v65.to_cbor_into(out);
+			Some(v122) => {
+				v122.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5096,8 +7190,8 @@ impl PowerChange {
 		}
 		crate::codec::cbor::text(out, "gone");
 		match &self.gone {
-			Some(v66) => {
-				v66.to_cbor_into(out);
+			Some(v123) => {
+				v123.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5256,8 +7350,8 @@ impl ProviderUpdate {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v67) => {
-				v67.to_json_into(out);
+			Some(v124) => {
+				v124.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -5266,8 +7360,8 @@ impl ProviderUpdate {
 		out.push(',');
 		out.push_str("\"gone\":");
 		match &self.gone {
-			Some(v68) => {
-				let _ = write!(out, "{}", v68);
+			Some(v125) => {
+				let _ = write!(out, "{}", v125);
 			}
 			None => {
 				out.push_str("null");
@@ -5285,8 +7379,8 @@ impl ProviderUpdate {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v69) => {
-				v69.to_text_into(out);
+			Some(v126) => {
+				v126.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -5295,8 +7389,8 @@ impl ProviderUpdate {
 		out.push_str(", ");
 		out.push_str("gone=");
 		match &self.gone {
-			Some(v70) => {
-				let _ = write!(out, "{}", v70);
+			Some(v127) => {
+				let _ = write!(out, "{}", v127);
 			}
 			None => {
 				out.push('-');
@@ -5312,8 +7406,8 @@ impl ProviderUpdate {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v71) => {
-				v71.to_cbor_into(out);
+			Some(v128) => {
+				v128.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5321,8 +7415,8 @@ impl ProviderUpdate {
 		}
 		crate::codec::cbor::text(out, "gone");
 		match &self.gone {
-			Some(v72) => {
-				crate::codec::cbor::uint(out, *v72 as u64);
+			Some(v129) => {
+				crate::codec::cbor::uint(out, *v129 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5579,6 +7673,1084 @@ impl FixtureCommand {
 		crate::codec::cbor::boolean(out, self.on);
 		crate::codec::cbor::text(out, "delay-seconds");
 		crate::codec::cbor::uint(out, self.delay_seconds as u64);
+	}
+}
+
+impl ActiveTrip {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"level\":");
+		let _ = write!(out, "{}", self.level);
+		out.push(',');
+		out.push_str("\"temperature\":");
+		let _ = write!(out, "{}", self.temperature);
+		out.push(',');
+		out.push_str("\"devices\":");
+		out.push('[');
+		let mut v131 = true;
+		for v130 in self.devices.iter() {
+			if !v131 {
+				out.push(',');
+			}
+			v131 = false;
+			crate::codec::json_escape(v130, out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("level=");
+		let _ = write!(out, "{}", self.level);
+		out.push_str(", ");
+		out.push_str("temperature=");
+		let _ = write!(out, "{}", self.temperature);
+		out.push_str(", ");
+		out.push_str("devices=");
+		out.push('[');
+		let mut v133 = true;
+		for v132 in self.devices.iter() {
+			if !v133 {
+				out.push_str(", ");
+			}
+			v133 = false;
+			out.push_str(v132);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "level");
+		crate::codec::cbor::uint(out, self.level as u64);
+		crate::codec::cbor::text(out, "temperature");
+		crate::codec::cbor::uint(out, self.temperature as u64);
+		crate::codec::cbor::text(out, "devices");
+		crate::codec::cbor::array(out, self.devices.len());
+		for v134 in self.devices.iter() {
+			crate::codec::cbor::text(out, v134);
+		}
+	}
+}
+
+impl ZoneCooling {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"zone\":");
+		crate::codec::json_escape(&self.zone, out);
+		out.push(',');
+		out.push_str("\"passive\":");
+		match &self.passive {
+			Some(v135) => {
+				let _ = write!(out, "{}", v135);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"critical\":");
+		match &self.critical {
+			Some(v136) => {
+				let _ = write!(out, "{}", v136);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"hot\":");
+		match &self.hot {
+			Some(v137) => {
+				let _ = write!(out, "{}", v137);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"tc1\":");
+		let _ = write!(out, "{}", self.tc1);
+		out.push(',');
+		out.push_str("\"tc2\":");
+		let _ = write!(out, "{}", self.tc2);
+		out.push(',');
+		out.push_str("\"tsp\":");
+		let _ = write!(out, "{}", self.tsp);
+		out.push(',');
+		out.push_str("\"passive-processors\":");
+		out.push('[');
+		let mut v139 = true;
+		for v138 in self.passive_processors.iter() {
+			if !v139 {
+				out.push(',');
+			}
+			v139 = false;
+			crate::codec::json_escape(v138, out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"active\":");
+		out.push('[');
+		let mut v141 = true;
+		for v140 in self.active.iter() {
+			if !v141 {
+				out.push(',');
+			}
+			v141 = false;
+			v140.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"scp\":");
+		if self.scp {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("zone=");
+		out.push_str(&self.zone);
+		out.push_str(", ");
+		out.push_str("passive=");
+		match &self.passive {
+			Some(v142) => {
+				let _ = write!(out, "{}", v142);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("critical=");
+		match &self.critical {
+			Some(v143) => {
+				let _ = write!(out, "{}", v143);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("hot=");
+		match &self.hot {
+			Some(v144) => {
+				let _ = write!(out, "{}", v144);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("tc1=");
+		let _ = write!(out, "{}", self.tc1);
+		out.push_str(", ");
+		out.push_str("tc2=");
+		let _ = write!(out, "{}", self.tc2);
+		out.push_str(", ");
+		out.push_str("tsp=");
+		let _ = write!(out, "{}", self.tsp);
+		out.push_str(", ");
+		out.push_str("passive-processors=");
+		out.push('[');
+		let mut v146 = true;
+		for v145 in self.passive_processors.iter() {
+			if !v146 {
+				out.push_str(", ");
+			}
+			v146 = false;
+			out.push_str(v145);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("active=");
+		out.push('[');
+		let mut v148 = true;
+		for v147 in self.active.iter() {
+			if !v148 {
+				out.push_str(", ");
+			}
+			v148 = false;
+			v147.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("scp=");
+		if self.scp {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 10);
+		crate::codec::cbor::text(out, "zone");
+		crate::codec::cbor::text(out, &self.zone);
+		crate::codec::cbor::text(out, "passive");
+		match &self.passive {
+			Some(v149) => {
+				crate::codec::cbor::uint(out, *v149 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "critical");
+		match &self.critical {
+			Some(v150) => {
+				crate::codec::cbor::uint(out, *v150 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "hot");
+		match &self.hot {
+			Some(v151) => {
+				crate::codec::cbor::uint(out, *v151 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "tc1");
+		crate::codec::cbor::uint(out, self.tc1 as u64);
+		crate::codec::cbor::text(out, "tc2");
+		crate::codec::cbor::uint(out, self.tc2 as u64);
+		crate::codec::cbor::text(out, "tsp");
+		crate::codec::cbor::uint(out, self.tsp as u64);
+		crate::codec::cbor::text(out, "passive-processors");
+		crate::codec::cbor::array(out, self.passive_processors.len());
+		for v152 in self.passive_processors.iter() {
+			crate::codec::cbor::text(out, v152);
+		}
+		crate::codec::cbor::text(out, "active");
+		crate::codec::cbor::array(out, self.active.len());
+		for v153 in self.active.iter() {
+			v153.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "scp");
+		crate::codec::cbor::boolean(out, self.scp);
+	}
+}
+
+impl ZoneReading {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"temperature\":");
+		let _ = write!(out, "{}", self.temperature);
+		out.push(',');
+		out.push_str("\"sequence\":");
+		let _ = write!(out, "{}", self.sequence);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("temperature=");
+		let _ = write!(out, "{}", self.temperature);
+		out.push_str(", ");
+		out.push_str("sequence=");
+		let _ = write!(out, "{}", self.sequence);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "temperature");
+		crate::codec::cbor::uint(out, self.temperature as u64);
+		crate::codec::cbor::text(out, "sequence");
+		crate::codec::cbor::uint(out, self.sequence as u64);
+	}
+}
+
+impl FanLevel {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"control\":");
+		let _ = write!(out, "{}", self.control);
+		out.push(',');
+		out.push_str("\"speed-rpm\":");
+		let _ = write!(out, "{}", self.speed_rpm);
+		out.push(',');
+		out.push_str("\"noise\":");
+		let _ = write!(out, "{}", self.noise);
+		out.push(',');
+		out.push_str("\"power-mw\":");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("control=");
+		let _ = write!(out, "{}", self.control);
+		out.push_str(", ");
+		out.push_str("speed-rpm=");
+		let _ = write!(out, "{}", self.speed_rpm);
+		out.push_str(", ");
+		out.push_str("noise=");
+		let _ = write!(out, "{}", self.noise);
+		out.push_str(", ");
+		out.push_str("power-mw=");
+		let _ = write!(out, "{}", self.power_mw);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "control");
+		crate::codec::cbor::uint(out, self.control as u64);
+		crate::codec::cbor::text(out, "speed-rpm");
+		crate::codec::cbor::uint(out, self.speed_rpm as u64);
+		crate::codec::cbor::text(out, "noise");
+		crate::codec::cbor::uint(out, self.noise as u64);
+		crate::codec::cbor::text(out, "power-mw");
+		crate::codec::cbor::uint(out, self.power_mw as u64);
+	}
+}
+
+impl FanDescription {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"path\":");
+		crate::codec::json_escape(&self.path, out);
+		out.push(',');
+		out.push_str("\"by-power-state\":");
+		if self.by_power_state {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"fine-grain\":");
+		if self.fine_grain {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"step-size\":");
+		let _ = write!(out, "{}", self.step_size);
+		out.push(',');
+		out.push_str("\"levels\":");
+		out.push('[');
+		let mut v155 = true;
+		for v154 in self.levels.iter() {
+			if !v155 {
+				out.push(',');
+			}
+			v155 = false;
+			v154.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("path=");
+		out.push_str(&self.path);
+		out.push_str(", ");
+		out.push_str("by-power-state=");
+		if self.by_power_state {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("fine-grain=");
+		if self.fine_grain {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("step-size=");
+		let _ = write!(out, "{}", self.step_size);
+		out.push_str(", ");
+		out.push_str("levels=");
+		out.push('[');
+		let mut v157 = true;
+		for v156 in self.levels.iter() {
+			if !v157 {
+				out.push_str(", ");
+			}
+			v157 = false;
+			v156.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "path");
+		crate::codec::cbor::text(out, &self.path);
+		crate::codec::cbor::text(out, "by-power-state");
+		crate::codec::cbor::boolean(out, self.by_power_state);
+		crate::codec::cbor::text(out, "fine-grain");
+		crate::codec::cbor::boolean(out, self.fine_grain);
+		crate::codec::cbor::text(out, "step-size");
+		crate::codec::cbor::uint(out, self.step_size as u64);
+		crate::codec::cbor::text(out, "levels");
+		crate::codec::cbor::array(out, self.levels.len());
+		for v158 in self.levels.iter() {
+			v158.to_cbor_into(out);
+		}
+	}
+}
+
+impl FanStatus {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"control\":");
+		let _ = write!(out, "{}", self.control);
+		out.push(',');
+		out.push_str("\"speed-rpm\":");
+		let _ = write!(out, "{}", self.speed_rpm);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("control=");
+		let _ = write!(out, "{}", self.control);
+		out.push_str(", ");
+		out.push_str("speed-rpm=");
+		let _ = write!(out, "{}", self.speed_rpm);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "control");
+		crate::codec::cbor::uint(out, self.control as u64);
+		crate::codec::cbor::text(out, "speed-rpm");
+		crate::codec::cbor::uint(out, self.speed_rpm as u64);
+	}
+}
+
+impl PowerProfile {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			PowerProfile::Performance => out.push_str("\"performance\""),
+			PowerProfile::Balanced => out.push_str("\"balanced\""),
+			PowerProfile::PowerSaving => out.push_str("\"power-saving\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			PowerProfile::Performance => out.push_str("performance"),
+			PowerProfile::Balanced => out.push_str("balanced"),
+			PowerProfile::PowerSaving => out.push_str("power-saving"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PowerProfile::Performance => crate::codec::cbor::text(out, "performance"),
+			PowerProfile::Balanced => crate::codec::cbor::text(out, "balanced"),
+			PowerProfile::PowerSaving => crate::codec::cbor::text(out, "power-saving"),
+		}
+	}
+}
+
+impl CurvePoint {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"temperature\":");
+		let _ = write!(out, "{}", self.temperature);
+		out.push(',');
+		out.push_str("\"percent\":");
+		let _ = write!(out, "{}", self.percent);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("temperature=");
+		let _ = write!(out, "{}", self.temperature);
+		out.push_str(", ");
+		out.push_str("percent=");
+		let _ = write!(out, "{}", self.percent);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "temperature");
+		crate::codec::cbor::uint(out, self.temperature as u64);
+		crate::codec::cbor::text(out, "percent");
+		crate::codec::cbor::uint(out, self.percent as u64);
+	}
+}
+
+impl CorePower {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"cpu\":");
+		let _ = write!(out, "{}", self.cpu);
+		out.push(',');
+		out.push_str("\"idle-states\":");
+		let _ = write!(out, "{}", self.idle_states);
+		out.push(',');
+		out.push_str("\"perf-levels\":");
+		let _ = write!(out, "{}", self.perf_levels);
+		out.push(',');
+		out.push_str("\"perf-level\":");
+		let _ = write!(out, "{}", self.perf_level);
+		out.push(',');
+		out.push_str("\"window-cap\":");
+		let _ = write!(out, "{}", self.window_cap);
+		out.push(',');
+		out.push_str("\"window-floor\":");
+		let _ = write!(out, "{}", self.window_floor);
+		out.push(',');
+		out.push_str("\"inject-permille\":");
+		let _ = write!(out, "{}", self.inject_permille);
+		out.push(',');
+		out.push_str("\"latency-requests\":");
+		let _ = write!(out, "{}", self.latency_requests);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("cpu=");
+		let _ = write!(out, "{}", self.cpu);
+		out.push_str(", ");
+		out.push_str("idle-states=");
+		let _ = write!(out, "{}", self.idle_states);
+		out.push_str(", ");
+		out.push_str("perf-levels=");
+		let _ = write!(out, "{}", self.perf_levels);
+		out.push_str(", ");
+		out.push_str("perf-level=");
+		let _ = write!(out, "{}", self.perf_level);
+		out.push_str(", ");
+		out.push_str("window-cap=");
+		let _ = write!(out, "{}", self.window_cap);
+		out.push_str(", ");
+		out.push_str("window-floor=");
+		let _ = write!(out, "{}", self.window_floor);
+		out.push_str(", ");
+		out.push_str("inject-permille=");
+		let _ = write!(out, "{}", self.inject_permille);
+		out.push_str(", ");
+		out.push_str("latency-requests=");
+		let _ = write!(out, "{}", self.latency_requests);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 8);
+		crate::codec::cbor::text(out, "cpu");
+		crate::codec::cbor::uint(out, self.cpu as u64);
+		crate::codec::cbor::text(out, "idle-states");
+		crate::codec::cbor::uint(out, self.idle_states as u64);
+		crate::codec::cbor::text(out, "perf-levels");
+		crate::codec::cbor::uint(out, self.perf_levels as u64);
+		crate::codec::cbor::text(out, "perf-level");
+		crate::codec::cbor::uint(out, self.perf_level as u64);
+		crate::codec::cbor::text(out, "window-cap");
+		crate::codec::cbor::uint(out, self.window_cap as u64);
+		crate::codec::cbor::text(out, "window-floor");
+		crate::codec::cbor::uint(out, self.window_floor as u64);
+		crate::codec::cbor::text(out, "inject-permille");
+		crate::codec::cbor::uint(out, self.inject_permille as u64);
+		crate::codec::cbor::text(out, "latency-requests");
+		crate::codec::cbor::uint(out, self.latency_requests as u64);
+	}
+}
+
+impl ZonePower {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"zone\":");
+		crate::codec::json_escape(&self.zone, out);
+		out.push(',');
+		out.push_str("\"temperature\":");
+		let _ = write!(out, "{}", self.temperature);
+		out.push(',');
+		out.push_str("\"passive\":");
+		match &self.passive {
+			Some(v159) => {
+				let _ = write!(out, "{}", v159);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"critical\":");
+		match &self.critical {
+			Some(v160) => {
+				let _ = write!(out, "{}", v160);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"hot\":");
+		match &self.hot {
+			Some(v161) => {
+				let _ = write!(out, "{}", v161);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"passive-engaged\":");
+		if self.passive_engaged {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"cap-percent\":");
+		let _ = write!(out, "{}", self.cap_percent);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("zone=");
+		out.push_str(&self.zone);
+		out.push_str(", ");
+		out.push_str("temperature=");
+		let _ = write!(out, "{}", self.temperature);
+		out.push_str(", ");
+		out.push_str("passive=");
+		match &self.passive {
+			Some(v162) => {
+				let _ = write!(out, "{}", v162);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("critical=");
+		match &self.critical {
+			Some(v163) => {
+				let _ = write!(out, "{}", v163);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("hot=");
+		match &self.hot {
+			Some(v164) => {
+				let _ = write!(out, "{}", v164);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("passive-engaged=");
+		if self.passive_engaged {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("cap-percent=");
+		let _ = write!(out, "{}", self.cap_percent);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::text(out, "zone");
+		crate::codec::cbor::text(out, &self.zone);
+		crate::codec::cbor::text(out, "temperature");
+		crate::codec::cbor::uint(out, self.temperature as u64);
+		crate::codec::cbor::text(out, "passive");
+		match &self.passive {
+			Some(v165) => {
+				crate::codec::cbor::uint(out, *v165 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "critical");
+		match &self.critical {
+			Some(v166) => {
+				crate::codec::cbor::uint(out, *v166 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "hot");
+		match &self.hot {
+			Some(v167) => {
+				crate::codec::cbor::uint(out, *v167 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "passive-engaged");
+		crate::codec::cbor::boolean(out, self.passive_engaged);
+		crate::codec::cbor::text(out, "cap-percent");
+		crate::codec::cbor::uint(out, self.cap_percent as u64);
+	}
+}
+
+impl FanPower {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"path\":");
+		crate::codec::json_escape(&self.path, out);
+		out.push(',');
+		out.push_str("\"control\":");
+		let _ = write!(out, "{}", self.control);
+		out.push(',');
+		out.push_str("\"speed-rpm\":");
+		let _ = write!(out, "{}", self.speed_rpm);
+		out.push(',');
+		out.push_str("\"curve\":");
+		out.push('[');
+		let mut v169 = true;
+		for v168 in self.curve.iter() {
+			if !v169 {
+				out.push(',');
+			}
+			v169 = false;
+			v168.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("path=");
+		out.push_str(&self.path);
+		out.push_str(", ");
+		out.push_str("control=");
+		let _ = write!(out, "{}", self.control);
+		out.push_str(", ");
+		out.push_str("speed-rpm=");
+		let _ = write!(out, "{}", self.speed_rpm);
+		out.push_str(", ");
+		out.push_str("curve=");
+		out.push('[');
+		let mut v171 = true;
+		for v170 in self.curve.iter() {
+			if !v171 {
+				out.push_str(", ");
+			}
+			v171 = false;
+			v170.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "path");
+		crate::codec::cbor::text(out, &self.path);
+		crate::codec::cbor::text(out, "control");
+		crate::codec::cbor::uint(out, self.control as u64);
+		crate::codec::cbor::text(out, "speed-rpm");
+		crate::codec::cbor::uint(out, self.speed_rpm as u64);
+		crate::codec::cbor::text(out, "curve");
+		crate::codec::cbor::array(out, self.curve.len());
+		for v172 in self.curve.iter() {
+			v172.to_cbor_into(out);
+		}
+	}
+}
+
+impl ProcessorPowerStatus {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"profile\":");
+		self.profile.to_json_into(out);
+		out.push(',');
+		out.push_str("\"because\":");
+		crate::codec::json_escape(&self.because, out);
+		out.push(',');
+		out.push_str("\"cores\":");
+		out.push('[');
+		let mut v174 = true;
+		for v173 in self.cores.iter() {
+			if !v174 {
+				out.push(',');
+			}
+			v174 = false;
+			v173.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"zones\":");
+		out.push('[');
+		let mut v176 = true;
+		for v175 in self.zones.iter() {
+			if !v176 {
+				out.push(',');
+			}
+			v176 = false;
+			v175.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"fans\":");
+		out.push('[');
+		let mut v178 = true;
+		for v177 in self.fans.iter() {
+			if !v178 {
+				out.push(',');
+			}
+			v178 = false;
+			v177.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("profile=");
+		self.profile.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("because=");
+		out.push_str(&self.because);
+		out.push_str(", ");
+		out.push_str("cores=");
+		out.push('[');
+		let mut v180 = true;
+		for v179 in self.cores.iter() {
+			if !v180 {
+				out.push_str(", ");
+			}
+			v180 = false;
+			v179.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("zones=");
+		out.push('[');
+		let mut v182 = true;
+		for v181 in self.zones.iter() {
+			if !v182 {
+				out.push_str(", ");
+			}
+			v182 = false;
+			v181.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("fans=");
+		out.push('[');
+		let mut v184 = true;
+		for v183 in self.fans.iter() {
+			if !v184 {
+				out.push_str(", ");
+			}
+			v184 = false;
+			v183.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "profile");
+		self.profile.to_cbor_into(out);
+		crate::codec::cbor::text(out, "because");
+		crate::codec::cbor::text(out, &self.because);
+		crate::codec::cbor::text(out, "cores");
+		crate::codec::cbor::array(out, self.cores.len());
+		for v185 in self.cores.iter() {
+			v185.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "zones");
+		crate::codec::cbor::array(out, self.zones.len());
+		for v186 in self.zones.iter() {
+			v186.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "fans");
+		crate::codec::cbor::array(out, self.fans.len());
+		for v187 in self.fans.iter() {
+			v187.to_cbor_into(out);
+		}
 	}
 }
 

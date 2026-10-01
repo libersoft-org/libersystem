@@ -14,8 +14,11 @@ timeout = 1200
 do = "prompt"
 timeout = 180
 
-# THE ROW: one platform row, the `TPM2` table's, its one resource the 4 KiB locality-0 page at the platform's base
-# (0xFED40000) - and no interrupt, since the resource list ends after that one range.
+# THE ROW: one platform row, the `TPM2` table's, with the namespace's `MSFT0101` device merged into it - its path and
+# its hardware ID joined as ids, since both describe one device at the same base - and its one resource still the
+# table's 4 KiB locality-0 page at the platform's base (0xFED40000), not the `_CRS` range QEMU names; no interrupt,
+# since the resource list ends after that one range. THE PATH IS THE FRONT-END'S: QEMU places the CRB's device at
+# `\_SB.TPM` and the TIS's under the LPC bridge, so the row is read in two parts on either side of it.
 
 [[step]]
 do = "key"
@@ -23,7 +26,12 @@ text = "lsdev"
 
 [[step]]
 do = "expect"
-contains = "identity=table:TPM2#0, ids=[{kind=table, text=TPM2}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]"
+contains = 'identity=table:TPM2#0, ids=[{kind=table, text=TPM2}, {kind=identity, text=acpi:\_SB_.'
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = '.TPM_}, {kind=hid, text=MSFT0101}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]'
 timeout = 30
 
 # THE TOOL: the interface, swtpm's identity, and sealing available.

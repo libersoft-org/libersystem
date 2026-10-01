@@ -249,7 +249,7 @@ static HELD_BACK: AtomicU64 = AtomicU64::new(u64::MAX);
 
 // Make core `cpu` stop acknowledging shootdowns - and servicing anything they carry - until it is called
 // again with `None`.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn hold_back_for_test(cpu: Option<usize>) {
 	HELD_BACK.store(cpu.map_or(u64::MAX, |cpu| cpu as u64), Ordering::Release);
 }

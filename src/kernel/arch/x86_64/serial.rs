@@ -60,6 +60,10 @@ const RX_READ_OUT: usize = 64;
 // any synchronous write polls the holding register before writing anyway, in polls.
 const TERMINAL_LOCK_SPINS: u32 = 10_000_000;
 const THRE_POLLS: u32 = 1_000_000;
+// A PLANNED END'S WAIT FOR THE DRIVER (`Uart::settle_driver`): the ring empty this long - the driver's largest tap read,
+// 1024 bytes, takes 89 ms on the wire at the console's 115200 baud - and never longer than the bound in all.
+pub const SETTLE_QUIET_NS: u64 = 100_000_000;
+pub const SETTLE_BOUND_NS: u64 = 1_000_000_000;
 
 // The registers, as offsets from the base.
 const RBR_THR: u16 = 0;
@@ -829,6 +833,43 @@ impl Uart {
 		}
 	}
 
+	// ------------------------------------------------------------------ a planned end
+
+	// A PLANNED END'S LAST LINES. A power-off or a reset a process asked for, while a driver holds the UART: the lines
+	// before it - the request's own, a button driver's "pressed" - are in the ring or already in the driver's hands, and
+	// the terminal-path writer that follows takes the UART whatever it finds, so what the driver had read and not yet
+	// put out was lost with the machine. So the tap is signalled and this core yielded until the ring has stayed empty
+	// for `SETTLE_QUIET_NS` - long enough for the driver's largest read to reach the wire - and at most `SETTLE_BOUND_NS`
+	// in all: a driver that takes nothing does not hold the machine up. Never on a panic's or the forced deadline's
+	// path, where nothing may wait; the kernel's own lines need none of it.
+	pub fn settle_driver(&self) {
+		let now = || crate::arch::common::time::CLOCK.nanos(super::tsc::now());
+		let started = now();
+		let mut empty_since: Option<u64> = None;
+		loop {
+			let (driving, empty) = {
+				let inner = self.inner.lock();
+				(matches!(inner.owner, Owner::Driver(_)), inner.ring.len == 0)
+			};
+			if !driving {
+				return;
+			}
+			let at = now();
+			if empty {
+				if at.saturating_sub(*empty_since.get_or_insert(at)) >= SETTLE_QUIET_NS {
+					return;
+				}
+			} else {
+				empty_since = None;
+				self.deliver_tap_signal();
+			}
+			if at.saturating_sub(started) >= SETTLE_BOUND_NS {
+				return;
+			}
+			crate::sched::yield_now();
+		}
+	}
+
 	// ------------------------------------------------------------------ for the suite
 
 	#[cfg(test)]
@@ -848,6 +889,7 @@ impl Uart {
 	pub fn record_from(&self, from: usize) -> alloc::vec::Vec<Access> {
 		let record = RECORD.lock();
 		let first = from.max(record.len.saturating_sub(RECORD_CAP));
+		// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
 		(first..record.len).map(|at| record.entries[at % RECORD_CAP]).collect()
 	}
 
@@ -879,6 +921,7 @@ impl Uart {
 	#[cfg(test)]
 	pub fn take_read_out(&self) -> alloc::vec::Vec<u8> {
 		let mut kept = self.read_out.lock();
+		// ALLOC-OK: `#[cfg(test)]`, as above.
 		let bytes = kept.0[..kept.1].to_vec();
 		kept.1 = 0;
 		bytes
@@ -985,6 +1028,11 @@ pub fn flush_sync() {
 
 pub fn drain_sync() {
 	COM1.drain_sync();
+}
+
+// A PLANNED END'S LAST LINES - see `Uart::settle_driver`. For a power-off or a reset a process asked for.
+pub fn settle_driver() {
+	COM1.settle_driver();
 }
 
 // MAKE ROOM IN THE RING for a writer that may not lose a byte: drained here while the kernel drives the

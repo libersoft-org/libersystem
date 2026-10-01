@@ -15,7 +15,7 @@ interface device
 method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>
 method device.get op=2 (index:u32:rights=) -> result<device-entry, liber:base@1::error>
 method device.bindings op=3 () -> result<list<binding-record>, liber:base@1::error>
-enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8,local-stream=9,touch=10,bluetooth-hci=11,power-source=12,fixture-control=13,smartcard-reader=14,modem=15,camera=16,midi=17,printer=18,ptp-transport=19,admin-executor=20,gamepad=21,i2c-bus=22,gpio-lines=23,tpm=24,watchdog=25,ipmi=26,typec-connector=27,platform-switch=28)
+enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8,local-stream=9,touch=10,bluetooth-hci=11,power-source=12,fixture-control=13,smartcard-reader=14,modem=15,camera=16,midi=17,printer=18,ptp-transport=19,admin-executor=20,gamepad=21,i2c-bus=22,gpio-lines=23,tpm=24,watchdog=25,ipmi=26,typec-connector=27,platform-switch=28,thermal-zone=29,cooling-device=30)
 record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32,live:bool,name:string:bound=48,platform:option<u32>)
 enum policy-verb(disable=0,enable=1,select=2,retry=3)
 enum policy-outcome(accepted=0,no-such-device=1,not-a-candidate=2,quarantined=3,busy=4,refused=5,not-stored=6)
@@ -69,6 +69,21 @@ method acpi-node.dsm op=4 (uuid:list<u8>:bound=16:rights=,revision:u64:rights=,f
 method acpi-node.notifications op=5 () -> stream<acpi-notification>
 method acpi-node.set-power-state op=6 (state:u8:rights=) -> result<unit, liber:base@1::error>
 method acpi-node.sleep-power-state op=7 (target:u8:rights=,wake:bool:rights=) -> result<u8, liber:base@1::error>
+method acpi-node.has op=8 (name:string:bound=4:rights=) -> result<bool, liber:base@1::error>
+record processor-register(space:u8,bits:u8,address:u64)
+record processor-idle-state(entry:u8,hint:u32,register:processor-register,latency-us:u32,residency-us:u32,power-mw:u32,flags:u32)
+record processor-performance-state(core-mhz:u32,power-mw:u32,latency-us:u32,control:u32,status:u32)
+record processor-throttling-state(percent:u32,power-mw:u32,latency-us:u32,control:u32)
+record processor-domain(domain:u32,coordination:u32,processors:u32)
+record processor-cppc(highest:u32,nominal:u32,lowest:u32,desired:processor-register,minimum:option<processor-register>,maximum:option<processor-register>,preference:option<processor-register>)
+record processor-id(path:string:bound=64,uid:u32,cpu:u32)
+record processor-power(id:processor-id,idle:list<processor-idle-state>:bound=8,performance:list<processor-performance-state>:bound=32,pct-control:option<processor-register>,pct-status:option<processor-register>,ppc:u32,psd:option<processor-domain>,cppc:option<processor-cppc>,throttling:list<processor-throttling-state>:bound=32,ptc-control:option<processor-register>,tpc:u32,tsd:option<processor-domain>,refused:list<string>:bound=8)
+record processor-notification(path:string:bound=64,value:u32,sequence:u32)
+interface processor-firmware
+method processor-firmware.processors op=1 () -> result<list<processor-id>, liber:base@1::error>
+method processor-firmware.power op=2 (path:string:bound=64:rights=) -> result<processor-power, liber:base@1::error>
+method processor-firmware.notifications op=3 () -> stream<processor-notification>
+method processor-firmware.ost op=4 (path:string:bound=64:rights=,event:u32:rights=,status:u32:rights=) -> result<unit, liber:base@1::error>
 enum acpi-connection-kind(event-line=0,field-line=1,field-address=2)
 interface acpi-admin
 method acpi-admin.open-node op=1 (identity:string:bound=64:rights=) -> result<handle<channel>, liber:base@1::error>

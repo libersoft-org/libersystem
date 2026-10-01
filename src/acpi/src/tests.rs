@@ -838,3 +838,19 @@ fn ivrs_names_each_hardware_definition_and_skips_memory_definitions() {
 	assert_eq!(seen, vec![(0xfeb8_0000, 0x4000, 0), (0xfeb9_0000, 0x4000, 1)]);
 	assert_eq!(ivrs_units(&Builder::new(b"DMAR", 1, 48).finish(), |_| {}).err(), Some(Error::Signature), "another table is not an IVRS");
 }
+
+/// WHICH PROCESSOR UID IS WHICH APIC: both entry kinds, in the firmware's order, a disabled one said to be.
+#[test]
+fn the_processors_name_their_uid_and_their_apic_in_the_firmwares_order() {
+	let x2apic = {
+		let mut payload = alloc::vec![0, 0];
+		payload.extend_from_slice(&300u32.to_le_bytes());
+		payload.extend_from_slice(&0u32.to_le_bytes());
+		payload.extend_from_slice(&7u32.to_le_bytes());
+		payload
+	};
+	let bytes = MadtBuilder::new().local_apic(0).local_apic(1).raw(9, 16, &x2apic).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	let processors: alloc::vec::Vec<MadtProcessor> = madt.processors().collect();
+	assert_eq!(processors, [MadtProcessor { uid: 0, apic_id: 0, enabled: true }, MadtProcessor { uid: 1, apic_id: 1, enabled: true }, MadtProcessor { uid: 7, apic_id: 300, enabled: false }]);
+}

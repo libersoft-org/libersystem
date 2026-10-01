@@ -81,6 +81,13 @@ pub fn local_id() -> u32 {
 	local_apic_id()
 }
 
+// WHETHER AN INTERRUPT IS PENDING under the mask: any bit of the eight interrupt-request registers (0x200 to 0x270). An
+// idle entry that returned by itself - a `P_LVLx` read on hardware that implements the state returns at the wake - finds
+// the interrupt that woke the core here, and takes it rather than halting past it.
+pub fn interrupt_pending() -> bool {
+	(0..8u32).any(|at| read(0x200 + at * 0x10) != 0)
+}
+
 // Signal end-of-interrupt to the LAPIC. Must be called once per delivered
 // interrupt so further interrupts of equal or lower priority can be delivered.
 pub fn eoi() {

@@ -1468,6 +1468,17 @@ destination = "libexec/typeccheck.lsexe"
 providers = []
 development = true
 
+# THE PROCESSOR-POWER GATE'S PROBE, development-only: a core kept busy, or the scripted idle pattern - no authority.
+[[programs]]
+name = "procprobe"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/procprobe.lsexe"
+providers = []
+development = true
+
 # THE UPS GATE'S PROBE, development-only: a live client and the operator of the UPS a USB device the host
 # builds publishes through the xHCI driver - PowerService's read and control authorities.
 [[programs]]
@@ -1516,15 +1527,16 @@ providers = []
 development = true
 
 # THE TPM GATE'S OTHER COMPONENT: the observation and sealing grants and the files, and not measurement - its
-# refusals are half the gate.
+# refusals are half the gate. STATIC, in the services crate behind `required-features`, as every development-only
+# probe is, so no shipping build compiles or stages it.
 [[programs]]
 name = "tpmprobe"
-owner = "tools"
+owner = "services"
 role = "probe"
-linkage = "dynamic"
+linkage = "static"
 stage = "volume"
 destination = "libexec/tpmprobe.lsexe"
-providers = ["base-proto", "tpm-client", "volume-client", "storage-proto", "service-util", "lsrt"]
+providers = []
 development = true
 
 [[programs]]
@@ -1776,6 +1788,17 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/sleepctl.lsexe"
 providers = ["base-proto", "process-client", "lsrt"]
+
+# THE PROCESSORS' AND THE THERMAL POLICY'S OPERATOR TOOL, the one shipping holder of `processor-power`: the power
+# sources, the profile, each core's states and window, each zone and each fan - and the profile or a fan's curve set.
+[[programs]]
+name = "powerctl"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/powerctl.lsexe"
+providers = ["base-proto", "power-proto", "ipc-client", "wire", "lsrt"]
 
 # THE TPM DEMONSTRATION TOOL, the one shipping holder of the three TPM grants: it prints what the TPM answered, through
 # `tpm-client` - the library a third-party program links.
@@ -2778,6 +2801,17 @@ stage = "volume"
 destination = "libexec/acpi_service.lsexe"
 providers = []
 
+# STATIC, FOR THE REASON `acpi_service` IS: its decisions are `service-logic`'s and `procpower`'s, which no staged library
+# publishes.
+[[programs]]
+name = "processor_power_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/processor_power_service.lsexe"
+providers = []
+
 [[programs]]
 name = "modem_service"
 owner = "services"
@@ -3235,8 +3269,10 @@ heartbeat-deadline = 100
 suspend-deadline = 100
 
 # THE ACPI BATTERY, AC ADAPTER AND THERMAL ZONE: one binding per namespace node, its methods read over the node channel
-# the ACPI service serves and normalised by the power model, published as a `power-source` to PowerService alone. It
-# masters nothing and reaches no register: every value comes from the firmware's methods.
+# the ACPI service serves and normalised by the power model, published as a `power-source` to PowerService alone - and a
+# zone's cooling half as a `thermal-zone` to ProcessorPowerService alone, with the `system-power` connection DeviceManager
+# hands a zone's binding for the `_CRT` fallback. It masters nothing and reaches no register: every value comes from the
+# firmware's methods.
 [[programs]]
 name = "acpi_power"
 owner = "drivers"
@@ -3254,7 +3290,31 @@ match = [
 	{ transport = "platform", hid = "ACPI0003" },
 	{ transport = "platform", hid = "THERMALZONE" },
 ]
-provides = [{ kind = "power-source", most = 1, consumers = 1 }]
+provides = [
+	{ kind = "power-source", most = 1, consumers = 1 },
+	{ kind = "thermal-zone", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# THE ACPI FAN: one binding per `PNP0C0B` node, published as a `cooling-device` to ProcessorPowerService alone, on whose
+# command alone it sets the fan - `_FSL` for an ACPI 4.0 fan, the device power state for an ACPI 1.0 one - over the node
+# channel the ACPI service serves. It takes the sleep itself: the level last commanded applied again at the resume. It
+# masters nothing and reaches no register.
+[[programs]]
+name = "acpi_fan"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_fan.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", hid = "PNP0C0B" }]
+provides = [{ kind = "cooling-device", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
@@ -4009,6 +4069,15 @@ interface = "liber:device@1/provider-catalogue"
 kinds = ["audio"]
 presence = "optional"
 
+# THE IDLE-LATENCY BOUND, which a playing or recording device holds so that no core sleeps deeper than one period can
+# take: the kernel's `IdleLatency` privilege, duplicated by ServiceManager from the copy it keeps. Last, as every
+# addition to a role list is.
+[[services.roles]]
+tag = "LATENCY"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
 [[services]]
 name = "config_service"
 program = "config_service"
@@ -4333,6 +4402,17 @@ presence = "optional"
 tag = "CLOCKSRC"
 kind = "privilege"
 provider = "kernel"
+presence = "optional"
+
+# THE SLEEP BUTTONS' CONNECTIONS, MINTED AHEAD: a channel ServiceManager fills with a few `system-sleep` connections at
+# DeviceManager's start, one taken for each control-method button's driver at bind. Minting from the door instead is a
+# CONNECT ServiceManager answers in its standing loop - and during the bring-up ServiceManager is waiting on
+# DeviceManager itself, so a button bound then would hold both. The door mints once these are gone. LAST.
+[[services.roles]]
+tag = "SLEEPPOOL"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-sleep"
 presence = "optional"
 
 [[services]]
@@ -5785,6 +5865,8 @@ interface = "liber:typec@1/typec-control"
 # kernel under its policy. ADMIN is DeviceManager's root and nobody else's: ServiceManager mints DeviceManager a
 # connection after each start, the late hand-off DEVPERM already takes, since a role's provider must start first and
 # DeviceManager starts long before this service.
+# PROCESSORS is ProcessorPowerService's: the processors' power objects as the firmware states them, and their `Notify`
+# values, on a connection minted from it at each of its starts.
 #
 # VOLUME-STAGED AND TRANSPARENT: launched through ProcessService once that is up, relaunched from the volume. A crash
 # costs the namespace and nothing it published - its rows, reservations, companions and firmware-held functions stay,
@@ -5809,6 +5891,89 @@ tag = "ADMIN"
 kind = "serve-root"
 provider = "self"
 interface = "liber:device@1/acpi-admin"
+
+[[services.roles]]
+tag = "PROCESSORS"
+kind = "serve-root"
+provider = "self"
+interface = "liber:device@1/processor-firmware"
+
+# PROCESSOR AND THERMAL POWER: the one holder of the kernel's `ProcessorPower` privilege, which installs each core's idle
+# and performance tables from the firmware's processor objects (PROCESSORS, the ACPI service's) and sets the window each
+# core's governor is held to, where the profile, `_PPC` and passive cooling meet. It follows every `thermal-zone` and
+# `cooling-device` publication through a catalogue connection minted for those two kinds alone, and the power source -
+# for the default profile - as a subscriber of PowerService's state. Past `_HOT` it asks for hibernation through SLEEP,
+# past `_CRT` it arms the kernel's forced power-off through SYSPOWER and asks for the orderly one through SHUTDOWN.
+# PROCPOWER, SLEEP, SYSPOWER and SHUTDOWN are ServiceManager's to fill, at the first start and at every relaunch. CONTROL
+# is the operator's root: the status, the profile and a fan's curve - never `_CRT` or `_HOT`.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. What it installed stays in the kernel across its restart; the replacement reads the
+# firmware again, installs the same tables again, and adopts every zone and fan afresh from the catalogue.
+[[services]]
+name = "processor_power_service"
+program = "processor_power_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager", "acpi_service", "power_service"]
+
+[[services.roles]]
+tag = "PROCPOWER"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
+[[services.roles]]
+tag = "PROCESSORS"
+kind = "factory"
+provider = "acpi_service"
+source = "PROCESSORS"
+interface = "liber:device@1/processor-firmware"
+presence = "optional"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["thermal-zone", "cooling-device"]
+presence = "optional"
+
+[[services.roles]]
+tag = "POWERSTATE"
+kind = "factory"
+provider = "power_service"
+source = "SERVE"
+interface = "liber:power@1/power"
+presence = "optional"
+
+[[services.roles]]
+tag = "SLEEP"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-sleep"
+presence = "optional"
+
+[[services.roles]]
+tag = "SYSPOWER"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-power"
+presence = "optional"
+
+[[services.roles]]
+tag = "SHUTDOWN"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-shutdown"
+presence = "optional"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:power@1/processor-power-admin"
 
 # MODEMS: SIM, registration and the one data context this system supports. It consumes every `modem`
 # publication through a catalogue connection minted for that kind alone, and serves two roots: SERVE,

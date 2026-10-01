@@ -13,6 +13,8 @@ extern crate alloc;
 // A library says it properly: this is the surface a driver may use, and no binary owes it a caller.
 // Nothing here is exempt from having ONE - the items with no caller anywhere in the tree were
 // deleted before the move, not carried across by it.
+// THE ACPI FAN, the driver's parts a host can test: `_FIF`, `_FPS` and `_FST` read as the specification lays them out.
+pub mod acpi_fan;
 // ACPI BATTERY, AC AND THERMAL ZONE, the driver's parts a host can test: the class a node is, its methods' results read
 // at the specification's offsets, and the bound on a storm of notifications.
 pub mod acpi_power;

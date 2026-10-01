@@ -97,6 +97,7 @@ pub fn sys_record(site: u64, cycles: u64, value: u64) -> i64 {
 	if let Some(thread) = thread.as_deref() {
 		note(thread);
 	}
+	// ALLOC-OK: `perfbuf::Buffer::push`, a fixed ring of slots - a full one refuses, nothing grows.
 	match BUFFER.push(Record { site: perfbuf::site_tag(site), cycles, value, thread: koid, core: core_id(), kind: perfbuf::KIND_SITE, detail: 0 }) {
 		Push::Accepted => 0,
 		Push::Unarmed => PERF_RECORD_UNARMED,
@@ -156,6 +157,7 @@ pub fn switch(prev: Option<&Thread>, next: Option<&Thread>, why: u8) {
 	}
 	let outgoing = prev.map_or(0, |thread| koid32(thread.header().koid()) as u64);
 	let incoming = next.map_or(0, |thread| koid32(thread.header().koid()));
+	// ALLOC-OK: the fixed ring, as above.
 	BUFFER.push(Record { site: [0; 8], cycles, value: outgoing, thread: incoming, core: core_id(), kind: perfbuf::KIND_SWITCH, detail: why });
 }
 
@@ -173,5 +175,6 @@ pub fn wake(woken: &Thread, cause: u8) {
 		current.map_or(0, |thread| koid32(thread.header().koid()) as u64)
 	};
 	note(woken);
+	// ALLOC-OK: the fixed ring, as above.
 	BUFFER.push(Record { site: [0; 8], cycles, value: waker, thread: koid32(woken.header().koid()), core: core_id(), kind: perfbuf::KIND_WAKE, detail: cause });
 }

@@ -2970,3 +2970,82 @@ fn a_pci_child_node_names_its_function_and_a_line_of_its_child_is_a_connection()
 	let host = device(&found, b"/pcie@10000000");
 	assert_eq!(host.bus, NodeBus::Memory, "the host itself sits on the memory bus");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The idle states a tree describes.
+// ---------------------------------------------------------------------------------------------
+
+fn idle_tree(address_cells: u32) -> &'static [u8] {
+	let reg = |builder: &mut Builder, value: u64| {
+		if address_cells == 2 {
+			let mut bytes = (value >> 32).to_be_bytes()[4..].to_vec();
+			bytes.extend_from_slice(&(value as u32).to_be_bytes());
+			builder.prop("reg", &bytes);
+		} else {
+			builder.prop_u32("reg", value as u32);
+		}
+	};
+	let phandles = |builder: &mut Builder, list: &[u32]| {
+		let bytes: Vec<u8> = list.iter().flat_map(|phandle| phandle.to_be_bytes()).collect();
+		builder.prop("cpu-idle-states", &bytes);
+	};
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("cpus").prop_u32("#address-cells", address_cells).prop_u32("#size-cells", 0);
+	// THE PROPERTIES IN AN ORDER THE READER MUST NOT ASSUME: the list before the type, the type last.
+	builder.begin("cpu@0");
+	phandles(&mut builder, &[1, 2]);
+	reg(&mut builder, 0x1_0000_0000);
+	builder.prop_str("device_type", "cpu").end();
+	builder.begin("cpu@1").prop_str("device_type", "cpu");
+	reg(&mut builder, 0x1_0000_0001);
+	phandles(&mut builder, &[2]);
+	builder.end();
+	// A node under `/cpus` that is no cpu, and names states anyway.
+	builder.begin("cpu-map");
+	phandles(&mut builder, &[1]);
+	builder.end();
+	builder.begin("idle-states").prop_str("entry-method", "psci");
+	builder.begin("cpu-retention").prop_str("compatible", "arm,idle-state").prop_u32("phandle", 1).prop_u32("arm,psci-suspend-param", 0x0000_0001).prop_u32("entry-latency-us", 20).prop_u32("exit-latency-us", 40).prop_u32("min-residency-us", 80).end();
+	builder.begin("cpu-off").prop_u32("min-residency-us", 1000).prop("local-timer-stop", &[]).prop_u32("exit-latency-us", 250).prop_u32("entry-latency-us", 100).prop_u32("arm,psci-suspend-param", 0x4000_0002).prop_str("compatible", "arm,idle-state").prop_u32("phandle", 2).end();
+	builder.begin("cpu-disabled").prop_str("compatible", "arm,idle-state").prop_u32("phandle", 3).prop_u32("arm,psci-suspend-param", 3).prop_u32("entry-latency-us", 1).prop_u32("exit-latency-us", 1).prop_u32("min-residency-us", 1).prop_str("status", "disabled").end();
+	builder.begin("cpu-unfinished").prop_str("compatible", "arm,idle-state").prop_u32("phandle", 4).prop_u32("arm,psci-suspend-param", 4).prop_u32("entry-latency-us", 1).prop_u32("min-residency-us", 1).end();
+	builder.begin("hart-retention").prop_str("compatible", "riscv,idle-state").prop_u32("phandle", 5).prop_u32("riscv,sbi-suspend-param", 0).prop_u32("entry-latency-us", 10).prop_u32("exit-latency-us", 10).prop_u32("min-residency-us", 50).end();
+	builder.end();
+	builder.end();
+	builder.end();
+	builder.finish()
+}
+
+#[test]
+fn a_trees_idle_states_are_read_with_each_cpus_list_whatever_the_property_order() {
+	for cells in [1, 2] {
+		let tree = at(idle_tree(cells));
+		let read = tree.idle_states(IdleBinding::Arm).expect("a tree");
+		assert_eq!(read.state_count, 2, "the retention and power-down states, and not the disabled, the unfinished or the SBI one ({cells} cell(s))");
+		let first = cpu_reg(cells, 0);
+		let second = cpu_reg(cells, 1);
+		let names: Vec<u32> = read.for_cpu(first).map(|state| state.phandle).collect();
+		assert_eq!(names, [1, 2], "cpu@0's list, in its order");
+		let off: Vec<&TreeIdleState> = read.for_cpu(second).collect();
+		assert_eq!(off.len(), 1);
+		assert_eq!(*off[0], TreeIdleState { phandle: 2, parameter: 0x4000_0002, entry_latency_us: 100, exit_latency_us: 250, min_residency_us: 1000, local_timer_stop: true });
+		assert_eq!(read.cpu_count, 2, "the node that is no cpu is not one");
+		assert!(read.for_cpu(0x2).next().is_none(), "a reg no cpu node has names nothing");
+	}
+	let riscv = at(idle_tree(1)).idle_states(IdleBinding::Riscv).expect("a tree");
+	assert_eq!(riscv.state_count, 1);
+	assert_eq!(riscv.states[0], TreeIdleState { phandle: 5, parameter: 0, entry_latency_us: 10, exit_latency_us: 10, min_residency_us: 50, local_timer_stop: false });
+}
+
+// The `reg` a cpu node carries in `idle_tree`: with one cell the high word is not there.
+fn cpu_reg(cells: u32, index: u64) -> u64 {
+	if cells == 2 { 0x1_0000_0000 | index } else { index }
+}
+
+#[test]
+fn a_tree_with_no_idle_states_answers_none_of_them() {
+	let read = at(machine(|_| {})).idle_states(IdleBinding::Arm).expect("a tree");
+	assert_eq!((read.state_count, read.cpu_count), (0, 0), "cpu@0 of the minimal machine has no device_type, so it is not read as a cpu");
+}

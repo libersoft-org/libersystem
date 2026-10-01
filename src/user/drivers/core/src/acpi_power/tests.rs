@@ -88,3 +88,13 @@ fn a_storm_of_notifications_refreshes_once_per_interval() {
 	assert!(!coalescer.notified(100 + REFRESH_TICKS + 1), "the refresh bars the next interval too");
 	assert!(coalescer.take_due(100 + 2 * REFRESH_TICKS));
 }
+
+#[test]
+fn a_device_list_is_read_as_namespace_paths() {
+	let list = Value::Package(vec![Value::Reference(String::from("\\_SB_.CPU0")), Value::String(String::from("\\_SB.FAN"))]);
+	assert_eq!(devices(&list, 8).unwrap(), vec![String::from("\\_SB_.CPU0"), String::from("\\_SB_.FAN_")], "a name string's segments padded as the namespace spells them");
+	assert_eq!(devices(&Value::Integer(1), 8), Err(Refusal::Shape("a device list")));
+	assert_eq!(devices(&Value::Package(vec![Value::Integer(1)]), 8), Err(Refusal::Shape("a device list's element")));
+	let long = Value::Package((0..12).map(|_| Value::Reference(String::from("\\_SB_.CPU0"))).collect());
+	assert_eq!(devices(&long, 8).unwrap().len(), 8, "bounded");
+}

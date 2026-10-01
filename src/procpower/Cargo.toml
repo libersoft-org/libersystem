@@ -1,0 +1,17 @@
+[package]
+name = "procpower"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "The processor's power decisions the kernel makes - the tables' checks, the idle and performance governors, the latency bound - in a crate a host can drive"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+abi = { path = "../abi" }
+
+# A WARNING IS AN ERROR HERE, for the reason it is in `tickclock`: every idle entry and every performance change the
+# kernel makes is decided here.
+[lints.rust]
+warnings = "deny"

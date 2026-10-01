@@ -136,6 +136,7 @@ impl DeviceMemory {
 	// holding a claimed function's BAR.
 	#[cfg(liber_development)]
 	pub fn mapped_space(&self) -> Option<Arc<AddressSpace>> {
+		// ALLOC-OK: this clones an `Arc` - a refcount bump - out of the lock.
 		self.mapped_in.lock().clone()
 	}
 

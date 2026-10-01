@@ -357,6 +357,13 @@ enum provider-kind {
 	/// A PLATFORM SWITCH - a lid - the `platform-switch` contract below: its state and every change after it, which the
 	/// power-state service alone consumes for its sleep policy.
 	platform-switch = 28,
+	/// A THERMAL ZONE'S COOLING HALF - `liber:power@1`'s `thermal-zone` contract: what the zone asks of its cooling, its
+	/// temperature and a sampling period - which ProcessorPowerService alone consumes. The zone's STATE stays a
+	/// `power-source` for PowerService's readers.
+	thermal-zone = 29,
+	/// A FAN - `liber:power@1`'s `cooling-device` contract: its levels and the level it runs at - which
+	/// ProcessorPowerService alone consumes and commands.
+	cooling-device = 30,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by
@@ -820,6 +827,118 @@ interface acpi-node {
 	/// device is to wake the machine from it, from the node's `_SxD` and `_SxW` (`_S0W` alone for suspend to idle): the
 	/// deepest it may enter, and where it wakes, the deepest it still wakes from. Encoded as `set-power-state` takes it.
 	@op(7) sleep-power-state: func(target: u8, wake: bool) -> result<u8, error>;
+	/// WHETHER THE NODE HAS AN OBJECT by this name - admitted as `evaluate` admits it - with nothing evaluated: a method
+	/// whose call changes the platform (`_SCP`) is asked about before it is called.
+	@op(8) has:               func(@bound(4) name: string) -> result<bool, error>;
+}
+
+// ------------------------------------------------------------------ the processors' power, as the firmware states it
+
+/// A REGISTER a processor object names, as ACPI's Generic Address Structure gives it: the space (0 memory, 1 I/O, 0x0A
+/// the platform channel, 0x7F functional fixed hardware), the width in bits and the address.
+record processor-register {
+	space:   u8,
+	bits:    u8,
+	address: u64,
+}
+
+/// ONE IDLE STATE from `_CST` or `_LPI`: entered by a halt (0), by MWAIT with `hint` (1, a fixed-hardware entry) or by a
+/// read of `register` (2); its exit latency and its target residency (`_CST`'s latency counted for both where it states
+/// no residency); and the costs `flags` names - 1 the core's context is lost, 2 its timer stops, 4 bus-master
+/// arbitration is wanted.
+record processor-idle-state {
+	entry:        u8,
+	hint:         u32,
+	register:     processor-register,
+	latency-us:   u32,
+	residency-us: u32,
+	power-mw:     u32,
+	flags:        u32,
+}
+
+/// ONE `_PSS` STATE.
+record processor-performance-state {
+	core-mhz:   u32,
+	power-mw:   u32,
+	latency-us: u32,
+	control:    u32,
+	status:     u32,
+}
+
+/// ONE `_TSS` STATE: the share of full speed in percent, and the value `_PTC`'s control register takes for it.
+record processor-throttling-state {
+	percent:    u32,
+	power-mw:   u32,
+	latency-us: u32,
+	control:    u32,
+}
+
+/// `_PSD` or `_TSD`: the domain a processor is coordinated in - 0xFC software-all, 0xFD software-any, 0xFE hardware-all.
+record processor-domain {
+	domain:       u32,
+	coordination: u32,
+	processors:   u32,
+}
+
+/// CPPC's levels and registers, from `_CPC`: the energy-performance preference register where it has one.
+record processor-cppc {
+	highest:    u32,
+	nominal:    u32,
+	lowest:     u32,
+	desired:    processor-register,
+	minimum:    option<processor-register>,
+	maximum:    option<processor-register>,
+	preference: option<processor-register>,
+}
+
+/// WHICH PROCESSOR: its namespace path, its UID - a `Processor` object's processor ID, a processor device's `_UID` - and
+/// the kernel's core it is: the UID matched against the MADT's, and the APIC ID that entry gives against each core's.
+/// `0xFFFFFFFF` for a UID that names no number, and for a processor no running core is.
+record processor-id {
+	@bound(64) path: string,
+	uid:             u32,
+	cpu:             u32,
+}
+
+/// A PROCESSOR'S POWER, as its objects read now: its idle states (`_LPI` where it has one, `_CST` otherwise), its
+/// performance states with `_PCT`'s registers, `_PPC`'s limit and `_PSD`'s domain, or CPPC; its throttling states with
+/// `_PTC`'s register, `_TPC`'s limit and `_TSD`'s domain; and each object that could not be read, by name and why.
+record processor-power {
+	id:                              processor-id,
+	@bound(8)  idle:                 list<processor-idle-state>,
+	@bound(32) performance:          list<processor-performance-state>,
+	pct-control:                     option<processor-register>,
+	pct-status:                      option<processor-register>,
+	ppc:                             u32,
+	psd:                             option<processor-domain>,
+	cppc:                            option<processor-cppc>,
+	@bound(32) throttling:           list<processor-throttling-state>,
+	ptc-control:                     option<processor-register>,
+	tpc:                             u32,
+	tsd:                             option<processor-domain>,
+	@bound(8)  refused:              list<string>,
+}
+
+/// A processor's `Notify`: 0x80 its performance limit changed (`_PPC`), 0x81 its idle states (`_CST`, `_LPI`), 0x82 its
+/// throttling limit (`_TPC`).
+record processor-notification {
+	@bound(64) path: string,
+	value:           u32,
+	sequence:        u32,
+}
+
+/// THE PROCESSORS' POWER, as the ACPI service reads it - served on a manifest client role to ProcessorPowerService
+/// alone, which decides what the kernel is to install. The processor handshake (`_OSC`, or `_PDC`) told the firmware
+/// the forms the kernel executes, so the tables read here are ones it can take.
+interface processor-firmware {
+	/// Every processor of the namespace.
+	@op(1) processors: func() -> result<list<processor-id>, error>;
+	/// One processor's objects, evaluated now - after a `Notify`, again.
+	@op(2) power:      func(@bound(64) path: string) -> result<processor-power, error>;
+	/// Every processor's `Notify` 0x80, 0x81 and 0x82, as the firmware raises them.
+	@op(3) notifications: func() -> stream<processor-notification>;
+	/// `_OST`: the notification `event` handled with `status` (0 success). `not-found` for a processor without one.
+	@op(4) ost:        func(@bound(64) path: string, event: u32, status: u32) -> result<unit, error>;
 }
 
 /// What a connection DeviceManager hands the ACPI service is for.

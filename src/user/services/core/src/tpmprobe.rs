@@ -10,16 +10,24 @@
 //   `hold`       ONE `tpm` connection held across a restart of the driver, `random` asked on it every fifth of a
 //                second, and each change of answer printed: a value, `unavailable`, `interrupted`.
 
+//
+// A STATIC PROBE IN THIS CRATE, behind `required-features = ["development"]` as every other development-only program is,
+// so a shipping build never compiles it - it links `tpm-client` statically, which exercises the same library code a
+// dynamic program reaches through `tpm-client.lslib`.
+
 #![no_std]
 #![no_main]
 
 extern crate alloc;
+// THE TRAMPOLINES `tpm-client` CALLS THROUGH, linked into this static program: nothing in Rust names the crate, so it is
+// named here, or the linker never sees the symbols it defines.
+extern crate tpm_client_provider;
 
 use alloc::vec::Vec;
-use proto::system::{LaunchContext, Outcome};
+use ipc_client::ChannelTransport;
+use proto::path;
+use proto::system::{LaunchContext, OpenOpts, Outcome, volume};
 use rt::*;
-use storage_proto::path;
-use tools::{VolumeSet, read_volume_file};
 use tpm_client::TpmClient;
 
 // How long `hold` holds on: past the scenario's disable, the driver's absence and its enable.
@@ -55,9 +63,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	inherit_stdout(bootstrap);
 	let Some(context) = recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) else { exit() };
 	// The files first, then the grants - PermissionManager's vocabulary order.
-	let volumes = VolumeSet::receive(bootstrap, &mut buf);
-	let observe = VolumeSet::recv_grant(bootstrap, &mut buf, b"TPM").unwrap_or(0);
-	let seal = VolumeSet::recv_grant(bootstrap, &mut buf, b"TPMSEAL").unwrap_or(0);
+	let volumes = Volumes::receive(bootstrap, &mut buf);
+	let observe = recv_grant(bootstrap, &mut buf, b"TPM").unwrap_or(0);
+	let seal = recv_grant(bootstrap, &mut buf, b"TPMSEAL").unwrap_or(0);
 	if observe == 0 || seal == 0 {
 		verdict(false, b"the observation and sealing grants were not both delivered");
 		exit();
@@ -96,12 +104,86 @@ fn extend23(client: &mut TpmClient, observe: u64) {
 	verdict(before.is_some() && before == after, b"PCR 23 is unchanged");
 }
 
-fn read_file(volumes: &VolumeSet, cwd: &str, argument: &str) -> Option<Vec<u8>> {
-	let uri = path::resolve(cwd, argument.as_bytes())?;
-	unsafe { read_volume_file(volumes.client_for(cwd, argument.as_bytes()), &uri, 4096) }.ok()
+// THE VOLUME BUNDLE, in PermissionManager's fixed order - seven tagged messages with no count in front of them, so all
+// seven are read whether or not this probe uses them.
+struct Volumes {
+	system: u64,
+	media: u64,
+	iso: u64,
+	udf: u64,
+	usb: u64,
+	ram: u64,
+	tmp: u64,
 }
 
-fn other(client: &mut TpmClient, volumes: &VolumeSet, cwd: &str, file: &str) {
+impl Volumes {
+	fn receive(bootstrap: u64, buf: &mut [u8]) -> Volumes {
+		Volumes { system: recv_tagged(bootstrap, buf, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buf, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buf, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buf, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buf, b"USB").unwrap_or(0), ram: recv_tagged(bootstrap, buf, b"RAM").unwrap_or(0), tmp: recv_tagged(bootstrap, buf, b"TMP").unwrap_or(0) }
+	}
+
+	fn client_for(&self, cwd: &str, argument: &[u8]) -> u64 {
+		path::volume_client(cwd, argument, self.system, self.media, self.iso, self.udf, self.usb, self.ram, self.tmp)
+	}
+}
+
+// A GRANT AFTER THE VOLUMES, by its exact tag: the bootstrap terminator that may end the bundle is passed over, and
+// anything else is not this grant.
+fn recv_grant(bootstrap: u64, buf: &mut [u8], tag: &[u8]) -> Option<u64> {
+	loop {
+		match recv_blocking(bootstrap, buf) {
+			Received::Message { len, handle } if &buf[..len] == BOOTSTRAP_READY && handle == 0 => continue,
+			Received::Message { len, handle } if &buf[..len] == tag && handle != 0 => return Some(handle),
+			Received::Message { handle, .. } => {
+				if handle != 0 {
+					close(handle);
+				}
+				return None;
+			}
+			Received::Closed => return None,
+		}
+	}
+}
+
+// A FILE OF AT MOST `limit` BYTES, read through the volume its path names; the file's capability closed on every path.
+fn read_file(volumes: &Volumes, cwd: &str, argument: &str) -> Option<Vec<u8>> {
+	const LIMIT: usize = 4096;
+	let uri = path::resolve(cwd, argument.as_bytes())?;
+	let storage = volumes.client_for(cwd, argument.as_bytes());
+	if storage == 0 {
+		return None;
+	}
+	let opened = match volume::Client::new(ChannelTransport { chan: storage }).open(&OpenOpts { path: uri, write: false, create: false }) {
+		Some(Ok(opened)) if opened.file != 0 => opened,
+		_ => return None,
+	};
+	let length = match usize::try_from(opened.size) {
+		Ok(length) if length <= LIMIT => length,
+		_ => {
+			close(opened.file);
+			return None;
+		}
+	};
+	let mut bytes = Vec::new();
+	if length == 0 || bytes.try_reserve_exact(length).is_err() {
+		close(opened.file);
+		return (length == 0).then_some(bytes);
+	}
+	// SAFETY: the object is the file just opened, mapped whole; `length` is its size, read before the unmap.
+	let read = unsafe {
+		match map_object(opened.file) {
+			Some(address) => {
+				bytes.extend_from_slice(core::slice::from_raw_parts(address as *const u8, length));
+				unmap_object(opened.file);
+				true
+			}
+			None => false,
+		}
+	};
+	close(opened.file);
+	read.then_some(bytes)
+}
+
+fn other(client: &mut TpmClient, volumes: &Volumes, cwd: &str, file: &str) {
 	let Some(sealed) = read_file(volumes, cwd, file) else {
 		verdict(false, b"the tool's sealed file could not be read");
 		return;

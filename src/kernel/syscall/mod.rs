@@ -563,6 +563,22 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 			Err(error) => error,
 		},
 		abi::SYS_SYSTEM_FINGERPRINT => sys_system_fingerprint(a0),
+		abi::SYS_PROCESSOR_IDLE_TABLE => sys_processor_idle_table(a0, a1, a2, a3),
+		abi::SYS_PROCESSOR_PERF_TABLE => sys_processor_perf_table(a0, a1, a2),
+		abi::SYS_PROCESSOR_PERF_WINDOW => match holds_privilege(a0, PrivilegeKind::ProcessorPower) {
+			Ok(()) => crate::processor::set_window(a1 as usize, a2 as u32, a3 as u32),
+			Err(error) => error,
+		},
+		abi::SYS_PROCESSOR_IDLE_INJECT => match holds_privilege(a0, PrivilegeKind::ProcessorPower) {
+			Ok(()) => crate::processor::set_injection(a1 as usize, a2.min(u64::from(u32::MAX)) as u32),
+			Err(error) => error,
+		},
+		abi::SYS_PROCESSOR_PERF_PREFERENCE => match holds_privilege(a0, PrivilegeKind::ProcessorPower) {
+			Ok(()) if a2 <= u64::from(u8::MAX) => crate::processor::set_preference(a1 as usize, a2 as u8),
+			Ok(()) => ERR_INVALID,
+			Err(error) => error,
+		},
+		abi::SYS_LATENCY_REQUEST => sys_latency_request(a0, a1),
 		abi::SYS_DEVICE_NODE => firmware::sys_device_node(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
@@ -2264,7 +2280,11 @@ fn sys_device_properties(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if len != 0 && !user_buf_ok(buf_ptr, len as u64) {
 		return ERR_INVALID;
 	}
-	let mut block = alloc::vec![0u8; len];
+	let mut block: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	if block.try_reserve_exact(len).is_err() {
+		return abi::ERR_NO_MEMORY;
+	}
+	block.resize(len, 0);
 	let Some(total) = device::properties(index as usize, &mut block) else { return ERR_UNSUPPORTED };
 	let copied = total.min(len);
 	if copied != 0
@@ -2396,9 +2416,16 @@ fn sys_system_power(handle: u64, action: u64, seconds: u64) -> i64 {
 	if !Arc::ptr_eq(&domain, &sched::root_domain()) {
 		return ERR_ACCESS_DENIED;
 	}
+	// A PLANNED END: the console's driver given the lines before it - see `serial::settle_driver`.
 	match action {
-		abi::POWER_REBOOT => crate::power::reset(),
-		abi::POWER_OFF => arch::poweroff(),
+		abi::POWER_REBOOT => {
+			arch::serial::settle_driver();
+			crate::power::reset()
+		}
+		abi::POWER_OFF => {
+			arch::serial::settle_driver();
+			arch::poweroff()
+		}
 		abi::POWER_OFF_WITHIN if seconds != 0 => {
 			crate::power::arm_within(seconds);
 			0
@@ -2468,6 +2495,50 @@ fn sys_restore_write(privilege: u64, first: u64, count: u64, pages: u64) -> i64 
 		Ok(()) => 0,
 		Err(error) => error,
 	}
+}
+
+// PROCESSOR POWER - see `abi::SYS_PROCESSOR_IDLE_TABLE` and `crate::processor`.
+fn sys_processor_idle_table(privilege: u64, cpu: u64, states: u64, count: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::ProcessorPower) {
+		return error;
+	}
+	if count > abi::PROCESSOR_MAX_IDLE_STATES as u64 {
+		return ERR_INVALID;
+	}
+	let mut records = [abi::ProcessorIdleState::default(); abi::PROCESSOR_MAX_IDLE_STATES];
+	let bytes = count as usize * core::mem::size_of::<abi::ProcessorIdleState>();
+	if let Err(error) = copy_from_user_exact(records.as_mut_ptr() as *mut u8, states, bytes) {
+		return error;
+	}
+	crate::processor::install_idle(cpu as usize, &records[..count as usize])
+}
+
+fn sys_processor_perf_table(privilege: u64, cpu: u64, table: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::ProcessorPower) {
+		return error;
+	}
+	if table == 0 {
+		return crate::processor::install_perf(cpu as usize, None);
+	}
+	let Some(mut record) = crate::mem::heap::try_box(abi::ProcessorPerfTable::default()) else { return abi::ERR_NO_MEMORY };
+	if let Err(error) = copy_from_user_exact(&mut *record as *mut abi::ProcessorPerfTable as *mut u8, table, core::mem::size_of::<abi::ProcessorPerfTable>()) {
+		return error;
+	}
+	crate::processor::install_perf(cpu as usize, Some(&record))
+}
+
+// A LATENCY REQUEST, counted against its process and the system before its handle is made.
+fn sys_latency_request(privilege: u64, bound_us: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::IdleLatency) {
+		return error;
+	}
+	let thread = current_thread!();
+	let bound = bound_us.min(u64::from(u32::MAX - 1)) as u32;
+	let Some(request) = crate::object::latency_request::LatencyRequest::new() else { return ERR_RESOURCE_EXHAUSTED };
+	if let Err(error) = crate::processor::latency_add(thread.process().header().koid(), request.header().koid(), bound) {
+		return error;
+	}
+	install_object(&thread, request, Rights::TRANSFER | Rights::DUPLICATE)
 }
 
 fn sys_system_fingerprint(out: u64) -> i64 {
