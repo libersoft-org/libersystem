@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+pub mod activity;
 pub mod addr_select;
 pub mod admin_broker;
 pub mod admin_descriptor;
@@ -34,6 +35,7 @@ pub mod gatt_mouse;
 pub mod graph_limits;
 pub mod hci;
 pub mod hci_codec;
+pub mod hibernation;
 pub mod hogp;
 pub mod invalidation;
 pub mod ipv6;
@@ -64,6 +66,9 @@ pub mod selection;
 pub mod service_lifecycle;
 pub mod sha256;
 pub mod shell_language;
+pub mod sleep_order;
+pub mod sleep_policy;
+pub mod sleep_transaction;
 pub mod smp;
 pub mod smp_pairing;
 pub mod sntp;

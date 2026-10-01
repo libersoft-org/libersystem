@@ -1257,6 +1257,17 @@ pub fn free_at_start() -> usize {
 }
 
 // The number of frames currently free.
+// WHETHER THE FRAME AT `phys` IS FREE right now - in its pool's free blocks, or the run table's free runs before the
+// buddy exists. A frame outside every pool is not free: it was never the pool's to hand out. For the hibernation
+// snapshot, which copies every frame in use and calls this for each one in the memory map's seeded regions.
+pub fn is_free(phys: u64) -> bool {
+	let allocator = ALLOCATOR.lock();
+	if !allocator.pools.is_empty() {
+		return allocator.pool_of(phys).is_some_and(|at| allocator.pools[at].buddy.is_free_page(phys));
+	}
+	allocator.runs().iter().any(|run| phys >= run.base && phys < run.base + run.pages * PAGE_SIZE)
+}
+
 pub fn free_count() -> usize {
 	ALLOCATOR.lock().free_count
 }

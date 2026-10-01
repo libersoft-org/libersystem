@@ -32,3 +32,5 @@ forward!("liber_channel_liber_process_system_sleep_hibernate", "liber_channel_im
 forward!("liber_channel_liber_process_system_sleep_inhibit", "liber_channel_impl_liber_process_system_sleep_inhibit");
 forward!("liber_channel_liber_process_system_sleep_release", "liber_channel_impl_liber_process_system_sleep_release");
 forward!("liber_channel_liber_process_system_sleep_last_sleep", "liber_channel_impl_liber_process_system_sleep_last_sleep");
+forward!("liber_channel_liber_process_system_sleep_status", "liber_channel_impl_liber_process_system_sleep_status");
+forward!("liber_channel_liber_process_system_sleep_schedule_wake", "liber_channel_impl_liber_process_system_sleep_schedule_wake");

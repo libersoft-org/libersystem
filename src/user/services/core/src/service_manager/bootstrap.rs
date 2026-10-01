@@ -640,9 +640,10 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 			let keys: u64 = *raw_keys;
 			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
 			let pointer_forward: u64 = *pointer_console;
+			let (started, tpm_admin): (u64, u64) = (*proc_out, kept.end_of(b"tpm_service", b"ADMIN"));
 			let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
 				// THE ROLES ONLY THIS SUPERVISOR CAN FILL, answered by the one function the relaunch calls too.
-				if let Some(filled) = super::supervisor_role(name, role) {
+				if let Some(filled) = super::supervisor_role(name, role, started, tpm_admin) {
 					return Some(filled);
 				}
 				// The shell's session is minted ONCE and reused for the life of the system, so its
@@ -850,6 +851,22 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 				if name == b"device_manager" {
 					if role.tag == b"SYSPOWER" {
 						return Some((role.tag.to_vec(), service_connect(power)?));
+					}
+					// THE SLEEP BUTTONS' DOOR: a `system-sleep` connection this supervisor serves itself - DeviceManager
+					// asks on it for the fixed sleep button and mints one from it for each control-method sleep button's
+					// driver.
+					if role.tag == b"SLEEP" {
+						return Some((role.tag.to_vec(), super::sleep::mint()?));
+					}
+					// THE CLOCK SOURCE'S PRIVILEGE, duplicated from the copy kept: DeviceManager hands it to a Time and
+					// Alarm Device's driver at bind. None kept, the tag goes carrying nothing.
+					if role.tag == b"CLOCKSRC" {
+						let kept = super::CLOCK_SOURCE.load(core::sync::atomic::Ordering::Relaxed);
+						if kept == 0 {
+							return Some((role.tag.to_vec(), 0));
+						}
+						let copy: i64 = duplicate(kept, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+						return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
 					}
 					// THE BOOT WINDOW, AND THE DEADLINE ONLY THE FIRST TIME.
 					//

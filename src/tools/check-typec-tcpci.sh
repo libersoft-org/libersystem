@@ -24,13 +24,16 @@
 #     dropping;
 #   THE TIMING RUN: 200 negotiations, the response from each Source_Capabilities' alert to the Request's TRANSMIT write
 #     in this gate's log - under KVM at most 15 ms at the 99th percentile and never 24 ms.
+#   THE SLEEP: with a charger attached and a contract made, a suspend refused and the connector named; detached, a
+#     suspend to idle answered, and a charger the partner attaches while the guest sleeps finding the sink path off -
+#     the partner's status says so - with the contract made after the resume.
 #
 # THE PARTNER'S RECORD FAILS THE GATE on any request outside the latest offers or their currents, the sink path enabled
 # without VBUS, a hard reset sent with the sink path on, the sink path or the automatic discharge on when a hard reset
 # takes VBUS down, or a message sent while the supply moves.
 #
-# WHAT IT DOES NOT CLAIM: a sleep (carried with the sleep transaction), the ports' tree description (their emulated
-# sweep), a real port controller.
+# WHAT IT DOES NOT CLAIM: the ports' tree description (their emulated sweep), a real port controller, an S3 (the sink
+# path's rule is the suspend's, whichever state).
 #
 # IT BOOTS ITS OWN DEVELOPMENT INSTANCE in private state, and takes it down from the EXIT trap.
 set -euo pipefail
@@ -473,4 +476,37 @@ fi
 contracted 15000
 no_violations
 tcpc_ok detach >/dev/null
-echo "typec-tcpci: PASS - a port controller's Power Delivery sink: 15 V at the board's current and nothing it does not describe, swaps and identity not supported, malformed messages not believed, Wait, Reject and less power renegotiated, both alarms answered with the sink path off first, every Hard Reset and its timer not before its bound, 2.0, below-operating, non-PD and silent sources, a lost controller renegotiated through Soft_Reset without VBUS dropping, and the response inside its budget"
+probe await 1 detached >/dev/null
+
+# ------------------------------------------------------------------ the sleep
+
+case_name="sleep"
+# WITH A CONTRACT: the suspend refused, the connector named, and the contract kept.
+attach charger31
+contracted 15000
+ended=$(seen "ServiceManager: sleep: the transaction ended")
+refused=$(seen "the sleep is refused: connector 1 has its sink path enabled")
+./dev.sh launch --timeout 60 sleepctl suspend idle 3 >"$state/sleepctl-refused.log" 2>&1 || true
+await_line "ServiceManager: sleep: the transaction ended" "$case_name: the refused suspend never ended" "$ended" 60
+await_line "the sleep is refused: connector 1 has its sink path enabled" "$case_name: the driver did not name the connector it refused for" "$refused" 10
+line="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1)"
+grep -q "unwound at Drivers" <<<"$line" || fail "$case_name: the refusal did not unwind the drivers' step: $line"
+contracted 15000
+echo "typec-tcpci: $case_name: with a contract the suspend was refused, the connector named, and the contract kept"
+# DETACHED: a suspend to idle, a charger attached while asleep, the sink path off until the resume.
+detach
+ended=$(seen "ServiceManager: sleep: the transaction ended")
+entered=$(seen "sleep: entered")
+./dev.sh launch --timeout 120 sleepctl suspend idle 12 >"$state/sleepctl-sleep.log" 2>&1 &
+await_line "sleep: entered" "$case_name: the suspend to idle never entered" "$entered" 60
+attach charger31
+sleep 2
+[[ "$(status_of sinking)" == 0 ]] || fail "$case_name: the sink path was on while the guest slept"
+[[ "$(status_of contract)" == none ]] || fail "$case_name: a contract was made while the guest slept"
+await_line "ServiceManager: sleep: the transaction ended" "$case_name: the suspend to idle never ended" "$ended" 120
+grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "$case_name: the suspend to idle did not sleep and wake"
+contracted 15000
+no_violations
+tcpc_ok detach >/dev/null
+echo "typec-tcpci: $case_name: a charger attached while the guest slept found the sink path off, and the contract was made after the resume"
+echo "typec-tcpci: PASS - a port controller's Power Delivery sink: 15 V at the board's current and nothing it does not describe, swaps and identity not supported, malformed messages not believed, Wait, Reject and less power renegotiated, both alarms answered with the sink path off first, every Hard Reset and its timer not before its bound, 2.0, below-operating, non-PD and silent sources, a lost controller renegotiated through Soft_Reset without VBUS dropping, the response inside its budget, a suspend refused while a contract stands, and a charger attached during a sleep contracted only after it"

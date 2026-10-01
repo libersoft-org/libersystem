@@ -16,6 +16,12 @@ extern crate alloc;
 // ACPI BATTERY, AC AND THERMAL ZONE, the driver's parts a host can test: the class a node is, its methods' results read
 // at the specification's offsets, and the bound on a storm of notifications.
 pub mod acpi_power;
+// THE ACPI BUTTONS AND THE LID, the driver's parts a host can test: the class a node is, what its `Notify` values mean and
+// what `_LID` answers.
+pub mod acpi_button;
+// THE ACPI TIME AND ALARM DEVICE, the driver's parts a host can test: `_GCP`'s capabilities, `_GRT`'s time and what a
+// sleep's timed wake programs into a timer.
+pub mod acpi_tad;
 // THE AHCI DECISIONS, with no controller behind them: the port bitmap, the port state rules, the
 // scatter-gather arithmetic and the capacity parse, which is where an AHCI driver is actually wrong.
 pub mod ahci;
@@ -49,6 +55,9 @@ pub mod cdc;
 // THE USB CCID CLASS'S DECISIONS: a reader's class descriptor, its messages, and its slot-change notifications.
 pub mod ccid;
 pub mod common;
+// A DEVICE'S POWER STATE THROUGH ITS NODE CHANNEL: what a driver bound to a firmware node asks the ACPI service for, since
+// the power resources behind a state are shared and counted there.
+pub mod node_power;
 // VIRTIO-SERIAL MULTIPORT AS PURE DECISIONS: which queues a port owns, what a control message means,
 // and what this driver refuses. Every input here is bytes the DEVICE chose, which is why it is a
 // module with fixtures rather than a branch inside a binary nobody can run on the host.

@@ -317,6 +317,12 @@ fn a_driver_evaluates_its_own_node_and_nothing_else() {
 	for platform in ["_INI", "_REG", "_OSC", "_PTS", "_WAK", "_S3", "_SST"] {
 		assert_eq!(admission::admit(platform, None), Err(Refusal::Platform), "{platform}");
 	}
+	// A DEVICE'S POWER IS ASKED FOR, NEVER EVALUATED: `_PSx` by name would skip the power resources it shares.
+	for power in ["_PS0", "_PS3", "_PSW", "_DSW", "_ON", "_OFF"] {
+		assert_eq!(admission::admit(power, None), Err(Refusal::Power), "{power}");
+	}
+	assert_eq!(admission::admit("_PSC", None), Ok(Target::Own(*b"_PSC")), "its current state is read freely");
+	assert_eq!(admission::admit("_PR0", None), Ok(Target::Own(*b"_PR0")), "and so are the resources it names");
 	assert_eq!(admission::admit("\\_SB.PCI0._INI", None), Err(Refusal::OtherNode));
 	assert_eq!(admission::admit("CHLD.RDRG", None), Err(Refusal::OtherNode));
 	assert_eq!(admission::admit("^_DOS", None), Err(Refusal::OtherNode), "no class, no parent method");

@@ -15,7 +15,7 @@
 // SUSPEND TO RAM is the firmware's transition, x86_64's alone here (`arch::sleep`), entered from the boot core's idle
 // context once every other core is parked.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use abi::{ERR_ACCESS_DENIED, ERR_INTERRUPTED, ERR_INVALID, ERR_UNSUPPORTED, SleepReport};
 
@@ -58,6 +58,70 @@ pub fn sleep_type(x: usize) -> Option<(u8, u8)> {
 	(value & REGISTERED != 0).then_some(((value & 0x7) as u8, ((value >> 8) & 0x7) as u8))
 }
 
+// `SYS_SLEEP_STATES`: suspend to idle wherever the port parks its cores for one, suspend to RAM once `\_S3` is registered
+// and the platform can come back from it, and the fixed buttons.
+pub fn states() -> u64 {
+	let mut bits: u64 = 0;
+	if arch::sleep::offers_idle() {
+		bits |= 1 << abi::SLEEP_STATE_IDLE;
+	}
+	if sleep_type(3).is_some() && arch::sleep::offers_ram() {
+		bits |= 1 << abi::SLEEP_STATE_RAM;
+	}
+	// HIBERNATION'S KERNEL HALF: the snapshot, and `\_S4` or soft-off after it. Whether the machine is SET UP for it -
+	// a hibernation partition, a TPM to seal the key - is the image component's to say.
+	if arch::sleep::offers_disk() {
+		bits |= 1 << abi::SLEEP_STATE_DISK;
+	}
+	bits | arch::sleep::fixed_buttons()
+}
+
+// ------------------------------------------------------------------ the wall clock
+
+// THE WALL CLOCK A DRIVER HANDED, on a machine where the kernel reads no RTC of its own: Unix seconds at a boot-time
+// instant. `SYS_CLOCK_RTC` answers it counted forward on the boot-time clock - so TimeService, StorageService's stamps and
+// every other reader keep the one kernel read - and 0 before one is handed.
+static BASE_UNIX: AtomicU64 = AtomicU64::new(0);
+static BASE_BOOT_NS: AtomicU64 = AtomicU64::new(0);
+// A SUSPEND TO RAM'S LENGTH NOT YET KNOWN: the counter restarted and no RTC was read, so the base handed at the resume
+// is what the boot-time clock takes the sleep from, in one step.
+static SLEPT_UNKNOWN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// `SYS_CLOCK_RTC`: the kernel's own RTC where it drives one, the handed base otherwise.
+pub fn rtc_unix() -> u64 {
+	if arch::rtc_present() {
+		return arch::rtc::read_unix();
+	}
+	let base = BASE_UNIX.load(Ordering::Acquire);
+	if base == 0 {
+		return 0;
+	}
+	base + boot_ns().saturating_sub(BASE_BOOT_NS.load(Ordering::Acquire)) / 1_000_000_000
+}
+
+// `SYS_CLOCK_BASE`: the base handed. After an S3 whose length no RTC gave, the difference between it and what the old
+// base counts forward to is the sleep, which the boot-time clock takes in before the new base is kept.
+pub fn set_clock_base(unix: u64) -> i64 {
+	if unix == 0 {
+		return ERR_INVALID;
+	}
+	let old = BASE_UNIX.load(Ordering::Acquire);
+	if SLEPT_UNKNOWN.swap(false, Ordering::AcqRel) && old != 0 {
+		let expected = old + boot_ns().saturating_sub(BASE_BOOT_NS.load(Ordering::Acquire)) / 1_000_000_000;
+		let slept = unix.saturating_sub(expected);
+		add_slept(slept.saturating_mul(1_000_000_000));
+		crate::serial_println!("sleep: the clock's source says the sleep lasted {slept} s");
+	}
+	BASE_BOOT_NS.store(boot_ns(), Ordering::Release);
+	BASE_UNIX.store(unix, Ordering::Release);
+	0
+}
+
+// A suspend to RAM with no RTC to measure it: its length comes with the next base.
+pub fn slept_unknown() {
+	SLEPT_UNKNOWN.store(true, Ordering::Release);
+}
+
 // ------------------------------------------------------------------ the boot-time clock
 
 // EVERY SLEEP'S LENGTH, summed: the boot-time clock is the monotonic clock plus this. A suspend to idle's is the
@@ -80,8 +144,50 @@ pub fn add_slept(ns: u64) {
 // a delivered press would power the machine off.
 static WOKE: AtomicU64 = AtomicU64::new(0);
 
+// The core a suspend to idle parks its entry on, `usize::MAX` outside one.
+static ENTRY_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 pub fn woke_by(reason: u32, detail: u32) {
-	let _ = WOKE.compare_exchange(0, u64::from(reason) << 32 | u64::from(detail), Ordering::AcqRel, Ordering::Acquire);
+	if WOKE.compare_exchange(0, u64::from(reason) << 32 | u64::from(detail), Ordering::AcqRel, Ordering::Acquire).is_err() {
+		return;
+	}
+	// THE ENTRY'S CORE IS WOKEN when the wake landed on another: it is halted with nothing but the timed wake armed,
+	// and a button or a device routed elsewhere would otherwise wait for that.
+	let entry = ENTRY_CPU.load(Ordering::Acquire);
+	if entry != usize::MAX && entry != crate::sched::current_cpu_id() {
+		arch::apic::send_wake_ipi(crate::smp::lapic_id(entry));
+	}
+}
+
+// THE DEVICES' PART OF THE WAKE SET: the interrupts drivers marked in a `SUSPEND` step asked to arm wake
+// (`SYS_INTERRUPT_WAKE`), by their architectural identity plus one - zero is a free slot. A suspend to idle leaves them
+// unmasked, and the first to fire while the machine sleeps ends the sleep as a device's wake. A mark goes with the
+// binding that made it.
+const WAKE_SOURCES: usize = 32;
+static WAKE_SET: [AtomicU32; WAKE_SOURCES] = [const { AtomicU32::new(0) }; WAKE_SOURCES];
+
+// Marked or unmarked; false when the set is full.
+pub fn mark_wake(identity: u32, on: bool) -> bool {
+	let stored = identity.wrapping_add(1);
+	if !on {
+		for slot in WAKE_SET.iter() {
+			let _ = slot.compare_exchange(stored, 0, Ordering::AcqRel, Ordering::Acquire);
+		}
+		return true;
+	}
+	is_wake(identity) || WAKE_SET.iter().any(|slot| slot.compare_exchange(0, stored, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
+pub fn is_wake(identity: u32) -> bool {
+	let stored = identity.wrapping_add(1);
+	WAKE_SET.iter().any(|slot| slot.load(Ordering::Acquire) == stored)
+}
+
+// A DEVICE INTERRUPT TAKEN WHILE THE MACHINE SLEEPS: one of the wake set's wakes it, its identity the detail.
+pub fn device_interrupt(identity: u32) {
+	if is_wake(identity) {
+		woke_by(abi::WAKE_DEVICE, identity);
+	}
 }
 
 fn take_woke() -> Option<(u32, u32)> {
@@ -101,6 +207,11 @@ pub fn sys_system_sleep(domain: &alloc::sync::Arc<crate::object::domain::Domain>
 	if !alloc::sync::Arc::ptr_eq(domain, &crate::sched::root_domain()) {
 		return Err(ERR_ACCESS_DENIED);
 	}
+	// A FORCED POWER-OFF DEADLINE ARMED refuses the entry: a sleep's held clock would postpone it.
+	if crate::power::armed() {
+		crate::serial_println!("sleep: not entered - a forced power-off deadline is armed");
+		return Err(ERR_INTERRUPTED);
+	}
 	// THE TIMED WAKE, a deadline on the boot-time clock, as nanoseconds from now.
 	let after = match timed_wake {
 		0 => None,
@@ -115,7 +226,11 @@ pub fn sys_system_sleep(domain: &alloc::sync::Arc<crate::object::domain::Domain>
 			let Some(pair) = sleep_type(3) else { return Err(ERR_UNSUPPORTED) };
 			arch::sleep::suspend_to_ram(pair, after)
 		}
-		abi::SLEEP_STATE_DISK => Err(ERR_UNSUPPORTED),
+		// HIBERNATION'S SNAPSHOT: answered twice - `WAKE_SNAPSHOT`, then `WAKE_RESTORED` in the machine restored from its
+		// image (see `disk`). Offered where `\_S4` or soft-off can end it, which is every machine the entry runs on.
+		abi::SLEEP_STATE_DISK => arch::sleep::snapshot(),
+		// THE MACHINE OFF WITH ITS IMAGE WRITTEN.
+		abi::SLEEP_STATE_DISK_ENTER => arch::sleep::enter_disk(),
 		_ => Err(ERR_INVALID),
 	}
 }
@@ -162,8 +277,10 @@ fn suspend_to_idle(after: Option<u64>) -> Result<SleepReport, i64> {
 	let wake_at = after.map(counter_after);
 	let suspended_at = prologue("suspend to idle")?;
 	arch::sleep::mask_device_lines();
+	ENTRY_CPU.store(crate::sched::current_cpu_id(), Ordering::Release);
 	crate::idle::begin_sleep();
 	let (wake, detail) = park_here(wake_at);
+	ENTRY_CPU.store(usize::MAX, Ordering::Release);
 	// THE REBASE, FIRST: the counter that ran through the sleep leaves the monotonic clock.
 	let resumed_at = arch::tsc::now();
 	CLOCK.rebase(suspended_at, resumed_at);
@@ -207,3 +324,5 @@ fn park_here(wake_at: Option<u64>) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests;
+
+pub mod disk;

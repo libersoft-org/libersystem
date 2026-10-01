@@ -126,6 +126,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"FIRMWARE" => handle,
 		_ => 0,
 	};
+	// 1h. and the clock source's, relayed the same way: DeviceManager hands it to a Time and Alarm Device's driver.
+	let clock_source: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"CLOCKSRC" => handle,
+		_ => 0,
+	};
+	// 1i. and hibernation's, relayed the same way: ServiceManager hands it to the image component.
+	let hibernation: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 9 && &buf[..9] == b"HIBERNATE" => handle,
+		_ => 0,
+	};
 
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
@@ -206,8 +216,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		root_msg[..7].copy_from_slice(b"ROOTSEL");
 		root_msg[7..].copy_from_slice(&root_selection);
 		send_blocking(sm_side, &root_msg, 0);
-		// The firmware privilege, last, in the position it arrived in - sent carrying none when none came.
+		// The firmware privilege, in the position it arrived in - sent carrying none when none came.
 		send_blocking(sm_side, b"FIRMWARE", firmware);
+		// The clock source's, likewise.
+		send_blocking(sm_side, b"CLOCKSRC", clock_source);
+		// Hibernation's, last, likewise.
+		send_blocking(sm_side, b"HIBERNATE", hibernation);
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's
@@ -349,7 +363,7 @@ fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, domain: u
 // WHETHER A MESSAGE ON THE BRANCH IS THE SLEEP'S ENTRY rather than a boot report to relay: every report is text, and
 // the entry's frame opens with its operation number.
 fn is_sleep_entry(message: &[u8]) -> bool {
-	message.len() >= 6 && u16::from_le_bytes([message[0], message[1]]) == sleep_entry::OP_ENTER
+	message.len() >= 6 && [sleep_entry::OP_ENTER, sleep_entry::OP_OFF_HIBERNATED].contains(&u16::from_le_bytes([message[0], message[1]]))
 }
 
 // THE KERNEL'S SLEEP ENTRY, with the timed wake turned into a deadline on the boot-time clock.
@@ -382,11 +396,24 @@ impl sleep_entry::Service for Entry {
 			WAKE_DEVICE => WakeReason::Device,
 			WAKE_RTC => WakeReason::Rtc,
 			WAKE_PLATFORM => WakeReason::Platform,
+			WAKE_SNAPSHOT => WakeReason::Snapshot,
+			WAKE_RESTORED => WakeReason::Restored,
 			_ => WakeReason::Unknown,
 		};
 		let count = (report.core_count as usize).min(SLEEP_REPORT_CORES);
 		let cores = report.cores[..count].iter().map(|core| WireCorePark { cpu: core.cpu, timer: core.timer, ipi: core.ipi, device: core.device }).collect();
 		Ok(Woke { wake, detail: report.detail, slept: report.slept_ns, cores })
+	}
+
+	// THE MACHINE OFF WITH ITS IMAGE WRITTEN - `\_S4`, or soft-off. The kernel's entry returns only when it did not
+	// happen.
+	fn off_hibernated(&mut self) -> Result<(), Error> {
+		let mut report = SleepReport::default();
+		let answer: i64 = unsafe { syscall(SYS_SYSTEM_SLEEP, self.power, SLEEP_STATE_DISK_ENTER, 0, &mut report as *mut SleepReport as u64) } as i64;
+		match answer {
+			ERR_ACCESS_DENIED => Err(Error::Denied),
+			_ => Err(Error::Unsupported),
+		}
 	}
 }
 
@@ -490,7 +517,7 @@ fn serve_power_once(power: u64, requests: u64, set: u64, connections: &mut [(u64
 	}
 }
 
-// The two ops, and nothing else. A client of this can stop the machine and can do NOTHING further -
+// The ops that stop the machine, and nothing else. A client of this can stop the machine and can do NOTHING further -
 // which is the whole difference between this and the handle it replaced.
 struct PowerApi {
 	power: u64,
@@ -505,6 +532,16 @@ impl system_power::Service for PowerApi {
 
 	fn power_off(&mut self) -> Result<(), Error> {
 		let result: i64 = unsafe { syscall(SYS_SYSTEM_POWER, self.power, POWER_OFF, 0, 0) } as i64;
+		if result < 0 { Err(Error::Denied) } else { Ok(()) }
+	}
+
+	// THE FORCED DEADLINE, armed in the kernel, which outlives every process the orderly power-off after it stops -
+	// this one included. It only stops the machine, which is all a client of this interface may do.
+	fn power_off_within(&mut self, seconds: u32) -> Result<(), Error> {
+		if seconds == 0 {
+			return Err(Error::Invalid);
+		}
+		let result: i64 = unsafe { syscall(SYS_SYSTEM_POWER, self.power, POWER_OFF_WITHIN, u64::from(seconds), 0) } as i64;
 		if result < 0 { Err(Error::Denied) } else { Ok(()) }
 	}
 }

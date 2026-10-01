@@ -152,6 +152,22 @@ interface input-trusted {
 	@op(3) disarm: func(epoch: u64) -> result<unit, error>;
 }
 
+/// An edge of the activity signal.
+enum activity-edge {
+	/// No input from any source for the watcher's interval.
+	idle   = 1,
+	/// The first input after it.
+	active = 2,
+}
+
+/// THE ACTIVITY SIGNAL, served on InputService's `ACTIVITY` root: `watch(idle-after-ms)` answers a stream of edges -
+/// `idle` once there has been no input from any source for that long, `active` at the first input after it - and nothing
+/// about what the input was. Input during the protected session counts. Its holders are the power-state service's sleep
+/// policy, for its idle timeout, and the brightness policy. An interval outside a second to a day is refused.
+interface input-activity {
+	@op(1) watch: func(idle-after-ms: u32) -> stream<activity-edge>;
+}
+
 /// Privileged launcher boundary that mints a factory restricted to raw-key
 /// subscriptions. Connections produced from it cannot call the pointer snapshot op.
 interface input-admin {

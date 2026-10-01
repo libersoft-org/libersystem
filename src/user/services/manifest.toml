@@ -2726,6 +2726,17 @@ stage = "volume"
 destination = "libexec/tpm_service.lsexe"
 providers = []
 
+# STATIC, FOR THE REASON `smartcard_service` IS: the image's format and cryptography are `service-logic`'s, which no staged
+# library publishes.
+[[programs]]
+name = "hibernation_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/hibernation_service.lsexe"
+providers = []
+
 # STATIC, FOR THE REASON `smartcard_service` IS: its decisions are `service-logic`'s, which no staged library publishes.
 [[programs]]
 name = "bmc_service"
@@ -3246,6 +3257,76 @@ match = [
 provides = [{ kind = "power-source", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
+
+# THE SLEEP GATE'S FIXTURE: an `ivshmem-plain` function the gate hot-plugs into the empty native hot-plug port after boot
+# - so it is the last binding and the first suspended - whose `SUSPEND` it holds or refuses as the harness writes into its
+# shared memory. DEVELOPMENT-ONLY AND BOUND BY ADDRESS: the port's secondary bus, slot 0. `none` because it masters
+# nothing: the harness and the driver share the memory through the function's BAR.
+[[programs]]
+name = "sleep_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/sleep_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x05, pci-subclass = 0x00, pci-interface = 0x00, pci-address = { bus = 1, dev = 0, func = 0 } },
+]
+priority = "quirk"
+heartbeat-deadline = 100
+suspend-deadline = 1000
+
+# THE ACPI BUTTONS AND THE LID: one binding per namespace node. A control-method power button powers the machine off as
+# the fixed one does - DeviceManager hands it a `system-power` connection as it does the keyboards - and a control-method
+# sleep button asks for a suspend through a `system-sleep` connection minted for it; a lid publishes a `platform-switch`
+# to the power-state service, whose policy decides what a closed lid does. It masters nothing and reaches no register.
+[[programs]]
+name = "acpi_button"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_button.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "platform", hid = "PNP0C0C" },
+	{ transport = "platform", hid = "PNP0C0E" },
+	{ transport = "platform", hid = "PNP0C0D" },
+	{ transport = "platform", cid = "PNP0C0C" },
+	{ transport = "platform", cid = "PNP0C0E" },
+	{ transport = "platform", cid = "PNP0C0D" },
+]
+provides = [{ kind = "platform-switch", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# THE ACPI TIME AND ALARM DEVICE: its clock handed to the kernel under the clock source's privilege, which DeviceManager
+# hands this driver alone, and its wake timers set from a sleep's timed wake in its suspend step.
+[[programs]]
+name = "acpi_tad"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_tad.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", hid = "ACPI000E" }, { transport = "platform", cid = "ACPI000E" }]
+heartbeat-deadline = 100
+suspend-deadline = 200
 
 # THE ACPI GATE'S FIXTURE DRIVER: bound to the fixture SSDT's `LSFX0001` node through the ACPI service's namespace, it
 # asks for its node channel and runs the gate's probes on every `Notify`. A shipping image has neither the program nor
@@ -4236,6 +4317,24 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:device@1/provider-catalogue-admin"
 
+# THE SLEEP BUTTONS' DOOR: a `system-sleep` connection ServiceManager serves itself. DeviceManager asks on it for a
+# suspend when the fixed sleep button is pressed, and mints one from it for each control-method sleep button's driver,
+# as it mints a `system-power` one for the keyboards. LAST, read after `CATADMIN`.
+[[services.roles]]
+tag = "SLEEP"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-sleep"
+presence = "optional"
+
+# THE CLOCK SOURCE'S PRIVILEGE, which DeviceManager duplicates for a Time and Alarm Device's driver at bind: under it
+# that driver hands the kernel the wall clock on a machine whose kernel reads no RTC of its own. LAST.
+[[services.roles]]
+tag = "CLOCKSRC"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
 [[services]]
 name = "device_service"
 program = "device_service"
@@ -4353,6 +4452,15 @@ provider = "self"
 interface = "liber:display@1/display-trusted"
 presence = "optional"
 
+# THE OUTPUTS' ROOT, read-only: which outputs this service drives and whether each is the machine's own. The sleep policy
+# asks it before a closed lid suspends the machine. LAST, like every addition.
+[[services.roles]]
+tag = "OUTPUTS"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display-outputs"
+presence = "optional"
+
 [[services]]
 name = "input_service"
 program = "input_service"
@@ -4438,6 +4546,15 @@ provider = "self"
 interface = "liber:input@1/input-trusted"
 presence = "optional"
 
+# THE ACTIVITY SIGNAL'S ROOT: `watch(idle-after)` edges and nothing about what the input was. The power-state service's
+# sleep policy holds a connection of it. LAST, like every addition.
+[[services.roles]]
+tag = "ACTIVITY"
+kind = "serve-root"
+provider = "self"
+interface = "liber:input@1/input-activity"
+presence = "optional"
+
 # THE SYSTEM INSTANCE STARTS BEFORE THE THREE VOLUME INSTANCES, AND THE DEPENDENCY IS WHAT SAYS SO
 # (2026-09-04).
 #
@@ -4482,6 +4599,15 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:storage@1/volume"
+
+# THE HIBERNATION AREA - the GPT partition of the hibernation type on the system disk - for the image component alone.
+# LAST, after SERVE, and read by the system volume's instance only.
+[[services.roles]]
+tag = "HIBERNATION"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/hibernation-area"
+presence = "optional"
 
 
 [[services]]
@@ -5331,10 +5457,15 @@ provider = "self"
 interface = "liber:bluetooth@1/bluetooth-profile"
 
 # POWER STATE, NORMALISED, AND THE FEW DEVICE CONTROLS AN OPERATOR MAY USE. It consumes every
-# `power-source` publication through a catalogue connection minted for that kind alone, and serves two
+# `power-source` publication through a catalogue connection minted for that kind and `platform-switch`, and serves two
 # roots: STATE, which enumerates and subscribes and can change nothing, and CONTROL, which switches an
-# output a device advertises. It holds no system-power client: shutting the machine down is
-# SystemManager's, and nothing here can ask for it.
+# output a device advertises.
+#
+# AND THE SLEEP POLICY: a closed lid suspends unless an external display is in use - the lid's `platform-switch` and
+# DisplayService's OUTPUTS - an idle timeout suspends on battery - InputService's ACTIVITY - and a critical battery
+# hibernates where that is set up and otherwise powers off in order: the kernel's forced deadline through SYSPOWER's
+# `power-off-within`, then ServiceManager's sequence through SHUTDOWN. SLEEP, SYSPOWER and SHUTDOWN are ServiceManager's
+# to fill, at the first start and at every relaunch.
 #
 # TRANSPARENT AND RECONSTRUCTIBLE. Everything it knows, it re-reads from the catalogue: a restarted
 # instance takes a fresh snapshot from every provider and starts a new epoch, and its subscribers,
@@ -5345,7 +5476,13 @@ program = "power_service"
 restart = "transparent"
 state_class = "reconstructible"
 state_scope = "service"
-dependencies = ["log_service", "process_service", "device_manager"]
+dependencies = [
+	"log_service",
+	"process_service",
+	"device_manager",
+	"input_service",
+	"display_service",
+]
 
 [[services.roles]]
 tag = "CATALOGUE"
@@ -5353,7 +5490,7 @@ kind = "factory"
 provider = "device_manager"
 source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
-kinds = ["power-source"]
+kinds = ["power-source", "platform-switch"]
 presence = "optional"
 
 [[services.roles]]
@@ -5367,6 +5504,43 @@ tag = "CONTROL"
 kind = "serve-root"
 provider = "self"
 interface = "liber:power@1/power-control"
+
+[[services.roles]]
+tag = "ACTIVITY"
+kind = "client"
+provider = "input_service"
+source = "ACTIVITY"
+interface = "liber:input@1/input-activity"
+presence = "optional"
+
+[[services.roles]]
+tag = "OUTPUTS"
+kind = "client"
+provider = "display_service"
+source = "OUTPUTS"
+interface = "liber:display@1/display-outputs"
+presence = "optional"
+
+[[services.roles]]
+tag = "SLEEP"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-sleep"
+presence = "optional"
+
+[[services.roles]]
+tag = "SYSPOWER"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-power"
+presence = "optional"
+
+[[services.roles]]
+tag = "SHUTDOWN"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-shutdown"
+presence = "optional"
 
 # SMART-CARD READERS, EXCLUSIVE EXPIRING TRANSACTIONS AND A BOUNDED SET OF PIV OPERATIONS. It consumes
 # every `smartcard-reader` publication through a catalogue connection minted for that kind alone, and
@@ -5443,6 +5617,56 @@ interface = "liber:tpm@1/tpm-admin"
 #
 # TRANSPARENT: a replacement takes the providers again and chooses as the first instance did; the timers are in the
 # hardware. It is told the orderly shutdown before the kills, and the suspend transaction's sleep announcement.
+# THE HIBERNATION IMAGE COMPONENT: it writes the image of a hibernation's snapshot to the hibernation partition and, at
+# every start, restores the image it finds there - one program, because the key is sealed for the component that sealed
+# it. Its four roles are ServiceManager's to fill at every start: the kernel's Hibernation privilege, duplicated from the
+# copy kept; the hibernation area, the system volume's; a `tpm-seal` grant minted from TpmService's root for this
+# component and this start's task; and the restore's door. ServiceManager asks it `status` at a hibernation's acceptance
+# and `write-image` once the snapshot is taken, on the control channel it holds for it.
+#
+# TRANSPARENT: its state is the partition's, read again by the instance that replaces it.
+[[services]]
+name = "hibernation_service"
+program = "hibernation_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = [
+	"log_service",
+	"process_service",
+	"device_manager",
+	"storage_service",
+	"tpm_service",
+]
+
+[[services.roles]]
+tag = "HIBERNATE"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
+[[services.roles]]
+tag = "AREA"
+kind = "client"
+provider = "storage_service"
+source = "HIBERNATION"
+interface = "liber:storage@1/hibernation-area"
+presence = "optional"
+
+[[services.roles]]
+tag = "TPMSEAL"
+kind = "client"
+provider = "service_manager"
+interface = "liber:tpm@1/tpm"
+presence = "optional"
+
+[[services.roles]]
+tag = "RESTORE"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/hibernation-restore"
+presence = "optional"
+
 [[services]]
 name = "watchdog_service"
 program = "watchdog_service"

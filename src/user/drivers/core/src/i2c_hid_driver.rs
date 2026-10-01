@@ -6,7 +6,7 @@
 //
 // BRING-UP, AFTER READY. READY comes first and publishes nothing: the node channel is answered only to a binding that
 // is online, and what follows is bounded by the device rather than by the bind window. Then the HID descriptor register,
-// from the node's `_DSM` (HID over I2C's, function 1) or the tree's `hid-descr-addr`; the node's `_PS0` where it has one;
+// from the node's `_DSM` (HID over I2C's, function 1) or the tree's `hid-descr-addr`; D0 asked on the node channel;
 // the thirty-byte HID descriptor read and checked, a malformed one failing the binding with nothing published; SET_POWER
 // on, RESET, and the reset indication - a zero-length input report - awaited on the line within `RESET_BOUND_TICKS`, the
 // RESET sent once more and then the binding failed; then the report descriptor, handed to the generic HID parser, whose
@@ -16,11 +16,13 @@
 // THE LOOP. On the line's event: input reports are read until the line is quiet, each decoded by the collection its
 // report id belongs to - a pointer frame, or contact frames - and sent to that provider's consumers; then the event is
 // acknowledged, so the line may fire again. A line event with nothing behind it resets the device once, and the next
-// fails the binding. On STOP: SET_POWER sleep, then the node's `_PS3` where it has one.
+// fails the binding. On STOP: SET_POWER sleep, then D3cold asked on the node channel.
 //
-// THE SLEEP, between two line events: SET_POWER sleep and the node's `_PS3`, as a stop does, and the line unwatched; the
-// resume runs the node's `_PS0`, SET_POWER on and RESET with its indication awaited, as bind does - a device that lost
-// its power comes back through the same handshake - and a device that does not answer it did not come back.
+// THE SLEEP, between two line events: SET_POWER sleep and the state the sleep lets the node enter - it arms no wake, so
+// the deepest - and the line unwatched; the resume asks D0, SET_POWER on and RESET with its indication awaited, as bind
+// does - a device that lost its power comes back through the same handshake - and a device that does not answer it did
+// not come back. THE POWER STATES ARE ASKED, NEVER EVALUATED: `_PSx` and the power resources a state shares with other
+// devices are the ACPI service's (`drivers::node_power`).
 
 #![no_std]
 #![no_main]
@@ -33,6 +35,7 @@ use alloc::vec::Vec;
 use drivers::common;
 use drivers::hid;
 use drivers::i2c_hid::{self, Pointer, ResetHandshake, ResetNext, Route, Storm, StormAnswer};
+use drivers::node_power;
 use hid_i2c::{Device, Input, PowerState, SlaveAddress};
 use i2c_client::ScopedBus;
 use i2c_device_proto::generated::liber::i2c_device::v1::i2c_device;
@@ -147,8 +150,8 @@ impl Hid {
 		}
 	}
 
-	fn power_method(&self, method: &str) {
-		power_method(&self.name, self.node, method);
+	fn power_state(&self, state: u8) {
+		power_state(&self.name, self.node, state);
 	}
 
 	// RESET, and the indication awaited within the bound - sent once more, then refused.
@@ -258,22 +261,22 @@ impl Hid {
 	}
 
 	// THE SLEEP'S HALF OF WHAT A STOP DOES, and its way back - see the head of this file.
-	fn sleep_now(&mut self) -> bool {
+	fn sleep_now(&mut self, state: driver_protocol::SleepState) -> bool {
 		let asleep = self.device.set_power(&mut self.bus, PowerState::Sleep).is_ok();
 		if !asleep {
 			self.say("SET_POWER sleep could not be sent");
 		}
-		self.power_method("_PS3");
+		self.power_state(node_power::for_sleep(self.node, state, false));
 		asleep
 	}
 
-	// THE STOP: the device put to sleep, then the node's `_PS3`.
+	// THE STOP: the device put to sleep, then D3cold.
 	fn stop(&mut self) -> ! {
 		let asleep = self.device.set_power(&mut self.bus, PowerState::Sleep).is_ok();
 		if !asleep {
 			self.say("SET_POWER sleep could not be sent");
 		}
-		self.power_method("_PS3");
+		self.power_state(node_power::D3_COLD);
 		common::finish_stop(self.bootstrap, &self.bind, 0, true);
 		exit()
 	}
@@ -285,8 +288,8 @@ impl Hid {
 }
 
 impl common::SleepStep for Hid {
-	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
-		if !self.sleep_now() {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if !self.sleep_now(request.state) {
 			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
 		}
 		self.say("suspended - SET_POWER sleep");
@@ -294,7 +297,7 @@ impl common::SleepStep for Hid {
 	}
 
 	fn resume(&mut self, _lost_power: bool) -> bool {
-		self.power_method("_PS0");
+		self.power_state(node_power::D0);
 		match self.power_on_and_reset() {
 			Ok(()) => {
 				self.say("resumed - SET_POWER on and RESET answered");
@@ -312,16 +315,12 @@ impl common::SleepStep for Hid {
 	}
 }
 
-// A POWER METHOD OF THE NODE'S (`_PS0`, `_PS3`), where the node has it: a name the node does not have is no refusal.
-fn power_method(name: &str, node: u64, method: &str) {
-	if node == 0 {
-		return;
-	}
-	match acpi_node::Client::with_deadline(ChannelTransport { chan: node }, clock() + TICKS).evaluate(method, &[]) {
-		Some(Ok(_)) => say(name, &format!("{method} ran")),
-		Some(Err(error)) if format!("{error:?}").contains("NotFound") => {}
-		Some(Err(error)) => say(name, &format!("{method} did not run - {error:?}")),
-		None => say(name, &format!("{method} was not answered")),
+// THE NODE'S POWER STATE, asked on its channel: a node with no `_PSx` and no power resources answers with nothing done,
+// and one that could not enter the state is said and carried on from - the HID handshake is what says whether the
+// device answers.
+fn power_state(name: &str, node: u64, state: u8) {
+	if let Err(why) = node_power::set(node, state) {
+		say(name, &why);
 	}
 }
 
@@ -406,7 +405,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
 	}
 	// POWER, THEN THE DESCRIPTOR - which is what a device still held in reset, or one that is not HID over I2C, fails.
-	power_method(&name, node, "_PS0");
+	power_state(&name, node, node_power::D0);
 	let device = match Device::probe(&mut bus, address, register) {
 		Ok(device) => device,
 		Err(error) => {

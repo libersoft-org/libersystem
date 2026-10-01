@@ -65,6 +65,9 @@ struct Presenter {
 	/// Whether each image already holds a complete frame. AN IMAGE THAT DOES NOT IS FILLED WHOLE,
 	/// which is what makes a queue of several images correct rather than nearly correct.
 	complete: Vec<bool>,
+	/// AN ACQUIRE ANSWERED `out-of-date`: the configuration moved on and this end has not followed. The loop
+	/// follows it before its next wait - see `follow_configuration`.
+	out_of_date: bool,
 }
 
 impl Presenter {
@@ -79,7 +82,7 @@ impl Presenter {
 		shadow.try_reserve_exact(pitch as usize * height as usize).ok()?;
 		shadow.resize(pitch as usize * height as usize, 0);
 		let complete = alloc::vec![false; surface.image_count()];
-		Some(Presenter { surface, shadow, pitch, height, complete })
+		Some(Presenter { surface, shadow, pitch, height, complete, out_of_date: false })
 	}
 
 	/// Re-size the shadow for the surface's current generation, answering its base and layout.
@@ -120,6 +123,14 @@ impl Presenter {
 	fn present(&mut self, rect: Rect) -> bool {
 		let index = match self.surface.acquire() {
 			Some(Ok(surface::AcquiredImage::Image(index))) => index,
+			// THE CLIENT REBUILDS, which is what the contract says `out-of-date` asks for. Waiting for the Configure
+			// event alone froze the display for good whenever that event was dropped - DisplayService drops an event a
+			// full stream cannot take, and a display driver rebound after a suspend to RAM configures every surface
+			// while the console is still presenting the burst of lines the rebinding printed.
+			Some(Ok(surface::AcquiredImage::OutOfDate)) => {
+				self.out_of_date = true;
+				return false;
+			}
 			_ => return false,
 		};
 		let Some(image) = self.surface.image(index) else {
@@ -824,6 +835,10 @@ unsafe fn run(console: &mut Console) -> ! {
 			// host-window change), then each program-hosted PTY's slave-data, slave-control,
 			// and master channels interleaved (data / control / master at pty_base + 3*j),
 			// then the pointer channel (when present) in the last slot.
+			// A PRESENT TOLD THE CONFIGURATION MOVED ON: followed now, before this loop waits for anything.
+			if console.surface.as_ref().is_some_and(|presenter| presenter.borrow().out_of_date) {
+				follow_configuration(console);
+			}
 			waits.clear();
 			waits.push(console.input);
 			let nv: usize = console.vts.len();
@@ -1685,9 +1700,17 @@ fn handle_display_resize(console: &mut Console) {
 	let Some(surface::SurfaceEvent::Configure(_)) = decoded else {
 		return;
 	};
-	// A CONFIGURATION EVENT IS REBUILT FROM, not re-created from. The surface is the same capability;
+	follow_configuration(console);
+}
+
+// FOLLOW THE SURFACE'S CURRENT CONFIGURATION - on a Configure event, or on an acquire that answered `out-of-date`:
+// rebuilt, the shadow re-sized and every VT re-pointed and redrawn. A redraw that is told `out-of-date` again leaves
+// the flag clear, so a surface that cannot be followed is tried again at the next present rather than in a loop.
+fn follow_configuration(console: &mut Console) {
+	// A CONFIGURATION IS REBUILT FROM, not re-created from. The surface is the same capability;
 	// what changed is its generation, and rebuilding is what the lifecycle calls for.
 	if let Some(presenter) = console.surface.as_ref() {
+		presenter.borrow_mut().out_of_date = false;
 		if presenter.borrow_mut().surface.rebuild().is_none_or(|outcome| outcome.is_err()) {
 			return;
 		}
@@ -1714,6 +1737,7 @@ fn handle_display_resize(console: &mut Console) {
 		}
 		resize_vt(console, vi, cols, rows);
 	}
+	presenter.borrow_mut().out_of_date = false;
 }
 
 // Toggle the foreground VT's caret blink phase, presenting only when a pixel actually

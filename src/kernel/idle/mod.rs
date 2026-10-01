@@ -123,6 +123,8 @@ pub fn ready() -> bool {
 // A timer interrupt, from the architecture's handler.
 pub fn timer_interrupt() {
 	interrupt(Cause::Timer);
+	// THE FORCED POWER-OFF DEADLINE, checked in the interrupt itself: nothing a thread does postpones it.
+	crate::power::check(arch::apic::ticks());
 }
 
 // AN INTERRUPT THIS CORE TOOK, from the architecture's handler: remembered, so a halt it ended can say
@@ -134,7 +136,14 @@ pub fn interrupt(cause: Cause) {
 	let encoded = match cause {
 		Cause::Timer => LAST_TIMER,
 		Cause::Ipi => LAST_IPI,
-		Cause::Device(identity) => LAST_DEVICE + (identity & 0x00ff_ffff),
+		Cause::Device(identity) => {
+			// A WAKE-SET INTERRUPT ENDS A SUSPEND TO IDLE; any other the sleep left live is handled, and the core parks
+			// again.
+			if sleeping() {
+				crate::sleep::device_interrupt(identity);
+			}
+			LAST_DEVICE + (identity & 0x00ff_ffff)
+		}
 	};
 	CORES[crate::sched::current_cpu_id()].last.store(encoded, Ordering::Relaxed);
 }
@@ -332,6 +341,8 @@ pub fn halt(until: Option<u64>, ready: impl FnOnce() -> bool) {
 		// DEADLINE EXPIRY IS THE BSP'S, for progress and housekeeping waits alike: `min_deadline` still
 		// leaves the second out of what counts as progress, but not out of when the BSP wakes.
 		wake = earliest(wake, crate::sched::earliest_deadline());
+		// AND THE FORCED POWER-OFF DEADLINE: the idle boot core's one-shot is what carries it to the interrupt.
+		wake = earliest(wake, crate::power::deadline());
 		if HOUSEKEEPING.load(Ordering::Relaxed) != 0 {
 			let bound = now.saturating_add(HOUSEKEEPING_BOUND);
 			if wake.is_none_or(|at| bound < at) {

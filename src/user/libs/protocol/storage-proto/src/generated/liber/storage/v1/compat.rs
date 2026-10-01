@@ -73,3 +73,11 @@ fn fsck_report_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(FsckReport::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn hibernation_area_info_wire_is_stable() {
+	let sample = HibernationAreaInfo { present: true, bytes: 7, image_at_mount: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 7, 0, 0, 0, 0, 0, 0, 0, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(HibernationAreaInfo::decode(&bytes).unwrap(), sample);
+}

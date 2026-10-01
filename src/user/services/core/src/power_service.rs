@@ -2,9 +2,13 @@
 // authority and controlled, where a device advertises a control, by the one component granted the
 // operator authority.
 //
-// WHAT IT IS NOT. Rebooting and powering off the machine stay with SystemManager's `system-power`, and
-// this service holds no client of it. Turning a UPS's output off turns the UPS's output off. Suspend,
-// fan curves and platform power policy are not here at all: an alarm is an observation.
+// WHAT IT IS NOT. Rebooting and powering off the machine stay with SystemManager's `system-power`; the only client of it
+// this service holds arms the kernel's forced power-off deadline before a critical battery's orderly power-off. Turning a
+// UPS's output off turns the UPS's output off. Fan curves are not here: an alarm is an observation.
+//
+// THE SLEEP POLICY IS HERE - `policy`: a closed lid suspends unless an external display is in use, an idle timeout
+// suspends on battery, and a critical battery hibernates where that is set up and otherwise powers off in order. It
+// decides nothing itself - `service_logic::sleep_policy` does - and asks through the three doors ServiceManager fills.
 //
 // WHERE ITS STATE COMES FROM. Drivers publish `power-source` providers through their own bindings;
 // this service is the one consumer of that kind, through a catalogue connection minted for it alone,
@@ -31,6 +35,9 @@ use service_logic::power_registry::{Action, Change, ControlRefusal, Controls, Di
 use wire::Sink;
 
 include!(concat!(env!("OUT_DIR"), "/roles_power_service.rs"));
+
+#[path = "power_service/policy.rs"]
+mod policy;
 
 // Client connections minted from the two roots, together.
 const MAX_CLIENTS: usize = 32;
@@ -600,13 +607,14 @@ impl Power {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	// 1. The roles: a catalogue connection minted for `power-source` alone, and the two roots its
-	//    clients reach it on. Nothing else - no system-power client, no provider connection handed in.
+	// 1. The roles: a catalogue connection minted for `power-source` and `platform-switch`, the two roots its clients
+	//    reach it on, and the sleep policy's inputs and doors.
 	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let (catalogue, state_root, control_root) = (roles[0], roles[1], roles[2]);
+	let (activity, outputs, sleep, syspower, shutdown) = (roles[3], roles[4], roles[5], roles[6], roles[7]);
 
 	// 2. The providers this machine publishes, as a snapshot and then live. A machine with none has
 	//    none, which is a subscription that stays quiet rather than a failure. THE EPOCH IS THIS
@@ -616,6 +624,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let epoch = if random_get(&mut epoch_bytes) == epoch_bytes.len() { u64::from_le_bytes(epoch_bytes) } else { clock() };
 	let mut service = Power { registry: Registry::new(epoch), providers: Vec::new(), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
 	send_blocking(bootstrap, b"PowerService: online", 0);
+	// THE SLEEP POLICY, beside the state: it reads the lid, idleness and the sources, and asks through its own doors.
+	let mut sleep_policy = policy::SleepPolicy::new(catalogue, activity, outputs, sleep, syspower, shutdown);
 
 	let mut clients: Vec<Client> = Vec::new();
 	let mut buf = alloc::vec![0u8; 8192];
@@ -637,6 +647,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		waitset.extend(service.subscribers.iter().map(|subscriber| subscriber.chan));
 		waitset.extend(clients.iter().map(|client| client.chan));
+		waitset.extend(sleep_policy.handles());
 		// A subscriber with records waiting is retried at the coalescing interval, since nothing
 		// wakes this loop when a reader makes room.
 		let now = clock();
@@ -648,7 +659,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let ready = wait_any(&waitset, if deadline != 0 { deadline.max(now + 1) } else { 0 });
 		if ready >= 0 {
 			let handle = waitset[ready as usize];
-			serve(&mut service, &mut clients, handle, catalogue, subscription, &mut subscribed, (state_root, control_root), &mut buf, &mut reply);
+			if !sleep_policy.serve(handle, catalogue, &mut buf) {
+				serve(&mut service, &mut clients, handle, catalogue, subscription, &mut subscribed, (state_root, control_root), &mut buf, &mut reply);
+			}
 		}
 		// TIME, AND WHAT THE REQUEST JUST SERVED QUEUED. A refused control can start the fresh query that
 		// brings a source's controls back, and the query leaves on a tick: taken before the request, the
@@ -657,6 +670,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let effects = service.registry.tick(clock());
 		service.apply(effects);
 		service.drain_subscribers();
+		sleep_policy.power_changed(&service.registry);
 	}
 }
 

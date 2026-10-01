@@ -18,6 +18,16 @@ bench = false
 required-features = ["development"]
 
 [[bin]]
+# THE SLEEP GATE'S FIXTURE: an `ivshmem-plain` function hot-plugged into the empty native hot-plug port, whose `SUSPEND` is
+# held or refused as the harness writes into its shared memory. Development-only, bound by address - a shipping machine
+# has neither the program nor the device.
+name = "sleep_fixture"
+path = "src/sleep_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
 # THE IN-GUEST POWER FIXTURE: a HID-shaped UPS and ACPI-shaped power sources from decoded data,
 # published as two `power-source` providers, and the control endpoint the power gate's probe drives.
 # Development-only in the manifest, bound to a QEMU test device at a pinned address.
@@ -225,6 +235,22 @@ bench = false
 # and published as a `power-source`. Its pure parts are `src/acpi_power.rs`, in the library and host-tested.
 name = "acpi_power"
 path = "src/acpi_power_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE ACPI BUTTONS AND THE LID: a control-method power or sleep button carries out its press as the fixed one does, and a
+# lid publishes a `platform-switch`. Its pure parts are `src/acpi_button.rs`, in the library and host-tested.
+name = "acpi_button"
+path = "src/acpi_button_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE ACPI TIME AND ALARM DEVICE: its clock handed to the kernel where the kernel reads no RTC of its own, and its wake
+# timers set from a sleep's timed wake. Its pure parts are `src/acpi_tad.rs`, in the library and host-tested.
+name = "acpi_tad"
+path = "src/acpi_tad_driver.rs"
 test = false
 bench = false
 

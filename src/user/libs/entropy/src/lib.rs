@@ -94,6 +94,8 @@ pub struct Health {
 // construction that did not separate them would let an attacker who can influence one predict
 // another.
 const DOMAIN_ABSORB: u8 = 0x01;
+// THE TAG A STIR IS MIXED UNDER: no source's, so a stirred byte and a submitted one never hash alike.
+const STIRRED_TAG: u8 = 0xFF;
 const DOMAIN_DRAW: u8 = 0x02;
 const DOMAIN_REKEY: u8 = 0x03;
 
@@ -146,23 +148,7 @@ impl Pool {
 	/// records that a submission happened, which is what keeps a failing device from producing a
 	/// repeatable pool.
 	pub fn absorb(&mut self, bytes: &[u8], source: Source) -> u32 {
-		let mut input: [u8; ABSORB_INPUT] = [0u8; ABSORB_INPUT];
-		let mut offset: usize = 0;
-		loop {
-			let end: usize = (offset + ABSORB_CHUNK).min(bytes.len());
-			let chunk: &[u8] = &bytes[offset..end];
-			input[0] = DOMAIN_ABSORB;
-			input[1..33].copy_from_slice(&self.key);
-			input[33..41].copy_from_slice(&self.counter.to_le_bytes());
-			input[41] = source.tag();
-			input[42..42 + chunk.len()].copy_from_slice(chunk);
-			self.key = sha256::digest(&input[..42 + chunk.len()]);
-			self.counter = self.counter.wrapping_add(1);
-			offset = end;
-			if offset >= bytes.len() {
-				break;
-			}
-		}
+		self.mix(bytes, source.tag());
 		let credit: u32 = credit_for(source, bytes.len());
 		self.credited_bits = (self.credited_bits.saturating_add(credit)).min(CREDIT_CEILING_BITS);
 		self.submissions = self.submissions.saturating_add(1);
@@ -173,11 +159,40 @@ impl Pool {
 		credit
 	}
 
+	// THE STATE MOVED BY `bytes`, chunk by chunk, each chunk hashed with the key, the counter and the submission's tag.
+	fn mix(&mut self, bytes: &[u8], tag: u8) {
+		let mut input: [u8; ABSORB_INPUT] = [0u8; ABSORB_INPUT];
+		let mut offset: usize = 0;
+		loop {
+			let end: usize = (offset + ABSORB_CHUNK).min(bytes.len());
+			let chunk: &[u8] = &bytes[offset..end];
+			input[0] = DOMAIN_ABSORB;
+			input[1..33].copy_from_slice(&self.key);
+			input[33..41].copy_from_slice(&self.counter.to_le_bytes());
+			input[41] = tag;
+			input[42..42 + chunk.len()].copy_from_slice(chunk);
+			self.key = sha256::digest(&input[..42 + chunk.len()]);
+			self.counter = self.counter.wrapping_add(1);
+			offset = end;
+			if offset >= bytes.len() {
+				break;
+			}
+		}
+	}
+
 	/// Fill `out`, or refuse.
 	///
 	/// FALSE IS THE ANSWER, NOT WEAK BYTES. A caller that asked for key material and got a buffer it
 	/// cannot tell from good key material has no way to act on the difference, so the difference has
 	/// to be in the return rather than in the bytes.
+	/// BYTES MIXED IN AND CREDITED NOTHING: the pool's state moves, and nothing it answers repeats what it answered
+	/// before - which is what a machine restored from a hibernation image needs, whose pool is the image's and whose
+	/// next draws would otherwise be the draws the machine that wrote the image made after its snapshot. What is
+	/// stirred is a counter and a clock, and claiming it as entropy would be a lie; claiming nothing is not.
+	pub fn stir(&mut self, bytes: &[u8]) {
+		self.mix(bytes, STIRRED_TAG);
+	}
+
 	pub fn draw(&mut self, out: &mut [u8]) -> bool {
 		if !self.seeded() {
 			return false;

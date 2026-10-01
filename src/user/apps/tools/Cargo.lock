@@ -717,6 +717,10 @@ name = "opentype-profile"
 version = "0.0.0"
 
 [[package]]
+name = "partition"
+version = "0.0.0"
+
+[[package]]
 name = "pcm"
 version = "0.0.0"
 
@@ -1003,6 +1007,7 @@ dependencies = [
  "abi",
  "base-proto",
  "bootproto",
+ "partition",
  "wasm",
 ]
 

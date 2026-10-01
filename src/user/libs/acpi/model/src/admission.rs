@@ -2,7 +2,9 @@
 //! itself - with bounded arguments, and the few methods its class lets it reach on the parent node (the first is
 //! `_DOS` on a video output's adapter). PLATFORM METHODS ARE REFUSED: `_INI`, `_REG`, `_OSC`, `_PTS`, `_WAK`, the
 //! sleep objects, and the methods only the service runs; and so is every other node - a path with a separator, a
-//! root or a parent prefix.
+//! root or a parent prefix. THE DEVICE POWER METHODS ARE REFUSED TOO - `_PS0` to `_PS3`, `_PSW` and `_DSW`: a device's
+//! state is asked for with `set-power-state`, since the power resources it shares with other devices are counted by the
+//! service, and its wake is armed by the service's sleep step.
 
 use crate::node::VIDEO_OUTPUT;
 
@@ -21,6 +23,8 @@ pub enum Target {
 pub enum Refusal {
 	/// A platform method: the service's alone.
 	Platform,
+	/// A device power method: asked for through `set-power-state`, or run by the sleep step.
+	Power,
 	/// Another node - a path, a root or a parent prefix not in the class's row.
 	OtherNode,
 	/// Not a name at all.
@@ -29,6 +33,9 @@ pub enum Refusal {
 
 /// The platform methods no driver evaluates.
 pub const PLATFORM_METHODS: &[&[u8; 4]] = &[b"_INI", b"_REG", b"_OSC", b"_PTS", b"_WAK", b"_S0_", b"_S1_", b"_S2_", b"_S3_", b"_S4_", b"_S5_", b"_SST", b"_TTS", b"_PDC", b"_OSI", b"_GTS", b"_BFS", b"_SWS"];
+
+/// The device power methods no driver evaluates by name.
+pub const POWER_METHODS: &[&[u8; 4]] = &[b"_PS0", b"_PS1", b"_PS2", b"_PS3", b"_PSW", b"_DSW", b"_ON_", b"_OFF"];
 
 /// THE CLASS ROWS' PARENT METHODS: a video output's driver may evaluate `_DOS` on its adapter.
 pub fn parent_methods(class: Option<&str>) -> &'static [&'static [u8; 4]] {
@@ -66,6 +73,9 @@ pub fn admit(name: &str, class: Option<&str>) -> Result<Target, Refusal> {
 	let seg = segment(name).ok_or(Refusal::Malformed)?;
 	if PLATFORM_METHODS.iter().any(|platform| **platform == seg) {
 		return Err(Refusal::Platform);
+	}
+	if POWER_METHODS.iter().any(|power| **power == seg) {
+		return Err(Refusal::Power);
 	}
 	Ok(Target::Own(seg))
 }

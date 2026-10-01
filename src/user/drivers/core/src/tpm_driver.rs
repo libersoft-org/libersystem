@@ -21,6 +21,11 @@
 // an error separator into PCRs 0 to 7, and every secret sealed to them stays shut until the next boot; a TPM that does
 // not take it refuses the sleep. The resume sends no Startup when the firmware has already started the TPM - which is
 // asked, not assumed - and Startup(STATE) where it has not. A suspend to idle keeps the TPM powered and sends nothing.
+//
+// HIBERNATION sends nothing either. Its next start is a boot, and a boot starts the TPM with Startup(CLEAR), so nothing
+// Shutdown(STATE) saves would ever be restored - and the TPM has to stay usable after the snapshot, when the image's key
+// is sealed through it. The resume after a restored image finds the TPM started by the boot that restored it, whose
+// PCRs are the ones the key was unsealed with. A hybrid sleep suspends for the S3 it ends in, and sends Shutdown(STATE).
 
 #![no_std]
 #![no_main]
@@ -93,6 +98,8 @@ impl Transport for Interface {
 struct Driver {
 	tpm: Tpm<Interface>,
 	kind: InterfaceKind,
+	// Whether the suspend was hibernation's, so the resume after it knows the TPM was not saved.
+	hibernated: bool,
 }
 
 // What the TPM's answer was, in the contract's words: a response code is the TPM's own, a PCR the library will
@@ -243,7 +250,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	};
 	let device = resources.device;
-	let mut driver = Driver { tpm: Tpm::new(interface), kind };
+	let mut driver = Driver { tpm: Tpm::new(interface), kind, hibernated: false };
 	let not_responding = driver_protocol::DriverFailureCode::DeviceNotResponding;
 	if let Err(error) = driver.tpm.startup() {
 		refuse(bootstrap, &bind, b"Startup(CLEAR) failed", Some(error), not_responding);
@@ -332,7 +339,10 @@ struct Sleep<'a> {
 
 impl common::SleepStep for Sleep<'_> {
 	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
-		if request.state.loses_power() {
+		self.driver.hibernated = request.state == driver_protocol::SleepState::Disk;
+		if self.driver.hibernated {
+			print(b"driver.tpm: suspended for hibernation - nothing is sent; the image's key is sealed after the snapshot and the next boot starts the TPM afresh\n");
+		} else if request.state.loses_power() {
 			if let Err(error) = self.driver.tpm.shutdown_state() {
 				let mut line: Vec<u8> = Vec::from(&b"driver.tpm: the sleep is refused - Shutdown(STATE) failed ("[..]);
 				hex(outcome(error).1, &mut line);
@@ -347,8 +357,25 @@ impl common::SleepStep for Sleep<'_> {
 
 	fn resume(&mut self, lost_power: bool) -> bool {
 		if !lost_power {
-			// The TPM kept its power: after an unwound Shutdown(STATE) it runs on, and nothing is sent.
+			// The TPM kept its power: after an unwound Shutdown(STATE) it runs on, and nothing is sent. Hibernation's
+			// resume for the image is this one, and the flag stays for the resume after the restore.
 			return true;
+		}
+		if core::mem::take(&mut self.driver.hibernated) {
+			return match self.driver.tpm.started() {
+				Ok(true) => {
+					print(b"driver.tpm: resumed from hibernation - the boot that restored the image started the TPM, and its PCRs are that boot's\n");
+					true
+				}
+				Ok(false) => {
+					print(b"driver.tpm: resumed from hibernation - the TPM was not started, so it starts afresh (CLEAR)\n");
+					self.driver.tpm.startup().is_ok()
+				}
+				Err(_) => {
+					print(b"driver.tpm: the TPM does not answer after the restore\n");
+					false
+				}
+			};
 		}
 		match self.driver.tpm.started() {
 			Ok(true) => print(b"driver.tpm: resumed - the firmware started the TPM with its saved state; no Startup is sent\n"),

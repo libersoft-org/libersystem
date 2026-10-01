@@ -24,6 +24,7 @@ pub mod rtc;
 // that would not mean reprogramming an interrupt controller underneath the suite. The DECISIONS this
 // module is made of are elsewhere on purpose - which table field says what, in the host-tested
 // `acpi` crate, and what happens to an event nobody is listening for, in `platform_event`.
+pub mod hibernate;
 #[cfg(not(test))]
 pub mod sci;
 pub mod serial;
@@ -260,6 +261,24 @@ pub fn poweroff() -> ! {
 		}
 	}
 	halt_loop()
+}
+
+// WHETHER THIS KERNEL READS AN RTC OF ITS OWN: the CMOS clock, unless the FADT's boot flags say there is none or the
+// development switch names it absent - in which case the wall clock is the one a driver hands (`SYS_CLOCK_BASE`) and a
+// suspend to RAM arms no CMOS alarm. Decided once and kept: 1 present, 2 absent.
+pub fn rtc_present() -> bool {
+	static PRESENT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+	match PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+		1 => return true,
+		2 => return false,
+		_ => {}
+	}
+	#[cfg(not(test))]
+	let absent = absent_named(b"rtc") || firmware::fadt().and_then(|fadt| fadt.iapc_boot()).is_some_and(|boot| boot.cmos_rtc_not_present);
+	#[cfg(test)]
+	let absent = false;
+	PRESENT.store(if absent { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+	!absent
 }
 
 // WHETHER THE DEVELOPMENT SWITCH NAMES `word` AS ABSENT - a fw_cfg file of its own, read as the boot profile is, and

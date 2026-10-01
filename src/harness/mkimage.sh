@@ -96,6 +96,7 @@ MTOOLS_FAT_SERIAL="0x4C696265" # "Libe", so a hexdump of a serial says where it 
 GPT_DISK_GUID="4C424653-0000-4000-8000-000000000000"
 GPT_ESP_GUID="4C424653-0000-4000-8000-000000000001"
 GPT_SYSTEM_GUID="4C424653-0000-4000-8000-000000000002"
+GPT_HIBERNATION_GUID="4C424653-0000-4000-8000-000000000003"
 
 # Stamp a staged file with the build epoch before it is copied into a filesystem that records
 # mtimes. mtools copies the source file's timestamp, so the recorded time is whatever the build
@@ -488,7 +489,7 @@ make_img() {
 	# no-iommu` then looked for `libersystem-no-iommu.img`, this wrote `libersystem.img`, and the run
 	# ended with "no raw image at ..." having just reported that it wrote one - twice, because the
 	# cache missed on a file the builder never creates and rebuilt it every time.
-	local kernel="$1" size="${2:-64M}" final="$output" out="$output.$$.candidate"
+	local kernel="$1" size="${2:-64M}" hibernation_mib="${3:-0}" final="$output" out="$output.$$.candidate"
 	# AND THE CANDIDATE IS REGISTERED FOR CLEANUP, which it also was not: a failed or interrupted
 	# disk build left its `.candidate` beside the image for the next person to wonder about.
 	CANDIDATES+=("$out")
@@ -509,7 +510,15 @@ make_img() {
 	# byte beyond that is a byte the system volume does not get.
 	local esp_end=$((2048 + 32 * 1024 * 1024 / 512 - 1))
 	sgdisk "$out" -n "1:2048:$esp_end" -t 1:ef00 -c 1:ESP -u "1:$GPT_ESP_GUID" >/dev/null
-	sgdisk "$out" -n 2:0:0 -t 2:4C424653-0001-4000-8000-4C6962657246 -c 2:system -u "2:$GPT_SYSTEM_GUID" >/dev/null
+	# HIBERNATION, WHERE IT IS SET UP: a third partition of the LiberSystem hibernation type at the end of the disk,
+	# `hibernation_mib` long - at least the memory of the machine it is for, which the system checks before it
+	# hibernates - and zero, which is no image. Never a region inside the system volume, whose format stays as it is.
+	if ((hibernation_mib > 0)); then
+		sgdisk "$out" -n "2:0:-${hibernation_mib}M" -t 2:4C424653-0001-4000-8000-4C6962657246 -c 2:system -u "2:$GPT_SYSTEM_GUID" >/dev/null
+		sgdisk "$out" -n 3:0:0 -t 3:4C424653-0002-4000-8000-4C6962657246 -c 3:hibernation -u "3:$GPT_HIBERNATION_GUID" >/dev/null
+	else
+		sgdisk "$out" -n 2:0:0 -t 2:4C424653-0001-4000-8000-4C6962657246 -c 2:system -u "2:$GPT_SYSTEM_GUID" >/dev/null
+	fi
 	# The disk GUID last, so it is not re-drawn by the partition edits above.
 	sgdisk "$out" -U "$GPT_DISK_GUID" >/dev/null
 
@@ -569,12 +578,14 @@ make_img() {
 	fi
 	mv "$out" "$final"
 
-	info "wrote $final ($size, GPT: ESP)"
+	local layout="ESP, system"
+	((hibernation_mib == 0)) || layout+=", hibernation ${hibernation_mib} MiB"
+	info "wrote $final ($size, GPT: $layout)"
 	echo "$final"
 }
 
 cmd="${1:-}"
-[[ $# -ge 2 ]] || die "usage: mkimage.sh {iso|img} <kernel-elf> [size]"
+[[ $# -ge 2 ]] || die "usage: mkimage.sh {iso|img} <kernel-elf> [size [hibernation-MiB]]"
 kernel="$2"
 [[ -f "$kernel" ]] || die "kernel ELF not found: $kernel"
 kernel="$(realpath -m "$kernel")"
@@ -666,7 +677,7 @@ testiso)
 	;;
 img)
 	output="$BUILD/$SLUG$DMA_SUFFIX.img"
-	mode_input="img:${3:-64M}"
+	mode_input="img:${3:-64M}:hibernation-${4:-0}"
 	;;
 *) die "unknown subcommand '$cmd' (expected 'iso', 'testiso' or 'img')" ;;
 esac
@@ -828,7 +839,10 @@ info "cache miss $output; rebuilding"
 case "$cmd" in
 iso) make_iso "$kernel" 0 ;;
 testiso) make_iso "$kernel" 1 ;;
-img) make_img "$kernel" "${3:-64M}" ;;
+img)
+	[[ "${4:-0}" =~ ^[0-9]+$ ]] || die "the hibernation partition's size is in MiB, got '${4}'"
+	make_img "$kernel" "${3:-64M}" "${4:-0}"
+	;;
 esac
 # The key is recomputed AFTER assembly and must still agree. Producers are not covered by this
 # script's lock, so an input can be replaced while the image is being written - and the record would

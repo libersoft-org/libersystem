@@ -19,22 +19,30 @@ method process.launch-prepared-limited op=11 (name:string:rights=,limits:resourc
 interface system-power
 method system-power.reboot op=1 () -> result<unit, liber:base@1::error>
 method system-power.power-off op=2 () -> result<unit, liber:base@1::error>
+method system-power.power-off-within op=3 (seconds:u32:rights=) -> result<unit, liber:base@1::error>
+interface system-shutdown
+method system-shutdown.power-off op=1 () -> result<unit, liber:base@1::error>
 enum shutdown-action(power-off=1,reboot=2)
 interface shutdown-notice
 method shutdown-notice.prepare op=1 (action:shutdown-action:rights=) -> result<unit, liber:base@1::error>
 enum sleep-state(idle=1,ram=2,disk=3)
-enum sleep-step(none=0,announce=1,freeze=2,flush=3,drivers=4,platform=5,enter=6)
+enum sleep-step(none=0,announce=1,freeze=2,flush=3,drivers=4,platform=5,enter=6,image=7)
 enum sleep-reason(requested=1,sleep-button=2,lid=3,idle=4,critical=5)
 enum sleep-outcome(running=1,resumed=2,refused=3,unwound=4)
-enum wake-reason(unknown=0,timer=1,power-button=2,sleep-button=3,device=4,rtc=5,platform=6)
+enum wake-reason(unknown=0,timer=1,power-button=2,sleep-button=3,device=4,rtc=5,platform=6,snapshot=7,restored=8)
 record core-park(cpu:u32,timer:u32,ipi:u32,device:u32)
 record sleep-record(state:sleep-state,reason:sleep-reason,outcome:sleep-outcome,step:sleep-step,who:string,why:string,requested:u64,slept:u64,wake:wake-reason,wake-detail:u32,cores:list<core-park>:bound=64)
+record wake-source(name:string,armed:bool,detail:string)
+record sleep-inhibitor(reason:string,remaining-ms:u64)
+record sleep-status(idle:bool,ram:bool,disk:bool,wake-sources:list<wake-source>:bound=32,inhibitors:list<sleep-inhibitor>:bound=16,watchdog-cap-ms:u64,scheduled-wake:u64,hibernation-set-up:bool,hibernation-why:string,last-image:string)
 interface system-sleep
 method system-sleep.suspend op=1 (state:sleep-state:rights=,timed-wake-ms:u64:rights=,reason:sleep-reason:rights=) -> result<unit, liber:base@1::error>
-method system-sleep.hibernate op=2 (reason:sleep-reason:rights=) -> result<unit, liber:base@1::error>
+method system-sleep.hibernate op=2 (hybrid:bool:rights=,reason:sleep-reason:rights=) -> result<unit, liber:base@1::error>
 method system-sleep.inhibit op=3 (milliseconds:u32:rights=,reason:string:rights=) -> result<unit, liber:base@1::error>
 method system-sleep.release op=4 () -> result<unit, liber:base@1::error>
 method system-sleep.last-sleep op=5 () -> result<sleep-record, liber:base@1::error>
+method system-sleep.status op=6 () -> result<sleep-status, liber:base@1::error>
+method system-sleep.schedule-wake op=7 (unix-seconds:u64:rights=) -> result<unit, liber:base@1::error>
 interface sleep-notice
 method sleep-notice.announce op=16 (state:sleep-state:rights=) -> result<unit, liber:base@1::error>
 method sleep-notice.hold-writes op=17 () -> result<unit, liber:base@1::error>
@@ -45,6 +53,9 @@ interface device-sleep
 method device-sleep.check op=20 () -> result<list<string>, liber:base@1::error>
 method device-sleep.suspend op=21 (state:sleep-state:rights=,arm-wake:bool:rights=,timed-wake-ms:u64:rights=) -> result<drivers-suspended, liber:base@1::error>
 method device-sleep.resume op=22 (state:sleep-state:rights=) -> result<list<string>, liber:base@1::error>
+method device-sleep.resume-for-image op=23 () -> result<list<string>, liber:base@1::error>
+method device-sleep.suspend-image op=26 () -> result<unit, liber:base@1::error>
+method device-sleep.stop-all op=27 () -> result<list<string>, liber:base@1::error>
 interface platform-sleep
 method platform-sleep.prepare op=24 (state:sleep-state:rights=,wake-nodes:list<string>:bound=64:rights=) -> result<unit, liber:base@1::error>
 method platform-sleep.wake op=25 (state:sleep-state:rights=) -> result<unit, liber:base@1::error>
@@ -54,3 +65,12 @@ method application-freeze.thaw op=33 () -> result<unit, liber:base@1::error>
 record woke(wake:wake-reason,detail:u32,slept:u64,cores:list<core-park>:bound=64)
 interface sleep-entry
 method sleep-entry.enter op=28 (state:sleep-state:rights=,timed-wake-ms:u64:rights=) -> result<woke, liber:base@1::error>
+method sleep-entry.off-hibernated op=29 () -> result<unit, liber:base@1::error>
+record hibernation-status(set-up:bool,why:string,partition-bytes:u64,memory-bytes:u64,last-image:string)
+interface hibernation-image
+method hibernation-image.status op=30 () -> result<hibernation-status, liber:base@1::error>
+method hibernation-image.write-image op=31 () -> result<unit, liber:base@1::error>
+method hibernation-image.discard-image op=34 () -> result<unit, liber:base@1::error>
+interface hibernation-restore
+method hibernation-restore.prepare-replacement op=1 () -> result<unit, liber:base@1::error>
+method hibernation-restore.boot-continues op=2 () -> result<unit, liber:base@1::error>

@@ -188,6 +188,10 @@ def thermal_zone(n, body):
 	return Raw(b'\x5b\x85' + pkg_length(namestring(n) + _list(body)))
 
 
+def power_resource(n, system_level, order, body):
+	return Raw(b'\x5b\x84' + pkg_length(namestring(n) + bytes([system_level]) + struct.pack('<H', order) + _list(body)))
+
+
 def mutex(n, sync_level=0):
 	return Raw(b'\x5b\x01' + namestring(n) + bytes([sync_level]))
 
@@ -526,6 +530,7 @@ def self_test():
 	check('a _DSM returning an integer', bytes(hid).endswith(bytes(ret(buffer([0])))) and bytes(if_(lequal(arg(2), 1), [ret(0x20)])) in bytes(hid), True)
 	check('its function 0 bitmap names function 1', bytes(if_(lequal(arg(2), 0), [ret(buffer([0b11]))])) in bytes(hid), True)
 	check('a ThermalZone', thermal_zone('TZ00', [ret(0)]), b'\x5b\x85' + pkg_length(b'TZ00' + bytes(ret(0))))
+	check('a PowerResource: its level and its order after the name', power_resource('PWR0', 0, 0x0102, [ret(0)]), b'\x5b\x84' + pkg_length(b'PWR0' + b'\x00\x02\x01' + bytes(ret(0))))
 	check('a QWordMemory length at its offset', struct.unpack('<Q', qword_memory(0x800000000, 0x1000)[38:46])[0], 0x1000)
 	check('a QWordMemory minimum', struct.unpack('<Q', qword_memory(0x800000000, 0x1000)[14:22])[0], 0x800000000)
 	# THE INTERPRETER'S SUITE LOADS THE SAMPLE FROM ITS OWN COPY: any byte this emitter now makes differently is drift.

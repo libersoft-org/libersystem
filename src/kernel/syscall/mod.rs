@@ -516,7 +516,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 	let result: i64 = match num {
 		SYS_DEBUG_NOOP => a0 as i64,
 		SYS_CLOCK_GET => arch::apic::ticks() as i64,
-		SYS_CLOCK_RTC => arch::rtc::read_unix() as i64,
+		SYS_CLOCK_RTC => crate::sleep::rtc_unix() as i64,
 		// THE COUNTER LESS THE SLEEP OFFSET, the same term the tick subtracts - so across a sleep the two
 		// clocks agree on what did not happen.
 		SYS_CLOCK_MONO_NS => arch::common::time::CLOCK.nanos(arch::tsc::now()) as i64,
@@ -543,6 +543,26 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		abi::SYS_FIRMWARE_SLEEP_TYPE => firmware::sys_firmware_sleep_type(a0, a1, a2, a3),
 		abi::SYS_SYSTEM_SLEEP => sys_system_sleep(a0, a1, a2, a3),
 		abi::SYS_CLOCK_BOOT_NS => crate::sleep::boot_ns() as i64,
+		abi::SYS_INTERRUPT_WAKE => sys_interrupt_wake(a0, a1),
+		abi::SYS_SLEEP_STATES => crate::sleep::states() as i64,
+		abi::SYS_CLOCK_BASE => match holds_privilege(a0, PrivilegeKind::ClockSource) {
+			Ok(()) => crate::sleep::set_clock_base(a1),
+			Err(error) => error,
+		},
+		abi::SYS_SNAPSHOT_INFO => sys_snapshot_info(a0, a1),
+		abi::SYS_SNAPSHOT_READ => sys_snapshot_read(a0, a1, a2, a3),
+		abi::SYS_SNAPSHOT_RELEASE => match holds_privilege(a0, PrivilegeKind::Hibernation) {
+			Ok(()) => i64::from(crate::sleep::disk::release()),
+			Err(error) => error,
+		},
+		abi::SYS_RESTORE_BEGIN => sys_restore_begin(a0, a1, a2, a3),
+		abi::SYS_RESTORE_WRITE => sys_restore_write(a0, a1, a2, a3),
+		abi::SYS_RESTORE_COMMIT => match holds_privilege(a0, PrivilegeKind::Hibernation) {
+			Ok(()) if a1 != 0 => i64::from(crate::sleep::disk::abandon()),
+			Ok(()) => crate::sleep::disk::commit(),
+			Err(error) => error,
+		},
+		abi::SYS_SYSTEM_FINGERPRINT => sys_system_fingerprint(a0),
 		abi::SYS_DEVICE_NODE => firmware::sys_device_node(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
@@ -555,7 +575,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0, a1),
 		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
-		SYS_SYSTEM_POWER => sys_system_power(a0, a1),
+		SYS_SYSTEM_POWER => sys_system_power(a0, a1, a2),
 		SYS_CONSOLE_FEED => sys_console_feed(a0, a1, a2),
 		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1, a2),
 		SYS_CONSOLE_READLOG => sys_console_readlog(a0, a1),
@@ -2340,6 +2360,19 @@ fn sys_interrupt_ack(handle: u64) -> i64 {
 	0
 }
 
+// `SYS_INTERRUPT_WAKE`: the interrupt a driver holds, marked as a wake source or unmarked - WRITE on it, while it still
+// owns its binding, since a revoked one's vector may be another claim's line by now.
+fn sys_interrupt_wake(handle: u64, on: u64) -> i64 {
+	let interrupt = match current_typed::<Interrupt>(handle, ObjectType::Interrupt, Rights::WRITE) {
+		Ok(i) => i,
+		Err(e) => return e,
+	};
+	if !interrupt.owns_binding() {
+		return ERR_INVALID;
+	}
+	if crate::sleep::mark_wake(interrupt.vector(), on != 0) { 0 } else { ERR_RESOURCE_EXHAUSTED }
+}
+
 // Reboot or power the machine off (action = POWER_REBOOT | POWER_OFF), for a caller holding
 // MANAGE on the ROOT Domain. Diverges on a valid action; ERR_ACCESS_DENIED without the
 // capability, ERR_INVALID on an unknown action.
@@ -2355,7 +2388,7 @@ fn sys_interrupt_ack(handle: u64) -> i64 {
 // authority. Any other Domain would be an escalation - killing the apps Domain is not the
 // same as stopping the machine - which is why the handle is compared against the root rather
 // than merely required to be some Domain.
-fn sys_system_power(handle: u64, action: u64) -> i64 {
+fn sys_system_power(handle: u64, action: u64, seconds: u64) -> i64 {
 	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::MANAGE) {
 		Ok(d) => d,
 		Err(e) => return e,
@@ -2364,9 +2397,86 @@ fn sys_system_power(handle: u64, action: u64) -> i64 {
 		return ERR_ACCESS_DENIED;
 	}
 	match action {
-		abi::POWER_REBOOT => arch::reset(),
+		abi::POWER_REBOOT => crate::power::reset(),
 		abi::POWER_OFF => arch::poweroff(),
+		abi::POWER_OFF_WITHIN if seconds != 0 => {
+			crate::power::arm_within(seconds);
+			0
+		}
 		_ => ERR_INVALID,
+	}
+}
+
+// HIBERNATION'S IMAGE COMPONENT - see `abi::SYS_SNAPSHOT_INFO` and `crate::sleep::disk`. Every call but the fingerprint
+// requires the Hibernation privilege.
+fn sys_snapshot_info(privilege: u64, out: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::Hibernation) {
+		return error;
+	}
+	if !user_buf_writable(out, core::mem::size_of::<abi::SnapshotInfo>() as u64) {
+		return ERR_INVALID;
+	}
+	match crate::sleep::disk::info().and_then(|info| write_user(out, info)) {
+		Ok(()) => 0,
+		Err(error) => error,
+	}
+}
+
+fn sys_snapshot_read(privilege: u64, first: u64, count: u64, buffer: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::Hibernation) {
+		return error;
+	}
+	if count == 0 || count > abi::SNAPSHOT_BATCH || !user_buf_writable(buffer, count * (8 + 4096)) {
+		return ERR_INVALID;
+	}
+	match crate::sleep::disk::read(first, count, |offset, bytes| copy_to_user_exact(buffer + offset as u64, bytes.as_ptr(), bytes.len())) {
+		Ok(()) => 0,
+		Err(error) => error,
+	}
+}
+
+fn sys_restore_begin(privilege: u64, frames: u64, count: u64, context: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::Hibernation) {
+		return error;
+	}
+	if count == 0 || count > crate::sleep::disk::ram_top() / 4096 {
+		return ERR_INVALID;
+	}
+	let mut ctx = [0u8; abi::SNAPSHOT_CONTEXT];
+	if let Err(error) = copy_from_user_exact(ctx.as_mut_ptr(), context, ctx.len()) {
+		return error;
+	}
+	let frame_at = |index: u64| -> Result<u64, i64> {
+		let mut bytes = [0u8; 8];
+		copy_from_user_exact(bytes.as_mut_ptr(), frames + index * 8, 8)?;
+		Ok(u64::from_le_bytes(bytes))
+	};
+	match crate::sleep::disk::begin(count, ctx, frame_at) {
+		Ok(()) => 0,
+		Err(error) => error,
+	}
+}
+
+fn sys_restore_write(privilege: u64, first: u64, count: u64, pages: u64) -> i64 {
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::Hibernation) {
+		return error;
+	}
+	if count == 0 || count > abi::SNAPSHOT_BATCH {
+		return ERR_INVALID;
+	}
+	match crate::sleep::disk::write(first, count, |offset, dst| copy_from_user_exact(dst, pages + offset as u64, 4096)) {
+		Ok(()) => 0,
+		Err(error) => error,
+	}
+}
+
+fn sys_system_fingerprint(out: u64) -> i64 {
+	if !user_buf_writable(out, core::mem::size_of::<abi::SystemFingerprint>() as u64) {
+		return ERR_INVALID;
+	}
+	match write_user(out, crate::sleep::disk::fingerprint()) {
+		Ok(()) => 0,
+		Err(error) => error,
 	}
 }
 
@@ -4242,6 +4352,11 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 	let set_koid = set.header().koid();
 	loop {
 		if thread.process().is_killed() {
+			// THE SET GOES FIRST, as `sys_wait` drops its object: `exit` never returns, so a reference held in this frame
+			// is never dropped - and a set that is never dropped keeps every member alive. A channel it holds then never
+			// closes for its peer: a killed StorageService, whose control channel is one of its members, was never seen
+			// to end, and every client waiting on it waited for ever.
+			drop(set);
 			sched::exit();
 		}
 		if thread.process().is_held() {

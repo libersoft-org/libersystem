@@ -60,7 +60,25 @@
 #   acpi-fixture.py --power-storm FILE CONTROL     raise the power line many times through the GPIO backend's control
 #                                                  socket, the zone's reading changed before each; then write
 #                                                  `STORM_FINAL` and raise it until one more event fires
+#   acpi-fixture.py --sleep-event FILE CONTROL NAME   the sleep devices' event NAME - lid-close, lid-open, power-button,
+#                                                  sleep-button - written into the pages and line SLEEP_LINE raised
+#                                                  until an event fires
+#   acpi-fixture.py --tad-clock FILE UNIX          set the Time and Alarm Device's clock to UNIX (UTC)
+#   acpi-fixture.py --tad-read FILE                print the timers the TAD's driver programmed, as JSON
+#   acpi-fixture.py --power-read FILE              print the sleep devices' power resources and states, as JSON
 #   acpi-fixture.py --self-test        build the table and check it, writing nothing
+#
+# THE SLEEP GATE'S DEVICES (`--out FILE --sleep`, and `--memory FILE --sleep`), in the same table so their `Notify` has
+# the GPIO controller's `_AEI` to come from - line SLEEP_LINE, whose `_E06` raises what the pages' event byte names:
+#   PNP0C0D  (`\_SB.LID0`) - the lid: `_LID` the pages' byte, and `_PRW`.
+#   PNP0C0C  (`\_SB.PWRB`) - a control-method power button, and `_PRW`.
+#   PNP0C0E  (`\_SB.SLPB`) - a control-method sleep button, and `_PRW`.
+#   ACPI000E (`\_SB.TAD0`) - a Time and Alarm Device: `_GCP` from the pages, `_GRT` the pages' sixteen bytes - the harness
+#            keeps them running - and `_STV`, `_TIV`, `_GWS` and `_CWS` over the pages' timers, `_STV` counted.
+# AND TWO POWER RESOURCES: `\_SB.PSLP` in the `_PR0` of both the lid and the TAD - on while either is in D0, off only
+# when both have left it - and `\_SB.PWAK` in the lid's `_PRW`, on while its wake is armed. Each resource's state and the
+# counts of its `_ON` and `_OFF` are in the pages, and so is the last `_PSx` each device ran; the lid says `_S0W` and
+# `_S3W` are D3hot, the TAD says neither, so it stays in D0 through a sleep its timer is to wake.
 
 import argparse
 import os
@@ -108,6 +126,26 @@ STORM_EVENTS = 60
 STORM_SECONDS = 30
 STORM_FINAL = 3300
 DSM_UUID = '5c3c6b2e-8d7a-4f5b-9a41-2e1d7f0a6b93'
+# THE SLEEP GATE'S PAGES: the event byte `_E06` reads and clears (bit 0 the lid, 1 the power button, 2 the sleep button),
+# the lid's byte (1 open), and the TAD's capabilities, its two timers and their wake statuses, the count of `_STV` calls
+# and its `_GRT` buffer.
+SLEEP_LINE = 6
+SLEEP_GPE = 0x0E
+SLEEP_EVENTS = 0x40
+LID_OPEN = 0x41
+TAD_GCP = 0x44
+TAD_AC_TIMER = 0x48
+TAD_DC_TIMER = 0x4C
+TAD_AC_STATUS = 0x50
+TAD_DC_STATUS = 0x54
+TAD_STV_CALLS = 0x58
+TAD_GRT = 0x60
+TAD_DISABLED = 0xFFFFFFFF
+# THE POWER RESOURCES' BYTES: each resource's state, its `_ON` count and its `_OFF` count, then the lid's and the TAD's
+# last `_PSx` (0xFF before the first).
+POWER_PAGE = 0x70
+POWER_BYTES = ('pslp_on', 'pslp_ons', 'pslp_offs', 'pwak_on', 'pwak_ons', 'pwak_offs', 'lid_ps', 'tad_ps')
+SLEEP_EVENT_BITS = {'lid-close': 1, 'lid-open': 1, 'power-button': 2, 'sleep-button': 4}
 
 # THE UCSI DEVICE (`\_SB.UCSI`), absent until the harness's `UCPR` byte says a PPM is there: `_HID` `USBC000` and `_CID`
 # `PNP0CA0`, as shipping laptops name it, its mailbox `_CRS` range at UCSI_RANGE past the harness's pages and its own
@@ -136,7 +174,61 @@ def ucsi_mailbox_units(version):
 	return [E.unit('VER_', 16), E.offset_to(16), E.unit('CCI_', 32), E.unit('CTRL', 64), E.unit('MSGI', message), E.unit('MSGO', message)]
 
 
-def ssdt_body(ucsi_version=0x0210):
+def sleep_devices(ivsh):
+	"""THE LID, THE CONTROL-METHOD BUTTONS AND THE TIME AND ALARM DEVICE, each able to wake the machine through `_PRW`."""
+	prw = E.name('_PRW', E.package(SLEEP_GPE, 4))
+	timer = lambda ac, dc: lambda: [E.if_(E.lequal(E.arg(0), 0), [E.ret(ac)]), E.ret(dc)]
+
+	# A POWER RESOURCE SWITCHED THROUGH THE PAGES: its state, and each `_ON` and `_OFF` counted.
+	def resource(n, order, state, ons, offs):
+		return E.power_resource(n, 0, order, [
+			E.method('_STA', 0, [E.ret(ivsh + '.' + state)]),
+			E.method('_ON', 0, [E.store(1, ivsh + '.' + state), E.increment(ivsh + '.' + ons)], serialized=True),
+			E.method('_OFF', 0, [E.store(0, ivsh + '.' + state), E.increment(ivsh + '.' + offs)], serialized=True),
+		])
+
+	# `_PS0` AND `_PS3`, each writing the state it entered.
+	def states(field):
+		return [E.method('_PS0', 0, [E.store(0, ivsh + '.' + field)]), E.method('_PS3', 0, [E.store(3, ivsh + '.' + field)])]
+
+	return [
+		resource('PSLP', 0, 'PSST', 'PSON', 'PSOF'),
+		resource('PWAK', 1, 'PWST', 'PWON', 'PWOF'),
+		E.device('LID0', [
+			E.name('_HID', E.eisaid('PNP0C0D')),
+			E.method('_LID', 0, [E.ret(ivsh + '.LIDO')]),
+			E.name('_PRW', E.package(SLEEP_GPE, 3, '\\_SB.PWAK')),
+			E.name('_PR0', E.package('\\_SB.PSLP')),
+			E.name('_S0W', 3),
+			E.name('_S3W', 3),
+		] + states('LIDP')),
+		E.device('PWRB', [E.name('_HID', E.eisaid('PNP0C0C')), prw]),
+		E.device('SLPB', [E.name('_HID', E.eisaid('PNP0C0E')), prw]),
+		E.device('TAD0', [
+			E.name('_HID', E.string('ACPI000E')),
+			prw,
+			E.name('_PR0', E.package('\\_SB.PSLP')),
+		] + states('TADP') + [
+			E.method('_GCP', 0, [E.ret(ivsh + '.TGCP')]),
+			E.method('_GRT', 0, [E.ret(ivsh + '.TGRT')]),
+			E.method('_STV', 2, [
+				E.increment(ivsh + '.STVN'),
+				E.if_(E.lequal(E.arg(0), 0), [E.store(E.arg(1), ivsh + '.TACT')]),
+				E.if_(E.lequal(E.arg(0), 1), [E.store(E.arg(1), ivsh + '.TDCT')]),
+				E.ret(0),
+			], serialized=True),
+			E.method('_TIV', 1, timer(ivsh + '.TACT', ivsh + '.TDCT')()),
+			E.method('_GWS', 1, timer(ivsh + '.TAST', ivsh + '.TDST')()),
+			E.method('_CWS', 1, [
+				E.if_(E.lequal(E.arg(0), 0), [E.store(0, ivsh + '.TAST')]),
+				E.if_(E.lequal(E.arg(0), 1), [E.store(0, ivsh + '.TDST')]),
+				E.ret(0),
+			], serialized=True),
+		]),
+	]
+
+
+def ssdt_body(ucsi_version=0x0210, sleep=False):
 	# THE NODES QEMU'S DSDT ALREADY HAS for the three functions - `S` and the slot times eight - opened with `Scope`: a
 	# second node with the same `_ADR` would be a second companion of one function.
 	ivsh = f'\\_SB.PCI0.S{IVSHMEM_SLOT << 3:02X}'
@@ -156,6 +248,17 @@ def ssdt_body(ucsi_version=0x0210):
 				E.unit('BSTS', 32), E.unit('BRAT', 32), E.unit('BREM', 32), E.unit('BVOL', 32),
 				E.unit('APSR', 8), E.offset_to((ZONE_TMP - AC_PSR - 1) * 8), E.unit('TTMP', 32),
 			], access='AnyAcc'),
+			# THE POWER RESOURCES' BYTES.
+			E.field('HPGS', [
+				E.offset_to(POWER_PAGE * 8), E.unit('PSST', 8), E.unit('PSON', 8), E.unit('PSOF', 8), E.unit('PWST', 8), E.unit('PWON', 8),
+				E.unit('PWOF', 8), E.unit('LIDP', 8), E.unit('TADP', 8),
+			], access='AnyAcc'),
+			# THE SLEEP GATE'S BYTES, THE TAD'S TIMERS AND ITS CLOCK.
+			E.field('HPGS', [
+				E.offset_to(SLEEP_EVENTS * 8), E.unit('SLEV', 8), E.unit('LIDO', 8), E.offset_to(TAD_GCP * 8), E.unit('TGCP', 32),
+				E.unit('TACT', 32), E.unit('TDCT', 32), E.unit('TAST', 32), E.unit('TDST', 32), E.unit('STVN', 32),
+				E.offset_to(TAD_GRT * 8), E.unit('TGRT', 128),
+			], access='AnyAcc'),
 			# THE UCSI STAGING AREAS AND COUNTERS.
 			E.field('HPGS', [
 				E.offset_to(UCSI_PRESENT * 8), E.unit('UCPR', 8), E.offset_to((UCSI_DOORBELL - UCSI_PRESENT - 1) * 8),
@@ -164,12 +267,20 @@ def ssdt_body(ucsi_version=0x0210):
 			], access='AnyAcc'),
 		]),
 		E.scope(gpio, [
-			E.name('_AEI', E.buffer(E.resource_template(E.gpio_int([AEI_LINE], gpio, edge=True), E.gpio_int([POWER_LINE], gpio, edge=True), E.gpio_int([UCSI_LINE], gpio, edge=True)))),
+			E.name('_AEI', E.buffer(E.resource_template(*[E.gpio_int([line], gpio, edge=True) for line in [AEI_LINE, POWER_LINE, UCSI_LINE] + ([SLEEP_LINE] if sleep else [])]))),
 			E.method(f'_E{AEI_LINE:02X}', 0, [E.notify('\\_SB.LSF1', 0x80)]),
 			# THE PPM'S NOTIFICATION, as a laptop's notification method makes it: the copy, then `Notify`.
 			E.method(f'_E{UCSI_LINE:02X}', 0, [E.call('\\_SB.UCSI.COPY'), E.increment(ivsh + '.NCNT'), E.notify('\\_SB.UCSI', 0x80)]),
 			E.method(f'_E{POWER_LINE:02X}', 0, [E.notify('\\_SB.BAT0', 0x80), E.notify('\\_SB.ADP0', 0x80), E.notify('\\_TZ.TZ00', 0x80)]),
-		]),
+		] + ([
+			# THE SLEEP DEVICES' EVENTS, as the pages' byte names them, and the byte cleared.
+			E.method(f'_E{SLEEP_LINE:02X}', 0, [
+				E.if_(E.band(ivsh + '.SLEV', 1), [E.notify('\\_SB.LID0', 0x80)]),
+				E.if_(E.band(ivsh + '.SLEV', 2), [E.notify('\\_SB.PWRB', 0x80)]),
+				E.if_(E.band(ivsh + '.SLEV', 4), [E.notify('\\_SB.SLPB', 0x80)]),
+				E.store(0, ivsh + '.SLEV'),
+			], serialized=True),
+		] if sleep else [])),
 		E.scope('\\_SB', [
 			E.device('LSF1', [
 				E.name('_HID', E.string('LSFX0001')),
@@ -248,7 +359,7 @@ def ssdt_body(ucsi_version=0x0210):
 				E.name('_HID', E.string('ACPI0003')),
 				E.method('_PSR', 0, [E.ret(ivsh + '.APSR')]),
 			]),
-		]),
+		] + (sleep_devices(ivsh) if sleep else [])),
 		E.scope('\\_TZ', [
 			E.thermal_zone('TZ00', [
 				E.method('_TMP', 0, [E.ret(ivsh + '.TTMP')]),
@@ -261,8 +372,8 @@ def ssdt_body(ucsi_version=0x0210):
 	]
 
 
-def ssdt(ucsi_version=0x0210):
-	return E.table('SSDT', ssdt_body(ucsi_version), oem_table_id=b'LIBACPIF')
+def ssdt(ucsi_version=0x0210, sleep=False):
+	return E.table('SSDT', ssdt_body(ucsi_version, sleep), oem_table_id=b'LIBACPIF')
 
 
 HID_OVER_I2C = '3cdff6f7-4267-4555-ad05-b30a3d8938de'
@@ -315,8 +426,23 @@ def tcpc_ssdt():
 	return E.table('SSDT', tcpc_body(), oem_table_id=b'LIBTCPC ')
 
 
-def create_memory(path, ucsi_version=None):
+def grt_bytes(unix):
+	"""`_GRT`'s sixteen bytes for a Unix time: UTC, the zone unspecified, valid."""
+	import datetime
+	at = datetime.datetime.fromtimestamp(unix, tz=datetime.timezone.utc)
+	return struct.pack('<HBBBBBBHhB3x', at.year, at.month, at.day, at.hour, at.minute, at.second, 1, 0, 2047, 0)
+
+
+def create_memory(path, ucsi_version=None, sleep=False):
 	data = bytearray(MEMORY_SIZE)
+	# THE SLEEP DEVICES: the lid open, the TAD with its clock, both wake timers disabled, and its clock at the host's time
+	# until the gate sets another.
+	if sleep:
+		import time
+		data[LID_OPEN] = 1
+		struct.pack_into('<6I', data, TAD_GCP, 0b111, TAD_DISABLED, TAD_DISABLED, 0, 0, 0)
+		data[TAD_GRT:TAD_GRT + 16] = grt_bytes(int(time.time()))
+		data[POWER_PAGE + 6:POWER_PAGE + 8] = b'\xff\xff'
 	# A PPM THERE, when the harness runs one: the device present, and the VERSION function 2 copies at bind.
 	if ucsi_version is not None:
 		data[UCSI_PRESENT] = 1
@@ -389,6 +515,53 @@ def power_storm(path, control):
 	return 0
 
 
+def sleep_event(path, control, name):
+	"""ONE SLEEP-DEVICE EVENT: the pages written, then line SLEEP_LINE lowered and raised until the backend says an event
+	fired - an event fires only where the guest has its line armed."""
+	import socket
+	import time
+	if name not in SLEEP_EVENT_BITS:
+		raise SystemExit(f'acpi-fixture: {name!r} is none of {", ".join(SLEEP_EVENT_BITS)}')
+	if name.startswith('lid-'):
+		poke(path, LID_OPEN, bytes([1 if name == 'lid-open' else 0]))
+	poke(path, SLEEP_EVENTS, bytes([SLEEP_EVENT_BITS[name]]))
+	sock = socket.socket(socket.AF_UNIX)
+	sock.connect(control)
+	sock.settimeout(5)
+
+	def ask(text):
+		sock.sendall((text + '\n').encode())
+		return sock.recv(4096).decode()
+
+	deadline = time.monotonic() + 10
+	while True:
+		ask(f'lower {SLEEP_LINE}')
+		if 'fired' in ask(f'raise {SLEEP_LINE}'):
+			print(f'acpi-fixture: {name} raised')
+			return 0
+		if time.monotonic() >= deadline:
+			raise SystemExit(f'acpi-fixture: no event fired for {name}')
+		time.sleep(0.05)
+
+
+def tad_read(path):
+	import json
+	with open(path, 'rb') as handle:
+		handle.seek(TAD_AC_TIMER)
+		ac, dc, ac_status, dc_status, calls = struct.unpack('<5I', handle.read(20))
+	print(json.dumps({'ac_timer': ac, 'dc_timer': dc, 'ac_status': ac_status, 'dc_status': dc_status, 'stv_calls': calls}))
+	return 0
+
+
+def power_read(path):
+	import json
+	with open(path, 'rb') as handle:
+		handle.seek(POWER_PAGE)
+		values = handle.read(len(POWER_BYTES))
+	print(json.dumps(dict(zip(POWER_BYTES, values))))
+	return 0
+
+
 def self_test():
 	table = ssdt()
 	failures = []
@@ -405,6 +578,16 @@ def self_test():
 	for needle in (b'LSFX0C50', b'LSFX0C51', b'PNP0C50', b'SA8_', b'_DSM', E.i2c_serial_bus_v2(0x2C, f'\\_SB.PCI0.S{I2C_SLOT << 3:02X}', speed=400000), E.gpio_int([1], f'\\_SB.PCI0.S{GPIO_SLOT << 3:02X}', edge=False, active_low=True)):
 		if needle not in hid:
 			failures.append(f'the HID table lacks {needle!r}')
+	sleep = ssdt(sleep=True)
+	if sum(sleep) & 0xFF or struct.unpack('<I', sleep[4:8])[0] != len(sleep):
+		failures.append('the sleep table\'s checksum or length')
+	for needle in (b'LID0', b'PWRB', b'SLPB', b'TAD0', b'ACPI000E', b'_LID', b'_GRT', b'_STV', b'_GWS', b'_CWS', b'_E06', b'SLEV', b'PSLP', b'PWAK', b'_PR0', b'_S3W', b'_PS3', E.power_resource('PSLP', 0, 0, [])[:2]):
+		if needle not in sleep:
+			failures.append(f'the sleep table lacks {needle!r}')
+		if needle in table and needle not in (b'SLEV',):
+			failures.append(f'the plain table carries the sleep gate\'s {needle!r}')
+	if len(grt_bytes(0)) != 16:
+		failures.append('_GRT is not sixteen bytes')
 	tcpc = tcpc_ssdt()
 	if sum(tcpc) & 0xFF or struct.unpack('<I', tcpc[4:8])[0] != len(tcpc):
 		failures.append('the TCPCI table\'s checksum or length')
@@ -429,13 +612,18 @@ def main():
 	parser.add_argument('--set', nargs='+', metavar='FILE NAME=VALUE')
 	parser.add_argument('--power-storm', nargs=2, metavar=('FILE', 'CONTROL'))
 	parser.add_argument('--ucsi-version', type=lambda text: int(text, 0), help='a UCSI PPM is present, with this VERSION (0x0120, 0x0210)')
+	parser.add_argument('--sleep', action='store_true', help='the table and the memory carry the sleep gate\'s devices')
+	parser.add_argument('--sleep-event', nargs=3, metavar=('FILE', 'CONTROL', 'NAME'))
+	parser.add_argument('--tad-clock', nargs=2, metavar=('FILE', 'UNIX'))
+	parser.add_argument('--tad-read', metavar='FILE')
+	parser.add_argument('--power-read', metavar='FILE')
 	parser.add_argument('--self-test', action='store_true')
 	args = parser.parse_args()
 	if args.self_test:
 		return self_test()
 	if args.out:
 		with open(args.out, 'wb') as out:
-			out.write(ssdt(args.ucsi_version or 0x0210))
+			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep))
 	if args.hid_out:
 		with open(args.hid_out, 'wb') as out:
 			out.write(hid_ssdt())
@@ -443,13 +631,21 @@ def main():
 		with open(args.tcpc_out, 'wb') as out:
 			out.write(tcpc_ssdt())
 	if args.memory:
-		create_memory(args.memory, args.ucsi_version)
+		create_memory(args.memory, args.ucsi_version, args.sleep)
 	if args.poke:
 		poke(args.poke[0], int(args.poke[1], 0), bytes.fromhex(args.poke[2]))
 	if args.set:
 		set_values(args.set[0], args.set[1:])
 	if args.power_storm:
 		return power_storm(*args.power_storm)
+	if args.sleep_event:
+		return sleep_event(*args.sleep_event)
+	if args.tad_clock:
+		poke(args.tad_clock[0], TAD_GRT, grt_bytes(int(args.tad_clock[1], 0)))
+	if args.tad_read:
+		return tad_read(args.tad_read)
+	if args.power_read:
+		return power_read(args.power_read)
 	return 0
 
 

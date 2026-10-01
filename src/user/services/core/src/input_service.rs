@@ -551,6 +551,105 @@ enum Scope {
 	Keys,
 	/// A console program granted `input-gamepad`: `observe-gamepads` and nothing else.
 	Gamepad,
+	/// The activity signal's root and its connections: `input-activity.watch` and nothing else.
+	Activity,
+}
+
+// THE ACTIVITY SIGNAL (`liber:input@1/input-activity`): the last input from ANY source - keyboards, pointers, touch
+// surfaces, gamepads, the Bluetooth mouse and the trusted keyboard, the protected session's included - and each watcher's
+// edges, which `service_logic::activity` decides. Nothing about what the input was reaches a watcher.
+struct Activity {
+	last: u64,
+	watchers: Vec<Watcher>,
+}
+
+struct Watcher {
+	stream: u64,
+	watch: service_logic::activity::Watch,
+	seq: u32,
+}
+
+// How deep a watcher's stream is: it carries edges, two per idle period at the most.
+const ACTIVITY_DEPTH: u64 = 8;
+
+impl Activity {
+	// INPUT SEEN: the clock of the last input moves, and every idle watcher is told `active`.
+	fn seen(&mut self) {
+		self.last = clock();
+		for at in 0..self.watchers.len() {
+			if let Some(edge) = self.watchers[at].watch.input() {
+				Activity::emit(&mut self.watchers[at], edge);
+			}
+		}
+		self.watchers.retain(|watcher| watcher.stream != 0);
+	}
+
+	// TIME PASSED: every watcher whose interval has run out since the last input is told `idle`.
+	fn tick(&mut self) {
+		let now = clock();
+		let last = self.last;
+		for at in 0..self.watchers.len() {
+			if let Some(edge) = self.watchers[at].watch.tick(last, now) {
+				Activity::emit(&mut self.watchers[at], edge);
+			}
+		}
+		self.watchers.retain(|watcher| watcher.stream != 0);
+	}
+
+	// When the loop must next wake for an edge; zero for never.
+	fn due(&self) -> u64 {
+		self.watchers.iter().filter_map(|watcher| watcher.watch.due(self.last)).min().unwrap_or(0)
+	}
+
+	// ONE EDGE ON A WATCHER'S STREAM; a reader gone is the watcher gone.
+	fn emit(watcher: &mut Watcher, edge: service_logic::activity::Edge) {
+		let edge = match edge {
+			service_logic::activity::Edge::Idle => proto::system::ActivityEdge::Idle,
+			service_logic::activity::Edge::Active => proto::system::ActivityEdge::Active,
+		};
+		let mut frame = [0u8; 32];
+		let mut frame_handles = Handles::new();
+		let sent = proto::system::input_activity::watch_frame(watcher.seq, &edge, &mut frame, &mut frame_handles).is_some_and(|n| try_send(watcher.stream, &frame[..n], 0));
+		watcher.seq = watcher.seq.wrapping_add(1);
+		if !sent && matches!(try_recv(watcher.stream, &mut [0u8; 8]), Polled::Closed) {
+			close(watcher.stream);
+			watcher.stream = 0;
+		}
+	}
+}
+
+// `watch(idle-after-ms)`: the snapshot is empty - an edge is told when it happens, and a watcher whose interval has already
+// run out hears `idle` at the next tick.
+struct ActivityWatch {
+	idle_after: u64,
+}
+
+impl proto::system::input_activity::Service for ActivityWatch {
+	fn watch(&mut self, idle_after_ms: u32) -> Vec<proto::system::ActivityEdge> {
+		self.idle_after = u64::from(idle_after_ms).saturating_mul(TICKS_PER_SECOND) / 1000;
+		Vec::new()
+	}
+}
+
+// A WATCH OPENED on an activity connection: refused - answered with no stream - for an interval outside a second to a day.
+fn stream_watch_activity(client: u64, request: &[u8], activity: &mut Activity) {
+	let mut request_handle = Handles::new();
+	let mut asked = ActivityWatch { idle_after: 0 };
+	let Some((corr, _)) = proto::system::input_activity::watch_open(&mut asked, request, &mut request_handle) else { return };
+	let Some(watch) = service_logic::activity::Watch::new(asked.idle_after) else {
+		send_blocking(client, &corr.to_le_bytes(), 0);
+		return;
+	};
+	let Some((producer, consumer)) = channel_with_depth(ACTIVITY_DEPTH) else {
+		send_blocking(client, &corr.to_le_bytes(), 0);
+		return;
+	};
+	if !send_blocking(client, &corr.to_le_bytes(), consumer) {
+		close(producer);
+		return;
+	}
+	activity.watchers.push(Watcher { stream: producer, watch, seq: 0 });
+	activity.tick();
 }
 
 struct Client {
@@ -1237,6 +1336,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => 0,
 	};
 	let trusted_root: u64 = recv_tagged(bootstrap, &mut buf, b"TRUSTED").unwrap_or(0);
+	// THE ACTIVITY SIGNAL'S ROOT: the sleep policy and the brightness policy watch it. Optional, and LAST.
+	let activity_root: u64 = recv_tagged(bootstrap, &mut buf, b"ACTIVITY").unwrap_or(0);
 	let raw: u64 = take_published_pointer(catalogue, &ProviderKind::Input);
 	// POINTERS AND TOUCH SURFACES ARE FOLLOWED: both subscriptions stay open, and every provider they announce - at
 	// bootstrap or later - is attached, up to four pointers and one surface. Two of the catalogue's subscriber places,
@@ -1257,7 +1358,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new(kill, Gamepads { catalogue, subscription: pad_subscription, sources: Vec::new(), pads: Vec::new(), next_id: 1, focused: None, console: None });
 	let mut trusted = Trusted { watch: Watch::new(), arming: Arming::Off, producer: 0, seq: 0, protected: false };
-	serve(service, admin, raw, pointers, touch, forward, keys, focus, [trusted_keys, trusted_root], &mut trusted, &mut bluetooth, &mut state);
+	let mut activity = Activity { last: clock(), watchers: Vec::new() };
+	serve(service, admin, raw, pointers, touch, forward, keys, focus, [trusted_keys, trusted_root, activity_root], &mut trusted, &mut bluetooth, &mut state, &mut activity);
 	exit();
 }
 
@@ -1267,10 +1369,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
 #[allow(clippy::too_many_arguments)]
-fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: Followed, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root]: [u64; 2], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input) {
+fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: Followed, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root, activity_root]: [u64; 3], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input, activity: &mut Activity) {
 	let mut req: [u8; 64] = [0u8; 64];
 	let mut raw_open: bool = raw != 0;
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
+	// THE ACTIVITY ROOT IS A CLIENT CHANNEL OF ITS OWN SCOPE, after the service root, whose index the loop keeps at zero.
+	if activity_root != 0 {
+		clients.push(Client { chan: activity_root, scope: Scope::Activity });
+	}
 	let mut keys_open: bool = keys != 0;
 	let mut focus_open: bool = focus != 0;
 	let mut trusted_keys_open: bool = trusted_keys != 0;
@@ -1330,7 +1436,28 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 		// AND A GAMEPAD STREAM OWED A STATE WAKES IT A TICK LATER, on a HOUSEKEEPING wait: a reader that never
 		// drains must not keep a settling scheduler from settling.
 		let pad_retry: u64 = if state.pads_pending() { clock() + GAMEPAD_RETRY_TICKS } else { 0 };
-		let ready: i64 = if pad_retry != 0 && (!pending_retry || pad_retry < bluetooth.retry_at) { wait_any_periodic(&waitset, pad_retry) } else { wait_any(&waitset, if pending_retry { bluetooth.retry_at } else { 0 }) };
+		// AND THE ACTIVITY SIGNAL'S NEXT EDGE, a housekeeping wake: a watcher waiting minutes for idleness must not keep a
+		// settling scheduler from settling.
+		let idle_due: u64 = activity.due();
+		let earliest = |a: u64, b: u64| {
+			if a == 0 {
+				b
+			} else if b == 0 {
+				a
+			} else {
+				a.min(b)
+			}
+		};
+		let ready: i64 = if pad_retry != 0 && (!pending_retry || pad_retry < bluetooth.retry_at) {
+			wait_any_periodic(&waitset, earliest(pad_retry, idle_due))
+		} else if pending_retry {
+			wait_any(&waitset, earliest(bluetooth.retry_at, idle_due))
+		} else if idle_due != 0 {
+			wait_any_periodic(&waitset, idle_due)
+		} else {
+			wait_any(&waitset, 0)
+		};
+		activity.tick();
 		if pending_retry && clock() >= bluetooth.retry_at {
 			bluetooth.retry();
 		}
@@ -1348,6 +1475,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 							close(handle);
 						}
 						trusted.record(&req[..len]);
+						activity.seen();
 						// SECURE ATTENTION TAKES THE ORDINARY PATH AWAY BEFORE ANYTHING ELSE IS DELIVERED.
 						if trusted.protected {
 							state.protect(forward);
@@ -1456,6 +1584,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 							close(handle);
 						}
 						state.pad_frame(ready_handle, &pad_buf[..len]);
+						activity.seen();
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
@@ -1486,6 +1615,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 			continue;
 		}
 		if bluetooth.stream != 0 && ready_handle == bluetooth.stream {
+			activity.seen();
 			let mut frame_buf: [u8; 64] = [0u8; 64];
 			bluetooth.drain(state, forward, &mut frame_buf);
 			continue;
@@ -1548,6 +1678,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 						if let Some(contact) = contact_from(&req[..len]) {
 							state.record_contact(contact);
 						}
+						activity.seen();
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
@@ -1567,6 +1698,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 							close(handle);
 						}
 						state.record_key(&req[..len]);
+						activity.seen();
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
@@ -1585,6 +1717,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 						if let Some(event) = map_event(&req[..len]) {
 							state.record(event);
 						}
+						activity.seen();
 						if forward != 0 && !state.protected {
 							send_blocking(forward, &req[..len], 0);
 						}
@@ -1637,10 +1770,17 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 		match recv_blocking(client, &mut req) {
 			Received::Message { len, mut handle } => {
 				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-				if op == CONNECT_OP && scope == Scope::Full {
+				if op == CONNECT_OP && (scope == Scope::Full || scope == Scope::Activity) {
 					if let Some((mine, theirs)) = channel() {
 						clients.push(Client { chan: mine, scope });
 						send_blocking(client, &[], theirs);
+					}
+				} else if scope == Scope::Activity {
+					// THE ACTIVITY SIGNAL'S CONNECTIONS answer its one operation and nothing else.
+					if op == proto::system::input_activity::OP_WATCH {
+						stream_watch_activity(client, &req[..len], activity);
+					} else if len >= 6 {
+						send_blocking(client, &req[2..6], 0);
 					}
 				} else if op == input::OP_SUBSCRIBE && scope == Scope::Full {
 					stream_subscribe(client, &req[..len], state);

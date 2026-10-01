@@ -18,6 +18,9 @@ interface input-trusted
 method input-trusted.events op=1 () -> stream<trusted-input>
 method input-trusted.arm op=2 (epoch:u64:rights=) -> result<unit, liber:base@1::error>
 method input-trusted.disarm op=3 (epoch:u64:rights=) -> result<unit, liber:base@1::error>
+enum activity-edge(idle=1,active=2)
+interface input-activity
+method input-activity.watch op=1 (idle-after-ms:u32:rights=) -> stream<activity-edge>
 interface input-admin
 method input-admin.open-keys op=1 () -> result<handle<channel>, liber:base@1::error>
 method input-admin.open-gamepads op=2 () -> result<handle<channel>, liber:base@1::error>

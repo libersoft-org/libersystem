@@ -76,5 +76,61 @@ pub fn mac(key: &Key, message: &[u8]) -> [u8; BLOCK] {
 	state
 }
 
+/// THE SAME TAG, FED IN PIECES: for a message too long to hold whole - a hibernation image's chunk is a megabyte of
+/// pages - the blocks are chained as they arrive, and the last one is kept back until `finish`, since only then is it
+/// known to be the last and which subkey it takes. Any split of a message gives the tag `mac` gives it whole.
+pub struct Stream {
+	key: Key,
+	state: [u8; BLOCK],
+	// The bytes not yet chained: at most one block, held back in case it is the last.
+	held: [u8; BLOCK],
+	count: usize,
+}
+
+impl Stream {
+	pub fn new(key: &Key) -> Stream {
+		Stream { key: *key, state: [0u8; BLOCK], held: [0u8; BLOCK], count: 0 }
+	}
+
+	pub fn update(&mut self, mut bytes: &[u8]) {
+		while !bytes.is_empty() {
+			if self.count == BLOCK {
+				// A FULL HELD BLOCK WITH MORE BEHIND IT is not the last: chained plain.
+				let mut block = self.held;
+				for (byte, s) in block.iter_mut().zip(self.state.iter()) {
+					*byte ^= *s;
+				}
+				self.state = self.key.block(&block);
+				self.count = 0;
+			}
+			let take = (BLOCK - self.count).min(bytes.len());
+			self.held[self.count..self.count + take].copy_from_slice(&bytes[..take]);
+			self.count += take;
+			bytes = &bytes[take..];
+		}
+	}
+
+	pub fn finish(self) -> [u8; BLOCK] {
+		let (k1, k2) = subkeys(&self.key);
+		let mut block = [0u8; BLOCK];
+		if self.count == BLOCK {
+			block = self.held;
+			for (byte, k) in block.iter_mut().zip(k1.iter()) {
+				*byte ^= *k;
+			}
+		} else {
+			block[..self.count].copy_from_slice(&self.held[..self.count]);
+			block[self.count] = 0x80;
+			for (byte, k) in block.iter_mut().zip(k2.iter()) {
+				*byte ^= *k;
+			}
+		}
+		for (byte, s) in block.iter_mut().zip(self.state.iter()) {
+			*byte ^= *s;
+		}
+		self.key.block(&block)
+	}
+}
+
 #[cfg(test)]
 mod tests;

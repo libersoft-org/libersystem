@@ -276,3 +276,11 @@ fn display_resources_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(DisplayResources::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn display_output_wire_is_stable() {
+	let sample = DisplayOutput { index: 7, active: true, external: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(DisplayOutput::decode(&bytes).unwrap(), sample);
+}

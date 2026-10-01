@@ -1477,6 +1477,9 @@ pub enum ProviderKind {
 	/// `typec-provider` contract - its partner, roles, contract, offers, cable and modes, and the operator's four
 	/// requests - which TypeCService alone consumes. A connector that can sink is ALSO a `power-source`.
 	TypecConnector = 27,
+	/// A PLATFORM SWITCH - a lid - the `platform-switch` contract below: its state and every change after it, which the
+	/// power-state service alone consumes for its sleep policy.
+	PlatformSwitch = 28,
 }
 
 impl ProviderKind {
@@ -1546,6 +1549,7 @@ impl ProviderKind {
 			25 => Some(ProviderKind::Watchdog),
 			26 => Some(ProviderKind::Ipmi),
 			27 => Some(ProviderKind::TypecConnector),
+			28 => Some(ProviderKind::PlatformSwitch),
 			_ => None,
 		}
 	}
@@ -4655,6 +4659,283 @@ pub mod usb {
 	}
 }
 
+/// WHICH SWITCH: a lid, today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SwitchKind {
+	Lid = 1,
+}
+
+impl SwitchKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SwitchKind> {
+		let mut r = Reader::new(bytes);
+		let value = SwitchKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SwitchKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SwitchKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<SwitchKind> {
+		match r.u8()? {
+			1 => Some(SwitchKind::Lid),
+			_ => None,
+		}
+	}
+}
+
+/// A PLATFORM SWITCH'S STATE, and the count of changes its driver has read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwitchState {
+	pub kind: SwitchKind,
+	pub closed: bool,
+	pub sequence: u32,
+}
+
+impl SwitchState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SwitchState> {
+		let mut r = Reader::new(bytes);
+		let value = SwitchState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SwitchState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SwitchState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.boolean(self.closed)?;
+		w.u32(self.sequence)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<SwitchState> {
+		let kind = SwitchKind::read(r)?;
+		let closed = r.boolean()?;
+		let sequence = r.u32()?;
+		Some(SwitchState { kind, closed, sequence })
+	}
+}
+
+/// THE `platform-switch` PROVIDER CONTRACT, which a lid's driver publishes and the power-state service consumes: the
+/// state now, then every change after it - one frame for each reading that differed from the last, a reading made at
+/// each `Notify` and at every resume. What a closed lid DOES is the consumer's policy; this reports and decides nothing.
+// interface `platform-switch` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod platform_switch {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_WATCH: u16 = 1;
+
+	pub trait Service {
+		fn watch(&mut self) -> Vec<SwitchState>;
+	}
+
+	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
+		None
+	}
+
+	pub fn watch_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<SwitchState>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.watch();
+		Some((corr, items))
+	}
+	pub fn watch_frame(seq: u32, item: &SwitchState, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn watch_read(msg: &[u8], frame_handles: &mut Handles) -> Option<SwitchState> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = SwitchState::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn watch(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WATCH)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_platform_switch_watch")]
+	fn channel_invoke_watch(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.watch()
+	}
+}
+
 /// WHAT A WATCHDOG IS, as its driver read it at bind.
 ///
 /// THE TIMEOUT IS ONE NUMBER: the time from the last pet to the reset. Each driver divides it across its device's
@@ -5243,7 +5524,9 @@ impl AcpiNotification {
 /// VALUES TRAVEL IN THE SERVICE'S ENCODING: per value a tag byte - 0x01 integer (eight bytes), 0x02 string, 0x03
 /// buffer (a u32 length and the bytes), 0x04 package (a u32 count and the values), 0x05 reference (the path it
 /// names), 0x00 none - bounded in depth and size at both ends. PLATFORM METHODS ARE REFUSED: `_INI`, `_REG`, `_OSC`,
-/// `_PTS`, `_WAK` and the sleep objects are the service's, and so is every other node.
+/// `_PTS`, `_WAK` and the sleep objects are the service's, and so is every other node. SO ARE THE DEVICE POWER
+/// METHODS - `_PS0` to `_PS3`, `_PSW` and `_DSW`: a device's power state is asked for with `set-power-state`, because
+/// the power resources behind it are shared with other devices and counted by the service.
 // interface `acpi-node` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod acpi_node {
 	use super::*;
@@ -5255,6 +5538,8 @@ pub mod acpi_node {
 	pub const OP_PROPERTIES: u16 = 3;
 	pub const OP_DSM: u16 = 4;
 	pub const OP_NOTIFICATIONS: u16 = 5;
+	pub const OP_SET_POWER_STATE: u16 = 6;
+	pub const OP_SLEEP_POWER_STATE: u16 = 7;
 
 	pub trait Service {
 		/// The node this connection is scoped to: its identity, `acpi:` and the absolute path.
@@ -5268,6 +5553,16 @@ pub mod acpi_node {
 		fn dsm(&mut self, uuid: Vec<u8>, revision: u64, function: u64, arguments: Vec<u8>) -> Result<Vec<u8>, Error>;
 		/// The node's `Notify` values, as the firmware raises them.
 		fn notifications(&mut self) -> Vec<AcpiNotification>;
+		/// ENTER A DEVICE POWER STATE - 0 to 3 are D0 to D3hot, 4 is D3cold: the state's `_PRx` power resources turned on
+		/// first, in their `resource_order`, then `_PSx`, then what the old state held and this one does not let go - each
+		/// resource ON while any device holds it and OFF with the last. The state the node is already in runs nothing; a
+		/// node with neither `_PSx` nor `_PRx` answers `ok`, its power not the firmware's to switch. `io` when a method
+		/// failed - nothing then changed - and `invalid` for a number that is no state.
+		fn set_power_state(&mut self, state: u8) -> Result<(), Error>;
+		/// THE STATE TO ENTER FOR A SYSTEM SLEEP - `target` 0 for suspend to idle, 3 for RAM, 4 for disk - and whether the
+		/// device is to wake the machine from it, from the node's `_SxD` and `_SxW` (`_S0W` alone for suspend to idle): the
+		/// deepest it may enter, and where it wakes, the deepest it still wakes from. Encoded as `set-power-state` takes it.
+		fn sleep_power_state(&mut self, target: u8, wake: bool) -> Result<u8, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -5488,6 +5783,80 @@ pub mod acpi_node {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_SET_POWER_STATE => {
+				let state = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_power_state(state);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v96) => {
+							w.u8(1)?;
+						}
+						Err(v97) => {
+							w.u8(0)?;
+							v97.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SLEEP_POWER_STATE => {
+				let target = r.u8()?;
+				let wake = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.sleep_power_state(target, wake);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v98) => {
+							w.u8(1)?;
+							w.u8(*v98)?;
+						}
+						Err(v99) => {
+							w.u8(0)?;
+							v99.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -5652,8 +6021,8 @@ pub mod acpi_node {
 				return None;
 			}
 			w.u16(arguments.len() as u16)?;
-			for v96 in arguments.iter() {
-				w.u8(*v96)?;
+			for v100 in arguments.iter() {
+				w.u8(*v100)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -5673,13 +6042,13 @@ pub mod acpi_node {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v97 = r.u16()? as usize;
-						let mut v98 = Vec::new();
-						v98.try_reserve_exact(v97).ok()?;
-						for _ in 0..v97 {
-							v98.push(r.u8()?);
+						let v101 = r.u16()? as usize;
+						let mut v102 = Vec::new();
+						v102.try_reserve_exact(v101).ok()?;
+						for _ in 0..v101 {
+							v102.push(r.u8()?);
 						}
-						v98
+						v102
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -5699,66 +6068,6 @@ pub mod acpi_node {
 			let w = &mut writer;
 			w.u16(OP_PROPERTIES)?;
 			w.u32(corr)?;
-			// One call for both halves: the bytes cannot be taken without them.
-			let (request, request_handles) = writer.into_message();
-			let mut reply_handles = Handles::new();
-			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
-				Ok(reply) => reply,
-				Err(e) => {
-					self.last_error = Some(e);
-					return Some(Err(transport_outcome(e)));
-				}
-			};
-			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
-			let decoded = (|| {
-				let r = &mut reader;
-				if r.u32()? != corr {
-					return None;
-				}
-				let value = if r.tag()? {
-					Ok({
-						let v99 = r.u16()? as usize;
-						let mut v100 = Vec::new();
-						v100.try_reserve_exact(v99).ok()?;
-						for _ in 0..v99 {
-							v100.push(r.u8()?);
-						}
-						v100
-					})
-				} else {
-					Err(Error::read(r)?)
-				};
-				r.finish()?;
-				Some(value)
-			})();
-			if decoded.is_none() {
-				self.transport.discard_handles(reply_handles.as_slice());
-				return None;
-			}
-			decoded
-		}
-		pub fn dsm(&mut self, uuid: &[u8], revision: &u64, function: &u64, arguments: &[u8]) -> Option<Result<Vec<u8>, Error>> {
-			let corr = self.next_corr();
-			let mut writer = VecWriter::new();
-			let w = &mut writer;
-			w.u16(OP_DSM)?;
-			w.u32(corr)?;
-			if uuid.len() > u16::MAX as usize {
-				return None;
-			}
-			w.u16(uuid.len() as u16)?;
-			for v101 in uuid.iter() {
-				w.u8(*v101)?;
-			}
-			w.u64(*revision)?;
-			w.u64(*function)?;
-			if arguments.len() > u16::MAX as usize {
-				return None;
-			}
-			w.u16(arguments.len() as u16)?;
-			for v102 in arguments.iter() {
-				w.u8(*v102)?;
-			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -5797,6 +6106,66 @@ pub mod acpi_node {
 			}
 			decoded
 		}
+		pub fn dsm(&mut self, uuid: &[u8], revision: &u64, function: &u64, arguments: &[u8]) -> Option<Result<Vec<u8>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DSM)?;
+			w.u32(corr)?;
+			if uuid.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(uuid.len() as u16)?;
+			for v105 in uuid.iter() {
+				w.u8(*v105)?;
+			}
+			w.u64(*revision)?;
+			w.u64(*function)?;
+			if arguments.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(arguments.len() as u16)?;
+			for v106 in arguments.iter() {
+				w.u8(*v106)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v107 = r.u16()? as usize;
+						let mut v108 = Vec::new();
+						v108.try_reserve_exact(v107).ok()?;
+						for _ in 0..v107 {
+							v108.push(r.u8()?);
+						}
+						v108
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 		pub fn notifications(&mut self) -> Option<u64> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
@@ -5821,6 +6190,73 @@ pub mod acpi_node {
 				return None;
 			}
 			Some(reply_handles.first())
+		}
+		pub fn set_power_state(&mut self, state: &u8) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_POWER_STATE)?;
+			w.u32(corr)?;
+			w.u8(*state)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn sleep_power_state(&mut self, target: &u8, wake: &bool) -> Option<Result<u8, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SLEEP_POWER_STATE)?;
+			w.u32(corr)?;
+			w.u8(*target)?;
+			w.boolean(*wake)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u8()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
 		}
 	}
 
@@ -5862,6 +6298,22 @@ pub mod acpi_node {
 	fn channel_invoke_notifications(chan: u64) -> Option<u64> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.notifications()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_acpi_node_set_power_state")]
+	fn channel_invoke_set_power_state(chan: u64, state: &u8) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_power_state(state)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_acpi_node_sleep_power_state")]
+	fn channel_invoke_sleep_power_state(chan: u64, target: &u8, wake: &bool) -> Option<Result<u8, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.sleep_power_state(target, wake)
 	}
 }
 
@@ -5968,8 +6420,8 @@ pub mod acpi_admin {
 		match op {
 			OP_OPEN_NODE => {
 				let identity = {
-					let v105 = r.string_lp()?;
-					(v105.len() <= 64).then_some(v105)?
+					let v109 = r.string_lp()?;
+					(v109.len() <= 64).then_some(v109)?
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -5978,14 +6430,14 @@ pub mod acpi_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v106) => {
+						Ok(v110) => {
 							w.u8(1)?;
-							w.set_handle(*v106)?;
+							w.set_handle(*v110)?;
 							w.u32(0)?;
 						}
-						Err(v107) => {
+						Err(v111) => {
 							w.u8(0)?;
-							v107.write(w)?;
+							v111.write(w)?;
 						}
 					}
 					Some(())
@@ -6009,8 +6461,8 @@ pub mod acpi_admin {
 			}
 			OP_CONNECTION => {
 				let controller = {
-					let v108 = r.string_lp()?;
-					(v108.len() <= 64).then_some(v108)?
+					let v112 = r.string_lp()?;
+					(v112.len() <= 64).then_some(v112)?
 				};
 				let kind = AcpiConnectionKind::read(r)?;
 				let value = r.u32()?;
@@ -6025,12 +6477,12 @@ pub mod acpi_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v109) => {
+						Ok(v113) => {
 							w.u8(1)?;
 						}
-						Err(v110) => {
+						Err(v114) => {
 							w.u8(0)?;
-							v110.write(w)?;
+							v114.write(w)?;
 						}
 					}
 					Some(())
@@ -6334,25 +6786,25 @@ impl DeviceEntry {
 		out.push(',');
 		out.push_str("\"ids\":");
 		out.push('[');
-		let mut v112 = true;
-		for v111 in self.ids.iter() {
-			if !v112 {
+		let mut v116 = true;
+		for v115 in self.ids.iter() {
+			if !v116 {
 				out.push(',');
 			}
-			v112 = false;
-			v111.to_json_into(out);
+			v116 = false;
+			v115.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"resources\":");
 		out.push('[');
-		let mut v114 = true;
-		for v113 in self.resources.iter() {
-			if !v114 {
+		let mut v118 = true;
+		for v117 in self.resources.iter() {
+			if !v118 {
 				out.push(',');
 			}
-			v114 = false;
-			v113.to_json_into(out);
+			v118 = false;
+			v117.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -6411,25 +6863,25 @@ impl DeviceEntry {
 		out.push_str(", ");
 		out.push_str("ids=");
 		out.push('[');
-		let mut v116 = true;
-		for v115 in self.ids.iter() {
-			if !v116 {
+		let mut v120 = true;
+		for v119 in self.ids.iter() {
+			if !v120 {
 				out.push_str(", ");
 			}
-			v116 = false;
-			v115.to_text_into(out);
+			v120 = false;
+			v119.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("resources=");
 		out.push('[');
-		let mut v118 = true;
-		for v117 in self.resources.iter() {
-			if !v118 {
+		let mut v122 = true;
+		for v121 in self.resources.iter() {
+			if !v122 {
 				out.push_str(", ");
 			}
-			v118 = false;
-			v117.to_text_into(out);
+			v122 = false;
+			v121.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -6473,13 +6925,13 @@ impl DeviceEntry {
 		crate::codec::cbor::text(out, &self.identity);
 		crate::codec::cbor::text(out, "ids");
 		crate::codec::cbor::array(out, self.ids.len());
-		for v119 in self.ids.iter() {
-			v119.to_cbor_into(out);
+		for v123 in self.ids.iter() {
+			v123.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "resources");
 		crate::codec::cbor::array(out, self.resources.len());
-		for v120 in self.resources.iter() {
-			v120.to_cbor_into(out);
+		for v124 in self.resources.iter() {
+			v124.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "unresolved");
 		crate::codec::cbor::boolean(out, self.unresolved);
@@ -7043,8 +7495,8 @@ impl BindingRecord {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v121) => {
-				let _ = write!(out, "{}", v121);
+			Some(v125) => {
+				let _ = write!(out, "{}", v125);
 			}
 			None => {
 				out.push_str("null");
@@ -7092,8 +7544,8 @@ impl BindingRecord {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v122) => {
-				let _ = write!(out, "{}", v122);
+			Some(v126) => {
+				let _ = write!(out, "{}", v126);
 			}
 			None => {
 				out.push('-');
@@ -7129,8 +7581,8 @@ impl BindingRecord {
 		crate::codec::cbor::uint(out, self.resources as u64);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v123) => {
-				crate::codec::cbor::uint(out, *v123 as u64);
+			Some(v127) => {
+				crate::codec::cbor::uint(out, *v127 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7184,6 +7636,7 @@ impl ProviderKind {
 			ProviderKind::Watchdog => out.push_str("\"watchdog\""),
 			ProviderKind::Ipmi => out.push_str("\"ipmi\""),
 			ProviderKind::TypecConnector => out.push_str("\"typec-connector\""),
+			ProviderKind::PlatformSwitch => out.push_str("\"platform-switch\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -7215,6 +7668,7 @@ impl ProviderKind {
 			ProviderKind::Watchdog => out.push_str("watchdog"),
 			ProviderKind::Ipmi => out.push_str("ipmi"),
 			ProviderKind::TypecConnector => out.push_str("typec-connector"),
+			ProviderKind::PlatformSwitch => out.push_str("platform-switch"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -7246,6 +7700,7 @@ impl ProviderKind {
 			ProviderKind::Watchdog => crate::codec::cbor::text(out, "watchdog"),
 			ProviderKind::Ipmi => crate::codec::cbor::text(out, "ipmi"),
 			ProviderKind::TypecConnector => crate::codec::cbor::text(out, "typec-connector"),
+			ProviderKind::PlatformSwitch => crate::codec::cbor::text(out, "platform-switch"),
 		}
 	}
 }
@@ -7301,8 +7756,8 @@ impl ProviderInfo {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v124) => {
-				let _ = write!(out, "{}", v124);
+			Some(v128) => {
+				let _ = write!(out, "{}", v128);
 			}
 			None => {
 				out.push_str("null");
@@ -7345,8 +7800,8 @@ impl ProviderInfo {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v125) => {
-				let _ = write!(out, "{}", v125);
+			Some(v129) => {
+				let _ = write!(out, "{}", v129);
 			}
 			None => {
 				out.push('-');
@@ -7376,8 +7831,8 @@ impl ProviderInfo {
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v126) => {
-				crate::codec::cbor::uint(out, *v126 as u64);
+			Some(v130) => {
+				crate::codec::cbor::uint(out, *v130 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7555,8 +8010,8 @@ impl IncidentReport {
 		out.push(',');
 		out.push_str("\"platform\":");
 		match &self.platform {
-			Some(v127) => {
-				let _ = write!(out, "{}", v127);
+			Some(v131) => {
+				let _ = write!(out, "{}", v131);
 			}
 			None => {
 				out.push_str("null");
@@ -7624,8 +8079,8 @@ impl IncidentReport {
 		out.push_str(", ");
 		out.push_str("platform=");
 		match &self.platform {
-			Some(v128) => {
-				let _ = write!(out, "{}", v128);
+			Some(v132) => {
+				let _ = write!(out, "{}", v132);
 			}
 			None => {
 				out.push('-');
@@ -7669,8 +8124,8 @@ impl IncidentReport {
 		crate::codec::cbor::uint(out, self.dma_used as u64);
 		crate::codec::cbor::text(out, "platform");
 		match &self.platform {
-			Some(v129) => {
-				crate::codec::cbor::uint(out, *v129 as u64);
+			Some(v133) => {
+				crate::codec::cbor::uint(out, *v133 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7862,13 +8317,13 @@ impl HciPacket {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v131 = true;
-		for v130 in self.bytes.iter() {
-			if !v131 {
+		let mut v135 = true;
+		for v134 in self.bytes.iter() {
+			if !v135 {
 				out.push(',');
 			}
-			v131 = false;
-			let _ = write!(out, "{}", v130);
+			v135 = false;
+			let _ = write!(out, "{}", v134);
 		}
 		out.push(']');
 		out.push('}');
@@ -7883,13 +8338,13 @@ impl HciPacket {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v133 = true;
-		for v132 in self.bytes.iter() {
-			if !v133 {
+		let mut v137 = true;
+		for v136 in self.bytes.iter() {
+			if !v137 {
 				out.push_str(", ");
 			}
-			v133 = false;
-			let _ = write!(out, "{}", v132);
+			v137 = false;
+			let _ = write!(out, "{}", v136);
 		}
 		out.push(']');
 		out.push('}');
@@ -7902,8 +8357,8 @@ impl HciPacket {
 		crate::codec::cbor::uint(out, self.epoch as u64);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v134 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v134 as u64);
+		for v138 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v138 as u64);
 		}
 	}
 }
@@ -8053,13 +8508,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v136 = true;
-		for v135 in self.bytes.iter() {
-			if !v136 {
+		let mut v140 = true;
+		for v139 in self.bytes.iter() {
+			if !v140 {
 				out.push(',');
 			}
-			v136 = false;
-			let _ = write!(out, "{}", v135);
+			v140 = false;
+			let _ = write!(out, "{}", v139);
 		}
 		out.push(']');
 		out.push('}');
@@ -8068,13 +8523,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v138 = true;
-		for v137 in self.bytes.iter() {
-			if !v138 {
+		let mut v142 = true;
+		for v141 in self.bytes.iter() {
+			if !v142 {
 				out.push_str(", ");
 			}
-			v138 = false;
-			let _ = write!(out, "{}", v137);
+			v142 = false;
+			let _ = write!(out, "{}", v141);
 		}
 		out.push(']');
 		out.push('}');
@@ -8083,8 +8538,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v139 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v139 as u64);
+		for v143 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v143 as u64);
 		}
 	}
 }
@@ -8161,6 +8616,98 @@ impl UsbDevice {
 		crate::codec::cbor::uint(out, self.class as u64);
 		crate::codec::cbor::text(out, "type");
 		crate::codec::cbor::text(out, &self.r#type);
+	}
+}
+
+impl SwitchKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			SwitchKind::Lid => out.push_str("\"lid\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			SwitchKind::Lid => out.push_str("lid"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			SwitchKind::Lid => crate::codec::cbor::text(out, "lid"),
+		}
+	}
+}
+
+impl SwitchState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"closed\":");
+		if self.closed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"sequence\":");
+		let _ = write!(out, "{}", self.sequence);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("closed=");
+		if self.closed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("sequence=");
+		let _ = write!(out, "{}", self.sequence);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "closed");
+		crate::codec::cbor::boolean(out, self.closed);
+		crate::codec::cbor::text(out, "sequence");
+		crate::codec::cbor::uint(out, self.sequence as u64);
 	}
 }
 

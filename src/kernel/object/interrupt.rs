@@ -159,7 +159,12 @@ impl Interrupt {
 		self.pending.store(false, Ordering::Release);
 		// `swap`, so the unbind happens exactly once however many callers race here - and so `Drop`
 		// does not repeat it against a slot another device may by then own.
-		if self.bound.swap(false, Ordering::AcqRel) { crate::arch::interrupts::unbind(self.vector) } else { true }
+		if self.bound.swap(false, Ordering::AcqRel) {
+			crate::sleep::mark_wake(self.vector, false);
+			crate::arch::interrupts::unbind(self.vector)
+		} else {
+			true
+		}
 	}
 }
 
@@ -173,6 +178,8 @@ impl Drop for Interrupt {
 		// `swap` for the same reason `revoke` uses one: a forced release may already have unbound
 		// this vector, and repeating it would tear down whatever owns the slot by now.
 		if self.bound.swap(false, Ordering::AcqRel) {
+			// AND ITS WAKE MARK WITH IT: the vector may be another binding's next.
+			crate::sleep::mark_wake(self.vector, false);
 			crate::arch::interrupts::unbind(self.vector);
 		}
 	}

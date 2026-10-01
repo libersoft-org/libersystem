@@ -73,3 +73,11 @@ fn trusted_input_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(TrustedInput::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn activity_edge_wire_is_stable() {
+	let sample = ActivityEdge::Idle;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(ActivityEdge::decode(&bytes).unwrap(), sample);
+}

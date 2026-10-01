@@ -93,6 +93,10 @@ name = "tpm_service"
 path = "src/tpm_service.rs"
 
 [[bin]]
+name = "hibernation_service"
+path = "src/hibernation_service.rs"
+
+[[bin]]
 name = "bmc_service"
 path = "src/bmc_service.rs"
 
@@ -487,6 +491,11 @@ system-manifest = { path = "../../../tools/system-manifest" }
 [profile.dev.package.pix]
 opt-level = 2
 # The parent dev profile still retains debug information.
+
+# A hibernation image is encrypted and authenticated page by page - every page of memory in use, at the write and again
+# at the restore - and unoptimized AES and CMAC turn that into minutes. The ciphers are this crate's.
+[profile.dev.package.service-logic]
+opt-level = 2
 
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to

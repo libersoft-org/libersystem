@@ -142,9 +142,13 @@ impl<T: Timer> watchdog::Service for Provider<'_, T> {
 // A timer that is not armed is left alone - a timeout set on it would start it. An armed one is disarmed where the
 // device allows it; otherwise it is set to its longest timeout and petted a last time, and the step answers that
 // timeout as the latest the machine must be awake by - unless the device stops counting in the state asked for, when
-// there is no bound. The resume arms it again with the timeout it had, which catches a resume that hangs until the
-// watchdog service restores its own; one that was not armed is disarmed again, since a device that lost its power may
-// come back counting.
+// there is no bound. THE RESUME ARMS IT AGAIN, FIRST, with the timeout it had but at most `RESUME_WATCH_MS`: what it had
+// is the longest the watchdog service set at the announcement - on some devices half an hour - and a resume that hangs
+// after the drivers is caught within the bound, THE BRIDGE BOUND, which a boot must beat as well; the release, the resume notice and the thaw after it each have
+// ServiceManager's own bound, far below this one, and the resume notice is where the service restores its configured
+// timeout. One that was not armed is disarmed again, since a device that lost its power may come back counting.
+pub const RESUME_WATCH_MS: u32 = (BRIDGE_TICKS * 1000 / rt::TICKS_PER_SECOND) as u32;
+
 struct Sleep<'a, 'b, T: Timer> {
 	provider: &'a mut Provider<'b, T>,
 	serving: &'a mut common::Serving,
@@ -183,7 +187,7 @@ impl<T: Timer> common::SleepStep for Sleep<'_, '_, T> {
 
 	fn resume(&mut self, _lost_power: bool) -> bool {
 		match self.slept_ms.take() {
-			Some(timeout) => match self.provider.timer.arm(timeout) {
+			Some(timeout) => match self.provider.timer.arm(timeout.min(RESUME_WATCH_MS)) {
 				Ok(_) => print(b"driver.watchdog: armed again after the sleep\n"),
 				Err(_) => print(b"driver.watchdog: it did not take its arm again after the sleep\n"),
 			},

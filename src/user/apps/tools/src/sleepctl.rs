@@ -1,7 +1,10 @@
-// sleepctl - the sleep's operator command: suspend now, hibernate now, an idle sleep's inhibition, and the last sleep.
+// sleepctl - the sleep's operator command: suspend now, hibernate now, an idle sleep's inhibition, the status - the
+// states this machine takes, the wake sources, the inhibitors present and a watchdog's cap - the scheduled wake, and the
+// last sleep.
 //
 // THE ONE SHIPPING HOLDER OF `system-sleep`. ServiceManager serves it; the authority to put the machine to sleep is not
-// the authority to stop it, which is `system-power`'s, and this holds only the first.
+// the authority to stop it, which is `system-power`'s, and this holds only the first. THE SCHEDULED WAKE IS A GRANT OF
+// ITS OWN (`sleep-wake`), since a program that can wake the machine can empty its battery.
 //
 // A SUSPEND IS ANSWERED AT ACCEPTANCE, never at the resume: the transaction freezes the applications - this tool among
 // them - before it sleeps, so what this prints first is whether ServiceManager took the request. It then asks for the
@@ -17,14 +20,14 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use process_client::SleepClient;
-use proto::system::{LaunchContext, SleepOutcome, SleepReason, SleepRecord, SleepState, SleepStep, WakeReason};
+use proto::system::{LaunchContext, SleepOutcome, SleepReason, SleepRecord, SleepState, SleepStatus, SleepStep, WakeReason};
 use rt::*;
 use tools::{parse_u64, split_args};
 
 // How often the record is asked for while a sleep's transaction runs.
 const POLL_TICKS: u64 = TICKS_PER_SECOND / 10;
 
-const USAGE: &[u8] = b"usage: sleepctl [last | suspend [idle|ram] [SECONDS] | hibernate | inhibit SECONDS REASON]\n";
+const USAGE: &[u8] = b"usage: sleepctl [last | status | suspend [idle|ram] [SECONDS] | hibernate [hybrid] | inhibit SECONDS REASON | wake-at SECONDS | wake-cancel]\n";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -39,14 +42,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		print(b"sleepctl: the system-sleep authority was not granted\n");
 		exit();
 	}
+	// The scheduled wake's own connection, where the grant carries one.
+	let wake_chan = recv_tagged(bootstrap, &mut buf, b"SLEEPWAKE").unwrap_or(0);
 	let mut sleep = SleepClient::new(chan);
 	let args: Vec<&[u8]> = split_args(context.arguments.as_bytes()).collect();
 	match args.as_slice() {
 		[] | [b"last"] => last(&mut sleep),
+		[b"status"] => status(&mut sleep),
+		[b"wake-at", seconds] => schedule(wake_chan, clock_rtc().saturating_add(parse_u64(seconds).unwrap_or_else(|| usage()))),
+		[b"wake-cancel"] => schedule(wake_chan, 0),
 		[b"suspend"] => suspend(&mut sleep, SleepState::Idle, 0),
 		[b"suspend", state] => suspend(&mut sleep, state_of(state), 0),
 		[b"suspend", state, seconds] => suspend(&mut sleep, state_of(state), parse_u64(seconds).unwrap_or_else(|| usage()).saturating_mul(1000)),
-		[b"hibernate"] => hibernate(&mut sleep),
+		[b"hibernate"] => hibernate(&mut sleep, false),
+		[b"hibernate", b"hybrid"] => hibernate(&mut sleep, true),
 		[b"inhibit", seconds, reason @ ..] if !reason.is_empty() => {
 			let seconds = parse_u64(seconds).unwrap_or_else(|| usage());
 			let reason: Vec<String> = reason.iter().map(|word| String::from_utf8_lossy(word).into_owned()).collect();
@@ -91,10 +100,11 @@ fn suspend(sleep: &mut SleepClient, state: SleepState, timed_wake_ms: u64) {
 	wait_for_the_end(sleep);
 }
 
-fn hibernate(sleep: &mut SleepClient) {
-	match sleep.hibernate(&SleepReason::Requested) {
+// HIBERNATE: the image written and the machine off - or, `hybrid`, the image kept through a suspend to RAM.
+fn hibernate(sleep: &mut SleepClient, hybrid: bool) {
+	match sleep.hibernate(&hybrid, &SleepReason::Requested) {
 		Some(Ok(())) => {
-			say("sleepctl: hibernation accepted");
+			say(if hybrid { "sleepctl: hybrid sleep accepted" } else { "sleepctl: hibernation accepted" });
 			wait_for_the_end(sleep);
 		}
 		Some(Err(error)) => say(&format!("sleepctl: hibernation was refused - {error:?}")),
@@ -146,6 +156,56 @@ fn last(sleep: &mut SleepClient) {
 	}
 }
 
+// THE STATUS: what this machine's entry takes, what can wake it, who delays an idle sleep, a watchdog's cap and the
+// scheduled wake.
+fn status(sleep: &mut SleepClient) {
+	let Some(Ok(status)) = sleep.status() else {
+		say("sleepctl: the sleep's status could not be read");
+		return;
+	};
+	print_status(&status);
+}
+
+fn print_status(status: &SleepStatus) {
+	let mut offered: Vec<&str> = Vec::new();
+	for (taken, name) in [(status.idle, "suspend to idle"), (status.ram, "suspend to RAM"), (status.disk, "hibernation")] {
+		if taken {
+			offered.push(name);
+		}
+	}
+	say(&format!("states: {}", if offered.is_empty() { String::from("none") } else { offered.join(", ") }));
+	say(&if status.hibernation_set_up { String::from("hibernation: set up") } else { format!("hibernation: not set up - {}", status.hibernation_why) });
+	say(&format!("the image found at this boot: {}", status.last_image));
+	say("wake sources:");
+	for source in &status.wake_sources {
+		say(&format!("  {} - {} ({})", source.name, if source.armed { "armed" } else { "not armed" }, source.detail));
+	}
+	if status.inhibitors.is_empty() {
+		say("inhibitors: none");
+	} else {
+		say("inhibitors:");
+		for inhibitor in &status.inhibitors {
+			say(&format!("  {} - {} s left", inhibitor.reason, inhibitor.remaining_ms.div_ceil(1000)));
+		}
+	}
+	say(&if status.watchdog_cap_ms != 0 { format!("watchdog cap: the last sleep was held to {} ms", status.watchdog_cap_ms) } else { String::from("watchdog cap: none on the last sleep") });
+	say(&if status.scheduled_wake != 0 { format!("scheduled wake: at {} (Unix seconds)", status.scheduled_wake) } else { String::from("scheduled wake: none") });
+}
+
+// THE SCHEDULED WAKE, on the connection the `sleep-wake` grant carries; zero cancels it.
+fn schedule(wake_chan: u64, unix_seconds: u64) {
+	if wake_chan == 0 {
+		say("sleepctl: the sleep-wake authority was not granted");
+		return;
+	}
+	match SleepClient::new(wake_chan).schedule_wake(&unix_seconds) {
+		Some(Ok(())) if unix_seconds == 0 => say("sleepctl: the scheduled wake is cancelled"),
+		Some(Ok(())) => say(&format!("sleepctl: a wake is scheduled at {unix_seconds} (Unix seconds)")),
+		Some(Err(error)) => say(&format!("sleepctl: the scheduled wake was refused - {error:?}")),
+		None => say("sleepctl: ServiceManager did not answer"),
+	}
+}
+
 fn state_name(state: SleepState) -> &'static str {
 	match state {
 		SleepState::Idle => "suspend to idle",
@@ -163,6 +223,7 @@ fn step_name(step: SleepStep) -> &'static str {
 		SleepStep::Drivers => "the drivers",
 		SleepStep::Platform => "the platform",
 		SleepStep::Enter => "the entry",
+		SleepStep::Image => "hibernation's image",
 	}
 }
 
@@ -175,6 +236,8 @@ fn wake_name(wake: WakeReason) -> &'static str {
 		WakeReason::Device => "a device",
 		WakeReason::Rtc => "the RTC alarm",
 		WakeReason::Platform => "the platform",
+		WakeReason::Snapshot => "hibernation's snapshot",
+		WakeReason::Restored => "the restore of a hibernation image",
 	}
 }
 

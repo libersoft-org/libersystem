@@ -190,6 +190,19 @@ interface system-power {
 	@op(1) reboot: func() -> result<unit, error>;
 	/// Power the machine off. Returns only if the request was refused.
 	@op(2) power-off: func() -> result<unit, error>;
+	/// A FORCED POWER-OFF DEADLINE, `seconds` from now: the kernel keeps the earliest one armed, never moves it later
+	/// and never cancels it, and powers the machine off when it passes whatever the processes are doing. While one is
+	/// armed every reset the kernel would make powers the machine off instead, and the sleep entry is refused. Armed
+	/// before an orderly power-off whose end must not depend on the services it stops.
+	@op(3) power-off-within: func(seconds: u32) -> result<unit, error>;
+}
+
+/// THE ORDERLY POWER-OFF, AND NOTHING ELSE: ServiceManager's sequence - every service stopped in reverse dependency order,
+/// LogService's last batch flushed, then `system-power` - reached through this narrow interface rather than the shell's
+/// admin channel, which can stop any service. Served by ServiceManager. A request while the sequence runs is answered as
+/// already under way; one while a sleep's transaction runs ends the transaction at its next step, as the admin door does.
+interface system-shutdown {
+	@op(1) power-off: func() -> result<unit, error>;
 }
 
 /// What an orderly shutdown is about to do.
@@ -235,6 +248,8 @@ enum sleep-step {
 	platform = 5,
 	/// The kernel's entry.
 	enter    = 6,
+	/// Hibernation's image: its bindings resumed, the image written or discarded.
+	image    = 7,
 }
 
 /// WHO ASKED FOR A SLEEP: an inhibitor delays an IDLE sleep by its bounded amount, and nothing else.
@@ -276,6 +291,10 @@ enum wake-reason {
 	rtc          = 5,
 	/// The platform woke it and said nothing more (QEMU's `system_wakeup`).
 	platform     = 6,
+	/// HIBERNATION'S SNAPSHOT IS TAKEN: the machine did not sleep - its image is to be written.
+	snapshot     = 7,
+	/// RESTORED FROM A HIBERNATION IMAGE by a fresh boot.
+	restored     = 8,
 }
 
 /// One core's wakeups while it was parked in a suspend to idle, by cause.
@@ -307,6 +326,39 @@ record sleep-record {
 	@bound(64) cores: list<core-park>,
 }
 
+/// One source that can wake the machine, and whether it is armed.
+record wake-source {
+	/// `power button`, `sleep button`, `timed wake`, `scheduled wake`, or a device's companion node.
+	name:   string,
+	armed:  bool,
+	detail: string,
+}
+
+/// One inhibition of an idle sleep, and how long it has left.
+record sleep-inhibitor {
+	reason:       string,
+	remaining-ms: u64,
+}
+
+/// WHAT `sleepctl` SHOWS BESIDE THE LAST SLEEP: the states this machine's entry takes, the wake sources, the inhibitors
+/// present, the cap a watchdog put on the last sleep and the scheduled wake.
+record sleep-status {
+	idle: bool,
+	ram:  bool,
+	disk: bool,
+	@bound(32) wake-sources: list<wake-source>,
+	@bound(16) inhibitors:   list<sleep-inhibitor>,
+	/// The latest a watchdog let the last sleep last, in milliseconds from its entry; zero for no cap.
+	watchdog-cap-ms: u64,
+	/// The scheduled wake, as seconds since the Unix epoch; zero for none.
+	scheduled-wake:  u64,
+	/// HIBERNATION ON THIS MACHINE, as the image component says: set up, or why not; and what became of the image found
+	/// at this boot - "none", or why it was refused. Not set up, with the reason, where the component does not run.
+	hibernation-set-up: bool,
+	hibernation-why:    string,
+	last-image:         string,
+}
+
 /// THE AUTHORITY TO PUT THE MACHINE TO SLEEP - beside `system-power` and not inside it, because a client of that
 /// interface can stop the machine and nothing else. Served by ServiceManager; clients reach it through manifest
 /// roles and PermissionManager grants.
@@ -317,14 +369,23 @@ record sleep-record {
 interface system-sleep {
 	/// Suspend to idle or to RAM, with a timed wake `timed-wake-ms` from now, or none for zero.
 	@op(1) suspend:    func(state: sleep-state, timed-wake-ms: u64, reason: sleep-reason) -> result<unit, error>;
-	/// Hibernate: refused until the machine is set up for it.
-	@op(2) hibernate:  func(reason: sleep-reason) -> result<unit, error>;
+	/// HIBERNATE: the image written to the hibernation partition, then the machine off - or, `hybrid`, suspended to RAM
+	/// with the image kept, so a battery that dies in the night loses nothing, and the image invalidated when the S3
+	/// resumes. `unsupported` where the machine is not set up for it: no hibernation partition as large as memory, or no
+	/// TPM to seal its key.
+	@op(2) hibernate:  func(hybrid: bool, reason: sleep-reason) -> result<unit, error>;
 	/// Delay an IDLE sleep by at most `milliseconds` - a download, a call. Nothing delays a lid, sleep-button or
 	/// critical-battery sleep past its bound.
 	@op(3) inhibit:    func(milliseconds: u32, reason: string) -> result<unit, error>;
 	/// End this client's inhibition early.
 	@op(4) release:    func() -> result<unit, error>;
 	@op(5) last-sleep: func() -> result<sleep-record, error>;
+	@op(6) status:     func() -> result<sleep-status, error>;
+	/// A SCHEDULED WAKE - "wake the machine at 03:00" - for a connection minted with the `sleep-wake` grant alone: the
+	/// next sleep's timed wake, a wall-clock alarm, as seconds since the Unix epoch; zero cancels it. It is spent by the
+	/// sleep it wakes, and one whose time passed while the machine slept is spent once, not once per missed period. A
+	/// suspend to RAM refuses a scheduled wake further than its alarm reaches.
+	@op(7) schedule-wake: func(unix-seconds: u64) -> result<unit, error>;
 }
 
 /// THE SLEEP NOTICE, on the control channel ServiceManager holds for every service whose manifest entry declares
@@ -366,6 +427,15 @@ interface device-sleep {
 	/// Every suspended binding resumed; the answer names the devices that did not come back, which are being torn
 	/// down and rebound.
 	@op(22) resume:  func(state: sleep-state) -> result<list<string>, error>;
+	/// HIBERNATION, AFTER ITS SNAPSHOT: the bindings the image is written through resumed - every one publishing a
+	/// `block` or a `tpm` provider - and nothing else; the answer names them. The resume that follows resumes the rest.
+	@op(23) resume-for-image: func() -> result<list<string>, error>;
+	/// HYBRID SLEEP, ONCE THE IMAGE IS WRITTEN: the bindings `resume-for-image` resumed suspended again, for the suspend
+	/// to RAM that follows.
+	@op(26) suspend-image:    func() -> result<unit, error>;
+	/// A RESTORE'S LAST STEP BEFORE MEMORY IS REPLACED: every binding of this boot stopped, its device quiet; answered
+	/// once they are, naming any that did not stop within its bound.
+	@op(27) stop-all:         func() -> result<list<string>, error>;
 }
 
 /// THE PLATFORM'S STEP, served by the ACPI service on the control channel ServiceManager holds for it: `prepare`
@@ -396,4 +466,37 @@ record woke {
 /// requires - by ServiceManager over the channel they already share. It answers when the machine is awake again.
 interface sleep-entry {
 	@op(28) enter: func(state: sleep-state, timed-wake-ms: u64) -> result<woke, error>;
+	/// THE MACHINE OFF WITH ITS IMAGE WRITTEN: `\_S4` where the firmware offers it, soft-off otherwise. Answers only
+	/// when it did not happen.
+	@op(29) off-hibernated: func() -> result<unit, error>;
+}
+
+/// WHAT THE IMAGE COMPONENT SAYS OF THE MACHINE: whether hibernation is set up here, and why not; and what became of
+/// the image it last found at a boot.
+record hibernation-status {
+	set-up:          bool,
+	why:             string,
+	partition-bytes: u64,
+	memory-bytes:    u64,
+	/// "none", "restored", or why an image found at boot was refused.
+	last-image:      string,
+}
+
+/// THE IMAGE COMPONENT'S STEP, served by it on the control channel ServiceManager holds for it: `status` before a
+/// hibernation is accepted, `write-image` once the snapshot is taken - the snapshot the kernel holds sealed, encrypted
+/// and written, and given back - and `discard-image` when a hybrid sleep's S3 resumed and the image must not be.
+interface hibernation-image {
+	@op(30) status:        func() -> result<hibernation-status, error>;
+	@op(31) write-image:   func() -> result<unit, error>;
+	@op(34) discard-image: func() -> result<unit, error>;
+}
+
+/// A RESTORE'S DOOR, served by ServiceManager to the image component through a manifest client role: once every page of
+/// an image is written into the kernel and its header invalidated, `replace` stops every binding of the fresh boot and
+/// answers - and the component then replaces memory.
+interface hibernation-restore {
+	@op(1) prepare-replacement: func() -> result<unit, error>;
+	/// NO IMAGE IS RESTORED - none was found, or it was refused, or its restore could not happen: the boot goes on, and
+	/// what waited for the image's verdict (LogService's journal on the system volume) is let go.
+	@op(2) boot-continues:      func() -> result<unit, error>;
 }

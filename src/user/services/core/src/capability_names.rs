@@ -48,3 +48,5 @@ pub const CAP_TYPEC_CONTROL: &[u8] = b"TYPECCONTROL";
 // SERVICEMANAGER'S SLEEP AUTHORITY: every `system-sleep` grant is a fresh connection it mints itself - it serves the
 // interface, so no service's root stands behind the name.
 pub const CAP_SLEEP: &[u8] = b"SLEEP";
+// AND ITS SCHEDULED WAKE, a grant of its own: a `system-sleep` connection minted with it may schedule a wake.
+pub const CAP_SLEEP_WAKE: &[u8] = b"SLEEPWAKE";

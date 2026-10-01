@@ -23,6 +23,9 @@ abi = { path = "../../../abi" }
 base-proto = { path = "../../libs/protocol/base-proto" }
 # The dynamic-loader bounds the module graph is checked against.
 bootproto = { path = "../../../boot/protocol" }
+# The hibernation partition's type and the bytes that say it holds an image - one definition, the one the system
+# volume's service reads at mount.
+partition = { path = "../../../fs/partition" }
 # The component world's outcome types, so the classification answers in the vocabulary the guest is
 # actually told rather than in a private one both hosts would then have to translate.
 wasm = { path = "../../../wasm" }

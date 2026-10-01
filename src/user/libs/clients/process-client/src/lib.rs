@@ -4,7 +4,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use process_proto::generated::liber::process::v1::{ProcessInfo, SleepReason, SleepRecord, SleepState, StartResult};
+use process_proto::generated::liber::process::v1::{ProcessInfo, SleepReason, SleepRecord, SleepState, SleepStatus, StartResult};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_process_process_start"]
@@ -18,13 +18,17 @@ unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_process_system_sleep_suspend"]
 	fn sleep_suspend(chan: u64, state: &SleepState, timed_wake_ms: &u64, reason: &SleepReason) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_process_system_sleep_hibernate"]
-	fn sleep_hibernate(chan: u64, reason: &SleepReason) -> Option<Result<(), Error>>;
+	fn sleep_hibernate(chan: u64, hybrid: &bool, reason: &SleepReason) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_process_system_sleep_inhibit"]
 	fn sleep_inhibit(chan: u64, milliseconds: &u32, reason: &str) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_process_system_sleep_release"]
 	fn sleep_release(chan: u64) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_process_system_sleep_last_sleep"]
 	fn sleep_last(chan: u64) -> Option<Result<SleepRecord, Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_status"]
+	fn sleep_status(chan: u64) -> Option<Result<SleepStatus, Error>>;
+	#[link_name = "liber_channel_liber_process_system_sleep_schedule_wake"]
+	fn sleep_schedule_wake(chan: u64, unix_seconds: &u64) -> Option<Result<(), Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -80,8 +84,8 @@ impl SleepClient {
 	}
 
 	#[inline(always)]
-	pub fn hibernate(&mut self, reason: &SleepReason) -> Option<Result<(), Error>> {
-		unsafe { sleep_hibernate(self.chan, reason) }
+	pub fn hibernate(&mut self, hybrid: &bool, reason: &SleepReason) -> Option<Result<(), Error>> {
+		unsafe { sleep_hibernate(self.chan, hybrid, reason) }
 	}
 
 	#[inline(always)]
@@ -97,5 +101,15 @@ impl SleepClient {
 	#[inline(always)]
 	pub fn last_sleep(&mut self) -> Option<Result<SleepRecord, Error>> {
 		unsafe { sleep_last(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn status(&mut self) -> Option<Result<SleepStatus, Error>> {
+		unsafe { sleep_status(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn schedule_wake(&mut self, unix_seconds: &u64) -> Option<Result<(), Error>> {
+		unsafe { sleep_schedule_wake(self.chan, unix_seconds) }
 	}
 }

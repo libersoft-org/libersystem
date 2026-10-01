@@ -2524,6 +2524,70 @@ pub fn clock_boot_ns() -> u64 {
 	unsafe { syscall(SYS_CLOCK_BOOT_NS, 0, 0, 0, 0) }
 }
 
+// THE WALL CLOCK HANDED TO THE KERNEL, for a machine whose kernel reads no RTC of its own: `privilege` is the
+// ClockSource one DeviceManager hands the clock's driver. Zero, or a negative error.
+pub fn clock_base(privilege: u64, unix_seconds: u64) -> i64 {
+	unsafe { syscall(SYS_CLOCK_BASE, privilege, unix_seconds, 0, 0) as i64 }
+}
+
+// WHAT THIS MACHINE'S SLEEP ENTRY WOULD TAKE: `1 << SLEEP_STATE_x` per state, and the fixed-button bits.
+pub fn sleep_states() -> u64 {
+	unsafe { syscall(SYS_SLEEP_STATES, 0, 0, 0, 0) }
+}
+
+// MARK THE INTERRUPT THIS DRIVER HOLDS AS A WAKE SOURCE, or unmark it: a suspend to idle leaves it live, and it wakes the
+// machine. Done in a `SUSPEND` step asked to arm wake, undone at the resume. Zero, or a negative error.
+pub fn interrupt_wake(interrupt: u64, on: bool) -> i64 {
+	unsafe { syscall(SYS_INTERRUPT_WAKE, interrupt, u64::from(on), 0, 0) as i64 }
+}
+
+// ------------------------------------------------------------------ hibernation - see `abi::SYS_SNAPSHOT_INFO`
+
+// THE SNAPSHOT HELD, described. Zero, or a negative error (`ERR_INVALID` when none is held).
+pub fn snapshot_info(privilege: u64, info: &mut SnapshotInfo) -> i64 {
+	unsafe { syscall(SYS_SNAPSHOT_INFO, privilege, info as *mut SnapshotInfo as u64, 0, 0) as i64 }
+}
+
+// PAGES [first, first + count) OF THE SNAPSHOT into `buffer`: `count` physical addresses, then `count` pages. `buffer`
+// holds at least `count * (8 + 4096)` bytes. Zero, or a negative error.
+pub fn snapshot_read(privilege: u64, first: u64, count: u64, buffer: &mut [u8]) -> i64 {
+	if (buffer.len() as u64) < count.saturating_mul(8 + 4096) {
+		return ERR_INVALID;
+	}
+	unsafe { syscall(SYS_SNAPSHOT_READ, privilege, first, count, buffer.as_mut_ptr() as u64) as i64 }
+}
+
+// THE SNAPSHOT'S COPIES GIVEN BACK: 1 when one was held, 0 when none was.
+pub fn snapshot_release(privilege: u64) -> i64 {
+	unsafe { syscall(SYS_SNAPSHOT_RELEASE, privilege, 0, 0, 0) as i64 }
+}
+
+// A RESTORE BEGUN: the image's pages go to `frames`, and the kernel resumes with `context`. Zero, or a negative error.
+pub fn restore_begin(privilege: u64, frames: &[u64], context: &[u8; SNAPSHOT_CONTEXT]) -> i64 {
+	unsafe { syscall(SYS_RESTORE_BEGIN, privilege, frames.as_ptr() as u64, frames.len() as u64, context.as_ptr() as u64) as i64 }
+}
+
+// PAGES [first, first + pages.len() / 4096) OF A RESTORE written. Zero, or a negative error.
+pub fn restore_write(privilege: u64, first: u64, pages: &[u8]) -> i64 {
+	if pages.is_empty() || pages.len() % 4096 != 0 {
+		return ERR_INVALID;
+	}
+	unsafe { syscall(SYS_RESTORE_WRITE, privilege, first, (pages.len() / 4096) as u64, pages.as_ptr() as u64) as i64 }
+}
+
+// THE WHOLE-MEMORY REPLACEMENT: never returns when it happens - a negative error when it cannot. With `abandon`, the
+// restore dropped instead: 1 when one was held.
+pub fn restore_commit(privilege: u64, abandon: bool) -> i64 {
+	unsafe { syscall(SYS_RESTORE_COMMIT, privilege, u64::from(abandon), 0, 0) as i64 }
+}
+
+// THE DIGESTS AN IMAGE IS CHECKED AGAINST: this system image's and this hardware's.
+pub fn system_fingerprint() -> Option<SystemFingerprint> {
+	let mut fingerprint = SystemFingerprint::default();
+	let answer = unsafe { syscall(SYS_SYSTEM_FINGERPRINT, &mut fingerprint as *mut SystemFingerprint as u64, 0, 0, 0) as i64 };
+	(answer == 0).then_some(fingerprint)
+}
+
 // Fill `bytes` with kernel-provided randomness, returning how many bytes were written. Used
 // where a value has to differ per boot and not be guessable - a handshake that proves which
 // boot answered it, rather than one any earlier transcript could replay.

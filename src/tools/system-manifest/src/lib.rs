@@ -225,6 +225,8 @@ pub enum ProviderKindName {
 	Ipmi,
 	/// Every Type-C connector of one binding, with TypeCService its one consumer.
 	TypecConnector,
+	/// A lid's state and its changes, with the power-state service its one consumer.
+	PlatformSwitch,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -278,6 +280,7 @@ impl ProviderKindName {
 			ProviderKindName::Watchdog => 25,
 			ProviderKindName::Ipmi => 26,
 			ProviderKindName::TypecConnector => 27,
+			ProviderKindName::PlatformSwitch => 28,
 		}
 	}
 }

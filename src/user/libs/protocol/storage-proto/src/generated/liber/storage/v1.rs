@@ -3626,6 +3626,606 @@ pub mod writer {
 /// Privileged StorageService boundary that mints a client restricted to one directory
 /// below a system volume. The returned channel preserves normal `volume` operations,
 /// but rejects paths outside the granted directory and cannot mint a broader client.
+/// THE HIBERNATION AREA, as StorageService sees it on the disk its system volume is on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HibernationAreaInfo {
+	/// Whether that disk has a partition of the LiberSystem hibernation type.
+	pub present: bool,
+	/// Its size, in bytes.
+	pub bytes: u64,
+	/// Whether an image header was there when the volume was mounted - and so whether every write is held until the
+	/// image component's verdict.
+	pub image_at_mount: bool,
+}
+
+impl HibernationAreaInfo {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HibernationAreaInfo> {
+		let mut r = Reader::new(bytes);
+		let value = HibernationAreaInfo::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HibernationAreaInfo> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HibernationAreaInfo::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.boolean(self.present)?;
+		w.u64(self.bytes)?;
+		w.boolean(self.image_at_mount)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<HibernationAreaInfo> {
+		let present = r.boolean()?;
+		let bytes = r.u64()?;
+		let image_at_mount = r.boolean()?;
+		Some(HibernationAreaInfo { present, bytes, image_at_mount })
+	}
+}
+
+/// THE HIBERNATION AREA - the GPT partition of the LiberSystem hibernation type on the disk the system volume is on -
+/// served by the system volume's StorageService to the image component alone, through a manifest role. No filesystem is
+/// on it: the component writes an image there and reads one back, in whole sectors, as memory objects.
+///
+/// NOTHING ON THE SYSTEM VOLUME IS WRITTEN UNTIL AN IMAGE FOUND AT MOUNT HAS ITS VERDICT: every write is held, as the
+/// sleep holds them, and `verdict(false)` - no image, or one refused - lets them go; a restore replaces memory before they
+/// ever could.
+// interface `hibernation-area` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod hibernation_area {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_DESCRIBE: u16 = 1;
+	pub const OP_READ: u16 = 2;
+	pub const OP_WRITE: u16 = 3;
+	pub const OP_FLUSH: u16 = 4;
+	pub const OP_VERDICT: u16 = 5;
+
+	pub trait Service {
+		fn describe(&mut self) -> Result<HibernationAreaInfo, Error>;
+		/// Bytes [offset, offset + length) of the area, at most a megabyte and a sector, whole sectors.
+		fn read(&mut self, offset: u64, length: u32) -> Result<crate::codec::Buffer, Error>;
+		/// The first `length` bytes of `data` written at `offset`, whole sectors, at most a megabyte and a sector.
+		fn write(&mut self, offset: u64, data: crate::codec::Buffer, length: u32) -> Result<(), Error>;
+		fn flush(&mut self) -> Result<(), Error>;
+		fn verdict(&mut self, restoring: bool) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:storage")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_DESCRIBE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.describe();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v71) => {
+							w.u8(1)?;
+							v71.write(w)?;
+						}
+						Err(v72) => {
+							w.u8(0)?;
+							v72.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_READ => {
+				let offset = r.u64()?;
+				let length = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.read(offset, length);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v73) => {
+							w.u8(1)?;
+							w.set_handle(v73.handle)?;
+							w.u64(v73.len)?;
+						}
+						Err(v74) => {
+							w.u8(0)?;
+							v74.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_WRITE => {
+				let offset = r.u64()?;
+				let data = {
+					let len = r.u64()?;
+					let handle = r.take_handle()?;
+					crate::codec::Buffer { handle, len }
+				};
+				let length = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.write(offset, data, length);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v75) => {
+							w.u8(1)?;
+						}
+						Err(v76) => {
+							w.u8(0)?;
+							v76.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_FLUSH => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.flush();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v77) => {
+							w.u8(1)?;
+						}
+						Err(v78) => {
+							w.u8(0)?;
+							v78.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_VERDICT => {
+				let restoring = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.verdict(restoring);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v79) => {
+							w.u8(1)?;
+						}
+						Err(v80) => {
+							w.u8(0)?;
+							v80.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn describe(&mut self) -> Option<Result<HibernationAreaInfo, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DESCRIBE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(HibernationAreaInfo::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn read(&mut self, offset: &u64, length: &u32) -> Option<Result<crate::codec::Buffer, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_READ)?;
+			w.u32(corr)?;
+			w.u64(*offset)?;
+			w.u32(*length)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let len = r.u64()?;
+						let handle = r.take_handle()?;
+						crate::codec::Buffer { handle, len }
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn write(&mut self, offset: &u64, data: &crate::codec::Buffer, length: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WRITE)?;
+			w.u32(corr)?;
+			w.u64(*offset)?;
+			w.set_handle(data.handle)?;
+			w.u64(data.len)?;
+			w.u32(*length)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn flush(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_FLUSH)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn verdict(&mut self, restoring: &bool) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_VERDICT)?;
+			w.u32(corr)?;
+			w.boolean(*restoring)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_hibernation_area_describe")]
+	fn channel_invoke_describe(chan: u64) -> Option<Result<HibernationAreaInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.describe()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_hibernation_area_read")]
+	fn channel_invoke_read(chan: u64, offset: &u64, length: &u32) -> Option<Result<crate::codec::Buffer, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.read(offset, length)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_hibernation_area_write")]
+	fn channel_invoke_write(chan: u64, offset: &u64, data: &crate::codec::Buffer, length: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write(offset, data, length)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_hibernation_area_flush")]
+	fn channel_invoke_flush(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.flush()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_hibernation_area_verdict")]
+	fn channel_invoke_verdict(chan: u64, restoring: &bool) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.verdict(restoring)
+	}
+}
+
 // interface `volume-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod volume_admin {
 	use super::*;
@@ -3688,14 +4288,14 @@ pub mod volume_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v71) => {
+						Ok(v81) => {
 							w.u8(1)?;
-							w.set_handle(*v71)?;
+							w.set_handle(*v81)?;
 							w.u32(0)?;
 						}
-						Err(v72) => {
+						Err(v82) => {
 							w.u8(0)?;
-							v72.write(w)?;
+							v82.write(w)?;
 						}
 					}
 					Some(())
@@ -3727,14 +4327,14 @@ pub mod volume_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v73) => {
+						Ok(v83) => {
 							w.u8(1)?;
-							w.set_handle(*v73)?;
+							w.set_handle(*v83)?;
 							w.u32(0)?;
 						}
-						Err(v74) => {
+						Err(v84) => {
 							w.u8(0)?;
-							v74.write(w)?;
+							v84.write(w)?;
 						}
 					}
 					Some(())
@@ -4437,13 +5037,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"damaged\":");
 		out.push('[');
-		let mut v76 = true;
-		for v75 in self.damaged.iter() {
-			if !v76 {
+		let mut v86 = true;
+		for v85 in self.damaged.iter() {
+			if !v86 {
 				out.push(',');
 			}
-			v76 = false;
-			crate::codec::json_escape(v75, out);
+			v86 = false;
+			crate::codec::json_escape(v85, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -4458,13 +5058,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"faults\":");
 		out.push('[');
-		let mut v78 = true;
-		for v77 in self.faults.iter() {
-			if !v78 {
+		let mut v88 = true;
+		for v87 in self.faults.iter() {
+			if !v88 {
 				out.push(',');
 			}
-			v78 = false;
-			crate::codec::json_escape(v77, out);
+			v88 = false;
+			crate::codec::json_escape(v87, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4476,13 +5076,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("damaged=");
 		out.push('[');
-		let mut v80 = true;
-		for v79 in self.damaged.iter() {
-			if !v80 {
+		let mut v90 = true;
+		for v89 in self.damaged.iter() {
+			if !v90 {
 				out.push_str(", ");
 			}
-			v80 = false;
-			out.push_str(v79);
+			v90 = false;
+			out.push_str(v89);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4497,13 +5097,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("faults=");
 		out.push('[');
-		let mut v82 = true;
-		for v81 in self.faults.iter() {
-			if !v82 {
+		let mut v92 = true;
+		for v91 in self.faults.iter() {
+			if !v92 {
 				out.push_str(", ");
 			}
-			v82 = false;
-			out.push_str(v81);
+			v92 = false;
+			out.push_str(v91);
 		}
 		out.push(']');
 		out.push('}');
@@ -4514,8 +5114,8 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);
 		crate::codec::cbor::text(out, "damaged");
 		crate::codec::cbor::array(out, self.damaged.len());
-		for v83 in self.damaged.iter() {
-			crate::codec::cbor::text(out, v83);
+		for v93 in self.damaged.iter() {
+			crate::codec::cbor::text(out, v93);
 		}
 		crate::codec::cbor::text(out, "structural-failures");
 		crate::codec::cbor::uint(out, self.structural_failures as u64);
@@ -4525,9 +5125,76 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.io_failures as u64);
 		crate::codec::cbor::text(out, "faults");
 		crate::codec::cbor::array(out, self.faults.len());
-		for v84 in self.faults.iter() {
-			crate::codec::cbor::text(out, v84);
+		for v94 in self.faults.iter() {
+			crate::codec::cbor::text(out, v94);
 		}
+	}
+}
+
+impl HibernationAreaInfo {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"present\":");
+		if self.present {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"bytes\":");
+		let _ = write!(out, "{}", self.bytes);
+		out.push(',');
+		out.push_str("\"image-at-mount\":");
+		if self.image_at_mount {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("present=");
+		if self.present {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("bytes=");
+		let _ = write!(out, "{}", self.bytes);
+		out.push_str(", ");
+		out.push_str("image-at-mount=");
+		if self.image_at_mount {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "present");
+		crate::codec::cbor::boolean(out, self.present);
+		crate::codec::cbor::text(out, "bytes");
+		crate::codec::cbor::uint(out, self.bytes as u64);
+		crate::codec::cbor::text(out, "image-at-mount");
+		crate::codec::cbor::boolean(out, self.image_at_mount);
 	}
 }
 

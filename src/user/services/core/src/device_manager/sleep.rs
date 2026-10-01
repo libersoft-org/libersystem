@@ -14,6 +14,13 @@
 // bindings in bind order, every `watchdog` publisher FIRST; a device that did not come back is torn down and bound
 // again through the route a crash takes, once the step has ended - while any binding is suspended nothing is bound,
 // since a bind reads the volume and the volume's own driver may be one of them.
+//
+// HIBERNATION, once its snapshot is taken: `resume-for-image` resumes the bindings the image is written through - every
+// suspended one that publishes a `block` or a `tpm` provider - with no power lost, since nothing slept, and names those
+// that came back (one that did not is bound again after the sleep, as any);
+// `suspend-image` suspends them again for a hybrid sleep's S3. Either is answered once its bindings have, and the
+// resume that ends the sleep resumes whatever is still suspended. `stop-all`, a restore's last step before memory is
+// replaced, stops every binding as a shutdown does.
 
 use super::*;
 use alloc::string::String;
@@ -45,6 +52,9 @@ enum Phase {
 	Held,
 	// Asking each suspended binding to resume.
 	Resuming,
+	// Hibernation's: resuming the bindings the image is written through, and suspending them again.
+	ImageResuming,
+	ImageSuspending,
 }
 
 #[derive(Clone, Copy)]
@@ -73,6 +83,10 @@ pub(super) struct SleepRun {
 	// A `resume` that came while the bindings were still being suspended - ServiceManager gave up waiting on the step -
 	// by its correlation: taken as soon as the suspend is over.
 	resume_owed: Option<u32>,
+	// The bindings resumed for the image, and the one that failed it, with why.
+	image: Vec<usize>,
+	image_labels: Vec<String>,
+	image_failed: Option<(String, String)>,
 }
 
 impl SleepRun {
@@ -85,7 +99,24 @@ impl SleepRun {
 // Whether a control-channel message is one of this interface's requests rather than one of the supervisor's tagged
 // hand-offs, every one of which begins with an ASCII tag - two letters, far past these opcodes.
 pub(super) fn is_request(message: &[u8]) -> bool {
-	message.len() >= 6 && matches!(u16::from_le_bytes([message[0], message[1]]), device_sleep::OP_CHECK | device_sleep::OP_SUSPEND | device_sleep::OP_RESUME)
+	message.len() >= 6 && matches!(u16::from_le_bytes([message[0], message[1]]), device_sleep::OP_CHECK | device_sleep::OP_SUSPEND | device_sleep::OP_RESUME | device_sleep::OP_RESUME_FOR_IMAGE | device_sleep::OP_SUSPEND_IMAGE)
+}
+
+// Whether a control-channel message is a restore's `stop-all`, which the standing loop answers itself - it is a
+// shutdown's teardown.
+pub(super) fn is_stop_all(message: &[u8]) -> Option<u32> {
+	(message.len() >= 6 && u16::from_le_bytes([message[0], message[1]]) == device_sleep::OP_STOP_ALL).then(|| u32::from_le_bytes([message[2], message[3], message[4], message[5]]))
+}
+
+// `stop-all`'s answer: the bindings still bound once the teardown ran.
+pub(super) fn answer_stopped(correlation: u32, nodes: &[Node]) -> Option<Vec<u8>> {
+	let left: Vec<String> = nodes.iter().filter(|node| node.binding.is_some()).map(label).collect();
+	reply(correlation, |w| write_list(w, &left))
+}
+
+// Whether the node's binding publishes what the image is written through: a disk, or the TPM its key is sealed by.
+fn carries_the_image(node: &Node) -> bool {
+	node.entry().is_some_and(|entry| entry.provides.iter().any(|&(kind, _, _)| kind == driver_protocol::provider::BLOCK || kind == driver_protocol::provider::TPM))
 }
 
 // THE BINDING, NAMED FOR A PERSON: its driver and its device.
@@ -176,14 +207,14 @@ pub(super) fn request(run: &mut Option<SleepRun>, nodes: &mut [Node], message: &
 				say_line(&[b"the sleep cannot suspend ", who.as_bytes(), b" - ", why.as_bytes()]);
 				return answer_suspended(correlation, &DriversSuspended { failed: who, why, wake_nodes: Vec::new(), awake_by_ms: 0 });
 			}
-			let depth = dependency_depths(nodes);
-			let mut queue: Vec<usize> = (0..nodes.len()).filter(|&at| nodes[at].binding.is_some() && nodes[at].record.state == BindingState::Online).collect();
-			// REVERSE BIND ORDER, a consumer before its provider, every `watchdog` publisher last.
-			queue.sort_by_key(|&at| (publishes_watchdog(&nodes[at]), core::cmp::Reverse(depth[at]), core::cmp::Reverse(nodes[at].bind_at), core::cmp::Reverse(at)));
+			let online: Vec<usize> = (0..nodes.len()).filter(|&at| nodes[at].binding.is_some() && nodes[at].record.state == BindingState::Online).collect();
+			// REVERSE BIND ORDER, a consumer before its provider, every `watchdog` publisher last - `sleep_order`'s.
+			let bindings = order_view(nodes, &online);
+			let queue: Vec<usize> = service_logic::sleep_order::suspend_order(&bindings).into_iter().map(|at| online[at]).collect();
 			let mut count = [0u8; 20];
 			let n = decimal(queue.len() as u64, &mut count);
 			say_line(&[b"the sleep's driver step: ", &count[..n], b" binding(s) to suspend, one at a time"]);
-			*run = Some(SleepRun { correlation, state, arm_wake, timed_wake_ms, phase: Phase::Suspending, queue, asking: None, suspended: Vec::new(), wake_nodes: Vec::new(), awake_by: 0, failed: None, not_back: Vec::new(), resume_owed: None });
+			*run = Some(SleepRun { correlation, state, arm_wake, timed_wake_ms, phase: Phase::Suspending, queue, asking: None, suspended: Vec::new(), wake_nodes: Vec::new(), awake_by: 0, failed: None, not_back: Vec::new(), resume_owed: None, image: Vec::new(), image_labels: Vec::new(), image_failed: None });
 			None
 		}
 		device_sleep::OP_RESUME => {
@@ -208,6 +239,38 @@ pub(super) fn request(run: &mut Option<SleepRun>, nodes: &mut [Node], message: &
 				Some(_) => refuse(correlation, Error::Invalid),
 			}
 		}
+		// HIBERNATION'S: the image's bindings back, with no power lost - only while every binding is held suspended.
+		device_sleep::OP_RESUME_FOR_IMAGE => {
+			reader.finish()?;
+			let Some(held) = run.as_mut().filter(|held| held.phase == Phase::Held) else { return refuse(correlation, Error::Invalid) };
+			let image: Vec<usize> = held.suspended.iter().copied().filter(|&at| carries_the_image(&nodes[at])).collect();
+			if image.is_empty() {
+				say_line(&[b"the image has no binding to be written through"]);
+				return reply(correlation, |w| write_list(w, &[]));
+			}
+			held.suspended.retain(|at| !image.contains(at));
+			held.queue = resume_order(nodes, &image);
+			held.image = Vec::new();
+			held.image_labels = Vec::new();
+			held.image_failed = None;
+			held.correlation = correlation;
+			held.phase = Phase::ImageResuming;
+			None
+		}
+		device_sleep::OP_SUSPEND_IMAGE => {
+			reader.finish()?;
+			let Some(held) = run.as_mut().filter(|held| held.phase == Phase::Held) else { return refuse(correlation, Error::Invalid) };
+			if held.image.is_empty() {
+				return reply(correlation, |_| Some(()));
+			}
+			let bindings = order_view(nodes, &held.image);
+			held.queue = service_logic::sleep_order::suspend_order(&bindings).into_iter().map(|at| held.image[at]).collect();
+			held.image = Vec::new();
+			held.image_failed = None;
+			held.correlation = correlation;
+			held.phase = Phase::ImageSuspending;
+			None
+		}
 		_ => None,
 	}
 }
@@ -220,12 +283,18 @@ fn driver_state(state: SleepState) -> Option<driver_protocol::SleepState> {
 	}
 }
 
-// BIND ORDER, every `watchdog` publisher first: providers before their consumers.
+// BIND ORDER, every `watchdog` publisher first: providers before their consumers - `sleep_order`'s.
 fn resume_order(nodes: &[Node], suspended: &[usize]) -> Vec<usize> {
+	let bindings = order_view(nodes, suspended);
+	let all: Vec<usize> = (0..suspended.len()).collect();
+	service_logic::sleep_order::resume_order(&bindings, &all).into_iter().map(|at| suspended[at]).collect()
+}
+
+// THE BINDINGS `at` NAMES, as the order sees them: whether each publishes a `watchdog`, how deep it consumes, when it
+// bound.
+fn order_view(nodes: &[Node], at: &[usize]) -> Vec<service_logic::sleep_order::Binding> {
 	let depth = dependency_depths(nodes);
-	let mut order: Vec<usize> = suspended.to_vec();
-	order.sort_by_key(|&at| (!publishes_watchdog(&nodes[at]), depth[at], nodes[at].bind_at, at));
-	order
+	at.iter().map(|&index| service_logic::sleep_order::Binding { watchdog: publishes_watchdog(&nodes[index]), depth: depth[index] as u32, bind_at: nodes[index].bind_at }).collect()
 }
 
 fn reply(correlation: u32, body: impl FnOnce(&mut wire::VecWriter) -> Option<()>) -> Option<Vec<u8>> {
@@ -311,9 +380,9 @@ fn ask(run: &mut SleepRun, nodes: &mut [Node], at: usize) {
 	let (channel, generation) = (binding.channel, node.id.generation);
 	let mut payload = [0u8; driver_protocol::SUSPEND_PAYLOAD_LEN];
 	let (opcode, len, asked) = match run.phase {
-		Phase::Suspending => (driver_protocol::Opcode::Suspend, driver_protocol::encode_suspend(&driver_protocol::SuspendRequest { state: run.state, arm_wake: run.arm_wake, timed_wake_ms: run.timed_wake_ms }, &mut payload), SleepAsked::Suspend),
-		// AN UNWIND NEVER SLEPT: nothing lost power.
-		Phase::Unwinding => (driver_protocol::Opcode::Resume, driver_protocol::encode_resume(false, &mut payload), SleepAsked::Resume),
+		Phase::Suspending | Phase::ImageSuspending => (driver_protocol::Opcode::Suspend, driver_protocol::encode_suspend(&driver_protocol::SuspendRequest { state: run.state, arm_wake: run.arm_wake, timed_wake_ms: run.timed_wake_ms }, &mut payload), SleepAsked::Suspend),
+		// AN UNWIND NEVER SLEPT, and neither did a snapshot: nothing lost power.
+		Phase::Unwinding | Phase::ImageResuming => (driver_protocol::Opcode::Resume, driver_protocol::encode_resume(false, &mut payload), SleepAsked::Resume),
 		_ => (driver_protocol::Opcode::Resume, driver_protocol::encode_resume(run.state.loses_power(), &mut payload), SleepAsked::Resume),
 	};
 	node.sleep_answer = None;
@@ -346,6 +415,27 @@ fn answered(run: &mut SleepRun, nodes: &mut [Node], at: usize, answer: Option<Sl
 			driver_protocol::SuspendOutcome::Refused(code) => fail(run, who, String::from_utf8_lossy(code.name()).into_owned()),
 		},
 		(Phase::Suspending, _) => fail(run, who, String::from("its driver ended before it answered the suspend")),
+		// HIBERNATION'S: a binding that did not come back for the image is torn down and bound again once the sleep has
+		// ended, as after any sleep - a driver that sets a stopped device up again only by a bind answers so by design -
+		// and the step goes on with the rest: whether the image's own disk came back is what the write finds out. One that
+		// would not suspend again for a hybrid sleep's S3 fails the step that asked it.
+		(Phase::ImageResuming, Some(SleepAnswer::Resumed(true))) => {
+			say_line(&[b"resumed for the image: ", who.as_bytes()]);
+			run.image.push(at);
+			run.image_labels.push(who);
+		}
+		(Phase::ImageResuming, _) => {
+			say_line(&[who.as_bytes(), b" did not come back for the image; it is torn down and bound again once the sleep has ended"]);
+			run.not_back.push(who);
+		}
+		(Phase::ImageSuspending, Some(SleepAnswer::Suspended(suspended))) if matches!(suspended.outcome, driver_protocol::SuspendOutcome::Done | driver_protocol::SuspendOutcome::DoneWakeArmed) => {
+			say_line(&[b"suspended again after the image: ", who.as_bytes()]);
+			run.suspended.push(at);
+		}
+		(Phase::ImageSuspending, _) => {
+			run.image.push(at);
+			run.image_failed = Some((who, String::from("it would not suspend again after the image")));
+		}
 		// THE RESUME'S ANSWERS, the unwind's and the step's alike.
 		(_, Some(SleepAnswer::Resumed(true))) => say_line(&[b"resumed ", who.as_bytes()]),
 		(_, Some(SleepAnswer::Resumed(false))) => {
@@ -370,6 +460,11 @@ fn unanswered(run: &mut SleepRun, nodes: &mut [Node], at: usize) {
 		Phase::Suspending => {
 			run.suspended.push(at);
 			fail(run, who, String::from("it did not answer the suspend within its bound"));
+		}
+		// Half way, perhaps: resumed with the rest at the sleep's end.
+		Phase::ImageSuspending => {
+			run.suspended.push(at);
+			run.image_failed = Some((who, String::from("it did not answer the suspend within its bound")));
 		}
 		_ => {
 			say_line(&[who.as_bytes(), b" did not answer the resume within its bound; it is torn down and bound again"]);
@@ -424,6 +519,18 @@ fn finish(run: &mut SleepRun) -> (Option<Vec<u8>>, bool) {
 		Phase::Resuming => {
 			say_line(&[b"the sleep's resume step is done"]);
 			(answer_resumed(run.correlation, &run.not_back), true)
+		}
+		Phase::ImageResuming | Phase::ImageSuspending => {
+			let resuming = run.phase == Phase::ImageResuming;
+			run.phase = Phase::Held;
+			match run.image_failed.take() {
+				Some((who, why)) => {
+					say_line(&[b"the image's bindings failed at ", who.as_bytes(), b" - ", why.as_bytes()]);
+					(refuse(run.correlation, Error::Io), false)
+				}
+				None if resuming => (answer_resumed(run.correlation, &core::mem::take(&mut run.image_labels)), false),
+				None => (reply(run.correlation, |_| Some(())), false),
+			}
 		}
 		Phase::Held => (None, false),
 	}

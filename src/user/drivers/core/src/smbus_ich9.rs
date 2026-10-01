@@ -85,6 +85,7 @@ mod smbus {
 
 	impl common::SleepStep for Sleep<'_> {
 		fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+			print(b"driver.smbus-ich9: suspended - no register is touched until the resume\n");
 			driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
 		}
 
@@ -95,6 +96,7 @@ mod smbus {
 			}
 			self.controller.outb(HST_STS, STS_CLEAR);
 			self.controller.outb(AUX_STS, AUX_STS_CRCE);
+			print(b"driver.smbus-ich9: resumed - its base decodes, and the status is cleared\n");
 			true
 		}
 

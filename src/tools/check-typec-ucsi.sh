@@ -16,12 +16,16 @@
 #   3. slow: the first reset and the two commands after it each over five seconds - the binding ready inside
 #      DeviceManager's deadline and its connectors published once the slow start is over.
 #   4. spoiling: a PPM that spoils its inbound copy once it has notified - an attach and a detach served as on the others.
+#   5. sleep (S3 offered): a suspend to idle and an S3 cycle, each answered by `ucsi-acpi` - the PPM's command log, stamped
+#      by the host, showing no command from the driver's `SUSPENDED` to the kernel's `sleep: resumed`, and after it the
+#      notifications enabled again and every connector read again; a detach the PPM makes while the guest is in S3
+#      reported after the resume.
 #
 # THE PPM'S COMMAND LOG FAILS EVERY BOOT on a second command while a completion is unacknowledged, a completion left
 # unacknowledged, a write not followed by function 1, function 2 after a notification and before the next command, or
 # a connector change acknowledged other than beside its status.
 #
-# WHAT IT DOES NOT CLAIM: a sleep (carried with the sleep transaction), a vendor UCSI transport, a real laptop's EC.
+# WHAT IT DOES NOT CLAIM: a vendor UCSI transport, a real laptop's EC.
 #
 # IT BOOTS ITS OWN DEVELOPMENT INSTANCES in private state, one at a time, and takes the last one down from the EXIT trap.
 set -euo pipefail
@@ -57,6 +61,7 @@ mkdir -p "$kept"
 label="none"
 backend_pid=""
 ppm_pid=""
+follower=""
 
 keep_log() {
 	cp -f "$state/dev-serial.log" "$kept/serial-$label.log" 2>/dev/null || true
@@ -78,6 +83,7 @@ cleanup() {
 	keep_log
 	./dev.sh down >"$state/down.log" 2>&1 || echo "typec-ucsi: teardown reported a problem (see $kept/down.log)" >&2
 	stop_helpers
+	[[ -z "$follower" ]] || kill "$follower" 2>/dev/null || true
 	cp -f "$state"/*.log "$fixture"/*.log "$kept/" 2>/dev/null || true
 	rm -f .build/boot/*"-dev-$(basename "$state")"* 2>/dev/null || true
 	rm -rf "$state"
@@ -287,4 +293,130 @@ probe await 1 contract 9000
 ppm "detach 1" >/dev/null
 probe await 1 detached
 take_down
-echo "typec-ucsi: PASS - UCSI 1.2 and 2.1 through the _CID match: a charger's offers and contract, its supply beside the ACPI adapter and measured under 2.1, a data-role swap done, a power-role swap refused with the PPM's error, DisplayPort entered under the override and refused without it, a mode the PPM entered itself reported, malformed answers refused and a silent PPM recovered, a slow PPM served past its slow start, a spoiling one served as the others - and no break of the command discipline"
+
+# ------------------------------------------------------------------ 5. a sleep
+
+# ONE QMP COMMAND, events skipped - the run state and the wake.
+qmp() {
+	python3 - "$state/qemu-qmp.sock" "$1" <<'EOF'
+import json, socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.settimeout(10)
+sock.connect(sys.argv[1])
+stream = sock.makefile('rw')
+def answer():
+	while True:
+		line = json.loads(stream.readline())
+		if 'event' not in line:
+			return line
+def command(execute):
+	stream.write(json.dumps({'execute': execute}) + '\n')
+	stream.flush()
+	return answer()
+answer()
+command('qmp_capabilities')
+result = command(sys.argv[2])
+if sys.argv[2] == 'query-status':
+	print(result['return']['status'])
+EOF
+}
+
+await_state() {
+	for _ in $(seq 1 "$(($2 * 2))"); do
+		[[ "$(qmp query-status 2>/dev/null || true)" == "$1" ]] && return 0
+		sleep 0.5
+	done
+	fail "$label: QEMU was not $1 after $2 s"
+}
+
+# THE SERIAL LOG, STAMPED AS IT ARRIVES, to place the driver's and the kernel's lines against the PPM's stamped log.
+follow_serial() {
+	python3 -u - "$(serial_log)" "$state/serial-stamped-$label.log" <<'EOF' &
+import os, sys, time
+path, out = sys.argv[1], sys.argv[2]
+at, partial = 0, b''
+with open(out, 'w') as sink:
+	while True:
+		size = os.path.getsize(path) if os.path.exists(path) else 0
+		if size > at:
+			with open(path, 'rb') as log:
+				log.seek(at)
+				chunk = log.read(size - at)
+			at = size
+			now = time.time()
+			lines = (partial + chunk).split(b'\n')
+			partial = lines.pop()
+			for line in lines:
+				sink.write(f'{now:.3f} {line.decode(errors="replace")}\n')
+			sink.flush()
+		time.sleep(0.02)
+EOF
+	follower=$!
+}
+
+# THE PPM'S LOG ACROSS ONE SLEEP: no command from the driver's SUSPENDED to the kernel's `sleep: resumed`, then the
+# notifications enabled and both connectors read.
+ppm_across() {
+	local what="$1"
+	python3 - "$state/serial-stamped-$label.log" "$fixture/ppm-$label.log" "$what" <<'EOF' || fail "$label: $what - the PPM saw the sleep wrongly (see $kept/ppm-$label.log)"
+import re, sys
+serial, ppm, what = sys.argv[1], sys.argv[2], sys.argv[3]
+def last(pattern):
+	stamp = None
+	for line in open(serial, errors='replace'):
+		if pattern in line:
+			stamp = float(line.split(' ', 1)[0])
+	return stamp
+suspended, resumed = last('driver.ucsi-acpi: '), None
+suspended = last('suspended - no command is sent until the resume')
+resumed = last('sleep: resumed (')
+if suspended is None or resumed is None or resumed < suspended:
+	sys.exit(f'{what}: the driver said no SUSPENDED or the kernel no resume ({suspended}, {resumed})')
+commands = []
+for line in open(ppm, errors='replace'):
+	found = re.match(r'([0-9.]+) command (\w+) control (0x[0-9a-f]+)', line)
+	if found:
+		commands.append((float(found.group(1)), found.group(2), int(found.group(3), 16)))
+inside = [name for stamp, name, _ in commands if suspended < stamp < resumed]
+if inside:
+	sys.exit(f'{what}: {len(inside)} command(s) between SUSPENDED and the resume: {inside}')
+after = [(name, (control >> 16) & 0x7F) for stamp, name, control in commands if stamp > resumed]
+if 'SET_NOTIFICATION_ENABLE' not in [name for name, _ in after]:
+	sys.exit(f'{what}: the notifications were not enabled again after the resume')
+read = {connector for name, connector in after if name == 'GET_CONNECTOR_STATUS'}
+if not {1, 2} <= read:
+	sys.exit(f'{what}: the connectors read again after the resume were {sorted(read)}, not both')
+print(f'typec-ucsi: sleep: {what} - no command while asleep, the notifications enabled and both connectors read after it')
+EOF
+}
+
+export QEMU_EXTRA="-global ICH9-LPC.disable_s3=0"
+boot sleep v21 0x0210
+follow_serial
+ppm "attach 1 charger" >/dev/null
+probe await 1 contract 9000
+ended=$(seen "ServiceManager: sleep: the transaction ended")
+./dev.sh launch --timeout 120 sleepctl suspend idle 5 >"$state/sleepctl-idle.log" 2>&1 || true
+await_line "ServiceManager: sleep: the transaction ended" "the suspend to idle never ended" "$ended" 120
+grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "sleep: the suspend to idle did not sleep and wake"
+sleep 2
+ppm_across "suspend to idle"
+ended=$(seen "ServiceManager: sleep: the transaction ended")
+./dev.sh launch --timeout 200 sleepctl suspend ram >"$state/sleepctl-ram.log" 2>&1 &
+await_state suspended 60
+# A DETACH WHILE THE GUEST IS IN S3, reported after the resume.
+ppm "detach 1" >/dev/null
+sleep 2
+qmp system_wakeup >/dev/null
+await_state running 30
+await_line "ServiceManager: sleep: the transaction ended" "the S3 cycle never ended" "$ended" 180
+grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "sleep: the S3 cycle did not sleep and wake"
+sleep 2
+ppm_across "S3"
+probe await 1 detached
+echo "typec-ucsi: sleep: the detach the PPM made while the guest was in S3 was reported after the resume"
+kill "$follower" 2>/dev/null || true
+cp -f "$state/serial-stamped-$label.log" "$kept/" 2>/dev/null || true
+take_down
+unset QEMU_EXTRA
+echo "typec-ucsi: PASS - UCSI 1.2 and 2.1 through the _CID match: a charger's offers and contract, its supply beside the ACPI adapter and measured under 2.1, a data-role swap done, a power-role swap refused with the PPM's error, DisplayPort entered under the override and refused without it, a mode the PPM entered itself reported, malformed answers refused and a silent PPM recovered, a slow PPM served past its slow start, a spoiling one served as the others, a suspend to idle and an S3 cycle with no command while asleep and every connector read after it, a detach made in S3 reported - and no break of the command discipline"

@@ -40,12 +40,15 @@ FORMATS_ALL="iso img qcow2"
 
 help() {
 	usage_and_exit <<EOF
-usage: image.sh [--format FMT[,FMT...]] [--size SIZE] [--strip none|debug|all] [--dma-mode MODE]
+usage: image.sh [--format FMT[,FMT...]] [--size SIZE] [--hibernation MIB] [--strip none|debug|all] [--dma-mode MODE]
 
 Builds bootable images into .build/boot/. With no --format: all three formats.
 
   --format FMT   iso | img | qcow2 | all      (default: all)
   --size SIZE    disk size for img/qcow2, truncate-style: 128M, 1G   (default: 128M)
+  --hibernation MIB
+                 set the disk up for hibernation: a hibernation partition of MIB MiB at its end, at least
+                 the memory of the machine it is for (img/qcow2; default: none)
   --strip LEVEL  none (keep full debug kernel), debug (drop DWARF, keep symbols), or all (smallest)
                                                                   (default: all)
   --dma-mode M   enforcing-required | no-iommu | harness | all   (default: all)
@@ -78,6 +81,7 @@ EOF
 formats=()
 size="128M"
 strip="all"
+hibernation=0
 dma_modes=()
 
 while [[ $# -gt 0 ]]; do
@@ -94,6 +98,12 @@ while [[ $# -gt 0 ]]; do
 		[[ $# -ge 2 ]] || die "--size needs a value"
 		[[ "$2" =~ ^[0-9]+[KMGT]?$ ]] || die "size '$2' is not truncate-style (128M, 1G - no trailing B)"
 		size="$2"
+		shift 2
+		;;
+	--hibernation)
+		[[ $# -ge 2 ]] || die "--hibernation needs a value"
+		[[ "$2" =~ ^[0-9]+$ ]] || die "--hibernation takes the partition's size in MiB, got '$2'"
+		hibernation="$2"
 		shift 2
 		;;
 	--strip)
@@ -143,9 +153,9 @@ for dma_mode in "${dma_modes[@]}"; do
 			(cd "$SRC_DIR" && LIBER_DMA_MODE="$dma_mode" STRIP="$strip" harness/mkimage.sh iso "$kernel")
 			publish_image_evidence "$dma_mode" "$BUILD_DIR/boot/$slug$suffix.iso"
 			;;
-		img) (cd "$SRC_DIR" && LIBER_DMA_MODE="$dma_mode" STRIP="$strip" harness/mkimage.sh img "$kernel" "$size") ;;
+		img) (cd "$SRC_DIR" && LIBER_DMA_MODE="$dma_mode" STRIP="$strip" harness/mkimage.sh img "$kernel" "$size" "$hibernation") ;;
 		qcow2)
-			(cd "$SRC_DIR" && LIBER_DMA_MODE="$dma_mode" STRIP="$strip" harness/mkimage.sh img "$kernel" "$size")
+			(cd "$SRC_DIR" && LIBER_DMA_MODE="$dma_mode" STRIP="$strip" harness/mkimage.sh img "$kernel" "$size" "$hibernation")
 			raw="$BUILD_DIR/boot/$slug$suffix.img"
 			[[ -f "$raw" ]] || die "no raw image at $raw"
 			qemu-img convert -f raw -O qcow2 "$raw" "${raw%.img}.qcow2"

@@ -169,6 +169,10 @@ enum capability {
 	/// sleep's record - ServiceManager's `system-sleep`, a fresh connection per launch. Not the authority to stop the
 	/// machine, which is `system-power`'s. Granted to `sleepctl`. Appended last, for the reason `midi-output` states.
 	system-sleep,
+	/// WAKING THE MACHINE AT A TIME: `system-sleep`'s scheduled wake, a capability of its own because a program that can
+	/// wake the machine can empty its battery. A `system-sleep` connection minted with it may schedule; one without it
+	/// is refused. Granted to `sleepctl`. Appended last.
+	sleep-wake,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

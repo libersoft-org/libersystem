@@ -175,3 +175,22 @@ fn an_empty_submission_is_worth_nothing_and_still_moves_the_pool() {
 	assert!(without.draw(&mut plain));
 	assert_ne!(with_empty, plain, "a failed request must leave a mark, or a failing device makes the pool repeatable");
 }
+
+#[test]
+fn a_stir_moves_the_pool_and_credits_nothing() {
+	// A MACHINE RESTORED FROM A HIBERNATION IMAGE has the image's pool, and its next draws would be the draws the machine
+	// that wrote the image made after its snapshot. A stir makes them differ, and claims no entropy for a counter.
+	let mut restored: Pool = Pool::new();
+	restored.absorb(&[0x5Au8; 128], Source::Hardware);
+	let mut twin: Pool = Pool::new();
+	twin.absorb(&[0x5Au8; 128], Source::Hardware);
+	let before: Health = restored.health();
+	restored.stir(&12345u64.to_le_bytes());
+	let after: Health = restored.health();
+	assert_eq!(after.credited_bits, before.credited_bits, "a stir credits nothing");
+	assert_eq!(after.submissions, before.submissions, "and is no submission");
+	let (mut stirred, mut repeated) = ([0u8; 32], [0u8; 32]);
+	assert!(restored.draw(&mut stirred));
+	assert!(twin.draw(&mut repeated));
+	assert_ne!(stirred, repeated, "the restored pool does not repeat the twin's draws");
+}

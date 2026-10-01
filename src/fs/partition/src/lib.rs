@@ -44,6 +44,22 @@ pub const SECTOR_SIZE: usize = 512;
 // and the volume is found by it.
 pub const LIBERFS_TYPE_GUID: [u8; 16] = [0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46];
 
+// THE LIBERSYSTEM HIBERNATION PARTITION: `4C424653-0002-4000-8000-4C6962657246`, the LiberFS type's family, second member.
+// A hibernation image is written there - never inside a LiberFS volume, whose format stays as it is.
+pub const HIBERNATION_TYPE_GUID: [u8; 16] = [0x53, 0x46, 0x42, 0x4C, 0x02, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46];
+
+// WHAT THE PARTITION'S FIRST BYTES SAY WHILE IT HOLDS AN IMAGE: the image header's magic, and at `HIBERNATION_STATE_AT`
+// the state `HIBERNATION_STATE_IMAGE`, little-endian. The image component's format writes them; the system volume's
+// service reads them at mount, to know whether the volume's writes wait for the component's verdict on an image.
+pub const HIBERNATION_IMAGE_MAGIC: [u8; 8] = *b"LSHIBRN1";
+pub const HIBERNATION_STATE_AT: usize = 12;
+pub const HIBERNATION_STATE_IMAGE: u32 = 1;
+
+// Whether `first` - the partition's first bytes - holds an image, not yet authenticated: that is the component's.
+pub fn holds_hibernation_image(first: &[u8]) -> bool {
+	first.len() >= HIBERNATION_STATE_AT + 4 && first[..8] == HIBERNATION_IMAGE_MAGIC && first[HIBERNATION_STATE_AT..HIBERNATION_STATE_AT + 4] == HIBERNATION_STATE_IMAGE.to_le_bytes()
+}
+
 // An all-zero type GUID marks an UNUSED entry array slot. It is not a partition and it is
 // not evidence of one.
 const UNUSED_TYPE_GUID: [u8; 16] = [0; 16];
@@ -765,6 +781,39 @@ fn find_liberfs(gpt: &Gpt, companion: Option<(u64, u64)>) -> Disk {
 		Some((first, last)) => Disk::LiberFs { first, last },
 		None => Disk::GptWithoutLiberFs,
 	}
+}
+
+/// THE ONE PARTITION OF `type_guid` on a disk whose GPT verifies - the hibernation partition beside the system volume.
+/// None for a disk with no GPT, one whose table does not verify or is inconsistent, one with no such partition, and one
+/// with two: which of two was meant is not a guess this answer makes, as `find_liberfs` makes none about two system
+/// volumes. Nothing is written.
+pub fn find_partition(dev: &mut impl Sectors, type_guid: &[u8; 16]) -> Option<(u64, u64)> {
+	let mut lba1 = [0u8; SECTOR_SIZE];
+	if !dev.read(1, &mut lba1) || &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] != b"EFI PART" {
+		return None;
+	}
+	let counterpart = primary_counterpart(dev);
+	let gpt = read_gpt(dev, &lba1, 1, counterpart).ok()?;
+	let companion = companion_entries(&gpt, None);
+	if table_is_inconsistent(&gpt, companion) {
+		return None;
+	}
+	let mut found: Option<(u64, u64)> = None;
+	for e in gpt.entries.chunks_exact(gpt.entry_size) {
+		if e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != type_guid[..] {
+			continue;
+		}
+		let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().ok()?);
+		let last = u64::from_le_bytes(e[ENT_LAST_LBA..ENT_LAST_LBA + 8].try_into().ok()?);
+		if !usable_span(&gpt, companion, first, last) {
+			continue;
+		}
+		if found.is_some() {
+			return None;
+		}
+		found = Some((first, last));
+	}
+	found
 }
 
 // Is every used entry of this table one this build is willing to act on, and do any two of them

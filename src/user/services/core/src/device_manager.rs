@@ -548,6 +548,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//      none has services that reach no provider, which is a smaller machine rather than a
 		//      broken one - and refusing to start would trade that for a machine with no drivers.
 		let catalogue_admin: u64 = recv_tagged(bootstrap, &mut buf, b"CATADMIN").unwrap_or(0);
+		// 1b7. AND THE SLEEP BUTTONS' DOOR, last: a `system-sleep` connection ServiceManager serves - asked on for the
+		//      fixed sleep button, and minted from for each control-method sleep button's driver. Optional: a boot that
+		//      grants none has sleep buttons that do nothing, and says so when one is pressed.
+		let sleep_door: u64 = recv_tagged(bootstrap, &mut buf, b"SLEEP").unwrap_or(0);
+		SLEEP_DOOR.store(sleep_door, core::sync::atomic::Ordering::Relaxed);
+		// 1b8. and the clock source's privilege, last: duplicated for a Time and Alarm Device's driver at bind.
+		CLOCK_SOURCE.store(recv_tagged(bootstrap, &mut buf, b"CLOCKSRC").unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager
@@ -961,7 +968,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			let mut housekeeping: bool = false;
 			if platform_events != 0 {
-				if !serve_platform_events(platform_events, power, &mut buf) {
+				if !serve_platform_events(platform_events, power, sleep_door, &mut buf) {
 					machine_log(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
 					close(platform_events);
 					platform_events = 0;
@@ -1017,7 +1024,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						continue;
 					}
 					if platform_events != 0 && at == platform_events_at {
-						if !serve_platform_events(platform_events, power, &mut buf) {
+						if !serve_platform_events(platform_events, power, sleep_door, &mut buf) {
 							machine_log(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
 							close(platform_events);
 							platform_events = 0;
@@ -1205,6 +1212,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// AND THE RECORDS THAT NO LONGER DESCRIBE ANYTHING GO. The one moment this
 					// program has both the inventory and somewhere to write - see the function.
 					forget_absent_incidents(&nodes, policy_config);
+				}
+				// A RESTORE'S LAST STEP BEFORE MEMORY IS REPLACED: every binding stopped as a shutdown stops them - and this
+				// program goes on, to be replaced with the rest.
+				Received::Message { len, handle } if sleep::is_stop_all(&buf[..len]).is_some() => {
+					if handle != 0 {
+						close(handle);
+					}
+					let correlation = sleep::is_stop_all(&buf[..len]).unwrap_or(0);
+					print(b"DeviceManager: a restore stops every binding before memory is replaced\n");
+					stop_all(&mut nodes, &mut catalogue, driver_binding::StopIntent::Shutdown, &mut buf);
+					if let Some(answer) = sleep::answer_stopped(correlation, &nodes)
+						&& !send_with_room(bootstrap, &answer, 0)
+					{
+						print(b"DeviceManager: the restore's stop answer could not reach ServiceManager\n");
+					}
 				}
 				// THE SLEEP'S DRIVER STEP, asked by ServiceManager: answered at once for a check and for a resume with nothing
 				// suspended, and by the step itself, once it is over, for the rest.
@@ -1437,6 +1459,11 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 // THE TRUSTED KEY SINK'S PRODUCER, which only the physical keyboard drivers are handed - see `begin_bind`.
 // Its consumer goes to InputService's protected path alone, under `TRUSTEDKEYS`.
 static TRUSTED_KEY_PRODUCER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE SLEEP BUTTONS' DOOR and THE CLOCK SOURCE'S PRIVILEGE, as ServiceManager handed them: a control-method sleep
+// button's driver is minted a `system-sleep` connection from the first, a Time and Alarm Device's driver a duplicate of
+// the second - see `begin_bind`. Zero when the boot granted none.
+static SLEEP_DOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CLOCK_SOURCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 // THE ACPI SERVICE, as ServiceManager handed it over after the service's start: a connection of its `acpi-admin` root,
 // through which this program asks for node channels and hands over the connections the service holds. Replaced at every
 // relaunch; 0 when there is none.
@@ -2860,11 +2887,15 @@ fn grant_acpi_connections(nodes: &[Node], catalogue: &mut Catalogue, at: usize) 
 		};
 		match client.connection(&controller, &kind, &value, &connection) {
 			Some(Ok(())) => {}
-			Some(Err(_)) => say_acpi(&[b"the ACPI service refused a connection of ", controller.as_bytes()]),
-			None => {
+			// A CALL THAT NEVER REACHED A LIVE INSTANCE, or whose answer never came back, is not a refusal: it is the
+			// ended instance's connection, used between the new one's "namespace loaded" report and the hand-off of
+			// its own - and a grant marked done there was never made again, which left the new instance without the
+			// connection. Given up as a lost instance's, and the whole grant made again on the hand-off.
+			Some(Err(proto::system::Error::Again | proto::system::Error::CommitUncertain)) | None => {
 				acpi_admin_lost();
 				return Granted::Lost;
 			}
+			Some(Err(_)) => say_acpi(&[b"the ACPI service refused a connection of ", controller.as_bytes()]),
 		}
 	}
 	let mut line = [0u8; 20];
@@ -4680,6 +4711,37 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 			txn.holds(driver_protocol::ResourceKind::Console as u16, feed as u64);
 		}
 	}
+	// THE CONTROL-METHOD BUTTONS carry out a press as the fixed ones do: the power button through a `system-power`
+	// connection of its own, as the keyboards do, and the sleep button through a `system-sleep` one minted from the door
+	// ServiceManager handed this program. A door this boot did not grant leaves the button saying so when pressed.
+	if driver_name == b"acpi_button" {
+		let Some(connection) = service_connect(power) else {
+			refused(b"a power connection - the power service minted none");
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+		};
+		txn.holds(driver_protocol::ResourceKind::SysPower as u16, connection);
+		let door: u64 = SLEEP_DOOR.load(core::sync::atomic::Ordering::Relaxed);
+		if door != 0 {
+			let Some(connection) = service_connect(door) else {
+				refused(b"a sleep connection - ServiceManager minted none");
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+			};
+			txn.holds(driver_protocol::ResourceKind::SysSleep as u16, connection);
+		}
+	}
+	// THE TIME AND ALARM DEVICE'S DRIVER hands the kernel the wall clock under the clock source's privilege - a
+	// duplicate of the one this program holds, to that driver alone.
+	if driver_name == b"acpi_tad" {
+		let kept: u64 = CLOCK_SOURCE.load(core::sync::atomic::Ordering::Relaxed);
+		if kept != 0 {
+			let copy: i64 = duplicate(kept, RIGHT_TRANSFER);
+			if copy < 0 {
+				refused(b"the clock source's privilege - it could not be duplicated");
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+			}
+			txn.holds(driver_protocol::ResourceKind::ClockSource as u16, copy as u64);
+		}
+	}
 	// EVERY PORT RANGE THE ROW CARRIES, one resource each, in the row's order - no per-driver list decides
 	// it, exactly as the register window is passed. A range the kernel will not mint ends the attempt: a
 	// driver handed part of its device fails later, and less clearly.
@@ -5680,7 +5742,7 @@ fn machine_log(bytes: &[u8]) {
 /// a write that fits leaves on the first attempt.
 const MACHINE_LOG_ATTEMPTS: u32 = 100;
 
-fn serve_platform_events(events: u64, power: u64, buf: &mut [u8]) -> bool {
+fn serve_platform_events(events: u64, power: u64, sleep_door: u64, buf: &mut [u8]) -> bool {
 	// DRAINED, for the same reason the bus events are: a message left behind a readable channel is a
 	// wait that wakes immediately and forever.
 	loop {
@@ -5710,7 +5772,7 @@ fn serve_platform_events(events: u64, power: u64, buf: &mut [u8]) -> bool {
 					None => machine_log(b"DeviceManager: the power service minted no connection - the press cannot be acted on\n"),
 				}
 			}
-			abi::PLATFORM_EVENT_SLEEP_BUTTON => machine_log(b"DeviceManager: the sleep button was pressed - this system has no suspend path, so nothing is done\n"),
+			abi::PLATFORM_EVENT_SLEEP_BUTTON => press_sleep_button(sleep_door),
 			// A KIND THIS BUILD DOES NOT KNOW IS SAID AND NOT DROPPED. The kernel and this program are
 			// separately built artifacts; an event nobody here understands is a version skew, and a
 			// silent arm is how that becomes "the power button does nothing".
@@ -5718,6 +5780,26 @@ fn serve_platform_events(events: u64, power: u64, buf: &mut [u8]) -> bool {
 		}
 	}
 	true
+}
+
+// THE FIXED SLEEP BUTTON: a suspend asked for on the door ServiceManager handed this program - to RAM where the machine
+// offers it, to idle otherwise. ANSWERED AT ACCEPTANCE: this program is a participant the transaction then waits on,
+// so the request cannot wait for the resume, and ServiceManager does not make it. A second press while a sleep runs is
+// answered `again` at once.
+fn press_sleep_button(sleep_door: u64) {
+	if sleep_door == 0 {
+		machine_log(b"DeviceManager: the sleep button was pressed - this boot holds no system-sleep door, so nothing is done\n");
+		return;
+	}
+	let state = if sleep_states() & (1 << abi::SLEEP_STATE_RAM) != 0 { proto::system::SleepState::Ram } else { proto::system::SleepState::Idle };
+	machine_log(b"DeviceManager: the sleep button was pressed - asking ServiceManager for a suspend\n");
+	let mut client = proto::system::system_sleep::Client::with_deadline(ipc_client::ChannelTransport { chan: sleep_door }, clock().saturating_add(2 * TICKS_PER_SECOND));
+	match client.suspend(&state, &0, &proto::system::SleepReason::SleepButton) {
+		Some(Ok(())) => {}
+		Some(Err(proto::system::Error::Again)) => machine_log(b"DeviceManager: a sleep is already running - the press is answered by it\n"),
+		Some(Err(_)) => machine_log(b"DeviceManager: ServiceManager refused the sleep button's suspend\n"),
+		None => machine_log(b"DeviceManager: ServiceManager did not answer the sleep button's suspend\n"),
+	}
 }
 
 // A device appeared: give it a node and start binding it.
@@ -6705,6 +6787,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::WATCHDOG => proto::system::ProviderKind::Watchdog,
 		provider::IPMI => proto::system::ProviderKind::Ipmi,
 		provider::TYPEC_CONNECTOR => proto::system::ProviderKind::TypecConnector,
+		provider::PLATFORM_SWITCH => proto::system::ProviderKind::PlatformSwitch,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6738,6 +6821,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Watchdog => driver_protocol::provider::WATCHDOG,
 		proto::system::ProviderKind::Ipmi => driver_protocol::provider::IPMI,
 		proto::system::ProviderKind::TypecConnector => driver_protocol::provider::TYPEC_CONNECTOR,
+		proto::system::ProviderKind::PlatformSwitch => driver_protocol::provider::PLATFORM_SWITCH,
 	}
 }
 

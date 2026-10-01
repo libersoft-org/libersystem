@@ -13,7 +13,8 @@
 // DeviceManager; and enables every general-purpose event `\_GPE` answers.
 //
 // WHAT IT SERVES. DeviceManager's `acpi-admin` root - node channels for claims and live bindings, and the GPIO and
-// serial-bus connections the service holds - and each node channel: evaluate, `_DSD`, `_DSM` and `Notify`. A GPE is
+// serial-bus connections the service holds - and each node channel: evaluate, `_DSD`, `_DSM`, `Notify` and the device's
+// power state. A GPE is
 // answered by `_Lxx` or `_Exx` (the embedded controller's by its query methods), a GPIO-signalled event by `_Exx`,
 // `_Lxx` or `_EVT` in the controller's scope; a device-check or eject `Notify` re-walks the subtree and withdraws what
 // left.
@@ -25,9 +26,15 @@
 // kernel, which writes them into PM1 control with SLP_EN - so power-off and S3 use what this machine's firmware
 // describes. A registered pair outlives this instance: it is firmware data, and a restarted instance registers the
 // same. THE PLATFORM'S STEP of the suspend transaction, `platform-sleep`, is served on the control channel ServiceManager
-// holds for this service, beside the sleep notice: `prepare` evaluates `_PRW` and `_DSW` (or `_PSW`) on each wake node
-// and arms its wake GPE, then runs `_PTS` and `_SST`; `wake` runs `_WAK` and `_SST` and disarms what `prepare` armed.
-// The node channels still refuse `_PTS` and `_WAK`.
+// holds for this service, beside the sleep notice: `prepare` evaluates `_PRW` on each wake node - turning on the power
+// resources it names - and `_DSW` (or `_PSW`), and arms its wake GPE, then runs `_PTS` and `_SST`; `wake` runs `_WAK`
+// and `_SST`, disarms what `prepare` armed and lets its resources go. The node channels still refuse `_PTS` and `_WAK`.
+//
+// DEVICE POWER STATES. A driver asks for its device's state on its node channel, never by evaluating `_PSx`: the
+// state's `_PRx` power resources are turned on first, then `_PSx` runs, then what the old state held and the new one
+// does not is let go - each resource counted across every device and wake node that holds it, `_ON` with the first
+// holder and `_OFF` with the last (`acpi_model::power`). A channel that closes lets go of what its device held. The
+// node's `_SxD` and `_SxW` answer which state a system sleep lets the device enter.
 
 #![no_std]
 #![no_main]
@@ -41,6 +48,7 @@ use alloc::vec::Vec;
 
 use acpi_model::events::{self, Trigger};
 use acpi_model::node::{self, Role, Scope};
+use acpi_model::power::{self, DState, Plan, Resource, Resources};
 use acpi_model::{admission, handshake, properties};
 use aml::host::{Access, Host, HostError, TableBytes};
 use aml::{Aml, Limits, NodeId, Object, Path, Seg, Space};
@@ -630,6 +638,10 @@ struct Service {
 	ec_node: Option<NodeId>,
 	// The wake GPEs `prepare` armed for the sleep in progress, which `wake` disarms.
 	wake_armed: Vec<u16>,
+	// EVERY POWER RESOURCE'S HOLDERS AND EVERY DEVICE'S STATE, and the wake nodes whose `_PRW` resources `prepare` took
+	// for the sleep in progress, which `wake` lets go.
+	power: Resources,
+	wake_holders: Vec<String>,
 }
 
 impl Service {
@@ -1261,6 +1273,167 @@ impl Service {
 	}
 }
 
+// ---------------------------------------------------------------------------------------------- device power states
+
+impl Service {
+	// THE POWER RESOURCES A PACKAGE NAMES - `_PRx`, or `_PRW` past its event and its deepest state - each with its
+	// `resource_order`. An element that is no power resource is firmware's mistake: said, and skipped.
+	fn resources_of(&self, elements: &[aml::object::ObjRef], what: &str) -> Vec<Resource> {
+		let mut resources: Vec<Resource> = Vec::new();
+		for element in elements {
+			let node = match &*element.borrow() {
+				Object::Name { name, scope } => self.aml.ns.resolve(name, *scope),
+				Object::Reference(aml::object::Reference::Node(node)) => Some(*node),
+				_ => None,
+			};
+			let order = node.and_then(|node| self.aml.ns.object(node)).and_then(|object| {
+				let order = if let Object::PowerResource { order, .. } = &*object.borrow() { Some(*order) } else { None };
+				order
+			});
+			match (node, order) {
+				(Some(node), Some(order)) => resources.push(Resource { path: self.aml.ns.path(node).text(), order }),
+				_ => say(&format!("{what} names something that is not a power resource - it is skipped")),
+			}
+		}
+		resources
+	}
+
+	// AN INTEGER OBJECT OF A NODE'S, none where it has none or it is not an integer.
+	fn node_integer(&mut self, node: NodeId, name: &[u8; 4]) -> Option<u64> {
+		let value = self.aml.child_value(node, name, &mut self.host);
+		self.deliver_notifications();
+		match value {
+			Ok(Some(Object::Integer(value))) => Some(value),
+			_ => None,
+		}
+	}
+
+	// ONE POWER RESOURCE SWITCHED: `_ON` or `_OFF`, unless its `_STA` says it already is - a resource the firmware left
+	// on is counted from the first holder that takes it, and never turned on twice. False when the method failed.
+	fn switch_resource(&mut self, path: &str, on: bool) -> bool {
+		let what = if on { "on" } else { "off" };
+		let Some(node) = self.aml.lookup(path) else {
+			say(&format!("power resource {path} is not in the namespace - it is not turned {what}"));
+			return false;
+		};
+		if self.node_integer(node, b"_STA").map(|status| status & 1 != 0) == Some(on) {
+			say(&format!("power resource {path} is {what} already (held by {})", self.power.count(path)));
+			return true;
+		}
+		let Some(method) = self.aml.ns.child(node, Seg(if on { *b"_ON_" } else { *b"_OFF" })) else {
+			say(&format!("power resource {path} has no method to turn it {what}"));
+			return false;
+		};
+		let answered = self.aml.evaluate(method, &[], &mut self.host);
+		self.deliver_notifications();
+		match answered {
+			Ok(_) => {
+				say(&format!("power resource {path} {what} (held by {})", self.power.count(path)));
+				true
+			}
+			Err(error) => {
+				say(&format!("power resource {path} did not turn {what} - {error:?}"));
+				false
+			}
+		}
+	}
+
+	// A DEVICE'S POWER STATE, asked on its node channel: the plan the counts make, run in its order. A resource that
+	// would not turn on, or a `_PSx` that failed, turns off again what this transition turned on and leaves every count
+	// as it was; a resource that would not turn off is said, and the device is in its new state regardless.
+	fn set_power_state(&mut self, node: NodeId, identity: &str, state: DState) -> Result<(), Error> {
+		let wanted: Vec<Resource> = match state.resources() {
+			Some(name) => {
+				let value = self.aml.child_value(node, name, &mut self.host);
+				self.deliver_notifications();
+				match value {
+					Ok(Some(Object::Package(elements))) => self.resources_of(&elements, &format!("{identity}'s {}", seg_text(name))),
+					Ok(Some(_)) => {
+						say(&format!("{identity}'s {} is not a package - no resource is taken for {}", seg_text(name), state.name()));
+						Vec::new()
+					}
+					Ok(None) => Vec::new(),
+					Err(error) => {
+						say(&format!("{identity}'s {} failed - {error:?}", seg_text(name)));
+						return Err(Error::Io);
+					}
+				}
+			}
+			None => Vec::new(),
+		};
+		let before: Resources = self.power.clone();
+		let plan: Plan = self.power.transition(identity, state, &wanted);
+		let Some(method) = plan.method else { return Ok(()) };
+		let mut turned_on: Vec<String> = Vec::new();
+		for path in &plan.on {
+			if !self.switch_resource(path, true) {
+				self.undo_power(before, turned_on);
+				say(&format!("{identity} stays as it was - {path} would not turn on for {}", state.name()));
+				return Err(Error::Io);
+			}
+			turned_on.push(path.clone());
+		}
+		if let Some(entry) = self.aml.ns.child(node, Seg(*method)) {
+			let answered = self.aml.evaluate(entry, &[], &mut self.host);
+			self.deliver_notifications();
+			if let Err(error) = answered {
+				self.undo_power(before, turned_on);
+				say(&format!("{identity} stays as it was - its {} failed: {error:?}", seg_text(method)));
+				return Err(Error::Io);
+			}
+		}
+		for path in &plan.off {
+			self.switch_resource(path, false);
+		}
+		say(&format!("{identity} is in {} ({} resource(s) turned on, {} off)", state.name(), plan.on.len(), plan.off.len()));
+		Ok(())
+	}
+
+	// A TRANSITION THAT FAILED: the counts as they were, and what it turned on turned off again, last first.
+	fn undo_power(&mut self, before: Resources, turned_on: Vec<String>) {
+		self.power = before;
+		for path in turned_on.iter().rev() {
+			self.switch_resource(path, false);
+		}
+	}
+
+	// THE STATE A SYSTEM SLEEP LETS THE DEVICE ENTER - see `acpi_model::power::sleep_state`.
+	fn sleep_power_state(&mut self, node: NodeId, target: u8, wake: bool) -> Result<u8, Error> {
+		let (sxd, sxw) = power::sleep_objects(target).ok_or(Error::Invalid)?;
+		let shallowest = match sxd {
+			Some(name) => self.node_integer(node, &name),
+			None => None,
+		};
+		let deepest_wake = self.node_integer(node, &sxw);
+		Ok(power::sleep_state(shallowest, deepest_wake, wake).as_u8())
+	}
+
+	// A HOLDER GONE: what it held let go, each resource whose count reached zero turned off.
+	fn release_power(&mut self, holder: &str) {
+		for path in self.power.forget(holder) {
+			self.switch_resource(&path, false);
+		}
+	}
+
+	// A NODE CHANNEL CLOSED - its claim released, its driver gone: what its device held is let go, unless another
+	// channel of the same node is still open.
+	fn channel_gone(&mut self, gone: NodeChannel) {
+		close(gone.chan);
+		if gone.stream != 0 {
+			close(gone.stream);
+		}
+		if !self.channels.iter().any(|channel| channel.identity == gone.identity) && self.power.state(&gone.identity).is_some() {
+			say(&format!("{}'s channel closed - what it held is let go", gone.identity));
+			self.release_power(&gone.identity);
+		}
+	}
+}
+
+// A four-character name as text.
+fn seg_text(name: &[u8; 4]) -> &str {
+	core::str::from_utf8(name).unwrap_or("?")
+}
+
 struct AdminView<'a> {
 	service: &'a mut Service,
 }
@@ -1299,6 +1472,17 @@ impl acpi_node::Service for NodeView<'_> {
 
 	fn notifications(&mut self) -> Vec<AcpiNotification> {
 		Vec::new()
+	}
+
+	fn set_power_state(&mut self, state: u8) -> Result<(), Error> {
+		let state = DState::from_u8(state).ok_or(Error::Invalid)?;
+		let (node, identity) = (self.service.channels[self.at].node, self.service.channels[self.at].identity.clone());
+		self.service.set_power_state(node, &identity, state)
+	}
+
+	fn sleep_power_state(&mut self, target: u8, wake: bool) -> Result<u8, Error> {
+		let node = self.service.channels[self.at].node;
+		self.service.sleep_power_state(node, target, wake)
 	}
 }
 
@@ -1478,6 +1662,16 @@ impl Service {
 			say(&format!("{identity} wakes from S{deepest} at the deepest - not from S{target}; its wake is not armed"));
 			return;
 		}
+		// THE POWER ITS WAKE NEEDS, on before its wake is enabled and held until `wake` lets it go.
+		let resources = self.resources_of(prw.get(2..).unwrap_or(&[]), &format!("{identity}'s _PRW"));
+		if !resources.is_empty() {
+			let holder = format!("wake {identity}");
+			let (on, _) = self.power.hold(&holder, &resources);
+			for path in &on {
+				self.switch_resource(path, true);
+			}
+			self.wake_holders.push(holder);
+		}
 		if !self.run(node, b"_DSW", &[Object::Integer(1), Object::Integer(target), Object::Integer(0)]) {
 			self.run(node, b"_PSW", &[Object::Integer(1)]);
 		}
@@ -1487,6 +1681,15 @@ impl Service {
 			say(&format!("{identity} armed to wake the machine on general-purpose event {number:#04x}"));
 		} else {
 			say(&format!("general-purpose event {number:#04x} could not be set for {identity}'s wake"));
+		}
+	}
+}
+
+impl Service {
+	// WHAT `prepare` TOOK FOR THE WAKE NODES, let go.
+	fn release_wake_power(&mut self) {
+		for holder in core::mem::take(&mut self.wake_holders) {
+			self.release_power(&holder);
 		}
 	}
 }
@@ -1501,6 +1704,7 @@ impl platform_sleep::Service for Service {
 			SleepState::Disk => 4,
 		};
 		self.wake_armed.clear();
+		self.release_wake_power();
 		for identity in &wake_nodes {
 			self.arm_wake(identity, target);
 		}
@@ -1529,6 +1733,7 @@ impl platform_sleep::Service for Service {
 		for number in core::mem::take(&mut self.wake_armed) {
 			let _ = gpe(self.host.privilege, GPE_WAKE_CLEAR, number);
 		}
+		self.release_wake_power();
 		self.root_method("\\_SI_._SST", SST_WORKING);
 		say("the platform is awake again");
 		Ok(())
@@ -1572,7 +1777,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let (privilege, admin_root) = (roles[0], roles[1]);
-	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, wake_armed: Vec::new() };
+	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, wake_armed: Vec::new(), power: Resources::new(), wake_holders: Vec::new() };
 	if privilege == 0 {
 		say("no FirmwareInterpreter privilege was handed over - the namespace is not loaded");
 		send_blocking(bootstrap, b"AcpiService: online - no firmware privilege", 0);
@@ -1725,10 +1930,7 @@ fn serve_node(service: &mut Service, at: usize, buf: &mut [u8], reply: &mut [u8]
 		PolledCaps::Empty => return,
 		PolledCaps::Closed => {
 			let gone = service.channels.remove(at);
-			close(gone.chan);
-			if gone.stream != 0 {
-				close(gone.stream);
-			}
+			service.channel_gone(gone);
 			return;
 		}
 	};
@@ -1756,10 +1958,7 @@ fn serve_node(service: &mut Service, at: usize, buf: &mut [u8], reply: &mut [u8]
 		}
 		None => {
 			let gone = service.channels.remove(at);
-			close(gone.chan);
-			if gone.stream != 0 {
-				close(gone.stream);
-			}
+			service.channel_gone(gone);
 		}
 	}
 }

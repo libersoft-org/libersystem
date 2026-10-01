@@ -15,11 +15,19 @@
 //
 // THE ORDERLY SEQUENCE ENDS A TRANSACTION AT ITS NEXT STEP: the step in flight finishes, no later step starts, and the
 // transaction unwinds - or resumes, if the machine has already slept - and the sequence runs once it has ended.
+//
+// HIBERNATION is accepted only where the image component says the machine is set up for it - asked at acceptance - and
+// runs the same steps up to the entry, which takes the kernel's snapshot and answers twice. In the machine that ran on
+// (`snapshot`): the bindings the image goes through resumed (DeviceManager's `resume-for-image`), the image written (the
+// component's `write-image`), and the machine off through SystemManager (`off-hibernated`) - or, for a hybrid sleep,
+// those bindings suspended again and the machine suspended to RAM. In the machine restored from the image (`restored`):
+// the undo, as after any sleep. An image written owes its discard (`discard-image`) whenever the machine runs on after it,
+// before the held writes are released - see `service_logic::sleep_transaction`.
 
 use super::*;
 use alloc::format;
-use core::sync::atomic::{AtomicU64, Ordering};
-use proto::system::{DriversSuspended, SleepOutcome, SleepReason, SleepRecord, SleepState, SleepStep, WakeReason, Woke, application_freeze, device_sleep, platform_sleep, sleep_entry, sleep_notice, system_sleep};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use proto::system::{DriversSuspended, HibernationStatus, SleepInhibitor, SleepOutcome, SleepReason, SleepRecord, SleepState, SleepStatus, SleepStep, WakeReason, WakeSource, Woke, application_freeze, device_sleep, hibernation_image, platform_sleep, sleep_entry, sleep_notice, system_sleep};
 use wire::{Reader, Sink, VecWriter};
 
 // The sleep notice's bit in a manifest row's `notices`.
@@ -31,22 +39,36 @@ pub(super) const NOTICE_SLEEP: u8 = 2;
 // wait set each round - a role delivered at a start, or a grant resolved by name.
 pub(super) const MAX_SLEEP_CLIENTS: usize = 16;
 pub(super) static SLEEP_CLIENTS: [AtomicU64; MAX_SLEEP_CLIENTS] = [const { AtomicU64::new(0) }; MAX_SLEEP_CLIENTS];
+// WHICH OF THEM MAY SCHEDULE A WAKE: minted for the `sleep-wake` grant, and every connection a `CONNECT` on one of them
+// mints - a holder narrows what it hands on, it never widens it.
+static SLEEP_WAKES: [AtomicBool; MAX_SLEEP_CLIENTS] = [const { AtomicBool::new(false) }; MAX_SLEEP_CLIENTS];
 
 // A FRESH CONNECTION: its near end kept for the loop, its far end answered with every right a minted connection has
 // - as a root's `CONNECT` mints one - so its holder can narrow it for whoever it grants it to. None when the table is
 // full.
 pub(super) fn mint() -> Option<u64> {
-	let slot = SLEEP_CLIENTS.iter().find(|slot| slot.load(Ordering::Relaxed) == 0)?;
+	mint_with(false)
+}
+
+// The same, and whether it may schedule a wake.
+pub(super) fn mint_with(wake: bool) -> Option<u64> {
+	let at = SLEEP_CLIENTS.iter().position(|slot| slot.load(Ordering::Relaxed) == 0)?;
 	let (near, far): (u64, u64) = channel()?;
-	slot.store(near, Ordering::Relaxed);
+	SLEEP_CLIENTS[at].store(near, Ordering::Relaxed);
+	SLEEP_WAKES[at].store(wake, Ordering::Relaxed);
 	Some(far)
+}
+
+fn may_wake(near: u64) -> bool {
+	SLEEP_CLIENTS.iter().zip(SLEEP_WAKES.iter()).any(|(slot, wake)| slot.load(Ordering::Relaxed) == near && wake.load(Ordering::Relaxed))
 }
 
 // A client that closed: its slot given back, and any inhibition it held with it.
 fn retire(near: u64, sleeper: &mut Sleeper) {
-	for slot in SLEEP_CLIENTS.iter() {
+	for (slot, wake) in SLEEP_CLIENTS.iter().zip(SLEEP_WAKES.iter()) {
 		if slot.load(Ordering::Relaxed) == near {
 			slot.store(0, Ordering::Relaxed);
+			wake.store(false, Ordering::Relaxed);
 		}
 	}
 	sleeper.inhibitors.retain(|inhibitor| inhibitor.client != near);
@@ -66,6 +88,10 @@ const DRIVERS_TICKS: u64 = 12_000;
 const PLATFORM_TICKS: u64 = 1_000;
 // The clock is held through the sleep itself, so this bounds the entry and the wake, not the night.
 const ENTER_TICKS: u64 = 3_000;
+// THE IMAGE'S WRITE: every page in use, sealed and encrypted, through the disk's driver - minutes on a large machine.
+const IMAGE_TICKS: u64 = 120_000;
+// How long the image component may take to say whether the machine is set up, at a hibernation's acceptance.
+const STATUS_TICKS: u64 = 1_000;
 // The longest an inhibitor may delay an idle sleep.
 const MAX_INHIBIT_MS: u64 = 10 * 60 * 1_000;
 // How far below a watchdog's "awake by" the timed wake is set, so the resume runs before the timer ends.
@@ -80,24 +106,18 @@ fn scale() -> u64 {
 
 // ------------------------------------------------------------------ the transaction's parts
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Action {
-	Check,
-	Announce,
-	Freeze,
-	Flush,
-	Drivers,
-	Platform,
-	Enter,
-	// The undoing ones, run in the reverse of what was taken.
-	Wake,
-	DriversResume,
-	Release,
-	Resumed,
-	Thaw,
+// THE ORDER IS `service_logic::sleep_transaction`'S - what is next, what each step owes the undo, the thaw last - and
+// host-tested there against scripted answers; what is here is each step's IO.
+use service_logic::sleep_transaction::{Action, Plan};
+
+// WHAT A STEP IS CALLED, HOW LONG IT MAY TAKE AND WHICH STEP THE RECORD NAMES - this program's, beside the order.
+trait StepInfo {
+	fn name(self) -> &'static str;
+	fn bound(self) -> u64;
+	fn step(self) -> SleepStep;
 }
 
-impl Action {
+impl StepInfo for Action {
 	fn name(self) -> &'static str {
 		match self {
 			Action::Check => "check",
@@ -107,6 +127,12 @@ impl Action {
 			Action::Drivers => "drivers",
 			Action::Platform => "platform",
 			Action::Enter => "enter",
+			Action::ImageDrivers => "image drivers",
+			Action::ImageWrite => "image write",
+			Action::DiskOff => "off, hibernated",
+			Action::ImageSuspend => "image drivers suspended",
+			Action::RamEnter => "hybrid suspend to RAM",
+			Action::Discard => "image discarded",
 			Action::Wake => "platform wake",
 			Action::DriversResume => "drivers resume",
 			Action::Release => "writes released",
@@ -123,7 +149,10 @@ impl Action {
 			Action::Flush | Action::Release => FLUSH_TICKS,
 			Action::Drivers | Action::DriversResume => DRIVERS_TICKS,
 			Action::Platform | Action::Wake => PLATFORM_TICKS,
-			Action::Enter => ENTER_TICKS,
+			Action::Enter | Action::DiskOff | Action::RamEnter => ENTER_TICKS,
+			Action::ImageDrivers | Action::ImageSuspend => DRIVERS_TICKS,
+			Action::ImageWrite => IMAGE_TICKS,
+			Action::Discard => FLUSH_TICKS,
 		};
 		ticks.saturating_mul(scale())
 	}
@@ -136,13 +165,10 @@ impl Action {
 			Action::Freeze => SleepStep::Freeze,
 			Action::Flush => SleepStep::Flush,
 			Action::Platform => SleepStep::Platform,
-			Action::Enter => SleepStep::Enter,
+			Action::Enter | Action::DiskOff | Action::RamEnter => SleepStep::Enter,
+			Action::ImageDrivers | Action::ImageWrite | Action::ImageSuspend | Action::Discard => SleepStep::Image,
 			_ => SleepStep::None,
 		}
-	}
-
-	fn undoing(self) -> bool {
-		matches!(self, Action::Wake | Action::DriversResume | Action::Release | Action::Resumed | Action::Thaw)
 	}
 }
 
@@ -177,9 +203,8 @@ struct Transaction {
 	timed_wake_ms: u64,
 	// While an idle sleep waits out its inhibitors: until when.
 	inhibited_until: u64,
-	forward: Vec<Action>,
-	// What was taken, to be undone - the last pushed is undone first.
-	undo: Vec<Action>,
+	// The order: the steps ahead and the undo owed.
+	plan: Plan,
 	current: Option<Current>,
 	// The step that failed or refused, who and why.
 	failed: Option<(Action, String, String)>,
@@ -191,6 +216,10 @@ struct Transaction {
 	holding: Vec<usize>,
 	wake_nodes: Vec<String>,
 	awake_by_ms: u64,
+	// Whether the scheduled wake set this transaction's timed wake.
+	scheduled: bool,
+	// A hibernation's image kept through a suspend to RAM rather than the machine off.
+	hybrid: bool,
 }
 
 // One inhibition: its client, until when, and why.
@@ -211,6 +240,10 @@ pub(super) struct Sleeper {
 	pub(super) inhibitors: Vec<Inhibitor>,
 	// Services whose restart the transaction deferred: nothing is started while the drivers are suspended.
 	pub(super) deferred: Vec<usize>,
+	// THE SCHEDULED WAKE, seconds since the Unix epoch - zero for none - and what the last sleep armed, for `status`.
+	scheduled: u64,
+	last_wake_nodes: Vec<String>,
+	last_awake_by_ms: u64,
 }
 
 // What `drive` found when the transaction ended.
@@ -237,7 +270,7 @@ fn say(text: &str) {
 
 impl Sleeper {
 	pub(super) fn new(process: u64, system: u64) -> Sleeper {
-		Sleeper { record: empty_record(), txn: None, process, system, next_correlation: 0x5300_0001, inhibitors: Vec::new(), deferred: Vec::new() }
+		Sleeper { record: empty_record(), txn: None, process, system, next_correlation: 0x5300_0001, inhibitors: Vec::new(), deferred: Vec::new(), scheduled: 0, last_wake_nodes: Vec::new(), last_awake_by_ms: 0 }
 	}
 
 	pub(super) fn running(&self) -> bool {
@@ -282,15 +315,54 @@ impl Sleeper {
 
 	// ------------------------------------------------------------------ the requests
 
-	// `suspend` and `hibernate`: answered at acceptance, before any step runs.
-	fn request(&mut self, state: SleepState, timed_wake_ms: u64, reason: SleepReason) -> Result<(), Error> {
+	// `suspend` and `hibernate`: answered at acceptance, before any step runs. `image` is the image component's control
+	// channel, 0 where it does not run.
+	fn request(&mut self, state: SleepState, timed_wake_ms: u64, reason: SleepReason, hybrid: bool, image: u64) -> Result<(), Error> {
 		if self.txn.is_some() {
 			return Err(Error::Again);
 		}
+		// HIBERNATION WHERE THE MACHINE IS SET UP FOR IT - a hibernation partition as large as memory, and a TPM to seal
+		// its key - which the image component says; asked here, so a refusal is the requester's answer.
 		if state == SleepState::Disk {
-			// PART E'S: this machine is not set up for hibernation.
-			self.record = SleepRecord { state, reason, outcome: SleepOutcome::Refused, step: SleepStep::None, who: String::new(), why: String::from("hibernation is not set up on this machine"), requested: clock_boot_ns(), ..empty_record() };
+			let why = match image_status(image) {
+				Ok(status) if status.set_up => None,
+				Ok(status) => Some(format!("hibernation is not set up on this machine - {}", status.why)),
+				Err(why) => Some(why),
+			};
+			if let Some(why) = why {
+				say(&format!("hibernation refused: {why}"));
+				self.record = SleepRecord { state, reason, outcome: SleepOutcome::Refused, step: SleepStep::None, who: String::from("hibernation_service"), why, requested: clock_boot_ns(), ..empty_record() };
+				return Err(Error::Unsupported);
+			}
+		}
+		// A STATE THE KERNEL'S ENTRY WOULD NOT TAKE is refused at acceptance, not at the entry after everything was
+		// frozen: suspend to RAM needs `\_S3` registered and a firmware that can come back from it.
+		let offered: u64 = sleep_states();
+		let bit: u64 = match state {
+			SleepState::Idle => 1 << SLEEP_STATE_IDLE,
+			SleepState::Ram => 1 << SLEEP_STATE_RAM,
+			SleepState::Disk => 1 << SLEEP_STATE_DISK,
+		};
+		if offered & bit == 0 {
+			self.record = SleepRecord { state, reason, outcome: SleepOutcome::Refused, step: SleepStep::None, who: String::new(), why: format!("this machine does not offer {}", state_name(state)), requested: clock_boot_ns(), ..empty_record() };
 			return Err(Error::Unsupported);
+		}
+		// THE SCHEDULED WAKE BECOMES THIS SLEEP'S TIMED WAKE when it is the earlier; one whose time has already passed is
+		// spent now - a wall-clock alarm fires once.
+		let mut timed_wake_ms = timed_wake_ms;
+		let mut scheduled = false;
+		if self.scheduled != 0 {
+			let now = clock_rtc();
+			if now != 0 && self.scheduled <= now {
+				say(&format!("the scheduled wake at {} has passed - it is spent", self.scheduled));
+				self.scheduled = 0;
+			} else if now != 0 {
+				let ms = (self.scheduled - now).saturating_mul(1000);
+				if timed_wake_ms == 0 || ms < timed_wake_ms {
+					timed_wake_ms = ms;
+					scheduled = true;
+				}
+			}
 		}
 		// AN IDLE SLEEP WAITS OUT ITS INHIBITORS, each within its bound; nothing else waits for them.
 		let now = clock();
@@ -302,7 +374,11 @@ impl Sleeper {
 		}
 		self.record = SleepRecord { state, reason, outcome: SleepOutcome::Running, step: SleepStep::None, who: String::new(), why: String::new(), requested: clock_boot_ns(), ..empty_record() };
 		say(&format!("accepted {}{}", state_name(state), if timed_wake_ms != 0 { format!(", with a timed wake in {timed_wake_ms} ms") } else { String::new() }));
-		self.txn = Some(Transaction { state, timed_wake_ms, inhibited_until, forward: alloc::vec![Action::Check, Action::Announce, Action::Freeze, Action::Flush, Action::Drivers, Action::Platform, Action::Enter], undo: Vec::new(), current: None, failed: None, refused: false, ended_by: None, slept: false, announced: Vec::new(), holding: Vec::new(), wake_nodes: Vec::new(), awake_by_ms: 0 });
+		if scheduled {
+			say(&format!("the scheduled wake at {} is this sleep's timed wake", self.scheduled));
+		}
+		let plan = if state == SleepState::Disk { Plan::hibernation(hybrid) } else { Plan::new() };
+		self.txn = Some(Transaction { state, timed_wake_ms, inhibited_until, plan, current: None, failed: None, refused: false, ended_by: None, slept: false, announced: Vec::new(), holding: Vec::new(), wake_nodes: Vec::new(), awake_by_ms: 0, scheduled, hybrid });
 		Ok(())
 	}
 
@@ -311,7 +387,7 @@ impl Sleeper {
 	pub(super) fn end_by(&mut self, door: Door) {
 		if let Some(txn) = self.txn.as_mut() {
 			say(&format!("took the orderly sequence (door: {}); the transaction ends at its next step", door.name));
-			txn.forward.clear();
+			txn.plan.end();
 			txn.inhibited_until = 0;
 			txn.ended_by = Some(door);
 		}
@@ -333,10 +409,17 @@ impl Sleeper {
 				txn.inhibited_until = 0;
 			}
 			// The next action: forward while nothing failed and nothing ended it, the undo otherwise.
-			let next = if txn.failed.is_none() && !txn.forward.is_empty() { Some(txn.forward.remove(0)) } else { txn.undo.pop() };
+			let next = txn.plan.next();
 			let Some(action) = next else {
 				return Some(self.finish());
 			};
+			// THE SLEEP GATE'S HOOK: the resume stops here, the drivers back and nothing after them - no `alive` answered.
+			#[cfg(feature = "development")]
+			if action == Action::Release && super::SLEEP_HANG.swap(false, Ordering::Relaxed) {
+				say("the resume hangs after the drivers (development hook)");
+				txn.current = Some(Current { action, deadline: u64::MAX, waiting: Vec::new() });
+				return None;
+			}
 			self.start(action, state, channels);
 		}
 	}
@@ -344,6 +427,10 @@ impl Sleeper {
 	fn start(&mut self, action: Action, state: &[State; N], channels: &[u64; N]) {
 		let Some(txn) = self.txn.as_ref() else { return };
 		let (sleep_state, timed_wake_ms, awake_by_ms) = (txn.state, txn.timed_wake_ms, txn.awake_by_ms);
+		// THE DRIVERS AND THE PLATFORM PREPARE FOR WHAT THE MACHINE ENTERS: a hybrid sleep ends in S3 - a TPM saves its
+		// state for the S3 wake - and the snapshot needs no firmware.
+		let platform_state = if txn.hybrid { SleepState::Ram } else { sleep_state };
+		let image = index_of(b"hibernation_service").filter(|&index| state[index] == State::Ready && channels[index] != 0);
 		let (wake_nodes, holding, announced) = (txn.wake_nodes.clone(), txn.holding.clone(), txn.announced.clone());
 		say(&format!("step {} at tick {}", action.name(), clock()));
 		// The targets and each one's request.
@@ -381,7 +468,7 @@ impl Sleeper {
 					sends.push((
 						Target::Service(dm),
 						frame(device_sleep::OP_SUSPEND, |w| {
-							sleep_state.write(w)?;
+							platform_state.write(w)?;
 							w.boolean(true)?;
 							w.u64(timed_wake_ms)
 						}),
@@ -398,7 +485,7 @@ impl Sleeper {
 				sends.push((
 					Target::Service(acpi),
 					frame(platform_sleep::OP_PREPARE, |w| {
-						sleep_state.write(w)?;
+						platform_state.write(w)?;
 						write_list(w, &wake_nodes)
 					}),
 				));
@@ -422,11 +509,47 @@ impl Sleeper {
 			}
 			Action::Wake => {
 				let Some(acpi) = index_of(b"acpi_service").filter(|&index| ready(index)) else { return self.skip(action) };
-				sends.push((Target::Service(acpi), frame(platform_sleep::OP_WAKE, |w| sleep_state.write(w))));
+				sends.push((Target::Service(acpi), frame(platform_sleep::OP_WAKE, |w| platform_state.write(w))));
+			}
+			// ------------------------------------------------------------------ hibernation's, after the snapshot
+			Action::ImageDrivers | Action::ImageSuspend => match index_of(b"device_manager").filter(|&index| ready(index)) {
+				Some(dm) => sends.push((Target::Service(dm), frame(if action == Action::ImageDrivers { device_sleep::OP_RESUME_FOR_IMAGE } else { device_sleep::OP_SUSPEND_IMAGE }, |_| Some(())))),
+				None => {
+					self.fail_now(action, String::from("device_manager"), String::from("DeviceManager is not running"));
+					return;
+				}
+			},
+			Action::ImageWrite | Action::Discard => match image {
+				Some(index) => sends.push((Target::Service(index), frame(if action == Action::ImageWrite { hibernation_image::OP_WRITE_IMAGE } else { hibernation_image::OP_DISCARD_IMAGE }, |_| Some(())))),
+				None if action == Action::Discard => {
+					say("the image component does not run - the image it wrote cannot be discarded, and the next boot's refusal of it is what stands");
+					return self.skip(action);
+				}
+				None => {
+					self.fail_now(action, String::from("hibernation_service"), String::from("the image component does not run"));
+					return;
+				}
+			},
+			Action::DiskOff | Action::RamEnter => {
+				if self.system == 0 {
+					self.fail_now(action, String::from("system_manager"), String::from("there is no channel to SystemManager"));
+					return;
+				}
+				sends.push((
+					Target::System,
+					if action == Action::DiskOff {
+						frame(sleep_entry::OP_OFF_HIBERNATED, |_| Some(()))
+					} else {
+						frame(sleep_entry::OP_ENTER, |w| {
+							SleepState::Ram.write(w)?;
+							w.u64(0)
+						})
+					},
+				));
 			}
 			Action::DriversResume => {
 				let Some(dm) = index_of(b"device_manager").filter(|&index| ready(index)) else { return self.skip(action) };
-				sends.push((Target::Service(dm), frame(device_sleep::OP_RESUME, |w| sleep_state.write(w))));
+				sends.push((Target::Service(dm), frame(device_sleep::OP_RESUME, |w| platform_state.write(w))));
 			}
 			Action::Release => {
 				for &index in holding.iter().filter(|&&index| ready(index)) {
@@ -507,33 +630,15 @@ impl Sleeper {
 		if txn.failed.is_none() {
 			txn.failed = Some((action, who, why));
 		}
-		txn.forward.clear();
+		txn.plan.failed(action);
 	}
 
 	// EVERY TARGET OF THE STEP ANSWERED: the step's undo owed, and the next step free to start.
 	fn complete(&mut self, action: Action) {
 		let Some(txn) = self.txn.as_mut() else { return };
 		txn.current = None;
-		// THE THAW GOES LAST in every resume, after the resume notice, whichever was taken first.
-		let owed = match action {
-			Action::Announce => Some(Action::Resumed),
-			Action::Freeze => {
-				txn.undo.insert(0, Action::Thaw);
-				None
-			}
-			Action::Flush => Some(Action::Release),
-			Action::Drivers => Some(Action::DriversResume),
-			Action::Platform => Some(Action::Wake),
-			_ => None,
-		};
-		if let Some(owed) = owed {
-			// The resume notice before the thaw, whose place is fixed at the bottom.
-			if owed == Action::Resumed && txn.undo.first() == Some(&Action::Thaw) {
-				txn.undo.insert(1, owed);
-			} else {
-				txn.undo.push(owed);
-			}
-		}
+		// WHAT THE STEP OWES THE UNDO - the thaw last in every resume, after the resume notice - is the plan's.
+		txn.plan.completed(action);
 	}
 
 	// ------------------------------------------------------------------ the answers
@@ -593,10 +698,21 @@ impl Sleeper {
 					say(&format!("{device} did not come back and is bound again"));
 				}
 			}
-			Action::Enter => match Woke::read(reader) {
+			Action::ImageDrivers => {
+				let resumed = read_list(reader).unwrap_or_default();
+				say(&format!("the image is written through {}", if resumed.is_empty() { String::from("no binding") } else { resumed.join(", ") }));
+			}
+			Action::Enter | Action::RamEnter => match Woke::read(reader) {
+				// THE SNAPSHOT'S FIRST ANSWER: nothing slept - the image is to be written.
+				Some(woke) if woke.wake == WakeReason::Snapshot => say("hibernation's snapshot is taken - the image is written next"),
+				// ITS SECOND, IN THE MACHINE THE IMAGE RESTORED, is a sleep that ended: nothing of the image's steps goes
+				// forward.
 				Some(woke) => {
 					if let Some(txn) = self.txn.as_mut() {
 						txn.slept = true;
+						if woke.wake == WakeReason::Restored {
+							txn.plan.restored();
+						}
 					}
 					say(&format!("resumed - woken by {:?} after {} ms", woke.wake, woke.slept / 1_000_000));
 					self.record.wake = woke.wake;
@@ -648,6 +764,19 @@ impl Sleeper {
 
 	fn finish(&mut self) -> Ended {
 		let txn = self.txn.take().expect("a transaction to finish");
+		// WHAT THE SLEEP ARMED, for `status`; and THE SCHEDULED WAKE SPENT once its time has come - by the sleep it woke,
+		// or by one that slept past it, once however many periods it missed.
+		if txn.slept {
+			self.last_wake_nodes = txn.wake_nodes.clone();
+			self.last_awake_by_ms = txn.awake_by_ms;
+		}
+		if self.scheduled != 0 && (txn.slept || txn.scheduled) {
+			let now = clock_rtc();
+			if now != 0 && self.scheduled <= now {
+				say(&format!("the scheduled wake at {} is spent", self.scheduled));
+				self.scheduled = 0;
+			}
+		}
 		let record = &mut self.record;
 		match (&txn.failed, txn.slept) {
 			(_, true) => record.outcome = SleepOutcome::Resumed,
@@ -720,11 +849,25 @@ fn read_list(reader: &mut Reader) -> Option<Vec<String>> {
 	Some(out)
 }
 
+// THE IMAGE COMPONENT'S STATUS, on its control channel - 0 where it does not run.
+fn image_status(image: u64) -> Result<HibernationStatus, String> {
+	if image == 0 {
+		return Err(String::from("the hibernation image component does not run"));
+	}
+	match hibernation_image::Client::with_deadline(ChannelTransport { chan: image }, clock().saturating_add(STATUS_TICKS)).status() {
+		Some(Ok(status)) => Ok(status),
+		Some(Err(error)) => Err(format!("the image component answered {error:?}")),
+		None => Err(String::from("the image component did not answer")),
+	}
+}
+
 // ------------------------------------------------------------------ the served interface
 
 struct Api<'a> {
 	sleeper: &'a mut Sleeper,
 	client: u64,
+	// The image component's control channel, 0 where it does not run.
+	image: u64,
 }
 
 impl system_sleep::Service for Api<'_> {
@@ -732,11 +875,11 @@ impl system_sleep::Service for Api<'_> {
 		if state == SleepState::Disk {
 			return Err(Error::Invalid);
 		}
-		self.sleeper.request(state, timed_wake_ms, reason)
+		self.sleeper.request(state, timed_wake_ms, reason, false, 0)
 	}
 
-	fn hibernate(&mut self, reason: SleepReason) -> Result<(), Error> {
-		self.sleeper.request(SleepState::Disk, 0, reason)
+	fn hibernate(&mut self, hybrid: bool, reason: SleepReason) -> Result<(), Error> {
+		self.sleeper.request(SleepState::Disk, 0, reason, hybrid, self.image)
 	}
 
 	fn inhibit(&mut self, milliseconds: u32, reason: String) -> Result<(), Error> {
@@ -758,10 +901,45 @@ impl system_sleep::Service for Api<'_> {
 	fn last_sleep(&mut self) -> Result<SleepRecord, Error> {
 		Ok(self.sleeper.record.clone())
 	}
+
+	fn status(&mut self) -> Result<SleepStatus, Error> {
+		let offered: u64 = sleep_states();
+		let fixed = |bit: u64| if offered & bit != 0 { String::from("the fixed button PM1 carries") } else { String::from("a control-method device, or none") };
+		let mut wake_sources: Vec<WakeSource> = alloc::vec![
+			WakeSource { name: String::from("power button"), armed: offered & SLEEP_FIXED_POWER_BUTTON != 0, detail: fixed(SLEEP_FIXED_POWER_BUTTON) },
+			WakeSource { name: String::from("sleep button"), armed: offered & SLEEP_FIXED_SLEEP_BUTTON != 0, detail: fixed(SLEEP_FIXED_SLEEP_BUTTON) },
+			WakeSource { name: String::from("timed wake"), armed: true, detail: String::from("the one-shot timer for suspend to idle, the CMOS alarm for suspend to RAM") },
+			WakeSource { name: String::from("scheduled wake"), armed: self.sleeper.scheduled != 0, detail: if self.sleeper.scheduled != 0 { format!("at {} (Unix seconds)", self.sleeper.scheduled) } else { String::from("none scheduled") } },
+		];
+		for node in self.sleeper.last_wake_nodes.iter().take(28) {
+			wake_sources.push(WakeSource { name: node.clone(), armed: false, detail: String::from("a device whose driver armed wake at the last sleep") });
+		}
+		let now = clock();
+		let inhibitors = self.sleeper.inhibitors.iter().filter(|inhibitor| inhibitor.until > now).take(16).map(|inhibitor| SleepInhibitor { reason: inhibitor.reason.clone(), remaining_ms: (inhibitor.until - now).saturating_mul(1000) / TICKS_PER_SECOND }).collect();
+		let (hibernation_set_up, hibernation_why, last_image) = match image_status(self.image) {
+			Ok(status) => (status.set_up, status.why, status.last_image),
+			Err(why) => (false, why, String::from("none")),
+		};
+		Ok(SleepStatus { idle: offered & (1 << SLEEP_STATE_IDLE) != 0, ram: offered & (1 << SLEEP_STATE_RAM) != 0, disk: offered & (1 << SLEEP_STATE_DISK) != 0, wake_sources, inhibitors, watchdog_cap_ms: self.sleeper.last_awake_by_ms, scheduled_wake: self.sleeper.scheduled, hibernation_set_up, hibernation_why, last_image })
+	}
+
+	// A CONNECTION MINTED WITHOUT THE WAKE GRANT IS REFUSED: a program that can wake the machine can empty its battery.
+	fn schedule_wake(&mut self, unix_seconds: u64) -> Result<(), Error> {
+		if !may_wake(self.client) {
+			return Err(Error::Denied);
+		}
+		if unix_seconds != 0 && unix_seconds <= clock_rtc() {
+			return Err(Error::Invalid);
+		}
+		self.sleeper.scheduled = unix_seconds;
+		say(&if unix_seconds == 0 { String::from("the scheduled wake is cancelled") } else { format!("a wake is scheduled at {unix_seconds} (Unix seconds)") });
+		Ok(())
+	}
 }
 
-// ONE REQUEST ON A `system-sleep` CONNECTION; a connection that closed is retired.
-pub(super) fn serve(near: u64, sleeper: &mut Sleeper, buf: &mut [u8]) {
+// ONE REQUEST ON A `system-sleep` CONNECTION; a connection that closed is retired. `image` is the image component's
+// control channel, 0 where it does not run.
+pub(super) fn serve(near: u64, sleeper: &mut Sleeper, buf: &mut [u8], image: u64) {
 	let (len, mut handles) = match try_recv_caps(near, buf) {
 		PolledCaps::Message { len, handles } => (len, handles),
 		PolledCaps::Empty => return,
@@ -780,7 +958,7 @@ pub(super) fn serve(near: u64, sleeper: &mut Sleeper, buf: &mut [u8]) {
 		if op == HEARTBEAT_OP {
 			let _ = try_send(near, b"PONG", 0);
 		} else {
-			let minted: u64 = mint().unwrap_or(0);
+			let minted: u64 = mint_with(may_wake(near)).unwrap_or(0);
 			if !try_send(near, &[], minted) && minted != 0 {
 				close(minted);
 			}
@@ -789,7 +967,7 @@ pub(super) fn serve(near: u64, sleeper: &mut Sleeper, buf: &mut [u8]) {
 	}
 	let mut reply = alloc::vec![0u8; 4096];
 	let mut reply_handles = wire::Handles::new();
-	let written = system_sleep::dispatch(&mut Api { sleeper, client: near }, &buf[..len], &mut handles, &mut reply, &mut reply_handles);
+	let written = system_sleep::dispatch(&mut Api { sleeper, client: near, image }, &buf[..len], &mut handles, &mut reply, &mut reply_handles);
 	for &leftover in handles.as_slice().iter().chain(reply_handles.as_slice()) {
 		close(leftover);
 	}

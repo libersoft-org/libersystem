@@ -26,10 +26,16 @@
 #      undefined type, each refused while the rest is still read.
 #   5. AN ORDERLY REBOOT: the graceful-shutdown record in the log the next boot reads - the simulator's log survives the
 #      reset - ahead of that boot's own boot record.
+#   6. A SLEEP WITH BOTH DRIVERS BOUND: the harness BMC on ISA KCS and a simulated one on SSIF, S3 offered, the watchdog
+#      policy naming the BMC at 30 s - not the bridge bound. A suspend to idle and an S3 cycle, each answered by both
+#      `ipmi` bindings and `smbus_ich9`; SSIF identifying its BMC again after the S3; and in the harness BMC's record of
+#      what it received, for each sleep and in this order: the announcement's longest timeout, the driver's disarm ("don't
+#      stop" clear), after the resume the driver's re-arm with the bridge bound, and only then the service's restore of
+#      its configured timeout.
 #
 # WHAT IT DOES NOT CLAIM HERE: the protected screen's cases (the log's erasure approved, declined and cancelled by an
-# event, and the chassis stops) are `check-ipmi-admin.sh`'s; the BMC's watchdog is `check-watchdog.sh`'s; the
-# out-of-band cross-check needs OpenIPMI and ipmitool on the host; the sleep case is the suspend exchange's.
+# event, and the chassis stops) are `check-ipmi-admin.sh`'s; the BMC's watchdog outside a sleep is `check-watchdog.sh`'s;
+# the out-of-band cross-check needs OpenIPMI and ipmitool on the host.
 #
 # IT BOOTS ITS OWN DEVELOPMENT INSTANCES in private state, one at a time, drives the shell over the serial console
 # (`lab.sh sh`), and takes the last one down from the EXIT trap whatever happened.
@@ -459,4 +465,105 @@ order="$(grep -a -o -E "this system's (boot completed|orderly shutdown)" "$state
 [[ "$order" == "this system's boot completed|this system's orderly shutdown|this system's boot completed|" ]] || fail "the log must hold the first boot, its orderly shutdown and the second boot, in that order (read: $order)"
 take_down
 echo "ipmi: an orderly reboot's shutdown record is in the log ahead of the next boot's"
-echo "ipmi: PASS - five interfaces, each its own BMC; SMBIOS agreeing with every ISA and SSIF node; sensors, FRU and one boot event through KCS and SSIF, a restart writing none again; a pair reported and written once; the harness BMC's LAN, users, identify, temperatures, follow, bound and absences; malformed records refused; an orderly reboot's shutdown record ahead of the next boot's"
+
+# ------------------------------------------------------------------ 6. a sleep with both drivers bound
+
+qmp() {
+	python3 - "$state/qemu-qmp.sock" "$1" <<'EOF'
+import json, socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.settimeout(10)
+sock.connect(sys.argv[1])
+stream = sock.makefile('rw')
+def answer():
+	while True:
+		line = json.loads(stream.readline())
+		if 'event' not in line:
+			return line
+def command(execute):
+	stream.write(json.dumps({'execute': execute}) + '\n')
+	stream.flush()
+	return answer()
+answer()
+command('qmp_capabilities')
+result = command(sys.argv[2])
+if sys.argv[2] == 'query-status':
+	print(result['return']['status'])
+EOF
+}
+
+await_state() {
+	for _ in $(seq 1 "$(($2 * 2))"); do
+		[[ "$(qmp query-status 2>/dev/null || true)" == "$1" ]] && return 0
+		sleep 0.5
+	done
+	fail "sleep: QEMU was not $1 after $2 s"
+}
+
+# THE HARNESS BMC'S SET WATCHDOG TIMER REQUESTS since line `from` of its record, in the order the case requires.
+watchdog_order() {
+	local from="$1" what="$2"
+	python3 - "$state/record-sleep.log" "$from" "$what" <<'EOF' || fail "sleep: $what - the BMC did not receive the watchdog's step in order (see $kept/record-sleep.log)"
+import sys
+path, start, what = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+seen = []
+for line in open(path).read().splitlines()[start:]:
+	words = line.split()
+	if len(words) >= 3 and words[0] == '0x06' and words[1] == '0x24':
+		data = bytes.fromhex(words[2])
+		seen.append((data[0], int.from_bytes(data[4:6], 'little')))
+want = [('the announcement\'s longest timeout', lambda use, count: use & 0x40 and count == 65535),
+	('the driver\'s disarm', lambda use, count: not use & 0x40),
+	('the driver\'s re-arm with the bridge bound', lambda use, count: use & 0x40 and count == 1200),
+	('the service\'s restore of its configured timeout', lambda use, count: use & 0x40 and count == 300)]
+at = 0
+for use, count in seen:
+	if at < len(want) and want[at][1](use, count):
+		at += 1
+if at < len(want):
+	sys.exit(f'{what}: {want[at][0]} did not follow in order; the requests were {seen}')
+print(f'ipmi: sleep: {what} - the announcement\'s longest timeout, the disarm, the re-arm with the bridge bound and the restore, in order')
+EOF
+}
+
+start_harness sleep --guid 0102030405060708090a0b0c0d0e0f11
+export QEMU_EXTRA="$(extern_bmc)-device isa-ipmi-kcs,bmc=bmcx,irq=0 $(sim bmc1 0x43 "$(guid 9)")-device smbus-ipmi,bmc=bmc1,address=0x10 -global ICH9-LPC.disable_s3=0"
+boot sleep
+for pair in "watchdog.enabled on" "watchdog.device bmc" "watchdog.timeout-ms 30000" "watchdog.period-ms 4000" "watchdog.deadline-ms 2000"; do
+	# shellcheck disable=SC2086 # the key and its value are two words, as `set` takes them
+	out="$(./dev.sh launch --timeout 60 set $pair 2>&1)" || fail "sleep: set $pair was not run: $out"
+	grep -q "ok" <<<"$out" || fail "sleep: set $pair was refused: $out"
+done
+armed=$(seen "WatchdogService: armed bmc at")
+./dev.sh launch --timeout 60 stop watchdog_service >/dev/null 2>&1 || true
+./dev.sh launch --timeout 60 start watchdog_service >/dev/null 2>&1 || true
+await_line "WatchdogService: armed bmc at" "sleep: the watchdog service did not arm the BMC's watchdog" "$armed" 60
+for kind in idle ram; do
+	from=$(wc -l <"$state/record-sleep.log")
+	ended=$(seen "ServiceManager: sleep: the transaction ended")
+	restored=$(seen "WatchdogService: restored bmc to")
+	answered=$(seen "the BMC answers again")
+	if [[ "$kind" == idle ]]; then
+		./dev.sh launch --timeout 120 sleepctl suspend idle 5 >"$state/sleepctl-$kind.log" 2>&1 || true
+	else
+		./dev.sh launch --timeout 200 sleepctl suspend ram >"$state/sleepctl-$kind.log" 2>&1 &
+		await_state suspended 60
+		sleep 2
+		qmp system_wakeup >/dev/null
+		await_state running 30
+	fi
+	await_line "ServiceManager: sleep: the transaction ended" "sleep: the $kind sleep never ended" "$ended" 180
+	grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1 | grep -q "slept and woke" || fail "sleep: the $kind sleep did not sleep and wake"
+	await_line "WatchdogService: restored bmc to" "sleep: the watchdog service did not restore its timeout after the $kind sleep" "$restored" 30
+	for binding in "driver.ipmi: " "driver.smbus-ich9: "; do
+		tail -n 400 "$(serial_log)" | grep -a -q "${binding}.*resumed" || fail "sleep: $binding did not answer the $kind sleep's resume"
+	done
+	# BOTH BMCS IDENTIFIED AGAIN at the resume - SSIF's included - each binding saying its BMC answers.
+	await_line "the BMC answers again" "sleep: the BMCs were not identified again after the $kind sleep" "$((answered + 1))" 60
+	watchdog_order "$from" "the $kind sleep"
+done
+take_down
+stop_harness
+cp -f "$state/record-sleep.log" "$kept/" 2>/dev/null || true
+echo "ipmi: a sleep with KCS and SSIF bound: both answered to idle and S3, SSIF identified again, and the BMC received the watchdog's step in order"
+echo "ipmi: PASS - five interfaces, each its own BMC; SMBIOS agreeing with every ISA and SSIF node; sensors, FRU and one boot event through KCS and SSIF, a restart writing none again; a pair reported and written once; the harness BMC's LAN, users, identify, temperatures, follow, bound and absences; malformed records refused; an orderly reboot's shutdown record ahead of the next boot's; a sleep with KCS and SSIF bound, the BMC's watchdog stepped in order"

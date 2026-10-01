@@ -25,6 +25,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "partition"
+version = "0.0.0"
+
+[[package]]
 name = "service-logic"
 version = "0.0.0"
 dependencies = [
@@ -32,6 +36,7 @@ dependencies = [
  "base-proto",
  "bootproto",
  "event-proto",
+ "partition",
  "smartcard-model",
  "wasm",
 ]

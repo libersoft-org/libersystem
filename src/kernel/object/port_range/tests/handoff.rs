@@ -273,6 +273,10 @@ fn the_sleep_entry_follows_the_owner_it_finds_and_a_wake_from_s3_programs_the_ua
 	assert_eq!(COM2.write_bytes(b"queued for the tap\n"), 19);
 	let from = COM2.record_len();
 	COM2.sleep_begin();
+	// THE DRIVER'S SETTINGS, read as the loan began: the first three reads are its IER, LCR and MCR.
+	let read_at_loan: alloc::vec::Vec<(u16, u8)> = COM2.record_from(from).iter().filter(|access| !access.write).take(3).map(|access| (access.offset, access.value)).collect();
+	assert_eq!(read_at_loan.iter().map(|(offset, _)| *offset).collect::<alloc::vec::Vec<u16>>(), [IER, LCR, MCR], "the loan reads the driver's settings before it programs anything");
+	let driver_ier: u8 = read_at_loan[0].1;
 	assert_eq!(COM2.owner(), Owner::Sleep(key.generation), "lent for the window");
 	let writes = writes_since(from);
 	assert!(is_boot_sequence(&writes, false), "programmed with the receive interrupt left off: {writes:?}");
@@ -284,8 +288,13 @@ fn the_sleep_entry_follows_the_owner_it_finds_and_a_wake_from_s3_programs_the_ua
 	assert_eq!(COM2.write_bytes(b"sleep: resumed\n"), 15);
 	let writes = writes_since(from);
 	assert!(is_boot_sequence(&writes, false), "the wake programs it again, the receive interrupt still off while lent: {writes:?}");
+	let handed_back = COM2.record_len();
 	COM2.sleep_end();
 	assert_eq!(COM2.owner(), Owner::Driver(key.generation), "the claim holds it again");
+	// AND WITH THE DRIVER'S SETTINGS: the interrupt enables it had are the last thing written - a UART handed back with
+	// the receive interrupt off is a console that answers nothing typed after a suspend to idle.
+	let last_ier = writes_since(handed_back).iter().rev().find(|access| access.offset == IER).map(|access| access.value);
+	assert_eq!(last_ier, Some(driver_ier), "the driver's IER is written back last");
 	let before = COM2.record_len();
 	assert_eq!(COM2.write_bytes(b"for the tap\n"), 12);
 	assert_eq!(COM2.record_len(), before, "and later lines queue for the tap");

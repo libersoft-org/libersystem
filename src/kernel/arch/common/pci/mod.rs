@@ -52,6 +52,10 @@ const RESOURCED: &[(u8, u8, u8, u32, usize)] = &[
 	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_IPMI, abi::PCI_PROG_IF_IPMI_BT, abi::DEVICE_TYPE_IPMI_BT, 0),
 ];
 
+// THE FUNCTIONS RESOLVED BY IDENTITY, whose class names nothing a register file could be found by: QEMU's `ivshmem-plain`,
+// whose window is BAR 2, the memory a host file backs.
+const RESOURCED_BY_ID: &[(u16, u16, u32, usize)] = &[(abi::PCI_VENDOR_REDHAT, abi::PCI_DEVICE_IVSHMEM, abi::DEVICE_TYPE_SHARED_MEMORY, 2)];
+
 // PCI status register bit 4: a capability list is present (pointer at offset 0x34).
 const STATUS_CAP_LIST: u16 = 1 << 4;
 // Vendor-specific capability id; virtio describes its MMIO structures with these.
@@ -417,6 +421,9 @@ impl PciDevice {
 	// beside an `is_nvme` beside an `is_ahci` is a list every caller has to keep up with, and the
 	// table above is the list.
 	pub fn resourced_type(&self) -> Option<(u32, usize)> {
+		if let Some(&(_, _, device_type, bar)) = RESOURCED_BY_ID.iter().find(|(vendor, device, _, _)| self.vendor == *vendor && self.device_id == *device) {
+			return Some((device_type, bar));
+		}
 		RESOURCED.iter().find(|(class, subclass, prog_if, _, _)| self.class == *class && self.subclass == *subclass && self.prog_if == *prog_if).map(|(_, _, _, device_type, bar)| (*device_type, *bar))
 	}
 

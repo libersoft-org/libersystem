@@ -14,6 +14,9 @@ SECTIONS
 {
 	/* higher-half: top 2 GB, matches the kernel code model */
 	. = 0xffffffff80000000;
+	/* THE KERNEL'S CODE AND READ-ONLY DATA, from here to `__kernel_image_end`: what a hibernation image's system digest
+	 * reads of the kernel it was written by. */
+	__kernel_image_start = .;
 
 	.text : {
 		*(.text .text.*)
@@ -37,6 +40,7 @@ SECTIONS
 		KEEP(*(.extable))
 		__extable_end = .;
 	} :rodata
+	__kernel_image_end = .;
 
 	. = ALIGN(CONSTANT(MAXPAGESIZE));
 

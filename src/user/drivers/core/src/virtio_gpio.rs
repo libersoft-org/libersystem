@@ -14,6 +14,12 @@
 // THE EVENT QUEUE IS INTERRUPT-DRIVEN, on this device's own MSI-X vector: a line may not fire for the life of
 // the machine, and a driver that polled for it would spin under a cooperative scheduler for nothing. The
 // request queue is polled, one request at a time, as every virtio control queue here is.
+//
+// A SLEEP THAT CUTS THE POWER stops the device in the suspend step and brings it back IN PLACE at the resume: the
+// transport negotiated again, both queues restored, and every held line set up again as it was (`gpio::Lines::
+// restore`). The binding and every connection on it survive, which is what the lines' consumers need - the ACPI
+// service's `_AEI` events and fields, a Type-C controller's alert - since a rebind would come only after the drivers'
+// resume, and every driver resumed before it would wait on a line with nothing behind it.
 
 #![no_std]
 #![no_main]
@@ -26,6 +32,56 @@ use driver_protocol::GpioTrigger as ScopedTrigger;
 use drivers::common;
 use drivers::gpio::{self, Event, Lines, Request, Scope, Step, Trigger};
 use drivers::virtio::{self, Queue, Virtio};
+
+// THE SLEEP - see the head of this file.
+struct Sleep<'a> {
+	device: &'a Virtio,
+	controller: &'a mut Controller,
+	serving: &'a mut common::Serving,
+	stopped: bool,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		match self.device.sleep(request) {
+			Some(stopped) => {
+				self.stopped = stopped;
+				driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+			}
+			None => driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 },
+		}
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		let stopped = core::mem::take(&mut self.stopped);
+		if !lost_power && !stopped {
+			return true;
+		}
+		let controller = &mut *self.controller;
+		{
+			let mut queues: Vec<&mut Queue> = Vec::new();
+			queues.push(&mut controller.requests);
+			if let Some(events) = controller.events.as_mut() {
+				queues.push(events);
+			}
+			if !self.device.wake(&mut queues, lost_power, stopped) {
+				return false;
+			}
+		}
+		let mut steps = Vec::new();
+		controller.lines.restore(&mut steps);
+		if !controller.run(&steps) {
+			print(b"driver.virtio-gpio: its lines could not be set up again after the sleep\n");
+			return false;
+		}
+		print(b"driver.virtio-gpio: resumed - the device and every held line set up again in place\n");
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		Some(self.serving)
+	}
+}
 use proto::system::{Error, GpioEvent, GpioLine, GpioTrigger, gpio_device};
 use rt::*;
 
@@ -427,15 +483,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut buf = alloc::vec![0u8; 512];
 		let irq_set = [irq];
 		let devices: &[u64] = if irq != 0 { &irq_set } else { &[] };
+		common::takes_sleep();
 		loop {
-			match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, devices) {
+			match common::wait_providers_or_sleep(bootstrap, &bind, &mut serving, devices, false) {
 				None => {
 					if common::stop_requested() {
 						common::finish_stop(bootstrap, &bind, device.capability, common::quiesce_virtio());
 					}
 					exit();
 				}
-				Some(common::ProviderReady::Connected(index)) => {
+				Some(None) => {
+					if !common::take_sleep_step(bootstrap, &bind, &mut Sleep { device: &device, controller: &mut controller, serving: &mut serving, stopped: false }) {
+						if common::stop_requested() {
+							common::finish_stop(bootstrap, &bind, device.capability, common::quiesce_virtio());
+						}
+						exit();
+					}
+				}
+				Some(Some(common::ProviderReady::Connected(index))) => {
 					// ONE LINE, HELD BY ONE CONNECTION. Anything else is refused on the connection itself.
 					let admitted = match serving.scope_at(index) {
 						driver_protocol::Scope::GpioLine { line, trigger } => controller.take(serving.at(index), line, trigger).map_err(|why| refused(Some(line), why)).is_ok(),
@@ -448,12 +513,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						exit();
 					}
 				}
-				Some(common::ProviderReady::Consumer(index)) => {
+				Some(Some(common::ProviderReady::Consumer(index))) => {
 					if !serve(&mut controller, &serving, index, &mut buf) && !part(&mut controller, &mut serving, bootstrap, &bind, index) {
 						exit();
 					}
 				}
-				Some(common::ProviderReady::Device(_)) => {
+				Some(Some(common::ProviderReady::Device(_))) => {
 					// Read the ISR before acknowledging, which deasserts a level-triggered line and reads zero on
 					// MSI-X.
 					let _ = device.read_isr();

@@ -354,6 +354,9 @@ enum provider-kind {
 	/// `typec-provider` contract - its partner, roles, contract, offers, cable and modes, and the operator's four
 	/// requests - which TypeCService alone consumes. A connector that can sink is ALSO a `power-source`.
 	typec-connector = 27,
+	/// A PLATFORM SWITCH - a lid - the `platform-switch` contract below: its state and every change after it, which the
+	/// power-state service alone consumes for its sleep policy.
+	platform-switch = 28,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by
@@ -722,6 +725,25 @@ interface usb {
 	@op(1) list: func() -> result<list<usb-device>, error>;
 }
 
+/// WHICH SWITCH: a lid, today.
+enum switch-kind {
+	lid = 1,
+}
+
+/// A PLATFORM SWITCH'S STATE, and the count of changes its driver has read.
+record switch-state {
+	kind:     switch-kind,
+	closed:   bool,
+	sequence: u32,
+}
+
+/// THE `platform-switch` PROVIDER CONTRACT, which a lid's driver publishes and the power-state service consumes: the
+/// state now, then every change after it - one frame for each reading that differed from the last, a reading made at
+/// each `Notify` and at every resume. What a closed lid DOES is the consumer's policy; this reports and decides nothing.
+interface platform-switch {
+	@op(1) watch: func() -> stream<switch-state>;
+}
+
 /// WHAT A WATCHDOG IS, as its driver read it at bind.
 ///
 /// THE TIMEOUT IS ONE NUMBER: the time from the last pet to the reset. Each driver divides it across its device's
@@ -773,7 +795,9 @@ record acpi-notification {
 /// VALUES TRAVEL IN THE SERVICE'S ENCODING: per value a tag byte - 0x01 integer (eight bytes), 0x02 string, 0x03
 /// buffer (a u32 length and the bytes), 0x04 package (a u32 count and the values), 0x05 reference (the path it
 /// names), 0x00 none - bounded in depth and size at both ends. PLATFORM METHODS ARE REFUSED: `_INI`, `_REG`, `_OSC`,
-/// `_PTS`, `_WAK` and the sleep objects are the service's, and so is every other node.
+/// `_PTS`, `_WAK` and the sleep objects are the service's, and so is every other node. SO ARE THE DEVICE POWER
+/// METHODS - `_PS0` to `_PS3`, `_PSW` and `_DSW`: a device's power state is asked for with `set-power-state`, because
+/// the power resources behind it are shared with other devices and counted by the service.
 interface acpi-node {
 	/// The node this connection is scoped to: its identity, `acpi:` and the absolute path.
 	@op(1) path:          func() -> result<string, error>;
@@ -786,6 +810,16 @@ interface acpi-node {
 	@op(4) dsm:           func(@bound(16) uuid: list<u8>, revision: u64, function: u64, @bound(4096) arguments: list<u8>) -> result<list<u8>, error>;
 	/// The node's `Notify` values, as the firmware raises them.
 	@op(5) notifications: func() -> stream<acpi-notification>;
+	/// ENTER A DEVICE POWER STATE - 0 to 3 are D0 to D3hot, 4 is D3cold: the state's `_PRx` power resources turned on
+	/// first, in their `resource_order`, then `_PSx`, then what the old state held and this one does not let go - each
+	/// resource ON while any device holds it and OFF with the last. The state the node is already in runs nothing; a
+	/// node with neither `_PSx` nor `_PRx` answers `ok`, its power not the firmware's to switch. `io` when a method
+	/// failed - nothing then changed - and `invalid` for a number that is no state.
+	@op(6) set-power-state:   func(state: u8) -> result<unit, error>;
+	/// THE STATE TO ENTER FOR A SYSTEM SLEEP - `target` 0 for suspend to idle, 3 for RAM, 4 for disk - and whether the
+	/// device is to wake the machine from it, from the node's `_SxD` and `_SxW` (`_S0W` alone for suspend to idle): the
+	/// deepest it may enter, and where it wakes, the deepest it still wakes from. Encoded as `set-power-state` takes it.
+	@op(7) sleep-power-state: func(target: u8, wake: bool) -> result<u8, error>;
 }
 
 /// What a connection DeviceManager hands the ACPI service is for.

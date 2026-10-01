@@ -450,6 +450,11 @@ static SLEEP_MASKED: [core::sync::atomic::AtomicBool; IRQ_COUNT + WIRED_COUNT] =
 
 pub fn mask_claimed_lines() {
 	for (at, slot) in LINES.iter().enumerate() {
+		// A WAKE-SET LINE STAYS LIVE: its driver marked it, and its firing is what ends the sleep.
+		let vector = if at < IRQ_COUNT { IRQ_BASE as u32 + at as u32 } else { WIRED_BASE as u32 + (at - IRQ_COUNT) as u32 };
+		if crate::sleep::is_wake(vector) {
+			continue;
+		}
 		let gsi = slot.lock().as_ref().map(|line| line.gsi);
 		if let Some(gsi) = gsi
 			&& super::ioapic::unmasked(gsi)
@@ -461,14 +466,14 @@ pub fn mask_claimed_lines() {
 }
 
 // AND EVERY LIVE MSI-X ENTRY THE KERNEL PROGRAMMED, masked the same way for a suspend to idle - a message is an
-// interrupt like a wired line, and its device's driver has quiesced it - and unmasked again after. The wake set's are a
-// driver's to mark (the wake set has no such entry yet), so none is left live here.
+// interrupt like a wired line, and its device's driver has quiesced it - and unmasked again after. The wake set's, which
+// a driver marked, are left live.
 static SLEEP_MSIX_MASKED: [core::sync::atomic::AtomicBool; MSI_COUNT] = [const { core::sync::atomic::AtomicBool::new(false) }; MSI_COUNT];
 
 pub fn mask_msix_entries() {
 	for slot in 0..MSI_COUNT {
 		let virt = msix_virt(slot);
-		if !MSIX_LIVE[slot].load(Ordering::Acquire) || super::paging::translate(virt).is_none() {
+		if !MSIX_LIVE[slot].load(Ordering::Acquire) || super::paging::translate(virt).is_none() || crate::sleep::is_wake(MSI_BASE as u32 + slot as u32) {
 			continue;
 		}
 		let entry = (virt + MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64) as *mut u32;

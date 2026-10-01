@@ -616,6 +616,43 @@ fn signal_terminate_wakes_a_blocked_thread() {
 	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
 }
 
+tagged_test!(a_thread_killed_in_a_wait_set_lets_go_of_every_member, [Process, Syscall, Ipc], id = "kernel.kernel.a_thread_killed_in_a_wait_set_lets_go_of_every_member", covers = ["kernel"]);
+fn a_thread_killed_in_a_wait_set_lets_go_of_every_member() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::thread::ThreadState;
+	static BLOCKED: AtomicBool = AtomicBool::new(false);
+	static PAST_WAIT: AtomicBool = AtomicBool::new(false);
+	// A KILLED PROCESS'S WAIT SET MUST GO WITH IT, and its members with the set. The wait's `exit` never returns, so a
+	// reference to the set held in its frame was never dropped - and the set held every member: a channel end in it never
+	// closed for its peer. A killed StorageService, whose control channel was one of its members, was never seen to end by
+	// the supervisor, and every client waiting on it waited for ever - an orderly reboot stopped there.
+	extern "C" fn victim(handle: u64) {
+		unsafe {
+			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(set), "a wait set is created");
+			assert!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, handle, 0, 0) as i64 > 0, "the channel end joins the set");
+			BLOCKED.store(true, Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0);
+			PAST_WAIT.store(true, Ordering::SeqCst);
+		}
+	}
+	let (a, b) = object::channel::Channel::create();
+	let victim_thread = sched::spawn_with_object(victim, a, object::rights::Rights::ALL);
+	sched::run_until_idle();
+	assert!(BLOCKED.load(Ordering::SeqCst), "the victim ran and blocked in the set");
+	assert!(!b.is_peer_closed(), "while it waits, its end is open");
+	// The kill, as `SIG_KILL` delivers it.
+	let process = victim_thread.process().clone();
+	process.terminate();
+	for thread in process.live_threads() {
+		sched::wake_thread(&thread);
+	}
+	sched::run_until_idle();
+	assert!(!PAST_WAIT.load(Ordering::SeqCst), "the killed thread retired at the wait");
+	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
+	assert!(b.is_peer_closed(), "and the end the set held has closed for its peer");
+}
+
 tagged_test!(a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops, [Ipc, Scheduler, Kernel], id = "kernel.kernel.a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops", covers = ["kernel"]);
 fn a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops() {
 	use core::sync::atomic::{AtomicBool, Ordering};

@@ -65,7 +65,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("lsblk", "lsblk [json] - list the block devices and their volumes"),
 	("lsdev", "lsdev [json] - list the device nodes"),
 	("btctl", "btctl [-c N] [list|scan|pair|enable|disable|forget|power] ... - Bluetooth controllers, pairing and bonds"),
-	("sleepctl", "sleepctl [last | suspend [idle|ram] [SECONDS] | hibernate | inhibit SECONDS REASON] - put the machine to sleep, and how the last sleep ended"),
+	("sleepctl", "sleepctl [last | status | suspend [idle|ram] [SECONDS] | hibernate [hybrid] | inhibit SECONDS REASON | wake-at SECONDS | wake-cancel] - put the machine to sleep, what can wake it, and how the last sleep ended"),
 	("tpm", "tpm info | random N | pcr N | extend N TEXT | seal N TEXT FILE | unseal FILE | quote N NONCE FILE - the TPM's identity, random bytes, PCRs, sealed secrets and quotes"),
 	("bmc", "bmc [info | sensors | sel [--follow | clear] | fru | chassis ... | lan | users] [BMC] - the BMCs this system reaches; erasing and stopping are asked of a person"),
 	("typec", "typec - every USB Type-C connector: its partner, roles, contract, offers, cable, modes and last refusal"),

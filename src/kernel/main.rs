@@ -37,6 +37,7 @@ mod pkg;
 mod perf;
 // Fixed-hardware platform events (the power button), and the channel they are delivered on.
 mod platform_event;
+mod power;
 mod product;
 mod sched;
 mod sleep;
@@ -500,7 +501,7 @@ fn serial_console_pump() {
 	// it owned would be a second manager beside an orphan, which is worse than a reboot.
 	if resident_manager_lost() {
 		serial_println!("recovery: SystemManager ended after the system was up - the control plane has no owner, rebooting");
-		arch::reset();
+		power::reset();
 	}
 	static NUDGED: AtomicBool = AtomicBool::new(false);
 	if !NUDGED.load(Ordering::Relaxed) && console_input::shell_listening() {
@@ -905,6 +906,19 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	let firmware = Capability::new(Privilege::create(PrivilegeKind::FirmwareInterpreter).expect("the firmware privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
 	// ALLOC-OK: as above
 	kernel_ep.send(Message::new(b"FIRMWARE".to_vec(), alloc::vec![firmware])).map_err(|_| "failed to hand SystemManager the firmware privilege")?;
+	// THE CLOCK SOURCE'S PRIVILEGE, the sixth: what a Time and Alarm Device's driver hands the kernel the wall clock
+	// under. Last, like every addition; ServiceManager hands it to DeviceManager, which duplicates it for that binding.
+	// ALLOC-OK: boot, before userspace exists.
+	let clock_source = Capability::new(Privilege::create(PrivilegeKind::ClockSource).expect("the clock-source privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
+	// ALLOC-OK: as above
+	kernel_ep.send(Message::new(b"CLOCKSRC".to_vec(), alloc::vec![clock_source])).map_err(|_| "failed to hand SystemManager the clock-source privilege")?;
+	// THE HIBERNATION PRIVILEGE, the seventh: what the image component reads a snapshot and replaces memory under - the
+	// widest authority there is, and one component's alone. Last; ServiceManager keeps it and duplicates it for each start
+	// of that service.
+	// ALLOC-OK: boot, before userspace exists.
+	let hibernation = Capability::new(Privilege::create(PrivilegeKind::Hibernation).expect("the hibernation privilege, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE);
+	// ALLOC-OK: as above
+	kernel_ep.send(Message::new(b"HIBERNATE".to_vec(), alloc::vec![hibernation])).map_err(|_| "failed to hand SystemManager the hibernation privilege")?;
 	Ok((kernel_ep, process))
 }
 
@@ -1539,7 +1553,7 @@ pub(crate) fn boot_userspace(window_ticks: u64) {
 		// though every one of them was admitted before this point. Whatever bound, bound.
 		dma_policy::report();
 		serial_println!("recovery: SystemManager could not be stabilized after {} attempts - rebooting", MAX_RESTARTS + 1);
-		arch::reset();
+		power::reset();
 	}
 }
 

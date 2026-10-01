@@ -162,3 +162,105 @@ notice, its drivers' steps and the watchdog-across-a-sleep case; the IPMI, UCSI 
   with the wire's 16-bit count (was wrongly 32-bit).
 - Verification so far: `./build.sh --arch x86_64` -> RESULT ok (after the provider lists were made exact and
   `sleepctl` joined the wave table). No guest run yet.
+
+## Part a and b in the guest (x86_64): the S3 and suspend-to-idle faults found and fixed
+
+- DeviceManager deadlocked the resume after an S3: `persist_incidents` wrote the "did not come back" incidents through
+  ConfigService while StorageService held writes, and writes are released only after the drivers' resume answers. The
+  write now runs after the sleep step and not while a sleep run exists (`device_manager.rs`, the standing loop).
+- The development channel did not survive an S3 (rebound, its host handshake lost): `dev_channel.rs` takes the sleep
+  itself - stopped for a sleep that cuts the power, `Virtio::restore` plus `serial_port::Stream::rearm` (both queues
+  restored, the receive pool posted again) at the resume, under the same binding.
+- The display stopped presenting after any display-driver rebind (not S3-specific): a configuration within the same
+  generation - the output replaced under an unchanged extent - made the client library drop its images and offer them
+  again, which the service refuses within a generation; the console stayed `out-of-date` for good. `surface::Surface::
+  rebuild` now only acknowledges such a configuration (`src/user/libs/display/surface/src/lib.rs`). Evidence: a
+  screendump before and after a line typed on the emulated keyboard differed before an S3 and was identical after it,
+  before the fix.
+- S3's record listed every core as "cpu0 ... 0 wakeups": the entry reports no parked cores for S3 (the per-core record is
+  suspend to idle's); `arch/x86_64/sleep.rs`.
+- The keyboard is restored in place after an S3 and is a wake source in suspend to idle (`virtio_input.rs` `Sleep`), the
+  pointer restored in place.
+- A wake that lands on another core than the entry's now kicks the entry's core (`sleep::woke_by` sends a wake IPI to
+  `ENTRY_CPU`); before, a fixed button routed to the boot core left an entry on another core halted until its timer.
+
+## Part c - what wakes the machine, the devices that ask for sleep, the policy
+
+- THE WAKE SET: `SYS_INTERRUPT_WAKE = 113` (`rt::interrupt_wake`) marks the Interrupt a driver holds as a wake source
+  (WRITE, while it owns its binding; the mark goes with the binding at revoke and drop). `sleep::{mark_wake, is_wake,
+  device_interrupt}`: a 32-slot set; `idle::interrupt` reports a marked device interrupt taken while sleeping as
+  `WAKE_DEVICE` with its identity; `mask_claimed_lines`/`mask_msix_entries` leave marked lines live.
+  `SYS_SLEEP_STATES = 114` (`rt::sleep_states`): the states the entry takes (suspend to RAM once `\_S3` is registered and
+  the FACS exists) and the fixed buttons from the FADT's PWR_BUTTON/SLP_BUTTON flags (`sci::fixed_buttons`).
+- `system-sleep` gains `status` (op 6: states, wake sources, inhibitors, the last sleep's watchdog cap, the scheduled
+  wake) and `schedule-wake` (op 7), the latter only on a connection minted for the new `sleep-wake` capability
+  (`liber:security@1`, appended; `CAP_SLEEP_WAKE`, PermissionManager's vocabulary 54, granted to `sleepctl`). A `CONNECT`
+  on a wake-capable connection mints a wake-capable one. The scheduled wake becomes the next sleep's timed wake when it
+  is earlier, is spent by the sleep it woke or by one that slept past it, and one already past at a request is spent
+  then. ServiceManager refuses at acceptance a state the entry would not take (`Unsupported`, recorded as refused).
+- `sleepctl status`, `sleepctl wake-at SECONDS`, `sleepctl wake-cancel`; the synopsis updated.
+- DeviceManager's fixed sleep button: a `SLEEP` role (a `system-sleep` connection ServiceManager mints; manifest, LAST
+  after `CATADMIN`) asked for a suspend - to RAM where offered, else idle - with reason `sleep-button`
+  (`press_sleep_button`), answered at acceptance.
+- THE CONTROL-METHOD BUTTONS AND THE LID: `acpi_button` (new driver; pure parts `drivers::acpi_button`, 3 host tests)
+  bound to `PNP0C0C`/`PNP0C0E`/`PNP0C0D` (hid and cid rules): a power button's `Notify(0x80)` powers off through a
+  `system-power` connection DeviceManager hands it (by driver name, as the keyboards'); a sleep button's asks for a
+  suspend through a `system-sleep` connection minted from DeviceManager's door (new `ResourceKind::SysSleep = 13`);
+  `Notify(0x02)` is said as the wake. The lid publishes the new `platform-switch` provider kind (28; `liber:device@1`
+  `platform-switch.watch` stream of `switch-state`), `_LID` read at bind, at each `Notify` and at every resume. Wake
+  armed when asked (the ACPI service arms `_PRW`).
+- THE TIME AND ALARM DEVICE: `acpi_tad` (new driver; pure parts `drivers::acpi_tad`, 4 host tests: `_GCP`, `_GRT` with
+  the zone, the timer value). A new privilege kind `ClockSource`, minted at boot and relayed kernel -> SystemManager
+  (`CLOCKSRC`) -> ServiceManager (kept, `CLOCK_SOURCE`) -> DeviceManager (`CLOCKSRC` role, LAST) -> the `acpi_tad` binding
+  (`ResourceKind::ClockSource = 14`). `SYS_CLOCK_BASE = 115` (`rt::clock_base`): the wall clock handed; `SYS_CLOCK_RTC`
+  now answers `sleep::rtc_unix` - the CMOS clock where `arch::rtc_present()` (FADT `cmos_rtc_not_present`, or the
+  development switch's `rtc`), else the handed base counted forward on the boot-time clock, 0 before one. An S3 with no
+  RTC arms no CMOS alarm and leaves its length unknown (`sleep::slept_unknown`) until the base handed at the resume,
+  which the boot-time clock takes in one step. The driver programs `_STV` on the AC and DC timers from the sleep's timed
+  wake in its suspend step and reads, clears and disables them at the resume.
+- THE ORDERLY POWER-OFF AND THE FORCED DEADLINE (P02M0198d's pieces the critical battery needs): `system-power` gains
+  `power-off-within(seconds)` (SystemManager -> `SYS_SYSTEM_POWER` action `POWER_OFF_WITHIN = 2`). The kernel's `power`
+  module (new): the earliest deadline kept, never later, never cancelled; checked in `idle::timer_interrupt` on every
+  core and folded into the idle boot core's one-shot; `power::reset` powers off instead of resetting while armed (the
+  recovery ladder, the lost-SystemManager path and `POWER_REBOOT`); the sleep entry refused while armed. Two kernel tests
+  (the earliest kept and fired at its tick; fired from the timer interrupt while the core spins). A new `system-shutdown`
+  interface served by ServiceManager (`service_manager/shutdown.rs`): answered at acceptance, then the admin door's
+  sequence, or `end_by` with the door "system-shutdown's power-off" while a sleep's transaction runs.
+- THE ACTIVITY SIGNAL (P02M0199c's root, built here as the plan allows): InputService serves `ACTIVITY`
+  (`liber:input@1/input-activity`, `watch(idle-after-ms)` -> stream of `idle`/`active`), every input source feeding
+  `Activity::seen`, the next edge a housekeeping deadline of the loop; the edges are `service_logic::activity` (3 host
+  tests). DisplayService serves `OUTPUTS` (`display-outputs.outputs`: the one output, active while a scanout is
+  attached, external only where a platform description says so - none is read yet).
+- THE POLICY in PowerService (`power_service/policy.rs`), deciding nothing itself: `service_logic::sleep_policy` (5 host
+  tests) - a closed lid suspends once per closing unless an external display is in use; idleness suspends on battery
+  once per edge (or when going on battery while idle); a critical battery hibernates once, and a refused hibernation (as
+  every one is until part e) powers off in order: `power-off-within(10)` then `system-shutdown.power-off`. Roles:
+  CATALOGUE gains `platform-switch`; ACTIVITY, OUTPUTS; SLEEP, SYSPOWER, SHUTDOWN filled by `supervisor_role` at every
+  start and relaunch. Dependencies gain input_service and display_service.
+- THE DEFAULTS the plan lists are implemented as `Settings::default()` (lid suspends, idle suspends on battery after 15
+  minutes); the plan says the owner confirms them when the part starts - asked in the final report.
+- Verification so far: host tests - `drivers` `acpi_` 11 passed (the zone sign and the wake mapping each watched
+  failing under a mutation); `service_logic` `activity::`/`sleep_policy::` 8 passed (the external-display guard and the
+  idle edge each watched failing); `system-manifest` 29 passed. Kernel tests
+  `kernel.sleep.a_marked_interrupt_wakes_the_sleep_and_nothing_else_does`, `the_wake_the_sleep_saw_first_is_the_one_reported`,
+  `a_suspend_to_idle_parks_every_core_until_its_timed_wake_and_no_clock_jumps` -> PASS 3 passed (before the power module
+  was added); the power-module tests not yet run. `foreign-audit-link.py --check` after the rt changes -> reproduces.
+
+## Part d - the gate `check-sleep.sh` (x86_64)
+
+Three boots, each its own instance in private state:
+1. S3 offered: suspend to idle with host-stamped serial lines (the counter silent between the kernel's lines, monotonic
+   against boot-time clock across the gap, a 20 s Timer firing after its remaining awake time, the parking record);
+   S3 by `system_wakeup`; S3 by the RTC alarm; after each wake ping, a file read back, a frame presented (screendump
+   before/after typed keys), a line typed at the serial console answered, the wall clock within 2 s, a 1 s wait on time;
+   a Ctrl+Z job across a sleep and `fg`; the sleep fixture hot-plugged after the S3s (the restored Slot Control); a
+   refusal unwinding the drivers' step; a shutdown typed during a held drivers' step.
+2. The platform: the fixture SSDT with `--sleep` (LID0, PWRB, SLPB, TAD0 and `_E06` on GPIO line 6; `acpi-fixture.py
+   --sleep-event`, `--tad-clock`, `--tad-read`), the CMOS RTC named absent: lid, TAD clock and timer, sleep button,
+   policy relaunch, power button through the registered `\_S5`.
+3. The soft-off fallback: the registration refused, `shutdown` through the fixed ports.
+A KEY WAKE FROM S3 WAS CHECKED, NOT ASSUMED: with the guest in S3, a key through `dev.sh key` and a QMP
+`input-send-event` each left QEMU `suspended` (2026-09-30) - the gate does not require it.
+Runs so far: boot 1's suspend-to-idle case PASS (count 131 -> 132: monotonic +581 ms, boot-time +5498 ms; a 20 s Timer
+fired after 19994 ms awake and 24911 ms since boot; 64 cores parked, none woke for anything else; 4959 ms measured
+between the kernel's lines for a 5 s wake); the rest in progress.

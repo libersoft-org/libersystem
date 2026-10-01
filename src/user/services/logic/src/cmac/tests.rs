@@ -1,4 +1,4 @@
-use super::{mac, subkeys};
+use super::{Stream, mac, subkeys};
 use crate::aes::{BLOCK, Key};
 
 // RFC 4493's own examples, typed from the document. An expected value produced by this code would
@@ -77,4 +77,28 @@ fn a_trailing_zero_is_not_the_same_message() {
 	assert_ne!(mac(&key, &[]), mac(&key, &[0]));
 	// And length alone is not what distinguishes them: the same bytes give the same tag.
 	assert_eq!(mac(&key, &[1, 2, 3]), mac(&key, &[1, 2, 3]));
+}
+
+#[test]
+// THE STREAM IS THE SAME TAG IN PIECES: the RFC's four messages, each split at every point, and a long message fed in
+// uneven pieces, agree with the one-shot tag - the empty message and the whole-block ending included, which are where
+// a stream that decided "last block" too early would part from it.
+fn a_stream_fed_in_any_pieces_gives_the_one_shot_tag() {
+	let key = rfc_key();
+	let message = hex(MESSAGE);
+	for length in [0usize, 16, 40, 64] {
+		let whole = mac(&key, &message[..length]);
+		for split in 0..=length {
+			let mut stream = Stream::new(&key);
+			stream.update(&message[..split]);
+			stream.update(&message[split..length]);
+			assert_eq!(stream.finish(), whole, "length {length} split at {split}");
+		}
+	}
+	let long: alloc::vec::Vec<u8> = (0..5000u32).map(|at| (at * 7 + 3) as u8).collect();
+	let mut stream = Stream::new(&key);
+	for piece in long.chunks(333) {
+		stream.update(piece);
+	}
+	assert_eq!(stream.finish(), mac(&key, &long));
 }

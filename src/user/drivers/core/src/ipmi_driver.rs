@@ -592,9 +592,12 @@ impl common::SleepStep for Driver {
 			Ok(found) => self.say(&format!("resumed - the interface is {found}")),
 			Err(failure) => self.say(&format!("resumed - the interface did not prepare ({failure:?}); the BMC is asked again as it answers")),
 		}
-		// THE WATCHDOG FIRST, with the countdown it had: a resume that hangs is caught by it.
+		// THE WATCHDOG FIRST, with the countdown it had but at most the bridge bound: what it had is the longest the watchdog
+		// service set at the announcement, and a resume that hangs after the drivers is caught within the bound instead of
+		// an hour and a half later. The service's resume notice restores its configured timeout.
 		if let Some(timeout) = self.watchdog.as_mut().and_then(|wd| wd.slept_ms.take()) {
 			self.in_watchdog = true;
+			let timeout = timeout.min(u64::from(drivers::watchdog::RESUME_WATCH_MS));
 			let armed = ipmi::watchdog::arm(timeout, 0).map(|request| ipmi_bmc::data(self, &request).is_ok() && ipmi_bmc::data(self, &ipmi::watchdog::pet()).is_ok());
 			self.in_watchdog = false;
 			self.say(if armed == Some(true) { "the BMC's watchdog is armed again" } else { "the BMC's watchdog did not take its arm again" });

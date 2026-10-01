@@ -38,6 +38,7 @@ use proto::system::process;
 use proto::system::supervisor;
 use proto::system::system_power;
 use proto::system::{Entry, Error, Field, Severity, SupervisorStat};
+use proto::system::{Grant as TpmGrant, tpm_admin};
 use rt::*;
 use services::capability_names::*;
 
@@ -47,6 +48,10 @@ mod bootstrap;
 mod lifecycle;
 #[path = "service_manager/provider_checks.rs"]
 mod provider_checks;
+#[path = "service_manager/restore.rs"]
+mod restore;
+#[path = "service_manager/shutdown.rs"]
+mod shutdown;
 #[path = "service_manager/sleep.rs"]
 mod sleep;
 
@@ -409,6 +414,14 @@ static SELFTEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 // THE FIRMWARE INTERPRETER'S PRIVILEGE, as the boot chain handed it over: the one copy the ACPI service's are
 // duplicated from. Zero when the kernel sent none.
 static FIRMWARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE SYSTEMPOWER CONNECTION THIS SUPERVISOR HOLDS, as a factory: the power-state service's `system-power` role is minted
+// from it at every start - see `supervisor_role`.
+static SYSTEM_POWER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE CLOCK SOURCE'S PRIVILEGE, likewise kept: DeviceManager is handed a duplicate at every start.
+pub(crate) static CLOCK_SOURCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// THE HIBERNATION PRIVILEGE, kept: the image component - the one holder, which reads the snapshot and replaces memory -
+// is given a duplicate at every start.
+pub(crate) static HIBERNATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 // THE `supervisor-liveness` END THIS SUPERVISOR ANSWERS ON, in the standing loop's wait set. Minted again at every
 // start of the watchdog service, the new end replacing the old one - see `supervisor_role`.
 static LIVENESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -419,6 +432,10 @@ static STATUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 // the machine reset by the hardware rather than by anything this supervisor does.
 #[cfg(feature = "development")]
 static LIVENESS_SILENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// AND THE SLEEP GATE'S: the next sleep's resume hangs once the drivers are back - the watchdog re-armed, `alive` still
+// unanswered - so the hardware's expiry is what ends it.
+#[cfg(feature = "development")]
+pub(crate) static SLEEP_HANG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // The boot mode's name, as the watchdog service's policy defaults follow it: a test boot, a development image, or a
 // shipping one.
@@ -441,7 +458,19 @@ fn boot_mode() -> &'static [u8] {
 // relaunched instance in a test boot would otherwise read no mode at all; and its `supervisor-liveness` channel,
 // whose near end REPLACES the one the standing loop answered on - the old one died with the instance that held its
 // peer.
-fn supervisor_role(service: &[u8], role: &Role) -> Option<(Vec<u8>, u64)> {
+// A CLIENT END NARROWED TO A CLIENT ROLE'S CEILING - send, receive, wait and transfer - and the full end it was copied
+// from closed. A connection this supervisor mints carries every right, as a root's `CONNECT` answers one, so that a
+// grant's holder can narrow it again; a service reading its ROLES refuses one that arrives with more than its kind
+// allows, so a client minted for a role is narrowed here before it is handed over.
+fn client_end(handle: u64) -> Option<u64> {
+	let narrowed: i64 = duplicate(handle, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+	close(handle);
+	(narrowed > 0).then_some(narrowed as u64)
+}
+
+// `proc` is the started process's handle and `tpm_admin` the client end kept of TpmService's minting root, 0 where there is
+// none: the image component's seal grant is minted for its component and dies with its task, as PermissionManager's are.
+fn supervisor_role(service: &[u8], role: &Role, proc: u64, tpm_admin: u64) -> Option<(Vec<u8>, u64)> {
 	// THE ACPI SERVICE'S PRIVILEGE, duplicated from the copy kept here - so a relaunched instance holds it as the
 	// first did. None kept, the tag goes carrying nothing, and the service says so.
 	if service == b"acpi_service" && role.tag == ROLE_FIRMWARE {
@@ -467,6 +496,52 @@ fn supervisor_role(service: &[u8], role: &Role) -> Option<(Vec<u8>, u64)> {
 			close(old);
 		}
 		return Some((Vec::from(role.tag), narrowed as u64));
+	}
+	// THE POWER-STATE SERVICE'S THREE CLIENT ROLES, which only this supervisor can fill - `system-sleep` and
+	// `system-shutdown` are served here and `system-power` is reached through the connection held of SystemManager's - a
+	// fresh client each at the first start and at every relaunch, so a relaunched policy still suspends on a closed lid
+	// and still powers off on a critical battery.
+	if service == b"power_service" {
+		return match role.tag {
+			b"SLEEP" => Some((Vec::from(role.tag), client_end(sleep::mint()?)?)),
+			b"SHUTDOWN" => Some((Vec::from(role.tag), client_end(shutdown::mint()?)?)),
+			b"SYSPOWER" => Some((Vec::from(role.tag), client_end(service_connect(SYSTEM_POWER.load(core::sync::atomic::Ordering::Relaxed))?)?)),
+			_ => None,
+		};
+	}
+	// THE HIBERNATION IMAGE COMPONENT'S THREE: the privilege it reads a snapshot and replaces memory under, duplicated from
+	// the copy kept here; the restore's door, minted afresh; and its `tpm-seal` grant, minted from TpmService's root for
+	// its component name - the one name its key is sealed and unsealed under - and tied to this start's task.
+	if service == b"hibernation_service" {
+		return match role.tag {
+			b"HIBERNATE" => {
+				let kept = HIBERNATION.load(core::sync::atomic::Ordering::Relaxed);
+				if kept == 0 {
+					return Some((Vec::from(role.tag), 0));
+				}
+				let copy: i64 = duplicate(kept, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+				(copy > 0).then(|| (Vec::from(role.tag), copy as u64))
+			}
+			b"RESTORE" => Some((Vec::from(role.tag), client_end(restore::mint()?)?)),
+			b"TPMSEAL" => {
+				if tpm_admin == 0 || proc == 0 {
+					return Some((Vec::from(role.tag), 0));
+				}
+				let admin = service_connect(tpm_admin)?;
+				let owner: i64 = duplicate(proc, RIGHT_WAIT | RIGHT_TRANSFER);
+				if owner < 0 {
+					close(admin);
+					return Some((Vec::from(role.tag), 0));
+				}
+				let minted = tpm_admin::Client::new(ChannelTransport { chan: admin }).mint(&TpmGrant::TpmSeal, "hibernation_service", &(owner as u64));
+				close(admin);
+				match minted {
+					Some(Ok(connection)) => Some((Vec::from(role.tag), client_end(connection)?)),
+					_ => Some((Vec::from(role.tag), 0)),
+				}
+			}
+			_ => None,
+		};
 	}
 	if service != b"watchdog_service" {
 		return None;
@@ -580,6 +655,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len == 8 && &buf[..8] == b"SYSPOWER" && handle != 0 => handle,
 		_ => exit(),
 	};
+	SYSTEM_POWER.store(power, core::sync::atomic::Ordering::Relaxed);
 
 	// 1c. receive the boot mode flag ("MODE" + one byte, relayed down the chain from
 	//     the kernel). The bring-up self-tests - the stop-path exercise and the canary
@@ -649,6 +725,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		&& &buf[..8] == b"FIRMWARE"
 	{
 		FIRMWARE.store(handle, core::sync::atomic::Ordering::Relaxed);
+	}
+	// 1h. and the clock source's, kept the same way for DeviceManager.
+	if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf)
+		&& len >= 8
+		&& &buf[..8] == b"CLOCKSRC"
+	{
+		CLOCK_SOURCE.store(handle, core::sync::atomic::Ordering::Relaxed);
+	}
+	// 1i. and hibernation's, kept the same way for the image component, which is given a duplicate at every start.
+	if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf)
+		&& len >= 9
+		&& &buf[..9] == b"HIBERNATE"
+	{
+		HIBERNATION.store(handle, core::sync::atomic::Ordering::Relaxed);
 	}
 
 	// 2. bring the services up in dependency order. Each pass starts every pending
@@ -804,10 +894,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// to prove a governed tool's grant survives a service restart), minted like the
 	// process connection above, before the root transfers to the shell.
 	let mut drill_perm: u64 = 0;
+	// UNTIL THE IMAGE COMPONENT'S VERDICT only what it needs starts - see `restore`.
+	let before_verdict: [bool; N] = restore::before_verdict();
+	let mut verdict_owed: bool = index_of(b"hibernation_service").is_some();
 	loop {
 		let mut progress: bool = false;
 		let mut cursor: usize = 0;
-		while let Some(i) = service_logic::service_lifecycle::next_startable(cursor, N, |i| state[i] == State::Absent, |i| MANIFEST[i].deps, |dep| index_of(dep).is_some_and(|idx| state[idx] == State::Ready)) {
+		while let Some(i) = service_logic::service_lifecycle::next_startable(cursor, N, |i| state[i] == State::Absent && (!verdict_owed || before_verdict[i]), |i| MANIFEST[i].deps, |dep| index_of(dep).is_some_and(|idx| state[idx] == State::Ready)) {
 			cursor = i + 1;
 			let mut proc_handle: u64 = 0;
 			let (started, why): (State, Reason) = start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut role_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut net_client, &mut display_client, &mut display_admin, &mut display_stats, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf);
@@ -866,6 +959,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if MANIFEST[i].name == b"process_service" && started == State::Ready {
 				broker_process = service_connect(process_client).unwrap_or(0);
 			}
+			// THE IMAGE COMPONENT'S VERDICT, waited for before anything else starts.
+			if MANIFEST[i].name == b"hibernation_service" {
+				if started == State::Ready {
+					restore::await_verdict(&channels, &state, &mut buf);
+				}
+				verdict_owed = false;
+			}
 			if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 				broker_storage_admin = storage_admin;
 			}
@@ -909,17 +1009,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// on-disk journal) is delivered late, like its config client: minted
 				// from the freshly mounted system volume and sent on LogService's
 				// control channel.
+				// AND OWED, NOT SENT, WHERE AN IMAGE COMPONENT RUNS: until its verdict on an image found at mount, the system
+				// volume's writes are held, and a journal flush that waited on them would stall LogService - see `restore`.
 				if let Some(lg) = index_of(b"log_service") {
 					let journal: u64 = open_storage_directory(storage_admin, "vol://system/log");
-					if journal != 0 {
+					if journal != 0 && index_of(b"hibernation_service").is_some() {
+						restore::JOURNAL_OWED.store(journal, core::sync::atomic::Ordering::Release);
+					} else if journal != 0 {
 						send_blocking(channels[lg], b"STORAGE", journal);
 					}
 				}
 			}
 		}
 		if !progress {
+			// AN IMAGE COMPONENT THAT CANNOT START - a dependency failed - gives no verdict: the rest starts without it.
+			if verdict_owed {
+				verdict_owed = false;
+				continue;
+			}
 			break;
 		}
+	}
+
+	// THE JOURNAL OWED TO AN IMAGE COMPONENT THAT DID NOT START: nothing will give the verdict, so nothing is waited for.
+	if index_of(b"hibernation_service").is_none_or(|index| state[index] != State::Ready) {
+		restore::release_journal(&channels);
 	}
 
 	// WHAT NEVER STARTED, AND WHY. The loop above stops when no service can make progress, and a
@@ -1463,6 +1577,7 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_TYPEC,
 			CAP_TYPEC_CONTROL,
 			CAP_SLEEP,
+			CAP_SLEEP_WAKE,
 		],
 		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
 		// over at bring-up went with the instance that ended.
@@ -1509,8 +1624,8 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		return;
 	}
 	// THIS SUPERVISOR'S OWN AUTHORITY: minted here, since it serves the interface itself.
-	if name == CAP_SLEEP {
-		match sleep::mint() {
+	if name == CAP_SLEEP || name == CAP_SLEEP_WAKE {
+		match sleep::mint_with(name == CAP_SLEEP_WAKE) {
 			Some(minted) => {
 				send_blocking(chan, b"OK", minted);
 			}
@@ -1793,7 +1908,7 @@ fn hand_acpi_admin(kept: &Kept, channels: &[u64; N]) {
 // the plan cannot carry - its liveness channel and the boot mode - are `supervisor_role`'s, and its timers are in the
 // hardware. The ACPI service's privilege is `supervisor_role`'s too, and what it published is the kernel's to keep.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service" || name == b"hibernation_service"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its
@@ -1806,6 +1921,7 @@ fn relaunch_planned(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 	broker.kept.release_serve_roots(idx);
 	let Some((manager_side, service_side)) = channel() else { return false };
 	let proc: i64 = bootstrap::launch_service_from_volume(broker.process, MANIFEST[idx].name, MANIFEST[idx].program, service_side);
+	let tpm_admin: u64 = broker.kept.end_of(b"tpm_service", b"ADMIN");
 	if proc < 0 {
 		close(manager_side);
 		return false;
@@ -1815,7 +1931,7 @@ fn relaunch_planned(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 	let storage_admin: u64 = broker.storage_admin;
 	let mut external = |role: &Role| -> Option<(Vec<u8>, u64)> {
 		// THE ROLES ONLY THIS SUPERVISOR CAN FILL, answered as the first start answered them.
-		if let Some(filled) = supervisor_role(MANIFEST[idx].name, role) {
+		if let Some(filled) = supervisor_role(MANIFEST[idx].name, role, proc as u64, tpm_admin) {
 			return Some(filled);
 		}
 		if MANIFEST[idx].name == b"admin_service" && role.tag == b"JOURNAL" {
@@ -1969,9 +2085,10 @@ fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Des
 		loop {
 			// N services, the canary, the four supervisor channels plus the console's, and the watchdog service's
 			// liveness channel.
-			let mut handles: [u64; N + 10 + sleep::MAX_SLEEP_CLIENTS] = [0u64; N + 10 + sleep::MAX_SLEEP_CLIENTS];
-			let mut kinds: [u8; N + 10 + sleep::MAX_SLEEP_CLIENTS] = [0u8; N + 10 + sleep::MAX_SLEEP_CLIENTS];
-			let mut idxs: [usize; N + 10 + sleep::MAX_SLEEP_CLIENTS] = [0usize; N + 10 + sleep::MAX_SLEEP_CLIENTS];
+			const SLOTS: usize = N + 10 + sleep::MAX_SLEEP_CLIENTS + shutdown::MAX_SHUTDOWN_CLIENTS + restore::MAX_RESTORE_CLIENTS;
+			let mut handles: [u64; SLOTS] = [0u64; SLOTS];
+			let mut kinds: [u8; SLOTS] = [0u8; SLOTS];
+			let mut idxs: [usize; SLOTS] = [0usize; SLOTS];
 			let mut targets: [sleep::Target; 2] = [sleep::Target::Process; 2];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
@@ -2036,6 +2153,24 @@ fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Des
 					handles[count] = near;
 					kinds[count] = 9;
 					idxs[count] = slot;
+					count += 1;
+				}
+			}
+			// THE ORDERLY POWER-OFF'S CLIENTS.
+			for client in shutdown::SHUTDOWN_CLIENTS.iter() {
+				let near: u64 = client.load(core::sync::atomic::Ordering::Relaxed);
+				if near != 0 {
+					handles[count] = near;
+					kinds[count] = 11;
+					count += 1;
+				}
+			}
+			// A RESTORE'S DOOR.
+			for client in restore::RESTORE_CLIENTS.iter() {
+				let near: u64 = client.load(core::sync::atomic::Ordering::Relaxed);
+				if near != 0 {
+					handles[count] = near;
+					kinds[count] = 12;
 					count += 1;
 				}
 			}
@@ -2237,7 +2372,21 @@ fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Des
 				9 => {
 					// A `system-sleep` request - or a client that closed.
 					let near: u64 = handles[r];
-					sleep::serve(near, &mut sleeper, buf);
+					let image: u64 = index_of(b"hibernation_service").filter(|&index| state[index] == State::Ready).map_or(0, |index| channels[index]);
+					sleep::serve(near, &mut sleeper, buf, image);
+				}
+				12 => restore::serve(handles[r], channels, state, buf),
+				11 => {
+					// THE ORDERLY POWER-OFF, ASKED THROUGH `system-shutdown`: answered, then taken as the admin door's is -
+					// ending a sleep's transaction at its next step, or run now.
+					if shutdown::serve(handles[r], buf) {
+						console_report(b"system-shutdown", b"asked for the orderly power-off");
+						if sleeper.running() {
+							sleeper.end_by(sleep::Door { name: alloc::string::String::from("system-shutdown's power-off"), action: POWER_OFF });
+						} else {
+							run_power_verb(POWER_OFF, false, power, policy.shutdown_notice_ticks, state, channels, sup, procs, log_client, buf);
+						}
+					}
 				}
 				10 => {
 					// AN ANSWER THE SLEEP'S TRANSACTION AWAITS from ProcessService's supervisor root or SystemManager.
@@ -2328,6 +2477,13 @@ fn handle_admin(admin: u64, power: u64, notice_ticks: u64, sleeper: &mut sleep::
 		LIVENESS_SILENT.store(true, core::sync::atomic::Ordering::Relaxed);
 		debug_write(b"service_manager: supervisor-liveness answers stopped (development hook)\n");
 		send_blocking(admin, b"LIVENESS SILENT", 0);
+		return true;
+	}
+	#[cfg(feature = "development")]
+	if name == b"!sleep-hang" {
+		SLEEP_HANG.store(true, core::sync::atomic::Ordering::Relaxed);
+		debug_write(b"service_manager: the next sleep's resume will hang after the drivers (development hook)\n");
+		send_blocking(admin, b"SLEEP HANG ARMED", 0);
 		return true;
 	}
 	// AND ITS CRASH: `!crash <service>` SIG_KILLs a running service's process, so the standing loop sees its

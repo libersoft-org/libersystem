@@ -425,6 +425,22 @@ interface display-trusted {
 	@op(3) release: func(epoch: u64) -> result<unit, error>;
 }
 
+/// One output DisplayService drives.
+record display-output {
+	index:    u32,
+	/// A scanout is attached and showing.
+	active:   bool,
+	/// The platform describes it as external - a connector, not the machine's own panel. An output the platform says
+	/// nothing about is the machine's own.
+	external: bool,
+}
+
+/// THE OUTPUTS, read-only, on DisplayService's `OUTPUTS` root: which it drives and whether each is the machine's own -
+/// what the sleep policy asks before a closed lid suspends the machine.
+interface display-outputs {
+	@op(1) outputs: func() -> result<list<display-output>, error>;
+}
+
 /// Privileged launcher boundary. PermissionManager transfers the Process capability returned by
 /// ProcessService and receives a fresh display connection bound to that exact process. Ordinary
 /// display clients never receive this interface and cannot bind themselves or another task;

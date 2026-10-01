@@ -1121,3 +1121,36 @@ fn an_entry_array_must_sit_in_its_own_copys_metadata_region() {
 	let mut ok = primary_only(Layout::primary(), &entries);
 	assert_eq!(probe(&mut ok), Disk::LiberFs { first: 2048, last: 30000 });
 }
+
+// THE HIBERNATION PARTITION BESIDE THE SYSTEM VOLUME: found by its type, alone; the system volume still found beside it; a
+// disk with two, or with a table that does not verify, answers none.
+#[test]
+fn a_partition_of_a_type_is_found_alone_beside_the_system_volume() {
+	const HIBERNATION: [u8; 16] = HIBERNATION_TYPE_GUID;
+	let hibernation = |first: u64, last: u64| Entry { guid: HIBERNATION, first, last, unique: None };
+	let mut img = gpt_disk(&[liberfs_entry(2048, 40959), hibernation(40960, 49151)]);
+	assert_eq!(find_partition(&mut img, &HIBERNATION), Some((40960, 49151)));
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: 2048, last: 40959 }, "the system volume is still the one LiberFS partition");
+	let mut two = gpt_disk(&[liberfs_entry(2048, 40959), hibernation(40960, 45055), hibernation(45056, 49151)]);
+	assert_eq!(find_partition(&mut two, &HIBERNATION), None, "two are no answer");
+	let mut none = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	assert_eq!(find_partition(&mut none, &HIBERNATION), None);
+	let mut broken = gpt_disk(&[liberfs_entry(2048, 40959), hibernation(40960, 49151)]);
+	if let Some(header) = broken.sectors.get_mut(&1) {
+		header[16] ^= 0xFF;
+	}
+	assert_eq!(find_partition(&mut broken, &HIBERNATION), None, "a header whose checksum fails is not read");
+}
+
+#[test]
+fn an_image_is_held_only_where_its_magic_and_its_state_say_so() {
+	let mut first = [0u8; SECTOR_SIZE];
+	assert!(!holds_hibernation_image(&first), "an empty partition holds none");
+	first[..8].copy_from_slice(&HIBERNATION_IMAGE_MAGIC);
+	assert!(!holds_hibernation_image(&first), "a header whose state is empty - invalidated - holds none");
+	first[HIBERNATION_STATE_AT..HIBERNATION_STATE_AT + 4].copy_from_slice(&HIBERNATION_STATE_IMAGE.to_le_bytes());
+	assert!(holds_hibernation_image(&first));
+	first[0] ^= 1;
+	assert!(!holds_hibernation_image(&first), "another magic is no image");
+	assert!(!holds_hibernation_image(&first[..8]), "nor are too few bytes");
+}

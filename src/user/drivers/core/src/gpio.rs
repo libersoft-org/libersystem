@@ -199,6 +199,25 @@ impl Lines {
 		steps.push(Step::Send(Request { kind: MSG_SET_DIRECTION, line, value: DIRECTION_NONE }));
 	}
 
+	// THE DEVICE LOST ITS STATE - a sleep that cut its power, or the stop this driver made for one: the steps that set
+	// every held line up again as it was, in `take`'s order - input direction, then for an interrupt line its trigger,
+	// and its event buffer only where the device had it. A line whose event was delivered and not acknowledged keeps
+	// its buffer here, masked as before, and the acknowledgement queues it; an edge that came while the device was
+	// down is not seen, as a controller without power sees none, while a level still asserted fires at its buffer.
+	pub fn restore(&self, steps: &mut Vec<Step>) {
+		for &(line, held) in &self.held {
+			steps.push(Step::Send(Request { kind: MSG_SET_DIRECTION, line, value: DIRECTION_IN }));
+			match held {
+				Held::Level => {}
+				Held::Armed(trigger) => {
+					steps.push(Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line, value: trigger as u32 }));
+					steps.push(Step::QueueEvent(line));
+				}
+				Held::Delivered(trigger) => steps.push(Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line, value: trigger as u32 })),
+			}
+		}
+	}
+
 	// Whether `line` is held for events - which is what may acknowledge.
 	pub fn is_interrupt(&self, line: u16) -> bool {
 		self.find(line).is_some_and(|at| !matches!(self.held[at].1, Held::Level))

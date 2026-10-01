@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 157] = [
+const GATES: [(&str, &str); 159] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -440,6 +440,15 @@ const GATES: [(&str, &str); 157] = [
 	// SSDT, the kernel's publication and policy, DeviceManager's node channels and grants and the fixture driver's
 	// probes. Its subject is the kernel mechanism and the services and drivers above it.
 	("acpi", "kernel"),
+	// SLEEP AND RESUME, on development instances of its own with S3 offered: the kernel's entry, freeze and clocks, the
+	// transaction through the drivers and the services, the platform's half through the ACPI service and the fixture
+	// SSDT's devices - with QEMU's run state and the host's stamps as the oracles. Its subject is the kernel mechanism
+	// and everything above it.
+	("sleep", "kernel"),
+	// HIBERNATION, on development instances of its own with S4 offered and swtpm: the kernel's snapshot and whole-memory
+	// replacement, the image component, the storage area and the transaction - with the held QMP connection and the
+	// disk's header as the oracles. Its subject is the kernel mechanism and the services above it.
+	("hibernate", "kernel"),
 	// The lifecycle contract, end to end. Its subject is the runtime's init/fini runner, the kernel's
 	// per-image lifecycle table and the two fixtures that exercise them - a userspace or kernel
 	// change selects it, and it boots a guest because a constructor is only observable from inside
@@ -882,7 +891,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 58] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 60] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -918,6 +927,9 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 58] = [
 	"watchdog",
 	// And the firmware namespace's, which boots two.
 	"acpi",
+	// And the sleep's and hibernation's, which boot several in turn.
+	"sleep",
+	"hibernate",
 	// And HID over I2C's.
 	"i2c-hid",
 	"virtio-multiport",

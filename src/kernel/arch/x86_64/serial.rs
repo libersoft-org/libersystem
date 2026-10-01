@@ -149,6 +149,10 @@ struct Inner {
 	window: bool,
 	// The UART lost its settings in the sleep that just ended; the next line re-initialises it first.
 	lost: bool,
+	// THE DRIVER'S SETTINGS WHILE ITS UART IS LENT to a sleep's entry - IER, LCR, MCR and the divisor's two bytes, read
+	// as the loan began - written back as it ends. The loan programs the UART for the kernel's lines, and a UART handed
+	// back with the receive interrupt off is a console that answers nothing typed after the sleep.
+	lent: Option<[u8; 5]>,
 }
 
 // One register access, as the test build records it.
@@ -221,7 +225,7 @@ impl Uart {
 			base,
 			irq,
 			console,
-			inner: SpinLock::new(Inner { ring: TxRing::new(), owner: Owner::Kernel, dropped: 0, tap: None, signal_due: false, window: false, lost: false }),
+			inner: SpinLock::new(Inner { ring: TxRing::new(), owner: Owner::Kernel, dropped: 0, tap: None, signal_due: false, window: false, lost: false, lent: None }),
 			stray: AtomicU64::new(0),
 			driving: AtomicBool::new(false),
 			handler: AtomicUsize::new(0),
@@ -305,8 +309,16 @@ impl Uart {
 	// off - and the receive interrupt after it, when asked. Every register a driver could have left in any
 	// state is written.
 	fn boot_init(&self, path: Path, receive_interrupt: bool) {
+		self.boot_init_reading(path, receive_interrupt, &mut [0u8; 2]);
+	}
+
+	// THE SAME, with the divisor it replaces read into `divisor` while the latch is open - reads only, so the writes are
+	// the boot sequence's and nothing else.
+	fn boot_init_reading(&self, path: Path, receive_interrupt: bool, divisor: &mut [u8; 2]) {
 		self.write(path, IER, 0x00);
 		self.write(path, LCR, LCR_DLAB);
+		divisor[0] = self.read(path, RBR_THR);
+		divisor[1] = self.read(path, IER);
 		self.write(path, RBR_THR, 0x03);
 		self.write(path, IER, 0x00);
 		self.write(path, LCR, LCR_8N1);
@@ -771,7 +783,10 @@ impl Uart {
 			}
 			Owner::Driver(generation) => {
 				self.set_owner(&mut inner, Owner::Sleep(generation));
-				self.boot_init(Path::Sleep, false);
+				let (ier, lcr, mcr) = (self.read(Path::Sleep, IER), self.read(Path::Sleep, LCR), self.read(Path::Sleep, MCR));
+				let mut divisor = [0u8; 2];
+				self.boot_init_reading(Path::Sleep, false, &mut divisor);
+				inner.lent = Some([ier, lcr, mcr, divisor[0], divisor[1]]);
 				while inner.ring.len != 0 {
 					let byte = inner.ring.pop();
 					self.put_sync(Path::Sleep, byte);
@@ -800,6 +815,16 @@ impl Uart {
 		self.restore_after_sleep(&mut inner);
 		inner.window = false;
 		if let Owner::Sleep(generation) = inner.owner {
+			// THE DRIVER'S SETTINGS BACK before the UART is: the divisor through the latch, the line, the modem control,
+			// and the interrupt enables last.
+			if let Some([ier, lcr, mcr, dll, dlm]) = inner.lent.take() {
+				self.write(Path::Sleep, LCR, LCR_DLAB);
+				self.write(Path::Sleep, RBR_THR, dll);
+				self.write(Path::Sleep, IER, dlm);
+				self.write(Path::Sleep, LCR, lcr & !LCR_DLAB);
+				self.write(Path::Sleep, MCR, mcr);
+				self.write(Path::Sleep, IER, ier);
+			}
 			self.set_owner(&mut inner, Owner::Driver(generation));
 		}
 	}

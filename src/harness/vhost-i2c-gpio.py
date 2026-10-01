@@ -440,6 +440,12 @@ class Device:
             # IOTLB is a cache: emptied here, every access after the next start misses and QEMU answers it.
             self.iotlb.entries = []
             trace(f"{self.name}: ring {index} stopped, IOTLB emptied")
+            # AND WHAT THE MODEL HELD FROM THAT RING IS GONE WITH IT: a buffer the driver queued before the stop is
+            # not the driver's any more - a reset, or a guest suspended to RAM, which QEMU stops every vhost device
+            # for - and completing it later wrote through an IOTLB that no longer answers.
+            stopped = getattr(self.model, "ring_stopped", None)
+            if stopped is not None:
+                stopped(index)
             self.reply(request, struct.pack("<II", index, ring.last_avail))
             return True
         if request == SET_VRING_ADDR:
@@ -926,6 +932,17 @@ class GpioModel:
         trace(f"gpio: request {kind} line {line} value {value:#x} -> status {status}, {answer_len} byte(s)")
         return answer_len
 
+    def ring_stopped(self, index):
+        """THE EVENT QUEUE STOPPED: every buffer held for a line is dropped, and every line disarmed - the driver that
+        starts the queue again arms what it wants. The lines keep their levels: a level line still asserted fires at
+        the next buffer its driver queues, and an edge that comes while the queue is stopped is not delivered, as a
+        controller that is powered down delivers none - the control socket's `raise` answers it was not fired."""
+        if index == 1:
+            if self.pending:
+                trace(f"gpio: the event queue stopped - {len(self.pending)} held buffer(s) dropped")
+            self.pending.clear()
+            self.triggers = [IRQ_NONE] * len(self.names)
+
     def level_met(self, line):
         trigger = self.triggers[line]
         return (trigger == IRQ_HIGH and self.levels[line]) or (trigger == IRQ_LOW and not self.levels[line])
@@ -1237,6 +1254,30 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(completed, [(1, 7)])
         self.assertEqual(space.data[80], EVENT_VALID)
         self.assertFalse(model.set_level(1, 0, space), "no buffer queued: nothing to complete")
+
+    def test_a_stopped_event_queue_drops_its_held_buffers_and_a_raise_then_fires_nothing(self):
+        # A GUEST SUSPENDED TO RAM: QEMU stops the device, and a line raised then must not complete a buffer through an
+        # IOTLB that no longer answers - which crashed the backend, and QEMU with it.
+        model = GpioModel(["a", "b"])
+        completed = []
+
+        class Recorder:
+            def complete(self, index, head, written):
+                completed.append((index, head))
+
+        device = Device("gpio", None, model)
+        device.reply = lambda request, payload: None
+        model.device = Recorder()
+        space = FakeSpace()
+        space.data[0:8] = struct.pack("<HHI", GPIO_SET_IRQ_TYPE, 1, IRQ_RISING)
+        model.serve(0, 0, [(0, 8, False), (64, 1, True)], space)
+        space.data[16:18] = struct.pack("<H", 1)
+        self.assertIsNone(model.serve(1, 7, [(16, 2, False), (80, 1, True)], space))
+        self.assertTrue(device.handle(GET_VRING_BASE, struct.pack("<I", 1), []))
+        self.assertFalse(model.set_level(1, 1, space), "nothing held: the raise fires nothing")
+        self.assertEqual(completed, [])
+        self.assertEqual(model.triggers[1], IRQ_NONE, "disarmed until a driver arms it again")
+        self.assertEqual(model.levels[1], 1, "the level is kept")
 
     def test_a_stopped_ring_empties_the_iotlb(self):
         device = Device("i2c", None, I2cModel([]))

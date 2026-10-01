@@ -627,6 +627,10 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			"i2c_hid" | "tcpci" => DmaPolicy::None,
 			// THE ACPI POWER SOURCES: every value is a method's result on the node channel.
 			"acpi_power" => DmaPolicy::None,
+			// THE ACPI BUTTONS, THE LID AND THE TIME AND ALARM DEVICE: `Notify` values and methods on the node channel.
+			"acpi_button" | "acpi_tad" => DmaPolicy::None,
+			// THE SLEEP GATE'S FIXTURE: shared memory through its BAR, and nothing mastered.
+			"sleep_fixture" => DmaPolicy::None,
 			// THE ICH9 SMBUS HOST, THE IPMI INTERFACES AND UCSI: registers, an SMBus address and a shared mailbox.
 			"smbus_ich9" | "ipmi" | "ucsi_acpi" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,

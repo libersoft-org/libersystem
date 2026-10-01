@@ -100,6 +100,15 @@ declare -A GATES=(
 	# every safety invariant, every timer's bound, a lost controller renegotiated through Soft_Reset, and the response
 	# budget over 200 negotiations under KVM. The partner's model is `i2c-backend`'s suite.
 	["typec-tcpci"]="tools/check-typec-tcpci.sh"
+	# SLEEP AND RESUME ON x86_64 q35 WITH S3 OFFERED: suspend to idle and S3 through the transaction, every wake leaving the
+	# network, the files, the display, the serial console and the clocks working; the hot-plug slot restored; a stopped
+	# job left stopped; a refusing driver and a person's shutdown during a sleep unwinding it; the fixture SSDT's lid,
+	# buttons, TAD and power resources; and the fixed ports' soft-off.
+	["sleep"]="tools/check-sleep.sh"
+	# HIBERNATION ON x86_64 q35 WITH S4 OFFERED AND swtpm: an image written and restored with a running program going
+	# on, the boot after finding none, soft-off where S4 is not offered, a modified image, another system image and
+	# another machine each refused, hybrid sleep both ways, and a machine with no TPM not set up.
+	["hibernate"]="tools/check-hibernate.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

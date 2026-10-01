@@ -47,6 +47,13 @@ pub enum PrivilegeKind {
 	// reserved set and exclusivity as a claim's range. The ACPI service's; minted for it by whatever
 	// starts that service.
 	FirmwareInterpreter,
+	// May hand the kernel the wall clock on a machine whose kernel reads no RTC of its own (`SYS_CLOCK_BASE`) - the
+	// ACPI Time and Alarm Device's driver, to which DeviceManager hands it at bind. A holder can move every wall-clock
+	// reading in the system, which is why it is an authority of its own and nobody else's.
+	ClockSource,
+	// May read hibernation's snapshot - every byte memory held - and replace the whole of memory with an image
+	// (`SYS_SNAPSHOT_*`, `SYS_RESTORE_*`). The image component's alone: its holder is the machine.
+	Hibernation,
 }
 
 impl PrivilegeKind {}

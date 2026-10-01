@@ -108,6 +108,11 @@ fn a_watchdog_in_a_sleep_is_disarmed_where_it_can_be_and_otherwise_bounds_the_sl
 	assert_eq!(run(&mut timer, Some(30_000), &idle), (600_000, SuspendOutcome::Done, Some(600_000)));
 	assert_eq!(timer.pets, 1, "petted a last time");
 	assert_eq!(timer.arms, vec![600_000, 30_000]);
+	// THE LONGEST THE SERVICE SET AT THE ANNOUNCEMENT is what it had: the resume arms it at the resume's bound instead,
+	// so a resume that hangs is caught within it and not half an hour later.
+	let mut timer = Fake { can_disarm: true, ..Fake::default() };
+	assert_eq!(run(&mut timer, Some(600_000), &idle), (0, SuspendOutcome::Done, None));
+	assert_eq!(timer.arms, vec![super::RESUME_WATCH_MS], "the resume's bound, not the longest");
 	// The same device in S3, where it loses its power: no bound.
 	let mut timer = Fake { can_disarm: false, stops_in_s3: true, ..Fake::default() };
 	assert_eq!(run(&mut timer, Some(30_000), &ram).0, 0);

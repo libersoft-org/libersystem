@@ -151,6 +151,19 @@ impl Surface {
 			Ok(configuration) => configuration,
 			Err(error) => return Some(Err(error)),
 		};
+		// A CONFIGURATION WITHIN THE GENERATION THIS QUEUE WAS BUILT FOR is acknowledged and nothing more. The output
+		// replaced under an unchanged extent - a display driver rebound, after a crash or a sleep - moves the serial and
+		// not the generation: the service keeps every image supplied to it and refuses a slot supplied twice within one
+		// generation, so dropping the queue here left this end with no images and the service with no acknowledgement,
+		// and every acquire after it answered `out-of-date`.
+		if configuration.generation == self.generation && !self.images.is_empty() {
+			if let Err(error) = self.client.borrow_mut().ack_configure(&configuration.serial)? {
+				return Some(Err(error));
+			}
+			self.acknowledged = configuration.serial;
+			self.configuration = configuration;
+			return Some(Ok(()));
+		}
 		// THE OLD IMAGES GO FIRST. They belong to a generation that no longer exists, and an image
 		// of a stale generation is never presented into a new one.
 		self.images.clear();

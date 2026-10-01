@@ -81,3 +81,30 @@ fn the_names_are_one_nul_terminated_string_per_line() {
 	assert_eq!(Trigger::from_u8(0x08), Some(Trigger::Low));
 	assert_eq!(Trigger::from_u8(0x05), None);
 }
+
+// A DEVICE THAT LOST ITS STATE IN A SLEEP is set up again line by line: the level line's direction, the armed line's
+// trigger and buffer, and the delivered line's trigger alone - its buffer stays here until the acknowledgement.
+#[test]
+fn a_restored_device_gets_every_held_line_back_as_it_was() {
+	let mut lines = Lines::new(8, true);
+	let mut steps = Vec::new();
+	lines.take(1, Scope::Level, &mut steps).expect("free");
+	lines.take(2, Scope::Interrupt(Trigger::Rising), &mut steps).expect("free");
+	lines.take(4, Scope::Interrupt(Trigger::Low), &mut steps).expect("free");
+	assert_eq!(lines.event(4, EVENT_VALID), Event::Deliver(4));
+	let mut restored = Vec::new();
+	lines.restore(&mut restored);
+	assert_eq!(
+		restored,
+		[
+			Step::Send(Request { kind: MSG_SET_DIRECTION, line: 1, value: DIRECTION_IN }),
+			Step::Send(Request { kind: MSG_SET_DIRECTION, line: 2, value: DIRECTION_IN }),
+			Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line: 2, value: 0x01 }),
+			Step::QueueEvent(2),
+			Step::Send(Request { kind: MSG_SET_DIRECTION, line: 4, value: DIRECTION_IN }),
+			Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line: 4, value: 0x08 }),
+		]
+	);
+	// AND THE DELIVERED LINE'S CYCLE GOES ON: its acknowledgement queues the buffer.
+	assert_eq!(lines.acknowledge(4), Some(Step::QueueEvent(4)));
+}

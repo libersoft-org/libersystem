@@ -42,6 +42,13 @@ method writer.truncate op=3 (length:u64:rights=) -> result<unit, liber:base@1::e
 method writer.flush op=4 () -> result<u64, liber:base@1::error>
 method writer.commit op=5 () -> result<u64, liber:base@1::error>
 method writer.abort op=6 () -> result<unit, liber:base@1::error>
+record hibernation-area-info(present:bool,bytes:u64,image-at-mount:bool)
+interface hibernation-area
+method hibernation-area.describe op=1 () -> result<hibernation-area-info, liber:base@1::error>
+method hibernation-area.read op=2 (offset:u64:rights=,length:u32:rights=) -> result<buffer, liber:base@1::error>
+method hibernation-area.write op=3 (offset:u64:rights=,data:buffer:rights=,length:u32:rights=) -> result<unit, liber:base@1::error>
+method hibernation-area.flush op=4 () -> result<unit, liber:base@1::error>
+method hibernation-area.verdict op=5 (restoring:bool:rights=) -> result<unit, liber:base@1::error>
 interface volume-admin
 method volume-admin.open-directory op=1 (path:string:rights=,writable:bool:rights=) -> result<handle<channel>, liber:base@1::error>
 method volume-admin.open-file op=2 (path:string:rights=,writable:bool:rights=) -> result<handle<channel>, liber:base@1::error>

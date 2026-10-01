@@ -355,6 +355,34 @@ interface writer {
 /// Privileged StorageService boundary that mints a client restricted to one directory
 /// below a system volume. The returned channel preserves normal `volume` operations,
 /// but rejects paths outside the granted directory and cannot mint a broader client.
+/// THE HIBERNATION AREA, as StorageService sees it on the disk its system volume is on.
+record hibernation-area-info {
+	/// Whether that disk has a partition of the LiberSystem hibernation type.
+	present:        bool,
+	/// Its size, in bytes.
+	bytes:          u64,
+	/// Whether an image header was there when the volume was mounted - and so whether every write is held until the
+	/// image component's verdict.
+	image-at-mount: bool,
+}
+
+/// THE HIBERNATION AREA - the GPT partition of the LiberSystem hibernation type on the disk the system volume is on -
+/// served by the system volume's StorageService to the image component alone, through a manifest role. No filesystem is
+/// on it: the component writes an image there and reads one back, in whole sectors, as memory objects.
+///
+/// NOTHING ON THE SYSTEM VOLUME IS WRITTEN UNTIL AN IMAGE FOUND AT MOUNT HAS ITS VERDICT: every write is held, as the
+/// sleep holds them, and `verdict(false)` - no image, or one refused - lets them go; a restore replaces memory before they
+/// ever could.
+interface hibernation-area {
+	@op(1) describe: func() -> result<hibernation-area-info, error>;
+	/// Bytes [offset, offset + length) of the area, at most a megabyte and a sector, whole sectors.
+	@op(2) read:     func(offset: u64, length: u32) -> result<buffer, error>;
+	/// The first `length` bytes of `data` written at `offset`, whole sectors, at most a megabyte and a sector.
+	@op(3) write:    func(offset: u64, data: buffer, length: u32) -> result<unit, error>;
+	@op(4) flush:    func() -> result<unit, error>;
+	@op(5) verdict:  func(restoring: bool) -> result<unit, error>;
+}
+
 interface volume-admin {
 	/// `writable` decides whether the minted client may CHANGE anything under that directory.
 	///

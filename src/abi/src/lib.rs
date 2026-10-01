@@ -158,9 +158,10 @@ pub const SYS_PROCESS_SIGNAL: u64 = 45;
 pub const SYS_DEVICE_MSIX_ACQUIRE: u64 = 46;
 // Reboot or power the machine off.
 //   a0 = a MANAGE-capable handle to the ROOT Domain
-//   a1 = POWER_REBOOT or POWER_OFF
-// Does not return on success; ERR_ACCESS_DENIED for a handle that is not the root domain's or
-// lacks MANAGE, ERR_INVALID for an unknown action.
+//   a1 = POWER_REBOOT, POWER_OFF or POWER_OFF_WITHIN
+//   a2 = for POWER_OFF_WITHIN, the seconds from now
+// Does not return on success, but for POWER_OFF_WITHIN, which answers 0 once the deadline is armed; ERR_ACCESS_DENIED for
+// a handle that is not the root domain's or lacks MANAGE, ERR_INVALID for an unknown action or a zero bound.
 //
 // The comment here said the argument was the action and that restricting the call was "a future
 // PermissionManager concern". It has not been future since the handle argument landed - and
@@ -691,6 +692,9 @@ pub struct EntropyHealth {
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
+// A FORCED POWER-OFF DEADLINE, a2 seconds from now - see the kernel's `power` module. Returns 0; the earliest armed
+// stands, and none is ever cancelled.
+pub const POWER_OFF_WITHIN: u64 = 2;
 
 // Flag for SYS_WAIT (arg 2) / SYS_WAIT_ANY (arg 3): the deadline is a PERIODIC
 // housekeeping wake (a display poll, a blink tick), not pending progress. The
@@ -892,6 +896,12 @@ pub const PCI_PROG_IF_IPMI_KCS: u8 = 0x01;
 pub const PCI_PROG_IF_IPMI_BT: u8 = 0x02;
 pub const DEVICE_TYPE_IPMI_KCS: u32 = 0x107;
 pub const DEVICE_TYPE_IPMI_BT: u32 = 0x108;
+// QEMU'S SHARED-MEMORY FUNCTION, `ivshmem-plain` (1af4:1110), resolved by its identity rather than its class - its class
+// is a memory controller's, which names nothing: BAR 2 is the memory a host file backs. What the harness's fixtures reach
+// the guest through; no shipping device resolves this way.
+pub const PCI_VENDOR_REDHAT: u16 = 0x1af4;
+pub const PCI_DEVICE_IVSHMEM: u16 = 0x1110;
+pub const DEVICE_TYPE_SHARED_MEMORY: u32 = 0x109;
 
 // A FUNCTION THIS KERNEL RESOLVED NO PROFILE FOR, and that is a device type of its own rather than an
 // absence. Every PCI function is in the inventory; the ones outside the two resolvers carry their
@@ -928,6 +938,7 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		DEVICE_TYPE_HDA => "hda",
 		DEVICE_TYPE_IPMI_KCS => "ipmi-kcs",
 		DEVICE_TYPE_IPMI_BT => "ipmi-bt",
+		DEVICE_TYPE_SHARED_MEMORY => "shared-memory",
 		DEVICE_TYPE_UNKNOWN => "unresolved-pci-function",
 		DEVICE_TYPE_PLATFORM => "platform",
 		// A code this build does not classify. The NUMBER is kept, because a reader chasing an
@@ -1615,11 +1626,85 @@ pub const SYS_FIRMWARE_SLEEP_TYPE: u64 = 111;
 // clock excludes every sleep, so a deadline armed before one has the rest of its time after it; this is the clock
 // a sleep's length and a wall clock are counted on.
 pub const SYS_CLOCK_BOOT_NS: u64 = 112;
+// `SYS_INTERRUPT_WAKE(interrupt, on)`: A DRIVER MARKS ITS INTERRUPT AS A WAKE SOURCE in a `SUSPEND` step that armed
+// wake, and unmarks it at the resume - WRITE on the Interrupt, which must still own its binding. A suspend to idle
+// leaves a marked interrupt unmasked, and the first one to fire while the machine sleeps wakes it as a device's wake.
+// The mark goes with the binding. `ERR_RESOURCE_EXHAUSTED` when the wake set is full.
+pub const SYS_INTERRUPT_WAKE: u64 = 113;
+// `SYS_SLEEP_STATES()`: WHAT THIS MACHINE'S SLEEP ENTRY WOULD TAKE, and the fixed buttons it has - read-only, for any
+// caller: bit `1 << SLEEP_STATE_x` for each state the entry takes (suspend to RAM once `\_S3` is registered and the
+// firmware has its waking vector), and `SLEEP_FIXED_POWER_BUTTON` / `SLEEP_FIXED_SLEEP_BUTTON` for the buttons PM1
+// carries rather than a control-method device.
+pub const SYS_SLEEP_STATES: u64 = 114;
+// `SYS_CLOCK_BASE(clock source, unix seconds)`: A DRIVER HANDS THE KERNEL THE WALL CLOCK on a machine where the kernel
+// reads no RTC of its own - the ACPI Time and Alarm Device's `_GRT` - under the ClockSource privilege DeviceManager hands
+// that driver at bind. `SYS_CLOCK_RTC` then answers it counted forward on the boot-time clock, and 0 before it; after
+// a suspend to RAM, the base handed again at the resume is what the sleep's length is taken from.
+pub const SYS_CLOCK_BASE: u64 = 115;
+// ------------------------------------------------------------------ hibernation
+//
+// A SNAPSHOT IN THE KERNEL, WRITTEN BY USERSPACE. `SYS_SYSTEM_SLEEP(root, SLEEP_STATE_DISK, 0, report)` copies every page
+// in use into free memory and RETURNS TWICE: once in the running machine, `WAKE_SNAPSHOT` - the copy held for the image
+// component to read and write out - and once in the machine restored from that image, `WAKE_RESTORED`. The copy is
+// refused, named, when free memory cannot hold it. Every call below requires the Hibernation privilege: its holder reads
+// every byte memory held and can replace all of memory, which is why the image component alone holds it.
+//
+// `SYS_SNAPSHOT_INFO(privilege, info)`: the snapshot held - `SnapshotInfo`. `ERR_INVALID` when there is none.
+pub const SYS_SNAPSHOT_INFO: u64 = 116;
+// `SYS_SNAPSHOT_READ(privilege, first, count, buffer)`: pages [first, first + count) of the snapshot, `count` at most
+// `SNAPSHOT_BATCH`: their physical addresses (`count` u64s), then their bytes (`count` pages), into `buffer`.
+pub const SYS_SNAPSHOT_READ: u64 = 117;
+// `SYS_SNAPSHOT_RELEASE(privilege)`: the snapshot's copies given back - after the image is written, or when it is not.
+pub const SYS_SNAPSHOT_RELEASE: u64 = 118;
+// `SYS_RESTORE_BEGIN(privilege, frames, count, context)`: A RESTORE of `count` pages to the physical addresses the
+// `count` u64s at `frames` name, with the resume context the image carried (`SNAPSHOT_CONTEXT` bytes at `context`).
+// Refused: `ERR_INVALID` for an address that is not RAM of this machine, one named twice, or a context this kernel did
+// not write; `ERR_RESOURCE_EXHAUSTED` when free memory cannot hold the pages outside the frames they go to.
+pub const SYS_RESTORE_BEGIN: u64 = 119;
+// `SYS_RESTORE_WRITE(privilege, first, count, pages)`: the bytes of pages [first, first + count), `count` at most
+// `SNAPSHOT_BATCH`, each held in a frame no page of the image goes to.
+pub const SYS_RESTORE_WRITE: u64 = 120;
+// `SYS_RESTORE_COMMIT(privilege, abandon)`: THE WHOLE-MEMORY REPLACEMENT - every other core stopped, every page copied
+// to its frame from a trampoline in frames the image does not use, and a jump into the image's kernel along its resume
+// path. Never returns when it happens; `ERR_INVALID` for a restore with pages not yet written. With `abandon` set, the
+// restore is dropped and its memory given back instead.
+pub const SYS_RESTORE_COMMIT: u64 = 121;
+// `SYS_SYSTEM_FINGERPRINT(out)`: THE DIGESTS AN IMAGE IS CHECKED AGAINST, for any caller - `SystemFingerprint`: the
+// system image this kernel runs (its own code and the packages it booted with) and the hardware (the memory map's
+// classes, the cores, every PCI function).
+pub const SYS_SYSTEM_FINGERPRINT: u64 = 122;
+// The most pages one read or write moves, and the resume context's size.
+pub const SNAPSHOT_BATCH: u64 = 256;
+pub const SNAPSHOT_CONTEXT: usize = 64;
+
+// What `SYS_SNAPSHOT_INFO` answers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotInfo {
+	pub pages: u64,
+	pub context: [u8; SNAPSHOT_CONTEXT],
+	pub system: [u8; 32],
+	pub hardware: [u8; 32],
+}
+
+// What `SYS_SYSTEM_FINGERPRINT` answers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemFingerprint {
+	pub system: [u8; 32],
+	pub hardware: [u8; 32],
+}
+
+pub const SLEEP_FIXED_POWER_BUTTON: u64 = 1 << 8;
+pub const SLEEP_FIXED_SLEEP_BUTTON: u64 = 1 << 9;
 
 // The sleep states, as `liber:process@1/sleep-state` numbers them, and soft-off's registration.
 pub const SLEEP_STATE_IDLE: u64 = 1;
 pub const SLEEP_STATE_RAM: u64 = 2;
 pub const SLEEP_STATE_DISK: u64 = 3;
+// THE MACHINE OFF WITH ITS IMAGE WRITTEN: the registered `\_S4` pair, or soft-off where there is none. Never returns
+// when it happens.
+pub const SLEEP_STATE_DISK_ENTER: u64 = 4;
 pub const SLEEP_STATE_SOFT_OFF: u64 = 5;
 
 // What woke the machine, as `liber:process@1/wake-reason` numbers it.
@@ -1630,6 +1715,9 @@ pub const WAKE_SLEEP_BUTTON: u32 = 3;
 pub const WAKE_DEVICE: u32 = 4;
 pub const WAKE_RTC: u32 = 5;
 pub const WAKE_PLATFORM: u32 = 6;
+// The two returns of a hibernation's snapshot: taken, in the running machine; and restored from its image.
+pub const WAKE_SNAPSHOT: u32 = 7;
+pub const WAKE_RESTORED: u32 = 8;
 
 // The most cores a sleep report carries.
 pub const SLEEP_REPORT_CORES: usize = 64;

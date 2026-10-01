@@ -103,6 +103,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    keyboard feeds key bytes to the console; the pointer maps motion/buttons to
 		//    text-cell events it sends to InputService over a channel it hands up with its
 		//    report (the keyboard's report carries no channel).
+		common::takes_sleep();
 		if is_pointer {
 			let (producer, consumer): (u64, u64) = match channel() {
 				Some(pair) => pair,
@@ -118,12 +119,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			let mut line = [0u8; 64];
 			let n = common::describe(&mut line, b"virtio-input", &device, b"pointer");
 			common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::INPUT, consumer)]);
-			pointer_loop(bootstrap, &bind, irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
+			pointer_loop(bootstrap, &bind, &device, irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
 		} else {
 			let mut line = [0u8; 64];
 			let n = common::describe(&mut line, b"virtio-input", &device, b"keyboard");
 			common::online(bootstrap, &bind, &line[..n], &[]);
-			event_loop(bootstrap, &bind, irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
+			event_loop(bootstrap, &bind, &device, irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
 		}
 	}
 }
@@ -155,20 +156,86 @@ fn axis_max(device: &Virtio, axis: u16) -> Option<i32> {
 	input::axis_max(size, max)
 }
 
+// THE SLEEP, between two drains. A KEYBOARD ASKED TO ARM WAKE for a suspend to idle stays running with its interrupt
+// marked as a wake source: a key ends the sleep, and that key is delivered once the drivers run again. For a sleep that
+// cuts the power the device is stopped, and at the resume it is negotiated back with its ring and its event pool
+// restored under the same binding - a keyboard a person is waiting on does not wait out a rebind.
+struct Sleep<'a> {
+	device: &'a Virtio,
+	eventq: &'a mut Queue,
+	irq: u64,
+	pool_phys: u64,
+	slots: u16,
+	// Whether this binding arms wake: the keyboard does, the pointer does not.
+	wakes: bool,
+	serving: Option<&'a mut common::Serving>,
+	stopped: bool,
+	armed: bool,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		if self.wakes && request.arm_wake && !request.state.loses_power() && self.irq != 0 && interrupt_wake(self.irq, true) == 0 {
+			self.armed = true;
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::DoneWakeArmed, awake_by_ms: 0 };
+		}
+		match self.device.sleep(request) {
+			Some(stopped) => {
+				self.stopped = stopped;
+				driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+			}
+			None => driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 },
+		}
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		if core::mem::take(&mut self.armed) {
+			let _ = interrupt_wake(self.irq, false);
+		}
+		if !lost_power && !core::mem::take(&mut self.stopped) {
+			return true;
+		}
+		if !self.device.restore() || !self.eventq.restore(self.device) {
+			return false;
+		}
+		for id in 0..self.slots {
+			self.eventq.post_recv(id, self.pool_phys + id as u64 * EVENT_SIZE, EVENT_SIZE as u32);
+		}
+		self.eventq.notify();
+		self.device.driver_ok();
+		true
+	}
+
+	fn serving(&mut self) -> Option<&mut common::Serving> {
+		self.serving.as_deref_mut()
+	}
+}
+
 // Block on the device interrupt forever: each time it fires, drain every event buffer
 // the device filled (translating key presses to console input), re-post the drained
 // buffers, and re-arm the interrupt. MSI-X is edge-triggered, so there is no ISR line
 // to deassert and no GSI to unmask - the interrupt_ack just clears the pending flag.
-fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
+fn event_loop(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
 	unsafe {
 		let mut mods: Mods = Mods::default();
 		loop {
 			// Block until the keyboard raises its MSI-X interrupt - OR until the manager asks
 			// whether this driver is still answering. An input device that nobody is typing on is
 			// idle, and idle is not wedged.
-			if common::wait_or_answer(bootstrap, bind, &[irq]).is_none() {
-				common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
-				exit();
+			match common::wait_or_sleep(bootstrap, bind, &[irq]) {
+				None => {
+					common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
+					exit();
+				}
+				Some(None) => {
+					let mut step = Sleep { device, eventq: &mut *eventq, irq, pool_phys, slots, wakes: true, serving: None, stopped: false, armed: false };
+					if !common::take_sleep_step(bootstrap, bind, &mut step) {
+						common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
+						exit();
+					}
+					continue;
+				}
+				Some(Some(_)) => {}
 			}
 			// Clear the pending flag BEFORE the drain, so a press that lands while the ring is being
 			// read wakes the next wait rather than being cleared with this one (edge-triggered: no
@@ -192,7 +259,7 @@ fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue,
 // position and buttons to InputService (which maps them to the text-cell grid). The
 // send coalesces motion within one interrupt (the latest position wins). Consumer closure returns
 // its allowance while the provider keeps accepting replacements, even with no pointer activity.
-fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: Option<i32>, max_y: Option<i32>) -> ! {
+fn pointer_loop(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: Option<i32>, max_y: Option<i32>) -> ! {
 	unsafe {
 		// THE BOUND IS THE DEVICE'S OWN RANGE WHEN IT HAS ONE, and the relative range otherwise -
 		// which is what a mouse gets, because a mouse reports no axis block at all.
@@ -202,9 +269,21 @@ fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queu
 		let mut sent: input::Pointer = input::Pointer { x: -1, y: -1, buttons: 0 };
 		let mut serving = common::Serving::new(sink, 0);
 		loop {
-			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
-				common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
-				exit();
+			let ready = match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &[irq], false) {
+				None => {
+					common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
+					exit();
+				}
+				// THE SLEEP, between two drains: the pointer arms no wake.
+				Some(None) => {
+					let mut step = Sleep { device, eventq: &mut *eventq, irq, pool_phys, slots, wakes: false, serving: Some(&mut serving), stopped: false, armed: false };
+					if !common::take_sleep_step(bootstrap, bind, &mut step) {
+						common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
+						exit();
+					}
+					continue;
+				}
+				Some(Some(ready)) => ready,
 			};
 			if let common::ProviderReady::Consumer(at) = ready {
 				let mut unexpected = [0u8; 16];

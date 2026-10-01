@@ -51,7 +51,7 @@ use liberfs::{BlockDevice, FsError, LiberFs, MountError};
 use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
 use proto::codec::{Handles, Sink, SliceWriter};
-use proto::system::{Error, FileEvent, FileEventKind, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SleepState, SnapshotInfo, VolumeStatus, WriterMode, sleep_notice, volume, volume_admin, writer};
+use proto::system::{Error, FileEvent, FileEventKind, FileInfo, FileType, FsckReport, HibernationAreaInfo, OpenOpts, OpenResult, SleepState, SnapshotInfo, VolumeStatus, WriterMode, hibernation_area, sleep_notice, volume, volume_admin, writer};
 use rt::*;
 use udf::Udf;
 
@@ -174,6 +174,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// Whether this instance's block channel was ROUTED from a live provider - see the `USBBLOCK*`
 	// arm. Only the USB instance can answer anything but `false`.
 	let mut routed: bool = false;
+	// THE HIBERNATION AREA ON THE SYSTEM DISK, found when this instance mounts the system volume.
+	let mut area: Option<Area> = None;
+	let mut system: bool = false;
 	let mut usb: Option<UsbProviders> = None;
 	let mut vol: Volume = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
@@ -301,6 +304,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						print(b"StorageService: the volume this instance mounted is not the one the loader chose - refusing to serve it as the system volume\n");
 						exit();
 					}
+					system = true;
+					area = find_area(serving);
 					Volume::new(alloc::boxed::Box::new(DiskFs { fs, chan: serving }))
 				}
 				Err(reason) => {
@@ -402,6 +407,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => (0, handle),
 		_ => exit(),
 	};
+	// 2b. THE SYSTEM VOLUME'S INSTANCE ALONE: the hibernation area's root, for the image component - the tag always
+	// comes, carrying nothing where no image component runs.
+	let hibernation: u64 = if system {
+		match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 11 && &buf[..11] == b"HIBERNATION" => handle,
+			Received::Message { handle, .. } => {
+				if handle != 0 {
+					close(handle);
+				}
+				0
+			}
+			Received::Closed => exit(),
+		}
+	} else {
+		0
+	};
 	// 3. report in over the bootstrap channel (the supervisor that started us is
 	//    listening there), then serve generated volume requests until the client side
 	//    closes.
@@ -416,7 +437,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Err(reason) => rt::fail_bootstrap(bootstrap, b"classification report", reason),
 	};
 	send_blocking(bootstrap, &report, 0);
-	serve_volume(&mut vol, service, admin, usb, bootstrap);
+	serve_volume(&mut vol, service, admin, usb, bootstrap, area, hibernation);
 }
 
 // Build the entire report or fail; an announced classification tail is never optional.
@@ -1546,7 +1567,8 @@ struct HeldRequest {
 	handles: proto::codec::Handles,
 }
 
-fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<UsbProviders>, mut control: u64) -> ! {
+#[allow(clippy::too_many_arguments)]
+fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<UsbProviders>, mut control: u64, area: Option<Area>, mut hibernation: u64) -> ! {
 	// The admin's own `quiet`, for the reason the clients have one.
 	//
 	// The admin channel is never dropped: there is one of it, it is the operator's way in, and
@@ -1596,6 +1618,22 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 			control_koid = koid as u64;
 		} else {
 			control = 0;
+		}
+	}
+	// AN IMAGE ON THE SYSTEM DISK HOLDS EVERY WRITE FROM THE START, until the image component's verdict: a restore
+	// replaces memory with a machine whose volume must be exactly as it left it, and a refusal lets them go.
+	let mut image_hold: bool = area.as_ref().is_some_and(|area| area.image_at_mount);
+	if image_hold {
+		print(b"StorageService: a hibernation image is on the system disk - every write to vol://system is held until its verdict\n");
+		held = true;
+	}
+	let mut hibernation_koid: u64 = 0;
+	if hibernation != 0 {
+		let koid = waitset_add(set, hibernation);
+		if koid > 0 {
+			hibernation_koid = koid as u64;
+		} else {
+			hibernation = 0;
 		}
 	}
 	let mut clients: Vec<Client> = Vec::new();
@@ -1759,15 +1797,62 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				continue;
 			}
 		}
+		// THE HIBERNATION AREA'S ONE CLIENT, the image component.
+		if hibernation != 0 && ready == hibernation_koid {
+			match recv_caps_blocking(hibernation, &mut request) {
+				ReceivedCaps::Message { len, handles: mut caps } => {
+					let mut view = AreaView { area: area.as_ref(), image_hold: &mut image_hold, released: false };
+					let mut answer = [0u8; 128];
+					let mut answer_handles = proto::codec::Handles::new();
+					let written = hibernation_area::dispatch(&mut view, &request[..len], &mut caps, &mut answer, &mut answer_handles);
+					let released = view.released;
+					for &leftover in caps.as_slice() {
+						close(leftover);
+					}
+					// THE VERDICT LETS THE HELD WRITES GO, in the order they arrived - unless a sleep holds them too.
+					if released && !image_hold {
+						held = false;
+						for held_request in core::mem::take(&mut held_requests) {
+							let mut handles = held_request.handles;
+							if let Some(index) = clients.iter().position(|client| client.chan == held_request.chan) {
+								let (scope, quiet) = (clients[index].scope.clone(), clients[index].quiet);
+								let stalled = serve_client_request(vol, &mut clients, set, held_request.chan, &scope, quiet, &held_request.request, &mut handles, &mut reply, &mut listing, &mut pending, &mut watchers, index);
+								settle_client(set, vol, &mut clients, &mut pending, index, held_request.chan, stalled);
+							}
+							for &unclaimed in handles.as_slice() {
+								close(unclaimed);
+							}
+						}
+					}
+					if let Some(written) = written {
+						if !try_send_caps(hibernation, &answer[..written], answer_handles.as_slice()) {
+							for &unsent in answer_handles.as_slice() {
+								close(unsent);
+							}
+						}
+					}
+				}
+				ReceivedCaps::Closed => {
+					let _ = waitset_remove(set, hibernation_koid);
+					hibernation = 0;
+					hibernation_koid = 0;
+				}
+			}
+			continue;
+		}
 		// THE CONTROL CHANNEL: the sleep's notices.
 		if control != 0 && ready == control_koid {
 			match recv_caps_blocking(control, &mut request) {
 				ReceivedCaps::Message { len, handles: mut caps } => {
 					let mut notice = Notice { vol: &mut *vol, held: &mut held, released: false };
+					let image_held = image_hold;
 					let mut answer = [0u8; 64];
 					let mut answer_handles = proto::codec::Handles::new();
 					let written = sleep_notice::dispatch(&mut notice, &request[..len], &mut caps, &mut answer, &mut answer_handles);
-					let released = notice.released;
+					let released = notice.released && !image_held;
+					if image_held {
+						held = true;
+					}
 					for &leftover in caps.as_slice().iter().chain(answer_handles.as_slice()) {
 						close(leftover);
 					}
@@ -4276,6 +4361,120 @@ fn disk_pool_blocks(block_client: u64) -> u64 {
 	match block_capacity(block_client) {
 		Ok(bytes) if bytes > fs_start_bytes + liberfs::BLOCK_SIZE as u64 => (bytes - fs_start_bytes) / liberfs::BLOCK_SIZE as u64,
 		_ => FS_BLOCKS,
+	}
+}
+
+// ------------------------------------------------------------------ the hibernation area
+
+// THE HIBERNATION AREA - the GPT partition of the LiberSystem hibernation type on the system disk: where it is, how large,
+// and whether an image header was on it at mount. No filesystem is on it; the image component reads and writes it in whole
+// sectors, a megabyte and a sector at most per call.
+struct Area {
+	chan: u64,
+	first: u64,
+	sectors: u64,
+	max_sectors: u32,
+	image_at_mount: bool,
+}
+
+const AREA_BATCH: usize = 1024 * 1024 + 4096;
+
+fn find_area(chan: u64) -> Option<Area> {
+	if chan == 0 {
+		return None;
+	}
+	let (first, last) = partition::find_partition(&mut DiskSectors { chan }, &partition::HIBERNATION_TYPE_GUID)?;
+	let mut header = [0u8; SECTOR_SIZE];
+	let image_at_mount = unsafe { block_read(chan, first, 1, header.as_mut_ptr()) } && partition::holds_hibernation_image(&header);
+	let max_sectors = block_request_sectors(chan).max(1);
+	print(if image_at_mount { b"StorageService: the system disk has a hibernation partition, holding an image\n".as_slice() } else { b"StorageService: the system disk has a hibernation partition\n".as_slice() });
+	Some(Area { chan, first, sectors: last - first + 1, max_sectors, image_at_mount })
+}
+
+struct AreaView<'a> {
+	area: Option<&'a Area>,
+	image_hold: &'a mut bool,
+	released: bool,
+}
+
+impl AreaView<'_> {
+	// The sectors [offset, offset + length) of the area, checked: whole sectors, inside the partition, within the batch.
+	fn span(&self, offset: u64, length: u32) -> Result<(&Area, u64, u64), Error> {
+		let area = self.area.ok_or(Error::Unsupported)?;
+		let sector = SECTOR_SIZE as u64;
+		if offset % sector != 0 || u64::from(length) % sector != 0 || length == 0 || length as usize > AREA_BATCH {
+			return Err(Error::Invalid);
+		}
+		let (first, count) = (offset / sector, u64::from(length) / sector);
+		if first.checked_add(count).is_none_or(|end| end > area.sectors) {
+			return Err(Error::Invalid);
+		}
+		Ok((area, area.first + first, count))
+	}
+}
+
+impl hibernation_area::Service for AreaView<'_> {
+	fn describe(&mut self) -> Result<HibernationAreaInfo, Error> {
+		Ok(match self.area {
+			Some(area) => HibernationAreaInfo { present: true, bytes: area.sectors * SECTOR_SIZE as u64, image_at_mount: area.image_at_mount },
+			None => HibernationAreaInfo { present: false, bytes: 0, image_at_mount: false },
+		})
+	}
+
+	fn read(&mut self, offset: u64, length: u32) -> Result<Buffer, Error> {
+		let (area, mut lba, count) = self.span(offset, length)?;
+		let mut data: Vec<u8> = Vec::new();
+		data.try_reserve_exact(length as usize).map_err(|_| Error::Exhausted)?;
+		data.resize(length as usize, 0);
+		let mut done: u64 = 0;
+		while done < count {
+			let n = (count - done).min(u64::from(area.max_sectors));
+			if !unsafe { block_read(area.chan, lba, n as u32, data[(done as usize) * SECTOR_SIZE..].as_mut_ptr()) } {
+				return Err(Error::Io);
+			}
+			done += n;
+			lba += n;
+		}
+		let handle: u64 = unsafe { make_file_buffer(&data) }.ok_or(Error::Again)?;
+		Ok(Buffer { handle, len: data.len() as u64 })
+	}
+
+	// NOT A FILESYSTEM WRITE, and so never held: the image is written while the volume's writes are.
+	fn write(&mut self, offset: u64, data: Buffer, length: u32) -> Result<(), Error> {
+		let (area, mut lba, count) = self.span(offset, length)?;
+		let mapped = unsafe { map_buffer(&data) }.ok_or(Error::Invalid)?;
+		let bytes = mapped.as_slice();
+		if bytes.len() < length as usize {
+			return Err(Error::Invalid);
+		}
+		let mut done: u64 = 0;
+		while done < count {
+			let n = (count - done).min(u64::from(area.max_sectors));
+			if !unsafe { block_write(area.chan, lba, n as u32, bytes[(done as usize) * SECTOR_SIZE..].as_ptr()) } {
+				return Err(Error::Io);
+			}
+			done += n;
+			lba += n;
+		}
+		Ok(())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		let area = self.area.ok_or(Error::Unsupported)?;
+		if block_flush(area.chan) { Ok(()) } else { Err(Error::Io) }
+	}
+
+	fn verdict(&mut self, restoring: bool) -> Result<(), Error> {
+		if restoring {
+			print(b"StorageService: the image is restored - the held writes stay held, for memory to be replaced\n");
+			return Ok(());
+		}
+		if *self.image_hold {
+			print(b"StorageService: no image is restored - the held writes go to vol://system\n");
+			*self.image_hold = false;
+			self.released = true;
+		}
+		Ok(())
 	}
 }
 

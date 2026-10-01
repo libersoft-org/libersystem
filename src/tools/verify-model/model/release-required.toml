@@ -152,6 +152,8 @@ keys = [
 	"gate.qemu-tpm-tool / host / host / default",
 	"gate.serial-handoff / host / host / default",
 	"gate.typec-tcpci / host / host / default",
+	"gate.sleep / host / host / default",
+	"gate.hibernate / host / host / default",
 	"gate.typec-ucsi / host / host / default",
 	"gate.ucsi-ppm / host / host / default",
 	"gate.watchdog / host / host / default",

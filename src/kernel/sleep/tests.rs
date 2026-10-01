@@ -13,6 +13,31 @@ fn the_wake_the_sleep_saw_first_is_the_one_reported() {
 	assert_eq!(super::take_woke(), None, "and taken once");
 }
 
+crate::tagged_test!(a_marked_interrupt_wakes_the_sleep_and_nothing_else_does, [Kernel], id = "kernel.sleep.a_marked_interrupt_wakes_the_sleep_and_nothing_else_does", covers = ["kernel"]);
+fn a_marked_interrupt_wakes_the_sleep_and_nothing_else_does() {
+	let _ = super::take_woke();
+	super::device_interrupt(0x42);
+	assert_eq!(super::take_woke(), None, "an interrupt nobody marked is no wake");
+	assert!(super::mark_wake(0x42, true));
+	assert!(super::mark_wake(0x42, true), "marking twice is one mark");
+	super::device_interrupt(0x41);
+	assert_eq!(super::take_woke(), None, "only the marked identity");
+	super::device_interrupt(0x42);
+	assert_eq!(super::take_woke(), Some((abi::WAKE_DEVICE, 0x42)), "a device's wake, naming its interrupt");
+	assert!(super::mark_wake(0x42, false));
+	assert!(!super::is_wake(0x42), "and unmarked once, however often it was marked");
+	// THE SET IS BOUNDED, and a full one says so rather than dropping a mark.
+	for identity in 0..super::WAKE_SOURCES as u32 {
+		assert!(super::mark_wake(0x1000 + identity, true));
+	}
+	assert!(!super::mark_wake(0x2000, true), "a full wake set refuses");
+	for identity in 0..super::WAKE_SOURCES as u32 {
+		super::mark_wake(0x1000 + identity, false);
+	}
+	assert!(super::mark_wake(0x2000, true), "and takes one again once emptied");
+	super::mark_wake(0x2000, false);
+}
+
 crate::tagged_test!(a_sleep_type_is_checked_registered_and_kept, [Kernel], id = "kernel.sleep.a_sleep_type_is_checked_registered_and_kept", covers = ["kernel"]);
 fn a_sleep_type_is_checked_registered_and_kept() {
 	assert_eq!(super::register(abi::SLEEP_STATE_RAM, 8, 0), abi::ERR_INVALID, "SLP_TYP is three bits");

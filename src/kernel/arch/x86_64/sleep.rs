@@ -56,6 +56,33 @@ pub fn mask_device_lines() {
 	super::sci::gpes_enter_sleep();
 }
 
+// WHAT THIS PORT'S ENTRY TAKES: suspend to idle always; suspend to RAM where the firmware has a FACS to hold the waking
+// vector (the `\_S3` registration is the portable half); the fixed buttons from the FADT's flags.
+pub fn offers_idle() -> bool {
+	true
+}
+
+pub fn offers_ram() -> bool {
+	facs().is_some()
+}
+
+// The snapshot needs the trampoline page the resume path restarts the other cores through, and PM1 to read the wake.
+pub fn offers_disk() -> bool {
+	crate::boot_info().smp_trampoline != 0 && ports().is_some()
+}
+
+pub fn fixed_buttons() -> u64 {
+	#[cfg(not(test))]
+	{
+		super::sci::fixed_buttons()
+	}
+	// The suite arms no SCI, so it names no fixed button.
+	#[cfg(test)]
+	{
+		0
+	}
+}
+
 pub fn unmask_device_lines() {
 	#[cfg(not(test))]
 	super::sci::gpes_leave_sleep();
@@ -65,7 +92,17 @@ pub fn unmask_device_lines() {
 
 // ------------------------------------------------------------------ the request
 
+// WHAT THE BOOT CORE IS ASKED TO RUN: S3; hibernation's snapshot; or a restore's whole-memory replacement, which
+// answers only when it cannot happen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+	Ram,
+	Snapshot,
+	Replace,
+}
+
 struct Request {
+	kind: Kind,
 	pair: (u8, u8),
 	after: Option<u64>,
 	answer: Option<Result<SleepReport, i64>>,
@@ -79,6 +116,28 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 // SUSPEND TO RAM, asked from any core: the request handed to the boot core's idle context, and this thread blocked
 // until it answers - after the resume, or at a refusal.
 pub fn suspend_to_ram(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
+	ask(Kind::Ram, pair, after)
+}
+
+// HIBERNATION'S SNAPSHOT, the same way: answered twice - see `hibernate`.
+pub fn snapshot() -> Result<SleepReport, i64> {
+	ask(Kind::Snapshot, (0, 0), None)
+}
+
+// A RESTORE'S REPLACEMENT, the same way: answered only when it cannot happen.
+pub fn replace() -> i64 {
+	match ask(Kind::Replace, (0, 0), None) {
+		Ok(_) => ERR_UNSUPPORTED,
+		Err(error) => error,
+	}
+}
+
+pub use super::hibernate::{context_is_ours, development_variant, enter_disk, kernel_image, replace_memory};
+// The resume context a snapshot carries, which the suite's restore cases hand the kernel as an image's.
+#[cfg(test)]
+pub use super::hibernate::context;
+
+fn ask(kind: Kind, pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 	if crate::boot_info().smp_trampoline == 0 {
 		return Err(ERR_UNSUPPORTED);
 	}
@@ -88,7 +147,7 @@ pub fn suspend_to_ram(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport,
 		if request.is_some() {
 			return Err(ERR_ACCESS_DENIED);
 		}
-		*request = Some(Request { pair, after, answer: None });
+		*request = Some(Request { kind, pair, after, answer: None });
 	}
 	REQUEST_KOID.store(koid, Ordering::Release);
 	PENDING.store(true, Ordering::Release);
@@ -120,8 +179,12 @@ pub fn run_pending() {
 	if !PENDING.swap(false, Ordering::AcqRel) {
 		return;
 	}
-	let Some((pair, after)) = REQUEST.lock().as_ref().map(|request| (request.pair, request.after)) else { return };
-	let answer = run(pair, after);
+	let Some((kind, pair, after)) = REQUEST.lock().as_ref().map(|request| (request.kind, request.pair, request.after)) else { return };
+	let answer = match kind {
+		Kind::Ram => run(pair, after),
+		Kind::Snapshot => super::hibernate::run_snapshot(),
+		Kind::Replace => Err(crate::sleep::disk::replace_now()),
+	};
 	if let Some(request) = REQUEST.lock().as_mut() {
 		request.answer = Some(answer);
 	}
@@ -133,10 +196,10 @@ pub fn run_pending() {
 // PM1 control: SLP_TYP in bits 12:10, SLP_EN bit 13. PM1 status: WAK_STS bit 15, RTC_STS bit 10, PWRBTN_STS bit 8.
 const SLP_TYP: u16 = 0x7 << 10;
 const SLP_EN: u16 = 1 << 13;
-const WAK_STS: u16 = 1 << 15;
-const RTC_STS: u16 = 1 << 10;
-const PWRBTN_STS: u16 = 1 << 8;
-const SLPBTN_STS: u16 = 1 << 9;
+pub(super) const WAK_STS: u16 = 1 << 15;
+pub(super) const RTC_STS: u16 = 1 << 10;
+pub(super) const PWRBTN_STS: u16 = 1 << 8;
+pub(super) const SLPBTN_STS: u16 = 1 << 9;
 // PM1 enable: RTC_EN bit 10.
 const RTC_EN: u16 = 1 << 10;
 
@@ -154,6 +217,12 @@ static mut S3_SAVED_RSP: u64 = 0;
 #[repr(C, align(16))]
 struct ResumeStack([u8; 16 * 1024]);
 static mut S3_RESUME_STACK: ResumeStack = ResumeStack([0; 16 * 1024]);
+
+// The resume stack's top, which a hibernation image's context names too.
+#[allow(non_snake_case)]
+pub(super) fn SLEEP_RESUME_STACK_TOP() -> u64 {
+	(&raw const S3_RESUME_STACK as u64) + core::mem::size_of::<ResumeStack>() as u64
+}
 
 global_asm!(
 	r#"
@@ -202,8 +271,8 @@ s3_resume_entry:
 );
 
 unsafe extern "C" {
-	fn s3_save_and_enter(enter: extern "C" fn() -> u64) -> u64;
-	fn s3_resume_entry();
+	pub(super) fn s3_save_and_enter(enter: extern "C" fn() -> u64) -> u64;
+	pub(super) fn s3_resume_entry();
 }
 
 extern "C" fn restore_core() {
@@ -238,13 +307,13 @@ extern "C" fn enter_now() -> u64 {
 }
 
 // The FADT's PM1 blocks this entry needs: control a (required) and b, and event a's and b's status and enable.
-struct Ports {
-	control_a: u16,
-	control_b: u16,
-	status: [Option<(u16, u16)>; 2],
+pub(super) struct Ports {
+	pub(super) control_a: u16,
+	pub(super) control_b: u16,
+	pub(super) status: [Option<(u16, u16)>; 2],
 }
 
-fn ports() -> Option<Ports> {
+pub(super) fn ports() -> Option<Ports> {
 	let fadt = super::firmware::fadt()?;
 	let control_a = fadt.pm1a_control()?.io_port()?;
 	let control_b = fadt.pm1b_control().and_then(|block| block.io_port()).unwrap_or(0);
@@ -271,15 +340,18 @@ fn run(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 	if tramp_phys == 0 || tramp_phys >= 0x10_0000 || !super::apboot::cr3_is_reachable(kernel_cr3) {
 		return Err(ERR_UNSUPPORTED);
 	}
-	// THE TIMED WAKE IS THE CMOS ALARM, whole seconds from now, within the day the alarm reaches.
+	// THE TIMED WAKE IS THE CMOS ALARM, whole seconds from now, within the day the alarm reaches - on a machine with a CMOS
+	// clock. On one without, the Time and Alarm Device's driver armed its own timer in its step, and the kernel arms
+	// nothing.
+	let rtc = super::rtc_present();
 	let alarm = match after {
-		None => false,
-		Some(ns) => {
+		Some(ns) if rtc => {
 			if !super::rtc::arm_alarm(ns.div_ceil(1_000_000_000)) {
 				return Err(ERR_INVALID);
 			}
 			true
 		}
+		_ => false,
 	};
 	let suspended_at = match crate::sleep::prologue("suspend to RAM") {
 		Ok(at) => at,
@@ -290,7 +362,7 @@ fn run(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 			return Err(error);
 		}
 	};
-	let wall_before = super::rtc::read_unix();
+	let wall_before = if rtc { super::rtc::read_unix() } else { 0 };
 	mask_device_lines();
 	// EVERY OTHER CORE HELD in the idle loop's park before anything is saved: a core still running would change what
 	// is being saved, and the S3 takes its context anyway.
@@ -325,7 +397,7 @@ fn run(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 	unsafe {
 		super::apboot::set_root(tramp, kernel_cr3);
 		super::apboot::set_entry(tramp, s3_resume_entry as *const () as u64);
-		super::apboot::set_stack(tramp, (&raw const S3_RESUME_STACK as u64) + core::mem::size_of::<ResumeStack>() as u64);
+		super::apboot::set_stack(tramp, SLEEP_RESUME_STACK_TOP());
 		// THE WAKING VECTOR: the trampoline's real-mode page, and the 64-bit vector cleared so the firmware uses it.
 		core::ptr::write_volatile((facs + 12) as *mut u32, tramp_phys as u32);
 		let length = core::ptr::read_volatile((facs + 4) as *const u32);
@@ -389,9 +461,15 @@ fn run(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 	#[cfg(not(test))]
 	super::sci::rearm_after_reset();
 	let translating = crate::iommu::resume_after_reset();
-	// THE SLEEP'S LENGTH FROM THE RTC: the counter restarted with the machine.
-	let wall_after = super::rtc::read_unix();
-	let slept_ns = wall_after.saturating_sub(wall_before).saturating_mul(1_000_000_000);
+	// THE SLEEP'S LENGTH FROM THE RTC: the counter restarted with the machine. With no RTC of the kernel's own it is not
+	// known yet - the clock's driver hands the base again in its resume step, and the boot-time clock takes it then.
+	let slept_ns = if rtc {
+		let wall_after = super::rtc::read_unix();
+		wall_after.saturating_sub(wall_before).saturating_mul(1_000_000_000)
+	} else {
+		crate::sleep::slept_unknown();
+		0
+	};
 	crate::sleep::add_slept(slept_ns);
 	// EVERY OTHER CORE BACK, through the trampoline, on the identity map that is still reinstated - then removed.
 	crate::idle::end_hold();
@@ -412,7 +490,7 @@ fn run(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 
 // A SLEEP THAT DID NOT HAPPEN, unwound: the alarm disarmed, the clock rebased on the counter that ran on, the reason
 // said, and the COM1 window closed.
-fn abandon(suspended_at: u64, alarm: bool, why: &str, error: i64) -> i64 {
+pub(super) fn abandon(suspended_at: u64, alarm: bool, why: &str, error: i64) -> i64 {
 	if alarm {
 		super::rtc::disarm_alarm();
 	}

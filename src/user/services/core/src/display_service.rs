@@ -1714,6 +1714,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// THE PROTECTED SESSION'S ROOT, handed to AdminService alone. Optional: a boot without it has no
 		// protected screen, and AdminService declines every request. LAST, like every addition.
 		let trusted_root: u64 = recv_tagged(bootstrap, &mut buf, b"TRUSTED").unwrap_or(0);
+		// THE OUTPUTS' ROOT, read-only: which outputs this service drives and whether each is the machine's own - what the
+		// sleep policy asks before a closed lid suspends the machine. Optional, and LAST.
+		let outputs_root: u64 = recv_tagged(bootstrap, &mut buf, b"OUTPUTS").unwrap_or(0);
 		let providers: u64 = subscribe_to_displays(catalogue);
 		// THE SNAPSHOT IS ALREADY IN THE CHANNEL, which is what makes a subscription usable at
 		// bootstrap rather than only afterwards: the catalogue registers a subscriber and sends it
@@ -1726,7 +1729,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		serve_display(service, admin, stats_root, trusted_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control));
+		serve_display(service, admin, stats_root, trusted_root, outputs_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control));
 	}
 }
 
@@ -1878,7 +1881,58 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 	}
 }
 
-fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
+// THE OUTPUTS: the one this service drives, showing while a scanout is attached and not lost. External only where the
+// platform says so, and nothing here reads a platform description of its outputs yet - so the output is the machine's
+// own, which is what a machine with one display and no description of it has.
+struct OutputsCall<'a> {
+	state: &'a DisplayState,
+}
+
+impl proto::system::display_outputs::Service for OutputsCall<'_> {
+	fn outputs(&mut self) -> Result<Vec<proto::system::DisplayOutput>, Error> {
+		let scanout = &self.state.scanout;
+		Ok(alloc::vec![proto::system::DisplayOutput { index: 0, active: scanout.available() && !scanout.lost, external: false }])
+	}
+}
+
+// ONE REQUEST ON AN OUTPUTS CHANNEL - the root or a connection minted from it. False when the channel closed.
+fn serve_outputs(channel: u64, outputs: &mut Vec<u64>, state: &DisplayState, request: &mut [u8], reply: &mut [u8]) -> bool {
+	match recv_blocking(channel, request) {
+		Received::Message { len, handle } => {
+			if handle != 0 {
+				close(handle);
+			}
+			let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+			if op == HEARTBEAT_OP {
+				send_blocking(channel, b"PONG", 0);
+			} else if op == CONNECT_OP {
+				match channel_pair() {
+					Some((mine, theirs)) => {
+						outputs.push(mine);
+						send_blocking(channel, &[], theirs);
+					}
+					None => {
+						send_blocking(channel, &[], 0);
+					}
+				}
+			} else {
+				let mut reply_handle = proto::codec::Handles::new();
+				let mut request_handle = proto::codec::Handles::new();
+				if let Some(n) = proto::system::display_outputs::dispatch(&mut OutputsCall { state }, &request[..len], &mut request_handle, reply, &mut reply_handle) {
+					send_blocking(channel, &reply[..n], 0);
+				}
+			}
+			true
+		}
+		Received::Closed => false,
+	}
+}
+
+fn channel_pair() -> Option<(u64, u64)> {
+	channel()
+}
+
+fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, outputs_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
 	// THE OBSERVATION ROOT IS A FACTORY LIKE EVERY OTHER ROOT IN THIS SYSTEM, and it was not: it
 	// answered `resources()` and NOTHING else, so a supervisor minting an independent connection
@@ -1887,6 +1941,8 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 	// bootstrap. The boot chain stopped there: SystemGraphService never received its serve root and
 	// the shell after it was never started, on a system whose display was working perfectly.
 	let mut stats: Vec<u64> = if stats_root != 0 { alloc::vec![stats_root] } else { Vec::new() };
+	// THE OUTPUTS' ROOT AND EVERY CONNECTION MINTED FROM IT, waited on LAST so no index before them moves.
+	let mut outputs: Vec<u64> = if outputs_root != 0 { alloc::vec![outputs_root] } else { Vec::new() };
 	let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 	let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 	loop {
@@ -1948,16 +2004,26 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 				}
 			}
 		}
-		// AND THE PROTECTED SESSION'S CHANNEL, LAST: its holder going away ends the session.
+		// AND THE PROTECTED SESSION'S CHANNEL: its holder going away ends the session.
 		if state.trusted_session != 0 {
 			waits.push(state.trusted_session);
 		}
+		// AND THE OUTPUTS' CHANNELS, LAST, dispatched by handle before any index is read.
+		waits.extend(outputs.iter().copied());
 		// EACH PASS OF THE LOOP'S WAIT, with the number of handles it waits on - the per-pass cost that
 		// grows with the surface count - and which one ended it.
 		perf_site(b"ds-wait\0", waits.len() as u64);
 		let ready: i64 = wait_any(&waits, 0);
 		perf_site(b"ds-woke\0", ready as u64);
 		if ready < 0 {
+			continue;
+		}
+		if let Some(which) = outputs.iter().position(|&channel| channel == waits[ready as usize]) {
+			let channel = outputs[which];
+			if !serve_outputs(channel, &mut outputs, &state, &mut request, &mut reply) {
+				close(channel);
+				outputs.retain(|&held| held != channel);
+			}
 			continue;
 		}
 		if state.trusted_session != 0 && waits[ready as usize] == state.trusted_session {

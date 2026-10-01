@@ -15,12 +15,18 @@
 #   hidcheck cycle           the virtio-i2c binding disabled through the device policy: both HID bindings stop as lost
 #                            dependencies, their providers are detached, and the tablet still moves the cursor; enabled
 #                            again, both bind again on the GPIO controller that stayed bound, and deliver again
+#   ACROSS A SLEEP           a suspend to idle, and on x86_64 - S3 offered - an S3 cycle during which the control socket
+#                            makes the touchpad lose its power: both bindings answer SUSPENDED and RESUMED, and after
+#                            each resume `hidcheck watch` again sees the moves as pointer events and the contact as
+#                            contacts - which a driver that skipped SET_POWER on, or the RESET after the power loss,
+#                            cannot deliver, since a model left asleep or without its RESET reports nothing
 #   hidcheck malformed       the touchscreen bound again over a descriptor the control socket made malformed: its
 #                            binding fails and nothing is published for it
 #
 # THE PROBE CUES AND THE HOST ANSWERS: every phase of `hidcheck` prints the line the helper below waits for before it
-# watches, so nothing is raised ahead of a client that is not listening. ACROSS A SLEEP is P02M0197's to add, with the
-# suspend and resume exchange it carries.
+# watches, so nothing is raised ahead of a client that is not listening. `sleepctl` answers once the sleep it asked for
+# has ended - it is frozen with the rest and prints the record after the thaw - so the line after it runs after the
+# sleep.
 set -euo pipefail
 GUEST_GATE_NAME="i2c-hid"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -62,10 +68,14 @@ for _ in $(seq 1 100); do
 done
 [[ -e "$backend_dir/ready" ]] || fail "the vhost-user backend did not start"
 export I2C_FIXTURE=hid I2C_SOCKET="$backend_dir/i2c.sock" GPIO_SOCKET="$backend_dir/gpio.sock"
+# S3 OFFERED on x86_64, set explicitly rather than trusted as a default; the ports' sleep is a suspend to idle.
+if [[ "$GUEST_ARCH" == x86_64 ]]; then
+	export QEMU_EXTRA="${QEMU_EXTRA:+$QEMU_EXTRA }-global ICH9-LPC.disable_s3=0"
+fi
 # NO NIC: nothing here needs a network, and a NIC's status line can land inside a line the gate reads.
 export NET_NONE=1
-export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-360}"
-export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-600}"
+export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-480}"
+export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-720}"
 
 # One command to the backend's control socket; its one-line answer.
 control() {
@@ -102,8 +112,49 @@ reports() {
 	control "hid script touchscreen" >>"$backend_dir/host.log"
 }
 
+# ONE QMP COMMAND on a connection of its own: `query-status` answers the run state.
+qmp() {
+	python3 - "$root/../.build/boot/qemu-qmp.sock" "$1" <<'EOF'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(sys.argv[1])
+f = s.makefile('rw')
+def answer():
+	while True:
+		line = json.loads(f.readline())
+		if 'event' not in line:
+			return line
+def command(execute):
+	f.write(json.dumps({'execute': execute}) + '\n')
+	f.flush()
+	return answer()
+answer()
+command('qmp_capabilities')
+result = command(sys.argv[2])
+if sys.argv[2] == 'query-status':
+	print(result.get('return', {}).get('status', 'error'))
+EOF
+}
+
+# THE S3 CYCLE'S HOST HALF: once QEMU says the guest is suspended, the touchpad loses its power and the guest is woken.
+s3_host() {
+	local now
+	for _ in $(seq 1 600); do
+		now="$(qmp query-status 2>/dev/null || true)"
+		[[ "$now" == suspended ]] && break
+		sleep 0.2
+	done
+	echo "run state before the wake: $now" >>"$backend_dir/host.log"
+	[[ "$now" == suspended ]] || return 1
+	control "hid lose touchpad" >>"$backend_dir/host.log"
+	sleep 1
+	qmp system_wakeup >>"$backend_dir/host.log" 2>&1 || true
+}
+
 # THE HOST'S HALF OF EACH PHASE, answering the probe's cue.
 host_side() {
+	local watches
 	wait_for "hidcheck: watching - raise the reports now" || return 0
 	reports
 	wait_for "hidcheck: hold the lines now, then raise the reports" || return 0
@@ -152,6 +203,16 @@ print('moved the tablet twelve times')
 EOF
 	wait_for "hidcheck: raise the reports again now" || return 0
 	reports
+	# ACROSS A SLEEP: after the suspend to idle, and after the S3 on x86_64, the probe watches again.
+	watches=$(seen "hidcheck: watching - raise the reports now")
+	wait_for "hidcheck: watching - raise the reports now" "$watches" || return 0
+	reports
+	if [[ "$GUEST_ARCH" == x86_64 ]]; then
+		watches=$(seen "hidcheck: watching - raise the reports now")
+		s3_host || return 0
+		wait_for "hidcheck: watching - raise the reports now" "$watches" || return 0
+		reports
+	fi
 	wait_for "hidcheck: make the touchscreen's descriptor malformed now" || return 0
 	control "hid malformed touchscreen on" >>"$backend_dir/host.log"
 }
@@ -177,7 +238,9 @@ refuse() {
 
 host_side &
 helper=$!
-guest_gate_run $'hidcheck watch\nhidcheck storm\nhidcheck cycle\nhidcheck malformed' ""
+sleeps=$'sleepctl suspend idle 5\nhidcheck watch'
+[[ "$GUEST_ARCH" == x86_64 ]] && sleeps+=$'\nsleepctl suspend ram\nhidcheck watch'
+guest_gate_run $'hidcheck watch\nhidcheck storm\nhidcheck cycle\n'"$sleeps"$'\nhidcheck malformed' ""
 wait "$helper" 2>/dev/null || true
 helper=""
 
@@ -212,6 +275,23 @@ expect "InputService: a pointer provider is detached - platform device [0-9]+, .
 expect "InputService: a touch provider is detached - platform device [0-9]+, .* \(0 attached\)" "the touchscreen's surface must be detached"
 expect "hidcheck: the tablet still moves the cursor" "the tablet must keep moving the cursor"
 expect "hidcheck: PASS cycle" "both bindings must bind again and deliver"
+# ACROSS A SLEEP: every sleep ended as one, each binding answering both halves, and the watch passing after each.
+sleeps_n=1
+[[ "$GUEST_ARCH" == x86_64 ]] && sleeps_n=2
+ended="$(grep -ac "ServiceManager: sleep: the transaction ended - slept and woke" "$GUEST_LINES" || true)"
+((ended >= sleeps_n)) || fail "the $sleeps_n sleep(s) did not all end as slept and woke (saw $ended)"
+for device in "$touchpad" "$touchscreen"; do
+	suspended="$(grep -acE "driver\.i2c-hid: [^ ]*$device: suspended - SET_POWER sleep" "$GUEST_LINES" || true)"
+	resumed="$(grep -acE "driver\.i2c-hid: [^ ]*$device: resumed - SET_POWER on and RESET answered" "$GUEST_LINES" || true)"
+	((suspended >= sleeps_n && resumed >= sleeps_n)) || fail "$device answered $suspended suspend(s) and $resumed resume(s) for $sleeps_n sleep(s)"
+done
+passes="$(grep -ac "hidcheck: PASS watch" "$GUEST_LINES" || true)"
+((passes >= 1 + sleeps_n)) || fail "the watch did not pass after every sleep ($passes passes for $sleeps_n sleep(s) and the first)"
+if [[ "$GUEST_ARCH" == x86_64 ]]; then
+	grep -q "ok touchpad lost its power" "$backend_dir/host.log" || fail "the touchpad was not made to lose its power while the guest was in S3"
+	grep -aq "sleep: entered (suspend to RAM" "$GUEST_LINES" || fail "the S3 cycle never entered S3"
+fi
+echo "i2c-hid: across $sleeps_n sleep(s) both bindings answered SUSPENDED and RESUMED and the reports arrived after each"
 expect "driver\.i2c-hid: [^ ]*$touchscreen: its HID descriptor at register 0x1 is refused" "a malformed descriptor must be refused by name"
 expect "hidcheck: PASS malformed" "the binding must fail and publish nothing"
 echo "i2c-hid: PASS"

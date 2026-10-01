@@ -63,6 +63,10 @@ pub struct Resources {
 	// channel to its controller, scoped to that one address or line.
 	pub connections: [u64; proto::MAX_CONNECTIONS],
 	pub connection_count: usize,
+	// A `system-sleep` connection, for a control-method sleep button's driver.
+	pub syssleep: u64,
+	// The clock source's privilege, for a Time and Alarm Device's driver.
+	pub clock_source: u64,
 }
 
 // Read one frame. Answers with the header, the payload length, and every capability it carried.
@@ -159,6 +163,8 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 			proto::ResourceKind::TrustedKeys => &mut resources.trusted_keys,
 			proto::ResourceKind::ConsoleTap => &mut resources.console_tap,
 			proto::ResourceKind::Registers => &mut resources.registers,
+			proto::ResourceKind::SysSleep => &mut resources.syssleep,
+			proto::ResourceKind::ClockSource => &mut resources.clock_source,
 			// PORT RANGES ARE SEVERAL OF ONE KIND, kept in the order they came - the row's order. One past
 			// what a row can carry is closed, as a duplicate is.
 			proto::ResourceKind::PortRange => {
@@ -590,6 +596,34 @@ pub fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<us
 		for (at, &handle) in handles[..count].iter().enumerate() {
 			if poll_ready(handle) {
 				return Some(at);
+			}
+		}
+		if wait_any(&set[..count + 1], 0) < 0 {
+			return None;
+		}
+	}
+}
+
+// THE SAME WAIT, UNBOUNDED, FOR A DRIVER THAT TAKES THE SLEEP ITSELF: `Some(Some(index))` for a ready handle, `Some(None)`
+// for a `SUSPEND` handed back (read with `suspend_requested`), `None` as `wait_or_answer` answers it.
+pub fn wait_or_sleep(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<Option<usize>> {
+	let mut set: [u64; 8] = [0; 8];
+	let count: usize = handles.len().min(set.len() - 1);
+	set[..count].copy_from_slice(&handles[..count]);
+	set[count] = bootstrap;
+	loop {
+		match drain_control_into(bootstrap, bind, None, true) {
+			Control::Continue => {}
+			Control::Sleep => return Some(None),
+			Control::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+				return None;
+			}
+			Control::Ended => return None,
+		}
+		for (at, &handle) in handles[..count].iter().enumerate() {
+			if poll_ready(handle) {
+				return Some(Some(at));
 			}
 		}
 		if wait_any(&set[..count + 1], 0) < 0 {

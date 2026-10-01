@@ -178,6 +178,10 @@ pub enum Capability {
 	/// sleep's record - ServiceManager's `system-sleep`, a fresh connection per launch. Not the authority to stop the
 	/// machine, which is `system-power`'s. Granted to `sleepctl`. Appended last, for the reason `midi-output` states.
 	SystemSleep = 52,
+	/// WAKING THE MACHINE AT A TIME: `system-sleep`'s scheduled wake, a capability of its own because a program that can
+	/// wake the machine can empty its battery. A `system-sleep` connection minted with it may schedule; one without it
+	/// is refused. Granted to `sleepctl`. Appended last.
+	SleepWake = 53,
 }
 
 impl Capability {
@@ -273,6 +277,7 @@ impl Capability {
 			50 => Some(Capability::Typec),
 			51 => Some(Capability::TypecControl),
 			52 => Some(Capability::SystemSleep),
+			53 => Some(Capability::SleepWake),
 			_ => None,
 		}
 	}
@@ -1443,6 +1448,7 @@ impl Capability {
 			Capability::Typec => out.push_str("\"typec\""),
 			Capability::TypecControl => out.push_str("\"typec-control\""),
 			Capability::SystemSleep => out.push_str("\"system-sleep\""),
+			Capability::SleepWake => out.push_str("\"sleep-wake\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1500,6 +1506,7 @@ impl Capability {
 			Capability::Typec => out.push_str("typec"),
 			Capability::TypecControl => out.push_str("typec-control"),
 			Capability::SystemSleep => out.push_str("system-sleep"),
+			Capability::SleepWake => out.push_str("sleep-wake"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1557,6 +1564,7 @@ impl Capability {
 			Capability::Typec => crate::codec::cbor::text(out, "typec"),
 			Capability::TypecControl => crate::codec::cbor::text(out, "typec-control"),
 			Capability::SystemSleep => crate::codec::cbor::text(out, "system-sleep"),
+			Capability::SleepWake => crate::codec::cbor::text(out, "sleep-wake"),
 		}
 	}
 }

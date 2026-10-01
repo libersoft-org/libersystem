@@ -1262,6 +1262,12 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 				reap(cpu_sched(cpu));
 				return false;
 			}
+			// A REQUEST THAT WAITS FOR THE BOOT CORE'S IDLE CONTEXT is run here, between two threads' turns, and not only
+			// at a halt: a machine with a thread that never blocks does not settle - see `reschedule_as`.
+			if cpu == 0 && arch::sleep::s3_pending() {
+				arch::sleep::run_pending();
+				continue;
+			}
 			reschedule(Disposition::Requeue);
 		}
 		// Wake anything already past its deadline - a periodic wait does not count as
@@ -1532,7 +1538,12 @@ fn reschedule_as(disp: Disposition, why: u8) {
 	// Only for a REQUEUE: a thread that is blocking or retiring is leaving anyway, and both of those
 	// paths already return to the idle context. This is the yielding thread, which would otherwise
 	// be handed straight back its own turn for as long as it cares to take it.
-	if matches!(disp, Disposition::Requeue) && guard.current.is_some() && sched.drain_expired() {
+	// AND SO DOES A REQUEST THAT WAITS FOR THE BOOT CORE'S IDLE CONTEXT - an S3, hibernation's snapshot, a restore's
+	// replacement (`arch::sleep::run_pending`): a thread that never blocks would otherwise keep the boot core from ever
+	// reaching it, and nothing freezes a service before a restore. The thread is requeued, and runs again once the
+	// request has been answered.
+	let boot_core_owed = current_cpu_id() == 0 && arch::sleep::s3_pending();
+	if matches!(disp, Disposition::Requeue) && guard.current.is_some() && (sched.drain_expired() || boot_core_owed) {
 		let prev = guard.current.take().expect("checked on the line above");
 		let old_sp = prev.kstack_ptr_addr();
 		prev.set_state(ThreadState::Ready);

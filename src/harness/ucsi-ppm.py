@@ -156,7 +156,9 @@ class Ppm:
 	def record(self, line):
 		self.lines.append(line)
 		if self.log_file:
-			self.log_file.write(line + '\n')
+			# STAMPED WITH THE HOST'S TIME, so a gate can place a command against the guest's serial lines - the sleep
+			# case's "no command between SUSPENDED and RESUMED".
+			self.log_file.write(f'{time.time():.3f} {line}\n')
 			self.log_file.flush()
 
 	def violate(self, what):

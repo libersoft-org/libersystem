@@ -392,6 +392,13 @@ pub enum ResourceKind {
 	// controller that serves it, SCOPED to the one I2C address or the one GPIO line (with its trigger) the connection
 	// is. What a child binding reaches its bus through; the controller serves that scope and nothing beside it.
 	Connection = 12,
+	// A `system-sleep` CONNECTION of its own, for a control-method sleep button's driver: it asks for a suspend when the
+	// button is pressed, as DeviceManager does for the fixed one. Minted per binding from the door ServiceManager handed
+	// DeviceManager.
+	SysSleep = 13,
+	// THE CLOCK SOURCE'S PRIVILEGE, for a Time and Alarm Device's driver alone: under it the driver hands the kernel the
+	// wall clock on a machine whose kernel reads no RTC of its own.
+	ClockSource = 14,
 }
 
 // How many `PortRange` resources one bind can carry: one per port resource a row can record.
@@ -419,6 +426,8 @@ impl ResourceKind {
 			10 => Some(ResourceKind::ConsoleTap),
 			11 => Some(ResourceKind::Registers),
 			12 => Some(ResourceKind::Connection),
+			13 => Some(ResourceKind::SysSleep),
+			14 => Some(ResourceKind::ClockSource),
 			_ => None,
 		}
 	}
@@ -521,6 +530,9 @@ pub mod provider {
 	/// A USB TYPE-C CONNECTOR, every connector of one `ucsi-acpi` or `tcpci` binding, the `liber:typec@1`
 	/// `typec-provider` contract, which TypeCService alone consumes.
 	pub const TYPEC_CONNECTOR: u16 = 27;
+	/// A PLATFORM SWITCH - a lid - the `liber:device@1` `platform-switch` contract: its state and every change, which
+	/// the power-state service alone consumes for its sleep policy.
+	pub const PLATFORM_SWITCH: u16 = 28;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

@@ -116,6 +116,14 @@ static STORM_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// a PM1 block in a space this does not reach, or an SCI the redirection entry cannot address, ends
 /// with no interrupt armed and a line saying why - which is a machine whose power button does
 /// nothing, and is a great deal better than one that routed a line it cannot acknowledge.
+// THE FIXED BUTTONS THIS MACHINE HAS, as `SYS_SLEEP_STATES` reports them: the FADT's PWR_BUTTON (bit 4) and SLP_BUTTON
+// (bit 5) flags SET mean the button is a control-method device or absent, not the one PM1 carries.
+static FIXED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn fixed_buttons() -> u64 {
+	FIXED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn init(rsdp_phys: u64) {
 	let Some(bytes) = crate::smp::acpi_table(rsdp_phys, b"FACP") else {
 		crate::serial_println!("acpi: no FADT - fixed-hardware events are unavailable on this machine");
@@ -191,6 +199,8 @@ pub fn init(rsdp_phys: u64) {
 	//   AND THE ARMING LAST, because a source enabled while its line goes to a MASKED entry is still
 	//   asserted when the entry is unmasked - which delivers a press nobody made.
 	enter_acpi_mode(&fadt);
+	let flags: u32 = fadt.flags().unwrap_or(0);
+	FIXED.store(if flags & (1 << 4) == 0 { abi::SLEEP_FIXED_POWER_BUTTON } else { 0 } | if flags & (1 << 5) == 0 { abi::SLEEP_FIXED_SLEEP_BUTTON } else { 0 }, core::sync::atomic::Ordering::Relaxed);
 	*BLOCKS.lock() = Some(blocks);
 	ARMED.store(armed, core::sync::atomic::Ordering::Relaxed);
 	unsafe {
