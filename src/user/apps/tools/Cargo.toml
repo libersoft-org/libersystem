@@ -433,6 +433,10 @@ shared-image = [
 	"bmc-client-provider/shared-image",
 	"typec-client/shared-image",
 	"typec-client-provider/shared-image",
+	"input-client/shared-image",
+	"input-client-provider/shared-image",
+	"power-client/shared-image",
+	"power-client-provider/shared-image",
 	"admin-client/shared-image",
 	"admin-client-provider/shared-image",
 	"config-client/shared-image",
@@ -495,6 +499,10 @@ bmc-client = { path = "../../libs/clients/bmc-client", optional = true }
 bmc-client-provider = { path = "../../libs/clients/bmc-client-provider", optional = true }
 typec-client = { path = "../../libs/clients/typec-client", optional = true }
 typec-client-provider = { path = "../../libs/clients/typec-client-provider", optional = true }
+input-client = { path = "../../libs/clients/input-client", optional = true }
+input-client-provider = { path = "../../libs/clients/input-client-provider", optional = true }
+power-client = { path = "../../libs/clients/power-client", optional = true }
+power-client-provider = { path = "../../libs/clients/power-client-provider", optional = true }
 admin-client = { path = "../../libs/clients/admin-client", optional = true }
 admin-client-provider = { path = "../../libs/clients/admin-client-provider", optional = true }
 network-client = { path = "../../libs/clients/network-client", optional = true }

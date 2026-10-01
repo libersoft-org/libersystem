@@ -216,3 +216,14 @@ top of it.
   an earlier commit); none of this work's files is in its list.
 - The reference trees `/data/yellow/lsref` and `/data/yellow/lsins` were removed after the measurement (8 GB);
   `git archive ff08ea18` / `git archive HEAD` recreate them.
+
+## The ports' first run with the sites in (2026-10-01)
+
+- The aarch64 development boot of `check-tickless-idle.py` never reached its shell: `virtio-blk`'s driver died at
+  its first perf site, again at each rebind, until its node failed - "ring-3 general protection fault (code
+  0x6234f901) at 0x212bf4", the PC `rt::perf_now`, the syndrome's class 0x18 (a trapped MRS). A site is stamped with
+  CNTVCT_EL0 in user mode, `perf_site_record` reads the clock before it asks whether sites are live, and the aarch64
+  kernel never set CNTKCTL_EL1.EL0VCTEN - whose value at reset is the firmware's, clear on QEMU with or without EDK2.
+  So on aarch64 every process reaching a site died at its first one, trace boot or not. FIXED in the kernel
+  (`arch/aarch64/gic.rs`, `arm_local_timer`, run by every core): EL0VCTEN set, the physical count and every timer
+  register left EL1's. riscv64 already lets U-mode read `time` (`scounteren`); x86_64's `rdtsc` needs nothing.

@@ -737,3 +737,13 @@ NOT RUN:
 None for the three items.
 
 The milestone's own text keeps no suspend or platform policy. It stays open only for the cross-builds above.
+
+## The gates after P02M0197 and P02M0198 (2026-10-01)
+
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate power-ups` -> PASS.
+- `power-service` FAILED once in the batch of 2026-10-01 with three of its fifteen lines typed: the console driver's
+  budget (`GUEST_GATE_SECONDS`, 200 s) covers the boot as well, and the development boot now takes 118 s from the
+  firmware to the shell on this machine (75 s from the kernel's first line, 41 s of it StorageService copying the live
+  system volume into memory). The same gate run alone passed; its budgets are 300 s and 480 s now
+  (`src/tools/check-power-service.sh`, the reason in its comment), and it passed again in the next batch (481 s in all).
+  The boot's length is not this milestone's; it is said here because it is what the budget was paying for.

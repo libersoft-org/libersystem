@@ -184,3 +184,15 @@ The record of what was built and verified follows below when it is.
 #### Open after this record
 - Source (a)'s `_CRS` ranges (P02M0196b); the cross-builds; the sleep entry's production wiring (P02M0197b);
   the 16550's `RESUME` reprogramming with P02M0197's suspend and resume exchange.
+
+## The console at a planned end, and the gate run again (2026-10-01)
+
+- Found by P02M0197's gate and recorded in its audit: a power-off or reset a process asked for, while `uart16550`
+  held COM1, lost the lines the driver had read from the tap and not yet put out (up to 1024 bytes). `sys_system_power`
+  now calls `arch::serial::settle_driver` first: the tap signalled and the core yielded until the ring has been empty
+  for 100 ms, at most 1 s (empty on the ports). The terminal-path writer itself, and the panic and forced-deadline
+  paths, are unchanged. Kernel test `kernel.object.port_range.handoff.a_planned_end_waits_for_the_driver_to_take_the_ring_and_no_longer_than_its_bound`
+  (watched failing with the wait removed).
+- And `uart16550` keeps its consumer across a sleep it takes itself (the session was reset after every step, ending
+  ConsoleService's input stream at each wake) - P02M0197's audit.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate serial-handoff` -> PASS twice on 2026-10-01, the second with the settle in.

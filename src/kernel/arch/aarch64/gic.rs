@@ -338,6 +338,16 @@ fn arm_local_timer() {
 	unsafe {
 		core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
 	}
+	// THE VIRTUAL COUNT READABLE FROM EL0 (CNTKCTL_EL1.EL0VCTEN), on every core: user mode stamps a perf site with
+	// CNTVCT_EL0 (`rt::perf_now`), which traps while the bit is clear - and its value at reset is whatever the firmware
+	// left, which on QEMU, with or without EDK2, is clear: every driver reaching a site died on its first one. The
+	// physical count and every timer register stay EL1's.
+	unsafe {
+		let mut control: u64;
+		core::arch::asm!("mrs {}, cntkctl_el1", out(reg) control, options(nomem, nostack, preserves_flags));
+		control |= 1 << 1;
+		core::arch::asm!("msr cntkctl_el1, {}", "isb", in(reg) control, options(nomem, nostack, preserves_flags));
+	}
 }
 
 // THIS CORE'S TIMER AS A ONE-SHOT for a halt, at tick `deadline` - never, for `None` or a tick too far away

@@ -284,7 +284,8 @@ pub fn rtc_present() -> bool {
 
 // WHETHER THE DEVELOPMENT SWITCH NAMES `word` AS ABSENT - a fw_cfg file of its own, read as the boot profile is, and
 // honoured only on a development profile: the CMOS RTC (`rtc`) or the sleep-type registration (`sleep-types`), the
-// two cases q35 cannot otherwise reach. A shipping boot names no profile, so it is never consulted there.
+// two cases q35 cannot otherwise reach. Compiled into the development build alone (`cfg(liber_development)`).
+#[cfg(liber_development)]
 pub fn absent_named(word: &[u8]) -> bool {
 	if boot_profile().is_none() {
 		return false;
@@ -292,6 +293,13 @@ pub fn absent_named(word: &[u8]) -> bool {
 	let mut names = [0u8; 64];
 	let Some(len) = fwcfg::read_file(b"opt/org.libersystem/absent", &mut names) else { return false };
 	names[..len].split(|byte| matches!(byte, b' ' | b',' | b'\n' | 0)).any(|name| name == word)
+}
+
+// A SHIPPING KERNEL NAMES NOTHING ABSENT: the switch is compiled into the development build alone, so no machine's fw-cfg
+// can turn the CMOS clock or the sleep-type registration off in a shipping one.
+#[cfg(not(liber_development))]
+pub fn absent_named(_word: &[u8]) -> bool {
+	false
 }
 
 // Name the boot profile the host selected, or `None` for an ordinary boot. The profile

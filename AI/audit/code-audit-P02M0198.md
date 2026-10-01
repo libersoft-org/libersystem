@@ -457,3 +457,56 @@ VERIFICATION, so far: the six kernel configurations (`cargo check` for x86_64, a
 test) compiled clean in the working copy before it was synced; `fdt` 123 host tests (the idle-state parser's among
 them). THE PORTS' RUNS - the kernel test above and `check-tickless-idle.py aarch64 riscv64` with the fixture - are
 the job's slow-architecture step at its end and are recorded when run.
+
+## P02M0198 - the gate batches of 2026-10-01 (x86_64)
+
+- `processor-power` -> PASS three times (the third with the ports' processor work in the tree), every line of
+  P02M0198b to d's guest checks as listed in the gate's PASS line.
+- `TEST_SELECTION=<the five kernel.processor tests and the seven handoff tests> ./test.sh --arch x86_64` -> PASS, 12 in
+  37 s, after `./build.sh --arch x86_64` (a run before the build had refused: "the x86_64 build does not match the
+  sources").
+- `python3 tools/check-tickless-idle.py x86_64` -> PASS: 3 bursts of 45 keys echoed within 4 ms (median 2 ms), 36 wakes
+  on the UART's interrupt, an idle cpu0 at 91.7 wakes/s (the housekeeping bound) and the others at 0.0/s, a device
+  plugged in seen 77 ms later.
+- `kernel-allocations`, `source-hygiene` (after its own fix in the sleep gate's `run_stick`: a `tr | grep -q` under
+  `pipefail`), `development-gate`, `no-fixed-provider-slots`, `gate-oracles`, `firmware-fixtures` -> PASS.
+- The fan across a sleep: the gate `sleep`'s platform boot - P02M0197's audit.
+
+## P02M0198 on aarch64 and riscv64 - run (2026-10-01)
+
+- `./build.sh --arch aarch64` and `--arch riscv64` -> ok (after the fixes recorded in P02M0190's and P02M0196's audits
+  and one `foreign-audit-link.py --check`, which the rt changes of this goal require: "the recorded pass-2 inventory
+  reproduces"); `./build.sh --arch x86_64` -> ok again after the graph key's change (904 s, every cache rebuilt).
+- `TEST_SELECTION=kernel.processor.a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request
+  ./test.sh --arch aarch64` -> PASS (1 passed, 153 s); `--arch riscv64` -> PASS (1 passed, 211 s). On both: "core 0's
+  idle table from the device tree - 4 state(s)", the context-losing state said not entered ("it loses the core's
+  context, and no per-core resume path"), the retention states entered through PSCI's CPU_SUSPEND and the SBI's
+  HART_SUSPEND with no refusal, the deep state entered by a long idle period and the retention state within a 1000 us
+  request.
+- The firmwares' offers, said at boot: "PSCI SYSTEM_SUSPEND is not offered by this firmware" (aarch64) and "the SBI
+  System Suspend extension is not offered by this firmware" (riscv64).
+- `python3 tools/check-tickless-idle.py aarch64 riscv64` (2026-10-01) - aarch64 PASS on its second run (the first
+  never reached a shell: the aarch64 kernel left EL0 reads of CNTVCT_EL0 trapping - P02M0189's audit): every core
+  installed the tree's 4 idle states with the context-losing one held out; 3 bursts of 45 keys echoed within 21 ms
+  (median 6 ms), 22 wakes on the UART's interrupt 33; the retention states entered 1311 times over the sample through
+  PSCI and the context-losing state never; an idle cpu0 at 67.2 wakes/s, the others at 0.0/s over 20 s; a plugged
+  device seen 45 ms later; "PSCI SYSTEM_SUSPEND is not offered by this firmware"; suspend to idle - 5007 ms between
+  the kernel's lines for a 5 s wake with the counter silent, count 2 then 3 (monotonic +3475 ms, boot-time +8476 ms),
+  4 cores parked with no wake but the wake.
+- riscv64, on the same tree, passed every stage up to the suspend to idle in two runs whose failures were the GATE's:
+  (1) `graph`'s prompt buried by a late ipv6 line, waited for 600 s - `Serial.wait_prompt` now types an empty line
+  once the output has been quiet a while past a prompt the command produced, as `lab`'s boot wait does; (2) the
+  shell's prompt, printed when `sleepctl` ended, landed inside a background counter line ("sleepcheck: vol://system>
+  count 23 ...") and read as a skipped value - the prompt is taken out of a line before the counter's pattern is
+  matched (`PROMPT_TEXT`). Its stages so far: the 4 tree states installed, 45 keys echoed within 25 ms with 26 wakes
+  on the UART's interrupt 63, the retention states entered 1259 times through the SBI and the context-losing one
+  never, cpu0 at 58.8 wakes/s and the others at 0.0/s, a plugged device seen 52 ms later, "the SBI System Suspend
+  extension is not offered by this firmware", and the suspend to idle's own numbers in its log (5001 ms slept, count
+  2 then 3 with monotonic +4688 ms and boot-time +9690 ms - the difference the 5 s sleep - and every core parked with
+  no device wake). The third run is in progress.
+- `powerctl` had the same generic transport residual as P02M0192's `gamepad` (power::Client and
+  processor_power_admin::Client over `ChannelTransport` in the tool): `power-client` (PowerService's `sources`;
+  ProcessorPowerService's `status`, `set-profile`, `set-fan-curve`) and `power-client-provider` (the four
+  trampolines), a `lib/clients/power-client.lslib` row, and `powerctl`'s providers `base-proto`, `power-client`,
+  `lsrt`. `./build.sh --arch x86_64` ok; the `processor-power` gate, which drives `powerctl`, is in the batch running
+  now.

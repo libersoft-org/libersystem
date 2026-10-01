@@ -199,6 +199,8 @@ const CLASS_HUB: u8 = 9;
 const DESC_HUB: u16 = 0x29;
 const REQ_GET_STATUS: u8 = 0;
 const REQ_SET_FEATURE: u8 = 3;
+// The standard device feature a suspended device signals its own resume by (USB 2.0 9.4.1, 9.4.9).
+const FEATURE_DEVICE_REMOTE_WAKEUP: u16 = 1;
 const RT_CLASS_DEVICE_IN: u8 = 0xa0;
 const RT_CLASS_PORT: u8 = 0x23;
 const RT_CLASS_PORT_IN: u8 = 0xa3;
@@ -531,6 +533,9 @@ struct UsbDevice {
 	vendor: u16,
 	product: u16,
 	class: u8,
+	// REMOTE WAKEUP ENABLED on the device (SET_FEATURE(DEVICE_REMOTE_WAKEUP), sent when its configuration declares
+	// it and the device is a keyboard): what lets a key end a suspend to idle - see `Sleep`.
+	remote_wakeup: bool,
 }
 
 impl UsbDevice {
@@ -1032,11 +1037,22 @@ fn wait_clear(addr: u64, mask: u32) -> Option<()> {
 // halt, having stopped fetching from every ring. A suspend to idle keeps the controller's power and its state, so the
 // resume runs it again and signals each suspended port back to U0; a controller that lost its power lost its rings and
 // its device contexts, which only a bind sets up, so that resume answers it did not come back.
+// A SUSPEND TO IDLE ASKED TO ARM WAKE, with a keyboard whose remote wakeup this driver enabled, KEEPS THE CONTROLLER
+// RUNNING: its ports go to U3 as for any sleep, the controller is not halted, and its interrupt is marked as a wake
+// source. A key then signals the keyboard's resume, the controller posts the port's change on its event ring and
+// raises its interrupt, and that ends the sleep - the controller has no other way to say it: the wake a halted
+// controller raises is PCI's PME, which needs the platform's own wake path. Every other sleep halts it, as before:
+// suspend to RAM and hibernation lose its power, and a controller whose keyboards cannot wake is quiet.
 struct Sleep<'a> {
 	hc: &'a Xhci,
 	serving: &'a mut common::Serving,
 	// The ports this step sent to U3.
 	suspended: Vec<u32>,
+	// Whether a bound keyboard's remote wakeup is enabled, and the controller's interrupt.
+	keyboard_wakes: bool,
+	irq: u64,
+	// Whether this step left the controller running with its interrupt marked as a wake source.
+	armed: bool,
 }
 
 fn portsc(hc: &Xhci, port: u32) -> u32 {
@@ -1066,7 +1082,8 @@ fn wait_link(hc: &Xhci, port: u32, state: u32) -> bool {
 }
 
 impl common::SleepStep for Sleep<'_> {
-	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let wake = self.keyboard_wakes && request.arm_wake && !request.state.loses_power() && self.irq != 0;
 		for port in 1..=self.hc.ports {
 			let status = portsc(self.hc, port);
 			if status & (PORTSC_CCS | PORTSC_PED) == PORTSC_CCS | PORTSC_PED && (status & PORTSC_PLS) >> PORTSC_PLS_SHIFT == PLS_U0 {
@@ -1075,6 +1092,11 @@ impl common::SleepStep for Sleep<'_> {
 			}
 		}
 		let settled = self.suspended.iter().all(|&port| wait_link(self.hc, port, PLS_U3));
+		if settled && wake && interrupt_wake(self.irq, true) == 0 {
+			self.armed = true;
+			print(b"driver.xhci: suspended with a keyboard's remote wakeup armed - the controller runs on to raise it\n");
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::DoneWakeArmed, awake_by_ms: 0 };
+		}
 		if !settled || !self.hc.halt() {
 			print(b"driver.xhci: the sleep is refused - a port did not suspend or the controller did not halt\n");
 			self.wake_ports();
@@ -1084,6 +1106,13 @@ impl common::SleepStep for Sleep<'_> {
 	}
 
 	fn resume(&mut self, lost_power: bool) -> bool {
+		// A CONTROLLER LEFT RUNNING for a keyboard's wake: unmarked, and its ports back to U0 - a port a key resumed
+		// is in the Resume state, which U0 ends.
+		if core::mem::take(&mut self.armed) {
+			let _ = interrupt_wake(self.irq, false);
+			self.wake_ports();
+			return true;
+		}
 		if lost_power {
 			print(b"driver.xhci: the controller lost its rings in the sleep - it is bound again\n");
 			return false;
@@ -1262,7 +1291,7 @@ unsafe fn address_device(hc: &mut Xhci, root_port: u32, route: u32, speed: u32) 
 		// EVERY ALLOCATION FROM HERE IS OWNED BY THE DEVICE, so a failure part way through releases
 		// what it got rather than leaving a slot enabled and three pages pinned to a device that
 		// never came up.
-		let mut dev = UsbDevice { slot, port: root_port, route, speed, ep0: Ring { virt: 0, phys: 0, index: 0, cycle: 1, handle: 0 }, in_virt: 0, in_phys: 0, data_virt: 0, data_phys: 0, ctx_handle: 0, in_handle: 0, data_handle: 0, vendor: 0, product: 0, class: 0 };
+		let mut dev = UsbDevice { slot, port: root_port, route, speed, ep0: Ring { virt: 0, phys: 0, index: 0, cycle: 1, handle: 0 }, in_virt: 0, in_phys: 0, data_virt: 0, data_phys: 0, ctx_handle: 0, in_handle: 0, data_handle: 0, vendor: 0, product: 0, class: 0, remote_wakeup: false };
 		let built = (|| {
 			let (ctx_handle, _ctx_virt, ctx_phys): (u64, u64, u64) = dma_page()?;
 			dev.ctx_handle = ctx_handle;
@@ -1988,7 +2017,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			let ready = match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &waiting, owed) {
 				Some(Some(ready)) => Some(ready),
 				Some(None) => {
-					if common::take_sleep_step(bootstrap, bind, &mut Sleep { hc: &hc, serving: &mut serving, suspended: Vec::new() }) {
+					if common::take_sleep_step(bootstrap, bind, &mut Sleep { hc: &hc, serving: &mut serving, suspended: Vec::new(), keyboard_wakes: hids.remote_wakeup(), irq, armed: false }) {
 						continue;
 					}
 					None

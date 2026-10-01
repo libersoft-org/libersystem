@@ -66,6 +66,8 @@ IDLE_SAMPLE = 10.0
 IDLE_WAKE_S = 5
 IDLE_MARGIN_MS = 300
 SLEEP_OFFERED = re.compile(rb'sleep: [^\r\n]* is (offered|not offered) by this firmware')
+# THE SHELL'S PROMPT, as it reads once the colours are stripped - for taking it out of a line it landed in.
+PROMPT_TEXT = re.compile(r'vol://[^\r\n>]*> ')
 COUNTER = re.compile(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)')
 PARKED = re.compile(r'cpu(\d+): woke (\d+) time\(s\) for the timer, (\d+) for an IPI, (\d+) for a device')
 
@@ -151,18 +153,30 @@ class Serial:
 
 	# THE PROMPT, SETTLED: a prompt at the end of the output with nothing after it for a quarter of a second
 	# (scaled), which is `lab`'s own rule - a program can print a prompt-shaped line and keep going.
+	#
+	# AND A PROMPT A LATE LINE BURIED IS ASKED FOR AGAIN, as `lab`'s boot wait asks: the shell printed its prompt and
+	# a line written on its own clock - the network's address configuration, on riscv64 - landed after it, and nothing
+	# prints another. Once the output has been quiet a while past a prompt this command produced, an empty line is
+	# typed, and the shell answers it with one.
 	def wait_prompt(self, mark, timeout, what):
 		started = time.monotonic()
 		settle = lab.PROMPT_SETTLE * self.scale
+		nudge_from = mark
+		quiet_since = time.monotonic()
 		while True:
 			if lab.PROMPT.search(self.text_since(mark)):
 				if not self.pump(settle):
 					return
 				continue
+			if time.monotonic() - quiet_since >= lab.BOOT_NUDGE_QUIET * self.scale and lab.PROMPT_ANYWHERE.search(lab.strip_ansi(bytes(self.data[nudge_from:]))):
+				self.type(b'\n')
+				nudge_from = len(self.data)
+				quiet_since = time.monotonic()
 			left = started + timeout - time.monotonic()
 			if left <= 0:
 				raise GateError(f'{what}: no shell prompt within {timeout:.0f} s')
-			self.pump(min(left, 0.2))
+			if self.pump(min(left, 0.2)):
+				quiet_since = time.monotonic()
 
 	# Wait until the guest has written nothing for `quiet` seconds - an idle machine - or `limit` passes.
 	def settle(self, quiet, limit):
@@ -228,7 +242,10 @@ def suspend_to_idle(target, serial, scale):
 		raise GateError(f'suspend to idle: the host measured {slept:.0f} ms between the kernel\'s lines, under the {IDLE_WAKE_S} s wake')
 	rows = []
 	for stamp, line in lines:
-		found = COUNTER.search(line)
+		# A PROMPT THE SHELL PRINTED INTO A COUNTER LINE is taken out first: `sleepctl` ends at the serial shell while
+		# the counter writes in the background, and the two share the console - "sleepcheck: " then the prompt then
+		# "count 23 ..." is one counter line, not a missing value.
+		found = COUNTER.search(PROMPT_TEXT.sub('', line))
 		if found:
 			rows.append((stamp, int(found.group(1)), int(found.group(2)), int(found.group(3))))
 	inside = [row for row in rows if entered < row[0] < resumed]

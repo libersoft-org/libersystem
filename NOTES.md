@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- hybernation doesn't work without TPM - allow it with warning
 - shutdown doesn't work, it just halts, but not turns off
 - network doesn't work - ping google.com is not responding
 - imgview has a bug - when pressing escape or CTRL+C, it does not exit immediately

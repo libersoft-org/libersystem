@@ -83,3 +83,15 @@ missing from its `later_denials!` list, so the test failed on x86_64 (`--tags pr
 `src/kernel/test_suites/applications.rs` (`later_denials!` gains ` input-gamepad=deny`); the other probe
 summaries in that file use the same macro. No other pinned copy of the vocabulary exists in the tree
 (`grep admin-test=deny`). Re-verification: the same tag run, recorded in the P02M0198 record.
+
+## The dynamic report, refreshed at last (2026-10-02)
+
+- `./check.sh --refresh dynamic-report`, run once all three targets' graphs were current, FAILED on this milestone's
+  tool: "x86_64-unknown-none gamepad has a generic transport residual
+  ...ChannelTransport...wire::Transport::call=ipc-client" - `gamepad` built `input::Client::new(ChannelTransport { .. })`
+  itself, which instantiates the generated client's codec in the tool, the copy the client libraries exist to avoid.
+  FIXED as every other tool does it: `input-client` (the one operation, `observe-gamepads`, declared by its stable
+  name) and `input-client-provider` (its trampoline to the `liber_channel_impl_*` symbol `input-proto` exports), a
+  `lib/clients/input-client.lslib` library row, the tools crate's optional dependencies under `shared-image`, and
+  `gamepad`'s providers what it now imports (`base-proto`, `input-client`, `input-proto` for the stream frames'
+  decoder, `lico`, `lsrt`). Its regression run and the refresh's are in the batch running now.

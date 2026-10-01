@@ -443,7 +443,7 @@ WAVE_TAGS[6]='service,process,storage,permission-service'
 # guest then booted the PREVIOUS userspace and passed. `src/volume` is worse in its simplicity: it is
 # the factory files the volume literally ships, and changing one of them changed nothing the check
 # could see.
-VOLUME_SOURCES=(abi boot fs idl proto sdk term tools user volume wasm wire)
+VOLUME_SOURCES=(abi acpi aml boot fs idl platform procpower proto sdk term tools tpm user volume wasm wire)
 
 # WHAT THE LOADER IS BUILT FROM, which is not `boot/loader`.
 #

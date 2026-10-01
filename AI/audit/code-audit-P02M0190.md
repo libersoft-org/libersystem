@@ -161,3 +161,27 @@ Status: IMPLEMENTED; verified on x86_64 and the host; the ports' runs remain.
   showed the merged row). `src/harness/scenarios/tpm-tool.toml` now expects the merged row - a TOML literal string, so
   the path's backslash is the line's own - for both front-ends (QEMU's `_CRS` for TIS is 0x5000 and for CRB 0x1000 at
   the same base, merged either way, the row keeping the table's page).
+- AND THE PATH IS THE FRONT-END'S: with the merged expectation the CRB run passed and the TIS run failed - QEMU places
+  the TIS front-end's `MSFT0101` device under the LPC bridge (`\_SB_.PCI0.SF8_.TPM_`, read in that run's serial log)
+  and the CRB's at `\_SB_.TPM_`. The scenario reads the row in two parts on either side of the path (an `expect`
+  moves past its match, so the second part starts where the first ended - a first try that began the second part
+  with the path's dot failed on exactly that).
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate qemu-tpm-tool` -> PASS (519 s, 2026-10-01): "behind CRB and behind TIS, the
+  TPM2 table's row is one 4 KiB page with no interrupt, the driver binds it and restarts under a held connection,
+  TpmService serves the tool and refuses the probe by name, and the quote verifies"; on the host, two draws differ,
+  PCR 16 is the chain of the typed text, PCR 8 did not move, and OpenSSL verifies the quote over this nonce and PCR 16.
+- `development-gate` -> PASS (47 development-only programs absent from the shipping configuration, `tpmprobe` among
+  them now).
+
+## The first cross-build after the probe's move (2026-10-01)
+
+- `./build.sh --arch aarch64` FAILED: "build-shared: Cargo image graph has no unique archive for
+  user/libs/clients/tpm-client-provider". The services crate's dependency on `tpm-client-provider` (for the static
+  `tpmprobe`) did not forward the image's `shared-image` feature, so the graph build compiled the provider twice -
+  once with `shared-image` (the staged provider), once without (the services crate's) - and two archives are no unique
+  one. x86_64 had not seen it: its graph was cached from before the move, and THE GRAPH'S CACHE KEY DID NOT COVER THE
+  SERVICES CRATE, whose seed is built in that same graph - a dependency it gained changed which archives the graph
+  holds without invalidating it (the first aarch64 retry hit the same stale graph). FIXED: the services crate's
+  `shared-image` forwards to `tpm-client`, `tpm-client-provider` and `tpm-proto` (`services/core/Cargo.toml`), and the
+  graph key digests the services crate's sources (`src/tools/build-shared.sh`, `image_graph_source_digest`). The
+  rebuild then got past the graph.

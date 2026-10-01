@@ -163,6 +163,25 @@ struct Held {
 	events: u64,
 }
 
+// THE PORT INSTRUCTIONS ARE x86_64's (`rt::port`). The device-tree ports have no port space: the kernel grants no port
+// range there (`SYS_PORT_RANGE_FIRMWARE`), so every access below is refused before it is made - and these answer what
+// an undecoded port reads, all ones, should one ever be reached.
+#[cfg(not(target_arch = "x86_64"))]
+mod port {
+	pub fn inb(_port: u16) -> u8 {
+		u8::MAX
+	}
+	pub fn inw(_port: u16) -> u16 {
+		u16::MAX
+	}
+	pub fn inl(_port: u16) -> u32 {
+		u32::MAX
+	}
+	pub fn outb(_port: u16, _value: u8) {}
+	pub fn outw(_port: u16, _value: u16) {}
+	pub fn outl(_port: u16, _value: u32) {}
+}
+
 // The embedded controller's two ports, as the transport reads them.
 struct EcPorts {
 	data: u16,

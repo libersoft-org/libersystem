@@ -1,0 +1,17 @@
+[package]
+name = "input-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem input channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["input-proto/shared-image"]
+
+[dependencies]
+input-proto = { path = "../../protocol/input-proto" }
+
+[lints.rust]
+warnings = "deny"

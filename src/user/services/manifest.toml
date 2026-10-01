@@ -426,6 +426,22 @@ owner = "typec-client-provider"
 path = "user/libs/clients/typec-client-provider"
 
 [[sources]]
+owner = "input-client"
+path = "user/libs/clients/input-client"
+
+[[sources]]
+owner = "input-client-provider"
+path = "user/libs/clients/input-client-provider"
+
+[[sources]]
+owner = "power-client"
+path = "user/libs/clients/power-client"
+
+[[sources]]
+owner = "power-client-provider"
+path = "user/libs/clients/power-client-provider"
+
+[[sources]]
 owner = "tpm-client"
 path = "user/libs/clients/tpm-client"
 
@@ -1798,7 +1814,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/powerctl.lsexe"
-providers = ["base-proto", "power-proto", "ipc-client", "wire", "lsrt"]
+providers = ["base-proto", "power-client", "lsrt"]
 
 # THE TPM DEMONSTRATION TOOL, the one shipping holder of the three TPM grants: it prints what the TPM answered, through
 # `tpm-client` - the library a third-party program links.
@@ -1898,7 +1914,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/gamepad.lsexe"
-providers = ["base-proto", "input-proto", "ipc-client", "lico", "wire", "lsrt"]
+providers = ["base-proto", "input-client", "input-proto", "lico", "lsrt"]
 
 [[programs]]
 name = "lsvol"
@@ -6528,6 +6544,20 @@ owner = "typec-client-provider"
 destination = "lib/clients/typec-client.lslib"
 features = ["shared-image"]
 providers = ["typec-proto"]
+
+[[libraries]]
+name = "input-client"
+owner = "input-client-provider"
+destination = "lib/clients/input-client.lslib"
+features = ["shared-image"]
+providers = ["input-proto"]
+
+[[libraries]]
+name = "power-client"
+owner = "power-client-provider"
+destination = "lib/clients/power-client.lslib"
+features = ["shared-image"]
+providers = ["power-proto"]
 
 [[libraries]]
 name = "tpm-client"

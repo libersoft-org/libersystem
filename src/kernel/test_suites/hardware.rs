@@ -4550,7 +4550,8 @@ fn virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowled
 	let triggers = [
 		(3u32, Trigger::Rising, "spare-3", "raise 3", true),
 		(4, Trigger::Falling, "spare-4", "lower 4", false),
-		(5, Trigger::Both, "spare-5", "raise 5", true),
+		// Line 5 is the Type-C port controller's alert in the backend's model (`vhost-i2c-gpio.py`), named so.
+		(5, Trigger::Both, "tcpc-alert", "raise 5", true),
 		(6, Trigger::High, "spare-6", "raise 6", true),
 		(7, Trigger::Low, "spare-7", "lower 7", false),
 	];

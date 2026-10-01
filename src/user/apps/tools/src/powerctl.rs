@@ -15,8 +15,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::{ChargeState, CurvePoint, LaunchContext, PowerProfile, SourceKind, Tristate, ValueState, power, processor_power_admin};
+use power_client::{PowerClient, ProcessorPowerAdminClient};
+use proto::system::{ChargeState, CurvePoint, LaunchContext, PowerProfile, SourceKind, Tristate, ValueState};
 use rt::*;
 use tools::{parse_u64, split_args};
 
@@ -51,7 +51,7 @@ fn sources(state: u64) {
 		say("power sources: the power-state authority was not granted");
 		return;
 	}
-	match power::Client::new(ChannelTransport { chan: state }).sources() {
+	match PowerClient::new(state).sources() {
 		Some(Ok(sources)) if sources.is_empty() => say("power sources: none"),
 		Some(Ok(sources)) => {
 			say("power sources:");
@@ -109,7 +109,7 @@ fn idle_states(cpu: u32) {
 }
 
 fn status(admin: u64) {
-	let answer = processor_power_admin::Client::new(ChannelTransport { chan: admin }).status();
+	let answer = ProcessorPowerAdminClient::new(admin).status();
 	let status = match answer {
 		Some(Ok(status)) => status,
 		Some(Err(error)) => {
@@ -165,7 +165,7 @@ fn set_profile(admin: u64, name: &[u8]) {
 		b"power-saving" => PowerProfile::PowerSaving,
 		_ => usage(),
 	};
-	match processor_power_admin::Client::new(ChannelTransport { chan: admin }).set_profile(&profile) {
+	match ProcessorPowerAdminClient::new(admin).set_profile(&profile) {
 		Some(Ok(())) => say(&format!("powerctl: the profile is {}", profile_name(profile))),
 		Some(Err(error)) => say(&format!("powerctl: the profile was refused - {error:?}")),
 		None => say("powerctl: ProcessorPowerService did not answer"),
@@ -183,7 +183,7 @@ fn point(text: &[u8]) -> Option<CurvePoint> {
 fn set_curve(admin: u64, fan: &[u8], points: &[&[u8]]) {
 	let Ok(fan) = core::str::from_utf8(fan) else { usage() };
 	let curve: Vec<CurvePoint> = points.iter().map(|text| point(text).unwrap_or_else(|| usage())).collect();
-	match processor_power_admin::Client::new(ChannelTransport { chan: admin }).set_fan_curve(fan, &curve) {
+	match ProcessorPowerAdminClient::new(admin).set_fan_curve(fan, &curve) {
 		Some(Ok(())) => say(&format!("powerctl: {fan} follows the curve")),
 		Some(Err(error)) => say(&format!("powerctl: the curve was refused - {error:?}")),
 		None => say("powerctl: ProcessorPowerService did not answer"),

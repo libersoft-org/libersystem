@@ -509,6 +509,17 @@ name = "inflate"
 version = "0.0.0"
 
 [[package]]
+name = "input-client"
+version = "0.0.0"
+
+[[package]]
+name = "input-client-provider"
+version = "0.0.0"
+dependencies = [
+ "input-proto",
+]
+
+[[package]]
 name = "input-proto"
 version = "0.0.0"
 dependencies = [
@@ -747,6 +758,21 @@ dependencies = [
  "inflate",
  "pix",
  "quantize",
+]
+
+[[package]]
+name = "power-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "power-proto",
+]
+
+[[package]]
+name = "power-client-provider"
+version = "0.0.0"
+dependencies = [
+ "power-proto",
 ]
 
 [[package]]
@@ -1196,6 +1222,8 @@ dependencies = [
  "graphics-core",
  "graphics-profile",
  "imgconv",
+ "input-client",
+ "input-client-provider",
  "ipc-client",
  "keys",
  "lico",
@@ -1209,6 +1237,8 @@ dependencies = [
  "pcm",
  "pix",
  "png",
+ "power-client",
+ "power-client-provider",
  "process-client",
  "process-client-provider",
  "proto",

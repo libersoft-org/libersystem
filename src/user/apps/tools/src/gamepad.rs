@@ -21,7 +21,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
+use input_client::InputClient;
 use lico::{InputDecoder, InputEvent, Key, MouseTracking, TerminalGuard, TerminalOptions, TerminalWriter};
 use proto::system::{Gamepad, GamepadAxis, GamepadEvent, GamepadState, LaunchContext, input};
 use rt::*;
@@ -231,7 +231,7 @@ fn event_line(event: &GamepadEvent) -> Vec<u8> {
 
 // Open the stream on the gamepad-scope connection; `None` when InputService refused it.
 fn open(connection: u64) -> Option<u64> {
-	input::Client::new(ChannelTransport { chan: connection }).observe_gamepads()
+	InputClient::new(connection).observe_gamepads()
 }
 
 // What the next frame on the stream is.

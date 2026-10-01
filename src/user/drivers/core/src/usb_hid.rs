@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use driver_protocol::gamepad;
 use rt::*;
 
-use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, RT_ENDPOINT, SPEED_HIGH, SPEED_SUPER, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
+use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_DEVICE_REMOTE_WAKEUP, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, REQ_SET_FEATURE, RT_ENDPOINT, SPEED_HIGH, SPEED_SUPER, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
 use crate::{Ring, UsbDevice, Xhci};
 use crate::{command_and_wait, control_in, control_in_req, control_nodata, dma_page, r8, reset_endpoint, w32};
 use drivers::descriptor;
@@ -167,6 +167,11 @@ impl Hids {
 		self.entries.iter().flat_map(|(_, interfaces)| interfaces.iter())
 	}
 
+	// Whether a bound keyboard's remote wakeup is enabled - what a suspend to idle can be woken through.
+	pub fn remote_wakeup(&self) -> bool {
+		self.entries.iter().any(|(dev, _)| dev.remote_wakeup)
+	}
+
 	// Whether any bound interface reports keyboard-page keys.
 	pub fn any_keyboard(&self) -> bool {
 		self.interfaces().any(|h| h.layout.has_keyboard())
@@ -233,6 +238,8 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice, pads: &mut Pads)
 		descriptor::check_type(DESC_CONFIG as u8, head_record.kind).ok()?;
 		let total: u16 = head_record.field16(2).ok()?.min(1024);
 		let config_value: u16 = head_record.field(5).ok()? as u16;
+		// `bmAttributes` bit 5: the device can signal its own resume from suspend.
+		let declares_remote_wakeup = head_record.field(7).is_ok_and(|attributes| attributes & 0x20 != 0);
 		let received = control_in(hc, &mut pending, dev, DESC_CONFIG, total)?;
 		// AND THE WHOLE DESCRIPTOR HAS TO HAVE ARRIVED before it is walked.
 		let total = descriptor::check_transfer(total, received).ok()?;
@@ -363,6 +370,12 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice, pads: &mut Pads)
 		}
 		if bound.is_empty() {
 			return None;
+		}
+		// A KEYBOARD THAT CAN WAKE THE MACHINE is told it may, here, while no report is in flight: its remote wakeup only
+		// acts while its port is suspended, and enabling it at a sleep would be a control transfer racing the keys it
+		// reports. A pointer is not enabled - moving it is not a reason to wake. A device that refuses keeps working.
+		if declares_remote_wakeup && bound.iter().any(|h| h.layout.has_keyboard()) {
+			dev.remote_wakeup = control_nodata(hc, &mut pending, dev, 0x00, REQ_SET_FEATURE, FEATURE_DEVICE_REMOTE_WAKEUP, 0).is_some();
 		}
 		// EACH GAMEPAD IS ATTACHED TO THE PUBLICATION, labelled by where it is: the device, the port, the
 		// interface - and which collection, for a second one in one interface. Its state is the one before the

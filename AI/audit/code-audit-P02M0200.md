@@ -190,3 +190,23 @@ case (P02M0197) and the BMC (P02M0201).
 Status: IMPLEMENTED on x86_64 and the host, the gate passing; OPEN for the cross-architecture verification at the
 job's end, for the parts owed by P02M0197 and P02M0201, and for the owner's decisions listed at the top.
 - Gate `capability-model`: pass (1459 s).
+
+## The sleep case, and the gate run again (2026-10-01)
+
+- THE SLEEP CASE (owed to P02M0197, which landed second, and carried there): the service's step at the sleep notice and
+  the drivers' steps are P02M0197's audit's; the case itself is the gate `sleep`'s watchdog boot - `-device i6300esb`,
+  the policy armed at 15 s - and passes (2026-10-01): `running` at every reading through a suspend to idle three times
+  the timeout and after it, and `watchdog` 119 s after a resume ServiceManager's development hook made hang after the
+  drivers' step, the re-arm with the bridge bound being what expires. The BMC's watchdog steps across a sleep pass in
+  the gate `ipmi` (the harness BMC's record: the announcement's timeout, the disarm, the re-arm, the restore).
+- THE GATE `watchdog` FAILED in the batch of 2026-10-01 after its orderly reboot: "the instance was not recorded again
+  after the orderly reboot" - `dev.sh reboot` resets the guest over QMP and asks the development broker to WAIT for
+  the shell's prompt, and the broker SEEDS that wait with the serial log's tail, which after a reset is the PREVIOUS
+  boot's: whenever its last line was the prompt, the wait answered "prompt" a second after the reset, and the agent
+  asked next (30 s) was not there for a boot that takes about two minutes on this machine (29 s of it the loader
+  verifying the live volume, 41 s StorageService copying it into memory). Reproduced on a plain development instance:
+  one of four hard reboots recorded. FIXED (`src/harness/lab.py`): `dev-reboot` asks `WAIT ... nudge fresh`, and a
+  `fresh` wait starts from nothing; the broker's other waits are unchanged. Three of three hard reboots recorded after
+  it (116.0, 116.3 and 116.4 s to a prompt).
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate watchdog` -> PASS (2919 s): the i6300esb, the reset, the TCO, WDAT and the BMC
+  cases, the orderly reboot's notice and the boot bound among them.

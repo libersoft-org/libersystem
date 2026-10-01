@@ -363,3 +363,15 @@ COMMANDS AND RESULTS (PASSED unless said):
   `tagged_test!` declaration") - the pre-existing failure recorded before this step; the catalogue and release list
   were updated by hand in step with `check.sh`.
 - After the walk-order change in the ACPI service: gate `acpi` PASS again (481 s), every case as before.
+
+## The sleep exchange and the gates (2026-10-01)
+
+- The `i2c_hid` exchange is P02M0197's (it landed second) and recorded in its audit; `LIBER_DEVELOPMENT=1 ./check.sh
+  --gate i2c-hid` -> PASS (721 s): "across 2 sleep(s) both bindings answered SUSPENDED and RESUMED and the reports
+  arrived after each".
+- `i2c-bus` FAILED in the batch of 2026-10-01 on its kernel test
+  `kernel.hardware.virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged`: line 5 named
+  itself `tcpc-alert`, not `spare-5` - P02M0202 gave the backend's line 5 to the Type-C port controller's alert
+  (`vhost-i2c-gpio.py`'s model), and the test's table was never told. The test expects `tcpc-alert` now
+  (`src/kernel/test_suites/hardware.rs`); its run is in the batch running now.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate i2c-bus` -> PASS (53 s, 2026-10-01, after `./build.sh --arch x86_64`).

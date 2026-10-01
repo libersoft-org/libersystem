@@ -277,3 +277,12 @@ configuration, TCPCI selection rule and the tool's operator grant; the sleep exc
 case (P02M0197 carries both, recorded there); the TCPCI tree description on aarch64 and riscv64 (their emulated sweep
 at the job's end - `fdt_edit.py tcpc-fixture` and `qemu-run.sh`'s `I2C_FIXTURE=tcpc` are built and self-tested, not
 booted); the three cross-builds; a hardware run.
+
+## The sleep cases and the gates (2026-10-01)
+
+- The exchange in `ucsi_acpi` and `tcpci` and both fixtures' sleep cases are P02M0197's (it landed second) and recorded
+  in its audit; the gates carry them.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate typec-ucsi` -> PASS (1245 s): suspend to idle and S3 with no command while
+  asleep, the notifications enabled and both connectors read after each, the detach made in S3 reported after it.
+- `typec-tcpci` -> PASS: the suspend refused with a contract standing and the connector named, a charger attached during
+  a sleep finding the sink path off and contracted after it, and every earlier case.

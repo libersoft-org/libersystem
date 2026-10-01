@@ -180,3 +180,10 @@ yes to install `openipmi` and `ipmitool`); the sleep case and the drivers' sleep
 
 BLOCKERS AND QUESTIONS FOR THE OWNER: installing Debian's `openipmi` and `ipmitool` for the cross-check; whether the
 watchdog's 120 s boot bound should be larger (see the watchdog finding above).
+
+## The sleep case and the gates (2026-10-01)
+
+- The exchange in `ipmi` and `smbus_ich9` and the case A SLEEP WITH BOTH DRIVERS BOUND are P02M0197's (it landed
+  second) and recorded in its audit; the gate `ipmi` carries the case: "a sleep with KCS and SSIF bound: both answered
+  to idle and S3, SSIF identified again, and the BMC received the watchdog's step in order".
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate ipmi` -> PASS (2188 s); `qemu-ipmi-admin` -> PASS (1392 s).

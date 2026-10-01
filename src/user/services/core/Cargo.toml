@@ -23,6 +23,9 @@ shared-image = [
 	"proto/shared-image",
 	"rt/shared-image",
 	"storage-proto/shared-image",
+	"tpm-client/shared-image",
+	"tpm-client-provider/shared-image",
+	"tpm-proto/shared-image",
 ]
 
 [[bin]]

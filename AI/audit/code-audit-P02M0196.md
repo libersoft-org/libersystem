@@ -435,3 +435,21 @@ VERIFICATION OF STEP 3's THIRD ITEM, so far:
   C000 (the fixture's `_E07`) read again and acknowledged - QEMU's OSPM record for C000 reads (0x80, 0) after it - and
   the zone's and the fans' cooling. A rerun after the ports' processor changes are in the tree is in the gate batch of
   2026-10-01 and is recorded below when it ends.
+
+## The gates after the ports' processor work (2026-10-01)
+
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate processor-power` -> PASS a third time, with the device-tree ports' processor
+  changes in the tree (the x86_64 half untouched by them: `map_register` answers a reason, `firmware_suspend` the halt).
+- `acpi` -> PASS (416 s).
+- `qemu-tpm-tool` found the merge rule's effect on the TPM row - the `TPM2` table's row now carries the namespace
+  device's path and `MSFT0101` as ids, its one resource still the table's page, as step 1's merge rule states; the
+  scenario's expectation is updated in P02M0190's audit.
+
+## The first cross-build since step 2 (2026-10-01)
+
+- `./build.sh --arch aarch64` FAILED on `acpi_service`: `rt::port` (the port instructions) is x86_64's alone, and the
+  service's SystemIO accesses and its embedded-controller transport used it unconditionally - the ports had not been
+  built since step 2 landed (2026-09-29). The service is built for every target and serves nothing where no ACPI table
+  exists; on aarch64 and riscv64 a local `port` module answers what an undecoded port reads (all ones) and drops
+  writes, behind a kernel that grants no port range there, so no access reaches it. `cargo check` of the services,
+  drivers and tools crates (`--features development`, and `shared-image` for the tools) then clean on both ports.

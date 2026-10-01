@@ -2030,6 +2030,10 @@ if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 		for source in "$root/user/build.rs" "$root/../product.conf"; do
 			source_file_digest "$source"
 		done
+		# AND THE SERVICES CRATE, whose seed is built in the same graph: a provider it depends on without the image's
+		# features is a second archive of that provider, and a graph cached from before the dependency hid it until a
+		# target built its graph afresh.
+		printf 'services=%s\n' "$(source_digest "$(source_path services)")"
 	} | sha256sum | awk '{print $1}')"
 	image_graph_key="$({
 		printf 'format=liber-image-graph-cache-v1\n'

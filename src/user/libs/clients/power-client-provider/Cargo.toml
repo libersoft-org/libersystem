@@ -1,0 +1,17 @@
+[package]
+name = "power-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem power channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["power-proto/shared-image"]
+
+[dependencies]
+power-proto = { path = "../../protocol/power-proto" }
+
+[lints.rust]
+warnings = "deny"

@@ -205,7 +205,8 @@ pub fn fwcfg_read(name: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 // A PART OF THE MACHINE THE DEVELOPMENT HARNESS NAMES ABSENT, over the fw-cfg file `opt/org.libersystem/absent` - as on
-// x86_64. Only a boot with a profile reads it, so a shipping machine never does.
+// x86_64. Only a boot with a profile reads it, and only a development build has it (`cfg(liber_development)`).
+#[cfg(liber_development)]
 pub fn absent_named(word: &[u8]) -> bool {
 	if boot_profile().is_none() {
 		return false;
@@ -213,6 +214,13 @@ pub fn absent_named(word: &[u8]) -> bool {
 	let mut names = [0u8; 64];
 	let Some(len) = fwcfg_read(b"opt/org.libersystem/absent", &mut names) else { return false };
 	names[..len].split(|byte| matches!(byte, b' ' | b',' | b'\n' | 0)).any(|name| name == word)
+}
+
+// A SHIPPING KERNEL NAMES NOTHING ABSENT: the switch is compiled into the development build alone, so no machine's fw-cfg
+// can turn the CMOS clock or the sleep-type registration off in a shipping one.
+#[cfg(not(liber_development))]
+pub fn absent_named(_word: &[u8]) -> bool {
+	false
 }
 
 // WHETHER THE KERNEL READS AN RTC OF ITS OWN: this port's is part of QEMU `virt` (see `rtc`), and the development harness

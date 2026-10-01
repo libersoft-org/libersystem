@@ -536,3 +536,95 @@ boot 1 left out, so each round costs the platform boot alone; the gate itself un
   the watchdog boot (a suspend to idle three times the i6300esb's timeout with the guest running throughout, and a
   resume made to hang ending in the watchdog's expiry after 120 s). The gate itself, boot 1 included, is in the final
   batch and is recorded when it ends.
+
+## The last lines before a planned power-off, and the batch of 2026-10-01 (2026-10-01)
+
+- THE GATE'S FULL RUN FAILED ON ITS LAST PLATFORM CASE, which the scratch copy had passed: "the power button's press
+  asked for nothing (waited 30 s for ... PWRB: pressed - asking the power service to stop the machine)". The machine
+  HAD powered off through the registered `\_S5`, but the serial log ends "Audi" + "power-off: the registered \_S5" -
+  the button driver's line, the rest of an AudioService line and everything between were never on the wire. CAUSE:
+  the control-method power button (as the fixed one) asks `system-power`'s `power-off`, an immediate power-off, while
+  `uart16550` holds COM1; the driver had read those lines out of the console tap (up to 1024 bytes a read) and was
+  putting them out when the kernel's terminal-path writer took the UART - and bytes the driver has read are on its
+  side, which the writer, by design, does not wait for. FIXED (`arch::x86_64::serial::settle_driver`, called by
+  `sys_system_power` before a power-off or a reset - never on a panic's or the forced deadline's path, where nothing
+  may wait): while a driver holds the UART the tap is signalled and the core yielded until the ring has stayed empty
+  for 100 ms (`SETTLE_QUIET_NS`: the driver's largest read is 89 ms on the wire at 115200 baud), at most 1 s in all
+  (`SETTLE_BOUND_NS`); the ports have nothing to settle (`settle_driver` is empty there). An orderly power-off is
+  untouched: its drivers are stopped first and the kernel holds COM1 again by the time it is asked.
+  Kernel test `kernel.object.port_range.handoff.a_planned_end_waits_for_the_driver_to_take_the_ring_and_no_longer_than_its_bound`
+  on the suite's second UART: a driver that reads nothing holds the end for the bound and no longer, the bytes still
+  the ring's; a driver that reads 50 ms late is waited for, and the settle ends a quiet interval after its read; with
+  the kernel driving the UART it returns at once.
+  WATCHED FAILING: with `settle_driver` returning at once the test failed ("a driver that reads nothing holds the end
+  for the bound and no longer (426 ns)"); restored, the selection of the five `kernel.processor` and seven
+  `kernel.object.port_range.handoff` tests passed (12, 37 s, x86_64).
+- THE DEVELOPMENT SWITCH WAS IN EVERY BUILD: `arch::absent_named` (the CMOS RTC and the sleep-type registration named
+  absent over fw-cfg) was compiled into the shipping kernel too, honoured only when a boot profile is named - against
+  part d's "compiled into the development build only and never into the shipping set". It is `cfg(liber_development)`
+  now on all three targets, and a shipping kernel's `absent_named` answers false whatever a machine's fw-cfg holds
+  (`arch/{x86_64,aarch64,riscv64}/mod.rs`). Compiled both ways on x86_64 (`LIBER_DEVELOPMENT=0` and `1`, and the test
+  kernel); the ports at the end of the job.
+
+VERIFICATION, the gate batches of 2026-10-01 (x86_64, one guest at a time, `LIBER_DEVELOPMENT=1 ./check.sh --gate`):
+
+- `sleep` -> PASS (1912 s), boot 1 and every later boot: suspend to idle (count 84 then 85, monotonic +485 ms, boot-time
+  +5403 ms; a 20 s Timer after 20002 ms awake; 64 cores parked, none woke for anything but the wake; 4940 ms between the
+  kernel's lines for a 5 s wake), S3 by `system_wakeup` and by the RTC alarm, after each wake the ping, the file, a
+  frame, the serial line, the wall clock within 1 s and a 1 s wait of about 1030 ms; PCRs 0-7 unchanged across S3 and
+  the secret unsealed; the stopped job; the hot-plug after the S3s; the refusing fixture; the shutdown during a held
+  step; the platform boot (TAD, power resources, fans, buttons, relaunched policy, `\_S5`); the critical battery (QEMU
+  gone 10115 ms after the 10 s deadline was armed); the soft-off fallback; the watchdog boot (`running` through a sleep
+  three times the timeout, `watchdog` 119 s after a resume made to hang). Earlier runs that day failed - on the console
+  after a wake, the TAD, the rebind budget, the gate's own needles and the power button's lost line, each fixed above.
+- `hibernate` -> PASS (1987 s, ten boots; the restore "count 79 then 80: monotonic +2990 ms, boot-time +199990 ms").
+- The drivers' sleep cases in their own gates -> PASS: `ipmi` (KCS and SSIF across idle and S3, the BMC's watchdog
+  steps in order), `typec-ucsi` (idle and S3, the detach in S3 reported), `typec-tcpci` (refused with a contract, a
+  charger attached during a sleep contracted after it), `i2c-hid` (two sleeps).
+- STILL TO RUN: `sleep` once more after the switch's `cfg` (in the batch running now) and, at the end of the job, the
+  ports' suspend to idle in `check-tickless-idle.py aarch64 riscv64`.
+- `sleep` -> PASS again (1847 s, 2026-10-01) with the development switch compiled into the development build alone and
+  the last harness fixes in.
+- THE SCHEDULED WAKE, run by hand on a development instance with S3 offered (2026-10-01; no gate case carries it):
+  `sleepctl wake-at 15` then `sleepctl suspend idle` with no timed wake - "slept 8911 ms and was woken by the timed
+  wake", ServiceManager "the scheduled wake at 1790879099 is spent" (the transaction's steps took the rest of the 15 s);
+  `sleepctl wake-at 20` then `sleepctl suspend ram` - "slept 15000 ms and was woken by the RTC alarm", spent, QEMU
+  `running` with no host wake. `sleepctl status` lists the wake sources, the scheduled wake and the inhibitors.
+
+## The wake set's devices: a USB keyboard ends a suspend to idle (2026-10-01)
+
+WHAT WAS MISSING: part c's wake set names devices a driver arms in its SUSPEND step - USB remote wakeup through the
+controller, PCI PME, a network device's wake. Only `virtio-input`'s keyboard, the control-method buttons and lid, and
+the TAD armed anything; `xhci` halted its controller at every sleep.
+
+WHAT WAS IMPLEMENTED (`src/user/drivers/core/src/xhci.rs`, `usb_hid.rs`):
+
+- A KEYBOARD WHOSE CONFIGURATION DECLARES REMOTE WAKEUP (`bmAttributes` bit 5) is sent `SET_FEATURE(DEVICE_REMOTE_WAKEUP)`
+  when it is configured (`UsbDevice::remote_wakeup` records that it took it). Enabled there and not at the sleep: a
+  control transfer in the SUSPEND step would race the keyboard's own reports (the wait dispatches other HID events
+  through the bound devices, and the device being addressed would have to be out of that set), and the feature acts
+  only while the device's port is suspended. A pointer is not enabled; a device that refuses keeps working.
+- THE SLEEP STEP: a suspend to idle asked to arm wake, with such a keyboard bound, sends the ports to U3 as before but
+  does NOT halt the controller; its interrupt is marked as a wake source (`interrupt_wake`) and the answer is
+  `DoneWakeArmed`. A key makes the keyboard signal its resume, the controller (QEMU's too) moves the port to Resume and
+  posts the port's change on its event ring, and its interrupt ends the sleep. At the resume the mark is taken off and
+  the ports go back to U0. Every other sleep halts the controller as before.
+- DECISION: the controller stays running in that state because a halted controller's only wake is PCI PME through the
+  platform, which this machine's emulation does not raise; Linux's s2idle keeps a wake-capable controller's
+  interrupt live in the same way.
+
+VERIFIED by hand on a development instance (2026-10-01; no gate case carries it): with both `virtio-input` bindings
+disabled (`lsdev --disable 8`, `9`), so the controller's interrupt is the only armed device wake, `sleepctl suspend
+idle 60` and a key sent over QMP 14 s later -> "slept 8865 ms and was woken by a device"; the control - the same
+sleep for 20 s and no key - "slept 19910 ms and was woken by the timed wake", cpu0 woken once for the timer and no
+core for a device. "driver.xhci: suspended with a keyboard's remote wakeup armed" at each. The gate `sleep`'s
+regression run (S3 still halting the controller, suspend to idle with it armed and no core woken but by the wake) is
+in the batch running now.
+
+NOT DONE, AND WHY: PCI PME (PMCSR's PME_En from a driver's SUSPEND step, the companion's `_PRW` GPE already armed by
+`platform-sleep`) and a network device's wake. No device this harness can present raises either - QEMU's PCI devices
+generate no PME, and the network functions this system drives (virtio-net, CDC-ECM) have no wake function at all - so
+neither could be shown working, and both are left open in the milestone for hardware that has them.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate sleep` -> PASS (1871 s) with the controller armed: boot 1's suspend to idle
+  still "64 cores parked, none woke for anything but the wake", every S3 case (the controller halted as before) and
+  every later boot as in the runs above.

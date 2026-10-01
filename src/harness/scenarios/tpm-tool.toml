@@ -18,7 +18,8 @@ timeout = 180
 # its hardware ID joined as ids, since both describe one device at the same base - and its one resource still the
 # table's 4 KiB locality-0 page at the platform's base (0xFED40000), not the `_CRS` range QEMU names; no interrupt,
 # since the resource list ends after that one range. THE PATH IS THE FRONT-END'S: QEMU places the CRB's device at
-# `\_SB.TPM` and the TIS's under the LPC bridge, so the row is read in two parts on either side of it.
+# `\_SB.TPM` and the TIS's under the LPC bridge, so the row is read in two parts on either side of it - an `expect`
+# moves past its match, so the second starts where the first ended.
 
 [[step]]
 do = "key"
@@ -31,7 +32,7 @@ timeout = 30
 
 [[step]]
 do = "expect"
-contains = '.TPM_}, {kind=hid, text=MSFT0101}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]'
+contains = 'TPM_}, {kind=hid, text=MSFT0101}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]'
 timeout = 30
 
 # THE TOOL: the interface, swtpm's identity, and sealing available.
