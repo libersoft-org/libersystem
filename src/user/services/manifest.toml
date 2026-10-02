@@ -5557,11 +5557,12 @@ interface = "liber:bluetooth@1/bluetooth-profile"
 # roots: STATE, which enumerates and subscribes and can change nothing, and CONTROL, which switches an
 # output a device advertises.
 #
-# AND THE SLEEP POLICY: a closed lid suspends unless an external display is in use - the lid's `platform-switch` and
-# DisplayService's OUTPUTS - an idle timeout suspends on battery - InputService's ACTIVITY - and a critical battery
-# hibernates where that is set up and otherwise powers off in order: the kernel's forced deadline through SYSPOWER's
-# `power-off-within`, then ServiceManager's sequence through SHUTDOWN. SLEEP, SYSPOWER and SHUTDOWN are ServiceManager's
-# to fill, at the first start and at every relaunch.
+# AND THE SLEEP POLICY: closing the lid turns the screen off unless an external display is in use - the lid's
+# `platform-switch` and DisplayService's OUTPUTS, which also turns the screen off and on - and a critical battery powers
+# the machine off in order: the kernel's forced deadline through SYSPOWER's `power-off-within`, then ServiceManager's
+# sequence through SHUTDOWN. Each is a setting in CONFIG's tree: the lid may suspend instead, an idle timeout -
+# InputService's ACTIVITY - may suspend on battery, and a critical battery may hibernate where that is set up, all
+# through SLEEP. SLEEP, SYSPOWER and SHUTDOWN are ServiceManager's to fill, at the first start and at every relaunch.
 #
 # TRANSPARENT AND RECONSTRUCTIBLE. Everything it knows, it re-reads from the catalogue: a restarted
 # instance takes a fresh snapshot from every provider and starts a new epoch, and its subscribers,
@@ -5578,6 +5579,7 @@ dependencies = [
 	"device_manager",
 	"input_service",
 	"display_service",
+	"config_service",
 ]
 
 [[services.roles]]
@@ -5636,6 +5638,15 @@ tag = "SHUTDOWN"
 kind = "client"
 provider = "service_manager"
 interface = "liber:process@1/system-shutdown"
+presence = "optional"
+
+# THE SLEEP POLICY'S SETTINGS, read at every start: `power.lid`, `power.idle-suspend`, `power.idle-after-s` and
+# `power.critical`. Without the tree the defaults stand.
+[[services.roles]]
+tag = "CONFIG"
+kind = "client"
+provider = "config_service"
+interface = "liber:config@1/config"
 presence = "optional"
 
 # SMART-CARD READERS, EXCLUSIVE EXPIRING TRANSACTIONS AND A BOUNDED SET OF PIV OPERATIONS. It consumes

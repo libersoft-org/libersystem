@@ -40,6 +40,7 @@ method display-trusted.release op=3 (epoch:u64:rights=) -> result<unit, liber:ba
 record display-output(index:u32,active:bool,external:bool)
 interface display-outputs
 method display-outputs.outputs op=1 () -> result<list<display-output>, liber:base@1::error>
+method display-outputs.set-power op=2 (on:bool:rights=) -> result<unit, liber:base@1::error>
 interface display-admin
 method display-admin.bind op=1 (task:handle<liber:process@1::task>:rights=manage+wait) -> result<handle<channel>, liber:base@1::error>
 method display-admin.stats op=2 () -> presentation-stats

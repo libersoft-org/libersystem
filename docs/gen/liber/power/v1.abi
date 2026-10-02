@@ -64,7 +64,7 @@ interface cooling-device
 method cooling-device.describe op=1 () -> result<fan-description, liber:base@1::error>
 method cooling-device.set-level op=2 (level:u32:rights=) -> result<fan-status, liber:base@1::error>
 method cooling-device.status op=3 () -> result<fan-status, liber:base@1::error>
-enum power-profile(performance=1,balanced=2,power-saving=3)
+enum power-profile(performance=1,balanced=2,power-saving=3,automatic=4)
 record curve-point(temperature:u32,percent:u8)
 record core-power(cpu:u32,idle-states:u32,perf-levels:u32,perf-level:u32,window-cap:u32,window-floor:u32,inject-permille:u32,latency-requests:u32)
 record zone-power(zone:string:bound=64,temperature:u32,passive:option<u32>,critical:option<u32>,hot:option<u32>,passive-engaged:bool,cap-percent:u32)

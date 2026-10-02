@@ -20,7 +20,7 @@ use proto::system::{ChargeState, CurvePoint, LaunchContext, PowerProfile, Source
 use rt::*;
 use tools::{parse_u64, split_args};
 
-const USAGE: &[u8] = b"usage: powerctl [status | profile performance|balanced|power-saving | curve FAN CELSIUS:PERCENT...]\n";
+const USAGE: &[u8] = b"usage: powerctl [status | profile performance|balanced|power-saving|auto | curve FAN CELSIUS:PERCENT...]\n";
 
 fn say(text: &str) {
 	print(text.as_bytes());
@@ -155,6 +155,7 @@ fn profile_name(profile: PowerProfile) -> &'static str {
 		PowerProfile::Performance => "performance",
 		PowerProfile::Balanced => "balanced",
 		PowerProfile::PowerSaving => "power-saving",
+		PowerProfile::Automatic => "automatic",
 	}
 }
 
@@ -163,6 +164,7 @@ fn set_profile(admin: u64, name: &[u8]) {
 		b"performance" => PowerProfile::Performance,
 		b"balanced" => PowerProfile::Balanced,
 		b"power-saving" => PowerProfile::PowerSaving,
+		b"auto" => PowerProfile::Automatic,
 		_ => usage(),
 	};
 	match ProcessorPowerAdminClient::new(admin).set_profile(&profile) {

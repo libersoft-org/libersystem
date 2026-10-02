@@ -6,9 +6,10 @@
 // this service holds arms the kernel's forced power-off deadline before a critical battery's orderly power-off. Turning a
 // UPS's output off turns the UPS's output off. Fan curves are not here: an alarm is an observation.
 //
-// THE SLEEP POLICY IS HERE - `policy`: a closed lid suspends unless an external display is in use, an idle timeout
-// suspends on battery, and a critical battery hibernates where that is set up and otherwise powers off in order. It
-// decides nothing itself - `service_logic::sleep_policy` does - and asks through the three doors ServiceManager fills.
+// THE SLEEP POLICY IS HERE - `policy`: by default a closed lid turns the screen off unless an external display is in use,
+// and a critical battery powers the machine off in order; the settings in ConfigService's tree may make the lid suspend,
+// an idle timeout suspend on battery, and a critical battery hibernate where that is set up. It decides nothing itself -
+// `service_logic::sleep_policy` does - and asks through DisplayService's outputs and the three doors ServiceManager fills.
 //
 // WHERE ITS STATE COMES FROM. Drivers publish `power-source` providers through their own bindings;
 // this service is the one consumer of that kind, through a catalogue connection minted for it alone,
@@ -614,7 +615,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let (catalogue, state_root, control_root) = (roles[0], roles[1], roles[2]);
-	let (activity, outputs, sleep, syspower, shutdown) = (roles[3], roles[4], roles[5], roles[6], roles[7]);
+	let (activity, outputs, sleep, syspower, shutdown, config) = (roles[3], roles[4], roles[5], roles[6], roles[7], roles[8]);
 
 	// 2. The providers this machine publishes, as a snapshot and then live. A machine with none has
 	//    none, which is a subscription that stays quiet rather than a failure. THE EPOCH IS THIS
@@ -625,7 +626,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut service = Power { registry: Registry::new(epoch), providers: Vec::new(), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
 	send_blocking(bootstrap, b"PowerService: online", 0);
 	// THE SLEEP POLICY, beside the state: it reads the lid, idleness and the sources, and asks through its own doors.
-	let mut sleep_policy = policy::SleepPolicy::new(catalogue, activity, outputs, sleep, syspower, shutdown);
+	let mut sleep_policy = policy::SleepPolicy::new(catalogue, activity, outputs, sleep, syspower, shutdown, config);
 
 	let mut clients: Vec<Client> = Vec::new();
 	let mut buf = alloc::vec![0u8; 8192];

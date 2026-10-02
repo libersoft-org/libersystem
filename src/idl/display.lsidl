@@ -435,10 +435,16 @@ record display-output {
 	external: bool,
 }
 
-/// THE OUTPUTS, read-only, on DisplayService's `OUTPUTS` root: which it drives and whether each is the machine's own -
-/// what the sleep policy asks before a closed lid suspends the machine.
+/// THE OUTPUTS, on DisplayService's `OUTPUTS` root: which it drives and whether each is the machine's own - what the
+/// sleep policy asks before a closed lid suspends the machine - and the screen turned off and on, which a closed lid
+/// does by default. The root is a manifest role the power-state service alone holds.
 interface display-outputs {
 	@op(1) outputs: func() -> result<list<display-output>, error>;
+	/// THE SCREEN OFF (`on` false) OR ON. Off, the scanout is made black and nothing reaches it: every present
+	/// completes as `discarded-occluded`, in order, as a hidden surface's does. On, the visible surface is drawn whole
+	/// again. Asking for the state already in force changes nothing. The protected screen is not taken while the screen
+	/// is off, and a prompt held when it goes off is refused rather than shown: nobody can see it.
+	@op(2) set-power: func(on: bool) -> result<unit, error>;
 }
 
 /// Privileged launcher boundary. PermissionManager transfers the Process capability returned by

@@ -279,6 +279,9 @@ struct DisplayState {
 	/// away. A machine whose GPU driver keeps restarting shows it here rather than in a log nobody
 	/// reads.
 	resets: u64,
+	// THE SCREEN TURNED OFF (`display-outputs.set-power`): the scanout made black, and every present until it is turned on
+	// again completed as a hidden surface's is - in order, never shown.
+	dark: bool,
 	// REPORT THE NEXT PRESENT, because a scanout was just adopted.
 	//
 	// A frame reaching the display AFTER a driver restart is what the enforcing profile has to show,
@@ -323,7 +326,7 @@ fn physical_extent(logical: u32, scale: &ScaleRatio) -> Option<u32> {
 
 impl DisplayState {
 	fn new(scanout: Scanout, focus_control: u64, kill_control: u64) -> DisplayState {
-		DisplayState { scanout, surfaces: Vec::new(), scale: ScaleRatio { numerator: 1, denominator: 1 }, focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true, lock: Lock::new(), trusted_session: 0, closing: None, resets: 0 }
+		DisplayState { scanout, surfaces: Vec::new(), scale: ScaleRatio { numerator: 1, denominator: 1 }, focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true, lock: Lock::new(), trusted_session: 0, closing: None, resets: 0, dark: false }
 	}
 
 	fn surface_index(&self, chan: u64) -> Option<usize> {
@@ -741,7 +744,7 @@ impl DisplayState {
 		// A FRAME ACCEPTED WHILE HIDDEN COMPLETES IN ORDER AS DISCARDED. It kept its place and never
 		// reached a screen, which is a different fact from "it was refused" and is why the outcome
 		// is per present rather than a single error.
-		if !self.surfaces[index].visible {
+		if !self.surfaces[index].visible || self.dark {
 			self.complete(index, present_serial, PresentOutcome::DiscardedOccluded);
 			return Ok(present_serial);
 		}
@@ -1172,12 +1175,39 @@ impl DisplayState {
 	}
 
 	fn present_active_full(&mut self) {
+		if self.dark {
+			return;
+		}
 		let Some(index) = self.surface_index(self.active) else { return };
 		let Some(slot) = self.surfaces[index].images.iter().position(|image| image.state != ImageState::Stale && image.supplied()) else { return };
 		let width: u32 = self.surfaces[index].width;
 		let height: u32 = self.surfaces[index].height;
 		let blit: pix::BlitResult = self.blit(index, slot, Rect { x: 0, y: 0, width, height });
 		let _ = self.flush_damage(&[blit.rect]);
+	}
+
+	// THE SCREEN OFF OR ON - see `display-outputs.set-power`. Off: the scanout's pixels zeroed, black in every packed format
+	// this service presents into, and the whole of it flushed; on: the visible surface drawn whole again. The state already
+	// in force changes nothing.
+	fn set_power(&mut self, on: bool) {
+		if on != self.dark {
+			return;
+		}
+		self.dark = !on;
+		if !self.scanout.available() || self.scanout.lost {
+			return;
+		}
+		if self.dark {
+			let len: usize = self.scanout.fb.pitch as usize * self.scanout.height as usize;
+			// SAFETY: the scanout this service mapped and validated, `len` bytes long - the extent `blit` writes into.
+			unsafe { core::ptr::write_bytes(self.scanout.addr as *mut u8, 0, len) };
+			let (width, height): (u32, u32) = (self.scanout.width, self.scanout.height);
+			let _ = self.flush_damage(&[Rect { x: 0, y: 0, width, height }]);
+			debug_write(b"DisplayService: the screen is off\n");
+		} else {
+			self.present_active_full();
+			debug_write(b"DisplayService: the screen is on\n");
+		}
 	}
 
 	fn blit(&mut self, index: usize, slot: usize, damage: Rect) -> pix::BlitResult {
@@ -1335,8 +1365,8 @@ impl DisplayState {
 		if self.lock.held().is_some() {
 			return Err(Error::Again);
 		}
-		// A SCREEN NOBODY CAN SEE IS NO PLACE TO ASK A PERSON ANYTHING.
-		if self.scanout.addr == 0 || self.scanout.width == 0 || self.scanout.height == 0 || self.scanout.lost {
+		// A SCREEN NOBODY CAN SEE IS NO PLACE TO ASK A PERSON ANYTHING - and a screen turned off is one.
+		if self.scanout.addr == 0 || self.scanout.width == 0 || self.scanout.height == 0 || self.scanout.lost || self.dark {
 			return Err(Error::Unsupported);
 		}
 		let pitch: u32 = self.scanout.width.checked_mul(4).ok_or(Error::Invalid)?;
@@ -1363,6 +1393,11 @@ impl DisplayState {
 		let held = self.lock.held().ok_or(Error::Invalid)?;
 		if held.epoch != epoch {
 			return Err(Error::Stale);
+		}
+		// THE SCREEN TURNED OFF UNDER A HELD PROMPT: not shown, and not answered as shown - the holder refuses what it
+		// was about to ask, as for a screen it could not take.
+		if self.dark {
+			return Err(Error::Unsupported);
 		}
 		let (width, height): (u32, u32) = (self.scanout.width, self.scanout.height);
 		let pitch: u32 = width.checked_mul(4).ok_or(Error::Invalid)?;
@@ -1885,7 +1920,7 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 // platform says so, and nothing here reads a platform description of its outputs yet - so the output is the machine's
 // own, which is what a machine with one display and no description of it has.
 struct OutputsCall<'a> {
-	state: &'a DisplayState,
+	state: &'a mut DisplayState,
 }
 
 impl proto::system::display_outputs::Service for OutputsCall<'_> {
@@ -1893,10 +1928,15 @@ impl proto::system::display_outputs::Service for OutputsCall<'_> {
 		let scanout = &self.state.scanout;
 		Ok(alloc::vec![proto::system::DisplayOutput { index: 0, active: scanout.available() && !scanout.lost, external: false }])
 	}
+
+	fn set_power(&mut self, on: bool) -> Result<(), Error> {
+		self.state.set_power(on);
+		Ok(())
+	}
 }
 
 // ONE REQUEST ON AN OUTPUTS CHANNEL - the root or a connection minted from it. False when the channel closed.
-fn serve_outputs(channel: u64, outputs: &mut Vec<u64>, state: &DisplayState, request: &mut [u8], reply: &mut [u8]) -> bool {
+fn serve_outputs(channel: u64, outputs: &mut Vec<u64>, state: &mut DisplayState, request: &mut [u8], reply: &mut [u8]) -> bool {
 	match recv_blocking(channel, request) {
 		Received::Message { len, handle } => {
 			if handle != 0 {
@@ -2020,7 +2060,7 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 		}
 		if let Some(which) = outputs.iter().position(|&channel| channel == waits[ready as usize]) {
 			let channel = outputs[which];
-			if !serve_outputs(channel, &mut outputs, &state, &mut request, &mut reply) {
+			if !serve_outputs(channel, &mut outputs, &mut state, &mut request, &mut reply) {
 				close(channel);
 				outputs.retain(|&held| held != channel);
 			}

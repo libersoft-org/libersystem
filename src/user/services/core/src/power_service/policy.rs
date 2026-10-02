@@ -1,20 +1,23 @@
 // THE SLEEP POLICY'S INPUTS AND ITS DOORS - `service_logic::sleep_policy` decides; this reads what it is told and carries
 // out what it decides.
 //
-// WHAT IT READS: the lid's `platform-switch` publication, through the same catalogue connection the power sources arrive
-// on; InputService's activity signal, watched at the policy's idle timeout; DisplayService's outputs, asked at every
-// closing of the lid; and the power sources this service already holds - on battery when line power is known to be
-// absent, critical when a battery says so.
+// WHAT IT READS: its settings, from ConfigService's tree once at start (`sleep_policy::KEYS`); the lid's `platform-switch`
+// publication, through the same catalogue connection the power sources arrive on; InputService's activity signal,
+// watched at the policy's idle timeout; DisplayService's outputs, asked at every closing of the lid; and the power
+// sources this service already holds - on battery when line power is known to be absent, critical when a battery says
+// so.
 //
-// WHAT IT ASKS: a suspend through `system-sleep` - to RAM where the machine offers it, to idle otherwise - answered at
-// acceptance; a hibernation for a critical battery, and when that is refused - as it is wherever hibernation is not set
-// up - the orderly power-off: the kernel's forced deadline first, through `system-power`'s `power-off-within`, then
-// ServiceManager's sequence through `system-shutdown`. Never an immediate `system-power` power-off: the services are
-// stopped in order.
+// WHAT IT ASKS: the screen off and on again through DisplayService's `display-outputs`; a suspend through
+// `system-sleep` - to RAM where the machine offers it, to idle otherwise - answered at acceptance; for a critical battery
+// the orderly power-off - the kernel's forced deadline first, through `system-power`'s `power-off-within`, then
+// ServiceManager's sequence through `system-shutdown` - or, where the setting asks for it, a hibernation, with the
+// orderly power-off whenever that is refused, as it is wherever hibernation is not set up. Never an immediate
+// `system-power` power-off: the services are stopped in order.
 
 use super::*;
-use proto::system::{ActivityEdge, SleepReason, SleepState, SwitchKind, display_outputs, input_activity, platform_switch, system_power, system_shutdown, system_sleep};
-use service_logic::sleep_policy::{Action, Event, Policy, Settings, Why};
+use alloc::string::String;
+use proto::system::{ActivityEdge, SleepReason, SleepState, SwitchKind, config, display_outputs, input_activity, platform_switch, system_power, system_shutdown, system_sleep};
+use service_logic::sleep_policy::{Action, CriticalAction, Event, KEYS, LidAction, Policy, Settings, Why};
 
 // How long one question to ServiceManager, SystemManager, DisplayService or a provider may take.
 const ASK_TICKS: u64 = TICKS_PER_SECOND * 2;
@@ -45,9 +48,45 @@ fn say(text: &str) {
 	print(line.as_bytes());
 }
 
+// THE SETTINGS, from ConfigService's tree - a key absent or a tree that does not answer keeps its default, and a value
+// refused is named. The client is closed once read: the settings are this instance's, and a relaunch reads them again.
+fn read_settings(config_client: u64) -> Settings {
+	if config_client == 0 {
+		say("no configuration tree - the default settings stand");
+		return Settings::default();
+	}
+	let mut client = config::Client::with_deadline(ChannelTransport { chan: config_client }, clock() + ASK_TICKS);
+	let mut values: [Option<String>; KEYS.len()] = Default::default();
+	for (value, key) in values.iter_mut().zip(KEYS) {
+		*value = match client.get(key) {
+			Some(Ok(text)) => Some(text),
+			_ => None,
+		};
+	}
+	close(config_client);
+	let [lid, idle_suspend, idle_after_s, critical] = &values;
+	let (settings, refused) = Settings::from_keys(lid.as_deref(), idle_suspend.as_deref(), idle_after_s.as_deref(), critical.as_deref());
+	for key in refused {
+		say(&alloc::format!("the value of {key} is not one it takes - its default stands"));
+	}
+	let lid = match settings.lid {
+		LidAction::ScreenOff => "turns the screen off",
+		LidAction::Suspend => "suspends",
+		LidAction::Nothing => "does nothing",
+	};
+	let idle = if settings.idle_suspends_on_battery { "suspends on battery" } else { "suspends nothing" };
+	let critical = match settings.critical {
+		CriticalAction::PowerOff => "powers off in order",
+		CriticalAction::Hibernate => "hibernates",
+		CriticalAction::Nothing => "does nothing",
+	};
+	say(&alloc::format!("closing the lid {lid}, idleness after {} s {idle}, a critical battery {critical}", settings.idle_after_seconds));
+	settings
+}
+
 impl SleepPolicy {
-	pub(super) fn new(catalogue: u64, activity: u64, outputs: u64, sleep: u64, syspower: u64, shutdown: u64) -> SleepPolicy {
-		let settings = Settings::default();
+	pub(super) fn new(catalogue: u64, activity: u64, outputs: u64, sleep: u64, syspower: u64, shutdown: u64, config_client: u64) -> SleepPolicy {
+		let settings = read_settings(config_client);
 		let switches = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::PlatformSwitch).unwrap_or(0) } else { 0 };
 		let activity_stream = if activity != 0 { input_activity::Client::with_deadline(ChannelTransport { chan: activity }, clock() + ASK_TICKS).watch(&settings.idle_after_seconds.saturating_mul(1000)).unwrap_or(0) } else { 0 };
 		if activity_stream == 0 {
@@ -55,6 +94,9 @@ impl SleepPolicy {
 		}
 		if sleep == 0 {
 			say("no system-sleep client - a closed lid and idleness suspend nothing");
+		}
+		if outputs == 0 {
+			say("no display-outputs client - a closed lid turns no screen off");
 		}
 		SleepPolicy { policy: Policy::new(settings), switches, lid: None, activity_stream, outputs, sleep, syspower, shutdown, facts: None }
 	}
@@ -215,12 +257,27 @@ impl SleepPolicy {
 
 	fn feed(&mut self, event: Event) {
 		let action = self.policy.event(event);
+		if matches!((event, action), (Event::Power { critical: true, .. }, Action::PowerOff)) {
+			say("a battery is critical - powers the machine off in order");
+		}
 		self.act(action);
 	}
 
 	fn act(&mut self, action: Action) {
 		match action {
 			Action::Nothing => {}
+			Action::ScreenOff | Action::ScreenOn => {
+				let on = action == Action::ScreenOn;
+				say(if on { "turns the screen on" } else { "turns the screen off" });
+				if self.outputs == 0 {
+					return;
+				}
+				match display_outputs::Client::with_deadline(ChannelTransport { chan: self.outputs }, clock() + ASK_TICKS).set_power(&on) {
+					Some(Ok(())) => {}
+					Some(Err(error)) => say(&alloc::format!("DisplayService refused the screen's state - {error:?}")),
+					None => say("DisplayService did not answer the screen's state"),
+				}
+			}
 			Action::Suspend(why) => {
 				let reason = match why {
 					Why::Lid => SleepReason::Lid,

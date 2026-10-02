@@ -425,11 +425,13 @@ interface cooling-device {
 	@op(3) status:    func() -> result<fan-status, error>;
 }
 
-/// The profiles a person chooses between.
+/// The profiles a person chooses between. AUTOMATIC is no profile of its own: `set-profile` takes it to give the choice
+/// back to the power source's default - performance on line power, balanced on battery - and a status never names it.
 enum power-profile {
 	performance  = 1,
 	balanced     = 2,
 	power-saving = 3,
+	automatic    = 4,
 }
 
 /// ONE POINT OF A FAN CURVE: at this temperature (tenths of a kelvin) and above, this share of the fan's range.

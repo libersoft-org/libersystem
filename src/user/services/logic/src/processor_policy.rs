@@ -32,10 +32,10 @@ pub enum Profile {
 	PowerSaving,
 }
 
-/// THE DEFAULT PROFILE for the power source: balanced on line power - or where it is not known - and power saving on
-/// battery.
+/// THE DEFAULT PROFILE for the power source, as the owner decided it (2026-10-02): performance on line power - or where
+/// it is not known - and balanced on battery. A profile a person chose stands over either until the service restarts.
 pub fn default_profile(on_battery: bool) -> Profile {
-	if on_battery { Profile::PowerSaving } else { Profile::Balanced }
+	if on_battery { Profile::Balanced } else { Profile::Performance }
 }
 
 /// A WINDOW: the fastest level the governor may choose (`cap`) and the slowest (`floor`), levels fastest first.

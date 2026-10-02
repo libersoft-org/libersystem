@@ -5030,13 +5030,15 @@ pub mod cooling_device {
 	}
 }
 
-/// The profiles a person chooses between.
+/// The profiles a person chooses between. AUTOMATIC is no profile of its own: `set-profile` takes it to give the choice
+/// back to the power source's default - performance on line power, balanced on battery - and a status never names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PowerProfile {
 	Performance = 1,
 	Balanced = 2,
 	PowerSaving = 3,
+	Automatic = 4,
 }
 
 impl PowerProfile {
@@ -5082,6 +5084,7 @@ impl PowerProfile {
 			1 => Some(PowerProfile::Performance),
 			2 => Some(PowerProfile::Balanced),
 			3 => Some(PowerProfile::PowerSaving),
+			4 => Some(PowerProfile::Automatic),
 			_ => None,
 		}
 	}
@@ -8238,6 +8241,7 @@ impl PowerProfile {
 			PowerProfile::Performance => out.push_str("\"performance\""),
 			PowerProfile::Balanced => out.push_str("\"balanced\""),
 			PowerProfile::PowerSaving => out.push_str("\"power-saving\""),
+			PowerProfile::Automatic => out.push_str("\"automatic\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -8245,6 +8249,7 @@ impl PowerProfile {
 			PowerProfile::Performance => out.push_str("performance"),
 			PowerProfile::Balanced => out.push_str("balanced"),
 			PowerProfile::PowerSaving => out.push_str("power-saving"),
+			PowerProfile::Automatic => out.push_str("automatic"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -8252,6 +8257,7 @@ impl PowerProfile {
 			PowerProfile::Performance => crate::codec::cbor::text(out, "performance"),
 			PowerProfile::Balanced => crate::codec::cbor::text(out, "balanced"),
 			PowerProfile::PowerSaving => crate::codec::cbor::text(out, "power-saving"),
+			PowerProfile::Automatic => crate::codec::cbor::text(out, "automatic"),
 		}
 	}
 }

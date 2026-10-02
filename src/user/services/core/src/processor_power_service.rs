@@ -229,11 +229,13 @@ impl processor_power_admin::Service for Service {
 	}
 
 	fn set_profile(&mut self, profile: PowerProfile) -> Result<(), Error> {
-		self.chosen = Some(match profile {
-			PowerProfile::Performance => Profile::Performance,
-			PowerProfile::Balanced => Profile::Balanced,
-			PowerProfile::PowerSaving => Profile::PowerSaving,
-		});
+		self.chosen = match profile {
+			PowerProfile::Performance => Some(Profile::Performance),
+			PowerProfile::Balanced => Some(Profile::Balanced),
+			PowerProfile::PowerSaving => Some(Profile::PowerSaving),
+			// THE CHOICE GIVEN BACK: the power source's default again.
+			PowerProfile::Automatic => None,
+		};
 		self.profile_changed();
 		Ok(())
 	}

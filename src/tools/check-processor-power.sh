@@ -8,11 +8,14 @@
 #        - C000's `_PSS` through `_PCT`'s registers, C001's CPPC with its energy preference, and every core's `_LPI`
 #          naming the same two entry registers, installed - none refused; C002's `_PCT` of model-specific registers
 #          refused whole by the kernel;
-#        - at rest the slowest state written to `_PCT`'s control register and CPPC's lowest desired performance; under a
-#          load the fastest, on whichever of the two cores the load ran - this scheduler places a thread where it was
-#          started and balances nothing, so the load is launched again until it lands on one of them;
+#        - the default on line power, performance: both cores pinned at their fastest (0x10 and 255) with preference 0;
+#        - balanced chosen through `powerctl`: at rest the slowest state written to `_PCT`'s control register and CPPC's
+#          lowest desired performance; under a load the fastest, on whichever of the two cores the load ran - this
+#          scheduler places a thread where it was started and balances nothing, so the load is launched again until it
+#          lands on one of them;
 #        - the profiles through `powerctl`: performance pins both cores at their fastest (0x10 and 255) with preference 0,
-#          power saving caps C000 at its second state with preference 192;
+#          power saving caps C000 at its second state with preference 192, and `auto` gives the choice back to the
+#          power source's default;
 #        - a `_PPC` notification (line 7) capping C000 under the performance profile: read again, acknowledged through
 #          `_OST`, and the state written held to the cap;
 #        - the `_LPI` states with their latencies: where this host's CPU model gives the invariant TSC, the scripted idle
@@ -257,7 +260,15 @@ await_line "\\_SB_.CPUS.C002: core 2's performance table was refused" "Processor
 (($(seen "idle table of") == 0)) || fail "an idle table was refused"
 say "every core's _LPI installed, C000's _PSS and C001's CPPC installed, and C002's model-specific _PCT refused whole"
 
-# AT REST THE SLOWEST - balanced, the default on line power.
+# THE DEFAULT ON LINE POWER IS PERFORMANCE: both cores pinned at their fastest.
+await_line "with firmware tables, profile performance" "ProcessorPowerService did not take performance as the line-power default" 0 60
+await_page cpc_preference 0 "the line-power default's energy preference was not written"
+await_page pct_control "${PSS[0]}" "under the line-power default, C000 is not at its fastest state"
+await_page cpc_desired 255 "under the line-power default, C001's desired performance is not CPPC's highest"
+say "on line power the default is performance: C000 at 0x10 and C001 at 255, with preference 0"
+
+# BALANCED CHOSEN - AT REST THE SLOWEST.
+launch_says "the profile is balanced" profile-balanced-rest powerctl profile balanced || fail "powerctl could not set the balanced profile"
 await_page pct_control "${PSS[3]}" "at rest, C000 was not left at its slowest state"
 await_page cpc_desired 50 "at rest, C001's desired performance is not CPPC's lowest"
 await_page cpc_preference 128 "the balanced profile's energy preference was not written"
@@ -317,6 +328,11 @@ launch_says "core 0: 3 idle state(s), level [0-9]* of 4, window 1\.\.3" status-p
 launch_says "the profile is balanced" profile-balanced powerctl profile balanced || fail "powerctl could not set the balanced profile"
 await_page cpc_preference 128 "the balanced profile's preference was not written back"
 say "power saving caps C000's window at 1..3 with preference 192, and balanced writes 128 back"
+# THE CHOICE GIVEN BACK: the power source's default, performance on line power, again.
+launch_says "the profile is automatic" profile-auto powerctl profile auto || fail "powerctl could not give the profile back to the power source"
+await_page cpc_preference 0 "given back to the power source, the profile's preference is not performance's"
+launch_says "profile: performance (the default on line power)" status-auto powerctl status || fail "powerctl status does not name the line-power default after auto"
+say "auto gives the choice back: performance, the default on line power, with preference 0"
 
 # THE `_LPI` STATES: entered where the invariant TSC is there, left unentered with the reason where it is not.
 status_before="$(launch powerctl status)"

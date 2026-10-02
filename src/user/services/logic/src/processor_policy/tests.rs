@@ -61,8 +61,8 @@ fn ppc_and_the_thermal_cap_are_obeyed_above_any_profile() {
 
 #[test]
 fn the_default_profile_follows_the_power_source() {
-	assert_eq!(default_profile(false), Profile::Balanced);
-	assert_eq!(default_profile(true), Profile::PowerSaving);
+	assert_eq!(default_profile(false), Profile::Performance);
+	assert_eq!(default_profile(true), Profile::Balanced);
 	assert_eq!(cooling_mode(Profile::PowerSaving), 1);
 	assert_eq!(cooling_mode(Profile::Performance), 0);
 	assert!(energy_preference(Profile::Performance) < energy_preference(Profile::Balanced) && energy_preference(Profile::Balanced) < energy_preference(Profile::PowerSaving));
