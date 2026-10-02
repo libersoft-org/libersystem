@@ -9,7 +9,7 @@ fn image_key() -> ImageKey {
 }
 
 fn header() -> Header {
-	Header::new(&KEK_A, &[0xAB; 300], [1, 2, 3, 4, 5, 6, 7, 8], &image_key(), 1000, 1_790_000_000, [3; 32], [4; 32], [5; CONTEXT]).expect("a header")
+	Header::new(&KEK_A, KeyProtection::Tpm, &[0xAB; 300], [1, 2, 3, 4, 5, 6, 7, 8], &image_key(), 1000, 1_790_000_000, [3; 32], [4; 32], [5; CONTEXT]).expect("a header")
 }
 
 // A HEADER WRITTEN AND READ BACK gives the image key back under the same key-encryption key, and fits the system and
@@ -51,7 +51,11 @@ fn an_invalidated_or_foreign_header_is_no_image() {
 	let mut sealed = written.encode(STATE_IMAGE);
 	sealed[AT_SEALED_LEN..AT_SEALED_LEN + 4].copy_from_slice(&(SEALED_MAX as u32 + 1).to_le_bytes());
 	assert_eq!(Header::decode(&sealed), Err(Refusal::Malformed));
-	assert!(Header::new(&KEK_A, &[0; SEALED_MAX + 1], [0; 8], &image_key(), 1, 0, [0; 32], [0; 32], [0; CONTEXT]).is_err());
+	assert!(Header::new(&KEK_A, KeyProtection::Tpm, &[0; SEALED_MAX + 1], [0; 8], &image_key(), 1, 0, [0; 32], [0; 32], [0; CONTEXT]).is_err());
+	assert!(Header::new(&KEK_A, KeyProtection::Tpm, &[], [0; 8], &image_key(), 1, 0, [0; 32], [0; 32], [0; CONTEXT]).is_err(), "a sealed image with no blob");
+	let mut protection = written.encode(STATE_IMAGE);
+	protection[AT_PROTECTION] = 3;
+	assert_eq!(Header::decode(&protection), Err(Refusal::Malformed), "a key kept no way this format knows");
 }
 
 // ANOTHER SYSTEM IMAGE, OTHER HARDWARE: each refused by name.
@@ -111,4 +115,31 @@ fn the_partition_holds_a_header_then_full_chunks_and_a_shorter_last_one() {
 	assert_eq!(image_bytes(600), (HEADER_BYTES + 3 * CHUNK_HEAD + 600 * PAGE) as u64);
 	assert!(seal_chunk(&image_key(), 0, &[], &mut []).is_err(), "no page is no chunk");
 	assert!(seal_chunk(&image_key(), 0, &[1; CHUNK_PAGES + 1], &mut vec![0; (CHUNK_PAGES + 1) * PAGE]).is_err(), "nor is one past the bound");
+}
+
+// AN IMAGE WHOSE KEY IS IN THE CLEAR - written where no TPM seals: the header says so, holds the key-encryption key where
+// the sealed blob goes, opens under it and is authenticated as any other; a sealed image gives no key away.
+#[test]
+fn an_image_kept_in_the_clear_opens_under_the_key_its_header_holds() {
+	let written = Header::new(&KEK_B, KeyProtection::Clear, &[0xAB; 300], [8; 8], &image_key(), 300, 0, [3; 32], [4; 32], [5; CONTEXT]).expect("a header");
+	let read = Header::decode(&written.encode(STATE_IMAGE)).expect("an image");
+	assert_eq!(read.protection, KeyProtection::Clear);
+	assert_eq!(read.clear_key(), Some(KEK_B), "the key-encryption key itself, not the blob it was given");
+	assert_eq!(read.open(&KEK_B), Ok(image_key()));
+	assert_eq!(header().clear_key(), None, "a sealed image's key is TpmService's to open");
+	// A SEALED IMAGE TURNED INTO ONE IN THE CLEAR by its protection alone is malformed - its blob is not a key - and one
+	// whose blob is key-sized fails its authentication.
+	let mut turned = header().encode(STATE_IMAGE);
+	turned[AT_PROTECTION..AT_PROTECTION + 4].copy_from_slice(&2u32.to_le_bytes());
+	assert_eq!(Header::decode(&turned), Err(Refusal::Malformed));
+	let sealed = Header::new(&KEK_A, KeyProtection::Tpm, &[0xCD; KEK], [8; 8], &image_key(), 300, 0, [3; 32], [4; 32], [5; CONTEXT]).expect("a header");
+	let mut turned = sealed.encode(STATE_IMAGE);
+	turned[AT_PROTECTION..AT_PROTECTION + 4].copy_from_slice(&2u32.to_le_bytes());
+	let decoded = Header::decode(&turned).expect("shaped as an image in the clear");
+	let key = decoded.clear_key().expect("its blob read as a key");
+	assert_eq!(decoded.open(&key), Err(Refusal::Modified));
+	// A KEY-ENCRYPTION KEY IN THE CLEAR OF ANOTHER LENGTH is malformed.
+	let mut short = written.encode(STATE_IMAGE);
+	short[AT_SEALED_LEN..AT_SEALED_LEN + 4].copy_from_slice(&16u32.to_le_bytes());
+	assert_eq!(Header::decode(&short), Err(Refusal::Malformed));
 }

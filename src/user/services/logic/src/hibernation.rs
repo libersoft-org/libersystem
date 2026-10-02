@@ -14,7 +14,12 @@
 //! be moved, cut or altered unseen. The image key is stored in the header WRAPPED by a fresh 32-byte KEY-ENCRYPTION KEY
 //! - counter mode under its first half - and the header's fields and the wrapped key are authenticated under its
 //! second half; only the key-encryption key leaves this component, sealed through TpmService, and its sealed blob is in
-//! the header. No key is ever on the disk in the clear.
+//! the header. No key is ever on the disk in the clear - EXCEPT WHERE NO TPM SEALS, which the owner allows with a warning
+//! (2026-10-02): the header then says so (`KeyProtection::Clear`) and holds the key-encryption key itself where the
+//! sealed blob goes. Such an image is still authenticated - a corrupted one is refused - but anyone who can read the disk
+//! reads every secret that was in memory, and anyone who can write it can make the machine resume what they wrote. So a
+//! machine whose TPM seals refuses such an image (`Refusal::ClearOnSealingMachine`): an image in the clear is no way
+//! around the TPM's seal.
 //!
 //! THE REFUSALS: a header that is not an image, or is invalidated; an image whose authentication fails anywhere; one
 //! whose key does not unseal (the caller's, from TpmService's answer); one written by another system image; one
@@ -50,6 +55,7 @@ const AT_MAGIC: usize = 0;
 const AT_VERSION: usize = 8;
 const AT_STATE: usize = partition::HIBERNATION_STATE_AT;
 const AT_SEALED_LEN: usize = 16;
+const AT_PROTECTION: usize = 20;
 const AT_SEALED: usize = 24;
 const AT_NONCE: usize = AT_SEALED + SEALED_MAX;
 const AT_WRAPPED: usize = AT_NONCE + 8;
@@ -82,6 +88,8 @@ pub enum Refusal {
 	SystemChanged,
 	/// Describing other hardware.
 	HardwareChanged,
+	/// Its key in the clear, on a machine whose TPM seals - see the head of this file.
+	ClearOnSealingMachine,
 }
 
 impl Refusal {
@@ -94,6 +102,31 @@ impl Refusal {
 			Refusal::KeyNotUnsealed => "its key did not unseal - the loader changed since it was written",
 			Refusal::SystemChanged => "it was written by another system image",
 			Refusal::HardwareChanged => "it describes other hardware",
+			Refusal::ClearOnSealingMachine => "its key is in the clear, and this machine's TPM seals - anyone who could write the disk could have written it",
+		}
+	}
+}
+
+/// HOW THE KEY-ENCRYPTION KEY IS KEPT in the header: sealed through TpmService, or in the clear where no TPM seals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyProtection {
+	Tpm,
+	Clear,
+}
+
+impl KeyProtection {
+	fn code(self) -> u32 {
+		match self {
+			KeyProtection::Tpm => 1,
+			KeyProtection::Clear => 2,
+		}
+	}
+
+	fn from_code(code: u32) -> Option<KeyProtection> {
+		match code {
+			1 => Some(KeyProtection::Tpm),
+			2 => Some(KeyProtection::Clear),
+			_ => None,
 		}
 	}
 }
@@ -125,7 +158,8 @@ impl ImageKey {
 /// THE HEADER, as the writer fills it and the restorer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
-	/// The key-encryption key as TpmService sealed it.
+	/// How the key-encryption key is kept, and the key as TpmService sealed it - or, in the clear, the key itself.
+	pub protection: KeyProtection,
 	pub sealed: Vec<u8>,
 	/// The wrap's counter prefix, and the image key wrapped.
 	pub nonce: [u8; 8],
@@ -166,16 +200,18 @@ fn halves(kek: &[u8; KEK]) -> (Key, Key) {
 }
 
 impl Header {
-	/// A NEW IMAGE'S HEADER: the image key wrapped under `kek` with `nonce`, and every field authenticated.
+	/// A NEW IMAGE'S HEADER: the image key wrapped under `kek` with `nonce`, and every field authenticated. `sealed` is
+	/// TpmService's blob for `KeyProtection::Tpm`; for `KeyProtection::Clear` it is ignored, and `kek` itself is kept.
 	#[allow(clippy::too_many_arguments)]
-	pub fn new(kek: &[u8; KEK], sealed: &[u8], nonce: [u8; 8], image: &ImageKey, pages: u64, created: u64, system: [u8; 32], hardware: [u8; 32], context: [u8; CONTEXT]) -> Result<Header, Refusal> {
-		if sealed.len() > SEALED_MAX {
+	pub fn new(kek: &[u8; KEK], protection: KeyProtection, sealed: &[u8], nonce: [u8; 8], image: &ImageKey, pages: u64, created: u64, system: [u8; 32], hardware: [u8; 32], context: [u8; CONTEXT]) -> Result<Header, Refusal> {
+		let sealed: &[u8] = if protection == KeyProtection::Clear { kek } else { sealed };
+		if sealed.is_empty() || sealed.len() > SEALED_MAX {
 			return Err(Refusal::Malformed);
 		}
 		let (encrypt, _) = halves(kek);
 		let mut wrapped = image.bytes();
 		ctr(&encrypt, nonce, 0, &mut wrapped);
-		let mut header = Header { sealed: sealed.to_vec(), nonce, wrapped, pages, created, system, hardware, context, mac: [0u8; BLOCK] };
+		let mut header = Header { protection, sealed: sealed.to_vec(), nonce, wrapped, pages, created, system, hardware, context, mac: [0u8; BLOCK] };
 		header.mac = header.authentication(kek);
 		Ok(header)
 	}
@@ -198,6 +234,7 @@ impl Header {
 		out[AT_VERSION..AT_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
 		out[AT_STATE..AT_STATE + 4].copy_from_slice(&state.to_le_bytes());
 		out[AT_SEALED_LEN..AT_SEALED_LEN + 4].copy_from_slice(&(self.sealed.len() as u32).to_le_bytes());
+		out[AT_PROTECTION..AT_PROTECTION + 4].copy_from_slice(&self.protection.code().to_le_bytes());
 		out[AT_SEALED..AT_SEALED + self.sealed.len()].copy_from_slice(&self.sealed);
 		out[AT_NONCE..AT_NONCE + 8].copy_from_slice(&self.nonce);
 		out[AT_WRAPPED..AT_WRAPPED + 2 * KEY].copy_from_slice(&self.wrapped);
@@ -232,7 +269,11 @@ impl Header {
 		if sealed_len == 0 || sealed_len > SEALED_MAX {
 			return Err(Refusal::Malformed);
 		}
-		let mut header = Header { sealed: block[AT_SEALED..AT_SEALED + sealed_len].to_vec(), nonce: [0u8; 8], wrapped: [0u8; 2 * KEY], pages: u64_at(AT_PAGES), created: u64_at(AT_CREATED), system: [0u8; 32], hardware: [0u8; 32], context: [0u8; CONTEXT], mac: [0u8; BLOCK] };
+		let protection = KeyProtection::from_code(u32_at(AT_PROTECTION)).ok_or(Refusal::Malformed)?;
+		if protection == KeyProtection::Clear && sealed_len != KEK {
+			return Err(Refusal::Malformed);
+		}
+		let mut header = Header { protection, sealed: block[AT_SEALED..AT_SEALED + sealed_len].to_vec(), nonce: [0u8; 8], wrapped: [0u8; 2 * KEY], pages: u64_at(AT_PAGES), created: u64_at(AT_CREATED), system: [0u8; 32], hardware: [0u8; 32], context: [0u8; CONTEXT], mac: [0u8; BLOCK] };
 		header.nonce.copy_from_slice(&block[AT_NONCE..AT_NONCE + 8]);
 		header.wrapped.copy_from_slice(&block[AT_WRAPPED..AT_WRAPPED + 2 * KEY]);
 		header.system.copy_from_slice(&block[AT_SYSTEM..AT_SYSTEM + 32]);
@@ -243,6 +284,14 @@ impl Header {
 			return Err(Refusal::Malformed);
 		}
 		Ok(header)
+	}
+
+	/// THE KEY-ENCRYPTION KEY OF AN IMAGE KEPT IN THE CLEAR - `None` for a sealed one, whose key only TpmService opens.
+	pub fn clear_key(&self) -> Option<[u8; KEK]> {
+		if self.protection != KeyProtection::Clear {
+			return None;
+		}
+		self.sealed[..].try_into().ok()
 	}
 
 	/// THE IMAGE KEY, once the header's authentication under `kek` holds - `Modified` when it does not.

@@ -354,8 +354,9 @@ record sleep-status {
 	watchdog-cap-ms: u64,
 	/// The scheduled wake, as seconds since the Unix epoch; zero for none.
 	scheduled-wake:  u64,
-	/// HIBERNATION ON THIS MACHINE, as the image component says: set up, or why not; and what became of the image found
-	/// at this boot - "none", or why it was refused. Not set up, with the reason, where the component does not run.
+	/// HIBERNATION ON THIS MACHINE, as the image component says: set up, or why not - and, set up, the warning that limits
+	/// it where no TPM seals the image's key; and what became of the image found at this boot - "none", or why it was
+	/// refused. Not set up, with the reason, where the component does not run.
 	hibernation-set-up: bool,
 	hibernation-why:    string,
 	last-image:         string,
@@ -477,6 +478,7 @@ interface sleep-entry {
 /// the image it last found at a boot.
 record hibernation-status {
 	set-up:          bool,
+	/// Why it is not set up - or, where it is, a warning that limits it (no TPM seals the image's key); empty for none.
 	why:             string,
 	partition-bytes: u64,
 	memory-bytes:    u64,

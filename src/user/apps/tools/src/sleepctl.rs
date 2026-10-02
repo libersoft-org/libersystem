@@ -102,6 +102,13 @@ fn suspend(sleep: &mut SleepClient, state: SleepState, timed_wake_ms: u64) {
 
 // HIBERNATE: the image written and the machine off - or, `hybrid`, the image kept through a suspend to RAM.
 fn hibernate(sleep: &mut SleepClient, hybrid: bool) {
+	// THE WARNING FIRST, where the image's key will not be sealed.
+	if let Some(Ok(status)) = sleep.status()
+		&& status.hibernation_set_up
+		&& !status.hibernation_why.is_empty()
+	{
+		say(&format!("sleepctl: {}", status.hibernation_why));
+	}
 	match sleep.hibernate(&hybrid, &SleepReason::Requested) {
 		Some(Ok(())) => {
 			say(if hybrid { "sleepctl: hybrid sleep accepted" } else { "sleepctl: hibernation accepted" });
@@ -174,7 +181,12 @@ fn print_status(status: &SleepStatus) {
 		}
 	}
 	say(&format!("states: {}", if offered.is_empty() { String::from("none") } else { offered.join(", ") }));
-	say(&if status.hibernation_set_up { String::from("hibernation: set up") } else { format!("hibernation: not set up - {}", status.hibernation_why) });
+	// SET UP, AND WARNED where no TPM seals the image's key: the warning is the reason's field.
+	say(&match (status.hibernation_set_up, status.hibernation_why.is_empty()) {
+		(true, true) => String::from("hibernation: set up"),
+		(true, false) => format!("hibernation: set up - {}", status.hibernation_why),
+		(false, _) => format!("hibernation: not set up - {}", status.hibernation_why),
+	});
 	say(&format!("the image found at this boot: {}", status.last_image));
 	say("wake sources:");
 	for source in &status.wake_sources {

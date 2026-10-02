@@ -2830,8 +2830,9 @@ pub struct SleepStatus {
 	pub watchdog_cap_ms: u64,
 	/// The scheduled wake, as seconds since the Unix epoch; zero for none.
 	pub scheduled_wake: u64,
-	/// HIBERNATION ON THIS MACHINE, as the image component says: set up, or why not; and what became of the image found
-	/// at this boot - "none", or why it was refused. Not set up, with the reason, where the component does not run.
+	/// HIBERNATION ON THIS MACHINE, as the image component says: set up, or why not - and, set up, the warning that limits
+	/// it where no TPM seals the image's key; and what became of the image found at this boot - "none", or why it was
+	/// refused. Not set up, with the reason, where the component does not run.
 	pub hibernation_set_up: bool,
 	pub hibernation_why: String,
 	pub last_image: String,
@@ -5746,6 +5747,7 @@ pub mod sleep_entry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HibernationStatus {
 	pub set_up: bool,
+	/// Why it is not set up - or, where it is, a warning that limits it (no TPM seals the image's key); empty for none.
 	pub why: String,
 	pub partition_bytes: u64,
 	pub memory_bytes: u64,

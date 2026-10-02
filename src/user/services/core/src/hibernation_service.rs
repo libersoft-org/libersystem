@@ -17,8 +17,14 @@
 // journal.
 //
 // WHAT IT SERVES, on the control channel ServiceManager holds for it (`hibernation-image`): `status` - set up where the
-// area is at least as large as memory and a TPM seals; `write-image` - the kernel's snapshot sealed, encrypted and
-// written, then given back; `discard-image` - the header invalidated, when a machine runs on after writing an image.
+// area is at least as large as memory; `write-image` - the kernel's snapshot sealed, encrypted and written, then given
+// back; `discard-image` - the header invalidated, when a machine runs on after writing an image.
+//
+// WITHOUT A TPM THAT SEALS - none bound, or one whose owner hierarchy seals nothing - HIBERNATION IS STILL SET UP, as the
+// owner decided (2026-10-02), with a warning wherever it is offered: the status's `why`, and a line at every image
+// written. The image's key is then kept in the header in the clear (`service_logic::hibernation`'s head says what that
+// gives away), and no passphrase is asked at the resume. A TPM that answers wrongly is not "no TPM": hibernation is not
+// set up then. And a machine whose TPM seals refuses an image whose key is in the clear.
 //
 // THE FORMAT AND ITS CRYPTOGRAPHY are `service_logic::hibernation`'s.
 
@@ -33,7 +39,7 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::{Error, HibernationStatus, Outcome, hibernation_area, hibernation_image, hibernation_restore, tpm};
 use rt::*;
-use service_logic::hibernation::{self, CHUNK_HEAD, CHUNK_PAGES, HEADER_BYTES, Header, ImageKey, KEK, PAGE, Refusal, STATE_EMPTY, STATE_IMAGE};
+use service_logic::hibernation::{self, CHUNK_HEAD, CHUNK_PAGES, HEADER_BYTES, Header, ImageKey, KEK, KeyProtection, PAGE, Refusal, STATE_EMPTY, STATE_IMAGE};
 
 include!(concat!(env!("OUT_DIR"), "/roles_hibernation_service.rs"));
 
@@ -48,6 +54,20 @@ const TPM_WAIT_TICKS: u64 = 60 * TICKS_PER_SECOND;
 fn say(text: &str) {
 	let line = format!("HibernationService: {text}\n");
 	print(line.as_bytes());
+}
+
+// WHAT THE TPM DOES FOR THE IMAGE'S KEY.
+enum Sealing {
+	Seals,
+	// No TPM seals - why: the image's key is kept in the clear, with the warning.
+	Absent(String),
+	// The TPM or TpmService answered wrongly - why: hibernation is not set up.
+	Failed(String),
+}
+
+// THE WARNING, wherever hibernation without a TPM is offered.
+fn clear_warning(why: &str) -> String {
+	format!("WARNING: {why}, so the image's key is written beside it in the clear - anyone who can read the disk reads every secret that was in memory, and anyone who can write it can make the machine resume what they wrote")
 }
 
 struct Component {
@@ -121,6 +141,31 @@ impl Component {
 		tpm::Client::with_deadline(ChannelTransport { chan: self.tpm }, clock().saturating_add(CALL_TICKS))
 	}
 
+	// WHETHER THE TPM SEALS, asked of TpmService: a TPM bound, and its owner hierarchy usable. `wait` gives a TPM that is
+	// not bound yet `TPM_WAIT_TICKS` to be - what a restore asks, where the answer decides whether an image in the clear
+	// may resume.
+	fn sealing(&self, wait: bool) -> Sealing {
+		if self.tpm == 0 {
+			return Sealing::Absent(String::from("no TPM seals the image's key - its grant was not minted"));
+		}
+		let until = clock().saturating_add(TPM_WAIT_TICKS);
+		let answer = loop {
+			let answer = self.tpm().info();
+			match &answer {
+				Some(Ok(answer)) if wait && answer.outcome == Outcome::Unavailable && clock() < until => sleep_until(clock().saturating_add(TICKS_PER_SECOND / 10)),
+				_ => break answer,
+			}
+		};
+		match answer {
+			Some(Ok(answer)) if answer.outcome == Outcome::Done && answer.info.as_ref().is_some_and(|info| info.sealing) => Sealing::Seals,
+			Some(Ok(answer)) if answer.outcome == Outcome::Done => Sealing::Absent(String::from("the TPM's owner hierarchy has an authorization value or is disabled, so it seals nothing")),
+			Some(Ok(answer)) if answer.outcome == Outcome::Unavailable => Sealing::Absent(String::from("no TPM is bound to seal the image's key")),
+			Some(Ok(answer)) => Sealing::Failed(format!("the TPM answered {:?} (code {:#x})", answer.outcome, answer.code)),
+			Some(Err(error)) => Sealing::Failed(format!("TpmService refused the question ({error:?})")),
+			None => Sealing::Failed(String::from("TpmService did not answer")),
+		}
+	}
+
 	fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, String> {
 		if self.area == 0 {
 			return Err(String::from("no hibernation area is served to this component"));
@@ -173,17 +218,12 @@ impl Component {
 			String::from("the system disk has no hibernation partition")
 		} else if bytes < memory {
 			format!("the hibernation partition holds {bytes} bytes, less than the {memory} of memory")
-		} else if self.tpm == 0 {
-			String::from("no TPM seals the image's key - its grant was not minted")
 		} else {
-			// WHETHER THE TPM SEALS, asked of TpmService: a TPM bound, and its owner hierarchy usable.
-			match self.tpm().info() {
-				Some(Ok(answer)) if answer.outcome == Outcome::Done && answer.info.as_ref().is_some_and(|info| info.sealing) => String::new(),
-				Some(Ok(answer)) if answer.outcome == Outcome::Done => String::from("the TPM's owner hierarchy has an authorization value or is disabled, so it seals nothing"),
-				Some(Ok(answer)) if answer.outcome == Outcome::Unavailable => String::from("no TPM is bound to seal the image's key"),
-				Some(Ok(answer)) => format!("the TPM answered {:?} (code {:#x})", answer.outcome, answer.code),
-				Some(Err(error)) => format!("TpmService refused the question ({error:?})"),
-				None => String::from("TpmService did not answer"),
+			match self.sealing(false) {
+				Sealing::Seals => String::new(),
+				// SET UP, AND WARNED: `why` carries the warning beside `set-up`.
+				Sealing::Absent(why) => return HibernationStatus { set_up: true, why: clear_warning(&why), partition_bytes: bytes, memory_bytes: memory, last_image: self.last_image.clone() },
+				Sealing::Failed(why) => why,
 			}
 		};
 		HibernationStatus { set_up: why.is_empty(), why, partition_bytes: bytes, memory_bytes: memory, last_image: self.last_image.clone() }
@@ -211,11 +251,15 @@ impl Component {
 		if random_get(&mut kek) != KEK || random_get(&mut image_bytes) != 32 || random_get(&mut nonce) != 8 {
 			return Err(String::from("the kernel gave no random bytes for the keys"));
 		}
-		let sealed = match self.tpm().seal(&PCR, &kek) {
-			Some(Ok(answer)) if answer.outcome == Outcome::Done => answer.bytes,
-			Some(Ok(answer)) => return Err(format!("the TPM did not seal the key ({:?}, code {:#x})", answer.outcome, answer.code)),
-			Some(Err(error)) => return Err(format!("TpmService refused the seal ({error:?})")),
-			None => return Err(String::from("TpmService did not answer the seal")),
+		let (protection, sealed, kept) = match self.sealing(false) {
+			Sealing::Seals => match self.tpm().seal(&PCR, &kek) {
+				Some(Ok(answer)) if answer.outcome == Outcome::Done => (KeyProtection::Tpm, answer.bytes, format!("its key sealed to PCR {PCR}")),
+				Some(Ok(answer)) => return Err(format!("the TPM did not seal the key ({:?}, code {:#x})", answer.outcome, answer.code)),
+				Some(Err(error)) => return Err(format!("TpmService refused the seal ({error:?})")),
+				None => return Err(String::from("TpmService did not answer the seal")),
+			},
+			Sealing::Absent(why) => (KeyProtection::Clear, Vec::new(), format!("its key NOT sealed - {}", clear_warning(&why))),
+			Sealing::Failed(why) => return Err(why),
 		};
 		let image = ImageKey::from_bytes(&image_bytes);
 		// THE CHUNKS, each read from the kernel, sealed and written behind its head.
@@ -236,25 +280,17 @@ impl Component {
 			self.write(hibernation::chunk_offset(index), &record)?;
 		}
 		// THE HEADER LAST, and flushed: until it is on the disk, nothing here is an image.
-		let header = Header::new(&kek, &sealed, nonce, &image, info.pages, clock_rtc(), info.system, info.hardware, info.context).map_err(|refusal| format!("the header could not be made ({refusal:?})"))?;
+		let header = Header::new(&kek, protection, &sealed, nonce, &image, info.pages, clock_rtc(), info.system, info.hardware, info.context).map_err(|refusal| format!("the header could not be made ({refusal:?})"))?;
 		self.write(0, &header.encode(STATE_IMAGE))?;
 		self.flush()?;
-		say(&format!("the image is written - {} pages in {chunks} chunks, its key sealed to PCR {PCR}", info.pages));
+		say(&format!("the image is written - {} pages in {chunks} chunks, {kept}", info.pages));
 		Ok(())
 	}
 
 	// ------------------------------------------------------------------ the restore
 
-	// THE IMAGE FOUND AT MOUNT, restored - or why not. A restore that happens does not return.
-	fn restore(&mut self) -> Result<(), String> {
-		let block = self.read(0, HEADER_BYTES)?;
-		let header = match Header::decode(&block) {
-			Ok(header) => header,
-			Err(Refusal::NoImage) => return Err(String::from("none")),
-			Err(refusal) => return Err(String::from(refusal.text())),
-		};
-		say(&format!("an image of {} pages is on the hibernation partition - it is checked", header.pages));
-		// ITS KEY, OPENED ONLY FOR THIS COMPONENT AND ONLY WHILE PCR 4 HOLDS WHAT IT DID.
+	// A SEALED IMAGE'S KEY, OPENED ONLY FOR THIS COMPONENT AND ONLY WHILE PCR 4 HOLDS WHAT IT DID.
+	fn unseal(&self, header: &Header) -> Result<[u8; KEK], String> {
 		if self.tpm == 0 {
 			return Err(String::from("no TPM seal grant was minted, so its key cannot be unsealed"));
 		}
@@ -266,12 +302,34 @@ impl Component {
 				_ => break answer,
 			}
 		};
-		let kek: [u8; KEK] = match unsealed {
-			Some(Ok(answer)) if answer.outcome == Outcome::Done && answer.bytes.len() == KEK => answer.bytes[..].try_into().map_err(|_| String::from("the unsealed key has another length"))?,
-			Some(Ok(answer)) if answer.outcome == Outcome::PolicyRefused => return Err(String::from(Refusal::KeyNotUnsealed.text())),
-			Some(Ok(answer)) => return Err(format!("its key did not unseal ({:?}, code {:#x})", answer.outcome, answer.code)),
-			Some(Err(error)) => return Err(format!("TpmService refused the unseal ({error:?})")),
-			None => return Err(String::from("TpmService did not answer the unseal")),
+		match unsealed {
+			Some(Ok(answer)) if answer.outcome == Outcome::Done && answer.bytes.len() == KEK => answer.bytes[..].try_into().map_err(|_| String::from("the unsealed key has another length")),
+			Some(Ok(answer)) if answer.outcome == Outcome::PolicyRefused => Err(String::from(Refusal::KeyNotUnsealed.text())),
+			Some(Ok(answer)) => Err(format!("its key did not unseal ({:?}, code {:#x})", answer.outcome, answer.code)),
+			Some(Err(error)) => Err(format!("TpmService refused the unseal ({error:?})")),
+			None => Err(String::from("TpmService did not answer the unseal")),
+		}
+	}
+
+	// THE IMAGE FOUND AT MOUNT, restored - or why not. A restore that happens does not return.
+	fn restore(&mut self) -> Result<(), String> {
+		let block = self.read(0, HEADER_BYTES)?;
+		let header = match Header::decode(&block) {
+			Ok(header) => header,
+			Err(Refusal::NoImage) => return Err(String::from("none")),
+			Err(refusal) => return Err(String::from(refusal.text())),
+		};
+		say(&format!("an image of {} pages is on the hibernation partition - it is checked", header.pages));
+		// ITS KEY IN THE CLEAR: taken from the header - where no TPM seals, and on no other machine.
+		let kek: [u8; KEK] = match header.clear_key() {
+			Some(kek) => {
+				if let Sealing::Seals = self.sealing(true) {
+					return Err(String::from(Refusal::ClearOnSealingMachine.text()));
+				}
+				say("its key was written in the clear - no TPM sealed it");
+				kek
+			}
+			None => self.unseal(&header)?,
 		};
 		let image = header.open(&kek).map_err(|refusal| String::from(refusal.text()))?;
 		let fingerprint = system_fingerprint().ok_or_else(|| String::from("the kernel gave no fingerprint"))?;
