@@ -95,3 +95,6 @@ summaries in that file use the same macro. No other pinned copy of the vocabular
   `lib/clients/input-client.lslib` library row, the tools crate's optional dependencies under `shared-image`, and
   `gamepad`'s providers what it now imports (`base-proto`, `input-client`, `input-proto` for the stream frames'
   decoder, `lico`, `lsrt`). Its regression run and the refresh's are in the batch running now.
+- (2026-10-01) `./build.sh --arch aarch64`, `--arch riscv64` and `--arch x86_64` -> ok with the client library;
+  `./check.sh --refresh dynamic-report` -> ok, then the gate `dynamic-report` -> PASS; `qemu-gamepad-tool` -> PASS
+  (360 s). Status: COMPLETE.

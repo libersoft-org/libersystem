@@ -286,3 +286,4 @@ booted); the three cross-builds; a hardware run.
   asleep, the notifications enabled and both connectors read after each, the detach made in S3 reported after it.
 - `typec-tcpci` -> PASS: the suspend refused with a contract standing and the connector named, a charger attached during
   a sleep finding the sink path off and contracted after it, and every earlier case.
+- (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.

@@ -375,3 +375,4 @@ COMMANDS AND RESULTS (PASSED unless said):
   (`vhost-i2c-gpio.py`'s model), and the test's table was never told. The test expects `tcpc-alert` now
   (`src/kernel/test_suites/hardware.rs`); its run is in the batch running now.
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate i2c-bus` -> PASS (53 s, 2026-10-01, after `./build.sh --arch x86_64`).
+- (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.

@@ -187,3 +187,4 @@ watchdog's 120 s boot bound should be larger (see the watchdog finding above).
   second) and recorded in its audit; the gate `ipmi` carries the case: "a sleep with KCS and SSIF bound: both answered
   to idle and S3, SSIF identified again, and the BMC received the watchdog's step in order".
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate ipmi` -> PASS (2188 s); `qemu-ipmi-admin` -> PASS (1392 s).
+- (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.

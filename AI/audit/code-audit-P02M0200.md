@@ -210,3 +210,4 @@ job's end, for the parts owed by P02M0197 and P02M0201, and for the owner's deci
   it (116.0, 116.3 and 116.4 s to a prompt).
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate watchdog` -> PASS (2919 s): the i6300esb, the reset, the TCO, WDAT and the BMC
   cases, the orderly reboot's notice and the boot bound among them.
+- (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.

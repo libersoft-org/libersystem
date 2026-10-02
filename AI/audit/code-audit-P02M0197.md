@@ -628,3 +628,19 @@ neither could be shown working, and both are left open in the milestone for hard
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate sleep` -> PASS (1871 s) with the controller armed: boot 1's suspend to idle
   still "64 cores parked, none woke for anything but the wake", every S3 case (the controller halted as before) and
   every later boot as in the runs above.
+
+## The ports, run at the end of the job (2026-10-01)
+
+- `./build.sh --arch aarch64` and `--arch riscv64` -> ok, with the ports' `arch::sleep` halves (P02M0198's audit
+  records the fixes the first cross-build needed in other milestones' code).
+- Suspend to idle on aarch64 and riscv64 - `check-tickless-idle.py` -> PASS on both: 5007 and 5009 ms between the
+  kernel's lines for a 5 s wake with the counter silent, the boot-time clock taking the sleep in and the monotonic
+  clock not, 4 cores parked with no wake but the wake. "PSCI SYSTEM_SUSPEND is not offered by this firmware" and "the
+  SBI System Suspend extension is not offered by this firmware", said by the kernel at boot - the check part b asks
+  for, written down.
+- NOT DONE, reported as open: the per-core resume path on the two ports, and with it S3-like system suspend and
+  hibernation there (`ERR_UNSUPPORTED`); PCI PME and a network device's wake (no emulated device raises either).
+
+Status: implemented and verified on x86_64; suspend to idle verified on all three targets; OPEN as above, and for the
+owner's decisions (the policy's defaults; a passphrase where no TPM can seal - see also the owner's note in
+`NOTES.md`, "hybernation doesn't work without TPM - allow it with warning").

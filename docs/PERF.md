@@ -4,6 +4,29 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## An idle core's wakeups once the tick stops (2026-10-01)
+
+Every core used to take the periodic tick, busy or idle: 100 wakeups a second per core (`TICK_HZ`), by construction,
+since the interrupt fires every period whatever the core is doing. That BEFORE figure is the tick's rate, not a run of
+the old kernel. AFTER, an idle core halts on a one-shot for the earliest thing it has to do and takes no tick.
+
+HOW IT WAS MEASURED. `python3 src/tools/check-tickless-idle.py <target>` boots the development build, lets the
+machine settle, reads every core's idle record from the system graph (`graph`, the free per-core idle syscall) before
+and after an idle sample, and divides each core's wakeups by the sample's length. x86_64 under KVM with four cores;
+aarch64 and riscv64 under TCG with four cores, their trees carrying the gate's three idle states.
+
+| target | sample | cpu0 | cpu1 | cpu2 | cpu3 |
+|---|---|---|---|---|---|
+| x86_64 | 11 s | 91.7/s | 0.0/s | 0.0/s | 0.0/s |
+| aarch64 | 20 s | 67.2/s | 0.0/s | 0.0/s | 0.0/s |
+| riscv64 | 21 s | 58.8/s | 0.0/s | 0.0/s | 0.0/s |
+
+WHAT THE NUMBERS SAY. The application cores do not wake at all while idle. The boot core still wakes about as often
+as the tick did: it is the one core that runs the deadline check and the housekeeping bound, and the gate's machine
+carries a PCIe root port whose error reporting that core polls at the housekeeping bound - so cpu0's rate is the
+housekeeping bound's, not a tick's, and it falls with that bound, not with this change. On the device-tree ports the
+idle cores spend the sample in the tree's retention states, entered through PSCI and the SBI (1311 and 1259 entries).
+
 ## The port permission bitmap on every thread switch (2026-09-28)
 
 Port I/O became a capability: every core's TSS carries an 8 KiB I/O permission bitmap, and on every switch to

@@ -510,3 +510,21 @@ the job's slow-architecture step at its end and are recorded when run.
   trampolines), a `lib/clients/power-client.lslib` row, and `powerctl`'s providers `base-proto`, `power-client`,
   `lsrt`. `./build.sh --arch x86_64` ok; the `processor-power` gate, which drives `powerctl`, is in the batch running
   now.
+- riscv64's third run -> PASS: suspend to idle "the host measured 5009 ms for a 5 s wake with the counter silent,
+  count 2 then 3 (monotonic +4641 ms, boot-time +9643 ms), 4 cores parked with no wake but the wake". And x86_64
+  again with the gate's two fixes -> PASS (keys within 4 ms, a plugged device seen 80 ms later).
+- `docs/PERF.md` gains "An idle core's wakeups once the tick stops": application cores 0.0/s on all three targets,
+  the boot core 91.7 (x86_64), 67.2 (aarch64) and 58.8 (riscv64) a second - the housekeeping bound's rate. The BEFORE
+  figure is the tick's own 100/s, by construction, not a run of the old kernel.
+- `verify-model release-required --write`: 335 keys, seven new (`gate.processor-power` and the host suites of
+  `bmc-proto`, `platform`, `procpower`, `smbios`, `tpm-proto`, `typec-proto`); the gate `verify-model` then asked for
+  `acpi`, `aml`, `platform`, `procpower` and `tpm` in `lib.sh`'s VOLUME_SOURCES - each reaches the system volume and
+  a change in it was invisible to the staleness check - and passes with them. `verify-model-tests` pass.
+- The last host gates over the tree as it stands -> PASS: `dynamic-report` (after `--refresh dynamic-report` wrote
+  the three tables), `driver-protocol-note` (red before only because the aarch64 volume was older than this goal's
+  drivers), `source-hygiene`, `kernel-allocations`, `development-gate`, `dependency-policy`, `staged-consistency`,
+  `arch-surface`, `verify-model`, `firmware-fixtures`, `milestone-index`. Host suites: `service-logic` 737,
+  `driver-binding` 93, `procpower` 23, `drivers` 451.
+
+Status: parts a to d implemented and run on the targets each names; OPEN for context-losing idle states (P02M0197's
+per-core resume path on the ports), the owner's three-target kernel run, and the owner's confirmation of the defaults.

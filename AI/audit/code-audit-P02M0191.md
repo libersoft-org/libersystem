@@ -196,3 +196,5 @@ The record of what was built and verified follows below when it is.
 - And `uart16550` keeps its consumer across a sleep it takes itself (the session was reset after every step, ending
   ConsoleService's input stream at each wake) - P02M0197's audit.
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate serial-handoff` -> PASS twice on 2026-10-01, the second with the settle in.
+- (2026-10-01) the three cross-builds pass; on the device-tree ports the port-range calls answer `ERR_UNSUPPORTED`
+  (`arch::ioports::supported()` false - read in the code, not run). Status: COMPLETE.

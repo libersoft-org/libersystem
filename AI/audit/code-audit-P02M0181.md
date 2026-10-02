@@ -747,3 +747,5 @@ The milestone's own text keeps no suspend or platform policy. It stays open only
   system volume into memory). The same gate run alone passed; its budgets are 300 s and 480 s now
   (`src/tools/check-power-service.sh`, the reason in its comment), and it passed again in the next batch (481 s in all).
   The boot's length is not this milestone's; it is said here because it is what the budget was paying for.
+- (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole, the probes and the fixed class among
+  them; `power-service`, `power-ups` and `acpi` pass on x86_64. Status: COMPLETE.
