@@ -126,6 +126,9 @@ riscv64_save_and_leave:
 .global riscv64_resume_high
 // FROM THE STUB, on the boot page tables in the higher half, a1 the record: the hart put back as it was saved.
 riscv64_resume_high:
+	li      a7, 1                   // DEBUG-MARK
+	li      a0, 'H'                 // DEBUG-MARK
+	ecall                           // DEBUG-MARK
 	mv      a0, a1
 	ld      t0, {SATP}*8(a0)
 	sfence.vma
@@ -188,6 +191,9 @@ riscv64_resume_high:
 // few instructions there with translation on. Its addresses are words beside it, read PC-relative: the code runs at
 // its physical address and its virtual one alike.
 riscv64_resume_start:
+	li      a7, 1                   // DEBUG-MARK
+	li      a0, 'S'                 // DEBUG-MARK
+	ecall                           // DEBUG-MARK
 	lla     t0, 7f
 	ld      t1, 0(t0)               // the boot page tables, physical
 	srli    t1, t1, 12
@@ -211,6 +217,11 @@ riscv64_resume_start:
 // record, a0 the hart id. Position-independent, and no stack: the memory under it is being replaced. Its own page is
 // the image's too, which holds the same instructions - the system image's digest is what says it is the same kernel.
 riscv64_replace_trampoline:
+	mv      t6, a0                  // DEBUG-MARK
+	li      a7, 1                   // DEBUG-MARK
+	li      a0, 'T'                 // DEBUG-MARK
+	ecall                           // DEBUG-MARK
+	mv      a0, t6                  // DEBUG-MARK
 	csrw    satp, zero
 	sfence.vma
 	ld      t0, 0(a0)               // pages left
@@ -249,6 +260,11 @@ riscv64_replace_trampoline:
 	addi    t1, t1, 1
 	j       2b
 5:
+	mv      t6, a0                  // DEBUG-MARK
+	li      a7, 1                   // DEBUG-MARK
+	li      a0, 'J'                 // DEBUG-MARK
+	ecall                           // DEBUG-MARK
+	mv      a0, t6                  // DEBUG-MARK
 	fence.i
 	ld      t0, 16(a0)              // the image's resume entry
 	ld      a1, 24(a0)              // the image's boot record
@@ -308,6 +324,12 @@ pub fn trampoline() -> u64 {
 pub fn boot_tables() -> u64 {
 	// SAFETY: as `entry`.
 	unsafe { core::ptr::read_volatile(&raw const riscv64_resume_entry)[2] }
+}
+
+// DEBUG-MARK: one byte through the SBI's legacy console, past every lock.
+pub fn debug_mark(byte: u8) {
+	// SAFETY: DEBUG-MARK - an SBI call that prints a byte.
+	unsafe { core::arch::asm!("ecall", in("a7") 1usize, inout("a0") byte as usize => _, options(nostack)) };
 }
 
 // THE ONE OPERATION - see the head of this file. Called with interrupts masked; answers `leave`'s answer, or `RESUMED`

@@ -52,7 +52,7 @@ fn a_snapshot_holds_every_page_in_use_as_it_was_at_the_copy_and_gives_every_fram
 	let list = listed(pages);
 	assert_eq!(list.len() as u64, pages);
 	assert!(list.windows(2).all(|pair| pair[0] < pair[1]), "in address order, each page once");
-	assert!(list.iter().all(|&page| page % super::PAGE == 0 && page != 0 && super::image_ram(page)), "only RAM of an image's classes, never page zero");
+	assert!(list.iter().all(|&page| page % super::PAGE == 0 && page != 0 && super::image_ram(page, &None)), "only RAM of an image's classes, never page zero");
 	let at = list.iter().position(|&page| page == marked).expect("a page the kernel holds is in the snapshot") as u64;
 	let mut seen = Vec::new();
 	super::read(at, 1, |offset, bytes| {

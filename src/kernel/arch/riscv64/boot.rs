@@ -346,6 +346,10 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// life of the boot - so the same carve. See `arch::common::bootmem`.
 	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; crate::arch::common::bootmem::MAX_HOLES];
 	let mut hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
+	// WHICH HOLES ARE THE LOADER'S: these first ones, the tree's blob and the archive below - every other one the
+	// tree's, a firmware's (`bootmem::retained_map`).
+	let loader_holes = hole_count;
+	let blob = unsafe { super::dtb::located(dtb) }.and_then(|tree| tree.extent());
 	// AND WHAT THE DEVICE TREE RESERVES, including the blob itself - none of which anything carved.
 	//
 	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
@@ -369,6 +373,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// this boot does not have, and the device tree's reservation block does not cover an initrd -
 	// `/chosen` names the range, `/reserved-memory` does not. Those are the bytes every program's
 	// ELF image is read from for the life of the boot, so a pool spanning them hands one out.
+	let tree_holes = hole_count;
 	if let Some((base, len)) = archive {
 		if hole_count < holes.len() {
 			holes[hole_count] = crate::arch::common::bootmem::Hole { start: base, end: base + len };
@@ -447,7 +452,19 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	}
 	// Retain the boot memory map so the `lsmem` inventory tool can render it (heap-backed,
 	// so after heap::init).
-	crate::mem::retain_memmap(&regions);
+	{
+		unsafe extern "C" {
+			static __kernel_load: u8;
+		}
+		// A higher-half symbol, its offset taken off; the image runs to the first page the pool may hand out.
+		let load = (&raw const __kernel_load as u64) & !paging::KERNEL_VA_OFFSET;
+		let mut kinds = [(crate::arch::common::bootmem::Hole { start: 0, end: 0 }, bootproto::MEM_RESERVED); crate::arch::common::bootmem::MAX_HOLES];
+		for (at, hole) in holes[..hole_count].iter().enumerate() {
+			let loaders = at < loader_holes || at >= tree_holes || blob.is_some_and(|(base, len)| hole.start == base && hole.end == base + len);
+			kinds[at] = (*hole, if loaders { bootproto::MEM_BOOTLOADER } else { bootproto::MEM_RESERVED });
+		}
+		crate::mem::retain_memmap(&crate::arch::common::bootmem::retained_map(&regions, (load, paging::usable_region(0).0), &kinds[..hole_count]));
+	}
 	{
 		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		for i in 0..8 {

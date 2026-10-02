@@ -246,6 +246,41 @@ pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &
 	written
 }
 
+// THE MAP A DEVICE-TREE PORT RETAINS (`mem::retain_memmap`): the pool's regions as usable, the kernel image as the
+// kernel's, and each hole by the kind the caller gives it - a loader's reservation or the tree's blob as the loader's, a
+// firmware's reservation as reserved. Each range is widened to whole pages, and a page already taken by an earlier range
+// is not taken again: a hibernation's snapshot copies the kernel's and the loader's ranges whole, as x86_64's loader map
+// has it copy them, and a page named twice would be an image the restore refuses - while a firmware's reservation, which
+// a machine may protect from this kernel altogether, is never read. Sorted by base.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub fn retained_map(pool: &[MemRegion], kernel: (u64, u64), holes: &[(Hole, u32)]) -> alloc::vec::Vec<MemRegion> {
+	let mut out: alloc::vec::Vec<MemRegion> = pool.iter().filter(|region| region.length != 0).copied().collect();
+	let candidates = core::iter::once((Hole { start: kernel.0, end: kernel.1 }, bootproto::MEM_KERNEL)).chain(holes.iter().copied());
+	for (hole, kind) in candidates {
+		let (mut start, end) = (hole.start & !(PAGE - 1), (hole.end + PAGE - 1) & !(PAGE - 1));
+		// WHAT EARLIER RANGES DO NOT HOLD: walked in order, each overlap skipping the start past it or splitting the range.
+		let mut taken: alloc::vec::Vec<(u64, u64)> = out.iter().map(|region| (region.base, region.base + region.length)).collect();
+		taken.sort_unstable();
+		for (base, top) in taken {
+			if start >= end {
+				break;
+			}
+			if top <= start || base >= end {
+				continue;
+			}
+			if base > start {
+				out.push(MemRegion { base: start, length: base - start, kind, _pad: 0 });
+			}
+			start = start.max(top);
+		}
+		if start < end {
+			out.push(MemRegion { base: start, length: end - start, kind, _pad: 0 });
+		}
+	}
+	out.sort_unstable_by_key(|region| region.base);
+	out
+}
+
 #[cfg(test)]
 mod tests;
 

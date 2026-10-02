@@ -48,9 +48,18 @@ fn class(kind: u32) -> Class {
 	}
 }
 
-// Whether a frame is RAM of a class an image may hold - what a restore's target must be.
-fn image_ram(phys: u64) -> bool {
-	(0..crate::mem::memmap_len()).filter_map(crate::mem::memmap_get).any(|region| class(region.kind) != Class::Never && phys >= region.base && phys + PAGE <= region.base + region.length)
+// Whether a frame is RAM of a class an image may hold - what a restore's target must be. WHERE THE PORT'S DEVICE TREE
+// DESCRIBES THE RAM (`banks`), a frame of a bank may hold an image page though this boot's firmware keeps it as its own
+// reserved or runtime memory: a UEFI firmware moves those by a page or two from boot to boot of one machine, and nothing
+// this kernel runs calls back into them. Device memory and bad memory never.
+type Banks = Option<([(u64, u64); fdt::MAX_RAM_REGIONS], usize)>;
+
+fn image_ram(phys: u64, banks: &Banks) -> bool {
+	let regions = || (0..crate::mem::memmap_len()).filter_map(crate::mem::memmap_get);
+	match banks {
+		Some((banks, count)) => banks[..*count].iter().any(|&(base, length)| phys >= base && phys + PAGE <= base + length) && !regions().any(|region| matches!(region.kind, bootproto::MEM_MMIO | bootproto::MEM_BAD) && phys < region.base + region.length && region.base < phys + PAGE),
+		None => regions().any(|region| class(region.kind) != Class::Never && phys >= region.base && phys + PAGE <= region.base + region.length),
+	}
 }
 
 // The end of RAM: the highest address any region of the memory map reaches.
@@ -541,7 +550,9 @@ pub fn begin(count: u64, context: [u8; SNAPSHOT_CONTEXT], mut frame_at: impl FnM
 	if let Some(old) = RESTORE.lock().take() {
 		old.release();
 	}
-	let top = ram_top();
+	// THE BANKS READ ONCE, and the top of RAM the bitmap covers theirs too.
+	let banks = crate::arch::sleep::ram_banks();
+	let top = banks.as_ref().map_or(0, |(banks, count)| banks[..*count].iter().map(|&(base, length)| base + length).max().unwrap_or(0)).max(ram_top());
 	let targets = Bitmap::new(top)?;
 	for index in 0..count {
 		let phys = match frame_at(index) {
@@ -551,7 +562,7 @@ pub fn begin(count: u64, context: [u8; SNAPSHOT_CONTEXT], mut frame_at: impl FnM
 				return Err(error);
 			}
 		};
-		if phys % PAGE != 0 || phys == 0 || phys >= top || !image_ram(phys) || targets.set(phys) != Some(false) {
+		if phys % PAGE != 0 || phys == 0 || phys >= top || !image_ram(phys, &banks) || targets.set(phys) != Some(false) {
 			targets.free();
 			return Err(ERR_INVALID);
 		}

@@ -366,12 +366,14 @@ impl Component {
 		}
 		// AT MOST ONCE: the header invalidated before anything is stopped.
 		self.invalidate()?;
-		let _ = self.area().verdict(&true);
-		say(&format!("the image is authenticated and in the kernel - {} pages; every binding is stopped and memory replaced", header.pages));
+		// EVERY BINDING STOPPED BEFORE ANYTHING ELSE: a device still running would write into memory being replaced. A door
+		// that does not answer - the bring-up gave up waiting - refuses the image rather than replace memory under one.
 		match hibernation_restore::Client::with_deadline(ChannelTransport { chan: self.restore }, clock().saturating_add(2 * CALL_TICKS)).prepare_replacement() {
 			Some(Ok(())) => {}
-			other => say(&format!("the restore's door answered {other:?} - memory is replaced all the same")),
+			other => return Err(format!("the restore's door did not stop every binding ({other:?}), so memory is not replaced under them")),
 		}
+		let _ = self.area().verdict(&true);
+		say(&format!("the image is authenticated and in the kernel - {} pages; every binding is stopped and memory replaced", header.pages));
 		let answer = restore_commit(self.privilege, false);
 		// ONLY WHEN IT DID NOT HAPPEN.
 		Err(format!("the kernel could not replace memory ({answer})"))

@@ -53,6 +53,9 @@ SECTIONS
 
 	/* Higher-half kernel: virtual = KOFF + physical (load address). */
 	. = __boot_phys_end + KOFF;
+	/* Where the kernel was loaded, as a higher-half address the kernel can take: the start of the image a hibernation's
+	 * snapshot copies whole (`bootmem::retained_map`). */
+	__kernel_load = ADDR(.boot) + KOFF;
 	/* The read-execute span, as higher-half addresses - `harden_direct_map` masks KOFF off, the way
 	 * `usable_region` already does for `__kernel_end`. */
 	__kernel_rx_start = .;

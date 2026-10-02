@@ -29,8 +29,10 @@ pub(super) static JOURNAL_OWED: AtomicU64 = AtomicU64::new(0);
 // How long DeviceManager's teardown may take before the restore goes on without its answer.
 const STOP_TICKS: u64 = 60 * TICKS_PER_SECOND;
 // HOW LONG THE BRING-UP WAITS FOR THE VERDICT: the TPM's own minute, and an image as large as memory read, authenticated
-// and decrypted.
-const VERDICT_TICKS: u64 = 15 * 60 * TICKS_PER_SECOND;
+// and decrypted - which on an emulated aarch64 or riscv64 machine took past the fifteen minutes this once was, with the
+// boot then going on while the image component still asked for every binding to be stopped. An hour: the wait ends at
+// the verdict, so only a component that never gives one is held this long.
+const VERDICT_TICKS: u64 = 60 * 60 * TICKS_PER_SECOND;
 
 // Whether `boot-continues` has been answered at this boot.
 static VERDICT: AtomicBool = AtomicBool::new(false);

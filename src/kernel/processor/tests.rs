@@ -205,7 +205,8 @@ fn a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request
 // (PSCI's CPU_OFF, the SBI's HART_STOP) - what a power-down state does to it, which QEMU's firmwares do not - and this core
 // turns it on again at the resume entry with its record (CPU_ON, HART_START): it comes back through the path its boot
 // came through, with its context - the call that saved it answers `RESUMED` on the stack it was made on - and with its
-// interrupt controller interface and its timer: a thread on it sleeps on its own timer and is woken.
+// interrupt controller interface and its timer: a thread spawned on it runs, and its tick preempts a thread spinning on
+// it for one put there with no wake.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 crate::tagged_test!(a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through, [Kernel], id = "kernel.processor.a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through", covers = ["kernel"]);
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -214,8 +215,7 @@ fn a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_throu
 	static STAGE: AtomicU32 = AtomicU32::new(0);
 	static ANSWER: AtomicI64 = AtomicI64::new(0);
 	static ON: AtomicU32 = AtomicU32::new(u32::MAX);
-	static SLEPT: AtomicU32 = AtomicU32::new(0);
-	const NAP: u64 = u64::MAX - 0x5e5;
+	static PREEMPTED: AtomicU32 = AtomicU32::new(0);
 	extern "C" fn off_and_back(_: u64) {
 		crate::arch::disable_interrupts();
 		STAGE.store(1, Ordering::Release);
@@ -225,17 +225,15 @@ fn a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_throu
 		crate::arch::enable_interrupts();
 		STAGE.store(2, Ordering::Release);
 	}
-	extern "C" fn sleeps(_: u64) {
-		crate::sched::block_on(NAP, crate::arch::apic::ticks() + 3);
-		SLEPT.store(crate::sched::current_cpu_id() as u32 + 1, Ordering::Release);
-	}
+	const PAUSE: u64 = u64::MAX - 0x5e6;
 	assert!(crate::smp::cpu_count() >= 2, "the suite boots more than one core");
+	// WAITED FOR A TICK AT A TIME, BLOCKED: the boot core expires every deadline, and one that spun here would never
+	// expire the sleeping thread's.
 	let wait = |what: &str, done: &dyn Fn() -> bool| {
-		let mut spins = 0u64;
+		let bound = crate::arch::apic::ticks() + 60 * abi::TICKS_PER_SECOND;
 		while !done() {
-			assert!(spins < 2_000_000_000, "{what} within its bound");
-			spins += 1;
-			core::hint::spin_loop();
+			assert!(crate::arch::apic::ticks() < bound, "{what} within its bound");
+			crate::sched::block_on(PAUSE, crate::arch::apic::ticks() + 1);
 		}
 	};
 	STAGE.store(0, Ordering::Release);
@@ -247,9 +245,32 @@ fn a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_throu
 	assert_eq!(ANSWER.load(Ordering::Acquire), crate::arch::resume::RESUMED, "the call that saved the context answered through the entry");
 	assert_eq!(ON.load(Ordering::Acquire), 1, "on the core that turned off, on the stack it was made on");
 	assert_eq!(crate::arch::resume::resumes(), resumes + 1);
-	// ITS TIMER AND ITS INTERRUPTS: a thread on it sleeps three ticks on its own timer and is woken.
-	SLEPT.store(0, Ordering::Release);
-	let _sleeper = crate::sched::spawn_on(1, sleeps, 0);
-	wait("a thread on core 1 woken by its timer", &|| SLEPT.load(Ordering::Acquire) != 0);
-	assert_eq!(SLEPT.load(Ordering::Acquire), 2, "on core 1");
+	// ITS INTERRUPTS: a thread spawned on it runs - the wake IPI reaches it.
+	extern "C" fn runs(_: u64) {
+		RAN.store(crate::sched::current_cpu_id() as u32 + 1, Ordering::Release);
+	}
+	static RAN: AtomicU32 = AtomicU32::new(0);
+	RAN.store(0, Ordering::Release);
+	let _runner = crate::sched::spawn_on(1, runs, 0);
+	wait("a thread spawned on core 1 run", &|| RAN.load(Ordering::Acquire) != 0);
+	assert_eq!(RAN.load(Ordering::Acquire), 2, "on core 1");
+	// AND ITS TIMER: a thread spinning on it is preempted by its tick - the second thread is put on core 1 with no wake, so
+	// only core 1's own timer runs it.
+	static SPINNING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+	extern "C" fn spins(_: u64) {
+		SPINNING.store(true, Ordering::Release);
+		while SPINNING.load(Ordering::Acquire) {
+			core::hint::spin_loop();
+		}
+	}
+	extern "C" fn preempts(_: u64) {
+		PREEMPTED.store(crate::sched::current_cpu_id() as u32 + 1, Ordering::Release);
+		SPINNING.store(false, Ordering::Release);
+	}
+	PREEMPTED.store(0, Ordering::Release);
+	let _spinner = crate::sched::spawn_on(1, spins, 0);
+	wait("the spinning thread on core 1", &|| SPINNING.load(Ordering::Acquire));
+	let _preempter = crate::sched::spawn_on_unwoken(1, preempts, 0);
+	wait("core 1's tick preempting the spinning thread", &|| PREEMPTED.load(Ordering::Acquire) != 0);
+	assert_eq!(PREEMPTED.load(Ordering::Acquire), 2, "on core 1");
 }

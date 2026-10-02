@@ -638,6 +638,10 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// `arch::common::bootmem` for how long that held and what ended it.
 	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; crate::arch::common::bootmem::MAX_HOLES];
 	let mut hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
+	// WHICH HOLES ARE THE LOADER'S: these first ones, the tree's blob and the archive below - every other one the
+	// tree's, a firmware's (`bootmem::retained_map`).
+	let loader_holes = hole_count;
+	let blob = unsafe { super::dtb::located(dtb) }.and_then(|tree| tree.extent());
 	// AND WHAT THE DEVICE TREE RESERVES, including the blob itself - none of which anything carved.
 	//
 	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
@@ -662,6 +666,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// and knows nothing about a range the runner loaded with `-device loader`. Those are the bytes
 	// every program's ELF image is read from for the whole life of the boot, so a pool spanning
 	// them hands one out - the `BadImage` this milestone has already paid for once.
+	let tree_holes = hole_count;
 	if let Some((base, len)) = archive {
 		if hole_count < holes.len() {
 			holes[hole_count] = crate::arch::common::bootmem::Hole { start: base, end: base + len };
@@ -733,7 +738,19 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	}
 	// Retain the boot memory map now the heap is up, so SYS_MEMMAP_GET (lsmem) can
 	// report the physical layout - the x86 loader path retains it inside mem::init.
-	crate::mem::retain_memmap(&regions);
+	{
+		unsafe extern "C" {
+			static __kernel_load: u8;
+		}
+		// A higher-half symbol, its offset taken off; the image runs to the first page the pool may hand out.
+		let load = (&raw const __kernel_load as u64) & !paging::KERNEL_VA_OFFSET;
+		let mut kinds = [(crate::arch::common::bootmem::Hole { start: 0, end: 0 }, bootproto::MEM_RESERVED); crate::arch::common::bootmem::MAX_HOLES];
+		for (at, hole) in holes[..hole_count].iter().enumerate() {
+			let loaders = at < loader_holes || at >= tree_holes || blob.is_some_and(|(base, len)| hole.start == base && hole.end == base + len);
+			kinds[at] = (*hole, if loaders { bootproto::MEM_BOOTLOADER } else { bootproto::MEM_RESERVED });
+		}
+		crate::mem::retain_memmap(&crate::arch::common::bootmem::retained_map(&regions, (load, paging::usable_region(0).0), &kinds[..hole_count]));
+	}
 	// Bring up the early framebuffer console so the kernel draws the boot log to the
 	// display pixel-by-pixel like x86 - QEMU virt has no VGA, so without one the boot is
 	// serial-only. The UEFI loader hands a GOP framebuffer in the BootInfo (drawn to
