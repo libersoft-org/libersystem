@@ -644,3 +644,72 @@ neither could be shown working, and both are left open in the milestone for hard
 Status: implemented and verified on x86_64; suspend to idle verified on all three targets; OPEN as above, and for the
 owner's decisions (the policy's defaults; a passphrase where no TPM can seal - see also the owner's note in
 `NOTES.md`, "hybernation doesn't work without TPM - allow it with warning").
+
+## The owner's decisions, built (2026-10-02)
+
+The owner answered the open questions (2026-10-02): closing the lid only turns the display off and does not suspend;
+on battery the idle timeout suspends nothing; a critical battery does not put the machine to sleep either; hibernation
+without a TPM is allowed, with a warning when it is enabled, and no passphrase is asked at the resume.
+
+WHAT WAS DONE:
+- `display-outputs` gained `set-power(on)` (`src/idl/display.lsidl`, regenerated): DisplayService's `dark` state -
+  the scanout zeroed and flushed, every present completed `discarded-occluded` in order while dark, `present_active_full`
+  a no-op while dark and the visible surface drawn whole when the screen comes on; the protected screen is not taken
+  while dark (`lock_screen` answers `unsupported`, as for a lost scanout) and a prompt held when the screen goes off is
+  refused rather than shown (`show_screen` answers `unsupported`).
+- `service_logic::sleep_policy` rewritten around the owner's defaults: `Settings { lid: LidAction, idle_suspends_on_battery,
+  idle_after_seconds, critical: CriticalAction }`, default `ScreenOff` / false / 900 s / `PowerOff`; new actions
+  `ScreenOff` and `ScreenOn`; the lid's first state counts as an edge (a relaunched instance turns on a screen an earlier
+  one turned off); an external display in use keeps the lid from acting either way; `Settings::from_keys` reads
+  `power.lid` (`screen-off`|`suspend`|`nothing`), `power.idle-suspend` (`on`|`off`), `power.idle-after-s` (> 0) and
+  `power.critical` (`power-off`|`hibernate`|`nothing`), a refused value naming its key and keeping the default.
+  13 host tests (`sleep_policy::tests`).
+- PowerService: an optional CONFIG client role (`liber:config@1/config`, ConfigService added to its dependencies) read
+  once at every start - the settings said on the console in one line ("closing the lid turns the screen off, idleness
+  after 900 s suspends nothing, a critical battery powers off in order"); the screen actions go through its OUTPUTS
+  client's `set-power`; a critical battery under the default says "a battery is critical - powers the machine off in
+  order" and runs the existing orderly power-off (forced deadline, then `system-shutdown`).
+- Hibernation without a sealing TPM (`service_logic::hibernation`, `hibernation_service`): the header carries a
+  KEY PROTECTION word at offset 20 (1 = sealed through TpmService, 2 = in the clear), authenticated with the rest; a
+  key in the clear is the key-encryption key itself where the sealed blob goes (`Header::clear_key`). The image
+  component's `sealing()` answers Seals / Absent(why) / Failed(why): absent - no grant, no TPM bound, or an owner
+  hierarchy that seals nothing - is SET UP WITH THE WARNING in the status's `why` ("WARNING: ..., so the image's key is
+  written beside it in the clear - anyone who can read the disk reads every secret that was in memory, and anyone who
+  can write it can make the machine resume what they wrote") and the image written in the clear with the warning on
+  the console; a TPM that answers wrongly is still "not set up". A RESTORE of an image in the clear is refused on a
+  machine whose TPM seals (`Refusal::ClearOnSealingMachine`), after giving a late TPM the same 60 s an unseal gets - so
+  an image in the clear is no way around a TPM's seal. `sleepctl status` prints "hibernation: set up - WARNING: ...",
+  and `sleepctl hibernate` prints the warning before it asks. No passphrase is offered. 9 host tests
+  (`hibernation::tests`, one new).
+- The gates follow the defaults: `sleep` - the lid closed turns the screen off (QEMU's screendump black, a line typed
+  then still black, the machine running, no transaction) and opened turns it on (not black); `power.lid suspend` set,
+  the power service killed and relaunched, the relaunched instance reading it and suspending to RAM on the lid with the
+  device power states checked, the key given back to `screen-off` once read; the battery boot's critical battery
+  powering off in order with no hibernation asked. `hibernate` - case 7 is now WITHOUT A TPM: set up with the warning,
+  an image written with its key in the clear and restored on a boot still without one (the counter going on), and such
+  an image refused on a boot whose TPM seals.
+
+VERIFICATION:
+- `./gen.sh` -> ok (display-outputs `set-power`; the `hibernation-status` and `sleep-status` docs).
+- `cargo test --offline --manifest-path src/user/services/logic/Cargo.toml` -> 746 passed (sleep_policy 13,
+  hibernation 9).
+- `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64 --part user` -> ok.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate qemu-admin-path` -> PASS (DisplayService's protected screen with the dark
+  state in); `power-service` -> PASS; `source-hygiene`, `staged-consistency`, `dependency-policy` -> PASS.
+- `dynamic-report` -> FAIL on the first run: only byte counts moved (powerctl, sleepctl, the providers whose protocol
+  crates changed) - no import, owner or residual. `./check.sh --refresh dynamic-report` rewrote the tracked reports.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate hibernate` -> PASS in 2463 s, twelve boots (2026-10-02): every case before,
+  and "no TPM: set up with the warning, the image written with its key in the clear and restored - the counter went
+  on" (count 79 then 80, monotonic +3028 ms, boot-time +254028 ms) and "clear-on-tpm: refused (its key is in the
+  clear, and this machine), the machine booted fresh and the header is invalidated".
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate sleep` -> FAIL once on the TAD stamp: `mdir` printed `5:09`, the hour under
+  ten padded with a space, and the check's pattern wanted two digits (it had passed with hours past ten). The pattern
+  takes one or two digits now.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate sleep` -> PASS in 1869 s (2026-10-02): "closing the lid turned the screen
+  off - black, a typed line unseen - and suspended nothing; opening it turned the screen on"; "the lid set to suspend,
+  the relaunched power service suspended to RAM on it, and the TAD's clock measured the sleep" with the device power
+  states as before; "a critical battery powered the machine off in order through the relaunched policy, as the owner's
+  default has it, QEMU gone 10127 ms after the 10 s deadline was armed"; every other case as before.
+
+LEFT FOR THE OWNER: whether a critical battery should still power the machine off in order (the default built) or do
+nothing at all - the answer said "suspend off" and did not name the power-off, which protects the filesystems.

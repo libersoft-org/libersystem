@@ -338,8 +338,7 @@ static ROOT_DOMAIN: SpinLock<Option<Arc<Domain>>> = SpinLock::new(None);
 static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
 // The kernel's own page-table root - what an S3 entry runs on, since every other root lacks the identity map it
-// reinstates.
-#[cfg(any(test, target_arch = "x86_64"))]
+// reinstates, and what a hibernation image's context names.
 pub fn kernel_cr3() -> u64 {
 	KERNEL_CR3.load(Ordering::Acquire)
 }

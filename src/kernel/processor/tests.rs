@@ -124,9 +124,12 @@ fn a_cppc_preference_is_written_only_where_the_table_names_its_register() {
 }
 
 // THE DEVICE TREE'S STATES, on the device-tree ports: three as `/cpus/idle-states` describes them - a retention state, a
-// deeper one, and one that loses the core's context - installed on this core the way the boot installs a tree's,
-// entered through the firmware (PSCI's CPU_SUSPEND, the SBI's HART_SUSPEND) by idle periods, the one that loses the
-// context never, and a latency request below the deeper state's wake keeping the core in the retention state.
+// deeper one, and one that loses the core's context - installed on this core the way the boot installs a tree's and
+// entered through the firmware (PSCI's CPU_SUSPEND, the SBI's HART_SUSPEND) by idle periods. A long one enters the deep
+// state; within a latency request of 1000 us the deepest left is the one that loses the context, entered through the
+// per-core resume path - on riscv64, whose OpenSBI ends a non-retentive suspend at the resume address, the hart came back
+// through the entry; QEMU's PSCI ends a power-down state as a wait, so on aarch64 the call returned with the context
+// kept - and within a request of 300 us the retention state.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 crate::tagged_test!(a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request, [Kernel], id = "kernel.processor.a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request", covers = ["kernel"]);
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -152,7 +155,7 @@ fn a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request
 	let info = crate::idle::info(cpu).expect("the core's record");
 	assert_eq!(info.state_count, 4, "the halt and the tree's three");
 	assert_eq!([info.states[1].exit_latency_us, info.states[2].exit_latency_us, info.states[3].exit_latency_us], [60, 350, 2000]);
-	assert_ne!(info.states[2].unenterable, 0, "the state that loses the core's context is held out of the governor's choices");
+	assert_eq!(info.states[2].unenterable, 0, "the state that loses the core's context is enterable: the per-core resume path brings the core back");
 	let refused = crate::arch::processor::firmware_refusals();
 	let entries = || -> [u64; 4] { core::array::from_fn(|at| super::COUNTS[cpu].entries[at].load(Ordering::Relaxed)) };
 	let lost = entries()[2];
@@ -169,18 +172,84 @@ fn a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request
 	idle();
 	let after = entries();
 	assert_eq!(after[3], before[3] + 1, "a long idle period enters the deep state ({before:?}, then {after:?})");
-	assert_eq!(after[2], before[2], "never the state that loses the context");
-	// A REQUEST OF 1000 US: the deep state's 2000 us wake is past it, and the retention state is the deepest left.
+	// A REQUEST OF 1000 US: the deep state's 2000 us wake is past it, and the one that loses the context - 350 us - is the
+	// deepest left.
 	let request = crate::object::latency_request::LatencyRequest::new().expect("a request");
 	use crate::object::KernelObject;
 	super::latency_add(9_000_002, request.header().koid(), 1000).expect("room for one");
+	let resumes = crate::arch::resume::resumes();
 	let bounded = entries();
 	idle();
 	let within = entries();
-	assert_eq!((within[1], within[3]), (bounded[1] + 1, bounded[3]), "within the request the retention state, not the deep one ({bounded:?}, then {within:?})");
+	assert_eq!((within[2], within[3]), (bounded[2] + 1, bounded[3]), "within the request the state that loses the context, not the deep one ({bounded:?}, then {within:?})");
+	#[cfg(target_arch = "riscv64")]
+	assert_eq!(crate::arch::resume::resumes(), resumes + 1, "the hart came back through the resume entry");
+	#[cfg(target_arch = "aarch64")]
+	let _ = resumes;
+	drop(request);
+	// A REQUEST OF 300 US: only the retention state's 60 us wake is within it.
+	let request = crate::object::latency_request::LatencyRequest::new().expect("a request");
+	super::latency_add(9_000_003, request.header().koid(), 300).expect("room for one");
+	let bounded = entries();
+	idle();
+	let within = entries();
+	assert_eq!((within[1], within[2], within[3]), (bounded[1] + 1, bounded[2], bounded[3]), "within the request the retention state ({bounded:?}, then {within:?})");
 	drop(request);
 	assert_eq!(super::BOUND.load(Ordering::Acquire), u32::MAX);
-	assert_eq!(entries()[2], lost, "the state that loses the context was never entered");
+	assert!(entries()[2] > lost, "the state that loses the context was entered");
 	assert_eq!(crate::arch::processor::firmware_refusals(), refused, "every entry was the firmware's, none the halt's instead");
 	assert_eq!(super::install_idle(cpu, &[]), 0);
+}
+
+// THE PER-CORE RESUME PATH, ONE OPERATION, on the device-tree ports: core 1 saves its context and turns itself off
+// (PSCI's CPU_OFF, the SBI's HART_STOP) - what a power-down state does to it, which QEMU's firmwares do not - and this core
+// turns it on again at the resume entry with its record (CPU_ON, HART_START): it comes back through the path its boot
+// came through, with its context - the call that saved it answers `RESUMED` on the stack it was made on - and with its
+// interrupt controller interface and its timer: a thread on it sleeps on its own timer and is woken.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+crate::tagged_test!(a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through, [Kernel], id = "kernel.processor.a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through", covers = ["kernel"]);
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through() {
+	use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+	static STAGE: AtomicU32 = AtomicU32::new(0);
+	static ANSWER: AtomicI64 = AtomicI64::new(0);
+	static ON: AtomicU32 = AtomicU32::new(u32::MAX);
+	static SLEPT: AtomicU32 = AtomicU32::new(0);
+	const NAP: u64 = u64::MAX - 0x5e5;
+	extern "C" fn off_and_back(_: u64) {
+		crate::arch::disable_interrupts();
+		STAGE.store(1, Ordering::Release);
+		let answer = crate::arch::resume::save_and_leave(crate::arch::resume::off_leave, 0);
+		ANSWER.store(answer, Ordering::Release);
+		ON.store(crate::sched::current_cpu_id() as u32, Ordering::Release);
+		crate::arch::enable_interrupts();
+		STAGE.store(2, Ordering::Release);
+	}
+	extern "C" fn sleeps(_: u64) {
+		crate::sched::block_on(NAP, crate::arch::apic::ticks() + 3);
+		SLEPT.store(crate::sched::current_cpu_id() as u32 + 1, Ordering::Release);
+	}
+	assert!(crate::smp::cpu_count() >= 2, "the suite boots more than one core");
+	let wait = |what: &str, done: &dyn Fn() -> bool| {
+		let mut spins = 0u64;
+		while !done() {
+			assert!(spins < 2_000_000_000, "{what} within its bound");
+			spins += 1;
+			core::hint::spin_loop();
+		}
+	};
+	STAGE.store(0, Ordering::Release);
+	let resumes = crate::arch::resume::resumes();
+	let _off = crate::sched::spawn_on(1, off_and_back, 0);
+	wait("core 1 off with its context saved", &|| STAGE.load(Ordering::Acquire) == 1 && crate::arch::resume::stopped(1));
+	assert_eq!(crate::arch::resume::start_saved(1), 0, "the firmware turned core 1 on at the resume entry");
+	wait("core 1 back", &|| STAGE.load(Ordering::Acquire) == 2);
+	assert_eq!(ANSWER.load(Ordering::Acquire), crate::arch::resume::RESUMED, "the call that saved the context answered through the entry");
+	assert_eq!(ON.load(Ordering::Acquire), 1, "on the core that turned off, on the stack it was made on");
+	assert_eq!(crate::arch::resume::resumes(), resumes + 1);
+	// ITS TIMER AND ITS INTERRUPTS: a thread on it sleeps three ticks on its own timer and is woken.
+	SLEPT.store(0, Ordering::Release);
+	let _sleeper = crate::sched::spawn_on(1, sleeps, 0);
+	wait("a thread on core 1 woken by its timer", &|| SLEPT.load(Ordering::Acquire) != 0);
+	assert_eq!(SLEPT.load(Ordering::Acquire), 2, "on core 1");
 }

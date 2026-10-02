@@ -37,6 +37,9 @@
 #   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
+#   ENTROPY=1   a `virtio-rng-pci` on an aarch64 or riscv64 run outside the suite, which has its own: neither port has
+#               a random instruction, so without a device `SYS_RANDOM_GET` refuses - and a hibernation's keys are drawn
+#               from it
 #   RUN_DISK=   a system disk that outlives the run: created if absent - from the volume the medium is
 #               paired with, where there is one - and used as it is if present, so two boots can share
 #               one disk for a cold-reboot proof
@@ -2704,6 +2707,10 @@ qemu_run_aarch64() {
 		if [[ "$reduced" != "1" ]]; then
 			# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 			qemu_attach_virt_interactive qemu_args -aarch64 "$virtio_opts"
+			# AN ENTROPY DEVICE WHEN ASKED (`ENTROPY=1`) - see `qemu_attach_entropy`.
+			if [[ "${ENTROPY:-0}" == "1" ]]; then
+				qemu_attach_entropy qemu_args "$virtio_opts"
+			fi
 			# The development profile is not x86_64's alone: a scenario has to be runnable against
 			# a cold boot of every target, and what that needs is a guest that names the profile
 			# (so DeviceManager starts an agent) and a channel for the agent to answer on.
@@ -3074,6 +3081,10 @@ qemu_run_riscv64() {
 		if [[ "$reduced" != "1" ]]; then
 			# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 			qemu_attach_virt_interactive qemu_args -riscv64 "$virtio_opts"
+			# AN ENTROPY DEVICE WHEN ASKED (`ENTROPY=1`) - see `qemu_attach_entropy`.
+			if [[ "${ENTROPY:-0}" == "1" ]]; then
+				qemu_attach_entropy qemu_args "$virtio_opts"
+			fi
 			if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 				qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
 				qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"

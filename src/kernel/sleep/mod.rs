@@ -13,7 +13,9 @@
 // a sleep. The boot-time clock takes the sleep in.
 //
 // SUSPEND TO RAM is the firmware's transition, x86_64's alone here (`arch::sleep`), entered from the boot core's idle
-// context once every other core is parked.
+// context once every other core is parked (`boot_core`). HIBERNATION's snapshot and a restore's replacement are entered
+// there too, on every port: x86_64's own (`arch::x86_64::hibernate`), the device-tree ports' through the per-core resume
+// path (`image`).
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -69,7 +71,7 @@ pub fn states() -> u64 {
 		bits |= 1 << abi::SLEEP_STATE_RAM;
 	}
 	// HIBERNATION'S KERNEL HALF: the snapshot, and `\_S4` or soft-off after it. Whether the machine is SET UP for it -
-	// a hibernation partition, a TPM to seal the key - is the image component's to say.
+	// a hibernation partition, and whether a TPM seals the key - is the image component's to say.
 	if arch::sleep::offers_disk() {
 		bits |= 1 << abi::SLEEP_STATE_DISK;
 	}
@@ -117,8 +119,7 @@ pub fn set_clock_base(unix: u64) -> i64 {
 	0
 }
 
-// A suspend to RAM with no RTC to measure it: its length comes with the next base.
-#[cfg(target_arch = "x86_64")]
+// A suspend to RAM or a restore with no RTC to measure it: its length comes with the next base.
 pub fn slept_unknown() {
 	SLEPT_UNKNOWN.store(true, Ordering::Release);
 }
@@ -332,4 +333,7 @@ fn park_here(wake_at: Option<u64>) -> (u32, u32) {
 #[cfg(test)]
 mod tests;
 
+pub mod boot_core;
 pub mod disk;
+#[cfg(not(target_arch = "x86_64"))]
+pub mod image;

@@ -23,7 +23,9 @@
 #   6. HYBRID SLEEP: the image written, then S3 instead of the power-off. Woken by the host, the machine runs on and the
 #      image is discarded. Again, and QEMU killed while suspended - the battery that died in the night: the next boot
 #      restores the image, and the counter goes on.
-#   7. NOT SET UP: a boot with no TPM says hibernation is not set up, and a hibernate is refused.
+#   7. WITHOUT A TPM: hibernation is set up, with the warning in `sleepctl status`; an image is written with its key in the
+#      clear - the line saying so carries the warning, and the header says so - and a new QEMU, still without a TPM,
+#      restores it with the counter going on. Then such an image, written again, is refused on a boot whose TPM seals.
 # AFTER EVERY REFUSAL the header is invalidated on the disk and `sleepctl status` names why.
 #
 # IT BOOTS ITS OWN INSTANCES in private state, one at a time, and takes the last one down from the EXIT trap.
@@ -249,6 +251,17 @@ else:
 EOF
 }
 
+# HOW THE HEADER KEEPS THE IMAGE'S KEY: `tpm` (sealed) or `clear`.
+protection() {
+	python3 - "$disk" "$area_at" <<'EOF'
+import struct, sys
+with open(sys.argv[1], 'rb') as disk:
+	disk.seek(int(sys.argv[2]))
+	block = disk.read(24)
+print({1: 'tpm', 2: 'clear'}.get(struct.unpack_from('<I', block, 20)[0], 'unknown'))
+EOF
+}
+
 # ONE BYTE OF CHUNK 2's DATA flipped on the host: the image's authentication must fail.
 modify_image() {
 	python3 - "$disk" "$area_at" <<'EOF'
@@ -462,12 +475,27 @@ await_line "ServiceManager: sleep: the transaction ended - slept and woke" "hybr
 counter_goes_on hybrid-restore counter-hybrid.txt "$((off_ms / 2))"
 say "hybrid: the power lost in S3, the next boot restored the image"
 
-# 7. NOT SET UP.
+# 7. WITHOUT A TPM: set up and warned, written in the clear and restored; and refused where a TPM seals.
+NO_TPM_WARNING="WARNING: no TPM is bound to seal the image's key, so the image's key is written beside it in the clear"
 boot no-tpm "$S_OFFERED" none
 status="$(status_line no-tpm)"
-grep -q "hibernation: not set up - no TPM is bound" <<<"$status" || fail "no-tpm: the status does not say hibernation is not set up for want of a TPM: $status"
-launch sleepctl hibernate >"$state/sleepctl-no-tpm.log" 2>&1 || true
-grep -q "hibernation was refused" "$state/sleepctl-no-tpm.log" || fail "no-tpm: a hibernate was not refused: $(cat "$state/sleepctl-no-tpm.log")"
-say "no TPM: hibernation is not set up, and a hibernate is refused"
+grep -q -F "hibernation: set up - $NO_TPM_WARNING" <<<"$status" || fail "no-tpm: the status does not say hibernation is set up with the warning: $status"
+start_counter counter-no-tpm.txt
+hibernate no-tpm
+grep -a -q -F "its key NOT sealed - $NO_TPM_WARNING" "$serial" || fail "no-tpm: the image written did not say its key is in the clear, with the warning"
+[[ "$(protection)" == clear ]] || fail "no-tpm: the header does not keep the key in the clear ($(protection))"
+off_started=$(date +%s%3N)
+boot no-tpm-restore "$S_OFFERED" none
+await_line "HibernationService: its key was written in the clear - no TPM sealed it" "no-tpm-restore: the image's key was not taken from the header" 0 600
+await_line "HibernationService: the image is authenticated and in the kernel" "no-tpm-restore: the image was not restored" 0 600
+off_ms=$(($(date +%s%3N) - off_started))
+await_line "ServiceManager: sleep: the transaction ended - slept and woke" "no-tpm-restore: the restored machine's transaction did not end" 0 300
+[[ "$(header)" == empty ]] || fail "no-tpm-restore: the header was not invalidated before the jump ($(header))"
+counter_goes_on no-tpm-restore counter-no-tpm.txt "$((off_ms / 2))"
+say "no TPM: set up with the warning, the image written with its key in the clear and restored - the counter went on"
+hibernate no-tpm-again
+[[ "$(protection)" == clear ]] || fail "no-tpm-again: the header does not keep the key in the clear ($(protection))"
+boot clear-on-tpm "$S_OFFERED"
+refused clear-on-tpm "its key is in the clear, and this machine"
 
-say "PASS - $boots boots: an image written and entered S4 (SUSPEND_DISK), restored with the counter going on; the boot after found none; powered off where S4 is not offered; a modified image, another system image and another machine each refused with the header invalidated; hybrid discarded on the S3 resume and restored after the power was lost; not set up without a TPM"
+say "PASS - $boots boots: an image written and entered S4 (SUSPEND_DISK), restored with the counter going on; the boot after found none; powered off where S4 is not offered; a modified image, another system image and another machine each refused with the header invalidated; hybrid discarded on the S3 resume and restored after the power was lost; without a TPM set up with the warning, written with its key in the clear and restored, and such an image refused where a TPM seals"

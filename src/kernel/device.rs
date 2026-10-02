@@ -139,8 +139,8 @@ static DEVICES: SpinLock<Vec<DeviceEntry>> = SpinLock::new(Vec::new());
 // reads it for `lspci`.
 static PCI_FUNCTIONS: SpinLock<Vec<abi::PciInfo>> = SpinLock::new(Vec::new());
 
-// Every function the boot scan found, as (bus, device, function) - what an S3 saves and restores the configuration of.
-#[cfg(target_arch = "x86_64")]
+// Every function the boot scan found, as (bus, device, function) - what an S3 or a hibernation saves and restores the
+// configuration of.
 pub fn pci_addresses() -> Vec<(u8, u8, u8)> {
 	// ALLOC-OK: the S3 entry, before the machine sleeps, bounded by the functions the scan found.
 	PCI_FUNCTIONS.lock().iter().map(|info| (info.bus, info.dev, info.func)).collect()

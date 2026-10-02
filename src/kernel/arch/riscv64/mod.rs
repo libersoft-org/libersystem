@@ -72,6 +72,7 @@ pub fn device_tree() -> Option<fdt::Fdt> {
 
 pub mod platform;
 pub mod processor;
+pub mod resume;
 pub mod serial;
 pub mod sleep;
 pub mod traps;
@@ -361,6 +362,11 @@ pub mod apic {
 	// WHETHER EVERY HART HAS Sstc, read from the device tree at init: `stimecmp` is then this supervisor's own
 	// compare register and a timer is one CSR write rather than a call into the firmware.
 	static SSTC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+	// Whether `stimecmp` is this kernel's compare register - what the per-core resume path saves with the hart.
+	pub fn has_sstc() -> bool {
+		SSTC.load(Ordering::Relaxed)
+	}
 
 	// The next S-mode timer interrupt at counter reading `when` - `u64::MAX` for none - which also clears the
 	// pending timer bit.

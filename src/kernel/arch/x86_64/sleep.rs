@@ -25,13 +25,13 @@
 // delivered as a press, and every other core is restarted through the trampoline.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 
-use abi::{ERR_ACCESS_DENIED, ERR_INVALID, ERR_TIMED_OUT, ERR_UNSUPPORTED, SleepReport};
+use abi::{ERR_INVALID, ERR_TIMED_OUT, ERR_UNSUPPORTED, SleepReport};
 
 use super::port::{inw, outw};
 use crate::arch::common::time::CLOCK;
-use crate::sync::SpinLock;
+use crate::sleep::boot_core::{self, Kind};
 
 // ------------------------------------------------------------------ the portable hooks
 
@@ -92,41 +92,29 @@ pub fn unmask_device_lines() {
 
 // ------------------------------------------------------------------ the request
 
-// WHAT THE BOOT CORE IS ASKED TO RUN: S3; hibernation's snapshot; or a restore's whole-memory replacement, which
-// answers only when it cannot happen.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-	Ram,
-	Snapshot,
-	Replace,
-}
-
-struct Request {
-	kind: Kind,
-	pair: (u8, u8),
-	after: Option<u64>,
-	answer: Option<Result<SleepReport, i64>>,
-}
-
-static REQUEST: SpinLock<Option<Request>> = SpinLock::new(None);
-// The koid the asking thread blocks on, and whether a request waits for the boot core.
-static REQUEST_KOID: AtomicU64 = AtomicU64::new(0);
-static PENDING: AtomicBool = AtomicBool::new(false);
-
-// SUSPEND TO RAM, asked from any core: the request handed to the boot core's idle context, and this thread blocked
-// until it answers - after the resume, or at a refusal.
+// SUSPEND TO RAM, hibernation's snapshot and a restore's replacement, each asked of the boot core's idle context
+// (`sleep::boot_core`) - where the trampoline the resume path restarts the other cores through exists at all.
 pub fn suspend_to_ram(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
-	ask(Kind::Ram, pair, after)
+	if crate::boot_info().smp_trampoline == 0 {
+		return Err(ERR_UNSUPPORTED);
+	}
+	boot_core::ask(Kind::Ram, pair, after)
 }
 
-// HIBERNATION'S SNAPSHOT, the same way: answered twice - see `hibernate`.
+// HIBERNATION'S SNAPSHOT: answered twice - see `hibernate`.
 pub fn snapshot() -> Result<SleepReport, i64> {
-	ask(Kind::Snapshot, (0, 0), None)
+	if crate::boot_info().smp_trampoline == 0 {
+		return Err(ERR_UNSUPPORTED);
+	}
+	boot_core::ask(Kind::Snapshot, (0, 0), None)
 }
 
-// A RESTORE'S REPLACEMENT, the same way: answered only when it cannot happen.
+// A RESTORE'S REPLACEMENT: answered only when it cannot happen.
 pub fn replace() -> i64 {
-	match ask(Kind::Replace, (0, 0), None) {
+	if crate::boot_info().smp_trampoline == 0 {
+		return ERR_UNSUPPORTED;
+	}
+	match boot_core::ask(Kind::Replace, (0, 0), None) {
 		Ok(_) => ERR_UNSUPPORTED,
 		Err(error) => error,
 	}
@@ -137,58 +125,22 @@ pub use super::hibernate::{context_is_ours, development_variant, enter_disk, ker
 #[cfg(test)]
 pub use super::hibernate::context;
 
-fn ask(kind: Kind, pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
-	if crate::boot_info().smp_trampoline == 0 {
-		return Err(ERR_UNSUPPORTED);
-	}
-	let koid = crate::object::ObjectHeader::new().koid();
-	{
-		let mut request = REQUEST.lock();
-		if request.is_some() {
-			return Err(ERR_ACCESS_DENIED);
-		}
-		*request = Some(Request { kind, pair, after, answer: None });
-	}
-	REQUEST_KOID.store(koid, Ordering::Release);
-	PENDING.store(true, Ordering::Release);
-	crate::idle::wake_core(0);
-	loop {
-		if let Some(answer) = {
-			let mut request = REQUEST.lock();
-			match request.as_mut().and_then(|held| held.answer.take()) {
-				Some(answer) => {
-					*request = None;
-					Some(answer)
-				}
-				None => None,
-			}
-		} {
-			return answer;
-		}
-		crate::sched::block_on_flagged(koid, crate::sched::NO_DEADLINE, false, || REQUEST.lock().as_ref().is_some_and(|held| held.answer.is_some()));
-	}
-}
-
 // Whether a request waits for the boot core's idle context.
 pub fn s3_pending() -> bool {
-	PENDING.load(Ordering::Acquire)
+	boot_core::pending()
 }
 
-// THE BOOT CORE, IDLE: the pending request run, and the asker woken with the answer.
 pub fn run_pending() {
-	if !PENDING.swap(false, Ordering::AcqRel) {
-		return;
-	}
-	let Some((kind, pair, after)) = REQUEST.lock().as_ref().map(|request| (request.kind, request.pair, request.after)) else { return };
-	let answer = match kind {
-		Kind::Ram => run(pair, after),
+	boot_core::run_pending()
+}
+
+// THE BOOT CORE'S RUN OF A REQUEST.
+pub fn run(kind: Kind, pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
+	match kind {
+		Kind::Ram => run_ram(pair, after),
 		Kind::Snapshot => super::hibernate::run_snapshot(),
 		Kind::Replace => Err(crate::sleep::disk::replace_now()),
-	};
-	if let Some(request) = REQUEST.lock().as_mut() {
-		request.answer = Some(answer);
 	}
-	crate::sched::wake_object(REQUEST_KOID.load(Ordering::Acquire));
 }
 
 // ------------------------------------------------------------------ the entry and the resume, on the boot core
@@ -331,7 +283,7 @@ fn facs() -> Option<u64> {
 	Some(crate::mem::hhdm_offset() + phys)
 }
 
-fn run(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
+fn run_ram(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 	let Some(ports) = ports() else { return Err(ERR_UNSUPPORTED) };
 	let Some(facs) = facs() else { return Err(ERR_UNSUPPORTED) };
 	let tramp_phys = crate::boot_info().smp_trampoline;

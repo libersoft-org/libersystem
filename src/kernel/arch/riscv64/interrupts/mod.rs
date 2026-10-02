@@ -518,6 +518,44 @@ pub fn mask_msi_entries() {
 	}
 }
 
+// EVERY ENTRY THE KERNEL PROGRAMMED, ACROSS A HIBERNATION: its address, data and vector control saved as the snapshot
+// found them - the sleep's masks in them - and written back once a restore has given the functions their addresses again,
+// the control last; `unmask_msi_entries` then takes the sleep's masks off.
+static SAVED_MSI: [[core::sync::atomic::AtomicU32; 4]; MAX_MSI] = [const { [const { core::sync::atomic::AtomicU32::new(0) }; 4] }; MAX_MSI];
+
+pub fn save_msi_entries() {
+	for slot in 0..MAX_MSI {
+		let table = SLOT_TABLE[slot].load(core::sync::atomic::Ordering::Acquire);
+		if table == 0 {
+			continue;
+		}
+		let entry = super::paging::phys_to_virt(table) as *const u32;
+		for (word, saved) in SAVED_MSI[slot].iter().enumerate() {
+			// SAFETY: the entry `program_msix_entry` wrote, through the same mapping.
+			saved.store(unsafe { entry.add(word).read_volatile() }, core::sync::atomic::Ordering::Relaxed);
+		}
+	}
+}
+
+pub fn restore_msi_entries() {
+	for slot in 0..MAX_MSI {
+		let table = SLOT_TABLE[slot].load(core::sync::atomic::Ordering::Acquire);
+		if table == 0 {
+			continue;
+		}
+		let entry = super::paging::phys_to_virt(table) as *mut u32;
+		let saved = |word: usize| SAVED_MSI[slot][word].load(core::sync::atomic::Ordering::Relaxed);
+		// SAFETY: as `save_msi_entries`: masked while the message goes back, then the control as saved.
+		unsafe {
+			entry.add(3).write_volatile(1);
+			entry.add(0).write_volatile(saved(0));
+			entry.add(1).write_volatile(saved(1));
+			entry.add(2).write_volatile(saved(2));
+			entry.add(3).write_volatile(saved(3));
+		}
+	}
+}
+
 pub fn unmask_msi_entries() {
 	for slot in 0..MAX_MSI {
 		let table = SLOT_TABLE[slot].load(core::sync::atomic::Ordering::Acquire);

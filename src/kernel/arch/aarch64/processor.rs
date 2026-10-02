@@ -1,7 +1,8 @@
 // THE aarch64 HALF OF PROCESSOR POWER: what the core offers an idle state, and PSCI's CPU_SUSPEND - the entry the device
 // tree's `idle-states` name. The generic timer's counter is the clock and runs on in every state; the core's own timer
-// runs on in every state its tree does not mark `local-timer-stop`, which is that state's own flag here. No state that
-// loses the core's context is entered: this port has no per-core resume path.
+// runs on in every state its tree does not mark `local-timer-stop`, which is that state's own flag here. A state that
+// loses the core's context - a power-down one - is entered through the per-core resume path (`resume`): the context
+// saved, CPU_SUSPEND given the entry, and the core back through it, or returned to where the firmware kept it.
 //
 // NO PROCESSOR REGISTER IS MAPPED. A register-entered idle state or a performance table comes from ACPI's processor
 // objects, which this port does not read (it boots from the device tree), so a table naming a register is refused at
@@ -12,7 +13,7 @@ use super::psci;
 pub const ARCH: procpower::Arch = procpower::Arch::Aarch64;
 
 pub fn cpu() -> procpower::Cpu {
-	procpower::Cpu { mwait: false, invariant_counter: true, timer_always_running: false, context_resume: false }
+	procpower::Cpu { mwait: false, invariant_counter: true, timer_always_running: false, context_resume: true }
 }
 
 pub fn map_register(_phys: u64) -> Result<u64, &'static str> {
@@ -57,9 +58,17 @@ pub fn firmware_refusals() -> u64 {
 }
 
 // A TREE'S STATE, ENTERED with interrupts masked: CPU_SUSPEND returns once an interrupt is pending - masked or not, as WFI
-// does - and the unmask after takes it. A firmware that refuses the call leaves the core in the halt instead, said once.
+// does - and the unmask after takes it; a power-down state goes through the per-core resume path, which returns here as
+// the call would have. A firmware that refuses the call leaves the core in the halt instead, said once.
 pub fn firmware_suspend(parameter: u32) {
-	let status = psci::cpu_suspend(parameter);
+	let status = if state_loses_context(parameter) {
+		match super::resume::save_and_leave(super::resume::suspend_leave, u64::from(parameter)) {
+			super::resume::RESUMED => 0,
+			status => status,
+		}
+	} else {
+		psci::cpu_suspend(parameter)
+	};
 	if status != 0 {
 		REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 		static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

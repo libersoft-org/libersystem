@@ -234,6 +234,96 @@ fn init_distributor_v3() {
 	}
 }
 
+// THE DISTRIBUTOR, WHOLE, ACROSS A HIBERNATION: every SPI's group, enable, priority, trigger and target - its CPU
+// targets on GICv2, its affinity route on GICv3 - and the control register: what a restore's fresh boot reset and set its
+// own way, written back as the image's kernel left it. The SGIs and PPIs are each core's, put back by its own start.
+struct SavedDistributor {
+	control: u32,
+	lines: usize,
+	groups: alloc::vec::Vec<u32>,
+	enables: alloc::vec::Vec<u32>,
+	priorities: alloc::vec::Vec<u32>,
+	triggers: alloc::vec::Vec<u32>,
+	targets: alloc::vec::Vec<u32>,
+	routes: alloc::vec::Vec<u64>,
+}
+
+static SAVED_DISTRIBUTOR: crate::sync::SpinLock<Option<SavedDistributor>> = crate::sync::SpinLock::new(None);
+
+// `count` words read from `offset` up, from word `first`.
+fn read_words(offset: usize, first: usize, count: usize) -> Option<alloc::vec::Vec<u32>> {
+	let mut out = alloc::vec::Vec::new();
+	out.try_reserve_exact(count).ok()?;
+	for word in first..first + count {
+		// SAFETY: a distributor register this port maps, read.
+		out.push(unsafe { core::ptr::read_volatile(gicd(offset + word * 4)) });
+	}
+	Some(out)
+}
+
+fn write_words(offset: usize, first: usize, words: &[u32]) {
+	for (at, &value) in words.iter().enumerate() {
+		// SAFETY: a distributor register this port maps, written as it was read.
+		unsafe { core::ptr::write_volatile(gicd(offset + (first + at) * 4), value) };
+	}
+}
+
+/// The distributor saved; false when there is no memory to save it in.
+pub fn save_distributor() -> bool {
+	// ITLinesNumber: the SPIs are interrupts 32 to 32 * (N + 1) - 1.
+	// SAFETY: the distributor this port maps; reads.
+	let (control, lines) = unsafe { (core::ptr::read_volatile(gicd(GICD_CTLR)), ((core::ptr::read_volatile(gicd(GICD_TYPER)) & 0x1f) as usize + 1) * 32) };
+	let spis = lines - 32;
+	let saved = (|| {
+		let routes = if v3() {
+			let mut routes = alloc::vec::Vec::new();
+			routes.try_reserve_exact(spis).ok()?;
+			for intid in 32..lines {
+				// SAFETY: as above.
+				routes.push(unsafe { core::ptr::read_volatile(gicd(GICD_IROUTER + intid * 8) as *const u64) });
+			}
+			routes
+		} else {
+			alloc::vec::Vec::new()
+		};
+		Some(SavedDistributor { control, lines, groups: read_words(GICD_IGROUPR, 1, lines / 32 - 1)?, enables: read_words(GICD_ISENABLER, 1, lines / 32 - 1)?, priorities: read_words(GICD_IPRIORITYR, 8, spis / 4)?, triggers: read_words(GICD_ICFGR, 2, spis / 16)?, targets: if v3() { alloc::vec::Vec::new() } else { read_words(GICD_ITARGETSR, 8, spis / 4)? }, routes })
+	})();
+	let Some(saved) = saved else { return false };
+	*SAVED_DISTRIBUTOR.lock() = Some(saved);
+	true
+}
+
+/// The saved distributor written back: off while every SPI takes its group, priority, trigger and target, every SPI
+/// disabled first, the enables last, then the control register.
+pub fn restore_distributor() {
+	let Some(saved) = SAVED_DISTRIBUTOR.lock().take() else { return };
+	// SAFETY: the distributor this port maps, written as `save_distributor` read it.
+	unsafe {
+		core::ptr::write_volatile(gicd(GICD_CTLR), 0);
+	}
+	gicd_wait();
+	for word in 1..saved.lines / 32 {
+		// SAFETY: as above.
+		unsafe { core::ptr::write_volatile(gicd(GICD_ICENABLER + word * 4), u32::MAX) };
+	}
+	gicd_wait();
+	write_words(GICD_IGROUPR, 1, &saved.groups);
+	write_words(GICD_IPRIORITYR, 8, &saved.priorities);
+	write_words(GICD_ICFGR, 2, &saved.triggers);
+	if v3() {
+		for (at, &route) in saved.routes.iter().enumerate() {
+			// SAFETY: as above.
+			unsafe { core::ptr::write_volatile(gicd(GICD_IROUTER + (32 + at) * 8) as *mut u64, route) };
+		}
+	} else {
+		write_words(GICD_ITARGETSR, 8, &saved.targets);
+	}
+	write_words(GICD_ISENABLER, 1, &saved.enables);
+	// SAFETY: as above.
+	unsafe { core::ptr::write_volatile(gicd(GICD_CTLR), saved.control) };
+	gicd_wait();
+}
+
 // Bring up a secondary core's CPU interface + timer (the distributor is already on). The CPU
 // interface, the redistributor frame and the SGI/PPI enable bits are all per core, so each core must
 // run this itself.

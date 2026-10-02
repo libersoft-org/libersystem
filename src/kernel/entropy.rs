@@ -34,7 +34,6 @@ pub fn absorb(bytes: &[u8], source: Source) -> u32 {
 // FALSE IS THE ANSWER, NOT WEAK BYTES: a caller that asked for key material and got a buffer it
 // cannot distinguish from good key material has no way to act on the difference.
 // Bytes mixed in and credited nothing - see `entropy::Pool::stir`.
-#[cfg(target_arch = "x86_64")]
 pub fn stir(bytes: &[u8]) {
 	POOL.lock().stir(bytes)
 }

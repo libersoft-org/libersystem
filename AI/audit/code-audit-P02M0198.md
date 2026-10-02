@@ -528,3 +528,37 @@ the job's slow-architecture step at its end and are recorded when run.
 
 Status: parts a to d implemented and run on the targets each names; OPEN for context-losing idle states (P02M0197's
 per-core resume path on the ports), the owner's three-target kernel run, and the owner's confirmation of the defaults.
+
+## The owner's profile defaults, built (2026-10-02)
+
+The owner decided (2026-10-02): on mains the maximum performance, on battery something between (balanced), and the
+person can switch.
+
+WHAT WAS DONE:
+- `service_logic::processor_policy::default_profile`: performance on line power (or where it is not known), balanced
+  on battery; its host test follows.
+- `power-profile` gained `automatic = 4` (`src/idl/power.lsidl`; regenerated with `--accept-breaking`, nothing being
+  versioned before the first release): `set-profile(automatic)` gives the choice back to the power source's default,
+  and a status never names it. ProcessorPowerService maps it to "no choice"; `powerctl profile auto` asks for it.
+- THE GOVERNOR DECIDES AT A CHANGE OF THE WINDOW (`kernel/processor`): with performance the default, the gate's switch
+  to balanced left C001 - idle the whole time, so with no utilisation period ending to decide at - at the fastest level
+  the performance window had pinned (`cpc_desired` 255 for 20 s). `set_window` now decides the level in the new window
+  at once from the busy share the core's last period measured (`last_busy_permille`, recorded by `on_tick`), through the
+  same `perf::next_level` and its transition-latency rule.
+- The gate `processor-power`: at boot the line-power default is performance (both cores pinned at their fastest,
+  preference 0, "profile performance" in the service's online line); balanced is chosen before the at-rest and
+  under-load checks; and after the profile cases `powerctl profile auto` gives the choice back - preference 0 and
+  "profile: performance (the default on line power)" in `powerctl status`.
+
+VERIFICATION:
+- `cargo test --offline --manifest-path src/user/services/logic/Cargo.toml` -> 746 passed (processor_policy 9).
+- `./gen.sh --accept-breaking` -> ok (`power-profile` gained a value; the ABI checker calls an added enum value
+  breaking, and nothing is versioned before the first release).
+- The first run of `LIBER_DEVELOPMENT=1 ./check.sh --gate processor-power` with the new defaults -> FAIL: "at rest,
+  C001's desired performance is not CPPC's lowest (cpc_desired reads 255, not 50, after 20 s)" - the idle core kept the
+  level the performance window pinned; the `set_window` change above is the fix.
+- `cd src/kernel && cargo build` and `TEST=1 TEST_TAGS="" cargo build --tests` -> ok.
+- `LIBER_DEVELOPMENT=1 ./check.sh --gate processor-power` -> PASS (2026-10-02): "on line power the default is
+  performance: C000 at 0x10 and C001 at 255, with preference 0"; "at rest C000's control register reads 0x13 and
+  C001's desired performance 50, with the balanced preference 128"; "auto gives the choice back: performance, the
+  default on line power, with preference 0"; every other case as before.

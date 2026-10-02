@@ -323,8 +323,9 @@ impl Sleeper {
 		if self.txn.is_some() {
 			return Err(Error::Again);
 		}
-		// HIBERNATION WHERE THE MACHINE IS SET UP FOR IT - a hibernation partition as large as memory, and a TPM to seal
-		// its key - which the image component says; asked here, so a refusal is the requester's answer.
+		// HIBERNATION WHERE THE MACHINE IS SET UP FOR IT - a hibernation partition as large as memory, and a TPM that seals
+		// its key or none at all (with the component's warning) - which the image component says; asked here, so a refusal
+		// is the requester's answer.
 		if state == SleepState::Disk {
 			let why = match image_status(image) {
 				Ok(status) if status.set_up => None,

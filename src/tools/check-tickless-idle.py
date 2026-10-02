@@ -68,7 +68,9 @@ IDLE_MARGIN_MS = 300
 SLEEP_OFFERED = re.compile(rb'sleep: [^\r\n]* is (offered|not offered) by this firmware')
 # THE SHELL'S PROMPT, as it reads once the colours are stripped - for taking it out of a line it landed in.
 PROMPT_TEXT = re.compile(r'vol://[^\r\n>]*> ')
-COUNTER = re.compile(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)')
+# WITHOUT ITS PREFIX: the counter writes "sleepcheck: " and the rest of its line in two writes, and another program's
+# lines - `sleepctl`'s record of the last sleep, then its prompt - can land between them.
+COUNTER = re.compile(r'count (\d+) mono-ms (\d+) boot-ms (\d+)')
 PARKED = re.compile(r'cpu(\d+): woke (\d+) time\(s\) for the timer, (\d+) for an IPI, (\d+) for a device')
 
 ARMED = re.compile(rb'console: typed input raises interrupt (\d+)')

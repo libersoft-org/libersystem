@@ -1260,7 +1260,6 @@ pub fn free_at_start() -> usize {
 // WHETHER THE FRAME AT `phys` IS FREE right now - in its pool's free blocks, or the run table's free runs before the
 // buddy exists. A frame outside every pool is not free: it was never the pool's to hand out. For the hibernation
 // snapshot, which copies every frame in use and calls this for each one in the memory map's seeded regions.
-#[cfg(any(test, target_arch = "x86_64"))]
 pub fn is_free(phys: u64) -> bool {
 	let allocator = ALLOCATOR.lock();
 	if !allocator.pools.is_empty() {

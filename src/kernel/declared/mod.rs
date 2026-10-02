@@ -126,8 +126,7 @@ pub fn claim_writes(index: usize, vendor: u16, device: u16, bus: u8, dev: u8, fu
 }
 
 // AFTER AN S3, WHICH RESET THE FUNCTION: every live claim's writes made again, from the bits its row names - the
-// value the release restores stays the one saved at the claim.
-#[cfg(target_arch = "x86_64")]
+// value the release restores stays the one saved at the claim - after a hibernation's restore too, on every port.
 pub fn replay_claim_writes() {
 	let table = SAVED.lock();
 	for (_, (bus, dev, func), writes) in table.iter() {

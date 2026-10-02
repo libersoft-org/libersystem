@@ -97,16 +97,18 @@ struct Core {
 	preference: Option<u8>,
 	inject_permille: u32,
 	predictor: Predictor,
-	// The utilisation period the performance governor decides over: when it began, and the idle time inside it.
+	// The utilisation period the performance governor decides over: when it began, and the idle time inside it - and the
+	// busy share the last one measured, which a change of the window decides from at once.
 	period_start_ns: u64,
 	period_idle_ns: u64,
+	last_busy_permille: Option<u32>,
 	// The idle injection's account: what the period owes, and since when the core is injecting.
 	inject_owed_ns: u64,
 }
 
 impl Core {
 	const fn new() -> Core {
-		Core { idle: Vec::new(), perf: None, window: None, preference: None, inject_permille: 0, predictor: Predictor::new(), period_start_ns: 0, period_idle_ns: 0, inject_owed_ns: 0 }
+		Core { idle: Vec::new(), perf: None, window: None, preference: None, inject_permille: 0, predictor: Predictor::new(), period_start_ns: 0, period_idle_ns: 0, last_busy_permille: None, inject_owed_ns: 0 }
 	}
 }
 
@@ -237,8 +239,9 @@ fn unenterable_text(why: procpower::Unenterable) -> &'static str {
 // halt first, then each state the tree describes, ordered by how long its wake takes - the entry's latency and the
 // exit's, which together are what a latency request bounds. The kernel reads the tree itself, with no interpreter
 // between, and a table installed later replaces this one. A state that loses the core's context (PSCI's power-down
-// StateType, a non-retentive SBI type) or stops its timer (`local-timer-stop`) is installed with that flag, which
-// `procpower::enterable` holds it out by - said on the console at the install.
+// StateType, a non-retentive SBI type) or stops its timer (`local-timer-stop`) is installed with that flag: the first is
+// entered through the port's per-core resume path, and the second is held out by `procpower::enterable` - said on the
+// console at the install.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn install_tree_states(tree: &fdt::TreeIdleStates) {
 	#[cfg(target_arch = "aarch64")]
@@ -381,7 +384,9 @@ pub fn install_perf(cpu: usize, raw: Option<&abi::ProcessorPerfTable>) -> i64 {
 	0
 }
 
-// THE WINDOW, obeyed at once.
+// THE WINDOW, obeyed at once - and the level decided in it at once from the busy share the core's last period measured:
+// a core in a long idle has no period ending to decide at, and would hold a level the old window wanted - the fastest a
+// performance profile pinned it at, under a balanced one that would have let it rest.
 pub fn set_window(cpu: usize, cap: u32, floor: u32) -> i64 {
 	if cpu >= crate::smp::cpu_count() {
 		return abi::ERR_INVALID;
@@ -393,8 +398,13 @@ pub fn set_window(cpu: usize, cap: u32, floor: u32) -> i64 {
 		return abi::ERR_INVALID;
 	}
 	core.window = Some(window);
+	let last_busy = core.last_busy_permille;
 	if let Some(installed) = core.perf.as_mut() {
-		let level = window.clamp(installed.level);
+		let mut level = window.clamp(installed.level);
+		if let Some(busy) = last_busy {
+			let since = now_ns().saturating_sub(installed.changed_at_ns) / 1000;
+			level = perf::next_level(level, busy, window, since, installed.table.transition_us());
+		}
 		if level != installed.level {
 			apply(cpu, installed, level);
 		}
@@ -571,6 +581,7 @@ pub fn on_tick(cpu: usize) -> bool {
 	let busy_permille = ((elapsed - idle).saturating_mul(1000) / elapsed.max(1)) as u32;
 	core.period_start_ns = now;
 	core.period_idle_ns = 0;
+	core.last_busy_permille = Some(busy_permille);
 	// THE INJECTION'S ACCOUNT: each period owes its share as idle, taken whole when the core next gives way.
 	if core.inject_permille != 0 {
 		core.inject_owed_ns = core.inject_owed_ns.saturating_add(elapsed * u64::from(core.inject_permille) / 1000);

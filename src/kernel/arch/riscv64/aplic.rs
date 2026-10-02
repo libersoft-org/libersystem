@@ -28,7 +28,6 @@
 const DOMAINCFG: u64 = 0x0000;
 const SOURCECFG: u64 = 0x0004;
 const SETIPNUM: u64 = 0x1cdc;
-#[cfg(test)]
 const SETIE: u64 = 0x1e00;
 const SETIENUM: u64 = 0x1edc;
 const CLRIENUM: u64 = 0x1fdc;
@@ -119,6 +118,68 @@ pub unsafe fn disarm_source(base: u64, source: u32) {
 	unsafe {
 		write(base, CLRIENUM, source);
 		write(base, SOURCECFG + (source as u64 - 1) * 4, SM_INACTIVE);
+	}
+}
+
+// THE DOMAIN, WHOLE, ACROSS A HIBERNATION: its configuration, every source's mode and target, and every enable - what a
+// restore's fresh boot reset and armed its own way, written back as the image's kernel left it. The sources are read
+// to the highest an APLIC addresses; one the controller does not implement reads as inactive and is written so.
+struct SavedDomain {
+	domaincfg: u32,
+	sources: alloc::vec::Vec<(u32, u32)>,
+	enables: alloc::vec::Vec<u32>,
+}
+
+static SAVED_DOMAIN: crate::sync::SpinLock<Option<SavedDomain>> = crate::sync::SpinLock::new(None);
+
+/// The domain saved; false when there is no memory to save it in - a machine with no APLIC domain saves nothing and
+/// answers true.
+pub fn save_domain() -> bool {
+	let Some(base) = domain() else { return true };
+	let words = (MAX_SOURCE as usize + 1).div_ceil(32);
+	let mut sources = alloc::vec::Vec::new();
+	let mut enables = alloc::vec::Vec::new();
+	if sources.try_reserve_exact(MAX_SOURCE as usize).is_err() || enables.try_reserve_exact(words).is_err() {
+		return false;
+	}
+	// SAFETY: the adopted domain, inside the direct map; reads.
+	let domaincfg = unsafe {
+		let at = |offset: u64| super::paging::phys_to_virt(base + offset) as *const u32;
+		for source in 1..=MAX_SOURCE {
+			let index = (source as u64 - 1) * 4;
+			sources.push((core::ptr::read_volatile(at(SOURCECFG + index)), core::ptr::read_volatile(at(TARGET + index))));
+		}
+		for word in 0..words {
+			enables.push(core::ptr::read_volatile(at(SETIE + word as u64 * 4)));
+		}
+		core::ptr::read_volatile(at(DOMAINCFG))
+	};
+	*SAVED_DOMAIN.lock() = Some(SavedDomain { domaincfg, sources, enables });
+	true
+}
+
+/// The saved domain written back: delivery off while the sources take their modes and targets, every source disabled
+/// first, the enables last, then the configuration.
+pub fn restore_domain() {
+	let Some(base) = domain() else { return };
+	let Some(saved) = SAVED_DOMAIN.lock().take() else { return };
+	// SAFETY: as `save_domain`, written.
+	unsafe {
+		let at = |offset: u64| super::paging::phys_to_virt(base + offset) as *mut u32;
+		core::ptr::write_volatile(at(DOMAINCFG), saved.domaincfg & !DOMAINCFG_IE);
+		for source in 1..=MAX_SOURCE {
+			let index = (source as u64 - 1) * 4;
+			let (mode, target) = saved.sources[source as usize - 1];
+			core::ptr::write_volatile(at(CLRIENUM), source);
+			core::ptr::write_volatile(at(SOURCECFG + index), mode);
+			if mode != SM_INACTIVE {
+				core::ptr::write_volatile(at(TARGET + index), target);
+			}
+		}
+		for (word, &enables) in saved.enables.iter().enumerate() {
+			core::ptr::write_volatile(at(SETIE + word as u64 * 4), enables);
+		}
+		core::ptr::write_volatile(at(DOMAINCFG), saved.domaincfg);
 	}
 }
 

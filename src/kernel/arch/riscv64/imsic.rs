@@ -242,6 +242,29 @@ pub fn init_hart() {
 	}
 }
 
+// THIS HART'S INTERRUPT FILE, as the per-core resume path keeps it across a lost context: its delivery, its threshold
+// and its enables - zero for a machine with no IMSIC this kernel uses, whose file is never put back.
+pub fn save_hart() -> (u64, u64, u64) {
+	if !usable() {
+		return (0, 0, 0);
+	}
+	// SAFETY: this hart's own indirect registers, read.
+	unsafe { (ireg_read(EIDELIVERY) as u64, ireg_read(EITHRESHOLD) as u64, ireg_read(EIE0) as u64) }
+}
+
+pub fn restore_hart(saved: (u64, u64, u64)) {
+	if !usable() {
+		return;
+	}
+	// SAFETY: this hart's own indirect registers, written back as `save_hart` read them - the enables last, once the
+	// file delivers at the threshold it had.
+	unsafe {
+		ireg_write(EITHRESHOLD, saved.1 as usize);
+		ireg_write(EIDELIVERY, saved.0 as usize);
+		ireg_write(EIE0, saved.2 as usize);
+	}
+}
+
 // WHICH HART'S INTERRUPT FILE HOLDS EACH EID'S ENABLE BIT.
 //
 // An IMSIC enable bit lives in ONE hart's file, and the only way to touch a file is to be the hart

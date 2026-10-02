@@ -78,6 +78,7 @@ mod its;
 pub mod platform;
 pub mod processor;
 pub mod psci;
+pub mod resume;
 pub mod serial;
 pub mod sleep;
 pub mod usercopy;

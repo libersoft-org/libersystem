@@ -251,14 +251,20 @@ pub fn park_once(cpu: usize) {
 	}
 }
 
-// AN S3'S HOLD: every core but the boot core parked in the sleep mode and KEPT there - never back to its scheduler -
-// until the hold ends, since the S3 takes every core's context and the boot core saves nothing a running core could
-// still be changing. Each held core says so, for the entry to wait on.
+// AN S3'S OR A SNAPSHOT'S HOLD: every core but the boot core parked in the sleep mode and KEPT there - never back to its
+// scheduler - until the hold ends, since the entry takes every core's context and the boot core saves nothing a running
+// core could still be changing. Each held core says so, for the entry to wait on. ON THE DEVICE-TREE PORTS a held core
+// saves its context first, through the per-core resume path (`arch::resume`): a machine an image restored brings it
+// back with `start_saved`, inside its hold - and a restore's replacement asks every held core to turn itself off
+// (`stop_held`), so the image's kernel can turn it on again.
 static HOLD: AtomicBool = AtomicBool::new(false);
 static HELD: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+#[cfg(not(target_arch = "x86_64"))]
+static STOP_HELD: AtomicBool = AtomicBool::new(false);
+// The held core that takes a replacement from its hold instead of turning off, `usize::MAX` for none.
+#[cfg(not(target_arch = "x86_64"))]
+static JUMPER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
 
-// THE HOLD IS x86_64'S S3 AND HIBERNATION ENTRY'S - the other ports' entry is suspend to idle alone.
-#[cfg(target_arch = "x86_64")]
 pub fn begin_hold() {
 	for held in HELD.iter() {
 		held.store(false, Ordering::Relaxed);
@@ -268,16 +274,49 @@ pub fn begin_hold() {
 }
 
 // Whether every online core but the caller's is held.
-#[cfg(target_arch = "x86_64")]
 pub fn all_others_held() -> bool {
 	let this = crate::sched::current_cpu_id();
 	(0..crate::smp::cpu_count()).all(|cpu| cpu == this || HELD[cpu].load(Ordering::Acquire))
 }
 
-#[cfg(target_arch = "x86_64")]
+// Whether core `cpu` is held - for the restore, which waits for each core it brings back to leave its hold.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn held(cpu: usize) -> bool {
+	HELD.get(cpu).is_some_and(|held| held.load(Ordering::Acquire))
+}
+
 pub fn end_hold() {
 	HOLD.store(false, Ordering::SeqCst);
 	end_sleep();
+}
+
+// EVERY HELD CORE TURNED OFF, for a restore's replacement: each leaves its hold through the firmware's off and never
+// comes back in this kernel - but `jumper`, which takes the replacement from its hold (`sleep::image::jump`).
+#[cfg(not(target_arch = "x86_64"))]
+pub fn stop_held(jumper: Option<usize>) {
+	JUMPER.store(jumper.unwrap_or(usize::MAX), Ordering::SeqCst);
+	STOP_HELD.store(true, Ordering::SeqCst);
+	wake_every_other_core();
+}
+
+// A HELD CORE'S PARK, on the device-tree ports: entered from `save_and_leave` with the context saved, so it says it is
+// held only now - the entry copies nothing until every record is whole. It returns when the hold ends, or turns the
+// core off when a replacement asks - or, on the core the replacement runs on, takes it.
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn hold_leave(_record: *mut arch::resume::Record, cpu: u64) -> i64 {
+	let cpu = cpu as usize;
+	HELD[cpu].store(true, Ordering::Release);
+	while HOLD.load(Ordering::Acquire) {
+		if STOP_HELD.load(Ordering::Acquire) {
+			if JUMPER.load(Ordering::Acquire) == cpu {
+				crate::sleep::image::jump();
+			}
+			arch::resume::off_now();
+		}
+		park_once(cpu);
+		arch::disable_interrupts();
+	}
+	0
 }
 
 // Each online core's wakeups while parked, into `out`; how many were written.
@@ -321,13 +360,18 @@ pub fn halt(until: Option<u64>, ready: impl FnOnce() -> bool) {
 			BSP_WAKE.store(AWAKE, Ordering::SeqCst);
 		}
 		arch::apic::timer_at_counter(None);
-		// HELD FOR AN S3: parked, and never back to the scheduler until the hold ends.
+		// HELD FOR AN S3 OR A SNAPSHOT: parked, and never back to the scheduler until the hold ends.
 		if HOLD.load(Ordering::Acquire) && !bsp {
-			HELD[cpu].store(true, Ordering::Release);
-			while HOLD.load(Ordering::Acquire) {
-				park_once(cpu);
-				arch::disable_interrupts();
+			#[cfg(target_arch = "x86_64")]
+			{
+				HELD[cpu].store(true, Ordering::Release);
+				while HOLD.load(Ordering::Acquire) {
+					park_once(cpu);
+					arch::disable_interrupts();
+				}
 			}
+			#[cfg(not(target_arch = "x86_64"))]
+			let _ = arch::resume::save_and_leave(hold_leave, cpu as u64);
 			HELD[cpu].store(false, Ordering::Release);
 			arch::enable_interrupts();
 		} else {

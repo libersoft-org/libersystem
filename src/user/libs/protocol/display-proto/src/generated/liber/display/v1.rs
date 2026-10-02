@@ -3229,8 +3229,8 @@ impl DisplayOutput {
 }
 
 /// THE OUTPUTS, on DisplayService's `OUTPUTS` root: which it drives and whether each is the machine's own - what the
-/// sleep policy asks before a closed lid suspends the machine - and the screen turned off and on, which a closed lid
-/// does by default. The root is a manifest role the power-state service alone holds.
+/// sleep policy asks before a closed lid acts, since an external display in use keeps it from acting - and the screen
+/// turned off and on, which a closed lid does by default. The root is a manifest role the power-state service alone holds.
 // interface `display-outputs` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod display_outputs {
 	use super::*;

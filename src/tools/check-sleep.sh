@@ -36,20 +36,22 @@
 #      `sleep: entered`, the unwind naming the sequence and its door, the power verb after it, and QEMU's exit.
 #
 # THE PLATFORM BOOT: the fixture SSDT with the sleep gate's devices and the development switch naming the CMOS RTC absent.
-# Closing the lid suspends through the power-state service's policy; the Time and Alarm Device's clock - the harness plays
-# it five years ahead - is the wall clock, stamps files and measures an S3; its timer is what the driver programs from the
-# sleep's timed wake, and the host wakes the guest at it; THE FANS' DRIVERS answer SUSPENDED and RESUMED across a suspend
-# to idle and an S3, and the level FAN1 was commanded through its curve - cleared in the pages by the host while the guest
-# is in S3 - is applied again at the resume; the control-method sleep button suspends; the policy killed and relaunched
-# still suspends on the lid; and the control-method power button powers off through the registered `\_S5`.
+# Closing the lid turns the screen off through the power-state service's policy - black on the host's screendump, a line
+# typed then unseen, the machine running - and opening it turns the screen on; then, the lid set to suspend
+# (`power.lid`) and the policy killed and relaunched, closing it suspends to RAM; the Time and Alarm Device's clock - the
+# harness plays it five years ahead - is the wall clock, stamps files and measures an S3; its timer is what the driver
+# programs from the sleep's timed wake, and the host wakes the guest at it; THE FANS' DRIVERS answer SUSPENDED and
+# RESUMED across a suspend to idle and an S3, and the level FAN1 was commanded through its curve - cleared in the pages
+# by the host while the guest is in S3 - is applied again at the resume; the control-method sleep button suspends; and
+# the control-method power button powers off through the registered `\_S5`.
 # THE DEVICE POWER STATES, read from the fixture's pages - the lid and the TAD share one power resource in D0, and the
 # lid's wake needs another: after the boot the shared one is on, turned on ONCE for its two holders; while the lid's S3
 # is suspended both devices ran `_PS3`, the shared resource is off and the wake one on; while the TAD's timed S3 is
 # suspended the TAD - its timer to wake the machine, and no `_S3W` to say a deeper state still wakes - kept D0, so the
 # shared resource stayed on with the lid in D3hot; after each wake both are in D0 and the wake resource off again.
 # THE BATTERY BOOT: the same fixture, the power service killed and relaunched, and then the fixture's battery discharged
-# past critical with the adapter off line - on a machine where hibernation is not set up, so the policy's orderly
-# power-off through the relaunched instance's clients: the forced deadline armed, ServiceManager's sequence, the
+# past critical with the adapter off line - the owner's default, the policy's orderly power-off with no hibernation
+# asked, through the relaunched instance's clients: the forced deadline armed, ServiceManager's sequence, the
 # registered `\_S5`, and QEMU gone within the bound.
 # THE FALLBACK BOOT: the switch refusing the sleep-type registration, and `shutdown` taking the fixed ports.
 #
@@ -281,6 +283,11 @@ await_end() {
 # A SCREEN, as QEMU shows it.
 screen() {
 	qmp screendump "{\"filename\": \"$1\", \"format\": \"png\"}" >/dev/null || fail "QEMU refused the screendump"
+}
+
+# WHETHER A SCREEN IS BLACK, every pixel.
+black() {
+	python3 -c 'import sys; from PIL import Image; sys.exit(0 if Image.open(sys.argv[1]).convert("RGB").getextrema() == ((0, 0), (0, 0), (0, 0)) else 1)' "$1"
 }
 
 marker_n=0
@@ -739,7 +746,8 @@ tad_clock_check() {
 	python3 - "$entry" "$host" "tad-$label.txt" <<'EOF' || fail "$label: the file written is not stamped with the TAD's time ($(date -u -d "@$host" +'%Y-%m-%d %H:%M')): $entry"
 import datetime, re, sys
 entry, host, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-found = re.search(r'(\d{4}-\d\d-\d\d) +(\d\d:\d\d) +' + re.escape(name), entry)
+# mdir pads an hour under ten with a space, not a zero.
+found = re.search(r'(\d{4}-\d\d-\d\d) +(\d{1,2}:\d\d) +' + re.escape(name), entry)
 if not found:
 	sys.exit(1)
 stamped = datetime.datetime.strptime(f'{found.group(1)} {found.group(2)}', '%Y-%m-%d %H:%M').replace(tzinfo=datetime.timezone.utc).timestamp()
@@ -786,12 +794,51 @@ run_platform() {
 	await_line "acpi:\\_SB_.LID0 is in D0" "the lid was never put in D0" 0 60
 	power_check "after the boot" "lid_ps == 0 and tad_ps == 0 and pslp_on == 1 and pslp_ons == 1 and pslp_offs == 0 and pwak_on == 0"
 
-	# THE LID: closing it suspends - to RAM, which this machine offers - asked by the policy with the lid as the reason.
-	local ended asked
+	# THE LID, AS THE OWNER'S DEFAULTS HAVE IT: closing it turns the screen off - black, and a line typed then reaches no
+	# frame - and suspends nothing; opening it turns the screen on again.
+	local ended asked out off on
+	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery powers off in order" "the policy did not start with the owner's defaults" 0 60
+	ended=$(seen "ServiceManager: sleep: the transaction ended")
+	off=$(seen "DisplayService: the screen is off")
+	on=$(seen "DisplayService: the screen is on")
+	screen "$state/screen-lid-open.png"
+	black "$state/screen-lid-open.png" && fail "the screen is black before the lid closed - nothing to tell an off screen by"
+	sleep_event lid-close
+	await_line "PowerService: sleep policy: turns the screen off" "closing the lid did not turn the screen off" 0 30
+	await_line "DisplayService: the screen is off" "DisplayService did not turn the screen off" "$off" 30
+	sleep 1
+	screen "$state/screen-lid-closed.png"
+	black "$state/screen-lid-closed.png" || fail "the screen is not black with the lid closed"
+	./dev.sh key --text "echo dark" >/dev/null 2>&1 || fail "the emulated keyboard took no keys with the lid closed"
+	sleep 2
+	screen "$state/screen-lid-typed.png"
+	black "$state/screen-lid-typed.png" || fail "a line typed with the lid closed reached the screen"
+	[[ "$(run_state)" == running ]] || fail "the machine is not running with the lid closed - $(run_state)"
+	(($(seen "ServiceManager: sleep: the transaction ended") == ended)) || fail "closing the lid put the machine to sleep"
+	sleep_event lid-open
+	await_line "DisplayService: the screen is on" "opening the lid did not turn the screen on" "$on" 30
+	sleep 2
+	screen "$state/screen-lid-opened.png"
+	black "$state/screen-lid-opened.png" && fail "the screen stayed black after the lid opened"
+	say "platform: closing the lid turned the screen off - black, a typed line unseen - and suspended nothing; opening it turned the screen on"
+
+	# THE LID SET TO SUSPEND, AND THE POLICY KILLED AND RELAUNCHED: the relaunched instance reads the setting and suspends -
+	# to RAM, which this machine offers - through its own `system-sleep` client, with the lid as the reason. The setting is
+	# given back to its default once the relaunched instance has read it: the tree outlives this instance's boots.
+	local restarted
+	out="$(launch set power.lid suspend)" || fail "set power.lid suspend was not run: $out"
+	grep -q "ok" <<<"$out" || fail "set power.lid suspend was refused: $out"
+	restarted=$(seen "supervisor: power_service restarted")
+	out="$(launch stop '!crash power_service')" || fail "the crash hook was not reached: $out"
+	await_line "supervisor: power_service restarted" "ServiceManager did not relaunch the killed power service" "$restarted" 60
+	await_line "PowerService: sleep policy: follows the lid" "the relaunched policy never followed the lid" 1 60
+	await_line "PowerService: sleep policy: closing the lid suspends" "the relaunched policy did not read power.lid" 0 30
+	out="$(launch set power.lid screen-off)" || fail "set power.lid screen-off was not run: $out"
+	grep -q "ok" <<<"$out" || fail "power.lid could not be given back to its default: $out"
 	ended=$(seen "ServiceManager: sleep: the transaction ended")
 	asked=$(seen "PowerService: sleep policy: asks for a suspend (Lid)")
 	sleep_event lid-close
-	await_line "PowerService: sleep policy: asks for a suspend (Lid)" "closing the lid asked for no suspend" "$asked" 30
+	await_line "PowerService: sleep policy: asks for a suspend (Lid)" "the relaunched policy asked for no suspend on the lid" "$asked" 30
 	await_s3_and_wake "the lid's suspend" "$ended" lid_s3_power
 	sleep_event lid-open
 	out="$(launch sleepctl last)" || true
@@ -799,7 +846,7 @@ run_platform() {
 	power_check "after the lid's wake" "lid_ps == 0 and tad_ps == 0 and pslp_on == 1 and pslp_ons == 2 and pwak_on == 0 and pwak_offs == 1"
 	await_line "the clock's source says the sleep lasted" "the kernel took no sleep length from the TAD's clock" 0 30
 	tad_clock_check lid
-	say "platform: closing the lid suspended to RAM through the policy, and the TAD's clock measured the sleep"
+	say "platform: the lid set to suspend, the relaunched power service suspended to RAM on it, and the TAD's clock measured the sleep"
 
 	# THE TAD'S TIMED WAKE: the driver programs the timer in its step, and the host - QEMU has no TAD to raise it - wakes
 	# the guest at that time.
@@ -862,20 +909,6 @@ EOF
 	out="$(launch sleepctl last)" || true
 	grep -q "(SleepButton)" <<<"$out" || fail "the last sleep's record does not name the sleep button"
 	say "platform: the control-method sleep button suspended the machine"
-
-	# THE POLICY KILLED AND RELAUNCHED: the lid still suspends, through the relaunched instance's own client.
-	local restarted out
-	restarted=$(seen "supervisor: power_service restarted")
-	out="$(launch stop '!crash power_service')" || fail "the crash hook was not reached: $out"
-	await_line "supervisor: power_service restarted" "ServiceManager did not relaunch the killed power service" "$restarted" 60
-	await_line "PowerService: sleep policy: follows the lid" "the relaunched policy never followed the lid" 1 60
-	ended=$(seen "ServiceManager: sleep: the transaction ended")
-	asked=$(seen "PowerService: sleep policy: asks for a suspend (Lid)")
-	sleep_event lid-close
-	await_line "PowerService: sleep policy: asks for a suspend (Lid)" "the relaunched policy asked for no suspend on the lid" "$asked" 30
-	await_s3_and_wake "the relaunched policy's lid suspend" "$ended"
-	sleep_event lid-open
-	say "platform: the relaunched power service still suspended the machine on a closed lid"
 
 	# THE CONTROL-METHOD POWER BUTTON, LAST: it powers the machine off as the fixed one does, through the registered \_S5.
 	sleep_event power-button
@@ -949,8 +982,8 @@ time.sleep(0.3)
 if 'fired' not in ask('raise 3'):
 	sys.exit('raising line 3 fired no event')
 EOF
-	await_line "PowerService: sleep policy: a battery is critical - asks for hibernation" "battery: the policy did not act on the critical battery" 0 60
-	await_line "PowerService: sleep policy: hibernation was refused - the orderly power-off instead" "battery: the refused hibernation did not turn into the orderly power-off" 0 30
+	await_line "PowerService: sleep policy: a battery is critical - powers the machine off in order" "battery: the policy did not act on the critical battery" 0 60
+	(($(seen "PowerService: sleep policy: a battery is critical - asks for hibernation") == 0)) || fail "battery: the policy asked for hibernation, which the owner's default does not"
 	await_line "PowerService: sleep policy: the machine is off within ${FORCED_BOUND_S} s" "battery: the forced deadline was not armed" 0 30
 	local armed_at gone_at
 	armed_at="$(stamp_of "the machine is off within ${FORCED_BOUND_S} s" 0)"
@@ -965,7 +998,7 @@ EOF
 	local took
 	took=$(ms_between "$armed_at" "$gone_at")
 	((took <= FORCED_BOUND_S * 1000 + 1000)) || fail "battery: QEMU exited ${took} ms after the forced deadline was armed, past its ${FORCED_BOUND_S} s bound"
-	say "battery: a critical battery on a machine without hibernation powered off in order through the relaunched policy, QEMU gone ${took} ms after the ${FORCED_BOUND_S} s deadline was armed"
+	say "battery: a critical battery powered the machine off in order through the relaunched policy, as the owner's default has it, QEMU gone ${took} ms after the ${FORCED_BOUND_S} s deadline was armed"
 	kill "$ticker" "$backend" 2>/dev/null || true
 }
 

@@ -88,6 +88,16 @@ pub fn config_write_exact(bus: u8, dev: u8, func: u8, off: u16, width: u8, value
 
 // A CHIPSET MEMORY REGISTER, which no row of this port declares - the rows that declare one (the ICH9's GCS, a
 // WDAT's system-memory registers) are x86_64's. So there is no window to map it in.
+// Every function's configuration saved, and written back after a hibernation's restore - `common`'s, through this
+// port's accessors.
+pub fn save_config_all() -> bool {
+	common::save_config_all(config_read_exact)
+}
+
+pub fn restore_config_all() {
+	common::restore_config_all(config_write_exact)
+}
+
 pub fn map_declared(_phys: u64) -> Option<u64> {
 	None
 }

@@ -297,10 +297,36 @@ fn call(function: u64, first: u64, second: u64, third: u64) -> i64 {
 
 // A RETENTION STATE, ENTERED: PSCI CPU_SUSPEND with the tree's power-state parameter. The core waits as WFI does - an
 // interrupt pending, masked or not, ends it - and the call returns with its context kept. A power-down state
-// (`state_loses_context`) never reaches here: it loses the core's context, and this port has no per-core resume path,
-// so it is held out of the governor's choices at install. Answers PSCI's status: 0 entered and left.
+// (`state_loses_context`) goes through `cpu_suspend_to` instead, from the per-core resume path. Answers PSCI's status:
+// 0 entered and left.
 pub(crate) fn cpu_suspend(power_state: u32) -> i64 {
 	call(PSCI_CPU_SUSPEND, u64::from(power_state), 0, 0)
+}
+
+// A POWER-DOWN STATE, ENTERED with the entry and the context id it resumes at: `resume::suspend_leave`'s call, the
+// core's context saved. A firmware that ends it as a wait - QEMU's PSCI always does - returns 0 here with it kept.
+pub(crate) fn cpu_suspend_to(power_state: u32, entry: u64, context: u64) -> i64 {
+	call(PSCI_CPU_SUSPEND, u64::from(power_state), entry, context)
+}
+
+// PSCI CPU_OFF (SMC32), and AFFINITY_INFO (SMC64), whose answer for a core that is off is 1.
+const PSCI_CPU_OFF: u64 = 0x8400_0002;
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
+
+// THIS CORE OFF - `resume::off_leave`'s call. Answers PSCI's status, since an off that returns did not happen.
+pub(crate) fn cpu_off() -> i64 {
+	call(PSCI_CPU_OFF, 0, 0, 0)
+}
+
+// A CORE ON at an entry with a context id - `resume::start_saved`'s call, for a core that turned itself off with its
+// context saved. Answers PSCI's status.
+pub(crate) fn cpu_on_to(mpidr: u64, entry: u64, context: u64) -> i64 {
+	cpu_on(resolved_conduit(), mpidr, entry, context)
+}
+
+// Whether a core is off, as AFFINITY_INFO answers for it alone (level 0).
+pub(crate) fn affinity_off(mpidr: u64) -> bool {
+	call(PSCI_AFFINITY_INFO, mpidr, 0, 0) == 1
 }
 
 // WHETHER THE FIRMWARE OFFERS `function`, asked of PSCI_FEATURES: a PSCI before 1.0, or none at all, answers no.
@@ -324,6 +350,11 @@ pub(crate) fn state_loses_context(power_state: u32) -> bool {
 		}
 	};
 	power_state & (1 << if extended { 30 } else { 16 }) != 0
+}
+
+// Whether a PSCI conduit answers on this machine at all.
+pub(crate) fn conduit_present() -> bool {
+	matches!(resolved_conduit(), bootproto::PSCI_HVC | bootproto::PSCI_SMC)
 }
 
 // SYSTEM_SUSPEND - the machine's suspend to RAM - offered, asked once.

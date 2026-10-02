@@ -107,8 +107,13 @@ declare -A GATES=(
 	["sleep"]="tools/check-sleep.sh"
 	# HIBERNATION ON x86_64 q35 WITH S4 OFFERED AND swtpm: an image written and restored with a running program going
 	# on, the boot after finding none, soft-off where S4 is not offered, a modified image, another system image and
-	# another machine each refused, hybrid sleep both ways, and a machine with no TPM not set up.
+	# another machine each refused, hybrid sleep both ways, and with no TPM set up with a warning, its image written with
+	# the key in the clear and restored - and refused where a TPM seals.
 	["hibernate"]="tools/check-hibernate.sh"
+	# HIBERNATION ON aarch64 AND riscv64, one guest at a time, with no TPM: set up with the warning, an image written and
+	# the machine off, the next boot replacing memory on the core the image's boot core was and every other core turned
+	# on again at its record, a running program going on; the boot after finding none, and a modified image refused.
+	["hibernate-ports"]="python3 tools/check-hibernate-ports.py"
 	# PROCESSOR AND THERMAL POWER ON x86_64 q35 WITH THE FIXTURE'S PROCESSORS, ZONE AND FANS: every core's tables installed
 	# from the firmware's objects and C002's model-specific one refused, the state the governor asked for read from the
 	# registers at rest, under load, under `_PPC` and under each profile, the `_LPI` states entered or left unentered with
