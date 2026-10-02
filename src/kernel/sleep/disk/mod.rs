@@ -410,9 +410,12 @@ fn digest_of<'a>(kernel: &[u8], modules: impl Iterator<Item = (&'a [u8], &'a [u8
 	parts.finish()
 }
 
-// THE HARDWARE'S DIGEST: the memory map by class - every kind of RAM the loader or the kernel may take one class, each
-// other kind its own, adjacent ranges of one class merged, so what a boot's loader allocated does not move it - the
-// cores, and every PCI function the scan found with its identity.
+// THE HARDWARE'S DIGEST: the machine's memory, the cores, and every PCI function the scan found with its identity. THE
+// MEMORY IS THE BANKS THE DEVICE TREE DESCRIBES where the port has one (`arch::sleep::ram_banks`): a UEFI firmware moves
+// its own runtime regions inside them between boots of one machine, by a page or two, so the memory map's holes are no
+// fingerprint of the hardware there - a restore whose pages would land in one is refused frame by frame (`image_ram`).
+// Elsewhere it is the memory map by class - every kind of RAM the loader or the kernel may take one class, each other
+// kind its own, adjacent ranges of one class merged, so what a boot's loader allocated does not move it.
 //
 // SAID ON THE CONSOLE EACH TIME IT IS TAKEN, by its parts - how many memory ranges and their own digest, the cores, how
 // many functions and theirs - so a refusal for "other hardware" can be traced to the part that moved.
@@ -430,7 +433,11 @@ fn hardware_digest() -> [u8; 32] {
 		}
 		ranges += 1;
 	};
-	for index in 0..crate::mem::memmap_len() {
+	let banks = crate::arch::sleep::ram_banks();
+	for &(base, length) in banks.as_ref().map_or(&[][..], |(banks, count)| &banks[..*count]) {
+		push(&mut parts, (0, base, length));
+	}
+	for index in 0..if banks.is_some() { 0 } else { crate::mem::memmap_len() } {
 		let Some(region) = crate::mem::memmap_get(index) else { continue };
 		let kind = match region.kind {
 			bootproto::MEM_USABLE | bootproto::MEM_BOOTLOADER_RECLAIMABLE | bootproto::MEM_BOOTLOADER | bootproto::MEM_KERNEL => 0,
@@ -462,7 +469,8 @@ fn hardware_digest() -> [u8; 32] {
 		});
 	}
 	let (memory, functions) = (memory.finish(), functions.finish());
-	crate::serial_println!("sleep: the hardware's digest - {ranges} memory range(s) ({:02x}{:02x}{:02x}{:02x}), {} core(s), {found} PCI function(s) ({:02x}{:02x}{:02x}{:02x})", memory[0], memory[1], memory[2], memory[3], crate::smp::cpu_count(), functions[0], functions[1], functions[2], functions[3]);
+	let unit = if banks.is_some() { "bank" } else { "range" };
+	crate::serial_println!("sleep: the hardware's digest - {ranges} memory {unit}(s) ({:02x}{:02x}{:02x}{:02x}), {} core(s), {found} PCI function(s) ({:02x}{:02x}{:02x}{:02x})", memory[0], memory[1], memory[2], memory[3], crate::smp::cpu_count(), functions[0], functions[1], functions[2], functions[3]);
 	parts.finish()
 }
 

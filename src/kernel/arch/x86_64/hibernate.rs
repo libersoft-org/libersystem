@@ -60,6 +60,12 @@ pub fn development_variant(out: &mut [u8; 64]) -> usize {
 	super::fwcfg::read_file(b"opt/org.libersystem/system-variant", out).unwrap_or(0)
 }
 
+// NO DEVICE TREE DESCRIBES THIS MACHINE'S RAM: the hardware digest takes the memory map, which the firmware keeps the
+// same from boot to boot (`sleep::disk`).
+pub fn ram_banks() -> Option<([(u64, u64); 16], usize)> {
+	None
+}
+
 // THE RESUME CONTEXT this kernel writes into a snapshot, and checks a restore's against.
 pub fn context() -> [u8; SNAPSHOT_CONTEXT] {
 	encode(words())

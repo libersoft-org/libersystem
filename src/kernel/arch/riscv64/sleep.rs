@@ -51,6 +51,13 @@ pub fn report_offers() {
 	}
 }
 
+// THE MACHINE'S RAM AS ITS DEVICE TREE DESCRIBES IT - the banks, which a firmware's own regions inside them do not move -
+// for a hibernation image's hardware digest (`sleep::disk`).
+pub fn ram_banks() -> Option<([(u64, u64); fdt::MAX_RAM_REGIONS], usize)> {
+	let info = super::device_tree_boot_info()?;
+	(info.ram_region_count > 0).then_some((info.ram_regions, info.ram_region_count))
+}
+
 // WHY HIBERNATION IS NOT OFFERED, where it is not: the harts are stopped and started through the HSM extension.
 pub fn disk_refused() -> Option<&'static str> {
 	(!super::sbi_probe_extension(0x48_534D)).then_some("the SBI does not offer the HSM extension, which stops and starts the harts")

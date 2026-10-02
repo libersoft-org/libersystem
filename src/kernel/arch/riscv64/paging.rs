@@ -222,8 +222,10 @@ pub fn usable_region(ram_top: u64) -> (u64, u64) {
 //   [__kernel_rx_start, __kernel_rx_end)   read + execute        - `.text`, `.rodata`, `.extable`
 //   everything else                        read + write, no exec - all other RAM
 //
-// The low identity window loses execute entirely: it exists so the boot stub keeps running when
-// paging turns on, and nothing re-enters it afterwards.
+// The low identity window keeps execute over the kernel's read-only text alone, as the high map does, and loses it over
+// everything else: it exists so the boot stub keeps running when paging turns on, and the only code that runs there
+// afterwards is the per-core resume path's (`resume`) - a hart back from a lost context, or a hibernation's
+// replacement, runs a few instructions of `.text` at their physical address with translation just on.
 //
 // The linker script aligns both boundaries to 2 MiB for exactly this. A permission boundary inside
 // a leaf would force the leaf to be the union of what its two halves need, which is where W^X goes
@@ -272,8 +274,8 @@ pub fn harden_direct_map() {
 	for gib in 0..8usize {
 		complete &= split(256 + gib, gib as u64 * GIB, true);
 	}
-	// The identity window: the same RAM, and nothing executes there once the harts are up.
-	complete &= split(2, 2 * GIB, false);
+	// The identity window: the same RAM, executable over the read-only text alone once the harts are up.
+	complete &= split(2, 2 * GIB, true);
 	unsafe {
 		asm!("sfence.vma", options(nostack, preserves_flags));
 	}

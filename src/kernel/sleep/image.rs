@@ -325,20 +325,23 @@ pub fn replace_memory(restore: &mut disk::Restore) -> i64 {
 // THE JUMP, on the core that takes it: every other core off, within a bound - a core still running would run in memory
 // being replaced - and then the port's trampoline, which never returns.
 pub fn jump() -> ! {
+	// THE BOUND IS A TIME, NOT A COUNT: an emulated core spins at a pace no count describes.
+	const OFF_BOUND_NS: u64 = 10_000_000_000;
 	let this = crate::sched::current_cpu_id();
+	let started = CLOCK.nanos(arch::tsc::now());
 	for cpu in 0..crate::smp::cpu_count() {
 		if cpu == this {
 			continue;
 		}
-		let mut waited = 0u64;
 		while !arch::resume::stopped(cpu) {
-			waited += 1;
-			if waited > 2_000_000_000 {
+			if CLOCK.nanos(arch::tsc::now()).saturating_sub(started) > OFF_BOUND_NS {
 				crate::serial_println!("hibernate: core {cpu} did not turn off - the replacement does not run, and this core halts");
 				arch::halt_loop();
 			}
 			core::hint::spin_loop();
 		}
 	}
+	crate::serial_println!("hibernate: every other core is off - core {this} copies the image and jumps into its kernel");
+	arch::serial::flush_sync();
 	arch::sleep::replace_jump(PARAMS.load(Ordering::SeqCst))
 }

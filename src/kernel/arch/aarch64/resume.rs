@@ -117,6 +117,10 @@ aarch64_save_and_leave:
 .global aarch64_resume_high
 // FROM THE STUB, on the boot page tables in the higher half, x0 the record: the core put back as it was saved.
 aarch64_resume_high:
+	mov     x9, #0x09000000         // DEBUG-MARK
+	movk    x9, #0xffff, lsl #48    // DEBUG-MARK
+	mov     w10, #'H'               // DEBUG-MARK
+	strb    w10, [x9]               // DEBUG-MARK
 	ldp     x9, x10, [x0, #{TCR_MAIR}]
 	msr     tcr_el1, x9
 	msr     mair_el1, x10
@@ -169,23 +173,25 @@ aarch64_resume_high:
 	mov     x0, #1
 	ret
 
-.section .data.boot, "a"
 .balign 8
-.Lr_high: .quad aarch64_resume_high
-
-.section .text.boot, "ax"
 .global aarch64_resume_start
 // THE ENTRY, at its physical address with the MMU off - x0 the record: the boot page tables adopted with the caches on,
-// as a secondary's start does, and on into the higher half. NO SET/WAY INVALIDATION, which the secondary's start does on
+// as a secondary's start does, and on into the higher half. IN `.text` AND NOT `.text.boot`: once every core is up the
+// direct map - whose gigabytes the boot tables' low half shares - is execute-never everywhere but over the kernel's
+// read-only text (`paging::harden_direct_map`), and this runs a few instructions there with translation on. Its
+// addresses are words beside it, read PC-relative: it runs at its physical address and its virtual one alike. NO
+// SET/WAY INVALIDATION, which the secondary's start does on
 // caches PSCI leaves UNKNOWN at a first power-on: a core resuming from a power-down state finds its caches as the
 // firmware's power-down left them, cleaned, and invalidating by set/way here could only throw away a line it still owns.
 aarch64_resume_start:
 	mov     x19, x0
+	mov     x9, #0x09000000         // DEBUG-MARK
+	mov     w10, #'S'               // DEBUG-MARK
+	strb    w10, [x9]               // DEBUG-MARK
 	ic      iallu
 	dsb     sy
 	isb
-	adrp    x20, __boot_tables
-	add     x20, x20, :lo12:__boot_tables
+	ldr     x20, 7f                 // the boot page tables, physical
 	add     x21, x20, #4096         // L0_LOW  (TTBR0, low identity)
 	add     x22, x20, #8192         // L0_HIGH (TTBR1, higher half)
 	mov     x0, #0xFF00
@@ -209,11 +215,16 @@ aarch64_resume_start:
 	orr     x0, x0, #0x1000        // I: instruction caches
 	msr     sctlr_el1, x0
 	isb
-	adrp    x0, .Lr_high
-	ldr     x4, [x0, :lo12:.Lr_high]
+	ldr     x4, 8f                  // `aarch64_resume_high`, virtual
 	mov     x0, x19
 	br      x4
+.balign 8
+7:
+	.quad   __boot_tables
+8:
+	.quad   aarch64_resume_high
 
+.balign 4
 .global aarch64_replace_trampoline
 // A HIBERNATION'S REPLACEMENT, at its identity address on the boot tables' low half - x0 the parameters' physical address:
 // every dirty line cleaned to memory, translation and the data cache off, every page of the image copied to its frame,
@@ -222,6 +233,9 @@ aarch64_resume_start:
 // what says it is the same kernel.
 aarch64_replace_trampoline:
 	mov     x19, x0
+	mov     x9, #0x09000000         // DEBUG-MARK
+	mov     w10, #'T'               // DEBUG-MARK
+	strb    w10, [x9]               // DEBUG-MARK
 	// CLEAN AND INVALIDATE BY SET/WAY, every level to the point of coherency: the image's pages were written through the
 	// cache, and the copy reads memory.
 	mrs     x0, clidr_el1
@@ -305,6 +319,9 @@ aarch64_replace_trampoline:
 	b       6b
 10:
 	dsb     sy
+	mov     x9, #0x09000000         // DEBUG-MARK
+	mov     w10, #'J'               // DEBUG-MARK
+	strb    w10, [x9]               // DEBUG-MARK
 	ic      iallu
 	dsb     sy
 	isb
@@ -349,15 +366,16 @@ pub fn record_address(cpu: usize) -> u64 {
 
 // THE ENTRY THE FIRMWARE IS GIVEN: the stub's physical address.
 pub fn entry() -> u64 {
-	// SAFETY: words the linker filled, never written.
-	unsafe { core::ptr::read_volatile(&raw const aarch64_resume_entry)[0] }
+	// SAFETY: words the linker filled, never written. The stub is linked in the kernel's half; its physical address is
+	// its virtual one less the offset.
+	unsafe { core::ptr::read_volatile(&raw const aarch64_resume_entry)[0] & !super::paging::KERNEL_VA_OFFSET }
 }
 
 // A HIBERNATION'S TRAMPOLINE, and the boot page tables it is jumped to on: physical addresses, which are the identity
 // addresses the tables' low half maps them at.
 pub fn trampoline() -> u64 {
 	// SAFETY: as `entry`.
-	unsafe { core::ptr::read_volatile(&raw const aarch64_resume_entry)[1] }
+	unsafe { core::ptr::read_volatile(&raw const aarch64_resume_entry)[1] & !super::paging::KERNEL_VA_OFFSET }
 }
 
 pub fn boot_tables() -> u64 {

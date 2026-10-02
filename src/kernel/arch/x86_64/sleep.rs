@@ -120,7 +120,7 @@ pub fn replace() -> i64 {
 	}
 }
 
-pub use super::hibernate::{context_is_ours, development_variant, enter_disk, kernel_image, replace_memory};
+pub use super::hibernate::{context_is_ours, development_variant, enter_disk, kernel_image, ram_banks, replace_memory};
 // The resume context a snapshot carries, which the suite's restore cases hand the kernel as an image's.
 #[cfg(test)]
 pub use super::hibernate::context;

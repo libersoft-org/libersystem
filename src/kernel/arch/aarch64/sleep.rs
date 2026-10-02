@@ -51,6 +51,13 @@ pub fn report_offers() {
 	}
 }
 
+// THE MACHINE'S RAM AS ITS DEVICE TREE DESCRIBES IT - the banks, which a firmware's own regions inside them do not move -
+// for a hibernation image's hardware digest (`sleep::disk`).
+pub fn ram_banks() -> Option<([(u64, u64); fdt::MAX_RAM_REGIONS], usize)> {
+	let info = super::device_tree_boot_info()?;
+	(info.ram_region_count > 0).then_some((info.ram_regions, info.ram_region_count))
+}
+
 // WHY HIBERNATION IS NOT OFFERED, where it is not: the cores are turned off and on through PSCI, and an ITS's tables and
 // mappings are not what a restore puts back.
 pub fn disk_refused() -> Option<&'static str> {

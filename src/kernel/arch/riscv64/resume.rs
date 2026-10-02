@@ -180,27 +180,31 @@ riscv64_resume_high:
 	li      a0, 1
 	ret
 
-.section .data.boot, "a"
 .balign 8
-.Lr_high: .quad riscv64_resume_high
-
-.section .text.boot, "ax"
 .global riscv64_resume_start
 // THE ENTRY, at its physical address with the MMU off - a0 the hart id, a1 the record: the boot page tables adopted, as
-// a secondary's start does, and on into the higher half.
+// a secondary's start does, and on into the higher half. IN `.text` AND NOT `.text.boot`: the identity window keeps
+// execute over the kernel's read-only text alone once the harts are up (`paging::harden_direct_map`), and this runs a
+// few instructions there with translation on. Its addresses are words beside it, read PC-relative: the code runs at
+// its physical address and its virtual one alike.
 riscv64_resume_start:
-	la      t0, __boot_tables
-	srli    t1, t0, 12
+	lla     t0, 7f
+	ld      t1, 0(t0)               // the boot page tables, physical
+	srli    t1, t1, 12
 	li      t2, 8
 	slli    t2, t2, 60
 	or      t1, t1, t2
 	sfence.vma
 	csrw    satp, t1
 	sfence.vma
-	la      t0, .Lr_high
-	ld      t0, 0(t0)
+	ld      t0, 8(t0)               // `riscv64_resume_high`, virtual
 	jr      t0
+.balign 8
+7:
+	.dword  __boot_tables
+	.dword  riscv64_resume_high
 
+.balign 4
 .global riscv64_replace_trampoline
 // A HIBERNATION'S REPLACEMENT, from the boot page tables at its identity address - a0 the parameters' physical address:
 // translation off, every page of the image copied to its frame, and the image's resume entry with the image's boot
@@ -289,15 +293,16 @@ pub fn record_address(cpu: usize) -> u64 {
 
 // THE ENTRY THE FIRMWARE IS GIVEN: the stub's physical address.
 pub fn entry() -> u64 {
-	// SAFETY: words the linker filled, never written.
-	unsafe { core::ptr::read_volatile(&raw const riscv64_resume_entry)[0] }
+	// SAFETY: words the linker filled, never written. The stub is linked in the kernel's half; its physical address is
+	// its virtual one less the offset.
+	unsafe { core::ptr::read_volatile(&raw const riscv64_resume_entry)[0] & !super::paging::KERNEL_VA_OFFSET }
 }
 
 // A HIBERNATION'S TRAMPOLINE, and the boot page tables it is jumped to on: physical addresses, which are the identity
 // addresses those tables map them at.
 pub fn trampoline() -> u64 {
 	// SAFETY: as `entry`.
-	unsafe { core::ptr::read_volatile(&raw const riscv64_resume_entry)[1] }
+	unsafe { core::ptr::read_volatile(&raw const riscv64_resume_entry)[1] & !super::paging::KERNEL_VA_OFFSET }
 }
 
 pub fn boot_tables() -> u64 {
