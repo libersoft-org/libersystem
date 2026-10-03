@@ -713,3 +713,161 @@ VERIFICATION:
 
 LEFT FOR THE OWNER: whether a critical battery should still power the machine off in order (the default built) or do
 nothing at all - the answer said "suspend off" and did not name the power-off, which protects the filesystems.
+
+## The per-core resume path and hibernation on aarch64 and riscv64 (2026-10-02)
+
+WHAT WAS DONE:
+- THE PER-CORE RESUME PATH, ONE OPERATION (`arch/{aarch64,riscv64}/resume.rs`): `save_and_leave(leave, arg)` saves the
+  core's callee-saved integer and FP registers, its stack pointer and the EL1/S-mode state this kernel set - aarch64:
+  TTBR0/1, TCR, MAIR, SCTLR, VBAR, TPIDR_EL1/EL0/RO, SP_EL0, CPACR, CNTKCTL, CNTP_CTL/CVAL, MDSCR, CONTEXTIDR, DAIF, FPCR,
+  FPSR; riscv64: `sstatus`, `sie`, `stvec`, `sscratch`, `satp`, `scounteren`, `stimecmp` where Sstc is used, `gp`, `tp`,
+  `fcsr` and the IMSIC file (delivery, threshold, enables) - into the core's own record and calls `leave`. A `leave`
+  that returns kept the context; a core that comes back through `*_resume_start` - the physical entry PSCI's CPU_ON /
+  CPU_SUSPEND or the SBI's HART_START / non-retentive HART_SUSPEND is given - adopts the boot page tables there (no
+  set/way invalidation on aarch64: a resuming core's caches are as the firmware's power-down left them), and
+  `*_resume_high` puts back its translation first, then everything else, and returns `RESUMED` from `save_and_leave` on
+  the stack the call was made on; `restored` then puts back what is not a register - the GIC CPU interface and
+  redistributor (`gic::init_secondary`) or the IMSIC file - and the tick. The entry and the trampolines are in `.text`,
+  not `.text.boot`, with their addresses as words beside them read PC-relative: once every core is up the direct map
+  is execute-never everywhere but over the kernel's read-only text (`paging::harden_direct_map`; on riscv64 the identity
+  window keeps execute over that span), and the entry runs a few instructions there with translation on.
+  `leave`s: `suspend_leave` (a power-down CPU_SUSPEND or a non-retentive HART_SUSPEND), `off_leave` (CPU_OFF /
+  HART_STOP), `off_now`; `start_saved(cpu)` (CPU_ON / HART_START at the entry with the record), `stopped(cpu)`
+  (AFFINITY_INFO / HART_GET_STATUS).
+- CONTEXT-LOSING IDLE STATES ENTERED: `procpower::Cpu::context_resume` is true on both ports; `firmware_suspend` takes a
+  state that loses the context through `save_and_leave(suspend_leave)` - QEMU's PSCI ends a power-down CPU_SUSPEND as a
+  wait (the call returns with the context kept), OpenSBI ends a non-retentive default suspend at the resume address
+  (the hart comes back through the entry). A state that also stops the core's timer is still held out: no broadcast
+  timer, as part b of the processor milestone says.
+- THE BOOT CORE'S REQUEST, PORTABLE (`sleep/boot_core.rs`): x86_64's ask / run_pending / Kind, moved out of
+  `arch/x86_64/sleep.rs` and used by all three (`arch::sleep::run(kind, ..)` per port).
+- THE HOLD ON EVERY PORT (`idle`): `begin_hold`, `all_others_held`, `end_hold` no longer x86_64's alone; on the ports a
+  held core saves its context through `save_and_leave(hold_leave)` and says it is held only then; `stop_held(jumper)`
+  turns every held core off for a restore's replacement but the one that takes it from its hold (`held(cpu)` for the
+  restore's wait).
+- HIBERNATION ON THE PORTS (`sleep/image.rs`, the ports' `sleep.rs`): offered where PSCI turns cores off and on and no
+  ITS carries the MSIs (aarch64), where the SBI offers HSM (riscv64) - said at boot. The snapshot from the boot core's
+  idle context: every other core held with its record saved, the machine's settings saved (`save_machine`: the GIC
+  distributor whole - every SPI's group, enable, priority, trigger and target or route - or the APLIC domain whole,
+  every function's configuration, the MSI-X entries the kernel programmed), then the boot core's own `save_and_leave`
+  whose `leave` is the copy; the first return is the machine that ran on, the second (`RESUMED`) the machine an image
+  restored: the settings written back, claim writes replayed, the IOMMU's attachments sent again, the sleep's length
+  from the platform RTC, the random pool stirred, and every other core turned on AT ITS RECORD - it comes back inside
+  its hold. The context names the kernel's page tables, the resume entry, the boot core's record and the hart/MPIDR it
+  ran on. The replacement runs on THE CORE THE IMAGE'S BOOT CORE WAS (OpenSBI starts a boot on any hart): the others
+  turned off, that core - from its hold if it is not the boot core, which then turns itself off - waits for every other
+  core to be off by the firmware's word and jumps to the port's trampoline from its identity address on the boot
+  tables: riscv64 with translation off, aarch64 after a clean-and-invalidate by set/way with translation and the data
+  cache off, every page copied to its frame from the directory/list pages outside the image, and the image's resume
+  entry with its boot record. `enter_disk` powers off (no S4 on these ports).
+- THE MAP A DEVICE-TREE PORT RETAINS (`bootmem::retained_map`, both ports' `boot.rs`): the pool's regions as usable, the
+  kernel image as the kernel's, each loader reservation and the tree's blob as the loader's, a firmware reservation as
+  reserved - page-widened, no page taken twice, sorted. Before it the ports' retained map held the pool alone, so a
+  snapshot left out the kernel's own image and a restored kernel ran on a text the image did not carry.
+- THE HARDWARE DIGEST AND THE RESTORE'S FRAMES FROM THE TREE'S RAM BANKS (`arch::sleep::ram_banks`, `sleep::disk`):
+  the UEFI firmware moves its own reserved and runtime regions by a page or two from boot to boot of one machine, so a
+  digest over the memory map refused every restore as "another machine". On the ports the digest covers the device
+  tree's memory banks, and a frame of a bank may take an image page though this boot's firmware keeps it (`image_ram`);
+  device and bad memory never. x86_64 keeps its memory-map digest (`ram_banks` answers `None` there).
+- THE RESTORE WAITS FOR THE BINDINGS, NOT A CLOCK: HibernationService asks the restore's door to stop every binding
+  BEFORE it gives the verdict that releases the held writes, and refuses the replacement when the door did not stop
+  them all (memory is never replaced under a running driver); ServiceManager's verdict wait is 60 minutes instead of
+  15 - a TCG boot of a port spends longer than 15 minutes reading and authenticating the image.
+- THE TEARDOWN'S WAIT AND A REFUSAL AFTER IT (`service_manager/restore.rs`, `hibernation_service.rs`): the first riscv64
+  run refused its sealed image with "the restore's door did not stop every binding (Some(Err(CommitUncertain)))" -
+  under TCG every driver's stop was forced, one after another, and DeviceManager's teardown outlasted ServiceManager's
+  one-minute wait for it; and the machine then could not boot on, its disk drivers being among what was stopped
+  ("no artifact at vol://system/libexec/..."). Now ServiceManager waits ten minutes for the teardown and the image
+  component that long and one call more, and a boot whose bindings were stopped for a replacement that did not happen
+  - a refusal after the stop, no verdict in time, the component gone - restarts the machine through SystemManager's
+  service ("every binding was stopped for a replacement that did not happen - the machine restarts, and boots fresh");
+  the header was invalidated before the stop, so the next boot is a fresh one. The component's refusal says so, does
+  not try the invalidation again on a disk whose driver is gone, and leaves the held writes held; ServiceManager hands
+  LogService no journal on that volume. TO REACH IT ON PURPOSE: the development switch `opt/org.libersystem/absent`
+  takes `replacement` - `sleep::disk::commit` then refuses (`ERR_UNSUPPORTED`, said on the console), compiled into the
+  development build alone, read only on a boot with a profile, like `rtc` and `sleep-types` - and the gate `hibernate`
+  has a case 8 for it: an image refused at its commit after every binding was stopped, the machine restarted by
+  ServiceManager, and the same QEMU's next boot fresh with no image found.
+- PCI CONFIGURATION ACROSS A RESET, PORTABLE (`arch/common/pci`): x86_64's `save_config_all`/`restore_config_all` moved
+  to `common`, over each port's exact-width accessors.
+- `device::pci_addresses`, `frame::is_free`, `sched::kernel_cr3`, `declared::replay_claim_writes`, `entropy::stir`,
+  `sleep::slept_unknown`, `iommu::resume_after_reset` and `sleep::disk`'s snapshot/restore halves no longer x86_64-only.
+- `qemu-run.sh`: `ENTROPY=1` attaches a virtio-rng on aarch64 and riscv64 - neither port has a random instruction, and
+  the image's keys are drawn from the kernel's pool.
+- Kernel tests on the ports: `kernel.processor.a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through`
+  (core 1 saves its context and turns itself off, core 0 turns it on at the entry: `RESUMED` on its own stack, then a
+  thread on it woken by an IPI and a spinner on it preempted) and the tree-states test changed: within a 1000 us
+  request the context-losing state is entered (on riscv64 through the entry), within 300 us the retention state.
+- The gate `hibernate-ports` (`tools/check-hibernate-ports.py`, registered in `check.sh`): per port, with `swtpm` behind
+  `tpm-tis-device` - set up with no warning, an image sealed and restored with every core back and a background counter
+  going on - then with no TPM - no image after the resume, set up with the warning, an image in the clear restored the
+  same way, the restored machine hibernating again - and that image, modified, refused. The counter file is read with
+  `grep`, which writes a line at a time (see FOUND). THE CLOCKS' ORACLE is exact rather than a bound: across the widest
+  boot-time step (the time off, at least half the host-measured off time) the boot-time clock moved by exactly the
+  sleep the kernel reported ("after N ms", to the RTC's second) more than the monotonic clock. A five-second bound on
+  the monotonic step - x86_64's, under KVM - failed here twice on a working restore: the transaction around the time off
+  took the monotonic clock 13 to 20 s under TCG, and once the counter, its output waiting on the volume behind its
+  redirection, had stood 45 s before the freeze (58 s in all, while the two clocks differed by exactly the 711000 ms
+  slept). Lines the gate decides on - the refusal's reason - are waited for whole, as they arrive a piece at a time.
+
+FOUND, NOT FIXED (outside these milestones; put to the owner): at the serial shell `cat` of a file larger than 4096
+bytes shows its first 4096 bytes and says nothing, and so does `head -n N file | tail`: `cat` sends the whole mapped
+file and `head` a 16 KiB window as ONE message, while the shell's foreground relay (`run_tool`'s 4096-byte buffer) and
+the stream reader (`rt::stream::MAX_CHUNK`) receive into 4096 bytes and `sys_channel_recv` truncates to the buffer.
+The first aarch64 run of this gate failed on it - "the counter never finished" after a restore that had worked.
+
+FOUND BY THE PORTS' KERNEL SELECTION, its first whole run there (16 tests on each port):
+- `kernel.sleep.disk.a_restore_refuses_a_foreign_context_and_frames_that_are_not_ram_or_named_twice` failed on aarch64
+  ("past the end of RAM"): it named `ram_top()` - the memory map's top - while a restore since the device tree's banks
+  holds frames under the banks' end, past the last pages a UEFI firmware keeps as its own. `sleep::disk::ram_end(banks)`
+  is now the one rule, used by `begin` and by the test.
+- `kernel.sleep.a_suspend_to_idle_parks_every_core_until_its_timed_wake_and_no_clock_jumps` failed on aarch64 ("slept
+  141217120 ns, the wake was 300000000 ns out"): its deadline is on the boot-time clock, read before the call, and the
+  entry's own work under TCG took the rest. Its oracles are exact now instead of TCG-blind bounds: woken no earlier than
+  the deadline; the boot-time clock moved by the reported sleep more than the monotonic one (within 10 ms of two
+  readings); the tick by no more than the monotonic clock's own advance.
+
+OBSERVED, NOT A FAILURE: on both ports the restored machine's xHCI controller "lost its rings in the sleep" and is
+bound again, as on x86_64; on the ports its torn-down process takes a ring-3 page fault at a revoked mapping as it goes
+("fault: ring-3 page fault ... terminating process ... (unnamed)", right after "xhci went away holding published
+providers"), where x86_64's ends without one. DeviceManager tears it down either way and the new binding comes online.
+
+DEBUGGING MARKS REMOVED: the single-byte UART/SBI marks used to find the restore's crash (in both `resume.rs` and in
+`sleep/image.rs`) are gone; the runs below are of the tree without them.
+
+VERIFICATION:
+- Builds: `LIBER_DEVELOPMENT=1 ./build.sh --arch riscv64` and `--arch aarch64` (the gates' own) and
+  `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64` - RESULT ok; the non-development builds of all three before each
+  kernel selection - RESULT ok.
+- `python3 tools/check-hibernate-ports.py --no-build riscv64` (2026-10-02, 21:56-23:11, 4468 s): PASS - "sealed:
+  restored - count 458 then 459: monotonic +19451 ms, boot-time +1092451 ms, every core back"; "the boot after the
+  resume found no image, was set up with the warning, and hibernated in the clear"; "clear: restored - count 459 then
+  460: monotonic +19294 ms, boot-time +1115294 ms, every core back"; "the restored machine hibernated again"; "a
+  modified image was refused, the header invalidated and the machine booted fresh".
+- `python3 tools/check-hibernate-ports.py --no-build aarch64` (2026-10-02, 23:11-23:59, 2925 s): PASS - sealed 467 then
+  468 (monotonic +14096 ms, boot-time +664096 ms), clear 468 then 469 (monotonic +13703 ms, boot-time +726704 ms), the
+  rest as on riscv64.
+- THE RUNS BEFORE THEM, each failing on something fixed above: aarch64 "the counter never finished" (the 4 KiB
+  truncation, FOUND); riscv64 "the restore's door did not stop every binding (Some(Err(CommitUncertain)))" and a wedged
+  boot after it (the teardown's wait and the restart); riscv64 "the monotonic clock moved 19593 ms" and aarch64 "57984
+  ms" across the time off (the exact oracle); riscv64 "modified: the image was refused, but not as modified: []" (the
+  line read before it ended).
+- `python3 tools/check-tickless-idle.py --no-build aarch64` (2026-10-03, 571 s): PASS - 4 idle states on every core,
+  the context-losing one held out (it is `local-timer-stop`), the retention states entered 1303 times, cpu0 66.9/s and
+  the other cores 0.0/s (`docs/PERF.md` has 67.2/s), suspend to idle 5007 ms for a 5 s wake with 4 cores parked.
+- `env -u LIBER_DEVELOPMENT ./build.sh --arch aarch64 && env -u LIBER_DEVELOPMENT TEST_SELECTION=<the 16 port ids>
+  ./test.sh --arch aarch64 --tags kernel,scheduler,smp,domain,process,syscall`: PASS, 16 passed (153 s) - the per-core
+  resume test, the tree-states test, the suspend-to-idle test and the four `sleep::disk` tests among them; after the two
+  failures above (FOUND BY THE PORTS' KERNEL SELECTION). The same on riscv64: PASS, 16 passed (223 s).
+- `./check.sh --gate hibernate` (x86_64, 2026-10-03, 00:30-01:17, 2841 s): PASS, 13 boots - "restore: count 79 then
+  80: monotonic +3165 ms, boot-time +203165 ms", every refusal as before, and case 8 "late-refusal: refused after every
+  binding was stopped - the machine restarted and booted fresh".
+- `env -u LIBER_DEVELOPMENT ./build.sh --arch x86_64 && env -u LIBER_DEVELOPMENT TEST_SELECTION=<the 19 x86 ids>
+  ./test.sh --tags kernel,scheduler,smp,domain,process,syscall`: PASS, 19 passed (36 s).
+- `./check.sh --gate source-hygiene` (clean), `--gate gate-oracles` (25 test ids, every one declared), `--gate
+  milestone-index` (clean); `./check.sh --refresh dynamic-report` (sizes only) then `--gate dynamic-report`: RESULT ok.
+- `rustfmt --edition 2024 --check` on every changed Rust file, `shfmt -d src/tools/check-hibernate.sh`, `python3 -m
+  py_compile src/tools/check-hibernate-ports.py`: clean.
+
+BLOCKERS: none for the per-core path and the ports' hibernation. Left in this milestone: PCI PME and a network
+device's wake, which no device this harness presents raises.

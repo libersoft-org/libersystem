@@ -18,7 +18,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use abi::{ERR_INVALID, ERR_NO_MEMORY, ERR_RESOURCE_EXHAUSTED, SNAPSHOT_BATCH, SNAPSHOT_CONTEXT, SnapshotInfo, SystemFingerprint};
+use abi::{ERR_INVALID, ERR_NO_MEMORY, ERR_RESOURCE_EXHAUSTED, ERR_UNSUPPORTED, SNAPSHOT_BATCH, SNAPSHOT_CONTEXT, SnapshotInfo, SystemFingerprint};
 
 use crate::mem::frame;
 use crate::sync::SpinLock;
@@ -65,6 +65,12 @@ fn image_ram(phys: u64, banks: &Banks) -> bool {
 // The end of RAM: the highest address any region of the memory map reaches.
 pub fn ram_top() -> u64 {
 	(0..crate::mem::memmap_len()).filter_map(crate::mem::memmap_get).filter(|region| class(region.kind) != Class::Never).map(|region| region.base + region.length).max().unwrap_or(0)
+}
+
+// THE END OF RAM A RESTORE'S FRAMES ARE HELD UNDER: the memory map's, or the device tree's banks' where they reach further
+// - a firmware's own regions at the top of a bank are RAM an image may hold (`image_ram`).
+fn ram_end(banks: &Banks) -> u64 {
+	banks.as_ref().map_or(0, |(banks, count)| banks[..*count].iter().map(|&(base, length)| base + length).max().unwrap_or(0)).max(ram_top())
 }
 
 // EVERY PAGE THE IMAGE HOLDS, in address order, until `visit` answers false: `skip` names the frames the snapshot set
@@ -552,7 +558,7 @@ pub fn begin(count: u64, context: [u8; SNAPSHOT_CONTEXT], mut frame_at: impl FnM
 	}
 	// THE BANKS READ ONCE, and the top of RAM the bitmap covers theirs too.
 	let banks = crate::arch::sleep::ram_banks();
-	let top = banks.as_ref().map_or(0, |(banks, count)| banks[..*count].iter().map(|&(base, length)| base + length).max().unwrap_or(0)).max(ram_top());
+	let top = ram_end(&banks);
 	let targets = Bitmap::new(top)?;
 	for index in 0..count {
 		let phys = match frame_at(index) {
@@ -637,11 +643,16 @@ pub fn abandon() -> bool {
 }
 
 // THE WHOLE-MEMORY REPLACEMENT, once every page is written - handed to the boot core, where the image's resume path
-// continues. Answers only when it cannot happen.
+// continues. Answers only when it cannot happen - and, on a development profile, when the harness names the replacement
+// absent (`replacement`): the one way to reach a restore refused after its bindings were stopped.
 pub fn commit() -> i64 {
 	match RESTORE.lock().as_ref() {
 		Some(restore) if restore.written == restore.pages => {}
 		_ => return ERR_INVALID,
+	}
+	if crate::arch::absent_named(b"replacement") {
+		crate::serial_println!("hibernate: the development switch names the replacement absent - memory is not replaced");
+		return ERR_UNSUPPORTED;
 	}
 	crate::arch::sleep::replace()
 }

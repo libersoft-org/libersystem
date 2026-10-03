@@ -206,7 +206,7 @@ pub fn absent_named(word: &[u8]) -> bool {
 }
 
 // A SHIPPING KERNEL NAMES NOTHING ABSENT: the switch is compiled into the development build alone, so no machine's fw-cfg
-// can turn the CMOS clock or the sleep-type registration off in a shipping one.
+// can turn the CMOS clock, the sleep-type registration or a hibernation's replacement off in a shipping one.
 #[cfg(not(liber_development))]
 pub fn absent_named(_word: &[u8]) -> bool {
 	false

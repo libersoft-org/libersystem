@@ -158,16 +158,12 @@ pub fn run_snapshot() -> Result<SleepReport, i64> {
 	// ------------------------------------------------------------------ the second return: restored from the image
 	let resumed_at = arch::tsc::now();
 	arch::serial::sleep_wake(true);
-	arch::resume::debug_mark(b'a'); // DEBUG-MARK
 	CLOCK.rebase(suspended_at, resumed_at);
 	arch::sleep::restore_machine();
-	arch::resume::debug_mark(b'b'); // DEBUG-MARK
 	crate::declared::replay_claim_writes();
-	arch::resume::debug_mark(b'c'); // DEBUG-MARK
 	// THE IOMMU BEFORE ANY DRIVER RUNS: the fresh boot's controller holds the fresh boot's domains, and the image's
 	// attachments and mappings go to it again.
 	let translating = crate::iommu::resume_after_reset();
-	arch::resume::debug_mark(b'd'); // DEBUG-MARK
 	// THE SLEEP'S LENGTH FROM THE PLATFORM'S CLOCK, which ran through it - or, with none, from the base the clock's
 	// driver hands again at its resume.
 	let slept_ns = if rtc {
@@ -180,11 +176,9 @@ pub fn run_snapshot() -> Result<SleepReport, i64> {
 	// THE RANDOM POOL MOVED ON: its state is the image's, from before the copy, and what the machine that ran on drew
 	// after it - the image's key among it - must not be drawn again.
 	stir_entropy(resumed_at);
-	arch::resume::debug_mark(b'e'); // DEBUG-MARK
 	// EVERY OTHER CORE BACK, AT ITS RECORD, inside the hold that has now ended.
 	crate::idle::end_hold();
 	let back = restart_other_cores();
-	arch::resume::debug_mark(b'f'); // DEBUG-MARK
 	arch::apic::timer_periodic();
 	arch::enable_interrupts();
 	arch::sleep::unmask_device_lines();

@@ -47,6 +47,10 @@ include!(concat!(env!("OUT_DIR"), "/roles_hibernation_service.rs"));
 const PCR: u32 = 4;
 // How long one call to the area, the TPM or the restore's door may take.
 const CALL_TICKS: u64 = 30 * TICKS_PER_SECOND;
+// HOW LONG THE DOOR'S `prepare-replacement` MAY TAKE: ServiceManager's own wait for DeviceManager's teardown (ten
+// minutes - `service_manager::restore`'s `STOP_TICKS`) and one call more, so this end never gives up on a teardown the
+// door is still waiting for. On an emulated port every driver's stop is forced, one after another, past a minute.
+const STOP_TICKS: u64 = 10 * 60 * TICKS_PER_SECOND + CALL_TICKS;
 // HOW LONG A BOOT WAITS FOR ITS TPM: TpmService is up before this component, and the TPM's driver is bound when
 // DeviceManager's drivers are - not necessarily yet. A TPM that is `unavailable` for this long is none.
 const TPM_WAIT_TICKS: u64 = 60 * TICKS_PER_SECOND;
@@ -77,6 +81,9 @@ struct Component {
 	restore: u64,
 	// What became of the image found at this boot: "none", "restored" never answers, or why it was refused.
 	last_image: String,
+	// Whether this boot's bindings were asked to stop for a replacement: a refusal after it cannot let the boot go on -
+	// ServiceManager restarts the machine - and its header was invalidated before.
+	stopped: bool,
 }
 
 // A MEMORY OBJECT HOLDING `bytes`, handed over whole: what the area's `write` takes.
@@ -368,7 +375,8 @@ impl Component {
 		self.invalidate()?;
 		// EVERY BINDING STOPPED BEFORE ANYTHING ELSE: a device still running would write into memory being replaced. A door
 		// that does not answer - the bring-up gave up waiting - refuses the image rather than replace memory under one.
-		match hibernation_restore::Client::with_deadline(ChannelTransport { chan: self.restore }, clock().saturating_add(2 * CALL_TICKS)).prepare_replacement() {
+		self.stopped = true;
+		match hibernation_restore::Client::with_deadline(ChannelTransport { chan: self.restore }, clock().saturating_add(STOP_TICKS)).prepare_replacement() {
 			Some(Ok(())) => {}
 			other => return Err(format!("the restore's door did not stop every binding ({other:?}), so memory is not replaced under them")),
 		}
@@ -388,6 +396,13 @@ impl Component {
 		if found {
 			match self.restore() {
 				Ok(()) => {}
+				// AFTER THE BINDINGS WERE STOPPED the boot cannot go on - its disks are among them - and the header is
+				// already invalidated: ServiceManager restarts the machine at the verdict, and the writes stay held.
+				Err(why) if self.stopped => {
+					say(&format!("the image is refused after every binding was stopped for it, and the machine restarts and boots fresh - {why}"));
+					let _ = restore_commit(self.privilege, true);
+					self.last_image = format!("refused: {why}");
+				}
 				Err(why) => {
 					if why != "none" {
 						say(&format!("the image is refused, and the machine boots fresh - {why}"));
@@ -400,7 +415,7 @@ impl Component {
 				}
 			}
 		}
-		if self.area != 0 {
+		if self.area != 0 && !self.stopped {
 			let _ = self.area().verdict(&false);
 		}
 		if self.restore != 0 {
@@ -453,7 +468,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
-	let mut component = Component { privilege: roles[0], area: roles[1], tpm: roles[2], restore: roles[3], last_image: String::from("none") };
+	let mut component = Component { privilege: roles[0], area: roles[1], tpm: roles[2], restore: roles[3], last_image: String::from("none"), stopped: false };
 	send_blocking(bootstrap, b"HibernationService: online", 0);
 	component.at_start();
 	let mut buf = alloc::vec![0u8; 4096];

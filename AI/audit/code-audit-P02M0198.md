@@ -562,3 +562,33 @@ VERIFICATION:
   performance: C000 at 0x10 and C001 at 255, with preference 0"; "at rest C000's control register reads 0x13 and
   C001's desired performance 50, with the balanced preference 128"; "auto gives the choice back: performance, the
   default on line power, with preference 0"; every other case as before.
+
+## Idle states that lose the core's context, entered on aarch64 and riscv64 (2026-10-03)
+
+WHAT WAS DONE:
+- `procpower::Cpu::context_resume` is true on both device-tree ports, so the governor may choose a state that loses the
+  core's context there; `firmware_suspend` enters such a state through P02M0197's per-core resume path -
+  `resume::save_and_leave(suspend_leave, ..)`: the core's callee-saved and EL1/S-mode state saved into its record, then
+  a power-down CPU_SUSPEND (aarch64) or a non-retentive HART_SUSPEND (riscv64). QEMU's PSCI ends the power-down
+  CPU_SUSPEND as a wait - the call returns with the context kept - and OpenSBI ends the non-retentive default suspend
+  at the resume address, so the hart comes back through `riscv64_resume_start` and returns `RESUMED` on its own stack
+  with its IMSIC file and tick put back.
+- A state that also stops the core's timer (`local-timer-stop`) is still held out: no broadcast timer, as part b says.
+- `kernel.processor.a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request` changed with it: a
+  1000 us request now admits the context-losing state (entered, on riscv64 through the entry), a 300 us request the
+  retention state alone.
+
+DECISIONS: the gate `tickless-idle`'s tree keeps its context-losing state `local-timer-stop`, so the gate's existing
+oracle ("the one that loses the context never") still holds and tests the timer rule; the context-losing entry itself
+is proven by the kernel test, whose tree has a context-losing state that keeps its timer.
+
+VERIFICATION:
+- The ports' kernel selection (16 ids each, `--tags kernel,scheduler,smp,domain,process,syscall`, after
+  `env -u LIBER_DEVELOPMENT ./build.sh --arch <port>`): PASS on aarch64 (16 passed, 153 s) and riscv64 (16 passed,
+  223 s) - `kernel.processor.a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request` and
+  `kernel.processor.a_core_that_lost_its_context_comes_back_through_the_entry_its_boot_came_through` among them.
+- `python3 tools/check-tickless-idle.py --no-build aarch64` (2026-10-03): PASS - the context-losing tree state held out
+  for its timer, the retention states entered 1303 times, the wakeups as in `docs/PERF.md`; riscv64 ran PASS on
+  2026-10-02 with the same kernel change.
+- The gate `hibernate-ports` (PASS on both ports, 2026-10-02) holds and restarts every core through the same per-core
+  path.

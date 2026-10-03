@@ -1005,7 +1005,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// THE IMAGE COMPONENT'S VERDICT, waited for before anything else starts.
 			if MANIFEST[i].name == b"hibernation_service" {
 				if started == State::Ready {
-					restore::await_verdict(&channels, &state, &mut buf);
+					restore::await_verdict(&channels, &state, power, &mut buf);
 				}
 				verdict_owed = false;
 			}

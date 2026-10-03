@@ -117,10 +117,6 @@ aarch64_save_and_leave:
 .global aarch64_resume_high
 // FROM THE STUB, on the boot page tables in the higher half, x0 the record: the core put back as it was saved.
 aarch64_resume_high:
-	mov     x9, #0x09000000         // DEBUG-MARK
-	movk    x9, #0xffff, lsl #48    // DEBUG-MARK
-	mov     w10, #'H'               // DEBUG-MARK
-	strb    w10, [x9]               // DEBUG-MARK
 	ldp     x9, x10, [x0, #{TCR_MAIR}]
 	msr     tcr_el1, x9
 	msr     mair_el1, x10
@@ -132,18 +128,10 @@ aarch64_resume_high:
 	tlbi    vmalle1
 	dsb     sy
 	isb
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'1'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldp     x9, x10, [x0, #{SCTLR_VBAR}]
 	msr     sctlr_el1, x9
 	msr     vbar_el1, x10
 	isb
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'2'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldp     x9, x10, [x0, #{TPIDR}]
 	msr     tpidr_el1, x9
 	msr     tpidr_el0, x10
@@ -154,10 +142,6 @@ aarch64_resume_high:
 	msr     cpacr_el1, x9
 	msr     cntkctl_el1, x10
 	isb
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'3'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldp     x9, x10, [x0, #{FPCR}]
 	msr     fpcr, x9
 	msr     fpsr, x10
@@ -165,31 +149,15 @@ aarch64_resume_high:
 	ldp     d10, d11, [x0, #120]
 	ldp     d12, d13, [x0, #136]
 	ldp     d14, d15, [x0, #152]
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'4'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldr     x9, [x0, #{MDSCR}]
 	msr     mdscr_el1, x9
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'5'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldp     x9, x10, [x0, #{CNTP}]
 	msr     cntp_cval_el0, x10
 	msr     cntp_ctl_el0, x9
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'6'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldp     x9, x10, [x0, #{DAIF_CONTEXTIDR}]
 	msr     contextidr_el1, x10
 	msr     daif, x9
 	isb
-	mov     x11, #0x09000000        // DEBUG-MARK
-	movk    x11, #0xffff, lsl #48   // DEBUG-MARK
-	mov     w12, #'7'               // DEBUG-MARK
-	strb    w12, [x11]              // DEBUG-MARK
 	ldr     x9, [x0, #{SP}]
 	mov     sp, x9
 	ldp     x29, x30, [x0, #{FP_LR}]
@@ -208,14 +176,11 @@ aarch64_resume_high:
 // direct map - whose gigabytes the boot tables' low half shares - is execute-never everywhere but over the kernel's
 // read-only text (`paging::harden_direct_map`), and this runs a few instructions there with translation on. Its
 // addresses are words beside it, read PC-relative: it runs at its physical address and its virtual one alike. NO
-// SET/WAY INVALIDATION, which the secondary's start does on
-// caches PSCI leaves UNKNOWN at a first power-on: a core resuming from a power-down state finds its caches as the
-// firmware's power-down left them, cleaned, and invalidating by set/way here could only throw away a line it still owns.
+// SET/WAY INVALIDATION, which the secondary's start does on caches PSCI leaves UNKNOWN at a first power-on: a core
+// resuming from a power-down state finds its caches as the firmware's power-down left them, cleaned, and invalidating by
+// set/way here could only throw away a line it still owns.
 aarch64_resume_start:
 	mov     x19, x0
-	mov     x9, #0x09000000         // DEBUG-MARK
-	mov     w10, #'S'               // DEBUG-MARK
-	strb    w10, [x9]               // DEBUG-MARK
 	ic      iallu
 	dsb     sy
 	isb
@@ -261,9 +226,6 @@ aarch64_resume_start:
 // what says it is the same kernel.
 aarch64_replace_trampoline:
 	mov     x19, x0
-	mov     x9, #0x09000000         // DEBUG-MARK
-	mov     w10, #'T'               // DEBUG-MARK
-	strb    w10, [x9]               // DEBUG-MARK
 	// CLEAN AND INVALIDATE BY SET/WAY, every level to the point of coherency: the image's pages were written through the
 	// cache, and the copy reads memory.
 	mrs     x0, clidr_el1
@@ -347,9 +309,6 @@ aarch64_replace_trampoline:
 	b       6b
 10:
 	dsb     sy
-	mov     x9, #0x09000000         // DEBUG-MARK
-	mov     w10, #'J'               // DEBUG-MARK
-	strb    w10, [x9]               // DEBUG-MARK
 	ic      iallu
 	dsb     sy
 	isb
@@ -411,12 +370,6 @@ pub fn boot_tables() -> u64 {
 	unsafe { core::ptr::read_volatile(&raw const aarch64_resume_entry)[2] }
 }
 
-// DEBUG-MARK: one byte to QEMU virt's PL011, past every lock.
-pub fn debug_mark(byte: u8) {
-	// SAFETY: DEBUG-MARK - the UART's data register through the direct map.
-	unsafe { core::ptr::write_volatile(super::paging::phys_to_virt(0x0900_0000) as *mut u32, u32::from(byte)) };
-}
-
 // THE ONE OPERATION - see the head of this file. Called with interrupts masked; answers `leave`'s answer, or `RESUMED`
 // once the core is back through the entry and `restored` has put back what is not a register.
 pub fn save_and_leave(leave: extern "C" fn(*mut Record, u64) -> i64, arg: u64) -> i64 {
@@ -425,9 +378,7 @@ pub fn save_and_leave(leave: extern "C" fn(*mut Record, u64) -> i64, arg: u64) -
 	// `leave` either returns or never comes back but through the entry.
 	let answer = unsafe { aarch64_save_and_leave(&raw mut RECORDS[cpu], leave, arg) };
 	if answer == RESUMED {
-		debug_mark(b'r');
 		restored();
-		debug_mark(b'q');
 	}
 	answer
 }

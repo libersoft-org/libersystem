@@ -94,7 +94,9 @@ fn a_restore_refuses_a_foreign_context_and_frames_that_are_not_ram_or_named_twic
 	assert_eq!(super::begin(2, context, |_| Ok(held)), Err(ERR_INVALID), "one frame named twice");
 	assert_eq!(super::begin(1, context, |_| Ok(held + 8)), Err(ERR_INVALID), "not a page");
 	assert_eq!(super::begin(1, context, |_| Ok(0)), Err(ERR_INVALID), "page zero");
-	assert_eq!(super::begin(1, context, |_| Ok(super::ram_top())), Err(ERR_INVALID), "past the end of RAM");
+	// THE END OF RAM AS A RESTORE HOLDS IT: on a device-tree port the banks reach past the memory map's top, whose last
+	// pages a UEFI firmware keeps as its own.
+	assert_eq!(super::begin(1, context, |_| Ok(super::ram_end(&crate::arch::sleep::ram_banks()))), Err(ERR_INVALID), "past the end of RAM");
 	// A LIST THAT CHANGES BETWEEN THE TWO READS: the second pass holds it to the first.
 	let mut reads = 0u64;
 	let changing = super::begin(2, context, |index| {

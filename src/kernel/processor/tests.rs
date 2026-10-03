@@ -145,7 +145,8 @@ fn a_trees_idle_states_are_entered_through_the_firmware_within_a_latency_request
 	let mut tree = fdt::TreeIdleStates { states: [fdt::TreeIdleState::default(); fdt::MAX_TREE_IDLE_STATES], state_count: 3, cpus: [(0, [0; fdt::MAX_TREE_IDLE_STATES], 0); fdt::MAX_TREE_IDLE_CPUS], cpu_count: 1 };
 	tree.states[0] = fdt::TreeIdleState { phandle: 1, parameter: retention, entry_latency_us: 20, exit_latency_us: 40, min_residency_us: 80, local_timer_stop: false };
 	tree.states[1] = fdt::TreeIdleState { phandle: 2, parameter: deep, entry_latency_us: 500, exit_latency_us: 1500, min_residency_us: 5000, local_timer_stop: false };
-	// NOT `local-timer-stop`, so the reason it is held out is the context it loses - the gate's tree carries the timer's.
+	// NOT `local-timer-stop`: losing the context alone no longer holds a state out - the per-core resume path brings the
+	// core back - while one that stops the timer still is, as the gate's tree, which carries the timer's, shows.
 	tree.states[2] = fdt::TreeIdleState { phandle: 3, parameter: lost, entry_latency_us: 100, exit_latency_us: 250, min_residency_us: 1000, local_timer_stop: false };
 	let mut names = [0u32; fdt::MAX_TREE_IDLE_STATES];
 	names[..3].copy_from_slice(&[1, 2, 3]);

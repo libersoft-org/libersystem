@@ -26,6 +26,10 @@
 #   7. WITHOUT A TPM: hibernation is set up, with the warning in `sleepctl status`; an image is written with its key in the
 #      clear - the line saying so carries the warning, and the header says so - and a new QEMU, still without a TPM,
 #      restores it with the counter going on. Then such an image, written again, is refused on a boot whose TPM seals.
+#   8. A REFUSAL AFTER EVERY BINDING WAS STOPPED: the development switch names the kernel's replacement absent
+#      (`opt/org.libersystem/absent` = `replacement`), so an image read, authenticated and held by the kernel is refused
+#      at its commit, after the restore's door stopped every binding - the disks among them. The machine restarts, and
+#      its next boot - the same QEMU - is a fresh one that finds no image.
 # AFTER EVERY REFUSAL the header is invalidated on the disk and `sleepctl status` names why.
 #
 # IT BOOTS ITS OWN INSTANCES in private state, one at a time, and takes the last one down from the EXIT trap.
@@ -498,4 +502,15 @@ hibernate no-tpm-again
 boot clear-on-tpm "$S_OFFERED"
 refused clear-on-tpm "its key is in the clear, and this machine"
 
-say "PASS - $boots boots: an image written and entered S4 (SUSPEND_DISK), restored with the counter going on; the boot after found none; powered off where S4 is not offered; a modified image, another system image and another machine each refused with the header invalidated; hybrid discarded on the S3 resume and restored after the power was lost; without a TPM set up with the warning, written with its key in the clear and restored, and such an image refused where a TPM seals"
+# 8. A REFUSAL AFTER EVERY BINDING WAS STOPPED: the machine restarts and boots fresh.
+hibernate late-refusal-image
+boot late-refusal "$S_OFFERED -fw_cfg name=opt/org.libersystem/absent,string=replacement"
+grep -a -q -F "hibernate: the development switch names the replacement absent" "$serial" || fail "late-refusal: the kernel did not refuse the replacement the switch names absent"
+grep -a -q -F "HibernationService: the image is refused after every binding was stopped for it, and the machine restarts and boots fresh" "$serial" || fail "late-refusal: the image was not refused as one whose bindings were stopped"
+grep -a -q -F "ServiceManager: restore: every binding was stopped for a replacement that did not happen - the machine restarts, and boots fresh" "$serial" || fail "late-refusal: ServiceManager did not restart the machine"
+(($(seen "HibernationService: online") >= 2)) || fail "late-refusal: no second boot followed the restart"
+[[ "$(header)" == empty ]] || fail "late-refusal: the header was not invalidated before the bindings were stopped ($(header))"
+grep -q "the image found at this boot: none" <<<"$(status_line late-refusal)" || fail "late-refusal: the boot after the restart found an image: $(cat "$state/status-late-refusal.log")"
+say "late-refusal: refused after every binding was stopped - the machine restarted and booted fresh"
+
+say "PASS - $boots boots: an image written and entered S4 (SUSPEND_DISK), restored with the counter going on; the boot after found none; powered off where S4 is not offered; a modified image, another system image and another machine each refused with the header invalidated; hybrid discarded on the S3 resume and restored after the power was lost; without a TPM set up with the warning, written with its key in the clear and restored, and such an image refused where a TPM seals; refused after its bindings were stopped, the machine restarted and booted fresh"

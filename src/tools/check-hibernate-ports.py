@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # check-hibernate-ports.py - hibernation on the device-tree ports, end to end: aarch64 and riscv64, each booting its
 # development build from a system disk SET UP FOR IT - a GPT whose first partition is the system volume and whose second
-# is a hibernation partition a little larger than the guest's memory. No TPM is attached: these boots are the owner's
+# is a hibernation partition a little larger than the guest's memory - first with `swtpm` behind QEMU's
+# `tpm-tis-device`, which the device tree describes as a `tcg,tpm-tis-mmio` node, and then with no TPM: the owner's
 # "hibernation without a TPM", allowed with a warning, the image's key written beside it in the clear.
 #
 # THE ORACLES ARE THE HOST'S. Neither port has an S4, so a hibernation ends in the firmware's power-off and the guest's
 # QEMU exits; the image's header is read from the disk file between the boots - its magic, its state, and how its key is
 # kept. On each target:
 #
-#   1. SET UP AND WARNED: the kernel says hibernation is offered (every core's context through the firmware), and
-#      `sleepctl status` says it is set up, with the warning that no TPM seals its key.
+#   1. SET UP, SEALED: the kernel says hibernation is offered (every core's context through the firmware), and with the
+#      TPM bound `sleepctl status` says it is set up, with no warning.
 #   2. HIBERNATE AND RESTORE. A counter runs in the background at the serial shell; `sleepctl hibernate`; the image is
-#      written with its key in the clear - the header says so - and QEMU exits. A new boot on the same disk takes the key
-#      from the header, puts the image in the kernel, replaces memory on the core the image's boot core was, and the
-#      image's kernel resumes: every other core turned on again at its record, the transaction ending "slept and woke"
-#      by the restore, the header invalidated - and the counter goes on at its next value, one unbroken sequence, with
-#      its monotonic clock moved by less than five seconds across the time off and its boot-time clock by at least half
-#      of it: the same program, the same counter, on a machine all of whose cores came back.
-#   3. THE BOOT AFTER A RESUME sees no image.
-#   4. A MODIFIED IMAGE: hibernated again, one byte of a chunk flipped on the host - refused as modified, the header
+#      written with its key sealed through the TPM - the header says so - and QEMU exits. A new boot on the same disk and
+#      the same TPM unseals the key, puts the image in the kernel, replaces memory on the core the image's boot core was,
+#      and the image's kernel resumes: every other core turned on again at its record, the transaction ending "slept and
+#      woke" by the restore, the header invalidated - and the counter goes on at its next value, one unbroken sequence,
+#      its boot-time clock moved by at least half the time off and by exactly the sleep the kernel reported more than its
+#      monotonic clock: the same program, the same counter, on a machine all of whose cores came back.
+#   3. THE BOOT AFTER A RESUME, WITH NO TPM, sees no image, and says hibernation is set up with the warning that no TPM
+#      seals its key. A counter again, and an image written with its key in the clear.
+#   4. RESTORED IN THE CLEAR: the next boot, still with no TPM, takes the key from the header and the counter goes on as
+#      in 2. The restored machine hibernates again.
+#   5. A MODIFIED IMAGE: that image with one byte of a chunk flipped on the host - refused as modified, the header
 #      invalidated, and the machine boots fresh.
 #
 # ONE GUEST AT A TIME: each boot is torn down before the next one, and each target before the next.
@@ -28,6 +32,7 @@
 import importlib.util
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -113,11 +118,45 @@ class Disk:
 			disk.write(bytes([byte[0] ^ 0x40]))
 
 
+# ------------------------------------------------------------------ the TPM
+
+# `swtpm` FOR ONE BOOT, on a state directory kept across the boots that share it: started before QEMU, stopped after it,
+# so every boot's PCRs start from a reset as a machine's do.
+class Tpm:
+	def __init__(self, state):
+		self.state = state
+		self.socket = os.path.join(state, 'swtpm.sock')
+		self.process = None
+		os.makedirs(state, exist_ok=True)
+
+	def start(self):
+		if os.path.exists(self.socket):
+			os.unlink(self.socket)
+		log = os.path.join(self.state, 'swtpm.log')
+		self.process = subprocess.Popen(['swtpm', 'socket', '--tpm2', '--tpmstate', f'dir={self.state}', '--ctrl', f'type=unixio,path={self.socket}', '--log', f'file={log}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(self.socket):
+			if self.process.poll() is not None or time.monotonic() > deadline:
+				raise GateError(f'swtpm did not open its control socket (see {log})')
+			time.sleep(0.1)
+
+	def stop(self):
+		if self.process is not None:
+			self.process.terminate()
+			try:
+				self.process.wait(timeout=10)
+			except subprocess.TimeoutExpired:
+				self.process.kill()
+				self.process.wait()
+			self.process = None
+
+
 # ------------------------------------------------------------------ one boot
 
 class Guest:
-	def __init__(self, target, disk, label, work):
+	def __init__(self, target, disk, label, work, tpm=None):
 		self.target = target
+		self.tpm = tpm
 		self.scale = 10.0
 		self.serial_path = os.path.join(lab.BUILD, f'hibernate-serial-{target}.sock')
 		self.log_path = os.path.join(work, f'hibernate-{target}-{label}.log')
@@ -127,21 +166,30 @@ class Guest:
 			os.unlink(self.serial_path)
 		# AN ENTROPY DEVICE: neither port has a random instruction, and the image's keys are drawn from the kernel's pool.
 		env = dict(os.environ, LIBER_DEVELOPMENT='1', DEV_PROFILE='1', COLD='1', SERIAL=f'unix:{self.serial_path},server', SMP=str(SMP), MEM=f'{MEM_MIB}M', RUN_DISK=disk.path, LIBER_RUN_MODE='development', UEFI='1', ENTROPY='1')
-		note(f'{target}: boot {label}; serial log {self.log_path}')
+		env.pop('TPM_SOCKET', None)
+		env.pop('TPM_FRONTEND', None)
+		if tpm is not None:
+			tpm.start()
+			env.update(TPM_SOCKET=tpm.socket, TPM_FRONTEND='tis')
+		note(f'{target}: boot {label}{" with the TPM" if tpm else " with no TPM"}; serial log {self.log_path}')
 		self.process = subprocess.Popen(['bash', 'harness/qemu-run.sh', target, kernel], cwd=SRC, env=env, stdout=self.runner_log, stderr=self.runner_log, start_new_session=True)
+		self.log = open(self.log_path, 'wb')
 		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		deadline = time.monotonic() + 300
 		while True:
-			if self.process.poll() is not None:
-				raise GateError(f'{label}: the guest exited before it opened its serial line (see {self.runner_log.name})')
+			try:
+				if self.process.poll() is not None:
+					raise GateError(f'{label}: the guest exited before it opened its serial line (see {self.runner_log.name})')
+				if time.monotonic() > deadline:
+					raise GateError(f'{label}: the guest never opened its serial line')
+			except GateError:
+				self.close()
+				raise
 			try:
 				sock.connect(self.serial_path)
 				break
 			except OSError:
-				if time.monotonic() > deadline:
-					raise GateError(f'{label}: the guest never opened its serial line') from None
 				time.sleep(0.5)
-		self.log = open(self.log_path, 'wb')
 		self.serial = Serial(sock, self.log, self.scale)
 
 	def boot_to_shell(self, what):
@@ -150,8 +198,8 @@ class Guest:
 	def seen(self, needle):
 		return needle.encode() in lab.strip_ansi(bytes(self.serial.data))
 
-	def wait_line(self, needle, timeout, what):
-		self.serial.wait_for(0, lambda text: needle.encode() in text, timeout, what)
+	def wait_line(self, needle, timeout, what, since=0):
+		self.serial.wait_for(since, lambda text: needle.encode() in text, timeout, what)
 
 	# THE GUEST GONE: QEMU exits at the firmware's power-off, and so does the runner that exec'd it.
 	def wait_exit(self, timeout, what):
@@ -174,105 +222,155 @@ class Guest:
 			except OSError:
 				pass
 			self.process.wait()
+		if self.tpm is not None:
+			self.tpm.stop()
 		self.log.close()
 		self.runner_log.close()
 
 
 # THE COUNTER ACROSS THE TIME OFF, read from its file once it has ended: one unbroken run of values from 1, whose widest
-# step of the boot-time clock is the time off, at least `off_ms`, while the monotonic clock moved by less than five
-# seconds across it.
+# step of the boot-time clock is the time off, at least `off_ms`, and across which the boot-time clock moved by EXACTLY
+# the sleep the kernel reported more than the monotonic clock did - to the RTC's second. Not a bound on the monotonic
+# step itself: under emulation the transaction around the time off takes it tens of seconds, and the counter's own
+# output, waiting on the volume behind its redirection, can hold the counter longer than that before the freeze.
 COUNT = re.compile(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)')
-
-
-def counter_goes_on(guest, name, off_ms):
-	end = time.monotonic() + (COUNTER_S * 2 + 120) * guest.scale
-	while True:
-		text = guest.serial.run(f'cat {name}', 120)
-		if 'sleepcheck: count done' in text:
+# THE FILE READ THROUGH `grep`, which writes a line at a time. The shell relays a foreground command's output, and a pipe
+# carries a stage's, a message of at most 4096 bytes at a time, and `cat` and `head` send a file's window as one message -
+# so at the serial shell they show a counter file's first 4096 bytes. A read whose lines were cut by a line the serial
+# console mixed in is read again.
+def counter_rows(guest, name):
+	for _ in range(3):
+		text = guest.serial.run(f'grep count {name}', 300)
+		rows = [tuple(int(value) for value in found) for found in COUNT.findall(text)]
+		if 'sleepcheck: count done' in text and [row[0] for row in rows] == list(range(1, len(rows) + 1)):
 			break
+	return rows
+
+
+def counter_goes_on(guest, name, off_ms, slept_ms):
+	end = time.monotonic() + (COUNTER_S * 2 + 120) * guest.scale
+	while 'sleepcheck: count done' not in guest.serial.run(f'tail -n 2 {name}', 120):
 		if time.monotonic() > end:
 			raise GateError('the counter never finished, so its file was never published')
 		time.sleep(5)
-	rows = [tuple(int(value) for value in found) for found in COUNT.findall(text)]
+	rows = counter_rows(guest, name)
 	if not rows or [row[0] for row in rows] != list(range(1, len(rows) + 1)):
 		raise GateError('the counter did not run one unbroken sequence from 1 - it skipped, repeated or started again')
 	gap = max(range(1, len(rows)), key=lambda at: rows[at][2] - rows[at - 1][2])
 	mono, boot = rows[gap][1] - rows[gap - 1][1], rows[gap][2] - rows[gap - 1][2]
 	if boot < off_ms:
 		raise GateError(f'the boot-time clock moved {boot} ms at its widest step, under the {off_ms} ms off')
-	if mono > 5000:
-		raise GateError(f'the monotonic clock moved {mono} ms across the time off')
+	if abs((boot - mono) - slept_ms) > 1000:
+		raise GateError(f'across the time off the boot-time clock moved {boot} ms and the monotonic clock {mono} ms - not {slept_ms} ms apart, the sleep the kernel reported')
 	return rows[gap - 1][0], rows[gap][0], mono, boot
 
 
-# A HIBERNATION ASKED: the image written with its key in the clear, and the guest gone.
-def hibernate(guest, disk, what):
+# A HIBERNATION ASKED: the image written - its key sealed through the TPM, or in the clear with the warning - and the
+# guest gone.
+def hibernate(guest, disk, what, sealed):
+	mark = len(guest.serial.data)
 	guest.serial.type(b'sleepctl hibernate\n')
-	guest.wait_line('HibernationService: the image is written', 900, f'{what}: the image')
-	# THE WHOLE LINE, which arrives a piece at a time: its key in the clear, and the warning.
-	guest.wait_line(f'its key NOT sealed - {WARNING}', 60, f'{what}: the image written with its key in the clear and the warning')
-	guest.wait_line('hibernate: the image is written - no S4 on this machine, so it is powered off', 300, f'{what}: the power-off')
+	guest.wait_line('HibernationService: the image is written', 900, f'{what}: the image', mark)
+	# THE WHOLE LINE, which arrives a piece at a time: how its key is kept, and the warning where no TPM seals it.
+	if sealed:
+		guest.wait_line('chunks, its key sealed to PCR 4', 60, f'{what}: the image written with its key sealed', mark)
+	else:
+		guest.wait_line(f'its key NOT sealed - {WARNING}', 60, f'{what}: the image written with its key in the clear and the warning', mark)
+	guest.wait_line('hibernate: the image is written - no S4 on this machine, so it is powered off', 300, f'{what}: the power-off', mark)
 	guest.wait_exit(300, what)
 	guest.close()
-	if disk.header() != 'image' or disk.protection() != 'clear':
-		raise GateError(f'{what}: the partition does not hold an image whose key is in the clear ({disk.header()}, {disk.protection()})')
+	kept = 'tpm' if sealed else 'clear'
+	if disk.header() != 'image' or disk.protection() != kept:
+		raise GateError(f'{what}: the partition does not hold an image whose key is kept {kept} ({disk.header()}, {disk.protection()})')
+
+
+# `sleepctl status`, once the TPM's driver has come online where there is one - the status asks without waiting - until
+# it says `want` (a line of the serial console's can land inside the tool's output, so it is asked up to three times).
+def status(guest, tpm, want, what):
+	if tpm is not None:
+		guest.wait_line('driver.tpm: online', 1800, f'{what}: the TPM driver')
+	for _ in range(3):
+		lines = [line.strip() for line in guest.serial.run('sleepctl status', 300).splitlines()]
+		if want(lines):
+			return
+	raise GateError(f'{what}: {lines}')
+
+
+# A RESTORE: the image in the kernel, memory replaced and the image's kernel resumed, the transaction ended, every core
+# back and the header invalidated - and the counter going on across the time off.
+def restored(guest, disk, what, off_started, counter):
+	guest.wait_line('HibernationService: the image is authenticated and in the kernel', 1800, f'{what}: the image')
+	guest.wait_line('hibernate: replacing memory with the image', 600, f'{what}: the replacement')
+	resumed = re.compile(rb'sleep: resumed \(the restore of a hibernation image, after (\d+) ms')
+	guest.serial.wait_for(0, lambda text: resumed.search(text) is not None, 600, f'{what}: the resume')
+	slept_ms = int(resumed.search(guest.serial.text_since(0)).group(1))
+	off_ms = int((time.monotonic() - off_started) * 1000)
+	guest.wait_line('ServiceManager: sleep: the transaction ended - slept and woke', 900, f'{what}: the transaction')
+	if guest.seen('did not come back from the image') or guest.seen('was not turned on again'):
+		raise GateError(f'{what}: a core did not come back from the image')
+	guest.serial.type(b'\n')
+	guest.boot_to_shell(f'{what}: the restored machine')
+	if disk.header() != 'empty':
+		raise GateError(f'{what}: the header was not invalidated before the jump ({disk.header()})')
+	before, after, mono, boot = counter_goes_on(guest, counter, off_ms // 2, slept_ms)
+	note(f'{guest.target}: {what} - count {before} then {after}: monotonic +{mono} ms, boot-time +{boot} ms, every core back')
 
 
 def run(target, work):
 	disk = Disk(target, work)
-	# 1 and 2: set up and warned; hibernate.
-	guest = Guest(target, disk, 'fresh', work)
+	state = os.path.join(work, f'tpm-{target}')
+	shutil.rmtree(state, ignore_errors=True)
+	tpm = Tpm(state)
+	# 1 and 2, WITH THE TPM: set up with no warning; an image sealed, and restored.
+	guest = Guest(target, disk, 'sealed', work, tpm)
 	try:
 		guest.boot_to_shell('the first boot')
 		if not guest.seen('sleep: hibernation is offered'):
 			raise GateError('the kernel did not say hibernation is offered')
-		status = guest.serial.run('sleepctl status', 300)
-		if f'hibernation: set up - {WARNING}' not in status:
-			raise GateError(f'the status does not say hibernation is set up with the warning: {status}')
-		guest.serial.type(f'sleepcheck count {COUNTER_S} > counter.txt &\n'.encode())
+		status(guest, tpm, lambda lines: 'hibernation: set up' in lines, 'with the TPM, the status does not say hibernation is set up, with no warning')
+		guest.serial.type(f'sleepcheck count {COUNTER_S} > counter-sealed.txt &\n'.encode())
 		time.sleep(5 * guest.scale)
-		hibernate(guest, disk, 'hibernate')
+		hibernate(guest, disk, 'sealed: hibernate', True)
 	finally:
 		guest.close()
 	off_started = time.monotonic()
-	note(f'{target}: hibernated - the image written with its key in the clear, and the machine off')
-	guest = Guest(target, disk, 'restore', work)
+	note(f'{target}: hibernated - the image written with its key sealed through the TPM, and the machine off')
+	guest = Guest(target, disk, 'sealed-restore', work, tpm)
 	try:
-		guest.wait_line('HibernationService: its key was written in the clear - no TPM sealed it', 1800, 'restore: the key')
-		guest.wait_line('HibernationService: the image is authenticated and in the kernel', 1800, 'restore: the image')
-		guest.wait_line('hibernate: replacing memory with the image', 600, 'restore: the replacement')
-		guest.wait_line('sleep: resumed (the restore of a hibernation image', 600, 'restore: the resume')
-		off_ms = int((time.monotonic() - off_started) * 1000)
-		guest.wait_line('ServiceManager: sleep: the transaction ended - slept and woke', 900, 'restore: the transaction')
-		if guest.seen('did not come back from the image') or guest.seen('was not turned on again'):
-			raise GateError('restore: a core did not come back from the image')
-		guest.serial.type(b'\n')
-		guest.boot_to_shell('the restored machine')
-		if disk.header() != 'empty':
-			raise GateError(f'restore: the header was not invalidated before the jump ({disk.header()})')
-		before, after, mono, boot = counter_goes_on(guest, 'counter.txt', off_ms // 2)
-		note(f'{target}: restored - count {before} then {after}: monotonic +{mono} ms, boot-time +{boot} ms, every core back')
+		restored(guest, disk, 'sealed: restored', off_started, 'counter-sealed.txt')
 	finally:
 		guest.close()
-	# 3. The boot after a resume.
-	guest = Guest(target, disk, 'after-restore', work)
+	# 3, WITH NO TPM: no image after the resume; set up with the warning; an image in the clear.
+	guest = Guest(target, disk, 'clear', work)
 	try:
 		guest.boot_to_shell('the boot after the resume')
-		status = guest.serial.run('sleepctl status', 300)
-		if 'the image found at this boot: none' not in status:
-			raise GateError(f'the boot after a resume found an image: {status}')
-		hibernate(guest, disk, 'hibernate again')
+		status(guest, None, lambda lines: 'the image found at this boot: none' in lines and any(line.startswith(f'hibernation: set up - {WARNING}') for line in lines), 'with no TPM after the resume, the status does not say no image was found and hibernation is set up with the warning')
+		guest.serial.type(f'sleepcheck count {COUNTER_S} > counter-clear.txt &\n'.encode())
+		time.sleep(5 * guest.scale)
+		hibernate(guest, disk, 'clear: hibernate', False)
 	finally:
 		guest.close()
-	note(f'{target}: the boot after the resume found no image; hibernated again')
-	# 4. A modified image.
+	off_started = time.monotonic()
+	note(f'{target}: the boot after the resume found no image, was set up with the warning, and hibernated in the clear')
+	# 4. Restored in the clear, and hibernated again from the restored machine.
+	guest = Guest(target, disk, 'clear-restore', work)
+	try:
+		guest.wait_line('HibernationService: its key was written in the clear - no TPM sealed it', 1800, 'clear: the key')
+		restored(guest, disk, 'clear: restored', off_started, 'counter-clear.txt')
+		hibernate(guest, disk, 'clear: the restored machine hibernates again', False)
+	finally:
+		guest.close()
+	note(f'{target}: the restored machine hibernated again')
+	# 5. A modified image.
 	disk.modify()
 	guest = Guest(target, disk, 'modified', work)
 	try:
-		guest.wait_line('HibernationService: the image is refused, and the machine boots fresh - ', 1800, 'modified: the refusal')
-		refused = [line for _, line in guest.serial.lines_since(0) if 'the image is refused' in line]
-		if not any('modified' in line for line in refused):
-			raise GateError(f'modified: the image was refused, but not as modified: {refused}')
+		# THE WHOLE LINE, which arrives a piece at a time: its reason is its end.
+		refusal = re.compile(rb'HibernationService: the image is refused, and the machine boots fresh - ([^\n]*)\n')
+		guest.serial.wait_for(0, lambda text: refusal.search(text) is not None, 1800, 'modified: the refusal')
+		why = refusal.search(guest.serial.text_since(0)).group(1).decode(errors='replace')
+		if 'modified' not in why:
+			raise GateError(f'modified: the image was refused, but not as modified: {why}')
 		guest.boot_to_shell('the fresh boot after the refusal')
 		if disk.header() != 'empty':
 			raise GateError(f'modified: the refused image\'s header was not invalidated ({disk.header()})')
@@ -289,6 +387,9 @@ def main():
 		if target not in TARGETS:
 			print(f'check-hibernate-ports: unknown target {target!r}', file=sys.stderr)
 			return 2
+	if shutil.which('swtpm') is None:
+		print('check-hibernate-ports: swtpm is not installed - setup.sh installs it, and this gate fails rather than skips without it', file=sys.stderr)
+		return 1
 	work = os.path.join(lab.BUILD_ROOT, 'logs', 'hibernate-ports')
 	os.makedirs(work, exist_ok=True)
 	failed = []

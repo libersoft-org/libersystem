@@ -87,16 +87,25 @@ fn a_freeze_holds_the_subtree_and_its_newcomers_and_a_thaw_leaves_a_stop_alone()
 crate::tagged_test!(a_suspend_to_idle_parks_every_core_until_its_timed_wake_and_no_clock_jumps, [Kernel, Smp, Scheduler], id = "kernel.sleep.a_suspend_to_idle_parks_every_core_until_its_timed_wake_and_no_clock_jumps", covers = ["kernel"]);
 fn a_suspend_to_idle_parks_every_core_until_its_timed_wake_and_no_clock_jumps() {
 	const WAKE_NS: u64 = 300_000_000;
+	// The slack between two readings of the clocks taken one after the other - an emulated core can be descheduled
+	// between them.
+	const READ_SLACK_NS: u64 = 10_000_000;
 	let clock = &arch::common::time::CLOCK;
 	let (boot_before, mono_before, ticks_before) = (super::boot_ns(), clock.nanos(arch::tsc::now()), arch::apic::ticks());
-	let report = super::sys_system_sleep(&sched::root_domain(), abi::SLEEP_STATE_IDLE, super::boot_ns() + WAKE_NS).expect("the machine slept");
+	let deadline = boot_before + WAKE_NS;
+	let report = super::sys_system_sleep(&sched::root_domain(), abi::SLEEP_STATE_IDLE, deadline).expect("the machine slept");
 	let (boot_after, mono_after, ticks_after) = (super::boot_ns(), clock.nanos(arch::tsc::now()), arch::apic::ticks());
 	assert_eq!(report.wake, abi::WAKE_TIMER, "the timed wake ended it");
-	assert!(report.slept_ns >= WAKE_NS - WAKE_NS / 10, "slept {} ns, the wake was {WAKE_NS} ns out", report.slept_ns);
-	assert!(boot_after - boot_before >= report.slept_ns, "the boot-time clock takes the sleep in");
-	// THE MONOTONIC CLOCK AND THE TICK EXCLUDE IT: what they advanced by is the work around the sleep, not the sleep.
-	assert!(mono_after - mono_before < report.slept_ns / 2, "the monotonic clock jumped by {} ns across a {} ns sleep", mono_after - mono_before, report.slept_ns);
-	assert!(ticks_after - ticks_before < 10, "the tick jumped by {} across the sleep", ticks_after - ticks_before);
+	// NOT BEFORE ITS DEADLINE - which is on the boot-time clock, so the entry's own work, slow under emulation, is part
+	// of the wait and the sleep itself is what is left of it.
+	assert!(boot_after >= deadline, "woken {} ns before the timed wake's deadline", deadline - boot_after);
+	assert!(report.slept_ns > 0 && boot_after - boot_before >= report.slept_ns, "the boot-time clock takes the sleep in");
+	// THE MONOTONIC CLOCK AND THE TICK EXCLUDE IT: the boot-time clock moved by exactly the sleep more than the monotonic
+	// one, and the tick by no more than the monotonic clock's own advance - the work around the sleep, not the sleep.
+	let excluded = (boot_after - boot_before) - (mono_after - mono_before);
+	assert!(excluded.abs_diff(report.slept_ns) <= READ_SLACK_NS, "the boot-time clock moved {excluded} ns more than the monotonic one across a {} ns sleep", report.slept_ns);
+	let tick_ns = 1_000_000_000 / u64::from(arch::common::time::TICK_HZ);
+	assert!(ticks_after - ticks_before <= (mono_after - mono_before) / tick_ns + 1, "the tick jumped by {} across the sleep, the monotonic clock by {} ns", ticks_after - ticks_before, mono_after - mono_before);
 	assert_eq!(report.core_count as usize, smp::cpu_count(), "every core's parked record");
 	assert!(!super::sleeping(), "and the sleep ended");
 	// NO PERIODIC TICK WHILE PARKED: a core woken a tick at a time for 300 ms would have taken 30 timer wakes.
