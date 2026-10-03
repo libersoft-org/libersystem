@@ -51,6 +51,7 @@ use acpi_model::events::{self, Trigger};
 use acpi_model::node::{self, Role, Scope};
 use acpi_model::power::{self, DState, Plan, Resource, Resources};
 use acpi_model::processor::{self as processor_objects, Entry, Gas};
+use acpi_model::sleep::{self as platform_half, Platform, Prw, Sleeper};
 use acpi_model::{admission, handshake, properties};
 use aml::host::{Access, Host, HostError, TableBytes};
 use aml::{Aml, Limits, NodeId, Object, Path, Seg, Space};
@@ -676,12 +677,10 @@ struct Service {
 	// The event this instance's embedded controller raises, and its node.
 	ec_gpe: Option<u16>,
 	ec_node: Option<NodeId>,
-	// The wake GPEs `prepare` armed for the sleep in progress, which `wake` disarms.
-	wake_armed: Vec<u16>,
-	// EVERY POWER RESOURCE'S HOLDERS AND EVERY DEVICE'S STATE, and the wake nodes whose `_PRW` resources `prepare` took
-	// for the sleep in progress, which `wake` lets go.
+	// THE SLEEP IN PROGRESS: the wake events `prepare` set and the wake nodes' power it took, which `wake` gives back.
+	sleeper: Sleeper,
+	// EVERY POWER RESOURCE'S HOLDERS AND EVERY DEVICE'S STATE.
 	power: Resources,
-	wake_holders: Vec<String>,
 	// THE PROCESSORS' POWER: the root ServiceManager connects ProcessorPowerService through, its connections, every
 	// processor the walk found, and the MADT's (UID, APIC ID) for each processor it lists.
 	processors_root: u64,
@@ -1872,12 +1871,12 @@ fn register_sleep_types(service: &mut Service) {
 			say(&format!("{path} is not a package - {name} is not registered"));
 			continue;
 		};
-		let integer = |at: usize| elements.get(at).and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None });
-		let (Some(a), b) = (integer(0), integer(1)) else {
+		let integers: Vec<Option<u64>> = elements.iter().take(2).map(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None }).collect();
+		let Some((a, b)) = platform_half::sleep_type(&integers) else {
 			say(&format!("{path} names no sleep type - {name} is not registered"));
 			continue;
 		};
-		let answer = unsafe { syscall(SYS_FIRMWARE_SLEEP_TYPE, service.host.privilege, state, a & 7, b.unwrap_or(a) & 7) } as i64;
+		let answer = unsafe { syscall(SYS_FIRMWARE_SLEEP_TYPE, service.host.privilege, state, u64::from(a), u64::from(b)) } as i64;
 		if answer == 0 {
 			registered.push(name);
 		} else {
@@ -1887,119 +1886,88 @@ fn register_sleep_types(service: &mut Service) {
 	say(&format!("sleep types registered: {}", if registered.is_empty() { String::from("none") } else { registered.join(" ") }));
 }
 
-// `_SST`'S VALUES: working, waking, sleeping, sleeping with its context saved.
-const SST_WORKING: u64 = 1;
-const SST_WAKING: u64 = 2;
-const SST_SLEEPING: u64 = 3;
-const SST_HIBERNATING: u64 = 4;
+// THE PLATFORM HALF OF A SLEEP, over this service's namespace, power resources and the kernel's events - the order is
+// `acpi_model::sleep`'s.
+struct SleepPlatform<'a>(&'a mut Service);
 
-impl Service {
+impl Platform for SleepPlatform<'_> {
+	type Resource = Resource;
+
+	// `_PRW`'s event - an index into the FADT's GPE blocks; an event on a GPE block device is not one this service can
+	// arm - its deepest state and the power resources past them.
+	fn prw(&mut self, identity: &str) -> Prw<Resource> {
+		let service = &mut *self.0;
+		let Some(node) = service.node_of_identity(identity) else { return Prw::Absent };
+		let prw = match service.aml.child_value(node, b"_PRW", &mut service.host) {
+			Ok(Some(Object::Package(elements))) => elements,
+			_ => return Prw::None,
+		};
+		let integer = |at: usize| prw.get(at).and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None });
+		let Some(number) = integer(0) else { return Prw::BlockDevice };
+		let resources = service.resources_of(prw.get(2..).unwrap_or(&[]), &format!("{identity}'s _PRW"));
+		Prw::Event { number: number as u16, deepest: integer(1).unwrap_or(0), resources }
+	}
+
+	fn hold_power(&mut self, holder: &str, resources: &[Resource]) {
+		let (on, _) = self.0.power.hold(holder, resources);
+		for path in &on {
+			self.0.switch_resource(path, true);
+		}
+	}
+
+	fn release_power(&mut self, holder: &str) {
+		self.0.release_power(holder);
+	}
+
+	fn enable_device_wake(&mut self, identity: &str, target: u64) {
+		let Some(node) = self.0.node_of_identity(identity) else { return };
+		if !self.0.run(node, b"_DSW", &[Object::Integer(1), Object::Integer(target), Object::Integer(0)]) {
+			self.0.run(node, b"_PSW", &[Object::Integer(1)]);
+		}
+	}
+
+	fn set_wake_event(&mut self, number: u16) -> bool {
+		gpe(self.0.host.privilege, GPE_WAKE_SET, number) == 0
+	}
+
+	fn clear_wake_event(&mut self, number: u16) {
+		let _ = gpe(self.0.host.privilege, GPE_WAKE_CLEAR, number);
+	}
+
 	// A METHOD BY ITS ABSOLUTE PATH, where the namespace has it: `_PTS`, `_WAK`, `\_SI._SST`. One it does not have is
 	// no failure - most machines have no `\_SI`.
 	fn root_method(&mut self, path: &str, argument: u64) {
-		if let Some(node) = self.aml.lookup(path) {
-			let _ = self.evaluate(node, &[Object::Integer(argument)], "the sleep method");
+		if let Some(node) = self.0.aml.lookup(path) {
+			let _ = self.0.evaluate(node, &[Object::Integer(argument)], "the sleep method");
 		}
 	}
 
-	// ONE WAKE NODE ARMED: `_PRW`'s event - an index into the FADT's GPE blocks; an event on a GPE block device is not
-	// one this service can arm - then `_DSW` (or `_PSW`, where there is no `_DSW`), then the event set for wake.
-	fn arm_wake(&mut self, identity: &str, target: u64) {
-		let Some(node) = self.node_of_identity(identity) else {
-			say(&format!("{identity} is not in the namespace - its wake is not armed"));
-			return;
-		};
-		let prw = match self.aml.child_value(node, b"_PRW", &mut self.host) {
-			Ok(Some(Object::Package(elements))) => elements,
-			_ => {
-				say(&format!("{identity} has no _PRW - it cannot wake the machine"));
-				return;
-			}
-		};
-		let number = prw.first().and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None });
-		let Some(number) = number else {
-			say(&format!("{identity}'s _PRW names an event on a GPE block device - its wake is not armed"));
-			return;
-		};
-		let deepest = prw.get(1).and_then(|element| if let Object::Integer(value) = &*element.borrow() { Some(*value) } else { None }).unwrap_or(0);
-		if deepest < target {
-			say(&format!("{identity} wakes from S{deepest} at the deepest - not from S{target}; its wake is not armed"));
-			return;
-		}
-		// THE POWER ITS WAKE NEEDS, on before its wake is enabled and held until `wake` lets it go.
-		let resources = self.resources_of(prw.get(2..).unwrap_or(&[]), &format!("{identity}'s _PRW"));
-		if !resources.is_empty() {
-			let holder = format!("wake {identity}");
-			let (on, _) = self.power.hold(&holder, &resources);
-			for path in &on {
-				self.switch_resource(path, true);
-			}
-			self.wake_holders.push(holder);
-		}
-		if !self.run(node, b"_DSW", &[Object::Integer(1), Object::Integer(target), Object::Integer(0)]) {
-			self.run(node, b"_PSW", &[Object::Integer(1)]);
-		}
-		let number = number as u16;
-		if gpe(self.host.privilege, GPE_WAKE_SET, number) == 0 {
-			self.wake_armed.push(number);
-			say(&format!("{identity} armed to wake the machine on general-purpose event {number:#04x}"));
-		} else {
-			say(&format!("general-purpose event {number:#04x} could not be set for {identity}'s wake"));
-		}
+	fn say(&mut self, line: &str) {
+		say(line);
 	}
 }
 
-impl Service {
-	// WHAT `prepare` TOOK FOR THE WAKE NODES, let go.
-	fn release_wake_power(&mut self) {
-		for holder in core::mem::take(&mut self.wake_holders) {
-			self.release_power(&holder);
-		}
+fn sleep_state(state: SleepState) -> platform_half::State {
+	match state {
+		SleepState::Idle => platform_half::State::Idle,
+		SleepState::Ram => platform_half::State::Ram,
+		SleepState::Disk => platform_half::State::Disk,
 	}
 }
 
-// THE PLATFORM'S STEP - see the head of this file. `_PTS` for a sleep the firmware enters; suspend to idle is no
-// firmware transition, so it runs `_SST` alone.
+// THE PLATFORM'S STEP - see the head of this file.
 impl platform_sleep::Service for Service {
 	fn prepare(&mut self, state: SleepState, wake_nodes: Vec<String>) -> Result<(), Error> {
-		let target: u64 = match state {
-			SleepState::Idle => 0,
-			SleepState::Ram => 3,
-			SleepState::Disk => 4,
-		};
-		self.wake_armed.clear();
-		self.release_wake_power();
-		for identity in &wake_nodes {
-			self.arm_wake(identity, target);
-		}
-		if target != 0 {
-			self.root_method("\\_PTS", target);
-		}
-		self.root_method("\\_SI_._SST", if state == SleepState::Disk { SST_HIBERNATING } else { SST_SLEEPING });
-		say(&format!(
-			"the platform is prepared for {}",
-			match state {
-				SleepState::Idle => "suspend to idle",
-				SleepState::Ram => "S3",
-				SleepState::Disk => "S4",
-			}
-		));
+		let mut sleeper = core::mem::take(&mut self.sleeper);
+		sleeper.prepare(&mut SleepPlatform(self), sleep_state(state), &wake_nodes);
+		self.sleeper = sleeper;
 		Ok(())
 	}
 
 	fn wake(&mut self, state: SleepState) -> Result<(), Error> {
-		self.root_method("\\_SI_._SST", SST_WAKING);
-		match state {
-			SleepState::Idle => {}
-			SleepState::Ram => self.root_method("\\_WAK", 3),
-			SleepState::Disk => self.root_method("\\_WAK", 4),
-		}
-		for number in core::mem::take(&mut self.wake_armed) {
-			let _ = gpe(self.host.privilege, GPE_WAKE_CLEAR, number);
-		}
-		self.release_wake_power();
-		self.root_method("\\_SI_._SST", SST_WORKING);
-		say("the platform is awake again");
+		let mut sleeper = core::mem::take(&mut self.sleeper);
+		sleeper.wake(&mut SleepPlatform(self), sleep_state(state));
+		self.sleeper = sleeper;
 		Ok(())
 	}
 }
@@ -2041,7 +2009,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let (privilege, admin_root, processors_root) = (roles[0], roles[1], roles[2]);
-	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, wake_armed: Vec::new(), power: Resources::new(), wake_holders: Vec::new(), processors_root, processor_clients: Vec::new(), processors: Vec::new(), madt: Vec::new() };
+	let mut service = Service { aml: Aml::new(Limits::default()), host: Firmware { privilege, fixed: Fixed::default(), current: None, regions: Vec::new(), ports: Vec::new(), companions: Vec::new(), ec: None, ec_glk: false, held: Vec::new(), notifications: Vec::new(), facs_lock: None, refused: Vec::new() }, instance: 0, events: 0, admin_root, admins: Vec::new(), channels: Vec::new(), published: Vec::new(), ec_gpe: None, ec_node: None, sleeper: Sleeper::default(), power: Resources::new(), processors_root, processor_clients: Vec::new(), processors: Vec::new(), madt: Vec::new() };
 	if privilege == 0 {
 		say("no FirmwareInterpreter privilege was handed over - the namespace is not loaded");
 		send_blocking(bootstrap, b"AcpiService: online - no firmware privilege", 0);
