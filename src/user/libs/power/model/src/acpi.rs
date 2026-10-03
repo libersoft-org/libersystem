@@ -124,6 +124,18 @@ pub struct Thermal<'a> {
 	pub active: &'a [u32],
 }
 
+/// HOW FAR PAST `_CRT` THE MACHINE IS POWERED OFF AT ONCE, in the zone's own tenths of a degree: five degrees. At `_CRT`
+/// the thermal policy asks for the orderly power-off and arms no deadline after it; a zone that goes on heating through
+/// that, or one whose policy is not there to ask, meets this second threshold, past which the policy and the zone's own
+/// driver each power the machine off immediately. ACPI defines no trip above `_CRT`: this one is the system's (the
+/// owner, 2026-10-03).
+pub const IMMEDIATE_MARGIN: u32 = 50;
+
+/// The immediate power-off's threshold for a zone's raw `_CRT`, on the same reference.
+pub fn immediate_trip(critical: u32) -> u32 {
+	critical.saturating_add(IMMEDIATE_MARGIN)
+}
+
 /// The zone, normalised: its reading and trips on ONE reference, absolute or relative, and an
 /// over-temperature alarm derived only by comparing the reading with the CRITICAL trip on that same
 /// reference - the one threshold ACPI defines as the zone exceeding its limit. The trips are

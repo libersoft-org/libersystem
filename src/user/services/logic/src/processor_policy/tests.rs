@@ -111,14 +111,32 @@ fn a_share_becomes_the_value_the_fan_takes() {
 fn critical_trips_act_once_per_crossing_crt_before_hot() {
 	let mut trips = Trips::default();
 	let (critical, hot) = (Some(3732), Some(3682));
-	assert_eq!(trips.reading(3600, critical, hot), Critical::Nothing);
-	assert_eq!(trips.reading(3690, critical, hot), Critical::Hibernate);
-	assert_eq!(trips.reading(3700, critical, hot), Critical::Nothing, "once per crossing");
-	assert_eq!(trips.reading(3740, critical, hot), Critical::PowerOff);
-	assert_eq!(trips.reading(3750, critical, hot), Critical::Nothing);
+	assert_eq!(trips.reading(3600, critical, hot, None), Critical::Nothing);
+	assert_eq!(trips.reading(3690, critical, hot, None), Critical::Hibernate);
+	assert_eq!(trips.reading(3700, critical, hot, None), Critical::Nothing, "once per crossing");
+	assert_eq!(trips.reading(3740, critical, hot, None), Critical::PowerOff);
+	assert_eq!(trips.reading(3750, critical, hot, None), Critical::Nothing);
 	let mut straight = Trips::default();
-	assert_eq!(straight.reading(3800, critical, hot), Critical::PowerOff, "past both at once: the graver alone");
-	assert_eq!(straight.reading(3600, critical, hot), Critical::Nothing);
-	assert_eq!(straight.reading(3740, critical, hot), Critical::PowerOff, "a new crossing acts again");
-	assert_eq!(Trips::default().reading(9999, None, None), Critical::Nothing);
+	assert_eq!(straight.reading(3800, critical, hot, None), Critical::PowerOff, "past both at once: the graver alone");
+	assert_eq!(straight.reading(3600, critical, hot, None), Critical::Nothing);
+	assert_eq!(straight.reading(3740, critical, hot, None), Critical::PowerOff, "a new crossing acts again");
+	assert_eq!(Trips::default().reading(9999, None, None, None), Critical::Nothing);
+}
+
+// THE IMMEDIATE THRESHOLD ABOVE `_CRT`: the orderly power-off at `_CRT` waits for no deadline, and a zone that goes on
+// heating past the second threshold asks for the machine off at once - once per crossing, and alone when a reading
+// crosses every trip together.
+#[test]
+fn past_the_immediate_threshold_the_machine_goes_off_at_once() {
+	let (critical, hot, immediate) = (Some(3732), Some(3682), Some(3782));
+	let mut trips = Trips::default();
+	assert_eq!(trips.reading(3740, critical, hot, immediate), Critical::PowerOff, "at _CRT, the orderly power-off");
+	assert_eq!(trips.reading(3770, critical, hot, immediate), Critical::Nothing, "between the two, nothing more");
+	assert_eq!(trips.reading(3782, critical, hot, immediate), Critical::Immediate, "at the threshold, at once");
+	assert_eq!(trips.reading(3800, critical, hot, immediate), Critical::Nothing, "once per crossing");
+	assert_eq!(trips.reading(3760, critical, hot, immediate), Critical::Nothing, "back under it, still past _CRT");
+	assert_eq!(trips.reading(3790, critical, hot, immediate), Critical::Immediate, "a new crossing acts again");
+	let mut straight = Trips::default();
+	assert_eq!(straight.reading(3900, critical, hot, immediate), Critical::Immediate, "past every trip at once: the gravest alone");
+	assert_eq!(straight.reading(3740, critical, hot, immediate), Critical::Nothing, "and _CRT, already past, is not asked again");
 }

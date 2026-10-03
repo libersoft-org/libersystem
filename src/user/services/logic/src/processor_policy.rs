@@ -245,8 +245,10 @@ pub enum Critical {
 	Nothing,
 	/// Past `_HOT`: hibernation, and the power-off where it is refused.
 	Hibernate,
-	/// Past `_CRT`: the forced bound armed, then the orderly power-off.
+	/// Past `_CRT`: the orderly power-off, with no deadline after it.
 	PowerOff,
+	/// Past the immediate threshold above `_CRT`: the machine off at once.
+	Immediate,
 }
 
 /// A ZONE'S CRITICAL TRIPS, acted on once per crossing.
@@ -254,19 +256,30 @@ pub enum Critical {
 pub struct Trips {
 	hot_acted: bool,
 	critical_acted: bool,
+	immediate_acted: bool,
 }
 
 impl Trips {
-	/// One reading against `_CRT` and `_HOT`: `_CRT` first, as it is the graver; each once until the zone is under it
-	/// again.
-	pub fn reading(&mut self, temperature: u32, critical: Option<u32>, hot: Option<u32>) -> Critical {
+	/// One reading against the immediate threshold, `_CRT` and `_HOT`, the gravest first; each once until the zone is
+	/// under it again. A reading that crosses several at once asks for the gravest alone.
+	pub fn reading(&mut self, temperature: u32, critical: Option<u32>, hot: Option<u32>, immediate: Option<u32>) -> Critical {
+		let past_immediate = immediate.is_some_and(|trip| temperature >= trip);
 		let past_critical = critical.is_some_and(|trip| temperature >= trip);
 		let past_hot = hot.is_some_and(|trip| temperature >= trip);
+		if !past_immediate {
+			self.immediate_acted = false;
+		}
 		if !past_critical {
 			self.critical_acted = false;
 		}
 		if !past_hot {
 			self.hot_acted = false;
+		}
+		if past_immediate && !self.immediate_acted {
+			self.immediate_acted = true;
+			self.critical_acted = true;
+			self.hot_acted = true;
+			return Critical::Immediate;
 		}
 		if past_critical && !self.critical_acted {
 			self.critical_acted = true;

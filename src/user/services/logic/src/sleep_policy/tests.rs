@@ -14,7 +14,7 @@ fn the_defaults_are_the_owners() {
 	assert_eq!(settings.lid, LidAction::ScreenOff);
 	assert!(!settings.idle_suspends_on_battery);
 	assert_eq!(settings.idle_after_seconds, 15 * 60);
-	assert_eq!(settings.critical, CriticalAction::PowerOff);
+	assert_eq!(settings.critical, CriticalAction::Nothing);
 }
 
 #[test]
@@ -97,8 +97,18 @@ fn going_on_battery_while_idle_suspends_once_where_idleness_suspends() {
 }
 
 #[test]
-fn by_default_a_critical_battery_powers_off_in_order_once() {
+fn by_default_a_critical_battery_does_nothing_and_is_told_once() {
 	let mut p = policy();
+	assert!(!p.critical_told());
+	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Nothing);
+	assert!(p.critical_told(), "the edge was taken, though nothing was done");
+	assert_eq!(p.event(Event::Power { on_battery: false, critical: false }), Action::Nothing);
+	assert!(!p.critical_told(), "and is taken again at the next time it is critical");
+}
+
+#[test]
+fn a_critical_battery_set_to_power_off_powers_off_in_order_once() {
+	let mut p = with(Settings { critical: CriticalAction::PowerOff, ..Settings::default() });
 	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::PowerOff);
 	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Nothing, "once until it is no longer critical");
 	assert_eq!(p.event(Event::Power { on_battery: false, critical: false }), Action::Nothing);
@@ -128,8 +138,8 @@ fn the_keys_set_the_settings_and_a_refused_value_keeps_its_default() {
 	let (settings, refused) = Settings::from_keys(Some("suspend"), Some("on"), Some("120"), Some("hibernate"));
 	assert_eq!(settings, Settings { lid: LidAction::Suspend, idle_suspends_on_battery: true, idle_after_seconds: 120, critical: CriticalAction::Hibernate });
 	assert!(refused.is_empty());
-	let (settings, refused) = Settings::from_keys(Some("nothing"), Some("off"), None, Some("nothing"));
-	assert_eq!(settings, Settings { lid: LidAction::Nothing, critical: CriticalAction::Nothing, ..Settings::default() });
+	let (settings, refused) = Settings::from_keys(Some("nothing"), Some("off"), None, Some("power-off"));
+	assert_eq!(settings, Settings { lid: LidAction::Nothing, critical: CriticalAction::PowerOff, ..Settings::default() });
 	assert!(refused.is_empty());
 	let (settings, refused) = Settings::from_keys(Some("sleep"), Some("yes"), Some("0"), Some("halt"));
 	assert_eq!(settings, Settings::default());

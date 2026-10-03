@@ -16,7 +16,7 @@
 // queueing mechanism beside the one the kernel already accounts would mean two answers to "how
 // much memory can a stalled pipeline hold", and the kernel's is the one Domains enforce.
 
-use crate::{ERR_PEER_CLOSED, Received, channel_peek, close, recv_blocking, send_blocking, try_send};
+use crate::{ERR_PEER_CLOSED, ERR_WOULD_BLOCK, Received, channel_peek, close, recv_blocking, send_blocking, try_send, wait};
 
 // The largest payload one chunk carries. Sized to fill a channel message without forcing a
 // producer to split ordinary output: a terminal write, a line of text and a filesystem block
@@ -124,16 +124,30 @@ impl Reader {
 		Self { channel }
 	}
 
-	// Read one chunk into `buf`, blocking until there is one. `buf` should be MAX_CHUNK bytes;
-	// a shorter one truncates, which the caller sees as a shorter `Data`.
+	// Read one chunk into `buf`, blocking until there is one. `buf` should be MAX_CHUNK bytes.
+	//
+	// A CHUNK LARGER THAN `buf` FAILS THE STREAM. The kernel's receive cuts a message to the buffer it is given and the
+	// rest is gone, so reading one would hand the caller a shortened stream as if it were whole - which is how a 30 KiB
+	// `cat` at the serial shell came out as its first 4096 bytes. A writer that keeps to MAX_CHUNK never meets this.
 	pub fn read(&mut self, buf: &mut [u8]) -> Chunk {
-		match recv_blocking(self.channel, buf) {
-			Received::Message { len, .. } if len == FAILED_TAG.len() && buf.starts_with(FAILED_TAG) => Chunk::Failed,
-			Received::Message { len, .. } if len > 0 => Chunk::Data(len),
-			// A zero-length message is not data and not a failure report; treating it as the
-			// end would let an empty write truncate a stream, so it is simply skipped.
-			Received::Message { .. } => self.read(buf),
-			Received::Closed => Chunk::End,
+		loop {
+			let pending: i64 = channel_peek(self.channel);
+			if pending == ERR_WOULD_BLOCK {
+				wait(self.channel, 0);
+				continue;
+			}
+			if pending > buf.len() as i64 {
+				let _ = recv_blocking(self.channel, buf);
+				return Chunk::Failed;
+			}
+			return match recv_blocking(self.channel, buf) {
+				Received::Message { len, .. } if len == FAILED_TAG.len() && buf.starts_with(FAILED_TAG) => Chunk::Failed,
+				Received::Message { len, .. } if len > 0 => Chunk::Data(len),
+				// A zero-length message is not data and not a failure report; treating it as the
+				// end would let an empty write truncate a stream, so it is simply skipped.
+				Received::Message { .. } => continue,
+				Received::Closed => Chunk::End,
+			};
 		}
 	}
 

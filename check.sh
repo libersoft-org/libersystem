@@ -177,6 +177,9 @@ declare -A GATES=(
 	# row, the driver, TpmService, the shipping `tpm` tool and the probe's refusals, a driver and a service restart,
 	# and a quote OpenSSL verifies on the host.
 	["qemu-tpm-tool"]="tools/check-tpm-tool.sh"
+	# OUTPUT PAST ONE STREAM CHUNK, cold in a development image: a 5 KiB file read back whole through the shell's relay,
+	# a pipe's edge and `head`'s window - each once showed only its first 4096 bytes.
+	["shell-large-output"]="tools/check-shell-large-output.sh"
 	# THE COM1 HANDOFF on a development instance of its own: the kernel hands COM1 to its userspace driver and
 	# takes it back on a kill and on a disable, counting zero stray register accesses each time; `lab sh` answers
 	# through both paths; and a panic reaches the wire past a driver that stopped draining a full ring.

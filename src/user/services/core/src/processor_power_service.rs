@@ -51,8 +51,6 @@ const ASK_TICKS: u64 = TICKS_PER_SECOND * 10;
 // The operator connections minted from CONTROL or from one of them: PermissionManager's own, a tool's, and a
 // replacement's while the one it replaces is still closing.
 const MAX_OPERATORS: usize = 8;
-// THE FORCED POWER-OFF'S BOUND past `_CRT`: ten seconds, as the plan states it.
-const FORCED_BOUND_SECONDS: u32 = 10;
 
 fn say(text: &str) {
 	let line = format!("ProcessorPowerService: {text}\n");
@@ -167,19 +165,29 @@ impl Service {
 
 	// ------------------------------------------------------------------ the critical trips
 
-	// PAST `_CRT`: the kernel's forced deadline armed first, so the machine is off within the bound whatever the orderly
-	// sequence meets, then ServiceManager's orderly power-off.
+	// PAST `_CRT`: ServiceManager's orderly power-off, with no deadline armed after it - a zone that goes on heating meets
+	// the immediate threshold above `_CRT` (`power_model::acpi::IMMEDIATE_MARGIN`), and that one does not wait.
 	pub(crate) fn critical_power_off(&self, zone: &str) {
-		say(&format!("{zone} is past _CRT - the machine powers off"));
-		if self.syspower == 0 || !matches!(proto::system::system_power::Client::with_deadline(ChannelTransport { chan: self.syspower }, clock() + ASK_TICKS).power_off_within(&FORCED_BOUND_SECONDS), Some(Ok(()))) {
-			say("the forced power-off deadline could not be armed");
-		} else {
-			say(&format!("the forced power-off deadline is armed - the machine is off within {FORCED_BOUND_SECONDS} s"));
-		}
+		say(&format!("{zone} is past _CRT - the machine powers off in order"));
 		if self.shutdown == 0 || !matches!(proto::system::system_shutdown::Client::with_deadline(ChannelTransport { chan: self.shutdown }, clock() + ASK_TICKS).power_off(), Some(Ok(()))) {
-			say("the orderly power-off was not taken - the forced deadline stands");
+			say("the orderly power-off was not taken - the immediate threshold above _CRT stands");
 		} else {
 			say("the orderly power-off is under way");
+		}
+	}
+
+	// PAST THE IMMEDIATE THRESHOLD ABOVE `_CRT`: the machine off at once, through SystemManager's `system-power` - no
+	// service is stopped first. The zone's own driver does the same at the same crossing, whichever comes first.
+	pub(crate) fn critical_immediate(&self, zone: &str) {
+		let margin = power_model::acpi::IMMEDIATE_MARGIN;
+		say(&format!("{zone} is {}.{} degrees past _CRT - the machine powers off at once", margin / 10, margin % 10));
+		match self.syspower {
+			0 => say("no system-power connection to power the machine off at once - the zone's driver does it"),
+			power => match proto::system::system_power::Client::with_deadline(ChannelTransport { chan: power }, clock() + ASK_TICKS).power_off() {
+				Some(Ok(())) => say("the machine did not stop, and SystemManager reported no error"),
+				Some(Err(error)) => say(&format!("SystemManager refused the immediate power-off: {error:?}")),
+				None => say("SystemManager did not answer the immediate power-off"),
+			},
 		}
 	}
 
@@ -408,6 +416,7 @@ impl Service {
 	fn after_readings(&mut self) {
 		for (zone, action) in self.thermal.take_actions() {
 			match action {
+				processor_policy::Critical::Immediate => self.critical_immediate(&zone),
 				processor_policy::Critical::PowerOff => self.critical_power_off(&zone),
 				processor_policy::Critical::Hibernate => self.critical_hibernate(&zone),
 				processor_policy::Critical::Nothing => {}

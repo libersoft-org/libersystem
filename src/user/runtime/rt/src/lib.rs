@@ -454,12 +454,18 @@ pub fn print(bytes: &[u8]) {
 	unsafe {
 		// If a stdout console channel is set, the program's terminal output goes there
 		// (to the userspace ConsoleService, which renders it and mirrors it to serial)
-		// as one message; otherwise it falls back to the kernel debug port in bulk -
-		// one syscall per chunk, not one per byte (the per-byte path stalled the console
+		// a stream chunk at a time (`send_chunks`); otherwise - and for whatever the
+		// channel refused - it falls back to the kernel debug port in bulk - one
+		// syscall per chunk, not one per byte (the per-byte path stalled the console
 		// service's serial mirror, and the gpu present queued behind it, for ~500 ms).
 		let out: u64 = STDOUT.load(Ordering::Relaxed);
-		if out != 0 && send_blocking(out, bytes, 0) {
-			return;
+		let mut bytes: &[u8] = bytes;
+		if out != 0 {
+			let sent: usize = send_chunks(out, bytes);
+			if sent == bytes.len() {
+				return;
+			}
+			bytes = &bytes[sent..];
 		}
 		for chunk in bytes.chunks(DEBUG_WRITE_CHUNK) {
 			// The kernel reports how much its transmit ring accepted; once a chunk does
@@ -492,7 +498,23 @@ pub fn write_stdout(bytes: &[u8]) -> bool {
 		print(bytes);
 		return true;
 	}
-	send_blocking(out, bytes, 0)
+	send_chunks(out, bytes) == bytes.len()
+}
+
+// ONE WRITE ON A STDOUT CHANNEL, A CHUNK AT A TIME - at most `stream::MAX_CHUNK` bytes a message, the byte-stream
+// contract every reader sizes its buffer to. This was one message of the whole write, and a reader's receive cuts a
+// message to the buffer it is given: `cat` of a 30 KiB file at the serial shell showed its first 4096 bytes and said
+// nothing, and so did `head -n 120 file | tail`. Answers how many bytes went out - all of them, or every byte before
+// the chunk the far end refused.
+fn send_chunks(out: u64, bytes: &[u8]) -> usize {
+	let mut sent: usize = 0;
+	for chunk in bytes.chunks(stream::MAX_CHUNK) {
+		if !send_blocking(out, chunk, 0) {
+			break;
+		}
+		sent += chunk.len();
+	}
+	sent
 }
 
 // Write bytes to the kernel debug/serial port, returning how many the kernel's

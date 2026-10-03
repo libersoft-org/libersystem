@@ -26,16 +26,23 @@
 #   2. THE ZONE HEATED, through the relaunched instance and its clients: past `_AC0` FAN0's level (`_FSL`) rises and
 #      FAN1 follows the default curve; past `_PSV` passive cooling engages, `_TMP` sampled every `_TSP`, and - the
 #      performance profile pinning C000 at its fastest - the state written falls; past `_CRT` - and `_HOT` with it - the
-#      forced deadline is armed, the orderly power-off runs, and QEMU is gone within the bound.
-#   3. THE ZONE HEATED WITH PROCESSORPOWERSERVICE STOPPED: the zone's driver arms the forced deadline itself, and QEMU is
-#      gone at the bound with no orderly power-off.
+#      orderly power-off runs with no deadline armed after it, and QEMU is gone.
+#   3. THE ZONE HEATED WITH PROCESSORPOWERSERVICE STOPPED: past `_CRT` the zone's driver says so and leaves it to the
+#      policy, and the machine runs on; past the immediate threshold five degrees above `_CRT` the driver powers it off
+#      at once, with no orderly power-off.
+#   4. STRAIGHT PAST THE IMMEDIATE THRESHOLD with the policy running: the machine off at once - by the policy or by the
+#      zone's driver, whichever is first - and no orderly power-off.
 #
 # IT BOOTS ITS OWN INSTANCES in private state, one at a time, and takes the last one down from the EXIT trap.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
 
-FORCED_BOUND_S=10
+# PAST `_CRT` THE ORDERLY POWER-OFF, with no deadline after it: QEMU is to be gone well within this. PAST THE IMMEDIATE
+# THRESHOLD - `_CRT` and five degrees, `power_model::acpi::IMMEDIATE_MARGIN` over the fixture's 368.2 K - at once.
+ORDERLY_BOUND_S=30
+IMMEDIATE_TMP=3732
+IMMEDIATE_BOUND_S=5
 # The fixture's `_PSS` control values, fastest first.
 PSS=(16 17 18 19)
 
@@ -428,21 +435,22 @@ say "past _PSV passive cooling engaged, sampled every _TSP, and C000 was given $
 events="$state/qmp-critical.log"
 hold_qmp "$events"
 heat 3700
-await_line "is past _CRT - the machine powers off" "the policy did not act on _CRT" 0 30
-await_line "the forced power-off deadline is armed" "the forced deadline was not armed" 0 30
-armed_at="$(date +%s.%N)"
-for _ in $(seq 1 $((FORCED_BOUND_S * 4))); do
+await_line "is past _CRT - the machine powers off in order" "the policy did not act on _CRT" 0 30
+await_line "the orderly power-off is under way" "the policy's orderly power-off was not taken" 0 30
+asked_at="$(date +%s.%N)"
+for _ in $(seq 1 $((ORDERLY_BOUND_S * 2))); do
 	grep -q '^closed' "$events" && break
 	sleep 0.5
 done
-grep -q '^closed' "$events" || fail "QEMU was still up $((FORCED_BOUND_S * 2)) s after the forced deadline was armed"
+grep -q '^closed' "$events" || fail "QEMU was still up ${ORDERLY_BOUND_S} s after the orderly power-off was asked for"
 grep -q 'SHUTDOWN' "$events" || fail "QMP sent no SHUTDOWN event"
 gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
 has "supervisor: system-shutdown asked for the orderly power-off" "ServiceManager did not take the orderly power-off"
-took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$armed_at" "$gone_at")
-((took <= FORCED_BOUND_S * 1000 + 1000)) || fail "QEMU exited ${took} ms after the forced deadline was armed, past its ${FORCED_BOUND_S} s bound"
+(($(seen "the forced power-off deadline is armed") == 0)) || fail "past _CRT a forced deadline was still armed"
+(($(seen "powers off at once") == 0)) || fail "at 370.0 K, under the immediate threshold, the machine was powered off at once"
+took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$asked_at" "$gone_at")
 keep_log
-say "past _CRT: the forced deadline armed, the orderly power-off run, QEMU gone ${took} ms after"
+say "past _CRT: the orderly power-off run with no deadline armed, QEMU gone ${took} ms after"
 
 # ------------------------------------------------------------------ 3. the zone heated with the policy stopped
 
@@ -456,18 +464,52 @@ out="$(launch stop processor_power_service)"
 grep -q "^stopped:" <<<"$out" || fail "ProcessorPowerService could not be stopped: $out"
 events="$state/qmp-stopped.log"
 hold_qmp "$events"
+# PAST `_CRT` AND UNDER THE IMMEDIATE THRESHOLD: the policy's, and with the policy stopped nothing powers the machine off.
 heat 3700
-await_line "the zone is past _CRT - the forced power-off is armed" "the zone's driver did not arm the forced power-off itself" 0 30
-armed_at="$(date +%s.%N)"
-for _ in $(seq 1 $((FORCED_BOUND_S * 4))); do
+await_line "the zone is past _CRT - the thermal policy powers the machine off in order; past ${IMMEDIATE_TMP} this binding powers it off at once" "the zone's driver did not say _CRT's crossing and its own threshold" 0 30
+sleep 10
+grep -q '^closed' "$events" && fail "with the policy stopped, QEMU went away past _CRT and under the immediate threshold"
+# PAST THE IMMEDIATE THRESHOLD: the zone's driver powers the machine off at once.
+heat "$((IMMEDIATE_TMP + 8))"
+await_line "the zone is past the immediate threshold above _CRT - the machine powers off at once" "the zone's driver did not act at the immediate threshold" 0 30
+asked_at="$(date +%s.%N)"
+for _ in $(seq 1 $((IMMEDIATE_BOUND_S * 2))); do
 	grep -q '^closed' "$events" && break
 	sleep 0.5
 done
-grep -q '^closed' "$events" || fail "with the policy stopped, QEMU was still up $((FORCED_BOUND_S * 2)) s after the zone's driver armed the deadline"
+grep -q '^closed' "$events" || fail "with the policy stopped, QEMU was still up ${IMMEDIATE_BOUND_S} s after the zone's driver powered it off at once"
 gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
-took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$armed_at" "$gone_at")
-((took >= FORCED_BOUND_S * 1000 - 1500 && took <= FORCED_BOUND_S * 1000 + 1500)) || fail "with the policy stopped, QEMU exited ${took} ms after the deadline was armed - not at the ${FORCED_BOUND_S} s bound"
+took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$asked_at" "$gone_at")
 (($(seen "system-shutdown asked for the orderly power-off") == 0)) || fail "with the policy stopped, an orderly power-off still ran"
 keep_log
-say "with ProcessorPowerService stopped, the zone's driver armed the deadline and QEMU was gone ${took} ms after, at the bound"
-say "PASS - the processors' tables installed and obeyed, _PPC and the profiles, the _LPI states, a latency request, a relaunch, and the zone heated through the policy and without it"
+say "with ProcessorPowerService stopped: past _CRT the machine ran on; past the immediate threshold the zone's driver powered it off at once, QEMU gone ${took} ms after"
+
+# ------------------------------------------------------------------ 4. straight past the immediate threshold
+
+./dev.sh down >"$state/down-stopped.log" 2>&1 || true
+kill "$backend_pid" 2>/dev/null || true
+wait "$backend_pid" 2>/dev/null || true
+start_helpers
+boot immediate
+await_line "follows \\_TZ_.TZ00" "ProcessorPowerService did not follow the zone" 0 60
+events="$state/qmp-immediate.log"
+hold_qmp "$events"
+heat "$((IMMEDIATE_TMP + 8))"
+await_line "powers off at once" "past the immediate threshold nothing powered the machine off at once" 0 30
+asked_at="$(date +%s.%N)"
+for _ in $(seq 1 $((IMMEDIATE_BOUND_S * 2))); do
+	grep -q '^closed' "$events" && break
+	sleep 0.5
+done
+grep -q '^closed' "$events" || fail "QEMU was still up ${IMMEDIATE_BOUND_S} s after the machine was powered off at once"
+gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
+took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$asked_at" "$gone_at")
+# WHICHEVER SAID IT FIRST: the policy and the zone's driver act at the same crossing, and the first power-off ends the
+# machine before the other can speak. The policy's choice of the gravest trip alone is its host test's.
+by="the zone's driver"
+(($(seen "TZ00 is 5.0 degrees past _CRT - the machine powers off at once") == 0)) || by="the thermal policy"
+(($(seen "is past _CRT - the machine powers off in order") == 0)) || fail "past every trip at once, the policy asked for the orderly power-off as well"
+(($(seen "system-shutdown asked for the orderly power-off") == 0)) || fail "past the immediate threshold an orderly power-off ran"
+keep_log
+say "straight past the immediate threshold with the policy running: the machine powered off at once ($by first), with no orderly power-off, QEMU gone ${took} ms after"
+say "PASS - the processors' tables installed and obeyed, _PPC and the profiles, the _LPI states, a latency request, a relaunch, and the zone heated through the policy and without it - the orderly power-off at _CRT, and at once past the threshold above it"

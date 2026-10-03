@@ -14,9 +14,10 @@
 // ProcessorPowerService alone: what passive and active cooling need - `_PSV`, `_CRT`, `_HOT`, `_TC1`, `_TC2`, `_TSP`,
 // `_PSL`, every `_ACx` with its `_ALx`, and whether there is `_SCP` - every reading of `_TMP` as it is taken, `_TMP`
 // read every `_TSP` while the policy asks for it, and `_SCP` set as the policy asks. AND THE FALLBACK: every reading is
-// compared with `_CRT` here too - the over-temperature alarm the power model derives - and at the crossing the kernel's
-// forced power-off is armed through the `system-power` connection DeviceManager hands a zone's binding, so a policy that
-// is dead, restarting or stopped still leaves the machine off within the bound.
+// compared here too - with `_CRT`, whose crossing is said and left to the policy's orderly power-off, and with the
+// immediate threshold above it (`power_model::acpi::immediate_trip`), at whose crossing this binding powers the machine
+// off at once through the `system-power` connection DeviceManager hands a zone's binding - so a policy that is dead,
+// restarting or stopped still leaves a zone that goes on heating no further than that threshold.
 //
 // WHEN THE ACPI SERVICE RESTARTS its node channels end with it: what was published stays until it is read again, the
 // node is asked for again (`drivers::common`), and the one the new instance serves is subscribed to and read at once.
@@ -46,8 +47,6 @@ const TOKEN: u16 = 0;
 const TOKEN_COOLING: u16 = 1;
 // The fastest a policy may have `_TMP` read: every tenth of a second.
 const MIN_SAMPLE_MS: u32 = 100;
-// THE FORCED POWER-OFF'S BOUND past `_CRT`, the policy's own.
-const FORCED_BOUND_SECONDS: u32 = 10;
 // The most `_PSL` processors and `_ALx` fans a zone describes.
 const MOST_DEVICES: usize = 8;
 // The one source's local number.
@@ -75,15 +74,17 @@ struct Power {
 	seq: u32,
 	// A thermal zone's polling interval, when its firmware asks for polling.
 	poll: Option<u64>,
-	// A ZONE'S COOLING HALF: the last `_TMP`, the readings stream the policy opened and its sequence, the period the policy
-	// asked `_TMP` to be read at (0 for the zone's own), the `system-power` connection the fallback arms through, and
-	// whether the last reading was past `_CRT`.
+	// A ZONE'S COOLING HALF: the last `_TMP` and `_CRT`, the readings stream the policy opened and its sequence, the
+	// period the policy asked `_TMP` to be read at (0 for the zone's own), the `system-power` connection the fallback
+	// powers the machine off through, and whether the last reading was past `_CRT` and past the immediate threshold.
 	temperature: Option<u32>,
+	critical: Option<u32>,
 	readings: u64,
 	reading_seq: u32,
 	sample_ms: u32,
 	syspower: u64,
 	past_critical: bool,
+	past_immediate: bool,
 }
 
 impl Power {
@@ -135,7 +136,9 @@ impl Power {
 			Class::ThermalZone => {
 				let temperature = self.integer("_TMP")?.ok_or_else(|| String::from("the zone has no _TMP"))?;
 				self.temperature = Some(temperature);
-				let mut zone = Zone { temperature, relative: self.integer("_RTV")?.is_some_and(|relative| relative != 0), critical: self.integer("_CRT")?, hot: self.integer("_HOT")?, passive: self.integer("_PSV")?, active: Vec::new() };
+				let critical = self.integer("_CRT")?;
+				self.critical = critical;
+				let mut zone = Zone { temperature, relative: self.integer("_RTV")?.is_some_and(|relative| relative != 0), critical, hot: self.integer("_HOT")?, passive: self.integer("_PSV")?, active: Vec::new() };
 				for index in 0..10u8 {
 					match self.integer(&format!("_AC{index}"))? {
 						Some(trip) => zone.active.push(trip),
@@ -207,20 +210,29 @@ impl Power {
 				}
 			}
 		}
-		// THE FALLBACK: at the crossing of `_CRT`, the forced power-off armed here, whatever the policy does.
+		// `_CRT` IS THE POLICY'S: its orderly power-off. Said here, at the crossing, with the threshold this binding acts at.
 		let past = state.alarms.iter().any(|alarm| alarm.kind == AlarmKind::OverTemperature && alarm.state == Tristate::Yes);
+		let immediate = self.critical.map(power_model::acpi::immediate_trip);
 		if past && !self.past_critical {
+			say(&self.name, &format!("the zone is past _CRT - the thermal policy powers the machine off in order; past {} this binding powers it off at once", immediate.unwrap_or(u32::MAX)));
+		}
+		self.past_critical = past;
+		// THE FALLBACK, AT THE IMMEDIATE THRESHOLD ABOVE `_CRT`: the machine off at once through `system-power`, whatever
+		// the policy does - or whether it runs at all. A reading the firmware calls unknown is no temperature.
+		let past_immediate = temperature != power_model::convert::ACPI_UNKNOWN && immediate.is_some_and(|trip| temperature >= trip);
+		if past_immediate && !self.past_immediate {
 			if self.syspower == 0 {
-				say(&self.name, "the zone is past _CRT - and this binding holds no system-power connection to arm the forced power-off");
+				say(&self.name, "the zone is past the immediate threshold above _CRT - and this binding holds no system-power connection to power the machine off");
 			} else {
-				match system_power::Client::with_deadline(ChannelTransport { chan: self.syspower }, clock() + TICKS).power_off_within(&FORCED_BOUND_SECONDS) {
-					Some(Ok(())) => say(&self.name, &format!("the zone is past _CRT - the forced power-off is armed, the machine is off within {FORCED_BOUND_SECONDS} s")),
-					Some(Err(error)) => say(&self.name, &format!("the zone is past _CRT - the forced power-off was refused: {error:?}")),
-					None => say(&self.name, "the zone is past _CRT - SystemManager did not answer the forced power-off"),
+				say(&self.name, "the zone is past the immediate threshold above _CRT - the machine powers off at once");
+				match system_power::Client::with_deadline(ChannelTransport { chan: self.syspower }, clock() + TICKS).power_off() {
+					Some(Ok(())) => say(&self.name, "the machine did not stop, and SystemManager reported no error"),
+					Some(Err(error)) => say(&self.name, &format!("the immediate power-off was refused: {error:?}")),
+					None => say(&self.name, "SystemManager did not answer the immediate power-off"),
 				}
 			}
 		}
-		self.past_critical = past;
+		self.past_immediate = past_immediate;
 	}
 
 	// THE PERIOD `_TMP` IS READ AT: the policy's while it asks, else the zone's own.
@@ -420,7 +432,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		say(&name, "the firmware describes no node for it");
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
 	}
-	let mut power = Power { name, class, node, information: None, state: None, revision: 1, stream: 0, seq: 0, poll: None, temperature: None, readings: 0, reading_seq: 0, sample_ms: 0, syspower: resources.syspower, past_critical: false };
+	let mut power = Power { name, class, node, information: None, state: None, revision: 1, stream: 0, seq: 0, poll: None, temperature: None, critical: None, readings: 0, reading_seq: 0, sample_ms: 0, syspower: resources.syspower, past_critical: false, past_immediate: false };
 	if let Err(why) = power.read(true).map(|state| power.state = Some(state)) {
 		say(&power.name, &format!("its state could not be read - {why}"));
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::DeviceNotResponding);

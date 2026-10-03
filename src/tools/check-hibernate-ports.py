@@ -234,10 +234,8 @@ class Guest:
 # step itself: under emulation the transaction around the time off takes it tens of seconds, and the counter's own
 # output, waiting on the volume behind its redirection, can hold the counter longer than that before the freeze.
 COUNT = re.compile(r'sleepcheck: count (\d+) mono-ms (\d+) boot-ms (\d+)')
-# THE FILE READ THROUGH `grep`, which writes a line at a time. The shell relays a foreground command's output, and a pipe
-# carries a stage's, a message of at most 4096 bytes at a time, and `cat` and `head` send a file's window as one message -
-# so at the serial shell they show a counter file's first 4096 bytes. A read whose lines were cut by a line the serial
-# console mixed in is read again.
+# THE FILE READ THROUGH `grep`, which writes a line at a time, so a line the serial console mixes in cuts one line of it
+# and not a window; a read whose lines were cut is read again.
 def counter_rows(guest, name):
 	for _ in range(3):
 		text = guest.serial.run(f'grep count {name}', 300)

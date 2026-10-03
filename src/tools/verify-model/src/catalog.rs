@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 160] = [
+const GATES: [(&str, &str); 162] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -428,6 +428,10 @@ const GATES: [(&str, &str); 160] = [
 	// over `swtpm` behind QEMU's two front-ends. Its subject is the driver and the service above the library, and it
 	// boots a development image through the emulated keyboard.
 	("qemu-tpm-tool", "userspace.build"),
+	// OUTPUT PAST ONE STREAM CHUNK, through the shell's relay, a pipe's edge and `head`'s window, cold in a development
+	// image. Its subject is the runtime's stdout writes, the stream reader and the shell's relay - a userspace change
+	// selects it.
+	("shell-large-output", "userspace.build"),
 	// THE COM1 HANDOFF, on a development instance of its own: the kernel lets COM1 go to its userspace driver, takes
 	// it back on a kill and on a disable with zero stray register accesses, and gets a panic onto the wire past a
 	// driver that stopped draining. Its subject is the kernel's console and the driver above it.
@@ -449,6 +453,11 @@ const GATES: [(&str, &str); 160] = [
 	// replacement, the image component, the storage area and the transaction - with the held QMP connection and the
 	// disk's header as the oracles. Its subject is the kernel mechanism and the services above it.
 	("hibernate", "kernel"),
+	// HIBERNATION ON THE DEVICE-TREE PORTS, on guests of its own with swtpm behind `tpm-tis-device` and then with none:
+	// the per-core resume path, the snapshot and the replacement through the firmware's core control, the image
+	// component sealed and in the clear - with the disk's header and QEMU's exit at the firmware's power-off as the
+	// oracles. Its subject is the kernel mechanism and the services above it.
+	("hibernate-ports", "kernel"),
 	// PROCESSOR AND THERMAL POWER, on development instances of its own with the fixture's processors, zone and fans: the
 	// kernel's tables, governors and register writes, ProcessorPowerService, the zone's and the fan's drivers and the
 	// ACPI service's processor contract - with the registers the kernel writes and QEMU's exit as the oracles. Its
@@ -896,7 +905,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 61] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 63] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -920,6 +929,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 61] = [
 	"qemu-dfu-tool",
 	// And the TPM's, over swtpm.
 	"qemu-tpm-tool",
+	// And the large-output scenario's.
+	"shell-large-output",
 	// And the BMC's administrative actions, one cold scenario a case.
 	"qemu-ipmi-admin",
 	// And UCSI's, four PPM profiles a boot each.
@@ -935,6 +946,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 61] = [
 	// And the sleep's and hibernation's, which boot several in turn.
 	"sleep",
 	"hibernate",
+	"hibernate-ports",
 	// And processor power's, which boots two.
 	"processor-power",
 	// And HID over I2C's.

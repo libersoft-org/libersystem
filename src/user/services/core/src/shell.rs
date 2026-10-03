@@ -1538,13 +1538,19 @@ fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String,
 		}
 	};
 	// Relay the command's output to our console as it prints, until it exits and its stdout
-	// end closes. The buffer matches the console's own per-write size, so a single message
-	// renders the same as it would straight from the command.
-	let mut obuf: [u8; 4096] = [0u8; 4096];
+	// end closes. EACH MESSAGE WHOLE, at the size its sender made it: a fixed buffer here cut
+	// every message past it to the buffer, and a command that wrote more at once - `cat` of a
+	// file past 4 KiB - showed its beginning and nothing else. `print` hands it on to the
+	// console a stream chunk at a time.
 	loop {
-		match recv_blocking(out_read, &mut obuf) {
-			Received::Message { len, .. } => print(&obuf[..len]),
-			Received::Closed => break,
+		match recv_vec_blocking(out_read) {
+			ReceivedVec::Message { bytes, handle } => {
+				if handle != 0 {
+					close(handle);
+				}
+				print(&bytes);
+			}
+			ReceivedVec::Closed | ReceivedVec::Failed => break,
 		}
 	}
 	close(out_read);

@@ -49,9 +49,10 @@
 # is suspended both devices ran `_PS3`, the shared resource is off and the wake one on; while the TAD's timed S3 is
 # suspended the TAD - its timer to wake the machine, and no `_S3W` to say a deeper state still wakes - kept D0, so the
 # shared resource stayed on with the lid in D3hot; after each wake both are in D0 and the wake resource off again.
-# THE BATTERY BOOT: the same fixture, the power service killed and relaunched, and then the fixture's battery discharged
-# past critical with the adapter off line - the owner's default, the policy's orderly power-off with no hibernation
-# asked, through the relaunched instance's clients: the forced deadline armed, ServiceManager's sequence, the
+# THE BATTERY BOOT: the same fixture, and the fixture's battery discharged past critical with the adapter off line - the
+# owner's default does nothing, says so, and the machine runs on; then `power.critical power-off` set and the power
+# service killed and relaunched, and the relaunched instance, finding the battery critical, runs the orderly power-off
+# with no hibernation asked through its own clients: the forced deadline armed, ServiceManager's sequence, the
 # registered `\_S5`, and QEMU gone within the bound.
 # THE FALLBACK BOOT: the switch refusing the sleep-type registration, and `shutdown` taking the fixed ports.
 #
@@ -797,7 +798,7 @@ run_platform() {
 	# THE LID, AS THE OWNER'S DEFAULTS HAVE IT: closing it turns the screen off - black, and a line typed then reaches no
 	# frame - and suspends nothing; opening it turns the screen on again.
 	local ended asked out off on
-	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery powers off in order" "the policy did not start with the owner's defaults" 0 60
+	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery does nothing" "the policy did not start with the owner's defaults" 0 60
 	ended=$(seen "ServiceManager: sleep: the transaction ended")
 	off=$(seen "DisplayService: the screen is off")
 	on=$(seen "DisplayService: the screen is on")
@@ -936,14 +937,39 @@ run_battery() {
 	./dev.sh up >"$state/up-battery.log" 2>&1 || fail "the battery instance did not come up (see $kept/up-battery.log)"
 	follow_serial
 	await_line "PowerService: sleep policy: follows the lid" "the sleep policy never started" 0 60
-	local restarted out
-	restarted=$(seen "supervisor: power_service restarted")
-	out="$(launch stop '!crash power_service')" || fail "battery: the crash hook was not reached: $out"
-	await_line "supervisor: power_service restarted" "battery: ServiceManager did not relaunch the killed power service" "$restarted" 60
-	await_line "PowerService: sleep policy: follows the lid" "battery: the relaunched policy never started" 1 60
+	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery does nothing" "battery: the policy did not start with the owner's defaults" 0 60
 	status_out="$(launch sleepctl status)"
 	grep -q "hibernation: not set up" <<<"$status_out" || fail "battery: hibernation is set up on a machine with no hibernation partition: $status_out"
-	# QEMU'S EXIT, TIMED BY A CONNECTION HELD UNTIL IT CLOSES: opened before the discharge, its close stamped by the host.
+	# THE OWNER'S DEFAULT: the battery discharged past critical with the adapter off line, and nothing done - said, and
+	# the machine still running and answering a while after.
+	python3 src/harness/acpi-fixture.py --set "$fixture/ivshmem.bin" ac-online=0 battery-state=5 battery-rate=9000 battery-remaining=1000 >/dev/null || fail "battery: the fixture's pages could not be written"
+	python3 - "$fixture/control.sock" <<'EOF' || fail "battery: the power line could not be raised"
+import socket, sys, time
+def ask(text):
+	sock = socket.socket(socket.AF_UNIX)
+	sock.connect(sys.argv[1])
+	sock.settimeout(5)
+	sock.sendall((text + '\n').encode())
+	return sock.recv(4096).decode()
+ask('lower 3')
+time.sleep(0.3)
+if 'fired' not in ask('raise 3'):
+	sys.exit('raising line 3 fired no event')
+EOF
+	await_line "PowerService: sleep policy: a battery is critical - the policy does nothing, as it is set to" "battery: the policy did not say it does nothing for the critical battery" 0 60
+	sleep $((FORCED_BOUND_S + 5))
+	(($(seen "PowerService: sleep policy: a battery is critical - powers the machine off in order") == 0)) || fail "battery: the policy powered off, which the owner's default does not"
+	(($(seen "PowerService: sleep policy: a battery is critical - asks for hibernation") == 0)) || fail "battery: the policy asked for hibernation, which the owner's default does not"
+	(($(seen "supervisor: system-shutdown asked for the orderly power-off") == 0)) || fail "battery: an orderly power-off was asked for under the owner's default"
+	status_out="$(launch sleepctl status)" || fail "battery: the machine did not answer $((FORCED_BOUND_S + 5)) s after its battery went critical: $status_out"
+	say "battery: a critical battery did nothing, as the owner's default has it - said, and the machine still running"
+	# THE SETTING THAT POWERS OFF: `power.critical power-off`, read by a relaunched instance - which finds the battery
+	# critical at its first reading and acts on it through its own clients: the forced deadline, ServiceManager's sequence,
+	# the registered `\_S5`, and QEMU gone within the bound. The key stays set: the machine is off at the end of it.
+	local restarted out
+	out="$(launch set power.critical power-off)" || fail "set power.critical power-off was not run: $out"
+	grep -q "ok" <<<"$out" || fail "set power.critical power-off was refused: $out"
+	# QEMU'S EXIT, TIMED BY A CONNECTION HELD UNTIL IT CLOSES: opened before the relaunch, its close stamped by the host.
 	local events="$state/qmp-battery.log"
 	python3 - "$state/qemu-qmp.sock" "$events" <<'EOF' &
 import json, socket, sys, time
@@ -968,22 +994,11 @@ EOF
 		sleep 0.2
 	done
 	grep -q '^connected' "$events" 2>/dev/null || fail "battery: the held QMP connection was not taken"
-	python3 src/harness/acpi-fixture.py --set "$fixture/ivshmem.bin" ac-online=0 battery-state=5 battery-rate=9000 battery-remaining=1000 >/dev/null || fail "battery: the fixture's pages could not be written"
-	python3 - "$fixture/control.sock" <<'EOF' || fail "battery: the power line could not be raised"
-import socket, sys, time
-def ask(text):
-	sock = socket.socket(socket.AF_UNIX)
-	sock.connect(sys.argv[1])
-	sock.settimeout(5)
-	sock.sendall((text + '\n').encode())
-	return sock.recv(4096).decode()
-ask('lower 3')
-time.sleep(0.3)
-if 'fired' not in ask('raise 3'):
-	sys.exit('raising line 3 fired no event')
-EOF
-	await_line "PowerService: sleep policy: a battery is critical - powers the machine off in order" "battery: the policy did not act on the critical battery" 0 60
-	(($(seen "PowerService: sleep policy: a battery is critical - asks for hibernation") == 0)) || fail "battery: the policy asked for hibernation, which the owner's default does not"
+	restarted=$(seen "supervisor: power_service restarted")
+	out="$(launch stop '!crash power_service')" || fail "battery: the crash hook was not reached: $out"
+	await_line "supervisor: power_service restarted" "battery: ServiceManager did not relaunch the killed power service" "$restarted" 60
+	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery powers off in order" "battery: the relaunched policy did not read power.critical" 0 60
+	await_line "PowerService: sleep policy: a battery is critical - powers the machine off in order" "battery: the relaunched policy did not act on the critical battery" 0 60
 	await_line "PowerService: sleep policy: the machine is off within ${FORCED_BOUND_S} s" "battery: the forced deadline was not armed" 0 30
 	local armed_at gone_at
 	armed_at="$(stamp_of "the machine is off within ${FORCED_BOUND_S} s" 0)"
@@ -998,7 +1013,7 @@ EOF
 	local took
 	took=$(ms_between "$armed_at" "$gone_at")
 	((took <= FORCED_BOUND_S * 1000 + 1000)) || fail "battery: QEMU exited ${took} ms after the forced deadline was armed, past its ${FORCED_BOUND_S} s bound"
-	say "battery: a critical battery powered the machine off in order through the relaunched policy, as the owner's default has it, QEMU gone ${took} ms after the ${FORCED_BOUND_S} s deadline was armed"
+	say "battery: set to power off, a critical battery powered the machine off in order through the relaunched policy, QEMU gone ${took} ms after the ${FORCED_BOUND_S} s deadline was armed"
 	kill "$ticker" "$backend" 2>/dev/null || true
 }
 

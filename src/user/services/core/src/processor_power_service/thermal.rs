@@ -237,8 +237,12 @@ impl Thermal {
 	fn reading(&mut self, at: usize, temperature: u32) {
 		let now = clock();
 		let zone = &mut self.zones[at];
+		// A READING THE FIRMWARE CALLS UNKNOWN is no temperature: it trips nothing and moves no cooling.
+		if temperature == power_model::convert::ACPI_UNKNOWN {
+			return;
+		}
 		zone.temperature = Some(temperature);
-		match zone.trips.reading(temperature, zone.cooling.critical, zone.cooling.hot) {
+		match zone.trips.reading(temperature, zone.cooling.critical, zone.cooling.hot, zone.cooling.critical.map(power_model::acpi::immediate_trip)) {
 			Critical::Nothing => {}
 			action => self.actions.push((zone.cooling.zone.clone(), action)),
 		}

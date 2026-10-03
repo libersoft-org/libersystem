@@ -9,10 +9,10 @@
 //
 // WHAT IT ASKS: the screen off and on again through DisplayService's `display-outputs`; a suspend through
 // `system-sleep` - to RAM where the machine offers it, to idle otherwise - answered at acceptance; for a critical battery
-// the orderly power-off - the kernel's forced deadline first, through `system-power`'s `power-off-within`, then
-// ServiceManager's sequence through `system-shutdown` - or, where the setting asks for it, a hibernation, with the
-// orderly power-off whenever that is refused, as it is wherever hibernation is not set up. Never an immediate
-// `system-power` power-off: the services are stopped in order.
+// nothing by default, said on the console, and where the setting asks for it the orderly power-off - the kernel's
+// forced deadline first, through `system-power`'s `power-off-within`, then ServiceManager's sequence through
+// `system-shutdown` - or a hibernation, with the orderly power-off whenever that is refused, as it is wherever
+// hibernation is not set up. Never an immediate `system-power` power-off: the services are stopped in order.
 
 use super::*;
 use alloc::string::String;
@@ -256,9 +256,14 @@ impl SleepPolicy {
 	}
 
 	fn feed(&mut self, event: Event) {
+		let critical_edge = matches!(event, Event::Power { critical: true, .. }) && !self.policy.critical_told();
 		let action = self.policy.event(event);
-		if matches!((event, action), (Event::Power { critical: true, .. }, Action::PowerOff)) {
-			say("a battery is critical - powers the machine off in order");
+		if critical_edge {
+			match self.policy.settings.critical {
+				CriticalAction::PowerOff => say("a battery is critical - powers the machine off in order"),
+				CriticalAction::Nothing => say("a battery is critical - the policy does nothing, as it is set to"),
+				CriticalAction::Hibernate => {}
+			}
 		}
 		self.act(action);
 	}

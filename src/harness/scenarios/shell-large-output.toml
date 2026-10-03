@@ -1,0 +1,62 @@
+# A COMMAND'S OUTPUT PAST ONE STREAM CHUNK REACHES THE TERMINAL WHOLE, and so does a pipeline stage's.
+#
+# A program's output travels as stream chunks of at most 4096 bytes (`rt::stream::MAX_CHUNK`) - to the shell's relay,
+# through a pipe, to the console. `cat` and `head` used to send a whole file, or a 16 KiB window of one, as ONE message,
+# and each reader cut it to its own buffer without a word: `cat` of a 5 KiB file showed its first 4096 bytes, and
+# `cat file | tail -n 1` printed a line from the middle. The file here is a counter's - 101 lines, about 5 KiB, written
+# a line at a time through a redirection - whose last line, `sleepcheck: count done`, lies past the first 4096 bytes
+# and appears nowhere in what is typed. `head -n 101` reads it through the window path, `tail` through a pipe.
+version = 1
+name = "shell large output"
+description = "Output larger than one stream chunk reaches the terminal whole, from a command and through a pipe."
+timeout = 400
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "input"
+text = "sleepcheck count 10 > big.txt"
+
+[[step]]
+do = "prompt"
+timeout = 120
+
+# THE SHELL'S RELAY: `cat` writes the whole file at once.
+[[step]]
+do = "input"
+text = "cat big.txt"
+
+[[step]]
+do = "expect"
+contains = "sleepcheck: count done"
+timeout = 60
+
+[[step]]
+do = "prompt"
+timeout = 60
+
+# A PIPE'S EDGE: `cat` into `tail`, whose last line is the file's.
+[[step]]
+do = "input"
+text = "cat big.txt | tail -n 1"
+
+[[step]]
+do = "expect"
+contains = "sleepcheck: count done"
+timeout = 60
+
+[[step]]
+do = "prompt"
+timeout = 60
+
+# `head`'s window, a whole 16 KiB of the file read at once, through the relay.
+[[step]]
+do = "input"
+text = "head -n 101 big.txt"
+
+[[step]]
+do = "expect"
+contains = "sleepcheck: count done"
+timeout = 60

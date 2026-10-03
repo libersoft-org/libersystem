@@ -3,9 +3,9 @@
 //!
 //! THE DEFAULTS, as the owner decided them (2026-10-02): closing the lid TURNS THE SCREEN OFF and suspends nothing, and
 //! opening it turns the screen on again - nothing at all while an external display is in use; idleness suspends
-//! nothing, on battery either; a critical battery neither suspends nor hibernates - it powers the machine off in order,
-//! so the filesystems are closed before the battery gives out. The sleep buttons suspend and the power buttons keep
-//! powering off - their drivers ask for that themselves, and this policy is not in their path.
+//! nothing, on battery either; and a critical battery does nothing at all - it neither suspends, hibernates nor powers
+//! the machine off (the owner, 2026-10-03), which says so on the console. The sleep buttons suspend and the power
+//! buttons keep powering off - their drivers ask for that themselves, and this policy is not in their path.
 //!
 //! EACH IS A SETTING, read from ConfigService's tree when the service starts (`Settings::from_keys`): `power.lid`
 //! (`screen-off`, `suspend` or `nothing`), `power.idle-suspend` (`on` or `off`: whether idleness on battery suspends),
@@ -86,7 +86,7 @@ pub struct Settings {
 
 impl Default for Settings {
 	fn default() -> Settings {
-		Settings { lid: LidAction::ScreenOff, idle_suspends_on_battery: false, idle_after_seconds: 15 * 60, critical: CriticalAction::PowerOff }
+		Settings { lid: LidAction::ScreenOff, idle_suspends_on_battery: false, idle_after_seconds: 15 * 60, critical: CriticalAction::Nothing }
 	}
 }
 
@@ -193,6 +193,12 @@ impl Policy {
 				if unplugged && self.idle && self.settings.idle_suspends_on_battery { Action::Suspend(Why::Idle) } else { Action::Nothing }
 			}
 		}
+	}
+
+	/// Whether a critical battery has been told since the last reading that was not critical - `event` acts on its first
+	/// one only, whatever the setting.
+	pub fn critical_told(&self) -> bool {
+		self.critical_acted
 	}
 
 	/// THE HIBERNATION REFUSED - not set up, or refused for any other reason: the orderly power-off instead.
