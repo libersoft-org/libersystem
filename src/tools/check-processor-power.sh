@@ -434,10 +434,10 @@ say "past _PSV passive cooling engaged, sampled every _TSP, and C000 was given $
 
 events="$state/qmp-critical.log"
 hold_qmp "$events"
+heated_at="$(date +%s.%N)"
 heat 3700
 await_line "is past _CRT - the machine powers off in order" "the policy did not act on _CRT" 0 30
 await_line "the orderly power-off is under way" "the policy's orderly power-off was not taken" 0 30
-asked_at="$(date +%s.%N)"
 for _ in $(seq 1 $((ORDERLY_BOUND_S * 2))); do
 	grep -q '^closed' "$events" && break
 	sleep 0.5
@@ -448,9 +448,9 @@ gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
 has "supervisor: system-shutdown asked for the orderly power-off" "ServiceManager did not take the orderly power-off"
 (($(seen "the forced power-off deadline is armed") == 0)) || fail "past _CRT a forced deadline was still armed"
 (($(seen "powers off at once") == 0)) || fail "at 370.0 K, under the immediate threshold, the machine was powered off at once"
-took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$asked_at" "$gone_at")
+took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$heated_at" "$gone_at")
 keep_log
-say "past _CRT: the orderly power-off run with no deadline armed, QEMU gone ${took} ms after"
+say "past _CRT: the orderly power-off run with no deadline armed, QEMU gone ${took} ms after the zone was heated past it"
 
 # ------------------------------------------------------------------ 3. the zone heated with the policy stopped
 
@@ -470,19 +470,20 @@ await_line "the zone is past _CRT - the thermal policy powers the machine off in
 sleep 10
 grep -q '^closed' "$events" && fail "with the policy stopped, QEMU went away past _CRT and under the immediate threshold"
 # PAST THE IMMEDIATE THRESHOLD: the zone's driver powers the machine off at once.
+heated_at="$(date +%s.%N)"
 heat "$((IMMEDIATE_TMP + 8))"
 await_line "the zone is past the immediate threshold above _CRT - the machine powers off at once" "the zone's driver did not act at the immediate threshold" 0 30
-asked_at="$(date +%s.%N)"
 for _ in $(seq 1 $((IMMEDIATE_BOUND_S * 2))); do
 	grep -q '^closed' "$events" && break
 	sleep 0.5
 done
 grep -q '^closed' "$events" || fail "with the policy stopped, QEMU was still up ${IMMEDIATE_BOUND_S} s after the zone's driver powered it off at once"
 gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
-took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$asked_at" "$gone_at")
+took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$heated_at" "$gone_at")
+((took <= IMMEDIATE_BOUND_S * 1000)) || fail "with the policy stopped, QEMU went away ${took} ms after the zone was heated past the immediate threshold, past ${IMMEDIATE_BOUND_S} s"
 (($(seen "system-shutdown asked for the orderly power-off") == 0)) || fail "with the policy stopped, an orderly power-off still ran"
 keep_log
-say "with ProcessorPowerService stopped: past _CRT the machine ran on; past the immediate threshold the zone's driver powered it off at once, QEMU gone ${took} ms after"
+say "with ProcessorPowerService stopped: past _CRT the machine ran on; past the immediate threshold the zone's driver powered it off at once, QEMU gone ${took} ms after the zone was heated past it"
 
 # ------------------------------------------------------------------ 4. straight past the immediate threshold
 
@@ -494,16 +495,17 @@ boot immediate
 await_line "follows \\_TZ_.TZ00" "ProcessorPowerService did not follow the zone" 0 60
 events="$state/qmp-immediate.log"
 hold_qmp "$events"
+heated_at="$(date +%s.%N)"
 heat "$((IMMEDIATE_TMP + 8))"
 await_line "powers off at once" "past the immediate threshold nothing powered the machine off at once" 0 30
-asked_at="$(date +%s.%N)"
 for _ in $(seq 1 $((IMMEDIATE_BOUND_S * 2))); do
 	grep -q '^closed' "$events" && break
 	sleep 0.5
 done
 grep -q '^closed' "$events" || fail "QEMU was still up ${IMMEDIATE_BOUND_S} s after the machine was powered off at once"
 gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
-took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$asked_at" "$gone_at")
+took=$(python3 -c "import sys; print(int((float(sys.argv[2]) - float(sys.argv[1])) * 1000))" "$heated_at" "$gone_at")
+((took <= IMMEDIATE_BOUND_S * 1000)) || fail "QEMU went away ${took} ms after the zone was heated past the immediate threshold, past ${IMMEDIATE_BOUND_S} s"
 # WHICHEVER SAID IT FIRST: the policy and the zone's driver act at the same crossing, and the first power-off ends the
 # machine before the other can speak. The policy's choice of the gravest trip alone is its host test's.
 by="the zone's driver"
@@ -511,5 +513,5 @@ by="the zone's driver"
 (($(seen "is past _CRT - the machine powers off in order") == 0)) || fail "past every trip at once, the policy asked for the orderly power-off as well"
 (($(seen "system-shutdown asked for the orderly power-off") == 0)) || fail "past the immediate threshold an orderly power-off ran"
 keep_log
-say "straight past the immediate threshold with the policy running: the machine powered off at once ($by first), with no orderly power-off, QEMU gone ${took} ms after"
+say "straight past the immediate threshold with the policy running: the machine powered off at once ($by first), with no orderly power-off, QEMU gone ${took} ms after the zone was heated past it"
 say "PASS - the processors' tables installed and obeyed, _PPC and the profiles, the _LPI states, a latency request, a relaunch, and the zone heated through the policy and without it - the orderly power-off at _CRT, and at once past the threshold above it"
