@@ -871,3 +871,55 @@ VERIFICATION:
 
 BLOCKERS: none for the per-core path and the ports' hibernation. Left in this milestone: PCI PME and a network
 device's wake, which no device this harness presents raises.
+
+## The owner's answers of 2026-10-03: a critical battery does nothing; output past one stream chunk fixed
+
+The owner decided (2026-10-03): by default a critical battery does nothing; and the defect found by the ports'
+hibernation gate - output past 4 KiB cut short at the serial shell and in a pipe - is to be fixed at once.
+
+WHAT WAS DONE:
+- `service_logic::sleep_policy`: `Settings::default().critical` is `CriticalAction::Nothing`; `power-off` and
+  `hibernate` stay settings (`power.critical`). `Policy::critical_told` says whether the critical edge was taken, so
+  PowerService says "a battery is critical - the policy does nothing, as it is set to" once per critical crossing, and
+  its settings line ends "a critical battery does nothing". Host tests: the default does nothing and is told once; the
+  setting `power-off` powers off in order once; the keys parse `power-off`.
+- The gate `sleep`'s battery boot: the owner's default - the battery discharged past critical, the line said, no
+  orderly power-off asked and the machine answering 15 s later; then `power.critical power-off` set, the power service
+  killed and relaunched, and the relaunched instance - finding the battery critical at its first reading - running the
+  orderly power-off through its own clients (the forced deadline, ServiceManager's sequence, `\_S5`, QEMU gone within
+  the bound). The platform boot's settings line follows the new default.
+- THE STREAM CHUNK. The byte-stream contract (`rt::stream`) has every message at most `MAX_CHUNK` (4096) bytes and every
+  reader sizes its buffer to it, but `rt::print` and `rt::write_stdout` sent a whole write as ONE message - `cat` the
+  mapped file, `head` a 16 KiB window - and `sys_channel_recv` cuts a message to the receiver's buffer without a word.
+  Now: `send_chunks` sends a stdout write a chunk at a time (both functions; `print` still falls back to the debug port
+  for what the channel refused); the shell's foreground relay (`run_tool`) receives each message whole
+  (`recv_vec_blocking`) instead of into a 4 KiB array; and `stream::Reader::read` peeks a pending message's length and
+  answers `Failed` for one larger than the caller's buffer instead of handing on a shortened chunk as if it were whole.
+- The gate `shell-large-output` (`tools/check-shell-large-output.sh`, `harness/scenarios/shell-large-output.toml`), cold
+  on x86_64 in a development image: a 101-line counter file written through a redirection, its last line read back by
+  `cat` (the relay), `cat | tail -n 1` (a pipe's edge) and `head -n 101` (the window path). Registered in `check.sh` and in
+  verify-model's catalog (`userspace.build`, a guest gate) and its release-required keys - and with it
+  `hibernate-ports`, which the catalog did not know (`verify-model check` said so).
+- `check-hibernate-ports.py` keeps reading its counter files with `grep`; its comment no longer describes the defect.
+- The gate `sleep`'s case 5 waits for its resumed job's end (see VERIFICATION).
+
+VERIFICATION:
+- `cargo test --manifest-path user/services/logic/Cargo.toml`: 748 passed (`sleep_policy` 14, `processor_policy` 10).
+- The development builds of all three after the rt change first failed as rt edits do ("abiprobe admits icdprobe at
+  ..., and the staged icdprobe is ..."); `python3 src/tools/foreign-audit-link.py --check` ("the recorded pass-2
+  inventory reproduces", all three arches), then `LIBER_DEVELOPMENT=1 ./build.sh --arch aarch64|riscv64|x86_64`: RESULT ok.
+- `./check.sh --gate shell-large-output` (x86_64, 2026-10-03): PASS in 250 s - the serial log holds all 101 lines from
+  `cat big.txt`, `sleepcheck: count done` alone from `cat big.txt | tail -n 1`, and all 101 again from `head -n 101`.
+  Before the fix the same reads ended at the 4096th byte (the hibernation gate's runs of 2026-10-02 showed it).
+- `./check.sh --gate sleep` (x86_64, 2026-10-03): PASS in 1919 s, its third run - "battery: a critical battery did
+  nothing, as the owner's default has it - said, and the machine still running"; "battery: set to power off, a critical
+  battery powered the machine off in order through the relaunched policy, QEMU gone 10129 ms after the 10 s deadline was
+  armed". The first run failed "lid: date printed no time" with `./dev.sh launch` killed by an illegal instruction on
+  the host (this machine's intermittent SIGILL); the second "the fixture never held the drivers' step": case 5's resumed
+  60 s counter still held the serial terminal's foreground, so the line case 7 typed for the shell went to the job - a
+  race in the gate, which now waits for that job's `count done` before going on.
+- `cargo run --manifest-path tools/verify-model/Cargo.toml -- check` (exit 0) and its 157 tests; `./check.sh --gate
+  source-hygiene`, `gate-oracles`, `milestone-index`, `verify-model` and - after `--refresh dynamic-report`, sizes only -
+  `dynamic-report`: RESULT ok. rustfmt on every changed Rust file, shfmt on every changed script: clean.
+
+BLOCKERS: none.

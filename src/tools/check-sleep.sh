@@ -556,8 +556,12 @@ sleep 2
 (($(seen "sleepcheck: count") == stopped_at)) || fail "the job stopped with Ctrl+Z ran again after the thaw"
 last="$(grep -a -o "sleepcheck: count [0-9]*" "$serial" | tail -n 1 | cut -d' ' -f3)"
 resumed_n=$(seen "sleepcheck: count $((last + 1)) ")
+counted=$(seen "sleepcheck: count done")
 type_serial fg || fail "the serial console took no input"
 await_line "sleepcheck: count $((last + 1)) " "fg did not resume the stopped job at its next value" "$resumed_n" 20
+# THE JOB RUN TO ITS END: it holds the serial terminal's foreground, and a line typed for the shell before it ends is
+# the job's input - case 7 types at that shell.
+await_line "sleepcheck: count done" "the resumed job never finished" "$counted" 120
 say "a job stopped with Ctrl+Z stayed stopped across the sleep, and fg resumed it at count $((last + 1))"
 
 # 4. THE HOT-PLUG SLOT AFTER THE S3s: the sleep gate's fixture - an `ivshmem-plain` function over a file the harness

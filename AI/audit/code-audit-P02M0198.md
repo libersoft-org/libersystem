@@ -592,3 +592,44 @@ VERIFICATION:
   2026-10-02 with the same kernel change.
 - The gate `hibernate-ports` (PASS on both ports, 2026-10-02) holds and restarts every core through the same per-core
   path.
+
+## `_CRT`: the orderly power-off with no deadline, and a separate threshold for the immediate one (2026-10-03)
+
+The owner decided (2026-10-03): no ten seconds waited for the orderly power-off to end; a separate threshold for the
+immediate power-off instead. The default fan curve and CPPC's preferences stand as built.
+
+WHAT WAS DONE:
+- `power_model::acpi::IMMEDIATE_MARGIN` (50, the zone's tenths of a degree: five degrees) and `immediate_trip(critical)`
+  - the threshold above `_CRT` past which the machine goes off at once. ACPI defines no trip above `_CRT`; this one is
+  the system's, and the two places that act on it share it.
+- `service_logic::processor_policy`: `Critical::Immediate`, and `Trips::reading(temperature, critical, hot, immediate)`
+  - the gravest trip first, each once per crossing, a reading past several asking for the gravest alone. Host test
+  `past_the_immediate_threshold_the_machine_goes_off_at_once`; the existing trip test with the new argument.
+- ProcessorPowerService: past `_CRT` the orderly power-off through `system-shutdown` and nothing armed after it ("is
+  past _CRT - the machine powers off in order"); past the threshold `system-power`'s `power-off` at once ("is 5.0
+  degrees past _CRT - the machine powers off at once"); `_HOT`'s refused hibernation still takes the `_CRT` sequence.
+  `FORCED_BOUND_SECONDS` is gone from it. A `_TMP` reading the firmware calls unknown (`0xFFFFFFFF`) trips nothing and
+  moves no cooling - before, it compared above every trip.
+- The zone's driver (`acpi_power_driver`): at `_CRT`'s crossing it says so and leaves it to the policy - it arms no
+  deadline any more; at the immediate threshold it powers the machine off at once through its own `system-power`
+  connection, so a stopped or dead policy still stops a zone that goes on heating there. Unknown readings are ignored.
+- The gate `processor-power`: case 2 past `_CRT` - the orderly power-off under way, no deadline armed, nothing at once,
+  QEMU gone; case 3 with the policy stopped - past `_CRT` the driver's line and the machine running on 10 s later, past
+  the threshold the driver's immediate power-off and QEMU gone within 5 s with no orderly power-off; case 4, a new boot
+  with the policy running, straight past the threshold - off at once (by the policy or the driver, whichever is first:
+  the first power-off ends the machine before the other speaks) with no orderly power-off.
+
+VERIFICATION:
+- `cargo test --manifest-path user/services/logic/Cargo.toml processor_policy`: 10 passed (the new
+  `past_the_immediate_threshold_the_machine_goes_off_at_once` among them); `cargo test --manifest-path
+  user/libs/power/model/Cargo.toml`: 51 passed.
+- `./check.sh --gate processor-power` (x86_64, 2026-10-03): PASS in 614 s - "past _CRT: the orderly power-off run with
+  no deadline armed, QEMU gone 2234 ms after the zone was heated past it"; "with ProcessorPowerService stopped: past _CRT
+  the machine ran on; past the immediate threshold the zone's driver powered it off at once, QEMU gone 273 ms after";
+  "straight past the immediate threshold with the policy running: the machine powered off at once (the zone's driver
+  first), with no orderly power-off, QEMU gone 267 ms after". An earlier run passed the same cases but timed them from
+  the moment the gate saw the line, after QEMU had gone (negative milliseconds); they are timed from the heating now,
+  with the immediate ones held to 5 s.
+- The development builds of all three (with the rt change's audit relink): RESULT ok.
+
+BLOCKERS: none. Open in this milestone: the owner's three-target kernel run.
