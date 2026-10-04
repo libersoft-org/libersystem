@@ -87,6 +87,11 @@ APT_PACKAGES=(
 	# this file is that the whole check suite runs on a developer's machine.
 	virtiofsd # the virtio-fs daemon QEMU's vhost-user-fs device talks to
 	swtpm     # software TPM 2.0 behind QEMU's tpm-tis and tpm-crb models
+
+	# AND THE OUT-OF-BAND HALF OF A BMC: OpenIPMI's `ipmi_sim` answers QEMU's `ipmi-bmc-extern` and serves the same BMC
+	# over its LAN side, where `ipmitool` reads it from outside - the cross-check of the `ipmi` gate.
+	openipmi # ipmi_sim, the simulated BMC with a LAN interface
+	ipmitool # an IPMI client over the LAN, the outside reader
 )
 
 info "Updating apt and installing packages..."

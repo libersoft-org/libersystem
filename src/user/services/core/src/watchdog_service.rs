@@ -48,9 +48,12 @@ include!(concat!(env!("OUT_DIR"), "/roles_watchdog_service.rs"));
 const PLANNED_ROLES: usize = 3;
 // How long a provider has to answer one request: a register write or two behind a driver's loop.
 const PROVIDER_TICKS: u64 = TICKS_PER_SECOND / 2;
-// THE BOOT BOUND, proposed 120 s: what a timer that survives the reset is armed with at an orderly reboot - the time a
-// boot is given from the reset to its watchdog service's first pet.
-const DEFAULT_BOOT_BOUND_MS: u32 = 120_000;
+// THE BOOT BOUND, ten minutes (the owner, 2026-10-04): what a timer that survives the reset is armed with at an orderly
+// reboot - the time a shutdown and the boot after it are given from the notice to the next watchdog service's first
+// pet. The 120 s first proposed reset a development image mid-boot behind a BMC; a short bound turns one slow boot -
+// a hibernation image read back, a long check - into a machine that resets itself in a loop, and a long one only
+// catches a hung boot later. `watchdog.boot-bound-ms` sets another.
+const DEFAULT_BOOT_BOUND_MS: u32 = 600_000;
 
 fn now_ms() -> u64 {
 	clock() * 1000 / TICKS_PER_SECOND

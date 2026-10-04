@@ -83,9 +83,10 @@ use proto::system::{Error, WatchdogDescription, watchdog};
 use rt::*;
 
 // THE BRIDGE: a timer found running at bind that CAN reset the machine is petted at once and kept fed by its driver
-// until its consumer's first pet (an arm is one) or disarm - for at most this long, 120 s, the boot bound, which a
-// boot must beat from the driver's bind to its consumer's first pet. After it the driver stops feeding, so a boot
-// that never brings the watchdog service up still resets the machine.
+// until its consumer's first pet (an arm is one) or disarm - for at most this long, 120 s, which a boot must beat from
+// the driver's bind to its consumer's first pet (the watchdog service's boot bound, armed at an orderly reboot, covers
+// the reset to the bind). After it the driver stops feeding, so a boot that never brings the watchdog service up
+// still resets the machine.
 pub const BRIDGE_TICKS: u64 = 120 * rt::TICKS_PER_SECOND;
 // How often the bridge pets: once a second, far inside any timeout a device takes.
 pub const BRIDGE_PET_TICKS: u64 = rt::TICKS_PER_SECOND;

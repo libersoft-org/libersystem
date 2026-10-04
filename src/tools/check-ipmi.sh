@@ -32,10 +32,15 @@
 #      what it received, for each sleep and in this order: the announcement's longest timeout, the driver's disarm ("don't
 #      stop" clear), after the resume the driver's re-arm with the bridge bound, and only then the service's restore of
 #      its configured timeout.
+#   7. THE OUT-OF-BAND CROSS-CHECK: OpenIPMI's `ipmi_sim` behind `ipmi-bmc-extern` on ISA KCS, its LAN side on a
+#      loopback port. The LAN configuration `ipmitool` writes over the LAN is what `bmc lan` reads through KCS, the users
+#      `ipmi_sim` is configured with are what `bmc users` reads and `ipmitool` lists, and the boot's event the BMC
+#      service writes through KCS is the record `ipmitool` reads over the LAN - its id, type, generator, sensor type and
+#      number, direction, data and timestamp.
 #
 # WHAT IT DOES NOT CLAIM HERE: the protected screen's cases (the log's erasure approved, declined and cancelled by an
-# event, and the chassis stops) are `check-ipmi-admin.sh`'s; the BMC's watchdog outside a sleep is `check-watchdog.sh`'s;
-# the out-of-band cross-check needs OpenIPMI and ipmitool on the host.
+# event, and the chassis stops) are `check-ipmi-admin.sh`'s; the BMC's watchdog outside a sleep is `check-watchdog.sh`'s.
+# An event sent from outside (`ipmitool event`) is not one: `ipmi_sim` does not log a platform event its LAN side takes.
 #
 # IT BOOTS ITS OWN DEVELOPMENT INSTANCES in private state, one at a time, drives the shell over the serial console
 # (`lab.sh sh`), and takes the last one down from the EXIT trap whatever happened.
@@ -55,6 +60,8 @@ case "${1:-}" in
 *) fail "unexpected argument '$1'" ;;
 esac
 command -v python3 >/dev/null || fail "python3 is not installed, and the lab is written in it"
+command -v ipmi_sim >/dev/null || fail "ipmi_sim is not installed - setup.sh installs openipmi, and this gate fails rather than skips without it"
+command -v ipmitool >/dev/null || fail "ipmitool is not installed - setup.sh installs it, and this gate fails rather than skips without it"
 [[ ! -S .build/boot/lab-ctl.sock ]] || fail "an ad-hoc lab guest is up (.build/boot/lab-ctl.sock) - take it down with ./lab.sh quit first"
 
 state="$(mktemp -d "${TMPDIR:-/tmp}/liber-ipmi.XXXXXX")"
@@ -567,4 +574,83 @@ take_down
 stop_harness
 cp -f "$state/record-sleep.log" "$kept/" 2>/dev/null || true
 echo "ipmi: a sleep with KCS and SSIF bound: both answered to idle and S3, SSIF identified again, and the BMC received the watchdog's step in order"
-echo "ipmi: PASS - five interfaces, each its own BMC; SMBIOS agreeing with every ISA and SSIF node; sensors, FRU and one boot event through KCS and SSIF, a restart writing none again; a pair reported and written once; the harness BMC's LAN, users, identify, temperatures, follow, bound and absences; malformed records refused; an orderly reboot's shutdown record ahead of the next boot's; a sleep with KCS and SSIF bound, the BMC's watchdog stepped in order"
+
+# ------------------------------------------------------------------ 7. the out-of-band cross-check
+
+# OPENIPMI'S `ipmi_sim` BEHIND `ipmi-bmc-extern`, on ISA KCS, with its LAN side on a loopback port the host reads with
+# `ipmitool`: one BMC, reached from inside through the system's interface and from outside over its network side.
+oob_free_port() {
+	python3 -c 'import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if sys.argv[1] == "udp" else socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])' "$1"
+}
+oob_lan="$(oob_free_port udp)"
+oob_vm="$(oob_free_port tcp)"
+mkdir -p "$state/sim/state"
+cat >"$state/sim/lan.conf" <<EOF
+name "liberbmc"
+set_working_mc 0x20
+  startlan 1
+    addr 127.0.0.1 $oob_lan
+    priv_limit admin
+    allowed_auths_callback none md2 md5 straight
+    allowed_auths_user none md2 md5 straight
+    allowed_auths_operator none md2 md5 straight
+    allowed_auths_admin none md2 md5 straight
+    guid a123456789abcdefa123456789abcdef
+  endlan
+  serial 15 127.0.0.1 $oob_vm codec VM
+  startnow false
+  user 1 true  ""        "test" user     10       none md2 md5 straight
+  user 2 true  "ipmiusr" "test" admin    10       none md2 md5 straight
+EOF
+cat >"$state/sim/bmc.emu" <<'EOF'
+mc_setbmc 0x20
+mc_add 0x20 0 no-device-sdrs 0x23 9 8 0x9f 0x1291 0xf02 persist_sdr
+sel_enable 0x20 1000 0x0a
+mc_enable 0x20
+EOF
+(cd "$state/sim" && exec ipmi_sim -c lan.conf -f bmc.emu -s "$state/sim/state" -n >"$state/ipmi-sim.log" 2>&1) &
+helper=$!
+outside() {
+	ipmitool -I lanplus -H 127.0.0.1 -p "$oob_lan" -U ipmiusr -P test "$@" 2>/dev/null
+}
+for _ in $(seq 1 50); do
+	grep -q "Product ID" <<<"$(outside mc info || true)" && break
+	sleep 0.2
+done
+grep -q "Product ID" <<<"$(outside mc info || true)" || fail "oob: ipmi_sim did not answer ipmitool over its LAN side (see $kept/ipmi-sim.log)"
+# THE LAN CONFIGURATION, WRITTEN FROM OUTSIDE, before the guest boots.
+for setting in "ipsrc static" "ipaddr 192.168.77.10" "netmask 255.255.255.0" "defgw ipaddr 192.168.77.1" "macaddr 52:54:00:aa:bb:cc" "vlan id 7"; do
+	# shellcheck disable=SC2086 # the parameter and its value are words of their own, as ipmitool takes them
+	outside lan set 1 $setting >/dev/null || fail "oob: ipmitool could not set the LAN's $setting"
+done
+grep -q "IP Address  *: 192.168.77.10" <<<"$(outside lan print 1 || true)" || fail "oob: the LAN configuration written from outside did not read back from outside"
+export QEMU_EXTRA="-chardev socket,id=simbmc,host=127.0.0.1,port=$oob_vm,reconnect-ms=1000 -device ipmi-bmc-extern,id=bmcs,chardev=simbmc -device isa-ipmi-kcs,bmc=bmcs,irq=0"
+boot oob
+boot_events 1
+sh_line "bmc lan"
+sh_line "bmc users"
+sh_line "bmc sel"
+# OUTSIDE IN: what ipmitool wrote over the LAN is what the BMC service reads through KCS.
+expect "channel 1: static address 192\.168\.77\.10 mask 255\.255\.255\.0 gateway 192\.168\.77\.1 mac 52:54:00:aa:bb:cc vlan 7" "the LAN configuration written from outside must be read through KCS"
+expect "channel 1 user 1 \(unnamed\) enabled privilege 2" "ipmi_sim's first user, a user, as configured"
+expect "channel 1 user 2 ipmiusr enabled privilege 4" "ipmi_sim's second user, an administrator, as configured"
+grep -qE '^2 +ipmiusr +true +false +true +ADMINISTRATOR' <<<"$(outside user list 1 || true)" || fail "oob: ipmitool did not list the administrator the guest read"
+# INSIDE OUT: the boot's event the BMC service wrote through KCS is the record ipmitool reads over the LAN, field by field.
+inside="$(grep -a -oE '0x0001 type 0x02 at [0-9]+ generator 0xf041 sensor type 0x1f sensor 0x00 asserted event 0x6f data 06 ff ff' "$(said)" | head -n 1)"
+[[ -n "$inside" ]] || fail "oob: the guest did not read the boot's event as record 1 (see $kept/out-oob.log)"
+outside sel get 1 >"$state/oob-sel.log" || fail "oob: ipmitool could not read record 1"
+for field in "SEL Record ID *: 0001" "Record Type *: 02" "Generator ID *: f041" "Sensor Type *: OS Boot" "Sensor Number *: 00" "Event Direction *: Assertion Event" "Event Data *: 06ffff"; do
+	grep -qE -- "$field" "$state/oob-sel.log" || fail "oob: record 1 read from outside has no '$field' (see $kept/oob-sel.log)"
+done
+stamp="$(awk '{print $5}' <<<"$inside")"
+grep -qE "^ +1 \|.*\| *0*$stamp *\| OS Boot" <<<"$(outside sel list || true)" || fail "oob: record 1's timestamp $stamp read inside is not the one read from outside"
+take_down
+cp -f "$state/oob-sel.log" "$state/ipmi-sim.log" "$kept/" 2>/dev/null || true
+kill "$helper" 2>/dev/null || true
+wait "$helper" 2>/dev/null || true
+helper=""
+echo "ipmi: oob: ipmi_sim's LAN configuration written by ipmitool read through KCS, its users alike, and the boot's event written through KCS read over the LAN as the same record, field by field"
+echo "ipmi: PASS - five interfaces, each its own BMC; SMBIOS agreeing with every ISA and SSIF node; sensors, FRU and one boot event through KCS and SSIF, a restart writing none again; a pair reported and written once; the harness BMC's LAN, users, identify, temperatures, follow, bound and absences; malformed records refused; an orderly reboot's shutdown record ahead of the next boot's; a sleep with KCS and SSIF bound, the BMC's watchdog stepped in order; ipmi_sim's LAN configuration and users read through KCS as ipmitool wrote and lists them, and the boot's event read over the LAN as the record written"

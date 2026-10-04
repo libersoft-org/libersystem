@@ -330,9 +330,10 @@ binds() {
 	seen "watchdog [a-z]* at bind, initial countdown"
 }
 
-# THE BOOT BOUND the orderly reboot arms, set for this case: the proposed 120 s did not cover this machine's development
-# image - its shutdown sequence and the next boot to the IPMI driver's bind - and the BMC reset the booting machine.
-# The case is that the notice arms the CONFIGURED bound, so it configures one the boot fits in.
+# THE BOOT BOUND the orderly reboot arms, set for this case: the 120 s first proposed did not cover this machine's
+# development image - its shutdown sequence and the next boot to the IPMI driver's bind - and the BMC reset the booting
+# machine; the default is ten minutes since. The case is that the notice arms the CONFIGURED bound, so it configures one
+# - the default's value - rather than trusting the default.
 BOOT_BOUND_MS=600000
 
 # THE BMC ARMED SHORT: the policy naming it, the boot bound set, the TCO disarmed beside it.
