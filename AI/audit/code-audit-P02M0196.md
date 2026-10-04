@@ -453,3 +453,42 @@ VERIFICATION OF STEP 3's THIRD ITEM, so far:
   exists; on aarch64 and riscv64 a local `port` module answers what an undecoded port reads (all ones) and drops
   writes, behind a kernel that grants no port range there, so no access reaches it. `cargo check` of the services,
   drivers and tools crates (`--features development`, and `shared-image` for the tools) then clean on both ports.
+
+## The platform half of sleep host-tested, and the carve-out's second admission closed (2026-10-03)
+
+WHAT WAS DONE:
+- `acpi_model::sleep` (`src/user/libs/acpi/model/src/sleep.rs`): the platform half of a sleep, pure. `Sleeper::prepare`
+  lets go of what an earlier `prepare` took, then for each wake node reads `_PRW` through `Platform::prw` (absent, none,
+  an event on a GPE block device, or the event's number, its deepest state and its power resources), passes a node over
+  whole when it cannot wake from the state entered, holds its resources on, runs `_DSW` (or `_PSW`), sets its event for
+  wake and records it only when the kernel took it; then `\_PTS` for a state the firmware enters and `\_SI._SST`
+  sleeping (hibernating for S4). `Sleeper::wake`: `_SST` waking, `\_WAK` for a firmware state, every recorded event
+  cleared, every holder let go, `_SST` working. `sleep_type` reads SLP_TYPa/SLP_TYPb from `\_S3`/`\_S4`/`\_S5`'s
+  package (three bits each, the second defaulting to the first). The console lines are the service's, unchanged.
+- The ACPI service runs `platform-sleep` through it: `SleepPlatform` implements `Platform` over its namespace
+  (`node_of_identity`, `_PRW`, `resources_of`), its power resources (`power.hold`, `switch_resource`,
+  `release_power`), `_DSW`/`_PSW`, the kernel's wake events (`GPE_WAKE_SET`/`CLEAR`) and `root_method`; its
+  `wake_armed`/`wake_holders` fields became one `Sleeper`; `register_sleep_types` decodes through `sleep_type`. One
+  difference in what is said, none in what is done: a `_PRW` element that is no power resource is now named even for a
+  node that then cannot wake from the state entered.
+- Six host tests against a scripted namespace (`sleep::tests`): S3 in ACPI's order and its wake undoing it; suspend to
+  idle with no `_PTS`/`_WAK` and S4 with both and the hibernating `_SST`; a node passed over whole (deepest too shallow,
+  no `_PRW`, a block device's event, absent); a refused event never cleared while its power is let go; a second
+  `prepare` letting go of the first's; the sleep-type decoding.
+- P02M0196's policy item closed on the evidence P02M0198 produced: the fixture carve-out's second admission (processor
+  table registers in the firmware-held `ivshmem-plain` BAR) is exercised by the gate `processor-power`.
+
+VERIFICATION:
+- `cargo test --manifest-path user/libs/acpi/model/Cargo.toml`: 28 passed - `sleep::` 6 of them (one first run ended in
+  a rustc SIGSEGV, this machine's, and passed on the retry); the suite is `host-tests`'s `acpi-model`
+  (`verify-model host-suites` lists it).
+- `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`: RESULT ok; rustfmt clean on the service and the model.
+- `./check.sh --gate sleep` (x86_64, 2026-10-03): PASS in 2061 s - the platform boot's lid S3 with the TAD's and the
+  lid's wake armed (`_PRW` resources on, `_PSW`/`_DSW`, the wake GPEs) and given back after the wake, as the power
+  checks before, during and after read them; "sleep types registered" on every boot, and the fallback boot with them
+  named absent.
+- `./check.sh --gate processor-power` (x86_64, 2026-10-03, PASS in 614 s) for the carve-out's second admission.
+- `./check.sh --gate source-hygiene`, `gate-oracles`, `milestone-index`, `verify-model`, and `dynamic-report` after
+  `--refresh dynamic-report`: RESULT ok.
+
+BLOCKERS: none for this; the ports' runs wait for the single end-of-job run, as the owner decided again (2026-10-03).
