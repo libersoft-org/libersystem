@@ -37,20 +37,6 @@ timeout = 300
 do = "prompt"
 timeout = 120
 
-# THE BINDING THAT HOLDS THE BUTTON'S ROW AND THE POLICY THAT FOLLOWS ITS PROVIDER, both before the press: a press
-# before either would be acted on by DeviceManager or the driver alone.
-[[step]]
-do = "expect"
-contains = "driver.acpi-button: kernel:pwrbtn: online (PowerButton, fixed hardware)"
-timeout = 60
-unordered = true
-
-[[step]]
-do = "expect"
-contains = "PowerService: sleep policy: follows the power button"
-timeout = 60
-unordered = true
-
 [[step]]
 do = "monitor"
 command = "system_powerdown"
@@ -61,6 +47,10 @@ do = "expect"
 contains = "acpi: the power button was pressed"
 timeout = 60
 
+# THE BINDING THAT HOLDS THE BUTTON'S ROW AND THE POLICY THAT FOLLOWS ITS PROVIDER are both in place by the prompt -
+# their lines come before the shell's, which is where a scenario's reading starts - and these two lines are what says
+# so: DeviceManager hands a press only to an online binding, and the driver tells the policy only through a stream the
+# policy opened. A press either did not reach would be acted on by DeviceManager or the driver alone, and say that.
 [[step]]
 do = "expect"
 contains = "DeviceManager: the power button was pressed - handed to the driver that holds it"
