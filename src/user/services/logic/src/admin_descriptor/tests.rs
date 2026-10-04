@@ -91,3 +91,21 @@ fn the_operation_table_says_what_a_bmc_action_does_and_refuses_what_it_cannot_sa
 	assert!(!probe.iter().any(|line| line.starts_with("Operation:")));
 	assert_eq!((Action::BmcSelClear.wire(), Action::BmcChassisControl.wire(), Action::BmcChassisControl.name()), (3, 4, "bmc-chassis-control"));
 }
+
+#[test]
+fn an_upload_says_it_reads_the_firmware_out_with_its_bound_and_file_and_warns_of_secrets() {
+	let mut parameters = alloc::vec::Vec::from(3000u32.to_le_bytes());
+	parameters.extend_from_slice(b"vol://usb/backup.bin");
+	let said = operation(Action::FirmwareUpload, &parameters).unwrap().unwrap();
+	assert!(said.starts_with("READ this target's firmware OUT - at most 3000 bytes"), "{said}");
+	assert!(said.contains("\"vol://usb/backup.bin\"") && said.contains("secrets"), "{said}");
+	let mut hostile = alloc::vec::Vec::from(10u32.to_le_bytes());
+	hostile.extend_from_slice("x\u{202e}y".as_bytes());
+	assert!(operation(Action::FirmwareUpload, &hostile).unwrap().unwrap().contains("x\\u{202e}y"), "the name is escaped as a label is");
+	assert_eq!(operation(Action::FirmwareUpload, &[1, 0, 0]), Err(Refusal::Unrenderable), "no bound");
+	assert_eq!(operation(Action::FirmwareUpload, &0u32.to_le_bytes()), Err(Refusal::Unrenderable), "no bound and no file");
+	let mut past = alloc::vec::Vec::from((MAX_UPLOAD + 1).to_le_bytes());
+	past.push(b'x');
+	assert_eq!(operation(Action::FirmwareUpload, &past), Err(Refusal::Unrenderable), "past what an upload may hold");
+	assert_eq!((Action::FirmwareUpload.wire(), Action::FirmwareUpload.name(), Action::FirmwareUpload.reads(), Action::FirmwareDownload.reads()), (5, "firmware-upload", true, false));
+}

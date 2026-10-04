@@ -127,6 +127,24 @@ pub(crate) fn send_cap(channel: &object::channel::Channel, payload: &[u8], objec
 	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap])).map_err(|_| "bootstrap capability send failed")
 }
 
+// THE HIBERNATION AREA'S ROOT, which the StorageService instance that mounts the system volume takes after its serve
+// root - arriving carrying nothing where no image component runs, as in every harness here. Missing, that instance
+// waited for it and never reported in.
+pub(crate) fn send_no_hibernation(boot: &object::channel::Channel) {
+	boot.send(object::channel::Message::new(b"HIBERNATION".to_vec(), alloc::vec::Vec::new())).expect("storage hibernation bootstrap");
+}
+
+// THE SUPERVISOR'S ROOT, which ProcessService takes after its serve root - it tells a request from its supervisor
+// from a client's by the root it came through - and will not start without. No supervisor stands in these
+// harnesses, so nobody holds the other end: a second root closing is dropped, and the service serves its clients
+// as before. Missing, the service waited for it and never reported in, and every harness here that starts one
+// failed with it.
+pub(crate) fn send_supervise_root(boot: &object::channel::Channel) -> Result<(), &'static str> {
+	use object::rights::Rights;
+	let (root, _unheld) = object::channel::Channel::create();
+	send_cap(boot, b"SUPERVISE", root, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER)
+}
+
 // THE MANAGER HALF OF THE DRIVER BRING-UP WIRE, for the two suites that spawn a real driver.
 //
 // Those suites stand in for DeviceManager while a driver comes up, so they have to speak the same
@@ -1122,6 +1140,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// one: a shell without a process client fails before it prints a prompt.
 	let process_client_for_shell = process_client.clone();
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL)?;
+	send_supervise_root(&process_boot_kernel)?;
 
 	// TimeService: its (dead-peer) network client and its service channel. It seeds its
 	// wall clock from the RTC and serves it; the governed `date` command reads it through
@@ -3633,6 +3652,7 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
 	// stand in accurately, or the test agrees with nothing that happens on a real boot.
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
+	send_supervise_root(&boot_kernel).expect("supervise bootstrap");
 	(boot_kernel, service_client)
 }
 
@@ -3778,6 +3798,23 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		i16::from_le_bytes([message.bytes[0], message.bytes[1]])
 	}
 
+	// WHAT THE STAND-IN DRIVER COUNTED, as a counting driver answers `CMD_STATS`.
+	const COUNTED: driver_protocol::audio::PlaybackStats = driver_protocol::audio::PlaybackStats { underruns: 2, silent_frames: 960, feedback_q16: 48 << 16, feedback_ignored: 1 };
+
+	// THE STAND-IN DRIVER'S NEXT MESSAGE THAT IS NOT A COUNTERS QUERY. AudioService reads the device's counters
+	// when it connects, every few periods while it plays and once a stream stops, and the stand-in answers each
+	// the way a counting driver does - so a scenario reads the periods it is about and nothing else.
+	fn from_driver(snd: &Channel, what: &str) -> Message {
+		loop {
+			let message = snd.recv().expect(what);
+			if message.bytes[..] != [driver_protocol::audio::CMD_STATS] {
+				return message;
+			}
+			snd.send(Message::new(COUNTED.encode().to_vec(), alloc::vec::Vec::new())).expect("the counters answered");
+			sched::run_until_idle();
+		}
+	}
+
 	let init = init_package_bytes().expect("init package module not found");
 	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
@@ -3805,6 +3842,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
 	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+	send_supervise_root(&process_boot_kernel).expect("process supervise bootstrap");
 	let (audio_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("audio admin bootstrap");
 	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
@@ -3816,6 +3854,13 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	// `serve_provider_catalogue`.
 	let (catalogue_server, catalogue_client) = Channel::create();
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("catalogue bootstrap");
+	// THE IDLE-LATENCY PRIVILEGE, which this harness has none of to give - the tag still arrives, carrying
+	// nothing, because the bootstrap is read positionally and a role that is not sent swallows the next one or
+	// leaves the service waiting for it. Missing, it did the second: the service never reported in.
+	boot_kernel.send(Message::new(b"LATENCY".to_vec(), alloc::vec::Vec::new())).expect("latency bootstrap");
+	// AND THE OBSERVATION ROOT, LAST, which this harness reads the counters back through as the System Graph does.
+	let (stats_root, stats_service) = Channel::create();
+	send_cap(&boot_kernel, b"STATS", stats_service, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("stats bootstrap");
 	sched::run_until_idle();
 	let storage_online = storage_boot_kernel.recv().expect("StorageService online report");
 	assert_eq!(&storage_online.bytes[..], b"StorageService: online (vol://system)");
@@ -3826,6 +3871,25 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	// because the service went looking for it.
 	serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
 	sched::run_until_idle();
+	// THE COUNTERS ARE READ FIRST, the moment the device is connected and before anything plays - and what the
+	// observation root answers after that is what the driver said, no older and no invented.
+	let asked = snd_host.recv().expect("the counters asked for as the device connected");
+	assert_eq!(&asked.bytes[..], &[driver_protocol::audio::CMD_STATS], "a connected device's counters are read before anything is played");
+	let observed = |corr: u32| -> audio_proto::generated::liber::audio::v1::AudioResources {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&audio_proto::generated::liber::audio::v1::audio_stats::OP_RESOURCES.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		stats_root.send(Message::new(request, alloc::vec::Vec::new())).expect("an audio resources request");
+		sched::run_until_idle();
+		let reply = stats_root.recv().expect("an audio resources reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr, "the resources echo their correlation id");
+		audio_proto::generated::liber::audio::v1::AudioResources::decode(&reply.bytes[4..]).expect("the resources decode")
+	};
+	assert!(!observed(90).counted, "nothing is counted before the driver has answered");
+	snd_host.send(Message::new(COUNTED.encode().to_vec(), alloc::vec::Vec::new())).expect("the counters answered");
+	sched::run_until_idle();
+	let counted = observed(91);
+	assert_eq!((counted.counted, counted.underruns, counted.silent_frames, counted.feedback_q16, counted.feedback_ignored), (true, 2, 960, 48 << 16, 1), "the observation root answers what the driver counted");
 	match scenario {
 		AudioServiceScenario::ScopeAndMixing => {
 			assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");
@@ -3847,7 +3911,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			send_write(&stereo, 4, &pcm(1_536, 2, 30_000));
 			sched::run_until_idle();
 			write_reply(&stereo, 4, 1_536);
-			let first = snd_host.recv().expect("first hardware period");
+			let first = from_driver(&snd_host, "first hardware period");
 			assert_eq!(first.bytes.len(), 2_048);
 			assert_eq!(sample(&first), 30_000, "first stream plays alone");
 
@@ -3865,11 +3929,11 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("first period ACK");
 			sched::run_until_idle();
-			let second = snd_host.recv().expect("mixed second period");
+			let second = from_driver(&snd_host, "mixed second period");
 			assert_eq!(sample(&second), i16::MAX, "two streams plus beep saturate instead of wrapping");
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("second period ACK");
 			sched::run_until_idle();
-			let third = snd_host.recv().expect("resampled third period");
+			let third = from_driver(&snd_host, "resampled third period");
 			assert_eq!(sample(&third), 27_000, "24 kHz mono is duplicated and survives for two output periods");
 
 			close_stream(&stereo, 7);
@@ -3879,11 +3943,11 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			assert_eq!(mono.recv().expect("mono close reply").bytes[4], 1);
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("third period ACK");
 			sched::run_until_idle();
-			let fourth = snd_host.recv().expect("beep tail period");
+			let fourth = from_driver(&snd_host, "beep tail period");
 			assert_eq!(sample(&fourth), 6_000, "beep continues through the shared mixer after streams drain");
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("fourth period ACK");
 			sched::run_until_idle();
-			let stop = snd_host.recv().expect("hardware stop sentinel");
+			let stop = from_driver(&snd_host, "hardware stop sentinel");
 			assert!(stop.bytes.is_empty(), "idle mixer releases the hardware stream");
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("stop ACK");
 			sched::run_until_idle();
@@ -3893,7 +3957,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			send_write(&bounded, 10, &pcm(4_096, 2, 100));
 			sched::run_until_idle();
 			write_reply(&bounded, 10, 4_096);
-			let period = snd_host.recv().expect("bounded period one");
+			let period = from_driver(&snd_host, "bounded period one");
 			assert_eq!(sample(&period), 100);
 			send_write(&bounded, 11, &pcm(512, 2, 100));
 			sched::run_until_idle();
@@ -3903,18 +3967,18 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			assert!(bounded.recv().is_err(), "full queue defers the write reply");
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("bounded period one ACK");
 			sched::run_until_idle();
-			let period = snd_host.recv().expect("bounded period two");
+			let period = from_driver(&snd_host, "bounded period two");
 			assert_eq!(sample(&period), 100);
 			assert!(bounded.recv().is_err(), "one ACK has not yet made bounded capacity visible");
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("bounded period two ACK");
 			sched::run_until_idle();
 			write_reply(&bounded, 12, 512);
-			let period = snd_host.recv().expect("bounded period three");
+			let period = from_driver(&snd_host, "bounded period three");
 			assert_eq!(sample(&period), 100);
 			drop(bounded);
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("bounded period three ACK");
 			sched::run_until_idle();
-			let stop = snd_host.recv().expect("peer-close stop sentinel");
+			let stop = from_driver(&snd_host, "peer-close stop sentinel");
 			assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
 			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("peer-close stop ACK");
 			sched::run_until_idle();
@@ -3923,13 +3987,13 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			let mp3_scope = open_scope(&audio_admin, 43);
 			let (_mp3_stdout, mp3_process) = launch_play(&process_client, storage_client, mp3_scope, b"vol://system/audio/test.mp3");
 			sched::run_until_idle();
-			let mut mp3_period = snd_host.recv().expect("MP3 first hardware period");
+			let mut mp3_period = from_driver(&snd_host, "MP3 first hardware period");
 			assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
 			let mut mp3_periods = 1u32;
 			while mp3_periods < 12 {
 				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("MP3 period ACK");
 				sched::run_until_idle();
-				mp3_period = snd_host.recv().expect("next MP3 period");
+				mp3_period = from_driver(&snd_host, "next MP3 period");
 				assert!(!mp3_period.bytes.is_empty(), "MP3 queue underrun stopped the hardware stream");
 				mp3_periods += 1;
 			}
@@ -3941,7 +4005,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			loop {
 				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("MP3 tail ACK");
 				sched::run_until_idle();
-				mp3_period = snd_host.recv().expect("MP3 tail period or stop");
+				mp3_period = from_driver(&snd_host, "MP3 tail period or stop");
 				if mp3_period.bytes.is_empty() {
 					break;
 				}
@@ -3957,7 +4021,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			send_write(&doomed, 14, &pcm(512, 2, 200));
 			sched::run_until_idle();
 			write_reply(&doomed, 14, 512);
-			let period = snd_host.recv().expect("period pending at driver crash");
+			let period = from_driver(&snd_host, "period pending at driver crash");
 			assert_eq!(sample(&period), 200);
 			drop(snd_host);
 			sched::run_until_idle();
@@ -4088,6 +4152,7 @@ fn start_process_service_from_volume(volume: &[u8]) -> (alloc::sync::Arc<object:
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
 	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+	send_supervise_root(&process_boot_kernel).expect("process supervise bootstrap");
 	(process_boot_kernel, storage_boot_kernel, process_client)
 }
 
@@ -4421,6 +4486,7 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
 	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+	send_supervise_root(&process_boot_kernel).expect("process supervise bootstrap");
 	let mut launch = alloc::vec::Vec::new();
 	launch.extend_from_slice(&3u16.to_le_bytes());
 	launch.extend_from_slice(&correlation.to_le_bytes());
@@ -4885,6 +4951,10 @@ impl StorageHarness {
 		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+		// Only the instance on `BLOCK` mounts the system volume, and only that one reads it.
+		if tag == b"BLOCK" {
+			send_no_hibernation(&boot);
+		}
 		let mut harness = Self { boot, block, client, admin, disk, capacity, process: Some(process), backing: Backing::Disk { tag: tag.to_vec() } };
 		for _ in 0..100_000 {
 			harness.pump();
@@ -6752,6 +6822,8 @@ impl ConsoleHarness {
 		display_boot.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("display stats bootstrap");
 		// And the protected-session root, which only AdminService is ever handed: none here.
 		display_boot.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
+		// And the outputs root, which only the power policy is handed: none here.
+		display_boot.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
 
 		let width: u32 = (cols * 8) as u32;
 		let height: u32 = (rows * 16) as u32;

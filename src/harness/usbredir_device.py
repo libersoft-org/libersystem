@@ -30,9 +30,40 @@ THE DEVICES, chosen with `--emulate`:
               and comes back from that reset in DFU mode as another product with the same serial number, which is
               the device a gadget cannot play: it changes what it is without leaving the bus.
   dfu-detach  the same target with `bitWillDetach`: after DFU_DETACH it leaves the bus by itself and comes back.
+  speaker-async
+              a UAC1 speaker whose isochronous OUT data endpoint is ASYNCHRONOUS: 48 kHz stereo 16-bit, packets up to
+              50 frames, and a feedback endpoint (IN 0x82, refreshed every 8 ms) reporting a clock 0.2 % fast - 48.096
+              frames a millisecond in 10.14. It counts the frames it receives each second against its own clock, and
+              the silent ones.
+  speaker-uac2
+              a HIGH-SPEED UAC2 speaker: one clock source (0x10) offering 44.1 kHz and 48 to 96 kHz in steps of 48, which
+              comes up at 44.1; its terminals run on it; the streaming interface's alternate 1 carries isochronous OUT
+              0x01 every microframe, asynchronous, with its feedback endpoint (IN 0x81) every millisecond. Its clock runs
+              0.2 % fast of WHATEVER RATE IS SET and the feedback says so in 16.16 frames a microframe - so a host that
+              never set 48 kHz is asked for 44.1 kHz's rate, and plays at it. It counts the frames it receives each
+              second against its own clock.
+  bt-sco      a Bluetooth controller with VOICE: interface 0's event pipe (interrupt IN 0x81) and ACL pair (bulk 0x82
+              and 0x02), commands on the control pipe answered as the gadget emulator answers them, ACL looped back;
+              interface 1's alternates 1-5 carry isochronous IN 0x83 and OUT 0x03 of 9, 17, 25, 33 and 49 bytes, and
+              every SCO packet that arrives on the OUT pipe goes back out on the IN pipe in pieces of the setting's
+              size - except one on handle 0xffe, whose second piece goes back LOST (an error status, no data).
+  midi2       a USB MIDI 2.0 device: its MIDI 1.0 face on alternate 0 (bulk 0x01 and 0x81, two cables each way, packets
+              looped back) and its UMP face on alternate 1 (the same endpoints, words looped back), two Group Terminal
+              Blocks over four groups - "Keys" on groups 0-1 and "Pads" on 2-3, both ways - read with GET_DESCRIPTOR,
+              and an answer to UMP Endpoint Discovery: Endpoint Info (two blocks, MIDI 1.0 and 2.0) and its name.
+  uvc-iso     a UVC 1.1 camera streaming 64x48 YUY2 ISOCHRONOUSLY: alternate zero carries no endpoint, alternates 1-3
+              carry isochronous IN 0x81 of 256, 512 and 1023 bytes, and the probe answers a 512-byte payload. Frames
+              are the gadget camera's - the number in the first eight bytes, the shared pattern after - cut into
+              payloads with FID and EOF; frame 2 has one packet LOST (sent with an error status and no data) and frame
+              3 carries the error bit; the second stream committed ends with the camera leaving the bus after its
+              first frame and a tenth of a second of empty payloads.
+  dfu-upload  the `dfu-reset` target with `bitCanUpload` in both modes: in DFU mode DFU_UPLOAD reads its firmware - a
+              factory image of 2500 bytes by the shared formula, seed 3, until an image is manifested in its place - in
+              1024-byte blocks, the last one short.
 """
 
 import argparse
+import collections
 import hashlib
 import os
 import select
@@ -143,6 +174,21 @@ class Device:
     def iso_in(self, address):
         return b""
 
+    # One isochronous OUT packet the host sent on `address`.
+    def iso_out(self, address, data):
+        pass
+
+    # A bulk OUT transfer's data, and the bytes queued for a bulk IN endpoint and an interrupt IN one - each taken as
+    # the host asks for it.
+    def bulk_out(self, address, data):
+        pass
+
+    def bulk_in(self, address, length):
+        return b""
+
+    def interrupt_in(self, address):
+        return None
+
     def iso_started(self, address):
         pass
 
@@ -211,9 +257,471 @@ def firmware(seed, length):
 
 # THE IMAGE THIS TARGET VERIFIES AT MANIFESTATION: anything else is errVERIFY.
 DFU_EXPECTED = hashlib.sha256(firmware(5, 3000)).digest()
+class SpeakerAsync(Device):
+    """A UAC1 speaker with an asynchronous data endpoint and an explicit feedback endpoint - see the head of this file."""
+
+    name = "speaker-async"
+    strings = {1: "LiberSystem harness", 2: "asynchronous speaker", 3: "LIBERSPK0001"}
+    # ITS CLOCK: 48.096 kHz, 0.2 % fast - in 10.14 frames a millisecond, as the feedback endpoint sends it.
+    RATE = 48_096
+    FEEDBACK = round(RATE * 16384 / 1000)
+    MAX_FRAMES = 50
+
+    def __init__(self):
+        super().__init__()
+        self.second = None
+        self.frames = 0
+        self.silent = 0
+        self.total = 0
+        self.total_silent = 0
+
+    def configuration_descriptor(self):
+        header = bytes([9, 0x24, 0x01, 0x00, 0x01]) + struct.pack("<H", 9 + 12 + 9) + bytes([1, 1])
+        streaming_in = bytes([12, 0x24, 0x02, 1]) + struct.pack("<H", 0x0101) + bytes([0, 2]) + struct.pack("<H", 0x0003) + bytes([0, 0])
+        speaker = bytes([9, 0x24, 0x03, 2]) + struct.pack("<H", 0x0301) + bytes([0, 1, 0])
+        control = bytes([9, DT_INTERFACE, 0, 0, 0, 1, 1, 0, 0]) + header + streaming_in + speaker
+        idle = bytes([9, DT_INTERFACE, 1, 0, 0, 1, 2, 0, 0])
+        active = bytes([9, DT_INTERFACE, 1, 1, 2, 1, 2, 0, 0])
+        general = bytes([7, 0x24, 0x01, 1, 1]) + struct.pack("<H", 0x0001)
+        format_one = bytes([11, 0x24, 0x02, 0x01, 2, 2, 16, 1]) + (48000).to_bytes(3, "little")
+        # ISOCHRONOUS, ASYNCHRONOUS, naming its feedback endpoint 0x82.
+        data = bytes([9, DT_ENDPOINT, 0x01, 0x05]) + struct.pack("<H", self.MAX_FRAMES * 4) + bytes([1, 0, 0x82])
+        data_general = bytes([7, 0x25, 0x01, 0x00, 0x00]) + struct.pack("<H", 0)
+        # FEEDBACK USAGE, refreshed every 2^3 milliseconds.
+        feedback = bytes([9, DT_ENDPOINT, 0x82, 0x11]) + struct.pack("<H", 3) + bytes([1, 3, 0])
+        body = control + idle + active + general + format_one + data + data_general + feedback
+        return bytes([9, DT_CONFIG]) + struct.pack("<H", 9 + len(body)) + bytes([2, 1, 0, 0x80, 50]) + body
+
+    def control(self, request_type, request, value, index, length, data):
+        if request_type == 0x22 and request == 0x01 and value >> 8 == 0x01:
+            return (SUCCESS, b"") if int.from_bytes(data[:3], "little") == 48000 else (STALL, b"")
+        if request_type == 0xA2 and request == 0x81 and value >> 8 == 0x01:
+            return SUCCESS, (48000).to_bytes(3, "little")
+        return STALL, b""
+
+    def on_alternate(self, interface, alternate):
+        say(self.name, f"alternate {alternate}" + (" - zero bandwidth" if alternate == 0 else ""))
+
+    def iso_started(self, address):
+        say(self.name, f"{'feedback' if address & 0x80 else 'data'} stream on 0x{address:02x} started")
+
+    def iso_stopped(self, address):
+        say(self.name, f"stream on 0x{address:02x} stopped - {self.total} frames received, {self.total_silent} of them silent")
+
+    # THE FEEDBACK: its clock's rate, every time the host reads it.
+    def iso_in(self, address):
+        return self.FEEDBACK.to_bytes(3, "little")
+
+    # EACH SECOND'S FRAMES, counted against this device's own clock - the host's monotonic one, here.
+    def iso_out(self, address, data):
+        now = time.monotonic()
+        if self.second is None:
+            self.second = now
+        frames = len(data) // 4
+        silent = frames if data and not any(data) else 0
+        self.frames += frames
+        self.silent += silent
+        self.total += frames
+        self.total_silent += silent
+        if now - self.second >= 1.0:
+            say(self.name, f"received {self.frames} frames in the last second ({self.silent} silent); its clock asks {self.RATE}")
+            self.second, self.frames, self.silent = now, 0, 0
+
+
+class SpeakerUac2(Device):
+    """A high-speed UAC2 speaker on a settable clock - see the head of this file."""
+
+    name = "speaker-uac2"
+    speed = SPEED_HIGH
+    # THE ASSOCIATION CLASS: a UAC2 function groups its interfaces with an interface association descriptor.
+    device_class = (0xEF, 0x02, 0x01)
+    strings = {1: "LiberSystem harness", 2: "UAC2 speaker", 3: "LIBERSPK0002"}
+    CLOCK = 0x10
+    RANGES = ((44_100, 44_100, 0), (48_000, 96_000, 48_000))
+    # SEVEN FRAMES A MICROFRAME AT MOST: six at 48 kHz, and the seventh for a fast clock's carry.
+    MAX_PACKET = 7 * 4
+
+    def __init__(self):
+        super().__init__()
+        self.rate = 44_100
+        self.second = None
+        self.frames = 0
+        self.total = 0
+
+    def offered(self, rate):
+        return any(low <= rate <= high and (step == 0 or (rate - low) % step == 0) for low, high, step in self.RANGES)
+
+    def configuration_descriptor(self):
+        association = bytes([8, 0x0B, 0, 2, 1, 0, 0x20, 0])
+        control = bytes([9, DT_INTERFACE, 0, 0, 0, 1, 1, 0x20, 0])
+        clock = bytes([8, 0x24, 0x0A, self.CLOCK, 0x03, 0x07, 0, 0])
+        streaming_in = bytes([17, 0x24, 0x02, 1]) + struct.pack("<H", 0x0101) + bytes([0, self.CLOCK, 2]) + struct.pack("<I", 3) + bytes([0]) + struct.pack("<H", 0) + bytes([0])
+        speaker = bytes([12, 0x24, 0x03, 3]) + struct.pack("<H", 0x0301) + bytes([0, 1, self.CLOCK]) + struct.pack("<H", 0) + bytes([0])
+        topology = clock + streaming_in + speaker
+        header = bytes([9, 0x24, 0x01]) + struct.pack("<H", 0x0200) + bytes([0x01]) + struct.pack("<H", 9 + len(topology)) + bytes([0])
+        idle = bytes([9, DT_INTERFACE, 1, 0, 0, 1, 2, 0x20, 0])
+        active = bytes([9, DT_INTERFACE, 1, 1, 2, 1, 2, 0x20, 0])
+        general = bytes([16, 0x24, 0x01, 1, 0, 1]) + struct.pack("<I", 1) + bytes([2]) + struct.pack("<I", 3) + bytes([0])
+        format_two = bytes([6, 0x24, 0x02, 0x01, 2, 16])
+        # ISOCHRONOUS, ASYNCHRONOUS, every microframe - and no bSynchAddress, which UAC2 endpoints do not carry.
+        data = bytes([7, DT_ENDPOINT, 0x01, 0x05]) + struct.pack("<H", self.MAX_PACKET) + bytes([1])
+        data_general = bytes([8, 0x25, 0x01, 0, 0, 0]) + struct.pack("<H", 0)
+        # FEEDBACK USAGE, every 2^(4-1) microframes: a millisecond.
+        feedback = bytes([7, DT_ENDPOINT, 0x81, 0x11]) + struct.pack("<H", 4) + bytes([4])
+        body = association + control + header + topology + idle + active + general + format_two + data + data_general + feedback
+        return bytes([9, DT_CONFIG]) + struct.pack("<H", 9 + len(body)) + bytes([2, 1, 0, 0x80, 50]) + body
+
+    # THE CLOCK'S SAMPLING-FREQUENCY CONTROL, through the audio-control interface: RANGE and CUR read, CUR written -
+    # a rate the clock does not offer is stalled.
+    def control(self, request_type, request, value, index, length, data):
+        if value >> 8 != 0x01 or index != (self.CLOCK << 8):
+            return STALL, b""
+        if request_type == 0xA1 and request == 0x02:
+            answer = struct.pack("<H", len(self.RANGES)) + b"".join(struct.pack("<III", *triple) for triple in self.RANGES)
+            return SUCCESS, answer[:length]
+        if request_type == 0xA1 and request == 0x01:
+            return SUCCESS, struct.pack("<I", self.rate)[:length]
+        if request_type == 0x21 and request == 0x01 and len(data) >= 4:
+            rate = struct.unpack("<I", data[:4])[0]
+            if not self.offered(rate):
+                say(self.name, f"refused a clock of {rate} Hz")
+                return STALL, b""
+            self.rate = rate
+            say(self.name, f"the clock runs at {rate} Hz")
+            return SUCCESS, b""
+        return STALL, b""
+
+    def on_alternate(self, interface, alternate):
+        say(self.name, f"alternate {alternate}" + (" - zero bandwidth" if alternate == 0 else f", the clock at {self.rate} Hz"))
+
+    def iso_started(self, address):
+        say(self.name, f"{'feedback' if address & 0x80 else 'data'} stream on 0x{address:02x} started")
+
+    def iso_stopped(self, address):
+        say(self.name, f"stream on 0x{address:02x} stopped - {self.total} frames received at {self.rate} Hz")
+
+    # THE FEEDBACK: the clock's rate, 0.2 % fast, in 16.16 frames a microframe.
+    def iso_in(self, address):
+        return round(self.rate * 1.002 * 65536 / 8000).to_bytes(4, "little")
+
+    def iso_out(self, address, data):
+        now = time.monotonic()
+        if self.second is None:
+            self.second = now
+        frames = len(data) // 4
+        self.frames += frames
+        self.total += frames
+        if now - self.second >= 1.0:
+            say(self.name, f"received {self.frames} frames in the last second; its clock asks {round(self.rate * 1.002)}")
+            self.second, self.frames = now, 0
+
+
+class BtSco(Device):
+    """A Bluetooth controller with voice settings - see the head of this file."""
+
+    name = "bt-sco"
+    device_class = (0xE0, 0x01, 0x01)
+    strings = {1: "LiberSystem harness", 2: "Bluetooth controller with voice", 3: "LIBERBT0002"}
+    BD_ADDR = bytes([0x02, 0x00, 0x00, 0xEE, 0xFF, 0xC0])
+    SIZES = (0, 9, 17, 25, 33, 49)
+    TORN_HANDLE = 0xFFE
+    EVENT_PACKET = 16
+
+    def __init__(self):
+        super().__init__()
+        self.events = collections.deque()
+        self.acl_held = bytearray()
+        self.acl_back = bytearray()
+        self.sco_held = bytearray()
+        self.sco_back = collections.deque()
+
+    def configuration_descriptor(self):
+        def setting(number, alternate, endpoints):
+            return bytes([9, DT_INTERFACE, number, alternate, len(endpoints), 0xE0, 0x01, 0x01, 0]) + b"".join(endpoints)
+
+        def endpoint(address, attributes, packet, interval):
+            return bytes([7, DT_ENDPOINT, address, attributes]) + struct.pack("<H", packet) + bytes([interval])
+
+        primary = setting(0, 0, [endpoint(0x81, 0x03, self.EVENT_PACKET, 1), endpoint(0x82, 0x02, 64, 0), endpoint(0x02, 0x02, 64, 0)])
+        voice = b"".join(setting(1, alternate, [endpoint(0x83, 0x01, size, 1), endpoint(0x03, 0x01, size, 1)]) for alternate, size in enumerate(self.SIZES))
+        body = primary + voice
+        return bytes([9, DT_CONFIG]) + struct.pack("<H", 9 + len(body)) + bytes([2, 1, 0, 0x80, 50]) + body
+
+    def on_alternate(self, interface, alternate):
+        say(self.name, f"interface {interface} alternate {alternate}" + (" - zero bandwidth" if alternate == 0 else f", pieces of {self.SIZES[alternate]} bytes"))
+        if interface == 1:
+            self.sco_held.clear()
+            self.sco_back.clear()
+
+    def complete(self, opcode, status, parameters=b""):
+        body = bytes([1]) + struct.pack("<H", opcode) + bytes([status]) + parameters
+        self.event(bytes([0x0E, len(body)]) + body)
+
+    # AN EVENT GOES UP THE INTERRUPT PIPE IN PACKETS OF ITS SIZE, as a real controller's does.
+    def event(self, event):
+        for at in range(0, len(event), self.EVENT_PACKET):
+            self.events.append(event[at:at + self.EVENT_PACKET])
+
+    # A command: class, host to device, the DEVICE recipient - answered as the gadget emulator answers it.
+    def control(self, request_type, request, value, index, length, data):
+        if request_type != 0x20 or request != 0x00 or len(data) < 3:
+            return STALL, b""
+        opcode = struct.unpack("<H", data[:2])[0]
+        if opcode == 0x0C03:
+            self.complete(opcode, 0)
+        elif opcode == 0x1009:
+            self.complete(opcode, 0, self.BD_ADDR)
+        else:
+            self.complete(opcode, 0x01)
+        say(self.name, f"command {opcode:#06x}")
+        return SUCCESS, b""
+
+    def interrupt_in(self, address):
+        return self.events.popleft() if self.events else None
+
+    # ACL LOOPED BACK on the bulk pair, with a Number Of Completed Packets event for each packet taken.
+    def bulk_out(self, address, data):
+        self.acl_held += data
+        while len(self.acl_held) >= 4:
+            length = 4 + struct.unpack("<H", self.acl_held[2:4])[0]
+            if len(self.acl_held) < length:
+                break
+            packet = bytes(self.acl_held[:length])
+            del self.acl_held[:length]
+            self.acl_back += packet
+            handle = struct.unpack("<H", packet[:2])[0] & 0x0FFF
+            self.event(bytes([0x13, 5, 1]) + struct.pack("<HH", handle, 1))
+            say(self.name, f"ACL {len(packet)} bytes on handle {handle:#05x} looped back")
+
+    def bulk_in(self, address, length):
+        data = bytes(self.acl_back[:length])
+        del self.acl_back[:length]
+        return data
+
+    # SCO LOOPED BACK: whole packets cut out of the OUT pieces by their own headers, each sent back in pieces of the
+    # setting's size - a packet starting a piece, as the host's transport expects.
+    def iso_out(self, address, data):
+        self.sco_held += data
+        size = self.SIZES[self.alternates.get(1, 0)]
+        while len(self.sco_held) >= 3 and size:
+            length = 3 + self.sco_held[2]
+            if len(self.sco_held) < length:
+                break
+            packet = bytes(self.sco_held[:length])
+            del self.sco_held[:length]
+            handle = struct.unpack("<H", packet[:2])[0] & 0x0FFF
+            pieces = [packet[at:at + size] for at in range(0, len(packet), size)]
+            for index, piece in enumerate(pieces):
+                self.sco_back.append(None if handle == self.TORN_HANDLE and index == 1 else piece)
+            say(self.name, f"SCO {len(packet)} bytes on handle {handle:#05x} looped back in {len(pieces)} pieces" + (", the second LOST" if handle == self.TORN_HANDLE else ""))
+
+    # AN INTERVAL WITH NOTHING TO SEND sends an empty piece; a lost one goes with an error status.
+    def iso_in(self, address):
+        return self.sco_back.popleft() if self.sco_back else b""
+
+    def iso_started(self, address):
+        say(self.name, f"{'IN' if address & 0x80 else 'OUT'} voice stream on 0x{address:02x} started")
+
+    def iso_stopped(self, address):
+        say(self.name, f"voice stream on 0x{address:02x} stopped")
+
+
+class Midi2(Device):
+    """A USB MIDI 2.0 device with both faces - see the head of this file."""
+
+    name = "midi2"
+    strings = {1: "LiberSystem harness", 2: "MIDI 2.0 device", 3: "LIBERMIDI0002", 4: "Keys", 5: "Pads"}
+    # id, name string, first group, groups.
+    BLOCKS = ((1, 4, 0, 2), (2, 5, 2, 2))
+    ENDPOINT_NAME = b"Liber UMP"
+
+    def __init__(self):
+        super().__init__()
+        self.back = bytearray()
+        self.held = bytearray()
+
+    def configuration_descriptor(self):
+        def cs_endpoint(subtype, ids):
+            return bytes([4 + len(ids), 0x25, subtype, len(ids)]) + bytes(ids)
+
+        control = bytes([9, DT_INTERFACE, 0, 0, 0, 1, 1, 0, 0]) + bytes([9, 0x24, 0x01, 0x00, 0x01]) + struct.pack("<H", 9) + bytes([1, 1])
+        midi1 = bytes([9, DT_INTERFACE, 1, 0, 2, 1, 3, 0, 0]) + bytes([7, 0x24, 0x01, 0x00, 0x01]) + struct.pack("<H", 7)
+        midi1 += bytes([9, DT_ENDPOINT, 0x01, 0x02]) + struct.pack("<H", 64) + bytes([0, 0, 0]) + cs_endpoint(0x01, [1, 2])
+        midi1 += bytes([9, DT_ENDPOINT, 0x81, 0x02]) + struct.pack("<H", 64) + bytes([0, 0, 0]) + cs_endpoint(0x01, [3, 4])
+        midi2 = bytes([9, DT_INTERFACE, 1, 1, 2, 1, 3, 0, 0]) + bytes([7, 0x24, 0x01, 0x00, 0x02]) + struct.pack("<H", 7)
+        midi2 += bytes([7, DT_ENDPOINT, 0x01, 0x02]) + struct.pack("<H", 64) + bytes([0]) + cs_endpoint(0x02, [1, 2])
+        midi2 += bytes([7, DT_ENDPOINT, 0x81, 0x02]) + struct.pack("<H", 64) + bytes([0]) + cs_endpoint(0x02, [1, 2])
+        body = control + midi1 + midi2
+        return bytes([9, DT_CONFIG]) + struct.pack("<H", 9 + len(body)) + bytes([2, 1, 0, 0x80, 50]) + body
+
+    # THE GROUP TERMINAL BLOCKS, asked for as a standard GET_DESCRIPTOR to the interface: type 0x26, alternate 1.
+    def control(self, request_type, request, value, index, length, data):
+        if request_type == 0x81 and request == 0x06 and value == 0x2601 and index == 1:
+            blocks = b"".join(bytes([13, 0x26, 0x02, ident, 0, first, count, string, 0x11, 0, 0, 0, 0]) for ident, string, first, count in self.BLOCKS)
+            return SUCCESS, bytes([5, 0x26, 0x01]) + struct.pack("<H", 5 + len(blocks)) + blocks
+        return STALL, b""
+
+    def on_alternate(self, interface, alternate):
+        say(self.name, f"alternate {alternate} - " + ("UMP" if alternate == 1 else "MIDI 1.0"))
+        self.back.clear()
+        self.held.clear()
+
+    def ump_face(self):
+        return self.alternates.get(1, 0) == 1
+
+    # UMP ENDPOINT DISCOVERY answered with Endpoint Info - UMP 1.1, two static function blocks, MIDI 1.0 and 2.0 - and
+    # the endpoint's name in one complete message; every other message looped back word for word.
+    def bulk_out(self, address, data):
+        if not self.ump_face():
+            self.back += data
+            say(self.name, f"MIDI 1.0 packets looped back: {len(data) // 4}")
+            return
+        self.held += data
+        while len(self.held) >= 4:
+            first = struct.unpack("<I", self.held[:4])[0]
+            size = 4 * (1, 1, 1, 2, 2, 4, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4)[first >> 28]
+            if len(self.held) < size:
+                break
+            message = bytes(self.held[:size])
+            del self.held[:size]
+            if first >> 28 == 0xF and (first >> 16) & 0x3FF == 0x000:
+                info = (0xF0010101, 0x80000000 | len(self.BLOCKS) << 24 | 0x300, 0, 0)
+                name = self.ENDPOINT_NAME.ljust(14, b"\0")
+                words = (0xF0030000 | name[0] << 8 | name[1], *struct.unpack(">III", name[2:14]))
+                self.back += struct.pack("<4I", *info) + struct.pack("<4I", *words)
+                say(self.name, "Endpoint Discovery answered: two function blocks, and the name")
+            else:
+                self.back += message
+                say(self.name, f"UMP of {size // 4} word(s) on group {(first >> 24) & 0xF} looped back")
+
+    def bulk_in(self, address, length):
+        data = bytes(self.back[:length])
+        del self.back[:length]
+        return data
+
+
+class UvcIso(Device):
+    """A UVC 1.1 camera streaming 64x48 YUY2 over isochronous IN 0x81 - see the head of this file."""
+
+    name = "uvc-iso"
+    strings = {1: "LiberSystem harness", 2: "isochronous camera", 3: "LIBERCAM0001"}
+    WIDTH, HEIGHT = 64, 48
+    FRAME = 64 * 48 * 2
+    INTERVAL = 333_333
+    PACKETS = (256, 512, 1023)
+    PAYLOAD = 512
+    LOST_FRAME, LOST_PACKET, BAD_FRAME = 2, 4, 3
+
+    def __init__(self):
+        super().__init__()
+        self.probe = self.default_probe()
+        self.commits = 0
+        self.number = 0
+        self.queue = []
+        self.packets = 0
+        self.lost = 0
+        self.filled = False
+
+    def default_probe(self):
+        probe = bytearray(34)
+        probe[0] = 1
+        probe[2], probe[3] = 1, 1
+        struct.pack_into("<I", probe, 4, self.INTERVAL)
+        struct.pack_into("<I", probe, 18, self.FRAME)
+        struct.pack_into("<I", probe, 22, self.PAYLOAD)
+        probe[31] = 1
+        return probe
+
+    def configuration_descriptor(self):
+        control = bytes([13, 0x24, 0x01, 0x10, 0x01, 13, 0]) + struct.pack("<I", 6_000_000) + bytes([1, 1])
+        streaming = bytes([14, 0x24, 0x01, 1, 77, 0, 0x81, 0, 2, 0, 0, 0, 1, 0])
+        yuy2 = bytes([0x59, 0x55, 0x59, 0x32, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+        streaming += bytes([27, 0x24, 0x04, 1, 1]) + yuy2 + bytes([16, 1, 0, 0, 0, 0])
+        streaming += bytes([30, 0x24, 0x05, 1, 0]) + struct.pack("<HHIIIIB", self.WIDTH, self.HEIGHT, 1, 1, self.FRAME, self.INTERVAL, 1) + struct.pack("<I", self.INTERVAL)
+        streaming += bytes([6, 0x24, 0x0D, 1, 1, 4])
+        body = bytes([9, DT_INTERFACE, 0, 0, 0, 0x0E, 0x01, 0x00, 0]) + control
+        body += bytes([9, DT_INTERFACE, 1, 0, 0, 0x0E, 0x02, 0x00, 0]) + streaming
+        for at, packet in enumerate(self.PACKETS):
+            body += bytes([9, DT_INTERFACE, 1, at + 1, 1, 0x0E, 0x02, 0x00, 0])
+            body += bytes([7, DT_ENDPOINT, 0x81, 0x05]) + struct.pack("<H", packet) + bytes([1])
+        return bytes([9, DT_CONFIG]) + struct.pack("<H", 9 + len(body)) + bytes([2, 1, 0, 0x80, 50]) + body
+
+    # PROBE AND COMMIT, on the streaming interface: what the host asked for, with this camera's frame and payload sizes.
+    def control(self, request_type, request, value, index, length, data):
+        selector = value >> 8
+        if request_type == 0x21 and request == 0x01 and selector == 1:
+            probe = bytearray(self.default_probe())
+            probe[:min(len(data), 8)] = data[:min(len(data), 8)]
+            struct.pack_into("<I", probe, 18, self.FRAME)
+            struct.pack_into("<I", probe, 22, self.PAYLOAD)
+            self.probe = probe
+            return SUCCESS, b""
+        if request_type == 0x21 and request == 0x01 and selector == 2:
+            self.commits += 1
+            self.number = 0
+            self.queue = []
+            self.filled = False
+            say(self.name, f"committed stream {self.commits} - a {self.PAYLOAD}-byte payload")
+            return SUCCESS, b""
+        if request_type == 0xA1 and selector in (1, 2):
+            if request == 0x85:
+                return SUCCESS, struct.pack("<H", 34)
+            if request == 0x86:
+                return SUCCESS, bytes([3])
+            return SUCCESS, bytes(self.probe if request == 0x81 else self.default_probe())[:length]
+        return STALL, b""
+
+    def on_alternate(self, interface, alternate):
+        if interface == 1:
+            say(self.name, f"alternate {alternate}" + (" - zero bandwidth" if alternate == 0 else f", {self.PACKETS[alternate - 1]} bytes an interval"))
+
+    def iso_started(self, address):
+        say(self.name, f"streaming from frame {self.number}")
+
+    def iso_stopped(self, address):
+        say(self.name, f"stopped after {self.packets} packets, {self.lost} of them lost on purpose, at frame {self.number}")
+
+    def frame(self, number):
+        data = struct.pack("<Q", number) + bytes((at * 7 + number * 13) % 251 for at in range(8, self.FRAME))
+        room = self.PAYLOAD - 2
+        chunks = [data[at:at + room] for at in range(0, len(data), room)]
+        out = []
+        for at, chunk in enumerate(chunks):
+            flags = 0x80 | (number & 1) | (0x02 if at == len(chunks) - 1 else 0)
+            if number == self.BAD_FRAME and at == 0:
+                flags |= 0x40
+            out.append(None if number == self.LOST_FRAME and at == self.LOST_PACKET else bytes([2, flags]) + chunk)
+        return out
+
+    # ONE SERVICE INTERVAL'S PAYLOAD - or `None`, a packet lost, which goes out with an error status and no data.
+    def iso_in(self, address):
+        if not self.queue:
+            # THE SECOND STREAM ENDS WITH THE CAMERA LEAVING after its first frame - and not at once: QEMU prefills
+            # its buffer of isochronous IN packets before it hands any to the guest and drops what it holds when the
+            # device goes. So the first frame is followed by a tenth of a second of empty payloads still carrying ITS
+            # FID - which the class says belong to no frame - and then the camera leaves.
+            if self.commits >= 2 and self.number == 1 and not self.filled:
+                self.filled = True
+                self.queue = [bytes([2, 0x80])] * 100
+            elif self.commits >= 2 and self.filled:
+                say(self.name, "leaving the bus in the middle of the second stream")
+                self.leaving = "gone"
+                return b""
+            else:
+                self.queue = self.frame(self.number)
+            self.number += 1
+        self.packets += 1
+        packet = self.queue.pop(0)
+        if packet is None:
+            self.lost += 1
+        return packet
+
+
+# THE FIRMWARE AN UPLOAD-CAPABLE TARGET HOLDS BEFORE ANYTHING IS MANIFESTED.
+DFU_FACTORY = firmware(3, 2500)
 # AN IMAGE THAT BEGINS WITH THIS makes the target leave the bus after its first block, for good.
 DFU_UNPLUG = b"UNPLUG"
-DFU_IDLE, DFU_DNLOAD_SYNC, DFU_DNLOAD_IDLE, DFU_MANIFEST_SYNC, DFU_MANIFEST, DFU_ERROR = 2, 3, 5, 6, 7, 10
+DFU_IDLE, DFU_DNLOAD_SYNC, DFU_DNLOAD_IDLE, DFU_MANIFEST_SYNC, DFU_MANIFEST, DFU_UPLOAD_IDLE, DFU_ERROR = 2, 3, 5, 6, 7, 9, 10
 APP_IDLE, APP_DETACH = 0, 1
 ERR_VERIFY, ERR_ADDRESS, ERR_NOTDONE = 0x07, 0x08, 0x09
 
@@ -230,10 +738,14 @@ class Dfu(Device):
 
     strings = {1: "LiberSystem harness", 2: "firmware target", 3: "LIBERDFU0001"}
 
-    def __init__(self, will_detach):
+    def __init__(self, will_detach, can_upload=False):
         super().__init__()
         self.will_detach = will_detach
-        self.name = "dfu-detach" if will_detach else "dfu-reset"
+        self.can_upload = can_upload
+        self.name = "dfu-upload" if can_upload else "dfu-detach" if will_detach else "dfu-reset"
+        # What an upload reads: the factory image, then whatever was manifested.
+        self.held = DFU_FACTORY
+        self.uploaded = 0
         self.mode_dfu = False
         self.detach_requested = False
         self.state = APP_IDLE
@@ -248,7 +760,7 @@ class Dfu(Device):
     def configuration_descriptor(self):
         protocol = 0x02 if self.mode_dfu else 0x01
         # bmAttributes: download-capable and manifestation-tolerant, and in runtime mode whether it leaves by itself.
-        attributes = 0x01 | 0x04 | (0x08 if self.will_detach and not self.mode_dfu else 0)
+        attributes = 0x01 | 0x04 | (0x08 if self.will_detach and not self.mode_dfu else 0) | (0x02 if self.can_upload else 0)
         functional = bytes([9, 0x21, attributes]) + struct.pack("<HHH", 500, 1024, 0x0110)
         body = bytes([9, DT_INTERFACE, 0, 0, 0, 0xFE, 0x01, protocol, 0]) + functional
         return bytes([9, DT_CONFIG]) + struct.pack("<H", 9 + len(body)) + bytes([1, 1, 0, 0x80, 50]) + body
@@ -288,9 +800,13 @@ class Dfu(Device):
                 self.image, self.block = bytearray(), 0
             return SUCCESS, b""
         if request_type == 0x21 and request == 6:
+            if self.state == DFU_UPLOAD_IDLE:
+                say(self.name, f"DFU_ABORT during an upload, after {self.uploaded} bytes")
             self.state, self.status = DFU_IDLE, 0
             self.image, self.block = bytearray(), 0
             return SUCCESS, b""
+        if request_type == 0xA1 and request == 2:
+            return self.upload(value, length)
         if request_type == 0xA1 and request == 3:
             return SUCCESS, self.get_status()
         if request_type == 0xA1 and request == 5:
@@ -317,6 +833,23 @@ class Dfu(Device):
             say(self.name, "an image that says UNPLUG - leaving the bus in the middle of its download")
             self.leaving = "gone"
 
+    def upload(self, block, length):
+        if not self.can_upload or self.state not in (DFU_IDLE, DFU_UPLOAD_IDLE):
+            return STALL, b""
+        if self.state == DFU_IDLE:
+            if block != 0:
+                return STALL, b""
+            self.uploaded = 0
+            say(self.name, f"DFU_UPLOAD begins, {length}-byte blocks")
+        data = self.held[block * length:(block + 1) * length]
+        self.uploaded += len(data)
+        if len(data) < length:
+            say(self.name, f"DFU_UPLOAD ended - {self.uploaded} bytes in {block + 1} block(s)")
+            self.state = DFU_IDLE
+        else:
+            self.state = DFU_UPLOAD_IDLE
+        return SUCCESS, data
+
     def get_status(self):
         poll = 0
         if self.state == DFU_DNLOAD_SYNC:
@@ -326,6 +859,7 @@ class Dfu(Device):
             if digest == DFU_EXPECTED:
                 say(self.name, f"{len(self.image)} bytes in {self.block} block(s), the expected image - manifesting")
                 self.state, poll = DFU_MANIFEST, 50
+                self.held = bytes(self.image)
             else:
                 say(self.name, f"{len(self.image)} bytes in {self.block} block(s), NOT the expected image - errVERIFY")
                 self.state, self.status = DFU_ERROR, ERR_VERIFY
@@ -349,6 +883,13 @@ class Redirection:
         self.id64 = False
         # Isochronous IN streams: address -> [interval in seconds, when the next packet is due, packets sent].
         self.streams = {}
+        # Isochronous OUT streams the host started.
+        self.outs = set()
+        # Bulk IN requests waiting for data, oldest first: (id, endpoint, length). Interrupt IN endpoints receiving,
+        # and the id of the next interrupt packet.
+        self.bulk_waiting = []
+        self.interrupts = set()
+        self.interrupt_id = 0
         # When a device that left the bus by itself comes back, if it is going to.
         self.returning = None
 
@@ -434,6 +975,10 @@ class Redirection:
             if interface is None or current.get(address) == interface or address not in current:
                 del self.streams[address]
                 self.device.iso_stopped(address)
+        for address in list(self.outs):
+            if interface is None or current.get(address) == interface or address not in current:
+                self.outs.discard(address)
+                self.device.iso_stopped(address)
 
     def handle(self, kind, ident, body):
         device = self.device
@@ -476,8 +1021,14 @@ class Redirection:
         elif kind == START_ISO_STREAM:
             address = body[0]
             interval = next((i for _n, _a, _c, _s, _p, endpoints in device.current() for a, attributes, _packet, i in endpoints if a == address and attributes & 3 == TYPE_ISO), None)
-            if interval is None or not address & 0x80:
+            if interval is None:
                 self.send(ISO_STREAM_STATUS, ident, bytes([INVAL, address]))
+                return
+            # AN OUT STREAM IS THE HOST'S TO PACE: its packets arrive and are handed to the model as they come.
+            if not address & 0x80:
+                self.outs.add(address)
+                self.send(ISO_STREAM_STATUS, ident, bytes([SUCCESS, address]))
+                device.iso_started(address)
                 return
             # A full-speed interval is frames; a high-speed one is 2^(n-1) microframes.
             seconds = interval / 1000 if device.speed == SPEED_FULL else (1 << (interval - 1)) / 8000
@@ -486,9 +1037,15 @@ class Redirection:
             device.iso_started(address)
         elif kind == STOP_ISO_STREAM:
             address = body[0]
-            if self.streams.pop(address, None) is not None:
+            if self.streams.pop(address, None) is not None or address in self.outs:
+                self.outs.discard(address)
                 device.iso_stopped(address)
             self.send(ISO_STREAM_STATUS, ident, bytes([SUCCESS, address]))
+        elif kind == ISO_PACKET:
+            # AN ISOCHRONOUS OUT PACKET: endpoint, status, length, then the data. Nothing answers it.
+            address, _status, length = struct.unpack("<BBH", body[:4])
+            if address in self.outs:
+                device.iso_out(address, bytes(body[4:4 + length]))
         elif kind == CONTROL_PACKET:
             self.control_packet(ident, body)
             # A MODEL THAT HAS TO LEAVE does so after its answer has gone: a detach is acknowledged before the
@@ -498,12 +1055,29 @@ class Redirection:
         elif kind == DEVICE_DISCONNECT_ACK:
             if self.returning is not None:
                 self.come_back()
-        elif kind in (CANCEL_DATA_PACKET, FILTER_FILTER):
-            # Nothing is ever left pending here - every data packet is answered as it arrives - and no filter
-            # is kept, so these change nothing.
+        elif kind == BULK_PACKET:
+            # endpoint, status, length, stream id and the length's high half - then, going OUT, the data.
+            endpoint, _status, low, _stream, high = struct.unpack("<BBHIH", body[:10])
+            length = low | (high << 16 if self.both(CAP_32BITS_BULK_LENGTH) else 0)
+            if endpoint & 0x80:
+                # AN IN REQUEST WAITS for data, and is answered when the model has some.
+                self.bulk_waiting.append((ident, endpoint, length))
+            else:
+                device.bulk_out(endpoint, bytes(body[10:10 + length]))
+                self.send(BULK_PACKET, ident, struct.pack("<BBHIH", endpoint, SUCCESS, length & 0xFFFF, 0, length >> 16))
+        elif kind == CANCEL_DATA_PACKET:
+            # A WAITING BULK REQUEST the host gave up on is answered as cancelled; nothing else is ever left pending.
+            for waiting in [w for w in self.bulk_waiting if w[0] == ident]:
+                self.bulk_waiting.remove(waiting)
+                self.send(BULK_PACKET, ident, struct.pack("<BBHIH", waiting[1], CANCELLED, 0, 0, 0))
+        elif kind == FILTER_FILTER:
             pass
-        elif kind in (START_INTERRUPT_RECEIVING, STOP_INTERRUPT_RECEIVING):
-            self.send(INTERRUPT_RECEIVING_STATUS, ident, bytes([INVAL, body[0]]))
+        elif kind == START_INTERRUPT_RECEIVING:
+            self.interrupts.add(body[0])
+            self.send(INTERRUPT_RECEIVING_STATUS, ident, bytes([SUCCESS, body[0]]))
+        elif kind == STOP_INTERRUPT_RECEIVING:
+            self.interrupts.discard(body[0])
+            self.send(INTERRUPT_RECEIVING_STATUS, ident, bytes([SUCCESS, body[0]]))
         else:
             say(device.name, f"a packet of type {kind} this device does not answer")
 
@@ -531,17 +1105,38 @@ class Redirection:
     # stream that fell behind catches up in bursts of at most a few packets a turn rather than skipping frames -
     # the counter in the samples must never jump, so late is the only way this side may be wrong.
     def pump(self):
+        # THE DATA THE MODEL HAS FOR THE HOST: interrupt packets as they come, and waiting bulk requests answered, each
+        # with as much as it asked for and no more.
+        for address in sorted(self.interrupts):
+            while (data := self.device.interrupt_in(address)) is not None:
+                self.send(INTERRUPT_PACKET, self.interrupt_id, struct.pack("<BBH", address, SUCCESS, len(data)) + data)
+                self.interrupt_id += 1
+        for waiting in list(self.bulk_waiting):
+            ident, endpoint, length = waiting
+            data = self.device.bulk_in(endpoint, length)
+            if data:
+                self.bulk_waiting.remove(waiting)
+                self.send(BULK_PACKET, ident, struct.pack("<BBHIH", endpoint, SUCCESS, len(data) & 0xFFFF, 0, len(data) >> 16) + data)
         now = time.monotonic()
         for address, stream in self.streams.items():
             seconds, due, sent = stream
             burst = 0
             while due <= now and burst < 16:
                 data = self.device.iso_in(address)
-                self.send(ISO_PACKET, sent, struct.pack("<BBH", address, SUCCESS, len(data)) + data)
+                # A PACKET THE MODEL LOSES goes out with an error status and nothing in it.
+                if data is None:
+                    self.send(ISO_PACKET, sent, struct.pack("<BBH", address, IOERROR, 0))
+                else:
+                    self.send(ISO_PACKET, sent, struct.pack("<BBH", address, SUCCESS, len(data)) + data)
                 sent += 1
                 due += seconds
                 burst += 1
+                if self.device.leaving is not None:
+                    break
             stream[1], stream[2] = due, sent
+            if self.device.leaving is not None:
+                self.leave()
+                return
 
     def next_due(self):
         if not self.streams:
@@ -554,6 +1149,9 @@ class Redirection:
             if self.returning is not None and time.monotonic() >= self.returning:
                 self.come_back()
             wait = self.next_due()
+            # A MODEL WITH DATA PENDING is looked at again soon, whatever the streams' schedule.
+            if self.bulk_waiting or self.interrupts:
+                wait = 0.001 if wait is None else min(wait, 0.001)
             ready, _, _ = select.select([self.connection], [], [], 0.25 if wait is None else min(wait, 0.25))
             if ready:
                 chunk = self.connection.recv(65536)
@@ -579,7 +1177,7 @@ class Redirection:
             self.pump()
 
 
-DEVICES = {"mic": Microphone, "dfu-reset": lambda: Dfu(False), "dfu-detach": lambda: Dfu(True)}
+DEVICES = {"bt-sco": BtSco, "mic": Microphone, "midi2": Midi2, "speaker-async": SpeakerAsync, "speaker-uac2": SpeakerUac2, "uvc-iso": UvcIso, "dfu-reset": lambda: Dfu(False), "dfu-detach": lambda: Dfu(True), "dfu-upload": lambda: Dfu(False, True)}
 
 
 def main():

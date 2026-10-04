@@ -466,6 +466,11 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 	// conversation. See `serve_provider_catalogue`.
 	let (catalogue_server, catalogue_client) = Channel::create();
 	send_cap(&audio_boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	// THE IDLE-LATENCY PRIVILEGE AND THE OBSERVATION ROOT, neither of which this harness gives - both tags still
+	// arrive, carrying nothing, because the bootstrap is read positionally: missing, the service waited for them
+	// and never reported in.
+	audio_boot_kernel.send(Message::new(b"LATENCY".to_vec(), alloc::vec::Vec::new())).expect("the latency tag");
+	audio_boot_kernel.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("the stats tag");
 	sched::run_until_idle();
 	assert_eq!(&audio_boot_kernel.recv().expect("AudioService online report").bytes[..], b"AudioService: online");
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
@@ -527,8 +532,9 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 		for _ in 0..200_000 {
 			system.pump();
 			// The driver's side of the protocol: a one-byte message is a command, `1` asks for a
-			// period and `2` ends the stream. Anything else here would be a playback period, which
-			// this test never produces.
+			// period and `2` ends the stream, and `3` asks for the playback counters - which this
+			// stand-in keeps none of, so it refuses with an empty answer as `virtio-snd` does.
+			// Anything else here would be a playback period, which this test never produces.
 			if let Ok(command) = snd_host.recv() {
 				match command.bytes.as_slice() {
 					[1] => {
@@ -540,6 +546,7 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 						snd_host.send(Message::new(period, alloc::vec::Vec::new())).expect("a captured period");
 					}
 					[2] => snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("the capture stop ACK"),
+					[3] => snd_host.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("the counters refused"),
 					other => panic!("the service sent the driver something that is not a capture command: {other:?}"),
 				}
 			}
@@ -900,7 +907,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 // enumerated stops being denied out loud - so each new one is added here, once, rather than to every string.
 macro_rules! later_denials {
 	() => {
-		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny input-gamepad=deny tpm=deny tpm-measure=deny tpm-seal=deny"
+		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny input-gamepad=deny tpm=deny tpm-measure=deny tpm-seal=deny bmc=deny typec=deny typec-control=deny system-sleep=deny sleep-wake=deny processor-power=deny"
 	};
 }
 

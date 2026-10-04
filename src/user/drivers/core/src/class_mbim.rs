@@ -66,7 +66,7 @@ fn limits() -> mbim::Limits {
 }
 
 // A USB string descriptor, as text.
-fn usb_string(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, index: u8) -> String {
+pub(crate) fn usb_string(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, index: u8) -> String {
 	if index == 0 {
 		return String::new();
 	}

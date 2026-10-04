@@ -457,6 +457,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// with the fixture's control endpoint, inventory and a receiver on endpoint 0; `midihold` is the second receiver, on endpoint 1; `midiread` holds inventory ALONE; `midifail`'s
 		// launch fails after its receiver was minted.
 		b"midicheck" => Some(granted("midicheck", alloc::vec![Capability::FixtureControl, Capability::Midi, Capability::MidiInput, Capability::MidiOutput])),
+		b"midiump" => Some(granted("midiump", alloc::vec![Capability::FixtureControl, Capability::Midi, Capability::MidiInput, Capability::MidiOutput])),
 		b"midihold" => Some(granted("midihold", alloc::vec![Capability::MidiInput])),
 		b"midiread" => Some(granted("midiread", alloc::vec![Capability::Midi])),
 		b"midifail" => Some(granted("midifail", alloc::vec![Capability::MidiInput, Capability::ModemIdentity])),
@@ -1100,7 +1101,7 @@ fn admin_policy(component: &str) -> Option<AdminScope> {
 		}
 	}
 	match component {
-		"dfu" => Some(AdminScope { actions: alloc::vec![AdminAction::FirmwareDownload], target_prefix: String::from("dfu:") }),
+		"dfu" => Some(AdminScope { actions: alloc::vec![AdminAction::FirmwareDownload, AdminAction::FirmwareUpload], target_prefix: String::from("dfu:") }),
 		// THE BMC TOOL: erasing a BMC's event log and its chassis control, on targets that name a BMC - and nothing else
 		// gets either.
 		"bmc" => Some(AdminScope { actions: alloc::vec![AdminAction::BmcSelClear, AdminAction::BmcChassisControl], target_prefix: String::from("bmc:") }),
@@ -1117,6 +1118,8 @@ fn midi_policy(component: &str) -> Option<(&'static str, u32)> {
 		match component {
 			"midicheck" | "midifail" => return Some(("fixture", 0)),
 			"midihold" => return Some(("fixture", 1)),
+			// The UMP probe's, on the fixture's UMP receive endpoint.
+			"midiump" => return Some(("fixture", 3)),
 			_ => {}
 		}
 	}
@@ -1131,6 +1134,10 @@ fn midi_output_policy(component: &str) -> Option<(&'static str, u32)> {
 		// reads.
 		if component == "midicheck" {
 			return Some(("fixture", 2));
+		}
+		// And the UMP probe's, the UMP transmit endpoint, played back on the one its receiver reads.
+		if component == "midiump" {
+			return Some(("fixture", 4));
 		}
 	}
 	let _ = component;

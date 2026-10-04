@@ -568,6 +568,9 @@ enum hci-packet-kind {
 	/// speak it can refuse a packet by kind rather than by guessing at a length - and so the kind
 	/// is not allocated twice when that work arrives.
 	iso     = 4,
+	/// SYNCHRONOUS VOICE, both directions: a 12-bit connection handle with its status bits, a length byte and that
+	/// many bytes. Carried only while `voice` holds a setting open, and only by a provider whose attachment says so.
+	sco     = 5,
 }
 
 /// WHAT THE TRANSPORT WILL CARRY, LEARNED BEFORE A BYTE MOVES.
@@ -598,6 +601,9 @@ record hci-attachment {
 	/// which is what makes a packet from before a reset distinguishable from one after it, rather
 	/// than being delivered into a host stack that has forgotten the link it belongs to.
 	epoch:            u32,
+	/// Whether this provider carries `sco` at all - a controller with voice settings - and the largest packet.
+	sco:              bool,
+	max-sco:          u32,
 }
 
 /// One HCI packet as the transport delivered it, with none of the consumer's own framing implied.
@@ -658,6 +664,11 @@ interface hci-transport {
 	/// session is invalid when this returns, and the provider says so on `control` as well - a
 	/// consumer that reset the controller itself still learns it the same way one that did not does.
 	@op(5) reset:   func() -> result<u32, error>;
+	/// THE VOICE SETTING THE CONSUMER NEGOTIATED WITH THE CONTROLLER, carried: how many voice channels and 8- or
+	/// 16-bit samples, or the wideband setting for one channel - answered with the setting the transport chose, or
+	/// `unsupported` for one this controller does not have. Zero channels closes voice, and answers zero. A transport
+	/// never looks inside a voice packet and never sets a link up: the consumer has, before it asks for this.
+	@op(6) voice:   func(channels: u8, bits: u8, wideband: bool) -> result<u8, error>;
 }
 
 /// THE LARGEST FRAME EITHER DIRECTION OF A CONSOLE BYTE STREAM WILL CARRY, and the version the two

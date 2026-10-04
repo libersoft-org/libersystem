@@ -10,7 +10,10 @@
 //                          time, after a delayed read
 //   midicheck malformed    misalignment, a reserved code, a cable the endpoint lacks: typed faults
 //   midicheck cap          a SysEx over 64 kB in many small fragments is aborted by number; a new one recovers
-//   midicheck unsupported  UMP is unsupported; a direction an endpoint lacks is invalid; inventory opens nothing
+//   midicheck unsupported  either protocol is only a question of grants; a direction an endpoint lacks is invalid;
+//                          inventory opens nothing
+//   midicheck ump          the MIDI 1.0 endpoints through the translation the other way: read as UMP, and UMP sent
+//                          on the transmit endpoint as MIDI 1.0 - a message with no MIDI 1.0 form refusing its batch
 //   midicheck send         a phrase through the sender comes back through the receiver, chunk for chunk; a bad
 //                          batch sends nothing; a stopped sender is closed
 //   midicheck overflow     a flood past the queue ends the receiver with a readable overflow
@@ -26,7 +29,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{Error, EventEndReason, LaunchContext, MidiAbortReason, MidiBatch, MidiChunk, MidiChunkKind, MidiDirection, MidiEndpointId, MidiFaultCode, MidiItem, MidiProtocol, midi, midi_fixture, midi_input, midi_output};
+use proto::system::{Error, EventEndReason, LaunchContext, MidiAbortReason, MidiBatch, MidiChunk, MidiChunkKind, MidiDirection, MidiEndpointId, MidiFaultCode, MidiItem, MidiProtocol, MidiUmp, midi, midi_fixture, midi_input, midi_output};
 use rt::*;
 use services::capability_names::*;
 
@@ -185,8 +188,9 @@ fn unsupported(probe: &Probe) {
 	let receive = probe.endpoint();
 	let transmit = probe.transmit().id;
 	let open = |endpoint: &MidiEndpointId, direction: MidiDirection, protocol: MidiProtocol| midi::Client::with_deadline(ChannelTransport { chan: probe.inventory }, clock() + 5 * TICKS).open(endpoint, &direction, &protocol);
-	if !matches!(open(&receive, MidiDirection::Receive, MidiProtocol::Ump), Some(Err(Error::Unsupported))) || !matches!(open(&transmit, MidiDirection::Transmit, MidiProtocol::Ump), Some(Err(Error::Unsupported))) {
-		fail(b"unsupported: UMP was not refused as unsupported");
+	// EITHER PROTOCOL ON EITHER ENDPOINT IS A QUESTION OF GRANTS ALONE - the other one goes through the translation.
+	if !matches!(open(&receive, MidiDirection::Receive, MidiProtocol::Ump), Some(Err(Error::Denied))) || !matches!(open(&transmit, MidiDirection::Transmit, MidiProtocol::Ump), Some(Err(Error::Denied))) {
+		fail(b"unsupported: UMP on a MIDI 1.0 endpoint was refused for something other than a grant");
 	}
 	if !matches!(open(&receive, MidiDirection::Transmit, MidiProtocol::Midi1), Some(Err(Error::Invalid))) || !matches!(open(&transmit, MidiDirection::Receive, MidiProtocol::Midi1), Some(Err(Error::Invalid))) {
 		fail(b"unsupported: a direction the endpoint does not have was not refused as invalid");
@@ -194,7 +198,38 @@ fn unsupported(probe: &Probe) {
 	if !matches!(open(&receive, MidiDirection::Receive, MidiProtocol::Midi1), Some(Err(Error::Denied))) || !matches!(open(&transmit, MidiDirection::Transmit, MidiProtocol::Midi1), Some(Err(Error::Denied))) {
 		fail(b"unsupported: inventory opened a receiver or a sender");
 	}
-	say(b"PASS unsupported: UMP is unsupported, a direction the endpoint lacks is invalid, and inventory opens neither way");
+	say(b"PASS unsupported: either protocol needs only a grant, a direction the endpoint lacks is invalid, and inventory opens neither way");
+}
+
+// THE MIDI 1.0 ENDPOINTS READ AND WRITTEN AS UMP: the receiver asks for UMP, and UMP sent on the transmit endpoint goes
+// out as MIDI 1.0 - a group as a cable - and comes back through the loopback as MIDI 1.0 in UMP.
+fn ump(probe: &Probe) {
+	let input = || midi_input::Client::with_deadline(ChannelTransport { chan: probe.input }, clock() + 5 * TICKS);
+	let output = || midi_output::Client::with_deadline(ChannelTransport { chan: probe.output }, clock() + 5 * TICKS);
+	if !matches!(input().protocol(&MidiProtocol::Ump), Some(Ok(()))) {
+		fail(b"ump: the receiver would not read UMP");
+	}
+	let sent = alloc::vec![MidiUmp { group: Some(1), words: alloc::vec![0x2191_3C64] }, MidiUmp { group: Some(0), words: alloc::vec![0x3003_0102, 0x0300_0000] }];
+	if !matches!(output().send_ump(&sent), Some(Ok(()))) {
+		fail(b"ump: UMP was not taken on a MIDI 1.0 endpoint");
+	}
+	let back = probe.drain();
+	let words: Vec<(Option<u8>, &[u32])> = back.iter().filter_map(|item| if let MidiItem::Ump(message) = item { Some((message.group, message.words.as_slice())) } else { None }).collect();
+	// THE SYSEX COMES BACK AS THE PACKETS CARRIED IT: a start of two bytes, and an end of one.
+	let want: [(Option<u8>, &[u32]); 3] = [(Some(1), &[0x2191_3C64]), (Some(0), &[0x3012_0102, 0]), (Some(0), &[0x3031_0300, 0])];
+	if words != want || back.len() != want.len() {
+		fail(b"ump: a MIDI 1.0 endpoint did not come back as MIDI 1.0 in UMP");
+	}
+	// A MESSAGE WITH NO MIDI 1.0 FORM refuses its batch: a per-note controller, and SysEx8.
+	for bad in [alloc::vec![MidiUmp { group: Some(0), words: alloc::vec![0x4000_3C01, 0] }], alloc::vec![MidiUmp { group: Some(0), words: alloc::vec![0x5001_0000, 0, 0, 0] }]] {
+		if !matches!(output().send_ump(&bad), Some(Err(Error::Invalid))) {
+			fail(b"ump: a message with no MIDI 1.0 form was not refused");
+		}
+	}
+	if !probe.drain().is_empty() {
+		fail(b"ump: a refused batch reached the device");
+	}
+	say(b"PASS ump: a MIDI 1.0 endpoint read as MIDI 1.0 in UMP, UMP sent on its transmit endpoint as MIDI 1.0, and a message with no MIDI 1.0 form refused");
 }
 
 fn chunk(cable: u8, kind: MidiChunkKind, bytes: &[u8], message: Option<u32>) -> MidiChunk {
@@ -371,13 +406,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"malformed" => malformed(&probe),
 		b"cap" => cap(&probe),
 		b"unsupported" => unsupported(&probe),
+		b"ump" => ump(&probe),
 		b"send" => send(&probe),
 		b"overflow" => overflow(&probe),
 		b"lost" => lost(&probe),
 		b"unplug" => unplug(&probe),
 		b"fresh" => fresh(&probe),
 		b"inherit" => inherit(&probe),
-		_ => fail(b"usage: midicheck receive | malformed | cap | unsupported | send | overflow | lost | unplug | fresh | inherit"),
+		_ => fail(b"usage: midicheck receive | malformed | cap | unsupported | ump | send | overflow | lost | unplug | fresh | inherit"),
 	}
 	exit();
 }

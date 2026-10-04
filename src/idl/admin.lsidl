@@ -39,6 +39,8 @@ enum admin-action {
 	bmc-sel-clear     = 3,
 	/// A BMC chassis control: power down, power cycle, hard reset or soft shutdown.
 	bmc-chassis-control = 4,
+	/// Read a DFU target's firmware out, for the requester to keep - from a target that declares upload alone.
+	firmware-upload   = 5,
 }
 
 /// THE OPERATION EXACTLY AS THE EXECUTOR FROZE IT, and all that a confirmation authorizes.
@@ -88,6 +90,23 @@ enum admin-result {
 	outcome-unknown = 3,
 }
 
+/// WHAT AN OPERATION THAT READS READ, handed to the requester READ-ONLY: it maps the bytes and can change none of them.
+record admin-image {
+	image:             handle<admin-payload>,
+	/// How many of the object's bytes are the image.
+	length:            u32,
+	/// SHA-256 of those bytes, as the operation's record states it.
+	@bound(32) digest: list<u8>,
+}
+
+/// AN OPERATION THAT READS: its result, and - for a completed one alone - what it read.
+variant admin-read {
+	completed(admin-image),
+	failed,
+	/// Dispatched, and its end not observed. Nothing is handed over, and it is never retried.
+	outcome-unknown,
+}
+
 /// ONE REQUEST AT A TIME ON A CONNECTION. `request` is answered when it is decided.
 interface admin-request {
 	@op(1) request: func(args: admin-request-args, @rights(map) payload: handle<admin-payload>) -> result<admin-answer, error>;
@@ -95,9 +114,11 @@ interface admin-request {
 	@op(2) cancel:  func() -> result<unit, error>;
 }
 
-/// A GRANT'S CHANNEL. `execute` is the one attempt at the confirmed operation.
+/// A GRANT'S CHANNEL. `execute` is the one attempt at the confirmed operation - `execute-read` for an operation that
+/// READS (`firmware-upload`), with what it read. The call of the other kind is refused and consumes nothing.
 interface admin-authority {
-	@op(1) execute: func() -> result<admin-result, error>;
+	@op(1) execute:      func() -> result<admin-result, error>;
+	@op(2) execute-read: func() -> result<admin-read, error>;
 }
 
 /// What a request connection may ask for: these actions, on targets whose selector starts with this.
@@ -127,6 +148,8 @@ interface admin-executor {
 	@op(2) revalidate: func(operation: u64) -> result<unit, error>;
 	@op(3) execute:    func(operation: u64, epoch: u64) -> result<admin-result, error>;
 	@op(4) cancel:     func(operation: u64) -> result<unit, error>;
+	/// The one attempt at an operation that READS, under the same start guard: what it read, made read-only.
+	@op(5) execute-read: func(operation: u64, epoch: u64) -> result<admin-read, error>;
 }
 
 enum admin-event {
@@ -155,6 +178,9 @@ record admin-record {
 	monotonic-ns:             u64,
 	utc-seconds:              option<u64>,
 	@bound(16) utc-provenance: string,
+	/// What a completed operation that READS handed over: its length and SHA-256. Zero and empty otherwise.
+	result-length:            u32,
+	@bound(32) result-digest: list<u8>,
 }
 
 record admin-journal-page {

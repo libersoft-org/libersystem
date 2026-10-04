@@ -3678,3 +3678,350 @@ VERIFICATION (2026-09-29, x86_64):
 - `LIBER_DEVELOPMENT=1 ./image.sh --format iso` then `./check.sh --gate power-ups` (P02M0181's new gate) - FAILED
   before the fix as described above, PASS after it (483 s).
 - NOT RUN: the oracle on aarch64 and riscv64 (the end of the job).
+
+## The power-button provider: the fixed and control-method buttons as `platform-switch` publications (2026-10-04)
+
+THE ITEM. "Publish a typed power-button provider with a capability-gated SHUTDOWN request". Its plan is written under
+the item in the milestone (2026-10-04): the consumer it waited for exists now - P02M0197's power-state policy, which
+already decided what the lid does - and the press it would decide had a defect of its own: both the fixed button's
+press (DeviceManager) and the control-method one's (the `acpi-button` driver) called SystemManager's `power-off`,
+which stops the machine at once with no service stopped and no log flushed.
+
+WHAT WAS DONE:
+- THE KERNEL DECLARES THE FIXED BUTTONS AS ROWS. `arch::x86_64::platform::fixed_of` reads a FADT's PWR_BUTTON and
+  SLP_BUTTON flags (none on a hardware-reduced machine or one whose PM1a event block is not in port I/O); the SCI's
+  arming and `describe` read the same answer. Each fixed button is a claimable kernel row with no resource,
+  `kernel:pwrbtn` (`LNXPWRBN`) and `kernel:slpbtn` (`LNXSLPBN`) - names and ids in `abi`.
+- THE DRIVER PROTOCOL GAINED `PRESSED` (20), manager to driver, empty, no handle. DeviceManager's
+  `serve_platform_events` hands a fixed press to the ONLINE binding that holds the button's row (`hand_press`) and says
+  so; with none, it acts as before and says that ("no driver holds it"). A `PRESSED` coming the wrong way is refused
+  with the other manager-to-driver opcodes. The drivers' common loop counts presses (`common::presses`) in every wait
+  and in the sleep's hold, and the bounded wait hands one back as "nothing ready".
+- `switch-kind` GAINED `power-button` AND `sleep-button`, and `sleep-reason` `power-button`. A button is momentary: the
+  watch opens on its state, open, and each press is one frame `closed` with the sequence advanced. Both IDL changes
+  are additive and were regenerated with `--accept-breaking` (nothing is versioned yet).
+- THE `acpi-button` DRIVER binds the two rows too (the manifest's `LNXPWRBN`/`LNXSLPBN` rules), asks no node for them
+  and takes their presses from the control channel; EVERY binding - lid, buttons, fixed or not - publishes a
+  `platform-switch`. A press goes to the consumer; with none watching, or a stream that is full or gone
+  (`acpi_button::actor`), the driver carries it out as before - so a press never does nothing for want of a consumer.
+- THE POLICY (`service_logic::sleep_policy`): `Event::Pressed(Button)`, settings `power.button` (`power-off` - the
+  default - `suspend`, `hibernate`, `nothing`) and `power.sleep-button` (`suspend` - the default - `hibernate`,
+  `nothing`; `power-off` refused). A refused hibernation is the orderly power-off for a power button and a critical
+  battery, nothing more for a sleep button. PowerService follows EVERY `platform-switch` publication, each one's kind
+  told by its first frame ("follows the power button"), acts once per press, and the power-off it asks for is the
+  orderly one it already had: the forced deadline armed, then ServiceManager's sequence through `system-shutdown`.
+
+TESTS ADDED: protocol `a_press_ends_nothing_and_carries_nothing` (and 20 taken out of the unknown list); driver
+`the_kernel_s_fixed_button_rows_are_buttons_whose_presses_come_from_the_manager`,
+`a_press_is_the_consumer_s_only_when_it_reached_a_consumer`; policy (5 new): the defaults, every setting, a press as an
+edge of its own, the hibernation fallbacks by button, a press leaving the lid's and the battery's edges alone; kernel
+`kernel.platform_rows.the_fixed_buttons_are_claimable_rows_that_hold_nothing` (QEMU's FADT: a fixed power button and no
+fixed sleep button; the row claimable, holding nothing, matched by the `acpi_button` entry, claimed, refused a second
+time, released and claimed again).
+
+VERIFICATION (x86_64):
+- host: `driver-protocol` 80, `service-logic` 752, `drivers` 453 - all pass.
+- `./build.sh` (x86_64) - exit 0, no warning; `cd src/kernel && TEST=1 TEST_TAGS="" cargo build --tests` - clean.
+- `TEST_SELECTION=<the new test and two neighbours> ./test.sh --arch x86_64` - "3 passed (29s)".
+- `./lab.sh scenario-cold x86_64 src/harness/scenarios/power-button.toml` - "power button passed in 4.8 s"; the boot
+  log, in order: `driver.acpi-button: kernel:pwrbtn: online (PowerButton, fixed hardware)`, `PowerService: sleep
+  policy: follows the power button`, then after `system_powerdown`: `acpi: the power button was pressed`,
+  `DeviceManager: the power button was pressed - handed to the driver that holds it`, `driver.acpi-button:
+  kernel:pwrbtn: pressed - told the power-state policy, which decides what it does`, `PowerService: sleep policy: the
+  power button was pressed - it powers off in order`, `power: a forced power-off deadline is armed ... (10 s from
+  now)`, `supervisor: system-shutdown asked for the orderly power-off`, every service stopped, `power-off: the
+  registered \_S5 (0, 0) into PM1 control`.
+- `./check.sh --gate sleep` (after `LIBER_DEVELOPMENT=1 ./image.sh --format iso`) - PASS, 1718 s: both power buttons
+  and the sleep button followed; the sleep button set to `nothing` told to the policy and nothing done, no
+  transaction, the machine running; at its default, read by the policy relaunched again, a suspend to RAM with the
+  sleep button as the reason; the control-method power button told to the policy and the machine powered off in order
+  through `system-shutdown` and `\_S5`, with every driver stopped before its device was taken. A first run of the gate
+  failed in its first boot, before any of this, on the harness's console socket refusing a Ctrl+Z it had taken a line
+  earlier ("the serial console took no Ctrl+Z", `ConnectionRefusedError`), which no change here touches; the rerun
+  passed whole.
+
+## Found by that run: the orderly power-off killed DeviceManager before it stopped a driver (2026-10-04)
+
+WHAT WAS WRONG. In the scenario's orderly power-off - and in a `shutdown` typed at the serial shell (the sleep gate's
+fallback boot, 2026-10-03) and the processor-power gate's - the kernel released seven claims at once and nine drivers
+then died on ring-3 page faults, most at `0x4000_0000_0014`: the first object mapped into a driver is its BAR, and
+0x14 is virtio's `device_status` - the reset each driver writes as it stops. `lifecycle::shutdown_all` stops every
+service by SIG_KILL, DeviceManager among them, so DeviceManager's own `stop_all` - every driver told `STOP` in
+reverse dependency order, its device quiesced, its claim given back after it exited - never ran: its death released
+every claim while the drivers still ran, and the kernel revoked their registers under them. DeviceManager's own comment
+names this ("a forced revocation dressed up as a shutdown") on the path that was never taken.
+
+THE FIX. `shutdown_all` asks DeviceManager first (`stop_device_manager`): `STOP` on its control channel - the request
+the selftest's `stop_service` already sends - and its answer "DeviceManager: stopped" awaited for five seconds, its
+own bound for the drivers (one heartbeat deadline and one teardown allowance) plus two; only then, or past the bound
+with a line saying so, is it killed with the rest. And the sequence says where it begins ("supervisor: the orderly
+power-off begins", or reboot), whichever door it came in by.
+
+THE ORACLE. The gate `sleep` checks every orderly power-off it runs - the power button's, the battery's and the typed
+`shutdown` - for no ring-3 fault after that line, no "did not stop its drivers within its bound", and DeviceManager
+stopped.
+- The scenario again after the fix: "power button passed in 5.4 s"; after "the orderly power-off begins" the log has
+  no fault, every claim released one by one, "DeviceManager: every shutdown teardown classified", "supervisor:
+  device_manager stopped", `\_S5`.
+- STILL THERE AND NOT THIS FIX'S: `virtio-gpu` and `virtio-snd` exit when their one consumer connection closes
+  mid-sequence ("exited without saying anything") and DeviceManager restarts them before its own stop; its stop then
+  stops the restarted ones. It is the GPU restart behaviour other milestones rely on, not a fault.
+
+## And the sequence did not fit its own forced deadline: a kill that freed a large object one shootdown per frame (2026-10-04)
+
+WHAT WAS FOUND. With DeviceManager asked first, the gate `sleep`'s power-button case still ended without "supervisor:
+device_manager stopped": the policy's forced deadline (10 s) passed while ServiceManager was still stopping services,
+and the kernel powered the machine off with DeviceManager not yet reached. Measured on a development instance with an
+orderly `shutdown`, the sequence took 41 s. Stamps taken from the serial mirror put the gap after `process_service`,
+then after `config_service` - the mirror lags - so it was measured from inside, in ticks written straight to the kernel's
+log: `signal(storage_service, SIG_KILL)` took 3947 ticks; inside it `Process::terminate`'s `close_all`; inside that,
+dropping two `MemoryObject`s, 33 335 ms and 6 175 ms.
+
+WHY. `frame::retire` - the one door back to the allocator for frames a page table pointed at - pushed each frame into
+the quarantine ring, and once the ring (512) was full every further frame paid for a cross-core TLB shootdown of its
+own. A large object is tens of thousands of frames; so tens of thousands of shootdowns.
+
+THE FIX. A retirement larger than the queue pays for ONE shootdown and frees every frame: every frame passed in was
+unmapped before the call and a flush is not per-address. And a queue found full is drained - one shootdown gives all of
+it back - before any frame pays for its own; the per-frame path stays only for a shootdown that does not complete.
+Measured again: the whole orderly power-off in 1.5 s ("the orderly power-off begins" to `\_S5`), DeviceManager's
+teardown classified and stopped inside it.
+
+ALSO BOUNDED: the sequence's "stopped" record to LogService was a round trip with no deadline; it is half a second now
+(`emit_event_within`), so a LogService waiting on a service already gone cannot hold the sequence either.
+
+TEST ADDED: `kernel.mem.frame.a_large_retirement_is_one_shootdown_and_gives_every_frame_back` - on several cores (a
+shootdown counted once, checked first, so the counts mean something), 2 055 frames retired in at most one shootdown,
+nothing left queued, every frame back; and 500 frames into a queue holding 63 (room for 449) in at most two. Before the
+fix the first would have taken some 1 500 shootdowns. x86_64: "1 passed"; with the neighbouring quarantine test, "2
+passed".
+
+VERIFICATION OF THE THREE ABOVE, ON THE FINAL TREE (2026-10-04, x86_64):
+- The scenario `power-button` again after the kernel fix - "power button passed in 3.8 s"; after "the orderly power-off
+  begins" no fault, "DeviceManager: every shutdown teardown classified", "supervisor: device_manager stopped".
+- The gate `sleep` - PASS (1718 s), including the three orderly power-offs it now checks: the power button's, the
+  battery's ("QEMU gone 2305 ms after the 10 s deadline was armed" - the sequence finished inside the bound, where it
+  used to be the forced deadline that ended it), and the typed `shutdown` of the fallback boot.
+- `./check.sh --gate source-hygiene` - PASS after one fix it found in the gate `ipmi`'s case 7 of 2026-10-04 (a
+  `grep | head` under pipefail, now `grep -m 1`); `--gate gate-oracles` - PASS.
+- NOT RUN: aarch64 and riscv64 - the fixed buttons are x86's (a device-tree button is the ports' item), and the
+  `frame::retire` change and the ServiceManager change run there at the end of the job with the ports' suites.
+
+## USB DFU UPLOAD: the owner's option B, an explicit backup on request (2026-10-04)
+
+THE GO-AHEAD. The plan was written on 2026-09-25 and held as "plans only" with the other reopened USB items; the
+owner's instruction of 2026-10-04 - finish P02M0099, then P02M0103, then P02M0188 to P02M0202 - is the go-ahead it
+waited for.
+
+WHAT WAS DONE, against the plan's OWNS:
+- `liber:admin@1`: the action `firmware-upload` (5); `admin-image` (the image as a read-only `admin-payload`, its
+  length and SHA-256) and `admin-read` (`completed(admin-image)`, `failed`, `outcome-unknown`); `execute-read` on
+  `admin-authority` and on `admin-executor`; and `admin-record` gained `result-length` and `result-digest` - a
+  completed read's length and SHA-256 in its operation's record. Regenerated with `--accept-breaking`.
+- `service_logic::admin_descriptor`: the action, `reads()`, and its operation-table row - "READ this target's firmware
+  OUT - at most N bytes - and hand it to the requester, which names it "FILE"; a firmware image can hold the device's own
+  secrets and licensed code; the payload is the target's name" - from parameters of a bound (four bytes) and the file
+  (UTF-8), the file escaped as a label is; a bound of zero or past a mebibyte, or no file, is refused before anything
+  reaches an executor.
+- AdminService: an executor carries a SET of actions (the DFU executor both); an operation that reads is dispatched
+  with `execute-read`, its answer's image kept (a whole digest, a length inside the object, or it is a failure) until
+  the grant's `execute-read` is answered with it; the call of the other kind is refused and consumes nothing; a grant
+  that ends unanswered closes the image. The completion's record states the length and SHA-256, and so does its line.
+- The DFU executor (`class_dfu`): `prepare` for an upload - a target that declares `bitCanUpload` (refused before the
+  screen otherwise), the payload the target's name, the bound from the parameters; `execute-read` - idle first, then
+  `DFU_UPLOAD` block by block until a short one (`dfu::upload_step`), the device told `DFU_ABORT` and nothing kept past
+  the bound, nothing kept when it stops answering part-way ("incomplete", never retried), and the image copied into an
+  object of its own and handed over READ-ONLY (`RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER`) with its SHA-256; a runtime
+  target is detached and followed into DFU mode as a download is, the upload carried across (`Job::Upload`). The BMC's
+  and the probe's executors answer `execute-read` unsupported.
+- `dfu backup TARGET FILE [MAX]`: the file made under `FILE.partial` before anything is asked (a destination the tool
+  cannot create is refused before the screen), the image written there through a transactional writer and renamed onto
+  FILE only once whole; a decline, a failure or an unknown end removes the temporary file. PermissionManager's `dfu`
+  scope gained `firmware-upload`.
+- `drivers::dfu`: `can_upload`, `MAX_UPLOAD`, `upload_parameters`/`upload_request`, `Upload`/`upload_step`.
+
+TESTS ADDED: host - `drivers::dfu` (3: the parameters, the block steps, the attribute) and `admin_descriptor` (1: the
+row, its escaping and its refusals); the gate `qemu-dfu-tool` grew a backup refused before the screen on its first
+boot's target (which declares no upload) and a second boot on `usbredir_device.py`'s new `dfu-upload` target.
+
+ONE DEPARTURE FROM THE PLAN: it said the tool writes under a temporary name and renames a complete image. The FAT
+backing a USB stick has no rename (`FatBacking` keeps the trait's `Invalid`), and the first run of the gate showed it -
+"cannot be created here" (`touch`, which FAT does not take either). The property is kept by the volume's transactional
+writer instead: opened over FILE before the request (the destination check, still before the screen), committed only
+with a whole image - the volume publishes a writer's bytes at the commit as the file's whole contents - and aborted on
+every other end, so nothing is ever published for a backup that read nothing.
+
+FOUND ON THE WAY: the first run also failed on the harness's own device - `Dfu.current`, the new held-image attribute,
+shadowed `Device.current()` and broke the endpoint report (renamed `held`); and the completion's record was written
+after the grant had been answered and the image handed over, so its digest was looked up too late - the length and
+SHA-256 are kept apart (`read_results`) until the completion's record takes them.
+
+VERIFICATION (2026-10-04, x86_64):
+- host: `service-logic` 753, `drivers` 456 - pass.
+- `./build.sh` (x86_64) - exit 0, no warning; the test kernel builds.
+- `./check.sh --gate qemu-dfu-tool` - PASS (545 s): "a backup of the target, which declares no upload, was declined
+  before the protected screen was shown"; "backup: declined, nothing was read; confirmed, the runtime target was
+  followed into DFU mode and the file on the stick is its image byte for byte, with the SHA-256 the tool and the record
+  state; past its bound, the upload was stopped and no file was written". The device's log: one DFU_DETACH (the
+  confirmed backup's), "DFU_UPLOAD ended - 2500 bytes in 3 block(s)" once, "DFU_ABORT during an upload, after 2048
+  bytes" once; the stick holds `backup.bin` and neither `declined.bin` nor `short.bin`.
+- AdminService's other two gates, since its executor table, grant calls and record changed: `qemu-admin-path` - PASS
+  (487 s, its journal read back after a reboot with the new record fields); `qemu-ipmi-admin` - PASS (1438 s).
+- NOT RUN: aarch64 and riscv64 (the end of the job).
+
+## USB Video Class: isochronous streaming (2026-10-04)
+
+THE GO-AHEAD. Planned 2026-09-25 and held as "plans only"; the owner's instruction of 2026-10-04 to finish P02M0099 is
+the go-ahead.
+
+WHAT WAS DONE, against the plan's OWNS:
+1. THE ALTERNATE BY BANDWIDTH - `drivers::uvc`: `bind` takes a camera whose streaming interface carries isochronous IN
+   endpoints on its later alternates (`Binding::iso`, `bulk_in` now optional; a camera with neither is refused as
+   `NoStreamingEndpoint`, said by the xHCI driver); `IsoAlternate::capacity` counts `wMaxPacketSize` bits 12:11 at high
+   speed only; `alternate_for` answers the smallest alternate that carries the committed `dwMaxPayloadTransferSize`,
+   the lowest-numbered of equals, or `NoBandwidth { needed, most }`.
+2. THE STREAM - `class_uvc`: an isochronous camera rests at zero bandwidth from its bind; `negotiate` finds the
+   alternate after PROBE and COMMIT (refused, and said, when none carries the payload); `start` brings the endpoint up
+   with one Configure Endpoint that drops and adds it at the alternate's size (interval exponent from `usb_audio`, the
+   burst field at high speed), selects the alternate and keeps one page of transfers standing (up to
+   `CAPTURE_POSTED`), registered with the controller's kept-completions so a synchronous wait does not drop one; each
+   completion is one payload, fed to the `Assembler`; an empty one is no payload.
+3. A MISSED OR FAILED PACKET LOSES ITS FRAME - `Assembler::lost()`: the open frame becomes bad; with none open, the next
+   frame to open is bad (it may lack its start), and nothing after it.
+4. STOP AND UNPLUG: the standing transfers abandoned (Stop Endpoint, the stopped events read and anyone else's kept, Set
+   TR Dequeue), alternate zero selected, every buffer handed back; an unplug goes the bulk camera's way.
+5. THE FIXTURE - `usbredir_device.py --emulate uvc-iso`: a UVC 1.1 camera, 64x48 YUY2, alternates of 256, 512 and 1023
+   bytes, a 512-byte committed payload, frames cut into payloads with FID and EOF, frame 2's fifth packet sent as LOST
+   (an error status, no data - QEMU's usb-redir hands that to the guest as a transaction error), frame 3 with the error
+   bit; the harness's packet pump learned the lost packet and a device that leaves from its isochronous stream.
+
+FOUND ON THE WAY: the unplug case first failed with nothing of the second stream arriving - QEMU's usb-redir prefills
+its buffer of isochronous IN packets before handing any to the guest and drops what it holds when the device leaves,
+and the camera left right after its first frame's 13 packets. The camera now follows its first frame with a tenth of a
+second of empty payloads still carrying that frame's FID - which the class, and the `Assembler`, say belong to no
+frame - and then leaves; the assertion ("the first frame, and nothing after") is unchanged.
+
+VERIFICATION (2026-10-04, x86_64):
+- host: `drivers` 458 (uvc: the isochronous binding and the refusal by name, the alternate choice with the multiplier
+  and its refusal, the lost-packet path) - pass.
+- `./build.sh --arch x86_64` - exit 0; the test kernel builds.
+- `USB_GADGET=uvc-iso TEST_SELECTION=kernel.hardware.usb_video_streams_over_isochronous_packets ./test.sh --arch x86_64`
+  - "1 passed (22s)": "frames [0, 1, 4, 5, 6, 7] arrived whole and in order over isochronous packets, the frame that
+  lost a packet and the one marked bad were dropped as the device's, the stream stopped, and a camera unplugged
+  mid-stream closed its events and was withdrawn"; the driver: "the camera streams on alternate 2, 512 bytes an
+  interval, 8 transfers standing", "the camera's stream stopped - it is back at zero bandwidth"; the camera: "alternate
+  2, 512 bytes an interval", "stopped after 164 packets, 1 of them lost on purpose", "alternate 0 - zero bandwidth".
+- `USB_GADGET=uvc TEST_SELECTION=kernel.hardware.usb_video_negotiates_a_stream_and_writes_frames_into_queued_buffers` -
+  "1 passed (37s)", unchanged ("frames [0, 1, 2, 4] arrived whole and in order, frame 3 was dropped"); `usb-gadget.sh
+  verify` after it: "the host carries nothing of this harness's".
+- `USB_GADGET=mic` the audio capture oracle - "1 passed (30s)" (its isochronous constants are shared now).
+- NOT RUN: aarch64 and riscv64 (the end of the job).
+
+## USB Audio Class: the standing playback, an asynchronous sink's feedback, and the count in diagnostics (2026-10-04)
+
+WHAT WAS DONE (the plan's six parts, x86_64):
+1. THE STREAM STANDS - `usb_audio::Sink`: a PCM queue of `PLAYBACK_QUEUE` (four periods), `PLAYBACK_POSTED` (16)
+   packets standing, an IOC per `PLAYBACK_GROUP` (8) packets and on the last of a post; completions drain `inflight` up
+   to the TRB the event names (`absorb_sink`), so a missed intermediate event loses nothing. `play` queues and answers
+   `OK` when the queue has room for the next period, else when completions make room; an idle stream starts at
+   `PLAYBACK_START` (two periods); `end_play` drains and idles.
+2. THE PACER - `uac::Pacer::{nominal_for, next, peek, feedback, rate}`; host tests: a simulated second at both speeds
+   and both formats to the frame, the ignored outlier, the clamp, and that a peek takes nothing.
+3. THE FEEDBACK ENDPOINT - `uac::{sync_of, feedback_in, Feedback, feedback_value}`; `FeedbackPipe` keeps
+   `FEEDBACK_POSTED` (8) transfers standing, the endpoint context written beside the data endpoint's.
+4. OPTION (A) - silence in place of what the queue cannot fill, one underrun per dry spell, the silent frames counted;
+   the padding only while fewer than three quarters of the slots stand (`post_playback`'s `floor`).
+5. DIAGNOSTICS - `driver_protocol::audio::{CMD_STATS, PlaybackStats, STATS_BYTES}` (decode `#[inline]` - AudioService
+   is dynamic and the crate is no shared library); xHCI answers, HDA and virtio-snd refuse. IDL `liber:audio@1`
+   `audio-resources` + `audio-stats`; AudioService role `STATS` (last), counters cached on connect, every
+   `STATS_EVERY` (16) periods and after a stop (`DriverPending::Stats`); SystemGraphService role `AUDIO` (after
+   `DISPLAY`), the ladder and the relaunch path send `kept.end_of(audio_service, STATS)`; rows `playback-underruns`,
+   `silent-frames`, none when not counted; `audio-proto` in the graph's providers; shell `graph NAME`.
+6. THE FIXTURE - `usbredir_device.py` `SpeakerAsync` (+ iso OUT in the redirection), `qemu-run.sh`
+   `USB_QEMU_SPEAKER=off`, `test-kernel.sh` routing.
+
+DEFECTS FOUND AND FIXED:
+- THE CDC NOTIFICATION STORM (`usb_net`): the interrupt endpoint's context had Interval 0 (every microframe), and
+  `post_notification` re-posted the moment a read came back; QEMU's ECM status endpoint answers every read, QEMU's xHCI
+  does not pace interrupt endpoints - ~6000 completions/s for the life of the adapter (measured: DCI 3 of the ECM slot,
+  short packet, 8 bytes, 2048 events per ~33 ticks). Every request to the xHCI driver was answered a tick late, and a
+  200 ms timed wait in a kernel test woke after 1.8-2.0 s. Fixed: the context carries `interrupt_interval` of the
+  descriptor's `bInterval` (now parsed: `cdc::Binding::notification_interval`), and the read waits one interval after
+  the last completion (`Notify::{every, due}`, the loop's retry timer, a housekeeping wait). After: a round trip about
+  0.5 ms, the 200 ms wait 193-198 ms.
+- THE GREEDY SILENCE: after a starvation, one period back padded five packets of a group of eight with silence while
+  the next period was 2 ms away - a second underrun at once. Fixed by the floor in (4).
+- KERNEL HARNESS DRIFT: AudioService (`LATENCY`, both harnesses), ProcessService (`SUPERVISE`, eight sites via
+  `send_supervise_root`), StorageService on the system volume (`HIBERNATION`, `send_no_hibernation`, six sites),
+  DisplayService (`OUTPUTS`, three), InputService (`ACTIVITY`, five) - each service blocked on the missing role, every
+  test on those harnesses failed at its first step. The permission summaries' `later_denials!` gained the six
+  capabilities added meanwhile. `font_catalogue`'s `restart` corrected to `escalate` (no relaunch exists; the
+  `bootstrap-plan` gate failed on it).
+- A UAC1 SINK'S RATE IS NOT SET (the source's is): recorded for the UAC2 change, which sets both.
+
+DEPARTURES FROM THE PLAN: the 200 ms starvation's silent frames are asserted as 4000-10000, not "about 9600": the
+queue and the ring hold about 45 ms of it.
+
+VERIFICATION (2026-10-04, x86_64):
+- host: `drivers` 461, `driver-protocol` 81 - pass.
+- `USB_GADGET=speaker-async` the playback oracle - three runs pass: "282 periods fed in 296-297 ticks at the speaker's
+  rate 0x301894 ... with no underrun; 200 ms starved: 1 underrun, 7976-8361 silent frames; 100 periods after it with
+  nothing more run dry".
+- `USB_GADGET=mic` the capture oracle and `kernel.hardware.xhci_driver_enumerates_the_usb_bus` (CDC link up) - pass.
+- The AudioService suite (four) - pass, reading the counters through the `audio-stats` root before and after the
+  stand-in answered `CMD_STATS`.
+- The 64 + 15 + 1 kernel tests reaching the repaired harnesses - pass (the dynamic system/bin test alone).
+- A development boot: `graph audio_service` answers with `resources=[]` (its AudioService holds virtio-snd, which
+  refuses `CMD_STATS`); `graph nosuch` says "no such component".
+- NOT RUN: a booted machine whose AudioService holds a USB sink; aarch64 and riscv64 (the end of the job).
+
+## USB Audio Class 2: Type I on a clock source, and the stream's timing counted in time (2026-10-04)
+
+WHAT WAS DONE:
+- `drivers::uac`: `PROTOCOL_UAC2`, the AC subtypes (input/output terminal, clock source/selector/multiplier);
+  `FormatOne::clocked` (no rates; `suits` answers the shape); `format_two`; `Binding::clock: Option<Clock>` (`id`,
+  `control_interface`); `bind_for` reads the version per interface, the UAC2 general (`bTerminalLink`, `bmFormats` bit
+  0, `bNrChannels`) and format, the terminals' `bCSourceID` and clock kinds; a selector/multiplier/missing clock is
+  `NotBindable::ClockTopology`; a UAC1/UAC2 mix is `Malformed`; UAC2 feedback = the feedback endpoint of the setting.
+  `range_offers` (count + min/max/res triples, `MAX_SUBRANGES` 16, short answers refused); `posting(interval_us,
+  buffers)` = (16 ms ahead, an event per 8 ms), bounded by `MAX_AHEAD` (128) and the page.
+- `usb_audio`: `set_rate` (UAC2 `GET RANGE`/`SET CUR` on the clock via the AC interface; UAC1 endpoint SET_CUR when
+  several rates) for the sink at configure and the source at start; `Sink::group`, `FeedbackPipe::group`, the
+  source's slots from `posting`; the staging array sized `MAX_AHEAD`. `xhci`: the audio class admits 0xef; the kept
+  audio completions bounded by `2 * MAX_AHEAD + 4`.
+- Fixture `speaker-uac2` (high speed, IAD, clock 0x10 offering 44.1 and 48-96/48, coming up at 44.1, feedback at
+  0.2 % over the clock's rate in 16.16) and its test-kernel routing; kernel test
+  `usb_audio_plays_a_uac2_speaker_at_high_speed`; the playback oracles share `pcm_ask`/`pcm_feed`/`pcm_stats`.
+- Found and fixed meanwhile: a UAC1 sink's rate was never set (the source's was).
+- Incident, recorded because it cost a reconstruction: a patch script truncated `uac.rs` (`open(p,'w')` before the
+  read); the file was rebuilt from HEAD plus this session's verbatim blocks, and every UAC1 host test (the binding,
+  the feedback, the pacer) passed on the rebuilt file before the UAC2 change was applied on top.
+
+VERIFICATION (2026-10-04, x86_64): host `drivers` 466; the UAC2 oracle twice ("200 periods played in 209-210 ticks at
+the speaker's rate 0x60312 ... set on its clock at 48 kHz, with no underrun"; the speaker: "the clock runs at 48000 Hz",
+"received 48096 frames in the last second"); the async speaker, mic and enumeration oracles; the AudioService suite
+with `audiorec` (5). NOT RUN: aarch64, riscv64.
+
+## USB Bluetooth: SCO voice over the isochronous settings (2026-10-04)
+
+WHAT WAS DONE:
+- IDL `liber:device@1`: `hci-packet-kind.sco = 5`; `hci-attachment.{sco, max-sco}`; `hci-transport @op(6) voice(channels,
+  bits, wideband) -> result<u8, error>`. `bt_fixture` (in-guest) refuses both.
+- `drivers::bt_usb`: `Voice`, `Binding::{voice_interface, voice, voice_at, has_voice}`, `alternate_for`,
+  `SCO_HEADER`/`MAX_SCO`/`MAX_VOICE`, `sco_is_whole`, `ScoPieces` (piece/lost/clear; skip by the header's length,
+  else to the last whole packet's handle; empty pieces ignored).
+- `iso.rs` (new, shared): `IsoPipe` with `open(hc, dev, &[(Endpoint, capacity)], floor)` - one Configure Endpoint for
+  all, context entries max(dcis, floor) - `post_in`/`complete_in` and `send_out`/`complete_out`/`room`, `stop`,
+  `release`; `class_uvc` moved onto it (its own `IsoIn` removed).
+- `class_bt`: `VoiceOpen`; `open_voice`, `close_voice`, `send_sco` (queue 8, `again`), the `voice` op, SCO sends taken
+  before dispatch like ACL, completions in `absorb` (TRB-pointer answers; pieces to packets; a lost piece to
+  `ScoPieces::lost`), voice closed on reset/departure, pipes released on unplug; attach advertises SCO when voice
+  alternates exist.
+- Fixture: `usbredir_device.py` bulk (IN requests held until data, cancels answered, 32-bit lengths) and interrupt
+  receiving; `BtSco`; `test-kernel.sh` routing; kernel oracle `usb_bluetooth_carries_sco_voice_over_isochronous_settings`.
+
+FOUND: the first oracle run failed on its own test - the "next" packet was sent on the handle the fixture tears, so it
+lost a piece as designed; the oracle sends it on the ordinary handle now.
+
+VERIFICATION (2026-10-04, x86_64): host `drivers` 470; the SCO oracle twice; `USB_GADGET=bt` and `USB_GADGET=uvc-iso`
+oracles unchanged. NOT RUN: aarch64, riscv64.

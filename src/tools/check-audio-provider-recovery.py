@@ -20,7 +20,9 @@ FIXTURE = r'''
 extern crate alloc;
 use std::{cell::RefCell, collections::{HashMap, HashSet, VecDeque}};
 use device_proto::generated::liber::device::v1::{provider_catalogue, ProviderInfo, ProviderKind};
+use driver_protocol::audio::{CMD_STATS, PlaybackStats};
 const PERIOD_BYTES: usize = 2048;
+const STATS_EVERY: u32 = 16;
 #[derive(Default)]
 struct Runtime {
     messages: HashMap<u64, VecDeque<Vec<u8>>>, closed: HashSet<u64>,
@@ -48,7 +50,7 @@ fn wait_any(handles: &[u64], _: u64) -> i64 { RT.with_borrow(|rt| {
 }) }
 fn open_provider(_: u64, info: &ProviderInfo) -> u64 { RT.with_borrow_mut(|rt| rt.opened.push(info.binding_generation)); 99 }
 #[derive(PartialEq)]
-enum DriverPending { None, Period, Stop, Capture(usize) }
+enum DriverPending { None, Period, Stop, Capture(usize), Stats }
 struct Pending { caps: wire::Handles }
 struct Stream { chan: u64, pending: Option<Pending> }
 struct Capture { chan: u64, pending: Option<()>, unavailable: bool, ready: Option<()> }
@@ -56,10 +58,13 @@ struct Capture { chan: u64, pending: Option<()>, unavailable: bool, ready: Optio
 // engine counts a device's consecutive refusals and treats the device as lost at `REFUSAL_LIMIT`,
 // and a double that does not carry the counter cannot compile the code that keeps it.
 const REFUSAL_LIMIT: u32 = 8;
+// AND THE DEVICE'S COUNTERS, which the production engine reads when a device connects and every few periods: the
+// extracted `pump` and `driver_ready` keep them, and the events read their answer.
 struct Audio {
     snd: u64, driver_pending: DriverPending, driver_running: bool, capture_running: bool,
     driver_refusals: u32,
     streams: Vec<Stream>, captures: Vec<Capture>, tones: Vec<()>, period: Vec<u8>,
+    counters: Option<PlaybackStats>, stats_due: bool, periods_since_stats: u32,
 }
 impl Audio {
     fn has_audio(&self) -> bool { !self.tones.is_empty() }
@@ -69,7 +74,7 @@ impl Audio {
 }
 struct Client { chan: u64 }
 fn step(state: &mut Audio, providers: &mut u64) {
-    let catalogue = 70; let admin = 90; let clients = vec![Client { chan: 100 }];
+    let catalogue = 70; let admin = 90; let clients = vec![Client { chan: 100 }]; let stats: Vec<u64> = vec![];
     let mut request = [0; 128]; let mut providers = *providers;
     // A production continue completes this one turn; an empty wait must never receive.
     for _ in 0..1 {
@@ -79,7 +84,8 @@ fn step(state: &mut Audio, providers: &mut u64) {
 fn audio() -> Audio {
     RT.with_borrow_mut(|rt| *rt = Runtime::default());
     Audio { snd: 10, driver_pending: DriverPending::None, driver_running: false, capture_running: false,
-        driver_refusals: 0, streams: vec![], captures: vec![], tones: vec![], period: vec![0; PERIOD_BYTES] }
+        driver_refusals: 0, streams: vec![], captures: vec![], tones: vec![], period: vec![0; PERIOD_BYTES],
+        counters: None, stats_due: false, periods_since_stats: 0 }
 }
 fn announce(live: bool, generation: u64) {
     // AN UNNAMED PUBLICATION, which is what a device with one provider of a kind publishes: the name
@@ -124,6 +130,19 @@ fn a_pending_period_reply_still_completes_on_the_same_connection() {
     step(&mut state, &mut providers);
     RT.with_borrow(|rt| assert!(rt.released.is_empty()));
 }
+#[test]
+fn a_connected_devices_counters_are_read_before_anything_plays() {
+    let mut state = audio(); let mut providers = 80;
+    state.connected(55); state.tones.push(()); state.pump();
+    assert!(state.driver_pending == DriverPending::Stats, "the counters are asked for first");
+    let counted = PlaybackStats { underruns: 3, silent_frames: 7, feedback_q16: 1, feedback_ignored: 0 };
+    RT.with_borrow_mut(|rt| rt.messages.entry(55).or_default().push_back(counted.encode().to_vec()));
+    step(&mut state, &mut providers);
+    assert!(state.counters == Some(counted) && state.driver_pending == DriverPending::None, "the answer is kept");
+    state.pump();
+    assert!(state.driver_pending == DriverPending::Period, "and then the period plays");
+    RT.with_borrow(|rt| assert_eq!(rt.sent, [55, 55]));
+}
 '''
 
 
@@ -134,23 +153,23 @@ def main() -> None:
     # missing substring instead of checking anything.
     serving = source[source.index("fn serve(root:"):]
     events = serving[serving.index("let driver_first:"):serving.index("if ready_chan == admin {")]
-    methods = "\n".join(method(source, name) for name in ("pump", "driver_ready", "driver_failed"))
+    methods = "\n".join(method(source, name) for name in ("pump", "driver_ready", "driver_failed", "connected", "stats_ready"))
     program = FIXTURE.replace("@@METHODS@@", methods).replace("@@WAIT_AND_EVENTS@@", events)
     mutant = program.replace("let driver_first: bool = state.snd != 0;", "let driver_first: bool = state.snd != 0 && state.driver_pending != DriverPending::None;")
     if mutant == program:
         raise ValueError("idle-close mutation did not change production wait")
     with tempfile.TemporaryDirectory(prefix="liber-audio-provider-") as directory:
         path = Path(directory)
-        dependencies = {"device-proto": "src/user/libs/protocol/device-proto", "wire": "src/wire"}
+        dependencies = {"device-proto": "src/user/libs/protocol/device-proto", "driver-protocol": "src/user/libs/driver/protocol", "wire": "src/wire"}
         manifest = '[package]\nname="audio-provider-regressions"\nedition="2024"\n[lib]\npath="tests.rs"\n[dependencies]\n'
         manifest += "".join(f'{name}={{path="{ROOT / relative}"}}\n' for name, relative in dependencies.items())
         (path / "Cargo.toml").write_text(manifest)
         command = ["cargo", "test", "--offline", "--quiet", "--manifest-path", str(path / "Cargo.toml"), "--lib"]
         (path / "tests.rs").write_text(program)
         result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or "3 passed" not in result.stdout:
+        if result.returncode or "4 passed" not in result.stdout:
             raise SystemExit(result.stdout)
-        print("audio-provider-recovery: 3 production subscription and driver-wait regressions passed")
+        print("audio-provider-recovery: 4 production subscription, driver-wait and counter regressions passed")
         (path / "tests.rs").write_text(mutant)
         result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode != 101 or "test result: FAILED" not in result.stdout:

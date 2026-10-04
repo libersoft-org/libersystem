@@ -23,13 +23,19 @@
 // it, and adopted by a device that comes back in DFU mode where the runtime device was, with its serial number
 // (`dfu::same_device`). That device downloads the image and answers; one that does not come back in time is
 // answered `failed` - nothing of the image was sent - and the publication is withdrawn.
+//
+// AN UPLOAD - `firmware-upload`, a backup asked for and confirmed like a download - reads the firmware OUT of a target
+// that declares `bitCanUpload`, followed into DFU mode the same way. Its blocks come back until one is short; a device
+// that sends past the bound the person confirmed is told to abort and nothing it sent is kept; one that stops
+// answering part-way leaves the upload incomplete, and nothing is kept either. A complete image is handed over
+// READ-ONLY with its length and SHA-256, through `execute-read`, for the requester to write where it was named.
 
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use proto::system::{AdminAction, AdminDescriptor, AdminPrepared, AdminResult, Error, admin_executor};
+use proto::system::{AdminAction, AdminDescriptor, AdminImage, AdminPrepared, AdminRead, AdminResult, Error, admin_executor};
 use rt::*;
 
 use crate::classes::{self, Carry, Module};
@@ -63,15 +69,23 @@ pub struct Dfu {
 	detaching: Option<Box<Carried>>,
 }
 
+/// What a detach is carrying into DFU mode to do there.
+enum Job {
+	/// The confirmed image, to download.
+	Download(Vec<u8>),
+	/// A read of the firmware, up to the confirmed bound.
+	Upload(u32),
+}
+
 /// WHAT A DETACH CARRIES INTO DFU MODE: where the runtime device was and what it called itself, the executor's state
-/// with the started operation in it, the confirmed image, and the execution waiting on the answer.
+/// with the started operation in it, what the operation does there, and the execution waiting on the answer.
 pub struct Carried {
 	port: u32,
 	route: u32,
 	serial: Option<String>,
 	target: String,
 	operations: Operations,
-	image: Vec<u8>,
+	job: Job,
 	chan: u64,
 	corr: u32,
 	deadline: u64,
@@ -86,15 +100,24 @@ impl Carry for Carried {
 		self.deadline
 	}
 
-	// NOTHING OF THE IMAGE WAS SENT: the device took a detach and did not come back as itself, so the answer is a
-	// failure and not an unknown outcome.
+	// NOTHING OF THE IMAGE WAS SENT, OR READ: the device took a detach and did not come back as itself, so the answer
+	// is a failure and not an unknown outcome.
 	fn expire(&mut self) {
 		let mut line: common::Bounded<160> = common::Bounded::new();
 		line.push(b"driver.xhci: ");
 		line.push(self.target.as_bytes());
-		line.push(b" did not come back in DFU mode - its download failed before a byte was sent\n");
-		print(line.as_bytes());
-		answer(self.chan, self.corr, Ok(AdminResult::Failed));
+		match self.job {
+			Job::Download(_) => {
+				line.push(b" did not come back in DFU mode - its download failed before a byte was sent\n");
+				print(line.as_bytes());
+				answer(self.chan, self.corr, Ok(AdminResult::Failed));
+			}
+			Job::Upload(_) => {
+				line.push(b" did not come back in DFU mode - nothing of its firmware was read\n");
+				print(line.as_bytes());
+				answer_read(self.chan, self.corr, Ok(AdminRead::Failed));
+			}
+		}
 	}
 
 	fn as_any(&mut self) -> &mut dyn core::any::Any {
@@ -113,6 +136,31 @@ fn answer(chan: u64, corr: u32, result: Result<AdminResult, Error>) {
 	frame.push(tag);
 	frame.extend_from_slice(&bytes);
 	let _ = send_blocking(chan, &frame, 0);
+}
+
+// AN EXECUTE-READ'S ANSWER, sent when the upload is over: what it read travels as the frame's one capability.
+fn answer_read(chan: u64, corr: u32, result: Result<AdminRead, Error>) {
+	let mut writer = wire::VecWriter::new();
+	let encoded = (|| {
+		wire::Sink::u32(&mut writer, corr)?;
+		match &result {
+			Ok(value) => {
+				wire::Sink::u8(&mut writer, 1)?;
+				value.write(&mut writer)
+			}
+			Err(error) => {
+				wire::Sink::u8(&mut writer, 0)?;
+				error.write(&mut writer)
+			}
+		}
+	})();
+	let (bytes, handles) = writer.into_message();
+	if encoded.is_some() && send_caps_blocking(chan, &bytes, handles.as_slice()) {
+		return;
+	}
+	for &handle in handles.as_slice() {
+		close(handle);
+	}
 }
 
 // The device's serial number, as a string - `None` when it has none or it does not read.
@@ -187,24 +235,32 @@ fn copy_payload(payload: u64, length: u32) -> Option<Vec<u8>> {
 }
 
 impl Dfu {
-	// A RUNTIME TARGET'S CONFIRMED EXECUTION: the start guard, the image, the detach - and the answer left for the
-	// device the detach turns this one into.
-	fn detach(&mut self, hc: &mut Xhci, hids: &mut Hids, chan: u64, corr: u32, operation: u64, epoch: u64) {
+	// A RUNTIME TARGET'S CONFIRMED EXECUTION: the start guard, the image or the bound, the detach - and the answer left
+	// for the device the detach turns this one into. `reads` for an `execute-read`, whose operation must be an upload,
+	// as an `execute`'s must be a download.
+	#[allow(clippy::too_many_arguments)]
+	fn detach(&mut self, hc: &mut Xhci, hids: &mut Hids, chan: u64, corr: u32, operation: u64, epoch: u64, reads: bool) {
+		let refuse = |chan: u64, corr: u32, error: Error| if reads { answer_read(chan, corr, Err(error)) } else { answer(chan, corr, Err(error)) };
 		let started = match self.operations.start(operation, epoch, self.generation, clock()) {
 			Ok(started) => started,
-			Err(refusal) => return answer(chan, corr, Err(refused(refusal))),
+			Err(refusal) => return refuse(chan, corr, refused(refusal)),
 		};
-		let image = match dfu::image(&started.payload, self.dev.vendor, self.dev.product) {
-			Ok(image) => image.to_vec(),
-			Err(_) => return answer(chan, corr, Err(Error::Invalid)),
+		let job = match (reads, upload_of(started)) {
+			(true, Some(bound)) => Job::Upload(bound),
+			(false, None) => match dfu::image(&started.payload, self.dev.vendor, self.dev.product) {
+				Ok(image) => Job::Download(image.to_vec()),
+				Err(_) => return refuse(chan, corr, Error::Invalid),
+			},
+			_ => return refuse(chan, corr, Error::Invalid),
 		};
 		// THE DEVICE IS TOLD HOW LONG TO WAIT FOR ITS RESET: its own timeout, and no more than a second of it.
 		if !self.request(hc, hids, dfu::REQ_DETACH, self.binding.detach_timeout_ms.min(1000)) {
-			return answer(chan, corr, Ok(AdminResult::Failed));
+			return if reads { answer_read(chan, corr, Ok(AdminRead::Failed)) } else { answer(chan, corr, Ok(AdminResult::Failed)) };
 		}
 		let deadline = clock() + self.binding.return_window_ms().div_ceil(10);
 		let operations = core::mem::replace(&mut self.operations, Operations::new(self.generation));
-		self.detaching = Some(Box::new(Carried { port: self.dev.port, route: self.dev.route, serial: self.serial.clone(), target: self.target.clone(), operations, image, chan, corr, deadline }));
+		let what: &[u8] = if matches!(job, Job::Upload(_)) { b" was detached - its confirmed upload follows it into DFU mode\n" } else { b" was detached - its confirmed download follows it into DFU mode\n" };
+		self.detaching = Some(Box::new(Carried { port: self.dev.port, route: self.dev.route, serial: self.serial.clone(), target: self.target.clone(), operations, job, chan, corr, deadline }));
 		// A DEVICE THAT WAITS FOR ITS RESET GETS ONE: the controller takes this port's devices down and enumerates it
 		// again, which resets it - and it comes back in DFU mode.
 		if !self.binding.will_detach() {
@@ -213,7 +269,7 @@ impl Dfu {
 		let mut line: common::Bounded<160> = common::Bounded::new();
 		line.push(b"driver.xhci: ");
 		line.push(self.target.as_bytes());
-		line.push(b" was detached - its confirmed download follows it into DFU mode\n");
+		line.push(what);
 		print(line.as_bytes());
 	}
 
@@ -292,6 +348,97 @@ impl Dfu {
 	}
 }
 
+impl Dfu {
+	// THE UPLOAD. Idle first, then block after block until a short one ends it - past `bound`, the device is told to
+	// abort and nothing is kept - and the image handed over read-only, with its SHA-256.
+	fn upload(&mut self, hc: &mut Xhci, hids: &mut Hids, bound: u32) -> AdminRead {
+		// THE DEVICE IN DFU MODE SAYS WHETHER IT CAN BE READ, whatever its runtime self declared.
+		if !self.binding.can_upload() {
+			self.say(b" does not declare upload in DFU mode - nothing was read\n");
+			return AdminRead::Failed;
+		}
+		let Some(status) = self.get_status(hc, hids) else { return AdminRead::Failed };
+		if status.state == dfu::STATE_ERROR {
+			self.request(hc, hids, dfu::REQ_CLRSTATUS, 0);
+		} else if status.state != dfu::STATE_IDLE {
+			self.request(hc, hids, dfu::REQ_ABORT, 0);
+		}
+		if self.get_status(hc, hids).map(|status| status.state) != Some(dfu::STATE_IDLE) {
+			return AdminRead::Failed;
+		}
+		let block = self.binding.transfer_size as usize;
+		let mut image: Vec<u8> = Vec::new();
+		let mut number: u16 = 0;
+		loop {
+			let Some(received) = control_in_req(hc, hids, &mut self.dev, dfu::RT_CLASS_INTERFACE_IN, dfu::REQ_UPLOAD, number, self.binding.interface as u16, block as u16) else {
+				// STOPPED ANSWERING, OR LEFT, PART-WAY: incomplete, and never retried.
+				self.say(b"'s upload is incomplete - the device stopped answering part-way; nothing is handed over\n");
+				return AdminRead::Failed;
+			};
+			let received = (received as usize).min(block);
+			let step = dfu::upload_step(image.len(), received, block, bound);
+			if step == dfu::Upload::PastBound {
+				self.request(hc, hids, dfu::REQ_ABORT, 0);
+				self.say(b" sent more than the bound confirmed - the upload is stopped and nothing is handed over\n");
+				return AdminRead::Failed;
+			}
+			image.extend((0..received as u64).map(|at| unsafe { r8(self.dev.data_virt + at) }));
+			if step == dfu::Upload::Done {
+				break;
+			}
+			number = number.wrapping_add(1);
+		}
+		if image.is_empty() {
+			self.say(b" sent an empty image - nothing is handed over\n");
+			return AdminRead::Failed;
+		}
+		let Some(handed) = read_only_copy(&image) else { return AdminRead::Failed };
+		let digest = bootproto::sha256::digest(&image);
+		let mut line: common::Bounded<192> = common::Bounded::new();
+		line.push(b"driver.xhci: a DFU upload read ");
+		line.decimal(image.len() as u64);
+		line.push(b" bytes in ");
+		line.decimal(u64::from(number) + 1);
+		line.push(b" block(s) from ");
+		line.push(self.target.as_bytes());
+		line.push(b"\n");
+		print(line.as_bytes());
+		AdminRead::Completed(AdminImage { image: handed, length: image.len() as u32, digest: digest.to_vec() })
+	}
+
+	fn say(&self, what: &[u8]) {
+		let mut line: common::Bounded<192> = common::Bounded::new();
+		line.push(b"driver.xhci: ");
+		line.push(self.target.as_bytes());
+		line.push(what);
+		print(line.as_bytes());
+	}
+}
+
+// THE IMAGE IN AN OBJECT OF ITS OWN, and a handle to it that can read and map it and do nothing else.
+fn read_only_copy(image: &[u8]) -> Option<u64> {
+	let object = memory_object_create(image.len() as u64);
+	if object < 0 {
+		return None;
+	}
+	let object = object as u64;
+	let Some(addr) = (unsafe { map_object(object) }) else {
+		close(object);
+		return None;
+	};
+	unsafe { core::ptr::copy_nonoverlapping(image.as_ptr(), addr as *mut u8, image.len()) };
+	unmap_object(object);
+	let handed = duplicate(object, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+	close(object);
+	(handed > 0).then_some(handed as u64)
+}
+
+// AN UPLOAD'S BOUND, from its operation's parameters - a download has none, which is how the two are told apart once
+// started; the preparation admitted each by its action.
+fn upload_of(prepared: &drivers::admin_operation::Prepared) -> Option<u32> {
+	dfu::upload_parameters(&prepared.parameters).map(|(bound, _)| bound)
+}
+
 struct View<'a> {
 	dfu: &'a mut Dfu,
 	hc: &'a mut Xhci,
@@ -303,6 +450,9 @@ impl admin_executor::Service for View<'_> {
 	fn prepare(&mut self, action: AdminAction, target: String, parameters: Vec<u8>, payload_length: u32, payload: u64) -> Result<AdminPrepared, Error> {
 		let copied = copy_payload(payload, payload_length);
 		close(payload);
+		if action == AdminAction::FirmwareUpload {
+			return self.prepare_upload(target, parameters, payload_length, copied);
+		}
 		if action != AdminAction::FirmwareDownload {
 			return Err(Error::Unsupported);
 		}
@@ -334,6 +484,10 @@ impl admin_executor::Service for View<'_> {
 	fn execute(&mut self, operation: u64, epoch: u64) -> Result<AdminResult, Error> {
 		let generation = self.dfu.generation;
 		let started = self.dfu.operations.start(operation, epoch, generation, clock()).map_err(refused)?;
+		// AN UPLOAD IS REDEEMED WITH `execute-read`, and nothing is written for one.
+		if upload_of(started).is_some() {
+			return Err(Error::Invalid);
+		}
 		let payload = started.payload.clone();
 		let image = dfu::image(&payload, self.dfu.dev.vendor, self.dfu.dev.product).map_err(|_| Error::Invalid)?.to_vec();
 		let result = self.dfu.download(self.hc, self.hids, &image);
@@ -347,6 +501,37 @@ impl admin_executor::Service for View<'_> {
 
 	fn cancel(&mut self, operation: u64) -> Result<(), Error> {
 		self.dfu.operations.cancel(operation).map_err(refused)
+	}
+
+	fn execute_read(&mut self, operation: u64, epoch: u64) -> Result<AdminRead, Error> {
+		let generation = self.dfu.generation;
+		let started = self.dfu.operations.start(operation, epoch, generation, clock()).map_err(refused)?;
+		let bound = upload_of(started).ok_or(Error::Invalid)?;
+		Ok(self.dfu.upload(self.hc, self.hids, bound))
+	}
+}
+
+impl View<'_> {
+	// AN UPLOAD'S PREPARATION: a target this executor serves that declares upload, a bound and a file it can show, and
+	// the payload the target's name - what the protected screen shows as the operation, frozen here like a download's.
+	fn prepare_upload(&mut self, target: String, parameters: Vec<u8>, payload_length: u32, copied: Option<Vec<u8>>) -> Result<AdminPrepared, Error> {
+		if !self.dfu.resolves(&target) {
+			return Err(Error::NotFound);
+		}
+		if !self.dfu.binding.can_upload() {
+			return Err(Error::Unsupported);
+		}
+		let (bound, _) = dfu::upload_parameters(&parameters).ok_or(Error::Invalid)?;
+		let copied = copied.ok_or(Error::Invalid)?;
+		if copied != target.as_bytes() {
+			return Err(Error::Invalid);
+		}
+		let generation = self.dfu.generation;
+		let epoch = self.dfu.operations.epoch;
+		let prepared = self.dfu.operations.prepare(generation, &parameters, &copied, clock(), LIFETIME_TICKS).map_err(refused)?;
+		let blocks = bound / u32::from(self.dfu.binding.transfer_size) + 2;
+		let descriptor = AdminDescriptor { version: 1, action: AdminAction::FirmwareUpload, executor: String::from_utf8_lossy(driver_protocol::provider::USB_DFU_NAME).into_owned(), executor_epoch: epoch, target: self.dfu.target.clone(), target_generation: prepared.generation, parameters: prepared.parameters.clone(), payload_length, payload_digest: prepared.digest.to_vec() };
+		Ok(AdminPrepared { operation: prepared.operation, descriptor, deadline_ms: 5000 + 2000 * blocks })
 	}
 }
 
@@ -390,17 +575,23 @@ impl Module for Dfu {
 		// A RUNTIME TARGET'S EXECUTION IS ANSWERED LATER, by the device the detach turns it into - so it is taken
 		// before the generated dispatch, which answers at once. Two words after the header: operation and epoch.
 		if self.binding.mode == dfu::Mode::Runtime
-			&& let Some((admin_executor::OP_EXECUTE, corr)) = classes::correlation(&request)
+			&& let Some((op @ (admin_executor::OP_EXECUTE | admin_executor::OP_EXECUTE_READ), corr)) = classes::correlation(&request)
 		{
 			for &handle in handles.as_slice() {
 				close(handle);
 			}
+			let reads = op == admin_executor::OP_EXECUTE_READ;
 			if request.len() != 6 + 16 || self.detaching.is_some() {
-				answer(chan, corr, Err(if request.len() != 22 { Error::Invalid } else { Error::Again }));
+				let error = if request.len() != 22 { Error::Invalid } else { Error::Again };
+				if reads {
+					answer_read(chan, corr, Err(error))
+				} else {
+					answer(chan, corr, Err(error))
+				}
 				return true;
 			}
 			let word = |at: usize| u64::from_le_bytes(request[at..at + 8].try_into().unwrap_or([0; 8]));
-			self.detach(hc, hids, chan, corr, word(6), word(14));
+			self.detach(hc, hids, chan, corr, word(6), word(14), reads);
 			return true;
 		}
 		let mut reply = [0u8; 1024];
@@ -434,11 +625,28 @@ impl Module for Dfu {
 		let Some(carried) = carried.as_any().downcast_mut::<Carried>() else { return false };
 		let was = dfu::Identity { port: carried.port, route: carried.route, serial: carried.serial.as_deref() };
 		let now = dfu::Identity { port: self.dev.port, route: self.dev.route, serial: self.serial.as_deref() };
-		if self.binding.mode != dfu::Mode::Dfu || !self.binding.can_download() || !dfu::same_device(&was, &now) {
+		if self.binding.mode != dfu::Mode::Dfu || !dfu::same_device(&was, &now) {
+			return false;
+		}
+		// AN UPLOAD CARRIED HERE IS READ, and answered with what it read.
+		if let Job::Upload(bound) = carried.job {
+			self.operations = core::mem::replace(&mut carried.operations, Operations::new(0));
+			let result = self.upload(hc, hids, bound);
+			let mut line: common::Bounded<192> = common::Bounded::new();
+			line.push(b"driver.xhci: ");
+			line.push(carried.target.as_bytes());
+			line.push(b" came back in DFU mode as ");
+			line.push(self.target.as_bytes());
+			line.push(if matches!(result, AdminRead::Completed(_)) { b" and its firmware was read\n".as_slice() } else { b" and its firmware was not read\n" });
+			print(line.as_bytes());
+			answer_read(carried.chan, carried.corr, Ok(result));
+			return true;
+		}
+		if !self.binding.can_download() {
 			return false;
 		}
 		self.operations = core::mem::replace(&mut carried.operations, Operations::new(0));
-		let image = core::mem::take(&mut carried.image);
+		let Job::Download(image) = core::mem::replace(&mut carried.job, Job::Download(Vec::new())) else { return false };
 		let result = self.download(hc, hids, &image);
 		let mut line: common::Bounded<192> = common::Bounded::new();
 		line.push(b"driver.xhci: ");

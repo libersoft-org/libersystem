@@ -41,6 +41,7 @@ fn an_ecm_configuration_names_its_two_interfaces_and_its_bulk_pair() {
 	assert_eq!(bound.bulk_in_packet, 512);
 	assert_eq!(bound.mac_string, 4);
 	assert_eq!(bound.max_segment, 1514);
+	assert_eq!((bound.notification, bound.notification_interval), (Some(0x83), 16), "the notification endpoint and its interval");
 }
 
 #[test]

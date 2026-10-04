@@ -181,7 +181,7 @@ impl Pipe {
 // The xHCI endpoint-context interval for an interrupt endpoint: the exponent of its period in 125 us
 // microframes. A high-speed descriptor already carries the exponent plus one; a full- or low-speed one counts
 // 1 ms frames, so the period is the smallest power of two covering bInterval * 8 microframes.
-fn interrupt_interval(speed: u32, b_interval: u32) -> u32 {
+pub(crate) fn interrupt_interval(speed: u32, b_interval: u32) -> u32 {
 	if speed == crate::SPEED_HIGH || speed == crate::SPEED_SUPER {
 		return b_interval.clamp(1, 16) - 1;
 	}
@@ -845,7 +845,7 @@ pub unsafe fn probe(hc: &mut Xhci, mut dev: UsbDevice) -> Result<Box<dyn Module>
 					};
 				}
 				// SAID, BECAUSE A CAMERA LEFT SILENT IS A CAMERA NOBODY KNOWS IS UNSUPPORTED.
-				Err(drivers::uvc::NotBindable::Isochronous) => print(b"driver.xhci: a video camera is on the bus and streams isochronously, which this transport does not drive\n"),
+				Err(drivers::uvc::NotBindable::NoStreamingEndpoint) => print(b"driver.xhci: a video camera is on the bus with no streaming endpoint - neither bulk nor isochronous IN - so there is nothing to stream from\n"),
 				Err(_) => {}
 			}
 			if let Ok(binding) = drivers::printer::bind(config) {

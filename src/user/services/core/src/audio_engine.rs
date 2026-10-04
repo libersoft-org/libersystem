@@ -16,11 +16,12 @@ use ipc_client::ChannelTransport;
 use pcm::encode::{Remix, Resample};
 use pcm::{Format, OUTPUT_RATE};
 use proto::codec::Buffer;
-use proto::system::Error;
 use proto::system::audio::{self, Service as AudioService};
 use proto::system::audio_admin::{self, Service as AdminService};
+use proto::system::audio_stats::{self, Service as StatsService};
 use proto::system::pcm_capture::{self, Service as PcmCaptureService};
 use proto::system::pcm_stream::{self, Service as PcmService};
+use proto::system::{AudioResources, Error};
 use proto::system::{ProviderInfo, ProviderKind, provider_catalogue};
 use rt::*;
 
@@ -44,7 +45,7 @@ const MAX_CAPTURES: usize = 1;
 // THE THIRD COPY, AND IT IS THE CONSUMER'S (2026-09-19). Both servers of this provider kind and the
 // one consumer each spelled these out; they are `driver_protocol::audio` now, which is also where
 // the three message shapes are enumerated.
-use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP};
+use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP, CMD_STATS, PlaybackStats};
 const MAX_TONES: usize = 8;
 const AMP: i16 = 6_000;
 const REQUEST_MAX: usize = 128;
@@ -141,6 +142,11 @@ impl Tone {
 
 // How many refused periods in a row mean the device is not playing anything.
 const REFUSAL_LIMIT: u32 = 8;
+// THE DEVICE'S COUNTERS ARE READ AGAIN after this many periods played - about 170 ms - and once more when the
+// stream stops, so what the System Graph is answered is that old at most while a stream plays and exact once it
+// has stopped. Read from here and not when the graph asks, because the graph's question must not wait behind a
+// period the driver is still answering.
+const STATS_EVERY: u32 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DriverPending {
@@ -152,6 +158,8 @@ enum DriverPending {
 	// The capture stream was asked to stop. Nobody is waiting for the answer, but the driver owes
 	// one and it has to be read off the channel before the next request.
 	CaptureStop,
+	// The device's playback counters were asked for.
+	Stats,
 }
 
 // One recorder: the channel it is served on, the conversion from the device's 48 kHz stereo down to
@@ -189,6 +197,11 @@ struct Audio {
 	// core's idle governor bounded by it, and released when the device stops or this instance ends.
 	latency_privilege: u64,
 	latency: u64,
+	// THE DEVICE'S PLAYBACK COUNTERS AS LAST READ, `None` when the provider keeps none - it refused the query -
+	// or there is no device; whether they are due to be read again, and the periods played since they were.
+	counters: Option<PlaybackStats>,
+	stats_due: bool,
+	periods_since_stats: u32,
 }
 
 // What a connection may ask for. `Full` is the service channel ServiceManager holds; the other two
@@ -211,7 +224,33 @@ struct Client {
 
 impl Audio {
 	fn new(snd: u64) -> Audio {
-		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, driver_refusals: 0, capture_running: false, period: alloc::vec![0; PERIOD_BYTES], latency_privilege: 0, latency: 0 }
+		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, driver_refusals: 0, capture_running: false, period: alloc::vec![0; PERIOD_BYTES], latency_privilege: 0, latency: 0, counters: None, stats_due: false, periods_since_stats: 0 }
+	}
+
+	// A DEVICE WAS CONNECTED: its counters are read before anything else is asked of it, so the first question
+	// the graph asks is answered with what the device keeps rather than with nothing.
+	fn connected(&mut self, snd: u64) {
+		self.snd = snd;
+		self.counters = None;
+		self.stats_due = true;
+		self.periods_since_stats = 0;
+	}
+
+	// The counters' answer: decoded, or `None` for a provider that refused - it keeps none.
+	fn stats_ready(&mut self, handle: u64, reply: &[u8]) {
+		if handle != 0 {
+			close(handle);
+		}
+		self.driver_pending = DriverPending::None;
+		self.counters = PlaybackStats::decode(reply);
+	}
+
+	// What the System Graph is answered: the counters as last read.
+	fn resources(&self) -> AudioResources {
+		match self.counters {
+			Some(counted) => AudioResources { counted: true, underruns: counted.underruns, silent_frames: counted.silent_frames, feedback_q16: counted.feedback_q16, feedback_ignored: counted.feedback_ignored },
+			None => AudioResources { counted: false, underruns: 0, silent_frames: 0, feedback_q16: 0, feedback_ignored: 0 },
+		}
 	}
 
 	// THE LATENCY REQUEST, held exactly while the device plays or records. A request the kernel refuses - no privilege,
@@ -339,6 +378,16 @@ impl Audio {
 		if self.snd == 0 || self.driver_pending != DriverPending::None {
 			return;
 		}
+		if self.stats_due {
+			self.stats_due = false;
+			self.periods_since_stats = 0;
+			if send_blocking(self.snd, &[CMD_STATS], 0) {
+				self.driver_pending = DriverPending::Stats;
+			} else {
+				self.driver_failed();
+			}
+			return;
+		}
 		if self.has_audio() {
 			self.fill_period();
 			if send_blocking(self.snd, &self.period, 0) {
@@ -360,8 +409,18 @@ impl Audio {
 		if handle != 0 {
 			close(handle);
 		}
-		if self.driver_pending == DriverPending::Stop {
-			self.driver_running = false;
+		match self.driver_pending {
+			DriverPending::Stop => {
+				self.driver_running = false;
+				self.stats_due = true;
+			}
+			DriverPending::Period if played => {
+				self.periods_since_stats += 1;
+				if self.periods_since_stats >= STATS_EVERY {
+					self.stats_due = true;
+				}
+			}
+			_ => {}
 		}
 		self.driver_pending = DriverPending::None;
 		// A REFUSAL IS AN EMPTY REPLY and a played period is answered "OK", which is the convention
@@ -387,6 +446,8 @@ impl Audio {
 		self.driver_pending = DriverPending::None;
 		self.driver_running = false;
 		self.capture_running = false;
+		self.counters = None;
+		self.stats_due = false;
 		self.tones.clear();
 		// A recorder outlives the device only as a stream that says so: the channel stays open and
 		// every `read` on it answers not-found, so a recording in progress ends with an error rather
@@ -649,6 +710,17 @@ impl AudioService for RootCall<'_> {
 	}
 }
 
+// THE OBSERVATION ROOT'S CALLS, which can read the counters and change nothing.
+struct StatsCall<'a> {
+	audio: &'a Audio,
+}
+
+impl StatsService for StatsCall<'_> {
+	fn resources(&mut self) -> AudioResources {
+		self.audio.resources()
+	}
+}
+
 struct AdminCall<'a> {
 	clients: &'a mut Vec<Client>,
 }
@@ -723,6 +795,9 @@ pub fn run(bootstrap: u64) -> ! {
 	let catalogue: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"CATALOGUE").unwrap_or(0);
 	// THE IDLE-LATENCY PRIVILEGE, after the catalogue: a playing device is held to a bound no core's idle state exceeds.
 	let latency_privilege: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"LATENCY").unwrap_or(0);
+	// THE OBSERVATION ROOT, LAST: what the System Graph reads the device's counters through, and nothing else.
+	// Optional - a boot that grants none has a graph without them.
+	let stats_root: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"STATS").unwrap_or(0);
 	send_blocking(bootstrap, b"AudioService: online", 0);
 	// The subscription is opened BEFORE anything is served, so the snapshot and the stream are
 	// one operation - a provider published between the two would otherwise be lost, which is the
@@ -736,7 +811,7 @@ pub fn run(bootstrap: u64) -> ! {
 	}
 	let mut audio = Audio::new(0);
 	audio.latency_privilege = latency_privilege;
-	serve(root, admin, catalogue, providers, audio);
+	serve(root, admin, stats_root, catalogue, providers, audio);
 }
 
 // OPEN A CONNECTION TO ONE PUBLISHED PROVIDER, or answer zero.
@@ -765,8 +840,11 @@ fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
 	}
 }
 
-fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: Audio) -> ! {
+fn serve(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut providers: u64, mut state: Audio) -> ! {
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
+	// THE OBSERVATION ROOT AND THE CONNECTIONS MINTED FROM IT, each its own channel: two observers sharing one
+	// would take each other's replies.
+	let mut stats: Vec<u64> = if stats_root != 0 { alloc::vec![stats_root] } else { Vec::new() };
 	let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 	let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 	loop {
@@ -787,7 +865,7 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 		// An idle driver's channel can close too. Observe that before a replacement publication
 		// is consumed, or the stale handle makes us discard the provider we could reconnect to.
 		let driver_first: bool = state.snd != 0;
-		let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 2);
+		let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + stats.len() + state.streams.len() + state.captures.len() + 2);
 		if driver_first {
 			waits.push(state.snd);
 		}
@@ -799,6 +877,7 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 			waits.push(providers);
 		}
 		waits.push(admin);
+		waits.extend(stats.iter().copied());
 		waits.extend(clients.iter().map(|client| client.chan));
 		for stream in &state.streams {
 			if stream.chan != 0 {
@@ -836,7 +915,7 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 							if opened == 0 {
 								print(b"AudioService: an audio provider is published and this service could not connect to it\n");
 							} else {
-								state.snd = opened;
+								state.connected(opened);
 								print(b"AudioService: an audio provider was published and this service connected to it\n");
 							}
 						} else if !info.live && state.snd != 0 {
@@ -874,6 +953,10 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 						Received::Closed => state.driver_failed(),
 					}
 				}
+				DriverPending::Stats => match recv_blocking(state.snd, &mut request) {
+					Received::Message { len, handle } => state.stats_ready(handle, &request[..len]),
+					Received::Closed => state.driver_failed(),
+				},
 				_ => match recv_blocking(state.snd, &mut request) {
 					// THE REPLY'S CONTENT IS THE ANSWER. An empty one is the driver saying the period
 					// was not played; "OK" is the period having reached the device.
@@ -908,6 +991,43 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 					}
 				}
 				ReceivedCaps::Closed => exit(),
+			}
+			continue;
+		}
+		if let Some(which) = stats.iter().position(|&observation| observation == ready_chan) {
+			match recv_blocking(ready_chan, &mut request) {
+				Received::Message { len, handle } => {
+					if handle != 0 {
+						close(handle);
+					}
+					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+					if op == HEARTBEAT_OP {
+						send_blocking(ready_chan, b"PONG", 0);
+					} else if op == CONNECT_OP {
+						match channel() {
+							Some((mine, theirs)) => {
+								stats.push(mine);
+								send_blocking(ready_chan, &[], theirs);
+							}
+							None => {
+								send_blocking(ready_chan, &[], 0);
+							}
+						}
+					} else {
+						let mut reply_handle = proto::codec::Handles::new();
+						let mut request_handle = proto::codec::Handles::new();
+						let mut call = StatsCall { audio: &state };
+						if let Some(n) = audio_stats::dispatch(&mut call, &request[..len], &mut request_handle, &mut reply, &mut reply_handle) {
+							send_blocking(ready_chan, &reply[..n], 0);
+						}
+					}
+				}
+				// AN OBSERVER WENT AWAY, which changes nothing about playing sound - nor does the root going away:
+				// what is left is the connections already minted from it.
+				Received::Closed => {
+					close(ready_chan);
+					stats.remove(which);
+				}
 			}
 			continue;
 		}

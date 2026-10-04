@@ -3093,6 +3093,100 @@ fn usb_gamepads_report_which_pad_pressed_what() {
 	let _ = crate::device::release_claim(claim);
 }
 
+tagged_test!(usb_midi2_negotiates_ump_and_carries_every_group, [Drivers, Usb, Slow], id = "kernel.hardware.usb_midi2_negotiates_ump_and_carries_every_group", covers = ["kernel", "drivers", "midi-device-proto"]);
+fn usb_midi2_negotiates_ump_and_carries_every_group() {
+	// THE DEVICE IS A PROCESS IN THE HOST, played over QEMU's `usb-redir` by `usbredir_device.py --emulate midi2`: a USB
+	// MIDI 2.0 device with its MIDI 1.0 face on alternate 0 and its UMP face on alternate 1, two Group Terminal Blocks
+	// over four groups, an answer to UMP Endpoint Discovery and everything else looped back. This side plays MidiService
+	// at the provider contract: the function blocks are the device's own, the UMP endpoint's words go out and come back
+	// on all four groups word for word - a MIDI 2.0 note, a MIDI 1.0 control change in UMP, a SysEx7 and a MIDI 2.0
+	// control change - after the device's own answer to Endpoint Discovery, and the MIDI 1.0 face still works after.
+	use midi_device_proto::generated::liber::midi_device::v1 as midi;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "midi2" {
+		crate::serial_println!("usb-midi2: NOT RUN - no USB MIDI 2.0 device on this run; play one with USB_GADGET=midi2");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::MIDI, driver_protocol::provider::USB_MIDI_NAME, patience).expect("the controller publishes the MIDI device it bound");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = midi::midi_device::Client::new(KernelTransport::new(&host_end, patience));
+	client.open(&1).expect("the device answered the open").expect("the device opened");
+	let endpoints = client.endpoints().expect("the device answered").expect("the endpoints were listed");
+	let listed: alloc::vec::Vec<(u32, u8, midi::MidiDeviceDirection, midi::MidiDeviceProtocol)> = endpoints.iter().map(|endpoint| (endpoint.index, endpoint.cables, endpoint.direction, endpoint.protocol)).collect();
+	assert_eq!(
+		listed,
+		[
+			(0, 2, midi::MidiDeviceDirection::Receive, midi::MidiDeviceProtocol::Midi1),
+			(1, 2, midi::MidiDeviceDirection::Transmit, midi::MidiDeviceProtocol::Midi1),
+			(2, 4, midi::MidiDeviceDirection::Receive, midi::MidiDeviceProtocol::Ump),
+			(3, 4, midi::MidiDeviceDirection::Transmit, midi::MidiDeviceProtocol::Ump),
+		],
+		"both faces, the UMP one with the four groups its blocks cover"
+	);
+	let blocks = client.blocks(&2).expect("answered").expect("the UMP endpoint's blocks");
+	let read: alloc::vec::Vec<(u8, &str, u8, u8, midi::MidiDeviceBlockDirection, u8)> = blocks.iter().map(|block| (block.id, block.name.as_str(), block.first_group, block.groups, block.direction, block.protocol)).collect();
+	assert_eq!(read, [(1, "Keys", 0, 2, midi::MidiDeviceBlockDirection::Both, 0x11), (2, "Pads", 2, 2, midi::MidiDeviceBlockDirection::Both, 0x11)], "the blocks as the device declares them, with their names");
+	assert_eq!(client.blocks(&0), Some(Ok(alloc::vec::Vec::new())), "a MIDI 1.0 endpoint has none");
+	let stream = client.events().expect("the device answered the stream request");
+	assert_eq!(client.start(&2, &0x71), Some(Ok(())), "the UMP endpoint starts - the device on its MIDI 2.0 face");
+	assert_eq!(client.start(&0, &0x72), Some(Err(midi::Error::Again)), "and the MIDI 1.0 face cannot receive while the UMP one does");
+
+	// ENDPOINT DISCOVERY, THEN ONE MESSAGE ON EACH GROUP, as one batch of words.
+	let discovery: [u32; 4] = [0xF000_0101, 0x0000_001F, 0, 0];
+	let messages: [&[u32]; 4] = [&[0x4090_3C00, 0xFFFF_0000], &[0x21B1_0740], &[0x3216_0102, 0x0304_0506], &[0x43B2_0700, 0x8000_0000]];
+	let words: alloc::vec::Vec<u32> = discovery.iter().copied().chain(messages.iter().flat_map(|message| message.iter().copied())).collect();
+	let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+	assert_eq!(client.send(&3, &bytes), Some(Ok(())), "the device took the batch");
+	let mut transport = client.into_transport();
+	let stream = transport.take(stream).expect("the stream was handed over").into_any_arc().downcast::<Channel>().expect("the stream is a channel");
+	let mut client = midi::midi_device::Client::new(transport);
+	let heard = |stream: &Channel, endpoint: u32, generation: u64, want: usize| -> alloc::vec::Vec<u8> {
+		let mut heard = alloc::vec::Vec::new();
+		let give_up = arch::apic::ticks() + patience;
+		while heard.len() < want && arch::apic::ticks() < give_up {
+			sched::run_until_idle_until(arch::apic::ticks() + 1);
+			let Ok(frame) = stream.recv() else { continue };
+			let mut handles = midi_device_proto::codec::Handles::new();
+			match midi::midi_device::events_read(&frame.bytes, &mut handles).expect("a stream frame decodes") {
+				midi::MidiDeviceEvent::Batch(batch) => {
+					assert_eq!((batch.endpoint, batch.receiver_generation), (endpoint, generation), "the batch is the started endpoint's");
+					heard.extend_from_slice(&batch.packets);
+				}
+				midi::MidiDeviceEvent::Lost(lost) => panic!("input was lost on a stream with room: {lost:?}"),
+			}
+		}
+		heard
+	};
+	let back = heard(&stream, 2, 0x71, 4 * (8 + 7));
+	let back: alloc::vec::Vec<u32> = back.chunks_exact(4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])).collect();
+	assert_eq!(back.len(), 8 + 7, "the discovery's two four-word answers and the four messages' seven words");
+	assert_eq!(&back[..2], &[0xF001_0101, 0x8000_0000 | 2 << 24 | 0x300], "Endpoint Info: UMP 1.1, two static function blocks, MIDI 1.0 and 2.0");
+	assert_eq!(back[4] >> 16 & 0x3FF, 0x003, "then the endpoint's name");
+	assert_eq!(&back[8..], words[4..].to_vec(), "and every group's message back word for word");
+
+	// THE MIDI 1.0 FACE AFTER IT: stopped on UMP, started on MIDI 1.0, and packets back on both cables.
+	assert_eq!(client.stop(&2, &0x71), Some(Ok(())));
+	assert_eq!(client.start(&0, &0x73), Some(Ok(())), "the MIDI 1.0 endpoint starts - the device back on alternate 0");
+	let packets: [u8; 8] = [0x09, 0x90, 0x3C, 0x64, 0x1B, 0xB1, 0x07, 0x40];
+	assert_eq!(client.send(&1, &packets.to_vec()), Some(Ok(())));
+	assert_eq!(heard(&stream, 0, 0x73, 8), packets, "both cables' packets back on the MIDI 1.0 face");
+
+	crate::serial_println!("usb-midi2: two function blocks read as the device declares them, Endpoint Discovery answered, UMP on four groups looped back word for word, and the MIDI 1.0 face still carrying packets on alternate 0");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
 tagged_test!(usb_midi_transmits_on_each_cable_and_hears_it_come_back, [Drivers, Usb, Slow], id = "kernel.hardware.usb_midi_transmits_on_each_cable_and_hears_it_come_back", covers = ["kernel", "drivers", "midi-device-proto"]);
 fn usb_midi_transmits_on_each_cable_and_hears_it_come_back() {
 	// THE FAR END ECHOES: `midi-source.py --echo` plays back on each of the gadget card's raw MIDI ports whatever
@@ -3143,6 +3237,13 @@ fn usb_midi_transmits_on_each_cable_and_hears_it_come_back() {
 	assert_eq!(client.send(&1, &[0x29, 0x90, 0x3c, 0x64]), Some(Err(midi::Error::Invalid)), "a cable the endpoint does not carry is refused");
 	let stream = client.events().expect("the device answered the stream request");
 	assert_eq!(client.start(&0, &0x52), Some(Ok(())), "the receive endpoint starts");
+	// THE FAR END OPENS ITS PORTS ONLY AFTER IT SEES THIS SIDE CONFIGURE THE DEVICE, and half a second after that - see
+	// `midi-source.py` - and a gadget with nobody on its ports takes what arrives and drops it: the send was answered,
+	// and the echo never came, every run. Two seconds is that wait with room.
+	let settle = arch::apic::ticks() + 200;
+	while arch::apic::ticks() < settle {
+		sched::run_until_idle_until(settle);
+	}
 	// THE SEND IS ANSWERED WHEN THE DEVICE HAS TAKEN IT, not when it was asked.
 	assert_eq!(client.send(&1, &packets.concat()), Some(Ok(())), "the device took all eight packets");
 	let mut transport = client.into_transport();
@@ -3487,6 +3588,105 @@ fn usb_dfu_downloads_only_the_confirmed_image_once() {
 	assert_eq!(client.execute(&cancelled.operation, &epoch), Some(Err(admin::Error::Denied)));
 
 	crate::serial_println!("usb-dfu: the confirmed image was downloaded and manifested once, a corrupted one failed at the device, and nothing else started");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_bluetooth_carries_sco_voice_over_isochronous_settings, [Drivers, Usb, Slow], id = "kernel.hardware.usb_bluetooth_carries_sco_voice_over_isochronous_settings", covers = ["kernel", "drivers", "device-proto"]);
+fn usb_bluetooth_carries_sco_voice_over_isochronous_settings() {
+	// THE CONTROLLER IS A PROCESS IN THE HOST, played over QEMU's `usb-redir` by `usbredir_device.py --emulate bt-sco`:
+	// the primary interface the gadget controller has - commands, events, ACL looped back - and a voice interface whose
+	// alternates 1 to 5 carry an isochronous pair, every SCO packet that arrives looped back in pieces of the setting's
+	// size, one handle's with its second piece lost. This side plays BluetoothService after it set a synchronous link up:
+	// it asks `voice` for one channel of 16-bit samples - alternate 2, the table says - sends SCO packets of several
+	// lengths and reads them back byte for byte while ACL still flows on the bulk pair; the torn packet must not arrive
+	// and the one after it must; and closing voice puts the interface back at zero bandwidth.
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "bt-sco" {
+		crate::serial_println!("usb-bluetooth-sco: NOT RUN - no Bluetooth controller with voice on this run; play one with USB_GADGET=bt-sco");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::BLUETOOTH_HCI, driver_protocol::provider::USB_BLUETOOTH_NAME, patience).expect("the controller publishes the Bluetooth controller it bound");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = device::hci_transport::Client::new(KernelTransport::new(&host_end, patience));
+	let attached = client.attach(&1).expect("answered").expect("attached");
+	assert!(attached.sco && attached.max_sco == 258, "a controller with voice settings carries SCO, up to a 255-byte packet: {attached:?}");
+	let packets = client.receive().expect("the receive stream opened");
+	let mut transport = client.into_transport();
+	let packets = transport.take(packets).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let mut client = device::hci_transport::Client::new(transport);
+	let next = |stream: &Channel| -> device::HciPacket {
+		let give_up = arch::apic::ticks() + patience;
+		while arch::apic::ticks() < give_up {
+			sched::run_until_idle_until(arch::apic::ticks() + 1);
+			if let Ok(frame) = stream.recv() {
+				let mut handles = device_proto::codec::Handles::new();
+				return device::hci_transport::receive_read(&frame.bytes, &mut handles).expect("a packet frame decodes");
+			}
+		}
+		panic!("nothing arrived on the packet stream");
+	};
+	let sco = |handle: u16, length: u8, seed: u8| -> alloc::vec::Vec<u8> { handle.to_le_bytes().into_iter().chain([length]).chain((0..length).map(|n| n.wrapping_mul(13) ^ seed)).collect() };
+
+	// THE CONTROLLER ANSWERS, and voice is refused before a setting is open.
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x09, 0x10, 0x00].to_vec()), Some(Ok(3)));
+	assert_eq!(&next(&packets).bytes[6..], &[0x02, 0x00, 0x00, 0xee, 0xff, 0xc0], "the controller's own address");
+	assert_eq!(client.send(&device::HciPacketKind::Sco, &sco(0x021, 4, 0)), Some(Err(device::Error::Invalid)), "voice before a setting is a skipped step");
+	assert_eq!(client.voice(&1, &16, &true), Some(Err(device::Error::Unsupported)), "this controller has no wideband setting");
+	assert_eq!(client.voice(&1, &12, &false), Some(Err(device::Error::Invalid)), "and the table has no 12-bit row");
+	assert_eq!(client.voice(&1, &16, &false), Some(Ok(2)), "one channel of 16-bit samples is alternate 2");
+
+	// SCO BOTH WAYS, IN PIECES OF SEVENTEEN BYTES, with ACL between them.
+	for (length, seed) in [(48u8, 1u8), (0, 2), (14, 3), (60, 4), (255, 5)] {
+		let packet = sco(0x021, length, seed);
+		assert_eq!(client.send(&device::HciPacketKind::Sco, &packet), Some(Ok(packet.len() as u32)), "the controller took the {length}-byte voice packet");
+		let back = next(&packets);
+		assert_eq!((back.kind, back.bytes), (device::HciPacketKind::Sco, packet), "the {length}-byte voice packet came back as it went");
+	}
+	let mut acl: alloc::vec::Vec<u8> = alloc::vec![0x40, 0x20, 100, 0];
+	acl.extend((0..100u8).map(|n| n ^ 0x5a));
+	assert_eq!(client.send(&device::HciPacketKind::Acl, &acl), Some(Ok(acl.len() as u32)));
+	let (mut echoed, mut completed) = (false, false);
+	while !(echoed && completed) {
+		let arrived = next(&packets);
+		match arrived.kind {
+			device::HciPacketKind::Acl => {
+				assert_eq!(arrived.bytes, acl, "ACL still flows on the bulk pair while voice is open");
+				echoed = true;
+			}
+			device::HciPacketKind::Event => {
+				assert_eq!(arrived.bytes, [0x13, 5, 1, 0x40, 0x00, 1, 0]);
+				completed = true;
+			}
+			other => panic!("a {other:?} packet"),
+		}
+	}
+
+	// A PACKET THAT LOST A PIECE IS NOT DELIVERED, and the one after it is.
+	let torn = sco(0xffe, 48, 6);
+	assert_eq!(client.send(&device::HciPacketKind::Sco, &torn), Some(Ok(torn.len() as u32)));
+	let after = sco(0x021, 30, 7);
+	assert_eq!(client.send(&device::HciPacketKind::Sco, &after), Some(Ok(after.len() as u32)));
+	let back = next(&packets);
+	assert_eq!((back.kind, back.bytes.len()), (device::HciPacketKind::Sco, after.len()), "the torn packet did not arrive with a hole in it");
+	assert_eq!(back.bytes, after);
+
+	// AND VOICE CLOSED: zero bandwidth, and a voice packet a skipped step again.
+	assert_eq!(client.voice(&0, &0, &false), Some(Ok(0)));
+	assert_eq!(client.send(&device::HciPacketKind::Sco, &sco(0x021, 4, 8)), Some(Err(device::Error::Invalid)));
+	crate::serial_println!("usb-bluetooth-sco: voice opened on alternate 2, SCO packets of 3 to 258 bytes looped back byte for byte in 17-byte pieces with ACL flowing beside them, a packet that lost a piece refused and the next delivered, and voice closed at zero bandwidth");
 	driver.terminate();
 	sched::run_until_idle();
 	let _ = crate::device::release_claim(claim);
@@ -3910,6 +4110,337 @@ fn usb_video_negotiates_a_stream_and_writes_frames_into_queued_buffers() {
 	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 2), "the controller withdrew the camera's publication when the camera left");
 
 	crate::serial_println!("usb-video: frames {good:?} arrived whole and in order, frame 3 was dropped as the device's, the stream stopped, and a camera unplugged mid-stream closed its events and was withdrawn");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_video_streams_over_isochronous_packets, [Drivers, Usb, Slow], id = "kernel.hardware.usb_video_streams_over_isochronous_packets", covers = ["kernel", "drivers", "camera-device-proto"]);
+fn usb_video_streams_over_isochronous_packets() {
+	// THE CAMERA IS A PROCESS IN THE HOST, played over QEMU's `usb-redir` by `usbredir_device.py --emulate uvc-iso`: a
+	// UVC 1.1 camera at 64x48 YUY2 whose streaming interface rests at zero bandwidth and carries isochronous IN 0x81
+	// on three alternates of 256, 512 and 1023 bytes, and whose probe commits a 512-byte payload. This side plays
+	// CameraService as the bulk oracle does. Frame 2 has one of its packets LOST in the transport - sent with an error
+	// status and nothing in it - and frame 3 carries the device's error bit: both must come back as drops, and every
+	// other frame whole, byte for byte, in order. The second stream's camera leaves the bus after its first frame.
+	use camera_device_proto::generated::liber::camera_device::v1 as camera;
+	use camera_proto::generated::liber::camera::v1 as shared;
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "uvc-iso" {
+		crate::serial_println!("usb-video-iso: NOT RUN - no isochronous camera on this run; play one with USB_GADGET=uvc-iso");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1500;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1500 * 13;
+	const FRAME: usize = 64 * 48 * 2;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::CAMERA, driver_protocol::provider::USB_VIDEO_NAME, patience).expect("the controller publishes the isochronous camera it bound, by name");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = camera::camera_device::Client::new(KernelTransport::new(&host_end, patience));
+
+	client.open(&1).expect("the camera answered").expect("the camera opened");
+	let formats = client.formats().expect("answered").expect("formats listed");
+	assert_eq!((formats.len(), formats[0].frame_type), (1, shared::FrameType::Yuy2));
+	let events = client.events().expect("the event stream opened");
+	let request = shared::StreamRequest { format: 1, size: 1, interval: shared::Interval { numerator: 333_333, denominator: 10_000_000 } };
+	let negotiated = client.negotiate(&1, &request).expect("answered").expect("the stream was negotiated, an alternate found for its payload");
+	assert_eq!((negotiated.width, negotiated.height, negotiated.stride), (64, 48, 128));
+
+	let buffers: [alloc::sync::Arc<object::memory_object::MemoryObject>; 2] = core::array::from_fn(|_| object::memory_object::MemoryObject::create(FRAME).expect("a frame buffer"));
+	let mut transport = client.into_transport();
+	let events = transport.take(events).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let handles: [u64; 2] = core::array::from_fn(|at| transport.offer(buffers[at].clone(), Rights::READ | Rights::WRITE | Rights::MAP));
+	let mut client = camera::camera_device::Client::new(transport);
+	for (at, handle) in handles.iter().enumerate() {
+		assert_eq!(client.register(&1, &(at as u8), handle), Some(Ok(())), "buffer {at} registered");
+	}
+	let mut lease: u64 = 100;
+	for at in 0..2u8 {
+		assert_eq!(client.queue(&1, &at, &lease), Some(Ok(())));
+		lease += 1;
+	}
+	assert_eq!(client.start(&1), Some(Ok(())), "the stream starts on the alternate its payload needs");
+
+	// FRAMES OUT OF ISOCHRONOUS PACKETS, each checked byte for byte and queued again, until both bad frames were dropped
+	// and four whole ones seen past them.
+	let mut good: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let mut dropped_by_device = 0;
+	let give_up = arch::apic::ticks() + patience * 2;
+	while (good.iter().filter(|&&number| number > 3).count() < 4 || dropped_by_device < 2) && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		let Ok(frame) = events.recv() else { continue };
+		let mut frame_handles = camera_device_proto::codec::Handles::new();
+		match camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("an event decodes") {
+			camera::CameraDeviceEvent::Frame(done) => {
+				assert_eq!(done.stream_generation, 1);
+				assert_eq!(done.valid_bytes as usize, FRAME, "a whole YUY2 frame");
+				let bytes = read_from_object(&buffers[done.buffer as usize], FRAME);
+				let number = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+				assert!(number != 2, "frame 2 lost a packet in the transport and was delivered anyway");
+				assert!(number != 3, "frame 3 carried the device's error bit and was delivered anyway");
+				assert!(bytes[8..].iter().enumerate().all(|(at, &byte)| byte == (((at + 8) as u64 * 7 + number * 13) % 251) as u8), "frame {number} arrived as the device sent it, across its thirteen packets");
+				good.push(number);
+				assert_eq!(client.queue(&1, &done.buffer, &lease), Some(Ok(())), "and its buffer is queued again");
+				lease += 1;
+			}
+			camera::CameraDeviceEvent::Dropped(drop) => {
+				if drop.reason == camera::CameraDropReason::Device {
+					dropped_by_device += 1;
+				}
+			}
+			camera::CameraDeviceEvent::Gap(_) => {}
+		}
+	}
+	assert!(good.iter().filter(|&&number| number > 3).count() >= 4, "four whole frames arrived after the bad two, got {good:?}");
+	assert!(dropped_by_device >= 2, "the frame that lost a packet and the one the device marked bad were dropped with the device as the reason ({dropped_by_device})");
+	assert!(good.windows(2).all(|pair| pair[0] < pair[1]), "in the order the device sent them: {good:?}");
+	assert_eq!(client.stop(&1), Some(Ok(())), "the stream stops, the camera back at zero bandwidth, every buffer back");
+	assert_eq!(client.queue(&1, &0, &lease), Some(Err(camera::Error::Stale)), "and a stopped stream takes no buffer");
+
+	// AND AN UNPLUG IN THE MIDDLE OF A STREAM, as on bulk: the second stream's first frame, then the camera gone.
+	let negotiated = client.negotiate(&2, &request).expect("answered").expect("a second stream negotiated");
+	assert_eq!(negotiated.stream_generation, 2);
+	let mut transport = client.into_transport();
+	let handles: [u64; 2] = core::array::from_fn(|at| transport.offer(buffers[at].clone(), Rights::READ | Rights::WRITE | Rights::MAP));
+	let mut client = camera::camera_device::Client::new(transport);
+	for (at, handle) in handles.iter().enumerate() {
+		assert_eq!(client.register(&2, &(at as u8), handle), Some(Ok(())), "buffer {at} registered for the second stream");
+		assert_eq!(client.queue(&2, &(at as u8), &lease), Some(Ok(())));
+		lease += 1;
+	}
+	assert_eq!(client.start(&2), Some(Ok(())));
+	let mut second: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let give_up = arch::apic::ticks() + patience * 2;
+	let closed = loop {
+		assert!(arch::apic::ticks() < give_up, "the camera leaving did not end the event stream; frames of the second stream: {second:?}");
+		sched::run_until_idle();
+		match events.recv() {
+			Ok(frame) => {
+				let mut frame_handles = camera_device_proto::codec::Handles::new();
+				if let camera::CameraDeviceEvent::Frame(done) = camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("an event decodes") {
+					assert_eq!((done.stream_generation, done.valid_bytes as usize), (2, FRAME), "a whole frame of the second stream");
+					let bytes = read_from_object(&buffers[done.buffer as usize], FRAME);
+					second.push(u64::from_le_bytes(bytes[..8].try_into().unwrap()));
+				}
+			}
+			Err(object::channel::ChannelError::PeerClosed) => break true,
+			Err(_) => {}
+		}
+	};
+	assert!(closed && second == [0], "the second stream's first frame arrived before the camera left, and nothing after: {second:?}");
+	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 2), "the controller withdrew the camera's publication when the camera left");
+
+	crate::serial_println!("usb-video-iso: frames {good:?} arrived whole and in order over isochronous packets, the frame that lost a packet and the one marked bad were dropped as the device's, the stream stopped, and a camera unplugged mid-stream closed its events and was withdrawn");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+// THE PCM WIRE AS AUDIOSERVICE SPEAKS IT, for the playback oracles below, whose feeders are THREADS: a stream that plays
+// never lets the machine go idle, and the test's own context runs only when nothing else does, so a feeder there would
+// be late with every period and the stream would run dry for the test's sake.
+#[cfg(target_arch = "x86_64")]
+const PCM_PATIENCE: u64 = 1000;
+#[cfg(not(target_arch = "x86_64"))]
+const PCM_PATIENCE: u64 = 1000 * 13;
+
+// ONE REQUEST AND ITS ANSWER, waited for BLOCKED on the channel and woken by the driver's send - not by yielding, which in
+// this suite hands the core back until the next tick and makes a feeder a period late every few periods.
+fn pcm_ask(pcm: &object::channel::Channel, bytes: alloc::vec::Vec<u8>) -> Option<alloc::vec::Vec<u8>> {
+	let koid = crate::object::KernelObject::header(pcm).koid();
+	pcm.send(object::channel::Message::new(bytes, alloc::vec::Vec::new())).ok()?;
+	let give_up = arch::apic::ticks() + PCM_PATIENCE;
+	loop {
+		if let Ok(reply) = pcm.recv() {
+			return Some(reply.bytes);
+		}
+		if arch::apic::ticks() >= give_up {
+			return None;
+		}
+		sched::block_on_flagged(koid, give_up, false, || pcm.is_readable());
+	}
+}
+
+// Period `n` of a ramp, never silent: what a device counts as silent is what the driver played in its place.
+fn pcm_period(n: usize) -> alloc::vec::Vec<u8> {
+	(0..driver_protocol::audio::PERIOD_BYTES as usize).map(|at| ((at + n * 7) % 251) as u8 | 1).collect()
+}
+
+// Periods `from..from + count`, each answered `OK` once queued with room for the next - so the feeding is paced by the
+// device.
+fn pcm_feed(pcm: &object::channel::Channel, count: usize, from: usize) -> bool {
+	(from..from + count).all(|n| pcm_ask(pcm, pcm_period(n)).is_some_and(|reply| reply == driver_protocol::audio::OK))
+}
+
+// The provider's playback counters.
+fn pcm_stats(pcm: &object::channel::Channel) -> Option<driver_protocol::audio::PlaybackStats> {
+	pcm_ask(pcm, alloc::vec![driver_protocol::audio::CMD_STATS]).and_then(|reply| driver_protocol::audio::PlaybackStats::decode(&reply))
+}
+
+tagged_test!(usb_audio_playback_follows_an_asynchronous_speakers_clock, [Drivers, Usb, Slow], id = "kernel.hardware.usb_audio_playback_follows_an_asynchronous_speakers_clock", covers = ["kernel", "drivers"]);
+fn usb_audio_playback_follows_an_asynchronous_speakers_clock() {
+	// THE SPEAKER IS A PROCESS IN THE HOST, played over QEMU's `usb-redir` by `usbredir_device.py --emulate
+	// speaker-async`: a UAC1 speaker whose data endpoint is asynchronous and whose feedback endpoint reports a clock
+	// 0.2 % fast. A THREAD of this test plays AudioService on the PCM wire - a thread, and not this context, because a
+	// stream that plays never lets the machine go idle and this context runs only when nothing else does, so a feeder
+	// here would be late with every period and the stream would run dry for the test's sake. It feeds periods steadily
+	// - each answered once it is queued and there is room for the next, so the feeding is paced by the device - and
+	// reads the provider's counters with `CMD_STATS`: the feedback value in use and no underrun; then it starves the
+	// stream for 200 ms, which must count ONE underrun and the silence played in its place; and the periods after it
+	// must play without a restart.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use driver_protocol::audio;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "speaker-async" {
+		crate::serial_println!("usb-audio-playback: NOT RUN - no asynchronous speaker on this run; play one with USB_GADGET=speaker-async");
+		return;
+	}
+
+	// WHAT THE FEEDER FOUND: the ticks the steady feed took, the counters after it, after the starvation and after the
+	// feed that followed - or why it stopped.
+	struct Found {
+		took: u64,
+		steady: audio::PlaybackStats,
+		starved: audio::PlaybackStats,
+		after: audio::PlaybackStats,
+	}
+	static DONE: AtomicBool = AtomicBool::new(false);
+	static FOUND: crate::sync::SpinLock<Option<Result<Found, &'static str>>> = crate::sync::SpinLock::new(None);
+
+	extern "C" fn feeder(arg: u64) {
+		// SAFETY: the test handed this thread one strong reference, made by `Arc::into_raw`.
+		let pcm = unsafe { alloc::sync::Arc::from_raw(arg as *const Channel) };
+		let koid = crate::object::KernelObject::header(&*pcm).koid();
+		let feed = |count: usize, from: usize| pcm_feed(&pcm, count, from);
+		let stats = || pcm_stats(&pcm);
+		let ask = |bytes: alloc::vec::Vec<u8>| pcm_ask(&pcm, bytes);
+		let found = (|| {
+			let started = arch::apic::ticks();
+			if !feed(282, 0) {
+				return Err("a period of the steady feed was refused or not answered");
+			}
+			let took = arch::apic::ticks() - started;
+			let steady = stats().ok_or("the counters after the steady feed were not answered")?;
+			// A 200 MS STARVATION, by the clock.
+			let resume = arch::apic::ticks() + 20;
+			while arch::apic::ticks() < resume {
+				sched::block_on(koid, resume);
+			}
+			if !feed(1, 282) {
+				return Err("the period after the starvation was refused");
+			}
+			let starved = stats().ok_or("the counters after the starvation were not answered")?;
+			if !feed(100, 283) {
+				return Err("a period after the starvation was refused or not answered");
+			}
+			let after = stats().ok_or("the counters at the end were not answered")?;
+			if ask(alloc::vec::Vec::new()).is_none_or(|reply| reply != audio::OK) {
+				return Err("the end of the stream was not answered OK");
+			}
+			Ok(Found { took, steady, starved, after })
+		})();
+		*FOUND.lock() = Some(found);
+		DONE.store(true, Ordering::SeqCst);
+	}
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+	let audio_token = offer_token_of(&offers, driver_protocol::provider::AUDIO).expect("a controller with a speaker on it publishes its PCM provider");
+	let (pcm, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, audio_token, driver_end).expect("the audio CONNECT should send");
+	sched::run_until_idle();
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(feeder, alloc::sync::Arc::into_raw(pcm.clone()) as u64);
+	let give_up = arch::apic::ticks() + PCM_PATIENCE * 2;
+	while !DONE.load(Ordering::SeqCst) && arch::apic::ticks() < give_up {
+		sched::run_until_idle_until(arch::apic::ticks() + 10);
+	}
+	assert!(DONE.load(Ordering::SeqCst), "the feeder did not finish within its patience");
+	let found = FOUND.lock().take().expect("the feeder said what it found").unwrap_or_else(|why| panic!("{why}"));
+
+	assert!(found.took >= 250, "282 periods were taken in {} ticks - the provider answered faster than the device plays", found.took);
+	let asked_rate: u32 = (48_096u32 * 16_384 / 1000) << 2;
+	assert!(found.steady.feedback_q16.abs_diff(asked_rate) <= 4, "the rate in use is the one the speaker's feedback asks: {:#x}, asked {asked_rate:#x}", found.steady.feedback_q16);
+	assert_eq!((found.steady.underruns, found.steady.silent_frames, found.steady.feedback_ignored), (0, 0, 0), "a stream fed steadily never ran dry");
+	assert_eq!(found.starved.underruns, 1, "one dry spell is one underrun");
+	assert!((4_000..=10_000).contains(&found.starved.silent_frames), "about 200 ms less what was queued went out as silence: {} frames", found.starved.silent_frames);
+	assert_eq!((found.after.underruns, found.after.silent_frames), (found.starved.underruns, found.starved.silent_frames), "fed steadily again, nothing more ran dry");
+
+	crate::serial_println!("usb-audio-playback: 282 periods fed in {} ticks at the speaker's rate {:#x} (16.16 a millisecond) with no underrun; 200 ms starved: {} underrun, {} silent frames; 100 periods after it with nothing more run dry", found.took, found.steady.feedback_q16, found.starved.underruns, found.starved.silent_frames);
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_audio_plays_a_uac2_speaker_at_high_speed, [Drivers, Usb, Slow], id = "kernel.hardware.usb_audio_plays_a_uac2_speaker_at_high_speed", covers = ["kernel", "drivers"]);
+fn usb_audio_plays_a_uac2_speaker_at_high_speed() {
+	// THE SPEAKER IS `usbredir_device.py --emulate speaker-uac2`: a HIGH-SPEED UAC2 speaker whose rate is its CLOCK's - which
+	// comes up at 44.1 kHz and offers 48 - with an asynchronous data endpoint every microframe and a feedback endpoint
+	// that asks for 0.2 % over whatever rate the clock runs at, in 16.16 frames a microframe. A thread plays AudioService:
+	// two seconds of periods fed steadily, then the counters. The rate in use must be 48 kHz's - which only a clock the
+	// driver set to 48 kHz asks for; left at 44.1 the same feedback is a frame and a half a millisecond less, inside what
+	// the pacer obeys - and nothing ran dry with a packet every 125 microseconds.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use driver_protocol::audio;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "speaker-uac2" {
+		crate::serial_println!("usb-audio-uac2: NOT RUN - no UAC2 speaker on this run; play one with USB_GADGET=speaker-uac2");
+		return;
+	}
+	static DONE: AtomicBool = AtomicBool::new(false);
+	static FOUND: crate::sync::SpinLock<Option<Result<(u64, audio::PlaybackStats), &'static str>>> = crate::sync::SpinLock::new(None);
+
+	extern "C" fn feeder(arg: u64) {
+		// SAFETY: the test handed this thread one strong reference, made by `Arc::into_raw`.
+		let pcm = unsafe { alloc::sync::Arc::from_raw(arg as *const Channel) };
+		let found = (|| {
+			let started = arch::apic::ticks();
+			if !pcm_feed(&pcm, 200, 0) {
+				return Err("a period of the steady feed was refused or not answered");
+			}
+			let took = arch::apic::ticks() - started;
+			let counted = pcm_stats(&pcm).ok_or("the counters were not answered")?;
+			if pcm_ask(&pcm, alloc::vec::Vec::new()).is_none_or(|reply| reply != audio::OK) {
+				return Err("the end of the stream was not answered OK");
+			}
+			Ok((took, counted))
+		})();
+		*FOUND.lock() = Some(found);
+		DONE.store(true, Ordering::SeqCst);
+	}
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+	let audio_token = offer_token_of(&offers, driver_protocol::provider::AUDIO).expect("a controller with a UAC2 speaker on it publishes its PCM provider");
+	let (pcm, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, audio_token, driver_end).expect("the audio CONNECT should send");
+	sched::run_until_idle();
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(feeder, alloc::sync::Arc::into_raw(pcm.clone()) as u64);
+	let give_up = arch::apic::ticks() + PCM_PATIENCE * 2;
+	while !DONE.load(Ordering::SeqCst) && arch::apic::ticks() < give_up {
+		sched::run_until_idle_until(arch::apic::ticks() + 10);
+	}
+	assert!(DONE.load(Ordering::SeqCst), "the feeder did not finish within its patience");
+	let (took, counted) = FOUND.lock().take().expect("the feeder said what it found").unwrap_or_else(|why| panic!("{why}"));
+
+	assert!(took >= 180, "200 periods were taken in {took} ticks - the provider answered faster than the device plays");
+	// 48.096 kHz a microframe in 16.16, as the speaker rounds it.
+	let asked_rate: u32 = (48_096u64 * 65_536).div_ceil(8_000) as u32;
+	assert!(counted.feedback_q16.abs_diff(asked_rate) <= 4, "the rate in use is the one a 48 kHz clock asks: {:#x}, asked {asked_rate:#x}", counted.feedback_q16);
+	assert_eq!((counted.underruns, counted.silent_frames, counted.feedback_ignored), (0, 0, 0), "a stream fed steadily at a packet a microframe never ran dry");
+
+	crate::serial_println!("usb-audio-uac2: 200 periods played in {took} ticks at the speaker's rate {:#x} (16.16 a microframe), set on its clock at 48 kHz, with no underrun", counted.feedback_q16);
 	driver.terminate();
 	sched::run_until_idle();
 	let _ = crate::device::release_claim(claim);

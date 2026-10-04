@@ -447,8 +447,8 @@ unsafe fn serve_command(ctl: &Ctl, rx: &mut Rx, irq: u64, capture: Option<u32>, 
 				}
 				send_blocking(service, b"OK", 0);
 			}
-			// A command this driver does not know. Answered rather than ignored, because the client
-			// is blocked on the reply either way.
+			// A command this driver does not know - `CMD_STATS` among them: it plays a period at a time and keeps no
+			// playback counters. Answered rather than ignored, because the client is blocked on the reply either way.
 			_ => {
 				send_blocking(service, &[], 0);
 			}

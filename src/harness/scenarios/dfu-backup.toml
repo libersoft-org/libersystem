@@ -1,0 +1,132 @@
+# THE SHIPPING FIRMWARE REQUESTER'S BACKUP, END TO END, THROUGH THE EMULATED KEYBOARD.
+#
+# `dfu backup` asks for a target's firmware to be read OUT into a file - a mutation of nothing on the device, and still
+# confirmed on the protected screen, since a firmware image can hold the device's own secrets and licensed code. The
+# target is `usbredir_device.py`'s upload-capable DFU device in runtime mode, which the USB DFU executor follows into
+# DFU mode at the reset it waits for, and the file goes onto this run's USB stick.
+#
+# `check-dfu-tool.sh` runs this with the target in place and then reads the stick: the file byte for byte, and no file
+# left by the backups that read nothing. Run bare, there is no target.
+version = 1
+name = "dfu backup"
+description = "The shipping dfu command reads a target's firmware out into a file once a person confirms it on the protected screen; a decline reads nothing, and an image past the confirmed bound is stopped with no file written."
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+# DECLINED: nothing is read, the runtime target is not even detached, and the file made for it is gone.
+[[step]]
+do = "key"
+text = "dfu backup dfu:1d6b:0104 vol://usb/declined.bin &"
+
+[[step]]
+do = "expect"
+contains = "dfu: the firmware of dfu:1d6b:0104, at most 1048576 bytes, into vol://usb/declined.bin - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["esc"]
+
+[[step]]
+do = "expect"
+contains = "dfu: declined - nothing was read"
+
+# CONFIRMED: the runtime target is followed into DFU mode and its firmware read out, whole, into the file.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "dfu backup dfu:1d6b:0104 vol://usb/backup.bin &"
+
+[[step]]
+do = "expect"
+contains = "dfu: the firmware of dfu:1d6b:0104, at most 1048576 bytes, into vol://usb/backup.bin - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "dfu: confirmed - reading it"
+
+[[step]]
+do = "expect"
+contains = "dfu: completed - 2500 bytes, SHA-256 "
+timeout = 120
+
+# PAST THE BOUND: a backup of at most 1024 bytes from the device now in DFU mode - stopped at the second block, and no
+# file written.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "dfu backup dfu:1d6b:0105 vol://usb/short.bin 1024 &"
+
+[[step]]
+do = "expect"
+contains = "dfu: the firmware of dfu:1d6b:0105, at most 1024 bytes, into vol://usb/short.bin - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "dfu: failed - nothing was read out; no file was written"
+timeout = 120
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"

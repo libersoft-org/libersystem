@@ -1664,9 +1664,10 @@ destination = "libexec/camfail.lsexe"
 providers = []
 development = true
 
-# THE MIDI GATE'S FOUR PROBES, development-only. `midicheck` drives the scenario with a receiver on endpoint 0,
-# inventory and the fixture's control endpoint; `midihold` is the second receiver, on endpoint 1; `midiread`
-# holds inventory alone; `midifail`'s launch fails after its receiver was minted, and it never runs.
+# THE MIDI GATE'S FIVE PROBES, development-only. `midicheck` drives the scenario with a receiver on endpoint 0,
+# inventory and the fixture's control endpoint; `midiump` does the same on the UMP pair, 3 and 4; `midihold` is the
+# second receiver, on endpoint 1; `midiread` holds inventory alone; `midifail`'s launch fails after its receiver was
+# minted, and it never runs.
 # THE ADMINISTRATIVE-PATH GATE'S PROBES: the requester and scenario driver, the process another launch's
 # endpoints are handed to, and an ordinary client that keeps trying to cover the protected screen.
 [[programs]]
@@ -1706,6 +1707,16 @@ role = "probe"
 linkage = "static"
 stage = "volume"
 destination = "libexec/midicheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "midiump"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/midiump.lsexe"
 providers = []
 development = true
 
@@ -2659,6 +2670,7 @@ providers = [
 	"observability-proto",
 	"device-proto",
 	"display-proto",
+	"audio-proto",
 	"base-proto",
 	"ipc-client",
 	"wire",
@@ -4098,6 +4110,16 @@ kind = "privilege"
 provider = "kernel"
 presence = "optional"
 
+# THE OBSERVATION ROOT, AND IT IS NOT THE SERVE OR THE ADMIN ONE: authority to READ the playing device's counters
+# must not be authority to make a sound or to record one, so the System Graph is handed this and nothing else.
+# Optional: a boot that grants none has a graph without them. Last, as every addition to a role list is.
+[[services.roles]]
+tag = "STATS"
+kind = "serve-root"
+provider = "self"
+interface = "liber:audio@1/audio-stats"
+presence = "optional"
+
 [[services]]
 name = "config_service"
 program = "config_service"
@@ -4151,9 +4173,13 @@ interface = "liber:config@1/config"
 [[services]]
 name = "font_catalogue"
 program = "font_catalogue"
-restart = "transparent"
-# EVERYTHING IT HOLDS IS DERIVED FROM THE FONT DIRECTORY, which is what makes it restartable: a fresh
-# instance re-reads the directory and is in the same place. It persists nothing of its own.
+# ESCALATE, BECAUSE THAT IS WHAT HAPPENS. Its STATE would survive a restart - everything it holds is derived from
+# the font directory, so a fresh instance re-reads the directory and is in the same place, and it persists
+# nothing of its own - but its CLIENTS would not: PermissionManager is handed the font roots once at boot and
+# grants from them, and the supervisor has no relaunch that re-runs this bootstrap and reaches them again. It
+# said `transparent`, the restart path found no relaunch for it and escalated, and the bootstrap-plan check
+# said so. Transparent needs that relaunch first.
+restart = "escalate"
 state_class = "ephemeral"
 state_scope = "service"
 # PROCESSSERVICE IS A DEPENDENCY OF EVERY SERVICE LOADED FROM THE VOLUME, and this row omitted it
@@ -5375,6 +5401,16 @@ kind = "client"
 provider = "display_service"
 source = "STATS"
 interface = "liber:display@1/display-stats"
+presence = "optional"
+
+# AND AUDIOSERVICE'S, for the playing device's counters - after DISPLAY, in the order the ladder sends them, and
+# optional for the same reason: a machine whose audio service never came up hands a zero here.
+[[services.roles]]
+tag = "AUDIO"
+kind = "client"
+provider = "audio_service"
+source = "STATS"
+interface = "liber:audio@1/audio-stats"
 presence = "optional"
 
 [[services.roles]]

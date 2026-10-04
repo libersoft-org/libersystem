@@ -32,6 +32,7 @@ pub enum Action {
 	ProbeWrite,
 	BmcSelClear,
 	BmcChassisControl,
+	FirmwareUpload,
 }
 
 impl Action {
@@ -41,6 +42,7 @@ impl Action {
 			Action::ProbeWrite => "probe-write",
 			Action::BmcSelClear => "bmc-sel-clear",
 			Action::BmcChassisControl => "bmc-chassis-control",
+			Action::FirmwareUpload => "firmware-upload",
 		}
 	}
 
@@ -50,9 +52,21 @@ impl Action {
 			Action::ProbeWrite => 2,
 			Action::BmcSelClear => 3,
 			Action::BmcChassisControl => 4,
+			Action::FirmwareUpload => 5,
 		}
 	}
+
+	/// WHETHER THE OPERATION READS AND HANDS WHAT IT READ TO THE REQUESTER - redeemed with `execute-read`, never with
+	/// `execute`.
+	pub fn reads(self) -> bool {
+		self == Action::FirmwareUpload
+	}
 }
+
+/// The largest image an upload may name as its bound - the executor's own.
+pub const MAX_UPLOAD: u32 = 1 << 20;
+/// The longest file name an upload's parameters may carry.
+pub const MAX_UPLOAD_NAME: usize = 200;
 
 /// What a requester asked for.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -101,6 +115,17 @@ pub fn operation(action: Action, parameters: &[u8]) -> Result<Option<String>, Re
 			[low, high] => Ok(Some(format!("erase all {} records of the BMC's event log; an event that arrives first cancels it; {PAYLOAD}", u16::from_le_bytes([*low, *high])))),
 			_ => Err(Refusal::Unrenderable),
 		},
+		// THE BOUND AND THE FILE: four bytes little-endian, then the name the requester gives the image - shown escaped,
+		// as its own words are.
+		Action::FirmwareUpload => {
+			let Some((bound, name)) = parameters.split_first_chunk::<4>() else { return Err(Refusal::Unrenderable) };
+			let bound = u32::from_le_bytes(*bound);
+			let Ok(name) = core::str::from_utf8(name) else { return Err(Refusal::Unrenderable) };
+			if bound == 0 || bound > MAX_UPLOAD || name.is_empty() || name.len() > MAX_UPLOAD_NAME {
+				return Err(Refusal::Unrenderable);
+			}
+			Ok(Some(format!("READ this target's firmware OUT - at most {bound} bytes - and hand it to the requester, which names it \"{}\"; a firmware image can hold the device's own secrets and licensed code; {PAYLOAD}", escape_label(name))))
+		}
 		Action::BmcChassisControl => {
 			const HARD: &str = "the machine stops at once: no service is stopped and nothing is flushed";
 			let said = match parameters {

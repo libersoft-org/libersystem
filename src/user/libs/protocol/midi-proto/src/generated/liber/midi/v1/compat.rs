@@ -26,12 +26,36 @@ fn midi_direction_wire_is_stable() {
 	assert_eq!(MidiDirection::decode(&bytes).unwrap(), sample);
 }
 #[test]
-fn midi_endpoint_wire_is_stable() {
-	let sample = MidiEndpoint { id: MidiEndpointId { slot: 7, generation: 7, binding_generation: 7, endpoint: 7, incarnation: 7 }, name: String::from("x"), protocol: MidiProtocol::Midi1, direction: MidiDirection::Receive, cables: 7, receiving: true };
+fn midi_block_direction_wire_is_stable() {
+	let sample = MidiBlockDirection::Receives;
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 120, 1, 1, 7, 1];
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(MidiBlockDirection::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn midi_block_wire_is_stable() {
+	let sample = MidiBlock { id: 7, name: String::from("x"), first_group: 7, groups: 7, direction: MidiBlockDirection::Receives, protocol: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 1, 0, 120, 7, 7, 1, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(MidiBlock::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn midi_endpoint_wire_is_stable() {
+	let sample = MidiEndpoint { id: MidiEndpointId { slot: 7, generation: 7, binding_generation: 7, endpoint: 7, incarnation: 7 }, name: String::from("x"), protocol: MidiProtocol::Midi1, direction: MidiDirection::Receive, cables: 7, receiving: true, blocks: alloc::vec![MidiBlock { id: 7, name: String::from("x"), first_group: 7, groups: 7, direction: MidiBlockDirection::Receives, protocol: 7 }] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 120, 1, 1, 7, 1, 1, 0, 7, 1, 0, 120, 7, 7, 1, 7];
 	assert_eq!(bytes, golden);
 	assert_eq!(MidiEndpoint::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn midi_ump_wire_is_stable() {
+	let sample = MidiUmp { group: Some(7), words: alloc::vec![7] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 7, 1, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(MidiUmp::decode(&bytes).unwrap(), sample);
 }
 #[test]
 fn midi_chunk_kind_wire_is_stable() {

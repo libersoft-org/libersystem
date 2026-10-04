@@ -52,6 +52,10 @@ struct Notify {
 	posted: bool,
 	// What the adapter last said its link was, so a repeat is not reported as a transition.
 	up: Option<bool>,
+	// THE ENDPOINT'S SERVICE INTERVAL IN CLOCK TICKS, and the tick the next read may be posted at - see
+	// `post_notification`.
+	every: u64,
+	due: u64,
 }
 
 pub struct Net {
@@ -247,14 +251,18 @@ pub unsafe fn configure_network(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ne
 		// ENDPOINT TYPE SEVEN IS INTERRUPT IN, where six is bulk IN and two is bulk OUT. A driver
 		// that configured the notification endpoint as bulk asks the controller for a pipe the
 		// device does not have, and the configure command is refused for the whole adapter.
-		let mut contexts: [(u32, u32, u32, &Ring); 3] = [(dci_in, bound.bulk_in_packet as u32, 6u32, &ring_in), (dci_out, bound.bulk_out_packet as u32, 2u32, &ring_out), (dci_in, 0, 6, &ring_in)];
+		// AND ITS INTERVAL, which is the endpoint context's and not only the descriptor's: left at zero it asks the
+		// controller to poll the endpoint every microframe.
+		let note_interval = crate::classes::interrupt_interval(dev.speed, u32::from(bound.notification_interval));
+		let mut contexts: [(u32, u32, u32, u32, &Ring); 3] = [(dci_in, bound.bulk_in_packet as u32, 6u32, 0, &ring_in), (dci_out, bound.bulk_out_packet as u32, 2u32, 0, &ring_out), (dci_in, 0, 6, 0, &ring_in)];
 		let mut context_count = 2usize;
 		if let (Some(dci), Some(ring)) = (note_dci, note_ring.as_ref()) {
-			contexts[2] = (dci, NOTIFY_BYTES as u32, 7u32, ring);
+			contexts[2] = (dci, NOTIFY_BYTES as u32, 7u32, note_interval, ring);
 			context_count = 3;
 		}
-		for &(dci, mps, ep_type, ring) in &contexts[..context_count] {
+		for &(dci, mps, ep_type, interval, ring) in &contexts[..context_count] {
 			let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
+			(ep_ctx as *mut u32).write_volatile(interval << 16);
 			((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
 			((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
 			((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
@@ -307,7 +315,7 @@ pub unsafe fn configure_network(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ne
 			segment => (segment - 14).min(FRAME_BYTES as u16 - 14),
 		};
 		let note = match (note_dci, note_ring, note_page) {
-			(Some(dci), Some(ring), Some((_, virt, phys))) => Some(Notify { dci, ring, virt, phys, posted: false, up: None }),
+			(Some(dci), Some(ring), Some((_, virt, phys))) => Some(Notify { dci, ring, virt, phys, posted: false, up: None, every: interval_ticks(note_interval), due: 0 }),
 			_ => None,
 		};
 		Some(Net { dci_in, dci_out, ring_in, ring_out, note, rx_virt, rx_phys, rx_handle, tx_virt, tx_phys, tx_handle, posted: false, mac, mtu })
@@ -321,21 +329,42 @@ const NOTIFY_BYTES: usize = cdc::NOTIFICATION_HEADER_LEN + 8;
 /// bytes arrived. A residual is what was NOT transferred.
 pub const NOTIFY_WINDOW: usize = NOTIFY_BYTES;
 
-/// Post the standing notification transfer, if none is outstanding.
+// An endpoint-context interval - the exponent of a period of 125 us microframes - in clock ticks, at least one.
+fn interval_ticks(exponent: u32) -> u64 {
+	let micros = 125u64 << exponent.min(15);
+	micros.saturating_mul(TICKS_PER_SECOND).div_ceil(1_000_000).max(1)
+}
+
+/// Post the standing notification transfer, if none is outstanding - AND NOT BEFORE THE ENDPOINT'S
+/// INTERVAL HAS PASSED SINCE THE LAST ONE CAME BACK.
 ///
 /// A QUEUE NOTHING DRAINS IS A QUEUE THAT FILLS. An interrupt endpoint the driver configured and
 /// never read from is one the device eventually stops being able to write to, so this is posted
 /// beside the receive transfer rather than only when somebody asks about the link.
+///
+/// THE INTERVAL IS KEPT HERE TOO, and not left to the controller. QEMU's adapter answers every read
+/// with its connection state and leaves the pacing to the host controller, and its xHCI does not pace
+/// an interrupt endpoint at all: a read posted the moment the last one came back came back at once,
+/// some six thousand times a second, and the controller's interrupt kept a core busy for as long as
+/// the adapter was plugged in - found as a kernel test whose timed waits woke late by seconds while
+/// an audio stream played. On a controller that keeps the interval this costs nothing: a read never
+/// comes back sooner than one interval after the last.
 pub fn post_notification(hc: &Xhci, dev: &UsbDevice, net: &mut Net) {
 	unsafe {
 		let Some(note) = net.note.as_mut() else { return };
-		if note.posted {
+		if note.posted || clock() < note.due {
 			return;
 		}
 		note.ring.push(note.phys, NOTIFY_BYTES as u32, TRB_NORMAL << 10 | TRB_IOC);
 		w32(hc.db + dev.slot as u64 * 4, note.dci);
 		note.posted = true;
 	}
+}
+
+/// The tick the notification endpoint's next read is due at, while none is posted - what the
+/// service loop's retry timer is armed for.
+pub fn notification_due(net: &Net) -> Option<u64> {
+	net.note.as_ref().filter(|note| !note.posted).map(|note| note.due)
 }
 
 /// Read one notification the adapter delivered, and say when its link CHANGED.
@@ -346,6 +375,7 @@ pub fn handle_notification(net: &mut Net, arrived: usize) -> Option<cdc::Notific
 	unsafe {
 		let note = net.note.as_mut()?;
 		note.posted = false;
+		note.due = clock() + note.every;
 		let mut bytes = [0u8; NOTIFY_BYTES];
 		let take = arrived.min(NOTIFY_BYTES);
 		for (index, byte) in bytes[..take].iter_mut().enumerate() {

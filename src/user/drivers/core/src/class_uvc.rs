@@ -12,8 +12,16 @@
 // `drivers::uvc::Assembler` reads those bits and decides where each payload's data goes; this module is its sink,
 // the leased buffers. A frame the device marked bad, one that overran its buffer, a YUY2 frame of the wrong length
 // and a compressed frame no EOF ended are DROPPED with the device as the reason - and their buffer stays queued for
-// the next. A frame that found no queued buffer is dropped with that reason. Isochronous streaming is not this
-// transport's.
+// the next. A frame that found no queued buffer is dropped with that reason.
+//
+// ISOCHRONOUS STREAMING, ONE PAYLOAD A SERVICE INTERVAL. Most cameras stream isochronously: their streaming interface
+// rests at alternate zero, the zero-bandwidth setting, and carries its IN endpoint on later alternates of different
+// sizes. After PROBE and COMMIT the alternate is the smallest that carries the committed payload
+// (`drivers::uvc::alternate_for`); while the stream runs that alternate is selected and as many transfers as one page
+// of packet buffers holds stand on the endpoint - the standing capture USB Audio has - each re-posted as it completes,
+// and each completion one payload, fed to the same `Assembler`. A packet the transport missed or failed is LOST, and
+// with it the frame it belonged to (`Assembler::lost`) - never delivered with a hole in it. A stop abandons the
+// standing transfers (Stop Endpoint, Set TR Dequeue) and puts the camera back at zero bandwidth.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -21,8 +29,10 @@ use proto::system::{CameraDeviceEvent, CameraDrop, CameraDropReason, CameraFrame
 use rt::*;
 
 use crate::classes::{self, Module, Pipe};
+use crate::iso::{self, IsoPipe, MAX_PAYLOAD};
 use crate::usb_hid::Hids;
-use crate::{FEATURE_ENDPOINT_HALT, KIND_CAMERA, REQ_CLEAR_FEATURE, RT_ENDPOINT, UsbDevice, Xhci, control_in_req, control_nodata, control_out_req, r8};
+use crate::{FEATURE_ENDPOINT_HALT, KIND_CAMERA, REQ_CLEAR_FEATURE, RT_ENDPOINT, SPEED_HIGH, UsbDevice, Xhci};
+use crate::{control_in_req, control_nodata, control_out_req, r8};
 use drivers::common;
 use drivers::usb_class::ClassKind;
 use drivers::uvc::{self, Binding};
@@ -30,8 +40,9 @@ use drivers::uvc::{self, Binding};
 const VERSION: u32 = 1;
 const REQUEST_BYTES: usize = 256;
 const STREAM_DEPTH: u64 = 64;
-// A payload is one transfer, and a transfer is a page at most.
-const MAX_PAYLOAD: u32 = 4096;
+// The request that selects an interface's alternate setting.
+const REQ_SET_INTERFACE: u8 = 0x0b;
+const RT_INTERFACE_OUT: u8 = 0x01;
 
 struct Slot {
 	id: u8,
@@ -51,6 +62,8 @@ struct Stream {
 	assembler: uvc::Assembler,
 	/// The slot the open frame is going into, and the lease it was queued under.
 	current: Option<(usize, u64)>,
+	/// An isochronous camera's alternate for this stream: the smallest that carries its committed payload.
+	alternate: Option<uvc::IsoAlternate>,
 }
 
 // THE ASSEMBLER'S SINK: the consumer's buffers. A frame takes the first queued one, is written only inside it, and
@@ -87,7 +100,9 @@ pub struct Uvc {
 	dev: UsbDevice,
 	binding: Binding,
 	normalized: uvc::Normalized,
-	input: Pipe,
+	/// A bulk camera's pipe - `None` for an isochronous one, whose stream is `iso` while it runs.
+	input: Option<Pipe>,
+	iso: Option<IsoPipe>,
 	connection: u64,
 	consumer: u64,
 	stream: Option<Stream>,
@@ -140,21 +155,37 @@ pub unsafe fn configure(hc: &mut Xhci, mut dev: UsbDevice, binding: Binding) -> 
 				return Err(dev);
 			}
 		};
-		let Some(mut input) = Pipe::new(dev.slot, dev.speed, &binding.bulk_in) else {
-			print(b"driver.xhci: a camera is on the bus and no pages were left for its pipe\n");
-			return Err(dev);
+		let mut line: common::Bounded<128> = common::Bounded::new();
+		let input = match binding.bulk_in {
+			Some(endpoint) => {
+				let Some(mut input) = Pipe::new(dev.slot, dev.speed, &endpoint) else {
+					print(b"driver.xhci: a camera is on the bus and no pages were left for its pipe\n");
+					return Err(dev);
+				};
+				if !classes::configure_pipes(hc, &mut dev, &[&input], 0) || !classes::select(hc, &mut dev, binding.config_value, binding.streaming_interface, 0) {
+					input.release(hc);
+					print(b"driver.xhci: a camera's streaming endpoint or its configuration was refused\n");
+					return Err(dev);
+				}
+				line.push(b"driver.xhci: video camera bound - bulk streaming, ");
+				Some(input)
+			}
+			// AN ISOCHRONOUS CAMERA RESTS AT ZERO BANDWIDTH: its endpoint is brought up when a stream starts.
+			None => {
+				if !classes::select(hc, &mut dev, binding.config_value, binding.streaming_interface, 0) {
+					print(b"driver.xhci: a camera's configuration was refused\n");
+					return Err(dev);
+				}
+				line.push(b"driver.xhci: video camera bound - isochronous streaming over ");
+				line.decimal(binding.iso.len() as u64);
+				line.push(b" alternate(s), ");
+				None
+			}
 		};
-		if !classes::configure_pipes(hc, &mut dev, &[&input], 0) || !classes::select(hc, &mut dev, binding.config_value, binding.streaming_interface, 0) {
-			input.release(hc);
-			print(b"driver.xhci: a camera's streaming endpoint or its configuration was refused\n");
-			return Err(dev);
-		}
-		let mut line: common::Bounded<96> = common::Bounded::new();
-		line.push(b"driver.xhci: video camera bound - bulk streaming, ");
 		line.decimal(normalized.formats.len() as u64);
 		line.push(b" format(s)\n");
 		print(line.as_bytes());
-		Ok(Uvc { dev, binding, normalized, input, connection: 0, consumer: 0, stream: None, events: 0, event_seq: 0, buf: alloc::vec![0u8; REQUEST_BYTES] })
+		Ok(Uvc { dev, binding, normalized, input, iso: None, connection: 0, consumer: 0, stream: None, events: 0, event_seq: 0, buf: alloc::vec![0u8; REQUEST_BYTES] })
 	}
 }
 
@@ -223,20 +254,65 @@ impl Uvc {
 	}
 
 	fn post(&mut self, hc: &mut Xhci) {
-		if let Some(stream) = self.stream.as_ref()
-			&& stream.running
-			&& !self.input.busy
+		let Some(stream) = self.stream.as_ref().filter(|stream| stream.running) else { return };
+		let length = stream.max_payload;
+		if let Some(input) = self.input.as_mut()
+			&& !input.busy
 		{
-			let length = stream.max_payload;
-			self.input.post(hc, length);
+			input.post(hc, length);
+		}
+		if let Some(iso) = self.iso.as_mut() {
+			iso.post_in(hc);
 		}
 	}
 
-	// STOP ON THE DEVICE'S SIDE: a bulk camera stops streaming when its endpoint's halt is cleared.
+	// STOP ON THE DEVICE'S SIDE: a bulk camera stops streaming when its endpoint's halt is cleared; an isochronous one
+	// when it is put back at alternate zero, the zero-bandwidth setting - after its standing transfers are abandoned.
 	fn halt(&mut self, hc: &mut Xhci, hids: &mut Hids) {
-		let _ = classes::abandon(hc, hids, &mut self.input);
-		let address = self.binding.bulk_in.address as u16;
-		let _ = control_nodata(hc, hids, &mut self.dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, address);
+		if let Some(input) = self.input.as_mut() {
+			let _ = classes::abandon(hc, hids, input);
+			if let Some(endpoint) = self.binding.bulk_in {
+				let _ = control_nodata(hc, hids, &mut self.dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, endpoint.address as u16);
+			}
+		}
+		if let Some(mut iso) = self.iso.take() {
+			iso.stop(hc, hids);
+			iso.release(hc);
+			if control_nodata(hc, hids, &mut self.dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, 0, self.binding.streaming_interface as u16).is_some() {
+				print(b"driver.xhci: the camera's stream stopped - it is back at zero bandwidth\n");
+			}
+		}
+	}
+
+	// AN ISOCHRONOUS STREAM'S START: its endpoint brought up at the alternate's size, the alternate selected, and its
+	// transfers standing.
+	fn start_iso(&mut self, hc: &mut Xhci, hids: &mut Hids, alternate: uvc::IsoAlternate) -> bool {
+		if let Some(mut old) = self.iso.take() {
+			old.stop(hc, hids);
+			old.release(hc);
+		}
+		let capacity = alternate.capacity(self.dev.speed == SPEED_HIGH);
+		let Some(iso) = (unsafe { iso::open(hc, &mut self.dev, &[(alternate.endpoint, capacity)], 0) }).and_then(|mut pipes| pipes.pop()) else {
+			print(b"driver.xhci: the camera's isochronous endpoint was refused by the controller\n");
+			return false;
+		};
+		if control_nodata(hc, hids, &mut self.dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, alternate.alternate as u16, self.binding.streaming_interface as u16).is_none() {
+			let mut iso = iso;
+			iso.release(hc);
+			print(b"driver.xhci: the camera refused the alternate setting that carries its stream\n");
+			return false;
+		}
+		let mut line: common::Bounded<128> = common::Bounded::new();
+		line.push(b"driver.xhci: the camera streams on alternate ");
+		line.decimal(u64::from(alternate.alternate));
+		line.push(b", ");
+		line.decimal(u64::from(iso.capacity));
+		line.push(b" bytes an interval, ");
+		line.decimal(u64::from(iso.buffers));
+		line.push(b" transfers standing\n");
+		print(line.as_bytes());
+		self.iso = Some(iso);
+		true
 	}
 }
 
@@ -292,10 +368,28 @@ impl camera_device::Service for View<'_> {
 		if probed.max_payload == 0 || probed.max_payload > MAX_PAYLOAD {
 			return Err(Error::Unsupported);
 		}
+		// AN ISOCHRONOUS CAMERA'S ALTERNATE, by the payload it committed to: refused, and said, when none carries it.
+		let alternate = if self.uvc.binding.bulk_in.is_none() {
+			match uvc::alternate_for(&self.uvc.binding.iso, probed.max_payload, self.uvc.dev.speed == SPEED_HIGH) {
+				Ok(alternate) => Some(alternate),
+				Err(refused) => {
+					let mut line: common::Bounded<160> = common::Bounded::new();
+					line.push(b"driver.xhci: no alternate setting of the camera carries its committed ");
+					line.decimal(u64::from(refused.needed));
+					line.push(b"-byte payload - the most is ");
+					line.decimal(u64::from(refused.most));
+					line.push(b"\n");
+					print(line.as_bytes());
+					return Err(Error::Unsupported);
+				}
+			}
+		} else {
+			None
+		};
 		unsafe { core::ptr::copy_nonoverlapping(answered.as_ptr(), self.uvc.dev.data_virt as *mut u8, answered.len()) };
 		control_out_req(self.hc, self.hids, &mut self.uvc.dev, uvc::RT_CLASS_INTERFACE_OUT, uvc::SET_CUR, (uvc::VS_COMMIT_CONTROL as u16) << 8, interface, answered.len() as u16).ok_or(Error::Io)?;
 		self.uvc.release_all();
-		self.uvc.stream = Some(Stream { generation, selection, slots: Vec::new(), running: false, sequence: 0, max_payload: probed.max_payload, assembler: uvc::Assembler::new(), current: None });
+		self.uvc.stream = Some(Stream { generation, selection, slots: Vec::new(), running: false, sequence: 0, max_payload: probed.max_payload, assembler: uvc::Assembler::new(), current: None, alternate });
 		Ok(Negotiated { stream_generation: generation, format: selection.format, frame_type: info.frame_type, width: selection.width, height: selection.height, interval: request.interval, max_bytes: selection.max_bytes, stride: selection.stride, plane_offset: 0, range: info.range, matrix: info.matrix })
 	}
 
@@ -330,7 +424,14 @@ impl camera_device::Service for View<'_> {
 
 	fn start(&mut self, generation: u64) -> Result<(), Error> {
 		let stream = self.uvc.stream(generation)?;
-		stream.running = true;
+		if let Some(alternate) = stream.alternate
+			&& !self.uvc.start_iso(self.hc, self.hids, alternate)
+		{
+			return Err(Error::Io);
+		}
+		if let Some(stream) = self.uvc.stream.as_mut() {
+			stream.running = true;
+		}
 		self.uvc.post(self.hc);
 		Ok(())
 	}
@@ -431,16 +532,33 @@ impl Module for Uvc {
 	}
 
 	fn absorb(&mut self, hc: &mut Xhci, hids: &mut Hids, _pointer: u64, status: u32, control: u32) -> bool {
-		if !self.input.owns(control) {
-			return false;
+		let running = self.stream.as_ref().is_some_and(|stream| stream.running);
+		// AN ISOCHRONOUS COMPLETION: a payload into the assembler, a lost packet losing its frame.
+		if let Some(iso) = self.iso.as_mut()
+			&& iso.owns(control)
+		{
+			match iso.complete_in(status) {
+				iso::Completed::Payload(payload) if running && !payload.is_empty() => self.payload(&payload),
+				iso::Completed::Lost if running => {
+					if let Some(stream) = self.stream.as_mut() {
+						stream.assembler.lost();
+					}
+				}
+				_ => {}
+			}
+			self.post(hc);
+			return true;
 		}
-		let (code, moved) = self.input.complete(status);
-		if self.stream.as_ref().is_some_and(|stream| stream.running) {
+		let Some(input) = self.input.as_mut().filter(|input| input.owns(control)) else { return false };
+		let (code, moved) = input.complete(status);
+		if running {
 			if classes::succeeded(code) && moved > 0 {
-				let transfer = self.input.read(moved as usize);
+				let transfer = input.read(moved as usize);
 				self.payload(&transfer);
-			} else if classes::stalled(code) {
-				let _ = classes::clear_halt(hc, hids, &mut self.dev, &mut self.input);
+			} else if classes::stalled(code)
+				&& let Some(input) = self.input.as_mut()
+			{
+				let _ = classes::clear_halt(hc, hids, &mut self.dev, input);
 			}
 		}
 		self.post(hc);
@@ -453,6 +571,11 @@ impl Module for Uvc {
 			close(self.events);
 			self.events = 0;
 		}
-		self.input.release(hc);
+		if let Some(input) = self.input.as_mut() {
+			input.release(hc);
+		}
+		if let Some(mut iso) = self.iso.take() {
+			iso.release(hc);
+		}
 	}
 }

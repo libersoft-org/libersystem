@@ -1895,11 +1895,12 @@ fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 				close(*stats_server);
 				*stats_server = 0;
 			}
-			// A RESTARTED GRAPH GETS THE SAME TWO CONNECTIONS. `broker.device_manager` is the
+			// A RESTARTED GRAPH GETS THE SAME CONNECTIONS - AudioService's observation root read from what this
+			// supervisor keeps, so a graph restarted after AudioService was gets the live one. `broker.device_manager` is the
 			// supervisor's own catalogue client; without it a graph that came back after a restart
 			// would report every device `running` again, which is the defect this milestone is
 			// about arriving through the back door.
-			bootstrap_system_graph_service(manager_side, procs, state, device, broker.device_manager, broker.display_stats, root, stats_server)
+			bootstrap_system_graph_service(manager_side, procs, state, device, broker.device_manager, broker.display_stats, broker.kept.end_of(b"audio_service", b"STATS"), root, stats_server)
 		} else {
 			bootstrap_serve(manager_side, root)
 		};

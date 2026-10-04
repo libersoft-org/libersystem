@@ -5,6 +5,11 @@
 //! to a batch, with the host time the completion became available - and MidiService decodes them with the
 //! driver library's staged decoder. The other way, MidiService encodes with the same library and a provider
 //! puts the packets on the wire as they are. No client ever sees or writes a raw packet.
+//!
+//! AN ENDPOINT SAYS WHICH PACKETS IT CARRIES. A `midi1` endpoint's are USB-MIDI 1.0 event packets; a `ump`
+//! endpoint's are Universal MIDI Packet WORDS - each four bytes, little-endian, a message one to four of them - which
+//! is what a USB MIDI 2.0 device's alternate setting carries, and the endpoint lists the function blocks its groups
+//! belong to. A device's two faces are alternates of one interface, so a provider runs one face at a time.
 
 package liber:midi-device@1;
 
@@ -27,11 +32,37 @@ enum midi-device-direction {
 	transmit = 2,
 }
 
+/// The packets an endpoint carries.
+enum midi-device-protocol {
+	midi1 = 1,
+	ump   = 2,
+}
+
 record midi-device-endpoint {
 	index:           u32,
 	@bound(64) name: string,
+	/// The cables of a `midi1` endpoint; the groups a `ump` endpoint's blocks cover - at most sixteen either way.
 	cables:          u8,
 	direction:       midi-device-direction,
+	protocol:        midi-device-protocol,
+}
+
+/// Which way a function block's groups carry messages, from the DEVICE's side.
+enum midi-device-block-direction {
+	receives = 1,
+	sends    = 2,
+	both     = 3,
+}
+
+/// ONE FUNCTION BLOCK of a UMP endpoint, as the device declares it: which groups belong together, which way they go,
+/// its name and the MIDI protocol it says it speaks (`bMIDIProtocol`).
+record midi-device-block {
+	id:              u8,
+	@bound(32) name: string,
+	first-group:     u8,
+	groups:          u8,
+	direction:       midi-device-block-direction,
+	protocol:        u8,
 }
 
 /// One transport completion's packets, four bytes each, in the order they arrived.
@@ -65,6 +96,8 @@ interface midi-device {
 	/// behind it; refused on a receive endpoint, for a cable the endpoint does not carry, and for a batch that
 	/// is not a whole number of packets.
 	@op(6) send:      func(endpoint: u32, @bound(256) packets: list<u8>) -> result<unit, error>;
+	/// A `ump` endpoint's function blocks; none for a `midi1` endpoint.
+	@op(7) @bound(8) blocks: func(endpoint: u32) -> result<list<midi-device-block>, error>;
 }
 
 // ------------------------------------------------------------------ development only

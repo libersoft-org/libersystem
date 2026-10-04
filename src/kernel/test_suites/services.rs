@@ -130,6 +130,8 @@ fn input_service_streams_pointer_events() {
 	// NO TRUSTED KEYBOARD AND NO PROTECTED-INPUT HOLDER in this scenario: both tags travel, carrying nothing.
 	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
+	// And the activity root, which only the power policy is handed: none here.
+	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, raw_consumer).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
@@ -246,6 +248,8 @@ fn a_touch_surface_reports_contacts_and_not_a_cursor() {
 	// NO TRUSTED KEYBOARD AND NO PROTECTED-INPUT HOLDER in this scenario: both tags travel, carrying nothing.
 	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
+	// And the activity root, which only the power policy is handed: none here.
+	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("no usb pointer");
@@ -452,6 +456,8 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
+	// And the activity root, which only the power policy is handed: none here.
+	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
 	let mut catalogue = Catalogue { server: catalogue_server, pointer: None, touch: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new(), opened: alloc::vec::Vec::new() };
 	let pump = |catalogue: &mut Catalogue| {
 		for _ in 0..8 {
@@ -589,6 +595,8 @@ fn input_service_streams_keys_only_with_display_focus() {
 	send_cap(&boot_kernel, b"CATALOGUE", pointer_catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
+	// And the activity root, which only the power policy is handed: none here.
+	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&pointer_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
@@ -842,6 +850,8 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 	send_cap(&boot_kernel, b"TRUSTEDKEYS", trusted_keys_input, Rights::ALL).expect("trusted keys bootstrap");
 	send_cap(&boot_kernel, b"TRUSTED", trusted_root_input, Rights::ALL).expect("trusted input bootstrap");
+	// And the activity root, which only the power policy is handed: none here.
+	boot_kernel.send(object::channel::Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
 
 	let catalogue = core::cell::RefCell::new(Catalogue { server: catalogue_server, gamepads: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new() });
 	// PROVIDER A IS PUBLISHED BEFORE THE SERVICE STARTS, as a controller bound at boot is.
@@ -1468,6 +1478,8 @@ mod display_harness {
 		send_cap(&boot_kernel, b"STATS", stats_service, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("display stats bootstrap");
 		// And the protected-session root, which only AdminService is ever handed: none here.
 		boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
+		// And the outputs root, which only the power policy is handed: none here.
+		boot_kernel.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
 		sched::run_until_idle();
 		crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
@@ -2901,6 +2913,7 @@ fn process_service_resolves_one_final_executable_suffix() {
 	// swallows the next message instead of being skipped.
 	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new())).expect("empty registry bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	send_supervise_root(&boot_kernel).expect("supervise bootstrap");
 
 	for (corr, name) in [(1u32, &b"ping"[..]), (2, &b"ping.lsexe"[..]), (3, &b"ping.lsexe.lsexe"[..])] {
 		let mut start = alloc::vec::Vec::new();
@@ -3029,6 +3042,7 @@ fn config_set_survives_a_service_reboot() {
 	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL).expect("spawn StorageService");
 	send_cap(&storage_boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("BLOCK bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("SERVE bootstrap");
+	crate::tests::send_no_hibernation(&storage_boot_kernel);
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = crate::tests::whole_device_volume(CAPACITY as usize);
 	let mut online = false;
 	for _ in 0..100_000 {
@@ -3429,6 +3443,7 @@ fn pty_hosts_a_program() {
 	core::mem::drop(registry_server);
 	send_cap(&proc_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&proc_boot_kernel, b"SERVE", proc_server, Rights::ALL).expect("process serve bootstrap");
+	send_supervise_root(&proc_boot_kernel).expect("process supervise bootstrap");
 
 	send_cap(&boot_kernel, b"CLIENT", vt1_console_a, Rights::ALL).expect("CLIENT bootstrap");
 	send_cap(&boot_kernel, b"CONTROL", ctl_console, Rights::ALL).expect("CONTROL bootstrap");
@@ -3591,6 +3606,8 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	// cannot send until it has read everything before it.
 	display_boot_kernel.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("display stats bootstrap");
 	display_boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
+	// And the outputs root, which only the power policy is handed: none here.
+	display_boot_kernel.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&display_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 

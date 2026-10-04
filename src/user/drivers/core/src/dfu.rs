@@ -9,6 +9,10 @@
 // across by the executor that sent it, and only to a device that comes back in DFU mode where the runtime device
 // was, carrying its serial number if it had one (`same_device`). Anything else that arrives there is not it.
 //
+// AN UPLOAD READS THE FIRMWARE OUT - a backup, asked for explicitly and confirmed like a download, from a device that
+// declares `bitCanUpload` alone. Its blocks come back until one is short, and a device that sends more than the bound
+// the person confirmed is stopped there and nothing it sent is kept (`upload_step`).
+//
 // THE SUFFIX IS THE ONLY METADATA THE CLASS HAS. DFU 1.1 files end in sixteen bytes naming the device, the vendor
 // and the product the image is for, and a CRC over everything before it. Where an image carries one it is held
 // against the target and checked, and a mismatch refuses the image; where it carries none there is nothing to
@@ -92,6 +96,11 @@ impl Binding {
 		self.attributes & ATTR_CAN_DOWNLOAD != 0
 	}
 
+	/// Whether the device's firmware can be read out of it in DFU mode.
+	pub fn can_upload(&self) -> bool {
+		self.attributes & ATTR_CAN_UPLOAD != 0
+	}
+
 	/// Whether the device leaves the bus by itself after a detach, rather than waiting for the host to reset it.
 	pub fn will_detach(&self) -> bool {
 		self.attributes & ATTR_WILL_DETACH != 0
@@ -136,6 +145,50 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	}
 	let mode = if setting.protocol == PROTOCOL_DFU_MODE { Mode::Dfu } else { Mode::Runtime };
 	Ok(Binding { config_value: parsed.value, interface: setting.interface, alternate: setting.alternate, mode, attributes, detach_timeout_ms, transfer_size: transfer_size.min(MAX_TRANSFER), version })
+}
+
+/// The largest image an upload reads: a mebibyte, held in the controller's process until it is handed over.
+pub const MAX_UPLOAD: u32 = 1 << 20;
+/// The longest file name an upload's parameters carry.
+pub const MAX_UPLOAD_NAME: usize = 200;
+
+/// AN UPLOAD'S PARAMETERS: the bound, four bytes little-endian, then the file the requester names for the image, in
+/// UTF-8 - what the protected screen shows. `None` for a bound of zero or past `MAX_UPLOAD`, and for a name that is
+/// empty, too long or not UTF-8.
+pub fn upload_parameters(parameters: &[u8]) -> Option<(u32, &str)> {
+	let (bound, name) = parameters.split_first_chunk::<4>()?;
+	let bound = u32::from_le_bytes(*bound);
+	let name = core::str::from_utf8(name).ok()?;
+	(bound != 0 && bound <= MAX_UPLOAD && !name.is_empty() && name.len() <= MAX_UPLOAD_NAME).then_some((bound, name))
+}
+
+/// The parameters `upload_parameters` reads.
+pub fn upload_request(bound: u32, name: &str) -> Vec<u8> {
+	let mut out = Vec::from(bound.to_le_bytes());
+	out.extend_from_slice(name.as_bytes());
+	out
+}
+
+/// Where an upload stands after one block's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upload {
+	/// A whole block, inside the bound: ask for the next.
+	More,
+	/// A short block - the device's end - and the image inside the bound.
+	Done,
+	/// The device sent more than the bound: stop it, and keep nothing.
+	PastBound,
+}
+
+/// ONE BLOCK'S ANSWER: `read` bytes kept so far, `received` in this block of `block` asked for, against `bound`.
+pub fn upload_step(read: usize, received: usize, block: usize, bound: u32) -> Upload {
+	if read + received > bound as usize {
+		Upload::PastBound
+	} else if received < block {
+		Upload::Done
+	} else {
+		Upload::More
+	}
 }
 
 /// A GETSTATUS answer.

@@ -27,7 +27,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{AdminAction, AdminAnswer, AdminDescriptor, AdminEvent, AdminGrant, AdminJournalFault, AdminJournalPage, AdminPrepared, AdminRecord, AdminRequestArgs, AdminResult, AdminScope, Error, OpenOpts, ProviderInfo, ProviderKind, Timestamp, TrustedInput, TrustedInputKind, TrustedScreen, WriterMode, admin_authority, admin_executor, admin_factory, admin_journal, admin_request, admin_test, display_trusted, input_trusted, provider_catalogue, time, volume, writer};
+use proto::system::{AdminAction, AdminAnswer, AdminDescriptor, AdminEvent, AdminGrant, AdminImage, AdminJournalFault, AdminJournalPage, AdminPrepared, AdminRead, AdminRecord, AdminRequestArgs, AdminResult, AdminScope, Error, OpenOpts, ProviderInfo, ProviderKind, Timestamp, TrustedInput, TrustedInputKind, TrustedScreen, WriterMode, admin_authority, admin_executor, admin_factory, admin_journal, admin_request, admin_test, display_trusted, input_trusted, provider_catalogue, time, volume, writer};
 use rt::*;
 use service_logic::admin_broker::{self as ab, Effect, Event, Outcome};
 use service_logic::admin_descriptor::{self as ad, Action, Asked, Descriptor};
@@ -57,7 +57,8 @@ const TIME_REFRESH_TICKS: u64 = 6000;
 // Margin past an executor's own deadline before its silence is an unknown outcome.
 const EXECUTE_MARGIN_TICKS: u64 = 100;
 
-// THE REGISTERED EXECUTORS, by the action each carries out: its publication name. The firmware adapter's
+// THE REGISTERED EXECUTORS, by the actions each carries out: its publication name. The DFU executor carries two - an
+// image written to a target, and one read out of it. The firmware adapter's
 // slot is named and nothing publishes under it until the USB driver set's DFU class module does, so until
 // then that action is declined. The probe's exists in a development image alone - the executor that serves
 // it is a development fixture - and a shipping build does not name it at all.
@@ -69,16 +70,16 @@ const BMC_CHASSIS_EXECUTOR: &[u8] = b"org.libersystem.admin-bmc-chassis";
 #[cfg(feature = "development")]
 const PROBE_EXECUTOR: &[u8] = b"org.libersystem.admin-probe";
 
-fn action_of(name: &[u8]) -> Option<Action> {
+fn actions_of(name: &[u8]) -> &'static [Action] {
 	#[cfg(feature = "development")]
 	if name == PROBE_EXECUTOR {
-		return Some(Action::ProbeWrite);
+		return &[Action::ProbeWrite];
 	}
 	match name {
-		DFU_EXECUTOR => Some(Action::FirmwareDownload),
-		BMC_SEL_EXECUTOR => Some(Action::BmcSelClear),
-		BMC_CHASSIS_EXECUTOR => Some(Action::BmcChassisControl),
-		_ => None,
+		DFU_EXECUTOR => &[Action::FirmwareDownload, Action::FirmwareUpload],
+		BMC_SEL_EXECUTOR => &[Action::BmcSelClear],
+		BMC_CHASSIS_EXECUTOR => &[Action::BmcChassisControl],
+		_ => &[],
 	}
 }
 
@@ -183,6 +184,7 @@ fn action_wire(action: Action) -> AdminAction {
 		Action::ProbeWrite => AdminAction::ProbeWrite,
 		Action::BmcSelClear => AdminAction::BmcSelClear,
 		Action::BmcChassisControl => AdminAction::BmcChassisControl,
+		Action::FirmwareUpload => AdminAction::FirmwareUpload,
 	}
 }
 
@@ -192,6 +194,7 @@ fn action_from(action: AdminAction) -> Action {
 		AdminAction::ProbeWrite => Action::ProbeWrite,
 		AdminAction::BmcSelClear => Action::BmcSelClear,
 		AdminAction::BmcChassisControl => Action::BmcChassisControl,
+		AdminAction::FirmwareUpload => Action::FirmwareUpload,
 	}
 }
 
@@ -259,7 +262,7 @@ struct Executor {
 	key: u32,
 	info: ProviderInfo,
 	chan: u64,
-	action: Action,
+	actions: &'static [Action],
 	next_corr: u32,
 	sent: Vec<(u32, Sent)>,
 }
@@ -285,6 +288,8 @@ struct GrantConn {
 	request: ab::RequestId,
 	chan: u64,
 	call: Option<u32>,
+	// Whether the waiting call is `execute-read`, answered with what the operation read.
+	reads: bool,
 }
 
 // The protected session: its epoch, what it shows, and what the display and the keyboard have acknowledged.
@@ -356,6 +361,11 @@ struct Service {
 	grants: Vec<GrantConn>,
 	// A request's payload, until its preparation carries it to the executor.
 	payloads: Vec<(ab::RequestId, u64)>,
+	// WHAT A COMPLETED OPERATION THAT READS HANDED OVER, from the executor's answer until the grant's: the image, read-only.
+	images: Vec<(ab::RequestId, AdminImage)>,
+	// AND WHAT ITS COMPLETION'S RECORD STATES - its length and SHA-256 - until that record is written, which may be after
+	// the grant was answered and the image handed over.
+	read_results: Vec<(ab::RequestId, u32, Vec<u8>)>,
 	// An executor's own operation deadline, from its preparation; and a dispatch's, once sent.
 	operation_ms: Vec<(ab::RequestId, u32)>,
 	dispatched: Vec<(ab::RequestId, u64)>,
@@ -450,13 +460,19 @@ impl admin_request::Service for RequestView {
 	}
 }
 
+// `Some(reads)`: a call was made - `execute-read` when `reads`.
 struct GrantView {
-	asked: bool,
+	asked: Option<bool>,
 }
 
 impl admin_authority::Service for GrantView {
 	fn execute(&mut self) -> Result<AdminResult, Error> {
-		self.asked = true;
+		self.asked = Some(false);
+		Err(Error::Again)
+	}
+
+	fn execute_read(&mut self) -> Result<AdminRead, Error> {
+		self.asked = Some(true);
 		Err(Error::Again)
 	}
 }
@@ -522,7 +538,7 @@ impl Service {
 	}
 
 	fn executor_for(&self, action: Action) -> Option<usize> {
-		self.executors.iter().position(|executor| executor.action == action)
+		self.executors.iter().position(|executor| executor.actions.contains(&action))
 	}
 
 	// PREPARATION: the journal must be able to promise the request's records, an executor must serve its
@@ -589,10 +605,15 @@ impl Service {
 			// NEVER SENT, so nothing was attempted: a failure, with certainty.
 			return self.step(|broker, now, effects| broker.executed(request, Outcome::Failed, now, effects));
 		};
+		let reads = self.broker.request(request).is_some_and(|held| held.asked.action.reads());
 		let executor = &mut self.executors[at];
 		let corr = next(&mut executor.next_corr);
 		if !post(executor.chan, corr, |capture| {
-			let _ = admin_executor::Client::new(capture).execute(&operation, &epoch);
+			if reads {
+				let _ = admin_executor::Client::new(capture).execute_read(&operation, &epoch);
+			} else {
+				let _ = admin_executor::Client::new(capture).execute(&operation, &epoch);
+			}
 		}) {
 			return self.step(|broker, now, effects| broker.executed(request, Outcome::Failed, now, effects));
 		}
@@ -637,13 +658,17 @@ impl Service {
 			answer(chan, corr, Ok(AdminAnswer::Declined), |value, w| value.write(w));
 			return;
 		}
-		self.grants.push(GrantConn { request, chan: mine, call: None });
+		self.grants.push(GrantConn { request, chan: mine, call: None, reads: false });
 		answer(chan, corr, Ok(AdminAnswer::Granted(AdminGrant { grant: narrowed as u64, descriptor })), |value, w| value.write(w));
 	}
 
 	fn close_grant(&mut self, request: ab::RequestId) {
 		let Some(at) = self.grants.iter().position(|grant| grant.request == request) else { return };
 		let grant = self.grants.remove(at);
+		// AN IMAGE NOBODY WILL BE HANDED goes with the grant.
+		if let Some(place) = self.images.iter().position(|(held, _)| *held == request) {
+			close(self.images.remove(place).1.image);
+		}
 		// A REDEMPTION STILL WAITING is answered before its channel goes.
 		if let Some(corr) = grant.call {
 			answer::<AdminResult>(grant.chan, corr, Err(Error::Denied), |_, _| Some(()));
@@ -655,8 +680,37 @@ impl Service {
 
 	fn redeemed(&mut self, request: ab::RequestId, outcome: Option<Outcome>) {
 		self.dispatched.retain(|(held, _)| *held != request);
-		let Some(grant) = self.grants.iter_mut().find(|grant| grant.request == request) else { return };
-		let Some(corr) = grant.call.take() else { return };
+		let image = self.images.iter().position(|(held, _)| *held == request).map(|place| self.images.remove(place).1);
+		let Some(grant) = self.grants.iter_mut().find(|grant| grant.request == request) else {
+			if let Some(image) = image {
+				close(image.image);
+			}
+			return;
+		};
+		let Some(corr) = grant.call.take() else {
+			if let Some(image) = image {
+				close(image.image);
+			}
+			return;
+		};
+		// AN OPERATION THAT READS IS ANSWERED WITH WHAT IT READ, and with nothing for any other end.
+		if grant.reads {
+			let result = match (outcome, image) {
+				(Some(Outcome::Completed), Some(image)) => Ok(AdminRead::Completed(image)),
+				(Some(Outcome::Completed) | Some(Outcome::Failed), None) => Ok(AdminRead::Failed),
+				(Some(Outcome::Unknown), None) => Ok(AdminRead::OutcomeUnknown),
+				(None, None) => Err(Error::Denied),
+				(_, Some(image)) => {
+					close(image.image);
+					if outcome.is_none() { Err(Error::Denied) } else { Ok(AdminRead::Failed) }
+				}
+			};
+			answer(grant.chan, corr, result, |value, w| value.write(w));
+			return;
+		}
+		if let Some(image) = image {
+			close(image.image);
+		}
 		let result = match outcome {
 			Some(Outcome::Completed) => Ok(AdminResult::Completed),
 			Some(Outcome::Failed) => Ok(AdminResult::Failed),
@@ -671,11 +725,26 @@ impl Service {
 	// ONE RECORD, built from what the broker knows of the request, pushed behind whatever is waiting. The
 	// wall clock goes with it only as TimeService last reported it, and says so.
 	fn record(&mut self, request: ab::RequestId, event: Event, reason: &'static str) {
+		// WHAT A COMPLETED READ HANDED OVER, in its completion's record: its length, and its SHA-256.
+		let (result_length, result_digest) = match self.read_results.iter().position(|(held, ..)| *held == request) {
+			Some(at) if event == Event::Completed => {
+				let (_, length, digest) = self.read_results.remove(at);
+				(length, digest)
+			}
+			_ => (0, Vec::new()),
+		};
+		let reason: String = if result_digest.is_empty() { String::from(reason) } else { format!("read {result_length} bytes") };
 		// EVERY DECISION IS ALSO SAID, as it is recorded: the line is a diagnostic and the journal is the record.
 		let mut line = format!("AdminService: request {request} {}", event_name(event));
 		if !reason.is_empty() {
 			line.push_str(": ");
-			line.push_str(reason);
+			line.push_str(&reason);
+		}
+		if !result_digest.is_empty() {
+			line.push_str(", SHA-256 ");
+			for byte in &result_digest {
+				line.push_str(&format!("{byte:02x}"));
+			}
 		}
 		line.push('\n');
 		print(line.as_bytes());
@@ -688,7 +757,7 @@ impl Service {
 			Some((unix, at)) => (Some(unix + clock().saturating_sub(at) / 100), String::from("time-service")),
 			None => (None, String::new()),
 		};
-		let mut record = AdminRecord { sequence, broker_epoch: self.broker.epoch, request, launch, requester, action, digest, event: event_wire(event), reason: bounded(reason, 64), monotonic_ns: clock_ns(), utc_seconds, utc_provenance };
+		let mut record = AdminRecord { sequence, broker_epoch: self.broker.epoch, request, launch, requester, action, digest, event: event_wire(event), reason: bounded(&reason, 64), monotonic_ns: clock_ns(), utc_seconds, utc_provenance, result_length, result_digest };
 		let bytes = match record.encode_vec().and_then(|encoded| aj::frame(&encoded).ok()) {
 			Some(bytes) => bytes,
 			// A RECORD PAST ITS BOUND carries a bounded refusal instead of what would not fit.
@@ -1247,11 +1316,12 @@ impl Service {
 	// ------------------------------------------------------------------ executors
 
 	fn adopt(&mut self, info: ProviderInfo) {
-		let Some(action) = action_of(info.name.as_bytes()) else {
+		let actions = actions_of(info.name.as_bytes());
+		if actions.is_empty() {
 			print(b"AdminService: a publication under a name no action is registered to was not adopted\n");
 			return;
-		};
-		if self.executor_for(action).is_some() {
+		}
+		if actions.iter().any(|&action| self.executor_for(action).is_some()) {
 			print(b"AdminService: a second executor for one action was refused\n");
 			return;
 		}
@@ -1261,10 +1331,9 @@ impl Service {
 		};
 		let key = self.next_executor;
 		self.next_executor = self.next_executor.wrapping_add(1).max(1);
-		self.executors.push(Executor { key, info, chan, action, next_corr: 1, sent: Vec::new() });
-		print(b"AdminService: an executor was registered for ");
-		print(action.name().as_bytes());
-		print(b"\n");
+		self.executors.push(Executor { key, info, chan, actions, next_corr: 1, sent: Vec::new() });
+		let names: Vec<&str> = actions.iter().map(|action| action.name()).collect();
+		print(format!("AdminService: an executor was registered for {}\n", names.join(", ")).as_bytes());
 	}
 
 	fn lose_executor(&mut self, key: u32) {
@@ -1285,13 +1354,21 @@ impl Service {
 				PolledCaps::Empty => return true,
 				PolledCaps::Closed => return false,
 			};
-			for &handle in handles.as_slice() {
-				close(handle);
-			}
-			let Some(at) = self.executors.iter().position(|executor| executor.key == key) else { return true };
-			let Some((corr, ok, mut reader)) = reply_head(&buf[..len], &handles) else { return false };
-			let Some(place) = self.executors[at].sent.iter().position(|(sent, _)| *sent == corr) else { continue };
+			let Some(at) = self.executors.iter().position(|executor| executor.key == key) else {
+				close_except(&handles, &[]);
+				return true;
+			};
+			let Some((corr, ok, mut reader)) = reply_head(&buf[..len], &handles) else {
+				close_except(&handles, &[]);
+				return false;
+			};
+			let Some(place) = self.executors[at].sent.iter().position(|(sent, _)| *sent == corr) else {
+				close_except(&handles, &[]);
+				continue;
+			};
 			let (_, sent) = self.executors[at].sent.remove(place);
+			// THE ONE CAPABILITY AN ANSWER MAY CARRY: a completed read's image, kept until the grant is answered.
+			let mut kept: Option<u64> = None;
 			match sent {
 				Sent::Prepare(request) => {
 					let prepared = if ok { AdminPrepared::read(&mut reader) } else { None };
@@ -1314,20 +1391,34 @@ impl Service {
 				}
 				Sent::Revalidate(request) => self.step(|broker, now, effects| broker.revalidated(request, ok, now, effects)),
 				Sent::Execute(request) => {
-					let outcome = if ok {
+					let reads = self.broker.request(request).is_some_and(|held| held.asked.action.reads());
+					let outcome = if !ok {
+						// REFUSED UNDER ITS START GUARD: nothing was attempted.
+						Outcome::Failed
+					} else if reads {
+						match AdminRead::read(&mut reader) {
+							// AN IMAGE AS AN IMAGE IS STATED, or none: a whole digest, a length inside the object.
+							Some(AdminRead::Completed(image)) if image.digest.len() == ad::DIGEST && image.length <= ad::MAX_UPLOAD && object_info(image.image).is_some_and(|info| info.size >= u64::from(image.length)) => {
+								kept = Some(image.image);
+								self.read_results.push((request, image.length, image.digest.clone()));
+								self.images.push((request, image));
+								Outcome::Completed
+							}
+							Some(AdminRead::Completed(_)) | Some(AdminRead::Failed) => Outcome::Failed,
+							_ => Outcome::Unknown,
+						}
+					} else {
 						match AdminResult::read(&mut reader) {
 							Some(AdminResult::Completed) => Outcome::Completed,
 							Some(AdminResult::Failed) => Outcome::Failed,
 							_ => Outcome::Unknown,
 						}
-					} else {
-						// REFUSED UNDER ITS START GUARD: nothing was attempted.
-						Outcome::Failed
 					};
 					self.step(|broker, now, effects| broker.executed(request, outcome, now, effects));
 				}
 				Sent::Release => {}
 			}
+			close_except(&handles, kept.as_slice());
 		}
 	}
 
@@ -1515,7 +1606,7 @@ impl Service {
 					return;
 				}
 			};
-			let mut view = GrantView { asked: false };
+			let mut view = GrantView { asked: None };
 			let mut reply_handles = Handles::new();
 			let written = admin_authority::dispatch(&mut view, &buf[..len], &mut handles, reply_buf, &mut reply_handles);
 			for &leftover in handles.as_slice() {
@@ -1525,10 +1616,16 @@ impl Service {
 				close(leftover);
 			}
 			let corr = if len >= 6 { u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]) } else { 0 };
-			if !view.asked {
+			let Some(reads) = view.asked else {
 				if let Some(written) = written {
 					let _ = try_send(chan, &reply_buf[..written], 0);
 				}
+				continue;
+			};
+			// THE CALL OF THE OTHER KIND - `execute` for an operation that reads, or `execute-read` for one that does not -
+			// is refused and consumes nothing: the operation confirmed is one or the other.
+			if self.broker.request(request).is_some_and(|held| held.asked.action.reads()) != reads {
+				answer::<AdminResult>(chan, corr, Err(Error::Invalid), |_, _| Some(()));
 				continue;
 			}
 			// EXECUTE. A second call while the first waits, a spent grant, an expired one, or one whose owner has
@@ -1539,6 +1636,7 @@ impl Service {
 			if admitted {
 				if let Some(grant) = self.grants.iter_mut().find(|grant| grant.request == request) {
 					grant.call = Some(corr);
+					grant.reads = reads;
 				}
 			} else {
 				answer::<AdminResult>(chan, corr, Err(Error::Denied), |_, _| Some(()));
@@ -1801,7 +1899,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// declined.
 	broker.path = display_root != 0 && events != 0;
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::AdminExecutor).unwrap_or(0) } else { 0 };
-	let mut service = Service { broker, journal, executors: Vec::new(), conns: Vec::new(), grants: Vec::new(), payloads: Vec::new(), operation_ms: Vec::new(), dispatched: Vec::new(), owed: Vec::new(), writing: None, retry_at: 0, fault: AdminJournalFault::None, held: None, reads: Vec::new(), vol_calls: Vec::new(), session: None, sessions: 0, display_calls: Vec::new(), input_calls: Vec::new(), volume: journal_root, display: display_root, input: input_root, events, time: time_root, catalogue, vol_corr: 1, display_corr: 1, input_corr: 1, time_corr: 1, time_asked: None, time_at: 0, utc: None, next_executor: 1 };
+	let mut service = Service { broker, journal, executors: Vec::new(), conns: Vec::new(), grants: Vec::new(), payloads: Vec::new(), images: Vec::new(), read_results: Vec::new(), operation_ms: Vec::new(), dispatched: Vec::new(), owed: Vec::new(), writing: None, retry_at: 0, fault: AdminJournalFault::None, held: None, reads: Vec::new(), vol_calls: Vec::new(), session: None, sessions: 0, display_calls: Vec::new(), input_calls: Vec::new(), volume: journal_root, display: display_root, input: input_root, events, time: time_root, catalogue, vol_corr: 1, display_corr: 1, input_corr: 1, time_corr: 1, time_asked: None, time_at: 0, utc: None, next_executor: 1 };
 	{
 		let mut line = format!("AdminService: online, epoch {}, {} journal records recovered", service.broker.epoch, recovered);
 		if !service.broker.path {

@@ -26,12 +26,36 @@ fn midi_device_direction_wire_is_stable() {
 	assert_eq!(MidiDeviceDirection::decode(&bytes).unwrap(), sample);
 }
 #[test]
-fn midi_device_endpoint_wire_is_stable() {
-	let sample = MidiDeviceEndpoint { index: 7, name: String::from("x"), cables: 7, direction: MidiDeviceDirection::Receive };
+fn midi_device_protocol_wire_is_stable() {
+	let sample = MidiDeviceProtocol::Midi1;
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 120, 7, 1];
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(MidiDeviceProtocol::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn midi_device_endpoint_wire_is_stable() {
+	let sample = MidiDeviceEndpoint { index: 7, name: String::from("x"), cables: 7, direction: MidiDeviceDirection::Receive, protocol: MidiDeviceProtocol::Midi1 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 120, 7, 1, 1];
 	assert_eq!(bytes, golden);
 	assert_eq!(MidiDeviceEndpoint::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn midi_device_block_direction_wire_is_stable() {
+	let sample = MidiDeviceBlockDirection::Receives;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(MidiDeviceBlockDirection::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn midi_device_block_wire_is_stable() {
+	let sample = MidiDeviceBlock { id: 7, name: String::from("x"), first_group: 7, groups: 7, direction: MidiDeviceBlockDirection::Receives, protocol: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 1, 0, 120, 7, 7, 1, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(MidiDeviceBlock::decode(&bytes).unwrap(), sample);
 }
 #[test]
 fn midi_packet_batch_wire_is_stable() {

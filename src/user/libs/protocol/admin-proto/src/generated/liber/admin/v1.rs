@@ -41,6 +41,8 @@ pub enum AdminAction {
 	BmcSelClear = 3,
 	/// A BMC chassis control: power down, power cycle, hard reset or soft shutdown.
 	BmcChassisControl = 4,
+	/// Read a DFU target's firmware out, for the requester to keep - from a target that declares upload alone.
+	FirmwareUpload = 5,
 }
 
 impl AdminAction {
@@ -87,6 +89,7 @@ impl AdminAction {
 			2 => Some(AdminAction::ProbeWrite),
 			3 => Some(AdminAction::BmcSelClear),
 			4 => Some(AdminAction::BmcChassisControl),
+			5 => Some(AdminAction::FirmwareUpload),
 			_ => None,
 		}
 	}
@@ -471,6 +474,153 @@ impl AdminResult {
 	}
 }
 
+/// WHAT AN OPERATION THAT READS READ, handed to the requester READ-ONLY: it maps the bytes and can change none of them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminImage {
+	pub image: u64,
+	/// How many of the object's bytes are the image.
+	pub length: u32,
+	/// SHA-256 of those bytes, as the operation's record states it.
+	pub digest: Vec<u8>,
+}
+
+impl AdminImage {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AdminImage> {
+		let mut r = Reader::new(bytes);
+		let value = AdminImage::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AdminImage> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AdminImage::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.set_handle(self.image)?;
+		w.u32(0)?;
+		w.u32(self.length)?;
+		if self.digest.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.digest.len() as u16)?;
+		for v14 in self.digest.iter() {
+			w.u8(*v14)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AdminImage> {
+		let image = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
+		let length = r.u32()?;
+		let digest = {
+			let v15 = r.u16()? as usize;
+			let v15 = (v15 <= 32).then_some(v15)?;
+			let mut v16 = Vec::new();
+			v16.try_reserve_exact(v15).ok()?;
+			for _ in 0..v15 {
+				v16.push(r.u8()?);
+			}
+			v16
+		};
+		Some(AdminImage { image, length, digest })
+	}
+}
+
+/// AN OPERATION THAT READS: its result, and - for a completed one alone - what it read.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AdminRead {
+	Completed(AdminImage),
+	Failed,
+	/// Dispatched, and its end not observed. Nothing is handed over, and it is never retried.
+	OutcomeUnknown,
+}
+
+impl AdminRead {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AdminRead> {
+		let mut r = Reader::new(bytes);
+		let value = AdminRead::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AdminRead> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AdminRead::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			AdminRead::Completed(v17) => {
+				w.u8(0)?;
+				v17.write(w)?;
+			}
+			AdminRead::Failed => {
+				w.u8(1)?;
+			}
+			AdminRead::OutcomeUnknown => {
+				w.u8(2)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AdminRead> {
+		match r.u8()? {
+			0 => Some(AdminRead::Completed(AdminImage::read(r)?)),
+			1 => Some(AdminRead::Failed),
+			2 => Some(AdminRead::OutcomeUnknown),
+			_ => None,
+		}
+	}
+}
+
 /// ONE REQUEST AT A TIME ON A CONNECTION. `request` is answered when it is decided.
 // interface `admin-request` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod admin_request {
@@ -528,13 +678,13 @@ pub mod admin_request {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v14) => {
+						Ok(v18) => {
 							w.u8(1)?;
-							v14.write(w)?;
+							v18.write(w)?;
 						}
-						Err(v15) => {
+						Err(v19) => {
 							w.u8(0)?;
-							v15.write(w)?;
+							v19.write(w)?;
 						}
 					}
 					Some(())
@@ -564,12 +714,12 @@ pub mod admin_request {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v16) => {
+						Ok(v20) => {
 							w.u8(1)?;
 						}
-						Err(v17) => {
+						Err(v21) => {
 							w.u8(0)?;
-							v17.write(w)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -761,7 +911,8 @@ pub mod admin_request {
 	}
 }
 
-/// A GRANT'S CHANNEL. `execute` is the one attempt at the confirmed operation.
+/// A GRANT'S CHANNEL. `execute` is the one attempt at the confirmed operation - `execute-read` for an operation that
+/// READS (`firmware-upload`), with what it read. The call of the other kind is refused and consumes nothing.
 // interface `admin-authority` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod admin_authority {
 	use super::*;
@@ -769,9 +920,11 @@ pub mod admin_authority {
 	use alloc::vec::Vec;
 
 	pub const OP_EXECUTE: u16 = 1;
+	pub const OP_EXECUTE_READ: u16 = 2;
 
 	pub trait Service {
 		fn execute(&mut self) -> Result<AdminResult, Error>;
+		fn execute_read(&mut self) -> Result<AdminRead, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -802,13 +955,49 @@ pub mod admin_authority {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v18) => {
+						Ok(v22) => {
 							w.u8(1)?;
-							v18.write(w)?;
+							v22.write(w)?;
 						}
-						Err(v19) => {
+						Err(v23) => {
 							w.u8(0)?;
-							v19.write(w)?;
+							v23.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_EXECUTE_READ => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.execute_read();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v24) => {
+							w.u8(1)?;
+							v24.write(w)?;
+						}
+						Err(v25) => {
+							w.u8(0)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -946,6 +1135,38 @@ pub mod admin_authority {
 			}
 			decoded
 		}
+		pub fn execute_read(&mut self) -> Option<Result<AdminRead, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_EXECUTE_READ)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(AdminRead::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -954,6 +1175,14 @@ pub mod admin_authority {
 	fn channel_invoke_execute(chan: u64) -> Option<Result<AdminResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.execute()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_admin_admin_authority_execute_read")]
+	fn channel_invoke_execute_read(chan: u64) -> Option<Result<AdminRead, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.execute_read()
 	}
 }
 
@@ -1004,26 +1233,26 @@ impl AdminScope {
 			return None;
 		}
 		w.u16(self.actions.len() as u16)?;
-		for v20 in self.actions.iter() {
-			v20.write(w)?;
+		for v26 in self.actions.iter() {
+			v26.write(w)?;
 		}
 		w.bytes_lp(self.target_prefix.as_bytes())?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<AdminScope> {
 		let actions = {
-			let v21 = r.u16()? as usize;
-			let v21 = (v21 <= 2).then_some(v21)?;
-			let mut v22 = Vec::new();
-			v22.try_reserve_exact(v21).ok()?;
-			for _ in 0..v21 {
-				v22.push(AdminAction::read(r)?);
+			let v27 = r.u16()? as usize;
+			let v27 = (v27 <= 2).then_some(v27)?;
+			let mut v28 = Vec::new();
+			v28.try_reserve_exact(v27).ok()?;
+			for _ in 0..v27 {
+				v28.push(AdminAction::read(r)?);
 			}
-			v22
+			v28
 		};
 		let target_prefix = {
-			let v23 = r.string_lp()?;
-			(v23.len() <= 64).then_some(v23)?
+			let v29 = r.string_lp()?;
+			(v29.len() <= 64).then_some(v29)?
 		};
 		Some(AdminScope { actions, target_prefix })
 	}
@@ -1065,8 +1294,8 @@ pub mod admin_factory {
 		match op {
 			OP_MINT => {
 				let component = {
-					let v24 = r.string_lp()?;
-					(v24.len() <= 64).then_some(v24)?
+					let v30 = r.string_lp()?;
+					(v30.len() <= 64).then_some(v30)?
 				};
 				let scope = AdminScope::read(r)?;
 				let launch = r.u64()?;
@@ -1089,14 +1318,14 @@ pub mod admin_factory {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v25) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							w.set_handle(*v25)?;
+							w.set_handle(*v31)?;
 							w.u32(0)?;
 						}
-						Err(v26) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v26.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -1327,12 +1556,15 @@ pub mod admin_executor {
 	pub const OP_REVALIDATE: u16 = 2;
 	pub const OP_EXECUTE: u16 = 3;
 	pub const OP_CANCEL: u16 = 4;
+	pub const OP_EXECUTE_READ: u16 = 5;
 
 	pub trait Service {
 		fn prepare(&mut self, action: AdminAction, target: String, parameters: Vec<u8>, payload_length: u32, payload: u64) -> Result<AdminPrepared, Error>;
 		fn revalidate(&mut self, operation: u64) -> Result<(), Error>;
 		fn execute(&mut self, operation: u64, epoch: u64) -> Result<AdminResult, Error>;
 		fn cancel(&mut self, operation: u64) -> Result<(), Error>;
+		/// The one attempt at an operation that READS, under the same start guard: what it read, made read-only.
+		fn execute_read(&mut self, operation: u64, epoch: u64) -> Result<AdminRead, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1358,18 +1590,18 @@ pub mod admin_executor {
 			OP_PREPARE => {
 				let action = AdminAction::read(r)?;
 				let target = {
-					let v27 = r.string_lp()?;
-					(v27.len() <= 64).then_some(v27)?
+					let v33 = r.string_lp()?;
+					(v33.len() <= 64).then_some(v33)?
 				};
 				let parameters = {
-					let v28 = r.u16()? as usize;
-					let v28 = (v28 <= 256).then_some(v28)?;
-					let mut v29 = Vec::new();
-					v29.try_reserve_exact(v28).ok()?;
-					for _ in 0..v28 {
-						v29.push(r.u8()?);
+					let v34 = r.u16()? as usize;
+					let v34 = (v34 <= 256).then_some(v34)?;
+					let mut v35 = Vec::new();
+					v35.try_reserve_exact(v34).ok()?;
+					for _ in 0..v34 {
+						v35.push(r.u8()?);
 					}
-					v29
+					v35
 				};
 				let payload_length = r.u32()?;
 				let payload = {
@@ -1391,13 +1623,13 @@ pub mod admin_executor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v30) => {
+						Ok(v36) => {
 							w.u8(1)?;
-							v30.write(w)?;
+							v36.write(w)?;
 						}
-						Err(v31) => {
+						Err(v37) => {
 							w.u8(0)?;
-							v31.write(w)?;
+							v37.write(w)?;
 						}
 					}
 					Some(())
@@ -1428,12 +1660,12 @@ pub mod admin_executor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v32) => {
+						Ok(v38) => {
 							w.u8(1)?;
 						}
-						Err(v33) => {
+						Err(v39) => {
 							w.u8(0)?;
-							v33.write(w)?;
+							v39.write(w)?;
 						}
 					}
 					Some(())
@@ -1465,13 +1697,13 @@ pub mod admin_executor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v34) => {
+						Ok(v40) => {
 							w.u8(1)?;
-							v34.write(w)?;
+							v40.write(w)?;
 						}
-						Err(v35) => {
+						Err(v41) => {
 							w.u8(0)?;
-							v35.write(w)?;
+							v41.write(w)?;
 						}
 					}
 					Some(())
@@ -1502,12 +1734,50 @@ pub mod admin_executor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v36) => {
+						Ok(v42) => {
 							w.u8(1)?;
 						}
-						Err(v37) => {
+						Err(v43) => {
 							w.u8(0)?;
-							v37.write(w)?;
+							v43.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_EXECUTE_READ => {
+				let operation = r.u64()?;
+				let epoch = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.execute_read(operation, epoch);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v44) => {
+							w.u8(1)?;
+							v44.write(w)?;
+						}
+						Err(v45) => {
+							w.u8(0)?;
+							v45.write(w)?;
 						}
 					}
 					Some(())
@@ -1625,8 +1895,8 @@ pub mod admin_executor {
 				return None;
 			}
 			w.u16(parameters.len() as u16)?;
-			for v38 in parameters.iter() {
-				w.u8(*v38)?;
+			for v46 in parameters.iter() {
+				w.u8(*v46)?;
 			}
 			w.u32(*payload_length)?;
 			w.set_handle(*payload)?;
@@ -1757,6 +2027,40 @@ pub mod admin_executor {
 			}
 			decoded
 		}
+		pub fn execute_read(&mut self, operation: &u64, epoch: &u64) -> Option<Result<AdminRead, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_EXECUTE_READ)?;
+			w.u32(corr)?;
+			w.u64(*operation)?;
+			w.u64(*epoch)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(AdminRead::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1789,6 +2093,14 @@ pub mod admin_executor {
 	fn channel_invoke_cancel(chan: u64, operation: &u64) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.cancel(operation)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_admin_admin_executor_execute_read")]
+	fn channel_invoke_execute_read(chan: u64, operation: &u64, epoch: &u64) -> Option<Result<AdminRead, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.execute_read(operation, epoch)
 	}
 }
 
@@ -1873,6 +2185,9 @@ pub struct AdminRecord {
 	pub monotonic_ns: u64,
 	pub utc_seconds: Option<u64>,
 	pub utc_provenance: String,
+	/// What a completed operation that READS handed over: its length and SHA-256. Zero and empty otherwise.
+	pub result_length: u32,
+	pub result_digest: Vec<u8>,
 }
 
 impl AdminRecord {
@@ -1921,22 +2236,30 @@ impl AdminRecord {
 			return None;
 		}
 		w.u16(self.digest.len() as u16)?;
-		for v39 in self.digest.iter() {
-			w.u8(*v39)?;
+		for v47 in self.digest.iter() {
+			w.u8(*v47)?;
 		}
 		self.event.write(w)?;
 		w.bytes_lp(self.reason.as_bytes())?;
 		w.u64(self.monotonic_ns)?;
 		match &self.utc_seconds {
-			Some(v40) => {
+			Some(v48) => {
 				w.u8(1)?;
-				w.u64(*v40)?;
+				w.u64(*v48)?;
 			}
 			None => {
 				w.u8(0)?;
 			}
 		}
 		w.bytes_lp(self.utc_provenance.as_bytes())?;
+		w.u32(self.result_length)?;
+		if self.result_digest.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.result_digest.len() as u16)?;
+		for v49 in self.result_digest.iter() {
+			w.u8(*v49)?;
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<AdminRecord> {
@@ -1945,32 +2268,43 @@ impl AdminRecord {
 		let request = r.u64()?;
 		let launch = r.u64()?;
 		let requester = {
-			let v41 = r.string_lp()?;
-			(v41.len() <= 64).then_some(v41)?
+			let v50 = r.string_lp()?;
+			(v50.len() <= 64).then_some(v50)?
 		};
 		let action = r.u8()?;
 		let digest = {
-			let v42 = r.u16()? as usize;
-			let v42 = (v42 <= 32).then_some(v42)?;
-			let mut v43 = Vec::new();
-			v43.try_reserve_exact(v42).ok()?;
-			for _ in 0..v42 {
-				v43.push(r.u8()?);
+			let v51 = r.u16()? as usize;
+			let v51 = (v51 <= 32).then_some(v51)?;
+			let mut v52 = Vec::new();
+			v52.try_reserve_exact(v51).ok()?;
+			for _ in 0..v51 {
+				v52.push(r.u8()?);
 			}
-			v43
+			v52
 		};
 		let event = AdminEvent::read(r)?;
 		let reason = {
-			let v44 = r.string_lp()?;
-			(v44.len() <= 64).then_some(v44)?
+			let v53 = r.string_lp()?;
+			(v53.len() <= 64).then_some(v53)?
 		};
 		let monotonic_ns = r.u64()?;
 		let utc_seconds = if r.tag()? { Some(r.u64()?) } else { None };
 		let utc_provenance = {
-			let v45 = r.string_lp()?;
-			(v45.len() <= 16).then_some(v45)?
+			let v54 = r.string_lp()?;
+			(v54.len() <= 16).then_some(v54)?
 		};
-		Some(AdminRecord { sequence, broker_epoch, request, launch, requester, action, digest, event, reason, monotonic_ns, utc_seconds, utc_provenance })
+		let result_length = r.u32()?;
+		let result_digest = {
+			let v55 = r.u16()? as usize;
+			let v55 = (v55 <= 32).then_some(v55)?;
+			let mut v56 = Vec::new();
+			v56.try_reserve_exact(v55).ok()?;
+			for _ in 0..v55 {
+				v56.push(r.u8()?);
+			}
+			v56
+		};
+		Some(AdminRecord { sequence, broker_epoch, request, launch, requester, action, digest, event, reason, monotonic_ns, utc_seconds, utc_provenance, result_length, result_digest })
 	}
 }
 
@@ -2025,8 +2359,8 @@ impl AdminJournalPage {
 			return None;
 		}
 		w.u16(self.records.len() as u16)?;
-		for v46 in self.records.iter() {
-			v46.write(w)?;
+		for v57 in self.records.iter() {
+			v57.write(w)?;
 		}
 		w.u64(self.oldest)?;
 		w.u64(self.next)?;
@@ -2035,14 +2369,14 @@ impl AdminJournalPage {
 	}
 	pub fn read(r: &mut Reader) -> Option<AdminJournalPage> {
 		let records = {
-			let v47 = r.u16()? as usize;
-			let v47 = (v47 <= 16).then_some(v47)?;
-			let mut v48 = Vec::new();
-			v48.try_reserve_exact(v47).ok()?;
-			for _ in 0..v47 {
-				v48.push(AdminRecord::read(r)?);
+			let v58 = r.u16()? as usize;
+			let v58 = (v58 <= 16).then_some(v58)?;
+			let mut v59 = Vec::new();
+			v59.try_reserve_exact(v58).ok()?;
+			for _ in 0..v58 {
+				v59.push(AdminRecord::read(r)?);
 			}
-			v48
+			v59
 		};
 		let oldest = r.u64()?;
 		let next = r.u64()?;
@@ -2093,13 +2427,13 @@ pub mod admin_journal {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v49) => {
+						Ok(v60) => {
 							w.u8(1)?;
-							v49.write(w)?;
+							v60.write(w)?;
 						}
-						Err(v50) => {
+						Err(v61) => {
 							w.u8(0)?;
-							v50.write(w)?;
+							v61.write(w)?;
 						}
 					}
 					Some(())
@@ -2300,8 +2634,8 @@ impl AdminProbeEffects {
 			return None;
 		}
 		w.u16(self.digest.len() as u16)?;
-		for v51 in self.digest.iter() {
-			w.u8(*v51)?;
+		for v62 in self.digest.iter() {
+			w.u8(*v62)?;
 		}
 		w.u64(self.generation)?;
 		Some(())
@@ -2310,14 +2644,14 @@ impl AdminProbeEffects {
 		let writes = r.u32()?;
 		let dispatches = r.u32()?;
 		let digest = {
-			let v52 = r.u16()? as usize;
-			let v52 = (v52 <= 32).then_some(v52)?;
-			let mut v53 = Vec::new();
-			v53.try_reserve_exact(v52).ok()?;
-			for _ in 0..v52 {
-				v53.push(r.u8()?);
+			let v63 = r.u16()? as usize;
+			let v63 = (v63 <= 32).then_some(v63)?;
+			let mut v64 = Vec::new();
+			v64.try_reserve_exact(v63).ok()?;
+			for _ in 0..v63 {
+				v64.push(r.u8()?);
 			}
-			v53
+			v64
 		};
 		let generation = r.u64()?;
 		Some(AdminProbeEffects { writes, dispatches, digest, generation })
@@ -2428,13 +2762,13 @@ pub mod admin_probe_witness {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v54) => {
+						Ok(v65) => {
 							w.u8(1)?;
-							v54.write(w)?;
+							v65.write(w)?;
 						}
-						Err(v55) => {
+						Err(v66) => {
 							w.u8(0)?;
-							v55.write(w)?;
+							v66.write(w)?;
 						}
 					}
 					Some(())
@@ -2464,13 +2798,13 @@ pub mod admin_probe_witness {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v56) => {
+						Ok(v67) => {
 							w.u8(1)?;
-							w.u64(*v56)?;
+							w.u64(*v67)?;
 						}
-						Err(v57) => {
+						Err(v68) => {
 							w.u8(0)?;
-							v57.write(w)?;
+							v68.write(w)?;
 						}
 					}
 					Some(())
@@ -2501,12 +2835,12 @@ pub mod admin_probe_witness {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v58) => {
+						Ok(v69) => {
 							w.u8(1)?;
 						}
-						Err(v59) => {
+						Err(v70) => {
 							w.u8(0)?;
-							v59.write(w)?;
+							v70.write(w)?;
 						}
 					}
 					Some(())
@@ -2842,12 +3176,12 @@ pub mod admin_test {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v60) => {
+						Ok(v71) => {
 							w.u8(1)?;
 						}
-						Err(v61) => {
+						Err(v72) => {
 							w.u8(0)?;
-							v61.write(w)?;
+							v72.write(w)?;
 						}
 					}
 					Some(())
@@ -2878,12 +3212,12 @@ pub mod admin_test {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v62) => {
+						Ok(v73) => {
 							w.u8(1)?;
 						}
-						Err(v63) => {
+						Err(v74) => {
 							w.u8(0)?;
-							v63.write(w)?;
+							v74.write(w)?;
 						}
 					}
 					Some(())
@@ -2913,13 +3247,13 @@ pub mod admin_test {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v64) => {
+						Ok(v75) => {
 							w.u8(1)?;
-							w.u32(*v64)?;
+							w.u32(*v75)?;
 						}
-						Err(v65) => {
+						Err(v76) => {
 							w.u8(0)?;
-							v65.write(w)?;
+							v76.write(w)?;
 						}
 					}
 					Some(())
@@ -3172,6 +3506,7 @@ impl AdminAction {
 			AdminAction::ProbeWrite => out.push_str("\"probe-write\""),
 			AdminAction::BmcSelClear => out.push_str("\"bmc-sel-clear\""),
 			AdminAction::BmcChassisControl => out.push_str("\"bmc-chassis-control\""),
+			AdminAction::FirmwareUpload => out.push_str("\"firmware-upload\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3180,6 +3515,7 @@ impl AdminAction {
 			AdminAction::ProbeWrite => out.push_str("probe-write"),
 			AdminAction::BmcSelClear => out.push_str("bmc-sel-clear"),
 			AdminAction::BmcChassisControl => out.push_str("bmc-chassis-control"),
+			AdminAction::FirmwareUpload => out.push_str("firmware-upload"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -3188,6 +3524,7 @@ impl AdminAction {
 			AdminAction::ProbeWrite => crate::codec::cbor::text(out, "probe-write"),
 			AdminAction::BmcSelClear => crate::codec::cbor::text(out, "bmc-sel-clear"),
 			AdminAction::BmcChassisControl => crate::codec::cbor::text(out, "bmc-chassis-control"),
+			AdminAction::FirmwareUpload => crate::codec::cbor::text(out, "firmware-upload"),
 		}
 	}
 }
@@ -3230,13 +3567,13 @@ impl AdminDescriptor {
 		out.push(',');
 		out.push_str("\"parameters\":");
 		out.push('[');
-		let mut v67 = true;
-		for v66 in self.parameters.iter() {
-			if !v67 {
+		let mut v78 = true;
+		for v77 in self.parameters.iter() {
+			if !v78 {
 				out.push(',');
 			}
-			v67 = false;
-			let _ = write!(out, "{}", v66);
+			v78 = false;
+			let _ = write!(out, "{}", v77);
 		}
 		out.push(']');
 		out.push(',');
@@ -3245,13 +3582,13 @@ impl AdminDescriptor {
 		out.push(',');
 		out.push_str("\"payload-digest\":");
 		out.push('[');
-		let mut v69 = true;
-		for v68 in self.payload_digest.iter() {
-			if !v69 {
+		let mut v80 = true;
+		for v79 in self.payload_digest.iter() {
+			if !v80 {
 				out.push(',');
 			}
-			v69 = false;
-			let _ = write!(out, "{}", v68);
+			v80 = false;
+			let _ = write!(out, "{}", v79);
 		}
 		out.push(']');
 		out.push('}');
@@ -3278,13 +3615,13 @@ impl AdminDescriptor {
 		out.push_str(", ");
 		out.push_str("parameters=");
 		out.push('[');
-		let mut v71 = true;
-		for v70 in self.parameters.iter() {
-			if !v71 {
+		let mut v82 = true;
+		for v81 in self.parameters.iter() {
+			if !v82 {
 				out.push_str(", ");
 			}
-			v71 = false;
-			let _ = write!(out, "{}", v70);
+			v82 = false;
+			let _ = write!(out, "{}", v81);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3293,13 +3630,13 @@ impl AdminDescriptor {
 		out.push_str(", ");
 		out.push_str("payload-digest=");
 		out.push('[');
-		let mut v73 = true;
-		for v72 in self.payload_digest.iter() {
-			if !v73 {
+		let mut v84 = true;
+		for v83 in self.payload_digest.iter() {
+			if !v84 {
 				out.push_str(", ");
 			}
-			v73 = false;
-			let _ = write!(out, "{}", v72);
+			v84 = false;
+			let _ = write!(out, "{}", v83);
 		}
 		out.push(']');
 		out.push('}');
@@ -3320,15 +3657,15 @@ impl AdminDescriptor {
 		crate::codec::cbor::uint(out, self.target_generation as u64);
 		crate::codec::cbor::text(out, "parameters");
 		crate::codec::cbor::array(out, self.parameters.len());
-		for v74 in self.parameters.iter() {
-			crate::codec::cbor::uint(out, *v74 as u64);
+		for v85 in self.parameters.iter() {
+			crate::codec::cbor::uint(out, *v85 as u64);
 		}
 		crate::codec::cbor::text(out, "payload-length");
 		crate::codec::cbor::uint(out, self.payload_length as u64);
 		crate::codec::cbor::text(out, "payload-digest");
 		crate::codec::cbor::array(out, self.payload_digest.len());
-		for v75 in self.payload_digest.iter() {
-			crate::codec::cbor::uint(out, *v75 as u64);
+		for v86 in self.payload_digest.iter() {
+			crate::codec::cbor::uint(out, *v86 as u64);
 		}
 	}
 }
@@ -3359,13 +3696,13 @@ impl AdminRequestArgs {
 		out.push(',');
 		out.push_str("\"parameters\":");
 		out.push('[');
-		let mut v77 = true;
-		for v76 in self.parameters.iter() {
-			if !v77 {
+		let mut v88 = true;
+		for v87 in self.parameters.iter() {
+			if !v88 {
 				out.push(',');
 			}
-			v77 = false;
-			let _ = write!(out, "{}", v76);
+			v88 = false;
+			let _ = write!(out, "{}", v87);
 		}
 		out.push(']');
 		out.push(',');
@@ -3386,13 +3723,13 @@ impl AdminRequestArgs {
 		out.push_str(", ");
 		out.push_str("parameters=");
 		out.push('[');
-		let mut v79 = true;
-		for v78 in self.parameters.iter() {
-			if !v79 {
+		let mut v90 = true;
+		for v89 in self.parameters.iter() {
+			if !v90 {
 				out.push_str(", ");
 			}
-			v79 = false;
-			let _ = write!(out, "{}", v78);
+			v90 = false;
+			let _ = write!(out, "{}", v89);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3411,8 +3748,8 @@ impl AdminRequestArgs {
 		crate::codec::cbor::text(out, &self.target);
 		crate::codec::cbor::text(out, "parameters");
 		crate::codec::cbor::array(out, self.parameters.len());
-		for v80 in self.parameters.iter() {
-			crate::codec::cbor::uint(out, *v80 as u64);
+		for v91 in self.parameters.iter() {
+			crate::codec::cbor::uint(out, *v91 as u64);
 		}
 		crate::codec::cbor::text(out, "payload-length");
 		crate::codec::cbor::uint(out, self.payload_length as u64);
@@ -3483,9 +3820,9 @@ impl AdminAnswer {
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			AdminAnswer::Declined => out.push_str("\"declined\""),
-			AdminAnswer::Granted(v81) => {
+			AdminAnswer::Granted(v92) => {
 				out.push_str("{\"granted\":");
-				v81.to_json_into(out);
+				v92.to_json_into(out);
 				out.push('}');
 			}
 		}
@@ -3493,9 +3830,9 @@ impl AdminAnswer {
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			AdminAnswer::Declined => out.push_str("declined"),
-			AdminAnswer::Granted(v82) => {
+			AdminAnswer::Granted(v93) => {
 				out.push_str("granted(");
-				v82.to_text_into(out);
+				v93.to_text_into(out);
 				out.push(')');
 			}
 		}
@@ -3503,10 +3840,10 @@ impl AdminAnswer {
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			AdminAnswer::Declined => crate::codec::cbor::text(out, "declined"),
-			AdminAnswer::Granted(v83) => {
+			AdminAnswer::Granted(v94) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "granted");
-				v83.to_cbor_into(out);
+				v94.to_cbor_into(out);
 			}
 		}
 	}
@@ -3551,6 +3888,129 @@ impl AdminResult {
 	}
 }
 
+impl AdminImage {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"image\":");
+		let _ = write!(out, "{}", self.image);
+		out.push(',');
+		out.push_str("\"length\":");
+		let _ = write!(out, "{}", self.length);
+		out.push(',');
+		out.push_str("\"digest\":");
+		out.push('[');
+		let mut v96 = true;
+		for v95 in self.digest.iter() {
+			if !v96 {
+				out.push(',');
+			}
+			v96 = false;
+			let _ = write!(out, "{}", v95);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("image=");
+		let _ = write!(out, "{}", self.image);
+		out.push_str(", ");
+		out.push_str("length=");
+		let _ = write!(out, "{}", self.length);
+		out.push_str(", ");
+		out.push_str("digest=");
+		out.push('[');
+		let mut v98 = true;
+		for v97 in self.digest.iter() {
+			if !v98 {
+				out.push_str(", ");
+			}
+			v98 = false;
+			let _ = write!(out, "{}", v97);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "image");
+		crate::codec::cbor::uint(out, self.image as u64);
+		crate::codec::cbor::text(out, "length");
+		crate::codec::cbor::uint(out, self.length as u64);
+		crate::codec::cbor::text(out, "digest");
+		crate::codec::cbor::array(out, self.digest.len());
+		for v99 in self.digest.iter() {
+			crate::codec::cbor::uint(out, *v99 as u64);
+		}
+	}
+}
+
+impl AdminRead {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			AdminRead::Completed(v100) => {
+				out.push_str("{\"completed\":");
+				v100.to_json_into(out);
+				out.push('}');
+			}
+			AdminRead::Failed => out.push_str("\"failed\""),
+			AdminRead::OutcomeUnknown => out.push_str("\"outcome-unknown\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			AdminRead::Completed(v101) => {
+				out.push_str("completed(");
+				v101.to_text_into(out);
+				out.push(')');
+			}
+			AdminRead::Failed => out.push_str("failed"),
+			AdminRead::OutcomeUnknown => out.push_str("outcome-unknown"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			AdminRead::Completed(v102) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "completed");
+				v102.to_cbor_into(out);
+			}
+			AdminRead::Failed => crate::codec::cbor::text(out, "failed"),
+			AdminRead::OutcomeUnknown => crate::codec::cbor::text(out, "outcome-unknown"),
+		}
+	}
+}
+
 impl AdminScope {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3571,13 +4031,13 @@ impl AdminScope {
 		out.push('{');
 		out.push_str("\"actions\":");
 		out.push('[');
-		let mut v85 = true;
-		for v84 in self.actions.iter() {
-			if !v85 {
+		let mut v104 = true;
+		for v103 in self.actions.iter() {
+			if !v104 {
 				out.push(',');
 			}
-			v85 = false;
-			v84.to_json_into(out);
+			v104 = false;
+			v103.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -3589,13 +4049,13 @@ impl AdminScope {
 		out.push('{');
 		out.push_str("actions=");
 		out.push('[');
-		let mut v87 = true;
-		for v86 in self.actions.iter() {
-			if !v87 {
+		let mut v106 = true;
+		for v105 in self.actions.iter() {
+			if !v106 {
 				out.push_str(", ");
 			}
-			v87 = false;
-			v86.to_text_into(out);
+			v106 = false;
+			v105.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3607,8 +4067,8 @@ impl AdminScope {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "actions");
 		crate::codec::cbor::array(out, self.actions.len());
-		for v88 in self.actions.iter() {
-			v88.to_cbor_into(out);
+		for v107 in self.actions.iter() {
+			v107.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "target-prefix");
 		crate::codec::cbor::text(out, &self.target_prefix);
@@ -3755,13 +4215,13 @@ impl AdminRecord {
 		out.push(',');
 		out.push_str("\"digest\":");
 		out.push('[');
-		let mut v90 = true;
-		for v89 in self.digest.iter() {
-			if !v90 {
+		let mut v109 = true;
+		for v108 in self.digest.iter() {
+			if !v109 {
 				out.push(',');
 			}
-			v90 = false;
-			let _ = write!(out, "{}", v89);
+			v109 = false;
+			let _ = write!(out, "{}", v108);
 		}
 		out.push(']');
 		out.push(',');
@@ -3776,8 +4236,8 @@ impl AdminRecord {
 		out.push(',');
 		out.push_str("\"utc-seconds\":");
 		match &self.utc_seconds {
-			Some(v91) => {
-				let _ = write!(out, "{}", v91);
+			Some(v110) => {
+				let _ = write!(out, "{}", v110);
 			}
 			None => {
 				out.push_str("null");
@@ -3786,6 +4246,21 @@ impl AdminRecord {
 		out.push(',');
 		out.push_str("\"utc-provenance\":");
 		crate::codec::json_escape(&self.utc_provenance, out);
+		out.push(',');
+		out.push_str("\"result-length\":");
+		let _ = write!(out, "{}", self.result_length);
+		out.push(',');
+		out.push_str("\"result-digest\":");
+		out.push('[');
+		let mut v112 = true;
+		for v111 in self.result_digest.iter() {
+			if !v112 {
+				out.push(',');
+			}
+			v112 = false;
+			let _ = write!(out, "{}", v111);
+		}
+		out.push(']');
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3810,13 +4285,13 @@ impl AdminRecord {
 		out.push_str(", ");
 		out.push_str("digest=");
 		out.push('[');
-		let mut v93 = true;
-		for v92 in self.digest.iter() {
-			if !v93 {
+		let mut v114 = true;
+		for v113 in self.digest.iter() {
+			if !v114 {
 				out.push_str(", ");
 			}
-			v93 = false;
-			let _ = write!(out, "{}", v92);
+			v114 = false;
+			let _ = write!(out, "{}", v113);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3831,8 +4306,8 @@ impl AdminRecord {
 		out.push_str(", ");
 		out.push_str("utc-seconds=");
 		match &self.utc_seconds {
-			Some(v94) => {
-				let _ = write!(out, "{}", v94);
+			Some(v115) => {
+				let _ = write!(out, "{}", v115);
 			}
 			None => {
 				out.push('-');
@@ -3841,10 +4316,25 @@ impl AdminRecord {
 		out.push_str(", ");
 		out.push_str("utc-provenance=");
 		out.push_str(&self.utc_provenance);
+		out.push_str(", ");
+		out.push_str("result-length=");
+		let _ = write!(out, "{}", self.result_length);
+		out.push_str(", ");
+		out.push_str("result-digest=");
+		out.push('[');
+		let mut v117 = true;
+		for v116 in self.result_digest.iter() {
+			if !v117 {
+				out.push_str(", ");
+			}
+			v117 = false;
+			let _ = write!(out, "{}", v116);
+		}
+		out.push(']');
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 12);
+		crate::codec::cbor::map(out, 14);
 		crate::codec::cbor::text(out, "sequence");
 		crate::codec::cbor::uint(out, self.sequence as u64);
 		crate::codec::cbor::text(out, "broker-epoch");
@@ -3859,8 +4349,8 @@ impl AdminRecord {
 		crate::codec::cbor::uint(out, self.action as u64);
 		crate::codec::cbor::text(out, "digest");
 		crate::codec::cbor::array(out, self.digest.len());
-		for v95 in self.digest.iter() {
-			crate::codec::cbor::uint(out, *v95 as u64);
+		for v118 in self.digest.iter() {
+			crate::codec::cbor::uint(out, *v118 as u64);
 		}
 		crate::codec::cbor::text(out, "event");
 		self.event.to_cbor_into(out);
@@ -3870,8 +4360,8 @@ impl AdminRecord {
 		crate::codec::cbor::uint(out, self.monotonic_ns as u64);
 		crate::codec::cbor::text(out, "utc-seconds");
 		match &self.utc_seconds {
-			Some(v96) => {
-				crate::codec::cbor::uint(out, *v96 as u64);
+			Some(v119) => {
+				crate::codec::cbor::uint(out, *v119 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3879,6 +4369,13 @@ impl AdminRecord {
 		}
 		crate::codec::cbor::text(out, "utc-provenance");
 		crate::codec::cbor::text(out, &self.utc_provenance);
+		crate::codec::cbor::text(out, "result-length");
+		crate::codec::cbor::uint(out, self.result_length as u64);
+		crate::codec::cbor::text(out, "result-digest");
+		crate::codec::cbor::array(out, self.result_digest.len());
+		for v120 in self.result_digest.iter() {
+			crate::codec::cbor::uint(out, *v120 as u64);
+		}
 	}
 }
 
@@ -3902,13 +4399,13 @@ impl AdminJournalPage {
 		out.push('{');
 		out.push_str("\"records\":");
 		out.push('[');
-		let mut v98 = true;
-		for v97 in self.records.iter() {
-			if !v98 {
+		let mut v122 = true;
+		for v121 in self.records.iter() {
+			if !v122 {
 				out.push(',');
 			}
-			v98 = false;
-			v97.to_json_into(out);
+			v122 = false;
+			v121.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -3926,13 +4423,13 @@ impl AdminJournalPage {
 		out.push('{');
 		out.push_str("records=");
 		out.push('[');
-		let mut v100 = true;
-		for v99 in self.records.iter() {
-			if !v100 {
+		let mut v124 = true;
+		for v123 in self.records.iter() {
+			if !v124 {
 				out.push_str(", ");
 			}
-			v100 = false;
-			v99.to_text_into(out);
+			v124 = false;
+			v123.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3950,8 +4447,8 @@ impl AdminJournalPage {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "records");
 		crate::codec::cbor::array(out, self.records.len());
-		for v101 in self.records.iter() {
-			v101.to_cbor_into(out);
+		for v125 in self.records.iter() {
+			v125.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "oldest");
 		crate::codec::cbor::uint(out, self.oldest as u64);
@@ -3988,13 +4485,13 @@ impl AdminProbeEffects {
 		out.push(',');
 		out.push_str("\"digest\":");
 		out.push('[');
-		let mut v103 = true;
-		for v102 in self.digest.iter() {
-			if !v103 {
+		let mut v127 = true;
+		for v126 in self.digest.iter() {
+			if !v127 {
 				out.push(',');
 			}
-			v103 = false;
-			let _ = write!(out, "{}", v102);
+			v127 = false;
+			let _ = write!(out, "{}", v126);
 		}
 		out.push(']');
 		out.push(',');
@@ -4012,13 +4509,13 @@ impl AdminProbeEffects {
 		out.push_str(", ");
 		out.push_str("digest=");
 		out.push('[');
-		let mut v105 = true;
-		for v104 in self.digest.iter() {
-			if !v105 {
+		let mut v129 = true;
+		for v128 in self.digest.iter() {
+			if !v129 {
 				out.push_str(", ");
 			}
-			v105 = false;
-			let _ = write!(out, "{}", v104);
+			v129 = false;
+			let _ = write!(out, "{}", v128);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4034,8 +4531,8 @@ impl AdminProbeEffects {
 		crate::codec::cbor::uint(out, self.dispatches as u64);
 		crate::codec::cbor::text(out, "digest");
 		crate::codec::cbor::array(out, self.digest.len());
-		for v106 in self.digest.iter() {
-			crate::codec::cbor::uint(out, *v106 as u64);
+		for v130 in self.digest.iter() {
+			crate::codec::cbor::uint(out, *v130 as u64);
 		}
 		crate::codec::cbor::text(out, "generation");
 		crate::codec::cbor::uint(out, self.generation as u64);

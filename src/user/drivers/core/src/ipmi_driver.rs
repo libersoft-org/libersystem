@@ -43,7 +43,7 @@ use ipmi::identity::{DeviceId, Identity};
 use ipmi::{Availability, Change, Failure, Request, Response, bt, kcs, sdr, ssif};
 use power_model::convert::Tagged;
 use proto::generated::liber::bmc::v1 as bmc;
-use proto::system::{AdminAction, AdminDescriptor, AdminPrepared, AdminResult, ControlOutcome, Error, ProviderCommand, ProviderSource, ProviderUpdate, ProviderUpdateKind, SourceState, WatchdogDescription, acpi_node, admin_executor, power_provider, watchdog};
+use proto::system::{AdminAction, AdminDescriptor, AdminPrepared, AdminRead, AdminResult, ControlOutcome, Error, ProviderCommand, ProviderSource, ProviderUpdate, ProviderUpdateKind, SourceState, WatchdogDescription, acpi_node, admin_executor, power_provider, watchdog};
 use rt::*;
 use wire::Handles;
 
@@ -899,6 +899,11 @@ impl admin_executor::Service for ExecutorView<'_> {
 	fn cancel(&mut self, operation: u64) -> Result<(), Error> {
 		let operations = if self.action == AdminAction::BmcSelClear { &mut self.driver.sel_ops } else { &mut self.driver.chassis_ops };
 		operations.cancel(operation).map_err(refused)
+	}
+
+	// A BMC'S ACTIONS READ NOTHING OUT.
+	fn execute_read(&mut self, _operation: u64, _epoch: u64) -> Result<AdminRead, Error> {
+		Err(Error::Unsupported)
 	}
 }
 

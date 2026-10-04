@@ -546,12 +546,14 @@ if [[ "${USB_GADGET:-}" == "mtp" ]]; then
 		echo "[test-$ARCH] the MTP objects could not be written; the tests that need them are unavailable" >&2
 		unset USB_GADGET
 	fi
-# `mic` AND THE TWO `dfu-*` ARE NOT GADGETS EITHER: each is a device `usbredir_device.py` plays over QEMU's
-# `usb-redir` - a microphone because an isochronous endpoint is the one thing `dummy_hcd` cannot carry, and a DFU
+# `mic`, `speaker-async`, `speaker-uac2`, `bt-sco`, `midi2`, `uvc-iso` AND THE TWO `dfu-*` ARE NOT GADGETS EITHER: each is a
+# device `usbredir_device.py` plays over QEMU's `usb-redir` - a microphone, two speakers, a Bluetooth controller's voice, a
+# USB MIDI 2.0 device (no gadget function for it is built) and an isochronous camera because an isochronous
+# endpoint is the one thing `dummy_hcd` cannot carry, and a DFU
 # target because it changes what it is at a bus reset without leaving the bus, which no gadget can. The process listens on a socket in this run's
 # own directory, QEMU's chardev connects to it, and the exit trap stops the process and removes the directory.
 # Nothing in the host's kernel is touched, so the gadget rules are not engaged at all.
-elif [[ "${USB_GADGET:-}" == "mic" || "${USB_GADGET:-}" == "dfu-reset" || "${USB_GADGET:-}" == "dfu-detach" ]]; then
+elif [[ "${USB_GADGET:-}" == "mic" || "${USB_GADGET:-}" == "speaker-async" || "${USB_GADGET:-}" == "speaker-uac2" || "${USB_GADGET:-}" == "bt-sco" || "${USB_GADGET:-}" == "midi2" || "${USB_GADGET:-}" == "uvc-iso" || "${USB_GADGET:-}" == "dfu-reset" || "${USB_GADGET:-}" == "dfu-detach" ]]; then
 	USB_REDIR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liber-usbredir.XXXXXX")"
 	USB_REDIR_SOCKET="$USB_REDIR_DIR/device.sock"
 	python3 "$ROOT/harness/usbredir_device.py" --emulate "$USB_GADGET" --socket "$USB_REDIR_SOCKET" --ready "$USB_REDIR_DIR/ready" >&2 &
@@ -562,6 +564,10 @@ elif [[ "${USB_GADGET:-}" == "mic" || "${USB_GADGET:-}" == "dfu-reset" || "${USB
 	done
 	if [[ -e "$USB_REDIR_DIR/ready" ]]; then
 		export USB_REDIR_SOCKET
+		# A SPEAKER OF ITS OWN TAKES THE ONE SINK THE DRIVER BINDS, so QEMU's is left off the bus.
+		if [[ "$USB_GADGET" == "speaker-async" || "$USB_GADGET" == "speaker-uac2" ]]; then
+			export USB_QEMU_SPEAKER=off
+		fi
 		echo "[test-$ARCH] usbredir device $USB_GADGET listens for QEMU on root port 3"
 	else
 		echo "[test-$ARCH] the usbredir device did not start; the tests that need it are unavailable" >&2
@@ -737,7 +743,7 @@ set +e
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" USB_QEMU_SPEAKER="${USB_QEMU_SPEAKER:-on}" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

@@ -1673,9 +1673,23 @@ pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
 // successful shootdown takes it out. Holding memory is a cost; handing out memory somebody else can
 // still read is not a cost, it is a defect.
 //
+// A RETIREMENT LARGER THAN THE QUEUE PAYS FOR ONE SHOOTDOWN, NOT ONE PER FRAME. Every frame in `frames` was unmapped
+// before this call and a flush is not per-address, so one completed shootdown leaves none of them a stale translation
+// anywhere. Pushed one by one, the frames filled the queue after `QUARANTINE_CAPACITY` of them and every frame after
+// that paid for a shootdown of its own - a large memory object, tens of thousands of frames, took half a minute to
+// free, and that held a killed service's teardown and the orderly power-off behind it (measured 2026-10-04: 33 s for
+// one object of `storage_service`). And a queue found full is drained - one shootdown frees all of it - before a frame
+// pays for its own.
+//
 // SAFETY: the caller owns every frame in `frames` and has removed every mapping of them.
 pub unsafe fn retire(frames: &[u64]) {
 	if frames.is_empty() {
+		return;
+	}
+	if frames.len() > QUARANTINE_CAPACITY && crate::mem::tlb::shootdown() {
+		for &phys in frames {
+			unsafe { deallocate(phys) };
+		}
 		return;
 	}
 	// What the queue could not take, to be dealt with the expensive way rather than lost.
@@ -1695,6 +1709,13 @@ pub unsafe fn retire(frames: &[u64]) {
 			// ALLOC-OK: not a heap collection at all - a fixed ring that answers false when full,
 			// which is what the paragraph above is about.
 			if !quarantine.push(phys) {
+				// FULL: one shootdown gives the whole queue back, and covers this frame too.
+				drop(quarantine);
+				unsafe { drain_quarantine() };
+				quarantine = QUARANTINE.lock();
+				if quarantine.push(phys) {
+					continue;
+				}
 				if unqueued_len < unqueued.len() {
 					unqueued[unqueued_len] = phys;
 					unqueued_len += 1;

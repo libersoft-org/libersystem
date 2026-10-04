@@ -345,7 +345,7 @@ impl hci_transport::Service for Fixture {
 		if version != VERSION {
 			return Err(Error::Unsupported);
 		}
-		Ok(HciAttachment { version, iso: false, max_command: 258, max_event: 257, max_acl: ACL_BYTES as u32 + 4, max_iso: 0, command_credits: 1, acl_credits: ACL_BUFFERS as u32, acl_queue: 16, epoch: self.epoch })
+		Ok(HciAttachment { version, iso: false, max_command: 258, max_event: 257, max_acl: ACL_BYTES as u32 + 4, max_iso: 0, command_credits: 1, acl_credits: ACL_BUFFERS as u32, acl_queue: 16, epoch: self.epoch, sco: false, max_sco: 0 })
 	}
 
 	fn send(&mut self, kind: HciPacketKind, bytes: Vec<u8>) -> Result<u32, Error> {
@@ -353,7 +353,7 @@ impl hci_transport::Service for Fixture {
 			HciPacketKind::Command => self.command(&bytes),
 			HciPacketKind::Acl => self.acl(&bytes),
 			HciPacketKind::Event => return Err(Error::Invalid),
-			HciPacketKind::Iso => return Err(Error::Unsupported),
+			HciPacketKind::Iso | HciPacketKind::Sco => return Err(Error::Unsupported),
 		}
 		Ok(bytes.len() as u32)
 	}
@@ -364,6 +364,11 @@ impl hci_transport::Service for Fixture {
 
 	fn control(&mut self) -> Vec<HciControlEvent> {
 		Vec::new()
+	}
+
+	// NO VOICE: this fixture carries the service's LE world, and synchronous links are not in it.
+	fn voice(&mut self, _channels: u8, _bits: u8, _wideband: bool) -> Result<u8, Error> {
+		Err(Error::Unsupported)
 	}
 
 	fn reset(&mut self) -> Result<u32, Error> {

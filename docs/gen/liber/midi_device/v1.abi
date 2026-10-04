@@ -2,7 +2,10 @@ package liber:midi-device@1
 record midi-bounds(version:u32,max-packets:u16)
 record midi-open(connection-generation:u64,bounds:midi-bounds)
 enum midi-device-direction(receive=1,transmit=2)
-record midi-device-endpoint(index:u32,name:string:bound=64,cables:u8,direction:midi-device-direction)
+enum midi-device-protocol(midi1=1,ump=2)
+record midi-device-endpoint(index:u32,name:string:bound=64,cables:u8,direction:midi-device-direction,protocol:midi-device-protocol)
+enum midi-device-block-direction(receives=1,sends=2,both=3)
+record midi-device-block(id:u8,name:string:bound=32,first-group:u8,groups:u8,direction:midi-device-block-direction,protocol:u8)
 record midi-packet-batch(endpoint:u32,receiver-generation:u64,received-ns:u64,packets:list<u8>:bound=256)
 record midi-input-lost(endpoint:u32,receiver-generation:u64)
 variant midi-device-event(batch=0:midi-packet-batch,lost=1:midi-input-lost)
@@ -13,6 +16,7 @@ method midi-device.start op=3 (endpoint:u32:rights=,receiver-generation:u64:righ
 method midi-device.stop op=4 (endpoint:u32:rights=,receiver-generation:u64:rights=) -> result<unit, liber:base@1::error>
 method midi-device.events op=5 () -> stream<midi-device-event>
 method midi-device.send op=6 (endpoint:u32:rights=,packets:list<u8>:bound=256:rights=) -> result<unit, liber:base@1::error>
+method midi-device.blocks op=7 (endpoint:u32:rights=) -> result<list<midi-device-block>, liber:base@1::error>:bound=8
 record midi-fixture-stats(batches:u32,packets:u32,receiving:u8,sent:u32)
 interface midi-fixture
 method midi-fixture.inject op=1 (endpoint:u32:rights=,packets:list<u8>:bound=256:rights=) -> result<unit, liber:base@1::error>

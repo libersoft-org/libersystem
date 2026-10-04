@@ -317,7 +317,7 @@ pub fn select(normalized: &Normalized, format: u8, size: u8, interval: u32) -> O
 // that carried it. Its bits say which frame the data belongs to (FID), whether the frame ends here (EOF) and
 // whether the device knows the data is bad (ERR).
 
-use crate::usb_function::{Configuration, Endpoint, Refused as ConfigRefused};
+use crate::usb_function::{Configuration, Endpoint, Refused as ConfigRefused, TRANSFER_ISOCHRONOUS};
 
 pub const CLASS_VIDEO: u8 = 0x0e;
 pub const SUBCLASS_CONTROL: u8 = 0x01;
@@ -337,9 +337,41 @@ pub const HEADER_ERR: u8 = 1 << 6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotBindable {
 	NoVideoInterface,
-	/// Its streaming interface streams isochronously: endpoints only on later alternates.
-	Isochronous,
+	/// A streaming interface with neither a bulk IN endpoint on its alternate zero nor an isochronous IN one on a
+	/// later alternate: there is nothing to stream from.
+	NoStreamingEndpoint,
 	Malformed(ConfigRefused),
+}
+
+/// One alternate setting of an isochronous streaming interface and the IN endpoint it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IsoAlternate {
+	pub alternate: u8,
+	pub endpoint: Endpoint,
+}
+
+impl IsoAlternate {
+	/// WHAT ONE SERVICE INTERVAL CARRIES: the packet size, and at high speed the packets the high-bandwidth bits
+	/// (12:11) add - one to three a microframe. A full-speed endpoint has no such bits to count.
+	pub fn capacity(&self, high_speed: bool) -> u32 {
+		let size = u32::from(self.endpoint.packet & 0x07ff);
+		let extra = if high_speed { u32::from(self.endpoint.packet >> 11 & 0x3).min(2) } else { 0 };
+		size * (extra + 1)
+	}
+}
+
+/// No alternate carries the committed payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoBandwidth {
+	pub needed: u32,
+	pub most: u32,
+}
+
+/// THE ALTERNATE BY BANDWIDTH: the one with the smallest capacity that still carries `needed` bytes a service interval
+/// - the committed `dwMaxPayloadTransferSize` - the lowest-numbered of equals; and a refusal naming the largest there
+/// is when none does.
+pub fn alternate_for(alternates: &[IsoAlternate], needed: u32, high_speed: bool) -> Result<IsoAlternate, NoBandwidth> {
+	alternates.iter().filter(|candidate| candidate.capacity(high_speed) >= needed).min_by_key(|candidate| (candidate.capacity(high_speed), candidate.alternate)).copied().ok_or(NoBandwidth { needed, most: alternates.iter().map(|candidate| candidate.capacity(high_speed)).max().unwrap_or(0) })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,7 +379,10 @@ pub struct Binding {
 	pub config_value: u8,
 	pub control_interface: u8,
 	pub streaming_interface: u8,
-	pub bulk_in: Endpoint,
+	/// A bulk camera's endpoint, on its alternate zero - `None` for an isochronous camera.
+	pub bulk_in: Option<Endpoint>,
+	/// An isochronous camera's alternates, each with its IN endpoint, in the order they came - empty for a bulk one.
+	pub iso: Vec<IsoAlternate>,
 	/// UVC's version, from the control interface's header: the probe structure's length follows it.
 	pub version: u16,
 	/// The streaming interface's class-specific records: what `normalize` reads.
@@ -360,16 +395,20 @@ impl Binding {
 	}
 }
 
-/// The video function of one configuration, when it streams over bulk.
+/// THE VIDEO FUNCTION OF ONE CONFIGURATION: a bulk camera by the IN endpoint on its streaming interface's alternate
+/// zero, an isochronous one by the IN endpoints its later alternates carry - alternate zero being, by the class, the
+/// zero-bandwidth setting an isochronous camera rests in.
 pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	let parsed = Configuration::parse(config).map_err(NotBindable::Malformed)?;
 	let control = parsed.settings.iter().find(|setting| setting.is(CLASS_VIDEO, SUBCLASS_CONTROL)).ok_or(NotBindable::NoVideoInterface)?;
 	let version = parsed.functional(control).find(|record| record.kind == CS_INTERFACE && record.field(2) == Ok(VC_HEADER)).and_then(|record| record.field16(3).ok()).unwrap_or(0x0100);
 	let streaming = parsed.settings.iter().find(|setting| setting.is(CLASS_VIDEO, SUBCLASS_STREAMING) && setting.alternate == 0).ok_or(NotBindable::NoVideoInterface)?;
-	let Some(bulk_in) = streaming.first(Endpoint::is_bulk_in) else {
-		return Err(NotBindable::Isochronous);
-	};
-	Ok(Binding { config_value: parsed.value, control_interface: control.interface, streaming_interface: streaming.interface, bulk_in, version, graph: parsed.functional_bytes(streaming).to_vec() })
+	let bulk_in = streaming.first(Endpoint::is_bulk_in);
+	let iso: Vec<IsoAlternate> = if bulk_in.is_some() { Vec::new() } else { parsed.settings.iter().filter(|setting| setting.interface == streaming.interface && setting.alternate != 0).filter_map(|setting| setting.first(|endpoint| endpoint.transfer() == TRANSFER_ISOCHRONOUS && endpoint.is_in()).map(|endpoint| IsoAlternate { alternate: setting.alternate, endpoint })).collect() };
+	if bulk_in.is_none() && iso.is_empty() {
+		return Err(NotBindable::NoStreamingEndpoint);
+	}
+	Ok(Binding { config_value: parsed.value, control_interface: control.interface, streaming_interface: streaming.interface, bulk_in, iso, version, graph: parsed.functional_bytes(streaming).to_vec() })
 }
 
 /// The probe (or commit) control for this selection, at the device's structure length.
@@ -483,16 +522,30 @@ impl Open {
 ///   - ERR, or a header that is not one, loses the open frame, and nothing more of it is written;
 ///   - data past the buffer, or past the most a frame may be, loses the frame and is not written;
 ///   - a frame that found no buffer is still assembled to its end, so that its end is seen, and ends unbuffered.
+///
+/// AND AN ISOCHRONOUS TRANSPORT LOSES PACKETS, which a bulk one never does: `lost` says one was missed. The frame open
+/// when it happened has a hole in it and is lost; with none open, the packet may have been the start of the next, so
+/// the next frame to open is lost too - and nothing after it.
 #[derive(Default)]
 pub struct Assembler {
 	frame: Option<Open>,
 	/// The FID of the frame that ended last.
 	ended: Option<bool>,
+	/// A packet was lost with no frame open: the next one to open may be missing its start.
+	lost_between: bool,
 }
 
 impl Assembler {
 	pub const fn new() -> Self {
-		Assembler { frame: None, ended: None }
+		Assembler { frame: None, ended: None, lost_between: false }
+	}
+
+	/// A PACKET WAS LOST - missed, or failed in the transport: whatever frame it belonged to is lost.
+	pub fn lost(&mut self) {
+		match self.frame.as_mut() {
+			Some(frame) => frame.bad = true,
+			None => self.lost_between = true,
+		}
 	}
 
 	/// One payload into the frame it belongs to. `limit` is the most a frame may be: the committed frame size.
@@ -510,7 +563,8 @@ impl Assembler {
 		if self.frame.is_none() && self.ended == Some(header.fid) {
 			return;
 		}
-		let frame = self.frame.get_or_insert_with(|| Open { fid: header.fid, capacity: sink.open(), written: 0, bad: false });
+		let lost_between = core::mem::take(&mut self.lost_between);
+		let frame = self.frame.get_or_insert_with(|| Open { fid: header.fid, capacity: sink.open(), written: 0, bad: lost_between });
 		frame.bad |= header.err;
 		let data = &transfer[header.data..];
 		if let Some(capacity) = frame.capacity

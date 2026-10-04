@@ -67,7 +67,7 @@ fn admin_event_wire_is_stable() {
 }
 #[test]
 fn admin_record_wire_is_stable() {
-	let sample = AdminRecord { sequence: 7, broker_epoch: 7, request: 7, launch: 7, requester: String::from("x"), action: 7, digest: alloc::vec![7], event: AdminEvent::Requested, reason: String::from("x"), monotonic_ns: 7, utc_seconds: Some(7), utc_provenance: String::from("x") };
+	let sample = AdminRecord { sequence: 7, broker_epoch: 7, request: 7, launch: 7, requester: String::from("x"), action: 7, digest: alloc::vec![7], event: AdminEvent::Requested, reason: String::from("x"), monotonic_ns: 7, utc_seconds: Some(7), utc_provenance: String::from("x"), result_length: 7, result_digest: alloc::vec![7] };
 	let bytes = sample.encode_vec().expect("encode");
 	let golden: &[u8] = &[
 		7,
@@ -133,13 +133,20 @@ fn admin_record_wire_is_stable() {
 		1,
 		0,
 		120,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		7,
 	];
 	assert_eq!(bytes, golden);
 	assert_eq!(AdminRecord::decode(&bytes).unwrap(), sample);
 }
 #[test]
 fn admin_journal_page_wire_is_stable() {
-	let sample = AdminJournalPage { records: alloc::vec![AdminRecord { sequence: 7, broker_epoch: 7, request: 7, launch: 7, requester: String::from("x"), action: 7, digest: alloc::vec![7], event: AdminEvent::Requested, reason: String::from("x"), monotonic_ns: 7, utc_seconds: Some(7), utc_provenance: String::from("x") }], oldest: 7, next: 7, evicted: 7 };
+	let sample = AdminJournalPage { records: alloc::vec![AdminRecord { sequence: 7, broker_epoch: 7, request: 7, launch: 7, requester: String::from("x"), action: 7, digest: alloc::vec![7], event: AdminEvent::Requested, reason: String::from("x"), monotonic_ns: 7, utc_seconds: Some(7), utc_provenance: String::from("x"), result_length: 7, result_digest: alloc::vec![7] }], oldest: 7, next: 7, evicted: 7 };
 	let bytes = sample.encode_vec().expect("encode");
 	let golden: &[u8] = &[
 		1,
@@ -207,6 +214,13 @@ fn admin_journal_page_wire_is_stable() {
 		1,
 		0,
 		120,
+		7,
+		0,
+		0,
+		0,
+		1,
+		0,
+		7,
 		7,
 		0,
 		0,

@@ -12,3 +12,6 @@ method pcm-capture.close op=2 () -> result<unit, liber:base@1::error>
 interface audio-admin
 method audio-admin.open-streams op=1 () -> result<handle<channel>, liber:base@1::error>
 method audio-admin.open-captures op=2 () -> result<handle<channel>, liber:base@1::error>
+record audio-resources(counted:bool,underruns:u64,silent-frames:u64,feedback-q16:u32,feedback-ignored:u64)
+interface audio-stats
+method audio-stats.resources op=1 () -> audio-resources

@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::{ChannelTransport, SvcTransport};
-use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, CoreIdle, CoreIdleState, CoreLevel, CoreWakeSource, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, device, display_stats, provider_catalogue, supervisor, system_graph};
+use proto::system::{AudioResources, BindingRecord, BindingState, Component, ComponentState, ComponentType, CoreIdle, CoreIdleState, CoreLevel, CoreWakeSource, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, audio_stats, device, display_stats, provider_catalogue, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -58,6 +58,8 @@ struct GraphService {
 	/// the display path holds, and nothing on it can change a thing. Zero when the boot granted
 	/// none, which is a smaller graph rather than a broken one.
 	display_stats: u64,
+	// AudioService's observation root, or 0: the playing device's counters.
+	audio_stats: u64,
 }
 
 // A binding state as the graph's component state. The two vocabularies meet HERE and nowhere else,
@@ -132,6 +134,7 @@ impl system_graph::Service for GraphService {
 			};
 			components.push(Component { name: node.name.clone(), r#type: ComponentType::Service, state, deps: node.deps.clone(), counters, resources: Vec::new() });
 		}
+		print(b"DEBUG-GRAPH process.stats\n");
 		spans.push(TraceSpan { name: String::from("process.stats"), duration_ns: clock_ns().wrapping_sub(stats_start) });
 
 		// Device nodes: enumerate the hardware devices over the DeviceService connection,
@@ -144,6 +147,7 @@ impl system_graph::Service for GraphService {
 			Some(Ok(d)) => d,
 			_ => Vec::new(),
 		};
+		print(b"DEBUG-GRAPH device.list\n");
 		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: clock_ns().wrapping_sub(list_start) });
 		// THE BINDINGS, from the one process that holds them.
 		//
@@ -203,6 +207,7 @@ impl system_graph::Service for GraphService {
 					}
 				}
 			}
+			print(b"DEBUG-GRAPH supervisor.status\n");
 			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: clock_ns().wrapping_sub(sup_start) });
 		}
 
@@ -223,12 +228,30 @@ impl system_graph::Service for GraphService {
 					}
 				}
 			}
+			print(b"DEBUG-GRAPH display.resources\n");
 			spans.push(TraceSpan { name: String::from("display.resources"), duration_ns: clock_ns().wrapping_sub(display_start) });
+		}
+
+		// AND WHAT THE PLAYING DEVICE COUNTED, from AudioService: its dry spells and the silence played in their
+		// place, under the audio service - nothing for a device that keeps no counters.
+		if self.audio_stats != 0 {
+			let audio_start: u64 = clock_ns();
+			if let Some(resources) = audio_stats::Client::new(ChannelTransport { chan: self.audio_stats }).resources() {
+				for component in components.iter_mut() {
+					if component.name.as_bytes() == b"audio_service" {
+						component.resources = audio_rows(&resources);
+						break;
+					}
+				}
+			}
+			print(b"DEBUG-GRAPH audio.resources\n");
+			spans.push(TraceSpan { name: String::from("audio.resources"), duration_ns: clock_ns().wrapping_sub(audio_start) });
 		}
 
 		// HOW EACH CORE RESTS, from the kernel's own per-core record: a free read, one core at a time.
 		let cores_start: u64 = clock_ns();
 		let cores = idle_rows();
+		print(b"DEBUG-GRAPH cpu.idle\n");
 		spans.push(TraceSpan { name: String::from("cpu.idle"), duration_ns: clock_ns().wrapping_sub(cores_start) });
 
 		Ok(Graph { components, spans, cores })
@@ -276,6 +299,18 @@ fn display_rows(resources: &DisplayResources) -> Vec<ResourceCount> {
 	]
 }
 
+// THE PLAYING DEVICE'S COUNTERS AS ROWS: counts with no bound, because nothing is refused at one - and none at all
+// for a device that keeps no counters, whose zeros would read as a clean record it does not have.
+fn audio_rows(resources: &AudioResources) -> Vec<ResourceCount> {
+	if !resources.counted {
+		return Vec::new();
+	}
+	alloc::vec![
+		ResourceCount { name: String::from("playback-underruns"), live: resources.underruns, bound: 0 },
+		ResourceCount { name: String::from("silent-frames"), live: resources.silent_frames, bound: 0 },
+	]
+}
+
 // Map a kernel ProcessStats liveness code to the typed component state.
 fn map_state(state: u64) -> ComponentState {
 	match state {
@@ -315,6 +350,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// DisplayService's OBSERVATION root, or 0 on a boot that granted none - in which case the graph
 	// reports no display resources rather than inventing any.
 	let mut display_stats_client: u64 = 0;
+	// AudioService's, likewise optional.
+	let mut audio_stats_client: u64 = 0;
 	let service: u64 = loop {
 		match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } => {
@@ -326,6 +363,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					bindings_client = handle;
 				} else if len >= 7 && &buf[..7] == b"DISPLAY" {
 					display_stats_client = handle;
+				} else if len >= 5 && &buf[..5] == b"AUDIO" {
+					audio_stats_client = handle;
 				} else if len >= 6 && &buf[..6] == b"DEVICE" {
 					device_client = handle;
 				} else if len >= 5 && &buf[..5] == b"SERVE" {
@@ -348,7 +387,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    name requires: the supervisor mints a fresh connection per client from this root, so a
 	//    client that lost its channel when this process was replaced can ask for another. A
 	//    service served on one channel can be restarted, but nobody can reconnect to it.
-	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client, display_stats: display_stats_client };
+	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client, display_stats: display_stats_client, audio_stats: audio_stats_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	// SIZED FOR THE WHOLE GRAPH, which is one component per supervised service and one per device-table
 	// row, each carrying its dependency names. Four kilobytes held the graph while the service set was

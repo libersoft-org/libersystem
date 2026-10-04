@@ -304,9 +304,9 @@ fn hci_packet_kind_wire_is_stable() {
 }
 #[test]
 fn hci_attachment_wire_is_stable() {
-	let sample = HciAttachment { version: 7, iso: true, max_command: 7, max_event: 7, max_acl: 7, max_iso: 7, command_credits: 7, acl_credits: 7, acl_queue: 7, epoch: 7 };
+	let sample = HciAttachment { version: 7, iso: true, max_command: 7, max_event: 7, max_acl: 7, max_iso: 7, command_credits: 7, acl_credits: 7, acl_queue: 7, epoch: 7, sco: true, max_sco: 7 };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(HciAttachment::decode(&bytes).unwrap(), sample);
 }

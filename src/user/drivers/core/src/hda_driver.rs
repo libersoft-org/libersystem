@@ -786,6 +786,11 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 					stop_capture(controller);
 					send_blocking(service, audio::OK, 0);
 				}
+				// THIS PROVIDER PLAYS A PERIOD AT A TIME AND KEEPS NO PLAYBACK COUNTERS: refused, which AudioService reads
+				// as "no counters".
+				audio::Message::Stats => {
+					send_blocking(service, audio::REFUSED, 0);
+				}
 				// A LENGTH THIS WIRE HAS NO SHAPE FOR IS ANSWERED AND NOT PLAYED. Playing a short
 				// message as a period is part of a period played as though it were whole.
 				audio::Message::Unknown => {

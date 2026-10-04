@@ -90,6 +90,8 @@ pub struct Binding {
 	/// The notification endpoint's address, when the control interface publishes one. An adapter
 	/// that does not is one whose link state cannot be asked for.
 	pub notification: Option<u8>,
+	/// And its bInterval, as the descriptor has it - frames at full speed, an exponent at high speed.
+	pub notification_interval: u8,
 	/// The data interface named by the union descriptor, and the setting its endpoints are in.
 	pub data_interface: u8,
 	pub data_alternate: u8,
@@ -152,6 +154,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	let mut model: Option<Model> = None;
 	let mut control_interface: Option<u8> = None;
 	let mut notification: Option<u8> = None;
+	let mut notification_interval: u8 = 0;
 	let mut union_data: Option<u8> = None;
 	let mut mac_string: Option<u8> = None;
 	let mut max_segment: u16 = 0;
@@ -218,6 +221,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 				// an OUT one is not something an adapter reports through.
 				if attributes & 0x03 == 0x03 && address & 0x80 != 0 {
 					notification = Some(address);
+					notification_interval = record.field(6).unwrap_or(0);
 				}
 			}
 			descriptor::DT_ENDPOINT => {
@@ -254,7 +258,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	if union_data != data_interface {
 		return Err(NotBindable::NoDataInterface);
 	}
-	Ok(Binding { model, config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, notification, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, mac_string, max_segment })
+	Ok(Binding { model, config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, notification, notification_interval, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, mac_string, max_segment })
 }
 
 /// Decode the MAC address a device publishes as a string descriptor.

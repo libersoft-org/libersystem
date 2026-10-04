@@ -460,10 +460,12 @@ impl Encoder {
 // THE TRANSPORT'S HALF: which interface setting a USB MIDI 1.0 device's packets arrive on, how many cables its
 // receive endpoint carries - and the endpoint of the same setting packets are SENT on, with its own count.
 //
-// MIDI 1.0 AND NOTHING ELSE. A MIDI Streaming interface's class header names its revision, and a device that
-// speaks USB MIDI 2.0 puts that on an alternate setting whose packets are Universal MIDI Packets - which the
-// provider contract does not carry. So the setting bound is the one whose header says 1.0, and a 2.0 setting
-// beside it is left alone rather than read as event packets.
+// MIDI 1.0 FIRST, AND UMP BESIDE IT. A MIDI Streaming interface's class header names its revision, and a device that
+// speaks USB MIDI 2.0 puts that on an alternate setting of the same interface whose packets are Universal MIDI
+// Packets - and keeps the MIDI 1.0 face on alternate zero, as the specification requires. So the setting bound is the
+// one whose header says 1.0, and a 2.0 setting beside it is bound AS UMP (`Binding::ump`), never read as event packets:
+// its endpoints and the Group Terminal Blocks each names, the blocks themselves read from the device by the class
+// request (`ump::blocks`).
 
 use crate::usb_function::{Configuration, DT_CS_ENDPOINT, DT_CS_INTERFACE, Endpoint, Refused};
 
@@ -474,6 +476,9 @@ pub const MS_HEADER: u8 = 0x01;
 pub const MS_REVISION_1_0: u16 = 0x0100;
 /// The class-specific endpoint descriptor that says how many embedded jacks - cables - an endpoint carries.
 pub const MS_GENERAL: u8 = 0x01;
+/// A MIDI 2.0 setting's revision, and its endpoints' record naming the Group Terminal Blocks each carries.
+pub const MS_REVISION_2_0: u16 = 0x0200;
+pub const MS_GENERAL_2_0: u8 = 0x02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotBindable {
@@ -496,6 +501,54 @@ pub struct Binding {
 	/// The OUT endpoint of the same setting and the cables IT carries, which need not be the receive side's:
 	/// a device with two inputs and one output is ordinary. `None` for a device that only sends.
 	pub output: Option<(Endpoint, u8)>,
+	/// The same interface's MIDI 2.0 setting, when it has one that is whole.
+	pub ump: Option<UmpSetting>,
+}
+
+/// THE BLOCK IDS ONE UMP ENDPOINT CARRIES, as its `MS_GENERAL_2_0` record lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockIds {
+	ids: [u8; crate::ump::MAX_BLOCKS],
+	count: u8,
+}
+
+impl BlockIds {
+	pub fn as_slice(&self) -> &[u8] {
+		&self.ids[..self.count as usize]
+	}
+}
+
+/// A MIDI 2.0 setting: its alternate, its UMP endpoints, and the blocks each names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UmpSetting {
+	pub alternate: u8,
+	pub input: (Endpoint, BlockIds),
+	pub output: Option<(Endpoint, BlockIds)>,
+}
+
+/// The Group Terminal Block ids an endpoint's `MS_GENERAL_2_0` record names - `None` with no record, or one that names
+/// none, more than `MAX_BLOCKS`, or block zero, which no block is.
+fn blocks_of(parsed: &Configuration<'_>, endpoint: &Endpoint) -> Option<BlockIds> {
+	let general = parsed.endpoint_extra(endpoint).find(|record| record.kind == DT_CS_ENDPOINT && record.field(2) == Ok(MS_GENERAL_2_0))?;
+	let count = general.field(3).ok()?;
+	if count == 0 || count as usize > crate::ump::MAX_BLOCKS {
+		return None;
+	}
+	let mut ids = [0u8; crate::ump::MAX_BLOCKS];
+	for (at, id) in ids.iter_mut().take(count as usize).enumerate() {
+		*id = general.field(4 + at).ok().filter(|&id| id != 0)?;
+	}
+	Some(BlockIds { ids, count })
+}
+
+/// The MIDI 2.0 setting of `interface`: its header says 2.0, its IN endpoint names its blocks, and its OUT endpoint, if
+/// it has one that names blocks, goes with it. Anything less is no UMP face - the MIDI 1.0 one still binds.
+fn ump_setting(parsed: &Configuration<'_>, interface: u8) -> Option<UmpSetting> {
+	let carries = |endpoint: &&Endpoint| endpoint.transfer() == crate::usb_function::TRANSFER_BULK || endpoint.transfer() == crate::usb_function::TRANSFER_INTERRUPT;
+	let setting = parsed.settings.iter().find(|setting| setting.interface == interface && setting.is(CLASS_AUDIO, SUBCLASS_MIDI_STREAMING) && parsed.functional(setting).any(|record| record.kind == DT_CS_INTERFACE && record.field(2) == Ok(MS_HEADER) && record.field16(3) == Ok(MS_REVISION_2_0)))?;
+	let input = setting.endpoints.iter().filter(carries).filter(|endpoint| endpoint.is_in()).find_map(|endpoint| blocks_of(parsed, endpoint).map(|ids| (*endpoint, ids)))?;
+	let output = setting.endpoints.iter().filter(carries).filter(|endpoint| !endpoint.is_in()).find_map(|endpoint| blocks_of(parsed, endpoint).map(|ids| (*endpoint, ids)));
+	Some(UmpSetting { alternate: setting.alternate, input, output })
 }
 
 /// How many cables an endpoint's class-specific record says it carries, if it has one.
@@ -530,7 +583,8 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 					break;
 				}
 			}
-			return Ok(Binding { config_value: parsed.value, interface: setting.interface, alternate: setting.alternate, input: *endpoint, cables, output });
+			let ump = ump_setting(&parsed, setting.interface);
+			return Ok(Binding { config_value: parsed.value, interface: setting.interface, alternate: setting.alternate, input: *endpoint, cables, output, ump });
 		}
 	}
 	Err(NotBindable::NoReceiveEndpoint)

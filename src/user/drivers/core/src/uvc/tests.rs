@@ -200,6 +200,12 @@ fn the_colour_matrix_follows_the_uvc_code_points() {
 // streaming interface whose alternate zero carries the bulk endpoint, an input header, one YUY2 format with one
 // 64x48 frame, and its colour matching.
 fn usb_camera(bulk: bool) -> Vec<u8> {
+	usb_camera_with(bulk, &[])
+}
+
+// AND AN ISOCHRONOUS ONE: alternate zero with no endpoint, then one alternate per packet size, each carrying
+// isochronous IN 0x81 with that `wMaxPacketSize`.
+fn usb_camera_with(bulk: bool, iso: &[u16]) -> Vec<u8> {
 	use crate::descriptor;
 	let mut out: Vec<u8> = alloc::vec![9, descriptor::DT_CONFIG, 0, 0, 2, 1, 0, 0x80, 50];
 	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 0, CLASS_VIDEO, SUBCLASS_CONTROL, 0, 0]);
@@ -221,6 +227,12 @@ fn usb_camera(bulk: bool) -> Vec<u8> {
 	if bulk {
 		out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x81, 0x02, 0x00, 0x02, 0]);
 	}
+	for (at, packet) in iso.iter().enumerate() {
+		out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, at as u8 + 1, 1, CLASS_VIDEO, SUBCLASS_STREAMING, 0, 0]);
+		out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x81, 0x05]);
+		out.extend_from_slice(&packet.to_le_bytes());
+		out.push(1);
+	}
 	let total = out.len() as u16;
 	out[2..4].copy_from_slice(&total.to_le_bytes());
 	out
@@ -229,15 +241,35 @@ fn usb_camera(bulk: bool) -> Vec<u8> {
 #[test]
 fn a_bulk_streaming_camera_binds_and_its_graph_normalizes() {
 	let bound = bind(&usb_camera(true)).expect("a bulk camera binds");
-	assert_eq!((bound.control_interface, bound.streaming_interface, bound.bulk_in.address, bound.version, bound.probe_length()), (0, 1, 0x81, 0x0110, 34));
+	assert_eq!((bound.control_interface, bound.streaming_interface, bound.bulk_in.map(|endpoint| endpoint.address), bound.version, bound.probe_length()), (0, 1, Some(0x81), 0x0110, 34));
 	let normalized = normalize(&bound.graph).expect("the streaming records normalize, header and all");
 	assert_eq!(normalized.formats.len(), 1);
 	assert_eq!((normalized.formats[0].sizes[0].width, normalized.formats[0].sizes[0].height), (64, 48));
 }
 
 #[test]
-fn an_isochronous_camera_is_refused_by_name() {
-	assert_eq!(bind(&usb_camera(false)), Err(NotBindable::Isochronous));
+fn an_isochronous_camera_binds_by_its_alternates_and_one_with_no_endpoint_is_refused_by_name() {
+	let bound = bind(&usb_camera_with(false, &[256, 512, 1023])).expect("an isochronous camera binds");
+	assert_eq!(bound.bulk_in, None);
+	assert_eq!(bound.iso.iter().map(|alternate| (alternate.alternate, alternate.endpoint.address, alternate.capacity(false))).collect::<Vec<_>>(), alloc::vec![(1, 0x81, 256), (2, 0x81, 512), (3, 0x81, 1023)]);
+	assert!(normalize(&bound.graph).is_ok(), "its alternate zero carries the whole graph");
+	assert_eq!(bind(&usb_camera(false)), Err(NotBindable::NoStreamingEndpoint));
+}
+
+#[test]
+fn the_alternate_is_the_smallest_that_carries_the_committed_payload() {
+	let bound = bind(&usb_camera_with(false, &[1023, 256, 512, 512])).expect("binds");
+	assert_eq!(alternate_for(&bound.iso, 512, false).map(|chosen| chosen.alternate), Ok(3), "the first of the two that carry exactly enough");
+	assert_eq!(alternate_for(&bound.iso, 257, false).map(|chosen| chosen.alternate), Ok(3));
+	assert_eq!(alternate_for(&bound.iso, 1, false).map(|chosen| chosen.alternate), Ok(2), "the smallest, whatever its number");
+	assert_eq!(alternate_for(&bound.iso, 1024, false), Err(NoBandwidth { needed: 1024, most: 1023 }), "none carries it, and the refusal says the most there is");
+	// THE HIGH-BANDWIDTH BITS COUNT AT HIGH SPEED ALONE: 1024 bytes and two more packets a microframe is 3072.
+	let wide = bind(&usb_camera_with(false, &[0x1400, 1024])).expect("binds");
+	assert_eq!(wide.iso[0].capacity(true), 3072);
+	assert_eq!(wide.iso[0].capacity(false), 1024, "a full-speed endpoint has no such bits to count");
+	assert_eq!(alternate_for(&wide.iso, 2048, true).map(|chosen| chosen.alternate), Ok(1));
+	assert!(alternate_for(&wide.iso, 2048, false).is_err());
+	assert!(alternate_for(&[], 1, false).is_err(), "no alternate at all");
 }
 
 #[test]
@@ -407,4 +439,24 @@ fn an_eof_with_no_data_ends_the_frame() {
 	let mut buffers = Buffers::queued(&[8]);
 	feed(&mut assembler, &mut buffers, &[part(false, false, false, &[1, 2]), part(false, true, false, &[])]);
 	assert_eq!(buffers.ended[0].0, Assembled { buffered: true, written: 2, bad: false, eof: true });
+}
+
+#[test]
+fn a_lost_packet_loses_its_frame_and_nothing_after_it() {
+	// LOST INSIDE A FRAME: the frame ends as bad, the next is whole.
+	let mut assembler = Assembler::new();
+	let mut buffers = Buffers::queued(&[16, 16, 16]);
+	feed(&mut assembler, &mut buffers, &[part(false, false, false, &[1, 2])]);
+	assembler.lost();
+	feed(&mut assembler, &mut buffers, &[part(false, true, false, &[4]), part(true, false, false, &[5]), part(true, true, false, &[6])]);
+	assert_eq!(buffers.ended.len(), 2);
+	assert!(buffers.ended[0].0.bad && !buffers.ended[0].0.whole(None), "the frame with a hole in it is lost");
+	assert!(buffers.ended[1].0.whole(Some(2)), "and the one after it is whole");
+	// LOST BETWEEN FRAMES: the next frame may be missing its start, and is lost; the one after it is not.
+	let mut assembler = Assembler::new();
+	let mut buffers = Buffers::queued(&[16, 16, 16]);
+	feed(&mut assembler, &mut buffers, &[part(false, true, false, &[1])]);
+	assembler.lost();
+	feed(&mut assembler, &mut buffers, &[part(true, true, false, &[2]), part(false, true, false, &[3])]);
+	assert_eq!(buffers.ended.iter().map(|(frame, _)| frame.bad).collect::<Vec<_>>(), alloc::vec![false, true, false]);
 }

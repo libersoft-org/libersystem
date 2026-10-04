@@ -403,6 +403,7 @@ fn system_volume_spans_the_disks_capacity() {
 	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+	crate::tests::send_no_hibernation(&boot_kernel);
 
 	// serve the raw block protocol over the sparse disk until the service reports in.
 	let mut disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> = crate::tests::whole_device_volume((expected_pool * 4096) as usize);
@@ -519,6 +520,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+	crate::tests::send_no_hibernation(&boot_kernel);
 
 	let mut online = false;
 	'serve: for _ in 0..100_000 {
@@ -579,6 +581,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+	crate::tests::send_no_hibernation(&boot_kernel);
 
 	let header_before = disk.get(&1).expect("the GPT header is on the disk").clone();
 	let entries_before = disk.get(&2).expect("the entry array is on the disk").clone();
@@ -617,6 +620,7 @@ fn storage_on_disk(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<
 	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+	crate::tests::send_no_hibernation(&boot_kernel);
 	for _ in 0..100_000 {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, disk, capacity);

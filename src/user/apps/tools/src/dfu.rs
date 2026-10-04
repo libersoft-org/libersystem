@@ -1,17 +1,27 @@
-// dfu - ask for a firmware image to be written to a USB DFU target, through the trusted administrative path.
+// dfu - ask for a firmware image to be written to a USB DFU target, or for a target's firmware to be read out of it,
+// through the trusted administrative path.
 //
 //   dfu TARGET IMAGE
+//   dfu backup TARGET FILE [MAX]
 //
 // TARGET names the device the way the DFU executor answers to: `dfu:VVVV:PPPP` by vendor and product, or the
 // live binding it prints (`dfu:port3.0/if0/1d6b:0104`). IMAGE is a file, relative to the working directory or an
 // absolute URI - a DFU 1.1 image, whose suffix, where it has one, the executor holds against the target.
 //
-// NOTHING IS WRITTEN BECAUSE THIS PROGRAM ASKED. It puts one request to AdminService on the request connection
-// PermissionManager minted for this launch - the `dfu` scope: firmware download, on `dfu:` targets, and nothing
-// else - and AdminService shows the operation, frozen, on the protected screen. Only a person's confirmation
-// there turns the request into a grant, and the grant into one attempt; a decline, or no answer, writes nothing.
-// What the device then reports is printed as it came: completed, refused, or an end nobody observed - which is
-// never retried and never described as rolled back, because DFU gives a host no rollback to promise.
+// NOTHING IS WRITTEN - OR READ - BECAUSE THIS PROGRAM ASKED. It puts one request to AdminService on the request
+// connection PermissionManager minted for this launch - the `dfu` scope: firmware download and upload, on `dfu:`
+// targets, and nothing else - and AdminService shows the operation, frozen, on the protected screen. Only a person's
+// confirmation there turns the request into a grant, and the grant into one attempt; a decline, or no answer, does
+// nothing. What the device then reports is printed as it came: completed, refused, or an end nobody observed - which
+// is never retried and never described as rolled back, because DFU gives a host no rollback to promise.
+//
+// A BACKUP reads the target's firmware OUT - at most MAX bytes, a mebibyte unless named - into FILE: an explicit
+// request, confirmed like a download, since a firmware image can hold the device's own secrets and licensed code. A
+// TRANSACTIONAL WRITER over FILE is opened before anything is asked - a destination this program cannot write is
+// refused before the screen is shown - and the image is committed through it only when it is whole: the volume
+// publishes a writer's bytes at its commit, as the file's whole contents, and an aborted one publishes nothing, so a
+// failed backup never leaves a file that looks like one. A target that does not declare upload is refused before the
+// screen too, by its executor.
 
 #![no_std]
 #![no_main]
@@ -21,10 +31,14 @@ extern crate alloc;
 use admin_client::{AdminAuthorityClient, AdminRequestClient};
 use alloc::format;
 use alloc::string::String;
-use proto::system::{AdminAction, AdminAnswer, AdminRequestArgs, AdminResult, LaunchContext, OpenOpts};
+use alloc::vec::Vec;
+use proto::system::{AdminAction, AdminAnswer, AdminRead, AdminRequestArgs, AdminResult, LaunchContext, OpenOpts, WriterMode};
 use rt::*;
 use storage_proto::path;
-use volume_client::VolumeClient;
+use volume_client::{VolumeClient, WRITER_CHUNK, WriterClient};
+
+// The largest image a backup reads unless the command names less - the executor's own bound.
+const MAX_UPLOAD: u32 = 1 << 20;
 
 fn say(line: &str) {
 	eprint(b"dfu: ");
@@ -51,22 +65,152 @@ unsafe fn image_of(storage: u64, uri: &str) -> (u64, u32) {
 		}
 		let size = opened.size as usize;
 		let Some(from) = map_object(opened.file) else { fail(&format!("{uri}: cannot be mapped")) };
-		let copy = memory_object_create(size as u64);
-		if copy < 0 {
-			fail("no memory for the image");
-		}
-		let copy = copy as u64;
-		let Some(to) = map_object(copy) else { fail("the image's copy cannot be mapped") };
-		core::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, size);
+		let (shared, _) = shared_copy(core::slice::from_raw_parts(from as *const u8, size));
 		unmap_object(opened.file);
 		close(opened.file);
-		unmap_object(copy);
-		let shared = duplicate(copy, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		close(copy);
-		if shared < 0 {
-			fail("the image cannot be handed over");
+		(shared, size as u32)
+	}
+}
+
+// Bytes in an object of this program's own, handed over read-only.
+fn shared_copy(bytes: &[u8]) -> (u64, u32) {
+	let copy = memory_object_create(bytes.len() as u64);
+	if copy < 0 {
+		fail("no memory for the request");
+	}
+	let copy = copy as u64;
+	let Some(to) = (unsafe { map_object(copy) }) else { fail("the request's copy cannot be mapped") };
+	unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, bytes.len()) };
+	unmap_object(copy);
+	let shared = duplicate(copy, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+	close(copy);
+	if shared < 0 {
+		fail("the request cannot be handed over");
+	}
+	(shared as u64, bytes.len() as u32)
+}
+
+fn hex(bytes: &[u8]) -> String {
+	let mut out = String::new();
+	for byte in bytes {
+		out.push_str(&format!("{byte:02x}"));
+	}
+	out
+}
+
+fn download(connection: u64, target: &str, file: &str, storage: u64, uri: &str) {
+	let (payload, length) = unsafe { image_of(storage, uri) };
+	let args = AdminRequestArgs { action: AdminAction::FirmwareDownload, target: String::from(target), parameters: Vec::new(), payload_length: length, label: format!("firmware {file}") };
+	say(&format!("{file} ({length} bytes) for {target} - confirm it on the protected screen"));
+	match AdminRequestClient::new(connection).request(&args, payload) {
+		Some(Ok(AdminAnswer::Granted(grant))) => {
+			say("confirmed - writing it");
+			let outcome = AdminAuthorityClient::new(grant.grant).execute();
+			close(grant.grant);
+			match outcome {
+				Some(Ok(AdminResult::Completed)) => say("completed - the device took the image and manifested it"),
+				Some(Ok(AdminResult::Failed)) => say("failed - the device refused the image; nothing is claimed about what it holds now"),
+				Some(Ok(AdminResult::OutcomeUnknown)) => say("the end was not observed - the device went silent or left; it is not retried"),
+				Some(Err(error)) => say(&format!("not started: {error:?}")),
+				None => say("the attempt went unanswered"),
+			}
 		}
-		(shared as u64, size as u32)
+		Some(Ok(AdminAnswer::Declined)) => say("declined - nothing was written"),
+		Some(Err(error)) => say(&format!("refused: {error:?}")),
+		None => say("the request went unanswered - nothing was written"),
+	}
+}
+
+// THE IMAGE, COMMITTED WHOLE through the writer opened for it: true once FILE holds all of it and nothing else.
+fn keep(mut writer: WriterClient, image: u64, length: u32) -> bool {
+	let Some(addr) = (unsafe { map_object(image) }) else {
+		let _ = writer.abort();
+		close(writer.handle());
+		return false;
+	};
+	let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, length as usize) };
+	let mut written = true;
+	for chunk in bytes.chunks(WRITER_CHUNK) {
+		if !matches!(writer.write(chunk), Some(Ok(_))) {
+			written = false;
+			break;
+		}
+	}
+	unmap_object(image);
+	if !written {
+		let _ = writer.abort();
+		close(writer.handle());
+		return false;
+	}
+	let published = writer.commit();
+	close(writer.handle());
+	matches!(published, Some(Ok(published)) if published == u64::from(length))
+}
+
+// NOTHING IS PUBLISHED: the writer aborted, and FILE is as it was.
+fn forget(mut writer: WriterClient) {
+	let _ = writer.abort();
+	close(writer.handle());
+}
+
+fn backup(connection: u64, target: &str, file: &str, bound: u32, storage: u64, uri: &str) {
+	// THE DESTINATION IS OPENED FOR WRITING BEFORE ANYTHING IS ASKED: one this program cannot write is refused before
+	// the screen.
+	let writer = match VolumeClient::new(storage).open_writer(uri, WriterMode::Replace) {
+		Some(Ok(writer)) => writer,
+		_ => fail(&format!("{file}: cannot be written here - nothing was asked")),
+	};
+	// THE PAYLOAD IS THE TARGET'S NAME, and the parameters the bound and the file - what the screen shows.
+	let (payload, length) = shared_copy(target.as_bytes());
+	let mut parameters = Vec::from(bound.to_le_bytes());
+	parameters.extend_from_slice(uri.as_bytes());
+	let args = AdminRequestArgs { action: AdminAction::FirmwareUpload, target: String::from(target), parameters, payload_length: length, label: format!("backup to {file}") };
+	say(&format!("the firmware of {target}, at most {bound} bytes, into {file} - confirm it on the protected screen"));
+	match AdminRequestClient::new(connection).request(&args, payload) {
+		Some(Ok(AdminAnswer::Granted(grant))) => {
+			say("confirmed - reading it");
+			let outcome = AdminAuthorityClient::new(grant.grant).execute_read();
+			close(grant.grant);
+			match outcome {
+				Some(Ok(AdminRead::Completed(image))) => {
+					let kept = keep(writer, image.image, image.length);
+					close(image.image);
+					if kept {
+						say(&format!("completed - {} bytes, SHA-256 {}, written to {file}", image.length, hex(&image.digest)));
+					} else {
+						say(&format!("the image was read and could not be written to {file} - nothing was published there"));
+					}
+				}
+				Some(Ok(AdminRead::Failed)) => {
+					forget(writer);
+					say("failed - nothing was read out; no file was written");
+				}
+				Some(Ok(AdminRead::OutcomeUnknown)) => {
+					forget(writer);
+					say("the end was not observed - nothing was handed over; it is not retried");
+				}
+				Some(Err(error)) => {
+					forget(writer);
+					say(&format!("not started: {error:?}"));
+				}
+				None => {
+					forget(writer);
+					say("the attempt went unanswered - no file was written");
+				}
+			}
+		}
+		Some(Ok(AdminAnswer::Declined)) => {
+			forget(writer);
+			say("declined - nothing was read");
+		}
+		Some(Err(error)) => {
+			forget(writer);
+			say(&format!("refused: {error:?}"));
+		}
+		None => {
+			forget(writer);
+			say("the request went unanswered - nothing was read");
+		}
 	}
 }
 
@@ -85,9 +229,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let udf = volumes.take(CAP_UDF);
 	let usb = volumes.take(CAP_USB);
 	let connection = recv_tagged(bootstrap, &mut buf, b"ADMINREQUEST").unwrap_or(0);
-	let mut words = context.arguments.split_whitespace();
-	let (Some(target), Some(file), None) = (words.next(), words.next(), words.next()) else {
-		fail("usage: dfu TARGET IMAGE - TARGET is dfu:VVVV:PPPP or the binding the target printed");
+	let words: Vec<&str> = context.arguments.split_whitespace().collect();
+	let (reading, target, file, bound) = match words.as_slice() {
+		["backup", target, file] => (true, *target, *file, MAX_UPLOAD),
+		["backup", target, file, most] => match most.parse::<u32>() {
+			Ok(most) if most > 0 && most <= MAX_UPLOAD => (true, *target, *file, most),
+			_ => fail(&format!("{most}: MAX is a number of bytes from 1 to {MAX_UPLOAD}")),
+		},
+		[target, file] if *target != "backup" => (false, *target, *file, 0),
+		_ => fail("usage: dfu TARGET IMAGE | dfu backup TARGET FILE [MAX] - TARGET is dfu:VVVV:PPPP or the binding the target printed"),
 	};
 	if !target.starts_with("dfu:") {
 		fail(&format!("{target}: not a DFU target - they are named dfu:..."));
@@ -97,25 +247,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let Some(uri) = path::resolve(&context.cwd, file.as_bytes()) else { fail(&format!("{file}: not a path")) };
 	let storage = path::volume_client(&context.cwd, file.as_bytes(), system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
-	let (payload, length) = unsafe { image_of(storage, &uri) };
-	let args = AdminRequestArgs { action: AdminAction::FirmwareDownload, target: String::from(target), parameters: alloc::vec::Vec::new(), payload_length: length, label: format!("firmware {file}") };
-	say(&format!("{file} ({length} bytes) for {target} - confirm it on the protected screen"));
-	match AdminRequestClient::new(connection).request(&args, payload) {
-		Some(Ok(AdminAnswer::Granted(grant))) => {
-			say("confirmed - writing it");
-			let outcome = AdminAuthorityClient::new(grant.grant).execute();
-			close(grant.grant);
-			match outcome {
-				Some(Ok(AdminResult::Completed)) => say("completed - the device took the image and manifested it"),
-				Some(Ok(AdminResult::Failed)) => say("failed - the device refused the image; nothing is claimed about what it holds now"),
-				Some(Ok(AdminResult::OutcomeUnknown)) => say("the end was not observed - the device went silent or left; it is not retried"),
-				Some(Err(error)) => say(&format!("not started: {error:?}")),
-				None => say("the attempt went unanswered"),
-			}
-		}
-		Some(Ok(AdminAnswer::Declined)) => say("declined - nothing was written"),
-		Some(Err(error)) => say(&format!("refused: {error:?}")),
-		None => say("the request went unanswered - nothing was written"),
+	if reading {
+		backup(connection, target, file, bound, storage, &uri);
+	} else {
+		download(connection, target, file, storage, &uri);
 	}
 	exit();
 }

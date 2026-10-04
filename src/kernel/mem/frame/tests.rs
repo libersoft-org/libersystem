@@ -443,6 +443,49 @@ fn a_shared_page_goes_through_the_quarantine_rather_than_the_allocator() {
 	assert!(crate::mem::frame::free_count() >= before_free, "after the drain the frame is back");
 }
 
+// A RETIREMENT FAR LARGER THAN THE QUARANTINE IS ONE SHOOTDOWN, AND EVERY FRAME COMES BACK. It was one shootdown per
+// frame past the queue's capacity - a large memory object took half a minute to free.
+crate::tagged_test!(a_large_retirement_is_one_shootdown_and_gives_every_frame_back, [Frame, Memory], id = "kernel.mem.frame.a_large_retirement_is_one_shootdown_and_gives_every_frame_back", covers = ["kernel"]);
+fn a_large_retirement_is_one_shootdown_and_gives_every_frame_back() {
+	use crate::mem::frame;
+	const FRAMES: usize = 4 * 512 + 7;
+	assert!(frame::drain_quarantine_fully(64), "the shootdown completes on a quiet machine");
+	// THE COUNT MEANS SOMETHING HERE: on one core a shootdown is the local flush and counts nothing, and every
+	// assertion below would hold whatever `retire` did.
+	assert!(crate::smp::cpu_count() > 1, "the suite runs on several cores");
+	let generation = crate::mem::tlb::request_generation();
+	assert!(crate::mem::tlb::shootdown());
+	assert_eq!(crate::mem::tlb::request_generation() - generation, 1, "one shootdown is counted once");
+	let before = frame::free_count();
+	let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(FRAMES);
+	for _ in 0..FRAMES {
+		frames.push(frame::allocate().expect("the test machine has the frames"));
+	}
+	let generation = crate::mem::tlb::request_generation();
+	// SAFETY: allocated above, never mapped, owned here alone.
+	unsafe { frame::retire(&frames) };
+	let shootdowns = crate::mem::tlb::request_generation() - generation;
+	assert!(shootdowns <= 1, "{FRAMES} frames took {shootdowns} shootdowns - one covers them all");
+	assert_eq!(frame::quarantined(), 0, "none of them waits in the quarantine");
+	assert!(frame::free_count() >= before, "and every one is back");
+	// AND A QUEUE FOUND FULL IS DRAINED, NOT PAID FOR FRAME BY FRAME: one frame short of the drain threshold already
+	// waiting, and a retirement the queue's capacity holds but its free places do not.
+	let waiting: alloc::vec::Vec<u64> = (0..63).map(|_| frame::allocate().expect("the test machine has the frames")).collect();
+	for &phys in &waiting {
+		// SAFETY: as above.
+		unsafe { frame::retire(&[phys]) };
+	}
+	assert_eq!(frame::quarantined(), 63, "below the drain threshold, they wait");
+	let more: alloc::vec::Vec<u64> = (0..500).map(|_| frame::allocate().expect("the test machine has the frames")).collect();
+	let generation = crate::mem::tlb::request_generation();
+	// SAFETY: as above.
+	unsafe { frame::retire(&more) };
+	let shootdowns = crate::mem::tlb::request_generation() - generation;
+	assert!(shootdowns <= 2, "500 frames into a queue with room for 449 took {shootdowns} shootdowns");
+	assert!(frame::drain_quarantine_fully(64), "and the drain completes");
+	assert!(frame::free_count() >= before, "every frame is back");
+}
+
 crate::tagged_test!(a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota, [Frame, Memory, Process, Handle], id = "kernel.mem.frame.a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota", covers = ["kernel"]);
 fn a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota() {
 	// `sys_thread_create` took a bootstrap capability with `take_for_transfer`, whose contract is

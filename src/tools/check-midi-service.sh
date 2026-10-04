@@ -1,10 +1,10 @@
 #!/bin/bash
 # MidiService, end to end, against the in-guest MIDI fixture - THE SERVICE, ITS RECEIVERS AND ITS BOUNDS. The
-# fixture delivers raw USB-MIDI 1.0 packet batches the probes script, and MidiService decodes them with the
-# driver library's decoder; success here establishes the bounded event vocabulary, the decoder over real
-# packets, the receiver's queue and lifetime, the sender's round trip through the fixture's loopback and the
-# grants, and says nothing about USB MIDI transport or UMP - the first is the hardware suite's, the second does
-# not exist yet.
+# fixture delivers raw USB-MIDI 1.0 packet batches the probes script, and UMP words on its UMP pair, and MidiService
+# decodes them with the driver library's decoder and UMP layer; success here establishes the bounded event
+# vocabulary, the decoder over real packets, the receiver's queue and lifetime, the sender's round trip through the
+# fixture's loopback, UMP and the translation both ways, and the grants - and says nothing about USB MIDI transport,
+# which is the hardware suite's.
 #
 #   handles return to baseline  MidiService's handles, read from the system graph, are the same after the
 #                                 first probes and after the scenario
@@ -15,7 +15,11 @@
 #   typed faults                `midicheck malformed`
 #   the SysEx cap               `midicheck cap`: 64 kB crossed in small fragments, aborted once by number,
 #                                 never ended; recovery at a new message
-#   unsupported and denied      `midicheck unsupported`
+#   either protocol, denied     `midicheck unsupported`: either protocol needs only a grant
+#   UMP on a MIDI 1.0 endpoint  `midicheck ump`: read as UMP, UMP sent as MIDI 1.0, no MIDI 1.0 form refused
+#   UMP                         `midiump ump`: the UMP endpoint's groups and blocks, every group word for word, a
+#                                 bad batch sending nothing
+#   the translation             `midiump translate`: UMP read as MIDI 1.0 chunks, chunks sent as UMP, and back
 #   sending                     `midicheck send`: a phrase out through the sender and back through the
 #                                 receiver, chunk for chunk; a bad batch sends nothing; a stopped sender is
 #                                 closed
@@ -37,22 +41,23 @@ guest_gate_arch "$@"
 
 fail() { guest_gate_fail "$@"; }
 
-guest_gate_require_programs midi_fixture midicheck midihold midiread midifail midi_service
+guest_gate_require_programs midi_fixture midicheck midiump midihold midiread midifail midi_service
 
 # THE FIXTURE'S DEVICE, at the address its registry entry pins.
 export QEMU_EXTRA="-device edu,addr=0x19"
 # NO NIC. Nothing here needs a network, and a NIC's IPv6 status line - written straight to the port while
 # a `graph` line comes through ConsoleService's mirror - can land inside the service's line and hide its count.
 export NET_NONE=1
-export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-240}"
-export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-400}"
+# THREE UMP PHASES MORE than the budget was set for, a few seconds each.
+export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-270}"
+export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-430}"
 
 expect() {
 	local lines="$1" line="$2" why="$3"
 	grep -qF "$line" "$lines" || {
 		echo "midi-service: expected \"$line\" - $why" >&2
 		echo "--- guest log ---" >&2
-		grep -aE 'midicheck|midihold|midiread|midifail|midi-fixture|MidiService' "$lines" >&2 || cat "$lines" >&2
+		grep -aE 'midicheck|midiump|midihold|midiread|midifail|midi-fixture|MidiService' "$lines" >&2 || cat "$lines" >&2
 		exit 1
 	}
 	echo "midi-service: $line"
@@ -66,11 +71,13 @@ expect() {
 # `fg` BEFORE THE LAST `graph`: the background holder, `midihold hold 2 &`, can still hold what it was granted when
 # the last probe returns, and a count read then is the holder's and not a leak. `fg` waits for it, and says
 # there is no such job when it has already gone.
-guest_gate_run $'midiread\nmidicheck receive\ngraph\nmidicheck malformed\nmidicheck cap\nmidicheck unsupported\nmidicheck send\nmidihold dup | midicheck inherit\nmidihold hold 2 &\nmidihold hold 1\nmidicheck overflow\nmidicheck lost\nmidifail\nmidicheck unplug\nmidicheck fresh\nfg\ngraph' ""
+# `graph midi_service` AND NOT `graph`: the whole graph is a line per service and per device, and on the serial
+# console it outgrows the mirror, which drops the services first - this one's line among them.
+guest_gate_run $'midiread\nmidicheck receive\ngraph midi_service\nmidicheck malformed\nmidicheck cap\nmidicheck unsupported\nmidicheck ump\nmidicheck send\nmidiump ump\nmidiump translate\nmidihold dup | midicheck inherit\nmidihold hold 2 &\nmidihold hold 1\nmidicheck overflow\nmidicheck lost\nmidifail\nmidicheck unplug\nmidicheck fresh\nfg\ngraph midi_service' ""
 lines="$GUEST_LINES"
 
-if grep -aq 'midicheck: FAIL\|midiread: FAIL\|midifail: FAIL' "$lines"; then
-	grep -a 'midicheck: FAIL\|midiread: FAIL\|midifail: FAIL' "$lines" >&2
+if grep -aq 'midicheck: FAIL\|midiump: FAIL\|midiread: FAIL\|midifail: FAIL' "$lines"; then
+	grep -a 'midicheck: FAIL\|midiump: FAIL\|midiread: FAIL\|midifail: FAIL' "$lines" >&2
 	fail "a probe reported a failure"
 fi
 expect "$lines" "driver.midi-fixture: online" "the fixture must bind"
@@ -79,8 +86,11 @@ expect "$lines" "midiread: PASS" "inventory must list and refuse"
 expect "$lines" "midicheck: PASS receive" "bytes, cables, fragments, order and receipt time must hold"
 expect "$lines" "midicheck: PASS malformed" "malformed packets must be typed faults"
 expect "$lines" "midicheck: PASS cap" "the SysEx cap must hold across fragments, and recovery follow"
-expect "$lines" "midicheck: PASS unsupported" "UMP must be unsupported, a missing direction invalid, and inventory must open nothing"
+expect "$lines" "midicheck: PASS unsupported" "either protocol must need only a grant, a missing direction be invalid, and inventory open nothing"
+expect "$lines" "midicheck: PASS ump" "a MIDI 1.0 endpoint must read and send as UMP through the translation"
 expect "$lines" "midicheck: PASS send" "a sent phrase must come back through the loopback, and a bad batch send nothing"
+expect "$lines" "midiump: PASS ump" "UMP must come back word for word on every group, and a bad batch send nothing"
+expect "$lines" "midiump: PASS translate" "UMP must read as MIDI 1.0 chunks, and chunks send as UMP"
 expect "$lines" "midihold: held endpoint 1 and stopped" "a receiver on the second endpoint must work beside the first"
 expect "$lines" "MidiService: a second receiver on an endpoint was refused as busy - there is no fan-out" "a second receiver on one endpoint must be refused"
 expect "$lines" "midicheck: PASS overflow" "saturation must end the receiver readably"
@@ -98,4 +108,4 @@ counts="$(grep -aoE '\{name=midi_service, type=service, [^{]*counters=\{messages
 [[ "$(sed -n 1p <<<"$counts")" == "$(sed -n 2p <<<"$counts")" ]] || fail "MidiService's handles did not return to their baseline ($(tr '\n' ' ' <<<"$counts"))"
 echo "midi-service: the service's handles returned to their baseline ($(sed -n 1p <<<"$counts"))"
 
-echo "midi-service: PASS - the bounded event vocabulary and queue, the decoder over real packets, SysEx bounds, typed faults, saturation, loss, unplug, sending through the loopback, grants and reclamation (the service; not USB MIDI transport or UMP)"
+echo "midi-service: PASS - the bounded event vocabulary and queue, the decoder over real packets, SysEx bounds, typed faults, saturation, loss, unplug, sending through the loopback, UMP and the translation both ways, grants and reclamation (the service; not USB MIDI transport)"

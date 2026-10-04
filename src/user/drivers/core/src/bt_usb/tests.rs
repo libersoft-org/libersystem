@@ -53,3 +53,84 @@ fn packets_are_whole_only_when_their_lengths_say_so() {
 	assert!(acl_is_whole(&[0x40, 0x20, 2, 0, 7, 8]));
 	assert!(!acl_is_whole(&[0x40, 0x20, 3, 0, 7, 8]));
 }
+
+// A controller with its voice interface: alternate zero with empty isochronous endpoints, as the specification has it,
+// then alternates 1 to 5 of 9, 17, 25, 33 and 49 bytes.
+fn with_voice() -> Vec<u8> {
+	let mut out = controller();
+	for (alternate, packet) in [0u8, 9, 17, 25, 33, 49].into_iter().enumerate() {
+		out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, alternate as u8, 2, CLASS_WIRELESS, SUBCLASS_RF, PROTOCOL_BLUETOOTH, 0]);
+		out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x83, 0x01, packet, 0x00, 1]);
+		out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x03, 0x01, packet, 0x00, 1]);
+	}
+	let total = out.len() as u16;
+	out[2..4].copy_from_slice(&total.to_le_bytes());
+	out[4] = 2;
+	out
+}
+
+#[test]
+fn the_voice_alternates_are_read_with_their_isochronous_pairs() {
+	let bound = bind(&with_voice()).expect("a controller with voice binds");
+	assert_eq!(bound.voice_interface, Some(1));
+	let two = bound.voice_at(2).expect("alternate 2");
+	assert_eq!((two.iso_in.address, two.iso_out.address, two.iso_in.max_packet(), two.iso_out.max_packet()), (0x83, 0x03, 17, 17));
+	assert_eq!(bound.voice_at(0), None, "alternate zero carries nothing");
+	assert_eq!(bound.voice_at(6), None, "and this controller has no wideband alternate");
+	assert!(bound.has_voice());
+	assert!(!bind(&controller()).expect("a controller without voice").has_voice());
+}
+
+#[test]
+fn a_voice_setting_takes_the_tables_alternate() {
+	assert_eq!([(1, 8), (2, 8), (3, 8)].map(|(channels, bits)| alternate_for(channels, bits, false)), [Some(1), Some(2), Some(3)]);
+	assert_eq!([(1, 16), (2, 16), (3, 16)].map(|(channels, bits)| alternate_for(channels, bits, false)), [Some(2), Some(4), Some(5)]);
+	assert_eq!(alternate_for(1, 16, true), Some(6), "wideband is one channel on alternate 6");
+	assert_eq!((alternate_for(0, 16, false), alternate_for(4, 8, false), alternate_for(1, 12, false), alternate_for(2, 16, true)), (None, None, None, None));
+}
+
+// A SCO packet on `handle` with `length` bytes of a pattern.
+fn sco(handle: u16, length: u8, seed: u8) -> Vec<u8> {
+	handle.to_le_bytes().into_iter().chain([length]).chain((0..length).map(|n| n.wrapping_mul(7) ^ seed)).collect()
+}
+
+#[test]
+fn sco_packets_are_cut_into_pieces_and_put_back_at_every_piece_size() {
+	for capacity in [9usize, 17, 25, 33, 49, 63] {
+		let mut pieces = ScoPieces::new(capacity);
+		for length in [0u8, 1, 6, 14, 30, 46, 48, 60, 120, 255] {
+			let packet = sco(0x0021, length, capacity as u8);
+			assert!(sco_is_whole(&packet));
+			let mut out = Vec::new();
+			for piece in packet.chunks(capacity) {
+				out.extend(pieces.piece(piece));
+				assert!(pieces.piece(&[]).is_empty(), "an empty interval between pieces is no piece");
+			}
+			assert_eq!(out, alloc::vec![packet], "{length} bytes in pieces of {capacity}");
+		}
+	}
+	assert!(!sco_is_whole(&[0x21, 0x00, 4, 1, 2]));
+}
+
+#[test]
+fn a_packet_that_lost_a_piece_is_refused_and_the_next_one_delivered() {
+	let mut pieces = ScoPieces::new(17);
+	let before = sco(0x0021, 48, 1);
+	assert_eq!(before.chunks(17).flat_map(|piece| pieces.piece(piece)).collect::<Vec<_>>(), alloc::vec![before.clone()]);
+	// ITS MIDDLE PIECE LOST: the header said three pieces, so the last of them is skipped.
+	let torn = sco(0x0021, 48, 2);
+	let after = sco(0x0021, 30, 3);
+	let mut chunks = torn.chunks(17);
+	assert!(pieces.piece(chunks.next().unwrap()).is_empty());
+	chunks.next();
+	pieces.lost();
+	assert!(pieces.piece(chunks.next().unwrap()).is_empty(), "the torn packet's last piece is not a packet");
+	assert_eq!(after.chunks(17).flat_map(|piece| pieces.piece(piece)).collect::<Vec<_>>(), alloc::vec![after.clone()]);
+	// ITS HEADER LOST: the pieces after it are skipped until one opens a packet on the connection's handle.
+	let headless = sco(0x0021, 48, 4);
+	pieces.lost();
+	for piece in headless.chunks(17).skip(1) {
+		assert!(pieces.piece(piece).is_empty(), "a piece of the packet whose header was lost");
+	}
+	assert_eq!(after.chunks(17).flat_map(|piece| pieces.piece(piece)).collect::<Vec<_>>(), alloc::vec![after]);
+}

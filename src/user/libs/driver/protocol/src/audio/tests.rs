@@ -15,8 +15,19 @@ fn a_length_is_the_tag_and_every_other_length_is_refused() {
 	// AND AN UNDEFINED COMMAND BYTE IS NOT CAPTURE. A server that treated anything one byte long as
 	// a capture request would answer a question nobody asked with a buffer of samples.
 	assert_eq!(message(&[0]), Message::Unknown);
-	assert_eq!(message(&[3]), Message::Unknown);
+	assert_eq!(message(&[4]), Message::Unknown);
 	assert_eq!(message(&[255]), Message::Unknown);
+	assert_eq!(message(&[CMD_STATS]), Message::Stats);
+}
+
+#[test]
+fn the_counters_round_trip_and_no_other_answer_reads_as_them() {
+	let stats = PlaybackStats { underruns: 1, silent_frames: 9_600, feedback_q16: 48 << 16 | 0x1999, feedback_ignored: 2 };
+	assert_eq!(PlaybackStats::decode(&stats.encode()), Some(stats));
+	assert_eq!(PlaybackStats::decode(REFUSED), None, "a provider that keeps none refuses");
+	assert_eq!(PlaybackStats::decode(OK), None);
+	assert_eq!(PlaybackStats::decode(&[0; PERIOD_BYTES as usize]), None);
+	assert!(STATS_BYTES != OK.len() && STATS_BYTES != PERIOD_BYTES as usize && STATS_BYTES != 0);
 }
 
 #[test]

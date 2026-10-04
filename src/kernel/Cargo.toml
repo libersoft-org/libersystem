@@ -77,6 +77,9 @@ display-proto = { path = "../user/libs/protocol/display-proto" }
 # `scanout` with a backing and a generation, which is a record with a capability in it - and a
 # harness writing those bytes by hand would be the second encoder this tree generates one for.
 display-device-proto = { path = "../user/libs/protocol/display-device-proto" }
+# AND THE AUDIO WIRE'S OBSERVATION RECORD, for the harness that stands in for AudioService's supervisor and
+# reads the device's counters back through the `audio-stats` root the System Graph is handed.
+audio-proto = { path = "../user/libs/protocol/audio-proto" }
 # The network wire types, for the same reason and in the same way: the permission-manager scenario
 # stands in for NetworkService so a governed `ip` has something to query, and a hand-written copy of
 # `net-info` is how that harness and the service drift apart - which is exactly what happened when

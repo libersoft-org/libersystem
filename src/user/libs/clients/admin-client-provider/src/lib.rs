@@ -25,3 +25,12 @@ global_asm!(".section .text.liber_channel_liber_admin_admin_authority_execute,\"
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(".section .text.liber_channel_liber_admin_admin_authority_execute,\"ax\",@progbits\n.globl liber_channel_liber_admin_admin_authority_execute\n.type liber_channel_liber_admin_admin_authority_execute,%function\nliber_channel_liber_admin_admin_authority_execute:\ntail liber_channel_impl_liber_admin_admin_authority_execute\n.size liber_channel_liber_admin_admin_authority_execute, . - liber_channel_liber_admin_admin_authority_execute\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_admin_admin_authority_execute_read,\"ax\",@progbits\n.globl liber_channel_liber_admin_admin_authority_execute_read\n.type liber_channel_liber_admin_admin_authority_execute_read,@function\nliber_channel_liber_admin_admin_authority_execute_read:\njmp liber_channel_impl_liber_admin_admin_authority_execute_read\n.size liber_channel_liber_admin_admin_authority_execute_read, . - liber_channel_liber_admin_admin_authority_execute_read\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_admin_admin_authority_execute_read,\"ax\",@progbits\n.globl liber_channel_liber_admin_admin_authority_execute_read\n.type liber_channel_liber_admin_admin_authority_execute_read,%function\nliber_channel_liber_admin_admin_authority_execute_read:\nb liber_channel_impl_liber_admin_admin_authority_execute_read\n.size liber_channel_liber_admin_admin_authority_execute_read, . - liber_channel_liber_admin_admin_authority_execute_read\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_admin_admin_authority_execute_read,\"ax\",@progbits\n.globl liber_channel_liber_admin_admin_authority_execute_read\n.type liber_channel_liber_admin_admin_authority_execute_read,%function\nliber_channel_liber_admin_admin_authority_execute_read:\ntail liber_channel_impl_liber_admin_admin_authority_execute_read\n.size liber_channel_liber_admin_admin_authority_execute_read, . - liber_channel_liber_admin_admin_authority_execute_read\n");

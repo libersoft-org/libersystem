@@ -89,3 +89,37 @@ fn the_suffix_crc_is_the_reference_tools_one() {
 	// CRC-32 without the final inversion: the standard check value 0xcbf43926 inverted.
 	assert_eq!(suffix_crc(b"123456789"), !0xcbf4_3926);
 }
+
+#[test]
+fn an_upload_names_its_bound_and_its_file_and_nothing_unreadable() {
+	let parameters = upload_request(3000, "vol://usb/backup.bin");
+	assert_eq!(upload_parameters(&parameters), Some((3000, "vol://usb/backup.bin")));
+	assert_eq!(upload_parameters(&upload_request(0, "x")), None, "a bound of nothing");
+	assert_eq!(upload_parameters(&upload_request(MAX_UPLOAD + 1, "x")), None, "past what an upload may hold");
+	assert_eq!(upload_parameters(&upload_request(MAX_UPLOAD, "x")), Some((MAX_UPLOAD, "x")));
+	assert_eq!(upload_parameters(&upload_request(10, "")), None, "no file named");
+	assert_eq!(upload_parameters(&[1, 0, 0]), None, "no bound");
+	let mut bad = upload_request(10, "a");
+	bad.push(0xff);
+	assert_eq!(upload_parameters(&bad), None, "not UTF-8");
+	let long = "x".repeat(MAX_UPLOAD_NAME + 1);
+	assert_eq!(upload_parameters(&upload_request(10, &long)), None);
+}
+
+#[test]
+fn an_upload_ends_at_a_short_block_and_is_stopped_past_its_bound() {
+	assert_eq!(upload_step(0, 1024, 1024, 3000), Upload::More);
+	assert_eq!(upload_step(2048, 952, 1024, 3000), Upload::Done, "the short block, inside the bound");
+	assert_eq!(upload_step(2048, 1024, 1024, 3000), Upload::PastBound, "a whole block past it");
+	assert_eq!(upload_step(1024, 1024, 1024, 2048), Upload::More, "exactly the bound, and the device has not ended");
+	assert_eq!(upload_step(2048, 0, 1024, 2048), Upload::Done, "its empty block ends an image of exactly the bound");
+	assert_eq!(upload_step(2048, 1, 1024, 2048), Upload::PastBound, "and one byte more does not");
+}
+
+#[test]
+fn a_target_says_whether_it_can_be_read() {
+	let readable = bind(&target(PROTOCOL_DFU_MODE, ATTR_CAN_DOWNLOAD | ATTR_CAN_UPLOAD, 1024)).expect("binds");
+	assert!(readable.can_upload());
+	let not = bind(&target(PROTOCOL_DFU_MODE, ATTR_CAN_DOWNLOAD, 1024)).expect("binds");
+	assert!(!not.can_upload());
+}

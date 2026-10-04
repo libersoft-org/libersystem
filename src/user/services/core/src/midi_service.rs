@@ -13,6 +13,12 @@
 // sender's answer waits for the provider's, which waits for the device to take the packets. So one batch is in
 // flight per sender, and a slow device slows its sender and nothing else.
 //
+// UMP BESIDE MIDI 1.0. A `ump` endpoint's batches are Universal MIDI Packet words, cut into messages and their SysEx7
+// and SysEx8 counted with the driver library's UMP layer; a receiver reads what it asked for - a MIDI 1.0 endpoint as
+// MIDI 1.0 in UMP, a UMP endpoint as MIDI 1.0 chunks through the translation and the same staged decoder - and a
+// sender sends either on either the same way. A batch that grows past what one provider send carries goes as several,
+// one after another, and the sender is answered when the last is taken.
+//
 // BOUNDED EVERYWHERE, AND LOSS IS NEVER SILENT. Each receiver has one `service_logic::bounded_event` queue:
 // 256 events and 32 kB, integrity records included. A batch that does not fit ENDS the receiver with
 // `overflow` and discards what it held; a provider's report of lost input ends it with
@@ -27,9 +33,9 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use drivers::usb_midi;
+use drivers::{ump, usb_midi};
 use ipc_client::ChannelTransport;
-use proto::system::{Error, EventEnd, EventEndReason, EventHeader, EventSource, MidiAbort, MidiAbortReason, MidiBatch, MidiChunk, MidiChunkKind, MidiDeviceDirection, MidiDeviceEvent, MidiDirection, MidiEndpoint, MidiEndpointId, MidiEvent, MidiFault, MidiFaultCode, MidiGrant, MidiItem, MidiProtocol, MidiReceiverStatus, ProviderInfo, ProviderKind, midi, midi_admin, midi_device, midi_input, midi_output, provider_catalogue};
+use proto::system::{Error, EventEnd, EventEndReason, EventHeader, EventSource, MidiAbort, MidiAbortReason, MidiBatch, MidiBlock, MidiBlockDirection, MidiChunk, MidiChunkKind, MidiDeviceBlockDirection, MidiDeviceDirection, MidiDeviceEvent, MidiDeviceProtocol, MidiDirection, MidiEndpoint, MidiEndpointId, MidiEvent, MidiFault, MidiFaultCode, MidiGrant, MidiItem, MidiProtocol, MidiReceiverStatus, MidiUmp, ProviderInfo, ProviderKind, midi, midi_admin, midi_device, midi_input, midi_output, provider_catalogue};
 use rt::*;
 use service_logic::bounded_event as be;
 use wire::{Handles, Reader, Sink, Transport, TransportError};
@@ -51,14 +57,25 @@ const MAX_READ: usize = 64;
 const VERSION: u32 = 1;
 const OPEN_TICKS: u64 = 100;
 const BUF_BYTES: usize = 8192;
+// The most one provider `send` carries.
+const SEND_BYTES: usize = usb_midi::MAX_PACKETS * usb_midi::PACKET;
+
+// One endpoint of a provider: as it listed itself, and - for a UMP one - its function blocks.
+struct Endpoint {
+	index: u32,
+	name: String,
+	cables: u8,
+	direction: MidiDeviceDirection,
+	ump: bool,
+	blocks: Vec<MidiBlock>,
+}
 
 struct Provider {
 	key: u32,
 	info: ProviderInfo,
 	chan: u64,
 	events: u64,
-	// Index, name, cable count and direction of each endpoint.
-	endpoints: Vec<(u32, String, u8, MidiDeviceDirection)>,
+	endpoints: Vec<Endpoint>,
 	// Calls not yet answered, by correlation.
 	sent: Vec<(u32, Pending)>,
 	next_corr: u32,
@@ -82,8 +99,16 @@ struct Sender {
 	generation: u64,
 	active: bool,
 	encoder: usb_midi::Encoder,
-	// The sender's `send` waiting for the provider: its correlation.
+	// The sender's `send` waiting for the provider: its correlation - and the batches still to go after the one in
+	// flight, when what it sent grew past one provider send.
 	waiting: Option<u32>,
+	outbox: Vec<Vec<u8>>,
+	// Whether its endpoint carries UMP; and what keeps a UMP sender's SysEx counted, and MIDI 1.0 in UMP cut back at
+	// threes for a MIDI 1.0 endpoint.
+	ump: bool,
+	cables: u8,
+	tracker: ump::Tracker,
+	to_packets: ump::ToPackets,
 }
 
 // One receiver: the grant's connection, the owner it lives as long as, and its bounded stream.
@@ -101,6 +126,13 @@ struct Receiver {
 	decoder: usb_midi::Decoder,
 	// A read waiting for its first event: its correlation, how many it takes, and until when.
 	reading: Option<(u32, usize, u64)>,
+	// Whether its endpoint carries UMP, and the protocol it reads - the endpoint's own unless it asked for the other;
+	// the UMP layer's SysEx counting, and the translation down to packets for a MIDI 1.0 reading of UMP.
+	ump: bool,
+	reads: MidiProtocol,
+	cables: u8,
+	tracker: ump::Tracker,
+	to_packets: ump::ToPackets,
 }
 
 struct Service {
@@ -223,13 +255,85 @@ fn item(output: usb_midi::Output) -> MidiItem {
 	}
 }
 
+// A UMP message in the public vocabulary.
+fn ump_item(message: &ump::Ump) -> MidiItem {
+	MidiItem::Ump(MidiUmp { group: message.group(), words: message.words().to_vec() })
+}
+
+// A decoded MIDI 1.0 chunk as MIDI 1.0 in UMP - through the packet that carries it, so the translation is the one the
+// library states. A raw byte belongs to no message and has no UMP form.
+fn ump_of_chunk(chunk: &usb_midi::Chunk) -> Option<MidiItem> {
+	let bytes = chunk.bytes();
+	let packet = match chunk.kind {
+		usb_midi::Kind::Raw => return None,
+		usb_midi::Kind::Short => ump::packet_of_message(chunk.cable, bytes),
+		_ => {
+			let cin = if chunk.end { *[0x5u8, 0x6, 0x7].get(bytes.len().checked_sub(1)?)? } else { 0x4 };
+			let mut packet = [chunk.cable << 4 | cin, 0, 0, 0];
+			packet[1..1 + bytes.len()].copy_from_slice(bytes);
+			packet
+		}
+	};
+	ump::ump_of_packet(packet).map(|message| ump_item(&message))
+}
+
+fn abort_reason(reason: ump::Abort) -> MidiAbortReason {
+	match reason {
+		ump::Abort::Cap => MidiAbortReason::Cap,
+		ump::Abort::Malformed => MidiAbortReason::Malformed,
+		ump::Abort::Restarted => MidiAbortReason::Restarted,
+	}
+}
+
+fn word_fault(fault: ump::Fault) -> MidiItem {
+	MidiItem::Fault(MidiFault { cable: None, code: if fault == ump::Fault::Alignment { MidiFaultCode::Alignment } else { MidiFaultCode::Truncated } })
+}
+
 impl Receiver {
-	// Queue what the decoder produced, stamped with the receipt time it came with. An event that does not fit
-	// ends the stream - and integrity records are events like any other, so an abort that cannot be queued
-	// ends it too.
-	fn enqueue(&mut self, outputs: Vec<usb_midi::Output>, received_ns: u64) -> Result<(), be::End> {
-		for output in outputs {
-			let event = item(output);
+	// ONE BATCH, as this receiver reads it: the endpoint's packets decoded in its own protocol or translated into the
+	// other. A UMP batch's words are cut into messages and their SysEx counted; read as MIDI 1.0 they go down to event
+	// packets and through the same decoder a MIDI 1.0 endpoint's do.
+	fn decode(&mut self, bytes: &[u8], now: u64) -> Vec<MidiItem> {
+		let mut outputs = Vec::new();
+		if !self.ump {
+			self.decoder.decode(bytes, now, &mut outputs);
+			return outputs
+				.into_iter()
+				.filter_map(|output| match (output, self.reads) {
+					(usb_midi::Output::Chunk(chunk), MidiProtocol::Ump) => ump_of_chunk(&chunk),
+					(output, _) => Some(item(output)),
+				})
+				.collect();
+		}
+		let (messages, fault) = match ump::words_of_bytes(bytes) {
+			Ok(words) => ump::split(&words),
+			Err(fault) => (Vec::new(), Some(fault)),
+		};
+		let mut items = Vec::new();
+		if self.reads == MidiProtocol::Ump {
+			for message in messages {
+				for tracked in self.tracker.take(message) {
+					match tracked {
+						ump::Tracked::Message(message, _) => items.push(ump_item(&message)),
+						ump::Tracked::Aborted { group, number, reason } => items.push(MidiItem::Aborted(MidiAbort { cable: group, message: number, reason: abort_reason(reason) })),
+						// A PART WITH NO MESSAGE TO BELONG TO is discarded, as a MIDI 1.0 decoder discards one.
+						ump::Tracked::Stray(_) => {}
+					}
+				}
+			}
+		} else {
+			let packets: Vec<u8> = messages.iter().flat_map(|message| self.to_packets.take(message)).flatten().collect();
+			self.decoder.decode(&packets, now, &mut outputs);
+			items.extend(outputs.into_iter().map(item));
+		}
+		items.extend(fault.map(word_fault));
+		items
+	}
+
+	// Queue what was decoded, stamped with the receipt time it came with. An event that does not fit ends the stream
+	// - and integrity records are events like any other, so an abort that cannot be queued ends it too.
+	fn enqueue(&mut self, items: Vec<MidiItem>, received_ns: u64) -> Result<(), be::End> {
+		for event in items {
 			let header = EventHeader { sequence: self.queue.next_sequence(), received_ns };
 			let bytes = MidiEvent { header, item: event.clone() }.encode_vec().map_or(usize::MAX, |encoded| encoded.len());
 			self.queue.push((event, received_ns), bytes)?;
@@ -249,11 +353,12 @@ impl Service {
 		MidiEndpointId { slot: provider.info.slot, generation: provider.info.provider_generation, binding_generation: provider.info.binding_generation, endpoint, incarnation: self.incarnation }
 	}
 
-	fn endpoint_info(&self, provider: &Provider, endpoint: &(u32, String, u8, MidiDeviceDirection)) -> MidiEndpoint {
-		let held = |held_provider: u32, held_endpoint: u32| held_provider == provider.key && held_endpoint == endpoint.0;
+	fn endpoint_info(&self, provider: &Provider, endpoint: &Endpoint) -> MidiEndpoint {
+		let held = |held_provider: u32, held_endpoint: u32| held_provider == provider.key && held_endpoint == endpoint.index;
 		let receiving = self.receivers.iter().any(|receiver| receiver.active && held(receiver.provider, receiver.endpoint)) || self.senders.iter().any(|sender| sender.active && held(sender.provider, sender.endpoint));
-		let direction = if endpoint.3 == MidiDeviceDirection::Transmit { MidiDirection::Transmit } else { MidiDirection::Receive };
-		MidiEndpoint { id: self.endpoint_id(provider, endpoint.0), name: endpoint.1.clone(), protocol: MidiProtocol::Midi1, direction, cables: endpoint.2, receiving }
+		let direction = if endpoint.direction == MidiDeviceDirection::Transmit { MidiDirection::Transmit } else { MidiDirection::Receive };
+		let protocol = if endpoint.ump { MidiProtocol::Ump } else { MidiProtocol::Midi1 };
+		MidiEndpoint { id: self.endpoint_id(provider, endpoint.index), name: endpoint.name.clone(), protocol, direction, cables: endpoint.cables, receiving, blocks: endpoint.blocks.clone() }
 	}
 
 	fn clients(&self) -> usize {
@@ -354,6 +459,38 @@ impl Service {
 				return;
 			}
 		};
+		// A UMP ENDPOINT'S FUNCTION BLOCKS, asked for once as the device is admitted: what it says about itself.
+		let mut held = Vec::new();
+		for endpoint in endpoints {
+			let ump = endpoint.protocol == MidiDeviceProtocol::Ump;
+			let blocks = if ump {
+				match client.blocks(&endpoint.index) {
+					Some(Ok(blocks)) => blocks
+						.into_iter()
+						.map(|block| MidiBlock {
+							id: block.id,
+							name: block.name,
+							first_group: block.first_group,
+							groups: block.groups,
+							direction: match block.direction {
+								MidiDeviceBlockDirection::Receives => MidiBlockDirection::Receives,
+								MidiDeviceBlockDirection::Sends => MidiBlockDirection::Sends,
+								MidiDeviceBlockDirection::Both => MidiBlockDirection::Both,
+							},
+							protocol: block.protocol,
+						})
+						.collect(),
+					_ => {
+						print(b"MidiService: a MIDI device did not list a UMP endpoint's function blocks\n");
+						close(chan);
+						return;
+					}
+				}
+			} else {
+				Vec::new()
+			};
+			held.push(Endpoint { index: endpoint.index, name: endpoint.name, cables: endpoint.cables, direction: endpoint.direction, ump, blocks });
+		}
 		let events = client.events().unwrap_or(0);
 		if events == 0 {
 			close(chan);
@@ -361,7 +498,7 @@ impl Service {
 		}
 		let key = self.next_key;
 		self.next_key = self.next_key.wrapping_add(1).max(1);
-		self.providers.push(Provider { key, info, chan, events, endpoints: endpoints.into_iter().map(|endpoint| (endpoint.index, endpoint.name, endpoint.cables, endpoint.direction)).collect(), sent: Vec::new(), next_corr: 1 });
+		self.providers.push(Provider { key, info, chan, events, endpoints: held, sent: Vec::new(), next_corr: 1 });
 		print(b"MidiService: a MIDI device was admitted\n");
 	}
 
@@ -414,10 +551,20 @@ impl Service {
 						Some(false) => Err(Error::read(&mut reader).unwrap_or(Error::Io)),
 						None => Err(Error::Io),
 					};
-					if let Some(at) = self.senders.iter().position(|sender| sender.active && sender.generation == generation)
-						&& let Some(corr) = self.senders[at].waiting.take()
-					{
-						reply(self.senders[at].chan, corr, result, |_, _| Some(()));
+					let Some(sender) = self.senders.iter().position(|sender| sender.active && sender.generation == generation) else { continue };
+					// THE NEXT BATCH OF THE SAME SEND, if the provider took this one and there is one.
+					if result.is_ok() && !self.senders[sender].outbox.is_empty() {
+						let batch = self.senders[sender].outbox.remove(0);
+						let endpoint = self.senders[sender].endpoint;
+						if self.call(key, Pending::Send(generation), |client| {
+							let _ = client.send(&endpoint, &batch);
+						}) {
+							continue;
+						}
+					}
+					self.senders[sender].outbox.clear();
+					if let Some(corr) = self.senders[sender].waiting.take() {
+						reply(self.senders[sender].chan, corr, result, |_, _| Some(()));
 					}
 					continue;
 				}
@@ -458,9 +605,8 @@ impl Service {
 					if batch.received_ns > clock_ns() {
 						return Err(b"a batch arrived from the future");
 					}
-					let mut outputs = Vec::new();
-					self.receivers[at].decoder.decode(&batch.packets, clock(), &mut outputs);
-					if self.receivers[at].enqueue(outputs, batch.received_ns).is_err() {
+					let items = self.receivers[at].decode(&batch.packets, clock());
+					if self.receivers[at].enqueue(items, batch.received_ns).is_err() {
 						print(b"MidiService: a receiver overflowed and was stopped\n");
 						self.end(at, be::Reason::Overflow);
 						continue;
@@ -486,7 +632,7 @@ impl Service {
 			let mut outputs = Vec::new();
 			self.receivers[at].decoder.tick(now, &mut outputs);
 			if !outputs.is_empty() {
-				if self.receivers[at].enqueue(outputs, clock_ns()).is_err() {
+				if self.receivers[at].enqueue(outputs.into_iter().map(item).collect(), clock_ns()).is_err() {
 					self.end(at, be::Reason::Overflow);
 					continue;
 				}
@@ -531,7 +677,7 @@ impl midi_admin::Service for AdminView<'_> {
 			[] => return refuse(Error::NotFound),
 			_ => return refuse(Error::Invalid),
 		};
-		let Some(&(_, _, cables, direction)) = service.providers[at].endpoints.iter().find(|(index, _, _, _)| *index == endpoint) else { return refuse(Error::NotFound) };
+		let Some((cables, direction, ump)) = service.providers[at].endpoints.iter().find(|held| held.index == endpoint).map(|held| (held.cables, held.direction, held.ump)) else { return refuse(Error::NotFound) };
 		// A RECEIVER ON A TRANSMIT ENDPOINT would wait for ever on a device that sends nothing there.
 		if direction != MidiDeviceDirection::Receive {
 			return refuse(Error::Invalid);
@@ -556,7 +702,8 @@ impl midi_admin::Service for AdminView<'_> {
 			close(theirs);
 			return refuse(Error::Io);
 		}
-		service.receivers.push(Receiver { chan: mine, owner, provider: key, endpoint, generation, source: source.clone(), active: true, queue: be::Queue::new(), decoder: usb_midi::Decoder::new(cables), reading: None });
+		let reads = if ump { MidiProtocol::Ump } else { MidiProtocol::Midi1 };
+		service.receivers.push(Receiver { chan: mine, owner, provider: key, endpoint, generation, source: source.clone(), active: true, queue: be::Queue::new(), decoder: usb_midi::Decoder::new(cables), reading: None, ump, reads, cables, tracker: ump::Tracker::new(), to_packets: ump::ToPackets::new() });
 		Ok(MidiGrant { connection: theirs, source })
 	}
 
@@ -575,7 +722,7 @@ impl midi_admin::Service for AdminView<'_> {
 			[] => return refuse(Error::NotFound),
 			_ => return refuse(Error::Invalid),
 		};
-		let Some(&(_, _, cables, direction)) = service.providers[at].endpoints.iter().find(|(index, _, _, _)| *index == endpoint) else { return refuse(Error::NotFound) };
+		let Some((cables, direction, ump)) = service.providers[at].endpoints.iter().find(|held| held.index == endpoint).map(|held| (held.cables, held.direction, held.ump)) else { return refuse(Error::NotFound) };
 		if direction != MidiDeviceDirection::Transmit {
 			return refuse(Error::Invalid);
 		}
@@ -592,7 +739,7 @@ impl midi_admin::Service for AdminView<'_> {
 		service.next_generation += 1;
 		let info = &service.providers[at].info;
 		let source = EventSource { incarnation: service.incarnation, slot: info.slot, generation: info.provider_generation, binding_generation: info.binding_generation, endpoint, receiver_generation: generation };
-		service.senders.push(Sender { chan: mine, owner, provider: key, endpoint, generation, active: true, encoder: usb_midi::Encoder::new(cables), waiting: None });
+		service.senders.push(Sender { chan: mine, owner, provider: key, endpoint, generation, active: true, encoder: usb_midi::Encoder::new(cables), waiting: None, outbox: Vec::new(), ump, cables, tracker: ump::Tracker::new(), to_packets: ump::ToPackets::new() });
 		Ok(MidiGrant { connection: theirs, source })
 	}
 
@@ -626,17 +773,14 @@ impl midi::Service for InventoryView<'_> {
 		let service = self.service;
 		Ok(service.providers.iter().flat_map(|provider| provider.endpoints.iter().map(move |endpoint| service.endpoint_info(provider, endpoint))).collect())
 	}
-	fn open(&mut self, endpoint: MidiEndpointId, direction: MidiDirection, protocol: MidiProtocol) -> Result<(), Error> {
-		// UMP DOES NOT EXIST HERE YET, and saying so is the answer - nothing is silently accepted.
-		if protocol == MidiProtocol::Ump {
-			return Err(Error::Unsupported);
-		}
+	// EITHER PROTOCOL ON EITHER ENDPOINT, the other one through the translation - so the protocol is never the reason.
+	fn open(&mut self, endpoint: MidiEndpointId, direction: MidiDirection, _protocol: MidiProtocol) -> Result<(), Error> {
 		let service = self.service;
-		let Some(held) = service.providers.iter().find_map(|provider| provider.endpoints.iter().find(|held| service.endpoint_id(provider, held.0) == endpoint)) else {
+		let Some(held) = service.providers.iter().find_map(|provider| provider.endpoints.iter().find(|held| service.endpoint_id(provider, held.index) == endpoint)) else {
 			return Err(Error::NotFound);
 		};
 		// A DIRECTION THE ENDPOINT DOES NOT HAVE is not a question of permission.
-		let transmit = held.3 == MidiDeviceDirection::Transmit;
+		let transmit = held.direction == MidiDeviceDirection::Transmit;
 		if transmit != (direction == MidiDirection::Transmit) {
 			return Err(Error::Invalid);
 		}
@@ -649,6 +793,7 @@ impl midi::Service for InventoryView<'_> {
 enum Asked {
 	Read(u16, u32),
 	Stop,
+	Protocol(MidiProtocol),
 }
 
 struct InputView<'a> {
@@ -661,7 +806,7 @@ impl midi_input::Service for InputView<'_> {
 	fn endpoint(&mut self) -> Result<MidiEndpoint, Error> {
 		let receiver = &self.service.receivers[self.receiver];
 		let provider = self.service.providers.iter().find(|provider| provider.key == receiver.provider).ok_or(Error::Closed)?;
-		let endpoint = provider.endpoints.iter().find(|endpoint| endpoint.0 == receiver.endpoint).ok_or(Error::Closed)?;
+		let endpoint = provider.endpoints.iter().find(|endpoint| endpoint.index == receiver.endpoint).ok_or(Error::Closed)?;
 		Ok(self.service.endpoint_info(provider, endpoint))
 	}
 	fn read(&mut self, max: u16, wait_ms: u32) -> Result<MidiBatch, Error> {
@@ -676,11 +821,16 @@ impl midi_input::Service for InputView<'_> {
 		self.asked = Some(Asked::Stop);
 		Err(Error::Again)
 	}
+	fn protocol(&mut self, protocol: MidiProtocol) -> Result<(), Error> {
+		self.asked = Some(Asked::Protocol(protocol));
+		Err(Error::Again)
+	}
 }
 
 // A sender's connection. `send` waits on the provider, so it is answered by hand.
 enum Told {
 	Send(Vec<MidiChunk>),
+	SendUmp(Vec<MidiUmp>),
 	Stop,
 }
 
@@ -694,11 +844,15 @@ impl midi_output::Service for OutputView<'_> {
 	fn endpoint(&mut self) -> Result<MidiEndpoint, Error> {
 		let sender = &self.service.senders[self.sender];
 		let provider = self.service.providers.iter().find(|provider| provider.key == sender.provider).ok_or(Error::Closed)?;
-		let endpoint = provider.endpoints.iter().find(|endpoint| endpoint.0 == sender.endpoint).ok_or(Error::Closed)?;
+		let endpoint = provider.endpoints.iter().find(|endpoint| endpoint.index == sender.endpoint).ok_or(Error::Closed)?;
 		Ok(self.service.endpoint_info(provider, endpoint))
 	}
 	fn send(&mut self, chunks: Vec<MidiChunk>) -> Result<(), Error> {
 		self.told = Some(Told::Send(chunks));
+		Err(Error::Again)
+	}
+	fn send_ump(&mut self, messages: Vec<MidiUmp>) -> Result<(), Error> {
+		self.told = Some(Told::SendUmp(messages));
 		Err(Error::Again)
 	}
 	fn stop(&mut self) -> Result<(), Error> {
@@ -742,7 +896,7 @@ impl Service {
 		};
 		let corr = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
 		match told {
-			Told::Send(chunks) => {
+			Told::Send(_) | Told::SendUmp(_) => {
 				let sender = &mut self.senders[at];
 				if !sender.active {
 					reply::<()>(chan, corr, Err(Error::Closed), |_, _| Some(()));
@@ -752,23 +906,24 @@ impl Service {
 					reply::<()>(chan, corr, Err(Error::Again), |_, _| Some(()));
 					return true;
 				}
-				// CHECKED WHOLE, AND ENCODED ONLY IF EVERY CHUNK IS A PACKET: a refusal sends nothing and moves no
-				// open message.
-				let Some(outgoing) = chunks.iter().map(outgoing).collect::<Option<Vec<_>>>() else {
+				let encoded = match told {
+					Told::Send(chunks) => sender.chunks(&chunks),
+					Told::SendUmp(messages) => sender.messages(&messages),
+					Told::Stop => unreachable!(),
+				};
+				let Some(mut batches) = encoded else {
 					reply::<()>(chan, corr, Err(Error::Invalid), |_, _| Some(()));
 					return true;
 				};
-				let mut packets = Vec::new();
-				if outgoing.is_empty() || sender.encoder.encode_all(&outgoing, &mut packets).is_err() {
-					reply::<()>(chan, corr, Err(Error::Invalid), |_, _| Some(()));
-					return true;
-				}
+				let first = batches.remove(0);
+				sender.outbox = batches;
 				let (provider, endpoint, generation) = (sender.provider, sender.endpoint, sender.generation);
 				if self.call(provider, Pending::Send(generation), |client| {
-					let _ = client.send(&endpoint, &packets);
+					let _ = client.send(&endpoint, &first);
 				}) {
 					self.senders[at].waiting = Some(corr);
 				} else {
+					self.senders[at].outbox.clear();
 					reply::<()>(chan, corr, Err(Error::Io), |_, _| Some(()));
 				}
 			}
@@ -811,9 +966,81 @@ impl Service {
 				self.end(at, be::Reason::Stopped);
 				reply(chan, corr, Ok(()), |_, _| Some(()));
 			}
+			// THE OTHER PROTOCOL FROM HERE ON: a SysEx open in the old reading is discarded with it, as a reset is.
+			Asked::Protocol(protocol) => {
+				let receiver = &mut self.receivers[at];
+				receiver.reads = protocol;
+				receiver.decoder = usb_midi::Decoder::new(receiver.cables);
+				receiver.tracker = ump::Tracker::new();
+				receiver.to_packets = ump::ToPackets::new();
+				reply(chan, corr, Ok(()), |_, _| Some(()));
+			}
 		}
 		true
 	}
+}
+
+impl Sender {
+	// A MIDI 1.0 SENDER'S CHUNKS, checked whole and encoded - for a UMP endpoint, each packet then as MIDI 1.0 in UMP -
+	// and cut into provider sends. `None` refuses the batch and moves nothing.
+	fn chunks(&mut self, chunks: &[MidiChunk]) -> Option<Vec<Vec<u8>>> {
+		let outgoing = chunks.iter().map(outgoing).collect::<Option<Vec<_>>>()?;
+		let mut packets = Vec::new();
+		if outgoing.is_empty() || self.encoder.encode_all(&outgoing, &mut packets).is_err() {
+			return None;
+		}
+		if !self.ump {
+			return Some(batches(packets.chunks_exact(usb_midi::PACKET).map(<[u8]>::to_vec)));
+		}
+		Some(batches(packets.chunks_exact(usb_midi::PACKET).filter_map(|packet| ump::ump_of_packet([packet[0], packet[1], packet[2], packet[3]])).map(|message| message.bytes())))
+	}
+
+	// A UMP SENDER'S MESSAGES, checked whole: each as many words as its type says, its group the one its words carry and
+	// one the endpoint has, and its SysEx parts fitting the messages they continue. For a MIDI 1.0 endpoint each goes
+	// down by the translation, and one with no MIDI 1.0 form refuses the batch. `None` moves nothing.
+	fn messages(&mut self, messages: &[MidiUmp]) -> Option<Vec<Vec<u8>>> {
+		if messages.is_empty() {
+			return None;
+		}
+		let mut tracker = self.tracker.clone();
+		let mut to_packets = self.to_packets.clone();
+		let mut pieces = Vec::new();
+		for message in messages {
+			let parsed = ump::Ump::new(&message.words)?;
+			if parsed.group() != message.group || parsed.group().is_some_and(|group| group >= self.cables) {
+				return None;
+			}
+			if self.ump {
+				if !tracker.take(parsed).iter().all(|tracked| matches!(tracked, ump::Tracked::Message(..))) {
+					return None;
+				}
+				pieces.push(parsed.bytes());
+			} else {
+				let packets = to_packets.take(&parsed);
+				// A SYSEX7 PART MAY GIVE NO PACKET YET - its bytes wait for threes - but anything else that gives none has
+				// no MIDI 1.0 form.
+				if packets.is_empty() && parsed.message_type() != ump::MT_DATA64 {
+					return None;
+				}
+				pieces.extend(packets.into_iter().map(|packet| packet.to_vec()));
+			}
+		}
+		self.tracker = tracker;
+		self.to_packets = to_packets;
+		Some(batches(pieces.into_iter()))
+	}
+}
+
+// Messages or packets gathered into provider sends of at most `SEND_BYTES`, none cut across two.
+fn batches(pieces: impl Iterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+	let mut out: Vec<Vec<u8>> = Vec::new();
+	for piece in pieces {
+		match out.last_mut() {
+			Some(last) if last.len() + piece.len() <= SEND_BYTES => last.extend(piece),
+			_ => out.push(piece),
+		}
+	}
+	out
 }
 
 #[unsafe(no_mangle)]

@@ -19,7 +19,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use drivers::admin_operation::{MAX_PAYLOAD, Operations, Refusal};
 use drivers::common;
-use proto::system::{AdminAction, AdminDescriptor, AdminPrepared, AdminProbeEffects, AdminProbeFault, AdminResult, Error, admin_executor, admin_probe_witness};
+use proto::system::{AdminAction, AdminDescriptor, AdminPrepared, AdminProbeEffects, AdminProbeFault, AdminRead, AdminResult, Error, admin_executor, admin_probe_witness};
 use rt::*;
 
 const NAME: &str = "org.libersystem.admin-probe";
@@ -105,6 +105,11 @@ impl admin_executor::Service for ExecutorView<'_> {
 
 	fn cancel(&mut self, operation: u64) -> Result<(), Error> {
 		self.fixture.operations.cancel(operation).map_err(refusal)
+	}
+
+	// THE PROBE WRITES; it reads nothing out.
+	fn execute_read(&mut self, _operation: u64, _epoch: u64) -> Result<AdminRead, Error> {
+		Err(Error::Unsupported)
 	}
 }
 

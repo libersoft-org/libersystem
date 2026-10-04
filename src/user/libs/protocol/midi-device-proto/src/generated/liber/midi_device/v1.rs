@@ -7,6 +7,11 @@
 //! to a batch, with the host time the completion became available - and MidiService decodes them with the
 //! driver library's staged decoder. The other way, MidiService encodes with the same library and a provider
 //! puts the packets on the wire as they are. No client ever sees or writes a raw packet.
+//!
+//! AN ENDPOINT SAYS WHICH PACKETS IT CARRIES. A `midi1` endpoint's are USB-MIDI 1.0 event packets; a `ump`
+//! endpoint's are Universal MIDI Packet WORDS - each four bytes, little-endian, a message one to four of them - which
+//! is what a USB MIDI 2.0 device's alternate setting carries, and the endpoint lists the function blocks its groups
+//! belong to. A device's two faces are alternates of one interface, so a provider runs one face at a time.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
 use crate::codec::{Handles, PROTOCOL_INFO_OP, Reader, Sink, SliceWriter, VecWriter};
@@ -178,12 +183,69 @@ impl MidiDeviceDirection {
 	}
 }
 
+/// The packets an endpoint carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MidiDeviceProtocol {
+	Midi1 = 1,
+	Ump = 2,
+}
+
+impl MidiDeviceProtocol {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MidiDeviceProtocol> {
+		let mut r = Reader::new(bytes);
+		let value = MidiDeviceProtocol::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MidiDeviceProtocol> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MidiDeviceProtocol::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<MidiDeviceProtocol> {
+		match r.u8()? {
+			1 => Some(MidiDeviceProtocol::Midi1),
+			2 => Some(MidiDeviceProtocol::Ump),
+			_ => None,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MidiDeviceEndpoint {
 	pub index: u32,
 	pub name: String,
+	/// The cables of a `midi1` endpoint; the groups a `ump` endpoint's blocks cover - at most sixteen either way.
 	pub cables: u8,
 	pub direction: MidiDeviceDirection,
+	pub protocol: MidiDeviceProtocol,
 }
 
 impl MidiDeviceEndpoint {
@@ -226,6 +288,7 @@ impl MidiDeviceEndpoint {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u8(self.cables)?;
 		self.direction.write(w)?;
+		self.protocol.write(w)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<MidiDeviceEndpoint> {
@@ -236,7 +299,135 @@ impl MidiDeviceEndpoint {
 		};
 		let cables = r.u8()?;
 		let direction = MidiDeviceDirection::read(r)?;
-		Some(MidiDeviceEndpoint { index, name, cables, direction })
+		let protocol = MidiDeviceProtocol::read(r)?;
+		Some(MidiDeviceEndpoint { index, name, cables, direction, protocol })
+	}
+}
+
+/// Which way a function block's groups carry messages, from the DEVICE's side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MidiDeviceBlockDirection {
+	Receives = 1,
+	Sends = 2,
+	Both = 3,
+}
+
+impl MidiDeviceBlockDirection {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MidiDeviceBlockDirection> {
+		let mut r = Reader::new(bytes);
+		let value = MidiDeviceBlockDirection::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MidiDeviceBlockDirection> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MidiDeviceBlockDirection::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<MidiDeviceBlockDirection> {
+		match r.u8()? {
+			1 => Some(MidiDeviceBlockDirection::Receives),
+			2 => Some(MidiDeviceBlockDirection::Sends),
+			3 => Some(MidiDeviceBlockDirection::Both),
+			_ => None,
+		}
+	}
+}
+
+/// ONE FUNCTION BLOCK of a UMP endpoint, as the device declares it: which groups belong together, which way they go,
+/// its name and the MIDI protocol it says it speaks (`bMIDIProtocol`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MidiDeviceBlock {
+	pub id: u8,
+	pub name: String,
+	pub first_group: u8,
+	pub groups: u8,
+	pub direction: MidiDeviceBlockDirection,
+	pub protocol: u8,
+}
+
+impl MidiDeviceBlock {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MidiDeviceBlock> {
+		let mut r = Reader::new(bytes);
+		let value = MidiDeviceBlock::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MidiDeviceBlock> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MidiDeviceBlock::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.id)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		w.u8(self.first_group)?;
+		w.u8(self.groups)?;
+		self.direction.write(w)?;
+		w.u8(self.protocol)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<MidiDeviceBlock> {
+		let id = r.u8()?;
+		let name = {
+			let v1 = r.string_lp()?;
+			(v1.len() <= 32).then_some(v1)?
+		};
+		let first_group = r.u8()?;
+		let groups = r.u8()?;
+		let direction = MidiDeviceBlockDirection::read(r)?;
+		let protocol = r.u8()?;
+		Some(MidiDeviceBlock { id, name, first_group, groups, direction, protocol })
 	}
 }
 
@@ -292,8 +483,8 @@ impl MidiPacketBatch {
 			return None;
 		}
 		w.u16(self.packets.len() as u16)?;
-		for v1 in self.packets.iter() {
-			w.u8(*v1)?;
+		for v2 in self.packets.iter() {
+			w.u8(*v2)?;
 		}
 		Some(())
 	}
@@ -302,14 +493,14 @@ impl MidiPacketBatch {
 		let receiver_generation = r.u64()?;
 		let received_ns = r.u64()?;
 		let packets = {
-			let v2 = r.u16()? as usize;
-			let v2 = (v2 <= 256).then_some(v2)?;
-			let mut v3 = Vec::new();
-			v3.try_reserve_exact(v2).ok()?;
-			for _ in 0..v2 {
-				v3.push(r.u8()?);
+			let v3 = r.u16()? as usize;
+			let v3 = (v3 <= 256).then_some(v3)?;
+			let mut v4 = Vec::new();
+			v4.try_reserve_exact(v3).ok()?;
+			for _ in 0..v3 {
+				v4.push(r.u8()?);
 			}
-			v3
+			v4
 		};
 		Some(MidiPacketBatch { endpoint, receiver_generation, received_ns, packets })
 	}
@@ -412,13 +603,13 @@ impl MidiDeviceEvent {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			MidiDeviceEvent::Batch(v4) => {
+			MidiDeviceEvent::Batch(v5) => {
 				w.u8(0)?;
-				v4.write(w)?;
-			}
-			MidiDeviceEvent::Lost(v5) => {
-				w.u8(1)?;
 				v5.write(w)?;
+			}
+			MidiDeviceEvent::Lost(v6) => {
+				w.u8(1)?;
+				v6.write(w)?;
 			}
 		}
 		Some(())
@@ -445,6 +636,7 @@ pub mod midi_device {
 	pub const OP_STOP: u16 = 4;
 	pub const OP_EVENTS: u16 = 5;
 	pub const OP_SEND: u16 = 6;
+	pub const OP_BLOCKS: u16 = 7;
 
 	pub trait Service {
 		fn open(&mut self, version: u32) -> Result<MidiOpen, Error>;
@@ -457,6 +649,8 @@ pub mod midi_device {
 		/// behind it; refused on a receive endpoint, for a cable the endpoint does not carry, and for a batch that
 		/// is not a whole number of packets.
 		fn send(&mut self, endpoint: u32, packets: Vec<u8>) -> Result<(), Error>;
+		/// A `ump` endpoint's function blocks; none for a `midi1` endpoint.
+		fn blocks(&mut self, endpoint: u32) -> Result<Vec<MidiDeviceBlock>, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -488,13 +682,13 @@ pub mod midi_device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v6) => {
+						Ok(v7) => {
 							w.u8(1)?;
-							v6.write(w)?;
-						}
-						Err(v7) => {
-							w.u8(0)?;
 							v7.write(w)?;
+						}
+						Err(v8) => {
+							w.u8(0)?;
+							v8.write(w)?;
 						}
 					}
 					Some(())
@@ -524,19 +718,19 @@ pub mod midi_device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v8) => {
+						Ok(v9) => {
 							w.u8(1)?;
-							if v8.len() > u16::MAX as usize {
+							if v9.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v8.len() as u16)?;
-							for v10 in v8.iter() {
-								v10.write(w)?;
+							w.u16(v9.len() as u16)?;
+							for v11 in v9.iter() {
+								v11.write(w)?;
 							}
 						}
-						Err(v9) => {
+						Err(v10) => {
 							w.u8(0)?;
-							v9.write(w)?;
+							v10.write(w)?;
 						}
 					}
 					Some(())
@@ -568,12 +762,12 @@ pub mod midi_device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v11) => {
+						Ok(v12) => {
 							w.u8(1)?;
 						}
-						Err(v12) => {
+						Err(v13) => {
 							w.u8(0)?;
-							v12.write(w)?;
+							v13.write(w)?;
 						}
 					}
 					Some(())
@@ -605,12 +799,12 @@ pub mod midi_device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v13) => {
+						Ok(v14) => {
 							w.u8(1)?;
 						}
-						Err(v14) => {
+						Err(v15) => {
 							w.u8(0)?;
-							v14.write(w)?;
+							v15.write(w)?;
 						}
 					}
 					Some(())
@@ -635,14 +829,14 @@ pub mod midi_device {
 			OP_SEND => {
 				let endpoint = r.u32()?;
 				let packets = {
-					let v15 = r.u16()? as usize;
-					let v15 = (v15 <= 256).then_some(v15)?;
-					let mut v16 = Vec::new();
-					v16.try_reserve_exact(v15).ok()?;
-					for _ in 0..v15 {
-						v16.push(r.u8()?);
+					let v16 = r.u16()? as usize;
+					let v16 = (v16 <= 256).then_some(v16)?;
+					let mut v17 = Vec::new();
+					v17.try_reserve_exact(v16).ok()?;
+					for _ in 0..v16 {
+						v17.push(r.u8()?);
 					}
-					v16
+					v17
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -651,12 +845,55 @@ pub mod midi_device {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v17) => {
+						Ok(v18) => {
 							w.u8(1)?;
 						}
-						Err(v18) => {
+						Err(v19) => {
 							w.u8(0)?;
-							v18.write(w)?;
+							v19.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_BLOCKS => {
+				let endpoint = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.blocks(endpoint);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v20) => {
+							w.u8(1)?;
+							if v20.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v20.len() as u16)?;
+							for v22 in v20.iter() {
+								v22.write(w)?;
+							}
+						}
+						Err(v21) => {
+							w.u8(0)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -856,14 +1093,14 @@ pub mod midi_device {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v19 = r.u16()? as usize;
-						let v19 = (v19 <= 8).then_some(v19)?;
-						let mut v20 = Vec::new();
-						v20.try_reserve_exact(v19).ok()?;
-						for _ in 0..v19 {
-							v20.push(MidiDeviceEndpoint::read(r)?);
+						let v23 = r.u16()? as usize;
+						let v23 = (v23 <= 8).then_some(v23)?;
+						let mut v24 = Vec::new();
+						v24.try_reserve_exact(v23).ok()?;
+						for _ in 0..v23 {
+							v24.push(MidiDeviceEndpoint::read(r)?);
 						}
-						v20
+						v24
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -981,8 +1218,8 @@ pub mod midi_device {
 				return None;
 			}
 			w.u16(packets.len() as u16)?;
-			for v21 in packets.iter() {
-				w.u8(*v21)?;
+			for v25 in packets.iter() {
+				w.u8(*v25)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -1001,6 +1238,52 @@ pub mod midi_device {
 					return None;
 				}
 				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn blocks(&mut self, endpoint: &u32) -> Option<Result<Vec<MidiDeviceBlock>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BLOCKS)?;
+			w.u32(corr)?;
+			w.u32(*endpoint)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v26 = r.u16()? as usize;
+						let v26 = (v26 <= 8).then_some(v26)?;
+						let mut v27 = Vec::new();
+						v27.try_reserve_exact(v26).ok()?;
+						for _ in 0..v26 {
+							v27.push(MidiDeviceBlock::read(r)?);
+						}
+						v27
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
 				r.finish()?;
 				Some(value)
 			})();
@@ -1058,6 +1341,14 @@ pub mod midi_device {
 	fn channel_invoke_send(chan: u64, endpoint: &u32, packets: &[u8]) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.send(endpoint, packets)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_midi_device_midi_device_blocks")]
+	fn channel_invoke_blocks(chan: u64, endpoint: &u32) -> Option<Result<Vec<MidiDeviceBlock>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.blocks(endpoint)
 	}
 }
 
@@ -1172,126 +1463,18 @@ pub mod midi_fixture {
 			OP_INJECT => {
 				let endpoint = r.u32()?;
 				let packets = {
-					let v22 = r.u16()? as usize;
-					let v22 = (v22 <= 256).then_some(v22)?;
-					let mut v23 = Vec::new();
-					v23.try_reserve_exact(v22).ok()?;
-					for _ in 0..v22 {
-						v23.push(r.u8()?);
+					let v28 = r.u16()? as usize;
+					let v28 = (v28 <= 256).then_some(v28)?;
+					let mut v29 = Vec::new();
+					v29.try_reserve_exact(v28).ok()?;
+					for _ in 0..v28 {
+						v29.push(r.u8()?);
 					}
-					v23
+					v29
 				};
 				r.finish()?;
 				request_handles.clear();
 				let result = service.inject(endpoint, packets);
-				let encoded: Option<()> = (|| {
-					let w = &mut writer;
-					w.u32(corr)?;
-					match &result {
-						Ok(v24) => {
-							w.u8(1)?;
-						}
-						Err(v25) => {
-							w.u8(0)?;
-							v25.write(w)?;
-						}
-					}
-					Some(())
-				})();
-				if encoded.is_none() {
-					if writer.has_handle() {
-						match Handles::try_from_slice(writer.handles()) {
-							Some(taken) => *reply_handles = taken,
-							None => {}
-						}
-						return None;
-					}
-					// the reply outgrew the caller's buffer: replace it with a typed
-					// error, so the client sees a failure instead of hanging.
-					writer.reset();
-					let w = &mut writer;
-					w.u32(corr)?;
-					w.u8(0)?;
-					Error::Again.write(w)?;
-				}
-			}
-			OP_FLOOD => {
-				let endpoint = r.u32()?;
-				let batches = r.u32()?;
-				r.finish()?;
-				request_handles.clear();
-				let result = service.flood(endpoint, batches);
-				let encoded: Option<()> = (|| {
-					let w = &mut writer;
-					w.u32(corr)?;
-					match &result {
-						Ok(v26) => {
-							w.u8(1)?;
-						}
-						Err(v27) => {
-							w.u8(0)?;
-							v27.write(w)?;
-						}
-					}
-					Some(())
-				})();
-				if encoded.is_none() {
-					if writer.has_handle() {
-						match Handles::try_from_slice(writer.handles()) {
-							Some(taken) => *reply_handles = taken,
-							None => {}
-						}
-						return None;
-					}
-					// the reply outgrew the caller's buffer: replace it with a typed
-					// error, so the client sees a failure instead of hanging.
-					writer.reset();
-					let w = &mut writer;
-					w.u32(corr)?;
-					w.u8(0)?;
-					Error::Again.write(w)?;
-				}
-			}
-			OP_LOSE => {
-				let endpoint = r.u32()?;
-				r.finish()?;
-				request_handles.clear();
-				let result = service.lose(endpoint);
-				let encoded: Option<()> = (|| {
-					let w = &mut writer;
-					w.u32(corr)?;
-					match &result {
-						Ok(v28) => {
-							w.u8(1)?;
-						}
-						Err(v29) => {
-							w.u8(0)?;
-							v29.write(w)?;
-						}
-					}
-					Some(())
-				})();
-				if encoded.is_none() {
-					if writer.has_handle() {
-						match Handles::try_from_slice(writer.handles()) {
-							Some(taken) => *reply_handles = taken,
-							None => {}
-						}
-						return None;
-					}
-					// the reply outgrew the caller's buffer: replace it with a typed
-					// error, so the client sees a failure instead of hanging.
-					writer.reset();
-					let w = &mut writer;
-					w.u32(corr)?;
-					w.u8(0)?;
-					Error::Again.write(w)?;
-				}
-			}
-			OP_WITHDRAW => {
-				r.finish()?;
-				request_handles.clear();
-				let result = service.withdraw();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -1323,10 +1506,12 @@ pub mod midi_fixture {
 					Error::Again.write(w)?;
 				}
 			}
-			OP_REPUBLISH => {
+			OP_FLOOD => {
+				let endpoint = r.u32()?;
+				let batches = r.u32()?;
 				r.finish()?;
 				request_handles.clear();
-				let result = service.republish();
+				let result = service.flood(endpoint, batches);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -1358,6 +1543,112 @@ pub mod midi_fixture {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_LOSE => {
+				let endpoint = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.lose(endpoint);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v34) => {
+							w.u8(1)?;
+						}
+						Err(v35) => {
+							w.u8(0)?;
+							v35.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_WITHDRAW => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.withdraw();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v36) => {
+							w.u8(1)?;
+						}
+						Err(v37) => {
+							w.u8(0)?;
+							v37.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_REPUBLISH => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.republish();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v38) => {
+							w.u8(1)?;
+						}
+						Err(v39) => {
+							w.u8(0)?;
+							v39.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			OP_STATS => {
 				r.finish()?;
 				request_handles.clear();
@@ -1366,13 +1657,13 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v34) => {
+						Ok(v40) => {
 							w.u8(1)?;
-							v34.write(w)?;
+							v40.write(w)?;
 						}
-						Err(v35) => {
+						Err(v41) => {
 							w.u8(0)?;
-							v35.write(w)?;
+							v41.write(w)?;
 						}
 					}
 					Some(())
@@ -1489,8 +1780,8 @@ pub mod midi_fixture {
 				return None;
 			}
 			w.u16(packets.len() as u16)?;
-			for v36 in packets.iter() {
-				w.u8(*v36)?;
+			for v42 in packets.iter() {
+				w.u8(*v42)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -1854,6 +2145,42 @@ impl MidiDeviceDirection {
 	}
 }
 
+impl MidiDeviceProtocol {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			MidiDeviceProtocol::Midi1 => out.push_str("\"midi1\""),
+			MidiDeviceProtocol::Ump => out.push_str("\"ump\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			MidiDeviceProtocol::Midi1 => out.push_str("midi1"),
+			MidiDeviceProtocol::Ump => out.push_str("ump"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			MidiDeviceProtocol::Midi1 => crate::codec::cbor::text(out, "midi1"),
+			MidiDeviceProtocol::Ump => crate::codec::cbor::text(out, "ump"),
+		}
+	}
+}
+
 impl MidiDeviceEndpoint {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1883,6 +2210,9 @@ impl MidiDeviceEndpoint {
 		out.push(',');
 		out.push_str("\"direction\":");
 		self.direction.to_json_into(out);
+		out.push(',');
+		out.push_str("\"protocol\":");
+		self.protocol.to_json_into(out);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1898,10 +2228,13 @@ impl MidiDeviceEndpoint {
 		out.push_str(", ");
 		out.push_str("direction=");
 		self.direction.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("protocol=");
+		self.protocol.to_text_into(out);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "name");
@@ -1910,6 +2243,122 @@ impl MidiDeviceEndpoint {
 		crate::codec::cbor::uint(out, self.cables as u64);
 		crate::codec::cbor::text(out, "direction");
 		self.direction.to_cbor_into(out);
+		crate::codec::cbor::text(out, "protocol");
+		self.protocol.to_cbor_into(out);
+	}
+}
+
+impl MidiDeviceBlockDirection {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			MidiDeviceBlockDirection::Receives => out.push_str("\"receives\""),
+			MidiDeviceBlockDirection::Sends => out.push_str("\"sends\""),
+			MidiDeviceBlockDirection::Both => out.push_str("\"both\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			MidiDeviceBlockDirection::Receives => out.push_str("receives"),
+			MidiDeviceBlockDirection::Sends => out.push_str("sends"),
+			MidiDeviceBlockDirection::Both => out.push_str("both"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			MidiDeviceBlockDirection::Receives => crate::codec::cbor::text(out, "receives"),
+			MidiDeviceBlockDirection::Sends => crate::codec::cbor::text(out, "sends"),
+			MidiDeviceBlockDirection::Both => crate::codec::cbor::text(out, "both"),
+		}
+	}
+}
+
+impl MidiDeviceBlock {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"first-group\":");
+		let _ = write!(out, "{}", self.first_group);
+		out.push(',');
+		out.push_str("\"groups\":");
+		let _ = write!(out, "{}", self.groups);
+		out.push(',');
+		out.push_str("\"direction\":");
+		self.direction.to_json_into(out);
+		out.push(',');
+		out.push_str("\"protocol\":");
+		let _ = write!(out, "{}", self.protocol);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("first-group=");
+		let _ = write!(out, "{}", self.first_group);
+		out.push_str(", ");
+		out.push_str("groups=");
+		let _ = write!(out, "{}", self.groups);
+		out.push_str(", ");
+		out.push_str("direction=");
+		self.direction.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("protocol=");
+		let _ = write!(out, "{}", self.protocol);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "first-group");
+		crate::codec::cbor::uint(out, self.first_group as u64);
+		crate::codec::cbor::text(out, "groups");
+		crate::codec::cbor::uint(out, self.groups as u64);
+		crate::codec::cbor::text(out, "direction");
+		self.direction.to_cbor_into(out);
+		crate::codec::cbor::text(out, "protocol");
+		crate::codec::cbor::uint(out, self.protocol as u64);
 	}
 }
 
@@ -1942,13 +2391,13 @@ impl MidiPacketBatch {
 		out.push(',');
 		out.push_str("\"packets\":");
 		out.push('[');
-		let mut v38 = true;
-		for v37 in self.packets.iter() {
-			if !v38 {
+		let mut v44 = true;
+		for v43 in self.packets.iter() {
+			if !v44 {
 				out.push(',');
 			}
-			v38 = false;
-			let _ = write!(out, "{}", v37);
+			v44 = false;
+			let _ = write!(out, "{}", v43);
 		}
 		out.push(']');
 		out.push('}');
@@ -1966,13 +2415,13 @@ impl MidiPacketBatch {
 		out.push_str(", ");
 		out.push_str("packets=");
 		out.push('[');
-		let mut v40 = true;
-		for v39 in self.packets.iter() {
-			if !v40 {
+		let mut v46 = true;
+		for v45 in self.packets.iter() {
+			if !v46 {
 				out.push_str(", ");
 			}
-			v40 = false;
-			let _ = write!(out, "{}", v39);
+			v46 = false;
+			let _ = write!(out, "{}", v45);
 		}
 		out.push(']');
 		out.push('}');
@@ -1987,8 +2436,8 @@ impl MidiPacketBatch {
 		crate::codec::cbor::uint(out, self.received_ns as u64);
 		crate::codec::cbor::text(out, "packets");
 		crate::codec::cbor::array(out, self.packets.len());
-		for v41 in self.packets.iter() {
-			crate::codec::cbor::uint(out, *v41 as u64);
+		for v47 in self.packets.iter() {
+			crate::codec::cbor::uint(out, *v47 as u64);
 		}
 	}
 }
@@ -2054,43 +2503,43 @@ impl MidiDeviceEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			MidiDeviceEvent::Batch(v42) => {
+			MidiDeviceEvent::Batch(v48) => {
 				out.push_str("{\"batch\":");
-				v42.to_json_into(out);
+				v48.to_json_into(out);
 				out.push('}');
 			}
-			MidiDeviceEvent::Lost(v43) => {
+			MidiDeviceEvent::Lost(v49) => {
 				out.push_str("{\"lost\":");
-				v43.to_json_into(out);
+				v49.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			MidiDeviceEvent::Batch(v44) => {
+			MidiDeviceEvent::Batch(v50) => {
 				out.push_str("batch(");
-				v44.to_text_into(out);
+				v50.to_text_into(out);
 				out.push(')');
 			}
-			MidiDeviceEvent::Lost(v45) => {
+			MidiDeviceEvent::Lost(v51) => {
 				out.push_str("lost(");
-				v45.to_text_into(out);
+				v51.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			MidiDeviceEvent::Batch(v46) => {
+			MidiDeviceEvent::Batch(v52) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "batch");
-				v46.to_cbor_into(out);
+				v52.to_cbor_into(out);
 			}
-			MidiDeviceEvent::Lost(v47) => {
+			MidiDeviceEvent::Lost(v53) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "lost");
-				v47.to_cbor_into(out);
+				v53.to_cbor_into(out);
 			}
 		}
 	}

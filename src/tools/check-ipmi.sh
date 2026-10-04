@@ -639,7 +639,7 @@ expect "channel 1 user 1 \(unnamed\) enabled privilege 2" "ipmi_sim's first user
 expect "channel 1 user 2 ipmiusr enabled privilege 4" "ipmi_sim's second user, an administrator, as configured"
 grep -qE '^2 +ipmiusr +true +false +true +ADMINISTRATOR' <<<"$(outside user list 1 || true)" || fail "oob: ipmitool did not list the administrator the guest read"
 # INSIDE OUT: the boot's event the BMC service wrote through KCS is the record ipmitool reads over the LAN, field by field.
-inside="$(grep -a -oE '0x0001 type 0x02 at [0-9]+ generator 0xf041 sensor type 0x1f sensor 0x00 asserted event 0x6f data 06 ff ff' "$(said)" | head -n 1)"
+inside="$(grep -a -m 1 -oE '0x0001 type 0x02 at [0-9]+ generator 0xf041 sensor type 0x1f sensor 0x00 asserted event 0x6f data 06 ff ff' "$(said)" || true)"
 [[ -n "$inside" ]] || fail "oob: the guest did not read the boot's event as record 1 (see $kept/out-oob.log)"
 outside sel get 1 >"$state/oob-sel.log" || fail "oob: ipmitool could not read record 1"
 for field in "SEL Record ID *: 0001" "Record Type *: 02" "Generator ID *: f041" "Sensor Type *: OS Boot" "Sensor Number *: 00" "Event Direction *: Assertion Event" "Event Data *: 06ffff"; do

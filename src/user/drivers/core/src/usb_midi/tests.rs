@@ -176,6 +176,36 @@ fn a_midi_2_0_setting_is_not_read_as_event_packets() {
 	assert_eq!(bind(&streaming(0x0200, 2)), Err(NotBindable::NoMidiInterface));
 }
 
+// The same device with a MIDI 2.0 face on alternate 1: its header says 2.0, its bulk IN names blocks `in_blocks` and its
+// bulk OUT block 1.
+fn with_ump(in_blocks: &[u8]) -> Vec<u8> {
+	use crate::descriptor;
+	use crate::usb_function::{DT_CS_ENDPOINT, DT_CS_INTERFACE};
+	let mut out = streaming(MS_REVISION_1_0, 2);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, 1, 2, CLASS_AUDIO, SUBCLASS_MIDI_STREAMING, 0, 0]);
+	out.extend_from_slice(&[7, DT_CS_INTERFACE, MS_HEADER, 0x00, 0x02, 7, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x01, 0x02, 0x40, 0x00, 0]);
+	out.extend_from_slice(&[5, DT_CS_ENDPOINT, MS_GENERAL_2_0, 1, 1]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x82, 0x02, 0x40, 0x00, 0]);
+	out.extend_from_slice(&[4 + in_blocks.len() as u8, DT_CS_ENDPOINT, MS_GENERAL_2_0, in_blocks.len() as u8]);
+	out.extend_from_slice(in_blocks);
+	let total = out.len() as u16;
+	out[2..4].copy_from_slice(&total.to_le_bytes());
+	out
+}
+
+#[test]
+fn a_midi_2_0_face_binds_beside_the_midi_1_0_one_with_its_blocks() {
+	let bound = bind(&with_ump(&[1, 2])).expect("the device binds");
+	assert_eq!((bound.alternate, bound.input.address), (0, 0x82), "the MIDI 1.0 face is still alternate zero's");
+	let ump = bound.ump.expect("and its UMP face is alternate 1's");
+	assert_eq!((ump.alternate, ump.input.0.address, ump.input.1.as_slice()), (1, 0x82, &[1u8, 2][..]));
+	assert_eq!(ump.output.map(|(endpoint, ids)| (endpoint.address, ids.as_slice().to_vec())), Some((0x01, alloc::vec![1])));
+	assert_eq!(bind(&streaming(MS_REVISION_1_0, 2)).expect("a MIDI 1.0 device").ump, None, "a device without one has none");
+	assert_eq!(bind(&with_ump(&[])).expect("binds").ump, None, "an endpoint naming no block is no UMP face");
+	assert_eq!(bind(&with_ump(&[1, 0])).expect("binds").ump, None, "and block zero is no block");
+}
+
 #[test]
 fn a_cable_count_a_packet_cannot_name_is_refused() {
 	assert_eq!(bind(&streaming(MS_REVISION_1_0, 0)), Err(NotBindable::BadCableCount));

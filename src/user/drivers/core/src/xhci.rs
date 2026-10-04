@@ -33,6 +33,7 @@ mod class_printer;
 mod class_ptp;
 mod class_uvc;
 mod classes;
+mod iso;
 mod usb_audio;
 mod usb_hid;
 mod usb_net;
@@ -52,7 +53,7 @@ use rt::*;
 
 use crate::usb_audio::configure_audio;
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, TOUCH_SINK, configure_hid, depart, handle_hid_event, post_reports};
-use crate::usb_net::{NOTIFY_WINDOW, Net, configure_network, handle_net_event, handle_notification, post_notification, post_receive, transmit};
+use crate::usb_net::{NOTIFY_WINDOW, Net, configure_network, handle_net_event, handle_notification, notification_due, post_notification, post_receive, transmit};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
 use crate::usb_uas::{Uas, configure_uas};
 use driver_protocol::audio;
@@ -501,8 +502,8 @@ struct Xhci {
 	class_pending: Vec<(u64, u32, u32)>,
 	// THE AUDIO SOURCE'S ENDPOINT, whose standing capture transfers complete during every synchronous wait,
 	// and the completions those waits kept for the loop.
-	audio_rx: Option<(u32, u32)>,
-	audio_pending: Vec<(u32, u32)>,
+	audio_rx: Vec<(u32, u32)>,
+	audio_pending: Vec<(u64, u32, u32)>,
 	// A ROOT PORT WHOSE DEVICES ARE TO BE TAKEN DOWN AND ENUMERATED AGAIN although nothing was unplugged: a DFU
 	// target that waits for the host's reset after a detach, which that enumeration's port reset is.
 	redo_port: Option<u32>,
@@ -977,7 +978,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: None, audio_pending: Vec::new(), redo_port: None })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: Vec::new(), audio_pending: Vec::new(), redo_port: None })
 	}
 }
 
@@ -1485,13 +1486,10 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 				line.push(b" byte packets\n");
 				print(line.as_bytes());
 			}
-			// A SOURCE'S COMPLETIONS ARE KEPT FOR THE LOOP when a synchronous wait takes them off the ring, as a
-			// class pipe's are: its transfers stand, so their events arrive during every other wait.
-			if let Some(source) = streams.source.as_ref() {
-				hc.audio_rx = Some((dev.slot, source.dci));
-				hc.audio_pending.clear();
-			}
+			// A SOURCE'S AND A SINK'S COMPLETIONS ARE KEPT FOR THE LOOP when a synchronous wait takes them off the ring,
+			// as a class pipe's are: their transfers stand, so their events arrive during every other wait.
 			audio.list.push((dev, streams));
+			hc.audio_rx = audio.owners();
 		} else {
 			// THE SERVICE-BACKED CLASSES LAST, because each of them reads every configuration the device has
 			// before it knows - which is bus traffic every device the modules above bound would have paid.
@@ -1573,8 +1571,9 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 		// dispatch as the cheap test in front of `configure_serial`'s descriptor walk.
 		ClassKind::Serial => class == 0 || class == drivers::cdc::CLASS_COMMUNICATIONS,
 		// An audio device declares its class PER INTERFACE and leaves zero at the device level, like
-		// HID and mass storage - the audio-control and audio-streaming interfaces are what carry it.
-		ClassKind::Audio => class == 0 || class == drivers::uac::CLASS_AUDIO,
+		// HID and mass storage - the audio-control and audio-streaming interfaces are what carry it - or, as a UAC2
+		// function does, the association class (0xef) its interface association descriptor needs.
+		ClassKind::Audio => class == 0 || class == 0xef || class == drivers::uac::CLASS_AUDIO,
 		// THE SERVICE-BACKED CLASSES name themselves per interface, all but two: a Bluetooth controller
 		// declares its class at the device level, and a composite device of any of them declares zero or the
 		// association class (0xef).
@@ -1943,9 +1942,10 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			(GAMEPAD_TOKEN, gamepad_server),
 		]);
 		common::takes_sleep();
-		// THE GAMEPAD PUBLICATION'S RETRY: while a frame is owed, the loop wakes a tick later on this timer, on a
-		// HOUSEKEEPING wait - a consumer that never drains must not keep a settling scheduler from settling.
-		let pad_retry: u64 = match timer_create() {
+		// THE LOOP'S RETRY TIMER, on a HOUSEKEEPING wait: while a gamepad frame is owed the loop wakes a tick later on
+		// it - a consumer that never drains must not keep a settling scheduler from settling - and while a CDC
+		// adapter's notification read waits for its interval, when that interval is up.
+		let retry: u64 = match timer_create() {
 			timer if timer > 0 => timer as u64,
 			_ => exit(),
 		};
@@ -1976,8 +1976,8 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			classes.absorb_kept(hc, &mut hids);
 			// THE AUDIO SOURCE'S KEPT COMPLETIONS, oldest first, for the same reason.
 			while !hc.audio_pending.is_empty() {
-				let (status, control) = hc.audio_pending.remove(0);
-				let _ = usb_audio::absorb(hc, &mut audio, status, control);
+				let (pointer, status, control) = hc.audio_pending.remove(0);
+				let _ = usb_audio::absorb(hc, &mut audio, pointer, status, control);
 			}
 			// A PORT A MODULE ASKED TO HAVE ENUMERATED AGAIN - a DFU target waiting for the reset its detach needs -
 			// is done before the loop sleeps, because nothing else will wake it: the device is waiting too.
@@ -2004,17 +2004,23 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 					}
 				}
 			}
+			// THE CDC ADAPTER'S NOTIFICATION READ, once its interval has passed - see `post_notification`.
+			if let Some((dev, net)) = network.as_mut() {
+				post_notification(hc, dev, net);
+			}
 			// THE CONTROLLER'S INTERRUPT FIRST, then the channels class modules wait on - a modem's transmit channel -
-			// and last the gamepad publication's retry, ARMED EVERY PASS: a tick away while a frame is owed, and
-			// never otherwise, because a timer stays expired until it is armed again.
+			// and last the retry, ARMED EVERY PASS: a tick away while a gamepad frame is owed, at the notification
+			// read's interval while one waits for it, and never otherwise, because a timer stays expired until it is
+			// armed again.
 			hids.pads.flush();
 			let owed = hids.pads.owes();
-			timer_set(pad_retry, if owed { clock() + 1 } else { u64::MAX });
+			let renote = network.as_ref().and_then(|(_, net)| notification_due(net));
+			timer_set(retry, core::cmp::min(if owed { clock() + 1 } else { u64::MAX }, renote.unwrap_or(u64::MAX)));
 			let mut waiting: Vec<u64> = alloc::vec![irq];
 			waiting.extend(classes.waits());
 			let retry_at = waiting.len();
-			waiting.push(pad_retry);
-			let ready = match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &waiting, owed) {
+			waiting.push(retry);
+			let ready = match common::wait_providers_or_sleep(bootstrap, bind, &mut serving, &waiting, owed || renote.is_some()) {
 				Some(Some(ready)) => Some(ready),
 				Some(None) => {
 					if common::take_sleep_step(bootstrap, bind, &mut Sleep { hc: &hc, serving: &mut serving, suspended: Vec::new(), keyboard_wakes: hids.remote_wakeup(), irq, armed: false }) {
@@ -2158,7 +2164,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 					continue;
 				}
 				// THE AUDIO SOURCE'S STANDING CAPTURE.
-				if control >> 10 & 0x3f == TRB_EV_TRANSFER && usb_audio::absorb(hc, &mut audio, status, control) {
+				if control >> 10 & 0x3f == TRB_EV_TRANSFER && usb_audio::absorb(hc, &mut audio, pointer, status, control) {
 					continue;
 				}
 				// AND THE CLASS MODULES', each answering only for its own pipes.
@@ -2337,13 +2343,8 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 								close(handle);
 							}
 							match audio::message(&period[..len]) {
-								audio::Message::Play => {
-									let played = match audio.sink() {
-										Some((dev, sink)) => usb_audio::play(hc, &mut hids, dev, sink, &period[..len]),
-										None => false,
-									};
-									send_blocking(server, if played { audio::OK } else { audio::REFUSED }, 0);
-								}
+								// A PERIOD IS QUEUED ON THE STANDING PLAYBACK, and answered when there is room for the next.
+								audio::Message::Play => usb_audio::play(hc, &mut audio, server, &period[..len]),
 								// A CAPTURE IS ANSWERED FROM THE SOURCE'S STANDING CAPTURE - now, or when a
 								// period is there - and its end stops the stream.
 								audio::Message::Capture => usb_audio::capture(hc, &mut hids, &mut audio, server),
@@ -2351,13 +2352,20 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 									usb_audio::end_capture(hc, &mut hids, &mut audio);
 									send_blocking(server, audio::OK, 0);
 								}
-								// AN ISOCHRONOUS SINK HAS NOTHING TO STOP. There is no stream to
-								// release: the endpoint is scheduled when a transfer is posted and
-								// idle when none is, so the end of a stream is the absence of the
-								// next period.
+								// THE END OF THE PLAYBACK STREAM: what is queued plays out, and the stream goes idle.
 								audio::Message::EndPlayback => {
+									usb_audio::end_play(hc, &mut audio);
 									send_blocking(server, audio::OK, 0);
 								}
+								// THE SINK'S COUNTERS, or a refusal with no sink here.
+								audio::Message::Stats => match usb_audio::stats(&mut audio) {
+									Some(stats) => {
+										send_blocking(server, &stats.encode(), 0);
+									}
+									None => {
+										send_blocking(server, audio::REFUSED, 0);
+									}
+								},
 								// A SHAPE THIS WIRE DOES NOT HAVE is refused, with the wire's own refusal.
 								audio::Message::Unknown => {
 									send_blocking(server, audio::REFUSED, 0);
@@ -2566,8 +2574,8 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		// class budget with them, or a device unplugged and plugged in again is refused by
 		// a budget still holding the first one's place.
 		for mut dev in audio.take_port(port) {
-			if hc.audio_rx.is_some_and(|(slot, _)| slot == dev.slot) {
-				hc.audio_rx = None;
+			if hc.audio_rx.iter().any(|&(slot, _)| slot == dev.slot) {
+				hc.audio_rx.retain(|&(slot, _)| slot != dev.slot);
 				hc.audio_pending.clear();
 			}
 			dev.release(hc);
@@ -2669,9 +2677,9 @@ fn keep_stray(hc: &mut Xhci, pointer: u64, status: u32, control: u32) -> bool {
 	}
 	// AND THE AUDIO SOURCE'S, which stand for as long as a capture runs. Bounded by the transfers that can
 	// stand: a completion past that is not one of them.
-	if hc.audio_rx == Some(owner) {
-		if hc.audio_pending.len() < drivers::usb_class::CAPTURE_POSTED as usize + 2 {
-			hc.audio_pending.push((status, control));
+	if hc.audio_rx.contains(&owner) {
+		if hc.audio_pending.len() < 2 * drivers::uac::MAX_AHEAD as usize + 4 {
+			hc.audio_pending.push((pointer, status, control));
 		}
 		return true;
 	}

@@ -11,7 +11,7 @@
 
 #![no_std]
 
-use admin_proto::generated::liber::admin::v1::{AdminAnswer, AdminRequestArgs, AdminResult};
+use admin_proto::generated::liber::admin::v1::{AdminAnswer, AdminRead, AdminRequestArgs, AdminResult};
 use base_proto::generated::liber::base::v1::Error;
 
 unsafe extern "Rust" {
@@ -19,6 +19,8 @@ unsafe extern "Rust" {
 	fn request_request(chan: u64, args: &AdminRequestArgs, payload: &u64) -> Option<Result<AdminAnswer, Error>>;
 	#[link_name = "liber_channel_liber_admin_admin_authority_execute"]
 	fn authority_execute(chan: u64) -> Option<Result<AdminResult, Error>>;
+	#[link_name = "liber_channel_liber_admin_admin_authority_execute_read"]
+	fn authority_execute_read(chan: u64) -> Option<Result<AdminRead, Error>>;
 }
 
 /// A REQUEST CONNECTION: one question at a time to the trusted administrative path, answered once a person
@@ -57,5 +59,11 @@ impl AdminAuthorityClient {
 	#[inline(always)]
 	pub fn execute(&mut self) -> Option<Result<AdminResult, Error>> {
 		unsafe { authority_execute(self.chan) }
+	}
+
+	/// The one attempt at an operation that READS, with what it read.
+	#[inline(always)]
+	pub fn execute_read(&mut self) -> Option<Result<AdminRead, Error>> {
+		unsafe { authority_execute_read(self.chan) }
 	}
 }

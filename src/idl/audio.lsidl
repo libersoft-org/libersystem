@@ -49,3 +49,28 @@ interface audio-admin {
 	@op(1) open-streams:  func() -> result<handle<channel>, error>;
 	@op(2) open-captures: func() -> result<handle<channel>, error>;
 }
+
+/// WHAT THE PLAYING DEVICE COUNTED, for the System Graph: OBSERVATION AND NEVER ENFORCEMENT, and never a
+/// sample. The counters are the device provider's own, as AudioService last read them - while a stream plays
+/// at most a few hundred milliseconds old, and exact once it has stopped.
+record audio-resources {
+	/// Whether the provider counts at all. False with no device, and for a provider that plays a period at a
+	/// time and keeps no counters - the rest is then zero and means nothing.
+	counted:          bool,
+	/// Dry spells: how many times the device's queue ran out while the stream played, and the frames of
+	/// silence that went out in its place.
+	underruns:        u64,
+	silent-frames:    u64,
+	/// The rate an asynchronous sink's feedback endpoint asks for, frames per service interval in 16.16 -
+	/// zero for a sink without one - and the feedback values ignored as too far from nominal.
+	feedback-q16:     u32,
+	feedback-ignored: u64,
+}
+
+/// OBSERVATION AND NEVER ENFORCEMENT: what the playing device counted, for the System Graph.
+///
+/// A SEPARATE INTERFACE, because authority to READ the counters must not be authority to make a sound or to
+/// record one. The System Graph is handed this endpoint and nothing else.
+interface audio-stats {
+	@op(1) resources: func() -> audio-resources;
+}

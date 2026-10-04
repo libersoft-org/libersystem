@@ -40,6 +40,8 @@ static STOP_PENDING: AtomicBool = AtomicBool::new(false);
 static NODE: AtomicU64 = AtomicU64::new(0);
 static OWN_SLEEP: AtomicBool = AtomicBool::new(false);
 static SUSPEND_ASKED: AtomicU64 = AtomicU64::new(0);
+// THE FIXED BUTTON'S PRESSES, as the production wait counts a manager's `PRESSED` - which these regressions never send.
+static PRESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 fn request_node(_: u64, _: &Bind) -> bool { true }
 fn take_node(_: &Bind, _: proto::Opcode, handle: u64) { if handle != 0 { close(handle) } }
 fn encode_request(_: &proto::SuspendRequest) -> u64 { 0 }

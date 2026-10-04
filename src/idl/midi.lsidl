@@ -20,6 +20,13 @@
 //!
 //! ORDER AND TIME are `liber:event@1`'s: the endpoint's observation order across all its cables, never sorted,
 //! and host receipt time only - USB MIDI 1.0 carries no device timestamp, and none is invented.
+//!
+//! UMP BESIDE MIDI 1.0. A `ump` endpoint - a USB MIDI 2.0 device's - carries Universal MIDI Packets: a message of one to
+//! four 32-bit words, on one of sixteen GROUPS, and the endpoint lists the function blocks its groups belong to. A
+//! receiver reads it as `ump` items, its SysEx7 and SysEx8 counted within the bounds a MIDI 1.0 SysEx is; a sender
+//! sends UMP messages. AND EITHER SPEAKS TO EITHER: a receiver may ask for the other protocol, and a MIDI 1.0 endpoint
+//! is then read as MIDI 1.0 in UMP, or a UMP endpoint as MIDI 1.0 chunks by the specification's translation - a cable
+//! is a group, and a group a cable; a sender may send either on either the same way. Nothing else invents a group.
 
 package liber:midi@1;
 
@@ -46,15 +53,42 @@ enum midi-direction {
 	transmit = 2,
 }
 
+/// Which way a function block's groups carry messages, from the DEVICE's side.
+enum midi-block-direction {
+	receives = 1,
+	sends    = 2,
+	both     = 3,
+}
+
+/// One function block of a UMP endpoint, as the device declares it.
+record midi-block {
+	id:              u8,
+	@bound(32) name: string,
+	first-group:     u8,
+	groups:          u8,
+	direction:       midi-block-direction,
+	/// The MIDI protocol the block says it speaks, as the device numbers it.
+	protocol:        u8,
+}
+
 record midi-endpoint {
 	id:              midi-endpoint-id,
 	@bound(64) name: string,
 	protocol:        midi-protocol,
 	direction:       midi-direction,
-	/// Cables 0..cables-1 are this endpoint's; at most 16.
+	/// Cables 0..cables-1 are this endpoint's - for a UMP endpoint, the groups its blocks cover; at most 16.
 	cables:          u8,
 	/// A receiver holds it now - or, on a transmit endpoint, a sender.
 	receiving:       bool,
+	/// A UMP endpoint's function blocks; none for a MIDI 1.0 one.
+	@bound(8) blocks: list<midi-block>,
+}
+
+/// ONE UNIVERSAL MIDI PACKET MESSAGE: its words, as many as its first word's type says, and its group - absent for the
+/// utility and stream messages, which have none.
+record midi-ump {
+	group:            option<u8>,
+	@bound(4) words:  list<u32>,
 }
 
 enum midi-chunk-kind {
@@ -112,6 +146,8 @@ enum midi-fault-code {
 	status    = 4,
 	/// Padding that is not zero.
 	padding   = 5,
+	/// UMP words a batch ends inside a message of.
+	truncated = 6,
 }
 
 /// A packet the decoder refused; `cable` is absent when the refusal could not be attributed to one, in which
@@ -125,6 +161,9 @@ variant midi-item {
 	chunk(midi-chunk),
 	aborted(midi-abort),
 	fault(midi-fault),
+	/// A UMP message, to a receiver reading UMP. Its SysEx7 and SysEx8 parts are counted as a chunk's are, and an
+	/// abort's `cable` is then the group.
+	ump(midi-ump),
 }
 
 record midi-event {
@@ -148,7 +187,7 @@ record midi-receiver-status {
 }
 
 /// INVENTORY: the endpoints and what they are. `open` exists to say no precisely: receiving and sending each
-/// need a grant, a direction the endpoint does not have is invalid, and UMP is unsupported.
+/// need a grant, and a direction the endpoint does not have is invalid.
 interface midi {
 	@op(1) @bound(32) endpoints: func() -> result<list<midi-endpoint>, error>;
 	@op(2) open: func(endpoint: midi-endpoint-id, direction: midi-direction, protocol: midi-protocol) -> result<unit, error>;
@@ -164,6 +203,10 @@ interface midi-input {
 	@op(3) status:   func() -> result<midi-receiver-status, error>;
 	/// Stop receiving; the queued events are discarded and the slot freed.
 	@op(4) stop:     func() -> result<unit, error>;
+	/// READ THE OTHER PROTOCOL from here on: a MIDI 1.0 endpoint as MIDI 1.0 in UMP, or a UMP endpoint as MIDI 1.0
+	/// chunks by the specification's translation - a group as a cable, MIDI 2.0 channel voice translated down, and a
+	/// message with no MIDI 1.0 form not delivered. The endpoint's own protocol is the default.
+	@op(5) protocol: func(protocol: midi-protocol) -> result<unit, error>;
 }
 
 /// ONE SENDER, on the one transmit endpoint this connection was minted for, for as long as its owner lives.
@@ -175,6 +218,9 @@ interface midi-output {
 	@op(2) send:     func(@bound(64) chunks: list<midi-chunk>) -> result<unit, error>;
 	/// Stop sending; a message the sender left open stays unfinished, and the slot is freed.
 	@op(3) stop:     func() -> result<unit, error>;
+	/// Send these UMP messages, in order, as one batch - checked whole as `send` is. On a MIDI 1.0 endpoint they go as
+	/// MIDI 1.0 by the translation, a group as a cable, and a message with no MIDI 1.0 form refuses the batch.
+	@op(4) send-ump: func(@bound(64) messages: list<midi-ump>) -> result<unit, error>;
 }
 
 record midi-grant {

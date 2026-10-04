@@ -15,6 +15,15 @@
 // capture, and AudioService opens one provider - so a period goes to whichever device has a sink and a
 // capture to whichever has a source. A headset is both; QEMU's speaker and a microphone are two.
 //
+// A PLAYBACK STANDS WHILE IT PLAYS, the mirror of the capture below. A period is QUEUED - four periods at most,
+// about 43 ms - and answered `OK` once it is and there is room for the next, so AudioService is paced by the device's
+// clock and not its own; packets are posted ahead of the bus from the queue, each sized by `drivers::uac::Pacer` -
+// the nominal rate for an adaptive or synchronous sink, the rate an asynchronous sink's FEEDBACK ENDPOINT asks for
+// otherwise, read from the group of transfers that stands on it. WHEN THE QUEUE RUNS DRY WHILE THE STREAM PLAYS, a packet of
+// SILENCE goes out in its place - the owner's option (a), 2026-09-25: the device's clock keeps running, the gap is
+// silence and the stream resumes without a restart - and one underrun is counted per dry spell, with the silent
+// frames. `EndPlayback` lets the queue drain and the stream go idle. The counters answer `CMD_STATS`.
+//
 // A CAPTURE STANDS WHILE IT RUNS. From the first `CMD_CAPTURE` until `CMD_CAPTURE_STOP` the source's
 // capture setting is selected and `CAPTURE_POSTED` isochronous IN transfers stay posted, each re-posted as
 // it completes and each completion appended to a FIFO of eight periods; a capture request is answered from
@@ -30,12 +39,11 @@ use rt::*;
 use crate::usb_hid::Hids;
 use crate::{CC_SHORT_PACKET, CC_SUCCESS, DESC_CONFIG, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, TRB_CONFIGURE_ENDPOINT, TRB_EV_CMD_COMPLETE, TRB_IOC, TRB_SET_TR_DEQUEUE};
 use crate::{Ring, UsbDevice, Xhci};
-use crate::{command, command_and_wait, control_in_req, control_nodata, control_out_req, dma_page, keep_stray, r8, take_event, w32, wait_command, wait_transfer};
+use crate::{command, command_and_wait, control_in_req, control_nodata, control_out_req, dma_page, keep_stray, r8, take_event, w32, wait_command};
 use driver_protocol::audio;
 use drivers::common;
 use drivers::descriptor;
 use drivers::uac::{self, Direction};
-use drivers::usb_class::CAPTURE_POSTED;
 
 const REQ_SET_INTERFACE: u8 = 0x0b;
 const RT_INTERFACE_OUT: u8 = 0x01;
@@ -43,6 +51,11 @@ const RT_INTERFACE_OUT: u8 = 0x01;
 const RT_CLASS_ENDPOINT_OUT: u8 = 0x22;
 const UAC_SET_CUR: u8 = 0x01;
 const UAC_SAMPLING_FREQ_CONTROL: u16 = 0x01;
+// UAC2's CUR and RANGE on an entity - a clock - through the audio-control interface: the class interface requests.
+const RT_CLASS_INTERFACE_IN: u8 = 0xA1;
+const RT_CLASS_INTERFACE_OUT: u8 = 0x21;
+const UAC2_CUR: u8 = 0x01;
+const UAC2_RANGE: u8 = 0x02;
 
 /// The isochronous TRB type, and the endpoint types for an isochronous OUT and IN pipe.
 ///
@@ -50,14 +63,14 @@ const UAC_SAMPLING_FREQ_CONTROL: u16 = 0x01;
 /// driver that configured an isochronous endpoint as bulk asks the controller for a pipe the device
 /// does not have; one that posted a Normal TRB on an isochronous ring posts a transfer the
 /// controller has no schedule for.
-const TRB_ISOCH: u32 = 5;
+pub(crate) const TRB_ISOCH: u32 = 5;
 const EP_TYPE_ISOCH_OUT: u32 = 1;
-const EP_TYPE_ISOCH_IN: u32 = 5;
+pub(crate) const EP_TYPE_ISOCH_IN: u32 = 5;
 const TRB_STOP_ENDPOINT: u32 = 15;
 // A transfer ring an isochronous endpoint found empty when its interval came round: an event with no transfer
 // behind it, which completes nothing that was posted.
-const CC_RING_UNDERRUN: u32 = 14;
-const CC_RING_OVERRUN: u32 = 15;
+pub(crate) const CC_RING_UNDERRUN: u32 = 14;
+pub(crate) const CC_RING_OVERRUN: u32 = 15;
 // The xHCI speed of a high-speed device, whose isochronous interval is microframes rather than frames.
 const SPEED_HIGH: u32 = 3;
 
@@ -66,20 +79,69 @@ const SPEED_HIGH: u32 = 3;
 /// A FRAME ID IS A PROMISE ABOUT WHEN, and a driver that names one has to know what frame the
 /// controller is on and how far ahead it may schedule. `SIA` is the transport saying "you choose",
 /// which for a sink whose consumer paces it is the right answer: the period arrives when it arrives.
-const TRB_START_ISOCH_ASAP: u32 = 1 << 31;
+pub(crate) const TRB_START_ISOCH_ASAP: u32 = 1 << 31;
 
 /// The captured bytes a source may hold for its consumer: eight periods, about 85 ms.
 pub const CAPTURE_FIFO: usize = 8 * audio::PERIOD_BYTES as usize;
 
-/// A bound audio sink.
+/// THE PCM A PLAYING SINK MAY HOLD: four periods, about 43 ms - what a consumer may be late by before a listener hears
+/// it, and the latency a period waits before it plays. Eight were tried while a CDC adapter's notification endpoint kept
+/// this driver's core busy and every consumer's answer a scheduler tick late (see `post_notification`); with that gone,
+/// four held a steady feed without a dry spell run after run.
+pub const PLAYBACK_QUEUE: usize = 4 * audio::PERIOD_BYTES as usize;
+// HOW MANY PACKETS A STREAM KEEPS AHEAD OF THE BUS AND HOW MANY TO ONE COMPLETION EVENT are `uac::posting`'s, in time:
+// about 16 ms ahead and an event every 8 ms, at full speed sixteen and eight. ONE EVENT PER GROUP, and per the last one
+// a post leaves standing - an event for every packet is a thousand interrupts a second at full speed and eight thousand
+// at high speed, each with its register writes to the controller, measured at about three thousand events a second with
+// the feedback endpoint's before they were grouped. The feedback endpoint keeps one group standing.
+/// WHAT AN IDLE STREAM WAITS TO HOLD BEFORE IT STARTS: two periods, about 21 ms - half the queue, and more than the
+/// packets it posts ahead, so a stream does not run dry in its first milliseconds for want of the period still on its
+/// way.
+pub const PLAYBACK_START: usize = 2 * audio::PERIOD_BYTES as usize;
+
+/// An asynchronous sink's feedback endpoint, with the group of transfers that stands on it while the stream plays.
+struct FeedbackPipe {
+	dci: u32,
+	ring: Ring,
+	page: u64,
+	phys: u64,
+	virt: u64,
+	max_packet: u16,
+	/// How many transfers stand at once, one event for them.
+	group: u32,
+	/// The standing transfers' TRB addresses, oldest first, and the buffer each reads into.
+	inflight: VecDeque<(u64, u64)>,
+}
+
+/// A bound audio sink and its standing playback.
 pub struct Sink {
 	dci: u32,
 	ring: Ring,
-	/// The page one period is staged in before the controller reads it, and its handle.
+	/// The page the posted packets are staged in - one buffer each, a packet's size apart - and its handle.
 	page: u64,
 	virt: u64,
 	phys: u64,
 	binding: uac::Binding,
+	feedback: Option<FeedbackPipe>,
+	queue: VecDeque<u8>,
+	pacer: uac::Pacer,
+	/// How many packets stand ahead of the bus at most - one page buffer each - how many to one completion event, how
+	/// many stand, and where the next one lands.
+	slots: u32,
+	group: u32,
+	posted: u32,
+	next: u32,
+	/// The standing packets' TRB addresses, oldest first: a completion event names the TRB that asked for it, and every
+	/// one before it is done too.
+	inflight: VecDeque<u64>,
+	running: bool,
+	ending: bool,
+	/// Inside a dry spell: the next silent packet is no new underrun.
+	dry: bool,
+	underruns: u64,
+	silent_frames: u64,
+	/// The consumer channel a play request is waiting on for room, or zero.
+	pub waiting: u64,
 }
 
 /// A bound audio source and its standing capture.
@@ -90,7 +152,7 @@ pub struct Source {
 	virt: u64,
 	phys: u64,
 	binding: uac::Binding,
-	/// How many packet buffers the page holds, and so how many transfers may stand.
+	/// How many transfers stand at most - one page buffer each, about 16 ms of them.
 	slots: u32,
 	running: bool,
 	posted: u32,
@@ -127,8 +189,17 @@ impl Source {
 impl Audio {
 	pub fn release(&mut self) {
 		if let Some(sink) = self.sink.as_mut() {
+			// A PLAY WAITING WHEN ITS SINK LEAVES is refused rather than left waiting for ever.
+			if sink.waiting != 0 {
+				send_blocking(sink.waiting, audio::REFUSED, 0);
+				sink.waiting = 0;
+			}
 			sink.ring.release();
 			close(sink.page);
+			if let Some(feedback) = sink.feedback.as_mut() {
+				feedback.ring.release();
+				close(feedback.page);
+			}
 		}
 		if let Some(source) = self.source.as_mut() {
 			// A CAPTURE WAITING WHEN ITS SOURCE LEAVES is refused rather than left waiting for ever.
@@ -189,13 +260,35 @@ impl Devices {
 		gone
 	}
 
-	/// The consumer channel closed: a capture waiting on it has nobody to answer.
+	/// The consumer channel closed: a capture or a play waiting on it has nobody to answer.
 	pub fn consumer_closed(&mut self, channel: u64) {
 		if let Some((_, source)) = self.source()
 			&& source.waiting == channel
 		{
 			source.waiting = 0;
 		}
+		if let Some((_, sink)) = self.sink()
+			&& sink.waiting == channel
+		{
+			sink.waiting = 0;
+		}
+	}
+
+	/// The (slot, endpoint) of every standing transfer here, for the completions a synchronous wait keeps.
+	pub fn owners(&self) -> Vec<(u32, u32)> {
+		let mut out = Vec::new();
+		for (dev, audio) in &self.list {
+			if let Some(sink) = audio.sink.as_ref() {
+				out.push((dev.slot, sink.dci));
+				if let Some(feedback) = sink.feedback.as_ref() {
+					out.push((dev.slot, feedback.dci));
+				}
+			}
+			if let Some(source) = audio.source.as_ref() {
+				out.push((dev.slot, source.dci));
+			}
+		}
+		out
 	}
 }
 
@@ -209,7 +302,7 @@ impl Default for Devices {
 // is 2^(n-1) FRAMES at full speed and 2^(n-1) microframes at high speed - so one frame is an exponent of three,
 // and a driver that wrote the descriptor's number gets a schedule eight times too fast, which the controller
 // answers with underruns.
-fn interval_exponent(speed: u32, interval: u8) -> u32 {
+pub(crate) fn interval_exponent(speed: u32, interval: u8) -> u32 {
 	let n = interval.clamp(1, 16) as u32;
 	if speed == SPEED_HIGH { n - 1 } else { n - 1 + 3 }
 }
@@ -276,6 +369,7 @@ pub unsafe fn configure_audio(hc: &mut Xhci, dev: &mut UsbDevice, sink: bool, so
 				Some(uac::NotBindable::NoUsableFormat) => b"no alternate setting offers 48 kHz stereo 16-bit, and this driver refuses rather than resamples",
 				Some(uac::NotBindable::Malformed) => b"its configuration descriptor is malformed",
 				Some(uac::NotBindable::TooMany) => b"its configuration describes more than this bounded walk follows",
+				Some(uac::NotBindable::ClockTopology) => b"its stream runs on a clock this driver cannot set - none, or a selector or a multiplier",
 			});
 			print(b"\n");
 			return None;
@@ -298,6 +392,13 @@ pub unsafe fn configure_audio(hc: &mut Xhci, dev: &mut UsbDevice, sink: bool, so
 			print(b"driver.xhci: the audio device refused the alternate setting that carries its endpoint\n");
 			return None;
 		}
+		// AND ITS RATE - a sink's as well as a source's, which a speaker offering 44.1 and 48 kHz was not given, and played
+		// at whichever it came up in.
+		if let Some(bound) = sink_binding
+			&& !set_rate(hc, &mut hids, dev, &bound)
+		{
+			return None;
+		}
 
 		let dci_of = |binding: &uac::Binding| (binding.endpoint & 0x0f) as u32 * 2 + u32::from(binding.endpoint & 0x80 != 0);
 		let sink_ring = match sink_binding {
@@ -305,6 +406,12 @@ pub unsafe fn configure_audio(hc: &mut Xhci, dev: &mut UsbDevice, sink: bool, so
 			None => None,
 		};
 		let source_ring = match source_binding {
+			Some(_) => Some(Ring::new()?),
+			None => None,
+		};
+		// AN ASYNCHRONOUS SINK'S FEEDBACK ENDPOINT, configured beside its data endpoint.
+		let feedback = sink_binding.and_then(|bound| bound.feedback);
+		let feedback_ring = match feedback {
 			Some(_) => Some(Ring::new()?),
 			None => None,
 		};
@@ -323,6 +430,13 @@ pub unsafe fn configure_audio(hc: &mut Xhci, dev: &mut UsbDevice, sink: bool, so
 			entries = entries.max(dci);
 			write_endpoint(hc, dev, dci, EP_TYPE_ISOCH_IN, bound, ring);
 		}
+		if let (Some(feedback), Some(ring), Some(bound)) = (feedback.as_ref(), feedback_ring.as_ref(), sink_binding.as_ref()) {
+			let dci = (feedback.endpoint & 0x0f) as u32 * 2 + 1;
+			add |= 1 << dci;
+			entries = entries.max(dci);
+			let as_endpoint = uac::Binding { endpoint: feedback.endpoint, max_packet: feedback.max_packet, interval: feedback.interval, ..*bound };
+			write_endpoint(hc, dev, dci, EP_TYPE_ISOCH_IN, &as_endpoint, ring);
+		}
 		((dev.in_virt + 4) as *mut u32).write_volatile(add);
 		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
 		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20 | dev.route);
@@ -334,14 +448,26 @@ pub unsafe fn configure_audio(hc: &mut Xhci, dev: &mut UsbDevice, sink: bool, so
 		let sink = match (sink_binding, sink_ring) {
 			(Some(binding), Some(ring)) => {
 				let (page, virt, phys) = dma_page()?;
-				Some(Sink { dci: dci_of(&binding), ring, page, virt, phys, binding })
+				let feedback = match (binding.feedback, feedback_ring) {
+					(Some(feedback), Some(ring)) => {
+						let (page, virt, phys) = dma_page()?;
+						Some(FeedbackPipe { dci: (feedback.endpoint & 0x0f) as u32 * 2 + 1, ring, page, phys, virt, max_packet: feedback.max_packet.max(4), group: uac::posting(uac::interval_us(feedback.interval, dev.speed == SPEED_HIGH), 4096 / u32::from(feedback.max_packet.max(4))).1, inflight: VecDeque::new() })
+					}
+					_ => None,
+				};
+				let high_speed = dev.speed == SPEED_HIGH;
+				let frame_bytes = u32::from(binding.format.channels) * u32::from(binding.format.subframe_bytes);
+				let nominal = uac::Pacer::nominal_for(uac::WANTED_RATE_HZ, uac::interval_us(binding.interval, high_speed));
+				let pacer = uac::Pacer::new(nominal, u32::from(binding.max_packet) / frame_bytes.max(1));
+				let (slots, group) = uac::posting(uac::interval_us(binding.interval, high_speed), 4096 / u32::from(binding.max_packet.max(1)));
+				Some(Sink { dci: dci_of(&binding), ring, page, virt, phys, binding, feedback, queue: VecDeque::new(), pacer, slots, group, posted: 0, next: 0, inflight: VecDeque::new(), running: false, ending: false, dry: false, underruns: 0, silent_frames: 0, waiting: 0 })
 			}
 			_ => None,
 		};
 		let source = match (source_binding, source_ring) {
 			(Some(binding), Some(ring)) => {
 				let (page, virt, phys) = dma_page()?;
-				let slots = (4096 / binding.max_packet.max(1) as u32).min(CAPTURE_POSTED).max(1);
+				let (slots, _) = uac::posting(uac::interval_us(binding.interval, dev.speed == SPEED_HIGH), 4096 / u32::from(binding.max_packet.max(1)));
 				Some(Source { dci: dci_of(&binding), ring, page, virt, phys, binding, slots, running: false, posted: 0, next: 0, done: 0, fifo: VecDeque::new(), overrun: false, dropped: 0, waiting: 0 })
 			}
 			_ => None,
@@ -350,40 +476,187 @@ pub unsafe fn configure_audio(hc: &mut Xhci, dev: &mut UsbDevice, sink: bool, so
 	}
 }
 
-/// Play one period, answering whether the controller took it.
-///
-/// ONE TRANSFER DESCRIPTOR PER SERVICE INTERVAL. An isochronous endpoint carries `max_packet` bytes
-/// each time the bus schedules it, so a period is several transfers - and the last one is short,
-/// which is not an error: the wire's period and the device's packet size divide evenly only by
-/// accident.
-pub unsafe fn play(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, sink: &mut Sink, period: &[u8]) -> bool {
+// THE BYTES OF ONE FRAME at the sink's format.
+fn frame_bytes(sink: &Sink) -> u32 {
+	(u32::from(sink.binding.format.channels) * u32::from(sink.binding.format.subframe_bytes)).max(1)
+}
+
+// POST PACKETS UNTIL AS MANY STAND AS THE PAGE HAS BUFFERS FOR, each the pacer's frames: from the queue, or - while the
+// stream plays and the queue has run dry - silence in its place. One completion event per `PLAYBACK_GROUP` packets and
+// per the last one posted; the doorbell rung once.
+//
+// A PACKET THE QUEUE CANNOT FILL WAITS while three quarters of the slots still stand: that is milliseconds of sound
+// already on the bus, and the period that fills it is on its way. Padded with silence whenever a slot was free, a
+// stream that had run dry and was fed again ran dry a second time at once - the first period back filled two and a
+// half packets of a group of eight, and the other five went out silent while the next period was two milliseconds
+// away. Below that floor the bus needs the packet more than the queue needs the wait, and it goes out padded.
+unsafe fn post_playback(hc: &mut Xhci, dev: &UsbDevice, sink: &mut Sink) {
 	unsafe {
-		let bytes = period.len().min(4096);
-		for (index, byte) in period[..bytes].iter().enumerate() {
-			((sink.virt + index as u64) as *mut u8).write_volatile(*byte);
+		let frame = frame_bytes(sink);
+		let floor = sink.slots - sink.slots / 4;
+		// THE PACKETS, staged first, so the last one is known when the IOC bits are set.
+		let mut staged: [(u64, u32); uac::MAX_AHEAD as usize] = [(0, 0); uac::MAX_AHEAD as usize];
+		let mut count = 0usize;
+		while sink.running && sink.posted + (count as u32) < sink.slots && count < staged.len() {
+			// DRAINED AND ENDING: nothing more is posted, and the stream goes idle once what stands has gone.
+			if sink.ending && sink.queue.is_empty() {
+				break;
+			}
+			let bytes = (sink.pacer.peek() * frame) as usize;
+			if sink.queue.len() < bytes && !sink.ending && sink.posted + (count as u32) >= floor {
+				break;
+			}
+			let frames = sink.pacer.next();
+			let bytes = (frames * frame) as usize;
+			let at = sink.virt + u64::from(sink.next) * u64::from(sink.binding.max_packet);
+			let taken = bytes.min(sink.queue.len());
+			for offset in 0..taken {
+				let byte = sink.queue.pop_front().unwrap_or(0);
+				((at + offset as u64) as *mut u8).write_volatile(byte);
+			}
+			// THE REST OF THE PACKET IS SILENCE when the queue could not fill it - and an ending stream sends only what
+			// it has, so its last packet is short rather than padded.
+			let length = if sink.ending { taken } else { bytes };
+			if taken < bytes && !sink.ending {
+				for offset in taken..bytes {
+					((at + offset as u64) as *mut u8).write_volatile(0);
+				}
+				if !sink.dry {
+					sink.dry = true;
+					sink.underruns += 1;
+				}
+				sink.silent_frames += ((bytes - taken) as u32 / frame) as u64;
+			} else if taken == bytes {
+				sink.dry = false;
+			}
+			staged[count] = (sink.phys + u64::from(sink.next) * u64::from(sink.binding.max_packet), length as u32);
+			sink.next = (sink.next + 1) % sink.slots;
+			count += 1;
 		}
-		let packets = uac::packets_for(bytes as u32, sink.binding.max_packet);
-		if packets == 0 {
+		if count > 0 {
+			core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+			for (index, &(phys, length)) in staged[..count].iter().enumerate() {
+				let ioc = (sink.posted + 1) % sink.group == 0 || index + 1 == count;
+				let trb = sink.ring.phys + sink.ring.index * 16;
+				sink.ring.push(phys, length, TRB_ISOCH << 10 | TRB_START_ISOCH_ASAP | if ioc { TRB_IOC } else { 0 });
+				sink.inflight.push_back(trb);
+				sink.posted += 1;
+			}
+			w32(hc.db + dev.slot as u64 * 4, sink.dci);
+		}
+		// AND THE FEEDBACK ENDPOINT'S GROUP OF TRANSFERS, while the stream plays.
+		if sink.running
+			&& let Some(feedback) = sink.feedback.as_mut()
+			&& feedback.inflight.is_empty()
+		{
+			for index in 0..feedback.group {
+				let buffer = u64::from(index) * u64::from(feedback.max_packet);
+				let trb = feedback.ring.phys + feedback.ring.index * 16;
+				let ioc = index + 1 == feedback.group;
+				feedback.ring.push(feedback.phys + buffer, u32::from(feedback.max_packet), TRB_ISOCH << 10 | TRB_START_ISOCH_ASAP | if ioc { TRB_IOC } else { 0 });
+				feedback.inflight.push_back((trb, buffer));
+			}
+			w32(hc.db + dev.slot as u64 * 4, feedback.dci);
+		}
+		if sink.ending && sink.queue.is_empty() && sink.posted == 0 && !sink.feedback.as_ref().is_some_and(|feedback| !feedback.inflight.is_empty()) {
+			sink.running = false;
+			sink.ending = false;
+		}
+	}
+}
+
+// Answer a play request waiting for room, once there is room for a period.
+fn answer_play(sink: &mut Sink) {
+	if sink.waiting != 0 && sink.queue.len() + audio::PERIOD_BYTES as usize <= PLAYBACK_QUEUE {
+		send_blocking(sink.waiting, audio::OK, 0);
+		sink.waiting = 0;
+	}
+}
+
+/// ONE PERIOD TO PLAY, from the consumer on `server`: queued, the stream started if it was idle, and answered `OK` now
+/// if the queue has room for the next - or when completions make room. Refused when no sink is here, or a play is
+/// already waiting.
+pub unsafe fn play(hc: &mut Xhci, devices: &mut Devices, server: u64, period: &[u8]) {
+	unsafe {
+		let Some((dev, sink)) = devices.sink() else {
+			send_blocking(server, audio::REFUSED, 0);
+			return;
+		};
+		if sink.waiting != 0 || sink.queue.len() + period.len() > PLAYBACK_QUEUE {
+			send_blocking(server, audio::REFUSED, 0);
+			return;
+		}
+		sink.queue.extend(period.iter().copied());
+		sink.ending = false;
+		if !sink.running && sink.queue.len() >= PLAYBACK_START {
+			sink.running = true;
+			sink.dry = false;
+		}
+		post_playback(hc, dev, sink);
+		sink.waiting = server;
+		answer_play(sink);
+	}
+}
+
+/// THE END OF THE PLAYBACK STREAM: what is queued plays out, and then the stream is idle.
+pub unsafe fn end_play(hc: &mut Xhci, devices: &mut Devices) {
+	unsafe {
+		if let Some((dev, sink)) = devices.sink() {
+			// A STREAM THAT NEVER REACHED ITS START still plays what it holds.
+			if sink.running || !sink.queue.is_empty() {
+				sink.running = true;
+				sink.ending = true;
+			}
+			post_playback(hc, dev, sink);
+		}
+	}
+}
+
+/// The sink's counters, for `CMD_STATS` - `None` with no sink here.
+pub fn stats(devices: &mut Devices) -> Option<audio::PlaybackStats> {
+	let (_, sink) = devices.sink()?;
+	let feedback_q16 = if sink.feedback.is_some() { sink.pacer.rate() } else { 0 };
+	Some(audio::PlaybackStats { underruns: sink.underruns, silent_frames: sink.silent_frames, feedback_q16, feedback_ignored: sink.pacer.ignored })
+}
+
+// A COMPLETION FOR THE SINK'S DATA OR FEEDBACK ENDPOINT. The event names the TRB that asked for it, and every packet
+// posted before that one is done too: the packets gone, more posted, a waiting play answered - or the feedback group's
+// latest value read into the pacer and the group posted again.
+unsafe fn absorb_sink(hc: &mut Xhci, dev: &UsbDevice, sink: &mut Sink, pointer: u64, status: u32, control: u32) -> bool {
+	unsafe {
+		let code = status >> 24;
+		let dci = control >> 16 & 0x1f;
+		if dci == sink.dci {
+			if code != CC_RING_UNDERRUN
+				&& code != CC_RING_OVERRUN
+				&& let Some(at) = sink.inflight.iter().position(|&trb| trb == pointer)
+			{
+				sink.inflight.drain(..=at);
+				sink.posted = sink.posted.saturating_sub(at as u32 + 1);
+			}
+			post_playback(hc, dev, sink);
+			answer_play(sink);
+			return true;
+		}
+		let Some(feedback) = sink.feedback.as_mut() else { return false };
+		if dci != feedback.dci {
 			return false;
 		}
-		core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-		for index in 0..packets {
-			let span = uac::packet_span(bytes as u32, sink.binding.max_packet, index);
-			let at = sink.phys + index as u64 * sink.binding.max_packet as u64;
-			// ONLY THE LAST ONE ASKS FOR A COMPLETION. An interrupt per packet is eleven events a
-			// period at this size, and what the caller is waiting for is the period, not the packet.
-			let last = index + 1 == packets;
-			let control = TRB_ISOCH << 10 | TRB_START_ISOCH_ASAP | if last { TRB_IOC } else { 0 };
-			sink.ring.push(at, span, control);
+		if code == CC_RING_UNDERRUN || code == CC_RING_OVERRUN {
+			return true;
 		}
-		w32(hc.db + dev.slot as u64 * 4, sink.dci);
-		// A SHORT PACKET IS A NORMAL COMPLETION HERE. The last transfer of a period is short
-		// whenever the period is not a multiple of the packet size, which is every period at this
-		// wire's size against this device's.
-		match wait_transfer(hc, hids, dev.slot, sink.dci) {
-			Some(code) => code == CC_SUCCESS || code == CC_SHORT_PACKET,
-			None => false,
+		let Some(at) = feedback.inflight.iter().position(|&(trb, _)| trb == pointer) else { return true };
+		let (_, buffer) = feedback.inflight[at];
+		feedback.inflight.drain(..=at);
+		if code == CC_SUCCESS || code == CC_SHORT_PACKET {
+			let moved = u32::from(feedback.max_packet).saturating_sub(status & 0x00ff_ffff) as usize;
+			let bytes: Vec<u8> = (0..moved.min(4) as u64).map(|offset| r8(feedback.virt + buffer + offset)).collect();
+			if let Some(value) = uac::feedback_value(&bytes, dev.speed == SPEED_HIGH) {
+				let _ = sink.pacer.feedback(value);
+			}
 		}
+		post_playback(hc, dev, sink);
+		true
 	}
 }
 
@@ -406,8 +679,49 @@ unsafe fn post_captures(hc: &mut Xhci, dev: &UsbDevice, source: &mut Source) {
 	}
 }
 
-// Start a capture: the source's streaming setting selected, its rate set where the device has a choice, the
-// FIFO empty and the transfers standing.
+// THE STREAM'S RATE, SET ON THE DEVICE once its setting is selected. UAC1's is the endpoint's, set only where the format
+// offers more than one rate - a device with one may not implement the control at all, and a stall there is not a reason
+// to refuse a stream already at 48 kHz. UAC2's is the clock's: its own `GET RANGE` answer must offer 48 kHz, and
+// `SET CUR` writes it - a clock that does not offer it, or will not take it, refuses the stream rather than playing it
+// at another rate.
+unsafe fn set_rate(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, bound: &uac::Binding) -> bool {
+	unsafe {
+		let Some(clock) = bound.clock else {
+			if bound.format.continuous || bound.format.rate_count > 1 {
+				let rate = uac::WANTED_RATE_HZ.to_le_bytes();
+				core::ptr::copy_nonoverlapping(rate.as_ptr(), dev.data_virt as *mut u8, 3);
+				let _ = control_out_req(hc, hids, dev, RT_CLASS_ENDPOINT_OUT, UAC_SET_CUR, UAC_SAMPLING_FREQ_CONTROL << 8, bound.endpoint as u16, 3);
+			}
+			return true;
+		};
+		let index = u16::from(clock.id) << 8 | u16::from(clock.control_interface);
+		let Some(received) = control_in_req(hc, hids, dev, RT_CLASS_INTERFACE_IN, UAC2_RANGE, UAC_SAMPLING_FREQ_CONTROL << 8, index, uac::RANGE_BYTES) else {
+			print(b"driver.xhci: the audio device's clock did not answer which rates it runs at\n");
+			return false;
+		};
+		let answer = core::slice::from_raw_parts(dev.data_virt as *const u8, received.min(u32::from(uac::RANGE_BYTES)) as usize);
+		match uac::range_offers(answer, uac::WANTED_RATE_HZ) {
+			Ok(true) => {}
+			Ok(false) => {
+				print(b"driver.xhci: the audio device's clock does not run at 48 kHz, and this driver refuses rather than resamples\n");
+				return false;
+			}
+			Err(_) => {
+				print(b"driver.xhci: the audio device's clock answered its rates malformed\n");
+				return false;
+			}
+		}
+		let rate = uac::WANTED_RATE_HZ.to_le_bytes();
+		core::ptr::copy_nonoverlapping(rate.as_ptr(), dev.data_virt as *mut u8, 4);
+		if control_out_req(hc, hids, dev, RT_CLASS_INTERFACE_OUT, UAC2_CUR, UAC_SAMPLING_FREQ_CONTROL << 8, index, 4).is_none() {
+			print(b"driver.xhci: the audio device's clock refused 48 kHz\n");
+			return false;
+		}
+		true
+	}
+}
+
+// Start a capture: the source's streaming setting selected, its rate set, the FIFO empty and the transfers standing.
 unsafe fn start_capture(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, source: &mut Source) -> bool {
 	unsafe {
 		let bound = source.binding;
@@ -415,12 +729,9 @@ unsafe fn start_capture(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, sou
 			print(b"driver.xhci: the audio source refused the alternate setting that carries its endpoint\n");
 			return false;
 		}
-		// A RATE IS SET ONLY WHERE THE DEVICE OFFERS MORE THAN ONE. A device with one rate may not implement the
-		// control at all, and a stall there is not a reason to refuse a stream that is already at 48 kHz.
-		if bound.format.continuous || bound.format.rate_count > 1 {
-			let rate = uac::WANTED_RATE_HZ.to_le_bytes();
-			core::ptr::copy_nonoverlapping(rate.as_ptr(), dev.data_virt as *mut u8, 3);
-			let _ = control_out_req(hc, hids, dev, RT_CLASS_ENDPOINT_OUT, UAC_SET_CUR, UAC_SAMPLING_FREQ_CONTROL << 8, bound.endpoint as u16, 3);
+		if !set_rate(hc, hids, dev, &bound) {
+			let _ = control_nodata(hc, hids, dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, 0, bound.streaming_interface as u16);
+			return false;
 		}
 		source.fifo.clear();
 		source.overrun = false;
@@ -538,8 +849,14 @@ pub unsafe fn end_capture(hc: &mut Xhci, hids: &mut Hids, devices: &mut Devices)
 
 /// A completion for the source's endpoint: its bytes into the FIFO, its transfer posted again, and a waiting
 /// capture answered. Whether the event was the source's.
-pub unsafe fn absorb(hc: &mut Xhci, devices: &mut Devices, status: u32, control: u32) -> bool {
+pub unsafe fn absorb(hc: &mut Xhci, devices: &mut Devices, pointer: u64, status: u32, control: u32) -> bool {
 	unsafe {
+		if let Some((dev, sink)) = devices.sink()
+			&& control >> 24 == dev.slot
+			&& absorb_sink(hc, dev, sink, pointer, status, control)
+		{
+			return true;
+		}
 		let Some((dev, source)) = devices.source() else { return false };
 		if control >> 24 != dev.slot || control >> 16 & 0x1f != source.dci {
 			return false;

@@ -138,6 +138,9 @@ pub mod usb_class;
 // reads instead of walking the records itself.
 pub mod usb_function;
 pub mod usb_midi;
+// UNIVERSAL MIDI PACKETS: message lengths and groups, SysEx7 and SysEx8 counted, MIDI 1.0 packets to and from UMP, MIDI
+// 2.0 channel voice down to MIDI 1.0, and the Group Terminal Blocks a USB MIDI 2.0 device lists.
+pub mod ump;
 pub mod uvc;
 pub mod virtio;
 // THE VIRTIO-VSOCK DECISIONS: the packet header, the credit window and the connection state

@@ -1271,5 +1271,335 @@ pub mod audio_admin {
 	}
 }
 
+/// WHAT THE PLAYING DEVICE COUNTED, for the System Graph: OBSERVATION AND NEVER ENFORCEMENT, and never a
+/// sample. The counters are the device provider's own, as AudioService last read them - while a stream plays
+/// at most a few hundred milliseconds old, and exact once it has stopped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioResources {
+	/// Whether the provider counts at all. False with no device, and for a provider that plays a period at a
+	/// time and keeps no counters - the rest is then zero and means nothing.
+	pub counted: bool,
+	/// Dry spells: how many times the device's queue ran out while the stream played, and the frames of
+	/// silence that went out in its place.
+	pub underruns: u64,
+	pub silent_frames: u64,
+	/// The rate an asynchronous sink's feedback endpoint asks for, frames per service interval in 16.16 -
+	/// zero for a sink without one - and the feedback values ignored as too far from nominal.
+	pub feedback_q16: u32,
+	pub feedback_ignored: u64,
+}
+
+impl AudioResources {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioResources> {
+		let mut r = Reader::new(bytes);
+		let value = AudioResources::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioResources> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioResources::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.boolean(self.counted)?;
+		w.u64(self.underruns)?;
+		w.u64(self.silent_frames)?;
+		w.u32(self.feedback_q16)?;
+		w.u64(self.feedback_ignored)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioResources> {
+		let counted = r.boolean()?;
+		let underruns = r.u64()?;
+		let silent_frames = r.u64()?;
+		let feedback_q16 = r.u32()?;
+		let feedback_ignored = r.u64()?;
+		Some(AudioResources { counted, underruns, silent_frames, feedback_q16, feedback_ignored })
+	}
+}
+
+/// OBSERVATION AND NEVER ENFORCEMENT: what the playing device counted, for the System Graph.
+///
+/// A SEPARATE INTERFACE, because authority to READ the counters must not be authority to make a sound or to
+/// record one. The System Graph is handed this endpoint and nothing else.
+// interface `audio-stats` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod audio_stats {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_RESOURCES: u16 = 1;
+
+	pub trait Service {
+		fn resources(&mut self) -> AudioResources;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:audio")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_RESOURCES => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.resources();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					result.write(w)?;
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn resources(&mut self) -> Option<AudioResources> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RESOURCES)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = AudioResources::read(r)?;
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_stats_resources")]
+	fn channel_invoke_resources(chan: u64) -> Option<AudioResources> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.resources()
+	}
+}
+
+impl AudioResources {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"counted\":");
+		if self.counted {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"underruns\":");
+		let _ = write!(out, "{}", self.underruns);
+		out.push(',');
+		out.push_str("\"silent-frames\":");
+		let _ = write!(out, "{}", self.silent_frames);
+		out.push(',');
+		out.push_str("\"feedback-q16\":");
+		let _ = write!(out, "{}", self.feedback_q16);
+		out.push(',');
+		out.push_str("\"feedback-ignored\":");
+		let _ = write!(out, "{}", self.feedback_ignored);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("counted=");
+		if self.counted {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("underruns=");
+		let _ = write!(out, "{}", self.underruns);
+		out.push_str(", ");
+		out.push_str("silent-frames=");
+		let _ = write!(out, "{}", self.silent_frames);
+		out.push_str(", ");
+		out.push_str("feedback-q16=");
+		let _ = write!(out, "{}", self.feedback_q16);
+		out.push_str(", ");
+		out.push_str("feedback-ignored=");
+		let _ = write!(out, "{}", self.feedback_ignored);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "counted");
+		crate::codec::cbor::boolean(out, self.counted);
+		crate::codec::cbor::text(out, "underruns");
+		crate::codec::cbor::uint(out, self.underruns as u64);
+		crate::codec::cbor::text(out, "silent-frames");
+		crate::codec::cbor::uint(out, self.silent_frames as u64);
+		crate::codec::cbor::text(out, "feedback-q16");
+		crate::codec::cbor::uint(out, self.feedback_q16 as u64);
+		crate::codec::cbor::text(out, "feedback-ignored");
+		crate::codec::cbor::uint(out, self.feedback_ignored as u64);
+	}
+}
+
 #[cfg(test)]
 mod compat;

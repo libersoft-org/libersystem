@@ -15,6 +15,10 @@
 // back as one batch on the receive endpoint, so the MIDI gate sends through its grant and reads what it sent
 // through another - a whole round trip with no device. Packets sent while nobody receives on endpoint 0 are
 // gone, as on a cable nobody listens to.
+//
+// AND A UMP PAIR: receive endpoint 3 and transmit endpoint 4, four groups each, two function blocks over them, the
+// transmit side wired back to the receive side the same way - what MidiService's UMP path and its translation are
+// checked against.
 
 #![no_std]
 #![no_main]
@@ -23,7 +27,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use drivers::common;
-use proto::system::{Error, MidiBounds, MidiDeviceDirection, MidiDeviceEndpoint, MidiDeviceEvent, MidiFixtureStats, MidiInputLost, MidiOpen, MidiPacketBatch, midi_device, midi_fixture};
+use proto::system::{Error, MidiBounds, MidiDeviceBlock, MidiDeviceBlockDirection, MidiDeviceDirection, MidiDeviceEndpoint, MidiDeviceEvent, MidiDeviceProtocol, MidiFixtureStats, MidiInputLost, MidiOpen, MidiPacketBatch, midi_device, midi_fixture};
 use rt::*;
 
 const NAME: &[u8] = b"org.libersystem.midi-fixture";
@@ -37,6 +41,11 @@ const ENDPOINTS: [(u32, u8); 2] = [(0, 2), (1, 1)];
 // The transmit endpoint, its cables, and the receive endpoint its packets come back on.
 const TRANSMIT: (u32, u8) = (2, 2);
 const LOOPBACK: u32 = 0;
+// The UMP pair: the receive endpoint and its groups, and the transmit endpoint wired back to it.
+const UMP_RECEIVE: (u32, u8) = (3, 4);
+const UMP_TRANSMIT: u32 = 4;
+// Its two function blocks: id, name, first group, groups.
+const BLOCKS: [(u8, &str, u8, u8); 2] = [(1, "fixture keys", 0, 2), (2, "fixture pads", 2, 2)];
 
 #[derive(Default)]
 struct Session {
@@ -51,8 +60,8 @@ struct Fixture {
 	next_token: u16,
 	connection: u64,
 	session: Session,
-	// The receiver generation each endpoint was started under, if any.
-	receiving: [Option<u64>; 2],
+	// The receiver generation each endpoint was started under, if any - by index, the UMP receive endpoint's at 3.
+	receiving: [Option<u64>; 4],
 	stats: MidiFixtureStats,
 }
 
@@ -90,7 +99,7 @@ impl Fixture {
 			close(self.session.events);
 		}
 		self.session = Session::default();
-		self.receiving = [None; 2];
+		self.receiving = [None; 4];
 		self.stats.receiving = 0;
 	}
 }
@@ -109,12 +118,17 @@ impl midi_device::Service for DeviceView<'_> {
 	}
 
 	fn endpoints(&mut self) -> Result<Vec<MidiDeviceEndpoint>, Error> {
-		let mut endpoints: Vec<MidiDeviceEndpoint> = ENDPOINTS.iter().map(|&(index, cables)| MidiDeviceEndpoint { index, name: alloc::format!("fixture port {index}"), cables, direction: MidiDeviceDirection::Receive }).collect();
-		endpoints.push(MidiDeviceEndpoint { index: TRANSMIT.0, name: alloc::format!("fixture port {} out", TRANSMIT.0), cables: TRANSMIT.1, direction: MidiDeviceDirection::Transmit });
+		let mut endpoints: Vec<MidiDeviceEndpoint> = ENDPOINTS.iter().map(|&(index, cables)| MidiDeviceEndpoint { index, name: alloc::format!("fixture port {index}"), cables, direction: MidiDeviceDirection::Receive, protocol: MidiDeviceProtocol::Midi1 }).collect();
+		endpoints.push(MidiDeviceEndpoint { index: TRANSMIT.0, name: alloc::format!("fixture port {} out", TRANSMIT.0), cables: TRANSMIT.1, direction: MidiDeviceDirection::Transmit, protocol: MidiDeviceProtocol::Midi1 });
+		endpoints.push(MidiDeviceEndpoint { index: UMP_RECEIVE.0, name: alloc::format!("fixture UMP {}", UMP_RECEIVE.0), cables: UMP_RECEIVE.1, direction: MidiDeviceDirection::Receive, protocol: MidiDeviceProtocol::Ump });
+		endpoints.push(MidiDeviceEndpoint { index: UMP_TRANSMIT, name: alloc::format!("fixture UMP {UMP_TRANSMIT} out"), cables: UMP_RECEIVE.1, direction: MidiDeviceDirection::Transmit, protocol: MidiDeviceProtocol::Ump });
 		Ok(endpoints)
 	}
 
 	fn start(&mut self, endpoint: u32, receiver_generation: u64) -> Result<(), Error> {
+		if endpoint == TRANSMIT.0 {
+			return Err(Error::Invalid);
+		}
 		let slot = self.fixture.receiving.get_mut(endpoint as usize).ok_or(Error::NotFound)?;
 		*slot = Some(receiver_generation);
 		self.fixture.stats.receiving = self.fixture.receiving.iter().filter(|slot| slot.is_some()).count() as u8;
@@ -137,8 +151,19 @@ impl midi_device::Service for DeviceView<'_> {
 
 	// TAKEN WHOLE, AND PLAYED BACK on the receive endpoint as one batch - or lost, if nobody is receiving there.
 	fn send(&mut self, endpoint: u32, packets: Vec<u8>) -> Result<(), Error> {
-		if ENDPOINTS.iter().any(|&(index, _)| index == endpoint) {
+		if ENDPOINTS.iter().any(|&(index, _)| index == endpoint) || endpoint == UMP_RECEIVE.0 {
 			return Err(Error::Invalid);
+		}
+		// THE UMP PAIR'S WORDS, played back the same way; what they mean is the service's to check.
+		if endpoint == UMP_TRANSMIT {
+			if packets.is_empty() || packets.len() % 4 != 0 || packets.len() > 256 {
+				return Err(Error::Invalid);
+			}
+			self.fixture.stats.sent += (packets.len() / 4) as u32;
+			if self.fixture.receiving[UMP_RECEIVE.0 as usize].is_some() {
+				self.fixture.deliver(UMP_RECEIVE.0, packets)?;
+			}
+			return Ok(());
 		}
 		if endpoint != TRANSMIT.0 {
 			return Err(Error::NotFound);
@@ -151,6 +176,17 @@ impl midi_device::Service for DeviceView<'_> {
 			self.fixture.deliver(LOOPBACK, packets)?;
 		}
 		Ok(())
+	}
+
+	// BOTH BLOCKS ON BOTH UMP ENDPOINTS, each covering two of the four groups both ways.
+	fn blocks(&mut self, endpoint: u32) -> Result<Vec<MidiDeviceBlock>, Error> {
+		if endpoint == UMP_RECEIVE.0 || endpoint == UMP_TRANSMIT {
+			return Ok(BLOCKS.iter().map(|&(id, name, first_group, groups)| MidiDeviceBlock { id, name: alloc::string::String::from(name), first_group, groups, direction: MidiDeviceBlockDirection::Both, protocol: 0x11 }).collect());
+		}
+		if endpoint <= TRANSMIT.0 {
+			return Ok(Vec::new());
+		}
+		Err(Error::NotFound)
 	}
 }
 
@@ -273,7 +309,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let (Some((midi, midi_far)), Some((control, control_far))) = (channel(), channel()) else { exit() };
 	common::online_named(bootstrap, &bind, b"driver.midi-fixture: online (a MIDI device with two receive endpoints and a transmit one wired back, for the MIDI gate)", &[(driver_protocol::provider::MIDI, midi_far, NAME), (driver_protocol::provider::FIXTURE_CONTROL, control_far, CONTROL_NAME)]);
 	let mut serving = common::Serving::from_offers(&[(MIDI_TOKEN, midi), (CONTROL_TOKEN, control)]);
-	let mut fixture = Fixture { live: true, token: MIDI_TOKEN, next_token: CONTROL_TOKEN + 1, connection: 0, session: Session::default(), receiving: [None; 2], stats: MidiFixtureStats { batches: 0, packets: 0, receiving: 0, sent: 0 } };
+	let mut fixture = Fixture { live: true, token: MIDI_TOKEN, next_token: CONTROL_TOKEN + 1, connection: 0, session: Session::default(), receiving: [None; 4], stats: MidiFixtureStats { batches: 0, packets: 0, receiving: 0, sent: 0 } };
 	let mut buf = alloc::vec![0u8; 2048];
 	loop {
 		match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, &[]) {

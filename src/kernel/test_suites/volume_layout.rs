@@ -39,6 +39,7 @@ fn start_process_service(storage: &mut StorageHarness, package: &pkg::Package<'s
 	core::mem::drop(registry_server);
 	send_cap(&boot, b"REGISTRY", registry_client, Rights::ALL).expect("ProcessService registry bootstrap");
 	send_cap(&boot, b"SERVE", server, Rights::ALL).expect("ProcessService serve bootstrap");
+	send_supervise_root(&boot).expect("ProcessService supervise bootstrap");
 	let online = wait_message(storage, &boot, "ProcessService did not report online");
 	assert_eq!(&online.bytes[..], b"ProcessService: online", "ProcessService serves the fresh system volume");
 	client

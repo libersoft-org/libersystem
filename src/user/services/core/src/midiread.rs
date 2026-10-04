@@ -1,7 +1,7 @@
 // midiread - the MIDI gate's inventory-only client. DEVELOPMENT-ONLY.
 //
 // It holds `midi` and nothing else, and proves what that is: the endpoints are listed with their protocol,
-// direction and cables, receiving through inventory is denied, and output is unsupported.
+// direction, cables and - for the UMP pair - their function blocks, and inventory can neither receive nor send.
 
 #![no_std]
 #![no_main]
@@ -37,9 +37,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(Ok(endpoints)) => endpoints,
 		_ => fail(b"the endpoints could not be listed"),
 	};
-	let directions: Vec<(MidiDirection, u8)> = endpoints.iter().map(|endpoint| (endpoint.direction, endpoint.cables)).collect();
-	if endpoints.iter().any(|endpoint| endpoint.protocol != MidiProtocol::Midi1) || directions != [(MidiDirection::Receive, 2), (MidiDirection::Receive, 1), (MidiDirection::Transmit, 2)] {
-		fail(b"the fixture's two receive endpoints and its transmit one were not listed as they are");
+	let listed: Vec<(MidiDirection, u8, MidiProtocol, usize)> = endpoints.iter().map(|endpoint| (endpoint.direction, endpoint.cables, endpoint.protocol, endpoint.blocks.len())).collect();
+	let want = [
+		(MidiDirection::Receive, 2, MidiProtocol::Midi1, 0),
+		(MidiDirection::Receive, 1, MidiProtocol::Midi1, 0),
+		(MidiDirection::Transmit, 2, MidiProtocol::Midi1, 0),
+		(MidiDirection::Receive, 4, MidiProtocol::Ump, 2),
+		(MidiDirection::Transmit, 4, MidiProtocol::Ump, 2),
+	];
+	if listed != want {
+		fail(b"the fixture's two receive endpoints, its transmit one and its UMP pair were not listed as they are");
 	}
 	if !matches!(client().open(&endpoints[0].id, &MidiDirection::Receive, &MidiProtocol::Midi1), Some(Err(Error::Denied))) || !matches!(client().open(&endpoints[2].id, &MidiDirection::Transmit, &MidiProtocol::Midi1), Some(Err(Error::Denied))) {
 		fail(b"inventory opened a receiver or a sender");
@@ -47,6 +54,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if !matches!(client().open(&endpoints[0].id, &MidiDirection::Transmit, &MidiProtocol::Midi1), Some(Err(Error::Invalid))) {
 		fail(b"a receive endpoint was opened to send");
 	}
-	print(b"midiread: PASS endpoints listed with protocol, direction and cables; inventory can neither receive nor send\n");
+	print(b"midiread: PASS endpoints listed with protocol, direction, cables and blocks; inventory can neither receive nor send\n");
 	exit();
 }

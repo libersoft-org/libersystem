@@ -84,3 +84,24 @@ keys = ["esc"]
 [[step]]
 do = "expect"
 contains = "dfu: declined - nothing was written"
+
+# A BACKUP OF THIS TARGET, WHICH DECLARES NO UPLOAD: declined by its executor before the protected screen is shown.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "dfu backup dfu:1d6b:0105 vol://usb/nope.bin &"
+
+[[step]]
+do = "expect"
+contains = "dfu: the firmware of dfu:1d6b:0105, at most 1048576 bytes, into vol://usb/nope.bin - confirm it on the protected screen"
+
+[[step]]
+do = "expect"
+contains = "dfu: declined - nothing was read"
+timeout = 60

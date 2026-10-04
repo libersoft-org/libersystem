@@ -1174,11 +1174,14 @@ qemu_attach_xhci() {
 		scratch_sweep "$QEMU_BUILD_DIR/uas-scratch" .img
 		rm -f "$uas"
 		if truncate -s 4M "$uas"; then
+			# AN AUDIO SINK ON THE BUS, which is the only ISOCHRONOUS device in this harness - the one
+			# transfer type the xHCI driver had no code for until the audio class needed it. LEFT OFF when a run
+			# plays a speaker of its own (`USB_QEMU_SPEAKER=off`): the driver binds one sink, and the first.
+			if [[ "${USB_QEMU_SPEAKER:-on}" != off ]]; then
+				arr+=(-device "usb-audio,bus=usb.0,port=1.4,audiodev=snd0")
+			fi
 			arr+=(
 				-drive "file=$uas,if=none,id=uasdisk,format=raw"
-				# AN AUDIO SINK ON THE BUS, which is the only ISOCHRONOUS device in this harness - the one
-				# transfer type the xHCI driver had no code for until the audio class needed it.
-				-device "usb-audio,bus=usb.0,port=1.4,audiodev=snd0"
 				-device "usb-uas,bus=usb.0,port=4,id=uasbus"
 				-device "scsi-hd,bus=uasbus.0,drive=uasdisk"
 			)

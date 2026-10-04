@@ -788,6 +788,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"camread", Shape::Rest),
 	(b"camfail", Shape::Rest),
 	(b"midicheck", Shape::Rest),
+	(b"midiump", Shape::Rest),
 	(b"midihold", Shape::Rest),
 	(b"midiread", Shape::Rest),
 	(b"midifail", Shape::Rest),
@@ -1208,6 +1209,10 @@ fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64,
 	}
 	if line == b"graph cbor" {
 		query_graph(graphsvc, broker, GraphFmt::Cbor);
+		return false;
+	}
+	if let Some(name) = line.strip_prefix(b"graph ") {
+		query_graph(graphsvc, broker, GraphFmt::Named(name));
 		return false;
 	}
 	if line == b"ps -i" {
@@ -1950,10 +1955,15 @@ fn mouse_cmd(inputsvc: u64) {
 // The representation the `graph` command renders the snapshot in: human-readable text
 // (the default), a JSON document, or a CBOR document shown as hex. The JSON and CBOR
 // forms are the same bytes a remote consumer would read off the wire in a later phase.
-enum GraphFmt {
+//
+// OR ONE COMPONENT, as text, by name (`graph audio_service`): the whole graph is one line per service and
+// per device, and on a serial console it outgrows the mirror - the services, which come first, are what is
+// dropped.
+enum GraphFmt<'a> {
 	Text,
 	Json(JsonMode),
 	Cbor,
+	Named(&'a [u8]),
 }
 
 // Query SystemGraphService for the live system graph over the generated client and
@@ -1983,6 +1993,16 @@ fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
 				print(b"\n");
 			}
 			GraphFmt::Cbor => print_hex(&graph.to_cbor()),
+			GraphFmt::Named(name) => {
+				let named: Vec<&Component> = graph.components.iter().filter(|c| c.name.as_bytes() == name).collect();
+				if named.is_empty() {
+					print(b"graph: no such component\n");
+				}
+				for component in named {
+					print(component.to_text().as_bytes());
+					print(b"\n");
+				}
+			}
 		},
 		Some(Err(_)) => print(b"graph: query error\n"),
 		None => print(b"graph: service unavailable\n"),
