@@ -653,6 +653,10 @@ pub fn wait_or_answer_until(bootstrap: u64, bind: &Bind, handles: &[u64], deadli
 			}
 			Control::Ended => return None,
 		}
+		// A FIXED BUTTON'S PRESS is handed back as "nothing ready" too: the caller's loop takes it with `presses`.
+		if PRESSES.load(core::sync::atomic::Ordering::Acquire) != 0 {
+			return Some(None);
+		}
 		// A CONSUMER JUST ACCEPTED IS NOT IN `handles`, the caller's copy of the set, so this wait would never wake for
 		// its requests - a consumer that connected after the first (a policy service relaunched) asked and was never
 		// answered. Handed back as "nothing ready": the caller's loop builds its set again, with the new endpoint in it.
@@ -1144,6 +1148,10 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 					return Control::Ended;
 				}
 			}
+			// THE FIXED BUTTON THIS BINDING HOLDS WAS PRESSED: counted, for its loop to take with `presses`.
+			proto::Opcode::Pressed => {
+				PRESSES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+			}
 			_ => {
 				if handle != 0 {
 					close(handle);
@@ -1152,6 +1160,15 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 			}
 		}
 	}
+}
+
+// THE PRESSES OF THE FIXED BUTTON THIS BINDING HOLDS, counted as the manager's `PRESSED` frames arrive and not yet taken.
+static PRESSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// The presses that arrived since the last call, taken - for the driver of a fixed button's row, whose bounded wait
+// (`wait_or_answer_until`) answers "nothing ready" when one arrives.
+pub fn presses() -> u32 {
+	PRESSES.swap(0, core::sync::atomic::Ordering::AcqRel)
 }
 
 // THE FIRMWARE NODE'S CHANNEL, as the manager last answered this driver's request: 0 until it has, and 0 again after
@@ -1386,6 +1403,10 @@ pub fn hold(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> H
 				if !suspended(bootstrap, bind, &proto::Suspended { outcome: proto::SuspendOutcome::Done, awake_by_ms: 0 }) {
 					return Held::Ended;
 				}
+			}
+			// A PRESS WHILE SUSPENDED is counted and taken after the resume, as every other wait counts it.
+			proto::Opcode::Pressed => {
+				PRESSES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 			}
 			_ => {
 				if handle != 0 {

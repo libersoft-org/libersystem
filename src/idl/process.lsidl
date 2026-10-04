@@ -266,6 +266,8 @@ enum sleep-reason {
 	critical      = 5,
 	/// A thermal zone past `_HOT`, where hibernation is set up.
 	thermal       = 6,
+	/// A power button, fixed or control-method, set to suspend or hibernate.
+	power-button  = 7,
 }
 
 /// How the last sleep ended.

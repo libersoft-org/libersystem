@@ -1,16 +1,21 @@
 // THE ACPI BUTTONS AND THE LID: one binding per namespace node - a control-method power button (`PNP0C0C`), a
-// control-method sleep button (`PNP0C0E`) or a lid (`PNP0C0D`) - on the node-scoped channel the ACPI service serves.
+// control-method sleep button (`PNP0C0E`) or a lid (`PNP0C0D`) - on the node-scoped channel the ACPI service serves; and
+// one per fixed-hardware button the kernel declares a row for (`LNXPWRBN`, `LNXSLPBN`), which has no node.
 //
-// A BUTTON'S PRESS IS ITS `Notify(0x80)`. The power button's is carried out as the fixed one's is: through the
-// `system-power` connection DeviceManager hands the Power-key drivers, so it powers the machine off exactly as the
-// fixed button does. The sleep button's asks ServiceManager for a suspend through the `system-sleep` connection
-// DeviceManager mints for it - to RAM where the machine offers it, to idle otherwise - answered at acceptance, since
-// this driver is a participant the transaction then waits on. `Notify(0x02)` is the button having WOKEN the machine:
-// said, and never taken as a second request.
+// EVERY ONE PUBLISHES A `platform-switch` PROVIDER, whose consumer - the power-state service - decides what a press or
+// a closed lid does. This driver decides nothing about either while a consumer watches.
 //
-// THE LID publishes a `platform-switch` provider: `_LID` read at bind, at each `Notify(0x80)` and at every resume - a lid
-// closed or opened while the machine slept is a change like any other - and every change sent to its consumer, the
-// power-state service, whose policy decides what a closed lid does. This driver decides nothing about it.
+// A BUTTON'S PRESS IS ITS `Notify(0x80)`, or for a fixed one DeviceManager's `PRESSED` - the PM1 event the kernel
+// decoded. Each press is one frame `closed` with the sequence advanced; the button's state is open otherwise, and the
+// watch opens on that. WITH NO CONSUMER - none watches, or its stream is full or gone - the driver carries the press out
+// itself, as it did before any policy existed, so a press never does nothing: the power button through the
+// `system-power` connection DeviceManager hands the Power-key drivers, which powers the machine off; the sleep button by
+// asking ServiceManager for a suspend through the `system-sleep` connection DeviceManager mints for it - to RAM where
+// the machine offers it, to idle otherwise - answered at acceptance, since this driver is a participant the transaction
+// then waits on. `Notify(0x02)` is the button having WOKEN the machine: said, and never taken as a second request.
+//
+// THE LID: `_LID` read at bind, at each `Notify(0x80)` and at every resume - a lid closed or opened while the machine
+// slept is a change like any other - and every change sent to its consumer.
 //
 // THE SLEEP: asked to arm wake, it answers that it did - the ACPI service arms the node's `_PRW` event in the platform's
 // step - and holds nothing, since it has no device of its own to stop. Its pure parts are `drivers::acpi_button`.
@@ -23,7 +28,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use drivers::acpi_button::{self, Class, Event};
+use drivers::acpi_button::{self, Actor, Class, Event, Source};
 use drivers::common;
 use drivers::node_power;
 use ipc_client::ChannelTransport;
@@ -33,9 +38,9 @@ use wire::Handles;
 
 // How long one question to the node, or to ServiceManager, may take.
 const TICKS: u64 = TICKS_PER_SECOND * 5;
-// The lid's one publication.
+// The switch's one publication.
 const TOKEN: u16 = 0;
-// Deep enough that a lid opened and closed faster than the policy reads never blocks this driver.
+// Deep enough that a lid opened and closed, or a button pressed, faster than the policy reads never blocks this driver.
 const STREAM_DEPTH: u64 = 32;
 // How often a binding whose node ended looks for the one handed again.
 const NODE_LOOK_TICKS: u64 = TICKS_PER_SECOND;
@@ -43,19 +48,25 @@ const NODE_LOOK_TICKS: u64 = TICKS_PER_SECOND;
 struct Button {
 	name: String,
 	class: Class,
+	source: Source,
+	// The node's channel; 0 for a fixed button, which has none.
 	node: u64,
 	// The Power key's and the sleep button's doors, as DeviceManager handed them.
 	syspower: u64,
 	syssleep: u64,
-	// The lid's last reading, its change count, and the consumer's stream.
+	// The lid's last reading, the change count - a button's presses - and the consumer's stream.
 	closed: Option<bool>,
 	sequence: u32,
 	stream: u64,
 }
 
 impl Button {
-	// THE NODE'S POWER STATE: one that could not be entered is said, and the device is served as it is.
+	// THE NODE'S POWER STATE: one that could not be entered is said, and the device is served as it is. A fixed button
+	// has no node, and no power state of its own.
 	fn power_state(&self, state: u8) {
+		if self.node == 0 {
+			return;
+		}
 		if let Err(why) = node_power::set(self.node, state) {
 			self.say(&why);
 		}
@@ -78,22 +89,34 @@ impl Button {
 		}
 	}
 
-	fn state(&self) -> SwitchState {
-		SwitchState { kind: SwitchKind::Lid, closed: self.closed.unwrap_or(false), sequence: self.sequence }
+	fn kind(&self) -> SwitchKind {
+		match self.class {
+			Class::Lid => SwitchKind::Lid,
+			Class::PowerButton => SwitchKind::PowerButton,
+			Class::SleepButton => SwitchKind::SleepButton,
+		}
 	}
 
-	// One frame on the consumer's stream.
-	fn emit(&mut self, state: &SwitchState) {
+	// THE STATE NOW: the lid as last read; a button open - a press is a frame of its own.
+	fn state(&self) -> SwitchState {
+		SwitchState { kind: self.kind(), closed: self.class == Class::Lid && self.closed.unwrap_or(false), sequence: self.sequence }
+	}
+
+	// One frame on the consumer's stream: whether it was taken.
+	fn emit(&mut self, state: &SwitchState) -> bool {
 		if self.stream == 0 {
-			return;
+			return false;
 		}
 		let mut frame = [0u8; 64];
 		let mut handles = Handles::new();
-		if let Some(len) = platform_switch::watch_frame(state.sequence, state, &mut frame, &mut handles)
-			&& !try_send(self.stream, &frame[..len], 0)
-		{
+		let Some(len) = platform_switch::watch_frame(state.sequence, state, &mut frame, &mut handles) else { return false };
+		if try_send(self.stream, &frame[..len], 0) {
+			return true;
+		}
+		if self.class == Class::Lid {
 			self.say("the consumer's stream is full - the change waits in the state it reads next");
 		}
+		false
 	}
 
 	// THE LID READ AGAIN, and a change sent: at a `Notify`, at the resume, and at a node handed again.
@@ -115,25 +138,41 @@ impl Button {
 		self.emit(&state);
 	}
 
-	// A PRESS: the power button powers the machine off as the fixed one does; the sleep button asks for a suspend; the lid
-	// is read again.
+	// A PRESS: told to the consumer, which decides; with none, the power button powers the machine off and the sleep button
+	// asks for a suspend, as before any policy existed. The lid is read again.
 	fn pressed(&mut self) {
+		if self.class == Class::Lid {
+			self.refresh_lid();
+			return;
+		}
+		self.sequence = self.sequence.wrapping_add(1);
+		let press = SwitchState { kind: self.kind(), closed: true, sequence: self.sequence };
+		let watched = self.stream != 0;
+		let delivered = self.emit(&press);
+		let why = match acpi_button::actor(watched, delivered) {
+			Actor::Consumer => {
+				self.say("pressed - told the power-state policy, which decides what it does");
+				return;
+			}
+			Actor::Driver if watched => "the policy's stream did not take it",
+			Actor::Driver => "no policy watches it",
+		};
 		match self.class {
 			Class::PowerButton => {
 				if self.syspower == 0 {
-					self.say("pressed - this binding holds no system-power connection, so nothing is done");
+					self.say(&format!("pressed - {why}, and this binding holds no system-power connection, so nothing is done"));
 					return;
 				}
-				self.say("pressed - asking the power service to stop the machine");
+				self.say(&format!("pressed - {why}; asking the power service to stop the machine"));
 				let _ = system_power::Client::with_deadline(ChannelTransport { chan: self.syspower }, clock() + TICKS).power_off();
 			}
 			Class::SleepButton => {
 				if self.syssleep == 0 {
-					self.say("pressed - this binding holds no system-sleep connection, so nothing is done");
+					self.say(&format!("pressed - {why}, and this binding holds no system-sleep connection, so nothing is done"));
 					return;
 				}
 				let state = if sleep_states() & (1 << SLEEP_STATE_RAM) != 0 { SleepState::Ram } else { SleepState::Idle };
-				self.say("pressed - asking ServiceManager for a suspend");
+				self.say(&format!("pressed - {why}; asking ServiceManager for a suspend"));
 				match system_sleep::Client::with_deadline(ChannelTransport { chan: self.syssleep }, clock() + TICKS).suspend(&state, &0, &SleepReason::SleepButton) {
 					Some(Ok(())) => {}
 					Some(Err(Error::Again)) => self.say("a sleep is already running - the press is answered by it"),
@@ -141,15 +180,15 @@ impl Button {
 					None => self.say("ServiceManager did not answer"),
 				}
 			}
-			Class::Lid => self.refresh_lid(),
+			Class::Lid => {}
 		}
 	}
 }
 
-// THE LID'S PROVIDER: its state now, then every change.
+// THE SWITCH'S PROVIDER: its state now - a lid once it was read, a button always, open - then every change.
 impl platform_switch::Service for Button {
 	fn watch(&mut self) -> Vec<SwitchState> {
-		if self.closed.is_some() { alloc::vec![self.state()] } else { Vec::new() }
+		if self.class != Class::Lid || self.closed.is_some() { alloc::vec![self.state()] } else { Vec::new() }
 	}
 }
 
@@ -186,7 +225,7 @@ fn subscribe(node: u64) -> u64 {
 	acpi_node::Client::with_deadline(ChannelTransport { chan: node }, clock() + TICKS).notifications().unwrap_or(0)
 }
 
-// ONE REQUEST FROM THE LID'S CONSUMER: the watch opened - its snapshot sent first - or nothing else this contract has.
+// ONE REQUEST FROM THE SWITCH'S CONSUMER: the watch opened - its snapshot sent first - or nothing else this contract has.
 fn serve(button: &mut Button, channel: u64, buf: &mut [u8]) -> bool {
 	let (len, mut handles) = match try_recv_caps(channel, buf) {
 		PolledCaps::Message { len, handles } => (len, handles),
@@ -216,31 +255,28 @@ fn serve(button: &mut Button, channel: u64, buf: &mut [u8]) -> bool {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let (bind, resources) = common::handshake(bootstrap);
 	let name = String::from_utf8_lossy(bind.info.platform.identity()).into_owned();
-	let Some(class) = acpi_button::class_of(bind.info.platform.match_ids().iter().map(|id| id.text())) else {
+	let Some((class, source)) = acpi_button::class_of(bind.info.platform.match_ids().iter().map(|id| id.text())) else {
 		print(format!("driver.acpi-button: {name}: its ids name none of a power button, a sleep button or a lid\n").as_bytes());
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::UnsupportedDevice);
 	};
 	common::takes_sleep();
-	// ONLINE FIRST: the node channel is answered only to a binding that is online. The lid publishes its switch.
-	let report = format!("driver.acpi-button: {name}: online ({class:?})");
-	let (mut serving, online) = if class == Class::Lid {
-		let Some((producer, consumer)) = channel() else { exit() };
-		(common::Serving::from_offers(&[(TOKEN, producer)]), common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::PLATFORM_SWITCH, consumer)]))
-	} else {
-		(common::Serving::from_offers(&[]), common::online(bootstrap, &bind, report.as_bytes(), &[]))
-	};
-	if !online {
+	// ONLINE FIRST: the node channel is answered only to a binding that is online. Every one publishes its switch.
+	let report = if source == Source::Fixed { format!("driver.acpi-button: {name}: online ({class:?}, fixed hardware)") } else { format!("driver.acpi-button: {name}: online ({class:?})") };
+	let Some((producer, consumer)) = channel() else { exit() };
+	let mut serving = common::Serving::from_offers(&[(TOKEN, producer)]);
+	if !common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::PLATFORM_SWITCH, consumer)]) {
 		exit();
 	}
-	if !common::request_node(bootstrap, &bind) || common::wait_node_or_answer(bootstrap, &bind, &[]).is_none() {
+	// A FIXED BUTTON HAS NO NODE TO ASK FOR: its presses arrive on the control channel.
+	if source == Source::Node && (!common::request_node(bootstrap, &bind) || common::wait_node_or_answer(bootstrap, &bind, &[]).is_none()) {
 		if common::stop_requested() {
 			common::finish_stop(bootstrap, &bind, 0, true);
 		}
 		exit();
 	}
-	let node = common::node().unwrap_or(0);
-	let mut button = Button { name, class, node, syspower: resources.syspower, syssleep: resources.syssleep, closed: None, sequence: 0, stream: 0 };
-	if node == 0 {
+	let node = if source == Source::Node { common::node().unwrap_or(0) } else { 0 };
+	let mut button = Button { name, class, source, node, syspower: resources.syspower, syssleep: resources.syssleep, closed: None, sequence: 0, stream: 0 };
+	if source == Source::Node && node == 0 {
 		button.say("the firmware describes no node for it");
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
 	}
@@ -251,10 +287,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::DeviceNotResponding);
 		}
 	}
-	let mut notifications = subscribe(node);
+	let mut notifications = if node != 0 { subscribe(node) } else { 0 };
 	let mut buf = alloc::vec![0u8; 1024];
 	loop {
-		let looking = if button.node == 0 { clock() + NODE_LOOK_TICKS } else { u64::MAX };
+		let looking = if button.node == 0 && button.source == Source::Node { clock() + NODE_LOOK_TICKS } else { u64::MAX };
 		let mut handles: Vec<u64> = Vec::new();
 		if notifications != 0 {
 			handles.push(notifications);
@@ -273,6 +309,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				common::finish_stop(bootstrap, &bind, 0, true);
 			}
 			exit();
+		}
+		// A FIXED BUTTON'S PRESSES, as DeviceManager handed them.
+		for _ in 0..common::presses() {
+			button.pressed();
 		}
 		match common::fresh_node() {
 			Some(0) => button.say("the firmware describes no node for it any more"),

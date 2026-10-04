@@ -4668,11 +4668,13 @@ pub mod usb {
 	}
 }
 
-/// WHICH SWITCH: a lid, today.
+/// WHICH SWITCH: a lid, or a power or sleep button - the control-method kind and the fixed-hardware kind alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SwitchKind {
 	Lid = 1,
+	PowerButton = 2,
+	SleepButton = 3,
 }
 
 impl SwitchKind {
@@ -4716,6 +4718,8 @@ impl SwitchKind {
 	pub fn read(r: &mut Reader) -> Option<SwitchKind> {
 		match r.u8()? {
 			1 => Some(SwitchKind::Lid),
+			2 => Some(SwitchKind::PowerButton),
+			3 => Some(SwitchKind::SleepButton),
 			_ => None,
 		}
 	}
@@ -4778,9 +4782,11 @@ impl SwitchState {
 	}
 }
 
-/// THE `platform-switch` PROVIDER CONTRACT, which a lid's driver publishes and the power-state service consumes: the
-/// state now, then every change after it - one frame for each reading that differed from the last, a reading made at
-/// each `Notify` and at every resume. What a closed lid DOES is the consumer's policy; this reports and decides nothing.
+/// THE `platform-switch` PROVIDER CONTRACT, which a lid's or a button's driver publishes and the power-state service
+/// consumes: the state now, then every change after it - one frame for each reading that differed from the last, a
+/// reading made at each `Notify` and at every resume. A BUTTON IS MOMENTARY: its state is open, and each press is one
+/// frame `closed` with the sequence advanced - an edge, acted on once - and no release follows it. What a closed lid or a
+/// press DOES is the consumer's policy; this reports and decides nothing.
 // interface `platform-switch` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod platform_switch {
 	use super::*;
@@ -9922,16 +9928,22 @@ impl SwitchKind {
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			SwitchKind::Lid => out.push_str("\"lid\""),
+			SwitchKind::PowerButton => out.push_str("\"power-button\""),
+			SwitchKind::SleepButton => out.push_str("\"sleep-button\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			SwitchKind::Lid => out.push_str("lid"),
+			SwitchKind::PowerButton => out.push_str("power-button"),
+			SwitchKind::SleepButton => out.push_str("sleep-button"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			SwitchKind::Lid => crate::codec::cbor::text(out, "lid"),
+			SwitchKind::PowerButton => crate::codec::cbor::text(out, "power-button"),
+			SwitchKind::SleepButton => crate::codec::cbor::text(out, "sleep-button"),
 		}
 	}
 }

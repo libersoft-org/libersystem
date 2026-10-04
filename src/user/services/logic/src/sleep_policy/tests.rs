@@ -15,6 +15,8 @@ fn the_defaults_are_the_owners() {
 	assert!(!settings.idle_suspends_on_battery);
 	assert_eq!(settings.idle_after_seconds, 15 * 60);
 	assert_eq!(settings.critical, CriticalAction::Nothing);
+	assert_eq!(settings.power_button, ButtonAction::PowerOff);
+	assert_eq!(settings.sleep_button, ButtonAction::Suspend);
 }
 
 #[test]
@@ -118,11 +120,11 @@ fn a_critical_battery_set_to_power_off_powers_off_in_order_once() {
 #[test]
 fn a_critical_battery_set_to_hibernate_does_once_and_a_refusal_powers_off() {
 	let mut p = with(Settings { critical: CriticalAction::Hibernate, ..Settings::default() });
-	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Hibernate);
-	assert_eq!(p.hibernation_refused(), Action::PowerOff);
+	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Hibernate(Why::Critical));
+	assert_eq!(p.hibernation_refused(Why::Critical), Action::PowerOff);
 	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Nothing, "once until it is no longer critical");
 	assert_eq!(p.event(Event::Power { on_battery: false, critical: false }), Action::Nothing);
-	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Hibernate, "and again at the next time it is");
+	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Hibernate(Why::Critical), "and again at the next time it is");
 }
 
 #[test]
@@ -134,16 +136,56 @@ fn a_critical_battery_set_to_nothing_does_nothing() {
 
 #[test]
 fn the_keys_set_the_settings_and_a_refused_value_keeps_its_default() {
-	assert_eq!(Settings::from_keys(None, None, None, None), (Settings::default(), alloc::vec![]));
-	let (settings, refused) = Settings::from_keys(Some("suspend"), Some("on"), Some("120"), Some("hibernate"));
-	assert_eq!(settings, Settings { lid: LidAction::Suspend, idle_suspends_on_battery: true, idle_after_seconds: 120, critical: CriticalAction::Hibernate });
+	assert_eq!(Settings::from_keys([None; 6]), (Settings::default(), alloc::vec![]));
+	let (settings, refused) = Settings::from_keys([Some("suspend"), Some("on"), Some("120"), Some("hibernate"), Some("suspend"), Some("hibernate")]);
+	assert_eq!(settings, Settings { lid: LidAction::Suspend, idle_suspends_on_battery: true, idle_after_seconds: 120, critical: CriticalAction::Hibernate, power_button: ButtonAction::Suspend, sleep_button: ButtonAction::Hibernate });
 	assert!(refused.is_empty());
-	let (settings, refused) = Settings::from_keys(Some("nothing"), Some("off"), None, Some("power-off"));
-	assert_eq!(settings, Settings { lid: LidAction::Nothing, critical: CriticalAction::PowerOff, ..Settings::default() });
+	let (settings, refused) = Settings::from_keys([Some("nothing"), Some("off"), None, Some("power-off"), Some("nothing"), Some("nothing")]);
+	assert_eq!(settings, Settings { lid: LidAction::Nothing, critical: CriticalAction::PowerOff, power_button: ButtonAction::Nothing, sleep_button: ButtonAction::Nothing, ..Settings::default() });
 	assert!(refused.is_empty());
-	let (settings, refused) = Settings::from_keys(Some("sleep"), Some("yes"), Some("0"), Some("halt"));
+	let (settings, refused) = Settings::from_keys([Some("sleep"), Some("yes"), Some("0"), Some("halt"), Some("reboot"), Some("power-off")]);
 	assert_eq!(settings, Settings::default());
-	assert_eq!(refused, alloc::vec!["power.lid", "power.idle-suspend", "power.idle-after-s", "power.critical"]);
-	let (_, refused) = Settings::from_keys(None, None, Some("ten"), None);
+	assert_eq!(refused, alloc::vec!["power.lid", "power.idle-suspend", "power.idle-after-s", "power.critical", "power.button", "power.sleep-button"], "a sleep button that powered off would be a second power button");
+	let (_, refused) = Settings::from_keys([None, None, Some("ten"), None, None, None]);
 	assert_eq!(refused, alloc::vec!["power.idle-after-s"]);
+}
+
+#[test]
+fn by_default_a_power_button_powers_off_in_order_and_a_sleep_button_suspends_at_every_press() {
+	let mut p = policy();
+	assert_eq!(p.event(Event::Pressed(Button::Power)), Action::PowerOff);
+	assert_eq!(p.event(Event::Pressed(Button::Power)), Action::PowerOff, "a press is an edge of its own - the second is asked for again");
+	assert_eq!(p.event(Event::Pressed(Button::Sleep)), Action::Suspend(Why::SleepButton));
+	assert_eq!(p.event(Event::Pressed(Button::Sleep)), Action::Suspend(Why::SleepButton));
+	assert_eq!((p.button(Button::Power), p.button(Button::Sleep)), (ButtonAction::PowerOff, ButtonAction::Suspend));
+}
+
+#[test]
+fn a_button_does_what_it_is_set_to_and_nothing_does_nothing() {
+	let mut p = with(Settings { power_button: ButtonAction::Suspend, sleep_button: ButtonAction::Nothing, ..Settings::default() });
+	assert_eq!(p.event(Event::Pressed(Button::Power)), Action::Suspend(Why::PowerButton));
+	assert_eq!(p.event(Event::Pressed(Button::Sleep)), Action::Nothing);
+	let mut p = with(Settings { power_button: ButtonAction::Nothing, ..Settings::default() });
+	assert_eq!(p.event(Event::Pressed(Button::Power)), Action::Nothing);
+	assert_eq!(p.event(Event::Lid(true)), Action::ScreenOff, "and nothing else is touched by it");
+}
+
+#[test]
+fn a_button_set_to_hibernate_falls_back_by_what_it_is_for() {
+	let mut p = with(Settings { power_button: ButtonAction::Hibernate, sleep_button: ButtonAction::Hibernate, ..Settings::default() });
+	assert_eq!(p.event(Event::Pressed(Button::Power)), Action::Hibernate(Why::PowerButton));
+	assert_eq!(p.hibernation_refused(Why::PowerButton), Action::PowerOff, "the power button's point is a machine that stops");
+	assert_eq!(p.event(Event::Pressed(Button::Sleep)), Action::Hibernate(Why::SleepButton));
+	assert_eq!(p.hibernation_refused(Why::SleepButton), Action::Nothing, "a sleep button never powers the machine off");
+}
+
+#[test]
+fn a_press_changes_no_edge_the_lid_idleness_or_the_battery_keep() {
+	let mut p = with(Settings { critical: CriticalAction::PowerOff, ..Settings::default() });
+	assert_eq!(p.event(Event::Lid(true)), Action::ScreenOff);
+	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::PowerOff);
+	assert_eq!(p.event(Event::Pressed(Button::Sleep)), Action::Suspend(Why::SleepButton));
+	assert_eq!(p.event(Event::Lid(true)), Action::Nothing, "the lid is still closed");
+	assert_eq!(p.event(Event::Power { on_battery: true, critical: true }), Action::Nothing, "the battery is still critical");
+	assert!(p.critical_told());
 }

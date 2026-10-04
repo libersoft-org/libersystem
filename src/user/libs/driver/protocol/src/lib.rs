@@ -291,6 +291,11 @@ pub enum Opcode {
 	// driver -> manager. One byte: back, or a device that did not come back - which the manager tears down and
 	// rebinds through the route it already has.
 	Resumed = 19,
+	// manager -> driver, after the handshake. Empty: THE FIXED-HARDWARE BUTTON THIS BINDING HOLDS WAS PRESSED. A fixed
+	// power or sleep button is no device on any bus - its press is a PM1 status bit the kernel decodes and reports to
+	// the manager as a platform event - so the press reaches the driver that holds the button's kernel-declared row
+	// here, and nowhere else. Sent to an online binding of that row alone; one frame per press.
+	Pressed = 20,
 }
 
 impl Opcode {
@@ -317,6 +322,7 @@ impl Opcode {
 			17 => Some(Opcode::Suspended),
 			18 => Some(Opcode::Resume),
 			19 => Some(Opcode::Resumed),
+			20 => Some(Opcode::Pressed),
 			_ => None,
 		}
 	}
@@ -330,7 +336,7 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped | Opcode::NodeRequest | Opcode::NodeAbsent | Opcode::Suspend | Opcode::Suspended | Opcode::Resume | Opcode::Resumed => 0,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped | Opcode::NodeRequest | Opcode::NodeAbsent | Opcode::Suspend | Opcode::Suspended | Opcode::Resume | Opcode::Resumed | Opcode::Pressed => 0,
 			Opcode::Resource | Opcode::Offer | Opcode::Connect | Opcode::Node => 1,
 		}
 	}

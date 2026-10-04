@@ -199,8 +199,7 @@ pub fn init(rsdp_phys: u64) {
 	//   AND THE ARMING LAST, because a source enabled while its line goes to a MASKED entry is still
 	//   asserted when the entry is unmasked - which delivers a press nobody made.
 	enter_acpi_mode(&fadt);
-	let flags: u32 = fadt.flags().unwrap_or(0);
-	FIXED.store(if flags & (1 << 4) == 0 { abi::SLEEP_FIXED_POWER_BUTTON } else { 0 } | if flags & (1 << 5) == 0 { abi::SLEEP_FIXED_SLEEP_BUTTON } else { 0 }, core::sync::atomic::Ordering::Relaxed);
+	FIXED.store(super::platform::fixed_of(&fadt), core::sync::atomic::Ordering::Relaxed);
 	*BLOCKS.lock() = Some(blocks);
 	ARMED.store(armed, core::sync::atomic::Ordering::Relaxed);
 	unsafe {

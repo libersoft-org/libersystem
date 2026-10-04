@@ -2,9 +2,10 @@
 // publishes, in the order it publishes them: what the kernel declares because it drives it - the legacy
 // chipset, the interrupt controllers, the PCI host, COM1 - then what the static ACPI tables name.
 //
-// THE KERNEL-HELD SET IS PUBLISHED SO THE MACHINE IS ACCOUNTED FOR, and is never claimable. COM1 is the one
-// kernel-declared row a claim may take: that claim is the console's handoff to a driver. The ISA DMA controller's channel registers are held and its page
-// registers (0x80..0x8F) are not: they master nothing and firmware methods use them.
+// THE KERNEL-HELD SET IS PUBLISHED SO THE MACHINE IS ACCOUNTED FOR, and is never claimable. COM1 is a kernel-declared
+// row a claim may take: that claim is the console's handoff to a driver. So are the fixed-hardware buttons, which hold
+// nothing: their claim is where DeviceManager hands their presses. The ISA DMA controller's channel registers are held
+// and its page registers (0x80..0x8F) are not: they master nothing and firmware methods use them.
 
 use alloc::vec::Vec;
 
@@ -139,9 +140,35 @@ pub fn describe() -> Vec<Described> {
 		com1.add_line(isa_line(madt.as_ref(), 4));
 		push(&mut out, com1);
 	}
+	// THE FIXED-HARDWARE BUTTONS THE FADT DESCRIBES, each a claimable row with no resource of its own: a press is a PM1
+	// status bit the SCI's handler decodes and reports, and DeviceManager hands it to the binding that holds the row.
+	let fixed = crate::smp::acpi_table(rsdp, b"FACP").and_then(|bytes| acpi::Fadt::new(bytes).ok()).map_or(0, |fadt| fixed_of(&fadt));
+	for (bit, identity, hid) in [
+		(abi::SLEEP_FIXED_POWER_BUTTON, abi::PLATFORM_ROW_POWER_BUTTON, abi::PLATFORM_HID_POWER_BUTTON),
+		(abi::SLEEP_FIXED_SLEEP_BUTTON, abi::PLATFORM_ROW_SLEEP_BUTTON, abi::PLATFORM_HID_SLEEP_BUTTON),
+	] {
+		if fixed & bit == 0 {
+			continue;
+		}
+		if let Some(mut button) = platform::Description::new(abi::PLATFORM_SOURCE_KERNEL, abi::PLATFORM_STATE_CLAIMABLE, identity) {
+			button.add_match(abi::MATCH_ID_HID, hid);
+			push(&mut out, button);
+		}
+	}
 	tables(&mut out, rsdp, madt.as_ref());
 	crate::arch::common::platform::report_smbios(crate::boot_info().smbios, |phys| crate::mem::hhdm_offset() + phys);
 	out
+}
+
+/// THE FIXED BUTTONS A FADT DESCRIBES, as `SLEEP_FIXED_*` bits: none on a hardware-reduced machine or one whose PM1a
+/// event block is not in port I/O, since no press of theirs could be read. The kernel's platform rows and the SCI's
+/// arming read the same answer.
+pub fn fixed_of(fadt: &acpi::Fadt<'_>) -> u64 {
+	if fadt.hardware_reduced() || fadt.pm1a_event().and_then(|event| event.io_port()).is_none() {
+		return 0;
+	}
+	let flags: u32 = fadt.flags().unwrap_or(0);
+	(if flags & (1 << 4) == 0 { abi::SLEEP_FIXED_POWER_BUTTON } else { 0 }) | (if flags & (1 << 5) == 0 { abi::SLEEP_FIXED_SLEEP_BUTTON } else { 0 })
 }
 
 // An ISA IRQ as the wired line it arrives on: its Global System Interrupt and configuration from the MADT's

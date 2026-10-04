@@ -27,7 +27,7 @@ interface shutdown-notice
 method shutdown-notice.prepare op=1 (action:shutdown-action:rights=) -> result<unit, liber:base@1::error>
 enum sleep-state(idle=1,ram=2,disk=3)
 enum sleep-step(none=0,announce=1,freeze=2,flush=3,drivers=4,platform=5,enter=6,image=7)
-enum sleep-reason(requested=1,sleep-button=2,lid=3,idle=4,critical=5,thermal=6)
+enum sleep-reason(requested=1,sleep-button=2,lid=3,idle=4,critical=5,thermal=6,power-button=7)
 enum sleep-outcome(running=1,resumed=2,refused=3,unwound=4)
 enum wake-reason(unknown=0,timer=1,power-button=2,sleep-button=3,device=4,rtc=5,platform=6,snapshot=7,restored=8)
 record core-park(cpu:u32,timer:u32,ipi:u32,device:u32)

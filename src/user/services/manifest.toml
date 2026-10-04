@@ -3358,10 +3358,12 @@ priority = "quirk"
 heartbeat-deadline = 100
 suspend-deadline = 1000
 
-# THE ACPI BUTTONS AND THE LID: one binding per namespace node. A control-method power button powers the machine off as
-# the fixed one does - DeviceManager hands it a `system-power` connection as it does the keyboards - and a control-method
-# sleep button asks for a suspend through a `system-sleep` connection minted for it; a lid publishes a `platform-switch`
-# to the power-state service, whose policy decides what a closed lid does. It masters nothing and reaches no register.
+# THE ACPI BUTTONS AND THE LID: one binding per namespace node, and one per fixed-hardware button the kernel declares a
+# row for (`LNXPWRBN`, `LNXSLPBN`), whose presses DeviceManager hands it. Each publishes a `platform-switch` to the
+# power-state service, whose policy decides what a press or a closed lid does. With no consumer a button carries its
+# press out itself: the power button powers the machine off - DeviceManager hands it a `system-power` connection as it
+# does the keyboards - and the sleep button asks for a suspend through a `system-sleep` connection minted for it. It
+# masters nothing and reaches no register.
 [[programs]]
 name = "acpi_button"
 owner = "drivers"
@@ -3381,6 +3383,8 @@ match = [
 	{ transport = "platform", cid = "PNP0C0C" },
 	{ transport = "platform", cid = "PNP0C0E" },
 	{ transport = "platform", cid = "PNP0C0D" },
+	{ transport = "platform", hid = "LNXPWRBN" },
+	{ transport = "platform", hid = "LNXSLPBN" },
 ]
 provides = [{ kind = "platform-switch", most = 1, consumers = 1 }]
 heartbeat-deadline = 100

@@ -648,6 +648,14 @@ pub struct PortResource {
 pub const PLATFORM_EVENT_POWER_BUTTON: u8 = 1;
 pub const PLATFORM_EVENT_SLEEP_BUTTON: u8 = 2;
 
+// THE FIXED-HARDWARE BUTTONS' ROWS: kernel-declared and claimable, on a machine whose FADT says the button is fixed
+// hardware, each with the match id an operating system gives such a button. The binding that holds one is the one
+// DeviceManager hands that button's presses to.
+pub const PLATFORM_ROW_POWER_BUTTON: &[u8] = b"kernel:pwrbtn";
+pub const PLATFORM_ROW_SLEEP_BUTTON: &[u8] = b"kernel:slpbtn";
+pub const PLATFORM_HID_POWER_BUTTON: &[u8] = b"LNXPWRBN";
+pub const PLATFORM_HID_SLEEP_BUTTON: &[u8] = b"LNXSLPBN";
+
 // What a device event's first byte says.
 pub const DEVICE_EVENT_ARRIVED: u8 = 1;
 pub const DEVICE_EVENT_DEPARTED: u8 = 2;

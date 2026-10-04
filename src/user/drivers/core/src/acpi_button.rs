@@ -1,9 +1,10 @@
-// THE ACPI BUTTONS AND THE LID - the parts of the `acpi_button` driver a host can test: which class a node is, what its
-// `Notify` values mean, and what `_LID` answers.
+// THE ACPI BUTTONS AND THE LID - the parts of the `acpi_button` driver a host can test: which class a row is and where
+// its presses come from, what its `Notify` values mean, what `_LID` answers, and who acts on a press.
 //
 // A control-method power button (`PNP0C0C`), sleep button (`PNP0C0E`) or lid (`PNP0C0D`). A button raises `Notify(0x80)`
 // when it is pressed and `Notify(0x02)` when it woke the machine; a lid raises `0x80` when it moved, and `_LID` answers
-// nonzero for open.
+// nonzero for open. A FIXED-HARDWARE power or sleep button is the kernel's row (`LNXPWRBN`, `LNXSLPBN`) with no node: its
+// presses arrive from DeviceManager.
 
 use aml::wire::Value;
 
@@ -15,17 +16,44 @@ pub enum Class {
 	Lid,
 }
 
-/// The class a row's match ids name, `_HID` first and each `_CID` after.
-pub fn class_of<'a>(ids: impl IntoIterator<Item = &'a [u8]>) -> Option<Class> {
+/// Where a row's presses come from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+	/// Its namespace node's `Notify`.
+	Node,
+	/// DeviceManager's `PRESSED`: the PM1 event the kernel decoded, for the kernel's row of a fixed-hardware button.
+	Fixed,
+}
+
+/// The class a row's match ids name, `_HID` first and each `_CID` after, and where its presses come from.
+pub fn class_of<'a>(ids: impl IntoIterator<Item = &'a [u8]>) -> Option<(Class, Source)> {
 	for id in ids {
 		match id {
-			b"PNP0C0C" => return Some(Class::PowerButton),
-			b"PNP0C0E" => return Some(Class::SleepButton),
-			b"PNP0C0D" => return Some(Class::Lid),
+			b"PNP0C0C" => return Some((Class::PowerButton, Source::Node)),
+			b"PNP0C0E" => return Some((Class::SleepButton, Source::Node)),
+			b"PNP0C0D" => return Some((Class::Lid, Source::Node)),
+			b"LNXPWRBN" => return Some((Class::PowerButton, Source::Fixed)),
+			b"LNXSLPBN" => return Some((Class::SleepButton, Source::Fixed)),
 			_ => {}
 		}
 	}
 	None
+}
+
+/// Who acts on a button's press.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Actor {
+	/// The consumer of the button's `platform-switch` - the power-state policy - which decides what a press does.
+	Consumer,
+	/// The driver itself, as it did before any policy existed: the power button powers off, the sleep button suspends. So
+	/// a press never does nothing for want of a consumer.
+	Driver,
+}
+
+/// THE PRESS'S ACTOR: the consumer when one watches the button and the press reached its stream; the driver otherwise -
+/// no consumer, or one whose stream is full or gone.
+pub fn actor(watched: bool, delivered: bool) -> Actor {
+	if watched && delivered { Actor::Consumer } else { Actor::Driver }
 }
 
 /// What one `Notify` value means to a node of this class.

@@ -1,8 +1,9 @@
 // THE SLEEP POLICY'S INPUTS AND ITS DOORS - `service_logic::sleep_policy` decides; this reads what it is told and carries
 // out what it decides.
 //
-// WHAT IT READS: its settings, from ConfigService's tree once at start (`sleep_policy::KEYS`); the lid's `platform-switch`
-// publication, through the same catalogue connection the power sources arrive on; InputService's activity signal,
+// WHAT IT READS: its settings, from ConfigService's tree once at start (`sleep_policy::KEYS`); every `platform-switch`
+// publication - the lid's, and the power and sleep buttons', fixed and control-method alike - through the same catalogue
+// connection the power sources arrive on, each one's kind told by its first frame; InputService's activity signal,
 // watched at the policy's idle timeout; DisplayService's outputs, asked at every closing of the lid; and the power
 // sources this service already holds - on battery when line power is known to be absent, critical when a battery says
 // so.
@@ -12,28 +13,61 @@
 // nothing by default, said on the console, and where the setting asks for it the orderly power-off - the kernel's
 // forced deadline first, through `system-power`'s `power-off-within`, then ServiceManager's sequence through
 // `system-shutdown` - or a hibernation, with the orderly power-off whenever that is refused, as it is wherever
-// hibernation is not set up. Never an immediate `system-power` power-off: the services are stopped in order.
+// hibernation is not set up; for a press of the power button the same orderly power-off by default, and of the sleep
+// button a suspend. Never an immediate `system-power` power-off: the services are stopped in order.
 
 use super::*;
 use alloc::string::String;
 use proto::system::{ActivityEdge, SleepReason, SleepState, SwitchKind, config, display_outputs, input_activity, platform_switch, system_power, system_shutdown, system_sleep};
-use service_logic::sleep_policy::{Action, CriticalAction, Event, KEYS, LidAction, Policy, Settings, Why};
+use service_logic::sleep_policy::{Action, Button, ButtonAction, CriticalAction, Event, KEYS, LidAction, Policy, Settings, Why};
 
 // How long one question to ServiceManager, SystemManager, DisplayService or a provider may take.
 const ASK_TICKS: u64 = TICKS_PER_SECOND * 2;
 // THE FORCED POWER-OFF'S BOUND, armed before the orderly sequence is asked for: ten seconds, as the plan states it.
 const FORCED_BOUND_SECONDS: u32 = 10;
 
-struct Lid {
+// ONE `platform-switch` PUBLICATION FOLLOWED: a lid or a button, its kind known from its first frame, and a button's
+// last sequence, so a frame read again is no second press.
+struct Switch {
 	info: ProviderInfo,
 	chan: u64,
 	stream: u64,
+	kind: Option<SwitchKind>,
+	sequence: u32,
+}
+
+fn named(kind: Option<SwitchKind>) -> &'static str {
+	match kind {
+		Some(SwitchKind::Lid) => "the lid",
+		Some(SwitchKind::PowerButton) => "the power button",
+		Some(SwitchKind::SleepButton) => "the sleep button",
+		None => "a switch",
+	}
+}
+
+fn reason(why: Why) -> SleepReason {
+	match why {
+		Why::Lid => SleepReason::Lid,
+		Why::Idle => SleepReason::Idle,
+		Why::Critical => SleepReason::Critical,
+		Why::PowerButton => SleepReason::PowerButton,
+		Why::SleepButton => SleepReason::SleepButton,
+	}
+}
+
+fn does(action: ButtonAction) -> &'static str {
+	match action {
+		ButtonAction::PowerOff => "powers off in order",
+		ButtonAction::Suspend => "suspends",
+		ButtonAction::Hibernate => "hibernates",
+		ButtonAction::Nothing => "does nothing",
+	}
 }
 
 pub(super) struct SleepPolicy {
 	policy: Policy,
 	switches: u64,
-	lid: Option<Lid>,
+	followed: Vec<Switch>,
 	activity_stream: u64,
 	outputs: u64,
 	sleep: u64,
@@ -64,8 +98,7 @@ fn read_settings(config_client: u64) -> Settings {
 		};
 	}
 	close(config_client);
-	let [lid, idle_suspend, idle_after_s, critical] = &values;
-	let (settings, refused) = Settings::from_keys(lid.as_deref(), idle_suspend.as_deref(), idle_after_s.as_deref(), critical.as_deref());
+	let (settings, refused) = Settings::from_keys(values.each_ref().map(|value| value.as_deref()));
 	for key in refused {
 		say(&alloc::format!("the value of {key} is not one it takes - its default stands"));
 	}
@@ -80,7 +113,7 @@ fn read_settings(config_client: u64) -> Settings {
 		CriticalAction::Hibernate => "hibernates",
 		CriticalAction::Nothing => "does nothing",
 	};
-	say(&alloc::format!("closing the lid {lid}, idleness after {} s {idle}, a critical battery {critical}", settings.idle_after_seconds));
+	say(&alloc::format!("closing the lid {lid}, idleness after {} s {idle}, a critical battery {critical}, the power button {}, the sleep button {}", settings.idle_after_seconds, does(settings.power_button), does(settings.sleep_button)));
 	settings
 }
 
@@ -93,18 +126,18 @@ impl SleepPolicy {
 			say("no activity signal - the idle timeout is off");
 		}
 		if sleep == 0 {
-			say("no system-sleep client - a closed lid and idleness suspend nothing");
+			say("no system-sleep client - a closed lid, idleness and the buttons suspend nothing");
 		}
 		if outputs == 0 {
 			say("no display-outputs client - a closed lid turns no screen off");
 		}
-		SleepPolicy { policy: Policy::new(settings), switches, lid: None, activity_stream, outputs, sleep, syspower, shutdown, facts: None }
+		SleepPolicy { policy: Policy::new(settings), switches, followed: Vec::new(), activity_stream, outputs, sleep, syspower, shutdown, facts: None }
 	}
 
 	// The channels the loop waits on for the policy.
 	pub(super) fn handles(&self) -> Vec<u64> {
 		let mut out = Vec::new();
-		for handle in [self.switches, self.lid.as_ref().map_or(0, |lid| lid.stream), self.activity_stream] {
+		for handle in [self.switches, self.activity_stream].into_iter().chain(self.followed.iter().map(|switch| switch.stream)) {
 			if handle != 0 {
 				out.push(handle);
 			}
@@ -118,8 +151,8 @@ impl SleepPolicy {
 			self.drain_switches(catalogue, buf);
 			return true;
 		}
-		if self.lid.as_ref().is_some_and(|lid| lid.stream == handle) {
-			self.drain_lid(buf);
+		if let Some(at) = self.followed.iter().position(|switch| switch.stream == handle) {
+			self.drain_switch(at, buf);
 			return true;
 		}
 		if handle == self.activity_stream {
@@ -146,41 +179,39 @@ impl SleepPolicy {
 			let mut frame_handles = wire::Handles::new();
 			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else { continue };
 			if info.live {
-				self.adopt_lid(catalogue, info);
-			} else if self.lid.as_ref().is_some_and(|lid| publication_of(&lid.info) == publication_of(&info)) {
-				self.drop_lid("its publication was withdrawn");
+				self.adopt(catalogue, info);
+			} else if let Some(at) = self.followed.iter().position(|switch| publication_of(&switch.info) == publication_of(&info)) {
+				self.drop_switch(at, "its publication was withdrawn");
 			}
 		}
 	}
 
-	// THE LID ARRIVED: its watch opened, its state now read as the first frame.
-	fn adopt_lid(&mut self, catalogue: u64, info: ProviderInfo) {
-		if self.lid.is_some() {
+	// A SWITCH ARRIVED: its watch opened, its state now read as the first frame - which names what it is.
+	fn adopt(&mut self, catalogue: u64, info: ProviderInfo) {
+		if self.followed.iter().any(|switch| publication_of(&switch.info) == publication_of(&info)) {
 			return;
 		}
 		let Some(Ok(chan)) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) else {
-			say("the lid's publication could not be opened");
+			say("a switch's publication could not be opened");
 			return;
 		};
 		let Some(stream) = platform_switch::Client::with_deadline(ChannelTransport { chan }, clock() + ASK_TICKS).watch() else {
-			say("the lid's driver did not open its watch");
+			say("a switch's driver did not open its watch");
 			close(chan);
 			return;
 		};
-		say("follows the lid");
-		self.lid = Some(Lid { info, chan, stream });
+		self.followed.push(Switch { info, chan, stream, kind: None, sequence: 0 });
 	}
 
-	fn drop_lid(&mut self, why: &str) {
-		if let Some(lid) = self.lid.take() {
-			close(lid.stream);
-			close(lid.chan);
-			say(&alloc::format!("no longer follows the lid - {why}"));
-		}
+	fn drop_switch(&mut self, at: usize, why: &str) {
+		let switch = self.followed.swap_remove(at);
+		close(switch.stream);
+		close(switch.chan);
+		say(&alloc::format!("no longer follows {} - {why}", named(switch.kind)));
 	}
 
-	fn drain_lid(&mut self, buf: &mut [u8]) {
-		let Some(stream) = self.lid.as_ref().map(|lid| lid.stream) else { return };
+	fn drain_switch(&mut self, at: usize, buf: &mut [u8]) {
+		let stream = self.followed[at].stream;
 		loop {
 			match try_recv_caps(stream, buf) {
 				PolledCaps::Message { len, handles } => {
@@ -189,21 +220,37 @@ impl SleepPolicy {
 					for &leftover in frame.as_slice() {
 						close(leftover);
 					}
-					if state.kind != SwitchKind::Lid {
-						continue;
+					let switch = &mut self.followed[at];
+					let first = switch.kind.is_none();
+					let again = !first && switch.sequence == state.sequence;
+					switch.kind = Some(state.kind);
+					switch.sequence = state.sequence;
+					if first {
+						say(&alloc::format!("follows {}", named(Some(state.kind))));
 					}
-					say(if state.closed { "the lid is closed" } else { "the lid is open" });
-					// AN EXTERNAL DISPLAY IN USE keeps the machine awake: asked at every closing, since one may have been
-					// plugged in since the last.
-					if state.closed {
-						let external = self.external_display();
-						self.feed(Event::ExternalDisplay(external));
+					match state.kind {
+						SwitchKind::Lid => {
+							say(if state.closed { "the lid is closed" } else { "the lid is open" });
+							// AN EXTERNAL DISPLAY IN USE keeps the machine awake: asked at every closing, since one may
+							// have been plugged in since the last.
+							if state.closed {
+								let external = self.external_display();
+								self.feed(Event::ExternalDisplay(external));
+							}
+							self.feed(Event::Lid(state.closed));
+						}
+						// A BUTTON'S PRESS IS A FRAME `closed` WITH ITS SEQUENCE ADVANCED; its state otherwise is open.
+						SwitchKind::PowerButton | SwitchKind::SleepButton if state.closed && !again => {
+							let button = if state.kind == SwitchKind::PowerButton { Button::Power } else { Button::Sleep };
+							say(&alloc::format!("{} was pressed - it {}", named(Some(state.kind)), does(self.policy.button(button))));
+							self.feed(Event::Pressed(button));
+						}
+						SwitchKind::PowerButton | SwitchKind::SleepButton => {}
 					}
-					self.feed(Event::Lid(state.closed));
 				}
 				PolledCaps::Empty => return,
 				PolledCaps::Closed => {
-					self.drop_lid("its driver ended");
+					self.drop_switch(at, "its driver ended");
 					return;
 				}
 			}
@@ -284,10 +331,7 @@ impl SleepPolicy {
 				}
 			}
 			Action::Suspend(why) => {
-				let reason = match why {
-					Why::Lid => SleepReason::Lid,
-					Why::Idle => SleepReason::Idle,
-				};
+				let reason = reason(why);
 				let state = if sleep_states() & (1 << SLEEP_STATE_RAM) != 0 { SleepState::Ram } else { SleepState::Idle };
 				say(&alloc::format!("asks for a suspend ({reason:?})"));
 				if self.sleep == 0 {
@@ -299,12 +343,16 @@ impl SleepPolicy {
 					None => say("ServiceManager did not answer the suspend"),
 				}
 			}
-			Action::Hibernate => {
-				say("a battery is critical - asks for hibernation");
-				let refused = self.sleep == 0 || !matches!(system_sleep::Client::with_deadline(ChannelTransport { chan: self.sleep }, clock() + ASK_TICKS).hibernate(&false, &SleepReason::Critical), Some(Ok(())));
+			Action::Hibernate(why) => {
+				if why == Why::Critical {
+					say("a battery is critical - asks for hibernation");
+				} else {
+					say(&alloc::format!("asks for hibernation ({:?})", reason(why)));
+				}
+				let refused = self.sleep == 0 || !matches!(system_sleep::Client::with_deadline(ChannelTransport { chan: self.sleep }, clock() + ASK_TICKS).hibernate(&false, &reason(why)), Some(Ok(())));
 				if refused {
-					say("hibernation was refused - the orderly power-off instead");
-					let next = self.policy.hibernation_refused();
+					let next = self.policy.hibernation_refused(why);
+					say(if next == Action::PowerOff { "hibernation was refused - the orderly power-off instead" } else { "hibernation was refused - nothing more is done" });
 					self.act(next);
 				}
 			}

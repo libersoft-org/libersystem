@@ -50,7 +50,7 @@ method console-stream.receive op=3 () -> result<stream<console-chunk>, liber:bas
 record usb-device(port:u32,speed:string,vendor:u32,product:u32,class:u32,type:string)
 interface usb
 method usb.list op=1 () -> result<list<usb-device>, liber:base@1::error>
-enum switch-kind(lid=1)
+enum switch-kind(lid=1,power-button=2,sleep-button=3)
 record switch-state(kind:switch-kind,closed:bool,sequence:u32)
 interface platform-switch
 method platform-switch.watch op=1 () -> stream<switch-state>

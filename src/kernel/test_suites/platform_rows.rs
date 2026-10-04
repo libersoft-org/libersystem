@@ -492,6 +492,49 @@ fn every_iommu_unit_the_firmware_names_is_a_kernel_held_row() {
 	crate::serial_println!("platform-iommu: {} IOMMU unit(s) the firmware names are kernel-held rows", units.len());
 }
 
+// THE FIXED-HARDWARE BUTTONS THE FADT DESCRIBES ARE CLAIMABLE ROWS THAT HOLD NOTHING, each matched by the id the
+// `acpi-button` driver's rule names - QEMU's machine has a fixed power button and no fixed sleep button - and the claim
+// that is where DeviceManager hands a press takes the row, and its release gives it back.
+#[cfg(target_arch = "x86_64")]
+crate::tagged_test!(the_fixed_buttons_are_claimable_rows_that_hold_nothing, [Drivers, Kernel, ArchX86_64], id = "kernel.platform_rows.the_fixed_buttons_are_claimable_rows_that_hold_nothing", covers = ["kernel"]);
+#[cfg(target_arch = "x86_64")]
+fn the_fixed_buttons_are_claimable_rows_that_hold_nothing() {
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(row: u64) {
+		let grant = crate::tests::claim_device(row).expect("the power button's row is claimed under the entry that declares it");
+		assert_eq!(device::info(row as usize).map(|info| info.platform.state), Some(abi::PLATFORM_STATE_CLAIMABLE), "a claim does not change what the row is");
+		assert_eq!(crate::tests::claim_device(row).map(|_| ()), Err(abi::ERR_ALREADY_CLAIMED), "one binding holds it");
+		crate::tests::release_device(&grant);
+		let again = crate::tests::claim_device(row).expect("and it is claimed again after the release");
+		crate::tests::release_device(&again);
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let fadt = crate::smp::acpi_table(crate::boot_info().rsdp, b"FACP").and_then(|bytes| acpi::Fadt::new(bytes).ok()).expect("the test machine has a FADT");
+	let fixed = arch::platform::fixed_of(&fadt);
+	assert_eq!(fixed, abi::SLEEP_FIXED_POWER_BUTTON, "QEMU's machine declares a fixed power button and no fixed sleep button");
+	let mut power = None;
+	for (bit, identity, hid) in [
+		(abi::SLEEP_FIXED_POWER_BUTTON, abi::PLATFORM_ROW_POWER_BUTTON, abi::PLATFORM_HID_POWER_BUTTON),
+		(abi::SLEEP_FIXED_SLEEP_BUTTON, abi::PLATFORM_ROW_SLEEP_BUTTON, abi::PLATFORM_HID_SLEEP_BUTTON),
+	] {
+		let row = (0..device::count()).find(|&index| device::info(index).is_some_and(|info| info.platform.identity() == identity));
+		let name = core::str::from_utf8(identity).unwrap_or("?");
+		if fixed & bit == 0 {
+			assert!(row.is_none(), "{name} is published for a button the FADT does not describe as fixed");
+			continue;
+		}
+		let row = row.unwrap_or_else(|| panic!("{name} is not published"));
+		let info = device::info(row).expect("the button's row");
+		assert_eq!((info.platform.kind, info.platform.source, info.platform.state), (abi::ROW_KIND_PLATFORM, abi::PLATFORM_SOURCE_KERNEL, abi::PLATFORM_STATE_CLAIMABLE), "{name} is a claimable row of the kernel's");
+		assert!(info.platform.match_ids().iter().any(|id| id.kind == abi::MATCH_ID_HID && id.text() == hid), "{name} carries its match id");
+		assert!(info.platform.mmio().is_empty() && info.platform.lines().is_empty() && info.port_count == 0, "{name} holds nothing");
+		let entry = crate::tests::entry_for_device(row as u64).unwrap_or_else(|| panic!("no rule of the manifest admits {name}"));
+		assert!(entry.starts_with(b"acpi_button\0"), "{name} is the acpi-button driver's");
+		power = Some(row);
+	}
+	in_thread(body, power.expect("the power button's row") as u64, &DONE);
+}
+
 // THE HPET THE TABLE DESCRIBES IS ACCOUNTED FOR, as QEMU writes the table - its base a window of width zero, which
 // a reader that took it for half a register refused, leaving the timer's block owned by nobody.
 #[cfg(target_arch = "x86_64")]

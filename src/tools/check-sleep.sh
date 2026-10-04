@@ -42,8 +42,11 @@
 # harness plays it five years ahead - is the wall clock, stamps files and measures an S3; its timer is what the driver
 # programs from the sleep's timed wake, and the host wakes the guest at it; THE FANS' DRIVERS answer SUSPENDED and
 # RESUMED across a suspend to idle and an S3, and the level FAN1 was commanded through its curve - cleared in the pages
-# by the host while the guest is in S3 - is applied again at the resume; the control-method sleep button suspends; and
-# the control-method power button powers off through the registered `\_S5`.
+# by the host while the guest is in S3 - is applied again at the resume; THE BUTTONS, each a `platform-switch` the policy
+# follows - the fixed power button the kernel declares a row for among them: the control-method sleep button set to
+# `nothing` (`power.sleep-button`, read by the relaunched instance) does nothing, and at its default, read by an instance
+# relaunched again, suspends; and the control-method power button, at its default, powers off IN ORDER - ServiceManager's
+# sequence through `system-shutdown`, then the registered `\_S5`.
 # THE DEVICE POWER STATES, read from the fixture's pages - the lid and the TAD share one power resource in D0, and the
 # lid's wake needs another: after the boot the shared one is on, turned on ONCE for its two holders; while the lid's S3
 # is suspended both devices ran `_PS3`, the shared resource is off and the wake one on; while the TAD's timed S3 is
@@ -788,11 +791,14 @@ run_platform() {
 	: >"$stamped"
 	./dev.sh up >"$state/up-platform.log" 2>&1 || fail "the platform instance did not come up (see $kept/up-platform.log)"
 	follow_serial
-	for needle in "driver.acpi-button: acpi:\\_SB_.LID0: online" "driver.acpi-button: acpi:\\_SB_.PWRB: online" "driver.acpi-button: acpi:\\_SB_.SLPB: online" "driver.acpi-tad: acpi:\\_SB_.TAD0: online"; do
+	for needle in "driver.acpi-button: acpi:\\_SB_.LID0: online" "driver.acpi-button: acpi:\\_SB_.PWRB: online" "driver.acpi-button: acpi:\\_SB_.SLPB: online" "driver.acpi-button: kernel:pwrbtn: online (PowerButton, fixed hardware)" "driver.acpi-tad: acpi:\\_SB_.TAD0: online"; do
 		await_line "$needle" "a sleep device's driver never came online" 0 120
 	done
 	await_line "and is handed to the kernel" "the TAD's clock was never handed to the kernel" 0 60
 	await_line "PowerService: sleep policy: follows the lid" "the sleep policy never followed the lid" 0 60
+	# BOTH POWER BUTTONS - the fixed one and PWRB - AND THE SLEEP BUTTON, each a provider the policy follows.
+	await_line "PowerService: sleep policy: follows the power button" "the sleep policy never followed both power buttons" 1 60
+	await_line "PowerService: sleep policy: follows the sleep button" "the sleep policy never followed the sleep button" 0 60
 	tad_clock_check boot
 	# BOTH HOLDERS IN D0 and the shared resource turned on once.
 	await_line "acpi:\\_SB_.TAD0 is in D0" "the TAD was never put in D0" 0 60
@@ -802,7 +808,7 @@ run_platform() {
 	# THE LID, AS THE OWNER'S DEFAULTS HAVE IT: closing it turns the screen off - black, and a line typed then reaches no
 	# frame - and suspends nothing; opening it turns the screen on again.
 	local ended asked out off on
-	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery does nothing" "the policy did not start with the owner's defaults" 0 60
+	await_line "PowerService: sleep policy: closing the lid turns the screen off, idleness after 900 s suspends nothing, a critical battery does nothing, the power button powers off in order, the sleep button suspends" "the policy did not start with the owner's defaults" 0 60
 	ended=$(seen "ServiceManager: sleep: the transaction ended")
 	off=$(seen "DisplayService: the screen is off")
 	on=$(seen "DisplayService: the screen is on")
@@ -827,19 +833,27 @@ run_platform() {
 	black "$state/screen-lid-opened.png" && fail "the screen stayed black after the lid opened"
 	say "platform: closing the lid turned the screen off - black, a typed line unseen - and suspended nothing; opening it turned the screen on"
 
-	# THE LID SET TO SUSPEND, AND THE POLICY KILLED AND RELAUNCHED: the relaunched instance reads the setting and suspends -
-	# to RAM, which this machine offers - through its own `system-sleep` client, with the lid as the reason. The setting is
-	# given back to its default once the relaunched instance has read it: the tree outlives this instance's boots.
-	local restarted
+	# THE LID SET TO SUSPEND AND THE SLEEP BUTTON TO NOTHING, AND THE POLICY KILLED AND RELAUNCHED: the relaunched instance
+	# reads both settings and suspends - to RAM, which this machine offers - through its own `system-sleep` client, with the
+	# lid as the reason. The settings are given back to their defaults once the relaunched instance has read them: the tree
+	# outlives this instance's boots.
+	local restarted sleep_follows
 	out="$(launch set power.lid suspend)" || fail "set power.lid suspend was not run: $out"
 	grep -q "ok" <<<"$out" || fail "set power.lid suspend was refused: $out"
+	out="$(launch set power.sleep-button nothing)" || fail "set power.sleep-button nothing was not run: $out"
+	grep -q "ok" <<<"$out" || fail "set power.sleep-button nothing was refused: $out"
 	restarted=$(seen "supervisor: power_service restarted")
+	sleep_follows=$(seen "PowerService: sleep policy: follows the sleep button")
 	out="$(launch stop '!crash power_service')" || fail "the crash hook was not reached: $out"
 	await_line "supervisor: power_service restarted" "ServiceManager did not relaunch the killed power service" "$restarted" 60
 	await_line "PowerService: sleep policy: follows the lid" "the relaunched policy never followed the lid" 1 60
-	await_line "PowerService: sleep policy: closing the lid suspends" "the relaunched policy did not read power.lid" 0 30
-	out="$(launch set power.lid screen-off)" || fail "set power.lid screen-off was not run: $out"
-	grep -q "ok" <<<"$out" || fail "power.lid could not be given back to its default: $out"
+	await_line "PowerService: sleep policy: follows the sleep button" "the relaunched policy never followed the sleep button" "$sleep_follows" 60
+	await_line "PowerService: sleep policy: closing the lid suspends, idleness after 900 s suspends nothing, a critical battery does nothing, the power button powers off in order, the sleep button does nothing" "the relaunched policy did not read power.lid and power.sleep-button" 0 30
+	for key in "power.lid screen-off" "power.sleep-button suspend"; do
+		# shellcheck disable=SC2086 # the key and its value are words of their own, as `set` takes them
+		out="$(launch set $key)" || fail "set $key was not run: $out"
+		grep -q "ok" <<<"$out" || fail "${key%% *} could not be given back to its default: $out"
+	done
 	ended=$(seen "ServiceManager: sleep: the transaction ended")
 	asked=$(seen "PowerService: sleep policy: asks for a suspend (Lid)")
 	sleep_event lid-close
@@ -852,6 +866,19 @@ run_platform() {
 	await_line "the clock's source says the sleep lasted" "the kernel took no sleep length from the TAD's clock" 0 30
 	tad_clock_check lid
 	say "platform: the lid set to suspend, the relaunched power service suspended to RAM on it, and the TAD's clock measured the sleep"
+
+	# THE SLEEP BUTTON SET TO NOTHING: told to the policy, which does nothing - said, no transaction, the machine running.
+	local told nothing
+	ended=$(seen "ServiceManager: sleep: the transaction ended")
+	told=$(seen "SLPB: pressed - told the power-state policy")
+	nothing=$(seen "PowerService: sleep policy: the sleep button was pressed - it does nothing")
+	sleep_event sleep-button
+	await_line "SLPB: pressed - told the power-state policy" "the sleep button's press was not told to the policy" "$told" 30
+	await_line "PowerService: sleep policy: the sleep button was pressed - it does nothing" "the policy did not say the sleep button set to nothing does nothing" "$nothing" 30
+	sleep 5
+	(($(seen "ServiceManager: sleep: the transaction ended") == ended)) || fail "the sleep button set to nothing put the machine to sleep"
+	[[ "$(run_state)" == running ]] || fail "the machine is not running after the sleep button set to nothing - $(run_state)"
+	say "platform: the sleep button set to nothing was told to the policy, which did nothing"
 
 	# THE TAD'S TIMED WAKE: the driver programs the timer in its step, and the host - QEMU has no TAD to raise it - wakes
 	# the guest at that time.
@@ -906,24 +933,39 @@ EOF
 	fan_await 60 "fan: after the S3 resume FAN1 does not hold the level commanded before the sleep"
 	say "fan: across a suspend to idle and S3 both fans' drivers answered SUSPENDED and RESUMED, and the level cleared in S3 was applied again"
 
-	# THE CONTROL-METHOD SLEEP BUTTON.
+	# THE CONTROL-METHOD SLEEP BUTTON AT ITS DEFAULT, read by the policy relaunched once more: told to the policy, which
+	# suspends - to RAM - with the sleep button as the reason.
+	local defaults asked_button
+	restarted=$(seen "supervisor: power_service restarted")
+	defaults=$(seen "a critical battery does nothing, the power button powers off in order, the sleep button suspends")
+	sleep_follows=$(seen "PowerService: sleep policy: follows the sleep button")
+	out="$(launch stop '!crash power_service')" || fail "the crash hook was not reached: $out"
+	await_line "supervisor: power_service restarted" "ServiceManager did not relaunch the killed power service" "$restarted" 60
+	await_line "a critical battery does nothing, the power button powers off in order, the sleep button suspends" "the policy relaunched again did not read the defaults back" "$defaults" 60
+	await_line "PowerService: sleep policy: follows the sleep button" "the policy relaunched again never followed the sleep button" "$sleep_follows" 60
 	ended=$(seen "ServiceManager: sleep: the transaction ended")
+	told=$(seen "SLPB: pressed - told the power-state policy")
+	asked_button=$(seen "PowerService: sleep policy: asks for a suspend (SleepButton)")
 	sleep_event sleep-button
-	await_line "SLPB: pressed - asking ServiceManager for a suspend" "the sleep button's press asked for no suspend" 0 30
+	await_line "SLPB: pressed - told the power-state policy" "the sleep button's press was not told to the policy" "$told" 30
+	await_line "PowerService: sleep policy: asks for a suspend (SleepButton)" "the policy asked for no suspend on the sleep button" "$asked_button" 30
 	await_s3_and_wake "the sleep button's suspend" "$ended"
 	out="$(launch sleepctl last)" || true
 	grep -q "(SleepButton)" <<<"$out" || fail "the last sleep's record does not name the sleep button"
 	say "platform: the control-method sleep button suspended the machine"
 
-	# THE CONTROL-METHOD POWER BUTTON, LAST: it powers the machine off as the fixed one does, through the registered \_S5.
+	# THE CONTROL-METHOD POWER BUTTON, LAST: told to the policy, which powers the machine off in order - ServiceManager's
+	# sequence through `system-shutdown`, then the registered \_S5.
 	sleep_event power-button
-	await_line "PWRB: pressed - asking the power service to stop the machine" "the power button's press asked for nothing" 0 30
+	await_line "PWRB: pressed - told the power-state policy" "the power button's press was not told to the policy" 0 30
+	await_line "PowerService: sleep policy: the power button was pressed - it powers off in order" "the policy did not power off on the power button" 0 30
+	await_line "supervisor: system-shutdown asked for the orderly power-off" "ServiceManager did not take the power button's orderly power-off" 0 30
 	for _ in $(seq 1 60); do
 		[[ "$(run_state)" == "unanswered" ]] && break
 		sleep 1
 	done
 	grep -a -q "power-off: the registered \\\\_S5" "$serial" || fail "the power-off did not name the registered \\_S5"
-	say "platform: the control-method power button powered the machine off through the registered \\_S5"
+	say "platform: the control-method power button, told to the policy, powered the machine off in order through the registered \\_S5"
 	kill "$ticker" "$backend" 2>/dev/null || true
 }
 

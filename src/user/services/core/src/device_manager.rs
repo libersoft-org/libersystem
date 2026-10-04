@@ -970,7 +970,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			let mut housekeeping: bool = false;
 			if platform_events != 0 {
-				if !serve_platform_events(platform_events, power, sleep_door, &mut buf) {
+				if !serve_platform_events(platform_events, &nodes, power, sleep_door, &mut buf) {
 					machine_log(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
 					close(platform_events);
 					platform_events = 0;
@@ -1026,7 +1026,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						continue;
 					}
 					if platform_events != 0 && at == platform_events_at {
-						if !serve_platform_events(platform_events, power, sleep_door, &mut buf) {
+						if !serve_platform_events(platform_events, &nodes, power, sleep_door, &mut buf) {
 							machine_log(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
 							close(platform_events);
 							platform_events = 0;
@@ -4058,7 +4058,7 @@ fn drain_frames(node: &mut Node, buf: &mut [u8]) {
 				}
 			},
 			// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
-			driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource | driver_protocol::Opcode::Node | driver_protocol::Opcode::NodeAbsent | driver_protocol::Opcode::Suspend | driver_protocol::Opcode::Resume => refuse(&handles),
+			driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource | driver_protocol::Opcode::Node | driver_protocol::Opcode::NodeAbsent | driver_protocol::Opcode::Suspend | driver_protocol::Opcode::Resume | driver_protocol::Opcode::Pressed => refuse(&handles),
 		}
 	}
 }
@@ -5788,7 +5788,7 @@ fn machine_log(bytes: &[u8]) {
 /// a write that fits leaves on the first attempt.
 const MACHINE_LOG_ATTEMPTS: u32 = 100;
 
-fn serve_platform_events(events: u64, power: u64, sleep_door: u64, buf: &mut [u8]) -> bool {
+fn serve_platform_events(events: u64, nodes: &[Node], power: u64, sleep_door: u64, buf: &mut [u8]) -> bool {
 	// DRAINED, for the same reason the bus events are: a message left behind a readable channel is a
 	// wait that wakes immediately and forever.
 	loop {
@@ -5805,8 +5805,12 @@ fn serve_platform_events(events: u64, power: u64, sleep_door: u64, buf: &mut [u8
 			continue;
 		}
 		match buf[0] {
+			// THE BINDING THAT HOLDS THE BUTTON'S ROW IS HANDED THE PRESS, and its consumer - the power-state policy -
+			// decides what it does. With none online, the press does what it did before any driver held the row.
+			abi::PLATFORM_EVENT_POWER_BUTTON if hand_press(nodes, abi::PLATFORM_ROW_POWER_BUTTON) => machine_log(b"DeviceManager: the power button was pressed - handed to the driver that holds it\n"),
+			abi::PLATFORM_EVENT_SLEEP_BUTTON if hand_press(nodes, abi::PLATFORM_ROW_SLEEP_BUTTON) => machine_log(b"DeviceManager: the sleep button was pressed - handed to the driver that holds it\n"),
 			abi::PLATFORM_EVENT_POWER_BUTTON => {
-				machine_log(b"DeviceManager: the power button was pressed - asking the power service to stop the machine\n");
+				machine_log(b"DeviceManager: the power button was pressed - no driver holds it; asking the power service to stop the machine\n");
 				// A CONNECTION PER REQUEST, AND NOT ONE HELD OPEN. This program holds the FACTORY; a
 				// connection minted at boot and kept for the one moment it might be used is a live
 				// authority to stop the machine sitting in a variable for the life of the system.
@@ -5828,6 +5832,15 @@ fn serve_platform_events(events: u64, power: u64, sleep_door: u64, buf: &mut [u8
 	true
 }
 
+// A FIXED BUTTON'S PRESS AS `PRESSED`, to the binding that holds the button's kernel-declared row - online, so its
+// driver reads its control channel. False when none does, or the frame was not taken: the caller acts on the press.
+fn hand_press(nodes: &[Node], identity: &[u8]) -> bool {
+	let held = |node: &&Node| node.info.platform.kind == abi::ROW_KIND_PLATFORM && node.info.platform.source == abi::PLATFORM_SOURCE_KERNEL && node.info.platform.identity() == identity && node.record.state == BindingState::Online;
+	let Some(node) = nodes.iter().find(held) else { return false };
+	let Some(binding) = node.binding.as_ref() else { return false };
+	send_frame(binding.channel, driver_protocol::Opcode::Pressed, node.id.generation, &[], 0, u32::MAX)
+}
+
 // THE FIXED SLEEP BUTTON: a suspend asked for on the door ServiceManager handed this program - to RAM where the machine
 // offers it, to idle otherwise. ANSWERED AT ACCEPTANCE: this program is a participant the transaction then waits on,
 // so the request cannot wait for the resume, and ServiceManager does not make it. A second press while a sleep runs is
@@ -5838,7 +5851,7 @@ fn press_sleep_button(sleep_door: u64) {
 		return;
 	}
 	let state = if sleep_states() & (1 << abi::SLEEP_STATE_RAM) != 0 { proto::system::SleepState::Ram } else { proto::system::SleepState::Idle };
-	machine_log(b"DeviceManager: the sleep button was pressed - asking ServiceManager for a suspend\n");
+	machine_log(b"DeviceManager: the sleep button was pressed - no driver holds it; asking ServiceManager for a suspend\n");
 	let mut client = proto::system::system_sleep::Client::with_deadline(ipc_client::ChannelTransport { chan: sleep_door }, clock().saturating_add(2 * TICKS_PER_SECOND));
 	match client.suspend(&state, &0, &proto::system::SleepReason::SleepButton) {
 		Some(Ok(())) => {}

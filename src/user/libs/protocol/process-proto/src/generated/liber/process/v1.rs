@@ -2352,6 +2352,8 @@ pub enum SleepReason {
 	Critical = 5,
 	/// A thermal zone past `_HOT`, where hibernation is set up.
 	Thermal = 6,
+	/// A power button, fixed or control-method, set to suspend or hibernate.
+	PowerButton = 7,
 }
 
 impl SleepReason {
@@ -2400,6 +2402,7 @@ impl SleepReason {
 			4 => Some(SleepReason::Idle),
 			5 => Some(SleepReason::Critical),
 			6 => Some(SleepReason::Thermal),
+			7 => Some(SleepReason::PowerButton),
 			_ => None,
 		}
 	}
@@ -6750,6 +6753,7 @@ impl SleepReason {
 			SleepReason::Idle => out.push_str("\"idle\""),
 			SleepReason::Critical => out.push_str("\"critical\""),
 			SleepReason::Thermal => out.push_str("\"thermal\""),
+			SleepReason::PowerButton => out.push_str("\"power-button\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -6760,6 +6764,7 @@ impl SleepReason {
 			SleepReason::Idle => out.push_str("idle"),
 			SleepReason::Critical => out.push_str("critical"),
 			SleepReason::Thermal => out.push_str("thermal"),
+			SleepReason::PowerButton => out.push_str("power-button"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -6770,6 +6775,7 @@ impl SleepReason {
 			SleepReason::Idle => crate::codec::cbor::text(out, "idle"),
 			SleepReason::Critical => crate::codec::cbor::text(out, "critical"),
 			SleepReason::Thermal => crate::codec::cbor::text(out, "thermal"),
+			SleepReason::PowerButton => crate::codec::cbor::text(out, "power-button"),
 		}
 	}
 }

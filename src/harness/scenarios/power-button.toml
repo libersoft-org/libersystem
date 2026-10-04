@@ -11,27 +11,45 @@
 # silent when wrong. A machine that did none of them boots identically and answers this command by
 # doing nothing at all.
 #
-# THE VACUITY GUARD IS THAT THE LINE ONLY EXISTS AFTER A PRESS. Nothing prints it at boot: it is
-# written by the handler, from the interrupt, with the status bit in hand.
+# AND THEN THE PROVIDER: the kernel declares the fixed button as a claimable row, the `acpi-button`
+# driver holds it and publishes a `platform-switch`, the power-state policy follows it, DeviceManager
+# hands the press to that driver, the driver tells the policy, and the policy powers the machine off
+# IN ORDER - ServiceManager's sequence through `system-shutdown`, every service stopped, then `\_S5`.
 #
-# TWO ASSERTIONS AND NOT ONE, BECAUSE THEY BELONG TO DIFFERENT HALVES. The kernel's line says the
-# SCI arrived and was decoded; DeviceManager's says the typed event reached a consumer that acted on
-# it. A gate with only the second cannot tell "the interrupt never came" from "it came and nothing
-# was done with it", and those are two defects with two owners.
+# THE VACUITY GUARD IS THAT THE LINES ONLY EXIST AFTER A PRESS. Nothing prints them at boot: the
+# kernel's is written by the handler, from the interrupt, with the status bit in hand, and each later
+# one by the step before it.
+#
+# ONE ASSERTION PER HALF. The kernel's line says the SCI arrived and was decoded; DeviceManager's that
+# the typed event reached the binding; the driver's that it reached the policy; the policy's what it
+# decided; ServiceManager's and the kernel's last two that the decision was carried out in order. A
+# gate with only the last cannot tell which half did nothing.
 version = 1
 name = "power button"
-# AND IT ENDS WITH THE MACHINE OFF, WHICH IS THE ASSERTION AND NOT AN ACCIDENT. The last step waits
-# for the consumer to say it is acting on the press; what it acts on is `power_off`. Every other
-# scenario gives its scope back by driving the guest afterwards - a keystroke, a prompt, a reset -
-# and there is nothing here to drive. The teardown asserts the opposite instead: that nothing
-# answers any more.
+# AND IT ENDS WITH THE MACHINE OFF, WHICH IS THE ASSERTION AND NOT AN ACCIDENT. Every other scenario
+# gives its scope back by driving the guest afterwards - a keystroke, a prompt, a reset - and there is
+# nothing here to drive. The teardown asserts the opposite instead: that nothing answers any more.
 ends = "powered-off"
-description = "The chassis power button raises an SCI the kernel decodes, acknowledges and reports."
+description = "The chassis power button raises an SCI the kernel decodes and reports, its driver tells the power-state policy, and the machine powers off in order."
 timeout = 300
 
 [[step]]
 do = "prompt"
 timeout = 120
+
+# THE BINDING THAT HOLDS THE BUTTON'S ROW AND THE POLICY THAT FOLLOWS ITS PROVIDER, both before the press: a press
+# before either would be acted on by DeviceManager or the driver alone.
+[[step]]
+do = "expect"
+contains = "driver.acpi-button: kernel:pwrbtn: online (PowerButton, fixed hardware)"
+timeout = 60
+unordered = true
+
+[[step]]
+do = "expect"
+contains = "PowerService: sleep policy: follows the power button"
+timeout = 60
+unordered = true
 
 [[step]]
 do = "monitor"
@@ -45,5 +63,25 @@ timeout = 60
 
 [[step]]
 do = "expect"
-contains = "DeviceManager: the power button was pressed"
+contains = "DeviceManager: the power button was pressed - handed to the driver that holds it"
 timeout = 60
+
+[[step]]
+do = "expect"
+contains = "driver.acpi-button: kernel:pwrbtn: pressed - told the power-state policy"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "PowerService: sleep policy: the power button was pressed - it powers off in order"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "supervisor: system-shutdown asked for the orderly power-off"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "power-off: the registered \\_S5"
+timeout = 120

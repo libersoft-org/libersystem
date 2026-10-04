@@ -62,11 +62,11 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	// 1 through 19 are allocated - `DISCONNECT` took 12 (2026-08-31), the firmware node's request and its two
-	// answers 13 to 15, suspend and resume with their answers 16 to 19 (2026-09-29) - so 20 is the next one that is
-	// not. The list is written out rather than derived, which is what makes adding an opcode a decision somebody
-	// makes here rather than a number that quietly starts being accepted.
-	for raw in [0u16, 20, 21, 0xffff] {
+	// 1 through 20 are allocated - `DISCONNECT` took 12 (2026-08-31), the firmware node's request and its two
+	// answers 13 to 15, suspend and resume with their answers 16 to 19 (2026-09-29), a fixed button's press 20
+	// (2026-10-04) - so 21 is the next one that is not. The list is written out rather than derived, which is what
+	// makes adding an opcode a decision somebody makes here rather than a number that quietly starts being accepted.
+	for raw in [0u16, 21, 22, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}
@@ -534,6 +534,16 @@ fn a_row_s_connection_becomes_the_scope_it_is_minted_with() {
 	assert!(connection_scope(tree, &abi::Connection { kind: abi::CONNECTION_SPI, ..i2c(0, 0) }).is_err(), "and SPI");
 }
 
+// A FIXED BUTTON'S PRESS ends nothing and carries nothing: no handle, and the frame is the whole of what it says.
+#[test]
+fn a_press_ends_nothing_and_carries_nothing() {
+	assert!(!Opcode::Pressed.is_terminal() && !Opcode::Pressed.ends_the_binding());
+	assert_eq!(Opcode::Pressed.handle_count(), 0);
+	assert_eq!(Opcode::from_u16(20), Some(Opcode::Pressed));
+	let bytes = header(Opcode::Pressed, 3, 0).encode();
+	assert_eq!(Header::decode(&bytes).map(|header| (header.opcode, header.generation)), Ok((Opcode::Pressed, 3)));
+}
+
 // SUSPEND AND RESUME ARE NOT TERMINAL, carry no handle, and refuse every payload that is not exactly theirs.
 #[test]
 fn suspend_and_resume_round_trip_and_refuse_what_is_not_theirs() {
@@ -542,7 +552,6 @@ fn suspend_and_resume_round_trip_and_refuse_what_is_not_theirs() {
 		assert_eq!(opcode.handle_count(), 0);
 		assert_eq!(Opcode::from_u16(opcode as u16), Some(opcode));
 	}
-	assert_eq!(Opcode::from_u16(20), None);
 	let mut out = [0u8; 16];
 	let request = SuspendRequest { state: SleepState::Ram, arm_wake: true, timed_wake_ms: 90_000 };
 	let len = encode_suspend(&request, &mut out);
