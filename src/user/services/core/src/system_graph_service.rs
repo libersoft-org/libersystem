@@ -134,7 +134,6 @@ impl system_graph::Service for GraphService {
 			};
 			components.push(Component { name: node.name.clone(), r#type: ComponentType::Service, state, deps: node.deps.clone(), counters, resources: Vec::new() });
 		}
-		print(b"DEBUG-GRAPH process.stats\n");
 		spans.push(TraceSpan { name: String::from("process.stats"), duration_ns: clock_ns().wrapping_sub(stats_start) });
 
 		// Device nodes: enumerate the hardware devices over the DeviceService connection,
@@ -147,7 +146,6 @@ impl system_graph::Service for GraphService {
 			Some(Ok(d)) => d,
 			_ => Vec::new(),
 		};
-		print(b"DEBUG-GRAPH device.list\n");
 		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: clock_ns().wrapping_sub(list_start) });
 		// THE BINDINGS, from the one process that holds them.
 		//
@@ -207,7 +205,6 @@ impl system_graph::Service for GraphService {
 					}
 				}
 			}
-			print(b"DEBUG-GRAPH supervisor.status\n");
 			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: clock_ns().wrapping_sub(sup_start) });
 		}
 
@@ -228,7 +225,6 @@ impl system_graph::Service for GraphService {
 					}
 				}
 			}
-			print(b"DEBUG-GRAPH display.resources\n");
 			spans.push(TraceSpan { name: String::from("display.resources"), duration_ns: clock_ns().wrapping_sub(display_start) });
 		}
 
@@ -244,14 +240,12 @@ impl system_graph::Service for GraphService {
 					}
 				}
 			}
-			print(b"DEBUG-GRAPH audio.resources\n");
 			spans.push(TraceSpan { name: String::from("audio.resources"), duration_ns: clock_ns().wrapping_sub(audio_start) });
 		}
 
 		// HOW EACH CORE RESTS, from the kernel's own per-core record: a free read, one core at a time.
 		let cores_start: u64 = clock_ns();
 		let cores = idle_rows();
-		print(b"DEBUG-GRAPH cpu.idle\n");
 		spans.push(TraceSpan { name: String::from("cpu.idle"), duration_ns: clock_ns().wrapping_sub(cores_start) });
 
 		Ok(Graph { components, spans, cores })

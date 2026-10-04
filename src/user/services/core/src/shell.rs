@@ -1976,12 +1976,16 @@ fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
 	// A fresh sub-connection per query, re-resolving the root through the supervisor when
 	// the held one is dead. That is what lets the service be stopped and started again
 	// under a running shell: the durable reference is the capability name, not the channel.
+	debug_write(b"DEBUG-SHELL graph: connecting\n");
 	let Some(connection) = connect_or_resolve(graphsvc, broker, CAP_GRAPH) else {
 		print(b"graph: service unavailable\n");
 		return;
 	};
+	debug_write(b"DEBUG-SHELL graph: asking\n");
 	let mut client = system_graph::Client::new(ChannelTransport { chan: connection });
-	match client.snapshot() {
+	let answer = client.snapshot();
+	debug_write(b"DEBUG-SHELL graph: answered\n");
+	match answer {
 		Some(Ok(graph)) => match fmt {
 			GraphFmt::Text => {
 				print_text_lines(&graph.components, |c: &Component| -> String { c.to_text() });
@@ -2008,6 +2012,7 @@ fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
 		None => print(b"graph: service unavailable\n"),
 	}
 	// The connection was minted for this query; the root stays.
+	debug_write(b"DEBUG-SHELL graph: printed\n");
 	close(connection);
 }
 
