@@ -41,7 +41,8 @@ pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
 
 // Tear the whole service tree down for a graceful power-off. LogService flushes first;
 // every service whose row declares the shutdown notice is told next, under one bound; every
-// other service then stops in reverse-dependency order. The issuing shell and the console
+// other service then stops in reverse-dependency order - DeviceManager asked to stop its
+// drivers before it is killed (`stop_device_manager`). The issuing shell and the console
 // that hosts it are excluded from the order and die with the machine. `notice_ticks` is the
 // notice's bound; `None` leaves the notice out, which only a development hook asks for.
 pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, action: proto::system::ShutdownAction, notice_ticks: Option<u64>, buf: &mut [u8]) {
@@ -54,9 +55,13 @@ pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup:
 		notify_shutdown(state, channels, action, notice_ticks, buf);
 	}
 	let order: Vec<usize> = shutdown_order(state);
+	let device_manager = index_of(b"device_manager");
 	for &idx in &order {
 		if state[idx] != State::Ready {
 			continue;
+		}
+		if Some(idx) == device_manager && !stop_device_manager(channels[idx], buf) {
+			console_report(MANIFEST[idx].name, b"did not stop its drivers within its bound - it is killed with them running");
 		}
 		if procs[idx] != 0 {
 			signal(procs[idx], SIG_KILL);
@@ -70,8 +75,48 @@ pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup:
 		}
 		state[idx] = State::Stopped;
 		sup[idx].failure = Failure::Stopped;
-		emit_event(log_client, MANIFEST[idx].name, b"stopped");
+		emit_event_within(log_client, MANIFEST[idx].name, b"stopped", Some(SHUTDOWN_LOG_TICKS));
 		console_report(MANIFEST[idx].name, b"stopped");
+	}
+}
+
+// HOW LONG THE ORDERLY SEQUENCE WAITS FOR LOGSERVICE TO TAKE ONE "stopped" RECORD: half a second. A record it does not
+// take in that time is not worth a sequence the forced power-off deadline ends half done.
+const SHUTDOWN_LOG_TICKS: u64 = TICKS_PER_SECOND / 2;
+
+// DEVICEMANAGER'S BOUND FOR STOPPING ITS DRIVERS: its own `stop_all` spends at most one heartbeat deadline and one
+// teardown allowance over every binding, three seconds; this is that and two seconds for the answer to come back.
+const DEVICE_MANAGER_STOP_TICKS: u64 = 5 * TICKS_PER_SECOND;
+
+// DEVICEMANAGER IS ASKED TO STOP, AND KILLED ONLY AFTER IT ANSWERED OR ITS BOUND PASSED. Asked, it stops every driver in
+// reverse dependency order - each told `STOP`, its device quiesced, its claim given back once it exited - and answers.
+// KILLED FIRST, as every other service is, it took every claim with it at once while its drivers still ran: the kernel
+// revoked their registers under them and each faulted on its next write - its device never reset, in an orderly
+// power-off. True once it answered or ended; false past the bound, or when it could not be asked.
+fn stop_device_manager(control: u64, buf: &mut [u8]) -> bool {
+	if control == 0 || !try_send(control, b"STOP", 0) {
+		return false;
+	}
+	let deadline: u64 = clock() + DEVICE_MANAGER_STOP_TICKS;
+	loop {
+		match try_recv(control, buf) {
+			Polled::Message { len, handle } => {
+				if handle != 0 {
+					close(handle);
+				}
+				// ITS ANSWER, and nothing else it may have queued before the request.
+				if buf[..len].starts_with(b"DeviceManager: stopped") {
+					return true;
+				}
+			}
+			Polled::Closed => return true,
+			Polled::Empty => {
+				if clock() >= deadline {
+					return false;
+				}
+				wait(control, deadline);
+			}
+		}
 	}
 }
 
@@ -192,8 +237,9 @@ impl supervisor::Service for StatsApi<'_> {
 // waited for under ONE bound, `notice_ticks`. A service that has not answered by then is killed with the rest; a
 // message on a control channel that is not the answer is not served while the sequence runs.
 //
-// Only this orderly sequence tells anybody: the immediate power paths - the Power key, Ctrl+Alt+Delete, the power
-// button DeviceManager handles - reach SystemManager's `system-power` directly and stay notice-free by design.
+// Only this orderly sequence tells anybody: the immediate power paths - the Power key, Ctrl+Alt+Delete, a power button
+// pressed while no power-state policy follows it - reach SystemManager's `system-power` directly and stay notice-free by
+// design. A power button the policy follows takes this sequence.
 pub(super) fn notify_shutdown(state: &[State; N], channels: &[u64; N], action: proto::system::ShutdownAction, notice_ticks: u64, buf: &mut [u8]) {
 	// One correlation for the whole sequence: each service is asked exactly once.
 	const CORRELATION: u32 = 1;

@@ -58,6 +58,9 @@
 # with no hibernation asked through its own clients: the forced deadline armed, ServiceManager's sequence, the
 # registered `\_S5`, and QEMU gone within the bound.
 # THE FALLBACK BOOT: the switch refusing the sleep-type registration, and `shutdown` taking the fixed ports.
+# EVERY ORDERLY POWER-OFF HERE - the power button's, the battery's and the typed `shutdown` - is also checked for a driver
+# whose device was taken while it still ran: no ring-3 fault after the sequence began, and DeviceManager stopped within
+# its bound.
 #
 # A KEY WAKE FROM S3 IS NOT REQUIRED: QEMU requests a system wakeup from its PS/2 keyboard, which this system does not
 # drive, and delivers a USB or virtio key to a suspended machine as nothing that wakes it. Case 6 checks this rather
@@ -282,6 +285,27 @@ await_end() {
 	local ended
 	ended="$(grep -a "ServiceManager: sleep: the transaction ended" "$serial" | tail -n 1)"
 	[[ "$ended" == *"slept and woke"* ]] || fail "$what: the transaction ended as: $ended"
+}
+
+# AN ORDERLY POWER-OFF STOPS EVERY DRIVER BEFORE ITS DEVICE IS TAKEN FROM IT: no ring-3 fault after the sequence began -
+# a driver whose claim went while it still ran faults on its revoked registers - and DeviceManager stopped, within its
+# bound.
+orderly_without_faults() {
+	local what="$1"
+	python3 - "$serial" <<'EOF' || fail "$what: the orderly power-off was not orderly (see $kept)"
+import sys
+text = open(sys.argv[1], 'rb').read()
+at = text.rfind(b'supervisor: the orderly power-off begins')
+if at < 0:
+	sys.exit('no orderly power-off began')
+after = text[at:]
+for bad in (b'fault: ring-3', b'did not stop its drivers within its bound'):
+	if bad in after:
+		line = after[after.find(bad):].split(b'\n', 1)[0].decode(errors='replace')
+		sys.exit(f'after the sequence began: {line}')
+if b'supervisor: device_manager stopped' not in after:
+	sys.exit('DeviceManager was never stopped')
+EOF
 }
 
 # A SCREEN, as QEMU shows it.
@@ -965,7 +989,8 @@ EOF
 		sleep 1
 	done
 	grep -a -q "power-off: the registered \\\\_S5" "$serial" || fail "the power-off did not name the registered \\_S5"
-	say "platform: the control-method power button, told to the policy, powered the machine off in order through the registered \\_S5"
+	orderly_without_faults "platform: the power button's power-off"
+	say "platform: the control-method power button, told to the policy, powered the machine off in order through the registered \\_S5 - every driver stopped before its device was taken"
 	kill "$ticker" "$backend" 2>/dev/null || true
 }
 
@@ -1056,6 +1081,7 @@ EOF
 	gone_at="$(grep '^closed' "$events" | cut -d' ' -f2)"
 	grep -a -q "supervisor: system-shutdown asked for the orderly power-off" "$serial" || fail "battery: ServiceManager did not take the orderly power-off through system-shutdown"
 	grep -a -q "power-off: the registered \\\\_S5" "$serial" || fail "battery: the power-off did not name the registered \\_S5"
+	orderly_without_faults "battery"
 	local took
 	took=$(ms_between "$armed_at" "$gone_at")
 	((took <= FORCED_BOUND_S * 1000 + 1000)) || fail "battery: QEMU exited ${took} ms after the forced deadline was armed, past its ${FORCED_BOUND_S} s bound"
@@ -1078,6 +1104,7 @@ run_soft_off_fallback() {
 		sleep 1
 	done
 	grep -a -q "power-off: the fixed ports (no \\\\_S5 registered)" "$serial" || fail "the power-off with nothing registered did not take the fixed ports"
+	orderly_without_faults "soft-off"
 	say "soft-off: with the registration refused, power-off took the fixed ports"
 }
 

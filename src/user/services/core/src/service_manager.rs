@@ -55,7 +55,7 @@ mod shutdown;
 #[path = "service_manager/sleep.rs"]
 mod sleep;
 
-use bootstrap::{Kept, bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
+use bootstrap::{Kept, bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, emit_event_within, launch_from_volume, open_storage_directory, start_service, stop_service};
 use lifecycle::{depends_on_scoped, has_running_dependent, serve_stats_once, shutdown_all, shutdown_order, verify_shutdown_order};
 
 // A service in the boot manifest: its package entry name, the supervisor's crash
@@ -2609,6 +2609,8 @@ fn handle_admin(admin: u64, power: u64, notice_ticks: u64, sleeper: &mut sleep::
 #[allow(clippy::too_many_arguments)]
 fn run_power_verb(action: u64, without_notice: bool, power: u64, notice_ticks: u64, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], log_client: u64, buf: &mut [u8]) {
 	let notice: proto::system::ShutdownAction = if action == POWER_REBOOT { proto::system::ShutdownAction::Reboot } else { proto::system::ShutdownAction::PowerOff };
+	// SAID AS IT BEGINS, whichever door it came in by: what happens to the machine from here on is this sequence's.
+	print(if action == POWER_REBOOT { b"supervisor: the orderly reboot begins\n" } else { b"supervisor: the orderly power-off begins\n" });
 	if without_notice {
 		debug_write(b"service_manager: the shutdown notice is skipped (development hook)\n");
 	}

@@ -1215,13 +1215,24 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 // "online"/"stopped"). A no-op until LogService is up (log_client == 0). The
 // supervisor logs service lifecycle the way systemd journals unit start/stop.
 pub(super) fn emit_event(log_client: u64, source: &[u8], event: &[u8]) {
+	emit_event_within(log_client, source, event, None);
+}
+
+// THE SAME RECORD, WAITED FOR NO LONGER THAN `ticks` - for the orderly shutdown, where LogService outlives services it
+// may itself be waiting on: an unbounded round trip there held the whole sequence for half a minute after
+// `process_service` was killed, past the forced power-off deadline, with every service after it still running.
+pub(super) fn emit_event_within(log_client: u64, source: &[u8], event: &[u8], ticks: Option<u64>) {
 	if log_client == 0 {
 		return;
 	}
 	let entry = Entry { timestamp: clock(), severity: Severity::Info, source: String::from_utf8_lossy(source).into_owned(), fields: alloc::vec![Field { key: String::from("event"), value: String::from_utf8_lossy(event).into_owned() }] };
 	// Emit the record through the generated Log client (a round-trip over the log
 	// channel); best-effort, so the result is ignored.
-	let mut client = log::Client::new(ChannelTransport { chan: log_client });
+	let transport = ChannelTransport { chan: log_client };
+	let mut client = match ticks {
+		Some(ticks) => log::Client::with_deadline(transport, clock() + ticks),
+		None => log::Client::new(transport),
+	};
 	let _ = client.emit(&entry);
 }
 
