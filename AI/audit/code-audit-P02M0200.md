@@ -211,3 +211,28 @@ job's end, for the parts owed by P02M0197 and P02M0201, and for the owner's deci
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate watchdog` -> PASS (2919 s): the i6300esb, the reset, the TCO, WDAT and the BMC
   cases, the orderly reboot's notice and the boot bound among them.
 - (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.
+
+## The owner's decisions, recorded (2026-10-04)
+
+The owner answered the questions this part asked when it started, on a plain account of each: T, P and D at 60 s, 15 s
+and 5 s; armed by default in a shipping image; the order WDAT, TCO, `i6300esb`, BMC; a 2 s shutdown notice - all as
+built - and a ten-minute boot bound.
+
+WHAT WAS DONE:
+- `watchdog_service.rs`: `DEFAULT_BOOT_BOUND_MS` 120 000 -> 600 000, its comment saying why (a short bound turns one
+  slow boot into a reset loop; a long one only catches a hung boot later); `watchdog.boot-bound-ms` still sets another.
+- `drivers::watchdog`: the takeover bridge stays 120 s - the time from a driver's bind to its consumer's first pet - and
+  its comment no longer calls it the boot bound, which covers the reset to the bind. `RESUME_WATCH_MS` follows the
+  bridge, as before, so the sleep case's 120 s and the `ipmi` sleep case's re-arm count (1200) are unchanged.
+- `check-watchdog.sh`: the BMC case still sets the bound explicitly (the case is that the notice arms the CONFIGURED
+  bound); its comment says the default is ten minutes now.
+- `P02M0200.md` and its TODO row carry the decisions.
+
+VERIFICATION:
+- `LIBER_DEVELOPMENT=1 ./image.sh --format iso` (x86_64, builds the service and the drivers): ok; rustfmt and shfmt
+  clean. No gate exercises the default itself - `check-watchdog.sh` sets the bound it tests - so the change is proved by
+  the build and by reading `read_policy`, which takes `watchdog.boot-bound-ms` and falls back to the constant.
+- `./check.sh --gate ipmi` (2026-10-04, PASS in 2464 s) with these drivers: the sleep case's re-arm with the bridge
+  bound still 1200 counts.
+
+BLOCKERS: none for the decisions; the ports' runs wait for the end of the job.

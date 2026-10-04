@@ -188,3 +188,39 @@ watchdog's 120 s boot bound should be larger (see the watchdog finding above).
   to idle and S3, SSIF identified again, and the BMC received the watchdog's step in order".
 - `LIBER_DEVELOPMENT=1 ./check.sh --gate ipmi` -> PASS (2188 s); `qemu-ipmi-admin` -> PASS (1392 s).
 - (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.
+
+## The out-of-band cross-check, with OpenIPMI's simulator (2026-10-04)
+
+The owner allowed `openipmi` and `ipmitool` on this machine (2026-10-04); both are installed (`ipmi_sim`, ipmitool
+1.8.19) and `setup.sh` now lists them beside `swtpm`.
+
+WHAT WAS DONE:
+- The gate `ipmi` gained case 7 (`tools/check-ipmi.sh`): OpenIPMI's `ipmi_sim` behind QEMU's `ipmi-bmc-extern` on ISA
+  KCS (`irq=0`), its VM serial side on a free loopback TCP port and its LAN side (RMCP+) on a free loopback UDP port, its
+  configuration and emulator command file written by the gate (one BMC at 0x20, product 0x0f02, a SEL of 1000 entries,
+  users 1 "" as user and 2 "ipmiusr" as administrator). Before the guest boots, `ipmitool -I lanplus` writes the LAN
+  configuration over the LAN (static source, 192.168.77.10/24, gateway .1, MAC 52:54:00:aa:bb:cc, VLAN 7) and reads it
+  back. In the guest: the boot's event written once, `bmc lan`, `bmc users`, `bmc sel`. OUTSIDE IN: the LAN
+  configuration and both users as written and configured; INSIDE OUT: record 1, the boot's event the BMC service wrote
+  through KCS, read over the LAN by `ipmitool sel get 1` and `sel list` with the same id, type, generator (0xf041),
+  sensor type (OS Boot), sensor number, direction, data (06 ff ff) and timestamp. The simulator is the gate's helper,
+  killed with the boot and in the EXIT trap; its log and the outside record are kept.
+- Found, and said in the gate's head rather than claimed: `ipmi_sim` does not log a platform event its LAN side takes
+  (`ipmitool event 1` answers, and the log stays as it was), so the outside-in direction is the configuration and the
+  users, not an event.
+- The preflight fails, rather than skips, without `ipmi_sim` or `ipmitool`.
+
+VERIFICATION:
+- `apt-get install -y openipmi ipmitool` (with the owner's leave): `ipmi_sim` and ipmitool 1.8.19 installed; `setup.sh`
+  lists both. Prototyped by hand first - `ipmi_sim -c lan.conf -f bmc.emu -s <dir> -n`, `ipmitool -I lanplus ... lan
+  set`/`lan print`, a development instance behind it reading `bmc lan` = "channel 1: static address 192.168.77.10
+  mask 255.255.255.0 gateway 192.168.77.1 mac 52:54:00:aa:bb:cc vlan 7" and `bmc sel` = "0x0001 type 0x02 at 262178
+  generator 0xf041 sensor type 0x1f ... data 06 ff ff", which `ipmitool sel list` showed as "1 | Pre-Init |0000262178|
+  OS Boot | boot completed".
+- `LIBER_DEVELOPMENT=1 ./image.sh --format iso`: ok (the watchdog service's ten-minute default boot bound in it).
+- `./check.sh --gate ipmi` (x86_64, 2026-10-04): PASS in 2464 s - cases 1 to 6 as before and "ipmi: oob: ipmi_sim's LAN
+  configuration written by ipmitool read through KCS, its users alike, and the boot's event written through KCS read
+  over the LAN as the same record, field by field".
+- `shfmt -d` on `check-ipmi.sh` and `setup.sh`: clean; `./check.sh --gate milestone-index`: ok with the row ticked.
+
+BLOCKERS: none - the milestone is complete.
