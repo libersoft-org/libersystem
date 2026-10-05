@@ -756,7 +756,7 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, queue: &virtio::Queue, mut 
 				}
 				block::OP_CAPACITY => {
 					let bytes = unit.capacity.blocks * block_bytes;
-					send_blocking(endpoint, &block::capacity_reply(bytes, MOST_BLOCKS), 0);
+					send_blocking(endpoint, &block::capacity_reply(bytes, MOST_BLOCKS, block::DeviceClass::VirtioScsi), 0);
 				}
 				block::OP_FLUSH => {
 					let ok = command(queue, virt, phys, sense_size, cdb_size, &unit.lun, &scsi::synchronize_cache10(), None).ok();

@@ -59,9 +59,9 @@ fn snapshot_info_wire_is_stable() {
 }
 #[test]
 fn volume_status_wire_is_stable() {
-	let sample = VolumeStatus { label: String::from("x"), total_bytes: 7, free_bytes: 7, compression: true, read_only: true, filesystem: String::from("x") };
+	let sample = VolumeStatus { label: String::from("x"), total_bytes: 7, free_bytes: 7, compression: true, read_only: true, filesystem: String::from("x"), device: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 120];
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 120, 1, 0, 120];
 	assert_eq!(bytes, golden);
 	assert_eq!(VolumeStatus::decode(&bytes).unwrap(), sample);
 }

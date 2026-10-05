@@ -74,7 +74,15 @@ struct Node {
     candidates: Vec<&'static Entry>, candidate: usize, running: Option<usize>, preferred: Option<usize>,
     disabled_by_policy: bool, retry_pending: bool, restart_requested: bool, retry_once: bool,
     retry_at: u64, selection_pending: bool, bind_at: u64,
+    // The paths these tables do not take still name them: the firmware connections' needs, the number a node
+    // asked its driver with, and the sleep's question and answer.
+    needs: Vec<Need>, node_request: u64, sleep_asked: SleepAsked, sleep_answer: Option<SleepAnswer>,
 }
+struct Need { controller: BindingId, kind: u16 }
+#[derive(Clone, Copy, PartialEq, Eq)] enum SleepAsked { None, Suspend, Resume }
+#[derive(Clone, Copy)] enum SleepAnswer { Suspended(driver_protocol::Suspended), Resumed(bool) }
+fn say_line(_: &[&[u8]]) {}
+fn driver_text(name: &[u8]) -> Vec<u8> { name.to_vec() }
 impl Node {
     fn new(channel: u64, entry: &'static Entry) -> Self {
         let mut record = BindingRecord::new(); assert!(record.move_to(BindingState::Binding, None));
@@ -83,7 +91,8 @@ impl Node {
             last_opcode: 0, last_frame_at: 0, beat: Heartbeat::default(), offers: Offers, incident: Incident::open(),
             candidates: vec![entry], candidate: 0, running: Some(0), preferred: None,
             disabled_by_policy: false, retry_pending: false, restart_requested: false, retry_once: false,
-            retry_at: 0, selection_pending: false, bind_at: 0 }
+            retry_at: 0, selection_pending: false, bind_at: 0,
+            needs: Vec::new(), node_request: 0, sleep_asked: SleepAsked::None, sleep_answer: None }
     }
     fn push(&mut self, event: BindingEvent) -> bool { self.queue.push(event) }
     fn driver_name(&self) -> &'static [u8] { b"fixture" }
@@ -97,6 +106,7 @@ struct Catalogue { entries: Vec<(BindingId, u16)> }
 impl Catalogue {
     fn count_of(&self, kind: u16) -> usize { self.entries.iter().filter(|entry| entry.1 == kind).count() }
     fn count_for(&self, id: BindingId, kind: u16) -> usize { self.entries.iter().filter(|entry| entry.0 == id && entry.1 == kind).count() }
+    fn serving(&self, controller: BindingId, kind: u16) -> Option<usize> { self.entries.iter().position(|entry| entry.0 == controller && entry.1 == kind) }
     fn withdraw_binding(&mut self, id: BindingId) {
         self.entries.retain(|entry| entry.0 != id);
         EFFECTS.with_borrow_mut(|effects| effects.push((false, id.dev as u64)));
@@ -168,10 +178,13 @@ fn consume(node: &mut Node) -> usize {
     let mut expiries = 0;
     while let Some(event) = node.queue.pop(1) {
         expiries += usize::from(matches!(event, BindingEvent::Wedged { .. }));
-        if let EventDecision::Admitted { next_state: Some(next), cause, .. } = driver_binding::reduce_event(node.record.state, event) {
-            if matches!(event, BindingEvent::Wedged { .. }) && node.record.state == BindingState::Online {
-                assert!(cause == Some(driver_binding::FailureCause::Hung), "expiry must use the ordinary Hung fault transition");
-            }
+        let decision = driver_binding::reduce_event(node.record.state, event);
+        // AN EXPIRY ON AN ONLINE DRIVER MARKS IT AND LEAVES IT RUNNING (the owner's decision, 2026-09-21): the
+        // reducer admits it with no transition and no cause, and the manager counts the miss.
+        if matches!(event, BindingEvent::Wedged { .. }) && node.record.state == BindingState::Online {
+            assert!(decision == EventDecision::Admitted { event, next_state: None, cause: None, planned_stop: false }, "an online expiry is marked, not torn down");
+        }
+        if let EventDecision::Admitted { next_state: Some(next), cause, .. } = decision {
             assert!(node.record.move_to(next, cause));
         }
     }
@@ -188,7 +201,7 @@ fn refilled_channel_returns_to_other_nodes() {
     assert_eq!(reads.iter().filter(|&&channel| channel == 1).count(), MAX_DRIVER_FRAMES_PER_PASS);
     for node in &mut nodes {
         assert_eq!(consume(node), 1, "both expired watchdogs must reach their lifecycle queues");
-        assert!(node.record.state == BindingState::Stopping);
+        assert!(node.record.state == BindingState::Online, "an expiry marks the driver and leaves it running");
     }
 }
 #[test]
@@ -208,7 +221,7 @@ fn full_queue_preserves_watchdog_expiry() {
         } else {
             assert_eq!(delivered, 1);
         }
-        assert!(node.record.state == BindingState::Stopping);
+        assert!(node.record.state == BindingState::Online, "an expiry marks the driver and leaves it running");
         assert_eq!(node.beat.wake_at(), 0);
         assert_eq!(node.beat.tick(100000), driver_binding::Beat::Idle);
     }
@@ -227,7 +240,7 @@ fn continuing_traffic_cannot_starve_pending_expiry() {
     unsafe { drain_channel(&mut node, &mut [0; 128]); }
     unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
     assert_eq!(consume(&mut node), 1, "fresh traffic cannot overtake an already pending expiry");
-    assert!(node.record.state == BindingState::Stopping);
+    assert!(node.record.state == BindingState::Online, "an expiry marks the driver and leaves it running");
     assert_eq!(node.beat.wake_at(), 0);
 }
 #[test]
@@ -262,7 +275,7 @@ fn unrelated_frames_do_not_answer_the_outstanding_ping() {
     CLOCKS.with_borrow_mut(|times| *times = [16, 16].into());
     unsafe { drain_channel(&mut node, &mut [0; 128]); }
     assert_eq!(consume(&mut node), 1);
-    assert!(node.record.state == BindingState::Stopping);
+    assert!(node.record.state == BindingState::Online, "an expiry marks the driver and leaves it running");
 }
 #[test]
 fn first_reply_uses_receipt_deadline_even_without_tick() {
@@ -276,7 +289,7 @@ fn first_reply_uses_receipt_deadline_even_without_tick() {
         FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
         let wake = unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]) };
         assert_eq!(consume(&mut node), usize::from(!timely), "receipt clocks {clocks:?}");
-        assert!(node.record.state == if timely { BindingState::Online } else { BindingState::Stopping });
+        assert!(node.record.state == BindingState::Online, "timely or not, the driver is left running - an expiry only marks it");
         assert_eq!(wake, if timely { 19 } else { 0 });
     }
 }
@@ -301,7 +314,7 @@ fn direct_intake_prioritizes_new_expiry_before_traffic() {
     FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
     unsafe { drain_channel(&mut node, &mut [0; 128]); }
     assert_eq!(consume(&mut node), 1, "a receipt that crossed the deadline owns the last queue slot");
-    assert!(node.record.state == BindingState::Stopping);
+    assert!(node.record.state == BindingState::Online, "an expiry marks the driver and leaves it running");
     assert_eq!(node.beat.wake_at(), 0);
 }
 #[test]
@@ -361,7 +374,7 @@ fn disable_orders_dependency_closure() {
 def fixture(source: str, beat: str | None = None) -> str:
     # THE ANCHORS LOST THEIR `unsafe` WITH THE SOURCE (P02M0178 removed propagated unsafe from the
     # runtime wrappers), and the call below lost a tab with the block that wrapped it.
-    functions = ["fn expire_heartbeat(", "fn drain_channel(", "fn drain_frames(", "fn tick_heartbeats(", "fn expire_planned_stop(", "fn planned_stop_deadline(", "fn apply_policy(", "fn begin_operator_stop(", "fn begin_dependency_stop(", "fn stop_nodes_that_lost_a_dependency(", "fn stoppable_on_a_lost_dependency(", "fn requirements_met(", "fn dependency_depths("]
+    functions = ["fn expire_heartbeat(", "fn drain_channel(", "fn drain_frames(", "fn tick_heartbeats(", "fn expire_planned_stop(", "fn planned_stop_deadline(", "fn apply_policy(", "fn begin_operator_stop(", "fn begin_dependency_stop(", "fn stop_nodes_that_lost_a_dependency(", "fn stoppable_on_a_lost_dependency(", "fn requirements_met(", "fn needs_met(", "fn dependency_depths("]
     bound = next(line for line in source.splitlines() if line.startswith("const MAX_DRIVER_FRAMES_PER_PASS:"))
     if beat is None:
         beat = (ROOT / "src/user/libs/driver/binding/src/lib.rs").read_text()

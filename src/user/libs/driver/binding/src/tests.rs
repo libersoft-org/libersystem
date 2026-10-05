@@ -1789,6 +1789,14 @@ fn ending_events_keep_their_causes_and_only_stopped_is_a_clean_stop() {
 }
 
 #[test]
+fn a_missed_heartbeat_marks_an_online_driver_and_tears_down_any_other() {
+	let wedged = BindingEvent::Wedged { generation: 31 };
+	assert!(reduce_event(BindingState::Online, wedged) == EventDecision::Admitted { event: wedged, next_state: None, cause: None, planned_stop: false }, "online: marked and left running, no transition and no cause");
+	assert!(reduce_event(BindingState::Suspended, wedged) == EventDecision::Admitted { event: wedged, next_state: Some(BindingState::Stopping), cause: Some(FailureCause::Hung), planned_stop: false }, "a resume nobody answered is torn down");
+	assert!(reduce_event(BindingState::Stopping, wedged) == EventDecision::Admitted { event: wedged, next_state: None, cause: Some(FailureCause::Hung), planned_stop: false }, "a planned stop past its deadline is torn down, hung");
+}
+
+#[test]
 fn disk_probes_and_role_handoff_name_the_same_provider_at_every_index() {
 	// Publication order differs from bus order; two children on one controller also
 	// prove that equal bus addresses retain their publication-slot tie break.

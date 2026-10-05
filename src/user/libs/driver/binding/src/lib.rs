@@ -673,6 +673,12 @@ pub fn reduce_event(state: BindingState, event: BindingEvent) -> EventDecision {
 		}
 		BindingEvent::Stopped { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::Stopped), true),
 		BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::DriverExited), false),
+		// A MISSED HEARTBEAT FROM `Online` IS MARKED, NOT A TRANSITION: the driver is left running and still asked, its
+		// misses counted (the owner's decision, 2026-09-21 - a tick is not a unit of work, and a port that emulates every
+		// instruction misses one-second deadlines while a dozen drivers bind). Raised in any other state - a planned
+		// stop past its deadline, a resume nobody answered - it is the teardown a crash takes. The state it was raised
+		// in is what tells the two apart, so it is decided here and the manager reads the decision.
+		BindingEvent::Wedged { .. } if state == BindingState::Online => (None, None, false),
 		BindingEvent::Wedged { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::Hung), false),
 		BindingEvent::Offered { .. } | BindingEvent::Withdrawn { .. } | BindingEvent::Disconnected { .. } | BindingEvent::Ponged { .. } => (None, None, false),
 		BindingEvent::ClaimSettled { .. } => return EventDecision::Refused,

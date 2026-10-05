@@ -4025,3 +4025,127 @@ lost a piece as designed; the oracle sends it on the ordinary handle now.
 
 VERIFICATION (2026-10-04, x86_64): host `drivers` 470; the SCO oracle twice; `USB_GADGET=bt` and `USB_GADGET=uvc-iso`
 oracles unchanged. NOT RUN: aarch64, riscv64.
+
+## USB MIDI 2.0: UMP end to end, with the translation both ways (2026-10-04)
+
+WHAT WAS DONE:
+- IDL `liber:midi-device@1`: an endpoint's `protocol` (`midi1` | `ump`), `midi-device-block` with its direction,
+  `@op(7) blocks(endpoint)`. `liber:midi@1`: `midi-block`, an endpoint's `blocks`, `midi-ump` (words + group, absent
+  for utility and stream messages), the `ump` item, fault `truncated`, `midi-input @op(5) protocol`, `midi-output
+  @op(4) send-ump`; inventory's `open` no longer answers `unsupported`.
+- `drivers::ump` (new, host-tested): message lengths by type, a word stream cut into messages, SysEx7/SysEx8 tracked
+  per group within the 64 kB cap (restart, overlong part, cap - each an abort by number; a part with nothing open a
+  stray), USB-MIDI 1.0 packets <-> MIDI 1.0 in UMP (SysEx re-cut at threes), MIDI 2.0 channel voice down by the default
+  translation, Group Terminal Block answers parsed with every number checked.
+- `usb_midi::bind` keeps the MIDI 2.0 setting beside the MIDI 1.0 one; `class_midi` reads the blocks (GET_DESCRIPTOR
+  0x26) and their names, and selects a face per endpoint (MIDI 1.0 endpoints 0/1, UMP 2/3), `again` while the other
+  face is busy.
+- MidiService: receivers decode in the protocol they read, senders check a UMP batch whole (length, group, the
+  endpoint's groups, SysEx parts) and refuse it whole; batches past one provider send go as several.
+- Fixtures: `usbredir_device.py --emulate midi2`; the in-guest MIDI fixture's UMP pair (3, 4) with two blocks; probe
+  `midiump`; `midicheck ump`; `midiread` lists five endpoints with their blocks.
+
+FOUND: `usb_midi_transmits_on_each_cable_and_hears_it_come_back` failed every run - the far end opens its ports half a
+second after it sees the guest configure the device; the oracle waits two seconds now. The MIDI gate reads `graph
+midi_service`, since the whole graph outgrows the serial mirror.
+
+VERIFICATION (2026-10-04, x86_64): host `drivers` 479 at the time; the midi2 oracle twice; `midi` and `midi-echo`
+oracles; `qemu-midi-service` twice in a row (after the console fixes below). NOT RUN: aarch64, riscv64.
+
+## The serial console: two prompts for one, and a deadlock between the console and its UART driver (2026-10-04)
+
+WHAT WAS FOUND, while `qemu-midi-service` hung now and then at `graph`:
+- The kernel sent the first-prompt newline twice: `serial_console_pump` (idle hook, its own `NUDGED`) and
+  `console_shell_loop` (`ever_attached`). Every guest-console run since showed a second prompt right after the first
+  command was typed, so every scripted line was typed one command early, into the command still running.
+- `uart16550`'s receive path called `Session::deliver` -> `send_chunk`, which waits out a full stream (16 deep) with
+  no bound and serves nothing meanwhile. ConsoleService's `SerialWire::write` waits on its answer with no deadline and
+  reads the receive stream only from its main loop. A line typed while the console renders a long output arrives a
+  byte per chunk (QEMU's 16550 at trigger level 1, the driver idle between bytes), fills the stream, and both wait
+  for ever. After it nothing reached the wire, debug writes included, which is why the shell's own instrumentation
+  showed nothing.
+
+WHAT WAS DONE:
+- `kernel/main.rs`: `greet_shell` - the hint and the newline once a boot (`GREETED`), called from both places.
+- `serial_port`: `offer_chunk` and `Session::offer` - one attempt, the sequence number spent only on delivery.
+- `uart16550`: `deliver` offers and keeps the bytes on refusal, answering whether it is behind; a retry timer a tick
+  away while behind (a housekeeping wait); `take_received` reads only what `Held` has room for and turns the receive
+  interrupt off when it has none, so the far end is backpressured instead of losing bytes; `deliver` turns it on again
+  and reads what waited. `uart`: `Uart::receive_interrupt`, `Held::room` (+ host tests).
+- The DEBUG-SHELL lines in `shell.rs` were removed.
+
+VERIFICATION (2026-10-04, x86_64): reproduced before the change - a 300-character line typed during `graph json`
+(desynchronised script) hung the console in round 3 of 3; after it, a driver typing that line during `graph json`
+on purpose ran 3 x 5 rounds with no hang, and with the backpressure change `uname` and `poweroff` typed behind the
+bursts both ran; `serial-handoff` and `shell-large-output` pass; host `drivers` 480; the test kernel builds. NOT RUN:
+aarch64, riscv64 (`uart16550` binds on x86_64 only; `greet_shell` is shared).
+
+## The heartbeat's mark, decided in the reducer; three gate harnesses brought up to the manager (2026-10-04)
+
+`driver-event-dispatch` had been red since 2026-09-21: DeviceManager's `Wedged` arm read `node.record.state ==
+BindingState::Online` to choose mark-and-leave over teardown, which the gate refuses as a second decision beside
+`reduce_event`.
+
+WHAT WAS DONE:
+- `driver_binding::reduce_event`: `Wedged` on `Online` -> admitted, no transition, no cause; any other state as
+  before (teardown, `hung`). Host test `a_missed_heartbeat_marks_an_online_driver_and_tears_down_any_other`.
+- DeviceManager's arm: `if next_state.is_none() && cause.is_none()`.
+- `check-device-manager-progress.py`, `check-device-claim-result.py`, `check-driver-lifecycle.py`: stubs for what the
+  manager grew (`Scope` and `CatalogueView.scope`, `begin_bind`'s children, `start_candidate`'s publishers, `Need` and
+  `needs_met`, `SleepAsked`/`SleepAnswer`, `node_request`, `Catalogue::serving`, `say_line`/`driver_text`/`decimal`);
+  the lifecycle harness's `consume` and six tests expect an online expiry to be marked rather than torn down.
+- `check-driver-mutations.sh`: the HID contact-begin anchor follows `open: Option<(Contact, u32)>`.
+
+VERIFICATION (2026-10-04): host `driver-binding` 94; `driver-event-dispatch` passes (progress 1 + 10 rejected, claim
+result 1 + 3, lifecycle 13 tests + 12 rejected); `driver-mutations` 89 of 89; a booted development guest still ends
+the planned-stop fixture `disabled by an operator`.
+
+## The system volume on NVMe and on AHCI: staging, an honest device name, and the gate (2026-10-04)
+
+WHAT WAS DONE:
+- `manifest.toml`: `nvme`, `ahci` -> `stage = "pinned"`, `destination = "<name>.lsexe"`, `lifecycle = "boot-critical"`
+  (with the cost in a comment: the bootstrap set on every architecture, no stored operator policy, no operator retry).
+- `driver_protocol::block`: `CAPACITY_CLASS_LEN = 20`, `DeviceClass` (eight values, `from_wire`, `name`),
+  `capacity_reply(bytes, max, class)`, `decode_device_class` (+ host test); all seven servers pass their class
+  (virtio-blk, ahci, virtio-scsi, sdhci, usb-storage, usb-uas, nvme).
+- IDL `liber:storage@1` `volume-status.device` (regenerated with `--accept-breaking`); StorageService's `block_device`
+  asks the capacity reply's class for every block-backed status, `memory` for memfs and the archive; `lsblk` prints it.
+- StorageService: `mount_system_volume(chan, say)` - quiet in `classify_block` and among several candidates, every
+  disk's reason printed when none carries the chosen volume.
+- Kernel oracles: the NVMe and AHCI tests read their ELFs at `libexec/` and assert their class.
+- Harness: `SYSTEM_DISK=virtio|nvme|ahci|virtio-scsi` (`qemu_attach_system_disk`), x86_64.
+- Gate `boot-volume-controllers` (check.sh, catalog `GATES` + `GATES_THAT_BOOT_A_GUEST`, release-required, inventory).
+- `check-guest-verdict.py`: stubs for `qemu_attach_system_disk`, `qemu_run_system_disk` and `QEMU_BUILD_DIR`; the
+  inventory (`docs/verification/P02M0177-guest-cases.md`) names the 29 guest-booting gates it lacked, and the new one.
+- `release-required.toml`: `host.audio-proto`, which the catalog derived and the list lacked.
+- `check-driver-protocol-note.sh`: the staged scan takes the pinned drivers' names from the manifest (it matched
+  `virtio_*`/`xhci`/`dev_channel` and found one of three once NVMe and AHCI were pinned); `check-provider-routing.py`:
+  the `mount_system_volume` stub takes `say`.
+- `kernel/test_suites/hardware.rs`: the NVMe and AHCI oracles take their ELFs from the init package; the unbound-
+  function test skips a function a declared row names (the i6300esb, whose row resolves its BAR).
+
+- `kernel/test_suites/boot.rs`: the online list gains the 17 services added since the font catalogue (details after
+  " - " counted as the report they begin with); the lifecycle count's failure lists what arrived; `root_inventory` and
+  `end_chain` end the booted chain at the test's end; `no_selected_root_refuses_a_valid_block_volume` drains bounded.
+
+VERIFICATION (2026-10-04, x86_64): `boot-volume-controllers` passes (seven boots); host `driver-protocol` 82;
+`guest-verdict`, `verify-model`, `verify-model-tests` pass; `test.sh --tags boot` 16 passed; `test.sh --tags
+drivers,pci,slow` 153 passed; `boot-manifest`, `bootstrap-plan`, `test-tags`, `source-hygiene`, `declared-interfaces`
+pass, and so do `provider-routing`, `no-fixed-provider-slots`, `dependency-policy`, `capability-model` and `one-wait`;
+`driver-protocol-note` passes x86_64 and waits for the ports' builds (their bootstrap sets predate the pin);
+`foreign-audit-link --check` reproduces. NOT RUN: aarch64, riscv64 - and on riscv64 the ESP is an
+NVMe disk that now binds in phase one, so its FAT volume joins the probes `vol://media` is chosen from.
+
+## The first storage record: the system volume behind each controller, timed through StorageService (2026-10-04)
+
+MEASURED (x86_64, KVM, `time` in the guest; the system disk behind `SYSTEM_DISK=virtio|nvme|ahci`): `cp` of a 1.72 MiB
+file 0.91-0.94 s (virtio-blk), 0.93-0.97 s (nvme), 1.06-1.17 s (ahci); `wc` of it 0.25-0.27 s on all three. Bind
+windows from DeviceManager's own lines: virtio-blk 27-49, nvme 16-27, ahci 15-28 ticks. The transport is within a
+quarter across three command sets, so the cost sits above the driver.
+
+TRIED AND DROPPED: a kernel-harness measurement straight against each block provider (one request in flight, a
+child Domain for the peak, a kill and a rebind for recovery). It timed the harness's `run_until_idle` loop rather than
+the device and, against AHCI's polled NCQ with 512 KiB requests, never finished in 15 minutes; the same large I/O
+through the real path (`cp` of 1.72 MiB on an AHCI system volume, three times) completes. The code was removed.
+
+STILL TO RECORD: peak memory and recovery times, network, input, audio and UVC, and the ports.

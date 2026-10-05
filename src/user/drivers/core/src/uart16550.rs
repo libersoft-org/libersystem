@@ -10,7 +10,8 @@
 //   - THE TAP: the kernel's output, in order, onto the wire, and a marker line where the ring's bound dropped
 //     some of it;
 //   - IRQ 4: every received byte, handed to the consumer of its `ConsoleBytes` publication - held, bounded, while
-//     nobody is attached, so a shell that was listening before the handoff loses no keystroke to it;
+//     nobody is attached or the consumer is behind, so a shell that was listening before the handoff loses no
+//     keystroke to it; past the bound the bytes stay in the UART and the far end waits;
 //   - THE PUBLICATION, under the kernel console's provider name: ConsoleService attaches to it, its mirror of the
 //     foreground terminal arrives as console-stream writes, and the tap is emptied before each one is written,
 //     so a kernel line queued before a mirror chunk reaches the wire before it.
@@ -63,7 +64,8 @@ mod console {
 		pub uart: Uart<Ports>,
 		pub irq: u64,
 		pub tap: u64,
-		// Received bytes nobody has taken yet: while no consumer is attached, and while a write is on the wire.
+		// Received bytes nobody has taken yet: while no consumer is attached, while a write is on the wire, and while
+		// the consumer's stream is full.
 		pub held: Held,
 		// Kernel output the tap reported dropped, in total.
 		pub dropped: u64,
@@ -112,11 +114,25 @@ mod console {
 		pub fn service_line(&mut self) {
 			interrupt_ack(self.irq);
 			let _ = self.uart.acknowledge();
+			self.take_received();
+		}
+
+		// EVERY RECEIVED BYTE THE HELD BOUND HAS ROOM FOR. What does not fit stays in the FIFO, and the receive
+		// interrupt goes off with it - a FIFO this cannot empty would hold the line up and raise no further edge -
+		// so the UART takes no more and the far end WAITS, as it waited while this driver blocked on a full
+		// stream: typed input is backpressured, never dropped. `deliver` turns it on again once the consumer has
+		// taken what is held.
+		pub fn take_received(&mut self) {
 			let mut chunk = [0u8; RX_CHUNK];
 			loop {
-				let n = self.uart.receive(&mut chunk);
+				let room = self.held.room().min(RX_CHUNK);
+				if room == 0 {
+					self.uart.receive_interrupt(false);
+					return;
+				}
+				let n = self.uart.receive(&mut chunk[..room]);
 				if n == 0 {
-					break;
+					return;
 				}
 				self.held.push(&chunk[..n]);
 			}
@@ -154,12 +170,21 @@ mod console {
 		}
 	}
 
-	// Hand what was received to the consumer when one is listening; keep it otherwise.
-	pub fn deliver(console: &mut Console, session: &mut Session, bind: &common::Bind, bootstrap: u64, buffers: &mut serial_port::Buffers) {
-		if session.listening() && !console.held.is_empty() {
-			session.deliver(bind, bootstrap, console.held.bytes(), buffers);
+	// Hand what was received to the consumer when one is listening; keep it otherwise - and keep it while the
+	// consumer's stream is full, serving its writes meanwhile (`Session::offer` says why). Answers whether bytes
+	// wait on a consumer that has not read yet, which is what the serve loop's retry is armed for.
+	pub fn deliver(console: &mut Console, session: &mut Session, buffers: &mut serial_port::Buffers) -> bool {
+		while session.listening() && !console.held.is_empty() {
+			if !session.offer(console.held.bytes(), buffers) {
+				return true;
+			}
 			console.held.clear();
+			// ROOM AGAIN: the receive interrupt back on, and what the bound left in the FIFO read now - no edge
+			// is coming for bytes that were already there.
+			console.uart.receive_interrupt(true);
+			console.take_received();
 		}
+		false
 	}
 
 	pub fn program(uart: &mut Uart<Ports>) -> bool {
@@ -242,6 +267,11 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 		refuse(bootstrap, &bind, b"the console's tap could not be read", unusable);
 	}
 	let Some((bytes, bytes_far)) = channel() else { refuse(bootstrap, &bind, b"no channel for its provider", driver_protocol::DriverFailureCode::OutOfMemory) };
+	// THE RETRY FOR A CONSUMER THAT IS BEHIND: armed a tick away while received bytes wait on its full stream.
+	let retry: u64 = match timer_create() {
+		t if t > 0 => t as u64,
+		_ => refuse(bootstrap, &bind, b"no timer for its receive retry", driver_protocol::DriverFailureCode::OutOfMemory),
+	};
 	let mut digits = [0u8; 4];
 	let mut report = common::Bounded::<96>::new();
 	report.push(b"driver.uart16550: online - 16550 at port 0x");
@@ -257,8 +287,11 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 	let mut session = Session::new();
 	let mut buffers = serial_port::Buffers::default();
 	loop {
-		console::deliver(&mut console, &mut session, &bind, bootstrap, &mut buffers);
-		match common::wait_providers_or_sleep(bootstrap, &bind, &mut serving, &[console.irq, console.tap], false) {
+		// A housekeeping wait while behind: a consumer that never reads again must not keep a settling scheduler
+		// from settling.
+		let behind = console::deliver(&mut console, &mut session, &mut buffers);
+		timer_set(retry, if behind { clock() + 1 } else { u64::MAX });
+		match common::wait_providers_or_sleep(bootstrap, &bind, &mut serving, &[console.irq, console.tap, retry], behind) {
 			// A `SUSPEND`: the step taken here, and the loop goes on after the resume - WITH THE SAME CONSUMER. Its
 			// connection and its receive stream outlive the sleep, so the session is kept: resetting it closed the stream
 			// ConsoleService reads typed input from, and the console stopped answering after a wake.
@@ -302,7 +335,7 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 				}
 			}
 			Some(Some(common::ProviderReady::Device(0))) => console.service_line(),
-			Some(Some(common::ProviderReady::Device(_))) => {
+			Some(Some(common::ProviderReady::Device(1))) => {
 				if console.drain_tap(&bind, bootstrap).is_err() {
 					// The tap was revoked: the release is under way and the manager's stop follows. Nothing
 					// more can be written for the kernel, and nothing is waited on here.
@@ -310,6 +343,8 @@ fn serve(bootstrap: u64, bind: common::Bind, resources: common::Resources) -> ! 
 					exit();
 				}
 			}
+			// The retry: the next pass offers the held bytes again.
+			Some(Some(common::ProviderReady::Device(_))) => {}
 		}
 	}
 }

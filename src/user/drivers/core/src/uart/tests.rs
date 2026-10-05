@@ -73,6 +73,18 @@ fn the_transmit_interrupt_is_on_only_while_a_write_waits_and_keeps_the_receive_e
 }
 
 #[test]
+fn the_receive_interrupt_goes_off_while_nothing_has_room_and_keeps_the_transmit_enable() {
+	let mut uart = Uart::new(Script::default());
+	uart.program(Line { divisor: 3 }, true);
+	uart.transmit_interrupt(true);
+	uart.regs.writes.clear();
+	uart.receive_interrupt(false);
+	uart.receive_interrupt(false);
+	uart.receive_interrupt(true);
+	assert_eq!(uart.regs.writes, [(IER, IER_TX_EMPTY), (IER, IER_TX_EMPTY | IER_RX_AVAILABLE)], "off once, on once, the transmit enable kept");
+}
+
+#[test]
 fn a_full_holding_register_takes_nothing_and_an_empty_one_takes_a_fifo_load() {
 	let mut uart = Uart::new(Script { lsr: alloc::vec![0, LSR_THR_EMPTY], ..Script::default() });
 	let bytes = [b'x'; 40];
@@ -103,9 +115,11 @@ fn every_received_byte_is_read_while_there_is_room_and_damage_is_counted() {
 fn input_held_for_a_consumer_keeps_the_oldest_and_counts_what_the_bound_dropped() {
 	let mut held = Held::default();
 	assert!(held.is_empty());
+	assert_eq!(held.room(), HELD_INPUT);
 	assert_eq!(held.push(&[b'a'; 500]), 500);
 	assert_eq!(held.push(b"0123456789abcdef"), 12, "twelve more fit the bound");
 	assert_eq!(held.bytes().len(), HELD_INPUT);
+	assert_eq!(held.room(), 0, "and nothing more has room");
 	assert_eq!(&held.bytes()[500..], b"0123456789ab", "the newest are the ones dropped");
 	assert_eq!(held.dropped(), 4);
 	held.clear();

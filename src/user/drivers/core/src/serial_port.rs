@@ -387,6 +387,27 @@ fn send_chunk(bind: &common::Bind, bootstrap: u64, state: &mut Attachment, chunk
 	}
 }
 
+// One chunk OFFERED to the stream, once: false when the stream is full and the chunk did not go - its sequence
+// number unspent, so the same bytes can be offered again. A consumer that closed ends the attachment, as in
+// `send_chunk`, and the bytes count as taken: there is nobody left to keep them for.
+fn offer_chunk(state: &mut Attachment, chunk: &[u8], frame: &mut [u8]) -> bool {
+	let mut handles: Handles = Handles::new();
+	let item: ConsoleChunk = ConsoleChunk { bytes: chunk.to_vec() };
+	let Some(written) = console_stream::receive_frame(state.seq, &item, frame, &mut handles) else { return true };
+	match try_send_outcome(state.stream, &frame[..written], 0) {
+		SendOutcome::Delivered => {
+			state.seq = state.seq.wrapping_add(1);
+			true
+		}
+		SendOutcome::Failed => {
+			close(state.stream);
+			state.stream = 0;
+			true
+		}
+		SendOutcome::Stalled => false,
+	}
+}
+
 // ONE SERVED PORT, WHOLE: both queues, the receive pool behind one of them, the transmit buffer
 // behind the other, and the single consumer's session.
 //
@@ -527,6 +548,24 @@ impl Session {
 			return;
 		}
 		send_chunk(bind, bootstrap, &mut self.state, chunk, &mut buffers.frame);
+	}
+
+	/// Offer bytes the transport received to the attached consumer, ONCE: false when its stream is full and
+	/// the bytes are still the caller's to offer again.
+	///
+	/// FOR A TRANSPORT THAT HOLDS WHAT IT RECEIVED, SERVING A CONSUMER THAT ALSO WRITES. `deliver` waits a full
+	/// stream out and serves nothing meanwhile - and a consumer that writes waits for its `write` to be answered
+	/// without reading its stream. ConsoleService does exactly that: it mirrors the terminal to the wire, and
+	/// while it renders a long output it reads nothing, so a line typed meanwhile - a chunk a byte while the
+	/// driver is idle - filled the stream, the driver waited on it, and the console's next mirror write waited
+	/// on the driver. Both for ever: the serial console went silent in the middle of a command, the kernel's
+	/// own lines with it. A transport that keeps its bytes anyway offers them, keeps them when refused, and goes
+	/// on serving the write after which the consumer reads.
+	pub fn offer(&mut self, chunk: &[u8], buffers: &mut Buffers) -> bool {
+		if chunk.is_empty() || self.state.stream == 0 {
+			return true;
+		}
+		offer_chunk(&mut self.state, chunk, &mut buffers.frame)
 	}
 
 	/// Whether a consumer is attached and holding a stream, for a transport deciding whether a

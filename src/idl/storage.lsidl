@@ -83,7 +83,10 @@ record snapshot-info {
 /// the disk), whether transparent compression is on for new writes, whether the
 /// mount is read-only (a snapshot mount, or degraded by on-disk damage), and the name
 /// of the filesystem serving the volume ("liberfs", "fat16", "exfat", "iso9660",
-/// "udf", "archive"). Foreign backends track no pool numbers and report zero bytes.
+/// "udf", "archive"). Foreign backends track no pool numbers and report zero bytes. And the
+/// DEVICE the volume is on, as its block driver names it ("virtio-blk", "nvme", "ahci",
+/// "sdhci", "virtio-scsi", "usb-storage", "usb-uas"; "block" for a driver that does not say;
+/// "memory" for a volume held in memory) - the one thing nothing else on the wire tells.
 record volume-status {
 	label:       string,
 	total-bytes: u64,
@@ -91,6 +94,7 @@ record volume-status {
 	compression: bool,
 	read-only:   bool,
 	filesystem:  string,
+	device:      string,
 }
 
 /// What a volume integrity check found, BY CATEGORY, and the paths of the damaged files - so the

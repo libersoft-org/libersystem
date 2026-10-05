@@ -60,6 +60,21 @@ read_floor() {
 	' user/services/manifest.toml
 }
 
+# THE PINNED DRIVERS BY NAME, from the same place. The staged scan below picked them out by a name pattern -
+# `virtio_*`, `xhci`, `dev_channel` - which was the pinned set when it was written and stopped being it the day NVMe
+# and AHCI were pinned: the floor rose with the manifest and the pattern did not, so the scan found one of three.
+# Development drivers are named too; a shipping build simply does not stage them.
+pinned_drivers() {
+	awk '
+		/^\[\[programs\]\]/ { if (role == "driver" && stage == "pinned") print name; role = ""; stage = ""; name = ""; next }
+		/^name = / { gsub(/"/, "", $3); name = $3 }
+		/^role = "driver"$/ { role = "driver" }
+		/^stage = / { gsub(/"/, "", $3); stage = $3 }
+		END { if (role == "driver" && stage == "pinned") print name }
+	' user/services/manifest.toml
+}
+PINNED_NAMES=" $(pinned_drivers | tr '\n' ' ')"
+
 MINIMUM_STAGED="$(read_floor pinned)"
 MINIMUM_IN_VOLUME="$(read_floor volume)"
 if [[ "$MINIMUM_STAGED" -lt 1 || "$MINIMUM_IN_VOLUME" -lt 1 ]]; then
@@ -106,10 +121,7 @@ for arch in x86_64 aarch64 riscv64; do
 	for file in "$staged"/*.lsexe; do
 		[[ -e "$file" ]] || continue
 		name="$(basename "$file" .lsexe)"
-		case "$name" in
-		virtio_* | xhci | dev_channel) ;;
-		*) continue ;;
-		esac
+		[[ "$PINNED_NAMES" == *" $name "* ]] || continue
 		found=$((found + 1))
 		if [[ "$(count_notes "$file" "$version")" == 0 ]]; then
 			echo "driver-note: $arch/$name carries no protocol note in its staged bytes." >&2

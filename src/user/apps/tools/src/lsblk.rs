@@ -49,18 +49,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// One row per volume: the vol:// name, the backing block device transport, the
-// filesystem the volume's service reports, and the backing device's capacity asked
-// through the volume's typed `capacity` query.
+// One row per volume: the vol:// name, the device the volume's service says it is on -
+// as the block driver names it, so a system volume on NVMe reads `nvme` - the filesystem
+// the service reports, and the backing device's capacity asked through the volume's typed
+// `capacity` query. This printed a fixed `virtio-blk` for every disk-backed volume, which
+// was true of the one machine it was written on and nothing more.
 fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mode: Option<JsonMode>) {
 	let json: bool = mode.is_some();
-	let rows: [(&str, &str, u64); 5] = [
-		("vol://system", "virtio-blk", system),
-		("vol://media", "virtio-blk", media),
-		("vol://iso", "virtio-blk", iso),
-		("vol://udf", "virtio-blk", udf),
-		("vol://usb", "usb-storage", usb),
-	];
+	let rows: [(&str, u64); 5] = [("vol://system", system), ("vol://media", media), ("vol://iso", iso), ("vol://udf", udf), ("vol://usb", usb)];
 	let mut out = String::new();
 	if json {
 		out.push('[');
@@ -68,14 +64,15 @@ fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mod
 		// The aligned column header (bold), like lsvol.
 		out.push_str("\x1b[1mvolume        device       type        size\x1b[0m\n");
 	}
-	for (i, &(name, device, chan)) in rows.iter().enumerate() {
+	for (i, &(name, chan)) in rows.iter().enumerate() {
 		// The size is the backing block DEVICE's capacity (what a block-device
 		// lister reports), asked through the volume's typed query - deliberately the
 		// raw disk size, not lsvol's usable filesystem pool (disk minus the factory
 		// archive region), so the two tools answer different, complementary questions.
 		let capacity: Option<u64> = volume_capacity(chan);
-		let fs: Option<String> = volume_filesystem(chan);
-		render_row(&mut out, i, name, device, fs.as_deref(), capacity, json);
+		let status: Option<(String, String)> = volume_status(chan);
+		let device: &str = status.as_ref().map_or("-", |(_, device)| device.as_str());
+		render_row(&mut out, i, name, device, status.as_ref().map(|(fs, _)| fs.as_str()), capacity, json);
 	}
 	if let Some(mode) = mode {
 		out.push(']');
@@ -85,15 +82,15 @@ fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mod
 	print(out.as_bytes());
 }
 
-// The filesystem a volume's service reports (`liberfs` / `exfat` / `iso9660` /
-// `udf`), or None when the volume (or its disk) is absent.
-fn volume_filesystem(chan: u64) -> Option<String> {
+// The filesystem a volume's service reports (`liberfs` / `exfat` / `iso9660` / `udf`) and
+// the device it says the volume is on, or None when the volume (or its disk) is absent.
+fn volume_status(chan: u64) -> Option<(String, String)> {
 	if chan == 0 {
 		return None;
 	}
 	let mut client = VolumeClient::new(chan);
 	match client.status() {
-		Some(Ok(st)) => Some(st.filesystem),
+		Some(Ok(st)) => Some((st.filesystem, st.device)),
 		_ => None,
 	}
 }

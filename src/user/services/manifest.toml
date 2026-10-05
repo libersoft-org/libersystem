@@ -803,12 +803,18 @@ name = "ahci"
 owner = "drivers"
 role = "driver"
 linkage = "static"
-stage = "volume"
-destination = "drivers/ahci.lsexe"
+# PINNED AND BOOT-CRITICAL, BECAUSE THIS CONTROLLER CAN HOLD THE SYSTEM VOLUME. A driver loaded from the volume
+# cannot be the one that makes the volume reachable, so it is in the bootstrap set and binds in phase one beside
+# `virtio_blk`, and its provider is among the probes the system volume is chosen from - by the medium's pairing
+# uuid, never by bus order. What it costs is paid by every controller of this kind, the ones holding no system
+# volume included: the bootstrap set carries it on every architecture, and a boot-critical binding takes no stored
+# operator policy and no operator retry, since that policy would live on the volume it mounts.
+stage = "pinned"
+destination = "ahci.lsexe"
 providers = []
 
 [programs.driver]
-lifecycle = "controller"
+lifecycle = "boot-critical"
 # The same declaration every other DMA-mastering storage driver here carries, and the same cost,
 # which the threat model records: with no translating controller in the path this driver is a TCB
 # member for memory safety.
@@ -2007,12 +2013,18 @@ name = "nvme"
 owner = "drivers"
 role = "driver"
 linkage = "static"
-stage = "volume"
-destination = "drivers/nvme.lsexe"
+# PINNED AND BOOT-CRITICAL, BECAUSE THIS CONTROLLER CAN HOLD THE SYSTEM VOLUME. A driver loaded from the volume
+# cannot be the one that makes the volume reachable, so it is in the bootstrap set and binds in phase one beside
+# `virtio_blk`, and its provider is among the probes the system volume is chosen from - by the medium's pairing
+# uuid, never by bus order. What it costs is paid by every controller of this kind, the ones holding no system
+# volume included: the bootstrap set carries it on every architecture, and a boot-critical binding takes no stored
+# operator policy and no operator retry, since that policy would live on the volume it mounts.
+stage = "pinned"
+destination = "nvme.lsexe"
 providers = []
 
 [programs.driver]
-lifecycle = "controller"
+lifecycle = "boot-critical"
 # TRUSTED-UNTRANSLATED, THE SAME AS EVERY OTHER DMA-MASTERING STORAGE DRIVER HERE, and the reason is
 # worth stating rather than inheriting. `iommu-required` binds only where an enforcing controller
 # translates the device's addresses and REFUSES on a `no-iommu` machine, which is most profiles - so

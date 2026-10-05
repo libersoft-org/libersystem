@@ -276,10 +276,10 @@ mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
 # HID: a new contact begins at each contact identifier. Without that, every finger takes the LAST
 # one's position - one pointer that jumps rather than several fingers.
 mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
-	"							if let Some(done) = open.take()
-								&& written < out.len()" \
-	"							if let Some(done) = None::<Contact>
-								&& written < out.len()" \
+	"					if let Some((done, _)) = open.take()
+						&& written < out.len()" \
+	"					if let Some((done, _)) = None::<(Contact, u32)>
+						&& written < out.len()" \
 	each_contact_identifier_begins_a_contact_and_its_axes_are_its_own
 
 # HID: contact count says how many slots are real. A digitizer leaves the unused ones holding what

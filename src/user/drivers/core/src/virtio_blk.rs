@@ -490,9 +490,9 @@ fn reply_block(blk_server: u64, status: u32, xfer: u64) {
 	send_blocking(blk_server, &block::reply(status), xfer);
 }
 
-// Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE],
+// Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE][class u32 LE],
 // no handle - the size of the disk plus the most sectors one request moves here, so
 // the StorageService sizes its requests to the driver instead of a shared constant.
 fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
-	send_blocking(blk_server, &block::capacity_reply(bytes, max_sectors), 0);
+	send_blocking(blk_server, &block::capacity_reply(bytes, max_sectors, block::DeviceClass::VirtioBlk), 0);
 }

@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 162] = [
+const GATES: [(&str, &str); 163] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -436,6 +436,10 @@ const GATES: [(&str, &str); 162] = [
 	// it back on a kill and on a disable with zero stray register accesses, and gets a panic onto the wire past a
 	// driver that stopped draining. Its subject is the kernel's console and the driver above it.
 	("serial-handoff", "kernel"),
+	// THE SYSTEM VOLUME ON NVMe AND ON AHCI, end to end: the controllers' drivers bound before the volume, the volume
+	// chosen by its pairing, written and read back across a cold reboot, `lsblk` naming the device, and a volume no
+	// such driver reaches refused by name. Its subject is the drivers' staging and StorageService's choice.
+	("boot-volume-controllers", "userspace.build"),
 	// THE HARDWARE WATCHDOG, on development instances of its own: the declared registers, the three drivers, the
 	// watchdog service's choice and schedule, ServiceManager's liveness answer and its shutdown notice - with QEMU's
 	// run state as the oracle. Its subject is the kernel mechanism and the drivers and services above it.
@@ -905,7 +909,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 63] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 64] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -939,6 +943,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 63] = [
 	"typec-tcpci",
 	// And the COM1 handoff's, on a development instance of its own.
 	"serial-handoff",
+	// And the system volume's controllers, two boots each, a decoy and a refusal.
+	"boot-volume-controllers",
 	// And the hardware watchdog's, which boots four in turn.
 	"watchdog",
 	// And the firmware namespace's, which boots two.

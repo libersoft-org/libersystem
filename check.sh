@@ -184,6 +184,10 @@ declare -A GATES=(
 	# takes it back on a kill and on a disable, counting zero stray register accesses each time; `lab sh` answers
 	# through both paths; and a panic reaches the wire past a driver that stopped draining a full ring.
 	["serial-handoff"]="tools/check-serial-handoff.sh"
+	# THE SYSTEM VOLUME BEHIND NVMe AND BEHIND AHCI, with no virtio-blk system disk: per controller a file written and
+	# read back after a cold reboot with `lsblk` naming the controller; the paired volume chosen over an unpaired
+	# LiberFS decoy; and a paired volume no driver bound before it can reach refused by name.
+	["boot-volume-controllers"]="tools/check-boot-volume-controllers.sh"
 	# THE HARDWARE WATCHDOG on development instances of its own, one device at a time: the i6300esb, q35's TCO and a
 	# WDAT over it each armed by name and fed through three timeouts, and each expiring - `watchdog` in QEMU's run
 	# state under `-action watchdog=pause` - once ServiceManager stops answering `alive`; the i6300esb also through a

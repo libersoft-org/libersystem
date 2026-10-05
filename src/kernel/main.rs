@@ -481,15 +481,31 @@ fn boot_main() {
 	serial_println!("halting");
 }
 
+// THE HINT, AND THE EMPTY LINE THAT MAKES THE SHELL PRINT ITS FIRST PROMPT - ONCE A BOOT, from whichever of the two
+// places watching for the shell sees it listening first.
+//
+// ONCE, AND IN ONE PLACE. The idle hook below and `console_shell_loop` each sent their own newline, so the shell
+// answered with two prompts for one: the second came right after the first command was typed, and whatever drives the
+// console by its prompt - the gates' console driver, a person's script - typed every later line one command early,
+// into the command still running. The hint goes with the nudge so the line a driver waits on still comes first.
+#[cfg(not(test))]
+fn greet_shell() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static GREETED: AtomicBool = AtomicBool::new(false);
+	if console_input::shell_listening() && !GREETED.swap(true, Ordering::Relaxed) {
+		serial_println!("shell attached - type 'help', or 'exit' to halt");
+		console_input::feed_serial(b'\n');
+	}
+}
+
 // Pump the serial UART into the console input and nudge the shell's first prompt.
 // Registered as the scheduler's idle hook (sched::set_idle_hook) so it runs on the
 // BSP's idle spin: a polling driver (virtio-gpu's display-resize timer) keeps the BSP
 // in run_until_idle so it never reaches console_shell_loop's own pump, yet serial
-// input must stay live. The one-shot newline nudges the shell's first prompt once it
-// has attached (the keyboard path nudges the same way on its first key).
+// input must stay live. The first prompt is `greet_shell`'s (the keyboard path nudges
+// the same way on its first key).
 #[cfg(not(test))]
 fn serial_console_pump() {
-	use core::sync::atomic::{AtomicBool, Ordering};
 	// THE CONTROL PLANE HAS NO OWNER, SO THE MACHINE DOES NOT KEEP RUNNING AS THOUGH IT HAS ONE.
 	//
 	// Checked here because this hook runs on every idle pass whatever the shell is doing, and a
@@ -500,11 +516,7 @@ fn serial_console_pump() {
 		serial_println!("recovery: SystemManager ended after the system was up - the control plane has no owner, rebooting");
 		power::reset();
 	}
-	static NUDGED: AtomicBool = AtomicBool::new(false);
-	if !NUDGED.load(Ordering::Relaxed) && console_input::shell_listening() {
-		NUDGED.store(true, Ordering::Relaxed);
-		console_input::feed_serial(b'\n');
-	}
+	greet_shell();
 	// Drain the whole serial RX FIFO each wake: the BSP now halts between idle passes
 	// (~100 Hz timer wakes) instead of busy-spinning, so polling one byte per pass could
 	// let a fast paste overrun the 16-byte UART FIFO. Reading until empty keeps serial
@@ -567,9 +579,8 @@ pub(crate) fn console_shell_loop() {
 		if listening && !ever_attached {
 			ever_attached = true;
 			// AND THE HINT WHEN THERE IS SOMETHING TO HINT AT, with the nudge that makes the shell
-			// print its first prompt.
-			serial_println!("shell attached - type 'help', or 'exit' to halt");
-			console_input::feed_serial(b'\n');
+			// print its first prompt - unless the idle hook got there first.
+			greet_shell();
 		}
 		if !listening && ever_attached {
 			break;

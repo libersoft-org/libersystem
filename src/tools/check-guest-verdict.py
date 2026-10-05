@@ -393,7 +393,9 @@ fi
             block, replacements = re.subn(r'virtio_disk="\$\((qemu_prepare_system_disk [^\n]*?)\)"', r'\1', block)
             self.assertEqual(replacements, 1)
         if unchecked_substitution:
-            attach = re.search(r'^\t\tqemu_attach_virtio_blk qemu_args "\$run_disk"[^\n]*\n', block, re.M)
+            # x86_64 attaches through `qemu_attach_system_disk`, which puts the disk on the controller a run
+            # names; the ports attach virtio-blk directly. Either is the call that must not run.
+            attach = re.search(r'^\t\tqemu_attach_(?:virtio_blk|system_disk) qemu_args "\$run_disk"[^\n]*\n', block, re.M)
             self.assertIsNotNone(attach, architecture)
             attach = attach.group(0).replace('"$run_disk"', '"$(qemu_run_disk "$virtio_disk")"')
             block = block.splitlines(keepends=True)[0] + attach + '\tfi\n'
@@ -411,6 +413,11 @@ qemu_run_disk() {
     return 1
 }
 qemu_attach_virtio_blk() { printf 'ATTACHED <%s>\n' "$2"; }
+qemu_attach_system_disk() { printf 'ATTACHED <%s>\n' "$2"; }
+# The persistent-disk choice in front of the copy: with no `RUN_DISK` it IS the private copy, which is the
+# acquisition under test, and with no paired volume beside the image there is nothing else to copy from.
+qemu_run_system_disk() { qemu_run_disk "$1"; }
+QEMU_BUILD_DIR=/nonexistent
 caller() {
     local volume_image=volume volume_pkg=volume virtio_disk=disk virtio_opts="" dma_fixture=0
 ''' + block + '    echo "CONTINUED"\n}\ncaller\n'

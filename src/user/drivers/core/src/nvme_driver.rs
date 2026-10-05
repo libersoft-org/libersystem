@@ -757,7 +757,7 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 				block::OP_WRITE => serve_write(controller, endpoint, lba, count, handle),
 				block::OP_CAPACITY => {
 					let bytes = controller.namespace.blocks * controller.namespace.block_bytes as u64;
-					send_blocking(endpoint, &block::capacity_reply(bytes, controller.most_blocks()), 0);
+					send_blocking(endpoint, &block::capacity_reply(bytes, controller.most_blocks(), block::DeviceClass::Nvme), 0);
 				}
 				block::OP_FLUSH => {
 					let ok = controller.flush().is_ok();

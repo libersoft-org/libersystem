@@ -1146,7 +1146,7 @@ pub fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, 
 				reply(server, if ok { block::STATUS_OK } else { block::STATUS_ERR }, 0);
 			}
 			block::OP_CAPACITY => {
-				send_blocking(server, &block::capacity_reply(device.capacity, most), 0);
+				send_blocking(server, &block::capacity_reply(device.capacity, most, block::DeviceClass::UsbAttachedScsi), 0);
 			}
 			block::OP_FLUSH => {
 				let ok = flush(hc, hids, dev, device);

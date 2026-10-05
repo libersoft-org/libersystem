@@ -154,7 +154,7 @@ struct LiberFs<T> { uuid: [u8; 16], device: PhantomData<T> }
 impl<T> LiberFs<T> { fn uuid(&self) -> [u8; 16] { self.uuid } }
 #[derive(Clone, Copy)]
 enum RootMountError { Missing, Ambiguous }
-fn mount_system_volume(channel: u64) -> Option<LiberFs<ChannelBlockDevice>> {
+fn mount_system_volume(channel: u64, _say: bool) -> Option<LiberFs<ChannelBlockDevice>> {
     let id = match channel { 11 | 13 => 1, 12 | 22 => 2, _ => return None };
     Some(LiberFs { uuid: [id; 16], device: PhantomData })
 }

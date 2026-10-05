@@ -487,7 +487,10 @@ impl SnapshotInfo {
 /// the disk), whether transparent compression is on for new writes, whether the
 /// mount is read-only (a snapshot mount, or degraded by on-disk damage), and the name
 /// of the filesystem serving the volume ("liberfs", "fat16", "exfat", "iso9660",
-/// "udf", "archive"). Foreign backends track no pool numbers and report zero bytes.
+/// "udf", "archive"). Foreign backends track no pool numbers and report zero bytes. And the
+/// DEVICE the volume is on, as its block driver names it ("virtio-blk", "nvme", "ahci",
+/// "sdhci", "virtio-scsi", "usb-storage", "usb-uas"; "block" for a driver that does not say;
+/// "memory" for a volume held in memory) - the one thing nothing else on the wire tells.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeStatus {
 	pub label: String,
@@ -496,6 +499,7 @@ pub struct VolumeStatus {
 	pub compression: bool,
 	pub read_only: bool,
 	pub filesystem: String,
+	pub device: String,
 }
 
 impl VolumeStatus {
@@ -540,6 +544,7 @@ impl VolumeStatus {
 		w.boolean(self.compression)?;
 		w.boolean(self.read_only)?;
 		w.bytes_lp(self.filesystem.as_bytes())?;
+		w.bytes_lp(self.device.as_bytes())?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<VolumeStatus> {
@@ -549,7 +554,8 @@ impl VolumeStatus {
 		let compression = r.boolean()?;
 		let read_only = r.boolean()?;
 		let filesystem = r.string_lp()?;
-		Some(VolumeStatus { label, total_bytes, free_bytes, compression, read_only, filesystem })
+		let device = r.string_lp()?;
+		Some(VolumeStatus { label, total_bytes, free_bytes, compression, read_only, filesystem, device })
 	}
 }
 
@@ -4966,6 +4972,9 @@ impl VolumeStatus {
 		out.push(',');
 		out.push_str("\"filesystem\":");
 		crate::codec::json_escape(&self.filesystem, out);
+		out.push(',');
+		out.push_str("\"device\":");
+		crate::codec::json_escape(&self.device, out);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4995,10 +5004,13 @@ impl VolumeStatus {
 		out.push_str(", ");
 		out.push_str("filesystem=");
 		out.push_str(&self.filesystem);
+		out.push_str(", ");
+		out.push_str("device=");
+		out.push_str(&self.device);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::map(out, 7);
 		crate::codec::cbor::text(out, "label");
 		crate::codec::cbor::text(out, &self.label);
 		crate::codec::cbor::text(out, "total-bytes");
@@ -5011,6 +5023,8 @@ impl VolumeStatus {
 		crate::codec::cbor::boolean(out, self.read_only);
 		crate::codec::cbor::text(out, "filesystem");
 		crate::codec::cbor::text(out, &self.filesystem);
+		crate::codec::cbor::text(out, "device");
+		crate::codec::cbor::text(out, &self.device);
 	}
 }
 

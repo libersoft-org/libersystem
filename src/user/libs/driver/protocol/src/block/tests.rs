@@ -77,7 +77,7 @@ fn a_reply_too_short_to_hold_a_status_is_refused() {
 
 #[test]
 fn a_capacity_reply_round_trips_through_the_bytes_the_servers_send() {
-	let encoded = capacity_reply(4096 * 512, 128);
+	let encoded = capacity_reply(4096 * 512, 128, DeviceClass::Nvme);
 	assert_eq!(&encoded[0..4], &STATUS_OK.to_le_bytes(), "the status leads");
 	assert_eq!(decode_capacity(&encoded), Some(Capacity { bytes: 4096 * 512, max_sectors: 128 }));
 }
@@ -86,7 +86,7 @@ fn a_capacity_reply_round_trips_through_the_bytes_the_servers_send() {
 fn a_transfer_bound_above_what_the_wire_carries_saturates_rather_than_truncating() {
 	// A truncated bound publishes a SMALL number: the client then sends requests the server refuses
 	// for a reason it never stated. Saturation publishes the largest number the wire can say.
-	let encoded = capacity_reply(1 << 40, (u32::MAX as u64) + 7);
+	let encoded = capacity_reply(1 << 40, (u32::MAX as u64) + 7, DeviceClass::Nvme);
 	assert_eq!(decode_capacity(&encoded).expect("still a capacity").max_sectors, u32::MAX);
 }
 
@@ -94,11 +94,11 @@ fn a_transfer_bound_above_what_the_wire_carries_saturates_rather_than_truncating
 fn a_failed_capacity_query_carries_no_size_and_is_not_read_as_one() {
 	// The eight bytes where a size would be are whatever the server's reply buffer held. A client
 	// that read them anyway would mount a medium whose size it invented.
-	let mut failed = capacity_reply(1234 * 512, 64);
+	let mut failed = capacity_reply(1234 * 512, 64, DeviceClass::Nvme);
 	failed[0..4].copy_from_slice(&STATUS_ERR.to_le_bytes());
 	assert_eq!(decode_capacity(&failed), None, "a failed query answers with no capacity at all");
 
-	let mut refused = capacity_reply(1234 * 512, 64);
+	let mut refused = capacity_reply(1234 * 512, 64, DeviceClass::Nvme);
 	refused[0..4].copy_from_slice(&STATUS_INVALID.to_le_bytes());
 	assert_eq!(decode_capacity(&refused), None);
 }
@@ -109,7 +109,7 @@ fn a_capacity_reply_too_short_is_refused_even_when_its_status_says_ok() {
 	// otherwise read twelve bytes past the message.
 	assert_eq!(decode_capacity(&reply(STATUS_OK)), None);
 	for short in 0..CAPACITY_REPLY_LEN {
-		let whole = capacity_reply(512, 1);
+		let whole = capacity_reply(512, 1, DeviceClass::Nvme);
 		assert_eq!(decode_capacity(&whole[..short]), None, "{short} bytes is not a capacity reply");
 	}
 }
@@ -127,7 +127,7 @@ fn the_total_decoder_and_the_checked_one_are_the_same_parser() {
 fn a_server_predating_the_per_request_bound_still_reports_a_size() {
 	// Twelve bytes is what a server that only ever sent status-and-size answers. StorageService
 	// reads the size and falls back to its own bound; it must not be left with no size at all.
-	let whole = capacity_reply(2048 * 512, 64);
+	let whole = capacity_reply(2048 * 512, 64, DeviceClass::Nvme);
 	let old: &[u8] = &whole[..CAPACITY_SIZE_LEN];
 	assert_eq!(decode_capacity_bytes(old), Some(2048 * 512));
 	assert_eq!(decode_capacity(old), None, "but the bound is genuinely absent rather than zero");
@@ -136,10 +136,34 @@ fn a_server_predating_the_per_request_bound_still_reports_a_size() {
 #[test]
 fn a_short_or_failed_reply_yields_no_size_either() {
 	for short in 0..CAPACITY_SIZE_LEN {
-		let whole = capacity_reply(512, 1);
+		let whole = capacity_reply(512, 1, DeviceClass::Nvme);
 		assert_eq!(decode_capacity_bytes(&whole[..short]), None, "{short} bytes carries no size");
 	}
-	let mut failed = capacity_reply(512, 1);
+	let mut failed = capacity_reply(512, 1, DeviceClass::Nvme);
 	failed[0..4].copy_from_slice(&STATUS_ERR.to_le_bytes());
 	assert_eq!(decode_capacity_bytes(&failed), None);
+}
+
+#[test]
+fn a_capacity_reply_names_its_device_and_an_older_or_failed_one_names_nothing() {
+	let whole = capacity_reply(2048 * 512, 64, DeviceClass::Ahci);
+	assert_eq!(decode_device_class(&whole), DeviceClass::Ahci);
+	assert_eq!(decode_capacity(&whole), Some(Capacity { bytes: 2048 * 512, max_sectors: 64 }), "the class follows the bound and moves nothing in front of it");
+	assert_eq!(decode_device_class(&whole[..CAPACITY_REPLY_LEN]), DeviceClass::Unnamed, "a server predating the field");
+	let mut failed = whole;
+	failed[0..4].copy_from_slice(&STATUS_ERR.to_le_bytes());
+	assert_eq!(decode_device_class(&failed), DeviceClass::Unnamed, "a failed query's bytes are not read");
+	assert_eq!(DeviceClass::from_wire(99), DeviceClass::Unnamed, "a class this client does not know");
+	assert_eq!(DeviceClass::Unnamed.name(), "block");
+	for class in [
+		DeviceClass::VirtioBlk,
+		DeviceClass::Nvme,
+		DeviceClass::Ahci,
+		DeviceClass::Sdhci,
+		DeviceClass::VirtioScsi,
+		DeviceClass::UsbMassStorage,
+		DeviceClass::UsbAttachedScsi,
+	] {
+		assert_eq!(DeviceClass::from_wire(class as u32), class, "{} round-trips", class.name());
+	}
 }

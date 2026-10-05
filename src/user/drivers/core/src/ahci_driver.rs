@@ -731,7 +731,7 @@ unsafe fn take(bootstrap: u64, bind: &common::Bind, serving: &mut common::Servin
 			block::OP_WRITE => place_write(controller, endpoint, lba, count, handle, flight),
 			block::OP_CAPACITY => {
 				let bytes = controller.disk.sectors * controller.disk.sector_bytes as u64;
-				send_blocking(endpoint, &block::capacity_reply(bytes, controller.most_sectors()), 0);
+				send_blocking(endpoint, &block::capacity_reply(bytes, controller.most_sectors(), block::DeviceClass::Ahci), 0);
 				Took::Answered
 			}
 			// A FLUSH IS NOT A QUEUED COMMAND AND MUST NOT MEET ONE. The specification forbids

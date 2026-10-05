@@ -57,6 +57,53 @@ pub const CAPACITY_REPLY_LEN: usize = 16;
 // the service, which made it a property of that client rather than of the protocol; it is named here
 // so the two lengths mean different things on purpose rather than by accident.
 pub const CAPACITY_SIZE_LEN: usize = 12;
+// AND AFTER THE BOUND, WHAT KIND OF DEVICE ANSWERS: `[status u32][bytes u64][max sectors u32][class u32]`. Nothing
+// else on this wire says it, and a volume's service is otherwise left to guess - `lsblk` printed `virtio-blk` for the
+// system volume whatever disk it was on. A server predating the field answers sixteen bytes, read as `Unnamed`.
+pub const CAPACITY_CLASS_LEN: usize = 20;
+
+// The device classes a block server names. A number on the wire, a name at the edge: the wire stays fixed-size and
+// a client that does not know a newer class still reads the size and the bound in front of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceClass {
+	Unnamed = 0,
+	VirtioBlk = 1,
+	Nvme = 2,
+	Ahci = 3,
+	Sdhci = 4,
+	VirtioScsi = 5,
+	UsbMassStorage = 6,
+	UsbAttachedScsi = 7,
+}
+
+impl DeviceClass {
+	pub fn from_wire(value: u32) -> DeviceClass {
+		match value {
+			1 => DeviceClass::VirtioBlk,
+			2 => DeviceClass::Nvme,
+			3 => DeviceClass::Ahci,
+			4 => DeviceClass::Sdhci,
+			5 => DeviceClass::VirtioScsi,
+			6 => DeviceClass::UsbMassStorage,
+			7 => DeviceClass::UsbAttachedScsi,
+			_ => DeviceClass::Unnamed,
+		}
+	}
+
+	// The name a person reads. `block` for a server that did not say: true, and nothing more is known.
+	pub fn name(self) -> &'static str {
+		match self {
+			DeviceClass::Unnamed => "block",
+			DeviceClass::VirtioBlk => "virtio-blk",
+			DeviceClass::Nvme => "nvme",
+			DeviceClass::Ahci => "ahci",
+			DeviceClass::Sdhci => "sdhci",
+			DeviceClass::VirtioScsi => "virtio-scsi",
+			DeviceClass::UsbMassStorage => "usb-storage",
+			DeviceClass::UsbAttachedScsi => "usb-uas",
+		}
+	}
+}
 
 // One request as sent. `count` is THE WIRE VALUE, not an admitted one: admission is
 // `drivers::blk::request_range` and it refuses rather than clamps, so a decoder that quietly
@@ -126,11 +173,12 @@ pub fn reply(status: u32) -> [u8; REPLY_LEN] {
 // The capacity reply. `max_sectors` is saturated into the `u32` the wire carries rather than
 // truncated: a server whose bound exceeds four billion sectors would otherwise publish a small
 // number, and a client would then send requests the server refuses for a reason it never stated.
-pub fn capacity_reply(bytes: u64, max_sectors: u64) -> [u8; CAPACITY_REPLY_LEN] {
-	let mut out = [0u8; CAPACITY_REPLY_LEN];
+pub fn capacity_reply(bytes: u64, max_sectors: u64, class: DeviceClass) -> [u8; CAPACITY_CLASS_LEN] {
+	let mut out = [0u8; CAPACITY_CLASS_LEN];
 	out[0..4].copy_from_slice(&STATUS_OK.to_le_bytes());
 	out[4..12].copy_from_slice(&bytes.to_le_bytes());
 	out[12..16].copy_from_slice(&(max_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
+	out[16..20].copy_from_slice(&(class as u32).to_le_bytes());
 	out
 }
 
@@ -174,6 +222,17 @@ pub fn decode_capacity(bytes: &[u8]) -> Option<Capacity> {
 	let mut most = [0u8; 4];
 	most.copy_from_slice(&bytes[12..16]);
 	Some(Capacity { bytes: size, max_sectors: u32::from_le_bytes(most) })
+}
+
+// The device class from a capacity reply: `Unnamed` for one too short to carry it - a server predating the field -
+// and for a status that is not `STATUS_OK`, whose remaining bytes are whatever the server's buffer held.
+pub fn decode_device_class(bytes: &[u8]) -> DeviceClass {
+	if bytes.len() < CAPACITY_CLASS_LEN || decode_status(bytes) != Some(STATUS_OK) {
+		return DeviceClass::Unnamed;
+	}
+	let mut class = [0u8; 4];
+	class.copy_from_slice(&bytes[16..20]);
+	DeviceClass::from_wire(u32::from_le_bytes(class))
 }
 
 #[cfg(test)]

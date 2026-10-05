@@ -71,7 +71,11 @@ impl Provider { fn name(&self) -> &[u8] { b"fixture" } }
 struct Subscriber { producer: u64, kind: u16, seq: u32 }
 struct Catalogue { entries: Vec<Option<Provider>>, subscribers: [Option<Subscriber>; MAX_SUBSCRIBERS] }
 impl Catalogue { fn new() -> Self { Self { entries: Vec::new(), subscribers: [const { None }; MAX_SUBSCRIBERS] } } }
-struct CatalogueView<'a> { catalogue: &'a mut Catalogue, nodes: &'a [Node] }
+// WHAT A CATALOGUE CONNECTION MAY REACH: every kind here - the fixtures subscribe on the inventory connection.
+#[derive(Clone, Copy)]
+struct Scope;
+impl Scope { fn inventory() -> Self { Scope } fn admits(&self, _: u16) -> bool { true } fn bits(&self) -> u32 { 0 } }
+struct CatalogueView<'a> { catalogue: &'a mut Catalogue, nodes: &'a [Node], scope: Scope }
 fn provider_kind_from_wire(kind: u16) -> u16 { kind }
 fn subscribed_kind(request: &[u8]) -> Option<u16> { request.first().map(|&kind| kind as u16) }
 struct Entry { name: &'static [u8], artifact: &'static [u8], requires: &'static [u16] }
@@ -111,9 +115,14 @@ fn tick_heartbeats(_: &mut [Node], _: &mut [u8]) -> u64 { 0 }
 fn tick_handshakes(_: &mut [Node], soonest: u64) -> u64 { soonest }
 fn drain_channel(_: &mut Node, _: &mut [u8]) {}
 fn settle_dependencies(_: &mut [Node], _: &mut Catalogue) -> usize { 0 }
+// The firmware-connection needs a fixture node never has, and the lines a refusal prints.
+fn needs_met(_: &Node, _: &Catalogue) -> bool { true }
+fn say_line(_: &[&[u8]]) {}
+fn driver_text(name: &[u8]) -> Vec<u8> { name.to_vec() }
+fn decimal(_: u64, _: &mut [u8; 20]) -> usize { 0 }
 struct Package;
 impl Package { fn lookup(&self, _: &[u8]) -> Option<&[u8]> { Some(&[]) } }
-fn begin_bind(node: &mut Node, _: &u64, _: &[u8], _: &[u8], _: u64, _: u64, _: u64, _: u64) { node.record.state = BindingState::Binding; RT.with_borrow_mut(|rt| rt.binds += 1); }
+fn begin_bind(node: &mut Node, _: &u64, _: &[u8], _: &[u8], _: u64, _: u64, _: u64, _: u64, _: Option<()>) { node.record.state = BindingState::Binding; RT.with_borrow_mut(|rt| rt.binds += 1); }
 unsafe fn boot_retry_pass(nodes: &mut [Node], catalogue: &mut Catalogue) {
     let first_node = 0; let package = Package; let power = 0; let console_input = 0; let device_privilege = 0;
     RETRY_LOOPS
@@ -186,7 +195,7 @@ fn main() { unsafe {
                 RT.with_borrow_mut(|rt| *rt = Runtime::default());
                 let mut catalogue = Catalogue::new(); catalogue.entries = (0..count).map(|at| provider(at, 1)).collect();
                 catalogue.entries.push(provider(count, 2));
-                open_subscription(1, &mut catalogue, &[], &[1], &mut wire::Handles::new());
+                open_subscription(1, Scope::inventory(), &mut catalogue, &[], &[1], &mut wire::Handles::new());
                 let subscriber = catalogue.subscribers.iter().flatten().next().expect("complete snapshot must retain the live stream");
                 assert_eq!(subscriber.seq, count as u32);
                 RT.with_borrow_mut(|rt| {

@@ -3186,7 +3186,7 @@ impl FileSystem for DiskFs {
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let block: u64 = liberfs::BLOCK_SIZE as u64;
-		Ok(VolumeStatus { label: String::from_utf8_lossy(self.fs.label()).into_owned(), total_bytes: self.fs.num_blocks() * block, free_bytes: self.fs.free_blocks() * block, compression: self.fs.compression(), read_only: self.fs.is_read_only(), filesystem: String::from("liberfs") })
+		Ok(VolumeStatus { label: String::from_utf8_lossy(self.fs.label()).into_owned(), total_bytes: self.fs.num_blocks() * block, free_bytes: self.fs.free_blocks() * block, compression: self.fs.compression(), read_only: self.fs.is_read_only(), filesystem: String::from("liberfs"), device: block_device(self.chan) })
 	}
 	fn write_file(&mut self, name: &[u8], data: &[u8]) -> Result<(), Error> {
 		self.fs.write_file(name, data).map_err(map_fs_err)
@@ -3324,7 +3324,7 @@ impl FileSystem for FatBacking {
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let (kind, total, free): (&'static str, u64, u64) = self.run(|fs| Ok((fs.kind_name(), fs.total_bytes(), fs.free_bytes()?)))?;
-		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: free, compression: false, read_only: false, filesystem: String::from(kind) })
+		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: free, compression: false, read_only: false, filesystem: String::from(kind), device: block_device(self.chan) })
 	}
 	fn write_file(&mut self, name: &[u8], data: &[u8]) -> Result<(), Error> {
 		self.run(|fs| fs.write_file(name, data))
@@ -3404,7 +3404,7 @@ impl FileSystem for MemFs {
 		self.fs.stream_abort();
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
-		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs") })
+		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs"), device: String::from("memory") })
 	}
 	fn write_file(&mut self, name: &[u8], data: &[u8]) -> Result<(), Error> {
 		self.fs.write_file(name, data).map_err(map_fs_err)
@@ -3684,7 +3684,7 @@ impl FileSystem for IsoFs {
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
-		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") })
+		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660"), device: block_device(self.chan) })
 	}
 }
 
@@ -3743,7 +3743,7 @@ impl FileSystem for UdfFs {
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
-		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") })
+		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf"), device: block_device(self.chan) })
 	}
 }
 
@@ -3809,7 +3809,7 @@ impl FileSystem for ArchiveFs {
 		Ok(self.len as u64)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
-		Ok(VolumeStatus { label: String::new(), total_bytes: self.len as u64, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive") })
+		Ok(VolumeStatus { label: String::new(), total_bytes: self.len as u64, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive"), device: String::from("memory") })
 	}
 	fn write_file(&mut self, _name: &[u8], _data: &[u8]) -> Result<(), Error> {
 		Err(Error::Denied)
@@ -4132,7 +4132,8 @@ fn classify_block(chan: u64) -> u8 {
 	if chan == 0 {
 		return FORMAT_UNKNOWN;
 	}
-	if mount_system_volume(chan).is_some() {
+	// QUIET: a disk that is not a LiberFS volume is an answer here, not a refusal.
+	if mount_system_volume(chan, false).is_some() {
 		return FORMAT_LIBERFS;
 	}
 	if Iso9660::mount_checked(IsoBlockDevice { chan }).is_ok() {
@@ -4182,12 +4183,17 @@ fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Result
 	// The probe list includes the primary provider through an independent connection. Inspect
 	// that list alone when present so one physical volume is not counted twice.
 	let candidates = if probes.is_empty() { core::slice::from_ref(&primary) } else { probes };
+	// ONE CANDIDATE SAYS WHY IT IS NOT A SYSTEM VOLUME AS IT IS LOOKED AT; SEVERAL SAY NOTHING UNTIL NONE IS. With the
+	// controllers that can hold the volume all bound in phase one, most probes are disks that are not the system
+	// volume and were never meant to be - each one printing "vol://system NOT mounted" told a reader the volume was
+	// missing on a boot that mounted it. Only when no candidate carries the chosen volume is every refusal worth a line.
+	let single = candidates.iter().filter(|&&chan| chan != 0).count() <= 1;
 	let mut selected = None;
 	for &chan in candidates {
 		if chan == 0 {
 			continue;
 		}
-		let Some(fs) = mount_system_volume(chan) else { continue };
+		let Some(fs) = mount_system_volume(chan, single) else { continue };
 		if want.is_some_and(|uuid| fs.uuid() != uuid) {
 			continue;
 		}
@@ -4196,10 +4202,15 @@ fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Result
 		}
 		selected = Some((fs, chan));
 	}
+	if selected.is_none() && !single {
+		for &chan in candidates.iter().filter(|&&chan| chan != 0) {
+			let _ = mount_system_volume(chan, true);
+		}
+	}
 	selected.ok_or(RootMountError::Missing)
 }
 
-fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
+fn mount_system_volume(block_client: u64, say: bool) -> Option<LiberFs<ChannelBlockDevice>> {
 	// What the disk IS, before deciding what may be written to it. Exactly two answers lead
 	// anywhere near a format, and the difference between them and the rest is the difference
 	// between a blank disk and somebody else's.
@@ -4234,7 +4245,9 @@ fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>>
 		// where a person is standing. That is the manual step, it already exists, and it is the
 		// only one.
 		partition::Disk::Blank => {
-			print(b"storage: vol://system NOT mounted: the disk carries no filesystem. Nothing was changed - write a system volume image to it deliberately; this system does not format disks by itself\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk carries no filesystem. Nothing was changed - write a system volume image to it deliberately; this system does not format disks by itself\n");
+			}
 			return None;
 		}
 		// Everything below means the whole-device fallback is not available, because the
@@ -4242,24 +4255,32 @@ fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>>
 		// MBR, the GPT header, the entry array and every partition the disk carries.
 		// Refusing costs a boot; the alternative cost the disk.
 		partition::Disk::GptWithoutLiberFs => {
-			print(b"storage: vol://system NOT mounted: the disk has a GPT with no LiberFS partition. Nothing was changed - create one, or attach the right disk\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk has a GPT with no LiberFS partition. Nothing was changed - create one, or attach the right disk\n");
+			}
 			return None;
 		}
 		// TWO CANDIDATES AND NOTHING TO CHOOSE BETWEEN THEM. Mounting either would be mounting
 		// whichever the entry order happens to name first, which a partitioning tool or a clone can
 		// change without touching either filesystem - and this mount is writable.
 		partition::Disk::AmbiguousLiberFs => {
-			print(b"storage: vol://system NOT mounted: the disk names MORE THAN ONE LiberFS partition and nothing says which is the system volume. Nothing was changed - remove or retype the one that is not\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk names MORE THAN ONE LiberFS partition and nothing says which is the system volume. Nothing was changed - remove or retype the one that is not\n");
+			}
 			return None;
 		}
 		partition::Disk::MbrWithoutLiberFs => {
-			print(b"storage: vol://system NOT mounted: the disk carries an MBR partition table. Nothing was changed - its partitions are still there; repartition it deliberately if that is what you want\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk carries an MBR partition table. Nothing was changed - its partitions are still there; repartition it deliberately if that is what you want\n");
+			}
 			return None;
 		}
 		partition::Disk::ForeignFilesystem { name } => {
-			print(b"storage: vol://system NOT mounted: the disk carries a filesystem written straight onto the medium (");
-			print(name.as_bytes());
-			print(b"), with no partition table. Nothing was changed - copy the data off before reusing this disk\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk carries a filesystem written straight onto the medium (");
+				print(name.as_bytes());
+				print(b"), with no partition table. Nothing was changed - copy the data off before reusing this disk\n");
+			}
 			return None;
 		}
 		// The one that closes the hole this crate was written for and then left open by a
@@ -4268,23 +4289,33 @@ fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>>
 		// evidence of an empty disk - and a raw ext4 begins one sector past where the probe
 		// used to stop looking.
 		partition::Disk::UnknownData => {
-			print(b"storage: vol://system NOT mounted: the disk carries data this build does not recognise, and no partition table. Nothing was changed - erase it deliberately if it really is scrap\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk carries data this build does not recognise, and no partition table. Nothing was changed - erase it deliberately if it really is scrap\n");
+			}
 			return None;
 		}
 		partition::Disk::HybridMbrAndGpt => {
-			print(b"storage: vol://system NOT mounted: the disk carries BOTH an MBR partition table and a GPT. Nothing was changed - two tables describing one disk disagree by construction, and nothing here can say which you meant\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk carries BOTH an MBR partition table and a GPT. Nothing was changed - two tables describing one disk disagree by construction, and nothing here can say which you meant\n");
+			}
 			return None;
 		}
 		partition::Disk::NoMemory => {
-			print(b"storage: vol://system NOT mounted: this machine could not hold the disk's partition table while checking it. Nothing was changed - the disk may be perfectly fine\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: this machine could not hold the disk's partition table while checking it. Nothing was changed - the disk may be perfectly fine\n");
+			}
 			return None;
 		}
 		partition::Disk::CorruptGpt => {
-			print(b"storage: vol://system NOT mounted: the disk's GPT does not verify, in neither the primary nor the backup copy. Nothing was changed - this is a damaged partition table, not a blank disk\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk's GPT does not verify, in neither the primary nor the backup copy. Nothing was changed - this is a damaged partition table, not a blank disk\n");
+			}
 			return None;
 		}
 		partition::Disk::Io => {
-			print(b"storage: vol://system NOT mounted: the disk did not answer while its partition table was read. Nothing was changed - check the device and reboot\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the disk did not answer while its partition table was read. Nothing was changed - check the device and reboot\n");
+			}
 			return None;
 		}
 	};
@@ -4306,7 +4337,9 @@ fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>>
 		// and the probe is damaged. It used to fall through to a format, which destroyed exactly
 		// the volume the contradiction was about.
 		Err(MountError::Unformatted) => {
-			print(b"storage: vol://system NOT mounted: the container looks like a LiberFS volume and does not mount as one. Nothing was changed - this is damage, not an empty disk\n");
+			if say {
+				print(b"storage: vol://system NOT mounted: the container looks like a LiberFS volume and does not mount as one. Nothing was changed - this is damage, not an empty disk\n");
+			}
 			return None;
 		}
 		Err(reason) => {
@@ -4671,6 +4704,24 @@ fn block_capacity(block_client: u64) -> Result<u64, Error> {
 	match recv_blocking(block_client, &mut rep) {
 		Received::Message { len, handle } if handle == 0 => block::decode_capacity_bytes(&rep[..len]).ok_or(Error::Again),
 		_ => Err(Error::Again),
+	}
+}
+
+// WHAT KIND OF DEVICE A VOLUME IS ON, as its block driver names it in the capacity reply's trailing class - `block`
+// for a driver that does not say, or one that cannot answer now. Asked when a status is, which is rare, so it is not
+// kept: a removable medium's driver can change under a volume.
+fn block_device(block_client: u64) -> String {
+	if block_client == 0 {
+		return String::from(block::DeviceClass::Unnamed.name());
+	}
+	let req = block::Request { op: block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	if !send_blocking(block_client, &req, 0) {
+		return String::from(block::DeviceClass::Unnamed.name());
+	}
+	let mut rep: [u8; block::CAPACITY_CLASS_LEN] = [0u8; block::CAPACITY_CLASS_LEN];
+	match recv_blocking(block_client, &mut rep) {
+		Received::Message { len, handle } if handle == 0 => String::from(block::decode_device_class(&rep[..len]).name()),
+		_ => String::from(block::DeviceClass::Unnamed.name()),
 	}
 }
 

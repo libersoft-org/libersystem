@@ -496,7 +496,7 @@ impl volume::Service for VolStub {
 	}
 
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
-		Ok(VolumeStatus { label: String::from("system"), total_bytes: 0x100000, free_bytes: 0x80000, compression: false, read_only: false, filesystem: String::from("liberfs") })
+		Ok(VolumeStatus { label: String::from("system"), total_bytes: 0x100000, free_bytes: 0x80000, compression: false, read_only: false, filesystem: String::from("liberfs"), device: String::from("nvme") })
 	}
 
 	fn set_compression(&mut self, _enabled: bool) -> Result<(), Error> {

@@ -81,6 +81,13 @@ mod proto { pub mod system {
     pub enum PolicyVerb {Retry,Enable,Disable,Select}
 } }
 fn candidate_position(_:&Node,_:&[u8])->Option<usize> {None}
+// What a node carries that the claim stage never reads: its firmware connections' needs, the sleep's question and
+// answer, and the publishers a child binding is handed.
+struct Need;
+fn needs_of(_:&DeviceInfo)->Vec<Need> {Vec::new()}
+#[derive(Clone,Copy,PartialEq,Eq)] enum SleepAsked {None}
+#[derive(Clone,Copy)] struct SleepAnswer;
+struct Publisher;
 PRODUCTION_TYPES
 impl Node { NODE_METHODS }
 impl Attempt { fn new()->Self {Self {held:driver_binding::Holdings::new(),key:ClaimKey::default()}} BEGIN_TEARDOWN }
@@ -88,7 +95,7 @@ struct Syscalls;
 PRODUCTION_FUNCTIONS
 // Only the claim stage is under test: keep its actual pre-observation, admission, match and
 // successful ownership statements. ELF parsing and later channel/spawn effects are outside it.
-unsafe fn begin_bind(node:&mut Node,info:&DeviceInfo,elf:&[u8],driver_name:&[u8],key_producer:u64,power:u64,console_input:u64,device_privilege:u64)->BindStart {
+unsafe fn begin_bind(node:&mut Node,info:&DeviceInfo,elf:&[u8],driver_name:&[u8],key_producer:u64,power:u64,console_input:u64,device_privilege:u64,_children:Option<(&mut Catalogue,&[Publisher])>)->BindStart {
     unsafe {
         let teardown_deadline=1000;
         let attempts_left=!node.retry_once && may_try_again(&node.incident,node.attempt);
@@ -117,8 +124,8 @@ fn setup(pre:Option<u32>,post:Option<u32>,errno:i64,prior:u32,manual:bool,count:
     node
 }
 fn start(node:&mut Node,standing:bool) {
-    unsafe { if standing {start_candidate(node,1,None,0,0,0,1,&Catalogue,&mut [0]);}
-    else {let info=node.info;begin_bind(node,&info,&IMAGE,b"fixture",0,0,0,1);} }
+    unsafe { if standing {start_candidate(node,1,None,0,0,0,1,&mut Catalogue,&[],&mut [0]);}
+    else {let info=node.info;begin_bind(node,&info,&IMAGE,b"fixture",0,0,0,1,None);} }
 }
 #[test]
 fn quarantine_after_refusal_is_terminal_across_callers_and_budgets() {

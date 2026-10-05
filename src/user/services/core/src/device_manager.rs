@@ -5077,15 +5077,17 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 				// went on running - which is the opposite of what the operator asked for.
 				//
 				// THE TWO ARE TOLD APART BY THE STATE THEY ARE RAISED IN, which each injector
-				// already requires: `Online` for the watchdog, `Stopping` for the planned stop. So
-				// the mark-and-leave is guarded on `Online` and everything else falls through to
-				// the one teardown route, which is what the arm did before.
+				// already requires: `Online` for the watchdog, `Stopping` for the planned stop. The
+				// REDUCER reads that state and admits the watchdog's with no transition and no cause
+				// - `reduce_event` says why - so the mark-and-leave is that decision, and everything
+				// else falls through to the one teardown route, which is what the arm did before.
+				// It read the record's state here once, a second decision beside the reducer's.
 				//
 				// FOUND BY `planned_stop_deadlines`, a fixture that runs at startup in the
 				// DEVELOPMENT build and asserts the node ends `Disabled` with no binding. The
 				// ordinary suites never run it, so 440 tests on three ports had nothing to say
 				// about this: the first thing that did was a cold scenario refusing to boot.
-				if node.record.state == BindingState::Online {
+				if next_state.is_none() && cause.is_none() {
 					let missed: u32 = node.beat.resume(clock(), driver_protocol::heartbeat_period(node.beat.deadline()));
 					if missed.is_power_of_two() {
 						let mut count = [0u8; 20];

@@ -551,11 +551,11 @@ pub fn reply_block(blk_server: u64, status: u32, xfer: u64) {
 	send_blocking(blk_server, &block::reply(status), xfer);
 }
 
-// Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE],
+// Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE][class u32 LE],
 // no handle - the same wire contract driver.virtio-blk serves; the cap here is the
 // TRB data-stage bound.
 fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
-	let reply: [u8; 16] = block::capacity_reply(bytes, max_sectors);
+	let reply: [u8; block::CAPACITY_CLASS_LEN] = block::capacity_reply(bytes, max_sectors, block::DeviceClass::UsbMassStorage);
 	send_blocking(blk_server, &reply, 0);
 }
 

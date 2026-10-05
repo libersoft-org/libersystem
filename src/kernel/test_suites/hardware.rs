@@ -911,8 +911,9 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 	// than assume away: the q35 chipset carries its own SATA controller with a CD-ROM on it, and the
 	// driver refuses ATAPI by signature. So this walks every AHCI function the table holds and takes
 	// the first that reports READY, which is what DeviceManager does with the same two.
-	let (volume, _package) = scenario_packages().expect("boot modules should be present");
-	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/ahci.lsexe")).expect("the ahci.lsexe driver should be staged on the volume under drivers/");
+	// A PINNED DRIVER, so it is in the bootstrap set: the init package carries it under its own name.
+	let (_volume, package) = scenario_packages().expect("boot modules should be present");
+	let elf = package.lookup(b"ahci.lsexe").expect("the ahci.lsexe driver should be in the init package, where a pinned driver lives");
 
 	let mut controllers: alloc::vec::Vec<(abi::DeviceInfo, u64, u64, usize)> = alloc::vec::Vec::new();
 	for i in 0..device::count() {
@@ -958,6 +959,7 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 	sched::run_until_idle();
 	let cap_reply = blk.recv().expect("the capacity reply should arrive");
 	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
+	assert_eq!(driver_protocol::block::decode_device_class(&cap_reply.bytes), driver_protocol::block::DeviceClass::Ahci, "the capacity reply names the device class, which is what tells a volume's service what disk it is on");
 	// The number comes from IDENTIFY DEVICE's 48-bit sector count, not from anything this test said.
 	assert_eq!(reported.bytes, 8 * 1024 * 1024, "the disk should report the attached medium's real size");
 
@@ -1059,8 +1061,9 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	// ONE RESOURCE, NOT FOUR. This driver polls its completion queue, so it never asks for the
 	// interrupt the xHCI harness below must mint; an absent resource is a state it can see rather
 	// than a message it waits for, which is what `BIND` stating its own count is for.
-	let (volume, _package) = scenario_packages().expect("boot modules should be present");
-	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/nvme.lsexe")).expect("the nvme.lsexe driver should be staged on the volume under drivers/");
+	// A PINNED DRIVER, so it is in the bootstrap set: the init package carries it under its own name.
+	let (_volume, package) = scenario_packages().expect("boot modules should be present");
+	let elf = package.lookup(b"nvme.lsexe").expect("the nvme.lsexe driver should be in the init package, where a pinned driver lives");
 
 	// THE LAST NVMe CONTROLLER ON THE BUS, AND NOT THE FIRST, WHICH IS A THREE-TARGET FACT.
 	//
@@ -1101,6 +1104,7 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	sched::run_until_idle();
 	let cap_reply = blk.recv().expect("the capacity reply should arrive");
 	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
+	assert_eq!(driver_protocol::block::decode_device_class(&cap_reply.bytes), driver_protocol::block::DeviceClass::Nvme, "the capacity reply names the device class, which is what tells a volume's service what disk it is on");
 	// EIGHT MEGABYTES, which is the SECOND scratch medium the harness attaches - the last NVMe
 	// controller on every one of the three machines. See the selection above for why it is the last
 	// and not the first.
@@ -1621,11 +1625,16 @@ fn a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing() {
 	let count = crate::device::count();
 	let mut unresolved = 0usize;
 	for index in 0..count {
-		let Some(entry) = crate::device::with(index, |d| (d.device_type, d.transport, d.bar_phys, d.bar_len, d.msix_cap, d.vendor, d.bus, d.dev, d.func)) else {
+		let Some(entry) = crate::device::with(index, |d| (d.device_type, d.transport, d.bar_phys, d.bar_len, d.msix_cap, d.vendor, d.product, d.bus, d.dev, d.func)) else {
 			panic!("device {index} is counted and cannot be read - the count and the table disagree");
 		};
-		let (device_type, transport, bar_phys, bar_len, msix_cap, vendor, bus, dev, func) = entry;
+		let (device_type, transport, bar_phys, bar_len, msix_cap, vendor, product, bus, dev, func) = entry;
 		if device_type != abi::DEVICE_TYPE_UNKNOWN as u16 {
+			continue;
+		}
+		// A FUNCTION A DECLARED ROW NAMES IS ONE SOMETHING BINDS: the row resolves the BAR its driver is handed - the
+		// i6300esb watchdog this machine carries is one - so it is not the case this test is about.
+		if crate::declared::row_for(vendor, product).is_some() {
 			continue;
 		}
 		unresolved += 1;

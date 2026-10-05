@@ -43,6 +43,10 @@
 #   RUN_DISK=   a system disk that outlives the run: created if absent - from the volume the medium is
 #               paired with, where there is one - and used as it is if present, so two boots can share
 #               one disk for a cold-reboot proof
+#   SYSTEM_DISK= virtio | nvme | ahci | virtio-scsi - the controller the x86_64 system disk sits behind (default
+#               virtio). The others are how a gate boots the system from a disk that is not virtio-blk: the
+#               same disk, on a controller of its own, so the scratch media the suite attaches stay where
+#               its oracles look for them
 #   LIBER_RUN_MODE=test|development|public|gate
 #             THE RUN MODE, and the one carrier of it. It is REQUIRED: the outermost entry point
 #             that knows sets it - `test.sh` says `test`, `run.sh` says `public`, the lab says
@@ -637,6 +641,25 @@ qemu_attach_virtio_blk() {
 	else
 		arr+=(-device "virtio-blk-pci,drive=$drive_id")
 	fi
+}
+
+# THE SYSTEM DISK ON THE CONTROLLER THE RUN NAMES (`SYSTEM_DISK`). `virtio` is the ordinary attachment; the others
+# put the same disk behind an NVMe controller, an AHCI controller or a virtio-scsi one of its own. Two of those can
+# hold the system volume - their drivers bind before it is mounted - and the third cannot, which is the boot that has
+# to refuse by name rather than run from something else.
+qemu_attach_system_disk() {
+	local -n system_args=$1
+	local file="$2" legacy="${3:-}"
+	case "${SYSTEM_DISK:-virtio}" in
+	virtio) qemu_attach_virtio_blk system_args "$file" vblk "$legacy" ;;
+	nvme) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "nvme,drive=vblk,serial=libersystem-system") ;;
+	ahci) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "ahci,id=systemsata" -device "ide-hd,drive=vblk,bus=systemsata.0") ;;
+	virtio-scsi) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "virtio-scsi-pci,id=systemscsi" -device "scsi-hd,drive=vblk,bus=systemscsi.0") ;;
+	*)
+		echo "qemu-run: SYSTEM_DISK=${SYSTEM_DISK} is none of virtio, nvme, ahci, virtio-scsi" >&2
+		return 1
+		;;
+	esac
 }
 
 qemu_attach_virtio_net() {
@@ -2130,7 +2153,7 @@ qemu_run_x86_64() {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
-		qemu_attach_virtio_blk qemu_args "$run_disk" vblk "$virtio_opts"
+		qemu_attach_system_disk qemu_args "$run_disk" "$virtio_opts" || exit 1
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.

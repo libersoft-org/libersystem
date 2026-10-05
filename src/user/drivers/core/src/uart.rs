@@ -118,6 +118,17 @@ impl<R: Registers> Uart<R> {
 		}
 	}
 
+	// Whether the receive interrupt is wanted: off while what was received has nowhere to go, so the bytes stay in
+	// the FIFO and the far end waits for room instead of losing them; on again once there is room. The transmit
+	// enable is kept either way.
+	pub fn receive_interrupt(&mut self, on: bool) {
+		let ier = if on { self.ier | IER_RX_AVAILABLE } else { self.ier & !IER_RX_AVAILABLE };
+		if ier != self.ier {
+			self.ier = ier;
+			self.regs.write(IER, ier);
+		}
+	}
+
 	// As much of `bytes` as the transmitter takes now - a FIFO load when the holding register is empty, and
 	// nothing otherwise. Answers how many.
 	pub fn put(&mut self, bytes: &[u8]) -> usize {
@@ -190,6 +201,11 @@ impl Held {
 
 	pub fn is_empty(&self) -> bool {
 		self.len == 0
+	}
+
+	// How many more bytes the bound keeps.
+	pub fn room(&self) -> usize {
+		HELD_INPUT - self.len
 	}
 
 	pub fn bytes(&self) -> &[u8] {

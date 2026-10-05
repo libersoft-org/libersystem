@@ -104,6 +104,7 @@ fn init_package_starts_system_manager() {
 	// A test that passed a tight one would be timing an emulator, which is what the profile gates
 	// found out the hard way.
 	const TEST_BOOT_WINDOW: u64 = 100_000;
+	let before = root_inventory();
 	let (kernel_ep, _manager) = spawn_system_manager(arch::apic::ticks().saturating_add(TEST_BOOT_WINDOW), TEST_BOOT_WINDOW).expect("SystemManager should start from the init package");
 	// A BOUNDED DRAIN, AND THIS IS THE ONE THAT USED TO HANG THE WHOLE SUITE. `run_until_idle` returns
 	// when the run queue empties and the next deadline is further out than the drain's own; a booted
@@ -134,7 +135,7 @@ fn init_package_starts_system_manager() {
 	// refused on, and this boot comes up with a link over USB. The no-provider state still has a
 	// gate of its own: the `dma-degraded` scenario boots without the suite's devices and requires
 	// the "up without a link" line, which is why the adapter is attached in test mode only.
-	let online_reports: [&[u8]; 24] = [
+	let online_reports: [&[u8]; 41] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online (vol://system)",
@@ -164,6 +165,27 @@ fn init_package_starts_system_manager() {
 		b"ConsoleService: online",
 		b"SystemGraphService: online",
 		b"Shell: online",
+		// THE DESTINATION SERVICES AND THE PLATFORM ONES, which this list did not know either (added 2026-10-04):
+		// seventeen services joined the manifest after the font catalogue, each reporting online, and each fell into
+		// the lifecycle bucket - seventeen of them filled its twelve places before one lifecycle drill report had
+		// arrived, so the collection ended early and the count failed on reports that were not lifecycle ones at all.
+		b"AcpiService: online",
+		b"AdminService: online",
+		b"BluetoothBondStore: online",
+		b"BluetoothService: online",
+		b"BmcService: online",
+		b"CameraService: online",
+		b"HibernationService: online",
+		b"MediaImportService: online",
+		b"MidiService: online",
+		b"ModemService: online",
+		b"PowerService: online",
+		b"ProcessorPowerService: online",
+		b"SmartcardService: online",
+		b"SpoolService: online",
+		b"TpmService: online",
+		b"TypeCService: online",
+		b"WatchdogService: online",
 	];
 	let lifecycle_reports: [&[u8]; 12] = [
 		b"ServiceManager: routed volumes read correctly",
@@ -245,8 +267,12 @@ fn init_package_starts_system_manager() {
 		// that hangs with the console's first frame as its last line, which is what this was.
 		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
 		while let Ok(message) = kernel_ep.recv() {
-			if online_reports.iter().any(|expected| message.bytes.as_slice() == *expected) {
-				actual_online_reports.push(message.bytes);
+			// A REPORT WITH ITS DETAILS AFTER " - " IS STILL ITS SERVICE'S ONLINE REPORT: the ACPI service names its
+			// tables, the processor service its cores and the watchdog its policy, and what they say depends on the
+			// machine. It is counted as the report it begins with.
+			let named = online_reports.iter().find(|expected| message.bytes.as_slice() == **expected || (message.bytes.starts_with(expected) && message.bytes[expected.len()..].starts_with(b" - ")));
+			if let Some(expected) = named {
+				actual_online_reports.push(expected.to_vec());
 			} else {
 				actual_lifecycle_reports.push(message.bytes);
 			}
@@ -278,9 +304,68 @@ fn init_package_starts_system_manager() {
 	let mut expected_online_reports = online_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
 	expected_online_reports.sort();
 	assert_eq!(actual_online_reports, expected_online_reports, "every manifest service reports online; independent ready services may use any deterministic tie order");
-	assert_eq!(actual_lifecycle_reports.len(), lifecycle_reports.len(), "every lifecycle report must arrive");
+	// WHAT ARRIVED, IN THE FAILURE: a count alone says something extra came or something did not, and not which.
+	let arrived = actual_lifecycle_reports.iter().map(|report| alloc::string::String::from_utf8_lossy(report).into_owned()).collect::<alloc::vec::Vec<_>>();
+	assert_eq!(actual_lifecycle_reports.len(), lifecycle_reports.len(), "every lifecycle report must arrive, and nothing else; arrived={arrived:?}");
 	let expected_lifecycle_reports = lifecycle_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
 	assert_eq!(actual_lifecycle_reports, expected_lifecycle_reports, "lifecycle drill reports must preserve their causal order");
+	end_chain(&before);
+}
+
+// WHAT THE ROOT DOMAIN HOLDS NOW - its live processes and its child Domains, by koid - so a test that boots the chain
+// can tell what it brought up from what was there before it.
+fn root_inventory() -> (alloc::vec::Vec<u64>, alloc::vec::Vec<u64>) {
+	use object::KernelObject;
+	let root = sched::root_domain();
+	let processes = root.live_processes().iter().map(|process| process.header().koid()).collect();
+	let mut domains = alloc::vec::Vec::new();
+	let mut batch: [Option<alloc::sync::Arc<object::domain::Domain>>; 16] = Default::default();
+	let mut from = 0;
+	loop {
+		let (written, next) = root.children_from(from, &mut batch);
+		if written == 0 {
+			break;
+		}
+		domains.extend(batch[..written].iter_mut().filter_map(Option::take).map(|domain| domain.header().koid()));
+		from = next;
+	}
+	(processes, domains)
+}
+
+// AND THE CHAIN ENDED, rather than left running under every test after the one that booted it. Its services pace
+// themselves on timers, so an unbounded drain in any later test never returned: the suite timed out on the first test
+// after this one that used one, which no run had reached while this test failed earlier. The managers in the root
+// Domain are terminated first, so nothing is left to restart what the Domain kills take down.
+fn end_chain(before: &(alloc::vec::Vec<u64>, alloc::vec::Vec<u64>)) {
+	use object::KernelObject;
+	let root = sched::root_domain();
+	for process in root.live_processes() {
+		if !before.0.contains(&process.header().koid()) {
+			process.terminate();
+		}
+	}
+	let mut batch: [Option<alloc::sync::Arc<object::domain::Domain>>; 16] = Default::default();
+	let mut from = 0;
+	loop {
+		let (written, next) = root.children_from(from, &mut batch);
+		if written == 0 {
+			break;
+		}
+		for domain in batch[..written].iter_mut().filter_map(Option::take) {
+			if !before.1.contains(&domain.header().koid()) {
+				domain.kill();
+			}
+		}
+		from = next;
+	}
+	let give_up = arch::apic::ticks().saturating_add(3000);
+	while arch::apic::ticks() < give_up {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		if root.live_processes().iter().all(|process| before.0.contains(&process.header().koid()) || process.is_terminated()) {
+			return;
+		}
+	}
+	panic!("the booted chain did not end within its bound after its Domains were killed");
 }
 
 tagged_test!(a_control_plane_that_lost_its_owner_is_not_reported_healthy, [Boot, Process], id = "kernel.boot.a_control_plane_that_lost_its_owner_is_not_reported_healthy", covers = ["kernel"]);
@@ -876,7 +961,9 @@ fn no_selected_root_refuses_a_valid_block_volume() {
 	let mut disk = StorageHarness::build_tiny_fixture();
 	for _ in 0..100_000 {
 		pump_block_stand_in(&block, &mut disk, 512 * 1024);
-		sched::run_until_idle();
+		// A BOUNDED DRAIN, for the reason `init_package_starts_system_manager` gives: a booted chain that paces itself on
+		// timers - and the one that test brought up is still running its services - never lets the unbounded one return.
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
 		assert!(boot.recv().is_err(), "RootSelection::None must never report a promoted system volume");
 		if boot.is_peer_closed() {
 			return;
