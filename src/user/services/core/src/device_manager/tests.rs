@@ -97,7 +97,7 @@ pub fn pending_shutdown_outcomes() {
 		node.record.move_to(BindingState::Binding, None);
 		node.record.move_to(BindingState::Stopping, None);
 		let deadline = clock().saturating_add(1);
-		node.teardown = Some(Teardown { pending: driver_binding::Pending { process: event, claim: 0, domain: 0, exited: false, state: Some(driver_binding::CLAIM_FREE) }, deadline, landed: None, cause: FailureCause::Stopped, retrying: false, planned_stop: true, intent: driver_binding::StopIntent::Shutdown });
+		node.teardown = Some(Teardown { pending: driver_binding::Pending { process: event, claim: 0, domain: 0, exited: false, state: Some(driver_binding::CLAIM_FREE) }, deadline, landed: None, cause: FailureCause::Stopped, retrying: false, planned_stop: true, intent: driver_binding::StopIntent::Shutdown, began_at: 0 });
 		let mut catalogue = Catalogue::new();
 		let mut bytes = [0; 128];
 		settle_shutdown_node(&mut node, &mut catalogue, &mut bytes, deadline);

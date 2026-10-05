@@ -900,6 +900,11 @@ pub struct BindingRecord {
 	/// A PLATFORM DEVICE'S NUMBER - the kernel's row for a device the firmware describes - and none for a PCI
 	/// function, whose identity is `bus`, `dev` and `func`. Appended.
 	pub platform: Option<u32>,
+	/// THE RUNNING DRIVER'S MEMORY, from its own Domain's counters: what it holds now and the most it has held since
+	/// the Domain was made. Zero where no driver runs. The incident report captures the same two when a binding goes
+	/// wrong; these are for one that has not, so a driver's footprint can be read without breaking it. Appended.
+	pub memory_used: u64,
+	pub memory_peak: u64,
 }
 
 impl BindingRecord {
@@ -959,6 +964,8 @@ impl BindingRecord {
 				w.u8(0)?;
 			}
 		}
+		w.u64(self.memory_used)?;
+		w.u64(self.memory_peak)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<BindingRecord> {
@@ -975,7 +982,9 @@ impl BindingRecord {
 		let providers = r.u32()?;
 		let resources = r.u32()?;
 		let platform = if r.tag()? { Some(r.u32()?) } else { None };
-		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources, platform })
+		let memory_used = r.u64()?;
+		let memory_peak = r.u64()?;
+		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources, platform, memory_used, memory_peak })
 	}
 }
 
@@ -8885,6 +8894,12 @@ impl BindingRecord {
 				out.push_str("null");
 			}
 		}
+		out.push(',');
+		out.push_str("\"memory-used\":");
+		let _ = write!(out, "{}", self.memory_used);
+		out.push(',');
+		out.push_str("\"memory-peak\":");
+		let _ = write!(out, "{}", self.memory_peak);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -8934,10 +8949,16 @@ impl BindingRecord {
 				out.push('-');
 			}
 		}
+		out.push_str(", ");
+		out.push_str("memory-used=");
+		let _ = write!(out, "{}", self.memory_used);
+		out.push_str(", ");
+		out.push_str("memory-peak=");
+		let _ = write!(out, "{}", self.memory_peak);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 13);
+		crate::codec::cbor::map(out, 15);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "bus");
@@ -8971,6 +8992,10 @@ impl BindingRecord {
 				crate::codec::cbor::null(out);
 			}
 		}
+		crate::codec::cbor::text(out, "memory-used");
+		crate::codec::cbor::uint(out, self.memory_used as u64);
+		crate::codec::cbor::text(out, "memory-peak");
+		crate::codec::cbor::uint(out, self.memory_peak as u64);
 	}
 }
 

@@ -2241,6 +2241,9 @@ struct Node {
 	// it: the incident report carries a silence interval, and only when something has already gone
 	// wrong. This is the ordinary case, on the ordinary path, for every driver at every boot.
 	bind_at: u64,
+	// WHEN THE LAST DRIVER'S END BEGAN, while a restart is on its way: the next READY says how long the node was
+	// without one - the recovery time a driver item records - and clears it.
+	ended_at: u64,
 	// WHICH of the chosen entry's rules matched this device. See `BindingRecord.rule`.
 	matched_rule: u32,
 	// How many resources the current bind granted: the MMIO window, an interrupt where the entry
@@ -2338,6 +2341,8 @@ struct Teardown {
 	// teardown has answered rather than before it has run.
 	planned_stop: bool,
 	intent: driver_binding::StopIntent,
+	// The tick the binding's end began - where the time the node spends without a driver starts.
+	began_at: u64,
 }
 
 // WHAT WAS TRUE WHEN A BINDING WENT WRONG, taken BEFORE the process is gone.
@@ -2376,7 +2381,7 @@ impl Node {
 		// A DEVICE THE FIRMWARE DESCRIBES IS NAMED BY ITS PLATFORM NUMBER - its row - and never by the zero
 		// address it reports, which is the host bridge's.
 		let id = if info.platform.kind == ROW_KIND_PLATFORM { BindingId::platform(index as u32, 0) } else { BindingId::new(info.bus, info.dev, info.func, 0) };
-		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), needs: needs_of(info), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, sleep_asked: SleepAsked::None, sleep_answer: None, disabled_by_policy: false }
+		Node { id, index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), node_request: 0, acpi_granted: (0, 0), needs: needs_of(info), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, ended_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, sleep_asked: SleepAsked::None, sleep_answer: None, disabled_by_policy: false }
 	}
 
 	// A manual grant is separate from the automatic count and survives only until one claim.
@@ -2535,7 +2540,7 @@ impl Attempt {
 			offers.close_all();
 			out
 		};
-		Teardown { pending, deadline, landed: None, cause: FailureCause::TeardownUnconfirmed, retrying: false, planned_stop: false, intent: driver_binding::StopIntent::Fault }
+		Teardown { pending, deadline, landed: None, cause: FailureCause::TeardownUnconfirmed, retrying: false, planned_stop: false, intent: driver_binding::StopIntent::Fault, began_at: clock() }
 	}
 }
 
@@ -3541,7 +3546,7 @@ fn resolve_teardown(node: &mut Node, driver_name: &[u8], now: u64) -> Option<Bin
 		driver_binding::Settled::Unconfirmed => BindingState::Quarantined,
 	};
 	let (cause, landed, retrying) = (teardown.cause, teardown.landed, teardown.retrying);
-	let (planned_stop, intent) = (teardown.planned_stop, teardown.intent);
+	let (planned_stop, intent, began_at) = (teardown.planned_stop, teardown.intent, teardown.began_at);
 	node.teardown = None;
 	// Cleanup of an empty transaction only proves that this manager owns nothing.
 	// A kernel quarantine observed at acquisition is terminal even when that cleanup succeeds.
@@ -3580,6 +3585,7 @@ fn resolve_teardown(node: &mut Node, driver_name: &[u8], now: u64) -> Option<Bin
 	}
 	if retrying {
 		node.record.move_to(BindingState::Backoff, Some(cause));
+		node.ended_at = began_at;
 		print(b"DeviceManager: restarting ");
 		print_driver_name(driver_name);
 		print(b"\n");
@@ -3937,6 +3943,19 @@ fn drain_frames(node: &mut Node, buf: &mut [u8]) {
 								n += 1;
 							}
 							print(&line[..n]);
+						}
+						// AND, AFTER A RESTART, HOW LONG THE NODE WAS WITHOUT A DRIVER: from the tick its last driver's end
+						// began - the teardown, the backoff and this bind together - which is the recovery a driver item
+						// records and the one figure no other line gives.
+						if node.ended_at != 0 {
+							let mut number = [0u8; 20];
+							let digits = decimal(clock().saturating_sub(node.ended_at), &mut number);
+							print(b"DeviceManager: ");
+							print_driver_name(node.driver_name());
+							print(b" recovered ");
+							print(&number[..digits]);
+							print(b" tick(s) after its last driver ended\n");
+							node.ended_at = 0;
 						}
 						node.push(BindingEvent::Ready { generation });
 					}
@@ -6237,7 +6256,8 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 	fn bindings(&mut self) -> Vec<proto::system::BindingRecord> {
 		self.nodes
 			.iter()
-			.map(|node| proto::system::BindingRecord {
+			.map(|node| (node, node.binding.as_ref().filter(|binding| binding.domain != 0).and_then(|binding| domain_stats(binding.domain))))
+			.map(|(node, domain)| proto::system::BindingRecord {
 				index: node.index as u32,
 				bus: node.id.bus as u32,
 				dev: node.id.dev as u32,
@@ -6253,6 +6273,8 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 				providers: self.catalogue.count_for_binding(node.id) as u32,
 				resources: node.granted_resources,
 				platform: node.id.platform,
+				memory_used: domain.as_ref().map_or(0, |domain| domain.memory_used),
+				memory_peak: domain.as_ref().map_or(0, |domain| domain.memory_peak),
 			})
 			.collect()
 	}

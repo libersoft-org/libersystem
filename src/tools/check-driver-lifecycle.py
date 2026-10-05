@@ -73,7 +73,7 @@ struct Node {
     last_opcode: u16, last_frame_at: u64, beat: Heartbeat, offers: Offers, incident: Incident,
     candidates: Vec<&'static Entry>, candidate: usize, running: Option<usize>, preferred: Option<usize>,
     disabled_by_policy: bool, retry_pending: bool, restart_requested: bool, retry_once: bool,
-    retry_at: u64, selection_pending: bool, bind_at: u64,
+    retry_at: u64, selection_pending: bool, bind_at: u64, ended_at: u64,
     // The paths these tables do not take still name them: the firmware connections' needs, the number a node
     // asked its driver with, and the sleep's question and answer.
     needs: Vec<Need>, node_request: u64, sleep_asked: SleepAsked, sleep_answer: Option<SleepAnswer>,
@@ -91,7 +91,7 @@ impl Node {
             last_opcode: 0, last_frame_at: 0, beat: Heartbeat::default(), offers: Offers, incident: Incident::open(),
             candidates: vec![entry], candidate: 0, running: Some(0), preferred: None,
             disabled_by_policy: false, retry_pending: false, restart_requested: false, retry_once: false,
-            retry_at: 0, selection_pending: false, bind_at: 0,
+            retry_at: 0, selection_pending: false, bind_at: 0, ended_at: 0,
             needs: Vec::new(), node_request: 0, sleep_asked: SleepAsked::None, sleep_answer: None }
     }
     fn push(&mut self, event: BindingEvent) -> bool { self.queue.push(event) }

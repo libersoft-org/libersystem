@@ -239,6 +239,11 @@ record binding-record {
 	/// A PLATFORM DEVICE'S NUMBER - the kernel's row for a device the firmware describes - and none for a PCI
 	/// function, whose identity is `bus`, `dev` and `func`. Appended.
 	platform:    option<u32>,
+	/// THE RUNNING DRIVER'S MEMORY, from its own Domain's counters: what it holds now and the most it has held since
+	/// the Domain was made. Zero where no driver runs. The incident report captures the same two when a binding goes
+	/// wrong; these are for one that has not, so a driver's footprint can be read without breaking it. Appended.
+	memory-used: u64,
+	memory-peak: u64,
 }
 
 /// The Device service contract: enumerate the devices the kernel discovered on the
