@@ -553,6 +553,74 @@ enum Scope {
 	Gamepad,
 	/// The activity signal's root and its connections: `input-activity.watch` and nothing else.
 	Activity,
+	/// The system keys' root and its connections: `system-keys.watch` and nothing else - DisplayService's alone.
+	SystemKeys,
+}
+
+// THE SYSTEM KEYS (`liber:input@1/system-keys`): the consumer page's brightness pair, taken off the raw key stream
+// BEFORE ordinary delivery and before the protected session's check - they never enter `key-event`, and the person at
+// the protected screen can still make it readable - and streamed to DisplayService, which owns the brightness. A
+// press is one item; releases are not sent.
+#[derive(Default)]
+struct SystemKeys {
+	watchers: Vec<(u64, u32)>,
+}
+
+// How deep a watcher's stream is: presses at human rate, and a reader that stops is cut off rather than queued for.
+const SYSTEM_KEY_DEPTH: u64 = 16;
+
+impl SystemKeys {
+	fn press(&mut self, key: proto::system::SystemKey) {
+		for (stream, seq) in self.watchers.iter_mut() {
+			let mut frame = [0u8; 32];
+			let mut frame_handles = Handles::new();
+			let sent = proto::system::system_keys::watch_frame(*seq, &key, &mut frame, &mut frame_handles).is_some_and(|n| try_send(*stream, &frame[..n], 0));
+			*seq = seq.wrapping_add(1);
+			if !sent && matches!(try_recv(*stream, &mut [0u8; 8]), Polled::Closed) {
+				close(*stream);
+				*stream = 0;
+			}
+		}
+		self.watchers.retain(|(stream, _)| *stream != 0);
+	}
+
+	fn open(&mut self, client: u64, request: &[u8]) {
+		let mut request_handle = Handles::new();
+		let Some((corr, _)) = proto::system::system_keys::watch_open(&mut SystemKeysWatch, request, &mut request_handle) else { return };
+		let Some((producer, consumer)) = channel_with_depth(SYSTEM_KEY_DEPTH) else {
+			send_blocking(client, &corr.to_le_bytes(), 0);
+			return;
+		};
+		if !send_blocking(client, &corr.to_le_bytes(), consumer) {
+			close(producer);
+			return;
+		}
+		self.watchers.push((producer, 0));
+	}
+}
+
+struct SystemKeysWatch;
+
+impl proto::system::system_keys::Service for SystemKeysWatch {
+	fn watch(&mut self) -> Vec<proto::system::SystemKey> {
+		Vec::new()
+	}
+}
+
+// THE FIVE-BYTE RAW FRAME of a system key - `[page u16][usage u16][state u8]`, beside the keyboard page's three-byte one -
+// as the key, when it is one of the set and pressed. A release is `Some(None)`: taken off the stream, and nothing sent.
+fn system_key(raw: &[u8]) -> Option<Option<proto::system::SystemKey>> {
+	if raw.len() != 5 {
+		return None;
+	}
+	let page = u16::from_le_bytes([raw[0], raw[1]]);
+	let usage = u16::from_le_bytes([raw[2], raw[3]]);
+	let key = match (page, usage) {
+		(0x0c, 0x6f) => proto::system::SystemKey::BrightnessUp,
+		(0x0c, 0x70) => proto::system::SystemKey::BrightnessDown,
+		_ => return Some(None),
+	};
+	Some((raw[4] != 0).then_some(key))
 }
 
 // THE ACTIVITY SIGNAL (`liber:input@1/input-activity`): the last input from ANY source - keyboards, pointers, touch
@@ -1149,14 +1217,23 @@ fn map_event(raw: &[u8]) -> Option<PointerEvent> {
 	Some(PointerEvent { col, row, buttons })
 }
 
-// THE BLUETOOTH MOUSE, AS ONE MORE POINTER SOURCE.
+// THE BLUETOOTH INPUT DEVICES, AS MORE SOURCES OF EVERY KIND.
 //
 // Every other pointer reaches this service already folded by its driver into an absolute, normalised
-// position. A Bluetooth mouse has no driver in that sense - its reports arrive decoded from
-// BluetoothService over the profile channel - so the fold happens here, with the drivers' own range,
-// and what comes out is the same five-byte record every other pointer produces. From there it takes
-// the SAME path: the cell mapping, the ring, and the forward to ConsoleService. There is no second
-// pointer path for it to diverge from.
+// position, and every other keyboard's keys arrive on the merged key sink. A Bluetooth device has no driver
+// in that sense - its reports arrive decoded from BluetoothService over the profile channel, one stream a
+// device trusted for input, at most eight - so the fold and the routing happen here, and what comes out is
+// what every other device produces: the pointer's five-byte record on the one pointer path, a key on the
+// ordinary key path (NEVER the trusted sink: a Bluetooth keyboard's Ctrl+Alt+F12 stays reserved and is neither
+// secure attention nor delivered), a brightness key on the system-key path, and a gamepad on the gamepad set,
+// this stream its source.
+//
+// AND THE TEXT CONSOLE, which the ordinary key stream does not reach: its keystrokes come from the kernel's
+// console input, which only a holder of a ConsoleInputSource feeds. This service holds one for the Bluetooth
+// keyboards and feeds it through the drivers' own cooking - `drivers::keys`, the layout, the locks, the escapes
+// and the reserved keys - one modifier and lock state a device, as each USB keyboard has its own. It holds no
+// SystemPower connection, so a Bluetooth keyboard's Ctrl+Alt+Delete and Power key act on nothing. Nothing is
+// fed while a protected session is up.
 //
 // REACHED BY NAME THROUGH THE BROKER, NOT HANDED OVER AT BRING-UP - and that is not a preference. A
 // role from a service is a dependency on it in this manifest, with no optional form, and a dependency
@@ -1169,13 +1246,12 @@ fn map_event(raw: &[u8]) -> Option<PointerEvent> {
 // answers a resolve only once it supervises; a blocking resolve here would park the pointer path until
 // then, or for ever on a harness with no broker at all. So the request is sent, the bootstrap channel
 // joins the wait, and the answer is taken when it comes. Until then - and on a machine whose broker
-// never answers - this slot is simply empty, and every other pointer works as it always did.
+// never answers - this slot is simply empty, and every other device works as it always did.
 struct Bluetooth {
 	// The bootstrap channel, which is also the broker channel a resolve travels on.
 	broker: u64,
 	profile: u64,
-	stream: u64,
-	pointer: service_logic::hogp::Pointer,
+	inputs: Vec<BluetoothInput>,
 	retry_at: u64,
 	// A resolve has been sent and not answered.
 	resolving: bool,
@@ -1184,8 +1260,24 @@ struct Bluetooth {
 	refused: bool,
 }
 
+// One device's stream, and what this service keeps for it: its own pointer fold, its own modifier and lock
+// state for the console, and the keyboard-page keys it holds, so its loss lets every one of them go.
+struct BluetoothInput {
+	controller: u32,
+	peer: proto::system::PeerAddress,
+	stream: u64,
+	pointer: service_logic::hogp::Pointer,
+	mods: drivers::keys::Mods,
+	held: [u16; MAX_HELD],
+	holding: usize,
+}
+
+// At most eight devices, as the milestone states; and the keys one of them may hold down at once.
+const MAX_BLUETOOTH_INPUTS: usize = 8;
+const MAX_HELD: usize = 16;
+
 // How long to wait before trying again: two seconds. Long enough that a peer or a stack that is not
-// there costs almost nothing, short enough that a person switching a mouse on does not wonder whether
+// there costs almost nothing, short enough that a person switching a device on does not wonder whether
 // it worked.
 const BLUETOOTH_RETRY_TICKS: u64 = 200;
 
@@ -1194,8 +1286,8 @@ impl Bluetooth {
 		!self.refused
 	}
 
-	// The retry: ask the broker for the profile authority if there is none, or open a stream from the
-	// first enabled peer if there is.
+	// The retry: ask the broker for the profile authority if there is none, or open a stream from every
+	// trusted peer that has none.
 	fn retry(&mut self) {
 		self.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
 		if self.profile == 0 {
@@ -1221,9 +1313,16 @@ impl Bluetooth {
 			}
 			_ => return,
 		};
-		let Some(first) = peers.first() else { return };
-		if let Some(Ok(stream)) = client.open_mouse(&first.controller, &first.peer) {
-			self.stream = stream;
+		for peer in peers {
+			if self.inputs.len() >= MAX_BLUETOOTH_INPUTS {
+				break;
+			}
+			if self.inputs.iter().any(|input| input.controller == peer.controller && input.peer == peer.peer) {
+				continue;
+			}
+			if let Some(Ok(stream)) = client.open_input(&peer.controller, &peer.peer) {
+				self.inputs.push(BluetoothInput { controller: peer.controller, peer: peer.peer, stream, pointer: service_logic::hogp::Pointer::new(), mods: drivers::keys::Mods::default(), held: [0; MAX_HELD], holding: 0 });
+			}
 		}
 	}
 
@@ -1256,34 +1355,98 @@ impl Bluetooth {
 		}
 	}
 
-	// Drain the stream into the one pointer path, as the same five-byte record a driver sends.
-	fn drain(&mut self, state: &mut Input, forward: u64, buf: &mut [u8]) {
+	// Drain one device's stream onto the paths every other device's input takes.
+	fn drain(&mut self, at: usize, state: &mut Input, system_keys: &mut SystemKeys, forward: u64, buf: &mut [u8]) {
+		let stream = self.inputs[at].stream;
 		loop {
-			match try_recv_caps(self.stream, buf) {
+			match try_recv_caps(stream, buf) {
 				PolledCaps::Message { len, handles } => {
 					for &handle in handles.as_slice() {
 						close(handle);
 					}
 					let mut frame = Handles::new();
-					let Some(report) = proto::system::bluetooth_profile::open_mouse_read(&buf[..len], &mut frame) else { continue };
-					let (x, y) = self.pointer.fold(report.dx, report.dy);
-					let raw: [u8; RAW_LEN] = [x.to_le_bytes()[0], x.to_le_bytes()[1], y.to_le_bytes()[0], y.to_le_bytes()[1], report.buttons & 0x07];
-					if let Some(event) = map_event(&raw) {
-						state.record(event);
-					}
-					if forward != 0 && !state.protected {
-						send_blocking(forward, &raw, 0);
-					}
+					let Some(report) = proto::system::bluetooth_profile::open_input_read(&buf[..len], &mut frame) else { continue };
+					self.inputs[at].deliver(report, state, system_keys, forward);
 				}
 				PolledCaps::Empty => return,
 				PolledCaps::Closed => {
-					close(self.stream);
-					self.stream = 0;
+					// THE DEVICE IS GONE: every key it held goes up, its locks and modifiers with it, and each gamepad it
+					// brought departs.
+					let mut input = self.inputs.remove(at);
+					input.release(state);
+					close(input.stream);
+					while let Some(handle) = state.gamepads.pads.iter().find(|pad| pad.source == stream).map(|pad| pad.handle) {
+						state.pad_departed(stream, handle);
+					}
 					self.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
 					return;
 				}
 			}
 		}
+	}
+}
+
+impl BluetoothInput {
+	fn deliver(&mut self, report: proto::system::InputReport, state: &mut Input, system_keys: &mut SystemKeys, forward: u64) {
+		use proto::system::InputReport;
+		match report {
+			InputReport::Pointer(report) => {
+				let (x, y) = self.pointer.fold(report.dx, report.dy);
+				let raw: [u8; RAW_LEN] = [x.to_le_bytes()[0], x.to_le_bytes()[1], y.to_le_bytes()[0], y.to_le_bytes()[1], report.buttons & 0x07];
+				if let Some(event) = map_event(&raw) {
+					state.record(event);
+				}
+				if forward != 0 && !state.protected {
+					send_blocking(forward, &raw, 0);
+				}
+			}
+			InputReport::Key(key) => {
+				// THE KEYBOARD PAGE on the ordinary key path, held keys counted for the release a loss needs.
+				if key.page == 0x07 {
+					self.track(key.usage, key.down);
+					state.record_key(&[key.usage as u8, (key.usage >> 8) as u8, u8::from(key.down)]);
+				}
+				// A SYSTEM KEY - the consumer page's brightness pair - on the system-key path, as a USB keyboard's.
+				if key.page == 0x0c
+					&& let Some(frame) = drivers::keys::system_key_frame(key.usage, key.down)
+					&& let Some(Some(pressed)) = system_key(&frame)
+				{
+					system_keys.press(pressed);
+				}
+				// THE CONSOLE, through the drivers' own cooking - never while a protected session is up.
+				if !state.protected {
+					let code = drivers::keys::usage_keycode((u32::from(key.page) << 16) | u32::from(key.usage));
+					if code != 0 {
+						drivers::keys::feed_key(code, u32::from(key.down), &mut self.mods);
+					}
+				}
+			}
+			InputReport::Gamepad(frame) => state.pad_frame(self.stream, &frame.bytes),
+		}
+	}
+
+	fn track(&mut self, usage: u16, down: bool) {
+		let held = &mut self.held[..self.holding];
+		match (down, held.iter().position(|key| *key == usage)) {
+			(true, None) if self.holding < MAX_HELD => {
+				self.held[self.holding] = usage;
+				self.holding += 1;
+			}
+			(false, Some(at)) => {
+				self.held[at] = self.held[self.holding - 1];
+				self.holding -= 1;
+			}
+			_ => {}
+		}
+	}
+
+	fn release(&mut self, state: &mut Input) {
+		for at in 0..self.holding {
+			let usage = self.held[at];
+			state.record_key(&[usage as u8, (usage >> 8) as u8, 0]);
+		}
+		self.holding = 0;
+		self.mods.release_all();
 	}
 }
 
@@ -1338,6 +1501,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let trusted_root: u64 = recv_tagged(bootstrap, &mut buf, b"TRUSTED").unwrap_or(0);
 	// THE ACTIVITY SIGNAL'S ROOT: the sleep policy and the brightness policy watch it. Optional, and LAST.
 	let activity_root: u64 = recv_tagged(bootstrap, &mut buf, b"ACTIVITY").unwrap_or(0);
+	// THE SYSTEM KEYS' ROOT: DisplayService holds it, for the brightness. Optional, and LAST.
+	let system_keys_root: u64 = recv_tagged(bootstrap, &mut buf, b"SYSKEYS").unwrap_or(0);
+	// THE CONSOLE INPUT PRIVILEGE, delegated for the Bluetooth keyboards alone: the drivers' key cooking feeds the
+	// console under it. Optional, and LAST; without it a Bluetooth keyboard types into no console.
+	drivers::keys::set_console_input(recv_tagged(bootstrap, &mut buf, b"CONSOLE").unwrap_or(0));
 	let raw: u64 = take_published_pointer(catalogue, &ProviderKind::Input);
 	// POINTERS AND TOUCH SURFACES ARE FOLLOWED: both subscriptions stay open, and every provider they announce - at
 	// bootstrap or later - is attached, up to four pointers and one surface. Two of the catalogue's subscriber places,
@@ -1348,7 +1516,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// announces - at bootstrap or later - is adopted from it in the serve loop.
 	let pad_subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Gamepad).unwrap_or(0) } else { 0 };
 	// The Bluetooth slot starts empty and asks the broker once this service is online - see `Bluetooth`.
-	let mut bluetooth = Bluetooth { broker: bootstrap, profile: 0, stream: 0, pointer: service_logic::hogp::Pointer::new(), retry_at: clock(), resolving: false, refused: false };
+	let mut bluetooth = Bluetooth { broker: bootstrap, profile: 0, inputs: Vec::new(), retry_at: clock(), resolving: false, refused: false };
 
 	// 2. report in to the supervisor that started us.
 	{
@@ -1359,7 +1527,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut state: Input = Input::new(kill, Gamepads { catalogue, subscription: pad_subscription, sources: Vec::new(), pads: Vec::new(), next_id: 1, focused: None, console: None });
 	let mut trusted = Trusted { watch: Watch::new(), arming: Arming::Off, producer: 0, seq: 0, protected: false };
 	let mut activity = Activity { last: clock(), watchers: Vec::new() };
-	serve(service, admin, raw, pointers, touch, forward, keys, focus, [trusted_keys, trusted_root, activity_root], &mut trusted, &mut bluetooth, &mut state, &mut activity);
+	serve(service, admin, raw, pointers, touch, forward, keys, focus, [trusted_keys, trusted_root, activity_root, system_keys_root], &mut trusted, &mut bluetooth, &mut state, &mut activity);
 	exit();
 }
 
@@ -1369,7 +1537,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
 #[allow(clippy::too_many_arguments)]
-fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: Followed, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root, activity_root]: [u64; 3], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input, activity: &mut Activity) {
+fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: Followed, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root, activity_root, system_keys_root]: [u64; 4], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input, activity: &mut Activity) {
 	let mut req: [u8; 64] = [0u8; 64];
 	let mut raw_open: bool = raw != 0;
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
@@ -1377,6 +1545,10 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 	if activity_root != 0 {
 		clients.push(Client { chan: activity_root, scope: Scope::Activity });
 	}
+	if system_keys_root != 0 {
+		clients.push(Client { chan: system_keys_root, scope: Scope::SystemKeys });
+	}
+	let mut system_keys = SystemKeys::default();
 	let mut keys_open: bool = keys != 0;
 	let mut focus_open: bool = focus != 0;
 	let mut trusted_keys_open: bool = trusted_keys != 0;
@@ -1406,9 +1578,7 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 		if admin != 0 {
 			waitset.push(admin);
 		}
-		if bluetooth.stream != 0 {
-			waitset.push(bluetooth.stream);
-		}
+		waitset.extend(bluetooth.inputs.iter().map(|input| input.stream));
 		if bluetooth.resolving {
 			waitset.push(bluetooth.broker);
 		}
@@ -1431,8 +1601,10 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 		waitset.extend(state.gamepads.focused.iter().chain(state.gamepads.console.iter()).map(|stream| stream.producer));
 		waitset.extend(clients.iter().map(|client| client.chan));
 		// A BLUETOOTH SLOT WITH NOTHING OPEN WAKES THIS LOOP ON ITS RETRY DEADLINE - unless a resolve is
-		// already in flight, whose answer wakes it instead, or the broker has refused the name.
-		let pending_retry: bool = bluetooth.stream == 0 && !bluetooth.resolving && bluetooth.wanted();
+		// already in flight, whose answer wakes it instead, or the broker has refused the name. With devices
+		// open it still looks for more, on a housekeeping wake below.
+		let pending_retry: bool = bluetooth.inputs.is_empty() && !bluetooth.resolving && bluetooth.wanted();
+		let more_wanted: bool = !bluetooth.inputs.is_empty() && bluetooth.inputs.len() < MAX_BLUETOOTH_INPUTS && !bluetooth.resolving && bluetooth.wanted();
 		// AND A GAMEPAD STREAM OWED A STATE WAKES IT A TICK LATER, on a HOUSEKEEPING wait: a reader that never
 		// drains must not keep a settling scheduler from settling.
 		let pad_retry: u64 = if state.pads_pending() { clock() + GAMEPAD_RETRY_TICKS } else { 0 };
@@ -1448,17 +1620,18 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 				a.min(b)
 			}
 		};
+		let more_due: u64 = if more_wanted { bluetooth.retry_at } else { 0 };
 		let ready: i64 = if pad_retry != 0 && (!pending_retry || pad_retry < bluetooth.retry_at) {
-			wait_any_periodic(&waitset, earliest(pad_retry, idle_due))
+			wait_any_periodic(&waitset, earliest(earliest(pad_retry, idle_due), more_due))
 		} else if pending_retry {
 			wait_any(&waitset, earliest(bluetooth.retry_at, idle_due))
-		} else if idle_due != 0 {
-			wait_any_periodic(&waitset, idle_due)
+		} else if idle_due != 0 || more_due != 0 {
+			wait_any_periodic(&waitset, earliest(idle_due, more_due))
 		} else {
 			wait_any(&waitset, 0)
 		};
 		activity.tick();
-		if pending_retry && clock() >= bluetooth.retry_at {
+		if (pending_retry || more_wanted) && clock() >= bluetooth.retry_at {
 			bluetooth.retry();
 		}
 		if ready < 0 {
@@ -1614,10 +1787,10 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 		if was_pad_stream {
 			continue;
 		}
-		if bluetooth.stream != 0 && ready_handle == bluetooth.stream {
+		if let Some(at) = bluetooth.inputs.iter().position(|input| input.stream == ready_handle) {
 			activity.seen();
-			let mut frame_buf: [u8; 64] = [0u8; 64];
-			bluetooth.drain(state, forward, &mut frame_buf);
+			let mut frame_buf: [u8; 256] = [0u8; 256];
+			bluetooth.drain(at, state, &mut system_keys, forward, &mut frame_buf);
 			continue;
 		}
 		if focus_open && ready_handle == focus {
@@ -1697,7 +1870,12 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 						if handle != 0 {
 							close(handle);
 						}
-						state.record_key(&req[..len]);
+						// A SYSTEM KEY GOES TO ITS WATCHER AND NOWHERE ELSE, before anything ordinary delivery checks.
+						match system_key(&req[..len]) {
+							Some(Some(key)) => system_keys.press(key),
+							Some(None) => {}
+							None => state.record_key(&req[..len]),
+						}
 						activity.seen();
 					}
 					Polled::Empty => break,
@@ -1770,10 +1948,17 @@ fn serve(service: u64, admin: u64, raw: u64, mut pointers: Followed, mut touch: 
 		match recv_blocking(client, &mut req) {
 			Received::Message { len, mut handle } => {
 				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-				if op == CONNECT_OP && (scope == Scope::Full || scope == Scope::Activity) {
+				if op == CONNECT_OP && (scope == Scope::Full || scope == Scope::Activity || scope == Scope::SystemKeys) {
 					if let Some((mine, theirs)) = channel() {
 						clients.push(Client { chan: mine, scope });
 						send_blocking(client, &[], theirs);
+					}
+				} else if scope == Scope::SystemKeys {
+					// THE SYSTEM KEYS' CONNECTIONS answer their one operation and nothing else.
+					if op == proto::system::system_keys::OP_WATCH {
+						system_keys.open(client, &req[..len]);
+					} else if len >= 6 {
+						send_blocking(client, &req[2..6], 0);
 					}
 				} else if scope == Scope::Activity {
 					// THE ACTIVITY SIGNAL'S CONNECTIONS answer its one operation and nothing else.

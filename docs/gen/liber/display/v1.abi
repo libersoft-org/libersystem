@@ -46,3 +46,29 @@ method display-admin.bind op=1 (task:handle<liber:process@1::task>:rights=manage
 method display-admin.stats op=2 () -> presentation-stats
 method display-admin.set-visible op=3 (task:handle<liber:process@1::task>:rights=manage,surface:u64:rights=) -> result<unit, liber:base@1::error>
 method display-admin.set-scale op=4 (scale:scale-ratio:rights=) -> result<unit, liber:base@1::error>
+record pci-function(bus:u32,dev:u32,func:u32)
+variant output-source(provider=0:pci-function,boot-framebuffer=1:option<pci-function>)
+record edid-identity(manufacturer:u16,product:u16,serial:u32)
+record brightness-output(id:u32,source:output-source,edid:option<edid-identity>)
+enum backlight-kind(firmware=0,usb-monitor=1,native=2)
+enum join-reason(native=0,firmware-adapter=1,edid=2,single-output=3)
+enum backlight-standing(active=0,shadowed=1,unjoined=2)
+variant brightness-scale(levels=0:list<u32>,range=1:brightness-range)
+record brightness-range(minimum:u32,maximum:u32)
+record backlight-state(key:string,kind:backlight-kind,output:option<u32>,reason:option<join-reason>,standing:backlight-standing,shadowed-by:option<string>,scale:brightness-scale,level:option<u32>,floor:u32,ac-default:option<u32>,battery-default:option<u32>,failed:bool,touched:bool)
+enum brightness-cause(snapshot=0,key=1,firmware-hotkey=2,device=3,client=4,appeared=5,left=6)
+record brightness-change(key:string,level:option<u32>,cause:brightness-cause,serial:u64)
+variant brightness-target(level=0:u32,percent=1:u32,steps=2:i32)
+record brightness-set(level:u32,serial:u64)
+interface display-brightness
+method display-brightness.outputs op=1 () -> result<list<brightness-output>, liber:base@1::error>
+method display-brightness.backlights op=2 () -> result<list<backlight-state>, liber:base@1::error>
+method display-brightness.subscribe op=3 () -> stream<brightness-change>
+interface display-brightness-control
+method display-brightness-control.set op=1 (key:string:rights=,target:brightness-target:rights=,allow-zero:bool:rights=) -> result<brightness-set, liber:base@1::error>
+record brightness-settings(automatic:bool,idle-seconds:option<u32>)
+interface brightness-policy
+method brightness-policy.set op=1 (key:string:rights=,target:brightness-target:rights=,allow-zero:bool:rights=) -> result<brightness-set, liber:base@1::error>
+method brightness-policy.settings op=2 () -> result<brightness-settings, liber:base@1::error>
+method brightness-policy.set-automatic op=3 (on:bool:rights=) -> result<unit, liber:base@1::error>
+method brightness-policy.set-idle op=4 (seconds:option<u32>:rights=) -> result<unit, liber:base@1::error>

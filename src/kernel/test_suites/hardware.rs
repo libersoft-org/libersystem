@@ -2570,7 +2570,7 @@ fn recv_withdrawal(channel: &object::channel::Channel, generation: u64, token: u
 /// TICKS - a class device's answer can take as long as the device does, which is not a number of passes -
 /// and a table for the capabilities a reply hands over.
 #[cfg(test)]
-struct KernelTransport<'a> {
+pub(super) struct KernelTransport<'a> {
 	channel: &'a object::channel::Channel,
 	patience: u64,
 	received: alloc::vec::Vec<(u64, alloc::sync::Arc<dyn object::KernelObject>)>,
@@ -2580,7 +2580,7 @@ struct KernelTransport<'a> {
 
 #[cfg(test)]
 impl<'a> KernelTransport<'a> {
-	fn new(channel: &'a object::channel::Channel, patience: u64) -> KernelTransport<'a> {
+	pub(super) fn new(channel: &'a object::channel::Channel, patience: u64) -> KernelTransport<'a> {
 		KernelTransport { channel, patience, received: alloc::vec::Vec::new(), offered: alloc::vec::Vec::new() }
 	}
 

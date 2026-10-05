@@ -135,7 +135,7 @@ fn init_package_starts_system_manager() {
 	// refused on, and this boot comes up with a link over USB. The no-provider state still has a
 	// gate of its own: the `dma-degraded` scenario boots without the suite's devices and requires
 	// the "up without a link" line, which is why the adapter is attached in test mode only.
-	let online_reports: [&[u8]; 41] = [
+	let online_reports: [&[u8]; 42] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online (vol://system)",
@@ -174,6 +174,7 @@ fn init_package_starts_system_manager() {
 		b"BluetoothBondStore: online",
 		b"BluetoothService: online",
 		b"BmcService: online",
+		b"BrightnessPolicy: online",
 		b"CameraService: online",
 		b"HibernationService: online",
 		b"MediaImportService: online",

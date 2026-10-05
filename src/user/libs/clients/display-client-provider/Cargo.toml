@@ -1,0 +1,17 @@
+[package]
+name = "display-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem display channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["display-proto/shared-image"]
+
+[dependencies]
+display-proto = { path = "../../protocol/display-proto" }
+
+[lints.rust]
+warnings = "deny"

@@ -787,9 +787,13 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 					send_blocking(service, audio::OK, 0);
 				}
 				// THIS PROVIDER PLAYS A PERIOD AT A TIME AND KEEPS NO PLAYBACK COUNTERS: refused, which AudioService reads
-				// as "no counters".
-				audio::Message::Stats => {
+				// as "no counters". AND IT HAS NO LEVEL OF ITS OWN that this driver drives: refused, and scaled upstream.
+				audio::Message::Stats | audio::Message::Volume(_) => {
 					send_blocking(service, audio::REFUSED, 0);
+				}
+				// WHAT THIS PROVIDER IS: the fixed 48 kHz stereo both ways, two periods of latency - its double buffer.
+				audio::Message::Format => {
+					send_blocking(service, &audio::DeviceFormat::LEGACY.encode(), 0);
 				}
 				// A LENGTH THIS WIRE HAS NO SHAPE FOR IS ANSWERED AND NOT PLAYED. Playing a short
 				// message as a period is part of a period played as though it were whole.

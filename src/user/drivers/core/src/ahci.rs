@@ -102,6 +102,13 @@ pub fn link_up(ssts: u32) -> bool {
 	det == 3 && ipm == 1
 }
 
+/// Whether the port has seen a device at all: `DET` above zero, a device detected whether or not its link is
+/// established yet. A port still at zero shortly after a COMRESET has nothing on it - the device answers the reset
+/// with COMINIT within milliseconds - and is not worth the second a link that IS coming may take.
+pub fn device_present(ssts: u32) -> bool {
+	ssts & 0x0F != 0
+}
+
 /// The ports this controller implements, as indices, from the `PI` bitmap.
 ///
 /// THE BITMAP IS NOT A COUNT, and this is the trap it sets: `CAP.NP` says how many ports the

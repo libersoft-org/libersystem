@@ -997,6 +997,12 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 		crate::console::release_claim();
 		return ERR_NO_MEMORY;
 	}
+	// THE FUNCTION THAT DECODES IT, from the boot scan's record of every function's memory BARs.
+	let mut geom = geom;
+	if let Some(function) = crate::firmware::decoder_of(base_phys) {
+		geom.decoder = u32::from(function.bus) << 16 | u32::from(function.device) << 8 | u32::from(function.function);
+		geom.decoder_present = 1;
+	}
 	if let Err(e) = write_user(buf_ptr, geom) {
 		// The reply did not reach the caller, so the mapping must not stay: the caller is told the
 		// call failed and would have no reason - or any way - to unmap a framebuffer it was never

@@ -4149,3 +4149,35 @@ the device and, against AHCI's polled NCQ with 512 KiB requests, never finished 
 through the real path (`cp` of 1.72 MiB on an AHCI system volume, three times) completes. The code was removed.
 
 STILL TO RECORD: peak memory and recovery times, network, input, audio and UVC, and the ports.
+
+## Driver memory in `lsdev`, and recovery times from DeviceManager (2026-10-05)
+
+WHAT WAS DONE: IDL `binding-record` gains `memory-used`/`memory-peak` (appended), filled from the running binding's
+`domain_stats`; DeviceManager's `Teardown.began_at` and `Node.ended_at` - set when a retrying teardown resolves - and
+at the next READY the line "X recovered N tick(s) after its last driver ended". Harness stubs follow (`ended_at` in
+the lifecycle harness's Node, `began_at` in DeviceManager's own teardown test).
+
+MEASURED (x86_64 development instance, `dev.sh kernel-console kill-driver`): nvme 19, ahci 18, virtio-net 19, xhci 36
+ticks from the kill's teardown to READY; rebind windows 1-3 ticks; Domain memory 60 KiB used / 64 KiB peak for the
+static drivers, 1.06-1.09 MiB peak for those linking a shared provider library.
+
+VERIFICATION: `driver-event-dispatch` passes; x86_64 build; the development instance answered `lsdev` with the new
+fields and recovered every driver killed.
+
+## The network family measured, and two TCP receive defects it found (2026-10-05)
+
+MEASURED (x86_64, virtio-net, QEMU user network, a host server on 127.0.0.1:9000 reached as 10.0.2.2): ping to the
+gateway 1.1-1.4 ms (first 3.7 ms); 8 MiB into the guest through `nc ... | wc` at 2.2-2.4 MB/s (16 KiB window, no scale).
+
+FOUND AND FIXED:
+- `apps/tools/src/nc.rs`, `tcp.rs`: the receive stream was read with `recv_caps_blocking` into `[u8; 1024]`; a chunk
+  frame larger than that was truncated by the kernel and `socket::recv_read` refused it, so the data vanished. Now
+  `recv_vec_caps_blocking` (exact size by peek), with `Failed`/`TimedOut` reported. Seen in a capture: the guest
+  acknowledged and drained 4 KiB, `wc` counted 24 bytes.
+- `services/core/src/net.rs`: `next_sequence` - the send queue's `snd_nxt()` once established (or closing), the
+  handshake field before - for the data-receipt ACK and `tcp_build_window_update`. They carried the post-SYN sequence
+  forever; a capture shows the user network answering each such segment with its own ACK. After: 35115 frames for
+  8 MiB instead of 53522.
+
+VERIFICATION: two captured runs (`filter-dump`), before and after; the 8 MiB transfers counted whole by `wc`;
+`ipv6-peer` re-run on the shipping image (see P02M0183's record).

@@ -485,3 +485,158 @@ interface display-admin {
 	/// no surface is reconfigured and the output keeps the scale it had.
 	@op(4) set-scale: func(scale: scale-ratio) -> result<unit, error>;
 }
+
+/// A PCI FUNCTION, as the bus enumerates it.
+record pci-function {
+	bus:  u32,
+	dev:  u32,
+	func: u32,
+}
+
+/// WHERE AN OUTPUT'S PIXELS GO: a `display` provider, named by the PCI function of the binding that publishes it, or
+/// the boot framebuffer - with the PCI function that decodes it where the kernel found one, and none for a ramfb or a
+/// device tree's simple framebuffer, which no function decodes.
+variant output-source {
+	provider(pci-function),
+	boot-framebuffer(option<pci-function>),
+}
+
+/// A monitor's EDID identity: manufacturer id, product code and serial number from the base block.
+record edid-identity {
+	manufacturer: u16,
+	product:      u16,
+	serial:       u32,
+}
+
+/// AN OUTPUT, as brightness sees it. There is exactly one today, id 0 - the id every `surface-configuration` carries -
+/// whatever the scanout is; the list is a list so that more are additive. An output id is not persistent: a stored
+/// level is keyed by its backlight, never by this.
+record brightness-output {
+	id:     u32,
+	source: output-source,
+	edid:   option<edid-identity>,
+}
+
+enum backlight-kind {
+	firmware,
+	usb-monitor,
+	native,
+}
+
+/// WHY A BACKLIGHT IS JOINED TO ITS OUTPUT: published by the output's own display binding, an ACPI video output under
+/// the adapter that decodes the output's pixels, a USB monitor whose EDID matches the output's, or the only USB
+/// backlight while the output has no other.
+enum join-reason {
+	native,
+	firmware-adapter,
+	edid,
+	single-output,
+}
+
+/// ONE ACTIVE BACKLIGHT PER OUTPUT: the others joined to it are shadowed - listed, refused a set, never stepped,
+/// dimmed or restored - and one joined to nothing is unjoined: settable by its key, touched by nothing automatic.
+enum backlight-standing {
+	active,
+	shadowed,
+	unjoined,
+}
+
+variant brightness-scale {
+	levels(list<u32>),
+	range(brightness-range),
+}
+
+record brightness-range {
+	minimum: u32,
+	maximum: u32,
+}
+
+/// ONE BACKLIGHT AND EVERYTHING BRIGHTNESS KNOWS OF IT: its stable key and kind, the output it is joined to and why,
+/// its standing (with the winner's key when shadowed), its levels, its level now where known, the FLOOR no key,
+/// hotkey, step or ordinary set goes below, the firmware's defaults, whether its provider stopped answering, and
+/// whether anything - a key, a hotkey, a set, the device itself - has moved its level since it appeared: the brightness
+/// policy restores a stored level only to a backlight nothing has, so a policy started again leaves a level alone.
+record backlight-state {
+	key:             string,
+	kind:            backlight-kind,
+	output:          option<u32>,
+	reason:          option<join-reason>,
+	standing:        backlight-standing,
+	shadowed-by:     option<string>,
+	scale:           brightness-scale,
+	level:           option<u32>,
+	floor:           u32,
+	ac-default:      option<u32>,
+	battery-default: option<u32>,
+	failed:          bool,
+	touched:         bool,
+}
+
+/// WHO MOVED A LEVEL: a brightness key, a firmware hotkey, the device itself (a monitor's own buttons, firmware that
+/// stepped on its own), a client's set - or the snapshot a subscription opens with, and a backlight appearing or
+/// leaving.
+enum brightness-cause {
+	snapshot,
+	key,
+	firmware-hotkey,
+	device,
+	client,
+	appeared,
+	left,
+}
+
+/// One change of one backlight, numbered: a set answers the serial of the change it produced, which is how the policy
+/// tells its own changes from everyone else's.
+record brightness-change {
+	key:    string,
+	level:  option<u32>,
+	cause:  brightness-cause,
+	serial: u64,
+}
+
+/// WHAT A SET ASKS FOR: an absolute level from the scale, a percent of the range mapped to the nearest level, or a
+/// signed number of steps - the next listed level, or a sixteenth of a range's span.
+variant brightness-target {
+	level(u32),
+	percent(u32),
+	steps(i32),
+}
+
+record brightness-set {
+	level:  u32,
+	serial: u64,
+}
+
+/// THE READ, on DisplayService's `BRIGHTNESS` root, reached through the `brightness` capability. Nothing here sets
+/// anything. A subscription opens with one `snapshot` change per backlight and then follows every change whoever made
+/// it; a subscriber that stops reading has its stream closed rather than losing one backlight's last change silently,
+/// and subscribes again for a fresh snapshot.
+interface display-brightness {
+	@op(1) outputs: func() -> result<list<brightness-output>, error>;
+	@op(2) backlights: func() -> result<list<backlight-state>, error>;
+	@op(3) subscribe: func() -> stream<brightness-change>;
+}
+
+/// THE SET, on DisplayService's `BRIGHTNESSCTL` root, whose one client the manifest declares is the brightness policy
+/// and to which no capability name resolves. `key` names a backlight; zero - a black panel - is reached only with
+/// `allow-zero`, every other set stopping at the floor. A shadowed backlight answers `busy`.
+interface display-brightness-control {
+	@op(1) set: func(key: string, target: brightness-target, allow-zero: bool) -> result<brightness-set, error>;
+}
+
+/// The brightness policy's two settings: automatic brightness, and the idle timeout after which the active backlight
+/// is dimmed - none for never.
+record brightness-settings {
+	automatic:    bool,
+	idle-seconds: option<u32>,
+}
+
+/// THE POLICY'S CONTROL, on `brightness_policy`'s `CONTROL` root, reached through the `brightness-control`
+/// capability: a set, forwarded to DisplayService with the caller's explicit zero so the floor holds the same, and the
+/// two settings, stored by the policy.
+interface brightness-policy {
+	@op(1) set: func(key: string, target: brightness-target, allow-zero: bool) -> result<brightness-set, error>;
+	@op(2) settings: func() -> result<brightness-settings, error>;
+	@op(3) set-automatic: func(on: bool) -> result<unit, error>;
+	@op(4) set-idle: func(seconds: option<u32>) -> result<unit, error>;
+}

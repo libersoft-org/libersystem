@@ -31,6 +31,12 @@ pub mod opcode {
 	pub const LE_ENABLE_ENCRYPTION: u16 = 0x2019;
 	pub const LE_READ_LOCAL_P256_PUBLIC_KEY: u16 = 0x2025;
 	pub const LE_GENERATE_DHKEY: u16 = 0x2026;
+	pub const LE_SET_RANDOM_ADDRESS: u16 = 0x2005;
+	pub const LE_CLEAR_FILTER_ACCEPT_LIST: u16 = 0x2010;
+	pub const LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST: u16 = 0x2011;
+	pub const LE_ADD_DEVICE_TO_RESOLVING_LIST: u16 = 0x2027;
+	pub const LE_CLEAR_RESOLVING_LIST: u16 = 0x2029;
+	pub const LE_SET_ADDRESS_RESOLUTION_ENABLE: u16 = 0x202d;
 }
 
 /// Event codes.
@@ -119,6 +125,61 @@ pub fn scan_parameters() -> [u8; 7] {
 	out[3..5].copy_from_slice(&window.to_le_bytes());
 	out[5] = 0x00;
 	out[6] = 0x00;
+	out
+}
+
+/// `LE Set Scan Parameters` from `own`'s address type: 0 public, 1 random - this host's private address.
+pub fn scan_parameters_from(own: u8) -> [u8; 7] {
+	let mut out = scan_parameters();
+	out[5] = own;
+	out
+}
+
+/// `LE Set Random Address`: this host's private address, most significant first, reversed onto the wire.
+pub fn random_address(address: &[u8; 6]) -> [u8; 6] {
+	address_to_wire(address)
+}
+
+/// `LE Add Device To Filter Accept List`: an identity address and its type.
+pub fn accept_list_entry(kind: u8, address: &[u8; 6]) -> [u8; 7] {
+	let mut out = [0u8; 7];
+	out[0] = kind;
+	out[1..].copy_from_slice(&address_to_wire(address));
+	out
+}
+
+/// `LE Add Device To Resolving List`: a peer's identity, its identity resolving key and this host's, the keys in
+/// `smp`'s order and reversed onto the wire.
+pub fn resolving_list_entry(kind: u8, address: &[u8; 6], peer_irk: &[u8; 16], local_irk: &[u8; 16]) -> [u8; 39] {
+	let mut out = [0u8; 39];
+	out[0] = kind;
+	out[1..7].copy_from_slice(&address_to_wire(address));
+	out[7..23].copy_from_slice(&reverse16(peer_irk));
+	out[23..39].copy_from_slice(&reverse16(local_irk));
+	out
+}
+
+/// `LE Create Connection` THROUGH THE FILTER ACCEPT LIST: to whichever device on it advertises first, from `own`'s
+/// address type - how a bonded peripheral reconnects.
+pub fn create_connection_accepted(own: u8) -> [u8; 25] {
+	let mut out = create_connection(0, &[0; 6]);
+	out[4] = 0x01;
+	out[12] = own;
+	out
+}
+
+/// `LE Create Connection` to one peer from `own`'s address type.
+pub fn create_connection_from(kind: u8, address: &[u8; 6], own: u8) -> [u8; 25] {
+	let mut out = create_connection(kind, address);
+	out[12] = own;
+	out
+}
+
+/// `LE Enable Encryption` with an LE legacy key: the Rand and EDIV it was distributed with.
+pub fn enable_encryption_legacy(handle: u16, ltk: &[u8; 16], rand: &[u8; 8], ediv: u16) -> [u8; 28] {
+	let mut out = enable_encryption(handle, ltk);
+	out[2..10].copy_from_slice(rand);
+	out[10..12].copy_from_slice(&ediv.to_le_bytes());
 	out
 }
 

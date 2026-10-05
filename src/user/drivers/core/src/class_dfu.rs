@@ -164,7 +164,7 @@ fn answer_read(chan: u64, corr: u32, result: Result<AdminRead, Error>) {
 }
 
 // The device's serial number, as a string - `None` when it has none or it does not read.
-unsafe fn serial_of(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<String> {
+pub(crate) unsafe fn serial_of(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<String> {
 	unsafe {
 		let mut hids = Hids::new();
 		let received = control_in_req(hc, &mut hids, dev, 0x80, REQ_GET_DESCRIPTOR, 0x0100, 0, 18)?;

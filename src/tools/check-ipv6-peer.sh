@@ -82,6 +82,12 @@ PY
 # INITIATED - a name resolved, a connection opened, a probe sent - and a peer can only answer. The
 # console driver types those lines into the guest's shell and records the whole conversation in the
 # same shape `SERIAL=file:` produces, so every assertion below reads one file either way.
+# HOW LONG A ROW THAT WATCHES THE BRING-UP RUNS. The network is up about thirty-seven seconds into a boot on this tree -
+# the bootstrap set, two more controller drivers bound before the volume and every service since this gate was written -
+# and the quiet row's three solicitations need twelve seconds after the first. Forty-five seconds was the number when the
+# boot was shorter; the rows measure the stack, not the boot, so the window follows the boot.
+BRING_UP_SECONDS=60
+
 row() {
 	local scenario="$1" seconds="$2" link_mtu="${3:-}" label="${4:-$1}" script="${5:-}"
 	local port capture guest socket driver_pid=""
@@ -124,7 +130,7 @@ script() {
 
 # 1. NOTHING ANSWERS.
 note "quiet: nothing answers, and the guest must still configure itself and keep asking"
-mapfile -t records < <(row quiet 45)
+mapfile -t records < <(row quiet "$BRING_UP_SECONDS")
 capture="${records[0]}"
 guest="${records[1]}"
 
@@ -200,7 +206,7 @@ note "  the report precedes detection and is sourced from ::, the probe follows,
 
 # 2. A ROUTER ANSWERS.
 note "router: one advertisement with an autonomous /64, a recursive server and a smaller MTU"
-mapfile -t records < <(row router 45)
+mapfile -t records < <(row router "$BRING_UP_SECONDS")
 capture="${records[0]}"
 guest="${records[1]}"
 grep -q "sent router-advertisement lifetime=1800 prefixes=1 rdnss=1" "$capture" || fail "router: the peer did not advertise"
@@ -223,7 +229,7 @@ note "  the address was formed and proven, the route and the MTU were taken, sol
 
 # 3. AN ADVERTISEMENT THAT LIES.
 note "hostile: preferred beyond valid, an autonomous prefix that is not a /64, and a withdrawal"
-mapfile -t records < <(row hostile 45)
+mapfile -t records < <(row hostile "$BRING_UP_SECONDS")
 capture="${records[0]}"
 guest="${records[1]}"
 grep -q "sent router-advertisement lifetime=1800 prefixes=2" "$capture" || fail "hostile: the peer did not advertise"
@@ -239,7 +245,7 @@ note "  both malformed prefixes were refused, no address was formed, and the wit
 
 # 4. A FLOOD OF MALFORMED PACKETS.
 note "flood: sixty-four packets whose extension chain is a lie, while the host is bringing itself up"
-mapfile -t records < <(row flood 45)
+mapfile -t records < <(row flood "$BRING_UP_SECONDS")
 capture="${records[0]}"
 guest="${records[1]}"
 [[ "$(grep -c "sent malformed extension chain" "$capture")" -ge 32 ]] || fail "flood: the peer did not flood"
@@ -262,7 +268,7 @@ note "  the host came up under the flood, and answered at most the burst"
 
 # 5. ECHO TRAFFIC, AND A REPORT ABOUT IT.
 note "echo: an echo request to the address the guest formed, and a Packet Too Big quoting the reply"
-mapfile -t records < <(row echo 45)
+mapfile -t records < <(row echo "$BRING_UP_SECONDS")
 capture="${records[0]}"
 guest="${records[1]}"
 grep -q "learned the guest's global address 2001:db8:a:" "$capture" || fail "echo: the guest never formed an address from the advertised prefix"
@@ -289,7 +295,7 @@ note "  the guest answered the echo from its formed address, took the error quot
 # one an implementation comparing with `>` instead of `>=` gets wrong, and every smaller link fails
 # the same test for the same reason.
 note "narrow link: the device reports 1279 bytes, one below what IPv6 requires"
-mapfile -t records < <(row quiet 45 1279 narrow)
+mapfile -t records < <(row quiet "$BRING_UP_SECONDS" 1279 narrow)
 capture="${records[0]}"
 guest="${records[1]}"
 # THE FAMILY IS REFUSED, and it says so. Raising the number instead would leave a host writing frames

@@ -1496,6 +1496,12 @@ pub enum ProviderKind {
 	/// A FAN - `liber:power@1`'s `cooling-device` contract: its levels and the level it runs at - which
 	/// ProcessorPowerService alone consumes and commands.
 	CoolingDevice = 30,
+	/// A DISPLAY BACKLIGHT - `liber:display-device@1`'s `backlight` contract: its levels, its level and the hotkeys its
+	/// firmware raised - which DisplayService alone consumes.
+	Backlight = 31,
+	/// AN AMBIENT-LIGHT SENSOR - `liber:display-device@1`'s `ambient-light` contract - which the brightness policy alone
+	/// consumes.
+	AmbientLight = 32,
 }
 
 impl ProviderKind {
@@ -1568,6 +1574,8 @@ impl ProviderKind {
 			28 => Some(ProviderKind::PlatformSwitch),
 			29 => Some(ProviderKind::ThermalZone),
 			30 => Some(ProviderKind::CoolingDevice),
+			31 => Some(ProviderKind::Backlight),
+			32 => Some(ProviderKind::AmbientLight),
 			_ => None,
 		}
 	}
@@ -9047,6 +9055,8 @@ impl ProviderKind {
 			ProviderKind::PlatformSwitch => out.push_str("\"platform-switch\""),
 			ProviderKind::ThermalZone => out.push_str("\"thermal-zone\""),
 			ProviderKind::CoolingDevice => out.push_str("\"cooling-device\""),
+			ProviderKind::Backlight => out.push_str("\"backlight\""),
+			ProviderKind::AmbientLight => out.push_str("\"ambient-light\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -9081,6 +9091,8 @@ impl ProviderKind {
 			ProviderKind::PlatformSwitch => out.push_str("platform-switch"),
 			ProviderKind::ThermalZone => out.push_str("thermal-zone"),
 			ProviderKind::CoolingDevice => out.push_str("cooling-device"),
+			ProviderKind::Backlight => out.push_str("backlight"),
+			ProviderKind::AmbientLight => out.push_str("ambient-light"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -9115,6 +9127,8 @@ impl ProviderKind {
 			ProviderKind::PlatformSwitch => crate::codec::cbor::text(out, "platform-switch"),
 			ProviderKind::ThermalZone => crate::codec::cbor::text(out, "thermal-zone"),
 			ProviderKind::CoolingDevice => crate::codec::cbor::text(out, "cooling-device"),
+			ProviderKind::Backlight => crate::codec::cbor::text(out, "backlight"),
+			ProviderKind::AmbientLight => crate::codec::cbor::text(out, "ambient-light"),
 		}
 	}
 }

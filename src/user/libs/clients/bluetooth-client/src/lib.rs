@@ -14,7 +14,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use bluetooth_proto::generated::liber::bluetooth::v1::{BondedPeer, ControllerInfo, PairingProgress, PeerAddress, ScanHandle, ScanResult};
+use bluetooth_proto::generated::liber::bluetooth::v1::{BondedPeer, ControllerInfo, DeviceStatus, MediaCommand, PairingProgress, PeerAddress, Profile, PromptReply, ScanHandle, ScanResult};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_controllers"]
@@ -25,6 +25,8 @@ unsafe extern "Rust" {
 	fn read_results(chan: u64, scan: &ScanHandle) -> Option<Result<Vec<ScanResult>, Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_scanning"]
 	fn read_scanning(chan: u64, scan: &ScanHandle) -> Option<Result<bool, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_cancel"]
+	fn read_cancel(chan: u64, scan: &ScanHandle) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_power"]
 	fn operator_power(chan: u64, controller: &u32, on: &bool) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_pair"]
@@ -37,6 +39,28 @@ unsafe extern "Rust" {
 	fn operator_forget(chan: u64, controller: &u32, peer: &PeerAddress) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_enable"]
 	fn operator_enable(chan: u64, controller: &u32, peer: &PeerAddress, on: &bool) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_cancel"]
+	fn operator_cancel(chan: u64, controller: &u32) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_prompts"]
+	fn operator_prompts(chan: u64, controller: &u32) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_answer"]
+	fn operator_answer(chan: u64, controller: &u32, prompt: &u32, reply: &PromptReply) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_discoverable"]
+	fn operator_discoverable(chan: u64, controller: &u32, seconds: &u32) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_trust"]
+	fn operator_trust(chan: u64, controller: &u32, peer: &PeerAddress, profile: &Profile, on: &bool) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_alias"]
+	fn operator_alias(chan: u64, controller: &u32, peer: &PeerAddress, alias: &str) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_devices"]
+	fn operator_devices(chan: u64, controller: &u32) -> Option<Result<Vec<DeviceStatus>, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_connect"]
+	fn operator_connect(chan: u64, controller: &u32, peer: &PeerAddress, profile: &Profile) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_media"]
+	fn operator_media(chan: u64, controller: &u32, peer: &PeerAddress, command: &MediaCommand) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_disconnect"]
+	fn operator_disconnect(chan: u64, controller: &u32, peer: &PeerAddress, profile: &Profile) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_pair_legacy"]
+	fn operator_pair_legacy(chan: u64, controller: &u32, peer: &PeerAddress) -> Option<Result<(), Error>>;
 }
 
 /// The READ authority: the controllers, and a scan with its results.
@@ -71,9 +95,14 @@ impl BluetoothClient {
 	pub fn scanning(&mut self, scan: &ScanHandle) -> Option<Result<bool, Error>> {
 		unsafe { read_scanning(self.chan, scan) }
 	}
+
+	#[inline(always)]
+	pub fn cancel(&mut self, scan: &ScanHandle) -> Option<Result<(), Error>> {
+		unsafe { read_cancel(self.chan, scan) }
+	}
 }
 
-/// The OPERATOR authority: power, pairing and the bonds.
+/// The OPERATOR authority: power, pairing and its prompts, the bonds, trust, and profile connections.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct BluetoothOperatorClient {
@@ -114,5 +143,61 @@ impl BluetoothOperatorClient {
 	#[inline(always)]
 	pub fn enable(&mut self, controller: u32, peer: &PeerAddress, on: bool) -> Option<Result<(), Error>> {
 		unsafe { operator_enable(self.chan, &controller, peer, &on) }
+	}
+
+	#[inline(always)]
+	pub fn cancel(&mut self, controller: u32) -> Option<Result<(), Error>> {
+		unsafe { operator_cancel(self.chan, &controller) }
+	}
+
+	/// The prompt watcher: the stream's consumer end, read with the protocol's `prompts_read`.
+	#[inline(always)]
+	pub fn prompts(&mut self, controller: u32) -> Option<Result<u64, Error>> {
+		unsafe { operator_prompts(self.chan, &controller) }
+	}
+
+	#[inline(always)]
+	pub fn answer(&mut self, controller: u32, prompt: u32, reply: &PromptReply) -> Option<Result<(), Error>> {
+		unsafe { operator_answer(self.chan, &controller, &prompt, reply) }
+	}
+
+	#[inline(always)]
+	pub fn discoverable(&mut self, controller: u32, seconds: u32) -> Option<Result<(), Error>> {
+		unsafe { operator_discoverable(self.chan, &controller, &seconds) }
+	}
+
+	#[inline(always)]
+	pub fn trust(&mut self, controller: u32, peer: &PeerAddress, profile: Profile, on: bool) -> Option<Result<(), Error>> {
+		unsafe { operator_trust(self.chan, &controller, peer, &profile, &on) }
+	}
+
+	#[inline(always)]
+	pub fn alias(&mut self, controller: u32, peer: &PeerAddress, alias: &str) -> Option<Result<(), Error>> {
+		unsafe { operator_alias(self.chan, &controller, peer, alias) }
+	}
+
+	#[inline(always)]
+	pub fn devices(&mut self, controller: u32) -> Option<Result<Vec<DeviceStatus>, Error>> {
+		unsafe { operator_devices(self.chan, &controller) }
+	}
+
+	#[inline(always)]
+	pub fn connect(&mut self, controller: u32, peer: &PeerAddress, profile: Profile) -> Option<Result<(), Error>> {
+		unsafe { operator_connect(self.chan, &controller, peer, &profile) }
+	}
+
+	#[inline(always)]
+	pub fn media(&mut self, controller: u32, peer: &PeerAddress, command: MediaCommand) -> Option<Result<(), Error>> {
+		unsafe { operator_media(self.chan, &controller, peer, &command) }
+	}
+
+	#[inline(always)]
+	pub fn disconnect(&mut self, controller: u32, peer: &PeerAddress, profile: Profile) -> Option<Result<(), Error>> {
+		unsafe { operator_disconnect(self.chan, &controller, peer, &profile) }
+	}
+
+	#[inline(always)]
+	pub fn pair_legacy(&mut self, controller: u32, peer: &PeerAddress) -> Option<Result<(), Error>> {
+		unsafe { operator_pair_legacy(self.chan, &controller, peer) }
 	}
 }

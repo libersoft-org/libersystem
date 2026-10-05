@@ -26,6 +26,7 @@ extern crate alloc;
 mod class_bt;
 mod class_ccid;
 mod class_dfu;
+mod class_display_hid;
 mod class_mbim;
 mod class_midi;
 mod class_power;
@@ -608,6 +609,8 @@ const KIND_DFU: u8 = 18;
 // A GAMEPAD, which is not a pointer: ranked below a keyboard and a touch surface and above a pointer when one
 // device is several.
 const KIND_GAMEPAD: u8 = 19;
+// A MONITOR'S HID INTERFACE: its brightness, and the ambient-light sensor it carries.
+const KIND_MONITOR: u8 = 20;
 
 // The addressed devices, by root port - the state hot-plug works against and the
 // inventory `usb.list` serves. An attach enumerates a root port only when no slot
@@ -1546,6 +1549,7 @@ fn admits(hc: &Xhci, kind: ClassKind, class: u8) -> bool {
 					ClassKind::Mbim => b"MBIM".as_slice(),
 					ClassKind::Video => b"video".as_slice(),
 					ClassKind::Dfu => b"DFU".as_slice(),
+					ClassKind::Display => b"monitor".as_slice(),
 				});
 				print(b" module is full (");
 				print(refusal.describe());
@@ -1586,6 +1590,7 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 		ClassKind::Mbim => class == 0 || class == 0xef || class == drivers::cdc::CLASS_COMMUNICATIONS,
 		ClassKind::Video => class == 0 || class == 0xef || class == 0x0e,
 		ClassKind::Dfu => class == 0 || class == 0xef || class == 0xfe,
+		ClassKind::Display => class == 0 || class == 0xef || class == 0x03,
 	}
 }
 
@@ -2366,8 +2371,13 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 										send_blocking(server, audio::REFUSED, 0);
 									}
 								},
-								// A SHAPE THIS WIRE DOES NOT HAVE is refused, with the wire's own refusal.
-								audio::Message::Unknown => {
+								// WHAT THIS PROVIDER IS: the directions its function has, at the wire's fixed format.
+								audio::Message::Format => {
+									send_blocking(server, &usb_audio::format(&mut audio).encode(), 0);
+								}
+								// A SHAPE THIS WIRE DOES NOT HAVE is refused, with the wire's own refusal - and so is a
+								// level, which this driver leaves to the consumer to scale.
+								audio::Message::Unknown | audio::Message::Volume(_) => {
 									send_blocking(server, audio::REFUSED, 0);
 								}
 							}
@@ -2489,6 +2499,7 @@ fn kind_name(kind: u8) -> &'static str {
 		KIND_CAMERA => "camera",
 		KIND_DFU => "dfu",
 		KIND_GAMEPAD => "gamepad",
+		KIND_MONITOR => "monitor",
 		_ => "device",
 	}
 }

@@ -10,6 +10,15 @@ version = "0.0.0"
 name = "audio-client"
 version = "0.0.0"
 dependencies = [
+ "audio-proto",
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "audio-proto"
+version = "0.0.0"
+dependencies = [
  "base-proto",
  "wire",
 ]

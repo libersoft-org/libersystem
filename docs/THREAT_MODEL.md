@@ -218,6 +218,57 @@ from it - and it is not a tamper-proof archive against an administrator who alre
 authority over the system volume. The indistinguishable `declined` is a semantic property, not a claim of
 constant-time answers or of the absence of every availability side channel.
 
+### 2.4 A device on the radio
+
+BluetoothService is the one program that parses a stranger's radio packets, so it holds as little as possible
+while it does: no device claim, no DMA and no key at rest - the keys live in the bond store, reached over a
+private capability only this service holds. A peer within range is assumed capable of sending any packet the
+controller passes up, of pretending to be any address, and of pairing again with whatever it claims to be.
+
+**Pairing is a question a person answers, and the answer is only as good as where it was typed.** Every model
+that needs a person - Numeric Comparison, Passkey Entry, a legacy PIN, and consent to an incoming pairing - is
+a prompt the service raises on the operator authority's watcher stream, which only `btctl pair` and
+`btctl pairable` hold, with the protocol's 25-second deadline after which the service answers no itself.
+While no watcher is attached the controller is not pairable: an incoming pairing is refused, and an outgoing
+one this host started declares NoInputNoOutput, so nothing is offered that nobody can answer.
+
+```text
+WHAT AN ANSWER PROVES:
+- that the holder of the operator authority confirmed, on an ordinary terminal;
+- NOT that a person at this machine's own keyboard did: another local program holding the same
+  terminal can draw over the question or type the answer. The prompt is not the protected screen of
+  2.3, which confirms an operation a requester froze; it exists on every machine, including one whose
+  only keyboard will be the Bluetooth one being paired;
+- that the six digits compared or typed came from the peer's display or keyboard - Numeric
+  Comparison and Passkey Entry still defeat an attacker on the radio alone;
+- nothing about which radio answered a Just Works pairing, which `btctl` says when that is what ran.
+```
+
+**A bond is never lowered.** Each is kept with its key agreement (legacy PIN, LE legacy, P-192 Simple Pairing,
+P-256 Secure Connections) and whether a person authenticated it; a bonded peer that pairs again lower on
+either axis is refused and keeps its bond, and the operator forgets it to pair it anew. A debug link key is
+refused outright: its private half is published.
+
+**What a bonded peer may open is the operator's word, per profile.** Trust is kept in the bond record and set
+with `btctl trust`; the radio is connectable only while a bonded peer is trusted for a profile this system
+serves inbound, a `btctl receive` waits, or a watcher makes it pairable, and discoverable only under
+`btctl discoverable`, for at most 180 seconds. An inbound channel is refused where its profile is first named
+- by PSM at L2CAP and by server channel on RFCOMM - unless the link is encrypted and the peer trusted for that
+profile; a bonded peer's link that is not encrypted yet is secured with the stored key before its channel is
+answered. SDP answers any connected peer, the one service a peer reads before it pairs.
+
+No Bluetooth input reaches the trusted key sink of 2.3: BluetoothService is not one of the keyboard drivers
+DeviceManager hands that sink to, and nothing it produces has a path there.
+
+**A keyboard trusted for input types at the console, so the radio stack joins what console input rests on.** Its
+keys reach InputService decoded, never as a HID report, and InputService feeds the kernel's console input for it
+under a ConsoleInputSource delegated to it alone besides DeviceManager's keyboard drivers, through the drivers'
+own key cooking - so a key types the same whichever keyboard produced it, and a compromised BluetoothService can
+type at the console as a compromised keyboard driver can. Nothing is fed while a protected session is up. Its
+Ctrl+Alt+Delete and its Power key act on nothing: InputService holds no SystemPower connection, and a radio peer
+is not handed the machine's power - a keyboard driver's chord is the path that must survive a wedged
+supervisor, and a Bluetooth keyboard's keys cross a radio stack and two services to get anywhere.
+
 ## 3. Enforced boundaries
 
 The boundaries below are mechanisms in the kernel (TCB) plus one policy layer in

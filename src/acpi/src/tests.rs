@@ -854,3 +854,30 @@ fn the_processors_name_their_uid_and_their_apic_in_the_firmwares_order() {
 	let processors: alloc::vec::Vec<MadtProcessor> = madt.processors().collect();
 	assert_eq!(processors, [MadtProcessor { uid: 0, apic_id: 0, enabled: true }, MadtProcessor { uid: 1, apic_id: 1, enabled: true }, MadtProcessor { uid: 7, apic_id: 300, enabled: false }]);
 }
+
+#[test]
+fn dmar_joins_each_namespace_device_scope_to_its_andd_name_and_requester_id() {
+	// An ANDD numbering `\_SB.PCI0.I2C1` 3, a DRHD whose scopes are a PCI endpoint (type 1, skipped) and namespace device 3
+	// at bus 0, device 0x15, function 1 - and a namespace scope for 9, which no ANDD declares.
+	let name = b"\\_SB.PCI0.I2C1\0";
+	let andd_len = 8 + name.len();
+	let drhd_len = 16 + 8 + 8 + 8;
+	let mut builder = Builder::new(b"DMAR", 1, 48 + andd_len + drhd_len).u8(36, 38);
+	builder = builder.u16(48, 4).u16(50, andd_len as u16).u8(55, 3);
+	for (at, byte) in name.iter().enumerate() {
+		builder = builder.u8(56 + at, *byte);
+	}
+	let drhd = 48 + andd_len;
+	builder = builder.u16(drhd, 0).u16(drhd + 2, drhd_len as u16).u64(drhd + 8, 0xfed9_0000);
+	builder = builder.u8(drhd + 16, 1).u8(drhd + 17, 8).u8(drhd + 20, 0).u8(drhd + 21, 0).u8(drhd + 22, 2).u8(drhd + 23, 0);
+	builder = builder.u8(drhd + 24, 5).u8(drhd + 25, 8).u8(drhd + 28, 3).u8(drhd + 29, 0).u8(drhd + 30, 0x15).u8(drhd + 31, 1);
+	builder = builder.u8(drhd + 32, 5).u8(drhd + 33, 8).u8(drhd + 36, 9).u8(drhd + 37, 0).u8(drhd + 38, 0x16).u8(drhd + 39, 0);
+	let bytes = builder.finish();
+	let mut seen = Vec::new();
+	dmar_namespace_streams(&bytes, |stream| seen.push((stream.name().to_vec(), stream.source_id))).expect("a DMAR");
+	assert_eq!(seen, vec![(b"\\_SB.PCI0.I2C1".to_vec(), 0x15 << 3 | 1)], "the one scope an ANDD names, with its requester id");
+	// A SCOPE THAT RUNS PAST ITS UNIT is refused, not read.
+	let mut broken = bytes.clone();
+	broken[drhd + 25] = 0x40;
+	assert_eq!(dmar_namespace_streams(&Builder { bytes: broken }.finish(), |_| {}), Err(Error::TooShort));
+}

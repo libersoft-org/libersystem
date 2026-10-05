@@ -93,6 +93,7 @@ dependencies = [
 name = "audio-client"
 version = "0.0.0"
 dependencies = [
+ "audio-proto",
  "base-proto",
  "wire",
 ]
@@ -285,6 +286,21 @@ dependencies = [
  "base-proto",
  "ipc-client",
  "wire",
+]
+
+[[package]]
+name = "display-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "display-proto",
+]
+
+[[package]]
+name = "display-client-provider"
+version = "0.0.0"
+dependencies = [
+ "display-proto",
 ]
 
 [[package]]
@@ -1211,6 +1227,8 @@ dependencies = [
  "config-client-provider",
  "device-client",
  "device-client-provider",
+ "display-client",
+ "display-client-provider",
  "flac",
  "font-client",
  "font-client-provider",

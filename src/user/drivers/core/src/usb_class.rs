@@ -71,6 +71,9 @@ pub enum ClassKind {
 	Video,
 	/// A DFU function: nothing but the control pipe, which is where the class puts all of it.
 	Dfu,
+	/// A USB monitor's HID interface: its brightness and EDID on the control pipe as feature reports, and the
+	/// interrupt IN an ambient-light sensor on it sends its readings on.
+	Display,
 }
 
 /// One endpoint ring is one DMA page, which is the unit both class modules allocate in.
@@ -174,6 +177,8 @@ pub const MBIM_COST: Cost = Cost { endpoints: 3, dma_bytes: 3 * RING_BYTES + 3 *
 pub const VIDEO_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES + 4 * 4096, in_flight: 1 };
 /// A DFU FUNCTION: no endpoint of its own - its transfers are control transfers through the device's page.
 pub const DFU_COST: Cost = Cost { endpoints: 0, dma_bytes: 0, in_flight: 1 };
+/// A MONITOR: one interrupt IN with its ring and page, and its standing read.
+pub const DISPLAY_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES + 4096, in_flight: 1 };
 
 /// ONE DEVICE OF EACH OF THESE CLASSES, for the reason the audio sink is one: each publishes ONE provider, and
 /// its service drives what it is given. The limit is the cost, so a second device is refused by count.
@@ -273,13 +278,14 @@ pub struct Budget {
 	mbim: Usage,
 	video: Usage,
 	dfu: Usage,
+	display: Usage,
 }
 
 const NONE: Usage = Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 };
 
 impl Budget {
 	pub const fn new() -> Budget {
-		Budget { hid: NONE, storage: NONE, network: NONE, uas: NONE, serial: NONE, audio: NONE, printer: NONE, still_image: NONE, smart_card: NONE, midi: NONE, power_device: NONE, bluetooth: NONE, mbim: NONE, video: NONE, dfu: NONE }
+		Budget { hid: NONE, storage: NONE, network: NONE, uas: NONE, serial: NONE, audio: NONE, printer: NONE, still_image: NONE, smart_card: NONE, midi: NONE, power_device: NONE, bluetooth: NONE, mbim: NONE, video: NONE, dfu: NONE, display: NONE }
 	}
 
 	pub const fn limits(kind: ClassKind) -> Limits {
@@ -299,6 +305,7 @@ impl Budget {
 			ClassKind::Mbim => one_of(MBIM_COST),
 			ClassKind::Video => one_of(VIDEO_COST),
 			ClassKind::Dfu => one_of(DFU_COST),
+			ClassKind::Display => one_of(DISPLAY_COST),
 		}
 	}
 
@@ -319,6 +326,7 @@ impl Budget {
 			ClassKind::Mbim => MBIM_COST,
 			ClassKind::Video => VIDEO_COST,
 			ClassKind::Dfu => DFU_COST,
+			ClassKind::Display => DISPLAY_COST,
 		}
 	}
 
@@ -339,6 +347,7 @@ impl Budget {
 			ClassKind::Mbim => self.mbim,
 			ClassKind::Video => self.video,
 			ClassKind::Dfu => self.dfu,
+			ClassKind::Display => self.display,
 		}
 	}
 
@@ -407,7 +416,7 @@ impl Budget {
 			ClassKind::Audio => bytes <= 4096,
 			// EVERY SERVICE-BACKED CLASS STAGES IN THE PAGES IT WAS CHARGED FOR AND NEVER GROWS THEM: a camera's
 			// frame is assembled in the CLIENT's buffer, and every other message here fits a page.
-			ClassKind::Printer | ClassKind::StillImage | ClassKind::SmartCard | ClassKind::Midi | ClassKind::PowerDevice | ClassKind::Bluetooth | ClassKind::Mbim | ClassKind::Video | ClassKind::Dfu => bytes <= 4096,
+			ClassKind::Printer | ClassKind::StillImage | ClassKind::SmartCard | ClassKind::Midi | ClassKind::PowerDevice | ClassKind::Bluetooth | ClassKind::Mbim | ClassKind::Video | ClassKind::Dfu | ClassKind::Display => bytes <= 4096,
 		}
 	}
 
@@ -428,6 +437,7 @@ impl Budget {
 			ClassKind::Mbim => &mut self.mbim,
 			ClassKind::Video => &mut self.video,
 			ClassKind::Dfu => &mut self.dfu,
+			ClassKind::Display => &mut self.display,
 		}
 	}
 }

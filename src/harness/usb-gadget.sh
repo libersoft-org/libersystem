@@ -124,6 +124,11 @@ plan_for() {
 	midi-echo) printf 'c.1 midi.usb0 midi\n' ;;
 	# A UPS: the kernel's HID function with a HID Power Device report descriptor, answered by `ups-sim.py`.
 	ups) printf 'c.1 hid.usb0 hid-ups\n' ;;
+	# A MONITOR: the kernel's HID function with a Monitor Control collection - its brightness and the start of its
+	# EDID - and an Ambient Light collection, answered by `monitor-sim.py`.
+	monitor) printf 'c.1 hid.usb0 hid-monitor\n' ;;
+	# A CONSUMER CONTROL KEYPAD with the two brightness keys, pressed by `keys-sim.py`.
+	consumer-keys) printf 'c.1 hid.usb0 hid-consumer\n' ;;
 	# THE CLASSES THE KERNEL HAS NO FUNCTION FOR, each a FunctionFS function whose far end is an emulator in
 	# `usb_ffs.py`: a CCID reader with a PIV card in it.
 	ccid) printf 'c.1 ffs.liber ffs-ccid\n' ;;
@@ -136,7 +141,7 @@ plan_for() {
 	mbim) printf 'gadgetfs mbim\n' ;;
 	# And a video camera streaming over bulk.
 	uvc) printf 'gadgetfs uvc\n' ;;
-	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, hid-gamepad-pair, uac2, printer, midi, midi-echo, ups, ccid, dfu, bt, mbim, uvc" ;;
+	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, hid-gamepad-pair, uac2, printer, midi, midi-echo, ups, monitor, consumer-keys, ccid, dfu, bt, mbim, uvc" ;;
 	esac
 }
 
@@ -179,6 +184,18 @@ hid_descriptor() {
 	# DelayBeforeShutdown in feature report 3.
 	hid-ups)
 		printf '%b' '\x05\x84\x09\x04\xa1\x01\x09\x24\xa1\x00\x85\x01\x05\x85\x09\xd0\x09\x44\x09\x45\x09\x42\x09\x4b\x15\x00\x25\x01\x75\x01\x95\x05\x81\x02\x75\x03\x95\x01\x81\x01\x09\x66\x25\x64\x75\x08\x81\x02\x09\x68\x27\xff\xff\x00\x00\x66\x01\x10\x75\x10\x81\x02\x65\x00\x85\x02\x09\x2c\x25\x03\x75\x08\xb1\x02\x09\x67\x09\x83\x09\x29\x25\x64\x95\x03\xb1\x02\x05\x84\x09\x30\x27\xff\xff\x00\x00\x67\x21\xd1\xf0\x00\x55\x05\x75\x10\x95\x01\xb1\x02\x65\x00\x55\x00\x85\x03\x09\x57\x16\xff\xff\x26\xff\x7f\x66\x01\x10\x75\x10\xb1\x02\x65\x00\xc0\xc0'
+		;;
+	# A MONITOR, on the Monitor and VESA Virtual Controls pages and the Sensors page. Byte for byte the descriptor the
+	# driver library's `hid_display` tests carry: feature report 1 the EDID's first thirty-two bytes - the most a HID
+	# gadget answers GET_REPORT with leaves no room for the whole block, and the identity is in the first sixteen -
+	# feature report 2 a 0..100 Brightness, and input report 3 a sixteen-bit illuminance in lux.
+	hid-monitor)
+		printf '%b' '\x05\x80\x09\x01\xa1\x01\x85\x01\x09\x02\x15\x00\x26\xff\x00\x75\x08\x95\x20\xb2\x02\x01\x05\x82\x85\x02\x09\x10\x15\x00\x25\x64\x75\x08\x95\x01\xb1\x02\xc0\x05\x20\x09\x41\xa1\x01\x85\x03\x0a\xd1\x04\x15\x00\x27\xff\xff\x00\x00\x75\x10\x95\x01\x55\x00\x81\x02\xc0'
+		;;
+	# A CONSUMER CONTROL collection, one sixteen-bit usage array: the brightness increment (0x6f) and decrement (0x70)
+	# among the usages it may report, and zero for none pressed.
+	hid-consumer)
+		printf '%b' '\x05\x0c\x09\x01\xa1\x01\x15\x00\x26\xff\x03\x19\x00\x2a\xff\x03\x75\x10\x95\x01\x81\x00\xc0'
 		;;
 	esac
 }
@@ -223,6 +240,10 @@ hid_report_length() {
 	hid-gamepad) echo 7 ;;
 	# The longest report with its ID byte: feature report 2 is seven.
 	hid-ups) echo 8 ;;
+	# The EDID feature report with its ID byte: the function caps both GET_REPORT's answer and SET_REPORT's data at
+	# this length.
+	hid-monitor) echo 33 ;;
+	hid-consumer) echo 2 ;;
 	esac
 }
 
@@ -384,14 +405,17 @@ configure_function() {
 	ffs-*)
 		start_functionfs "$function_name" "${shape#ffs-}"
 		;;
-	hid-touch | hid-gamepad | hid-ups)
+	hid-touch | hid-gamepad | hid-ups | hid-monitor | hid-consumer)
 		write_attr "$dir/functions/$function_name/protocol" 0
 		write_attr "$dir/functions/$function_name/subclass" 0
 		write_attr "$dir/functions/$function_name/report_length" "$(hid_report_length "$shape")"
-		hid_descriptor "$shape" >"$dir/functions/$function_name/report_desc"
+		# ONE WRITE, because each write of this attribute REPLACES the descriptor: bash's printf hands its output over
+		# at every newline byte, and a descriptor holding 0x0a - the monitor's two-byte Illuminance usage is `0a d1 04`
+		# - reached the function as only what followed the last one. `dd` gathers the whole of it first.
+		hid_descriptor "$shape" | dd of="$dir/functions/$function_name/report_desc" bs=4096 iflag=fullblock status=none
 		# NO OUT ENDPOINT FOR THE UPS, so SET_REPORT comes over the control pipe - which is how a host writes a
 		# UPS's feature reports - and reaches `ups-sim.py` through the function's read side.
-		if [[ "$shape" == "hid-ups" ]]; then
+		if [[ "$shape" == "hid-ups" || "$shape" == "hid-monitor" ]]; then
 			write_attr "$dir/functions/$function_name/no_out_endpoint" 1
 		fi
 		;;
@@ -671,7 +695,7 @@ setup)
 teardown) cmd_teardown ;;
 verify) cmd_verify ;;
 *)
-	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|hid-gamepad-pair|uac2|printer|midi|midi-echo|ups|ccid|dfu|bt|mbim|uvc> | teardown | verify" >&2
+	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|hid-gamepad-pair|uac2|printer|midi|midi-echo|ups|monitor|consumer-keys|ccid|dfu|bt|mbim|uvc> | teardown | verify" >&2
 	exit 2
 	;;
 esac

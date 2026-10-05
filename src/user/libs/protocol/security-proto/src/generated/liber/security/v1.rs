@@ -186,6 +186,23 @@ pub enum Capability {
 	/// curve where the platform leaves the fan to the operating system. Never `_CRT` or `_HOT`, which no verb reaches.
 	/// Granted to `powerctl`. Appended last.
 	ProcessorPower = 54,
+	/// THE BRIGHTNESS, READ: the outputs, every backlight with its levels and standing, and the change stream - a
+	/// connection from DisplayService's `BRIGHTNESS` root, on which nothing sets anything. Granted to `brightness`.
+	/// Appended last.
+	Brightness = 55,
+	/// THE BRIGHTNESS, SET: a level, and the policy's automatic brightness and idle timeout - a connection from the
+	/// brightness policy's `CONTROL` root. Granted to `brightness`. Appended last.
+	BrightnessControl = 56,
+	/// AN APPLICATION'S GATT CLIENT, minted per launch for one bonded peer the operator gave an alias and trusted for GATT,
+	/// and the services the component's policy row names - never one the Bluetooth stack drives itself.
+	BluetoothGatt = 57,
+	/// AUDIOSERVICE, OPERATED: the device inventory, the default output, input and voice device, each device's level and
+	/// the streams' placement - a connection from AudioService's `CONTROL` root. Granted to `audioctl`. Appended last.
+	AudioControl = 58,
+	/// A VOICE SESSION, minted per launch through `audio-admin.open-voices`: a duplex session at a voice rate and its
+	/// call relay, and neither a playback stream nor a recorder of its own - it records as well as plays, so it is
+	/// granted as neither alone. Appended last.
+	AudioVoice = 59,
 }
 
 impl Capability {
@@ -283,6 +300,11 @@ impl Capability {
 			52 => Some(Capability::SystemSleep),
 			53 => Some(Capability::SleepWake),
 			54 => Some(Capability::ProcessorPower),
+			55 => Some(Capability::Brightness),
+			56 => Some(Capability::BrightnessControl),
+			57 => Some(Capability::BluetoothGatt),
+			58 => Some(Capability::AudioControl),
+			59 => Some(Capability::AudioVoice),
 			_ => None,
 		}
 	}
@@ -1455,6 +1477,11 @@ impl Capability {
 			Capability::SystemSleep => out.push_str("\"system-sleep\""),
 			Capability::SleepWake => out.push_str("\"sleep-wake\""),
 			Capability::ProcessorPower => out.push_str("\"processor-power\""),
+			Capability::Brightness => out.push_str("\"brightness\""),
+			Capability::BrightnessControl => out.push_str("\"brightness-control\""),
+			Capability::BluetoothGatt => out.push_str("\"bluetooth-gatt\""),
+			Capability::AudioControl => out.push_str("\"audio-control\""),
+			Capability::AudioVoice => out.push_str("\"audio-voice\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1514,6 +1541,11 @@ impl Capability {
 			Capability::SystemSleep => out.push_str("system-sleep"),
 			Capability::SleepWake => out.push_str("sleep-wake"),
 			Capability::ProcessorPower => out.push_str("processor-power"),
+			Capability::Brightness => out.push_str("brightness"),
+			Capability::BrightnessControl => out.push_str("brightness-control"),
+			Capability::BluetoothGatt => out.push_str("bluetooth-gatt"),
+			Capability::AudioControl => out.push_str("audio-control"),
+			Capability::AudioVoice => out.push_str("audio-voice"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1573,6 +1605,11 @@ impl Capability {
 			Capability::SystemSleep => crate::codec::cbor::text(out, "system-sleep"),
 			Capability::SleepWake => crate::codec::cbor::text(out, "sleep-wake"),
 			Capability::ProcessorPower => crate::codec::cbor::text(out, "processor-power"),
+			Capability::Brightness => crate::codec::cbor::text(out, "brightness"),
+			Capability::BrightnessControl => crate::codec::cbor::text(out, "brightness-control"),
+			Capability::BluetoothGatt => crate::codec::cbor::text(out, "bluetooth-gatt"),
+			Capability::AudioControl => crate::codec::cbor::text(out, "audio-control"),
+			Capability::AudioVoice => crate::codec::cbor::text(out, "audio-voice"),
 		}
 	}
 }

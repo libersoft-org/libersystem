@@ -32,9 +32,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::bluetooth_bond_store::{self, Service};
-use proto::system::{BondRecord, Error, OpenOpts, PeerAddress, PeerKind, SecurityLevel, WriterMode, volume, writer};
+use proto::system::{BondLevel, BondRecord, Error, KeyAgreement, OpenOpts, PeerAddress, PeerKind, Profile, Radio, SecurityLevel, WriterMode, volume, writer};
 use rt::*;
-use service_logic::bond_store::{Address, MAX_NAME, Record, Refusal, Store, load};
+use service_logic::bond_store::{Address, MAX_ALIAS, MAX_NAME, RADIO_CLASSIC, RADIO_LE, Record, Refusal, Store, load};
 
 include!(concat!(env!("OUT_DIR"), "/roles_bluetooth_bond_store.rs"));
 
@@ -73,6 +73,9 @@ fn peer_kind_wire(kind: PeerKind) -> u8 {
 	match kind {
 		PeerKind::Public => 1,
 		PeerKind::RandomStatic => 2,
+		PeerKind::Bredr => 3,
+		// A RESOLVABLE ADDRESS IS NEVER A BOND'S: the store refuses the kind it maps to.
+		PeerKind::Resolvable => 4,
 	}
 }
 
@@ -80,8 +83,47 @@ fn peer_kind_from(kind: u8) -> Option<PeerKind> {
 	match kind {
 		1 => Some(PeerKind::Public),
 		2 => Some(PeerKind::RandomStatic),
+		3 => Some(PeerKind::Bredr),
 		_ => None,
 	}
+}
+
+fn agreement_wire(agreement: KeyAgreement) -> u8 {
+	match agreement {
+		KeyAgreement::Legacy => 1,
+		KeyAgreement::LeLegacy => 2,
+		KeyAgreement::P192 => 3,
+		KeyAgreement::SecureConnections => 4,
+	}
+}
+
+fn agreement_from(value: u8) -> KeyAgreement {
+	match value {
+		1 => KeyAgreement::Legacy,
+		2 => KeyAgreement::LeLegacy,
+		3 => KeyAgreement::P192,
+		// A RECORD FROM BEFORE THE LEVELS, which LE Secure Connections Just Works made.
+		_ => KeyAgreement::SecureConnections,
+	}
+}
+
+fn trust_wire(trusted: &[Profile]) -> u8 {
+	trusted.iter().fold(0, |bits, profile| bits | trust_bit(*profile))
+}
+
+fn trust_bit(profile: Profile) -> u8 {
+	match profile {
+		Profile::Input => 1 << 0,
+		Profile::Audio => 1 << 1,
+		Profile::Voice => 1 << 2,
+		Profile::Pan => 1 << 3,
+		Profile::Spp => 1 << 4,
+		Profile::Gatt => 1 << 5,
+	}
+}
+
+fn trust_from(bits: u8) -> Vec<Profile> {
+	[Profile::Input, Profile::Audio, Profile::Voice, Profile::Pan, Profile::Spp, Profile::Gatt].into_iter().filter(|profile| bits & trust_bit(*profile) != 0).collect()
 }
 
 fn security_wire(level: SecurityLevel) -> u8 {
@@ -108,22 +150,69 @@ fn record_from_wire(wire: &BondRecord) -> Option<Record> {
 	if wire.version != service_logic::bond_store::VERSION {
 		return None;
 	}
-	if wire.key.len() != 16 {
+	// AN LE BOND CARRIES ITS LONG-TERM KEY, A CLASSIC ONE ITS LINK KEY; either may also carry the other where a key was
+	// derived across transports.
+	let classic = wire.radio == Radio::Classic;
+	if (!wire.key.is_empty() && wire.key.len() != 16) || (!wire.link_key.is_empty() && wire.link_key.len() != 16) || (classic && wire.link_key.is_empty()) || (!classic && wire.key.is_empty()) {
 		return None;
 	}
-	let mut record = Record { local: address_from_wire(&wire.local)?, peer: address_from_wire(&wire.peer)?, security: security_wire(wire.security), enabled: wire.enabled, ..Record::default() };
-	record.key.copy_from_slice(&wire.key);
+	if (!wire.irk.is_empty() && wire.irk.len() != 16) || (!wire.rand.is_empty() && wire.rand.len() != 8) {
+		return None;
+	}
+	let trust = trust_wire(&wire.trusted) | if wire.enabled { trust_bit(Profile::Input) } else { 0 };
+	let mut record = Record { local: address_from_wire(&wire.local)?, peer: address_from_wire(&wire.peer)?, security: security_wire(wire.security), enabled: trust & trust_bit(Profile::Input) != 0, radio: if classic { RADIO_CLASSIC } else { RADIO_LE }, link_key_type: wire.link_key_type, agreement: agreement_wire(wire.level.agreement), authenticated: wire.level.authenticated, trust, ..Record::default() };
+	if !wire.key.is_empty() {
+		record.key.copy_from_slice(&wire.key);
+	}
+	if !wire.link_key.is_empty() {
+		record.link_key.copy_from_slice(&wire.link_key);
+	}
+	if !wire.irk.is_empty() {
+		let mut irk = [0u8; 16];
+		irk.copy_from_slice(&wire.irk);
+		record.irk = Some(irk);
+	}
+	record.ediv = wire.ediv;
+	if !wire.rand.is_empty() {
+		record.rand.copy_from_slice(&wire.rand);
+	}
 	let name = wire.name.as_bytes();
 	let kept = name.len().min(MAX_NAME);
 	record.name[..kept].copy_from_slice(&name[..kept]);
 	record.name_len = kept as u8;
+	let alias = wire.alias.as_bytes();
+	let kept = alias.len().min(MAX_ALIAS);
+	record.alias[..kept].copy_from_slice(&alias[..kept]);
+	record.alias_len = kept as u8;
 	Some(record)
 }
 
 // A stored record onto the wire. `key` is filled only where the caller is entitled to it, which is
 // `lookup` and never `list` - see `list`.
 fn record_to_wire(record: &Record, with_key: bool) -> Option<BondRecord> {
-	Some(BondRecord { version: service_logic::bond_store::VERSION, local: address_to_wire(&record.local)?, peer: address_to_wire(&record.peer)?, key: if with_key { record.key.to_vec() } else { Vec::new() }, security: security_from(record.security)?, name: String::from(core::str::from_utf8(record.name()).unwrap_or("")), enabled: record.enabled })
+	let classic = record.radio == RADIO_CLASSIC;
+	let keyed = |key: &[u8; 16], present: bool| if with_key && present { key.to_vec() } else { Vec::new() };
+	Some(BondRecord {
+		version: service_logic::bond_store::VERSION,
+		local: address_to_wire(&record.local)?,
+		peer: address_to_wire(&record.peer)?,
+		key: keyed(&record.key, !classic || record.key != [0; 16]),
+		security: security_from(record.security)?,
+		name: String::from(core::str::from_utf8(record.name()).unwrap_or("")),
+		enabled: record.trust & trust_bit(Profile::Input) != 0,
+		radio: if classic { Radio::Classic } else { Radio::Le },
+		link_key: keyed(&record.link_key, classic || record.link_key != [0; 16]),
+		link_key_type: record.link_key_type,
+		level: BondLevel { agreement: agreement_from(record.agreement), authenticated: record.authenticated },
+		trusted: trust_from(record.trust),
+		alias: String::from(core::str::from_utf8(record.alias()).unwrap_or("")),
+		irk: match record.irk {
+			Some(irk) if with_key => irk.to_vec(),
+			_ => Vec::new(),
+		},
+		ediv: record.ediv,
+		rand: if with_key && record.rand != [0; 8] { record.rand.to_vec() } else { Vec::new() },
+	})
 }
 
 impl Bonds {

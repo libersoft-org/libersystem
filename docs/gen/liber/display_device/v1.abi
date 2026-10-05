@@ -5,3 +5,23 @@ interface display-device
 method display-device.scanout op=1 () -> result<scanout, liber:base@1::error>
 method display-device.present op=2 (generation:u32:rights=,damage:liber:graphics@1::damage-region:rights=) -> result<unit, liber:base@1::error>
 method display-device.events op=3 () -> stream<device-event>
+record backlight-function(bus:u32,dev:u32,func:u32)
+record monitor-identity(manufacturer:u16,product:u16,serial:u32)
+variant backlight-target(function=0:backlight-function,monitor=1:monitor-identity,none=2:unit)
+enum backlight-source(firmware=0,usb-monitor=1,native=2)
+variant backlight-scale(levels=0:list<u32>,range=1:backlight-range)
+record backlight-range(minimum:u32,maximum:u32)
+record backlight-description(source:backlight-source,key:string,scale:backlight-scale,ac-default:option<u32>,battery-default:option<u32>,target:backlight-target)
+enum backlight-hotkey(up=0,down=1,cycle=2,zero=3)
+variant backlight-event(level=0:u32,hotkey=1:backlight-hotkey)
+interface backlight
+method backlight.describe op=1 () -> result<backlight-description, liber:base@1::error>
+method backlight.get op=2 () -> result<u32, liber:base@1::error>
+method backlight.set op=3 (level:u32:rights=) -> result<u32, liber:base@1::error>
+method backlight.events op=4 () -> stream<backlight-event>
+record light-response(adjustment:u32,illuminance:u32)
+record ambient-light-description(curve:list<light-response>)
+record illuminance(milli-lux:u64)
+interface ambient-light
+method ambient-light.describe op=1 () -> result<ambient-light-description, liber:base@1::error>
+method ambient-light.events op=2 () -> stream<illuminance>

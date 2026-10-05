@@ -89,3 +89,107 @@ interface display-device {
 	/// The bounded event stream: resizes and replacements.
 	@op(3) events: func() -> stream<device-event>;
 }
+
+/// THE PCI FUNCTION A BACKLIGHT BELONGS TO, as the bus enumerates it - the adapter an ACPI video output sits under, or
+/// a native driver's own function.
+record backlight-function {
+	bus:  u32,
+	dev:  u32,
+	func: u32,
+}
+
+/// A MONITOR'S IDENTITY, from its EDID base block: the manufacturer id, the product code and the serial number.
+record monitor-identity {
+	manufacturer: u16,
+	product:      u16,
+	serial:       u32,
+}
+
+/// WHAT A BACKLIGHT BELONGS TO, as its driver reads it and never derives: the ACPI driver copies its adapter's function
+/// from its claim's identity, the USB one reads the monitor's EDID from the device.
+variant backlight-target {
+	function(backlight-function),
+	monitor(monitor-identity),
+	none,
+}
+
+/// WHO DRIVES THE LEVEL: the firmware (ACPI's video extension), a USB monitor's control page, or a graphics driver's
+/// own registers.
+enum backlight-source {
+	firmware,
+	usb-monitor,
+	native,
+}
+
+/// The levels a backlight takes: a discrete list, ascending and without duplicates, or a range.
+variant backlight-scale {
+	levels(list<u32>),
+	range(backlight-range),
+}
+
+record backlight-range {
+	minimum: u32,
+	maximum: u32,
+}
+
+/// A BACKLIGHT DESCRIBES ITSELF: who drives it, the STABLE KEY a stored level is filed under - one that survives a
+/// reboot (`acpi:` and the output node's path; `usb:` and vendor:product:serial, or vendor:product and the port path) -
+/// its levels, the firmware's defaults on AC and on battery where it has them, and what it belongs to.
+record backlight-description {
+	source:          backlight-source,
+	key:             string,
+	scale:           backlight-scale,
+	ac-default:      option<u32>,
+	battery-default: option<u32>,
+	target:          backlight-target,
+}
+
+/// A FIRMWARE HOTKEY, as the firmware notified it: one step up or down, cycle, or to zero.
+enum backlight-hotkey {
+	up,
+	down,
+	cycle,
+	zero,
+}
+
+/// What a backlight reports between calls: its level changed by the firmware or the device itself (a monitor's own
+/// buttons), or a hotkey the firmware raised and did not act on.
+variant backlight-event {
+	level(u32),
+	hotkey(backlight-hotkey),
+}
+
+/// THE BACKLIGHT, as DisplayService drives it - on its own provider kind, beside the display wire, because display
+/// brightness is its one consumer.
+interface backlight {
+	@op(1) describe: func() -> result<backlight-description, error>;
+	/// The level now; `unavailable` where the device cannot say (no `_BQC`, nothing set yet).
+	@op(2) get: func() -> result<u32, error>;
+	/// Set a level from the scale, answering the level set.
+	@op(3) set: func(level: u32) -> result<u32, error>;
+	@op(4) events: func() -> stream<backlight-event>;
+}
+
+/// One point of a light sensor's response curve, as ACPI's `_ALR` gives it: the display adjustment in percent of
+/// normal, at an illuminance in lux.
+record light-response {
+	adjustment:  u32,
+	illuminance: u32,
+}
+
+record ambient-light-description {
+	/// The firmware's response curve, ascending by illuminance, or empty where the sensor has none.
+	curve: list<light-response>,
+}
+
+/// One reading, in thousandths of a lux.
+record illuminance {
+	milli-lux: u64,
+}
+
+/// AN AMBIENT-LIGHT SENSOR, as the brightness policy reads it. The stream's first item is the reading now, so a
+/// consumer never waits for a change to learn the light.
+interface ambient-light {
+	@op(1) describe: func() -> result<ambient-light-description, error>;
+	@op(2) events: func() -> stream<illuminance>;
+}

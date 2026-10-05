@@ -471,6 +471,7 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 	// and never reported in.
 	audio_boot_kernel.send(Message::new(b"LATENCY".to_vec(), alloc::vec::Vec::new())).expect("the latency tag");
 	audio_boot_kernel.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("the stats tag");
+	audio_boot_kernel.send(Message::new(b"CONTROL".to_vec(), alloc::vec::Vec::new())).expect("the control tag");
 	sched::run_until_idle();
 	assert_eq!(&audio_boot_kernel.recv().expect("AudioService online report").bytes[..], b"AudioService: online");
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
@@ -532,11 +533,14 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 		for _ in 0..200_000 {
 			system.pump();
 			// The driver's side of the protocol: a one-byte message is a command, `1` asks for a
-			// period and `2` ends the stream, and `3` asks for the playback counters - which this
-			// stand-in keeps none of, so it refuses with an empty answer as `virtio-snd` does.
-			// Anything else here would be a playback period, which this test never produces.
+			// period and `2` ends the stream, `3` asks for the playback counters - which this
+			// stand-in keeps none of, so it refuses with an empty answer as `virtio-snd` does - and `4`
+			// asks what the device is, which it refuses too: the fixed 48 kHz stereo every provider
+			// spoke before it was asked. Anything else here would be a playback period, which this
+			// test never produces.
 			if let Ok(command) = snd_host.recv() {
 				match command.bytes.as_slice() {
+					[4] => snd_host.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("the format refused"),
 					[1] => {
 						let mut period = alloc::vec::Vec::with_capacity(PERIOD_BYTES);
 						while period.len() < PERIOD_BYTES {

@@ -188,7 +188,10 @@ fn a_consumer_accepted_during_a_wait_on_the_callers_set_is_handed_back_so_the_se
                 raise SystemExit(f'{name}: expected assertion failure:\n{result.stdout}')
             print(f'driver-connections: rejected {name}')
     subprocess.run([sys.executable, str(ROOT / 'src/tools/check-provider-catalogue.py')], check=True)
-    subprocess.run([sys.executable, str(ROOT / 'src/tools/check-audio-provider-recovery.py')], check=True)
+    # AUDIOSERVICE'S PROVIDER RECOVERY is no longer a fragment extracted from one slot: every publication is a device
+    # of its own, withdrawn by its identity and failed by its channel, and the kernel suite drives it with two
+    # providers (`kernel.services.audio_service_routes_streams_by_the_device_inventory`) and with its only driver
+    # gone (`kernel.services.audio_service_keeps_streams_through_driver_loss`).
 
 
 if __name__ == '__main__':

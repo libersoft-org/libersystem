@@ -6873,6 +6873,8 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::PLATFORM_SWITCH => proto::system::ProviderKind::PlatformSwitch,
 		provider::THERMAL_ZONE => proto::system::ProviderKind::ThermalZone,
 		provider::COOLING_DEVICE => proto::system::ProviderKind::CoolingDevice,
+		provider::BACKLIGHT => proto::system::ProviderKind::Backlight,
+		provider::AMBIENT_LIGHT => proto::system::ProviderKind::AmbientLight,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6909,6 +6911,8 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::PlatformSwitch => driver_protocol::provider::PLATFORM_SWITCH,
 		proto::system::ProviderKind::ThermalZone => driver_protocol::provider::THERMAL_ZONE,
 		proto::system::ProviderKind::CoolingDevice => driver_protocol::provider::COOLING_DEVICE,
+		proto::system::ProviderKind::Backlight => driver_protocol::provider::BACKLIGHT,
+		proto::system::ProviderKind::AmbientLight => driver_protocol::provider::AMBIENT_LIGHT,
 	}
 }
 
@@ -7000,7 +7004,7 @@ struct CatalogueClients {
 	channels: [u64; MAX_CATALOGUE_CLIENTS],
 	// Indexed exactly like `channels`, and moved with it by `retire`: a scope that stayed behind
 	// when its channel was replaced would be the previous holder's authority handed to the next.
-	scopes: [u32; MAX_CATALOGUE_CLIENTS],
+	scopes: [u64; MAX_CATALOGUE_CLIENTS],
 	count: usize,
 }
 
@@ -7194,7 +7198,7 @@ fn open_subscription(service: u64, scope: Scope, catalogue: &mut Catalogue, node
 		// catalogue's own root answers CONNECT with - and any other number is a manifest row whose
 		// kind list is missing one. The two are different mistakes in different files, and a
 		// refusal that does not separate them sends the reader to the wrong one.
-		let digits = decimal(scope.bits() as u64, &mut number);
+		let digits = decimal(scope.bits(), &mut number);
 		line[n..n + digits].copy_from_slice(&number[..digits]);
 		n += digits;
 		for byte in b")\n" {

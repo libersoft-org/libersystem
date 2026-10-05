@@ -1316,6 +1316,12 @@ pub struct Framebuffer {
 	/// reading it back is the one access pattern that is orders of magnitude slower than it looks,
 	/// and a consumer that cannot ask has to assume the worse case or be wrong.
 	pub memory_type: u32,
+	/// THE PCI FUNCTION THAT DECODES THE SURFACE, where the kernel's boot scan found one whose memory BAR holds its
+	/// base: `bus << 16 | device << 8 | function`, read only when `decoder_present` is 1. None for a ramfb or a
+	/// device tree's simple framebuffer, which no function decodes. A laptop's panel is the boot framebuffer and its
+	/// firmware's backlight is joined to the output by this function.
+	pub decoder: u32,
+	pub decoder_present: u32,
 }
 
 /// The memory types `Framebuffer::memory_type` names. WRITE-BACK is what every target this system

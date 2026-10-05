@@ -4,6 +4,82 @@ package liber:audio@1;
 
 use liber:base@1.{error};
 
+// ------------------------------------------------------------------ the device model
+
+/// WHERE A DEVICE IS REACHED: a catalogue `audio` provider - a sound card or a USB audio function - or an endpoint
+/// BluetoothService offers on `bluetooth-audio`.
+enum audio-transport {
+	provider  = 1,
+	bluetooth = 2,
+}
+
+/// A device's own PCM format: signed 16-bit little-endian, interleaved, at this rate and channel count.
+record audio-format {
+	rate:     u32,
+	channels: u8,
+}
+
+/// ONE DEVICE IN THE INVENTORY. `id` is AudioService's number for this arrival and is never reused while the service
+/// runs: a device that leaves and comes back is a new arrival with a new number.
+record audio-device {
+	id:              u32,
+	/// What the device calls itself, or what it is - "virtio sound", a headset's name.
+	@bound(48) label: string,
+	transport:       audio-transport,
+	/// The directions it serves, each in the device's own format; none is a direction it does not have.
+	output:          option<audio-format>,
+	input:           option<audio-format>,
+	/// A VOICE DEVICE: a headset's or earbuds' call audio, mono at a voice rate both ways, used by voice sessions and
+	/// never by music. Its link is up only while a session is open.
+	voice:           bool,
+	/// A PHONE PLAYING TO THIS SYSTEM: a stream this service plays to the default output itself, never an input a
+	/// recorder can read.
+	route:           bool,
+	/// The device's own latency in microseconds: its period queue, and a codec frame, a sink's delay report or a
+	/// presentation delay where it has one.
+	latency-us:      u32,
+	/// Its level, 0 to 100.
+	volume:          u8,
+	/// The device applies the level itself and its samples are not scaled; otherwise this service scales them.
+	hardware-volume: bool,
+	/// Whether it is the default for each direction now.
+	default-output:  bool,
+	default-input:   bool,
+	default-voice:   bool,
+}
+
+/// A direction a device can be the default for.
+enum audio-direction {
+	output = 1,
+	input  = 2,
+	voice  = 3,
+}
+
+/// ONE STREAM AS THE OPERATOR SEES IT: where it plays, what it is, and the silence it has played.
+record audio-stream-info {
+	/// The device it plays on now; none with no device at all.
+	device:        option<u32>,
+	/// The device it named, where it named one; it follows the default otherwise.
+	named:         option<u32>,
+	format:        audio-format,
+	/// Its queue and its device's latency, in microseconds.
+	latency-us:    u32,
+	/// Frames of silence played in its place: while it had no device, or between devices.
+	silent-frames: u64,
+	/// A voice session's playback half, or the phone's stream this service plays itself.
+	voice:         bool,
+	route:         bool,
+}
+
+/// WHAT THE ROUTING RULE COUNTED: streams moved between devices, frames played into no device, and the phone stream's
+/// jitter buffer - periods dropped full and periods of silence given empty.
+record audio-counters {
+	moves:           u64,
+	silent-frames:   u64,
+	route-overflows: u64,
+	route-underruns: u64,
+}
+
 /// AudioService: headless PCM playback and capture over the virtio-sound device. `beep` queues a
 /// tone of the given frequency (Hz) and duration (milliseconds) into the same mixer - the device is
 /// reached as a capability (the channel this interface is served on), never as
@@ -13,10 +89,19 @@ use liber:base@1.{error};
 /// sub-channel served as `pcm-capture`, converted DOWN from the hardware's 48 kHz stereo to the
 /// rate and channel count asked for. It answers not-found on a machine whose sound device has no
 /// input stream, which is an ordinary machine rather than an error.
+///
+/// THE DEVICE MODEL (additive at version 1): `devices` is the inventory every scope may read, `open-stream-to` and
+/// `open-capture-from` name a device instead of following the default - and move to the default when it leaves -
+/// and `open-voice` opens a duplex voice session at 8 or 16 kHz mono on a connection allowed both ways. A stream
+/// opened with no device at all is accepted and plays into silence, counted, until one arrives.
 interface audio {
-	@op(1) beep:         func(freq: u16, millis: u32) -> result<unit, error>;
-	@op(2) open-stream:  func(rate: u32, channels: u8) -> result<handle<channel>, error>;
-	@op(3) open-capture: func(rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(1) beep:              func(freq: u16, millis: u32) -> result<unit, error>;
+	@op(2) open-stream:       func(rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(3) open-capture:      func(rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(4) devices:           func() -> list<audio-device>;
+	@op(5) open-stream-to:    func(device: u32, rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(6) open-capture-from: func(device: u32, rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(7) open-voice:        func(rate: u32) -> result<handle<channel>, error>;
 }
 
 /// A playback stream returned by `audio.open-stream`. Samples are signed 16-bit
@@ -25,8 +110,10 @@ interface audio {
 /// bounded playback capacity is available, making synchronous IPC backpressure the playback clock. Closing the
 /// channel is equivalent to `close`; explicit close drains accepted samples first.
 interface pcm-stream {
-	@op(1) write: func(data: buffer) -> result<u32, error>;
-	@op(2) close: func() -> result<unit, error>;
+	@op(1) write:   func(data: buffer) -> result<u32, error>;
+	@op(2) close:   func() -> result<unit, error>;
+	/// The stream's latency in microseconds: what it holds queued, and its device's own.
+	@op(3) latency: func() -> u32;
 }
 
 /// A capture stream returned by `audio.open-capture`. Samples are signed 16-bit little-endian,
@@ -36,8 +123,10 @@ interface pcm-stream {
 /// the device the capture clock the way playback backpressure is the playback clock. An empty
 /// answer means the stream is over; closing the channel is equivalent to `close`.
 interface pcm-capture {
-	@op(1) read:  func() -> result<list<u8>, error>;
-	@op(2) close: func() -> result<unit, error>;
+	@op(1) read:    func() -> result<list<u8>, error>;
+	@op(2) close:   func() -> result<unit, error>;
+	/// The device's own latency in microseconds.
+	@op(3) latency: func() -> u32;
 }
 
 /// Privileged launcher boundary that mints factories restricted to one direction.
@@ -45,9 +134,13 @@ interface pcm-capture {
 /// `open-capture`. Neither can queue `beep` tones, and NEITHER CAN DO THE OTHER'S JOB: "may record"
 /// is not "may make a sound", and a launcher that cannot say which it is granting is a launcher that
 /// hands a microphone to anything that beeps.
+///
+/// `open-voices` MINTS THE THIRD: a connection that may only `open-voice` - a duplex session, which records as well as
+/// plays and so is granted as neither alone (`audio-voice`).
 interface audio-admin {
 	@op(1) open-streams:  func() -> result<handle<channel>, error>;
 	@op(2) open-captures: func() -> result<handle<channel>, error>;
+	@op(3) open-voices:   func() -> result<handle<channel>, error>;
 }
 
 /// WHAT THE PLAYING DEVICE COUNTED, for the System Graph: OBSERVATION AND NEVER ENFORCEMENT, and never a
@@ -73,4 +166,52 @@ record audio-resources {
 /// record one. The System Graph is handed this endpoint and nothing else.
 interface audio-stats {
 	@op(1) resources: func() -> audio-resources;
+}
+/// AN OPERATOR AUTHORITY ON AUDIOSERVICE: the inventory, the default devices and each device's level, held by
+/// `audioctl` as `btctl` holds Bluetooth's. Resolved by name through the broker, minted per launch by PermissionManager
+/// for a component its policy names.
+interface audio-control {
+	@op(1) devices:     func() -> list<audio-device>;
+	/// Make a device the default for a direction, as its arrival would; the device it displaced returns when it leaves.
+	@op(2) set-default: func(device: u32, direction: audio-direction) -> result<unit, error>;
+	/// A device's level, 0 to 100: sent to a device that applies it itself, or scaled here.
+	@op(3) set-volume:  func(device: u32, volume: u8) -> result<unit, error>;
+	@op(4) streams:     func() -> list<audio-stream-info>;
+	@op(5) counters:    func() -> audio-counters;
+}
+
+// ------------------------------------------------------------------ voice and calls
+
+/// The state of a call a voice session's holder declares, relayed to the voice device.
+enum call-state {
+	none     = 0,
+	incoming = 1,
+	outgoing = 2,
+	active   = 3,
+	held     = 4,
+}
+
+/// What a headset asks of a call: relayed to the session that declared one.
+enum call-command {
+	answer  = 1,
+	hang-up = 2,
+	reject  = 3,
+	redial  = 4,
+}
+
+/// A DUPLEX VOICE SESSION from `audio.open-voice`: mono at the session's rate, signed 16-bit little-endian. `write` is
+/// playback with the same backpressure as `pcm-stream`; `read` answers one period of what the voice device - or the
+/// default input - heard, converted to the session's rate. OPENING A SESSION IS WHAT BRINGS A HEADSET'S AUDIO LINK UP
+/// and closing the last one takes it down.
+interface voice-session {
+	@op(1) write:    func(data: buffer) -> result<u32, error>;
+	@op(2) read:     func() -> result<list<u8>, error>;
+	/// The call this session declares - or none. The voice device is told; with none declared anywhere, a headset is
+	/// told there is no call and its commands are refused.
+	@op(3) set-call: func(state: call-state) -> result<unit, error>;
+	/// The voice device's call commands as they arrive.
+	@op(4) commands: func() -> result<stream<call-command>, error>;
+	/// The session's latency both ways, in microseconds.
+	@op(5) latency:  func() -> u32;
+	@op(6) close:    func() -> result<unit, error>;
 }

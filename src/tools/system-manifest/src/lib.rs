@@ -231,6 +231,10 @@ pub enum ProviderKindName {
 	ThermalZone,
 	/// A fan, with ProcessorPowerService its one consumer.
 	CoolingDevice,
+	/// A display backlight, with DisplayService its one consumer.
+	Backlight,
+	/// An ambient-light sensor, with the brightness policy its one consumer.
+	AmbientLight,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -287,6 +291,8 @@ impl ProviderKindName {
 			ProviderKindName::PlatformSwitch => 28,
 			ProviderKindName::ThermalZone => 29,
 			ProviderKindName::CoolingDevice => 30,
+			ProviderKindName::Backlight => 31,
+			ProviderKindName::AmbientLight => 32,
 		}
 	}
 }

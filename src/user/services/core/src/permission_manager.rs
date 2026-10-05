@@ -135,7 +135,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 55] = [
+const VOCABULARY: [Capability; 60] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -240,6 +240,17 @@ const VOCABULARY: [Capability; 55] = [
 	Capability::SleepWake,
 	// THE PROCESSORS' POWER, OPERATED: a fresh connection to ProcessorPowerService's operator root per launch. Read by tag.
 	Capability::ProcessorPower,
+	// THE BRIGHTNESS, read and set: a fresh connection to DisplayService's read root and to the brightness policy's
+	// control root per launch, each read by tag.
+	Capability::Brightness,
+	Capability::BrightnessControl,
+	// AN APPLICATION'S GATT CLIENT, minted per launch from BluetoothService's admin root for one aliased peer and the
+	// services the component's row names. Read by tag.
+	Capability::BluetoothGatt,
+	// AUDIOSERVICE OPERATED: a fresh connection per launch from its operator root; and a voice session's connection,
+	// minted per launch through its admin root. Read by tag.
+	Capability::AudioControl,
+	Capability::AudioVoice,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -352,6 +363,11 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// scheduled wake, which is a grant of its own.
 		b"sleepctl" => Some(granted("sleepctl", alloc::vec![Capability::SystemSleep, Capability::SleepWake])),
 		b"powerctl" => Some(granted("powerctl", alloc::vec![Capability::PowerState, Capability::ProcessorPower])),
+		// THE BRIGHTNESS TOOL holds both, as `btctl` holds both Bluetooth authorities; the development probes split them:
+		// `brightcheck` both, `brightread` the read alone - its half of the gate is that it reads and cannot set.
+		b"brightness" => Some(granted("brightness", alloc::vec![Capability::Brightness, Capability::BrightnessControl])),
+		b"brightcheck" => Some(granted("brightcheck", alloc::vec![Capability::Brightness, Capability::BrightnessControl])),
+		b"brightread" => Some(granted("brightread", alloc::vec![Capability::Brightness])),
 		// THE TPM DEMONSTRATION TOOL, and the one shipping row that holds any TPM grant: all three, and the files
 		// it keeps sealed objects and quotes in. There is one TPM and no alias, so this row IS the policy.
 		b"tpm" => Some(granted("tpm", alloc::vec![Capability::Tpm, Capability::TpmMeasure, Capability::TpmSeal, Capability::Volumes])),
@@ -392,6 +408,11 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 			],
 		)),
 		b"btread" => Some(granted("btread", alloc::vec![Capability::Bluetooth])),
+		// THE LE GATE'S APPLICATION, development-only: a GATT client on the peer aliased `tag-1`, and nothing else.
+		b"btgatt" => Some(granted("btgatt", alloc::vec![Capability::BluetoothGatt])),
+		// THE BR/EDR GATE'S PROBE, development-only: both Bluetooth authorities, since it is the prompt watcher a
+		// person would be, and the fixture's control endpoint, through which the devices on the far side act.
+		b"btclassic" => Some(granted("btclassic", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator, Capability::FixtureControl, Capability::AudioStream, Capability::AudioControl])),
 		// THE HID-OVER-I2C GATE'S PROBE, development-only: the device list and its policy verbs - it disables and
 		// enables the I2C controller's binding and the touchscreen's - the pointer and contact streams, and a display
 		// surface whose input focus is the proof the contact stream asks for.
@@ -515,6 +536,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// A RECORDER HOLDS TWO THINGS: somewhere to write, and the authority to record. Not
 		// `audio-stream`, which it has no use for, and not `audio`, which is the whole service.
 		b"audiorec" => Some(granted("audiorec", alloc::vec![Capability::Volumes, Capability::AudioCapture])),
+		// THE AUDIO OPERATOR'S TOOL, the one shipping holder of `audio-control`: the inventory, the defaults and the
+		// levels - and no stream, recorder or voice session of its own.
+		b"audioctl" => Some(granted("audioctl", alloc::vec![Capability::AudioControl])),
+		// THE DEVICE MODEL'S DEVELOPMENT PROBE: a stream, a recorder and a voice session, and the operator authority to
+		// read where each of them plays.
+		b"audioprobe" => Some(granted("audioprobe", alloc::vec![Capability::AudioStream, Capability::AudioCapture, Capability::AudioControl, Capability::AudioVoice])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
 		b"usage" => Some(granted("usage", alloc::vec![Capability::Resource])),
 		b"ps" => Some(granted("ps", alloc::vec![Capability::Resource, Capability::Process])),
@@ -659,6 +686,11 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::SystemSleep => CAP_SLEEP,
 		Capability::SleepWake => CAP_SLEEP_WAKE,
 		Capability::ProcessorPower => CAP_PROCESSOR_POWER,
+		Capability::Brightness => CAP_BRIGHTNESS,
+		Capability::BrightnessControl => CAP_BRIGHTNESS_CONTROL,
+		Capability::BluetoothGatt => b"BTGATT",
+		Capability::AudioControl => CAP_AUDIO_CONTROL,
+		Capability::AudioVoice => b"AUDIO_VOICE",
 	}
 }
 
@@ -744,6 +776,8 @@ struct Clients {
 	// CAMERASERVICE'S INVENTORY AND MINTING ROOTS, the same way.
 	camera: u64,
 	camera_admin: u64,
+	// BLUETOOTHSERVICE'S MINTING ROOT, the same way.
+	bt_admin: u64,
 	// MIDISERVICE'S INVENTORY AND MINTING ROOTS, the same way.
 	midi: u64,
 	midi_admin: u64,
@@ -764,6 +798,9 @@ struct Clients {
 	sleep_wake: u64,
 	// PROCESSORPOWERSERVICE'S OPERATOR ROOT, resolved by name: every grant is a fresh connection from it.
 	processor_power: u64,
+	brightness: u64,
+	brightness_control: u64,
+	audio_control: u64,
 	// What the last grant resolved a selection to, for its audit entry: the exact reader a smart-card
 	// grant was minted for. Taken by the audit line that follows the grant, so it never outlives it.
 	grant_detail: String,
@@ -790,7 +827,7 @@ impl Clients {
 			Capability::Supervisor => self.supervisor,
 			Capability::Services => self.services,
 			Capability::Usb => self.usb_catalogue,
-			Capability::Display | Capability::InputKeys | Capability::AudioStream | Capability::AudioCapture => 0,
+			Capability::Display | Capability::InputKeys | Capability::AudioStream | Capability::AudioCapture | Capability::AudioVoice => 0,
 			// The `volumes` capability has no single representative client - it is granted as a
 			// bundle of five channels by `grant_volumes`, never through this single-channel path.
 			// The system volume stands in here for the (headless-denied) dynamic-request path.
@@ -831,6 +868,11 @@ impl Clients {
 			Capability::SystemSleep => self.sleep,
 			Capability::SleepWake => self.sleep_wake,
 			Capability::ProcessorPower => self.processor_power,
+			Capability::Brightness => self.brightness,
+			Capability::BrightnessControl => self.brightness_control,
+			// Minted per launch through BluetoothService's admin root: see `grant_for_task`.
+			Capability::BluetoothGatt => 0,
+			Capability::AudioControl => self.audio_control,
 		}
 	}
 }
@@ -885,6 +927,18 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 				return 0;
 			}
 			match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_streams() {
+				Some(Ok(audio)) => audio,
+				_ => 0,
+			}
+		}
+		// A VOICE SESSION, FROM THE SAME ADMIN CHANNEL AND A GRANT OF ITS OWN: the connection this mints answers
+		// `open-voice` and refuses a stream, a recorder and a beep - a duplex session plays and records, so it is
+		// granted as neither alone.
+		Capability::AudioVoice => {
+			if clients.audio_admin == 0 {
+				return 0;
+			}
+			match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_voices() {
 				Some(Ok(audio)) => audio,
 				_ => 0,
 			}
@@ -981,6 +1035,29 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 					clients.grant_detail = alloc::format!("modem slot {} generation {} binding {} sim {}", minted.modem.slot, minted.modem.generation, minted.modem.binding_generation, minted.sim_generation);
 					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
 					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
+		// A GATT CLIENT ON ONE ALIASED PEER, for this component and this task, over the services its row names. Minting
+		// connects nothing: the client asks, and the grant ends with the task however its connection is copied.
+		Capability::BluetoothGatt => {
+			let Some((alias, services)) = bluetooth_gatt_policy(component) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.bt_admin, clients.broker, CAP_BT_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let services: Vec<proto::system::ServiceClass> = services.iter().map(|&uuid| proto::system::ServiceClass { uuid }).collect();
+			let minted = proto::system::bluetooth_admin::Client::new(ChannelTransport { chan: admin }).mint_gatt(alias, &services, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(connection)) => {
+					clients.grant_detail = alloc::format!("bluetooth peer {alias}");
+					let narrowed = duplicate(connection, GRANT_RIGHTS);
+					close(connection);
 					if narrowed > 0 { narrowed as u64 } else { 0 }
 				}
 				_ => 0,
@@ -1138,6 +1215,19 @@ fn midi_output_policy(component: &str) -> Option<(&'static str, u32)> {
 		// And the UMP probe's, the UMP transmit endpoint, played back on the one its receiver reads.
 		if component == "midiump" {
 			return Some(("fixture", 4));
+		}
+	}
+	let _ = component;
+	None
+}
+
+// WHICH PEER AND WHICH SERVICES A COMPONENT'S GATT GRANT IS FOR: an alias the operator gave a bonded peer with
+// `btctl alias`, never an address, and the 16-bit service classes it may reach. The default is no peer at all.
+fn bluetooth_gatt_policy(component: &str) -> Option<(&'static str, &'static [u16])> {
+	{
+		// THE LE GATE'S APPLICATION, development-only: the fixture tag's battery and custom services.
+		if component == "btgatt" {
+			return Some(("tag-1", &[0x180f, 0xfff0]));
 		}
 	}
 	let _ = component;
@@ -1357,6 +1447,12 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		Capability::SleepWake => (&mut clients.sleep_wake, CAP_SLEEP_WAKE),
 		// A FRESH CONNECTION PER LAUNCH from ProcessorPowerService's operator root.
 		Capability::ProcessorPower => (&mut clients.processor_power, CAP_PROCESSOR_POWER),
+		// A FRESH CONNECTION PER LAUNCH from DisplayService's brightness read root and the brightness policy's control
+		// root.
+		Capability::Brightness => (&mut clients.brightness, CAP_BRIGHTNESS),
+		Capability::BrightnessControl => (&mut clients.brightness_control, CAP_BRIGHTNESS_CONTROL),
+		// A FRESH CONNECTION PER LAUNCH from AudioService's operator root, resolved by name like the others.
+		Capability::AudioControl => (&mut clients.audio_control, CAP_AUDIO_CONTROL),
 		_ => {
 			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
 			return if dup >= 0 { dup as u64 } else { 0 };
@@ -2631,7 +2727,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, sleep: 0, sleep_wake: 0, processor_power: 0, grant_detail: String::new() };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, bt_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, sleep: 0, sleep_wake: 0, processor_power: 0, brightness: 0, brightness_control: 0, audio_control: 0, grant_detail: String::new() };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

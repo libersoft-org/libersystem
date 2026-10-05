@@ -120,6 +120,10 @@ name = "processor_power_service"
 path = "src/processor_power_service.rs"
 
 [[bin]]
+name = "brightness_policy"
+path = "src/brightness_policy.rs"
+
+[[bin]]
 name = "modem_service"
 path = "src/modem_service.rs"
 
@@ -185,6 +189,26 @@ path = "src/btread.rs"
 required-features = ["development"]
 
 [[bin]]
+# The BR/EDR gate's scenario driver, absent from a shipped image: both Bluetooth authorities and the fixture's
+# control endpoint.
+name = "btclassic"
+path = "src/btclassic.rs"
+required-features = ["development"]
+
+[[bin]]
+# The LE gate's application, absent from a shipped image: one GATT grant on the aliased fixture tag.
+name = "btgatt"
+path = "src/btgatt.rs"
+required-features = ["development"]
+
+[[bin]]
+# The audio device model's scenario driver, absent from a shipped image: a stream, a recorder, a voice session and the
+# operator authority that reads where each plays.
+name = "audioprobe"
+path = "src/audioprobe.rs"
+required-features = ["development"]
+
+[[bin]]
 # THE POWER GATE'S SCENARIO DRIVER, absent from a shipped image: it holds PowerService's control
 # authority and the power fixture's control endpoint, which only a development image has.
 name = "powercheck"
@@ -195,6 +219,19 @@ required-features = ["development"]
 # The power gate's ordinary read client, which holds the read authority and nothing else.
 name = "powerread"
 path = "src/powerread.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE BRIGHTNESS GATE'S DRIVER, absent from a shipped image: it holds what the `brightness` tool holds and prints a
+# verdict per case.
+name = "brightcheck"
+path = "src/brightcheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# The brightness gate's ordinary read client, which holds the read and nothing else.
+name = "brightread"
+path = "src/brightread.rs"
 required-features = ["development"]
 
 [[bin]]

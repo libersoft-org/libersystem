@@ -369,6 +369,13 @@ unsafe fn feed_event(addr: u64, mods: &mut Mods, key_sink: u64) {
 			return;
 		}
 		if value <= 1 {
+			// EV_KEY 224 AND 225 ARE THE BRIGHTNESS PAIR: no keyboard-page usage, so they travel as the consumer page's
+			// system-key frame, translated back through the one table.
+			if key_sink != 0
+				&& let Some(frame) = keys::system_key_frame(keys::keycode_consumer(code), value == 1)
+			{
+				let _ = send_blocking(key_sink, &frame, 0);
+			}
 			let usage: u16 = keys::keycode_hid(code);
 			if usage != 0 {
 				let event: [u8; 3] = [usage as u8, (usage >> 8) as u8, (value == 1) as u8];

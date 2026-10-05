@@ -50,6 +50,8 @@ pub mod op {
 	pub const READ_BY_TYPE_RESPONSE: u8 = 0x09;
 	pub const READ_REQUEST: u8 = 0x0a;
 	pub const READ_RESPONSE: u8 = 0x0b;
+	pub const READ_BLOB_REQUEST: u8 = 0x0c;
+	pub const READ_BLOB_RESPONSE: u8 = 0x0d;
 	pub const READ_BY_GROUP_TYPE_REQUEST: u8 = 0x10;
 	pub const READ_BY_GROUP_TYPE_RESPONSE: u8 = 0x11;
 	pub const WRITE_REQUEST: u8 = 0x12;
@@ -135,7 +137,7 @@ pub fn answer<'a>(pdu: &'a [u8], want: u8, mtu: usize) -> Result<Answer<'a>, Ref
 
 /// Whether this subset speaks the opcode at all.
 pub const fn known(opcode: u8) -> bool {
-	matches!(opcode, op::ERROR_RESPONSE | op::EXCHANGE_MTU_REQUEST | op::EXCHANGE_MTU_RESPONSE | op::FIND_INFORMATION_REQUEST | op::FIND_INFORMATION_RESPONSE | op::READ_BY_TYPE_REQUEST | op::READ_BY_TYPE_RESPONSE | op::READ_REQUEST | op::READ_RESPONSE | op::READ_BY_GROUP_TYPE_REQUEST | op::READ_BY_GROUP_TYPE_RESPONSE | op::WRITE_REQUEST | op::WRITE_RESPONSE | op::HANDLE_VALUE_NOTIFICATION | op::WRITE_COMMAND)
+	matches!(opcode, op::ERROR_RESPONSE | op::EXCHANGE_MTU_REQUEST | op::EXCHANGE_MTU_RESPONSE | op::FIND_INFORMATION_REQUEST | op::FIND_INFORMATION_RESPONSE | op::READ_BY_TYPE_REQUEST | op::READ_BY_TYPE_RESPONSE | op::READ_REQUEST | op::READ_RESPONSE | op::READ_BLOB_REQUEST | op::READ_BLOB_RESPONSE | op::READ_BY_GROUP_TYPE_REQUEST | op::READ_BY_GROUP_TYPE_RESPONSE | op::WRITE_REQUEST | op::WRITE_RESPONSE | op::HANDLE_VALUE_NOTIFICATION | op::WRITE_COMMAND)
 }
 
 /// The MTU the two ends will use, from what this client asked for and what the server answered.

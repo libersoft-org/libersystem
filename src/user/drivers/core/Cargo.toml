@@ -249,6 +249,23 @@ test = false
 bench = false
 
 [[bin]]
+# THE ACPI VIDEO BACKLIGHT: one binding per panel output node (the `video-output` class), `_BCL`, `_BCM`, `_BQC` and the
+# adapter's `_DOS` over the node channel, published as a `backlight` to DisplayService. Its pure parts are
+# `src/acpi_video.rs`, in the library and host-tested.
+name = "acpi_backlight"
+path = "src/acpi_backlight_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE ACPI AMBIENT-LIGHT SENSOR: one binding per `ACPI0008` node, `_ALI`, `_ALR` and `_ALP` over the node channel,
+# published as an `ambient-light` to the brightness policy. Its pure parts are in `src/acpi_video.rs` too.
+name = "acpi_als"
+path = "src/acpi_als_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 # THE ACPI BUTTONS AND THE LID: a control-method power or sleep button carries out its press as the fixed one does, and a
 # lid publishes a `platform-switch`. Its pure parts are `src/acpi_button.rs`, in the library and host-tested.
 name = "acpi_button"

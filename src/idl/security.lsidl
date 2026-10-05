@@ -177,6 +177,23 @@ enum capability {
 	/// curve where the platform leaves the fan to the operating system. Never `_CRT` or `_HOT`, which no verb reaches.
 	/// Granted to `powerctl`. Appended last.
 	processor-power,
+	/// THE BRIGHTNESS, READ: the outputs, every backlight with its levels and standing, and the change stream - a
+	/// connection from DisplayService's `BRIGHTNESS` root, on which nothing sets anything. Granted to `brightness`.
+	/// Appended last.
+	brightness,
+	/// THE BRIGHTNESS, SET: a level, and the policy's automatic brightness and idle timeout - a connection from the
+	/// brightness policy's `CONTROL` root. Granted to `brightness`. Appended last.
+	brightness-control,
+	/// AN APPLICATION'S GATT CLIENT, minted per launch for one bonded peer the operator gave an alias and trusted for GATT,
+	/// and the services the component's policy row names - never one the Bluetooth stack drives itself.
+	bluetooth-gatt,
+	/// AUDIOSERVICE, OPERATED: the device inventory, the default output, input and voice device, each device's level and
+	/// the streams' placement - a connection from AudioService's `CONTROL` root. Granted to `audioctl`. Appended last.
+	audio-control,
+	/// A VOICE SESSION, minted per launch through `audio-admin.open-voices`: a duplex session at a voice rate and its
+	/// call relay, and neither a playback stream nor a recorder of its own - it records as well as plays, so it is
+	/// granted as neither alone. Appended last.
+	audio-voice,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

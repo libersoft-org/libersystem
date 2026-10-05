@@ -369,6 +369,12 @@ enum provider-kind {
 	/// A FAN - `liber:power@1`'s `cooling-device` contract: its levels and the level it runs at - which
 	/// ProcessorPowerService alone consumes and commands.
 	cooling-device = 30,
+	/// A DISPLAY BACKLIGHT - `liber:display-device@1`'s `backlight` contract: its levels, its level and the hotkeys its
+	/// firmware raised - which DisplayService alone consumes.
+	backlight = 31,
+	/// AN AMBIENT-LIGHT SENSOR - `liber:display-device@1`'s `ambient-light` contract - which the brightness policy alone
+	/// consumes.
+	ambient-light = 32,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

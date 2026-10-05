@@ -21,8 +21,9 @@
 /// THIS IS NOT THE VOCABULARY'S SIZE and deliberately does not track it. Whether a number is a kind
 /// this system has is the protocol decoder's question and it already answers it - an unknown
 /// discriminant does not decode, so it never reaches here. What this bounds is the mask, and a kind
-/// allocated past it is a mask that silently wraps.
-pub const MAX_KIND: u16 = 31;
+/// allocated past it is a mask that silently wraps - which is what the brightness kinds, the thirty-first and the
+/// thirty-second, found the thirty-two-bit mask doing: it was widened to sixty-four.
+pub const MAX_KIND: u16 = 63;
 
 /// The most kinds one connection may be minted for, which is the interface's own bound.
 pub const MAX_SCOPE_KINDS: usize = 16;
@@ -43,7 +44,7 @@ pub enum Refusal {
 /// What one minted connection may do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Scope {
-	allowed: u32,
+	allowed: u64,
 }
 
 impl Scope {
@@ -57,7 +58,7 @@ impl Scope {
 	/// IT IS NOT HANDED TO A CONSUMER. The root is a service registration rather than a connection,
 	/// and what reaches it is the supervisor minting on somebody else's behalf.
 	pub const fn unrestricted() -> Self {
-		Self { allowed: u32::MAX }
+		Self { allowed: u64::MAX }
 	}
 
 	/// Mint a scope over these kinds. Duplicates are the same subset and are accepted.
@@ -68,7 +69,7 @@ impl Scope {
 		if kinds.len() > MAX_SCOPE_KINDS {
 			return Err(Refusal::TooManyKinds);
 		}
-		let mut allowed: u32 = 0;
+		let mut allowed: u64 = 0;
 		let mut at = 0;
 		while at < kinds.len() {
 			let kind = kinds[at];
@@ -95,14 +96,14 @@ impl Scope {
 	}
 
 	/// The mask, for a table that stores one per slot.
-	pub const fn bits(&self) -> u32 {
+	pub const fn bits(&self) -> u64 {
 		self.allowed
 	}
 
 	/// The scope a stored mask describes. THE INVERSE OF `bits` AND NOTHING MORE: it is how a table
 	/// gives a scope back, not a second way to construct one, so it performs no validation and a
 	/// caller must not reach it with a number that did not come from `bits`.
-	pub const fn from_bits(allowed: u32) -> Self {
+	pub const fn from_bits(allowed: u64) -> Self {
 		Self { allowed }
 	}
 }

@@ -172,20 +172,29 @@ unsafe fn send_request(sock: &mut SocketClient, request: &[u8]) -> bool {
 
 // Drain the socket's received-data stream (a sub-channel of framed chunks), printing
 // each chunk, until the producer closes - end of stream (the peer's FIN).
+//
+// EACH FRAME RECEIVED AT ITS OWN SIZE. A chunk is as large as the connection's receive buffer
+// held when it was drained, and NetworkService frames it whole; this read every frame into 1024
+// bytes, the kernel cut the message to that, the decode refused what was left, and every chunk
+// past a small HTTP answer vanished without a word - a 4 KiB download printed nothing at all.
 fn drain(sock: &mut SocketClient) {
 	if let Some(rxstream) = sock.recv() {
-		let mut frame: [u8; 1024] = [0u8; 1024];
 		loop {
-			match recv_caps_blocking(rxstream, &mut frame) {
-				ReceivedCaps::Message { len, handles: mut frame_handles } => {
-					if let Some(chunk) = socket::recv_read(&frame[..len], &mut frame_handles) {
+			let mut frame_handles = proto::codec::Handles::new();
+			match recv_vec_caps_blocking(rxstream, &mut frame_handles) {
+				ReceivedVecCaps::Message { bytes } => {
+					if let Some(chunk) = socket::recv_read(&bytes, &mut frame_handles) {
 						print(&chunk.data);
 					}
 					for handle in frame_handles.as_slice() {
 						close(*handle);
 					}
 				}
-				ReceivedCaps::Closed => break,
+				ReceivedVecCaps::Closed => break,
+				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+					eprint(b"nc: the received data could not be read\n");
+					break;
+				}
 			}
 		}
 		close(rxstream);

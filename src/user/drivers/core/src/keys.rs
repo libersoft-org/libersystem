@@ -191,7 +191,9 @@ pub const KEY_SEARCH: u16 = 217;
 pub const KEY_BACK: u16 = 158;
 pub const KEY_FORWARD: u16 = 159;
 
-// The display brightness keys, reserved until backlight control exists.
+// The display brightness keys. Reserved on the CONSOLE path still: they do not reach the line discipline. Where they go
+// instead is the raw key sink, as the consumer page's five-byte frame (`system_key_frame`), and from there InputService's
+// system-key stream to DisplayService, which owns the brightness.
 pub const KEY_BRIGHTNESSDOWN: u16 = 224;
 pub const KEY_BRIGHTNESSUP: u16 = 225;
 
@@ -647,6 +649,21 @@ const HID_KEYCODES: [u16; 0x95] = [
 ];
 
 // Resolve a HID keyboard-page usage id to its keycode (0 = unmapped).
+// Resolve a page-extended HID usage to its keycode: the keyboard page through
+// the boot-usage table (its modifier range through the modifier map), the
+// Consumer page through the multimedia map. 0 = unmapped. SHARED: the xHCI driver's
+// keyboards and InputService's Bluetooth keyboards both send a usage here, so a key types
+// the same whichever keyboard produced it.
+pub fn usage_keycode(usage: u32) -> u16 {
+	let (page, u): (u16, u32) = ((usage >> 16) as u16, usage & 0xffff);
+	match page {
+		0x07 if (0xe0..=0xe7).contains(&u) => HID_MODIFIER_KEYCODES[(u - 0xe0) as usize],
+		0x07 if u <= 0xff => hid_keycode(u as u8),
+		0x0c => consumer_keycode(u as u16),
+		_ => 0,
+	}
+}
+
 pub fn hid_keycode(usage: u8) -> u16 {
 	if (usage as usize) < HID_KEYCODES.len() { HID_KEYCODES[usage as usize] } else { 0 }
 }
@@ -691,6 +708,28 @@ pub fn consumer_keycode(usage: u16) -> u16 {
 		0x227 => KEY_REFRESH,
 		_ => 0,
 	}
+}
+
+// THE SYSTEM-KEY SET: the consumer-page usages that leave a keyboard as their own raw frame rather than a key-event -
+// brightness increment and decrement. Nothing else of the consumer page does.
+pub const SYSTEM_KEY_USAGES: [u16; 2] = [0x6f, 0x70];
+
+// The consumer-page usage of a Linux/virtio EV_KEY code - `consumer_keycode` the other way, through the same table, so
+// one mapping stays the single source. 0 for a code with none.
+pub fn keycode_consumer(code: u16) -> u16 {
+	if code == 0 {
+		return 0;
+	}
+	(0u16..=0x3ff).find(|&usage| consumer_keycode(usage) == code).unwrap_or(0)
+}
+
+// A SYSTEM KEY'S RAW FRAME: `[page u16][usage u16][state u8]`, five bytes beside the keyboard page's three, so a reader
+// tells the two apart by length. Only the system-key set has one.
+pub fn system_key_frame(usage: u16, down: bool) -> Option<[u8; 5]> {
+	if !SYSTEM_KEY_USAGES.contains(&usage) {
+		return None;
+	}
+	Some([0x0c, 0x00, usage as u8, (usage >> 8) as u8, down as u8])
 }
 
 // The keycode of each HID boot-report modifier bit (byte 0, bits 0..7):

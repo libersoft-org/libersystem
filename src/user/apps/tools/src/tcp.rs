@@ -130,18 +130,24 @@ fn connect(netsvc: u64, args: &[u8]) {
 		};
 		if let Some(Ok(_)) = sock.send(&probe) {
 			if let Some(rxstream) = sock.recv() {
-				let mut frame: [u8; 1024] = [0u8; 1024];
+				// EACH FRAME AT ITS OWN SIZE - see `nc`'s drain: a fixed 1024-byte read cut every chunk
+				// past a small answer and the decode dropped it.
 				loop {
-					match recv_caps_blocking(rxstream, &mut frame) {
-						ReceivedCaps::Message { len, handles: mut frame_handles } => {
-							if let Some(chunk) = socket::recv_read(&frame[..len], &mut frame_handles) {
+					let mut frame_handles = proto::codec::Handles::new();
+					match recv_vec_caps_blocking(rxstream, &mut frame_handles) {
+						ReceivedVecCaps::Message { bytes } => {
+							if let Some(chunk) = socket::recv_read(&bytes, &mut frame_handles) {
 								print(&chunk.data);
 							}
 							for handle in frame_handles.as_slice() {
 								close(*handle);
 							}
 						}
-						ReceivedCaps::Closed => break,
+						ReceivedVecCaps::Closed => break,
+						ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+							eprint(b"tcp: the received data could not be read\n");
+							break;
+						}
 					}
 				}
 				close(rxstream);

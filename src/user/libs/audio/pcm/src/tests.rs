@@ -29,3 +29,21 @@ fn phase_accumulator_converts_24_to_48_khz() {
 	mono.advance(&mut phase, &mut frame);
 	assert_eq!((phase, frame), (0, 1));
 }
+
+#[test]
+// A DEVICE AT ITS OWN RATE: a 48 kHz stream on a 16 kHz voice device steps three source frames an output frame, and an
+// 8 kHz one on a 44.1 kHz device repeats each source frame five or six times, never drifting.
+fn the_phase_accumulator_steps_a_stream_at_any_device_rate() {
+	let stereo = Format::new(48_000, 2).unwrap();
+	let (mut phase, mut frame) = (0, 0);
+	for _ in 0..10 {
+		stereo.advance_to(16_000, &mut phase, &mut frame);
+	}
+	assert_eq!((phase, frame), (0, 30));
+	let narrow = Format::new(8_000, 1).unwrap();
+	let (mut phase, mut frame) = (0, 0);
+	for _ in 0..44_100 {
+		narrow.advance_to(44_100, &mut phase, &mut frame);
+	}
+	assert_eq!((phase, frame), (0, 8_000), "a second of output takes a second of source");
+}

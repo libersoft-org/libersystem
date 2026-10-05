@@ -544,6 +544,11 @@ pub mod provider {
 	pub const THERMAL_ZONE: u16 = 29;
 	/// A FAN, the `liber:power@1` `cooling-device` contract, which ProcessorPowerService alone consumes and commands.
 	pub const COOLING_DEVICE: u16 = 30;
+	/// A DISPLAY BACKLIGHT, the `liber:display-device@1` `backlight` contract, which DisplayService alone consumes.
+	pub const BACKLIGHT: u16 = 31;
+	/// AN AMBIENT-LIGHT SENSOR, the `liber:display-device@1` `ambient-light` contract, which the brightness policy alone
+	/// consumes.
+	pub const AMBIENT_LIGHT: u16 = 32;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.
@@ -598,6 +603,10 @@ pub mod provider {
 	pub const USB_BLUETOOTH_NAME: &[u8] = b"org.libersystem.usb.bluetooth";
 	pub const USB_MBIM_NAME: &[u8] = b"org.libersystem.usb.mbim";
 	pub const USB_VIDEO_NAME: &[u8] = b"org.libersystem.usb.video";
+	// A USB MONITOR'S TWO PUBLICATIONS: its brightness, which DisplayService drives, and the ambient-light sensor it
+	// carries, which the brightness policy reads.
+	pub const USB_BACKLIGHT_NAME: &[u8] = b"org.libersystem.usb.backlight";
+	pub const USB_AMBIENT_LIGHT_NAME: &[u8] = b"org.libersystem.usb.ambient-light";
 	// THE DFU SLOT ADMINSERVICE ROUTES `firmware-download` TO, and the name is ITS: the administrative path
 	// reserves it, and a DFU function is the executor that fills it.
 	pub const USB_DFU_NAME: &[u8] = b"org.libersystem.admin-dfu";

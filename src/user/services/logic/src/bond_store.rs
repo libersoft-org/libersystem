@@ -30,8 +30,19 @@ pub const MAX_RECORDS: usize = 64;
 /// The longest peer name kept, which is the same bound the wire carries.
 pub const MAX_NAME: usize = 48;
 
-/// One record's bytes on disk.
-pub const RECORD_BYTES: usize = 89;
+/// One record's bytes on disk: the LE fields first, as they were, then what both radios added - the radio, the BR/EDR
+/// link key and its type, the level on both axes, the trust, the alias and the identity resolving key, then LE legacy's
+/// EDIV and Rand - then the checksum over all of it.
+pub const RECORD_BYTES: usize = 186;
+/// Where the checksum sits, which is everything before it.
+const SUM_AT: usize = RECORD_BYTES - 4;
+
+/// The longest alias kept.
+pub const MAX_ALIAS: usize = 48;
+
+/// The radios a bond is over.
+pub const RADIO_CLASSIC: u8 = 1;
+pub const RADIO_LE: u8 = 2;
 
 /// The most the whole file may be. A file larger than this is not this store's, whatever it
 /// contains, and is refused rather than parsed for whatever fits.
@@ -54,11 +65,30 @@ pub struct Record {
 	pub enabled: bool,
 	pub name: [u8; MAX_NAME],
 	pub name_len: u8,
+	/// `RADIO_CLASSIC` or `RADIO_LE`.
+	pub radio: u8,
+	/// The BR/EDR link key and its type; zero on LE.
+	pub link_key: [u8; 16],
+	pub link_key_type: u8,
+	/// The key agreement (`bt_pairing::Agreement`'s order, 1 to 4) and whether a person authenticated it.
+	pub agreement: u8,
+	pub authenticated: bool,
+	/// The trust bits, one per profile (`bt_policy::Trust`).
+	pub trust: u8,
+	pub alias: [u8; MAX_ALIAS],
+	pub alias_len: u8,
+	/// The LE peer's identity resolving key, where it gave one.
+	pub irk: Option<[u8; 16]>,
+	/// An LE legacy key's EDIV and Rand, which name it when the link is encrypted with it; zero for Secure Connections.
+	pub ediv: u16,
+	pub rand: [u8; 8],
 }
+
+const EMPTY_RECORD: Record = Record { local: Address { kind: 0, bytes: [0; 6] }, peer: Address { kind: 0, bytes: [0; 6] }, key: [0; 16], security: 0, enabled: false, name: [0; MAX_NAME], name_len: 0, radio: RADIO_LE, link_key: [0; 16], link_key_type: 0, agreement: 0, authenticated: false, trust: 0, alias: [0; MAX_ALIAS], alias_len: 0, irk: None, ediv: 0, rand: [0; 8] };
 
 impl Default for Record {
 	fn default() -> Self {
-		Record { local: Address::default(), peer: Address::default(), key: [0; 16], security: 0, enabled: false, name: [0; MAX_NAME], name_len: 0 }
+		EMPTY_RECORD
 	}
 }
 
@@ -66,6 +96,10 @@ impl Record {
 	/// The name, without the padding behind it.
 	pub fn name(&self) -> &[u8] {
 		&self.name[..(self.name_len as usize).min(MAX_NAME)]
+	}
+
+	pub fn alias(&self) -> &[u8] {
+		&self.alias[..(self.alias_len as usize).min(MAX_ALIAS)]
 	}
 }
 
@@ -82,8 +116,10 @@ pub enum Fault {
 	Version { found: u32 },
 	/// A record whose checksum does not match its bytes.
 	Corrupt { at: usize },
-	/// A name length past the field that holds it.
+	/// A name or alias length past the field that holds it.
 	Name { len: u8 },
+	/// A radio this store does not know.
+	Radio { radio: u8 },
 	/// An address kind this store does not know. One and two are public and random-static, which
 	/// are the two this profile speaks; anything else is a record written by something else.
 	AddressKind { kind: u8 },
@@ -100,12 +136,14 @@ fn checksum(bytes: &[u8]) -> u32 {
 	hash
 }
 
-/// The two address kinds this profile speaks.
+/// The address kinds a bond is kept against: an LE public or random-static identity, or a BR/EDR address. A resolvable
+/// address is never one - a bond names the identity it resolves to.
 const KIND_PUBLIC: u8 = 1;
 const KIND_RANDOM_STATIC: u8 = 2;
+const KIND_BREDR: u8 = 3;
 
 fn known_kind(kind: u8) -> bool {
-	kind == KIND_PUBLIC || kind == KIND_RANDOM_STATIC
+	kind == KIND_PUBLIC || kind == KIND_RANDOM_STATIC || kind == KIND_BREDR
 }
 
 /// Write one record's bytes.
@@ -121,8 +159,20 @@ pub fn encode(record: &Record) -> [u8; RECORD_BYTES] {
 	out[35] = u8::from(record.enabled);
 	out[36] = record.name_len;
 	out[37..85].copy_from_slice(&record.name);
-	let sum = checksum(&out[..85]);
-	out[85..89].copy_from_slice(&sum.to_le_bytes());
+	out[85] = record.radio;
+	out[86..102].copy_from_slice(&record.link_key);
+	out[102] = record.link_key_type;
+	out[103] = record.agreement;
+	out[104] = u8::from(record.authenticated);
+	out[105] = record.trust;
+	out[106] = record.alias_len;
+	out[107..155].copy_from_slice(&record.alias);
+	out[155] = u8::from(record.irk.is_some());
+	out[156..172].copy_from_slice(&record.irk.unwrap_or([0; 16]));
+	out[172..174].copy_from_slice(&record.ediv.to_le_bytes());
+	out[174..182].copy_from_slice(&record.rand);
+	let sum = checksum(&out[..SUM_AT]);
+	out[SUM_AT..].copy_from_slice(&sum.to_le_bytes());
 	out
 }
 
@@ -135,8 +185,8 @@ pub fn decode(bytes: &[u8], at: usize) -> Result<Record, Fault> {
 	if bytes.len() != RECORD_BYTES {
 		return Err(Fault::Ragged { len: bytes.len() });
 	}
-	let stored = u32::from_le_bytes([bytes[85], bytes[86], bytes[87], bytes[88]]);
-	if stored != checksum(&bytes[..85]) {
+	let stored = u32::from_le_bytes([bytes[SUM_AT], bytes[SUM_AT + 1], bytes[SUM_AT + 2], bytes[SUM_AT + 3]]);
+	if stored != checksum(&bytes[..SUM_AT]) {
 		return Err(Fault::Corrupt { at });
 	}
 	let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -153,6 +203,27 @@ pub fn decode(bytes: &[u8], at: usize) -> Result<Record, Fault> {
 	record.enabled = bytes[35] != 0;
 	record.name_len = bytes[36];
 	record.name.copy_from_slice(&bytes[37..85]);
+	record.radio = bytes[85];
+	record.link_key.copy_from_slice(&bytes[86..102]);
+	record.link_key_type = bytes[102];
+	record.agreement = bytes[103];
+	record.authenticated = bytes[104] != 0;
+	record.trust = bytes[105];
+	record.alias_len = bytes[106];
+	record.alias.copy_from_slice(&bytes[107..155]);
+	if bytes[155] != 0 {
+		let mut irk = [0u8; 16];
+		irk.copy_from_slice(&bytes[156..172]);
+		record.irk = Some(irk);
+	}
+	record.ediv = u16::from_le_bytes([bytes[172], bytes[173]]);
+	record.rand.copy_from_slice(&bytes[174..182]);
+	if record.radio != RADIO_CLASSIC && record.radio != RADIO_LE {
+		return Err(Fault::Radio { radio: record.radio });
+	}
+	if record.alias_len as usize > MAX_ALIAS {
+		return Err(Fault::Name { len: record.alias_len });
+	}
 	if !known_kind(record.local.kind) {
 		return Err(Fault::AddressKind { kind: record.local.kind });
 	}
@@ -238,7 +309,7 @@ impl Store {
 	}
 
 	pub const fn empty() -> Store {
-		Store { loaded: Loaded { records: [Record { local: Address { kind: 0, bytes: [0; 6] }, peer: Address { kind: 0, bytes: [0; 6] }, key: [0; 16], security: 0, enabled: false, name: [0; MAX_NAME], name_len: 0 }; MAX_RECORDS], len: 0, unreadable: 0 } }
+		Store { loaded: Loaded { records: [EMPTY_RECORD; MAX_RECORDS], len: 0, unreadable: 0 } }
 	}
 
 	pub const fn unreadable(&self) -> usize {

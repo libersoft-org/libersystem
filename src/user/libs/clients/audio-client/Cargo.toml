@@ -12,6 +12,7 @@ shared-image = []
 
 [dependencies]
 base-proto = { path = "../../protocol/base-proto" }
+audio-proto = { path = "../../protocol/audio-proto" }
 wire = { path = "../../../../wire" }
 
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found

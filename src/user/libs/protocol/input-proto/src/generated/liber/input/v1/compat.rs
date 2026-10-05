@@ -81,3 +81,11 @@ fn activity_edge_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(ActivityEdge::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn system_key_wire_is_stable() {
+	let sample = SystemKey::BrightnessUp;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(SystemKey::decode(&bytes).unwrap(), sample);
+}

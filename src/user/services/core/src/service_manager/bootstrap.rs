@@ -273,7 +273,11 @@ fn mint_scoped_consumer(root: u64, kinds: &[u16]) -> Option<u64> {
 fn service_limits(name: &[u8]) -> Option<proto::system::ResourceLimits> {
 	const MB: u64 = 1024 * 1024;
 	match name {
-		b"bluetooth_service" => Some(proto::system::ResourceLimits { memory: 64 * MB, handles: 256, threads: 4, ipc_queue: 2 * MB, stack: 2 * MB, dma: 0 }),
+		// DERIVED FROM THE STACK'S OWN BOUNDS: the IPC figure grew to 4 MB for the standing queues the profiles add.
+		b"bluetooth_service" => {
+			use service_logic::bt_bounds;
+			Some(proto::system::ResourceLimits { memory: bt_bounds::DOMAIN_MEMORY as u64, handles: bt_bounds::DOMAIN_HANDLES as u64, threads: bt_bounds::DOMAIN_THREADS as u64, ipc_queue: bt_bounds::DOMAIN_IPC_QUEUES as u64, stack: bt_bounds::DOMAIN_STACK as u64, dma: 0 })
+		}
 		b"bluetooth_bond_store" => Some(proto::system::ResourceLimits { memory: 16 * MB, handles: 64, threads: 2, ipc_queue: 256 * 1024, stack: MB, dma: 0 }),
 		_ => None,
 	}
@@ -843,6 +847,14 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 					message.extend_from_slice(b"PACKAGE");
 					message.extend_from_slice(&(pkg_len as u64).to_le_bytes());
 					return Some((message, dup as u64));
+				}
+				// INPUTSERVICE FEEDS THE CONSOLE for the Bluetooth keyboards, under a copy of the same privilege.
+				if name == b"input_service" && role.tag == b"CONSOLE" {
+					if console_input == 0 {
+						return Some((role.tag.to_vec(), 0));
+					}
+					let copy: i64 = duplicate(console_input, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+					return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
 				}
 				// DEVICEMANAGER CARRIES THE POWER PATH TO THE KEYBOARD DRIVERS, because the Power
 				// key must keep working when this supervisor does not - the whole reason it is a

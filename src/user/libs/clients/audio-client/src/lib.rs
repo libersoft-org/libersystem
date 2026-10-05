@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use audio_proto::generated::liber::audio::v1::{AudioCounters, AudioDevice, AudioDirection, AudioStreamInfo};
 use base_proto::generated::liber::base::v1::Error;
 use wire::Buffer;
 
@@ -25,6 +26,16 @@ unsafe extern "Rust" {
 	fn audio_admin_open_streams(chan: u64) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_audio_audio_admin_open_captures"]
 	fn audio_admin_open_captures(chan: u64) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_devices"]
+	fn audio_control_devices(chan: u64) -> Option<Vec<AudioDevice>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_set_default"]
+	fn audio_control_set_default(chan: u64, device: &u32, direction: &AudioDirection) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_set_volume"]
+	fn audio_control_set_volume(chan: u64, device: &u32, volume: &u8) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_streams"]
+	fn audio_control_streams(chan: u64) -> Option<Vec<AudioStreamInfo>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_counters"]
+	fn audio_control_counters(chan: u64) -> Option<AudioCounters>;
 }
 
 #[derive(Clone, Copy)]
@@ -121,5 +132,44 @@ impl AudioAdminClient {
 	#[inline(always)]
 	pub fn open_captures(&mut self) -> Option<Result<u64, Error>> {
 		unsafe { audio_admin_open_captures(self.chan) }
+	}
+}
+
+/// THE OPERATOR'S AUTHORITY ON AUDIOSERVICE: the inventory, the defaults, the levels and where the streams play.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct AudioControlClient {
+	chan: u64,
+}
+
+impl AudioControlClient {
+	#[inline(always)]
+	pub const fn new(chan: u64) -> Self {
+		Self { chan }
+	}
+
+	#[inline(always)]
+	pub fn devices(&mut self) -> Option<Vec<AudioDevice>> {
+		unsafe { audio_control_devices(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn set_default(&mut self, device: &u32, direction: &AudioDirection) -> Option<Result<(), Error>> {
+		unsafe { audio_control_set_default(self.chan, device, direction) }
+	}
+
+	#[inline(always)]
+	pub fn set_volume(&mut self, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
+		unsafe { audio_control_set_volume(self.chan, device, volume) }
+	}
+
+	#[inline(always)]
+	pub fn streams(&mut self) -> Option<Vec<AudioStreamInfo>> {
+		unsafe { audio_control_streams(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn counters(&mut self) -> Option<AudioCounters> {
+		unsafe { audio_control_counters(self.chan) }
 	}
 }

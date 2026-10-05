@@ -518,6 +518,15 @@ pub trait Module {
 	fn adopt(&mut self, _hc: &mut Xhci, _hids: &mut Hids, _carried: &mut dyn Carry) -> bool {
 		false
 	}
+	/// A SECOND PUBLICATION, for a device that is two providers at once - a monitor carrying a light sensor, whose two
+	/// consumers are two services: its kind and name. Published and withdrawn with the first, under a token of its own.
+	fn second(&self) -> Option<(u16, &'static [u8])> {
+		None
+	}
+	/// Serve what one consumer of the second publication sent, as `serve` does the first's.
+	fn serve_second(&mut self, _hc: &mut Xhci, _hids: &mut Hids, _chan: u64) -> bool {
+		false
+	}
 }
 
 /// WHAT A MODULE CARRIES ACROSS ITS DEVICE'S RE-ENUMERATION. Held by the controller between the device leaving and
@@ -542,6 +551,8 @@ struct Pending {
 struct Bound {
 	module: Box<dyn Module>,
 	token: u16,
+	// The second publication's token, when the module has one and it was made; zero otherwise.
+	second: u16,
 	published: bool,
 }
 
@@ -561,7 +572,7 @@ impl Classes {
 	}
 
 	pub fn add(&mut self, module: Box<dyn Module>) {
-		self.bound.push(Bound { module, token: 0, published: false });
+		self.bound.push(Bound { module, token: 0, second: 0, published: false });
 	}
 
 	/// The roles bound, for the report line.
@@ -570,7 +581,7 @@ impl Classes {
 	}
 
 	pub fn owns(&self, token: u16) -> bool {
-		token >= FIRST_TOKEN && (self.bound.iter().any(|bound| bound.published && bound.token == token) || self.pending.iter().any(|pending| pending.token == token))
+		token >= FIRST_TOKEN && (self.bound.iter().any(|bound| bound.published && (bound.token == token || bound.second == token)) || self.pending.iter().any(|pending| pending.token == token))
 	}
 
 	/// Every module whose device is on this root port leaves: its pipes, its device and its budget line are
@@ -593,12 +604,19 @@ impl Classes {
 			print(crate::kind_name(gone.module.inventory()).as_bytes());
 			match handoff {
 				Some(carried) => {
+					// A handoff keeps the first publication alone: a second has nothing to answer with meanwhile.
+					if gone.second != 0 {
+						self.withdrawn.push(gone.second);
+					}
 					self.pending.push(Pending { carried, token: gone.token });
 					print(b" detached on purpose - its publication is held for the device it comes back as\n");
 				}
 				None => {
 					if gone.published {
 						self.withdrawn.push(gone.token);
+					}
+					if gone.second != 0 {
+						self.withdrawn.push(gone.second);
 					}
 					print(b" detached - its publication is withdrawn\n");
 				}
@@ -647,6 +665,22 @@ impl Classes {
 			self.next_token += 1;
 			bound.token = token;
 			bound.published = true;
+			// THE SECOND PUBLICATION, when the module is two providers: a refusal of it leaves the first standing.
+			if let Some((kind, name)) = bound.module.second()
+				&& self.next_token != u16::MAX
+				&& let Some((near, far)) = channel()
+			{
+				let second = self.next_token;
+				if !serving.publish(second, near) {
+					close(near);
+					close(far);
+				} else if common::offer_named(bootstrap, bind, kind, second, name, far) {
+					self.next_token += 1;
+					bound.second = second;
+				} else {
+					serving.retire(second);
+				}
+			}
 			bound.module.start(hc);
 		}
 		let _ = hids;
@@ -679,10 +713,11 @@ impl Classes {
 	pub fn serve(&mut self, hc: &mut Xhci, hids: &mut Hids, token: u16, chan: u64, bootstrap: u64, bind: &common::Bind) -> bool {
 		// A PUBLICATION HELD FOR A DEVICE THAT IS NOT BACK YET has nothing to answer with: what arrives is drained,
 		// and the consumer's request waiting on the handoff is the one that is answered.
-		let Some(bound) = self.bound.iter_mut().find(|bound| bound.published && bound.token == token) else {
+		let Some(bound) = self.bound.iter_mut().find(|bound| bound.published && (bound.token == token || bound.second == token)) else {
 			return drain(chan);
 		};
-		if bound.module.serve(hc, hids, chan, bootstrap, bind) {
+		let open = if bound.second == token { bound.module.serve_second(hc, hids, chan) } else { bound.module.serve(hc, hids, chan, bootstrap, bind) };
+		if open {
 			return false;
 		}
 		bound.module.departed(hc, hids, chan);
@@ -778,6 +813,15 @@ pub unsafe fn probe(hc: &mut Xhci, mut dev: UsbDevice) -> Result<Box<dyn Module>
 				dev = match crate::class_power::probe(hc, dev, interface) {
 					Ok(module) => {
 						let _ = hc.budget.admit(ClassKind::PowerDevice);
+						return Ok(Box::new(module));
+					}
+					Err(dev) => dev,
+				};
+				// AND A MONITOR, whose descriptor names the VESA brightness or an ambient-light sensor - the same
+				// HID transport again, another destination.
+				dev = match crate::class_display_hid::probe(hc, dev, interface) {
+					Ok(module) => {
+						let _ = hc.budget.admit(ClassKind::Display);
 						return Ok(Box::new(module));
 					}
 					Err(dev) => dev,

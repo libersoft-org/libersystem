@@ -186,6 +186,7 @@ fn every_service_backed_class_takes_one_device_and_refuses_the_second() {
 		ClassKind::Mbim,
 		ClassKind::Video,
 		ClassKind::Dfu,
+		ClassKind::Display,
 	];
 	let mut budget = Budget::new();
 	for kind in kinds {

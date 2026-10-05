@@ -90,9 +90,56 @@ struct State {
 	// THE MEMORY PROCESSOR POWER HOLDS - a register a processor table names, admitted by `admit_processor_memory` - once
 	// for each admission: no region of the service's maps over it while a table names it.
 	processor_held: Vec<(u64, u64)>,
+	// THE NAMESPACE DEVICES A DMAR PUTS BEHIND A HARDWARE UNIT: each one's identity (`acpi:` and its path, every
+	// segment four characters) and the requester id its DMA carries.
+	streams: Vec<(Vec<u8>, u32)>,
 }
 
-static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None, events: None, decoded: Vec::new(), io_windows: Vec::new(), mappings: Vec::new(), held: Vec::new(), companions: Vec::new(), parents: Vec::new(), merged: Vec::new(), reported: Vec::new(), grants: Vec::new(), lists: Vec::new(), ipmi: Vec::new(), processor_held: Vec::new() });
+static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None, events: None, decoded: Vec::new(), io_windows: Vec::new(), mappings: Vec::new(), held: Vec::new(), companions: Vec::new(), parents: Vec::new(), merged: Vec::new(), reported: Vec::new(), grants: Vec::new(), lists: Vec::new(), ipmi: Vec::new(), processor_held: Vec::new(), streams: Vec::new() });
+
+// A NAMESPACE DEVICE THAT MASTERS THE BUS, as the DMAR names it (`\_SB.PCI0.I2C1`): kept under the identity the ACPI
+// service will publish it with - `acpi:` and the path with every segment padded to four characters, as the namespace
+// holds names - and its requester id.
+#[cfg(any(not(test), target_arch = "x86_64"))]
+pub fn note_namespace_stream(name: &[u8], source_id: u16) {
+	let Some(identity) = namespace_identity(name) else { return };
+	let mut state = STATE.lock();
+	if state.streams.try_reserve(1).is_ok() {
+		state.streams.push((identity, u32::from(source_id)));
+	}
+}
+
+// `\_SB.PCI0.I2C1` as an identity: `acpi:\_SB_.PCI0.I2C1`.
+pub fn namespace_identity(name: &[u8]) -> Option<Vec<u8>> {
+	let mut identity: Vec<u8> = Vec::new();
+	identity.try_reserve(5 + name.len() + 8).ok()?;
+	identity.extend_from_slice(b"acpi:");
+	let path = name.strip_prefix(b"\\").unwrap_or(name);
+	identity.push(b'\\');
+	for (at, segment) in path.split(|byte| *byte == b'.').enumerate() {
+		if segment.is_empty() || segment.len() > 4 {
+			return None;
+		}
+		if at > 0 {
+			identity.push(b'.');
+		}
+		identity.extend_from_slice(segment);
+		for _ in segment.len()..4 {
+			identity.push(b'_');
+		}
+	}
+	Some(identity)
+}
+
+// THE STREAM A DMAR NAMED FOR THIS ROW, attached: the row's claim is then refused by name, since no IOMMU driver of this
+// kernel serves a DMAR unit - never a non-mastering claim of a device that masters the bus.
+fn attach_stream(description: &mut platform::Description) {
+	let state = STATE.lock();
+	if let Some((_, stream)) = state.streams.iter().find(|(identity, _)| identity.as_slice() == description.identity()) {
+		description.part.flags |= abi::PLATFORM_FLAG_DMA_STREAM;
+		description.part.dma_stream = *stream;
+	}
+}
 
 // SMBIOS'S IPMI RECORD `instance`, as the boot read it: what an `IPI0001` node is checked against.
 #[cfg(any(not(test), target_arch = "x86_64"))]
@@ -177,6 +224,25 @@ pub fn record_decoded(ranges: Vec<crate::arch::common::pci::DecodedRange>, io_wi
 	// ALLOC-OK: boot, the bus's ranges recorded once from the boot scan, before userspace exists.
 	state.decoded = ranges.iter().map(|range| Decoded { base: range.base, len: range.len, function: Function { segment: 0, bus: range.bus, device: range.dev, function: range.func }, window: range.window }).collect();
 	state.io_windows = io_windows;
+}
+
+// THE FUNCTION WHOSE MEMORY BAR HOLDS `address` - the boot framebuffer's decoder - from the boot scan's record. A
+// bridge's window is not a decoder: the function behind it is.
+pub fn decoder_of(address: u64) -> Option<Function> {
+	decoder_in(STATE.lock().decoded.iter().map(|range| (range.base, range.len, range.function, range.window)), address)
+}
+
+// The containment decision itself, over any list of (base, length, function, window).
+pub fn decoder_in(ranges: impl Iterator<Item = (u64, u64, Function, bool)>, address: u64) -> Option<Function> {
+	let mut found = None;
+	for (base, len, function, window) in ranges {
+		if window || len == 0 || address < base || address - base >= len {
+			continue;
+		}
+		found = Some(function);
+		break;
+	}
+	found
 }
 
 pub fn decoded_ranges(out: &mut dyn FnMut(u64, u64)) {
@@ -679,6 +745,7 @@ pub fn report(process: u64, bytes: &[u8]) -> i64 {
 	match decoded {
 		Report::Device(mut device) => {
 			attach_smbios(&mut device.description, device.properties);
+			attach_stream(&mut device.description);
 			// EVERYTHING THIS REPORT KEEPS, HELD FIRST: a short heap refuses the report whole, before anything is published.
 			let Some(identity) = heap::try_to_vec(device.description.identity()) else { return abi::ERR_NO_MEMORY };
 			let Some(properties) = heap::try_to_vec(device.properties) else { return abi::ERR_NO_MEMORY };

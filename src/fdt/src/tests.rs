@@ -3049,3 +3049,19 @@ fn a_tree_with_no_idle_states_answers_none_of_them() {
 	let read = at(machine(|_| {})).idle_states(IdleBinding::Arm).expect("a tree");
 	assert_eq!((read.state_count, read.cpu_count), (0, 0), "cpu@0 of the minimal machine has no device_type, so it is not read as a cpu");
 }
+
+#[test]
+fn a_node_whose_iommus_names_a_stream_carries_it_and_one_without_carries_none() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("iommu@9050000").prop_str("compatible", "arm,smmu-v3").prop_reg64(0x0905_0000, 0x2_0000).prop_u32("#iommu-cells", 1).prop_u32("phandle", 0x40).end();
+	builder.begin("dma@9100000").prop_str("compatible", "vendor,dma").prop_reg64(0x0910_0000, 0x1000).prop("iommus", &be_cells(&[0x40, 0x21])).end();
+	builder.begin("uart@9200000").prop_str("compatible", "vendor,uart").prop_reg64(0x0920_0000, 0x1000).end();
+	builder.end();
+	let tree = at(builder.finish());
+	let found = devices_of(&tree);
+	assert_eq!(device(&found, b"/dma@9100000").dma_stream, Some(0x21), "the stream after the IOMMU's phandle");
+	assert_eq!(device(&found, b"/uart@9200000").dma_stream, None, "no iommus, no stream");
+	assert_eq!(device(&found, b"/iommu@9050000").dma_stream, None);
+}

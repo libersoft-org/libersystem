@@ -21,6 +21,9 @@ method input-trusted.disarm op=3 (epoch:u64:rights=) -> result<unit, liber:base@
 enum activity-edge(idle=1,active=2)
 interface input-activity
 method input-activity.watch op=1 (idle-after-ms:u32:rights=) -> stream<activity-edge>
+enum system-key(brightness-up=1,brightness-down=2)
+interface system-keys
+method system-keys.watch op=1 () -> stream<system-key>
 interface input-admin
 method input-admin.open-keys op=1 () -> result<handle<channel>, liber:base@1::error>
 method input-admin.open-gamepads op=2 () -> result<handle<channel>, liber:base@1::error>

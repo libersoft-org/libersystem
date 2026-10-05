@@ -29,12 +29,13 @@ fn an_empty_set_is_refused_and_the_inventory_scope_is_how_none_is_said_on_purpos
 
 #[test]
 // A KIND THIS MASK CANNOT EXPRESS IS REFUSED RATHER THAN WRAPPED. A shift past the width is where a
-// silent scope error comes from: kind 33 would set bit 1 and mint a connection to BLOCK devices.
+// silent scope error comes from: kind 65 would set bit 1 and mint a connection to BLOCK devices.
 fn a_kind_the_mask_cannot_express_is_refused_rather_than_wrapped() {
 	assert_eq!(Scope::of(&[0]), Err(Refusal::UnknownKind(0)));
 	assert_eq!(Scope::of(&[MAX_KIND + 1]), Err(Refusal::UnknownKind(MAX_KIND + 1)));
-	assert_eq!(Scope::of(&[33]), Err(Refusal::UnknownKind(33)), "33 would be block, one shift around");
-	assert_eq!(Scope::of(&[5, 33]), Err(Refusal::UnknownKind(33)), "and one bad entry refuses the set");
+	assert_eq!(Scope::of(&[65]), Err(Refusal::UnknownKind(65)), "65 would be block, one shift around");
+	assert_eq!(Scope::of(&[5, 65]), Err(Refusal::UnknownKind(65)), "and one bad entry refuses the set");
+	assert!(Scope::of(&[32]).is_ok_and(|scope| scope.admits(32) && !scope.admits(0)), "the thirty-second kind, ambient light, is expressible and wraps onto nothing");
 	assert!(Scope::of(&[MAX_KIND]).is_ok(), "the last expressible kind is expressible");
 }
 

@@ -49,22 +49,22 @@ fn a_version_this_build_does_not_know_is_refused() {
 	let mut bytes = encode(&record(1, 2));
 	bytes[..4].copy_from_slice(&(VERSION + 1).to_le_bytes());
 	// The checksum has to be right, or this would be testing the checksum instead.
-	let sum = super::checksum(&bytes[..85]);
-	bytes[85..89].copy_from_slice(&sum.to_le_bytes());
+	let sum = super::checksum(&bytes[..RECORD_BYTES - 4]);
+	bytes[RECORD_BYTES - 4..].copy_from_slice(&sum.to_le_bytes());
 	assert_eq!(decode(&bytes, 0), Err(Fault::Version { found: VERSION + 1 }));
 }
 
 #[test]
-// AN ADDRESS KIND THIS STORE DOES NOT KNOW IS A RECORD WRITTEN BY SOMETHING ELSE. Resolvable
-// private addresses need a resolution step this milestone excludes; treated as static, a bond would
-// be kept against an address that is different by the time the peer reconnects.
+// AN ADDRESS KIND THIS STORE DOES NOT KNOW IS A RECORD WRITTEN BY SOMETHING ELSE. A resolvable private
+// address is never a bond's: a bond names the identity it resolves to, and one kept against the
+// rotating address would be different by the time the peer reconnects.
 fn an_address_kind_this_profile_does_not_speak_is_refused() {
 	let mut odd = record(1, 2);
-	odd.peer.kind = 3;
+	odd.peer.kind = 4;
 	let bytes = encode(&odd);
-	assert_eq!(decode(&bytes, 0), Err(Fault::AddressKind { kind: 3 }));
+	assert_eq!(decode(&bytes, 0), Err(Fault::AddressKind { kind: 4 }));
 	let mut store = Store::empty();
-	assert_eq!(store.put(&odd), Err(Refusal::Malformed(Fault::AddressKind { kind: 3 })));
+	assert_eq!(store.put(&odd), Err(Refusal::Malformed(Fault::AddressKind { kind: 4 })));
 	// And a name past the field that holds it.
 	let mut long = record(1, 2);
 	long.name_len = MAX_NAME as u8 + 1;
@@ -168,4 +168,29 @@ fn the_whole_store_round_trips_through_its_own_bytes() {
 	assert_eq!(reloaded.unreadable, 0);
 	assert_eq!(reloaded.entries(), store.entries());
 	assert!(bytes.len() <= MAX_FILE_BYTES);
+}
+
+#[test]
+fn both_radios_fields_round_trip_and_a_bredr_address_is_a_known_kind() {
+	let mut classic = record(1, 2);
+	classic.peer = Address { kind: 3, bytes: [1, 2, 3, 4, 5, 6] };
+	classic.radio = super::RADIO_CLASSIC;
+	classic.link_key = [0x5A; 16];
+	classic.link_key_type = 0x08;
+	classic.agreement = 4;
+	classic.authenticated = true;
+	classic.trust = 0b0000_0101;
+	classic.alias[..4].copy_from_slice(b"keys");
+	classic.alias_len = 4;
+	classic.irk = Some([0x11; 16]);
+	let bytes = encode(&classic);
+	let back = decode(&bytes, 0).unwrap();
+	assert_eq!(back, classic);
+	assert_eq!(back.alias(), b"keys");
+	let mut bad = encode(&classic);
+	bad[85] = 9;
+	let sum = super::checksum(&bad[..RECORD_BYTES - 4]);
+	bad[RECORD_BYTES - 4..].copy_from_slice(&sum.to_le_bytes());
+	assert_eq!(decode(&bad, 0), Err(Fault::Radio { radio: 9 }));
+	assert!(MAX_RECORDS * RECORD_BYTES <= MAX_FILE_BYTES);
 }

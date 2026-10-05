@@ -94,6 +94,15 @@
 # THE FANS, in the sleep table and the processor-power table: `\_SB.FAN0` (`PNP0C0B`, three `_FPS` levels - control 0, 50
 # and 100) and `\_SB.FAN1` (`PNP0C0B`, `_FIF`'s fine-grain control in steps of 5 %), `_FSL` and `_FST` over the pages.
 #
+# THE BRIGHTNESS GATE'S DEVICES (`--out FILE --brightness`, and `--memory FILE --brightness`), in the same table so their
+# `Notify` has the GPIO controller's `_AEI` to come from - line BRIGHTNESS_LINE, whose `_E08` notifies the value the
+# pages' event byte names, 0x80 to the sensor and anything else to the panel:
+#   `\_SB.PCI0.S08` - q35's VGA function, QEMU's own node opened with `Scope` (a run with `VGA=std`): `_DOS` recording its
+#            argument and counting itself in the pages, beside a `_DOD` naming the panel's `_ADR`, as firmware declares both.
+#   `\_SB.PCI0.S08.LCD0` - the panel's output, `_ADR` 0x400: `_BCL` an AC default of 70, a battery default of 30 and the
+#            levels 0 to 100 in tens; `_BCM` writes the level into the pages and counts itself; `_BQC` reads it.
+#   ACPI0008 (`\_SB.ALS0`) - an ambient-light sensor: `_ALI` the pages' dword in lux, `_ALR` a five-point curve.
+#
 # AND TWO POWER RESOURCES: `\_SB.PSLP` in the `_PR0` of both the lid and the TAD - on while either is in D0, off only
 # when both have left it - and `\_SB.PWAK` in the lid's `_PRW`, on while its wake is armed. Each resource's state and the
 # counts of its `_ON` and `_OFF` are in the pages, and so is the last `_PSx` each device ran; the lid says `_S0W` and
@@ -188,6 +197,24 @@ SPACE_MEMORY = 0
 SPACE_FIXED_HARDWARE = 0x7F
 PROCESSOR_FIELDS = {'ppc': (PROCESSOR_PPC, 1), 'fan0': (FAN_PAGE, 4), 'fan1': (FAN_PAGE + 8, 4)}
 
+# THE BRIGHTNESS GATE'S PAGES: the panel's level `_BCM` writes and `_BQC` reads, `_BCM`'s count, `_DOS`'s last argument and
+# count, the event byte `_E08` notifies and clears, and the sensor's illuminance in lux.
+BRIGHTNESS_LINE = 8
+BRIGHTNESS_PAGE = 0xB0
+BRIGHTNESS_LEVEL = BRIGHTNESS_PAGE
+BRIGHTNESS_CALLS = BRIGHTNESS_PAGE + 1
+DOS_VALUE = BRIGHTNESS_PAGE + 2
+DOS_CALLS = BRIGHTNESS_PAGE + 3
+BRIGHTNESS_EVENT = BRIGHTNESS_PAGE + 4
+ILLUMINANCE = BRIGHTNESS_PAGE + 8
+VGA_SLOT = 0x01
+# `_BCL`: the AC default, the battery default, then the levels - the firmware default a boot starts the region at is the
+# AC one, since the fixture's adapter says the machine is on mains.
+BCL = (70, 30, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+# `_ALR`: (adjustment in percent of normal, illuminance in lux).
+ALR = ((70, 0), (73, 10), (85, 80), (100, 300), (150, 1000))
+BRIGHTNESS_FIELDS = {'level': (BRIGHTNESS_LEVEL, 1), 'illuminance': (ILLUMINANCE, 4), 'dos': (DOS_VALUE, 1), 'dos-calls': (DOS_CALLS, 1)}
+
 # THE UCSI DEVICE (`\_SB.UCSI`), absent until the harness's `UCPR` byte says a PPM is there: `_HID` `USBC000` and `_CID`
 # `PNP0CA0`, as shipping laptops name it, its mailbox `_CRS` range at UCSI_RANGE past the harness's pages and its own
 # region over it. Its `_DSM` behaves as firmware does: function 1 copies CONTROL and MESSAGE_OUT into the OUTBOUND
@@ -265,6 +292,30 @@ def sleep_devices(ivsh):
 				E.if_(E.lequal(E.arg(0), 1), [E.store(0, ivsh + '.TDST')]),
 				E.ret(0),
 			], serialized=True),
+		]),
+	]
+
+
+def brightness_devices(ivsh):
+	"""THE PANEL BELOW Q35'S VGA FUNCTION, ITS ADAPTER'S `_DOS` AND `_DOD`, AND THE LIGHT SENSOR."""
+	vga = f'\\_SB.PCI0.S{VGA_SLOT << 3:02X}'
+	return [
+		E.scope(vga, [
+			E.method('_DOS', 1, [E.store(E.arg(0), ivsh + '.DOSV'), E.increment(ivsh + '.DOSN')], serialized=True),
+			E.name('_DOD', E.package(0x80010400)),
+			E.device('LCD0', [
+				E.name('_ADR', 0x400),
+				E.name('_BCL', E.package(*BCL)),
+				E.method('_BCM', 1, [E.store(E.arg(0), ivsh + '.BLVL'), E.increment(ivsh + '.BCMN')], serialized=True),
+				E.method('_BQC', 0, [E.ret(ivsh + '.BLVL')]),
+			]),
+		]),
+		E.scope('\\_SB', [
+			E.device('ALS0', [
+				E.name('_HID', E.string('ACPI0008')),
+				E.method('_ALI', 0, [E.ret(ivsh + '.ALSI')]),
+				E.name('_ALR', E.package(*[E.package(adjustment, lux) for adjustment, lux in ALR])),
+			]),
 		]),
 	]
 
@@ -353,7 +404,7 @@ def fans(ivsh):
 	]
 
 
-def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False):
+def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False, brightness=False):
 	# THE NODES QEMU'S DSDT ALREADY HAS for the three functions - `S` and the slot times eight - opened with `Scope`: a
 	# second node with the same `_ADR` would be a second companion of one function.
 	ivsh = f'\\_SB.PCI0.S{IVSHMEM_SLOT << 3:02X}'
@@ -390,6 +441,11 @@ def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False):
 				E.offset_to((FAN_PAGE - PROCESSOR_PPC - 1) * 8), E.unit('F0LV', 32), E.unit('F0LN', 32), E.unit('F1LV', 32), E.unit('F1LN', 32),
 				E.offset_to((ZONE_SCP - FAN_PAGE - 16) * 8), E.unit('SCPM', 8), E.unit('SCPN', 8),
 			], access='AnyAcc'),
+			# THE BRIGHTNESS GATE'S BYTES: the panel's level and `_BCM` count, `_DOS`, the event, the illuminance.
+			E.field('HPGS', [
+				E.offset_to(BRIGHTNESS_PAGE * 8), E.unit('BLVL', 8), E.unit('BCMN', 8), E.unit('DOSV', 8), E.unit('DOSN', 8), E.unit('BEVT', 8),
+				E.offset_to((ILLUMINANCE - BRIGHTNESS_EVENT - 1) * 8), E.unit('ALSI', 32),
+			], access='AnyAcc'),
 			# THE UCSI STAGING AREAS AND COUNTERS.
 			E.field('HPGS', [
 				E.offset_to(UCSI_PRESENT * 8), E.unit('UCPR', 8), E.offset_to((UCSI_DOORBELL - UCSI_PRESENT - 1) * 8),
@@ -398,7 +454,7 @@ def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False):
 			], access='AnyAcc'),
 		]),
 		E.scope(gpio, [
-			E.name('_AEI', E.buffer(E.resource_template(*[E.gpio_int([line], gpio, edge=True) for line in [AEI_LINE, POWER_LINE, UCSI_LINE] + ([SLEEP_LINE] if sleep else []) + ([PROCESSOR_LINE] if processors else [])]))),
+			E.name('_AEI', E.buffer(E.resource_template(*[E.gpio_int([line], gpio, edge=True) for line in [AEI_LINE, POWER_LINE, UCSI_LINE] + ([SLEEP_LINE] if sleep else []) + ([PROCESSOR_LINE] if processors else []) + ([BRIGHTNESS_LINE] if brightness else [])]))),
 			E.method(f'_E{AEI_LINE:02X}', 0, [E.notify('\\_SB.LSF1', 0x80)]),
 			# THE PPM'S NOTIFICATION, as a laptop's notification method makes it: the copy, then `Notify`.
 			E.method(f'_E{UCSI_LINE:02X}', 0, [E.call('\\_SB.UCSI.COPY'), E.increment(ivsh + '.NCNT'), E.notify('\\_SB.UCSI', 0x80)]),
@@ -414,7 +470,15 @@ def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False):
 		] if sleep else []) + ([
 			# THE PROCESSOR'S PERFORMANCE LIMIT CHANGED: C000 notified, `_PPC` read again from the pages.
 			E.method(f'_E{PROCESSOR_LINE:02X}', 0, [E.notify('\\_SB.CPUS.C000', 0x80)]),
-		] if processors else [])),
+		] if processors else []) + ([
+			# THE BRIGHTNESS GATE'S EVENT, as the pages' byte names it: 0x80 to the sensor, a panel notification - 0x85 to
+			# 0x89 - to the panel; the byte cleared.
+			E.method(f'_E{BRIGHTNESS_LINE:02X}', 0, [
+				E.if_(E.lequal(ivsh + '.BEVT', 0x80), [E.notify('\\_SB.ALS0', 0x80)]),
+				*[E.if_(E.lequal(ivsh + '.BEVT', value), [E.notify(f'\\_SB.PCI0.S{VGA_SLOT << 3:02X}.LCD0', value)]) for value in (0x85, 0x86, 0x87, 0x88, 0x89)],
+				E.store(0, ivsh + '.BEVT'),
+			], serialized=True),
+		] if brightness else [])),
 		E.scope('\\_SB', [
 			E.device('LSF1', [
 				E.name('_HID', E.string('LSFX0001')),
@@ -510,11 +574,11 @@ def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False):
 				E.method('_SCP', 1, [E.store(E.arg(0), ivsh + '.SCPM'), E.increment(ivsh + '.SCPN')], serialized=True),
 			] if processors else [])),
 		]),
-	] + (processor_objects(ivsh) if processors else [])
+	] + (processor_objects(ivsh) if processors else []) + (brightness_devices(ivsh) if brightness else [])
 
 
-def ssdt(ucsi_version=0x0210, sleep=False, processors=False):
-	return E.table('SSDT', ssdt_body(ucsi_version, sleep, processors), oem_table_id=b'LIBACPIF')
+def ssdt(ucsi_version=0x0210, sleep=False, processors=False, brightness=False):
+	return E.table('SSDT', ssdt_body(ucsi_version, sleep, processors, brightness), oem_table_id=b'LIBACPIF')
 
 
 HID_OVER_I2C = '3cdff6f7-4267-4555-ad05-b30a3d8938de'
@@ -582,6 +646,7 @@ PAGE_UNITS = {
 	'SCPN': ZONE_SCP + 1,
 	'UCPR': UCSI_PRESENT, 'ODBL': UCSI_DOORBELL, 'LOG2': UCSI_REFRESHES, 'NCNT': UCSI_NOTIFIES, 'OCTL': UCSI_CONTROL,
 	'IVER': UCSI_VERSION, 'ICCI': UCSI_CCI, 'OMSG': UCSI_MESSAGE_OUT, 'IMSG': UCSI_MESSAGE_IN,
+	'BLVL': BRIGHTNESS_LEVEL, 'BCMN': BRIGHTNESS_CALLS, 'DOSV': DOS_VALUE, 'DOSN': DOS_CALLS, 'BEVT': BRIGHTNESS_EVENT, 'ALSI': ILLUMINANCE,
 }
 
 
@@ -624,8 +689,12 @@ def grt_bytes(unix):
 	return struct.pack('<HBBBBBBHhB3x', at.year, at.month, at.day, at.hour, at.minute, at.second, 1, 0, 2047, 0)
 
 
-def create_memory(path, ucsi_version=None, sleep=False, processors=False):
+def create_memory(path, ucsi_version=None, sleep=False, processors=False, brightness=False):
 	data = bytearray(MEMORY_SIZE)
+	# THE PANEL AT ITS FIRMWARE DEFAULT, as firmware leaves it at power-on, and a dim room.
+	if brightness:
+		data[BRIGHTNESS_LEVEL] = BCL[0]
+		struct.pack_into('<I', data, ILLUMINANCE, 10)
 	# THE SLEEP DEVICES: the lid open, the TAD with its clock, both wake timers disabled, and its clock at the host's time
 	# until the gate sets another.
 	if sleep:
@@ -736,6 +805,22 @@ def sleep_event(path, control, name):
 		time.sleep(0.05)
 
 
+def brightness_read(path):
+	"""THE PANEL'S LEVEL AND `_BCM` COUNT, `_DOS`'S LAST ARGUMENT AND COUNT, AND THE ILLUMINANCE."""
+	import json
+	with open(path, 'rb') as handle:
+		data = handle.read()
+	print(json.dumps({'level': data[BRIGHTNESS_LEVEL], 'bcm_calls': data[BRIGHTNESS_CALLS], 'dos': data[DOS_VALUE], 'dos_calls': data[DOS_CALLS], 'illuminance': struct.unpack_from('<I', data, ILLUMINANCE)[0]}))
+	return 0
+
+
+def brightness_event(path, control, value):
+	"""ONE BRIGHTNESS-GATE NOTIFICATION: the value written into the event byte, then line BRIGHTNESS_LINE raised until an
+	event fires - 0x80 to the sensor, 0x85 to 0x89 to the panel."""
+	poke(path, BRIGHTNESS_EVENT, bytes([value]))
+	return raise_line(control, BRIGHTNESS_LINE)
+
+
 def processor_read(path):
 	"""WHAT THE KERNEL AND THE FIRMWARE WROTE: `_PCT`'s control and status, `_CPC`'s desired performance and preference,
 	`_PPC`, each fan's level and `_FSL` count, and `_SCP`'s mode and count."""
@@ -827,6 +912,14 @@ def self_test():
 			failures.append(f'the processor table lacks {needle!r}')
 		if needle in table and needle not in (b'C000',):
 			failures.append(f'the plain table carries the processor gate\'s {needle!r}')
+	brightness = ssdt(brightness=True)
+	if sum(brightness) & 0xFF or struct.unpack('<I', brightness[4:8])[0] != len(brightness):
+		failures.append('the brightness table\'s checksum or length')
+	for needle in (b'S08_', b'_DOS', b'_DOD', b'LCD0', b'_BCL', b'_BCM', b'_BQC', b'ALS0', b'ACPI0008', b'_ALI', b'_ALR', b'_E08', b'BEVT'):
+		if needle not in brightness:
+			failures.append(f'the brightness table lacks {needle!r}')
+		if needle in table and needle not in (b'BEVT',):
+			failures.append(f'the plain table carries the brightness gate\'s {needle!r}')
 	if b'FAN0' not in sleep:
 		failures.append('the sleep table lacks the fans')
 	tcpc = tcpc_ssdt()
@@ -837,7 +930,7 @@ def self_test():
 			failures.append(f'the TCPCI table lacks {needle!r}')
 	# EVERY UNIT OF THE HARNESS PAGES WHERE THE HOST READS AND WRITES IT, in each table.
 	placed = 0
-	for label, built in (('plain', table), ('sleep', sleep), ('processor', processors)):
+	for label, built in (('plain', table), ('sleep', sleep), ('processor', processors), ('brightness', brightness)):
 		for name, offset, remainder in page_units(built):
 			placed += 1
 			if name not in PAGE_UNITS:
@@ -867,6 +960,10 @@ def main():
 	parser.add_argument('--sleep', action='store_true', help='the table and the memory carry the sleep gate\'s devices')
 	parser.add_argument('--processors', action='store_true', help='the table carries the processor-power gate\'s processors, fans and zone objects')
 	parser.add_argument('--processor-read', metavar='FILE')
+	parser.add_argument('--brightness', action='store_true', help='the table and the memory carry the brightness gate\'s panel, its adapter\'s methods and the light sensor')
+	parser.add_argument('--brightness-read', metavar='FILE')
+	parser.add_argument('--brightness-event', nargs=3, metavar=('FILE', 'CONTROL', 'VALUE'))
+	parser.add_argument('--brightness-set', nargs='+', metavar='FILE NAME=VALUE')
 	parser.add_argument('--raise', nargs=2, metavar=('CONTROL', 'LINE'), dest='raise_')
 	parser.add_argument('--sleep-event', nargs=3, metavar=('FILE', 'CONTROL', 'NAME'))
 	parser.add_argument('--tad-clock', nargs=2, metavar=('FILE', 'UNIX'))
@@ -878,7 +975,7 @@ def main():
 		return self_test()
 	if args.out:
 		with open(args.out, 'wb') as out:
-			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep, args.processors))
+			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep, args.processors, args.brightness))
 	if args.hid_out:
 		with open(args.hid_out, 'wb') as out:
 			out.write(hid_ssdt())
@@ -886,7 +983,7 @@ def main():
 		with open(args.tcpc_out, 'wb') as out:
 			out.write(tcpc_ssdt())
 	if args.memory:
-		create_memory(args.memory, args.ucsi_version, args.sleep, args.processors)
+		create_memory(args.memory, args.ucsi_version, args.sleep, args.processors, args.brightness)
 	if args.poke:
 		poke(args.poke[0], int(args.poke[1], 0), bytes.fromhex(args.poke[2]))
 	if args.set:
@@ -903,6 +1000,17 @@ def main():
 		return power_read(args.power_read)
 	if args.processor_read:
 		return processor_read(args.processor_read)
+	if args.brightness_read:
+		return brightness_read(args.brightness_read)
+	if args.brightness_event:
+		return brightness_event(args.brightness_event[0], args.brightness_event[1], int(args.brightness_event[2], 0))
+	if args.brightness_set:
+		for pair in args.brightness_set[1:]:
+			name, _, value = pair.partition('=')
+			if name not in BRIGHTNESS_FIELDS or not value:
+				raise SystemExit(f'acpi-fixture: {pair!r} is not NAME=VALUE with a NAME of {", ".join(BRIGHTNESS_FIELDS)}')
+			offset, size = BRIGHTNESS_FIELDS[name]
+			poke(args.brightness_set[0], offset, int(value, 0).to_bytes(size, 'little'))
 	if args.raise_:
 		return raise_line(args.raise_[0], int(args.raise_[1], 0))
 	return 0

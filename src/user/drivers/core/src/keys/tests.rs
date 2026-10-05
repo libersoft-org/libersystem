@@ -86,3 +86,14 @@ fn a_lock_key_toggles_once_per_press() {
 	feed_key(KEY_CAPSLOCK, 0, &mut mods);
 	assert_eq!(mods.caps, held, "the release that ends the repeat is still a release");
 }
+
+#[test]
+fn the_brightness_keys_map_both_ways_and_only_the_system_set_has_a_frame() {
+	assert_eq!(keycode_consumer(KEY_BRIGHTNESSUP), 0x6f, "EV_KEY 225 is consumer brightness increment");
+	assert_eq!(keycode_consumer(KEY_BRIGHTNESSDOWN), 0x70, "EV_KEY 224 is consumer brightness decrement");
+	assert_eq!(consumer_keycode(keycode_consumer(KEY_VOLUMEUP)), KEY_VOLUMEUP, "the inverse of the one table");
+	assert_eq!(keycode_consumer(0), 0);
+	assert_eq!(system_key_frame(0x6f, true), Some([0x0c, 0x00, 0x6f, 0x00, 1]));
+	assert_eq!(system_key_frame(0x70, false), Some([0x0c, 0x00, 0x70, 0x00, 0]));
+	assert_eq!(system_key_frame(0xe9, true), None, "a volume key is not a system key");
+}

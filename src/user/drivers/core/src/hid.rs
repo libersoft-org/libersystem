@@ -79,6 +79,11 @@ const INPUT_NULL_STATE: u32 = 1 << 6;
 // the diff runs against is a 64-byte buffer).
 const MAX_REPORT_BYTES: u32 = 64;
 
+// A FEATURE REPORT MAY BE WIDER: it is read and written by a control transfer through the device's own page, never by
+// the interrupt pipe or the diff, and a monitor's EDID Information is one - a hundred and twenty-eight bytes, more with
+// the base block's neighbours. The field table holds it; the input path never sees it.
+const MAX_FEATURE_BYTES: u32 = 256;
+
 // The most usages one array field reports at once (a boot keyboard rolls over
 // at 6; NKRO keyboards use variable bitmaps instead of wider arrays).
 const ARRAY_MAX: usize = 16;
@@ -867,6 +872,10 @@ pub struct FieldInfo {
 	pub collection: u32,
 	/// Which occurrence of that innermost collection's usage this is: the second Outlet is 1.
 	pub occurrence: u16,
+	/// A ONE-ELEMENT FEATURE ARRAY - a property whose value is the index of one of the selectors its logical collection
+	/// lists, as a HID sensor declares its reporting and power states - rather than a variable. `usage` is its first
+	/// selector and `collection` the property it sets.
+	pub array: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -896,7 +905,8 @@ pub enum FieldsRefused {
 	Truncated,
 	/// Collections nested past `MAX_COLLECTION_DEPTH`.
 	TooDeep,
-	/// A report past sixty-four bytes, or more fields than `MAX_FIELDS`.
+	/// An input or output report past sixty-four bytes, a feature report past two hundred and fifty-six, or more
+	/// fields than `MAX_FIELDS`.
 	TooLarge,
 }
 
@@ -977,10 +987,22 @@ pub fn fields(desc: &[u8]) -> Result<FieldTable, FieldsRefused> {
 						let cursor = lengths[at].2;
 						let bits = g.size.saturating_mul(g.count);
 						let end = cursor.saturating_add(bits);
-						if end > MAX_REPORT_BYTES * 8 {
+						let most = if kind == ReportKind::Feature { MAX_FEATURE_BYTES } else { MAX_REPORT_BYTES };
+						if end > most * 8 {
 							return Err(FieldsRefused::TooLarge);
 						}
-						// Constant items are padding, and array items are not entered - see above.
+						// Constant items are padding, and array items are not entered - see above - but for ONE: a feature
+						// array of a single element, which is how a property chooses among its selectors.
+						let selector = kind == ReportKind::Feature && data & INPUT_CONSTANT == 0 && data & INPUT_VARIABLE == 0 && g.count == 1 && (1..=32).contains(&g.size);
+						if selector {
+							if out.len() >= MAX_FIELDS {
+								return Err(FieldsRefused::TooLarge);
+							}
+							let application = collections.iter().find(|&&(kind, _, _)| kind == 1).map_or(0, |&(_, usage, _)| usage);
+							let (collection, occurrence) = collections.last().map_or((0, 0), |&(_, usage, occurrence)| (usage, occurrence));
+							let usage = usages.first().copied().unwrap_or(usage_min);
+							out.push(FieldInfo { kind, report_id: g.id, bit_offset: cursor, size: g.size, usage, logical_min: g.logical_min, logical_max: g.logical_max, null_state: false, unit: 0, unit_exponent: 0, application, collection, occurrence, array: true });
+						}
 						if data & INPUT_CONSTANT == 0 && data & INPUT_VARIABLE != 0 && (1..=32).contains(&g.size) {
 							let application = collections.iter().find(|&&(kind, _, _)| kind == 1).map_or(0, |&(_, usage, _)| usage);
 							let (collection, occurrence) = collections.last().map_or((0, 0), |&(_, usage, occurrence)| (usage, occurrence));
@@ -998,7 +1020,7 @@ pub fn fields(desc: &[u8]) -> Result<FieldTable, FieldsRefused> {
 								} else {
 									0
 								};
-								out.push(FieldInfo { kind, report_id: g.id, bit_offset: cursor + n * g.size, size: g.size, usage, logical_min: g.logical_min, logical_max, null_state: data & (1 << 6) != 0, unit: g.unit, unit_exponent: g.unit_exponent, application, collection, occurrence });
+								out.push(FieldInfo { kind, report_id: g.id, bit_offset: cursor + n * g.size, size: g.size, usage, logical_min: g.logical_min, logical_max, null_state: data & (1 << 6) != 0, unit: g.unit, unit_exponent: g.unit_exponent, application, collection, occurrence, array: false });
 							}
 						}
 						lengths[at].2 = end;

@@ -10,6 +10,14 @@
 pub const CAP_BT_READ: &[u8] = b"BTREAD";
 pub const CAP_BT_OPERATOR: &[u8] = b"BTOPERATOR";
 pub const CAP_BT_PROFILE: &[u8] = b"BLUETOOTH";
+// BluetoothService's minting root: applications' GATT grants, minted by PermissionManager.
+pub const CAP_BT_ADMIN: &[u8] = b"BTADMIN";
+// BLUETOOTHSERVICE'S AUDIO ROOT: the endpoints AudioService alone resolves and opens - re-resolved, as InputService
+// re-resolves the profile one, when the stack has been restarted.
+pub const CAP_BT_AUDIO: &[u8] = b"BTAUDIO";
+// AUDIOSERVICE'S OPERATOR ROOT: the inventory, the defaults and the levels, which PermissionManager resolves for
+// `audioctl`'s grant.
+pub const CAP_AUDIO_CONTROL: &[u8] = b"AUDIOCONTROL";
 // POWERSERVICE'S TWO ROOTS: normalised state, and the device controls an operator may use. Resolved
 // by name like the Bluetooth ones, so PermissionManager holds neither from bring-up and its grants
 // survive a restart of the service.
@@ -52,3 +60,6 @@ pub const CAP_SLEEP: &[u8] = b"SLEEP";
 pub const CAP_SLEEP_WAKE: &[u8] = b"SLEEPWAKE";
 // PROCESSORPOWERSERVICE'S OPERATOR ROOT: every `processor-power` grant is a fresh connection from it.
 pub const CAP_PROCESSOR_POWER: &[u8] = b"PROCESSORPOWER";
+// THE BRIGHTNESS: read from DisplayService's `BRIGHTNESS` root, set through the brightness policy's `CONTROL` root.
+pub const CAP_BRIGHTNESS: &[u8] = b"BRIGHTNESS";
+pub const CAP_BRIGHTNESS_CONTROL: &[u8] = b"BRIGHTNESSCONTROL";

@@ -21,6 +21,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+
+#[path = "display_service/brightness.rs"]
+mod brightness;
 use ipc_client::ChannelTransport;
 use pix::{Image, Rect, Target};
 use proto::codec::Handles;
@@ -1752,19 +1755,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// THE OUTPUTS' ROOT, read-only: which outputs this service drives and whether each is the machine's own - what the
 		// sleep policy asks before a closed lid suspends the machine. Optional, and LAST.
 		let outputs_root: u64 = recv_tagged(bootstrap, &mut buf, b"OUTPUTS").unwrap_or(0);
+		// THE BRIGHTNESS: its read root, its set root - the brightness policy's alone - and the system-key stream
+		// InputService hands this service alone. Optional, and LAST.
+		let brightness_root: u64 = recv_tagged(bootstrap, &mut buf, b"BRIGHTNESS").unwrap_or(0);
+		let brightness_control: u64 = recv_tagged(bootstrap, &mut buf, b"BRIGHTNESSCTL").unwrap_or(0);
+		let system_keys: u64 = recv_tagged(bootstrap, &mut buf, b"SYSKEYS").unwrap_or(0);
 		let providers: u64 = subscribe_to_displays(catalogue);
 		// THE SNAPSHOT IS ALREADY IN THE CHANNEL, which is what makes a subscription usable at
 		// bootstrap rather than only afterwards: the catalogue registers a subscriber and sends it
 		// everything published, in one step, before it answers. So the provider this machine has is
 		// readable here, without blocking, and a machine that has none falls through to the boot
 		// framebuffer exactly as one with no display driver always did.
-		let gpu: u64 = take_published_display(catalogue, providers, &mut buf);
+		let (gpu, display_function): (u64, Option<service_logic::brightness::Function>) = take_published_display(catalogue, providers, &mut buf);
 		let scanout: Scanout = init_scanout(gpu, display_ctl, &mut buf);
 		if !scanout.available() {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		serve_display(service, admin, stats_root, trusted_root, outputs_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control));
+		let brightness = brightness::Brightness::new(catalogue, brightness_root, brightness_control, system_keys);
+		serve_display(service, admin, stats_root, trusted_root, outputs_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control), brightness, display_function);
 	}
 }
 
@@ -1818,12 +1827,12 @@ fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
 // It stops at the first provider it CONNECTS to rather than draining the channel: a frame this
 // function reads and drops is a publication the standing loop will never see, and a second display
 // is exactly the thing this milestone exists to stop dropping.
-fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> u64 {
+fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> (u64, Option<service_logic::brightness::Function>) {
 	if catalogue == 0 || providers == 0 {
-		return 0;
+		return (0, None);
 	}
 	loop {
-		let PolledCaps::Message { len, handles } = try_recv_caps(providers, buf) else { return 0 };
+		let PolledCaps::Message { len, handles } = try_recv_caps(providers, buf) else { return (0, None) };
 		for &handle in handles.as_slice() {
 			close(handle);
 		}
@@ -1837,7 +1846,7 @@ fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> u64
 		}
 		let opened: u64 = open_provider(catalogue, &info);
 		if opened != 0 {
-			return opened;
+			return (opened, Some(service_logic::brightness::Function { bus: info.bus, dev: info.dev, func: info.func }));
 		}
 	}
 }
@@ -1878,7 +1887,7 @@ fn describe_framebuffer(scanout: &DeviceScanout) -> Option<(Framebuffer, u32, u3
 	// which reads it back, and that is the one access pattern a write-combining aperture makes orders
 	// of magnitude slower than it looks. A driver that ever hands over such an aperture has to say so
 	// here, and a consumer that cannot ask has to assume the worse case or be wrong.
-	let fb = Framebuffer { width: layout.extent.width, height: layout.extent.height, pitch: layout.pitch, bytes_per_pixel: masks.bytes_per_pixel as u32, red_shift: masks.red.shift, red_size: masks.red.bits, green_shift: masks.green.shift, green_size: masks.green.bits, blue_shift: masks.blue.shift, blue_size: masks.blue.bits, _pad: [0; 2], memory_type: rt::FRAMEBUFFER_WRITE_BACK };
+	let fb = Framebuffer { width: layout.extent.width, height: layout.extent.height, pitch: layout.pitch, bytes_per_pixel: masks.bytes_per_pixel as u32, red_shift: masks.red.shift, red_size: masks.red.bits, green_shift: masks.green.shift, green_size: masks.green.bits, blue_shift: masks.blue.shift, blue_size: masks.blue.bits, _pad: [0; 2], memory_type: rt::FRAMEBUFFER_WRITE_BACK, decoder: 0, decoder_present: 0 };
 	// THE BACKING MUST HOLD WHAT THE LAYOUT DESCRIBES. A driver that hands over a shorter object
 	// than its own description is a mapping this service would read past.
 	if scanout.backing.len < layout.backend_access_span(true)? {
@@ -1972,7 +1981,8 @@ fn channel_pair() -> Option<(u64, u64)> {
 	channel()
 }
 
-fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, outputs_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
+#[allow(clippy::too_many_arguments)]
+fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, outputs_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState, mut brightness: brightness::Brightness, mut display_function: Option<service_logic::brightness::Function>) -> ! {
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
 	// THE OBSERVATION ROOT IS A FACTORY LIKE EVERY OTHER ROOT IN THIS SYSTEM, and it was not: it
 	// answered `resources()` and NOTHING else, so a supervisor minting an independent connection
@@ -2050,12 +2060,26 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 		}
 		// AND THE OUTPUTS' CHANNELS, LAST, dispatched by handle before any index is read.
 		waits.extend(outputs.iter().copied());
+		// AND THE BRIGHTNESS'S, after them and dispatched the same way. Its output's source first: the provider this
+		// service presents on, or the boot framebuffer once it has none.
+		brightness.set_source(match (state.scanout.gpu, display_function) {
+			(gpu, Some(function)) if gpu != 0 => service_logic::brightness::OutputSource::Provider(function),
+			// THE BOOT FRAMEBUFFER'S DECODER, as the kernel found it from the boot scan's BARs - none for a ramfb.
+			_ => service_logic::brightness::OutputSource::BootFramebuffer((state.scanout.gpu == 0 && state.scanout.fb.decoder_present == 1).then(|| {
+				let decoder = state.scanout.fb.decoder;
+				service_logic::brightness::Function { bus: decoder >> 16 & 0xff, dev: decoder >> 8 & 0xff, func: decoder & 0xff }
+			})),
+		});
+		brightness.handles(&mut waits);
 		// EACH PASS OF THE LOOP'S WAIT, with the number of handles it waits on - the per-pass cost that
 		// grows with the surface count - and which one ended it.
 		perf_site(b"ds-wait\0", waits.len() as u64);
 		let ready: i64 = wait_any(&waits, 0);
 		perf_site(b"ds-woke\0", ready as u64);
 		if ready < 0 {
+			continue;
+		}
+		if brightness.ready(waits[ready as usize], &mut request, &mut reply) {
 			continue;
 		}
 		if let Some(which) = outputs.iter().position(|&channel| channel == waits[ready as usize]) {
@@ -2148,6 +2172,7 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 							if opened == 0 {
 								print(b"DisplayService: a display provider is published and this service could not connect to it\n");
 							} else if state.adopt_scanout(opened, &mut request) {
+								display_function = Some(service_logic::brightness::Function { bus: info.bus, dev: info.dev, func: info.func });
 								print(b"DisplayService: a display provider was published and this service presents on it\n");
 								state.notify_resize();
 								state.present_active_full();

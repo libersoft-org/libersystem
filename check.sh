@@ -73,6 +73,10 @@ declare -A GATES=(
 	# a guest and reads what the bound provider actually agreed to.
 	["icd-selection"]="tools/check-icd-selection.sh"
 	["bluetooth-service"]="tools/check-bluetooth-service.sh"
+	["bluetooth-classic"]="tools/check-bluetooth-classic.sh"
+	["bluetooth-input"]="tools/check-bluetooth-input.sh"
+	["bluetooth-le"]="tools/check-bluetooth-le.sh"
+	["bluetooth-audio"]="tools/check-bluetooth-audio.sh"
 	# POWERSERVICE AGAINST THE IN-GUEST POWER FIXTURE: exact canonical units, read denial, one-outlet
 	# control, coherent bounded subscriptions, a withheld reply and a restart. Service and
 	# normalisation coverage - the fixture's data is decoded HID and ACPI written out, not a device.
@@ -81,6 +85,12 @@ declare -A GATES=(
 	# class, read and driven through PowerService by a live client - its reports reach the subscriber, and an
 	# operator's turn-off and cancel reach the device.
 	["power-ups"]="tools/check-power-ups.sh"
+	# DISPLAY BRIGHTNESS THROUGH A USB MONITOR the host builds: bound, joined, set, stepped, floored, read without the set,
+	# followed by automatic brightness, and the policy restarted with PowerService.
+	["brightness-usb"]="tools/check-brightness-usb.sh"
+	# AND THROUGH THE FIRMWARE, on the ACPI fixture: the panel joined by its adapter, its hotkeys, the keypad, automatic
+	# brightness through `_ALR` and the stored level restored across a reset.
+	["brightness-acpi"]="tools/check-brightness-acpi.sh"
 	# IPMI ON x86_64 q35: the five system interfaces against QEMU's simulated BMCs, a pair, the harness's own BMC with
 	# its hostile modes, malformed records and an orderly reboot - through the drivers, the BMC service and the tool.
 	["ipmi"]="tools/check-ipmi.sh"
@@ -266,6 +276,10 @@ declare -A GATES=(
 	# slot goes down. The gate reads those two lines in order, because a log that only counted them
 	# would pass for a surprise removal too.
 	["qemu-pcie-hotplug"]="tools/check-qemu-pcie-hotplug.sh"
+	# THE AUDIO DEVICE MODEL ON A LIVE MACHINE: the boot's two sound providers as devices, a card plugged into the
+	# hot-plug slot taking a playing stream and giving it back when it is taken out, the operator's default and level,
+	# and a voice session - read through AudioService's own inventory by `audioprobe`.
+	["audio-routing"]="tools/check-audio-routing.sh"
 	# AN IDLE MACHINE THAT TAKES NO TICK, on all three targets, one guest at a time: bytes typed on the
 	# UART echoed within a second, the per-core idle records crediting the wakes to the UART's receive
 	# line rather than to a poll, a device plugged over QMP into the idle machine seen - and how often

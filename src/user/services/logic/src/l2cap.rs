@@ -23,9 +23,10 @@
 /// The L2CAP header: a two-byte length and a two-byte channel id.
 pub const HEADER: usize = 4;
 
-/// The largest SDU this profile carries. The boot mouse subset runs on the default ATT MTU of 23,
-/// so this is headroom by a factor of twenty and not a number anything here needs.
-pub const MAX_SDU: usize = 512;
+/// The largest PDU payload this host reassembles: the 1691-byte BR/EDR MTU every dynamic channel is
+/// configured with, and the six bytes enhanced retransmission adds around a segment - its control field,
+/// the SDU length on a start and the FCS. LE's ATT MTU of 247 is well inside it.
+pub const MAX_SDU: usize = crate::bt_bounds::BREDR_MTU + 6;
 
 /// The largest PDU, which is an SDU and the header in front of it.
 pub const MAX_PDU: usize = MAX_SDU + HEADER;

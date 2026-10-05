@@ -132,6 +132,9 @@ fn input_service_streams_pointer_events() {
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	// And the activity root, which only the power policy is handed: none here.
 	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
+	// And the system keys' root, which only DisplayService is handed: none here.
+	boot_kernel.send(Message::new(b"SYSKEYS".to_vec(), alloc::vec::Vec::new())).expect("system keys bootstrap");
+	boot_kernel.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("console input bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, raw_consumer).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
@@ -250,6 +253,9 @@ fn a_touch_surface_reports_contacts_and_not_a_cursor() {
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	// And the activity root, which only the power policy is handed: none here.
 	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
+	// And the system keys' root, which only DisplayService is handed: none here.
+	boot_kernel.send(Message::new(b"SYSKEYS".to_vec(), alloc::vec::Vec::new())).expect("system keys bootstrap");
+	boot_kernel.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("console input bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("no usb pointer");
@@ -458,6 +464,9 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	// And the activity root, which only the power policy is handed: none here.
 	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
+	// And the system keys' root, which only DisplayService is handed: none here.
+	boot_kernel.send(Message::new(b"SYSKEYS".to_vec(), alloc::vec::Vec::new())).expect("system keys bootstrap");
+	boot_kernel.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("console input bootstrap");
 	let mut catalogue = Catalogue { server: catalogue_server, pointer: None, touch: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new(), opened: alloc::vec::Vec::new() };
 	let pump = |catalogue: &mut Catalogue| {
 		for _ in 0..8 {
@@ -597,6 +606,9 @@ fn input_service_streams_keys_only_with_display_focus() {
 	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	// And the activity root, which only the power policy is handed: none here.
 	boot_kernel.send(Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
+	// And the system keys' root, which only DisplayService is handed: none here.
+	boot_kernel.send(Message::new(b"SYSKEYS".to_vec(), alloc::vec::Vec::new())).expect("system keys bootstrap");
+	boot_kernel.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("console input bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&pointer_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
@@ -852,6 +864,9 @@ fn gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity() {
 	send_cap(&boot_kernel, b"TRUSTED", trusted_root_input, Rights::ALL).expect("trusted input bootstrap");
 	// And the activity root, which only the power policy is handed: none here.
 	boot_kernel.send(object::channel::Message::new(b"ACTIVITY".to_vec(), alloc::vec::Vec::new())).expect("activity bootstrap");
+	// And the system keys' root, which only DisplayService is handed: none here.
+	boot_kernel.send(object::channel::Message::new(b"SYSKEYS".to_vec(), alloc::vec::Vec::new())).expect("system keys bootstrap");
+	boot_kernel.send(object::channel::Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("console input bootstrap");
 
 	let catalogue = core::cell::RefCell::new(Catalogue { server: catalogue_server, gamepads: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new() });
 	// PROVIDER A IS PUBLISHED BEFORE THE SERVICE STARTS, as a controller bound at boot is.
@@ -1480,6 +1495,10 @@ mod display_harness {
 		boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 		// And the outputs root, which only the power policy is handed: none here.
 		boot_kernel.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
+		// And the brightness's two roots and the system-key stream, which the deployed system hands it: none here.
+		for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..]] {
+			boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
+		}
 		sched::run_until_idle();
 		crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
@@ -1504,6 +1523,8 @@ mod display_harness {
 		sched::run_until_idle();
 		let online = boot_kernel.recv().expect("DisplayService online report");
 		assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
+		// THE BACKLIGHT SUBSCRIPTION, which the service makes once it is online: answered with nothing.
+		crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the backlight subscription with nothing");
 		Harness { console: console_client, focus: focus_input, kill: kill_input, stats: stats_root, admin: display_admin_channel, gpu: gpu_kernel, device_events: device_stream, scanout, service, boot: boot_kernel }
 	}
 }
@@ -2363,9 +2384,14 @@ fn audio_service_keeps_mp3_playback_continuous() {
 	run_audio_service_scenario(AudioServiceScenario::Mp3Continuity);
 }
 
-tagged_test!(audio_service_closes_streams_after_driver_failure, [Service, Audio, AudioService], id = "kernel.services.audio_service_closes_streams_after_driver_failure", covers = ["kernel"]);
-fn audio_service_closes_streams_after_driver_failure() {
-	run_audio_service_scenario(AudioServiceScenario::DriverFailure);
+tagged_test!(audio_service_keeps_streams_through_driver_loss, [Service, Audio, AudioService], id = "kernel.services.audio_service_keeps_streams_through_driver_loss", covers = ["kernel", "bin.audio_service"]);
+fn audio_service_keeps_streams_through_driver_loss() {
+	run_audio_service_scenario(AudioServiceScenario::DriverLoss);
+}
+
+tagged_test!(audio_service_routes_streams_by_the_device_inventory, [Service, Audio, AudioService], id = "kernel.services.audio_service_routes_streams_by_the_device_inventory", covers = ["kernel", "bin.audio_service"]);
+fn audio_service_routes_streams_by_the_device_inventory() {
+	run_audio_service_scenario(AudioServiceScenario::Inventory);
 }
 
 tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services", "bin.network_service"]);
@@ -3608,6 +3634,9 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	display_boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 	// And the outputs root, which only the power policy is handed: none here.
 	display_boot_kernel.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
+	for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..]] {
+		display_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
+	}
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&display_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
@@ -3630,6 +3659,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	sched::run_until_idle();
 	let online = display_boot_kernel.recv().expect("DisplayService online report");
 	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
+	crate::tests::serve_provider_catalogue_empty(&display_catalogue_server).expect("the catalogue answered the backlight subscription with nothing");
 
 	// Every synchronous present the console makes goes to the gpu and waits for the acknowledgement,
 	// so the stand-in gpu has to answer them or the console parks mid-frame. Drains whatever is

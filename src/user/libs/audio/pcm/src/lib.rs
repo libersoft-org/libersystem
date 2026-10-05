@@ -63,9 +63,16 @@ impl Format {
 	}
 
 	pub fn advance(self, phase: &mut u32, frame: &mut usize) {
+		self.advance_to(OUTPUT_RATE, phase, frame);
+	}
+
+	/// ONE OUTPUT FRAME AT `rate`: the source frame steps by this format's rate over the output's, so a device at any
+	/// rate takes the stream at its own - nearest neighbour, as `advance` is at the fixed output rate.
+	pub fn advance_to(self, rate: u32, phase: &mut u32, frame: &mut usize) {
+		let rate = rate.max(1);
 		*phase += self.rate;
-		while *phase >= OUTPUT_RATE {
-			*phase -= OUTPUT_RATE;
+		while *phase >= rate {
+			*phase -= rate;
 			*frame += 1;
 		}
 	}

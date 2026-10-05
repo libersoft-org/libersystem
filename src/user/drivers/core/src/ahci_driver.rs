@@ -67,6 +67,11 @@ const SIGNATURE_TICKS: u64 = 20;
 // And how long the link is given to come up after a reset, which the specification measures in
 // milliseconds and this system measures in hundredths of a second.
 const RESET_TICKS: u64 = 100;
+// HOW LONG A PORT WITH NOTHING ON IT IS GIVEN TO SHOW A DEVICE AT ALL. A device answers the reset with COMINIT in
+// milliseconds, which sets `DET`; a port where it stays zero is empty, and waiting the whole link bound on it cost a
+// second a port - five seconds of every boot on q35, whose chipset controller has five empty ports beside its disc,
+// once this driver bound before the system volume.
+const PRESENCE_TICKS: u64 = 5;
 
 unsafe fn r32(addr: u64) -> u32 {
 	unsafe { (addr as *const u32).read_volatile() }
@@ -377,8 +382,10 @@ unsafe fn reset_port(port: u64) {
 		while hold.waiting() {}
 		w32(port + ahci::PORT_SCTL, sctl);
 		let mut link = common::Deadline::ticks(RESET_TICKS);
+		let mut presence = common::Deadline::ticks(PRESENCE_TICKS);
 		while link.waiting() {
-			if ahci::link_up(r32(port + ahci::PORT_SSTS)) {
+			let ssts = r32(port + ahci::PORT_SSTS);
+			if ahci::link_up(ssts) || (!presence.waiting() && !ahci::device_present(ssts)) {
 				break;
 			}
 		}

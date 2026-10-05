@@ -1,6 +1,6 @@
 // The emulated peer's cryptography is a SEPARATE implementation from the host's, so it is held to the
 // same published vectors here - on its own, before the two are ever made to agree in the guest.
-use super::{Peer, aes128, cmac, f4, f5, f6, fingerprint};
+use super::{Peer, aes128, ah, c1, cmac, f4, f5, f6, fingerprint, g2, h6, h7, link_key_from_ltk, ltk_from_link_key, s1};
 
 fn hex<const N: usize>(text: &str) -> [u8; N] {
 	let clean: alloc::string::String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -85,4 +85,38 @@ fn reports_cannot_be_enabled_before_the_link_is_encrypted() {
 	assert_eq!(peer.att(&enable, true), Some(alloc::vec![0x13]));
 	assert!(peer.boot_mode && peer.notify);
 	assert!(peer.report(0).is_some());
+}
+
+// The fixture's own legacy functions and address hash, held to the same published sample data as the host's.
+#[test]
+fn the_independent_legacy_functions_meet_the_core_sample_data() {
+	let k = [0u8; 16];
+	let c = c1(&k, &hex("5783D52156AD6F0E6388274EC6702EE0"), &hex("07071000000101"), &hex("05000800000302"), 1, &hex("A1A2A3A4A5A6"), 0, &hex("B1B2B3B4B5B6"));
+	assert_eq!(c, hex::<16>("1e1e3fef878988ead2a74dc5bef13b86"));
+	assert_eq!(s1(&k, &hex("000F0E0D0C0B0A091122334455667788"), &hex("010203040506070899AABBCCDDEEFF00")), hex::<16>("9a1fe1f0e8b0f49b5b4216ae796da062"));
+	// ah: IRK ec0234a357c8ad05341010a60a397d9b, prand 708194 -> 0dfbaa.
+	assert_eq!(ah(&hex("ec0234a357c8ad05341010a60a397d9b"), hex("708194")), hex::<3>("0dfbaa"));
+	// g2 from the specification's numeric comparison sample.
+	let u: [u8; 32] = hex("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6");
+	let v: [u8; 32] = hex("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd");
+	let x: [u8; 16] = hex("d5cb8454d177733effffb2ec712baeab");
+	let y: [u8; 16] = hex("a6e8e7cc25a75f6e216583f7ff3dc4cf");
+	assert_eq!(g2(&u, &v, &x, &y), 0x2f9ed5ba);
+}
+
+#[test]
+// THE CROSS-TRANSPORT FUNCTIONS: h6 and h7 to Appendix D.8 and D.9, and the two chains built on them - the link key
+// handed over as HCI carries it, least significant octet first.
+fn the_independent_h6_and_h7_meet_appendix_d_and_chain_both_ways() {
+	let w = hex::<16>("ec0234a357c8ad05341010a60a397d9b");
+	assert_eq!(h6(&w, b"lebr"), hex("2d9ae102e76dc91ce8d3a9e280b16399"));
+	let mut salt = [0u8; 16];
+	salt[12..].copy_from_slice(b"tmp1");
+	assert_eq!(h7(&salt, &w), hex("fb173597c6a3c0ecd2998c2a75a57011"));
+	let mut expected = h6(&h7(&salt, &w), b"lebr");
+	expected.reverse();
+	assert_eq!(link_key_from_ltk(&w, true), expected);
+	let mut hci = w;
+	hci.reverse();
+	assert_eq!(ltk_from_link_key(&hci, false), h6(&h6(&w, b"tmp2"), b"brle"));
 }

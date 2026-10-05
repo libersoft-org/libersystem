@@ -3696,7 +3696,49 @@ enum AudioServiceScenario {
 	ScopeAndMixing,
 	Backpressure,
 	Mp3Continuity,
-	DriverFailure,
+	DriverLoss,
+	Inventory,
+}
+
+// THE CATALOGUE'S CONVERSATION, KEPT OPEN: as `serve_provider_catalogue`, but the subscription's stream is handed back
+// so a scenario can publish a second provider and withdraw it.
+fn serve_provider_catalogue_kept(server: &object::channel::Channel, kind: device_proto::generated::liber::device::v1::ProviderKind, provider: alloc::sync::Arc<dyn object::KernelObject>) -> Result<alloc::sync::Arc<object::channel::Channel>, &'static str> {
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+	let request = server.recv().map_err(|_| "no subscribe request")?;
+	let corr = subscribe_correlation(&request.bytes).ok_or("the subscribe request did not decode")?;
+	let (stream_server, stream_client) = Channel::create();
+	let mut reply = alloc::vec::Vec::new();
+	reply.extend_from_slice(&corr.to_le_bytes());
+	server.send(Message::new(reply, alloc::vec![Capability::new(stream_client, Rights::ALL)])).map_err(|_| "the subscribe reply was refused")?;
+	publish_provider(server, &stream_server, kind, 0, true, Some(provider))?;
+	Ok(stream_server)
+}
+
+// ONE PUBLICATION ON A KEPT SUBSCRIPTION: a provider at `slot` going live - and its connection answered when the
+// service asks for it - or withdrawn.
+fn publish_provider(server: &object::channel::Channel, stream: &object::channel::Channel, kind: device_proto::generated::liber::device::v1::ProviderKind, slot: u32, live: bool, provider: Option<alloc::sync::Arc<dyn object::KernelObject>>) -> Result<(), &'static str> {
+	use device_proto::codec as wire;
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::Message;
+	use object::handle::Capability;
+	use object::rights::Rights;
+	let info = device::ProviderInfo { kind, bus: 0, dev: 4 + slot, func: 0, binding_generation: 1, slot, provider_generation: 1, name: alloc::string::String::new().into(), live, platform: None };
+	let mut frame = [0u8; 64];
+	let mut frame_handles = wire::Handles::new();
+	let len = device::provider_catalogue::subscribe_frame(0, &info, &mut frame, &mut frame_handles).ok_or("the provider frame did not encode")?;
+	stream.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).map_err(|_| "the provider frame was refused")?;
+	sched::run_until_idle();
+	let Some(provider) = provider else { return Ok(()) };
+	let request = server.recv().map_err(|_| "no open request")?;
+	let corr = subscribe_correlation(&request.bytes).ok_or("the open request did not decode")?;
+	let mut reply = alloc::vec::Vec::new();
+	reply.extend_from_slice(&corr.to_le_bytes());
+	reply.push(1);
+	reply.extend_from_slice(&0u32.to_le_bytes());
+	server.send(Message::new(reply, alloc::vec![Capability::new(provider, Rights::ALL)])).map_err(|_| "the open reply was refused")?;
+	Ok(())
 }
 
 fn run_audio_service_scenario(scenario: AudioServiceScenario) {
@@ -3815,6 +3857,19 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		}
 	}
 
+	// THE FIRST THING A CONNECTED DEVICE IS ASKED: what it is.
+	fn answer_format(snd: &Channel, format: &driver_protocol::audio::DeviceFormat) {
+		let asked = snd.recv().expect("the format asked for as the device connected");
+		assert_eq!(&asked.bytes[..], &[driver_protocol::audio::CMD_FORMAT], "a connected device is asked what it is before anything else");
+		snd.send(Message::new(format.encode().to_vec(), alloc::vec::Vec::new())).expect("the format answered");
+		sched::run_until_idle();
+	}
+
+	// THE OPERATOR'S VIEW, through the control root as `audioctl` holds it.
+	fn control(root: &Channel) -> audio_proto::generated::liber::audio::v1::audio_control::Client<hardware::KernelTransport<'_>> {
+		audio_proto::generated::liber::audio::v1::audio_control::Client::new(hardware::KernelTransport::new(root, 1_000))
+	}
+
 	let init = init_package_bytes().expect("init package module not found");
 	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
@@ -3861,6 +3916,9 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	// AND THE OBSERVATION ROOT, LAST, which this harness reads the counters back through as the System Graph does.
 	let (stats_root, stats_service) = Channel::create();
 	send_cap(&boot_kernel, b"STATS", stats_service, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("stats bootstrap");
+	// AND THE OPERATOR ROOT, LAST: the inventory, the defaults and the levels.
+	let (control_root, control_service) = Channel::create();
+	send_cap(&boot_kernel, b"CONTROL", control_service, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("control bootstrap");
 	sched::run_until_idle();
 	let storage_online = storage_boot_kernel.recv().expect("StorageService online report");
 	assert_eq!(&storage_online.bytes[..], b"StorageService: online (vol://system)");
@@ -3869,10 +3927,12 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	// AND THEN IT ASKS. The report above is sent before the subscription, so the service is parked
 	// in its `subscribe` call by here - which is exactly the seam this proves: the device arrives
 	// because the service went looking for it.
-	serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
+	let catalogue_stream = serve_provider_catalogue_kept(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
 	sched::run_until_idle();
-	// THE COUNTERS ARE READ FIRST, the moment the device is connected and before anything plays - and what the
-	// observation root answers after that is what the driver said, no older and no invented.
+	// WHAT THE DEVICE IS, FIRST: the fixed 48 kHz stereo every provider spoke before it was asked.
+	answer_format(&snd_host, &driver_protocol::audio::DeviceFormat::LEGACY);
+	// THE COUNTERS ARE READ NEXT, before anything plays - and what the observation root answers after that is what
+	// the driver said, no older and no invented.
 	let asked = snd_host.recv().expect("the counters asked for as the device connected");
 	assert_eq!(&asked.bytes[..], &[driver_protocol::audio::CMD_STATS], "a connected device's counters are read before anything is played");
 	let observed = |corr: u32| -> audio_proto::generated::liber::audio::v1::AudioResources {
@@ -4016,17 +4076,80 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			sched::run_until_idle();
 			assert!(mp3_process.is_terminated(), "interrupted MP3 player closes and exits");
 		}
-		AudioServiceScenario::DriverFailure => {
-			let doomed = open(&service_client, 13, 48_000, 2).expect("stream before driver crash");
-			send_write(&doomed, 14, &pcm(512, 2, 200));
+		// A STREAM NEVER ENDS BECAUSE ITS DEVICE LEFT: with no device at all it keeps accepting, and what it plays goes
+		// into silence on the host's timer, counted - and a stream opened with no device at all is accepted the same way.
+		AudioServiceScenario::DriverLoss => {
+			let kept = open(&service_client, 13, 48_000, 2).expect("stream before driver crash");
+			send_write(&kept, 14, &pcm(512, 2, 200));
 			sched::run_until_idle();
-			write_reply(&doomed, 14, 512);
+			write_reply(&kept, 14, 512);
 			let period = from_driver(&snd_host, "period pending at driver crash");
 			assert_eq!(sample(&period), 200);
 			drop(snd_host);
 			sched::run_until_idle();
-			assert!(doomed.is_peer_closed(), "driver crash closes live PCM streams");
-			assert!(open(&service_client, 15, 48_000, 2).is_err(), "driver crash makes future opens fail");
+			assert!(!kept.is_peer_closed(), "a stream outlives its device");
+			send_write(&kept, 15, &pcm(1_024, 2, 200));
+			sched::run_until_idle();
+			write_reply(&kept, 15, 1_024);
+			let late = open(&service_client, 16, 48_000, 2).expect("a stream opens with no device at all");
+			assert!(control(&control_root).devices().expect("the inventory").is_empty(), "the device is gone from the inventory");
+			for _ in 0..40 {
+				advance_clock(1);
+				sched::run_until_idle();
+			}
+			let counters = control(&control_root).counters().expect("the counters");
+			assert!(counters.silent_frames >= 1_024, "what the stream played with no device was counted as silence: {}", counters.silent_frames);
+			let streams = control(&control_root).streams().expect("the streams");
+			assert!(streams.iter().all(|stream| stream.device.is_none()), "every stream plays on no device");
+			drop(late);
+		}
+		// THE INVENTORY AND THE ROUTING RULE: a second provider in a format of its own arrives and takes the default, a
+		// stream plays on it at its rate and channel count, its level is applied here, and when it is withdrawn the
+		// stream moves back to the first device - never ending.
+		AudioServiceScenario::Inventory => {
+			use driver_protocol::audio::{DeviceFormat, PcmFormat};
+			let voice = PcmFormat { rate: 16_000, channels: 1 };
+			let narrow = DeviceFormat { output: Some(voice), input: Some(voice), period_bytes: 320, latency_us: 20_000, hardware_volume: false, volume: 100 };
+			let (snd2_host, snd2_service) = Channel::create();
+			publish_provider(&catalogue_server, &catalogue_stream, device_proto::generated::liber::device::v1::ProviderKind::Audio, 1, true, Some(snd2_service)).expect("the second provider published and connected");
+			sched::run_until_idle();
+			answer_format(&snd2_host, &narrow);
+			let devices = control(&control_root).devices().expect("the inventory");
+			assert_eq!(devices.len(), 2, "both providers are devices");
+			let second = devices.iter().find(|device| device.output.as_ref().is_some_and(|format| format.rate == 16_000)).expect("the second device, at its own rate");
+			assert!(second.default_output && second.default_input, "the device that arrived is the default");
+			assert_eq!(second.latency_us, 20_000);
+			let first = devices.iter().find(|device| device.id != second.id).expect("the first device").id;
+			let second = second.id;
+			let stream = open(&service_client, 40, 48_000, 2).expect("a stream on the default");
+			send_write(&stream, 41, &pcm(3_000, 2, 20_000));
+			sched::run_until_idle();
+			write_reply(&stream, 41, 3_000);
+			let period = from_driver(&snd2_host, "a period at the second device's own format");
+			assert_eq!(period.bytes.len(), 320, "ten milliseconds of 16 kHz mono");
+			assert_eq!(sample(&period), 20_000, "stereo mixed down to the device's one channel");
+			assert_eq!(control(&control_root).set_volume(&second, &50), Some(Ok(())), "the level is set");
+			snd2_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("the period ACK");
+			sched::run_until_idle();
+			let period = from_driver(&snd2_host, "a period at half the level");
+			assert_eq!(sample(&period), 5_000, "level 50 is a quarter of the amplitude, applied here");
+			// THE DRIVER GOES THE WAY A HOT-UNPLUGGED ONE DOES: it answers the period and is gone before the next one is
+			// sent - so the service's next request is the one that finds the channel closed - and the withdrawal follows.
+			snd2_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("the last period ACK");
+			drop(snd2_host);
+			sched::run_until_idle();
+			publish_provider(&catalogue_server, &catalogue_stream, device_proto::generated::liber::device::v1::ProviderKind::Audio, 1, false, None).expect("the second provider withdrawn");
+			sched::run_until_idle();
+			let devices = control(&control_root).devices().expect("the inventory");
+			assert_eq!(devices.len(), 1, "the withdrawn device left");
+			assert!(devices[0].id == first && devices[0].default_output, "the device it displaced is the default again");
+			let period = from_driver(&snd_host, "the stream back on the first device");
+			assert_eq!(period.bytes.len(), 2_048);
+			assert_eq!(sample(&period), 20_000, "at the first device's own level");
+			assert!(control(&control_root).counters().expect("the counters").moves >= 1, "the move counted");
+			assert!(!stream.is_peer_closed(), "the stream never ended");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("the period ACK");
+			sched::run_until_idle();
 		}
 	}
 }
@@ -6083,11 +6206,14 @@ fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, 
 	let package = pkg::Package::parse(volume).expect("volume package parses");
 	let process = object::process::Process::new(object::address_space::AddressSpace::create().expect("dynamic test address space"), domain).expect("dynamic test process");
 	let elf = bootproto::elf::Elf::parse(main).expect("dynamic test main is ELF");
-	let dynamic = elf.dynamic_info().expect("main dynamic metadata parses").expect("main has PT_DYNAMIC");
 	let mut loaded = alloc::vec::Vec::new();
 	let mut visiting = alloc::vec::Vec::new();
-	for dependency in elf.needed_names(&dynamic).expect("main dependencies parse") {
-		load(&package, &process, dependency, &mut loaded, &mut visiting);
+	// A STATIC SERVICE has no providers to load: the same spawn serves it, so a service that changes its linkage is not
+	// a change to every test that starts it.
+	if let Some(dynamic) = elf.dynamic_info().expect("main dynamic metadata parses") {
+		for dependency in elf.needed_names(&dynamic).expect("main dependencies parse") {
+			load(&package, &process, dependency, &mut loaded, &mut visiting);
+		}
 	}
 	let entry = loader::load_image_into(&process, main).expect("load dynamic test main");
 	let bootstrap = process.install(bootstrap, object::rights::Rights::ALL).expect("a bootstrap handle");
@@ -6824,6 +6950,10 @@ impl ConsoleHarness {
 		display_boot.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 		// And the outputs root, which only the power policy is handed: none here.
 		display_boot.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
+		// And the brightness's two roots and the system-key stream, which the deployed system hands it: none here.
+		for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..]] {
+			display_boot.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
+		}
 
 		let width: u32 = (cols * 8) as u32;
 		let height: u32 = (rows * 16) as u32;
@@ -6843,6 +6973,8 @@ impl ConsoleHarness {
 		sched::run_until_idle();
 		let online = display_boot.recv().expect("DisplayService online report");
 		assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
+		// THE BACKLIGHT SUBSCRIPTION, which the service makes once it is online: answered with nothing.
+		crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the backlight subscription with nothing");
 
 		let (console_boot, console_boot_user) = Channel::create();
 		let (vt1_console, vt1_program) = Channel::create();

@@ -160,12 +160,12 @@ expect "$second" "btcheck: PASS reuse" "after the cold reboot the bond must be r
 expect "$second" "btcheck: PASS forget" "a forgotten bond must be gone and the mouse must no longer move the cursor"
 
 # ---- the shipping operator: `btctl` scans, pairs from the scan, enables and lists.
-grep -aqE 'c0:ff:ee:00:00:01 random +-?[0-9]+ dBm' "$second" || fail "btctl scan did not report the fixture mouse"
+grep -aqE 'c0:ff:ee:00:00:01 le-random +-?[0-9]+ dBm' "$second" || fail "btctl scan did not report the fixture mouse"
 echo "bluetooth-service: btctl scan reported the fixture mouse"
-expect "$second" "bonded: encrypted, not authenticated" "btctl pair must reach a bond from the scan, and say what Just Works does not prove"
-expect "$second" "c0:ff:ee:00:00:01 random is an input source" "btctl enable must make the bonded mouse an input source"
-grep -aqE 'bonded c0:ff:ee:00:00:01 random ".*" - input enabled' "$second" || fail "btctl must list the new bond as an enabled input source"
-echo "bluetooth-service: btctl lists the new bond as an enabled input source"
+expect "$second" "bonded: Secure Connections, Just Works (nothing proved which radio answered)" "btctl pair must reach a bond from the scan, and say what Just Works does not prove"
+expect "$second" "c0:ff:ee:00:00:01 le-random is trusted for input" "btctl enable must make the bonded mouse an input source"
+grep -aqE 'c0:ff:ee:00:00:01 le-random ".*" - Secure Connections, Just Works .*trusted for input' "$second" || fail "btctl must list the new bond as trusted for input"
+echo "bluetooth-service: btctl lists the new bond as trusted for input"
 repaired="$(sed -n '/btcheck: PASS forget/,$p' "$second" | grep -acE 'bt-fixture: paired;' || true)"
 [[ "$repaired" == 1 ]] || fail "the fixture reported $repaired pairings after the forget; btctl's one is expected"
 

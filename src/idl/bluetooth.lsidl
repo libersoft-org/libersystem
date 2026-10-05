@@ -13,18 +13,28 @@
 package liber:bluetooth@1;
 
 use liber:base@1.{error};
+use liber:process@1.{task};
 
 /// Which kind a peer address is.
 ///
-/// THIS SLICE SPEAKS TWO AND REFUSES THE REST. Resolvable private addresses - the ones a device
-/// rotates for privacy - need an identity resolving key and a resolution step that this milestone
-/// excludes by name, and a stack that treated one as a static address would bond to a peer whose
-/// address is different by the time it reconnects.
+/// A RESOLVABLE PRIVATE ADDRESS - one a device rotates for privacy - is resolved with the identity key the
+/// peer gave at bonding, and a bonded peer is always named by its IDENTITY address; `resolvable` names one
+/// seen before it resolved, or one no bond resolves.
 enum peer-kind {
-	/// An address from the device's own assigned block.
+	/// An LE address from the device's own assigned block.
 	public        = 1,
-	/// A random address the device does not rotate.
+	/// An LE random address the device does not rotate.
 	random-static = 2,
+	/// A BR/EDR device address.
+	bredr         = 3,
+	/// An LE resolvable private address no bond resolves.
+	resolvable    = 4,
+}
+
+/// Which radio a device was found on or is bonded over.
+enum radio {
+	classic = 1,
+	le      = 2,
 }
 
 /// A peer's address, most significant byte first - the order the specification's own sample data is
@@ -48,6 +58,20 @@ record controller-info {
 	/// The session this controller is in. A reset advances it, and everything a client held from
 	/// the previous one is gone.
 	epoch:              u32,
+	/// Whether it has a BR/EDR radio as well as LE.
+	classic:            bool,
+	/// The inbound policy's state now: page scan, inquiry scan, and whether a prompt watcher makes
+	/// it pairable.
+	connectable:        bool,
+	discoverable:       bool,
+	pairable:           bool,
+}
+
+/// A 16-bit service class UUID, as an extended inquiry response or an advertisement names it. A record and not a
+/// bare `u16` so that the list of them is this package's own type: a list of a primitive is a growth routine
+/// every package shares, and which package provides it differs per target.
+record service-class {
+	uuid: u16,
 }
 
 /// One device a scan found.
@@ -62,6 +86,12 @@ record scan-result {
 	/// Whether it advertised the human-interface service. A hint for an operator choosing from a
 	/// list, and not a claim that this stack can drive it.
 	human-interface:   bool,
+	/// The radio it was found on.
+	radio:             radio,
+	/// A classic device's class of device, zero on LE.
+	class-of-device:   u32,
+	/// The 16-bit service class UUIDs its extended inquiry response or advertisement named.
+	@bound(16) services: list<service-class>,
 }
 
 /// How far a pairing attempt has got.
@@ -96,6 +126,91 @@ enum security-level {
 	encrypted-authenticated     = 3,
 }
 
+/// THE KEY AGREEMENT a bond was made with, lowest first within each radio.
+enum key-agreement {
+	/// BR/EDR legacy pairing with a PIN, only ever when the operator asked for it.
+	legacy             = 1,
+	/// LE legacy pairing, the same.
+	le-legacy          = 2,
+	/// BR/EDR Secure Simple Pairing on P-192.
+	p192               = 3,
+	/// P-256 Secure Connections, either radio.
+	secure-connections = 4,
+}
+
+/// A BOND'S LEVEL ON TWO AXES - the key agreement and whether a person authenticated it - and a bond is
+/// never replaced by one lower on either.
+record bond-level {
+	agreement:     key-agreement,
+	authenticated: bool,
+}
+
+/// A profile a peer may be trusted for: what admits an inbound connection for it, and what an
+/// application grant for SPP or GATT is checked against.
+enum profile {
+	input = 1,
+	audio = 2,
+	voice = 3,
+	pan   = 4,
+	spp   = 5,
+	gatt  = 6,
+}
+
+/// WHAT A PERSON IS ASKED during a pairing.
+enum prompt-question {
+	/// Do the six digits match the peer's? `value` is them.
+	compare       = 1,
+	/// Type `value` on the peer.
+	show-passkey  = 2,
+	/// Type the six digits the peer shows.
+	enter-passkey = 3,
+	/// Type the peer's PIN: legacy pairing, which the operator asked for.
+	enter-pin     = 4,
+	/// May this peer pair? An incoming pairing with no number to compare.
+	consent       = 5,
+}
+
+/// ONE PROMPT the service originates on the operator authority: answered by `answer` before its deadline,
+/// after which the service answers no itself.
+record pairing-prompt {
+	id:                u32,
+	controller:        u32,
+	peer:              peer-address,
+	radio:             radio,
+	question:          prompt-question,
+	/// The six digits to compare or show; zero otherwise.
+	value:             u32,
+	/// Keypress notifications the peer sent while a passkey is typed on it.
+	keypresses:        u8,
+	/// How long is left, in milliseconds, when the prompt was sent.
+	deadline-ms:       u32,
+	@bound(48) name:   string,
+}
+
+/// What a person answered.
+variant prompt-reply {
+	yes,
+	no,
+	passkey(u32),
+	pin(list<u8>),
+}
+
+/// One device as `btctl` lists it: both radios in one list.
+record device-status {
+	address:            peer-address,
+	radio:              radio,
+	@bound(48) name:    string,
+	@bound(48) alias:   string,
+	bonded:             bool,
+	connected:          bool,
+	level:              option<bond-level>,
+	@bound(8) trusted:  list<profile>,
+	/// The profiles connected to it now.
+	@bound(8) connected-profiles: list<profile>,
+	/// Its battery in percent, where it reports one.
+	battery:            option<u8>,
+}
+
 /// What a pairing attempt came to.
 record pairing-progress {
 	state:    pairing-state,
@@ -113,6 +228,10 @@ record bonded-peer {
 	/// Whether this peer's input is currently an input source.
 	enabled:           bool,
 	security:          security-level,
+	radio:             radio,
+	level:             bond-level,
+	@bound(8) trusted: list<profile>,
+	@bound(48) alias:  string,
 }
 
 /// A scan's own identity, so that a cancellation names the scan it cancels rather than whichever one
@@ -170,8 +289,37 @@ interface bluetooth-operator {
 	/// reboot. The live link is terminated with it.
 	@op(6) forget:   func(controller: u32, peer: peer-address) -> result<unit, error>;
 	/// Make a bonded peer an input source, or stop it being one. Disabling closes whatever channel
-	/// the input service holds for it.
+	/// the input service holds for it. The same as trusting it for input.
 	@op(7) enable:   func(controller: u32, peer: peer-address, on: bool) -> result<unit, error>;
+	/// THE PROMPT WATCHER: a stream of this controller's pairing prompts. While one is open the controller
+	/// is pairable and declares the IO capabilities a person can answer; one watcher per controller, a
+	/// second refused.
+	@op(8) prompts:  func(controller: u32) -> result<stream<pairing-prompt>, error>;
+	/// Answer a prompt. A reply that does not fit the question, or comes after the deadline, is refused.
+	@op(9) answer:   func(controller: u32, prompt: u32, reply: prompt-reply) -> result<unit, error>;
+	/// Make the classic radio discoverable for at most 180 seconds; zero ends it.
+	@op(10) discoverable: func(controller: u32, seconds: u32) -> result<unit, error>;
+	/// Trust a bonded peer for a profile, or stop trusting it.
+	@op(11) trust:   func(controller: u32, peer: peer-address, profile: profile, on: bool) -> result<unit, error>;
+	/// The operator's name for a bonded peer: what an application grant names it by. Empty clears it.
+	@op(12) alias:   func(controller: u32, peer: peer-address, @bound(32) alias: string) -> result<unit, error>;
+	/// Every device this controller knows - bonded, connected or found - on both radios.
+	@op(13) devices: func(controller: u32) -> result<list<device-status>, error>;
+	/// Connect a bonded peer's profile, or disconnect it.
+	@op(14) connect:    func(controller: u32, peer: peer-address, profile: profile) -> result<unit, error>;
+	@op(15) disconnect: func(controller: u32, peer: peer-address, profile: profile) -> result<unit, error>;
+	/// Pair with legacy PIN entry: only for a device that cannot do better, and never over a better bond.
+	@op(16) pair-legacy: func(controller: u32, peer: peer-address) -> result<unit, error>;
+	/// THE REMOTE CONTROL, toward a phone playing to this system: a button pressed and let go over AVRCP.
+	@op(17) media:       func(controller: u32, peer: peer-address, command: media-command) -> result<unit, error>;
+}
+
+/// A button the operator presses on a phone that plays to this system.
+enum media-command {
+	play     = 1,
+	pause    = 2,
+	next     = 3,
+	previous = 4,
 }
 
 /// One pointer report, as this stack hands it up.
@@ -189,28 +337,94 @@ record mouse-report {
 	buttons: u8,
 }
 
-/// A peer this machine's operator has made an input source, as the input service learns of it: the
+/// A key going down or up, with its usage page. THE PAGE TRAVELS WITH IT: a keyboard's own keys are the
+/// keyboard page's, and its media, volume and launcher keys the consumer page's, and the two are never folded
+/// into one number a consumer must take apart.
+record key-transition {
+	page:  u16,
+	usage: u16,
+	down:  bool,
+}
+
+/// A gamepad frame on the production gamepad wire - its arrival with its shape, a state, or its departure -
+/// exactly as a gamepad driver sends one, so the gamepad set takes a Bluetooth gamepad as one more source.
+record gamepad-frame {
+	@bound(160) bytes: list<u8>,
+}
+
+/// One decoded report from a peer trusted for input. DECODED AND NEVER A HID REPORT: the consumer needs no
+/// report parser, which is what keeps it from having to become a second HID implementation.
+variant input-report {
+	pointer(mouse-report),
+	key(key-transition),
+	gamepad(gamepad-frame),
+}
+
+/// A peer this machine's operator has trusted for input, as the input service learns of it: the
 /// controller it is bonded on and its address, and nothing else - no key, no name, no security record.
 record enabled-peer {
 	controller: u32,
 	peer:       peer-address,
 }
 
-/// THE PROFILE AUTHORITY: one verb, over peers an operator has already enabled.
+/// THE PROFILE AUTHORITY: one verb, over peers an operator has already trusted for input.
 ///
 /// Held by the input service and by nothing else. It cannot scan, cannot pair, cannot enumerate
-/// bonds and cannot reach a peer the operator has not enabled - so the component that consumes
-/// pointer input has no authority over the radio that produces it.
+/// bonds and cannot reach a peer the operator has not trusted - so the component that consumes
+/// input has no authority over the radio that produces it.
 interface bluetooth-profile {
-	/// A bounded stream of reports from one enabled peer. Refused for a peer that is not bonded or
-	/// not enabled. The stream ends when the peer is disabled, when the link is lost, or when the
+	/// A bounded stream of decoded reports from one peer trusted for input, on either radio: pointer motion,
+	/// key transitions with their page, and gamepad frames. Refused for a peer that is not bonded or not
+	/// trusted for input. The stream ends when the trust is withdrawn, when the link is lost, or when the
 	/// controller's session ends - and a consumer learns of all three the same way.
-	@op(1) open-mouse: func(controller: u32, peer: peer-address) -> result<stream<mouse-report>, error>;
-	/// The peers `open-mouse` would accept right now. WITHOUT IT THE ONE CONSUMER OF THIS INTERFACE
-	/// COULD NOT FIND WHAT IT IS ALLOWED TO OPEN: the operator's bonded list is on another authority,
-	/// and handing the input service that authority to learn a peer address would give it the verbs
-	/// that come with it. This answers with the enabled peers and nothing about the others.
+	@op(1) open-input: func(controller: u32, peer: peer-address) -> result<stream<input-report>, error>;
+	/// The peers `open-input` would accept right now: bonded and trusted for input, on every controller. WITHOUT
+	/// IT THE ONE CONSUMER OF THIS INTERFACE COULD NOT FIND WHAT IT IS ALLOWED TO OPEN, and handing it the
+	/// operator's bonded list would hand it the verbs that come with it.
 	@op(2) enabled: func() -> result<list<enabled-peer>, error>;
+}
+
+/// A primary service on a peer, as an application's GATT grant sees it: its 16-bit class and its handle range.
+record gatt-service {
+	uuid:  u16,
+	start: u16,
+	end:   u16,
+}
+
+/// A characteristic: its value's handle, its class and its declaration's properties.
+record gatt-characteristic {
+	handle:     u16,
+	uuid:       u16,
+	properties: u8,
+}
+
+/// A notification's or an indication's value, with the characteristic it came from.
+record gatt-value {
+	handle: u16,
+	@bound(244) value: list<u8>,
+}
+
+/// AN APPLICATION'S GATT CLIENT, minted per launch by PermissionManager for one component, one bonded peer the
+/// operator gave an alias and trusted for GATT, and a set of services. IT REACHES NOTHING OUTSIDE THOSE SERVICES - and
+/// never a service the stack drives itself: HID, GAP, GATT and the LE Audio services - and it ends with the launch.
+/// While the peer is not connected every operation answers `closed`.
+interface bluetooth-gatt {
+	/// The granted services the peer has.
+	@op(1) services:        func() -> result<list<gatt-service>, error>;
+	/// The characteristics of the granted service beginning at `start`.
+	@op(2) characteristics: func(start: u16) -> result<list<gatt-characteristic>, error>;
+	@op(3) read:            func(handle: u16) -> result<list<u8>, error>;
+	/// A write with a response.
+	@op(4) write:           func(handle: u16, @bound(244) value: list<u8>) -> result<unit, error>;
+	/// The characteristic's notifications, turned on for as long as the stream is held.
+	@op(5) subscribe:       func(handle: u16) -> result<stream<gatt-value>, error>;
+}
+
+/// THE MINTING ROOT PermissionManager holds, and nothing else: application grants, each for one component's launch.
+interface bluetooth-admin {
+	/// A GATT client for `owner`'s launch, on the bonded peer the operator named `alias` - refused unless that peer is
+	/// trusted for GATT - and for these services alone.
+	@op(1) mint-gatt: func(@bound(32) alias: string, @bound(8) services: list<service-class>, owner: handle<task>) -> result<handle<channel>, error>;
 }
 
 /// WHAT A BOND IS, on the private wire between this service and the store that keeps it.
@@ -234,6 +448,21 @@ record bond-record {
 	@bound(48) name:  string,
 	/// Whether the operator has made this peer an input source.
 	enabled:          bool,
+	/// The radio the bond is over; a peer bonded over both through a derived key has a record for each.
+	radio:            radio,
+	/// The BR/EDR link key and its type, as Link Key Notification gave them; empty on LE.
+	@bound(16) link-key: list<u8>,
+	link-key-type:    u8,
+	/// The level, on both axes.
+	level:            bond-level,
+	@bound(8) trusted: list<profile>,
+	@bound(48) alias: string,
+	/// The LE peer's identity resolving key, where it gave one; empty otherwise.
+	@bound(16) irk:   list<u8>,
+	/// An LE legacy key's EDIV and Rand, which name it when a link is encrypted with it; zero and empty for
+	/// Secure Connections.
+	ediv:             u16,
+	@bound(8) rand:   list<u8>,
 }
 
 /// THE BOND STORE'S PRIVATE INTERFACE. One holder, and it is not a client of anything above.
@@ -252,4 +481,145 @@ interface bluetooth-bond-store {
 	/// the operator's `bonded` list is built from, and building it from `lookup` would mean reading
 	/// every key to show a list of names.
 	@op(4) list:   func(local: peer-address) -> result<list<bond-record>, error>;
+}
+
+// ------------------------------------------------------------------ development only
+
+/// What one of the in-guest fixture's peers does next, on the gate's word.
+enum fixture-action {
+	/// Page this host and hold the link it accepts: an inbound connection.
+	page          = 1,
+	/// Open an L2CAP channel to the PSM `argument` names, on the link the peer holds.
+	open-psm      = 2,
+	/// Begin a pairing from the peer's side: authentication on the link it holds.
+	pair          = 3,
+	/// The link key type the peer's next pairing produces - how a downgrade is made.
+	key-type      = 4,
+	/// Type the passkey `argument` on the peer, as a person reading this host's display would.
+	type-passkey  = 5,
+	/// Ask this host's SDP server for the 16-bit service class `argument`; answers how many records matched.
+	sdp-search    = 6,
+	/// Open RFCOMM server channel `argument` on this host.
+	rfcomm-open   = 7,
+	/// Drop the link.
+	disconnect    = 8,
+	/// Forget the link key the peer holds, as a device reset to factory settings does.
+	forget        = 9,
+	/// Send `argument` bytes of data on the peer's open RFCOMM channel, to see credits flow.
+	rfcomm-send   = 10,
+	/// The keyboard presses Ctrl+Alt+Delete and lets go.
+	ctrl-alt-delete = 11,
+	/// The keyboard presses its Power key and lets go.
+	power-key     = 12,
+	/// A HID device opens its control and interrupt channels to this host, as one reconnecting does.
+	hid-connect   = 13,
+	/// The gamepad reports: buttons in `argument`'s low sixteen bits, its hat in the next four, X in the top byte.
+	gamepad-report = 14,
+	/// An LE device reads this host's name through this host's attribute server.
+	read-host-name = 15,
+	/// A dual-mode device's LE half begins advertising from its public address (`argument` 1), or stops and drops its
+	/// LE link (0).
+	le-advertise  = 16,
+	/// The phone streams to this host over A2DP - configuring this host's sink - for `argument` seconds, a tone in one
+	/// subband; or, with 0, stops.
+	stream        = 17,
+	/// The headset changes its own level to the absolute volume `argument`, and tells a controller registered for it.
+	volume        = 18,
+	/// The headset presses its play button toward this host.
+	press-play    = 19,
+}
+
+/// THE IN-GUEST BLUETOOTH FIXTURE'S CONTROL ENDPOINT. DEVELOPMENT ONLY: it exists on a development fixture
+/// bound to a QEMU test device, reached through PermissionManager in a development build for a probe whose
+/// policy row grants `fixture-control`. Its peers are numbered from 1 in the order the fixture documents; what
+/// it reports is what the far side of the radio saw this host do.
+interface bluetooth-fixture {
+	/// One peer acts. The answer is the action's own result: an L2CAP connection result, a record count, a
+	/// link handle - zero where there is nothing to say.
+	@op(1) act:    func(peer: u8, action: fixture-action, argument: u32) -> result<u32, error>;
+	/// What the far side saw since the last call, one line each, oldest first.
+	@op(2) events: func() -> result<list<string>, error>;
+	/// The keyboard types `text` - letters, digits, space, `-`, `.` and a newline as Enter - `delay-ms` from now, so a
+	/// probe can end and leave the shell's prompt to read it.
+	@op(3) type-text: func(peer: u8, @bound(64) text: string, delay-ms: u32) -> result<unit, error>;
+}
+
+// ------------------------------------------------------------------ audio, for AudioService
+
+/// What a Bluetooth audio endpoint is, as AudioService's inventory takes it.
+enum audio-endpoint-kind {
+	/// Headphones or a speaker: A2DP, or an LE Audio sink.
+	output = 1,
+	/// A microphone streaming on its own: an LE Audio source.
+	input  = 2,
+	/// A headset's call audio both ways: HFP or HSP over SCO, or LE Audio's bidirectional streams. Its link is up only
+	/// while it is open.
+	voice  = 3,
+	/// A PHONE PLAYING TO THIS SYSTEM - the A2DP sink route, or a broadcast this system receives: read as capture is,
+	/// played to the default output, and never an input.
+	route  = 4,
+}
+
+/// ONE ENDPOINT, as it is offered: its number on this connection, whose it is, and how it is driven - in the format
+/// the device-side PCM contract states, its period acknowledgment its clock.
+record audio-endpoint {
+	id:              u32,
+	peer:            peer-address,
+	@bound(48) name: string,
+	kind:            audio-endpoint-kind,
+	rate:            u32,
+	channels:        u8,
+	latency-us:      u32,
+	/// The device applies its level itself - AVRCP absolute volume, HFP's gains, LE Volume Control.
+	hardware-volume: bool,
+	volume:          u8,
+}
+
+/// A device's level changed on the device itself.
+record endpoint-volume {
+	id:     u32,
+	volume: u8,
+}
+
+/// The call state AudioService relays from a voice session to the voice device.
+enum bt-call-state {
+	none     = 0,
+	incoming = 1,
+	outgoing = 2,
+	active   = 3,
+	held     = 4,
+}
+
+/// A headset's call command, relayed to AudioService.
+enum bt-call-command {
+	answer  = 1,
+	hang-up = 2,
+	reject  = 3,
+	redial  = 4,
+}
+
+/// What the endpoints stream carries.
+variant audio-event {
+	/// An endpoint is offered.
+	arrived(audio-endpoint),
+	/// An endpoint is gone: its id.
+	departed(u32),
+	/// An endpoint's own level changed.
+	volume(endpoint-volume),
+	/// A voice device's call command.
+	command(bt-call-command),
+}
+
+/// BLUETOOTH'S AUDIO, FOR AUDIOSERVICE ALONE: resolved by name through the broker, never a role, so stopping the radio
+/// stack stops no audio and no audio waits for the radio. Endpoints are offered as they come and go; each is opened as
+/// a PCM channel speaking the device-side contract a sound card speaks; levels travel both ways; and the call relay
+/// carries a voice session's call state out and a headset's commands in.
+interface bluetooth-audio {
+	/// The endpoints offered now, then every change, as a stream. One subscriber: a second is refused.
+	@op(1) endpoints:  func() -> result<stream<audio-event>, error>;
+	/// The PCM channel of an endpoint. Opening a voice endpoint brings its audio link up, and closing it takes it down.
+	@op(2) open:       func(id: u32) -> result<handle<channel>, error>;
+	@op(3) set-volume: func(id: u32, volume: u8) -> result<unit, error>;
+	/// The call state the voice device reports; none when no session declares one.
+	@op(4) set-call:   func(state: bt-call-state) -> result<unit, error>;
 }

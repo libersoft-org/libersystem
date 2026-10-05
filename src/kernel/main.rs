@@ -383,7 +383,7 @@ pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
 	// runs on, because in QEMU a boot surface is ordinary RAM. What was missing was SAYING so: a
 	// cache policy that is not stated cannot be checked, and a consumer deciding whether it may read
 	// the surface back had nothing to ask.
-	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: fb.bytes_per_pixel, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2], memory_type: abi::FRAMEBUFFER_WRITE_BACK };
+	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: fb.bytes_per_pixel, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2], memory_type: abi::FRAMEBUFFER_WRITE_BACK, decoder: 0, decoder_present: 0 };
 	Some((fb.addr, geom))
 }
 

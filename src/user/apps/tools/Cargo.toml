@@ -193,6 +193,11 @@ name = "btctl"
 path = "src/btctl.rs"
 
 [[bin]]
+# THE AUDIO OPERATOR COMMAND: the one shipping holder of `audio-control`.
+name = "audioctl"
+path = "src/audioctl.rs"
+
+[[bin]]
 # THE SLEEP'S OPERATOR COMMAND: the one shipping holder of `system-sleep`.
 name = "sleepctl"
 path = "src/sleepctl.rs"
@@ -218,6 +223,12 @@ path = "src/bmc.rs"
 # holds the operator's requests.
 name = "typec"
 path = "src/typec.rs"
+
+[[bin]]
+# THE BRIGHTNESS TOOL: every output and backlight through DisplayService's read, and a set and the policy's two settings
+# through the brightness policy's control.
+name = "brightness"
+path = "src/brightness.rs"
 
 [[bin]]
 # THE FIRMWARE-DOWNLOAD REQUESTER: the one shipping holder of an administrative request connection, scoped to
@@ -433,6 +444,8 @@ shared-image = [
 	"bmc-client-provider/shared-image",
 	"typec-client/shared-image",
 	"typec-client-provider/shared-image",
+	"display-client/shared-image",
+	"display-client-provider/shared-image",
 	"input-client/shared-image",
 	"input-client-provider/shared-image",
 	"power-client/shared-image",
@@ -499,6 +512,8 @@ bmc-client = { path = "../../libs/clients/bmc-client", optional = true }
 bmc-client-provider = { path = "../../libs/clients/bmc-client-provider", optional = true }
 typec-client = { path = "../../libs/clients/typec-client", optional = true }
 typec-client-provider = { path = "../../libs/clients/typec-client-provider", optional = true }
+display-client = { path = "../../libs/clients/display-client", optional = true }
+display-client-provider = { path = "../../libs/clients/display-client-provider", optional = true }
 input-client = { path = "../../libs/clients/input-client", optional = true }
 input-client-provider = { path = "../../libs/clients/input-client-provider", optional = true }
 power-client = { path = "../../libs/clients/power-client", optional = true }

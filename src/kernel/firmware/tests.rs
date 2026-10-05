@@ -531,3 +531,32 @@ fn only_the_running_instance_asks_for_general_purpose_events() {
 	}
 	in_thread(body, &DONE);
 }
+
+crate::tagged_test!(the_boot_framebuffers_decoder_is_the_function_whose_memory_bar_holds_it, [Kernel, Pci], id = "kernel.firmware.the_boot_framebuffers_decoder_is_the_function_whose_memory_bar_holds_it", covers = ["kernel"]);
+fn the_boot_framebuffers_decoder_is_the_function_whose_memory_bar_holds_it() {
+	let vga = Function { segment: 0, bus: 0, device: 1, function: 0 };
+	let bridge = Function { segment: 0, bus: 0, device: 0x1c, function: 0 };
+	let gpu = Function { segment: 0, bus: 1, device: 0, function: 0 };
+	let ranges = [(0xE000_0000u64, 0x1000_0000u64, bridge, true), (0xE000_0000, 0x0100_0000, gpu, false), (0xFD00_0000, 0x0100_0000, vga, false)];
+	assert_eq!(super::decoder_in(ranges.iter().copied(), 0xFD00_0000), Some(vga), "the base itself");
+	assert_eq!(super::decoder_in(ranges.iter().copied(), 0xFDFF_F000), Some(vga), "inside the BAR");
+	assert_eq!(super::decoder_in(ranges.iter().copied(), 0xFE00_0000), None, "one past its end decodes nothing");
+	assert_eq!(super::decoder_in(ranges.iter().copied(), 0xE000_8000), Some(gpu), "the function behind a bridge, never the bridge's window");
+	assert_eq!(super::decoder_in(ranges.iter().copied(), 0xEF00_0000), None, "a window alone is no decoder");
+	assert_eq!(super::decoder_in([(0x1000u64, 0u64, vga, false)].into_iter(), 0x1000), None, "an empty BAR holds nothing");
+	// AND THE BOOT ITSELF: on the test profile the boot framebuffer lies in a function's BAR the scan recorded.
+	if let Some((address, _)) = crate::framebuffer_geometry()
+		&& let Some(physical) = crate::arch::paging::translate(address)
+	{
+		let decoder = super::decoder_of(physical);
+		crate::serial_println!("firmware: the boot framebuffer at {physical:#x} is decoded by {:?}", decoder.map(|function| (function.bus, function.device, function.function)));
+	}
+}
+
+crate::tagged_test!(a_dmar_namespace_name_is_the_identity_the_service_publishes, [Kernel], id = "kernel.firmware.a_dmar_namespace_name_is_the_identity_the_service_publishes", covers = ["kernel"]);
+fn a_dmar_namespace_name_is_the_identity_the_service_publishes() {
+	assert_eq!(super::namespace_identity(b"\\_SB.PCI0.I2C1").as_deref(), Some(&b"acpi:\\_SB_.PCI0.I2C1"[..]), "every segment four characters");
+	assert_eq!(super::namespace_identity(b"_SB.UAR").as_deref(), Some(&b"acpi:\\_SB_.UAR_"[..]), "a name without the root's backslash is from the root");
+	assert_eq!(super::namespace_identity(b"\\_SB.TOOLONG"), None, "a segment past four characters is no namespace name");
+	assert_eq!(super::namespace_identity(b"\\_SB..X"), None, "nor is an empty one");
+}

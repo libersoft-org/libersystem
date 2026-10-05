@@ -1,12 +1,21 @@
 package liber:bluetooth@1
-enum peer-kind(public=1,random-static=2)
+enum peer-kind(public=1,random-static=2,bredr=3,resolvable=4)
+enum radio(classic=1,le=2)
 record peer-address(kind:peer-kind,bytes:list<u8>:bound=6)
-record controller-info(address:peer-address,powered:bool,secure-connections:bool,epoch:u32)
-record scan-result(address:peer-address,name:string:bound=48,rssi:i32,human-interface:bool)
+record controller-info(address:peer-address,powered:bool,secure-connections:bool,epoch:u32,classic:bool,connectable:bool,discoverable:bool,pairable:bool)
+record service-class(uuid:u16)
+record scan-result(address:peer-address,name:string:bound=48,rssi:i32,human-interface:bool,radio:radio,class-of-device:u32,services:list<service-class>:bound=16)
 enum pairing-state(idle=1,connecting=2,pairing=3,bonded=4,failed=5)
 enum security-level(none=1,encrypted-unauthenticated=2,encrypted-authenticated=3)
+enum key-agreement(legacy=1,le-legacy=2,p192=3,secure-connections=4)
+record bond-level(agreement:key-agreement,authenticated:bool)
+enum profile(input=1,audio=2,voice=3,pan=4,spp=5,gatt=6)
+enum prompt-question(compare=1,show-passkey=2,enter-passkey=3,enter-pin=4,consent=5)
+record pairing-prompt(id:u32,controller:u32,peer:peer-address,radio:radio,question:prompt-question,value:u32,keypresses:u8,deadline-ms:u32,name:string:bound=48)
+variant prompt-reply(yes=0:unit,no=1:unit,passkey=2:u32,pin=3:list<u8>)
+record device-status(address:peer-address,radio:radio,name:string:bound=48,alias:string:bound=48,bonded:bool,connected:bool,level:option<bond-level>,trusted:list<profile>:bound=8,connected-profiles:list<profile>:bound=8,battery:option<u8>)
 record pairing-progress(state:pairing-state,security:security-level,address:peer-address)
-record bonded-peer(address:peer-address,name:string:bound=48,enabled:bool,security:security-level)
+record bonded-peer(address:peer-address,name:string:bound=48,enabled:bool,security:security-level,radio:radio,level:bond-level,trusted:list<profile>:bound=8,alias:string:bound=48)
 record scan-handle(id:u32)
 interface bluetooth
 method bluetooth.controllers op=1 () -> result<list<controller-info>, liber:base@1::error>
@@ -22,14 +31,55 @@ method bluetooth-operator.cancel op=4 (controller:u32:rights=) -> result<unit, l
 method bluetooth-operator.bonded op=5 (controller:u32:rights=) -> result<list<bonded-peer>, liber:base@1::error>
 method bluetooth-operator.forget op=6 (controller:u32:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
 method bluetooth-operator.enable op=7 (controller:u32:rights=,peer:peer-address:rights=,on:bool:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.prompts op=8 (controller:u32:rights=) -> result<stream<pairing-prompt>, liber:base@1::error>
+method bluetooth-operator.answer op=9 (controller:u32:rights=,prompt:u32:rights=,reply:prompt-reply:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.discoverable op=10 (controller:u32:rights=,seconds:u32:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.trust op=11 (controller:u32:rights=,peer:peer-address:rights=,profile:profile:rights=,on:bool:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.alias op=12 (controller:u32:rights=,peer:peer-address:rights=,alias:string:bound=32:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.devices op=13 (controller:u32:rights=) -> result<list<device-status>, liber:base@1::error>
+method bluetooth-operator.connect op=14 (controller:u32:rights=,peer:peer-address:rights=,profile:profile:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.disconnect op=15 (controller:u32:rights=,peer:peer-address:rights=,profile:profile:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.pair-legacy op=16 (controller:u32:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.media op=17 (controller:u32:rights=,peer:peer-address:rights=,command:media-command:rights=) -> result<unit, liber:base@1::error>
+enum media-command(play=1,pause=2,next=3,previous=4)
 record mouse-report(dx:i32,dy:i32,wheel:i32,buttons:u8)
+record key-transition(page:u16,usage:u16,down:bool)
+record gamepad-frame(bytes:list<u8>:bound=160)
+variant input-report(pointer=0:mouse-report,key=1:key-transition,gamepad=2:gamepad-frame)
 record enabled-peer(controller:u32,peer:peer-address)
 interface bluetooth-profile
-method bluetooth-profile.open-mouse op=1 (controller:u32:rights=,peer:peer-address:rights=) -> result<stream<mouse-report>, liber:base@1::error>
+method bluetooth-profile.open-input op=1 (controller:u32:rights=,peer:peer-address:rights=) -> result<stream<input-report>, liber:base@1::error>
 method bluetooth-profile.enabled op=2 () -> result<list<enabled-peer>, liber:base@1::error>
-record bond-record(version:u32,local:peer-address,peer:peer-address,key:list<u8>:bound=16,security:security-level,name:string:bound=48,enabled:bool)
+record gatt-service(uuid:u16,start:u16,end:u16)
+record gatt-characteristic(handle:u16,uuid:u16,properties:u8)
+record gatt-value(handle:u16,value:list<u8>:bound=244)
+interface bluetooth-gatt
+method bluetooth-gatt.services op=1 () -> result<list<gatt-service>, liber:base@1::error>
+method bluetooth-gatt.characteristics op=2 (start:u16:rights=) -> result<list<gatt-characteristic>, liber:base@1::error>
+method bluetooth-gatt.read op=3 (handle:u16:rights=) -> result<list<u8>, liber:base@1::error>
+method bluetooth-gatt.write op=4 (handle:u16:rights=,value:list<u8>:bound=244:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-gatt.subscribe op=5 (handle:u16:rights=) -> result<stream<gatt-value>, liber:base@1::error>
+interface bluetooth-admin
+method bluetooth-admin.mint-gatt op=1 (alias:string:bound=32:rights=,services:list<service-class>:bound=8:rights=,owner:handle<liber:process@1::task>:rights=) -> result<handle<channel>, liber:base@1::error>
+record bond-record(version:u32,local:peer-address,peer:peer-address,key:list<u8>:bound=16,security:security-level,name:string:bound=48,enabled:bool,radio:radio,link-key:list<u8>:bound=16,link-key-type:u8,level:bond-level,trusted:list<profile>:bound=8,alias:string:bound=48,irk:list<u8>:bound=16,ediv:u16,rand:list<u8>:bound=8)
 interface bluetooth-bond-store
 method bluetooth-bond-store.lookup op=1 (local:peer-address:rights=,peer:peer-address:rights=) -> result<bond-record, liber:base@1::error>
 method bluetooth-bond-store.store op=2 (record:bond-record:rights=) -> result<unit, liber:base@1::error>
 method bluetooth-bond-store.delete op=3 (local:peer-address:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
 method bluetooth-bond-store.list op=4 (local:peer-address:rights=) -> result<list<bond-record>, liber:base@1::error>
+enum fixture-action(page=1,open-psm=2,pair=3,key-type=4,type-passkey=5,sdp-search=6,rfcomm-open=7,disconnect=8,forget=9,rfcomm-send=10,ctrl-alt-delete=11,power-key=12,hid-connect=13,gamepad-report=14,read-host-name=15,le-advertise=16,stream=17,volume=18,press-play=19)
+interface bluetooth-fixture
+method bluetooth-fixture.act op=1 (peer:u8:rights=,action:fixture-action:rights=,argument:u32:rights=) -> result<u32, liber:base@1::error>
+method bluetooth-fixture.events op=2 () -> result<list<string>, liber:base@1::error>
+method bluetooth-fixture.type-text op=3 (peer:u8:rights=,text:string:bound=64:rights=,delay-ms:u32:rights=) -> result<unit, liber:base@1::error>
+enum audio-endpoint-kind(output=1,input=2,voice=3,route=4)
+record audio-endpoint(id:u32,peer:peer-address,name:string:bound=48,kind:audio-endpoint-kind,rate:u32,channels:u8,latency-us:u32,hardware-volume:bool,volume:u8)
+record endpoint-volume(id:u32,volume:u8)
+enum bt-call-state(none=0,incoming=1,outgoing=2,active=3,held=4)
+enum bt-call-command(answer=1,hang-up=2,reject=3,redial=4)
+variant audio-event(arrived=0:audio-endpoint,departed=1:u32,volume=2:endpoint-volume,command=3:bt-call-command)
+interface bluetooth-audio
+method bluetooth-audio.endpoints op=1 () -> result<stream<audio-event>, liber:base@1::error>
+method bluetooth-audio.open op=2 (id:u32:rights=) -> result<handle<channel>, liber:base@1::error>
+method bluetooth-audio.set-volume op=3 (id:u32:rights=,volume:u8:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-audio.set-call op=4 (state:bt-call-state:rights=) -> result<unit, liber:base@1::error>

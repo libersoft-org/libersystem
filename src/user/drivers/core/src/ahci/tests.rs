@@ -70,6 +70,9 @@ fn a_port_needs_both_a_device_and_an_active_link() {
 	assert!(link_up(0x0000_0103), "device present, interface active");
 	assert!(!link_up(0x0000_0203), "device present, interface in partial power");
 	assert!(!link_up(0x0000_0101), "no device detected");
+	assert!(device_present(0x0000_0101), "a device detected, its link not yet established");
+	assert!(device_present(0x0000_0103));
+	assert!(!device_present(0x0000_0100), "nothing on the port");
 	assert!(!link_up(0), "nothing at all");
 }
 

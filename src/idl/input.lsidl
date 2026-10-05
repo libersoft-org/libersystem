@@ -168,6 +168,20 @@ interface input-activity {
 	@op(1) watch: func(idle-after-ms: u32) -> stream<activity-edge>;
 }
 
+/// A SYSTEM KEY, from the consumer page's system-key set: the two brightness keys.
+enum system-key {
+	brightness-up   = 1,
+	brightness-down = 2,
+}
+
+/// THE SYSTEM KEYS, served on InputService's `SYSKEYS` root to DisplayService alone, which owns the brightness. A
+/// consumer-page usage of the set is taken off the raw stream BEFORE ordinary delivery and before the protected
+/// session's check - it never enters `key-event`, and the person at the protected screen can still make it readable -
+/// and each press is one item; releases are not sent, and raw input does not repeat, so a held key is one step.
+interface system-keys {
+	@op(1) watch: func() -> stream<system-key>;
+}
+
 /// Privileged launcher boundary that mints a factory restricted to raw-key
 /// subscriptions. Connections produced from it cannot call the pointer snapshot op.
 interface input-admin {

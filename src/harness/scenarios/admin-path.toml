@@ -375,9 +375,12 @@ do = "expect"
 contains = "AdminService: the protected screen is closed"
 timeout = 30
 
+# EITHER OF THE TWO ENDINGS A DEAD REQUESTER HAS. Its task ends and its request connection closes in the same
+# moment, AdminService sees whichever the kernel delivers first, and both are true: "requester task ended" or
+# "requester connection closed". Expecting one of them failed one run in two on the order alone.
 [[step]]
 do = "expect"
-contains = "declined: requester task ended"
+contains = "declined: requester "
 
 # DELEGATION, AND THE OWNER ENDS: a helper holds the request connection and the unused grant, confirms it
 # holds both, waits for the original task to end, and redeems - nothing reaches the executor.
@@ -503,10 +506,11 @@ do = "expect"
 contains = "adminhelper: released the held acknowledgments after their requester ended"
 
 # UNORDERED: AdminService records the decline the moment the requester ends and writes it straight to the port,
-# while the probes' lines come through the console - so the log has them in either order.
+# while the probes' lines come through the console - so the log has them in either order. And either of the two
+# endings, for the reason given at the first requester that dies above.
 [[step]]
 do = "expect"
-contains = "declined: requester task ended"
+contains = "declined: requester "
 unordered = true
 
 # THE CONSUMPTION'S RECORD, HELD ACROSS THE OWNER'S DEATH: the grant stays spent and nothing is dispatched.

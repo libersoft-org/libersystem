@@ -716,6 +716,7 @@ def run(peer, scenario, seconds):
 	echo_at = None
 	echoed = False
 	pinged = False
+	ping_tries = 0
 	quoted = False
 	# The quoted errors waiting to go out, one per idle pass, and who to send them to.
 	quoted_queue = []
@@ -754,15 +755,21 @@ def run(peer, scenario, seconds):
 				connect_at = time.monotonic() + 3.0
 				inbound_port += 1
 				peer.send_tcp6(guest_mac, guest_global, PEER_GLOBAL, inbound_port, plan["connect_in"], 0x5000, 0, TCP_SYN, options=bytes([2, 4]) + struct.pack(">H", 1220))
-			if plan.get("ipv4_ping") and not pinged and guest_mac and time.monotonic() >= ping_at:
-				peer.ipv4_echo_request(guest_mac, 0x5151, 1)
-				pinged = True
+			# AGAIN UNTIL ANSWERED, a few seconds apart and bounded, the way `connect_in` repeats its SYN. One ping at
+			# a guessed instant was lost whenever it landed before the guest's IPv4 was serving - during its DHCP,
+			# or while the stack came up - which failed the row on the boot's timing rather than on the stack.
+			if plan.get("ipv4_ping") and not pinged and guest_mac and time.monotonic() >= ping_at and ping_tries < 15:
+				ping_tries += 1
+				peer.ipv4_echo_request(guest_mac, 0x5151, ping_tries)
+				ping_at = time.monotonic() + 2.0
 			if quoted_queue and quoted_to is not None:
 				responder, quoted_source, quoted_destination, kind, code, sequence = quoted_queue.pop(0)
 				peer.quoted_echo_error(quoted_to[0], quoted_to[1], responder, quoted_source, quoted_destination, kind, code, 0x4242, sequence)
 			continue
 		frame = Frame(raw)
 		peer.note(f"saw {frame.describe()}")
+		if frame.kind == "ipv4-echo-reply":
+			pinged = True
 		if frame.source_mac:
 			guest_mac = frame.source_mac
 		# A detection probe from `::` for a global address is the guest proving the address it formed

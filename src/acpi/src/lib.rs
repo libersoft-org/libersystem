@@ -1245,6 +1245,85 @@ pub fn dmar_units(bytes: &[u8], mut visit: impl FnMut(IommuUnit)) -> Result<(), 
 	Ok(())
 }
 
+// The DMAR structure that names an ACPI namespace device, and the device scope that puts one behind a hardware unit.
+const DMAR_ANDD: u16 = 4;
+const DMAR_SCOPE_NAMESPACE: u8 = 5;
+/// The longest ACPI object name an ANDD is read with.
+pub const ANDD_NAME: usize = 64;
+
+/// AN ACPI NAMESPACE DEVICE THAT MASTERS THE BUS BEHIND A DMAR UNIT: its object name as the ANDD states it, and the
+/// requester id its DMA carries - the stream an IOMMU would translate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NamespaceStream {
+	pub name: [u8; ANDD_NAME],
+	pub name_len: usize,
+	pub source_id: u16,
+}
+
+impl NamespaceStream {
+	pub fn name(&self) -> &[u8] {
+		&self.name[..self.name_len]
+	}
+}
+
+/// EVERY NAMESPACE DEVICE A DMAR PUTS BEHIND A HARDWARE UNIT: each ANDD's object name joined by its device number to
+/// the namespace-device scope of a DRHD naming that number, with the scope's requester id - its start bus and the last
+/// device and function of its path. A scope naming a number no ANDD declares is skipped; a structure that runs past
+/// the table ends the walk, as `dmar_units` does.
+pub fn dmar_namespace_streams(bytes: &[u8], mut visit: impl FnMut(NamespaceStream)) -> Result<(), Error> {
+	let table = Table::with_signature(bytes, b"DMAR")?;
+	let mut names: [(u8, [u8; ANDD_NAME], usize); 16] = [(0, [0; ANDD_NAME], 0); 16];
+	let mut name_count = 0usize;
+	let mut scopes: [(u8, u16); 16] = [(0, 0); 16];
+	let mut scope_count = 0usize;
+	let mut at = IOMMU_STRUCTURES;
+	while let (Some(kind), Some(length)) = (table.u16_at(at), table.u16_at(at + 2)) {
+		let length = length as usize;
+		if length < 4 || at + length > table.len() {
+			return Err(Error::TooShort);
+		}
+		if kind == DMAR_ANDD && length > 8 && name_count < names.len() {
+			let number = table.u8_at(at + 7).ok_or(Error::TooShort)?;
+			let mut name = [0u8; ANDD_NAME];
+			let mut len = 0usize;
+			while at + 8 + len < at + length && len < ANDD_NAME {
+				let byte = table.u8_at(at + 8 + len).ok_or(Error::TooShort)?;
+				if byte == 0 {
+					break;
+				}
+				name[len] = byte;
+				len += 1;
+			}
+			names[name_count] = (number, name, len);
+			name_count += 1;
+		}
+		if kind == DMAR_DRHD && length >= 16 {
+			let mut scope = at + 16;
+			while scope + 6 <= at + length {
+				let (Some(scope_kind), Some(scope_length), Some(number), Some(bus)) = (table.u8_at(scope), table.u8_at(scope + 1), table.u8_at(scope + 4), table.u8_at(scope + 5)) else { return Err(Error::TooShort) };
+				let scope_length = scope_length as usize;
+				if scope_length < 6 || scope + scope_length > at + length {
+					return Err(Error::TooShort);
+				}
+				if scope_kind == DMAR_SCOPE_NAMESPACE && scope_length >= 8 && scope_count < scopes.len() {
+					let last = scope + scope_length - 2;
+					let (Some(device), Some(function)) = (table.u8_at(last), table.u8_at(last + 1)) else { return Err(Error::TooShort) };
+					scopes[scope_count] = (number, u16::from(bus) << 8 | u16::from(device & 0x1f) << 3 | u16::from(function & 7));
+					scope_count += 1;
+				}
+				scope += scope_length;
+			}
+		}
+		at += length;
+	}
+	for &(number, source_id) in &scopes[..scope_count] {
+		if let Some(&(_, name, name_len)) = names[..name_count].iter().find(|(declared, _, _)| *declared == number) {
+			visit(NamespaceStream { name, name_len, source_id });
+		}
+	}
+	Ok(())
+}
+
 /// EVERY HARDWARE DEFINITION AN IVRS NAMES, in table order, by the same rule.
 pub fn ivrs_units(bytes: &[u8], mut visit: impl FnMut(IommuUnit)) -> Result<(), Error> {
 	let table = Table::with_signature(bytes, b"IVRS")?;

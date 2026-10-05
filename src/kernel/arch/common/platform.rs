@@ -202,6 +202,12 @@ pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line
 		if block.unresolved || unresolved {
 			description.part.flags |= abi::PLATFORM_FLAG_UNRESOLVED;
 		}
+		// A NODE WHOSE `iommus` NAMES A STREAM masters the bus behind an IOMMU: the stream is the row's, and its claim is
+		// attached like a PCI endpoint where this kernel's IOMMU driver serves that controller - refused by name elsewhere.
+		if let Some(stream) = node.dma_stream {
+			description.part.flags |= abi::PLATFORM_FLAG_DMA_STREAM;
+			description.part.dma_stream = stream;
+		}
 		// ALLOC-OK: boot, once per published node; the block is bounded by `MAX_DEVICE_PROPERTIES`.
 		out.push(Described { description, properties: properties[..block.len].to_vec(), targets, registers: Vec::new() });
 	}

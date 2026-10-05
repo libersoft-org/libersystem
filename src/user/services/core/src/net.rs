@@ -1186,7 +1186,7 @@ impl Stack {
 		}
 		// Acknowledge any data or FIN we consumed.
 		if progressed {
-			let len: usize = self.emit_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], &[], out);
+			let len: usize = self.emit_tcp(ci, TCP_ACK, self.next_sequence(ci), self.conns[ci].rcv_nxt, &[], &[], out);
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		Outcome { reply_len: 0, event: Event::None }
@@ -1215,6 +1215,18 @@ impl Stack {
 		c.peer_wscale = if c.rcv_wscale != 0 { TCP_WS_SHIFT } else { 0 };
 		c.rto_deadline_ms = None;
 		c.send_failed = false;
+	}
+
+	// THE SEQUENCE A SEGMENT WITH NO DATA CARRIES: the next one this side will send. Once the handshake is done the
+	// send queue owns that number and `snd_nxt` stays where the SYN left it - so an acknowledgement or a window
+	// update built from `snd_nxt` named a sequence the peer had already acknowledged after the first byte this side
+	// sent. That is an unacceptable segment by RFC 793's test: a strict peer drops it, window update included, and
+	// answers with an acknowledgement of its own, which is the ping-pong every received segment set off.
+	fn next_sequence(&self, ci: usize) -> u32 {
+		match self.conns[ci].state {
+			TcpState::Established | TcpState::FinWait => self.conns[ci].tx.snd_nxt(),
+			TcpState::Closed | TcpState::SynSent | TcpState::SynRcvd => self.conns[ci].snd_nxt,
+		}
 	}
 
 	// The segment size in force: the smaller of what the peer accepts and what the path carries.
@@ -2177,7 +2189,7 @@ impl Stack {
 		if !self.conns[ci].in_use || self.conns[ci].state != TcpState::Established {
 			return 0;
 		}
-		let seq: u32 = self.conns[ci].snd_nxt;
+		let seq: u32 = self.next_sequence(ci);
 		let ack: u32 = self.conns[ci].rcv_nxt;
 		self.build_tcp(ci, TCP_ACK, seq, ack, &[], out)
 	}

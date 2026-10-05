@@ -1,17 +1,45 @@
 package liber:audio@1
+enum audio-transport(provider=1,bluetooth=2)
+record audio-format(rate:u32,channels:u8)
+record audio-device(id:u32,label:string:bound=48,transport:audio-transport,output:option<audio-format>,input:option<audio-format>,voice:bool,route:bool,latency-us:u32,volume:u8,hardware-volume:bool,default-output:bool,default-input:bool,default-voice:bool)
+enum audio-direction(output=1,input=2,voice=3)
+record audio-stream-info(device:option<u32>,named:option<u32>,format:audio-format,latency-us:u32,silent-frames:u64,voice:bool,route:bool)
+record audio-counters(moves:u64,silent-frames:u64,route-overflows:u64,route-underruns:u64)
 interface audio
 method audio.beep op=1 (freq:u16:rights=,millis:u32:rights=) -> result<unit, liber:base@1::error>
 method audio.open-stream op=2 (rate:u32:rights=,channels:u8:rights=) -> result<handle<channel>, liber:base@1::error>
 method audio.open-capture op=3 (rate:u32:rights=,channels:u8:rights=) -> result<handle<channel>, liber:base@1::error>
+method audio.devices op=4 () -> list<audio-device>
+method audio.open-stream-to op=5 (device:u32:rights=,rate:u32:rights=,channels:u8:rights=) -> result<handle<channel>, liber:base@1::error>
+method audio.open-capture-from op=6 (device:u32:rights=,rate:u32:rights=,channels:u8:rights=) -> result<handle<channel>, liber:base@1::error>
+method audio.open-voice op=7 (rate:u32:rights=) -> result<handle<channel>, liber:base@1::error>
 interface pcm-stream
 method pcm-stream.write op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
 method pcm-stream.close op=2 () -> result<unit, liber:base@1::error>
+method pcm-stream.latency op=3 () -> u32
 interface pcm-capture
 method pcm-capture.read op=1 () -> result<list<u8>, liber:base@1::error>
 method pcm-capture.close op=2 () -> result<unit, liber:base@1::error>
+method pcm-capture.latency op=3 () -> u32
 interface audio-admin
 method audio-admin.open-streams op=1 () -> result<handle<channel>, liber:base@1::error>
 method audio-admin.open-captures op=2 () -> result<handle<channel>, liber:base@1::error>
+method audio-admin.open-voices op=3 () -> result<handle<channel>, liber:base@1::error>
 record audio-resources(counted:bool,underruns:u64,silent-frames:u64,feedback-q16:u32,feedback-ignored:u64)
 interface audio-stats
 method audio-stats.resources op=1 () -> audio-resources
+interface audio-control
+method audio-control.devices op=1 () -> list<audio-device>
+method audio-control.set-default op=2 (device:u32:rights=,direction:audio-direction:rights=) -> result<unit, liber:base@1::error>
+method audio-control.set-volume op=3 (device:u32:rights=,volume:u8:rights=) -> result<unit, liber:base@1::error>
+method audio-control.streams op=4 () -> list<audio-stream-info>
+method audio-control.counters op=5 () -> audio-counters
+enum call-state(none=0,incoming=1,outgoing=2,active=3,held=4)
+enum call-command(answer=1,hang-up=2,reject=3,redial=4)
+interface voice-session
+method voice-session.write op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
+method voice-session.read op=2 () -> result<list<u8>, liber:base@1::error>
+method voice-session.set-call op=3 (state:call-state:rights=) -> result<unit, liber:base@1::error>
+method voice-session.commands op=4 () -> result<stream<call-command>, liber:base@1::error>
+method voice-session.latency op=5 () -> u32
+method voice-session.close op=6 () -> result<unit, liber:base@1::error>

@@ -63,6 +63,10 @@ pub struct DeviceNode {
 	interrupt_count: usize,
 	pub interrupt_controller: bool,
 	pub gpio_controller: bool,
+	// THE DMA STREAM ITS `iommus` NAMES: the first specifier's first cell after the IOMMU's phandle - the stream id under
+	// a one-cell binding, which every IOMMU binding a `virt` machine carries uses. None for a node with no `iommus`,
+	// which masters nothing an IOMMU translates.
+	pub dma_stream: Option<u32>,
 	span: (u64, u64),
 }
 
@@ -110,6 +114,7 @@ struct Open {
 	reg: Option<(u64, u32)>,
 	interrupts: Option<(u64, u32)>,
 	extended: Option<(u64, u32)>,
+	iommus: Option<(u64, u32)>,
 	phandle: u32,
 	interrupt_controller: bool,
 	gpio_controller: bool,
@@ -120,7 +125,7 @@ struct Open {
 
 impl Open {
 	const fn empty() -> Self {
-		Open { path_len: 0, name: 0, compatible: None, enabled: true, reg: None, interrupts: None, extended: None, phandle: 0, interrupt_controller: false, gpio_controller: false, pci: false, start: 0 }
+		Open { path_len: 0, name: 0, compatible: None, enabled: true, reg: None, interrupts: None, extended: None, iommus: None, phandle: 0, interrupt_controller: false, gpio_controller: false, pci: false, start: 0 }
 	}
 }
 
@@ -195,7 +200,7 @@ impl Fdt {
 						if at > 0
 							&& node.enabled && let Some((value, len)) = node.compatible
 						{
-							let mut device = DeviceNode { path: [0; MAX_PATH], path_len: 0, compatible: [0; MAX_COMPATIBLE], compatible_len: 0, phandle: node.phandle, bus: NodeBus::Memory, regs: [(0, 0); MAX_NODE_REGS], reg_count: 0, reg_refused: false, interrupts: [NodeInterrupt::Unresolved; MAX_NODE_INTERRUPTS], interrupt_count: 0, interrupt_controller: node.interrupt_controller, gpio_controller: node.gpio_controller, span: (node.start, p) };
+							let mut device = DeviceNode { path: [0; MAX_PATH], path_len: 0, compatible: [0; MAX_COMPATIBLE], compatible_len: 0, phandle: node.phandle, bus: NodeBus::Memory, regs: [(0, 0); MAX_NODE_REGS], reg_count: 0, reg_refused: false, interrupts: [NodeInterrupt::Unresolved; MAX_NODE_INTERRUPTS], interrupt_count: 0, interrupt_controller: node.interrupt_controller, gpio_controller: node.gpio_controller, dma_stream: None, span: (node.start, p) };
 							let shown = if at == 0 { 1 } else { node.path_len };
 							device.path[..shown].copy_from_slice(if at == 0 { b"/" } else { &path[..shown] });
 							device.path_len = shown;
@@ -211,6 +216,12 @@ impl Fdt {
 								self.read_regs(&mut device, value, len, cells[at - 1], &buses, at);
 							}
 							self.read_interrupts(&mut device, node, parent[at], &mut controllers);
+							// `iommus = <&iommu id ...>`: the stream id after the first phandle.
+							if let Some((value, len)) = node.iommus
+								&& len >= 8
+							{
+								device.dma_stream = Some(self.be32(value + 4));
+							}
 							visit(&device);
 						}
 						if at > 0 {
@@ -246,6 +257,8 @@ impl Fdt {
 							open[at].interrupts = Some((value, len));
 						} else if self.str_eq(pname, "interrupts-extended") {
 							open[at].extended = Some((value, len));
+						} else if self.str_eq(pname, "iommus") {
+							open[at].iommus = Some((value, len));
 						} else if len == 4 && self.str_eq(pname, "interrupt-parent") {
 							parent[at] = self.be32(value);
 						} else if len == 4 && (self.str_eq(pname, "phandle") || self.str_eq(pname, "linux,phandle")) {

@@ -764,6 +764,9 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// image stages none of them, and there the launch is refused like any other unknown program.
 	(b"btcheck", Shape::Rest),
 	(b"btread", Shape::Rest),
+	(b"btclassic", Shape::Rest),
+	(b"audioprobe", Shape::Rest),
+	(b"btgatt", Shape::Bare),
 	(b"hidcheck", Shape::Rest),
 	(b"powercheck", Shape::Rest),
 	(b"powerread", Shape::Rest),
@@ -773,6 +776,8 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"upscheck", Shape::Rest),
 	(b"bmccheck", Shape::Rest),
 	(b"typeccheck", Shape::Rest),
+	(b"brightcheck", Shape::Rest),
+	(b"brightread", Shape::Rest),
 	(b"cardcheck", Shape::Rest),
 	(b"cardhold", Shape::Rest),
 	(b"cardread", Shape::Rest),
@@ -805,13 +810,17 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// `--enable`, `--retry`, `--select`, `--incident` with a row number or a platform device's identity - and
 	// those are typed at a prompt like any other command.
 	(b"lsdev", Shape::Rest),
-	(b"btctl", Shape::Rest),
+	// THE BLUETOOTH OPERATOR takes the interactive shape: `pair` and `pairable` answer a pairing's prompts on
+	// the terminal they were started from, which the output-only shape cannot give them.
+	(b"btctl", Shape::InteractiveArgs),
 	(b"sleepctl", Shape::Rest),
 	(b"powerctl", Shape::Rest),
 	(b"tpm", Shape::Rest),
 	(b"dfu", Shape::Rest),
 	(b"bmc", Shape::Rest),
 	(b"typec", Shape::Rest),
+	(b"brightness", Shape::Rest),
+	(b"audioctl", Shape::Rest),
 	(b"perm", Shape::Json),
 	(b"usage", Shape::Json),
 	(b"lscpu", Shape::Json),

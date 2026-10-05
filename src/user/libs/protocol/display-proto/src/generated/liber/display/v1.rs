@@ -4011,6 +4011,2065 @@ pub mod display_admin {
 	}
 }
 
+/// A PCI FUNCTION, as the bus enumerates it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PciFunction {
+	pub bus: u32,
+	pub dev: u32,
+	pub func: u32,
+}
+
+impl PciFunction {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PciFunction> {
+		let mut r = Reader::new(bytes);
+		let value = PciFunction::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PciFunction> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PciFunction::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.bus)?;
+		w.u32(self.dev)?;
+		w.u32(self.func)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<PciFunction> {
+		let bus = r.u32()?;
+		let dev = r.u32()?;
+		let func = r.u32()?;
+		Some(PciFunction { bus, dev, func })
+	}
+}
+
+/// WHERE AN OUTPUT'S PIXELS GO: a `display` provider, named by the PCI function of the binding that publishes it, or
+/// the boot framebuffer - with the PCI function that decodes it where the kernel found one, and none for a ramfb or a
+/// device tree's simple framebuffer, which no function decodes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OutputSource {
+	Provider(PciFunction),
+	BootFramebuffer(Option<PciFunction>),
+}
+
+impl OutputSource {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<OutputSource> {
+		let mut r = Reader::new(bytes);
+		let value = OutputSource::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<OutputSource> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = OutputSource::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			OutputSource::Provider(v54) => {
+				w.u8(0)?;
+				v54.write(w)?;
+			}
+			OutputSource::BootFramebuffer(v55) => {
+				w.u8(1)?;
+				match v55 {
+					Some(v56) => {
+						w.u8(1)?;
+						v56.write(w)?;
+					}
+					None => {
+						w.u8(0)?;
+					}
+				}
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<OutputSource> {
+		match r.u8()? {
+			0 => Some(OutputSource::Provider(PciFunction::read(r)?)),
+			1 => Some(OutputSource::BootFramebuffer(if r.tag()? { Some(PciFunction::read(r)?) } else { None })),
+			_ => None,
+		}
+	}
+}
+
+/// A monitor's EDID identity: manufacturer id, product code and serial number from the base block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdidIdentity {
+	pub manufacturer: u16,
+	pub product: u16,
+	pub serial: u32,
+}
+
+impl EdidIdentity {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<EdidIdentity> {
+		let mut r = Reader::new(bytes);
+		let value = EdidIdentity::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<EdidIdentity> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = EdidIdentity::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u16(self.manufacturer)?;
+		w.u16(self.product)?;
+		w.u32(self.serial)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<EdidIdentity> {
+		let manufacturer = r.u16()?;
+		let product = r.u16()?;
+		let serial = r.u32()?;
+		Some(EdidIdentity { manufacturer, product, serial })
+	}
+}
+
+/// AN OUTPUT, as brightness sees it. There is exactly one today, id 0 - the id every `surface-configuration` carries -
+/// whatever the scanout is; the list is a list so that more are additive. An output id is not persistent: a stored
+/// level is keyed by its backlight, never by this.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrightnessOutput {
+	pub id: u32,
+	pub source: OutputSource,
+	pub edid: Option<EdidIdentity>,
+}
+
+impl BrightnessOutput {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessOutput> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessOutput::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessOutput> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessOutput::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.id)?;
+		self.source.write(w)?;
+		match &self.edid {
+			Some(v57) => {
+				w.u8(1)?;
+				v57.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessOutput> {
+		let id = r.u32()?;
+		let source = OutputSource::read(r)?;
+		let edid = if r.tag()? { Some(EdidIdentity::read(r)?) } else { None };
+		Some(BrightnessOutput { id, source, edid })
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BacklightKind {
+	Firmware = 0,
+	UsbMonitor = 1,
+	Native = 2,
+}
+
+impl BacklightKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BacklightKind> {
+		let mut r = Reader::new(bytes);
+		let value = BacklightKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BacklightKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BacklightKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<BacklightKind> {
+		match r.u8()? {
+			0 => Some(BacklightKind::Firmware),
+			1 => Some(BacklightKind::UsbMonitor),
+			2 => Some(BacklightKind::Native),
+			_ => None,
+		}
+	}
+}
+
+/// WHY A BACKLIGHT IS JOINED TO ITS OUTPUT: published by the output's own display binding, an ACPI video output under
+/// the adapter that decodes the output's pixels, a USB monitor whose EDID matches the output's, or the only USB
+/// backlight while the output has no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JoinReason {
+	Native = 0,
+	FirmwareAdapter = 1,
+	Edid = 2,
+	SingleOutput = 3,
+}
+
+impl JoinReason {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<JoinReason> {
+		let mut r = Reader::new(bytes);
+		let value = JoinReason::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<JoinReason> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = JoinReason::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<JoinReason> {
+		match r.u8()? {
+			0 => Some(JoinReason::Native),
+			1 => Some(JoinReason::FirmwareAdapter),
+			2 => Some(JoinReason::Edid),
+			3 => Some(JoinReason::SingleOutput),
+			_ => None,
+		}
+	}
+}
+
+/// ONE ACTIVE BACKLIGHT PER OUTPUT: the others joined to it are shadowed - listed, refused a set, never stepped,
+/// dimmed or restored - and one joined to nothing is unjoined: settable by its key, touched by nothing automatic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BacklightStanding {
+	Active = 0,
+	Shadowed = 1,
+	Unjoined = 2,
+}
+
+impl BacklightStanding {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BacklightStanding> {
+		let mut r = Reader::new(bytes);
+		let value = BacklightStanding::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BacklightStanding> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BacklightStanding::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<BacklightStanding> {
+		match r.u8()? {
+			0 => Some(BacklightStanding::Active),
+			1 => Some(BacklightStanding::Shadowed),
+			2 => Some(BacklightStanding::Unjoined),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrightnessScale {
+	Levels(Vec<u32>),
+	Range(BrightnessRange),
+}
+
+impl BrightnessScale {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessScale> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessScale::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessScale> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessScale::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			BrightnessScale::Levels(v58) => {
+				w.u8(0)?;
+				if v58.len() > u16::MAX as usize {
+					return None;
+				}
+				w.u16(v58.len() as u16)?;
+				for v59 in v58.iter() {
+					w.u32(*v59)?;
+				}
+			}
+			BrightnessScale::Range(v60) => {
+				w.u8(1)?;
+				v60.write(w)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessScale> {
+		match r.u8()? {
+			0 => Some(BrightnessScale::Levels({
+				let v61 = r.u16()? as usize;
+				let mut v62 = Vec::new();
+				v62.try_reserve_exact(v61).ok()?;
+				for _ in 0..v61 {
+					v62.push(r.u32()?);
+				}
+				v62
+			})),
+			1 => Some(BrightnessScale::Range(BrightnessRange::read(r)?)),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrightnessRange {
+	pub minimum: u32,
+	pub maximum: u32,
+}
+
+impl BrightnessRange {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessRange> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessRange::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessRange> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessRange::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.minimum)?;
+		w.u32(self.maximum)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessRange> {
+		let minimum = r.u32()?;
+		let maximum = r.u32()?;
+		Some(BrightnessRange { minimum, maximum })
+	}
+}
+
+/// ONE BACKLIGHT AND EVERYTHING BRIGHTNESS KNOWS OF IT: its stable key and kind, the output it is joined to and why,
+/// its standing (with the winner's key when shadowed), its levels, its level now where known, the FLOOR no key,
+/// hotkey, step or ordinary set goes below, the firmware's defaults, whether its provider stopped answering, and
+/// whether anything - a key, a hotkey, a set, the device itself - has moved its level since it appeared: the brightness
+/// policy restores a stored level only to a backlight nothing has, so a policy started again leaves a level alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BacklightState {
+	pub key: String,
+	pub kind: BacklightKind,
+	pub output: Option<u32>,
+	pub reason: Option<JoinReason>,
+	pub standing: BacklightStanding,
+	pub shadowed_by: Option<String>,
+	pub scale: BrightnessScale,
+	pub level: Option<u32>,
+	pub floor: u32,
+	pub ac_default: Option<u32>,
+	pub battery_default: Option<u32>,
+	pub failed: bool,
+	pub touched: bool,
+}
+
+impl BacklightState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BacklightState> {
+		let mut r = Reader::new(bytes);
+		let value = BacklightState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BacklightState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BacklightState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.key.as_bytes())?;
+		self.kind.write(w)?;
+		match &self.output {
+			Some(v63) => {
+				w.u8(1)?;
+				w.u32(*v63)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.reason {
+			Some(v64) => {
+				w.u8(1)?;
+				v64.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		self.standing.write(w)?;
+		match &self.shadowed_by {
+			Some(v65) => {
+				w.u8(1)?;
+				w.bytes_lp(v65.as_bytes())?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		self.scale.write(w)?;
+		match &self.level {
+			Some(v66) => {
+				w.u8(1)?;
+				w.u32(*v66)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.u32(self.floor)?;
+		match &self.ac_default {
+			Some(v67) => {
+				w.u8(1)?;
+				w.u32(*v67)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.battery_default {
+			Some(v68) => {
+				w.u8(1)?;
+				w.u32(*v68)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.boolean(self.failed)?;
+		w.boolean(self.touched)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BacklightState> {
+		let key = r.string_lp()?;
+		let kind = BacklightKind::read(r)?;
+		let output = if r.tag()? { Some(r.u32()?) } else { None };
+		let reason = if r.tag()? { Some(JoinReason::read(r)?) } else { None };
+		let standing = BacklightStanding::read(r)?;
+		let shadowed_by = if r.tag()? { Some(r.string_lp()?) } else { None };
+		let scale = BrightnessScale::read(r)?;
+		let level = if r.tag()? { Some(r.u32()?) } else { None };
+		let floor = r.u32()?;
+		let ac_default = if r.tag()? { Some(r.u32()?) } else { None };
+		let battery_default = if r.tag()? { Some(r.u32()?) } else { None };
+		let failed = r.boolean()?;
+		let touched = r.boolean()?;
+		Some(BacklightState { key, kind, output, reason, standing, shadowed_by, scale, level, floor, ac_default, battery_default, failed, touched })
+	}
+}
+
+/// WHO MOVED A LEVEL: a brightness key, a firmware hotkey, the device itself (a monitor's own buttons, firmware that
+/// stepped on its own), a client's set - or the snapshot a subscription opens with, and a backlight appearing or
+/// leaving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BrightnessCause {
+	Snapshot = 0,
+	Key = 1,
+	FirmwareHotkey = 2,
+	Device = 3,
+	Client = 4,
+	Appeared = 5,
+	Left = 6,
+}
+
+impl BrightnessCause {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessCause> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessCause::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessCause> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessCause::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessCause> {
+		match r.u8()? {
+			0 => Some(BrightnessCause::Snapshot),
+			1 => Some(BrightnessCause::Key),
+			2 => Some(BrightnessCause::FirmwareHotkey),
+			3 => Some(BrightnessCause::Device),
+			4 => Some(BrightnessCause::Client),
+			5 => Some(BrightnessCause::Appeared),
+			6 => Some(BrightnessCause::Left),
+			_ => None,
+		}
+	}
+}
+
+/// One change of one backlight, numbered: a set answers the serial of the change it produced, which is how the policy
+/// tells its own changes from everyone else's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrightnessChange {
+	pub key: String,
+	pub level: Option<u32>,
+	pub cause: BrightnessCause,
+	pub serial: u64,
+}
+
+impl BrightnessChange {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessChange> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessChange::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessChange> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessChange::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.key.as_bytes())?;
+		match &self.level {
+			Some(v69) => {
+				w.u8(1)?;
+				w.u32(*v69)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		self.cause.write(w)?;
+		w.u64(self.serial)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessChange> {
+		let key = r.string_lp()?;
+		let level = if r.tag()? { Some(r.u32()?) } else { None };
+		let cause = BrightnessCause::read(r)?;
+		let serial = r.u64()?;
+		Some(BrightnessChange { key, level, cause, serial })
+	}
+}
+
+/// WHAT A SET ASKS FOR: an absolute level from the scale, a percent of the range mapped to the nearest level, or a
+/// signed number of steps - the next listed level, or a sixteenth of a range's span.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrightnessTarget {
+	Level(u32),
+	Percent(u32),
+	Steps(i32),
+}
+
+impl BrightnessTarget {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessTarget> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessTarget::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessTarget> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessTarget::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			BrightnessTarget::Level(v70) => {
+				w.u8(0)?;
+				w.u32(*v70)?;
+			}
+			BrightnessTarget::Percent(v71) => {
+				w.u8(1)?;
+				w.u32(*v71)?;
+			}
+			BrightnessTarget::Steps(v72) => {
+				w.u8(2)?;
+				w.i32(*v72)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessTarget> {
+		match r.u8()? {
+			0 => Some(BrightnessTarget::Level(r.u32()?)),
+			1 => Some(BrightnessTarget::Percent(r.u32()?)),
+			2 => Some(BrightnessTarget::Steps(r.i32()?)),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrightnessSet {
+	pub level: u32,
+	pub serial: u64,
+}
+
+impl BrightnessSet {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessSet> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessSet::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessSet> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessSet::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.level)?;
+		w.u64(self.serial)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessSet> {
+		let level = r.u32()?;
+		let serial = r.u64()?;
+		Some(BrightnessSet { level, serial })
+	}
+}
+
+/// THE READ, on DisplayService's `BRIGHTNESS` root, reached through the `brightness` capability. Nothing here sets
+/// anything. A subscription opens with one `snapshot` change per backlight and then follows every change whoever made
+/// it; a subscriber that stops reading has its stream closed rather than losing one backlight's last change silently,
+/// and subscribes again for a fresh snapshot.
+// interface `display-brightness` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod display_brightness {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_OUTPUTS: u16 = 1;
+	pub const OP_BACKLIGHTS: u16 = 2;
+	pub const OP_SUBSCRIBE: u16 = 3;
+
+	pub trait Service {
+		fn outputs(&mut self) -> Result<Vec<BrightnessOutput>, Error>;
+		fn backlights(&mut self) -> Result<Vec<BacklightState>, Error>;
+		fn subscribe(&mut self) -> Vec<BrightnessChange>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:display")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_OUTPUTS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.outputs();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v73) => {
+							w.u8(1)?;
+							if v73.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v73.len() as u16)?;
+							for v75 in v73.iter() {
+								v75.write(w)?;
+							}
+						}
+						Err(v74) => {
+							w.u8(0)?;
+							v74.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_BACKLIGHTS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.backlights();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v76) => {
+							w.u8(1)?;
+							if v76.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v76.len() as u16)?;
+							for v78 in v76.iter() {
+								v78.write(w)?;
+							}
+						}
+						Err(v77) => {
+							w.u8(0)?;
+							v77.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<BrightnessChange>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.subscribe();
+		Some((corr, items))
+	}
+	pub fn subscribe_frame(seq: u32, item: &BrightnessChange, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn subscribe_read(msg: &[u8], frame_handles: &mut Handles) -> Option<BrightnessChange> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = BrightnessChange::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn outputs(&mut self) -> Option<Result<Vec<BrightnessOutput>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OUTPUTS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v79 = r.u16()? as usize;
+						let mut v80 = Vec::new();
+						v80.try_reserve_exact(v79).ok()?;
+						for _ in 0..v79 {
+							v80.push(BrightnessOutput::read(r)?);
+						}
+						v80
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn backlights(&mut self) -> Option<Result<Vec<BacklightState>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BACKLIGHTS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v81 = r.u16()? as usize;
+						let mut v82 = Vec::new();
+						v82.try_reserve_exact(v81).ok()?;
+						for _ in 0..v81 {
+							v82.push(BacklightState::read(r)?);
+						}
+						v82
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn subscribe(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUBSCRIBE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_brightness_outputs")]
+	fn channel_invoke_outputs(chan: u64) -> Option<Result<Vec<BrightnessOutput>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.outputs()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_brightness_backlights")]
+	fn channel_invoke_backlights(chan: u64) -> Option<Result<Vec<BacklightState>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.backlights()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_brightness_subscribe")]
+	fn channel_invoke_subscribe(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.subscribe()
+	}
+}
+
+/// THE SET, on DisplayService's `BRIGHTNESSCTL` root, whose one client the manifest declares is the brightness policy
+/// and to which no capability name resolves. `key` names a backlight; zero - a black panel - is reached only with
+/// `allow-zero`, every other set stopping at the floor. A shadowed backlight answers `busy`.
+// interface `display-brightness-control` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod display_brightness_control {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SET: u16 = 1;
+
+	pub trait Service {
+		fn set(&mut self, key: String, target: BrightnessTarget, allow_zero: bool) -> Result<BrightnessSet, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:display")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_SET => {
+				let key = r.string_lp()?;
+				let target = BrightnessTarget::read(r)?;
+				let allow_zero = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set(key, target, allow_zero);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v83) => {
+							w.u8(1)?;
+							v83.write(w)?;
+						}
+						Err(v84) => {
+							w.u8(0)?;
+							v84.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn set(&mut self, key: &str, target: &BrightnessTarget, allow_zero: &bool) -> Option<Result<BrightnessSet, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET)?;
+			w.u32(corr)?;
+			w.bytes_lp(key.as_bytes())?;
+			target.write(w)?;
+			w.boolean(*allow_zero)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(BrightnessSet::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_brightness_control_set")]
+	fn channel_invoke_set(chan: u64, key: &str, target: &BrightnessTarget, allow_zero: &bool) -> Option<Result<BrightnessSet, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set(key, target, allow_zero)
+	}
+}
+
+/// The brightness policy's two settings: automatic brightness, and the idle timeout after which the active backlight
+/// is dimmed - none for never.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrightnessSettings {
+	pub automatic: bool,
+	pub idle_seconds: Option<u32>,
+}
+
+impl BrightnessSettings {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BrightnessSettings> {
+		let mut r = Reader::new(bytes);
+		let value = BrightnessSettings::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BrightnessSettings> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BrightnessSettings::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.boolean(self.automatic)?;
+		match &self.idle_seconds {
+			Some(v85) => {
+				w.u8(1)?;
+				w.u32(*v85)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BrightnessSettings> {
+		let automatic = r.boolean()?;
+		let idle_seconds = if r.tag()? { Some(r.u32()?) } else { None };
+		Some(BrightnessSettings { automatic, idle_seconds })
+	}
+}
+
+/// THE POLICY'S CONTROL, on `brightness_policy`'s `CONTROL` root, reached through the `brightness-control`
+/// capability: a set, forwarded to DisplayService with the caller's explicit zero so the floor holds the same, and the
+/// two settings, stored by the policy.
+// interface `brightness-policy` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod brightness_policy {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SET: u16 = 1;
+	pub const OP_SETTINGS: u16 = 2;
+	pub const OP_SET_AUTOMATIC: u16 = 3;
+	pub const OP_SET_IDLE: u16 = 4;
+
+	pub trait Service {
+		fn set(&mut self, key: String, target: BrightnessTarget, allow_zero: bool) -> Result<BrightnessSet, Error>;
+		fn settings(&mut self) -> Result<BrightnessSettings, Error>;
+		fn set_automatic(&mut self, on: bool) -> Result<(), Error>;
+		fn set_idle(&mut self, seconds: Option<u32>) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:display")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_SET => {
+				let key = r.string_lp()?;
+				let target = BrightnessTarget::read(r)?;
+				let allow_zero = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set(key, target, allow_zero);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v86) => {
+							w.u8(1)?;
+							v86.write(w)?;
+						}
+						Err(v87) => {
+							w.u8(0)?;
+							v87.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SETTINGS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.settings();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v88) => {
+							w.u8(1)?;
+							v88.write(w)?;
+						}
+						Err(v89) => {
+							w.u8(0)?;
+							v89.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_AUTOMATIC => {
+				let on = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_automatic(on);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v90) => {
+							w.u8(1)?;
+						}
+						Err(v91) => {
+							w.u8(0)?;
+							v91.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_IDLE => {
+				let seconds = if r.tag()? { Some(r.u32()?) } else { None };
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_idle(seconds);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v92) => {
+							w.u8(1)?;
+						}
+						Err(v93) => {
+							w.u8(0)?;
+							v93.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn set(&mut self, key: &str, target: &BrightnessTarget, allow_zero: &bool) -> Option<Result<BrightnessSet, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET)?;
+			w.u32(corr)?;
+			w.bytes_lp(key.as_bytes())?;
+			target.write(w)?;
+			w.boolean(*allow_zero)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(BrightnessSet::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn settings(&mut self) -> Option<Result<BrightnessSettings, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SETTINGS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(BrightnessSettings::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_automatic(&mut self, on: &bool) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_AUTOMATIC)?;
+			w.u32(corr)?;
+			w.boolean(*on)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_idle(&mut self, seconds: &Option<u32>) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_IDLE)?;
+			w.u32(corr)?;
+			match seconds {
+				Some(v94) => {
+					w.u8(1)?;
+					w.u32(*v94)?;
+				}
+				None => {
+					w.u8(0)?;
+				}
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_brightness_policy_set")]
+	fn channel_invoke_set(chan: u64, key: &str, target: &BrightnessTarget, allow_zero: &bool) -> Option<Result<BrightnessSet, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set(key, target, allow_zero)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_brightness_policy_settings")]
+	fn channel_invoke_settings(chan: u64) -> Option<Result<BrightnessSettings, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.settings()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_brightness_policy_set_automatic")]
+	fn channel_invoke_set_automatic(chan: u64, on: &bool) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_automatic(on)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_brightness_policy_set_idle")]
+	fn channel_invoke_set_idle(chan: u64, seconds: &Option<u32>) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_idle(seconds)
+	}
+}
+
 impl ScaleRatio {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -4179,8 +6238,8 @@ impl OutputColour {
 		out.push(',');
 		out.push_str("\"sdr-white-nits\":");
 		match &self.sdr_white_nits {
-			Some(v54) => {
-				let _ = write!(out, "{}", v54);
+			Some(v95) => {
+				let _ = write!(out, "{}", v95);
 			}
 			None => {
 				out.push_str("null");
@@ -4189,8 +6248,8 @@ impl OutputColour {
 		out.push(',');
 		out.push_str("\"min-nits\":");
 		match &self.min_nits {
-			Some(v55) => {
-				let _ = write!(out, "{}", v55);
+			Some(v96) => {
+				let _ = write!(out, "{}", v96);
 			}
 			None => {
 				out.push_str("null");
@@ -4199,8 +6258,8 @@ impl OutputColour {
 		out.push(',');
 		out.push_str("\"max-nits\":");
 		match &self.max_nits {
-			Some(v56) => {
-				let _ = write!(out, "{}", v56);
+			Some(v97) => {
+				let _ = write!(out, "{}", v97);
 			}
 			None => {
 				out.push_str("null");
@@ -4209,8 +6268,8 @@ impl OutputColour {
 		out.push(',');
 		out.push_str("\"max-frame-average-nits\":");
 		match &self.max_frame_average_nits {
-			Some(v57) => {
-				let _ = write!(out, "{}", v57);
+			Some(v98) => {
+				let _ = write!(out, "{}", v98);
 			}
 			None => {
 				out.push_str("null");
@@ -4225,8 +6284,8 @@ impl OutputColour {
 		out.push_str(", ");
 		out.push_str("sdr-white-nits=");
 		match &self.sdr_white_nits {
-			Some(v58) => {
-				let _ = write!(out, "{}", v58);
+			Some(v99) => {
+				let _ = write!(out, "{}", v99);
 			}
 			None => {
 				out.push('-');
@@ -4235,8 +6294,8 @@ impl OutputColour {
 		out.push_str(", ");
 		out.push_str("min-nits=");
 		match &self.min_nits {
-			Some(v59) => {
-				let _ = write!(out, "{}", v59);
+			Some(v100) => {
+				let _ = write!(out, "{}", v100);
 			}
 			None => {
 				out.push('-');
@@ -4245,8 +6304,8 @@ impl OutputColour {
 		out.push_str(", ");
 		out.push_str("max-nits=");
 		match &self.max_nits {
-			Some(v60) => {
-				let _ = write!(out, "{}", v60);
+			Some(v101) => {
+				let _ = write!(out, "{}", v101);
 			}
 			None => {
 				out.push('-');
@@ -4255,8 +6314,8 @@ impl OutputColour {
 		out.push_str(", ");
 		out.push_str("max-frame-average-nits=");
 		match &self.max_frame_average_nits {
-			Some(v61) => {
-				let _ = write!(out, "{}", v61);
+			Some(v102) => {
+				let _ = write!(out, "{}", v102);
 			}
 			None => {
 				out.push('-');
@@ -4270,8 +6329,8 @@ impl OutputColour {
 		self.space.to_cbor_into(out);
 		crate::codec::cbor::text(out, "sdr-white-nits");
 		match &self.sdr_white_nits {
-			Some(v62) => {
-				crate::codec::cbor::f32(out, *v62);
+			Some(v103) => {
+				crate::codec::cbor::f32(out, *v103);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4279,8 +6338,8 @@ impl OutputColour {
 		}
 		crate::codec::cbor::text(out, "min-nits");
 		match &self.min_nits {
-			Some(v63) => {
-				crate::codec::cbor::f32(out, *v63);
+			Some(v104) => {
+				crate::codec::cbor::f32(out, *v104);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4288,8 +6347,8 @@ impl OutputColour {
 		}
 		crate::codec::cbor::text(out, "max-nits");
 		match &self.max_nits {
-			Some(v64) => {
-				crate::codec::cbor::f32(out, *v64);
+			Some(v105) => {
+				crate::codec::cbor::f32(out, *v105);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4297,8 +6356,8 @@ impl OutputColour {
 		}
 		crate::codec::cbor::text(out, "max-frame-average-nits");
 		match &self.max_frame_average_nits {
-			Some(v65) => {
-				crate::codec::cbor::f32(out, *v65);
+			Some(v106) => {
+				crate::codec::cbor::f32(out, *v106);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4465,14 +6524,14 @@ impl TimestampEvidence {
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			TimestampEvidence::Unavailable => out.push_str("\"unavailable\""),
-			TimestampEvidence::Estimated(v66) => {
+			TimestampEvidence::Estimated(v107) => {
 				out.push_str("{\"estimated\":");
-				let _ = write!(out, "{}", v66);
+				let _ = write!(out, "{}", v107);
 				out.push('}');
 			}
-			TimestampEvidence::Measured(v67) => {
+			TimestampEvidence::Measured(v108) => {
 				out.push_str("{\"measured\":");
-				let _ = write!(out, "{}", v67);
+				let _ = write!(out, "{}", v108);
 				out.push('}');
 			}
 		}
@@ -4480,14 +6539,14 @@ impl TimestampEvidence {
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			TimestampEvidence::Unavailable => out.push_str("unavailable"),
-			TimestampEvidence::Estimated(v68) => {
+			TimestampEvidence::Estimated(v109) => {
 				out.push_str("estimated(");
-				let _ = write!(out, "{}", v68);
+				let _ = write!(out, "{}", v109);
 				out.push(')');
 			}
-			TimestampEvidence::Measured(v69) => {
+			TimestampEvidence::Measured(v110) => {
 				out.push_str("measured(");
-				let _ = write!(out, "{}", v69);
+				let _ = write!(out, "{}", v110);
 				out.push(')');
 			}
 		}
@@ -4495,15 +6554,15 @@ impl TimestampEvidence {
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			TimestampEvidence::Unavailable => crate::codec::cbor::text(out, "unavailable"),
-			TimestampEvidence::Estimated(v70) => {
+			TimestampEvidence::Estimated(v111) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "estimated");
-				crate::codec::cbor::uint(out, *v70 as u64);
+				crate::codec::cbor::uint(out, *v111 as u64);
 			}
-			TimestampEvidence::Measured(v71) => {
+			TimestampEvidence::Measured(v112) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "measured");
-				crate::codec::cbor::uint(out, *v71 as u64);
+				crate::codec::cbor::uint(out, *v112 as u64);
 			}
 		}
 	}
@@ -4571,8 +6630,8 @@ impl FrameTiming {
 		out.push('{');
 		out.push_str("\"preferred-deadline\":");
 		match &self.preferred_deadline {
-			Some(v72) => {
-				let _ = write!(out, "{}", v72);
+			Some(v113) => {
+				let _ = write!(out, "{}", v113);
 			}
 			None => {
 				out.push_str("null");
@@ -4581,8 +6640,8 @@ impl FrameTiming {
 		out.push(',');
 		out.push_str("\"refresh-interval\":");
 		match &self.refresh_interval {
-			Some(v73) => {
-				let _ = write!(out, "{}", v73);
+			Some(v114) => {
+				let _ = write!(out, "{}", v114);
 			}
 			None => {
 				out.push_str("null");
@@ -4594,8 +6653,8 @@ impl FrameTiming {
 		out.push('{');
 		out.push_str("preferred-deadline=");
 		match &self.preferred_deadline {
-			Some(v74) => {
-				let _ = write!(out, "{}", v74);
+			Some(v115) => {
+				let _ = write!(out, "{}", v115);
 			}
 			None => {
 				out.push('-');
@@ -4604,8 +6663,8 @@ impl FrameTiming {
 		out.push_str(", ");
 		out.push_str("refresh-interval=");
 		match &self.refresh_interval {
-			Some(v75) => {
-				let _ = write!(out, "{}", v75);
+			Some(v116) => {
+				let _ = write!(out, "{}", v116);
 			}
 			None => {
 				out.push('-');
@@ -4617,8 +6676,8 @@ impl FrameTiming {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "preferred-deadline");
 		match &self.preferred_deadline {
-			Some(v76) => {
-				crate::codec::cbor::uint(out, *v76 as u64);
+			Some(v117) => {
+				crate::codec::cbor::uint(out, *v117 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4626,8 +6685,8 @@ impl FrameTiming {
 		}
 		crate::codec::cbor::text(out, "refresh-interval");
 		match &self.refresh_interval {
-			Some(v77) => {
-				crate::codec::cbor::uint(out, *v77 as u64);
+			Some(v118) => {
+				crate::codec::cbor::uint(out, *v118 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4713,30 +6772,30 @@ impl SurfaceEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			SurfaceEvent::Configure(v78) => {
+			SurfaceEvent::Configure(v119) => {
 				out.push_str("{\"configure\":");
-				v78.to_json_into(out);
+				v119.to_json_into(out);
 				out.push('}');
 			}
 			SurfaceEvent::ImageAvailable => out.push_str("\"image-available\""),
-			SurfaceEvent::PresentComplete(v79) => {
+			SurfaceEvent::PresentComplete(v120) => {
 				out.push_str("{\"present-complete\":");
-				v79.to_json_into(out);
+				v120.to_json_into(out);
 				out.push('}');
 			}
 			SurfaceEvent::CloseRequested => out.push_str("\"close-requested\""),
-			SurfaceEvent::VisibilityChanged(v80) => {
+			SurfaceEvent::VisibilityChanged(v121) => {
 				out.push_str("{\"visibility-changed\":");
-				if *v80 {
+				if *v121 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
 				}
 				out.push('}');
 			}
-			SurfaceEvent::FocusChanged(v81) => {
+			SurfaceEvent::FocusChanged(v122) => {
 				out.push_str("{\"focus-changed\":");
-				if *v81 {
+				if *v122 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
@@ -4747,30 +6806,30 @@ impl SurfaceEvent {
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			SurfaceEvent::Configure(v82) => {
+			SurfaceEvent::Configure(v123) => {
 				out.push_str("configure(");
-				v82.to_text_into(out);
+				v123.to_text_into(out);
 				out.push(')');
 			}
 			SurfaceEvent::ImageAvailable => out.push_str("image-available"),
-			SurfaceEvent::PresentComplete(v83) => {
+			SurfaceEvent::PresentComplete(v124) => {
 				out.push_str("present-complete(");
-				v83.to_text_into(out);
+				v124.to_text_into(out);
 				out.push(')');
 			}
 			SurfaceEvent::CloseRequested => out.push_str("close-requested"),
-			SurfaceEvent::VisibilityChanged(v84) => {
+			SurfaceEvent::VisibilityChanged(v125) => {
 				out.push_str("visibility-changed(");
-				if *v84 {
+				if *v125 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
 				}
 				out.push(')');
 			}
-			SurfaceEvent::FocusChanged(v85) => {
+			SurfaceEvent::FocusChanged(v126) => {
 				out.push_str("focus-changed(");
-				if *v85 {
+				if *v126 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
@@ -4781,27 +6840,27 @@ impl SurfaceEvent {
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			SurfaceEvent::Configure(v86) => {
+			SurfaceEvent::Configure(v127) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "configure");
-				v86.to_cbor_into(out);
+				v127.to_cbor_into(out);
 			}
 			SurfaceEvent::ImageAvailable => crate::codec::cbor::text(out, "image-available"),
-			SurfaceEvent::PresentComplete(v87) => {
+			SurfaceEvent::PresentComplete(v128) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "present-complete");
-				v87.to_cbor_into(out);
+				v128.to_cbor_into(out);
 			}
 			SurfaceEvent::CloseRequested => crate::codec::cbor::text(out, "close-requested"),
-			SurfaceEvent::VisibilityChanged(v88) => {
+			SurfaceEvent::VisibilityChanged(v129) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "visibility-changed");
-				crate::codec::cbor::boolean(out, *v88);
+				crate::codec::cbor::boolean(out, *v129);
 			}
-			SurfaceEvent::FocusChanged(v89) => {
+			SurfaceEvent::FocusChanged(v130) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "focus-changed");
-				crate::codec::cbor::boolean(out, *v89);
+				crate::codec::cbor::boolean(out, *v130);
 			}
 		}
 	}
@@ -4825,9 +6884,9 @@ impl AcquiredImage {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			AcquiredImage::Image(v90) => {
+			AcquiredImage::Image(v131) => {
 				out.push_str("{\"image\":");
-				let _ = write!(out, "{}", v90);
+				let _ = write!(out, "{}", v131);
 				out.push('}');
 			}
 			AcquiredImage::Again => out.push_str("\"again\""),
@@ -4837,9 +6896,9 @@ impl AcquiredImage {
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			AcquiredImage::Image(v91) => {
+			AcquiredImage::Image(v132) => {
 				out.push_str("image(");
-				let _ = write!(out, "{}", v91);
+				let _ = write!(out, "{}", v132);
 				out.push(')');
 			}
 			AcquiredImage::Again => out.push_str("again"),
@@ -4849,10 +6908,10 @@ impl AcquiredImage {
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			AcquiredImage::Image(v92) => {
+			AcquiredImage::Image(v133) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "image");
-				crate::codec::cbor::uint(out, *v92 as u64);
+				crate::codec::cbor::uint(out, *v133 as u64);
 			}
 			AcquiredImage::Again => crate::codec::cbor::text(out, "again"),
 			AcquiredImage::NotVisible => crate::codec::cbor::text(out, "not-visible"),
@@ -5391,6 +7450,1099 @@ impl DisplayOutput {
 		crate::codec::cbor::boolean(out, self.active);
 		crate::codec::cbor::text(out, "external");
 		crate::codec::cbor::boolean(out, self.external);
+	}
+}
+
+impl PciFunction {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"bus\":");
+		let _ = write!(out, "{}", self.bus);
+		out.push(',');
+		out.push_str("\"dev\":");
+		let _ = write!(out, "{}", self.dev);
+		out.push(',');
+		out.push_str("\"func\":");
+		let _ = write!(out, "{}", self.func);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("bus=");
+		let _ = write!(out, "{}", self.bus);
+		out.push_str(", ");
+		out.push_str("dev=");
+		let _ = write!(out, "{}", self.dev);
+		out.push_str(", ");
+		out.push_str("func=");
+		let _ = write!(out, "{}", self.func);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "bus");
+		crate::codec::cbor::uint(out, self.bus as u64);
+		crate::codec::cbor::text(out, "dev");
+		crate::codec::cbor::uint(out, self.dev as u64);
+		crate::codec::cbor::text(out, "func");
+		crate::codec::cbor::uint(out, self.func as u64);
+	}
+}
+
+impl OutputSource {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			OutputSource::Provider(v134) => {
+				out.push_str("{\"provider\":");
+				v134.to_json_into(out);
+				out.push('}');
+			}
+			OutputSource::BootFramebuffer(v135) => {
+				out.push_str("{\"boot-framebuffer\":");
+				match v135 {
+					Some(v136) => {
+						v136.to_json_into(out);
+					}
+					None => {
+						out.push_str("null");
+					}
+				}
+				out.push('}');
+			}
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			OutputSource::Provider(v137) => {
+				out.push_str("provider(");
+				v137.to_text_into(out);
+				out.push(')');
+			}
+			OutputSource::BootFramebuffer(v138) => {
+				out.push_str("boot-framebuffer(");
+				match v138 {
+					Some(v139) => {
+						v139.to_text_into(out);
+					}
+					None => {
+						out.push('-');
+					}
+				}
+				out.push(')');
+			}
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			OutputSource::Provider(v140) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "provider");
+				v140.to_cbor_into(out);
+			}
+			OutputSource::BootFramebuffer(v141) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "boot-framebuffer");
+				match v141 {
+					Some(v142) => {
+						v142.to_cbor_into(out);
+					}
+					None => {
+						crate::codec::cbor::null(out);
+					}
+				}
+			}
+		}
+	}
+}
+
+impl EdidIdentity {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"manufacturer\":");
+		let _ = write!(out, "{}", self.manufacturer);
+		out.push(',');
+		out.push_str("\"product\":");
+		let _ = write!(out, "{}", self.product);
+		out.push(',');
+		out.push_str("\"serial\":");
+		let _ = write!(out, "{}", self.serial);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("manufacturer=");
+		let _ = write!(out, "{}", self.manufacturer);
+		out.push_str(", ");
+		out.push_str("product=");
+		let _ = write!(out, "{}", self.product);
+		out.push_str(", ");
+		out.push_str("serial=");
+		let _ = write!(out, "{}", self.serial);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "manufacturer");
+		crate::codec::cbor::uint(out, self.manufacturer as u64);
+		crate::codec::cbor::text(out, "product");
+		crate::codec::cbor::uint(out, self.product as u64);
+		crate::codec::cbor::text(out, "serial");
+		crate::codec::cbor::uint(out, self.serial as u64);
+	}
+}
+
+impl BrightnessOutput {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"source\":");
+		self.source.to_json_into(out);
+		out.push(',');
+		out.push_str("\"edid\":");
+		match &self.edid {
+			Some(v143) => {
+				v143.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("source=");
+		self.source.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("edid=");
+		match &self.edid {
+			Some(v144) => {
+				v144.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "source");
+		self.source.to_cbor_into(out);
+		crate::codec::cbor::text(out, "edid");
+		match &self.edid {
+			Some(v145) => {
+				v145.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
+impl BacklightKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			BacklightKind::Firmware => out.push_str("\"firmware\""),
+			BacklightKind::UsbMonitor => out.push_str("\"usb-monitor\""),
+			BacklightKind::Native => out.push_str("\"native\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			BacklightKind::Firmware => out.push_str("firmware"),
+			BacklightKind::UsbMonitor => out.push_str("usb-monitor"),
+			BacklightKind::Native => out.push_str("native"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BacklightKind::Firmware => crate::codec::cbor::text(out, "firmware"),
+			BacklightKind::UsbMonitor => crate::codec::cbor::text(out, "usb-monitor"),
+			BacklightKind::Native => crate::codec::cbor::text(out, "native"),
+		}
+	}
+}
+
+impl JoinReason {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			JoinReason::Native => out.push_str("\"native\""),
+			JoinReason::FirmwareAdapter => out.push_str("\"firmware-adapter\""),
+			JoinReason::Edid => out.push_str("\"edid\""),
+			JoinReason::SingleOutput => out.push_str("\"single-output\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			JoinReason::Native => out.push_str("native"),
+			JoinReason::FirmwareAdapter => out.push_str("firmware-adapter"),
+			JoinReason::Edid => out.push_str("edid"),
+			JoinReason::SingleOutput => out.push_str("single-output"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			JoinReason::Native => crate::codec::cbor::text(out, "native"),
+			JoinReason::FirmwareAdapter => crate::codec::cbor::text(out, "firmware-adapter"),
+			JoinReason::Edid => crate::codec::cbor::text(out, "edid"),
+			JoinReason::SingleOutput => crate::codec::cbor::text(out, "single-output"),
+		}
+	}
+}
+
+impl BacklightStanding {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			BacklightStanding::Active => out.push_str("\"active\""),
+			BacklightStanding::Shadowed => out.push_str("\"shadowed\""),
+			BacklightStanding::Unjoined => out.push_str("\"unjoined\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			BacklightStanding::Active => out.push_str("active"),
+			BacklightStanding::Shadowed => out.push_str("shadowed"),
+			BacklightStanding::Unjoined => out.push_str("unjoined"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BacklightStanding::Active => crate::codec::cbor::text(out, "active"),
+			BacklightStanding::Shadowed => crate::codec::cbor::text(out, "shadowed"),
+			BacklightStanding::Unjoined => crate::codec::cbor::text(out, "unjoined"),
+		}
+	}
+}
+
+impl BrightnessScale {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			BrightnessScale::Levels(v146) => {
+				out.push_str("{\"levels\":");
+				out.push('[');
+				let mut v148 = true;
+				for v147 in v146.iter() {
+					if !v148 {
+						out.push(',');
+					}
+					v148 = false;
+					let _ = write!(out, "{}", v147);
+				}
+				out.push(']');
+				out.push('}');
+			}
+			BrightnessScale::Range(v149) => {
+				out.push_str("{\"range\":");
+				v149.to_json_into(out);
+				out.push('}');
+			}
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			BrightnessScale::Levels(v150) => {
+				out.push_str("levels(");
+				out.push('[');
+				let mut v152 = true;
+				for v151 in v150.iter() {
+					if !v152 {
+						out.push_str(", ");
+					}
+					v152 = false;
+					let _ = write!(out, "{}", v151);
+				}
+				out.push(']');
+				out.push(')');
+			}
+			BrightnessScale::Range(v153) => {
+				out.push_str("range(");
+				v153.to_text_into(out);
+				out.push(')');
+			}
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BrightnessScale::Levels(v154) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "levels");
+				crate::codec::cbor::array(out, v154.len());
+				for v155 in v154.iter() {
+					crate::codec::cbor::uint(out, *v155 as u64);
+				}
+			}
+			BrightnessScale::Range(v156) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "range");
+				v156.to_cbor_into(out);
+			}
+		}
+	}
+}
+
+impl BrightnessRange {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"minimum\":");
+		let _ = write!(out, "{}", self.minimum);
+		out.push(',');
+		out.push_str("\"maximum\":");
+		let _ = write!(out, "{}", self.maximum);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("minimum=");
+		let _ = write!(out, "{}", self.minimum);
+		out.push_str(", ");
+		out.push_str("maximum=");
+		let _ = write!(out, "{}", self.maximum);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "minimum");
+		crate::codec::cbor::uint(out, self.minimum as u64);
+		crate::codec::cbor::text(out, "maximum");
+		crate::codec::cbor::uint(out, self.maximum as u64);
+	}
+}
+
+impl BacklightState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"key\":");
+		crate::codec::json_escape(&self.key, out);
+		out.push(',');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"output\":");
+		match &self.output {
+			Some(v157) => {
+				let _ = write!(out, "{}", v157);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"reason\":");
+		match &self.reason {
+			Some(v158) => {
+				v158.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"standing\":");
+		self.standing.to_json_into(out);
+		out.push(',');
+		out.push_str("\"shadowed-by\":");
+		match &self.shadowed_by {
+			Some(v159) => {
+				crate::codec::json_escape(v159, out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"scale\":");
+		self.scale.to_json_into(out);
+		out.push(',');
+		out.push_str("\"level\":");
+		match &self.level {
+			Some(v160) => {
+				let _ = write!(out, "{}", v160);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"floor\":");
+		let _ = write!(out, "{}", self.floor);
+		out.push(',');
+		out.push_str("\"ac-default\":");
+		match &self.ac_default {
+			Some(v161) => {
+				let _ = write!(out, "{}", v161);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"battery-default\":");
+		match &self.battery_default {
+			Some(v162) => {
+				let _ = write!(out, "{}", v162);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"failed\":");
+		if self.failed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"touched\":");
+		if self.touched {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("key=");
+		out.push_str(&self.key);
+		out.push_str(", ");
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("output=");
+		match &self.output {
+			Some(v163) => {
+				let _ = write!(out, "{}", v163);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("reason=");
+		match &self.reason {
+			Some(v164) => {
+				v164.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("standing=");
+		self.standing.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("shadowed-by=");
+		match &self.shadowed_by {
+			Some(v165) => {
+				out.push_str(v165);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("scale=");
+		self.scale.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("level=");
+		match &self.level {
+			Some(v166) => {
+				let _ = write!(out, "{}", v166);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("floor=");
+		let _ = write!(out, "{}", self.floor);
+		out.push_str(", ");
+		out.push_str("ac-default=");
+		match &self.ac_default {
+			Some(v167) => {
+				let _ = write!(out, "{}", v167);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("battery-default=");
+		match &self.battery_default {
+			Some(v168) => {
+				let _ = write!(out, "{}", v168);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("failed=");
+		if self.failed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("touched=");
+		if self.touched {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 13);
+		crate::codec::cbor::text(out, "key");
+		crate::codec::cbor::text(out, &self.key);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "output");
+		match &self.output {
+			Some(v169) => {
+				crate::codec::cbor::uint(out, *v169 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "reason");
+		match &self.reason {
+			Some(v170) => {
+				v170.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "standing");
+		self.standing.to_cbor_into(out);
+		crate::codec::cbor::text(out, "shadowed-by");
+		match &self.shadowed_by {
+			Some(v171) => {
+				crate::codec::cbor::text(out, v171);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "scale");
+		self.scale.to_cbor_into(out);
+		crate::codec::cbor::text(out, "level");
+		match &self.level {
+			Some(v172) => {
+				crate::codec::cbor::uint(out, *v172 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "floor");
+		crate::codec::cbor::uint(out, self.floor as u64);
+		crate::codec::cbor::text(out, "ac-default");
+		match &self.ac_default {
+			Some(v173) => {
+				crate::codec::cbor::uint(out, *v173 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "battery-default");
+		match &self.battery_default {
+			Some(v174) => {
+				crate::codec::cbor::uint(out, *v174 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "failed");
+		crate::codec::cbor::boolean(out, self.failed);
+		crate::codec::cbor::text(out, "touched");
+		crate::codec::cbor::boolean(out, self.touched);
+	}
+}
+
+impl BrightnessCause {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			BrightnessCause::Snapshot => out.push_str("\"snapshot\""),
+			BrightnessCause::Key => out.push_str("\"key\""),
+			BrightnessCause::FirmwareHotkey => out.push_str("\"firmware-hotkey\""),
+			BrightnessCause::Device => out.push_str("\"device\""),
+			BrightnessCause::Client => out.push_str("\"client\""),
+			BrightnessCause::Appeared => out.push_str("\"appeared\""),
+			BrightnessCause::Left => out.push_str("\"left\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			BrightnessCause::Snapshot => out.push_str("snapshot"),
+			BrightnessCause::Key => out.push_str("key"),
+			BrightnessCause::FirmwareHotkey => out.push_str("firmware-hotkey"),
+			BrightnessCause::Device => out.push_str("device"),
+			BrightnessCause::Client => out.push_str("client"),
+			BrightnessCause::Appeared => out.push_str("appeared"),
+			BrightnessCause::Left => out.push_str("left"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BrightnessCause::Snapshot => crate::codec::cbor::text(out, "snapshot"),
+			BrightnessCause::Key => crate::codec::cbor::text(out, "key"),
+			BrightnessCause::FirmwareHotkey => crate::codec::cbor::text(out, "firmware-hotkey"),
+			BrightnessCause::Device => crate::codec::cbor::text(out, "device"),
+			BrightnessCause::Client => crate::codec::cbor::text(out, "client"),
+			BrightnessCause::Appeared => crate::codec::cbor::text(out, "appeared"),
+			BrightnessCause::Left => crate::codec::cbor::text(out, "left"),
+		}
+	}
+}
+
+impl BrightnessChange {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"key\":");
+		crate::codec::json_escape(&self.key, out);
+		out.push(',');
+		out.push_str("\"level\":");
+		match &self.level {
+			Some(v175) => {
+				let _ = write!(out, "{}", v175);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"cause\":");
+		self.cause.to_json_into(out);
+		out.push(',');
+		out.push_str("\"serial\":");
+		let _ = write!(out, "{}", self.serial);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("key=");
+		out.push_str(&self.key);
+		out.push_str(", ");
+		out.push_str("level=");
+		match &self.level {
+			Some(v176) => {
+				let _ = write!(out, "{}", v176);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("cause=");
+		self.cause.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("serial=");
+		let _ = write!(out, "{}", self.serial);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "key");
+		crate::codec::cbor::text(out, &self.key);
+		crate::codec::cbor::text(out, "level");
+		match &self.level {
+			Some(v177) => {
+				crate::codec::cbor::uint(out, *v177 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "cause");
+		self.cause.to_cbor_into(out);
+		crate::codec::cbor::text(out, "serial");
+		crate::codec::cbor::uint(out, self.serial as u64);
+	}
+}
+
+impl BrightnessTarget {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			BrightnessTarget::Level(v178) => {
+				out.push_str("{\"level\":");
+				let _ = write!(out, "{}", v178);
+				out.push('}');
+			}
+			BrightnessTarget::Percent(v179) => {
+				out.push_str("{\"percent\":");
+				let _ = write!(out, "{}", v179);
+				out.push('}');
+			}
+			BrightnessTarget::Steps(v180) => {
+				out.push_str("{\"steps\":");
+				let _ = write!(out, "{}", v180);
+				out.push('}');
+			}
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			BrightnessTarget::Level(v181) => {
+				out.push_str("level(");
+				let _ = write!(out, "{}", v181);
+				out.push(')');
+			}
+			BrightnessTarget::Percent(v182) => {
+				out.push_str("percent(");
+				let _ = write!(out, "{}", v182);
+				out.push(')');
+			}
+			BrightnessTarget::Steps(v183) => {
+				out.push_str("steps(");
+				let _ = write!(out, "{}", v183);
+				out.push(')');
+			}
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BrightnessTarget::Level(v184) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "level");
+				crate::codec::cbor::uint(out, *v184 as u64);
+			}
+			BrightnessTarget::Percent(v185) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "percent");
+				crate::codec::cbor::uint(out, *v185 as u64);
+			}
+			BrightnessTarget::Steps(v186) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "steps");
+				crate::codec::cbor::int(out, *v186 as i64);
+			}
+		}
+	}
+}
+
+impl BrightnessSet {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"level\":");
+		let _ = write!(out, "{}", self.level);
+		out.push(',');
+		out.push_str("\"serial\":");
+		let _ = write!(out, "{}", self.serial);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("level=");
+		let _ = write!(out, "{}", self.level);
+		out.push_str(", ");
+		out.push_str("serial=");
+		let _ = write!(out, "{}", self.serial);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "level");
+		crate::codec::cbor::uint(out, self.level as u64);
+		crate::codec::cbor::text(out, "serial");
+		crate::codec::cbor::uint(out, self.serial as u64);
+	}
+}
+
+impl BrightnessSettings {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"automatic\":");
+		if self.automatic {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"idle-seconds\":");
+		match &self.idle_seconds {
+			Some(v187) => {
+				let _ = write!(out, "{}", v187);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("automatic=");
+		if self.automatic {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("idle-seconds=");
+		match &self.idle_seconds {
+			Some(v188) => {
+				let _ = write!(out, "{}", v188);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "automatic");
+		crate::codec::cbor::boolean(out, self.automatic);
+		crate::codec::cbor::text(out, "idle-seconds");
+		match &self.idle_seconds {
+			Some(v189) => {
+				crate::codec::cbor::uint(out, *v189 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
 	}
 }
 

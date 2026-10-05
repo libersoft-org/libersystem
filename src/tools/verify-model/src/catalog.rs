@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 163] = [
+const GATES: [(&str, &str); 170] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -331,6 +331,12 @@ const GATES: [(&str, &str); 163] = [
 	// it - and it boots a development image twice because the fixture is development-only and a cold
 	// reboot is two boots.
 	("bluetooth-service", "userspace.build"),
+	("bluetooth-classic", "userspace.build"),
+	("bluetooth-input", "userspace.build"),
+	("bluetooth-le", "userspace.build"),
+	("bluetooth-audio", "userspace.build"),
+	// AUDIOSERVICE'S DEVICE MODEL on the lab machine: two providers at boot, a third hot-plugged under a playing stream.
+	("audio-routing", "userspace.build"),
 	// POWERSERVICE, against the in-guest power fixture's HID-shaped and ACPI-shaped providers: canonical
 	// units, the read, control and publication boundaries, subscriptions that coalesce and close as
 	// stated, a withheld control reply, and a restart. Its subject is the service, the conversion leaf,
@@ -341,6 +347,15 @@ const GATES: [(&str, &str); 163] = [
 	// driver's HID Power Device class and read and driven through PowerService by a live client. Its subject is the
 	// class, the service and the control path - a userspace change selects it - and it boots a development guest.
 	("power-ups", "userspace.build"),
+	// DISPLAY BRIGHTNESS THROUGH A REAL USB MONITOR the host builds (the gadget kind `monitor`): the xHCI driver's monitor
+	// class, DisplayService's join, set and floor, the brightness policy's control, settings and automatic brightness,
+	// and its restart. Its subject is the class, the services and the tool's path - a userspace change selects it - and
+	// it boots a development guest.
+	("brightness-usb", "userspace.build"),
+	// AND THROUGH THE FIRMWARE, on the ACPI fixture: the boot framebuffer's decoder, the panel's join by its adapter,
+	// `_DOS`, the hotkey notifications, the keypad, automatic brightness through `_ALR` and a restore across a reset. Its
+	// subject is the kernel's decoder, the two ACPI drivers and the services above them, and it boots a development guest.
+	("brightness-acpi", "kernel"),
 	// IPMI, on development guests: the five system interfaces against QEMU's simulated BMCs, a pair, the harness BMC and
 	// its hostile modes, malformed records and an orderly reboot. Its subject is the transports, the driver, the BMC
 	// service and the tool - a userspace change selects it - and it boots guests.
@@ -909,13 +924,21 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 64] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 71] = [
 	"dma-mode-x86_64",
+	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
+	"audio-routing",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
 	"bluetooth-service",
+	"bluetooth-classic",
+	"bluetooth-input",
+	"bluetooth-le",
+	"bluetooth-audio",
 	"power-service",
 	"power-ups",
+	"brightness-usb",
+	"brightness-acpi",
 	"ipmi",
 	"smartcard-service",
 	"qemu-modem-service",

@@ -10,6 +10,442 @@ use core::fmt::Write as _;
 
 pub use crate::generated::liber::base::v1::Error;
 
+/// WHERE A DEVICE IS REACHED: a catalogue `audio` provider - a sound card or a USB audio function - or an endpoint
+/// BluetoothService offers on `bluetooth-audio`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AudioTransport {
+	Provider = 1,
+	Bluetooth = 2,
+}
+
+impl AudioTransport {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioTransport> {
+		let mut r = Reader::new(bytes);
+		let value = AudioTransport::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioTransport> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioTransport::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioTransport> {
+		match r.u8()? {
+			1 => Some(AudioTransport::Provider),
+			2 => Some(AudioTransport::Bluetooth),
+			_ => None,
+		}
+	}
+}
+
+/// A device's own PCM format: signed 16-bit little-endian, interleaved, at this rate and channel count.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioFormat {
+	pub rate: u32,
+	pub channels: u8,
+}
+
+impl AudioFormat {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioFormat> {
+		let mut r = Reader::new(bytes);
+		let value = AudioFormat::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioFormat> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioFormat::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.rate)?;
+		w.u8(self.channels)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioFormat> {
+		let rate = r.u32()?;
+		let channels = r.u8()?;
+		Some(AudioFormat { rate, channels })
+	}
+}
+
+/// ONE DEVICE IN THE INVENTORY. `id` is AudioService's number for this arrival and is never reused while the service
+/// runs: a device that leaves and comes back is a new arrival with a new number.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioDevice {
+	pub id: u32,
+	/// What the device calls itself, or what it is - "virtio sound", a headset's name.
+	pub label: String,
+	pub transport: AudioTransport,
+	/// The directions it serves, each in the device's own format; none is a direction it does not have.
+	pub output: Option<AudioFormat>,
+	pub input: Option<AudioFormat>,
+	/// A VOICE DEVICE: a headset's or earbuds' call audio, mono at a voice rate both ways, used by voice sessions and
+	/// never by music. Its link is up only while a session is open.
+	pub voice: bool,
+	/// A PHONE PLAYING TO THIS SYSTEM: a stream this service plays to the default output itself, never an input a
+	/// recorder can read.
+	pub route: bool,
+	/// The device's own latency in microseconds: its period queue, and a codec frame, a sink's delay report or a
+	/// presentation delay where it has one.
+	pub latency_us: u32,
+	/// Its level, 0 to 100.
+	pub volume: u8,
+	/// The device applies the level itself and its samples are not scaled; otherwise this service scales them.
+	pub hardware_volume: bool,
+	/// Whether it is the default for each direction now.
+	pub default_output: bool,
+	pub default_input: bool,
+	pub default_voice: bool,
+}
+
+impl AudioDevice {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioDevice> {
+		let mut r = Reader::new(bytes);
+		let value = AudioDevice::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioDevice> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioDevice::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.id)?;
+		w.bytes_lp(self.label.as_bytes())?;
+		self.transport.write(w)?;
+		match &self.output {
+			Some(v0) => {
+				w.u8(1)?;
+				v0.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.input {
+			Some(v1) => {
+				w.u8(1)?;
+				v1.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.boolean(self.voice)?;
+		w.boolean(self.route)?;
+		w.u32(self.latency_us)?;
+		w.u8(self.volume)?;
+		w.boolean(self.hardware_volume)?;
+		w.boolean(self.default_output)?;
+		w.boolean(self.default_input)?;
+		w.boolean(self.default_voice)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioDevice> {
+		let id = r.u32()?;
+		let label = {
+			let v2 = r.string_lp()?;
+			(v2.len() <= 48).then_some(v2)?
+		};
+		let transport = AudioTransport::read(r)?;
+		let output = if r.tag()? { Some(AudioFormat::read(r)?) } else { None };
+		let input = if r.tag()? { Some(AudioFormat::read(r)?) } else { None };
+		let voice = r.boolean()?;
+		let route = r.boolean()?;
+		let latency_us = r.u32()?;
+		let volume = r.u8()?;
+		let hardware_volume = r.boolean()?;
+		let default_output = r.boolean()?;
+		let default_input = r.boolean()?;
+		let default_voice = r.boolean()?;
+		Some(AudioDevice { id, label, transport, output, input, voice, route, latency_us, volume, hardware_volume, default_output, default_input, default_voice })
+	}
+}
+
+/// A direction a device can be the default for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AudioDirection {
+	Output = 1,
+	Input = 2,
+	Voice = 3,
+}
+
+impl AudioDirection {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioDirection> {
+		let mut r = Reader::new(bytes);
+		let value = AudioDirection::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioDirection> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioDirection::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioDirection> {
+		match r.u8()? {
+			1 => Some(AudioDirection::Output),
+			2 => Some(AudioDirection::Input),
+			3 => Some(AudioDirection::Voice),
+			_ => None,
+		}
+	}
+}
+
+/// ONE STREAM AS THE OPERATOR SEES IT: where it plays, what it is, and the silence it has played.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioStreamInfo {
+	/// The device it plays on now; none with no device at all.
+	pub device: Option<u32>,
+	/// The device it named, where it named one; it follows the default otherwise.
+	pub named: Option<u32>,
+	pub format: AudioFormat,
+	/// Its queue and its device's latency, in microseconds.
+	pub latency_us: u32,
+	/// Frames of silence played in its place: while it had no device, or between devices.
+	pub silent_frames: u64,
+	/// A voice session's playback half, or the phone's stream this service plays itself.
+	pub voice: bool,
+	pub route: bool,
+}
+
+impl AudioStreamInfo {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioStreamInfo> {
+		let mut r = Reader::new(bytes);
+		let value = AudioStreamInfo::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioStreamInfo> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioStreamInfo::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match &self.device {
+			Some(v3) => {
+				w.u8(1)?;
+				w.u32(*v3)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.named {
+			Some(v4) => {
+				w.u8(1)?;
+				w.u32(*v4)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		self.format.write(w)?;
+		w.u32(self.latency_us)?;
+		w.u64(self.silent_frames)?;
+		w.boolean(self.voice)?;
+		w.boolean(self.route)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioStreamInfo> {
+		let device = if r.tag()? { Some(r.u32()?) } else { None };
+		let named = if r.tag()? { Some(r.u32()?) } else { None };
+		let format = AudioFormat::read(r)?;
+		let latency_us = r.u32()?;
+		let silent_frames = r.u64()?;
+		let voice = r.boolean()?;
+		let route = r.boolean()?;
+		Some(AudioStreamInfo { device, named, format, latency_us, silent_frames, voice, route })
+	}
+}
+
+/// WHAT THE ROUTING RULE COUNTED: streams moved between devices, frames played into no device, and the phone stream's
+/// jitter buffer - periods dropped full and periods of silence given empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioCounters {
+	pub moves: u64,
+	pub silent_frames: u64,
+	pub route_overflows: u64,
+	pub route_underruns: u64,
+}
+
+impl AudioCounters {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AudioCounters> {
+		let mut r = Reader::new(bytes);
+		let value = AudioCounters::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AudioCounters> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AudioCounters::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u64(self.moves)?;
+		w.u64(self.silent_frames)?;
+		w.u64(self.route_overflows)?;
+		w.u64(self.route_underruns)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AudioCounters> {
+		let moves = r.u64()?;
+		let silent_frames = r.u64()?;
+		let route_overflows = r.u64()?;
+		let route_underruns = r.u64()?;
+		Some(AudioCounters { moves, silent_frames, route_overflows, route_underruns })
+	}
+}
+
 /// AudioService: headless PCM playback and capture over the virtio-sound device. `beep` queues a
 /// tone of the given frequency (Hz) and duration (milliseconds) into the same mixer - the device is
 /// reached as a capability (the channel this interface is served on), never as
@@ -19,6 +455,11 @@ pub use crate::generated::liber::base::v1::Error;
 /// sub-channel served as `pcm-capture`, converted DOWN from the hardware's 48 kHz stereo to the
 /// rate and channel count asked for. It answers not-found on a machine whose sound device has no
 /// input stream, which is an ordinary machine rather than an error.
+///
+/// THE DEVICE MODEL (additive at version 1): `devices` is the inventory every scope may read, `open-stream-to` and
+/// `open-capture-from` name a device instead of following the default - and move to the default when it leaves -
+/// and `open-voice` opens a duplex voice session at 8 or 16 kHz mono on a connection allowed both ways. A stream
+/// opened with no device at all is accepted and plays into silence, counted, until one arrives.
 // interface `audio` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod audio {
 	use super::*;
@@ -28,11 +469,19 @@ pub mod audio {
 	pub const OP_BEEP: u16 = 1;
 	pub const OP_OPEN_STREAM: u16 = 2;
 	pub const OP_OPEN_CAPTURE: u16 = 3;
+	pub const OP_DEVICES: u16 = 4;
+	pub const OP_OPEN_STREAM_TO: u16 = 5;
+	pub const OP_OPEN_CAPTURE_FROM: u16 = 6;
+	pub const OP_OPEN_VOICE: u16 = 7;
 
 	pub trait Service {
 		fn beep(&mut self, freq: u16, millis: u32) -> Result<(), Error>;
 		fn open_stream(&mut self, rate: u32, channels: u8) -> Result<u64, Error>;
 		fn open_capture(&mut self, rate: u32, channels: u8) -> Result<u64, Error>;
+		fn devices(&mut self) -> Vec<AudioDevice>;
+		fn open_stream_to(&mut self, device: u32, rate: u32, channels: u8) -> Result<u64, Error>;
+		fn open_capture_from(&mut self, device: u32, rate: u32, channels: u8) -> Result<u64, Error>;
+		fn open_voice(&mut self, rate: u32) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -65,12 +514,12 @@ pub mod audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v0) => {
+						Ok(v5) => {
 							w.u8(1)?;
 						}
-						Err(v1) => {
+						Err(v6) => {
 							w.u8(0)?;
-							v1.write(w)?;
+							v6.write(w)?;
 						}
 					}
 					Some(())
@@ -102,14 +551,14 @@ pub mod audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v2) => {
+						Ok(v7) => {
 							w.u8(1)?;
-							w.set_handle(*v2)?;
+							w.set_handle(*v7)?;
 							w.u32(0)?;
 						}
-						Err(v3) => {
+						Err(v8) => {
 							w.u8(0)?;
-							v3.write(w)?;
+							v8.write(w)?;
 						}
 					}
 					Some(())
@@ -141,14 +590,158 @@ pub mod audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v4) => {
+						Ok(v9) => {
 							w.u8(1)?;
-							w.set_handle(*v4)?;
+							w.set_handle(*v9)?;
 							w.u32(0)?;
 						}
-						Err(v5) => {
+						Err(v10) => {
 							w.u8(0)?;
-							v5.write(w)?;
+							v10.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_DEVICES => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.devices();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					if result.len() > u16::MAX as usize {
+						return None;
+					}
+					w.u16(result.len() as u16)?;
+					for v11 in result.iter() {
+						v11.write(w)?;
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			OP_OPEN_STREAM_TO => {
+				let device = r.u32()?;
+				let rate = r.u32()?;
+				let channels = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_stream_to(device, rate, channels);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v12) => {
+							w.u8(1)?;
+							w.set_handle(*v12)?;
+							w.u32(0)?;
+						}
+						Err(v13) => {
+							w.u8(0)?;
+							v13.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OPEN_CAPTURE_FROM => {
+				let device = r.u32()?;
+				let rate = r.u32()?;
+				let channels = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_capture_from(device, rate, channels);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v14) => {
+							w.u8(1)?;
+							w.set_handle(*v14)?;
+							w.u32(0)?;
+						}
+						Err(v15) => {
+							w.u8(0)?;
+							v15.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OPEN_VOICE => {
+				let rate = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_voice(rate);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v16) => {
+							w.u8(1)?;
+							w.set_handle(*v16)?;
+							w.u32(0)?;
+						}
+						Err(v17) => {
+							w.u8(0)?;
+							v17.write(w)?;
 						}
 					}
 					Some(())
@@ -370,6 +963,171 @@ pub mod audio {
 			}
 			decoded
 		}
+		pub fn devices(&mut self) -> Option<Vec<AudioDevice>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DEVICES)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = {
+					let v18 = r.u16()? as usize;
+					let mut v19 = Vec::new();
+					v19.try_reserve_exact(v18).ok()?;
+					for _ in 0..v18 {
+						v19.push(AudioDevice::read(r)?);
+					}
+					v19
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn open_stream_to(&mut self, device: &u32, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_STREAM_TO)?;
+			w.u32(corr)?;
+			w.u32(*device)?;
+			w.u32(*rate)?;
+			w.u8(*channels)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn open_capture_from(&mut self, device: &u32, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_CAPTURE_FROM)?;
+			w.u32(corr)?;
+			w.u32(*device)?;
+			w.u32(*rate)?;
+			w.u8(*channels)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn open_voice(&mut self, rate: &u32) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_VOICE)?;
+			w.u32(corr)?;
+			w.u32(*rate)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -395,6 +1153,38 @@ pub mod audio {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.open_capture(rate, channels)
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_devices")]
+	fn channel_invoke_devices(chan: u64) -> Option<Vec<AudioDevice>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.devices()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_open_stream_to")]
+	fn channel_invoke_open_stream_to(chan: u64, device: &u32, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_stream_to(device, rate, channels)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_open_capture_from")]
+	fn channel_invoke_open_capture_from(chan: u64, device: &u32, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_capture_from(device, rate, channels)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_open_voice")]
+	fn channel_invoke_open_voice(chan: u64, rate: &u32) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_voice(rate)
+	}
 }
 
 /// A playback stream returned by `audio.open-stream`. Samples are signed 16-bit
@@ -410,10 +1200,13 @@ pub mod pcm_stream {
 
 	pub const OP_WRITE: u16 = 1;
 	pub const OP_CLOSE: u16 = 2;
+	pub const OP_LATENCY: u16 = 3;
 
 	pub trait Service {
 		fn write(&mut self, data: crate::codec::Buffer) -> Result<u32, Error>;
 		fn close(&mut self) -> Result<(), Error>;
+		/// The stream's latency in microseconds: what it holds queued, and its device's own.
+		fn latency(&mut self) -> u32;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -449,13 +1242,13 @@ pub mod pcm_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v6) => {
+						Ok(v20) => {
 							w.u8(1)?;
-							w.u32(*v6)?;
+							w.u32(*v20)?;
 						}
-						Err(v7) => {
+						Err(v21) => {
 							w.u8(0)?;
-							v7.write(w)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -485,12 +1278,12 @@ pub mod pcm_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v8) => {
+						Ok(v22) => {
 							w.u8(1)?;
 						}
-						Err(v9) => {
+						Err(v23) => {
 							w.u8(0)?;
-							v9.write(w)?;
+							v23.write(w)?;
 						}
 					}
 					Some(())
@@ -510,6 +1303,26 @@ pub mod pcm_stream {
 					w.u32(corr)?;
 					w.u8(0)?;
 					Error::Again.write(w)?;
+				}
+			}
+			OP_LATENCY => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.latency();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u32(result)?;
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
 				}
 			}
 			_ => return None,
@@ -662,6 +1475,39 @@ pub mod pcm_stream {
 			}
 			decoded
 		}
+		pub fn latency(&mut self) -> Option<u32> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LATENCY)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = r.u32()?;
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -679,6 +1525,14 @@ pub mod pcm_stream {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.close()
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_pcm_stream_latency")]
+	fn channel_invoke_latency(chan: u64) -> Option<u32> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.latency()
+	}
 }
 
 /// A capture stream returned by `audio.open-capture`. Samples are signed 16-bit little-endian,
@@ -695,10 +1549,13 @@ pub mod pcm_capture {
 
 	pub const OP_READ: u16 = 1;
 	pub const OP_CLOSE: u16 = 2;
+	pub const OP_LATENCY: u16 = 3;
 
 	pub trait Service {
 		fn read(&mut self) -> Result<Vec<u8>, Error>;
 		fn close(&mut self) -> Result<(), Error>;
+		/// The device's own latency in microseconds.
+		fn latency(&mut self) -> u32;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -729,19 +1586,19 @@ pub mod pcm_capture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v10) => {
+						Ok(v24) => {
 							w.u8(1)?;
-							if v10.len() > u16::MAX as usize {
+							if v24.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v10.len() as u16)?;
-							for v12 in v10.iter() {
-								w.u8(*v12)?;
+							w.u16(v24.len() as u16)?;
+							for v26 in v24.iter() {
+								w.u8(*v26)?;
 							}
 						}
-						Err(v11) => {
+						Err(v25) => {
 							w.u8(0)?;
-							v11.write(w)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -771,12 +1628,12 @@ pub mod pcm_capture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v13) => {
+						Ok(v27) => {
 							w.u8(1)?;
 						}
-						Err(v14) => {
+						Err(v28) => {
 							w.u8(0)?;
-							v14.write(w)?;
+							v28.write(w)?;
 						}
 					}
 					Some(())
@@ -796,6 +1653,26 @@ pub mod pcm_capture {
 					w.u32(corr)?;
 					w.u8(0)?;
 					Error::Again.write(w)?;
+				}
+			}
+			OP_LATENCY => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.latency();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u32(result)?;
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
 				}
 			}
 			_ => return None,
@@ -906,13 +1783,13 @@ pub mod pcm_capture {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v15 = r.u16()? as usize;
-						let mut v16 = Vec::new();
-						v16.try_reserve_exact(v15).ok()?;
-						for _ in 0..v15 {
-							v16.push(r.u8()?);
+						let v29 = r.u16()? as usize;
+						let mut v30 = Vec::new();
+						v30.try_reserve_exact(v29).ok()?;
+						for _ in 0..v29 {
+							v30.push(r.u8()?);
 						}
-						v16
+						v30
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -958,6 +1835,39 @@ pub mod pcm_capture {
 			}
 			decoded
 		}
+		pub fn latency(&mut self) -> Option<u32> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LATENCY)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = r.u32()?;
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -975,6 +1885,14 @@ pub mod pcm_capture {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.close()
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_pcm_capture_latency")]
+	fn channel_invoke_latency(chan: u64) -> Option<u32> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.latency()
+	}
 }
 
 /// Privileged launcher boundary that mints factories restricted to one direction.
@@ -982,6 +1900,9 @@ pub mod pcm_capture {
 /// `open-capture`. Neither can queue `beep` tones, and NEITHER CAN DO THE OTHER'S JOB: "may record"
 /// is not "may make a sound", and a launcher that cannot say which it is granting is a launcher that
 /// hands a microphone to anything that beeps.
+///
+/// `open-voices` MINTS THE THIRD: a connection that may only `open-voice` - a duplex session, which records as well as
+/// plays and so is granted as neither alone (`audio-voice`).
 // interface `audio-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod audio_admin {
 	use super::*;
@@ -990,10 +1911,12 @@ pub mod audio_admin {
 
 	pub const OP_OPEN_STREAMS: u16 = 1;
 	pub const OP_OPEN_CAPTURES: u16 = 2;
+	pub const OP_OPEN_VOICES: u16 = 3;
 
 	pub trait Service {
 		fn open_streams(&mut self) -> Result<u64, Error>;
 		fn open_captures(&mut self) -> Result<u64, Error>;
+		fn open_voices(&mut self) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1024,14 +1947,14 @@ pub mod audio_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v17) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							w.set_handle(*v17)?;
+							w.set_handle(*v31)?;
 							w.u32(0)?;
 						}
-						Err(v18) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v18.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -1061,14 +1984,51 @@ pub mod audio_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v19) => {
+						Ok(v33) => {
 							w.u8(1)?;
-							w.set_handle(*v19)?;
+							w.set_handle(*v33)?;
 							w.u32(0)?;
 						}
-						Err(v20) => {
+						Err(v34) => {
 							w.u8(0)?;
-							v20.write(w)?;
+							v34.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OPEN_VOICES => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_voices();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v35) => {
+							w.u8(1)?;
+							w.set_handle(*v35)?;
+							w.u32(0)?;
+						}
+						Err(v36) => {
+							w.u8(0)?;
+							v36.write(w)?;
 						}
 					}
 					Some(())
@@ -1252,6 +2212,45 @@ pub mod audio_admin {
 			}
 			decoded
 		}
+		pub fn open_voices(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_VOICES)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1268,6 +2267,14 @@ pub mod audio_admin {
 	fn channel_invoke_open_captures(chan: u64) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.open_captures()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_admin_open_voices")]
+	fn channel_invoke_open_voices(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_voices()
 	}
 }
 
@@ -1526,6 +2533,1796 @@ pub mod audio_stats {
 	}
 }
 
+/// AN OPERATOR AUTHORITY ON AUDIOSERVICE: the inventory, the default devices and each device's level, held by
+/// `audioctl` as `btctl` holds Bluetooth's. Resolved by name through the broker, minted per launch by PermissionManager
+/// for a component its policy names.
+// interface `audio-control` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod audio_control {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_DEVICES: u16 = 1;
+	pub const OP_SET_DEFAULT: u16 = 2;
+	pub const OP_SET_VOLUME: u16 = 3;
+	pub const OP_STREAMS: u16 = 4;
+	pub const OP_COUNTERS: u16 = 5;
+
+	pub trait Service {
+		fn devices(&mut self) -> Vec<AudioDevice>;
+		/// Make a device the default for a direction, as its arrival would; the device it displaced returns when it leaves.
+		fn set_default(&mut self, device: u32, direction: AudioDirection) -> Result<(), Error>;
+		/// A device's level, 0 to 100: sent to a device that applies it itself, or scaled here.
+		fn set_volume(&mut self, device: u32, volume: u8) -> Result<(), Error>;
+		fn streams(&mut self) -> Vec<AudioStreamInfo>;
+		fn counters(&mut self) -> AudioCounters;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:audio")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_DEVICES => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.devices();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					if result.len() > u16::MAX as usize {
+						return None;
+					}
+					w.u16(result.len() as u16)?;
+					for v37 in result.iter() {
+						v37.write(w)?;
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			OP_SET_DEFAULT => {
+				let device = r.u32()?;
+				let direction = AudioDirection::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_default(device, direction);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v38) => {
+							w.u8(1)?;
+						}
+						Err(v39) => {
+							w.u8(0)?;
+							v39.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_VOLUME => {
+				let device = r.u32()?;
+				let volume = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_volume(device, volume);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v40) => {
+							w.u8(1)?;
+						}
+						Err(v41) => {
+							w.u8(0)?;
+							v41.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_STREAMS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.streams();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					if result.len() > u16::MAX as usize {
+						return None;
+					}
+					w.u16(result.len() as u16)?;
+					for v42 in result.iter() {
+						v42.write(w)?;
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			OP_COUNTERS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.counters();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					result.write(w)?;
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn devices(&mut self) -> Option<Vec<AudioDevice>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_DEVICES)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = {
+					let v43 = r.u16()? as usize;
+					let mut v44 = Vec::new();
+					v44.try_reserve_exact(v43).ok()?;
+					for _ in 0..v43 {
+						v44.push(AudioDevice::read(r)?);
+					}
+					v44
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_default(&mut self, device: &u32, direction: &AudioDirection) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_DEFAULT)?;
+			w.u32(corr)?;
+			w.u32(*device)?;
+			direction.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_volume(&mut self, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_VOLUME)?;
+			w.u32(corr)?;
+			w.u32(*device)?;
+			w.u8(*volume)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn streams(&mut self) -> Option<Vec<AudioStreamInfo>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STREAMS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = {
+					let v45 = r.u16()? as usize;
+					let mut v46 = Vec::new();
+					v46.try_reserve_exact(v45).ok()?;
+					for _ in 0..v45 {
+						v46.push(AudioStreamInfo::read(r)?);
+					}
+					v46
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn counters(&mut self) -> Option<AudioCounters> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_COUNTERS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = AudioCounters::read(r)?;
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_devices")]
+	fn channel_invoke_devices(chan: u64) -> Option<Vec<AudioDevice>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.devices()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_set_default")]
+	fn channel_invoke_set_default(chan: u64, device: &u32, direction: &AudioDirection) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_default(device, direction)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_set_volume")]
+	fn channel_invoke_set_volume(chan: u64, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_volume(device, volume)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_streams")]
+	fn channel_invoke_streams(chan: u64) -> Option<Vec<AudioStreamInfo>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.streams()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_counters")]
+	fn channel_invoke_counters(chan: u64) -> Option<AudioCounters> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.counters()
+	}
+}
+
+/// The state of a call a voice session's holder declares, relayed to the voice device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CallState {
+	None = 0,
+	Incoming = 1,
+	Outgoing = 2,
+	Active = 3,
+	Held = 4,
+}
+
+impl CallState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CallState> {
+		let mut r = Reader::new(bytes);
+		let value = CallState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CallState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CallState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<CallState> {
+		match r.u8()? {
+			0 => Some(CallState::None),
+			1 => Some(CallState::Incoming),
+			2 => Some(CallState::Outgoing),
+			3 => Some(CallState::Active),
+			4 => Some(CallState::Held),
+			_ => None,
+		}
+	}
+}
+
+/// What a headset asks of a call: relayed to the session that declared one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CallCommand {
+	Answer = 1,
+	HangUp = 2,
+	Reject = 3,
+	Redial = 4,
+}
+
+impl CallCommand {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<CallCommand> {
+		let mut r = Reader::new(bytes);
+		let value = CallCommand::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<CallCommand> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = CallCommand::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<CallCommand> {
+		match r.u8()? {
+			1 => Some(CallCommand::Answer),
+			2 => Some(CallCommand::HangUp),
+			3 => Some(CallCommand::Reject),
+			4 => Some(CallCommand::Redial),
+			_ => None,
+		}
+	}
+}
+
+/// A DUPLEX VOICE SESSION from `audio.open-voice`: mono at the session's rate, signed 16-bit little-endian. `write` is
+/// playback with the same backpressure as `pcm-stream`; `read` answers one period of what the voice device - or the
+/// default input - heard, converted to the session's rate. OPENING A SESSION IS WHAT BRINGS A HEADSET'S AUDIO LINK UP
+/// and closing the last one takes it down.
+// interface `voice-session` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod voice_session {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_WRITE: u16 = 1;
+	pub const OP_READ: u16 = 2;
+	pub const OP_SET_CALL: u16 = 3;
+	pub const OP_COMMANDS: u16 = 4;
+	pub const OP_LATENCY: u16 = 5;
+	pub const OP_CLOSE: u16 = 6;
+
+	pub trait Service {
+		fn write(&mut self, data: crate::codec::Buffer) -> Result<u32, Error>;
+		fn read(&mut self) -> Result<Vec<u8>, Error>;
+		/// The call this session declares - or none. The voice device is told; with none declared anywhere, a headset is
+		/// told there is no call and its commands are refused.
+		fn set_call(&mut self, state: CallState) -> Result<(), Error>;
+		/// The voice device's call commands as they arrive.
+		fn commands(&mut self) -> Result<Vec<CallCommand>, Error>;
+		/// The session's latency both ways, in microseconds.
+		fn latency(&mut self) -> u32;
+		fn close(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:audio")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_WRITE => {
+				let data = {
+					let len = r.u64()?;
+					let handle = r.take_handle()?;
+					crate::codec::Buffer { handle, len }
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.write(data);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v47) => {
+							w.u8(1)?;
+							w.u32(*v47)?;
+						}
+						Err(v48) => {
+							w.u8(0)?;
+							v48.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_READ => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.read();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v49) => {
+							w.u8(1)?;
+							if v49.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v49.len() as u16)?;
+							for v51 in v49.iter() {
+								w.u8(*v51)?;
+							}
+						}
+						Err(v50) => {
+							w.u8(0)?;
+							v50.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_CALL => {
+				let state = CallState::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_call(state);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v52) => {
+							w.u8(1)?;
+						}
+						Err(v53) => {
+							w.u8(0)?;
+							v53.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_LATENCY => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.latency();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u32(result)?;
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			OP_CLOSE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.close();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v54) => {
+							w.u8(1)?;
+						}
+						Err(v55) => {
+							w.u8(0)?;
+							v55.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn commands_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<CallCommand>, Error>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.commands();
+		Some((corr, items))
+	}
+	pub fn commands_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(1)?;
+		w.u32(0)?;
+		writer.finish()
+	}
+	pub fn commands_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(0)?;
+		error.write(w)?;
+		writer.finish()
+	}
+	pub fn commands_frame(seq: u32, item: &CallCommand, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn commands_read(msg: &[u8], frame_handles: &mut Handles) -> Option<CallCommand> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = CallCommand::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn write(&mut self, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WRITE)?;
+			w.u32(corr)?;
+			w.set_handle(data.handle)?;
+			w.u64(data.len)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn read(&mut self) -> Option<Result<Vec<u8>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_READ)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v56 = r.u16()? as usize;
+						let mut v57 = Vec::new();
+						v57.try_reserve_exact(v56).ok()?;
+						for _ in 0..v56 {
+							v57.push(r.u8()?);
+						}
+						v57
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_call(&mut self, state: &CallState) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_CALL)?;
+			w.u32(corr)?;
+			state.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn commands(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_COMMANDS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			let decoded = (|| {
+				if r.u32()? != corr {
+					return None;
+				}
+				if r.tag()? {
+					let _ = r.u32()?;
+					r.finish()?;
+					if reply_handles.len() != 1 {
+						return None;
+					}
+					return Some(Ok(reply_handles.first()));
+				}
+				if !reply_handles.is_empty() {
+					return None;
+				}
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
+			})();
+			if !matches!(decoded, Some(Ok(_))) {
+				self.transport.discard_handles(reply_handles.as_slice());
+			}
+			decoded
+		}
+		pub fn latency(&mut self) -> Option<u32> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LATENCY)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = r.u32()?;
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn close(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CLOSE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_voice_session_write")]
+	fn channel_invoke_write(chan: u64, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write(data)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_voice_session_read")]
+	fn channel_invoke_read(chan: u64) -> Option<Result<Vec<u8>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.read()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_voice_session_set_call")]
+	fn channel_invoke_set_call(chan: u64, state: &CallState) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_call(state)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_voice_session_commands")]
+	fn channel_invoke_commands(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.commands()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_voice_session_latency")]
+	fn channel_invoke_latency(chan: u64) -> Option<u32> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.latency()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_voice_session_close")]
+	fn channel_invoke_close(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.close()
+	}
+}
+
+impl AudioTransport {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			AudioTransport::Provider => out.push_str("\"provider\""),
+			AudioTransport::Bluetooth => out.push_str("\"bluetooth\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			AudioTransport::Provider => out.push_str("provider"),
+			AudioTransport::Bluetooth => out.push_str("bluetooth"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			AudioTransport::Provider => crate::codec::cbor::text(out, "provider"),
+			AudioTransport::Bluetooth => crate::codec::cbor::text(out, "bluetooth"),
+		}
+	}
+}
+
+impl AudioFormat {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"rate\":");
+		let _ = write!(out, "{}", self.rate);
+		out.push(',');
+		out.push_str("\"channels\":");
+		let _ = write!(out, "{}", self.channels);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("rate=");
+		let _ = write!(out, "{}", self.rate);
+		out.push_str(", ");
+		out.push_str("channels=");
+		let _ = write!(out, "{}", self.channels);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "rate");
+		crate::codec::cbor::uint(out, self.rate as u64);
+		crate::codec::cbor::text(out, "channels");
+		crate::codec::cbor::uint(out, self.channels as u64);
+	}
+}
+
+impl AudioDevice {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"label\":");
+		crate::codec::json_escape(&self.label, out);
+		out.push(',');
+		out.push_str("\"transport\":");
+		self.transport.to_json_into(out);
+		out.push(',');
+		out.push_str("\"output\":");
+		match &self.output {
+			Some(v58) => {
+				v58.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"input\":");
+		match &self.input {
+			Some(v59) => {
+				v59.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"voice\":");
+		if self.voice {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"route\":");
+		if self.route {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"latency-us\":");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push(',');
+		out.push_str("\"volume\":");
+		let _ = write!(out, "{}", self.volume);
+		out.push(',');
+		out.push_str("\"hardware-volume\":");
+		if self.hardware_volume {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"default-output\":");
+		if self.default_output {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"default-input\":");
+		if self.default_input {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"default-voice\":");
+		if self.default_voice {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("label=");
+		out.push_str(&self.label);
+		out.push_str(", ");
+		out.push_str("transport=");
+		self.transport.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("output=");
+		match &self.output {
+			Some(v60) => {
+				v60.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("input=");
+		match &self.input {
+			Some(v61) => {
+				v61.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("voice=");
+		if self.voice {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("route=");
+		if self.route {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("latency-us=");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push_str(", ");
+		out.push_str("volume=");
+		let _ = write!(out, "{}", self.volume);
+		out.push_str(", ");
+		out.push_str("hardware-volume=");
+		if self.hardware_volume {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("default-output=");
+		if self.default_output {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("default-input=");
+		if self.default_input {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("default-voice=");
+		if self.default_voice {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 13);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "label");
+		crate::codec::cbor::text(out, &self.label);
+		crate::codec::cbor::text(out, "transport");
+		self.transport.to_cbor_into(out);
+		crate::codec::cbor::text(out, "output");
+		match &self.output {
+			Some(v62) => {
+				v62.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "input");
+		match &self.input {
+			Some(v63) => {
+				v63.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "voice");
+		crate::codec::cbor::boolean(out, self.voice);
+		crate::codec::cbor::text(out, "route");
+		crate::codec::cbor::boolean(out, self.route);
+		crate::codec::cbor::text(out, "latency-us");
+		crate::codec::cbor::uint(out, self.latency_us as u64);
+		crate::codec::cbor::text(out, "volume");
+		crate::codec::cbor::uint(out, self.volume as u64);
+		crate::codec::cbor::text(out, "hardware-volume");
+		crate::codec::cbor::boolean(out, self.hardware_volume);
+		crate::codec::cbor::text(out, "default-output");
+		crate::codec::cbor::boolean(out, self.default_output);
+		crate::codec::cbor::text(out, "default-input");
+		crate::codec::cbor::boolean(out, self.default_input);
+		crate::codec::cbor::text(out, "default-voice");
+		crate::codec::cbor::boolean(out, self.default_voice);
+	}
+}
+
+impl AudioDirection {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			AudioDirection::Output => out.push_str("\"output\""),
+			AudioDirection::Input => out.push_str("\"input\""),
+			AudioDirection::Voice => out.push_str("\"voice\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			AudioDirection::Output => out.push_str("output"),
+			AudioDirection::Input => out.push_str("input"),
+			AudioDirection::Voice => out.push_str("voice"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			AudioDirection::Output => crate::codec::cbor::text(out, "output"),
+			AudioDirection::Input => crate::codec::cbor::text(out, "input"),
+			AudioDirection::Voice => crate::codec::cbor::text(out, "voice"),
+		}
+	}
+}
+
+impl AudioStreamInfo {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"device\":");
+		match &self.device {
+			Some(v64) => {
+				let _ = write!(out, "{}", v64);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"named\":");
+		match &self.named {
+			Some(v65) => {
+				let _ = write!(out, "{}", v65);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"format\":");
+		self.format.to_json_into(out);
+		out.push(',');
+		out.push_str("\"latency-us\":");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push(',');
+		out.push_str("\"silent-frames\":");
+		let _ = write!(out, "{}", self.silent_frames);
+		out.push(',');
+		out.push_str("\"voice\":");
+		if self.voice {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"route\":");
+		if self.route {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("device=");
+		match &self.device {
+			Some(v66) => {
+				let _ = write!(out, "{}", v66);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("named=");
+		match &self.named {
+			Some(v67) => {
+				let _ = write!(out, "{}", v67);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("format=");
+		self.format.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("latency-us=");
+		let _ = write!(out, "{}", self.latency_us);
+		out.push_str(", ");
+		out.push_str("silent-frames=");
+		let _ = write!(out, "{}", self.silent_frames);
+		out.push_str(", ");
+		out.push_str("voice=");
+		if self.voice {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("route=");
+		if self.route {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::text(out, "device");
+		match &self.device {
+			Some(v68) => {
+				crate::codec::cbor::uint(out, *v68 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "named");
+		match &self.named {
+			Some(v69) => {
+				crate::codec::cbor::uint(out, *v69 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "format");
+		self.format.to_cbor_into(out);
+		crate::codec::cbor::text(out, "latency-us");
+		crate::codec::cbor::uint(out, self.latency_us as u64);
+		crate::codec::cbor::text(out, "silent-frames");
+		crate::codec::cbor::uint(out, self.silent_frames as u64);
+		crate::codec::cbor::text(out, "voice");
+		crate::codec::cbor::boolean(out, self.voice);
+		crate::codec::cbor::text(out, "route");
+		crate::codec::cbor::boolean(out, self.route);
+	}
+}
+
+impl AudioCounters {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"moves\":");
+		let _ = write!(out, "{}", self.moves);
+		out.push(',');
+		out.push_str("\"silent-frames\":");
+		let _ = write!(out, "{}", self.silent_frames);
+		out.push(',');
+		out.push_str("\"route-overflows\":");
+		let _ = write!(out, "{}", self.route_overflows);
+		out.push(',');
+		out.push_str("\"route-underruns\":");
+		let _ = write!(out, "{}", self.route_underruns);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("moves=");
+		let _ = write!(out, "{}", self.moves);
+		out.push_str(", ");
+		out.push_str("silent-frames=");
+		let _ = write!(out, "{}", self.silent_frames);
+		out.push_str(", ");
+		out.push_str("route-overflows=");
+		let _ = write!(out, "{}", self.route_overflows);
+		out.push_str(", ");
+		out.push_str("route-underruns=");
+		let _ = write!(out, "{}", self.route_underruns);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "moves");
+		crate::codec::cbor::uint(out, self.moves as u64);
+		crate::codec::cbor::text(out, "silent-frames");
+		crate::codec::cbor::uint(out, self.silent_frames as u64);
+		crate::codec::cbor::text(out, "route-overflows");
+		crate::codec::cbor::uint(out, self.route_overflows as u64);
+		crate::codec::cbor::text(out, "route-underruns");
+		crate::codec::cbor::uint(out, self.route_underruns as u64);
+	}
+}
+
 impl AudioResources {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1598,6 +4395,93 @@ impl AudioResources {
 		crate::codec::cbor::uint(out, self.feedback_q16 as u64);
 		crate::codec::cbor::text(out, "feedback-ignored");
 		crate::codec::cbor::uint(out, self.feedback_ignored as u64);
+	}
+}
+
+impl CallState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			CallState::None => out.push_str("\"none\""),
+			CallState::Incoming => out.push_str("\"incoming\""),
+			CallState::Outgoing => out.push_str("\"outgoing\""),
+			CallState::Active => out.push_str("\"active\""),
+			CallState::Held => out.push_str("\"held\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			CallState::None => out.push_str("none"),
+			CallState::Incoming => out.push_str("incoming"),
+			CallState::Outgoing => out.push_str("outgoing"),
+			CallState::Active => out.push_str("active"),
+			CallState::Held => out.push_str("held"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			CallState::None => crate::codec::cbor::text(out, "none"),
+			CallState::Incoming => crate::codec::cbor::text(out, "incoming"),
+			CallState::Outgoing => crate::codec::cbor::text(out, "outgoing"),
+			CallState::Active => crate::codec::cbor::text(out, "active"),
+			CallState::Held => crate::codec::cbor::text(out, "held"),
+		}
+	}
+}
+
+impl CallCommand {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			CallCommand::Answer => out.push_str("\"answer\""),
+			CallCommand::HangUp => out.push_str("\"hang-up\""),
+			CallCommand::Reject => out.push_str("\"reject\""),
+			CallCommand::Redial => out.push_str("\"redial\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			CallCommand::Answer => out.push_str("answer"),
+			CallCommand::HangUp => out.push_str("hang-up"),
+			CallCommand::Reject => out.push_str("reject"),
+			CallCommand::Redial => out.push_str("redial"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			CallCommand::Answer => crate::codec::cbor::text(out, "answer"),
+			CallCommand::HangUp => crate::codec::cbor::text(out, "hang-up"),
+			CallCommand::Reject => crate::codec::cbor::text(out, "reject"),
+			CallCommand::Redial => crate::codec::cbor::text(out, "redial"),
+		}
 	}
 }
 

@@ -612,6 +612,15 @@ pub unsafe fn end_play(hc: &mut Xhci, devices: &mut Devices) {
 	}
 }
 
+/// WHAT THIS PROVIDER IS, for `CMD_FORMAT`: the wire's fixed 48 kHz stereo in the directions the function has, and its
+/// latency - the playback queue it holds before the device takes a period.
+pub fn format(devices: &mut Devices) -> audio::DeviceFormat {
+	let output = devices.sink().is_some();
+	let input = devices.has_source();
+	let latency_us = (PLAYBACK_QUEUE as u64 / 4 * 1_000_000 / u64::from(audio::RATE_HZ)) as u32;
+	audio::DeviceFormat { output: if output { audio::DeviceFormat::LEGACY.output } else { None }, input: if input { audio::DeviceFormat::LEGACY.input } else { None }, latency_us, ..audio::DeviceFormat::LEGACY }
+}
+
 /// The sink's counters, for `CMD_STATS` - `None` with no sink here.
 pub fn stats(devices: &mut Devices) -> Option<audio::PlaybackStats> {
 	let (_, sink) = devices.sink()?;

@@ -112,6 +112,11 @@ pub fn describe() -> Vec<Described> {
 		if walked.is_err() {
 			crate::serial_println!("device: the {table} table ends in a structure that cannot be read - the units before it are published");
 		}
+		// AND THE NAMESPACE DEVICES A DMAR PUTS BEHIND ITS UNITS: their requester ids, attached to their rows when the
+		// ACPI service publishes them.
+		if signature == b"DMAR" && acpi::dmar_namespace_streams(bytes, |stream| crate::firmware::note_namespace_stream(stream.name(), stream.source_id)).is_err() {
+			crate::serial_println!("device: the DMAR's namespace-device scopes end in a structure that cannot be read");
+		}
 		for (index, unit) in units.iter().enumerate() {
 			let mut name = [0u8; abi::PLATFORM_NAME_LEN];
 			// ALLOC-OK: boot, one name per unit the table lists, before userspace exists.

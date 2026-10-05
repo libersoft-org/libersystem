@@ -71,7 +71,7 @@ const RXQ: u16 = 3;
 // constants and a comment here, which is how the SECOND server of this provider kind came to speak
 // a different protocol: a one-byte message meant "hand me a captured period" to this driver and
 // "play this one byte" to `hda`.
-use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP, PERIOD_BYTES};
+use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP, CMD_FORMAT, DeviceFormat, PERIOD_BYTES};
 // The device-side ring holds several periods, so playback does not underrun while
 // we synthesize and submit the next one.
 const BUFFER_BYTES: u32 = PERIOD_BYTES * 8;
@@ -386,6 +386,12 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, ctl: &Ctl, tx: &mut Tx, rx:
 						serve_command(ctl, rx, irq, capture, service, command, &mut capturing);
 						continue;
 					}
+					// ANY OTHER LENGTH THAT IS NOT A PERIOD - a level, which this device has none of - is refused and not
+					// played: part of a period played as whole is a click.
+					if len != PERIOD_BYTES as usize {
+						send_blocking(service, &[], 0);
+						continue;
+					}
 					// first period of a session: configure and start the stream.
 					if !started {
 						started = ctl.set_params(stream) && ctl.stream_cmd(R_PCM_PREPARE, stream) && ctl.stream_cmd(R_PCM_START, stream);
@@ -421,6 +427,13 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, ctl: &Ctl, tx: &mut Tx, rx:
 // without a second message shape for errors.
 unsafe fn serve_command(ctl: &Ctl, rx: &mut Rx, irq: u64, capture: Option<u32>, service: u64, command: u8, capturing: &mut bool) {
 	unsafe {
+		// WHAT THIS PROVIDER IS: the fixed 48 kHz stereo - input only where the device has an input stream - in periods
+		// of `PERIOD_BYTES`, two periods of latency, and no level of its own.
+		if command == CMD_FORMAT {
+			let format = DeviceFormat { input: if capture.is_some() { DeviceFormat::LEGACY.input } else { None }, ..DeviceFormat::LEGACY };
+			send_blocking(service, &format.encode(), 0);
+			return;
+		}
 		let Some(stream) = capture else {
 			// No input stream on this device. Answer every capture command the same way, including
 			// the stop, so a client that gives up does not block on a reply that never comes.

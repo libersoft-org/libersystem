@@ -985,7 +985,9 @@ def listen(path):
 def serve(args):
     devices = DEVICES
     register = RegisterDevice(0x50, control=lambda text: command(text, register, gpio_model, devices, hid))
-    gpio_model = GpioModel(["hid-touchpad", "hid-touchscreen", "acpi-aei", "spare-3", "spare-4", "tcpc-alert", "spare-6", "spare-7"])
+    # LINE 8 IS THE BRIGHTNESS GATE'S: `acpi-fixture.py --brightness` puts its `_E08` there, so the panel's and the light
+    # sensor's notifications have a line no other gate's table uses.
+    gpio_model = GpioModel(["hid-touchpad", "hid-touchscreen", "acpi-aei", "spare-3", "spare-4", "tcpc-alert", "spare-6", "spare-7", "acpi-brightness"])
 
     def set_line(line, level):
         space = devices["gpio"].space if "gpio" in devices else None

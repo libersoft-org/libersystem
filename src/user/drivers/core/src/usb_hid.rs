@@ -554,7 +554,15 @@ unsafe fn feed_hid_report(h: &mut Hid, pads: &mut Pads, report: &[u8]) {
 				let _ = send_blocking(key_sink, &event, 0);
 			}
 		}
-		let code: u16 = usage_keycode(usage);
+		// A SYSTEM KEY - the consumer page's brightness pair - goes on the raw sink as its own five-byte frame, and never on
+		// the trusted keyboard's sink, which carries the keyboard page alone.
+		if page == 0x0c
+			&& key_sink != 0
+			&& let Some(frame) = keys::system_key_frame(raw, down)
+		{
+			let _ = send_blocking(key_sink, &frame, 0);
+		}
+		let code: u16 = keys::usage_keycode(usage);
 		if code != 0 {
 			keys::feed_key(code, down as u32, mods);
 		}
@@ -638,17 +646,4 @@ pub fn depart(pads: &mut Pads, interfaces: &[Hid]) {
 		}
 	}
 	pads.flush();
-}
-
-// Resolve a page-extended HID usage to its keycode: the keyboard page through
-// the boot-usage table (its modifier range through the modifier map), the
-// Consumer page through the multimedia map. 0 = unmapped.
-fn usage_keycode(usage: u32) -> u16 {
-	let (page, u): (u16, u32) = ((usage >> 16) as u16, usage & 0xffff);
-	match page {
-		0x07 if (0xe0..=0xe7).contains(&u) => keys::HID_MODIFIER_KEYCODES[(u - 0xe0) as usize],
-		0x07 if u <= 0xff => keys::hid_keycode(u as u8),
-		0x0c => keys::consumer_keycode(u as u16),
-		_ => 0,
-	}
 }

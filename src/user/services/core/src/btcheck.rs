@@ -222,7 +222,7 @@ fn forget(operator: u64, input_client: u64) {
 // THE FIGURES THE SUPERVISOR STATES, which this probe checks the kernel's counters against rather than
 // against themselves: (memory, handles, threads, ipc queue, stack, dma).
 const MB: u64 = 1024 * 1024;
-const SERVICE_LIMITS: [u64; 6] = [64 * MB, 256, 4, 2 * MB, 2 * MB, 0];
+const SERVICE_LIMITS: [u64; 6] = [64 * MB, 256, 4, 4 * MB, 2 * MB, 0];
 const STORE_LIMITS: [u64; 6] = [16 * MB, 64, 2, 256 * 1024, MB, 0];
 
 // One service's six (used, limit) pairs as ProcessService reports them, in the order above.

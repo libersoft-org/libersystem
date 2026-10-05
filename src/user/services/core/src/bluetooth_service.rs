@@ -1,45 +1,67 @@
-// BluetoothService - the host stack above HCI, for the boot mouse slice and nothing more.
+// BluetoothService - the host stack above HCI, for both radios.
 //
 // WHAT RUNS HERE AND WHAT DOES NOT. This program parses a stranger's radio packets, so it is built to
 // hold as little as possible while it does: no device claim, no MMIO, no DMA and no link key at rest.
 // The controller is reached over a `bluetooth-hci` provider from the catalogue, the keys over a
-// private capability to the bond store, and the pointer it eventually produces leaves over a typed
-// report channel to InputService. Its Domain is sized by the supervisor and holds zero DMA.
+// private capability to the bond store, and what it produces leaves over typed channels to the
+// services that own it. Its Domain is sized by the supervisor and holds zero DMA.
 //
-// EVERY PROTOCOL DECISION IS IN `service_logic`, held by host tests - the HCI codec and credits,
-// L2CAP reassembly, the ATT walks, the SMP initiator and its derivations against the specification's
-// own sample data, the GATT discovery and the boot report. What is here is the IO around them: which
+// EVERY PROTOCOL DECISION IS IN `service_logic`, held by host tests - the HCI codecs for both radios
+// and the credits, L2CAP reassembly and BR/EDR signalling, enhanced retransmission, RFCOMM, SDP, the
+// ATT walks, the SMP initiator and the key functions against the specification's own sample data,
+// the pairing rules and levels, and the inbound policy. What is here is the IO around them: which
 // packet goes where, what waits on what, and what a client is told.
 //
-// THE SLICE IS DELIBERATELY NARROW. One LE central link per controller, public and static-random
-// peers, Just Works with LE Secure Connections and no downgrade, a boot mouse over HOGP. Anything
-// else a peer offers is a typed "unsupported" rather than an attempt.
+// THE BOUNDS ARE `service_logic::bt_bounds`: two controllers, at most eight links on each across both
+// radios and seven of them BR/EDR, sixteen L2CAP channels and eight RFCOMM channels a link, and a
+// queue of 32 ACL packets a link. The BR/EDR half - inquiry, paging, Secure Simple Pairing's host
+// answers, link keys, L2CAP, SDP and RFCOMM - is `classic`; the prompts both radios' pairings raise
+// are there too, since every one so far is a BR/EDR one.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{BondRecord, BondedPeer, ControllerInfo, EnabledPeer, Error, HciAttachment, HciControlKind, HciPacket, HciPacketKind, MouseReport, PairingProgress, PairingState, PeerAddress, PeerKind, ProviderInfo, ProviderKind, ScanHandle, ScanResult, SecurityLevel, bluetooth, bluetooth_bond_store, bluetooth_operator, bluetooth_profile, hci_transport, provider_catalogue};
+use proto::system::{BondLevel, BondRecord, BondedPeer, ControllerInfo, DeviceStatus, EnabledPeer, Error, HciAttachment, HciControlKind, HciPacket, HciPacketKind, InputReport, KeyAgreement, MouseReport, PairingProgress, PairingState, PeerAddress, PeerKind, Profile, PromptReply, ProviderInfo, ProviderKind, Radio, ScanHandle, ScanResult, SecurityLevel, ServiceClass, bluetooth, bluetooth_bond_store, bluetooth_operator, bluetooth_profile, hci_transport, provider_catalogue};
 use rt::*;
-use service_logic::gatt_mouse::{Discovery, Next};
+use service_logic::bt_bounds;
+use service_logic::bt_pairing::{Agreement, Level};
+use service_logic::gatt_mouse;
+use service_logic::gatt_server;
 use service_logic::hci::{Credits, Kind, Limits, Session};
 use service_logic::hci_codec::{self, Event, opcode};
+use service_logic::hogp_map;
 use service_logic::l2cap::{Fed, Reassembly};
-use service_logic::smp_pairing::{Initiator, Step};
+use service_logic::smp_pairing::Initiator;
 use wire::Transport;
 
 include!(concat!(env!("OUT_DIR"), "/roles_bluetooth_service.rs"));
 
+#[path = "bluetooth_service/a2dp.rs"]
+mod a2dp;
+#[path = "bluetooth_service/audio.rs"]
+mod audio;
+#[path = "bluetooth_service/classic.rs"]
+mod classic;
+#[path = "bluetooth_service/gatt.rs"]
+mod gatt;
+#[path = "bluetooth_service/input.rs"]
+mod input;
+#[path = "bluetooth_service/le.rs"]
+mod le;
+
 // ------------------------------------------------------------------ the bounds the milestone states
 
-// Two controllers, one link each.
-const MAX_CONTROLLERS: usize = 2;
+const MAX_CONTROLLERS: usize = bt_bounds::CONTROLLERS;
 // Client connections across all three interfaces.
-const MAX_CLIENTS: usize = 16;
-// Commands and data queued for one controller before a send is refused.
+const MAX_CLIENTS: usize = bt_bounds::CLIENT_CONNECTIONS;
+// Commands queued for one controller before a send is refused.
 const MAX_QUEUED: usize = 16;
 // Open report streams per link.
 const MAX_STREAMS: usize = 4;
@@ -52,7 +74,7 @@ const PAIRING_TICKS: u64 = 60 * TICKS_PER_SECOND;
 const TICKS_PER_SECOND: u64 = 100;
 // The version of the HCI transport this host speaks.
 const HCI_VERSION: u32 = 1;
-// The two fixed L2CAP channels this slice uses.
+// The two fixed LE L2CAP channels the LE half uses.
 const ATT_CID: u16 = 0x0004;
 const SMP_CID: u16 = 0x0006;
 // Why a link is disconnected: remote user terminated, and authentication failure.
@@ -67,6 +89,15 @@ const BOND_FRAME: usize = 1024;
 // is enough; the reply is still checked against it.
 const CORR: u32 = 1;
 
+// The kind byte this service keys a peer by, ahead of its address: the two LE kinds as LE commands carry them,
+// and a BR/EDR device address.
+const KIND_PUBLIC: u8 = 0;
+const KIND_RANDOM: u8 = 1;
+const KIND_BREDR: u8 = 3;
+
+// A peer: its kind byte and its address, most significant first - the form every derivation takes.
+type Peer = [u8; 7];
+
 // --------------------------------------------------------------------------------- the state
 
 // Which interface a client connection speaks. The ROOT a connection was minted from decides this,
@@ -76,6 +107,8 @@ enum Interface {
 	Read,
 	Operator,
 	Profile,
+	Admin,
+	Audio,
 }
 
 struct Client {
@@ -83,52 +116,98 @@ struct Client {
 	interface: Interface,
 }
 
-// A scan and what it has found, deduplicated by address.
+// A scan and what it has found on both radios, deduplicated by address. Inquiry's page scan repetition mode
+// and clock offset are kept beside a classic result, so paging what a scan found is fast.
 struct Scan {
 	id: u32,
 	deadline: u64,
 	running: bool,
+	inquiring: bool,
 	results: Vec<ScanResult>,
+	paging: Vec<(Peer, u8, u16)>,
+}
+
+impl Scan {
+	fn active(&self) -> bool {
+		self.running || self.inquiring
+	}
 }
 
 // A pairing attempt's progress, for the operator's `progress`.
 struct Attempt {
-	peer: [u8; 7],
+	peer: Peer,
 	deadline: u64,
 	state: PairingState,
 	security: SecurityLevel,
 }
 
-// One link to one peer.
-struct Link {
-	handle: u16,
-	// The peer's type byte and address, most significant first - the form every derivation takes.
-	peer: [u8; 7],
-	reassembly: Reassembly,
-	pairing: Option<Initiator>,
-	discovery: Option<Discovery>,
-	encrypted: bool,
-	security: SecurityLevel,
-	report: Option<u16>,
-	// Buttons last reported, so a loss can release what the peer was holding.
-	buttons: u8,
-	streams: Vec<u64>,
-	// The key this link was encrypted with when it came from the bond store rather than a pairing,
-	// so a failure to encrypt can be told apart from a pairing failure.
-	reconnecting: bool,
+// The HOGP walk under way: the report map's first, and the boot mouse's for a device that has none.
+enum Walk {
+	Map(hogp_map::Discovery),
+	Boot(gatt_mouse::Discovery),
 }
 
-// The initialisation sequence, one command at a time.
+// One link to one peer, on either radio.
+struct Link {
+	handle: u16,
+	peer: Peer,
+	// This host's own address on the link, as SMP's derivations take it: its private address on LE.
+	local: Peer,
+	// The GATT server a peer acting as a client reads: GAP and GATT, made on its first request.
+	server: Option<gatt_server::Server>,
+	// The ATT client applications' grants use: the peer's services, and the operations queued.
+	gatt: gatt::Client,
+	reassembly: Reassembly,
+	encrypted: bool,
+	security: SecurityLevel,
+	// ACL packets made and waiting for a controller buffer: at most `QUEUED_ACL_PER_LINK`.
+	outbox: VecDeque<Vec<u8>>,
+	// LE: the pairing, and the HOGP walk - the report map's, or the boot mouse's where the device has no map.
+	pairing: Option<Initiator>,
+	walk: Option<Walk>,
+	// The boot mouse report's handle, when that is what the walk found.
+	report: Option<u16>,
+	// The report map's input reports, when that is what it found.
+	map: Option<hogp_map::Map>,
+	// BOTH RADIOS: the decoder an input device's reports go through, and the input streams they go to.
+	decoder: Option<input::Decoder>,
+	// Buttons last reported by a boot mouse, so a loss can release what the peer was holding.
+	buttons: u8,
+	streams: Vec<u64>,
+	// The key this link was encrypted with came from the bond store rather than a pairing, so a failure to
+	// encrypt can be told apart from a pairing failure.
+	reconnecting: bool,
+	// BR/EDR: everything above ACL.
+	classic: Option<Box<classic::ClassicLink>>,
+}
+
+impl Link {
+	fn new(handle: u16, peer: Peer) -> Link {
+		Link { handle, peer, local: [0; 7], server: None, gatt: gatt::Client::default(), reassembly: Reassembly::new(), encrypted: false, security: SecurityLevel::None, outbox: VecDeque::new(), pairing: None, walk: None, report: None, map: None, decoder: None, buttons: 0, streams: Vec::new(), reconnecting: false, classic: None }
+	}
+
+	fn is_classic(&self) -> bool {
+		self.peer[0] == KIND_BREDR
+	}
+}
+
+// Where initialisation is: running its steps, waiting for the P-256 key, or done.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Init {
-	Reset,
-	ReadAddress,
-	ReadCommands,
-	ReadBuffer,
-	EventMask,
-	LeEventMask,
+	Running,
 	PublicKey,
 	Ready,
+}
+
+// One initialisation command. A TOLERANT one may be refused - a controller without BR/EDR, or without
+// Secure Connections on it, answers some with "unknown command" - and initialisation goes on; any other
+// refusal leaves the controller unused. A CLASSIC one is dropped when the controller turns out to have no
+// BR/EDR radio.
+struct InitStep {
+	op: u16,
+	params: Vec<u8>,
+	tolerant: bool,
+	classic: bool,
 }
 
 struct Controller {
@@ -137,48 +216,79 @@ struct Controller {
 	packets: u64,
 	control: u64,
 	limits: Limits,
+	// Command credits and LE data buffers; and the BR/EDR data buffers, which a controller counts apart.
 	credits: Credits,
+	bredr: Credits,
+	le_bytes: u32,
+	bredr_bytes: u32,
+	// A controller that reports no LE buffers of its own shares the BR/EDR ones with LE.
+	le_shares: bool,
 	session: Session,
 	address: [u8; 6],
 	powered: bool,
 	secure_connections: bool,
+	// Whether it has a BR/EDR radio, and whether that radio took Secure Connections host support.
+	classic: bool,
+	classic_sc: bool,
 	init: Init,
+	steps: VecDeque<InitStep>,
+	waiting_step: Option<(u16, bool)>,
 	pending: Vec<(u16, Vec<u8>)>,
 	outstanding: Option<u16>,
 	public_key: Option<[u8; 64]>,
 	scan: Option<Scan>,
 	attempt: Option<Attempt>,
-	link: Option<Link>,
-	// A bonded, enabled peer this controller should connect to without pairing.
-	reconnect: Option<[u8; 7]>,
+	links: Vec<Link>,
+	// A bonded, enabled LE peer this controller is connecting to without pairing.
+	reconnect: Option<Peer>,
+	// The BR/EDR side: what it pages, its inbound policy and its prompts.
+	bredr_state: classic::ControllerState,
+	// The LE side: this host's privacy, and the bonded peripherals' reconnection.
+	le: le::LeState,
 }
 
 struct Stack {
 	controllers: Vec<Controller>,
 	bonds: u64,
 	next_scan: u32,
+	// Applications' GATT grants, each for one launch.
+	grants: Vec<gatt::Grant>,
+	// AudioService's endpoints, and the call it relays.
+	audio: audio::AudioRoot,
 }
 
 // ------------------------------------------------------------------ address forms
 
-fn peer_to_wire(peer: &[u8; 7]) -> PeerAddress {
-	PeerAddress { kind: if peer[0] == 0 { PeerKind::Public } else { PeerKind::RandomStatic }, bytes: peer[1..].to_vec() }
+fn peer_to_wire(peer: &Peer) -> PeerAddress {
+	let kind = match peer[0] {
+		KIND_PUBLIC => PeerKind::Public,
+		KIND_BREDR => PeerKind::Bredr,
+		// THE TOP TWO BITS of a random address say which kind it is: `11` static, `01` resolvable.
+		_ if peer[1] >> 6 == 0b01 => PeerKind::Resolvable,
+		_ => PeerKind::RandomStatic,
+	};
+	PeerAddress { kind, bytes: peer[1..].to_vec() }
 }
 
-fn peer_from_wire(address: &PeerAddress) -> Option<[u8; 7]> {
+fn peer_from_wire(address: &PeerAddress) -> Option<Peer> {
 	if address.bytes.len() != 6 {
 		return None;
 	}
 	let mut out = [0u8; 7];
 	out[0] = match address.kind {
-		PeerKind::Public => 0,
-		PeerKind::RandomStatic => 1,
+		PeerKind::Public => KIND_PUBLIC,
+		PeerKind::RandomStatic | PeerKind::Resolvable => KIND_RANDOM,
+		PeerKind::Bredr => KIND_BREDR,
 	};
 	out[1..].copy_from_slice(&address.bytes);
 	Some(out)
 }
 
-fn local_address(controller: &Controller) -> [u8; 7] {
+fn radio_of(peer: &Peer) -> Radio {
+	if peer[0] == KIND_BREDR { Radio::Classic } else { Radio::Le }
+}
+
+fn local_address(controller: &Controller) -> Peer {
 	let mut out = [0u8; 7];
 	out[1..].copy_from_slice(&controller.address);
 	out
@@ -188,6 +298,47 @@ fn local_wire(controller: &Controller) -> PeerAddress {
 	peer_to_wire(&local_address(controller))
 }
 
+// The level's two axes, in the logic's terms and the wire's.
+fn level_to_wire(level: &Level) -> BondLevel {
+	let agreement = match level.agreement {
+		Agreement::Legacy => KeyAgreement::Legacy,
+		Agreement::LeLegacy => KeyAgreement::LeLegacy,
+		Agreement::P192 => KeyAgreement::P192,
+		Agreement::SecureConnections => KeyAgreement::SecureConnections,
+	};
+	BondLevel { agreement, authenticated: level.authenticated }
+}
+
+fn level_from_wire(level: &BondLevel) -> Level {
+	let agreement = match level.agreement {
+		KeyAgreement::Legacy => Agreement::Legacy,
+		KeyAgreement::LeLegacy => Agreement::LeLegacy,
+		KeyAgreement::P192 => Agreement::P192,
+		KeyAgreement::SecureConnections => Agreement::SecureConnections,
+	};
+	Level { agreement, authenticated: level.authenticated }
+}
+
+fn security_of(level: &Level) -> SecurityLevel {
+	if level.authenticated { SecurityLevel::EncryptedAuthenticated } else { SecurityLevel::EncryptedUnauthenticated }
+}
+
+fn profile_to_logic(profile: Profile) -> service_logic::bt_policy::Profile {
+	use service_logic::bt_policy::Profile as P;
+	match profile {
+		Profile::Input => P::Input,
+		Profile::Audio => P::Audio,
+		Profile::Voice => P::Voice,
+		Profile::Pan => P::Pan,
+		Profile::Spp => P::Spp,
+		Profile::Gatt => P::Gatt,
+	}
+}
+
+fn trust_of(trusted: &[Profile]) -> service_logic::bt_policy::Trust {
+	trusted.iter().fold(service_logic::bt_policy::Trust::default(), |trust, profile| trust.with(profile_to_logic(*profile), true))
+}
+
 // Zero a buffer that held key material, with writes the compiler may not drop as dead because the buffer
 // is about to be freed.
 fn scrub(bytes: &mut [u8]) {
@@ -195,6 +346,13 @@ fn scrub(bytes: &mut [u8]) {
 		// SAFETY: a valid, aligned byte of this slice.
 		unsafe { core::ptr::write_volatile(byte, 0) };
 	}
+}
+
+// Zero both keys a record may carry.
+fn scrub_record(record: &mut BondRecord) {
+	scrub(&mut record.key);
+	scrub(&mut record.link_key);
+	scrub(&mut record.irk);
 }
 
 // A request encoded here, sent and answered over one channel. The reply comes back in a vector this service
@@ -220,23 +378,31 @@ fn answered<T>(reply: &[u8], read: impl FnOnce(&mut wire::Reader) -> Option<T>) 
 	Some(value)
 }
 
-// `hci-transport.send` of one command, FROM A FRAME THIS SERVICE OWNS AND ZEROES. An encryption's parameters
-// carry the LTK, and the generated client would copy the command into a vector of its own and free that - and
-// every smaller one it outgrew - with the key still in it. The reply carries a count and nothing secret.
-fn send_command(chan: u64, command: &[u8]) -> bool {
-	let mut frame = [0u8; COMMAND_FRAME];
+// `hci-transport.send` of one packet, FROM A FRAME THIS SERVICE OWNS AND ZEROES. An encryption's parameters
+// carry the LTK, a link key reply carries the link key, and the generated client would copy the packet into
+// a vector of its own and free that - and every smaller one it outgrew - with the key still in it. The reply
+// carries a count and nothing secret.
+fn send_packet(chan: u64, kind: HciPacketKind, packet: &[u8]) -> bool {
+	let mut frame = alloc::vec![0u8; packet.len() + 16];
 	let len = (|| {
-		let length = u16::try_from(command.len()).ok()?;
+		let length = u16::try_from(packet.len()).ok()?;
 		frame[..2].copy_from_slice(&hci_transport::OP_SEND.to_le_bytes());
 		frame[2..6].copy_from_slice(&CORR.to_le_bytes());
-		let at = 6 + HciPacketKind::Command.encode(&mut frame[6..])?;
+		let at = 6 + kind.encode(&mut frame[6..])?;
 		frame.get_mut(at..at + 2)?.copy_from_slice(&length.to_le_bytes());
-		frame.get_mut(at + 2..at + 2 + command.len())?.copy_from_slice(command);
-		Some(at + 2 + command.len())
+		frame.get_mut(at + 2..at + 2 + packet.len())?.copy_from_slice(packet);
+		Some(at + 2 + packet.len())
 	})();
 	let reply = len.and_then(|len| exchange(chan, &frame[..len]));
 	scrub(&mut frame);
 	reply.and_then(|reply| answered(&reply, |reader| reader.u32())).is_some_and(|result| result.is_ok())
+}
+
+fn send_command(chan: u64, command: &[u8]) -> bool {
+	if command.len() + 16 > COMMAND_FRAME {
+		return false;
+	}
+	send_packet(chan, HciPacketKind::Command, command)
 }
 
 // ------------------------------------------------------------------ the controller
@@ -267,8 +433,19 @@ impl Controller {
 		scrub(&mut params);
 	}
 
-	// Drop every queued command. One of them may be an encryption carrying a key, so each is zeroed
-	// first rather than freed as it is.
+	// `LE Enable Encryption` with an LE legacy key and the EDIV and Rand that name it.
+	fn encrypt_legacy(&mut self, handle: u16, ltk: &[u8; 16], rand: &[u8; 8], ediv: u16) {
+		let mut params = hci_codec::enable_encryption_legacy(handle, ltk, rand, ediv);
+		self.command(opcode::LE_ENABLE_ENCRYPTION, &params);
+		scrub(&mut params);
+	}
+
+	fn disconnect(&mut self, handle: u16, reason: u8) {
+		self.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, reason));
+	}
+
+	// Drop every queued command. One of them may carry a key, so each is zeroed first rather than freed as
+	// it is.
 	fn clear_pending(&mut self) {
 		for (_, params) in self.pending.iter_mut() {
 			scrub(params);
@@ -278,8 +455,9 @@ impl Controller {
 
 	// Send the next command if the controller will take one. AT MOST ONE IS OUTSTANDING, and the
 	// credit comes back on the controller's own completion - never on the transport's acceptance,
-	// which is the defect `hci::Credits` exists to rule out.
+	// which is the defect `hci::Credits` exists to rule out. Then whatever link data the buffers allow.
 	fn pump(&mut self) {
+		self.flush_links();
 		if self.outstanding.is_some() || self.pending.is_empty() {
 			return;
 		}
@@ -294,8 +472,8 @@ impl Controller {
 			return;
 		};
 		let sent = send_command(self.transport, &bytes);
-		// The command has gone, or failed to; either way neither copy is read again, and an encryption's
-		// carries the LTK.
+		// The command has gone, or failed to; either way neither copy is read again, and a key-carrying one's
+		// parameters are zeroed here.
 		scrub(&mut params);
 		scrub(&mut bytes);
 		self.credits.drained();
@@ -310,93 +488,152 @@ impl Controller {
 		}
 	}
 
-	// Send L2CAP data on the link, as one ACL packet. The boot mouse slice never sends a PDU larger
-	// than one controller buffer, so there is no fragmentation on the way out.
-	fn l2cap(&mut self, cid: u16, payload: &[u8]) -> bool {
-		let Some(link) = self.link.as_ref() else { return false };
+	// The data buffers a link's packets take, and their size.
+	fn pool(&mut self, classic: bool) -> (&mut Credits, u32) {
+		if classic || self.le_shares { (&mut self.bredr, self.bredr_bytes) } else { (&mut self.credits, self.le_bytes) }
+	}
+
+	// L2CAP data on a link: one PDU, FRAGMENTED to the controller's buffer size and queued on the link, sent
+	// as buffers free. False when the link's queue cannot take the whole PDU - which drops it whole rather
+	// than sending a start whose continuations will never follow.
+	fn l2cap(&mut self, handle: u16, cid: u16, payload: &[u8]) -> bool {
 		let mut pdu = Vec::with_capacity(4 + payload.len());
 		pdu.extend_from_slice(&(payload.len() as u16).to_le_bytes());
 		pdu.extend_from_slice(&cid.to_le_bytes());
 		pdu.extend_from_slice(payload);
-		if pdu.len() as u32 > self.limits.ceiling(Kind::Acl).saturating_sub(4) {
+		self.l2cap_pdu(handle, pdu)
+	}
+
+	// A PDU whose basic header is already on it - an enhanced retransmission frame - queued the same way.
+	fn l2cap_pdu(&mut self, handle: u16, pdu: Vec<u8>) -> bool {
+		let Some(at) = self.links.iter().position(|link| link.handle == handle) else { return false };
+		let classic = self.links[at].is_classic();
+		let (_, size) = self.pool(classic);
+		let size = (size as usize).clamp(27, bt_bounds::ACL_PACKET - 4);
+		let fragments = pdu.len().div_ceil(size);
+		let link = &mut self.links[at];
+		if link.outbox.len() + fragments > bt_bounds::QUEUED_ACL_PER_LINK {
+			print(b"BluetoothService: a link's data queue is full; a packet is dropped\n");
 			return false;
 		}
-		if self.credits.take(Kind::Acl).is_err() {
-			print(b"BluetoothService: no controller buffer for link data; a packet is dropped\n");
-			return false;
+		for (index, chunk) in pdu.chunks(size).enumerate() {
+			// THE FIRST FRAGMENT IS A START (`00`, not automatically flushable) and every other a continuation.
+			link.outbox.push_back(hci_codec::acl(handle, if index == 0 { 0b00 } else { 0b01 }, chunk));
 		}
-		let packet = hci_codec::acl(link.handle, 0b00, &pdu);
-		let sent = hci_transport::Client::new(ChannelTransport { chan: self.transport }).send(&HciPacketKind::Acl, &packet);
-		self.credits.drained();
-		if !matches!(sent, Some(Ok(_))) {
-			self.credits.acl_completed(1);
-			return false;
-		}
+		self.flush_links();
 		true
 	}
 
-	// Begin (or begin again) the initialisation sequence.
+	// Send queued link data while the buffers last, a link at a time from the front of its queue.
+	fn flush_links(&mut self) {
+		for at in 0..self.links.len() {
+			loop {
+				if self.links[at].outbox.is_empty() {
+					break;
+				}
+				let classic = self.links[at].is_classic();
+				let transport = self.transport;
+				let (pool, _) = self.pool(classic);
+				if pool.take(Kind::Acl).is_err() {
+					break;
+				}
+				let packet = self.links[at].outbox.pop_front().unwrap_or_default();
+				let sent = send_packet(transport, HciPacketKind::Acl, &packet);
+				let (pool, _) = self.pool(classic);
+				pool.drained();
+				if !sent {
+					pool.acl_completed(1);
+					print(b"BluetoothService: the transport refused link data\n");
+					break;
+				}
+			}
+		}
+	}
+
+	fn link(&self, handle: u16) -> Option<&Link> {
+		self.links.iter().find(|link| link.handle == handle)
+	}
+
+	fn link_mut(&mut self, handle: u16) -> Option<&mut Link> {
+		self.links.iter_mut().find(|link| link.handle == handle)
+	}
+
+	fn link_to(&self, peer: &Peer) -> Option<&Link> {
+		self.links.iter().find(|link| &link.peer == peer)
+	}
+
+	fn link_to_mut(&mut self, peer: &Peer) -> Option<&mut Link> {
+		self.links.iter_mut().find(|link| &link.peer == peer)
+	}
+
+	fn le_links(&self) -> usize {
+		self.links.iter().filter(|link| !link.is_classic()).count()
+	}
+
+	// Begin (or begin again) the initialisation sequence. THE STEPS ARE A QUEUE, and the BR/EDR ones leave
+	// it when the controller says it has no BR/EDR radio.
 	fn start_init(&mut self) {
-		self.init = Init::Reset;
+		self.init = Init::Running;
 		self.powered = false;
 		self.public_key = None;
 		self.clear_pending();
 		self.outstanding = None;
 		self.credits.reset();
+		self.bredr.reset();
+		self.steps.clear();
+		let step = |op: u16, params: &[u8], tolerant: bool, classic: bool| InitStep { op, params: params.to_vec(), tolerant, classic };
+		let steps = [
+			step(opcode::READ_BD_ADDR, &[], false, false),
+			step(opcode::READ_LOCAL_SUPPORTED_COMMANDS, &[], false, false),
+			step(service_logic::hci_bredr::opcode::READ_LOCAL_SUPPORTED_FEATURES, &[], true, false),
+			step(service_logic::hci_bredr::opcode::READ_BUFFER_SIZE, &[], true, true),
+			step(opcode::LE_READ_BUFFER_SIZE, &[], false, false),
+			// The event mask is chosen when this step is sent, by whether the controller has BR/EDR.
+			step(opcode::SET_EVENT_MASK, &[], false, false),
+			// Connection complete, advertising report, and the two key-agreement completions.
+			step(opcode::LE_SET_EVENT_MASK, &0x0000_0000_0000_01ffu64.to_le_bytes(), false, false),
+		];
+		self.steps.extend(steps);
+		self.steps.extend(classic::init_steps());
+		self.waiting_step = Some((opcode::RESET, false));
 		self.command(opcode::RESET, &[]);
 	}
 
-	// The next step of initialisation, after the previous one completed.
+	// The next initialisation step, after the previous one completed.
 	fn advance_init(&mut self) {
-		self.init = match self.init {
-			Init::Reset => {
-				self.command(opcode::READ_BD_ADDR, &[]);
-				Init::ReadAddress
+		while let Some(mut step) = self.steps.pop_front() {
+			if step.classic && !self.classic {
+				continue;
 			}
-			Init::ReadAddress => {
-				self.command(opcode::READ_LOCAL_SUPPORTED_COMMANDS, &[]);
-				Init::ReadCommands
+			if step.op == opcode::SET_EVENT_MASK {
+				// EVERY EVENT A HOST OF BOTH RADIOS READS - the BR/EDR pairing events up to keypress
+				// notification - and LE meta; without BR/EDR the original mask.
+				let mask: u64 = if self.classic { 0x3fff_ffff_ffff_ffff } else { 0x2000_1fff_ffff_ffff };
+				step.params = mask.to_le_bytes().to_vec();
 			}
-			Init::ReadCommands => {
-				self.command(opcode::LE_READ_BUFFER_SIZE, &[]);
-				Init::ReadBuffer
-			}
-			Init::ReadBuffer => {
-				// The default mask and LE meta events, which is where everything this slice reads
-				// about a link arrives.
-				self.command(opcode::SET_EVENT_MASK, &0x2000_1fff_ffff_ffffu64.to_le_bytes());
-				Init::EventMask
-			}
-			Init::EventMask => {
-				// Connection complete, advertising report, and the two key-agreement completions.
-				self.command(opcode::LE_SET_EVENT_MASK, &0x0000_0000_0000_01ffu64.to_le_bytes());
-				Init::LeEventMask
-			}
-			Init::LeEventMask => {
-				// A CONTROLLER WITHOUT THE P-256 COMMANDS IS READY AND CANNOT PAIR, and it says so in
-				// `controllers` rather than failing halfway through a pairing later.
-				if self.secure_connections {
-					self.command(opcode::LE_READ_LOCAL_P256_PUBLIC_KEY, &[]);
-					Init::PublicKey
-				} else {
-					self.powered = true;
-					Init::Ready
-				}
-			}
-			Init::PublicKey => {
-				self.powered = true;
-				Init::Ready
-			}
-			Init::Ready => Init::Ready,
-		};
+			self.waiting_step = Some((step.op, step.tolerant));
+			self.command(step.op, &step.params);
+			return;
+		}
+		self.waiting_step = None;
+		// A CONTROLLER WITHOUT THE P-256 COMMANDS IS READY AND CANNOT PAIR ON LE, and it says so in
+		// `controllers` rather than failing halfway through a pairing later.
+		if self.secure_connections && self.init != Init::PublicKey {
+			self.init = Init::PublicKey;
+			self.command(opcode::LE_READ_LOCAL_P256_PUBLIC_KEY, &[]);
+			return;
+		}
+		self.powered = true;
+		self.init = Init::Ready;
 	}
 
 	// End whatever this controller's session held: links, scans, attempts and report streams. A
 	// reset or a fault does this, and so does powering the radio off. THE SESSION'S SCAN GOES WITH IT:
 	// its handle answers `not-found`, and nothing it found can be chosen for a pairing in the next one.
 	fn end_session(&mut self) {
-		if let Some(mut link) = self.link.take() {
+		for mut link in self.links.drain(..) {
 			release_streams(&mut link);
+			link.pairing = None;
 		}
 		self.scan = None;
 		if let Some(attempt) = self.attempt.as_mut()
@@ -404,22 +641,37 @@ impl Controller {
 		{
 			attempt.state = PairingState::Failed;
 		}
+		self.bredr_state.end_session();
+		self.le.end_session();
 		self.clear_pending();
 		self.outstanding = None;
 		self.credits.reset();
+		self.bredr.reset();
+	}
+
+	fn fail_attempt(&mut self, peer: &Peer) {
+		if let Some(attempt) = self.attempt.as_mut()
+			&& &attempt.peer == peer
+			&& matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)
+		{
+			attempt.state = PairingState::Failed;
+		}
 	}
 }
 
-// A lost link releases what its peer was holding and ends every report stream. A final report with
-// no buttons comes first, so a consumer that stops hearing from this peer is not left with a button
-// held down for ever.
+// A lost link releases what its peer was holding and ends every input stream. What is held goes up
+// first - every key, every button, every gamepad - so a consumer that stops hearing from this peer is
+// not left with anything held down for ever.
 fn release_streams(link: &mut Link) {
+	let mut releases = link.decoder.as_mut().map(input::Decoder::releases).unwrap_or_default();
 	if link.buttons != 0 {
-		let released = MouseReport { dx: 0, dy: 0, wheel: 0, buttons: 0 };
-		for &stream in &link.streams {
-			write_report(stream, &released);
-		}
+		releases.push(InputReport::Pointer(MouseReport { dx: 0, dy: 0, wheel: 0, buttons: 0 }));
 		link.buttons = 0;
+	}
+	for report in &releases {
+		for &stream in &link.streams {
+			write_input(stream, report);
+		}
 	}
 	for stream in link.streams.drain(..) {
 		close(stream);
@@ -429,11 +681,25 @@ fn release_streams(link: &mut Link) {
 // One report onto a stream. A stream whose consumer stopped draining is not waited for: the report
 // is dropped for that consumer, which is the one behaviour that keeps a slow reader from stopping
 // the radio.
-fn write_report(stream: u64, report: &MouseReport) -> bool {
-	let mut frame = [0u8; 64];
+fn write_input(stream: u64, report: &InputReport) -> bool {
+	let mut frame = [0u8; 256];
 	let mut handles = wire::Handles::new();
-	let Some(len) = bluetooth_profile::open_mouse_frame(0, report, &mut frame, &mut handles) else { return false };
+	let Some(len) = bluetooth_profile::open_input_frame(0, report, &mut frame, &mut handles) else { return false };
 	!matches!(try_send_outcome(stream, &frame[..len], 0), SendOutcome::Failed)
+}
+
+// Reports onto every stream a link has, dropping a stream whose consumer is gone.
+fn deliver(link: &mut Link, reports: &[InputReport]) {
+	if reports.is_empty() {
+		return;
+	}
+	link.streams.retain(|&stream| {
+		let kept = reports.iter().all(|report| write_input(stream, report));
+		if !kept {
+			close(stream);
+		}
+		kept
+	});
 }
 
 // ------------------------------------------------------------------ the bond store
@@ -443,11 +709,11 @@ impl Stack {
 		bluetooth_bond_store::Client::new(ChannelTransport { chan: self.bonds })
 	}
 
-	// The stored record for this controller and peer, KEY INCLUDED - so only the two callers that need the
-	// key ask for it, and each zeroes it once it has. THE REPLY CARRYING IT is read from a vector this service
-	// owns and zeroed once read; the generated client would free its own with the key in it. The request names
-	// two addresses and nothing secret.
-	fn bond(&self, at: usize, peer: &[u8; 7]) -> Option<BondRecord> {
+	// The stored record for this controller and peer, KEYS INCLUDED - so only the callers that need a key or
+	// rewrite the record ask for it, and each zeroes it once it has. THE REPLY CARRYING IT is read from a
+	// vector this service owns and zeroed once read; the generated client would free its own with the key in
+	// it. The request names two addresses and nothing secret.
+	fn bond(&self, at: usize, peer: &Peer) -> Option<BondRecord> {
 		if self.bonds == 0 {
 			return None;
 		}
@@ -460,9 +726,9 @@ impl Stack {
 		let answer = answered(&reply, BondRecord::read);
 		scrub(&mut reply);
 		match answer {
-			Some(Ok(record)) if record.key.len() == 16 => Some(record),
+			Some(Ok(record)) if record.key.len() == 16 || record.link_key.len() == 16 => Some(record),
 			Some(Ok(mut record)) => {
-				scrub(&mut record.key);
+				scrub_record(&mut record);
 				None
 			}
 			_ => None,
@@ -485,29 +751,39 @@ impl Stack {
 		reply.and_then(|reply| answered(&reply, |_| Some(()))).is_some_and(|result| result.is_ok())
 	}
 
-	// Whether this peer is bonded on this controller and an operator made it an input source - read from
-	// the store's listing, which carries no key.
-	fn enabled_peer(&self, at: usize, peer: &[u8; 7]) -> Option<bool> {
+	// Every bond on this controller, WITHOUT KEYS - the store's listing carries none - and without the record that names
+	// this host itself, which holds its identity resolving key and is no bond.
+	fn records(&self, at: usize) -> Vec<BondRecord> {
 		if self.bonds == 0 {
-			return None;
+			return Vec::new();
 		}
-		let wire = peer_to_wire(peer);
-		match self.bonds().list(&local_wire(&self.controllers[at])) {
-			Some(Ok(records)) => records.iter().find(|record| record.peer == wire).map(|record| record.enabled),
-			_ => None,
+		let local = local_wire(&self.controllers[at]);
+		match self.bonds().list(&local) {
+			Some(Ok(records)) => records.into_iter().filter(|record| record.peer != local).collect(),
+			_ => Vec::new(),
 		}
 	}
 
-	// The first bonded peer on this controller an operator has made an input source, which is the
-	// peer this controller connects to on its own after a start, a restart or a reset.
-	fn enabled_bond(&self, at: usize) -> Option<[u8; 7]> {
-		if self.bonds == 0 {
-			return None;
-		}
-		match self.bonds().list(&local_wire(&self.controllers[at])) {
-			Some(Ok(records)) => records.iter().find(|record| record.enabled).and_then(|record| peer_from_wire(&record.peer)),
-			_ => None,
-		}
+	// One peer's record without its keys.
+	fn record(&self, at: usize, peer: &Peer) -> Option<BondRecord> {
+		let wire = peer_to_wire(peer);
+		self.records(at).into_iter().find(|record| record.peer == wire)
+	}
+
+	// Rewrite one record through `change`, keys and all, durably. False when there is no such bond or the
+	// store could not commit.
+	fn rewrite_bond(&self, at: usize, peer: &Peer, change: impl FnOnce(&mut BondRecord)) -> Result<(), Error> {
+		let Some(mut record) = self.bond(at, peer) else { return Err(Error::NotFound) };
+		change(&mut record);
+		let stored = self.store_bond(&record);
+		scrub_record(&mut record);
+		if stored { Ok(()) } else { Err(Error::Io) }
+	}
+
+	// Whether this peer is bonded on this controller and an operator made it an input source - read from
+	// the store's listing, which carries no key.
+	fn enabled_peer(&self, at: usize, peer: &Peer) -> Option<bool> {
+		self.record(at, peer).map(|record| record.enabled)
 	}
 }
 
@@ -517,10 +793,15 @@ impl Stack {
 	fn on_event(&mut self, at: usize, bytes: &[u8]) {
 		let event = match hci_codec::event(bytes) {
 			Ok(event) => event,
-			// AN EVENT THIS HOST DOES NOT READ IS IGNORED, and a malformed one is too - but the second
-			// is said, because a controller sending events whose lengths disagree with their bytes is a
-			// controller whose every later event deserves suspicion.
-			Err(hci_codec::Refusal::Unhandled { .. }) => return,
+			// AN EVENT THE LE CODEC DOES NOT READ goes to the BR/EDR one, and one neither reads is ignored. A
+			// malformed one is said, because a controller sending events whose lengths disagree with their
+			// bytes is a controller whose every later event deserves suspicion.
+			Err(hci_codec::Refusal::Unhandled { .. }) => {
+				if let Some(event) = service_logic::hci_bredr::decode(bytes) {
+					self.on_classic_event(at, event);
+				}
+				return;
+			}
 			Err(_) => {
 				print(b"BluetoothService: a malformed event from the controller was refused\n");
 				return;
@@ -544,9 +825,9 @@ impl Stack {
 				}
 			}
 			Event::DhKey { status, key } => {
+				let Some(handle) = self.controllers[at].links.iter().find(|link| link.pairing.is_some()).map(|link| link.handle) else { return };
 				let steps = {
-					let Some(link) = self.controllers[at].link.as_mut() else { return };
-					let Some(pairing) = link.pairing.as_mut() else { return };
+					let Some(pairing) = self.controllers[at].link_mut(handle).and_then(|link| link.pairing.as_mut()) else { return };
 					if status == 0 && key.len() == 32 {
 						let mut wire = [0u8; 32];
 						wire.copy_from_slice(key);
@@ -557,17 +838,32 @@ impl Stack {
 						pairing.on_dhkey_failed()
 					}
 				};
-				self.run_smp(at, steps);
+				self.run_smp(at, handle, steps);
 			}
 			Event::Connected { status, handle, peer_kind, peer } => self.on_connected(at, status, handle, peer_kind, peer),
 			Event::Disconnected { handle, .. } => self.on_disconnected(at, handle),
-			Event::EncryptionChange { status, handle, enabled } => self.on_encryption(at, status, handle, enabled),
-			Event::CompletedPackets { count, rest, .. } => {
-				let controller = &mut self.controllers[at];
-				controller.credits.acl_completed(count as u32);
-				for entry in rest.chunks_exact(4) {
-					controller.credits.acl_completed(u16::from_le_bytes([entry[2], entry[3]]) as u32);
+			Event::EncryptionChange { status, handle, enabled } => {
+				if self.controllers[at].link(handle).is_some_and(Link::is_classic) {
+					self.classic_encryption(at, status, handle, enabled);
+				} else {
+					self.on_encryption(at, status, handle, enabled);
 				}
+			}
+			Event::CompletedPackets { handle, count, rest } => {
+				let controller = &mut self.controllers[at];
+				let mut entries = Vec::with_capacity(1 + rest.len() / 4);
+				entries.push((handle, count));
+				for entry in rest.chunks_exact(4) {
+					entries.push((u16::from_le_bytes([entry[0], entry[1]]) & 0x0fff, u16::from_le_bytes([entry[2], entry[3]])));
+				}
+				// EACH HANDLE'S COUNT GOES BACK TO ITS OWN RADIO'S BUFFERS; a handle no longer held returns to the
+				// pool its radio would use, which is LE's unless it shares.
+				for (handle, count) in entries {
+					let classic = controller.link(handle).is_some_and(Link::is_classic);
+					let (pool, _) = controller.pool(classic);
+					pool.acl_completed(count as u32);
+				}
+				controller.flush_links();
 			}
 			Event::Advertising { count, reports } => self.on_advertising(at, count, reports),
 		}
@@ -581,40 +877,51 @@ impl Stack {
 		}
 		let status = params.first().copied().unwrap_or(0xff);
 		if controller.init != Init::Ready {
-			if status != 0 {
+			let Some((waiting, tolerant)) = controller.waiting_step else { return };
+			if waiting != op {
+				return;
+			}
+			if status != 0 && !tolerant {
 				// NOT USED, AND NOT STUCK: left as a controller that is ready and off, so an operator's
 				// power-on runs initialisation again from the reset rather than answering for nothing.
 				print(b"BluetoothService: the controller refused an initialisation command; it is not used\n");
 				controller.powered = false;
 				controller.init = Init::Ready;
+				controller.waiting_step = None;
 				return;
 			}
-			match op {
-				opcode::READ_BD_ADDR if params.len() >= 7 => {
-					let mut wire = [0u8; 6];
-					wire.copy_from_slice(&params[1..7]);
-					controller.address = hci_codec::address_from_wire(&wire);
-				}
-				opcode::READ_LOCAL_SUPPORTED_COMMANDS => {
-					controller.secure_connections = params.get(1 + hci_codec::P256_OCTET).is_some_and(|octet| octet & hci_codec::P256_BITS == hci_codec::P256_BITS);
-				}
-				opcode::LE_READ_BUFFER_SIZE if params.len() >= 4 => {
-					// THE CONTROLLER'S OWN BUFFER COUNT, bounded by the transport's queue: a
-					// controller that reports zero shares its classic buffers, which this slice does
-					// not read, so the attachment's advertised count stands.
-					let buffers = params[3] as u32;
-					if buffers > 0 {
-						controller.credits = Credits::new(1, buffers, MAX_QUEUED as u32);
+			if status == 0 {
+				match op {
+					opcode::READ_BD_ADDR if params.len() >= 7 => {
+						let mut wire = [0u8; 6];
+						wire.copy_from_slice(&params[1..7]);
+						controller.address = hci_codec::address_from_wire(&wire);
 					}
+					opcode::READ_LOCAL_SUPPORTED_COMMANDS => {
+						controller.secure_connections = params.get(1 + hci_codec::P256_OCTET).is_some_and(|octet| octet & hci_codec::P256_BITS == hci_codec::P256_BITS);
+					}
+					opcode::LE_READ_BUFFER_SIZE if params.len() >= 4 => {
+						// THE CONTROLLER'S OWN BUFFER COUNT, bounded by the transport's queue: a controller that
+						// reports zero shares its BR/EDR buffers with LE.
+						let size = u16::from_le_bytes([params[1], params[2]]) as u32;
+						let buffers = params[3] as u32;
+						if buffers > 0 {
+							controller.credits = Credits::new(1, buffers, MAX_QUEUED as u32);
+							controller.le_bytes = size.max(27);
+						} else {
+							controller.le_shares = controller.classic;
+						}
+					}
+					_ => classic::on_init_complete(controller, op, params),
 				}
-				_ => {}
+			} else if op == service_logic::hci_bredr::opcode::READ_LOCAL_SUPPORTED_FEATURES {
+				controller.classic = false;
+			} else if op == service_logic::hci_bredr::opcode::WRITE_SECURE_CONNECTIONS_HOST_SUPPORT {
+				controller.classic_sc = false;
 			}
-			let expected = matches!((controller.init, op), (Init::Reset, opcode::RESET) | (Init::ReadAddress, opcode::READ_BD_ADDR) | (Init::ReadCommands, opcode::READ_LOCAL_SUPPORTED_COMMANDS) | (Init::ReadBuffer, opcode::LE_READ_BUFFER_SIZE) | (Init::EventMask, opcode::SET_EVENT_MASK) | (Init::LeEventMask, opcode::LE_SET_EVENT_MASK));
-			if expected {
-				controller.advance_init();
-				if controller.init == Init::Ready {
-					self.after_ready(at);
-				}
+			controller.advance_init();
+			if controller.init == Init::Ready {
+				self.after_ready(at);
 			}
 			return;
 		}
@@ -623,6 +930,7 @@ impl Stack {
 				scan.running = false;
 			}
 		}
+		self.classic_complete(at, op, status, params);
 	}
 
 	fn on_status(&mut self, at: usize, status: u8, op: u16) {
@@ -643,231 +951,164 @@ impl Stack {
 				}
 			}
 			opcode::LE_CREATE_CONNECTION => {
-				if let Some(attempt) = controller.attempt.as_mut() {
+				controller.le.accepting = false;
+				if let Some(peer) = controller.reconnect.take() {
+					controller.fail_attempt(&peer);
+				}
+				if let Some(attempt) = controller.attempt.as_mut()
+					&& attempt.peer[0] != KIND_BREDR
+					&& attempt.state == PairingState::Connecting
+				{
 					attempt.state = PairingState::Failed;
 				}
-				controller.reconnect = None;
 			}
 			opcode::LE_GENERATE_DHKEY => {
-				let steps = match controller.link.as_mut().and_then(|link| link.pairing.as_mut()) {
+				let Some(handle) = controller.links.iter().find(|link| link.pairing.is_some()).map(|link| link.handle) else { return };
+				let steps = match controller.link_mut(handle).and_then(|link| link.pairing.as_mut()) {
 					Some(pairing) => pairing.on_dhkey_failed(),
 					None => return,
 				};
-				self.run_smp(at, steps);
+				self.run_smp(at, handle, steps);
 			}
-			opcode::LE_ENABLE_ENCRYPTION => self.encryption_failed(at),
-			_ => {}
+			opcode::LE_ENABLE_ENCRYPTION => {
+				if let Some(handle) = controller.links.iter().find(|link| !link.is_classic() && !link.encrypted).map(|link| link.handle) {
+					self.encryption_failed(at, handle);
+				}
+			}
+			_ => self.classic_status(at, status, op),
 		}
 	}
 
-	// A controller that finished initialising connects to the peer an operator enabled, if there is
-	// one - which is what makes a bond survive a restart and a reboot without pairing again.
+	// A controller that finished initialising connects to the LE peer an operator enabled, if there is one -
+	// which is what makes a bond survive a restart and a reboot without pairing again - and takes the BR/EDR
+	// inbound policy it should have now.
 	fn after_ready(&mut self, at: usize) {
-		if !self.controllers[at].powered || self.controllers[at].link.is_some() {
+		if !self.controllers[at].powered {
 			return;
 		}
-		if let Some(peer) = self.enabled_bond(at) {
-			let controller = &mut self.controllers[at];
-			controller.reconnect = Some(peer);
-			let mut address = [0u8; 6];
-			address.copy_from_slice(&peer[1..]);
-			controller.command(opcode::LE_CREATE_CONNECTION, &hci_codec::create_connection(peer[0], &address));
-		}
+		self.refresh_policy(at);
+		self.le_ready(at);
 	}
 
 	fn on_connected(&mut self, at: usize, status: u8, handle: u16, peer_kind: u8, address: [u8; 6]) {
+		// A RESOLVED IDENTITY - types 2 and 3 - is the bonded peer's identity address, public or static random.
 		let mut peer = [0u8; 7];
-		peer[0] = peer_kind;
+		peer[0] = peer_kind & 0x01;
 		peer[1..].copy_from_slice(&address);
 		let controller = &mut self.controllers[at];
+		let through_list = core::mem::take(&mut controller.le.accepting);
+		let relist = through_list && core::mem::take(&mut controller.le.relist);
 		if status != 0 {
-			if let Some(attempt) = controller.attempt.as_mut()
-				&& attempt.peer == peer
-			{
-				attempt.state = PairingState::Failed;
-			}
+			controller.fail_attempt(&peer);
 			controller.reconnect = None;
+			// A STANDING ATTEMPT CANCELLED FOR A NEW LIST is taken up again with it now.
+			if relist {
+				self.reconnect_bonded(at);
+			}
 			return;
 		}
-		// ONE LINK PER CONTROLLER. A second connection is a peer this slice did not ask for, and it is
-		// disconnected rather than held.
-		if controller.link.is_some() {
-			controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_USER));
+		// THE LINK BOUND: eight links across both radios. A connection past it is refused rather than held.
+		if controller.links.len() >= bt_bounds::LINKS_PER_CONTROLLER || controller.link_to(&peer).is_some() {
+			controller.disconnect(handle, REASON_USER);
 			return;
 		}
 		let pairing_peer = controller.attempt.as_ref().is_some_and(|attempt| attempt.peer == peer && attempt.state == PairingState::Connecting);
-		let reconnecting = controller.reconnect == Some(peer);
+		// A DEVICE THE ACCEPT LIST LET IN is a bonded one: the list holds nothing else.
+		let reconnecting = controller.reconnect == Some(peer) || (through_list && !pairing_peer);
+		controller.reconnect = None;
+		// A connection this host did not ask for is a peer it does not know, and LE never advertises here: it
+		// is disconnected rather than held.
 		if !pairing_peer && !reconnecting {
-			controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_USER));
+			controller.disconnect(handle, REASON_USER);
 			return;
 		}
-		controller.link = Some(Link { handle, peer, reassembly: Reassembly::new(), pairing: None, discovery: None, encrypted: false, security: SecurityLevel::None, report: None, buttons: 0, streams: Vec::new(), reconnecting });
+		let mut link = Link::new(handle, peer);
+		link.reconnecting = reconnecting;
+		link.local = controller.le.local(local_address(controller));
+		controller.links.push(link);
 		if pairing_peer {
-			self.start_pairing(at);
+			self.start_le_pairing(at, handle);
 		} else {
 			// RECONNECT: the key comes from the store, and encryption is PROVED before input is
 			// enabled - a link that will not encrypt with the stored key is a peer that is not the one
 			// that bonded, or one that forgot the bond, and either way it is not an input source.
 			match self.bond(at, &peer) {
-				Some(mut record) => {
+				Some(mut record) if record.key.len() == 16 => {
 					let mut ltk = [0u8; 16];
 					ltk.copy_from_slice(&record.key);
-					scrub(&mut record.key);
-					self.controllers[at].encrypt(handle, &ltk);
+					let legacy = (record.rand.len() == 8).then(|| {
+						let mut rand = [0u8; 8];
+						rand.copy_from_slice(&record.rand);
+						(rand, record.ediv)
+					});
+					scrub_record(&mut record);
+					match legacy {
+						Some((rand, ediv)) => self.controllers[at].encrypt_legacy(handle, &ltk, &rand, ediv),
+						None => self.controllers[at].encrypt(handle, &ltk),
+					}
 					scrub(&mut ltk);
 				}
-				None => {
-					let controller = &mut self.controllers[at];
-					controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_AUTHENTICATION));
+				Some(mut record) => {
+					scrub_record(&mut record);
+					self.controllers[at].disconnect(handle, REASON_AUTHENTICATION);
 				}
-			}
-		}
-	}
-
-	fn start_pairing(&mut self, at: usize) {
-		let controller = &mut self.controllers[at];
-		let Some(public_key) = controller.public_key else { return };
-		// HEALTHY SYSTEM RANDOMNESS OR NO PAIRING. A nonce from a predictable source is a pairing an
-		// attacker can reproduce; `random_insecure` is refused by name here, and a machine without a
-		// healthy source refuses to pair rather than pairing badly.
-		let mut na = [0u8; 16];
-		if random_get(&mut na) != na.len() {
-			print(b"BluetoothService: no healthy random source; pairing is refused\n");
-			if let Some(attempt) = controller.attempt.as_mut() {
-				attempt.state = PairingState::Failed;
-			}
-			if let Some(link) = controller.link.as_ref() {
-				let handle = link.handle;
-				controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_AUTHENTICATION));
-			}
-			return;
-		}
-		let local = local_address(controller);
-		let Some(link) = controller.link.as_mut() else { return };
-		let (pairing, first) = Initiator::start(local, link.peer, public_key, na);
-		na.fill(0);
-		link.pairing = Some(pairing);
-		if let Some(attempt) = controller.attempt.as_mut() {
-			attempt.state = PairingState::Pairing;
-		}
-		self.run_smp(at, alloc::vec![first]);
-	}
-
-	fn run_smp(&mut self, at: usize, mut steps: Vec<Step>) {
-		for step in steps.iter_mut() {
-			let controller = &mut self.controllers[at];
-			match step {
-				Step::Send(pdu) => {
-					controller.l2cap(SMP_CID, pdu);
-				}
-				Step::GenerateDhKey(key) => {
-					controller.command(opcode::LE_GENERATE_DHKEY, &hci_codec::generate_dhkey(key));
-				}
-				// The key rides in the step list, which is freed after this loop: zeroed in place first.
-				Step::Encrypt(ltk) => {
-					if let Some(link) = controller.link.as_ref() {
-						let handle = link.handle;
-						controller.encrypt(handle, ltk);
-					}
-					scrub(ltk);
-				}
-				Step::Failed(_) => {
-					if let Some(attempt) = controller.attempt.as_mut() {
-						attempt.state = PairingState::Failed;
-					}
-					if let Some(link) = controller.link.as_ref() {
-						let handle = link.handle;
-						controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_AUTHENTICATION));
-					}
-				}
+				None => self.controllers[at].disconnect(handle, REASON_AUTHENTICATION),
 			}
 		}
 	}
 
 	fn on_encryption(&mut self, at: usize, status: u8, handle: u16, enabled: bool) {
-		let Some(link) = self.controllers[at].link.as_ref() else { return };
-		if link.handle != handle {
-			return;
-		}
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
 		if status != 0 || !enabled {
-			self.encryption_failed(at);
+			self.encryption_failed(at, handle);
 			return;
 		}
 		let peer = link.peer;
-		let reconnecting = link.reconnecting;
-		if !reconnecting {
-			let Some(mut ltk) = link.pairing.as_ref().and_then(Initiator::ltk) else {
-				self.encryption_failed(at);
-				return;
-			};
-			// BONDED ONLY AFTER THE DURABLE COMMIT. The store answers after its writer session has
-			// committed, and a pairing is not reported as bonded before that answer - a bond that
-			// exists only in memory is one a reboot silently removes. A store that cannot write ENDS
-			// the attempt: there is no transient bond to fall back to.
-			let local = local_wire(&self.controllers[at]);
-			let mut record = BondRecord { version: service_logic::bond_store::VERSION, local, peer: peer_to_wire(&peer), key: ltk.to_vec(), security: SecurityLevel::EncryptedUnauthenticated, name: alloc::string::String::new(), enabled: false };
-			let stored = self.store_bond(&record);
-			scrub(&mut record.key);
-			scrub(&mut ltk);
-			let controller = &mut self.controllers[at];
-			if let Some(link) = controller.link.as_mut() {
-				// The key has done its work in this process; the store holds the copy that outlives it.
-				// Dropping the initiator zeroes what it held.
-				link.pairing = None;
-			}
-			if !stored {
-				print(b"BluetoothService: the bond could not be stored durably; the pairing is abandoned\n");
-				if let Some(attempt) = controller.attempt.as_mut() {
-					attempt.state = PairingState::Failed;
-				}
-				controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_AUTHENTICATION));
+		link.encrypted = true;
+		// A PAIRING'S ENCRYPTION is the start of its key distribution: the bond is made when the keys are in, and
+		// stored durably before it is reported.
+		if !link.reconnecting {
+			let steps = link.pairing.as_mut().map(Initiator::on_encrypted).unwrap_or_default();
+			if link.pairing.is_none() {
+				self.encryption_failed(at, handle);
 				return;
 			}
-			if let Some(attempt) = controller.attempt.as_mut() {
-				attempt.state = PairingState::Bonded;
-				attempt.security = SecurityLevel::EncryptedUnauthenticated;
-			}
+			self.run_smp(at, handle, steps);
+			return;
 		}
-		let controller = &mut self.controllers[at];
-		if let Some(link) = controller.link.as_mut() {
-			link.encrypted = true;
-			link.security = SecurityLevel::EncryptedUnauthenticated;
+		let security = self.record(at, &peer).map(|record| security_of(&level_from_wire(&record.level))).unwrap_or(SecurityLevel::EncryptedUnauthenticated);
+		if let Some(link) = self.controllers[at].link_mut(handle) {
+			link.security = security;
 		}
 		if self.enabled_peer(at, &peer) == Some(true) {
-			self.start_discovery(at);
+			self.start_discovery(at, handle);
 		}
 	}
 
-	fn encryption_failed(&mut self, at: usize) {
+	fn encryption_failed(&mut self, at: usize, handle: u16) {
 		let controller = &mut self.controllers[at];
-		if let Some(attempt) = controller.attempt.as_mut()
-			&& matches!(attempt.state, PairingState::Pairing | PairingState::Connecting)
-		{
-			attempt.state = PairingState::Failed;
-		}
-		controller.reconnect = None;
-		if let Some(link) = controller.link.as_mut() {
-			link.pairing = None;
-			let handle = link.handle;
-			controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_AUTHENTICATION));
-		}
+		let Some(link) = controller.link_mut(handle) else { return };
+		link.pairing = None;
+		let peer = link.peer;
+		controller.fail_attempt(&peer);
+		controller.disconnect(handle, REASON_AUTHENTICATION);
 	}
 
 	fn on_disconnected(&mut self, at: usize, handle: u16) {
 		let controller = &mut self.controllers[at];
-		if controller.link.as_ref().is_none_or(|link| link.handle != handle) {
-			return;
+		let Some(position) = controller.links.iter().position(|link| link.handle == handle) else { return };
+		let mut link = controller.links.remove(position);
+		link.pairing = None;
+		release_streams(&mut link);
+		self.gatt_gone(&mut link);
+		let controller = &mut self.controllers[at];
+		controller.fail_attempt(&link.peer);
+		if link.is_classic() {
+			self.classic_gone(at, link);
+		} else {
+			// A BONDED PERIPHERAL GONE IS WAITED FOR AGAIN, through the accept list.
+			self.reconnect_bonded(at);
 		}
-		if let Some(mut link) = controller.link.take() {
-			link.pairing = None;
-			release_streams(&mut link);
-		}
-		if let Some(attempt) = controller.attempt.as_mut()
-			&& matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)
-		{
-			attempt.state = PairingState::Failed;
-		}
-		controller.reconnect = None;
 	}
 
 	fn on_advertising(&mut self, at: usize, count: u8, reports: &[u8]) {
@@ -878,25 +1119,31 @@ impl Stack {
 		let controller = &mut self.controllers[at];
 		let Some(scan) = controller.scan.as_mut().filter(|scan| scan.running) else { return };
 		for advertisement in found {
-			// Only the two address kinds this slice speaks; a resolvable private address is one it
-			// cannot bond to.
+			// A STATIC OR A RESOLVABLE RANDOM ADDRESS, or a public one; a non-resolvable private address names
+			// nobody this host could find again.
 			let kind = match advertisement.kind {
 				0 => PeerKind::Public,
 				1 if advertisement.address[0] & 0xc0 == 0xc0 => PeerKind::RandomStatic,
+				1 if advertisement.address[0] & 0xc0 == 0x40 => PeerKind::Resolvable,
 				_ => continue,
 			};
-			let address = PeerAddress { kind, bytes: advertisement.address.to_vec() };
+			// A PRIVATE ADDRESS A BOND RESOLVES is reported as that bond's identity.
+			let address = match (kind, controller.le.resolve(&advertisement.address)) {
+				(PeerKind::Resolvable, Some(identity)) => peer_to_wire(&identity),
+				_ => PeerAddress { kind, bytes: advertisement.address.to_vec() },
+			};
 			if scan.results.iter().any(|result| result.address == address) {
 				continue;
 			}
-			let (name, human_interface) = hci_codec::advertised(advertisement.data());
-			let name = name.and_then(|bytes| core::str::from_utf8(&bytes[..bytes.len().min(48)]).ok()).unwrap_or("");
-			scan.results.push(ScanResult { address, name: alloc::string::String::from(name), rssi: advertisement.rssi as i32, human_interface });
 			if scan.results.len() >= MAX_SCAN_RESULTS {
 				scan.running = false;
 				controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(false));
 				return;
 			}
+			let (name, human_interface) = hci_codec::advertised(advertisement.data());
+			let name = name.and_then(|bytes| core::str::from_utf8(&bytes[..bytes.len().min(48)]).ok()).unwrap_or("");
+			let services = if human_interface { alloc::vec![ServiceClass { uuid: 0x1812 }] } else { Vec::new() };
+			scan.results.push(ScanResult { address, name: String::from(name), rssi: advertisement.rssi as i32, human_interface, radio: Radio::Le, class_of_device: 0, services });
 		}
 	}
 
@@ -907,11 +1154,10 @@ impl Stack {
 		let now = clock();
 		let payload: Vec<u8>;
 		let cid;
+		let classic;
 		{
-			let Some(link) = self.controllers[at].link.as_mut() else { return };
-			if link.handle != handle {
-				return;
-			}
+			let Some(link) = self.controllers[at].link_mut(handle) else { return };
+			classic = link.is_classic();
 			match link.reassembly.feed(boundary, data, now) {
 				Ok(Fed::Complete { cid: channel, .. }) => {
 					cid = channel;
@@ -924,86 +1170,169 @@ impl Stack {
 				}
 			}
 		}
+		if classic {
+			self.classic_pdu(at, handle, cid, &payload);
+			return;
+		}
 		match cid {
 			SMP_CID => {
-				let steps = match self.controllers[at].link.as_mut().and_then(|link| link.pairing.as_mut()) {
+				let steps = match self.controllers[at].link_mut(handle).and_then(|link| link.pairing.as_mut()) {
 					Some(pairing) => pairing.on_pdu(&payload),
 					None => return,
 				};
-				self.run_smp(at, steps);
+				self.run_smp(at, handle, steps);
 			}
-			ATT_CID => self.on_att(at, &payload),
-			// A channel this slice does not open carries nothing it reads.
+			ATT_CID => self.on_att(at, handle, &payload),
+			// A channel the LE half does not open carries nothing it reads.
 			_ => {}
 		}
 	}
 
-	fn on_att(&mut self, at: usize, pdu: &[u8]) {
+	fn on_att(&mut self, at: usize, handle: u16, pdu: &[u8]) {
+		// A REQUEST FROM THE PEER, acting as a client, is this host's GATT server's to answer.
+		if pdu.first().is_some_and(|code| matches!(*code, 0x02 | 0x04 | 0x06 | 0x08 | 0x0a | 0x0c | 0x0e | 0x10 | 0x12 | 0x16 | 0x18 | 0x20 | 0x52 | 0xd2)) {
+			let answer = {
+				let Some(link) = self.controllers[at].link_mut(handle) else { return };
+				link.server.get_or_insert_with(|| gatt_server::Server::new(b"LiberSystem")).answer(pdu)
+			};
+			if let Some(answer) = answer {
+				self.controllers[at].l2cap(handle, ATT_CID, &answer);
+			}
+			return;
+		}
 		// A NOTIFICATION IS NOT AN ANSWER. It arrives whenever the peer has a report, including in the
 		// middle of discovery, and feeding it to the discovery as the answer to its last request would
 		// end the procedure with a refusal it did not earn.
 		if pdu.first() == Some(&service_logic::att::op::HANDLE_VALUE_NOTIFICATION) {
-			self.on_notification(at, pdu);
+			self.on_notification(at, handle, pdu);
 			return;
 		}
-		let next = {
-			let Some(discovery) = self.controllers[at].link.as_mut().and_then(|link| link.discovery.as_mut()) else { return };
-			discovery.on_answer(pdu)
+		enum Stepped {
+			Map(hogp_map::Next),
+			Boot(gatt_mouse::Next),
+		}
+		let stepped = match self.controllers[at].link_mut(handle).and_then(|link| link.walk.as_mut()) {
+			Some(Walk::Map(discovery)) => Stepped::Map(discovery.on_answer(pdu)),
+			Some(Walk::Boot(discovery)) => Stepped::Boot(discovery.on_answer(pdu)),
+			// NO WALK: the response is an application's operation's.
+			None => {
+				self.gatt_response(at, handle, pdu);
+				return;
+			}
 		};
-		self.run_gatt(at, next);
+		match stepped {
+			Stepped::Map(next) => self.run_map(at, handle, next),
+			Stepped::Boot(next) => self.run_boot(at, handle, next),
+		}
+		// A WALK THAT ENDED frees the bearer for what applications queued.
+		if self.controllers[at].link(handle).is_some_and(|link| link.walk.is_none()) {
+			self.next_gatt(at, handle);
+		}
 	}
 
-	fn start_discovery(&mut self, at: usize) {
-		let Some(link) = self.controllers[at].link.as_mut() else { return };
-		if link.discovery.is_some() || !link.encrypted {
+	// THE HOGP WALK, on an encrypted link of a peer trusted for input: the report map's first.
+	fn start_discovery(&mut self, at: usize, handle: u16) {
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
+		if link.walk.is_some() || link.decoder.is_some() || !link.encrypted {
 			return;
 		}
-		let (discovery, first) = Discovery::start(service_logic::att::DEFAULT_MTU);
-		link.discovery = Some(discovery);
-		self.run_gatt(at, first);
+		let (discovery, first) = hogp_map::Discovery::start(service_logic::att::DEFAULT_MTU);
+		link.walk = Some(Walk::Map(discovery));
+		self.run_map(at, handle, first);
 	}
 
-	fn run_gatt(&mut self, at: usize, next: Next) {
+	fn run_map(&mut self, at: usize, handle: u16, next: hogp_map::Next) {
 		let controller = &mut self.controllers[at];
 		match next {
-			Next::Request(pdu) => {
-				controller.l2cap(ATT_CID, &pdu);
+			hogp_map::Next::Request(pdu) => {
+				controller.l2cap(handle, ATT_CID, &pdu);
 			}
-			Next::Command(pdu, then) => {
-				controller.l2cap(ATT_CID, &pdu);
-				self.run_gatt(at, *then);
+			hogp_map::Next::Command(pdu, then) => {
+				controller.l2cap(handle, ATT_CID, &pdu);
+				self.run_map(at, handle, *then);
 			}
-			Next::Ready { report } => {
-				if let Some(link) = controller.link.as_mut() {
-					link.report = Some(report);
+			hogp_map::Next::Ready(map) => {
+				let Some(link) = controller.link_mut(handle) else { return };
+				link.walk = None;
+				match input::Decoder::new(&map.descriptor) {
+					Some(decoder) => {
+						let arrivals = decoder.arrivals();
+						link.decoder = Some(decoder);
+						link.map = Some(map);
+						deliver(link, &arrivals);
+					}
+					None => print(b"BluetoothService: the peer's report map describes nothing this system takes as input\n"),
 				}
 			}
-			// THE PEER IS NOT A BOOT MOUSE THIS SLICE CAN DRIVE, and saying so is the whole answer: the
-			// bond stands, the link stays encrypted, and nothing is published as input.
-			Next::Unsupported(_) => print(b"BluetoothService: the peer is not a boot mouse this service can drive\n"),
-			Next::Failed(_) | Next::ServerError(_) => print(b"BluetoothService: the peer's attribute table could not be walked\n"),
+			// A DEVICE WITHOUT A REPORT MAP is a boot device: the boot mouse's walk takes over.
+			hogp_map::Next::Unsupported(hogp_map::Unsupported::NoReportMap) => {
+				let (discovery, first) = gatt_mouse::Discovery::start(service_logic::att::DEFAULT_MTU);
+				if let Some(link) = controller.link_mut(handle) {
+					link.walk = Some(Walk::Boot(discovery));
+				}
+				self.run_boot(at, handle, first);
+			}
+			hogp_map::Next::Unsupported(_) => {
+				print(b"BluetoothService: the peer's human-interface service has nothing this host can turn on\n");
+				if let Some(link) = controller.link_mut(handle) {
+					link.walk = None;
+				}
+			}
+			hogp_map::Next::Failed(_) | hogp_map::Next::ServerError(_) => {
+				print(b"BluetoothService: the peer's attribute table could not be walked\n");
+				if let Some(link) = controller.link_mut(handle) {
+					link.walk = None;
+				}
+			}
 		}
 	}
 
-	fn on_notification(&mut self, at: usize, pdu: &[u8]) {
+	fn run_boot(&mut self, at: usize, handle: u16, next: gatt_mouse::Next) {
+		let controller = &mut self.controllers[at];
+		match next {
+			gatt_mouse::Next::Request(pdu) => {
+				controller.l2cap(handle, ATT_CID, &pdu);
+			}
+			gatt_mouse::Next::Command(pdu, then) => {
+				controller.l2cap(handle, ATT_CID, &pdu);
+				self.run_boot(at, handle, *then);
+			}
+			gatt_mouse::Next::Ready { report } => {
+				if let Some(link) = controller.link_mut(handle) {
+					link.report = Some(report);
+					link.walk = None;
+				}
+			}
+			// THE PEER IS NOT A BOOT MOUSE THIS SERVICE CAN DRIVE, and saying so is the whole answer: the
+			// bond stands, the link stays encrypted, and nothing is published as input.
+			gatt_mouse::Next::Unsupported(_) => print(b"BluetoothService: the peer is not a boot mouse this service can drive\n"),
+			gatt_mouse::Next::Failed(_) | gatt_mouse::Next::ServerError(_) => print(b"BluetoothService: the peer's attribute table could not be walked\n"),
+		}
+	}
+
+	fn on_notification(&mut self, at: usize, handle: u16, pdu: &[u8]) {
 		if pdu.len() < 3 {
 			return;
 		}
-		let Some(link) = self.controllers[at].link.as_mut() else { return };
-		let handle = u16::from_le_bytes([pdu[1], pdu[2]]);
-		if link.report != Some(handle) || !link.encrypted {
+		self.gatt_notification(at, handle, pdu);
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
+		let attribute = u16::from_le_bytes([pdu[1], pdu[2]]);
+		if !link.encrypted {
+			return;
+		}
+		// A REPORT-MAP DEVICE: the notification's handle says which report, and so its id.
+		if let Some(id) = link.map.as_ref().and_then(|map| map.id_of(attribute)) {
+			let reports = link.decoder.as_mut().map(|decoder| decoder.report_with_id(id, &pdu[3..])).unwrap_or_default();
+			deliver(link, &reports);
+			return;
+		}
+		if link.report != Some(attribute) {
 			return;
 		}
 		let Ok(decoded) = service_logic::hogp::report(&pdu[3..]) else { return };
 		link.buttons = decoded.buttons;
-		let report = MouseReport { dx: decoded.dx, dy: decoded.dy, wheel: decoded.wheel, buttons: decoded.buttons };
-		link.streams.retain(|&stream| {
-			let kept = write_report(stream, &report);
-			if !kept {
-				close(stream);
-			}
-			kept
-		});
+		let report = InputReport::Pointer(MouseReport { dx: decoded.dx, dy: decoded.dy, wheel: decoded.wheel, buttons: decoded.buttons });
+		deliver(link, &[report]);
 	}
 
 	// ------------------------------------------------------------------ timers
@@ -1018,13 +1347,17 @@ impl Stack {
 			if let Some(attempt) = controller.attempt.as_ref().filter(|attempt| matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)) {
 				soonest = soonest.min(attempt.deadline);
 			}
+			if let Some(due) = controller.bredr_state.next_deadline(&controller.links) {
+				soonest = soonest.min(due);
+			}
 		}
 		soonest
 	}
 
 	fn run_timers(&mut self) {
 		let now = clock();
-		for controller in &mut self.controllers {
+		for at in 0..self.controllers.len() {
+			let controller = &mut self.controllers[at];
 			if let Some(scan) = controller.scan.as_mut()
 				&& scan.running
 				&& now >= scan.deadline
@@ -1039,20 +1372,28 @@ impl Stack {
 				// SIXTY SECONDS, WHATEVER THE PEER DOES. A connection that never completes is cancelled
 				// and a link that stalled mid-exchange is disconnected; either way the attempt is over.
 				attempt.state = PairingState::Failed;
-				match controller.link.as_ref() {
-					Some(link) => {
-						let handle = link.handle;
-						controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_USER));
+				let peer = attempt.peer;
+				match controller.link_to(&peer).map(|link| link.handle) {
+					Some(handle) => controller.disconnect(handle, REASON_USER),
+					None if peer[0] == KIND_BREDR => {
+						controller.command(service_logic::hci_bredr::opcode::CREATE_CONNECTION_CANCEL, &peer[1..].iter().rev().copied().collect::<Vec<u8>>());
 					}
 					None => {
 						controller.command(opcode::LE_CREATE_CONNECTION_CANCEL, &[]);
 					}
 				}
 			}
-			if let Some(link) = controller.link.as_mut()
-				&& link.reassembly.expire(now)
-			{
-				print(b"BluetoothService: an incomplete packet on a link was given up at its deadline\n");
+			for link in controller.links.iter_mut() {
+				if link.reassembly.expire(now) {
+					print(b"BluetoothService: an incomplete packet on a link was given up at its deadline\n");
+				}
+			}
+			self.classic_timers(at, now);
+			// A NEW PRIVATE ADDRESS when the old one's time is up - not while a connection attempt is out, which the
+			// controller would refuse.
+			let controller = &self.controllers[at];
+			if controller.powered && controller.le.own.is_some() && now >= controller.le.rotate_at && !controller.le.accepting && controller.attempt.as_ref().is_none_or(|attempt| attempt.state != PairingState::Connecting) {
+				self.rotate_address(at);
 			}
 		}
 	}
@@ -1066,7 +1407,15 @@ struct ReadView<'a> {
 
 impl bluetooth::Service for ReadView<'_> {
 	fn controllers(&mut self) -> Result<Vec<ControllerInfo>, Error> {
-		Ok(self.stack.controllers.iter().map(|controller| ControllerInfo { address: local_wire(controller), powered: controller.powered, secure_connections: controller.secure_connections, epoch: controller.session.epoch() }).collect())
+		Ok(self
+			.stack
+			.controllers
+			.iter()
+			.map(|controller| {
+				let (connectable, discoverable) = controller.bredr_state.scan_flags();
+				ControllerInfo { address: local_wire(controller), powered: controller.powered, secure_connections: controller.secure_connections, epoch: controller.session.epoch(), classic: controller.classic, connectable, discoverable, pairable: controller.bredr_state.watcher != 0 }
+			})
+			.collect())
 	}
 
 	fn scan(&mut self, at: u32, deadline_ms: u32) -> Result<ScanHandle, Error> {
@@ -1075,16 +1424,19 @@ impl bluetooth::Service for ReadView<'_> {
 		if !controller.powered {
 			return Err(Error::Closed);
 		}
-		if controller.scan.as_ref().is_some_and(|scan| scan.running) {
+		if controller.scan.as_ref().is_some_and(Scan::active) {
 			return Err(Error::Again);
 		}
 		// THE CALLER'S DEADLINE IS CAPPED, NOT BELIEVED. A scan is a radio running, and a client asking
 		// for an hour of it is a client deciding how the machine behaves.
-		let ticks = (deadline_ms.min(MAX_SCAN_MS) as u64).saturating_mul(TICKS_PER_SECOND) / 1000;
-		if !controller.command(opcode::LE_SET_SCAN_PARAMETERS, &hci_codec::scan_parameters()) || !controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(true)) {
+		let ms = deadline_ms.min(MAX_SCAN_MS);
+		let ticks = (ms as u64).saturating_mul(TICKS_PER_SECOND) / 1000;
+		if !controller.command(opcode::LE_SET_SCAN_PARAMETERS, &hci_codec::scan_parameters_from(controller.le.own_type())) || !controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(true)) {
 			return Err(Error::Exhausted);
 		}
-		controller.scan = Some(Scan { id, deadline: clock().saturating_add(ticks.max(1)), running: true, results: Vec::new() });
+		// BOTH RADIOS IN ONE SCAN: inquiry runs beside the LE scan for as long, in its own units of 1.28 s.
+		let inquiring = controller.classic && controller.command(service_logic::hci_bredr::opcode::INQUIRY, &service_logic::hci_bredr::inquiry(ms.div_ceil(1280) as u8, 0));
+		controller.scan = Some(Scan { id, deadline: clock().saturating_add(ticks.max(1)), running: true, inquiring, results: Vec::new(), paging: Vec::new() });
 		self.stack.next_scan = self.stack.next_scan.wrapping_add(1);
 		Ok(ScanHandle { id })
 	}
@@ -1094,15 +1446,20 @@ impl bluetooth::Service for ReadView<'_> {
 	}
 
 	fn scanning(&mut self, scan: ScanHandle) -> Result<bool, Error> {
-		self.stack.controllers.iter().find_map(|controller| controller.scan.as_ref().filter(|found| found.id == scan.id)).map(|found| found.running).ok_or(Error::NotFound)
+		self.stack.controllers.iter().find_map(|controller| controller.scan.as_ref().filter(|found| found.id == scan.id)).map(Scan::active).ok_or(Error::NotFound)
 	}
 
 	fn cancel(&mut self, scan: ScanHandle) -> Result<(), Error> {
 		for controller in &mut self.stack.controllers {
 			if let Some(found) = controller.scan.as_mut().filter(|found| found.id == scan.id) {
-				if found.running {
-					found.running = false;
+				let (running, inquiring) = (found.running, found.inquiring);
+				found.running = false;
+				found.inquiring = false;
+				if running {
 					controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(false));
+				}
+				if inquiring {
+					controller.command(service_logic::hci_bredr::opcode::INQUIRY_CANCEL, &[]);
 				}
 				return Ok(());
 			}
@@ -1142,6 +1499,7 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		controller.end_session();
 		controller.powered = false;
 		controller.init = Init::Ready;
+		controller.waiting_step = None;
 		controller.reconnect = None;
 		controller.command(opcode::RESET, &[]);
 		controller.pump();
@@ -1149,32 +1507,7 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 	}
 
 	fn pair(&mut self, at: u32, peer: PeerAddress) -> Result<(), Error> {
-		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
-		let controller = self.stack.controllers.get_mut(at as usize).ok_or(Error::NotFound)?;
-		if !controller.powered {
-			return Err(Error::Closed);
-		}
-		if !controller.secure_connections || controller.public_key.is_none() {
-			return Err(Error::Unsupported);
-		}
-		// ONE ATTEMPT PER CONTROLLER IS LIVE, and a second is refused rather than queued - a queued
-		// pairing is one an operator has stopped watching.
-		if controller.attempt.as_ref().is_some_and(|attempt| matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)) || controller.link.is_some() {
-			return Err(Error::Again);
-		}
-		// THE OPERATOR SELECTS WHAT THE RADIO REPORTED: an address this controller's current scan did not
-		// find is not a choice made from a scan, whatever the operator typed.
-		let wire = peer_to_wire(&peer);
-		if !controller.scan.as_ref().is_some_and(|scan| scan.results.iter().any(|result| result.address == wire)) {
-			return Err(Error::NotFound);
-		}
-		let mut address = [0u8; 6];
-		address.copy_from_slice(&peer[1..]);
-		if !controller.command(opcode::LE_CREATE_CONNECTION, &hci_codec::create_connection(peer[0], &address)) {
-			return Err(Error::Exhausted);
-		}
-		controller.attempt = Some(Attempt { peer, deadline: clock().saturating_add(PAIRING_TICKS), state: PairingState::Connecting, security: SecurityLevel::None });
-		Ok(())
+		self.stack.pair(at as usize, &peer, false)
 	}
 
 	fn progress(&mut self, at: u32) -> Result<PairingProgress, Error> {
@@ -1192,11 +1525,16 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 			return Err(Error::NotFound);
 		}
 		attempt.state = PairingState::Failed;
-		match controller.link.as_mut() {
+		let peer = attempt.peer;
+		match controller.link_to_mut(&peer) {
 			Some(link) => {
 				link.pairing = None;
 				let handle = link.handle;
-				controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_USER));
+				controller.disconnect(handle, REASON_USER);
+			}
+			None if peer[0] == KIND_BREDR => {
+				let wire: Vec<u8> = peer[1..].iter().rev().copied().collect();
+				controller.command(service_logic::hci_bredr::opcode::CREATE_CONNECTION_CANCEL, &wire);
 			}
 			None => {
 				controller.command(opcode::LE_CREATE_CONNECTION_CANCEL, &[]);
@@ -1206,12 +1544,14 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 	}
 
 	fn bonded(&mut self, at: u32) -> Result<Vec<BondedPeer>, Error> {
-		let controller = self.stack.controllers.get(at as usize).ok_or(Error::NotFound)?;
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
 		if self.stack.bonds == 0 {
 			return Err(Error::Closed);
 		}
-		let records = self.stack.bonds().list(&local_wire(controller)).ok_or(Error::Closed)??;
-		Ok(records.into_iter().map(|record| BondedPeer { address: record.peer, name: record.name, enabled: record.enabled, security: record.security }).collect())
+		let records = self.stack.bonds().list(&local_wire(&self.stack.controllers[at as usize])).ok_or(Error::Closed)??;
+		Ok(records.into_iter().map(|record| BondedPeer { address: record.peer, name: record.name, enabled: record.enabled, security: record.security, radio: record.radio, level: record.level, trusted: record.trusted, alias: record.alias }).collect())
 	}
 
 	// DURABLY, AND BEFORE THIS ANSWERS: the store's delete commits before it replies, and only then is
@@ -1228,57 +1568,245 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		if controller.reconnect == Some(peer) {
 			controller.reconnect = None;
 		}
-		if let Some(link) = controller.link.as_ref().filter(|link| link.peer == peer) {
-			let handle = link.handle;
-			controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_USER));
+		if let Some(handle) = controller.link_to(&peer).map(|link| link.handle) {
+			controller.disconnect(handle, REASON_USER);
+		}
+		self.stack.refresh_policy(at as usize);
+		if !peer_is_classic(&peer) {
+			self.stack.relist(at as usize);
 		}
 		Ok(())
 	}
 
+	// THE SAME AS TRUSTING IT FOR INPUT, and the record says both.
 	fn enable(&mut self, at: u32, peer: PeerAddress, on: bool) -> Result<(), Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		self.stack.set_trust(at as usize, &peer, Profile::Input, on)
+	}
+
+	fn prompts(&mut self, at: u32) -> Result<Vec<proto::system::PairingPrompt>, Error> {
+		// Validated here; the stream itself is made by `serve_prompts`, which owns the channel.
+		let controller = self.stack.controllers.get(at as usize).ok_or(Error::NotFound)?;
+		if controller.bredr_state.watcher != 0 {
+			return Err(Error::Again);
+		}
+		Ok(Vec::new())
+	}
+
+	fn answer(&mut self, at: u32, prompt: u32, reply: PromptReply) -> Result<(), Error> {
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.stack.answer(at as usize, prompt, reply)
+	}
+
+	fn discoverable(&mut self, at: u32, seconds: u32) -> Result<(), Error> {
+		let controller = self.stack.controllers.get_mut(at as usize).ok_or(Error::NotFound)?;
+		if !controller.classic {
+			return Err(Error::Unsupported);
+		}
+		if !controller.powered {
+			return Err(Error::Closed);
+		}
+		controller.bredr_state.discoverable_until = (seconds > 0).then(|| clock() + service_logic::bt_policy::discoverable_until(0, seconds) * TICKS_PER_SECOND / 1000);
+		self.stack.refresh_policy(at as usize);
+		Ok(())
+	}
+
+	fn trust(&mut self, at: u32, peer: PeerAddress, profile: Profile, on: bool) -> Result<(), Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		self.stack.set_trust(at as usize, &peer, profile, on)
+	}
+
+	fn alias(&mut self, at: u32, peer: PeerAddress, alias: String) -> Result<(), Error> {
 		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
 		if at as usize >= self.stack.controllers.len() {
 			return Err(Error::NotFound);
 		}
-		let Some(mut record) = self.stack.bond(at as usize, &peer) else { return Err(Error::NotFound) };
-		record.enabled = on;
-		let stored = self.stack.store_bond(&record);
-		scrub(&mut record.key);
-		if !stored {
-			return Err(Error::Io);
+		// AN ALIAS IS A NAME A GRANT CAN CARRY: printable, no separator a policy row splits on, and one peer
+		// per alias on a controller.
+		if alias.len() > 32 || !alias.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+			return Err(Error::Invalid);
 		}
-		let controller = &mut self.stack.controllers[at as usize];
-		if on {
-			// An enabled peer that is already connected and encrypted becomes an input source now.
-			if controller.link.as_ref().is_some_and(|link| link.peer == peer && link.encrypted) {
-				self.stack.start_discovery(at as usize);
+		if !alias.is_empty() && self.stack.records(at as usize).iter().any(|record| record.alias == alias && peer_from_wire(&record.peer) != Some(peer)) {
+			return Err(Error::Again);
+		}
+		self.stack.rewrite_bond(at as usize, &peer, |record| record.alias = alias)
+	}
+
+	fn devices(&mut self, at: u32) -> Result<Vec<DeviceStatus>, Error> {
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		Ok(self.stack.devices(at as usize))
+	}
+
+	fn connect(&mut self, at: u32, peer: PeerAddress, profile: Profile) -> Result<(), Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.stack.connect_profile(at as usize, &peer, profile)
+	}
+
+	fn disconnect(&mut self, at: u32, peer: PeerAddress, profile: Profile) -> Result<(), Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.stack.disconnect_profile(at as usize, &peer, profile)
+	}
+
+	fn pair_legacy(&mut self, at: u32, peer: PeerAddress) -> Result<(), Error> {
+		self.stack.pair(at as usize, &peer, true)
+	}
+
+	// THE REMOTE CONTROL'S BUTTONS, toward a phone playing to this system.
+	fn media(&mut self, at: u32, peer: PeerAddress, command: proto::system::MediaCommand) -> Result<(), Error> {
+		use service_logic::avrcp::Operation;
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		if at as usize >= self.stack.controllers.len() || !peer_is_classic(&peer) {
+			return Err(Error::NotFound);
+		}
+		let operation = match command {
+			proto::system::MediaCommand::Play => Operation::Play,
+			proto::system::MediaCommand::Pause => Operation::Pause,
+			proto::system::MediaCommand::Next => Operation::Forward,
+			proto::system::MediaCommand::Previous => Operation::Backward,
+		};
+		self.stack.media_command(at as usize, &peer, operation)
+	}
+}
+
+impl Stack {
+	// PAIR WITH WHAT THE RADIO REPORTED: an address this controller's current scan did not find is not a
+	// choice made from a scan, whatever the operator typed. `legacy` is the operator's word that this device
+	// cannot do better than a PIN.
+	fn pair(&mut self, at: usize, peer: &PeerAddress, legacy: bool) -> Result<(), Error> {
+		let peer = peer_from_wire(peer).ok_or(Error::Invalid)?;
+		if at >= self.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		// LE LEGACY IS NEVER RUN OVER A SECURE CONNECTIONS BOND, whatever the scan heard.
+		if legacy && peer[0] != KIND_BREDR && self.record(at, &peer).is_some_and(|record| level_from_wire(&record.level).agreement == Agreement::SecureConnections) {
+			return Err(Error::Denied);
+		}
+		let controller = &mut self.controllers[at];
+		if !controller.powered {
+			return Err(Error::Closed);
+		}
+		// ONE ATTEMPT PER CONTROLLER IS LIVE, and a second is refused rather than queued - a queued
+		// pairing is one an operator has stopped watching.
+		if controller.attempt.as_ref().is_some_and(|attempt| matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)) {
+			return Err(Error::Again);
+		}
+		let wire = peer_to_wire(&peer);
+		if !controller.scan.as_ref().is_some_and(|scan| scan.results.iter().any(|result| result.address == wire)) {
+			return Err(Error::NotFound);
+		}
+		if peer[0] == KIND_BREDR {
+			return self.pair_classic(at, peer, legacy);
+		}
+		self.pair_le(at, peer, legacy)
+	}
+
+	// TRUST, per peer and per profile, durably; input trust and `enabled` are the same thing.
+	fn set_trust(&mut self, at: usize, peer: &Peer, profile: Profile, on: bool) -> Result<(), Error> {
+		if at >= self.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.rewrite_bond(at, peer, |record| {
+			record.trusted.retain(|held| *held != profile);
+			if on {
+				record.trusted.push(profile);
 			}
-		} else if let Some(link) = controller.link.as_mut().filter(|link| link.peer == peer) {
-			// DISABLING CLOSES WHATEVER THE INPUT SERVICE HOLDS FOR IT, releasing held buttons first.
+			if profile == Profile::Input {
+				record.enabled = on;
+			}
+		})?;
+		let controller = &mut self.controllers[at];
+		if profile == Profile::Input
+			&& !on && let Some(link) = controller.link_to_mut(peer)
+			&& peer_is_classic(peer)
+		{
+			// A CLASSIC DEVICE NO LONGER TRUSTED FOR INPUT: its streams end, what it held released first.
 			release_streams(link);
-			link.report = None;
-			link.discovery = None;
+		}
+		if profile == Profile::Input
+			&& let Some(handle) = controller.link_to(peer).map(|link| link.handle)
+			&& !peer_is_classic(peer)
+		{
+			if on {
+				// An enabled peer that is already connected and encrypted becomes an input source now.
+				if controller.link(handle).is_some_and(|link| link.encrypted) {
+					self.start_discovery(at, handle);
+				}
+			} else if let Some(link) = controller.link_mut(handle) {
+				// DISABLING CLOSES WHATEVER THE INPUT SERVICE HOLDS FOR IT, releasing what is held first.
+				release_streams(link);
+				link.report = None;
+				link.map = None;
+				link.decoder = None;
+				link.walk = None;
+			}
+		}
+		self.refresh_policy(at);
+		// AN LE PEER'S RECONNECTION is what input and GATT trust admit: the accept list is made again.
+		if !peer_is_classic(peer) && matches!(profile, Profile::Input | Profile::Gatt) {
+			self.relist(at);
 		}
 		Ok(())
 	}
+
+	// Every device this controller knows, on both radios: its bonds, its links and what its current scan found.
+	fn devices(&self, at: usize) -> Vec<DeviceStatus> {
+		let controller = &self.controllers[at];
+		let mut out: Vec<DeviceStatus> = Vec::new();
+		for record in self.records(at) {
+			let Some(peer) = peer_from_wire(&record.peer) else { continue };
+			let link = controller.link_to(&peer);
+			out.push(DeviceStatus { address: record.peer, radio: record.radio, name: record.name, alias: record.alias, bonded: true, connected: link.is_some(), level: Some(record.level), trusted: record.trusted, connected_profiles: link.map(classic::connected_profiles).unwrap_or_default(), battery: None });
+		}
+		for link in &controller.links {
+			let wire = peer_to_wire(&link.peer);
+			if out.iter().any(|device| device.address == wire) {
+				continue;
+			}
+			let name = controller.bredr_state.name_of(&link.peer).unwrap_or_default();
+			out.push(DeviceStatus { address: wire, radio: radio_of(&link.peer), name, alias: String::new(), bonded: false, connected: true, level: None, trusted: Vec::new(), connected_profiles: classic::connected_profiles(link), battery: None });
+		}
+		if let Some(scan) = controller.scan.as_ref() {
+			for result in &scan.results {
+				if out.iter().any(|device| device.address == result.address) {
+					continue;
+				}
+				out.push(DeviceStatus { address: result.address.clone(), radio: result.radio, name: result.name.clone(), alias: String::new(), bonded: false, connected: false, level: None, trusted: Vec::new(), connected_profiles: Vec::new(), battery: None });
+			}
+		}
+		out
+	}
+}
+
+fn peer_is_classic(peer: &Peer) -> bool {
+	peer[0] == KIND_BREDR
 }
 
 // ------------------------------------------------------------------ the profile interface
 
 struct ProfileView<'a> {
 	stack: &'a mut Stack,
-	// Which controller the accepted stream is for, set by `open_mouse` for the caller to attach the
+	// Which controller and link the accepted stream is for, set by `open_mouse` for the caller to attach the
 	// stream's producer to.
-	target: Option<usize>,
+	target: Option<(usize, u16)>,
 }
 
 impl bluetooth_profile::Service for ProfileView<'_> {
-	fn open_mouse(&mut self, at: u32, peer: PeerAddress) -> Result<Vec<MouseReport>, Error> {
+	fn open_input(&mut self, at: u32, peer: PeerAddress) -> Result<Vec<InputReport>, Error> {
 		let peer_address = peer_from_wire(&peer).ok_or(Error::Invalid)?;
 		if at as usize >= self.stack.controllers.len() {
 			return Err(Error::NotFound);
 		}
-		// ONLY OVER A PEER AN OPERATOR ENABLED. The input service cannot reach a peer that is merely
+		// ONLY OVER A PEER AN OPERATOR TRUSTED FOR INPUT. The input service cannot reach a peer that is merely
 		// bonded, and a peer an operator has not approved is not an input source whatever it sends.
 		match self.stack.enabled_peer(at as usize, &peer_address) {
 			Some(true) => {}
@@ -1286,26 +1814,24 @@ impl bluetooth_profile::Service for ProfileView<'_> {
 			None => return Err(Error::NotFound),
 		}
 		let controller = &self.stack.controllers[at as usize];
-		match controller.link.as_ref() {
-			Some(link) if link.peer == peer_address && link.streams.len() >= MAX_STREAMS => return Err(Error::Exhausted),
-			Some(link) if link.peer == peer_address => {}
+		match controller.link_to(&peer_address) {
+			Some(link) if link.streams.len() >= MAX_STREAMS => return Err(Error::Exhausted),
+			Some(link) => self.target = Some((at as usize, link.handle)),
 			// The peer is bonded and enabled and not connected right now: the stream is refused with
 			// `closed`, which is the same answer a lost link gives, so a consumer retries the same way.
-			_ => return Err(Error::Closed),
+			None => return Err(Error::Closed),
 		}
-		self.target = Some(at as usize);
 		Ok(Vec::new())
 	}
 
-	// The peers `open-mouse` would accept: bonded AND enabled, on every controller this service has.
+	// The peers `open-input` would accept: bonded AND trusted for input, on every controller and both radios.
 	fn enabled(&mut self) -> Result<Vec<EnabledPeer>, Error> {
 		if self.stack.bonds == 0 {
 			return Err(Error::Closed);
 		}
 		let mut out = Vec::new();
-		for (at, controller) in self.stack.controllers.iter().enumerate() {
-			let Some(Ok(records)) = self.stack.bonds().list(&local_wire(controller)) else { continue };
-			out.extend(records.into_iter().filter(|record| record.enabled).map(|record| EnabledPeer { controller: at as u32, peer: record.peer }));
+		for at in 0..self.stack.controllers.len() {
+			out.extend(self.stack.records(at).into_iter().filter(|record| record.enabled).map(|record| EnabledPeer { controller: at as u32, peer: record.peer }));
 		}
 		Ok(out)
 	}
@@ -1340,7 +1866,9 @@ impl Stack {
 			return;
 		}
 		let limits = Limits::of(attachment.iso, attachment.max_command, attachment.max_event, attachment.max_acl, attachment.max_iso);
-		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, attachment.acl_queue.min(MAX_QUEUED as u32)), session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, init: Init::Reset, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, link: None, reconnect: None };
+		let queue = attachment.acl_queue.min(MAX_QUEUED as u32);
+		let acl_bytes = attachment.max_acl.saturating_sub(4).max(27);
+		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new() };
 		controller.start_init();
 		controller.pump();
 		self.controllers.push(controller);
@@ -1352,6 +1880,7 @@ impl Stack {
 		let Some(at) = self.controllers.iter().position(|controller| controller.info.slot == info.slot && controller.info.provider_generation == info.provider_generation) else { return };
 		let mut controller = self.controllers.remove(at);
 		controller.end_session();
+		controller.bredr_state.detach_watcher();
 		close(controller.packets);
 		close(controller.control);
 		close(controller.transport);
@@ -1375,9 +1904,9 @@ impl Stack {
 				continue;
 			};
 			self.on_packet(at, &packet);
-			// A PACKET CAN CARRY KEY MATERIAL - the Diffie-Hellman key arrives in an event - so both copies of
-			// it are zeroed once it has been handled, however that went: the decoded bytes are freed next, and
-			// `buf` is reused for every message after this one.
+			// A PACKET CAN CARRY KEY MATERIAL - the Diffie-Hellman key and a link key notification arrive in
+			// events - so both copies of it are zeroed once it has been handled, however that went: the decoded
+			// bytes are freed next, and `buf` is reused for every message after this one.
 			scrub(&mut packet.bytes);
 			scrub(&mut buf[..len]);
 		}
@@ -1447,12 +1976,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
-	let (catalogue, bonds, read_root, operator_root, profile_root) = (roles[0], roles[1], roles[2], roles[3], roles[4]);
+	let (catalogue, bonds, read_root, operator_root, profile_root, admin_root, audio_root) = (roles[0], roles[1], roles[2], roles[3], roles[4], roles[5], roles[6]);
 
 	// 2. subscribe to the controllers this machine publishes. A machine with none has none, which is
 	//    a subscription that stays quiet rather than a failure.
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::BluetoothHci).unwrap_or(0) } else { 0 };
-	let mut stack = Stack { controllers: Vec::new(), bonds, next_scan: 1 };
+	let mut stack = Stack { controllers: Vec::new(), bonds, next_scan: 1, grants: Vec::new(), audio: audio::AudioRoot::new() };
 	send_blocking(bootstrap, b"BluetoothService: online", 0);
 
 	let mut clients: Vec<Client> = Vec::new();
@@ -1460,11 +1989,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut reply = alloc::vec![0u8; 8192];
 	let mut subscribed = subscription != 0;
 	loop {
-		let mut waitset: Vec<u64> = Vec::with_capacity(8 + clients.len() + 2 * MAX_CONTROLLERS);
-		for root in [read_root, operator_root, profile_root] {
+		let mut waitset: Vec<u64> = Vec::with_capacity(8 + clients.len() + 3 * MAX_CONTROLLERS);
+		for root in [read_root, operator_root, profile_root, admin_root, audio_root] {
 			if root != 0 {
 				waitset.push(root);
 			}
+		}
+		// EVERY GRANT, and the task each is for: its end ends the grant.
+		for grant in &stack.grants {
+			waitset.push(grant.chan);
+			waitset.push(grant.owner);
 		}
 		if subscribed {
 			waitset.push(subscription);
@@ -1472,10 +2006,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		for controller in &stack.controllers {
 			waitset.push(controller.packets);
 			waitset.push(controller.control);
+			// A PROMPT WATCHER sends nothing; its end is waited on so that its closing - `btctl` ending - is
+			// seen at once and the controller stops being pairable.
+			if controller.bredr_state.watcher != 0 {
+				waitset.push(controller.bredr_state.watcher);
+			}
 		}
 		waitset.extend(clients.iter().map(|client| client.chan));
-		let ready = wait_any(&waitset, stack.next_deadline());
+		// THE OPENED ENDPOINTS' CHANNELS, each read only while it holds no unanswered request.
+		waitset.extend(stack.audio.pcm.iter().filter(|pcm| !pcm.holding()).map(|pcm| pcm.chan));
+		let deadline = match stack.pcm_deadline() {
+			Some(due) => due.min(stack.next_deadline()),
+			None => stack.next_deadline(),
+		};
+		let ready = wait_any(&waitset, deadline);
 		stack.run_timers();
+		stack.pcm_timers();
 		for controller in &mut stack.controllers {
 			controller.pump();
 		}
@@ -1497,6 +2043,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let info = stack.controllers[at].info.clone();
 				stack.withdraw(&info);
 			}
+			continue;
+		}
+		if let Some(at) = stack.controllers.iter().position(|controller| controller.bredr_state.watcher == handle) {
+			stack.drain_watcher(at, &mut buf);
+			continue;
+		}
+		if let Some(index) = stack.grants.iter().position(|grant| grant.chan == handle) {
+			stack.serve_grant(index, &mut buf);
+			continue;
+		}
+		if let Some(index) = stack.audio.pcm.iter().position(|pcm| pcm.chan == handle) {
+			stack.serve_pcm(index, &mut buf);
+			for controller in &mut stack.controllers {
+				controller.pump();
+			}
+			continue;
+		}
+		if let Some(index) = stack.grants.iter().position(|grant| grant.owner == handle) {
+			// THE LAUNCH IS OVER: its grant goes with it.
+			let grant = stack.grants.remove(index);
+			gatt::end_grant(grant);
 			continue;
 		}
 
@@ -1533,6 +2100,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(Interface::Operator)
 		} else if handle == profile_root {
 			Some(Interface::Profile)
+		} else if handle == admin_root {
+			Some(Interface::Admin)
+		} else if handle == audio_root {
+			Some(Interface::Audio)
 		} else {
 			None
 		};
@@ -1578,8 +2149,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				continue;
 			}
-			if interface == Interface::Profile && op == bluetooth_profile::OP_OPEN_MOUSE {
-				serve_open_mouse(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
+			if interface == Interface::Profile && op == bluetooth_profile::OP_OPEN_INPUT {
+				serve_open_input(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
+				continue;
+			}
+			if interface == Interface::Operator && op == bluetooth_operator::OP_PROMPTS {
+				serve_prompts(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
+				continue;
+			}
+			if interface == Interface::Audio && op == proto::system::bluetooth_audio::OP_ENDPOINTS {
+				audio::serve_endpoints(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
 				continue;
 			}
 		}
@@ -1588,6 +2167,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Interface::Read => bluetooth::dispatch(&mut ReadView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
 			Interface::Operator => bluetooth_operator::dispatch(&mut OperatorView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
 			Interface::Profile => bluetooth_profile::dispatch(&mut ProfileView { stack: &mut stack, target: None }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
+			Interface::Admin => proto::system::bluetooth_admin::dispatch(&mut gatt::AdminView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
+			Interface::Audio => proto::system::bluetooth_audio::dispatch(&mut audio::AudioView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
 		};
 		for &leftover in handles.as_slice() {
 			close(leftover);
@@ -1605,20 +2186,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 }
 
-// `open-mouse` is a stream: validated by the service trait, then answered with the CONSUMER end of a
-// fresh pair whose producer is kept on the link - which is where reports are written as they arrive.
-fn serve_open_mouse(stack: &mut Stack, channel: u64, request: &[u8], handles: &mut wire::Handles, reply: &mut [u8]) {
+// `open-input` is a stream: validated by the service trait, then answered with the CONSUMER end of a
+// fresh pair whose producer is kept on the link - which is where reports are written as they arrive. A
+// device whose decoder knows its gamepads tells the new stream of them first.
+fn serve_open_input(stack: &mut Stack, channel: u64, request: &[u8], handles: &mut wire::Handles, reply: &mut [u8]) {
 	let mut view = ProfileView { stack, target: None };
-	let Some((corr, result)) = bluetooth_profile::open_mouse_open(&mut view, request, handles) else { return };
+	let Some((corr, result)) = bluetooth_profile::open_input_open(&mut view, request, handles) else { return };
 	let target = view.target;
 	let answer = match (result, target) {
-		(Ok(_), Some(at)) => match channel_with_depth(64) {
-			Some((producer, consumer)) => match stack.controllers[at].link.as_mut() {
+		(Ok(_), Some((at, link_handle))) => match channel_with_depth(64) {
+			Some((producer, consumer)) => match stack.controllers[at].link_mut(link_handle) {
 				Some(link) => {
 					link.streams.push(producer);
-					if let Some(len) = bluetooth_profile::open_mouse_reply_ok(corr, reply)
+					if let Some(len) = bluetooth_profile::open_input_reply_ok(corr, reply)
 						&& send_caps_blocking(channel, &reply[..len], &[consumer])
 					{
+						for report in link.decoder.as_ref().map(input::Decoder::arrivals).unwrap_or_default() {
+							write_input(producer, &report);
+						}
 						return;
 					}
 					link.streams.retain(|&stream| stream != producer);
@@ -1637,7 +2222,38 @@ fn serve_open_mouse(stack: &mut Stack, channel: u64, request: &[u8], handles: &m
 		(Err(error), _) => error,
 		(Ok(_), None) => Error::Invalid,
 	};
-	if let Some(len) = bluetooth_profile::open_mouse_reply_err(corr, &answer, reply) {
+	if let Some(len) = bluetooth_profile::open_input_reply_err(corr, &answer, reply) {
+		send_blocking(channel, &reply[..len], 0);
+	}
+}
+
+// `prompts` is a stream too: the watcher's producer is kept on the controller, and while it is there the
+// controller is pairable and declares the IO capabilities a person can answer.
+fn serve_prompts(stack: &mut Stack, channel: u64, request: &[u8], handles: &mut wire::Handles, reply: &mut [u8]) {
+	let mut view = OperatorView { stack };
+	let Some((corr, result)) = bluetooth_operator::prompts_open(&mut view, request, handles) else { return };
+	// The controller the request named, read back from its first argument after the operation and correlation.
+	let at = request.get(6..10).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize);
+	let answer = match (result, at) {
+		(Ok(_), Some(at)) if at < stack.controllers.len() => match channel_with_depth(16) {
+			Some((producer, consumer)) => {
+				if let Some(len) = bluetooth_operator::prompts_reply_ok(corr, reply)
+					&& send_caps_blocking(channel, &reply[..len], &[consumer])
+				{
+					stack.controllers[at].bredr_state.watcher = producer;
+					stack.refresh_policy(at);
+					return;
+				}
+				close(producer);
+				close(consumer);
+				return;
+			}
+			None => Error::Exhausted,
+		},
+		(Err(error), _) => error,
+		(Ok(_), _) => Error::Invalid,
+	};
+	if let Some(len) = bluetooth_operator::prompts_reply_err(corr, &answer, reply) {
 		send_blocking(channel, &reply[..len], 0);
 	}
 }

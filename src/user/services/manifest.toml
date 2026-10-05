@@ -426,6 +426,14 @@ owner = "typec-client-provider"
 path = "user/libs/clients/typec-client-provider"
 
 [[sources]]
+owner = "display-client"
+path = "user/libs/clients/display-client"
+
+[[sources]]
+owner = "display-client-provider"
+path = "user/libs/clients/display-client-provider"
+
+[[sources]]
 owner = "input-client"
 path = "user/libs/clients/input-client"
 
@@ -841,13 +849,13 @@ providers = ["network-client", "network-proto", "lsrt"]
 name = "audio_service"
 owner = "services"
 role = "service"
-linkage = "dynamic"
+# STATIC, as BluetoothService and InputService are: the device model's arithmetic is `service_logic`'s, whose generic
+# instances a dynamic program would import from whichever provider happened to export them - and it speaks Bluetooth's
+# audio contract beside its own.
+linkage = "static"
 stage = "volume"
 destination = "libexec/audio_service.lsexe"
-# `device-proto` and `ipc-client` because this service DISCOVERS its device: it holds a
-# provider-catalogue connection and subscribes to the audio kind rather than being handed a driver
-# channel. `base-proto` comes with the catalogue's error type.
-providers = ["pcm", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+providers = []
 
 [[programs]]
 name = "beep"
@@ -1027,6 +1035,7 @@ providers = [
 	"pix",
 	"display-proto",
 	"display-device-proto",
+	"input-proto",
 	"graphics-core",
 	"graphics-proto",
 	"device-proto",
@@ -1297,26 +1306,16 @@ providers = [
 	"lsrt",
 ]
 
+# STATIC, FOR THE REASON `midi_service` IS: the console key cooking - `drivers::keys` - its Bluetooth keyboards type through is the drivers library's, which no staged library publishes,
+# and a dynamic program imports every function it calls from one.
 [[programs]]
 name = "input_service"
 owner = "services"
 role = "service"
-linkage = "dynamic"
+linkage = "static"
 stage = "volume"
 destination = "libexec/input_service.lsexe"
-# `device-proto`, `base-proto` and `ipc-client` because this service DISCOVERS its pointing devices:
-# it holds a provider-catalogue connection and asks for the input and pointer kinds.
-providers = [
-	"keys",
-	"input-proto",
-	"bluetooth-proto",
-	"device-proto",
-	"base-proto",
-	"ipc-client",
-	"wire",
-	"service-util",
-	"lsrt",
-]
+providers = []
 
 [[programs]]
 name = "ip"
@@ -1407,6 +1406,42 @@ destination = "libexec/btread.lsexe"
 providers = []
 development = true
 
+# THE AUDIO DEVICE MODEL'S SCENARIO DRIVER, development-only: a stream, a recorder, a voice session and the operator
+# authority `audioctl` holds, through which it reads where each of them plays while the gate plugs devices in and out.
+[[programs]]
+name = "audioprobe"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/audioprobe.lsexe"
+providers = []
+development = true
+
+# THE BR/EDR GATE'S PROBE, development-only: Bluetooth's read and operator authorities and the fixture's control
+# endpoint. It is the prompt watcher a person would be, answering on the operator connection, and it makes the
+# fixture's devices act from the far side of the radio.
+[[programs]]
+name = "btclassic"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/btclassic.lsexe"
+providers = []
+development = true
+
+# THE LE GATE'S APPLICATION, development-only: one GATT grant, on the peer aliased `tag-1`, and nothing else.
+[[programs]]
+name = "btgatt"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/btgatt.lsexe"
+providers = []
+development = true
+
 # THE HID-OVER-I2C GATE'S PROBE, development-only: a live pointer and contact client of InputService with a focused
 # surface, and the device policy it disables and enables the controller's and the touchscreen's bindings with.
 [[programs]]
@@ -1439,6 +1474,28 @@ role = "probe"
 linkage = "static"
 stage = "volume"
 destination = "libexec/powerread.lsexe"
+providers = []
+development = true
+
+# THE BRIGHTNESS GATE'S PROBES, development-only: `brightcheck` holds what the `brightness` tool holds and prints a
+# verdict per case; `brightread` holds the read alone, reads, and has a set sent down that read closed.
+[[programs]]
+name = "brightcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/brightcheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "brightread"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/brightread.lsexe"
 providers = []
 development = true
 
@@ -1801,7 +1858,8 @@ destination = "bin/lsfont.lsexe"
 providers = ["base-proto", "font-client", "lsrt"]
 
 # THE BLUETOOTH OPERATOR COMMAND, the one shipping holder of the operator authority: without it a machine can
-# list its radios and never pair anything.
+# list its radios and never pair anything. It reads its pairing prompts' frames itself, so it links the protocol
+# beside the client.
 [[programs]]
 name = "btctl"
 owner = "tools"
@@ -1809,7 +1867,18 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/btctl.lsexe"
-providers = ["base-proto", "bluetooth-client", "lsrt"]
+providers = ["base-proto", "bluetooth-client", "bluetooth-proto", "lsrt"]
+
+# THE AUDIO OPERATOR'S TOOL, the one shipping holder of `audio-control`: the devices, the defaults and the levels,
+# through `audio-client`'s operator client.
+[[programs]]
+name = "audioctl"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/audioctl.lsexe"
+providers = ["base-proto", "audio-client", "lsrt"]
 
 # THE SLEEP'S OPERATOR TOOL, the one shipping holder of `system-sleep`: suspend now, hibernate now, an idle sleep's
 # inhibition and the last sleep's record, through `process-client`'s sleep client.
@@ -1865,6 +1934,18 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/typec.lsexe"
 providers = ["base-proto", "typec-client", "lsrt"]
+
+# THE BRIGHTNESS TOOL: the outputs and every backlight with its key, join, standing, levels and floor through
+# DisplayService's read; a set - absolute, percent, a step, an explicit zero - and the policy's two settings through the
+# brightness policy's control, which forwards the set with the floor kept.
+[[programs]]
+name = "brightness"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/brightness.lsexe"
+providers = ["base-proto", "display-client", "lsrt"]
 
 # THE FIRMWARE-DOWNLOAD REQUESTER, the one shipping holder of an administrative request connection: PermissionManager
 # scopes it to firmware download on `dfu:` targets, and every request it makes waits for a person on the protected
@@ -2723,22 +2804,16 @@ stage = "volume"
 destination = "libexec/font_catalogue.lsexe"
 providers = []
 
+# STATIC, FOR THE REASON `midi_service` IS: the HID report-descriptor parser its input decoding goes through is the drivers library's, which no staged library publishes,
+# and a dynamic program imports every function it calls from one.
 [[programs]]
 name = "bluetooth_service"
 owner = "services"
 role = "service"
-linkage = "dynamic"
+linkage = "static"
 stage = "volume"
 destination = "libexec/bluetooth_service.lsexe"
-providers = [
-	"bluetooth-proto",
-	"device-proto",
-	"base-proto",
-	"ipc-client",
-	"wire",
-	"service-util",
-	"lsrt",
-]
+providers = []
 
 [[programs]]
 name = "bluetooth_bond_store"
@@ -2850,6 +2925,16 @@ role = "service"
 linkage = "static"
 stage = "volume"
 destination = "libexec/processor_power_service.lsexe"
+providers = []
+
+# STATIC, FOR THE REASON `smartcard_service` IS: its decisions are `service-logic`'s, which no staged library publishes.
+[[programs]]
+name = "brightness_policy"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/brightness_policy.lsexe"
 providers = []
 
 [[programs]]
@@ -3066,8 +3151,9 @@ heartbeat-deadline = 100
 suspend-deadline = 100
 
 # THE IN-GUEST BLUETOOTH FIXTURE, and the reason the Bluetooth host stack can be proved at all: an
-# emulated controller and the LE boot mouse on the far side of its radio, published as a
-# `bluetooth-hci` provider over the production transport wire. There is no radio in an emulator.
+# emulated dual-mode controller, the LE boot mouse and five BR/EDR devices on the far side of its radio,
+# published as a `bluetooth-hci` provider over the production transport wire - and the control endpoint
+# the gates' probes drive the devices through. There is no radio in an emulator.
 #
 # DEVELOPMENT-ONLY, AND BOUND BY ADDRESS. The device it binds is QEMU's `edu` test function, which a
 # gate adds at this exact address and which no shipping machine has - so the fixture cannot be
@@ -3091,7 +3177,10 @@ match = [
 	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 29, func = 0 } },
 ]
 priority = "quirk"
-provides = [{ kind = "bluetooth-hci", most = 1, consumers = 1 }]
+provides = [
+	{ kind = "bluetooth-hci", most = 1, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
@@ -3355,6 +3444,48 @@ lifecycle = "function"
 dma = "none"
 match = [{ transport = "platform", hid = "PNP0C0B" }]
 provides = [{ kind = "cooling-device", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# THE ACPI VIDEO BACKLIGHT: one binding per panel output - a method-only device of the `video-output` class below a display
+# adapter's companion - published as a `backlight` to DisplayService alone, which joins it to the output whose pixels
+# that adapter decodes. `_BCL`'s levels, `_BCM` and `_BQC` on the node, the adapter's `_DOS` the one parent method its
+# class admits; the output's hotkey notifications forwarded for DisplayService to apply like keys. It takes the sleep
+# itself: `_DOS` and the level applied again at the resume. It masters nothing and reaches no register.
+[[programs]]
+name = "acpi_backlight"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_backlight.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", class = "video-output" }]
+provides = [{ kind = "backlight", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# THE ACPI AMBIENT-LIGHT SENSOR: one binding per `ACPI0008` node, published as an `ambient-light` to the brightness
+# policy alone - `_ALI` the reading, `_ALR` the response curve, `_ALP` the polling interval where the firmware notifies
+# nothing. It takes the sleep itself: polling stopped, and the reading taken again at the resume.
+[[programs]]
+name = "acpi_als"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/acpi_als.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", hid = "ACPI0008" }]
+provides = [{ kind = "ambient-light", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
@@ -3956,6 +4087,10 @@ provides = [
 	{ kind = "modem", most = 1, consumers = 1 },
 	{ kind = "camera", most = 1, consumers = 1 },
 	{ kind = "admin-executor", most = 1, consumers = 1 },
+	# A USB MONITOR'S BRIGHTNESS AND THE AMBIENT-LIGHT SENSOR IT MAY CARRY: one monitor, two publications, and one
+	# consumer each - DisplayService drives the backlight, the brightness policy reads the light.
+	{ kind = "backlight", most = 1, consumers = 1 },
+	{ kind = "ambient-light", most = 1, consumers = 1 },
 	# AND GAMEPADS, WHICH ARE NOT A POINTER: every gamepad of every HID interface this controller binds, on
 	# one standing publication made at the handshake whether or not one is plugged in, with InputService its
 	# one consumer. LAST, because an offer's token is its position.
@@ -4131,6 +4266,14 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:audio@1/audio-stats"
 presence = "optional"
+
+# THE OPERATOR ROOT: the inventory, the default devices and each device's level, which PermissionManager reaches by
+# name through the broker for `audioctl` and nothing else holds. Last, as every addition to a role list is.
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:audio@1/audio-control"
 
 [[services]]
 name = "config_service"
@@ -4560,7 +4703,7 @@ kind = "factory"
 provider = "device_manager"
 source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
-kinds = ["display"]
+kinds = ["display", "backlight"]
 presence = "optional"
 
 
@@ -4597,6 +4740,32 @@ tag = "OUTPUTS"
 kind = "serve-root"
 provider = "self"
 interface = "liber:display@1/display-outputs"
+presence = "optional"
+
+# THE BRIGHTNESS: the read every holder of the `brightness` capability reaches, the set the brightness policy alone
+# holds - no capability name resolves to it - and the system-key stream InputService hands this service alone. All
+# optional: a boot without them has keys that do nothing and no brightness to read.
+[[services.roles]]
+tag = "BRIGHTNESS"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display-brightness"
+presence = "optional"
+
+[[services.roles]]
+tag = "BRIGHTNESSCTL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display-brightness-control"
+presence = "optional"
+
+[[services.roles]]
+tag = "SYSKEYS"
+kind = "client"
+provider = "input_service"
+source = "SYSKEYS"
+interface = "liber:input@1/system-keys"
+exclusive = true
 presence = "optional"
 
 [[services]]
@@ -4691,6 +4860,24 @@ tag = "ACTIVITY"
 kind = "serve-root"
 provider = "self"
 interface = "liber:input@1/input-activity"
+presence = "optional"
+
+# THE SYSTEM KEYS: the consumer page's brightness pair, taken off the raw key stream before ordinary delivery and
+# streamed to DisplayService alone, which owns the brightness.
+[[services.roles]]
+tag = "SYSKEYS"
+kind = "serve-root"
+provider = "self"
+interface = "liber:input@1/system-keys"
+presence = "optional"
+
+# THE CONSOLE INPUT PRIVILEGE, delegated so InputService can type a Bluetooth keyboard's keys into the text console
+# through the drivers' own key cooking - the one holder besides DeviceManager's keyboard drivers. Optional, and LAST
+# like every addition to a positional bootstrap.
+[[services.roles]]
+tag = "CONSOLE"
+kind = "privilege"
+provider = "kernel"
 presence = "optional"
 
 # THE SYSTEM INSTANCE STARTS BEFORE THE THREE VOLUME INSTANCES, AND THE DEPENDENCY IS WHAT SAYS SO
@@ -5604,6 +5791,25 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:bluetooth@1/bluetooth-profile"
 
+# THE MINTING ROOT, which PermissionManager reaches by name through the broker and nothing else holds: an application's
+# GATT client is minted from it per launch, for one component, one aliased peer and a set of services. LAST, like
+# every addition to a positional bootstrap.
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-admin"
+
+# THE AUDIO ROOT, which AudioService reaches by name through the broker and nothing else holds: its endpoints offered as
+# they come and go, each opened as a PCM channel on the device-side contract, levels both ways and the call relay. Never
+# a role of AudioService's: stopping the radio's stack stops no audio. LAST, like every addition to a positional
+# bootstrap.
+[[services.roles]]
+tag = "AUDIO"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-audio"
+
 # POWER STATE, NORMALISED, AND THE FEW DEVICE CONTROLS AN OPERATOR MAY USE. It consumes every
 # `power-source` publication through a catalogue connection minted for that kind and `platform-switch`, and serves two
 # roots: STATE, which enumerates and subscribes and can change nothing, and CONTROL, which switches an
@@ -5900,6 +6106,90 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:bmc@1/bmc"
+
+# THE BRIGHTNESS POLICY: a stored level restored when a backlight appears, the firmware's default by power source where
+# nothing is stored, the active backlight dimmed at the idle timeout and put back at the first input, and automatic
+# brightness from an ambient-light sensor once someone turns it on. DisplayService owns the backlights, the keys and the
+# floor; this service asks it through `BRIGHTNESSCTL`, whose one client this is - no capability name resolves to that
+# root - and serves CONTROL, which the `brightness` tool reaches through the `brightness-control` capability.
+#
+# A SERVICE OF ITS OWN BECAUSE THE SCREEN MUST NOT WAIT FOR A VOLUME: restoring needs ConfigService, and DisplayService
+# starts without it.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE, SO NO ROLE IS EXCLUSIVE: an exclusive client end is handed over at the first delivery,
+# and a relaunch would find nothing to deliver. Settings and levels are ConfigService's; everything else is read again.
+# ITS CONNECTIONS TO DISPLAYSERVICE, POWERSERVICE AND INPUTSERVICE ARE MINTED, NOT THE ROOTS DUPLICATED: a duplicated root
+# is shared with the supervisor minting on it, and two readers on one channel take each other's answers - and
+# PowerService answers nothing on its root but a mint.
+[[services]]
+name = "brightness_policy"
+program = "brightness_policy"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = [
+	"log_service",
+	"process_service",
+	"device_manager",
+	"input_service",
+	"display_service",
+	"power_service",
+	"config_service",
+]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["ambient-light"]
+presence = "optional"
+
+[[services.roles]]
+tag = "BRIGHTNESS"
+kind = "factory"
+provider = "display_service"
+source = "BRIGHTNESS"
+interface = "liber:display@1/display-brightness"
+presence = "optional"
+
+[[services.roles]]
+tag = "BRIGHTNESSCTL"
+kind = "factory"
+provider = "display_service"
+source = "BRIGHTNESSCTL"
+interface = "liber:display@1/display-brightness-control"
+presence = "optional"
+
+[[services.roles]]
+tag = "CONFIG"
+kind = "client"
+provider = "config_service"
+interface = "liber:config@1/config"
+presence = "optional"
+
+[[services.roles]]
+tag = "POWER"
+kind = "factory"
+provider = "power_service"
+source = "SERVE"
+interface = "liber:power@1/power"
+presence = "optional"
+
+[[services.roles]]
+tag = "ACTIVITY"
+kind = "factory"
+provider = "input_service"
+source = "ACTIVITY"
+interface = "liber:input@1/input-activity"
+presence = "optional"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/brightness-policy"
 
 # THE TYPE-C CONNECTORS. It consumes every `typec-connector` publication through a catalogue connection minted for that
 # kind alone, holds no claim and publishes nothing, and serves two roots: SERVE, which enumerates and subscribes and
@@ -6607,6 +6897,13 @@ owner = "typec-client-provider"
 destination = "lib/clients/typec-client.lslib"
 features = ["shared-image"]
 providers = ["typec-proto"]
+
+[[libraries]]
+name = "display-client"
+owner = "display-client-provider"
+destination = "lib/clients/display-client.lslib"
+features = ["shared-image"]
+providers = ["display-proto"]
 
 [[libraries]]
 name = "input-client"

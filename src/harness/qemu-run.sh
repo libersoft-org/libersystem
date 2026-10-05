@@ -28,6 +28,8 @@
 #             by a boot that says `off`. A NAMED KNOB RATHER THAN A QEMU_EXTRA RECIPE, because which
 #             timer an idle core programmed is what such a run is for.
 #   GPU_SIZE=WxH  the x86_64 interactive `virtio-vga`'s scanout size (its xres and yres)
+#   VGA=std   x86_64 interactive: q35's own VGA function at 00:01.0 instead of `virtio-vga` - the boot framebuffer in a
+#             function's BAR, presented by DisplayService as the boot framebuffer (the brightness gate's ACPI half)
 #   MEM=      override RAM (default varies by arch)
 #   STRIP=    none | debug | all for a harness-created boot medium (default: all)
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
@@ -2521,7 +2523,14 @@ qemu_run_x86_64() {
 		fi
 		gpu_size_args=",xres=${BASH_REMATCH[1]},yres=${BASH_REMATCH[2]}"
 	fi
-	qemu_args+=(-vga none -device "virtio-vga${virtio_plain:+,$virtio_plain}${gpu_size_args}")
+	# VGA=std: q35's own VGA function, at 00:01.0, in place of `virtio-vga` - so the boot framebuffer lies in a PCI
+	# function's BAR, which is the kernel's "decoder" of it and the function a laptop's firmware backlight is joined to
+	# through; no display driver binds it, and DisplayService presents on the boot framebuffer.
+	if [[ "${VGA:-}" == "std" ]]; then
+		qemu_args+=(-vga std)
+	else
+		qemu_args+=(-vga none -device "virtio-vga${virtio_plain:+,$virtio_plain}${gpu_size_args}")
+	fi
 	qemu_append_audio qemu_args
 	qemu_args+=(-device "virtio-sound-pci,audiodev=snd0${virtio_plain:+,$virtio_plain}")
 

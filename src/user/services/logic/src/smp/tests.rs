@@ -1,4 +1,4 @@
-use super::{Address, Keys, PublicKeyX, Value, comparison_digits, f4, f5, f6, g2};
+use super::{Address, Keys, PublicKeyX, Value, c1, comparison_digits, f4, f5, f6, g2, s1};
 use crate::aes::{BLOCK, Key};
 use crate::cmac::mac;
 
@@ -105,4 +105,24 @@ fn swapping_the_two_addresses_derives_a_different_key() {
 	assert_ne!(right.mac_key, swapped.mac_key);
 	// The same for the nonces, which is the other pair an implementation can transpose.
 	assert_ne!(right.ltk, f5(&w, &n2(), &n1(), &a1(), &a2()).ltk);
+}
+
+// THE LEGACY CONFIRM VALUE AND SHORT-TERM KEY, against the specification's own sample data.
+#[test]
+fn c1_matches_the_specifications_legacy_confirm_sample() {
+	let k = [0u8; 16];
+	let r: Value = hex("5783D52156AD6F0E6388274EC6702EE0");
+	let preq: [u8; 7] = hex("07071000000101");
+	let pres: [u8; 7] = hex("05000800000302");
+	let ia: [u8; 6] = hex("A1A2A3A4A5A6");
+	let ra: [u8; 6] = hex("B1B2B3B4B5B6");
+	assert_eq!(c1(&k, &r, &preq, &pres, 1, &ia, 0, &ra), hex::<16>("1e1e3fef878988ead2a74dc5bef13b86"));
+}
+
+#[test]
+fn s1_matches_the_specifications_short_term_key_sample() {
+	let k = [0u8; 16];
+	let r1: Value = hex("000F0E0D0C0B0A091122334455667788");
+	let r2: Value = hex("010203040506070899AABBCCDDEEFF00");
+	assert_eq!(s1(&k, &r1, &r2), hex::<16>("9a1fe1f0e8b0f49b5b4216ae796da062"));
 }

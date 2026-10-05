@@ -1601,6 +1601,8 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_DEVICE,
 			CAP_BT_READ,
 			CAP_BT_OPERATOR,
+			CAP_BT_ADMIN,
+			CAP_AUDIO_CONTROL,
 			CAP_INPUT,
 			CAP_POWER_STATE,
 			CAP_POWER_CONTROL,
@@ -1623,10 +1625,14 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 			CAP_SLEEP,
 			CAP_SLEEP_WAKE,
 			CAP_PROCESSOR_POWER,
+			CAP_BRIGHTNESS,
+			CAP_BRIGHTNESS_CONTROL,
 		],
 		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
 		// over at bring-up went with the instance that ended.
 		b"input_service" => &[CAP_BT_PROFILE],
+		// THE AUDIO ENDPOINTS, re-resolved in the same way after a restart of the stack.
+		b"audio_service" => &[CAP_BT_AUDIO],
 		b"console_service" => &[CAP_CONFIG, CAP_DEVICE],
 		b"system_graph_service" => &[CAP_DEVICE],
 		// The shell resolves the system graph rather than holding the connection it was given
@@ -1642,7 +1648,8 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_CONFIG => Some(b"config_service"),
 		CAP_DEVICE => Some(b"device_service"),
 		CAP_GRAPH => Some(b"system_graph_service"),
-		CAP_BT_READ | CAP_BT_OPERATOR | CAP_BT_PROFILE => Some(b"bluetooth_service"),
+		CAP_BT_READ | CAP_BT_OPERATOR | CAP_BT_PROFILE | CAP_BT_ADMIN | CAP_BT_AUDIO => Some(b"bluetooth_service"),
+		CAP_AUDIO_CONTROL => Some(b"audio_service"),
 		CAP_INPUT => Some(b"input_service"),
 		CAP_POWER_STATE | CAP_POWER_CONTROL => Some(b"power_service"),
 		CAP_SMARTCARD_ADMIN => Some(b"smartcard_service"),
@@ -1656,6 +1663,8 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_BMC => Some(b"bmc_service"),
 		CAP_TYPEC | CAP_TYPEC_CONTROL => Some(b"typec_service"),
 		CAP_PROCESSOR_POWER => Some(b"processor_power_service"),
+		CAP_BRIGHTNESS => Some(b"display_service"),
+		CAP_BRIGHTNESS_CONTROL => Some(b"brightness_policy"),
 		_ => None,
 	}
 }
@@ -1688,6 +1697,9 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_BT_READ => broker.kept.end_of(b"bluetooth_service", b"SERVE"),
 		CAP_BT_OPERATOR => broker.kept.end_of(b"bluetooth_service", b"OPERATOR"),
 		CAP_BT_PROFILE => broker.kept.end_of(b"bluetooth_service", b"PROFILE"),
+		CAP_BT_ADMIN => broker.kept.end_of(b"bluetooth_service", b"ADMIN"),
+		CAP_BT_AUDIO => broker.kept.end_of(b"bluetooth_service", b"AUDIO"),
+		CAP_AUDIO_CONTROL => broker.kept.end_of(b"audio_service", b"CONTROL"),
 		// INPUTSERVICE'S ORDINARY ROOT, for the one grant that could never deliver anything. The
 		// `input` capability has been in the vocabulary with no client behind it - PermissionManager's
 		// table held zero - so a component granted it received nothing and could not subscribe to a
@@ -1712,6 +1724,8 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_TYPEC => broker.kept.end_of(b"typec_service", b"SERVE"),
 		CAP_TYPEC_CONTROL => broker.kept.end_of(b"typec_service", b"CONTROL"),
 		CAP_PROCESSOR_POWER => broker.kept.end_of(b"processor_power_service", b"CONTROL"),
+		CAP_BRIGHTNESS => broker.kept.end_of(b"display_service", b"BRIGHTNESS"),
+		CAP_BRIGHTNESS_CONTROL => broker.kept.end_of(b"brightness_policy", b"CONTROL"),
 		_ => 0,
 	};
 	let alive: bool = match service_of_cap(name).and_then(index_of) {
@@ -1956,9 +1970,10 @@ fn hand_acpi_admin(kept: &Kept, channels: &[u64; N]) {
 // the plan cannot carry - its liveness channel and the boot mode - are `supervisor_role`'s, and its timers are in the
 // hardware. The ACPI service's privilege is `supervisor_role`'s too, and what it published is the kernel's to keep.
 // ProcessorPowerService's privilege and its three clients of this supervisor are `supervisor_role`'s, and what it
-// installed is the kernel's to keep.
+// installed is the kernel's to keep. The brightness policy holds no exclusive role: its settings and levels are
+// ConfigService's, and everything else it reads again.
 fn plan_relaunchable(name: &[u8]) -> bool {
-	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service" || name == b"hibernation_service" || name == b"processor_power_service"
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service" || name == b"tpm_service" || name == b"watchdog_service" || name == b"acpi_service" || name == b"bmc_service" || name == b"typec_service" || name == b"hibernation_service" || name == b"processor_power_service" || name == b"brightness_policy"
 }
 
 // Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its

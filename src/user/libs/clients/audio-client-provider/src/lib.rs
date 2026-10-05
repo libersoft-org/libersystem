@@ -32,3 +32,8 @@ forward!("liber_channel_liber_audio_audio_open_capture", "liber_channel_impl_lib
 forward!("liber_channel_liber_audio_pcm_capture_read", "liber_channel_impl_liber_audio_pcm_capture_read");
 forward!("liber_channel_liber_audio_pcm_capture_close", "liber_channel_impl_liber_audio_pcm_capture_close");
 forward!("liber_channel_liber_audio_audio_admin_open_captures", "liber_channel_impl_liber_audio_audio_admin_open_captures");
+forward!("liber_channel_liber_audio_audio_control_devices", "liber_channel_impl_liber_audio_audio_control_devices");
+forward!("liber_channel_liber_audio_audio_control_set_default", "liber_channel_impl_liber_audio_audio_control_set_default");
+forward!("liber_channel_liber_audio_audio_control_set_volume", "liber_channel_impl_liber_audio_audio_control_set_volume");
+forward!("liber_channel_liber_audio_audio_control_streams", "liber_channel_impl_liber_audio_audio_control_streams");
+forward!("liber_channel_liber_audio_audio_control_counters", "liber_channel_impl_liber_audio_audio_control_counters");

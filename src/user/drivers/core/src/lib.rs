@@ -46,6 +46,15 @@ pub mod blk;
 // fixture driver links it - and its cryptography is a separate implementation from the host stack's,
 // held to the same published vectors, so the two agreeing in the guest means something.
 pub mod bt_peer;
+// THE EMULATED BR/EDR WORLD the same fixture plays beside the mouse: the classic half of its controller and five
+// classic devices, their L2CAP, SDP and RFCOMM written apart from the host stack's. DEVELOPMENT-ONLY in what uses it.
+pub mod bt_world;
+// THE EMULATED LE WORLD beyond the mouse: three LE peripherals pairing in every model, with private addresses, key
+// distribution and attribute servers of their own. DEVELOPMENT-ONLY in what uses it.
+pub mod bt_le_world;
+// THE FIXTURE'S SBC: what the emulated headset reads from a stream and the emulated phone writes into one - its own
+// frame reader, CRC, allocation and dequantization, apart from the host's codec. DEVELOPMENT-ONLY in what uses it.
+pub mod bt_sbc;
 // THE USB BLUETOOTH HCI TRANSPORT'S DECISIONS: the controller's pipes, and where one HCI packet ends in transfers
 // that do not say.
 pub mod bt_usb;
@@ -81,6 +90,12 @@ pub mod hid;
 // THE HID POWER DEVICE CLASS OVER THE COMMON HID FIELD TABLE: which fields carry a UPS's values, what the latest
 // reports say, and how a control is written back.
 pub mod hid_power;
+// THE USB MONITOR CONTROL CLASS AND THE HID AMBIENT-LIGHT SENSOR OVER THE SAME TABLE: a monitor's brightness and EDID,
+// and a sensor's illuminance.
+pub mod hid_display;
+// ACPI'S VIDEO EXTENSION AND ITS LIGHT SENSOR, the backlight and sensor drivers' parts a host can test: `_BCL`, `_BQC`,
+// the output's notification map, the firmware that steps itself, and `_ALI`, `_ALR` and `_ALP`.
+pub mod acpi_video;
 // HID OVER I2C, the driver's parts a host can test: which collections publish what, which report goes where, the
 // reset handshake's bound and the interrupt-storm rule.
 pub mod i2c_hid;

@@ -181,6 +181,86 @@ pub fn f6(w: &[u8; 16], n1: &[u8; 16], n2: &[u8; 16], r: &[u8; 16], io_cap: &[u8
 // The gate proves that the key the host presented after a cold reboot is the key the first boot's
 // pairing produced, and it needs to compare the two without either one appearing in a log. Four bytes
 // of a CMAC under the key itself identify it without revealing it.
+// `g2`, the six digits of Numeric Comparison: CMAC under X over U, V and Y, the low thirty-two bits.
+pub fn g2(u: &[u8; 32], v: &[u8; 32], x: &[u8; 16], y: &[u8; 16]) -> u32 {
+	let mut message = [0u8; 80];
+	message[..32].copy_from_slice(u);
+	message[32..64].copy_from_slice(v);
+	message[64..].copy_from_slice(y);
+	let tag = cmac(x, &message);
+	u32::from_be_bytes([tag[12], tag[13], tag[14], tag[15]])
+}
+
+// `c1`, legacy pairing's confirm: e(k, e(k, r ^ p1) ^ p2), p1 the response, the request and the two address types,
+// p2 four zero octets and the initiator's then the responder's address.
+pub fn c1(k: &[u8; 16], r: &[u8; 16], preq: &[u8; 7], pres: &[u8; 7], iat: u8, ia: &[u8; 6], rat: u8, ra: &[u8; 6]) -> [u8; 16] {
+	let mut p1 = [0u8; 16];
+	p1[..7].copy_from_slice(pres);
+	p1[7..14].copy_from_slice(preq);
+	p1[14] = rat;
+	p1[15] = iat;
+	let mut first = [0u8; 16];
+	for i in 0..16 {
+		first[i] = r[i] ^ p1[i];
+	}
+	let mut second = aes128(k, &first);
+	for (i, byte) in second.iter_mut().enumerate().skip(4) {
+		*byte ^= if i < 10 { ia[i - 4] } else { ra[i - 10] };
+	}
+	aes128(k, &second)
+}
+
+// `s1`, legacy's short-term key: e(k, the low halves of r1 then r2).
+pub fn s1(k: &[u8; 16], r1: &[u8; 16], r2: &[u8; 16]) -> [u8; 16] {
+	let mut block = [0u8; 16];
+	block[..8].copy_from_slice(&r1[8..]);
+	block[8..].copy_from_slice(&r2[8..]);
+	aes128(k, &block)
+}
+
+// `ah`, the private address hash: the low twenty-four bits of e(irk, prand padded).
+pub fn ah(irk: &[u8; 16], prand: [u8; 3]) -> [u8; 3] {
+	let mut block = [0u8; 16];
+	block[13..].copy_from_slice(&prand);
+	let out = aes128(irk, &block);
+	[out[13], out[14], out[15]]
+}
+
+// ------------------------------------------------------------------ cross-transport key derivation
+
+// `h6(W, keyID)`, a CMAC under W over the four-octet key id; and `h7(SALT, W)`, a CMAC under the salt over W - values
+// most significant first.
+pub fn h6(w: &[u8; 16], key_id: &[u8; 4]) -> [u8; 16] {
+	cmac(w, key_id)
+}
+
+pub fn h7(salt: &[u8; 16], w: &[u8; 16]) -> [u8; 16] {
+	cmac(salt, w)
+}
+
+// A salt `h7` takes: the four ASCII octets in the low end, zero above.
+fn salt(text: &[u8; 4]) -> [u8; 16] {
+	let mut out = [0u8; 16];
+	out[12..].copy_from_slice(text);
+	out
+}
+
+// THE BR/EDR LINK KEY A DUAL-MODE DEVICE DERIVES from its LE Secure Connections LTK, as HCI carries a link key - least
+// significant octet first: `h7` with `tmp1` where both sides set CT2, `h6` with it otherwise, then `h6` with `lebr`.
+pub fn link_key_from_ltk(ltk: &[u8; 16], ct2: bool) -> [u8; 16] {
+	let intermediate = if ct2 { h7(&salt(b"tmp1"), ltk) } else { h6(ltk, b"tmp1") };
+	let mut key = h6(&intermediate, b"lebr");
+	key.reverse();
+	key
+}
+
+// THE LE LTK FROM A BR/EDR SECURE CONNECTIONS LINK KEY held as HCI carries it: `tmp2`, then `brle`.
+pub fn ltk_from_link_key(link_key: &[u8; 16], ct2: bool) -> [u8; 16] {
+	let w: [u8; 16] = reversed(link_key);
+	let intermediate = if ct2 { h7(&salt(b"tmp2"), &w) } else { h6(&w, b"tmp2") };
+	h6(&intermediate, b"brle")
+}
+
 pub fn fingerprint(key: &[u8; 16]) -> u32 {
 	let tag = cmac(key, b"liber bt fixture fingerprint");
 	u32::from_be_bytes([tag[0], tag[1], tag[2], tag[3]])
@@ -234,6 +314,9 @@ pub struct Peer {
 	// GATT state.
 	pub boot_mode: bool,
 	pub notify: bool,
+	// Report protocol's own report: notifications turned on through its configuration descriptor.
+	pub report_mode: bool,
+	pub notify_report: bool,
 }
 
 // The peer's public key, as the wire carries it. Any 64 bytes the emulated controller will agree on.
@@ -247,7 +330,7 @@ pub fn peer_public_key() -> [u8; 64] {
 
 impl Peer {
 	pub const fn new() -> Peer {
-		Peer { smp: Smp::Idle, host: [0; 7], pka: [0; 64], na: [0; 16], request: [0; 7], mac_key: [0; 16], ltk: None, pairings: 0, boot_mode: false, notify: false }
+		Peer { smp: Smp::Idle, host: [0; 7], pka: [0; 64], na: [0; 16], request: [0; 7], mac_key: [0; 16], ltk: None, pairings: 0, boot_mode: false, notify: false, report_mode: false, notify_report: false }
 	}
 
 	fn own(&self) -> [u8; 7] {
@@ -263,6 +346,8 @@ impl Peer {
 		self.smp = Smp::Idle;
 		self.boot_mode = false;
 		self.notify = false;
+		self.report_mode = false;
+		self.notify_report = false;
 	}
 
 	// One SMP PDU from the host, answered with the PDUs to send back.
@@ -335,15 +420,30 @@ impl Default for Peer {
 
 // ------------------------------------------------------------------ the GATT server
 
-// The HOGP boot mouse table: GAP, then HID with protocol mode, the boot report and its configuration
-// descriptor, then HID information. (handle, attribute type, declaration value handle, characteristic uuid)
+// The HOGP mouse table: GAP, then HID with protocol mode, the boot report and its configuration descriptor, HID
+// information, the report map, and report protocol's input report with its configuration and its reference.
+// (handle, attribute type, declaration value handle, characteristic uuid)
 pub const PROTOCOL_MODE_VALUE: u16 = 0x0008;
 pub const REPORT_VALUE: u16 = 0x000a;
 pub const REPORT_CONFIGURATION: u16 = 0x000b;
+pub const REPORT_MAP_VALUE: u16 = 0x000f;
+pub const INPUT_REPORT_VALUE: u16 = 0x0011;
+pub const INPUT_REPORT_CONFIGURATION: u16 = 0x0012;
+pub const INPUT_REPORT_REFERENCE: u16 = 0x0013;
 
-const SERVICES: [(u16, u16, u16); 2] = [(0x0001, 0x0005, 0x1800), (0x0006, 0x000e, 0x1812)];
-const DECLARATIONS: [(u16, u16, u16); 4] = [(0x0002, 0x0003, 0x2a00), (0x0007, 0x0008, 0x2a4e), (0x0009, 0x000a, 0x2a33), (0x000c, 0x000d, 0x2a4a)];
-const ATTRIBUTES: [(u16, u16); 12] = [
+// THE REPORT MAP: three buttons, X, Y and a wheel, relative - longer than one ATT packet, so a host reads it in pieces.
+#[rustfmt::skip]
+pub const REPORT_MAP: [u8; 52] = [
+	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00,
+	0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+	0x95, 0x01, 0x75, 0x05, 0x81, 0x03,
+	0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
+	0xc0, 0xc0,
+];
+
+const SERVICES: [(u16, u16, u16); 2] = [(0x0001, 0x0005, 0x1800), (0x0006, 0x0013, 0x1812)];
+const DECLARATIONS: [(u16, u16, u16); 6] = [(0x0002, 0x0003, 0x2a00), (0x0007, 0x0008, 0x2a4e), (0x0009, 0x000a, 0x2a33), (0x000c, 0x000d, 0x2a4a), (0x000e, 0x000f, 0x2a4b), (0x0010, 0x0011, 0x2a4d)];
+const ATTRIBUTES: [(u16, u16); 17] = [
 	(0x0001, 0x2800),
 	(0x0002, 0x2803),
 	(0x0003, 0x2a00),
@@ -355,7 +455,12 @@ const ATTRIBUTES: [(u16, u16); 12] = [
 	(0x000b, 0x2902),
 	(0x000c, 0x2803),
 	(0x000d, 0x2a4a),
-	(0x000e, 0x2a4b),
+	(0x000e, 0x2803),
+	(0x000f, 0x2a4b),
+	(0x0010, 0x2803),
+	(0x0011, 0x2a4d),
+	(0x0012, 0x2902),
+	(0x0013, 0x2908),
 ];
 
 fn not_found(request: u8, handle: u16) -> alloc::vec::Vec<u8> {
@@ -403,7 +508,31 @@ impl Peer {
 			}
 			0x52 if pdu.len() == 4 && u16::from_le_bytes([pdu[1], pdu[2]]) == PROTOCOL_MODE_VALUE => {
 				self.boot_mode = pdu[3] == 0;
+				self.report_mode = pdu[3] == 1;
 				None
+			}
+			// THE REPORT MAP, in packet-sized pieces, and the input report's reference: report id 0, an input.
+			0x0a if pdu.len() == 3 && u16::from_le_bytes([pdu[1], pdu[2]]) == REPORT_MAP_VALUE => {
+				let mut out = alloc::vec![0x0b];
+				out.extend_from_slice(&REPORT_MAP[..REPORT_MAP.len().min(ROOM + 1)]);
+				Some(out)
+			}
+			0x0c if pdu.len() == 5 && u16::from_le_bytes([pdu[1], pdu[2]]) == REPORT_MAP_VALUE => {
+				let offset = usize::from(u16::from_le_bytes([pdu[3], pdu[4]]));
+				if offset > REPORT_MAP.len() {
+					return Some(alloc::vec![0x01, 0x0c, pdu[1], pdu[2], 0x07]);
+				}
+				let mut out = alloc::vec![0x0d];
+				out.extend_from_slice(&REPORT_MAP[offset..REPORT_MAP.len().min(offset + ROOM + 1)]);
+				Some(out)
+			}
+			0x0a if pdu.len() == 3 && u16::from_le_bytes([pdu[1], pdu[2]]) == INPUT_REPORT_REFERENCE => Some(alloc::vec![0x0b, 0, 1]),
+			0x12 if pdu.len() == 5 && u16::from_le_bytes([pdu[1], pdu[2]]) == INPUT_REPORT_CONFIGURATION => {
+				if !encrypted {
+					return Some(alloc::vec![0x01, 0x12, pdu[1], pdu[2], 0x0f]);
+				}
+				self.notify_report = pdu[3] & 0x01 != 0;
+				Some(alloc::vec![0x13])
 			}
 			0x12 if pdu.len() == 5 && u16::from_le_bytes([pdu[1], pdu[2]]) == REPORT_CONFIGURATION => {
 				if !encrypted {
@@ -418,11 +547,17 @@ impl Peer {
 	}
 
 	// The next scripted report as a notification, once the host has asked for them.
+	// IN REPORT PROTOCOL the input report carries the map's layout - buttons, X, Y and a wheel - and in boot protocol
+	// the boot report's.
 	pub fn report(&self, step: u32) -> Option<alloc::vec::Vec<u8>> {
+		let (buttons, dx, dy): (u8, i8, i8) = script(step);
+		if self.report_mode && self.notify_report {
+			let handle = INPUT_REPORT_VALUE.to_le_bytes();
+			return Some(alloc::vec![0x1b, handle[0], handle[1], buttons, dx as u8, dy as u8, 0]);
+		}
 		if !self.boot_mode || !self.notify {
 			return None;
 		}
-		let (buttons, dx, dy): (u8, i8, i8) = script(step);
 		let handle = REPORT_VALUE.to_le_bytes();
 		Some(alloc::vec![0x1b, handle[0], handle[1], buttons, dx as u8, dy as u8])
 	}

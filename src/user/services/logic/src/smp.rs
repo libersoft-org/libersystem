@@ -124,5 +124,41 @@ pub const fn comparison_digits(g2: u32) -> u32 {
 	g2 % 1_000_000
 }
 
+/// `c1`, LE legacy pairing's confirm value: `e(k, e(k, r ^ p1) ^ p2)`, where `p1` is the pairing response, the
+/// pairing request and the two address types, and `p2` four zero octets and the two addresses - initiator first.
+///
+/// LEGACY PAIRING IS ONLY EVER RUN ON THE OPERATOR'S WORD, for a device that has nothing better: its key agreement
+/// is a recording away from broken by anyone who heard it. This is here so that such a device can be bonded at
+/// the legacy level it earns, and called by nothing else.
+pub fn c1(k: &Value, r: &Value, preq: &[u8; 7], pres: &[u8; 7], iat: u8, ia: &[u8; 6], rat: u8, ra: &[u8; 6]) -> Value {
+	let mut p1 = [0u8; BLOCK];
+	p1[..7].copy_from_slice(pres);
+	p1[7..14].copy_from_slice(preq);
+	p1[14] = rat;
+	p1[15] = iat;
+	let mut p2 = [0u8; BLOCK];
+	p2[4..10].copy_from_slice(ia);
+	p2[10..16].copy_from_slice(ra);
+	let key = Key::new(k);
+	let mut block = [0u8; BLOCK];
+	for (at, byte) in block.iter_mut().enumerate() {
+		*byte = r[at] ^ p1[at];
+	}
+	let mut inner = key.block(&block);
+	for (at, byte) in inner.iter_mut().enumerate() {
+		*byte ^= p2[at];
+	}
+	key.block(&inner)
+}
+
+/// `s1`, LE legacy pairing's short-term key: `e(k, r1' || r2')`, the low halves of the responder's and the
+/// initiator's random values.
+pub fn s1(k: &Value, r1: &Value, r2: &Value) -> Value {
+	let mut block = [0u8; BLOCK];
+	block[..8].copy_from_slice(&r1[8..]);
+	block[8..].copy_from_slice(&r2[8..]);
+	Key::new(k).block(&block)
+}
+
 #[cfg(test)]
 mod tests;
