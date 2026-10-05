@@ -55,6 +55,8 @@ mod gatt;
 mod input;
 #[path = "bluetooth_service/le.rs"]
 mod le;
+#[path = "bluetooth_service/voice.rs"]
+mod voice;
 
 // ------------------------------------------------------------------ the bounds the milestone states
 
@@ -221,6 +223,8 @@ struct Controller {
 	bredr: Credits,
 	le_bytes: u32,
 	bredr_bytes: u32,
+	// The largest voice packet the transport carries, its header included: zero for one that carries none.
+	sco_bytes: u32,
 	// A controller that reports no LE buffers of its own shares the BR/EDR ones with LE.
 	le_shares: bool,
 	session: Session,
@@ -1095,6 +1099,9 @@ impl Stack {
 	}
 
 	fn on_disconnected(&mut self, at: usize, handle: u16) {
+		if self.voice_disconnected(at, handle) {
+			return;
+		}
 		let controller = &mut self.controllers[at];
 		let Some(position) = controller.links.iter().position(|link| link.handle == handle) else { return };
 		let mut link = controller.links.remove(position);
@@ -1765,7 +1772,7 @@ impl Stack {
 		for record in self.records(at) {
 			let Some(peer) = peer_from_wire(&record.peer) else { continue };
 			let link = controller.link_to(&peer);
-			out.push(DeviceStatus { address: record.peer, radio: record.radio, name: record.name, alias: record.alias, bonded: true, connected: link.is_some(), level: Some(record.level), trusted: record.trusted, connected_profiles: link.map(classic::connected_profiles).unwrap_or_default(), battery: None });
+			out.push(DeviceStatus { address: record.peer, radio: record.radio, name: record.name, alias: record.alias, bonded: true, connected: link.is_some(), level: Some(record.level), trusted: record.trusted, connected_profiles: link.map(classic::connected_profiles).unwrap_or_default(), battery: link.and_then(battery_of) });
 		}
 		for link in &controller.links {
 			let wire = peer_to_wire(&link.peer);
@@ -1773,7 +1780,7 @@ impl Stack {
 				continue;
 			}
 			let name = controller.bredr_state.name_of(&link.peer).unwrap_or_default();
-			out.push(DeviceStatus { address: wire, radio: radio_of(&link.peer), name, alias: String::new(), bonded: false, connected: true, level: None, trusted: Vec::new(), connected_profiles: classic::connected_profiles(link), battery: None });
+			out.push(DeviceStatus { address: wire, radio: radio_of(&link.peer), name, alias: String::new(), bonded: false, connected: true, level: None, trusted: Vec::new(), connected_profiles: classic::connected_profiles(link), battery: battery_of(link) });
 		}
 		if let Some(scan) = controller.scan.as_ref() {
 			for result in &scan.results {
@@ -1785,6 +1792,11 @@ impl Stack {
 		}
 		out
 	}
+}
+
+// The battery a headset reported over its voice gateway's HF indicator.
+fn battery_of(link: &Link) -> Option<u8> {
+	link.classic.as_ref()?.voice.as_ref()?.battery
 }
 
 fn peer_is_classic(peer: &Peer) -> bool {
@@ -1868,7 +1880,7 @@ impl Stack {
 		let limits = Limits::of(attachment.iso, attachment.max_command, attachment.max_event, attachment.max_acl, attachment.max_iso);
 		let queue = attachment.acl_queue.min(MAX_QUEUED as u32);
 		let acl_bytes = attachment.max_acl.saturating_sub(4).max(27);
-		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new() };
+		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, sco_bytes: if attachment.sco { attachment.max_sco.min(258) } else { 0 }, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new() };
 		controller.start_init();
 		controller.pump();
 		self.controllers.push(controller);
@@ -1919,6 +1931,13 @@ impl Stack {
 		let kind = match packet.kind {
 			HciPacketKind::Event => Kind::Event,
 			HciPacketKind::Acl => Kind::Acl,
+			// VOICE is bounded by what the transport said it carries, and only by a transport that carries it.
+			HciPacketKind::Sco => {
+				if packet.bytes.len() as u32 <= self.controllers[at].sco_bytes {
+					self.on_sco(at, &packet.bytes);
+				}
+				return;
+			}
 			_ => return,
 		};
 		if service_logic::hci::check_inbound(&self.controllers[at].limits, kind as u16, packet.bytes.len() as u32).is_err() {

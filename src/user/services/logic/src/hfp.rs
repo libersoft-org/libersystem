@@ -20,6 +20,8 @@ pub const CODEC_MSBC: u8 = 2;
 /// THIS GATEWAY'S FEATURES, as `+BRSF` states them: the ability to reject a call (bit 5), enhanced call status (6),
 /// codec negotiation (9) and HF indicators (10). No three-way calling, no voice recognition, no in-band ring tone.
 pub const AG_FEATURES: u32 = (1 << 5) | (1 << 6) | (1 << 9) | (1 << 10);
+/// The gateway's features as its SDP record states them: wideband speech, bit 5.
+pub const SDP_FEATURES: u16 = 1 << 5;
 /// The HF feature bit saying it does codec negotiation, and the one for HF indicators.
 pub const HF_CODEC_NEGOTIATION: u32 = 1 << 7;
 pub const HF_INDICATORS: u32 = 1 << 8;

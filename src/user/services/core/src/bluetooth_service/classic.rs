@@ -21,6 +21,7 @@ use super::*;
 use service_logic::bt_pairing::{self, Prompt, Question, Reply};
 use service_logic::bt_policy::{self, Decision, Inbound};
 use service_logic::hci_bredr::{self, Event as Bredr, IoCapability, KeyType};
+use service_logic::hfp;
 use service_logic::l2cap_bredr::{self, Channels, Ertm, ErtmOut, Mode, Out as L2Out, Signal, psm};
 use service_logic::rfcomm::{self, Out as RfOut, Session};
 use service_logic::sdp::{self, Answer, Search, Server, Uuid};
@@ -87,13 +88,16 @@ pub(crate) struct ControllerState {
 
 impl ControllerState {
 	pub fn new() -> ControllerState {
-		// THE ROLES THIS SYSTEM OFFERS, each with its record: A2DP's source (a player) and sink (headphones), and the remote
-		// control's target - claiming no player category, there being no media session - and controller.
+		// THE ROLES THIS SYSTEM OFFERS, each with its record: A2DP's source (a player) and sink (headphones), the remote
+		// control's target - claiming no player category, there being no media session - and controller, and the voice
+		// gateway a headset connects to, by the hands-free and the headset profile.
 		let mut sdp = Server::new();
 		sdp.offer(sdp::a2dp(0x0001_0001, false, 0x0001));
 		sdp.offer(sdp::a2dp(0x0001_0002, true, 0x0001));
 		sdp.offer(sdp::avrcp(0x0001_0003, true, 0x0000));
 		sdp.offer(sdp::avrcp(0x0001_0004, false, 0x0001));
+		sdp.offer(sdp::hfp_audio_gateway(0x0001_0005, bt_policy::HFP_CHANNEL, hfp::SDP_FEATURES));
+		sdp.offer(sdp::hsp_audio_gateway(0x0001_0006, bt_policy::HSP_CHANNEL));
 		ControllerState { watcher: 0, prompt: None, next_prompt: 1, discoverable_until: None, written_scan: None, legacy: None, paging: None, sdp, names: Vec::new(), classes: Vec::new(), receive_waits: None, wants: Vec::new(), transaction: 1 }
 	}
 
@@ -244,11 +248,13 @@ pub(crate) struct ClassicLink {
 	pub derive: Option<([u8; 16], bool)>,
 	// The derivation a central peer started, answered from this side.
 	pub responder: Option<BredrResponder>,
+	// The voice gateway a headset opened on the link, and its synchronous link.
+	pub voice: Option<super::voice::VoiceLink>,
 }
 
 impl ClassicLink {
 	fn new(central: bool) -> ClassicLink {
-		ClassicLink { channels: Channels::new(), ertm: Vec::new(), held: Vec::new(), sdp_client: None, rfcomm: None, hid: Hid::default(), ours: IoCapability::NoInputNoOutput, theirs: None, pairing: false, refused: false, authenticating: false, level: None, features: None, last_activity: clock(), sniff: false, profiles: bt_policy::Trust::default(), a2dp: super::a2dp::A2dp::default(), central, derive: None, responder: None }
+		ClassicLink { channels: Channels::new(), ertm: Vec::new(), held: Vec::new(), sdp_client: None, rfcomm: None, hid: Hid::default(), ours: IoCapability::NoInputNoOutput, theirs: None, pairing: false, refused: false, authenticating: false, level: None, features: None, last_activity: clock(), sniff: false, profiles: bt_policy::Trust::default(), a2dp: super::a2dp::A2dp::default(), central, derive: None, responder: None, voice: None }
 	}
 
 	// The source key goes the moment it is no longer wanted.
@@ -315,7 +321,7 @@ pub(crate) fn on_init_complete(controller: &mut Controller, op: u16, params: &[u
 
 // ------------------------------------------------------------------ address forms
 
-fn bredr(wire: &[u8; 6]) -> Peer {
+pub(crate) fn bredr(wire: &[u8; 6]) -> Peer {
 	let mut peer = [0u8; 7];
 	peer[0] = KIND_BREDR;
 	peer[1..].copy_from_slice(&hci_codec::address_from_wire(wire));
@@ -383,7 +389,8 @@ impl Stack {
 					classic.central = central;
 				}
 			}
-			Bredr::RoleChange { .. } | Bredr::EncryptionKeyRefresh { .. } | Bredr::RemoteExtendedFeatures { .. } | Bredr::EncryptionChange { .. } | Bredr::SynchronousComplete { .. } => {}
+			Bredr::SynchronousComplete { status, handle, address, .. } => self.voice_connected(at, status, handle, &address),
+			Bredr::RoleChange { .. } | Bredr::EncryptionKeyRefresh { .. } | Bredr::RemoteExtendedFeatures { .. } | Bredr::EncryptionChange { .. } => {}
 			Bredr::LinkKeyRequest { address } => self.on_link_key_request(at, &address),
 			Bredr::LinkKeyNotification { address, mut key, kind } => {
 				self.on_link_key(at, &address, &key, kind);
@@ -555,7 +562,7 @@ impl Stack {
 	fn on_connection_request(&mut self, at: usize, address: &[u8; 6], link: u8) {
 		let peer = bredr(address);
 		if link != 1 {
-			// A synchronous link the peer asks for: the voice path is not set up from the peer's side here.
+			// A SYNCHRONOUS LINK THE PEER ASKS FOR is refused: the voice gateway sets its link up itself, for a session.
 			self.controllers[at].command(hci_bredr::opcode::REJECT_SYNCHRONOUS_CONNECTION_REQUEST, &hci_bredr::reject_connection(address, REJECT_RESOURCES));
 			return;
 		}
@@ -657,6 +664,7 @@ impl Stack {
 
 	pub(crate) fn classic_gone(&mut self, at: usize, mut link: Link) {
 		self.a2dp_gone(&mut link);
+		self.voice_link_gone(at, &mut link);
 		let state = &mut self.controllers[at].bredr_state;
 		if state.prompt.as_ref().is_some_and(|pending| pending.peer == link.peer) {
 			state.prompt = None;
@@ -1575,11 +1583,17 @@ impl Stack {
 				}
 				RfOut::Opened(server_channel) => {
 					let profile = rfcomm.opening.iter().position(|(held, _)| *held == server_channel).map(|position| rfcomm.opening.remove(position).1);
-					if let Some(profile) = profile {
+					// A HEADSET OPENED THE VOICE GATEWAY'S CHANNEL - admitted by the policy for a peer trusted for voice.
+					let inbound_voice = profile.is_none() && matches!(server_channel, bt_policy::HFP_CHANNEL | bt_policy::HSP_CHANNEL);
+					if let Some(profile) = profile.or(inbound_voice.then_some(Profile::Voice)) {
 						rfcomm.open.push((server_channel, profile));
 						classic.profiles = classic.profiles.with(profile_to_logic(profile), true);
 					}
+					if inbound_voice {
+						self.voice_opened(at, handle, server_channel);
+					}
 				}
+				RfOut::Data(server_channel, bytes) if classic.voice.as_ref().is_some_and(|voice| voice.channel == server_channel) => self.voice_data(at, handle, &bytes),
 				RfOut::Data(server_channel, bytes) => {
 					// WHAT ARRIVES FOR A CONSUMER that has not taken it is held, bounded; the credits went back
 					// with the session's own top-up, so a peer is never stalled by a consumer that is absent.
@@ -1603,6 +1617,9 @@ impl Stack {
 						classic.profiles = classic.profiles.with(profile_to_logic(profile), false);
 					}
 					rfcomm.held.retain(|(held, _)| *held != server_channel);
+					if classic.voice.as_ref().is_some_and(|voice| voice.channel == server_channel) {
+						self.voice_gone(at, handle);
+					}
 				}
 				RfOut::SessionOpen => {}
 				RfOut::SessionClosed => {
@@ -1611,10 +1628,20 @@ impl Stack {
 						classic.profiles = classic.profiles.with(profile_to_logic(profile), false);
 					}
 					classic.rfcomm = None;
+					self.voice_gone(at, handle);
 					self.close_channel(at, handle, cid);
 				}
 			}
 		}
+	}
+
+	// Bytes to the peer on one open DLC.
+	pub(crate) fn rfcomm_send(&mut self, at: usize, handle: u16, server_channel: u8, bytes: &[u8]) {
+		let outs = match self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()).and_then(|classic| classic.rfcomm.as_mut()) {
+			Some(rfcomm) => rfcomm.session.write(server_channel, bytes).unwrap_or_default(),
+			None => return,
+		};
+		self.run_rfcomm(at, handle, outs);
 	}
 
 	// ------------------------------------------------------------------ profiles

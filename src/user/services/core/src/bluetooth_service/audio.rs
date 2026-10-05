@@ -26,8 +26,8 @@ pub(crate) fn period_bytes(rate: u32, channels: u8) -> usize {
 }
 
 // ONE OPENED ENDPOINT'S PCM CHANNEL, on the device-side contract a sound card speaks: which link's stream it is, its
-// format, and the request it holds - an output period whose acknowledgment waits for the timer, or a capture waiting
-// for the phone's next packet.
+// format, and the request it holds - an output period whose acknowledgment waits for the timer, a voice period's that
+// waits for the link to carry what is queued, or a capture waiting for the phone's or the headset's next packet.
 pub(crate) struct Pcm {
 	pub chan: u64,
 	pub endpoint: u32,
@@ -42,13 +42,14 @@ pub(crate) struct Pcm {
 	pub pacer: Option<TimerPacer>,
 	// The clock tick an output period's acknowledgment is due at.
 	pub ack_at: Option<u64>,
+	pub ack_held: bool,
 	pub capture_waiting: bool,
 }
 
 impl Pcm {
 	// Whether the channel holds a request it has not answered: it is not read again until it has.
 	pub fn holding(&self) -> bool {
-		self.ack_at.is_some() || self.capture_waiting
+		self.ack_at.is_some() || self.ack_held || self.capture_waiting
 	}
 }
 
@@ -134,9 +135,7 @@ impl AudioRoot {
 		}
 	}
 
-	// A HEADSET'S CALL COMMAND, relayed when a session declares a call; refused - false, which the profile answers with
-	// ERROR - when none does.
-	#[allow(dead_code)]
+	// A HEADSET'S CALL COMMAND, relayed when a session declares a call; the gateway itself answered ERROR when none does.
 	pub fn command(&mut self, command: BtCallCommand) -> bool {
 		if self.call == BtCallState::None || self.subscriber == 0 {
 			return false;
@@ -170,7 +169,11 @@ impl bluetooth_audio::Service for AudioView<'_> {
 			return Err(Error::Again);
 		}
 		let (server, client) = channel().ok_or(Error::Exhausted)?;
-		audio.pcm.push(Pcm { chan: server, endpoint: id, at, handle, kind: endpoint.kind, rate: endpoint.rate, channels: endpoint.channels, latency_us: endpoint.latency_us, hardware_volume: endpoint.hardware_volume, volume: endpoint.volume, pacer: None, ack_at: None, capture_waiting: false });
+		audio.pcm.push(Pcm { chan: server, endpoint: id, at, handle, kind: endpoint.kind, rate: endpoint.rate, channels: endpoint.channels, latency_us: endpoint.latency_us, hardware_volume: endpoint.hardware_volume, volume: endpoint.volume, pacer: None, ack_at: None, ack_held: false, capture_waiting: false });
+		// A VOICE ENDPOINT OPENED IS A SESSION: the headset's synchronous link comes up with it.
+		if endpoint.kind == AudioEndpointKind::Voice {
+			self.stack.voice_up(at, handle);
+		}
 		Ok(client)
 	}
 
@@ -183,8 +186,13 @@ impl bluetooth_audio::Service for AudioView<'_> {
 		if !endpoint.hardware_volume {
 			return Err(Error::Unsupported);
 		}
+		let kind = endpoint.kind;
 		let (at, handle) = self.stack.audio.owner(id).ok_or(Error::NotFound)?;
-		self.stack.a2dp_set_volume(at, handle, volume)?;
+		if kind == AudioEndpointKind::Voice {
+			self.stack.voice_set_volume(at, handle, volume)?;
+		} else {
+			self.stack.a2dp_set_volume(at, handle, volume)?;
+		}
 		if let Some(endpoint) = self.stack.audio.endpoints.iter_mut().find(|endpoint| endpoint.id == id) {
 			endpoint.volume = volume;
 		}
@@ -193,6 +201,7 @@ impl bluetooth_audio::Service for AudioView<'_> {
 
 	fn set_call(&mut self, state: BtCallState) -> Result<(), Error> {
 		self.stack.audio.call = state;
+		self.stack.voice_call(state);
 		Ok(())
 	}
 }
@@ -241,8 +250,10 @@ impl Stack {
 			PolledCaps::Closed => {
 				let pcm = self.audio.pcm.remove(index);
 				close(pcm.chan);
-				if pcm.kind == AudioEndpointKind::Output {
-					self.a2dp_stop(pcm.at, pcm.handle);
+				match pcm.kind {
+					AudioEndpointKind::Output => self.a2dp_stop(pcm.at, pcm.handle),
+					AudioEndpointKind::Voice => self.voice_down(pcm.at, pcm.handle),
+					_ => {}
 				}
 				return;
 			}
@@ -273,9 +284,10 @@ impl Stack {
 				let answer = DeviceFormat { output, input, period_bytes: period as u32, latency_us: pcm.latency_us, hardware_volume: pcm.hardware_volume, volume: pcm.volume };
 				Some(answer.encode().to_vec())
 			}
-			(1, Some(CMD_CAPTURE)) if matches!(kind, AudioEndpointKind::Route | AudioEndpointKind::Input) => {
+			(1, Some(CMD_CAPTURE)) if kind != AudioEndpointKind::Output => {
 				let samples = period / 2;
-				match self.a2dp_take_period(at, handle, samples) {
+				let taken = if kind == AudioEndpointKind::Voice { self.voice_take_period(at, handle, samples) } else { self.a2dp_take_period(at, handle, samples) };
+				match taken {
 					Some(bytes) => Some(bytes),
 					None => {
 						self.audio.pcm[index].capture_waiting = true;
@@ -284,8 +296,18 @@ impl Stack {
 				}
 			}
 			(1, Some(CMD_CAPTURE_STOP)) => Some(driver_protocol::audio::OK.to_vec()),
+			// A VOICE PERIOD, queued for the link's packets: acknowledged at once while the queue has room.
+			(len, _) if len == period && kind == AudioEndpointKind::Voice => {
+				let samples: Vec<i16> = buf[..len].chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+				if self.voice_play(at, handle, &samples) {
+					Some(driver_protocol::audio::OK.to_vec())
+				} else {
+					self.audio.pcm[index].ack_held = true;
+					None
+				}
+			}
 			// A PERIOD TO PLAY, encoded and sent now; its acknowledgment waits for the timer, a little ahead of it.
-			(len, _) if len == period && matches!(kind, AudioEndpointKind::Output | AudioEndpointKind::Voice) => {
+			(len, _) if len == period && kind == AudioEndpointKind::Output => {
 				let samples: Vec<i16> = buf[..len].chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
 				self.a2dp_play(at, handle, &samples);
 				let pcm = &mut self.audio.pcm[index];
@@ -324,14 +346,24 @@ impl Stack {
 		self.audio.pcm.iter().filter_map(|pcm| pcm.ack_at).min()
 	}
 
-	// A PHONE'S AUDIO ARRIVED: a capture waiting on the route answered with a period, if a whole one is held.
+	// A PHONE'S OR A HEADSET'S AUDIO ARRIVED: a capture waiting on the endpoint answered with a period, if a whole one is
+	// held.
 	pub(crate) fn audio_capture_ready(&mut self, id: u32) {
 		let Some(index) = self.audio.pcm.iter().position(|pcm| pcm.endpoint == id && pcm.capture_waiting) else { return };
 		let pcm = &self.audio.pcm[index];
-		let (at, handle, samples, chan) = (pcm.at, pcm.handle, period_bytes(pcm.rate, pcm.channels) / 2, pcm.chan);
-		if let Some(bytes) = self.a2dp_take_period(at, handle, samples) {
+		let (at, handle, samples, chan, kind) = (pcm.at, pcm.handle, period_bytes(pcm.rate, pcm.channels) / 2, pcm.chan, pcm.kind);
+		let taken = if kind == AudioEndpointKind::Voice { self.voice_take_period(at, handle, samples) } else { self.a2dp_take_period(at, handle, samples) };
+		if let Some(bytes) = taken {
 			self.audio.pcm[index].capture_waiting = false;
 			send_blocking(chan, &bytes, 0);
+		}
+	}
+
+	// THE LINK CARRIED WHAT WAS QUEUED: a voice period held for it is acknowledged.
+	pub(crate) fn voice_ack(&mut self, id: u32) {
+		if let Some(pcm) = self.audio.pcm.iter_mut().find(|pcm| pcm.endpoint == id && pcm.ack_held) {
+			pcm.ack_held = false;
+			send_blocking(pcm.chan, driver_protocol::audio::OK, 0);
 		}
 	}
 }
