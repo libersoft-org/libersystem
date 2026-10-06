@@ -28,8 +28,11 @@
 #   encrypted         no route without the Broadcast Code nor with a wrong one; joined with the right one
 #   the links go      one member's link gone the device stays; both gone, it leaves AudioService
 #
-# THE CONTROLLER IS AN EXTENDED ONE: the fixture refuses the legacy scan and connection commands after any extended
-# one, as real controllers do, so every scan and connection here runs the extended commands.
+# THE CONTROLLER BECOMES AN LE AUDIO ONE HERE: the fixture starts as a plain LE controller - every other gate runs the
+# legacy scan and connection commands - and the probe makes it one with extended advertising, periodic sync, the CIS
+# central role and the synchronized receiver from its next reset, which powering the radio off sends. Like a real one it
+# then refuses the legacy scan and connection commands after any extended one, so every scan and connection here runs
+# the extended commands.
 
 set -euo pipefail
 GUEST_GATE_NAME="bluetooth-le-audio"

@@ -1490,6 +1490,19 @@ fn earbuds(probe: &Probe, ticks: u64) -> (AudioDevice, AudioDevice) {
 
 fn le_audio(probe: &mut Probe) {
 	probe.ready();
+	// AN LE AUDIO CONTROLLER: the fixture's from its next reset, which powering the radio off sends - and on again, the
+	// host learns what it is anew.
+	probe.act(0, FixtureAction::LeFeatures, 1);
+	probe.take("the fixture did not take the LE Audio controller", 2 * TICKS, |line| line == "controller will be an LE Audio one from its next reset");
+	if !matches!(probe.operator().power(&0, &false), Some(Ok(()))) {
+		fail("powering the radio off was refused");
+	}
+	probe.take("the controller was not reset as an LE Audio one", 3 * TICKS, |line| line == "controller reset as an LE Audio one");
+	if !matches!(probe.operator().power(&0, &true), Some(Ok(()))) {
+		fail("powering the radio on was refused");
+	}
+	probe.ready();
+	say("the controller is an LE Audio one from its reset: extended advertising, periodic sync, CIS central, synchronized receiver");
 	// THE LEFT EARBUD, paired by the operator - Just Works, nothing to compare - and trusted for audio.
 	let handle = match probe.read().scan(&0, &4000) {
 		Some(Ok(handle)) => handle,
