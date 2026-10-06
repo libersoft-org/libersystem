@@ -1,7 +1,8 @@
 // THE DEVICES THIS MACHINE'S DEVICE TREE DESCRIBES, as the descriptions `device::init` publishes: every node
 // naming a `compatible` and resources, the kernel's own among them held - the APLIC, the IMSIC, the ACLINT,
-// the goldfish clock, fw_cfg, the PCIe host, the console UART and the `sifive,test` reset device, whose
-// authority is the system's power role and never a driver's.
+// the goldfish clock, fw_cfg, the PCIe host and the `sifive,test` reset device, whose authority is the system's
+// power role and never a driver's. The 16550 the kernel writes to is claimable with the console flag when the
+// tree names it as its console, and its claim takes the console from the kernel; held otherwise.
 
 use alloc::vec::Vec;
 
@@ -49,7 +50,15 @@ pub fn wired_line(tree: &fdt::Fdt, route: &fdt::IntxRoute) -> Option<abi::WiredL
 pub fn describe() -> Vec<Described> {
 	#[cfg(not(test))]
 	{
-		let out = super::device_tree().map(|tree| crate::arch::common::platform::from_tree(&tree, KERNEL_HELD, super::serial::UART_BASE, |route| wired_line(&tree, route))).unwrap_or_default();
+		let out = super::device_tree()
+			.map(|tree| {
+				// THE CONSOLE THE TREE NAMES, when it is the UART this kernel writes to, with the register layout it writes with: its row
+				// is the one whose claim takes the console from the kernel.
+				let handed = tree.console().is_some_and(|console| console.uart == fdt::Uart::Ns16550 && console.base == super::serial::UART_BASE && console.reg_shift == 0 && console.reg_io_width == 1);
+				let console = crate::arch::common::platform::ConsoleUart { base: super::serial::UART_BASE, handed };
+				crate::arch::common::platform::from_tree(&tree, KERNEL_HELD, console, |route| wired_line(&tree, route))
+			})
+			.unwrap_or_default();
 		crate::arch::common::platform::report_smbios(super::boot::loader_smbios(super::boot::BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst)), super::paging::phys_to_virt);
 		out
 	}

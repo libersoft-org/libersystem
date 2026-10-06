@@ -96,11 +96,11 @@ impl Stack {
 	// ------------------------------------------------------------------ the call gateway
 
 	// AN EARBUD WROTE THE CALL CONTROL POINT: answered by its notification, and what it asked relayed - the gateway's
-	// own refusal where no session declares a call, and where the writer is not an encrypted peer trusted for audio:
-	// a call is answered or ended only by a device the operator let carry it.
+	// own refusal where no session declares a call, and where the writer is not an encrypted peer trusted for voice:
+	// a call is answered or ended only by a device the operator let carry calls, as HFP's gateway is.
 	pub(crate) fn le_server_writes(&mut self, at: usize, handle: u16) {
 		let Some((peer, encrypted)) = self.controllers[at].link(handle).map(|link| (link.peer, link.encrypted)) else { return };
-		let trusted = encrypted && self.record(at, &peer).is_some_and(|record| record.trusted.contains(&Profile::Audio));
+		let trusted = encrypted && self.record(at, &peer).is_some_and(|record| record.trusted.contains(&Profile::Voice));
 		let call = if trusted { call_of(self.audio.call) } else { gtbs::Call::None };
 		let Some(server) = self.controllers[at].link_mut(handle).and_then(|link| link.server.as_mut()) else { return };
 		let writes = server.take_writes();
@@ -128,17 +128,21 @@ impl Stack {
 		}
 	}
 
-	// THE CALL A SESSION DECLARED, to every LE peer's bearer: its state and the list, notified where the peer asked.
+	// THE CALL A SESSION DECLARED, to the bearer every LE peer reads: its state and the list - notified only to an
+	// encrypted peer trusted for voice that asked, so a call is told to no device the operator did not let carry calls.
 	pub(crate) fn le_call(&mut self, state: BtCallState) {
 		let call = call_of(state);
-		for controller in self.controllers.iter_mut() {
+		for at in 0..self.controllers.len() {
+			let told: Vec<u16> = self.controllers[at].links.iter().filter(|link| !link.is_classic() && link.encrypted && link.server.is_some()).filter(|link| self.record(at, &link.peer).is_some_and(|record| record.trusted.contains(&Profile::Voice))).map(|link| link.handle).collect();
+			let controller = &mut self.controllers[at];
 			let mut out = Vec::new();
 			for link in controller.links.iter_mut().filter(|link| !link.is_classic()) {
 				let Some(server) = link.server.as_mut() else { continue };
+				let tell = told.contains(&link.handle);
 				for (kind, value) in [(lea::uuid::CALL_STATE, gtbs::call_state(call)), (lea::uuid::BEARER_LIST_CURRENT_CALLS, gtbs::current_calls(call))] {
 					let Some(attribute) = server.handle_of(kind) else { continue };
 					server.set_value(attribute, value);
-					if let Some(notification) = server.notification(attribute) {
+					if tell && let Some(notification) = server.notification(attribute) {
 						out.push((link.handle, notification));
 					}
 				}

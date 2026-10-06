@@ -935,6 +935,12 @@ scene.
 | vector-stress | 240 | 241 | 6.9 ms | 75.4 - 76.8 ms | 76.4 ms | 66.7 ms | 1.13x |
 | image-stress | 25 | 3 | 38.9 ms | 344.7 ms | 348.0 ms | 16.7 ms | 20.7x |
 
+LATER, ON 2026-10-06, the filter path: `UI-effects` 149 -> 106 ms (still 1.6x its ceiling), the filtered
+layers' probe 96 -> 61 ms, the backdrop blur 29.7 -> 22.8 ms - with every frame the same bytes - by
+evaluating each filter node over only what the nodes after it read of it, clearing a node's scratch only
+beyond what it overwrites, and taking a whole-pixel offset as a shifted fetch. What is left of the scene is
+the Gaussian, about 62 of its 106 ms.
+
 **`UI-basic` SITS ON ITS CEILING, WHICH IS NOT THE SAME AS CLEARING IT, and a range is given rather
 than a single median because a single median here is a coin toss.** Seven consecutive runs measured
 16.36, 16.47, 16.70, 16.36, 16.66, 16.66 and 16.96 ms against a ceiling of 16.7: five met it and two

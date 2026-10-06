@@ -933,15 +933,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/traceroute.lsexe"
-providers = [
-	"base-proto",
-	"cli",
-	"network-client",
-	"network-proto",
-	"wire",
-	"modem-device-proto",
-	"lsrt",
-]
+providers = ["base-proto", "cli", "network-client", "network-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "component_host"
@@ -2503,7 +2495,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/kill.lsexe"
-providers = ["base-proto", "cli", "session-client", "modem-device-proto", "lsrt"]
+providers = ["base-proto", "cli", "session-client", "lsrt"]
 
 [[programs]]
 name = "pwd"
@@ -3819,6 +3811,33 @@ provides = [{ kind = "console-bytes", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
+# THE KERNEL CONSOLE'S UART ON THE DEVICE-TREE PORTS: the node the tree names as its console - aarch64's PL011, riscv64's
+# 16550 in a register window - which the kernel publishes claimable with the console flag, and whose claim IS the
+# console's handoff, as COM1's is: the kernel stops driving the UART before the claim's resources are minted, its output
+# leaves through the console tap the claim carries, and the release gives the UART back. Its window, its line and the
+# tap; no DMA. ONE publication, under the kernel console's name, for ConsoleService alone. Matched by the node's
+# `compatible`, one rule per string; a row of these that is not the console is refused by the driver.
+[[programs]]
+name = "console_uart"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/console_uart.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [
+	{ transport = "platform", compatible = "arm,pl011" },
+	{ transport = "platform", compatible = "ns16550a" },
+	{ transport = "platform", compatible = "ns16550" },
+]
+provides = [{ kind = "console-bytes", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
 [[programs]]
 name = "virtio_gpio"
 owner = "drivers"
@@ -4830,10 +4849,11 @@ interface = "liber:input@1/input-admin"
 # COUNT compiled into the manager: a third pointing device had nowhere to go. This service asks the
 # catalogue for the input and pointer kinds instead, and takes what it finds.
 #
-# AND IT KEEPS THREE SUBSCRIPTIONS OPEN - pointer, touch and gamepad: a HID-over-I2C touchpad beside xHCI's
+# AND IT KEEPS FOUR SUBSCRIPTIONS OPEN - input, pointer, touch and gamepad: a HID-over-I2C touchpad beside xHCI's
 # tablet, a rebound driver's replacement, a second controller are attached as they are published and detached as
-# they are withdrawn (four pointers, one touch surface, four gamepad providers at a time). Only the `input` kind is
-# taken once, at bootstrap.
+# they are withdrawn (four of each pointer kind, one touch surface, four gamepad providers at a time). The `input`
+# kind - the virtio tablet's - was taken once, at bootstrap, until 2026-10-06: a virtio tablet bound again was then
+# attached by nothing.
 #
 # LAST, like every addition to a role list: these are read POSITIONALLY from the generated
 # `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.

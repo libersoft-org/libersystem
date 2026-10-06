@@ -40,14 +40,15 @@
 //       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync (the terminal-path writer, entered
 //                   before the first line of a panic or a fatal exception and before a reset, a power-off or
 //                   the test exit), drain_sync, make_room, write_bytes, write_whole, read_byte,
-//                   tx_pending (false where writes are synchronous: only x86 keeps a transmit ring),
+//                   tx_pending (whether the transmit ring holds bytes an idle core must come back for),
 //                   arm_rx_interrupt (the console UART's receive line - COM1's IRQ 4 through the I/O
 //                   APIC, the PL011's SPI or the 16550's APLIC source as the device tree names it -
 //                   answered by the handler the boot tail passes, or refused in words), and the console
 //                   handoff: console_hand_over, console_hand_back, console_held_by, console_attach_tap,
-//                   console_tap_read, console_deliver, console_dropped (development build). Only x86_64's
-//                   COM1 is handed to a driver so far; the other two answer every handoff call with a
-//                   refusal, and no row of theirs asks.
+//                   console_tap_read, console_deliver, console_dropped (development build). All three
+//                   keep a transmit ring and hand their console UART to a driver through its claim:
+//                   x86_64's COM1 by its own code, the PL011 and the MMIO 16550 by
+//                   `common::console_uart`'s rules over a model of their registers.
 //       pci:        PciDevice / VirtioDevice / ResourcedDevice, scan, scan_virtio, scan_resourced,
 //                   set_intx_disabled, msix_enable, config_read_exact, config_write_exact (one declared
 //                   configuration register at exactly its width), map_declared (a chipset memory register's

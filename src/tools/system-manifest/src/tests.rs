@@ -616,7 +616,7 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// A PLATFORM ROW'S DRIVER MASTERS NOTHING, and the kernel refuses a platform claim whose entry declares
 			// DMA: the TPM driver moves every command through the interface's own buffer registers, and the
 			// console UART's driver every byte through its data register.
-			"tpm_driver" | "uart16550" => DmaPolicy::None,
+			"tpm_driver" | "uart16550" | "console_uart" => DmaPolicy::None,
 			// THE WATCHDOGS MASTER NOTHING: a timer is armed and fed through its registers.
 			"i6300esb" | "tco" | "wdat" => DmaPolicy::None,
 			// THE ACPI GATE'S FIXTURE DRIVER: a namespace device's platform row, reached through its window and its
@@ -625,8 +625,9 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// HID OVER I2C AND A TYPE-C PORT CONTROLLER: child bindings, whose every byte crosses their controller's scoped
 			// connection.
 			"i2c_hid" | "tcpci" => DmaPolicy::None,
-			// THE ACPI POWER SOURCES AND THE FAN: every value is a method's result on the node channel.
-			"acpi_power" | "acpi_fan" => DmaPolicy::None,
+			// THE ACPI POWER SOURCES, THE FAN, THE VIDEO BACKLIGHT AND THE AMBIENT LIGHT SENSOR: every value is a
+			// method's result on the node channel.
+			"acpi_power" | "acpi_fan" | "acpi_backlight" | "acpi_als" => DmaPolicy::None,
 			// THE ACPI BUTTONS, THE LID AND THE TIME AND ALARM DEVICE: `Notify` values and methods on the node channel.
 			"acpi_button" | "acpi_tad" => DmaPolicy::None,
 			// THE SLEEP GATE'S FIXTURE: shared memory through its BAR, and nothing mastered.

@@ -650,6 +650,11 @@ struct Console {
 	clipboard: Vec<u8>,
 	// The pointer button bits from the previous event, to detect press / release edges.
 	ptr_buttons: u8,
+	// A POINTER EVENT CHANGED WHAT THE SCREEN SHOWS and the frame is not presented yet: the queue of
+	// events is drained first and the result presented ONCE. A frame per event was the whole cost of a
+	// fast pointer here - past about three hundred events a second the console fell behind its own
+	// queue, and the events behind it were lost.
+	pointer_present_due: bool,
 	// Set when the serial mirror had to drop old backlog (SERIAL_PENDING_MAX): the next
 	// drain writes the gap marker where the dropped output would have been.
 	serial_gap: bool,
@@ -769,7 +774,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), admin, facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, wire: SerialWire::new(console_bytes), vocab: None };
+		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), admin, facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, pointer_present_due: false, serial_gap: false, wire: SerialWire::new(console_bytes), vocab: None };
 		run(&mut console);
 	}
 }
@@ -916,16 +921,7 @@ unsafe fn run(console: &mut Console) -> ! {
 						let serial_input: bool = len == 2 && keys[0] == 0;
 						let key_bytes: &[u8] = if serial_input { &keys[1..2] } else { &keys[..len] };
 						if console.pointer != 0 {
-							loop {
-								match try_recv(console.pointer, &mut out) {
-									Polled::Message { len, .. } => handle_pointer(console, &out[..len]),
-									Polled::Empty => break,
-									Polled::Closed => {
-										console.pointer = 0;
-										break;
-									}
-								}
-							}
+							drain_pointer(console, &mut out);
 						}
 						handle_keys(console, key_bytes, serial_input);
 					}
@@ -939,16 +935,7 @@ unsafe fn run(console: &mut Console) -> ! {
 					handle_display_resize(console);
 				} else if have_pointer && r == ptr_idx {
 					// a raw pointer event from InputService: SGR report, selection, or scrollback.
-					loop {
-						match try_recv(console.pointer, &mut out) {
-							Polled::Message { len, .. } => handle_pointer(console, &out[..len]),
-							Polled::Empty => break,
-							Polled::Closed => {
-								console.pointer = 0;
-								break;
-							}
-						}
-					}
+					drain_pointer(console, &mut out);
 				} else if r < display_idx {
 					let vi: usize = (r - 1) / 2;
 					if (r - 1) % 2 == 0 {
@@ -1805,6 +1792,24 @@ fn snap_fg_live(console: &mut Console) {
 	}
 }
 
+// EVERY POINTER EVENT QUEUED, then one presented frame for all of them.
+fn drain_pointer(console: &mut Console, out: &mut [u8]) {
+	loop {
+		match try_recv(console.pointer, out) {
+			Polled::Message { len, .. } => handle_pointer(console, &out[..len]),
+			Polled::Empty => break,
+			Polled::Closed => {
+				console.pointer = 0;
+				break;
+			}
+		}
+	}
+	if console.pointer_present_due {
+		console.pointer_present_due = false;
+		present_fg(console);
+	}
+}
+
 // Handle one raw pointer event from InputService: [x u16 LE][y u16 LE][buttons u8][wheel i8].
 // When the foreground program enabled mouse tracking (DECSET ?1000 / ?1002 / ?1003), the
 // event is translated into SGR mouse reports and delivered to the program (best-effort: a
@@ -1848,7 +1853,7 @@ fn handle_pointer(console: &mut Console, msg: &[u8]) {
 				t.flush();
 			}
 		}
-		present_fg(console);
+		console.pointer_present_due = true;
 		pointer_report(console, fg, col, row, buttons, prev, wheel, sgr, motion, anymotion);
 		return;
 	}
@@ -1878,7 +1883,7 @@ fn handle_pointer(console: &mut Console, msg: &[u8]) {
 		}
 		t.flush();
 	}
-	present_fg(console);
+	console.pointer_present_due = true;
 	if !left_now && left_was {
 		// Release: keep the selection highlighted so it can be copied explicitly
 		// (right-click or Ctrl+Shift+C / Ctrl+Insert). Selecting alone does NOT copy.
@@ -1892,7 +1897,7 @@ fn handle_pointer(console: &mut Console, msg: &[u8]) {
 				t.screen.selection_clear();
 				t.flush();
 			}
-			present_fg(console);
+			console.pointer_present_due = true;
 		}
 	}
 	if mid_now && !mid_was {

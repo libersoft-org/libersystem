@@ -510,6 +510,9 @@ pub fn init_vectors() {
 //
 // A fixed string and a hand-written hex digit need one small buffer and no call depth at all. The
 // report is uglier to read and it arrives, which is the entire trade.
+//
+// AND IT GOES TO THE WIRE, NOT INTO THE RING: the reporter enters the terminal-path writer before its
+// first byte, after which `write_bytes` polls the transmitter and writes, with no lock taken.
 fn wire_str(text: &str) {
 	super::serial::write_bytes(text.as_bytes());
 }
@@ -548,6 +551,10 @@ extern "C" fn aarch64_bad_stack(sp: u64, esr: u64, far: u64, elr: u64, vector: u
 	// core's would say the same thing about a different slice, and a garbled pair says nothing.
 	static REPORTS: AtomicU32 = AtomicU32::new(0);
 	if REPORTS.fetch_add(1, Ordering::AcqRel) == 0 {
+		// THE TERMINAL-PATH WRITER FIRST: the console's output is a ring, a driver may hold the UART, and from here on
+		// every byte must reach the wire synchronously. It waits for the ring's lock a bounded while and then goes on
+		// without it, and it formats nothing - which is what this stack can afford.
+		super::serial::flush_sync();
 		wire_str("\naarch64: BAD KERNEL STACK sp=");
 		wire_hex(sp);
 		wire_str(" esr=");
@@ -723,6 +730,9 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	const FRAME_X29: usize = 232 / 8;
 	const FRAME_X30: usize = 240 / 8;
 	let (fp, lr) = unsafe { (*frame.add(FRAME_X29), *frame.add(FRAME_X30)) };
+	// THE TERMINAL-PATH WRITER BEFORE THE FIRST LINE, as on every path that ends the machine: these lines would
+	// otherwise go into a ring nothing drains once this core halts with a driver holding the UART.
+	super::serial::flush_sync();
 	crate::serial_println!("aarch64 EXCEPTION [{source} {kind_str}] EC={ec:#x} ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
 	crate::serial_println!("aarch64:   called from LR={lr:#x}, frame pointer x29={fp:#x}");
 	crate::serial_println!("aarch64: unhandled exception - halting");

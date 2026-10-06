@@ -407,6 +407,9 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 		EXC_STORE_PAGE_FAULT => "store page fault",
 		_ => "trap",
 	};
+	// THE TERMINAL-PATH WRITER BEFORE THE FIRST LINE, as on every path that ends the machine: these lines would
+	// otherwise go into a ring nothing drains once this hart halts with a driver holding the UART.
+	super::serial::flush_sync();
 	crate::serial_println!("riscv64 S-MODE TRAP: {cause} (scause={scause:#x}) stval={stval:#x} sepc={sepc:#x}");
 	crate::serial_println!("riscv64: unhandled kernel trap - halting");
 	super::halt_loop()

@@ -27,9 +27,15 @@
 // `wired`: the kernel's own handlers for wired interrupt lines, shared by the two backends whose
 // controller hands over an interrupt NUMBER (a GIC INTID, an APLIC-delivered EID) rather than a
 // vector it chose - x86_64 indexes by vector and has its own table.
+// `console_uart`: the console UART's transmit ring, owner and handoff to a userspace driver, over a
+// model of its registers - aarch64's PL011 and riscv64's MMIO 16550. x86_64's COM1 keeps its own,
+// which these rules were taken from; every target's suite runs them over a scripted UART.
 
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod bootmem;
+// The console UART of the device-tree ports, and in every test build the rules it runs, over a script.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+pub mod console_uart;
 pub mod context;
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fwcfg;

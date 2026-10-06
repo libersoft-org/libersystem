@@ -3445,18 +3445,34 @@ fn send_with_room(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	}
 }
 
-// Send one frame, optionally moving one capability with it under `mask`.
-fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], handle: u64, mask: u32) -> bool {
-	let mut frame = [0u8; driver_protocol::HEADER_LEN + driver_protocol::MAX_PAYLOAD];
+// One frame's bytes, written into `frame`: the header and the payload. Answers the length.
+fn encode_frame(frame: &mut [u8; driver_protocol::HEADER_LEN + driver_protocol::MAX_PAYLOAD], opcode: driver_protocol::Opcode, generation: u64, payload: &[u8]) -> usize {
 	let header = driver_protocol::Header { version: driver_protocol::VERSION, opcode, generation, payload_len: payload.len() as u32 };
 	frame[..driver_protocol::HEADER_LEN].copy_from_slice(&header.encode());
 	frame[driver_protocol::HEADER_LEN..driver_protocol::HEADER_LEN + payload.len()].copy_from_slice(payload);
-	let bytes = &frame[..driver_protocol::HEADER_LEN + payload.len()];
+	driver_protocol::HEADER_LEN + payload.len()
+}
+
+// One frame, sent only if the driver's queue has room NOW - and why not, when it has none. The heartbeat's send: see
+// `tick_heartbeats`.
+fn offer_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8]) -> SendOutcome {
+	let mut frame = [0u8; driver_protocol::HEADER_LEN + driver_protocol::MAX_PAYLOAD];
+	let len = encode_frame(&mut frame, opcode, generation, payload);
+	try_send_outcome(channel, &frame[..len], 0)
+}
+
+// Send one frame, optionally moving one capability with it under `mask`.
+fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], handle: u64, mask: u32) -> bool {
+	let mut frame = [0u8; driver_protocol::HEADER_LEN + driver_protocol::MAX_PAYLOAD];
+	let len = encode_frame(&mut frame, opcode, generation, payload);
+	let bytes = &frame[..len];
 	// THE PLAIN SEND IS THE ONE THAT REPEATS. A frame that MOVES a capability is a bind, a stop or a
-	// resource hand-over - once per driver per transition - while the plain one is the heartbeat this
-	// loop sends to every bound driver on every pass, which is the send that can park a supervisor
-	// for ever. The attenuated path keeps its wait: it is not on the repeating path, and a capability
-	// transfer that gave up half way is a harder thing to be right about than one that waits.
+	// resource hand-over - once per driver per transition - while the plain one was also the heartbeat
+	// this loop sends to every bound driver on every pass, which is the send that can park a supervisor
+	// for ever; the heartbeat waits for nothing now and goes through `offer_frame`, because a bounded
+	// wait on every pass was still a second's wait in front of every other driver. The attenuated path
+	// keeps its wait: it is not on the repeating path, and a capability transfer that gave up half way
+	// is a harder thing to be right about than one that waits.
 	// SUPERVISOR-WAIT-OK: a frame that MOVES a capability is once per driver per transition, not the
 	// per-pass heartbeat, and a transfer that gave up half way is harder to be right about than one
 	// that waits. The repeating send above it is the bounded one.
@@ -7644,12 +7660,20 @@ fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 			driver_binding::Beat::Ask(sequence) => {
 				let mut payload = [0u8; driver_protocol::SEQUENCE_PAYLOAD_LEN];
 				driver_protocol::encode_sequence(sequence, &mut payload);
-				if send_frame(channel, driver_protocol::Opcode::Ping, generation, &payload, 0, 0) {
-					node.beat.asked(now);
-				} else {
+				// THE PING DOES NOT WAIT FOR ROOM (2026-10-06). It went out through `send_with_room`, whose second
+				// is right for a frame that must arrive and wrong for this one: a driver that has stopped reading
+				// has its queue full of the pings it never answered - sixty-four, the channel's depth, sixty-four
+				// periods after it stopped - and from then on EVERY PASS waited out that second for it, so every
+				// other driver's answer was read after its own deadline. Measured with one virtio-input driver
+				// parked in a send: every other driver marked suspect, "stopped answering" and "answered a ping
+				// nobody asked" for each of them every second, for as long as the one stayed parked. A full
+				// queue is that driver's silence and not a reason to wait: the ping counts as asked, its deadline
+				// runs, and it is marked exactly as it would be for a ping it read and did not answer.
+				match offer_frame(channel, driver_protocol::Opcode::Ping, generation, &payload) {
+					SendOutcome::Delivered | SendOutcome::Stalled => node.beat.asked(now),
 					// The channel is gone, which is a driver that ended rather than one that is
 					// slow. The exit event will arrive on its own; this only stops asking.
-					node.beat.unsendable(now);
+					SendOutcome::Failed => node.beat.unsendable(now),
 				}
 			}
 		}

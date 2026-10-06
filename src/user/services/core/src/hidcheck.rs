@@ -15,12 +15,28 @@
 //   hidcheck malformed  the touchscreen bound again over a descriptor the gate made malformed: the binding fails,
 //                       and nothing is published for it
 //   hidcheck ring       one view of the pointer ring - a second client's answer beside a phase that is watching
+//
+// AND THE INPUT FIGURES, which are a measurement and no gate's - the driver roadmap's integration item records them:
+//
+//   hidcheck route virtio|usb
+//                       which of the machine's input devices QEMU feeds: the virtio-input functions - each binding
+//                       disabled and enabled again through the device policy, so the fresh DRIVER_OK makes it the
+//                       device QEMU feeds - or, `usb`, the HID devices on the xHCI bus, the virtio-input bindings left
+//                       disabled. `route virtio` puts the machine back
+//   hidcheck rate keys|pointer [focused]
+//                       thirty-two cued single events the host answers - each cue's time to the event's arrival here
+//                       bounds injection-to-delivery from above - and then a stream the host sends, counted until it
+//                       has been quiet for a second, every time by this guest's clock. `focused` holds a surface with
+//                       input focus through a pointer run, as a graphical application would, so the text console is
+//                       not the one following the pointer
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::{BindingState, LaunchContext, PolicyOutcome, PolicyVerb, device, device_policy_admin, input};
@@ -153,7 +169,8 @@ struct Focus {
 	contacts: u64,
 }
 
-fn focus(display: u64, input_client: u64) -> Focus {
+// A surface presented once and holding input focus, and the one-shot proof of it a stream is opened with.
+fn focused(display: u64) -> (surface::Surface, u64) {
 	let client = surface::connect(display);
 	let Some(Ok(held)) = surface::Surface::create(&client, surface::wire_extent(64, 64), 2) else { fail(b"no surface") };
 	if let Some(Ok(proto::system::AcquiredImage::Image(image))) = held.acquire() {
@@ -167,6 +184,11 @@ fn focus(display: u64, input_client: u64) -> Focus {
 			_ => fail(b"the surface never held input focus"),
 		}
 	};
+	(held, proof)
+}
+
+fn focus(display: u64, input_client: u64) -> Focus {
+	let (held, proof) = focused(display);
 	let Some(contacts) = input::Client::new(ChannelTransport { chan: input_client }).subscribe_contacts(&proof) else { fail(b"the contact stream was refused to a focused surface") };
 	Focus { _surface: held, contacts }
 }
@@ -329,6 +351,203 @@ fn malformed(device_client: u64, policy: u64) {
 	say(b"PASS malformed");
 }
 
+// ------------------------------------------------------------------ the input figures
+
+// How many cued single events a rate phase asks for, how long one is waited for, and how long a stream must be quiet
+// before it is over. THIRTY-TWO, InputService's pointer ring: by the stream's cue the ring holds the rounds' events and
+// nothing older, so nothing in it can be taken for a move of the stream.
+const ROUNDS: u32 = 32;
+const CUE_TICKS: u64 = 2 * TICKS;
+const QUIET_TICKS: u64 = TICKS;
+
+// WHERE QEMU'S INPUT GOES. QEMU hands a host key or tablet event to the device of its kind that became active LAST: a
+// virtio-input function becomes active at its driver's DRIVER_OK and inactive at its reset, a USB keyboard when it is
+// created and a USB tablet at its first poll. So `virtio` disables and enables every virtio-input binding - each comes
+// back with a fresh DRIVER_OK - and `usb` disables them, which resets both functions and leaves the HID devices on the
+// xHCI bus the only ones QEMU can feed. A STORED DISABLE OUTLIVES A BOOT, so a measurement ends with `route virtio`.
+fn route(device_client: u64, policy: u64, to: &[u8]) {
+	let indices: Vec<u32> = bindings(device_client).iter().filter(|binding| binding.artifact == "virtio_input").map(|binding| binding.index).collect();
+	if indices.is_empty() {
+		fail(b"route: there is no virtio-input binding");
+	}
+	for &index in &indices {
+		apply(policy, index, PolicyVerb::Disable, b"route: a virtio-input binding could not be disabled");
+	}
+	await_states(device_client, "virtio_input", indices.len(), &[BindingState::Disabled], b"route: the virtio-input bindings did not stop");
+	if to == b"usb" {
+		say(format!("routed to the USB HID devices: {} virtio-input binding(s) disabled", indices.len()).as_bytes());
+		return;
+	}
+	for &index in &indices {
+		apply(policy, index, PolicyVerb::Enable, b"route: a virtio-input binding could not be enabled again");
+	}
+	await_states(device_client, "virtio_input", indices.len(), &[BindingState::Online], b"route: the virtio-input bindings did not bind again");
+	say(format!("routed to the virtio-input devices: {} binding(s) bound again", indices.len()).as_bytes());
+}
+
+// THE CUE THE HOST ANSWERS, written straight into the kernel's console ring: the console mirror a `print` takes is
+// buffered, and a cue that waited in it would be measured as the device's delay.
+fn cue(what: &str) {
+	debug_write(format!("hidcheck-cue {what}\n").as_bytes());
+}
+
+fn millis(ns: u64) -> String {
+	format!("{}.{:02} ms", ns / 1_000_000, ns % 1_000_000 / 10_000)
+}
+
+// The cued rounds' spread - the fastest, the middle and the slowest - and how many never arrived.
+fn rounds_line(what: &str, mut samples: Vec<u64>, missed: u32) -> String {
+	samples.sort_unstable();
+	match (samples.first(), samples.last()) {
+		(Some(&low), Some(&high)) => format!("{what} - {} cued event(s): cue to arrival {} fastest, {} median, {} slowest; {missed} never arrived", samples.len(), millis(low), millis(samples[samples.len() / 2]), millis(high)),
+		_ => format!("{what} - no cued event arrived ({missed} cue(s))"),
+	}
+}
+
+// A stream as counted here: how many, from the first to the last, and the longest wait between two.
+fn stream_line(what: &str, count: u64, first: u64, last: u64, gap: u64, extra: &str) -> String {
+	let span = last.saturating_sub(first);
+	let rate = if span == 0 { 0 } else { (count.saturating_sub(1)) * 1_000_000_000 / span };
+	format!("{what} - stream: {count} event(s) in {}, {rate} a second, the longest gap {}{extra}", millis(span), millis(gap))
+}
+
+// THE KEYS, on the live stream a focused surface's proof opens - which is how an application receives them.
+fn rate_keys(display: u64, input_client: u64) {
+	let (_held, proof) = focused(display);
+	let Some(stream) = input::Client::new(ChannelTransport { chan: input_client }).subscribe_keys(&proof) else { fail(b"rate: the key stream was refused to a focused surface") };
+	let mut buf = [0u8; 64];
+	// When the next key event arrived; `Some(None)` when none came by `until`, and `None` when the stream closed -
+	// InputService's answer to a reader that fell a channel behind.
+	let mut next = |until: u64| -> Option<Option<u64>> {
+		loop {
+			match recv_caps_deadline(stream, &mut buf, until) {
+				DeadlineCaps::Message { len, mut handles } => {
+					let at = clock_ns();
+					let event = input::subscribe_keys_read(&buf[..len], &mut handles);
+					for &handle in handles.as_slice() {
+						close(handle);
+					}
+					if event.is_some() {
+						return Some(Some(at));
+					}
+				}
+				DeadlineCaps::TimedOut => return Some(None),
+				DeadlineCaps::Closed => return None,
+			}
+		}
+	};
+	let mut samples: Vec<u64> = Vec::new();
+	let mut missed = 0u32;
+	for round in 1..=ROUNDS {
+		let asked = clock_ns();
+		cue(&format!("{round}"));
+		match next(clock() + CUE_TICKS) {
+			Some(Some(at)) => samples.push(at - asked),
+			Some(None) => missed += 1,
+			None => fail(b"rate: the key stream closed during the cued events"),
+		}
+	}
+	say(rounds_line("keys", samples, missed).as_bytes());
+	cue("stream");
+	let Some(Some(first)) = next(clock() + 10 * TICKS) else { fail(b"rate: no key of the stream arrived") };
+	let (mut count, mut last, mut gap, mut closed) = (1u64, first, 0u64, false);
+	loop {
+		match next(clock() + QUIET_TICKS) {
+			Some(Some(at)) => {
+				gap = gap.max(at - last);
+				last = at;
+				count += 1;
+			}
+			Some(None) => break,
+			None => {
+				closed = true;
+				break;
+			}
+		}
+	}
+	let extra = if closed { ", then InputService closed the stream: this reader fell a channel behind" } else { "" };
+	say(stream_line("keys", count, first, last, gap, extra).as_bytes());
+	close(stream);
+}
+
+// THE POINTER, as its one client API gives it: a snapshot of the last thirty-two events InputService mapped. So the host
+// NUMBERS ITS MOVES BY WHERE THEY LAND - the stream's move n at column n mod 80 of row n / 80, the cued rounds on the
+// last row alone - and an event is counted once by its position, whichever snapshot it was seen in. A snapshot a tick
+// sees every event while fewer than thirty-two arrive between two of them, 3200 a second; a move that never became an
+// event of its own - folded into the next by the driver, or lost before it - is one the host sent that never arrived.
+fn rate_pointer(input_client: u64, display: u64, focus: bool) {
+	// A FOCUSED SURFACE, when asked for, for the whole run: the console stops following the pointer while it holds focus.
+	let _held = focus.then(|| {
+		let (held, proof) = focused(display);
+		close(proof);
+		held
+	});
+	let mut samples: Vec<u64> = Vec::new();
+	let mut missed = 0u32;
+	let mut seen = snapshot(input_client);
+	for round in 1..=ROUNDS {
+		let asked = clock_ns();
+		cue(&format!("{round}"));
+		let until = clock() + CUE_TICKS;
+		loop {
+			let now = snapshot(input_client);
+			if now != seen {
+				samples.push(clock_ns() - asked);
+				seen = now;
+				break;
+			}
+			if clock() >= until {
+				missed += 1;
+				break;
+			}
+		}
+	}
+	say(rounds_line("pointer", samples, missed).as_bytes());
+	cue("stream");
+	let until = clock() + 10 * TICKS;
+	let mut arrived: Vec<bool> = alloc::vec![false; STREAM_POSITIONS];
+	let (mut count, mut first, mut last, mut gap, mut highest) = (0u64, 0u64, 0u64, 0u64, 0usize);
+	let mut quiet_from = 0u64;
+	// THE SLOWEST SNAPSHOT: a subscription InputService answers late is InputService not running its loop.
+	let mut slowest = 0u64;
+	loop {
+		let asked = clock_ns();
+		let now = snapshot(input_client);
+		let at = clock_ns();
+		slowest = slowest.max(at - asked);
+		let mut fresh = 0u64;
+		for &(col, row, _) in &now {
+			let position = row as usize * GRID_COLUMNS + col as usize;
+			if position != 0 && position < STREAM_POSITIONS && !arrived[position] {
+				arrived[position] = true;
+				highest = highest.max(position);
+				fresh += 1;
+			}
+		}
+		if fresh != 0 {
+			if count == 0 {
+				first = at;
+			} else {
+				gap = gap.max(at - last);
+			}
+			count += fresh;
+			last = at;
+			quiet_from = clock();
+		} else if count == 0 && clock() >= until {
+			fail(b"rate: no pointer event of the stream arrived");
+		} else if count != 0 && clock() >= quiet_from + QUIET_TICKS {
+			break;
+		}
+		sleep_until(clock() + 1);
+	}
+	let extra = format!(", the last move numbered {highest}: {} of the moves up to it never arrived as an event of their own; the slowest snapshot {}", highest as u64 - count.min(highest as u64), millis(slowest));
+	say(stream_line("pointer", count, first, last, gap, &extra).as_bytes());
+}
+
+// InputService's grid, and the stream's positions on it: every row but the last, which the cued rounds use.
+const GRID_COLUMNS: usize = 80;
+const STREAM_POSITIONS: usize = GRID_COLUMNS * 49;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 256];
@@ -357,12 +576,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		malformed(device_client, policy);
 		exit();
 	}
+	// THE INPUT FIGURES' TWO PHASES, which take a second word.
+	let which = args.split(|&b| b == b' ').filter(|word| !word.is_empty()).nth(1).unwrap_or(&[]);
+	match (phase, which) {
+		(b"route", b"virtio" | b"usb") => {
+			route(device_client, policy, which);
+			exit();
+		}
+		(b"rate", b"keys") => {
+			rate_keys(display, input_client);
+			exit();
+		}
+		(b"rate", b"pointer") => {
+			let focus = args.split(|&b| b == b' ').filter(|word| !word.is_empty()).nth(2) == Some(b"focused".as_slice());
+			rate_pointer(input_client, display, focus);
+			exit();
+		}
+		_ => {}
+	}
 	let held = focus(display, input_client);
 	match phase {
 		b"watch" => verdict(b"watch", watch(input_client, &held, b"watching - raise the reports now")),
 		b"storm" => verdict(b"storm", watch(input_client, &held, b"hold the lines now, then raise the reports")),
 		b"cycle" => cycle(device_client, policy, input_client, &held),
-		_ => fail(b"usage: hidcheck watch | storm | cycle | malformed | ring"),
+		_ => fail(b"usage: hidcheck watch | storm | cycle | malformed | ring | route virtio|usb | rate keys|pointer [focused]"),
 	}
 	exit();
 }

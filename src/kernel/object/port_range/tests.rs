@@ -147,9 +147,12 @@ fn refused_and_terminal_ports() {
 crate::tagged_test!(a_machine_with_no_port_space_mints_nothing, [Object, Kernel, Syscall], id = "kernel.object.port_range.a_machine_with_no_port_space_mints_nothing", covers = ["kernel"]);
 #[cfg(not(target_arch = "x86_64"))]
 fn a_machine_with_no_port_space_mints_nothing() {
-	// EVERY CALL ANSWERS UNSUPPORTED, and no row carries a port resource.
+	// EVERY PORT CALL ANSWERS UNSUPPORTED, and no row carries a port resource. The resource acquisition is asked
+	// for a PORT RANGE: the same call serves a row's lines, windows and the console's tap on every machine, and
+	// a kind it does not know is invalid before it is unsupported.
 	assert!(!crate::arch::ioports::supported());
-	for number in [abi::SYS_DEVICE_RESOURCE_ACQUIRE, abi::SYS_PORT_RANGE_MAP, abi::SYS_PORT_RANGE_UNMAP, abi::SYS_PORT_RANGE_FIRMWARE] {
+	assert_eq!(unsafe { crate::arch::syscall::invoke(abi::SYS_DEVICE_RESOURCE_ACQUIRE, 0, abi::RESOURCE_KIND_PORT_RANGE, 0, 0) } as i64, syscall::ERR_UNSUPPORTED, "a port range is acquired from nothing");
+	for number in [abi::SYS_PORT_RANGE_MAP, abi::SYS_PORT_RANGE_UNMAP, abi::SYS_PORT_RANGE_FIRMWARE] {
 		assert_eq!(unsafe { crate::arch::syscall::invoke(number, 0, 0, 0, 0) } as i64, syscall::ERR_UNSUPPORTED, "syscall {number}");
 	}
 	for index in 0..crate::device::count() {

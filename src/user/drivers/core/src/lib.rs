@@ -74,6 +74,9 @@ pub mod cdc;
 // THE USB CCID CLASS'S DECISIONS: a reader's class descriptor, its messages, and its slot-change notifications.
 pub mod ccid;
 pub mod common;
+// THE KERNEL CONSOLE'S UART IN A REGISTER WINDOW - the device-tree ports' PL011 and 16550 - as its driver serves it over
+// either register engine, and what a platform description says about the UART.
+pub mod console_uart;
 // A DEVICE'S POWER STATE THROUGH ITS NODE CHANNEL: what a driver bound to a firmware node asks the ACPI service for, since
 // the power resources behind a state are shared and counted there.
 pub mod node_power;
@@ -119,6 +122,8 @@ pub mod net;
 // host test can watch failing.
 pub mod nvme;
 pub mod piv_card;
+// THE PL011 REGISTER ENGINE, apart from where the UART is and what clocks it - the 16550's neighbour beside `uart`.
+pub mod pl011;
 pub mod port;
 // THE USB PRINTER CLASS'S DECISIONS: which interface setting to drive, the class requests, and what a port
 // status byte and a device ID may say.

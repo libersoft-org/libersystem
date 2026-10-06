@@ -1312,7 +1312,14 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 								None => &*surface,
 							};
 							let kernels = layer.filter.and_then(|handle| prepared.kernels.get(handle.0 as usize)).map_or(&[][..], |kernels| kernels.as_slice());
-							Some(crate::filter::evaluate(graph, kernels, &layer.surface, backdrop, layer.bounds, pool, spans, nodes, prepared.working, lookup)?)
+							// WHAT THE LAYER IS COMPOSITED FROM is its bounds inside the surface it composites onto, and
+							// that is all of the graph's output anything reads.
+							let into_bounds = match layers.last() {
+								Some(parent) => parent.bounds,
+								None => tile,
+							};
+							let wanted = into_bounds.intersection(&layer.bounds);
+							Some(crate::filter::evaluate(graph, kernels, &layer.surface, backdrop, layer.bounds, wanted, pool, spans, nodes, prepared.working, lookup)?)
 						}
 						None => None,
 					};

@@ -74,13 +74,26 @@ pub fn report_smbios(entry: u64, phys_to_virt: fn(u64) -> u64) {
 	});
 }
 
+// THE UART THE KERNEL WRITES TO, as a device-tree port describes it: its base, and whether the tree names it as its
+// console - which is what makes its row the one whose claim hands the console to a driver.
+#[cfg(all(not(test), any(target_arch = "aarch64", target_arch = "riscv64")))]
+pub struct ConsoleUart {
+	pub base: u64,
+	pub handed: bool,
+}
+
 // THE NODES OF A DEVICE TREE, AS DESCRIPTIONS: each node naming a `compatible` and resources, identified by
 // its path (`dt:/soc/serial@10000000`), matched by each of its `compatible` strings, with its `reg`
 // translated to MMIO, its interrupts made WIRED LINES where their parent is the interrupt controller this
 // kernel drives (`line` says what a specifier becomes on this port) and LINE CONNECTIONS where their parent
 // is a GPIO controller that is also an interrupt controller, an address on the I2C or SPI bus it sits on made
 // a connection, and its property block attached. KERNEL-HELD are the nodes whose `compatible` names a device
-// the kernel drives itself, and the console UART at `console_base`.
+// the kernel drives itself, and the UART the kernel writes to when it is not the console `console` hands over.
+//
+// THE KERNEL'S CONSOLE UART IS CLAIMABLE, with `PLATFORM_FLAG_CONSOLE`, when the tree names it as its console - its
+// `/chosen/stdout-path` node at the base the kernel writes to - and its claim is the console's handoff to a driver,
+// as x86_64's `kernel:com1` row's is: the kernel drives it until then and takes it back at the release. A test kernel
+// reads no tree, so the suite's console stays the kernel's on these ports as COM1 does on x86_64.
 //
 // THE TPM NODE IS CUT TO ITS PAGE: QEMU's `tcg,tpm-tis-mmio` node names all five localities (0x5000 bytes),
 // and the device is ONE MMIO range - locality 0's 4 KiB page at the node's base - with no interrupt, exactly
@@ -91,7 +104,7 @@ pub fn report_smbios(entry: u64, phys_to_virt: fn(u64) -> u64) {
 // is the node carrying the phandle the line names - and `device::init` joins it to that row once every
 // description is published.
 #[cfg(all(not(test), any(target_arch = "aarch64", target_arch = "riscv64")))]
-pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line: impl Fn(&fdt::IntxRoute) -> Option<abi::WiredLine>) -> Vec<Described> {
+pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console: ConsoleUart, line: impl Fn(&fdt::IntxRoute) -> Option<abi::WiredLine>) -> Vec<Described> {
 	let mut nodes: Vec<fdt::DeviceNode> = Vec::new();
 	let walked = tree.devices(|node| {
 		// ALLOC-OK: boot, once, one entry per device node the tree describes.
@@ -133,9 +146,13 @@ pub fn from_tree(tree: &fdt::Fdt, kernel_held: &[&[u8]], console_base: u64, line
 			crate::serial_println!("device: {name} is not published - its reg could not be read or translated to a physical address");
 			continue;
 		}
-		let held = node.compatible().any(|compatible| kernel_held.contains(&compatible)) || node.regs().iter().any(|&(base, _)| base == console_base && node.bus == fdt::NodeBus::Memory);
+		let at_console = node.bus == fdt::NodeBus::Memory && node.regs().iter().any(|&(base, _)| base == console.base);
+		let held = node.compatible().any(|compatible| kernel_held.contains(&compatible)) || (at_console && !console.handed);
 		let state = if held { abi::PLATFORM_STATE_KERNEL_HELD } else { abi::PLATFORM_STATE_CLAIMABLE };
 		let Some(mut description) = platform::Description::new(abi::PLATFORM_SOURCE_TREE, state, &identity[..len]) else { continue };
+		if at_console && !held {
+			description.part.flags |= abi::PLATFORM_FLAG_CONSOLE;
+		}
 		let mut whole = true;
 		for compatible in node.compatible() {
 			whole &= description.add_match(abi::MATCH_ID_COMPATIBLE, compatible);

@@ -777,6 +777,12 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	if !guard.record_dma_buffer(&object) {
 		return ERR_NO_MEMORY;
 	}
+	// THE FIRST BUFFER A RE-BOUND DEVICE WILL BE GIVEN is where its deferred bus mastering goes on, if its
+	// driver has not reset it and said so first: a driver hands a device new addresses only after the
+	// reset that started its bring-up. See `device::claim`.
+	if let Some(key) = claim {
+		device::master_if_deferred(key);
+	}
 	// AND THE CAPABILITY IS MINTED BEFORE THE ROW THAT MAKES IT REVOCABLE EXISTS (added 2026-09-02).
 	//
 	// `Capability::new` snapshots the object's revocation generation AT THE MOMENT IT RUNS, and
@@ -1391,6 +1397,16 @@ fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64, entry_ptr: u64) 
 	// The stamp the claim carries: the entry as validated, and its policy.
 	let (stamped_entry, policy) = device::claim_stamp(key).unwrap_or((entry, abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8));
 	// FROM HERE THE DEVICE IS TAKEN, so every refusal below gives it back.
+	//
+	// THE CONSOLE UART'S REGISTER WINDOW IS MINTED ONLY WHILE THIS CLAIM HOLDS THE UART, as its port range is: the
+	// claim above took it from the kernel, and a terminal path that took it back since keeps it. A port-I/O console
+	// (COM1) has no window, and nothing is asked.
+	if bar_len != 0
+		&& let Some(base) = device::console_row(index as usize)
+		&& !arch::serial::console_held_by(base, key.generation)
+	{
+		return abandon_claim(&thread, key, ERR_ACCESS_DENIED);
+	}
 	let Some(memory) = DeviceMemory::for_claim(key, bar_phys, bar_len as usize) else {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
 	};
@@ -1576,6 +1592,8 @@ fn sys_device_quiesced(device_handle: u64) -> i64 {
 	let index = key.device_index;
 	match device::release_quiesced_if_current(key) {
 		Some((vectors, frames)) => {
+			// THE RESET THAT WAS WAITED FOR: a device its last driver left running masters the bus again.
+			device::master_if_deferred(key);
 			if vectors != 0 {
 				crate::serial_println!("irq: device {index} confirmed stopped - {vectors} masked MSI vector(s) released for re-use");
 			}
@@ -2163,7 +2181,7 @@ fn sys_dev_console(privilege: u64, request: u64) -> i64 {
 	let (vendor, product) = ((request >> 16) as u16, (request >> 32) as u16);
 	match request & 0xFFFF {
 		abi::DEV_CONSOLE_HOLD_AND_FLOOD => {
-			// A console with no transmit ring - the ports' synchronous UARTs - has nothing to fill.
+			// A console with no transmit ring has nothing to fill.
 			if arch::serial::console_dropped().is_none() {
 				return ERR_UNSUPPORTED;
 			}
@@ -2202,6 +2220,12 @@ fn platform_mmio_acquire(claim_handle: u64, which: u64) -> i64 {
 	}
 	let key = claim.key();
 	let Some((base, len)) = device::platform_mmio(key.device_index as usize, which) else { return ERR_INVALID };
+	// A CONSOLE UART'S WINDOW, only while this claim holds the UART - as for the claim's own window.
+	if let Some(console) = device::console_row(key.device_index as usize)
+		&& !arch::serial::console_held_by(console, key.generation)
+	{
+		return ERR_ACCESS_DENIED;
+	}
 	if !thread.handles().lock().reserve(1) {
 		return ERR_RESOURCE_EXHAUSTED;
 	}

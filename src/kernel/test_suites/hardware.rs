@@ -4211,6 +4211,42 @@ fn usb_video_streams_over_isochronous_packets() {
 	assert!(good.iter().filter(|&&number| number > 3).count() >= 4, "four whole frames arrived after the bad two, got {good:?}");
 	assert!(dropped_by_device >= 2, "the frame that lost a packet and the one the device marked bad were dropped with the device as the reason ({dropped_by_device})");
 	assert!(good.windows(2).all(|pair| pair[0] < pair[1]), "in the order the device sent them: {good:?}");
+
+	// AND THE STREAM'S FIGURES, which the driver roadmap's integration item records and nothing here asserts. Past the
+	// emulator's two bad frames every frame is a whole one, so for two seconds of this guest's clock each is counted and
+	// its buffer queued again at once; the time from the driver finishing a frame - its `arrival-ns`, stamped on the clock
+	// a process reads - to this reader taking it is kept, and the driver's private memory is sampled while it streams.
+	// The emulator sends one payload a service interval, so the rate is its packet clock's and not the 30 a second the
+	// commit names.
+	let clock_ns = || arch::common::time::CLOCK.nanos(arch::tsc::now());
+	let resting = driver.memory_bytes();
+	let mut most = resting;
+	let (mut whole, mut no_buffer, mut by_device, mut gaps) = (0u64, 0u64, 0u64, 0u64);
+	let mut delays: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let started = clock_ns();
+	while clock_ns() - started < 2_000_000_000 {
+		sched::run_until_idle();
+		most = most.max(driver.memory_bytes());
+		let Ok(frame) = events.recv() else { continue };
+		let taken = clock_ns();
+		let mut frame_handles = camera_device_proto::codec::Handles::new();
+		match camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("an event decodes") {
+			camera::CameraDeviceEvent::Frame(done) => {
+				delays.push(taken.saturating_sub(done.arrival_ns));
+				whole += 1;
+				assert_eq!(client.queue(&1, &done.buffer, &lease), Some(Ok(())), "a measured frame's buffer is queued again");
+				lease += 1;
+			}
+			camera::CameraDeviceEvent::Dropped(drop) if drop.reason == camera::CameraDropReason::NoBuffer => no_buffer += u64::from(drop.count),
+			camera::CameraDeviceEvent::Dropped(drop) => by_device += u64::from(drop.count),
+			camera::CameraDeviceEvent::Gap(_) => gaps += 1,
+		}
+	}
+	let elapsed = clock_ns() - started;
+	delays.sort_unstable();
+	let micros = |at: usize| delays.get(at).map_or(0, |ns| ns / 1000);
+	let hundredths = whole * 100_000_000_000 / elapsed.max(1);
+	crate::serial_println!("usb-video-iso: measured {whole} whole frame(s) in {} ms ({}.{:02} a second), {no_buffer} dropped for no queued buffer, {by_device} by the device, {gaps} gap(s); completion to this reader {} us fastest, {} us median, {} us slowest; the driver's private memory {} KiB resting, {} KiB at most while streaming", elapsed / 1_000_000, hundredths / 100, hundredths % 100, micros(0), micros(delays.len() / 2), micros(delays.len().saturating_sub(1)), resting / 1024, most / 1024);
 	assert_eq!(client.stop(&1), Some(Ok(())), "the stream stops, the camera back at zero bandwidth, every buffer back");
 	assert_eq!(client.queue(&1, &0, &lease), Some(Err(camera::Error::Stale)), "and a stopped stream takes no buffer");
 

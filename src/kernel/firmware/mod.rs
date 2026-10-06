@@ -100,7 +100,8 @@ static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None,
 // A NAMESPACE DEVICE THAT MASTERS THE BUS, as the DMAR names it (`\_SB.PCI0.I2C1`): kept under the identity the ACPI
 // service will publish it with - `acpi:` and the path with every segment padded to four characters, as the namespace
 // holds names - and its requester id.
-#[cfg(any(not(test), target_arch = "x86_64"))]
+// x86_64's alone: a DMAR is an ACPI table, and the device-tree ports read none.
+#[cfg(target_arch = "x86_64")]
 pub fn note_namespace_stream(name: &[u8], source_id: u16) {
 	let Some(identity) = namespace_identity(name) else { return };
 	let mut state = STATE.lock();
@@ -110,6 +111,7 @@ pub fn note_namespace_stream(name: &[u8], source_id: u16) {
 }
 
 // `\_SB.PCI0.I2C1` as an identity: `acpi:\_SB_.PCI0.I2C1`.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn namespace_identity(name: &[u8]) -> Option<Vec<u8>> {
 	let mut identity: Vec<u8> = Vec::new();
 	identity.try_reserve(5 + name.len() + 8).ok()?;

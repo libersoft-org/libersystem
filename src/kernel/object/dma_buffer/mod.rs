@@ -111,6 +111,12 @@ fn hold(device: u32, frames: Vec<u64>) {
 	// Dropped here: the `Vec` goes, the frames stay out of circulation. Deliberately NOT retired.
 }
 
+// Whether `device` is held for - its untranslated frames, or the mark of none a translated buffer leaves (see the
+// drop below): a driver of it ended with its DMA never confirmed stopped, and nobody has reset it since.
+pub fn holds_for(device: u32) -> bool {
+	HELD.lock().iter().any(|slot| slot.as_ref().is_some_and(|held| held.device == device))
+}
+
 // A driver has reset `device`, so nothing it was pointed at is in flight any more: retire every
 // frame held for it. Returns how many frames were released.
 //
@@ -422,6 +428,19 @@ impl Drop for DmaBuffer {
 			(Some(device), true, false) => {
 				hold(device, frames);
 				Vec::new()
+			}
+			// A TERMINATED DRIVER'S TRANSLATED BUFFER: its unmap confirmed, so its frames are no device's and go back -
+			// but nothing confirmed the DEVICE stopped, and an engine that driver started may still be running against
+			// the addresses that just went away. Without a mark, the next claim mastered the bus at once and that engine's
+			// next read faulted in the new binding's domain, which took the device off the bus for good: an HDA stream
+			// killed mid-playback never came back (2026-10-06). So the device is marked as one whose DMA was never
+			// confirmed stopped - a hold of NO frames, once - and its next claim defers bus mastering as it does for the
+			// untranslated case (`device::claim`) until its reset; the reset's `release_for` clears the mark.
+			(Some(device), true, true) => {
+				if !holds_for(device) {
+					hold(device, Vec::new());
+				}
+				frames
 			}
 			_ => frames,
 		};

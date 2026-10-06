@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use driver_protocol::gamepad;
 use rt::*;
 
-use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_DEVICE_REMOTE_WAKEUP, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, REQ_SET_FEATURE, RT_ENDPOINT, SPEED_HIGH, SPEED_SUPER, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
+use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_DEVICE_REMOTE_WAKEUP, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, REQ_SET_FEATURE, RT_ENDPOINT, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
 use crate::{Ring, UsbDevice, Xhci};
 use crate::{command_and_wait, control_in, control_in_req, control_nodata, dma_page, r8, reset_endpoint, w32};
 use drivers::descriptor;
@@ -274,7 +274,7 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice, pads: &mut Pads)
 				let (Ok(ep_addr), Ok(attrs)) = (record.field(2), record.field(3)) else { continue };
 				if ep_addr & 0x80 != 0 && attrs & 0x3 == EP_ATTR_INTERRUPT {
 					let (Ok(mps), Ok(interval)) = (record.field16(4), record.field(6)) else { continue };
-					open.endpoint = Some(((ep_addr & 0xf) as u32 * 2 + 1, mps as u32, ep_interval(dev.speed, interval as u32)));
+					open.endpoint = Some(((ep_addr & 0xf) as u32 * 2 + 1, mps as u32, crate::classes::interrupt_interval(dev.speed, interval as u32)));
 				}
 			}
 		}
@@ -436,21 +436,6 @@ fn push_decimal(out: &mut Vec<u8>, value: u32) {
 		}
 	}
 	out.extend(digits[..count].iter().rev());
-}
-
-// The xHCI endpoint-context interval field for an interrupt endpoint: the exponent
-// of the service interval in 125 us microframes. High/SuperSpeed descriptors carry
-// the exponent + 1 already; a full/low-speed bInterval counts 1 ms frames, so find
-// the smallest exponent whose period covers it (bInterval * 8 microframes).
-fn ep_interval(speed: u32, b_interval: u32) -> u32 {
-	if speed == SPEED_HIGH || speed == SPEED_SUPER {
-		return b_interval.clamp(1, 16) - 1;
-	}
-	let mut exp: u32 = 3;
-	while exp < 15 && 1 << (exp - 3) < b_interval {
-		exp += 1;
-	}
-	exp
 }
 
 // Post an interface's next input-report TRB (sized by its layout, into its own report page) and ring its

@@ -22,6 +22,9 @@ use rt::*;
 use session_client::SessionClient;
 use tools::split_args;
 
+// The most job ids one `kill` names.
+const MAX_IDS: usize = 64;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -38,7 +41,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	let mut signal = JobSignalKind::Term;
-	let mut ids: Vec<u32> = Vec::new();
+	// THE IDS IN A FIXED ARRAY: a vector pushed to imports its growth routine from whichever shared library
+	// provides that instance, and on one port none that this program declares did.
+	let mut ids = [0u32; MAX_IDS];
+	let mut count = 0usize;
 	for word in split_args(&arguments) {
 		match classify(word) {
 			Arg::Long(b"term", None) => signal = JobSignalKind::Term,
@@ -54,11 +60,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					eprint(b"kill: not a job id\n");
 					exit();
 				};
-				if ids.try_reserve(1).is_err() {
-					eprint(b"kill: out of memory\n");
+				if count == MAX_IDS {
+					eprint(b"kill: too many job ids at once\n");
 					exit();
 				}
-				ids.push(id);
+				ids[count] = id;
+				count += 1;
 			}
 			_ => {
 				usage();
@@ -66,12 +73,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		}
 	}
-	if ids.is_empty() {
+	if count == 0 {
 		usage();
 		exit();
 	}
 	let mut client = SessionClient::new(session);
-	for id in ids {
+	for &id in &ids[..count] {
 		match client.job_signal(id, signal) {
 			Some(Ok(info)) => {
 				let mut line = String::new();

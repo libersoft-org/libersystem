@@ -155,7 +155,10 @@ fn trace(client: &mut NetworkClient, destination: &ScopedAddress, shown: &[u8], 
 		let mut named: Option<proto::system::IpAddress> = None;
 		let mut arrived = false;
 		let mut refused = false;
-		let mut times: Vec<u32> = Vec::new();
+		// THE ROW'S TIMES IN A FIXED ARRAY, as many as the probes' ceiling: a vector pushed to imports its growth
+		// routine from whichever shared library provides that instance, which is not the same one on every port.
+		let mut times = [0u32; PROBE_CEILING as usize];
+		let mut count = 0usize;
 		for probe in 0..probes {
 			if interrupted() {
 				break;
@@ -180,12 +183,16 @@ fn trace(client: &mut NetworkClient, destination: &ScopedAddress, shown: &[u8], 
 				}
 			};
 			match hop.status {
-				HopStatus::Timeout => times.push(u32::MAX),
+				HopStatus::Timeout => {
+					times[count] = u32::MAX;
+					count += 1;
+				}
 				status => {
 					if named.is_none() {
 						named = Some(hop.addr);
 					}
-					times.push(hop.rtt_us);
+					times[count] = hop.rtt_us;
+					count += 1;
 					if matches!(status, HopStatus::Reply) {
 						arrived = true;
 					}
@@ -204,7 +211,8 @@ fn trace(client: &mut NetworkClient, destination: &ScopedAddress, shown: &[u8], 
 			// router that does not answer is a router configured not to answer.
 			None => line.extend_from_slice(b"*"),
 		}
-		for time in &times {
+		let times = &times[..count];
+		for time in times {
 			line.push(b' ');
 			if *time == u32::MAX {
 				line.push(b'*');

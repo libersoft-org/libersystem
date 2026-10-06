@@ -200,6 +200,13 @@ pub fn register(intid: u32, handler: HandlerFn) -> bool {
 	WIRED.register(intid, handler)
 }
 
+/// Stop answering `intid`: the console UART's line, let go when a claim takes the UART so the claim can
+/// bind it (`bind_wired` refuses a line this kernel answers), and registered again at the release.
+#[cfg(not(test))]
+pub fn unregister(intid: u32) -> bool {
+	WIRED.unregister(intid)
+}
+
 /// Run this kernel's own handler for `intid`, and say whether there was one. `false` sends the
 /// interrupt on to the MSI registry, which is where every other one belongs.
 pub fn dispatch_wired(intid: u32) -> bool {

@@ -83,13 +83,12 @@ impl<T> SpinLock<T> {
 
 	// THE DATA WITHOUT THE LOCK, for a path that ends the machine and has waited for the lock as long as it
 	// will: the console's terminal-path writer, whose holder may be this very core, interrupted inside the
-	// section.
+	// section - COM1's on x86_64, the device-tree ports' console UART on the other two.
 	//
 	// # Safety
 	// The caller must be on a path that never returns to the code the holder was running, and must accept
 	// that a holder on another core may still be touching the data.
 	#[allow(clippy::mut_from_ref)]
-	#[cfg(target_arch = "x86_64")]
 	pub unsafe fn get_unlocked(&self) -> &mut T {
 		unsafe { &mut *self.data.get() }
 	}

@@ -62,6 +62,18 @@ fn programming_writes_every_register_a_driver_could_have_left_and_the_receive_in
 }
 
 #[test]
+fn programming_without_a_described_clock_keeps_the_divisor_and_with_one_is_the_whole_programming() {
+	let mut uart = Uart::new(Script::default());
+	uart.program_line(None, true);
+	assert_eq!(uart.regs.writes, [(IER, 0), (LCR, LCR_8N1), (IIR_FCR, FCR_ENABLE_AND_CLEAR), (MCR, MCR_CONSOLE), (IER, IER_RX_AVAILABLE)], "the latch never opened, so the divisor the UART holds is kept - and the rest as `program` writes it");
+	let mut whole = Uart::new(Script::default());
+	whole.program(Line { divisor: 2 }, false);
+	let mut described = Uart::new(Script::default());
+	described.program_line(Some(Line { divisor: 2 }), false);
+	assert_eq!(described.regs.writes, whole.regs.writes, "with a line it is `program`, byte for byte");
+}
+
+#[test]
 fn the_transmit_interrupt_is_on_only_while_a_write_waits_and_keeps_the_receive_enable() {
 	let mut uart = Uart::new(Script::default());
 	uart.program(Line { divisor: 3 }, true);

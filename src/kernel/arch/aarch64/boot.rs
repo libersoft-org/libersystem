@@ -976,6 +976,8 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	#[cfg(not(test))]
 	{
 		run_system_manager();
+		// The terminal-path writer first: the console's output is a ring, and nothing drains it once this core halts.
+		super::serial::flush_sync();
 		crate::serial_println!("aarch64: halting");
 		super::halt_loop()
 	}

@@ -1,0 +1,170 @@
+# THE CONSOLE HANDOFF ON A DEVICE-TREE PORT, cold, in a development image: the kernel's console UART - aarch64's PL011,
+# riscv64's 16550 - handed to `console_uart` at boot, typed into and answered through it, taken back on a kill and on a
+# disable with zero stray register accesses each time, handed again on the restart and on the enable, and a panic put
+# on the wire past a driver that holds the UART and has stopped draining a full ring.
+#
+# A TEMPLATE, filled per port by `check-serial-handoff.sh --arch ARCH`, which runs it with
+#
+#   ./lab.sh scenario-cold --serial-broker ARCH <the filled copy>
+#
+# - the broker owns the UART, so `serial-sh` types into it and reads the answer back through it. The placeholders:
+# @UART@ the kernel's name for the UART in its handoff lines, @LINE@ its receive line as those lines name it,
+# @ONLINE@ the driver's online line, @ROW@ the console row's identity. The boot's own handoff, the driver's online line
+# and ConsoleService's attachment happen before a scenario's first step, so the script reads those three from the log.
+version = 1
+name = "serial handoff @ARCH@"
+description = "The console UART handed to its driver, round-tripped through it, taken back with zero stray accesses on a kill and on a disable, handed again, and a panic on the wire past a driver holding a full ring."
+timeout = 1800
+ends = "halted"
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+# 1. THROUGH THE DRIVER: typed into the UART the driver reads, answered through the writes it serves.
+
+[[step]]
+do = "serial-sh"
+command = "echo handoff-through-the-driver"
+contains = "handoff-through-the-driver"
+timeout = 60
+
+# 2. THE DRIVER KILLED: the kernel takes the UART back - zero kernel accesses while the driver held it - and DeviceManager
+# restarts the driver, which takes it again.
+
+[[step]]
+do = "kernel-console"
+request = "kill-holder"
+
+[[step]]
+do = "expect"
+contains = "console: @UART@ is the kernel's again - 0 kernel access(es) to its registers while the driver held it"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "DeviceManager: restarting"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "console: @UART@ (@LINE@) is handed to row"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "@ONLINE@"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "go through the kernel console's UART driver"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "serial-sh"
+command = "echo handoff-after-the-restart"
+contains = "handoff-after-the-restart"
+timeout = 60
+
+# 3. DISABLED: nobody restarts the driver, the kernel takes the UART back, and its own path answers.
+
+[[step]]
+do = "launch"
+program = "lsdev"
+args = "--disable @ROW@"
+timeout = 60
+
+[[step]]
+do = "output"
+contains = "accepted"
+timeout = 60
+
+[[step]]
+do = "finished"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "console: @UART@ is the kernel's again - 0 kernel access(es) to its registers while the driver held it"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "serial-sh"
+command = "echo handoff-through-the-kernel"
+contains = "handoff-through-the-kernel"
+timeout = 60
+
+# 4. ENABLED AGAIN: the next handoff, and the driver answers.
+
+[[step]]
+do = "launch"
+program = "lsdev"
+args = "--enable @ROW@"
+timeout = 60
+
+[[step]]
+do = "output"
+contains = "accepted"
+timeout = 60
+
+[[step]]
+do = "finished"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "console: @UART@ (@LINE@) is handed to row"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "go through the kernel console's UART driver"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "serial-sh"
+command = "echo handoff-after-the-enable"
+contains = "handoff-after-the-enable"
+timeout = 60
+
+# 5. THE CASE THE TERMINAL PATH EXISTS FOR: the tap's reads held and the ring past its bound while the driver keeps
+# serving - the round trip still answers - then a panic, whose dropped count and text reach the wire in that order.
+
+[[step]]
+do = "kernel-console"
+request = "hold-and-flood"
+timeout = 120
+
+[[step]]
+do = "serial-sh"
+command = "echo handoff-while-the-ring-is-full"
+contains = "handoff-while-the-ring-is-full"
+timeout = 60
+
+[[step]]
+do = "kernel-console"
+request = "panic"
+
+[[step]]
+do = "expect"
+contains = "byte(s) of kernel output were dropped at the ring's bound before this point"
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "*** KERNEL PANIC ***"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "a panic asked for over the development channel"
+timeout = 60

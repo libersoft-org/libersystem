@@ -75,6 +75,25 @@ impl<const N: usize> Wired<N> {
 		false
 	}
 
+	/// Stop answering `number`: the row is free again, and the line is one a claim may take. `false` when no row
+	/// answered it.
+	///
+	/// THE NUMBER ALONE IS CLEARED, never the handler beside it. `dispatch` reads the number first and the handler
+	/// only after it matched, so an interrupt already past the match still finds the handler it matched against;
+	/// and `register` writes the handler before it makes a row live, so a stale one is never reached. Clearing the
+	/// handler too would race a `register` that took the freed row in between, and leave a live line answered by
+	/// nothing.
+	///
+	/// The console UART's line on aarch64, given to the claim that takes the UART and answered again at its release.
+	/// riscv64 never unregisters: every wired line there arrives under one identity, which hot-plug lines share.
+	#[cfg(any(test, target_arch = "aarch64"))]
+	pub fn unregister(&self, number: u32) -> bool {
+		if number == EMPTY {
+			return false;
+		}
+		(0..N).any(|row| self.number[row].compare_exchange(number, EMPTY, Ordering::AcqRel, Ordering::Acquire).is_ok())
+	}
+
 	/// Whether this kernel answers `number` itself - which makes it a line no claim may take.
 	#[cfg(any(test, not(target_arch = "riscv64")))]
 	pub fn holds(&self, number: u32) -> bool {
@@ -168,6 +187,25 @@ mod tests {
 		// wrong: a table that overwrote a row to make space would refuse and lose a line at once.
 		assert!(wired.dispatch(35) && wired.dispatch(36));
 		assert_eq!(SEEN.load(Ordering::SeqCst), (1 << 35) + (1 << 36));
+	}
+
+	// A LINE LET GO IS NOBODY'S: it answers nothing, a claim may take it, and registering it again answers it - in a
+	// row of its own or the one it left.
+	crate::tagged_test!(an_unregistered_line_answers_nothing_until_it_is_registered_again, [Kernel, Interrupt], id = "kernel.arch.common.wired.an_unregistered_line_answers_nothing", covers = ["kernel"]);
+	fn an_unregistered_line_answers_nothing_until_it_is_registered_again() {
+		let wired: Wired<2> = Wired::new();
+		SEEN.store(0, Ordering::SeqCst);
+		assert!(wired.register(35, record));
+		assert!(wired.register(36, record));
+		assert!(wired.unregister(35), "the line had a row");
+		assert!(!wired.unregister(35), "and has none once it is let go");
+		assert!(!wired.unregister(0), "zero is no line");
+		assert!(!wired.holds(35) && !wired.dispatch(35), "a line let go is not held and answers nothing");
+		assert!(wired.register(37, other), "its row is free for another line");
+		assert!(wired.dispatch(37) && wired.dispatch(36));
+		assert_eq!(SEEN.load(Ordering::SeqCst), (1 << 38) + (1 << 36), "the new line's handler ran, and the one beside it");
+		assert!(!wired.register(35, record), "a full table refuses the old line until a row is free");
+		assert!(wired.unregister(37) && wired.register(35, record) && wired.dispatch(35), "and answers it again once one is");
 	}
 
 	// A LINE THE KERNEL ANSWERS IS NOT A CLAIM'S: `holds` is what a claimed line is refused by.

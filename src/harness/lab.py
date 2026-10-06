@@ -338,6 +338,8 @@ def broker_reply(conn, outcome, data):
 # guest's own socket. Both have to move together, or a scenario types into one guest and reads
 # another's screen.
 SERIAL_OVERRIDE = os.environ.get('LAB_SERIAL_OVERRIDE') or None
+# THE CONTROL SOCKET OF A COLD RUN'S SERIAL BROKER, while one owns the guest's UART (`scenario-cold --serial-broker`).
+SERIAL_CTL_OVERRIDE = None
 
 
 def serial_log_path():
@@ -2981,6 +2983,26 @@ class LabGuest:
 	def kill_driver(self, function, timeout):
 		return self.scenario_child(['dev-kernel-console', 'kill-driver', function, '--timeout', str(timeout)], timeout)
 
+	# A DEVELOPMENT KERNEL'S CONSOLE REQUEST without an argument - `kill-holder`, `hold-and-flood`, `panic`.
+	def kernel_console(self, request, timeout):
+		return self.scenario_child(['dev-kernel-console', request, '--timeout', str(timeout)], timeout)
+
+	# A COMMAND TYPED INTO THE GUEST'S UART, and what came back through it up to the prompt - through the broker a cold
+	# run started with `--serial-broker`, which owns the serial line as `lab boot`'s does. The one way a scenario reaches
+	# the serial console itself rather than the terminal behind the control channel. None when this run has no such
+	# broker, or the guest did not come back to a prompt.
+	def serial_sh(self, command, timeout):
+		if SERIAL_CTL_OVERRIDE is None:
+			return None
+		note_input()
+		try:
+			reply = ctl_request(f'RUN {timeout} {command}', timeout, SERIAL_CTL_OVERRIDE)
+		except (OSError, SystemExit):
+			return None
+		if not reply.prompted:
+			return None
+		return strip_ansi(reply.data).decode(errors='replace')
+
 
 def cmd_dev_test(args):
 	import scenario
@@ -3040,11 +3062,16 @@ def cmd_dev_test(args):
 def cmd_scenario_cold(args):
 	import scenario
 
-	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE, MON_OVERRIDE, QMP_OVERRIDE, KEY_PACING
+	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE, SERIAL_CTL_OVERRIDE, MON_OVERRIDE, QMP_OVERRIDE, KEY_PACING
 	verbose = '--verbose' in args
+	# THE SERIAL LINE OWNED BY A BROKER rather than written to a file: the guest's UART on a socket this run connects to,
+	# teed into the same log, with the broker's control socket serving `serial-sh` steps - a command typed into the UART
+	# and answered through it, as `lab sh` does for `lab boot`'s guest. Without it the UART is an output file and nothing
+	# can be typed into it.
+	serial_broker = '--serial-broker' in args
 	rest = [a for a in args if not a.startswith('--')]
 	if len(rest) < 2 or rest[0] not in ('x86_64', 'aarch64', 'riscv64'):
-		die('usage: scenario-cold [--verbose] <x86_64|aarch64|riscv64> <file.toml>...')
+		die('usage: scenario-cold [--verbose] [--serial-broker] <x86_64|aarch64|riscv64> <file.toml>...')
 	target, paths = rest[0], rest[1:]
 	documents = []
 	for path in paths:
@@ -3150,7 +3177,15 @@ def cmd_scenario_cold(args):
 	# same reason.
 	if target != 'x86_64':
 		guest_env['UEFI'] = '1'
-	print(f'lab: booting {target}; serial log {os.path.relpath(log, SRC)}')
+	serial_sock = os.path.join(BUILD, f'serial-cold-{target}.sock')
+	serial_ctl = os.path.join(BUILD, f'serial-ctl-cold-{target}.sock')
+	if serial_broker:
+		for path in (serial_sock, serial_ctl):
+			with contextlib.suppress(OSError):
+				os.remove(path)
+		# `server` without `nowait`: QEMU waits for the broker's connection, so no boot output is lost before it.
+		guest_env['SERIAL'] = f'unix:{serial_sock},server'
+	print(f'lab: booting {target}; serial log {os.path.relpath(log, SRC)}' + (' (a broker owns the UART)' if serial_broker else ''))
 	# The runner's own diagnosis goes into the serial log's neighbour rather than into /dev/null: it
 	# is the process that says "loader EFI not found" or "init package not found", and discarding
 	# that left every startup failure looking like a guest that never answered.
@@ -3161,6 +3196,30 @@ def cmd_scenario_cold(args):
 	try:
 		CHANNEL_OVERRIDE = socket_path
 		SERIAL_OVERRIDE = log
+		if serial_broker:
+			# THE BROKER TAKES THE LINE AS SOON AS QEMU OFFERS IT - the runner stages the medium first, which takes a
+			# while - and owns it until QEMU closes it. It tees every byte into the log the readiness wait and the
+			# scenario's steps read, exactly as the file backend would have.
+			serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+			offered = time.time() + 900
+			while True:
+				if guest.poll() is not None:
+					die(f'the {target} guest exited before it offered its serial line (see {os.path.join(BUILD, f"cold-{target}-runner.log")})')
+				if time.time() >= offered:
+					die(f'the {target} guest never offered its serial line at {serial_sock}')
+				try:
+					serial.connect(serial_sock)
+					break
+				except OSError:
+					time.sleep(0.5)
+			if os.fork() == 0:
+				os.setsid()
+				try:
+					broker(serial, ctl_path=serial_ctl, log_path=log)
+				finally:
+					os._exit(0)
+			serial.close()
+			SERIAL_CTL_OVERRIDE = serial_ctl
 		# An emulated guest is slower than the native one every scenario deadline was written
 		# against, by roughly an order of magnitude on the interactive steps.
 		scenario.TIME_SCALE = 1.0 if target == 'x86_64' else 10.0
@@ -3240,6 +3299,7 @@ def cmd_scenario_cold(args):
 	finally:
 		CHANNEL_OVERRIDE = None
 		SERIAL_OVERRIDE = None
+		SERIAL_CTL_OVERRIDE = None
 		MON_OVERRIDE = None
 		QMP_OVERRIDE = None
 		# TERM, then KILL. This sent TERM, waited fifteen seconds and SUPPRESSED the failure - so a

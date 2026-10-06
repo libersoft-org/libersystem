@@ -510,6 +510,10 @@ pub fn handle_irq(from_user: bool) {
 		} else {
 			arm_timer(INTERVAL.load(Ordering::Relaxed));
 		}
+		// AND THE CONSOLE'S TRANSMIT RING, on a busy core's tick as x86_64 drains COM1's: the idle loop drains it too,
+		// and a core that never idles would otherwise hold the kernel's output back. `try_lock`-guarded, so it never
+		// spins in this handler.
+		super::serial::drain_tx();
 	} else {
 		if intid != 0 {
 			crate::idle::interrupt(crate::idle::Cause::Device(intid));

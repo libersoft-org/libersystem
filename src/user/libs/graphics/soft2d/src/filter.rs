@@ -15,7 +15,7 @@
 
 use alloc::vec::Vec;
 
-use graphics_core::geom::PixelRect;
+use graphics_core::geom::{PixelRect, RectF};
 use graphics_core::pixel::{Rgba, Working};
 use render2d::Error;
 use render2d::filter::{FilterGraph, FilterNode};
@@ -34,12 +34,35 @@ use crate::target::Surface;
 /// node while the graph runs and is reserved at `prepare` for the list's largest graph, and a blur's
 /// weights were computed there with the graph (`kernels`), so evaluating a filter in a tile allocates
 /// nothing - it used to build both, in every tile the filtered layer reached.
+///
+/// EACH NODE IS EVALUATED OVER WHAT THE NODES AFTER IT READ OF IT, and the last over `wanted` - the part
+/// of `bounds` the layer is composited from. `bounds` is the tile grown by the graph's whole expansion,
+/// which every node used to fill: an offset's three pixels widened a flood, a mask and a composite by
+/// the blur's twelve. The regions come from the profile's own bounds map (`FilterNode::required_input`),
+/// walked backwards from `wanted`, so a pixel inside `wanted` is the same number it was.
 #[allow(clippy::too_many_arguments)]
-pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
+pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, wanted: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
 	results.clear();
+	let regions = regions(graph, bounds, wanted);
 	let mut outcome: Result<Surface, Error> = Err(Error::Allocation);
 	for (index, node) in graph.nodes().iter().enumerate() {
-		let Some(mut into) = pool.take(bounds) else {
+		let region = regions.get(index).copied().flatten().unwrap_or(PixelRect::new(bounds.x, bounds.y, 0, 0));
+		// A NODE THAT SETS EVERY PIXEL OF `bounds` is given a surface cleared only beyond them; one that
+		// may leave pixels unwritten - a missing input, a blur, a morphology, a tile with nothing to
+		// repeat, an image that is not there - still starts from a cleared one.
+		let whole = {
+			let present = |slot: &u16| results.get(*slot as usize).is_some_and(Option::is_some);
+			match node {
+				FilterNode::Source | FilterNode::Backdrop | FilterNode::Flood { .. } => true,
+				FilterNode::Offset { input, .. } | FilterNode::ColorMatrix { input, .. } | FilterNode::Convolution { input, .. } | FilterNode::Crop { input, .. } => present(input),
+				FilterNode::Composite { source, backdrop, .. } | FilterNode::Blend { source, backdrop, .. } => present(source) && present(backdrop),
+				FilterNode::DisplacementMap { input, map, .. } => present(input) && present(map),
+				FilterNode::In { input, mask } => present(input) && present(mask),
+				_ => false,
+			}
+		};
+		let taken = if whole { pool.take_overwritten(bounds, region) } else { pool.take(bounds) };
+		let Some(mut into) = taken else {
 			// THE POOL IS THE RESERVATION `prepare` MADE, so exhausting it is a budget that was too
 			// small rather than a machine that is out of memory - and the caller is told which.
 			give_back(pool, results);
@@ -47,16 +70,16 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 		};
 		let input = |slot: u16| -> Option<&Surface> { results.get(slot as usize).and_then(|entry| entry.as_ref()) };
 		match node {
-			FilterNode::Source => copy(source, &mut into, bounds),
+			FilterNode::Source => copy(source, &mut into, region),
 			// THE BACKDROP IS WHAT IS ALREADY THERE, read before the layer composites over it - which
 			// is what makes a frosted panel a blur of the scene rather than of itself.
-			FilterNode::Backdrop => copy_from(backdrop, &mut into, bounds),
+			FilterNode::Backdrop => copy_from(backdrop, &mut into, region),
 			FilterNode::Image(handle) => {
 				if let Some((view, _, table)) = images.lookup(handle.0)
 					&& let Ok(sampler) = graphics_core::sample::Sampler::with_table(view, working, graphics_core::sample::Spread::Clamp, table)
 				{
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							into.set(x, y, sampler.sample((x - bounds.x) as f32 + 0.5, (y - bounds.y) as f32 + 0.5, graphics_core::sample::Quality::Bilinear));
 						}
 					}
@@ -70,7 +93,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 				let weights = kernels.get(index).and_then(|entry| entry.as_ref());
 				match (input(*slot), horizontal, weights) {
 					(Some(from), Some(mut horizontal), Some((across, down))) => {
-						blur(from, &mut horizontal, &mut into, bounds, across, down, spans);
+						blur(from, &mut horizontal, &mut into, bounds, region, across, down, spans);
 						pool.give(horizontal);
 					}
 					(_, Some(horizontal), _) => pool.give(horizontal),
@@ -82,9 +105,24 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 				}
 			}
 			FilterNode::Offset { input: slot, dx, dy } => {
-				if let Some(from) = input(*slot) {
-					for target_y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for target_x in bounds.x..bounds.x.saturating_add(bounds.width) {
+				// A WHOLE-PIXEL OFFSET IS A SHIFTED FETCH: a bilinear sample at a whole pixel weighs its
+				// other three taps by zero, so the pixel itself is the sample - one read where there
+				// were four, and the drop shadow every interface draws is offset by whole pixels.
+				let whole_pixels = libm::floorf(*dx) == *dx && libm::floorf(*dy) == *dy && libm::fabsf(*dx) < 65_536.0 && libm::fabsf(*dy) < 65_536.0;
+				if let Some(from) = input(*slot)
+					&& whole_pixels
+				{
+					let (shift_x, shift_y) = (*dx as i64, *dy as i64);
+					for target_y in region.y..region.y.saturating_add(region.height) {
+						for target_x in region.x..region.x.saturating_add(region.width) {
+							let (source_x, source_y) = (target_x as i64 - shift_x, target_y as i64 - shift_y);
+							let value = if source_x < 0 || source_y < 0 || source_x > u32::MAX as i64 || source_y > u32::MAX as i64 { Rgba::TRANSPARENT } else { from.get(source_x as u32, source_y as u32) };
+							into.set(target_x, target_y, value);
+						}
+					}
+				} else if let Some(from) = input(*slot) {
+					for target_y in region.y..region.y.saturating_add(region.height) {
+						for target_x in region.x..region.x.saturating_add(region.width) {
 							// THE SAMPLE COMES FROM WHERE THE OFFSET CAME FROM, which is the source
 							// MINUS the offset - getting the sign the other way moves a shadow to the
 							// opposite side of the thing that cast it.
@@ -97,8 +135,8 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			}
 			FilterNode::ColorMatrix { input: slot, matrix } => {
 				if let Some(from) = input(*slot) {
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							into.set(x, y, colour_matrix(from.get(x, y), matrix));
 						}
 					}
@@ -106,16 +144,16 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			}
 			FilterNode::Flood { color } => {
 				let colour = to_working(*color, working);
-				for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-					for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+				for y in region.y..region.y.saturating_add(region.height) {
+					for x in region.x..region.x.saturating_add(region.width) {
 						into.set(x, y, colour);
 					}
 				}
 			}
 			FilterNode::Composite { source: source_slot, backdrop: backdrop_slot, operator } => {
 				if let (Some(over), Some(under)) = (input(*source_slot), input(*backdrop_slot)) {
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							into.set(x, y, graphics_core::composite::composite(*operator, render2d::blend::BlendMode::Normal, over.get(x, y), under.get(x, y)));
 						}
 					}
@@ -123,8 +161,8 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			}
 			FilterNode::Blend { source: source_slot, backdrop: backdrop_slot, mode } => {
 				if let (Some(over), Some(under)) = (input(*source_slot), input(*backdrop_slot)) {
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							into.set(x, y, graphics_core::composite::composite(render2d::blend::Operator::SrcOver, *mode, over.get(x, y), under.get(x, y)));
 						}
 					}
@@ -145,8 +183,8 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					} else {
 						1.0
 					};
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							let mut total = Rgba::TRANSPARENT;
 							for (row, line) in weights.iter().enumerate() {
 								for (column, weight) in line.iter().enumerate() {
@@ -162,18 +200,18 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			}
 			FilterNode::MorphologyDilate { input: slot, x: radius_x, y: radius_y } => {
 				if let Some(from) = input(*slot) {
-					morphology(from, &mut into, bounds, *radius_x, *radius_y, true);
+					morphology(from, &mut into, region, *radius_x, *radius_y, true);
 				}
 			}
 			FilterNode::MorphologyErode { input: slot, x: radius_x, y: radius_y } => {
 				if let Some(from) = input(*slot) {
-					morphology(from, &mut into, bounds, *radius_x, *radius_y, false);
+					morphology(from, &mut into, region, *radius_x, *radius_y, false);
 				}
 			}
 			FilterNode::DisplacementMap { input: slot, map, scale, x_channel, y_channel } => {
 				if let (Some(from), Some(displacement)) = (input(*slot), input(*map)) {
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							// THE MAP IS READ UNPREMULTIPLIED, because a displacement is a NUMBER
 							// carried in a channel rather than a colour: a half-transparent red that
 							// meant "half a scale to the right" would mean a quarter of one premultiplied.
@@ -188,8 +226,8 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			FilterNode::Crop { input: slot, rect } => {
 				if let Some(from) = input(*slot) {
 					let keep = pixel_rect(*rect);
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							let inside = x >= keep.0 && y >= keep.1 && x < keep.2 && y < keep.3;
 							into.set(x, y, if inside { from.get(x, y) } else { Rgba::TRANSPARENT });
 						}
@@ -201,8 +239,8 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					let keep = pixel_rect(*rect);
 					let (width, height) = (keep.2.saturating_sub(keep.0), keep.3.saturating_sub(keep.1));
 					if width > 0 && height > 0 {
-						for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-							for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+						for y in region.y..region.y.saturating_add(region.height) {
+							for x in region.x..region.x.saturating_add(region.width) {
 								// WRAPPED ABOUT THE RECTANGLE'S OWN ORIGIN, so the tile that lands on
 								// the rectangle is the rectangle - a wrap about the surface origin
 								// would shift the pattern whenever the tile moved.
@@ -216,8 +254,8 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			}
 			FilterNode::In { input: slot, mask } => {
 				if let (Some(from), Some(mask)) = (input(*slot), input(*mask)) {
-					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+					for y in region.y..region.y.saturating_add(region.height) {
+						for x in region.x..region.x.saturating_add(region.width) {
 							// KEEP ONLY WHERE THE MASK HAS ALPHA, which is what every clip-shaped
 							// effect is built on.
 							into.set(x, y, from.get(x, y).scaled(mask.get(x, y).alpha));
@@ -237,6 +275,54 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 	give_back(pool, results);
 	outcome
 }
+
+// THE REGION EACH NODE IS EVALUATED OVER, walked backwards from the last node's `wanted`: a node's
+// input must cover what the node's own region needs of it, which is the profile's bounds map; a node
+// nothing reads is evaluated over nothing. EVERY REGION LIES INSIDE `bounds`, where the surfaces are.
+//
+// THE BLUR READS ITS INPUT OVER ALL OF `bounds` and writes only its region: where `bounds` ends is where
+// its source ends, whatever part of it the nodes after it read.
+fn regions(graph: &FilterGraph, bounds: PixelRect, wanted: PixelRect) -> [Option<PixelRect>; MAX_NODES] {
+	let mut regions = [None; MAX_NODES];
+	let nodes = graph.nodes();
+	let count = nodes.len().min(MAX_NODES);
+	if count == 0 {
+		return regions;
+	}
+	regions[count - 1] = Some(wanted.intersection(&bounds));
+	for index in (0..count).rev() {
+		let Some(want) = regions[index] else { continue };
+		let node = &nodes[index];
+		let asked = RectF::new(want.x as f32, want.y as f32, want.width as f32, want.height as f32);
+		let needed = crate::tile::cover(node.required_input(asked)).intersection(&bounds);
+		for input in node.inputs() {
+			if let Some(slot) = regions.get_mut(input as usize) {
+				*slot = Some(match *slot {
+					Some(held) => union(held, needed),
+					None => needed,
+				});
+			}
+		}
+	}
+	regions
+}
+
+// The smallest rectangle covering both - an empty one covers nothing.
+fn union(left: PixelRect, right: PixelRect) -> PixelRect {
+	if left.width == 0 || left.height == 0 {
+		return right;
+	}
+	if right.width == 0 || right.height == 0 {
+		return left;
+	}
+	let (x, y) = (left.x.min(right.x), left.y.min(right.y));
+	let right_edge = left.x.saturating_add(left.width).max(right.x.saturating_add(right.width));
+	let bottom_edge = left.y.saturating_add(left.height).max(right.y.saturating_add(right.height));
+	PixelRect::new(x, y, right_edge - x, bottom_edge - y)
+}
+
+// The most nodes a graph holds, which the profile bounds.
+const MAX_NODES: usize = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_nodes as usize;
 
 fn give_back(pool: &mut Pool, results: &mut Vec<Option<Surface>>) {
 	for surface in results.drain(..).flatten() {
@@ -266,16 +352,27 @@ fn copy(from: &Surface, into: &mut Surface, bounds: PixelRect) {
 /// turns a radius-squared kernel into two radius-sized ones - at three standard deviations and a
 /// twenty-pixel blur that is the difference between four thousand taps a pixel and a hundred and
 /// twenty.
-fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bounds: PixelRect, horizontal: &[f32], vertical: &[f32], spans: &mut crate::backend::Spans) {
+///
+/// THE SOURCE IS ALL OF `bounds` AND THE OUTPUT ONLY `region`: the horizontal pass fills the region's columns
+/// over its rows and the vertical kernel's reach above and below them, and the vertical pass the region -
+/// each pixel from the same taps, added in the same order, as when the whole of `bounds` was filled.
+#[allow(clippy::too_many_arguments)]
+fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bounds: PixelRect, region: PixelRect, horizontal: &[f32], vertical: &[f32], spans: &mut crate::backend::Spans) {
 	let (left, top) = (bounds.x, bounds.y);
 	let (width, height) = (bounds.width as usize, bounds.height as usize);
 	let reach = |kernel: &[f32]| (kernel.len() as i64 - 1) / 2;
+	// THE REGION IN `bounds`' OWN COLUMNS AND ROWS, and the rows the horizontal pass must fill for it.
+	let region = region.intersection(&bounds);
+	let (columns_from, columns_to) = ((region.x - left) as usize, (region.x - left + region.width) as usize);
+	let (rows_from, rows_to) = ((region.y - top) as usize, (region.y - top + region.height) as usize);
+	let down_reach = reach(vertical).max(0) as usize;
+	let (pass_from, pass_to) = (rows_from.saturating_sub(down_reach), (rows_to + down_reach).min(height));
 	// THE ROW IS READ ONCE, CONVOLVED IN A BUFFER AND WRITTEN ONCE. Reading each tap through the
 	// surface would fetch one pixel at a time through a bounds check, a row lookup and a half-float
 	// decode - twenty-five times per pixel for a four-pixel blur.
 	if width > 0 && spans.filter_input.len() >= width {
 		let offset = reach(horizontal);
-		for y in top..top + bounds.height {
+		for y in top + pass_from as u32..top + pass_to as u32 {
 			from.read_span(left, y, &mut spans.filter_input[..width]);
 			// THE INTERIOR HAS NO EDGE TO TEST FOR, and it is nearly all of the row. Every tap of
 			// every pixel asked whether it had fallen off the source - two comparisons and a branch
@@ -290,7 +387,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 			// THE ORDER OF THE ADDITIONS IS UNCHANGED - tap zero to tap last, for every pixel - which
 			// is what makes this the same number and not merely a close one.
 			let interior = (offset.max(0) as usize).min(width)..width.saturating_sub(offset.max(0) as usize).max((offset.max(0) as usize).min(width));
-			for x in 0..width {
+			for x in columns_from..columns_to {
 				let mut sum = Rgba::TRANSPARENT;
 				if interior.contains(&x) {
 					let base = x - offset.max(0) as usize;
@@ -307,12 +404,12 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 				}
 				spans.filter_output[x] = sum;
 			}
-			horizontal_pass.write_span(left, y, &spans.filter_output[..width]);
+			horizontal_pass.write_span(region.x, y, &spans.filter_output[columns_from..columns_to]);
 		}
 	}
 	if height > 0 && spans.filter_input.len() >= height {
 		let offset = reach(vertical);
-		for x in left..left + bounds.width {
+		for x in region.x..region.x + region.width {
 			// THE COLUMN IS READ AND WRITTEN AS A RUN, which is what the first pass already did for
 			// its rows. Walking it with `get` and `set` recomputed the local coordinates, the bounds
 			// check and the byte offset for every pixel - twice, once each way - over the whole of
@@ -320,7 +417,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 			horizontal_pass.read_column(x, top, &mut spans.filter_input[..height]);
 			// The same split as the first pass, for the same reason.
 			let interior = (offset.max(0) as usize).min(height)..height.saturating_sub(offset.max(0) as usize).max((offset.max(0) as usize).min(height));
-			for y in 0..height {
+			for y in rows_from..rows_to {
 				let mut sum = Rgba::TRANSPARENT;
 				if interior.contains(&y) {
 					let base = y - offset.max(0) as usize;
@@ -337,7 +434,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 				}
 				spans.filter_output[y] = sum;
 			}
-			into.write_column(x, top, &spans.filter_output[..height]);
+			into.write_column(x, region.y, &spans.filter_output[rows_from..rows_to]);
 		}
 	}
 }

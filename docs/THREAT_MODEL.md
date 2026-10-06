@@ -275,10 +275,10 @@ gave this host encrypted under its bond's key - is paired with Just Works and tr
 question. Whoever holds a set's key can therefore pose as its member, which is the set's own protocol's limit; the key
 is never read from an unencrypted link, and a member that does not bond within the search is let go.
 
-**A call is relayed only for a device the operator let carry audio.** This host's telephone bearer answers every
-connected LE peer's reads - the peers it connects to are ones it paired or reconnects to - but a write to its Call
-Control Point is relayed to the voice session only from an encrypted link to a peer trusted for audio, and only while
-a session declares a call; otherwise the bearer refuses it. A broadcast's Broadcast Code is the operator's, passed on
+**A call is relayed only for a device the operator let carry calls.** This host's telephone bearer answers every
+connected LE peer's reads - the peers it connects to are ones it paired or reconnects to - but notifies a call's state
+only to an encrypted peer trusted for voice, and relays a write to its Call Control Point to the voice session only
+from such a peer and only while a session declares a call; otherwise the bearer refuses it. A broadcast's Broadcast Code is the operator's, passed on
 the call and scrubbed once the controller has it; this host keeps no code.
 
 No Bluetooth input reaches the trusted key sink of 2.3: BluetoothService is not one of the keyboard drivers

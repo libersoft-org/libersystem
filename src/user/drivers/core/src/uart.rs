@@ -102,6 +102,22 @@ impl<R: Registers> Uart<R> {
 		self.regs.write(IER, self.ier);
 	}
 
+	// THE SAME, for a UART whose clock may not be described: with a line, exactly `program`; without one, the divisor
+	// the UART holds is kept - the latch is never opened - and every other register is written as `program` writes it.
+	// A divisor computed from a guessed clock would put the console at a rate the far end does not read.
+	pub fn program_line(&mut self, line: Option<Line>, receive_interrupt: bool) {
+		if let Some(line) = line {
+			self.program(line, receive_interrupt);
+			return;
+		}
+		self.regs.write(IER, 0);
+		self.regs.write(LCR, LCR_8N1);
+		self.regs.write(IIR_FCR, FCR_ENABLE_AND_CLEAR);
+		self.regs.write(MCR, MCR_CONSOLE);
+		self.ier = if receive_interrupt { IER_RX_AVAILABLE } else { 0 };
+		self.regs.write(IER, self.ier);
+	}
+
 	// Every interrupt enable off: what a stopping driver leaves.
 	pub fn quiet(&mut self) {
 		self.ier = 0;

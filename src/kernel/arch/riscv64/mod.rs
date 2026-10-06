@@ -128,12 +128,18 @@ pub fn idle_halt() {
 // FID 0 = sbi_system_reset(reset_type, reset_reason)): reset_type 0 = shutdown,
 // 1 = cold reboot; reset_reason 0 = no reason. OpenSBI performs the platform action
 // (on QEMU virt: cold reboot re-enters the firmware, shutdown exits QEMU).
+//
+// AND THE LAST WORDS GO OUT BEFORE THE MACHINE DOES: the console's output is a ring a drain empties, so the
+// terminal-path writer puts what it holds on the wire first - x86_64's `reset` says what a log that ends
+// mid-shutdown cost there.
 pub fn reset() -> ! {
+	serial::flush_sync();
 	sbi_system_reset(1, 0);
 	halt_loop()
 }
 
 pub fn poweroff() -> ! {
+	serial::flush_sync();
 	sbi_system_reset(0, 0);
 	halt_loop()
 }
@@ -297,6 +303,8 @@ pub fn exit_qemu(success: bool) -> ! {
 	// the fixed three-instruction magic sequence (slli x0 / ebreak / srai x0) around the
 	// `ebreak` as a semihosting trap and consumes it before any S-mode trap delivery;
 	// `.option norvc` keeps the instructions uncompressed so the pattern matches exactly.
+	// Flush any queued serial output (the test report) before QEMU exits.
+	serial::flush_sync();
 	let block: [u64; 2] = [0x20026, if success { 0 } else { 1 }];
 	unsafe {
 		core::arch::asm!(
@@ -466,6 +474,10 @@ pub mod apic {
 		} else {
 			arm_timer();
 		}
+		// AND THE CONSOLE'S TRANSMIT RING, on a busy hart's tick as x86_64 drains COM1's: the idle loop drains it
+		// too, and a hart that never idles would otherwise hold the kernel's output back. `try_lock`-guarded, so it
+		// never spins in this handler.
+		super::serial::drain_tx();
 	}
 
 	// Enable the S-mode timer interrupt (SIE.STIE, bit 5), the software interrupt

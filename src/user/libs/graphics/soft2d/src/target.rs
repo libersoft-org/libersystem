@@ -87,6 +87,34 @@ impl Surface {
 		self.image.view_mut().bytes_mut().fill(0);
 	}
 
+	/// CLEAR WHAT `bounds` DOES NOT COVER - the columns right of it and the rows below it, to the
+	/// surface's extent - for a writer that is about to set every pixel of `bounds` itself. Clearing
+	/// the whole scratch before a node that overwrites it was a third of what a filter graph's
+	/// trivial nodes cost; what is left beyond `bounds` must still read transparent, because a
+	/// bilinear tap or a convolution reaches one pixel past the edge.
+	pub fn clear_outside(&mut self, bounds: PixelRect) {
+		let extent = self.image.layout().extent;
+		let pitch = self.image.layout().pitch as usize;
+		let row_bytes = extent.width as usize * BYTES_PER_PIXEL;
+		// THE KEPT RECTANGLE IN THIS SURFACE'S OWN PIXELS, clamped to it: the columns `left..right` of the
+		// rows `top..bottom`.
+		let left = bounds.x.saturating_sub(self.origin.0).min(extent.width);
+		let right = bounds.x.saturating_add(bounds.width).saturating_sub(self.origin.0).min(extent.width).max(left);
+		let top = bounds.y.saturating_sub(self.origin.1).min(extent.height);
+		let bottom = bounds.y.saturating_add(bounds.height).saturating_sub(self.origin.1).min(extent.height).max(top);
+		let bytes = self.image.bytes_mut();
+		for row in 0..extent.height {
+			let start = row as usize * pitch;
+			let Some(line) = bytes.get_mut(start..start + row_bytes) else { break };
+			if row < top || row >= bottom {
+				line.fill(0);
+			} else {
+				line[..left as usize * BYTES_PER_PIXEL].fill(0);
+				line[right as usize * BYTES_PER_PIXEL..].fill(0);
+			}
+		}
+	}
+
 	/// One pixel, in the TARGET's coordinates.
 	///
 	/// THE BYTES ARE ADDRESSED DIRECTLY AND NOT THROUGH A VIEW. A view is CHECKED when it is built -

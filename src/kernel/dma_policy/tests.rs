@@ -179,8 +179,10 @@ fn the_kernel_registry_is_the_manifest_migration_table() {
 	for name in names {
 		let expected = match name {
 			b"virtio_net" => abi::DMA_POLICY_IOMMU_REQUIRED,
-			// A platform row's driver masters nothing - the kernel refuses a platform claim whose entry declares DMA.
-			b"tpm_driver" | b"uart16550" | b"i6300esb" | b"tco" | b"wdat" => abi::DMA_POLICY_NONE,
+			// A platform row's driver masters nothing - the kernel refuses a platform claim whose entry declares DMA -
+			// and neither do the drivers over a bus or a firmware method, nor the development fixtures, which bind a
+			// test device only to hold a binding on it.
+			b"tpm_driver" | b"uart16550" | b"console_uart" | b"i6300esb" | b"tco" | b"wdat" | b"i2c_hid" | b"acpi_power" | b"acpi_fan" | b"acpi_backlight" | b"acpi_als" | b"acpi_button" | b"acpi_tad" | b"smbus_ich9" | b"ipmi" | b"ucsi_acpi" | b"tcpci" | b"bt_fixture" | b"power_fixture" | b"smartcard_fixture" | b"modem_fixture" | b"camera_fixture" | b"midi_fixture" | b"gamepad_fixture" | b"admin_fixture" | b"sleep_fixture" | b"acpi_fixture" => abi::DMA_POLICY_NONE,
 			_ => abi::DMA_POLICY_TRUSTED_UNTRANSLATED,
 		};
 		assert_eq!(registry_policy(name), Some(expected as u8), "{} carries the policy it declares", core::str::from_utf8(name).unwrap());

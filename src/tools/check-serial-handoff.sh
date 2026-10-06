@@ -29,6 +29,14 @@
 #
 # IT BOOTS ITS OWN INSTANCE in private state, as the development lifecycle gate does, and takes it down from
 # the EXIT trap whatever happened.
+#
+# THE DEVICE-TREE PORTS, `--arch aarch64` or `--arch riscv64`: the same handoff of their console UART - the PL011, the
+# 16550 in a register window - to `console_uart`, as one cold development boot (`lab scenario-cold`), since the
+# persistent instance is x86_64's alone. The scenario `harness/scenarios/serial-handoff-port.toml`, filled for the port,
+# drives steps 2 to 6 above - with `--serial-broker`, so the round trips are typed into the UART and answered through
+# it - and this script then reads from the serial log what happened before the scenario's first step: the kernel's
+# handoff line naming the UART and its receive line, the driver's online line and ConsoleService's attachment, and
+# every reacquisition line's count at zero.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
@@ -37,6 +45,54 @@ fail() {
 	echo "serial-handoff: $*" >&2
 	exit 1
 }
+
+# THE PORT VARIANT: the scenario filled for one port, run cold, and the boot's own lines read from its log.
+port_gate() {
+	local arch="$1" uart line online row
+	case "$arch" in
+	aarch64) uart="the PL011 at 0x9000000" line="INTID 33" online="driver.console_uart: online - PL011 at 0x9000000" row="dt:/pl011@9000000" ;;
+	riscv64) uart="the 16550 at 0x10000000" line="APLIC source 10" online="driver.console_uart: online - 16550 at 0x10000000" row="dt:/soc/serial@10000000" ;;
+	*) fail "--arch takes aarch64 or riscv64 - x86_64's handoff is this gate run with no argument" ;;
+	esac
+	local work log kept
+	work="$(mktemp -d "${TMPDIR:-/tmp}/liber-handoff.XXXXXX")"
+	log="$(pwd)/.build/boot/cold-$arch.log"
+	kept="$(pwd)/.build/logs/serial-handoff-$arch"
+	sed -e "s|@ARCH@|$arch|g" -e "s|@UART@|$uart|g" -e "s|@LINE@|$line|g" -e "s|@ONLINE@|$online|g" -e "s|@ROW@|$row|g" src/harness/scenarios/serial-handoff-port.toml >"$work/serial-handoff.toml"
+	local status=0
+	./lab.sh scenario-cold --serial-broker "$arch" "$work/serial-handoff.toml" || status=$?
+	mkdir -p "$kept"
+	cp -f "$log" "$kept/serial.log" 2>/dev/null || true
+	rm -rf -- "$work"
+	((status == 0)) || fail "the $arch scenario failed (serial log: $kept/serial.log)"
+	[[ -f "$log" ]] || fail "the $arch scenario left no serial log at $log"
+	# THE BOOT'S OWN HANDOFF, before the scenario's first step: the kernel's line naming the UART and the receive line
+	# it let go, the driver online over it, and ConsoleService attached to it.
+	grep -a -q -F -- "console: $uart ($line) is handed to row" "$log" || fail "the kernel never handed $uart to a claim with its receive line let go"
+	grep -a -q -F -- "$online" "$log" || fail "the console UART's driver never came online"
+	grep -a -q -F -- "go through the kernel console's UART driver" "$log" || fail "ConsoleService never attached to the console UART's driver"
+	# EVERY REACQUISITION SAID ZERO: a drain, a receive handler or a poll left running is counted at the access path.
+	local back counted
+	back="$(grep -a -F -- "console: $uart is the kernel's again" "$log" || true)"
+	[[ -n "$back" ]] || fail "the kernel never took $uart back"
+	counted="$(grep -v -F -- "- 0 kernel access(es) to its registers while the driver held it" <<<"$back" || true)"
+	if [[ -n "$counted" ]]; then
+		echo "$counted" >&2
+		fail "a reacquisition counted kernel accesses to $uart while the driver held it"
+	fi
+	echo "serial-handoff: PASS on $arch - $uart went to console_uart at boot and came back to the kernel on a kill and on a disable with zero stray kernel accesses each time, the UART answered through the driver and through the kernel, and a panic under a driver that had stopped draining reached the wire after the dropped count"
+}
+
+case "${1:-}" in
+"") ;;
+--arch)
+	if [[ "${2:-x86_64}" != x86_64 ]]; then
+		port_gate "$2"
+		exit 0
+	fi
+	;;
+*) fail "unexpected argument '$1'" ;;
+esac
 
 command -v python3 >/dev/null || fail "python3 is not installed, and the lab is written in it"
 # `lab sh` talks to an ad-hoc `lab boot` guest when one is up, and this gate's own instance only when none is.

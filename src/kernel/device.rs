@@ -727,10 +727,10 @@ fn open_claim_slot(index: usize) {
 		if claims.try_reserve(wanted).is_err() {
 			return;
 		}
-		claims.resize_with(index + 1, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+		claims.resize_with(index + 1, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0, master_deferred: false });
 	}
 	let generation = claims[index].generation.wrapping_add(1);
-	claims[index] = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 };
+	claims[index] = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0, master_deferred: false };
 }
 
 // The number of retained PCI functions.
@@ -927,6 +927,9 @@ struct ClaimSlot {
 	// cannot create a DMA buffer.
 	entry: [u8; abi::ENTRY_NAME_LEN],
 	policy: u8,
+	// BUS MASTERING HELD OFF FOR THIS BINDING until its driver has reset the device or makes its first
+	// DMA buffer - see `claim`. False once it is on, and for every binding that never needed it.
+	master_deferred: bool,
 }
 
 // How long a teardown has to confirm before the device is quarantined.
@@ -946,7 +949,7 @@ fn reset_claims(len: usize) {
 	let mut claims = CLAIMS.lock();
 	claims.clear();
 	// ALLOC-OK: sized once at boot from the table just built.
-	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0, master_deferred: false });
 }
 
 // The stamp the CURRENT binding of `key`'s device carries: the entry it was validated against and
@@ -1156,8 +1159,23 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 	// BUS MASTERING GOES ON ONLY FOR A CLAIM THAT MASTERS. A `none` claim receives its registers and
 	// its interrupts and the bit stays off - which is what makes `none` an enforceable mode rather
 	// than a statement that the driver happens not to ask.
+	//
+	// AND NOT YET FOR A DEVICE ITS LAST DRIVER LEFT RUNNING. Frames still held for this device are a
+	// driver that ended with its DMA never confirmed stopped - killed in the middle of playback, say -
+	// and such a device may still be running the engines that driver started: an HDA stream with its
+	// run bit set resumes the moment the bus is its again, against addresses the new binding's domain
+	// does not have, and the first fault takes the device off the bus for good. So the bit waits for
+	// this binding's driver to say it has reset the device (`device_quiesced`) or to make its first
+	// DMA buffer - every driver resets before it hands a device new addresses - and the device's old
+	// engines meet a reset, not the bus.
+	slot.master_deferred = false;
 	if masters {
-		bus_master(entry, true);
+		if crate::object::dma_buffer::holds_for(index as u32) {
+			slot.master_deferred = true;
+			crate::serial_println!("device: {index}'s last driver ended with its DMA never confirmed stopped - bus mastering waits for this binding's reset or its first DMA buffer");
+		} else {
+			bus_master(entry, true);
+		}
 	}
 	// AND THE FUNCTION'S I/O DECODE, for a row whose ports include its own I/O BARs - set by the claim and
 	// cleared by the release, exactly as bus mastering is. A derived chipset sub-range never touches it.
@@ -1188,6 +1206,21 @@ pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi
 	slot.msi_quarantined_at_claim = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
 	slot.mmio_unconfirmed_at_claim = slot.mmio_unconfirmed;
 	Ok(abi::ClaimKey { device_index: index as u32, _pad: 0, generation })
+}
+
+// THE DEFERRED BUS MASTERING OF `key`'s BINDING TURNED ON - its driver reset the device, or is making
+// the first buffer the device will be given. Nothing for a key that is not the current binding, or a
+// binding whose bit is already on.
+pub fn master_if_deferred(key: abi::ClaimKey) {
+	let table = DEVICES.lock();
+	let mut claims = CLAIMS.lock();
+	let index = key.device_index as usize;
+	let (Some(entry), Some(slot)) = (table.get(index), claims.get_mut(index)) else { return };
+	if slot.state != ClaimState::Claimed || slot.generation != key.generation || !slot.master_deferred {
+		return;
+	}
+	slot.master_deferred = false;
+	bus_master(entry, true);
 }
 
 // Move a live claim into `Releasing`, so nothing new begins while the teardown runs.
@@ -1261,10 +1294,17 @@ fn finish_release(index: usize, confirmed: bool) -> ClaimState {
 }
 
 // The console UART's base when `entry` is its row: a platform row carrying `PLATFORM_FLAG_CONSOLE`, whose first
-// port range is the UART's registers.
+// port range is the UART's registers - COM1's on x86_64 - or, on a port with no port space, whose first MMIO range
+// is: the device-tree ports' PL011 and 16550.
 fn console_base(entry: &DeviceEntry) -> Option<u64> {
 	let row = entry.platform.as_ref()?;
-	(row.part.flags & abi::PLATFORM_FLAG_CONSOLE != 0 && entry.port_count > 0).then(|| entry.ports[0].base as u64)
+	if row.part.flags & abi::PLATFORM_FLAG_CONSOLE == 0 {
+		return None;
+	}
+	if entry.port_count > 0 {
+		return Some(entry.ports[0].base as u64);
+	}
+	row.part.mmio().first().map(|range| range.base)
 }
 
 // THE CONSOLE UART'S ROW, by index: its base, or `None` for any other row.
@@ -1272,8 +1312,8 @@ pub fn console_row(index: usize) -> Option<u64> {
 	DEVICES.lock().get(index).and_then(console_base)
 }
 
-// THE PROCESS HOLDING THE CONSOLE UART - the one its claim's port range is mapped into - for the development
-// request that kills it.
+// THE PROCESS HOLDING THE CONSOLE UART - the one its claim's port range is mapped into, or on the device-tree ports
+// its claim's register window - for the development request that kills it.
 #[cfg(liber_development)]
 pub fn console_holder() -> Option<alloc::sync::Arc<crate::object::process::Process>> {
 	let index = DEVICES.lock().iter().position(|entry| console_base(entry).is_some())?;
@@ -1288,7 +1328,17 @@ pub fn console_holder() -> Option<alloc::sync::Arc<crate::object::process::Proce
 	// COPIED OUT FALLIBLY, upgraded after the lock is given back - a last reference dropped here must not run its
 	// object's teardown under `DERIVED`. A short heap finds no holder.
 	let derived = crate::mem::heap::try_collect(DERIVED.lock().iter().filter(|row| row.key == key).map(|row| row.object.clone()))?;
-	derived.iter().filter_map(|weak| weak.upgrade()).find_map(|object| object.as_any().downcast_ref::<crate::object::port_range::PortRange>().and_then(|range| range.holder()))
+	for object in derived.iter().filter_map(|weak| weak.upgrade()) {
+		if let Some(holder) = object.as_any().downcast_ref::<crate::object::port_range::PortRange>().and_then(|range| range.holder()) {
+			return Some(holder);
+		}
+		// A WINDOW MAPPED INTO A PROCESS, as `bar_holder` finds a PCI driver: COM1's claim mints one too, of no length,
+		// which nothing maps.
+		if let Some(space) = object.as_any().downcast_ref::<crate::object::device_memory::DeviceMemory>().and_then(|memory| memory.mapped_space()) {
+			return process_in(&crate::sched::root_domain(), &space);
+		}
+	}
+	None
 }
 
 // THE PROCESS HOLDING A CLAIMED PCI FUNCTION'S BAR - the one its claim's window is mapped into - for the development
@@ -1900,7 +1950,7 @@ pub(crate) fn publish_namespace(description: platform::Description, properties: 
 			table[row] = platform_entry(&description, properties).ok_or(Unpublished::NoMemory)?;
 			let generation = claims.get(row).map_or(0, |slot| slot.generation).wrapping_add(1);
 			if let Some(slot) = claims.get_mut(row) {
-				*slot = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 };
+				*slot = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0, master_deferred: false };
 			}
 			row
 		}
@@ -1950,7 +2000,7 @@ pub(crate) fn publish_namespace(description: platform::Description, properties: 
 			}
 			let entry = platform_entry(&description, properties).ok_or(Unpublished::NoMemory)?;
 			table.push(entry);
-			claims.push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+			claims.push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0, master_deferred: false });
 			table.len() - 1
 		}
 	};
@@ -2040,7 +2090,7 @@ pub fn add_synthetic_device() -> usize {
 #[cfg(test)]
 fn push_free_claim_slot() {
 	// ALLOC-OK: `#[cfg(test)]`, as the comment above says.
-	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0, master_deferred: false });
 }
 
 // A TEST'S PLATFORM DESCRIPTION, published through the checks and the placement a boot's goes through - so a

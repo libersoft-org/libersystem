@@ -312,8 +312,10 @@ tagged_test!(pointer_and_touch_providers_are_followed_as_they_are_published_and_
 // INPUTSERVICE FOLLOWS EVERY POINTER AND TOUCH PROVIDER: both subscriptions stay open, up to four pointers are merged
 // into the one cursor and one touch surface is attached at a time, a provider past its kind's bound waits and is
 // attached when one of its kind goes, and a surface that goes lifts the finger it held. This plays the catalogue - the
-// two kept subscriptions, publications and withdrawals on them later, and each `open` answered with a driver end it
-// holds - and every driver, on the production six-byte frames.
+// kept subscriptions, publications and withdrawals on them later, and each `open` answered with a driver end it
+// holds - and every driver, on the production six-byte frames. AND THE `input` KIND IS FOLLOWED AS `pointer` IS: the
+// virtio tablet's, whose driver bound again publishes it again - and which was taken once, at bootstrap, so a tablet
+// bound again moved nothing (2026-10-06).
 fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn() {
 	use device_proto::codec as wire;
 	use device_proto::generated::liber::device::v1 as device;
@@ -321,9 +323,10 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 	use object::handle::Capability;
 	use object::rights::Rights;
 
-	// THE CATALOGUE: the pointer and touch subscriptions kept, the input and gamepad ones answered empty.
+	// THE CATALOGUE: the input, pointer and touch subscriptions kept, the gamepad one answered empty.
 	struct Catalogue {
 		server: alloc::sync::Arc<Channel>,
+		input: Option<alloc::sync::Arc<Channel>>,
 		pointer: Option<alloc::sync::Arc<Channel>>,
 		touch: Option<alloc::sync::Arc<Channel>>,
 		seq: u32,
@@ -341,8 +344,10 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 						let (stream, stream_client) = Channel::create();
 						self.server.send(Message::new(corr, alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the subscribe answer");
 						let kind = request.bytes[6];
-						if kind == device::ProviderKind::Pointer as u8 || kind == device::ProviderKind::Touch as u8 {
-							if kind == device::ProviderKind::Pointer as u8 {
+						if kind == device::ProviderKind::Input as u8 || kind == device::ProviderKind::Pointer as u8 || kind == device::ProviderKind::Touch as u8 {
+							if kind == device::ProviderKind::Input as u8 {
+								self.input = Some(stream);
+							} else if kind == device::ProviderKind::Pointer as u8 {
 								self.pointer = Some(stream);
 							} else {
 								self.touch = Some(stream);
@@ -378,7 +383,11 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 			let mut handles = wire::Handles::new();
 			let len = device::provider_catalogue::subscribe_frame(self.seq, info, &mut frame, &mut handles).expect("a publication frame encodes");
 			self.seq += 1;
-			let stream = if info.kind == device::ProviderKind::Pointer { &self.pointer } else { &self.touch };
+			let stream = match info.kind {
+				device::ProviderKind::Input => &self.input,
+				device::ProviderKind::Pointer => &self.pointer,
+				_ => &self.touch,
+			};
 			if let Some(stream) = stream {
 				stream.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).expect("a catalogue frame");
 			}
@@ -467,7 +476,7 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 	// And the system keys' root, which only DisplayService is handed: none here.
 	boot_kernel.send(Message::new(b"SYSKEYS".to_vec(), alloc::vec::Vec::new())).expect("system keys bootstrap");
 	boot_kernel.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("console input bootstrap");
-	let mut catalogue = Catalogue { server: catalogue_server, pointer: None, touch: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new(), opened: alloc::vec::Vec::new() };
+	let mut catalogue = Catalogue { server: catalogue_server, input: None, pointer: None, touch: None, seq: 0, providers: alloc::vec::Vec::new(), empties: alloc::vec::Vec::new(), opened: alloc::vec::Vec::new() };
 	let pump = |catalogue: &mut Catalogue| {
 		for _ in 0..8 {
 			sched::run_until_idle();
@@ -475,9 +484,12 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 		}
 		sched::run_until_idle();
 	};
-	// TWO POINTERS AND ONE SURFACE PUBLISHED BEFORE THE SERVICE ASKS, and a second surface too.
+	// TWO POINTERS AND ONE SURFACE PUBLISHED BEFORE THE SERVICE ASKS, and a second surface too - and the virtio tablet's
+	// `input` kind.
+	let input = device::ProviderKind::Input;
 	let pointer = device::ProviderKind::Pointer;
 	let touch = device::ProviderKind::Touch;
+	let r1 = catalogue.publish(input, 30, 1);
 	let p1 = catalogue.publish(pointer, 1, 1);
 	let p2 = catalogue.publish(pointer, 2, 1);
 	let t1 = catalogue.publish(touch, 10, 1);
@@ -485,7 +497,8 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 	pump(&mut catalogue);
 	let online = boot_kernel.recv().expect("InputService online report");
 	assert_eq!(&online.bytes[..], b"InputService: online");
-	assert!(catalogue.pointer.is_some() && catalogue.touch.is_some(), "both kinds were subscribed");
+	assert!(catalogue.input.is_some() && catalogue.pointer.is_some() && catalogue.touch.is_some(), "all three kinds were subscribed");
+	assert!(catalogue.was_opened(input, 30, 1), "the virtio tablet's provider published at the start was attached");
 	assert!(catalogue.was_opened(pointer, 1, 1) && catalogue.was_opened(pointer, 2, 1), "both pointers published at the start were attached");
 	assert!(catalogue.was_opened(touch, 10, 1) && !catalogue.was_opened(touch, 11, 1), "one surface is attached and the second waits");
 
@@ -531,6 +544,20 @@ fn pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn(
 	let seen = cursor(&service_client, 3);
 	assert!(seen.contains(&(40, 0)) && seen.contains(&(50, 0)), "the fourth and the fifth moved the cursor: {seen:?}");
 	assert!(p1.send(raw_pointer(at_column(12), 0)).is_err(), "and the withdrawn first is closed");
+
+	// THE VIRTIO TABLET BOUND AGAIN: its provider withdrawn, its connection closed, and the re-publication attached and
+	// moving the cursor - as a pointer's is, beside the four pointers attached.
+	r1.send(raw_pointer(at_column(60), 0)).expect("the virtio tablet");
+	catalogue.withdraw(input, 30, 1);
+	pump(&mut catalogue);
+	assert!(r1.send(raw_pointer(at_column(61), 0)).is_err(), "the withdrawn tablet's connection is closed");
+	let r1_again = catalogue.publish(input, 30, 2);
+	pump(&mut catalogue);
+	assert!(catalogue.was_opened(input, 30, 2), "the tablet's re-publication is attached");
+	r1_again.send(raw_pointer(at_column(62), 0)).expect("the tablet bound again");
+	sched::run_until_idle();
+	let seen = cursor(&service_client, 5);
+	assert!(seen.contains(&(60, 0)) && seen.contains(&(62, 0)) && !seen.contains(&(61, 0)), "the tablet moved the cursor before and after it was bound again: {seen:?}");
 
 	// THE SURFACES: a finger down on the first, the first withdrawn - the finger lifted - and the second attached.
 	let (proof, registered) = Channel::create();

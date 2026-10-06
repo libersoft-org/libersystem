@@ -1548,6 +1548,9 @@ fn le_audio(probe: &mut Probe) {
 		sleep_until(clock() + TICKS / 5);
 	}
 	say("a coordinated set: the left earbud paired by the operator, the right found by its RSI and bonded as the set's, trusted for audio");
+	// THE LEFT EARBUD MAY CARRY CALLS: the telephone bearer tells a call, and takes a command, only from a peer trusted
+	// for voice.
+	probe.trust(EARBUD_L, Profile::Voice, true);
 	probe.take("the left earbud never found this host's call bearer", 10 * TICKS, |line| line == "earbud L found the host's call bearer");
 
 	// ONE DEVICE IN AUDIOSERVICE: stereo at 48 kHz, and its voice at 16 kHz.

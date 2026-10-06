@@ -644,6 +644,8 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		report_timer();
 		super::syscall::init();
 		run_system_manager();
+		// The terminal-path writer first: the console's output is a ring, and nothing drains it once this core halts.
+		super::serial::flush_sync();
 		crate::serial_println!("riscv64: halting");
 		super::halt_loop()
 	}

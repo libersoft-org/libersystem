@@ -295,7 +295,19 @@ STEP_FIELDS = {
 	# A development kernel's driver kill: the driver that has the claimed PCI function `function` (VENDOR:DEVICE
 	# in hex) mapped is SIG_KILLed as DeviceManager would.
 	'kill-driver': {'required': ('function',), 'optional': ('timeout',)},
+	# A COMMAND TYPED INTO THE GUEST'S UART, and `contains` in what came back through the UART before the prompt - the
+	# serial console end to end, which `input` (the control channel's terminal) never touches. It needs a run whose
+	# broker owns the serial line, `lab scenario-cold --serial-broker`, and fails by name in any other.
+	'serial-sh': {'required': ('command', 'contains'), 'optional': ('timeout',)},
+	# A DEVELOPMENT KERNEL'S CONSOLE REQUEST: `kill-holder` SIG_KILLs the process holding the console UART as
+	# DeviceManager would; `hold-and-flood` holds every console tap's reads and writes kernel lines until the ring is
+	# past its bound; `panic` asks for a kernel panic - after which nothing answers, so a scenario that sends it says
+	# `ends = "halted"`.
+	'kernel-console': {'required': ('request',), 'optional': ('timeout',)},
 }
+
+# The development kernel's console requests a `kernel-console` step may name - the ones without an argument.
+KERNEL_CONSOLE_REQUESTS = ('kill-holder', 'hold-and-flood', 'panic')
 
 # The run states a `run-state` step may name: QEMU's own.
 RUN_STATES = ('running', 'watchdog', 'paused', 'shutdown', 'guest-panicked', 'internal-error', 'prelaunch', 'suspended')
@@ -326,10 +338,11 @@ def validate(document, path):
 	# answer. A scenario that asks the chassis to stop the machine, and whose assertion is that it
 	# WAS stopped, has nothing to answer afterwards: it would report "teardown did not complete" on
 	# the run where everything worked. `ends = "powered-off"` says so once, and the teardown then
-	# asserts the opposite thing: that nothing answers.
+	# asserts the opposite thing: that nothing answers. `ends = "halted"` is the same for a machine a
+	# scenario stopped on purpose without powering it off - a kernel panic it asked for.
 	ends = document.get('ends')
-	if ends is not None and ends != 'powered-off':
-		raise ScenarioError(f'{path}: ends must be "powered-off" when it is given, not {ends!r}')
+	if ends is not None and ends not in ('powered-off', 'halted'):
+		raise ScenarioError(f'{path}: ends must be "powered-off" or "halted" when it is given, not {ends!r}')
 	version = document.get('version')
 	if version != SCENARIO_VERSION:
 		raise ScenarioError(f'{path}: version {version!r}, this runner understands {SCENARIO_VERSION}')
@@ -448,6 +461,14 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} (run-state): hold must be 1..{MAX_STEP_SECONDS} seconds')
 	if kind == 'kill-driver' and not (isinstance(step['function'], str) and re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{4}', step['function'])):
 		raise ScenarioError(f'{where} (kill-driver): function must be VENDOR:DEVICE in hex, as 8086:25ab')
+	if kind == 'serial-sh':
+		command = step['command']
+		if not isinstance(command, str) or not command.strip() or '\n' in command or '\r' in command:
+			raise ScenarioError(f'{where} (serial-sh): command must be one non-empty line')
+		if len(command.encode()) > MAX_INPUT_BYTES:
+			raise ScenarioError(f'{where} (serial-sh): command is {len(command.encode())} B, at most {MAX_INPUT_BYTES}')
+	if kind == 'kernel-console' and step['request'] not in KERNEL_CONSOLE_REQUESTS:
+		raise ScenarioError(f'{where} (kernel-console): {step["request"]!r} is not a console request, expected one of {list(KERNEL_CONSOLE_REQUESTS)}')
 
 
 # The guest, as the runner sees it: terminal input and artifact publication over the control
@@ -623,7 +644,7 @@ def teardown(lab, verbose=False, baseline=None, first_run=True, ends=None):
 	# Everything below drives the guest, and a scenario that declared this end has just asserted
 	# that there is no guest - so the check is the opposite one: if anything still answers, the
 	# machine that was supposed to stop did not.
-	if ends == 'powered-off':
+	if ends in ('powered-off', 'halted'):
 		lab_module.timing_event('scenario', 'cleanup-end')
 		if lab.wait_prompt(int(2 * TIME_SCALE)):
 			return ['the machine answered a prompt after it was asked to power off']
@@ -804,6 +825,15 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'kill-driver':
 		if not lab.kill_driver(step['function'], int(limit)):
 			raise ScenarioError(f'{where}: the development kernel killed no driver of {step["function"]}')
+	elif kind == 'serial-sh':
+		answer = lab.serial_sh(step['command'], int(limit))
+		if answer is None:
+			raise ScenarioError(f'{where}: the serial console did not answer {step["command"]!r} at a prompt within {int(limit)} s - or this run has no serial broker (`scenario-cold --serial-broker`)')
+		if step['contains'] not in answer:
+			raise ScenarioError(f'{where}: the serial console answered {step["command"]!r} without {step["contains"]!r}: {answer[-300:]!r}')
+	elif kind == 'kernel-console':
+		if not lab.kernel_console(step['request'], int(limit)):
+			raise ScenarioError(f'{where}: the development kernel refused the console request {step["request"]}')
 	elif kind == 'prompt':
 		if not lab.wait_prompt(int(limit)):
 			raise ScenarioError(f'{where}: no shell prompt within {int(limit)} s')

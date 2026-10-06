@@ -1151,6 +1151,60 @@ class RunStateStepTest(unittest.TestCase):
 		scenario.validate(document, 'test.toml')
 
 
+# THE SERIAL-HANDOFF GATE'S PORT STEPS: a command typed into the UART whose answer must come back through it, the
+# development kernel's console requests, and a scenario that ends with the machine halted on purpose.
+class SerialStepTest(unittest.TestCase):
+	def guest(self, answer):
+		class Guest(ScriptedGuest):
+			def serial_sh(self, command, timeout):
+				self.calls.append(('serial_sh', command))
+				return answer
+
+		return Guest()
+
+	def drive(self, step, guest, limit=5):
+		scenario.run_step(step, scenario.Guest(guest), guest, limit, 0)
+
+	def test_an_answer_carrying_the_text_passes(self):
+		guest = self.guest('echo handoff\r\nhandoff\r\n')
+		self.drive({'do': 'serial-sh', 'command': 'echo handoff', 'contains': 'handoff'}, guest)
+		self.assertIn(('serial_sh', 'echo handoff'), guest.calls, 'the command went to the UART')
+
+	def test_an_answer_without_the_text_fails(self):
+		with self.assertRaises(scenario.ScenarioError) as caught:
+			self.drive({'do': 'serial-sh', 'command': 'echo handoff', 'contains': 'elsewhere'}, self.guest('echo handoff\r\nhandoff\r\n'))
+		self.assertIn('without', str(caught.exception))
+
+	# NO BROKER, OR NO PROMPT: the step fails rather than reading an empty answer as one that happened not to match.
+	def test_no_answer_fails_by_name(self):
+		with self.assertRaises(scenario.ScenarioError) as caught:
+			self.drive({'do': 'serial-sh', 'command': 'echo handoff', 'contains': 'handoff'}, self.guest(None))
+		self.assertIn('serial broker', str(caught.exception))
+
+	def test_a_refused_console_request_fails(self):
+		guest = ScriptedGuest(fail_on=None)
+		guest.answer = lambda name: name != 'kernel_console'
+		with self.assertRaises(scenario.ScenarioError):
+			self.drive({'do': 'kernel-console', 'request': 'kill-holder'}, guest)
+
+	def test_the_fields_and_the_end_are_validated(self):
+		for step in ({'do': 'serial-sh', 'command': 'echo a\necho b', 'contains': 'a'}, {'do': 'serial-sh', 'command': ' ', 'contains': 'a'}, {'do': 'serial-sh', 'command': 'ls'}, {'do': 'kernel-console', 'request': 'reboot'}):
+			document = {'version': scenario.SCENARIO_VERSION, 'name': 'x', 'step': [step]}
+			with self.assertRaises(scenario.ScenarioError, msg=repr(step)):
+				scenario.validate(document, 'test.toml')
+		with self.assertRaises(scenario.ScenarioError):
+			scenario.validate({'version': scenario.SCENARIO_VERSION, 'name': 'x', 'ends': 'crashed', 'step': [{'do': 'prompt'}]}, 'test.toml')
+		document = {'version': scenario.SCENARIO_VERSION, 'name': 'x', 'ends': 'halted', 'step': [{'do': 'serial-sh', 'command': 'echo a', 'contains': 'a'}, {'do': 'kernel-console', 'request': 'panic'}]}
+		scenario.validate(document, 'test.toml')
+
+	# A HALTED MACHINE ANSWERS NOTHING, and the teardown asks exactly that: a prompt after the panic fails it.
+	def test_a_halted_end_is_torn_down_by_asking_that_nothing_answers(self):
+		quiet = ScriptedGuest()
+		quiet.answer = lambda name: False if name == 'wait_prompt' else True
+		self.assertEqual(scenario.teardown(quiet, ends='halted'), [])
+		self.assertEqual(scenario.teardown(ScriptedGuest(), ends='halted'), ['the machine answered a prompt after it was asked to power off'])
+
+
 # BOOT-007's other half: the claim that a child which ignores TERM is killed, and that its whole
 # GROUP goes with it. Asserted in a comment when it was written; exercised here, because a cleanup
 # that quietly fails to clean is worse than none - the next run inherits whatever survived.

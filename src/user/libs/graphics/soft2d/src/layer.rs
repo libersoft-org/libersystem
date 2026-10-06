@@ -57,6 +57,15 @@ impl Pool {
 		Some(surface)
 	}
 
+	/// A SURFACE AT `bounds` FOR A WRITER THAT SETS EVERY PIXEL OF `written`: only what lies beyond it is
+	/// cleared.
+	pub fn take_overwritten(&mut self, bounds: PixelRect, written: PixelRect) -> Option<Surface> {
+		let mut surface = self.free.pop()?;
+		surface.rebase((bounds.x, bounds.y));
+		surface.clear_outside(written);
+		Some(surface)
+	}
+
 	pub fn give(&mut self, surface: Surface) {
 		self.free.push(surface);
 	}

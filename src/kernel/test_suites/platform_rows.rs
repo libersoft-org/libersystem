@@ -383,6 +383,11 @@ fn a_kernel_held_device_an_overlap_and_memory_or_a_bar_are_refused() {
 		assert_eq!(device::info(com1).map(|info| info.platform.state), Some(abi::PLATFORM_STATE_KERNEL_HELD));
 		assert_eq!(device::claim(com1, &dma_policy::entry_field(b"synthetic-none")), Err(device::ClaimError::Refused), "the console is the kernel's");
 	}
+	// AND ON THE DEVICE-TREE PORTS, whose console row is the tree's `/chosen/stdout-path` node and whose test kernel reads
+	// no tree: no row carries the console flag, so no claim can take the UART the suite is judged by - the same rule COM1's
+	// kernel-held row keeps on x86_64. The handoff's own rules run in `arch::common::console_uart`'s tests instead.
+	#[cfg(not(target_arch = "x86_64"))]
+	assert!(!(0..device::count()).any(|index| device::info(index).is_some_and(|info| info.platform.flags & abi::PLATFORM_FLAG_CONSOLE != 0)), "a test kernel publishes no console row its suite could lose the wire to");
 	// AN OVERLAP THAT STARTS AT THE SAME BASE IS ONE DEVICE, MERGED; ANY OTHER IS REFUSED.
 	let mut first = synthetic_platform_description(b"kernel:test-overlap-first");
 	assert!(first.add_mmio(free_window(0x10000), 0x2000));

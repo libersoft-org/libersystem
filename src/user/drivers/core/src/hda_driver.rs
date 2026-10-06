@@ -60,6 +60,10 @@ const BRINGUP_TICKS: u64 = 60;
 // about eleven milliseconds at this format, so this is far more than one and still bounded: a
 // controller that stops filling must not hold the consumer.
 const CAPTURE_TICKS: u64 = 50;
+// How long the controller is given to move on from the half a period is waiting for, in the same ticks: a period is
+// about eleven milliseconds, so this is many of them, and a controller that stops playing is refused rather than waited
+// on for ever.
+const PLAYBACK_TICKS: u64 = 50;
 
 use drivers::common::Deadline;
 unsafe fn r8(addr: u64) -> u8 {
@@ -395,6 +399,10 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 				return Err(Bringup::ResetEnter { gctl: r32(base + hda::REG_GCTL) });
 			}
 		}
+		// IN RESET, EVERY STREAM ENGINE IS STOPPED - whatever a driver before this one left running - and
+		// the kernel is told so: the frames it held for that driver go back, and a binding whose bus
+		// mastering waited for this reset gets it now.
+		device_quiesced(device);
 		w32(base + hda::REG_GCTL, hda::GCTL_RESET);
 		while r32(base + hda::REG_GCTL) & hda::GCTL_RESET == 0 {
 			if !deadline.waiting() {
@@ -637,11 +645,36 @@ unsafe fn stop(controller: &mut Controller) {
 	}
 }
 
+// Wait until the controller is playing the OTHER half of the buffer, which is when `half` - the period written into it
+// two periods ago - has been played and may be written again. False when it has not moved on inside its bound.
+//
+// THE DEVICE PACES PLAYBACK, AND IT DID NOT HERE (found 2026-10-06, measuring the audio drivers). A period was copied
+// into "the half the controller is not playing" and answered at once, so nothing waited for the controller at all:
+// AudioService, whose clock is this answer, handed over the next period one round trip later, and a twelve-second file
+// played in 1.4 s - each half overwritten several times before the controller reached it once. The link position is
+// the controller's own count of what it has consumed, and the half it is in is the one it is playing.
+unsafe fn half_played(controller: &Controller, half: u64) -> bool {
+	unsafe {
+		let mut deadline = Deadline::ticks(PLAYBACK_TICKS);
+		loop {
+			let position = r32(controller.stream + hda::SD_LPIB) as u64;
+			if (position / controller.period) % 2 != half {
+				return true;
+			}
+			if !deadline.waiting() {
+				return false;
+			}
+			yield_now();
+		}
+	}
+}
+
 // Make the capture buffer hold two periods and point the input stream at it.
 //
 // THE DESCRIPTORS ASK FOR A COMPLETION STATUS, which the playback ones do not need: playback is
-// paced by the consumer handing over the next period, and capture is paced by the DEVICE filling
-// one. `SD_BUFFER_COMPLETE` is how "a period is ready" is asked without an interrupt.
+// paced by the link position the controller advances as it plays (`half_played`), and capture by
+// the DEVICE filling a period. `SD_BUFFER_COMPLETE` is how "a period is ready" is asked without an
+// interrupt.
 unsafe fn configure_capture(controller: &mut Controller, bytes: u64) -> bool {
 	unsafe {
 		if controller.capture.virt != 0 && controller.capture.bytes >= bytes * 2 {
@@ -763,7 +796,13 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 						send_blocking(service, audio::REFUSED, 0);
 						continue;
 					}
-					// Into the half the controller is not playing, then run.
+					// Into the half the controller is not playing - once it has played what was there - then run. A
+					// controller that does not move on is refused: the answer is the consumer's clock, and an `OK` for
+					// a period that cannot be played would be one more period it was told went out.
+					if controller.running && !half_played(controller, half) {
+						send_blocking(service, audio::REFUSED, 0);
+						continue;
+					}
 					let at = controller.audio.virt + half * controller.period;
 					core::ptr::copy_nonoverlapping(period.as_ptr(), at as *mut u8, len);
 					core::sync::atomic::fence(core::sync::atomic::Ordering::Release);

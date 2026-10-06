@@ -93,6 +93,10 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	process.terminate();
 	crate::sched::run_until_idle();
 	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "the frames of a driver that died holding a buffer are held for its device, not handed to whoever allocates next");
+	// AND THE DEVICE IS KNOWN TO BE ONE ITS LAST DRIVER LEFT RUNNING, which is what holds a re-claim's bus
+	// mastering off until the next driver has reset it.
+	assert!(super::holds_for(DEVICE), "frames held for the device say its last driver ended with its DMA unconfirmed");
+	assert!(!super::holds_for(DEVICE + 1), "and say nothing about any other device");
 
 	// 3. And they come back when - and only when - somebody proves the device has been stopped.
 	//    That claim is a capability: the holder of the device's own DeviceMemory.
@@ -108,6 +112,7 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	let released = super::release_for(DEVICE);
 	assert_eq!(released, frames.len(), "resetting the device releases exactly its held frames");
 	assert_eq!(super::held_frames_for_test(DEVICE), 0, "and nothing is held for it any more");
+	assert!(!super::holds_for(DEVICE), "a device that was reset holds nothing back for its next binding");
 	drop(process);
 	crate::sched::run_until_idle();
 }

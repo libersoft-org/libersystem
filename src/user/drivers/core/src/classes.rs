@@ -180,13 +180,19 @@ impl Pipe {
 
 // The xHCI endpoint-context interval for an interrupt endpoint: the exponent of its period in 125 us
 // microframes. A high-speed descriptor already carries the exponent plus one; a full- or low-speed one counts
-// 1 ms frames, so the period is the smallest power of two covering bInterval * 8 microframes.
+// 1 ms frames, and its period is the LARGEST power of two NOT EXCEEDING bInterval * 8 microframes, 3 to 10.
+//
+// DOWN, NOT UP (corrected 2026-10-06, measuring the input drivers). This took the smallest power of two that
+// covered it, so a full-speed keyboard or tablet asking for 10 ms was polled every 16: one report each 16 ms - a
+// tablet stream of 62 events a second, a key's arrival up to 16 ms after it was pressed. A full-speed bInterval
+// is the longest period the device accepts and the host may poll more often, never less; it is the xHCI
+// specification's rule for these endpoints, and the 3-to-10 range is its range for them.
 pub(crate) fn interrupt_interval(speed: u32, b_interval: u32) -> u32 {
 	if speed == crate::SPEED_HIGH || speed == crate::SPEED_SUPER {
 		return b_interval.clamp(1, 16) - 1;
 	}
 	let mut exp: u32 = 3;
-	while exp < 15 && 1 << (exp - 3) < b_interval {
+	while exp < 10 && 1 << (exp + 1 - 3) <= b_interval {
 		exp += 1;
 	}
 	exp

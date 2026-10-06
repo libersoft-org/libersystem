@@ -99,6 +99,15 @@ pub fn hold_source(source: u32) {
 	}
 }
 
+/// Give `source` up: the console UART's, when a claim takes the UART and arms its line to an identity of its own.
+/// The kernel holds it again (`hold_source`) when the release gives the UART back.
+#[cfg(not(test))]
+pub fn release_source(source: u32) {
+	if let Some(word) = KERNEL_SOURCES.get((source / 64) as usize) {
+		word.fetch_and(!(1 << (source % 64)), core::sync::atomic::Ordering::AcqRel);
+	}
+}
+
 fn kernel_holds(source: u32) -> bool {
 	KERNEL_SOURCES.get((source / 64) as usize).is_some_and(|word| word.load(core::sync::atomic::Ordering::Acquire) & (1 << (source % 64)) != 0)
 }

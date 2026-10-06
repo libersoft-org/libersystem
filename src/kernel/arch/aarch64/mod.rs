@@ -143,7 +143,11 @@ pub fn idle_halt() {
 // calls `reset()` to get a clean machine, and on this port the machine simply stopped instead - the
 // last rung of the ladder silently absent on one target of three. A platform with no usable conduit
 // still halts, but says why rather than pretending it rebooted.
+// AND THE LAST WORDS GO OUT BEFORE THE MACHINE DOES: the console's output is a ring a drain empties, so the
+// terminal-path writer puts what it holds on the wire before PSCI is asked - x86_64's `reset` says what a log that
+// ends mid-shutdown cost there.
 pub fn reset() -> ! {
+	serial::flush_sync();
 	if !psci::system_reset() {
 		crate::serial_println!("aarch64: no PSCI conduit below this kernel - cannot reboot, halting instead");
 	}
@@ -151,6 +155,7 @@ pub fn reset() -> ! {
 }
 
 pub fn poweroff() -> ! {
+	serial::flush_sync();
 	if !psci::system_off() {
 		crate::serial_println!("aarch64: no PSCI conduit below this kernel - cannot power off, halting instead");
 	}
@@ -273,6 +278,8 @@ pub fn exit_qemu(success: bool) -> ! {
 	// passing an exit code the test runner maps to pass/fail: 0 = success, 1 = failure.
 	// The parameter block is {reason, exit_code}; ADP_Stopped_ApplicationExit (0x20026)
 	// is the normal-exit reason. The `hlt #0xf000` is the A64 semihosting trap.
+	// Flush any queued serial output (the test report) before QEMU exits.
+	serial::flush_sync();
 	let block: [u64; 2] = [0x20026, if success { 0 } else { 1 }];
 	unsafe {
 		core::arch::asm!(
