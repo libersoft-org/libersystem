@@ -1,5 +1,6 @@
 // bt_fixture - the in-guest Bluetooth controller AND the devices on the other end of its radio: an LE
-// boot mouse, and five BR/EDR devices (`drivers::bt_world`).
+// boot mouse, five BR/EDR devices (`drivers::bt_world`), the LE world's peripherals (`drivers::bt_le_world`)
+// and its LE Audio devices - two earbuds of one coordinated set and a broadcast source (`drivers::bt_le_audio`).
 //
 // DEVELOPMENT-ONLY. It is staged into the image a gate builds and into no shipping one, and nothing a
 // client does can enable it: it binds to a QEMU test device at a pinned address, which a shipping
@@ -24,6 +25,12 @@
 // THE CONTROL ENDPOINT. A gate's probe reaches the fixture through a `fixture-control` publication, which only
 // a development probe's policy row grants: it makes a device act - page this host, pair from its side, open a
 // channel, type a passkey - and reads what the far side saw, line by line, as `bt-fixture:` prints it.
+//
+// AN LE AUDIO CONTROLLER. It has extended advertising, periodic advertising, the CIS central role and the
+// synchronized receiver role, and keeps the rule real ones keep: a host that used an extended command is refused
+// the legacy scan and initiation until it resets. Its ISO data comes in as `iso` packets and goes out the way a USB
+// controller's bulk IN pipe delivers it - as `acl` packets carrying the ISO header, which the host tells apart by
+// handle.
 
 #![no_std]
 #![no_main]
@@ -33,6 +40,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
+use drivers::bt_le_audio::{self, Advert};
 use drivers::bt_le_world::{self, LeOut, LeWorld};
 use drivers::bt_peer::{self, Peer};
 use drivers::bt_world::{self, World};
@@ -152,6 +160,8 @@ impl Fixture {
 			match out {
 				LeOut::Event(bytes) => self.emit(HciPacketKind::Event, bytes),
 				LeOut::Acl(bytes) => self.emit(HciPacketKind::Acl, bytes),
+				// ISO DATA TO THE HOST travels as a USB controller's bulk IN pipe carries it: beside ACL, told apart by handle.
+				LeOut::Iso(bytes) => self.emit(HciPacketKind::Acl, bytes),
 			}
 		}
 		for line in self.le.take_log() {
@@ -271,6 +281,12 @@ impl Fixture {
 			self.world_out(outs);
 			return;
 		}
+		// THE LE AUDIO HALF: its features and buffers, its groups, streams, data paths and syncs - and the extended-mode
+		// rule, which refuses the legacy scan and initiation here once the host has gone extended.
+		if let Some(outs) = self.le.command(opcode, params) {
+			self.le_out(outs);
+			return;
+		}
 		match opcode {
 			// A RESET ENDS WHAT THE LINK LAYER WAS DOING - the connections and the scans, with no disconnection
 			// event - which is what a host powering the radio off relies on.
@@ -352,31 +368,35 @@ impl Fixture {
 			}
 			0x200d if params.len() == 25 => {
 				self.status(opcode, 0);
-				let own = params[12];
-				// THROUGH THE ACCEPT LIST: whichever device on it is there, or the first that comes back.
-				if params[4] == 0x01 {
-					self.accepting = Some(own);
-					self.try_accept();
+				self.initiate(params[4] == 0x01, params[12], params[5], &params[6..12]);
+			}
+			// THE EXTENDED SCAN: its parameters, and each enable a new listener that hears every advertiser there is - the
+			// mouse while nothing is connected to it.
+			0x2041 => {
+				let status = self.le.extended_scan_parameters(params);
+				self.complete(opcode, &[status]);
+			}
+			0x2042 => {
+				let (status, began) = self.le.extended_scan_enable(params, clock());
+				self.complete(opcode, &[status]);
+				if began {
+					if !self.connected {
+						self.meta(0x0d, &mouse_advert().extended_report());
+					}
+					let reports = self.le.extended_reports();
+					self.le_out(reports);
+				}
+			}
+			// LE EXTENDED CREATE CONNECTION, version 1: the filter policy, the own and peer address, the initiating PHYs and
+			// sixteen octets for each - on the air what the legacy one does.
+			0x2043 => {
+				let phys = params.get(9).copied().unwrap_or(0);
+				if params.len() < 10 || phys == 0 || phys & !0x07 != 0 || params.len() != 10 + 16 * phys.count_ones() as usize {
+					self.status(opcode, 0x12);
 					return;
 				}
-				// The host asked for a device by the address it advertises, or for nothing this controller can reach.
-				let mut wire = [0u8; 6];
-				wire.copy_from_slice(&params[6..12]);
-				wire.reverse();
-				let host = self.host_address(own);
-				if wire == bt_peer::PEER_ADDRESS && !self.connected {
-					self.connect_mouse(host);
-					return;
-				}
-				if let Some(at) = self.le.named(&wire) {
-					let outs = self.le.connect(at, host, false);
-					self.le_out(outs);
-					return;
-				}
-				let mut failed = alloc::vec![0x02, 0, 0, 0, params[5]];
-				failed.extend_from_slice(&params[6..12]);
-				failed.extend_from_slice(&[0; 7]);
-				self.meta(0x01, &failed);
+				self.status(opcode, 0);
+				self.initiate(params[0] == 0x01, params[1], params[2], &params[3..9]);
 			}
 			0x200e => {
 				self.complete(opcode, &[0]);
@@ -445,16 +465,41 @@ impl Fixture {
 	}
 
 	fn advertise(&mut self) {
-		// Connectable, random, the mouse's address; a name and the human-interface service.
-		let mut report = alloc::vec![1, 0x00, bt_peer::PEER_KIND];
-		let mut wire = bt_peer::PEER_ADDRESS;
+		self.meta(0x02, &mouse_advert().legacy_report());
+	}
+
+	// A CONNECTION THE HOST INITIATES - legacy or extended, the same on the air: through the accept list, whichever
+	// device on it is there or the first that comes back; or to the device it names by the address it advertises.
+	fn initiate(&mut self, accept_list: bool, own: u8, peer_type: u8, peer: &[u8]) {
+		if accept_list {
+			self.accepting = Some(own);
+			self.try_accept();
+			return;
+		}
+		// The host asked for a device by the address it advertises, or for nothing this controller can reach.
+		let mut wire = [0u8; 6];
+		wire.copy_from_slice(peer);
 		wire.reverse();
-		report.extend_from_slice(&wire);
-		let data: &[u8] = &[0x0e, 0x09, b'f', b'i', b'x', b't', b'u', b'r', b'e', b' ', b'm', b'o', b'u', b's', b'e', 0x03, 0x03, 0x12, 0x18];
-		report.push(data.len() as u8);
-		report.extend_from_slice(data);
-		report.push(0xc4);
-		self.meta(0x02, &report);
+		let host = self.host_address(own);
+		if wire == bt_peer::PEER_ADDRESS && !self.connected {
+			self.connect_mouse(host);
+			return;
+		}
+		if let Some(at) = self.le.named(&wire) {
+			let outs = self.le.connect(at, host, false);
+			self.le_out(outs);
+			return;
+		}
+		let mut failed = alloc::vec![0x02, 0, 0, 0, peer_type];
+		failed.extend_from_slice(peer);
+		failed.extend_from_slice(&[0; 7]);
+		self.meta(0x01, &failed);
+	}
+
+	// ONE ISO DATA PACKET FROM THE HOST: an SDU for an earbud's sink, its buffer straight back.
+	fn iso(&mut self, bytes: &[u8]) {
+		let outs = self.le.iso(bytes);
+		self.le_out(outs);
 	}
 
 	// ENCRYPTION WITH THE KEY THE HOST PRESENTED, and the one line a gate reads to tell a pairing from a
@@ -544,6 +589,9 @@ impl Fixture {
 		// THE KEYBOARD'S SCRIPT, at its time, whatever the mouse is doing.
 		let typed = self.world.tick(clock());
 		self.world_out(typed);
+		// THE LE AUDIO STREAMS toward the host, the periodic train's reports, an extended scan's end.
+		let audio = self.le.tick(clock());
+		self.le_out(audio);
 		if !self.connected || !self.encrypted {
 			return;
 		}
@@ -554,13 +602,20 @@ impl Fixture {
 	}
 }
 
+// THE MOUSE AS A SCAN HEARS IT: connectable, random, its address; a name and the human-interface service.
+fn mouse_advert() -> Advert {
+	let data: &[u8] = &[0x0e, 0x09, b'f', b'i', b'x', b't', b'u', b'r', b'e', b' ', b'm', b'o', b'u', b's', b'e', 0x03, 0x03, 0x12, 0x18];
+	Advert::legacy(bt_peer::PEER_KIND, bt_peer::PEER_ADDRESS, -60, data)
+}
+
 impl hci_transport::Service for Fixture {
 	fn attach(&mut self, version: u32) -> Result<HciAttachment, Error> {
 		if version != VERSION {
 			return Err(Error::Unsupported);
 		}
-		// THE LARGER OF THE TWO RADIOS' BUFFERS bounds a packet on the transport: BR/EDR's.
-		Ok(HciAttachment { version, iso: false, max_command: 258, max_event: 257, max_acl: bt_world::ACL_BYTES as u32 + 4, max_iso: 0, command_credits: 1, acl_credits: ACL_BUFFERS as u32, acl_queue: 16, epoch: self.epoch, sco: true, max_sco: 64 })
+		// THE LARGER OF THE TWO RADIOS' BUFFERS bounds a packet on the transport: BR/EDR's. An ISO packet holds its header,
+		// a time stamp, the SDU header and the largest SDU this controller takes.
+		Ok(HciAttachment { version, iso: true, max_command: 258, max_event: 257, max_acl: bt_world::ACL_BYTES as u32 + 4, max_iso: 4 + 4 + 4 + bt_le_audio::ISO_BYTES as u32, command_credits: 1, acl_credits: ACL_BUFFERS as u32, acl_queue: 16, epoch: self.epoch, sco: true, max_sco: 64 })
 	}
 
 	fn send(&mut self, kind: HciPacketKind, bytes: Vec<u8>) -> Result<u32, Error> {
@@ -569,7 +624,7 @@ impl hci_transport::Service for Fixture {
 			HciPacketKind::Acl => self.acl(&bytes),
 			HciPacketKind::Event => return Err(Error::Invalid),
 			HciPacketKind::Sco => self.world.sco_in(&bytes),
-			HciPacketKind::Iso => return Err(Error::Unsupported),
+			HciPacketKind::Iso => self.iso(&bytes),
 		}
 		Ok(bytes.len() as u32)
 	}
@@ -635,18 +690,35 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			}
 			return Ok(0);
 		}
-		// THE LE WORLD'S DEVICES: a passkey typed, a link dropped, a key forgotten, the host's name read.
+		// THE LE WORLD'S DEVICES: a passkey typed, a link dropped, a key forgotten, the host's name read - and an earbud's
+		// own volume and its call buttons.
 		if bt_le_world::LeWorld::is_device(peer) {
+			let earbud = bt_le_world::LeWorld::is_earbud(peer);
 			let outs = match action {
 				FixtureAction::TypePasskey => fixture.le.type_passkey(peer, argument),
 				FixtureAction::Disconnect => fixture.le.act_disconnect(peer),
 				FixtureAction::Forget => fixture.le.forget(peer).then(Vec::new),
-				FixtureAction::ReadHostName => fixture.le.read_host_name(peer),
+				FixtureAction::ReadHostName if !earbud => fixture.le.read_host_name(peer),
+				FixtureAction::LeVolume if earbud => fixture.le.earbud_volume(peer, u8::try_from(argument).map_err(|_| Error::Invalid)?),
+				FixtureAction::LeCall if earbud => {
+					let Some((called, outs)) = fixture.le.earbud_call(peer, u8::try_from(argument).map_err(|_| Error::Invalid)?) else { return Err(Error::Unsupported) };
+					fixture.le_out(outs);
+					return Ok(if called { 0 } else { 0x02 });
+				}
 				_ => return Err(Error::Unsupported),
 			};
 			let Some(outs) = outs else { return Ok(0x02) };
 			fixture.le_out(outs);
 			fixture.try_accept();
+			return Ok(0);
+		}
+		// THE BROADCAST SOURCE starts in the clear or encrypted, or stops.
+		if peer == bt_le_audio::BROADCAST_SOURCE {
+			if action != FixtureAction::Broadcast {
+				return Err(Error::Unsupported);
+			}
+			let outs = u8::try_from(argument).ok().and_then(|mode| fixture.le.broadcast(mode)).ok_or(Error::Invalid)?;
+			fixture.le_out(outs);
 			return Ok(0);
 		}
 		// A DUAL-MODE DEVICE'S LE HALF advertises or stops; and a reset forgets on both radios.
@@ -655,6 +727,10 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			fixture.le_out(outs);
 			if argument != 0 && fixture.scanning {
 				let reports = fixture.le.advertise();
+				fixture.le_out(reports);
+			}
+			if argument != 0 && fixture.le.scanning_extended() {
+				let reports = fixture.le.extended_reports();
 				fixture.le_out(reports);
 			}
 			fixture.try_accept();
@@ -686,7 +762,7 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			FixtureAction::HangUp => 20,
 			FixtureAction::AudioRequest => 21,
 			FixtureAction::PushObject => 22,
-			FixtureAction::ReadHostName | FixtureAction::LeAdvertise => return Err(Error::Unsupported),
+			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall => return Err(Error::Unsupported),
 		};
 		match fixture.world.act(peer, code, argument) {
 			Ok((result, outs)) => {
@@ -775,7 +851,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 	timer_set(timer, clock().saturating_add(REPORT_TICKS));
-	common::online_named(bootstrap, &bind, b"driver.bt-fixture: online (an emulated dual-mode controller, an LE boot mouse and five BR/EDR devices)", &[(driver_protocol::provider::BLUETOOTH_HCI, first_far, PUBLICATION_NAME), (driver_protocol::provider::FIXTURE_CONTROL, control_far, CONTROL_NAME)]);
+	common::online_named(bootstrap, &bind, b"driver.bt-fixture: online (an emulated dual-mode LE Audio controller, an LE boot mouse, five BR/EDR devices, LE peripherals, two earbuds and a broadcast source)", &[(driver_protocol::provider::BLUETOOTH_HCI, first_far, PUBLICATION_NAME), (driver_protocol::provider::FIXTURE_CONTROL, control_far, CONTROL_NAME)]);
 	let mut serving = common::Serving::from_offers(&[(HCI_TOKEN, first), (CONTROL_TOKEN, control)]);
 	let mut seed = [0u8; 8];
 	let _ = random_get(&mut seed);
@@ -823,8 +899,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			Some(common::ProviderReady::Device(_)) => {
 				fixture.tick();
-				// A STREAM ON THE PHONE'S CLOCK, and a voice link's microphone, are fed every tick; otherwise the reports' pace is enough.
-				let next = if fixture.world.streaming() || fixture.world.voice_active() { 1 } else { REPORT_TICKS };
+				// A STREAM ON THE PHONE'S CLOCK, a voice link's microphone, and every LE Audio stream and train are fed every
+				// tick; otherwise the reports' pace is enough.
+				let next = if fixture.world.streaming() || fixture.world.voice_active() || fixture.le.audio_active() { 1 } else { REPORT_TICKS };
 				timer_set(timer, clock().saturating_add(next));
 			}
 		}

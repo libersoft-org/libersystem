@@ -415,6 +415,7 @@ impl Stack {
 			let outs = voice.gateway.set_call(call);
 			self.run_gateway(at, handle, outs);
 		}
+		self.le_call(state);
 	}
 
 	// A LEVEL FOR THE HEADSET'S SPEAKER, as its gain.

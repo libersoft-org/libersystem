@@ -170,9 +170,13 @@ impl bluetooth_audio::Service for AudioView<'_> {
 		}
 		let (server, client) = channel().ok_or(Error::Exhausted)?;
 		audio.pcm.push(Pcm { chan: server, endpoint: id, at, handle, kind: endpoint.kind, rate: endpoint.rate, channels: endpoint.channels, latency_us: endpoint.latency_us, hardware_volume: endpoint.hardware_volume, volume: endpoint.volume, pacer: None, ack_at: None, ack_held: false, capture_waiting: false });
-		// A VOICE ENDPOINT OPENED IS A SESSION: the headset's synchronous link comes up with it.
-		if endpoint.kind == AudioEndpointKind::Voice {
-			self.stack.voice_up(at, handle);
+		match self.stack.source_of(id) {
+			// AN LE DEVICE'S CHANNEL OPENED starts its group, for music or a call.
+			Source::LeAudio => self.stack.le_audio_open(id),
+			Source::Broadcast => {}
+			// A VOICE ENDPOINT OPENED IS A SESSION: the headset's synchronous link comes up with it.
+			Source::Classic if endpoint.kind == AudioEndpointKind::Voice => self.stack.voice_up(at, handle),
+			Source::Classic => {}
 		}
 		Ok(client)
 	}
@@ -188,7 +192,9 @@ impl bluetooth_audio::Service for AudioView<'_> {
 		}
 		let kind = endpoint.kind;
 		let (at, handle) = self.stack.audio.owner(id).ok_or(Error::NotFound)?;
-		if kind == AudioEndpointKind::Voice {
+		if self.stack.source_of(id) == Source::LeAudio {
+			self.stack.le_audio_volume(id, volume)?;
+		} else if kind == AudioEndpointKind::Voice {
 			self.stack.voice_set_volume(at, handle, volume)?;
 		} else {
 			self.stack.a2dp_set_volume(at, handle, volume)?;
@@ -239,7 +245,35 @@ pub(crate) fn serve_endpoints(stack: &mut Stack, channel: u64, request: &[u8], h
 
 // ------------------------------------------------------------------ the PCM channels
 
+// WHICH PROFILE AN ENDPOINT IS: a BR/EDR link's - A2DP or HFP, by its kind - an LE Audio device's, or the broadcast's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Source {
+	Classic,
+	LeAudio,
+	Broadcast,
+}
+
 impl Stack {
+	pub(crate) fn source_of(&self, id: u32) -> Source {
+		if self.le_device_of(id).is_some() {
+			Source::LeAudio
+		} else if self.broadcast_owns(id) {
+			Source::Broadcast
+		} else {
+			Source::Classic
+		}
+	}
+
+	// A PERIOD OF CAPTURED AUDIO, from whichever profile the endpoint is.
+	fn take_period(&mut self, id: u32, at: usize, handle: u16, kind: AudioEndpointKind, samples: usize) -> Option<Vec<u8>> {
+		match self.source_of(id) {
+			Source::LeAudio => self.le_audio_take_period(id, samples),
+			Source::Broadcast => self.broadcast_take_period(samples),
+			Source::Classic if kind == AudioEndpointKind::Voice => self.voice_take_period(at, handle, samples),
+			Source::Classic => self.a2dp_take_period(at, handle, samples),
+		}
+	}
+
 	// ONE REQUEST ON AN OPENED ENDPOINT'S CHANNEL: its format, a period to play - acknowledged on the timer - the end of
 	// playback, or a period of a phone's audio to capture.
 	pub(crate) fn serve_pcm(&mut self, index: usize, buf: &mut [u8]) {
@@ -250,9 +284,11 @@ impl Stack {
 			PolledCaps::Closed => {
 				let pcm = self.audio.pcm.remove(index);
 				close(pcm.chan);
-				match pcm.kind {
-					AudioEndpointKind::Output => self.a2dp_stop(pcm.at, pcm.handle),
-					AudioEndpointKind::Voice => self.voice_down(pcm.at, pcm.handle),
+				match (self.source_of(pcm.endpoint), pcm.kind) {
+					(Source::LeAudio, _) => self.le_audio_close(pcm.endpoint),
+					(Source::Broadcast, _) => {}
+					(Source::Classic, AudioEndpointKind::Output) => self.a2dp_stop(pcm.at, pcm.handle),
+					(Source::Classic, AudioEndpointKind::Voice) => self.voice_down(pcm.at, pcm.handle),
 					_ => {}
 				}
 				return;
@@ -262,13 +298,15 @@ impl Stack {
 			close(handle);
 		}
 		let pcm = &self.audio.pcm[index];
-		let (at, handle, kind) = (pcm.at, pcm.handle, pcm.kind);
+		let (at, handle, kind, id) = (pcm.at, pcm.handle, pcm.kind, pcm.endpoint);
 		let period = period_bytes(pcm.rate, pcm.channels);
+		// AN LE DEVICE'S PERIODS ARE PACED BY THE TIMER, a call's as music's: its CISes take a frame each interval.
+		let source = self.source_of(id);
 		let reply: Option<Vec<u8>> = match (len, buf.first().copied()) {
 			// THE END OF PLAYBACK: the stream is suspended and the clock starts again with the next period.
 			(0, _) => {
 				self.audio.pcm[index].pacer = None;
-				if kind == AudioEndpointKind::Output {
+				if kind == AudioEndpointKind::Output && source == Source::Classic {
 					self.a2dp_stop(at, handle);
 				}
 				Some(driver_protocol::audio::OK.to_vec())
@@ -285,8 +323,7 @@ impl Stack {
 				Some(answer.encode().to_vec())
 			}
 			(1, Some(CMD_CAPTURE)) if kind != AudioEndpointKind::Output => {
-				let samples = period / 2;
-				let taken = if kind == AudioEndpointKind::Voice { self.voice_take_period(at, handle, samples) } else { self.a2dp_take_period(at, handle, samples) };
+				let taken = self.take_period(id, at, handle, kind, period / 2);
 				match taken {
 					Some(bytes) => Some(bytes),
 					None => {
@@ -297,7 +334,7 @@ impl Stack {
 			}
 			(1, Some(CMD_CAPTURE_STOP)) => Some(driver_protocol::audio::OK.to_vec()),
 			// A VOICE PERIOD, queued for the link's packets: acknowledged at once while the queue has room.
-			(len, _) if len == period && kind == AudioEndpointKind::Voice => {
+			(len, _) if len == period && kind == AudioEndpointKind::Voice && source == Source::Classic => {
 				let samples: Vec<i16> = buf[..len].chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
 				if self.voice_play(at, handle, &samples) {
 					Some(driver_protocol::audio::OK.to_vec())
@@ -307,9 +344,13 @@ impl Stack {
 				}
 			}
 			// A PERIOD TO PLAY, encoded and sent now; its acknowledgment waits for the timer, a little ahead of it.
-			(len, _) if len == period && kind == AudioEndpointKind::Output => {
+			(len, _) if len == period && (kind == AudioEndpointKind::Output || kind == AudioEndpointKind::Voice && source == Source::LeAudio) => {
 				let samples: Vec<i16> = buf[..len].chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
-				self.a2dp_play(at, handle, &samples);
+				if source == Source::LeAudio {
+					self.le_audio_play(id, &samples);
+				} else {
+					self.a2dp_play(at, handle, &samples);
+				}
 				let pcm = &mut self.audio.pcm[index];
 				let frames = (period / (2 * usize::from(pcm.channels))) as u64;
 				let rate = pcm.rate;
@@ -352,7 +393,7 @@ impl Stack {
 		let Some(index) = self.audio.pcm.iter().position(|pcm| pcm.endpoint == id && pcm.capture_waiting) else { return };
 		let pcm = &self.audio.pcm[index];
 		let (at, handle, samples, chan, kind) = (pcm.at, pcm.handle, period_bytes(pcm.rate, pcm.channels) / 2, pcm.chan, pcm.kind);
-		let taken = if kind == AudioEndpointKind::Voice { self.voice_take_period(at, handle, samples) } else { self.a2dp_take_period(at, handle, samples) };
+		let taken = self.take_period(id, at, handle, kind, samples);
 		if let Some(bytes) = taken {
 			self.audio.pcm[index].capture_waiting = false;
 			send_blocking(chan, &bytes, 0);

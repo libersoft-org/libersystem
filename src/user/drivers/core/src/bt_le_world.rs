@@ -1,5 +1,5 @@
-// THE EMULATED LE WORLD BEYOND THE MOUSE: three LE peripherals on the far side of the fixture's radio, each
-// pairing in a model the mouse does not.
+// THE EMULATED LE WORLD BEYOND THE MOUSE: the LE peripherals on the far side of the fixture's radio, each pairing in a
+// model the mouse does not - and the LE Audio world beside them (`bt_le_audio`).
 //
 // A TEST FIXTURE, DEVELOPMENT-ONLY, AND ITS PROTOCOLS ARE ITS OWN: the Security Manager's responder half, the key
 // distribution, the private address and the attribute server and client here use `bt_peer`'s own AES, CMAC and
@@ -18,11 +18,16 @@
 //                                                       address only while it advertises (`le-advertise` on device 2);
 //                                                       asks for the BR/EDR key to be derived from its LE pairing,
 //                                                       and holds the LE key its BR/EDR half derived
+//   12 earbud L    NoInputNoOutput, Secure Connections    Just Works with no prompt on either side; connectable extended
+//   13 earbud R                                           advertising from its identity, which it gives with its resolving
+//                                                       key; its LE Audio servers and its call bearer client are
+//                                                       `bt_le_audio`'s, and so is the broadcast source, device 14
 //
 // THE KEY AGREEMENT IS THE FIXTURE'S BY CONSTRUCTION, as the mouse's is: each device has a fixed public key, and the
 // emulated controller answers a DHKey request against it with that device's fixed shared secret. What the exchange
 // then proves is everything above the key agreement.
 
+use crate::bt_le_audio::{self, Advert, Audio, AudioOut, Ctx, EarLink};
 use crate::bt_peer::{ah, c1, f4, f5, f6, fingerprint, g2, s1};
 use alloc::format;
 use alloc::string::String;
@@ -42,13 +47,18 @@ pub struct LeSpec {
 	// A DUAL-MODE DEVICE'S LE HALF: its BR/EDR half's number on the control endpoint. Its identity is that half's public
 	// address, it advertises only when told to, and it derives keys across transports.
 	pub dual: Option<u8>,
+	// AN LE AUDIO EARBUD: which of the set's two it is. It gives its identity and resolving key though it advertises from
+	// its identity, and its attribute server is `bt_le_audio`'s.
+	pub earbud: Option<usize>,
 }
 
-pub const LE_DEVICES: [LeSpec; 4] = [
-	LeSpec { name: "fixture tag", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x08], capability: 0x01, secure_connections: true, private: true, legacy_key: false, services: true, dual: None },
-	LeSpec { name: "fixture remote", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x09], capability: 0x02, secure_connections: false, private: false, legacy_key: true, services: false, dual: None },
-	LeSpec { name: "fixture display", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x0a], capability: 0x00, secure_connections: true, private: false, legacy_key: false, services: false, dual: None },
-	LeSpec { name: "fixture phone", identity: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x02], capability: 0x01, secure_connections: true, private: false, legacy_key: false, services: false, dual: Some(2) },
+pub const LE_DEVICES: [LeSpec; 6] = [
+	LeSpec { name: "fixture tag", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x08], capability: 0x01, secure_connections: true, private: true, legacy_key: false, services: true, dual: None, earbud: None },
+	LeSpec { name: "fixture remote", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x09], capability: 0x02, secure_connections: false, private: false, legacy_key: true, services: false, dual: None, earbud: None },
+	LeSpec { name: "fixture display", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x0a], capability: 0x00, secure_connections: true, private: false, legacy_key: false, services: false, dual: None, earbud: None },
+	LeSpec { name: "fixture phone", identity: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x02], capability: 0x01, secure_connections: true, private: false, legacy_key: false, services: false, dual: Some(2), earbud: None },
+	LeSpec { name: "fixture earbud L", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x0c], capability: 0x03, secure_connections: true, private: false, legacy_key: false, services: false, dual: None, earbud: Some(0) },
+	LeSpec { name: "fixture earbud R", identity: [0xd0, 0x1b, 0xdc, 0x20, 0x00, 0x0d], capability: 0x03, secure_connections: true, private: false, legacy_key: false, services: false, dual: None, earbud: Some(1) },
 ];
 
 // The first LE world device's number on the control endpoint, and the first link handle.
@@ -60,6 +70,8 @@ const ATT_CID: u16 = 0x0004;
 pub enum LeOut {
 	Event(Vec<u8>),
 	Acl(Vec<u8>),
+	// AN ISO DATA PACKET TO THE HOST - an earbud's microphone, a broadcast's stream.
+	Iso(Vec<u8>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,6 +138,8 @@ pub struct LeWorld {
 	// A BR/EDR LINK KEY a dual-mode device derived from its LE pairing, for its BR/EDR half: its address, the key as HCI
 	// carries it, and whether it is authenticated.
 	derived: Option<([u8; 6], [u8; 16], bool)>,
+	// THE LE AUDIO HALF of the controller, the earbuds' servers and the broadcast source.
+	pub audio: Audio,
 }
 
 fn reversed<const N: usize>(bytes: &[u8]) -> [u8; N] {
@@ -158,7 +172,7 @@ pub fn dhkey(device: usize) -> [u8; 32] {
 
 impl LeWorld {
 	pub fn new(seed: u64) -> LeWorld {
-		let mut world = LeWorld { devices: Vec::new(), random: seed | 1, log: Vec::new(), derived: None };
+		let mut world = LeWorld { devices: Vec::new(), random: seed | 1, log: Vec::new(), derived: None, audio: Audio::new(seed.rotate_left(29) ^ 0x6a09_e667_f3bc_c908) };
 		for (at, spec) in LE_DEVICES.iter().enumerate() {
 			let mut irk = [0u8; 16];
 			for chunk in irk.chunks_mut(8) {
@@ -214,6 +228,10 @@ impl LeWorld {
 		for device in self.devices.iter_mut() {
 			device.link = None;
 		}
+		self.audio.reset();
+		for line in self.audio.take_log() {
+			self.say(line);
+		}
 	}
 
 	// The address type a device is heard and connected from: public for a dual-mode device's LE half, random otherwise.
@@ -226,24 +244,33 @@ impl LeWorld {
 		self.devices[at].link.is_none() && self.devices[at].advertising
 	}
 
-	// THE ADVERTISING REPORTS a scan hears: every device not connected, its name, and the custom service on the tag.
-	pub fn advertise(&self) -> Vec<LeOut> {
-		let mut out = Vec::new();
-		for at in 0..self.devices.len() {
-			if !self.present(at) {
-				continue;
-			}
-			let mut report = alloc::vec![1, 0x00, self.address_type(at)];
-			report.extend_from_slice(&reversed::<6>(&self.advertised(at)));
-			let name = self.devices[at].spec.name.as_bytes();
-			let mut data = alloc::vec![name.len() as u8 + 1, 0x09];
-			data.extend_from_slice(name);
-			report.push(data.len() as u8);
-			report.extend_from_slice(&data);
-			report.push(0xc0);
-			out.push(meta(0x02, &report));
+	// WHAT ONE DEVICE ADVERTISES: its name in a connectable legacy PDU - or, for an earbud, connectable extended advertising
+	// with its services, its announcement and its set identifier.
+	fn advert(&self, at: usize) -> Advert {
+		if let Some(ear) = self.devices[at].spec.earbud {
+			return Advert { event_type: 0x0001, address_type: 0x01, address: self.devices[at].spec.identity, secondary_phy: 1, sid: 0, rssi: -58 - ear as i8, periodic_interval: 0, data: self.audio.advertising_data(ear) };
 		}
+		let name = self.devices[at].spec.name.as_bytes();
+		let mut data = alloc::vec![name.len() as u8 + 1, 0x09];
+		data.extend_from_slice(name);
+		Advert::legacy(self.address_type(at), self.advertised(at), -64, &data)
+	}
+
+	// EVERY ADVERTISER THERE IS TO HEAR: each device not connected, and the broadcast source while it broadcasts.
+	pub fn adverts(&self) -> Vec<Advert> {
+		let mut out: Vec<Advert> = (0..self.devices.len()).filter(|&at| self.present(at)).map(|at| self.advert(at)).collect();
+		out.extend(self.audio.broadcast_advert());
 		out
+	}
+
+	// THE ADVERTISING REPORTS a legacy scan hears: the legacy advertisers only, each with its name.
+	pub fn advertise(&self) -> Vec<LeOut> {
+		self.adverts().iter().filter(|advert| advert.is_legacy()).map(|advert| meta(0x02, &advert.legacy_report())).collect()
+	}
+
+	// THE EXTENDED ADVERTISING REPORTS an extended scan hears: every advertiser.
+	pub fn extended_reports(&self) -> Vec<LeOut> {
+		self.adverts().iter().map(|advert| meta(0x0d, &advert.extended_report())).collect()
 	}
 
 	// Which device a host's create connection names, by the address it advertises.
@@ -271,6 +298,9 @@ impl LeWorld {
 		};
 		let host_kind = if host[0] == 1 { "random" } else { "public" };
 		self.say(format!("connected {} - the host from its {host_kind} address", self.short(at)));
+		if let Some(ear) = self.devices[at].spec.earbud {
+			self.audio.connected(ear);
+		}
 		// A HOST IT KNOWS BY ITS RESOLVING KEY is recognised behind its private address.
 		if host[0] == 1
 			&& let Some(irk) = self.devices[at].host_irk
@@ -287,13 +317,25 @@ impl LeWorld {
 		alloc::vec![meta(0x01, &body)]
 	}
 
+	// A LINK DROPPED, by the host or by the device. An earbud's streams go with it, each with its own completion before
+	// the link's, and it advertises again - heard at once by an extended scan that is on.
 	pub fn disconnect(&mut self, handle: u16, by_host: bool) -> Option<Vec<LeOut>> {
 		let at = self.by_handle(handle)?;
+		let reason = if by_host { 0x16 } else { 0x13 };
+		let mut out = Vec::new();
+		if let Some(ear) = self.devices[at].spec.earbud {
+			let lost = self.audio.acl_lost(ear, handle, reason);
+			out.extend(self.from_audio(lost));
+		}
 		self.devices[at].link = None;
 		let who = if by_host { "disconnected by the host" } else { "disconnected" };
 		self.say(format!("{who} {}", self.short(at)));
 		let h = handle.to_le_bytes();
-		Some(alloc::vec![event(0x05, &[0, h[0], h[1], if by_host { 0x16 } else { 0x13 }])])
+		out.push(event(0x05, &[0, h[0], h[1], reason]));
+		if self.devices[at].spec.earbud.is_some() && self.audio.scanning_extended() {
+			out.push(meta(0x0d, &self.advert(at).extended_report()));
+		}
+		Some(out)
 	}
 
 	pub fn dhkey_for(&self, key: &[u8]) -> Option<[u8; 32]> {
@@ -324,12 +366,18 @@ impl LeWorld {
 		if distributing {
 			link.smp = Smp::Distributing;
 		}
+		// A LINK ENCRYPTED WITH THE KEY OF A BOND IT HOLDS, rather than one a pairing is distributing keys after.
+		let bonded = accepted && matches!(link.smp, Smp::Idle | Smp::Bonded);
 		let h = handle.to_le_bytes();
 		let mut out = alloc::vec![event(0x08, &[if accepted { 0 } else { 0x06 }, h[0], h[1], u8::from(accepted)])];
 		let line = if accepted { format!("encrypted {name} with key {:08x}", fingerprint) } else { format!("encryption REFUSED for {name}") };
 		self.say(line);
 		if distributing {
 			out.extend(self.distribute(at));
+			out.extend(self.bonded(at, false));
+		} else if bonded && let Some(ear) = self.devices[at].spec.earbud {
+			let secured = self.audio.secured(ear);
+			out.extend(self.from_audio(secured));
 		}
 		Some(out)
 	}
@@ -356,6 +404,16 @@ impl LeWorld {
 		}
 		let cid = u16::from_le_bytes([data[2], data[3]]);
 		let payload = &data[4..];
+		// AN EARBUD'S ATTRIBUTE PROTOCOL is its LE Audio servers' and its call bearer client's.
+		if cid == ATT_CID
+			&& let Some(ear) = self.devices[at].spec.earbud
+		{
+			let link = self.ear_link(at)?;
+			let answers = self.audio.att(ear, payload, &link);
+			out.extend(self.from_audio(answers));
+			return Some(out);
+		}
+		let was_bonded = self.devices[at].link.as_ref().is_some_and(|link| link.smp == Smp::Bonded);
 		let answers = match cid {
 			SMP_CID => self.smp(at, payload),
 			ATT_CID => self.att(at, payload),
@@ -364,6 +422,7 @@ impl LeWorld {
 		for answer in answers {
 			out.extend(self.send(at, cid, &answer));
 		}
+		out.extend(self.bonded(at, was_bonded));
 		Some(out)
 	}
 
@@ -400,14 +459,16 @@ impl LeWorld {
 		match (state, code) {
 			(_, 0x01) if pdu.len() == 7 => {
 				let host_sc = pdu[3] & 0x08 != 0;
-				let mut response = [0x02, spec.capability, 0x00, 0x01 | 0x04, 16, 0, 0];
+				// A DEVICE WITH NO INPUT AND NO OUTPUT asks for no protection it cannot give: Just Works, on both sides.
+				let mitm = if spec.capability == 0x03 { 0 } else { 0x04 };
+				let mut response = [0x02, spec.capability, 0x00, 0x01 | mitm, 16, 0, 0];
 				if spec.secure_connections {
 					response[3] |= 0x08;
 				}
 				// THE KEYS IT GIVES: its identity where it is private, its legacy key where it has one; it takes the host's
 				// identity.
 				response[5] = pdu[5] & 0x02;
-				response[6] = pdu[6] & (if spec.private { 0x02 } else { 0 } | if spec.legacy_key { 0x01 } else { 0 });
+				response[6] = pdu[6] & (if spec.private || spec.earbud.is_some() { 0x02 } else { 0 } | if spec.legacy_key { 0x01 } else { 0 });
 				// A DUAL-MODE DEVICE asks for the BR/EDR key to be derived too, with CT2 where the host has it.
 				if spec.dual.is_some() && spec.secure_connections {
 					response[3] |= pdu[3] & 0x20;
@@ -426,6 +487,9 @@ impl LeWorld {
 				link.mconfirm = None;
 				link.pairing_key = None;
 				self.say(format!("pairing {name} from the host's request"));
+				if let Some(ear) = spec.earbud {
+					self.audio.pairing(ear);
+				}
 				out.push(response.to_vec());
 				let link = self.devices[at].link.as_mut().expect("a link");
 				if spec.secure_connections {
@@ -652,7 +716,7 @@ impl LeWorld {
 			pdus.push(master);
 			self.say(format!("{name} gave its long-term key {:08x} with EDIV {ediv:#06x}", fingerprint(&ltk)));
 		}
-		if resp & 0x02 != 0 && spec.private {
+		if resp & 0x02 != 0 && (spec.private || spec.earbud.is_some()) {
 			let irk = self.devices[at].irk;
 			let mut info = alloc::vec![0x08];
 			info.extend_from_slice(&reversed::<16>(&irk));
@@ -858,6 +922,9 @@ impl LeWorld {
 		device.ltk = None;
 		device.host_irk = None;
 		device.reset = true;
+		if let Some(ear) = device.spec.earbud {
+			self.audio.forget(ear);
+		}
 		self.say(format!("{name} was reset and forgot its key"));
 		true
 	}
@@ -870,5 +937,127 @@ impl LeWorld {
 
 	pub fn is_device(device: u8) -> bool {
 		(FIRST_LE_DEVICE..FIRST_LE_DEVICE + LE_DEVICES.len() as u8).contains(&device)
+	}
+
+	// ------------------------------------------------------------------ the LE Audio world
+
+	pub fn is_earbud(device: u8) -> bool {
+		device == bt_le_audio::EARBUD_L || device == bt_le_audio::EARBUD_R
+	}
+
+	// An earbud's link as its servers see it: the handle, whether it is encrypted, the key of its bond.
+	fn ear_link(&self, at: usize) -> Option<EarLink> {
+		let device = &self.devices[at];
+		let link = device.link.as_ref()?;
+		Some(EarLink { handle: link.handle, encrypted: link.encrypted, ltk: device.ltk })
+	}
+
+	// WHAT THE LE AUDIO HALF IS TOLD of the links: each earbud's, and every LE handle there is.
+	fn ctx(&self) -> Ctx {
+		let mut ctx = Ctx::default();
+		for (at, device) in self.devices.iter().enumerate() {
+			if let Some(link) = device.link.as_ref() {
+				ctx.acls.push(link.handle);
+				if let Some(ear) = device.spec.earbud {
+					ctx.links[ear] = self.ear_link(at);
+				}
+			}
+		}
+		ctx
+	}
+
+	// WHAT THE LE AUDIO HALF SENDS, as this world sends it - an earbud's ATT on its link - and what it said.
+	fn from_audio(&mut self, outs: Vec<AudioOut>) -> Vec<LeOut> {
+		let mut out = Vec::new();
+		for item in outs {
+			match item {
+				AudioOut::Event(bytes) => out.push(LeOut::Event(bytes)),
+				AudioOut::Iso(bytes) => out.push(LeOut::Iso(bytes)),
+				AudioOut::Att(ear, pdu) => {
+					if let Some(at) = self.devices.iter().position(|device| device.spec.earbud == Some(ear)) {
+						out.extend(self.send(at, ATT_CID, &pdu));
+					}
+				}
+			}
+		}
+		for line in self.audio.take_log() {
+			self.say(line);
+		}
+		out
+	}
+
+	// AN EARBUD'S PAIRING HAS ENDED IN A BOND - its keys distributed both ways and kept: it says so, and looks for the
+	// host's call bearer on the link the bond now secures.
+	fn bonded(&mut self, at: usize, was_bonded: bool) -> Vec<LeOut> {
+		let Some(ear) = self.devices[at].spec.earbud else { return Vec::new() };
+		let now_bonded = self.devices[at].link.as_ref().is_some_and(|link| link.smp == Smp::Bonded && link.encrypted);
+		if was_bonded || !now_bonded || self.devices[at].ltk.is_none() {
+			return Vec::new();
+		}
+		self.say(format!("{} bonded", self.short(at)));
+		let secured = self.audio.secured(ear);
+		self.from_audio(secured)
+	}
+
+	// ONE HCI COMMAND for the LE Audio half of the controller; `None` for anything else.
+	pub fn command(&mut self, opcode: u16, params: &[u8]) -> Option<Vec<LeOut>> {
+		let ctx = self.ctx();
+		let outs = self.audio.command(opcode, params, &ctx)?;
+		Some(self.from_audio(outs))
+	}
+
+	pub fn extended_scan_parameters(&mut self, params: &[u8]) -> u8 {
+		self.audio.extended_scan_parameters(params)
+	}
+
+	pub fn extended_scan_enable(&mut self, params: &[u8], now: u64) -> (u8, bool) {
+		self.audio.extended_scan_enable(params, now)
+	}
+
+	pub fn scanning_extended(&self) -> bool {
+		self.audio.scanning_extended()
+	}
+
+	// ONE ISO DATA PACKET FROM THE HOST.
+	pub fn iso(&mut self, bytes: &[u8]) -> Vec<LeOut> {
+		let ctx = self.ctx();
+		let outs = self.audio.iso(bytes, &ctx);
+		self.from_audio(outs)
+	}
+
+	// WHAT THE LE AUDIO HALF OWES AT `now`: streams toward the host, a periodic train's reports, a scan's end.
+	pub fn tick(&mut self, now: u64) -> Vec<LeOut> {
+		let ctx = self.ctx();
+		let outs = self.audio.tick(now, &ctx);
+		self.from_audio(outs)
+	}
+
+	pub fn audio_active(&self) -> bool {
+		self.audio.active()
+	}
+
+	// AN EARBUD CHANGES ITS OWN VOLUME; `None` for a device that is not one.
+	pub fn earbud_volume(&mut self, device: u8, volume: u8) -> Option<Vec<LeOut>> {
+		let at = usize::from(device.checked_sub(FIRST_LE_DEVICE)?);
+		let ear = self.devices.get(at)?.spec.earbud?;
+		let link = self.ear_link(at);
+		let outs = self.audio.own_volume(ear, volume, link.as_ref());
+		Some(self.from_audio(outs))
+	}
+
+	// AN EARBUD WRITES THE HOST'S CALL CONTROL POINT: whether it could - it found the host's call bearer - and what it
+	// sent; `None` for a device that is not an earbud.
+	pub fn earbud_call(&mut self, device: u8, opcode: u8) -> Option<(bool, Vec<LeOut>)> {
+		let at = usize::from(device.checked_sub(FIRST_LE_DEVICE)?);
+		let ear = self.devices.get(at)?.spec.earbud?;
+		let outs = self.audio.call(ear, opcode);
+		let called = outs.is_some();
+		Some((called, self.from_audio(outs.unwrap_or_default())))
+	}
+
+	// THE BROADCAST SOURCE starts, changes or stops; `None` for a mode it does not have.
+	pub fn broadcast(&mut self, mode: u8) -> Option<Vec<LeOut>> {
+		let outs = self.audio.broadcast(mode)?;
+		Some(self.from_audio(outs))
 	}
 }

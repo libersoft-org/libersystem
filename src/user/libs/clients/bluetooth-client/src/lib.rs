@@ -14,7 +14,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use bluetooth_proto::generated::liber::bluetooth::v1::{BondedPeer, ControllerInfo, DeviceStatus, MediaCommand, PairingProgress, PeerAddress, Profile, PromptReply, ScanHandle, ScanResult};
+use bluetooth_proto::generated::liber::bluetooth::v1::{BondedPeer, BroadcastSource, ControllerInfo, DeviceStatus, MediaCommand, PairingProgress, PeerAddress, Profile, PromptReply, ScanHandle, ScanResult};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_controllers"]
@@ -65,6 +65,14 @@ unsafe extern "Rust" {
 	fn operator_receive(chan: u64, controller: &u32, peer: &PeerAddress, max_bytes: &u64) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_connect_pan"]
 	fn operator_connect_pan(chan: u64, controller: &u32, peer: &PeerAddress, replace_uplink: &bool) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_broadcast_scan"]
+	fn operator_broadcast_scan(chan: u64, controller: &u32, seconds: &u32) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_broadcasts"]
+	fn operator_broadcasts(chan: u64, controller: &u32) -> Option<Result<Vec<BroadcastSource>, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_broadcast_play"]
+	fn operator_broadcast_play(chan: u64, controller: &u32, broadcast_id: &u32, code: &[u8]) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_broadcast_stop"]
+	fn operator_broadcast_stop(chan: u64, controller: &u32) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_object_push_write"]
 	fn object_push_write(chan: u64, data: &[u8]) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_object_push_finish"]
@@ -217,6 +225,27 @@ impl BluetoothOperatorClient {
 	#[inline(always)]
 	pub fn connect_pan(&mut self, controller: u32, peer: &PeerAddress, replace_uplink: bool) -> Option<Result<(), Error>> {
 		unsafe { operator_connect_pan(self.chan, &controller, peer, &replace_uplink) }
+	}
+
+	/// LE Audio broadcasts: a scan for their announcements, what it heard, one played, and the one playing stopped.
+	#[inline(always)]
+	pub fn broadcast_scan(&mut self, controller: u32, seconds: u32) -> Option<Result<(), Error>> {
+		unsafe { operator_broadcast_scan(self.chan, &controller, &seconds) }
+	}
+
+	#[inline(always)]
+	pub fn broadcasts(&mut self, controller: u32) -> Option<Result<Vec<BroadcastSource>, Error>> {
+		unsafe { operator_broadcasts(self.chan, &controller) }
+	}
+
+	#[inline(always)]
+	pub fn broadcast_play(&mut self, controller: u32, broadcast_id: u32, code: &[u8]) -> Option<Result<(), Error>> {
+		unsafe { operator_broadcast_play(self.chan, &controller, &broadcast_id, code) }
+	}
+
+	#[inline(always)]
+	pub fn broadcast_stop(&mut self, controller: u32) -> Option<Result<(), Error>> {
+		unsafe { operator_broadcast_stop(self.chan, &controller) }
 	}
 
 	/// An object push: its `object-push` channel, written with `ObjectPushClient`.

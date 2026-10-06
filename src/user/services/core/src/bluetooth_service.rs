@@ -47,6 +47,8 @@ include!(concat!(env!("OUT_DIR"), "/roles_bluetooth_service.rs"));
 mod a2dp;
 #[path = "bluetooth_service/audio.rs"]
 mod audio;
+#[path = "bluetooth_service/broadcast.rs"]
+mod broadcast;
 #[path = "bluetooth_service/classic.rs"]
 mod classic;
 #[path = "bluetooth_service/gatt.rs"]
@@ -55,6 +57,8 @@ mod gatt;
 mod input;
 #[path = "bluetooth_service/le.rs"]
 mod le;
+#[path = "bluetooth_service/le_audio.rs"]
+mod le_audio;
 #[path = "bluetooth_service/opp.rs"]
 mod opp;
 #[path = "bluetooth_service/pan.rs"]
@@ -188,11 +192,13 @@ struct Link {
 	reconnecting: bool,
 	// BR/EDR: everything above ACL.
 	classic: Option<Box<classic::ClassicLink>>,
+	// LE Audio: the BAP client walking, or driving, the peer's stream endpoints.
+	le_audio: Option<le_audio::LeLink>,
 }
 
 impl Link {
 	fn new(handle: u16, peer: Peer) -> Link {
-		Link { handle, peer, local: [0; 7], server: None, gatt: gatt::Client::default(), reassembly: Reassembly::new(), encrypted: false, security: SecurityLevel::None, outbox: VecDeque::new(), pairing: None, walk: None, report: None, map: None, decoder: None, buttons: 0, streams: Vec::new(), reconnecting: false, classic: None }
+		Link { handle, peer, local: [0; 7], server: None, gatt: gatt::Client::default(), reassembly: Reassembly::new(), encrypted: false, security: SecurityLevel::None, outbox: VecDeque::new(), pairing: None, walk: None, report: None, map: None, decoder: None, buttons: 0, streams: Vec::new(), reconnecting: false, classic: None, le_audio: None }
 	}
 
 	fn is_classic(&self) -> bool {
@@ -232,6 +238,16 @@ struct Controller {
 	bredr_bytes: u32,
 	// The largest voice packet the transport carries, its header included: zero for one that carries none.
 	sco_bytes: u32,
+	// Whether the controller has extended advertising - which makes every LE scan and connection the extended
+	// commands' - and the CIS central role; its ISO buffers free, the ISO packets dropped for want of one, and the
+	// inbound SDUs being put together.
+	extended: bool,
+	le_audio_capable: bool,
+	iso_free: u32,
+	iso_dropped: u64,
+	iso_reassembly: service_logic::le_iso::Reassembly,
+	// Data packets for handles no table names, dropped.
+	unclassified: u64,
 	// A controller that reports no LE buffers of its own shares the BR/EDR ones with LE.
 	le_shares: bool,
 	session: Session,
@@ -274,6 +290,9 @@ struct Stack {
 	audio: audio::AudioRoot,
 	// NetworkService's PAN links.
 	network: pan::NetworkRoot,
+	// LE Audio: the unicast devices, and the broadcast sink.
+	le_devices: Vec<le_audio::LeDevice>,
+	broadcast: broadcast::Sink,
 }
 
 // ------------------------------------------------------------------ address forms
@@ -444,6 +463,31 @@ impl Controller {
 		true
 	}
 
+	// THE EXTENDED-MODE RULE: a controller with extended advertising refuses the legacy scan and connection commands once
+	// any extended one was sent - and the broadcast sink sends them - so on such a controller every scan and every
+	// connection is the extended command, carrying the same parameters.
+	fn le_scan_parameters(&mut self) -> bool {
+		let legacy = hci_codec::scan_parameters_from(self.le.own_type());
+		if self.extended {
+			return self.command(service_logic::le_iso::opcode::LE_SET_EXTENDED_SCAN_PARAMETERS, &service_logic::le_iso::extended_scan_parameters_from(&legacy));
+		}
+		self.command(opcode::LE_SET_SCAN_PARAMETERS, &legacy)
+	}
+
+	fn le_scan_enable(&mut self, on: bool) -> bool {
+		if self.extended {
+			return self.command(service_logic::le_iso::opcode::LE_SET_EXTENDED_SCAN_ENABLE, &service_logic::le_iso::extended_scan_enable(on));
+		}
+		self.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(on))
+	}
+
+	fn le_create_connection(&mut self, legacy: &[u8; 25]) -> bool {
+		if self.extended {
+			return self.command(service_logic::le_iso::opcode::LE_EXTENDED_CREATE_CONNECTION, &service_logic::le_iso::extended_create_connection(legacy));
+		}
+		self.command(opcode::LE_CREATE_CONNECTION, legacy)
+	}
+
 	// Queue `LE Enable Encryption` for a link. The parameters carry the LTK, so the copy built here is
 	// zeroed once the queue holds its own - and the queue's is zeroed when it is sent or dropped.
 	fn encrypt(&mut self, handle: u16, ltk: &[u8; 16]) {
@@ -595,6 +639,10 @@ impl Controller {
 		self.init = Init::Running;
 		self.powered = false;
 		self.public_key = None;
+		// WHAT THE CONTROLLER IS, learnt again: a controller that answers no features this time has none.
+		self.extended = false;
+		self.le_audio_capable = false;
+		self.iso_free = 0;
 		self.clear_pending();
 		self.outstanding = None;
 		self.credits.reset();
@@ -607,12 +655,20 @@ impl Controller {
 			step(service_logic::hci_bredr::opcode::READ_LOCAL_SUPPORTED_FEATURES, &[], true, false),
 			step(service_logic::hci_bredr::opcode::READ_BUFFER_SIZE, &[], true, true),
 			step(opcode::LE_READ_BUFFER_SIZE, &[], false, false),
+			// THE LE FEATURES: extended advertising decides the scan's and the connection's commands, the CIS central
+			// role whether LE Audio unicast runs.
+			step(service_logic::le_iso::opcode::LE_READ_LOCAL_SUPPORTED_FEATURES, &[], true, false),
 			// The event mask is chosen when this step is sent, by whether the controller has BR/EDR.
 			step(opcode::SET_EVENT_MASK, &[], false, false),
-			// Connection complete, advertising report, and the two key-agreement completions.
-			step(opcode::LE_SET_EVENT_MASK, &0x0000_0000_0000_01ffu64.to_le_bytes(), false, false),
+			// Connection complete, advertising report, and the two key-agreement completions; and LE Audio's own.
+			step(opcode::LE_SET_EVENT_MASK, &service_logic::le_iso::LE_EVENT_MASK.to_le_bytes(), false, false),
 		];
 		self.steps.extend(steps);
+		// A TRANSPORT THAT CARRIES ISO: the controller's ISO buffers, and isochronous channels on for this host.
+		if self.limits.carries(service_logic::hci::Kind::Iso) {
+			self.steps.push_back(step(service_logic::le_iso::opcode::LE_READ_BUFFER_SIZE_V2, &[], true, false));
+			self.steps.push_back(step(service_logic::le_iso::opcode::LE_SET_HOST_FEATURE, &service_logic::le_iso::set_host_feature(service_logic::le_iso::ISOCHRONOUS_CHANNELS_HOST_SUPPORT, true), true, false));
+		}
 		self.steps.extend(classic::init_steps());
 		self.waiting_step = Some((opcode::RESET, false));
 		self.command(opcode::RESET, &[]);
@@ -650,6 +706,8 @@ impl Controller {
 	// reset or a fault does this, and so does powering the radio off. THE SESSION'S SCAN GOES WITH IT:
 	// its handle answers `not-found`, and nothing it found can be chosen for a pairing in the next one.
 	fn end_session(&mut self) {
+		self.iso_free = 0;
+		self.iso_reassembly = service_logic::le_iso::Reassembly::default();
 		for mut link in self.links.drain(..) {
 			release_streams(&mut link);
 			link.pairing = None;
@@ -816,6 +874,13 @@ impl Stack {
 			// malformed one is said, because a controller sending events whose lengths disagree with their
 			// bytes is a controller whose every later event deserves suspicion.
 			Err(hci_codec::Refusal::Unhandled { .. }) => {
+				// LE AUDIO'S SUBEVENTS - extended reports, periodic sync, CISes, BIGs.
+				if bytes.first() == Some(&hci_codec::event::LE_META)
+					&& let Some(event) = bytes.get(2).and_then(|&subevent| service_logic::le_iso::event(subevent, &bytes[3..]))
+				{
+					self.on_le_audio_event(at, event);
+					return;
+				}
 				if let Some(event) = service_logic::hci_bredr::decode(bytes) {
 					self.on_classic_event(at, event);
 				}
@@ -869,7 +934,6 @@ impl Stack {
 				}
 			}
 			Event::CompletedPackets { handle, count, rest } => {
-				let controller = &mut self.controllers[at];
 				let mut entries = Vec::with_capacity(1 + rest.len() / 4);
 				entries.push((handle, count));
 				for entry in rest.chunks_exact(4) {
@@ -878,11 +942,18 @@ impl Stack {
 				// EACH HANDLE'S COUNT GOES BACK TO ITS OWN RADIO'S BUFFERS; a handle no longer held returns to the
 				// pool its radio would use, which is LE's unless it shares.
 				for (handle, count) in entries {
+					// AN ISOCHRONOUS STREAM'S BUFFERS are their own.
+					if self.iso_handle(at, handle) {
+						let controller = &mut self.controllers[at];
+						controller.iso_free = controller.iso_free.saturating_add(u32::from(count));
+						continue;
+					}
+					let controller = &mut self.controllers[at];
 					let classic = controller.link(handle).is_some_and(Link::is_classic);
 					let (pool, _) = controller.pool(classic);
 					pool.acl_completed(count as u32);
 				}
-				controller.flush_links();
+				self.controllers[at].flush_links();
 			}
 			Event::Advertising { count, reports } => self.on_advertising(at, count, reports),
 		}
@@ -919,6 +990,18 @@ impl Stack {
 					opcode::READ_LOCAL_SUPPORTED_COMMANDS => {
 						controller.secure_connections = params.get(1 + hci_codec::P256_OCTET).is_some_and(|octet| octet & hci_codec::P256_BITS == hci_codec::P256_BITS);
 					}
+					service_logic::le_iso::opcode::LE_READ_LOCAL_SUPPORTED_FEATURES if params.len() >= 9 => {
+						let mut bytes = [0u8; 8];
+						bytes.copy_from_slice(&params[1..9]);
+						let features = u64::from_le_bytes(bytes);
+						controller.extended = features & service_logic::le_iso::feature::EXTENDED_ADVERTISING != 0;
+						controller.le_audio_capable = features & service_logic::le_iso::feature::CIS_CENTRAL != 0;
+					}
+					service_logic::le_iso::opcode::LE_READ_BUFFER_SIZE_V2 => {
+						if let Some((_, (_, count))) = service_logic::le_iso::buffer_sizes_v2(params) {
+							controller.iso_free = u32::from(count);
+						}
+					}
 					opcode::LE_READ_BUFFER_SIZE if params.len() >= 4 => {
 						// THE CONTROLLER'S OWN BUFFER COUNT, bounded by the transport's queue: a controller that
 						// reports zero shares its BR/EDR buffers with LE.
@@ -944,10 +1027,13 @@ impl Stack {
 			}
 			return;
 		}
-		if op == opcode::LE_SET_SCAN_ENABLE && status != 0 {
+		if (op == opcode::LE_SET_SCAN_ENABLE || op == service_logic::le_iso::opcode::LE_SET_EXTENDED_SCAN_ENABLE) && status != 0 {
 			if let Some(scan) = controller.scan.as_mut() {
 				scan.running = false;
 			}
+		}
+		if op == service_logic::le_iso::opcode::LE_SET_CIG_PARAMETERS {
+			self.le_audio_cig(at, params);
 		}
 		self.classic_complete(at, op, status, params);
 	}
@@ -969,7 +1055,7 @@ impl Stack {
 					self.after_ready(at);
 				}
 			}
-			opcode::LE_CREATE_CONNECTION => {
+			opcode::LE_CREATE_CONNECTION | service_logic::le_iso::opcode::LE_EXTENDED_CREATE_CONNECTION => {
 				controller.le.accepting = false;
 				if let Some(peer) = controller.reconnect.take() {
 					controller.fail_attempt(&peer);
@@ -1103,6 +1189,7 @@ impl Stack {
 			self.start_discovery(at, handle);
 		}
 		self.battery_read(at, handle);
+		self.le_audio_start(at, handle);
 	}
 
 	fn encryption_failed(&mut self, at: usize, handle: u16) {
@@ -1115,7 +1202,7 @@ impl Stack {
 	}
 
 	fn on_disconnected(&mut self, at: usize, handle: u16) {
-		if self.voice_disconnected(at, handle) {
+		if self.voice_disconnected(at, handle) || self.le_audio_disconnected(at, handle) {
 			return;
 		}
 		let controller = &mut self.controllers[at];
@@ -1124,6 +1211,7 @@ impl Stack {
 		link.pairing = None;
 		release_streams(&mut link);
 		self.gatt_gone(&mut link);
+		self.le_audio_link_gone(at, &mut link);
 		let controller = &mut self.controllers[at];
 		controller.fail_attempt(&link.peer);
 		if link.is_classic() {
@@ -1139,6 +1227,27 @@ impl Stack {
 			print(b"BluetoothService: an advertising report that runs past its event was refused\n");
 			return;
 		};
+		self.on_advertisements(at, found);
+	}
+
+	// AN EXTENDED REPORT THAT IS NOT A BROADCAST'S, read as the ordinary scan reads a legacy one: its first 31 bytes of
+	// data are where a name and service classes are.
+	pub(crate) fn extended_advertising(&mut self, at: usize, report: &service_logic::le_iso::ExtendedReport) {
+		let len = report.data.len().min(31);
+		let mut data = [0u8; 31];
+		data[..len].copy_from_slice(&report.data[..len]);
+		let advertisement = hci_codec::Advertisement { kind: report.address_type & 1, address: hci_codec::address_from_wire(&report.wire_address), rssi: report.rssi, data, data_len: len as u8 };
+		self.on_advertisements(at, alloc::vec![advertisement]);
+	}
+
+	fn on_advertisements(&mut self, at: usize, found: Vec<hci_codec::Advertisement>) {
+		// A COORDINATED SET'S OTHER MEMBER, by its RSI - whether a scan lists it or not.
+		for advertisement in &found {
+			if advertisement.kind <= 1 {
+				let kind = if advertisement.kind == 0 { PeerKind::Public } else { PeerKind::RandomStatic };
+				self.le_audio_advertised(at, &PeerAddress { kind, bytes: advertisement.address.to_vec() }, advertisement.data());
+			}
+		}
 		let controller = &mut self.controllers[at];
 		let Some(scan) = controller.scan.as_mut().filter(|scan| scan.running) else { return };
 		for advertisement in found {
@@ -1160,7 +1269,7 @@ impl Stack {
 			}
 			if scan.results.len() >= MAX_SCAN_RESULTS {
 				scan.running = false;
-				controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(false));
+				controller.le_scan_enable(false);
 				return;
 			}
 			let (name, human_interface) = hci_codec::advertised(advertisement.data());
@@ -1214,13 +1323,15 @@ impl Stack {
 	fn on_att(&mut self, at: usize, handle: u16, pdu: &[u8]) {
 		// A REQUEST FROM THE PEER, acting as a client, is this host's GATT server's to answer.
 		if pdu.first().is_some_and(|code| matches!(*code, 0x02 | 0x04 | 0x06 | 0x08 | 0x0a | 0x0c | 0x0e | 0x10 | 0x12 | 0x16 | 0x18 | 0x20 | 0x52 | 0xd2)) {
+			let call = self.audio.call;
 			let answer = {
 				let Some(link) = self.controllers[at].link_mut(handle) else { return };
-				link.server.get_or_insert_with(|| gatt_server::Server::new(b"LiberSystem")).answer(pdu)
+				link.server.get_or_insert_with(|| le_audio::host_server(call)).answer(pdu)
 			};
 			if let Some(answer) = answer {
 				self.controllers[at].l2cap(handle, ATT_CID, &answer);
 			}
+			self.le_server_writes(at, handle);
 			return;
 		}
 		// A NOTIFICATION IS NOT AN ANSWER. It arrives whenever the peer has a report, including in the
@@ -1338,8 +1449,11 @@ impl Stack {
 			return;
 		}
 		self.gatt_notification(at, handle, pdu);
-		let Some(link) = self.controllers[at].link_mut(handle) else { return };
 		let attribute = u16::from_le_bytes([pdu[1], pdu[2]]);
+		if self.le_audio_notification(at, handle, attribute, &pdu[3..]) {
+			return;
+		}
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
 		if !link.encrypted {
 			return;
 		}
@@ -1386,7 +1500,7 @@ impl Stack {
 				&& now >= scan.deadline
 			{
 				scan.running = false;
-				controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(false));
+				controller.le_scan_enable(false);
 			}
 			if let Some(attempt) = controller.attempt.as_mut()
 				&& matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)
@@ -1447,14 +1561,14 @@ impl bluetooth::Service for ReadView<'_> {
 		if !controller.powered {
 			return Err(Error::Closed);
 		}
-		if controller.scan.as_ref().is_some_and(Scan::active) {
+		if controller.scan.as_ref().is_some_and(Scan::active) || self.stack.broadcast.scanning.is_some_and(|(held, _)| held == at as usize) {
 			return Err(Error::Again);
 		}
 		// THE CALLER'S DEADLINE IS CAPPED, NOT BELIEVED. A scan is a radio running, and a client asking
 		// for an hour of it is a client deciding how the machine behaves.
 		let ms = deadline_ms.min(MAX_SCAN_MS);
 		let ticks = (ms as u64).saturating_mul(TICKS_PER_SECOND) / 1000;
-		if !controller.command(opcode::LE_SET_SCAN_PARAMETERS, &hci_codec::scan_parameters_from(controller.le.own_type())) || !controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(true)) {
+		if !controller.le_scan_parameters() || !controller.le_scan_enable(true) {
 			return Err(Error::Exhausted);
 		}
 		// BOTH RADIOS IN ONE SCAN: inquiry runs beside the LE scan for as long, in its own units of 1.28 s.
@@ -1479,7 +1593,7 @@ impl bluetooth::Service for ReadView<'_> {
 				found.running = false;
 				found.inquiring = false;
 				if running {
-					controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(false));
+					controller.le_scan_enable(false);
 				}
 				if inquiring {
 					controller.command(service_logic::hci_bredr::opcode::INQUIRY_CANCEL, &[]);
@@ -1519,6 +1633,8 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		// forgotten session was waiting for.
 		// Ready and off, even when this arrives halfway through initialisation: the next power-on starts
 		// it again from the reset.
+		self.stack.le_audio_reset(at as usize);
+		let controller = &mut self.stack.controllers[at as usize];
 		controller.end_session();
 		controller.powered = false;
 		controller.init = Init::Ready;
@@ -1693,6 +1809,28 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		self.stack.connect_pan(at as usize, &peer, replace_uplink)
 	}
 
+	fn broadcast_scan(&mut self, at: u32, seconds: u32) -> Result<(), Error> {
+		self.stack.broadcast_scan(at as usize, seconds)
+	}
+
+	fn broadcasts(&mut self, at: u32) -> Result<Vec<proto::system::BroadcastSource>, Error> {
+		self.stack.broadcasts(at as usize)
+	}
+
+	fn broadcast_play(&mut self, at: u32, broadcast_id: u32, code: Vec<u8>) -> Result<(), Error> {
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		let result = self.stack.broadcast_play(at as usize, broadcast_id, &code);
+		let mut code = code;
+		scrub(&mut code);
+		result
+	}
+
+	fn broadcast_stop(&mut self, at: u32) -> Result<(), Error> {
+		self.stack.broadcast_stop(at as usize)
+	}
+
 	fn send(&mut self, at: u32, peer: PeerAddress, name: String, length: Option<u64>) -> Result<u64, Error> {
 		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
 		if at as usize >= self.stack.controllers.len() {
@@ -1801,9 +1939,16 @@ impl Stack {
 			}
 		}
 		self.refresh_policy(at);
-		// AN LE PEER'S RECONNECTION is what input and GATT trust admit: the accept list is made again.
-		if !peer_is_classic(peer) && matches!(profile, Profile::Input | Profile::Gatt) {
+		// AN LE PEER'S RECONNECTION is what input, GATT and audio trust admit: the accept list is made again.
+		if !peer_is_classic(peer) && matches!(profile, Profile::Input | Profile::Gatt | Profile::Audio) {
 			self.relist(at);
+		}
+		// AN LE PEER TRUSTED FOR AUDIO, already connected: its table is walked now.
+		if profile == Profile::Audio
+			&& on && !peer_is_classic(peer)
+			&& let Some(handle) = self.controllers[at].link_to(peer).map(|link| link.handle)
+		{
+			self.le_audio_start(at, handle);
 		}
 		Ok(())
 	}
@@ -1923,7 +2068,7 @@ impl Stack {
 		let limits = Limits::of(attachment.iso, attachment.max_command, attachment.max_event, attachment.max_acl, attachment.max_iso);
 		let queue = attachment.acl_queue.min(MAX_QUEUED as u32);
 		let acl_bytes = attachment.max_acl.saturating_sub(4).max(27);
-		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, sco_bytes: if attachment.sco { attachment.max_sco.min(258) } else { 0 }, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new() };
+		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, sco_bytes: if attachment.sco { attachment.max_sco.min(258) } else { 0 }, extended: false, le_audio_capable: false, iso_free: 0, iso_dropped: 0, iso_reassembly: service_logic::le_iso::Reassembly::default(), unclassified: 0, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new() };
 		controller.start_init();
 		controller.pump();
 		self.controllers.push(controller);
@@ -1973,7 +2118,39 @@ impl Stack {
 		}
 		let kind = match packet.kind {
 			HciPacketKind::Event => Kind::Event,
+			// A TRANSPORT THAT CARRIES ISO delivers it with ACL: told apart by the handle, each then held to its own kind's
+			// ceiling - and a handle neither table names dropped and counted.
+			HciPacketKind::Acl if self.controllers[at].limits.iso => {
+				let controller = &self.controllers[at];
+				let class = service_logic::le_iso::classify(&packet.bytes, |handle| self.iso_handle(at, handle), |handle| controller.link(handle).is_some(), controller.limits.acl, controller.limits.iso_bytes);
+				match class {
+					service_logic::le_iso::Class::Acl => Kind::Acl,
+					service_logic::le_iso::Class::Iso => {
+						self.on_iso(at, &packet.bytes);
+						self.controllers[at].pump();
+						return;
+					}
+					service_logic::le_iso::Class::Unknown | service_logic::le_iso::Class::TooLong => {
+						let controller = &mut self.controllers[at];
+						controller.unclassified = controller.unclassified.saturating_add(1);
+						return;
+					}
+				}
+			}
 			HciPacketKind::Acl => Kind::Acl,
+			// A TRANSPORT THAT CARRIES ISO APART - a UART's own packet type - is held to the ISO ceiling, and only an
+			// ISO stream's handle is taken.
+			HciPacketKind::Iso => {
+				let controller = &self.controllers[at];
+				if controller.limits.iso && service_logic::hci::check_inbound(&controller.limits, Kind::Iso as u16, packet.bytes.len() as u32).is_ok() && packet.bytes.len() >= 2 && self.iso_handle(at, u16::from_le_bytes([packet.bytes[0], packet.bytes[1]]) & 0x0fff) {
+					self.on_iso(at, &packet.bytes);
+					self.controllers[at].pump();
+				} else {
+					let controller = &mut self.controllers[at];
+					controller.unclassified = controller.unclassified.saturating_add(1);
+				}
+				return;
+			}
 			// VOICE is bounded by what the transport said it carries, and only by a transport that carries it.
 			HciPacketKind::Sco => {
 				if packet.bytes.len() as u32 <= self.controllers[at].sco_bytes {
@@ -1994,6 +2171,16 @@ impl Stack {
 		self.controllers[at].pump();
 	}
 
+	// ONE ISO PACKET IN: a whole SDU, once its fragments are together, to the stream that owns its handle.
+	fn on_iso(&mut self, at: usize, bytes: &[u8]) {
+		let Some(sdu) = self.controllers[at].iso_reassembly.push(bytes) else { return };
+		if self.broadcast_handle(at, sdu.handle) {
+			self.broadcast_sdu(&sdu);
+		} else {
+			self.le_audio_sdu(at, &sdu);
+		}
+	}
+
 	// What happened to one controller's transport.
 	fn drain_control(&mut self, at: usize, buf: &mut [u8]) -> bool {
 		loop {
@@ -2011,6 +2198,7 @@ impl Stack {
 				// A RESET IS A NEW SESSION: links, scans and profile handles from the old one are gone,
 				// and initialisation runs again from the start.
 				HciControlKind::Reset => {
+					self.le_audio_reset(at);
 					let controller = &mut self.controllers[at];
 					controller.end_session();
 					controller.session.advance();
@@ -2018,6 +2206,7 @@ impl Stack {
 					controller.pump();
 				}
 				HciControlKind::Fault => {
+					self.le_audio_reset(at);
 					let controller = &mut self.controllers[at];
 					controller.end_session();
 					controller.powered = false;
@@ -2043,7 +2232,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 2. subscribe to the controllers this machine publishes. A machine with none has none, which is
 	//    a subscription that stays quiet rather than a failure.
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::BluetoothHci).unwrap_or(0) } else { 0 };
-	let mut stack = Stack { controllers: Vec::new(), bonds, next_scan: 1, grants: Vec::new(), serials: Vec::new(), pushes: Vec::new(), receivers: Vec::new(), receive_args: None, audio: audio::AudioRoot::new(), network: pan::NetworkRoot::new() };
+	let mut stack = Stack { controllers: Vec::new(), bonds, next_scan: 1, grants: Vec::new(), serials: Vec::new(), pushes: Vec::new(), receivers: Vec::new(), receive_args: None, audio: audio::AudioRoot::new(), network: pan::NetworkRoot::new(), le_devices: Vec::new(), broadcast: broadcast::Sink::default() };
 	send_blocking(bootstrap, b"BluetoothService: online", 0);
 
 	let mut clients: Vec<Client> = Vec::new();
@@ -2087,9 +2276,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		waitset.extend(clients.iter().map(|client| client.chan));
 		// THE OPENED ENDPOINTS' CHANNELS, each read only while it holds no unanswered request.
 		waitset.extend(stack.audio.pcm.iter().filter(|pcm| !pcm.holding()).map(|pcm| pcm.chan));
-		let deadline = [stack.pcm_deadline(), stack.serial_deadline(), stack.opp_deadline()].into_iter().flatten().fold(stack.next_deadline(), u64::min);
+		let deadline = [stack.pcm_deadline(), stack.serial_deadline(), stack.opp_deadline(), stack.broadcast_deadline(), stack.le_audio_deadline()].into_iter().flatten().fold(stack.next_deadline(), u64::min);
 		let ready = wait_any(&waitset, deadline);
 		stack.run_timers();
+		stack.broadcast_timers();
+		stack.le_audio_timers();
 		stack.pcm_timers();
 		stack.serial_timers();
 		stack.opp_timers();

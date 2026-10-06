@@ -60,6 +60,8 @@ pub struct Attribute {
 pub struct Server {
 	attributes: Vec<Attribute>,
 	mtu: usize,
+	// What a client wrote to a characteristic's value - a control point - for the stack to act on.
+	writes: Vec<(u16, Vec<u8>)>,
 }
 
 fn attribute(handle: u16, kind: u16, value: Vec<u8>) -> Attribute {
@@ -93,7 +95,7 @@ impl Server {
 			},
 			configuration,
 		];
-		Server { attributes, mtu: crate::att::DEFAULT_MTU }
+		Server { attributes, mtu: crate::att::DEFAULT_MTU, writes: Vec::new() }
 	}
 
 	/// A service the stack adds at its end: its declaration, then `attributes` after it, handles given in order.
@@ -122,6 +124,37 @@ impl Server {
 	/// The value at `handle`, where there is one.
 	pub fn value(&self, handle: u16) -> Option<&[u8]> {
 		self.attributes.iter().find(|attribute| attribute.handle == handle).map(|attribute| attribute.value.as_slice())
+	}
+
+	/// The value handle of the first characteristic of class `kind`.
+	pub fn handle_of(&self, kind: u16) -> Option<u16> {
+		self.attributes.iter().find(|attribute| attribute.kind == kind).map(|attribute| attribute.handle)
+	}
+
+	/// The stack's own new value for a characteristic.
+	pub fn set_value(&mut self, handle: u16, value: Vec<u8>) {
+		if let Some(attribute) = self.attributes.iter_mut().find(|attribute| attribute.handle == handle) {
+			attribute.value = value;
+		}
+	}
+
+	/// THE NOTIFICATION OF A CHARACTERISTIC'S VALUE, where the client turned notifications on in its configuration -
+	/// the descriptor just after the value - cut to what the MTU carries; `None` where it did not.
+	pub fn notification(&self, handle: u16) -> Option<Vec<u8>> {
+		let configuration = self.attributes.iter().find(|attribute| attribute.handle == handle + 1 && attribute.kind == uuid::CLIENT_CONFIGURATION)?;
+		if configuration.value.first().is_none_or(|bits| bits & 0x01 == 0) {
+			return None;
+		}
+		let value = self.value(handle)?;
+		let mut out = alloc::vec![op::HANDLE_VALUE_NOTIFICATION];
+		out.extend_from_slice(&handle.to_le_bytes());
+		out.extend_from_slice(&value[..value.len().min(self.mtu - 3)]);
+		Some(out)
+	}
+
+	/// What clients wrote to characteristics' values since the last call, oldest first.
+	pub fn take_writes(&mut self) -> Vec<(u16, Vec<u8>)> {
+		core::mem::take(&mut self.writes)
 	}
 
 	// The end of the group a service declaration begins: the handle before the next service's, or the table's last.
@@ -233,6 +266,9 @@ impl Server {
 					return answer(Some(error::INVALID_LENGTH));
 				}
 				attribute.value = value.to_vec();
+				if attribute.kind != uuid::CLIENT_CONFIGURATION {
+					self.writes.push((handle, value.to_vec()));
+				}
 				answer(None)
 			}
 			// A command this server does not speak has no answer; a request is told so.

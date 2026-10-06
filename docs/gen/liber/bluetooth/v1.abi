@@ -44,6 +44,11 @@ method bluetooth-operator.media op=17 (controller:u32:rights=,peer:peer-address:
 method bluetooth-operator.send op=18 (controller:u32:rights=,peer:peer-address:rights=,name:string:bound=256:rights=,length:option<u64>:rights=) -> result<handle<channel>, liber:base@1::error>
 method bluetooth-operator.receive op=19 (controller:u32:rights=,peer:peer-address:rights=,max-bytes:u64:rights=) -> result<stream<received-object>, liber:base@1::error>
 method bluetooth-operator.connect-pan op=20 (controller:u32:rights=,peer:peer-address:rights=,replace-uplink:bool:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.broadcast-scan op=21 (controller:u32:rights=,seconds:u32:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.broadcasts op=22 (controller:u32:rights=) -> result<list<broadcast-source>, liber:base@1::error>
+method bluetooth-operator.broadcast-play op=23 (controller:u32:rights=,broadcast-id:u32:rights=,code:list<u8>:bound=16:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.broadcast-stop op=24 (controller:u32:rights=) -> result<unit, liber:base@1::error>
+record broadcast-source(broadcast-id:u32,name:string:bound=32,address:peer-address,sid:u8)
 enum received-kind(offered=1,data=2,complete=3,failed=4,timed-out=5)
 record received-object(kind:received-kind,name:string:bound=256,object-type:string:bound=64,declared:option<u64>,received:u64,bytes:list<u8>:bound=1024)
 interface object-push
@@ -83,7 +88,7 @@ method bluetooth-bond-store.lookup op=1 (local:peer-address:rights=,peer:peer-ad
 method bluetooth-bond-store.store op=2 (record:bond-record:rights=) -> result<unit, liber:base@1::error>
 method bluetooth-bond-store.delete op=3 (local:peer-address:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
 method bluetooth-bond-store.list op=4 (local:peer-address:rights=) -> result<list<bond-record>, liber:base@1::error>
-enum fixture-action(page=1,open-psm=2,pair=3,key-type=4,type-passkey=5,sdp-search=6,rfcomm-open=7,disconnect=8,forget=9,rfcomm-send=10,ctrl-alt-delete=11,power-key=12,hid-connect=13,gamepad-report=14,read-host-name=15,le-advertise=16,stream=17,volume=18,press-play=19,hfp-connect=20,answer=21,hang-up=22,audio-request=23,push-object=24)
+enum fixture-action(page=1,open-psm=2,pair=3,key-type=4,type-passkey=5,sdp-search=6,rfcomm-open=7,disconnect=8,forget=9,rfcomm-send=10,ctrl-alt-delete=11,power-key=12,hid-connect=13,gamepad-report=14,read-host-name=15,le-advertise=16,stream=17,volume=18,press-play=19,hfp-connect=20,answer=21,hang-up=22,audio-request=23,push-object=24,broadcast=25,le-volume=26,le-call=27,le-features=28)
 interface bluetooth-fixture
 method bluetooth-fixture.act op=1 (peer:u8:rights=,action:fixture-action:rights=,argument:u32:rights=) -> result<u32, liber:base@1::error>
 method bluetooth-fixture.events op=2 () -> result<list<string>, liber:base@1::error>

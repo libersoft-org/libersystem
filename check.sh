@@ -78,6 +78,7 @@ declare -A GATES=(
 	["bluetooth-le"]="tools/check-bluetooth-le.sh"
 	["bluetooth-audio"]="tools/check-bluetooth-audio.sh"
 	["bluetooth-transfer"]="tools/check-bluetooth-transfer.sh"
+	["bluetooth-le-audio"]="tools/check-bluetooth-le-audio.sh"
 	# POWERSERVICE AGAINST THE IN-GUEST POWER FIXTURE: exact canonical units, read denial, one-outlet
 	# control, coherent bounded subscriptions, a withheld reply and a restart. Service and
 	# normalisation coverage - the fixture's data is decoded HID and ACPI written out, not a device.

@@ -166,7 +166,7 @@ impl Stack {
 			return;
 		}
 		let local = local_address(controller);
-		let wanted: Vec<Peer> = self.records(at).into_iter().filter(|record| record.radio == Radio::Le && (record.enabled || record.trusted.contains(&Profile::Gatt))).filter_map(|record| peer_from_wire(&record.peer)).filter(|peer| *peer != local && self.controllers[at].link_to(peer).is_none()).collect();
+		let wanted: Vec<Peer> = self.records(at).into_iter().filter(|record| record.radio == Radio::Le && (record.enabled || record.trusted.contains(&Profile::Gatt) || record.trusted.contains(&Profile::Audio))).filter_map(|record| peer_from_wire(&record.peer)).filter(|peer| *peer != local && self.controllers[at].link_to(peer).is_none()).collect();
 		if wanted.is_empty() || self.controllers[at].le_links() >= bt_bounds::LINKS_PER_CONTROLLER {
 			return;
 		}
@@ -188,7 +188,7 @@ impl Stack {
 		}
 		controller.command(opcode::LE_SET_ADDRESS_RESOLUTION_ENABLE, &[1]);
 		let own = controller.le.own_type();
-		if controller.command(opcode::LE_CREATE_CONNECTION, &hci_codec::create_connection_accepted(own)) {
+		if controller.le_create_connection(&hci_codec::create_connection_accepted(own)) {
 			controller.le.accepting = true;
 		}
 	}
@@ -236,7 +236,7 @@ impl Stack {
 		let mut address = [0u8; 6];
 		address.copy_from_slice(&peer[1..]);
 		let own = controller.le.own_type();
-		if !controller.command(opcode::LE_CREATE_CONNECTION, &hci_codec::create_connection_from(peer[0], &address, own)) {
+		if !controller.le_create_connection(&hci_codec::create_connection_from(peer[0], &address, own)) {
 			return Err(Error::Exhausted);
 		}
 		controller.le.legacy = legacy.then_some(peer);
@@ -409,6 +409,9 @@ impl Stack {
 			self.start_discovery(at, handle);
 		}
 		self.battery_read(at, handle);
+		// A COORDINATED SET'S MEMBER, bonded as the set's: trusted for audio, and walked.
+		self.le_audio_bonded(at, &link_peer, &identity);
+		self.le_audio_start(at, handle);
 		self.reconnect_bonded(at);
 	}
 }

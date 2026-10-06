@@ -134,3 +134,23 @@ fn a_packet_that_lost_a_piece_is_refused_and_the_next_one_delivered() {
 	}
 	assert_eq!(after.chunks(17).flat_map(|piece| pieces.piece(piece)).collect::<Vec<_>>(), alloc::vec![after]);
 }
+
+#[test]
+// ISO ON THE BULK PAIR: an ISO packet past the ACL ceiling - which only the host's handle table can tell is ISO - is cut
+// whole out of the IN pipe's transfers, and an outbound one is whole by its fourteen-bit load length.
+fn iso_packets_share_the_bulk_pair() {
+	let load = MAX_ISO - ACL_HEADER;
+	let mut packet = alloc::vec![0x60, 0x20];
+	packet.extend_from_slice(&(load as u16).to_le_bytes());
+	packet.resize(MAX_ISO, 0x5a);
+	assert!(packet.len() > MAX_ACL);
+	let mut reassembly = Reassembly::new(Kind::Acl);
+	assert!(reassembly.push(&packet[..512]).is_empty());
+	assert_eq!(reassembly.push(&packet[512..]), alloc::vec![packet.clone()]);
+	assert!(iso_is_whole(&packet));
+	assert!(!acl_is_whole(&packet), "past the ACL ceiling");
+	let mut flagged = packet[..12].to_vec();
+	flagged[2..4].copy_from_slice(&(8u16 | 0xc000).to_le_bytes());
+	assert!(iso_is_whole(&flagged), "the load length's top bits are not its length");
+	assert!(!iso_is_whole(&packet[..12]));
+}

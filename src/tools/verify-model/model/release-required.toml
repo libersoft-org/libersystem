@@ -70,6 +70,7 @@ keys = [
 	"gate.bluetooth-classic / host / host / default",
 	"gate.bluetooth-input / host / host / default",
 	"gate.bluetooth-le / host / host / default",
+	"gate.bluetooth-le-audio / host / host / default",
 	"gate.bluetooth-service / host / host / default",
 	"gate.bluetooth-transfer / host / host / default",
 	"gate.boot-harness / host / host / default",

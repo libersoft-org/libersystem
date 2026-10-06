@@ -19,6 +19,8 @@
 //   btclassic transfer the phone and the serial device bonded for the file pushes, and a push the phone tries with no
 //                      receiver waiting refused
 //   btclassic push N   the phone pushes an object of N bytes five seconds later: the gate's next line is the receiver
+//   btclassic tether held|up  the PAN link `btctl connect` asked for: up on both sides, and held by NetworkService - no
+//                      lease asked - or taken as the uplink, the phone's address leased
 //   btclassic forget   the keyboard forgotten: this host no longer takes its page
 //   btclassic input    the keyboard paired, trusted for input, reconnecting its HID channels, its report descriptor
 //                      read from its record, and connected for input; then it is told to type, after this probe has
@@ -44,6 +46,14 @@
 //                      brings the synchronous link up and carries a tone both ways, mSBC every CRC good; the call is
 //                      relayed - rung, answered and hung up from the headset - its level is its speaker gain, and the
 //                      session's end takes the link down
+//   btclassic leaudio  LE Audio earbuds, a coordinated set: the left paired by the operator and trusted for audio, the
+//                      right found by its RSI and bonded as the set's without a word; one device in AudioService, stereo
+//                      at 48 kHz - each earbud hears its own channel in LC3, read by the fixture's own reader - its level
+//                      both ways over Volume Control; a voice session takes it from music, its microphone's LC3 reaches
+//                      the session as a tone, and the call is relayed through this host's telephone bearer both ways
+//   btclassic broadcast  an Auracast broadcast found, joined and played on the earbuds - left and right each its own
+//                      stream; encrypted, refused without its code and with a wrong one, played with the right one; and
+//                      the set's links going take the device out of AudioService
 //   btclassic ctkd     the other radio's key: the phone paired on BR/EDR has its LE key derived over the BR/EDR
 //                      Security Manager, and its LE half is encrypted on it; paired anew on LE, its BR/EDR key is
 //                      derived from the LTK, and its BR/EDR half authenticates on it - both sides deriving apart
@@ -72,6 +82,12 @@ const GAMEPAD: u8 = 7;
 const TAG: u8 = 8;
 const REMOTE: u8 = 9;
 const DISPLAY: u8 = 10;
+const EARBUD_L: u8 = 12;
+const EARBUD_R: u8 = 13;
+const BROADCASTER: u8 = 14;
+// The fixture's broadcast: its ID, its name, and the code its encrypted form takes.
+const BROADCAST_ID: u32 = 0x12_3456;
+const BROADCAST_CODE: &[u8; 16] = b"fixture-code-016";
 
 // An LE world device's identity address, static random.
 fn identity_of(device: u8) -> PeerAddress {
@@ -137,6 +153,24 @@ impl Probe {
 				let line = self.seen[at].clone();
 				self.seen.drain(..=at);
 				return line;
+			}
+			if clock() >= deadline {
+				for line in &self.seen {
+					say(&format!("  the fixture said: {line}"));
+				}
+				fail(what);
+			}
+			sleep_until(clock() + TICKS / 10);
+		}
+	}
+
+	// THE FIRST LINE that `matches`, waiting up to `ticks` - taking only that line, for two devices whose lines interleave.
+	fn take(&mut self, what: &str, ticks: u64, matches: impl Fn(&str) -> bool) -> String {
+		let deadline = clock() + ticks;
+		loop {
+			self.collect();
+			if let Some(at) = self.seen.iter().position(|line| matches(line)) {
+				return self.seen.remove(at);
 			}
 			if clock() >= deadline {
 				for line in &self.seen {
@@ -1408,6 +1442,352 @@ fn voice(probe: &mut Probe) {
 
 // THE SERIAL DEVICE, NAMED FOR APPLICATIONS: an alias, and trust for the serial port - what `btserial`'s grant is
 // checked against. Bonded by the pairing phase.
+// ------------------------------------------------------------------ LE Audio
+
+// Ten milliseconds of two square waves at 48 kHz stereo - the left of period `left` samples, the right of `right` - as a
+// buffer a write carries.
+fn stereo_period(start: &mut usize, left: usize, right: usize) -> Buffer {
+	let frames = 480usize;
+	let handle = memory_object_create((frames * 4) as u64);
+	if handle < 0 {
+		fail("no memory for a period");
+	}
+	let handle = handle as u64;
+	let Some(base) = (unsafe { map_object(handle) }) else { fail("a period could not be mapped") };
+	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames * 2) };
+	for frame in 0..frames {
+		let at = *start + frame;
+		samples[frame * 2] = if at % left < left / 2 { 8_000 } else { -8_000 };
+		samples[frame * 2 + 1] = if at % right < right / 2 { 8_000 } else { -8_000 };
+	}
+	*start += frames;
+	unmap_object(handle);
+	Buffer { handle, len: (frames * 4) as u64 }
+}
+
+// The frequency an earbud's line says it heard loudest.
+fn heard_hz(line: &str) -> u32 {
+	line.rsplit("the loudest line at ").next().and_then(|rest| rest.trim_end_matches(" Hz").parse().ok()).unwrap_or(0)
+}
+
+// AN EARBUD HEARD ITS CHANNEL: every frame read whole by the fixture, and the loudest line within a bin or two of
+// `hz`.
+fn earbud_heard(probe: &mut Probe, side: &str, rate: u32, hz: u32, ticks: u64) -> String {
+	let prefix = format!("earbud {side} heard 50 frames of LC3 at {rate} Hz");
+	let line = probe.take(&format!("earbud {side} said nothing of what it heard at {rate} Hz"), ticks, |line| line.starts_with(&prefix));
+	if !line.contains("every frame whole") || heard_hz(&line).abs_diff(hz) > 100 {
+		fail(&format!("earbud {side} did not hear its {hz} Hz tone whole: {line}"));
+	}
+	line
+}
+
+// THE EARBUDS AS AUDIOSERVICE LISTS THEM: the set's output, and its voice.
+fn earbuds(probe: &Probe, ticks: u64) -> (AudioDevice, AudioDevice) {
+	let output = bluetooth_device(probe, "AudioService never listed the earbuds as an output", ticks, |device| device.output.is_some() && !device.voice && !device.route);
+	let voice = bluetooth_device(probe, "AudioService never listed the earbuds' voice", ticks, |device| device.voice);
+	(output, voice)
+}
+
+fn le_audio(probe: &mut Probe) {
+	probe.ready();
+	// THE LEFT EARBUD, paired by the operator - Just Works, nothing to compare - and trusted for audio.
+	let handle = match probe.read().scan(&0, &4000) {
+		Some(Ok(handle)) => handle,
+		_ => fail("the scan was refused"),
+	};
+	let deadline = clock() + 6 * TICKS;
+	while clock() < deadline && !matches!(probe.read().results(&handle), Some(Ok(results)) if [EARBUD_L, EARBUD_R].iter().all(|device| results.iter().any(|result| result.address == identity_of(*device)))) {
+		sleep_until(clock() + TICKS / 4);
+	}
+	if !matches!(probe.operator().pair(&0, &identity_of(EARBUD_L)), Some(Ok(()))) {
+		fail("pairing the left earbud was refused");
+	}
+	if probe.settle(10 * TICKS) != PairingState::Bonded {
+		fail("the left earbud did not bond");
+	}
+	probe.take("the left earbud did not say it bonded", 3 * TICKS, |line| line == "earbud L bonded");
+	probe.trust(EARBUD_L, Profile::Audio, true);
+
+	// THE SET: the right earbud found by the RSI it advertises, bonded as the set's and trusted as it is.
+	probe.take("the right earbud was not bonded as the set's", 25 * TICKS, |line| line == "earbud R bonded");
+	let deadline = clock() + 10 * TICKS;
+	while !probe.bond(EARBUD_R).is_some_and(|bond| bond.trusted.contains(&Profile::Audio)) {
+		if clock() >= deadline {
+			fail("the right earbud's bond is not trusted for audio as the set is");
+		}
+		sleep_until(clock() + TICKS / 5);
+	}
+	say("a coordinated set: the left earbud paired by the operator, the right found by its RSI and bonded as the set's, trusted for audio");
+	probe.take("the left earbud never found this host's call bearer", 10 * TICKS, |line| line == "earbud L found the host's call bearer");
+
+	// ONE DEVICE IN AUDIOSERVICE: stereo at 48 kHz, and its voice at 16 kHz.
+	let (output, voice) = earbuds(probe, 10 * TICKS);
+	if output.output.as_ref().map(|format| (format.rate, format.channels)) != Some((48_000, 2)) || !output.default_output || !output.hardware_volume {
+		fail("the earbuds are not the default output in stereo at 48 kHz with their own level");
+	}
+	if voice.output.as_ref().map(|format| (format.rate, format.channels)) != Some((16_000, 1)) || voice.input.as_ref().map(|format| format.rate) != Some(16_000) {
+		fail("the earbuds' voice is not 16 kHz mono both ways");
+	}
+	say("the set is one device: AudioService's default output in stereo at 48 kHz, and a voice device at 16 kHz");
+
+	// MUSIC: the left channel a 1 kHz tone, the right 2 kHz - each earbud configured for its own, hearing only it.
+	let stream = match audio::Client::new(ChannelTransport { chan: probe.audio }).open_stream(&48_000, &2) {
+		Some(Ok(stream)) => stream,
+		other => fail(&format!("a stream could not be opened: {other:?}")),
+	};
+	let mut start = 0usize;
+	for _ in 0..300 {
+		match pcm_stream::Client::new(ChannelTransport { chan: stream }).write(&stereo_period(&mut start, 48, 24)) {
+			Some(Ok(accepted)) if accepted > 0 => {}
+			other => fail(&format!("a write was not accepted: {other:?}")),
+		}
+	}
+	for (side, location) in [("L", "front left"), ("R", "front right")] {
+		let configured = format!("earbud {side} sink ASE is codec configured: 48000 Hz, 10000 us, 120 octets, location {location}");
+		probe.take(&format!("earbud {side} was not configured for its channel at 48 kHz"), 6 * TICKS, |line| line == configured);
+		probe.take(&format!("earbud {side}'s CIS was not established"), 6 * TICKS, |line| line == format!("earbud {side} CIS is established"));
+		probe.take(&format!("earbud {side}'s sink did not stream"), 6 * TICKS, |line| line == format!("earbud {side} sink ASE is streaming"));
+	}
+	let left = earbud_heard(probe, "L", 48_000, 1_000, 8 * TICKS);
+	let right = earbud_heard(probe, "R", 48_000, 2_000, 4 * TICKS);
+	let _ = pcm_stream::Client::new(ChannelTransport { chan: stream }).close();
+	close(stream);
+	say(&format!("music in LC3, each earbud its own channel: {} / {}", left.trim_start_matches("earbud "), right.trim_start_matches("earbud ")));
+
+	// THE LEVEL BOTH WAYS: sent to each member's Volume Control, and a member's own change taken back.
+	if !matches!(audio_control::Client::new(ChannelTransport { chan: probe.control }).set_volume(&output.id, &80), Some(Ok(()))) {
+		fail("the earbuds' level could not be set");
+	}
+	for side in ["L", "R"] {
+		probe.take(&format!("earbud {side} was not sent the level"), 3 * TICKS, |line| line == format!("earbud {side} volume was set to 204"));
+	}
+	probe.act(EARBUD_R, FixtureAction::LeVolume, 255);
+	probe.take("the right earbud did not change its own level", 2 * TICKS, |line| line == "earbud R changed its own volume to 255");
+	bluetooth_device(probe, "the earbud's own change of level did not reach AudioService", 3 * TICKS, |device| device.id == output.id && device.volume == 100);
+	say("the level both ways: 80 sent to both members as volume setting 204, and a member's own change to 255 taken back as 100");
+
+	// A CALL: the voice session takes the set from music once the music's streams have wound down.
+	let session = match audio::Client::new(ChannelTransport { chan: probe.voice }).open_voice(&16_000) {
+		Some(Ok(session)) => session,
+		other => fail(&format!("the voice session could not be opened: {other:?}")),
+	};
+	let client = || voice_session::Client::new(ChannelTransport { chan: session });
+	for (side, location) in [("L", "front left"), ("R", "front right")] {
+		let configured = format!("earbud {side} sink ASE is codec configured: 16000 Hz, 10000 us, 40 octets, location {location}");
+		probe.take(&format!("earbud {side} was not configured for the call"), 8 * TICKS, |line| line == configured);
+	}
+	probe.take("the left earbud's microphone was not configured for the call", 3 * TICKS, |line| line.starts_with("earbud L source ASE is codec configured: 16000 Hz, 10000 us, 40 octets"));
+	probe.take("the left earbud's microphone did not stream", 6 * TICKS, |line| line == "earbud L source ASE is streaming");
+	probe.take("the left earbud did not send its microphone", 3 * TICKS, |line| line == "earbud L sends its microphone");
+	let commands = match client().commands() {
+		Some(Ok(stream)) => stream,
+		other => fail(&format!("the commands stream was refused: {other:?}")),
+	};
+	// BOTH WAYS: the session's 1 kHz to the earbuds, and the microphone's tone read back - its frequency by its zero
+	// crossings, the samples that are not silence.
+	let mut start = 0usize;
+	let (mut crossings, mut counted, mut last) = (0usize, 0usize, 0i16);
+	for _ in 0..150 {
+		match client().write(&voice_period_of(&mut start, 16)) {
+			Some(Ok(accepted)) if accepted > 0 => {}
+			other => fail(&format!("the session's write was not accepted: {other:?}")),
+		}
+		if let Some(Ok(period)) = client().read() {
+			for pair in period.chunks_exact(2) {
+				let sample = i16::from_le_bytes([pair[0], pair[1]]);
+				if sample.unsigned_abs() < 200 && counted == 0 {
+					continue;
+				}
+				if counted > 0 && (sample < 0) != (last < 0) {
+					crossings += 1;
+				}
+				last = sample;
+				counted += 1;
+			}
+		}
+	}
+	let hz = if counted == 0 { 0 } else { crossings * 16_000 / (2 * counted) };
+	if counted < 8_000 || hz.abs_diff(1_000) > 150 {
+		fail(&format!("the earbud's microphone did not reach the session as its tone: {counted} samples, {hz} Hz"));
+	}
+	let heard = earbud_heard(probe, "L", 16_000, 1_000, 4 * TICKS);
+	say(&format!("a call's audio both ways in LC3: the microphone's tone read at about {hz} Hz from {counted} samples; {}", heard.trim_start_matches("earbud ")));
+
+	// THE CALL RELAYED through this host's telephone bearer: rung, answered from the earbud, active, hung up from it.
+	if !matches!(client().set_call(&CallState::Incoming), Some(Ok(()))) {
+		fail("the incoming call could not be declared");
+	}
+	probe.take("the earbud did not see the call ring", 3 * TICKS, |line| line == "earbud L saw call state incoming");
+	probe.act(EARBUD_L, FixtureAction::LeCall, 0);
+	probe.take("the earbud's accept was not answered success", 3 * TICKS, |line| line == "earbud L's call control was answered success");
+	let mut seen = Vec::new();
+	let deadline = clock() + 3 * TICKS;
+	while !seen.contains(&CallCommand::Answer) {
+		commands_seen(commands, &mut seen);
+		if clock() >= deadline {
+			fail("the earbud's answer did not reach the session");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+	let _ = client().set_call(&CallState::Active);
+	probe.take("the earbud did not see the call active", 3 * TICKS, |line| line == "earbud L saw call state active");
+	probe.act(EARBUD_L, FixtureAction::LeCall, 1);
+	let deadline = clock() + 3 * TICKS;
+	while !seen.contains(&CallCommand::HangUp) {
+		commands_seen(commands, &mut seen);
+		if clock() >= deadline {
+			fail("the earbud's hang-up did not reach the session");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+	let _ = client().set_call(&CallState::None);
+	probe.take("the earbud did not see the call end", 3 * TICKS, |line| line == "earbud L saw call state none");
+	say("the call relayed through the telephone bearer: rung, answered from the earbud, active, hung up from it");
+
+	// THE SESSION CLOSES: the call's streams wound down.
+	let _ = client().close();
+	close(commands);
+	close(session);
+	probe.take("the call's microphone stream did not end with the session", 6 * TICKS, |line| line == "earbud L source ASE is released");
+	say("the session closed and the call's streams with it");
+	print(b"btclassic: PASS leaudio\n");
+}
+
+// Ten milliseconds of a square wave of period `period` samples at 16 kHz mono.
+fn voice_period_of(start: &mut usize, period: usize) -> Buffer {
+	let frames = 160usize;
+	let handle = memory_object_create((frames * 2) as u64);
+	if handle < 0 {
+		fail("no memory for a period");
+	}
+	let handle = handle as u64;
+	let Some(base) = (unsafe { map_object(handle) }) else { fail("a period could not be mapped") };
+	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames) };
+	for (at, sample) in samples.iter_mut().enumerate() {
+		*sample = if (*start + at) % period < period / 2 { 8_000 } else { -8_000 };
+	}
+	*start += frames;
+	unmap_object(handle);
+	Buffer { handle, len: (frames * 2) as u64 }
+}
+
+// The fixture's broadcast in this host's list, scanning for up to `ticks`.
+fn find_broadcast(probe: &Probe, ticks: u64) {
+	if !matches!(probe.operator().broadcast_scan(&0, &5), Some(Ok(()))) {
+		fail("the broadcast scan was refused");
+	}
+	let deadline = clock() + ticks;
+	loop {
+		if let Some(Ok(sources)) = probe.operator().broadcasts(&0)
+			&& let Some(source) = sources.iter().find(|source| source.broadcast_id == BROADCAST_ID)
+		{
+			if source.name != "fixture broadcast" || source.address.bytes != identity_of(BROADCASTER).bytes {
+				fail(&format!("the broadcast was heard under the wrong name or address: {source:?}"));
+			}
+			return;
+		}
+		if clock() >= deadline {
+			fail("the broadcast scan did not hear the fixture's broadcast");
+		}
+		sleep_until(clock() + TICKS / 4);
+	}
+}
+
+// Whether AudioService lists a broadcast's route within `ticks`.
+fn route_listed(probe: &Probe, ticks: u64) -> Option<AudioDevice> {
+	let deadline = clock() + ticks;
+	loop {
+		if let Some(route) = audio_devices(probe).into_iter().find(|device| device.transport == AudioTransport::Bluetooth && device.route) {
+			return Some(route);
+		}
+		if clock() >= deadline {
+			return None;
+		}
+		sleep_until(clock() + TICKS / 5);
+	}
+}
+
+fn broadcast(probe: &mut Probe) {
+	probe.ready();
+	let (output, _) = earbuds(probe, 10 * TICKS);
+	// AN AURACAST BROADCAST IN THE CLEAR: heard, joined, offered as a route, and played on the earbuds - its left stream
+	// on the left earbud, its right on the right.
+	probe.act(BROADCASTER, FixtureAction::Broadcast, 1);
+	probe.take("the broadcast source did not start", 2 * TICKS, |line| line == "broadcast source is broadcasting in the clear");
+	find_broadcast(probe, 8 * TICKS);
+	if !matches!(probe.operator().broadcast_play(&0, &BROADCAST_ID, &[]), Some(Ok(()))) {
+		fail("playing the broadcast was refused");
+	}
+	probe.take("the broadcast's periodic train was not joined", 6 * TICKS, |line| line == "broadcast source's periodic train was synchronised");
+	probe.take("the broadcast's BIG was not joined", 6 * TICKS, |line| line == "broadcast source's BIG was synchronised: 2 streams");
+	let Some(route) = route_listed(probe, 4 * TICKS) else { fail("AudioService never listed the broadcast's route") };
+	if route.input.as_ref().map(|format| (format.rate, format.channels)) != Some((48_000, 2)) || route.output.is_some() || route.default_input {
+		fail("the broadcast is listed as something other than a stereo route at 48 kHz");
+	}
+	let left = earbud_heard(probe, "L", 48_000, 1_500, 10 * TICKS);
+	let right = earbud_heard(probe, "R", 48_000, 3_000, 4 * TICKS);
+	say(&format!("a broadcast found, joined and played on the earbuds as a route: {} / {}", left.trim_start_matches("earbud "), right.trim_start_matches("earbud ")));
+	if !matches!(probe.operator().broadcast_stop(&0), Some(Ok(()))) {
+		fail("stopping the broadcast was refused");
+	}
+	let deadline = clock() + 3 * TICKS;
+	while audio_devices(probe).iter().any(|device| device.id == route.id) {
+		if clock() >= deadline {
+			fail("the broadcast's route did not leave AudioService when it was stopped");
+		}
+		sleep_until(clock() + TICKS / 5);
+	}
+	probe.act(BROADCASTER, FixtureAction::Broadcast, 0);
+	probe.take("the broadcast source did not stop", 2 * TICKS, |line| line == "broadcast source stopped");
+
+	// ENCRYPTED: no route without its code, none with a wrong one, and played with the right one.
+	probe.act(BROADCASTER, FixtureAction::Broadcast, 2);
+	probe.take("the encrypted broadcast did not start", 2 * TICKS, |line| line == "broadcast source is broadcasting encrypted");
+	find_broadcast(probe, 8 * TICKS);
+	if !matches!(probe.operator().broadcast_play(&0, &BROADCAST_ID, &[]), Some(Ok(()))) {
+		fail("playing the encrypted broadcast was refused at the call");
+	}
+	if route_listed(probe, 4 * TICKS).is_some() {
+		fail("an encrypted broadcast became a route with no Broadcast Code");
+	}
+	find_broadcast(probe, 8 * TICKS);
+	if !matches!(probe.operator().broadcast_play(&0, &BROADCAST_ID, b"wrong-code-00016"), Some(Ok(()))) {
+		fail("playing the encrypted broadcast with a code was refused at the call");
+	}
+	probe.take("the source did not refuse the wrong code", 6 * TICKS, |line| line == "broadcast source's BIG refused a wrong Broadcast Code");
+	if route_listed(probe, 2 * TICKS).is_some() {
+		fail("an encrypted broadcast became a route with a wrong Broadcast Code");
+	}
+	find_broadcast(probe, 8 * TICKS);
+	if !matches!(probe.operator().broadcast_play(&0, &BROADCAST_ID, BROADCAST_CODE), Some(Ok(()))) {
+		fail("playing the encrypted broadcast with its code was refused");
+	}
+	probe.take("the encrypted broadcast's BIG was not joined with its code", 8 * TICKS, |line| line == "broadcast source's BIG was synchronised: 2 streams");
+	if route_listed(probe, 4 * TICKS).is_none() {
+		fail("the encrypted broadcast did not become a route with its code");
+	}
+	let _ = probe.operator().broadcast_stop(&0);
+	probe.act(BROADCASTER, FixtureAction::Broadcast, 0);
+	say("an encrypted broadcast: no route without its code or with a wrong one, joined with the right one");
+
+	// THE SET'S LINKS GO: one member's leaves the device offered, both take it out of AudioService.
+	probe.act(EARBUD_R, FixtureAction::Disconnect, 0);
+	sleep_until(clock() + TICKS);
+	if !audio_devices(probe).iter().any(|device| device.id == output.id) {
+		fail("the earbuds left AudioService with one member still connected");
+	}
+	probe.act(EARBUD_L, FixtureAction::Disconnect, 0);
+	let deadline = clock() + 4 * TICKS;
+	while audio_devices(probe).iter().any(|device| device.id == output.id) {
+		if clock() >= deadline {
+			fail("the earbuds' output did not leave AudioService when both links did");
+		}
+		sleep_until(clock() + TICKS / 5);
+	}
+	say("one member's link gone the device stays; both gone, it left AudioService's inventory");
+	print(b"btclassic: PASS broadcast\n");
+}
+
 fn serial(probe: &mut Probe) {
 	probe.ready();
 	if probe.bond(SERIAL).is_none() {
@@ -1467,6 +1847,33 @@ fn push(probe: &mut Probe, size: u32) {
 	print(format!("btclassic: PASS push - the phone pushes {size} bytes in five seconds\n").as_bytes());
 }
 
+// ------------------------------------------------------------------ tether
+
+// THE PAN LINK the shell's `btctl connect` just asked for: connected for PAN on the stack's account and its setup taken
+// on the phone's - and then either held by NetworkService, no lease asked of the phone, or taken as the uplink, the
+// phone's address leased.
+fn tether(probe: &mut Probe, up: bool) {
+	probe.ready();
+	probe.expect("the phone's access point never took the PAN setup", 20 * TICKS, |line| line == "phone's access point took the host's PAN setup");
+	let deadline = clock() + 5 * TICKS;
+	while !matches!(probe.operator().devices(&0), Some(Ok(devices)) if devices.iter().any(|device| device.address == address_of(PHONE) && device.connected_profiles.contains(&Profile::Pan))) {
+		if clock() >= deadline {
+			fail("the phone is not connected for PAN");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+	if up {
+		probe.expect("NetworkService never took the PAN link's lease", 20 * TICKS, |line| line == "phone's access point leased 192.168.44.2 to the host");
+		say("the PAN link is the uplink: the phone leased 192.168.44.2");
+	} else {
+		if probe.saw(4 * TICKS, |line| line.contains("leased")) {
+			fail("a PAN link that may not replace the uplink was taken as one");
+		}
+		say("the PAN link is connected and held: NetworkService asked the phone for no lease");
+	}
+	print(if up { b"btclassic: PASS tether up\n".as_slice() } else { b"btclassic: PASS tether held\n".as_slice() });
+}
+
 // ------------------------------------------------------------------ forget
 
 fn forget(probe: &mut Probe) {
@@ -1511,13 +1918,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		"ctkd" => ctkd(&mut probe),
 		"audio" => music(&mut probe),
 		"voice" => voice(&mut probe),
+		"leaudio" => le_audio(&mut probe),
+		"broadcast" => broadcast(&mut probe),
 		"serial" => serial(&mut probe),
 		"transfer" => transfer(&mut probe),
+		"tether held" => tether(&mut probe, false),
+		"tether up" => tether(&mut probe, true),
 		other if other.starts_with("push ") => push(&mut probe, other[5..].trim().parse().unwrap_or_else(|_| fail("usage: btclassic push BYTES"))),
 		// TYPED AT THE PROMPT BY THE BLUETOOTH KEYBOARD: that this ran is the claim.
 		"typed" => print(b"btclassic: PASS typed - this command was typed by the Bluetooth keyboard\n"),
 		"alive" => print(b"btclassic: PASS alive - the machine still runs after the keyboard's Ctrl+Alt+Delete and Power key\n"),
-		_ => fail("usage: btclassic pair|policy|reuse|forget|input|typed|alive|gamepad|le|ctkd|audio|voice|serial|transfer|push BYTES"),
+		_ => fail("usage: btclassic pair|policy|reuse|forget|input|typed|alive|gamepad|le|ctkd|audio|voice|leaudio|broadcast|serial|transfer|push BYTES|tether held|tether up"),
 	}
 	probe.unwatch();
 	exit();

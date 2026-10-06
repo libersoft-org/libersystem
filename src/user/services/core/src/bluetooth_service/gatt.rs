@@ -49,6 +49,8 @@ pub(crate) enum Kind {
 	Subscribe { handle: u16, cccd: u16 },
 	// The stack's own: the Battery Level characteristic's value, read by its type.
 	Battery,
+	// The stack's own: an LE Audio client's request, its response to `le_audio_response`.
+	Audio(Vec<u8>),
 }
 
 pub(crate) struct Op {
@@ -338,6 +340,17 @@ impl Stack {
 		self.next_gatt(at, handle);
 	}
 
+	// AN LE AUDIO CLIENT'S REQUEST, queued like a grant's: its walk and its control point share the one bearer.
+	pub(crate) fn audio_att(&mut self, at: usize, handle: u16, pdu: Vec<u8>) {
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
+		if link.gatt.queue.len() >= MAX_QUEUED_OPS {
+			print(b"BluetoothService: an LE Audio request found the link's queue full and is dropped\n");
+			return;
+		}
+		link.gatt.queue.push_back(Op { grant: 0, request: Vec::new(), kind: Kind::Audio(pdu) });
+		self.next_gatt(at, handle);
+	}
+
 	// THE NEXT QUEUED OPERATION GOES when the bearer is free: no walk of its own, and nothing outstanding.
 	pub(crate) fn next_gatt(&mut self, at: usize, handle: u16) {
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
@@ -361,6 +374,7 @@ impl Stack {
 				out
 			}
 			Kind::Battery => request(op::READ_BY_TYPE_REQUEST, &[0x0001, 0xffff, BATTERY_LEVEL]),
+			Kind::Audio(pdu) => pdu.clone(),
 		};
 		link.gatt.busy = Some(op);
 		self.controllers[at].l2cap(handle, ATT_CID, &pdu);
@@ -375,6 +389,11 @@ impl Stack {
 			if let Some(link) = self.controllers[at].link_mut(handle) {
 				link.gatt.battery = level;
 			}
+			self.next_gatt(at, handle);
+			return;
+		}
+		if matches!(op.kind, Kind::Audio(_)) {
+			self.le_audio_response(at, handle, pdu);
 			self.next_gatt(at, handle);
 			return;
 		}
@@ -463,7 +482,7 @@ impl Stack {
 				}
 			}
 			// Answered above.
-			Kind::Battery => {}
+			Kind::Battery | Kind::Audio(_) => {}
 			Kind::Subscribe { handle: value, .. } => {
 				let corr = u32::from_le_bytes([op.request[2], op.request[3], op.request[4], op.request[5]]);
 				if error_code.is_some() {
@@ -513,7 +532,7 @@ impl Stack {
 
 	// A LINK GONE: its queued operations are answered closed.
 	pub(crate) fn gatt_gone(&self, link: &mut Link) {
-		let pending: Vec<Op> = link.gatt.busy.take().into_iter().chain(link.gatt.queue.drain(..)).filter(|op| !matches!(op.kind, Kind::Battery)).collect();
+		let pending: Vec<Op> = link.gatt.busy.take().into_iter().chain(link.gatt.queue.drain(..)).filter(|op| !matches!(op.kind, Kind::Battery | Kind::Audio(_))).collect();
 		for op in pending {
 			let op_code = u16::from_le_bytes([op.request[0], op.request[1]]);
 			self.refuse(op.grant, &op.request, op_code, Error::Closed);

@@ -25,6 +25,9 @@ pub const ACL_HEADER: usize = 4;
 pub const MAX_COMMAND: usize = 258;
 pub const MAX_EVENT: usize = 257;
 pub const MAX_ACL: usize = 1028;
+/// THE LARGEST ISO PACKET this transport carries, its header included: an SDU of a thousand bytes and its load header,
+/// past any LC3 frame. ISO shares the ACL bulk pair, so the IN pipe's packets are cut at the larger of the two.
+pub const MAX_ISO: usize = 1032;
 /// A SCO packet: a two-byte connection handle with its status bits, a length byte, and that many bytes.
 pub const SCO_HEADER: usize = 3;
 pub const MAX_SCO: usize = SCO_HEADER + 255;
@@ -144,7 +147,7 @@ impl Reassembly {
 		self.held.extend_from_slice(bytes);
 		let ceiling = match self.kind {
 			Kind::Event => MAX_EVENT,
-			Kind::Acl => MAX_ACL,
+			Kind::Acl => MAX_ACL.max(MAX_ISO),
 		};
 		let mut out = Vec::new();
 		while let Some(length) = self.length() {
@@ -260,6 +263,11 @@ impl ScoPieces {
 /// Whether an ACL packet is one: its four-byte header, and a data length that is the rest of it.
 pub fn acl_is_whole(packet: &[u8]) -> bool {
 	packet.len() >= ACL_HEADER && packet.len() <= MAX_ACL && u16::from_le_bytes([packet[2], packet[3]]) as usize == packet.len() - ACL_HEADER
+}
+
+/// Whether an ISO packet is one: the four-byte header, and a fourteen-bit load length that is the rest of it.
+pub fn iso_is_whole(packet: &[u8]) -> bool {
+	packet.len() >= ACL_HEADER && packet.len() <= MAX_ISO && (u16::from_le_bytes([packet[2], packet[3]]) & 0x3fff) as usize == packet.len() - ACL_HEADER
 }
 
 #[cfg(test)]

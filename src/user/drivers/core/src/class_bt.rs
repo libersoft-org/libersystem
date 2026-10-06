@@ -19,7 +19,11 @@
 // of the SCO stream cut back into packets (`bt_usb::ScoPieces` - a packet that lost a piece is refused, never
 // delivered with a hole), and a SCO send cut into pieces of the alternate's size on the OUT pipe, answered when its
 // last piece is taken. Zero channels - and a reset, and the consumer leaving - put the interface back at zero
-// bandwidth. ISO, which shares the ACL pair and is told from it only by a handle, is not this transport's.
+// bandwidth.
+//
+// ISO SHARES THE ACL PAIR, told from ACL only by a connection handle, and the handles are the host's. So this transport
+// carries an outbound `iso` packet on the bulk OUT pipe like ACL, and delivers every packet the IN pipe brings as `acl`,
+// cut by the four-byte header both kinds share at the larger of the two ceilings: BluetoothService classifies.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -150,9 +154,9 @@ impl Bluetooth {
 		}
 	}
 
-	// One ACL send, answered when the controller took it.
-	fn send_acl(&mut self, hc: &mut Xhci, chan: u64, corr: u32, packet: &[u8]) {
-		if !bt_usb::acl_is_whole(packet) {
+	// One ACL send - or an ISO one, which shares the bulk OUT pipe - answered when the controller took it.
+	fn send_acl(&mut self, hc: &mut Xhci, chan: u64, corr: u32, packet: &[u8], iso: bool) {
+		if !(if iso { bt_usb::iso_is_whole(packet) } else { bt_usb::acl_is_whole(packet) }) {
 			classes::answer_u32(chan, corr, Err(Error::Invalid));
 			return;
 		}
@@ -263,7 +267,8 @@ impl hci_transport::Service for View<'_> {
 			return Err(Error::Unsupported);
 		}
 		let sco = self.bt.binding.has_voice();
-		Ok(HciAttachment { version, iso: false, max_command: bt_usb::MAX_COMMAND as u32, max_event: bt_usb::MAX_EVENT as u32, max_acl: bt_usb::MAX_ACL as u32, max_iso: 0, command_credits: 1, acl_credits: 1, acl_queue: 1, epoch: self.bt.epoch, sco, max_sco: if sco { bt_usb::MAX_SCO as u32 } else { 0 } })
+		// ISO ON THE BULK PAIR: carried out as its own kind, delivered in as ACL for the host to classify by its handle.
+		Ok(HciAttachment { version, iso: true, max_command: bt_usb::MAX_COMMAND as u32, max_event: bt_usb::MAX_EVENT as u32, max_acl: bt_usb::MAX_ACL as u32, max_iso: bt_usb::MAX_ISO as u32, command_credits: 1, acl_credits: 1, acl_queue: 1, epoch: self.bt.epoch, sco, max_sco: if sco { bt_usb::MAX_SCO as u32 } else { 0 } })
 	}
 
 	fn send(&mut self, kind: HciPacketKind, bytes: Vec<u8>) -> Result<u32, Error> {
@@ -277,10 +282,9 @@ impl hci_transport::Service for View<'_> {
 				control_out_req(self.hc, self.hids, &mut self.bt.dev, bt_usb::RT_CLASS_DEVICE_OUT, 0, 0, interface, bytes.len() as u16).ok_or(Error::Io)?;
 				Ok(bytes.len() as u32)
 			}
-			// ACL and SCO are taken before dispatch, because they are answered when the controller took them.
-			HciPacketKind::Acl | HciPacketKind::Sco => Err(Error::Invalid),
+			// ACL, ISO and SCO are taken before dispatch, because they are answered when the controller took them.
+			HciPacketKind::Acl | HciPacketKind::Iso | HciPacketKind::Sco => Err(Error::Invalid),
 			HciPacketKind::Event => Err(Error::Invalid),
-			HciPacketKind::Iso => Err(Error::Unsupported),
 		}
 	}
 
@@ -389,8 +393,8 @@ impl Module for Bluetooth {
 			self.consumer = chan;
 		}
 		match classes::correlation(&request) {
-			// An ACL or SCO send: the kind byte, then the packet as a length-prefixed list.
-			Some((hci_transport::OP_SEND, corr)) if request.len() >= 9 && (request[6] == HciPacketKind::Acl as u8 || request[6] == HciPacketKind::Sco as u8) => {
+			// An ACL, ISO or SCO send: the kind byte, then the packet as a length-prefixed list.
+			Some((hci_transport::OP_SEND, corr)) if request.len() >= 9 && (request[6] == HciPacketKind::Acl as u8 || request[6] == HciPacketKind::Iso as u8 || request[6] == HciPacketKind::Sco as u8) => {
 				for &handle in handles.as_slice() {
 					close(handle);
 				}
@@ -403,7 +407,7 @@ impl Module for Bluetooth {
 				if request[6] == HciPacketKind::Sco as u8 {
 					self.send_sco(hc, chan, corr, &packet);
 				} else {
-					self.send_acl(hc, chan, corr, &packet);
+					self.send_acl(hc, chan, corr, &packet, request[6] == HciPacketKind::Iso as u8);
 				}
 			}
 			// THE TWO STREAMS, opened by hand: their answers carry the consumer's ends.

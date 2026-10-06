@@ -14,9 +14,10 @@ use super::*;
 use proto::system::{NetworkEvent, NetworkLink, bluetooth_network};
 use service_logic::bnep::{self, Panu, Received};
 use service_logic::l2cap_bredr::psm;
+use service_logic::{bt_policy, sdp};
 
 // What the links stream holds for a subscriber that has not read it.
-const LINKS_DEPTH: usize = 16;
+const LINKS_DEPTH: u64 = 16;
 
 pub(crate) struct Pan {
 	pub cid: u16,

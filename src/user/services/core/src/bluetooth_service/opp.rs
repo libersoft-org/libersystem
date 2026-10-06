@@ -105,7 +105,7 @@ fn tell(stream: u64, event: &ReceivedObject) -> bool {
 // A receiver's stream is read by `btctl` as it writes its output: a stream that is full is waited on briefly, and a
 // holder that does not drain it in that time has gone as far as this service is concerned.
 fn send_outcome(stream: u64, frame: &[u8]) -> SendOutcome {
-	try_send_outcome(stream, frame, clock() + TICKS_PER_SECOND)
+	send_deadline(stream, frame, 0, clock() + TICKS_PER_SECOND)
 }
 
 fn event(kind: ReceivedKind, received: u64) -> ReceivedObject {

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Files over Bluetooth, against the in-guest fixture's phone and serial device: OBEX Object Push both ways, on L2CAP
-# where the peer's record offers it and on RFCOMM where it does not, through `btctl send` and `btctl receive` and the
-# shell's own redirections.
+# Files and tethering over Bluetooth, against the in-guest fixture's phone and serial device: OBEX Object Push both ways,
+# on L2CAP where the peer's record offers it and on RFCOMM where it does not, through `btctl send` and `btctl receive`
+# and the shell's own redirections; and PAN, the phone's network access point as NetworkService's uplink or not.
 #
 # THE ORACLE IS THE IN-GUEST FIXTURE, WRITTEN BY THE SAME TEAM, AND SAID SO: its OBEX server and client and the enhanced
 # retransmission mode its L2CAP channel runs in (`drivers::bt_world`'s `opp`) are written apart from the host stack's
@@ -18,6 +18,14 @@
 #   receiving            `btctl receive PHONE 8192 > note.txt` takes the phone's 3100-byte push, names it on its
 #                          diagnostics, and the file holds all of it - a hundred numbered lines, the last the hundredth
 #   the bound            `btctl receive PHONE 1000` refuses the same push before a byte of it, and says so
+#   a held tether        `btctl connect PHONE pan` brings BNEP up, and NetworkService - on its own NIC - holds the link
+#                          unselected: no lease is asked of the phone
+#   the uplink           `btctl connect PHONE pan replace` makes the link the uplink under a new generation: the phone
+#                          leases 192.168.44.2 by DHCP, and `ping -c 3 192.168.44.1` is answered by it over BNEP
+#   the fallback         the link disconnected, NetworkService goes back to its NIC
+#
+# THE ADDRESSING IS THE FIXTURE'S. The owner's preferred access point - a harness peer bridged to a host network where
+# `dnsmasq` answers DHCP - waits on adopting Bumble; this one leases from a network of its own, and says so.
 
 set -euo pipefail
 GUEST_GATE_NAME="bluetooth-transfer"
@@ -32,7 +40,7 @@ guest_gate_arch "$@"
 # directory goes.
 fail() {
 	if [[ -n "${GUEST_LINES:-}" && -f "$GUEST_LINES" ]]; then
-		grep -aE 'btclassic|btctl|bt-fixture|BluetoothService|PermissionManager|shell:|sent |[0-9]+ (big|note|small)\.txt|line [0-9]+' "$GUEST_LINES" >&2 || cat "$GUEST_LINES" >&2
+		grep -aE 'btclassic|btctl|bt-fixture|BluetoothService|PermissionManager|network:|shell:|guest-console|wc|big|note|small|line [0-9]+' "$GUEST_LINES" >&2 || cat "$GUEST_LINES" >&2
 	fi
 	guest_gate_fail "$@"
 }
@@ -40,29 +48,36 @@ fail() {
 guest_gate_require_programs bt_fixture btclassic btctl bluetooth_service bluetooth_bond_store sleepcheck wc tail
 
 export QEMU_EXTRA="-device edu,addr=0x1d"
-export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-180}"
-export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-320}"
+export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-260}"
+export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-400}"
 
 phone="00:1b:dc:20:00:02"
 serial="00:1b:dc:20:00:05"
 guest_gate_run "btclassic transfer
 sleepcheck count 10 > big.txt
-wc -c big.txt
+wc big.txt
 btctl send $phone big.txt < big.txt
 btctl send $serial big.txt < big.txt
 btclassic push 3100
 btctl receive $phone 8192 > note.txt
-wc -c note.txt
+wc note.txt
 tail -n 1 note.txt
 btclassic push 3100
-btctl receive $phone 1000 > small.txt" ""
+btctl receive $phone 1000 > small.txt
+btctl connect $phone pan
+btclassic tether held
+btctl disconnect $phone pan
+btctl connect $phone pan replace
+btclassic tether up
+ping -c 3 192.168.44.1
+btctl disconnect $phone pan" ""
 lines="$GUEST_LINES"
 
 expect() {
 	local line="$1" why="$2"
 	grep -qF "$line" "$lines" || {
 		echo "bluetooth-transfer: expected \"$line\" - $why" >&2
-		grep -aE 'btclassic|btctl|bt-fixture|BluetoothService|sent |[0-9]+ (big|note)\.txt|line [0-9]+' "$lines" >&2 || cat "$lines" >&2
+		grep -aE 'btclassic|btctl|bt-fixture|BluetoothService|network:|shell:|sent |[0-9]+ (big|note|small)\.txt|line [0-9]+' "$lines" >&2 || cat "$lines" >&2
 		exit 1
 	}
 	echo "bluetooth-transfer: $line"
@@ -70,11 +85,12 @@ expect() {
 
 expect "btclassic: PASS transfer" "the phone and the serial device must bond, and a push with no receiver waiting be refused"
 
-size="$(grep -aoE '^[0-9]+ big\.txt' "$lines" | head -n 1 | awk '{print $1}')"
+# `wc` says lines, words, bytes and scalars.
+size="$(grep -aoE '^[0-9]+ [0-9]+ [0-9]+ [0-9]+ [^ ]*big\.txt' "$lines" | head -n 1 | awk '{print $3}' || true)"
 [[ -n "$size" ]] || fail "wc never reported the file's size"
-over_l2cap="$(grep -aoE "bt-fixture: phone received big\.txt over L2CAP: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | head -n 1)"
+over_l2cap="$(grep -aoE "bt-fixture: phone received big\.txt over L2CAP: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | head -n 1 || true)"
 [[ -n "$over_l2cap" ]] || fail "the phone never received the file over L2CAP"
-over_rfcomm="$(grep -aoE "bt-fixture: serial received big\.txt over RFCOMM: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | head -n 1)"
+over_rfcomm="$(grep -aoE "bt-fixture: serial received big\.txt over RFCOMM: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | head -n 1 || true)"
 [[ -n "$over_rfcomm" ]] || fail "the serial device never received the file over RFCOMM"
 [[ "$over_l2cap" == *": $size bytes, digest "* ]] || fail "the phone received a different size than the file's $size bytes: $over_l2cap"
 [[ "${over_l2cap##* digest }" == "${over_rfcomm##* digest }" && "$over_rfcomm" == *": $size bytes, digest "* ]] || fail "the two transports delivered different bytes: $over_l2cap / $over_rfcomm"
@@ -84,11 +100,23 @@ echo "bluetooth-transfer: the $size-byte file reached the phone over L2CAP and t
 
 expect "btctl: receiving \"fixture-note.txt\" from $phone bredr: 3100 bytes, type \"text/plain\"" "the receiver must name the object as the phone gave it"
 expect "btctl: received 3100 bytes" "the receiver must take the whole object"
-expect "3100 note.txt" "the file the redirection wrote must hold the whole object"
+grep -aqE '^[0-9]+ [0-9]+ 3100 [0-9]+ [^ ]*note\.txt' "$lines" || fail "the file the redirection wrote must hold the whole object: wc did not count 3100 bytes"
+echo "bluetooth-transfer: note.txt holds 3100 bytes"
 expect "line 00100 of the phone's note" "the file's last line must be the phone's hundredth"
 expect "bt-fixture: phone pushed fixture-note.txt: 3100 bytes" "the phone must see its push answered success"
 
 expect "btctl: the object did not arrive whole: 0 bytes received" "an object past the receiver's bound must be refused before a byte of it"
 expect "bt-fixture: phone's push was answered 0xcd" "the phone must be told the object is too large"
 
-echo "bluetooth-transfer: PASS - Object Push sent on L2CAP and RFCOMM and received through the shell's redirections, refused with nobody waiting and past the receiver's bound"
+expect "network: a Bluetooth PAN link arrived, held while another link is selected" "a PAN link that may not replace the uplink must be held"
+expect "btclassic: PASS tether held" "the held link must be up on both sides with no lease asked"
+expect "network: a Bluetooth PAN link arrived, allowed to replace the uplink" "the operator's replace must reach NetworkService"
+expect "network: configured via DHCP - 192.168.44.2" "NetworkService must take the phone's lease on the PAN link"
+expect "btclassic: PASS tether up" "the phone must have leased its address"
+expect "bt-fixture: phone's access point answered a ping from 192.168.44.2" "a ping must cross BNEP both ways"
+expect "network: a Bluetooth PAN link departed" "the disconnect must withdraw the link"
+after="$(sed -n '/network: a Bluetooth PAN link departed/,$p' "$lines")"
+grep -qE "network: configured via DHCP - |network: DHCP unanswered" <<<"$after" || fail "NetworkService did not go back to its NIC when the PAN link went"
+echo "bluetooth-transfer: the PAN link held, then the uplink with the phone's lease and a ping across, then gone and the NIC back"
+
+echo "bluetooth-transfer: PASS - Object Push sent on L2CAP and RFCOMM and received through the shell's redirections, refused with nobody waiting and past the receiver's bound; PAN held, made the uplink and given back"

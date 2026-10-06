@@ -1934,6 +1934,10 @@ pub mod bluetooth_operator {
 	pub const OP_SEND: u16 = 18;
 	pub const OP_RECEIVE: u16 = 19;
 	pub const OP_CONNECT_PAN: u16 = 20;
+	pub const OP_BROADCAST_SCAN: u16 = 21;
+	pub const OP_BROADCASTS: u16 = 22;
+	pub const OP_BROADCAST_PLAY: u16 = 23;
+	pub const OP_BROADCAST_STOP: u16 = 24;
 
 	pub trait Service {
 		/// Turn a controller's radio on or off. The platform's own allow or deny setting is enforced
@@ -1992,6 +1996,16 @@ pub mod bluetooth_operator {
 		/// it the uplink in place of a selected one only where `replace-uplink` says so; otherwise it is held, unselected,
 		/// while another is selected. `connect` with `pan` is this without `replace-uplink`.
 		fn connect_pan(&mut self, controller: u32, peer: PeerAddress, replace_uplink: bool) -> Result<(), Error>;
+		/// LOOK FOR LE AUDIO BROADCASTS for at most `seconds` (30 at most): their announcements gathered for `broadcasts`.
+		fn broadcast_scan(&mut self, controller: u32, seconds: u32) -> Result<(), Error>;
+		/// The broadcasts heard by the last `broadcast-scan`, so far.
+		fn broadcasts(&mut self, controller: u32) -> Result<Vec<BroadcastSource>, Error>;
+		/// PLAY ONE: its periodic train joined, its BASE read, its BIG synchronised - with `code` where it is encrypted,
+		/// empty where it is not - and its streams offered to AudioService as a route to the default output, as a phone's
+		/// A2DP stream is. One broadcast at a time; a second replaces the first.
+		fn broadcast_play(&mut self, controller: u32, broadcast_id: u32, code: Vec<u8>) -> Result<(), Error>;
+		/// Stop the broadcast being played.
+		fn broadcast_stop(&mut self, controller: u32) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -2710,6 +2724,169 @@ pub mod bluetooth_operator {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_BROADCAST_SCAN => {
+				let controller = r.u32()?;
+				let seconds = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.broadcast_scan(controller, seconds);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v84) => {
+							w.u8(1)?;
+						}
+						Err(v85) => {
+							w.u8(0)?;
+							v85.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_BROADCASTS => {
+				let controller = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.broadcasts(controller);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v86) => {
+							w.u8(1)?;
+							if v86.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v86.len() as u16)?;
+							for v88 in v86.iter() {
+								v88.write(w)?;
+							}
+						}
+						Err(v87) => {
+							w.u8(0)?;
+							v87.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_BROADCAST_PLAY => {
+				let controller = r.u32()?;
+				let broadcast_id = r.u32()?;
+				let code = {
+					let v89 = r.u16()? as usize;
+					let v89 = (v89 <= 16).then_some(v89)?;
+					let mut v90 = Vec::new();
+					v90.try_reserve_exact(v89).ok()?;
+					for _ in 0..v89 {
+						v90.push(r.u8()?);
+					}
+					v90
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.broadcast_play(controller, broadcast_id, code);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v91) => {
+							w.u8(1)?;
+						}
+						Err(v92) => {
+							w.u8(0)?;
+							v92.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_BROADCAST_STOP => {
+				let controller = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.broadcast_stop(controller);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v93) => {
+							w.u8(1)?;
+						}
+						Err(v94) => {
+							w.u8(0)?;
+							v94.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -3063,13 +3240,13 @@ pub mod bluetooth_operator {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v84 = r.u16()? as usize;
-						let mut v85 = Vec::new();
-						v85.try_reserve_exact(v84).ok()?;
-						for _ in 0..v84 {
-							v85.push(BondedPeer::read(r)?);
+						let v95 = r.u16()? as usize;
+						let mut v96 = Vec::new();
+						v96.try_reserve_exact(v95).ok()?;
+						for _ in 0..v95 {
+							v96.push(BondedPeer::read(r)?);
 						}
-						v85
+						v96
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3360,13 +3537,13 @@ pub mod bluetooth_operator {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v86 = r.u16()? as usize;
-						let mut v87 = Vec::new();
-						v87.try_reserve_exact(v86).ok()?;
-						for _ in 0..v86 {
-							v87.push(DeviceStatus::read(r)?);
+						let v97 = r.u16()? as usize;
+						let mut v98 = Vec::new();
+						v98.try_reserve_exact(v97).ok()?;
+						for _ in 0..v97 {
+							v98.push(DeviceStatus::read(r)?);
 						}
-						v87
+						v98
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3529,9 +3706,9 @@ pub mod bluetooth_operator {
 			peer.write(w)?;
 			w.bytes_lp(name.as_bytes())?;
 			match length {
-				Some(v88) => {
+				Some(v99) => {
 					w.u8(1)?;
-					w.u64(*v88)?;
+					w.u64(*v99)?;
 				}
 				None => {
 					w.u8(0)?;
@@ -3624,6 +3801,159 @@ pub mod bluetooth_operator {
 			w.u32(*controller)?;
 			peer.write(w)?;
 			w.boolean(*replace_uplink)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn broadcast_scan(&mut self, controller: &u32, seconds: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BROADCAST_SCAN)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
+			w.u32(*seconds)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn broadcasts(&mut self, controller: &u32) -> Option<Result<Vec<BroadcastSource>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BROADCASTS)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v100 = r.u16()? as usize;
+						let mut v101 = Vec::new();
+						v101.try_reserve_exact(v100).ok()?;
+						for _ in 0..v100 {
+							v101.push(BroadcastSource::read(r)?);
+						}
+						v101
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn broadcast_play(&mut self, controller: &u32, broadcast_id: &u32, code: &[u8]) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BROADCAST_PLAY)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
+			w.u32(*broadcast_id)?;
+			if code.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(code.len() as u16)?;
+			for v102 in code.iter() {
+				w.u8(*v102)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn broadcast_stop(&mut self, controller: &u32) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BROADCAST_STOP)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -3811,6 +4141,101 @@ pub mod bluetooth_operator {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.connect_pan(controller, peer, replace_uplink)
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_broadcast_scan")]
+	fn channel_invoke_broadcast_scan(chan: u64, controller: &u32, seconds: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.broadcast_scan(controller, seconds)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_broadcasts")]
+	fn channel_invoke_broadcasts(chan: u64, controller: &u32) -> Option<Result<Vec<BroadcastSource>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.broadcasts(controller)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_broadcast_play")]
+	fn channel_invoke_broadcast_play(chan: u64, controller: &u32, broadcast_id: &u32, code: &[u8]) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.broadcast_play(controller, broadcast_id, code)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_broadcast_stop")]
+	fn channel_invoke_broadcast_stop(chan: u64, controller: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.broadcast_stop(controller)
+	}
+}
+
+/// An LE Audio broadcast heard: its Broadcast ID, its name as the source gave it, and the source's address and set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BroadcastSource {
+	pub broadcast_id: u32,
+	pub name: String,
+	pub address: PeerAddress,
+	pub sid: u8,
+}
+
+impl BroadcastSource {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BroadcastSource> {
+		let mut r = Reader::new(bytes);
+		let value = BroadcastSource::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BroadcastSource> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BroadcastSource::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.broadcast_id)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		self.address.write(w)?;
+		w.u8(self.sid)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BroadcastSource> {
+		let broadcast_id = r.u32()?;
+		let name = {
+			let v103 = r.string_lp()?;
+			(v103.len() <= 32).then_some(v103)?
+		};
+		let address = PeerAddress::read(r)?;
+		let sid = r.u8()?;
+		Some(BroadcastSource { broadcast_id, name, address, sid })
+	}
 }
 
 /// What a receiver hears of the one object a peer pushes.
@@ -3929,9 +4354,9 @@ impl ReceivedObject {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.bytes_lp(self.object_type.as_bytes())?;
 		match &self.declared {
-			Some(v89) => {
+			Some(v104) => {
 				w.u8(1)?;
-				w.u64(*v89)?;
+				w.u64(*v104)?;
 			}
 			None => {
 				w.u8(0)?;
@@ -3942,32 +4367,32 @@ impl ReceivedObject {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v90 in self.bytes.iter() {
-			w.u8(*v90)?;
+		for v105 in self.bytes.iter() {
+			w.u8(*v105)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ReceivedObject> {
 		let kind = ReceivedKind::read(r)?;
 		let name = {
-			let v91 = r.string_lp()?;
-			(v91.len() <= 256).then_some(v91)?
+			let v106 = r.string_lp()?;
+			(v106.len() <= 256).then_some(v106)?
 		};
 		let object_type = {
-			let v92 = r.string_lp()?;
-			(v92.len() <= 64).then_some(v92)?
+			let v107 = r.string_lp()?;
+			(v107.len() <= 64).then_some(v107)?
 		};
 		let declared = if r.tag()? { Some(r.u64()?) } else { None };
 		let received = r.u64()?;
 		let bytes = {
-			let v93 = r.u16()? as usize;
-			let v93 = (v93 <= 1024).then_some(v93)?;
-			let mut v94 = Vec::new();
-			v94.try_reserve_exact(v93).ok()?;
-			for _ in 0..v93 {
-				v94.push(r.u8()?);
+			let v108 = r.u16()? as usize;
+			let v108 = (v108 <= 1024).then_some(v108)?;
+			let mut v109 = Vec::new();
+			v109.try_reserve_exact(v108).ok()?;
+			for _ in 0..v108 {
+				v109.push(r.u8()?);
 			}
-			v94
+			v109
 		};
 		Some(ReceivedObject { kind, name, object_type, declared, received, bytes })
 	}
@@ -4018,14 +4443,14 @@ pub mod object_push {
 		match op {
 			OP_WRITE => {
 				let data = {
-					let v95 = r.u16()? as usize;
-					let v95 = (v95 <= 1024).then_some(v95)?;
-					let mut v96 = Vec::new();
-					v96.try_reserve_exact(v95).ok()?;
-					for _ in 0..v95 {
-						v96.push(r.u8()?);
+					let v110 = r.u16()? as usize;
+					let v110 = (v110 <= 1024).then_some(v110)?;
+					let mut v111 = Vec::new();
+					v111.try_reserve_exact(v110).ok()?;
+					for _ in 0..v110 {
+						v111.push(r.u8()?);
 					}
-					v96
+					v111
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -4034,13 +4459,13 @@ pub mod object_push {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v97) => {
+						Ok(v112) => {
 							w.u8(1)?;
-							w.u64(*v97)?;
+							w.u64(*v112)?;
 						}
-						Err(v98) => {
+						Err(v113) => {
 							w.u8(0)?;
-							v98.write(w)?;
+							v113.write(w)?;
 						}
 					}
 					Some(())
@@ -4070,13 +4495,13 @@ pub mod object_push {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v99) => {
+						Ok(v114) => {
 							w.u8(1)?;
-							w.u64(*v99)?;
+							w.u64(*v114)?;
 						}
-						Err(v100) => {
+						Err(v115) => {
 							w.u8(0)?;
-							v100.write(w)?;
+							v115.write(w)?;
 						}
 					}
 					Some(())
@@ -4106,12 +4531,12 @@ pub mod object_push {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v101) => {
+						Ok(v116) => {
 							w.u8(1)?;
 						}
-						Err(v102) => {
+						Err(v117) => {
 							w.u8(0)?;
-							v102.write(w)?;
+							v117.write(w)?;
 						}
 					}
 					Some(())
@@ -4227,8 +4652,8 @@ pub mod object_push {
 				return None;
 			}
 			w.u16(data.len() as u16)?;
-			for v103 in data.iter() {
-				w.u8(*v103)?;
+			for v118 in data.iter() {
+				w.u8(*v118)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -4579,21 +5004,21 @@ impl GamepadFrame {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v104 in self.bytes.iter() {
-			w.u8(*v104)?;
+		for v119 in self.bytes.iter() {
+			w.u8(*v119)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<GamepadFrame> {
 		let bytes = {
-			let v105 = r.u16()? as usize;
-			let v105 = (v105 <= 160).then_some(v105)?;
-			let mut v106 = Vec::new();
-			v106.try_reserve_exact(v105).ok()?;
-			for _ in 0..v105 {
-				v106.push(r.u8()?);
+			let v120 = r.u16()? as usize;
+			let v120 = (v120 <= 160).then_some(v120)?;
+			let mut v121 = Vec::new();
+			v121.try_reserve_exact(v120).ok()?;
+			for _ in 0..v120 {
+				v121.push(r.u8()?);
 			}
-			v106
+			v121
 		};
 		Some(GamepadFrame { bytes })
 	}
@@ -4645,17 +5070,17 @@ impl InputReport {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			InputReport::Pointer(v107) => {
+			InputReport::Pointer(v122) => {
 				w.u8(0)?;
-				v107.write(w)?;
+				v122.write(w)?;
 			}
-			InputReport::Key(v108) => {
+			InputReport::Key(v123) => {
 				w.u8(1)?;
-				v108.write(w)?;
+				v123.write(w)?;
 			}
-			InputReport::Gamepad(v109) => {
+			InputReport::Gamepad(v124) => {
 				w.u8(2)?;
-				v109.write(w)?;
+				v124.write(w)?;
 			}
 		}
 		Some(())
@@ -4779,19 +5204,19 @@ pub mod bluetooth_profile {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v110) => {
+						Ok(v125) => {
 							w.u8(1)?;
-							if v110.len() > u16::MAX as usize {
+							if v125.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v110.len() as u16)?;
-							for v112 in v110.iter() {
-								v112.write(w)?;
+							w.u16(v125.len() as u16)?;
+							for v127 in v125.iter() {
+								v127.write(w)?;
 							}
 						}
-						Err(v111) => {
+						Err(v126) => {
 							w.u8(0)?;
-							v111.write(w)?;
+							v126.write(w)?;
 						}
 					}
 					Some(())
@@ -5020,13 +5445,13 @@ pub mod bluetooth_profile {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v113 = r.u16()? as usize;
-						let mut v114 = Vec::new();
-						v114.try_reserve_exact(v113).ok()?;
-						for _ in 0..v113 {
-							v114.push(EnabledPeer::read(r)?);
+						let v128 = r.u16()? as usize;
+						let mut v129 = Vec::new();
+						v129.try_reserve_exact(v128).ok()?;
+						for _ in 0..v128 {
+							v129.push(EnabledPeer::read(r)?);
 						}
-						v114
+						v129
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -5221,22 +5646,22 @@ impl GattValue {
 			return None;
 		}
 		w.u16(self.value.len() as u16)?;
-		for v115 in self.value.iter() {
-			w.u8(*v115)?;
+		for v130 in self.value.iter() {
+			w.u8(*v130)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<GattValue> {
 		let handle = r.u16()?;
 		let value = {
-			let v116 = r.u16()? as usize;
-			let v116 = (v116 <= 244).then_some(v116)?;
-			let mut v117 = Vec::new();
-			v117.try_reserve_exact(v116).ok()?;
-			for _ in 0..v116 {
-				v117.push(r.u8()?);
+			let v131 = r.u16()? as usize;
+			let v131 = (v131 <= 244).then_some(v131)?;
+			let mut v132 = Vec::new();
+			v132.try_reserve_exact(v131).ok()?;
+			for _ in 0..v131 {
+				v132.push(r.u8()?);
 			}
-			v117
+			v132
 		};
 		Some(GattValue { handle, value })
 	}
@@ -5298,19 +5723,19 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v118) => {
+						Ok(v133) => {
 							w.u8(1)?;
-							if v118.len() > u16::MAX as usize {
+							if v133.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v118.len() as u16)?;
-							for v120 in v118.iter() {
-								v120.write(w)?;
+							w.u16(v133.len() as u16)?;
+							for v135 in v133.iter() {
+								v135.write(w)?;
 							}
 						}
-						Err(v119) => {
+						Err(v134) => {
 							w.u8(0)?;
-							v119.write(w)?;
+							v134.write(w)?;
 						}
 					}
 					Some(())
@@ -5341,19 +5766,19 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v121) => {
+						Ok(v136) => {
 							w.u8(1)?;
-							if v121.len() > u16::MAX as usize {
+							if v136.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v121.len() as u16)?;
-							for v123 in v121.iter() {
-								v123.write(w)?;
+							w.u16(v136.len() as u16)?;
+							for v138 in v136.iter() {
+								v138.write(w)?;
 							}
 						}
-						Err(v122) => {
+						Err(v137) => {
 							w.u8(0)?;
-							v122.write(w)?;
+							v137.write(w)?;
 						}
 					}
 					Some(())
@@ -5384,19 +5809,19 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v124) => {
+						Ok(v139) => {
 							w.u8(1)?;
-							if v124.len() > u16::MAX as usize {
+							if v139.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v124.len() as u16)?;
-							for v126 in v124.iter() {
-								w.u8(*v126)?;
+							w.u16(v139.len() as u16)?;
+							for v141 in v139.iter() {
+								w.u8(*v141)?;
 							}
 						}
-						Err(v125) => {
+						Err(v140) => {
 							w.u8(0)?;
-							v125.write(w)?;
+							v140.write(w)?;
 						}
 					}
 					Some(())
@@ -5421,14 +5846,14 @@ pub mod bluetooth_gatt {
 			OP_WRITE => {
 				let handle = r.u16()?;
 				let value = {
-					let v127 = r.u16()? as usize;
-					let v127 = (v127 <= 244).then_some(v127)?;
-					let mut v128 = Vec::new();
-					v128.try_reserve_exact(v127).ok()?;
-					for _ in 0..v127 {
-						v128.push(r.u8()?);
+					let v142 = r.u16()? as usize;
+					let v142 = (v142 <= 244).then_some(v142)?;
+					let mut v143 = Vec::new();
+					v143.try_reserve_exact(v142).ok()?;
+					for _ in 0..v142 {
+						v143.push(r.u8()?);
 					}
-					v128
+					v143
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -5437,12 +5862,12 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v129) => {
+						Ok(v144) => {
 							w.u8(1)?;
 						}
-						Err(v130) => {
+						Err(v145) => {
 							w.u8(0)?;
-							v130.write(w)?;
+							v145.write(w)?;
 						}
 					}
 					Some(())
@@ -5626,13 +6051,13 @@ pub mod bluetooth_gatt {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v131 = r.u16()? as usize;
-						let mut v132 = Vec::new();
-						v132.try_reserve_exact(v131).ok()?;
-						for _ in 0..v131 {
-							v132.push(GattService::read(r)?);
+						let v146 = r.u16()? as usize;
+						let mut v147 = Vec::new();
+						v147.try_reserve_exact(v146).ok()?;
+						for _ in 0..v146 {
+							v147.push(GattService::read(r)?);
 						}
-						v132
+						v147
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -5671,13 +6096,13 @@ pub mod bluetooth_gatt {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v133 = r.u16()? as usize;
-						let mut v134 = Vec::new();
-						v134.try_reserve_exact(v133).ok()?;
-						for _ in 0..v133 {
-							v134.push(GattCharacteristic::read(r)?);
+						let v148 = r.u16()? as usize;
+						let mut v149 = Vec::new();
+						v149.try_reserve_exact(v148).ok()?;
+						for _ in 0..v148 {
+							v149.push(GattCharacteristic::read(r)?);
 						}
-						v134
+						v149
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -5716,13 +6141,13 @@ pub mod bluetooth_gatt {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v135 = r.u16()? as usize;
-						let mut v136 = Vec::new();
-						v136.try_reserve_exact(v135).ok()?;
-						for _ in 0..v135 {
-							v136.push(r.u8()?);
+						let v150 = r.u16()? as usize;
+						let mut v151 = Vec::new();
+						v151.try_reserve_exact(v150).ok()?;
+						for _ in 0..v150 {
+							v151.push(r.u8()?);
 						}
-						v136
+						v151
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -5747,8 +6172,8 @@ pub mod bluetooth_gatt {
 				return None;
 			}
 			w.u16(value.len() as u16)?;
-			for v137 in value.iter() {
-				w.u8(*v137)?;
+			for v152 in value.iter() {
+				w.u8(*v152)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -5908,21 +6333,21 @@ impl SerialBytes {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v138 in self.bytes.iter() {
-			w.u8(*v138)?;
+		for v153 in self.bytes.iter() {
+			w.u8(*v153)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<SerialBytes> {
 		let bytes = {
-			let v139 = r.u16()? as usize;
-			let v139 = (v139 <= 1024).then_some(v139)?;
-			let mut v140 = Vec::new();
-			v140.try_reserve_exact(v139).ok()?;
-			for _ in 0..v139 {
-				v140.push(r.u8()?);
+			let v154 = r.u16()? as usize;
+			let v154 = (v154 <= 1024).then_some(v154)?;
+			let mut v155 = Vec::new();
+			v155.try_reserve_exact(v154).ok()?;
+			for _ in 0..v154 {
+				v155.push(r.u8()?);
 			}
-			v140
+			v155
 		};
 		Some(SerialBytes { bytes })
 	}
@@ -5987,12 +6412,12 @@ pub mod bluetooth_serial {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v141) => {
+						Ok(v156) => {
 							w.u8(1)?;
 						}
-						Err(v142) => {
+						Err(v157) => {
 							w.u8(0)?;
-							v142.write(w)?;
+							v157.write(w)?;
 						}
 					}
 					Some(())
@@ -6016,14 +6441,14 @@ pub mod bluetooth_serial {
 			}
 			OP_WRITE => {
 				let data = {
-					let v143 = r.u16()? as usize;
-					let v143 = (v143 <= 1024).then_some(v143)?;
-					let mut v144 = Vec::new();
-					v144.try_reserve_exact(v143).ok()?;
-					for _ in 0..v143 {
-						v144.push(r.u8()?);
+					let v158 = r.u16()? as usize;
+					let v158 = (v158 <= 1024).then_some(v158)?;
+					let mut v159 = Vec::new();
+					v159.try_reserve_exact(v158).ok()?;
+					for _ in 0..v158 {
+						v159.push(r.u8()?);
 					}
-					v144
+					v159
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -6032,13 +6457,13 @@ pub mod bluetooth_serial {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v145) => {
+						Ok(v160) => {
 							w.u8(1)?;
-							w.u32(*v145)?;
+							w.u32(*v160)?;
 						}
-						Err(v146) => {
+						Err(v161) => {
 							w.u8(0)?;
-							v146.write(w)?;
+							v161.write(w)?;
 						}
 					}
 					Some(())
@@ -6068,12 +6493,12 @@ pub mod bluetooth_serial {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v147) => {
+						Ok(v162) => {
 							w.u8(1)?;
 						}
-						Err(v148) => {
+						Err(v163) => {
 							w.u8(0)?;
-							v148.write(w)?;
+							v163.write(w)?;
 						}
 					}
 					Some(())
@@ -6274,8 +6699,8 @@ pub mod bluetooth_serial {
 				return None;
 			}
 			w.u16(data.len() as u16)?;
-			for v149 in data.iter() {
-				w.u8(*v149)?;
+			for v164 in data.iter() {
+				w.u8(*v164)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -6453,18 +6878,18 @@ pub mod bluetooth_admin {
 		match op {
 			OP_MINT_GATT => {
 				let alias = {
-					let v150 = r.string_lp()?;
-					(v150.len() <= 32).then_some(v150)?
+					let v165 = r.string_lp()?;
+					(v165.len() <= 32).then_some(v165)?
 				};
 				let services = {
-					let v151 = r.u16()? as usize;
-					let v151 = (v151 <= 8).then_some(v151)?;
-					let mut v152 = Vec::new();
-					v152.try_reserve_exact(v151).ok()?;
-					for _ in 0..v151 {
-						v152.push(ServiceClass::read(r)?);
+					let v166 = r.u16()? as usize;
+					let v166 = (v166 <= 8).then_some(v166)?;
+					let mut v167 = Vec::new();
+					v167.try_reserve_exact(v166).ok()?;
+					for _ in 0..v166 {
+						v167.push(ServiceClass::read(r)?);
 					}
-					v152
+					v167
 				};
 				let owner = {
 					let _ = r.u32()?;
@@ -6477,14 +6902,14 @@ pub mod bluetooth_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v153) => {
+						Ok(v168) => {
 							w.u8(1)?;
-							w.set_handle(*v153)?;
+							w.set_handle(*v168)?;
 							w.u32(0)?;
 						}
-						Err(v154) => {
+						Err(v169) => {
 							w.u8(0)?;
-							v154.write(w)?;
+							v169.write(w)?;
 						}
 					}
 					Some(())
@@ -6508,8 +6933,8 @@ pub mod bluetooth_admin {
 			}
 			OP_MINT_SERIAL => {
 				let alias = {
-					let v155 = r.string_lp()?;
-					(v155.len() <= 32).then_some(v155)?
+					let v170 = r.string_lp()?;
+					(v170.len() <= 32).then_some(v170)?
 				};
 				let owner = {
 					let _ = r.u32()?;
@@ -6522,14 +6947,14 @@ pub mod bluetooth_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v156) => {
+						Ok(v171) => {
 							w.u8(1)?;
-							w.set_handle(*v156)?;
+							w.set_handle(*v171)?;
 							w.u32(0)?;
 						}
-						Err(v157) => {
+						Err(v172) => {
 							w.u8(0)?;
-							v157.write(w)?;
+							v172.write(w)?;
 						}
 					}
 					Some(())
@@ -6646,8 +7071,8 @@ pub mod bluetooth_admin {
 				return None;
 			}
 			w.u16(services.len() as u16)?;
-			for v158 in services.iter() {
-				v158.write(w)?;
+			for v173 in services.iter() {
+				v173.write(w)?;
 			}
 			w.set_handle(*owner)?;
 			w.u32(0)?;
@@ -6827,8 +7252,8 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.key.len() as u16)?;
-		for v159 in self.key.iter() {
-			w.u8(*v159)?;
+		for v174 in self.key.iter() {
+			w.u8(*v174)?;
 		}
 		self.security.write(w)?;
 		w.bytes_lp(self.name.as_bytes())?;
@@ -6838,8 +7263,8 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.link_key.len() as u16)?;
-		for v160 in self.link_key.iter() {
-			w.u8(*v160)?;
+		for v175 in self.link_key.iter() {
+			w.u8(*v175)?;
 		}
 		w.u8(self.link_key_type)?;
 		self.level.write(w)?;
@@ -6847,24 +7272,24 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.trusted.len() as u16)?;
-		for v161 in self.trusted.iter() {
-			v161.write(w)?;
+		for v176 in self.trusted.iter() {
+			v176.write(w)?;
 		}
 		w.bytes_lp(self.alias.as_bytes())?;
 		if self.irk.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.irk.len() as u16)?;
-		for v162 in self.irk.iter() {
-			w.u8(*v162)?;
+		for v177 in self.irk.iter() {
+			w.u8(*v177)?;
 		}
 		w.u16(self.ediv)?;
 		if self.rand.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.rand.len() as u16)?;
-		for v163 in self.rand.iter() {
-			w.u8(*v163)?;
+		for v178 in self.rand.iter() {
+			w.u8(*v178)?;
 		}
 		Some(())
 	}
@@ -6873,68 +7298,68 @@ impl BondRecord {
 		let local = PeerAddress::read(r)?;
 		let peer = PeerAddress::read(r)?;
 		let key = {
-			let v164 = r.u16()? as usize;
-			let v164 = (v164 <= 16).then_some(v164)?;
-			let mut v165 = Vec::new();
-			v165.try_reserve_exact(v164).ok()?;
-			for _ in 0..v164 {
-				v165.push(r.u8()?);
+			let v179 = r.u16()? as usize;
+			let v179 = (v179 <= 16).then_some(v179)?;
+			let mut v180 = Vec::new();
+			v180.try_reserve_exact(v179).ok()?;
+			for _ in 0..v179 {
+				v180.push(r.u8()?);
 			}
-			v165
+			v180
 		};
 		let security = SecurityLevel::read(r)?;
 		let name = {
-			let v166 = r.string_lp()?;
-			(v166.len() <= 48).then_some(v166)?
+			let v181 = r.string_lp()?;
+			(v181.len() <= 48).then_some(v181)?
 		};
 		let enabled = r.boolean()?;
 		let radio = Radio::read(r)?;
 		let link_key = {
-			let v167 = r.u16()? as usize;
-			let v167 = (v167 <= 16).then_some(v167)?;
-			let mut v168 = Vec::new();
-			v168.try_reserve_exact(v167).ok()?;
-			for _ in 0..v167 {
-				v168.push(r.u8()?);
+			let v182 = r.u16()? as usize;
+			let v182 = (v182 <= 16).then_some(v182)?;
+			let mut v183 = Vec::new();
+			v183.try_reserve_exact(v182).ok()?;
+			for _ in 0..v182 {
+				v183.push(r.u8()?);
 			}
-			v168
+			v183
 		};
 		let link_key_type = r.u8()?;
 		let level = BondLevel::read(r)?;
 		let trusted = {
-			let v169 = r.u16()? as usize;
-			let v169 = (v169 <= 8).then_some(v169)?;
-			let mut v170 = Vec::new();
-			v170.try_reserve_exact(v169).ok()?;
-			for _ in 0..v169 {
-				v170.push(Profile::read(r)?);
+			let v184 = r.u16()? as usize;
+			let v184 = (v184 <= 8).then_some(v184)?;
+			let mut v185 = Vec::new();
+			v185.try_reserve_exact(v184).ok()?;
+			for _ in 0..v184 {
+				v185.push(Profile::read(r)?);
 			}
-			v170
+			v185
 		};
 		let alias = {
-			let v171 = r.string_lp()?;
-			(v171.len() <= 48).then_some(v171)?
+			let v186 = r.string_lp()?;
+			(v186.len() <= 48).then_some(v186)?
 		};
 		let irk = {
-			let v172 = r.u16()? as usize;
-			let v172 = (v172 <= 16).then_some(v172)?;
-			let mut v173 = Vec::new();
-			v173.try_reserve_exact(v172).ok()?;
-			for _ in 0..v172 {
-				v173.push(r.u8()?);
+			let v187 = r.u16()? as usize;
+			let v187 = (v187 <= 16).then_some(v187)?;
+			let mut v188 = Vec::new();
+			v188.try_reserve_exact(v187).ok()?;
+			for _ in 0..v187 {
+				v188.push(r.u8()?);
 			}
-			v173
+			v188
 		};
 		let ediv = r.u16()?;
 		let rand = {
-			let v174 = r.u16()? as usize;
-			let v174 = (v174 <= 8).then_some(v174)?;
-			let mut v175 = Vec::new();
-			v175.try_reserve_exact(v174).ok()?;
-			for _ in 0..v174 {
-				v175.push(r.u8()?);
+			let v189 = r.u16()? as usize;
+			let v189 = (v189 <= 8).then_some(v189)?;
+			let mut v190 = Vec::new();
+			v190.try_reserve_exact(v189).ok()?;
+			for _ in 0..v189 {
+				v190.push(r.u8()?);
 			}
-			v175
+			v190
 		};
 		Some(BondRecord { version, local, peer, key, security, name, enabled, radio, link_key, link_key_type, level, trusted, alias, irk, ediv, rand })
 	}
@@ -6999,13 +7424,13 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v176) => {
+						Ok(v191) => {
 							w.u8(1)?;
-							v176.write(w)?;
+							v191.write(w)?;
 						}
-						Err(v177) => {
+						Err(v192) => {
 							w.u8(0)?;
-							v177.write(w)?;
+							v192.write(w)?;
 						}
 					}
 					Some(())
@@ -7036,12 +7461,12 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v178) => {
+						Ok(v193) => {
 							w.u8(1)?;
 						}
-						Err(v179) => {
+						Err(v194) => {
 							w.u8(0)?;
-							v179.write(w)?;
+							v194.write(w)?;
 						}
 					}
 					Some(())
@@ -7073,12 +7498,12 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v180) => {
+						Ok(v195) => {
 							w.u8(1)?;
 						}
-						Err(v181) => {
+						Err(v196) => {
 							w.u8(0)?;
-							v181.write(w)?;
+							v196.write(w)?;
 						}
 					}
 					Some(())
@@ -7109,19 +7534,19 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v182) => {
+						Ok(v197) => {
 							w.u8(1)?;
-							if v182.len() > u16::MAX as usize {
+							if v197.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v182.len() as u16)?;
-							for v184 in v182.iter() {
-								v184.write(w)?;
+							w.u16(v197.len() as u16)?;
+							for v199 in v197.iter() {
+								v199.write(w)?;
 							}
 						}
-						Err(v183) => {
+						Err(v198) => {
 							w.u8(0)?;
-							v183.write(w)?;
+							v198.write(w)?;
 						}
 					}
 					Some(())
@@ -7353,13 +7778,13 @@ pub mod bluetooth_bond_store {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v185 = r.u16()? as usize;
-						let mut v186 = Vec::new();
-						v186.try_reserve_exact(v185).ok()?;
-						for _ in 0..v185 {
-							v186.push(BondRecord::read(r)?);
+						let v200 = r.u16()? as usize;
+						let mut v201 = Vec::new();
+						v201.try_reserve_exact(v200).ok()?;
+						for _ in 0..v200 {
+							v201.push(BondRecord::read(r)?);
 						}
-						v186
+						v201
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -7463,6 +7888,19 @@ pub enum FixtureAction {
 	/// The phone pushes this host an object of `argument` bytes over Object Push, five seconds from now - paging this
 	/// host first where it has no link.
 	PushObject = 24,
+	/// The broadcast source begins its LE Audio broadcast - `argument` 1 in the clear, 2 encrypted with the fixture's
+	/// Broadcast Code - or, with 0, ends it.
+	Broadcast = 25,
+	/// An earbud changes its own volume setting to `argument` (0 to 255), and notifies a client that asked.
+	LeVolume = 26,
+	/// An earbud writes this host's Call Control Point: opcode `argument` (0 accept, 1 terminate) on call index 1;
+	/// what this host notified back is reported.
+	LeCall = 27,
+	/// THE CONTROLLER ITSELF (peer 0): its LE features from its next HCI Reset - `argument` 1 an LE Audio controller with
+	/// extended advertising, periodic advertising sync, the CIS central role and the synchronized receiver, which
+	/// refuses the legacy scan and connection commands once an extended one is used; 0 the controller it starts as,
+	/// with none of them.
+	LeFeatures = 28,
 }
 
 impl FixtureAction {
@@ -7529,6 +7967,10 @@ impl FixtureAction {
 			22 => Some(FixtureAction::HangUp),
 			23 => Some(FixtureAction::AudioRequest),
 			24 => Some(FixtureAction::PushObject),
+			25 => Some(FixtureAction::Broadcast),
+			26 => Some(FixtureAction::LeVolume),
+			27 => Some(FixtureAction::LeCall),
+			28 => Some(FixtureAction::LeFeatures),
 			_ => None,
 		}
 	}
@@ -7590,13 +8032,13 @@ pub mod bluetooth_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v187) => {
+						Ok(v202) => {
 							w.u8(1)?;
-							w.u32(*v187)?;
+							w.u32(*v202)?;
 						}
-						Err(v188) => {
+						Err(v203) => {
 							w.u8(0)?;
-							v188.write(w)?;
+							v203.write(w)?;
 						}
 					}
 					Some(())
@@ -7626,19 +8068,19 @@ pub mod bluetooth_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v189) => {
+						Ok(v204) => {
 							w.u8(1)?;
-							if v189.len() > u16::MAX as usize {
+							if v204.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v189.len() as u16)?;
-							for v191 in v189.iter() {
-								w.bytes_lp(v191.as_bytes())?;
+							w.u16(v204.len() as u16)?;
+							for v206 in v204.iter() {
+								w.bytes_lp(v206.as_bytes())?;
 							}
 						}
-						Err(v190) => {
+						Err(v205) => {
 							w.u8(0)?;
-							v190.write(w)?;
+							v205.write(w)?;
 						}
 					}
 					Some(())
@@ -7663,8 +8105,8 @@ pub mod bluetooth_fixture {
 			OP_TYPE_TEXT => {
 				let peer = r.u8()?;
 				let text = {
-					let v192 = r.string_lp()?;
-					(v192.len() <= 64).then_some(v192)?
+					let v207 = r.string_lp()?;
+					(v207.len() <= 64).then_some(v207)?
 				};
 				let delay_ms = r.u32()?;
 				r.finish()?;
@@ -7674,12 +8116,12 @@ pub mod bluetooth_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v193) => {
+						Ok(v208) => {
 							w.u8(1)?;
 						}
-						Err(v194) => {
+						Err(v209) => {
 							w.u8(0)?;
-							v194.write(w)?;
+							v209.write(w)?;
 						}
 					}
 					Some(())
@@ -7844,13 +8286,13 @@ pub mod bluetooth_fixture {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v195 = r.u16()? as usize;
-						let mut v196 = Vec::new();
-						v196.try_reserve_exact(v195).ok()?;
-						for _ in 0..v195 {
-							v196.push(r.string_lp()?);
+						let v210 = r.u16()? as usize;
+						let mut v211 = Vec::new();
+						v211.try_reserve_exact(v210).ok()?;
+						for _ in 0..v210 {
+							v211.push(r.string_lp()?);
 						}
-						v196
+						v211
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -8058,8 +8500,8 @@ impl AudioEndpoint {
 		let id = r.u32()?;
 		let peer = PeerAddress::read(r)?;
 		let name = {
-			let v197 = r.string_lp()?;
-			(v197.len() <= 48).then_some(v197)?
+			let v212 = r.string_lp()?;
+			(v212.len() <= 48).then_some(v212)?
 		};
 		let kind = AudioEndpointKind::read(r)?;
 		let rate = r.u32()?;
@@ -8295,21 +8737,21 @@ impl AudioEvent {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			AudioEvent::Arrived(v198) => {
+			AudioEvent::Arrived(v213) => {
 				w.u8(0)?;
-				v198.write(w)?;
+				v213.write(w)?;
 			}
-			AudioEvent::Departed(v199) => {
+			AudioEvent::Departed(v214) => {
 				w.u8(1)?;
-				w.u32(*v199)?;
+				w.u32(*v214)?;
 			}
-			AudioEvent::Volume(v200) => {
+			AudioEvent::Volume(v215) => {
 				w.u8(2)?;
-				v200.write(w)?;
+				v215.write(w)?;
 			}
-			AudioEvent::Command(v201) => {
+			AudioEvent::Command(v216) => {
 				w.u8(3)?;
-				v201.write(w)?;
+				v216.write(w)?;
 			}
 		}
 		Some(())
@@ -8379,14 +8821,14 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v202) => {
+						Ok(v217) => {
 							w.u8(1)?;
-							w.set_handle(*v202)?;
+							w.set_handle(*v217)?;
 							w.u32(0)?;
 						}
-						Err(v203) => {
+						Err(v218) => {
 							w.u8(0)?;
-							v203.write(w)?;
+							v218.write(w)?;
 						}
 					}
 					Some(())
@@ -8418,12 +8860,12 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v204) => {
+						Ok(v219) => {
 							w.u8(1)?;
 						}
-						Err(v205) => {
+						Err(v220) => {
 							w.u8(0)?;
-							v205.write(w)?;
+							v220.write(w)?;
 						}
 					}
 					Some(())
@@ -8454,12 +8896,12 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v206) => {
+						Ok(v221) => {
 							w.u8(1)?;
 						}
-						Err(v207) => {
+						Err(v222) => {
 							w.u8(0)?;
-							v207.write(w)?;
+							v222.write(w)?;
 						}
 					}
 					Some(())
@@ -8858,8 +9300,8 @@ impl NetworkLink {
 		let id = r.u32()?;
 		let peer = PeerAddress::read(r)?;
 		let name = {
-			let v208 = r.string_lp()?;
-			(v208.len() <= 64).then_some(v208)?
+			let v223 = r.string_lp()?;
+			(v223.len() <= 64).then_some(v223)?
 		};
 		let replace_uplink = r.boolean()?;
 		Some(NetworkLink { id, peer, name, replace_uplink })
@@ -8912,13 +9354,13 @@ impl NetworkEvent {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			NetworkEvent::Arrived(v209) => {
+			NetworkEvent::Arrived(v224) => {
 				w.u8(0)?;
-				v209.write(w)?;
+				v224.write(w)?;
 			}
-			NetworkEvent::Departed(v210) => {
+			NetworkEvent::Departed(v225) => {
 				w.u8(1)?;
-				w.u32(*v210)?;
+				w.u32(*v225)?;
 			}
 		}
 		Some(())
@@ -8982,14 +9424,14 @@ pub mod bluetooth_network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v211) => {
+						Ok(v226) => {
 							w.u8(1)?;
-							w.set_handle(*v211)?;
+							w.set_handle(*v226)?;
 							w.u32(0)?;
 						}
-						Err(v212) => {
+						Err(v227) => {
 							w.u8(0)?;
-							v212.write(w)?;
+							v227.write(w)?;
 						}
 					}
 					Some(())
@@ -9350,13 +9792,13 @@ impl PeerAddress {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v214 = true;
-		for v213 in self.bytes.iter() {
-			if !v214 {
+		let mut v229 = true;
+		for v228 in self.bytes.iter() {
+			if !v229 {
 				out.push(',');
 			}
-			v214 = false;
-			let _ = write!(out, "{}", v213);
+			v229 = false;
+			let _ = write!(out, "{}", v228);
 		}
 		out.push(']');
 		out.push('}');
@@ -9368,13 +9810,13 @@ impl PeerAddress {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v216 = true;
-		for v215 in self.bytes.iter() {
-			if !v216 {
+		let mut v231 = true;
+		for v230 in self.bytes.iter() {
+			if !v231 {
 				out.push_str(", ");
 			}
-			v216 = false;
-			let _ = write!(out, "{}", v215);
+			v231 = false;
+			let _ = write!(out, "{}", v230);
 		}
 		out.push(']');
 		out.push('}');
@@ -9385,8 +9827,8 @@ impl PeerAddress {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v217 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v217 as u64);
+		for v232 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v232 as u64);
 		}
 	}
 }
@@ -9607,13 +10049,13 @@ impl ScanResult {
 		out.push(',');
 		out.push_str("\"services\":");
 		out.push('[');
-		let mut v219 = true;
-		for v218 in self.services.iter() {
-			if !v219 {
+		let mut v234 = true;
+		for v233 in self.services.iter() {
+			if !v234 {
 				out.push(',');
 			}
-			v219 = false;
-			v218.to_json_into(out);
+			v234 = false;
+			v233.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -9644,13 +10086,13 @@ impl ScanResult {
 		out.push_str(", ");
 		out.push_str("services=");
 		out.push('[');
-		let mut v221 = true;
-		for v220 in self.services.iter() {
-			if !v221 {
+		let mut v236 = true;
+		for v235 in self.services.iter() {
+			if !v236 {
 				out.push_str(", ");
 			}
-			v221 = false;
-			v220.to_text_into(out);
+			v236 = false;
+			v235.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -9671,8 +10113,8 @@ impl ScanResult {
 		crate::codec::cbor::uint(out, self.class_of_device as u64);
 		crate::codec::cbor::text(out, "services");
 		crate::codec::cbor::array(out, self.services.len());
-		for v222 in self.services.iter() {
-			v222.to_cbor_into(out);
+		for v237 in self.services.iter() {
+			v237.to_cbor_into(out);
 		}
 	}
 }
@@ -10066,21 +10508,21 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => out.push_str("\"yes\""),
 			PromptReply::No => out.push_str("\"no\""),
-			PromptReply::Passkey(v223) => {
+			PromptReply::Passkey(v238) => {
 				out.push_str("{\"passkey\":");
-				let _ = write!(out, "{}", v223);
+				let _ = write!(out, "{}", v238);
 				out.push('}');
 			}
-			PromptReply::Pin(v224) => {
+			PromptReply::Pin(v239) => {
 				out.push_str("{\"pin\":");
 				out.push('[');
-				let mut v226 = true;
-				for v225 in v224.iter() {
-					if !v226 {
+				let mut v241 = true;
+				for v240 in v239.iter() {
+					if !v241 {
 						out.push(',');
 					}
-					v226 = false;
-					let _ = write!(out, "{}", v225);
+					v241 = false;
+					let _ = write!(out, "{}", v240);
 				}
 				out.push(']');
 				out.push('}');
@@ -10091,21 +10533,21 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => out.push_str("yes"),
 			PromptReply::No => out.push_str("no"),
-			PromptReply::Passkey(v227) => {
+			PromptReply::Passkey(v242) => {
 				out.push_str("passkey(");
-				let _ = write!(out, "{}", v227);
+				let _ = write!(out, "{}", v242);
 				out.push(')');
 			}
-			PromptReply::Pin(v228) => {
+			PromptReply::Pin(v243) => {
 				out.push_str("pin(");
 				out.push('[');
-				let mut v230 = true;
-				for v229 in v228.iter() {
-					if !v230 {
+				let mut v245 = true;
+				for v244 in v243.iter() {
+					if !v245 {
 						out.push_str(", ");
 					}
-					v230 = false;
-					let _ = write!(out, "{}", v229);
+					v245 = false;
+					let _ = write!(out, "{}", v244);
 				}
 				out.push(']');
 				out.push(')');
@@ -10116,17 +10558,17 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => crate::codec::cbor::text(out, "yes"),
 			PromptReply::No => crate::codec::cbor::text(out, "no"),
-			PromptReply::Passkey(v231) => {
+			PromptReply::Passkey(v246) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "passkey");
-				crate::codec::cbor::uint(out, *v231 as u64);
+				crate::codec::cbor::uint(out, *v246 as u64);
 			}
-			PromptReply::Pin(v232) => {
+			PromptReply::Pin(v247) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "pin");
-				crate::codec::cbor::array(out, v232.len());
-				for v233 in v232.iter() {
-					crate::codec::cbor::uint(out, *v233 as u64);
+				crate::codec::cbor::array(out, v247.len());
+				for v248 in v247.iter() {
+					crate::codec::cbor::uint(out, *v248 as u64);
 				}
 			}
 		}
@@ -10179,8 +10621,8 @@ impl DeviceStatus {
 		out.push(',');
 		out.push_str("\"level\":");
 		match &self.level {
-			Some(v234) => {
-				v234.to_json_into(out);
+			Some(v249) => {
+				v249.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -10189,32 +10631,32 @@ impl DeviceStatus {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v236 = true;
-		for v235 in self.trusted.iter() {
-			if !v236 {
+		let mut v251 = true;
+		for v250 in self.trusted.iter() {
+			if !v251 {
 				out.push(',');
 			}
-			v236 = false;
-			v235.to_json_into(out);
+			v251 = false;
+			v250.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"connected-profiles\":");
 		out.push('[');
-		let mut v238 = true;
-		for v237 in self.connected_profiles.iter() {
-			if !v238 {
+		let mut v253 = true;
+		for v252 in self.connected_profiles.iter() {
+			if !v253 {
 				out.push(',');
 			}
-			v238 = false;
-			v237.to_json_into(out);
+			v253 = false;
+			v252.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"battery\":");
 		match &self.battery {
-			Some(v239) => {
-				let _ = write!(out, "{}", v239);
+			Some(v254) => {
+				let _ = write!(out, "{}", v254);
 			}
 			None => {
 				out.push_str("null");
@@ -10252,8 +10694,8 @@ impl DeviceStatus {
 		out.push_str(", ");
 		out.push_str("level=");
 		match &self.level {
-			Some(v240) => {
-				v240.to_text_into(out);
+			Some(v255) => {
+				v255.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -10262,32 +10704,32 @@ impl DeviceStatus {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v242 = true;
-		for v241 in self.trusted.iter() {
-			if !v242 {
+		let mut v257 = true;
+		for v256 in self.trusted.iter() {
+			if !v257 {
 				out.push_str(", ");
 			}
-			v242 = false;
-			v241.to_text_into(out);
+			v257 = false;
+			v256.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("connected-profiles=");
 		out.push('[');
-		let mut v244 = true;
-		for v243 in self.connected_profiles.iter() {
-			if !v244 {
+		let mut v259 = true;
+		for v258 in self.connected_profiles.iter() {
+			if !v259 {
 				out.push_str(", ");
 			}
-			v244 = false;
-			v243.to_text_into(out);
+			v259 = false;
+			v258.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("battery=");
 		match &self.battery {
-			Some(v245) => {
-				let _ = write!(out, "{}", v245);
+			Some(v260) => {
+				let _ = write!(out, "{}", v260);
 			}
 			None => {
 				out.push('-');
@@ -10311,8 +10753,8 @@ impl DeviceStatus {
 		crate::codec::cbor::boolean(out, self.connected);
 		crate::codec::cbor::text(out, "level");
 		match &self.level {
-			Some(v246) => {
-				v246.to_cbor_into(out);
+			Some(v261) => {
+				v261.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -10320,18 +10762,18 @@ impl DeviceStatus {
 		}
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v247 in self.trusted.iter() {
-			v247.to_cbor_into(out);
+		for v262 in self.trusted.iter() {
+			v262.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "connected-profiles");
 		crate::codec::cbor::array(out, self.connected_profiles.len());
-		for v248 in self.connected_profiles.iter() {
-			v248.to_cbor_into(out);
+		for v263 in self.connected_profiles.iter() {
+			v263.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "battery");
 		match &self.battery {
-			Some(v249) => {
-				crate::codec::cbor::uint(out, *v249 as u64);
+			Some(v264) => {
+				crate::codec::cbor::uint(out, *v264 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -10433,13 +10875,13 @@ impl BondedPeer {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v251 = true;
-		for v250 in self.trusted.iter() {
-			if !v251 {
+		let mut v266 = true;
+		for v265 in self.trusted.iter() {
+			if !v266 {
 				out.push(',');
 			}
-			v251 = false;
-			v250.to_json_into(out);
+			v266 = false;
+			v265.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -10473,13 +10915,13 @@ impl BondedPeer {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v253 = true;
-		for v252 in self.trusted.iter() {
-			if !v253 {
+		let mut v268 = true;
+		for v267 in self.trusted.iter() {
+			if !v268 {
 				out.push_str(", ");
 			}
-			v253 = false;
-			v252.to_text_into(out);
+			v268 = false;
+			v267.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -10503,8 +10945,8 @@ impl BondedPeer {
 		self.level.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v254 in self.trusted.iter() {
-			v254.to_cbor_into(out);
+		for v269 in self.trusted.iter() {
+			v269.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alias");
 		crate::codec::cbor::text(out, &self.alias);
@@ -10543,6 +10985,65 @@ impl ScanHandle {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "id");
 		crate::codec::cbor::uint(out, self.id as u64);
+	}
+}
+
+impl BroadcastSource {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"broadcast-id\":");
+		let _ = write!(out, "{}", self.broadcast_id);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"address\":");
+		self.address.to_json_into(out);
+		out.push(',');
+		out.push_str("\"sid\":");
+		let _ = write!(out, "{}", self.sid);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("broadcast-id=");
+		let _ = write!(out, "{}", self.broadcast_id);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("address=");
+		self.address.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("sid=");
+		let _ = write!(out, "{}", self.sid);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "broadcast-id");
+		crate::codec::cbor::uint(out, self.broadcast_id as u64);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "address");
+		self.address.to_cbor_into(out);
+		crate::codec::cbor::text(out, "sid");
+		crate::codec::cbor::uint(out, self.sid as u64);
 	}
 }
 
@@ -10620,8 +11121,8 @@ impl ReceivedObject {
 		out.push(',');
 		out.push_str("\"declared\":");
 		match &self.declared {
-			Some(v255) => {
-				let _ = write!(out, "{}", v255);
+			Some(v270) => {
+				let _ = write!(out, "{}", v270);
 			}
 			None => {
 				out.push_str("null");
@@ -10633,13 +11134,13 @@ impl ReceivedObject {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v257 = true;
-		for v256 in self.bytes.iter() {
-			if !v257 {
+		let mut v272 = true;
+		for v271 in self.bytes.iter() {
+			if !v272 {
 				out.push(',');
 			}
-			v257 = false;
-			let _ = write!(out, "{}", v256);
+			v272 = false;
+			let _ = write!(out, "{}", v271);
 		}
 		out.push(']');
 		out.push('}');
@@ -10657,8 +11158,8 @@ impl ReceivedObject {
 		out.push_str(", ");
 		out.push_str("declared=");
 		match &self.declared {
-			Some(v258) => {
-				let _ = write!(out, "{}", v258);
+			Some(v273) => {
+				let _ = write!(out, "{}", v273);
 			}
 			None => {
 				out.push('-');
@@ -10670,13 +11171,13 @@ impl ReceivedObject {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v260 = true;
-		for v259 in self.bytes.iter() {
-			if !v260 {
+		let mut v275 = true;
+		for v274 in self.bytes.iter() {
+			if !v275 {
 				out.push_str(", ");
 			}
-			v260 = false;
-			let _ = write!(out, "{}", v259);
+			v275 = false;
+			let _ = write!(out, "{}", v274);
 		}
 		out.push(']');
 		out.push('}');
@@ -10691,8 +11192,8 @@ impl ReceivedObject {
 		crate::codec::cbor::text(out, &self.object_type);
 		crate::codec::cbor::text(out, "declared");
 		match &self.declared {
-			Some(v261) => {
-				crate::codec::cbor::uint(out, *v261 as u64);
+			Some(v276) => {
+				crate::codec::cbor::uint(out, *v276 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -10702,8 +11203,8 @@ impl ReceivedObject {
 		crate::codec::cbor::uint(out, self.received as u64);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v262 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v262 as u64);
+		for v277 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v277 as u64);
 		}
 	}
 }
@@ -10888,13 +11389,13 @@ impl GamepadFrame {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v264 = true;
-		for v263 in self.bytes.iter() {
-			if !v264 {
+		let mut v279 = true;
+		for v278 in self.bytes.iter() {
+			if !v279 {
 				out.push(',');
 			}
-			v264 = false;
-			let _ = write!(out, "{}", v263);
+			v279 = false;
+			let _ = write!(out, "{}", v278);
 		}
 		out.push(']');
 		out.push('}');
@@ -10903,13 +11404,13 @@ impl GamepadFrame {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v266 = true;
-		for v265 in self.bytes.iter() {
-			if !v266 {
+		let mut v281 = true;
+		for v280 in self.bytes.iter() {
+			if !v281 {
 				out.push_str(", ");
 			}
-			v266 = false;
-			let _ = write!(out, "{}", v265);
+			v281 = false;
+			let _ = write!(out, "{}", v280);
 		}
 		out.push(']');
 		out.push('}');
@@ -10918,8 +11419,8 @@ impl GamepadFrame {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v267 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v267 as u64);
+		for v282 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v282 as u64);
 		}
 	}
 }
@@ -10942,58 +11443,58 @@ impl InputReport {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			InputReport::Pointer(v268) => {
+			InputReport::Pointer(v283) => {
 				out.push_str("{\"pointer\":");
-				v268.to_json_into(out);
+				v283.to_json_into(out);
 				out.push('}');
 			}
-			InputReport::Key(v269) => {
+			InputReport::Key(v284) => {
 				out.push_str("{\"key\":");
-				v269.to_json_into(out);
+				v284.to_json_into(out);
 				out.push('}');
 			}
-			InputReport::Gamepad(v270) => {
+			InputReport::Gamepad(v285) => {
 				out.push_str("{\"gamepad\":");
-				v270.to_json_into(out);
+				v285.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			InputReport::Pointer(v271) => {
+			InputReport::Pointer(v286) => {
 				out.push_str("pointer(");
-				v271.to_text_into(out);
+				v286.to_text_into(out);
 				out.push(')');
 			}
-			InputReport::Key(v272) => {
+			InputReport::Key(v287) => {
 				out.push_str("key(");
-				v272.to_text_into(out);
+				v287.to_text_into(out);
 				out.push(')');
 			}
-			InputReport::Gamepad(v273) => {
+			InputReport::Gamepad(v288) => {
 				out.push_str("gamepad(");
-				v273.to_text_into(out);
+				v288.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			InputReport::Pointer(v274) => {
+			InputReport::Pointer(v289) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "pointer");
-				v274.to_cbor_into(out);
+				v289.to_cbor_into(out);
 			}
-			InputReport::Key(v275) => {
+			InputReport::Key(v290) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "key");
-				v275.to_cbor_into(out);
+				v290.to_cbor_into(out);
 			}
-			InputReport::Gamepad(v276) => {
+			InputReport::Gamepad(v291) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "gamepad");
-				v276.to_cbor_into(out);
+				v291.to_cbor_into(out);
 			}
 		}
 	}
@@ -11167,13 +11668,13 @@ impl GattValue {
 		out.push(',');
 		out.push_str("\"value\":");
 		out.push('[');
-		let mut v278 = true;
-		for v277 in self.value.iter() {
-			if !v278 {
+		let mut v293 = true;
+		for v292 in self.value.iter() {
+			if !v293 {
 				out.push(',');
 			}
-			v278 = false;
-			let _ = write!(out, "{}", v277);
+			v293 = false;
+			let _ = write!(out, "{}", v292);
 		}
 		out.push(']');
 		out.push('}');
@@ -11185,13 +11686,13 @@ impl GattValue {
 		out.push_str(", ");
 		out.push_str("value=");
 		out.push('[');
-		let mut v280 = true;
-		for v279 in self.value.iter() {
-			if !v280 {
+		let mut v295 = true;
+		for v294 in self.value.iter() {
+			if !v295 {
 				out.push_str(", ");
 			}
-			v280 = false;
-			let _ = write!(out, "{}", v279);
+			v295 = false;
+			let _ = write!(out, "{}", v294);
 		}
 		out.push(']');
 		out.push('}');
@@ -11202,8 +11703,8 @@ impl GattValue {
 		crate::codec::cbor::uint(out, self.handle as u64);
 		crate::codec::cbor::text(out, "value");
 		crate::codec::cbor::array(out, self.value.len());
-		for v281 in self.value.iter() {
-			crate::codec::cbor::uint(out, *v281 as u64);
+		for v296 in self.value.iter() {
+			crate::codec::cbor::uint(out, *v296 as u64);
 		}
 	}
 }
@@ -11228,13 +11729,13 @@ impl SerialBytes {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v283 = true;
-		for v282 in self.bytes.iter() {
-			if !v283 {
+		let mut v298 = true;
+		for v297 in self.bytes.iter() {
+			if !v298 {
 				out.push(',');
 			}
-			v283 = false;
-			let _ = write!(out, "{}", v282);
+			v298 = false;
+			let _ = write!(out, "{}", v297);
 		}
 		out.push(']');
 		out.push('}');
@@ -11243,13 +11744,13 @@ impl SerialBytes {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v285 = true;
-		for v284 in self.bytes.iter() {
-			if !v285 {
+		let mut v300 = true;
+		for v299 in self.bytes.iter() {
+			if !v300 {
 				out.push_str(", ");
 			}
-			v285 = false;
-			let _ = write!(out, "{}", v284);
+			v300 = false;
+			let _ = write!(out, "{}", v299);
 		}
 		out.push(']');
 		out.push('}');
@@ -11258,8 +11759,8 @@ impl SerialBytes {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v286 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v286 as u64);
+		for v301 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v301 as u64);
 		}
 	}
 }
@@ -11293,13 +11794,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"key\":");
 		out.push('[');
-		let mut v288 = true;
-		for v287 in self.key.iter() {
-			if !v288 {
+		let mut v303 = true;
+		for v302 in self.key.iter() {
+			if !v303 {
 				out.push(',');
 			}
-			v288 = false;
-			let _ = write!(out, "{}", v287);
+			v303 = false;
+			let _ = write!(out, "{}", v302);
 		}
 		out.push(']');
 		out.push(',');
@@ -11321,13 +11822,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"link-key\":");
 		out.push('[');
-		let mut v290 = true;
-		for v289 in self.link_key.iter() {
-			if !v290 {
+		let mut v305 = true;
+		for v304 in self.link_key.iter() {
+			if !v305 {
 				out.push(',');
 			}
-			v290 = false;
-			let _ = write!(out, "{}", v289);
+			v305 = false;
+			let _ = write!(out, "{}", v304);
 		}
 		out.push(']');
 		out.push(',');
@@ -11339,13 +11840,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v292 = true;
-		for v291 in self.trusted.iter() {
-			if !v292 {
+		let mut v307 = true;
+		for v306 in self.trusted.iter() {
+			if !v307 {
 				out.push(',');
 			}
-			v292 = false;
-			v291.to_json_into(out);
+			v307 = false;
+			v306.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -11354,13 +11855,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"irk\":");
 		out.push('[');
-		let mut v294 = true;
-		for v293 in self.irk.iter() {
-			if !v294 {
+		let mut v309 = true;
+		for v308 in self.irk.iter() {
+			if !v309 {
 				out.push(',');
 			}
-			v294 = false;
-			let _ = write!(out, "{}", v293);
+			v309 = false;
+			let _ = write!(out, "{}", v308);
 		}
 		out.push(']');
 		out.push(',');
@@ -11369,13 +11870,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"rand\":");
 		out.push('[');
-		let mut v296 = true;
-		for v295 in self.rand.iter() {
-			if !v296 {
+		let mut v311 = true;
+		for v310 in self.rand.iter() {
+			if !v311 {
 				out.push(',');
 			}
-			v296 = false;
-			let _ = write!(out, "{}", v295);
+			v311 = false;
+			let _ = write!(out, "{}", v310);
 		}
 		out.push(']');
 		out.push('}');
@@ -11393,13 +11894,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("key=");
 		out.push('[');
-		let mut v298 = true;
-		for v297 in self.key.iter() {
-			if !v298 {
+		let mut v313 = true;
+		for v312 in self.key.iter() {
+			if !v313 {
 				out.push_str(", ");
 			}
-			v298 = false;
-			let _ = write!(out, "{}", v297);
+			v313 = false;
+			let _ = write!(out, "{}", v312);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11421,13 +11922,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("link-key=");
 		out.push('[');
-		let mut v300 = true;
-		for v299 in self.link_key.iter() {
-			if !v300 {
+		let mut v315 = true;
+		for v314 in self.link_key.iter() {
+			if !v315 {
 				out.push_str(", ");
 			}
-			v300 = false;
-			let _ = write!(out, "{}", v299);
+			v315 = false;
+			let _ = write!(out, "{}", v314);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11439,13 +11940,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v302 = true;
-		for v301 in self.trusted.iter() {
-			if !v302 {
+		let mut v317 = true;
+		for v316 in self.trusted.iter() {
+			if !v317 {
 				out.push_str(", ");
 			}
-			v302 = false;
-			v301.to_text_into(out);
+			v317 = false;
+			v316.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11454,13 +11955,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("irk=");
 		out.push('[');
-		let mut v304 = true;
-		for v303 in self.irk.iter() {
-			if !v304 {
+		let mut v319 = true;
+		for v318 in self.irk.iter() {
+			if !v319 {
 				out.push_str(", ");
 			}
-			v304 = false;
-			let _ = write!(out, "{}", v303);
+			v319 = false;
+			let _ = write!(out, "{}", v318);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11469,13 +11970,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("rand=");
 		out.push('[');
-		let mut v306 = true;
-		for v305 in self.rand.iter() {
-			if !v306 {
+		let mut v321 = true;
+		for v320 in self.rand.iter() {
+			if !v321 {
 				out.push_str(", ");
 			}
-			v306 = false;
-			let _ = write!(out, "{}", v305);
+			v321 = false;
+			let _ = write!(out, "{}", v320);
 		}
 		out.push(']');
 		out.push('}');
@@ -11490,8 +11991,8 @@ impl BondRecord {
 		self.peer.to_cbor_into(out);
 		crate::codec::cbor::text(out, "key");
 		crate::codec::cbor::array(out, self.key.len());
-		for v307 in self.key.iter() {
-			crate::codec::cbor::uint(out, *v307 as u64);
+		for v322 in self.key.iter() {
+			crate::codec::cbor::uint(out, *v322 as u64);
 		}
 		crate::codec::cbor::text(out, "security");
 		self.security.to_cbor_into(out);
@@ -11503,8 +12004,8 @@ impl BondRecord {
 		self.radio.to_cbor_into(out);
 		crate::codec::cbor::text(out, "link-key");
 		crate::codec::cbor::array(out, self.link_key.len());
-		for v308 in self.link_key.iter() {
-			crate::codec::cbor::uint(out, *v308 as u64);
+		for v323 in self.link_key.iter() {
+			crate::codec::cbor::uint(out, *v323 as u64);
 		}
 		crate::codec::cbor::text(out, "link-key-type");
 		crate::codec::cbor::uint(out, self.link_key_type as u64);
@@ -11512,22 +12013,22 @@ impl BondRecord {
 		self.level.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v309 in self.trusted.iter() {
-			v309.to_cbor_into(out);
+		for v324 in self.trusted.iter() {
+			v324.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alias");
 		crate::codec::cbor::text(out, &self.alias);
 		crate::codec::cbor::text(out, "irk");
 		crate::codec::cbor::array(out, self.irk.len());
-		for v310 in self.irk.iter() {
-			crate::codec::cbor::uint(out, *v310 as u64);
+		for v325 in self.irk.iter() {
+			crate::codec::cbor::uint(out, *v325 as u64);
 		}
 		crate::codec::cbor::text(out, "ediv");
 		crate::codec::cbor::uint(out, self.ediv as u64);
 		crate::codec::cbor::text(out, "rand");
 		crate::codec::cbor::array(out, self.rand.len());
-		for v311 in self.rand.iter() {
-			crate::codec::cbor::uint(out, *v311 as u64);
+		for v326 in self.rand.iter() {
+			crate::codec::cbor::uint(out, *v326 as u64);
 		}
 	}
 }
@@ -11574,6 +12075,10 @@ impl FixtureAction {
 			FixtureAction::HangUp => out.push_str("\"hang-up\""),
 			FixtureAction::AudioRequest => out.push_str("\"audio-request\""),
 			FixtureAction::PushObject => out.push_str("\"push-object\""),
+			FixtureAction::Broadcast => out.push_str("\"broadcast\""),
+			FixtureAction::LeVolume => out.push_str("\"le-volume\""),
+			FixtureAction::LeCall => out.push_str("\"le-call\""),
+			FixtureAction::LeFeatures => out.push_str("\"le-features\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -11602,6 +12107,10 @@ impl FixtureAction {
 			FixtureAction::HangUp => out.push_str("hang-up"),
 			FixtureAction::AudioRequest => out.push_str("audio-request"),
 			FixtureAction::PushObject => out.push_str("push-object"),
+			FixtureAction::Broadcast => out.push_str("broadcast"),
+			FixtureAction::LeVolume => out.push_str("le-volume"),
+			FixtureAction::LeCall => out.push_str("le-call"),
+			FixtureAction::LeFeatures => out.push_str("le-features"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -11630,6 +12139,10 @@ impl FixtureAction {
 			FixtureAction::HangUp => crate::codec::cbor::text(out, "hang-up"),
 			FixtureAction::AudioRequest => crate::codec::cbor::text(out, "audio-request"),
 			FixtureAction::PushObject => crate::codec::cbor::text(out, "push-object"),
+			FixtureAction::Broadcast => crate::codec::cbor::text(out, "broadcast"),
+			FixtureAction::LeVolume => crate::codec::cbor::text(out, "le-volume"),
+			FixtureAction::LeCall => crate::codec::cbor::text(out, "le-call"),
+			FixtureAction::LeFeatures => crate::codec::cbor::text(out, "le-features"),
 		}
 	}
 }
@@ -11931,73 +12444,73 @@ impl AudioEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			AudioEvent::Arrived(v312) => {
+			AudioEvent::Arrived(v327) => {
 				out.push_str("{\"arrived\":");
-				v312.to_json_into(out);
+				v327.to_json_into(out);
 				out.push('}');
 			}
-			AudioEvent::Departed(v313) => {
+			AudioEvent::Departed(v328) => {
 				out.push_str("{\"departed\":");
-				let _ = write!(out, "{}", v313);
+				let _ = write!(out, "{}", v328);
 				out.push('}');
 			}
-			AudioEvent::Volume(v314) => {
+			AudioEvent::Volume(v329) => {
 				out.push_str("{\"volume\":");
-				v314.to_json_into(out);
+				v329.to_json_into(out);
 				out.push('}');
 			}
-			AudioEvent::Command(v315) => {
+			AudioEvent::Command(v330) => {
 				out.push_str("{\"command\":");
-				v315.to_json_into(out);
+				v330.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			AudioEvent::Arrived(v316) => {
+			AudioEvent::Arrived(v331) => {
 				out.push_str("arrived(");
-				v316.to_text_into(out);
+				v331.to_text_into(out);
 				out.push(')');
 			}
-			AudioEvent::Departed(v317) => {
+			AudioEvent::Departed(v332) => {
 				out.push_str("departed(");
-				let _ = write!(out, "{}", v317);
+				let _ = write!(out, "{}", v332);
 				out.push(')');
 			}
-			AudioEvent::Volume(v318) => {
+			AudioEvent::Volume(v333) => {
 				out.push_str("volume(");
-				v318.to_text_into(out);
+				v333.to_text_into(out);
 				out.push(')');
 			}
-			AudioEvent::Command(v319) => {
+			AudioEvent::Command(v334) => {
 				out.push_str("command(");
-				v319.to_text_into(out);
+				v334.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			AudioEvent::Arrived(v320) => {
+			AudioEvent::Arrived(v335) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "arrived");
-				v320.to_cbor_into(out);
+				v335.to_cbor_into(out);
 			}
-			AudioEvent::Departed(v321) => {
+			AudioEvent::Departed(v336) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "departed");
-				crate::codec::cbor::uint(out, *v321 as u64);
+				crate::codec::cbor::uint(out, *v336 as u64);
 			}
-			AudioEvent::Volume(v322) => {
+			AudioEvent::Volume(v337) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "volume");
-				v322.to_cbor_into(out);
+				v337.to_cbor_into(out);
 			}
-			AudioEvent::Command(v323) => {
+			AudioEvent::Command(v338) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "command");
-				v323.to_cbor_into(out);
+				v338.to_cbor_into(out);
 			}
 		}
 	}
@@ -12088,43 +12601,43 @@ impl NetworkEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			NetworkEvent::Arrived(v324) => {
+			NetworkEvent::Arrived(v339) => {
 				out.push_str("{\"arrived\":");
-				v324.to_json_into(out);
+				v339.to_json_into(out);
 				out.push('}');
 			}
-			NetworkEvent::Departed(v325) => {
+			NetworkEvent::Departed(v340) => {
 				out.push_str("{\"departed\":");
-				let _ = write!(out, "{}", v325);
+				let _ = write!(out, "{}", v340);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			NetworkEvent::Arrived(v326) => {
+			NetworkEvent::Arrived(v341) => {
 				out.push_str("arrived(");
-				v326.to_text_into(out);
+				v341.to_text_into(out);
 				out.push(')');
 			}
-			NetworkEvent::Departed(v327) => {
+			NetworkEvent::Departed(v342) => {
 				out.push_str("departed(");
-				let _ = write!(out, "{}", v327);
+				let _ = write!(out, "{}", v342);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			NetworkEvent::Arrived(v328) => {
+			NetworkEvent::Arrived(v343) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "arrived");
-				v328.to_cbor_into(out);
+				v343.to_cbor_into(out);
 			}
-			NetworkEvent::Departed(v329) => {
+			NetworkEvent::Departed(v344) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "departed");
-				crate::codec::cbor::uint(out, *v329 as u64);
+				crate::codec::cbor::uint(out, *v344 as u64);
 			}
 		}
 	}

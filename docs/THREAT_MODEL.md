@@ -257,6 +257,30 @@ serves inbound, a `btctl receive` waits, or a watcher makes it pairable, and dis
 profile; a bonded peer's link that is not encrypted yet is secured with the stored key before its channel is
 answered. SDP answers any connected peer, the one service a peer reads before it pairs.
 
+**An application reaches a peer only through a grant minted for one launch.** A GATT connection and a serial port
+are each minted by PermissionManager from the operator's own `bluetooth-admin` authority, for one component's
+launch and one peer the operator aliased - never the radio, never another peer - and refused for a peer not trusted
+for that profile; the grant ends with the launch, and its subscriptions and its channel with it. The stack's own
+services - Battery, Human Interface, the LE Audio tables - are never part of an application's grant.
+
+**An object is received only while the operator waits for it.** `btctl receive PEER MAX-BYTES` is the consent: it
+admits that one bonded peer's Object Push for at most 180 seconds, refuses an object that declares more than the
+bound before a byte of it and aborts one that passes it while arriving, and the peer's name for the object is only
+printed - escaped - never used as a path. The service holds no storage authority; the shell's redirection writes
+where the user chose. Nobody waiting, the push is refused at the door.
+
+**A coordinated set is paired as one.** The operator's pairing of the first earbud of a set, and its trust for audio,
+consent for its other members: a device advertising an RSI that resolves with the set's key - which the first member
+gave this host encrypted under its bond's key - is paired with Just Works and trusted for audio without a further
+question. Whoever holds a set's key can therefore pose as its member, which is the set's own protocol's limit; the key
+is never read from an unencrypted link, and a member that does not bond within the search is let go.
+
+**A call is relayed only for a device the operator let carry audio.** This host's telephone bearer answers every
+connected LE peer's reads - the peers it connects to are ones it paired or reconnects to - but a write to its Call
+Control Point is relayed to the voice session only from an encrypted link to a peer trusted for audio, and only while
+a session declares a call; otherwise the bearer refuses it. A broadcast's Broadcast Code is the operator's, passed on
+the call and scrubbed once the controller has it; this host keeps no code.
+
 No Bluetooth input reaches the trusted key sink of 2.3: BluetoothService is not one of the keyboard drivers
 DeviceManager hands that sink to, and nothing it produces has a path there.
 

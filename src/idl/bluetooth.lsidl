@@ -327,6 +327,24 @@ interface bluetooth-operator {
 	/// it the uplink in place of a selected one only where `replace-uplink` says so; otherwise it is held, unselected,
 	/// while another is selected. `connect` with `pan` is this without `replace-uplink`.
 	@op(20) connect-pan: func(controller: u32, peer: peer-address, replace-uplink: bool) -> result<unit, error>;
+	/// LOOK FOR LE AUDIO BROADCASTS for at most `seconds` (30 at most): their announcements gathered for `broadcasts`.
+	@op(21) broadcast-scan: func(controller: u32, seconds: u32) -> result<unit, error>;
+	/// The broadcasts heard by the last `broadcast-scan`, so far.
+	@op(22) broadcasts:     func(controller: u32) -> result<list<broadcast-source>, error>;
+	/// PLAY ONE: its periodic train joined, its BASE read, its BIG synchronised - with `code` where it is encrypted,
+	/// empty where it is not - and its streams offered to AudioService as a route to the default output, as a phone's
+	/// A2DP stream is. One broadcast at a time; a second replaces the first.
+	@op(23) broadcast-play: func(controller: u32, broadcast-id: u32, @bound(16) code: list<u8>) -> result<unit, error>;
+	/// Stop the broadcast being played.
+	@op(24) broadcast-stop: func(controller: u32) -> result<unit, error>;
+}
+
+/// An LE Audio broadcast heard: its Broadcast ID, its name as the source gave it, and the source's address and set.
+record broadcast-source {
+	broadcast-id: u32,
+	@bound(32) name: string,
+	address:      peer-address,
+	sid:          u8,
 }
 
 /// What a receiver hears of the one object a peer pushes.
@@ -617,6 +635,19 @@ enum fixture-action {
 	/// The phone pushes this host an object of `argument` bytes over Object Push, five seconds from now - paging this
 	/// host first where it has no link.
 	push-object   = 24,
+	/// The broadcast source begins its LE Audio broadcast - `argument` 1 in the clear, 2 encrypted with the fixture's
+	/// Broadcast Code - or, with 0, ends it.
+	broadcast     = 25,
+	/// An earbud changes its own volume setting to `argument` (0 to 255), and notifies a client that asked.
+	le-volume     = 26,
+	/// An earbud writes this host's Call Control Point: opcode `argument` (0 accept, 1 terminate) on call index 1;
+	/// what this host notified back is reported.
+	le-call       = 27,
+	/// THE CONTROLLER ITSELF (peer 0): its LE features from its next HCI Reset - `argument` 1 an LE Audio controller with
+	/// extended advertising, periodic advertising sync, the CIS central role and the synchronized receiver, which
+	/// refuses the legacy scan and connection commands once an extended one is used; 0 the controller it starts as,
+	/// with none of them.
+	le-features   = 28,
 }
 
 /// THE IN-GUEST BLUETOOTH FIXTURE'S CONTROL ENDPOINT. DEVELOPMENT ONLY: it exists on a development fixture

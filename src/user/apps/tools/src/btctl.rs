@@ -58,8 +58,16 @@ const USAGE: &[u8] = b"usage: btctl [-c N] COMMAND
   media ADDRESS play|pause|next|previous   the remote control, toward a phone playing here
   send ADDRESS NAME < FILE          push FILE to a bonded device over Object Push, named NAME
   receive ADDRESS MAX-BYTES > FILE  take the one object that bonded device pushes in the next 180 seconds
+  broadcast scan [SECONDS]          LE Audio broadcasts around, for at most 30 seconds
+  broadcast play ID [CODE]          play one on the default output; CODE where it is encrypted
+  broadcast stop
   power on|off
 ";
+// A broadcast scan when no time is given, and the service's own cap on one; a Broadcast Code's length.
+const BROADCAST_SECONDS: u64 = 10;
+const MAX_BROADCAST_SECONDS: u64 = 30;
+const BROADCAST_CODE: usize = 16;
+const MAX_BROADCASTS: usize = 16;
 // The largest piece one object-push write carries.
 const PUSH_PIECE: usize = 1024;
 
@@ -137,6 +145,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		(Some(b"send"), 3) => tool.send(args[1], args[2]),
 		(Some(b"receive"), 3) => tool.receive(args[1], parse_u64(args[2]).unwrap_or_else(|| usage())),
+		(Some(b"broadcast"), 2) if args[1] == b"scan" => tool.broadcast_scan(BROADCAST_SECONDS),
+		(Some(b"broadcast"), 3) if args[1] == b"scan" => tool.broadcast_scan(parse_u64(args[2]).unwrap_or_else(|| usage())),
+		(Some(b"broadcast"), 3 | 4) if args[1] == b"play" => tool.broadcast_play(parse_broadcast_id(args[2]).unwrap_or_else(|| usage()), args.get(3).copied()),
+		(Some(b"broadcast"), 2) if args[1] == b"stop" => tool.broadcast_stop(),
 		(Some(b"power"), 2) => match args[1] {
 			b"on" => tool.power(true),
 			b"off" => tool.power(false),
@@ -162,6 +174,15 @@ fn parse_address(text: &[u8]) -> Option<[u8; 6]> {
 		*byte = u8::from_str_radix(part, 16).ok()?;
 	}
 	parts.next().is_none().then_some(out)
+}
+
+// A Broadcast ID as `scan` prints it - `0x123456` - or in decimal; 24 bits.
+fn parse_broadcast_id(text: &[u8]) -> Option<u32> {
+	let id = match text.strip_prefix(b"0x") {
+		Some(hex) => u32::from_str_radix(core::str::from_utf8(hex).ok()?, 16).ok()?,
+		None => u32::try_from(parse_u64(text)?).ok()?,
+	};
+	(id <= 0x00ff_ffff).then_some(id)
 }
 
 fn parse_profile(text: &[u8]) -> Option<Profile> {
@@ -575,6 +596,73 @@ impl Tool {
 		match self.operator().connect_pan(self.controller, &peer, true) {
 			Some(Ok(())) => print(format!("connecting pan to {}, allowed to replace the uplink\n", address(&peer)).as_bytes()),
 			other => report("the connection", other),
+		}
+	}
+
+	// LE AUDIO BROADCASTS AROUND: the scan runs in the service, and what it hears is listed as it comes - each by its
+	// Broadcast ID, which `broadcast play` takes, its name as the source gave it, and its address.
+	fn broadcast_scan(&self, seconds: u64) {
+		let seconds = seconds.clamp(1, MAX_BROADCAST_SECONDS);
+		match self.operator().broadcast_scan(self.controller, seconds as u32) {
+			Some(Ok(())) => print(format!("looking for broadcasts for {seconds} s...\n").as_bytes()),
+			other => return report("the broadcast scan", other),
+		}
+		// What was printed, in a fixed array: a vector pushed to would import its growth routine from whichever library
+		// shares that instance. The service keeps sixteen broadcasts at most.
+		let mut listed = [0u32; MAX_BROADCASTS];
+		let mut count = 0usize;
+		let deadline = clock() + seconds * TICKS;
+		loop {
+			if let Some(Ok(sources)) = self.operator().broadcasts(self.controller) {
+				for source in sources {
+					if listed[..count].contains(&source.broadcast_id) || count == MAX_BROADCASTS {
+						continue;
+					}
+					listed[count] = source.broadcast_id;
+					count += 1;
+					print(format!("0x{:06x}  {}  {}\n", source.broadcast_id, if source.name.is_empty() { "(no name)" } else { &source.name }, address(&source.address)).as_bytes());
+				}
+			}
+			if clock() >= deadline {
+				break;
+			}
+			sleep_until(clock() + TICKS / 2);
+		}
+		if count == 0 {
+			print(b"no broadcast was heard\n");
+		}
+	}
+
+	// PLAY ONE: joined by the service and offered to AudioService as a route, as a phone's stream is. A Broadcast Code
+	// is the source's text, padded with zeros to its sixteen octets; a longer one cannot be a code.
+	fn broadcast_play(&self, id: u32, code: Option<&[u8]>) {
+		let mut padded = [0u8; BROADCAST_CODE];
+		let code: &[u8] = match code {
+			None => &[],
+			Some(text) if text.len() <= BROADCAST_CODE => {
+				padded[..text.len()].copy_from_slice(text);
+				&padded
+			}
+			Some(_) => {
+				print(b"btctl: a Broadcast Code is at most 16 characters\n");
+				return;
+			}
+		};
+		let outcome = self.operator().broadcast_play(self.controller, id, code);
+		padded.fill(0);
+		match outcome {
+			Some(Ok(())) => print(format!("joining broadcast 0x{id:06x}\n").as_bytes()),
+			Some(Err(Error::NotFound)) => print(b"btctl: no such broadcast was heard - run `btctl broadcast scan` first\n"),
+			Some(Err(Error::Unsupported)) => print(b"btctl: this controller cannot receive LE Audio broadcasts\n"),
+			other => report("the broadcast", other),
+		}
+	}
+
+	fn broadcast_stop(&self) {
+		match self.operator().broadcast_stop(self.controller) {
+			Some(Ok(())) => print(b"the broadcast was stopped\n"),
+			Some(Err(Error::NotFound)) => print(b"btctl: no broadcast is playing\n"),
+			other => report("stopping the broadcast", other),
 		}
 	}
 

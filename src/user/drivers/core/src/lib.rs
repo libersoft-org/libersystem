@@ -52,9 +52,17 @@ pub mod bt_world;
 // THE EMULATED LE WORLD beyond the mouse: three LE peripherals pairing in every model, with private addresses, key
 // distribution and attribute servers of their own. DEVELOPMENT-ONLY in what uses it.
 pub mod bt_le_world;
+// THE EMULATED LE AUDIO WORLD: the LE Audio half of the fixture's controller - extended and periodic scanning, connected
+// and broadcast isochronous streams - and two earbuds of one coordinated set and a broadcast source, their stream
+// control, capabilities, set key, volume and call bearer client written apart from the host's. DEVELOPMENT-ONLY in what
+// uses it.
+pub mod bt_le_audio;
 // THE FIXTURE'S SBC: what the emulated headset reads from a stream and the emulated phone writes into one - its own
 // frame reader, CRC, allocation and dequantization, apart from the host's codec. DEVELOPMENT-ONLY in what uses it.
 pub mod bt_sbc;
+// THE FIXTURE'S LC3: what the emulated earbuds read from an LE Audio stream and the emulated sources write into one -
+// its own side-information reader and arithmetic coder, apart from the host's codec. DEVELOPMENT-ONLY in what uses it.
+pub mod bt_lc3;
 // THE USB BLUETOOTH HCI TRANSPORT'S DECISIONS: the controller's pipes, and where one HCI packet ends in transfers
 // that do not say.
 pub mod bt_usb;

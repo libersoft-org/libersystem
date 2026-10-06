@@ -146,6 +146,14 @@ fn scan_handle_wire_is_stable() {
 	assert_eq!(ScanHandle::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn broadcast_source_wire_is_stable() {
+	let sample = BroadcastSource { broadcast_id: 7, name: String::from("x"), address: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, sid: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 120, 1, 1, 0, 7, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(BroadcastSource::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn received_kind_wire_is_stable() {
 	let sample = ReceivedKind::Offered;
 	let bytes = sample.encode_vec().expect("encode");

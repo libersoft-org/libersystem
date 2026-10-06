@@ -2089,10 +2089,12 @@ destination = "libexec/network_service.lsexe"
 # `device-proto` because this service DISCOVERS its NIC: it holds a provider-catalogue connection and
 # subscribes to the network kind rather than being handed a frame channel. `service-util` because the
 # IPv6 host beside the IPv4 stack is decisions this service makes and the pure half of them lives
-# there, where a host can run them.
+# there, where a host can run them. `bluetooth-proto` because a Bluetooth PAN link is a NIC it reaches by name
+# through the broker: BluetoothService's network root, its links stream and each link's frame channel.
 providers = [
 	"network-proto",
 	"device-proto",
+	"bluetooth-proto",
 	"base-proto",
 	"ipc-client",
 	"wire",

@@ -39,3 +39,21 @@ fn a_service_added_follows_the_table() {
 	assert_eq!(groups, [op::READ_BY_GROUP_TYPE_RESPONSE, 6, 0x0a, 0x00, 0x0d, 0x00, 0x50, 0x18]);
 	assert_eq!(server.value(0x0c), Some(&[1, 2][..]));
 }
+
+#[test]
+// A CONTROL POINT: a client's write handed to the stack, and the stack's value notified only where the client asked.
+fn control_point_writes_reach_the_stack_and_values_are_notified() {
+	let mut server = Server::new(b"host");
+	let start = server.add_service(0x184c, &[(0x2bbd, 0x12, alloc::vec![], false), (0x2bbe, 0x18, alloc::vec![], true)]);
+	let state = server.handle_of(0x2bbd).unwrap();
+	let point = server.handle_of(0x2bbe).unwrap();
+	assert_eq!((start, state, point), (10, 12, 15));
+	server.set_value(state, alloc::vec![1, 0, 4]);
+	assert_eq!(server.notification(state), None, "not before the client asks");
+	assert_eq!(server.answer(&[op::WRITE_REQUEST, 13, 0, 1, 0]), Some(alloc::vec![op::WRITE_RESPONSE]));
+	assert_eq!(server.notification(state), Some(alloc::vec![op::HANDLE_VALUE_NOTIFICATION, 12, 0, 1, 0, 4]));
+	assert!(server.take_writes().is_empty(), "a configuration write is not a control point's");
+	assert_eq!(server.answer(&[op::WRITE_REQUEST, 15, 0, 0x00, 1]), Some(alloc::vec![op::WRITE_RESPONSE]));
+	assert_eq!(server.take_writes(), alloc::vec![(15, alloc::vec![0x00, 1])]);
+	assert_eq!(server.answer(&[op::WRITE_REQUEST, 12, 0, 9]), Some(alloc::vec![op::ERROR_RESPONSE, op::WRITE_REQUEST, 12, 0, error::WRITE_NOT_PERMITTED]));
+}
