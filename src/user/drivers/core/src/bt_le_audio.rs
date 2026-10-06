@@ -20,7 +20,12 @@
 // runs against the host's attribute server are `earbud`'s; the broadcast source and the sync this controller keeps with
 // it are `broadcast`'s.
 //
-// WHAT THE CONTROLLER DOES HERE: it answers the LE Audio commands - features, buffers, the extended scan and connection,
+// TWO KINDS OF CONTROLLER. The fixture starts as a plain LE controller - the LE Audio commands unknown to it, its
+// earbuds heard in legacy advertising - so every gate written before LE Audio runs the path it always ran. The gate's
+// `le-features` makes it the LE Audio one, or plain again, from the next HCI Reset, as a controller's firmware would
+// change under a host that powers the radio off and on.
+//
+// WHAT THE LE AUDIO CONTROLLER DOES HERE: it answers the LE Audio commands - features, buffers, the extended scan and connection,
 // a connected isochronous group and its streams, the ISO data paths, the periodic sync and the broadcast sync - with
 // the events the specification lays out, carries ISO data both ways, and keeps the rule real controllers keep: once a
 // host has used one extended advertising, scanning or initiating command, the legacy ones are refused until a reset.
@@ -384,6 +389,9 @@ struct Scan {
 
 pub struct Audio {
 	pub earbuds: [Earbud; 2],
+	// THE CONTROLLER'S KIND - LE Audio or plain LE - and the kind the next HCI Reset makes it.
+	le_audio: bool,
+	next_kind: Option<bool>,
 	cigs: Vec<Cig>,
 	// THE EXTENDED-MODE RULE'S STATE: an extended advertising, scanning or initiating command since the last reset.
 	extended: bool,
@@ -408,7 +416,7 @@ fn phy_of(bits: u8) -> u8 {
 
 impl Audio {
 	pub fn new(seed: u64) -> Audio {
-		let mut audio = Audio { earbuds: [Earbud::new(&SIDES[0]), Earbud::new(&SIDES[1])], cigs: Vec::new(), extended: false, scan: Scan::default(), source: broadcast::Source::default(), receiver: broadcast::Receiver::default(), random: seed | 1, now: 0, log: Vec::new() };
+		let mut audio = Audio { earbuds: [Earbud::new(&SIDES[0]), Earbud::new(&SIDES[1])], le_audio: false, next_kind: None, cigs: Vec::new(), extended: false, scan: Scan::default(), source: broadcast::Source::default(), receiver: broadcast::Receiver::default(), random: seed | 1, now: 0, log: Vec::new() };
 		audio.new_identifiers();
 		audio
 	}
@@ -457,10 +465,35 @@ impl Audio {
 		self.extended
 	}
 
+	pub fn le_audio(&self) -> bool {
+		self.le_audio
+	}
+
+	// THE GATE CHOOSES THE CONTROLLER'S KIND, for the next HCI Reset to apply.
+	pub fn choose(&mut self, le_audio: bool) {
+		self.next_kind = Some(le_audio);
+		self.log.push(String::from(if le_audio { "controller will be an LE Audio one from its next reset" } else { "controller will be a plain LE one from its next reset" }));
+	}
+
+	// AN HCI RESET: the kind the gate chose takes effect, and the link layer starts over.
+	pub fn hci_reset(&mut self) {
+		if let Some(kind) = self.next_kind.take()
+			&& kind != self.le_audio
+		{
+			self.le_audio = kind;
+			self.log.push(String::from(if kind { "controller reset as an LE Audio one" } else { "controller reset as a plain LE one" }));
+		}
+		self.reset();
+	}
+
 	// ------------------------------------------------------------------ commands
 
 	// ONE HCI COMMAND, if it is one this half of the controller answers; `None` for anything else.
 	pub fn command(&mut self, opcode: u16, params: &[u8], ctx: &Ctx) -> Option<Vec<AudioOut>> {
+		// A PLAIN LE CONTROLLER knows none of them: the fixture answers them as commands it does not have.
+		if !self.le_audio {
+			return None;
+		}
 		if (0x2036..=0x204a).contains(&opcode) {
 			self.extended = true;
 		}
@@ -487,7 +520,7 @@ impl Audio {
 			0x206f => out.push(self.remove_path(params)),
 			// A DISCONNECT OF A CIS: its completion, and the earbud's endpoints let go of it.
 			0x0406 if params.len() == 3 && self.cis_at(u16_at(params, 0) & 0x0fff).is_some() => out.extend(self.disconnect_cis(u16_at(params, 0) & 0x0fff, ctx)),
-			0x2044..=0x2049 | 0x2059 | 0x206b | 0x206c => out.extend(self.receiver_command(opcode, params)),
+			0x2044..=0x204a | 0x2059 | 0x206b | 0x206c => out.extend(self.receiver_command(opcode, params)),
 			_ => return None,
 		}
 		Some(out)
@@ -637,7 +670,7 @@ impl Audio {
 		if code == 0 {
 			body.extend(self.cis_timing(c, s));
 		} else {
-			body.extend_from_slice(&[0; 26]);
+			body.extend_from_slice(&[0; 25]);
 		}
 		let mut out = alloc::vec![meta(0x19, &body)];
 		let Some(ear) = ear.filter(|_| accepted) else { return out };

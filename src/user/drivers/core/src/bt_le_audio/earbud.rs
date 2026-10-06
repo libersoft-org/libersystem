@@ -481,6 +481,17 @@ impl Earbud {
 		data
 	}
 
+	// THE LEGACY ADVERTISING DATA a plain LE controller's scan hears, in the thirty-one octets a legacy PDU holds: flags,
+	// the name and the services.
+	pub fn legacy_advertising_data(&self) -> Vec<u8> {
+		let mut data = alloc::vec![0x02, 0x01, 0x06];
+		data.push(self.side.name.len() as u8 + 1);
+		data.push(0x09);
+		data.extend_from_slice(self.side.name.as_bytes());
+		data.extend_from_slice(&[0x09, 0x03, 0x4e, 0x18, 0x50, 0x18, 0x46, 0x18, 0x44, 0x18]);
+		data
+	}
+
 	// A NEW LINK: the default MTU, nothing queued, the client to run again.
 	pub fn connected(&mut self) {
 		self.mtu = DEFAULT_MTU;
@@ -1209,11 +1220,12 @@ impl Earbud {
 	}
 
 	// ONE SDU ON THE SINK'S STREAM, judged: a frame for every channel, each read whole by the fixture's LC3 reader. After
-	// the fiftieth that is not silent it says what it heard - once a stream.
+	// the fiftieth that is not silent it says what it heard - once a stream, and then it reads no more of it: the
+	// verdict is given, and a debug build's decoder on an emulated CPU is the costliest thing this process does.
 	pub fn hear(&mut self, cig: u8, cis: u8, sdu: &[u8], log: &mut Vec<String>) {
 		let Some(at) = self.ases.iter().position(|ase| ase.sink && ase.state == State::Streaming && ase.on(cig, cis)) else { return };
 		// A ZERO-LENGTH SDU is what a sink must tolerate, and says nothing.
-		if sdu.is_empty() {
+		if sdu.is_empty() || self.heard.reported {
 			return;
 		}
 		let codec = self.ases[at].codec;
@@ -1474,7 +1486,7 @@ impl Earbud {
 		self.client.state = state;
 		self.client.control = control;
 		self.client.step = Step::Descriptors;
-		let from = self.client.found.first().map_or(state, |first| first.1 + 1);
+		let from = self.client.found.first().map_or(state, |first| first.1.saturating_add(1));
 		self.request(Self::ranged(0x04, from, end, None))
 	}
 
@@ -1499,10 +1511,11 @@ impl Earbud {
 				return self.request(Self::ranged(0x04, last + 1, end, None));
 			}
 		}
-		// A VALUE'S CONFIGURATION: the first one after it and before the next declaration.
+		// A VALUE'S CONFIGURATION: the first one after it and before the next declaration - or up to the bearer's end,
+		// which a server may well put at 0xffff, so the limit is counted past it rather than overflowing.
 		let configuration = |value: u16| {
-			let limit = self.client.found.iter().map(|entry| entry.0).filter(|declaration| *declaration > value).min().unwrap_or(end + 1);
-			self.client.descriptors.iter().find(|descriptor| descriptor.1 == 0x2902 && descriptor.0 > value && descriptor.0 < limit).map_or(0, |descriptor| descriptor.0)
+			let limit = self.client.found.iter().map(|entry| u32::from(entry.0)).filter(|declaration| *declaration > u32::from(value)).min().unwrap_or(u32::from(end) + 1);
+			self.client.descriptors.iter().find(|descriptor| descriptor.1 == 0x2902 && descriptor.0 > value && u32::from(descriptor.0) < limit).map_or(0, |descriptor| descriptor.0)
 		};
 		let configurations = (configuration(self.client.state), configuration(self.client.control));
 		if configurations.0 == 0 || configurations.1 == 0 {
@@ -1561,16 +1574,12 @@ fn most_frequent(lines: &[u16]) -> u16 {
 
 #[cfg(test)]
 pub(super) mod probe {
-	// What the tests read of an earbud without a client: the handle of a characteristic by its UUID, and an endpoint's
-	// state code.
+	// What the tests read of an earbud without a client: the handle of a characteristic's value by its UUID - its
+	// configuration, where it has one, is the next - and an endpoint's state code.
 	use super::{Attr, Earbud};
 
 	pub fn value_handle(earbud: &Earbud, uuid: u16) -> u16 {
 		earbud.table.iter().find(|entry| matches!(entry.1, Attr::Value(held, _) if held == uuid)).map_or(0, |entry| entry.0)
-	}
-
-	pub fn configuration_handle(earbud: &Earbud, uuid: u16) -> u16 {
-		value_handle(earbud, uuid) + 1
 	}
 
 	pub fn state(earbud: &Earbud, id: u8) -> u8 {

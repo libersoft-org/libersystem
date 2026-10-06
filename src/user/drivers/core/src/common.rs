@@ -829,9 +829,42 @@ fn wait_providers_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, devi
 		set[live.len() + devices.len()] = bootstrap;
 		let waited = if housekeeping { wait_any_periodic(&set[..live.len() + devices.len() + 1], deadline) } else { wait_any(&set[..live.len() + devices.len() + 1], deadline) };
 		if waited < 0 && !(deadline != 0 && waited == ERR_TIMED_OUT) {
+			leaving(b"a wait on its channels failed, error ", waited.unsigned_abs());
 			return None;
 		}
 	}
+}
+
+// A DRIVER LEAVING ITS LOOP SAYS WHY before its caller exits, so a log tells one ending from another - and from a panic,
+// which rt ends with no word.
+fn leaving(why: &[u8], code: u64) {
+	let mut line = [0u8; 128];
+	let prefix = b"driver: leaving - ";
+	let mut at = 0;
+	for part in [&prefix[..], why] {
+		let take = part.len().min(line.len() - at);
+		line[at..at + take].copy_from_slice(&part[..take]);
+		at += take;
+	}
+	let mut digits = [0u8; 20];
+	let mut count = 0;
+	let mut value = code;
+	loop {
+		digits[count] = b'0' + (value % 10) as u8;
+		count += 1;
+		value /= 10;
+		if value == 0 {
+			break;
+		}
+	}
+	for &digit in digits[..count].iter().rev() {
+		if at < line.len() - 1 {
+			line[at] = digit;
+			at += 1;
+		}
+	}
+	line[at] = b'\n';
+	print(&line[..at + 1]);
 }
 
 // The two shapes above, with the one thing that differs between them named: whether a `CONNECT` may
@@ -1072,7 +1105,10 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 		let (len, handle) = match try_recv(bootstrap, &mut buf) {
 			Polled::Message { len, handle } => (len, handle),
 			Polled::Empty => return Control::Continue,
-			Polled::Closed => return Control::Ended,
+			Polled::Closed => {
+				leaving(b"the manager's channel closed, code ", 0);
+				return Control::Ended;
+			}
 		};
 		let Ok(header) = proto::Header::decode(&buf[..len]) else {
 			if handle != 0 {
@@ -1108,6 +1144,7 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 					if let Some(token) = token
 						&& !disconnected(bootstrap, bind, token)
 					{
+						leaving(b"a connection it could not take was not reported, token ", u64::from(token));
 						return Control::Ended;
 					}
 				}
@@ -1115,6 +1152,7 @@ fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serv
 			proto::Opcode::Ping => {
 				let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
 				if !pong(bootstrap, bind, sequence) {
+					leaving(b"its answer to a ping was not taken, code ", 0);
 					return Control::Ended;
 				}
 			}

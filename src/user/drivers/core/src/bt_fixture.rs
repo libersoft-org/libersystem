@@ -295,7 +295,10 @@ impl Fixture {
 				self.connected = false;
 				self.encrypted = false;
 				self.world.reset();
-				self.le.reset();
+				// THE CONTROLLER'S KIND the gate chose - LE Audio or plain LE - takes effect here, at the host's reset, and the
+				// fixture says so.
+				self.le.hci_reset();
+				self.le_out(Vec::new());
 				self.accepting = None;
 				self.resolution = false;
 				self.complete(opcode, &[0]);
@@ -372,11 +375,11 @@ impl Fixture {
 			}
 			// THE EXTENDED SCAN: its parameters, and each enable a new listener that hears every advertiser there is - the
 			// mouse while nothing is connected to it.
-			0x2041 => {
+			0x2041 if self.le.le_audio() => {
 				let status = self.le.extended_scan_parameters(params);
 				self.complete(opcode, &[status]);
 			}
-			0x2042 => {
+			0x2042 if self.le.le_audio() => {
 				let (status, began) = self.le.extended_scan_enable(params, clock());
 				self.complete(opcode, &[status]);
 				if began {
@@ -389,7 +392,7 @@ impl Fixture {
 			}
 			// LE EXTENDED CREATE CONNECTION, version 1: the filter policy, the own and peer address, the initiating PHYs and
 			// sixteen octets for each - on the air what the legacy one does.
-			0x2043 => {
+			0x2043 if self.le.le_audio() => {
 				let phys = params.get(9).copied().unwrap_or(0);
 				if params.len() < 10 || phys == 0 || phys & !0x07 != 0 || params.len() != 10 + 16 * phys.count_ones() as usize {
 					self.status(opcode, 0x12);
@@ -673,6 +676,17 @@ struct ControlView<'a> {
 impl bluetooth_fixture::Service for ControlView<'_> {
 	fn act(&mut self, peer: u8, action: FixtureAction, argument: u32) -> Result<u32, Error> {
 		let fixture = &mut *self.fixture;
+		// THE CONTROLLER ITSELF, peer 0: the kind it is from its next reset - an LE Audio one (1) or a plain LE one (0).
+		if peer == 0 {
+			if action != FixtureAction::LeFeatures || argument > 1 {
+				return Err(if action == FixtureAction::LeFeatures { Error::Invalid } else { Error::Unsupported });
+			}
+			fixture.le.choose_kind(argument == 1);
+			for line in fixture.le.take_log() {
+				fixture.note(line);
+			}
+			return Ok(0);
+		}
 		if peer == MOUSE {
 			// THE MOUSE does two things on the gate's word: forget its key, and drop its link.
 			match action {
@@ -762,7 +776,7 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			FixtureAction::HangUp => 20,
 			FixtureAction::AudioRequest => 21,
 			FixtureAction::PushObject => 22,
-			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall => return Err(Error::Unsupported),
+			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall | FixtureAction::LeFeatures => return Err(Error::Unsupported),
 		};
 		match fixture.world.act(peer, code, argument) {
 			Ok((result, outs)) => {
@@ -866,6 +880,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if common::stop_requested() {
 					common::finish_stop(bootstrap, &bind, 0, true);
 				}
+				// A DRIVER THAT LEAVES SAYS WHY, so a log tells this exit from a panic - which rt ends with no word.
+				print(b"bt-fixture: exiting - the manager's channel ended, or a wait on the fixture's channels failed\n");
 				exit();
 			}
 			Some(common::ProviderReady::Connected(_)) => {}
@@ -873,6 +889,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if !serve_control(&mut fixture, serving.at(index), &mut buf) {
 					let token = serving.close_at(index);
 					if !common::disconnected(bootstrap, &bind, token) {
+						print(b"bt-fixture: exiting - the manager did not take word that the control endpoint's probe left\n");
 						exit();
 					}
 				}
@@ -893,6 +910,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						}
 					}
 					if !common::disconnected(bootstrap, &bind, token) {
+						print(b"bt-fixture: exiting - the manager did not take word that the host left\n");
 						exit();
 					}
 				}

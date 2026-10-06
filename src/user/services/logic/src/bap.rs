@@ -328,6 +328,8 @@ impl Member {
 		if let Some(key) = self.set_key.as_ref() {
 			self.found.set = le_audio::sirk_of(key, &self.ltk_wire).map(|sirk| (sirk, self.set_size, self.set_rank));
 		}
+		// THE BOND'S KEY HAS DONE ITS ONE JOB: the walk keeps no copy of it.
+		self.ltk_wire = [0; 16];
 		alloc::vec![Out::Event(Event::Ready(self.found.clone()))]
 	}
 

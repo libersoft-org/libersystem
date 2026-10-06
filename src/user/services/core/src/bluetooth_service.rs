@@ -297,6 +297,17 @@ struct Stack {
 
 // ------------------------------------------------------------------ address forms
 
+// AN ADVERTISER'S ADDRESS KIND, by its type and its top bits: a static or a resolvable random address, or a public one;
+// a non-resolvable private address names nobody this host could find again.
+fn advertised_kind(kind: u8, address: &[u8; 6]) -> Option<PeerKind> {
+	match kind {
+		0 => Some(PeerKind::Public),
+		1 if address[0] & 0xc0 == 0xc0 => Some(PeerKind::RandomStatic),
+		1 if address[0] & 0xc0 == 0x40 => Some(PeerKind::Resolvable),
+		_ => None,
+	}
+}
+
 fn peer_to_wire(peer: &Peer) -> PeerAddress {
 	let kind = match peer[0] {
 		KIND_PUBLIC => PeerKind::Public,
@@ -1227,38 +1238,37 @@ impl Stack {
 			print(b"BluetoothService: an advertising report that runs past its event was refused\n");
 			return;
 		};
+		// A COORDINATED SET'S OTHER MEMBER, by its RSI - whether a scan lists it or not.
+		for advertisement in &found {
+			if let Some(kind) = advertised_kind(advertisement.kind, &advertisement.address) {
+				self.le_audio_advertised(at, &PeerAddress { kind, bytes: advertisement.address.to_vec() }, advertisement.data());
+			}
+		}
 		self.on_advertisements(at, found);
 	}
 
-	// AN EXTENDED REPORT THAT IS NOT A BROADCAST'S, read as the ordinary scan reads a legacy one: its first 31 bytes of
-	// data are where a name and service classes are.
+	// AN EXTENDED REPORT THAT IS NOT A BROADCAST'S: its whole data looked through for a set member's RSI - an LE Audio
+	// device's announcement runs past a legacy report's 31 bytes - then read as the ordinary scan reads a legacy one,
+	// whose first 31 bytes are where a name and service classes are.
 	pub(crate) fn extended_advertising(&mut self, at: usize, report: &service_logic::le_iso::ExtendedReport) {
+		let address = hci_codec::address_from_wire(&report.wire_address);
+		if let Some(kind) = advertised_kind(report.address_type & 1, &address) {
+			self.le_audio_advertised(at, &PeerAddress { kind, bytes: address.to_vec() }, &report.data);
+		}
 		let len = report.data.len().min(31);
 		let mut data = [0u8; 31];
 		data[..len].copy_from_slice(&report.data[..len]);
-		let advertisement = hci_codec::Advertisement { kind: report.address_type & 1, address: hci_codec::address_from_wire(&report.wire_address), rssi: report.rssi, data, data_len: len as u8 };
+		let advertisement = hci_codec::Advertisement { kind: report.address_type & 1, address, rssi: report.rssi, data, data_len: len as u8 };
 		self.on_advertisements(at, alloc::vec![advertisement]);
 	}
 
 	fn on_advertisements(&mut self, at: usize, found: Vec<hci_codec::Advertisement>) {
-		// A COORDINATED SET'S OTHER MEMBER, by its RSI - whether a scan lists it or not.
-		for advertisement in &found {
-			if advertisement.kind <= 1 {
-				let kind = if advertisement.kind == 0 { PeerKind::Public } else { PeerKind::RandomStatic };
-				self.le_audio_advertised(at, &PeerAddress { kind, bytes: advertisement.address.to_vec() }, advertisement.data());
-			}
-		}
 		let controller = &mut self.controllers[at];
 		let Some(scan) = controller.scan.as_mut().filter(|scan| scan.running) else { return };
 		for advertisement in found {
 			// A STATIC OR A RESOLVABLE RANDOM ADDRESS, or a public one; a non-resolvable private address names
 			// nobody this host could find again.
-			let kind = match advertisement.kind {
-				0 => PeerKind::Public,
-				1 if advertisement.address[0] & 0xc0 == 0xc0 => PeerKind::RandomStatic,
-				1 if advertisement.address[0] & 0xc0 == 0x40 => PeerKind::Resolvable,
-				_ => continue,
-			};
+			let Some(kind) = advertised_kind(advertisement.kind, &advertisement.address) else { continue };
 			// A PRIVATE ADDRESS A BOND RESOLVES is reported as that bond's identity.
 			let address = match (kind, controller.le.resolve(&advertisement.address)) {
 				(PeerKind::Resolvable, Some(identity)) => peer_to_wire(&identity),
@@ -1338,6 +1348,12 @@ impl Stack {
 		// middle of discovery, and feeding it to the discovery as the answer to its last request would
 		// end the procedure with a refusal it did not earn.
 		if pdu.first() == Some(&service_logic::att::op::HANDLE_VALUE_NOTIFICATION) {
+			self.on_notification(at, handle, pdu);
+			return;
+		}
+		// NOR IS AN INDICATION: confirmed - the peer sends nothing more until it is - and read as a notification.
+		if pdu.first() == Some(&0x1d) {
+			self.controllers[at].l2cap(handle, ATT_CID, &[0x1e]);
 			self.on_notification(at, handle, pdu);
 			return;
 		}

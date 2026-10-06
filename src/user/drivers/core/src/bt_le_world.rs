@@ -244,11 +244,16 @@ impl LeWorld {
 		self.devices[at].link.is_none() && self.devices[at].advertising
 	}
 
-	// WHAT ONE DEVICE ADVERTISES: its name in a connectable legacy PDU - or, for an earbud, connectable extended advertising
-	// with its services, its announcement and its set identifier.
+	// WHAT ONE DEVICE ADVERTISES: its name in a connectable legacy PDU - or, for an earbud on an LE Audio controller,
+	// connectable extended advertising with its services, its announcement and its set identifier; on a plain one, the
+	// legacy PDU with its name and services.
 	fn advert(&self, at: usize) -> Advert {
 		if let Some(ear) = self.devices[at].spec.earbud {
-			return Advert { event_type: 0x0001, address_type: 0x01, address: self.devices[at].spec.identity, secondary_phy: 1, sid: 0, rssi: -58 - ear as i8, periodic_interval: 0, data: self.audio.advertising_data(ear) };
+			let (identity, rssi) = (self.devices[at].spec.identity, -58 - ear as i8);
+			if !self.audio.le_audio() {
+				return Advert::legacy(0x01, identity, rssi, &self.audio.earbuds[ear].legacy_advertising_data());
+			}
+			return Advert { event_type: 0x0001, address_type: 0x01, address: identity, secondary_phy: 1, sid: 0, rssi, periodic_interval: 0, data: self.audio.advertising_data(ear) };
 		}
 		let name = self.devices[at].spec.name.as_bytes();
 		let mut data = alloc::vec![name.len() as u8 + 1, 0x09];
@@ -940,6 +945,29 @@ impl LeWorld {
 	}
 
 	// ------------------------------------------------------------------ the LE Audio world
+
+	// AN HCI RESET from the host: the controller's kind the gate chose takes effect, and the links end with no event.
+	pub fn hci_reset(&mut self) {
+		for device in self.devices.iter_mut() {
+			device.link = None;
+		}
+		self.audio.hci_reset();
+		for line in self.audio.take_log() {
+			self.say(line);
+		}
+	}
+
+	// THE GATE CHOOSES THE CONTROLLER'S KIND for the next HCI Reset: an LE Audio one, or a plain LE one.
+	pub fn choose_kind(&mut self, le_audio: bool) {
+		self.audio.choose(le_audio);
+		for line in self.audio.take_log() {
+			self.say(line);
+		}
+	}
+
+	pub fn le_audio(&self) -> bool {
+		self.audio.le_audio()
+	}
 
 	pub fn is_earbud(device: u8) -> bool {
 		device == bt_le_audio::EARBUD_L || device == bt_le_audio::EARBUD_R

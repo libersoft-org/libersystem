@@ -58,8 +58,10 @@ pub(crate) struct LeDevice {
 	// The stream to start once the group winding down has stopped: a call taking the device from music, or music
 	// coming back after it.
 	pub pending: Option<Purpose>,
-	// While the set's other members are looked for: when the device is offered with the members it has.
+	// While the set's other members are looked for: when the device is offered with the members it has; and the scan the
+	// search runs on - its id, and the deadline it had before the search lengthened it, none where the search began it.
 	pub search_until: Option<u64>,
+	pub search_scan: Option<(u32, Option<u64>)>,
 	pub coding: Vec<Coding>,
 	pub capture: VecDeque<i16>,
 	pub dropped: u64,
@@ -151,6 +153,10 @@ impl Stack {
 
 	// A BONDED LE PEER TRUSTED FOR AUDIO, its link encrypted: its table walked - once.
 	pub(crate) fn le_audio_start(&mut self, at: usize, handle: u16) {
+		// A CONTROLLER WITHOUT THE CIS CENTRAL ROLE carries no unicast stream: its earbuds are not offered at all.
+		if !self.controllers[at].le_audio_capable {
+			return;
+		}
 		let Some(link) = self.controllers[at].link(handle) else { return };
 		if link.le_audio.is_some() || !link.encrypted || link.is_classic() {
 			return;
@@ -161,11 +167,18 @@ impl Stack {
 		if !record.trusted.contains(&Profile::Audio) && !pending_member {
 			return;
 		}
+		// THE BOND'S KEY - looked up with its keys, as the list's records carry none - as the wire carries it, least
+		// significant first, which is how the walk takes it to decrypt a set's SIRK; the bond keeps it most significant
+		// first. The copies are zeroed once the walk holds its own.
+		let Some(mut bond) = self.bond(at, &peer) else { return };
 		let mut ltk = [0u8; 16];
-		if record.key.len() == 16 {
-			ltk.copy_from_slice(&record.key);
+		if bond.key.len() == 16 {
+			ltk.copy_from_slice(&bond.key);
+			ltk.reverse();
 		}
+		scrub_record(&mut bond);
 		let (member, outs) = Member::new(ltk);
+		scrub(&mut ltk);
 		if let Some(link) = self.controllers[at].link_mut(handle) {
 			link.le_audio = Some(LeLink { member: Box::new(member), found: None });
 		}
@@ -245,7 +258,7 @@ impl Stack {
 		let index = match self.le_devices.iter().position(|device| device.at == at && (device.holds(&peer) || sirk.is_some() && device.sirk == sirk)) {
 			Some(index) => index,
 			None => {
-				self.le_devices.push(LeDevice { at, sirk, size, members: Vec::new(), output: None, voice: None, media: None, channels: 1, group: None, purpose: None, pending: None, search_until: None, coding: Vec::new(), capture: VecDeque::new(), dropped: 0 });
+				self.le_devices.push(LeDevice { at, sirk, size, members: Vec::new(), output: None, voice: None, media: None, channels: 1, group: None, purpose: None, pending: None, search_until: None, search_scan: None, coding: Vec::new(), capture: VecDeque::new(), dropped: 0 });
 				self.le_devices.len() - 1
 			}
 		};
@@ -255,7 +268,8 @@ impl Stack {
 		// THE SET'S OTHER MEMBERS, looked for by their RSIs.
 		if (self.le_devices[index].members.len() as u8) < self.le_devices[index].size {
 			print(b"BluetoothService: an earbud is a member of a coordinated set; its other members are looked for\n");
-			self.scan_le(at, SEARCH_MS);
+			let scan = self.scan_le(at, SEARCH_MS);
+			self.le_devices[index].search_scan = scan;
 			self.le_devices[index].search_until = Some(clock().saturating_add(u64::from(SEARCH_MS) * TICKS_PER_SECOND / 1000));
 			return;
 		}
@@ -277,6 +291,7 @@ impl Stack {
 				continue;
 			}
 			self.le_devices[index].search_until = None;
+			self.le_search_done(index);
 			let at = self.le_devices[index].at;
 			let members = self.le_devices[index].members.clone();
 			let bonded: Vec<Peer> = members.into_iter().filter(|peer| self.record(at, peer).is_some()).collect();
@@ -339,6 +354,7 @@ impl Stack {
 			None
 		};
 		let voice = voice_config.and_then(|config| self.audio.offer(AudioEndpoint { id: 0, peer: peer_to_wire(&first), name, kind: AudioEndpointKind::Voice, rate: config.sample_rate, channels: 1, latency_us: config.frame_us * 2 + 20_000, hardware_volume: true, volume: level }, at, handle));
+		self.le_search_done(index);
 		let device = &mut self.le_devices[index];
 		device.search_until = None;
 		device.output = output;
@@ -351,16 +367,25 @@ impl Stack {
 	// THE SET'S OTHER MEMBER ADVERTISING: its RSI resolves with a device's key - paired, as the set's pairing was.
 	pub(crate) fn le_audio_advertised(&mut self, at: usize, address: &PeerAddress, data: &[u8]) {
 		let Some(rsi) = lea::rsi(data) else { return };
-		let Some(index) = self.le_devices.iter().position(|device| device.at == at && device.sirk.is_some_and(|sirk| lea::rsi_resolves(&sirk, &rsi)) && (device.members.len() as u8) < device.size) else { return };
+		let searching = self.le_devices.iter().any(|device| device.at == at && device.search_until.is_some());
+		let Some(index) = self.le_devices.iter().position(|device| device.at == at && device.sirk.is_some_and(|sirk| lea::rsi_resolves(&sirk, &rsi)) && (device.members.len() as u8) < device.size) else {
+			if searching {
+				print(b"BluetoothService: an advertiser's RSI names no set being looked for\n");
+			}
+			return;
+		};
 		let Some(peer) = peer_from_wire(address) else { return };
 		if self.le_devices[index].holds(&peer) || self.record(at, &peer).is_some() {
 			return;
 		}
 		// PAIRED AS THE SET'S - the operator's pairing of the first member was the consent - and a member only once the
 		// attempt is taken; one refused for now (another pairing running) is tried again at its next advertisement.
-		if self.pair_le(at, peer, false).is_ok() {
-			print(b"BluetoothService: the coordinated set's other member was found; it is paired as the set's\n");
-			self.le_devices[index].members.push(peer);
+		match self.pair_le(at, peer, false) {
+			Ok(()) => {
+				print(b"BluetoothService: the coordinated set's other member was found; it is paired as the set's\n");
+				self.le_devices[index].members.push(peer);
+			}
+			Err(error) => print(alloc::format!("BluetoothService: the coordinated set's other member was found, but its pairing was refused for now ({error:?}); it is tried again when it is heard again\n").as_bytes()),
 		}
 	}
 
@@ -589,22 +614,71 @@ impl Stack {
 	}
 
 	// A SCAN OF THE HOST'S OWN, for a set's other members: their advertisements reach `le_audio_advertised` whoever
-	// scans, so one already running - an operator's, or the broadcast sink's - is enough.
-	pub(crate) fn scan_le(&mut self, at: usize, ms: u32) {
-		if self.broadcast.scanning.is_some_and(|(held, _)| held == at) {
-			return;
+	// scans. A SCAN ALREADY RUNNING - an operator's, or the broadcast sink's - IS RESTARTED, and runs at least as long as
+	// the search: a controller reports each advertiser once per enable, and the other member was reported before this
+	// host held the set's key to know it.
+	//
+	// Answers the scan the search runs on: its id and the deadline it had before, where it lengthened one that ran.
+	pub(crate) fn scan_le(&mut self, at: usize, ms: u32) -> Option<(u32, Option<u64>)> {
+		let ticks = u64::from(ms).saturating_mul(TICKS_PER_SECOND) / 1000;
+		let due = clock().saturating_add(ticks.max(1));
+		if let Some((held, until)) = self.broadcast.scanning.as_mut()
+			&& *held == at
+		{
+			*until = (*until).max(due);
+			if let Some(controller) = self.controllers.get_mut(at) {
+				controller.command(le_iso::opcode::LE_SET_EXTENDED_SCAN_ENABLE, &le_iso::extended_scan_enable(false));
+				controller.command(le_iso::opcode::LE_SET_EXTENDED_SCAN_ENABLE, &le_iso::extended_scan_enable(true));
+			}
+			return None;
 		}
 		let id = self.next_scan;
-		let Some(controller) = self.controllers.get_mut(at) else { return };
-		if !controller.powered || controller.scan.as_ref().is_some_and(Scan::active) {
-			return;
+		let controller = self.controllers.get_mut(at)?;
+		if !controller.powered {
+			return None;
+		}
+		if let Some(scan) = controller.scan.as_mut().filter(|scan| scan.active()) {
+			if !scan.running {
+				return None;
+			}
+			let held = (scan.id, Some(scan.deadline));
+			scan.deadline = scan.deadline.max(due);
+			controller.le_scan_enable(false);
+			controller.le_scan_enable(true);
+			print(b"BluetoothService: the scan running is restarted to hear the set's other members\n");
+			return Some(held);
 		}
 		if !controller.le_scan_parameters() || !controller.le_scan_enable(true) {
-			return;
+			return None;
 		}
-		let ticks = u64::from(ms).saturating_mul(TICKS_PER_SECOND) / 1000;
-		controller.scan = Some(Scan { id, deadline: clock().saturating_add(ticks.max(1)), running: true, inquiring: false, results: Vec::new(), paging: Vec::new() });
+		controller.scan = Some(Scan { id, deadline: due, running: true, inquiring: false, results: Vec::new(), paging: Vec::new() });
 		self.next_scan = self.next_scan.wrapping_add(1);
+		Some((id, None))
+	}
+
+	// THE SEARCH IS OVER - every member found, or its time up: the scan it ran on gets its own deadline back, and one it
+	// began ends, so a scan the operator asks for next is not refused for it.
+	fn le_search_done(&mut self, index: usize) {
+		let Some((id, before)) = self.le_devices[index].search_scan.take() else { return };
+		let at = self.le_devices[index].at;
+		let Some(controller) = self.controllers.get_mut(at) else { return };
+		let now = clock();
+		let stop = match controller.scan.as_mut().filter(|scan| scan.id == id && scan.running) {
+			Some(scan) => match before {
+				Some(deadline) if deadline > now => {
+					scan.deadline = deadline;
+					false
+				}
+				_ => {
+					scan.running = false;
+					true
+				}
+			},
+			None => false,
+		};
+		if stop {
+			controller.le_scan_enable(false);
+		}
 	}
 
 	// ------------------------------------------------------------------ the samples

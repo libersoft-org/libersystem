@@ -1444,7 +1444,24 @@ fn voice(probe: &mut Probe) {
 // checked against. Bonded by the pairing phase.
 // ------------------------------------------------------------------ LE Audio
 
-// Ten milliseconds of two square waves at 48 kHz stereo - the left of period `left` samples, the right of `right` - as a
+// A SINE, NOT A SQUARE WAVE, for LC3: the codec quantizes a spectrum its noise shaping has tilted toward the highs, so
+// a square wave's third harmonic can come out the loudest line an earbud reads. sin(2 pi at / period) at 8000, from
+// the angle reduced to [-pi, pi] and its series - a part in a hundred thousand.
+fn sine(at: usize, period: usize) -> i16 {
+	let pi = core::f64::consts::PI;
+	let mut x = 2.0 * pi * (at % period) as f64 / period as f64;
+	if x > pi {
+		x -= 2.0 * pi;
+	}
+	let (mut term, mut sum) = (x, x);
+	for n in 1..9 {
+		term *= -x * x / ((2 * n) as f64 * (2 * n + 1) as f64);
+		sum += term;
+	}
+	(8_000.0 * sum) as i16
+}
+
+// Ten milliseconds of two sines at 48 kHz stereo - the left of period `left` samples, the right of `right` - as a
 // buffer a write carries.
 fn stereo_period(start: &mut usize, left: usize, right: usize) -> Buffer {
 	let frames = 480usize;
@@ -1457,8 +1474,8 @@ fn stereo_period(start: &mut usize, left: usize, right: usize) -> Buffer {
 	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames * 2) };
 	for frame in 0..frames {
 		let at = *start + frame;
-		samples[frame * 2] = if at % left < left / 2 { 8_000 } else { -8_000 };
-		samples[frame * 2 + 1] = if at % right < right / 2 { 8_000 } else { -8_000 };
+		samples[frame * 2] = sine(at, left);
+		samples[frame * 2 + 1] = sine(at, right);
 	}
 	*start += frames;
 	unmap_object(handle);
@@ -1543,7 +1560,7 @@ fn le_audio(probe: &mut Probe) {
 	}
 	say("the set is one device: AudioService's default output in stereo at 48 kHz, and a voice device at 16 kHz");
 
-	// MUSIC: the left channel a 1 kHz tone, the right 2 kHz - each earbud configured for its own, hearing only it.
+	// MUSIC: the left channel a 1 kHz sine, the right 2 kHz - each earbud configured for its own, hearing only it.
 	let stream = match audio::Client::new(ChannelTransport { chan: probe.audio }).open_stream(&48_000, &2) {
 		Some(Ok(stream)) => stream,
 		other => fail(&format!("a stream could not be opened: {other:?}")),
@@ -1666,7 +1683,7 @@ fn le_audio(probe: &mut Probe) {
 	print(b"btclassic: PASS leaudio\n");
 }
 
-// Ten milliseconds of a square wave of period `period` samples at 16 kHz mono.
+// Ten milliseconds of a sine of period `period` samples at 16 kHz mono.
 fn voice_period_of(start: &mut usize, period: usize) -> Buffer {
 	let frames = 160usize;
 	let handle = memory_object_create((frames * 2) as u64);
@@ -1677,7 +1694,7 @@ fn voice_period_of(start: &mut usize, period: usize) -> Buffer {
 	let Some(base) = (unsafe { map_object(handle) }) else { fail("a period could not be mapped") };
 	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames) };
 	for (at, sample) in samples.iter_mut().enumerate() {
-		*sample = if (*start + at) % period < period / 2 { 8_000 } else { -8_000 };
+		*sample = sine(*start + at, period);
 	}
 	*start += frames;
 	unmap_object(handle);
@@ -1783,7 +1800,10 @@ fn broadcast(probe: &mut Probe) {
 	probe.act(BROADCASTER, FixtureAction::Broadcast, 0);
 	say("an encrypted broadcast: no route without its code or with a wrong one, joined with the right one");
 
-	// THE SET'S LINKS GO: one member's leaves the device offered, both take it out of AudioService.
+	// THE SET'S LINKS GO: one member's leaves the device offered, both take it out of AudioService. Untrusted for audio
+	// first, so neither is taken back through the accept list the moment it drops.
+	probe.trust(EARBUD_L, Profile::Audio, false);
+	probe.trust(EARBUD_R, Profile::Audio, false);
 	probe.act(EARBUD_R, FixtureAction::Disconnect, 0);
 	sleep_until(clock() + TICKS);
 	if !audio_devices(probe).iter().any(|device| device.id == output.id) {
