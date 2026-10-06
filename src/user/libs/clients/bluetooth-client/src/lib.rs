@@ -59,6 +59,18 @@ unsafe extern "Rust" {
 	fn operator_media(chan: u64, controller: &u32, peer: &PeerAddress, command: &MediaCommand) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_disconnect"]
 	fn operator_disconnect(chan: u64, controller: &u32, peer: &PeerAddress, profile: &Profile) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_send"]
+	fn operator_send(chan: u64, controller: &u32, peer: &PeerAddress, name: &str, length: &Option<u64>) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_receive"]
+	fn operator_receive(chan: u64, controller: &u32, peer: &PeerAddress, max_bytes: &u64) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_connect_pan"]
+	fn operator_connect_pan(chan: u64, controller: &u32, peer: &PeerAddress, replace_uplink: &bool) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_object_push_write"]
+	fn object_push_write(chan: u64, data: &[u8]) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_object_push_finish"]
+	fn object_push_finish(chan: u64) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_bluetooth_object_push_abort"]
+	fn object_push_abort(chan: u64) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_bluetooth_bluetooth_operator_pair_legacy"]
 	fn operator_pair_legacy(chan: u64, controller: &u32, peer: &PeerAddress) -> Option<Result<(), Error>>;
 }
@@ -199,5 +211,52 @@ impl BluetoothOperatorClient {
 	#[inline(always)]
 	pub fn pair_legacy(&mut self, controller: u32, peer: &PeerAddress) -> Option<Result<(), Error>> {
 		unsafe { operator_pair_legacy(self.chan, &controller, peer) }
+	}
+
+	/// Tethering to a peer's network access point, with whether the link may replace a selected uplink.
+	#[inline(always)]
+	pub fn connect_pan(&mut self, controller: u32, peer: &PeerAddress, replace_uplink: bool) -> Option<Result<(), Error>> {
+		unsafe { operator_connect_pan(self.chan, &controller, peer, &replace_uplink) }
+	}
+
+	/// An object push: its `object-push` channel, written with `ObjectPushClient`.
+	#[inline(always)]
+	pub fn send(&mut self, controller: u32, peer: &PeerAddress, name: &str, length: Option<u64>) -> Option<Result<u64, Error>> {
+		unsafe { operator_send(self.chan, &controller, peer, name, &length) }
+	}
+
+	/// A receiver: the stream's consumer end, read with the protocol's `receive_read`.
+	#[inline(always)]
+	pub fn receive(&mut self, controller: u32, peer: &PeerAddress, max_bytes: u64) -> Option<Result<u64, Error>> {
+		unsafe { operator_receive(self.chan, &controller, peer, &max_bytes) }
+	}
+}
+
+/// AN OBJECT BEING PUSHED, from `BluetoothOperatorClient::send`.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct ObjectPushClient {
+	chan: u64,
+}
+
+impl ObjectPushClient {
+	#[inline(always)]
+	pub const fn new(chan: u64) -> Self {
+		Self { chan }
+	}
+
+	#[inline(always)]
+	pub fn write(&mut self, data: &[u8]) -> Option<Result<u64, Error>> {
+		unsafe { object_push_write(self.chan, data) }
+	}
+
+	#[inline(always)]
+	pub fn finish(&mut self) -> Option<Result<u64, Error>> {
+		unsafe { object_push_finish(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn abort(&mut self) -> Option<Result<(), Error>> {
+		unsafe { object_push_abort(self.chan) }
 	}
 }

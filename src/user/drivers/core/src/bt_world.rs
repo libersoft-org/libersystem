@@ -17,8 +17,14 @@
 //
 //   2 phone      DisplayYesNo, Secure Connections        Numeric Comparison
 //   3 keyboard   KeyboardOnly, Secure Connections        Passkey Entry, this host showing the digits
-//   4 headset    NoInputNoOutput, Secure Connections     Just Works; an incoming one asks consent
-//   5 serial     NoInputNoOutput, P-192 only             Just Works; a serial port on RFCOMM channel 3
+//   4 headset    NoInputNoOutput, Secure Connections     Just Works; an incoming one asks consent; an A2DP sink
+//                                                        and an HFP hands-free unit (`av`, `hf`)
+//   5 serial     NoInputNoOutput, P-192 only             Just Works; a serial port on RFCOMM channel 3 that
+//                                                        echoes what it receives, and Object Push on channel 4
+//
+// THE PHONE is a network access point on BNEP's PSM, leasing the host an address on a network of its own (`nap`); and
+// it takes an object pushed on its Object Push record - RFCOMM channel 12, or L2CAP's GOEP PSM 0x1021 in
+// enhanced retransmission mode - and pushes one to the host on the gate's word (`opp`).
 //   6 legacy     no Secure Simple Pairing                a PIN, 0000
 //   7 gamepad    NoInputNoOutput, Secure Connections     Just Works; a HID gamepad of the harness's shape
 //
@@ -37,6 +43,15 @@ mod tests;
 
 // A2DP and AVRCP: the headset's sink and remote control, the phone's stream and its remote control.
 mod av;
+
+// HFP: the headset's hands-free unit and its voice link.
+mod hf;
+
+// OBEX Object Push: the phone's and the serial device's servers, and the phone's push.
+mod opp;
+
+// PAN: the phone's network access point, and the little network behind it.
+mod nap;
 
 // ------------------------------------------------------------------ the devices
 
@@ -58,15 +73,17 @@ pub struct Spec {
 	// A DUAL-MODE DEVICE: it has the BR/EDR Security Manager, derives an LE key from a Secure Connections link key, and
 	// has an LE half in `bt_le_world` under the same public address.
 	pub dual: bool,
+	// AN OBJECT PUSH SERVER: its RFCOMM channel, and its GOEP L2CAP PSM where its record offers one.
+	pub opp: Option<(u8, Option<u16>)>,
 }
 
 pub const DEVICES: [Spec; 6] = [
-	Spec { name: "fixture phone", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x02], class: 0x5a020c, capability: 1, authentication: 0x05, ssp: true, secure_connections: true, uuids: &[0x1105, 0x110a, 0x110c, 0x1116, 0x111f], pin: b"", serial_channel: None, hid: None, dual: true },
-	Spec { name: "fixture keyboard", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x03], class: 0x002540, capability: 2, authentication: 0x05, ssp: true, secure_connections: true, uuids: &[0x1124], pin: b"", serial_channel: None, hid: Some(&KEYBOARD_DESCRIPTOR), dual: false },
-	Spec { name: "fixture headset", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x04], class: 0x240404, capability: 3, authentication: 0x04, ssp: true, secure_connections: true, uuids: &[0x111e, 0x1108, 0x110b, 0x110e], pin: b"", serial_channel: None, hid: None, dual: false },
-	Spec { name: "fixture serial", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x05], class: 0x001f00, capability: 3, authentication: 0x04, ssp: true, secure_connections: false, uuids: &[0x1101], pin: b"", serial_channel: Some(3), hid: None, dual: false },
-	Spec { name: "fixture legacy", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x06], class: 0x001f00, capability: 3, authentication: 0x00, ssp: false, secure_connections: false, uuids: &[0x1101], pin: b"0000", serial_channel: Some(1), hid: None, dual: false },
-	Spec { name: "fixture gamepad", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x07], class: 0x000508, capability: 3, authentication: 0x04, ssp: true, secure_connections: true, uuids: &[0x1124], pin: b"", serial_channel: None, hid: Some(&GAMEPAD_DESCRIPTOR), dual: false },
+	Spec { name: "fixture phone", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x02], class: 0x5a020c, capability: 1, authentication: 0x05, ssp: true, secure_connections: true, uuids: &[0x1105, 0x110a, 0x110c, 0x1116, 0x111f], pin: b"", serial_channel: None, hid: None, dual: true, opp: Some((12, Some(0x1021))) },
+	Spec { name: "fixture keyboard", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x03], class: 0x002540, capability: 2, authentication: 0x05, ssp: true, secure_connections: true, uuids: &[0x1124], pin: b"", serial_channel: None, hid: Some(&KEYBOARD_DESCRIPTOR), dual: false, opp: None },
+	Spec { name: "fixture headset", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x04], class: 0x240404, capability: 3, authentication: 0x04, ssp: true, secure_connections: true, uuids: &[0x111e, 0x1108, 0x110b, 0x110e], pin: b"", serial_channel: None, hid: None, dual: false, opp: None },
+	Spec { name: "fixture serial", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x05], class: 0x001f00, capability: 3, authentication: 0x04, ssp: true, secure_connections: false, uuids: &[0x1101, 0x1105], pin: b"", serial_channel: Some(3), hid: None, dual: false, opp: Some((4, None)) },
+	Spec { name: "fixture legacy", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x06], class: 0x001f00, capability: 3, authentication: 0x00, ssp: false, secure_connections: false, uuids: &[0x1101], pin: b"0000", serial_channel: Some(1), hid: None, dual: false, opp: None },
+	Spec { name: "fixture gamepad", address: [0x00, 0x1b, 0xdc, 0x20, 0x00, 0x07], class: 0x000508, capability: 3, authentication: 0x04, ssp: true, secure_connections: true, uuids: &[0x1124], pin: b"", serial_channel: None, hid: Some(&GAMEPAD_DESCRIPTOR), dual: false, opp: None },
 ];
 
 // The first device's number on the control endpoint.
@@ -80,12 +97,15 @@ pub const ACL_BUFFERS: u16 = 8;
 const LOG_LINES: usize = 256;
 // A received DLC's credits: given at negotiation, and topped up when half are used.
 const CREDITS: u8 = 7;
+// Frames a device holds unsent before it stops giving the host credits.
+const BACKLOG_FRAMES: usize = 8;
 
 // What the fixture sends the host.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Out {
 	Event(Vec<u8>),
 	Acl(Vec<u8>),
+	Sco(Vec<u8>),
 }
 
 // ------------------------------------------------------------------ state
@@ -118,6 +138,8 @@ struct Chan {
 	ours_done: bool,
 	theirs_done: bool,
 	open: bool,
+	// Enhanced retransmission mode, where the channel runs in it.
+	ertm: Option<opp::Ertm>,
 }
 
 struct Dlc {
@@ -130,6 +152,8 @@ struct Dlc {
 	received: usize,
 	// This side's modem status has gone.
 	msc_sent: bool,
+	// What arrived on it, for the profile above to read; dropped where none does.
+	inbox: Vec<u8>,
 }
 
 struct Rfcomm {
@@ -159,6 +183,10 @@ struct Link {
 	next_identifier: u8,
 	rfcomm: Option<Rfcomm>,
 	av: av::Av,
+	hf: hf::Hf,
+	opp: opp::Opp,
+	// The host's address on the PAN link, as its frames gave it: what BNEP's compressed forms leave out.
+	nap_host: [u8; 6],
 }
 
 struct Device {
@@ -173,6 +201,10 @@ struct Device {
 	link: Option<Link>,
 	// The host was paged and has not answered.
 	paging: bool,
+	// The gate asked the headset to connect to the voice gateway before it had a link: it does once encrypted.
+	hf_wanted: bool,
+	// A push the gate asked for: its size, and when it starts.
+	opp_wanted: Option<(u32, u64)>,
 }
 
 pub struct World {
@@ -398,7 +430,7 @@ impl Default for World {
 
 impl World {
 	pub fn new(seed: u64) -> World {
-		World { devices: DEVICES.iter().map(|spec| Device { spec, key: None, key_type: 0, reset: false, next_type: None, link: None, paging: false }).collect(), scan: 0, log: VecDeque::new(), random: seed | 1, transaction: 1, typing: Vec::new(), now: 0, derived: None }
+		World { devices: DEVICES.iter().map(|spec| Device { spec, key: None, key_type: 0, reset: false, next_type: None, link: None, paging: false, hf_wanted: false, opp_wanted: None }).collect(), scan: 0, log: VecDeque::new(), random: seed | 1, transaction: 1, typing: Vec::new(), now: 0, derived: None }
 	}
 
 	fn say(&mut self, line: String) {
@@ -470,7 +502,7 @@ impl World {
 
 	fn new_link(&mut self, at: usize) -> u16 {
 		let handle = FIRST_HANDLE + at as u16;
-		self.devices[at].link = Some(Link { handle, authenticated: false, encrypted: false, model: None, peer_started: false, host_capability: 3, host_authentication: 0, assembling: Vec::new(), want: 0, chans: Vec::new(), next_cid: 0x0040, next_identifier: 1, rfcomm: None, av: av::Av { volume: 0x40, ..av::Av::default() } });
+		self.devices[at].link = Some(Link { handle, authenticated: false, encrypted: false, model: None, peer_started: false, host_capability: 3, host_authentication: 0, assembling: Vec::new(), want: 0, chans: Vec::new(), next_cid: 0x0040, next_identifier: 1, rfcomm: None, av: av::Av { volume: 0x40, ..av::Av::default() }, hf: hf::Hf::default(), opp: opp::Opp::default(), nap_host: [0; 6] });
 		handle
 	}
 
@@ -535,6 +567,7 @@ impl World {
 				let handle = self.new_link(at);
 				self.say(format!("accepted {} - this host took its page", self.short(at)));
 				out.push(self.connection_complete(at, 0, handle));
+				out.extend(self.hf_linked(at));
 			}
 			0x040A => {
 				out.push(status(opcode, 0));
@@ -707,7 +740,18 @@ impl World {
 				let h = handle_of(params).to_le_bytes();
 				out.push(event(0x14, &[0, h[0], h[1], 0, 0, 0]));
 			}
-			0x080B | 0x042A | 0x0429 | 0x0428 => out.push(status(opcode, 0)),
+			0x080B | 0x042A | 0x0429 => out.push(status(opcode, 0)),
+			// THE HOST SETS A VOICE LINK UP to a headset: transparent data - the voice setting's air coding bits 11 - is
+			// mSBC.
+			0x0428 => {
+				out.push(status(opcode, 0));
+				let setting = params.get(12..14).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+				out.extend(self.sco_setup(handle_of(params), setting & 0x0003 == 0x0003));
+			}
+			0x0406 if self.owns_sco(handle_of(params)).is_some() => {
+				out.push(status(opcode, 0));
+				out.extend(self.sco_down(handle_of(params)));
+			}
 			0x0406 => {
 				let handle = handle_of(params);
 				let at = self.by_handle(handle)?;
@@ -972,6 +1016,13 @@ impl World {
 			15 => out.extend(self.phone_stream(at, argument)?),
 			16 => out.extend(self.headset_volume(at, argument as u8)?),
 			17 => out.extend(self.headset_play(at)?),
+			// THE HEADSET'S HANDS-FREE UNIT: it connects to the voice gateway, answers, hangs up, asks for audio.
+			18 => out.extend(self.hf_connect(at)?),
+			19 => out.extend(self.hf_press(at, "ATA")?),
+			20 => out.extend(self.hf_press(at, "AT+CHUP")?),
+			21 => out.extend(self.hf_press(at, "AT+BCC")?),
+			// THE PHONE PUSHES AN OBJECT of `argument` bytes, five seconds from now.
+			22 => out.extend(self.opp_push(at, argument)?),
 			14 => {
 				let remote = self.interrupt(at).ok_or("the gamepad's input is not connected")?;
 				let buttons = (argument as u16).to_le_bytes();
@@ -1102,17 +1153,25 @@ impl World {
 		let link = self.devices[at].link.as_mut()?;
 		let local = link.next_cid;
 		link.next_cid += 1;
-		link.chans.push(Chan { local, remote: 0, psm, purpose, ours_done: false, theirs_done: false, open: false });
+		link.chans.push(Chan { local, remote: 0, psm, purpose, ours_done: false, theirs_done: false, open: false, ertm: None });
 		let mut data = psm.to_le_bytes().to_vec();
 		data.extend_from_slice(&local.to_le_bytes());
 		Some(self.signal(at, 0x02, None, &data).into_iter().collect())
 	}
 
-	fn configure(&mut self, at: usize, remote: u16) -> Option<Out> {
-		// The default MTU: what a small device takes, and a test that the host fragments to it.
+	fn configure(&mut self, at: usize, remote: u16, ertm: bool, mtu: u16) -> Option<Out> {
+		// The default MTU of 672: what a small device takes, and a test that the host fragments to it. BNEP's channel
+		// takes a whole Ethernet frame.
 		let mut data = remote.to_le_bytes().to_vec();
 		data.extend_from_slice(&[0, 0, 0x01, 0x02]);
-		data.extend_from_slice(&672u16.to_le_bytes());
+		data.extend_from_slice(&mtu.to_le_bytes());
+		if ertm {
+			// ENHANCED RETRANSMISSION: a window of ten, three transmissions, two seconds and twelve, segments of 670.
+			data.extend_from_slice(&[0x04, 0x09, 0x03, 10, 3]);
+			data.extend_from_slice(&2000u16.to_le_bytes());
+			data.extend_from_slice(&12000u16.to_le_bytes());
+			data.extend_from_slice(&670u16.to_le_bytes());
+		}
 		self.signal(at, 0x04, None, &data)
 	}
 
@@ -1131,15 +1190,17 @@ impl World {
 				// THE HOST OPENS A CHANNEL: accepted, and this side's configuration follows.
 				0x02 => {
 					let (psm, scid) = (u16_at(0), u16_at(2));
+					// THE DEVICE'S OBJECT PUSH ON L2CAP runs in enhanced retransmission mode, as GOEP requires.
+					let ertm = self.devices[at].spec.opp.and_then(|(_, goep)| goep) == Some(psm);
 					let Some(link) = self.devices[at].link.as_mut() else { break };
 					let local = link.next_cid;
 					link.next_cid += 1;
-					link.chans.push(Chan { local, remote: scid, psm, purpose: Purpose::Host, ours_done: false, theirs_done: false, open: false });
+					link.chans.push(Chan { local, remote: scid, psm, purpose: Purpose::Host, ours_done: false, theirs_done: false, open: false, ertm: ertm.then(opp::Ertm::default) });
 					let mut response = local.to_le_bytes().to_vec();
 					response.extend_from_slice(&scid.to_le_bytes());
 					response.extend_from_slice(&[0, 0, 0, 0]);
 					out.extend(self.signal(at, 0x03, Some(identifier), &response));
-					out.extend(self.configure(at, scid));
+					out.extend(self.configure(at, scid, ertm, if psm == nap::BNEP_PSM { nap::BNEP_MTU } else { 672 }));
 				}
 				0x03 => {
 					let (dcid, scid, result) = (u16_at(0), u16_at(2), u16_at(4));
@@ -1152,11 +1213,15 @@ impl World {
 					let psm = link.chans[position].psm;
 					self.log.push_back(format!("l2cap {name} psm {psm:#06x} result {result}"));
 					if result != 0 {
-						link.chans.remove(position);
+						let purpose = link.chans.remove(position).purpose;
+						// THE HOST REFUSED THE SESSION A PUSH NEEDS.
+						if purpose == Purpose::Rfcomm(opp::HOST_CHANNEL) {
+							self.opp_refused(at);
+						}
 						continue;
 					}
 					link.chans[position].remote = dcid;
-					out.extend(self.configure(at, dcid));
+					out.extend(self.configure(at, dcid, false, 672));
 				}
 				0x04 => {
 					let dcid = u16_at(0);
@@ -1271,7 +1336,10 @@ impl World {
 
 	fn channel_data(&mut self, at: usize, cid: u16, payload: &[u8]) -> Vec<Out> {
 		let mut out = Vec::new();
-		let Some((psm, purpose, remote)) = self.devices[at].link.as_ref().and_then(|link| link.chans.iter().find(|chan| chan.local == cid && chan.open)).map(|chan| (chan.psm, chan.purpose, chan.remote)) else { return out };
+		let Some((psm, purpose, remote, ertm)) = self.devices[at].link.as_ref().and_then(|link| link.chans.iter().find(|chan| chan.local == cid && chan.open)).map(|chan| (chan.psm, chan.purpose, chan.remote, chan.ertm.is_some())) else { return out };
+		if ertm {
+			return self.opp_l2cap(at, cid, remote, payload);
+		}
 		match (psm, purpose) {
 			(0x0001, Purpose::Sdp(uuid)) => {
 				// THE HOST'S ANSWER TO THIS DEVICE'S SEARCH: how many records matched.
@@ -1291,6 +1359,7 @@ impl World {
 			}
 			(0x0001, _) => out.extend(self.sdp_server(at, remote, payload)),
 			(0x0003, _) => out.extend(self.rfcomm_receive(at, cid, remote, payload)),
+			(nap::BNEP_PSM, _) if self.devices[at].spec.uuids.contains(&0x1116) => out.extend(self.nap_receive(at, remote, payload)),
 			(av::AVDTP | av::AVCTP, _) => out.extend(self.av_data(at, cid, psm, payload)),
 			// A PROTOCOL CHANGE on the HID control channel is answered with a successful handshake.
 			(HID_CONTROL, _) => {
@@ -1351,6 +1420,41 @@ impl World {
 				de_text("fixture serial port"),
 			]));
 		}
+		// A NETWORK ACCESS POINT'S RECORD: BNEP on its PSM, version 1.0.
+		if spec.uuids.contains(&0x1116) && asked.contains(&0x1116) {
+			lists.push(de_sequence(&[
+				de_u16(0x0000),
+				de_u32(0x0001_0030),
+				de_u16(0x0001),
+				de_sequence(&[de_uuid(0x1116)]),
+				de_u16(0x0004),
+				de_sequence(&[de_sequence(&[de_uuid(0x0100), de_u16(nap::BNEP_PSM)]), de_sequence(&[de_uuid(0x000f), de_u16(0x0100), de_sequence(&[de_u16(0x0800), de_u16(0x0806)])])]),
+				de_u16(0x0009),
+				de_sequence(&[de_sequence(&[de_uuid(0x1116), de_u16(0x0100)])]),
+			]));
+		}
+		// AN OBJECT PUSH SERVER'S RECORD: its RFCOMM channel, OBEX over it, and its GOEP L2CAP PSM where it has one.
+		if let Some((channel, goep)) = spec.opp
+			&& asked.contains(&0x1105)
+		{
+			let mut record = alloc::vec![
+				de_u16(0x0000),
+				de_u32(0x0001_0020),
+				de_u16(0x0001),
+				de_sequence(&[de_uuid(0x1105)]),
+				de_u16(0x0004),
+				de_sequence(&[de_sequence(&[de_uuid(0x0100)]), de_sequence(&[de_uuid(0x0003), de_u8(channel)]), de_sequence(&[de_uuid(0x0008)])]),
+				de_u16(0x0009),
+				de_sequence(&[de_sequence(&[de_uuid(0x1105), de_u16(0x0102)])]),
+			];
+			if let Some(psm) = goep {
+				record.push(de_u16(0x0200));
+				record.push(de_u16(psm));
+			}
+			record.push(de_u16(0x0303));
+			record.push(de_sequence(&[de_u8(0xff)]));
+			lists.push(de_sequence(&record));
+		}
 		// AN A2DP SINK'S RECORD - the headset's - or a source's - the phone's - on AVDTP's PSM, version 1.3.
 		for class in [0x110bu16, 0x110a] {
 			if spec.uuids.contains(&class) && asked.contains(&class) {
@@ -1408,6 +1512,7 @@ impl World {
 		}
 		let name = self.short(at);
 		let serial_channel = self.devices[at].spec.serial_channel;
+		let opp_channel = self.devices[at].spec.opp.map(|(channel, _)| channel);
 		let Some(link) = self.devices[at].link.as_mut() else { return out };
 		let rfcomm = link.rfcomm.get_or_insert(Rfcomm { cid, initiator: false, mux: false, opening: None, dlcs: Vec::new() });
 		let initiator = rfcomm.initiator;
@@ -1418,6 +1523,11 @@ impl World {
 		let check = if control == UIH { crc8(&frame[..2]) } else { crc8(&frame[..header]) };
 		let mut sends: Vec<Vec<u8>> = Vec::new();
 		let mut lines: Vec<String> = Vec::new();
+		let gateway = hf::GATEWAY_CHANNEL << 1;
+		let was_open = rfcomm.dlcs.iter().any(|dlc| dlc.dlci == gateway && dlc.open);
+		let host_opp = opp::HOST_CHANNEL << 1;
+		let push_was_open = rfcomm.dlcs.iter().any(|dlc| dlc.dlci == host_opp && dlc.open);
+		let push_opening = rfcomm.opening == Some(opp::HOST_CHANNEL);
 		if frame[frame.len() - 1] != check {
 			lines.push(format!("rfcomm {name} dropped a frame with a bad check"));
 		} else {
@@ -1427,7 +1537,38 @@ impl World {
 			if body_start + len + 1 == frame.len() {
 				let info = frame[body_start..body_start + len].to_vec();
 				let credits = has_credits.then(|| frame[header]);
-				Self::rfcomm_frame_in(rfcomm, initiator, serial_channel, name, dlci, control, credits, &info, &mut sends, &mut lines);
+				Self::rfcomm_frame_in(rfcomm, initiator, &[serial_channel, opp_channel], name, dlci, control, credits, &info, &mut sends, &mut lines);
+			}
+		}
+		// WHAT ARRIVED ON THE VOICE GATEWAY'S CHANNEL is the hands-free unit's to read; on the serial port's, it is echoed
+		// back as its credits allow; on any other, nobody's.
+		let mut delivered = Vec::new();
+		let mut opened = false;
+		let mut push_opened = false;
+		let mut push_answer = Vec::new();
+		let mut served_bytes = Vec::new();
+		let push_refused = push_opening && rfcomm.opening.is_none() && !rfcomm.dlcs.iter().any(|dlc| dlc.dlci == host_opp);
+		for dlc in rfcomm.dlcs.iter_mut() {
+			// THE GATEWAY IS A CHANNEL THE HEADSET OPENED: a session this side began.
+			if dlc.dlci == gateway && initiator {
+				opened = dlc.open && !was_open;
+				delivered = core::mem::take(&mut dlc.inbox);
+			} else if dlc.dlci == host_opp && initiator {
+				// THE HOST'S OBJECT PUSH CHANNEL, which the phone's push opened.
+				push_opened = dlc.open && !push_was_open;
+				push_answer = core::mem::take(&mut dlc.inbox);
+			} else if !initiator && opp_channel == Some(dlc.dlci >> 1) {
+				served_bytes = core::mem::take(&mut dlc.inbox);
+			} else if dlc.open && serial_channel == Some(dlc.dlci >> 1) && !dlc.inbox.is_empty() {
+				let echo = core::mem::take(&mut dlc.inbox);
+				dlc.queued.push_back(echo);
+				while dlc.tx_credits > 0 {
+					let Some(data) = dlc.queued.pop_front() else { break };
+					dlc.tx_credits -= 1;
+					sends.push(rfcomm_frame(dlc.dlci, Self::cr(initiator, true), UIH, false, None, &data));
+				}
+			} else {
+				dlc.inbox.clear();
 			}
 		}
 		for line in lines {
@@ -1436,12 +1577,34 @@ impl World {
 		for send in sends {
 			out.extend(self.send_pdu(at, remote, &send));
 		}
+		if opened {
+			out.extend(self.hf_opened(at));
+		}
+		if !delivered.is_empty() {
+			out.extend(self.hf_receive(at, &delivered));
+		}
+		if push_refused {
+			self.opp_refused(at);
+		}
+		if push_opened {
+			out.extend(self.opp_opened(at));
+		}
+		if !push_answer.is_empty() {
+			out.extend(self.opp_answer(at, &push_answer));
+		}
+		if !served_bytes.is_empty()
+			&& let Some(channel) = opp_channel
+		{
+			for reply in self.opp_serve(at, &served_bytes, "RFCOMM") {
+				out.extend(self.rfcomm_write(at, channel, &reply));
+			}
+		}
 		out
 	}
 
 	// One well-formed frame, on the session's own state: what to send back and what to say.
 	#[allow(clippy::too_many_arguments)]
-	fn rfcomm_frame_in(rfcomm: &mut Rfcomm, initiator: bool, serial_channel: Option<u8>, name: &str, dlci: u8, control: u8, credits: Option<u8>, info: &[u8], sends: &mut Vec<Vec<u8>>, lines: &mut Vec<String>) {
+	fn rfcomm_frame_in(rfcomm: &mut Rfcomm, initiator: bool, served: &[Option<u8>], name: &str, dlci: u8, control: u8, credits: Option<u8>, info: &[u8], sends: &mut Vec<Vec<u8>>, lines: &mut Vec<String>) {
 		match (dlci, control) {
 			(0, SABM) => {
 				rfcomm.mux = true;
@@ -1452,7 +1615,7 @@ impl World {
 				// THE MULTIPLEXER IS OPEN: the parameters for the DLC this side is opening, credits asked for.
 				if let Some(channel) = rfcomm.opening {
 					let dlci = channel << 1;
-					rfcomm.dlcs.push(Dlc { dlci, open: false, tx_credits: 0, rx_credits: u16::from(CREDITS), queued: VecDeque::new(), received: 0, msc_sent: false });
+					rfcomm.dlcs.push(Dlc { dlci, open: false, tx_credits: 0, rx_credits: u16::from(CREDITS), queued: VecDeque::new(), received: 0, msc_sent: false, inbox: Vec::new() });
 					let frame_size = 127u16.to_le_bytes();
 					sends.push(Self::mcc(initiator, 0x20, true, &[dlci, 0xF0, 0, 0, frame_size[0], frame_size[1], 0, CREDITS]));
 				}
@@ -1472,11 +1635,11 @@ impl World {
 					// THE HOST NEGOTIATES A DLC on this device's server channel: credits accepted.
 					(0x20, true) if body.len() >= 8 => {
 						let dlci = body[0] & 0x3F;
-						if serial_channel != Some(dlci >> 1) {
+						if !served.contains(&Some(dlci >> 1)) {
 							sends.push(rfcomm_frame(dlci, Self::cr(initiator, false), DM, true, None, &[]));
 						} else {
 							rfcomm.dlcs.retain(|dlc| dlc.dlci != dlci);
-							rfcomm.dlcs.push(Dlc { dlci, open: false, tx_credits: u16::from(body[7] & 7), rx_credits: u16::from(CREDITS), queued: VecDeque::new(), received: 0, msc_sent: false });
+							rfcomm.dlcs.push(Dlc { dlci, open: false, tx_credits: u16::from(body[7] & 7), rx_credits: u16::from(CREDITS), queued: VecDeque::new(), received: 0, msc_sent: false, inbox: Vec::new() });
 							let mut answer = body.clone();
 							answer[1] = 0xE0;
 							answer[7] = CREDITS;
@@ -1547,19 +1710,21 @@ impl World {
 				}
 				if !info.is_empty() {
 					dlc.received += info.len();
+					dlc.inbox.extend_from_slice(info);
 					dlc.rx_credits = dlc.rx_credits.saturating_sub(1);
-					// CREDITS BACK when half are used, on an empty frame.
-					if dlc.rx_credits <= u16::from(CREDITS) / 2 {
-						let grant = u16::from(CREDITS) - dlc.rx_credits;
-						dlc.rx_credits += grant;
-						sends.push(rfcomm_frame(dlci, Self::cr(initiator, true), UIH, true, Some(grant as u8), &[]));
-					}
 				}
 				// What waited for credits goes now.
 				while dlc.tx_credits > 0 {
 					let Some(data) = dlc.queued.pop_front() else { break };
 					dlc.tx_credits -= 1;
 					sends.push(rfcomm_frame(dlci, Self::cr(initiator, true), UIH, false, None, &data));
+				}
+				// CREDITS BACK when half are used, on an empty frame - unless the device holds a backlog it could not
+				// send, as a device with a small buffer does: then the host waits, and its writer with it.
+				if dlc.rx_credits <= u16::from(CREDITS) / 2 && dlc.queued.len() < BACKLOG_FRAMES {
+					let grant = u16::from(CREDITS) - dlc.rx_credits;
+					dlc.rx_credits += grant;
+					sends.push(rfcomm_frame(dlci, Self::cr(initiator, true), UIH, true, Some(grant as u8), &[]));
 				}
 			}
 			_ => {}
@@ -1645,6 +1810,34 @@ impl World {
 		}
 		self.now = now;
 		out.extend(self.phone_tick(now));
+		out.extend(self.sco_tick(now));
+		out.extend(self.opp_tick(now));
+		out
+	}
+
+	// BYTES ON ONE OPEN DLC to the host, as its credits allow; the rest wait for the host's.
+	fn rfcomm_write(&mut self, at: usize, channel: u8, bytes: &[u8]) -> Vec<Out> {
+		let mut out = Vec::new();
+		let Some(link) = self.devices[at].link.as_mut() else { return out };
+		let Some(rfcomm) = link.rfcomm.as_mut() else { return out };
+		let cid = rfcomm.cid;
+		let cr = Self::cr(rfcomm.initiator, true);
+		let Some(dlc) = rfcomm.dlcs.iter_mut().find(|dlc| dlc.dlci >> 1 == channel && dlc.open) else { return out };
+		let dlci = dlc.dlci;
+		// FRAMES OF AT MOST 127 BYTES: what this side asks for when it opens a DLC, and less than the host takes.
+		for piece in bytes.chunks(127) {
+			dlc.queued.push_back(piece.to_vec());
+		}
+		let mut sends = Vec::new();
+		while dlc.tx_credits > 0 {
+			let Some(data) = dlc.queued.pop_front() else { break };
+			dlc.tx_credits -= 1;
+			sends.push(rfcomm_frame(dlci, cr, UIH, false, None, &data));
+		}
+		let Some(remote) = self.remote_of(at, cid) else { return out };
+		for send in sends {
+			out.extend(self.send_pdu(at, remote, &send));
+		}
 		out
 	}
 

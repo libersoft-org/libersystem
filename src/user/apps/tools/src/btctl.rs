@@ -24,8 +24,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use bluetooth_client::{BluetoothClient, BluetoothOperatorClient};
-use proto::system::{BondLevel, DeviceStatus, Error, KeyAgreement, LaunchContext, MediaCommand, PairingPrompt, PairingState, PeerAddress, PeerKind, Profile, PromptQuestion, PromptReply, Radio, bluetooth_operator};
+use bluetooth_client::{BluetoothClient, BluetoothOperatorClient, ObjectPushClient};
+use proto::system::{BondLevel, DeviceStatus, Error, KeyAgreement, LaunchContext, MediaCommand, PairingPrompt, PairingState, PeerAddress, PeerKind, Profile, PromptQuestion, PromptReply, Radio, ReceivedKind, bluetooth_operator};
 use rt::*;
 use tools::{parse_u64, split_args};
 
@@ -51,12 +51,17 @@ const USAGE: &[u8] = b"usage: btctl [-c N] COMMAND
   untrust ADDRESS PROFILE
   alias ADDRESS NAME                the name an application grant names a peer by; - clears it
   connect ADDRESS PROFILE
+  connect ADDRESS pan replace       tether, and let the link replace the network's selected uplink
   disconnect ADDRESS PROFILE
   enable ADDRESS | disable ADDRESS  trust for input, as before
   forget ADDRESS
   media ADDRESS play|pause|next|previous   the remote control, toward a phone playing here
+  send ADDRESS NAME < FILE          push FILE to a bonded device over Object Push, named NAME
+  receive ADDRESS MAX-BYTES > FILE  take the one object that bonded device pushes in the next 180 seconds
   power on|off
 ";
+// The largest piece one object-push write carries.
+const PUSH_PIECE: usize = 1024;
 
 struct Tool {
 	read: u64,
@@ -115,6 +120,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		(Some(b"untrust"), 3) => tool.trust(args[1], parse_profile(args[2]).unwrap_or_else(|| usage()), false),
 		(Some(b"alias"), 3) => tool.alias(args[1], if args[2] == b"-" { b"" } else { args[2] }),
 		(Some(b"connect"), 3) => tool.connect(args[1], parse_profile(args[2]).unwrap_or_else(|| usage()), true),
+		(Some(b"connect"), 4) if args[2] == b"pan" && args[3] == b"replace" => tool.tether(args[1]),
 		(Some(b"disconnect"), 3) => tool.connect(args[1], parse_profile(args[2]).unwrap_or_else(|| usage()), false),
 		(Some(b"enable"), 2) => tool.trust(args[1], Profile::Input, true),
 		(Some(b"disable"), 2) => tool.trust(args[1], Profile::Input, false),
@@ -129,6 +135,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			};
 			tool.media(args[1], command);
 		}
+		(Some(b"send"), 3) => tool.send(args[1], args[2]),
+		(Some(b"receive"), 3) => tool.receive(args[1], parse_u64(args[2]).unwrap_or_else(|| usage())),
 		(Some(b"power"), 2) => match args[1] {
 			b"on" => tool.power(true),
 			b"off" => tool.power(false),
@@ -560,6 +568,16 @@ impl Tool {
 		}
 	}
 
+	// TETHER, AND LET THE LINK REPLACE THE NETWORK'S SELECTED UPLINK - which `connect ADDRESS pan` alone does not: that
+	// link is held while another is selected.
+	fn tether(&self, text: &[u8]) {
+		let Some(peer) = self.known(text) else { return };
+		match self.operator().connect_pan(self.controller, &peer, true) {
+			Some(Ok(())) => print(format!("connecting pan to {}, allowed to replace the uplink\n", address(&peer)).as_bytes()),
+			other => report("the connection", other),
+		}
+	}
+
 	// A BUTTON ON THE REMOTE CONTROL, pressed and let go over AVRCP toward a phone this system is connected to.
 	fn media(&self, text: &[u8], command: MediaCommand) {
 		let Some(peer) = self.known(text) else { return };
@@ -567,6 +585,128 @@ impl Tool {
 			Some(Ok(())) => print(format!("sent {command:?} to {}\n", address(&peer)).as_bytes()),
 			Some(Err(Error::Closed)) => print(b"btctl: the device is not connected\n"),
 			other => report("the remote-control command", other),
+		}
+	}
+
+	// PUSH AN OBJECT: the bytes of the stream the shell's input redirection opened, forwarded on the operator
+	// connection. This tool opens no file and the service holds no storage authority: the shell read the file the user
+	// named, and NAME is only what the peer is told.
+	fn send(&self, text: &[u8], name: &[u8]) {
+		let Some(peer) = self.known(text) else { exit_with(1) };
+		let Ok(name) = core::str::from_utf8(name) else { usage() };
+		let input = stdin();
+		if input == 0 {
+			eprint(b"btctl: send reads the object from its input: btctl send ADDRESS NAME < FILE\n");
+			exit_with(1);
+		}
+		let chan = match self.operator().send(self.controller, &peer, name, None) {
+			Some(Ok(chan)) => chan,
+			other => {
+				report("the push", other);
+				exit_with(1);
+			}
+		};
+		let mut push = ObjectPushClient::new(chan);
+		let mut reader = stream::Reader::new(input);
+		let mut chunk = alloc::vec![0u8; stream::MAX_CHUNK];
+		'reading: loop {
+			let len = match reader.read(&mut chunk) {
+				stream::Chunk::Data(len) => len,
+				stream::Chunk::End => break,
+				stream::Chunk::Failed => {
+					eprint(b"btctl: the input failed; the push is abandoned\n");
+					let _ = push.abort();
+					exit_with(1);
+				}
+			};
+			for piece in chunk[..len].chunks(PUSH_PIECE) {
+				let mut offset = 0;
+				while offset < piece.len() {
+					match push.write(&piece[offset..]) {
+						Some(Ok(taken)) => offset += taken as usize,
+						// THE PEER HAS NOT TAKEN WHAT IS QUEUED: a moment, and again.
+						Some(Err(Error::Again)) => sleep_until(clock() + TICKS / 50),
+						// THE PUSH IS OVER: `finish` says why.
+						_ => break 'reading,
+					}
+				}
+			}
+		}
+		match push.finish() {
+			Some(Ok(bytes)) => print(format!("sent {name:?}, {bytes} bytes, to {}\n", address(&peer)).as_bytes()),
+			Some(Err(Error::Denied)) => {
+				eprint(b"btctl: the device refused the object\n");
+				exit_with(1);
+			}
+			Some(Err(Error::NotFound)) => {
+				eprint(b"btctl: the device offers no Object Push\n");
+				exit_with(1);
+			}
+			other => {
+				report("the push", other);
+				exit_with(1);
+			}
+		}
+	}
+
+	// RECEIVE ONE OBJECT, consented by this invocation: the bonded peer's page and its push admitted while this waits -
+	// at most 180 seconds - and its bytes written to this tool's output, which the shell's redirection writes where
+	// the user chose. The peer's name for the object is reported, escaped, on the diagnostics endpoint, and never used
+	// as a path. AN OBJECT THAT DOES NOT ARRIVE WHOLE is reported with the bytes that did, and this exits failed.
+	fn receive(&self, text: &[u8], max_bytes: u64) {
+		let Some(peer) = self.known(text) else { exit_with(1) };
+		let stream = match self.operator().receive(self.controller, &peer, max_bytes) {
+			Some(Ok(stream)) => stream,
+			other => {
+				report("waiting for an object", other);
+				exit_with(1);
+			}
+		};
+		eprint(format!("btctl: waiting up to 180 seconds for {} to push an object of at most {max_bytes} bytes\n", address(&peer)).as_bytes());
+		let mut buf = alloc::vec![0u8; 4096];
+		loop {
+			let (len, handles) = match recv_caps_blocking(stream, &mut buf) {
+				ReceivedCaps::Message { len, handles } => (len, handles),
+				ReceivedCaps::Closed => {
+					eprint(b"btctl: the Bluetooth service ended the receive before the object did\n");
+					exit_with(1);
+				}
+			};
+			let mut handles = handles;
+			let event = bluetooth_operator::receive_read(&buf[..len], &mut handles);
+			for &leftover in handles.as_slice() {
+				close(leftover);
+			}
+			let Some(event) = event else { continue };
+			match event.kind {
+				ReceivedKind::Offered => {
+					let declared = event.declared.map(|bytes| format!("{bytes} bytes")).unwrap_or_else(|| String::from("no length declared"));
+					let kind = if event.object_type.is_empty() { String::from("no type") } else { format!("type {:?}", event.object_type) };
+					eprint(format!("btctl: receiving {:?} from {}: {declared}, {kind}\n", event.name, address(&peer)).as_bytes());
+				}
+				ReceivedKind::Data => {
+					if !write_stdout(&event.bytes) {
+						eprint(b"btctl: the output went away; the object is abandoned\n");
+						close(stream);
+						exit_with(1);
+					}
+				}
+				ReceivedKind::Complete => {
+					eprint(format!("btctl: received {} bytes\n", event.received).as_bytes());
+					close(stream);
+					return;
+				}
+				ReceivedKind::Failed => {
+					eprint(format!("btctl: the object did not arrive whole: {} bytes received\n", event.received).as_bytes());
+					close(stream);
+					exit_with(1);
+				}
+				ReceivedKind::TimedOut => {
+					eprint(b"btctl: nothing was pushed within 180 seconds\n");
+					close(stream);
+					exit_with(1);
+				}
+			}
 		}
 	}
 

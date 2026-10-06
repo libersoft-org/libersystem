@@ -135,6 +135,7 @@ impl Fixture {
 			match out {
 				bt_world::Out::Event(bytes) => self.emit(HciPacketKind::Event, bytes),
 				bt_world::Out::Acl(bytes) => self.emit(HciPacketKind::Acl, bytes),
+				bt_world::Out::Sco(bytes) => self.emit(HciPacketKind::Sco, bytes),
 			}
 		}
 		for line in self.world.take_log() {
@@ -559,7 +560,7 @@ impl hci_transport::Service for Fixture {
 			return Err(Error::Unsupported);
 		}
 		// THE LARGER OF THE TWO RADIOS' BUFFERS bounds a packet on the transport: BR/EDR's.
-		Ok(HciAttachment { version, iso: false, max_command: 258, max_event: 257, max_acl: bt_world::ACL_BYTES as u32 + 4, max_iso: 0, command_credits: 1, acl_credits: ACL_BUFFERS as u32, acl_queue: 16, epoch: self.epoch, sco: false, max_sco: 0 })
+		Ok(HciAttachment { version, iso: false, max_command: 258, max_event: 257, max_acl: bt_world::ACL_BYTES as u32 + 4, max_iso: 0, command_credits: 1, acl_credits: ACL_BUFFERS as u32, acl_queue: 16, epoch: self.epoch, sco: true, max_sco: 64 })
 	}
 
 	fn send(&mut self, kind: HciPacketKind, bytes: Vec<u8>) -> Result<u32, Error> {
@@ -567,7 +568,8 @@ impl hci_transport::Service for Fixture {
 			HciPacketKind::Command => self.command(&bytes),
 			HciPacketKind::Acl => self.acl(&bytes),
 			HciPacketKind::Event => return Err(Error::Invalid),
-			HciPacketKind::Iso | HciPacketKind::Sco => return Err(Error::Unsupported),
+			HciPacketKind::Sco => self.world.sco_in(&bytes),
+			HciPacketKind::Iso => return Err(Error::Unsupported),
 		}
 		Ok(bytes.len() as u32)
 	}
@@ -580,9 +582,10 @@ impl hci_transport::Service for Fixture {
 		Vec::new()
 	}
 
-	// NO VOICE: this fixture carries the service's LE world, and synchronous links are not in it.
+	// VOICE: the headset's synchronous link carries what the world makes of it; the setting is the host's, and the
+	// world's packets are whole either way.
 	fn voice(&mut self, _channels: u8, _bits: u8, _wideband: bool) -> Result<u8, Error> {
-		Err(Error::Unsupported)
+		Ok(1)
 	}
 
 	fn reset(&mut self) -> Result<u32, Error> {
@@ -678,6 +681,11 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			FixtureAction::Stream => 15,
 			FixtureAction::Volume => 16,
 			FixtureAction::PressPlay => 17,
+			FixtureAction::HfpConnect => 18,
+			FixtureAction::Answer => 19,
+			FixtureAction::HangUp => 20,
+			FixtureAction::AudioRequest => 21,
+			FixtureAction::PushObject => 22,
 			FixtureAction::ReadHostName | FixtureAction::LeAdvertise => return Err(Error::Unsupported),
 		};
 		match fixture.world.act(peer, code, argument) {
@@ -815,8 +823,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			Some(common::ProviderReady::Device(_)) => {
 				fixture.tick();
-				// A STREAM ON THE PHONE'S CLOCK is fed every tick; otherwise the reports' pace is enough.
-				let next = if fixture.world.streaming() { 1 } else { REPORT_TICKS };
+				// A STREAM ON THE PHONE'S CLOCK, and a voice link's microphone, are fed every tick; otherwise the reports' pace is enough.
+				let next = if fixture.world.streaming() || fixture.world.voice_active() { 1 } else { REPORT_TICKS };
 				timer_set(timer, clock().saturating_add(next));
 			}
 		}

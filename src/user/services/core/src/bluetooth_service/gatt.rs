@@ -11,6 +11,9 @@
 // arrives - the request kept, and answered by running the generated dispatch again over the result.
 //
 // A GRANT ENDS WITH ITS LAUNCH: the owner task's end closes it, its subscriptions with it.
+//
+// THE STACK READS ONE THING ITSELF on the same queue: a bonded peer's battery level, where it has the Battery Service,
+// for the device's status - an operation of no grant's, answered to nobody.
 
 use super::*;
 use proto::system::{GattCharacteristic, GattService, GattValue, bluetooth_admin, bluetooth_gatt};
@@ -22,6 +25,8 @@ const STACK_SERVICES: [u16; 11] = [0x1800, 0x1801, 0x1812, 0x184e, 0x184f, 0x185
 const MAX_GRANTS: usize = bt_bounds::MINTED_GRANTS;
 // Operations a link holds queued.
 const MAX_QUEUED_OPS: usize = 16;
+// The Battery Level characteristic.
+const BATTERY_LEVEL: u16 = 0x2a19;
 
 pub(crate) struct Grant {
 	pub chan: u64,
@@ -42,6 +47,8 @@ pub(crate) enum Kind {
 	Write { handle: u16, value: Vec<u8> },
 	Configuration { handle: u16, end: u16 },
 	Subscribe { handle: u16, cccd: u16 },
+	// The stack's own: the Battery Level characteristic's value, read by its type.
+	Battery,
 }
 
 pub(crate) struct Op {
@@ -56,6 +63,8 @@ pub(crate) struct Client {
 	services: Option<Vec<(u16, u16, u16)>>,
 	queue: VecDeque<Op>,
 	busy: Option<Op>,
+	// The peer's battery level, as the stack last read it.
+	pub battery: Option<u8>,
 }
 
 // THE GENERATED DISPATCH, RUN AGAIN over a result: the reply a deferred request gets, encoded as the dispatch encodes.
@@ -217,6 +226,10 @@ impl bluetooth_admin::Service for AdminView<'_> {
 		self.stack.reconnect_bonded(at);
 		Ok(theirs)
 	}
+
+	fn mint_serial(&mut self, alias: String, owner: u64) -> Result<u64, Error> {
+		self.mint_serial_grant(alias, owner)
+	}
 }
 
 impl Stack {
@@ -315,6 +328,16 @@ impl Stack {
 		reply(chan, request, Err(error));
 	}
 
+	// A BONDED LE PEER'S BATTERY, read once its link is secured: queued behind whatever the link is doing.
+	pub(crate) fn battery_read(&mut self, at: usize, handle: u16) {
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
+		if link.is_classic() || link.gatt.queue.len() >= MAX_QUEUED_OPS {
+			return;
+		}
+		link.gatt.queue.push_back(Op { grant: 0, request: Vec::new(), kind: Kind::Battery });
+		self.next_gatt(at, handle);
+	}
+
 	// THE NEXT QUEUED OPERATION GOES when the bearer is free: no walk of its own, and nothing outstanding.
 	pub(crate) fn next_gatt(&mut self, at: usize, handle: u16) {
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
@@ -337,6 +360,7 @@ impl Stack {
 				out.extend_from_slice(&[0x01, 0x00]);
 				out
 			}
+			Kind::Battery => request(op::READ_BY_TYPE_REQUEST, &[0x0001, 0xffff, BATTERY_LEVEL]),
 		};
 		link.gatt.busy = Some(op);
 		self.controllers[at].l2cap(handle, ATT_CID, &pdu);
@@ -345,6 +369,15 @@ impl Stack {
 	// AN ATT RESPONSE for the operation outstanding: its result, or the next request of a walk.
 	pub(crate) fn gatt_response(&mut self, at: usize, handle: u16, pdu: &[u8]) {
 		let Some(op) = self.controllers[at].link_mut(handle).and_then(|link| link.gatt.busy.take()) else { return };
+		// THE STACK'S OWN READ: one handle and its one-byte level, a percentage; anything else is no battery.
+		if matches!(op.kind, Kind::Battery) {
+			let level = (pdu.len() >= 5 && pdu[0] == op::READ_BY_TYPE_RESPONSE && pdu[1] == 3).then_some(pdu[4]).filter(|level| *level <= 100);
+			if let Some(link) = self.controllers[at].link_mut(handle) {
+				link.gatt.battery = level;
+			}
+			self.next_gatt(at, handle);
+			return;
+		}
 		let Some(grant_index) = self.grants.iter().position(|grant| grant.chan == op.grant) else {
 			self.next_gatt(at, handle);
 			return;
@@ -429,6 +462,8 @@ impl Stack {
 					None => self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, Error::Unsupported),
 				}
 			}
+			// Answered above.
+			Kind::Battery => {}
 			Kind::Subscribe { handle: value, .. } => {
 				let corr = u32::from_le_bytes([op.request[2], op.request[3], op.request[4], op.request[5]]);
 				if error_code.is_some() {
@@ -478,7 +513,7 @@ impl Stack {
 
 	// A LINK GONE: its queued operations are answered closed.
 	pub(crate) fn gatt_gone(&self, link: &mut Link) {
-		let pending: Vec<Op> = link.gatt.busy.take().into_iter().chain(link.gatt.queue.drain(..)).collect();
+		let pending: Vec<Op> = link.gatt.busy.take().into_iter().chain(link.gatt.queue.drain(..)).filter(|op| !matches!(op.kind, Kind::Battery)).collect();
 		for op in pending {
 			let op_code = u16::from_le_bytes([op.request[0], op.request[1]]);
 			self.refuse(op.grant, &op.request, op_code, Error::Closed);

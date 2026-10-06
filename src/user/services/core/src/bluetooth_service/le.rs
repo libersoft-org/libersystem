@@ -408,6 +408,7 @@ impl Stack {
 		if self.enabled_peer(at, &identity) == Some(true) {
 			self.start_discovery(at, handle);
 		}
+		self.battery_read(at, handle);
 		self.reconnect_bonded(at);
 	}
 }

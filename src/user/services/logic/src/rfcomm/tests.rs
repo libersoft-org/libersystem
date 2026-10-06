@@ -147,3 +147,44 @@ fn data_on_a_dlc_that_is_not_open_is_answered_dm_and_a_peer_past_its_credits_is_
 	let out = b.receive(&stray, &mut |_| Admission::Accept);
 	assert!(matches!(&out[..], [Out::Send(bytes)] if decode(bytes, |_| false, 10).unwrap().kind == Kind::Dm));
 }
+
+#[test]
+// A BOUNDED WRITER AND A PAUSED READER: `room` is what fills the queue past the credits, and a paused DLC gives no
+// credits back until it is released - so a peer that sends stops, and starts again with the credits it is owed.
+fn room_bounds_a_writer_and_a_paused_reader_holds_the_peer() {
+	let mut a = Session::new(true, 1691);
+	let mut b = Session::new(false, 1691);
+	let first = a.connect(3).expect("room");
+	pump(&mut a, &mut b, first, &mut |_| Admission::Accept);
+	let frame = a.dlc(3).unwrap().frame;
+	assert_eq!(a.room(3), QUEUED_FRAMES * frame);
+	assert_eq!(a.room(4), 0, "no DLC, no room");
+	// Fifteen frames: seven go on the peer's credits, eight wait, and the queue is full.
+	let sent = a.write(3, &alloc::vec![0x55; 15 * frame]).unwrap();
+	assert_eq!(sent.len(), 7);
+	assert_eq!(a.room(3), 0);
+	// THE READER PAUSES: the peer's seven frames are taken and no credits go back.
+	assert!(b.pause(3, true).is_empty());
+	let mut granted = 0;
+	for out in sent {
+		let Out::Send(bytes) = out else { continue };
+		for out in b.receive(&bytes, &mut |_| Admission::Accept) {
+			if let Out::Send(frame) = out {
+				for out in a.receive(&frame, &mut |_| Admission::Accept) {
+					if matches!(out, Out::Send(_)) {
+						granted += 1;
+					}
+				}
+			}
+		}
+	}
+	assert_eq!(granted, 0, "a paused reader gave nothing back, so nothing more was sent");
+	assert_eq!(b.dlc(3).unwrap().rx_credits, 0);
+	// RELEASED: the credits it owes go back at once, and the queue moves.
+	let released = b.pause(3, false);
+	assert_eq!(released.len(), 1);
+	let Out::Send(bytes) = &released[0] else { panic!("a credit frame") };
+	let moved = a.receive(bytes, &mut |_| Admission::Accept);
+	assert_eq!(moved.iter().filter(|out| matches!(out, Out::Send(_))).count(), 7);
+	assert_eq!(a.room(3), QUEUED_FRAMES.saturating_sub(1) * frame);
+}

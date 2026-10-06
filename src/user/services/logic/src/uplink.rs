@@ -144,6 +144,26 @@ impl Uplinks {
 		Ok(Decision::Keep)
 	}
 
+	/// A TETHERED LINK - a phone's network access point over Bluetooth PAN, an Ethernet link another service offers:
+	/// taken at once by a service with no link, and in place of a selected NIC only where the operator said it may
+	/// replace one; otherwise held, unselected, for the fallback to choose. A modem's link is never replaced by one.
+	/// Its identity is `tether`'s, which sorts after every NIC's, so the fallback prefers a NIC.
+	pub fn tethered(&mut self, link: Publication, replace: bool) -> Result<Decision, Refusal> {
+		if self.nics.contains(&link) {
+			return Ok(Decision::Keep);
+		}
+		if self.nics.len() >= MAX_NICS {
+			return Err(Refusal::Exhausted);
+		}
+		self.nics.push(link);
+		self.failed.retain(|failed| *failed != link);
+		match self.selected {
+			Selected::None => Ok(self.switch(Selected::Nic(link))),
+			Selected::Nic(_) if replace => Ok(self.switch(Selected::Nic(link))),
+			_ => Ok(Decision::Keep),
+		}
+	}
+
 	/// A publication was withdrawn. If it was the selected link, the service moves on; if it was the NIC
 	/// a modem replaced, there is nothing to go back to any more.
 	pub fn withdrawn(&mut self, nic: Publication) -> Decision {
@@ -227,6 +247,11 @@ impl Uplinks {
 			_ => Decision::Keep,
 		}
 	}
+}
+
+/// A TETHERED LINK'S IDENTITY: past every slot DeviceManager hands out, numbered by the offering service.
+pub const fn tether(id: u32) -> Publication {
+	Publication { slot: u32::MAX - 0xffff + (id & 0xffff), generation: 0, binding_generation: id as u64 }
 }
 
 /// The configuration a raw-IP link arrives with.

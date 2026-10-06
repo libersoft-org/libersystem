@@ -150,3 +150,36 @@ fn a_raw_ip_configuration_is_validated_before_anything_is_installed() {
 	assert_eq!(validate(&Attachment { prefix: 0, ..attachment() }), Err(Refusal::Invalid));
 	assert_eq!(validate(&Attachment { prefix: 33, ..attachment() }), Err(Refusal::Invalid));
 }
+
+#[test]
+// A TETHERED LINK: held while a NIC is selected and it may not replace it; selected under a new generation where it
+// may; taken at once with no link; and when it goes, the existing fallback - the lowest live NIC - applies.
+fn a_tethered_link_replaces_a_nic_only_with_authority() {
+	let mut uplinks = Uplinks::new();
+	let ethernet = nic(3, 1);
+	uplinks.published(ethernet).unwrap();
+	let phone = tether(1);
+	assert!(phone > ethernet, "a tether sorts after every NIC");
+	assert_eq!(uplinks.tethered(phone, false), Ok(Decision::Keep));
+	assert_eq!(uplinks.selected(), Selected::Nic(ethernet), "held, unselected");
+	assert_eq!(uplinks.withdrawn(phone), Decision::Keep);
+	let generation = uplinks.generation();
+	let decision = uplinks.tethered(phone, true).unwrap();
+	assert_eq!(switched(decision), Selected::Nic(phone));
+	assert_eq!(uplinks.generation(), generation + 1);
+	// IT GOES: back to the NIC.
+	assert_eq!(switched(uplinks.withdrawn(phone)), Selected::Nic(ethernet));
+	// WITH NO LINK AT ALL it is taken at once, authority or not; and a held one is the fallback's when the NIC goes.
+	let mut bare = Uplinks::new();
+	assert_eq!(switched(bare.tethered(phone, false).unwrap()), Selected::Nic(phone));
+	let mut held = Uplinks::new();
+	held.published(ethernet).unwrap();
+	held.tethered(phone, false).unwrap();
+	assert_eq!(switched(held.failed(ethernet)), Selected::Nic(phone));
+	// A MODEM'S LINK is not replaced by a tether.
+	let mut modem = Uplinks::new();
+	let reservation = modem.reserve(false).unwrap();
+	modem.install(reservation).unwrap();
+	assert_eq!(modem.tethered(phone, true), Ok(Decision::Keep));
+	assert_eq!(modem.selected(), Selected::Modem(reservation));
+}

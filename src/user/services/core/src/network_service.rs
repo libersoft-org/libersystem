@@ -28,6 +28,7 @@ use rt::*;
 use crate::net::{DNS_PORT, Event, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Addr, MacAddr, NEIGH_MAX, NTP_PORT, SockEntry, SockEntryState, Stack};
 use proto::codec::{Buffer, Handles};
 use proto::system::{AcceptResult, AddressState, BindMode, Chunk, DnsServer, Error, FamilyReadiness, FetchChunk, FetchOutcome, HopStatus, InterfaceAddress, InterfaceId, IpAddress, Ipv4Addr as WireIp, Ipv6Addr as WireIpv6, LinkAttachment, LinkInstalled, ListenRequest, ListenResult, MacAddr as WireMac, Neighbor, NetCapacity, NetInfo, NextHop, OpenTarget, PingReply, PingStatus, ProviderInfo, ProviderKind, Reachability, RouteEntry, RoutePreference, RouterEntry, ScopedAddress, ScopedEndpoint, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, network_link_admin, provider_catalogue, socket};
+use proto::system::{NetworkEvent, bluetooth_network};
 use service_logic::addr_select;
 use service_logic::dhcp;
 use service_logic::dns;
@@ -35,6 +36,7 @@ use service_logic::net_profile::{Families, Pending, PendingKind, Readiness, read
 use service_logic::sntp;
 use service_logic::tcp_bind::Binding;
 use service_logic::uplink;
+use services::capability_names::CAP_BT_NETWORK;
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -201,6 +203,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    either family has started.
 	runtime.subscribe();
 	runtime.on_publications();
+	runtime.bt_retry();
 	if !runtime.announced {
 		// NO NETWORK PROVIDER ON THIS BOOT, AND THE SERVICE COMES UP ANYWAY - WITHOUT A LINK.
 		//
@@ -227,10 +230,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 // A NIC publication this service has seen, and what it takes to open it again: the fallback after a
-// modem, or after the selected NIC fails, reopens one of these through the catalogue.
+// modem, or after the selected NIC fails, reopens one of these - through the catalogue, or for a Bluetooth PAN link
+// through BluetoothService's network root.
 struct Published {
 	identity: uplink::Publication,
-	info: ProviderInfo,
+	source: Source,
+}
+
+#[derive(Clone)]
+enum Source {
+	Catalogue(ProviderInfo),
+	Bluetooth(u32),
+}
+
+// How long before the broker is asked again for Bluetooth's network links.
+const BLUETOOTH_RETRY_TICKS: u64 = 500;
+
+// BLUETOOTH'S PAN LINKS, REACHED BY NAME THROUGH THE BROKER - this service's bootstrap - and never a role: stopping the
+// radio's stack stops no network. The connection the resolve answered, the links stream on it, and when to ask again.
+struct BtNet {
+	client: u64,
+	events: u64,
+	resolving: bool,
+	refused: bool,
+	retry_at: u64,
 }
 
 // THE LINK THE SERVICE RUNS ON: the channel its frames - or, on a raw-IP link, its datagrams - travel
@@ -256,6 +279,7 @@ struct Runtime {
 	published: Vec<Published>,
 	uplinks: uplink::Uplinks,
 	link: Option<Link>,
+	bt: BtNet,
 	policy: Policy,
 	// The link-admin root ServiceManager keeps, and the connections minted from it.
 	link_root: u64,
@@ -295,7 +319,7 @@ impl Runtime {
 	fn new(bootstrap: u64, client: u64, catalogue: u64, link_root: u64, policy: Policy) -> Runtime {
 		let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
 		clients.push(client);
-		Runtime { bootstrap, announced: false, catalogue, providers: 0, published: Vec::new(), uplinks: uplink::Uplinks::new(), link: None, policy, link_root, link_admins: Vec::new(), holder: None, clients, socks: Vec::with_capacity(MAX_SOCKS), listeners: Vec::with_capacity(MAX_LISTEN), dns_flight: dns::InFlight::new(), pending: Pending::new(), echo: service_logic::net_profile::EchoCounter::new(random_u16()), req: alloc::vec![0u8; REQ_MAX], out: alloc::vec![0u8; REPLY_MAX] }
+		Runtime { bootstrap, announced: false, catalogue, providers: 0, published: Vec::new(), uplinks: uplink::Uplinks::new(), link: None, bt: BtNet { client: 0, events: 0, resolving: false, refused: false, retry_at: clock() }, policy, link_root, link_admins: Vec::new(), holder: None, clients, socks: Vec::with_capacity(MAX_SOCKS), listeners: Vec::with_capacity(MAX_LISTEN), dns_flight: dns::InFlight::new(), pending: Pending::new(), echo: service_logic::net_profile::EchoCounter::new(random_u16()), req: alloc::vec![0u8; REQ_MAX], out: alloc::vec![0u8; REPLY_MAX] }
 	}
 
 	// THE NETWORK-KIND SUBSCRIPTION, TAKEN ONCE AND HELD. It used to be given back after the first NIC
@@ -356,7 +380,7 @@ impl Runtime {
 				match self.uplinks.published(nic) {
 					Ok(decision) => {
 						if !self.published.iter().any(|held| held.identity == nic) {
-							self.published.push(Published { identity: nic, info });
+							self.published.push(Published { identity: nic, source: Source::Catalogue(info) });
 						}
 						decision
 					}
@@ -428,19 +452,29 @@ impl Runtime {
 
 	// Open a NIC through the catalogue, read its greeting, and build and configure a stack on it.
 	fn bring_up_nic(&mut self, nic: uplink::Publication, generation: u64) -> bool {
-		let Some(info) = self.published.iter().find(|held| held.identity == nic).map(|held| held.info.clone()) else {
+		let Some(source) = self.published.iter().find(|held| held.identity == nic).map(|held| held.source.clone()) else {
 			return false;
 		};
-		let frames: u64 = match provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(&info) {
-			Some(Ok(handle)) => handle,
-			Some(Err(_)) => {
-				print(b"NetworkService: the catalogue refused a connection to the network provider it published\n");
-				return false;
-			}
-			None => {
-				print(b"NetworkService: the catalogue did not answer the connection it published\n");
-				return false;
-			}
+		let frames: u64 = match source {
+			Source::Catalogue(info) => match provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(&info) {
+				Some(Ok(handle)) => handle,
+				Some(Err(_)) => {
+					print(b"NetworkService: the catalogue refused a connection to the network provider it published\n");
+					return false;
+				}
+				None => {
+					print(b"NetworkService: the catalogue did not answer the connection it published\n");
+					return false;
+				}
+			},
+			// A PAN LINK: its frame channel, which greets like a NIC's.
+			Source::Bluetooth(id) => match bluetooth_network::Client::new(ChannelTransport { chan: self.bt.client }).open(&id) {
+				Some(Ok(handle)) => handle,
+				_ => {
+					print(b"network: BluetoothService did not open the PAN link it offered\n");
+					return false;
+				}
+			},
 		};
 		// The frame-mover driver leads with our NIC's MAC and the link's MTU over the frame channel
 		// (it owns the device; we own the protocol), so we can build the stack - its neighbor-cache
@@ -603,6 +637,118 @@ impl Runtime {
 	}
 
 	// The periodic wake: the IPv6 layer's timers and the DHCP lease clock.
+	// ------------------------------------------------------------------ Bluetooth's PAN links
+
+	// When the broker or the links stream is to be asked for again; none while one is answered or awaited.
+	fn bt_due(&self) -> Option<u64> {
+		if self.bt.refused || self.bt.resolving || self.bt.events != 0 { None } else { Some(self.bt.retry_at) }
+	}
+
+	// THE RETRY: the broker asked for Bluetooth's network root where there is none, or the root for its links stream.
+	fn bt_retry(&mut self) {
+		if self.bt.refused || self.bt.resolving || self.bt.events != 0 || clock() < self.bt.retry_at {
+			return;
+		}
+		self.bt.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
+		if self.bt.client == 0 {
+			let mut request = Vec::with_capacity(2 + CAP_BT_NETWORK.len());
+			request.extend_from_slice(&RESOLVE_OP.to_le_bytes());
+			request.extend_from_slice(CAP_BT_NETWORK);
+			self.bt.resolving = send_blocking(self.bootstrap, &request, 0);
+			return;
+		}
+		let mut client = bluetooth_network::Client::new(ChannelTransport { chan: self.bt.client });
+		match client.links() {
+			Some(Ok(stream)) => self.bt.events = stream,
+			_ if client.last_error().is_some() => {
+				close(self.bt.client);
+				self.bt.client = 0;
+			}
+			_ => {}
+		}
+	}
+
+	// THE BROKER'S ANSWER to the resolve.
+	fn bt_answered(&mut self) {
+		let mut reply = [0u8; 16];
+		match try_recv(self.bootstrap, &mut reply) {
+			Polled::Message { len, handle } => {
+				self.bt.resolving = false;
+				if len >= 2 && &reply[..2] == b"OK" && handle != 0 {
+					self.bt.client = handle;
+					self.bt.retry_at = clock();
+					self.bt_retry();
+				} else {
+					if handle != 0 {
+						close(handle);
+					}
+					if len >= 6 && &reply[..6] == b"DENIED" {
+						self.bt.refused = true;
+					}
+				}
+			}
+			Polled::Empty => {}
+			Polled::Closed => {
+				self.bt.resolving = false;
+				self.bt.refused = true;
+			}
+		}
+	}
+
+	// THE LINKS STREAM: a PAN link up - selected by the uplink rule, or held - or gone; or the stream's end, which is the
+	// stack's instance ending: every link it offered goes, and the broker is asked again.
+	fn bt_events(&mut self) {
+		let mut buf = [0u8; 512];
+		loop {
+			match try_recv_caps(self.bt.events, &mut buf) {
+				PolledCaps::Message { len, handles } => {
+					for &handle in handles.as_slice() {
+						close(handle);
+					}
+					let mut frame = Handles::new();
+					let Some(event) = bluetooth_network::links_read(&buf[..len], &mut frame) else { continue };
+					match event {
+						NetworkEvent::Arrived(link) => {
+							let identity = uplink::tether(link.id);
+							match self.uplinks.tethered(identity, link.replace_uplink) {
+								Ok(decision) => {
+									if !self.published.iter().any(|held| held.identity == identity) {
+										self.published.push(Published { identity, source: Source::Bluetooth(link.id) });
+									}
+									print(if link.replace_uplink { b"network: a Bluetooth PAN link arrived, allowed to replace the uplink\n".as_slice() } else { b"network: a Bluetooth PAN link arrived, held while another link is selected\n".as_slice() });
+									self.apply(decision);
+								}
+								Err(_) => print(b"network: a PAN link past the sixteen links this service tracks is ignored\n"),
+							}
+						}
+						NetworkEvent::Departed(id) => {
+							let identity = uplink::tether(id);
+							self.published.retain(|held| held.identity != identity);
+							let decision = self.uplinks.withdrawn(identity);
+							print(b"network: a Bluetooth PAN link departed\n");
+							self.apply(decision);
+						}
+					}
+				}
+				PolledCaps::Empty => return,
+				PolledCaps::Closed => {
+					close(self.bt.events);
+					self.bt.events = 0;
+					close(self.bt.client);
+					self.bt.client = 0;
+					self.bt.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
+					let gone: Vec<uplink::Publication> = self.published.iter().filter(|held| matches!(held.source, Source::Bluetooth(_))).map(|held| held.identity).collect();
+					self.published.retain(|held| !matches!(held.source, Source::Bluetooth(_)));
+					for identity in gone {
+						let decision = self.uplinks.withdrawn(identity);
+						self.apply(decision);
+					}
+					return;
+				}
+			}
+		}
+	}
+
 	fn on_timer(&mut self) {
 		let Some(Link { frames, stack, lease, rx, tx }) = self.link.as_mut() else {
 			return;
@@ -1024,6 +1170,9 @@ impl network::Service for Unlinked<'_> {
 enum Ready {
 	Frames,
 	Providers,
+	// The broker's answer to a resolve, and Bluetooth's PAN links stream.
+	Broker,
+	BtLinks,
 	LinkAdmin,
 	Client,
 	Socket,
@@ -1057,6 +1206,10 @@ fn serve(mut runtime: Runtime) -> ! {
 			stand(link.frames, Ready::Frames, 0);
 		}
 		stand(runtime.providers, Ready::Providers, 0);
+		stand(runtime.bt.events, Ready::BtLinks, 0);
+		if runtime.bt.resolving {
+			stand(runtime.bootstrap, Ready::Broker, 0);
+		}
 		stand(runtime.link_root, Ready::LinkAdmin, 0);
 		for &chan in &runtime.link_admins {
 			stand(chan, Ready::LinkAdmin, 0);
@@ -1079,24 +1232,32 @@ fn serve(mut runtime: Runtime) -> ! {
 		// thing that has to happen - the lease clock, and after it the IPv6 layer's own next timer: a
 		// detection probe, a router solicitation, a neighbour retry or a listener report. Without
 		// this, a blocking client request starves every one of them. No link, no deadline.
-		let next: Option<u64> = runtime.link.as_ref().and_then(|link| {
+		let linked: Option<u64> = runtime.link.as_ref().and_then(|link| {
 			let ipv6_due: Option<u64> = link.stack.ipv6_deadline().map(ticks_from_ms);
 			match (link.lease.next_due(), ipv6_due) {
 				(Some(left), Some(right)) => Some(left.min(right)),
 				(left, right) => left.or(right),
 			}
 		});
+		// AND BLUETOOTH'S RETRY, linked or not.
+		let next: Option<u64> = match (linked, runtime.bt_due()) {
+			(Some(left), Some(right)) => Some(left.min(right)),
+			(left, right) => left.or(right),
+		};
 		let ready_raw: i64 = match next {
 			Some(deadline) => wait_any_periodic(&waits, deadline),
 			None => wait_any(&waits, 0),
 		};
 		if ready_raw == ERR_TIMED_OUT {
 			runtime.on_timer();
+			runtime.bt_retry();
 		} else if ready_raw >= 0 {
 			let ready: usize = ready_raw as usize;
 			match kind[ready] {
 				Ready::Frames => runtime.on_frames(),
 				Ready::Providers => runtime.on_publications(),
+				Ready::Broker => runtime.bt_answered(),
+				Ready::BtLinks => runtime.bt_events(),
 				Ready::LinkAdmin => runtime.on_link_admin(waits[ready]),
 				Ready::Client => runtime.on_client(slot_of[ready]),
 				Ready::Socket => runtime.on_socket(slot_of[ready]),

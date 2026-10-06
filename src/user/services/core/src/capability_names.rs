@@ -15,6 +15,8 @@ pub const CAP_BT_ADMIN: &[u8] = b"BTADMIN";
 // BLUETOOTHSERVICE'S AUDIO ROOT: the endpoints AudioService alone resolves and opens - re-resolved, as InputService
 // re-resolves the profile one, when the stack has been restarted.
 pub const CAP_BT_AUDIO: &[u8] = b"BTAUDIO";
+// BLUETOOTHSERVICE'S NETWORK ROOT: the PAN links NetworkService alone resolves and opens, re-resolved in the same way.
+pub const CAP_BT_NETWORK: &[u8] = b"BTNETWORK";
 // AUDIOSERVICE'S OPERATOR ROOT: the inventory, the defaults and the levels, which PermissionManager resolves for
 // `audioctl`'s grant.
 pub const CAP_AUDIO_CONTROL: &[u8] = b"AUDIOCONTROL";

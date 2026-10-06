@@ -93,6 +93,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("btclassic", "btclassic PHASE - drive the Bluetooth gates' scenarios against the fixture"),
 	("audioprobe", "audioprobe inventory|hold|operator|voice - the audio device model's gate driver (development)"),
 	("btgatt", "btgatt - read, write and subscribe through one GATT grant on the peer aliased tag-1"),
+	("btserial", "btserial - connect, write and read through one serial port grant on the peer aliased serial-1"),
 	("hidcheck", "hidcheck CASE - drive the HID-over-I2C gate: a live pointer and contact client with a focused surface"),
 	("powercheck", "powercheck CASE - drive the power gate against the in-guest fixture"),
 	("powerread", "powerread - read power state with the read authority alone"),

@@ -147,3 +147,62 @@ fn a_script_is_typed_on_the_interrupt_channel() {
 	assert_eq!(reports[0], [HIDP_DATA_INPUT, 1, 0, 0, 0x04, 0, 0, 0, 0, 0]);
 	assert_eq!(reports[2], [HIDP_DATA_INPUT, 1, 0, 0, 0x28, 0, 0, 0, 0, 0]);
 }
+
+// THE HEADSET'S VOICE LINK: set up by the host's command, a packet every 7.5 ms on the fixture's clock, its own frames
+// heard back whole with the tone in its subband, and the link's end reported with what was heard.
+#[test]
+fn the_headsets_voice_link_paces_and_hears() {
+	let mut world = World::new(3);
+	// The phone, the keyboard, then the headset.
+	let headset = 2;
+	let acl = world.new_link(headset);
+	world.tick(100);
+	let mut setup = acl.to_le_bytes().to_vec();
+	setup.extend_from_slice(&[0; 10]);
+	setup.extend_from_slice(&0x0063u16.to_le_bytes());
+	let up = world.command(0x0428, &setup).unwrap();
+	assert!(up.iter().any(|out| matches!(out, Out::Event(bytes) if bytes[0] == 0x2c && bytes[2] == 0 && bytes.last() == Some(&0x03))));
+	assert!(world.voice_active());
+	let packets: Vec<Vec<u8>> = world
+		.tick(130)
+		.into_iter()
+		.filter_map(|out| match out {
+			Out::Sco(bytes) => Some(bytes),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(packets.len(), 40, "thirty ticks of 10 ms are forty packets of 7.5 ms");
+	for packet in &packets {
+		assert_eq!(packet.len(), 63);
+		world.sco_in(packet);
+	}
+	let sco = u16::from_le_bytes([packets[0][0], packets[0][1]]);
+	let down = world.command(0x0406, &[sco.to_le_bytes()[0], sco.to_le_bytes()[1], 0x13]).unwrap();
+	assert!(down.iter().any(|out| matches!(out, Out::Event(bytes) if bytes[0] == 0x05)));
+	assert!(!world.voice_active());
+	assert!(world.take_log().iter().any(|line| line == "headset heard 40 mSBC frames from the host, every CRC good, the loudest subband 5; its voice link is down"));
+	assert!(world.owns(acl), "the ACL link stays up");
+}
+
+// THE FIXTURE'S OBJECT PUSH SERVER takes a pushed object whole, and its ERTM check is CRC-16/ARC's.
+#[test]
+fn the_object_push_server_takes_an_object() {
+	assert_eq!(opp::fcs16(b"123456789"), 0xbb3d, "CRC-16/ARC's check value");
+	let mut world = World::new(5);
+	// The phone.
+	let phone = 0;
+	world.new_link(phone);
+	let replies = world.opp_serve(phone, &[0x80, 0x00, 0x07, 0x10, 0x00, 0x10, 0x00], "RFCOMM");
+	assert_eq!(replies, alloc::vec![alloc::vec![0xa0, 0x00, 0x07, 0x10, 0x00, 0x04, 0x00]]);
+	let mut put = alloc::vec![0x82, 0, 0, 0x01, 0x00, 0x0b, 0x00, b'a', 0x00, b'.', 0x00, b'b', 0x00, 0x00, 0x49, 0x00, 0x08, b'h', b'e', b'l', b'l', b'o'];
+	let len = (put.len() as u16).to_be_bytes();
+	put[1] = len[0];
+	put[2] = len[1];
+	// IN TWO PIECES, as RFCOMM's frames may cut it.
+	assert!(world.opp_serve(phone, &put[..5], "RFCOMM").is_empty());
+	assert_eq!(world.opp_serve(phone, &put[5..], "RFCOMM"), alloc::vec![alloc::vec![0xa0, 0x00, 0x03]]);
+	let digest = opp::digest(b"hello");
+	assert!(world.take_log().iter().any(|line| *line == alloc::format!("phone received a.b over RFCOMM: 5 bytes, digest {digest:08x}")));
+	assert_eq!(opp::note(64).len(), 64);
+	assert!(opp::note(64).starts_with(b"line 00001 of the phone's note\n"));
+}

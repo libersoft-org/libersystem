@@ -203,6 +203,9 @@ pub enum Capability {
 	/// call relay, and neither a playback stream nor a recorder of its own - it records as well as plays, so it is
 	/// granted as neither alone. Appended last.
 	AudioVoice = 59,
+	/// AN APPLICATION'S SERIAL PORT, minted per launch for one bonded BR/EDR peer the operator gave an alias and trusted
+	/// for the serial port profile: a byte stream over RFCOMM, never a console. Appended last.
+	BluetoothSerial = 60,
 }
 
 impl Capability {
@@ -305,6 +308,7 @@ impl Capability {
 			57 => Some(Capability::BluetoothGatt),
 			58 => Some(Capability::AudioControl),
 			59 => Some(Capability::AudioVoice),
+			60 => Some(Capability::BluetoothSerial),
 			_ => None,
 		}
 	}
@@ -1482,6 +1486,7 @@ impl Capability {
 			Capability::BluetoothGatt => out.push_str("\"bluetooth-gatt\""),
 			Capability::AudioControl => out.push_str("\"audio-control\""),
 			Capability::AudioVoice => out.push_str("\"audio-voice\""),
+			Capability::BluetoothSerial => out.push_str("\"bluetooth-serial\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1546,6 +1551,7 @@ impl Capability {
 			Capability::BluetoothGatt => out.push_str("bluetooth-gatt"),
 			Capability::AudioControl => out.push_str("audio-control"),
 			Capability::AudioVoice => out.push_str("audio-voice"),
+			Capability::BluetoothSerial => out.push_str("bluetooth-serial"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1610,6 +1616,7 @@ impl Capability {
 			Capability::BluetoothGatt => crate::codec::cbor::text(out, "bluetooth-gatt"),
 			Capability::AudioControl => crate::codec::cbor::text(out, "audio-control"),
 			Capability::AudioVoice => crate::codec::cbor::text(out, "audio-voice"),
+			Capability::BluetoothSerial => crate::codec::cbor::text(out, "bluetooth-serial"),
 		}
 	}
 }

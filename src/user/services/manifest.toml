@@ -1442,6 +1442,17 @@ destination = "libexec/btgatt.lsexe"
 providers = []
 development = true
 
+# THE BR/EDR GATE'S APPLICATION, development-only: one serial port, on the peer aliased `serial-1`, and nothing else.
+[[programs]]
+name = "btserial"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/btserial.lsexe"
+providers = []
+development = true
+
 # THE HID-OVER-I2C GATE'S PROBE, development-only: a live pointer and contact client of InputService with a focused
 # surface, and the device policy it disables and enables the controller's and the touchscreen's bindings with.
 [[programs]]
@@ -5809,6 +5820,16 @@ tag = "AUDIO"
 kind = "serve-root"
 provider = "self"
 interface = "liber:bluetooth@1/bluetooth-audio"
+
+# THE NETWORK ROOT, which NetworkService reaches by name through the broker and nothing else holds: the PAN links this
+# host is a user of, offered as they come and go, each opened as a frame channel on a NIC provider's wire. Never a role
+# of NetworkService's: stopping the radio's stack stops no network. LAST, like every addition to a positional
+# bootstrap.
+[[services.roles]]
+tag = "NETWORK"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-network"
 
 # POWER STATE, NORMALISED, AND THE FEW DEVICE CONTROLS AN OPERATOR MAY USE. It consumes every
 # `power-source` publication through a catalogue connection minted for that kind and `platform-switch`, and serves two

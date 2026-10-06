@@ -34,8 +34,9 @@ const SNIFF_IDLE_TICKS: u64 = 2 * TICKS_PER_SECOND;
 const LOCAL_NAME: &[u8] = b"LiberSystem";
 // Names remembered from inquiry and remote name requests.
 const MAX_NAMES: usize = 32;
-// Data a DLC may hold for a consumer that has not taken it, before the oldest is dropped.
-const MAX_HELD_BYTES: usize = 8 * 1024;
+// Data a DLC may hold for a consumer that has not taken it, before the oldest is dropped: room for what a paused serial
+// port's peer may still send on the credits it holds, twice over, so a grant's reader that falls behind loses nothing.
+const MAX_HELD_BYTES: usize = 16 * 1024;
 // The reason a pairing a person refused or the policy forbids ends with: pairing not allowed.
 const REASON_PAIRING_NOT_ALLOWED: u8 = 0x18;
 // The reason a connection is rejected with: unacceptable device address, and limited resources.
@@ -59,6 +60,15 @@ pub(crate) struct Pending {
 pub(crate) enum Want {
 	// The link, then encryption, then the profile's own steps.
 	Profile(Profile),
+	// The link, then encryption, then an Object Push's search.
+	Push,
+}
+
+// What an SDP search this host runs is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+	Profile(Profile),
+	Push,
 }
 
 pub(crate) struct ControllerState {
@@ -89,8 +99,9 @@ pub(crate) struct ControllerState {
 impl ControllerState {
 	pub fn new() -> ControllerState {
 		// THE ROLES THIS SYSTEM OFFERS, each with its record: A2DP's source (a player) and sink (headphones), the remote
-		// control's target - claiming no player category, there being no media session - and controller, and the voice
-		// gateway a headset connects to, by the hands-free and the headset profile.
+		// control's target - claiming no player category, there being no media session - and controller, the voice
+		// gateway a headset connects to, by the hands-free and the headset profile, and the Object Push server a
+		// receiver's peer pushes to - on RFCOMM; the policy admits it only while a receiver waits.
 		let mut sdp = Server::new();
 		sdp.offer(sdp::a2dp(0x0001_0001, false, 0x0001));
 		sdp.offer(sdp::a2dp(0x0001_0002, true, 0x0001));
@@ -98,6 +109,7 @@ impl ControllerState {
 		sdp.offer(sdp::avrcp(0x0001_0004, false, 0x0001));
 		sdp.offer(sdp::hfp_audio_gateway(0x0001_0005, bt_policy::HFP_CHANNEL, hfp::SDP_FEATURES));
 		sdp.offer(sdp::hsp_audio_gateway(0x0001_0006, bt_policy::HSP_CHANNEL));
+		sdp.offer(sdp::opp_server(0x0001_0007, bt_policy::OPP_CHANNEL, None));
 		ControllerState { watcher: 0, prompt: None, next_prompt: 1, discoverable_until: None, written_scan: None, legacy: None, paging: None, sdp, names: Vec::new(), classes: Vec::new(), receive_waits: None, wants: Vec::new(), transaction: 1 }
 	}
 
@@ -185,7 +197,7 @@ pub(crate) struct SdpClient {
 	pub cid: u16,
 	pub search: Option<Search>,
 	pub uuid: u16,
-	pub purpose: Profile,
+	pub purpose: Purpose,
 }
 
 // THE HID HOST'S CHANNELS on a link - control and interrupt, by local channel id - and whether the device's report
@@ -211,7 +223,8 @@ const REPORT_DESCRIPTOR: u128 = 0x22;
 pub(crate) struct Rfcomm {
 	pub cid: u16,
 	pub session: Session,
-	pub opening: Vec<(u8, Profile)>,
+	// DLCs this side asked for: a profile's, or, with none, an Object Push session's.
+	pub opening: Vec<(u8, Option<Profile>)>,
 	pub open: Vec<(u8, Profile)>,
 	// What arrived on each DLC and nobody has taken yet: bounded, the oldest dropped.
 	pub held: Vec<(u8, VecDeque<u8>)>,
@@ -250,11 +263,13 @@ pub(crate) struct ClassicLink {
 	pub responder: Option<BredrResponder>,
 	// The voice gateway a headset opened on the link, and its synchronous link.
 	pub voice: Option<super::voice::VoiceLink>,
+	// The PAN link this host is a user of, over BNEP.
+	pub pan: Option<super::pan::Pan>,
 }
 
 impl ClassicLink {
 	fn new(central: bool) -> ClassicLink {
-		ClassicLink { channels: Channels::new(), ertm: Vec::new(), held: Vec::new(), sdp_client: None, rfcomm: None, hid: Hid::default(), ours: IoCapability::NoInputNoOutput, theirs: None, pairing: false, refused: false, authenticating: false, level: None, features: None, last_activity: clock(), sniff: false, profiles: bt_policy::Trust::default(), a2dp: super::a2dp::A2dp::default(), central, derive: None, responder: None, voice: None }
+		ClassicLink { channels: Channels::new(), ertm: Vec::new(), held: Vec::new(), sdp_client: None, rfcomm: None, hid: Hid::default(), ours: IoCapability::NoInputNoOutput, theirs: None, pairing: false, refused: false, authenticating: false, level: None, features: None, last_activity: clock(), sniff: false, profiles: bt_policy::Trust::default(), a2dp: super::a2dp::A2dp::default(), central, derive: None, responder: None, voice: None, pan: None }
 	}
 
 	// The source key goes the moment it is no longer wanted.
@@ -484,7 +499,7 @@ impl Stack {
 	}
 
 	// Page a peer: with inquiry's repetition mode and clock offset when the current scan found it.
-	fn page(&mut self, at: usize, peer: Peer) -> Result<(), Error> {
+	pub(crate) fn page(&mut self, at: usize, peer: Peer) -> Result<(), Error> {
 		let controller = &mut self.controllers[at];
 		if controller.bredr_state.paging.is_some() {
 			return Err(Error::Again);
@@ -657,14 +672,19 @@ impl Stack {
 		let wanted: Vec<Want> = self.controllers[at].bredr_state.wants.iter().filter(|(held, _)| *held == peer).map(|(_, want)| *want).collect();
 		self.controllers[at].bredr_state.wants.retain(|(held, _)| *held != peer);
 		for want in wanted {
-			let Want::Profile(profile) = want;
-			self.start_profile(at, handle, profile);
+			match want {
+				Want::Profile(profile) => self.start_profile(at, handle, profile),
+				Want::Push => self.start_push_search(at, handle),
+			}
 		}
 	}
 
 	pub(crate) fn classic_gone(&mut self, at: usize, mut link: Link) {
 		self.a2dp_gone(&mut link);
 		self.voice_link_gone(at, &mut link);
+		self.serial_closed(at, &link.peer, Error::Closed);
+		self.opp_link_gone(at, &link.peer);
+		self.pan_link_gone(&mut link);
 		let state = &mut self.controllers[at].bredr_state;
 		if state.prompt.as_ref().is_some_and(|pending| pending.peer == link.peer) {
 			state.prompt = None;
@@ -1137,6 +1157,7 @@ impl Stack {
 				}
 			}
 			psm::RFCOMM => self.rfcomm_data(at, handle, payload),
+			psm::BNEP => self.pan_data(at, handle, cid, payload),
 			psm::AVDTP | psm::AVCTP => self.a2dp_data(at, handle, cid, payload),
 			psm::HID_INTERRUPT => {
 				// INPUT DATA: the header byte, then the report as the device's descriptor lays it out.
@@ -1152,8 +1173,9 @@ impl Stack {
 			}
 			// The control channel's handshakes say a request was taken; nothing this host asks needs the answer.
 			psm::HID_CONTROL if payload.first().is_some_and(|byte| byte >> 4 == HIDP_HANDSHAKE >> 4) => {}
-			// A channel no profile reads yet carries nothing this host acts on.
-			_ => {}
+			// A CHANNEL NO PROFILE READS: an Object Push session's on L2CAP, where it is one; otherwise nothing this host
+			// acts on.
+			_ => self.opp_l2cap_data(at, handle, cid, payload),
 		}
 	}
 
@@ -1404,6 +1426,7 @@ impl Stack {
 				self.send_on(at, handle, cid, &request);
 			}
 			psm::AVDTP | psm::AVCTP => self.a2dp_channel_opened(at, handle, cid, channel.psm),
+			psm::BNEP => self.pan_opened(at, handle, cid),
 			psm::RFCOMM => {
 				let peer_mtu = usize::from(channel.peer_mtu);
 				let initiator = classic.rfcomm.as_ref().is_some_and(|rfcomm| rfcomm.cid == cid);
@@ -1423,12 +1446,14 @@ impl Stack {
 				}
 				self.run_rfcomm(at, handle, outs);
 			}
-			_ => {}
+			_ => self.opp_l2cap_opened(at, handle, cid),
 		}
 	}
 
 	fn channel_closed(&mut self, at: usize, handle: u16, cid: u16) {
 		self.a2dp_channel_closed(at, handle, cid);
+		self.opp_l2cap_closed(at, handle, cid);
+		self.pan_closed(at, handle, cid);
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
 		// THE INTERRUPT CHANNEL GOING ENDS THE DEVICE'S INPUT: what it held is let go on its streams.
 		if link.classic.as_ref().is_some_and(|classic| classic.hid.interrupt == Some(cid) || classic.hid.control == Some(cid)) {
@@ -1475,7 +1500,10 @@ impl Stack {
 			Answer::Records(records) => {
 				let Some(client) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()).and_then(|classic| classic.sdp_client.take()) else { return };
 				self.close_channel(at, handle, cid);
-				self.found_service(at, handle, client.purpose, &records);
+				match client.purpose {
+					Purpose::Profile(profile) => self.found_service(at, handle, profile, &records),
+					Purpose::Push => self.push_found(at, handle, &records),
+				}
 			}
 			Answer::Failed(_) => {
 				self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()).map(|classic| classic.sdp_client.take());
@@ -1519,12 +1547,17 @@ impl Stack {
 				}
 				self.a2dp_connect(at, handle);
 			}
+			// A PHONE'S NETWORK ACCESS POINT: BNEP's channel follows.
+			Profile::Pan => self.pan_found(at, handle, records),
 			Profile::Spp => {
 				let Some(server_channel) = records.iter().find_map(sdp::Record::rfcomm_channel) else {
 					print(b"BluetoothService: the peer offers no serial port\n");
+					if let Some(peer) = self.controllers[at].link(handle).map(|link| link.peer) {
+						self.serial_closed(at, &peer, Error::NotFound);
+					}
 					return;
 				};
-				self.rfcomm_connect(at, handle, server_channel, purpose);
+				self.rfcomm_connect(at, handle, server_channel, Some(purpose));
 			}
 			_ => {}
 		}
@@ -1532,7 +1565,8 @@ impl Stack {
 
 	// ------------------------------------------------------------------ RFCOMM
 
-	fn rfcomm_connect(&mut self, at: usize, handle: u16, server_channel: u8, profile: Profile) {
+	// A DLC TO THE PEER'S CHANNEL, for a profile - or, with none, for an Object Push session.
+	pub(crate) fn rfcomm_connect(&mut self, at: usize, handle: u16, server_channel: u8, profile: Option<Profile>) {
 		let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()) else { return };
 		if let Some(rfcomm) = classic.rfcomm.as_mut() {
 			if rfcomm.session.is_open() || rfcomm.session.dlc(server_channel).is_some() || !rfcomm.opening.is_empty() {
@@ -1572,7 +1606,13 @@ impl Stack {
 		self.run_rfcomm(at, handle, outs);
 	}
 
-	fn run_rfcomm(&mut self, at: usize, handle: u16, outs: Vec<RfOut>) {
+	pub(crate) fn run_rfcomm(&mut self, at: usize, handle: u16, outs: Vec<RfOut>) {
+		// What the serial port's grants and the Object Push sessions hear of it, once the session's steps are taken.
+		let mut serial_data = false;
+		let mut serial_opened = false;
+		let mut serial_closed = false;
+		let mut opp_channels = self.opp_rfcomm_channels(at, handle);
+		let mut opp_events: Vec<(u8, super::opp::RfEvent)> = Vec::new();
 		for out in outs {
 			let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()) else { return };
 			let Some(rfcomm) = classic.rfcomm.as_mut() else { return };
@@ -1582,18 +1622,27 @@ impl Stack {
 					self.send_on(at, handle, cid, &frame);
 				}
 				RfOut::Opened(server_channel) => {
-					let profile = rfcomm.opening.iter().position(|(held, _)| *held == server_channel).map(|position| rfcomm.opening.remove(position).1);
+					let asked = rfcomm.opening.iter().position(|(held, _)| *held == server_channel).map(|position| rfcomm.opening.remove(position).1);
+					// AN OBJECT PUSH SESSION'S CHANNEL: one this side asked for, or a peer's to this host's server.
+					if matches!(asked, Some(None)) || (asked.is_none() && server_channel == bt_policy::OPP_CHANNEL) {
+						opp_channels.push(server_channel);
+						opp_events.push((server_channel, super::opp::RfEvent::Opened));
+						continue;
+					}
+					let profile = asked.flatten();
 					// A HEADSET OPENED THE VOICE GATEWAY'S CHANNEL - admitted by the policy for a peer trusted for voice.
 					let inbound_voice = profile.is_none() && matches!(server_channel, bt_policy::HFP_CHANNEL | bt_policy::HSP_CHANNEL);
 					if let Some(profile) = profile.or(inbound_voice.then_some(Profile::Voice)) {
 						rfcomm.open.push((server_channel, profile));
 						classic.profiles = classic.profiles.with(profile_to_logic(profile), true);
 					}
+					serial_opened |= profile == Some(Profile::Spp);
 					if inbound_voice {
 						self.voice_opened(at, handle, server_channel);
 					}
 				}
 				RfOut::Data(server_channel, bytes) if classic.voice.as_ref().is_some_and(|voice| voice.channel == server_channel) => self.voice_data(at, handle, &bytes),
+				RfOut::Data(server_channel, bytes) if opp_channels.contains(&server_channel) => opp_events.push((server_channel, super::opp::RfEvent::Data(bytes))),
 				RfOut::Data(server_channel, bytes) => {
 					// WHAT ARRIVES FOR A CONSUMER that has not taken it is held, bounded; the credits went back
 					// with the session's own top-up, so a peer is never stalled by a consumer that is absent.
@@ -1609,12 +1658,18 @@ impl Stack {
 					while held.len() > MAX_HELD_BYTES {
 						held.pop_front();
 					}
+					serial_data |= rfcomm.open.iter().any(|(held, profile)| *held == server_channel && *profile == Profile::Spp);
 				}
 				RfOut::Closed(server_channel) => {
+					if opp_channels.contains(&server_channel) || rfcomm.opening.iter().any(|(held, profile)| *held == server_channel && profile.is_none()) {
+						opp_events.push((server_channel, super::opp::RfEvent::Closed));
+					}
+					serial_closed |= rfcomm.opening.iter().any(|(held, profile)| *held == server_channel && *profile == Some(Profile::Spp));
 					rfcomm.opening.retain(|(held, _)| *held != server_channel);
 					if let Some(position) = rfcomm.open.iter().position(|(held, _)| *held == server_channel) {
 						let (_, profile) = rfcomm.open.remove(position);
 						classic.profiles = classic.profiles.with(profile_to_logic(profile), false);
+						serial_closed |= profile == Profile::Spp;
 					}
 					rfcomm.held.retain(|(held, _)| *held != server_channel);
 					if classic.voice.as_ref().is_some_and(|voice| voice.channel == server_channel) {
@@ -1624,6 +1679,10 @@ impl Stack {
 				RfOut::SessionOpen => {}
 				RfOut::SessionClosed => {
 					let cid = rfcomm.cid;
+					serial_closed |= rfcomm.opening.iter().any(|(_, profile)| *profile == Some(Profile::Spp)) || rfcomm.open.iter().any(|(_, profile)| *profile == Profile::Spp);
+					for channel in rfcomm.opening.iter().filter(|(_, profile)| profile.is_none()).map(|(channel, _)| *channel).chain(opp_channels.iter().copied()) {
+						opp_events.push((channel, super::opp::RfEvent::Closed));
+					}
 					for (_, profile) in rfcomm.open.drain(..) {
 						classic.profiles = classic.profiles.with(profile_to_logic(profile), false);
 					}
@@ -1633,6 +1692,28 @@ impl Stack {
 				}
 			}
 		}
+		if serial_opened {
+			self.serial_opened(at, handle);
+		}
+		if serial_data {
+			self.serial_deliver(at, handle);
+		}
+		if serial_closed && let Some(peer) = self.controllers[at].link(handle).map(|link| link.peer) {
+			self.serial_closed(at, &peer, Error::Closed);
+		}
+		for (channel, happened) in opp_events {
+			self.opp_rfcomm(at, handle, channel, happened);
+		}
+	}
+
+	// ONE SDU ON AN ENHANCED RETRANSMISSION CHANNEL: segmented, numbered and kept until the peer acknowledges it.
+	pub(crate) fn ertm_send(&mut self, at: usize, handle: u16, cid: u16, sdu: &[u8]) {
+		let now = now_ms();
+		let outs = match self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()).and_then(|classic| classic.ertm.iter_mut().find(|(held, _)| *held == cid)) {
+			Some((_, ertm)) => ertm.send(sdu, now),
+			None => return,
+		};
+		self.run_ertm(at, handle, cid, outs);
 	}
 
 	// Bytes to the peer on one open DLC.
@@ -1651,7 +1732,7 @@ impl Stack {
 		if !peer_is_classic(peer) {
 			return Err(Error::Unsupported);
 		}
-		if !matches!(profile, Profile::Spp | Profile::Input | Profile::Audio) {
+		if !matches!(profile, Profile::Spp | Profile::Input | Profile::Audio | Profile::Pan) {
 			return Err(Error::Unsupported);
 		}
 		if self.record(at, peer).is_none() {
@@ -1679,6 +1760,9 @@ impl Stack {
 	}
 
 	pub(crate) fn disconnect_profile(&mut self, at: usize, peer: &Peer, profile: Profile) -> Result<(), Error> {
+		if profile == Profile::Pan {
+			return self.disconnect_pan(at, peer);
+		}
 		let controller = &mut self.controllers[at];
 		let Some(handle) = controller.link_to(peer).map(|link| link.handle) else { return Err(Error::NotFound) };
 		let Some(classic) = controller.link_mut(handle).and_then(|link| link.classic.as_mut()) else { return Err(Error::Unsupported) };
@@ -1707,18 +1791,26 @@ impl Stack {
 			Profile::Spp => sdp::uuid::SERIAL_PORT,
 			Profile::Input => sdp::uuid::HUMAN_INTERFACE_DEVICE,
 			Profile::Audio => sdp::uuid::AUDIO_SINK,
+			Profile::Pan => sdp::uuid::NAP,
 			_ => return,
 		};
-		let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()) else { return };
-		if profile == Profile::Input {
+		if profile == Profile::Input
+			&& let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut())
+		{
 			classic.hid.searched = true;
 		}
+		self.start_search(at, handle, uuid, Purpose::Profile(profile));
+	}
+
+	// ONE SEARCH OF THE PEER'S RECORDS for a class, and what it is for. One at a time on a link.
+	pub(crate) fn start_search(&mut self, at: usize, handle: u16, uuid: u16, purpose: Purpose) {
+		let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()) else { return };
 		if classic.sdp_client.is_some() {
 			print(b"BluetoothService: an SDP search is already running on the link; the connection is refused\n");
 			return;
 		}
 		let Some((cid, signal)) = classic.channels.open(psm::SDP, false) else { return };
-		classic.sdp_client = Some(SdpClient { cid, search: None, uuid, purpose: profile });
+		classic.sdp_client = Some(SdpClient { cid, search: None, uuid, purpose });
 		self.send_signal(at, handle, &signal);
 	}
 }

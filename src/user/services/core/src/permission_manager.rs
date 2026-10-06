@@ -135,7 +135,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 60] = [
+const VOCABULARY: [Capability; 61] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -251,6 +251,9 @@ const VOCABULARY: [Capability; 60] = [
 	// minted per launch through its admin root. Read by tag.
 	Capability::AudioControl,
 	Capability::AudioVoice,
+	// AN APPLICATION'S SERIAL PORT, minted per launch from BluetoothService's admin root for one aliased peer. Read by
+	// tag.
+	Capability::BluetoothSerial,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -410,9 +413,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"btread" => Some(granted("btread", alloc::vec![Capability::Bluetooth])),
 		// THE LE GATE'S APPLICATION, development-only: a GATT client on the peer aliased `tag-1`, and nothing else.
 		b"btgatt" => Some(granted("btgatt", alloc::vec![Capability::BluetoothGatt])),
+		// THE BR/EDR GATE'S APPLICATION, development-only: one serial port, on the peer aliased `serial-1`, and nothing else.
+		b"btserial" => Some(granted("btserial", alloc::vec![Capability::BluetoothSerial])),
 		// THE BR/EDR GATE'S PROBE, development-only: both Bluetooth authorities, since it is the prompt watcher a
-		// person would be, and the fixture's control endpoint, through which the devices on the far side act.
-		b"btclassic" => Some(granted("btclassic", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator, Capability::FixtureControl, Capability::AudioStream, Capability::AudioControl])),
+		// person would be, the fixture's control endpoint, through which the devices on the far side act, and the audio
+		// a music player and a call would hold.
+		b"btclassic" => Some(granted("btclassic", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator, Capability::FixtureControl, Capability::AudioStream, Capability::AudioControl, Capability::AudioVoice])),
 		// THE HID-OVER-I2C GATE'S PROBE, development-only: the device list and its policy verbs - it disables and
 		// enables the I2C controller's binding and the touchscreen's - the pointer and contact streams, and a display
 		// surface whose input focus is the proof the contact stream asks for.
@@ -691,6 +697,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::BluetoothGatt => b"BTGATT",
 		Capability::AudioControl => CAP_AUDIO_CONTROL,
 		Capability::AudioVoice => b"AUDIO_VOICE",
+		Capability::BluetoothSerial => b"BTSERIAL",
 	}
 }
 
@@ -871,7 +878,7 @@ impl Clients {
 			Capability::Brightness => self.brightness,
 			Capability::BrightnessControl => self.brightness_control,
 			// Minted per launch through BluetoothService's admin root: see `grant_for_task`.
-			Capability::BluetoothGatt => 0,
+			Capability::BluetoothGatt | Capability::BluetoothSerial => 0,
 			Capability::AudioControl => self.audio_control,
 		}
 	}
@@ -1063,6 +1070,28 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 				_ => 0,
 			}
 		}
+		// A SERIAL PORT ON ONE ALIASED PEER, for this component and this task. Minting connects nothing: the client
+		// connects, and the grant ends with the task, the channel it opened with it.
+		Capability::BluetoothSerial => {
+			let Some(alias) = bluetooth_serial_policy(component) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.bt_admin, clients.broker, CAP_BT_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = proto::system::bluetooth_admin::Client::new(ChannelTransport { chan: admin }).mint_serial(alias, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(connection)) => {
+					clients.grant_detail = alloc::format!("bluetooth serial peer {alias}");
+					let narrowed = duplicate(connection, GRANT_RIGHTS);
+					close(connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
 		// CAPTURE FROM ONE CAMERA, for this component and this task. Minting starts nothing: the client
 		// negotiates, registers its own buffers and starts explicitly, and the connection dies with the task
 		// however it is copied.
@@ -1228,6 +1257,18 @@ fn bluetooth_gatt_policy(component: &str) -> Option<(&'static str, &'static [u16
 		// THE LE GATE'S APPLICATION, development-only: the fixture tag's battery and custom services.
 		if component == "btgatt" {
 			return Some(("tag-1", &[0x180f, 0xfff0]));
+		}
+	}
+	let _ = component;
+	None
+}
+
+// WHICH PEER A COMPONENT'S SERIAL PORT IS ON: an alias the operator gave a bonded BR/EDR peer. The default is none.
+fn bluetooth_serial_policy(component: &str) -> Option<&'static str> {
+	{
+		// THE BR/EDR GATE'S APPLICATION, development-only: the fixture's serial device.
+		if component == "btserial" {
+			return Some("serial-1");
 		}
 	}
 	let _ = component;

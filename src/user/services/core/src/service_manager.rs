@@ -1633,6 +1633,8 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 		b"input_service" => &[CAP_BT_PROFILE],
 		// THE AUDIO ENDPOINTS, re-resolved in the same way after a restart of the stack.
 		b"audio_service" => &[CAP_BT_AUDIO],
+		// THE PAN LINKS, likewise.
+		b"network_service" => &[CAP_BT_NETWORK],
 		b"console_service" => &[CAP_CONFIG, CAP_DEVICE],
 		b"system_graph_service" => &[CAP_DEVICE],
 		// The shell resolves the system graph rather than holding the connection it was given
@@ -1648,7 +1650,7 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_CONFIG => Some(b"config_service"),
 		CAP_DEVICE => Some(b"device_service"),
 		CAP_GRAPH => Some(b"system_graph_service"),
-		CAP_BT_READ | CAP_BT_OPERATOR | CAP_BT_PROFILE | CAP_BT_ADMIN | CAP_BT_AUDIO => Some(b"bluetooth_service"),
+		CAP_BT_READ | CAP_BT_OPERATOR | CAP_BT_PROFILE | CAP_BT_ADMIN | CAP_BT_AUDIO | CAP_BT_NETWORK => Some(b"bluetooth_service"),
 		CAP_AUDIO_CONTROL => Some(b"audio_service"),
 		CAP_INPUT => Some(b"input_service"),
 		CAP_POWER_STATE | CAP_POWER_CONTROL => Some(b"power_service"),
@@ -1699,6 +1701,7 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_BT_PROFILE => broker.kept.end_of(b"bluetooth_service", b"PROFILE"),
 		CAP_BT_ADMIN => broker.kept.end_of(b"bluetooth_service", b"ADMIN"),
 		CAP_BT_AUDIO => broker.kept.end_of(b"bluetooth_service", b"AUDIO"),
+		CAP_BT_NETWORK => broker.kept.end_of(b"bluetooth_service", b"NETWORK"),
 		CAP_AUDIO_CONTROL => broker.kept.end_of(b"audio_service", b"CONTROL"),
 		// INPUTSERVICE'S ORDINARY ROOT, for the one grant that could never deliver anything. The
 		// `input` capability has been in the vocabulary with no client behind it - PermissionManager's

@@ -16,6 +16,7 @@
 #                                remote - refused until `pair-legacy`, never over a Secure Connections bond
 #   several links              the tag, the display and the remote connected at once
 #   the attribute server       the tag reads this host's name through it
+#   the battery                the tag's Battery Service, read by the stack itself, is its level in its status
 #   reconnection               the tag and the remote, trusted for input, come back through the accept list - the
 #                                tag named by its identity through the resolving list - each encrypted on the key its
 #                                pairing made, the remote's with its EDIV and Rand

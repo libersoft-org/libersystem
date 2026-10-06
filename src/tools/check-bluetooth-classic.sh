@@ -25,9 +25,14 @@
 #                               the bonds kept
 #   the inbound policy        a trusted keyboard's channel waits for its link to be secured with the stored
 #                               key; HID refused for security to a peer not trusted for input; RFCOMM refused
-#                               without voice trust; a channel no role serves refused; SDP answers anyone
+#                               without voice trust; a channel no role serves refused; SDP answers anyone with
+#                               this host's voice gateway and no role it does not run
 #   SDP and RFCOMM, client    `connect serial spp` pages, secures, searches the device's records, opens
 #                               channel 3, and credits flow both ways; an idle link goes into sniff
+#   an application's port     `btserial`, granted the serial port on the peer aliased `serial-1`: refused before
+#                               it connects, connected, a line echoed back whole, a burst larger than the DLC's
+#                               queue taken in parts with `again` and read back whole and in order while the
+#                               reader holds the peer, and the stream ending with the channel
 #   bonds outlive it          after a restart and a cold reboot the trusted keyboard's page is taken and
 #                               secured with the stored key - the fingerprint the first boot's pairing made -
 #                               and nothing pairs again; after a forget its page is refused
@@ -43,7 +48,7 @@ guest_gate_arch "$@"
 
 fail() { guest_gate_fail "$@"; }
 
-guest_gate_require_programs bt_fixture btclassic bluetooth_service bluetooth_bond_store
+guest_gate_require_programs bt_fixture btclassic btserial bluetooth_service bluetooth_bond_store
 
 # THE FIXTURE'S DEVICE, at the address its registry entry pins.
 export QEMU_EXTRA="-device edu,addr=0x1d"
@@ -51,8 +56,8 @@ export QEMU_EXTRA="-device edu,addr=0x1d"
 # disk the first one wrote.
 [[ -f "$root/../.build/boot/system-volume-bootable-x86_64.img" ]] || fail "there is no bootable system volume beside the image - build it:  LIBER_DEVELOPMENT=1 ./image.sh"
 export RUN_DISK="$guest_gate_work/system.img"
-export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-240}"
-export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-400}"
+export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-280}"
+export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-440}"
 
 expect() {
 	local lines="$1" line="$2" why="$3"
@@ -66,7 +71,7 @@ expect() {
 }
 
 # ---- boot one: the pairings, the policy, and a restart of the service.
-guest_gate_run $'btclassic pair\nbtclassic policy\nstop bluetooth_service\nstart bluetooth_service\nbtclassic reuse' ""
+guest_gate_run $'btclassic pair\nbtclassic policy\nbtclassic serial\nbtserial\nstop bluetooth_service\nstart bluetooth_service\nbtclassic reuse' ""
 first="$guest_gate_work/first"
 cp "$GUEST_LINES" "$first"
 if grep -aqF "vol://system is a live copy in memory" "$first" || ! grep -aqF "boot: the system volume is a paired block volume" "$first"; then
@@ -74,6 +79,9 @@ if grep -aqF "vol://system is a live copy in memory" "$first" || ! grep -aqF "bo
 fi
 expect "$first" "btclassic: PASS pair" "every BR/EDR pairing model must run through the prompts at its level, and no downgrade may pass"
 expect "$first" "btclassic: PASS policy" "the inbound policy, SDP and RFCOMM with credits must hold"
+expect "$first" "btclassic: PASS serial" "the serial device must be aliased and trusted for an application's grant"
+expect "$first" "btserial: PASS" "an application's serial port grant must connect, echo, hold back a burst on credits and end with its channel"
+grep -aE '^btserial: ' "$first" | sed 's/^/bluetooth-classic: /'
 expect "$first" "btclassic: PASS reuse" "after the restart the trusted keyboard must be secured with its stored key"
 paired="$(grep -aoE 'bt-fixture: paired keyboard type 0x08 key [0-9a-f]{8}' "$first" | tail -n 1 | awk '{print $NF}')"
 [[ -n "$paired" ]] || fail "the fixture never reported the keyboard's pairing"
@@ -99,4 +107,4 @@ if grep -aqE 'bt-fixture: paired ' "$second"; then
 	fail "something paired on the second boot; the bonds must be reused"
 fi
 
-echo "bluetooth-classic: PASS - the policy at rest, inquiry, every BR/EDR pairing model and its level, no downgrade, the inbound policy, SDP and RFCOMM with credits, sniff, and bonds across a restart and a cold reboot"
+echo "bluetooth-classic: PASS - the policy at rest, inquiry, every BR/EDR pairing model and its level, no downgrade, the inbound policy, SDP and RFCOMM with credits, sniff, an application's serial port grant, and bonds across a restart and a cold reboot"

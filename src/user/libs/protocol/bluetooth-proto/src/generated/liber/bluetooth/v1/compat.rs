@@ -146,6 +146,22 @@ fn scan_handle_wire_is_stable() {
 	assert_eq!(ScanHandle::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn received_kind_wire_is_stable() {
+	let sample = ReceivedKind::Offered;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(ReceivedKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn received_object_wire_is_stable() {
+	let sample = ReceivedObject { kind: ReceivedKind::Offered, name: String::from("x"), object_type: String::from("x"), declared: Some(7), received: 7, bytes: alloc::vec![7] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 1, 0, 120, 1, 0, 120, 1, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(ReceivedObject::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn media_command_wire_is_stable() {
 	let sample = MediaCommand::Play;
 	let bytes = sample.encode_vec().expect("encode");
@@ -218,6 +234,14 @@ fn gatt_value_wire_is_stable() {
 	assert_eq!(GattValue::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn serial_bytes_wire_is_stable() {
+	let sample = SerialBytes { bytes: alloc::vec![7] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(SerialBytes::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn bond_record_wire_is_stable() {
 	let sample = BondRecord { version: 7, local: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, peer: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, key: alloc::vec![7], security: SecurityLevel::None, name: String::from("x"), enabled: true, radio: Radio::Classic, link_key: alloc::vec![7], link_key_type: 7, level: BondLevel { agreement: KeyAgreement::Legacy, authenticated: true }, trusted: alloc::vec![Profile::Input], alias: String::from("x"), irk: alloc::vec![7], ediv: 7, rand: alloc::vec![7] };
 	let bytes = sample.encode_vec().expect("encode");
@@ -280,4 +304,20 @@ fn audio_event_wire_is_stable() {
 	let golden: &[u8] = &[0, 7, 0, 0, 0, 1, 1, 0, 7, 1, 0, 120, 1, 7, 0, 0, 0, 7, 7, 0, 0, 0, 1, 7];
 	assert_eq!(bytes, golden);
 	assert_eq!(AudioEvent::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn network_link_wire_is_stable() {
+	let sample = NetworkLink { id: 7, peer: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, name: String::from("x"), replace_uplink: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 1, 0, 7, 1, 0, 120, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(NetworkLink::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn network_event_wire_is_stable() {
+	let sample = NetworkEvent::Arrived(NetworkLink { id: 7, peer: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, name: String::from("x"), replace_uplink: true });
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0, 7, 0, 0, 0, 1, 1, 0, 7, 1, 0, 120, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(NetworkEvent::decode(&bytes).unwrap(), sample);
 }

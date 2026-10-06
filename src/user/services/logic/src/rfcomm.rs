@@ -26,6 +26,8 @@ pub const MAX_FRAME: usize = BREDR_MTU - 6;
 pub const DEFAULT_FRAME: usize = 127;
 /// The credits this side grants a DLC when it opens, and again whenever the peer's run low.
 pub const INITIAL_CREDITS: u8 = 7;
+/// Frames a DLC's writer may have queued past its credits: what `room` measures a bounded write against.
+pub const QUEUED_FRAMES: usize = 8;
 
 // ----------------------------------------------------------------------------------------------------------- the FCS
 
@@ -329,6 +331,8 @@ pub struct Dlc {
 	pub msc_received: bool,
 	/// Data waiting for credits.
 	pub queue: VecDeque<Vec<u8>>,
+	/// Its reader holds what arrived and has not taken it: the credits this side gives back wait.
+	pub paused: bool,
 }
 
 /// What the session asks the service to do.
@@ -429,7 +433,7 @@ impl Session {
 	fn negotiate(&mut self, channel: u8) -> Out {
 		let dlci = self.outbound_dlci(channel);
 		let frame = self.frame_size();
-		self.dlcs.push(Dlc { dlci, state: DlcState::WaitPn, frame, tx_credits: 0, rx_credits: u16::from(INITIAL_CREDITS), msc_sent: false, msc_received: false, queue: VecDeque::new() });
+		self.dlcs.push(Dlc { dlci, state: DlcState::WaitPn, frame, tx_credits: 0, rx_credits: u16::from(INITIAL_CREDITS), msc_sent: false, msc_received: false, queue: VecDeque::new(), paused: false });
 		self.send_mcc(Mcc { command: true, body: Command::Pn { dlci, cl: CL_CREDITS_REQUEST, priority: 7, frame: frame as u16, credits: INITIAL_CREDITS } })
 	}
 
@@ -455,6 +459,26 @@ impl Session {
 		Some(self.drain(at))
 	}
 
+	/// THE BYTES A BOUNDED WRITE MAY HAND THIS DLC NOW: what fills its queue to `QUEUED_FRAMES` frames. Zero for a DLC
+	/// that is not open, or one whose peer has stopped granting credits and whose queue is full.
+	pub fn room(&self, channel: u8) -> usize {
+		let Some(dlc) = self.dlcs.iter().find(|dlc| dlc.dlci >> 1 == channel && dlc.state == DlcState::Open) else { return 0 };
+		QUEUED_FRAMES.saturating_sub(dlc.queue.len()) * dlc.frame.max(1)
+	}
+
+	/// HOLD OR RELEASE THE PEER: while paused, credits it uses are not given back, so it stops when they run out; on
+	/// release, what it is owed goes back at once.
+	pub fn pause(&mut self, channel: u8, paused: bool) -> Vec<Out> {
+		let mut out = Vec::new();
+		let Some(at) = self.dlcs.iter().position(|dlc| dlc.dlci >> 1 == channel && dlc.state == DlcState::Open) else { return out };
+		self.dlcs[at].paused = paused;
+		if !paused && let Some(grant) = self.top_up(at) {
+			let dlci = self.dlcs[at].dlci;
+			out.push(self.send(dlci, Kind::Uih, true, true, Some(grant), Vec::new()));
+		}
+		out
+	}
+
 	fn drain(&mut self, at: usize) -> Vec<Out> {
 		let mut out = Vec::new();
 		while self.dlcs[at].tx_credits > 0 {
@@ -471,7 +495,7 @@ impl Session {
 	// Credits to grant the peer now, when it holds fewer than half of what this side gives.
 	fn top_up(&mut self, at: usize) -> Option<u8> {
 		let dlc = &mut self.dlcs[at];
-		if dlc.rx_credits < u16::from(INITIAL_CREDITS) / 2 + 1 {
+		if !dlc.paused && dlc.rx_credits < u16::from(INITIAL_CREDITS) / 2 + 1 {
 			let grant = u16::from(INITIAL_CREDITS) - dlc.rx_credits;
 			dlc.rx_credits += grant;
 			return Some(grant as u8);
@@ -626,7 +650,7 @@ impl Session {
 						self.dlcs[at].frame = agreed;
 						self.dlcs[at].tx_credits = u16::from(credits);
 					}
-					None => self.dlcs.push(Dlc { dlci, state: DlcState::WaitUa, frame: agreed, tx_credits: u16::from(credits), rx_credits: u16::from(INITIAL_CREDITS), msc_sent: false, msc_received: false, queue: VecDeque::new() }),
+					None => self.dlcs.push(Dlc { dlci, state: DlcState::WaitUa, frame: agreed, tx_credits: u16::from(credits), rx_credits: u16::from(INITIAL_CREDITS), msc_sent: false, msc_received: false, queue: VecDeque::new(), paused: false }),
 				}
 				out.push(self.send_mcc(Mcc { command: false, body: Command::Pn { dlci, cl: CL_CREDITS_ACCEPT, priority, frame: agreed as u16, credits: INITIAL_CREDITS } }));
 			}

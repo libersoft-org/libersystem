@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 170] = [
+const GATES: [(&str, &str); 171] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -335,6 +335,7 @@ const GATES: [(&str, &str); 170] = [
 	("bluetooth-input", "userspace.build"),
 	("bluetooth-le", "userspace.build"),
 	("bluetooth-audio", "userspace.build"),
+	("bluetooth-transfer", "userspace.build"),
 	// AUDIOSERVICE'S DEVICE MODEL on the lab machine: two providers at boot, a third hot-plugged under a playing stream.
 	("audio-routing", "userspace.build"),
 	// POWERSERVICE, against the in-guest power fixture's HID-shaped and ACPI-shaped providers: canonical
@@ -924,7 +925,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 71] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 72] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
@@ -935,6 +936,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 71] = [
 	"bluetooth-input",
 	"bluetooth-le",
 	"bluetooth-audio",
+	"bluetooth-transfer",
 	"power-service",
 	"power-ups",
 	"brightness-usb",

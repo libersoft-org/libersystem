@@ -312,6 +312,57 @@ interface bluetooth-operator {
 	@op(16) pair-legacy: func(controller: u32, peer: peer-address) -> result<unit, error>;
 	/// THE REMOTE CONTROL, toward a phone playing to this system: a button pressed and let go over AVRCP.
 	@op(17) media:       func(controller: u32, peer: peer-address, command: media-command) -> result<unit, error>;
+	/// PUSH ONE OBJECT to a bonded peer over OBEX Object Push - on L2CAP where the peer's record offers it, on RFCOMM
+	/// otherwise - named `name`, of `length` bytes where the caller knows it. The object's bytes go on the returned
+	/// `object-push`: THIS SERVICE HOLDS NO STORAGE AUTHORITY, and reads no file - `btctl send` forwards the stream the
+	/// shell's input redirection opened.
+	@op(18) send:        func(controller: u32, peer: peer-address, @bound(256) name: string, length: option<u64>) -> result<handle<channel>, error>;
+	/// RECEIVE THE ONE OBJECT the bonded `peer` pushes while this waits - at most `max-bytes` of it, for at most 180
+	/// seconds or until the stream is closed. While it waits the peer's page and its Object Push channel are admitted,
+	/// and nobody else's; an object that declares more than `max-bytes` is refused before a byte of it is taken, and
+	/// one that passes it while arriving is aborted. CONSENTED BY THE CALL: no prompt is raised. One receiver per
+	/// controller.
+	@op(19) receive:     func(controller: u32, peer: peer-address, max-bytes: u64) -> result<stream<received-object>, error>;
+	/// TETHER TO A BONDED PEER'S NETWORK ACCESS POINT as a PAN user, the link offered to NetworkService - which may make
+	/// it the uplink in place of a selected one only where `replace-uplink` says so; otherwise it is held, unselected,
+	/// while another is selected. `connect` with `pan` is this without `replace-uplink`.
+	@op(20) connect-pan: func(controller: u32, peer: peer-address, replace-uplink: bool) -> result<unit, error>;
+}
+
+/// What a receiver hears of the one object a peer pushes.
+enum received-kind {
+	/// The object begins: the peer's name for it, its type and the length it declared - the peer's words, never a path.
+	offered   = 1,
+	/// Its next bytes.
+	data      = 2,
+	/// It arrived whole.
+	complete  = 3,
+	/// It did not: refused for its size, aborted by the peer, or its link lost. `received` says how much came.
+	failed    = 4,
+	/// Nothing was pushed within the receiver's time.
+	timed-out = 5,
+}
+
+record received-object {
+	kind:                   received-kind,
+	@bound(256) name:       string,
+	@bound(64) object-type: string,
+	declared:               option<u64>,
+	received:               u64,
+	@bound(1024) bytes:     list<u8>,
+}
+
+/// AN OBJECT BEING PUSHED, from `bluetooth-operator.send`: its bytes, then its end.
+interface object-push {
+	/// The object's next bytes, and how many were taken: `again` while the push holds as much as it may and the peer
+	/// has not taken it, `closed` once the push is over.
+	@op(1) write:  func(@bound(1024) data: list<u8>) -> result<u64, error>;
+	/// The object's end. Answered when the peer has it - with the bytes it took - or with why it does not: `denied`
+	/// for a peer that refused it, `not-found` for one that offers no Object Push, `timed-out` for one that never
+	/// answered, `closed` for a link lost.
+	@op(2) finish: func() -> result<u64, error>;
+	/// Abandon it.
+	@op(3) abort:  func() -> result<unit, error>;
 }
 
 /// A button the operator presses on a phone that plays to this system.
@@ -420,11 +471,39 @@ interface bluetooth-gatt {
 	@op(5) subscribe:       func(handle: u16) -> result<stream<gatt-value>, error>;
 }
 
+/// A piece of what a serial port's peer sent, in the order it sent it.
+record serial-bytes {
+	@bound(1024) bytes: list<u8>,
+}
+
+/// AN APPLICATION'S SERIAL PORT, minted per launch by PermissionManager for one component and one bonded BR/EDR peer
+/// the operator gave an alias and trusted for the serial port profile: a byte stream over RFCOMM and nothing above
+/// it. NOT A CONSOLE - `console-bytes` is a device's kind, and its one consumer is the development agent. It ends
+/// with the launch, and the channel it opened closes with it.
+interface bluetooth-serial {
+	/// Connect the port: the peer paged where it has no link, its record searched for the serial port and the RFCOMM
+	/// channel the record names opened. Answered when the channel is open - at once where it is - or with why it is
+	/// not: `not-found` for a peer that offers no serial port, `timed-out` for one that never answered.
+	@op(1) connect: func() -> result<unit, error>;
+	/// Bytes to the peer, and how many were taken: as many as the channel's queue holds past the peer's credits.
+	/// `again` when it holds nothing more - the peer's credits are the backpressure - and `closed` while the channel
+	/// is not open.
+	@op(2) write:   func(@bound(1024) data: list<u8>) -> result<u32, error>;
+	/// What the peer sends, as it arrives - one subscription. A reader that falls behind holds the peer, its credits
+	/// not given back, rather than losing bytes. The stream ends when the channel closes.
+	@op(3) read:    func() -> result<stream<serial-bytes>, error>;
+	/// Close the channel. The grant stays for its launch and may connect again.
+	@op(4) close:   func() -> result<unit, error>;
+}
+
 /// THE MINTING ROOT PermissionManager holds, and nothing else: application grants, each for one component's launch.
 interface bluetooth-admin {
 	/// A GATT client for `owner`'s launch, on the bonded peer the operator named `alias` - refused unless that peer is
 	/// trusted for GATT - and for these services alone.
 	@op(1) mint-gatt: func(@bound(32) alias: string, @bound(8) services: list<service-class>, owner: handle<task>) -> result<handle<channel>, error>;
+	/// A serial port for `owner`'s launch, on the bonded BR/EDR peer the operator named `alias` - refused unless that
+	/// peer is trusted for the serial port profile. Minting connects nothing.
+	@op(2) mint-serial: func(@bound(32) alias: string, owner: handle<task>) -> result<handle<channel>, error>;
 }
 
 /// WHAT A BOND IS, on the private wire between this service and the store that keeps it.
@@ -527,6 +606,17 @@ enum fixture-action {
 	volume        = 18,
 	/// The headset presses its play button toward this host.
 	press-play    = 19,
+	/// The headset's hands-free unit connects to this host's voice gateway - paging this host first where it has no
+	/// link - and sets its service level connection up.
+	hfp-connect   = 20,
+	/// The headset's answer button (`ATA`), its hang-up (`AT+CHUP`), and its request for audio (`AT+BCC`); what this
+	/// host answered is reported.
+	answer        = 21,
+	hang-up       = 22,
+	audio-request = 23,
+	/// The phone pushes this host an object of `argument` bytes over Object Push, five seconds from now - paging this
+	/// host first where it has no link.
+	push-object   = 24,
 }
 
 /// THE IN-GUEST BLUETOOTH FIXTURE'S CONTROL ENDPOINT. DEVELOPMENT ONLY: it exists on a development fixture
@@ -622,4 +712,33 @@ interface bluetooth-audio {
 	@op(3) set-volume: func(id: u32, volume: u8) -> result<unit, error>;
 	/// The call state the voice device reports; none when no session declares one.
 	@op(4) set-call:   func(state: bt-call-state) -> result<unit, error>;
+}
+
+/// A PAN LINK, offered to NetworkService: a network access point this host is a PAN user of.
+record network-link {
+	id:             u32,
+	peer:           peer-address,
+	@bound(64) name: string,
+	/// Whether the operator said this link may replace a selected uplink: `btctl connect ADDRESS pan replace`.
+	replace-uplink: bool,
+}
+
+/// What the links stream carries.
+variant network-event {
+	/// A link is up: the access point answered its setup.
+	arrived(network-link),
+	/// A link is gone - disconnected, lost, or its stack stopped: its id.
+	departed(u32),
+}
+
+/// BLUETOOTH'S NETWORK LINKS, FOR NETWORKSERVICE ALONE: resolved by name through the broker, never a role, so no network
+/// waits for the radio. A link opened is a frame channel speaking a NIC provider's frame-plus-link wire - the greeting,
+/// `MAC` with the local controller's address and the 1500-byte MTU, then one Ethernet frame per message both ways - and
+/// BNEP's framing is this service's. Closing it ends nothing but the channel; the link ends with the operator's
+/// disconnect, or its peer.
+interface bluetooth-network {
+	/// The links offered now, then every change, as a stream. One subscriber: a second is refused.
+	@op(1) links: func() -> result<stream<network-event>, error>;
+	/// A link's frame channel. One holder.
+	@op(2) open:  func(id: u32) -> result<handle<channel>, error>;
 }

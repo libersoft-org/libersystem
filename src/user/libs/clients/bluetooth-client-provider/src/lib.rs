@@ -205,3 +205,57 @@ global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_med
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_media,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_media\n.type liber_channel_liber_bluetooth_bluetooth_operator_media,%function\nliber_channel_liber_bluetooth_bluetooth_operator_media:\ntail liber_channel_impl_liber_bluetooth_bluetooth_operator_media\n.size liber_channel_liber_bluetooth_bluetooth_operator_media, . - liber_channel_liber_bluetooth_bluetooth_operator_media\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_send,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_send\n.type liber_channel_liber_bluetooth_bluetooth_operator_send,@function\nliber_channel_liber_bluetooth_bluetooth_operator_send:\njmp liber_channel_impl_liber_bluetooth_bluetooth_operator_send\n.size liber_channel_liber_bluetooth_bluetooth_operator_send, . - liber_channel_liber_bluetooth_bluetooth_operator_send\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_send,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_send\n.type liber_channel_liber_bluetooth_bluetooth_operator_send,%function\nliber_channel_liber_bluetooth_bluetooth_operator_send:\nb liber_channel_impl_liber_bluetooth_bluetooth_operator_send\n.size liber_channel_liber_bluetooth_bluetooth_operator_send, . - liber_channel_liber_bluetooth_bluetooth_operator_send\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_send,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_send\n.type liber_channel_liber_bluetooth_bluetooth_operator_send,%function\nliber_channel_liber_bluetooth_bluetooth_operator_send:\ntail liber_channel_impl_liber_bluetooth_bluetooth_operator_send\n.size liber_channel_liber_bluetooth_bluetooth_operator_send, . - liber_channel_liber_bluetooth_bluetooth_operator_send\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_receive,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_receive\n.type liber_channel_liber_bluetooth_bluetooth_operator_receive,@function\nliber_channel_liber_bluetooth_bluetooth_operator_receive:\njmp liber_channel_impl_liber_bluetooth_bluetooth_operator_receive\n.size liber_channel_liber_bluetooth_bluetooth_operator_receive, . - liber_channel_liber_bluetooth_bluetooth_operator_receive\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_receive,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_receive\n.type liber_channel_liber_bluetooth_bluetooth_operator_receive,%function\nliber_channel_liber_bluetooth_bluetooth_operator_receive:\nb liber_channel_impl_liber_bluetooth_bluetooth_operator_receive\n.size liber_channel_liber_bluetooth_bluetooth_operator_receive, . - liber_channel_liber_bluetooth_bluetooth_operator_receive\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_receive,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_receive\n.type liber_channel_liber_bluetooth_bluetooth_operator_receive,%function\nliber_channel_liber_bluetooth_bluetooth_operator_receive:\ntail liber_channel_impl_liber_bluetooth_bluetooth_operator_receive\n.size liber_channel_liber_bluetooth_bluetooth_operator_receive, . - liber_channel_liber_bluetooth_bluetooth_operator_receive\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_write,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_write\n.type liber_channel_liber_bluetooth_object_push_write,@function\nliber_channel_liber_bluetooth_object_push_write:\njmp liber_channel_impl_liber_bluetooth_object_push_write\n.size liber_channel_liber_bluetooth_object_push_write, . - liber_channel_liber_bluetooth_object_push_write\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_write,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_write\n.type liber_channel_liber_bluetooth_object_push_write,%function\nliber_channel_liber_bluetooth_object_push_write:\nb liber_channel_impl_liber_bluetooth_object_push_write\n.size liber_channel_liber_bluetooth_object_push_write, . - liber_channel_liber_bluetooth_object_push_write\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_write,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_write\n.type liber_channel_liber_bluetooth_object_push_write,%function\nliber_channel_liber_bluetooth_object_push_write:\ntail liber_channel_impl_liber_bluetooth_object_push_write\n.size liber_channel_liber_bluetooth_object_push_write, . - liber_channel_liber_bluetooth_object_push_write\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_finish,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_finish\n.type liber_channel_liber_bluetooth_object_push_finish,@function\nliber_channel_liber_bluetooth_object_push_finish:\njmp liber_channel_impl_liber_bluetooth_object_push_finish\n.size liber_channel_liber_bluetooth_object_push_finish, . - liber_channel_liber_bluetooth_object_push_finish\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_finish,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_finish\n.type liber_channel_liber_bluetooth_object_push_finish,%function\nliber_channel_liber_bluetooth_object_push_finish:\nb liber_channel_impl_liber_bluetooth_object_push_finish\n.size liber_channel_liber_bluetooth_object_push_finish, . - liber_channel_liber_bluetooth_object_push_finish\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_finish,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_finish\n.type liber_channel_liber_bluetooth_object_push_finish,%function\nliber_channel_liber_bluetooth_object_push_finish:\ntail liber_channel_impl_liber_bluetooth_object_push_finish\n.size liber_channel_liber_bluetooth_object_push_finish, . - liber_channel_liber_bluetooth_object_push_finish\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_abort,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_abort\n.type liber_channel_liber_bluetooth_object_push_abort,@function\nliber_channel_liber_bluetooth_object_push_abort:\njmp liber_channel_impl_liber_bluetooth_object_push_abort\n.size liber_channel_liber_bluetooth_object_push_abort, . - liber_channel_liber_bluetooth_object_push_abort\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_abort,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_abort\n.type liber_channel_liber_bluetooth_object_push_abort,%function\nliber_channel_liber_bluetooth_object_push_abort:\nb liber_channel_impl_liber_bluetooth_object_push_abort\n.size liber_channel_liber_bluetooth_object_push_abort, . - liber_channel_liber_bluetooth_object_push_abort\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_object_push_abort,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_object_push_abort\n.type liber_channel_liber_bluetooth_object_push_abort,%function\nliber_channel_liber_bluetooth_object_push_abort:\ntail liber_channel_impl_liber_bluetooth_object_push_abort\n.size liber_channel_liber_bluetooth_object_push_abort, . - liber_channel_liber_bluetooth_object_push_abort\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_connect_pan,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_connect_pan\n.type liber_channel_liber_bluetooth_bluetooth_operator_connect_pan,@function\nliber_channel_liber_bluetooth_bluetooth_operator_connect_pan:\njmp liber_channel_impl_liber_bluetooth_bluetooth_operator_connect_pan\n.size liber_channel_liber_bluetooth_bluetooth_operator_connect_pan, . - liber_channel_liber_bluetooth_bluetooth_operator_connect_pan\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_connect_pan,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_connect_pan\n.type liber_channel_liber_bluetooth_bluetooth_operator_connect_pan,%function\nliber_channel_liber_bluetooth_bluetooth_operator_connect_pan:\nb liber_channel_impl_liber_bluetooth_bluetooth_operator_connect_pan\n.size liber_channel_liber_bluetooth_bluetooth_operator_connect_pan, . - liber_channel_liber_bluetooth_bluetooth_operator_connect_pan\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_bluetooth_bluetooth_operator_connect_pan,\"ax\",@progbits\n.globl liber_channel_liber_bluetooth_bluetooth_operator_connect_pan\n.type liber_channel_liber_bluetooth_bluetooth_operator_connect_pan,%function\nliber_channel_liber_bluetooth_bluetooth_operator_connect_pan:\ntail liber_channel_impl_liber_bluetooth_bluetooth_operator_connect_pan\n.size liber_channel_liber_bluetooth_bluetooth_operator_connect_pan, . - liber_channel_liber_bluetooth_bluetooth_operator_connect_pan\n");

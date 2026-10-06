@@ -1931,6 +1931,9 @@ pub mod bluetooth_operator {
 	pub const OP_DISCONNECT: u16 = 15;
 	pub const OP_PAIR_LEGACY: u16 = 16;
 	pub const OP_MEDIA: u16 = 17;
+	pub const OP_SEND: u16 = 18;
+	pub const OP_RECEIVE: u16 = 19;
+	pub const OP_CONNECT_PAN: u16 = 20;
 
 	pub trait Service {
 		/// Turn a controller's radio on or off. The platform's own allow or deny setting is enforced
@@ -1974,6 +1977,21 @@ pub mod bluetooth_operator {
 		fn pair_legacy(&mut self, controller: u32, peer: PeerAddress) -> Result<(), Error>;
 		/// THE REMOTE CONTROL, toward a phone playing to this system: a button pressed and let go over AVRCP.
 		fn media(&mut self, controller: u32, peer: PeerAddress, command: MediaCommand) -> Result<(), Error>;
+		/// PUSH ONE OBJECT to a bonded peer over OBEX Object Push - on L2CAP where the peer's record offers it, on RFCOMM
+		/// otherwise - named `name`, of `length` bytes where the caller knows it. The object's bytes go on the returned
+		/// `object-push`: THIS SERVICE HOLDS NO STORAGE AUTHORITY, and reads no file - `btctl send` forwards the stream the
+		/// shell's input redirection opened.
+		fn send(&mut self, controller: u32, peer: PeerAddress, name: String, length: Option<u64>) -> Result<u64, Error>;
+		/// RECEIVE THE ONE OBJECT the bonded `peer` pushes while this waits - at most `max-bytes` of it, for at most 180
+		/// seconds or until the stream is closed. While it waits the peer's page and its Object Push channel are admitted,
+		/// and nobody else's; an object that declares more than `max-bytes` is refused before a byte of it is taken, and
+		/// one that passes it while arriving is aborted. CONSENTED BY THE CALL: no prompt is raised. One receiver per
+		/// controller.
+		fn receive(&mut self, controller: u32, peer: PeerAddress, max_bytes: u64) -> Result<Vec<ReceivedObject>, Error>;
+		/// TETHER TO A BONDED PEER'S NETWORK ACCESS POINT as a PAN user, the link offered to NetworkService - which may make
+		/// it the uplink in place of a selected one only where `replace-uplink` says so; otherwise it is held, unselected,
+		/// while another is selected. `connect` with `pan` is this without `replace-uplink`.
+		fn connect_pan(&mut self, controller: u32, peer: PeerAddress, replace_uplink: bool) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -2610,6 +2628,88 @@ pub mod bluetooth_operator {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_SEND => {
+				let controller = r.u32()?;
+				let peer = PeerAddress::read(r)?;
+				let name = {
+					let v79 = r.string_lp()?;
+					(v79.len() <= 256).then_some(v79)?
+				};
+				let length = if r.tag()? { Some(r.u64()?) } else { None };
+				r.finish()?;
+				request_handles.clear();
+				let result = service.send(controller, peer, name, length);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v80) => {
+							w.u8(1)?;
+							w.set_handle(*v80)?;
+							w.u32(0)?;
+						}
+						Err(v81) => {
+							w.u8(0)?;
+							v81.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_CONNECT_PAN => {
+				let controller = r.u32()?;
+				let peer = PeerAddress::read(r)?;
+				let replace_uplink = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.connect_pan(controller, peer, replace_uplink);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v82) => {
+							w.u8(1)?;
+						}
+						Err(v83) => {
+							w.u8(0)?;
+							v83.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -2668,6 +2768,62 @@ pub mod bluetooth_operator {
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = PairingPrompt::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	pub fn receive_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<ReceivedObject>, Error>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let controller = r.u32()?;
+		let peer = PeerAddress::read(r)?;
+		let max_bytes = r.u64()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.receive(controller, peer, max_bytes);
+		Some((corr, items))
+	}
+	pub fn receive_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(1)?;
+		w.u32(0)?;
+		writer.finish()
+	}
+	pub fn receive_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(0)?;
+		error.write(w)?;
+		writer.finish()
+	}
+	pub fn receive_frame(seq: u32, item: &ReceivedObject, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn receive_read(msg: &[u8], frame_handles: &mut Handles) -> Option<ReceivedObject> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = ReceivedObject::read(r)?;
 		reader.finish()?;
 		frame_handles.clear();
 		Some(value)
@@ -2907,13 +3063,13 @@ pub mod bluetooth_operator {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v79 = r.u16()? as usize;
-						let mut v80 = Vec::new();
-						v80.try_reserve_exact(v79).ok()?;
-						for _ in 0..v79 {
-							v80.push(BondedPeer::read(r)?);
+						let v84 = r.u16()? as usize;
+						let mut v85 = Vec::new();
+						v85.try_reserve_exact(v84).ok()?;
+						for _ in 0..v84 {
+							v85.push(BondedPeer::read(r)?);
 						}
-						v80
+						v85
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3204,13 +3360,13 @@ pub mod bluetooth_operator {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v81 = r.u16()? as usize;
-						let mut v82 = Vec::new();
-						v82.try_reserve_exact(v81).ok()?;
-						for _ in 0..v81 {
-							v82.push(DeviceStatus::read(r)?);
+						let v86 = r.u16()? as usize;
+						let mut v87 = Vec::new();
+						v87.try_reserve_exact(v86).ok()?;
+						for _ in 0..v86 {
+							v87.push(DeviceStatus::read(r)?);
 						}
-						v82
+						v87
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3337,6 +3493,137 @@ pub mod bluetooth_operator {
 			w.u32(*controller)?;
 			peer.write(w)?;
 			command.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn send(&mut self, controller: &u32, peer: &PeerAddress, name: &str, length: &Option<u64>) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SEND)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
+			peer.write(w)?;
+			w.bytes_lp(name.as_bytes())?;
+			match length {
+				Some(v88) => {
+					w.u8(1)?;
+					w.u64(*v88)?;
+				}
+				None => {
+					w.u8(0)?;
+				}
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn receive(&mut self, controller: &u32, peer: &PeerAddress, max_bytes: &u64) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RECEIVE)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
+			peer.write(w)?;
+			w.u64(*max_bytes)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			let decoded = (|| {
+				if r.u32()? != corr {
+					return None;
+				}
+				if r.tag()? {
+					let _ = r.u32()?;
+					r.finish()?;
+					if reply_handles.len() != 1 {
+						return None;
+					}
+					return Some(Ok(reply_handles.first()));
+				}
+				if !reply_handles.is_empty() {
+					return None;
+				}
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
+			})();
+			if !matches!(decoded, Some(Ok(_))) {
+				self.transport.discard_handles(reply_handles.as_slice());
+			}
+			decoded
+		}
+		pub fn connect_pan(&mut self, controller: &u32, peer: &PeerAddress, replace_uplink: &bool) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CONNECT_PAN)?;
+			w.u32(corr)?;
+			w.u32(*controller)?;
+			peer.write(w)?;
+			w.boolean(*replace_uplink)?;
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -3499,6 +3786,564 @@ pub mod bluetooth_operator {
 	fn channel_invoke_media(chan: u64, controller: &u32, peer: &PeerAddress, command: &MediaCommand) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.media(controller, peer, command)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_send")]
+	fn channel_invoke_send(chan: u64, controller: &u32, peer: &PeerAddress, name: &str, length: &Option<u64>) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.send(controller, peer, name, length)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_receive")]
+	fn channel_invoke_receive(chan: u64, controller: &u32, peer: &PeerAddress, max_bytes: &u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.receive(controller, peer, max_bytes)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_operator_connect_pan")]
+	fn channel_invoke_connect_pan(chan: u64, controller: &u32, peer: &PeerAddress, replace_uplink: &bool) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.connect_pan(controller, peer, replace_uplink)
+	}
+}
+
+/// What a receiver hears of the one object a peer pushes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReceivedKind {
+	/// The object begins: the peer's name for it, its type and the length it declared - the peer's words, never a path.
+	Offered = 1,
+	/// Its next bytes.
+	Data = 2,
+	/// It arrived whole.
+	Complete = 3,
+	/// It did not: refused for its size, aborted by the peer, or its link lost. `received` says how much came.
+	Failed = 4,
+	/// Nothing was pushed within the receiver's time.
+	TimedOut = 5,
+}
+
+impl ReceivedKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ReceivedKind> {
+		let mut r = Reader::new(bytes);
+		let value = ReceivedKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ReceivedKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ReceivedKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<ReceivedKind> {
+		match r.u8()? {
+			1 => Some(ReceivedKind::Offered),
+			2 => Some(ReceivedKind::Data),
+			3 => Some(ReceivedKind::Complete),
+			4 => Some(ReceivedKind::Failed),
+			5 => Some(ReceivedKind::TimedOut),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReceivedObject {
+	pub kind: ReceivedKind,
+	pub name: String,
+	pub object_type: String,
+	pub declared: Option<u64>,
+	pub received: u64,
+	pub bytes: Vec<u8>,
+}
+
+impl ReceivedObject {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ReceivedObject> {
+		let mut r = Reader::new(bytes);
+		let value = ReceivedObject::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ReceivedObject> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ReceivedObject::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		w.bytes_lp(self.object_type.as_bytes())?;
+		match &self.declared {
+			Some(v89) => {
+				w.u8(1)?;
+				w.u64(*v89)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		w.u64(self.received)?;
+		if self.bytes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.bytes.len() as u16)?;
+		for v90 in self.bytes.iter() {
+			w.u8(*v90)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ReceivedObject> {
+		let kind = ReceivedKind::read(r)?;
+		let name = {
+			let v91 = r.string_lp()?;
+			(v91.len() <= 256).then_some(v91)?
+		};
+		let object_type = {
+			let v92 = r.string_lp()?;
+			(v92.len() <= 64).then_some(v92)?
+		};
+		let declared = if r.tag()? { Some(r.u64()?) } else { None };
+		let received = r.u64()?;
+		let bytes = {
+			let v93 = r.u16()? as usize;
+			let v93 = (v93 <= 1024).then_some(v93)?;
+			let mut v94 = Vec::new();
+			v94.try_reserve_exact(v93).ok()?;
+			for _ in 0..v93 {
+				v94.push(r.u8()?);
+			}
+			v94
+		};
+		Some(ReceivedObject { kind, name, object_type, declared, received, bytes })
+	}
+}
+
+/// AN OBJECT BEING PUSHED, from `bluetooth-operator.send`: its bytes, then its end.
+// interface `object-push` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod object_push {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_WRITE: u16 = 1;
+	pub const OP_FINISH: u16 = 2;
+	pub const OP_ABORT: u16 = 3;
+
+	pub trait Service {
+		/// The object's next bytes, and how many were taken: `again` while the push holds as much as it may and the peer
+		/// has not taken it, `closed` once the push is over.
+		fn write(&mut self, data: Vec<u8>) -> Result<u64, Error>;
+		/// The object's end. Answered when the peer has it - with the bytes it took - or with why it does not: `denied`
+		/// for a peer that refused it, `not-found` for one that offers no Object Push, `timed-out` for one that never
+		/// answered, `closed` for a link lost.
+		fn finish(&mut self) -> Result<u64, Error>;
+		/// Abandon it.
+		fn abort(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:bluetooth")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_WRITE => {
+				let data = {
+					let v95 = r.u16()? as usize;
+					let v95 = (v95 <= 1024).then_some(v95)?;
+					let mut v96 = Vec::new();
+					v96.try_reserve_exact(v95).ok()?;
+					for _ in 0..v95 {
+						v96.push(r.u8()?);
+					}
+					v96
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.write(data);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v97) => {
+							w.u8(1)?;
+							w.u64(*v97)?;
+						}
+						Err(v98) => {
+							w.u8(0)?;
+							v98.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_FINISH => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.finish();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v99) => {
+							w.u8(1)?;
+							w.u64(*v99)?;
+						}
+						Err(v100) => {
+							w.u8(0)?;
+							v100.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_ABORT => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.abort();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v101) => {
+							w.u8(1)?;
+						}
+						Err(v102) => {
+							w.u8(0)?;
+							v102.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn write(&mut self, data: &[u8]) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WRITE)?;
+			w.u32(corr)?;
+			if data.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(data.len() as u16)?;
+			for v103 in data.iter() {
+				w.u8(*v103)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u64()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn finish(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_FINISH)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u64()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn abort(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ABORT)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_object_push_write")]
+	fn channel_invoke_write(chan: u64, data: &[u8]) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write(data)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_object_push_finish")]
+	fn channel_invoke_finish(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.finish()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_object_push_abort")]
+	fn channel_invoke_abort(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.abort()
 	}
 }
 
@@ -3734,21 +4579,21 @@ impl GamepadFrame {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v83 in self.bytes.iter() {
-			w.u8(*v83)?;
+		for v104 in self.bytes.iter() {
+			w.u8(*v104)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<GamepadFrame> {
 		let bytes = {
-			let v84 = r.u16()? as usize;
-			let v84 = (v84 <= 160).then_some(v84)?;
-			let mut v85 = Vec::new();
-			v85.try_reserve_exact(v84).ok()?;
-			for _ in 0..v84 {
-				v85.push(r.u8()?);
+			let v105 = r.u16()? as usize;
+			let v105 = (v105 <= 160).then_some(v105)?;
+			let mut v106 = Vec::new();
+			v106.try_reserve_exact(v105).ok()?;
+			for _ in 0..v105 {
+				v106.push(r.u8()?);
 			}
-			v85
+			v106
 		};
 		Some(GamepadFrame { bytes })
 	}
@@ -3800,17 +4645,17 @@ impl InputReport {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			InputReport::Pointer(v86) => {
+			InputReport::Pointer(v107) => {
 				w.u8(0)?;
-				v86.write(w)?;
+				v107.write(w)?;
 			}
-			InputReport::Key(v87) => {
+			InputReport::Key(v108) => {
 				w.u8(1)?;
-				v87.write(w)?;
+				v108.write(w)?;
 			}
-			InputReport::Gamepad(v88) => {
+			InputReport::Gamepad(v109) => {
 				w.u8(2)?;
-				v88.write(w)?;
+				v109.write(w)?;
 			}
 		}
 		Some(())
@@ -3934,19 +4779,19 @@ pub mod bluetooth_profile {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v89) => {
+						Ok(v110) => {
 							w.u8(1)?;
-							if v89.len() > u16::MAX as usize {
+							if v110.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v89.len() as u16)?;
-							for v91 in v89.iter() {
-								v91.write(w)?;
+							w.u16(v110.len() as u16)?;
+							for v112 in v110.iter() {
+								v112.write(w)?;
 							}
 						}
-						Err(v90) => {
+						Err(v111) => {
 							w.u8(0)?;
-							v90.write(w)?;
+							v111.write(w)?;
 						}
 					}
 					Some(())
@@ -4175,13 +5020,13 @@ pub mod bluetooth_profile {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v92 = r.u16()? as usize;
-						let mut v93 = Vec::new();
-						v93.try_reserve_exact(v92).ok()?;
-						for _ in 0..v92 {
-							v93.push(EnabledPeer::read(r)?);
+						let v113 = r.u16()? as usize;
+						let mut v114 = Vec::new();
+						v114.try_reserve_exact(v113).ok()?;
+						for _ in 0..v113 {
+							v114.push(EnabledPeer::read(r)?);
 						}
-						v93
+						v114
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -4376,22 +5221,22 @@ impl GattValue {
 			return None;
 		}
 		w.u16(self.value.len() as u16)?;
-		for v94 in self.value.iter() {
-			w.u8(*v94)?;
+		for v115 in self.value.iter() {
+			w.u8(*v115)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<GattValue> {
 		let handle = r.u16()?;
 		let value = {
-			let v95 = r.u16()? as usize;
-			let v95 = (v95 <= 244).then_some(v95)?;
-			let mut v96 = Vec::new();
-			v96.try_reserve_exact(v95).ok()?;
-			for _ in 0..v95 {
-				v96.push(r.u8()?);
+			let v116 = r.u16()? as usize;
+			let v116 = (v116 <= 244).then_some(v116)?;
+			let mut v117 = Vec::new();
+			v117.try_reserve_exact(v116).ok()?;
+			for _ in 0..v116 {
+				v117.push(r.u8()?);
 			}
-			v96
+			v117
 		};
 		Some(GattValue { handle, value })
 	}
@@ -4453,19 +5298,19 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v97) => {
+						Ok(v118) => {
 							w.u8(1)?;
-							if v97.len() > u16::MAX as usize {
+							if v118.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v97.len() as u16)?;
-							for v99 in v97.iter() {
-								v99.write(w)?;
+							w.u16(v118.len() as u16)?;
+							for v120 in v118.iter() {
+								v120.write(w)?;
 							}
 						}
-						Err(v98) => {
+						Err(v119) => {
 							w.u8(0)?;
-							v98.write(w)?;
+							v119.write(w)?;
 						}
 					}
 					Some(())
@@ -4496,19 +5341,19 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v100) => {
+						Ok(v121) => {
 							w.u8(1)?;
-							if v100.len() > u16::MAX as usize {
+							if v121.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v100.len() as u16)?;
-							for v102 in v100.iter() {
-								v102.write(w)?;
+							w.u16(v121.len() as u16)?;
+							for v123 in v121.iter() {
+								v123.write(w)?;
 							}
 						}
-						Err(v101) => {
+						Err(v122) => {
 							w.u8(0)?;
-							v101.write(w)?;
+							v122.write(w)?;
 						}
 					}
 					Some(())
@@ -4539,19 +5384,19 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v103) => {
+						Ok(v124) => {
 							w.u8(1)?;
-							if v103.len() > u16::MAX as usize {
+							if v124.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v103.len() as u16)?;
-							for v105 in v103.iter() {
-								w.u8(*v105)?;
+							w.u16(v124.len() as u16)?;
+							for v126 in v124.iter() {
+								w.u8(*v126)?;
 							}
 						}
-						Err(v104) => {
+						Err(v125) => {
 							w.u8(0)?;
-							v104.write(w)?;
+							v125.write(w)?;
 						}
 					}
 					Some(())
@@ -4576,14 +5421,14 @@ pub mod bluetooth_gatt {
 			OP_WRITE => {
 				let handle = r.u16()?;
 				let value = {
-					let v106 = r.u16()? as usize;
-					let v106 = (v106 <= 244).then_some(v106)?;
-					let mut v107 = Vec::new();
-					v107.try_reserve_exact(v106).ok()?;
-					for _ in 0..v106 {
-						v107.push(r.u8()?);
+					let v127 = r.u16()? as usize;
+					let v127 = (v127 <= 244).then_some(v127)?;
+					let mut v128 = Vec::new();
+					v128.try_reserve_exact(v127).ok()?;
+					for _ in 0..v127 {
+						v128.push(r.u8()?);
 					}
-					v107
+					v128
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -4592,12 +5437,12 @@ pub mod bluetooth_gatt {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v108) => {
+						Ok(v129) => {
 							w.u8(1)?;
 						}
-						Err(v109) => {
+						Err(v130) => {
 							w.u8(0)?;
-							v109.write(w)?;
+							v130.write(w)?;
 						}
 					}
 					Some(())
@@ -4781,13 +5626,13 @@ pub mod bluetooth_gatt {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v110 = r.u16()? as usize;
-						let mut v111 = Vec::new();
-						v111.try_reserve_exact(v110).ok()?;
-						for _ in 0..v110 {
-							v111.push(GattService::read(r)?);
+						let v131 = r.u16()? as usize;
+						let mut v132 = Vec::new();
+						v132.try_reserve_exact(v131).ok()?;
+						for _ in 0..v131 {
+							v132.push(GattService::read(r)?);
 						}
-						v111
+						v132
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -4826,13 +5671,13 @@ pub mod bluetooth_gatt {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v112 = r.u16()? as usize;
-						let mut v113 = Vec::new();
-						v113.try_reserve_exact(v112).ok()?;
-						for _ in 0..v112 {
-							v113.push(GattCharacteristic::read(r)?);
+						let v133 = r.u16()? as usize;
+						let mut v134 = Vec::new();
+						v134.try_reserve_exact(v133).ok()?;
+						for _ in 0..v133 {
+							v134.push(GattCharacteristic::read(r)?);
 						}
-						v113
+						v134
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -4871,13 +5716,13 @@ pub mod bluetooth_gatt {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v114 = r.u16()? as usize;
-						let mut v115 = Vec::new();
-						v115.try_reserve_exact(v114).ok()?;
-						for _ in 0..v114 {
-							v115.push(r.u8()?);
+						let v135 = r.u16()? as usize;
+						let mut v136 = Vec::new();
+						v136.try_reserve_exact(v135).ok()?;
+						for _ in 0..v135 {
+							v136.push(r.u8()?);
 						}
-						v115
+						v136
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -4902,8 +5747,8 @@ pub mod bluetooth_gatt {
 				return None;
 			}
 			w.u16(value.len() as u16)?;
-			for v116 in value.iter() {
-				w.u8(*v116)?;
+			for v137 in value.iter() {
+				w.u8(*v137)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -5017,6 +5862,556 @@ pub mod bluetooth_gatt {
 	}
 }
 
+/// A piece of what a serial port's peer sent, in the order it sent it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialBytes {
+	pub bytes: Vec<u8>,
+}
+
+impl SerialBytes {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SerialBytes> {
+		let mut r = Reader::new(bytes);
+		let value = SerialBytes::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SerialBytes> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SerialBytes::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		if self.bytes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.bytes.len() as u16)?;
+		for v138 in self.bytes.iter() {
+			w.u8(*v138)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<SerialBytes> {
+		let bytes = {
+			let v139 = r.u16()? as usize;
+			let v139 = (v139 <= 1024).then_some(v139)?;
+			let mut v140 = Vec::new();
+			v140.try_reserve_exact(v139).ok()?;
+			for _ in 0..v139 {
+				v140.push(r.u8()?);
+			}
+			v140
+		};
+		Some(SerialBytes { bytes })
+	}
+}
+
+/// AN APPLICATION'S SERIAL PORT, minted per launch by PermissionManager for one component and one bonded BR/EDR peer
+/// the operator gave an alias and trusted for the serial port profile: a byte stream over RFCOMM and nothing above
+/// it. NOT A CONSOLE - `console-bytes` is a device's kind, and its one consumer is the development agent. It ends
+/// with the launch, and the channel it opened closes with it.
+// interface `bluetooth-serial` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod bluetooth_serial {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_CONNECT: u16 = 1;
+	pub const OP_WRITE: u16 = 2;
+	pub const OP_READ: u16 = 3;
+	pub const OP_CLOSE: u16 = 4;
+
+	pub trait Service {
+		/// Connect the port: the peer paged where it has no link, its record searched for the serial port and the RFCOMM
+		/// channel the record names opened. Answered when the channel is open - at once where it is - or with why it is
+		/// not: `not-found` for a peer that offers no serial port, `timed-out` for one that never answered.
+		fn connect(&mut self) -> Result<(), Error>;
+		/// Bytes to the peer, and how many were taken: as many as the channel's queue holds past the peer's credits.
+		/// `again` when it holds nothing more - the peer's credits are the backpressure - and `closed` while the channel
+		/// is not open.
+		fn write(&mut self, data: Vec<u8>) -> Result<u32, Error>;
+		/// What the peer sends, as it arrives - one subscription. A reader that falls behind holds the peer, its credits
+		/// not given back, rather than losing bytes. The stream ends when the channel closes.
+		fn read(&mut self) -> Result<Vec<SerialBytes>, Error>;
+		/// Close the channel. The grant stays for its launch and may connect again.
+		fn close(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:bluetooth")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_CONNECT => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.connect();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v141) => {
+							w.u8(1)?;
+						}
+						Err(v142) => {
+							w.u8(0)?;
+							v142.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_WRITE => {
+				let data = {
+					let v143 = r.u16()? as usize;
+					let v143 = (v143 <= 1024).then_some(v143)?;
+					let mut v144 = Vec::new();
+					v144.try_reserve_exact(v143).ok()?;
+					for _ in 0..v143 {
+						v144.push(r.u8()?);
+					}
+					v144
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.write(data);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v145) => {
+							w.u8(1)?;
+							w.u32(*v145)?;
+						}
+						Err(v146) => {
+							w.u8(0)?;
+							v146.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_CLOSE => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.close();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v147) => {
+							w.u8(1)?;
+						}
+						Err(v148) => {
+							w.u8(0)?;
+							v148.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn read_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<SerialBytes>, Error>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.read();
+		Some((corr, items))
+	}
+	pub fn read_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(1)?;
+		w.u32(0)?;
+		writer.finish()
+	}
+	pub fn read_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(0)?;
+		error.write(w)?;
+		writer.finish()
+	}
+	pub fn read_frame(seq: u32, item: &SerialBytes, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn read_read(msg: &[u8], frame_handles: &mut Handles) -> Option<SerialBytes> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = SerialBytes::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn connect(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CONNECT)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn write(&mut self, data: &[u8]) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WRITE)?;
+			w.u32(corr)?;
+			if data.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(data.len() as u16)?;
+			for v149 in data.iter() {
+				w.u8(*v149)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn read(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_READ)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			let decoded = (|| {
+				if r.u32()? != corr {
+					return None;
+				}
+				if r.tag()? {
+					let _ = r.u32()?;
+					r.finish()?;
+					if reply_handles.len() != 1 {
+						return None;
+					}
+					return Some(Ok(reply_handles.first()));
+				}
+				if !reply_handles.is_empty() {
+					return None;
+				}
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
+			})();
+			if !matches!(decoded, Some(Ok(_))) {
+				self.transport.discard_handles(reply_handles.as_slice());
+			}
+			decoded
+		}
+		pub fn close(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CLOSE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_serial_connect")]
+	fn channel_invoke_connect(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.connect()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_serial_write")]
+	fn channel_invoke_write(chan: u64, data: &[u8]) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write(data)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_serial_read")]
+	fn channel_invoke_read(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.read()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_serial_close")]
+	fn channel_invoke_close(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.close()
+	}
+}
+
 /// THE MINTING ROOT PermissionManager holds, and nothing else: application grants, each for one component's launch.
 // interface `bluetooth-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod bluetooth_admin {
@@ -5025,11 +6420,15 @@ pub mod bluetooth_admin {
 	use alloc::vec::Vec;
 
 	pub const OP_MINT_GATT: u16 = 1;
+	pub const OP_MINT_SERIAL: u16 = 2;
 
 	pub trait Service {
 		/// A GATT client for `owner`'s launch, on the bonded peer the operator named `alias` - refused unless that peer is
 		/// trusted for GATT - and for these services alone.
 		fn mint_gatt(&mut self, alias: String, services: Vec<ServiceClass>, owner: u64) -> Result<u64, Error>;
+		/// A serial port for `owner`'s launch, on the bonded BR/EDR peer the operator named `alias` - refused unless that
+		/// peer is trusted for the serial port profile. Minting connects nothing.
+		fn mint_serial(&mut self, alias: String, owner: u64) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -5054,18 +6453,18 @@ pub mod bluetooth_admin {
 		match op {
 			OP_MINT_GATT => {
 				let alias = {
-					let v117 = r.string_lp()?;
-					(v117.len() <= 32).then_some(v117)?
+					let v150 = r.string_lp()?;
+					(v150.len() <= 32).then_some(v150)?
 				};
 				let services = {
-					let v118 = r.u16()? as usize;
-					let v118 = (v118 <= 8).then_some(v118)?;
-					let mut v119 = Vec::new();
-					v119.try_reserve_exact(v118).ok()?;
-					for _ in 0..v118 {
-						v119.push(ServiceClass::read(r)?);
+					let v151 = r.u16()? as usize;
+					let v151 = (v151 <= 8).then_some(v151)?;
+					let mut v152 = Vec::new();
+					v152.try_reserve_exact(v151).ok()?;
+					for _ in 0..v151 {
+						v152.push(ServiceClass::read(r)?);
 					}
-					v119
+					v152
 				};
 				let owner = {
 					let _ = r.u32()?;
@@ -5078,14 +6477,59 @@ pub mod bluetooth_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v120) => {
+						Ok(v153) => {
 							w.u8(1)?;
-							w.set_handle(*v120)?;
+							w.set_handle(*v153)?;
 							w.u32(0)?;
 						}
-						Err(v121) => {
+						Err(v154) => {
 							w.u8(0)?;
-							v121.write(w)?;
+							v154.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_MINT_SERIAL => {
+				let alias = {
+					let v155 = r.string_lp()?;
+					(v155.len() <= 32).then_some(v155)?
+				};
+				let owner = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.mint_serial(alias, owner);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v156) => {
+							w.u8(1)?;
+							w.set_handle(*v156)?;
+							w.u32(0)?;
+						}
+						Err(v157) => {
+							w.u8(0)?;
+							v157.write(w)?;
 						}
 					}
 					Some(())
@@ -5202,9 +6646,51 @@ pub mod bluetooth_admin {
 				return None;
 			}
 			w.u16(services.len() as u16)?;
-			for v122 in services.iter() {
-				v122.write(w)?;
+			for v158 in services.iter() {
+				v158.write(w)?;
 			}
+			w.set_handle(*owner)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn mint_serial(&mut self, alias: &str, owner: &u64) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_MINT_SERIAL)?;
+			w.u32(corr)?;
+			w.bytes_lp(alias.as_bytes())?;
 			w.set_handle(*owner)?;
 			w.u32(0)?;
 			// One call for both halves: the bytes cannot be taken without them.
@@ -5248,6 +6734,14 @@ pub mod bluetooth_admin {
 	fn channel_invoke_mint_gatt(chan: u64, alias: &str, services: &[ServiceClass], owner: &u64) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.mint_gatt(alias, services, owner)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_admin_mint_serial")]
+	fn channel_invoke_mint_serial(chan: u64, alias: &str, owner: &u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.mint_serial(alias, owner)
 	}
 }
 
@@ -5333,8 +6827,8 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.key.len() as u16)?;
-		for v123 in self.key.iter() {
-			w.u8(*v123)?;
+		for v159 in self.key.iter() {
+			w.u8(*v159)?;
 		}
 		self.security.write(w)?;
 		w.bytes_lp(self.name.as_bytes())?;
@@ -5344,8 +6838,8 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.link_key.len() as u16)?;
-		for v124 in self.link_key.iter() {
-			w.u8(*v124)?;
+		for v160 in self.link_key.iter() {
+			w.u8(*v160)?;
 		}
 		w.u8(self.link_key_type)?;
 		self.level.write(w)?;
@@ -5353,24 +6847,24 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.trusted.len() as u16)?;
-		for v125 in self.trusted.iter() {
-			v125.write(w)?;
+		for v161 in self.trusted.iter() {
+			v161.write(w)?;
 		}
 		w.bytes_lp(self.alias.as_bytes())?;
 		if self.irk.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.irk.len() as u16)?;
-		for v126 in self.irk.iter() {
-			w.u8(*v126)?;
+		for v162 in self.irk.iter() {
+			w.u8(*v162)?;
 		}
 		w.u16(self.ediv)?;
 		if self.rand.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.rand.len() as u16)?;
-		for v127 in self.rand.iter() {
-			w.u8(*v127)?;
+		for v163 in self.rand.iter() {
+			w.u8(*v163)?;
 		}
 		Some(())
 	}
@@ -5379,68 +6873,68 @@ impl BondRecord {
 		let local = PeerAddress::read(r)?;
 		let peer = PeerAddress::read(r)?;
 		let key = {
-			let v128 = r.u16()? as usize;
-			let v128 = (v128 <= 16).then_some(v128)?;
-			let mut v129 = Vec::new();
-			v129.try_reserve_exact(v128).ok()?;
-			for _ in 0..v128 {
-				v129.push(r.u8()?);
+			let v164 = r.u16()? as usize;
+			let v164 = (v164 <= 16).then_some(v164)?;
+			let mut v165 = Vec::new();
+			v165.try_reserve_exact(v164).ok()?;
+			for _ in 0..v164 {
+				v165.push(r.u8()?);
 			}
-			v129
+			v165
 		};
 		let security = SecurityLevel::read(r)?;
 		let name = {
-			let v130 = r.string_lp()?;
-			(v130.len() <= 48).then_some(v130)?
+			let v166 = r.string_lp()?;
+			(v166.len() <= 48).then_some(v166)?
 		};
 		let enabled = r.boolean()?;
 		let radio = Radio::read(r)?;
 		let link_key = {
-			let v131 = r.u16()? as usize;
-			let v131 = (v131 <= 16).then_some(v131)?;
-			let mut v132 = Vec::new();
-			v132.try_reserve_exact(v131).ok()?;
-			for _ in 0..v131 {
-				v132.push(r.u8()?);
+			let v167 = r.u16()? as usize;
+			let v167 = (v167 <= 16).then_some(v167)?;
+			let mut v168 = Vec::new();
+			v168.try_reserve_exact(v167).ok()?;
+			for _ in 0..v167 {
+				v168.push(r.u8()?);
 			}
-			v132
+			v168
 		};
 		let link_key_type = r.u8()?;
 		let level = BondLevel::read(r)?;
 		let trusted = {
-			let v133 = r.u16()? as usize;
-			let v133 = (v133 <= 8).then_some(v133)?;
-			let mut v134 = Vec::new();
-			v134.try_reserve_exact(v133).ok()?;
-			for _ in 0..v133 {
-				v134.push(Profile::read(r)?);
+			let v169 = r.u16()? as usize;
+			let v169 = (v169 <= 8).then_some(v169)?;
+			let mut v170 = Vec::new();
+			v170.try_reserve_exact(v169).ok()?;
+			for _ in 0..v169 {
+				v170.push(Profile::read(r)?);
 			}
-			v134
+			v170
 		};
 		let alias = {
-			let v135 = r.string_lp()?;
-			(v135.len() <= 48).then_some(v135)?
+			let v171 = r.string_lp()?;
+			(v171.len() <= 48).then_some(v171)?
 		};
 		let irk = {
-			let v136 = r.u16()? as usize;
-			let v136 = (v136 <= 16).then_some(v136)?;
-			let mut v137 = Vec::new();
-			v137.try_reserve_exact(v136).ok()?;
-			for _ in 0..v136 {
-				v137.push(r.u8()?);
+			let v172 = r.u16()? as usize;
+			let v172 = (v172 <= 16).then_some(v172)?;
+			let mut v173 = Vec::new();
+			v173.try_reserve_exact(v172).ok()?;
+			for _ in 0..v172 {
+				v173.push(r.u8()?);
 			}
-			v137
+			v173
 		};
 		let ediv = r.u16()?;
 		let rand = {
-			let v138 = r.u16()? as usize;
-			let v138 = (v138 <= 8).then_some(v138)?;
-			let mut v139 = Vec::new();
-			v139.try_reserve_exact(v138).ok()?;
-			for _ in 0..v138 {
-				v139.push(r.u8()?);
+			let v174 = r.u16()? as usize;
+			let v174 = (v174 <= 8).then_some(v174)?;
+			let mut v175 = Vec::new();
+			v175.try_reserve_exact(v174).ok()?;
+			for _ in 0..v174 {
+				v175.push(r.u8()?);
 			}
-			v139
+			v175
 		};
 		Some(BondRecord { version, local, peer, key, security, name, enabled, radio, link_key, link_key_type, level, trusted, alias, irk, ediv, rand })
 	}
@@ -5505,13 +6999,13 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v140) => {
+						Ok(v176) => {
 							w.u8(1)?;
-							v140.write(w)?;
+							v176.write(w)?;
 						}
-						Err(v141) => {
+						Err(v177) => {
 							w.u8(0)?;
-							v141.write(w)?;
+							v177.write(w)?;
 						}
 					}
 					Some(())
@@ -5542,12 +7036,12 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v142) => {
+						Ok(v178) => {
 							w.u8(1)?;
 						}
-						Err(v143) => {
+						Err(v179) => {
 							w.u8(0)?;
-							v143.write(w)?;
+							v179.write(w)?;
 						}
 					}
 					Some(())
@@ -5579,12 +7073,12 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v144) => {
+						Ok(v180) => {
 							w.u8(1)?;
 						}
-						Err(v145) => {
+						Err(v181) => {
 							w.u8(0)?;
-							v145.write(w)?;
+							v181.write(w)?;
 						}
 					}
 					Some(())
@@ -5615,19 +7109,19 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v146) => {
+						Ok(v182) => {
 							w.u8(1)?;
-							if v146.len() > u16::MAX as usize {
+							if v182.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v146.len() as u16)?;
-							for v148 in v146.iter() {
-								v148.write(w)?;
+							w.u16(v182.len() as u16)?;
+							for v184 in v182.iter() {
+								v184.write(w)?;
 							}
 						}
-						Err(v147) => {
+						Err(v183) => {
 							w.u8(0)?;
-							v147.write(w)?;
+							v183.write(w)?;
 						}
 					}
 					Some(())
@@ -5859,13 +7353,13 @@ pub mod bluetooth_bond_store {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v149 = r.u16()? as usize;
-						let mut v150 = Vec::new();
-						v150.try_reserve_exact(v149).ok()?;
-						for _ in 0..v149 {
-							v150.push(BondRecord::read(r)?);
+						let v185 = r.u16()? as usize;
+						let mut v186 = Vec::new();
+						v186.try_reserve_exact(v185).ok()?;
+						for _ in 0..v185 {
+							v186.push(BondRecord::read(r)?);
 						}
-						v150
+						v186
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -5958,6 +7452,17 @@ pub enum FixtureAction {
 	Volume = 18,
 	/// The headset presses its play button toward this host.
 	PressPlay = 19,
+	/// The headset's hands-free unit connects to this host's voice gateway - paging this host first where it has no
+	/// link - and sets its service level connection up.
+	HfpConnect = 20,
+	/// The headset's answer button (`ATA`), its hang-up (`AT+CHUP`), and its request for audio (`AT+BCC`); what this
+	/// host answered is reported.
+	Answer = 21,
+	HangUp = 22,
+	AudioRequest = 23,
+	/// The phone pushes this host an object of `argument` bytes over Object Push, five seconds from now - paging this
+	/// host first where it has no link.
+	PushObject = 24,
 }
 
 impl FixtureAction {
@@ -6019,6 +7524,11 @@ impl FixtureAction {
 			17 => Some(FixtureAction::Stream),
 			18 => Some(FixtureAction::Volume),
 			19 => Some(FixtureAction::PressPlay),
+			20 => Some(FixtureAction::HfpConnect),
+			21 => Some(FixtureAction::Answer),
+			22 => Some(FixtureAction::HangUp),
+			23 => Some(FixtureAction::AudioRequest),
+			24 => Some(FixtureAction::PushObject),
 			_ => None,
 		}
 	}
@@ -6080,13 +7590,13 @@ pub mod bluetooth_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v151) => {
+						Ok(v187) => {
 							w.u8(1)?;
-							w.u32(*v151)?;
+							w.u32(*v187)?;
 						}
-						Err(v152) => {
+						Err(v188) => {
 							w.u8(0)?;
-							v152.write(w)?;
+							v188.write(w)?;
 						}
 					}
 					Some(())
@@ -6116,19 +7626,19 @@ pub mod bluetooth_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v153) => {
+						Ok(v189) => {
 							w.u8(1)?;
-							if v153.len() > u16::MAX as usize {
+							if v189.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v153.len() as u16)?;
-							for v155 in v153.iter() {
-								w.bytes_lp(v155.as_bytes())?;
+							w.u16(v189.len() as u16)?;
+							for v191 in v189.iter() {
+								w.bytes_lp(v191.as_bytes())?;
 							}
 						}
-						Err(v154) => {
+						Err(v190) => {
 							w.u8(0)?;
-							v154.write(w)?;
+							v190.write(w)?;
 						}
 					}
 					Some(())
@@ -6153,8 +7663,8 @@ pub mod bluetooth_fixture {
 			OP_TYPE_TEXT => {
 				let peer = r.u8()?;
 				let text = {
-					let v156 = r.string_lp()?;
-					(v156.len() <= 64).then_some(v156)?
+					let v192 = r.string_lp()?;
+					(v192.len() <= 64).then_some(v192)?
 				};
 				let delay_ms = r.u32()?;
 				r.finish()?;
@@ -6164,12 +7674,12 @@ pub mod bluetooth_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v157) => {
+						Ok(v193) => {
 							w.u8(1)?;
 						}
-						Err(v158) => {
+						Err(v194) => {
 							w.u8(0)?;
-							v158.write(w)?;
+							v194.write(w)?;
 						}
 					}
 					Some(())
@@ -6334,13 +7844,13 @@ pub mod bluetooth_fixture {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v159 = r.u16()? as usize;
-						let mut v160 = Vec::new();
-						v160.try_reserve_exact(v159).ok()?;
-						for _ in 0..v159 {
-							v160.push(r.string_lp()?);
+						let v195 = r.u16()? as usize;
+						let mut v196 = Vec::new();
+						v196.try_reserve_exact(v195).ok()?;
+						for _ in 0..v195 {
+							v196.push(r.string_lp()?);
 						}
-						v160
+						v196
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -6548,8 +8058,8 @@ impl AudioEndpoint {
 		let id = r.u32()?;
 		let peer = PeerAddress::read(r)?;
 		let name = {
-			let v161 = r.string_lp()?;
-			(v161.len() <= 48).then_some(v161)?
+			let v197 = r.string_lp()?;
+			(v197.len() <= 48).then_some(v197)?
 		};
 		let kind = AudioEndpointKind::read(r)?;
 		let rate = r.u32()?;
@@ -6785,21 +8295,21 @@ impl AudioEvent {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			AudioEvent::Arrived(v162) => {
+			AudioEvent::Arrived(v198) => {
 				w.u8(0)?;
-				v162.write(w)?;
+				v198.write(w)?;
 			}
-			AudioEvent::Departed(v163) => {
+			AudioEvent::Departed(v199) => {
 				w.u8(1)?;
-				w.u32(*v163)?;
+				w.u32(*v199)?;
 			}
-			AudioEvent::Volume(v164) => {
+			AudioEvent::Volume(v200) => {
 				w.u8(2)?;
-				v164.write(w)?;
+				v200.write(w)?;
 			}
-			AudioEvent::Command(v165) => {
+			AudioEvent::Command(v201) => {
 				w.u8(3)?;
-				v165.write(w)?;
+				v201.write(w)?;
 			}
 		}
 		Some(())
@@ -6869,14 +8379,14 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v166) => {
+						Ok(v202) => {
 							w.u8(1)?;
-							w.set_handle(*v166)?;
+							w.set_handle(*v202)?;
 							w.u32(0)?;
 						}
-						Err(v167) => {
+						Err(v203) => {
 							w.u8(0)?;
-							v167.write(w)?;
+							v203.write(w)?;
 						}
 					}
 					Some(())
@@ -6908,12 +8418,12 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v168) => {
+						Ok(v204) => {
 							w.u8(1)?;
 						}
-						Err(v169) => {
+						Err(v205) => {
 							w.u8(0)?;
-							v169.write(w)?;
+							v205.write(w)?;
 						}
 					}
 					Some(())
@@ -6944,12 +8454,12 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v170) => {
+						Ok(v206) => {
 							w.u8(1)?;
 						}
-						Err(v171) => {
+						Err(v207) => {
 							w.u8(0)?;
-							v171.write(w)?;
+							v207.write(w)?;
 						}
 					}
 					Some(())
@@ -7292,6 +8802,453 @@ pub mod bluetooth_audio {
 	}
 }
 
+/// A PAN LINK, offered to NetworkService: a network access point this host is a PAN user of.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkLink {
+	pub id: u32,
+	pub peer: PeerAddress,
+	pub name: String,
+	/// Whether the operator said this link may replace a selected uplink: `btctl connect ADDRESS pan replace`.
+	pub replace_uplink: bool,
+}
+
+impl NetworkLink {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<NetworkLink> {
+		let mut r = Reader::new(bytes);
+		let value = NetworkLink::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<NetworkLink> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = NetworkLink::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.id)?;
+		self.peer.write(w)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		w.boolean(self.replace_uplink)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<NetworkLink> {
+		let id = r.u32()?;
+		let peer = PeerAddress::read(r)?;
+		let name = {
+			let v208 = r.string_lp()?;
+			(v208.len() <= 64).then_some(v208)?
+		};
+		let replace_uplink = r.boolean()?;
+		Some(NetworkLink { id, peer, name, replace_uplink })
+	}
+}
+
+/// What the links stream carries.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NetworkEvent {
+	/// A link is up: the access point answered its setup.
+	Arrived(NetworkLink),
+	/// A link is gone - disconnected, lost, or its stack stopped: its id.
+	Departed(u32),
+}
+
+impl NetworkEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<NetworkEvent> {
+		let mut r = Reader::new(bytes);
+		let value = NetworkEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<NetworkEvent> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = NetworkEvent::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			NetworkEvent::Arrived(v209) => {
+				w.u8(0)?;
+				v209.write(w)?;
+			}
+			NetworkEvent::Departed(v210) => {
+				w.u8(1)?;
+				w.u32(*v210)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<NetworkEvent> {
+		match r.u8()? {
+			0 => Some(NetworkEvent::Arrived(NetworkLink::read(r)?)),
+			1 => Some(NetworkEvent::Departed(r.u32()?)),
+			_ => None,
+		}
+	}
+}
+
+/// BLUETOOTH'S NETWORK LINKS, FOR NETWORKSERVICE ALONE: resolved by name through the broker, never a role, so no network
+/// waits for the radio. A link opened is a frame channel speaking a NIC provider's frame-plus-link wire - the greeting,
+/// `MAC` with the local controller's address and the 1500-byte MTU, then one Ethernet frame per message both ways - and
+/// BNEP's framing is this service's. Closing it ends nothing but the channel; the link ends with the operator's
+/// disconnect, or its peer.
+// interface `bluetooth-network` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod bluetooth_network {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_LINKS: u16 = 1;
+	pub const OP_OPEN: u16 = 2;
+
+	pub trait Service {
+		/// The links offered now, then every change, as a stream. One subscriber: a second is refused.
+		fn links(&mut self) -> Result<Vec<NetworkEvent>, Error>;
+		/// A link's frame channel. One holder.
+		fn open(&mut self, id: u32) -> Result<u64, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:bluetooth")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_OPEN => {
+				let id = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open(id);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v211) => {
+							w.u8(1)?;
+							w.set_handle(*v211)?;
+							w.u32(0)?;
+						}
+						Err(v212) => {
+							w.u8(0)?;
+							v212.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn links_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<NetworkEvent>, Error>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.links();
+		Some((corr, items))
+	}
+	pub fn links_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(1)?;
+		w.u32(0)?;
+		writer.finish()
+	}
+	pub fn links_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(0)?;
+		error.write(w)?;
+		writer.finish()
+	}
+	pub fn links_frame(seq: u32, item: &NetworkEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn links_read(msg: &[u8], frame_handles: &mut Handles) -> Option<NetworkEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = NetworkEvent::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn links(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LINKS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			let decoded = (|| {
+				if r.u32()? != corr {
+					return None;
+				}
+				if r.tag()? {
+					let _ = r.u32()?;
+					r.finish()?;
+					if reply_handles.len() != 1 {
+						return None;
+					}
+					return Some(Ok(reply_handles.first()));
+				}
+				if !reply_handles.is_empty() {
+					return None;
+				}
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
+			})();
+			if !matches!(decoded, Some(Ok(_))) {
+				self.transport.discard_handles(reply_handles.as_slice());
+			}
+			decoded
+		}
+		pub fn open(&mut self, id: &u32) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN)?;
+			w.u32(corr)?;
+			w.u32(*id)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_network_links")]
+	fn channel_invoke_links(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.links()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_network_open")]
+	fn channel_invoke_open(chan: u64, id: &u32) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open(id)
+	}
+}
+
 impl PeerKind {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -7393,13 +9350,13 @@ impl PeerAddress {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v173 = true;
-		for v172 in self.bytes.iter() {
-			if !v173 {
+		let mut v214 = true;
+		for v213 in self.bytes.iter() {
+			if !v214 {
 				out.push(',');
 			}
-			v173 = false;
-			let _ = write!(out, "{}", v172);
+			v214 = false;
+			let _ = write!(out, "{}", v213);
 		}
 		out.push(']');
 		out.push('}');
@@ -7411,13 +9368,13 @@ impl PeerAddress {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v175 = true;
-		for v174 in self.bytes.iter() {
-			if !v175 {
+		let mut v216 = true;
+		for v215 in self.bytes.iter() {
+			if !v216 {
 				out.push_str(", ");
 			}
-			v175 = false;
-			let _ = write!(out, "{}", v174);
+			v216 = false;
+			let _ = write!(out, "{}", v215);
 		}
 		out.push(']');
 		out.push('}');
@@ -7428,8 +9385,8 @@ impl PeerAddress {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v176 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v176 as u64);
+		for v217 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v217 as u64);
 		}
 	}
 }
@@ -7650,13 +9607,13 @@ impl ScanResult {
 		out.push(',');
 		out.push_str("\"services\":");
 		out.push('[');
-		let mut v178 = true;
-		for v177 in self.services.iter() {
-			if !v178 {
+		let mut v219 = true;
+		for v218 in self.services.iter() {
+			if !v219 {
 				out.push(',');
 			}
-			v178 = false;
-			v177.to_json_into(out);
+			v219 = false;
+			v218.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -7687,13 +9644,13 @@ impl ScanResult {
 		out.push_str(", ");
 		out.push_str("services=");
 		out.push('[');
-		let mut v180 = true;
-		for v179 in self.services.iter() {
-			if !v180 {
+		let mut v221 = true;
+		for v220 in self.services.iter() {
+			if !v221 {
 				out.push_str(", ");
 			}
-			v180 = false;
-			v179.to_text_into(out);
+			v221 = false;
+			v220.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -7714,8 +9671,8 @@ impl ScanResult {
 		crate::codec::cbor::uint(out, self.class_of_device as u64);
 		crate::codec::cbor::text(out, "services");
 		crate::codec::cbor::array(out, self.services.len());
-		for v181 in self.services.iter() {
-			v181.to_cbor_into(out);
+		for v222 in self.services.iter() {
+			v222.to_cbor_into(out);
 		}
 	}
 }
@@ -8109,21 +10066,21 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => out.push_str("\"yes\""),
 			PromptReply::No => out.push_str("\"no\""),
-			PromptReply::Passkey(v182) => {
+			PromptReply::Passkey(v223) => {
 				out.push_str("{\"passkey\":");
-				let _ = write!(out, "{}", v182);
+				let _ = write!(out, "{}", v223);
 				out.push('}');
 			}
-			PromptReply::Pin(v183) => {
+			PromptReply::Pin(v224) => {
 				out.push_str("{\"pin\":");
 				out.push('[');
-				let mut v185 = true;
-				for v184 in v183.iter() {
-					if !v185 {
+				let mut v226 = true;
+				for v225 in v224.iter() {
+					if !v226 {
 						out.push(',');
 					}
-					v185 = false;
-					let _ = write!(out, "{}", v184);
+					v226 = false;
+					let _ = write!(out, "{}", v225);
 				}
 				out.push(']');
 				out.push('}');
@@ -8134,21 +10091,21 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => out.push_str("yes"),
 			PromptReply::No => out.push_str("no"),
-			PromptReply::Passkey(v186) => {
+			PromptReply::Passkey(v227) => {
 				out.push_str("passkey(");
-				let _ = write!(out, "{}", v186);
+				let _ = write!(out, "{}", v227);
 				out.push(')');
 			}
-			PromptReply::Pin(v187) => {
+			PromptReply::Pin(v228) => {
 				out.push_str("pin(");
 				out.push('[');
-				let mut v189 = true;
-				for v188 in v187.iter() {
-					if !v189 {
+				let mut v230 = true;
+				for v229 in v228.iter() {
+					if !v230 {
 						out.push_str(", ");
 					}
-					v189 = false;
-					let _ = write!(out, "{}", v188);
+					v230 = false;
+					let _ = write!(out, "{}", v229);
 				}
 				out.push(']');
 				out.push(')');
@@ -8159,17 +10116,17 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => crate::codec::cbor::text(out, "yes"),
 			PromptReply::No => crate::codec::cbor::text(out, "no"),
-			PromptReply::Passkey(v190) => {
+			PromptReply::Passkey(v231) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "passkey");
-				crate::codec::cbor::uint(out, *v190 as u64);
+				crate::codec::cbor::uint(out, *v231 as u64);
 			}
-			PromptReply::Pin(v191) => {
+			PromptReply::Pin(v232) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "pin");
-				crate::codec::cbor::array(out, v191.len());
-				for v192 in v191.iter() {
-					crate::codec::cbor::uint(out, *v192 as u64);
+				crate::codec::cbor::array(out, v232.len());
+				for v233 in v232.iter() {
+					crate::codec::cbor::uint(out, *v233 as u64);
 				}
 			}
 		}
@@ -8222,8 +10179,8 @@ impl DeviceStatus {
 		out.push(',');
 		out.push_str("\"level\":");
 		match &self.level {
-			Some(v193) => {
-				v193.to_json_into(out);
+			Some(v234) => {
+				v234.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -8232,32 +10189,32 @@ impl DeviceStatus {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v195 = true;
-		for v194 in self.trusted.iter() {
-			if !v195 {
+		let mut v236 = true;
+		for v235 in self.trusted.iter() {
+			if !v236 {
 				out.push(',');
 			}
-			v195 = false;
-			v194.to_json_into(out);
+			v236 = false;
+			v235.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"connected-profiles\":");
 		out.push('[');
-		let mut v197 = true;
-		for v196 in self.connected_profiles.iter() {
-			if !v197 {
+		let mut v238 = true;
+		for v237 in self.connected_profiles.iter() {
+			if !v238 {
 				out.push(',');
 			}
-			v197 = false;
-			v196.to_json_into(out);
+			v238 = false;
+			v237.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"battery\":");
 		match &self.battery {
-			Some(v198) => {
-				let _ = write!(out, "{}", v198);
+			Some(v239) => {
+				let _ = write!(out, "{}", v239);
 			}
 			None => {
 				out.push_str("null");
@@ -8295,8 +10252,8 @@ impl DeviceStatus {
 		out.push_str(", ");
 		out.push_str("level=");
 		match &self.level {
-			Some(v199) => {
-				v199.to_text_into(out);
+			Some(v240) => {
+				v240.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -8305,32 +10262,32 @@ impl DeviceStatus {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v201 = true;
-		for v200 in self.trusted.iter() {
-			if !v201 {
+		let mut v242 = true;
+		for v241 in self.trusted.iter() {
+			if !v242 {
 				out.push_str(", ");
 			}
-			v201 = false;
-			v200.to_text_into(out);
+			v242 = false;
+			v241.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("connected-profiles=");
 		out.push('[');
-		let mut v203 = true;
-		for v202 in self.connected_profiles.iter() {
-			if !v203 {
+		let mut v244 = true;
+		for v243 in self.connected_profiles.iter() {
+			if !v244 {
 				out.push_str(", ");
 			}
-			v203 = false;
-			v202.to_text_into(out);
+			v244 = false;
+			v243.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("battery=");
 		match &self.battery {
-			Some(v204) => {
-				let _ = write!(out, "{}", v204);
+			Some(v245) => {
+				let _ = write!(out, "{}", v245);
 			}
 			None => {
 				out.push('-');
@@ -8354,8 +10311,8 @@ impl DeviceStatus {
 		crate::codec::cbor::boolean(out, self.connected);
 		crate::codec::cbor::text(out, "level");
 		match &self.level {
-			Some(v205) => {
-				v205.to_cbor_into(out);
+			Some(v246) => {
+				v246.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8363,18 +10320,18 @@ impl DeviceStatus {
 		}
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v206 in self.trusted.iter() {
-			v206.to_cbor_into(out);
+		for v247 in self.trusted.iter() {
+			v247.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "connected-profiles");
 		crate::codec::cbor::array(out, self.connected_profiles.len());
-		for v207 in self.connected_profiles.iter() {
-			v207.to_cbor_into(out);
+		for v248 in self.connected_profiles.iter() {
+			v248.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "battery");
 		match &self.battery {
-			Some(v208) => {
-				crate::codec::cbor::uint(out, *v208 as u64);
+			Some(v249) => {
+				crate::codec::cbor::uint(out, *v249 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8476,13 +10433,13 @@ impl BondedPeer {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v210 = true;
-		for v209 in self.trusted.iter() {
-			if !v210 {
+		let mut v251 = true;
+		for v250 in self.trusted.iter() {
+			if !v251 {
 				out.push(',');
 			}
-			v210 = false;
-			v209.to_json_into(out);
+			v251 = false;
+			v250.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -8516,13 +10473,13 @@ impl BondedPeer {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v212 = true;
-		for v211 in self.trusted.iter() {
-			if !v212 {
+		let mut v253 = true;
+		for v252 in self.trusted.iter() {
+			if !v253 {
 				out.push_str(", ");
 			}
-			v212 = false;
-			v211.to_text_into(out);
+			v253 = false;
+			v252.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -8546,8 +10503,8 @@ impl BondedPeer {
 		self.level.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v213 in self.trusted.iter() {
-			v213.to_cbor_into(out);
+		for v254 in self.trusted.iter() {
+			v254.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alias");
 		crate::codec::cbor::text(out, &self.alias);
@@ -8586,6 +10543,168 @@ impl ScanHandle {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "id");
 		crate::codec::cbor::uint(out, self.id as u64);
+	}
+}
+
+impl ReceivedKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			ReceivedKind::Offered => out.push_str("\"offered\""),
+			ReceivedKind::Data => out.push_str("\"data\""),
+			ReceivedKind::Complete => out.push_str("\"complete\""),
+			ReceivedKind::Failed => out.push_str("\"failed\""),
+			ReceivedKind::TimedOut => out.push_str("\"timed-out\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			ReceivedKind::Offered => out.push_str("offered"),
+			ReceivedKind::Data => out.push_str("data"),
+			ReceivedKind::Complete => out.push_str("complete"),
+			ReceivedKind::Failed => out.push_str("failed"),
+			ReceivedKind::TimedOut => out.push_str("timed-out"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			ReceivedKind::Offered => crate::codec::cbor::text(out, "offered"),
+			ReceivedKind::Data => crate::codec::cbor::text(out, "data"),
+			ReceivedKind::Complete => crate::codec::cbor::text(out, "complete"),
+			ReceivedKind::Failed => crate::codec::cbor::text(out, "failed"),
+			ReceivedKind::TimedOut => crate::codec::cbor::text(out, "timed-out"),
+		}
+	}
+}
+
+impl ReceivedObject {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"object-type\":");
+		crate::codec::json_escape(&self.object_type, out);
+		out.push(',');
+		out.push_str("\"declared\":");
+		match &self.declared {
+			Some(v255) => {
+				let _ = write!(out, "{}", v255);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"received\":");
+		let _ = write!(out, "{}", self.received);
+		out.push(',');
+		out.push_str("\"bytes\":");
+		out.push('[');
+		let mut v257 = true;
+		for v256 in self.bytes.iter() {
+			if !v257 {
+				out.push(',');
+			}
+			v257 = false;
+			let _ = write!(out, "{}", v256);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("object-type=");
+		out.push_str(&self.object_type);
+		out.push_str(", ");
+		out.push_str("declared=");
+		match &self.declared {
+			Some(v258) => {
+				let _ = write!(out, "{}", v258);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("received=");
+		let _ = write!(out, "{}", self.received);
+		out.push_str(", ");
+		out.push_str("bytes=");
+		out.push('[');
+		let mut v260 = true;
+		for v259 in self.bytes.iter() {
+			if !v260 {
+				out.push_str(", ");
+			}
+			v260 = false;
+			let _ = write!(out, "{}", v259);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "object-type");
+		crate::codec::cbor::text(out, &self.object_type);
+		crate::codec::cbor::text(out, "declared");
+		match &self.declared {
+			Some(v261) => {
+				crate::codec::cbor::uint(out, *v261 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "received");
+		crate::codec::cbor::uint(out, self.received as u64);
+		crate::codec::cbor::text(out, "bytes");
+		crate::codec::cbor::array(out, self.bytes.len());
+		for v262 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v262 as u64);
+		}
 	}
 }
 
@@ -8769,13 +10888,13 @@ impl GamepadFrame {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v215 = true;
-		for v214 in self.bytes.iter() {
-			if !v215 {
+		let mut v264 = true;
+		for v263 in self.bytes.iter() {
+			if !v264 {
 				out.push(',');
 			}
-			v215 = false;
-			let _ = write!(out, "{}", v214);
+			v264 = false;
+			let _ = write!(out, "{}", v263);
 		}
 		out.push(']');
 		out.push('}');
@@ -8784,13 +10903,13 @@ impl GamepadFrame {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v217 = true;
-		for v216 in self.bytes.iter() {
-			if !v217 {
+		let mut v266 = true;
+		for v265 in self.bytes.iter() {
+			if !v266 {
 				out.push_str(", ");
 			}
-			v217 = false;
-			let _ = write!(out, "{}", v216);
+			v266 = false;
+			let _ = write!(out, "{}", v265);
 		}
 		out.push(']');
 		out.push('}');
@@ -8799,8 +10918,8 @@ impl GamepadFrame {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v218 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v218 as u64);
+		for v267 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v267 as u64);
 		}
 	}
 }
@@ -8823,58 +10942,58 @@ impl InputReport {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			InputReport::Pointer(v219) => {
+			InputReport::Pointer(v268) => {
 				out.push_str("{\"pointer\":");
-				v219.to_json_into(out);
+				v268.to_json_into(out);
 				out.push('}');
 			}
-			InputReport::Key(v220) => {
+			InputReport::Key(v269) => {
 				out.push_str("{\"key\":");
-				v220.to_json_into(out);
+				v269.to_json_into(out);
 				out.push('}');
 			}
-			InputReport::Gamepad(v221) => {
+			InputReport::Gamepad(v270) => {
 				out.push_str("{\"gamepad\":");
-				v221.to_json_into(out);
+				v270.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			InputReport::Pointer(v222) => {
+			InputReport::Pointer(v271) => {
 				out.push_str("pointer(");
-				v222.to_text_into(out);
+				v271.to_text_into(out);
 				out.push(')');
 			}
-			InputReport::Key(v223) => {
+			InputReport::Key(v272) => {
 				out.push_str("key(");
-				v223.to_text_into(out);
+				v272.to_text_into(out);
 				out.push(')');
 			}
-			InputReport::Gamepad(v224) => {
+			InputReport::Gamepad(v273) => {
 				out.push_str("gamepad(");
-				v224.to_text_into(out);
+				v273.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			InputReport::Pointer(v225) => {
+			InputReport::Pointer(v274) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "pointer");
-				v225.to_cbor_into(out);
+				v274.to_cbor_into(out);
 			}
-			InputReport::Key(v226) => {
+			InputReport::Key(v275) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "key");
-				v226.to_cbor_into(out);
+				v275.to_cbor_into(out);
 			}
-			InputReport::Gamepad(v227) => {
+			InputReport::Gamepad(v276) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "gamepad");
-				v227.to_cbor_into(out);
+				v276.to_cbor_into(out);
 			}
 		}
 	}
@@ -9048,13 +11167,13 @@ impl GattValue {
 		out.push(',');
 		out.push_str("\"value\":");
 		out.push('[');
-		let mut v229 = true;
-		for v228 in self.value.iter() {
-			if !v229 {
+		let mut v278 = true;
+		for v277 in self.value.iter() {
+			if !v278 {
 				out.push(',');
 			}
-			v229 = false;
-			let _ = write!(out, "{}", v228);
+			v278 = false;
+			let _ = write!(out, "{}", v277);
 		}
 		out.push(']');
 		out.push('}');
@@ -9066,13 +11185,13 @@ impl GattValue {
 		out.push_str(", ");
 		out.push_str("value=");
 		out.push('[');
-		let mut v231 = true;
-		for v230 in self.value.iter() {
-			if !v231 {
+		let mut v280 = true;
+		for v279 in self.value.iter() {
+			if !v280 {
 				out.push_str(", ");
 			}
-			v231 = false;
-			let _ = write!(out, "{}", v230);
+			v280 = false;
+			let _ = write!(out, "{}", v279);
 		}
 		out.push(']');
 		out.push('}');
@@ -9083,8 +11202,64 @@ impl GattValue {
 		crate::codec::cbor::uint(out, self.handle as u64);
 		crate::codec::cbor::text(out, "value");
 		crate::codec::cbor::array(out, self.value.len());
-		for v232 in self.value.iter() {
-			crate::codec::cbor::uint(out, *v232 as u64);
+		for v281 in self.value.iter() {
+			crate::codec::cbor::uint(out, *v281 as u64);
+		}
+	}
+}
+
+impl SerialBytes {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"bytes\":");
+		out.push('[');
+		let mut v283 = true;
+		for v282 in self.bytes.iter() {
+			if !v283 {
+				out.push(',');
+			}
+			v283 = false;
+			let _ = write!(out, "{}", v282);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("bytes=");
+		out.push('[');
+		let mut v285 = true;
+		for v284 in self.bytes.iter() {
+			if !v285 {
+				out.push_str(", ");
+			}
+			v285 = false;
+			let _ = write!(out, "{}", v284);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 1);
+		crate::codec::cbor::text(out, "bytes");
+		crate::codec::cbor::array(out, self.bytes.len());
+		for v286 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v286 as u64);
 		}
 	}
 }
@@ -9118,13 +11293,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"key\":");
 		out.push('[');
-		let mut v234 = true;
-		for v233 in self.key.iter() {
-			if !v234 {
+		let mut v288 = true;
+		for v287 in self.key.iter() {
+			if !v288 {
 				out.push(',');
 			}
-			v234 = false;
-			let _ = write!(out, "{}", v233);
+			v288 = false;
+			let _ = write!(out, "{}", v287);
 		}
 		out.push(']');
 		out.push(',');
@@ -9146,13 +11321,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"link-key\":");
 		out.push('[');
-		let mut v236 = true;
-		for v235 in self.link_key.iter() {
-			if !v236 {
+		let mut v290 = true;
+		for v289 in self.link_key.iter() {
+			if !v290 {
 				out.push(',');
 			}
-			v236 = false;
-			let _ = write!(out, "{}", v235);
+			v290 = false;
+			let _ = write!(out, "{}", v289);
 		}
 		out.push(']');
 		out.push(',');
@@ -9164,13 +11339,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v238 = true;
-		for v237 in self.trusted.iter() {
-			if !v238 {
+		let mut v292 = true;
+		for v291 in self.trusted.iter() {
+			if !v292 {
 				out.push(',');
 			}
-			v238 = false;
-			v237.to_json_into(out);
+			v292 = false;
+			v291.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -9179,13 +11354,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"irk\":");
 		out.push('[');
-		let mut v240 = true;
-		for v239 in self.irk.iter() {
-			if !v240 {
+		let mut v294 = true;
+		for v293 in self.irk.iter() {
+			if !v294 {
 				out.push(',');
 			}
-			v240 = false;
-			let _ = write!(out, "{}", v239);
+			v294 = false;
+			let _ = write!(out, "{}", v293);
 		}
 		out.push(']');
 		out.push(',');
@@ -9194,13 +11369,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"rand\":");
 		out.push('[');
-		let mut v242 = true;
-		for v241 in self.rand.iter() {
-			if !v242 {
+		let mut v296 = true;
+		for v295 in self.rand.iter() {
+			if !v296 {
 				out.push(',');
 			}
-			v242 = false;
-			let _ = write!(out, "{}", v241);
+			v296 = false;
+			let _ = write!(out, "{}", v295);
 		}
 		out.push(']');
 		out.push('}');
@@ -9218,13 +11393,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("key=");
 		out.push('[');
-		let mut v244 = true;
-		for v243 in self.key.iter() {
-			if !v244 {
+		let mut v298 = true;
+		for v297 in self.key.iter() {
+			if !v298 {
 				out.push_str(", ");
 			}
-			v244 = false;
-			let _ = write!(out, "{}", v243);
+			v298 = false;
+			let _ = write!(out, "{}", v297);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -9246,13 +11421,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("link-key=");
 		out.push('[');
-		let mut v246 = true;
-		for v245 in self.link_key.iter() {
-			if !v246 {
+		let mut v300 = true;
+		for v299 in self.link_key.iter() {
+			if !v300 {
 				out.push_str(", ");
 			}
-			v246 = false;
-			let _ = write!(out, "{}", v245);
+			v300 = false;
+			let _ = write!(out, "{}", v299);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -9264,13 +11439,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v248 = true;
-		for v247 in self.trusted.iter() {
-			if !v248 {
+		let mut v302 = true;
+		for v301 in self.trusted.iter() {
+			if !v302 {
 				out.push_str(", ");
 			}
-			v248 = false;
-			v247.to_text_into(out);
+			v302 = false;
+			v301.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -9279,13 +11454,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("irk=");
 		out.push('[');
-		let mut v250 = true;
-		for v249 in self.irk.iter() {
-			if !v250 {
+		let mut v304 = true;
+		for v303 in self.irk.iter() {
+			if !v304 {
 				out.push_str(", ");
 			}
-			v250 = false;
-			let _ = write!(out, "{}", v249);
+			v304 = false;
+			let _ = write!(out, "{}", v303);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -9294,13 +11469,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("rand=");
 		out.push('[');
-		let mut v252 = true;
-		for v251 in self.rand.iter() {
-			if !v252 {
+		let mut v306 = true;
+		for v305 in self.rand.iter() {
+			if !v306 {
 				out.push_str(", ");
 			}
-			v252 = false;
-			let _ = write!(out, "{}", v251);
+			v306 = false;
+			let _ = write!(out, "{}", v305);
 		}
 		out.push(']');
 		out.push('}');
@@ -9315,8 +11490,8 @@ impl BondRecord {
 		self.peer.to_cbor_into(out);
 		crate::codec::cbor::text(out, "key");
 		crate::codec::cbor::array(out, self.key.len());
-		for v253 in self.key.iter() {
-			crate::codec::cbor::uint(out, *v253 as u64);
+		for v307 in self.key.iter() {
+			crate::codec::cbor::uint(out, *v307 as u64);
 		}
 		crate::codec::cbor::text(out, "security");
 		self.security.to_cbor_into(out);
@@ -9328,8 +11503,8 @@ impl BondRecord {
 		self.radio.to_cbor_into(out);
 		crate::codec::cbor::text(out, "link-key");
 		crate::codec::cbor::array(out, self.link_key.len());
-		for v254 in self.link_key.iter() {
-			crate::codec::cbor::uint(out, *v254 as u64);
+		for v308 in self.link_key.iter() {
+			crate::codec::cbor::uint(out, *v308 as u64);
 		}
 		crate::codec::cbor::text(out, "link-key-type");
 		crate::codec::cbor::uint(out, self.link_key_type as u64);
@@ -9337,22 +11512,22 @@ impl BondRecord {
 		self.level.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v255 in self.trusted.iter() {
-			v255.to_cbor_into(out);
+		for v309 in self.trusted.iter() {
+			v309.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alias");
 		crate::codec::cbor::text(out, &self.alias);
 		crate::codec::cbor::text(out, "irk");
 		crate::codec::cbor::array(out, self.irk.len());
-		for v256 in self.irk.iter() {
-			crate::codec::cbor::uint(out, *v256 as u64);
+		for v310 in self.irk.iter() {
+			crate::codec::cbor::uint(out, *v310 as u64);
 		}
 		crate::codec::cbor::text(out, "ediv");
 		crate::codec::cbor::uint(out, self.ediv as u64);
 		crate::codec::cbor::text(out, "rand");
 		crate::codec::cbor::array(out, self.rand.len());
-		for v257 in self.rand.iter() {
-			crate::codec::cbor::uint(out, *v257 as u64);
+		for v311 in self.rand.iter() {
+			crate::codec::cbor::uint(out, *v311 as u64);
 		}
 	}
 }
@@ -9394,6 +11569,11 @@ impl FixtureAction {
 			FixtureAction::Stream => out.push_str("\"stream\""),
 			FixtureAction::Volume => out.push_str("\"volume\""),
 			FixtureAction::PressPlay => out.push_str("\"press-play\""),
+			FixtureAction::HfpConnect => out.push_str("\"hfp-connect\""),
+			FixtureAction::Answer => out.push_str("\"answer\""),
+			FixtureAction::HangUp => out.push_str("\"hang-up\""),
+			FixtureAction::AudioRequest => out.push_str("\"audio-request\""),
+			FixtureAction::PushObject => out.push_str("\"push-object\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -9417,6 +11597,11 @@ impl FixtureAction {
 			FixtureAction::Stream => out.push_str("stream"),
 			FixtureAction::Volume => out.push_str("volume"),
 			FixtureAction::PressPlay => out.push_str("press-play"),
+			FixtureAction::HfpConnect => out.push_str("hfp-connect"),
+			FixtureAction::Answer => out.push_str("answer"),
+			FixtureAction::HangUp => out.push_str("hang-up"),
+			FixtureAction::AudioRequest => out.push_str("audio-request"),
+			FixtureAction::PushObject => out.push_str("push-object"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -9440,6 +11625,11 @@ impl FixtureAction {
 			FixtureAction::Stream => crate::codec::cbor::text(out, "stream"),
 			FixtureAction::Volume => crate::codec::cbor::text(out, "volume"),
 			FixtureAction::PressPlay => crate::codec::cbor::text(out, "press-play"),
+			FixtureAction::HfpConnect => crate::codec::cbor::text(out, "hfp-connect"),
+			FixtureAction::Answer => crate::codec::cbor::text(out, "answer"),
+			FixtureAction::HangUp => crate::codec::cbor::text(out, "hang-up"),
+			FixtureAction::AudioRequest => crate::codec::cbor::text(out, "audio-request"),
+			FixtureAction::PushObject => crate::codec::cbor::text(out, "push-object"),
 		}
 	}
 }
@@ -9741,73 +11931,200 @@ impl AudioEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			AudioEvent::Arrived(v258) => {
+			AudioEvent::Arrived(v312) => {
 				out.push_str("{\"arrived\":");
-				v258.to_json_into(out);
+				v312.to_json_into(out);
 				out.push('}');
 			}
-			AudioEvent::Departed(v259) => {
+			AudioEvent::Departed(v313) => {
 				out.push_str("{\"departed\":");
-				let _ = write!(out, "{}", v259);
+				let _ = write!(out, "{}", v313);
 				out.push('}');
 			}
-			AudioEvent::Volume(v260) => {
+			AudioEvent::Volume(v314) => {
 				out.push_str("{\"volume\":");
-				v260.to_json_into(out);
+				v314.to_json_into(out);
 				out.push('}');
 			}
-			AudioEvent::Command(v261) => {
+			AudioEvent::Command(v315) => {
 				out.push_str("{\"command\":");
-				v261.to_json_into(out);
+				v315.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			AudioEvent::Arrived(v262) => {
+			AudioEvent::Arrived(v316) => {
 				out.push_str("arrived(");
-				v262.to_text_into(out);
+				v316.to_text_into(out);
 				out.push(')');
 			}
-			AudioEvent::Departed(v263) => {
+			AudioEvent::Departed(v317) => {
 				out.push_str("departed(");
-				let _ = write!(out, "{}", v263);
+				let _ = write!(out, "{}", v317);
 				out.push(')');
 			}
-			AudioEvent::Volume(v264) => {
+			AudioEvent::Volume(v318) => {
 				out.push_str("volume(");
-				v264.to_text_into(out);
+				v318.to_text_into(out);
 				out.push(')');
 			}
-			AudioEvent::Command(v265) => {
+			AudioEvent::Command(v319) => {
 				out.push_str("command(");
-				v265.to_text_into(out);
+				v319.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			AudioEvent::Arrived(v266) => {
+			AudioEvent::Arrived(v320) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "arrived");
-				v266.to_cbor_into(out);
+				v320.to_cbor_into(out);
 			}
-			AudioEvent::Departed(v267) => {
+			AudioEvent::Departed(v321) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "departed");
-				crate::codec::cbor::uint(out, *v267 as u64);
+				crate::codec::cbor::uint(out, *v321 as u64);
 			}
-			AudioEvent::Volume(v268) => {
+			AudioEvent::Volume(v322) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "volume");
-				v268.to_cbor_into(out);
+				v322.to_cbor_into(out);
 			}
-			AudioEvent::Command(v269) => {
+			AudioEvent::Command(v323) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "command");
-				v269.to_cbor_into(out);
+				v323.to_cbor_into(out);
+			}
+		}
+	}
+}
+
+impl NetworkLink {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"peer\":");
+		self.peer.to_json_into(out);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"replace-uplink\":");
+		if self.replace_uplink {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("peer=");
+		self.peer.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("replace-uplink=");
+		if self.replace_uplink {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "peer");
+		self.peer.to_cbor_into(out);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "replace-uplink");
+		crate::codec::cbor::boolean(out, self.replace_uplink);
+	}
+}
+
+impl NetworkEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			NetworkEvent::Arrived(v324) => {
+				out.push_str("{\"arrived\":");
+				v324.to_json_into(out);
+				out.push('}');
+			}
+			NetworkEvent::Departed(v325) => {
+				out.push_str("{\"departed\":");
+				let _ = write!(out, "{}", v325);
+				out.push('}');
+			}
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			NetworkEvent::Arrived(v326) => {
+				out.push_str("arrived(");
+				v326.to_text_into(out);
+				out.push(')');
+			}
+			NetworkEvent::Departed(v327) => {
+				out.push_str("departed(");
+				let _ = write!(out, "{}", v327);
+				out.push(')');
+			}
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			NetworkEvent::Arrived(v328) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "arrived");
+				v328.to_cbor_into(out);
+			}
+			NetworkEvent::Departed(v329) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "departed");
+				crate::codec::cbor::uint(out, *v329 as u64);
 			}
 		}
 	}

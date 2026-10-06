@@ -202,6 +202,12 @@ path = "src/btgatt.rs"
 required-features = ["development"]
 
 [[bin]]
+# The BR/EDR gate's application, absent from a shipped image: one serial port grant on the aliased fixture device.
+name = "btserial"
+path = "src/btserial.rs"
+required-features = ["development"]
+
+[[bin]]
 # The audio device model's scenario driver, absent from a shipped image: a stream, a recorder, a voice session and the
 # operator authority that reads where each plays.
 name = "audioprobe"

@@ -51,7 +51,13 @@ impl Header {
 	}
 }
 
+// mSBC's one configuration, behind its own sync word: 16 kHz mono, fifteen blocks, eight subbands, loudness, bitpool 26.
+pub const MSBC: Header = Header { frequency: 16_000, blocks: 15, mode: 0, snr: false, subbands: 8, bitpool: 26 };
+
 pub fn header(frame: &[u8]) -> Option<Header> {
+	if frame.len() >= 4 && frame[0] == 0xad {
+		return Some(MSBC);
+	}
 	if frame.len() < 4 || frame[0] != 0x9c {
 		return None;
 	}
@@ -233,22 +239,40 @@ pub fn hear(frame: &[u8]) -> Option<Heard> {
 // tone's sign block by block, which is a tone at that subband's centre after synthesis.
 pub fn tone_frame(subband: usize, amplitude_factor: u32, phase: &mut u32, out: &mut [u8]) -> usize {
 	let header = Header { frequency: 44_100, blocks: 16, mode: 3, snr: false, subbands: 8, bitpool: 35 };
+	tone(&header, subband, amplitude_factor, phase, out)
+}
+
+// THE HEADSET'S VOICE FRAME: the same tone in mSBC, its microphone heard by the host.
+pub fn msbc_tone_frame(subband: usize, amplitude_factor: u32, phase: &mut u32, out: &mut [u8]) -> usize {
+	tone(&MSBC, subband, amplitude_factor, phase, out)
+}
+
+fn tone(header: &Header, subband: usize, amplitude_factor: u32, phase: &mut u32, out: &mut [u8]) -> usize {
 	let length = header.length();
 	out[..length].fill(0);
+	let channels = header.channels();
 	let mut factors = [[0i32; 8]; 2];
-	factors[0][subband] = amplitude_factor as i32;
-	factors[1][subband] = amplitude_factor as i32;
-	let bits = allocation(&header, &factors);
-	let mut writer = Writer { bytes: out, at: 0 };
-	writer.put(0x9c, 8);
-	// 44.1 kHz, sixteen blocks, joint stereo, loudness, eight subbands.
-	writer.put((2 << 6) | (3 << 4) | (3 << 2) | 1, 8);
-	writer.put(35, 8);
-	writer.put(0, 8);
-	for _ in 0..8 {
-		writer.put(0, 1);
+	for row in factors.iter_mut().take(channels) {
+		row[subband] = amplitude_factor as i32;
 	}
-	for row in factors.iter() {
+	let bits = allocation(header, &factors);
+	let mut writer = Writer { bytes: out, at: 0 };
+	if *header == MSBC {
+		writer.put(0xad, 8);
+		writer.put(0, 16);
+	} else {
+		writer.put(0x9c, 8);
+		// 44.1 kHz, sixteen blocks, joint stereo, loudness, eight subbands.
+		writer.put((2 << 6) | (3 << 4) | (3 << 2) | 1, 8);
+		writer.put(header.bitpool, 8);
+	}
+	writer.put(0, 8);
+	if header.mode == 3 {
+		for _ in 0..8 {
+			writer.put(0, 1);
+		}
+	}
+	for row in factors.iter().take(channels) {
 		for &factor in row.iter() {
 			writer.put(factor as u32, 4);
 		}
@@ -257,9 +281,9 @@ pub fn tone_frame(subband: usize, amplitude_factor: u32, phase: &mut u32, out: &
 	let mut checked = alloc::vec![writer.bytes[1], writer.bytes[2]];
 	checked.extend_from_slice(&writer.bytes[4..4 + covered.div_ceil(8)]);
 	writer.bytes[3] = crc(&checked, 16 + covered);
-	for _ in 0..16 {
+	for _ in 0..header.blocks {
 		*phase ^= 1;
-		for ch in 0..2 {
+		for ch in 0..channels {
 			for sb in 0..8 {
 				let width = bits[ch][sb];
 				if width == 0 {
@@ -307,6 +331,11 @@ mod tests {
 			assert!(heard.crc_good);
 			let loudest = (0..8).max_by_key(|&sb| heard.energy[sb]).unwrap();
 			assert_eq!(loudest, 2);
+			let length = super::msbc_tone_frame(5, 11, &mut phase, &mut frame);
+			assert_eq!(length, 57, "mSBC's fixed frame");
+			let heard = super::hear(&frame[..length]).expect("an mSBC frame");
+			assert!(heard.crc_good);
+			assert_eq!((0..8).max_by_key(|&sb| heard.energy[sb]).unwrap(), 5);
 		}
 		frame[5] ^= 1;
 		assert!(!super::hear(&frame[..83]).unwrap().crc_good, "a scale factor changed fails the CRC");

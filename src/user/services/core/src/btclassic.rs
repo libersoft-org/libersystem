@@ -15,6 +15,10 @@
 //                      SDP client and RFCOMM finding and opening a serial port, credits flowing both ways; sniff
 //   btclassic reuse    after a restart or a cold reboot: the trusted keyboard pages, and the link is secured with
 //                      the stored key - which the fixture reports - without pairing again
+//   btclassic serial   the serial device aliased `serial-1` and trusted for the serial port, for `btserial`'s grant
+//   btclassic transfer the phone and the serial device bonded for the file pushes, and a push the phone tries with no
+//                      receiver waiting refused
+//   btclassic push N   the phone pushes an object of N bytes five seconds later: the gate's next line is the receiver
 //   btclassic forget   the keyboard forgotten: this host no longer takes its page
 //   btclassic input    the keyboard paired, trusted for input, reconnecting its HID channels, its report descriptor
 //                      read from its record, and connected for input; then it is told to type, after this probe has
@@ -25,7 +29,7 @@
 //                      for input and reconnected arrives in the gamepad set at rest, its button and hat show on it,
 //                      and its link going is its departure
 //   btclassic le       LE beyond one mouse: the tag paired by Numeric Comparison from its private address and bonded
-//                      under the identity it gave with its resolving key; the display by Passkey Entry this host
+//                      under the identity it gave with its resolving key, its battery level in its status; the display by Passkey Entry this host
 //                      types; the remote refused until `pair-legacy`, then bonded at the legacy level with its EDIV and
 //                      Rand; three LE links at once; this host's name read through its attribute server; and the tag
 //                      and the remote reconnecting through the accept list, the tag resolved, each on its stored key
@@ -34,6 +38,12 @@
 //                      delay is in the latency, its level goes both ways and its play button is answered not
 //                      implemented; the phone streams to this host as a route to the default output, and takes the
 //                      operator's pause
+//   btclassic voice    calls: the headset's hands-free unit connects to this host's voice gateway and sets its service
+//                      level connection up with mSBC, its battery in its status and its voice AudioService's default
+//                      voice device; with no session its answer and its request for audio are refused; a voice session
+//                      brings the synchronous link up and carries a tone both ways, mSBC every CRC good; the call is
+//                      relayed - rung, answered and hung up from the headset - its level is its speaker gain, and the
+//                      session's end takes the link down
 //   btclassic ctkd     the other radio's key: the phone paired on BR/EDR has its LE key derived over the BR/EDR
 //                      Security Manager, and its LE half is encrypted on it; paired anew on LE, its BR/EDR key is
 //                      derived from the LTK, and its BR/EDR half authenticates on it - both sides deriving apart
@@ -48,7 +58,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::Buffer;
-use proto::system::{AudioDevice, AudioTransport, BondedPeer, FixtureAction, KeyAgreement, LaunchContext, MediaCommand, PairingPrompt, PairingState, PeerAddress, PeerKind, Profile, PromptQuestion, PromptReply, Radio, audio, audio_control, bluetooth, bluetooth_fixture, bluetooth_operator, pcm_stream};
+use proto::system::{AudioDevice, AudioTransport, BondedPeer, CallCommand, CallState, FixtureAction, KeyAgreement, LaunchContext, MediaCommand, PairingPrompt, PairingState, PeerAddress, PeerKind, Profile, PromptQuestion, PromptReply, Radio, audio, audio_control, bluetooth, bluetooth_fixture, bluetooth_operator, pcm_stream, voice_session};
 use rt::*;
 
 const TICKS: u64 = 100;
@@ -85,9 +95,11 @@ struct Probe {
 	read: u64,
 	operator: u64,
 	fixture: u64,
-	// What an application plays through, and what `audioctl` reads the devices through.
+	// What an application plays through, what `audioctl` reads the devices through, and what a call opens its voice
+	// session through.
 	audio: u64,
 	control: u64,
+	voice: u64,
 	// What the far side said, not yet matched.
 	seen: Vec<String>,
 	watcher: u64,
@@ -546,17 +558,19 @@ fn policy(probe: &mut Probe) {
 	}
 	say("policy by PSM: HID refused for a peer not trusted for input, AVDTP admitted for one trusted for audio");
 
-	// SDP ANSWERS ANY CONNECTED PEER, and this host offers no record for a role it does not run.
+	// SDP ANSWERS ANY CONNECTED PEER: the voice gateway's record found, and none for a role this host does not run.
 	probe.act(HEADSET, FixtureAction::SdpSearch, 0x111f);
-	probe.expect("this host's SDP server did not answer the headset", 3 * TICKS, |line| line.starts_with("sdp headset found 0 records for 0x111f"));
-	say("this host's SDP server answered a connected peer's search");
+	probe.expect("this host's SDP server did not offer the voice gateway", 3 * TICKS, |line| line.starts_with("sdp headset found 1 records for 0x111f"));
+	probe.act(HEADSET, FixtureAction::SdpSearch, 0x1124);
+	probe.expect("this host's SDP server offered a role it does not run", 3 * TICKS, |line| line.starts_with("sdp headset found 0 records for 0x1124"));
+	say("this host's SDP server answered a connected peer's searches: its voice gateway, and no HID device");
 
 	// RFCOMM: the session needs voice trust; a channel needs a role this host runs on it.
-	probe.act(HEADSET, FixtureAction::RfcommOpen, 1);
+	probe.act(HEADSET, FixtureAction::RfcommOpen, 5);
 	probe.expect("an RFCOMM session from a peer not trusted for voice was not refused", 3 * TICKS, |line| line == "l2cap headset psm 0x0003 result 3");
 	probe.trust(HEADSET, Profile::Voice, true);
-	probe.act(HEADSET, FixtureAction::RfcommOpen, 1);
-	probe.expect("a channel no role serves was not refused", 5 * TICKS, |line| line == "rfcomm headset channel 1 refused by the host");
+	probe.act(HEADSET, FixtureAction::RfcommOpen, 5);
+	probe.expect("a channel no role serves was not refused", 5 * TICKS, |line| line == "rfcomm headset channel 5 refused by the host");
 	say("policy by RFCOMM channel: the session refused without voice trust, and a channel nothing serves refused with it");
 
 	// THE SERIAL PORT, FOUND AND OPENED: page, the stored key, an SDP search, RFCOMM with credits. The link the
@@ -864,6 +878,15 @@ fn le(probe: &mut Probe) {
 		_ => fail("the tag's bond is not under its identity at Secure Connections, authenticated"),
 	}
 	say("Numeric Comparison on LE: the tag bonded at Secure Connections, authenticated, under the identity it gave");
+	// ITS BATTERY SERVICE, read by the stack itself into the device's status.
+	let deadline = clock() + 3 * TICKS;
+	while !matches!(probe.operator().devices(&0), Some(Ok(devices)) if devices.iter().any(|device| device.address == identity_of(TAG) && device.battery == Some(87))) {
+		if clock() >= deadline {
+			fail("the tag's battery level is not in its status");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+	say("the tag's Battery Service read into its status: 87");
 
 	// PASSKEY ENTRY, THIS HOST TYPING what the display shows.
 	if !matches!(probe.operator().pair(&0, &identity_of(DISPLAY)), Some(Ok(()))) {
@@ -1232,6 +1255,218 @@ fn music(probe: &mut Probe) {
 	print(b"btclassic: PASS audio\n");
 }
 
+// ------------------------------------------------------------------ voice
+
+// The calls a voice session's commands stream delivered, as far as they have come.
+fn commands_seen(stream: u64, seen: &mut Vec<CallCommand>) {
+	let mut buf = [0u8; 64];
+	while let PolledCaps::Message { len, handles } = try_recv_caps(stream, &mut buf) {
+		let mut handles = handles;
+		if let Some(command) = voice_session::commands_read(&buf[..len], &mut handles) {
+			seen.push(command);
+		}
+		for &leftover in handles.as_slice() {
+			close(leftover);
+		}
+	}
+}
+
+// Ten milliseconds of a 2.5 kHz tone at 16 kHz mono - the third of mSBC's eight subbands - as a buffer.
+fn voice_period(start: &mut usize) -> Buffer {
+	let frames = 160usize;
+	let handle = memory_object_create((frames * 2) as u64);
+	if handle < 0 {
+		fail("no memory for a period");
+	}
+	let handle = handle as u64;
+	let Some(base) = (unsafe { map_object(handle) }) else { fail("a period could not be mapped") };
+	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames) };
+	for (at, sample) in samples.iter_mut().enumerate() {
+		// A square wave of period 6.4 samples: 2.5 kHz at 16 kHz.
+		*sample = if (*start + at) * 10 % 64 < 32 { 8_000 } else { -8_000 };
+	}
+	*start += frames;
+	unmap_object(handle);
+	Buffer { handle, len: (frames * 2) as u64 }
+}
+
+fn voice(probe: &mut Probe) {
+	probe.ready();
+	// THE HEADSET, bonded - by the music phase before this one, or paired here - and trusted for voice.
+	if probe.bond(HEADSET).is_none() {
+		let handle = match probe.read().scan(&0, &3000) {
+			Some(Ok(handle)) => handle,
+			_ => fail("the scan was refused"),
+		};
+		let deadline = clock() + 6 * TICKS;
+		while clock() < deadline && !matches!(probe.read().results(&handle), Some(Ok(results)) if results.iter().any(|result| result.address == address_of(HEADSET))) {
+			sleep_until(clock() + TICKS / 4);
+		}
+		probe.pair(HEADSET);
+		if probe.settle(10 * TICKS) != PairingState::Bonded {
+			fail("the headset did not bond");
+		}
+	}
+	probe.trust(HEADSET, Profile::Voice, true);
+	// THE HEADSET CONNECTS TO THIS GATEWAY and sets its service level connection up.
+	probe.act(HEADSET, FixtureAction::HfpConnect, 0);
+	probe.expect("the headset's service level connection did not come up", 10 * TICKS, |line| line == "headset's service level connection is up, codec mSBC, its battery 80");
+	let headset = bluetooth_device(probe, "AudioService never listed the headset's voice", 5 * TICKS, |device| device.voice);
+	if !headset.default_voice || headset.output.as_ref().map(|format| (format.rate, format.channels)) != Some((16_000, 1)) || headset.input.as_ref().map(|format| format.rate) != Some(16_000) {
+		fail("the headset's voice is not the default voice device at 16 kHz mono both ways");
+	}
+	match probe.operator().devices(&0) {
+		Some(Ok(devices)) if devices.iter().any(|device| device.address == address_of(HEADSET) && device.battery == Some(80)) => {}
+		_ => fail("the headset's battery is not in its status"),
+	}
+	say("the headset's service level connection: mSBC negotiated, its voice AudioService's default voice device at 16 kHz, its battery 80 in its status");
+
+	// NO SESSION, NO CALL: every call command refused, and no audio link.
+	probe.act(HEADSET, FixtureAction::Answer, 0);
+	probe.expect("the headset's answer with no call was not refused", 3 * TICKS, |line| line == "headset's ATA was answered ERROR");
+	probe.act(HEADSET, FixtureAction::AudioRequest, 0);
+	probe.expect("the headset's request for audio with no session was not refused", 3 * TICKS, |line| line == "headset's AT+BCC was answered ERROR");
+	say("with no session: the headset's answer and its request for audio refused, and no link set up");
+
+	// A VOICE SESSION: the link comes up, both directions carry the tone, and the call is relayed both ways.
+	let session = match audio::Client::new(ChannelTransport { chan: probe.voice }).open_voice(&16_000) {
+		Some(Ok(session)) => session,
+		other => fail(&format!("the voice session could not be opened: {other:?}")),
+	};
+	let client = || voice_session::Client::new(ChannelTransport { chan: session });
+	probe.expect("the voice link did not come up with the session", 5 * TICKS, |line| line == "headset's voice link is up: transparent, mSBC");
+	let commands = match client().commands() {
+		Some(Ok(stream)) => stream,
+		other => fail(&format!("the commands stream was refused: {other:?}")),
+	};
+	let mut start = 0usize;
+	let mut heard = 0usize;
+	let mut loud = false;
+	for _ in 0..80 {
+		match client().write(&voice_period(&mut start)) {
+			Some(Ok(accepted)) if accepted > 0 => {}
+			other => fail(&format!("the session's write was not accepted: {other:?}")),
+		}
+		if let Some(Ok(period)) = client().read() {
+			heard += period.len() / 2;
+			loud |= period.chunks_exact(2).any(|pair| i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs() > 1_000);
+		}
+	}
+	if heard < 8_000 || !loud {
+		fail(&format!("the headset's microphone did not reach the session: {heard} samples"));
+	}
+	say(&format!("a session's voice both ways: {heard} samples of the headset's microphone read, at 16 kHz"));
+	if !matches!(client().set_call(&CallState::Incoming), Some(Ok(()))) {
+		fail("the incoming call could not be declared");
+	}
+	probe.expect("the headset did not ring", 3 * TICKS, |line| line == "headset saw RING");
+	probe.act(HEADSET, FixtureAction::Answer, 0);
+	probe.expect("the headset's answer was not taken", 3 * TICKS, |line| line == "headset's ATA was answered OK");
+	let mut seen = Vec::new();
+	let deadline = clock() + 3 * TICKS;
+	while !seen.contains(&CallCommand::Answer) {
+		commands_seen(commands, &mut seen);
+		if clock() >= deadline {
+			fail("the headset's answer did not reach the session");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+	let _ = client().set_call(&CallState::Active);
+	probe.expect("the active call was not indicated", 3 * TICKS, |line| line == "headset saw +CIEV: 2,1");
+	probe.act(HEADSET, FixtureAction::HangUp, 0);
+	let deadline = clock() + 3 * TICKS;
+	while !seen.contains(&CallCommand::HangUp) {
+		commands_seen(commands, &mut seen);
+		if clock() >= deadline {
+			fail("the headset's hang-up did not reach the session");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+	let _ = client().set_call(&CallState::None);
+	probe.expect("the end of the call was not indicated", 3 * TICKS, |line| line == "headset saw +CIEV: 2,0");
+	say("the call relayed both ways: rung, answered from the headset, active, hung up from the headset");
+
+	// THE LEVEL, as the speaker gain.
+	if !matches!(audio_control::Client::new(ChannelTransport { chan: probe.control }).set_volume(&headset.id, &60), Some(Ok(()))) {
+		fail("the headset's level could not be set");
+	}
+	probe.expect("the headset's speaker gain was not set", 3 * TICKS, |line| line == "headset's speaker gain was set to 9");
+
+	// THE SESSION CLOSES: the link goes down, and the headset heard the session's tone.
+	let _ = client().close();
+	close(commands);
+	close(session);
+	let report = probe.expect("the voice link did not go down with the session", 5 * TICKS, |line| line.starts_with("headset heard ") && line.ends_with("its voice link is down"));
+	if !report.contains("every CRC good, the loudest subband 2") {
+		fail(&format!("the headset did not hear the session's tone: {report}"));
+	}
+	say(&format!("the session closed and its link with it: {}", report.trim_start_matches("headset ")));
+	print(b"btclassic: PASS voice\n");
+}
+
+// ------------------------------------------------------------------ serial
+
+// THE SERIAL DEVICE, NAMED FOR APPLICATIONS: an alias, and trust for the serial port - what `btserial`'s grant is
+// checked against. Bonded by the pairing phase.
+fn serial(probe: &mut Probe) {
+	probe.ready();
+	if probe.bond(SERIAL).is_none() {
+		fail("the serial device is not bonded");
+	}
+	if !matches!(probe.operator().alias(&0, &address_of(SERIAL), "serial-1"), Some(Ok(()))) {
+		fail("the serial device could not be aliased");
+	}
+	probe.trust(SERIAL, Profile::Spp, true);
+	say("the serial device is aliased serial-1 and trusted for the serial port, for an application's grant");
+	print(b"btclassic: PASS serial\n");
+}
+
+// ------------------------------------------------------------------ transfer
+
+// THE PEERS OF THE FILE PUSHES: the phone bonded by Numeric Comparison, the serial device by Just Works - and a push the
+// phone tries with no receiver waiting refused at this host's door.
+fn transfer(probe: &mut Probe) {
+	probe.ready();
+	let handle = match probe.read().scan(&0, &3000) {
+		Some(Ok(handle)) => handle,
+		_ => fail("the scan was refused"),
+	};
+	let deadline = clock() + 6 * TICKS;
+	while clock() < deadline && !matches!(probe.read().results(&handle), Some(Ok(results)) if [PHONE, SERIAL].iter().all(|device| results.iter().any(|result| result.address == address_of(*device)))) {
+		sleep_until(clock() + TICKS / 4);
+	}
+	if probe.bond(PHONE).is_none() {
+		probe.watch();
+		probe.pair(PHONE);
+		let prompt = probe.prompt("the phone's pairing raised no prompt", 10 * TICKS);
+		probe.answer(&prompt, PromptReply::Yes);
+		if probe.settle(10 * TICKS) != PairingState::Bonded {
+			fail("the phone did not bond");
+		}
+		probe.unwatch();
+	}
+	if probe.bond(SERIAL).is_none() {
+		probe.pair(SERIAL);
+		if probe.settle(10 * TICKS) != PairingState::Bonded {
+			fail("the serial device did not bond");
+		}
+	}
+	say("the phone and the serial device are bonded");
+	// NO RECEIVER WAITING: the phone's push is refused before a byte of it.
+	probe.act(PHONE, FixtureAction::PushObject, 100);
+	probe.expect("a push with no receiver waiting was not refused", 10 * TICKS, |line| line.starts_with("phone's push was refused"));
+	say("a push with no receiver waiting was refused");
+	print(b"btclassic: PASS transfer\n");
+}
+
+// THE PHONE WILL PUSH an object of `size` bytes five seconds from now: the gate's next line is the receiver.
+fn push(probe: &mut Probe, size: u32) {
+	probe.ready();
+	probe.act(PHONE, FixtureAction::PushObject, size);
+	probe.expect("the phone did not take the word to push", 3 * TICKS, |line| line.starts_with("phone will push "));
+	print(format!("btclassic: PASS push - the phone pushes {size} bytes in five seconds\n").as_bytes());
+}
+
 // ------------------------------------------------------------------ forget
 
 fn forget(probe: &mut Probe) {
@@ -1259,10 +1494,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let operator = recv_tagged(bootstrap, &mut buf, b"BTOPERATOR").unwrap_or(0);
 	let fixture = recv_tagged(bootstrap, &mut buf, b"FIXTURE").unwrap_or(0);
 	let control = recv_tagged(bootstrap, &mut buf, b"AUDIOCONTROL").unwrap_or(0);
-	if read == 0 || operator == 0 || fixture == 0 || audio == 0 || control == 0 {
+	let voice_grant = recv_tagged(bootstrap, &mut buf, b"AUDIO_VOICE").unwrap_or(0);
+	if read == 0 || operator == 0 || fixture == 0 || audio == 0 || control == 0 || voice_grant == 0 {
 		fail("a grant this probe needs was not delivered");
 	}
-	let mut probe = Probe { read, operator, fixture, audio, control, seen: Vec::new(), watcher: 0 };
+	let mut probe = Probe { read, operator, fixture, audio, control, voice: voice_grant, seen: Vec::new(), watcher: 0 };
 	let phase = context.map(|context| String::from(context.arguments.trim())).unwrap_or_default();
 	match phase.as_str() {
 		"pair" => pair(&mut probe),
@@ -1274,10 +1510,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		"le" => le(&mut probe),
 		"ctkd" => ctkd(&mut probe),
 		"audio" => music(&mut probe),
+		"voice" => voice(&mut probe),
+		"serial" => serial(&mut probe),
+		"transfer" => transfer(&mut probe),
+		other if other.starts_with("push ") => push(&mut probe, other[5..].trim().parse().unwrap_or_else(|_| fail("usage: btclassic push BYTES"))),
 		// TYPED AT THE PROMPT BY THE BLUETOOTH KEYBOARD: that this ran is the claim.
 		"typed" => print(b"btclassic: PASS typed - this command was typed by the Bluetooth keyboard\n"),
 		"alive" => print(b"btclassic: PASS alive - the machine still runs after the keyboard's Ctrl+Alt+Delete and Power key\n"),
-		_ => fail("usage: btclassic pair|policy|reuse|forget|input|typed|alive|gamepad|le|ctkd|audio"),
+		_ => fail("usage: btclassic pair|policy|reuse|forget|input|typed|alive|gamepad|le|ctkd|audio|voice|serial|transfer|push BYTES"),
 	}
 	probe.unwatch();
 	exit();

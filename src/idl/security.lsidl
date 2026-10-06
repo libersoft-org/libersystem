@@ -194,6 +194,9 @@ enum capability {
 	/// call relay, and neither a playback stream nor a recorder of its own - it records as well as plays, so it is
 	/// granted as neither alone. Appended last.
 	audio-voice,
+	/// AN APPLICATION'S SERIAL PORT, minted per launch for one bonded BR/EDR peer the operator gave an alias and trusted
+	/// for the serial port profile: a byte stream over RFCOMM, never a console. Appended last.
+	bluetooth-serial,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

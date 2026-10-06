@@ -55,6 +55,12 @@ mod gatt;
 mod input;
 #[path = "bluetooth_service/le.rs"]
 mod le;
+#[path = "bluetooth_service/opp.rs"]
+mod opp;
+#[path = "bluetooth_service/pan.rs"]
+mod pan;
+#[path = "bluetooth_service/serial.rs"]
+mod serial;
 #[path = "bluetooth_service/voice.rs"]
 mod voice;
 
@@ -111,6 +117,7 @@ enum Interface {
 	Profile,
 	Admin,
 	Audio,
+	Network,
 }
 
 struct Client {
@@ -255,10 +262,18 @@ struct Stack {
 	controllers: Vec<Controller>,
 	bonds: u64,
 	next_scan: u32,
-	// Applications' GATT grants, each for one launch.
+	// Applications' GATT grants and serial ports, each for one launch.
 	grants: Vec<gatt::Grant>,
+	serials: Vec<serial::Serial>,
+	// Object pushes under way, receivers waiting for an object, and a receive the operator view validated for the
+	// stream `serve_receive` makes.
+	pushes: Vec<opp::Pusher>,
+	receivers: Vec<opp::Receiver>,
+	receive_args: Option<(usize, Peer, u64)>,
 	// AudioService's endpoints, and the call it relays.
 	audio: audio::AudioRoot,
+	// NetworkService's PAN links.
+	network: pan::NetworkRoot,
 }
 
 // ------------------------------------------------------------------ address forms
@@ -1087,6 +1102,7 @@ impl Stack {
 		if self.enabled_peer(at, &peer) == Some(true) {
 			self.start_discovery(at, handle);
 		}
+		self.battery_read(at, handle);
 	}
 
 	fn encryption_failed(&mut self, at: usize, handle: u16) {
@@ -1669,6 +1685,33 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 	}
 
 	// THE REMOTE CONTROL'S BUTTONS, toward a phone playing to this system.
+	fn connect_pan(&mut self, at: u32, peer: PeerAddress, replace_uplink: bool) -> Result<(), Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.stack.connect_pan(at as usize, &peer, replace_uplink)
+	}
+
+	fn send(&mut self, at: u32, peer: PeerAddress, name: String, length: Option<u64>) -> Result<u64, Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.stack.push_object(at as usize, peer, &name, length)
+	}
+
+	// Validated here; the stream itself is made by `serve_receive`, which owns the channel.
+	fn receive(&mut self, at: u32, peer: PeerAddress, max_bytes: u64) -> Result<Vec<proto::system::ReceivedObject>, Error> {
+		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
+		if at as usize >= self.stack.controllers.len() {
+			return Err(Error::NotFound);
+		}
+		self.stack.receive_object(at as usize, peer, max_bytes)?;
+		self.stack.receive_args = Some((at as usize, peer, max_bytes));
+		Ok(Vec::new())
+	}
+
 	fn media(&mut self, at: u32, peer: PeerAddress, command: proto::system::MediaCommand) -> Result<(), Error> {
 		use service_logic::avrcp::Operation;
 		let peer = peer_from_wire(&peer).ok_or(Error::Invalid)?;
@@ -1794,9 +1837,9 @@ impl Stack {
 	}
 }
 
-// The battery a headset reported over its voice gateway's HF indicator.
+// The battery a peer reported: a headset over its voice gateway's HF indicator, an LE peer in its Battery Service.
 fn battery_of(link: &Link) -> Option<u8> {
-	link.classic.as_ref()?.voice.as_ref()?.battery
+	link.classic.as_ref().and_then(|classic| classic.voice.as_ref()?.battery).or(link.gatt.battery)
 }
 
 fn peer_is_classic(peer: &Peer) -> bool {
@@ -1995,12 +2038,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
 		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
-	let (catalogue, bonds, read_root, operator_root, profile_root, admin_root, audio_root) = (roles[0], roles[1], roles[2], roles[3], roles[4], roles[5], roles[6]);
+	let (catalogue, bonds, read_root, operator_root, profile_root, admin_root, audio_root, network_root) = (roles[0], roles[1], roles[2], roles[3], roles[4], roles[5], roles[6], roles[7]);
 
 	// 2. subscribe to the controllers this machine publishes. A machine with none has none, which is
 	//    a subscription that stays quiet rather than a failure.
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::BluetoothHci).unwrap_or(0) } else { 0 };
-	let mut stack = Stack { controllers: Vec::new(), bonds, next_scan: 1, grants: Vec::new(), audio: audio::AudioRoot::new() };
+	let mut stack = Stack { controllers: Vec::new(), bonds, next_scan: 1, grants: Vec::new(), serials: Vec::new(), pushes: Vec::new(), receivers: Vec::new(), receive_args: None, audio: audio::AudioRoot::new(), network: pan::NetworkRoot::new() };
 	send_blocking(bootstrap, b"BluetoothService: online", 0);
 
 	let mut clients: Vec<Client> = Vec::new();
@@ -2009,7 +2052,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut subscribed = subscription != 0;
 	loop {
 		let mut waitset: Vec<u64> = Vec::with_capacity(8 + clients.len() + 3 * MAX_CONTROLLERS);
-		for root in [read_root, operator_root, profile_root, admin_root, audio_root] {
+		for root in [read_root, operator_root, profile_root, admin_root, audio_root, network_root] {
 			if root != 0 {
 				waitset.push(root);
 			}
@@ -2019,6 +2062,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			waitset.push(grant.chan);
 			waitset.push(grant.owner);
 		}
+		for grant in &stack.serials {
+			waitset.push(grant.chan);
+			waitset.push(grant.owner);
+		}
+		// OBJECT PUSHES' CHANNELS, and the receivers' streams - sending nothing, waited on so that a holder that closes
+		// one is seen at once.
+		waitset.extend(stack.pushes.iter().map(|pusher| pusher.chan));
+		// NETWORKSERVICE'S FRAMES on the PAN links it opened.
+		waitset.extend(stack.pan_channels());
+		waitset.extend(stack.receiver_streams());
 		if subscribed {
 			waitset.push(subscription);
 		}
@@ -2034,13 +2087,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		waitset.extend(clients.iter().map(|client| client.chan));
 		// THE OPENED ENDPOINTS' CHANNELS, each read only while it holds no unanswered request.
 		waitset.extend(stack.audio.pcm.iter().filter(|pcm| !pcm.holding()).map(|pcm| pcm.chan));
-		let deadline = match stack.pcm_deadline() {
-			Some(due) => due.min(stack.next_deadline()),
-			None => stack.next_deadline(),
-		};
+		let deadline = [stack.pcm_deadline(), stack.serial_deadline(), stack.opp_deadline()].into_iter().flatten().fold(stack.next_deadline(), u64::min);
 		let ready = wait_any(&waitset, deadline);
 		stack.run_timers();
 		stack.pcm_timers();
+		stack.serial_timers();
+		stack.opp_timers();
 		for controller in &mut stack.controllers {
 			controller.pump();
 		}
@@ -2085,6 +2137,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			gatt::end_grant(grant);
 			continue;
 		}
+		if let Some(index) = stack.serials.iter().position(|grant| grant.chan == handle) {
+			stack.serve_serial(index, &mut buf);
+			continue;
+		}
+		if let Some(index) = stack.serials.iter().position(|grant| grant.owner == handle) {
+			stack.end_serial(index);
+			continue;
+		}
+		if let Some(index) = stack.pushes.iter().position(|pusher| pusher.chan == handle) {
+			stack.serve_push(index, &mut buf);
+			continue;
+		}
+		if stack.pan_channels().contains(&handle) {
+			stack.serve_pan(handle, &mut buf);
+			for controller in &mut stack.controllers {
+				controller.pump();
+			}
+			continue;
+		}
+		if stack.receiver_streams().any(|stream| stream == handle) {
+			if matches!(try_recv_caps(handle, &mut buf), PolledCaps::Closed) {
+				stack.receiver_gone(handle);
+			}
+			continue;
+		}
 
 		// THE CATALOGUE: a controller arriving or leaving.
 		if subscribed && handle == subscription {
@@ -2123,6 +2200,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(Interface::Admin)
 		} else if handle == audio_root {
 			Some(Interface::Audio)
+		} else if handle == network_root {
+			Some(Interface::Network)
 		} else {
 			None
 		};
@@ -2176,6 +2255,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				serve_prompts(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
 				continue;
 			}
+			if interface == Interface::Operator && op == bluetooth_operator::OP_RECEIVE {
+				serve_receive(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
+				continue;
+			}
+			if interface == Interface::Network && op == proto::system::bluetooth_network::OP_LINKS {
+				pan::serve_links(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
+				continue;
+			}
 			if interface == Interface::Audio && op == proto::system::bluetooth_audio::OP_ENDPOINTS {
 				audio::serve_endpoints(&mut stack, handle, &buf[..len], &mut handles, &mut reply);
 				continue;
@@ -2188,6 +2275,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Interface::Profile => bluetooth_profile::dispatch(&mut ProfileView { stack: &mut stack, target: None }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
 			Interface::Admin => proto::system::bluetooth_admin::dispatch(&mut gatt::AdminView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
 			Interface::Audio => proto::system::bluetooth_audio::dispatch(&mut audio::AudioView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
+			Interface::Network => proto::system::bluetooth_network::dispatch(&mut pan::NetworkView { stack: &mut stack }, &buf[..len], &mut handles, &mut reply, &mut reply_handles),
 		};
 		for &leftover in handles.as_slice() {
 			close(leftover);
@@ -2242,6 +2330,34 @@ fn serve_open_input(stack: &mut Stack, channel: u64, request: &[u8], handles: &m
 		(Ok(_), None) => Error::Invalid,
 	};
 	if let Some(len) = bluetooth_profile::open_input_reply_err(corr, &answer, reply) {
+		send_blocking(channel, &reply[..len], 0);
+	}
+}
+
+// `receive` is a stream: validated by the operator view, then answered with the consumer end of a fresh pair whose
+// producer the receiver keeps - which is where the object is told as it arrives.
+fn serve_receive(stack: &mut Stack, channel: u64, request: &[u8], handles: &mut wire::Handles, reply: &mut [u8]) {
+	let mut view = OperatorView { stack };
+	let Some((corr, result)) = bluetooth_operator::receive_open(&mut view, request, handles) else { return };
+	let answer = match (result, stack.receive_args.take()) {
+		(Ok(_), Some((at, peer, max_bytes))) => match channel_with_depth(32) {
+			Some((producer, consumer)) => {
+				if let Some(len) = bluetooth_operator::receive_reply_ok(corr, reply)
+					&& send_caps_blocking(channel, &reply[..len], &[consumer])
+				{
+					stack.receiver_started(at, peer, max_bytes, producer);
+					return;
+				}
+				close(producer);
+				close(consumer);
+				return;
+			}
+			None => Error::Exhausted,
+		},
+		(Err(error), _) => error,
+		(Ok(_), None) => Error::Invalid,
+	};
+	if let Some(len) = bluetooth_operator::receive_reply_err(corr, &answer, reply) {
 		send_blocking(channel, &reply[..len], 0);
 	}
 }
