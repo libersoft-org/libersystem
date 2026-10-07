@@ -2,7 +2,9 @@
 # runs the x86_64 cases on development instances of its own; this is the same i6300esb case as one cold boot, for
 # aarch64 and riscv64:
 #
-#   QEMU_EXTRA="-device i6300esb" ./lab.sh scenario-cold src/harness/scenarios/watchdog-i6300esb.toml --target ARCH
+#   QEMU_EXTRA="-device i6300esb" ./lab.sh scenario-cold ARCH harness/scenarios/watchdog-i6300esb.toml
+#
+# (a relative path is read from `src/`, where `lab.sh` runs `harness/lab.py`)
 #
 # THE ORACLE IS QEMU'S RUN STATE: every boot with a QMP socket passes `-action watchdog=pause`, so an expiry leaves the
 # guest in `watchdog` - a `run-state` hold of `running` is a stretch with no expiry in it. The timing is wider than

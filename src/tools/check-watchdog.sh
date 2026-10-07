@@ -33,7 +33,7 @@
 #      the watchdog as the cause, the TCO's reporting none.
 #
 # ACROSS A SLEEP is the sleep milestone's to add - there is no sleep entry to drive yet. The i6300esb on aarch64 and riscv64 runs as the scenario `watchdog-i6300esb` under
-# `./lab.sh scenario-cold --target ARCH`, with `QEMU_EXTRA=-device i6300esb`.
+# `./lab.sh scenario-cold ARCH`, with `QEMU_EXTRA=-device i6300esb`.
 #
 # IT BOOTS ITS OWN INSTANCES in private state, as the development lifecycle gate does, one at a time, and takes the
 # last one down from the EXIT trap whatever happened.

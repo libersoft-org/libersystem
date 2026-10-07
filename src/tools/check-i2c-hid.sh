@@ -74,8 +74,16 @@ if [[ "$GUEST_ARCH" == x86_64 ]]; then
 fi
 # NO NIC: nothing here needs a network, and a NIC's status line can land inside a line the gate reads.
 export NET_NONE=1
-export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-480}"
-export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-720}"
+# THE WINDOW, per target. 480 s is x86_64's. riscv64 under TCG with two harts reached its prompt about 495 s after QEMU
+# started and finished every case by about 530 s (the backend's own timestamps, 2026-10-07), so 480 s ended the window
+# before the first command; the emulated targets get 900 s and 1200 s.
+if [[ "$GUEST_ARCH" == x86_64 ]]; then
+	export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-480}"
+	export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-720}"
+else
+	export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-900}"
+	export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-1200}"
+fi
 
 # One command to the backend's control socket; its one-line answer.
 control() {

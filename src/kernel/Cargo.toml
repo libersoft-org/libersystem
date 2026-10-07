@@ -222,6 +222,15 @@ opt-level = 2
 [profile.dev.package.fscore]
 opt-level = 2
 
+# THE BOOT CONSOLE'S RENDERER, which draws every kernel line into the framebuffer until ConsoleService takes it over.
+# Unoptimized, a riscv64 development guest under TCG with a framebuffer spent its boot processor drawing: of 40 pc
+# samples over a minute, 39 were the renderer (`term::render`, the framebuffer writes) and the precondition checks and
+# pointer helpers an unoptimized build calls instead of inlining, one was in userspace, and the other hart was idle in
+# all 40. Drivers then missed DeviceManager's pings, each miss added lines to draw, and the boot did not reach
+# ProcessService in 1800 s.
+[profile.dev.package.term]
+opt-level = 2
+
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
 # call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry
