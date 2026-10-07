@@ -1775,6 +1775,9 @@ dev_channel_socket() {
 		printf '%s/dev-channel-cold-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
 	elif [[ "$TARGET_ARCH" == "x86_64" ]]; then
 		printf '%s/dev-channel.sock' "${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}"
+	elif [[ -n "${LIBER_DEV_STATE:-}" ]]; then
+		# A DEVICE-TREE TARGET'S PRIVATE INSTANCE (`dev.sh up --arch`), whose sockets are all under its state.
+		printf '%s/dev-channel.sock' "$LIBER_DEV_STATE"
 	else
 		printf '%s/dev-channel-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
 	fi
@@ -2772,6 +2775,10 @@ qemu_run_aarch64() {
 				if [[ "${COLD:-0}" == "1" ]]; then
 					dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
 					dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+				elif [[ -n "${LIBER_DEV_STATE:-}" ]]; then
+					# A PRIVATE INSTANCE'S (`dev.sh up --arch`), where `lab.py` looks for them.
+					dev_monitor="$LIBER_DEV_STATE/qemu-monitor.sock"
+					dev_qmp="$LIBER_DEV_STATE/qemu-qmp.sock"
 				fi
 				rm -f "$dev_monitor" "$dev_qmp"
 				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
@@ -3152,6 +3159,10 @@ qemu_run_riscv64() {
 				if [[ "${COLD:-0}" == "1" ]]; then
 					dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
 					dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+				elif [[ -n "${LIBER_DEV_STATE:-}" ]]; then
+					# A PRIVATE INSTANCE'S (`dev.sh up --arch`), where `lab.py` looks for them.
+					dev_monitor="$LIBER_DEV_STATE/qemu-monitor.sock"
+					dev_qmp="$LIBER_DEV_STATE/qemu-qmp.sock"
 				fi
 				rm -f "$dev_monitor" "$dev_qmp"
 				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")

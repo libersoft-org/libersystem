@@ -32,8 +32,14 @@
 # without VBUS, a hard reset sent with the sink path on, the sink path or the automatic discharge on when a hard reset
 # takes VBUS down, or a message sent while the supply moves.
 #
-# WHAT IT DOES NOT CLAIM: the ports' tree description (their emulated sweep), a real port controller, an S3 (the sink
-# path's rule is the suspend's, whichever state).
+# THE DEVICE-TREE PORTS, `--arch aarch64` or `--arch riscv64`: the same cases through the tree - `fdt_edit.py
+# tcpc-fixture`'s `tcpci` node under the I2C controller's node, its alert a line connection into the GPIO controller's -
+# on a private development instance of that target (`dev.sh up --arch`). The partner's two timers that wait on the sink
+# are stretched by a factor of 100 there, since an emulated guest cannot answer inside them, and the factor is printed
+# with the result; every wait of this script on the guest is ten times x86_64's; and the timing run is recorded and
+# not gated, as it is gated only under KVM.
+#
+# WHAT IT DOES NOT CLAIM: a real port controller, an S3 (the sink path's rule is the suspend's, whichever state).
 #
 # IT BOOTS ITS OWN DEVELOPMENT INSTANCE in private state, and takes it down from the EXIT trap.
 set -euo pipefail
@@ -45,12 +51,21 @@ fail() {
 	exit 1
 }
 
+arch=x86_64
 case "${1:-}" in
-"" | --arch)
-	[[ "${2:-x86_64}" == x86_64 ]] || fail "this gate is x86_64's, through the SSDT; the ports run the tree in their emulated sweep"
-	;;
+"") ;;
+--arch) arch="${2:-}" ;;
 *) fail "unexpected argument '$1'" ;;
 esac
+# THE EMULATED TARGETS' SCALE: the waits on the guest, and the partner's stretch.
+case "$arch" in
+x86_64) scale=1 stretch=1 ;;
+aarch64 | riscv64) scale=10 stretch=100 ;;
+*) fail "--arch takes x86_64, aarch64 or riscv64" ;;
+esac
+settle() {
+	sleep $(($1 * scale))
+}
 command -v python3 >/dev/null || fail "python3 is not installed, and the lab is written in it"
 [[ ! -S .build/boot/lab-ctl.sock ]] || fail "an ad-hoc lab guest is up (.build/boot/lab-ctl.sock) - take it down with ./lab.sh quit first"
 
@@ -64,6 +79,7 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])')"
 export HOSTFWD_PORT
 kept="$(pwd)/.build/logs/typec-tcpci"
+[[ "$arch" == x86_64 ]] || kept="$kept-$arch"
 rm -rf "$kept"
 mkdir -p "$kept"
 backend_pid=""
@@ -98,6 +114,7 @@ has() {
 
 await_line() {
 	local needle="$1" what="$2" baseline="$3" limit="${4:-120}"
+	limit=$((limit * scale))
 	for _ in $(seq 1 "$limit"); do
 		if (($(seen "$needle") > baseline)); then
 			return 0
@@ -111,7 +128,7 @@ await_line() {
 probe() {
 	local out="$state/probe.log" result
 	echo "\$ typeccheck $*" >>"$out"
-	result="$(./dev.sh launch --timeout 150 typeccheck "$@" 2>&1)" || true
+	result="$(./dev.sh launch --timeout $((150 * scale)) typeccheck "$@" 2>&1)" || true
 	echo "$result" >>"$out"
 	if grep -q "typeccheck: FAIL" <<<"$result" || ! grep -q "typeccheck: \(PASS\|answer\|[0-9]* connector(s)\)" <<<"$result"; then
 		echo "$result" >&2
@@ -124,9 +141,9 @@ probe() {
 probe_started() {
 	local out="$state/probe-$1.log"
 	shift
-	./dev.sh launch --timeout 150 typeccheck "$@" >"$out" 2>&1 &
+	./dev.sh launch --timeout $((150 * scale)) typeccheck "$@" >"$out" 2>&1 &
 	started_pid="$!"
-	for _ in $(seq 1 60); do
+	for _ in $(seq 1 $((60 * scale))); do
 		grep -q "typeccheck: watching" "$out" 2>/dev/null && return 0
 		sleep 1
 	done
@@ -179,7 +196,7 @@ no_violations() {
 }
 
 typec_tool() {
-	./dev.sh launch --timeout 60 typec >"$state/typec-$case_name.log" 2>&1 || true
+	./dev.sh launch --timeout $((60 * scale)) typec >"$state/typec-$case_name.log" 2>&1 || true
 	cp -f "$state/typec-$case_name.log" "$kept/"
 }
 
@@ -213,8 +230,8 @@ detach() {
 
 # ------------------------------------------------------------------ the boot
 
-stretch=1
-python3 src/harness/vhost-i2c-gpio.py --tcpc --tcpc-log "$fixture/tcpc.log" --stretch "$stretch" --i2c "$fixture/i2c.sock" --gpio "$fixture/gpio.sock" --control "$fixture/control.sock" --ready "$fixture/ready" >"$fixture/backend.log" 2>&1 &
+# `TCPC_TRACE=1` has the backend log every vhost-user message and IOTLB miss, to `backend.log` beside the others.
+python3 src/harness/vhost-i2c-gpio.py --tcpc --tcpc-log "$fixture/tcpc.log" --stretch "$stretch" ${TCPC_TRACE:+--trace} --i2c "$fixture/i2c.sock" --gpio "$fixture/gpio.sock" --control "$fixture/control.sock" --ready "$fixture/ready" >"$fixture/backend.log" 2>&1 &
 backend_pid="$!"
 for _ in $(seq 1 100); do
 	[[ -e "$fixture/ready" ]] && break
@@ -223,7 +240,7 @@ done
 [[ -e "$fixture/ready" ]] || fail "the vhost-user backend did not start (see $kept/backend.log)"
 export I2C_FIXTURE=tcpc I2C_SOCKET="$fixture/i2c.sock" GPIO_SOCKET="$fixture/gpio.sock"
 echo "typec-tcpci: booting (state $state, host port $HOSTFWD_PORT, partner stretch $stretch)"
-if ! ./dev.sh up --timeout 400 >"$state/up.log" 2>&1; then
+if ! ./dev.sh up --arch "$arch" --timeout $((400 * scale)) >"$state/up.log" 2>&1; then
 	tail -20 "$state/up.log" >&2
 	fail "the development instance did not come up (see $kept/up.log)"
 fi
@@ -253,7 +270,7 @@ echo "typec-tcpci: $case_name: 15 V at 2 A, 9, 12, 20 V and PPS never requested,
 case_name="swaps"
 for message in pr-swap dr-swap vconn-swap discover-identity get-sink-cap; do
 	tcpc_ok send "$message" >/dev/null
-	sleep 1
+	settle 1
 done
 answers="$(tcpc answers)"
 for pair in "PR_Swap -> Not_Supported" "DR_Swap -> Not_Supported" "VCONN_Swap -> Not_Supported" "Discover_Identity -> Not_Supported" "Get_Sink_Cap -> Sink_Capabilities"; do
@@ -267,7 +284,7 @@ case_name="malformed"
 tcpc_ok mark >/dev/null
 for kind in count reserved extended; do
 	tcpc_ok malformed "$kind" >/dev/null
-	sleep 1
+	settle 1
 done
 has "a message failed its check (Length) - not believed" "an object count past the bytes must not be believed"
 has "a message failed its check (Reserved) - not believed" "a reserved type must not be believed"
@@ -280,7 +297,7 @@ case_name="wait"
 count=$(grep -c "request position" "$fixture/tcpc.log" || true)
 tcpc_ok script wait >/dev/null
 tcpc_ok caps >/dev/null
-sleep 2
+settle 2
 grep -q "answering the request with Wait" "$fixture/tcpc.log" || fail "$case_name: the partner must have answered Wait"
 (($(grep -c "request position" "$fixture/tcpc.log") >= count + 2)) || fail "$case_name: the sink must ask again after Wait"
 contracted 15000
@@ -289,7 +306,7 @@ echo "typec-tcpci: $case_name: Wait, then the request again and Accept"
 case_name="reject"
 tcpc_ok script reject >/dev/null
 tcpc_ok caps >/dev/null
-sleep 2
+settle 2
 grep -q "answering the request with Reject" "$fixture/tcpc.log" || fail "$case_name: the partner must have answered Reject"
 contracted 15000
 echo "typec-tcpci: $case_name: Rejected, the contract kept"
@@ -353,7 +370,7 @@ echo "typec-tcpci: $case_name: the count kept through the reset, the contract ma
 case_name="no-ps-rdy"
 tcpc_ok script no-ps-rdy >/dev/null
 tcpc_ok caps >/dev/null
-sleep 3
+settle 3
 [[ "$(last_hard_reset)" == *"after Accept reached it"* ]] || fail "$case_name: Accept without PS_RDY must end in a Hard Reset ($(last_hard_reset))"
 at_least "$(last_hard_reset)" 450 "the Hard Reset for a missing PS_RDY"
 contracted 15000
@@ -385,7 +402,7 @@ attach charger20
 contracted 15000
 has "the source speaks Power Delivery 2.0" "a revision 2.0 source must be spoken to in 2.0"
 tcpc_ok send pr-swap >/dev/null
-sleep 1
+settle 1
 [[ "$(tcpc answers)" == *"PR_Swap -> Reject"* ]] || fail "$case_name: a swap from a 2.0 partner must be answered Reject"
 detach
 echo "typec-tcpci: $case_name: 15 V from a revision 2.0 charger, its swap answered Reject"
@@ -406,7 +423,7 @@ for profile in typec15 typec30; do
 	attach "$profile"
 	probe await 1 current "$level" >/dev/null
 	await_line "hard reset sent (2 of 2)" "a source with no Power Delivery must see the hard-reset count run out" "$sent_before" 30
-	sleep 3
+	settle 3
 	probe await 1 current "$level" >/dev/null
 	typec_tool
 	grep -q "power by Type-C current, $([[ $level == medium ]] && echo 1.5 || echo 3) A" "$state/typec-$case_name.log" || fail "$case_name: the Type-C current must stand"
@@ -419,7 +436,7 @@ sent_before=$(seen "hard reset sent (2 of 2)")
 tcpc_ok script no-caps >/dev/null
 attach charger31
 await_line "hard reset sent (2 of 2)" "no Source_Capabilities must run the hard-reset count out" "$sent_before" 30
-sleep 3
+settle 3
 resets="$(tcpc hard-resets)"
 checked=0
 while IFS= read -r entry; do
@@ -456,7 +473,7 @@ echo "typec-tcpci: $case_name: stopped as a lost dependency, bound again with no
 case_name="timing"
 tcpc_ok negotiate 200 >/dev/null
 timing=""
-for _ in $(seq 1 120); do
+for _ in $(seq 1 $((120 * scale))); do
 	timing="$(tcpc timing)"
 	[[ "$timing" == "ok done"* ]] && break
 	sleep 1
@@ -467,7 +484,7 @@ echo "typec-tcpci: $case_name: ${timing#ok done }"
 p99="$(sed -n 's/.* p99 \([0-9.]*\) ms.*/\1/p' <<<"$timing")"
 max="$(sed -n 's/.* max \([0-9.]*\) ms.*/\1/p' <<<"$timing")"
 timeouts="$(sed -n 's/.* timeouts \([0-9]*\).*/\1/p' <<<"$timing")"
-if [[ -e /dev/kvm && "${NOKVM:-0}" != "1" ]]; then
+if [[ "$arch" == x86_64 && -e /dev/kvm && "${NOKVM:-0}" != "1" ]]; then
 	python3 -c "import sys; sys.exit(0 if float('$p99') <= 15.0 and float('$max') < 24.0 and int('$timeouts') == 0 else 1)" || fail "$case_name: the response budget is missed under KVM - p99 $p99 ms (at most 15), max $max ms (never 24), $timeouts timeout(s)"
 	echo "typec-tcpci: $case_name: within the budget under KVM"
 else
@@ -486,7 +503,7 @@ attach charger31
 contracted 15000
 ended=$(seen "ServiceManager: sleep: the transaction ended")
 refused=$(seen "the sleep is refused: connector 1 has its sink path enabled")
-./dev.sh launch --timeout 60 sleepctl suspend idle 3 >"$state/sleepctl-refused.log" 2>&1 || true
+./dev.sh launch --timeout $((60 * scale)) sleepctl suspend idle 3 >"$state/sleepctl-refused.log" 2>&1 || true
 await_line "ServiceManager: sleep: the transaction ended" "$case_name: the refused suspend never ended" "$ended" 60
 await_line "the sleep is refused: connector 1 has its sink path enabled" "$case_name: the driver did not name the connector it refused for" "$refused" 10
 line="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -1)"
@@ -497,10 +514,10 @@ echo "typec-tcpci: $case_name: with a contract the suspend was refused, the conn
 detach
 ended=$(seen "ServiceManager: sleep: the transaction ended")
 entered=$(seen "sleep: entered")
-./dev.sh launch --timeout 120 sleepctl suspend idle 12 >"$state/sleepctl-sleep.log" 2>&1 &
+./dev.sh launch --timeout $((120 * scale)) sleepctl suspend idle $((12 * scale)) >"$state/sleepctl-sleep.log" 2>&1 &
 await_line "sleep: entered" "$case_name: the suspend to idle never entered" "$entered" 60
 attach charger31
-sleep 2
+settle 2
 [[ "$(status_of sinking)" == 0 ]] || fail "$case_name: the sink path was on while the guest slept"
 [[ "$(status_of contract)" == none ]] || fail "$case_name: a contract was made while the guest slept"
 await_line "ServiceManager: sleep: the transaction ended" "$case_name: the suspend to idle never ended" "$ended" 120
@@ -510,4 +527,7 @@ contracted 15000
 no_violations
 tcpc_ok detach >/dev/null
 echo "typec-tcpci: $case_name: a charger attached while the guest slept found the sink path off, and the contract was made after the resume"
+if [[ "$arch" != x86_64 ]]; then
+	echo "typec-tcpci: on $arch through the device tree, the partner's timers that wait on the sink stretched by $stretch"
+fi
 echo "typec-tcpci: PASS - a port controller's Power Delivery sink: 15 V at the board's current and nothing it does not describe, swaps and identity not supported, malformed messages not believed, Wait, Reject and less power renegotiated, both alarms answered with the sink path off first, every Hard Reset and its timer not before its bound, 2.0, below-operating, non-PD and silent sources, a lost controller renegotiated through Soft_Reset without VBUS dropping, the response inside its budget, a suspend refused while a contract stands, and a charger attached during a sleep contracted only after it"

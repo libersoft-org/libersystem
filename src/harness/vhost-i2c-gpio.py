@@ -28,7 +28,8 @@ the memory table translates them.
 
 `--tcpc` adds A TYPE-C PORT CONTROLLER at 0x52, its alert on line 5, and the Power Delivery source on its cable
 (`tcpc_partner.py`): the TCPCI gate's fixture, whose partner the `tcpc` commands drive. `--stretch F` multiplies the
-source's two timers that wait on the sink, for the emulated ports.
+source's two timers that wait on the sink, for the emulated ports - tSrcTransition only up to a ceiling that keeps the
+transition inside the sink's own PSTransitionTimer.
 
 `--self-test` runs the host suite of the parts a host can check without QEMU: the memory table's
 translation, the IOTLB's updates, misses and invalidations, and the device models.
@@ -36,9 +37,11 @@ translation, the IOTLB's updates, misses and invalidations, and the device model
 
 import argparse
 import array
+import faulthandler
 import mmap
 import os
 import select
+import signal
 import socket
 import struct
 import sys
@@ -55,6 +58,16 @@ TRACE = False
 def trace(message):
     if TRACE:
         print(f"{time.monotonic():.6f} {message}", file=sys.stderr, flush=True)
+
+
+# WHAT ARRIVED WHILE AN IOTLB MISS WAITED, said whether or not the trace is on: the trace is every message, and on an
+# emulated target that is enough work to move the timing a gate measures, while a miss is rare and is the one place
+# the backend waits on QEMU. None outside a miss.
+MISS_LOG = None
+
+
+def miss_note(message):
+    print(f"{time.monotonic():.6f} {message}", file=sys.stderr, flush=True)
 
 
 # ------------------------------------------------------------------------------------------ vhost-user
@@ -343,24 +356,34 @@ class Device:
         is also why a ring is never drained inside the handling of a message QEMU waits on."""
         if self.backend is None:
             raise RuntimeError(f"{self.name}: an IOTLB miss at {miss.iova:#x} and no backend channel to ask on")
+        global MISS_LOG
         perm = PERM_WO if miss.write else PERM_RO
         body = struct.pack("<QQQBB6x", miss.iova, 1, 0, perm, IOTLB_MISS)
         trace(f"{self.name}: IOTLB miss at {miss.iova:#x}")
         self.backend.sendall(HEADER.pack(BACKEND_IOTLB_MSG, FLAG_VERSION, len(body)) + body)
-        for _ in range(1000):
-            peers = [device for device in DEVICES.values() if device.sock is not None] or [self]
-            ready, _, _ = select.select([device.sock for device in peers], [], [], 5.0)
-            if not ready:
-                break
-            for device in peers:
-                if device.sock in ready and not device.serve_one():
-                    raise EOFError(f"{device.name}: the front end went away during an IOTLB miss")
-            try:
-                self.iotlb.translate(miss.iova, 1, miss.write)
-                return
-            except Miss:
-                continue
-        raise RuntimeError(f"{self.name}: no IOTLB update arrived for {miss.iova:#x}")
+        asked = time.monotonic()
+        MISS_LOG = []
+        try:
+            for _ in range(1000):
+                peers = [device for device in DEVICES.values() if device.sock is not None] or [self]
+                ready, _, _ = select.select([device.sock for device in peers], [], [], 5.0)
+                if not ready:
+                    break
+                for device in peers:
+                    if device.sock in ready and not device.serve_one():
+                        miss_note(f"{self.name}: IOTLB miss at {miss.iova:#x} ({'write' if miss.write else 'read'}) unanswered when the front end went away after {time.monotonic() - asked:.3f} s - meanwhile {' '.join(MISS_LOG[-40:])}")
+                        raise EOFError(f"{device.name}: the front end went away during an IOTLB miss")
+                try:
+                    self.iotlb.translate(miss.iova, 1, miss.write)
+                    if time.monotonic() - asked > 1.0:
+                        miss_note(f"{self.name}: IOTLB miss at {miss.iova:#x} answered after {time.monotonic() - asked:.3f} s - meanwhile {' '.join(MISS_LOG[-40:])}")
+                    return
+                except Miss:
+                    continue
+            miss_note(f"{self.name}: IOTLB miss at {miss.iova:#x} ({'write' if miss.write else 'read'}) unanswered after {time.monotonic() - asked:.3f} s - meanwhile {' '.join(MISS_LOG[-40:])}")
+            raise RuntimeError(f"{self.name}: no IOTLB update arrived for {miss.iova:#x}")
+        finally:
+            MISS_LOG = None
 
     def run_pending(self):
         """The drains a message asked for, now that its reply is sent."""
@@ -374,6 +397,12 @@ class Device:
             return False
         request, flags, body, fds = message
         trace(f"{self.name}: message {request} ({len(body)} bytes, {len(fds)} fd(s))")
+        if MISS_LOG is not None:
+            if request == IOTLB_MSG and len(body) >= 26:
+                iova, size, _, perm, kind = struct.unpack_from("<QQQBB", body)
+                MISS_LOG.append(f"{self.name}:iotlb-{kind}:{iova:#x}+{size:#x}/{perm}")
+            else:
+                MISS_LOG.append(f"{self.name}:{request}")
         ack = bool(flags & FLAG_NEED_REPLY) and self.protocol & PROTOCOL_REPLY_ACK
         answered = self.handle(request, body, fds)
         if ack and not answered:
@@ -1565,6 +1594,8 @@ class TcpcTest(unittest.TestCase):
 
 
 def main():
+    # A STALLED BACKEND SAYS WHERE IT IS: SIGUSR1 writes every thread's stack to stderr, which a gate keeps.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--i2c", help="the virtio-i2c vhost-user socket to listen on")
     parser.add_argument("--gpio", help="the virtio-gpio vhost-user socket to listen on")

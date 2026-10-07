@@ -34,9 +34,22 @@
 #
 # IT REFUSES TO START WHILE ANOTHER GUEST IS UP, rather than reuse an instance booted under conditions it
 # cannot state or take down one it did not start.
+#
+# THE EMULATED PORTS, `--arch aarch64` or `--arch riscv64`, only check x86_64's account: the scaled run alone, under
+# `development-trace`, as one cold boot through the lab's scenario runner - the command typed into the serial shell,
+# so the demo's report and the drain land in one log, as `lab sh` gives x86_64 - and the same collector, closing the
+# account within the same five percent. Their numbers are emulated ones, and go in `docs/PERF.md` marked so.
 
 SCRIPT_NAME=check-qemu-2d-account.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../lib.sh"
+
+ARCH=x86_64
+case "${1:-}" in
+"") ;;
+--arch) ARCH="${2:-}" ;;
+*) die "unexpected argument '$1'" ;;
+esac
+[[ "$ARCH" == x86_64 || "$ARCH" == aarch64 || "$ARCH" == riscv64 ]] || die "--arch takes x86_64, aarch64 or riscv64"
 
 RESULTS="${ACCOUNT_RESULTS:-$BUILD_DIR/logs/qemu-2d-account/$(date -u +%Y%m%dT%H%M%SZ)${CARGO_PROFILE_DEV_OPT_LEVEL:+-opt$CARGO_PROFILE_DEV_OPT_LEVEL}}"
 # A RELATIVE DIRECTORY IS THE REPOSITORY'S, not the working directory's: `check.sh` runs gates from
@@ -46,6 +59,38 @@ mkdir -p "$RESULTS"
 SERIAL_LOG="$BUILD_DIR/boot/lab-serial.log"
 IMAGE="$BUILD_DIR/boot/libersystem-dev.iso"
 COLLECTOR="$SRC_DIR/harness/frame_account.py"
+
+# THE PORT RUN: the scaled account, cold, and closed by the same collector.
+if [[ "$ARCH" != x86_64 ]]; then
+	if ps -eo comm= | grep -q '^qemu-system'; then
+		die "a QEMU guest is already running - this gate boots its own under stated conditions and will not share or take down another"
+	fi
+	python3 "$SRC_DIR/tools/check-frame-account-collector.py" >"$RESULTS/collector-fixtures.log" 2>&1 || die "the collector failed its fixture logs - see $RESULTS/collector-fixtures.log"
+	cat >"$RESULTS/scaled-$ARCH.toml" <<'EOF'
+version = 1
+name = "frame account scaled"
+description = "The scaled frame account under development-trace: one pinned walk of 160 frames at 640x480, its report and the drain on the serial line."
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+[[step]]
+do = "serial-sh"
+command = "test2d-sw --account --no-input --no-second-surface --frames=160 --phase-frames=40 --workers=1 --size=640x480"
+contains = "test2d-sw: done"
+timeout = 300
+EOF
+	LIBER_BOOT_PROFILE=development-trace "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 || die "the $ARCH scaled run failed - see $RESULTS/boot-$ARCH.log"
+	cp "$BUILD_DIR/boot/cold-$ARCH.log" "$RESULTS/serial-$ARCH.log"
+	grep -a -q "boot profile: development-trace" "$RESULTS/serial-$ARCH.log" || die "the $ARCH guest did not boot under development-trace - see $RESULTS/serial-$ARCH.log"
+	[[ "$(grep -a -o -m1 ' lanes=[0-9]*' "$RESULTS/serial-$ARCH.log" | cut -d= -f2)" == 1 ]] || die "the $ARCH run was pinned to one worker and reports another lane count - see $RESULTS/serial-$ARCH.log"
+	python3 "$COLLECTOR" "$RESULTS/serial-$ARCH.log" --drain 1 --demo-report "$RESULTS/serial-$ARCH.log" --json "$RESULTS/account-scaled-$ARCH.json" >"$RESULTS/account-scaled-$ARCH.txt" 2>&1 || die "the $ARCH account was refused: $(tail -n 1 "$RESULTS/account-scaled-$ARCH.txt")"
+	note "account scaled on $ARCH: $(head -n 1 "$RESULTS/account-scaled-$ARCH.txt")"
+	note "PASS on $ARCH (emulated) - the scaled account closed within five percent against the demo's own report; results in $RESULTS"
+	exit 0
+fi
 TARGET=x86_64-unknown-none
 BOOTED=0
 cleanup() {

@@ -348,7 +348,17 @@ pub fn function_bar(bus: u8, dev: u8, func: u8, index: usize) -> Option<(u64, u6
 	}
 	let base = common::bar_address::<Access>(&device, index)?;
 	let size = common::bar_size::<Access>(&device, index)?;
-	if base == 0 || size == 0 { None } else { Some((base, size)) }
+	if base == 0 || size == 0 {
+		return None;
+	}
+	// AND A WINDOW THE FIRMWARE PLACED BUT LEFT UNDECODED IS TURNED ON, since its address is handed out now. UEFI
+	// assigns every function's BARs and enables decoding only for the functions one of its own drivers opens: the
+	// i6300esb, which none does, kept its address with memory space off - QEMU's `info pci` said `BAR0: 32 bit memory
+	// (not mapped)` - so its driver read all-ones (a last reset of its own, on a cold boot) and its writes went
+	// nowhere: the stage preloads stayed at their reset value and its pets were never taken. Bus mastering is
+	// untouched; that is a claim's.
+	common::enable_memory_space::<Access>(bus, dev, func);
+	Some((base, size))
 }
 
 // One function's COMMAND register, read back - test-only, see `arch::common::pci::command`.

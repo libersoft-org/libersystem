@@ -5038,19 +5038,32 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 			// ONLY A MISMATCH REACHES HERE - `drain_channel` settles the answer that was asked
 			// for. A duplicate, one from an earlier round, or a number nobody asked with does
 			// NOT reset the watchdog, and this is where that is said out loud.
+			//
+			// SAID AT THE FIRST AND AT EVERY DOUBLING of the misses, as the mark below is: a late answer follows every miss
+			// of a driver the machine is too slow to run inside its deadline, and a line for each one fed the flood it
+			// reported - measured on riscv64 under TCG, 2884 of these lines and their misses' in one boot that never
+			// reached ProcessService, each line more for a boot processor already behind to put on the console.
 			BindingEvent::Ponged { .. } => {
-				print(b"DeviceManager: ");
-				print_driver_name(driver_name);
-				print(b" answered a ping nobody asked; the watchdog is not reset by it\n");
+				if node.beat.missed().is_power_of_two() {
+					print(b"DeviceManager: ");
+					print_driver_name(driver_name);
+					print(b" answered a ping nobody asked; the watchdog is not reset by it\n");
+				}
 				continue;
 			}
 			// A WEDGED DRIVER IS TORN DOWN LIKE A CRASHED ONE. The teardown is the same
 			// transaction and the same retry-and-quarantine counter; what differs is the reason
 			// for starting it, which is what the record carries.
 			BindingEvent::Wedged { .. } => {
-				print(b"DeviceManager: ");
-				print_driver_name(driver_name);
-				print(b" stopped answering its control path inside the deadline its registry entry declares\n");
+				// THE WATCHDOG'S MISS OF A DRIVER THAT IS MARKED AND LEFT RUNNING is said with its count, below, at the first
+				// and at every doubling - not at each one (see `Ponged` above). A planned stop that was not confirmed is said
+				// every time: it is one event, and it starts a teardown.
+				let marked_miss = next_state.is_none() && cause.is_none();
+				if !marked_miss || (node.beat.missed() + 1).is_power_of_two() {
+					print(b"DeviceManager: ");
+					print_driver_name(driver_name);
+					print(b" stopped answering its control path inside the deadline its registry entry declares\n");
+				}
 				// `hung`, NOT `handshake-timeout`. A driver that came up and then went quiet is
 				// a different fact from one that never answered at all, and a reader cannot act
 				// on "it did not answer" without knowing which.

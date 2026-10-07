@@ -1170,6 +1170,14 @@ def cmd_dev_up(args):
 	timeout = arg_value(args, '--timeout', 240)
 	build_timeout = arg_value(args, '--build-timeout', 1800)
 	displays = [d for d in ('vnc', 'spice') if f'--{d}' in args]
+	# A DEVICE-TREE TARGET'S INSTANCE, `--arch aarch64|riscv64`, is a PRIVATE one: a gate that drives its guest from
+	# the host the way it drives x86_64's - launches through the development channel, its serial log read as it grows -
+	# brings one up under `LIBER_DEV_STATE` and takes it down again. The persistent instance stays x86_64's.
+	arch, _ = take_string_arg(args, '--arch', 'x86_64')
+	if arch not in ('x86_64', 'aarch64', 'riscv64'):
+		die(f'dev-up: --arch takes x86_64, aarch64 or riscv64, not {arch}')
+	if arch != 'x86_64' and not os.environ.get('LIBER_DEV_STATE'):
+		die(f'dev-up: an {arch} instance is a private one - set LIBER_DEV_STATE to the directory it lives in')
 	state, identity = dev_state()
 	if state == 'ready':
 		# Idempotent for the owner: booting once and reusing the instance is the point,
@@ -1216,6 +1224,10 @@ def cmd_dev_up(args):
 	# decided - the harness then writes `enforcing-required` on the default x86_64 machine, which
 	# has a controller, and `no-iommu` under `--no-iommu`.
 	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1', LIBER_DEV_INSTANCE_BRINGUP='1', LIBER_RUN_MODE='development')
+	if arch != 'x86_64':
+		# THE BOOT `scenario-cold` GIVES THESE TARGETS, under this instance's own names: UEFI, because a direct boot
+		# carries no system volume, and four cores unless the caller says otherwise.
+		env.update(UEFI='1', SMP=os.environ.get('SMP', '4'))
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
 	# THE IMAGE BUILD IS A STEP OF ITS OWN, because the runner no longer performs one.
 	#
@@ -1232,7 +1244,7 @@ def cmd_dev_up(args):
 	# fingerprints `init-x86_64.pkg`, and `scenario-cold` exists precisely because the other two
 	# have no persistent instance to be.
 	try:
-		build = subprocess.run(image_command('none'), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
+		build = subprocess.run(image_command('none') if arch == 'x86_64' else build_command(arch), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
 	except subprocess.TimeoutExpired:
 		os.close(lock_fd)
 		die(f'the development image build did not finish within {build_timeout} s (see {DEV_QEMU_LOG})')
@@ -1243,8 +1255,13 @@ def cmd_dev_up(args):
 	# and a run-private instance boots an IMMUTABLE COPY of it under its own state directory rather
 	# than the tree's `.build/boot` file, which the next image build replaces.
 	image = os.path.join(BUILD_ROOT, 'boot', 'libersystem-dev.iso')
+	if arch != 'x86_64':
+		# THE KERNEL IS THE ARTIFACT these targets boot - the loader takes the packages beside it - copied, as the ISO
+		# is, so the next build cannot change what this instance's record names.
+		triple = {'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}[arch]
+		image = os.path.join(BUILD_ROOT, 'cargo', 'kernel', triple, 'debug', 'kernel')
 	if os.environ.get('LIBER_DEV_STATE'):
-		private = os.path.join(DEV_STATE, 'libersystem-dev.iso')
+		private = os.path.join(DEV_STATE, 'libersystem-dev.iso' if arch == 'x86_64' else f'kernel-{arch}')
 		temporary = f'{private}.{os.getpid()}.tmp'
 		shutil.copyfile(image, temporary)
 		os.chmod(temporary, 0o444)
@@ -1252,7 +1269,8 @@ def cmd_dev_up(args):
 		image = private
 	boot_artifact = {'path': image, 'sha256': file_sha256(image)}
 	print(f'lab: boot artifact sha256={boot_artifact["sha256"]} ({image})')
-	guest = subprocess.Popen(run_command(displays, image), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	command = run_command(displays, image) if arch == 'x86_64' else ['bash', 'harness/qemu-run.sh', arch, image]
+	guest = subprocess.Popen(command, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
 	record_lab_guest(guest)
 	qemu_deadline = time.time() + 60
 	while not dev_guest_qemu(guest.pid):
@@ -1293,7 +1311,10 @@ def cmd_dev_up(args):
 		'started': started,
 		# Taken after the guest booted, so it describes what this instance is actually
 		# running. A reattach deliberately keeps it: the broker changed, the guest did not.
-		'inputs': instance_inputs(),
+		# The fingerprint is of x86_64's inputs, which is what `dev-status` compares; another target's instance is
+		# private and short-lived, and records its target instead.
+		'inputs': instance_inputs() if arch == 'x86_64' else {},
+		'arch': arch,
 		'boot_artifact': boot_artifact,
 	})
 	os.close(lock_fd)

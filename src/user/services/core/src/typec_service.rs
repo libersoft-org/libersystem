@@ -93,6 +93,9 @@ struct TypeC {
 	registry: Registry<Held>,
 	requests: Requests,
 	providers: Vec<Provider>,
+	// Published providers whose update stream did not open inside OPEN_TICKS, asked again later
+	// (`service_logic::provider_retry`).
+	unopened: service_logic::provider_retry::ProviderRetry<ProviderInfo>,
 	subscribers: Vec<Subscriber>,
 	waiting: Vec<Waiting>,
 	next_provider: u32,
@@ -213,7 +216,7 @@ impl typec_control::Service for ControlView {
 impl TypeC {
 	// A publication arrived: open it and its update stream, and give it the registry's time to describe itself.
 	// BEYOND THE PROVIDER LIMIT IT IS REFUSED AND SAID, never admitted by evicting another.
-	fn adopt(&mut self, catalogue: u64, info: ProviderInfo) {
+	fn adopt(&mut self, catalogue: u64, info: ProviderInfo, attempts: u32) {
 		let now = clock();
 		if !self.registry.provider_room() {
 			print(b"TypeCService: a typec-connector provider was refused: this service holds eight (resource exhausted)\n");
@@ -227,8 +230,14 @@ impl TypeC {
 			return;
 		};
 		let Some(stream) = typec_provider::Client::with_deadline(ChannelTransport { chan }, now + OPEN_TICKS).updates() else {
-			print(b"TypeCService: a Type-C provider did not open its update stream\n");
 			close(chan);
+			// ASKED AGAIN, NOT LET GO: a provider busy at bind stays published, and a service that gave up on it held
+			// none of its connectors for the rest of the boot.
+			match self.unopened.failed(info, attempts, now) {
+				service_logic::provider_retry::Next::At(_) if attempts == 0 => print(b"TypeCService: a Type-C provider did not open its update stream - it is asked again\n"),
+				service_logic::provider_retry::Next::At(_) => {}
+				service_logic::provider_retry::Next::GivenUp => print(b"TypeCService: a Type-C provider did not open its update stream after every retry - it is not held\n"),
+			}
 			return;
 		};
 		let id = ProviderId(self.next_provider);
@@ -260,6 +269,8 @@ impl TypeC {
 	}
 
 	fn withdraw(&mut self, info: &ProviderInfo) {
+		let gone = publication_of(info);
+		self.unopened.withdraw(|waiting| publication_of(waiting) == gone);
 		if let Some(id) = self.registry.provider_of(publication_of(info)) {
 			self.lose(id, b"its publication was withdrawn");
 		}
@@ -561,7 +572,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::TypecConnector).unwrap_or(0) } else { 0 };
 	let mut epoch_bytes = [0u8; 8];
 	let epoch = if random_get(&mut epoch_bytes) == epoch_bytes.len() { u64::from_le_bytes(epoch_bytes) } else { clock() };
-	let mut service = TypeC { registry: Registry::new(epoch), requests: Requests::new(), providers: Vec::new(), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
+	let mut service = TypeC { registry: Registry::new(epoch), requests: Requests::new(), providers: Vec::new(), unopened: service_logic::provider_retry::ProviderRetry::new(OPEN_TICKS), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
 	print(b"TypeCService: online\n");
 	send_blocking(bootstrap, b"TypeCService: online", 0);
 
@@ -587,7 +598,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		waitset.extend(clients.iter().map(|client| client.chan));
 		let now = clock();
 		let retry = if service.registry.pending_subscribers().is_empty() { None } else { Some(now + service_logic::power_registry::COALESCE_TICKS) };
-		let deadline = [service.registry.next_deadline(), service.requests.next_deadline(), retry].into_iter().flatten().min().unwrap_or(0);
+		let deadline = [service.registry.next_deadline(), service.requests.next_deadline(), retry, service.unopened.next_deadline()].into_iter().flatten().min().unwrap_or(0);
 		let ready = wait_any(&waitset, if deadline != 0 { deadline.max(now + 1) } else { 0 });
 		if ready >= 0 {
 			let handle = waitset[ready as usize];
@@ -596,6 +607,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// TIME: a request past its fifteen seconds completes as indeterminate, a provider past its snapshot deadline
 		// is closed, and what the request just served queued goes out.
 		let now = clock();
+		for (info, attempts) in service.unopened.due(now) {
+			service.adopt(catalogue, info, attempts);
+		}
 		for corr in service.requests.tick(now) {
 			service.complete(corr, Ok(INDETERMINATE));
 		}
@@ -653,7 +667,7 @@ fn serve(service: &mut TypeC, clients: &mut Vec<Client>, handle: u64, catalogue:
 			let mut frame_handles = wire::Handles::new();
 			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else { continue };
 			if info.live {
-				service.adopt(catalogue, info);
+				service.adopt(catalogue, info, 0);
 			} else {
 				service.withdraw(&info);
 			}

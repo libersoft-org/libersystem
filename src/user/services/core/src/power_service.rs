@@ -110,6 +110,9 @@ struct Subscriber {
 struct Power {
 	registry: Registry<Held>,
 	providers: Vec<Provider>,
+	// Published providers whose update stream did not open inside OPEN_TICKS, asked again later
+	// (`service_logic::provider_retry`).
+	unopened: service_logic::provider_retry::ProviderRetry<ProviderInfo>,
 	subscribers: Vec<Subscriber>,
 	waiting: Vec<Waiting>,
 	next_provider: u32,
@@ -234,7 +237,7 @@ impl power_control::Service for ControlView {
 impl Power {
 	// A publication arrived: open it, open its update stream, and give it SNAPSHOT_TICKS to describe
 	// itself. BEYOND THE PROVIDER LIMIT IT IS REFUSED AND SAID, never admitted by evicting another.
-	fn adopt(&mut self, catalogue: u64, info: ProviderInfo) {
+	fn adopt(&mut self, catalogue: u64, info: ProviderInfo, attempts: u32) {
 		let now = clock();
 		if !self.registry.provider_room() {
 			print(b"PowerService: a power-source provider was refused: this service holds eight (resource exhausted)\n");
@@ -250,8 +253,13 @@ impl Power {
 		let stream = match power_provider::Client::with_deadline(ChannelTransport { chan }, now + OPEN_TICKS).updates() {
 			Some(stream) => stream,
 			None => {
-				print(b"PowerService: a power-source provider did not open its update stream\n");
 				close(chan);
+				// ASKED AGAIN, NOT LET GO - see TypeCService's: a provider busy at bind stays published.
+				match self.unopened.failed(info, attempts, now) {
+					service_logic::provider_retry::Next::At(_) if attempts == 0 => print(b"PowerService: a power-source provider did not open its update stream - it is asked again\n"),
+					service_logic::provider_retry::Next::At(_) => {}
+					service_logic::provider_retry::Next::GivenUp => print(b"PowerService: a power-source provider did not open its update stream after every retry - it is not held\n"),
+				}
 				return;
 			}
 		};
@@ -281,6 +289,8 @@ impl Power {
 	}
 
 	fn withdraw(&mut self, info: &ProviderInfo) {
+		let gone = publication_of(info);
+		self.unopened.withdraw(|waiting| publication_of(waiting) == gone);
 		if let Some(id) = self.registry.provider_of(publication_of(info)) {
 			self.lose(id, b"its publication was withdrawn");
 		}
@@ -623,7 +633,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::PowerSource).unwrap_or(0) } else { 0 };
 	let mut epoch_bytes = [0u8; 8];
 	let epoch = if random_get(&mut epoch_bytes) == epoch_bytes.len() { u64::from_le_bytes(epoch_bytes) } else { clock() };
-	let mut service = Power { registry: Registry::new(epoch), providers: Vec::new(), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
+	let mut service = Power { registry: Registry::new(epoch), providers: Vec::new(), unopened: service_logic::provider_retry::ProviderRetry::new(OPEN_TICKS), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
 	send_blocking(bootstrap, b"PowerService: online", 0);
 	// THE SLEEP POLICY, beside the state: it reads the lid, idleness and the sources, and asks through its own doors.
 	let mut sleep_policy = policy::SleepPolicy::new(catalogue, activity, outputs, sleep, syspower, shutdown, config);
@@ -653,10 +663,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// wakes this loop when a reader makes room.
 		let now = clock();
 		let retry = if service.registry.pending_subscribers().is_empty() { None } else { Some(now + service_logic::power_registry::COALESCE_TICKS) };
-		let deadline = match (service.registry.next_deadline(), retry) {
-			(Some(a), Some(b)) => a.min(b),
-			(a, b) => a.or(b).unwrap_or(0),
-		};
+		let deadline = [service.registry.next_deadline(), retry, service.unopened.next_deadline()].into_iter().flatten().min().unwrap_or(0);
 		let ready = wait_any(&waitset, if deadline != 0 { deadline.max(now + 1) } else { 0 });
 		if ready >= 0 {
 			let handle = waitset[ready as usize];
@@ -668,6 +675,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// brings a source's controls back, and the query leaves on a tick: taken before the request, the
 		// tick left it for the next deadline - which was the query's own, so it was sent as it expired and
 		// its answer was dropped, and the source never came back.
+		for (info, attempts) in service.unopened.due(clock()) {
+			service.adopt(catalogue, info, attempts);
+		}
 		let effects = service.registry.tick(clock());
 		service.apply(effects);
 		service.drain_subscribers();
@@ -725,7 +735,7 @@ fn serve(service: &mut Power, clients: &mut Vec<Client>, handle: u64, catalogue:
 			let mut frame_handles = wire::Handles::new();
 			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else { continue };
 			if info.live {
-				service.adopt(catalogue, info);
+				service.adopt(catalogue, info, 0);
 			} else {
 				service.withdraw(&info);
 			}

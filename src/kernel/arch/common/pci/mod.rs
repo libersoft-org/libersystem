@@ -1769,7 +1769,9 @@ pub fn msix_disable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 //
 // BUS MASTERING IS NOT ITS BUSINESS EITHER - see `msix_enable`. The name lost its second half with
 // the behaviour.
-#[cfg(target_arch = "riscv64")]
+//
+// AND THE DEVICE-TREE PORTS' `function_bar`, for a BAR the firmware placed and left undecoded.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn enable_memory_space<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
 	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE) as u32);
 }

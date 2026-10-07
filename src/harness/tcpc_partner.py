@@ -119,6 +119,11 @@ T_SENDER_RESPONSE = 0.027  # SenderResponseTimer: 24 to 30 ms - STRETCHED on the
 T_RECEIVER_RESPONSE = 0.003  # tReceiverResponse: at most 15 ms
 T_SRC_TRANSITION = 0.030  # tSrcTransition: 25 to 35 ms - STRETCHED on the emulated ports
 T_SUPPLY_SETTLE = 0.020  # the supply's move, inside tPSTransition's 450 ms
+# THE STRETCHED tSrcTransition'S CEILING. The sink's PSTransitionTimer - 450 to 550 ms from the Accept to PS_RDY - is a
+# sink timer and is not stretched, so a stretched wait before the transition has to leave the move and PS_RDY inside it:
+# at the emulated ports' factor of 100 the 30 ms became 3 s, and every sink sent Hard Reset some 500 ms after the
+# Accept, before the source had begun (aarch64, 2026-10-07). 300 ms is ten times the specification's and leaves the rest.
+T_SRC_TRANSITION_CEILING = 0.300
 T_PS_HARD_RESET = 0.030  # tPSHardReset: 25 to 35 ms
 T_SRC_RECOVER = 0.700  # tSrcRecover: 660 to 1000 ms
 
@@ -737,7 +742,7 @@ class Source:
             return
         self.state = 'accepted'
         self.answer(ACCEPT)
-        self.timers.at(T_RECEIVER_RESPONSE + T_SRC_TRANSITION * self.stretch, 'transition', lambda: self.transition(position, millivolts))
+        self.timers.at(T_RECEIVER_RESPONSE + min(T_SRC_TRANSITION * self.stretch, max(T_SRC_TRANSITION, T_SRC_TRANSITION_CEILING)), 'transition', lambda: self.transition(position, millivolts))
 
     def transition(self, position, millivolts):
         self.state = 'transition'
