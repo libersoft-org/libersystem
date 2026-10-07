@@ -70,6 +70,9 @@ do = "expect"
 contains = "watchdog_service"
 timeout = 30
 
+# THE SHELL'S `started:` AND THE SERVICE'S ARM ARE TWO PROCESSES' LINES ABOUT ONE ACTION, in whichever order their
+# paths to the console deliver them - on aarch64 the arm came first - so these and the like below are unordered.
+
 [[step]]
 do = "key"
 text = "start watchdog_service"
@@ -77,11 +80,13 @@ text = "start watchdog_service"
 [[step]]
 do = "expect"
 contains = "started: watchdog_service"
+unordered = true
 timeout = 60
 
 [[step]]
 do = "expect"
 contains = "WatchdogService: armed i6300esb at 29998 ms"
+unordered = true
 timeout = 60
 
 # THREE TIMEOUTS OF A HEALTHY SYSTEM.
@@ -105,11 +110,13 @@ timeout = 30
 [[step]]
 do = "expect"
 contains = "supervisor: watchdog_service restarted"
+unordered = true
 timeout = 60
 
 [[step]]
 do = "expect"
 contains = "WatchdogService: armed i6300esb at 29998 ms"
+unordered = true
 timeout = 60
 
 [[step]]
@@ -126,11 +133,13 @@ function = "8086:25ab"
 [[step]]
 do = "expect"
 contains = "driver.i6300esb: online - running at bind"
+unordered = true
 timeout = 120
 
 [[step]]
 do = "expect"
 contains = "WatchdogService: armed i6300esb at 29998 ms"
+unordered = true
 timeout = 60
 
 [[step]]

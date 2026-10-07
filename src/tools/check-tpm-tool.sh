@@ -12,8 +12,11 @@
 # verifies the quote's signature by the public point it carries, over an attestation that names this nonce and
 # carries the digest of PCR 16 as it was read just before.
 #
-# WHAT IT DOES NOT CLAIM: a TPM on real hardware, or the device-tree ports - their runs boot the `tpm-tis-device`
-# node with the same scenario.
+# THE DEVICE-TREE PORTS, `--arch aarch64` or `--arch riscv64`: the same scenario once, behind `tpm-tis-device`, whose
+# tree node is the row - `tcg,tpm-tis-mmio`, its one resource the 4 KiB page at the node's translated base - and the
+# same host checks.
+#
+# WHAT IT DOES NOT CLAIM: a TPM on real hardware.
 
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,17 +26,33 @@ fail() {
 	exit 1
 }
 
+arch=x86_64
 case "${1:-}" in
-"" | --arch)
-	[[ "${2:-x86_64}" == x86_64 ]] || fail "this gate is the x86_64 one; the ports run the same scenario on their tpm-tis-device"
-	;;
+"") ;;
+--arch) arch="${2:-}" ;;
 *) fail "unexpected argument '$1'" ;;
+esac
+# THE ROW AS `lsdev` PRINTS IT, in the scenario's two halves, and the identity the policy verbs name it by.
+case "$arch" in
+x86_64)
+	row_head='identity=table:TPM2#0, ids=[{kind=table, text=TPM2}, {kind=identity, text=acpi:\_SB_.'
+	row_tail='TPM_}, {kind=hid, text=MSFT0101}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]'
+	identity='table:TPM2#0'
+	;;
+aarch64 | riscv64)
+	base=0xc000000
+	[[ "$arch" == riscv64 ]] && base=0x4000000
+	identity="dt:/platform-bus@${base#0x}/tpm_tis@0"
+	row_head="identity=$identity, ids=[{kind=compatible, text=tcg,tpm-tis-mmio}]"
+	row_tail="resources=[{kind=mmio, base=$((base)), length=4096, level=false, active-low=false, controller=4294967295}]"
+	;;
+*) fail "--arch takes x86_64, aarch64 or riscv64" ;;
 esac
 
 command -v swtpm >/dev/null || fail "swtpm is not installed - setup.sh installs it, and this gate fails rather than skips without it"
 command -v openssl >/dev/null || fail "openssl is not installed"
 
-log="$repo/.build/boot/cold-x86_64.log"
+log="$repo/.build/boot/cold-$arch.log"
 work="$(mktemp -d "${TMPDIR:-/tmp}/liber-tpm-tool.XXXXXX")"
 tpm_pid=""
 cleanup() {
@@ -57,8 +76,15 @@ run() {
 		sleep 0.05
 	done
 	[[ -S "$state/swtpm.sock" ]] || fail "swtpm did not open its control socket"
-	sed "s/@IFACE@/$interface/" "$root/harness/scenarios/tpm-tool.toml" >"$state/tpm-tool.toml"
-	TPM_SOCKET="$state/swtpm.sock" TPM_FRONTEND="$frontend" "$repo/lab.sh" scenario-cold x86_64 "$state/tpm-tool.toml" || fail "the $frontend scenario failed (serial log: $log; swtpm log: $state/swtpm.log)"
+	python3 - "$root/harness/scenarios/tpm-tool.toml" "$state/tpm-tool.toml" "$interface" "$row_head" "$row_tail" "$identity" <<'FILL'
+import sys
+source, copy, interface, head, tail, identity = sys.argv[1:]
+text = open(source, encoding='utf-8').read()
+for name, value in (('@IFACE@', interface), ('@ROW_HEAD@', head), ('@ROW_TAIL@', tail), ('@IDENTITY@', identity)):
+    text = text.replace(name, value)
+open(copy, 'w', encoding='utf-8').write(text)
+FILL
+	TPM_SOCKET="$state/swtpm.sock" TPM_FRONTEND="$frontend" "$repo/lab.sh" scenario-cold "$arch" "$state/tpm-tool.toml" || fail "the $frontend scenario failed (serial log: $log; swtpm log: $state/swtpm.log)"
 	[[ -f "$log" ]] || fail "the $frontend scenario left no serial log at $log"
 	cp "$log" "$state/serial.log"
 	kill "$tpm_pid" 2>/dev/null || true
@@ -130,6 +156,11 @@ EOF
 	[[ "$(grep -ac "driver.tpm: online - $interface interface" "$state/serial.log")" -ge 2 ]] || fail "the $frontend run's driver did not come online again after its enable"
 }
 
-run crb CRB
-run tis FIFO
-echo "qemu-tpm-tool: PASS - behind CRB and behind TIS, the TPM2 table's row is one 4 KiB page with no interrupt, the driver binds it and restarts under a held connection, TpmService serves the tool and refuses the probe by name, and the quote verifies"
+if [[ "$arch" == x86_64 ]]; then
+	run crb CRB
+	run tis FIFO
+	echo "qemu-tpm-tool: PASS - behind CRB and behind TIS, the TPM2 table's row is one 4 KiB page with no interrupt, the driver binds it and restarts under a held connection, TpmService serves the tool and refuses the probe by name, and the quote verifies"
+else
+	run tis FIFO
+	echo "qemu-tpm-tool: PASS on $arch - behind tpm-tis-device, the tree node's row is one 4 KiB page with no interrupt, the driver binds it and restarts under a held connection, TpmService serves the tool and refuses the probe by name, and the quote verifies"
+fi

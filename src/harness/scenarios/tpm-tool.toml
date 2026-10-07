@@ -1,9 +1,11 @@
 # THE TPM, END TO END, THROUGH THE EMULATED KEYBOARD: the platform row, the shipping `tpm` tool, the other component's
 # refusals, a driver restart under a held connection, a TpmService restart, and a quote the gate verifies.
 #
-# `check-tpm-tool.sh` runs this with `swtpm` behind QEMU's CRB or TIS front-end - it writes the interface into the
-# copy it runs - and then checks on the host what the scenario cannot: that two draws differ, the PCR 16 chain, PCR 8
-# unchanged, and the quote's signature by OpenSSL. Run bare, there is no TPM.
+# `check-tpm-tool.sh` runs this with `swtpm` behind QEMU's CRB or TIS front-end - on aarch64 and riscv64 the TIS one,
+# `tpm-tis-device` - and writes into the copy it runs the interface (@IFACE@), the row's two halves as `lsdev` prints
+# them (@ROW_HEAD@, @ROW_TAIL@) and the identity a policy verb names it by (@IDENTITY@); then it checks on the host what
+# the scenario cannot: that two draws differ, the PCR 16 chain, PCR 8 unchanged, and the quote's signature by OpenSSL.
+# Run bare, there is no TPM.
 version = 1
 name = "tpm tool"
 description = "The shipping tpm command reaches a swtpm-backed TPM through its platform row, the driver and TpmService: identity, random bytes, PCRs, sealing, refusals by name, a driver and a service restart, and a quote."
@@ -14,12 +16,13 @@ timeout = 1200
 do = "prompt"
 timeout = 180
 
-# THE ROW: one platform row, the `TPM2` table's, with the namespace's `MSFT0101` device merged into it - its path and
-# its hardware ID joined as ids, since both describe one device at the same base - and its one resource still the
-# table's 4 KiB locality-0 page at the platform's base (0xFED40000), not the `_CRS` range QEMU names; no interrupt,
-# since the resource list ends after that one range. THE PATH IS THE FRONT-END'S: QEMU places the CRB's device at
-# `\_SB.TPM` and the TIS's under the LPC bridge, so the row is read in two parts on either side of it - an `expect`
-# moves past its match, so the second starts where the first ended.
+# THE ROW, in two parts - an `expect` moves past its match, so the second starts where the first ended. ON x86_64 one
+# platform row, the `TPM2` table's, with the namespace's `MSFT0101` device merged into it - its path and its hardware
+# ID joined as ids, since both describe one device at the same base - and its one resource still the table's 4 KiB
+# locality-0 page at the platform's base (0xFED40000), not the `_CRS` range QEMU names; no interrupt, since the
+# resource list ends after that one range. The path is the front-end's: QEMU places the CRB's device at `\_SB.TPM` and
+# the TIS's under the LPC bridge, which is where the row is cut in two. ON THE DEVICE-TREE PORTS the tree's
+# `tcg,tpm-tis-mmio` node, its one resource the same 4 KiB page at the node's translated base.
 
 [[step]]
 do = "key"
@@ -27,12 +30,12 @@ text = "lsdev"
 
 [[step]]
 do = "expect"
-contains = 'identity=table:TPM2#0, ids=[{kind=table, text=TPM2}, {kind=identity, text=acpi:\_SB_.'
+contains = '@ROW_HEAD@'
 timeout = 30
 
 [[step]]
 do = "expect"
-contains = 'TPM_}, {kind=hid, text=MSFT0101}], resources=[{kind=mmio, base=4275306496, length=4096, level=false, active-low=false, controller=4294967295}]'
+contains = '@ROW_TAIL@'
 timeout = 30
 
 # THE TOOL: the interface, swtpm's identity, and sealing available.
@@ -200,7 +203,7 @@ timeout = 30
 
 [[step]]
 do = "key"
-text = "lsdev --disable table:TPM2#0"
+text = "lsdev --disable @IDENTITY@"
 
 [[step]]
 do = "expect"
@@ -223,7 +226,7 @@ timeout = 30
 
 [[step]]
 do = "key"
-text = "lsdev --enable table:TPM2#0"
+text = "lsdev --enable @IDENTITY@"
 
 [[step]]
 do = "expect"

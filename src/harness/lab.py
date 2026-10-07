@@ -3457,7 +3457,8 @@ def cmd_log(args):
 # `&` and `|` because a scenario starts background jobs and pipelines as a person would, by typing them.
 # `#` because a platform device's stable identity carries one (`table:TPM2#0`), and a scenario names it.
 # `!` because ServiceManager's reserved admin names begin with one, and a development scenario types them.
-KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '#': 'shift-3', '!': 'shift-1', '\n': 'ret'}
+# `@` because a device-tree node's identity carries its unit address after one (`dt:/platform-bus@c000000/tpm_tis@0`).
+KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '#': 'shift-3', '!': 'shift-1', '@': 'shift-2', '\n': 'ret'}
 
 # The key names a scenario or a command may name directly, beyond letters and digits. A fixed
 # vocabulary rather than a string handed through to QEMU: this is the one place where what a
