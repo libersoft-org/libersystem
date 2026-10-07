@@ -477,6 +477,10 @@ fn a_walk_is_reconciled_by_identity_and_loaded_withdraws_what_it_did_not_report(
 			assert_eq!(seen.iter().filter(|event| **event == (abi::DEVICE_EVENT_ARRIVED, row as u64)).count(), 1, "one arrival for row {row}: {seen:?}");
 		}
 		assert_eq!(seen.last(), Some(&(abi::DEVICE_EVENT_NAMESPACE_LOADED, first)), "the report last: {seen:?}");
+		// A DEVICE TREE'S PCI CHILD, joined by the kernel at the boot scan: no walk reports it, and no "loaded" takes it.
+		let tree_function = device::with(0, |entry| (entry.bus, entry.dev, entry.func)).expect("row 0 is a PCI function");
+		assert_ne!(tree_function, (edu.bus, edu.dev, edu.func), "a function the namespace's companion does not describe");
+		super::tree_companion(b"dt:/test-pcie/child@0", tree_function.0, tree_function.1, tree_function.2);
 		// THE SERVICE RESTARTS: the second instance reports the first device and nothing else.
 		super::process_ended(koid());
 		let (second, _gpes_again) = attach(firmware);
@@ -493,6 +497,8 @@ fn a_walk_is_reconciled_by_identity_and_loaded_withdraws_what_it_did_not_report(
 		assert_eq!(device::with(target, |entry| entry.platform.as_ref().map(|row| row.part.match_count)).flatten(), ids_before, "the static row keeps its place and loses only what was merged");
 		assert_eq!(device::with(target, |entry| entry.on_bus), Some(true));
 		assert_eq!(device_node(function_row as usize).flags & abi::FIRMWARE_NODE_COMPANION, 0, "the companion no walk reported is detached");
+		let tree_node = device_node(0);
+		assert_eq!((tree_node.flags & abi::FIRMWARE_NODE_COMPANION != 0, tree_node.path()), (true, &b"dt:/test-pcie/child@0"[..]), "the tree's companion is the kernel's, and stays");
 		assert_eq!(crate::tests::claim_device(gone as u64).err(), Some(syscall::ERR_ACCESS_DENIED), "a withdrawn row is not claimable");
 		// REPORTED AGAIN, THE WITHDRAWN ROW IS REFILLED: the same index, a new generation, an arrival.
 		let generation = device::claim_generation(gone as usize);

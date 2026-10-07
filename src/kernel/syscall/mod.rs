@@ -683,11 +683,24 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_WAIT_ANY => sys_wait_any(a0, a1, a2, a3),
 		_ => ERR_BAD_SYSCALL,
 	};
+	// A WAIT THAT FOUND ITS PROCESS KILLED retires the thread here, with nothing of the call's held.
+	if result == RETIRE {
+		sched::exit();
+	}
 	// A FROZEN THREAD RETURNS TO USER MODE ONLY AT THE THAW, whatever its syscall was - a wait that ended, a send,
 	// a clock read. The flag is read only while some freeze is in effect, so every other syscall pays one load.
 	sched::park_if_frozen();
 	result as u64
 }
+
+// WHAT A BLOCKING CALL ANSWERS WHEN IT FINDS ITS PROCESS KILLED: never a value user mode sees, because
+// `syscall_dispatch` retires the thread on it. The call returns rather than calling `sched::exit` itself, so its
+// frame unwinds and every reference in it is dropped - the waits each called `exit` from inside their own frame, and
+// `exit` never returns, so the calling thread's own `Arc<Thread>` was never dropped: it kept the dead `Thread`, and
+// through it the whole `Process` - its address space, its frames and its Domain's charges - for every process killed
+// while it waited. The buffers a wait had built leaked with it. Dropping each reference by hand before the `exit`
+// was the fix tried twice (the object, then the set), and the thread itself was the one still missed.
+const RETIRE: i64 = i64::MIN;
 
 // SYS_ABI_CHECK: a starting process reports the ABI revision it was built against
 // (a0 = its abi::ABI_VERSION). The kernel accepts a match and refuses a mismatch, so a
@@ -4215,8 +4228,7 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 	// arrives while blocked is honoured first: a kill retires the thread, a stop parks it.
 	loop {
 		if thread.process().is_killed() {
-			drop(object);
-			sched::exit();
+			return RETIRE;
 		}
 		if thread.process().is_held() {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
@@ -4328,10 +4340,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	// whole set until one is ready or the deadline passes.
 	loop {
 		if thread.process().is_killed() {
-			for slot in objects.iter_mut() {
-				slot.take();
-			}
-			sched::exit();
+			return RETIRE;
 		}
 		if thread.process().is_held() {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
@@ -4453,12 +4462,10 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 	let set_koid = set.header().koid();
 	loop {
 		if thread.process().is_killed() {
-			// THE SET GOES FIRST, as `sys_wait` drops its object: `exit` never returns, so a reference held in this frame
-			// is never dropped - and a set that is never dropped keeps every member alive. A channel it holds then never
-			// closes for its peer: a killed StorageService, whose control channel is one of its members, was never seen
-			// to end, and every client waiting on it waited for ever.
-			drop(set);
-			sched::exit();
+			// THE SET GOES WITH THE FRAME, which `RETIRE` unwinds: a set that is never dropped keeps every member
+			// alive, and a channel it holds then never closes for its peer - a killed StorageService, whose control
+			// channel is one of its members, was never seen to end, and every client waiting on it waited for ever.
+			return RETIRE;
 		}
 		if thread.process().is_held() {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);

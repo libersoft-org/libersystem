@@ -24,6 +24,9 @@ use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/roles_device_service.rs"));
 
+// The largest reply this service builds: `list` for the whole table.
+const REPLY_BYTES: usize = 256 * 1024;
+
 // The kernel device table, behind the generated Device contract - plus the binding snapshot, which
 // this service does not hold and does not derive: it FORWARDS it, verbatim, from the one process
 // that does. A second rendering is how one surface comes to report a constant where a state belongs.
@@ -187,7 +190,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve generated list/get requests until the client side closes.
 	let mut devices: Devices = Devices { bindings };
 	let mut request: [u8; 256] = [0u8; 256];
-	let mut reply: [u8; 4096] = [0u8; 4096];
+	// THE WHOLE TABLE IN ONE REPLY, which `list` is. Four kilobytes on the stack held it while a row was a PCI
+	// function; a platform row carries its identity, its ids and every resource a claim mints, and a `list` that
+	// outgrows the buffer is answered `again` by the generated server - so SystemGraph showed no devices, DeviceManager
+	// read none, and `lsdev` could not resolve an identity. Measured in the whole kernel suite, whose tests add rows of
+	// their own: the 4 KiB reply failed there and the same request alone passed. A real machine's ACPI namespace
+	// describes as many rows. On the heap, sized for a table of a few hundred rows at their largest.
+	let mut reply = alloc::vec![0u8; REPLY_BYTES];
 	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { device::dispatch(&mut devices, req, handle, out, reply_handle) });
 	exit();
 }

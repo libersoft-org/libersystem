@@ -3,8 +3,9 @@ IMPLEMENTER'S IMPLEMENTATION ON P02M0194 (2026-10-04 to 2026-10-06):
 Scope: `docs/todo/P02M0194.md`, parts a to i - the classic foundations and pairing (a), LE beyond one mouse (b),
 input (c), AudioService's device, voice and call model (d), A2DP and AVRCP (e), HFP and HSP over SCO (f), serial,
 file push and tethering (g), LE Audio (h), and the operator tool, verification and completion (i). What stays open is
-the owner's: the independent radio and peers (RootCanal and Bumble) and the codec oracles (AOSP SBC, liblc3), and the
-end-of-job runs - the three cross-builds, the dynamic report and the Domain limits re-measured under load.
+the owner's: the independent radio and peers (RootCanal and Bumble) and the codec oracles (AOSP SBC, liblc3). The
+end-of-job runs are done: the three cross-builds, the regenerated dynamic report and its gate, and the Domain limits
+read after the LE Audio gate's load.
 
 ## What was implemented
 
@@ -99,6 +100,7 @@ one from its next HCI Reset, so every older gate still runs the legacy LE paths.
 ## Verification
 
 Host suites: `cargo test --manifest-path user/services/logic/Cargo.toml` for the leaves above (LC3: 35 pass, 1 ignored
-table print), `cargo test --manifest-path user/drivers/core/Cargo.toml bt_` for the fixture. Guest gates on x86_64:
+table print), `cargo test --manifest-path user/drivers/core/Cargo.toml bt_` for the fixture. Builds: all three
+targets, and `./check.sh --gate dynamic-report` (92 tools on each). Guest gates on x86_64:
 `bluetooth-classic`, `bluetooth-le`, `bluetooth-input`, `bluetooth-audio`, `bluetooth-transfer`, `bluetooth-service`,
 `audio-routing` and `bluetooth-le-audio`.

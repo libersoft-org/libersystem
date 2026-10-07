@@ -112,9 +112,15 @@ reports() {
 	control "hid script touchscreen" >>"$backend_dir/host.log"
 }
 
+# THE QMP SOCKET `qemu-run.sh` opened for this guest: x86_64's name, or a device-tree target's own.
+qmp_socket="$root/../.build/boot/qemu-qmp.sock"
+if [[ "$GUEST_ARCH" != x86_64 ]]; then
+	qmp_socket="$root/../.build/boot/qemu-qmp-$GUEST_ARCH.sock"
+fi
+
 # ONE QMP COMMAND on a connection of its own: `query-status` answers the run state.
 qmp() {
-	python3 - "$root/../.build/boot/qemu-qmp.sock" "$1" <<'EOF'
+	python3 - "$qmp_socket" "$1" <<'EOF'
 import json, socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.settimeout(10)
@@ -170,7 +176,7 @@ host_side() {
 	# ABSOLUTE positions: the monitor's `mouse_move` queues relative motion, which QEMU hands to the one relative
 	# device - the PS/2 mouse nothing here drives - and never to a tablet. Any failure is written down rather than
 	# ending this helper.
-	python3 - "$root/../.build/boot/qemu-qmp.sock" >>"$backend_dir/host.log" 2>&1 <<'EOF' || echo "QMP could not be driven" >>"$backend_dir/host.log"
+	python3 - "$qmp_socket" >>"$backend_dir/host.log" 2>&1 <<'EOF' || echo "QMP could not be driven" >>"$backend_dir/host.log"
 import json
 import socket
 import sys

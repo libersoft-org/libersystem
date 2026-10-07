@@ -275,8 +275,9 @@ pub fn companion_function(identity: &[u8]) -> Option<(u8, u8, u8)> {
 }
 
 // A DEVICE TREE'S PCI CHILD NODE, joined at the boot scan to the function its `reg` names - as the ACPI service joins a
-// node with `_ADR`. Its path is the companion node every reader sees.
-#[cfg(all(not(test), any(target_arch = "aarch64", target_arch = "riscv64")))]
+// node with `_ADR`. Its path is the companion node every reader sees. The kernel's, not the namespace's: no walk
+// reports it, so no "namespace loaded" withdraws it (`loaded`). The suite joins one on every target.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn tree_companion(identity: &[u8], bus: u8, dev: u8, func: u8) {
 	let function = Function { segment: 0, bus, device: dev, function: func };
 	crate::serial_println!("firmware: {} is the companion of {}", Text(identity), Bdf(function));
@@ -921,7 +922,10 @@ fn loaded(instance: u64) -> i64 {
 				stale.push(identity);
 			}
 		}
-		for held in state.merged.iter().map(|merge| &merge.identity).chain(state.companions.iter().map(|companion| &companion.path)) {
+		// A TREE'S COMPANION IS NOT THE NAMESPACE'S: the kernel joined it at the boot scan and no walk reports it. Taking
+		// it here withdrew every device-tree port's PCI child joins as the ACPI service - which runs there too, finds no
+		// ACPI and reports nothing - loaded its empty namespace.
+		for held in state.merged.iter().map(|merge| &merge.identity).chain(state.companions.iter().filter(|companion| !companion.path.starts_with(b"dt:")).map(|companion| &companion.path)) {
 			if state.reported.contains(held) {
 				continue;
 			}

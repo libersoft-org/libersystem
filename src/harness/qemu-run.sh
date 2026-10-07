@@ -2777,6 +2777,15 @@ qemu_run_aarch64() {
 				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
 				qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 				qemu_append_watchdog_action qemu_args
+			else
+				# A GATE'S GUEST GETS THEM TOO, under the same per-target names: `check-i2c-hid.sh` moves the machine's
+				# tablet through QMP's `input-send-event` on every target, and these two targets opened QMP only for a
+				# development guest - so on them the gate's tablet case dialled a socket that did not exist and failed.
+				local gate_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
+				local gate_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+				rm -f "$gate_monitor" "$gate_qmp"
+				qemu_args+=(-monitor "unix:$gate_monitor,server,nowait")
+				qemu_args+=(-qmp "unix:$gate_qmp,server,nowait")
 			fi
 		fi
 	fi
@@ -3148,6 +3157,15 @@ qemu_run_riscv64() {
 				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
 				qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 				qemu_append_watchdog_action qemu_args
+			else
+				# A GATE'S GUEST GETS THEM TOO, under the same per-target names: `check-i2c-hid.sh` moves the machine's
+				# tablet through QMP's `input-send-event` on every target, and these two targets opened QMP only for a
+				# development guest - so on them the gate's tablet case dialled a socket that did not exist and failed.
+				local gate_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
+				local gate_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+				rm -f "$gate_monitor" "$gate_qmp"
+				qemu_args+=(-monitor "unix:$gate_monitor,server,nowait")
+				qemu_args+=(-qmp "unix:$gate_qmp,server,nowait")
 			fi
 		fi
 	fi

@@ -1712,7 +1712,7 @@ fn device_service_lists_devices() {
 	let reply = service_client.recv().expect("list reply");
 	let b = &reply.bytes;
 	assert_eq!(le_u32(b, 0), corr, "list reply echoes the correlation id");
-	assert_eq!(b[4], 1, "list succeeded");
+	assert_eq!(b[4], 1, "list succeeded - the reply was {:?}", &b[..b.len().min(32)]);
 	let count = le_u16(b, 5);
 	assert!(count >= 1, "at least one device was enumerated");
 	assert_eq!(le_u32(b, 7), 0, "the first device is index 0");
@@ -1922,6 +1922,21 @@ fn a_device_masters_the_bus_only_while_it_is_claimed() {
 		match device::claim_state(INDEX) {
 			Some(device::ClaimState::Free) => {
 				assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "nothing holds this device, so it may not write to memory");
+				// A DEVICE ITS LAST DRIVER LEFT WITH DMA UNCONFIRMED is mastered at its next binding's reset, not at the
+				// claim - and earlier tests here end probes of device 0 that made device-bound buffers and never gave
+				// them back, which is that driver. So that claim is walked first when it is the state found: the bit
+				// stays off through the claim and comes on at the reset (`SYS_DEVICE_QUIESCED`), which also gives the
+				// held frames back - and the ordinary claim below then starts from a device holding nothing.
+				if crate::object::dma_buffer::holds_for(INDEX as u32) {
+					let grant = crate::tests::claim_device(INDEX as u64).expect("a free device is claimable");
+					assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "a device whose last driver left its DMA unconfirmed is not mastered at the claim");
+					let released = unsafe { arch::syscall::invoke(syscall::SYS_DEVICE_QUIESCED, grant.memory, 0, 0, 0) } as i64;
+					assert!(released >= 0, "the binding's reset is accepted, answering the frames it gave back: {released}");
+					assert_ne!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "and the reset is what masters it");
+					assert!(!crate::object::dma_buffer::holds_for(INDEX as u32), "the reset gave back what was held for it");
+					crate::tests::release_device(&grant);
+					assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "the permission went with that claim too");
+				}
 				let grant = crate::tests::claim_device(INDEX as u64).expect("a free device is claimable");
 				assert_ne!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "a holder has it now, so it may write to memory");
 				assert_eq!(crate::tests::claim_device(INDEX as u64).err(), Some(abi::ERR_ALREADY_CLAIMED), "and a second claim is refused by name");
@@ -5179,7 +5194,9 @@ fn virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowled
 	assert!(controller.connect(Scope::GpioLine { line: 0, trigger: Trigger::Level }).is_none(), "a held line is refused even for level reads");
 	assert!(controller.connect(Scope::Whole).is_none(), "an unscoped connection to a GPIO controller is refused");
 	assert!(controller.connect(Scope::I2cAddress(0x50)).is_none(), "and one scoped to an address");
-	assert!(controller.connect(Scope::GpioLine { line: 8, trigger: Trigger::Level }).is_none(), "and a line the controller does not have");
+	// FAR PAST THE BACKEND'S MODEL, which names nine lines now: this said line 8 while the model had eight, and the
+	// ninth it gained (`acpi-brightness`) made the refused line a real one.
+	assert!(controller.connect(Scope::GpioLine { line: 1000, trigger: Trigger::Level }).is_none(), "and a line the controller does not have");
 	assert_eq!(controller.departures(), 5, "each refusal gives its place back to the manager");
 
 	// 6. THE CONTROLLER KILLED: every line's connection closes with its process.

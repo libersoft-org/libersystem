@@ -211,6 +211,17 @@ lto = true
 [profile.dev.package.bootproto]
 opt-level = 3
 
+# THE STORAGE SCENARIOS' SYSTEM VOLUME is formatted once per test run, with every file of the scenario archive written
+# through LiberFS - the first test that starts a system volume pays for it. Unoptimized, that write of 302 files and
+# 36.7 MB took 16.4 s natively against 0.115 s at opt-level 3, and under aarch64's TCG the first such test went
+# silent for longer than the suite's 2400-second stall bound and was killed as a hang. These two crates are the
+# suite's only users here; with them optimized and the rest unoptimized the same write took 0.215 s natively.
+[profile.dev.package.liberfs]
+opt-level = 2
+
+[profile.dev.package.fscore]
+opt-level = 2
+
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
 # call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry

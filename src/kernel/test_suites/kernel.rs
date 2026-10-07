@@ -653,6 +653,73 @@ fn a_thread_killed_in_a_wait_set_lets_go_of_every_member() {
 	assert!(b.is_peer_closed(), "and the end the set held has closed for its peer");
 }
 
+tagged_test!(a_process_killed_in_any_wait_is_dropped_whole, [Process, Syscall, Ipc], id = "kernel.kernel.a_process_killed_in_any_wait_is_dropped_whole", covers = ["kernel"]);
+fn a_process_killed_in_any_wait_is_dropped_whole() {
+	use core::sync::atomic::{AtomicUsize, Ordering};
+	static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+	static PAST_WAIT: AtomicUsize = AtomicUsize::new(0);
+	// NOTHING OF A PROCESS KILLED WHILE IT WAITS MAY OUTLIVE IT. Each wait retired its thread from inside its own frame,
+	// where the calling thread's `Arc<Thread>` sat - and `exit` never returns, so that reference was never dropped: the
+	// dead `Thread` stayed, and through it the `Process`, its address space, its frames and its Domain's charges. Found
+	// by the root Domain's process count in the whole suite: fifty-eight dead StorageService instances still counted
+	// there, one for every storage harness a test had ended. The tests above hold the thread themselves, so they could
+	// not see it; this one keeps nothing but weak references.
+	extern "C" fn in_wait(handle: u64) {
+		unsafe {
+			BLOCKED.fetch_add(1, Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_WAIT, handle, 0, 0, 0);
+			PAST_WAIT.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+	extern "C" fn in_wait_any(handle: u64) {
+		unsafe {
+			let handles = [handle];
+			BLOCKED.fetch_add(1, Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_WAIT_ANY, handles.as_ptr() as u64, 1, 0, 0);
+			PAST_WAIT.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+	extern "C" fn in_wait_set(handle: u64) {
+		unsafe {
+			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(set), "a wait set is created");
+			assert!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, handle, 0, 0) as i64 > 0, "the channel end joins the set");
+			BLOCKED.fetch_add(1, Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0);
+			PAST_WAIT.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+	BLOCKED.store(0, Ordering::SeqCst);
+	PAST_WAIT.store(0, Ordering::SeqCst);
+	let mut peers = alloc::vec::Vec::new();
+	let mut gone = alloc::vec::Vec::new();
+	for (name, victim) in [("SYS_WAIT", in_wait as extern "C" fn(u64)), ("SYS_WAIT_ANY", in_wait_any), ("SYS_WAITSET_WAIT", in_wait_set)] {
+		let (a, b) = object::channel::Channel::create();
+		// The peer is held open, so nothing but the kill ends the wait.
+		peers.push(b);
+		let thread = sched::spawn_with_object(victim, a, object::rights::Rights::ALL);
+		sched::run_until_idle();
+		let process = thread.process().clone();
+		gone.push((name, alloc::sync::Arc::downgrade(&thread), alloc::sync::Arc::downgrade(&process)));
+		process.terminate();
+		for live in process.live_threads() {
+			sched::wake_thread(&live);
+		}
+	}
+	assert_eq!(BLOCKED.load(Ordering::SeqCst), 3, "every victim ran and blocked");
+	for _ in 0..1_000 {
+		sched::run_until_idle();
+		if gone.iter().all(|(_, thread, process)| thread.upgrade().is_none() && process.upgrade().is_none()) {
+			break;
+		}
+	}
+	assert_eq!(PAST_WAIT.load(Ordering::SeqCst), 0, "every killed thread retired at its wait");
+	for (name, thread, process) in &gone {
+		assert!(thread.upgrade().is_none(), "the thread killed in {name} is still referenced after it exited");
+		assert!(process.upgrade().is_none(), "the process killed in {name} is still referenced after its thread exited");
+	}
+}
+
 tagged_test!(a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops, [Ipc, Scheduler, Kernel], id = "kernel.kernel.a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops", covers = ["kernel"]);
 fn a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops() {
 	use core::sync::atomic::{AtomicBool, Ordering};
