@@ -7,7 +7,7 @@
 // UPS's output off turns the UPS's output off. Fan curves are not here: an alarm is an observation.
 //
 // THE SLEEP POLICY IS HERE - `policy`: by default a closed lid turns the screen off unless an external display is in use,
-// and a critical battery powers the machine off in order; the settings in ConfigService's tree may make the lid suspend,
+// and a critical battery does nothing; the settings in ConfigService's tree may make the lid suspend,
 // an idle timeout suspend on battery, and a critical battery hibernate where that is set up. It decides nothing itself -
 // `service_logic::sleep_policy` does - and asks through DisplayService's outputs and the three doors ServiceManager fills.
 //
@@ -428,7 +428,8 @@ impl Power {
 					let Some(result) = decoded else { return Err(b"a control reply did not decode") };
 					// ANSWERED ONCE. A reply after the deadline already completed the control is not
 					// the outstanding one, and the operator has had its answer.
-					if self.registry.control_answered(id, corr) {
+					let answered = if result == Ok(ControlOutcome::Indeterminate) { self.registry.control_indeterminate(id, corr, clock()) } else { self.registry.control_answered(id, corr) };
+					if answered {
 						self.complete(corr, result);
 					}
 				}

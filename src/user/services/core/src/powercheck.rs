@@ -476,6 +476,34 @@ fn withhold(state: u64, control: u64, fixture: u64) {
 	));
 }
 
+fn indeterminate(state: u64, control: u64, fixture: u64) {
+	let ups = find(&all_sources(state, 4), SourceKind::Ups);
+	let before = commands(fixture).len();
+	let mut fixture_client = power_fixture::Client::new(ChannelTransport { chan: fixture });
+	if !matches!(fixture_client.indeterminate(), Some(Ok(()))) || !matches!(fixture_client.withhold(&0, &1), Some(Ok(()))) {
+		fail(b"indeterminate: the fixture did not accept the fault");
+	}
+	let started = clock();
+	if set_output(control, &ups.id, 0, false) != Ok(ControlOutcome::Indeterminate) {
+		fail(b"indeterminate: the provider's outcome was not returned");
+	}
+	if set_output(control, &ups.id, 0, true) != Err(Error::Again) {
+		fail(b"indeterminate: a conflicting control was admitted before reconciliation");
+	}
+	if commands(fixture).len() != before + 1 {
+		fail(b"indeterminate: the command was replayed or the conflict reached the provider");
+	}
+	sleep_until(started + 6 * TICKS);
+	if set_output(control, &ups.id, 0, true) != Err(Error::Io) {
+		fail(b"indeterminate: a silent query did not leave controls unavailable");
+	}
+	sleep_until(clock() + TICKS);
+	if set_output(control, &ups.id, 0, true) != Ok(ControlOutcome::Done) || commands(fixture).len() != before + 2 {
+		fail(b"indeterminate: controls did not recover after a fresh query");
+	}
+	say(b"PASS indeterminate: a provider's uncertain reply blocked conflicts, never replayed the command, and required fresh reconciliation");
+}
+
 fn extra(state: u64, fixture: u64) {
 	let count = all_sources(state, 4).len();
 	if !matches!(power_fixture::Client::new(ChannelTransport { chan: fixture }).offer_extra(), Some(Ok(()))) {
@@ -546,9 +574,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"coalesce" => coalesce(state, fixture),
 		b"overflow" => overflow(state, fixture),
 		b"withhold" => withhold(state, control_chan, fixture),
+		b"indeterminate" => indeterminate(state, control_chan, fixture),
 		b"extra" => extra(state, fixture),
 		b"remove" => remove(state, fixture),
-		_ => fail(b"usage: powercheck list [exact] | control | denied | watch | alarm | coalesce | overflow | withhold | extra | remove"),
+		_ => fail(b"usage: powercheck list [exact] | control | denied | watch | alarm | coalesce | overflow | withhold | indeterminate | extra | remove"),
 	}
 	exit();
 }

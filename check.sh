@@ -112,6 +112,8 @@ declare -A GATES=(
 	# every safety invariant, every timer's bound, a lost controller renegotiated through Soft_Reset, and the response
 	# budget over 200 negotiations under KVM. The partner's model is `i2c-backend`'s suite.
 	["typec-tcpci"]="tools/check-typec-tcpci.sh"
+	["typec-tcpci-aarch64"]="tools/check-typec-tcpci.sh --arch aarch64"
+	["typec-tcpci-riscv64"]="tools/check-typec-tcpci.sh --arch riscv64"
 	# SLEEP AND RESUME ON x86_64 q35 WITH S3 OFFERED: suspend to idle and S3 through the transaction, every wake leaving the
 	# network, the files, the display, the serial console and the clocks working; the hot-plug slot restored; a stopped
 	# job left stopped; a refusing driver and a person's shutdown during a sleep unwinding it; the fixture SSDT's lid,
@@ -209,6 +211,8 @@ declare -A GATES=(
 	# SSDT, the kernel's publication and policy, DeviceManager's node channels and grants, the fixture driver's probes,
 	# the CPU hot-plug GPE, a restart reconciled by identity, and `_OSC` granting and refusing native hot-plug.
 	["acpi"]="tools/check-acpi.sh"
+	["firmware-tree-aarch64"]="tools/check-firmware-tree.sh --arch aarch64"
+	["firmware-tree-riscv64"]="tools/check-firmware-tree.sh --arch riscv64"
 	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
 	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
 	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three

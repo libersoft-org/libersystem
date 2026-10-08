@@ -387,7 +387,7 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice, pads: &mut Pads)
 				let handle = match pads.publisher.attach(shape) {
 					Some(handle) => handle,
 					None => {
-						print(b"driver.xhci: a gamepad was bound and not published: this controller publishes sixteen\n");
+						print(b"driver.xhci: a gamepad was bound and not published: gamepad slots or lifetime handles are exhausted\n");
 						0
 					}
 				};

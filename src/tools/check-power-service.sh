@@ -72,7 +72,7 @@ expect() {
 	echo "power-service: $line"
 }
 
-guest_gate_run $'powercheck list exact\npowerread control\npowerread publish\npowercheck control\npowercheck denied\npowercheck watch\npowercheck alarm\npowercheck coalesce\npowercheck overflow\npowercheck withhold\npowercheck extra\npowercheck remove\nstop power_service\nstart power_service\npowercheck list' ""
+guest_gate_run $'powercheck list exact\npowerread control\npowerread publish\npowercheck control\npowercheck denied\npowercheck watch\npowercheck alarm\npowercheck coalesce\npowercheck overflow\npowercheck withhold\npowercheck indeterminate\npowercheck extra\npowercheck remove\nstop power_service\nstart power_service\npowercheck list' ""
 lines="$GUEST_LINES"
 
 if grep -aq 'powercheck: FAIL\|powerread: FAIL' "$lines"; then
@@ -93,6 +93,7 @@ expect "$lines" "powercheck: PASS coalesce" "a slow reader must receive the late
 expect "$lines" "powercheck: PASS overflow" "transitions a reader does not take must close its subscription, and a new one must be current"
 expect "$lines" "PowerService: a subscription is closed - its reader fell behind, and continuity is lost" "the service must say that it closed the subscription"
 expect "$lines" "power-fixture: a control reply is withheld" "the fixture must have withheld the reply"
+expect "$lines" "powercheck: PASS indeterminate" "a provider's explicit uncertainty must require fresh reconciliation"
 expect "$lines" "powercheck: PASS withhold" "an unanswered control must be indeterminate, unreplayed and reconciled before a conflict, with the other provider served"
 expect "$lines" "power_fixture offered more providers of one kind than it declares in \`provides\`; refused" "DeviceManager must refuse a publication past the fixture's declaration"
 expect "$lines" "powercheck: PASS extra" "the refused publication must reach nothing"

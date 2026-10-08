@@ -492,3 +492,9 @@ VERIFICATION:
   `--refresh dynamic-report`: RESULT ok.
 
 BLOCKERS: none for this; the ports' runs wait for the single end-of-job run, as the owner decided again (2026-10-03).
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0196 (2026-10-08T03:26:17Z):
+
+Continuation review: read the complete milestone plan and the preserved implementation record, including earlier incomplete verification and later completion claims. Reviewed the dependency and verification conventions in docs/TESTING.md. No previous audit text was changed.
+Confirmed two implementation gaps in the current tree: the dedicated device-tree fixture node has no matching driver/run despite the explicit completion criterion, and the ACPI service drains EC query commands outside its _GLK-protected ec_access path. The actual EC transport is integrated in the service; physical laptop verification remains unperformed. Work and verification results are appended below as they occur.

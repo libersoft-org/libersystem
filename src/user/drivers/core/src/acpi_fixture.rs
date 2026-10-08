@@ -24,6 +24,9 @@ use proto::system::acpi_node;
 use rt::*;
 use wire::Handles;
 
+#[path = "acpi_fixture/tree.rs"]
+mod tree;
+
 const TICKS: u64 = TICKS_PER_SECOND * 5;
 const DSM_UUID: [u8; 16] = uuid(*b"5c3c6b2e8d7a4f5b9a412e1d7f0a6b93");
 
@@ -132,6 +135,9 @@ impl Probe {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let (bind, resources) = common::handshake(bootstrap);
+	if bind.info.platform.source == PLATFORM_SOURCE_TREE {
+		tree::serve(bootstrap, &bind, &resources);
+	}
 	let window = if resources.device != 0 { unsafe { syscall(SYS_DEVICE_MEMORY_MAP, resources.device, 0, 0, 0) } } else { 0 };
 	if !common::online(bootstrap, &bind, b"driver.acpi-fixture: online", &[]) {
 		exit();

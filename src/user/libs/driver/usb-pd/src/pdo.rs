@@ -142,7 +142,8 @@ pub fn select(sink: &Sink, offers: &[u32]) -> Option<Selection> {
 		Some(chosen) if chosen.microwatts() >= sink.operational_microwatts => Some(chosen),
 		_ => {
 			// NOTHING REACHES THE OPERATIONAL POWER: position 1, which a source's first offer always is, at 5 V.
-			let Offer::Fixed { millivolts, milliamps } = Offer::decode(*offers.first()?) else { return None };
+			let Offer::Fixed { millivolts: 5_000, milliamps } = Offer::decode(*offers.first()?) else { return None };
+			let millivolts = 5_000;
 			let limited = admitted(sink, millivolts, milliamps)?;
 			Some(Selection { position: 1, millivolts, milliamps: limited, mismatch: true })
 		}

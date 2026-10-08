@@ -3584,7 +3584,10 @@ development = true
 [programs.driver]
 lifecycle = "function"
 dma = "none"
-match = [{ transport = "platform", hid = "LSFX0001" }]
+match = [
+	{ transport = "platform", hid = "LSFX0001" },
+	{ transport = "platform", compatible = "liber,tree-fixture" },
+]
 heartbeat-deadline = 100
 suspend-deadline = 100
 

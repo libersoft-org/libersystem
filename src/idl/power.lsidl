@@ -346,6 +346,8 @@ interface power-fixture {
 	@op(7) offer-extra: func() -> result<unit, error>;
 	/// The UPS's outlets, on or off, in order.
 	@op(8) outlets:     func() -> result<list<bool>, error>;
+	/// Answer the next delivered control as indeterminate, as a device transport can do.
+	@op(9) indeterminate: func() -> result<unit, error>;
 }
 
 // ------------------------------------------------------------------ cooling: the zones, the fans, the policy's operator

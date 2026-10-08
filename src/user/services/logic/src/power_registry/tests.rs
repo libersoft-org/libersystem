@@ -270,6 +270,31 @@ fn a_control_is_checked_against_the_live_source_and_what_it_advertises() {
 }
 
 #[test]
+fn an_indeterminate_provider_reply_requires_fresh_state_before_another_control() {
+	let mut registry = live(&[0]);
+	let action = Action::SetOutput { outlet: 0, on: false };
+	let sent = registry.control(key(3, 1, 0), action, 0).unwrap();
+	assert!(!registry.control_indeterminate(ProviderId(2), sent.corr, 1));
+	assert!(!registry.control_indeterminate(ProviderId(1), sent.corr + 1, 1));
+	assert!(registry.control_indeterminate(ProviderId(1), sent.corr, 2));
+	assert!(!registry.control_indeterminate(ProviderId(1), sent.corr, 3), "a duplicate cannot start another query");
+	assert!(!registry.control_answered(ProviderId(1), sent.corr), "a later definitive reply cannot settle uncertainty");
+	assert_eq!(registry.control(key(3, 1, 0), action, 3), Err(ControlRefusal::Busy));
+	let effects = registry.tick(3);
+	assert_eq!(effects.len(), 1, "only a query, never a replay or a second operator completion");
+	let Effect::Query(query) = effects[0] else { panic!("expected reconciliation") };
+	assert_eq!((query.provider, query.local), (ProviderId(1), 0));
+	registry.frame(ProviderId(1), Frame::Updated { revision: 11, local: 0, state: ups(9) }, 4).unwrap();
+	assert_eq!(registry.control(key(3, 1, 0), action, 4), Err(ControlRefusal::Busy), "ordinary updates do not reconcile");
+	assert!(registry.tick(CONTROL_TICKS + 2).is_empty());
+	assert_eq!(registry.control(key(3, 1, 0), action, CONTROL_TICKS + 3), Err(ControlRefusal::Unavailable));
+	let Effect::Query(fresh) = registry.tick(CONTROL_TICKS + 3)[0] else { panic!("expected a fresh query") };
+	assert!(!registry.query_answered(ProviderId(1), query.corr, Some(ups(10)), CONTROL_TICKS + 4));
+	assert!(registry.query_answered(ProviderId(1), fresh.corr, Some(ups(11)), CONTROL_TICKS + 4));
+	assert!(registry.control(key(3, 1, 0), action, CONTROL_TICKS + 5).is_ok());
+}
+
+#[test]
 fn an_unanswered_control_is_indeterminate_is_never_resent_and_blocks_conflicts_until_reconciled() {
 	let mut registry = live(&[0]);
 	let off = Action::SetOutput { outlet: 0, on: false };

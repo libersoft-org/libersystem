@@ -98,3 +98,19 @@ summaries in that file use the same macro. No other pinned copy of the vocabular
 - (2026-10-01) `./build.sh --arch aarch64`, `--arch riscv64` and `--arch x86_64` -> ok with the client library;
   `./check.sh --refresh dynamic-report` -> ok, then the gate `dynamic-report` -> PASS; `qemu-gamepad-tool` -> PASS
   (360 s). Status: COMPLETE.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0192 (2026-10-08T03:25:49Z):
+
+Read the complete plan and prior implementation evidence, and reviewed the shared publisher, InputService stream/discovery integration and shipped tool. The feature and its prior required USB, service, tool, cross-build and dynamic-report verification are present. Found one explicit identity-contract gap: Publisher::attach and InputService::pad_arrived wrap exhausted u32 counters to 1, reusing lifetime identities. Implementation continuation addresses only that gap and its boundary verification.
+
+Status: continuation in progress; no unrun checks are claimed.
+
+### Identity exhaustion correction
+
+- `driver_protocol::gamepad::Publisher::attach` now uses zero only as the exhausted-counter sentinel: it issues the last nonzero `u32` once, then refuses attachments instead of wrapping to 1. Detach, disconnect and reconnect preserve exhaustion. No wire shape or ordinary attachment behavior changed.
+- `InputService::pad_arrived` applies the same rule to the service's independent id space and reports exhaustion before changing the gamepad set or emitting an arrival.
+- xHCI's refused-publication diagnostic now covers exhausted slots or lifetime handles; its existing refusal behavior is retained.
+- `exhausting_handles_never_reuses_a_departed_gamepads_identity` exercises a freed early handle, the final handle, refusal while slots remain, detach and reconnect, and absence of spurious owed frames.
+- PASSED: `cd src && cargo test --manifest-path user/libs/driver/protocol/Cargo.toml --target x86_64-unknown-linux-gnu gamepad::tests` (10 passed, 0 failed); `rustfmt --edition 2024 --check src/user/libs/driver/protocol/src/gamepad.rs src/user/services/core/src/input_service.rs` (exit 0).
+- Final cross-build and service/tool regression verification for this correction is pending the whole job's final verification stage. The prior real USB proof remains applicable to unchanged descriptor mapping and HID transport.

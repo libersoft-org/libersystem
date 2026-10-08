@@ -224,3 +224,21 @@ VERIFICATION:
 - `shfmt -d` on `check-ipmi.sh` and `setup.sh`: clean; `./check.sh --gate milestone-index`: ok with the row ticked.
 
 BLOCKERS: none - the milestone is complete.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0201 (2026-10-08T03:26:12Z):
+
+Continuation review (2026-10-08). Read the complete milestone plan, the previous implementation record, docs/TESTING.md and docs/ARCHITECTURES.md. Existing implementation and past results are being checked against the current tree; prior records are preserved verbatim. No new guest execution or hardware verification has passed in this continuation yet.
+
+Current-tree review confirms the existing KCS/BT/SSIF transports and their bounds, the IPMI driver's watchdog-first
+transaction seam (`Driver::ask`/`watchdog_first`), unavailable/recovery handling, child SMBus path, the suspend/resume
+exchange, the BMC service and protected administrative path. The recorded completed sleep, cross-build and OpenIPMI
+checks close the old record's initial pending items. No new implementation change was necessary for this milestone;
+status stays COMPLETE.
+
+Fresh targeted verification (all exited 0):
+- `cargo test --offline --manifest-path src/user/libs/driver/ipmi/Cargo.toml`: 27 passed.
+- `python3 src/harness/ipmi-harness-bmc.py --self-test`: every encoding checked.
+
+Not rerun here: the long IPMI, administrative and watchdog guest gates or cross-builds; their previous passes are
+recorded above and are not claimed as fresh execution. No new blocker found.

@@ -643,6 +643,24 @@ impl<T: Payload> Registry<T> {
 		}
 	}
 
+	/// A provider answered that delivery was indeterminate. This has the same uncertainty as a
+	/// missing reply: release the command, but query fresh state before admitting another control.
+	pub fn control_indeterminate(&mut self, id: ProviderId, corr: u32, now: u64) -> bool {
+		let Some(at) = self.providers.iter().position(|provider| provider.id == id) else { return false };
+		let Control::Pending { corr: outstanding, local, .. } = self.providers[at].control else { return false };
+		if outstanding != corr {
+			return false;
+		}
+		let key = self.key(at, local);
+		if let Some(source) = self.sources.iter_mut().find(|source| source.key == key) {
+			source.uncertain = true;
+		}
+		let query = self.corr();
+		self.providers[at].control = Control::Reconciling { corr: query, local, deadline: now + CONTROL_TICKS };
+		self.queries.push(Dispatch { provider: id, corr: query, local });
+		true
+	}
+
 	/// The provider answered the reconciliation query sent under `corr`, with the source's fresh state
 	/// or with a refusal. Fresh state is published like any update and settles the source; a refusal
 	/// leaves its controls unavailable. False for a reply that is not the one outstanding.

@@ -995,7 +995,12 @@ impl Input {
 			return;
 		}
 		let id = self.gamepads.next_id;
-		self.gamepads.next_id = self.gamepads.next_id.wrapping_add(1).max(1);
+		if id == 0 {
+			print(b"InputService: a gamepad was refused: lifetime gamepad ids are exhausted\n");
+			return;
+		}
+		// Zero marks exhaustion after the last id, rather than reusing an earlier attachment's id.
+		self.gamepads.next_id = self.gamepads.next_id.checked_add(1).unwrap_or(0);
 		// AT REST UNTIL ITS FIRST REPORT: no buttons, every hat centred, each axis at its midpoint.
 		let pad = Pad { id, source, handle, shape, state: shape.initial() };
 		let arrived = GamepadEvent::Arrived(pad.record());

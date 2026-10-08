@@ -90,6 +90,15 @@ fn variable_and_battery_sink_pdos_admit_a_range_and_ties_go_to_the_lower_voltage
 	assert_eq!(select(&battery, &[pps(21_000, 3_300, 3_000)]), None, "an augmented offer alone is nothing to request");
 }
 
+#[test]
+fn a_capability_mismatch_falls_back_only_to_a_fixed_5v_first_offer() {
+	let sink = Sink { operational_microwatts: 50_000_000, ..board() };
+	assert_eq!(select(&sink, &[fixed(15_000, 3_000), fixed(5_000, 3_000)]), None, "a malformed first offer is not the 5 V fallback, even when the board admits its voltage");
+	assert_eq!(select(&sink, &[]), None);
+	let fallback = select(&sink, &[fixed(5_000, 5_000), fixed(15_000, 3_000)]).expect("5 V at position 1");
+	assert_eq!(fallback, Selection { position: 1, millivolts: 5_000, milliamps: 3_000, mismatch: true });
+}
+
 // ------------------------------------------------------------------ the engine under a virtual clock
 
 // A test harness around the engine: the actions accumulated, the timers armed, the sink path and alarms as set.

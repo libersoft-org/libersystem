@@ -154,6 +154,7 @@ struct Fixture {
 	commands: Vec<FixtureCommand>,
 	withhold_commands: u32,
 	withhold_queries: u32,
+	indeterminate: bool,
 	next_token: u16,
 }
 
@@ -244,7 +245,7 @@ impl power_provider::Service for ProviderView<'_> {
 			}
 			proto::system::ProviderCommandKind::ScheduleOutputOff | proto::system::ProviderCommandKind::CancelOutputOff => {}
 		}
-		Ok(ControlOutcome::Done)
+		if core::mem::take(&mut self.fixture.indeterminate) { Ok(ControlOutcome::Indeterminate) } else { Ok(ControlOutcome::Done) }
 	}
 
 	fn query(&mut self, local: u32) -> Result<SourceState, Error> {
@@ -343,6 +344,11 @@ impl power_fixture::Service for ControlView<'_> {
 		Ok(())
 	}
 
+	fn indeterminate(&mut self) -> Result<(), Error> {
+		self.fixture.indeterminate = true;
+		Ok(())
+	}
+
 	fn offer_extra(&mut self) -> Result<(), Error> {
 		let token = self.fixture.next_token;
 		self.fixture.next_token = token + 1;
@@ -432,6 +438,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		commands: Vec::new(),
 		withhold_commands: 0,
 		withhold_queries: 0,
+		indeterminate: false,
 		next_token: CONTROL_TOKEN + 1,
 	};
 	let mut buf = alloc::vec![0u8; 4096];

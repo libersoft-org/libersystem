@@ -103,7 +103,7 @@
 #             refused by its lock.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   IDLE_FIXTURE=1    aarch64 and riscv64: the machine's tree given `/cpus/idle-states` (`fdt_edit.py idle-fixture`)
-#   I2C_FIXTURE=bus|hid|tcpc  I2C_SOCKET=  GPIO_SOCKET=
+#   I2C_FIXTURE=bus|hid|tcpc|tree  I2C_SOCKET=  GPIO_SOCKET=
 #             attach QEMU's vhost-user I2C and GPIO controllers at their pinned slots, their device side
 #             the `vhost-i2c-gpio.py` listening on the two sockets, with the guest's RAM on a shared memfd
 #             - see `qemu_attach_i2c_fixture`. `test-kernel.sh` starts the backend and sets all three.
@@ -1042,19 +1042,23 @@ qemu_attach_hid_table() {
 i2c_hid_dtb_args() {
 	local qemu="$1"
 	shift
-	[[ "${I2C_FIXTURE:-}" == "hid" || "${I2C_FIXTURE:-}" == "tcpc" ]] || return 0
+	[[ "${I2C_FIXTURE:-}" == "hid" || "${I2C_FIXTURE:-}" == "tcpc" || "${I2C_FIXTURE:-}" == "tree" ]] || return 0
 	if [[ "${DMA_DTB_NODE:-0}" == "1" ]]; then
 		echo "qemu-run: I2C_FIXTURE=$I2C_FIXTURE and DMA_DTB_NODE=1 each hand the guest an edited tree - one run asks for one" >&2
 		exit 1
 	fi
 	local dumped edited
+	local -a edit_args=(--i2c-slot 0x15 --gpio-slot 0x16)
+	if [[ "$I2C_FIXTURE" == tree ]]; then
+		edit_args=(--slot 0x16 --line 2)
+	fi
 	dumped="$(mktemp "$QEMU_BUILD_DIR/i2c-hid-XXXXXX.dtb")"
 	edited="${dumped%.dtb}.hid.dtb"
 	"$qemu" "$@" -machine "$MACHINE_FOR_DUMP,dumpdtb=$dumped" -display none >/dev/null 2>&1 || {
 		echo "qemu-run: the machine's device tree could not be dumped for the HID-over-I2C fixture" >&2
 		exit 1
 	}
-	python3 "$HERE/fdt_edit.py" "$I2C_FIXTURE-fixture" "$dumped" "$edited" --i2c-slot 0x15 --gpio-slot 0x16 || {
+	python3 "$HERE/fdt_edit.py" "$I2C_FIXTURE-fixture" "$dumped" "$edited" "${edit_args[@]}" || {
 		echo "qemu-run: the $I2C_FIXTURE fixture's nodes could not be added to the device tree" >&2
 		exit 1
 	}
@@ -1069,7 +1073,7 @@ idle_dtb_args() {
 	local qemu="$1" binding="$2"
 	shift 2
 	[[ "${IDLE_FIXTURE:-0}" == "1" ]] || return 0
-	if [[ "${DMA_DTB_NODE:-0}" == "1" || "${I2C_FIXTURE:-}" == "hid" || "${I2C_FIXTURE:-}" == "tcpc" ]]; then
+	if [[ "${DMA_DTB_NODE:-0}" == "1" || "${I2C_FIXTURE:-}" == "hid" || "${I2C_FIXTURE:-}" == "tcpc" || "${I2C_FIXTURE:-}" == "tree" ]]; then
 		echo "qemu-run: IDLE_FIXTURE=1 and another fixture each hand the guest an edited tree - one run asks for one" >&2
 		exit 1
 	fi

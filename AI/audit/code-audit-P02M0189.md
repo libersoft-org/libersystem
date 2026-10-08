@@ -227,3 +227,16 @@ top of it.
   So on aarch64 every process reaching a site died at its first one, trace boot or not. FIXED in the kernel
   (`arch/aarch64/gic.rs`, `arm_local_timer`, run by every core): EL0VCTEN set, the physical count and every timer
   register left EL1's. riscv64 already lets U-mode read `time` (`scounteren`); x86_64's `rdtsc` needs nothing.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0189 (2026-10-08T03:25:49Z):
+
+Read the complete plan, existing implementation record, collector, gate and cold scenario runner. Existing ordinary x86_64 evidence also includes the successful 2026-10-03 gate (675 s), but there are no completed port account artifacts and no final same-tree optimized comparison. The port branch already runs the specified scenario; unlike x86_64 it does not preserve the boot conditions and staged-artifact identities. Final measurement remains deferred until all implementation work is stable.
+
+Status: continuation in progress; no unrun checks are claimed.
+
+### Collector check and final measurement preparation
+
+- PASSED: `python3 src/tools/check-frame-account-collector.py` (13 tests, 0.016 s).
+- No harness source change is needed to capture the remaining measurement conditions: the cold runner retains its ESP and staged kernel, and the live QEMU command identifies its private files. The final run will retain these identities, the manifest-selected per-layer artifacts and the runner log beside each port account. Ports use `virtio-gpu-pci` under TCG, not x86_64's `virtio-vga` under KVM; their clock names will be stated explicitly.
+- Required final runs are the ordinary and optimized x86_64 gate on the final tree, followed by the port gate's scaled run on aarch64 and riscv64. No new guest run has been performed yet.

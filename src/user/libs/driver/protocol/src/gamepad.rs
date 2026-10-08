@@ -329,12 +329,16 @@ impl<const N: usize> Publisher<N> {
 	}
 
 	/// A new gamepad, holding its initial state; its handle, or `None` when the table is full or the
-	/// shape is not a gamepad's. HANDLES ARE NEVER REUSED, so a gamepad unplugged and plugged back is a new
+	/// lifetime handle space is exhausted. HANDLES ARE NEVER REUSED, so a gamepad unplugged and plugged back is a new
 	/// one to its consumer.
 	pub fn attach(&mut self, shape: Shape) -> Option<u32> {
+		if self.next_handle == 0 {
+			return None;
+		}
 		let slot = self.pads.iter().position(Option::is_none)?;
 		let handle = self.next_handle;
-		self.next_handle = self.next_handle.wrapping_add(1).max(1);
+		// Zero marks exhaustion after the last handle; detaching or reconnecting cannot reuse one.
+		self.next_handle = self.next_handle.checked_add(1).unwrap_or(0);
 		self.pads[slot] = Some(Pad { handle, shape, current: shape.initial(), unsent: false, known: false, departed: false });
 		if self.connected {
 			self.owe(slot, Owed::Arrival);

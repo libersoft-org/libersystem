@@ -1166,9 +1166,10 @@ impl Service {
 
 	// THE EMBEDDED CONTROLLER'S EVENTS: every query drained, bounded, and its `_Qxx` run in the controller's scope.
 	fn ec_queries(&mut self) {
-		let Some(ec) = self.host.ec.as_mut() else { return };
-		let drained = ec.drain();
 		let Some(scope) = self.ec_node else { return };
+		// QUERY uses the same command/data ports as a region transaction. Firmware may use them from SMM, so
+		// `_GLK` covers the drain too; release it before evaluating `_Qxx`, which may access an EC field itself.
+		let drained = self.host.ec_access(|ec| ec.drain());
 		match drained {
 			Ok((queries, flooded)) => {
 				if flooded {

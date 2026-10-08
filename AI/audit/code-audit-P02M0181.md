@@ -749,3 +749,10 @@ The milestone's own text keeps no suspend or platform policy. It stays open only
   The boot's length is not this milestone's; it is said here because it is what the budget was paying for.
 - (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole, the probes and the fixed class among
   them; `power-service`, `power-ups` and `acpi` pass on x86_64. Status: COMPLETE.
+
+
+# IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0181 (2026-10-08T03:26:07Z):
+
+Read the complete plan and traced normalization, provider streams, bounded subscriptions, control replies, and prior integration evidence. Found a real missing failure transition: a provider may explicitly return ControlOutcome::Indeterminate (the HID UPS driver does so), but PowerService currently treats every decoded reply as a definite completion and admits another control before querying fresh state. Implementing and verifying that reconciliation path; the previous completion label alone is insufficient.
+
+Verification in this continuation: not yet run. Final results and remaining work will be appended below.

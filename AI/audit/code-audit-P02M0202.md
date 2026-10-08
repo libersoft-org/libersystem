@@ -287,3 +287,38 @@ booted); the three cross-builds; a hardware run.
 - `typec-tcpci` -> PASS: the suspend refused with a contract standing and the connector named, a charger attached during
   a sleep finding the sink path off and contracted after it, and every earlier case.
 - (2026-10-01) `./build.sh --arch aarch64` and `--arch riscv64` build whole with this milestone's code; the ports' guest runs it names are the owner's long run.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0202 (2026-10-08T03:26:12Z):
+
+Continuation review (2026-10-08). Read the complete milestone plan, the previous implementation record, docs/TESTING.md and docs/ARCHITECTURES.md. Existing implementation and past results are being checked against the current tree; prior records are preserved verbatim. No new guest execution or hardware verification has passed in this continuation yet.
+
+Actual continuation change: `src/user/libs/driver/usb-pd/src/pdo.rs`, `select`, now requires a Fixed 5 V PDO at
+position 1 before using the capability-mismatch fallback. The previous pattern accepted any Fixed voltage if a
+sink PDO admitted it. Added `a_capability_mismatch_falls_back_only_to_a_fixed_5v_first_offer` in the existing host
+suite: a 15 V first offer is refused despite being board-supported; an empty list is refused; a valid 5 V fallback
+retains the sink current bound and mismatch bit. The targeted test was run on the old implementation first and
+FAILED (15 V was selected); after the fix the complete suite PASSED, 26 tests.
+
+Reviewed the production `tcpci_driver`/`typec_tcpci` and `ucsi_acpi`/`typec_ucsi` paths, TypeCService's records and
+request handling, the independent TCPC partner fixture, sleep exchange and the gate's port timer scaling. The
+existing aarch64 guest attempt's logs show termination by the old runner before kernel boot, not a TCPCI verdict.
+The plan header is corrected to reflect the confirmed owner policy and completed sleep/cross-build work; the
+required emulated-port and hardware criteria remain open.
+
+Resolved the old register-bit uncertainty from a primary source: USB-IF TCPCI revision 2.0 version 1.0, Table 4-28,
+pages 64–65, https://www.usb.org/sites/default/files/documents/usb-port_controller_specification_rev2.0_v1.0_0.pdf .
+It agrees with the existing `CAPABILITY_SINK_VBUS` bit 2 and `CAPABILITY_VBUS_MEASUREMENT` bit 10. No constants changed
+and this is not hardware verification.
+
+Fresh checks passed so far:
+- `cargo test --offline --manifest-path src/user/libs/driver/usb-pd/Cargo.toml`: 26 passed after the fix.
+- `cargo test --offline --manifest-path src/user/libs/driver/ucsi/Cargo.toml`: 14 passed.
+- `cargo test --offline --manifest-path src/user/services/logic/Cargo.toml typec_requests`: 5 passed.
+- `python3 src/harness/vhost-i2c-gpio.py --self-test`: 18 passed, including the independent TCPC partner.
+- `python3 src/harness/ucsi-ppm.py --self-test`: every answer checked.
+
+Still unperformed in this continuation: guest TCPCI runs (including both device-tree ports), fresh cross-builds and
+the real UCSI laptop/port-controller run. Hardware remains externally blocked until an owner-provided board is
+available; the fixtures do not discharge that criterion. Long guest runs are deferred until the coordinated end
+of the whole job, as requested.

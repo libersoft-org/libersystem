@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 172] = [
+const GATES: [(&str, &str); 176] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -375,6 +375,8 @@ const GATES: [(&str, &str); 172] = [
 	// A port controller's Power Delivery sink on a development guest: the `tcpci` driver and its engine against the
 	// backend's controller and source partner - a userspace change selects it - and it boots a guest.
 	("typec-tcpci", "userspace.build"),
+	("typec-tcpci-aarch64", "userspace.build"),
+	("typec-tcpci-riscv64", "userspace.build"),
 	// SMARTCARDSERVICE, against the in-guest smart-card fixture: reader-scoped grants, the PIV allowlist, the
 	// pinpad policy, transactions, removal and recovery, events and a restart, with the authentication
 	// signature verified by OpenSSL on the host. Its subject is the service, its pure leaves, the protocol,
@@ -465,6 +467,8 @@ const GATES: [(&str, &str); 172] = [
 	// SSDT, the kernel's publication and policy, DeviceManager's node channels and grants and the fixture driver's
 	// probes. Its subject is the kernel mechanism and the services and drivers above it.
 	("acpi", "kernel"),
+	("firmware-tree-aarch64", "kernel"),
+	("firmware-tree-riscv64", "kernel"),
 	// SLEEP AND RESUME, on development instances of its own with S3 offered: the kernel's entry, freeze and clocks, the
 	// transaction through the drivers and the services, the platform's half through the ACPI service and the fixture
 	// SSDT's devices - with QEMU's run state and the host's stamps as the oracles. Its subject is the kernel mechanism
@@ -926,7 +930,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 73] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 77] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
@@ -968,6 +972,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 73] = [
 	"typec-ucsi",
 	// And the port controller's, one development instance.
 	"typec-tcpci",
+	"typec-tcpci-aarch64",
+	"typec-tcpci-riscv64",
 	// And the COM1 handoff's, on a development instance of its own.
 	"serial-handoff",
 	// And the system volume's controllers, two boots each, a decoy and a refusal.
@@ -976,6 +982,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 73] = [
 	"watchdog",
 	// And the firmware namespace's, which boots two.
 	"acpi",
+	"firmware-tree-aarch64",
+	"firmware-tree-riscv64",
 	// And the sleep's and hibernation's, which boot several in turn.
 	"sleep",
 	"hibernate",

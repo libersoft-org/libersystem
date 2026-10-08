@@ -288,3 +288,22 @@ fn no_refusal_closes_anything_and_handles_are_never_reused() {
 	assert_eq!(publisher.attach(harness_shape(b"third")), None, "and the table holds what it was sized for");
 	assert_ne!(other, again);
 }
+
+#[test]
+fn exhausting_handles_never_reuses_a_departed_gamepads_identity() {
+	let mut publisher = Publisher::<2>::new();
+	let shape = harness_shape(b"pad");
+	let first = publisher.attach(shape).expect("the first handle");
+	assert_eq!(first, 1);
+	assert!(publisher.detach(first));
+	publisher.next_handle = u32::MAX;
+	let last = publisher.attach(shape).expect("the last handle is still usable");
+	assert_eq!(last, u32::MAX);
+	assert_eq!(publisher.attach(shape), None, "free slots cannot restart the lifetime counter");
+	assert!(publisher.detach(last));
+	publisher.disconnected();
+	publisher.connected();
+	assert_eq!(publisher.attach(shape), None, "neither detach nor reconnect permits an old identity");
+	assert!(publisher.is_empty());
+	assert!(!publisher.owes(), "refused attachments publish no frames");
+}

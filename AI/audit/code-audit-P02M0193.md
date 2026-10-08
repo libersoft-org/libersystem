@@ -57,3 +57,19 @@ NOT PERFORMED (and why):
 - `./check.sh --gate source-hygiene`: FAILS on seven harness Python files with a shebang and mode 644 (`src/harness/midi-source.py`, `mtp-root.py`, `printer-sink.py`, `ups-sim.py`, `usb_ffs.py`, `usb_gadgetfs.py`, `usbredir_device.py`) - none touched by this work, the same failure recorded before it; nothing in the files this milestone changed is reported.
 
 Status at the end of this pass: every item of the plan is done except the guest test on aarch64 and riscv64, which runs at the end of the job.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0193 (2026-10-08T03:25:49Z):
+
+Read the complete plan and prior implementation record and reviewed Workers, per-lane storage, prepare/render ownership and the demo integration. The existing completed status is supported by recovered port guest logs: .build/logs/test/aarch64-20261006T200719Z-3238893-guest.log and .build/logs/test/riscv64-20261006T211836Z-3322832-guest.log both contain the required six-frame, four-lane, sixteen-unit serial comparison. Reviewing final verdicts and targeted host coverage before reconciling the record.
+
+Status: continuation in progress; no unrun checks are claimed.
+
+### Recovered final verification and current review
+
+- The existing port runs contain explicit `[ok]` verdicts for `kernel.services.the_2d_demo_draws_the_same_frames_through_its_workers`: aarch64 in `.build/logs/test/aarch64-20261006T200719Z-3238893-guest.log` (19 s), riscv64 in `.build/logs/test/riscv64-20261006T211836Z-3322832-guest.log` (26 s). Both report `test2d-sw: compare frames=6 lanes=4 units=16 matched the serial walk`, normal demo completion, and whole-suite completion (514 and 517 passed respectively). These are recovered prior results, not new executions. They substantiate the plan's existing 2026-10-07 completion note and close the earlier record's outstanding port item.
+- Reviewed the current `Workers`/`Serial` contract and `Lane` storage (`workers.rs`), prepare-time glyph ownership and scratch ceiling ordering, all three unit layouts and `render`/`verdict` (`backend.rs`), the real-thread, reordered, duplicate-unit, early-return, cancellation, ceiling and allocation fixtures (`tests.rs`), and the demo's worker count and serial comparison. No missing implementation requirement was found.
+- New targeted check: `cd src && cargo test --manifest-path user/libs/graphics/soft2d/Cargo.toml --target x86_64-unknown-linux-gnu a_warmed_frame_asks_the_allocator_for_nothing` passed (1 test, 4.90 s). This exercises the warmed third replay after the later filter changes, with zero allocation and identical frame bytes through Serial and four lanes, for every unit layout.
+- The complete soft2d suite, scaling benchmark and guest suites were not repeated during this review; their prior evidence is retained above. No renderer source changed in this continuation.
+
+Status: COMPLETE; no remaining implementation or required-verification item for this milestone.

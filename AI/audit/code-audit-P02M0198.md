@@ -633,3 +633,24 @@ VERIFICATION:
 - The development builds of all three (with the rt change's audit relink): RESULT ok.
 
 BLOCKERS: none. Open in this milestone: the owner's three-target kernel run.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0198 (2026-10-08T03:26:12Z):
+
+Continuation review (2026-10-08). Read the complete milestone plan, the previous implementation record, docs/TESTING.md and docs/ARCHITECTURES.md. Existing implementation and past results are being checked against the current tree; prior records are preserved verbatim. No new guest execution or hardware verification has passed in this continuation yet.
+
+Current-tree review found the completed structure recorded by the previous implementer: `tickclock::Clock` supplies
+the computed ABI tick and the shared suspend offset; `kernel/idle` owns masked final-check/one-shot halts and their
+wakes; `kernel/processor` installs tables, accounts states and bounds the governors; `processor_power_service` and
+`processor_policy` hold the confirmed profiles and thermal actions. The latest plan records the three complete
+kernel suites and the alternate x86 timer run on 2026-10-06/07, later than the old audit's last open-run note. Those
+are historical recorded results, not tests rerun in this continuation. No required implementation change was found
+in this review; status stays COMPLETE.
+
+Fresh targeted verification (all exited 0):
+- `cargo test --offline --manifest-path src/tickclock/Cargo.toml`: 9 passed.
+- `cargo test --offline --manifest-path src/procpower/Cargo.toml`: 23 passed.
+- `cargo test --offline --manifest-path src/user/services/logic/Cargo.toml processor_policy`: 10 passed.
+
+Not rerun here: the full kernel suites, guest processor-power and tickless-idle gates, or hardware qualification.
+There is no new change to the clock or kernel governors requiring another full sweep in this continuation.

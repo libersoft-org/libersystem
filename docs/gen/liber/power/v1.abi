@@ -49,6 +49,7 @@ method power-fixture.commands op=5 () -> result<list<fixture-command>, liber:bas
 method power-fixture.withhold op=6 (commands:u32:rights=,queries:u32:rights=) -> result<unit, liber:base@1::error>
 method power-fixture.offer-extra op=7 () -> result<unit, liber:base@1::error>
 method power-fixture.outlets op=8 () -> result<list<bool>, liber:base@1::error>
+method power-fixture.indeterminate op=9 () -> result<unit, liber:base@1::error>
 record active-trip(level:u8,temperature:u32,devices:list<string>:bound=8)
 record zone-cooling(zone:string:bound=64,passive:option<u32>,critical:option<u32>,hot:option<u32>,tc1:u32,tc2:u32,tsp:u32,passive-processors:list<string>:bound=64,active:list<active-trip>:bound=10,scp:bool)
 record zone-reading(temperature:u32,sequence:u32)
