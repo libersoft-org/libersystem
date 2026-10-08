@@ -146,6 +146,8 @@ struct Publication {
 	seq: u32,
 	locals: u16,
 	revision: u64,
+	defer_updates: bool,
+	withheld_updates: u32,
 }
 
 struct Fixture {
@@ -349,6 +351,12 @@ impl power_fixture::Service for ControlView<'_> {
 		Ok(())
 	}
 
+	fn defer_updates(&mut self, publication: u8, enabled: bool) -> Result<u32, Error> {
+		let Some(held) = self.fixture.publications.get_mut(publication as usize) else { return Err(Error::NotFound) };
+		held.defer_updates = enabled;
+		Ok(held.withheld_updates)
+	}
+
 	fn offer_extra(&mut self) -> Result<(), Error> {
 		let token = self.fixture.next_token;
 		self.fixture.next_token = token + 1;
@@ -391,6 +399,12 @@ fn serve(fixture: &mut Fixture, serving: &mut common::Serving, bootstrap: u64, b
 	if op == power_provider::OP_UPDATES {
 		let mut view = ProviderView { fixture: &mut *fixture, which, withheld: false };
 		let Some((corr, items)) = power_provider::updates_open(&mut view, &buf[..len], &mut handles) else { return true };
+		let publication = &mut fixture.publications[which as usize];
+		if publication.defer_updates {
+			publication.withheld_updates = publication.withheld_updates.saturating_add(1);
+			print(b"power-fixture: an update-stream reply is withheld\n");
+			return true;
+		}
 		let Some((producer, consumer)) = channel_with_depth(STREAM_DEPTH) else { return true };
 		let publication = &mut fixture.publications[which as usize];
 		if publication.stream != 0 {
@@ -432,8 +446,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut fixture = Fixture {
 		model: Model::new(),
 		publications: [
-			Publication { token: 0, live: true, stream: 0, seq: 0, locals: 0b1, revision: 1 },
-			Publication { token: 1, live: true, stream: 0, seq: 0, locals: 0b111, revision: 1 },
+			Publication { token: 0, live: true, stream: 0, seq: 0, locals: 0b1, revision: 1, defer_updates: false, withheld_updates: 0 },
+			Publication { token: 1, live: true, stream: 0, seq: 0, locals: 0b111, revision: 1, defer_updates: false, withheld_updates: 0 },
 		],
 		commands: Vec::new(),
 		withhold_commands: 0,

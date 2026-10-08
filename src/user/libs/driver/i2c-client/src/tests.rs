@@ -147,6 +147,31 @@ fn bus(functionality: I2cFunctionality) -> Result<ScopedBus<Loopback>, Refusal> 
 }
 
 #[test]
+fn smbus_passes_one_absolute_deadline_to_each_block_and_can_start_a_later_transaction() {
+	struct Recording {
+		inner: Loopback,
+		deadlines: Vec<u64>,
+	}
+	impl Transport for Recording {
+		fn call(&mut self, request: &[u8], handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
+			self.deadlines.push(deadline);
+			self.inner.call(request, handles, reply_handles, deadline)
+		}
+		fn discard_handles(&mut self, handles: &[u64]) {
+			self.inner.discard_handles(handles);
+		}
+	}
+	let transport = Recording { inner: Loopback { model: Model::new(smbus_only()), calls: 0 }, deadlines: Vec::new() };
+	let mut smbus = Smbus::new(Client::with_deadline(transport, 400), smbus_only()).unwrap();
+	smbus.set_deadline(500);
+	smbus.block_write(2, &[0x18, 1]).unwrap();
+	assert_eq!(smbus.block_read(3).unwrap(), b"BLOCK");
+	smbus.set_deadline(900);
+	smbus.block_write(2, &[0x18, 1]).unwrap();
+	assert_eq!(smbus.into_client().into_transport().deadlines, [400, 400, 500, 500, 900], "negotiation and every block use their caller's absolute deadline");
+}
+
+#[test]
 fn the_bus_trait_reaches_the_connections_own_address_and_reads_what_was_written() {
 	let mut bus = bus(virtio_like()).expect("a controller serving plain I2C is taken");
 	assert_eq!(bus.address(), 0x2C, "the address is the connection's, asked of the controller");

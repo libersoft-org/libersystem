@@ -1,5 +1,5 @@
 format=liber-dynamic-image-report-v1
 target	tools	object_bytes	pie_bytes	unique_provider_bytes	staged_bytes	private_bytes	shared_bytes	test_command
-x86_64-unknown-none	92	2436928	1870520	9535120	11405640	5574656	10125312	./check.sh --gate dynamic-report
-aarch64-unknown-none	92	2617384	1977688	10382608	12360296	8261632	10407936	./check.sh --gate dynamic-report
-riscv64gc-unknown-none-elf	92	2779368	2268880	10386664	12655544	7528448	8613888	./check.sh --gate dynamic-report
+x86_64-unknown-none	92	2436928	1870520	9537160	11407680	5570560	10129408	./check.sh --gate dynamic-report
+aarch64-unknown-none	92	2617384	1977688	10385248	12362936	8261632	10412032	./check.sh --gate dynamic-report
+riscv64gc-unknown-none-elf	92	2779368	2268880	10388592	12657472	7528448	8613888	./check.sh --gate dynamic-report

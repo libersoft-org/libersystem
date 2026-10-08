@@ -323,8 +323,8 @@ def frame_terms(start, present_end, app, service, driver, app_sites, svc_sites, 
 		running, blocked, runnable = timelines[thread].split(t0, t1)
 		terms.append({"name": name, "layer": layer, "ms": (t1 - t0) * ns / 1e6, "work_ms": running * ns / 1e6, "blocked_ms": blocked * ns / 1e6, "runnable_ms": runnable * ns / 1e6})
 
-	# THE PACING WAIT, with its parks named: the fallback interval the loop asked for, and what the
-	# tick unit rounded it to beyond that.
+	# THE PACING WAIT: actual time inside finite parks before their requested deadline, and time
+	# beyond it (including tick and scheduling delay). Work between parks stays in the loop term.
 	parks = park_breakdown(window, start, acquire_begin["cycles"], ns)
 	term("application: pacing wait and frame-loop step", start, acquire_begin["cycles"], app, "application")
 	terms[-1].update(parks)
@@ -388,12 +388,16 @@ def first_label(sites, label):
 
 
 def park_breakdown(window, t0, t1, ns):
-	"""Every park between the frame's start and its acquire: what it asked for and what it got."""
+	"""Actual time inside finite parks before their requested deadline, and the excess beyond it.
+
+	An early tick or message can end a park before the same pacing deadline. The next park
+	asks for the remaining time, not a new policy delay. Count only time actually waited;
+	work between parks stays in the surrounding frame-loop term. A supplied pair is clipped
+	to this frame's window without moving its original deadline.
+	"""
 	parks = []
 	pending = {}
 	for site in window:
-		if not (t0 <= site["cycles"] <= t1):
-			continue
 		if site["label"] == "park-ns":
 			pending = {"asked_ms": site["value"] / 1e6, "begin": site["cycles"]}
 		elif site["label"] == "park-tk":
@@ -401,11 +405,21 @@ def park_breakdown(window, t0, t1, ns):
 		elif site["label"] == "park-end" and "begin" in pending:
 			value = site["value"]
 			woke = value if value < (1 << 63) else value - (1 << 64)
-			parks.append({"asked_ms": pending["asked_ms"], "ticks": pending.get("ticks", 0), "waited_ms": (site["cycles"] - pending["begin"]) * ns / 1e6, "ended_on": "message" if woke >= 0 else "deadline"})
+			if woke < 0 and woke != -11:  # abi::ERR_TIMED_OUT; another wait error is not a deadline.
+				raise AccountError(f"a pacing park failed with wait error {woke}")
+			begin = max(t0, pending["begin"])
+			end = min(t1, site["cycles"])
+			if end >= begin:
+				asked = max(0.0, pending["asked_ms"] - (begin - pending["begin"]) * ns / 1e6)
+				ticks = pending.get("ticks", 0)
+				# A message with no recorded finite deadline stays in the surrounding loop term.
+				# A timeout still identifies a finite deadline whose relative tick count expired.
+				bounded = ticks != 0 or pending["asked_ms"] != 0 or woke == -11
+				parks.append({"asked_ms": asked, "ticks": ticks, "waited_ms": (end - begin) * ns / 1e6, "ended_on": "message" if woke >= 0 else "deadline", "bounded": bounded})
 			pending = {}
-	deadline_parks = [park for park in parks if park["ended_on"] == "deadline"]
-	fallback_ms = sum(park["asked_ms"] for park in deadline_parks)
-	rounding_ms = sum(park["waited_ms"] - park["asked_ms"] for park in deadline_parks)
+	bounded_parks = [park for park in parks if park["bounded"]]
+	fallback_ms = sum(min(park["asked_ms"], park["waited_ms"]) for park in bounded_parks)
+	rounding_ms = sum(max(park["waited_ms"] - park["asked_ms"], 0.0) for park in bounded_parks)
 	return {"parks": parks, "fallback_interval_ms": fallback_ms, "tick_rounding_ms": rounding_ms}
 
 
@@ -605,7 +619,7 @@ def render(result):
 		lines.append(f"    {'term':<60} {'ms':>9} {'work':>9} {'blocked':>9} {'runnable':>9}")
 		for term in summary["terms"]:
 			lines.append(f"    {term['name']:<60} {term['ms']:9.3f} {term['work_ms']:9.3f} {term['blocked_ms']:9.3f} {term['runnable_ms']:9.3f}")
-		lines.append(f"    pacing: fallback interval {summary['fallback_interval_ms']:.3f} ms, tick rounding {summary['tick_rounding_ms']:.3f} ms, {summary['parks_per_frame']:.2f} parks per frame")
+		lines.append(f"    pacing parks: within requested deadline {summary['fallback_interval_ms']:.3f} ms, beyond deadline (tick/scheduling) {summary['tick_rounding_ms']:.3f} ms, {summary['parks_per_frame']:.2f} parks per frame")
 		device = summary["device"]
 		lines.append(f"    device: {device['commands']:.2f} commands, device time {device['device_ms']:.3f} ms, spin on CPU {device['spin_work_ms']:.3f} ms, {device['polls']:.0f} polls, {device['yields']:.2f} yields per frame")
 		lines.append(f"    pixels: {summary['source_pixels']:.0f} source, {summary['output_pixels']:.0f} output per frame; {summary['direct']} direct, {summary['scaled']} scaled; scanout {summary['scanout'] >> 32}x{summary['scanout'] & 0xFFFFFFFF}")

@@ -41,9 +41,10 @@ pub enum BusError {
 
 /// The two SMBus transactions SSIF is spoken over, on one address, with the clock the deadline is measured against.
 pub trait Smbus {
-	fn block_write(&mut self, command: u8, data: &[u8]) -> Result<(), BusError>;
+	/// Both operations use the transaction's absolute deadline, including any wait on the bus controller.
+	fn block_write(&mut self, command: u8, data: &[u8], deadline_ms: u64) -> Result<(), BusError>;
 	/// The block the device sent: its bytes, after the count it sent first.
-	fn block_read(&mut self, command: u8) -> Result<Vec<u8>, BusError>;
+	fn block_read(&mut self, command: u8, deadline_ms: u64) -> Result<Vec<u8>, BusError>;
 	fn now_ms(&mut self) -> u64;
 	fn pause(&mut self);
 }
@@ -111,14 +112,14 @@ impl Ssif {
 		if bytes.len() > self.capabilities.input.max(BLOCK as u8) as usize || bytes.len() > crate::MAX_REQUEST {
 			return Err(Failure::RequestTooLong);
 		}
-		self.write(bus, &bytes)?;
+		self.write(bus, &bytes, deadline_ms)?;
 		let read = self.read(bus, deadline_ms)?;
 		response(request, &read)
 	}
 
-	fn write<B: Smbus + ?Sized>(&self, bus: &mut B, bytes: &[u8]) -> Result<(), Failure> {
+	fn write<B: Smbus + ?Sized>(&self, bus: &mut B, bytes: &[u8], deadline_ms: u64) -> Result<(), Failure> {
 		if bytes.len() <= BLOCK {
-			return bus.block_write(WRITE_SINGLE, bytes).map_err(|_| Failure::Bus);
+			return write_block(bus, WRITE_SINGLE, bytes, deadline_ms);
 		}
 		if self.capabilities.parts == Parts::Single {
 			return Err(Failure::RequestTooLong);
@@ -136,7 +137,7 @@ impl Ssif {
 			} else {
 				return Err(Failure::RequestTooLong);
 			};
-			bus.block_write(command, chunk).map_err(|_| Failure::Bus)?;
+			write_block(bus, command, chunk, deadline_ms)?;
 			first = false;
 		}
 		Ok(())
@@ -185,11 +186,25 @@ impl Ssif {
 	}
 }
 
+fn check_deadline<B: Smbus + ?Sized>(bus: &mut B, deadline_ms: u64) -> Result<(), Failure> {
+	if bus.now_ms() >= deadline_ms { Err(Failure::Deadline) } else { Ok(()) }
+}
+
+fn write_block<B: Smbus + ?Sized>(bus: &mut B, command: u8, bytes: &[u8], deadline_ms: u64) -> Result<(), Failure> {
+	check_deadline(bus, deadline_ms)?;
+	let result = bus.block_write(command, bytes, deadline_ms);
+	check_deadline(bus, deadline_ms)?;
+	result.map_err(|_| Failure::Bus)
+}
+
 // ONE BLOCK READ, retried while the BMC NACKs it, pausing, within the deadline and the retry bound.
 fn read_block<B: Smbus + ?Sized>(bus: &mut B, command: u8, deadline_ms: u64) -> Result<Vec<u8>, Failure> {
 	let mut nacks = 0u32;
 	loop {
-		match bus.block_read(command) {
+		check_deadline(bus, deadline_ms)?;
+		let result = bus.block_read(command, deadline_ms);
+		check_deadline(bus, deadline_ms)?;
+		match result {
 			Ok(block) => {
 				if block.is_empty() || block.len() > BLOCK {
 					return Err(Failure::Protocol("an SMBus block count of zero or past 32"));
@@ -200,9 +215,6 @@ fn read_block<B: Smbus + ?Sized>(bus: &mut B, command: u8, deadline_ms: u64) -> 
 				nacks += 1;
 				if nacks >= NACK_RETRIES {
 					return Err(Failure::Protocol("the BMC NACKed its response past the retry bound"));
-				}
-				if bus.now_ms() >= deadline_ms {
-					return Err(Failure::Deadline);
 				}
 				bus.pause();
 			}

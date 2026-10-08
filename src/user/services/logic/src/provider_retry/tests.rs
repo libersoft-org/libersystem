@@ -48,3 +48,17 @@ fn several_due_at_once_all_come_out() {
 	assert_eq!(due, [0, 1, 2, 3]);
 	assert_eq!(retry.next_deadline(), None);
 }
+
+#[test]
+fn a_full_opening_set_leaves_other_due_retries_queued_without_spending_attempts() {
+	let mut retry = ProviderRetry::new(100);
+	retry.failed(1, 0, 0);
+	retry.failed(2, 1, 0);
+	assert!(retry.due_one(99).is_none());
+	assert_eq!(retry.due_one(200), Some((1, 1)));
+	assert_eq!(retry.next_deadline(), Some(200));
+	assert!(retry.contains(|item| *item == 2));
+	// The second waits for the shared opening capacity, retaining the same due time and retry count.
+	assert_eq!(retry.due_one(450), Some((2, 2)));
+	assert!(retry.is_empty());
+}

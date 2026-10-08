@@ -73,3 +73,7 @@ Status: continuation in progress; no unrun checks are claimed.
 - The complete soft2d suite, scaling benchmark and guest suites were not repeated during this review; their prior evidence is retained above. No renderer source changed in this continuation.
 
 Status: COMPLETE; no remaining implementation or required-verification item for this milestone.
+
+Additional targeted continuation check: `cd src && cargo test --manifest-path user/libs/graphics/soft2d/Cargo.toml --target x86_64-unknown-linux-gnu a_cancelled_frame_leaves_every_unit_whole_or_untouched` passed (1 test, 0.63 s), confirming each cancelled unit remains wholly rendered or untouched. No source change or additional incomplete item resulted.
+
+Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.

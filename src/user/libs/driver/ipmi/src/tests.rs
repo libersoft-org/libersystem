@@ -464,11 +464,14 @@ struct Ssif {
 	oversize: bool,
 	// Hostile: NACK for ever.
 	silent: bool,
+	// Time spent by successful SMBus blocks, independently of the BMC's NACK retries.
+	write_ms: u64,
+	read_ms: u64,
 }
 
 impl Ssif {
 	fn new(answer: impl FnMut(&[u8]) -> Vec<u8> + 'static) -> Ssif {
-		Ssif { inmsg: Vec::new(), outmsg: Vec::new(), block: 0, nacks: 0, clock: 0, answer: Box::new(answer), writes: Vec::new(), skip: false, oversize: false, silent: false }
+		Ssif { inmsg: Vec::new(), outmsg: Vec::new(), block: 0, nacks: 0, clock: 0, answer: Box::new(answer), writes: Vec::new(), skip: false, oversize: false, silent: false, write_ms: 0, read_ms: 0 }
 	}
 
 	fn load(&self, block: u32) -> Option<Vec<u8>> {
@@ -502,7 +505,8 @@ impl Ssif {
 }
 
 impl ssif::Smbus for Ssif {
-	fn block_write(&mut self, command: u8, data: &[u8]) -> Result<(), ssif::BusError> {
+	fn block_write(&mut self, command: u8, data: &[u8], _deadline_ms: u64) -> Result<(), ssif::BusError> {
+		self.clock += self.write_ms;
 		self.writes.push((command, data.len()));
 		match command {
 			ssif::WRITE_SINGLE | ssif::WRITE_START => self.inmsg = data.to_vec(),
@@ -517,11 +521,12 @@ impl ssif::Smbus for Ssif {
 		Ok(())
 	}
 
-	fn block_read(&mut self, command: u8) -> Result<Vec<u8>, ssif::BusError> {
+	fn block_read(&mut self, command: u8, _deadline_ms: u64) -> Result<Vec<u8>, ssif::BusError> {
 		if self.silent || self.nacks > 0 {
 			self.nacks = self.nacks.saturating_sub(1);
 			return Err(ssif::BusError::Nack);
 		}
+		self.clock += self.read_ms;
 		self.block = match command {
 			ssif::READ_SINGLE => 0,
 			ssif::READ_MIDDLE => self.block + 1,
@@ -588,6 +593,39 @@ fn an_ssif_response_out_of_order_past_32_or_nacked_past_the_bound_is_refused() {
 	// A BMC THAT TAKES ONE PART is never sent two.
 	let single = ssif::Ssif::default();
 	assert_eq!(single.transact(&mut Ssif::new(long), &Request::new(netfn::APP, 1, &[0; 40]), TRANSACTION_MS), Err(Failure::RequestTooLong));
+}
+
+#[test]
+fn ssif_successful_blocks_share_the_transactions_deadline() {
+	let echo = |request: &[u8]| {
+		let mut out = vec![request[0] | 4, request[1], 0];
+		out.extend_from_slice(&request[2..]);
+		out
+	};
+	let interface = ssif::Ssif { capabilities: ssif::Capabilities { parts: ssif::Parts::Middle, pec: false, version: 0, input: 0xFF, output: 0xFF } };
+	let short = device_id_request();
+	let long = Request::new(netfn::APP, 1, &[0; 100]);
+	let mut expired = Ssif::new(echo);
+	assert_eq!(interface.transact(&mut expired, &short, 0), Err(Failure::Deadline));
+	assert!(expired.writes.is_empty(), "a transaction already past its deadline touches no register");
+	for request in [&short, &long] {
+		let mut write = Ssif::new(echo);
+		write.write_ms = TRANSACTION_MS;
+		assert_eq!(interface.transact(&mut write, request, TRANSACTION_MS), Err(Failure::Deadline));
+		assert_eq!(write.writes.len(), 1, "a late block never starts the next write or read");
+		assert_eq!(write.nacks, if request == &short { 3 } else { 0 }, "no response read was attempted");
+		let mut read = Ssif::new(echo);
+		read.read_ms = TRANSACTION_MS;
+		assert_eq!(interface.transact(&mut read, request, TRANSACTION_MS), Err(Failure::Deadline), "a late successful response is not an answer within the deadline");
+	}
+	let mut writes = Ssif::new(echo);
+	writes.write_ms = 1_700;
+	assert_eq!(interface.transact(&mut writes, &long, TRANSACTION_MS), Err(Failure::Deadline));
+	assert_eq!(writes.writes.len(), 3, "the deadline is shared across the multipart request");
+	let mut reads = Ssif::new(echo);
+	reads.read_ms = 2_000;
+	assert_eq!(interface.transact(&mut reads, &long, TRANSACTION_MS), Err(Failure::Deadline));
+	assert_eq!(reads.block, 2, "the fourth response block must not start after the first three consume the deadline");
 }
 
 // ------------------------------------------------------------------ the message layer

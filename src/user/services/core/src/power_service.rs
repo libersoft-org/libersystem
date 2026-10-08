@@ -30,9 +30,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{ChangeKind, ControlOutcome, Error, PowerChange, ProviderCommand, ProviderCommandKind, ProviderInfo, ProviderKind, ProviderUpdateKind, SourceId, SourceSnapshot, SourceState, power, power_control, power_provider, provider_catalogue};
+use proto::system::{ChangeKind, ControlOutcome, Error, PowerChange, ProviderCommand, ProviderCommandKind, ProviderInfo, ProviderKind, ProviderUpdateKind, SourceId, SourceSnapshot, SourceState, platform_switch, power, power_control, power_provider, provider_catalogue};
 use rt::*;
 use service_logic::power_registry::{Action, Change, ControlRefusal, Controls, Dispatch, Effect, Frame, Payload, ProviderId, Publication, Registry, SourceKey, SubscriberId};
+use service_logic::provider_open::{Opens, Pending};
 use wire::Sink;
 
 include!(concat!(env!("OUT_DIR"), "/roles_power_service.rs"));
@@ -48,6 +49,9 @@ const MAX_CLIENTS: usize = 32;
 const LIVE_DEPTH: u64 = 8;
 // How long a provider has to answer the request that opens its update stream.
 const OPEN_TICKS: u64 = 100;
+// Concurrent handshakes, shared by power sources and switches. Announcements stay unread while
+// these slots are occupied; this is not a limit on the switches the policy follows.
+const MAX_OPENING: usize = 8;
 // The largest frame this service writes: one source with every trip and alarm it may carry fits in
 // well under a kilobyte.
 const FRAME_BYTES: usize = 2048;
@@ -113,6 +117,8 @@ struct Power {
 	// Published providers whose update stream did not open inside OPEN_TICKS, asked again later
 	// (`service_logic::provider_retry`).
 	unopened: service_logic::provider_retry::ProviderRetry<ProviderInfo>,
+	opening: Opens<ProviderInfo>,
+	catalogue_live: bool,
 	subscribers: Vec<Subscriber>,
 	waiting: Vec<Waiting>,
 	next_provider: u32,
@@ -235,42 +241,137 @@ impl power_control::Service for ControlView {
 // ------------------------------------------------------------------ providers
 
 impl Power {
-	// A publication arrived: open it, open its update stream, and give it SNAPSHOT_TICKS to describe
-	// itself. BEYOND THE PROVIDER LIMIT IT IS REFUSED AND SAID, never admitted by evicting another.
+	// A publication reserves its place before either request is sent. Neither stage waits here;
+	// the shared catalogue's correlation identifies which kind of provider its answer belongs to.
 	fn adopt(&mut self, catalogue: u64, info: ProviderInfo, attempts: u32) {
-		let now = clock();
-		if !self.registry.provider_room() {
-			print(b"PowerService: a power-source provider was refused: this service holds eight (resource exhausted)\n");
+		let key = publication_of(&info);
+		if !self.catalogue_live || self.opening.contains(|pending| publication_of(pending) == key) {
 			return;
 		}
-		if self.registry.provider_of(publication_of(&info)).is_some() {
-			return;
-		}
-		let Some(Ok(chan)) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) else {
-			print(b"PowerService: a published power source could not be opened\n");
+		let timeout = match info.kind {
+			ProviderKind::PowerSource => {
+				if self.registry.provider_of(key).is_some() || self.unopened.contains(|waiting| publication_of(waiting) == key) {
+					return;
+				}
+				let reserved = self.providers.len() + self.unopened.len() + self.opening.items().filter(|info| info.kind == ProviderKind::PowerSource).count();
+				if reserved >= service_logic::power_registry::MAX_PROVIDERS {
+					print(b"PowerService: a power-source provider was refused: this service holds eight (resource exhausted)\n");
+					return;
+				}
+				OPEN_TICKS
+			}
+			ProviderKind::PlatformSwitch => policy::ASK_TICKS,
+			_ => return,
+		};
+		let Some(corr) = self.opening.begin(info.clone(), attempts, clock(), timeout) else {
+			print(b"PowerService: a provider opening was refused: correlation space exhausted\n");
 			return;
 		};
-		let stream = match power_provider::Client::with_deadline(ChannelTransport { chan }, now + OPEN_TICKS).updates() {
-			Some(stream) => stream,
-			None => {
+		if !send_request(catalogue, provider_catalogue::OP_OPEN, corr, |writer| info.write(writer)) {
+			if let Some(pending) = self.opening.take_catalogue(corr) {
+				self.open_failed(pending);
+			}
+		}
+	}
+
+	fn open_failed(&mut self, pending: Pending<ProviderInfo>) {
+		if let Some(chan) = pending.channel() {
+			close(chan);
+		}
+		if pending.item.kind == ProviderKind::PowerSource {
+			match self.unopened.failed(pending.item, pending.attempts, clock()) {
+				service_logic::provider_retry::Next::At(_) if pending.attempts == 0 => print(b"PowerService: a published power source did not open - it is asked again\n"),
+				service_logic::provider_retry::Next::At(_) => {}
+				service_logic::provider_retry::Next::GivenUp => print(b"PowerService: a published power source did not open after every retry - it is not held\n"),
+			}
+		} else {
+			print(b"PowerService: sleep policy: a switch's publication or watch could not be opened\n");
+		}
+	}
+
+	fn cancel_open(&mut self, info: &ProviderInfo) {
+		let gone = publication_of(info);
+		self.unopened.withdraw(|waiting| publication_of(waiting) == gone);
+		for pending in self.opening.cancel(|waiting| publication_of(waiting) == gone) {
+			if let Some(chan) = pending.channel() {
 				close(chan);
-				// ASKED AGAIN, NOT LET GO - see TypeCService's: a provider busy at bind stays published.
-				match self.unopened.failed(info, attempts, now) {
-					service_logic::provider_retry::Next::At(_) if attempts == 0 => print(b"PowerService: a power-source provider did not open its update stream - it is asked again\n"),
-					service_logic::provider_retry::Next::At(_) => {}
-					service_logic::provider_retry::Next::GivenUp => print(b"PowerService: a power-source provider did not open its update stream after every retry - it is not held\n"),
+			}
+		}
+	}
+
+	fn opening_reply(&mut self, handle: u64, catalogue: bool, policy: &mut policy::SleepPolicy, buf: &mut [u8]) {
+		let (len, mut handles) = match try_recv_caps(handle, buf) {
+			PolledCaps::Message { len, handles } => (len, handles),
+			PolledCaps::Empty => return,
+			PolledCaps::Closed => {
+				if catalogue {
+					self.catalogue_live = false;
+					close(handle);
+					self.unopened.withdraw(|_| true);
+					for pending in self.opening.cancel(|_| true) {
+						if let Some(chan) = pending.channel() {
+							close(chan);
+						}
+					}
+					print(b"PowerService: the provider catalogue closed; pending opens cancelled\n");
+				} else if let Some(pending) = self.opening.take_channel(handle) {
+					self.open_failed(pending);
 				}
 				return;
 			}
 		};
-		let id = ProviderId(self.next_provider);
-		self.next_provider = self.next_provider.wrapping_add(1);
-		if !self.registry.add_provider(id, publication_of(&info), now) {
-			close(stream);
-			close(chan);
-			return;
+		let corr = buf[..len].get(..4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+		let pending = corr.and_then(|corr| if catalogue { self.opening.take_catalogue(corr) } else { self.opening.take_stream(handle, corr) });
+		if let Some(pending) = pending {
+			if clock() >= pending.deadline {
+				self.open_failed(pending);
+			} else if catalogue {
+				let decoded = (|| {
+					let mut reader = wire::Reader::with_handle_list(&buf[..len], &handles);
+					if reader.u32()? != pending.corr || !reader.tag()? {
+						return None;
+					}
+					let _ = reader.u32()?;
+					let chan = reader.take_handle()?;
+					reader.finish()?;
+					Some(chan)
+				})();
+				if let Some(chan) = decoded {
+					handles.clear();
+					let op = if pending.item.kind == ProviderKind::PowerSource { power_provider::OP_UPDATES } else { platform_switch::OP_WATCH };
+					let now = clock();
+					if send_request(chan, op, pending.corr, |_| Some(())) {
+						self.opening.await_stream(pending, chan, now);
+					} else {
+						close(chan);
+						self.open_failed(pending);
+					}
+				} else {
+					self.open_failed(pending);
+				}
+			} else if len == 4 && handles.len() == 1 {
+				let stream = handles.take_first();
+				if pending.item.kind == ProviderKind::PlatformSwitch {
+					policy.opened(pending.item, handle, stream);
+				} else {
+					let id = ProviderId(self.next_provider);
+					self.next_provider = self.next_provider.wrapping_add(1);
+					if self.registry.add_provider(id, publication_of(&pending.item), clock()) {
+						self.providers.push(Provider { id, chan: handle, stream, sent: Vec::new() });
+					} else {
+						close(stream);
+						close(handle);
+					}
+				}
+			} else {
+				self.open_failed(pending);
+			}
 		}
-		self.providers.push(Provider { id, chan, stream, sent: Vec::new() });
+		// A late or malformed reply owns no publication. This includes replies to withdrawn
+		// generations: their transferred capabilities must be closed, never adopted as replacements.
+		for &leftover in handles.as_slice() {
+			close(leftover);
+		}
 	}
 
 	// A provider is over - withdrawn, disconnected, or refused for what it sent. Everything it
@@ -289,8 +390,7 @@ impl Power {
 	}
 
 	fn withdraw(&mut self, info: &ProviderInfo) {
-		let gone = publication_of(info);
-		self.unopened.withdraw(|waiting| publication_of(waiting) == gone);
+		self.cancel_open(info);
 		if let Some(id) = self.registry.provider_of(publication_of(info)) {
 			self.lose(id, b"its publication was withdrawn");
 		}
@@ -507,59 +607,50 @@ impl Power {
 		let mut view = StateView { registry: &self.registry };
 		let Some((corr, _)) = power::subscribe_open(&mut view, request, handles) else { return false };
 		let mut reply = [0u8; 64];
-		let refuse = |error: Error, reply: &mut [u8]| {
-			if let Some(len) = power::subscribe_reply_err(corr, &error, reply) {
-				let _ = try_send(chan, &reply[..len], 0);
-			}
-		};
+		let refuse = |error: Error, reply: &mut [u8]| power::subscribe_reply_err(corr, &error, reply).is_some_and(|len| try_send(chan, &reply[..len], 0));
 		if !self.registry.subscriber_room() {
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		}
 		let epoch = self.registry.epoch();
 		let revision = self.registry.revision();
 		let sources = self.registry.sources();
 		let mut frames: Vec<Vec<u8>> = Vec::new();
 		if frames.try_reserve_exact(sources.len() + 1).is_err() {
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		}
 		let mut buf = [0u8; FRAME_BYTES];
 		let items = sources.iter().map(|(key, received, held)| PowerChange { epoch, revision, kind: ChangeKind::Snapshot, source: Some(snapshot_of(*key, *received, &held.0)), gone: None }).chain(core::iter::once(PowerChange { epoch, revision, kind: ChangeKind::SnapshotEnd, source: None, gone: None }));
 		for (seq, item) in items.enumerate() {
 			let mut frame_handles = wire::Handles::new();
 			let Some(len) = power::subscribe_frame(seq as u32, &item, &mut buf, &mut frame_handles) else {
-				refuse(Error::Exhausted, &mut reply);
-				return true;
+				return refuse(Error::Exhausted, &mut reply);
 			};
 			frames.push(buf[..len].to_vec());
 		}
 		let Some((producer, consumer)) = channel_with_depth(frames.len() as u64 + LIVE_DEPTH) else {
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		};
 		for frame in &frames {
 			if !try_send(producer, frame, 0) {
 				close(producer);
 				close(consumer);
-				refuse(Error::Exhausted, &mut reply);
-				return true;
+				return refuse(Error::Exhausted, &mut reply);
 			}
 		}
 		let Some(id) = self.registry.subscribe() else {
 			close(producer);
 			close(consumer);
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		};
 		match power::subscribe_reply_ok(corr, &mut reply) {
-			Some(len) if send_caps_blocking(chan, &reply[..len], &[consumer]) => {
+			Some(len) if try_send_caps(chan, &reply[..len], &[consumer]) => {
 				self.subscribers.push(Subscriber { id, chan: producer, seq: frames.len() as u32 });
 			}
 			_ => {
 				self.registry.unsubscribe(id);
 				close(producer);
 				close(consumer);
+				return false;
 			}
 		}
 		true
@@ -634,7 +725,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::PowerSource).unwrap_or(0) } else { 0 };
 	let mut epoch_bytes = [0u8; 8];
 	let epoch = if random_get(&mut epoch_bytes) == epoch_bytes.len() { u64::from_le_bytes(epoch_bytes) } else { clock() };
-	let mut service = Power { registry: Registry::new(epoch), providers: Vec::new(), unopened: service_logic::provider_retry::ProviderRetry::new(OPEN_TICKS), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
+	let mut service = Power { registry: Registry::new(epoch), providers: Vec::new(), unopened: service_logic::provider_retry::ProviderRetry::new(OPEN_TICKS), opening: Opens::new(MAX_OPENING), catalogue_live: catalogue != 0, subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
 	send_blocking(bootstrap, b"PowerService: online", 0);
 	// THE SLEEP POLICY, beside the state: it reads the lid, idleness and the sources, and asks through its own doors.
 	let mut sleep_policy = policy::SleepPolicy::new(catalogue, activity, outputs, sleep, syspower, shutdown, config);
@@ -650,25 +741,45 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waitset.push(root);
 			}
 		}
-		if subscribed {
+		let opening_room = service.opening.len() < MAX_OPENING;
+		if subscribed && opening_room {
 			waitset.push(subscription);
 		}
+		if service.catalogue_live {
+			waitset.push(catalogue);
+		}
+		waitset.extend(service.opening.channels());
 		for provider in &service.providers {
 			waitset.push(provider.stream);
 			waitset.push(provider.chan);
 		}
 		waitset.extend(service.subscribers.iter().map(|subscriber| subscriber.chan));
 		waitset.extend(clients.iter().map(|client| client.chan));
-		waitset.extend(sleep_policy.handles());
+		let switches = sleep_policy.switch_subscription();
+		waitset.extend(sleep_policy.handles().into_iter().filter(|handle| opening_room || *handle != switches));
 		// A subscriber with records waiting is retried at the coalescing interval, since nothing
 		// wakes this loop when a reader makes room.
 		let now = clock();
 		let retry = if service.registry.pending_subscribers().is_empty() { None } else { Some(now + service_logic::power_registry::COALESCE_TICKS) };
-		let deadline = [service.registry.next_deadline(), retry, service.unopened.next_deadline()].into_iter().flatten().min().unwrap_or(0);
+		let opening_retry = if opening_room { service.unopened.next_deadline() } else { None };
+		let deadline = [service.registry.next_deadline(), retry, opening_retry, service.opening.next_deadline(), sleep_policy.next_deadline()].into_iter().flatten().min().unwrap_or(0);
 		let ready = wait_any(&waitset, if deadline != 0 { deadline.max(now + 1) } else { 0 });
 		if ready >= 0 {
 			let handle = waitset[ready as usize];
-			if !sleep_policy.serve(handle, catalogue, &mut buf) {
+			if handle == catalogue || service.opening.channels().any(|channel| channel == handle) {
+				service.opening_reply(handle, handle == catalogue, &mut sleep_policy, &mut buf);
+			} else if handle == switches {
+				if let Some(info) = sleep_policy.drain_switches(&mut buf) {
+					if info.live {
+						if !sleep_policy.follows(&info) {
+							service.adopt(catalogue, info, 0);
+						}
+					} else {
+						service.cancel_open(&info);
+						sleep_policy.withdraw_switch(&info);
+					}
+				}
+			} else if !sleep_policy.serve(handle, &mut buf) {
 				serve(&mut service, &mut clients, handle, catalogue, subscription, &mut subscribed, (state_root, control_root), &mut buf, &mut reply);
 			}
 		}
@@ -676,12 +787,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// brings a source's controls back, and the query leaves on a tick: taken before the request, the
 		// tick left it for the next deadline - which was the query's own, so it was sent as it expired and
 		// its answer was dropped, and the source never came back.
-		for (info, attempts) in service.unopened.due(clock()) {
+		for pending in service.opening.expire(clock()) {
+			service.open_failed(pending);
+		}
+		while service.opening.len() < MAX_OPENING {
+			let Some((info, attempts)) = service.unopened.due_one(clock()) else { break };
 			service.adopt(catalogue, info, attempts);
 		}
 		let effects = service.registry.tick(clock());
 		service.apply(effects);
 		service.drain_subscribers();
+		sleep_policy.tick();
 		sleep_policy.power_changed(&service.registry);
 	}
 }
@@ -719,22 +835,23 @@ fn serve(service: &mut Power, clients: &mut Vec<Client>, handle: u64, catalogue:
 		return;
 	}
 
-	// THE CATALOGUE: a provider arriving or leaving.
+	// One catalogue announcement per loop. When all opening slots are occupied, this stream is
+	// left unread so a transient backlog never permanently drops another kind's publication.
 	if *subscribed && handle == subscription {
-		loop {
-			let (len, handles) = match try_recv_caps(subscription, buf) {
-				PolledCaps::Message { len, handles } => (len, handles),
-				PolledCaps::Empty => break,
-				PolledCaps::Closed => {
-					*subscribed = false;
-					break;
-				}
-			};
-			for &leftover in handles.as_slice() {
-				close(leftover);
+		let (len, handles) = match try_recv_caps(subscription, buf) {
+			PolledCaps::Message { len, handles } => (len, handles),
+			PolledCaps::Empty => return,
+			PolledCaps::Closed => {
+				*subscribed = false;
+				close(subscription);
+				return;
 			}
-			let mut frame_handles = wire::Handles::new();
-			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else { continue };
+		};
+		for &leftover in handles.as_slice() {
+			close(leftover);
+		}
+		let mut frame_handles = wire::Handles::new();
+		if let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) {
 			if info.live {
 				service.adopt(catalogue, info, 0);
 			} else {
@@ -777,21 +894,31 @@ fn serve(service: &mut Power, clients: &mut Vec<Client>, handle: u64, catalogue:
 	if len >= 2 {
 		let op = u16::from_le_bytes([buf[0], buf[1]]);
 		if op == HEARTBEAT_OP {
-			send_blocking(handle, b"PONG", 0);
+			for &leftover in handles.as_slice() {
+				close(leftover);
+			}
+			let _ = try_send(handle, b"PONG", 0);
 			return;
 		}
 		if op == CONNECT_OP {
+			for &leftover in handles.as_slice() {
+				close(leftover);
+			}
 			if clients.len() >= MAX_CLIENTS {
-				send_blocking(handle, &[], 0);
+				let _ = try_send(handle, &[], 0);
 				return;
 			}
 			match channel() {
 				Some((mine, theirs)) => {
-					clients.push(Client { chan: mine, interface });
-					send_blocking(handle, &[], theirs);
+					if try_send(handle, &[], theirs) {
+						clients.push(Client { chan: mine, interface });
+					} else {
+						close(mine);
+						close(theirs);
+					}
 				}
 				None => {
-					send_blocking(handle, &[], 0);
+					let _ = try_send(handle, &[], 0);
 				}
 			}
 			return;
@@ -811,12 +938,13 @@ fn serve(service: &mut Power, clients: &mut Vec<Client>, handle: u64, catalogue:
 				let mut reply_handles = wire::Handles::new();
 				match power::dispatch(&mut StateView { registry: &service.registry }, &buf[..len], &mut handles, reply, &mut reply_handles) {
 					Some(written) => {
-						if !send_caps_blocking(handle, &reply[..written], reply_handles.as_slice()) {
+						let sent = try_send_caps(handle, &reply[..written], reply_handles.as_slice());
+						if !sent {
 							for &leftover in reply_handles.as_slice() {
 								close(leftover);
 							}
 						}
-						true
+						sent
 					}
 					None => false,
 				}

@@ -348,6 +348,9 @@ interface power-fixture {
 	@op(8) outlets:     func() -> result<list<bool>, error>;
 	/// Answer the next delivered control as indeterminate, as a device transport can do.
 	@op(9) indeterminate: func() -> result<unit, error>;
+	/// Withhold this publication's update-stream openings while enabled. Return the cumulative
+	/// number withheld, including earlier generations, so the probe can observe an actual request.
+	@op(10) defer-updates: func(publication: u8, enabled: bool) -> result<u32, error>;
 }
 
 // ------------------------------------------------------------------ cooling: the zones, the fans, the policy's operator

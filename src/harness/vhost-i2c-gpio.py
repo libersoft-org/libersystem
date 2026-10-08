@@ -277,9 +277,11 @@ class Vring:
     def put_used(self, space, head, written):
         used_idx = load_u16(space.ring(self.used + 2, 2))
         slot = used_idx % self.num
-        element = space.ring(self.used + 4 + 8 * slot, 8, True).cast("I")
-        element[0] = head
-        element[1] = written
+        element = self.used + 4 + 8 * slot
+        # An eight-byte element starts four bytes past the ring's alignment, so its two words
+        # can occupy different IOTLB pages. Each aligned word stays inside one mapped span.
+        space.ring(element, 4, True).cast("I")[0] = head
+        space.ring(element + 4, 4, True).cast("I")[0] = written
         # THE INDEX LAST, AND IN ONE STORE: the driver polls it.
         store_u16(space.ring(self.used + 2, 2, True), (used_idx + 1) & 0xFFFF)
 
@@ -1232,6 +1234,36 @@ class SelfTest(unittest.TestCase):
 
         chains = list(ring.chains(Plain()))
         self.assertEqual(chains, [(0, [(0x5000, 8, False), (0x6000, 1, True)])])
+
+    def test_a_used_element_crossing_iotlb_pages_is_written_before_its_index(self):
+        memory = Memory()
+        first, second = bytearray(4096), bytearray(4096)
+        # Adjacent IOVAs need not be adjacent in QEMU's address space.
+        memory.replace([(0x100000, 4096, 0x7F0000000000, memoryview(first), None), (0x200000, 4096, 0x7F0000100000, memoryview(second), None)])
+        iotlb = Iotlb()
+        iotlb.update(0x5000, 4096, 0x7F0000000000, PERM_RW)
+        iotlb.update(0x6000, 4096, 0x7F0000100000, PERM_RW)
+
+        def ask(miss):
+            self.fail(f"both pages are mapped, but the used element asks again for {miss.iova:#x}")
+
+        test = self
+
+        class ObservedSpace(Space):
+            def ring(self, addr, length, write=False):
+                if write and addr == 0x6000:
+                    test.assertEqual(struct.unpack_from("<H", first, 0x80A)[0], 254, "the completion is not published before its length")
+                return super().ring(addr, length, write)
+
+        space = ObservedSpace(memory, iotlb, True, ask)
+        ring = Vring()
+        ring.num, ring.used = 1024, 0x5808
+        struct.pack_into("<H", first, 0x80A, 254)
+        # This guest layout's slot 254 is at 0x5FFC: head in the first page, length in the second.
+        ring.put_used(space, 7, 13)
+        self.assertEqual(struct.unpack_from("<I", first, 0xFFC)[0], 7)
+        self.assertEqual(struct.unpack_from("<I", second, 0)[0], 13)
+        self.assertEqual(struct.unpack_from("<H", first, 0x80A)[0], 255)
 
     def test_the_register_device_reads_writes_its_block_and_its_pec(self):
         device = RegisterDevice(0x50)

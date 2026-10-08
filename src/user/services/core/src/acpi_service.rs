@@ -1795,12 +1795,26 @@ fn ec_from_ecdt(service: &mut Service) {
 }
 
 fn start_ec(service: &mut Service, command: u16, data: u16, gpe_bit: Option<u16>, node: Option<NodeId>) {
+	let mut acquired = Vec::new();
 	for port in [data, command] {
 		let range = unsafe { syscall(SYS_PORT_RANGE_FIRMWARE, service.host.privilege, port as u64, 1, 0) } as i64;
-		if range <= 0 || port_range_map(range as u64) < 0 {
-			say(&format!("the embedded controller's port {port:#06x} was not granted - {}", errno_text(range)));
+		let mapped = if range > 0 {
+			acquired.push(range as u64);
+			port_range_map(range as u64)
+		} else {
+			range
+		};
+		if mapped < 0 || range <= 0 {
+			// A partial ECDT attempt must not keep its first port granted and poison the namespace fallback.
+			for handle in acquired {
+				let _ = port_range_unmap(handle);
+				close(handle);
+			}
+			say(&format!("the embedded controller's port {port:#06x} was not granted - {}", errno_text(mapped)));
 			return;
 		}
+	}
+	for port in [data, command] {
 		service.host.ports.push(Ports { base: port, len: 1 });
 	}
 	service.host.ec = Some(aml::ec::Ec::new(EcPorts { data, command }));

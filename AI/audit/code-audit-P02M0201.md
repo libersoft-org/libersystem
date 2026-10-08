@@ -242,3 +242,67 @@ Fresh targeted verification (all exited 0):
 
 Not rerun here: the long IPMI, administrative and watchdog guest gates or cross-builds; their previous passes are
 recorded above and are not claimed as fresh execution. No new blocker found.
+
+Additional fresh targeted checks passed: `cargo test --offline --manifest-path src/user/drivers/core/Cargo.toml
+--lib ipmi_bmc` (7 tests, repository bounds, identity, FRU and both executors); `cargo test --offline --manifest-path
+src/user/services/logic/Cargo.toml bmc` (1 protected-operation rendering test).
+
+Further deadline review and corrective implementation (2026-10-08T03:55:39Z):
+The initial continuation conclusion above is superseded by a reproduced SSIF defect. The plan requires a
+five-second transaction deadline, but `ssif::transact` checked it only when a read returned NACK. A successful
+late write/read, including multipart transfers, could pass the deadline; the real scoped SMBus client also used
+an infinite IPC deadline. A standalone mock returned a valid successful response after a write advanced its
+clock to 6000 ms with a 5000 ms transaction limit. The new repository regression failed before the fix because
+an already-expired transaction still wrote to the bus.
+
+Actual changes:
+- `driver/ipmi/src/ssif.rs`: pass the same absolute millisecond deadline to each bus operation and check it both
+  before and after every block write/read. Successful late blocks now return `Failure::Deadline`; multipart
+  messages cannot acquire a fresh budget for each block. Existing NACK retry and malformed-message bounds remain.
+- `driver/i2c-client/src/lib.rs`: expose the generated client's existing `set_deadline` through `Smbus`.
+- `drivers/core/src/ipmi_driver.rs`: `SmbusLink` converts the shared deadline to runtime ticks. A local
+  `SmbusTransport` bounds both request-queue backpressure and reply receipt using the runtime's existing deadline
+  APIs. It discards stale correlation replies (closing their transferred handles) within the same deadline so a
+  later BMC probe can recover after a timed-out operation. Initial functionality/address negotiation is also
+  bounded by `NODE_TICKS`. The shared generic IPC transport is unchanged.
+- `driver/ipmi/src/tests.rs`: add expired-before-write, late successful write/read, and cumulative multipart
+  deadline regression cases. `driver/i2c-client/src/tests.rs`: record deadlines crossing the real generated
+  codec for negotiation, both SSIF blocks, and a later transaction with a new deadline.
+
+Fresh checks after this correction (all passed):
+- `cargo test --offline --manifest-path src/user/libs/driver/ipmi/Cargo.toml`: 28 tests.
+- `cargo test --offline --manifest-path src/user/libs/driver/i2c-client/Cargo.toml`: 7 tests.
+- `cargo fmt --manifest-path src/user/libs/driver/ipmi/Cargo.toml -- --check` and the equivalent i2c-client command.
+- `git diff --check`.
+
+Pending final verification: peer review, refreshed all-architecture builds and the unchanged SSIF runtime case
+from `src/tools/check-ipmi.sh` section 1b. Its exact helper prefix and SSIF case were copied to
+`.build/logs/end-of-job/check-ipmi-ssif-deadline.sh`, with only HERE and retained log directory changed; `bash -n`
+passed. Planned command: `LIBER_DEVELOPMENT=1 bash .build/logs/end-of-job/check-ipmi-ssif-deadline.sh`.
+This is targeted coverage of the real scoped ICH9 connection, capabilities, GUID/product/SMBIOS, multipart
+SDR/FRU/SEL reads and service restart event deduplication; it must not be reported as a fresh pass of the full
+multi-boot IPMI gate. The current correction has no fresh guest result yet. Milestone reopened pending that
+verification; prior completed KCS/BT/admin/watchdog/OpenIPMI runs remain historical evidence.
+
+Final corrected-code verification (2026-10-08T04:08:04Z):
+- Independent peer review of the correction found no remaining issue in the scoped changes: correlation framing,
+  stale reply capability cleanup, bounded send/receive, initialization, and tick conversion were checked against
+  the generated client and runtime implementations.
+- `rustfmt --check --edition 2024 src/user/drivers/core/src/ipmi_driver.rs`: passed.
+- Root's final `LIBER_DEVELOPMENT=1 ./build.sh --arch all`: PASSED in 487 s for x86_64, aarch64 and riscv64 after
+  source freeze, including all user programs and images' staged volumes. Log:
+  `.build/logs/end-of-job/continuation-build-all-final.log`.
+- `LIBER_DEVELOPMENT=1 bash .build/logs/end-of-job/check-ipmi-ssif-deadline.sh`: PASSED, process exit 0. Every
+  unchanged section-1b assertion passed over the real ICH9 SMBus driver: SSIF capabilities; GUID, product and SMBIOS
+  agreement; sensor/SDR, FRU and SEL content; one boot event; service restart without writing it again. Main log:
+  `.build/logs/end-of-job/continuation-ipmi-ssif.log`; guest and shell logs:
+  `.build/logs/end-of-job/ipmi-ssif-deadline/`.
+
+The corrected behavior is covered by the 28 IPMI and 7 client host tests plus current runtime integration and all
+architecture builds. The full long multi-interface IPMI/admin/watchdog/OpenIPMI gates were not rerun: their existing
+passes remain historical, and this correction changes only SSIF transport/deadline handling. No forced-controller-
+stall guest case was added; deadline edge cases are the host regressions and the production IPC uses the existing
+runtime deadline primitives. Completion is restored; no implementation or verification blocker remains for P02M0201.
+The complete pre-continuation audit prefix from revision d0f54598 was independently verified byte-for-byte preserved.
+
+Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.

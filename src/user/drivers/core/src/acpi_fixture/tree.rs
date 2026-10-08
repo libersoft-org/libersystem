@@ -18,6 +18,11 @@ pub fn serve(bootstrap: u64, bind: &common::Bind, resources: &common::Resources)
 		say("refused: expected one GPIO connection and no wired interrupt");
 		common::failed(bootstrap, bind, driver_protocol::DriverFailureCode::ResourceUnusable);
 	}
+	// The controller calls have their own bound; READY first, as for the HID child, so an emulated
+	// controller need not finish both calls within DeviceManager's shorter bind window.
+	if !common::online(bootstrap, bind, b"driver.acpi-fixture: online (device tree)", &[]) {
+		exit();
+	}
 	let connection = resources.connections[0];
 	let client = || gpio_device::Client::with_deadline(ChannelTransport { chan: connection }, clock() + super::TICKS);
 	let Some(Ok(line)) = client().line() else {
@@ -32,9 +37,6 @@ pub fn serve(bootstrap: u64, bind: &common::Bind, resources: &common::Resources)
 	if events == 0 {
 		say("refused: the line has no event stream");
 		common::failed(bootstrap, bind, driver_protocol::DriverFailureCode::ResourceUnusable);
-	}
-	if !common::online(bootstrap, bind, b"driver.acpi-fixture: online (device tree)", &[]) {
-		exit();
 	}
 	say("dt:/liber-fixture bound through GPIO line 2 (rising), no wired interrupt; ready");
 	let mut buf = [0u8; 256];

@@ -240,3 +240,187 @@ Status: continuation in progress; no unrun checks are claimed.
 - PASSED: `python3 src/tools/check-frame-account-collector.py` (13 tests, 0.016 s).
 - No harness source change is needed to capture the remaining measurement conditions: the cold runner retains its ESP and staged kernel, and the live QEMU command identifies its private files. The final run will retain these identities, the manifest-selected per-layer artifacts and the runner log beside each port account. Ports use `virtio-gpu-pci` under TCG, not x86_64's `virtio-vga` under KVM; their clock names will be stated explicitly.
 - Required final runs are the ordinary and optimized x86_64 gate on the final tree, followed by the port gate's scaled run on aarch64 and riscv64. No new guest run has been performed yet.
+
+### Same-tree completion requirements checked before final runs
+
+Re-read the complete specification against the proposed final measurement. The one-tree item explicitly distinguishes changes before the insertion comparison from changes after it: for the latter, “the dormant comparison stands” and every current account/optimized/port row must be re-taken with that tree's dormant run as its reference. The recorded insertion A/B finished at 17:04Z on 2026-09-27; P02M0193's initial implementation record begins at 17:35:02Z, and the later timer/runtime changes and this continuation follow it. The specification therefore preserves that historical insertion proof and does not require reconstructing a current tree with the instrument removed. Comparing a current dormant run directly with the old `ff08ea18` interval as though only instrumentation changed would be invalid and will not be done.
+
+Reviewed the instrument changes since the P02M0193 commit: `rt::perf_site` and its cached-flag path, `perfbuf` and the kernel's dormant armed-flag test retain their implementation; later `kernel/perf.rs` changes concern test configuration, allocation annotations and the post-run serial drain. Current `--primitives` still measures the cached site's cost and first-use cost independently.
+
+Minimum final evidence remains: the complete ordinary x86_64 gate (including the current dormant reference, offscreen/direct/scaled/hidden/primitives/pooled rows), its same-source optimized comparison with the staged-artifact provenance check, then both emulated scaled accounts. Instrument overhead must compare the ordinary 160-frame report of the armed run with the ordinary 160-frame dormant report; the 152-frame armed-only report has a different shape mix and serves the collector's consistency check instead. A single-run delta will be reported as such, with no claim that it lies within the old tree's spread. If a material delta leaves the instrument's effect unresolved, targeted repeats are needed before closure. No build or guest was launched for this requirements review.
+
+Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+### Final same-source measurement: ordinary x86_64 completed
+
+After the final functional gates released every guest and fixture, ran the complete ordinary gate with fresh result/status paths: `env -u CARGO_PROFILE_DEV_OPT_LEVEL -u ACCOUNT_REFERENCE -u LIBER_BOOT_PROFILE -u DISPLAYS -u GPU_SIZE -u USB_GADGET LIBER_DEVELOPMENT=1 ACCOUNT_RESULTS=/data/yellow/libersystem/.build/logs/qemu-2d-account/continuation-20261008/ordinary RUN_STATUS_FILE=/data/yellow/libersystem/.build/logs/qemu-2d-account/continuation-20261008/ordinary.status ./check.sh --gate qemu-2d-account`. PASS, exit 0, 687 s. All four collected scenarios passed their closure and demo-report checks; pinned runs used one lane and the pooled row used four. Logs, raw reports, trace drains, JSON accounts and per-boot conditions are retained under that result directory; the adjacent ordinary.log/status hold the wrapper's terminal result.
+
+The measured build-input identity includes 2,798 tracked/new files under src, .cargo, shell build/harness entry points, product.conf and toolchain.lock; prose is excluded. It was `58d9026ae15c0247044c3765db7526986167c76ccca36e7dfb58eb113cb5e6e4` both before and after the ordinary gate (`source-start.json`, `source-after-ordinary.json` beside the results). Same-source optimized and emulated-port measurements are still required and not yet claimed passed.
+
+The optimized x86_64 gate also PASSed, exit 0, 490 s: the same command with `CARGO_PROFILE_DEV_OPT_LEVEL=2`, `ACCOUNT_REFERENCE=.../continuation-20261008/ordinary`, and fresh optimized result/status paths retained that override for every build/boot. Its provenance check proved that the image, staged kernel and virtio_gpu changed while the release DisplayService and demo remained byte-identical. Every account and worker-pin check passed. The full build-input hash remained identical through this gate (`source-after-optimized-before-collector.json`).
+
+Independent review then identified an analysis defect which the original collector tests had missed: an early deadline wake can cause a second park against the same fixed 16 ms pacing deadline, but the collector summed both remaining requested durations as if they were separate policy waits. This overstates the chosen delay and understates rounding/dispatch overshoot without changing the total pacing term or residue. Both original gate PASS statuses, original account JSON/text and the pre-correction collector/fixtures are preserved; the originals live under each result directory's `original-collector`. The port runs are paused for the minimal collector/fixture correction and offline replay of the already captured x86 traces. No guest or instrumentation behavior is being changed, and original chosen/rounding figures are not accepted as final evidence.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0189 (2026-10-08T06:31:07Z):
+
+Independent continuation review of the complete plan, existing account, current collector and ordinary run found
+that all four accounts have 152 frames (76/38/38), complete drains and negligible numeric residue; the matched
+160-frame armed/dormant reports and artifact provenance are valid. However `park_breakdown` sums remaining
+requested delays over repeated parks against one pacing deadline. In the captured first scaled frame, a park
+requested 15.952673 ms and returned after 15.215657 ms; the retry requested the remaining 0.725688 ms and returned
+after 10.421902 ms. The old collector counted 16.678361 ms as policy delay even though these waits share the
+same nominal 16 ms deadline. Frame closure hides the error because the same overcount is subtracted from its
+rounding figure. `FrameLoop::park` records remaining time; `Pacing::on_present` sets the deadline once.
+
+The authorized correction is limited to the host collector and its meaningful regression fixtures. Actual wait
+inside the requested deadline and actual overshoot must be separated per park, including message wakes and early
+deadline retries, with execution between parks left in the surrounding frame-loop term. No runtime, instrumentation,
+policy wait, kernel timer or guest build is changed. Both original collectors and original account outputs have
+already been archived by the performance continuation; guest runs are paused while this correction is verified.
+
+Implemented `park_breakdown` in `src/harness/frame_account.py` using actual finite park spans: each contributes
+`min(waited, remaining request)` within its requested deadline and `max(waited - remaining request, 0)` beyond
+it, including message-ended waits. Repeated parks do not recreate a full policy interval, and between-park
+execution remains in the surrounding frame-loop term. Provided complete park pairs are clipped to the account
+window while preserving their original deadline; this does not recover trace records missing from that window.
+A timeout remains finite even when its recorded relative tick count has expired to zero. Verified the actual ABI
+`ERR_TIMED_OUT = -11` (`src/abi/src/lib.rs`); other negative wait results are refused rather than mislabeled as
+deadlines. Message wakes with neither a recorded finite request nor finite tick count stay in the main loop term.
+The nominal `Pacing` interval remains 16 ms; these fields measure actual time inside parks, and the excess includes
+tick, wake and scheduling delay. Existing JSON field names are retained for compatibility; the text renderer and
+frame-term comment explicitly describe the corrected meaning.
+
+Added five meaningful regression cases in `src/tools/check-frame-account-collector.py`: early timeout followed by
+a retry against the same deadline; early and late message wakes; finite expired versus unbounded release waits;
+window clipping without moving the original deadline; and rejecting a non-timeout wait error. Corrected the old
+synthetic timeout value from -110 to the actual -11 ABI value. With the old production collector, the first 17-test
+run had the 13 existing tests pass and three new failures; its log is preserved as
+`.build/logs/qemu-2d-account/continuation-20261008/collector-pacing-before-17-tests.log`. The final 18-test fixture set
+against that same old collector failed four cases, also preserved in `collector-pacing-before.log`. After the
+correction, `python3 src/tools/check-frame-account-collector.py` PASSed all 18 tests in 0.016 s; final output is
+`collector-pacing-after.log` in that directory. Parsing both edited Python files with `ast.parse` and
+`git diff --check` PASSed. Root and performance continuation independently reviewed the formula and tests; no
+runtime or instrumentation source changed. Offline replay of all eight preserved x86 accounts and final static
+checks are delegated and still pending at this point, so original erroneous pacing splits are not final evidence.
+
+The reviewed collector correction is now applied and frozen; its worker records the fail-before/pass-after regressions separately below/above in this file. Independently reviewed finite-deadline clipping, early retry and message-wake attribution, unbounded waits and rejection of non-timeout errors. Replayed all eight retained x86 accounts with `python3 src/harness/frame_account.py <serial-log> --drain <1|2|3> --demo-report <run-report> --json <profile>/corrected-collector/account-<scenario>.json`; exact absolute commands are retained in `.../continuation-20261008/corrected-replay.log`. All eight PASS; wrapper `frame-account-offline-replay` reports exit 0, 4 s in corrected-replay.status. Separate corrected-collector directories hold the final JSON/text, without overwriting the original outputs or claiming another guest run.
+
+`collector-source-change-proof.json` compares every source/build input against the pre-correction snapshot. Exactly `src/harness/frame_account.py` and `src/tools/check-frame-account-collector.py` changed. The remaining 2,796 inputs, including every guest source, instrumentation site/payload and build input, have identical SHA-256 `8a522d442bf066528e2581f2fbb281c9b5d3bb9035f1ea7c64fc1a7f05a8ee6c`; therefore the original executed traces remain valid. The wider identity including analysis changed from `58d9026ae15c0247044c3765db7526986167c76ccca36e7dfb58eb113cb5e6e4` to `f982499934b845776c3a5824f091f6bbcc148b4fc9792a408fc7a03053b1e6bc`. Both individual collector/fixture hashes are retained in that proof. This is an offline analysis repair, not a new full-build or guest verification claim.
+
+All corrected shape accounts still close with only floating-point residue. The ordinary scaled mean time actually inside parks before the requested deadline is 15.962/15.963/15.966 ms (whole/partial/multi-rect), and measured overshoot is 6.081/5.442/5.154 ms. The fixed policy remains 16 ms; loop work between parks is not counted as another chosen delay, and overshoot includes dispatch/scheduling delay as well as tick rounding. Earlier historical chosen/rounding figures will be explicitly superseded in docs/PERF.md rather than silently retained as valid classifications. Port guest runs and final documentation/restoration are still pending.
+
+The performance continuation replayed all eight ordinary/optimized x86 accounts from the unchanged captured raw
+logs with the corrected collector: PASS, 4 s. Exact `python3 src/harness/frame_account.py ... --drain ...
+--demo-report ... --json ...` commands and each exit-0 result are preserved in
+`.build/logs/qemu-2d-account/continuation-20261008/corrected-replay.log`; corrected JSON/text are under each profile's
+`corrected-collector` directory and originals remain under `original-collector`. Independent read-only Python
+comparison of every JSON field confirmed that only each shape's two pacing subterms differ (six fields per
+account). All frame counts, trace records, named intervals, CPU/blocked/runnable splits, device, IPC, dispatch and
+demo comparisons are unchanged. Recomputed named-term sums and CPU-state sums close within floating-point
+residue (~1e-14 ms) in all eight accounts. The 24 shape means now place 15.952–15.992 ms within requested deadlines,
+with nonnegative overshoot. Ordinary scaled whole is 15.961499 ms within deadlines plus 6.080761 ms beyond,
+inside its unchanged 22.107357 ms pacing/frame-loop term; the remaining 0.065097 ms stays attributed to loop work.
+
+Independent optimized provenance review also confirmed the same image/kernel/virtio_gpu across its trace,
+dormant and small-scanout boots, opt-level 2 retained throughout, and release DisplayService/demo identical to
+ordinary. Its matched 160-frame reports give 100.292 ms armed versus 101.208 ms dormant mean intervals; the
+observed -0.916 ms difference is confounded by run variation and is not negative causal instrumentation overhead.
+Both profiles' trace accounts remain the separate 152-frame 76/38/38 shape sample; worker reports confirm one
+pinned lane versus four pooled lanes. Host primitive cached-site totals are single-aggregate measurements, not
+precision estimates of causal overhead. Final prose interpretation and port runtime gates are owned by the
+performance continuation and still pending here; no further collector or runtime changes are planned.
+
+The subsequent ARM native gate completed its 160-frame scenario but exited 1 after 751 s solely because its
+port postcheck required the literal `boot profile: development-trace` banner. Independent source review confirmed
+that only x86 `kmain` prints that banner. ARM and RISC-V instead call common `announce_measurement`, whose anchor
+requires the exact `development-trace` profile; `perf::init` independently checks that same profile before buffer
+attachment, and both performance syscalls return `ERR_UNSUPPORTED` without it. The ARM run had its 62.5 MHz anchor,
+attached buffer and complete `PERF-END 16463 0 0 0` drain, with 152 armed frames (76/38/38), so the banner check was
+an incorrect architecture assumption. The original failing script, native result and raw log are retained.
+
+After that guest terminated and its script was archived, changed only the port guard in
+`src/tools/check-qemu-2d-account.sh` to require the existing trace-only buffer attachment text, with a comment
+explaining the architecture distinction. Existing worker, anchor, complete-drain and matching armed-demo checks
+remain. No kernel, runtime, instrumentation or scenario was changed. `bash -n` and `shfmt -d` on this script,
+`git diff --check`, and all 18 collector fixtures PASSed (0.017 s). The retained ARM log returned exit 1 for the
+old banner grep, exit 0 for the new guard, and exit 0 for the unchanged full collector with `--drain 1` and the
+same log as `--demo-report`. A focused offline CLI check also confirmed refusal of a dormant-only log, a run
+missing its END, a run missing its anchor, and a fake attachment/anchor/empty-drain log: all exit 1 for the
+appropriate missing evidence. Exact commands/results and the small check script are preserved as
+`continuation-20261008/port-oracle-check.log` and `check-port-oracle.py`; independently collected JSON/text live in
+`aarch64/portable-oracle-checks`. The native banner failure remains a historical failure; corrected offline
+postchecks of that same completed guest are recorded separately by the performance continuation.
+
+Final measurement continuation (2026-10-08T07:22:19Z):
+
+The emulated checks ran last and alone, after both x86 accounts and corrected offline replay. The canonical
+ARM postchecks are preserved in `continuation-20261008/recheck-aarch64.sh`, `aarch64-final-check.log` and
+`aarch64-final-check.status`: PASS, exit 0, 1 s. They require the exact production trace-buffer line, one
+pinned lane and the complete collector against the same actual 160-frame cold scenario. Corrected output is
+`aarch64/corrected-check/account-scaled-aarch64.{json,txt}`. The native gate's exit 1 / 751 s banner failure
+remains unchanged in `aarch64.log` and `aarch64.status`; no second ARM guest invocation is claimed.
+
+RISC-V ran the corrected gate natively: PASS, exit 0, 1,111 s, with 152 accounted frames (76 whole / 38 partial /
+38 two-rectangle), 17,344 records and `PERF-END 17344 0 0 0`. Its build stage passed in 68 s. Both port commands
+cleared `CARGO_PROFILE_DEV_OPT_LEVEL`, `ACCOUNT_REFERENCE`, `LIBER_BOOT_PROFILE`, `DISPLAYS`, `GPU_SIZE` and
+`USB_GADGET`, set `LIBER_DEVELOPMENT=1 SMP=4 ACCOUNT_RESULTS=<port>` and ran the following wrapper, with separate
+absolute status/log paths under `.build/logs/qemu-2d-account/continuation-20261008/`:
+
+```sh
+bash -c 'SCRIPT_NAME=frame-account-port; source ./lib.sh; arm_run_verdict; src/tools/check-qemu-2d-account.sh --arch "$1"' _ aarch64
+bash -c 'SCRIPT_NAME=frame-account-port; source ./lib.sh; arm_run_verdict; src/tools/check-qemu-2d-account.sh --arch "$1"' _ riscv64
+```
+
+The port cold runners initially logged unanswered development-channel handshakes while their boot continued.
+These are the existing bounded readiness retries, not failed attempts to run the account or relaxed timeouts.
+Each completed its original scenario. Both guests and owned fixtures terminated; no QEMU remained before
+restoring the x86 image. RISC-V's native output is `riscv64/account-scaled-riscv64.{json,txt}` and its complete
+serial log is `riscv64/serial-riscv64.log`.
+
+For both ports, `conditions-live.json` captures the actual running QEMU argv, 4 vCPUs / 512 MiB / TCG / virtio-gpu-pci,
+QEMU 10.0.13, host Xeon Platinum 8272CL, kernel/driver dev opt-level 0, release PIE DisplayService/demo,
+firmware inputs, private ESP and staged kernel hashes. `conditions-final.json` records observed DMA/profile
+buffer evidence, all four cores/harts online and unchanged private ESP/kernel bytes at completion. ARM uses
+CNTVCT_EL0 at 62.5 MHz; RISC-V uses global rdtime at 10 MHz, not per-hart cycle counts. ARM whole / partial /
+multi-rectangle intervals are 1691.692 / 1238.187 / 1227.816 ms; RISC-V's are 2464.371 / 1767.117 / 1755.028 ms.
+Every shape's named account and CPU/blocked/runnable split closes with floating-point residue only and agrees
+with the demo's own armed report. These are emulated consistency checks, never native hardware-speed claims.
+
+`source-after-riscv64.json` equals the pre-RISC snapshot. The final proof
+`collector-and-port-gate-source-change-proof.json` records exactly three changes since the initial x86 execution:
+`src/harness/frame_account.py`, `src/tools/check-frame-account-collector.py` and
+`src/tools/check-qemu-2d-account.sh`. All 2,795 remaining guest/source/build inputs are identical with SHA-256
+`ae4fb91668fb7bf60b8372755454f2f0b40b2a938334e9200451bcdd80340210`. The final wide hash is
+`52b900132b4e7a0dbbb1b116d391a87b0523419f8a84def07d73837458274b5f`. Individual old/new hashes and original
+analysis files remain preserved. This proves that replay and the portable guard correction did not change the
+guest path; it does not claim a new full build for the collector-only edit.
+
+Wrote the final dated section in `docs/PERF.md`, with every named boundary for both x86 build profiles, all
+three size/scale conditions and both ports; damage pixels/copies/mappings; hidden-surface dispatch; system
+charge relative to each profile's offscreen row; current dormant/armed and cached-site measurements; syscall,
+IPC, allocation/map/copy/unmap and scheduler primitives; device wall/spin/blocked/runnable/poll/yield figures;
+the pinned and pooled rows; classification, disproofs and named missing-primitive follow-ups. Historical
+chosen-wait/rounding classifications are explicitly superseded, preserving the original history and insertion
+A/B. The current single-pair negative armed/dormant deltas are not claimed as negative causal overhead or as
+lying within the old tree's spread. Actual park spans include CPU syscall/instrument/return work; neither the
+before-deadline nor beyond-deadline number is exclusively blocked time, and large TCG overshoot is not charged
+entirely to native tick quantization. The 16 ms policy itself is unchanged.
+
+Restored ordinary x86 artifacts with the opt/profile/display/gadget overrides unset and
+`LIBER_DEVELOPMENT=1 ./image.sh --format iso --dma-mode enforcing-required`: PASS, outer exit 0; nested x86 full
+build PASS 73 s, then default ISO cache hit. Log: `continuation-20261008/restore-ordinary.log`. The restored
+kernel, virtio_gpu, DisplayService and demo hashes match the ordinary measured artifacts exactly. Default ISO
+SHA-256 is `ddb8e63b14a3eac14a752fd0c1579ed6c3a18a2afc83513c008ca7f1776fcf81`; this is the default image, not
+the gate-private measurement ISO. Root was notified that artifact-dependent dynamic-report refresh can now
+run. No further guest run or full-suite rerun is required by this milestone, and none is claimed here.
+
+Independent final read-only review checked all 30 shape accounts' named-term/state sums and counts, every
+published cell in the eight full per-layer table sets, all 18 charge/ratio rows, port artifact/profile hashes,
+counter anchors and record totals. The reviewer found no remaining arithmetic or specification-interpretation
+blocker and no reason for another run. `git diff --check` passes on the changed milestone documents; bytewise
+prefix checks against HEAD confirm the existing P0189, P0192 and P0193 audit contents remain intact. Marked only
+the four outstanding completion checkboxes and status in P02M0189, and its TODO row, COMPLETE. All required
+implementation and measurement verification for P0189 is now satisfied. The ARM failed native invocation and
+its successful corrected offline postchecks retain their distinct statuses. No audit rating is assigned.
+
+Final coordinator consistency checks: `./check.sh --gate milestone-index` PASS (3 s; `.build/logs/end-of-job/continuation-milestone-index-final.log`), `git diff --check` PASS. All thirteen original audit files remain exact byte prefixes from baseline `d0f54598`, each with its UTC continuation record. Plan/index review confirms ten completed requested milestones and only P02M0196, P02M0197 and P02M0202 open for their explicitly recorded hardware/design requirements. No owned QEMU, TCPCI backend or UPS simulator remains running.

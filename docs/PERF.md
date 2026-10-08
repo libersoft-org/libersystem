@@ -56,7 +56,485 @@ the map base past the limit, which together cost about 770 ns more than two plai
 two atomic loads and a volatile store per word, none of them inlined at opt-level 0. Nothing runs that case
 but a process that drives ports; every other process pays the 60 ns.
 
+## Frame account on the final milestone tree (2026-10-08)
+
+The largest x86_64 term remains drawing: 57.282 ms, 48.9% of the 117.079 ms whole-frame interval at 640×480 scaled onto 1280×800. The same scene’s offscreen frame costs 41.732 ms. The account below replaces the earlier tree's comparisons; the historical insertion A/B remains evidence about inserting the instrument, not a current performance baseline.
+
+### Measurement and analysis provenance
+
+All runs used one frozen guest implementation, after P02M0193/P02M0198 and the final provider/policy fixes. Results and exact commands are retained in `.build/logs/qemu-2d-account/continuation-20261008/`. The ordinary x86 gate passed in 687 s and its optimized counterpart in 490 s. Each used one reproducible image across its three boots, four vCPUs, one pinned drawing lane except the explicitly pooled row, headless QEMU, and enforcing-required DMA. The host was Intel Xeon Platinum 8272CL @ 2.60 GHz; QEMU was 10.0.13. x86 used KVM, `-cpu host` and `virtio-vga`; ports used TCG, four vCPUs, 512 MiB and `virtio-gpu-pci`, with no competing guest/build. Port figures are emulated consistency checks, not hardware-speed results. Their exact command lines, firmware/ESP/staged-kernel/system-volume hashes, layer artifacts and observed boot evidence are in each port’s `conditions-live.json`, `conditions-final.json` and `runner.log`.
+
+The initial all-input identity was `58d9026ae15c0247044c3765db7526986167c76ccca36e7dfb58eb113cb5e6e4`. Only three host analysis/harness files changed afterward: `frame_account.py`, its collector fixtures and the port gate’s profile check. Excluding exactly those three leaves all 2,795 other source/build inputs identical, SHA-256 `ae4fb91668fb7bf60b8372755454f2f0b40b2a938334e9200451bcdd80340210`. Final analysis-inclusive identity: `52b900132b4e7a0dbbb1b116d391a87b0523419f8a84def07d73837458274b5f`. The proof files retain individual old/new hashes. No guest code, instrumentation point or payload changed between measured rows; build profiles differ only as explicitly stated.
+
+Two measurement defects were corrected, with the original outcomes preserved. First, an early deadline wake can re-park against the same fixed 16 ms deadline. The old collector incorrectly added the remaining request again, overstating the chosen wait and understating overshoot. Five regression cases now cover retry, message wake, expired/unbounded wait, clipping and non-timeout errors; all 18 fixtures pass. The eight x86 raw traces were replayed into separate `corrected-collector/` outputs (PASS, 4 s), changing only the two pacing subfields. **Historical chosen-wait/rounding values below, including the old 16–18 ms classification, are superseded**; their other measurements remain historical, not new-tree evidence. Second, ARM/RISC do not print x86’s profile banner. ARM’s complete cold scenario therefore ended with the old gate failing solely that banner check (751 s). The corrected check requires the exact 8 MiB trace-buffer attachment line, which both ports emit only for `development-trace`, plus the existing anchor, complete drain, armed-report agreement and lane checks. Those checks passed on ARM’s preserved trace; dormant/missing-anchor/missing-END/empty-drain samples were rejected. No extra ARM boot or relabeling of its failed invocation is claimed. RISC ran the corrected gate and passed natively in 1,111 s, with 17,344 records and zero refused, incomplete or stale records.
+
+The fixed policy is 16 ms. “Within the requested deadline” below is elapsed time inside instrumented finite park spans before it; it includes any on-CPU syscall/instrument work. Loop work between parks is separate. “Beyond” can include remaining wait/syscall/instrument and return-path work as well as tick rounding, wake/dispatch latency and runnable delay. The main pacing row separately reports on-CPU, blocked and runnable time; neither subrow means exclusively blocked time or pure 10 ms quantization. Every account has 152 armed frames after eight warm-up presents: 76 whole, 38 partial and 38 two-rectangle frames. The ordinary 160-frame report has 84/38/38 and is used for the armed/dormant comparison. All shape sums close with floating-point rounding only; no trace refused, incomplete or stale records were accepted.
+
+| Staged artifact (SHA-256) | Ordinary x86 | Optimized x86 |
+| --- | --- | --- |
+| image | d1a04dea05a7b5bc2451aaecf4146869d35a98ddcc1bea480411a8cc0e0165e8 | 302b1eb3ed9c2ff761080a350d23f133369eaaf291ee663bc3974ebc7d83d80b |
+| kernel | 2c3885a66ed530b58021c857f8d3c001b502d289fc6f9f107180d9809b04fd19 | 378445fba7e562ba8aa1beaace9717e627a4f736da0f0dc1e00b144221e61592 |
+| virtio_gpu | abaa01ee55a1e2f89b8edbaa45347ce6abfa4e5507cbf710209f4a4be2eea5c0 | 7332c039d9059abc634a0ad0af6d0f003c46dc18e7229643d640794bbc4caa58 |
+| display_service | 390a3c53a09161b9fca52c982c8e4df3c37c0d8e21a2517198114c1a416cc66c | 390a3c53a09161b9fca52c982c8e4df3c37c0d8e21a2517198114c1a416cc66c |
+| test2d-sw | f1c6c7f51242250f68a490ed2fcb02ab75524bbed0d3f79e177aecb18caace9c | f1c6c7f51242250f68a490ed2fcb02ab75524bbed0d3f79e177aecb18caace9c |
+
+| Emulated target | Artifact | Profile / role | SHA-256 |
+| --- | --- | --- | --- |
+| aarch64 | boot_esp | boot medium / staged kernel | c4e785a8b61e7ec955a43613fa2f15b8bc4413f1989cc556fcf7766c05b65e72 |
+| aarch64 | boot_kernel | boot medium / staged kernel | edca119effaf576043b992aa32219fa3acc77f6385411436569867eaca9d2cc6 |
+| aarch64 | virtio_gpu | cargo dev opt-level0 | dcef7f28145e498454ddbe35ca4371971d36c6cfd63f1b0178e057829f76e493 |
+| aarch64 | display_service | release PIE | 62c3dabc648994798bbe5d6d51030318e39cd7f1985e4395c4da63c31f806a89 |
+| aarch64 | test2d-sw | release PIE | 5040b4284deef3a452037184ec60a763006f36771840494478b0fb5665eb31a3 |
+| riscv64 | boot_esp | boot medium / staged kernel | 82d555072b82b066cfe6a4dcf3fbe3613d42e61ab3a4f21d17d00562fd75d1a1 |
+| riscv64 | boot_kernel | boot medium / staged kernel | e85d9cfbc89ac8b41495cdf83cfaca24d572875eda46750bfe3533642c252524 |
+| riscv64 | virtio_gpu | cargo dev opt-level0 | a11477205eb2a2cde9e26b0be58701f42daf39fc78f0ad905b4dc8491423b91f |
+| riscv64 | display_service | release PIE | 3b58fdb5b07f3111f9fdb6465caa04c7595608096d61fb53b700444707319bd3 |
+| riscv64 | test2d-sw | release PIE | 1dbfebad6f1f7f0cc5fe92653aa64190a5d692933a9eacd99ccb469a2b5c71a7 |
+
+Kernel: `.build/cargo/kernel/x86_64-unknown-none/debug/kernel`; driver: `.build/cargo/user/x86_64-unknown-none/debug/virtio_gpu`. They use Cargo dev opt-level 0, or 2 throughout the optimized gate. DisplayService and the demo are the manifest-selected `.build/image/x86_64-unknown-none/{libexec/display_service,bin/test2d-sw}` release PIEs, byte-identical across profiles; their providers are release builds too. Every application/DisplayService term below therefore includes release user code and any dev-profile kernel work it invokes; driver terms include dev-profile driver and kernel work. Device observation time is not a compiler profile.
+
+| Clock / run | Measured anchor (Hz) | Clock used |
+| --- | --- | --- |
+| x86 ordinary trace / small | 2594419400 / 2594879000 | TSC |
+| x86 optimized trace / small | 2597968400 / 2598228000 | TSC |
+| aarch64 | 62500000 | CNTVCT_EL0 |
+| riscv64 | 10000000 | global time (rdtime), not per-hart rdcycle |
+
+Reproduce x86 with `LIBER_DEVELOPMENT=1 ACCOUNT_RESULTS=<ordinary> ./check.sh --gate qemu-2d-account`, then export `CARGO_PROFILE_DEV_OPT_LEVEL=2 ACCOUNT_REFERENCE=<ordinary> ACCOUNT_RESULTS=<optimized>` for the entire second invocation. Ports run last and alone: `LIBER_DEVELOPMENT=1 SMP=4 ACCOUNT_RESULTS=<port> src/tools/check-qemu-2d-account.sh --arch aarch64|riscv64`. Clear inherited boot-profile, scanout/display and gadget overrides as recorded in the audit. The gate supplies the trace/dormant profiles itself.
+
+### Instrument cost and the current dormant reference
+
+| Profile | Armed interval ms | Dormant interval ms | Observed delta ms | Armed / dormant draw ms | Cached site / empty loop ns | First site ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| ordinary | 100.850 | 101.709 | -0.859 | 57.569 / 58.727 | 0.565 / 0.557 | 29.012 |
+| optimized | 100.292 | 101.208 | -0.916 | 58.479 / 59.455 | 0.959 / 0.624 | 29.150 |
+
+These are matched 160-frame reports. The negative differences are observed single-pair deltas, not negative causal instrumentation cost and not evidence of lying within the old tree’s spread. The release draw moves too; this comparison does not isolate sub-millisecond overhead. One million cached calls and one million empty-loop iterations produced the primitive values above: the gross cached-loop cost amounts to roughly 23 ns per forty sites in the ordinary run and 38 ns in the optimized run. Small differences between those loop aggregates are not a precise isolated per-site latency. First use resolves `SYS_BOOT_PROFILE` once per process, outside the measured window; its roughly 29 ms cost persists and was not optimized here. The historical same-path-length insertion A/B remains valid under the plan’s explicit later-change clause.
+
+### Per-layer accounts
+
+Tables preserve all 21 named boundaries rather than hiding a residue in an unnamed remainder. Pacing subrows are subsets, not extra terms. Complete machine-readable accounts and scheduler-derived splits are in each result’s JSON.
+
+<details>
+<summary>640×480 surface, 1280×800 scanout, scaled — ordinary and optimized full accounts</summary>
+
+#### ordinary
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 22.107 (0.265/20.406/1.436) | 21.471 (0.270/19.825/1.376) | 21.182 (0.256/19.587/1.338) |
+| application: acquire (a call to DisplayService) | 0.905 (0.147/0.464/0.294) | 0.610 (0.170/0.232/0.208) | 1.074 (0.149/0.533/0.392) |
+| application: image mapping looked up | 0.004 (0.004/0.000/0.000) | 0.005 (0.005/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| application: record the scene | 0.060 (0.060/0.000/0.000) | 0.060 (0.060/0.000/0.000) | 0.055 (0.055/0.000/0.000) |
+| application: record to draw | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| application: draw (prepare and render) | 57.282 (57.221/0.000/0.061) | 58.713 (58.510/0.000/0.202) | 57.260 (57.147/0.000/0.113) |
+| application: damage computed | 0.008 (0.008/0.000/0.000) | 0.009 (0.009/0.000/0.000) | 0.009 (0.009/0.000/0.000) |
+| application: producer-ready signal | 0.018 (0.018/0.000/0.000) | 0.020 (0.020/0.000/0.000) | 0.018 (0.018/0.000/0.000) |
+| transport: present call to DisplayService | 0.096 (0.076/0.011/0.009) | 0.113 (0.070/0.034/0.009) | 0.099 (0.074/0.015/0.010) |
+| DisplayService: dispatch until the present is accepted | 0.008 (0.008/0.000/0.000) | 0.009 (0.009/0.000/0.000) | 0.008 (0.008/0.000/0.000) |
+| DisplayService: accepted to blit | 0.003 (0.003/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| DisplayService: blit | 34.194 (34.194/0.000/0.000) | 1.752 (1.752/0.000/0.000) | 1.167 (1.167/0.000/0.000) |
+| DisplayService: blit to device call | 0.005 (0.005/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: device call to the driver | 0.084 (0.053/0.021/0.009) | 0.077 (0.049/0.021/0.007) | 0.067 (0.047/0.013/0.007) |
+| driver: build the command | 0.025 (0.025/0.000/0.000) | 0.037 (0.037/0.000/0.000) | 0.032 (0.032/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 2.038 (0.341/0.000/1.696) | 1.049 (0.575/0.000/0.474) | 1.044 (0.562/0.000/0.482) |
+| driver: reply | 0.008 (0.008/0.000/0.000) | 0.008 (0.008/0.000/0.000) | 0.007 (0.007/0.000/0.000) |
+| transport: device call back to DisplayService | 0.086 (0.041/0.016/0.030) | 0.085 (0.040/0.017/0.028) | 0.082 (0.039/0.016/0.027) |
+| DisplayService: completion (release and events) | 0.024 (0.024/0.000/0.000) | 0.024 (0.024/0.000/0.000) | 0.023 (0.023/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: reply back to the application | 0.117 (0.036/0.006/0.075) | 0.117 (0.037/0.006/0.075) | 0.111 (0.036/0.005/0.070) |
+| Measured interval | 117.079 | 84.169 | 82.253 |
+| Residue | -0.000000 | 0.000000 | -0.000000 |
+| Within the requested deadline (subset of pacing) | 15.961 | 15.963 | 15.966 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 6.081 | 5.442 | 5.154 |
+
+#### optimized
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 22.048 (0.045/20.814/1.190) | 20.231 (0.037/19.284/0.910) | 20.658 (0.038/19.652/0.967) |
+| application: acquire (a call to DisplayService) | 0.142 (0.025/0.075/0.042) | 0.130 (0.022/0.070/0.038) | 0.139 (0.023/0.075/0.042) |
+| application: image mapping looked up | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| application: record the scene | 0.059 (0.059/0.000/0.000) | 0.054 (0.054/0.000/0.000) | 0.054 (0.054/0.000/0.000) |
+| application: record to draw | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| application: draw (prepare and render) | 59.156 (59.156/0.000/0.000) | 57.341 (57.341/0.000/0.000) | 58.586 (58.586/0.000/0.000) |
+| application: damage computed | 0.002 (0.002/0.000/0.000) | 0.003 (0.003/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| application: producer-ready signal | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| transport: present call to DisplayService | 0.027 (0.021/0.004/0.002) | 0.031 (0.016/0.013/0.002) | 0.030 (0.023/0.004/0.002) |
+| DisplayService: dispatch until the present is accepted | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| DisplayService: accepted to blit | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| DisplayService: blit | 34.537 (34.537/0.000/0.000) | 1.815 (1.815/0.000/0.000) | 1.246 (1.246/0.000/0.000) |
+| DisplayService: blit to device call | 0.001 (0.001/0.000/0.000) | 0.000 (0.000/0.000/0.000) | 0.000 (0.000/0.000/0.000) |
+| transport: device call to the driver | 0.021 (0.012/0.006/0.002) | 0.018 (0.011/0.005/0.001) | 0.016 (0.010/0.004/0.002) |
+| driver: build the command | 0.005 (0.005/0.000/0.000) | 0.006 (0.006/0.000/0.000) | 0.007 (0.007/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 1.946 (0.219/0.000/1.727) | 0.837 (0.411/0.000/0.426) | 0.917 (0.476/0.000/0.441) |
+| driver: reply | 0.002 (0.002/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: device call back to DisplayService | 0.016 (0.005/0.003/0.007) | 0.014 (0.005/0.002/0.007) | 0.015 (0.006/0.003/0.007) |
+| DisplayService: completion (release and events) | 0.008 (0.008/0.000/0.000) | 0.007 (0.007/0.000/0.000) | 0.007 (0.007/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| transport: reply back to the application | 0.027 (0.005/0.001/0.020) | 0.022 (0.004/0.001/0.017) | 0.027 (0.005/0.001/0.021) |
+| Measured interval | 118.008 | 80.522 | 81.718 |
+| Residue | 0.000000 | -0.000000 | 0.000000 |
+| Within the requested deadline (subset of pacing) | 15.988 | 15.991 | 15.990 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 6.040 | 4.223 | 4.649 |
+
+</details>
+
+<details>
+<summary>640×480 surface and scanout, direct — ordinary and optimized full accounts</summary>
+
+#### ordinary
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 19.499 (0.249/18.068/1.182) | 19.615 (0.230/18.279/1.107) | 19.705 (0.256/18.287/1.162) |
+| application: acquire (a call to DisplayService) | 0.917 (0.155/0.512/0.249) | 0.724 (0.161/0.353/0.210) | 0.743 (0.163/0.362/0.218) |
+| application: image mapping looked up | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| application: record the scene | 0.058 (0.058/0.000/0.000) | 0.059 (0.059/0.000/0.000) | 0.061 (0.061/0.000/0.000) |
+| application: record to draw | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| application: draw (prepare and render) | 56.972 (56.914/0.000/0.058) | 57.683 (57.648/0.000/0.036) | 58.585 (58.545/0.000/0.040) |
+| application: damage computed | 0.008 (0.008/0.000/0.000) | 0.010 (0.010/0.000/0.000) | 0.009 (0.009/0.000/0.000) |
+| application: producer-ready signal | 0.019 (0.019/0.000/0.000) | 0.020 (0.020/0.000/0.000) | 0.018 (0.018/0.000/0.000) |
+| transport: present call to DisplayService | 0.098 (0.074/0.015/0.009) | 0.112 (0.067/0.035/0.009) | 0.104 (0.068/0.027/0.009) |
+| DisplayService: dispatch until the present is accepted | 0.008 (0.008/0.000/0.000) | 0.011 (0.011/0.000/0.000) | 0.008 (0.008/0.000/0.000) |
+| DisplayService: accepted to blit | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| DisplayService: blit | 0.256 (0.256/0.000/0.000) | 0.039 (0.039/0.000/0.000) | 0.039 (0.039/0.000/0.000) |
+| DisplayService: blit to device call | 0.002 (0.002/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| transport: device call to the driver | 0.080 (0.051/0.016/0.013) | 0.071 (0.044/0.021/0.006) | 0.066 (0.047/0.013/0.006) |
+| driver: build the command | 0.023 (0.023/0.000/0.000) | 0.041 (0.041/0.000/0.000) | 0.037 (0.037/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 1.368 (0.390/0.000/0.978) | 1.118 (0.602/0.000/0.515) | 1.151 (0.596/0.000/0.554) |
+| driver: reply | 0.010 (0.010/0.000/0.000) | 0.008 (0.008/0.000/0.000) | 0.008 (0.008/0.000/0.000) |
+| transport: device call back to DisplayService | 0.091 (0.042/0.018/0.031) | 0.089 (0.042/0.017/0.031) | 0.088 (0.041/0.017/0.030) |
+| DisplayService: completion (release and events) | 0.024 (0.024/0.000/0.000) | 0.024 (0.024/0.000/0.000) | 0.023 (0.023/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: reply back to the application | 0.115 (0.038/0.006/0.072) | 0.109 (0.036/0.005/0.068) | 0.110 (0.036/0.005/0.069) |
+| Measured interval | 79.561 | 79.748 | 80.768 |
+| Residue | 0.000000 | 0.000000 | -0.000000 |
+| Within the requested deadline (subset of pacing) | 15.970 | 15.973 | 15.969 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 3.471 | 3.588 | 3.673 |
+
+#### optimized
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 18.919 (0.033/18.131/0.755) | 18.521 (0.031/17.698/0.792) | 19.265 (0.033/18.378/0.853) |
+| application: acquire (a call to DisplayService) | 0.112 (0.023/0.052/0.037) | 0.158 (0.024/0.080/0.053) | 0.162 (0.024/0.061/0.077) |
+| application: image mapping looked up | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| application: record the scene | 0.054 (0.054/0.000/0.000) | 0.058 (0.058/0.000/0.000) | 0.060 (0.060/0.000/0.000) |
+| application: record to draw | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| application: draw (prepare and render) | 57.903 (57.903/0.000/0.000) | 59.474 (59.474/0.000/0.000) | 59.855 (59.807/0.000/0.048) |
+| application: damage computed | 0.002 (0.002/0.000/0.000) | 0.003 (0.003/0.000/0.000) | 0.003 (0.003/0.000/0.000) |
+| application: producer-ready signal | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| transport: present call to DisplayService | 0.029 (0.023/0.004/0.002) | 0.030 (0.013/0.015/0.002) | 0.030 (0.017/0.011/0.002) |
+| DisplayService: dispatch until the present is accepted | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| DisplayService: accepted to blit | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| DisplayService: blit | 0.247 (0.247/0.000/0.000) | 0.030 (0.030/0.000/0.000) | 0.029 (0.029/0.000/0.000) |
+| DisplayService: blit to device call | 0.001 (0.001/0.000/0.000) | 0.000 (0.000/0.000/0.000) | 0.000 (0.000/0.000/0.000) |
+| transport: device call to the driver | 0.017 (0.011/0.004/0.002) | 0.016 (0.011/0.003/0.001) | 0.012 (0.008/0.003/0.001) |
+| driver: build the command | 0.004 (0.004/0.000/0.000) | 0.006 (0.006/0.000/0.000) | 0.005 (0.005/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 0.980 (0.229/0.000/0.752) | 0.816 (0.405/0.000/0.410) | 0.795 (0.388/0.000/0.407) |
+| driver: reply | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| transport: device call back to DisplayService | 0.016 (0.006/0.003/0.007) | 0.014 (0.006/0.003/0.006) | 0.013 (0.005/0.002/0.006) |
+| DisplayService: completion (release and events) | 0.008 (0.008/0.000/0.000) | 0.007 (0.007/0.000/0.000) | 0.006 (0.006/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| transport: reply back to the application | 0.029 (0.005/0.001/0.023) | 0.025 (0.005/0.001/0.018) | 0.025 (0.004/0.001/0.019) |
+| Measured interval | 78.335 | 79.170 | 80.272 |
+| Residue | 0.000000 | -0.000000 | 0.000000 |
+| Within the requested deadline (subset of pacing) | 15.992 | 15.992 | 15.992 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 2.911 | 2.512 | 3.256 |
+
+</details>
+
+<details>
+<summary>1280×800 surface and scanout, direct — ordinary and optimized full accounts</summary>
+
+#### ordinary
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 20.541 (0.224/19.239/1.077) | 21.618 (0.230/20.273/1.116) | 21.176 (0.234/19.681/1.261) |
+| application: acquire (a call to DisplayService) | 0.778 (0.139/0.412/0.226) | 0.640 (0.121/0.325/0.194) | 0.704 (0.154/0.304/0.247) |
+| application: image mapping looked up | 0.004 (0.004/0.000/0.000) | 0.004 (0.004/0.000/0.000) | 0.005 (0.005/0.000/0.000) |
+| application: record the scene | 0.064 (0.064/0.000/0.000) | 0.058 (0.058/0.000/0.000) | 0.067 (0.067/0.000/0.000) |
+| application: record to draw | 0.003 (0.003/0.000/0.000) | 0.003 (0.003/0.000/0.000) | 0.004 (0.004/0.000/0.000) |
+| application: draw (prepare and render) | 143.947 (143.947/0.000/0.000) | 141.383 (141.383/0.000/0.000) | 141.993 (141.957/0.000/0.036) |
+| application: damage computed | 0.012 (0.012/0.000/0.000) | 0.015 (0.015/0.000/0.000) | 0.013 (0.013/0.000/0.000) |
+| application: producer-ready signal | 0.032 (0.032/0.000/0.000) | 0.034 (0.034/0.000/0.000) | 0.033 (0.033/0.000/0.000) |
+| transport: present call to DisplayService | 0.134 (0.106/0.015/0.012) | 0.155 (0.087/0.056/0.012) | 0.139 (0.109/0.018/0.012) |
+| DisplayService: dispatch until the present is accepted | 0.011 (0.011/0.000/0.000) | 0.011 (0.011/0.000/0.000) | 0.013 (0.013/0.000/0.000) |
+| DisplayService: accepted to blit | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.003 (0.003/0.000/0.000) |
+| DisplayService: blit | 0.884 (0.884/0.000/0.000) | 0.090 (0.090/0.000/0.000) | 0.079 (0.079/0.000/0.000) |
+| DisplayService: blit to device call | 0.004 (0.004/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: device call to the driver | 0.086 (0.059/0.018/0.009) | 0.085 (0.054/0.025/0.007) | 0.076 (0.055/0.012/0.008) |
+| driver: build the command | 0.032 (0.032/0.000/0.000) | 0.048 (0.048/0.000/0.000) | 0.045 (0.045/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 2.475 (0.390/0.000/2.085) | 1.174 (0.619/0.000/0.554) | 1.163 (0.618/0.000/0.545) |
+| driver: reply | 0.009 (0.009/0.000/0.000) | 0.009 (0.009/0.000/0.000) | 0.009 (0.009/0.000/0.000) |
+| transport: device call back to DisplayService | 0.094 (0.043/0.018/0.033) | 0.090 (0.041/0.016/0.033) | 0.093 (0.042/0.017/0.034) |
+| DisplayService: completion (release and events) | 0.027 (0.027/0.000/0.000) | 0.026 (0.026/0.000/0.000) | 0.029 (0.029/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: reply back to the application | 0.135 (0.038/0.007/0.091) | 0.127 (0.035/0.006/0.086) | 0.133 (0.037/0.007/0.089) |
+| Measured interval | 169.276 | 165.575 | 165.779 |
+| Residue | 0.000000 | 0.000000 | -0.000000 |
+| Within the requested deadline (subset of pacing) | 15.958 | 15.965 | 15.963 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 4.515 | 5.595 | 5.149 |
+
+#### optimized
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 20.165 (0.046/19.164/0.956) | 21.547 (0.048/20.411/1.088) | 19.681 (0.038/18.769/0.875) |
+| application: acquire (a call to DisplayService) | 0.115 (0.025/0.053/0.037) | 0.095 (0.024/0.042/0.029) | 0.098 (0.024/0.045/0.028) |
+| application: image mapping looked up | 0.002 (0.002/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| application: record the scene | 0.070 (0.070/0.000/0.000) | 0.069 (0.069/0.000/0.000) | 0.068 (0.068/0.000/0.000) |
+| application: record to draw | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| application: draw (prepare and render) | 146.981 (146.981/0.000/0.000) | 145.941 (145.941/0.000/0.000) | 147.677 (147.677/0.000/0.000) |
+| application: damage computed | 0.004 (0.004/0.000/0.000) | 0.005 (0.005/0.000/0.000) | 0.003 (0.003/0.000/0.000) |
+| application: producer-ready signal | 0.007 (0.007/0.000/0.000) | 0.007 (0.007/0.000/0.000) | 0.006 (0.006/0.000/0.000) |
+| transport: present call to DisplayService | 0.050 (0.040/0.007/0.003) | 0.050 (0.020/0.027/0.003) | 0.042 (0.032/0.007/0.003) |
+| DisplayService: dispatch until the present is accepted | 0.005 (0.005/0.000/0.000) | 0.005 (0.005/0.000/0.000) | 0.005 (0.005/0.000/0.000) |
+| DisplayService: accepted to blit | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| DisplayService: blit | 0.940 (0.940/0.000/0.000) | 0.106 (0.106/0.000/0.000) | 0.097 (0.097/0.000/0.000) |
+| DisplayService: blit to device call | 0.001 (0.001/0.000/0.000) | 0.000 (0.000/0.000/0.000) | 0.000 (0.000/0.000/0.000) |
+| transport: device call to the driver | 0.019 (0.013/0.005/0.002) | 0.016 (0.011/0.004/0.001) | 0.015 (0.010/0.003/0.001) |
+| driver: build the command | 0.007 (0.007/0.000/0.000) | 0.009 (0.009/0.000/0.000) | 0.010 (0.010/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 2.357 (0.287/0.000/2.070) | 1.033 (0.507/0.000/0.527) | 1.097 (0.543/0.000/0.553) |
+| driver: reply | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) | 0.002 (0.002/0.000/0.000) |
+| transport: device call back to DisplayService | 0.023 (0.008/0.004/0.010) | 0.017 (0.006/0.003/0.008) | 0.030 (0.006/0.003/0.020) |
+| DisplayService: completion (release and events) | 0.012 (0.012/0.000/0.000) | 0.009 (0.009/0.000/0.000) | 0.009 (0.009/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) | 0.001 (0.001/0.000/0.000) |
+| transport: reply back to the application | 0.043 (0.007/0.002/0.035) | 0.033 (0.005/0.001/0.026) | 0.030 (0.005/0.001/0.023) |
+| Measured interval | 170.806 | 168.948 | 168.875 |
+| Residue | -0.000000 | 0.000000 | -0.000000 |
+| Within the requested deadline (subset of pacing) | 15.986 | 15.988 | 15.991 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 4.156 | 5.538 | 3.672 |
+
+</details>
+
+### Pixels, copies, mappings and hidden surfaces
+
+| Path | Shape | Source pixels read | Output pixels written | Blit ms | Device commands/frame |
+| --- | --- | --- | --- | --- | --- |
+| scaled | whole | 307200.0 | 852800.0 | 34.194 | 2.00 |
+| scaled | partial | 15304.1 | 43242.4 | 1.752 | 4.21 |
+| scaled | multi-rect | 9914.0 | 27913.7 | 1.167 | 4.00 |
+| small-direct | whole | 307200.0 | 307200.0 | 0.256 | 2.00 |
+| small-direct | partial | 15304.1 | 15304.1 | 0.039 | 4.21 |
+| small-direct | multi-rect | 9914.0 | 9914.0 | 0.039 | 4.00 |
+| direct | whole | 1024000.0 | 1024000.0 | 0.884 | 2.00 |
+| direct | partial | 42167.0 | 42167.0 | 0.090 | 4.21 |
+| direct | multi-rect | 27055.3 | 27055.3 | 0.079 | 4.00 |
+
+The application draws directly into its mapped surface image. DisplayService makes one copy into scanout for each damaged region: row copies at equal size, or the existing generic per-pixel nearest-neighbour conversion for scaling (whole scaled output is 1066×800). The device then receives TRANSFER_TO_HOST_2D and RESOURCE_FLUSH for its merged damage rectangles: another host-resource pixel transfer, not another application-side copy. Multiple rectangles can mean more than two commands per frame. The surface image and scanout mappings are per generation/driver lifetime (`app::Surface` mapping and `virtio_gpu` scanout allocation); acquire looks up the current mapping, rather than mapping the full image every frame. No extra copy or mapping was removed for this measurement.
+
+| Profile | Extra hidden surfaces | Wait handles | Passes | Enter wait µs | Leave wait µs | Whole interval ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| ordinary | 0 | 21 | 306 | 119.13 | 108.21 | 117.079 |
+| ordinary | 15 | 36 | 306 | 155.81 | 132.91 | 118.413 |
+| optimized | 0 | 21 | 306 | 21.71 | 24.13 | 118.008 |
+| optimized | 15 | 36 | 306 | 28.03 | 31.86 | 119.151 |
+
+The present chain still has one visible surface; hidden surfaces add channels to the dispatch wait set, not composition or copied pixels. The current count is 21 versus 36 handles, replacing the older 14/29 counts. The increase in loop cost is measurable, but remains far below the draw and scaled blit.
+
+### Primitives, device polling and pool
+
+| Guest primitive | Ordinary | Optimized |
+| --- | --- | --- |
+| SYS_DEBUG_NOOP, ns | 46.000 | 34.000 |
+| 640×480 (300 pages): create, ms | 0.740 | 0.038 |
+| 640×480: map, ms | 0.195 | 0.054 |
+| 640×480: touch, ms | 0.078 | 0.074 |
+| 640×480: copy, ms | 0.116 | 0.106 |
+| 640×480: unmap, ms | 0.139 | 0.053 |
+| 1280×800 (1,000 pages): create, ms | 2.371 | 0.467 |
+| 1280×800: map, ms | 0.687 | 0.240 |
+| 1280×800: touch, ms | 0.298 | 0.348 |
+| 1280×800: copy, ms | 0.338 | 0.344 |
+| 1280×800: unmap, ms | 0.433 | 0.160 |
+| acquire IPC round trip minus service handling, median ms | 0.602 | 0.103 |
+| present IPC round trip minus service handling, median ms | 0.207 | 0.051 |
+| Channel wake, median / mean ms | 0.027 / 0.150 | 0.006 / 0.027 |
+| Deadline wake, median / mean ms | 0.944 / 0.881 | 0.757 / 0.685 |
+
+Memory operations use 20 rounds, syscall timing 100,000 calls, and dormant-site timing one million calls. Back-to-back x86 site-clock reads measured 36 cycles minimum / 38 median (about 13.9 / 14.6 ns); that is far below the microsecond boundaries in the account. Port anchor rates state their counter scales; these are consistency runs, not separate port primitive benchmarks.
+
+| Profile | Shape | Notify→observed wall ms | Spin CPU ms | Blocked ms | Runnable ms | Yields/frame | Polls/frame |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ordinary | whole | 2.038 | 0.341 | 0.000 | 1.696 | 1.05 | 7781.3 |
+| ordinary | partial | 1.049 | 0.575 | 0.000 | 0.474 | 1.45 | 14632.7 |
+| ordinary | multi-rect | 1.044 | 0.562 | 0.000 | 0.482 | 1.50 | 14297.4 |
+| optimized | whole | 1.946 | 0.219 | 0.000 | 1.727 | 4.11 | 18494.4 |
+| optimized | partial | 0.837 | 0.411 | 0.000 | 0.426 | 7.79 | 40351.9 |
+| optimized | multi-rect | 0.917 | 0.476 | 0.000 | 0.441 | 9.89 | 48070.0 |
+
+Device observation wall time includes host-device progress and the driver’s delay before observing completion. For example, the ordinary whole-frame 2.038 ms contains only 0.341 ms of guest spin and 1.696 ms runnable delay. It is not a measurement of 2.038 ms of pure QEMU computation. Spin is named explicitly and never classified as useful rendering work.
+
+| Profile | Workers | Lanes | Units | Draw ms | Interval ms |
+| --- | --- | --- | --- | --- | --- |
+| ordinary | 1 | 1 | 8 | 58.727 | 101.709 |
+| ordinary | default | 4 | 80 | 60.560 | 104.024 |
+| optimized | 1 | 1 | 8 | 59.455 | 101.208 |
+| optimized | default | 4 | 80 | 60.674 | 102.881 |
+
+The pool row is separate from the serial account. Four default lanes share the same four vCPUs with services and do not improve this live scene’s mean here. Every account/offscreen run is pinned to one lane and the collector independently rejects a second demo thread running during a draw.
+
+### The system charge and what the profile changes
+
+| Profile | Path | Shape | Offscreen frame ms | Real interval ms | Charge / ratio | Without chosen park time: charge / ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| ordinary | scaled | whole | 41.732 | 117.079 | +75.347 / 2.81× | +59.386 / 2.42× |
+| ordinary | scaled | partial | 41.732 | 84.169 | +42.437 / 2.02× | +26.474 / 1.63× |
+| ordinary | scaled | multi-rect | 41.732 | 82.253 | +40.521 / 1.97× | +24.555 / 1.59× |
+| ordinary | small-direct | whole | 41.732 | 79.561 | +37.829 / 1.91× | +21.859 / 1.52× |
+| ordinary | small-direct | partial | 41.732 | 79.748 | +38.016 / 1.91× | +22.043 / 1.53× |
+| ordinary | small-direct | multi-rect | 41.732 | 80.768 | +39.036 / 1.94× | +23.067 / 1.55× |
+| ordinary | direct | whole | 125.820 | 169.276 | +43.456 / 1.35× | +27.498 / 1.22× |
+| ordinary | direct | partial | 125.820 | 165.575 | +39.755 / 1.32× | +23.791 / 1.19× |
+| ordinary | direct | multi-rect | 125.820 | 165.779 | +39.959 / 1.32× | +23.995 / 1.19× |
+| optimized | scaled | whole | 42.093 | 118.008 | +75.915 / 2.80× | +59.927 / 2.42× |
+| optimized | scaled | partial | 42.093 | 80.522 | +38.429 / 1.91× | +22.438 / 1.53× |
+| optimized | scaled | multi-rect | 42.093 | 81.718 | +39.625 / 1.94× | +23.634 / 1.56× |
+| optimized | small-direct | whole | 42.093 | 78.335 | +36.242 / 1.86× | +20.250 / 1.48× |
+| optimized | small-direct | partial | 42.093 | 79.170 | +37.077 / 1.88× | +21.085 / 1.50× |
+| optimized | small-direct | multi-rect | 42.093 | 80.272 | +38.179 / 1.91× | +22.187 / 1.53× |
+| optimized | direct | whole | 128.354 | 170.806 | +42.452 / 1.33× | +26.466 / 1.21× |
+| optimized | direct | partial | 128.354 | 168.948 | +40.594 / 1.32× | +24.606 / 1.19× |
+| optimized | direct | multi-rect | 128.354 | 168.875 | +40.521 / 1.32× | +24.531 / 1.19× |
+
+Both profiles use their own measured offscreen reference and the same release binaries. The optimized rows are the comparison without the ordinary dev build’s extra kernel/driver work; a change in the entire interval is not automatically assigned to compiler cost, since the unchanged release draw and the waits also vary. The explicitly kernel/driver-sensitive group—acquire, all four transport crossings, driver command/reply and DisplayService’s dispatch/completion edges—changes as follows:
+
+| Scaled shape | Ordinary group ms | Optimized group ms | Measured reduction ms |
+| --- | --- | --- | --- |
+| whole | 1.364 | 0.253 | 1.111 |
+| partial | 1.086 | 0.235 | 0.851 |
+| multi-rect | 1.510 | 0.248 | 1.262 |
+
+This measured reduction is about 0.85–1.26 ms per scaled frame (roughly 1–1.5%), not the dominant cost. The syscall/IPC/allocation primitives likewise improve under opt-level 2. Release draw or blit differences are not reclassified as unoptimized application code.
+
+| Profile | Dormant live draw ms | Draw after 60 ms warm-core spin | Offscreen draw ms | Draw reduction ms |
+| --- | --- | --- | --- | --- |
+| ordinary | 58.727 | 42.594 | 41.713 | 16.133 |
+| optimized | 59.455 | 43.091 | 42.075 | 16.364 |
+
+Keeping the core busy before drawing brings the live draw near the offscreen result, supporting the same idle-core/host scheduling-condition explanation on this tree. The spin increases total interval and burns CPU; it is a measurement intervention, not an optimization. No precise host frequency or hardware mechanism is inferred from the guest trace.
+
+### Emulated ports, measured last
+
+| Port (TCG) | Shape | Interval ms | Draw ms | Scaled blit ms | Before deadline ms | Beyond deadline ms | Residue |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| aarch64 | whole | 1691.692 | 1145.011 | 476.424 | 15.111 | 35.331 | 0.000000% |
+| aarch64 | partial | 1238.187 | 1145.807 | 25.134 | 15.200 | 35.438 | 0.000000% |
+| aarch64 | multi-rect | 1227.816 | 1144.896 | 16.253 | 15.192 | 35.396 | 0.000000% |
+| riscv64 | whole | 2464.371 | 1630.555 | 718.062 | 14.783 | 73.631 | 0.000000% |
+| riscv64 | partial | 1767.117 | 1621.298 | 36.818 | 14.825 | 69.816 | 0.000000% |
+| riscv64 | multi-rect | 1755.028 | 1622.001 | 24.836 | 14.883 | 69.311 | 0.000000% |
+
+<details>
+<summary>aarch64 emulated scaled account — all boundaries</summary>
+
+#### aarch64 (dev opt-level 0 kernel/driver; release application/DisplayService)
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 51.670 (2.302/48.247/1.121) | 51.789 (2.182/49.260/0.347) | 51.740 (2.208/49.218/0.314) |
+| application: acquire (a call to DisplayService) | 4.408 (0.930/1.482/1.996) | 3.343 (0.903/1.214/1.226) | 3.369 (0.909/1.192/1.268) |
+| application: image mapping looked up | 0.071 (0.071/0.000/0.000) | 0.068 (0.068/0.000/0.000) | 0.068 (0.068/0.000/0.000) |
+| application: record the scene | 0.562 (0.562/0.000/0.000) | 0.555 (0.555/0.000/0.000) | 0.546 (0.546/0.000/0.000) |
+| application: record to draw | 0.056 (0.056/0.000/0.000) | 0.055 (0.055/0.000/0.000) | 0.062 (0.062/0.000/0.000) |
+| application: draw (prepare and render) | 1145.011 (1144.758/0.000/0.253) | 1145.807 (1145.656/0.000/0.151) | 1144.896 (1144.428/0.000/0.468) |
+| application: damage computed | 0.187 (0.187/0.000/0.000) | 0.219 (0.219/0.000/0.000) | 0.206 (0.206/0.000/0.000) |
+| application: producer-ready signal | 0.538 (0.538/0.000/0.000) | 0.538 (0.538/0.000/0.000) | 0.527 (0.527/0.000/0.000) |
+| transport: present call to DisplayService | 1.907 (1.248/0.332/0.326) | 2.382 (1.326/0.727/0.329) | 2.126 (1.255/0.518/0.353) |
+| DisplayService: dispatch until the present is accepted | 0.276 (0.276/0.000/0.000) | 0.330 (0.330/0.000/0.000) | 0.301 (0.301/0.000/0.000) |
+| DisplayService: accepted to blit | 0.084 (0.084/0.000/0.000) | 0.095 (0.095/0.000/0.000) | 0.083 (0.083/0.000/0.000) |
+| DisplayService: blit | 476.424 (476.403/0.000/0.021) | 25.134 (25.134/0.000/0.000) | 16.253 (16.211/0.000/0.042) |
+| DisplayService: blit to device call | 0.108 (0.108/0.000/0.000) | 0.045 (0.045/0.000/0.000) | 0.043 (0.043/0.000/0.000) |
+| transport: device call to the driver | 2.105 (1.106/0.621/0.378) | 1.674 (0.827/0.561/0.286) | 1.414 (0.785/0.369/0.260) |
+| driver: build the command | 0.692 (0.692/0.000/0.000) | 0.829 (0.829/0.000/0.000) | 0.761 (0.761/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 3.042 (2.340/0.000/0.702) | 0.962 (0.962/0.000/0.000) | 0.969 (0.969/0.000/0.000) |
+| driver: reply | 0.169 (0.169/0.000/0.000) | 0.144 (0.144/0.000/0.000) | 0.143 (0.143/0.000/0.000) |
+| transport: device call back to DisplayService | 1.564 (0.482/0.314/0.768) | 1.448 (0.463/0.226/0.759) | 1.454 (0.464/0.232/0.758) |
+| DisplayService: completion (release and events) | 0.684 (0.684/0.000/0.000) | 0.696 (0.696/0.000/0.000) | 0.667 (0.667/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.056 (0.056/0.000/0.000) | 0.063 (0.063/0.000/0.000) | 0.055 (0.055/0.000/0.000) |
+| transport: reply back to the application | 2.079 (0.468/0.186/1.425) | 2.011 (0.457/0.187/1.367) | 2.134 (0.456/0.176/1.502) |
+| Measured interval | 1691.692 | 1238.187 | 1227.816 |
+| Residue | 0.000000 | 0.000000 | 0.000000 |
+| Within the requested deadline (subset of pacing) | 15.111 | 15.200 | 15.192 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 35.331 | 35.438 | 35.396 |
+
+</details>
+
+<details>
+<summary>riscv64 emulated scaled account — all boundaries</summary>
+
+#### riscv64 (dev opt-level 0 kernel/driver; release application/DisplayService)
+
+Milliseconds per frame: **total (on CPU / blocked / runnable)**. For the device row, on-CPU time is polling, not useful guest computation.
+
+| Term | Whole (76) | Partial (38) | Two rectangles (38) |
+| --- | --- | --- | --- |
+| application: pacing wait and frame-loop step | 90.118 (3.614/85.239/1.266) | 86.293 (3.571/82.060/0.663) | 85.788 (3.489/81.890/0.409) |
+| application: acquire (a call to DisplayService) | 7.343 (1.671/3.419/2.253) | 5.536 (1.650/2.128/1.757) | 5.526 (1.653/2.072/1.800) |
+| application: image mapping looked up | 0.085 (0.085/0.000/0.000) | 0.084 (0.084/0.000/0.000) | 0.084 (0.084/0.000/0.000) |
+| application: record the scene | 0.565 (0.565/0.000/0.000) | 0.557 (0.557/0.000/0.000) | 0.561 (0.561/0.000/0.000) |
+| application: record to draw | 0.085 (0.085/0.000/0.000) | 0.082 (0.082/0.000/0.000) | 0.082 (0.082/0.000/0.000) |
+| application: draw (prepare and render) | 1630.555 (1629.580/0.000/0.976) | 1621.298 (1620.496/0.000/0.802) | 1622.001 (1621.922/0.000/0.078) |
+| application: damage computed | 0.266 (0.266/0.000/0.000) | 0.297 (0.297/0.000/0.000) | 0.273 (0.273/0.000/0.000) |
+| application: producer-ready signal | 0.637 (0.637/0.000/0.000) | 0.621 (0.621/0.000/0.000) | 0.623 (0.623/0.000/0.000) |
+| transport: present call to DisplayService | 2.902 (2.051/0.436/0.415) | 3.364 (2.089/0.854/0.421) | 3.110 (2.040/0.653/0.417) |
+| DisplayService: dispatch until the present is accepted | 0.368 (0.368/0.000/0.000) | 0.410 (0.410/0.000/0.000) | 0.392 (0.392/0.000/0.000) |
+| DisplayService: accepted to blit | 0.128 (0.128/0.000/0.000) | 0.131 (0.131/0.000/0.000) | 0.126 (0.126/0.000/0.000) |
+| DisplayService: blit | 718.062 (718.005/0.000/0.057) | 36.818 (36.743/0.000/0.075) | 24.836 (24.763/0.000/0.073) |
+| DisplayService: blit to device call | 0.161 (0.161/0.000/0.000) | 0.068 (0.068/0.000/0.000) | 0.071 (0.071/0.000/0.000) |
+| transport: device call to the driver | 3.102 (1.822/0.732/0.548) | 2.608 (1.538/0.725/0.346) | 2.419 (1.559/0.470/0.390) |
+| driver: build the command | 0.842 (0.842/0.000/0.000) | 1.171 (1.171/0.000/0.000) | 1.081 (1.081/0.000/0.000) |
+| device: acknowledgement (notify to observed completion) | 1.861 (1.861/0.000/0.000) | 0.871 (0.871/0.000/0.000) | 0.914 (0.914/0.000/0.000) |
+| driver: reply | 0.220 (0.220/0.000/0.000) | 0.200 (0.200/0.000/0.000) | 0.212 (0.212/0.000/0.000) |
+| transport: device call back to DisplayService | 2.588 (1.211/0.315/1.062) | 2.378 (1.067/0.322/0.989) | 2.397 (1.077/0.298/1.022) |
+| DisplayService: completion (release and events) | 0.948 (0.948/0.000/0.000) | 0.924 (0.924/0.000/0.000) | 0.936 (0.936/0.000/0.000) |
+| DisplayService: completion to reply sent | 0.081 (0.081/0.000/0.000) | 0.081 (0.081/0.000/0.000) | 0.081 (0.081/0.000/0.000) |
+| transport: reply back to the application | 3.456 (1.095/0.253/2.107) | 3.324 (1.132/0.247/1.945) | 3.515 (1.062/0.253/2.200) |
+| Measured interval | 2464.371 | 1767.117 | 1755.028 |
+| Residue | 0.000000 | 0.000000 | -0.000000 |
+| Within the requested deadline (subset of pacing) | 14.783 | 14.825 | 14.883 |
+| Elapsed beyond deadline: work + waiting (subset of pacing) | 73.631 | 69.816 | 69.311 |
+
+</details>
+
+Both ports retain the same scaled surface/output dimensions and damage grouping, and all joins and work/wait sums close. The instruction-heavy draw and generic scale grow under TCG while the fixed 16 ms policy becomes a much smaller share. A port’s large overshoot is elapsed time beyond its requested deadline under emulation. It includes on-CPU wait/syscall/instrument and return-path work as well as timer/wake/scheduling delay; the pacing work/wait pairs remain separate. It is not evidence that native 10 ms quantization alone costs that amount. Counter sources, not per-hart cycle counts, keep the cross-core joins meaningful. These checks support the account’s boundary decomposition and explain changed shares; they do not rank native ARM, RISC-V and x86 hardware.
+
+### Classification and follow-ups
+
+Every x86 term above five percent is covered by these classes, with its optimized figure in the tables above:
+
+| Term | Classification and evidence |
+| --- | --- |
+| Draw in a whole frame | Work that has to happen for this renderer/scene, with an additional measured idle-core-condition component: warm-core and offscreen comparisons separate the latter without claiming a guest code optimization. |
+| Whole-scene replay in partial/two-rectangle frames | Work done more often than necessary: damage covers about 15,304 / 9,914 of 307,200 source pixels, yet the serial draw remains around 57–59 ms. Missing primitive: damage-limited replay. |
+| Scaled blit | Work done the long way for want of a same-format scaled-copy primitive: whole 640×480→1066×800 blit 34.194 ms ordinary / 34.537 ms optimized, compared with 0.256 ms for direct 640×480. Missing primitive: specialized nearest-neighbour copy or display scaling. |
+| Park time before the fixed deadline | A wait chosen by the program. The policy is 16 ms; actual finite-park time is reported separately and removed in the charge column. |
+| Deadline overshoot and idle-core-condition draw component | Predominantly scheduling/waiting consequences on x86, bounded by the pacing row’s small total on-CPU component. Corrected scaled overshoot exceeds 5% and remains after compiler optimization; the elapsed span also includes syscall/instrument work, so it is not all pure tick quantization or blocked time. |
+| Ordinary dev-profile cost | Measured separately, about 0.85–1.26 ms in the kernel/driver-sensitive group; below 5%. No dominant release-code term disappears in the optimized run. |
+
+The existing missing-primitive follow-ups remain, with current numbers rather than an implementation change: same-format scaled copy; direct scanout of the one visible client image to remove the DisplayService copy; device resources backed by guest memory to avoid TRANSFER_TO_HOST_2D; and damage-limited replay. Device completion is only roughly 1–2.5 ms here and includes observable scheduling delay, so the entire wall time is not promised as removable device-copy work. No compositor or extra visible-surface path was invented. Disproofs are retained: IPC/dispatch is not the dominant tens-of-milliseconds gap; fifteen hidden surfaces do not add composition; direct full-size row copying is below 1 ms; opt-level 2 does not remove the renderer/scaler costs; and four worker lanes do not improve this live workload on four vCPUs. No speed change was made in this milestone.
+
+
 ## Where a 2D frame's time goes, layer by layer (2026-09-27)
+
+**Historical account:** the final-tree account above supersedes this section’s current-performance comparisons. Its original chosen-wait/rounding split (including 16.91/18.26 ms and the 16–18 ms classification) was biased by counting a remaining deadline again after an early wake; those subfigures are not accepted measurements of policy delay. The fixed policy is 16 ms. The original raw measurements and insertion A/B remain historical evidence; the corrected 2026-10-08 account separates elapsed time within and beyond each requested deadline.
 
 The live 2D demo at 640x480 drew in 79.6 ms and presented every 132.4 ms (the 2026-09-15 row below), and
 nothing in the tree said where the other 52.8 ms went. This section is the account: every millisecond of a

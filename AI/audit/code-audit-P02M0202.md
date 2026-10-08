@@ -322,3 +322,228 @@ Still unperformed in this continuation: guest TCPCI runs (including both device-
 the real UCSI laptop/port-controller run. Hardware remains externally blocked until an owner-provided board is
 available; the fixtures do not discharge that criterion. Long guest runs are deferred until the coordinated end
 of the whole job, as requested.
+
+Additional fresh verification: `cargo test --offline --manifest-path src/user/drivers/core/Cargo.toml --lib typec`
+passed all 11 driver adapter/description tests; `cargo fmt --manifest-path src/user/libs/driver/usb-pd/Cargo.toml --
+--check` and `git diff --check` exited 0.
+
+The canonical USB-C power adapter also passed: `cargo test --offline --manifest-path
+src/user/libs/power/model/Cargo.toml usbc` (6 tests). The parallel platform-device continuation registered the two
+required guest variants in `check.sh` and the verification model: `typec-tcpci-aarch64` and `typec-tcpci-riscv64`,
+each invokes the existing gate with `--arch`; executing them remains part of final verification.
+
+Final verification commands queued after the shared builds settle, in this order (not yet executed):
+1. `LIBER_DEVELOPMENT=1 ./check.sh --gate typec-tcpci` — x86_64 KVM response budget and all functional cases.
+2. `LIBER_DEVELOPMENT=1 ./check.sh --gate typec-tcpci-aarch64` — the same cases over the device tree, source timer
+   stretch 100, timing reported without applying the KVM response budget.
+3. `LIBER_DEVELOPMENT=1 ./check.sh --gate typec-tcpci-riscv64` — the equivalent device-tree port run.
+Each invocation will receive a fresh `RUN_STATUS_FILE`; terminal exit records, not quiet logs, decide the result.
+
+Hardware limitation: the plan's final criterion asks for an owner-provided board and its final note specifies a real
+UCSI laptop and a real port controller. This workspace/task provides no such machine or access path. No live host
+Type-C power operation was attempted. An eventual hardware record can name the actual laptop/controller and the
+revision run and retain its observed behavior; no additional hardware acceptance criteria are invented here.
+Current simulated results and the specification check do not establish any physical-board observation. The
+hardware checkbox and milestone completion therefore remain open even if both port fixtures pass.
+
+Final-build gate attempt (2026-10-08): all-architecture source-frozen build passed (487 s; root log
+`.build/logs/end-of-job/continuation-build-all-final.log`). The first fresh
+`LIBER_DEVELOPMENT=1 RUN_STATUS_FILE=.build/logs/end-of-job/continuation-typec-tcpci-x86.status ./check.sh --gate typec-tcpci`
+FAILED, exit 1 after 297 s, at less-power renegotiation. Charger31 15 V/2 A, swaps, malformed messages, Wait and
+Reject cases passed. The partner accepted a correct 5 V request, then the I2C and GPIO requests stopped completing;
+the driver reported `write 0x1c: Controller` and its restart could not scope the alert line. This is not an expected
+case or a pass. Full initial evidence is preserved in `.build/logs/end-of-job/typec-tcpci-x86-failed-less/` and
+`continuation-typec-tcpci-x86.log`/`.status`. Ports have not run yet.
+
+Diagnosis in progress: an exact extracted prefix of the gate through the less-power case is running with
+`TCPC_TRACE=1` from `.build/logs/end-of-job/check-typec-tcpci-debug.sh`. Only HERE and log destination changed.
+The backend's existing SIGUSR1 stack diagnostic will identify a live stall if it recurs. This subset cannot count
+as full-gate or response-timing evidence; acceptance thresholds are unchanged.
+
+Cross-page backend diagnosis and correction (2026-10-08): diagnostic subset reproduced the same failure. The
+trace shows endless IOTLB misses at 0x6000, each immediately answered with a successful 0x6000+0x1000 update.
+The owned backend's SIGUSR1 stack was `recv_message -> Device.ask -> Space.view -> ring -> Vring.put_used`.
+The actual I2C ring uses base 0x5808; slot 254's 8-byte completion is at 0x5FFC and crosses the page boundary.
+`Iotlb.translate` refuses a range spanning two entries, so the old combined access repeatedly asked for the
+already-mapped second page and never returned to either controller or the partner timers. Diagnostic logs:
+`.build/logs/end-of-job/typec-tcpci-debug/`; subset exited 1, not accepted as timing evidence.
+
+The parallel platform-device implementer corrected only `Vring.put_used` in `src/harness/vhost-i2c-gpio.py`:
+write head and length as two aligned 4-byte stores, then publish the used index last. Its new host regression
+matches the actual ring layout with adjacent IOVAs mapped to noncontiguous host pages and checks ordering of the
+published index. On the old code: 1 failure / 19 tests (other 18 passed),
+`.build/logs/end-of-job/continuation-vhost-cross-page-before.log`. After the correction:
+`python3 src/harness/vhost-i2c-gpio.py --self-test` passed all 19, with syntax and diff checks passing; evidence
+`continuation-vhost-cross-page-after.log`. Reviewed the narrow fix and regression independently. This is a required
+fixture correction exposed by exercising the specified TCPCI gate; no guest driver or timing threshold changed.
+
+Full non-trace x86 gate restarted with fresh result path `continuation-typec-tcpci-x86-retry.status` and log
+`continuation-typec-tcpci-x86-retry.log`. Runtime/Rust sources remain those in the final all-architecture build;
+only the Python backend changed, so no additional all-architecture build is required for that correction.
+
+Corrected full x86_64 TCPCI run PASSED (2026-10-08), terminal exit 0 after 496 s:
+`LIBER_DEVELOPMENT=1 RUN_STATUS_FILE=.build/logs/end-of-job/continuation-typec-tcpci-x86-retry.status ./check.sh --gate typec-tcpci`.
+Every original case passed, including the formerly failing 15 V -> 5 V -> 15 V renegotiation, malformed messages,
+Wait/Reject, both VBUS alarm paths, reset timer bounds/recovery, weak/non-PD/silent sources, controller dependency
+withdrawal and rebind, refusal to sleep with an active contract, and charger attachment while asleep with the sink
+path disabled until resume. Independent source model reported no protocol/power violations. The 200-negotiation
+KVM timing result was p50 3.939 ms, p99 6.543 ms, maximum 6.936 ms, zero timeouts, 5–6 register transfers: passes
+unchanged p99 <= 15 ms and no response >= 24 ms limits. Timing ran without competing builds/guests or tracing.
+Root's post-fixture source-hygiene also passed in 93 s before this guest reached its test cases.
+
+Evidence: `.build/logs/end-of-job/continuation-typec-tcpci-x86-retry.log` and `.status`;
+`.build/logs/typec-tcpci/` detailed guest/probe/partner logs. The earlier failed result remains preserved separately.
+The aarch64 device-tree gate is now running with a fresh `continuation-typec-tcpci-aarch64.status` result path.
+Both port criteria and the physical-board criterion remain open until their actual results exist.
+
+First aarch64 run FAILED, native exit 1 after 457 s:
+`LIBER_DEVELOPMENT=1 RUN_STATUS_FILE=.build/logs/end-of-job/continuation-typec-tcpci-aarch64.status ./check.sh --gate typec-tcpci-aarch64`.
+TCPCI successfully bound through the device tree and published its connector/power source after an initial timed-out
+initialization retry. TypeCService nevertheless listed zero connectors. Serial lines 384–386 identify the sequence:
+opening the update stream timed out; DeviceManager refused another consumer while the previous closed connection
+still counted against the limit; TypeCService abandoned the provider. Evidence preserved before any rerun in
+`.build/logs/end-of-job/typec-tcpci-aarch64-failed-adoption/` plus the gate's `.log` and `.status`.
+
+Actual service correction in `src/user/services/core/src/typec_service.rs`: catalogue-open failures now enter the
+same existing seven-attempt bounded ProviderRetry as failed update-stream opens. The update-stream deadline begins
+at the actual call, retry delay at the actual failure, and registry snapshot budget at actual provider admission.
+Previously all three used a clock captured before the potentially slow catalogue call. No timeout was increased.
+Root independently confirmed the lifecycle diagnosis and corrected the same PowerService path within P02M0181.
+
+The plan requires bounded subscriber behavior. TypeCService still had blocking public enumeration, subscribe-open
+and connection replies, despite its bounded live-stream registry. These now use the established PowerService
+nonblocking send/close-on-full behavior; failed stream handoff closes both newly-created endpoints and removes its
+registry subscription, failed connection handoff releases both endpoints. Subscription refusals also return send
+failure so an unread refusal queue closes rather than silently retaining the client.
+
+Added the development `typeccheck stalled` regression in `typeccheck.rs`: fill enumeration replies without reading,
+then subscription replies without reading; each connection must close within the probe's existing WAIT bound,
+and another reader must still enumerate. The TCPCI gate invokes it before attaching a charger. The gate now first
+awaits the initial detached connector snapshot before asserting exactly one connector: service online is not a
+barrier for asynchronous provider adoption. All original case/timing assertions remain unchanged.
+
+Fast checks: `cargo test --offline --manifest-path src/user/services/logic/Cargo.toml provider_retry` passed all 3
+existing bounded-delay/exhaustion/withdrawal tests; `rustfmt --check --edition 2024` on both changed Rust files,
+`bash -n src/tools/check-typec-tcpci.sh`, and `git diff --check` passed. New backpressure probe and corrected ARM
+adoption are not yet guest-verified. Refreshed service builds and guest verification are pending; no fresh full-gate
+success is attributed to these newest service edits yet.
+
+Independent root review accepted the TypeC retry/clock/client cleanup and regression probe changes, and confirmed
+that waiting for the initial snapshot is the proper asynchronous-adoption barrier, not a relaxed completion
+criterion. The 496 s x86 pass predates these service edits; its detailed logs were preserved separately at
+`.build/logs/end-of-job/typec-tcpci-x86-passed-before-service-fix/` before the current-code rerun.
+
+Further required deadline isolation (2026-10-08): review found that synchronous catalogue/update-stream opens
+still blocked the TypeC service loop while it should enforce the operator's fifteen-second bound and the shared
+registry's slow-subscriber closure. Replaced `TypeC::adopt` with two nonblocking opening stages using the shared pure
+`service_logic::provider_open::Opens` state machine implemented by the parallel PowerService continuation.
+Catalogue requests and stream-open requests use `try_send`; replies are consumed from the ordinary wait set.
+Each stage keeps the existing OPEN_TICKS bound. Active providers, pending opens and retries share the eight-provider
+admission limit, with duplicate publications refused before allocating a new slot. Timeouts enter the existing
+finite retry policy; a withdrawal cancels pending opens and releases their channels; a closed catalogue cancels
+pending work. Unique correlations and strict reply/channel checks prevent old replies from adopting a replacement,
+and unused/late transferred capabilities are closed. Only bootstrap subscription/online signaling remain synchronous,
+before entering the service loop. Public-reader backpressure fixes and new probe remain in place.
+
+Fresh checks after this asynchronous correction:
+- `(cd src/user/services/core && cargo check --bin typec_service --bin typeccheck --features development)`: passed.
+- `cargo test --offline --manifest-path src/user/services/logic/Cargo.toml provider_open`: all 5 helper tests passed.
+- `rustfmt --check --edition 2024 src/user/services/core/src/typec_service.rs` and `git diff --check`: passed.
+Runtime wrapper peer review, final updated images and current-code TCPCI guest checks are still pending.
+
+Independent peer review of the asynchronous TypeC wrapper completed: generated catalogue reply layout, strict
+byte/capability consumption, unique correlations, withdrawal cancellation, the eight-provider reservation bound,
+wait-set size, stage deadlines and public subscribe failure cleanup were checked without finding a defect.
+Closed catalogues now also release their original connection; CONNECT/HEARTBEAT early returns dispose of unexpected
+incoming capabilities, matching the ordinary request cleanup. Final targeted checks repeated after these small
+cleanup changes: TypeC/typeccheck target cargo check passed; provider_open all 6 tests and provider_retry all 4 tests
+passed; Rust formatting and git diff whitespace check passed. Source is ready for refreshed guest verification;
+these checks do not substitute for the pending runtime checks or physical hardware criterion.
+
+Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+Final all-target source build after the asynchronous changes PASSED in 1277 s:
+`LIBER_DEVELOPMENT=1 ./build.sh --arch all`, log `.build/logs/end-of-job/continuation-build-all-async.log`.
+The first current-service ARM gate then FAILED natively in 864 s (exit 1), log
+`.build/logs/end-of-job/continuation-typec-tcpci-aarch64-final.log` and `.status`. Importantly the previously failing
+provider adoption now passed, as did the new unread-client regression, charger negotiation, swaps, malformed
+messages, Wait/Reject, changed offers, and the sustained VBUS alarm. The failure was the overshoot oracle, not its
+required safe recovery: the independent partner recorded an 18 V high alarm at 657.5150 s, returned to 15 V at
+657.5354 s, and recorded sink-off at 657.5401 s followed by hard reset at 657.5562 s. The guest correctly consumed
+the latched high alert, but its current VBUS sample was already 15 V; the gate demanded the literal guest log
+`a VBUS alarm (high) at 18000 mV` and timed out. TCPCI's voltage register is a current measurement, not the alarm's
+latched voltage. The plan requires the overshoot, source-fault and sink-off-before-reset/recovery, all still required.
+
+Preserved complete failed evidence at `.build/logs/end-of-job/typec-tcpci-aarch64-failed-overshoot/` and the exact
+original script at `check-typec-tcpci-before-alarm-oracle.sh` beside it. A read-only reproduction over those logs
+confirmed the original literal fails while independent 18 V alarm -> sink off -> hard reset -> new contract and
+recorded guest high alarm all pass. Corrected only the gate assertion: baseline and require a new guest high alarm,
+and independently baseline/require a new exact 18 V alarm in the partner's log. Source-fault, one-reset count,
+sink-path/model violations and new contract checks remain untouched; no timer was stretched further and no driver
+behavior changed. `bash -n src/tools/check-typec-tcpci.sh` and `git diff --check` passed.
+
+The concurrent original RISC-V gate was intentionally stopped through its private `dev.sh down` before any test
+case, to avoid running the known incorrect oracle. It exited 1 after 568 s; its generic 'no shell prompt within
+4000 s' text is a consequence of that intentional shutdown, not evidence of a 4000 s boot timeout. Logs retained at
+`.build/logs/end-of-job/typec-tcpci-riscv64-interrupted-old-oracle/` and the original final.log/.status. Both full ports
+will be restarted against the corrected oracle; no passing port result is claimed yet.
+
+Both corrected full port runs started from clean instances using the corrected assertion above. Peer review accepted
+the oracle correction and identified one shfmt spacing difference in its arithmetic expression. Preserved the exact
+running script at `.build/logs/end-of-job/check-typec-tcpci-running-oracle.sh`, then changed only that whitespace via
+temporary file plus atomic rename: each already-running Bash retains its original complete script inode. Final
+`shfmt -d src/tools/check-typec-tcpci.sh`, `bash -n` and `git diff --check` passed. The running test logic and final
+source are identical; the harmless formatting difference does not require restarting either guest.
+
+Final check after the narrowly corrected overshoot oracle: `./check.sh --gate source-hygiene --gate verify-model` PASS (118 s; `.build/logs/end-of-job/continuation-static-oracle-final.log`), and current `shfmt -d src/tools/check-typec-tcpci.sh`, `bash -n` and `git diff --check` PASS. Production sources and their successful all-target build are unchanged by this oracle correction. Full port guest reruns are still in progress, not yet passing evidence.
+
+Corrected complete aarch64 gate PASSED, native exit 0 after 1192 s:
+`LIBER_DEVELOPMENT=1 RUN_STATUS_FILE=.build/logs/end-of-job/continuation-typec-tcpci-aarch64-oracle.status ./check.sh --gate typec-tcpci-aarch64`.
+Log `.build/logs/end-of-job/continuation-typec-tcpci-aarch64-oracle.log`; detailed retained logs at
+`.build/logs/typec-tcpci-aarch64/`. All cases completed: asynchronous adoption, unread enumeration/subscription
+clients, negotiation/refusals/malformed input, both voltage alarms, every reset/timer, weak/non-PD/silent sources,
+controller dependency withdrawal/rebind without a VBUS drop, active-contract sleep refusal and charger attachment
+while asleep with sink disabled until resume. The corrected transient case independently recorded its new 18 V
+alarm while the later guest sample was 15 V, then proved the same required safe reset and recovery.
+Device-tree binding was `dt:/pcie@10000000/i2c@15,0/i2c/tcpc@52`. The plan's partner stretch factor remained 100;
+all sink timers remained unchanged. Its 200 TCG responses were p50 29.718 ms, p99 44.651 ms, maximum 47.365 ms,
+zero timeouts and six register transfers each. These TCG timings are recorded only, never claimed to meet KVM's
+15 ms/24 ms thresholds. RISC-V and fresh exclusive x86_64 checks still pending at this point.
+
+Corrected complete riscv64 gate PASSED, native exit 0 after 1344 s:
+`LIBER_DEVELOPMENT=1 RUN_STATUS_FILE=.build/logs/end-of-job/continuation-typec-tcpci-riscv64-oracle.status ./check.sh --gate typec-tcpci-riscv64`.
+Main log `.build/logs/end-of-job/continuation-typec-tcpci-riscv64-oracle.log`; details at
+`.build/logs/typec-tcpci-riscv64/`. The same complete scenario set, new stalled-reader regression, corrected
+independent overshoot observation and final sleep/charger case all passed through
+`dt:/soc/pci@30000000/i2c@15,0/i2c/tcpc@52`. The partner's allowed stretch remained 100. Its 200 TCG responses:
+p50 39.688 ms, p99 62.051 ms, maximum 74.577 ms, zero timeouts, six register transfers. These values are recorded,
+not compared with the native KVM latency thresholds. Both port guests and fixtures completed normal cleanup.
+The fresh exclusive x86_64 gate has now started with stretch 1; its measured current-code verdict remains pending.
+
+Root's final source-hygiene and verification-model checks passed in 118 s after the oracle's formatting correction,
+log `.build/logs/end-of-job/continuation-static-oracle-final.log`. No compiled source changed after the 1277 s
+all-target build. The earlier failures/interruption and their exact artifacts remain preserved above.
+
+FINAL CURRENT-CODE TCPCI VERIFICATION (2026-10-08):
+`LIBER_DEVELOPMENT=1 RUN_STATUS_FILE=.build/logs/end-of-job/continuation-typec-tcpci-x86-async-final.status ./check.sh --gate typec-tcpci`
+PASSED, native exit 0 after 501 s. Main log `.build/logs/end-of-job/continuation-typec-tcpci-x86-async-final.log`,
+terminal `.status`; detailed probe, guest and independent partner logs `.build/logs/typec-tcpci/`.
+Every case passed, including the new unread-client regression, corrected independent overshoot assertion,
+dependency withdrawal/rebind and both final sleep cases. The final 200-response KVM measurement (stretch 1,
+no concurrent guest/build/harness tracing) was p50 4.283 ms, p99 6.192 ms, maximum 7.001 ms, zero timeouts,
+5–6 register transfers: both unchanged requirements, p99 <= 15 ms and no response >= 24 ms, passed.
+The guest and fixture completed normal teardown; the owned processes and both prior port guests were checked gone
+before the host was explicitly released for the separate final performance-accounting work.
+
+Final status: all requested P02M0202 software and fixture work is implemented and verified. The TCPCI proof
+checkbox is now checked; the plan header and TODO entry reflect all three current-code full-gate passes and the
+remaining real-hardware criterion. Overall milestone remains OPEN because neither the required owner-provided
+real UCSI laptop nor TCPCI board was available. No hardware result or fresh full UCSI guest run is claimed.
+The existing UCSI guest results remain historical; fresh UCSI/PD/connector/power host checks and the current
+common-service TCPCI integration are recorded above. No existing requirement or timing budget was weakened.
+Earlier failed and intentionally interrupted runs are retained, clearly distinguished from these terminal passes.
+All pre-continuation audit content is preserved; this section assigns no audit rating.
+
+Acceptance-scope clarification in the final coordinator review: the remaining requirement is exactly the plan’s recorded real-hardware run where the owner provides a board. A suitable supplied UCSI laptop or TCPCI board and access to boot/collect the result would provide that target; this record does not add a requirement to supply both device classes. No such target or access has been established, so the existing real-hardware checkbox remains open.
+
+Final environment availability check (2026-10-08T13:30:32Z): read-only inspection of `/sys/class/dmi/id/{sys_vendor,product_name}` reports `QEMU` / `Standard PC (i440FX + PIIX, 1996)`. `/sys/bus/acpi/devices` has no PNP0C09, PNP0CA0 or USBC000 nodes, `/sys/class/typec` is absent, and `/dev/ttyACM*` / `/dev/ttyUSB*` have no matches. This confirms no relevant local target is exposed by this session; no owner-provided remote target/access has been established either. This is an environment inventory, not a physical-hardware acceptance test. The milestone-specific remaining hardware/design requirements above stay open.

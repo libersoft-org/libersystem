@@ -163,6 +163,11 @@ impl<T: Transport> Smbus<T> {
 		self.client
 	}
 
+	/// Set one absolute tick deadline shared by the following SMBus operations (zero waits forever).
+	pub fn set_deadline(&mut self, deadline: u64) {
+		self.client.set_deadline(deadline);
+	}
+
 	// One transaction's answer, when it was admitted at all: the bytes, of exactly `len` when that is known.
 	fn answer(&self, admitted: bool, reply: Option<Result<I2cReply, ContractError>>, len: Option<usize>) -> Result<Vec<u8>, SmbusError> {
 		if !admitted {

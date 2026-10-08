@@ -84,7 +84,9 @@ timeout = 300
 EOF
 	LIBER_BOOT_PROFILE=development-trace "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 || die "the $ARCH scaled run failed - see $RESULTS/boot-$ARCH.log"
 	cp "$BUILD_DIR/boot/cold-$ARCH.log" "$RESULTS/serial-$ARCH.log"
-	grep -a -q "boot profile: development-trace" "$RESULTS/serial-$ARCH.log" || die "the $ARCH guest did not boot under development-trace - see $RESULTS/serial-$ARCH.log"
+	# Both port entry points attach this buffer only under development-trace; the profile banner is
+	# x86-only. The collector below also requires the anchor, complete drain and matching armed report.
+	grep -a -F -q "perf: frame-account buffer attached - 262144 records of 32 bytes" "$RESULTS/serial-$ARCH.log" || die "the $ARCH guest did not attach its development-trace buffer - see $RESULTS/serial-$ARCH.log"
 	[[ "$(grep -a -o -m1 ' lanes=[0-9]*' "$RESULTS/serial-$ARCH.log" | cut -d= -f2)" == 1 ]] || die "the $ARCH run was pinned to one worker and reports another lane count - see $RESULTS/serial-$ARCH.log"
 	python3 "$COLLECTOR" "$RESULTS/serial-$ARCH.log" --drain 1 --demo-report "$RESULTS/serial-$ARCH.log" --json "$RESULTS/account-scaled-$ARCH.json" >"$RESULTS/account-scaled-$ARCH.txt" 2>&1 || die "the $ARCH account was refused: $(tail -n 1 "$RESULTS/account-scaled-$ARCH.txt")"
 	note "account scaled on $ARCH: $(head -n 1 "$RESULTS/account-scaled-$ARCH.txt")"

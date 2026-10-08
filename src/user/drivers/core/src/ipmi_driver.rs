@@ -45,7 +45,7 @@ use power_model::convert::Tagged;
 use proto::generated::liber::bmc::v1 as bmc;
 use proto::system::{AdminAction, AdminDescriptor, AdminPrepared, AdminRead, AdminResult, ControlOutcome, Error, ProviderCommand, ProviderSource, ProviderUpdate, ProviderUpdateKind, SourceState, WatchdogDescription, acpi_node, admin_executor, power_provider, watchdog};
 use rt::*;
-use wire::Handles;
+use wire::{Handles, Transport, TransportError};
 
 // The publications' tokens.
 const TOKEN_IPMI: u16 = 0;
@@ -127,8 +127,59 @@ impl ipmi::Registers for Mmio {
 }
 
 // SSIF'S TWO SMBUS TRANSACTIONS, over the address-scoped connection: a NACK is the BMC not ready.
+// The controller can stop answering, including while its request queue is full. Both halves of the
+// IPC use the transaction's absolute deadline. A late reply from an earlier timed-out operation is
+// discarded here so the next BMC probe can recover on this same address-scoped connection.
+struct SmbusTransport {
+	chan: u64,
+}
+
+impl Transport for SmbusTransport {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
+		let correlation = request.get(2..6).ok_or(TransportError::Malformed)?;
+		if clock() >= deadline {
+			return Err(TransportError::TimedOut);
+		}
+		match send_caps_deadline(self.chan, request, request_handles, deadline) {
+			SendOutcome::Delivered => {}
+			SendOutcome::Stalled => return Err(TransportError::TimedOut),
+			SendOutcome::Failed => return Err(TransportError::SendRefused),
+		}
+		loop {
+			if clock() >= deadline {
+				return Err(TransportError::TimedOut);
+			}
+			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+				ReceivedVecCaps::Message { bytes } => {
+					if clock() >= deadline {
+						self.discard_handles(reply_handles.as_slice());
+						*reply_handles = Handles::new();
+						return Err(TransportError::TimedOut);
+					}
+					if bytes.get(..4).is_none_or(|reply| reply == correlation) {
+						return Ok(bytes);
+					}
+					self.discard_handles(reply_handles.as_slice());
+					*reply_handles = Handles::new();
+				}
+				ReceivedVecCaps::Closed => return Err(TransportError::PeerClosed),
+				ReceivedVecCaps::Failed => return Err(TransportError::ReceiveFailed),
+				ReceivedVecCaps::TimedOut => return Err(TransportError::TimedOut),
+			}
+		}
+	}
+
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			if handle != 0 {
+				close(handle);
+			}
+		}
+	}
+}
+
 struct SmbusLink {
-	smbus: i2c_client::Smbus<ChannelTransport>,
+	smbus: i2c_client::Smbus<SmbusTransport>,
 }
 
 fn bus_error(error: i2c_client::SmbusError) -> ssif::BusError {
@@ -139,11 +190,13 @@ fn bus_error(error: i2c_client::SmbusError) -> ssif::BusError {
 }
 
 impl ssif::Smbus for SmbusLink {
-	fn block_write(&mut self, command: u8, data: &[u8]) -> Result<(), ssif::BusError> {
+	fn block_write(&mut self, command: u8, data: &[u8], deadline_ms: u64) -> Result<(), ssif::BusError> {
+		self.smbus.set_deadline(deadline_ms.saturating_mul(TICKS_PER_SECOND) / 1000);
 		self.smbus.block_write(command, data).map_err(bus_error)
 	}
 
-	fn block_read(&mut self, command: u8) -> Result<Vec<u8>, ssif::BusError> {
+	fn block_read(&mut self, command: u8, deadline_ms: u64) -> Result<Vec<u8>, ssif::BusError> {
+		self.smbus.set_deadline(deadline_ms.saturating_mul(TICKS_PER_SECOND) / 1000);
 		self.smbus.block_read(command).map_err(bus_error)
 	}
 
@@ -156,9 +209,9 @@ impl ssif::Smbus for SmbusLink {
 	}
 }
 
-fn smbus(chan: u64, pec: bool) -> Result<i2c_client::Smbus<ChannelTransport>, i2c_client::Refusal> {
+fn smbus(chan: u64, pec: bool) -> Result<i2c_client::Smbus<SmbusTransport>, i2c_client::Refusal> {
 	let needs = proto::system::I2cFunctionality { plain: false, max_transfer: 0, quick: false, byte: false, byte_data: false, word_data: false, block_write: true, block_read: true, i2c_block_read: false, pec };
-	i2c_client::Smbus::new(i2c_device_proto::generated::liber::i2c_device::v1::i2c_device::Client::new(ChannelTransport { chan }), needs)
+	i2c_client::Smbus::new(i2c_device_proto::generated::liber::i2c_device::v1::i2c_device::Client::with_deadline(SmbusTransport { chan }, clock() + NODE_TICKS), needs)
 }
 
 enum Interface {

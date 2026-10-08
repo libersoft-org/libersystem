@@ -16,6 +16,7 @@
 //   typeccheck enter N SVID VDO     ask for an alternate mode, and print the answer
 //   typeccheck exit N SVID VDO      ask to leave one, and print the answer
 //   typeccheck list                 every connector, one line each
+//   typeccheck stalled              unread enumeration/subscribe replies close their clients; another reader works
 //   typeccheck steady N SECONDS     subscribed: connector N attached throughout, never reported detached, for SECONDS
 //   typeccheck cycle                the virtio-i2c binding disabled through the device policy - every `tcpci` binding
 //                                   stopped as a lost dependency - then enabled again and every one online again
@@ -323,6 +324,35 @@ fn identity(connection: u64, wanted: u8) -> ConnectorId {
 	connectors.into_iter().find(|snapshot| snapshot.connector.number == wanted).map(|snapshot| snapshot.id).unwrap_or_else(|| fail(&format!("TypeCService holds no connector {wanted}")))
 }
 
+fn stalled_reader(reader: u64) {
+	let before = typec::typec::Client::with_deadline(ChannelTransport { chan: reader }, clock() + WAIT).connectors().and_then(Result::ok).unwrap_or_else(|| fail("stalled: the initial connector list could not be read"));
+	for op in [typec::typec::OP_CONNECTORS, typec::typec::OP_SUBSCRIBE] {
+		let Some(stalled) = service_connect(reader) else { fail("stalled: a read connection could not be opened") };
+		let mut request = [0u8; 6];
+		request[..2].copy_from_slice(&op.to_le_bytes());
+		let deadline = clock() + WAIT;
+		let mut sent = 0u32;
+		loop {
+			request[2..].copy_from_slice(&sent.to_le_bytes());
+			match try_send_outcome(stalled, &request, 0) {
+				SendOutcome::Delivered => sent += 1,
+				SendOutcome::Failed => break,
+				SendOutcome::Stalled => {}
+			}
+			if clock() >= deadline {
+				fail("stalled: unread replies blocked the service instead of closing the client");
+			}
+			yield_now();
+		}
+		close(stalled);
+		let after = typec::typec::Client::with_deadline(ChannelTransport { chan: reader }, clock() + WAIT).connectors().and_then(Result::ok).unwrap_or_else(|| fail("stalled: another reader could not enumerate after the stalled connection closed"));
+		if sent < 2 || after.len() != before.len() {
+			fail("stalled: the connector list changed or the request queue was never exercised");
+		}
+	}
+	say("PASS stalled: unread enumeration and subscribe replies closed their clients and another reader stayed serviceable");
+}
+
 fn report(asked: &str, answer: Option<Result<Answer, proto::system::Error>>) {
 	match answer {
 		Some(Ok(answer)) => match answer.outcome {
@@ -355,6 +385,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let words: Vec<&str> = context.arguments.split_whitespace().collect();
 	let control = || typec::typec_control::Client::with_deadline(ChannelTransport { chan: operator }, clock() + 20 * TICKS_PER_SECOND);
 	match words.as_slice() {
+		["stalled"] => stalled_reader(reader),
 		["await", n, what] => await_connector(reader, number(n), what, None),
 		["await", n, what, arg] => await_connector(reader, number(n), what, Some(arg)),
 		["source", n, what] => await_source(state, number(n), what, None),
@@ -389,7 +420,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		},
 		["steady", n, seconds] => steady(reader, number(n), seconds.parse().unwrap_or_else(|_| fail("steady takes whole seconds"))),
 		["cycle"] => cycle(device_client, policy),
-		_ => fail("usage: typeccheck await N WHAT [ARG] | source N WHAT [MV] | beside-ac N | data N ROLE | power N ROLE | enter N SVID VDO | exit N SVID VDO | list | steady N SECONDS | cycle"),
+		_ => fail("usage: typeccheck await N WHAT [ARG] | source N WHAT [MV] | beside-ac N | data N ROLE | power N ROLE | enter N SVID VDO | exit N SVID VDO | list | stalled | steady N SECONDS | cycle"),
 	}
 	exit();
 }

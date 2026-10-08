@@ -654,3 +654,12 @@ Fresh targeted verification (all exited 0):
 
 Not rerun here: the full kernel suites, guest processor-power and tickless-idle gates, or hardware qualification.
 There is no new change to the clock or kernel governors requiring another full sweep in this continuation.
+
+Final continuation build verification (2026-10-08): root's source-frozen
+`LIBER_DEVELOPMENT=1 ./build.sh --arch all` passed in 487 s for x86_64, aarch64 and riscv64;
+`.build/logs/end-of-job/continuation-build-all-final.log`. This supplements the fresh 9 tickclock, 23 procpower
+and 10 processor-policy host checks and the historical complete kernel-suite results already reviewed above.
+No new P02M0198 runtime code was required, and no new full kernel-suite pass is claimed. Milestone remains complete.
+The entire pre-continuation audit prefix from d0f54598 was checked byte-for-byte preserved.
+
+Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.

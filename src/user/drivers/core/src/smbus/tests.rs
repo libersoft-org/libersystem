@@ -4,6 +4,22 @@ use super::*;
 const ADDRESS: u8 = 0x50;
 
 #[test]
+fn the_specification_s_send_byte_examples_and_crc_example_have_the_expected_pec() {
+	// SMBus 2.0 sections 5.6.3.2/3 give these concrete Send Byte packets: address 1100001b,
+	// write, then Prepare to ARP (01) or Reset Device (02). This tests the Send Byte encoding only;
+	// it adds no ARP operation to the controller. https://smbus.org/specs/smbus20.pdf, page 40.
+	// The fixed residues are independently calculated by polynomial division of the packet, with
+	// eight zero bits appended, by x^8 + x^2 + x + 1 (0x107), as section 5.4.1 specifies.
+	for (command, pec) in [(0x01, 0xC0), (0x02, 0xC9)] {
+		assert_eq!(crc8(0, &[0xC2, command]), pec);
+		assert_eq!(compose(0x61, Transaction::SendByte(command), true).expect("the specification's Send Byte example").write(), &[command, pec]);
+	}
+	// The specification refers to the SMBus site's CRC examples; its calculator supplies this input:
+	// https://smbus.org/faq/crc8Applet.htm. Its polynomial remainder is 0x27.
+	assert_eq!(crc8(0, &[0x16, 0x12, 0x16, 0xC0, 0xE4, 0xD2]), 0x27);
+}
+
+#[test]
 fn the_pec_is_smbus_s_crc_8() {
 	// THE POLYNOMIAL THE SPECIFICATION NAMES, x^8 + x^2 + x + 1, from zero and unreflected - which the CRC
 	// catalogue lists as CRC-8/SMBUS with the check value 0xF4 over "123456789".

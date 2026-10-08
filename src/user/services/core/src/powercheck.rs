@@ -16,6 +16,7 @@
 //   powercheck overflow      transitions a reader does not take close its subscription; a new one is current
 //   powercheck withhold      a withheld reply completes as indeterminate, is not replayed, blocks conflicts
 //                            until reconciled, and leaves the other provider served
+//   powercheck adoption      a pending provider opening leaves existing controls/readers served; retry and withdrawal
 //   powercheck extra         a publication past the fixture's declaration reaches nothing
 //   powercheck remove        removal and withdrawal erase live state; a replacement is other sources
 
@@ -504,6 +505,124 @@ fn indeterminate(state: u64, control: u64, fixture: u64) {
 	say(b"PASS indeterminate: a provider's uncertain reply blocked conflicts, never replayed the command, and required fresh reconciliation");
 }
 
+fn stalled_reader(state: u64) {
+	for op in [power::OP_SOURCES, power::OP_SUBSCRIBE] {
+		let Some(stalled) = service_connect(state) else { fail(b"stalled: a read connection could not be opened") };
+		let mut request = [0u8; 6];
+		request[..2].copy_from_slice(&op.to_le_bytes());
+		let deadline = clock() + 3 * TICKS;
+		let mut sent = 0u32;
+		loop {
+			request[2..].copy_from_slice(&sent.to_le_bytes());
+			match try_send_outcome(stalled, &request, 0) {
+				SendOutcome::Delivered => sent += 1,
+				SendOutcome::Failed => break,
+				SendOutcome::Stalled => {}
+			}
+			if clock() >= deadline {
+				fail(b"stalled: an unread reply queue blocked the service instead of closing the client");
+			}
+			yield_now();
+		}
+		close(stalled);
+		if sent < 2 || sources(state).len() != 4 {
+			fail(b"stalled: another reader could not enumerate after the stalled connection closed");
+		}
+	}
+	say(b"PASS stalled: unread enumeration and subscribe replies closed their clients and another reader stayed serviceable");
+}
+
+fn deferred_updates(fixture: u64, enabled: bool) -> u32 {
+	match power_fixture::Client::with_deadline(ChannelTransport { chan: fixture }, clock() + 2 * TICKS).defer_updates(&ACPI, &enabled) {
+		Some(Ok(count)) => count,
+		_ => fail(b"adoption: the fixture refused update-stream deferral"),
+	}
+}
+
+fn wait_deferred_updates(fixture: u64, before: u32) {
+	let deadline = clock() + 5 * TICKS;
+	loop {
+		if deferred_updates(fixture, true) > before {
+			return;
+		}
+		if clock() >= deadline {
+			fail(b"adoption: no actual update-stream opening reached the fixture");
+		}
+		sleep_until(clock() + 1);
+	}
+}
+
+fn withdraw_acpi(state: u64, fixture: u64) {
+	if !matches!(power_fixture::Client::with_deadline(ChannelTransport { chan: fixture }, clock() + 2 * TICKS).withdraw(&ACPI), Some(Ok(()))) {
+		fail(b"adoption: the fixture could not withdraw its ACPI publication");
+	}
+	let deadline = clock() + 5 * TICKS;
+	loop {
+		let Some(Ok(left)) = power::Client::with_deadline(ChannelTransport { chan: state }, deadline).sources() else { fail(b"adoption: the source list did not answer after withdrawal") };
+		if left.len() == 1 && left[0].state.kind == SourceKind::Ups {
+			return;
+		}
+		if clock() >= deadline {
+			fail(b"adoption: a withdrawn publication left live sources");
+		}
+		sleep_until(clock() + 1);
+	}
+}
+
+fn republish_acpi(fixture: u64) {
+	if !matches!(power_fixture::Client::with_deadline(ChannelTransport { chan: fixture }, clock() + 2 * TICKS).republish(&ACPI), Some(Ok(()))) {
+		fail(b"adoption: the fixture could not publish its ACPI sources again");
+	}
+}
+
+fn adoption(state: u64, control: u64, fixture: u64) {
+	let listed = all_sources(state, 4);
+	let ups = find(&listed, SourceKind::Ups);
+	let original = find(&listed, SourceKind::Battery);
+	let commands_before = commands(fixture).len();
+	let before = deferred_updates(fixture, true);
+	withdraw_acpi(state, fixture);
+	republish_acpi(fixture);
+	// The independent fixture confirms UPDATES arrived. The old synchronous service is now waiting
+	// for its one-second opening deadline; a publication merely announced would not prove that.
+	wait_deferred_updates(fixture, before);
+	let deadline = clock() + TICKS / 2;
+	if !matches!(power_control::Client::with_deadline(ChannelTransport { chan: control }, deadline).set_output(&ups.id, &0, &false), Some(Ok(ControlOutcome::Done))) {
+		fail(b"adoption: a pending provider opening blocked an existing UPS control");
+	}
+	let Some(Ok(left)) = power::Client::with_deadline(ChannelTransport { chan: state }, deadline).sources() else { fail(b"adoption: a pending provider opening blocked enumeration") };
+	if clock() >= deadline || left.len() != 1 || left[0].id != ups.id {
+		fail(b"adoption: existing control and enumeration did not both complete inside 500 ms");
+	}
+	if commands(fixture).len() != commands_before + 1 || outlets(fixture) != [false, true] {
+		fail(b"adoption: the responsive control did not reach exactly its outlet");
+	}
+	deferred_updates(fixture, false);
+	let recovered = find(&all_sources(state, 4), SourceKind::Battery);
+	if recovered.id == original.id || set_output(control, &ups.id, 0, true) != Ok(ControlOutcome::Done) {
+		fail(b"adoption: a deferred provider did not recover through a fresh publication and retry");
+	}
+	// A second pending opening is withdrawn before the fault is released. Its retry must not admit
+	// the withdrawn generation; only the following explicit publication may supply sources again.
+	let before = deferred_updates(fixture, true);
+	withdraw_acpi(state, fixture);
+	republish_acpi(fixture);
+	wait_deferred_updates(fixture, before);
+	withdraw_acpi(state, fixture);
+	deferred_updates(fixture, false);
+	sleep_until(clock() + 2 * TICKS);
+	let left = sources(state);
+	if left.len() != 1 || left[0].id != ups.id {
+		fail(b"adoption: a withdrawn pending provider was admitted after its opening expired");
+	}
+	republish_acpi(fixture);
+	let replacement = find(&all_sources(state, 4), SourceKind::Battery);
+	if replacement.id == recovered.id {
+		fail(b"adoption: the replacement reused the withdrawn generation");
+	}
+	say(b"PASS adoption: a counted pending opening left UPS control and enumeration within 500 ms; retry recovered, withdrawal cancelled it, and a new generation recovered");
+}
+
 fn extra(state: u64, fixture: u64) {
 	let count = all_sources(state, 4).len();
 	if !matches!(power_fixture::Client::new(ChannelTransport { chan: fixture }).offer_extra(), Some(Ok(()))) {
@@ -575,9 +694,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"overflow" => overflow(state, fixture),
 		b"withhold" => withhold(state, control_chan, fixture),
 		b"indeterminate" => indeterminate(state, control_chan, fixture),
+		b"stalled" => stalled_reader(state),
+		b"adoption" => adoption(state, control_chan, fixture),
 		b"extra" => extra(state, fixture),
 		b"remove" => remove(state, fixture),
-		_ => fail(b"usage: powercheck list [exact] | control | denied | watch | alarm | coalesce | overflow | withhold | indeterminate | extra | remove"),
+		_ => fail(b"usage: powercheck list [exact] | control | denied | watch | alarm | coalesce | overflow | withhold | indeterminate | stalled | adoption | extra | remove"),
 	}
 	exit();
 }

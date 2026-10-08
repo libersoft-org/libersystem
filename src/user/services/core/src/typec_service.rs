@@ -23,7 +23,8 @@ use ipc_client::ChannelTransport;
 use proto::generated::liber::typec::v1 as typec;
 use proto::system::{Error, ProviderInfo, ProviderKind, provider_catalogue};
 use rt::*;
-use service_logic::power_registry::{Change, Controls, Effect, Frame, Payload, ProviderId, Publication, Registry, SourceKey, SubscriberId};
+use service_logic::power_registry::{Change, Controls, Effect, Frame, MAX_PROVIDERS, Payload, ProviderId, Publication, Registry, SourceKey, SubscriberId};
+use service_logic::provider_open::{Opens, Pending};
 use service_logic::typec_requests::{Refusal as RequestRefusal, Requests};
 use typec::{Answer, ChangeKind, Connector, ConnectorId, ConnectorSnapshot, DataRole, Outcome, PowerRole, Refusal, Request, RequestKind, TypecChange, UpdateKind, typec_control, typec_provider};
 use wire::Sink;
@@ -96,6 +97,8 @@ struct TypeC {
 	// Published providers whose update stream did not open inside OPEN_TICKS, asked again later
 	// (`service_logic::provider_retry`).
 	unopened: service_logic::provider_retry::ProviderRetry<ProviderInfo>,
+	opening: Opens<ProviderInfo>,
+	catalogue_live: bool,
 	subscribers: Vec<Subscriber>,
 	waiting: Vec<Waiting>,
 	next_provider: u32,
@@ -217,37 +220,112 @@ impl TypeC {
 	// A publication arrived: open it and its update stream, and give it the registry's time to describe itself.
 	// BEYOND THE PROVIDER LIMIT IT IS REFUSED AND SAID, never admitted by evicting another.
 	fn adopt(&mut self, catalogue: u64, info: ProviderInfo, attempts: u32) {
-		let now = clock();
-		if !self.registry.provider_room() {
+		let key = publication_of(&info);
+		if !self.catalogue_live || self.registry.provider_of(key).is_some() || self.opening.contains(|pending| publication_of(pending) == key) || self.unopened.contains(|pending| publication_of(pending) == key) {
+			return;
+		}
+		if self.providers.len() + self.opening.len() + self.unopened.len() >= MAX_PROVIDERS {
 			print(b"TypeCService: a typec-connector provider was refused: this service holds eight (resource exhausted)\n");
 			return;
 		}
-		if self.registry.provider_of(publication_of(&info)).is_some() {
-			return;
-		}
-		let Some(Ok(chan)) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) else {
-			print(b"TypeCService: a published Type-C provider could not be opened\n");
-			return;
-		};
-		let Some(stream) = typec_provider::Client::with_deadline(ChannelTransport { chan }, now + OPEN_TICKS).updates() else {
-			close(chan);
-			// ASKED AGAIN, NOT LET GO: a provider busy at bind stays published, and a service that gave up on it held
-			// none of its connectors for the rest of the boot.
-			match self.unopened.failed(info, attempts, now) {
-				service_logic::provider_retry::Next::At(_) if attempts == 0 => print(b"TypeCService: a Type-C provider did not open its update stream - it is asked again\n"),
-				service_logic::provider_retry::Next::At(_) => {}
-				service_logic::provider_retry::Next::GivenUp => print(b"TypeCService: a Type-C provider did not open its update stream after every retry - it is not held\n"),
+		let mut request = wire::VecWriter::new();
+		let Some(corr) = self.opening.begin(info.clone(), attempts, clock(), OPEN_TICKS) else { return };
+		let encoded = (|| {
+			request.u16(provider_catalogue::OP_OPEN)?;
+			request.u32(corr)?;
+			info.write(&mut request)
+		})();
+		if encoded.is_none() || request.into_inner().is_none_or(|bytes| !try_send(catalogue, &bytes, 0)) {
+			if let Some(pending) = self.opening.take_catalogue(corr) {
+				self.open_failed(pending);
 			}
-			return;
-		};
-		let id = ProviderId(self.next_provider);
-		self.next_provider = self.next_provider.wrapping_add(1);
-		if !self.registry.add_provider(id, publication_of(&info), now) {
-			close(stream);
-			close(chan);
-			return;
 		}
-		self.providers.push(Provider { id, chan, stream });
+	}
+
+	fn open_failed(&mut self, pending: Pending<ProviderInfo>) {
+		if let Some(chan) = pending.channel() {
+			close(chan);
+		}
+		match self.unopened.failed(pending.item, pending.attempts, clock()) {
+			service_logic::provider_retry::Next::At(_) if pending.attempts == 0 => print(b"TypeCService: a Type-C provider did not open - it is asked again\n"),
+			service_logic::provider_retry::Next::At(_) => {}
+			service_logic::provider_retry::Next::GivenUp => print(b"TypeCService: a Type-C provider did not open after every retry - it is not held\n"),
+		}
+	}
+
+	// Opening a provider never waits inside the service loop. Replies, timeouts and withdrawals
+	// advance these two stages while operator deadlines and subscriber queues keep being served.
+	fn opening_reply(&mut self, handle: u64, catalogue: bool, buf: &mut [u8]) {
+		let (len, mut handles) = match try_recv_caps(handle, buf) {
+			PolledCaps::Message { len, handles } => (len, handles),
+			PolledCaps::Empty => return,
+			PolledCaps::Closed => {
+				if catalogue {
+					self.catalogue_live = false;
+					close(handle);
+					self.unopened.withdraw(|_| true);
+					for pending in self.opening.cancel(|_| true) {
+						if let Some(chan) = pending.channel() {
+							close(chan);
+						}
+					}
+					print(b"TypeCService: the provider catalogue closed; pending opens cancelled\n");
+				} else if let Some(pending) = self.opening.take_channel(handle) {
+					self.open_failed(pending);
+				}
+				return;
+			}
+		};
+		let corr = buf[..len].get(..4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+		let pending = corr.and_then(|corr| if catalogue { self.opening.take_catalogue(corr) } else { self.opening.take_stream(handle, corr) });
+		if let Some(pending) = pending {
+			if clock() >= pending.deadline {
+				self.open_failed(pending);
+			} else if catalogue {
+				let decoded = (|| {
+					let mut reader = wire::Reader::with_handle_list(&buf[..len], &handles);
+					if reader.u32()? != pending.corr || !reader.tag()? {
+						return None;
+					}
+					let _ = reader.u32()?;
+					let chan = reader.take_handle()?;
+					reader.finish()?;
+					Some(chan)
+				})();
+				if let Some(chan) = decoded {
+					handles.clear();
+					let mut request = [0u8; 6];
+					request[..2].copy_from_slice(&typec_provider::OP_UPDATES.to_le_bytes());
+					request[2..].copy_from_slice(&pending.corr.to_le_bytes());
+					let now = clock();
+					if try_send(chan, &request, 0) {
+						self.opening.await_stream(pending, chan, now);
+					} else {
+						close(chan);
+						self.open_failed(pending);
+					}
+				} else {
+					self.open_failed(pending);
+				}
+			} else if len == 4 && handles.len() == 1 {
+				let stream = handles.take_first();
+				let id = ProviderId(self.next_provider);
+				self.next_provider = self.next_provider.wrapping_add(1);
+				if self.registry.add_provider(id, publication_of(&pending.item), clock()) {
+					self.providers.push(Provider { id, chan: handle, stream });
+				} else {
+					close(stream);
+					close(handle);
+				}
+			} else {
+				self.open_failed(pending);
+			}
+		}
+		// Unknown correlations include replies arriving after a deadline or withdrawal. Every
+		// capability they carry is released rather than admitted under a later publication.
+		for &leftover in handles.as_slice() {
+			close(leftover);
+		}
 	}
 
 	// A provider is over: everything it published is removed, and a request outstanding on it completes as
@@ -271,6 +349,11 @@ impl TypeC {
 	fn withdraw(&mut self, info: &ProviderInfo) {
 		let gone = publication_of(info);
 		self.unopened.withdraw(|waiting| publication_of(waiting) == gone);
+		for pending in self.opening.cancel(|waiting| publication_of(waiting) == gone) {
+			if let Some(chan) = pending.channel() {
+				close(chan);
+			}
+		}
 		if let Some(id) = self.registry.provider_of(publication_of(info)) {
 			self.lose(id, b"its publication was withdrawn");
 		}
@@ -448,59 +531,50 @@ impl TypeC {
 		let mut view = StateView { registry: &self.registry };
 		let Some((corr, _)) = typec::typec::subscribe_open(&mut view, request, handles) else { return false };
 		let mut reply = [0u8; 64];
-		let refuse = |error: Error, reply: &mut [u8]| {
-			if let Some(len) = typec::typec::subscribe_reply_err(corr, &error, reply) {
-				let _ = try_send(chan, &reply[..len], 0);
-			}
-		};
+		let refuse = |error: Error, reply: &mut [u8]| typec::typec::subscribe_reply_err(corr, &error, reply).is_some_and(|len| try_send(chan, &reply[..len], 0));
 		if !self.registry.subscriber_room() {
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		}
 		let epoch = self.registry.epoch();
 		let revision = self.registry.revision();
 		let connectors = self.registry.sources();
 		let mut frames: Vec<Vec<u8>> = Vec::new();
 		if frames.try_reserve_exact(connectors.len() + 1).is_err() {
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		}
 		let mut buf = [0u8; FRAME_BYTES];
 		let items = connectors.iter().map(|(key, received, held)| TypecChange { epoch, revision, kind: ChangeKind::Snapshot, connector: Some(snapshot_of(*key, *received, &held.0)), gone: None }).chain(core::iter::once(TypecChange { epoch, revision, kind: ChangeKind::SnapshotEnd, connector: None, gone: None }));
 		for (seq, item) in items.enumerate() {
 			let mut frame_handles = wire::Handles::new();
 			let Some(len) = typec::typec::subscribe_frame(seq as u32, &item, &mut buf, &mut frame_handles) else {
-				refuse(Error::Exhausted, &mut reply);
-				return true;
+				return refuse(Error::Exhausted, &mut reply);
 			};
 			frames.push(buf[..len].to_vec());
 		}
 		let Some((producer, consumer)) = channel_with_depth(frames.len() as u64 + LIVE_DEPTH) else {
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		};
 		for frame in &frames {
 			if !try_send(producer, frame, 0) {
 				close(producer);
 				close(consumer);
-				refuse(Error::Exhausted, &mut reply);
-				return true;
+				return refuse(Error::Exhausted, &mut reply);
 			}
 		}
 		let Some(id) = self.registry.subscribe() else {
 			close(producer);
 			close(consumer);
-			refuse(Error::Exhausted, &mut reply);
-			return true;
+			return refuse(Error::Exhausted, &mut reply);
 		};
 		match typec::typec::subscribe_reply_ok(corr, &mut reply) {
-			Some(len) if send_caps_blocking(chan, &reply[..len], &[consumer]) => {
+			Some(len) if try_send_caps(chan, &reply[..len], &[consumer]) => {
 				self.subscribers.push(Subscriber { id, chan: producer, seq: frames.len() as u32 });
 			}
 			_ => {
 				self.registry.unsubscribe(id);
 				close(producer);
 				close(consumer);
+				return false;
 			}
 		}
 		true
@@ -572,7 +646,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::TypecConnector).unwrap_or(0) } else { 0 };
 	let mut epoch_bytes = [0u8; 8];
 	let epoch = if random_get(&mut epoch_bytes) == epoch_bytes.len() { u64::from_le_bytes(epoch_bytes) } else { clock() };
-	let mut service = TypeC { registry: Registry::new(epoch), requests: Requests::new(), providers: Vec::new(), unopened: service_logic::provider_retry::ProviderRetry::new(OPEN_TICKS), subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
+	let mut service = TypeC { registry: Registry::new(epoch), requests: Requests::new(), providers: Vec::new(), unopened: service_logic::provider_retry::ProviderRetry::new(OPEN_TICKS), opening: Opens::new(MAX_PROVIDERS), catalogue_live: catalogue != 0, subscribers: Vec::new(), waiting: Vec::new(), next_provider: 1 };
 	print(b"TypeCService: online\n");
 	send_blocking(bootstrap, b"TypeCService: online", 0);
 
@@ -587,6 +661,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waitset.push(root);
 			}
 		}
+		if service.catalogue_live {
+			waitset.push(catalogue);
+		}
+		waitset.extend(service.opening.channels());
 		if subscribed {
 			waitset.push(subscription);
 		}
@@ -598,7 +676,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		waitset.extend(clients.iter().map(|client| client.chan));
 		let now = clock();
 		let retry = if service.registry.pending_subscribers().is_empty() { None } else { Some(now + service_logic::power_registry::COALESCE_TICKS) };
-		let deadline = [service.registry.next_deadline(), service.requests.next_deadline(), retry, service.unopened.next_deadline()].into_iter().flatten().min().unwrap_or(0);
+		let deadline = [service.registry.next_deadline(), service.requests.next_deadline(), retry, service.unopened.next_deadline(), service.opening.next_deadline()].into_iter().flatten().min().unwrap_or(0);
 		let ready = wait_any(&waitset, if deadline != 0 { deadline.max(now + 1) } else { 0 });
 		if ready >= 0 {
 			let handle = waitset[ready as usize];
@@ -607,6 +685,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// TIME: a request past its fifteen seconds completes as indeterminate, a provider past its snapshot deadline
 		// is closed, and what the request just served queued goes out.
 		let now = clock();
+		for pending in service.opening.expire(now) {
+			service.open_failed(pending);
+		}
 		for (info, attempts) in service.unopened.due(now) {
 			service.adopt(catalogue, info, attempts);
 		}
@@ -621,6 +702,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 // One ready handle.
 fn serve(service: &mut TypeC, clients: &mut Vec<Client>, handle: u64, catalogue: u64, subscription: u64, subscribed: &mut bool, roots: (u64, u64), buf: &mut [u8], reply: &mut [u8]) {
+	if service.catalogue_live && handle == catalogue {
+		service.opening_reply(handle, true, buf);
+		return;
+	}
+	if service.opening.channels().any(|channel| channel == handle) {
+		service.opening_reply(handle, false, buf);
+		return;
+	}
 	if let Some(at) = service.providers.iter().position(|provider| provider.stream == handle) {
 		if let Err(why) = service.drain_stream(at, buf) {
 			let id = service.providers[at].id;
@@ -706,22 +795,32 @@ fn serve(service: &mut TypeC, clients: &mut Vec<Client>, handle: u64, catalogue:
 	};
 	if len >= 2 {
 		let op = u16::from_le_bytes([buf[0], buf[1]]);
+		if op == HEARTBEAT_OP || op == CONNECT_OP {
+			for &leftover in handles.as_slice() {
+				close(leftover);
+			}
+			handles.clear();
+		}
 		if op == HEARTBEAT_OP {
-			send_blocking(handle, b"PONG", 0);
+			let _ = try_send(handle, b"PONG", 0);
 			return;
 		}
 		if op == CONNECT_OP {
 			if clients.len() >= MAX_CLIENTS {
-				send_blocking(handle, &[], 0);
+				let _ = try_send(handle, &[], 0);
 				return;
 			}
 			match channel() {
 				Some((mine, theirs)) => {
-					clients.push(Client { chan: mine, interface });
-					send_blocking(handle, &[], theirs);
+					if try_send(handle, &[], theirs) {
+						clients.push(Client { chan: mine, interface });
+					} else {
+						close(mine);
+						close(theirs);
+					}
 				}
 				None => {
-					send_blocking(handle, &[], 0);
+					let _ = try_send(handle, &[], 0);
 				}
 			}
 			return;
@@ -741,12 +840,13 @@ fn serve(service: &mut TypeC, clients: &mut Vec<Client>, handle: u64, catalogue:
 				let mut reply_handles = wire::Handles::new();
 				match typec::typec::dispatch(&mut StateView { registry: &service.registry }, &buf[..len], &mut handles, reply, &mut reply_handles) {
 					Some(written) => {
-						if !send_caps_blocking(handle, &reply[..written], reply_handles.as_slice()) {
+						let sent = try_send_caps(handle, &reply[..written], reply_handles.as_slice());
+						if !sent {
 							for &leftover in reply_handles.as_slice() {
 								close(leftover);
 							}
 						}
-						true
+						sent
 					}
 					None => false,
 				}

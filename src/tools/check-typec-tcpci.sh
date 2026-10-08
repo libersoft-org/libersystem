@@ -249,7 +249,9 @@ await_line "publishes typec-connector and power-source" "the driver never publis
 await_line "TypeCService: online" "TypeCService never came online" 0
 has "the board describes a sink: fixed 5000 mV 3000 mA, fixed 15000 mV 2000 mA; operating at 15000000 uW" "the driver must read the connector from the SSDT's _DSD"
 has "VBUS measured with alarms" "the controller measures VBUS"
+probe await 1 detached
 [[ "$(probe list)" == *"typeccheck: 1 connector(s)"* ]] || fail "boot: TypeCService must hold the controller's one connector"
+probe stalled
 
 # ------------------------------------------------------------------ a revision 3.1 charger
 
@@ -330,7 +332,8 @@ no_violations
 echo "typec-tcpci: $case_name: VBUS at 17.5 V in the 15 V contract - the sink path off before the Hard Reset, source-fault, the contract made anew"
 
 case_name="overshoot"
-alarms_before=$(seen "a VBUS alarm (high) at 18000 mV")
+alarms_before=$(seen "a VBUS alarm (high)")
+overshoots_before=$(grep -c -F "alarm high at 18000 mV" "$fixture/tcpc.log" || true)
 tcpc_ok caps less >/dev/null
 contracted 5000
 resets_before=$(status_of hard-resets-from-sink)
@@ -338,7 +341,11 @@ probe_started overshoot source 1 fault
 tcpc_ok script overshoot >/dev/null
 tcpc_ok caps >/dev/null
 probe_judged overshoot "the overshoot must report source-fault"
-await_line "a VBUS alarm (high) at 18000 mV" "the overshoot must raise the alarm" "$alarms_before" 20
+# The alert is latched; VBUS_VOLTAGE is a current sample. On an emulated CPU the 20 ms
+# overshoot can have settled before the driver reads it. The independent source must record
+# the actual 18 V alarm, and the guest must consume its high-alarm alert and recover safely.
+await_line "a VBUS alarm (high)" "the overshoot must raise the alarm" "$alarms_before" 20
+(($(grep -c -F "alarm high at 18000 mV" "$fixture/tcpc.log" || true) > overshoots_before)) || fail "$case_name: the source did not record a new 18 V high alarm"
 (($(status_of hard-resets-from-sink) == resets_before + 1)) || fail "$case_name: the alarm must be answered with one Hard Reset ($(tcpc status))"
 contracted 15000
 no_violations

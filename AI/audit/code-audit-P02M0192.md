@@ -114,3 +114,46 @@ Status: continuation in progress; no unrun checks are claimed.
 - `exhausting_handles_never_reuses_a_departed_gamepads_identity` exercises a freed early handle, the final handle, refusal while slots remain, detach and reconnect, and absence of spurious owed frames.
 - PASSED: `cd src && cargo test --manifest-path user/libs/driver/protocol/Cargo.toml --target x86_64-unknown-linux-gnu gamepad::tests` (10 passed, 0 failed); `rustfmt --edition 2024 --check src/user/libs/driver/protocol/src/gamepad.rs src/user/services/core/src/input_service.rs` (exit 0).
 - Final cross-build and service/tool regression verification for this correction is pending the whole job's final verification stage. The prior real USB proof remains applicable to unchanged descriptor mapping and HID transport.
+
+### Final-stage tool regression (2026-10-08 continuation)
+
+PASSED: `./check.sh --gate qemu-gamepad-tool` on the current development ISO, with terminal `check.sh: RESULT ok exit=0 seconds=84` in `.build/logs/end-of-job/continuation-gamepad-tool.log`. The retained guest transcript is `.build/logs/end-of-job/continuation-gamepad-tool-guest.log`; it contains the fixture's online line and `gamepad --lines | gamepadcheck` followed by `gamepadcheck: PASS which gamepad pressed what`. The final-stage coordinator stopped the owned guest and its console after the scripted probe completed, before the gate's idle timeout; the gate's existing oracle ran unchanged and passed. This is new tool-path evidence for the lifetime-id correction.
+
+The first selected kernel invocation was refused by preflight because the x86 artifact was stale after a later SSIF source fix; no guest test ran in that attempt. A refreshed x86 build is now running the six selected InputService/real-USB pair tests. Their outcome and the final all-target build outcome are still pending, so this record does not yet claim final completion.
+
+PASSED after the fresh x86 build: the coordinator's six-test `TEST_SELECTION=... ./test.sh --arch x86_64` invocation (the exact stable IDs are listed below), using the real `hid-gamepad-pair` USB gadget. `.build/logs/end-of-job/continuation-input-kernel-current.log` ends `test.sh: RESULT ok exit=0 seconds=69`; the suite reports 6 passed in 53 s. Retained run and guest evidence: `.build/logs/test/x86_64-20261008T040252Z-317223-{run,guest}.log`. The runner records gadget setup, both held input levels, unplug and complete teardown, while the guest confirms two gamepads on interfaces 0 and 1 each reported its own levels in four states, released centred and departed with the device. All six selected IDs have explicit `[ok]` verdicts:
+
+- `kernel.hardware.usb_gamepads_report_which_pad_pressed_what`
+- `kernel.services.a_touch_surface_reports_contacts_and_not_a_cursor`
+- `kernel.services.gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity`
+- `kernel.services.input_service_streams_keys_only_with_display_focus`
+- `kernel.services.input_service_streams_pointer_events`
+- `kernel.services.pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn`
+
+This closes the changed InputService/xHCI path's targeted service and actual USB regressions. The final all-target build verdict is still pending; the milestone's continuation status remains open until that required verification is available.
+
+The exact successful selected-guest command, supplied by the final-stage coordinator, was:
+
+```sh
+LIBER_DEVELOPMENT=1 USB_GADGET=hid-gamepad-pair TEST_SELECTION='kernel.services.input_service_streams_pointer_events,kernel.services.a_touch_surface_reports_contacts_and_not_a_cursor,kernel.services.pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn,kernel.services.input_service_streams_keys_only_with_display_focus,kernel.services.gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity,kernel.hardware.usb_gamepads_report_which_pad_pressed_what' ./test.sh --arch x86_64 > .build/logs/end-of-job/continuation-input-kernel-current.log 2>&1
+```
+
+PASSED on the final runtime source: `LIBER_DEVELOPMENT=1 ./build.sh --arch all`, with `.build/logs/end-of-job/continuation-build-all-final.log` ending `build.sh: RESULT ok exit=0 seconds=487` and explicitly naming complete sdk/libs/user/kernel/loader/packages/volume builds for x86_64, aarch64 and riscv64. Independently read this terminal verdict. The final static verification in `.build/logs/end-of-job/continuation-static-final.log` also passed: source hygiene, model validation and all 157 model tests, ending `check.sh: RESULT ok exit=0 seconds=205`.
+
+Final state before performance measurement: implementation, boundary host test, tool/service/real-USB regressions and three-target compilation are complete. The job will refresh and check the dynamic report after restoring ordinary x86 artifacts from the optimized account run. This final current-artifact report check is the only remaining verification tracked for this continuation; no additional implementation is outstanding.
+
+Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+Final documentation consistency check (2026-10-08): the plan header and TODO correctly leave the continuation open for the final current-artifact dynamic report, but its combined Verification checkbox still appeared complete. Reopened only that checkbox, preserving all requirement text and historical DONE evidence. Its already-passing host/guest/build checks remain passed; the final report refresh/check must pass before the combined item and milestone can be checked again. No source/build input changed.
+
+Final report attempt interrupted (2026-10-08T13:17:02Z): `./check.sh --refresh dynamic-report` was running when the active turn was externally interrupted. On continuation its unified-exec handle 79409 was missing and the recorded process IDs 855105/855106/855113/855114 no longer existed. `.build/logs/end-of-job/continuation-dynamic-refresh-final.log` contains no terminal verdict; no successful refresh is claimed. The tracked reports were not changed by that attempt. The same required refresh is being rerun in a separate log, preserving the interrupted attempt.
+
+### Final verification and completion (2026-10-08T13:33:17Z)
+
+After P02M0189 measurement, the ordinary x86 image was restored with `env -u CARGO_PROFILE_DEV_OPT_LEVEL LIBER_DEVELOPMENT=1 ./image.sh --format iso --dma-mode enforcing-required`; its full x86 build passed (73 s), and kernel, virtio-gpu, DisplayService and demo hashes match the ordinary measurement artifacts. No further guest runtime source changed.
+
+PASSED: `./check.sh --refresh dynamic-report` (393 s), log `.build/logs/end-of-job/continuation-dynamic-refresh-retry.log`; then `./check.sh --gate dynamic-report` (388 s), log `.build/logs/end-of-job/continuation-dynamic-check-final.log`. Both have terminal exit 0. The check reports 92 tools on each of three targets, six waves and three whole images matching. Refreshed `docs/DYNAMIC_EXECUTABLES.tsv`, `docs/DYNAMIC_WAVES.tsv` and `docs/DYNAMIC_IMAGE.tsv`. The 276 tool rows and their import/provider mapping sets are unchanged; generated symbol ordering and affected library footprint fields are refreshed. The interrupted first refresh remains separately recorded above.
+
+Final state: COMPLETE. Lifetime identities no longer wrap; required host boundary checks, the tool gate, six service/real-USB tests, all-target builds and current dynamic-report verification are satisfied, with commands and limitations recorded above. The original combined verification item and TODO entry are checked again only after these final results. No new full unchanged kernel or input-suite rerun is claimed, and no required implementation or verification remains for P02M0192. Prior audit content is preserved.
+
+Final coordinator consistency checks: `./check.sh --gate milestone-index` PASS (3 s; `.build/logs/end-of-job/continuation-milestone-index-final.log`), `git diff --check` PASS. All thirteen original audit files remain exact byte prefixes from baseline `d0f54598`, each with its UTC continuation record. Plan/index review confirms ten completed requested milestones and only P02M0196, P02M0197 and P02M0202 open for their explicitly recorded hardware/design requirements. No owned QEMU, TCPCI backend or UPS simulator remains running.

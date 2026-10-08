@@ -65,6 +65,6 @@ grep -aE '^btclassic: ' "$lines" | sed 's/^/bluetooth-le-audio: /'
 # THE SERVICE'S DOMAIN AFTER THE LOAD: what the system graph says BluetoothService used and at most, against the
 # Domain its bounds derive - read, not asserted, so a figure that moves is seen rather than a gate that flaps.
 sed -n '/graph bluetooth_service/,/vol:\/\/system>/p' "$lines" | sed 's/^/bluetooth-le-audio: graph: /'
-sed -n '/sent: usage/,$p' "$lines" | grep -aE 'bluetooth|memory|handles|threads|ipc|stack|dma|domain|name' | head -n 40 | sed 's/^/bluetooth-le-audio: usage: /' || true
+sed -n '/sent: usage/,$p' "$lines" | grep -aE 'bluetooth|memory|handles|threads|ipc|stack|dma|domain|name' | sed -n '1,40p' | sed 's/^/bluetooth-le-audio: usage: /' || true
 
 echo "bluetooth-le-audio: PASS - a coordinated set bonded and streamed as one device in LC3, each earbud its own channel; its level both ways; a call's audio both ways and the call relayed through the telephone bearer; a broadcast in the clear and encrypted played on the earbuds; the set's links going"

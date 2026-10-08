@@ -86,11 +86,11 @@ expect() {
 expect "btclassic: PASS transfer" "the phone and the serial device must bond, and a push with no receiver waiting be refused"
 
 # `wc` says lines, words, bytes and scalars.
-size="$(grep -aoE '^[0-9]+ [0-9]+ [0-9]+ [0-9]+ [^ ]*big\.txt' "$lines" | head -n 1 | awk '{print $3}' || true)"
+size="$(grep -aoE '^[0-9]+ [0-9]+ [0-9]+ [0-9]+ [^ ]*big\.txt' "$lines" | sed -n '1p' | awk '{print $3}' || true)"
 [[ -n "$size" ]] || fail "wc never reported the file's size"
-over_l2cap="$(grep -aoE "bt-fixture: phone received big\.txt over L2CAP: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | head -n 1 || true)"
+over_l2cap="$(grep -aoE "bt-fixture: phone received big\.txt over L2CAP: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | sed -n '1p' || true)"
 [[ -n "$over_l2cap" ]] || fail "the phone never received the file over L2CAP"
-over_rfcomm="$(grep -aoE "bt-fixture: serial received big\.txt over RFCOMM: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | head -n 1 || true)"
+over_rfcomm="$(grep -aoE "bt-fixture: serial received big\.txt over RFCOMM: [0-9]+ bytes, digest [0-9a-f]{8}" "$lines" | sed -n '1p' || true)"
 [[ -n "$over_rfcomm" ]] || fail "the serial device never received the file over RFCOMM"
 [[ "$over_l2cap" == *": $size bytes, digest "* ]] || fail "the phone received a different size than the file's $size bytes: $over_l2cap"
 [[ "${over_l2cap##* digest }" == "${over_rfcomm##* digest }" && "$over_rfcomm" == *": $size bytes, digest "* ]] || fail "the two transports delivered different bytes: $over_l2cap / $over_rfcomm"

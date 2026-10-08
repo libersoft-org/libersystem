@@ -70,6 +70,14 @@ impl<T> ProviderRetry<T> {
 		out
 	}
 
+	/// Take only as much opening work as the service has concurrent slots for; unread retries keep
+	/// their attempt count and original due time while another kind shares those slots.
+	pub fn due_one(&mut self, now: u64) -> Option<(T, u32)> {
+		let at = self.waiting.iter().position(|waiting| waiting.at <= now)?;
+		let waiting = self.waiting.remove(at);
+		Some((waiting.item, waiting.attempts))
+	}
+
 	/// Drop every waiting provider `gone` names - one the catalogue withdrew.
 	pub fn withdraw(&mut self, gone: impl Fn(&T) -> bool) {
 		self.waiting.retain(|waiting| !gone(&waiting.item));
@@ -77,6 +85,10 @@ impl<T> ProviderRetry<T> {
 
 	pub fn len(&self) -> usize {
 		self.waiting.len()
+	}
+
+	pub fn contains(&self, found: impl Fn(&T) -> bool) -> bool {
+		self.waiting.iter().any(|waiting| found(&waiting.item))
 	}
 
 	pub fn is_empty(&self) -> bool {

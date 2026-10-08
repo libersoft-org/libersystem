@@ -105,7 +105,7 @@ probe() {
 		printf '%s\n' "$output" >&2
 		fail "$what (brightcheck $* printed no line matching: $expected)"
 	}
-	echo "brightness-acpi: brightcheck $* - $(grep -aE -- "$expected" <<<"$output" | head -1)"
+	echo "brightness-acpi: brightcheck $* - $(grep -aE -- "$expected" <<<"$output" | sed -n '1p')"
 }
 
 # THE REGION'S VALUES, as JSON keys.

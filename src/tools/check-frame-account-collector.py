@@ -69,7 +69,7 @@ def frame(log, start, serial, shape, draw_ns=2_000_000, drop=None):
 	log.switch(start + 2_200, APP, 0, "blocked")
 	log.wake(start + 20_000_000, 0, APP, "deadline")
 	log.switch(start + 20_050_000, 0, APP, "yielded")
-	site("park-end", 20_060_000, (1 << 64) - 110, APP)
+	site("park-end", 20_060_000, (1 << 64) - 11, APP)
 	site("acq-beg", 20_100_000, 0, APP)
 	site("acq-end", 20_150_000, 0, APP)
 	site("rec-beg", 20_160_000, 0, APP)
@@ -183,6 +183,56 @@ class Collector(unittest.TestCase):
 		self.assertAlmostEqual(whole["fallback_interval_ms"], 16.0, places=6)
 		self.assertAlmostEqual(whole["tick_rounding_ms"], (20_060_000 - 2_000) / 1e6 - 16.0, places=6)
 		self.assertAlmostEqual(whole["parks_per_frame"], 2.0)
+
+	def pacing_parks(self, parks, start=0, end=100):
+		# Milliseconds in the fixture; one cycle remains one nanosecond.
+		sites = []
+		for begin, asked, ticks, finish, message in parks:
+			sites.extend([
+				{"label": "park-ns", "cycles": int(begin * 1e6), "value": int(asked * 1e6)},
+				{"label": "park-tk", "cycles": int(begin * 1e6), "value": ticks},
+				{"label": "park-end", "cycles": int(finish * 1e6), "value": 0 if message else (1 << 64) - 11},
+			])
+		return frame_account.park_breakdown(sites, int(start * 1e6), int(end * 1e6), 1.0)
+
+	def test_an_early_deadline_retry_does_not_count_the_same_policy_delay_twice(self):
+		# One deadline at 16 ms: the first tick returns early, the loop spends 0.1 ms
+		# preparing another park, and the next tick returns at 25 ms.
+		result = self.pacing_parks([(0, 16, 2, 15, False), (15.1, 0.9, 1, 25, False)])
+		self.assertAlmostEqual(result["fallback_interval_ms"], 15.9)
+		self.assertAlmostEqual(result["tick_rounding_ms"], 9.0)
+		self.assertEqual(len(result["parks"]), 2)
+
+	def test_message_wakes_keep_time_actually_waited_before_and_after_the_deadline(self):
+		# The first event interrupts at 3 ms; after 1 ms of loop work the same
+		# 16 ms deadline is resumed, but a later message returns only at 20 ms.
+		result = self.pacing_parks([(0, 16, 2, 3, True), (4, 12, 2, 20, True)])
+		self.assertAlmostEqual(result["fallback_interval_ms"], 15.0)
+		self.assertAlmostEqual(result["tick_rounding_ms"], 4.0)
+
+	def test_expired_finite_parks_and_unbounded_release_waits_are_distinct(self):
+		result = self.pacing_parks([(0, 0, 0, 4, True), (5, 0, 1, 8, False), (9, 0, 0, 11, False)])
+		self.assertEqual(result["fallback_interval_ms"], 0)
+		self.assertAlmostEqual(result["tick_rounding_ms"], 5.0)
+		self.assertEqual(len(result["parks"]), 3)
+
+	def test_pacing_slices_clip_both_boundaries_without_restarting_the_deadline(self):
+		parks = [(0, 16, 2, 20, False)]
+		result = self.pacing_parks(parks, start=5, end=18)
+		self.assertAlmostEqual(result["fallback_interval_ms"], 11.0)
+		self.assertAlmostEqual(result["tick_rounding_ms"], 2.0)
+		result = self.pacing_parks(parks, start=17, end=19)
+		self.assertEqual(result["fallback_interval_ms"], 0)
+		self.assertAlmostEqual(result["tick_rounding_ms"], 2.0)
+
+	def test_a_wait_error_is_not_an_expired_pacing_deadline(self):
+		sites = [
+			{"label": "park-ns", "cycles": 0, "value": 0},
+			{"label": "park-tk", "cycles": 1, "value": 0},
+			{"label": "park-end", "cycles": 10, "value": (1 << 64) - 2},
+		]
+		with self.assertRaisesRegex(frame_account.AccountError, "park.*failed"):
+			frame_account.park_breakdown(sites, 0, 20, 1.0)
 
 	def test_a_buffer_that_refused_records_is_rejected(self):
 		with self.assertRaisesRegex(frame_account.AccountError, "REFUSED"):
