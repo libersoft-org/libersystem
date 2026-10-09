@@ -31,8 +31,9 @@
 # AND THE PORTS' SLEEP, which is suspend to idle (neither firmware here offers more - the kernel says what it found at
 # boot): `sleepctl suspend idle` with the timed wake, the host's oracle the serial line's timing as on x86_64 - a
 # counter printing every 100 ms SILENT between the kernel's `sleep: entered` and `sleep: resumed` lines, that interval
-# at least the wake less a margin, the counter's next value after with its monotonic clock moved by less than the sleep
-# and its boot-time clock by at least it - and the parking from the last sleep's record: no core woke for a device,
+# at least the wake less a margin, the counter's next value after with its monotonic clock excluding the sleep
+# and its boot-time clock including it, with the synchronous entry/resume ticks checked against host time - and the parking
+# from the last sleep's record: no core woke for a device,
 # cpu0 at most once for the timer, every other core at most once, for the IPI that ends its park.
 #
 # ONE GUEST AT A TIME: each target is booted, driven and torn down before the next one boots.
@@ -221,6 +222,59 @@ def idle_states(serial, timeout):
 	return cores
 
 
+def sleep_clock_gap(rows, entered, resumed, reported_ms, margin_ms=IDLE_MARGIN_MS):
+	"""Rows: (line index, host timestamp, count, mono ms, boot ms); boundaries: (index, stamp, tick)."""
+	entered_at, entered_stamp, entered_tick = entered
+	resumed_at, resumed_stamp, resumed_tick = resumed
+	before = [row for row in rows if row[0] < entered_at]
+	after = [row for row in rows if row[0] > resumed_at]
+	if not before or not after:
+		raise GateError('the same counter did not span the sleep')
+	left, right = before[-1], after[0]
+	mono, boot = right[3] - left[3], right[4] - left[4]
+	# The application is frozen during awake driver preparation and restoration too. That interval
+	# need not be shorter than the sleep. Counter output may also queue at ConsoleService after thaw,
+	# so its receive timestamp is not its sample time. The kernel's entry/resume lines, by contrast,
+	# are synchronously on the wire. Their ticks may include only the host-measured awake remainder.
+	# boot-minus-mono alone is insufficient: boot is derived from mono plus the sleep total.
+	host_sleep = (resumed_stamp - entered_stamp) * 1000
+	tick_ms = (resumed_tick - entered_tick) * 10  # The ABI clock has 100 ticks per second.
+	if mono < 0 or tick_ms < 0 or tick_ms > host_sleep - reported_ms + margin_ms:
+		raise GateError(f'the monotonic clock did not exclude sleep: entry/resume ticks +{tick_ms} ms, host {host_sleep:.0f} ms, sleep {reported_ms} ms, counter +{mono} ms')
+	if abs((boot - mono) - reported_ms) > 100:
+		raise GateError(f'the clocks differ by {boot - mono} ms across sleep, not the reported {reported_ms} ms')
+	return left, right, mono, boot
+
+
+def clock_self_test():
+	ordinary = [(0, 0.0, 1, 0, 0), (3, 5.2, 2, 200, 5200)]
+	long_preparation = [(0, 0.0, 1, 0, 0), (3, 10.0, 2, 5000, 10000)]
+	entered, resumed = (1, 0.1, 10), (2, 5.1, 10)
+	sleep_clock_gap(ordinary, entered, resumed, 5000)
+	sleep_clock_gap(long_preparation, (1, 4.0, 400), (2, 9.0, 400), 5000)
+	# ConsoleService can deliver a queued counter batch later; synchronous kernel timing remains exact.
+	sleep_clock_gap([ordinary[0], (3, 7.5, 2, 200, 5200)], entered, resumed, 5000)
+	# A larger unrelated gap afterwards must not replace the pair that actually crosses the entry.
+	left, right, _, _ = sleep_clock_gap(ordinary + [(4, 25.2, 3, 20200, 25200)], entered, resumed, 5000)
+	if (left[2], right[2]) != (1, 2):
+		raise GateError('the clock oracle selected an unrelated gap')
+	cases = [
+		('missing rebase', [ordinary[0], (3, 5.2, 2, 5200, 10200)], (2, 5.1, 510)),
+		('double rebase with clamped ticks', [(0, 0.0, 1, 5000, 5000), (3, 5.2, 2, 200, 5200)], resumed),
+		('backwards entry ticks', ordinary, (2, 5.1, 9)),
+		('omitted boot sleep', [ordinary[0], (3, 5.2, 2, 200, 200)], resumed),
+		('missing before', [ordinary[1]], resumed),
+		('missing after', [ordinary[0]], resumed),
+	]
+	for name, rows, boundary in cases:
+		try:
+			sleep_clock_gap(rows, entered, boundary, 5000)
+		except GateError:
+			continue
+		raise GateError(f'the clock oracle accepted {name}')
+	note('clock oracle self-test PASS (four positive cases, six rejected false outcomes)')
+
+
 def suspend_to_idle(target, serial, scale):
 	# WHAT THE FIRMWARE OFFERS, said at boot - checked, not assumed.
 	offered = SLEEP_OFFERED.search(bytes(serial.data))
@@ -235,34 +289,31 @@ def suspend_to_idle(target, serial, scale):
 	serial.wait_for(mark, lambda seen: b'ServiceManager: sleep: the transaction ended' in seen, 300 * scale, 'the suspend to idle')
 	serial.wait_for(mark, lambda seen: b'sleepcheck: count done' in seen, 120 * scale, 'the counter\'s end')
 	lines = serial.lines_since(mark)
-	entered = next((stamp for stamp, line in lines if 'sleep: entered (suspend to idle' in line), None)
-	resumed = next((stamp for stamp, line in lines if 'sleep: resumed (the timed wake' in line), None)
+	entered = next(((at, stamp, int(found.group(1))) for at, (stamp, line) in enumerate(lines) if (found := re.search(r'sleep: entered \(suspend to idle, at tick (\d+)\)', line))), None)
+	resumed = next(((at, stamp, int(found.group(2)), int(found.group(1))) for at, (stamp, line) in enumerate(lines) if (found := re.search(r'sleep: resumed \(the timed wake, after (\d+) ms, at tick (\d+)\)', line))), None)
 	if entered is None or resumed is None:
 		raise GateError('suspend to idle: no `sleep: entered` or no `sleep: resumed` naming the timed wake')
-	slept = (resumed - entered) * 1000
+	entered_at, entered_stamp, _ = entered
+	resumed_at, resumed_stamp, _, reported = resumed
+	slept = (resumed_stamp - entered_stamp) * 1000
 	if slept < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
 		raise GateError(f'suspend to idle: the host measured {slept:.0f} ms between the kernel\'s lines, under the {IDLE_WAKE_S} s wake')
 	rows = []
-	for stamp, line in lines:
+	for at, (stamp, line) in enumerate(lines):
 		# A PROMPT THE SHELL PRINTED INTO A COUNTER LINE is taken out first: `sleepctl` ends at the serial shell while
 		# the counter writes in the background, and the two share the console - "sleepcheck: " then the prompt then
 		# "count 23 ..." is one counter line, not a missing value.
 		found = COUNTER.search(PROMPT_TEXT.sub('', line))
 		if found:
-			rows.append((stamp, int(found.group(1)), int(found.group(2)), int(found.group(3))))
-	inside = [row for row in rows if entered < row[0] < resumed]
+			rows.append((at, stamp, int(found.group(1)), int(found.group(2)), int(found.group(3))))
+	inside = [row for row in rows if entered_at < row[0] < resumed_at]
 	if inside:
-		raise GateError(f'suspend to idle: {len(inside)} counter line(s) arrived while the machine slept, the first count {inside[0][1]}')
-	if len(rows) < 2 or [row[1] for row in rows] != list(range(rows[0][1], rows[0][1] + len(rows))):
+		raise GateError(f'suspend to idle: {len(inside)} counter line(s) arrived while the machine slept, the first count {inside[0][2]}')
+	if len(rows) < 2 or [row[2] for row in rows] != list(range(rows[0][2], rows[0][2] + len(rows))):
 		raise GateError('suspend to idle: the counter skipped or repeated a value, or printed nothing')
-	if not (rows[0][0] < entered and rows[-1][0] > resumed):
-		raise GateError('suspend to idle: the counter did not run across the sleep')
-	gap = max(range(1, len(rows)), key=lambda at: rows[at][3] - rows[at - 1][3])
-	mono, boot = rows[gap][2] - rows[gap - 1][2], rows[gap][3] - rows[gap - 1][3]
-	if boot < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
-		raise GateError(f'suspend to idle: the boot-time clock moved {boot} ms across the sleep, under the {IDLE_WAKE_S} s wake')
-	if mono >= IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS:
-		raise GateError(f'suspend to idle: the monotonic clock moved {mono} ms across the sleep - it took the sleep in')
+	if reported < IDLE_WAKE_S * 1000 - IDLE_MARGIN_MS or reported > slept + IDLE_MARGIN_MS:
+		raise GateError(f'suspend to idle: the reported {reported} ms sleep disagrees with its timed wake or the host interval {slept:.0f} ms')
+	left, right, mono, boot = sleep_clock_gap(rows, entered, resumed[:3], reported)
 	record = serial.run('sleepctl last', 60 * scale)
 	if 'woken by the timed wake' not in record:
 		raise GateError(f'suspend to idle: the record does not name the timed wake: {record}')
@@ -276,7 +327,7 @@ def suspend_to_idle(target, serial, scale):
 			raise GateError(f'suspend to idle: cpu{cpu} woke {timer} time(s) for the timer and {ipi} for an IPI')
 	if not parked:
 		raise GateError('suspend to idle: the record lists no core')
-	note(f'{target}: suspend to idle - the host measured {slept:.0f} ms for a {IDLE_WAKE_S} s wake with the counter silent, count {rows[gap - 1][1]} then {rows[gap][1]} (monotonic +{mono} ms, boot-time +{boot} ms), {parked} cores parked with no wake but the wake')
+	note(f'{target}: suspend to idle - the host measured {slept:.0f} ms for a {IDLE_WAKE_S} s wake with the counter silent, count {left[2]} then {right[2]} (monotonic +{mono} ms, boot-time +{boot} ms), {parked} cores parked with no wake but the wake')
 
 
 def wakes_on(rows, identity):
@@ -482,6 +533,9 @@ def check(target, serial, qmp_path, scale):
 
 def main():
 	args = sys.argv[1:]
+	if args == ['--self-test']:
+		clock_self_test()
+		return 0
 	skip_build = '--no-build' in args
 	targets = [a for a in args if not a.startswith('--')] or list(TARGETS)
 	for target in targets:

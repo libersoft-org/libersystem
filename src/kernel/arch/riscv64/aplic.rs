@@ -121,6 +121,35 @@ pub unsafe fn disarm_source(base: u64, source: u32) {
 	}
 }
 
+/// A temporary kernel alarm may borrow an inactive source, but must not replace a firmware or driver
+/// route. The domain must already deliver MSIs, so arming it does not change shared domain settings.
+///
+/// # Safety
+/// `base` is the adopted domain inside the direct map; the binding lock excludes another source owner.
+pub unsafe fn inactive_target(base: u64, source: u32) -> Option<u32> {
+	if source == 0 || source > MAX_SOURCE {
+		return None;
+	}
+	unsafe {
+		let read = |offset| core::ptr::read_volatile(super::paging::phys_to_virt(base + offset) as *const u32);
+		if read(DOMAINCFG) & (DOMAINCFG_IE | DOMAINCFG_DM) != DOMAINCFG_IE | DOMAINCFG_DM || read(SOURCECFG + (source as u64 - 1) * 4) != SM_INACTIVE || read(SETIE + (source / 32) as u64 * 4) & (1 << (source % 32)) != 0 {
+			return None;
+		}
+		Some(read(TARGET + (source as u64 - 1) * 4))
+	}
+}
+
+/// Restore the target of the inactive source borrowed above, after its temporary binding was released.
+///
+/// # Safety
+/// The source was borrowed by `inactive_target` and the binding lock still excludes a replacement owner.
+pub unsafe fn restore_inactive_target(base: u64, source: u32, target: u32) {
+	unsafe {
+		disarm_source(base, source);
+		write(base, TARGET + (source as u64 - 1) * 4, target);
+	}
+}
+
 // THE DOMAIN, WHOLE, ACROSS A HIBERNATION: its configuration, every source's mode and target, and every enable - what a
 // restore's fresh boot reset and armed its own way, written back as the image's kernel left it. The sources are read
 // to the highest an APLIC addresses; one the controller does not implement reads as inactive and is written so.

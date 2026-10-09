@@ -263,9 +263,9 @@ static HELD: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPU
 static STOP_HELD: AtomicBool = AtomicBool::new(false);
 // A RETURNING SYSTEM SUSPEND asks each saved core to stop, but can cancel an unconsumed request and
 // observes a firmware refusal. The hibernation replacement's one-way STOP_HELD remains separate.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "riscv64")]
 static SYSTEM_STOP: [core::sync::atomic::AtomicU8; MAX_CPUS] = [const { core::sync::atomic::AtomicU8::new(0) }; MAX_CPUS];
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "riscv64")]
 static SYSTEM_STOP_ERROR: [core::sync::atomic::AtomicI64; MAX_CPUS] = [const { core::sync::atomic::AtomicI64::new(0) }; MAX_CPUS];
 // The held core that takes a replacement from its hold instead of turning off, `usize::MAX` for none.
 #[cfg(not(target_arch = "x86_64"))]
@@ -307,14 +307,14 @@ pub fn stop_held(jumper: Option<usize>) {
 
 // Request an already held core's CPU_OFF/HART_STOP. 1 is cancellable, 2 has entered firmware, 3
 // returned with an error. A successful stop is confirmed by the firmware's affinity/hart status.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn request_system_stop(cpu: usize) {
 	SYSTEM_STOP_ERROR[cpu].store(0, Ordering::Relaxed);
 	SYSTEM_STOP[cpu].store(1, Ordering::Release);
 	wake_core(cpu);
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn system_stop_state(cpu: usize) -> (u8, i64) {
 	let state = SYSTEM_STOP[cpu].load(Ordering::Acquire);
 	(state, SYSTEM_STOP_ERROR[cpu].load(Ordering::Relaxed))
@@ -322,12 +322,12 @@ pub fn system_stop_state(cpu: usize) -> (u8, i64) {
 
 // Cancel only a request the held core has not consumed. A caller must settle state 2 through the
 // firmware's stopped status (or state 3) before releasing the hold or restarting that core.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn cancel_system_stop(cpu: usize) {
 	let _ = SYSTEM_STOP[cpu].compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn clear_system_stop(cpu: usize) {
 	SYSTEM_STOP[cpu].store(0, Ordering::Release);
 }
@@ -340,6 +340,7 @@ extern "C" fn hold_leave(_record: *mut arch::resume::Record, cpu: u64) -> i64 {
 	let cpu = cpu as usize;
 	HELD[cpu].store(true, Ordering::Release);
 	while HOLD.load(Ordering::Acquire) {
+		#[cfg(target_arch = "riscv64")]
 		if SYSTEM_STOP[cpu].compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok() {
 			let error = arch::resume::off_leave(core::ptr::null_mut(), 0);
 			SYSTEM_STOP_ERROR[cpu].store(error, Ordering::Relaxed);

@@ -128,6 +128,8 @@ declare -A GATES=(
 	# the machine off, the next boot replacing memory on the core the image's boot core was and every other core turned
 	# on again at its record, a running program going on; the boot after finding none, and a modified image refused.
 	["hibernate-ports"]="python3 tools/check-hibernate-ports.py"
+	# The real SBI system-suspend handshake, retained RTC wake and repeated saved-hart returns; absent firmware too.
+	["system-suspend-riscv64"]="python3 tools/check-system-suspend.py"
 	# PROCESSOR AND THERMAL POWER ON x86_64 q35 WITH THE FIXTURE'S PROCESSORS, ZONE AND FANS: every core's tables installed
 	# from the firmware's objects and C002's model-specific one refused, the state the governor asked for read from the
 	# registers at rest, under load, under `_PPC` and under each profile, the `_LPI` states entered or left unentered with

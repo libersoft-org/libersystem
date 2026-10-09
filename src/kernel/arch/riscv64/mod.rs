@@ -628,18 +628,7 @@ pub mod firmware {
 }
 
 // --------------------------------------------------------------------- rtc
-pub mod rtc {
-	// QEMU virt exposes a Goldfish RTC (device tree "rtc@101000"): TIME_LOW then
-	// TIME_HIGH read the nanoseconds since the Unix epoch (reading LOW latches HIGH).
-	const RTC_BASE: u64 = 0x0010_1000;
-	pub fn read_unix() -> u64 {
-		unsafe {
-			let lo = core::ptr::read_volatile(super::paging::phys_to_virt(RTC_BASE) as *const u32) as u64;
-			let hi = core::ptr::read_volatile(super::paging::phys_to_virt(RTC_BASE + 4) as *const u32) as u64;
-			((hi << 32) | lo) / 1_000_000_000
-		}
-	}
-}
+pub mod rtc;
 
 // ------------------------------------------------------------------ random
 // (RISC-V has no guaranteed userspace entropy source, so this is a splitmix64 stream

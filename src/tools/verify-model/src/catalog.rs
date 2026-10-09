@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 176] = [
+const GATES: [(&str, &str); 177] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -483,6 +483,7 @@ const GATES: [(&str, &str); 176] = [
 	// component sealed and in the clear - with the disk's header and QEMU's exit at the firmware's power-off as the
 	// oracles. Its subject is the kernel mechanism and the services above it.
 	("hibernate-ports", "kernel"),
+	("system-suspend-riscv64", "kernel"),
 	// PROCESSOR AND THERMAL POWER, on development instances of its own with the fixture's processors, zone and fans: the
 	// kernel's tables, governors and register writes, ProcessorPowerService, the zone's and the fan's drivers and the
 	// ACPI service's processor contract - with the registers the kernel writes and QEMU's exit as the oracles. Its
@@ -930,7 +931,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 77] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 78] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
@@ -988,6 +989,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 77] = [
 	"sleep",
 	"hibernate",
 	"hibernate-ports",
+	"system-suspend-riscv64",
 	// And processor power's, which boots two.
 	"processor-power",
 	// And HID over I2C's.

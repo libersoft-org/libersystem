@@ -2826,10 +2826,28 @@ fn every_riscv64_aia_device_node_is_published_under_its_bus() {
 	assert_eq!(uart.interrupts(), &[NodeInterrupt::Controller(IntxRoute { controller: 0x14, cells: 2, spec: [10, 4, 0, 0] })]);
 	let rtc = device(&found, b"/soc/rtc@101000");
 	assert!(rtc.is_compatible(b"google,goldfish-rtc"));
+	assert!(!rtc.wakeup_source, "an ordinary RTC interrupt is not a retained system wake declaration");
 	assert_eq!(rtc.interrupts(), &[NodeInterrupt::Controller(IntxRoute { controller: 0x14, cells: 2, spec: [11, 4, 0, 0] })]);
 	let test = device(&found, b"/soc/test@100000");
 	assert!(test.is_compatible(b"sifive,test1") && test.is_compatible(b"sifive,test0"));
 	assert_eq!((test.regs(), test.interrupts().len()), (&[(0x0010_0000, 0x1000)][..], 0));
+}
+
+#[test]
+fn device_wakeup_source_is_an_explicit_empty_property_of_that_node() {
+	let mut builder = Builder::new();
+	builder.begin("").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("rtc@101000").prop_str("compatible", "google,goldfish-rtc").prop_reg64(0x101000, 0x1000).prop("wakeup-source", b"");
+	builder.begin("child@0").prop_str("compatible", "test,child").end();
+	builder.end();
+	builder.begin("other@102000").prop_str("compatible", "test,other").prop_reg64(0x102000, 0x1000).end();
+	builder.begin("malformed@103000").prop_str("compatible", "test,malformed").prop_reg64(0x103000, 0x1000).prop_u32("wakeup-source", 1).end();
+	builder.end();
+	let found = devices_of(&at(builder.finish()));
+	assert!(device(&found, b"/rtc@101000").wakeup_source);
+	assert!(!device(&found, b"/rtc@101000/child@0").wakeup_source, "a wake declaration is not inherited by children");
+	assert!(!device(&found, b"/other@102000").wakeup_source, "nor leaked to a sibling");
+	assert!(!device(&found, b"/malformed@103000").wakeup_source, "a boolean DT property has no payload");
 }
 
 // A tree the fixtures cannot express: a TPM node under a `simple-bus` whose `ranges` move it, an I2C

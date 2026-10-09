@@ -67,6 +67,7 @@ pub fn set_usable_for_test(usable: bool) {
 // Indirect-CSR register selects for siselect.
 const EIDELIVERY: usize = 0x70; // interrupt delivery enable
 const EITHRESHOLD: usize = 0x72; // priority threshold (0 = accept all)
+const EIP0: usize = 0x80; // pending identities 0..63
 const EIE0: usize = 0xC0; // enable bits for EIDs 0..63 (RV64: one 64-bit register)
 
 // How many interrupt files the controller has, which is how many harts can be an MSI target.
@@ -262,6 +263,38 @@ pub fn restore_hart(saved: (u64, u64, u64)) {
 		ireg_write(EITHRESHOLD, saved.1 as usize);
 		ireg_write(EIDELIVERY, saved.0 as usize);
 		ireg_write(EIE0, saved.2 as usize);
+	}
+}
+
+// The returning suspend coordinator temporarily accepts only its retained RTC wake identity. The
+// bindings stay owned by their original harts; this changes delivery, not the ownership bookkeeping.
+pub fn replace_enables(mask: u64) -> u64 {
+	unsafe {
+		let previous = ireg_read(EIE0) as u64;
+		ireg_write(EIE0, mask as usize);
+		previous
+	}
+}
+
+pub fn is_pending(eid: u32) -> bool {
+	eid > 0 && eid < 64 && unsafe { ireg_read(EIP0) & (1usize << eid) != 0 }
+}
+
+// Only after the source is disabled and its device has stopped asserting: discard this source's final
+// message before its identity can be reused. Other devices' pending bits are preserved.
+pub fn clear_pending(eid: u32) {
+	if eid > 0 && eid < 64 {
+		unsafe {
+			// Atomic bit clear: an arrival for another identity between a read and a whole-register
+			// write must not be lost.
+			core::arch::asm!(
+				"csrw 0x150, {select}",
+				"csrc 0x151, {bit}",
+				select = in(reg) EIP0,
+				bit = in(reg) 1usize << eid,
+				options(nostack, preserves_flags),
+			);
+		}
 	}
 }
 

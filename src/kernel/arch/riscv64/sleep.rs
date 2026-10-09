@@ -3,8 +3,9 @@
 // kernel programmed - each driver has quiesced its device - but the wake set's, and puts back exactly what it masked.
 // No fixed button exists here, so nothing is pending before an entry but what the wake set itself raises.
 //
-// SUSPEND TO RAM would be the SBI's System Suspend extension (SUSP), asked of the SBI's probe: whether this firmware
-// offers it is said once at boot (`report_offers`); QEMU's OpenSBI does not, and the entry does not take it.
+// SUSPEND TO RAM uses SBI SUSP when the firmware offers it and the tree describes a retained Goldfish RTC wake
+// route. The default QEMU firmware does not offer it; its documented OpenSBI test configuration can exercise the
+// actual SUSP warm-entry contract. No fixture makes the kernel pretend that firmware offered a transition.
 // HIBERNATION IS OFFERED where the SBI's HSM extension stops and starts harts: its snapshot holds every hart in its
 // hold with its context saved, the image's kernel is resumed on the hart the image's boot hart was, and every other hart
 // is started again at its record (`sleep::image`). The APLIC domain, every function's configuration and the MSI-X entries
@@ -34,7 +35,7 @@ pub fn offers_idle() -> bool {
 }
 
 pub fn offers_ram() -> bool {
-	false
+	super::sbi_probe_extension(0x5355_5350) && disk_refused().is_none() && super::rtc::wake_supported()
 }
 
 pub fn fixed_buttons() -> u64 {
@@ -44,7 +45,12 @@ pub fn fixed_buttons() -> u64 {
 // WHAT THE FIRMWARE OFFERS AND THE ENTRY TAKES, said once at boot - checked, not assumed.
 pub fn report_offers() {
 	let offered = super::sbi_probe_extension(0x5355_5350);
-	crate::serial_println!("sleep: the SBI System Suspend extension is {} by this firmware - this port's entry takes suspend to idle", if offered { "offered" } else { "not offered" });
+	crate::serial_println!("sleep: the SBI System Suspend extension is {} by this firmware", if offered { "offered" } else { "not offered" });
+	if offers_ram() {
+		crate::serial_println!("sleep: system suspend is offered with the retained RTC alarm");
+	} else {
+		crate::serial_println!("sleep: system suspend is not offered by this entry - firmware, saved cores and retained RTC wake are required");
+	}
 	match disk_refused() {
 		None => crate::serial_println!("sleep: hibernation is offered - every hart's context through the HSM extension"),
 		Some(why) => crate::serial_println!("sleep: hibernation is not offered - {why}"),
@@ -102,8 +108,7 @@ pub fn replace_jump(params: u64) -> ! {
 }
 
 // HIBERNATION, through the per-core resume path (`sleep::image`): its snapshot and a restore's replacement asked of the
-// boot core's idle context (`sleep::boot_core`), and the machine off at the end of the write. SUSPEND TO RAM is not
-// this port's - see the head of this file - and a request for it is answered `ERR_UNSUPPORTED` there.
+// boot core's idle context (`sleep::boot_core`), and the machine off at the end of the write.
 pub fn offers_disk() -> bool {
 	disk_refused().is_none()
 }
@@ -147,12 +152,53 @@ pub fn run_pending() {
 }
 
 // THE BOOT CORE'S RUN OF A REQUEST.
-pub fn run(kind: Kind, _pair: (u8, u8), _after: Option<u64>) -> Result<SleepReport, i64> {
+pub fn run(kind: Kind, _pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
 	match kind {
-		Kind::Ram => Err(ERR_UNSUPPORTED),
+		Kind::Ram => crate::sleep::system::run(after),
 		Kind::Snapshot => crate::sleep::image::run_snapshot(),
 		Kind::Replace => Err(crate::sleep::disk::replace_now()),
 	}
+}
+
+// SBI SUSP, FID 0. A successful call resumes at the saved physical entry with the record as its
+// opaque value; a direct return is a refusal. Only the retained external wake may end its WFI:
+// pending scheduler IPIs and the stopped core timer are not system wake sources.
+pub extern "C" fn enter_ram(record: *mut super::resume::Record, _arg: u64) -> i64 {
+	#[cfg(not(liber_development))]
+	let sleep_type = 0u64;
+	#[cfg(liber_development)]
+	let sleep_type = {
+		static INJECTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+		if super::absent_named(b"system-suspend-entry") && !INJECTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+			crate::serial_println!("sleep: development fixture asks SBI system suspend for a reserved sleep type");
+			u64::from(u32::MAX)
+		} else {
+			0
+		}
+	};
+	let (error, enables): (i64, u64);
+	// SAFETY: every other hart is stopped, this hart's context is saved and global interrupts are
+	// masked. SUSP preserves registers other than a0/a1; a refused call restores the local enables.
+	unsafe {
+		core::arch::asm!(
+			"csrrc {enables}, sie, {local}",
+			"csrc sip, {software}",
+			"fence rw, rw",
+			"ecall",
+			"csrw sie, {enables}",
+			enables = out(reg) enables,
+			local = in(reg) (1u64 << 1) | (1u64 << 5),
+			software = in(reg) 1u64 << 1,
+			in("a7") 0x5355_5350usize,
+			in("a6") 0usize,
+			inout("a0") sleep_type => error,
+			inout("a1") super::resume::entry() => _,
+			in("a2") record as u64,
+			options(nostack),
+		);
+	}
+	let _ = enables;
+	error
 }
 
 unsafe extern "C" {

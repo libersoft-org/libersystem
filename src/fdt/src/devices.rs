@@ -63,6 +63,8 @@ pub struct DeviceNode {
 	interrupt_count: usize,
 	pub interrupt_controller: bool,
 	pub gpio_controller: bool,
+	// The board declares this device usable as a system wake source. Merely having an interrupt does not.
+	pub wakeup_source: bool,
 	// THE DMA STREAM ITS `iommus` NAMES: the first specifier's first cell after the IOMMU's phandle - the stream id under
 	// a one-cell binding, which every IOMMU binding a `virt` machine carries uses. None for a node with no `iommus`,
 	// which masters nothing an IOMMU translates.
@@ -118,6 +120,7 @@ struct Open {
 	phandle: u32,
 	interrupt_controller: bool,
 	gpio_controller: bool,
+	wakeup_source: bool,
 	// `device_type = "pci"`: its children are functions on its bus.
 	pci: bool,
 	start: u64,
@@ -125,7 +128,7 @@ struct Open {
 
 impl Open {
 	const fn empty() -> Self {
-		Open { path_len: 0, name: 0, compatible: None, enabled: true, reg: None, interrupts: None, extended: None, iommus: None, phandle: 0, interrupt_controller: false, gpio_controller: false, pci: false, start: 0 }
+		Open { path_len: 0, name: 0, compatible: None, enabled: true, reg: None, interrupts: None, extended: None, iommus: None, phandle: 0, interrupt_controller: false, gpio_controller: false, wakeup_source: false, pci: false, start: 0 }
 	}
 }
 
@@ -200,7 +203,7 @@ impl Fdt {
 						if at > 0
 							&& node.enabled && let Some((value, len)) = node.compatible
 						{
-							let mut device = DeviceNode { path: [0; MAX_PATH], path_len: 0, compatible: [0; MAX_COMPATIBLE], compatible_len: 0, phandle: node.phandle, bus: NodeBus::Memory, regs: [(0, 0); MAX_NODE_REGS], reg_count: 0, reg_refused: false, interrupts: [NodeInterrupt::Unresolved; MAX_NODE_INTERRUPTS], interrupt_count: 0, interrupt_controller: node.interrupt_controller, gpio_controller: node.gpio_controller, dma_stream: None, span: (node.start, p) };
+							let mut device = DeviceNode { path: [0; MAX_PATH], path_len: 0, compatible: [0; MAX_COMPATIBLE], compatible_len: 0, phandle: node.phandle, bus: NodeBus::Memory, regs: [(0, 0); MAX_NODE_REGS], reg_count: 0, reg_refused: false, interrupts: [NodeInterrupt::Unresolved; MAX_NODE_INTERRUPTS], interrupt_count: 0, interrupt_controller: node.interrupt_controller, gpio_controller: node.gpio_controller, wakeup_source: node.wakeup_source, dma_stream: None, span: (node.start, p) };
 							let shown = if at == 0 { 1 } else { node.path_len };
 							device.path[..shown].copy_from_slice(if at == 0 { b"/" } else { &path[..shown] });
 							device.path_len = shown;
@@ -267,6 +270,8 @@ impl Fdt {
 							open[at].interrupt_controller = true;
 						} else if self.str_eq(pname, "gpio-controller") {
 							open[at].gpio_controller = true;
+						} else if self.str_eq(pname, "wakeup-source") && len == 0 {
+							open[at].wakeup_source = true;
 						} else if len >= 4 && self.str_eq(pname, "device_type") && self.str_eq(value, "pci") {
 							open[at].pci = true;
 						}

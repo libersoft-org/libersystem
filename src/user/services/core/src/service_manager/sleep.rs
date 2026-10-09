@@ -911,7 +911,7 @@ impl system_sleep::Service for Api<'_> {
 		let mut wake_sources: Vec<WakeSource> = alloc::vec![
 			WakeSource { name: String::from("power button"), armed: offered & SLEEP_FIXED_POWER_BUTTON != 0, detail: fixed(SLEEP_FIXED_POWER_BUTTON) },
 			WakeSource { name: String::from("sleep button"), armed: offered & SLEEP_FIXED_SLEEP_BUTTON != 0, detail: fixed(SLEEP_FIXED_SLEEP_BUTTON) },
-			WakeSource { name: String::from("timed wake"), armed: true, detail: String::from("the one-shot timer for suspend to idle, the CMOS alarm for suspend to RAM") },
+			WakeSource { name: String::from("timed wake"), armed: true, detail: String::from("the one-shot timer for suspend to idle, the platform alarm for suspend to RAM") },
 			WakeSource { name: String::from("scheduled wake"), armed: self.sleeper.scheduled != 0, detail: if self.sleeper.scheduled != 0 { format!("at {} (Unix seconds)", self.sleeper.scheduled) } else { String::from("none scheduled") } },
 		];
 		for node in self.sleeper.last_wake_nodes.iter().take(28) {

@@ -146,6 +146,16 @@ fn line_slot(eid: u32) -> Option<usize> {
 // tree named no APLIC domain (one without AIA among them), a source the kernel armed for itself, one another
 // claim holds, a hart with no file, or a full table.
 pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str> {
+	bind_wired_inner(line, false).map(|(interrupt, _)| interrupt)
+}
+
+// A temporary retained RTC wake may borrow only an inactive route. Check and reserve under the same
+// binding lock; a failed competing claim must never restore stale source settings over a new binding.
+pub(super) fn bind_wired_inactive(line: &abi::WiredLine) -> Result<(Arc<Interrupt>, u32), &'static str> {
+	bind_wired_inner(line, true)
+}
+
+fn bind_wired_inner(line: &abi::WiredLine, inactive: bool) -> Result<(Arc<Interrupt>, u32), &'static str> {
 	if line.controller != abi::LINE_CONTROLLER_APLIC {
 		return Err("its line is not an APLIC's");
 	}
@@ -169,6 +179,12 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 	if LINES.iter().any(|slot| matches!(&*slot.lock(), LineSlot::Held(held) if held.source == source)) {
 		return Err("another claim holds that line");
 	}
+	let previous_target = if inactive {
+		// SAFETY: the adopted domain, inside the direct map, and the binding lock held.
+		unsafe { super::aplic::inactive_target(base, source) }.ok_or("the source already has a route or its domain does not deliver MSIs")?
+	} else {
+		0
+	};
 	let Some(free) = LINES.iter().position(|slot| matches!(&*slot.lock(), LineSlot::Free)) else {
 		return Err("this kernel's table of claimed lines is full");
 	};
@@ -185,6 +201,9 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 		unsafe { super::aplic::disarm_source(base, source) };
 		let confirmed = super::imsic::disable_eid_on_owner(eid);
 		*LINES[free].lock() = if confirmed { LineSlot::Free } else { LineSlot::Stranded };
+		if inactive {
+			unsafe { super::aplic::restore_inactive_target(base, source, previous_target) };
+		}
 		return Err("the controller did not take its source");
 	}
 	// A LEVEL LINE ALREADY ASSERTED is pended by no edge: asked for once, so a device waiting since before the
@@ -193,7 +212,26 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 		// SAFETY: as above.
 		unsafe { super::aplic::unmask_source(base, source, true) };
 	}
-	Ok(intr)
+	Ok((intr, previous_target))
+}
+
+// Give the temporary RTC binding back and restore its inactive target as one reservation operation.
+// The RTC caller has already stopped the device, masked its source and drained its pending identity.
+pub(super) fn release_wired_inactive(intr: Arc<Interrupt>, target: u32) {
+	let _binding = BINDING.lock();
+	let Some(at) = line_slot(intr.vector()) else { return };
+	let source = match &*LINES[at].lock() {
+		LineSlot::Held(line) => line.source,
+		_ => return,
+	};
+	if intr.disown() {
+		crate::sleep::mark_wake(intr.vector(), false);
+		if unbind(intr.vector())
+			&& let Some(base) = super::aplic::domain()
+		{
+			unsafe { super::aplic::restore_inactive_target(base, source, target) };
+		}
+	}
 }
 
 // Whether a claimed line is live at its controller - for the suite, as on x86_64.

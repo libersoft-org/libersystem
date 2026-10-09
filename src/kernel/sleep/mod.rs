@@ -55,6 +55,7 @@ pub fn register(state: u64, typ_a: u64, typ_b: u64) -> i64 {
 }
 
 // The registered pair for `\_Sx`, if one is.
+#[cfg(any(test, target_arch = "x86_64"))]
 pub fn sleep_type(x: usize) -> Option<(u8, u8)> {
 	let value = SLEEP_TYPES.get(x)?.load(Ordering::Acquire);
 	(value & REGISTERED != 0).then_some(((value & 0x7) as u8, ((value >> 8) & 0x7) as u8))

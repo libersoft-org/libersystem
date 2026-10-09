@@ -3169,7 +3169,10 @@ qemu_run_riscv64() {
 				# reason: the virt machine has no VGA device, the interactive set offers ramfb
 				# instead, and nothing drives ramfb - so DisplayService never comes up and takes
 				# ConsoleService and the shell down with it. A driven guest needs all three.
-				qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+				# The suspend fixture screenshots this GPU; QEMU's primary display is the boot ramfb.
+				local suspend_gpu_id=""
+				[[ "${SYSTEM_SUSPEND_FIXTURE:-0}" == "1" ]] && suspend_gpu_id=",id=system-suspend-display"
+				qemu_args+=(-device "virtio-gpu-pci,$virtio_opts$suspend_gpu_id")
 				# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
 				# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
 				# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
