@@ -12,7 +12,7 @@
 // that ran on through the sleep is taken out of the monotonic clock, so neither clock jumps and no deadline passes in
 // a sleep. The boot-time clock takes the sleep in.
 //
-// SUSPEND TO RAM is the firmware's transition, x86_64's alone here (`arch::sleep`), entered from the boot core's idle
+// SUSPEND TO RAM is the firmware's transition (`arch::sleep`), entered from the boot core's idle
 // context once every other core is parked (`boot_core`). HIBERNATION's snapshot and a restore's replacement are entered
 // there too, on every port: x86_64's own (`arch::x86_64::hibernate`), the device-tree ports' through the per-core resume
 // path (`image`).
@@ -60,14 +60,14 @@ pub fn sleep_type(x: usize) -> Option<(u8, u8)> {
 	(value & REGISTERED != 0).then_some(((value & 0x7) as u8, ((value >> 8) & 0x7) as u8))
 }
 
-// `SYS_SLEEP_STATES`: suspend to idle wherever the port parks its cores for one, suspend to RAM once `\_S3` is registered
-// and the platform can come back from it, and the fixed buttons.
+// `SYS_SLEEP_STATES`: each architecture admits its own firmware transition. ACPI's registered _S3
+// pair is an x86 requirement, not a prerequisite for PSCI or SBI system suspend.
 pub fn states() -> u64 {
 	let mut bits: u64 = 0;
 	if arch::sleep::offers_idle() {
 		bits |= 1 << abi::SLEEP_STATE_IDLE;
 	}
-	if sleep_type(3).is_some() && arch::sleep::offers_ram() {
+	if arch::sleep::offers_ram() {
 		bits |= 1 << abi::SLEEP_STATE_RAM;
 	}
 	// HIBERNATION'S KERNEL HALF: the snapshot, and `\_S4` or soft-off after it. Whether the machine is SET UP for it -
@@ -225,10 +225,7 @@ pub fn sys_system_sleep(domain: &alloc::sync::Arc<crate::object::domain::Domain>
 	};
 	match state {
 		abi::SLEEP_STATE_IDLE => suspend_to_idle(after),
-		abi::SLEEP_STATE_RAM => {
-			let Some(pair) = sleep_type(3) else { return Err(ERR_UNSUPPORTED) };
-			arch::sleep::suspend_to_ram(pair, after)
-		}
+		abi::SLEEP_STATE_RAM => arch::sleep::suspend_to_ram(after),
 		// HIBERNATION'S SNAPSHOT: answered twice - `WAKE_SNAPSHOT`, then `WAKE_RESTORED` in the machine restored from its
 		// image (see `disk`). Offered where `\_S4` or soft-off can end it, which is every machine the entry runs on.
 		abi::SLEEP_STATE_DISK => arch::sleep::snapshot(),
@@ -337,3 +334,5 @@ pub mod boot_core;
 pub mod disk;
 #[cfg(not(target_arch = "x86_64"))]
 pub mod image;
+#[cfg(target_arch = "riscv64")]
+pub mod system;

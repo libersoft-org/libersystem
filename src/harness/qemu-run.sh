@@ -103,6 +103,7 @@
 #             refused by its lock.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   IDLE_FIXTURE=1    aarch64 and riscv64: the machine's tree given `/cpus/idle-states` (`fdt_edit.py idle-fixture`)
+#   SYSTEM_SUSPEND_FIXTURE=1  riscv64 UEFI: enable OpenSBI's documented system-suspend test backend through its tree
 #   I2C_FIXTURE=bus|hid|tcpc|tree  I2C_SOCKET=  GPIO_SOCKET=
 #             attach QEMU's vhost-user I2C and GPIO controllers at their pinned slots, their device side
 #             the `vhost-i2c-gpio.py` listening on the two sockets, with the guest's RAM on a shared memfd
@@ -1089,6 +1090,27 @@ idle_dtb_args() {
 		exit 1
 	}
 	printf -- '-dtb\n%s\n' "$edited"
+}
+
+# OpenSBI consumes this fixture's configuration before handing the tree to U-Boot. No kernel feature flag or
+# synthetic wake is added: the guest must probe and execute SBI SUSP, stop its other harts and arm its RTC.
+system_suspend_dtb_args() {
+	local -n suspend_into=$1
+	local qemu="$2"
+	shift 2
+	[[ "${SYSTEM_SUSPEND_FIXTURE:-0}" == "1" ]] || return 0
+	local dumped edited
+	dumped="$(mktemp "$QEMU_BUILD_DIR/system-suspend-XXXXXX.dtb")"
+	edited="${dumped%.dtb}.suspend.dtb"
+	"$qemu" "$@" -machine "$MACHINE_FOR_DUMP,dumpdtb=$dumped" -display none >/dev/null 2>&1 || {
+		echo "qemu-run: the machine's tree could not be dumped for the system-suspend fixture" >&2
+		exit 1
+	}
+	python3 "$HERE/fdt_edit.py" system-suspend-fixture "$dumped" "$edited" || {
+		echo "qemu-run: OpenSBI's system-suspend test configuration could not be added" >&2
+		exit 1
+	}
+	suspend_into+=(-dtb "$edited")
 }
 
 # THE ACPI GATE'S FIXTURE, when a run asks for it with `ACPI_FIXTURE` (the SSDT) and `ACPI_FIXTURE_MEMORY` (the backing
@@ -3262,6 +3284,7 @@ qemu_run_riscv64() {
 		local -a idle_tree=()
 		mapfile -t idle_tree < <(idle_dtb_args qemu-system-riscv64 riscv "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
 		independent+=("${idle_tree[@]}")
+		system_suspend_dtb_args independent qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}"
 		harness_hold
 		vsock_echo_start
 		exec "$qemu_bin" \
@@ -3365,6 +3388,17 @@ qemu_run_riscv64() {
 	trap - EXIT
 	exit "$qemu_status"
 }
+
+if [[ "${SYSTEM_SUSPEND_FIXTURE:-0}" == "1" ]]; then
+	if [[ "$TARGET_ARCH" != riscv64 || "${UEFI:-0}" != 1 ]]; then
+		echo "qemu-run: SYSTEM_SUSPEND_FIXTURE=1 requires riscv64 with UEFI=1" >&2
+		exit 2
+	fi
+	if [[ "${DMA_DTB_NODE:-0}" == 1 || "${IDLE_FIXTURE:-0}" == 1 || "${I2C_FIXTURE:-}" == hid || "${I2C_FIXTURE:-}" == tcpc || "${I2C_FIXTURE:-}" == tree ]]; then
+		echo "qemu-run: SYSTEM_SUSPEND_FIXTURE=1 and another fixture each hand the guest an edited tree - one run asks for one" >&2
+		exit 2
+	fi
+fi
 
 case "$TARGET_ARCH" in
 x86_64) qemu_run_x86_64 "$KERNEL_ELF" ;;

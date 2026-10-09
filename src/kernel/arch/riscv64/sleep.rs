@@ -108,8 +108,11 @@ pub fn offers_disk() -> bool {
 	disk_refused().is_none()
 }
 
-pub fn suspend_to_ram(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
-	boot_core::ask(Kind::Ram, pair, after)
+pub fn suspend_to_ram(after: Option<u64>) -> Result<SleepReport, i64> {
+	if !offers_ram() {
+		return Err(ERR_UNSUPPORTED);
+	}
+	boot_core::ask(Kind::Ram, (0, 0), after)
 }
 
 pub fn snapshot() -> Result<SleepReport, i64> {

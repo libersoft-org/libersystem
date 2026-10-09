@@ -18,6 +18,7 @@
 #   fdt_edit.py hid-fixture IN OUT --i2c-slot N --gpio-slot M       write the HID-over-I2C fixture tree
 #   fdt_edit.py tcpc-fixture IN OUT --i2c-slot N --gpio-slot M      write the TCPCI fixture tree
 #   fdt_edit.py idle-fixture IN OUT --binding arm|riscv              write the idle-state fixture tree
+#   fdt_edit.py system-suspend-fixture IN OUT                       enable OpenSBI's system-suspend test backend
 #   fdt_edit.py --self-test                                          build, edit and re-read a tree, writing nothing
 
 import struct
@@ -339,6 +340,25 @@ def idle_fixture(tree, binding):
 	return tree
 
 
+def system_suspend_fixture(tree):
+	"""Enable OpenSBI's documented test backend and declare the test board's retained RTC wake.
+	OpenSBI consumes and removes this node before the guest boots. The actual SBI SUSP call still checks
+	that other harts stopped and resumes through the firmware's warm entry; this does not model power loss.
+	See OpenSBI v1.6 docs/opensbi_config.md and lib/sbi/sbi_system.c."""
+	rtcs = [node for _, node in tree.walk() if b'google,goldfish-rtc' in (node.prop('compatible') or b'').split(b'\0')]
+	if len(rtcs) != 1:
+		raise TreeError('the system-suspend test board needs exactly one Goldfish RTC')
+	# The OpenSBI test backend leaves this device and its interrupt route powered. This board declaration
+	# is intentionally not inferred in the kernel merely from the RTC's register-compatible string.
+	rtcs[0].set('wakeup-source', b'')
+	chosen = tree.root.child('chosen') or tree.root.add(Node('chosen'))
+	config = chosen.child('opensbi-config') or chosen.add(Node('opensbi-config', [('compatible', text('opensbi,config'))]))
+	if config.prop('compatible') != text('opensbi,config'):
+		raise TreeError('/chosen/opensbi-config has a different binding')
+	config.set('system-suspend-test', b'')
+	return tree
+
+
 def self_test():
 	failures = []
 
@@ -408,6 +428,21 @@ def self_test():
 		check(f'{binding}: each a parameter', (first.prop(parameter) is not None, second.prop(parameter) is not None), (True, True))
 		names = cells(*[struct.unpack('>I', child.prop('phandle'))[0] for child in states.children]) if states else None
 		check(f'{binding}: every cpu names all three, in order', [again.find(f'/cpus/cpu@{index}').prop('cpu-idle-states') for index in range(2)], [names, names])
+	# Preserve the RTC/interrupt description and unrelated chosen data; declare retention only on the RTC.
+	suspend_tree = parse(blob)
+	suspend_tree.root.add(Node('chosen', [('bootargs', text('unchanged'))]))
+	suspend_tree.root.add(Node('rtc@101000', [('compatible', text('google,goldfish-rtc')), ('reg', cells(0, 0x101000, 0, 0x1000)), ('interrupts', cells(11, 4))]))
+	system_suspend_fixture(suspend_tree)
+	system_suspend_fixture(suspend_tree)
+	suspend_tree = parse(serialize(suspend_tree))
+	check('OpenSBI test backend enabled', suspend_tree.find('/chosen/opensbi-config').prop('system-suspend-test'), b'')
+	check('OpenSBI config binding', suspend_tree.find('/chosen/opensbi-config').prop('compatible'), text('opensbi,config'))
+	check('chosen data preserved', suspend_tree.find('/chosen').prop('bootargs'), text('unchanged'))
+	check('one firmware config node', len(suspend_tree.find('/chosen').children), 1)
+	check('RTC retained wake declared', suspend_tree.find('/rtc@101000').prop('wakeup-source'), b'')
+	check('RTC registers preserved', suspend_tree.find('/rtc@101000').prop('reg'), cells(0, 0x101000, 0, 0x1000))
+	check('RTC interrupt preserved', suspend_tree.find('/rtc@101000').prop('interrupts'), cells(11, 4))
+	check('suspend fixture preserves hardware', serialize(Tree(suspend_tree.reserved, suspend_tree.find('/pcie@10000000'))), serialize(Tree(tree.reserved, parse(blob).find('/pcie@10000000'))))
 	if failures:
 		for failure in failures:
 			print(f'fdt_edit: {failure}', file=sys.stderr)
@@ -419,6 +454,12 @@ def self_test():
 def main(argv):
 	if argv == ['--self-test']:
 		return self_test()
+	if len(argv) == 3 and argv[0] == 'system-suspend-fixture':
+		with open(argv[1], 'rb') as source:
+			tree = parse(source.read())
+		with open(argv[2], 'wb') as destination:
+			destination.write(serialize(system_suspend_fixture(tree)))
+		return 0
 	if len(argv) >= 3 and argv[0] in ('hid-fixture', 'tcpc-fixture'):
 		i2c_slot = int(argv[argv.index('--i2c-slot') + 1], 0) if '--i2c-slot' in argv else 0x15
 		gpio_slot = int(argv[argv.index('--gpio-slot') + 1], 0) if '--gpio-slot' in argv else 0x16
@@ -450,7 +491,7 @@ def main(argv):
 		with open(argv[2], 'wb') as destination:
 			destination.write(serialize(tree_fixture(tree, slot, line)))
 		return 0
-	print('usage: fdt_edit.py tree-fixture IN OUT [--slot N] [--line L] | hid-fixture|tcpc-fixture IN OUT [--i2c-slot N] [--gpio-slot M] | idle-fixture IN OUT --binding arm|riscv | --self-test', file=sys.stderr)
+	print('usage: fdt_edit.py tree-fixture IN OUT [--slot N] [--line L] | hid-fixture|tcpc-fixture IN OUT [--i2c-slot N] [--gpio-slot M] | idle-fixture IN OUT --binding arm|riscv | system-suspend-fixture IN OUT | --self-test', file=sys.stderr)
 	return 2
 
 

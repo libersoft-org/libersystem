@@ -63,7 +63,7 @@ pub fn offers_idle() -> bool {
 }
 
 pub fn offers_ram() -> bool {
-	facs().is_some()
+	crate::sleep::sleep_type(3).is_some() && facs().is_some()
 }
 
 // The snapshot needs the trampoline page the resume path restarts the other cores through, and PM1 to read the wake.
@@ -94,7 +94,8 @@ pub fn unmask_device_lines() {
 
 // SUSPEND TO RAM, hibernation's snapshot and a restore's replacement, each asked of the boot core's idle context
 // (`sleep::boot_core`) - where the trampoline the resume path restarts the other cores through exists at all.
-pub fn suspend_to_ram(pair: (u8, u8), after: Option<u64>) -> Result<SleepReport, i64> {
+pub fn suspend_to_ram(after: Option<u64>) -> Result<SleepReport, i64> {
+	let Some(pair) = crate::sleep::sleep_type(3) else { return Err(ERR_UNSUPPORTED) };
 	if crate::boot_info().smp_trampoline == 0 {
 		return Err(ERR_UNSUPPORTED);
 	}
