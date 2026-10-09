@@ -1060,3 +1060,97 @@ Current additional PASS evidence: all-target development build, shipping kernel 
 Final implementation scope: the returning RISC-V SBI/RTC path and its software verification are complete. P02M0197 remains OPEN for ARM SYSTEM_SUSPEND, which needs an actually offered platform/firmware and retained wake contract, and for PCI PME/network wake, which needs a selected supported endpoint and verifiable wake route. Either missing target could be an independently specified emulator or physical hardware; no blanket physical-board prerequisite is asserted. Plan requirements and existing audit contents are preserved. The plan and TODO now reflect this verified partial completion without closing the combined ARM/RISC-V or PME requirements.
 
 Final documentation/cleanup verification PASS: `./check.sh --gate milestone-index` exited 0 after the final plan/TODO updates; log `system-suspend-20261009/milestone-index-final.log`. `git diff --check` passed. All thirteen requested original audit prefixes still match commit `d0f54598` byte-for-byte. The final owned system-suspend QEMU process and serial socket are gone. Independent read-only review confirmed that final statuses and measured results agree with the retained terminal PASS, with the remaining requirements still open.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0197 (2026-10-09 18:28:16 UTC):
+
+Reviewed the remaining conditional system-suspend and wake-source items. The retained evidence proves actual SBI SUSP entry/refusal/resume through the OpenSBI QEMU fixture and suspend-to-idle on ARM; the current ARM firmware does not offer SYSTEM_SUSPEND. PCI PME and network wake are not provided by the devices/transports in the existing QEMU targets. The user excludes unavailable physical-only paths in Phase 2. This does not claim an ARM context-loss resume, PCI PME, or WoL implementation/test. Final scope reconciliation must distinguish these exclusions from the completed QEMU behavior. Existing audit content is preserved; no audit rating is assigned.
+
+
+# IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0197 (2026-10-09T19:04:08Z):
+
+Continuing the user-authorized QEMU-only scope. Read the complete plan, prior
+PME/network-wake and firmware investigations, current driver inventory, ARM sleep
+admission and the tickless-idle gate. The ARM implementation does not advertise
+RAM and rejects it; the existing gate proves firmware reporting and actual idle,
+but does not actively prove that an ARM RAM request is refused before a sleep
+transaction. That verification gap is being closed in the existing gate.
+
+The bounded PME/WoL review is checking the installed QEMU's actual models against
+the repository's existing NIC drivers. An emulated NIC without a matching driver
+is not a supported wake implementation; current model/driver absence is also not
+a universal claim that wake cannot be emulated. No new NIC driver, custom QEMU
+platform, guest run or long build has been performed in this continuation.
+
+### ARM early-refusal proof and bounded PME/WoL classification (2026-10-09T19:06:50Z)
+
+Implemented an ARM-only precondition in `src/tools/check-tickless-idle.py::suspend_to_idle`.
+It requires the actual boot report that PSCI SYSTEM_SUSPEND is absent, checks that
+`sleepctl status` offers idle and omits RAM, requests timed RAM, and requires an
+explicit `Unsupported` reply. The complete request/last-record trace must contain
+no accepted sleep, transaction step or kernel entry. The last record must name
+the requested RAM state and its refusal before freezing because the machine does
+not offer that state. The existing real suspend-to-idle proof follows unchanged.
+An offered ARM firmware now fails this absent-firmware scenario explicitly instead
+of being silently treated as equivalent coverage. No ARM SYSTEM_SUSPEND entry was
+implemented or claimed; current `offers_ram` and `run(Kind::Ram)` remain refusal.
+
+`check_arm_ram_refusal` has one accepted positive transcript and eight rejected
+false outcomes: unrelated refusal, missing reply, acceptance, freezing, an idle
+entry substituted for RAM, a stale different state, another refusal reason, and
+unwind after entry. Verification PASS: `python3 -m py_compile
+src/tools/check-tickless-idle.py`, `python3 src/tools/check-tickless-idle.py
+--self-test` (existing clock oracle plus the new refusal oracle), and
+`git diff --check`. No guest or build was run; the new ARM runtime assertion remains
+unperformed until the final `tickless-idle` gate. RISC-V gate behavior is unchanged.
+
+The installed version is QEMU 10.0.13. Its `-device help` lists e1000, e1000e,
+rtl8139, virtio-net and usb-net, but a listed model is not a repository driver.
+The manifest's actual `net` publications are `virtio_net` and xHCI's CDC-ECM
+transport. No e1000/e1000e/rtl8139/rtl815x driver or match exists in this repository.
+MBIM and Bluetooth service links add no PCI endpoint wake operation. Virtio-net
+uses the common suspend step, which reports Done and does not arm device wake;
+xHCI's current explicit wake step arms its supported keyboard case.
+
+Matching-version upstream primary sources were rechecked and retained with URLs
+and SHA-256 values in
+`.build/logs/end-of-job/qemu-only-20261009/pme-source-review/sources.json`:
+
+- [QEMU PCIe root implementation](https://raw.githubusercontent.com/qemu/qemu/v10.0.13/hw/pci/pcie.c):
+  `pcie_cap_root_init` explicitly omits PME emulation; the Root Control write mask
+  admits error controls, not PME interrupt enable. Liber's existing root-status
+  poll reads/clears/logs PME and does not arm a wake route.
+- [QEMU virtio-net](https://raw.githubusercontent.com/qemu/qemu/v10.0.13/hw/net/virtio-net.c)
+  provides no device wake-filter/PME operation consumed by the existing driver.
+  An ordinary RX interrupt is not evidence of the missing PME operation.
+- [QEMU USB network model](https://raw.githubusercontent.com/qemu/qemu/v10.0.13/hw/usb/dev-network.c)
+  advertises zero Ethernet power filters and no remote-wakeup configuration bit.
+  Its `usb_wakeup` calls announce queued response/receive endpoint data; they do
+  not supply an advertised network power-wake contract.
+- [e1000](https://raw.githubusercontent.com/qemu/qemu/v10.0.13/hw/net/e1000.c)
+  and [e1000e core](https://raw.githubusercontent.com/qemu/qemu/v10.0.13/hw/net/e1000e_core.c)
+  expose WUC/WUFC as generic stored registers, not a implemented network-triggered
+  PME route. [rtl8139](https://raw.githubusercontent.com/qemu/qemu/v10.0.13/hw/net/rtl8139.c)
+  declares Magic/LANWake bits without a corresponding trigger in this model.
+  In addition, none has a Liber driver. Merely choosing one by QEMU name therefore
+  cannot close the required integrated wake proof.
+
+No existing model/driver combination with a verifiable device wake operation and
+root/GPE route was found. The bounded QEMU-only scope can accurately record these
+current model/driver exclusions; this does not assert universal impossibility of
+emulation or completed PCI PME/network-wake software. The original broader item
+remains incomplete without a selected supported endpoint, power-state/trigger
+contract and verifiable route. Adding an unrelated NIC driver or a custom QEMU
+platform would exceed this continuation's fixed scope. No timer, ordinary RX,
+manual host wake or fabricated root status was substituted for the missing proof.
+
+
+IMPLEMENTER'S SCOPE/VERIFICATION UPDATE ON P02M0197 (2026-10-09 19:47:24 UTC):
+
+The owner has explicitly limited phase 2 to QEMU. For aarch64, the plan conditions RAM suspend on firmware offering PSCI SYSTEM_SUSPEND: the current firmware does not offer it. The required current-platform behavior is suspend-to-idle plus explicit unsupported RAM refusal before a suspend transaction; the new assertion still needs its guest run. RISC-V has the returning SBI/retained-RTC implementation and separately recorded absent/offered-phase evidence; no single combined post-fix pass is claimed. PCI PME/network wake remain unimplemented for a future supporting platform: the retained investigation documents the current QEMU model, existing Liber network-driver and wake-contract limitations. They are excluded from current-model acceptance, not declared physically verified or impossible in every emulator. The original requirement text and prior results remain intact.
+
+Verification continuation (2026-10-09T22:13:43Z):
+
+The frozen profile/readback/microphone continuation was built on all three targets with `RUST_MIN_STACK=33554432 LIBER_DEVELOPMENT=1 ./build.sh --arch ARCH --part libs`: x86_64 PASS442s, aarch64 PASS443s, riscv64 PASS439s; each staged inventory matches121 providers and121 consumers. The six foreign/runtime provider SHA256 identities remain unchanged from the successful canonical foreign regeneration, so no new foreign regeneration was required. Serial `./build.sh --arch all` with the same development/stack environment PASS271.24s; `./build.sh --arch all --part volume --kernel-on-volume` PASS221.06s. Exact logs are under `.build/logs/end-of-job/qemu-only-20261009/post-join-*`; `post-join-stage-results.json` preserves every command, environment, exit and elapsed time.
+
+`RUST_MIN_STACK=33554432 ./check.sh --refresh dynamic-report` PASS405.10s, `./check.sh --gate verify-model` PASS28.97s, and `./gen.sh --check` PASS16.04s. The registration check preceded compilation of the new microphone test and honestly reported it declared but not yet built. The subsequent actual x86_64 SMP4 kernel run compiled and ran all16 explicitly selected cases, PASS74.51s (61s guest):112 2D and222 3D conformance cases with zero failed/unsupported/untested, HDR/Extended/resize/worker equality, partial-allocation and emergency cleanup, both brightness responsiveness tests, audio routing/recovery, pointer/touch lifecycle, and separate microphone gain with legacy capture compatibility. Exact selection and command are in `post-join-stage-results.json`; authoritative suite log is `.build/logs/test/x86_64-20261009T220307Z-1439801-guest.log`. These are functional checks, not a live performance acceptance. ARM/RISC current microphone/joined-profile execution and the required full verification workflow remain pending; merge inventory preparation must refresh all target suites. No milestone completion is asserted by these common build results alone.

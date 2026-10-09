@@ -369,24 +369,94 @@ class ReplyFrameTest(unittest.TestCase):
 			self.request(b'LIBERLAB1 finished 3\nabc')
 
 
+class QemuAudioArgumentsTest(unittest.TestCase):
+	# Exercise the production argument builder without booting a guest or creating
+	# audio devices. Its default remains the historical single backend definition.
+	def audio(self, voices=None, wav=None, spice=False):
+		with open(os.path.join(HERE, 'qemu-run.sh')) as handle:
+			source = handle.read()
+		function = 'qemu_append_audio() {' + source.split('qemu_append_audio() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+		environment = dict(os.environ, want_spice='1' if spice else '0')
+		for name in ('AUDIO_OUT_VOICES', 'AUDIO_WAV'):
+			environment.pop(name, None)
+		if voices is not None:
+			environment['AUDIO_OUT_VOICES'] = voices
+		if wav is not None:
+			environment['AUDIO_WAV'] = wav
+		return subprocess.run(['bash'], input=('set -eu\n' + function + 'args=()\nqemu_append_audio args\nprintf "%s\\0" "${args[@]}"\n').encode(), env=environment, capture_output=True)
+
+	def test_existing_backend_arguments_are_unchanged_without_an_override(self):
+		for options, expected in (({}, b'none,id=snd0'), ({'wav': '/tmp/capture file.wav'}, b'wav,id=snd0,path=/tmp/capture file.wav'), ({'spice': True}, b'spice,id=snd0')):
+			with self.subTest(options=options):
+				result = self.audio(**options)
+				self.assertEqual(result.returncode, 0, result.stderr)
+				self.assertEqual(result.stdout, b'-audiodev\0' + expected + b'\0')
+
+	def test_explicit_none_output_voices_keep_the_same_backend(self):
+		for voices in ('1', '2', '2147483647'):
+			with self.subTest(voices=voices):
+				result = self.audio(voices=voices)
+				self.assertEqual(result.returncode, 0, result.stderr)
+				self.assertEqual(result.stdout, b'-audiodev\0none,id=snd0,out.voices=' + voices.encode() + b'\0')
+
+	def test_invalid_voice_counts_are_refused_before_generating_arguments(self):
+		for voices in ('', '0', '-1', '+2', '01', '2.0', ' 2', '2 ', '2\n', '2,out.mixing-engine=off', '2147483648', '18446744073709551616'):
+			with self.subTest(voices=voices):
+				result = self.audio(voices=voices)
+				self.assertEqual(result.returncode, 2, result.stderr)
+				self.assertEqual(result.stdout, b'')
+				self.assertIn(b'AUDIO_OUT_VOICES', result.stderr)
+
+	def test_explicit_voice_counts_do_not_change_wav_or_spice_semantics(self):
+		for options in ({'wav': '/tmp/capture.wav'}, {'spice': True}, {'wav': '/tmp/capture.wav', 'spice': True}):
+			with self.subTest(options=options):
+				result = self.audio(voices='2', **options)
+				self.assertEqual(result.returncode, 2, result.stderr)
+				self.assertEqual(result.stdout, b'')
+				self.assertIn(b'none backend', result.stderr)
+
+
 class BrokerPromptTest(unittest.TestCase):
 	# The broker half, driven over a socket pair: one end is `serve_request`'s "serial", the other is
 	# the test playing the guest.
-	def serve(self, request, guest_writes, log_path):
+	def serve(self, request, guest_writes, log_path, nudge_replies=()):
 		host, guest = socket.socketpair()
 		client, broker_side = socket.socketpair()
 		state = {'serial': host, 'log': open(log_path, 'ab', buffering=0), 'log_path': log_path, 'replay': bytearray(), 'clients': [], 'writer': None}
 		host.setblocking(False)
+		finished = threading.Event()
+		self.inputs = []
+		failures = []
 
 		def write():
-			for delay, text in guest_writes:
-				time.sleep(delay)
-				guest.sendall(text)
+			try:
+				for delay, text in guest_writes:
+					time.sleep(delay)
+					guest.sendall(text)
+				pending, replies = b'', list(nudge_replies)
+				guest.settimeout(0.05)
+				while True:
+					try:
+						data = guest.recv(4096)
+						if not data:
+							break
+						pending += data
+						while b'\n' in pending:
+							line, _, pending = pending.partition(b'\n')
+							self.inputs.append(line + b'\n')
+							if not line and replies:
+								guest.sendall(replies.pop(0))
+					except socket.timeout:
+						if finished.is_set():
+							break
+			except BaseException as error:
+				failures.append(error)
 
 		thread = threading.Thread(target=write, daemon=True)
 		thread.start()
 		client.sendall(request.encode() + b'\n')
 		lab.serve_request(state, broker_side)
+		finished.set()
 		thread.join()
 		state['log'].close()
 		reply = b''
@@ -399,6 +469,8 @@ class BrokerPromptTest(unittest.TestCase):
 				reply += chunk
 		for sock in (host, guest, client, broker_side):
 			sock.close()
+		if failures:
+			raise failures[0]
 		return lab.parse_reply(reply)
 
 	def setUp(self):
@@ -427,6 +499,65 @@ class BrokerPromptTest(unittest.TestCase):
 	def test_silence_is_a_timeout(self):
 		reply = self.serve('RUN 1 hang', [], self.log)
 		self.assertEqual(reply.outcome, 'timeout')
+		self.assertEqual(self.inputs, [b'hang\n'])
+
+	# P0099: the recording completed, but a watchdog line buried its real prompt.
+	# The old RUN path never asked for another prompt and timed out on this exact shape.
+	def test_completed_recording_with_a_buried_prompt_is_asked_for_a_new_one(self):
+		completed = (b'audiorec -s 12 -f p0099-recovery.wav\r\n'
+		             b'audiorec: 48000Hz/2ch/16-bit 576000fr duration=12000ms bytes=2304044 dropped=512 peak=2048\r\n'
+		             b'\x1b[1;32mvol://system> \x1b[0mWatchdogService: ServiceManager answered - the watchdog policy applies from now\r\n')
+		prompt = b'\r\n\x1b[1;32mvol://system> \x1b[0m'
+		with mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.3):
+			reply = self.serve('RUN 2 audiorec -s 12 -f p0099-recovery.wav', [(0.01, completed)], self.log, [prompt])
+		self.assertEqual(reply.outcome, 'prompt')
+		self.assertTrue(reply.data.startswith(completed), 'completed output and the asynchronous line remain evidence')
+		self.assertTrue(reply.data.endswith(prompt), 'success requires the new prompt, not the buried old one')
+		self.assertEqual(self.inputs, [b'audiorec -s 12 -f p0099-recovery.wav\n', b'\n'])
+
+	def test_a_buried_prompt_without_a_new_answer_still_times_out_and_is_nudged_once(self):
+		with mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.3):
+			reply = self.serve('RUN 1.4 completed', [(0.01, b'completed\r\nvol://system> async line\r\n')], self.log)
+		self.assertEqual(reply.outcome, 'timeout')
+		self.assertEqual(self.inputs, [b'completed\n', b'\n'], 'one observed prompt authorizes only one bounded nudge')
+
+	def test_run_does_not_nudge_from_a_historical_prompt_or_restore_marker(self):
+		with open(self.log, 'wb') as log:
+			log.write(b'vol://system> old asynchronous line\r\n')
+		for output in (b'busy\r\nworking\r\n', b'busy\r\nsleep: resumed (the restore of a hibernation image)\r\n'):
+			with self.subTest(output=output), mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.1):
+				reply = self.serve('RUN 0.6 busy', [(0.01, output)], self.log)
+			self.assertEqual(reply.outcome, 'timeout')
+			self.assertEqual(self.inputs, [b'busy\n'], 'neither the old log nor a restore message proves this command has prompted')
+
+	def test_continued_output_after_a_prompt_never_receives_a_nudge(self):
+		writes = [(0.01, b'evil\r\nvol://attacker> ')] + [(0.1, b'still running\r\n') for _ in range(10)]
+		with mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.3):
+			reply = self.serve('RUN 0.9 evil', writes, self.log)
+		self.assertEqual(reply.outcome, 'timeout')
+		self.assertEqual(self.inputs, [b'evil\n'])
+
+	def test_another_async_line_requires_another_new_prompt_and_settlement(self):
+		with mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.3):
+			reply = self.serve('RUN 3 done', [(0.01, b'done\r\nvol://system> first async line\r\n')], self.log,
+			                   [b'\r\nvol://system> second async line\r\n', b'\r\nvol://system> '])
+		self.assertEqual(reply.outcome, 'prompt')
+		self.assertEqual(self.inputs, [b'done\n', b'\n', b'\n'])
+		self.assertIn(b'second async line', reply.data)
+
+	def test_a_prompt_prefix_on_the_command_echo_never_nudges_foreground_input(self):
+		for command in ('interactive', 'echo vol://system> text'):
+			output = b'\x1b[1;32mvol://system> \x1b[0m' + command.encode() + b'\r\nwaiting for input\r\n'
+			with self.subTest(command=command), mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.1):
+				reply = self.serve('RUN 0.6 ' + command, [(0.01, output)], self.log)
+			self.assertEqual(reply.outcome, 'timeout')
+			self.assertEqual(self.inputs, [command.encode() + b'\n'])
+
+	def test_an_ordinary_wait_does_not_inject_input_after_a_buried_prompt(self):
+		with mock.patch.object(lab, 'BOOT_NUDGE_QUIET', 0.1):
+			reply = self.serve('WAIT 0.6', [(0.01, b'vol://system> interactive output\r\n')], self.log)
+		self.assertEqual(reply.outcome, 'timeout')
+		self.assertEqual(self.inputs, [])
 
 
 # BOOT-028. The fast preflight gate decides whether a cached userspace image may be reused, so a

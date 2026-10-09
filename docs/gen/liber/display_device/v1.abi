@@ -1,12 +1,15 @@
 package liber:display-device@1
 record scanout(backing:buffer,layout:liber:graphics@1::image-layout,visible:liber:graphics@1::extent-2d,generation:u32)
-variant device-event(resized=0:liber:graphics@1::extent-2d,replaced=1:scanout)
+variant device-event(resized=0:liber:graphics@1::extent-2d,replaced=1:scanout,monitor-changed=2:unit)
 interface display-device
 method display-device.scanout op=1 () -> result<scanout, liber:base@1::error>
 method display-device.present op=2 (generation:u32:rights=,damage:liber:graphics@1::damage-region:rights=) -> result<unit, liber:base@1::error>
 method display-device.events op=3 () -> stream<device-event>
+method display-device.monitor op=4 () -> result<monitor-description, liber:base@1::error>
 record backlight-function(bus:u32,dev:u32,func:u32)
 record monitor-identity(manufacturer:u16,product:u16,serial:u32)
+record monitor-mode(size:liber:graphics@1::extent-2d,refresh-millihertz:u32,interlaced:bool)
+record monitor-description(identity:monitor-identity,physical-size-mm:option<liber:graphics@1::extent-2d>,modes:list<monitor-mode>:bound=29,preferred:option<u32>)
 variant backlight-target(function=0:backlight-function,monitor=1:monitor-identity,none=2:unit)
 enum backlight-source(firmware=0,usb-monitor=1,native=2)
 variant backlight-scale(levels=0:list<u32>,range=1:backlight-range)
@@ -19,6 +22,7 @@ method backlight.describe op=1 () -> result<backlight-description, liber:base@1:
 method backlight.get op=2 () -> result<u32, liber:base@1::error>
 method backlight.set op=3 (level:u32:rights=) -> result<u32, liber:base@1::error>
 method backlight.events op=4 () -> stream<backlight-event>
+method backlight.firmware-display-id op=5 () -> result<option<u32>, liber:base@1::error>
 record light-response(adjustment:u32,illuminance:u32)
 record ambient-light-description(curve:list<light-response>)
 record illuminance(milli-lux:u64)

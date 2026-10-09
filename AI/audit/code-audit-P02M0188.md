@@ -926,3 +926,23 @@ closed.
 
 No code of this milestone changed in this round, so the `qemu-admin-path` pass recorded for the previous round
 still describes the current code.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0188 (2026-10-09 18:28:16 UTC):
+
+Reviewed the complete plan and retained implementation/audit evidence. The plan explicitly schedules the full ./verify.sh after P02M0099 and P02M0103; both are now in the authorized scope and this final verification remains required. Reviewed the recorded administrative requester-death reason race as a potential regression to check, without treating differing diagnostic wording as proof of execution authorization. Existing audit content is preserved; no audit rating is assigned.
+
+The requester-death diagnostic race is already addressed in the current `src/harness/scenarios/admin-path.toml`: the affected assertion accepts the common requester-decline prefix, while subsequent held-grant/delegation and executor-effect assertions remain required. `AdminService::check_owners` still checks task death before other ready work. No new race patch is necessary; the final existing gate will verify current behavior.
+
+Verification continuation (2026-10-09T22:13:43Z):
+
+The frozen profile/readback/microphone continuation was built on all three targets with `RUST_MIN_STACK=33554432 LIBER_DEVELOPMENT=1 ./build.sh --arch ARCH --part libs`: x86_64 PASS442s, aarch64 PASS443s, riscv64 PASS439s; each staged inventory matches121 providers and121 consumers. The six foreign/runtime provider SHA256 identities remain unchanged from the successful canonical foreign regeneration, so no new foreign regeneration was required. Serial `./build.sh --arch all` with the same development/stack environment PASS271.24s; `./build.sh --arch all --part volume --kernel-on-volume` PASS221.06s. Exact logs are under `.build/logs/end-of-job/qemu-only-20261009/post-join-*`; `post-join-stage-results.json` preserves every command, environment, exit and elapsed time.
+
+`RUST_MIN_STACK=33554432 ./check.sh --refresh dynamic-report` PASS405.10s, `./check.sh --gate verify-model` PASS28.97s, and `./gen.sh --check` PASS16.04s. The registration check preceded compilation of the new microphone test and honestly reported it declared but not yet built. The subsequent actual x86_64 SMP4 kernel run compiled and ran all16 explicitly selected cases, PASS74.51s (61s guest):112 2D and222 3D conformance cases with zero failed/unsupported/untested, HDR/Extended/resize/worker equality, partial-allocation and emergency cleanup, both brightness responsiveness tests, audio routing/recovery, pointer/touch lifecycle, and separate microphone gain with legacy capture compatibility. Exact selection and command are in `post-join-stage-results.json`; authoritative suite log is `.build/logs/test/x86_64-20261009T220307Z-1439801-guest.log`. These are functional checks, not a live performance acceptance. ARM/RISC current microphone/joined-profile execution and the required full verification workflow remain pending; merge inventory preparation must refresh all target suites. No milestone completion is asserted by these common build results alone.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0188 (2026-10-09 23:24:00 UTC):
+
+A shared host harness correction was required by an actual P02M0099 audio recording: its completed command prompt was buried by an asynchronous WatchdogService line. `src/harness/lab.py::run_prompt_after_echo` and `serve_request` now allow the existing five-second quiet newline refresh for RUN only after the complete fresh command echo and a subsequent line-start prompt; success still requires a newly settled final prompt within the original deadline. Historical bytes, command-echo prefixes and restore-only markers do not authorize it. This modifies the terminal broker used by administrative scenarios, not AdminService authorization or execution. The exact reproduction first failed the old broker; `python3 src/harness/harness-test.py BrokerPromptTest ReplyFrameTest ColdPromptTest` then passed all17 tests in19.235s. Evidence: `.build/logs/end-of-job/qemu-only-20261009/lab-run-prompt-before.log` and `lab-run-prompt-after.log`; full implementation detail is appended to P02M0099's audit at23:06:55 UTC. The retained prior administrative scenario passes remain historical evidence; the registered final administrative gate and required full verify workflow are still UNPERFORMED after this host change. No completion rating or checkbox is changed here.
+
+Timestamp correction (2026-10-09 23:24:18 UTC): the preceding host-broker continuation was appended at approximately23:22 UTC; its manually entered23:24 timestamp was two minutes ahead. Commands and retained verification results are unchanged.

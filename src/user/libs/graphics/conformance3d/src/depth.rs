@@ -28,14 +28,17 @@ fn normalised(format: DepthFormat, maximum: u32) -> Outcome {
 	Ok(())
 }
 
+// @covers: Depth16
 pub fn depth16() -> Outcome {
 	normalised(DepthFormat::Depth16, 0xFFFF)
 }
 
+// @covers: Depth24
 pub fn depth24() -> Outcome {
 	normalised(DepthFormat::Depth24, 0x00FF_FFFF)
 }
 
+// @covers: Depth32F
 pub fn depth32f() -> Outcome {
 	// A FLOAT FORMAT STORES THE FLOAT and quantises nothing: a depth that is exactly representable
 	// comes back exactly, which is the property the other four do not have.
@@ -45,16 +48,19 @@ pub fn depth32f() -> Outcome {
 	Ok(())
 }
 
+// @covers: Depth24Stencil8
 pub fn depth24_stencil8() -> Outcome {
 	normalised(DepthFormat::Depth24Stencil8, 0x00FF_FFFF)
 }
 
+// @covers: Depth32FStencil8
 pub fn depth32f_stencil8() -> Outcome {
 	let (stored, _) = stored_depth(DepthFormat::Depth32FStencil8, 0.25)?;
 	require!(stored == Stored::Float(0.25), "the depth half of a combined float format is still a float: {stored:?}");
 	Ok(())
 }
 
+// @covers: DepthCompareOps
 pub fn depth_compare_ops() -> Outcome {
 	// EVERY COMPARISON, AND EACH ONE DECIDING THE SAME PAIR OF FRAGMENTS. The buffer is left holding
 	// 0.5 by a first draw and a second at 0.5 is then tested against it under each operation: what
@@ -95,6 +101,7 @@ fn render_two(first: &crate::harness::Scene, second: &crate::harness::Scene, pla
 	crate::harness::render_pair(first, &write, second, plan)
 }
 
+// @covers: DepthWrite
 pub fn depth_write() -> Outcome {
 	// A TEST THAT PASSES AND A WRITE ARE TWO DECISIONS. A fragment that passes with the write off
 	// leaves the buffer as it was, which is what makes a transparent pass possible at all - and a
@@ -113,6 +120,7 @@ pub fn depth_write() -> Outcome {
 	Ok(())
 }
 
+// @covers: DepthBias
 pub fn depth_bias() -> Outcome {
 	// A BIAS MOVES A FRAGMENT'S DEPTH BEFORE THE TEST AND THE WRITE, which is what lets coplanar
 	// geometry be ordered deliberately. Two draws at the SAME depth: without a bias the second is
@@ -139,6 +147,7 @@ fn face(compare: CompareOp, reference: u8) -> StencilFace {
 	StencilFace { compare, read_mask: 0xFF, write_mask: 0xFF, reference, on_fail: StencilOp::Keep, on_depth_fail: StencilOp::Keep, on_pass: StencilOp::Keep }
 }
 
+// @covers: StencilCompare
 pub fn stencil_compare() -> Outcome {
 	// THE STENCIL TEST IS THE REFERENCE AGAINST WHAT IS STORED, and a cleared buffer holds zero. A
 	// reference of one under `Equal` therefore fails everywhere and under `NotEqual` passes
@@ -153,6 +162,7 @@ pub fn stencil_compare() -> Outcome {
 	Ok(())
 }
 
+// @covers: StencilReadMask
 pub fn stencil_read_mask() -> Outcome {
 	// THE READ MASK IS ANDed WITH BOTH SIDES BEFORE THE COMPARISON, which is what makes a stencil
 	// buffer usable as several independent bit planes. A reference of `0x10` against a stored zero
@@ -169,6 +179,7 @@ pub fn stencil_read_mask() -> Outcome {
 	Ok(())
 }
 
+// @covers: StencilWriteMask
 pub fn stencil_write_mask() -> Outcome {
 	// THE WRITE MASK SAYS WHICH BITS A WRITE MAY CHANGE. Replacing with `0xFF` under a mask of
 	// `0x0F` leaves the high nibble as it was, which is what lets two subsystems share one buffer.
@@ -180,6 +191,7 @@ pub fn stencil_write_mask() -> Outcome {
 	Ok(())
 }
 
+// @covers: StencilFailOp
 pub fn stencil_fail_op() -> Outcome {
 	// WHAT HAPPENS WHEN THE STENCIL TEST FAILS, which is a write even though nothing was drawn: a
 	// backend that only wrote on a pass could not implement a stencil-shadow pass at all.
@@ -192,6 +204,7 @@ pub fn stencil_fail_op() -> Outcome {
 	Ok(())
 }
 
+// @covers: StencilDepthFailOp
 pub fn stencil_depth_fail_op() -> Outcome {
 	// AND WHAT HAPPENS WHEN THE STENCIL PASSED AND THE DEPTH DID NOT, which is the third of the
 	// three and the one a naive implementation folds into the first.
@@ -205,6 +218,7 @@ pub fn stencil_depth_fail_op() -> Outcome {
 	Ok(())
 }
 
+// @covers: StencilPassOp
 pub fn stencil_pass_op() -> Outcome {
 	let scene = quad_at_depth(0.5, 1.0, 0.0, 0.0);
 	let plan = Plan { stencil: Some(StencilFace { on_pass: StencilOp::Replace, ..face(CompareOp::Always, 5) }), count: 6, ..Plan::default() };
@@ -215,12 +229,10 @@ pub fn stencil_pass_op() -> Outcome {
 	Ok(())
 }
 
+// @covers: StencilSeparateFrontBack
 pub fn stencil_separate_front_back() -> Outcome {
-	// THE TWO FACES CARRY SEPARATE STATE, which is what a two-sided stencil pass is: the front of a
-	// shadow volume increments and the back decrements, and a backend with one face would cancel
-	// them into nothing. `soft3d` takes one face and applies it to the side it was given, so what
-	// this scene checks is that the FACING is what selects it - a back-facing primitive under a
-	// front-only state is not stencilled by it.
+	// Opposite windings use different replacement values in the same pipeline. A single
+	// stencil face reused for both sides therefore cannot satisfy this fixture.
 	let front = crate::harness::Scene::new(vec![
 		crate::harness::Vertex::at(-1.0, -1.0, 0.5).coloured(1.0, 0.0, 0.0, 1.0),
 		crate::harness::Vertex::at(1.0, -1.0, 0.5).coloured(1.0, 0.0, 0.0, 1.0),
@@ -232,12 +244,12 @@ pub fn stencil_separate_front_back() -> Outcome {
 		crate::harness::Vertex::at(0.0, 1.0, 0.5).coloured(0.0, 1.0, 0.0, 1.0),
 		crate::harness::Vertex::at(1.0, -1.0, 0.5).coloured(0.0, 1.0, 0.0, 1.0),
 	]);
-	let plan = Plan { stencil: Some(StencilFace { on_pass: StencilOp::IncrementClamp, ..face(CompareOp::Always, 0) }), count: 3, ..Plan::default() };
+	let plan = Plan { stencil: Some(StencilFace { on_pass: StencilOp::Replace, ..face(CompareOp::Always, 5) }), stencil_back: Some(StencilFace { on_pass: StencilOp::Replace, ..face(CompareOp::Always, 9) }), depth_format: render3d::DepthFormat::Depth24Stencil8, count: 3, ..Plan::default() };
 	let front_frame = render(&front, &plan)?;
 	let back_frame = render(&back, &plan)?;
 	let (x, y) = (crate::harness::WIDTH / 2, crate::harness::HEIGHT * 3 / 4);
-	require!(front_frame.stencil_at(x, y) == 1, "a front-facing primitive is stencilled");
-	require!(back_frame.stencil_at(x, y) == 1, "and so is a back-facing one, under the state its own side carries");
+	require!(front_frame.stencil_at(x, y) == 5, "a front-facing primitive is stencilled");
+	require!(back_frame.stencil_at(x, y) == 9, "and so is a back-facing one, under the state its own side carries");
 	require!(front_frame.covered(x, y) && back_frame.covered(x, y), "and both are drawn, because nothing is culled here");
 	Ok(())
 }

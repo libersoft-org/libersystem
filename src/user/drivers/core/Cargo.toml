@@ -392,6 +392,7 @@ ipc-client = { path = "../../libs/ipc/ipc-client" }
 # application-facing display one: a driver's contract and an application's are two things, and one
 # package carrying both would make every application link the driver's wire.
 display-device-proto = { path = "../../libs/protocol/display-device-proto" }
+edid = { path = "../../libs/display/edid" }
 
 # THE CANONICAL POWER MODEL. A power producer - the in-guest fixture now, the HID Power Device and
 # ACPI drivers when they land - builds every record it publishes with these adapters, so the unit

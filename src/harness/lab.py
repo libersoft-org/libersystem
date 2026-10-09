@@ -297,7 +297,7 @@ PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
 # prints a prompt-shaped line from ending someone else's command.
 PROMPT_SETTLE = 0.25
 
-# How long a BOOT's wait lets the guest stay quiet, with a prompt the shell printed buried under later lines,
+# How long a boot wait or a RUN lets the guest stay quiet with its new prompt buried under later lines,
 # before it types one empty line to have the prompt printed again. See `serve_request`.
 BOOT_NUDGE_QUIET = 5.0
 
@@ -400,6 +400,18 @@ LAST_INPUT_AT = 0
 PROMPT_ANYWHERE = re.compile(rb'vol://[^\r\n>]*> ')
 # The kernel's line for a machine that a hibernation image replaced - see the boot nudge in `broker_wait`.
 RESTORED_MACHINE = re.compile(rb'sleep: resumed \(the restore of a hibernation image')
+
+
+def run_prompt_after_echo(raw, command, after):
+	# A RUN may receive the previous prompt together with its command echo. That
+	# prefix is not a completion prompt and must never cause input into a still
+	# running foreground job. Require the complete echo first, then a new prompt
+	# at the beginning of a later line, past any prompt already nudged.
+	plain = strip_ansi(raw)
+	echo = re.search(rb'(?m)^(?:vol://[^\r\n>]*> )?' + re.escape(command.encode()) + rb'\r?\n', plain)
+	if echo is None:
+		return False
+	return re.compile(rb'(?m)^vol://[^\r\n>]*> ').search(plain, max(echo.end(), len(strip_ansi(raw[:after])))) is not None
 
 
 def note_input():
@@ -628,9 +640,12 @@ def serve_request(state, conn):
 		return True
 	collected = b''
 	nudge = False
+	run_command = None
 	if parts[0] == 'RUN' and len(parts) == 3:
 		timeout, command = float(parts[1]), parts[2]
 		serial.sendall(command.encode() + b'\n')
+		run_command = command
+		nudge = True
 	elif parts[0] == 'INT' and len(parts) >= 2:
 		timeout = float(parts[1])
 		serial.sendall(b'\x03')
@@ -685,7 +700,10 @@ def serve_request(state, conn):
 	# once the wait has seen the shell prompt, the output has buried it and gone quiet, and again each time
 	# another late line buries the prompt that nudge produced. A MACHINE RESTORED FROM A HIBERNATION IMAGE prints no
 	# prompt at all - its shell printed one before the image was written and waits on it - so the kernel's line naming
-	# the restore stands for the prompt the nudge answers.
+	# the restore stands for the prompt the boot wait answers. A RUN has no such exception: it requires its complete
+	# command echo followed by a fresh prompt, never the prompt prefix on that echo. Like a boot wait, it only asks
+	# for a new prompt; a buried prompt alone cannot finish the request. Each observed prompt permits one nudge,
+	# and the original request deadline bounds the whole exchange. Ordinary WAIT and INT behavior stays unchanged.
 	deadline = time.time() + timeout
 	outcome = 'timeout'
 	settled_at = None
@@ -702,7 +720,7 @@ def serve_request(state, conn):
 			collected += data
 			settled_at = None
 			quiet_since = time.time()
-		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and (PROMPT_ANYWHERE.search(collected, nudge_from) or RESTORED_MACHINE.search(collected, nudge_from)):
+		if nudge and not has_prompt(collected[-256:]) and time.time() - quiet_since >= BOOT_NUDGE_QUIET and (run_prompt_after_echo(collected, run_command, nudge_from) if run_command is not None else (PROMPT_ANYWHERE.search(collected, nudge_from) or RESTORED_MACHINE.search(collected, nudge_from))):
 			serial.sendall(b'\n')
 			nudge_from = len(collected)
 			quiet_since = time.time()

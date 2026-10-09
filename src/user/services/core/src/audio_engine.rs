@@ -262,6 +262,9 @@ struct Device {
 	route: bool,
 	volume: u8,
 	volume_due: bool,
+	// None retains the original combined level for software providers until the operator opts into a separate mic.
+	microphone_volume: Option<u8>,
+	hardware_microphone_volume: bool,
 	pending: Pending,
 	running: bool,
 	capture_running: bool,
@@ -277,7 +280,11 @@ struct Device {
 
 impl Device {
 	fn new(id: u32, origin: Origin, label: String, chan: u64, format: DeviceFormat) -> Device {
-		Device { id, origin, label, chan, format, known: false, voice: false, route: false, volume: format.volume, volume_due: false, pending: Pending::None, running: false, capture_running: false, input_refused: false, refusals: 0, counters: None, stats_due: false, periods_since_stats: 0, period: Vec::new(), jitter: None }
+		Device { id, origin, label, chan, format, known: false, voice: false, route: false, volume: format.volume, volume_due: false, microphone_volume: None, hardware_microphone_volume: false, pending: Pending::None, running: false, capture_running: false, input_refused: false, refusals: 0, counters: None, stats_due: false, periods_since_stats: 0, period: Vec::new(), jitter: None }
+	}
+
+	fn microphone_level(&self) -> u8 {
+		self.microphone_volume.unwrap_or(if self.format.hardware_volume { 100 } else { self.volume })
 	}
 
 	fn output(&self) -> Option<PcmFormat> {
@@ -861,7 +868,9 @@ impl Audio {
 			device.input_refused = true;
 			return;
 		}
-		let gain = if device.format.hardware_volume { audio_routing::gain_q15(100) } else { audio_routing::gain_q15(device.volume) };
+		// A headset applies its microphone gain itself. Software gain is independent once explicitly selected;
+		// before that the old combined level remains, including routes which are not microphones.
+		let gain = audio_routing::gain_q15(if device.hardware_microphone_volume { 100 } else { device.microphone_level() });
 		let samples: Vec<i16> = period.chunks_exact(2).map(|pair| audio_routing::scale(i16::from_le_bytes([pair[0], pair[1]]), gain)).collect();
 		if let Some(jitter) = device.jitter.as_mut() {
 			jitter.push(samples);
@@ -948,6 +957,54 @@ impl Audio {
 				}
 			}
 		}
+		Ok(())
+	}
+
+	fn microphone_volume(&self, id: u32) -> Result<u8, Error> {
+		let device = self.device(id).ok_or(Error::NotFound)?;
+		if device.input().is_none() || device.route {
+			return Err(Error::Invalid);
+		}
+		// A legacy Bluetooth stack never reports its headset microphone gain. A speaker level is not evidence of it.
+		if matches!(device.origin, Origin::Bluetooth { .. }) && device.format.hardware_volume && device.microphone_volume.is_none() {
+			return Err(Error::Unsupported);
+		}
+		Ok(device.microphone_level())
+	}
+
+	fn set_microphone_volume(&mut self, id: u32, volume: u8) -> Result<(), Error> {
+		if volume > audio_routing::MAX_LEVEL {
+			return Err(Error::Invalid);
+		}
+		let index = self.index_of(id).ok_or(Error::NotFound)?;
+		if self.devices[index].input().is_none() || self.devices[index].route {
+			return Err(Error::Invalid);
+		}
+		let (level, hardware) = match self.devices[index].origin {
+			Origin::Provider { .. } => (volume, false),
+			Origin::Bluetooth { endpoint } => {
+				if self.bt.client == 0 {
+					return Err(Error::Closed);
+				}
+				let mut client = bluetooth_audio::Client::with_deadline(ChannelTransport { chan: self.bt.client }, clock().saturating_add(2 * TICKS_PER_SECOND));
+				let answer = client.set_microphone_volume(&endpoint, &volume);
+				if answer.is_none() || client.last_error().is_some() {
+					// An old stack may not answer the appended operation. Never block all sound indefinitely,
+					// and never let its late reply satisfy a later call with a reused correlation number.
+					self.bluetooth_lost();
+					return Err(answer.and_then(Result::err).unwrap_or(Error::Closed));
+				}
+				match answer {
+					Some(Ok(level)) => (level, true),
+					Some(Err(Error::Unsupported)) => (volume, false),
+					Some(Err(error)) => return Err(error),
+					None => return Err(Error::Closed),
+				}
+			}
+		};
+		let device = &mut self.devices[index];
+		device.microphone_volume = Some(level);
+		device.hardware_microphone_volume = hardware;
 		Ok(())
 	}
 
@@ -1168,6 +1225,17 @@ impl Audio {
 		}
 	}
 
+	fn bluetooth_lost(&mut self) {
+		close(self.bt.events);
+		self.bt.events = 0;
+		close(self.bt.client);
+		self.bt.client = 0;
+		while let Some(index) = self.devices.iter().position(|device| matches!(device.origin, Origin::Bluetooth { .. })) {
+			self.remove_device(index);
+		}
+		self.bt.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
+	}
+
 	// THE ENDPOINTS STREAM: arrivals, departures, a device's own level, a headset's call command - or its end, which is
 	// the stack's instance ending: every endpoint leaves, and the broker is asked again for the live one.
 	fn bluetooth_events(&mut self) {
@@ -1188,19 +1256,18 @@ impl Audio {
 								device.volume = level.volume.min(audio_routing::MAX_LEVEL);
 							}
 						}
+						AudioEvent::MicrophoneVolume(level) => {
+							if let Some(device) = self.devices.iter_mut().find(|device| device.origin == Origin::Bluetooth { endpoint: level.id }) {
+								device.microphone_volume = Some(level.volume.min(audio_routing::MAX_LEVEL));
+								device.hardware_microphone_volume = true;
+							}
+						}
 						AudioEvent::Command(command) => self.call_command(command),
 					}
 				}
 				PolledCaps::Empty => return,
 				PolledCaps::Closed => {
-					close(self.bt.events);
-					self.bt.events = 0;
-					close(self.bt.client);
-					self.bt.client = 0;
-					while let Some(index) = self.devices.iter().position(|device| matches!(device.origin, Origin::Bluetooth { .. })) {
-						self.remove_device(index);
-					}
-					self.bt.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
+					self.bluetooth_lost();
 					return;
 				}
 			}
@@ -1360,6 +1427,14 @@ impl ControlService for ControlCall<'_> {
 
 	fn set_volume(&mut self, device: u32, volume: u8) -> Result<(), Error> {
 		self.audio.set_volume(device, volume)
+	}
+
+	fn microphone_volume(&mut self, device: u32) -> Result<u8, Error> {
+		self.audio.microphone_volume(device)
+	}
+
+	fn set_microphone_volume(&mut self, device: u32, volume: u8) -> Result<(), Error> {
+		self.audio.set_microphone_volume(device, volume)
 	}
 
 	fn streams(&mut self) -> Vec<AudioStreamInfo> {

@@ -171,6 +171,7 @@ impl Rasteriser {
 
 	/// Fill a prebuilt edge list, emitting one row of coverage at a time. See `fill` for the slice's
 	/// indexing.
+	// @handles: AnalyticCoverageFill
 	pub fn fill_edges(&mut self, edges: &Edges, rule: FillRule, antialias: Antialias, bounds: PixelRect, row: impl FnMut(u32, usize, &[f32])) {
 		if bounds.is_empty() || !edges.reaches(bounds.y as f32, (bounds.y + bounds.height) as f32) {
 			return;
@@ -374,6 +375,7 @@ impl Rasteriser {
 /// inside one contour accumulates `1`, one wholly inside two nested contours wound the same way
 /// accumulates `2`, and a pixel an edge crosses accumulates the fraction. Saturating it is what makes
 /// the non-zero rule an area; folding it is what makes the even-odd rule one.
+// @handles: FillNonZero, FillEvenOdd
 fn wind(value: f32, rule: FillRule) -> f32 {
 	match rule {
 		FillRule::NonZero => {

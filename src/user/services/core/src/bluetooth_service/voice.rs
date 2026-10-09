@@ -120,6 +120,11 @@ impl Stack {
 			&& classic.voice.is_none()
 		{
 			classic.voice = Some(VoiceLink::new(server_channel));
+			// HSP has no HFP service-level or codec negotiation: its admitted RFCOMM
+			// connection is already a CVSD voice endpoint.
+			if server_channel == bt_policy::HSP_CHANNEL {
+				self.voice_offer(at, handle);
+			}
 		}
 	}
 
@@ -166,7 +171,11 @@ impl Stack {
 					self.audio.volume_changed(id, hfp::level_of(gain));
 				}
 			}
-			Hfp::MicrophoneGain(_) => {}
+			Hfp::MicrophoneGain(gain) => {
+				if let Some(id) = self.voice(at, handle).and_then(|voice| voice.endpoint) {
+					self.audio.microphone_volume_changed(id, hfp::level_of(gain));
+				}
+			}
 			Hfp::Battery(level) => {
 				if let Some(voice) = self.voice(at, handle) {
 					voice.battery = Some(level);
@@ -187,10 +196,12 @@ impl Stack {
 			return;
 		}
 		let rate = voice.rate();
+		let microphone_volume = hfp::level_of(voice.gateway.microphone_gain());
 		let name = self.controllers[at].bredr_state.name_of(&peer).unwrap_or_default();
 		// THE LATENCY: the link's interval, a packet each way, and the queue's two periods.
-		let endpoint = AudioEndpoint { id: 0, peer: peer_to_wire(&peer), name, kind: AudioEndpointKind::Voice, rate, channels: 1, latency_us: 7_500 + (PLAY_HOLD_MS as u32) * 1_000, hardware_volume: true, volume: hfp::level_of(10) };
+		let endpoint = AudioEndpoint { id: 0, peer: peer_to_wire(&peer), name, kind: AudioEndpointKind::Voice, rate, channels: 1, latency_us: 7_500 + (PLAY_HOLD_MS as u32) * 1_000, hardware_volume: true, volume: hfp::level_of(voice.gateway.speaker_gain()) };
 		let Some(id) = self.audio.offer(endpoint, at, handle) else { return };
+		self.audio.microphone_volume_changed(id, microphone_volume);
 		if let Some(voice) = self.voice(at, handle) {
 			voice.endpoint = Some(id);
 		}
@@ -235,7 +246,13 @@ impl Stack {
 	// THE SYNCHRONOUS LINK IS UP - or refused: the transport told the setting, and the codec's coders made.
 	pub(crate) fn voice_connected(&mut self, at: usize, status: u8, sco: u16, address: &[u8; 6]) {
 		let peer = classic::bredr(address);
-		let Some(handle) = self.controllers[at].link_to(&peer).map(|link| link.handle) else { return };
+		let Some(handle) = self.controllers[at].link_to(&peer).map(|link| link.handle) else {
+			if status == 0 {
+				self.controllers[at].disconnect(sco, REASON_USER);
+			}
+			return;
+		};
+		let owned = self.audio.pcm.iter().any(|pcm| pcm.at == at && pcm.handle == handle && pcm.kind == AudioEndpointKind::Voice);
 		let Some(voice) = self.voice(at, handle) else {
 			if status == 0 {
 				self.controllers[at].disconnect(sco, REASON_USER);
@@ -252,6 +269,15 @@ impl Stack {
 			if let (true, Some(id)) = (release, endpoint) {
 				self.voice_ack(id);
 			}
+			return;
+		}
+		// A subscriber may close while SETUP_SYNCHRONOUS_CONNECTION is in flight. Keep that
+		// request pending until this completion (so reopening cannot queue a second setup), but
+		// never enable a late successful link without a current owner. A replacement that already
+		// reopened the same voice endpoint is allowed to use the completion.
+		if !owned {
+			voice.gateway.set_audio_allowed(false);
+			self.controllers[at].disconnect(sco, REASON_USER);
 			return;
 		}
 		voice.sco = Some(sco);
@@ -423,6 +449,24 @@ impl Stack {
 		let voice = self.voice(at, handle).ok_or(Error::NotFound)?;
 		let outs = voice.gateway.set_speaker_gain(hfp::gain_of(level));
 		self.run_gateway(at, handle, outs);
+		Ok(())
+	}
+
+	pub(crate) fn voice_microphone_volume(&mut self, at: usize, handle: u16) -> Result<u8, Error> {
+		let voice = self.voice(at, handle).ok_or(Error::NotFound)?;
+		Ok(hfp::level_of(voice.gateway.microphone_gain()))
+	}
+
+	pub(crate) fn voice_set_microphone_volume(&mut self, at: usize, handle: u16, level: u8) -> Result<(), Error> {
+		let classic = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()).ok_or(Error::Closed)?;
+		let voice = classic.voice.as_mut().ok_or(Error::Closed)?;
+		let rfcomm = classic.rfcomm.as_mut().ok_or(Error::Closed)?;
+		let outs = voice.gateway.queue_microphone_gain(hfp::gain_of(level), &mut rfcomm.session, voice.channel).map_err(|error| match error {
+			hfp::GainRefusal::Closed => Error::Closed,
+			hfp::GainRefusal::Full => Error::Again,
+			hfp::GainRefusal::Invalid => Error::Invalid,
+		})?;
+		self.run_rfcomm(at, handle, outs);
 		Ok(())
 	}
 

@@ -406,6 +406,10 @@ impl LtpfDecoder {
 
 	/// Filters one frame in place: x holds x^(n), n < NF, and receives x^_ltpf(n).
 	pub(crate) fn run(&mut self, cfg: &Config, x: &mut [f64], active: bool, pitch_index: u32, nbits: usize) {
+		// External rate adaptation can retain the bitstream's activation bit while
+		// the new bitrate disables the filter. Its effective state must fade out
+		// and later fade in; keeping an active zero-gain filter skips both transitions.
+		let active = active && gain(cfg, nbits).is_some();
 		let nf = cfg.nf;
 		let lden = l_den(cfg);
 		let lnum = lden - 2;

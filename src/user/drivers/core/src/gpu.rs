@@ -14,6 +14,9 @@
 // So the numbers are bounded first and the arithmetic is checked after, and both are decisions rather
 // than device operations - which is why they are here, where a host test can hold them.
 
+// The bound output's monitor description, normalized through the shared EDID reader.
+pub mod monitor;
+
 // The largest extent this driver will accept from a device, on either axis.
 //
 // SIXTEEN THOUSAND THREE HUNDRED AND EIGHTY-FOUR, which is the image model's own maximum extent: a

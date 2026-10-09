@@ -99,6 +99,68 @@ pub fn answer(scene: &Scene, pending: &Pending, read: DrawableId) -> Result<Opti
 	Ok(scene.drawable_of_id(read))
 }
 
+/// A request recorded into the same command list as the render pass it observes.
+pub struct Recorded {
+	request: PickRequest,
+	kind: Readback,
+	destination: u32,
+}
+
+/// A recorded request associated with the backend's actual submission, rather than a caller-chosen serial.
+pub struct Submitted {
+	pub pending: Pending,
+	source: u32,
+}
+
+impl Recorded {
+	pub fn submitted(&self, submission: &render3d::Submission) -> Submitted {
+		Submitted { pending: Pending { request: self.request, kind: self.kind, readback: self.destination, serial: submission.completion.serial }, source: submission.completion.source }
+	}
+}
+
+/// Append a typed pixel readback after its render pass. The descriptor validates attachment type,
+/// bounds and Store semantics through the same command recorder used by the renderer.
+pub fn record(list: &mut render3d::command::CommandList, targets: u32, set: &render3d::resource::RenderTargetSet<'_>, request: PickRequest, kind: Readback, attachment: u32, destination: render3d::command::Buffer) -> Result<Recorded, render3d::Error> {
+	use render3d::command::{ReadbackAttachment, ReadbackCommand};
+	let selected = match kind {
+		Readback::Identity => ReadbackAttachment::Identity(attachment),
+		Readback::Colour => ReadbackAttachment::Colour(attachment),
+		Readback::Depth => ReadbackAttachment::Depth,
+	};
+	let extent = match kind {
+		Readback::Depth => set.depth_stencil.as_ref().map(|view| (view.width, view.height)),
+		_ => set.colour.get(attachment as usize).map(|view| (view.width, view.height)),
+	};
+	if extent != Some((request.width, request.height)) {
+		return Err(render3d::Error::InvalidRenderState { reason: "a pick's extent differs from its readback attachment" });
+	}
+	list.readback(ReadbackCommand { targets, attachment: selected, x: request.x, y: request.y, destination }, set)?;
+	Ok(Recorded { request, kind, destination: destination.0 })
+}
+
+/// Join the recorded request to a real backend result. Pending, failed, cancelled, lost, stale,
+/// wrong-destination and wrong-type replies cannot become a pixel value.
+// @handles: AsynchronousReadback
+pub fn completed(submitted: &Submitted, result: render3d::ReadbackResult) -> Result<render3d::ReadbackValue, render3d::Error> {
+	if result.ticket.completion.serial != submitted.pending.serial || result.ticket.completion.source != submitted.source || result.ticket.destination != submitted.pending.readback {
+		return Err(render3d::Error::InvalidRenderState { reason: "a readback completion belongs to another submission or destination" });
+	}
+	let value = result.finish()?;
+	let correct = matches!((submitted.pending.kind, value), (Readback::Identity, render3d::ReadbackValue::Identity(_)) | (Readback::Depth, render3d::ReadbackValue::Depth(_)) | (Readback::Colour, render3d::ReadbackValue::Colour(_)));
+	if !correct {
+		return Err(render3d::Error::InvalidRenderState { reason: "a readback completion has the wrong pixel type" });
+	}
+	Ok(value)
+}
+
+/// Resolve only an identity produced by the matched, completed submission into a scene drawable.
+pub fn answer_completed(scene: &Scene, submitted: &Submitted, result: render3d::ReadbackResult) -> Result<Option<u32>, render3d::Error> {
+	match completed(submitted, result)? {
+		render3d::ReadbackValue::Identity(identity) => Ok(scene.drawable_of_id(identity)),
+		_ => Err(render3d::Error::InvalidRenderState { reason: "only an identity readback can answer a scene pick" }),
+	}
+}
+
 /// The SELECTION PASS: one pass that writes the identity attachment beside the depth it is resolved
 /// against.
 ///
@@ -296,3 +358,6 @@ fn sqrt(value: f32) -> f32 {
 	}
 	estimate
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,17 @@
+{
+  "aosp-sbc": {
+    "revision": "745ee92b87ed62b5a8a1bac47d5df8cad623bf59",
+    "url": "https://android.googlesource.com/platform/packages/modules/Bluetooth/+archive/745ee92b87ed62b5a8a1bac47d5df8cad623bf59/system/embdrv/sbc.tar.gz",
+    "sha256": "5595d86271112ec7e3cafee5c4537292eaf028e91d8680053686c11dcc0e9c95"
+  },
+  "liblc3": {
+    "revision": "efe84d3e0ece9e54591098148da3d10f5503b84e",
+    "url": "https://codeload.github.com/google/liblc3/tar.gz/efe84d3e0ece9e54591098148da3d10f5503b84e",
+    "sha256": "dbee4c552f91605041290cd138965b63eb2188f2d0e89e1240dc0828977fa367"
+  },
+  "libsbc": {
+    "revision": "6e505650145c9973d08a0bdd5e5f5e1914305e40",
+    "url": "https://codeload.github.com/google/libsbc/tar.gz/6e505650145c9973d08a0bdd5e5f5e1914305e40",
+    "sha256": "fbb2e0b15d3f6717016bd61db26c134fe9c7231cc748d525714f0a2bca02177d"
+  }
+}

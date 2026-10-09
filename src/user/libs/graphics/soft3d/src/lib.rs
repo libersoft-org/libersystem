@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+pub mod buffer;
 pub mod clip;
 pub mod fixed;
 pub mod frame;
@@ -23,6 +24,7 @@ pub mod interp;
 pub mod interpreter;
 pub mod pass;
 pub mod raster;
+pub mod readback;
 pub mod texture;
 pub mod value;
 
@@ -52,6 +54,31 @@ mod counted {
 
 	std::thread_local! {
 		static COUNT: Cell<usize> = const { Cell::new(0) };
+		static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+	}
+
+	fn refused() -> bool {
+		FAIL_AFTER.with(|remaining| match remaining.get() {
+			Some(0) => true,
+			Some(count) => {
+				remaining.set(Some(count - 1));
+				false
+			}
+			None => false,
+		})
+	}
+
+	/// Refuse this thread's allocations after a stated number of successful requests.
+	pub fn fail_after<T>(successful: usize, work: impl FnOnce() -> T) -> T {
+		struct Reset;
+		impl Drop for Reset {
+			fn drop(&mut self) {
+				FAIL_AFTER.with(|remaining| remaining.set(None));
+			}
+		}
+		FAIL_AFTER.with(|remaining| remaining.set(Some(successful)));
+		let _reset = Reset;
+		work()
 	}
 
 	pub struct Counting;
@@ -61,6 +88,9 @@ mod counted {
 	unsafe impl GlobalAlloc for Counting {
 		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 			COUNT.with(|count| count.set(count.get() + 1));
+			if refused() {
+				return core::ptr::null_mut();
+			}
 			unsafe { System.alloc(layout) }
 		}
 
@@ -72,6 +102,9 @@ mod counted {
 			// A REALLOC IS AN ALLOCATION. A vector that grows is exactly what a steady-state frame
 			// must not do, and counting only `alloc` would miss every one of them.
 			COUNT.with(|count| count.set(count.get() + 1));
+			if refused() {
+				return core::ptr::null_mut();
+			}
 			unsafe { System.realloc(pointer, layout, new_size) }
 		}
 	}

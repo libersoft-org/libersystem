@@ -34,6 +34,20 @@ pub use abi::*;
 // module carried the lint switched off for that; the condition itself says it.
 #[cfg(not(feature = "host-tests"))]
 mod heap;
+
+/// Process-wide allocation attempts, including reallocations (which use this allocator's default
+/// allocate/copy/free path). Reading the counter allocates nothing and includes worker threads.
+#[cfg(not(feature = "host-tests"))]
+pub fn heap_allocation_count() -> u64 {
+	heap::allocation_count()
+}
+
+/// Live and peak bytes handed out by the process heap, including allocator alignment. Mapped
+/// surface images and thread stacks are separate kernel resources, outside this heap measure.
+#[cfg(not(feature = "host-tests"))]
+pub fn heap_allocation_bytes() -> (u64, u64) {
+	heap::allocation_bytes()
+}
 // The byte-stream contract shared by stdio, pipeline edges and storage adapters.
 pub mod stream;
 // Worker threads: a bounded pool that lives as long as the process. NOT UNDER THE HOST-TEST SEAM,

@@ -17,7 +17,7 @@
 
 use super::*;
 use proto::system::{GattCharacteristic, GattService, GattValue, bluetooth_admin, bluetooth_gatt};
-use service_logic::att::op;
+use service_logic::att::{op, subscription::Subscription};
 
 // The services this stack drives itself, which no grant reaches: GAP, GATT, HID, and the LE Audio services.
 const STACK_SERVICES: [u16; 11] = [0x1800, 0x1801, 0x1812, 0x184e, 0x184f, 0x1850, 0x1844, 0x1846, 0x184c, 0x1853, 0x1855];
@@ -25,6 +25,8 @@ const STACK_SERVICES: [u16; 11] = [0x1800, 0x1801, 0x1812, 0x184e, 0x184f, 0x185
 const MAX_GRANTS: usize = bt_bounds::MINTED_GRANTS;
 // Operations a link holds queued.
 const MAX_QUEUED_OPS: usize = 16;
+// A subscribe's entire bounded discovery and write, including time on the link's queue.
+const SUBSCRIBE_TICKS: u64 = 30 * TICKS_PER_SECOND;
 // The Battery Level characteristic.
 const BATTERY_LEVEL: u16 = 0x2a19;
 
@@ -45,8 +47,7 @@ pub(crate) enum Kind {
 	Characteristics { start: u16, end: u16, from: u16, found: Vec<GattCharacteristic> },
 	Read { handle: u16 },
 	Write { handle: u16, value: Vec<u8> },
-	Configuration { handle: u16, end: u16 },
-	Subscribe { handle: u16, cccd: u16 },
+	Subscribe(Subscription),
 	// The stack's own: the Battery Level characteristic's value, read by its type.
 	Battery,
 	// The stack's own: an LE Audio client's request, its response to `le_audio_response`.
@@ -65,6 +66,8 @@ pub(crate) struct Client {
 	services: Option<Vec<(u16, u16, u16)>>,
 	queue: VecDeque<Op>,
 	busy: Option<Op>,
+	// A timed-out bearer cannot correlate a late ATT response with a newer request.
+	failed: bool,
 	// The peer's battery level, as the stack last read it.
 	pub battery: Option<u8>,
 }
@@ -239,7 +242,7 @@ impl Stack {
 	fn grant_link(&self, grant: &Grant) -> Result<u16, Error> {
 		let controller = self.controllers.get(grant.at).ok_or(Error::Closed)?;
 		match controller.link_to(&grant.peer) {
-			Some(link) if link.encrypted => Ok(link.handle),
+			Some(link) if link.encrypted && !link.gatt.failed => Ok(link.handle),
 			_ => Err(Error::Closed),
 		}
 	}
@@ -296,14 +299,20 @@ impl Stack {
 				Kind::Characteristics { start, end, from: start + 1, found: Vec::new() }
 			}
 			bluetooth_gatt::OP_READ | bluetooth_gatt::OP_WRITE | bluetooth_gatt::OP_SUBSCRIBE => {
-				let Some((_, end)) = self.granted_range(&grants[index], argument) else {
+				let Some((start, end)) = self.granted_range(&grants[index], argument) else {
 					self.refuse(chan, &request, op_code, Error::Denied);
 					return;
 				};
 				match op_code {
 					bluetooth_gatt::OP_READ => Kind::Read { handle: argument },
 					bluetooth_gatt::OP_WRITE => Kind::Write { handle: argument, value: captured.value },
-					_ => Kind::Configuration { handle: argument, end },
+					_ => match Subscription::new(start, end, argument, clock().saturating_add(SUBSCRIBE_TICKS)) {
+						Ok(walk) => Kind::Subscribe(walk),
+						Err(error) => {
+							self.refuse(chan, &request, op_code, error);
+							return;
+						}
+					},
 				}
 			}
 			_ => return,
@@ -333,7 +342,7 @@ impl Stack {
 	// A BONDED LE PEER'S BATTERY, read once its link is secured: queued behind whatever the link is doing.
 	pub(crate) fn battery_read(&mut self, at: usize, handle: u16) {
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
-		if link.is_classic() || link.gatt.queue.len() >= MAX_QUEUED_OPS {
+		if link.is_classic() || link.gatt.failed || link.gatt.queue.len() >= MAX_QUEUED_OPS {
 			return;
 		}
 		link.gatt.queue.push_back(Op { grant: 0, request: Vec::new(), kind: Kind::Battery });
@@ -343,7 +352,7 @@ impl Stack {
 	// AN LE AUDIO CLIENT'S REQUEST, queued like a grant's: its walk and its control point share the one bearer.
 	pub(crate) fn audio_att(&mut self, at: usize, handle: u16, pdu: Vec<u8>) {
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
-		if link.gatt.queue.len() >= MAX_QUEUED_OPS {
+		if link.gatt.failed || link.gatt.queue.len() >= MAX_QUEUED_OPS {
 			print(b"BluetoothService: an LE Audio request found the link's queue full and is dropped\n");
 			return;
 		}
@@ -353,10 +362,13 @@ impl Stack {
 
 	// THE NEXT QUEUED OPERATION GOES when the bearer is free: no walk of its own, and nothing outstanding.
 	pub(crate) fn next_gatt(&mut self, at: usize, handle: u16) {
+		self.gatt_expire(clock());
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
-		if link.walk.is_some() || link.gatt.busy.is_some() {
+		if link.gatt.failed || link.walk.is_some() || link.gatt.busy.is_some() {
 			return;
 		}
+		// Closing an owner/grant also revokes any continuation not yet sent.
+		link.gatt.queue.retain(|op| op.grant == 0 || self.grants.iter().any(|grant| grant.chan == op.grant));
 		let Some(op) = link.gatt.queue.pop_front() else { return };
 		let pdu = match &op.kind {
 			Kind::Discover { from, .. } => request(op::READ_BY_GROUP_TYPE_REQUEST, &[*from, 0xffff, 0x2800]),
@@ -367,12 +379,7 @@ impl Stack {
 				out.extend_from_slice(value);
 				out
 			}
-			Kind::Configuration { handle, end } => request(op::FIND_INFORMATION_REQUEST, &[*handle + 1, *end]),
-			Kind::Subscribe { cccd, .. } => {
-				let mut out = request(op::WRITE_REQUEST, &[*cccd]);
-				out.extend_from_slice(&[0x01, 0x00]);
-				out
-			}
+			Kind::Subscribe(walk) => walk.request(),
 			Kind::Battery => request(op::READ_BY_TYPE_REQUEST, &[0x0001, 0xffff, BATTERY_LEVEL]),
 			Kind::Audio(pdu) => pdu.clone(),
 		};
@@ -382,10 +389,12 @@ impl Stack {
 
 	// AN ATT RESPONSE for the operation outstanding: its result, or the next request of a walk.
 	pub(crate) fn gatt_response(&mut self, at: usize, handle: u16, pdu: &[u8]) {
+		let now = clock();
+		self.gatt_expire(now);
 		let Some(op) = self.controllers[at].link_mut(handle).and_then(|link| link.gatt.busy.take()) else { return };
 		// THE STACK'S OWN READ: one handle and its one-byte level, a percentage; anything else is no battery.
 		if matches!(op.kind, Kind::Battery) {
-			let level = (pdu.len() >= 5 && pdu[0] == op::READ_BY_TYPE_RESPONSE && pdu[1] == 3).then_some(pdu[4]).filter(|level| *level <= 100);
+			let level = (pdu.len() >= 5 && pdu[0] == op::READ_BY_TYPE_RESPONSE && pdu[1] == 3).then(|| pdu[4]).filter(|level| *level <= 100);
 			if let Some(link) = self.controllers[at].link_mut(handle) {
 				link.gatt.battery = level;
 			}
@@ -469,40 +478,87 @@ impl Stack {
 				};
 				reply(chan, &op.request, result);
 			}
-			// THE CONFIGURATION DESCRIPTOR of the characteristic, then notifications on.
-			Kind::Configuration { handle: value, .. } => {
-				let cccd = (error_code.is_none() && pdu.len() > 2 && pdu[1] == 1).then(|| pdu[2..].chunks_exact(4).find(|entry| u16::from_le_bytes([entry[2], entry[3]]) == 0x2902).map(|entry| u16::from_le_bytes([entry[0], entry[1]]))).flatten();
-				match cccd {
-					Some(cccd) => {
-						if let Some(link) = self.controllers[at].link_mut(handle) {
-							link.gatt.queue.push_front(Op { grant: chan, request: op.request, kind: Kind::Subscribe { handle: value, cccd } });
-						}
+			// The pure walk validates every response, finds only this value's CCCD,
+			// and selects notification or indication from its actual properties.
+			Kind::Subscribe(mut walk) => match walk.on_response(pdu, now) {
+				Ok(false) => {
+					if let Some(link) = self.controllers[at].link_mut(handle) {
+						link.gatt.queue.push_front(Op { grant: chan, request: op.request, kind: Kind::Subscribe(walk) });
 					}
-					None => self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, Error::Unsupported),
 				}
-			}
+				Err(error) => self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, error),
+				Ok(true) => {
+					let corr = u32::from_le_bytes([op.request[2], op.request[3], op.request[4], op.request[5]]);
+					if let Some((producer, consumer)) = channel_with_depth(32) {
+						let mut out = [0u8; 64];
+						if let Some(len) = bluetooth_gatt::subscribe_reply_ok(corr, &mut out)
+							&& send_caps_blocking(chan, &out[..len], &[consumer])
+						{
+							self.grants[grant_index].subscriptions.push((walk.value(), producer));
+						} else {
+							close(producer);
+							close(consumer);
+						}
+					} else {
+						self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, Error::Exhausted);
+					}
+				}
+			},
 			// Answered above.
 			Kind::Battery | Kind::Audio(_) => {}
-			Kind::Subscribe { handle: value, .. } => {
-				let corr = u32::from_le_bytes([op.request[2], op.request[3], op.request[4], op.request[5]]);
-				if error_code.is_some() {
-					self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, Error::Denied);
-				} else if let Some((producer, consumer)) = channel_with_depth(32) {
-					let mut out = [0u8; 64];
-					if let Some(len) = bluetooth_gatt::subscribe_reply_ok(corr, &mut out)
-						&& send_caps_blocking(chan, &out[..len], &[consumer])
-					{
-						self.grants[grant_index].subscriptions.push((value, producer));
-					} else {
-						close(producer);
-						close(consumer);
-					}
-				} else {
-					self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, Error::Exhausted);
-				}
-			}
 		}
 		self.next_gatt(at, handle);
+	}
+
+	pub(crate) fn gatt_deadline(&self) -> Option<u64> {
+		self.controllers
+			.iter()
+			.flat_map(|controller| &controller.links)
+			.flat_map(|link| link.gatt.busy.iter().chain(link.gatt.queue.iter()))
+			.filter_map(|op| match &op.kind {
+				Kind::Subscribe(walk) => Some(walk.deadline()),
+				_ => None,
+			})
+			.min()
+	}
+
+	pub(crate) fn gatt_timers(&mut self) {
+		self.gatt_expire(clock());
+	}
+
+	fn gatt_expire(&mut self, now: u64) {
+		for at in 0..self.controllers.len() {
+			let mut ended = Vec::new();
+			let mut disconnect = Vec::new();
+			for link in &mut self.controllers[at].links {
+				let expired = |op: &Op| matches!(&op.kind, Kind::Subscribe(walk) if walk.expired(now));
+				if link.gatt.busy.as_ref().is_some_and(expired) {
+					link.gatt.failed = true;
+					link.gatt.services = None;
+					if let Some(op) = link.gatt.busy.take() {
+						ended.push((op, Error::TimedOut));
+					}
+					ended.extend(link.gatt.queue.drain(..).map(|op| (op, Error::Closed)));
+					disconnect.push(link.handle);
+				} else {
+					// A request that never owned the bearer can expire without disturbing it.
+					while let Some(index) = link.gatt.queue.iter().position(expired) {
+						if let Some(op) = link.gatt.queue.remove(index) {
+							ended.push((op, Error::TimedOut));
+						}
+					}
+				}
+			}
+			for (op, error) in ended {
+				if self.grants.iter().any(|grant| grant.chan == op.grant) {
+					let op_code = u16::from_le_bytes([op.request[0], op.request[1]]);
+					self.refuse(op.grant, &op.request, op_code, error);
+				}
+			}
+			for handle in disconnect {
+				self.controllers[at].disconnect(handle, REASON_USER);
+			}
+		}
 	}
 
 	// A NOTIFICATION, to every grant subscribed to its handle on this peer.

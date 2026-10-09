@@ -63,6 +63,8 @@ struct Scanout {
 	/// present names it - so a frame drawn against a backing the driver has given back is refused
 	/// rather than transferred into memory that is no longer ours.
 	generation: u32,
+	/// Metadata belongs to this bound provider; a boot framebuffer carries none.
+	monitor: Option<proto::system::MonitorDescription>,
 	/// The device's event stream, or zero when this scanout came from the boot framebuffer rather
 	/// than from a driver.
 	events: u64,
@@ -1276,6 +1278,7 @@ impl DisplayState {
 	// what it did before this path existed, and `adopt_scanout` is what releases it - when there is
 	// something to replace it with.
 	fn release_scanout(&mut self) {
+		self.scanout.monitor = None;
 		// A LOST SCANOUT ENDS THE PROTECTED SESSION: nothing is showing it any more, so nothing a person
 		// sees can be what they approve.
 		self.end_trusted();
@@ -1324,7 +1327,7 @@ impl DisplayState {
 			let old: u64 = self.scanout.handle;
 			// AND SO DOES A RESET DISPLAY: what was presented before is not what is showing now.
 			self.end_trusted();
-			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, events: open_device_events(gpu), lost: false };
+			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, monitor: ask_monitor(gpu), events: open_device_events(gpu), lost: false };
 			if old_events != 0 {
 				close(old_events);
 			}
@@ -1445,6 +1448,10 @@ impl DisplayState {
 	// would draw into memory the driver has given back.
 	fn handle_device_event(&mut self, event: DeviceEvent) -> bool {
 		let replaced = match event {
+			DeviceEvent::MonitorChanged => {
+				self.scanout.monitor = ask_monitor(self.scanout.gpu);
+				return false; // No framebuffer geometry or surface configuration changed.
+			}
 			DeviceEvent::Resized(extent) => {
 				if extent.width == 0 || extent.height == 0 || extent.width > self.scanout.fb.width || extent.height > self.scanout.fb.height {
 					return false;
@@ -1760,6 +1767,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let brightness_root: u64 = recv_tagged(bootstrap, &mut buf, b"BRIGHTNESS").unwrap_or(0);
 		let brightness_control: u64 = recv_tagged(bootstrap, &mut buf, b"BRIGHTNESSCTL").unwrap_or(0);
 		let system_keys: u64 = recv_tagged(bootstrap, &mut buf, b"SYSKEYS").unwrap_or(0);
+		let brightness_catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"BRIGHTCAT").unwrap_or(0);
 		let providers: u64 = subscribe_to_displays(catalogue);
 		// THE SNAPSHOT IS ALREADY IN THE CHANNEL, which is what makes a subscription usable at
 		// bootstrap rather than only afterwards: the catalogue registers a subscriber and sends it
@@ -1772,7 +1780,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		let brightness = brightness::Brightness::new(catalogue, brightness_root, brightness_control, system_keys);
+		let brightness = brightness::Brightness::new(brightness_catalogue, brightness_root, brightness_control, system_keys);
 		serve_display(service, admin, stats_root, trusted_root, outputs_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control), brightness, display_function);
 	}
 }
@@ -1868,6 +1876,26 @@ fn ask_scanout(gpu: u64) -> Option<DeviceScanout> {
 	}
 }
 
+fn ask_monitor(gpu: u64) -> Option<proto::system::MonitorDescription> {
+	if gpu == 0 {
+		return None;
+	}
+	let mut client = display_device::Client::new(ChannelTransport { chan: gpu });
+	let monitor = match client.monitor() {
+		Some(Ok(monitor)) => Some(monitor),
+		_ => None,
+	};
+	if let Some(description) = &monitor {
+		let physical = description.physical_size_mm.as_ref().map(|size| (size.width, size.height)).unwrap_or((0, 0));
+		let preferred = description.preferred.and_then(|index| description.modes.get(index as usize));
+		let (width, height, refresh) = preferred.map(|mode| (mode.size.width, mode.size.height, mode.refresh_millihertz)).unwrap_or((0, 0, 0));
+		debug_write(alloc::format!("DisplayService: monitor identity={:04x}:{:04x}:{} physical-mm={}x{} modes={} preferred={}x{}@{}\n", description.identity.manufacturer, description.identity.product, description.identity.serial, physical.0, physical.1, description.modes.len(), width, height, refresh).as_bytes());
+	} else {
+		debug_write(b"DisplayService: monitor metadata unavailable\n");
+	}
+	monitor
+}
+
 // Open the device's event stream, or zero when it has none to give.
 fn open_device_events(gpu: u64) -> u64 {
 	let mut client = display_device::Client::new(ChannelTransport { chan: gpu });
@@ -1906,7 +1934,7 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 				Some((fb, width, height)) => {
 					let addr: i64 = dma_buffer_map(handle);
 					if !sys_is_err(addr as u64) && valid_scanout(&fb, width, height) {
-						return Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, events: open_device_events(gpu), lost: false };
+						return Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, monitor: ask_monitor(gpu), events: open_device_events(gpu), lost: false };
 					}
 					if !sys_is_err(addr as u64) {
 						dma_buffer_unmap(handle);
@@ -1921,7 +1949,7 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 		// makes that stale.
 		let mut fb: Framebuffer = Framebuffer::default();
 		let addr: i64 = framebuffer_map(display_ctl, &mut fb);
-		if !sys_is_err(addr as u64) && valid_scanout(&fb, fb.width, fb.height) { Scanout { gpu: 0, handle: 0, addr: addr as u64, width: fb.width, height: fb.height, fb, generation: 0, events: 0, lost: false } } else { Scanout { gpu: 0, handle: 0, addr: 0, fb: Framebuffer::default(), width: 0, height: 0, generation: 0, events: 0, lost: false } }
+		if !sys_is_err(addr as u64) && valid_scanout(&fb, fb.width, fb.height) { Scanout { gpu: 0, handle: 0, addr: addr as u64, width: fb.width, height: fb.height, fb, generation: 0, monitor: None, events: 0, lost: false } } else { Scanout { gpu: 0, handle: 0, addr: 0, fb: Framebuffer::default(), width: 0, height: 0, generation: 0, monitor: None, events: 0, lost: false } }
 	}
 }
 
@@ -2070,11 +2098,13 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 				service_logic::brightness::Function { bus: decoder >> 16 & 0xff, dev: decoder >> 8 & 0xff, func: decoder & 0xff }
 			})),
 		});
+		brightness.set_edid(state.scanout.monitor.as_ref().map(|description| service_logic::brightness::Monitor { manufacturer: description.identity.manufacturer, product: description.identity.product, serial: description.identity.serial }));
+		brightness.poll();
 		brightness.handles(&mut waits);
 		// EACH PASS OF THE LOOP'S WAIT, with the number of handles it waits on - the per-pass cost that
 		// grows with the surface count - and which one ended it.
 		perf_site(b"ds-wait\0", waits.len() as u64);
-		let ready: i64 = wait_any(&waits, 0);
+		let ready: i64 = wait_any(&waits, brightness.deadline());
 		perf_site(b"ds-woke\0", ready as u64);
 		if ready < 0 {
 			continue;

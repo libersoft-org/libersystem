@@ -11,6 +11,9 @@ render-shader = { path = "../../user/libs/graphics/render-shader" }
 render3d = { path = "../../user/libs/graphics/render3d" }
 soft3d = { path = "../../user/libs/graphics/soft3d" }
 
+[dev-dependencies]
+scene3d = { path = "../../user/libs/graphics/scene3d" }
+
 # A WARNING IS AN ERROR HERE, as everywhere in this tree.
 [lints.rust]
 warnings = "deny"

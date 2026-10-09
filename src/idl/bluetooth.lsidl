@@ -729,6 +729,8 @@ variant audio-event {
 	volume(endpoint-volume),
 	/// A voice device's call command.
 	command(bt-call-command),
+	/// An independent headset microphone gain changed. Existing variants retain their wire tags and payloads.
+	microphone-volume(endpoint-volume),
 }
 
 /// BLUETOOTH'S AUDIO, FOR AUDIOSERVICE ALONE: resolved by name through the broker, never a role, so stopping the radio
@@ -743,6 +745,11 @@ interface bluetooth-audio {
 	@op(3) set-volume: func(id: u32, volume: u8) -> result<unit, error>;
 	/// The call state the voice device reports; none when no session declares one.
 	@op(4) set-call:   func(state: bt-call-state) -> result<unit, error>;
+	/// The headset's current independent microphone level; unsupported where the profile offers no microphone control.
+	@op(5) microphone-volume: func(id: u32) -> result<u8, error>;
+	/// Independent HFP/HSP microphone gain, 0 to 100; does not alter the speaker level. Invalid above 100.
+	/// Returns the actual level after the profile's gain quantization.
+	@op(6) set-microphone-volume: func(id: u32, volume: u8) -> result<u8, error>;
 }
 
 /// A PAN LINK, offered to NetworkService: a network access point this host is a PAN user of.

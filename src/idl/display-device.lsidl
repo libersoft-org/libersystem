@@ -75,6 +75,9 @@ variant device-event {
 	/// The backing was replaced: a new object, a new generation, and the old handle is the service's
 	/// to release once it has mapped this one.
 	replaced(scanout),
+	/// The monitor description changed or became unavailable. Query `monitor` again; this notification
+	/// carries no framebuffer and does not change the backing generation.
+	monitor-changed,
 }
 
 /// The display device, as DisplayService drives it.
@@ -88,6 +91,9 @@ interface display-device {
 	@op(2) present: func(generation: u32, damage: damage-region) -> result<unit, error>;
 	/// The bounded event stream: resizes and replacements.
 	@op(3) events: func() -> stream<device-event>;
+	/// The bound output's EDID base-block modes and physical size. Unsupported means the transport
+	/// offers no EDID; unavailable means it supplied no valid description. Neither prevents scanout.
+	@op(4) monitor: func() -> result<monitor-description, error>;
 }
 
 /// THE PCI FUNCTION A BACKLIGHT BELONGS TO, as the bus enumerates it - the adapter an ACPI video output sits under, or
@@ -103,6 +109,23 @@ record monitor-identity {
 	manufacturer: u16,
 	product:      u16,
 	serial:       u32,
+}
+
+/// One advertised base-block timing. This is discovery, not a promise that a controller can set it.
+record monitor-mode {
+	size:               extent-2d,
+	refresh-millihertz: u32,
+	interlaced:         bool,
+}
+
+record monitor-description {
+	identity:         monitor-identity,
+	/// Absent for an aspect ratio or unspecified size; neither is a physical measurement.
+	physical-size-mm: option<extent-2d>,
+	/// At most 29 modes: four detailed, seventeen established, eight standard timings, deduplicated.
+	@bound(29) modes:  list<monitor-mode>,
+	/// Index of the preferred detailed timing, when the EDID declares one.
+	preferred:        option<u32>,
 }
 
 /// WHAT A BACKLIGHT BELONGS TO, as its driver reads it and never derives: the ACPI driver copies its adapter's function
@@ -168,6 +191,9 @@ interface backlight {
 	/// Set a level from the scale, answering the level set.
 	@op(3) set: func(level: u32) -> result<u32, error>;
 	@op(4) events: func() -> stream<backlight-event>;
+	/// ACPI output _ADR, when available; used only to choose among firmware outputs of one adapter.
+	/// Additive optional metadata: consumers of older providers fall back to namespace ordering.
+	@op(5) firmware-display-id: func() -> result<option<u32>, error>;
 }
 
 /// One point of a light sensor's response curve, as ACPI's `_ALR` gives it: the display adjustment in percent of

@@ -918,3 +918,14 @@ The statement is accurate, and nothing in this milestone's code can close the it
 The item therefore needs the owner's decision, as the milestone records: reorder the services, give the quiet row
 more room, or accept the gate's state. The milestone stays open on this item alone. No code of this milestone
 changed in this round.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0183 (2026-10-09 18:28:16 UTC):
+
+Reviewed the complete plan and retained verification records. The previous IPv6 regression has a later recorded passing run in the plan; the older audit failure remains history, not the final known result. Software closure still requires the final integrated build/verification after the current shared changes; no fresh modem guest run is claimed here. Existing audit content is preserved; no audit rating is assigned.
+
+Verification continuation (2026-10-09T22:13:43Z):
+
+The frozen profile/readback/microphone continuation was built on all three targets with `RUST_MIN_STACK=33554432 LIBER_DEVELOPMENT=1 ./build.sh --arch ARCH --part libs`: x86_64 PASS442s, aarch64 PASS443s, riscv64 PASS439s; each staged inventory matches121 providers and121 consumers. The six foreign/runtime provider SHA256 identities remain unchanged from the successful canonical foreign regeneration, so no new foreign regeneration was required. Serial `./build.sh --arch all` with the same development/stack environment PASS271.24s; `./build.sh --arch all --part volume --kernel-on-volume` PASS221.06s. Exact logs are under `.build/logs/end-of-job/qemu-only-20261009/post-join-*`; `post-join-stage-results.json` preserves every command, environment, exit and elapsed time.
+
+`RUST_MIN_STACK=33554432 ./check.sh --refresh dynamic-report` PASS405.10s, `./check.sh --gate verify-model` PASS28.97s, and `./gen.sh --check` PASS16.04s. The registration check preceded compilation of the new microphone test and honestly reported it declared but not yet built. The subsequent actual x86_64 SMP4 kernel run compiled and ran all16 explicitly selected cases, PASS74.51s (61s guest):112 2D and222 3D conformance cases with zero failed/unsupported/untested, HDR/Extended/resize/worker equality, partial-allocation and emergency cleanup, both brightness responsiveness tests, audio routing/recovery, pointer/touch lifecycle, and separate microphone gain with legacy capture compatibility. Exact selection and command are in `post-join-stage-results.json`; authoritative suite log is `.build/logs/test/x86_64-20261009T220307Z-1439801-guest.log`. These are functional checks, not a live performance acceptance. ARM/RISC current microphone/joined-profile execution and the required full verification workflow remain pending; merge inventory preparation must refresh all target suites. No milestone completion is asserted by these common build results alone.

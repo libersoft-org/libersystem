@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::Buffer;
-use proto::system::{AudioDevice, AudioDirection, AudioStreamInfo, CallState, Error, LaunchContext, audio, audio_control, pcm_capture, pcm_stream, voice_session};
+use proto::system::{AudioDevice, AudioDirection, AudioStreamInfo, CallCommand, CallState, Error, LaunchContext, audio, audio_control, pcm_capture, pcm_stream, voice_session};
 use rt::*;
 
 const TICKS: u64 = 100;
@@ -87,6 +87,10 @@ impl Probe {
 
 // Some frames of a square wave, as a buffer the write carries.
 fn tone(frames: usize, channels: usize) -> Buffer {
+	tone_channels(frames, channels, false)
+}
+
+fn tone_channels(frames: usize, channels: usize, distinct: bool) -> Buffer {
 	let bytes = frames * channels * 2;
 	let handle = memory_object_create(bytes as u64);
 	if handle < 0 {
@@ -96,7 +100,8 @@ fn tone(frames: usize, channels: usize) -> Buffer {
 	let Some(base) = (unsafe { map_object(handle) }) else { fail("the period could not be mapped") };
 	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames * channels) };
 	for (at, sample) in samples.iter_mut().enumerate() {
-		*sample = if (at / channels / 24) % 2 == 0 { 4_000 } else { -4_000 };
+		let half_period = if distinct && at % channels == 1 { 12 } else { 24 };
+		*sample = if (at / channels / half_period) % 2 == 0 { 4_000 } else { -4_000 };
 	}
 	unmap_object(handle);
 	Buffer { handle, len: bytes as u64 }
@@ -325,6 +330,139 @@ fn voice(probe: &Probe) {
 	say("PASS voice");
 }
 
+// Independent host peers consume this audio and answer the call. This driver uses the same grants as an
+// application; neither it nor AudioService can manufacture the host's received packets or codec verdict.
+fn radio_music(probe: &Probe, stereo: bool) {
+	let stream = probe.open(None);
+	say(if stereo { "radio-stereo started" } else { "radio-music started" });
+	for _ in 0..300 {
+		match pcm_stream::Client::new(ChannelTransport { chan: stream }).write(&tone_channels(480, 2, stereo)) {
+			Some(Ok(accepted)) if accepted > 0 => {}
+			other => fail(&format!("a radio music write was not accepted: {other:?}")),
+		}
+	}
+	let _ = pcm_stream::Client::new(ChannelTransport { chan: stream }).close();
+	close(stream);
+	say(if stereo { "PASS radio-stereo" } else { "PASS radio-music" });
+}
+
+fn radio_voice(probe: &Probe) {
+	let session = match audio::Client::new(ChannelTransport { chan: probe.voice }).open_voice(&16_000) {
+		Some(Ok(session)) => session,
+		other => fail(&format!("the radio voice session could not be opened: {other:?}")),
+	};
+	let client = || voice_session::Client::new(ChannelTransport { chan: session });
+	let commands = match client().commands() {
+		Some(Ok(commands)) => commands,
+		other => fail(&format!("the radio call command stream was refused: {other:?}")),
+	};
+	if !matches!(client().set_call(&CallState::Incoming), Some(Ok(()))) {
+		fail("the radio incoming call could not be declared");
+	}
+	say("radio-voice incoming");
+	let mut answered = false;
+	let mut hung_up = false;
+	let mut heard = 0usize;
+	let mut energy = 0u64;
+	let mut crossings = 0usize;
+	let mut previous = 0i16;
+	let deadline = clock() + 30 * TICKS;
+	while !hung_up {
+		if clock() >= deadline {
+			fail("the independent peer did not answer and hang up the radio call");
+		}
+		match client().write(&tone(480, 1)) {
+			Some(Ok(accepted)) if accepted > 0 => {}
+			other => fail(&format!("the radio voice write failed: {other:?}")),
+		}
+		if let Some(Ok(period)) = client().read() {
+			for pair in period.chunks_exact(2) {
+				let sample = i16::from_le_bytes([pair[0], pair[1]]);
+				crossings += usize::from(previous <= 0 && sample > 0);
+				previous = sample;
+				energy += (i64::from(sample) * i64::from(sample)) as u64;
+				heard += 1;
+			}
+		}
+		let mut bytes = [0u8; 64];
+		while let PolledCaps::Message { len, handles } = try_recv_caps(commands, &mut bytes) {
+			let mut handles = handles;
+			match voice_session::commands_read(&bytes[..len], &mut handles) {
+				Some(CallCommand::Answer) if !answered => {
+					answered = true;
+					if !matches!(client().set_call(&CallState::Active), Some(Ok(()))) {
+						fail("the answered radio call could not become active");
+					}
+					say("radio-voice answered");
+				}
+				Some(CallCommand::HangUp) if answered => hung_up = true,
+				_ => {}
+			}
+			for &handle in handles.as_slice() {
+				close(handle);
+			}
+		}
+	}
+	let _ = client().set_call(&CallState::None);
+	let _ = client().close();
+	close(commands);
+	close(session);
+	if heard < 8_000 || energy / (heard as u64) < 100_000 {
+		fail(&format!("the independent microphone did not reach the session: {heard} samples, energy {energy}"));
+	}
+	let frequency = crossings * 16_000 / heard;
+	if !(1_300..=1_700).contains(&frequency) {
+		fail(&format!("the independent microphone tone was not 1500 Hz: {frequency} Hz over {heard} samples"));
+	}
+	say(&format!("PASS radio-voice samples {heard} mean-square {} frequency {frequency}", energy / heard as u64));
+}
+
+// The independent headset holds its real SCO acceptance while this application owns the voice
+// endpoint. Its HFP hangup closes that ownership before the held setup is allowed to complete.
+fn radio_voice_close(probe: &Probe) {
+	let session = match audio::Client::new(ChannelTransport { chan: probe.voice }).open_voice(&16_000) {
+		Some(Ok(session)) => session,
+		other => fail(&format!("the pending voice session could not be opened: {other:?}")),
+	};
+	let client = || voice_session::Client::new(ChannelTransport { chan: session });
+	let commands = match client().commands() {
+		Some(Ok(commands)) => commands,
+		other => fail(&format!("the pending voice command stream was refused: {other:?}")),
+	};
+	if !matches!(client().set_call(&CallState::Active), Some(Ok(()))) {
+		fail("the pending voice call could not be declared");
+	}
+	say("radio-voice-close waiting");
+	let deadline = clock() + 20 * TICKS;
+	let mut bytes = [0u8; 64];
+	loop {
+		match try_recv_caps(commands, &mut bytes) {
+			PolledCaps::Message { len, handles } => {
+				let mut handles = handles;
+				let command = voice_session::commands_read(&bytes[..len], &mut handles);
+				for &handle in handles.as_slice() {
+					close(handle);
+				}
+				if command == Some(CallCommand::HangUp) {
+					break;
+				}
+			}
+			PolledCaps::Closed => fail("the pending voice command stream closed before hangup"),
+			PolledCaps::Empty => {}
+		}
+		if clock() >= deadline {
+			fail("the independent headset did not hang up the pending voice session");
+		}
+		sleep_until(clock() + 1);
+	}
+	if !matches!(client().set_call(&CallState::None), Some(Ok(()))) || !matches!(client().close(), Some(Ok(()))) {
+		fail("the pending voice session did not close");
+	}
+	close(commands);
+	close(session);
+	say("PASS radio-voice-close");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 256];
@@ -345,7 +483,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		"hold" => hold(&probe),
 		"operator" => operator(&probe),
 		"voice" => voice(&probe),
-		_ => fail("usage: audioprobe inventory|hold|operator|voice"),
+		"radio-music" => radio_music(&probe, false),
+		"radio-stereo" => radio_music(&probe, true),
+		"radio-voice" => radio_voice(&probe),
+		"radio-voice-close" => radio_voice_close(&probe),
+		_ => fail("usage: audioprobe inventory|hold|operator|voice|radio-music|radio-stereo|radio-voice|radio-voice-close"),
 	}
 	exit();
 }

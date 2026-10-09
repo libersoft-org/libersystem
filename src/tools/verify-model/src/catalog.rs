@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 177] = [
+const GATES: [(&str, &str); 189] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -332,6 +332,8 @@ const GATES: [(&str, &str); 177] = [
 	// reboot is two boots.
 	("bluetooth-service", "userspace.build"),
 	("bluetooth-classic", "userspace.build"),
+	("bluetooth-codecs", "userspace.build"),
+	("bluetooth-independent", "userspace.build"),
 	("bluetooth-input", "userspace.build"),
 	("bluetooth-le", "userspace.build"),
 	("bluetooth-audio", "userspace.build"),
@@ -358,6 +360,7 @@ const GATES: [(&str, &str); 177] = [
 	// `_DOS`, the hotkey notifications, the keypad, automatic brightness through `_ALR` and a restore across a reset. Its
 	// subject is the kernel's decoder, the two ACPI drivers and the services above them, and it boots a development guest.
 	("brightness-acpi", "kernel"),
+	("brightness-acpi-no-dos", "kernel"),
 	// IPMI, on development guests: the five system interfaces against QEMU's simulated BMCs, a pair, the harness BMC and
 	// its hostile modes, malformed records and an orderly reboot. Its subject is the transports, the driver, the BMC
 	// service and the tool - a userspace change selects it - and it boots guests.
@@ -459,6 +462,15 @@ const GATES: [(&str, &str); 177] = [
 	// chosen by its pairing, written and read back across a cold reboot, `lsblk` naming the device, and a volume no
 	// such driver reaches refused by name. Its subject is the drivers' staging and StorageService's choice.
 	("boot-volume-controllers", "userspace.build"),
+	("boot-volume-controllers-aarch64", "userspace.build"),
+	("boot-volume-controllers-riscv64", "userspace.build"),
+	// Bound EDID through virtio-gpu into DisplayService, followed by presentation; absent-feature fallback.
+	("virtio-gpu-edid", "userspace.build"),
+	("camera-usb", "userspace.build"),
+	("camera-usb-aarch64", "userspace.build"),
+	("camera-usb-riscv64", "userspace.build"),
+	("virtio-gpu-edid-aarch64", "userspace.build"),
+	("virtio-gpu-edid-riscv64", "userspace.build"),
 	// THE HARDWARE WATCHDOG, on development instances of its own: the declared registers, the three drivers, the
 	// watchdog service's choice and schedule, ServiceManager's liveness answer and its shutdown notice - with QEMU's
 	// run state as the oracle. Its subject is the kernel mechanism and the drivers and services above it.
@@ -754,6 +766,7 @@ const GATES: [(&str, &str); 177] = [
 	// have, and a selection narrowed to one crate would skip exactly that change. Always selected for
 	// the same reason `dependency-policy` is, and it costs seconds on the host.
 	("graphics-profile", "harness.tools"),
+	("soft2d-performance", "soft2d"),
 	// The OpenType profile: the closed list of what a font may contain and this system will read.
 	// It reads the profile crate and the generated document beside it and nothing else, so it costs
 	// seconds; always selected for the same reason the graphics one is - the thing it guards against
@@ -931,13 +944,14 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 78] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 88] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
 	"bluetooth-service",
+	"bluetooth-independent",
 	"bluetooth-classic",
 	"bluetooth-input",
 	"bluetooth-le",
@@ -948,6 +962,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 78] = [
 	"power-ups",
 	"brightness-usb",
 	"brightness-acpi",
+	"brightness-acpi-no-dos",
 	"ipmi",
 	"smartcard-service",
 	"qemu-modem-service",
@@ -979,6 +994,14 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 78] = [
 	"serial-handoff",
 	// And the system volume's controllers, two boots each, a decoy and a refusal.
 	"boot-volume-controllers",
+	"boot-volume-controllers-aarch64",
+	"boot-volume-controllers-riscv64",
+	"virtio-gpu-edid",
+	"camera-usb",
+	"camera-usb-aarch64",
+	"camera-usb-riscv64",
+	"virtio-gpu-edid-aarch64",
+	"virtio-gpu-edid-riscv64",
 	// And the hardware watchdog's, which boots four in turn.
 	"watchdog",
 	// And the firmware namespace's, which boots two.
@@ -1125,6 +1148,11 @@ impl Catalog {
 
 		for (gate, subject) in GATES {
 			let mut covers = vec![subject.to_string()];
+			if gate == "soft2d-performance" {
+				for component in ["graphics-core", "graphics-profile", "render2d", "font-contract"] {
+					covers.push(component.to_string());
+				}
+			}
 			// This gate requires a DHCP lease through the real translated NIC: both transmit and
 			// receive must work, beyond the provider connection exercised by the boot-chain test.
 			if gate == "qemu-virtio-iommu-x86_64" {
@@ -1157,7 +1185,7 @@ impl Catalog {
 				covers.push("driver-binding".to_string());
 			}
 			if gate == "qemu-3d-demo" {
-				for component in ["render3d", "soft3d", "render-shader", "render-math", "render2d", "soft2d", "surface", "graphics-app"] {
+				for component in ["scene3d", "render3d", "soft3d", "render-shader", "render-math", "render2d", "soft2d", "surface", "graphics-app"] {
 					covers.push(component.to_string());
 				}
 			}

@@ -476,6 +476,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// scenario with the fixture's control endpoint, inventory and capture;
 		// `camhold` is the second capture client; `camread` holds inventory ALONE, which is its half of the
 		// gate; `camfail`'s launch fails after its capture grant was minted.
+		b"uvccheck" => Some(granted("uvccheck", alloc::vec![Capability::Device, Capability::DevicePolicy, Capability::Camera, Capability::CameraCapture])),
 		b"camcheck" => Some(granted("camcheck", alloc::vec![Capability::FixtureControl, Capability::Camera, Capability::CameraCapture])),
 		b"camhold" => Some(granted("camhold", alloc::vec![Capability::CameraCapture])),
 		b"camread" => Some(granted("camread", alloc::vec![Capability::Camera])),
@@ -1067,7 +1068,11 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 					close(connection);
 					if narrowed > 0 { narrowed as u64 } else { 0 }
 				}
-				_ => 0,
+				Some(Err(error)) => {
+					print(alloc::format!("PermissionManager: Bluetooth GATT grant for {component} alias {alias} refused: {error:?}; launch refused\n").as_bytes());
+					0
+				}
+				None => 0,
 			}
 		}
 		// A SERIAL PORT ON ONE ALIASED PEER, for this component and this task. Minting connects nothing: the client
@@ -1278,6 +1283,9 @@ fn bluetooth_serial_policy(component: &str) -> Option<&'static str> {
 // WHICH CAMERA A COMPONENT'S CAPTURE GRANT IS FOR: an alias CameraService's configuration binds to provider
 // metadata, never a camera identity and never "the first one present". The default is no camera at all.
 fn camera_policy(component: &str) -> Option<&'static str> {
+	if component == "uvccheck" {
+		return Some("usb-video");
+	}
 	{
 		// THE CAMERA GATE'S CAPTURE PROBES, all on the fixture camera.
 		if matches!(component, "camcheck" | "camhold" | "camfail") {

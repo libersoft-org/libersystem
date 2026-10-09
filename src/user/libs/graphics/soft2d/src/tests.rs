@@ -447,6 +447,169 @@ impl ImageSource for OneImage {
 	}
 }
 
+#[test]
+fn prepared_image_samples_preserve_filtering_coverage_and_the_live_backdrop() {
+	use render2d::paint::ImageQuality;
+	use render2d::transform::Transform;
+	let transforms = [Transform::IDENTITY, Transform { m: [[0.9, 0.12, 3.0], [-0.08, 1.1, 4.0], [0.001, -0.002, 1.0]] }];
+	for translucent in [false, true] {
+		let mut source = OneImage { identity: 7, image: if translucent { target(32, 32) } else { checkerboard(32) } };
+		if translucent {
+			for y in 0..32 {
+				for x in 0..32 {
+					graphics_core::pixel::write(&mut source.image.view_mut(), x, y, graphics_core::pixel::Rgba::new(x as f32 / 31.0, y as f32 / 31.0, 0.3, (x % 5) as f32 / 4.0));
+				}
+			}
+		}
+		for transform in transforms {
+			for quality in [ImageQuality::Nearest, ImageQuality::Bilinear, ImageQuality::Bicubic, ImageQuality::Mipmapped] {
+				let mut before = target(83, 71);
+				for y in 0..71 {
+					for x in 0..83 {
+						graphics_core::pixel::write(&mut before.view_mut(), x, y, graphics_core::pixel::Rgba::new(0.2, 0.5, 0.7, 0.7));
+					}
+				}
+				let record = render2d::list::ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 };
+				let mut canvas = Canvas::new();
+				canvas.set_transform(transform);
+				canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 83.0, 71.0), quality).unwrap();
+				canvas.draw_image(record, RectF::new(2.0, 3.0, 21.0, 25.0), RectF::new(-4.0, 7.25, 36.5, 40.25), quality).unwrap();
+				let list = canvas.finish().unwrap();
+				let mut backend = Soft2d::new().with_images(&source);
+				let mut prepared = backend.prepare(&list, &description(&before)).unwrap();
+				assert!(render2d::backend::Prepared::scratch_bytes(&prepared) <= graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes);
+				let mut cached = copy_of(&before);
+				backend.render(&prepared, &mut cached.view_mut()).unwrap();
+				assert_eq!(prepared.discard_image_samples(), 2);
+				backend.render(&prepared, &mut before.view_mut()).unwrap();
+				let difference = cached.bytes().iter().zip(before.bytes()).position(|(cached, plain)| cached != plain);
+				assert_eq!(difference, None, "{quality:?}, translucent={translucent}, transform={transform:?}");
+			}
+		}
+	}
+}
+
+#[test]
+fn image_content_refresh_reuses_storage_and_invalidates_opaque_coverage() {
+	use render2d::paint::ImageQuality;
+	for quality in [ImageQuality::Nearest, ImageQuality::Bilinear, ImageQuality::Bicubic, ImageQuality::Mipmapped] {
+		let mut source = OneImage { identity: 7, image: target(32, 32) };
+		for y in 0..32 {
+			for x in 0..32 {
+				graphics_core::pixel::write(&mut source.image.view_mut(), x, y, graphics_core::pixel::Rgba::new(0.7, 0.3, 0.1, 1.0));
+			}
+		}
+		let mut canvas = Canvas::new();
+		let record = render2d::list::ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 };
+		canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 64.0, 64.0), quality).unwrap();
+		let list = canvas.finish().unwrap();
+		let mut output = target(64, 64);
+		let mut backend = Soft2d::new().with_images(&source);
+		let mut prepared = backend.prepare(&list, &description(&output)).unwrap();
+		backend.render(&prepared, &mut output.view_mut()).unwrap();
+		assert!(prepared.tiles_without_backdrop() > 0);
+		let backend = backend.unbind();
+		for y in 0..32 {
+			for x in 0..32 {
+				graphics_core::pixel::write(&mut source.image.view_mut(), x, y, graphics_core::pixel::Rgba::new(0.7, 0.3, 0.1, (x % 3) as f32 / 2.0));
+			}
+		}
+		let mut backend = backend.with_images(&source);
+		let before = crate::counted::count();
+		backend.refresh_images(&mut prepared, &[render2d::list::ImageRecord { content_generation: 2, ..record }]).unwrap();
+		assert_eq!(crate::counted::count(), before, "{quality:?} refresh allocates nothing");
+		assert_eq!(prepared.tiles_without_backdrop(), 0, "the changed alpha invalidates the old opaque proof");
+		let mut reference = copy_of(&output);
+		backend.render(&prepared, &mut output.view_mut()).unwrap();
+		let mut fresh = Soft2d::new().with_images(&source);
+		let rebuilt = fresh.prepare(&list, &description(&reference)).unwrap();
+		fresh.render(&rebuilt, &mut reference.view_mut()).unwrap();
+		assert_eq!(output.bytes().iter().zip(reference.bytes()).position(|(a, b)| a != b), None, "{quality:?}: refreshed and fresh image content");
+		assert!(backend.refresh_images(&mut prepared, &[render2d::list::ImageRecord { layout_generation: 2, ..record }]).is_err(), "layout changes still require preparation");
+	}
+}
+
+#[test]
+fn cached_images_preserve_missing_resource_and_unclamped_float_alpha() {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb.linear_counterpart(), alpha_mode: AlphaMode::Premultiplied };
+	let layout = ImageLayout::new(Extent2D::new(64, 64), 64 * 16, PixelStorage::Known(PixelFormat::R32G32B32A32Float), RowOrigin::TopLeft, semantics).unwrap();
+	let mut source = OneImage { identity: 7, image: OwnedImage::new(layout).unwrap() };
+	let mut canvas = Canvas::new();
+	canvas.draw_image(render2d::list::ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 64.0, 64.0), RectF::new(0.0, 0.0, 64.0, 64.0), render2d::paint::ImageQuality::Nearest).unwrap();
+	let list = canvas.finish().unwrap();
+	for alpha in [1.0, 1.5] {
+		for y in 0..64 {
+			for x in 0..64 {
+				graphics_core::pixel::write(&mut source.image.view_mut(), x, y, graphics_core::pixel::Rgba::new(0.6, 0.3, 0.2, alpha));
+			}
+		}
+		let mut output = target(64, 64);
+		for y in 0..64 {
+			for x in 0..64 {
+				graphics_core::pixel::write(&mut output.view_mut(), x, y, graphics_core::pixel::Rgba::new(0.7, 0.5, 0.3, 0.8));
+			}
+		}
+		let mut reference = copy_of(&output);
+		let mut backend = Soft2d::new().with_images(&source);
+		let mut prepared = backend.prepare(&list, &description(&output)).unwrap();
+		if alpha > 1.0 {
+			assert_eq!(prepared.tiles_without_backdrop(), 0);
+			backend.render(&prepared, &mut output.view_mut()).unwrap();
+			assert_eq!(prepared.discard_image_samples(), 1);
+			backend.render(&prepared, &mut reference.view_mut()).unwrap();
+		} else {
+			assert!(prepared.tiles_without_backdrop() > 0);
+			let mut backend = backend.unbind();
+			backend.render(&prepared, &mut output.view_mut()).unwrap();
+		}
+		assert_eq!(output.bytes().iter().zip(reference.bytes()).position(|(a, b)| a != b), None, "alpha={alpha}");
+	}
+}
+
+#[test]
+fn a_refused_later_image_refresh_cannot_leave_an_old_opaque_tile_proof() {
+	struct Pair {
+		first: OwnedImage,
+		second: OwnedImage,
+	}
+	impl crate::target::ImageSource for Pair {
+		fn image(&self, identity: u64) -> Option<graphics_core::ImageView<'_>> {
+			match identity {
+				1 => Some(self.first.view()),
+				2 => Some(self.second.view()),
+				_ => None,
+			}
+		}
+	}
+	let mut images = Pair { first: target(32, 32), second: checkerboard(32) };
+	for y in 0..32 {
+		for x in 0..32 {
+			graphics_core::pixel::write(&mut images.first.view_mut(), x, y, graphics_core::pixel::Rgba::new(0.4, 0.3, 0.2, 1.0));
+		}
+	}
+	let records = [
+		render2d::list::ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 },
+		render2d::list::ImageRecord { identity: 2, layout_generation: 1, content_generation: 1 },
+	];
+	let mut canvas = Canvas::new();
+	canvas.draw_image(records[0], RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 64.0, 64.0), render2d::paint::ImageQuality::Nearest).unwrap();
+	canvas.draw_image(records[1], RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 1.0, 1.0), render2d::paint::ImageQuality::Bilinear).unwrap();
+	let list = canvas.finish().unwrap();
+	let output = target(64, 64);
+	let mut backend = Soft2d::new().with_images(&images);
+	let mut prepared = backend.prepare(&list, &description(&output)).unwrap();
+	assert!(prepared.tiles_without_backdrop() > 0);
+	let backend = backend.unbind();
+	images.first.bytes_mut().fill(0);
+	// Deliberately fail the second refresh after the first image has changed alpha. An application
+	// retaining the preparation after a refusal must not inherit the earlier opaque proof.
+	images.second = checkerboard(16);
+	let mut backend = backend.with_images(&images);
+	let changed = records.map(|record| render2d::list::ImageRecord { content_generation: 2, ..record });
+	assert!(backend.refresh_images(&mut prepared, &changed).is_err());
+	assert_eq!(prepared.tiles_without_backdrop(), 0);
+}
+
 /// A checkerboard, which is the pattern that shows minification: it averages to a flat grey and
 /// aliases to noise.
 fn checkerboard(size: u32) -> OwnedImage {

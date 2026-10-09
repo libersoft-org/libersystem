@@ -174,6 +174,7 @@ pub fn inside(setup: &Setup, at: (Subpixel, Subpixel)) -> bool {
 /// THE SAMPLE POSITIONS ARE THE PROFILE'S, taken from `render3d` rather than restated here - two
 /// copies of a sample grid is two grids that can disagree, and the disagreement is an MSAA edge that
 /// is right in the reference and wrong in the renderer.
+// @handles: Msaa1x, Msaa2x, Msaa4x
 pub fn coverage(setup: &Setup, pixel_x: i64, pixel_y: i64, samples: u32) -> Result<u32, render3d::Error> {
 	let positions = render3d::msaa::sample_positions(samples)?;
 	let mut mask = 0;
@@ -201,12 +202,16 @@ pub fn barycentric(setup: &Setup, at: (Subpixel, Subpixel)) -> [f32; 3] {
 
 /// The tile grid of one target, and the triangle indices binned into each tile.
 ///
-/// REUSED ACROSS FRAMES. `clear` keeps the allocations and empties the lists, so a steady-state
-/// frame allocates nothing here.
+/// REUSED ACROSS FRAMES. `clear` keeps previous capacity; frame execution additionally reserves
+/// a bounded cache in every tile, so a later pose reaching a new tile does not allocate.
 pub struct Bins {
 	across: u32,
 	down: u32,
 	tiles: Vec<Vec<u32>>,
+	/// Frame execution may bound the index cache. An overflowing tile visits the complete
+	/// validated setup list instead; standalone callers of `insert`/`tile` remain uncapped.
+	capacity_limit: Option<usize>,
+	overflow: Vec<bool>,
 	/// THE HIERARCHICAL DEPTH BOUND: the FURTHEST depth anything in this tile currently holds. A
 	/// triangle whose nearest vertex is further than this cannot produce a surviving fragment under
 	/// a nearer-wins test, so the whole triangle is rejected before a sample is touched.
@@ -221,7 +226,20 @@ impl Bins {
 	pub fn new(width: u32, height: u32) -> Self {
 		let across = width.div_ceil(TILE).max(1);
 		let down = height.div_ceil(TILE).max(1);
-		Self { across, down, tiles: vec![Vec::new(); (across * down) as usize], far: vec![1.0; (across * down) as usize] }
+		Self { across, down, tiles: vec![Vec::new(); (across * down) as usize], capacity_limit: None, overflow: vec![false; (across * down) as usize], far: vec![1.0; (across * down) as usize] }
+	}
+
+	/// Reserve every tile, including tiles the initial pose never reaches. Dense tiles have a
+	/// bounded cache rather than reserving the entire mesh for every tile of a large target.
+	pub(crate) fn reserve_triangles(&mut self, triangles: usize) -> Result<(), render3d::Error> {
+		let count = triangles.min(256);
+		for tile in &mut self.tiles {
+			if tile.capacity() < count {
+				tile.try_reserve_exact(count.saturating_sub(tile.len())).map_err(|_| render3d::Error::OutOfMemory { bytes: (count * core::mem::size_of::<u32>()) as u64 })?;
+			}
+		}
+		self.capacity_limit = Some(count);
+		Ok(())
 	}
 
 	/// The furthest depth this tile can still be beaten by.
@@ -253,6 +271,7 @@ impl Bins {
 		for tile in &mut self.tiles {
 			tile.clear();
 		}
+		self.overflow.fill(false);
 	}
 
 	/// Forget every tile's depth bound. Called once per frame, because the bound is only valid
@@ -274,6 +293,7 @@ impl Bins {
 		self.across = across;
 		self.down = down;
 		self.tiles.resize((across * down) as usize, Vec::new());
+		self.overflow.resize((across * down) as usize, false);
 		self.far.resize((across * down) as usize, 1.0);
 		self.clear();
 		self.reset_depth();
@@ -290,14 +310,20 @@ impl Bins {
 		let last_y = ((bounds.y1 - 1).max(0) as u32 / TILE).min(self.down - 1);
 		for tile_y in first_y..=last_y {
 			for tile_x in first_x..=last_x {
-				self.tiles[(tile_y * self.across + tile_x) as usize].push(triangle);
+				let index = (tile_y * self.across + tile_x) as usize;
+				let tile = &mut self.tiles[index];
+				if self.capacity_limit.is_some_and(|limit| tile.len() >= limit) {
+					self.overflow[index] = true;
+				} else {
+					tile.push(triangle);
+				}
 			}
 		}
 	}
 
 	/// The bytes this tile grid owns, for the caller to charge against its process Domain.
 	pub fn reserved_bytes(&self) -> usize {
-		core::mem::size_of::<Vec<u32>>() * self.tiles.capacity() + self.tiles.iter().map(|tile| tile.capacity() * core::mem::size_of::<u32>()).sum::<usize>() + self.far.capacity() * core::mem::size_of::<f32>()
+		core::mem::size_of::<Vec<u32>>() * self.tiles.capacity() + self.tiles.iter().map(|tile| tile.capacity() * core::mem::size_of::<u32>()).sum::<usize>() + self.far.capacity() * core::mem::size_of::<f32>() + self.overflow.capacity()
 	}
 
 	pub fn tile(&self, x: u32, y: u32) -> &[u32] {
@@ -311,8 +337,8 @@ impl Bins {
 
 	/// Every tile's bin, and every tile's depth bound to narrow - apart, because a frame shading its
 	/// tiles at once reads the first while each tile writes its own slot of the second.
-	pub(crate) fn parts(&mut self) -> (&[Vec<u32>], &mut [f32]) {
-		(&self.tiles, &mut self.far)
+	pub(crate) fn parts(&mut self) -> (&[Vec<u32>], &[bool], &mut [f32]) {
+		(&self.tiles, &self.overflow, &mut self.far)
 	}
 }
 

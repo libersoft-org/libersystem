@@ -393,9 +393,9 @@ fi
             block, replacements = re.subn(r'virtio_disk="\$\((qemu_prepare_system_disk [^\n]*?)\)"', r'\1', block)
             self.assertEqual(replacements, 1)
         if unchecked_substitution:
-            # x86_64 attaches through `qemu_attach_system_disk`, which puts the disk on the controller a run
-            # names; the ports attach virtio-blk directly. Either is the call that must not run.
-            attach = re.search(r'^\t\tqemu_attach_(?:virtio_blk|system_disk) qemu_args "\$run_disk"[^\n]*\n', block, re.M)
+            # Explicit controller fixtures attach through `qemu_attach_system_disk`; ordinary ports retain
+            # virtio-blk. Neither attachment may run after private acquisition fails.
+            attach = re.search(r'^\t{2,}qemu_attach_(?:virtio_blk|system_disk) qemu_args "\$run_disk"[^\n]*\n', block, re.M)
             self.assertIsNotNone(attach, architecture)
             attach = attach.group(0).replace('"$run_disk"', '"$(qemu_run_disk "$virtio_disk")"')
             block = block.splitlines(keepends=True)[0] + attach + '\tfi\n'
@@ -423,6 +423,62 @@ caller() {
 ''' + block + '    echo "CONTINUED"\n}\ncaller\n'
         return subprocess.run(["bash", "-c", script], env=dict(os.environ, COPY_SUCCEEDS=str(int(acquisition_succeeds))),
                               capture_output=True, text=True, timeout=5)
+
+    def test_explicit_port_controller_pairs_the_signed_manifest_to_its_volume(self):
+        pairing_function = self.production_function("qemu_port_volume_pairing")
+        manifest_function = self.production_function("stage_signed_boot_manifest")
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            kernel = work / "kernel"
+            kernel.write_bytes(b"the staged kernel")
+            wanted = "00112233445566778899aabbccddeeff"
+            environment = dict(os.environ, QEMU_BUILD_DIR=str(work), REPO_ROOT=str(ROOT),
+                               HERE=str(ROOT / "src/harness"), STAGED_KERNEL=str(kernel),
+                               TRACE=str(work / "arguments"))
+            environment.pop("SYSTEM_DISK", None)
+            script = "set -euo pipefail\n" + pairing_function + manifest_function + r'''
+cargo() { printf '%s\n' "$@" >"$TRACE"; touch "${@: -1}"; }
+mcopy() { :; }
+stage_signed_boot_manifest unused /no-bootstrap "$FIXTURE_ARCH"
+'''
+            for arch in ("aarch64", "riscv64"):
+                environment["FIXTURE_ARCH"] = arch
+                volume = work / f"system-volume-bootable-{arch}.img"
+                uuid = volume.with_suffix(".uuid")
+
+                def run(controller=None):
+                    env = environment.copy()
+                    if controller is not None:
+                        env["SYSTEM_DISK"] = controller
+                    (work / "arguments").unlink(missing_ok=True)
+                    return subprocess.run(["bash", "-c", script], env=env,
+                                          text=True, capture_output=True, timeout=5)
+
+                ordinary = run()
+                self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+                arguments = (work / "arguments").read_text().splitlines()
+                self.assertEqual(arguments[arguments.index("--volume-uuid") + 1], "0" * 32)
+                missing = run("nvme")
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertFalse((work / "arguments").exists())
+                volume.write_bytes(bytes(80) + bytes.fromhex(wanted) + bytes(32))
+                uuid.write_text(wanted + "\n")
+                for controller in ("virtio", "nvme", "ahci", "virtio-scsi"):
+                    with self.subTest(arch=arch, controller=controller):
+                        paired = run(controller)
+                        self.assertEqual(paired.returncode, 0, paired.stderr)
+                        arguments = (work / "arguments").read_text().splitlines()
+                        self.assertEqual(arguments[arguments.index("--volume-uuid") + 1], wanted)
+                uuid.write_text("11" * 16)
+                mismatch = run("ahci")
+                self.assertNotEqual(mismatch.returncode, 0)
+                self.assertIn("do not agree", mismatch.stderr)
+                self.assertFalse((work / "arguments").exists())
+                # Even a leftover broken fixture must not change an ordinary port boot.
+                ordinary = run()
+                self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+                arguments = (work / "arguments").read_text().splitlines()
+                self.assertEqual(arguments[arguments.index("--volume-uuid") + 1], "0" * 32)
 
     def test_every_architecture_refuses_failed_private_disk_acquisition(self):
         for architecture in ("x86_64", "aarch64", "riscv64"):

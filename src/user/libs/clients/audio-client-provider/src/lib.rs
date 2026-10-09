@@ -37,3 +37,6 @@ forward!("liber_channel_liber_audio_audio_control_set_default", "liber_channel_i
 forward!("liber_channel_liber_audio_audio_control_set_volume", "liber_channel_impl_liber_audio_audio_control_set_volume");
 forward!("liber_channel_liber_audio_audio_control_streams", "liber_channel_impl_liber_audio_audio_control_streams");
 forward!("liber_channel_liber_audio_audio_control_counters", "liber_channel_impl_liber_audio_audio_control_counters");
+
+forward!("liber_channel_liber_audio_audio_control_microphone_volume", "liber_channel_impl_liber_audio_audio_control_microphone_volume");
+forward!("liber_channel_liber_audio_audio_control_set_microphone_volume", "liber_channel_impl_liber_audio_audio_control_set_microphone_volume");

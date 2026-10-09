@@ -31,6 +31,13 @@ fail() {
 	exit 1
 }
 
+no_dos="${BRIGHTNESS_NO_DOS:-0}"
+if [[ "${1:-}" == --no-dos ]]; then
+	no_dos=1
+	shift
+fi
+[[ $# == 0 ]] || fail "usage: check-brightness-acpi.sh [--no-dos]"
+[[ "$no_dos" == 0 || "$no_dos" == 1 ]] || fail "BRIGHTNESS_NO_DOS must be 0 or 1"
 command -v python3 >/dev/null || fail "python3 is not installed, and the lab is written in it"
 [[ ! -S .build/boot/lab-ctl.sock ]] || fail "an ad-hoc lab guest is up (.build/boot/lab-ctl.sock) - take it down with ./lab.sh quit first"
 
@@ -43,7 +50,7 @@ s = socket.socket()
 s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])')"
 export HOSTFWD_PORT
-kept="$(pwd)/.build/logs/brightness-acpi"
+kept="$(pwd)/.build/logs/brightness-acpi$([[ "$no_dos" == 1 ]] && echo '-no-dos' || true)"
 rm -rf "$kept"
 mkdir -p "$kept"
 backend_pid=""
@@ -133,7 +140,9 @@ notify() {
 }
 
 # THE FIXTURE, ITS BACKEND AND THE KEYPAD.
-python3 src/harness/acpi-fixture.py --out "$fixture/fixture.aml" --memory "$fixture/ivshmem.bin" --brightness
+fixture_args=(--brightness)
+[[ "$no_dos" == 0 ]] || fixture_args+=(--brightness-no-dos)
+python3 src/harness/acpi-fixture.py --out "$fixture/fixture.aml" --memory "$fixture/ivshmem.bin" "${fixture_args[@]}"
 python3 src/harness/vhost-i2c-gpio.py --i2c "$fixture/i2c.sock" --gpio "$fixture/gpio.sock" --control "$fixture/control.sock" --ready "$fixture/ready" >"$fixture/backend.log" 2>&1 &
 backend_pid="$!"
 for _ in $(seq 1 100); do
@@ -169,8 +178,16 @@ await_line "AcpiService: online - instance 1" "the ACPI service never came onlin
 probe "brightcheck: idle off" "the idle timeout must go off first" idle-off
 probe "brightcheck: active backlight acpi:.*LCD0 kind=Firmware output=0 reason=firmware-adapter standing=active" "the panel must join output 0 by its adapter" wait 60
 probe "brightcheck: output 0 source boot-framebuffer decoder 00:01.0" "output 0 must be the boot framebuffer, decoded by q35's VGA function" outputs
-[[ "$(region dos)" == "4" ]] || fail "_DOS saw $(region dos), not 0x04"
-echo "brightness-acpi: the adapter's _DOS saw 0x04 ($(region dos_calls) call(s))"
+check_dos() {
+	if [[ "$no_dos" == 1 ]]; then
+		[[ "$(region dos)" == 0 && "$(region dos_calls)" == 0 ]] || fail "the adapter without _DOS changed the _DOS record"
+		grep -aq "the adapter has no _DOS - the step is skipped" "$(serial_log)" || fail "the driver did not diagnose the absent _DOS"
+	else
+		[[ "$(region dos)" == 4 ]] || fail "_DOS saw $(region dos), not 0x04"
+	fi
+}
+check_dos
+echo "brightness-acpi: adapter bound (no-_DOS=$no_dos, _DOS calls=$(region dos_calls))"
 await_level 70 "the panel starts at the firmware's AC default"
 
 # A SET, AND THE FIRMWARE'S HOTKEYS: one step each, 0x88 to the floor, 0x89 nothing.
@@ -233,7 +250,7 @@ if ! ./dev.sh reboot --timeout 400 >"$state/reboot.log" 2>&1; then
 	fail "the second boot did not come up (see $kept/reboot.log)"
 fi
 await_line "BrightnessPolicy: online" "the brightness policy never came online on the second boot" "$online" 180
-[[ "$(region dos)" == "4" ]] || fail "_DOS was not evaluated again on the second boot"
+check_dos
 await_level 60 "the stored level was restored on the second boot" 60
 probe "brightcheck: settings automatic=false idle=off" "the settings must still be the first boot's" settings
 
@@ -318,6 +335,9 @@ await_state running 30 "S3 after system_wakeup"
 await_line "ServiceManager: sleep: the transaction ended" "the S3 cycle never ended" "$ended" 180
 answered "S3" "$bs" "$br" "$ss" "$sr"
 await_level 60 "the level set before the sleep is back after S3"
-[[ "$(region dos)" == "4" && "$(region dos_calls)" -gt "$dos_calls" ]] || fail "_DOS was not evaluated with 0x04 again at the resume"
-echo "brightness-acpi: S3 answered by both drivers; _DOS saw 0x04 again and the level set before the sleep is back"
+check_dos
+if [[ "$no_dos" == 0 ]]; then
+	[[ "$(region dos_calls)" -gt "$dos_calls" ]] || fail "_DOS was not evaluated with 0x04 again at the resume"
+fi
+echo "brightness-acpi: S3 answered by both drivers; adapter no-_DOS=$no_dos and the level set before the sleep is back"
 echo "brightness-acpi: PASS"

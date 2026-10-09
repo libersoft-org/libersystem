@@ -40,6 +40,7 @@ fn partial(frame: &crate::harness::Frame) -> u32 {
 	count
 }
 
+// @covers: Msaa1x
 pub fn msaa_1x() -> Outcome {
 	// ONE SAMPLE IS THE ABSENCE OF MULTISAMPLING and not a special case of it: every pixel is either
 	// the primitive's colour or the clear, and nothing is in between.
@@ -49,6 +50,7 @@ pub fn msaa_1x() -> Outcome {
 	Ok(())
 }
 
+// @covers: Msaa2x
 pub fn msaa_2x() -> Outcome {
 	// TWO SAMPLES MAKE ONE INTERMEDIATE VALUE POSSIBLE, which is what an edge pixel takes: half the
 	// samples covered is half the colour.
@@ -64,6 +66,7 @@ pub fn msaa_2x() -> Outcome {
 	Ok(())
 }
 
+// @covers: Msaa4x
 pub fn msaa_4x() -> Outcome {
 	// AND FOUR SAMPLES MAKE THREE, which is what distinguishes a four-sample implementation from a
 	// two-sample one dressed up: a quarter and three quarters are values two samples cannot produce.
@@ -82,6 +85,7 @@ pub fn msaa_4x() -> Outcome {
 	Ok(())
 }
 
+// @covers: SampleMask
 pub fn sample_mask() -> Outcome {
 	// THE SAMPLE MASK REMOVES SAMPLES AFTER COVERAGE AND BEFORE THE WRITE. A fully covered pixel
 	// under a mask of one sample in four resolves to a quarter of the colour, which no coverage
@@ -101,6 +105,7 @@ pub fn sample_mask() -> Outcome {
 	Ok(())
 }
 
+// @covers: AlphaToCoverage
 pub fn alpha_to_coverage() -> Outcome {
 	// ALPHA BECOMES COVERAGE, which is what makes a cut-out leaf antialias without a sorted pass: a
 	// fragment at half alpha covers half the samples of a pixel it fully covers. A backend that
@@ -123,6 +128,7 @@ pub fn alpha_to_coverage() -> Outcome {
 	Ok(())
 }
 
+// @covers: MsaaResolve
 pub fn msaa_resolve() -> Outcome {
 	// A RESOLVE IS THE AVERAGE OF THE SAMPLES AND NOT THE FIRST OF THEM, which is the whole
 	// difference between a multisampled attachment and a bigger one. `Colour::resolve` is what a

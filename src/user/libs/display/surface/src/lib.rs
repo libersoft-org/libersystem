@@ -18,7 +18,7 @@ extern crate alloc;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use display_proto::codec::Handles;
 pub use display_proto::generated::liber::display::v1::{AcquiredImage, SurfaceConfiguration, SurfaceEvent};
 use display_proto::generated::liber::display::v1::{DamageRegion, ImageLimits, PresentQueue, SurfaceRequest, display, surface as wire};
@@ -112,6 +112,7 @@ impl Drop for Mapping {
 /// One surface: its configuration, its queue, and the images mapped for the current generation.
 pub struct Surface {
 	client: RefCell<wire::Client<ChannelTransport>>,
+	frame_correlation: Cell<u32>,
 	channel: u64,
 	configuration: SurfaceConfiguration,
 	/// The serial this client has ACKNOWLEDGED. A present names it, and a present that named an
@@ -134,7 +135,7 @@ impl Surface {
 			Ok(channel) => channel,
 			Err(error) => return Some(Err(error)),
 		};
-		let mut surface = Surface { client: RefCell::new(wire::Client::new(ChannelTransport { chan: channel })), channel, configuration: SurfaceConfiguration { serial: 0, generation: 0, logical_extent: Extent2d { width: 0, height: 0 }, physical_extent: Extent2d { width: 0, height: 0 }, scale: display_proto::generated::liber::display::v1::ScaleRatio { numerator: 1, denominator: 1 }, transform: display_proto::generated::liber::display::v1::OutputTransform::Normal, output: 0, format: display_proto::generated::liber::graphics::v1::PixelFormat::B8g8r8x8Unorm, colour: display_proto::generated::liber::display::v1::OutputColour { space: display_proto::generated::liber::graphics::v1::ColorSpace::Srgb, sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None }, subpixel: display_proto::generated::liber::display::v1::SubpixelLayout::Unknown, visible: false, focused: false }, acknowledged: u64::MAX, images: Vec::new(), generation: u64::MAX, pitch: 0, producer: 0, done: 0 };
+		let mut surface = Surface { frame_correlation: Cell::new(0), client: RefCell::new(wire::Client::new(ChannelTransport { chan: channel })), channel, configuration: SurfaceConfiguration { serial: 0, generation: 0, logical_extent: Extent2d { width: 0, height: 0 }, physical_extent: Extent2d { width: 0, height: 0 }, scale: display_proto::generated::liber::display::v1::ScaleRatio { numerator: 1, denominator: 1 }, transform: display_proto::generated::liber::display::v1::OutputTransform::Normal, output: 0, format: display_proto::generated::liber::graphics::v1::PixelFormat::B8g8r8x8Unorm, colour: display_proto::generated::liber::display::v1::OutputColour { space: display_proto::generated::liber::graphics::v1::ColorSpace::Srgb, sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None }, subpixel: display_proto::generated::liber::display::v1::SubpixelLayout::Unknown, visible: false, focused: false }, acknowledged: u64::MAX, images: Vec::new(), generation: u64::MAX, pitch: 0, producer: 0, done: 0 };
 		if let Err(error) = surface.rebuild()? {
 			return Some(Err(error));
 		}
@@ -261,7 +262,7 @@ impl Surface {
 
 	/// Take the next image WITHOUT BLOCKING.
 	pub fn acquire(&self) -> Option<Result<AcquiredImage, Error>> {
-		self.client.borrow_mut().acquire_next()
+		self.frame_call(wire::OP_ACQUIRE_NEXT, |_| Some(()), AcquiredImage::read)
 	}
 
 	/// Give an acquired image back without presenting it.
@@ -282,7 +283,50 @@ impl Surface {
 	/// extent - a rectangle can be wrong by a pixel and a variant cannot, and the first present of a
 	/// generation must be this one.
 	pub fn present_whole(&self, image: u32) -> Option<Result<u64, Error>> {
-		self.present(image, DamageRegion { whole: true, rects: Vec::new() })
+		self.frame_call(
+			wire::OP_PRESENT,
+			|writer| {
+				use display_proto::codec::Sink;
+				writer.u32(image)?;
+				writer.u64(self.acknowledged)?;
+				writer.u64(self.generation)?;
+				DamageRegion { whole: true, rects: Vec::new() }.write(writer)
+			},
+			|reader| reader.u64(),
+		)
+	}
+
+	/// These two fixed-size calls are the steady-state frame path. Use the shared wire writers and
+	/// generated value codecs with stack storage so presenting a frame does not allocate RPC buffers.
+	/// The ordinary generated client remains responsible for setup and variable-sized damage.
+	fn frame_call<T>(&self, operation: u16, parameters: impl FnOnce(&mut display_proto::codec::SliceWriter<'_>) -> Option<()>, value: impl FnOnce(&mut display_proto::codec::Reader<'_>) -> Option<T>) -> Option<Result<T, Error>> {
+		use display_proto::codec::{Reader, Sink, SliceWriter};
+		let correlation = self.frame_correlation.get();
+		self.frame_correlation.set(correlation.wrapping_add(1));
+		let mut request = [0u8; 64];
+		let mut writer = SliceWriter::new(&mut request);
+		writer.u16(operation)?;
+		writer.u32(correlation)?;
+		parameters(&mut writer)?;
+		let length = writer.finish()?;
+		if !rt::send_caps_blocking(self.channel, &request[..length], &[]) {
+			return Some(Err(Error::Again));
+		}
+		let mut reply = [0u8; 64];
+		let rt::ReceivedCaps::Message { len, handles } = rt::recv_caps_blocking(self.channel, &mut reply) else { return Some(Err(Error::CommitUncertain)) };
+		if !handles.is_empty() {
+			for handle in handles.as_slice() {
+				close(*handle);
+			}
+			return None;
+		}
+		let mut reader = Reader::new(reply.get(..len)?);
+		if reader.u32() != Some(correlation) {
+			return None;
+		}
+		let result = if reader.tag()? { Ok(value(&mut reader)?) } else { Err(Error::read(&mut reader)?) };
+		reader.finish()?;
+		Some(result)
 	}
 
 	/// Present a bounded list of damaged rectangles.

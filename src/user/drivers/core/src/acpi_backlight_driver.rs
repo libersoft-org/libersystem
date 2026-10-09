@@ -197,6 +197,14 @@ impl Panel {
 }
 
 impl backlight::Service for Panel {
+	fn firmware_display_id(&mut self) -> Result<Option<u32>, Error> {
+		match self.evaluate("_ADR", &[]) {
+			Ok(Some(Value::Integer(value))) => Ok(u32::try_from(value).ok()),
+			Ok(None) => Ok(None),
+			_ => Err(Error::Unsupported),
+		}
+	}
+
 	fn describe(&mut self) -> Result<BacklightDescription, Error> {
 		Ok(BacklightDescription { source: BacklightSource::Firmware, key: self.name.clone(), scale: BacklightScale::Levels(self.levels.levels.clone()), ac_default: self.levels.ac_default, battery_default: self.levels.battery_default, target: self.target.clone() })
 	}

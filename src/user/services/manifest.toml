@@ -1145,6 +1145,8 @@ providers = [
 	"render-math",
 	"render-shader",
 	"render2d",
+	"render3d",
+	"scene3d",
 	"soft2d",
 	"soft3d",
 	"surface",
@@ -1690,6 +1692,16 @@ development = true
 # the fixture's control endpoint; `camhold` is the second capture client busy refusal, an inherited endpoint
 # and a kept buffer need; `camread` holds inventory alone; `camfail`'s launch fails after its capture grant
 # was minted, and it never runs.
+[[programs]]
+name = "uvccheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/uvccheck.lsexe"
+providers = []
+development = true
+
 [[programs]]
 name = "camcheck"
 owner = "services"
@@ -4738,7 +4750,7 @@ kind = "factory"
 provider = "device_manager"
 source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
-kinds = ["display", "backlight"]
+kinds = ["display"]
 presence = "optional"
 
 
@@ -4801,6 +4813,16 @@ provider = "input_service"
 source = "SYSKEYS"
 interface = "liber:input@1/system-keys"
 exclusive = true
+presence = "optional"
+
+# Backlight admission is asynchronous; its replies need a distinct connection from synchronous display adoption.
+[[services.roles]]
+tag = "BRIGHTCAT"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["backlight"]
 presence = "optional"
 
 [[services]]
@@ -7444,7 +7466,7 @@ name = "scene3d"
 owner = "scene3d"
 destination = "lib/graphics/scene3d.lslib"
 features = []
-providers = ["render-math", "render3d", "lsrt"]
+providers = ["render-math", "render-shader", "render3d", "lsrt"]
 
 [[libraries]]
 name = "render3d-conformance"

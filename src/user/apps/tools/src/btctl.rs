@@ -40,11 +40,11 @@ const PAIR_SECONDS: u64 = 65;
 const PAIRABLE_SECONDS: u64 = 120;
 const MAX_PAIRABLE_SECONDS: u64 = 600;
 
-const USAGE: &[u8] = b"usage: btctl [-c N] COMMAND
+const USAGE: &[u8] = b"usage: btctl [-c N] [-k public|random|bredr] COMMAND
   list                              devices on both radios: bonded, connected and found
   scan [SECONDS]                    inquiry and LE scan together
   pair ADDRESS [public|random|bredr]
-  pair-legacy ADDRESS               PIN pairing, for a device that cannot do better
+  pair-legacy ADDRESS [public|random|bredr]   legacy pairing, only when requested
   pairable [SECONDS]                answer incoming pairings from this terminal
   discoverable SECONDS|off          at most 180 seconds
   trust ADDRESS PROFILE             input, audio, voice, pan, spp or gatt
@@ -75,6 +75,7 @@ struct Tool {
 	read: u64,
 	operator: u64,
 	controller: u32,
+	kind: Option<PeerKind>,
 }
 
 #[unsafe(no_mangle)]
@@ -95,32 +96,45 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut args: Vec<&[u8]> = split_args(context.arguments.as_bytes()).collect();
 	// `-c N` names the controller; the first is the default.
 	let mut controller: u32 = 0;
-	if args.first() == Some(&&b"-c"[..]) {
-		match args.get(1).and_then(|text| parse_u64(text)).and_then(|at| u32::try_from(at).ok()) {
-			Some(at) => controller = at,
-			None => usage(),
+	let mut kind = None;
+	while matches!(args.first().copied(), Some(b"-c" | b"-k")) {
+		if args.first() == Some(&&b"-c"[..]) {
+			match args.get(1).and_then(|text| parse_u64(text)).and_then(|at| u32::try_from(at).ok()) {
+				Some(at) => controller = at,
+				None => usage(),
+			}
+		} else {
+			kind = Some(match args.get(1).copied() {
+				Some(b"public") => PeerKind::Public,
+				Some(b"random") => PeerKind::RandomStatic,
+				Some(b"bredr") => PeerKind::Bredr,
+				_ => usage(),
+			});
 		}
 		args.drain(..2);
 	}
-	let tool = Tool { read, operator, controller };
+	let tool = Tool { read, operator, controller, kind };
 	match (args.first().copied(), args.len()) {
 		(None, _) | (Some(b"list"), 1) => tool.list(),
 		(Some(b"scan"), 1) => tool.scan(SCAN_SECONDS),
 		(Some(b"scan"), 2) => tool.scan(parse_u64(args[1]).unwrap_or_else(|| usage())),
-		(Some(b"pair"), 2 | 3) => {
+		(Some(b"pair" | b"pair-legacy"), 2 | 3) => {
 			let bytes = parse_address(args[1]).unwrap_or_else(|| usage());
 			// THE KIND, IF GIVEN; otherwise each in turn. The service answers `not-found` for an identity its
 			// current scan did not report, so trying them all can only ever reach the one the radio heard.
 			let kinds: &[PeerKind] = match args.get(2).copied() {
+				None if kind == Some(PeerKind::Public) => &[PeerKind::Public],
+				None if kind == Some(PeerKind::RandomStatic) => &[PeerKind::RandomStatic, PeerKind::Resolvable],
+				None if kind == Some(PeerKind::Bredr) => &[PeerKind::Bredr],
+				None if args[0] == b"pair-legacy" => &[PeerKind::Bredr],
 				None => &[PeerKind::Bredr, PeerKind::Public, PeerKind::RandomStatic, PeerKind::Resolvable],
 				Some(b"public") => &[PeerKind::Public],
 				Some(b"random") => &[PeerKind::RandomStatic, PeerKind::Resolvable],
 				Some(b"bredr") => &[PeerKind::Bredr],
 				Some(_) => usage(),
 			};
-			tool.pair(bytes, kinds, false);
+			tool.pair(bytes, kinds, args[0] == b"pair-legacy");
 		}
-		(Some(b"pair-legacy"), 2) => tool.pair(parse_address(args[1]).unwrap_or_else(|| usage()), &[PeerKind::Bredr], true),
 		(Some(b"pairable"), 1) => tool.pairable(PAIRABLE_SECONDS),
 		(Some(b"pairable"), 2) => tool.pairable(parse_u64(args[1]).unwrap_or_else(|| usage()).min(MAX_PAIRABLE_SECONDS)),
 		(Some(b"discoverable"), 2) => tool.discoverable(if args[1] == b"off" { 0 } else { parse_u64(args[1]).unwrap_or_else(|| usage()) }),
@@ -360,7 +374,7 @@ impl Tool {
 	fn known(&self, text: &[u8]) -> Option<PeerAddress> {
 		let Some(bytes) = parse_address(text) else { usage() };
 		match self.operator().devices(self.controller) {
-			Some(Ok(devices)) => match devices.into_iter().find(|device| device.address.bytes == bytes) {
+			Some(Ok(devices)) => match devices.into_iter().find(|device| device.address.bytes == bytes && self.kind.is_none_or(|kind| device.address.kind == kind || (kind == PeerKind::RandomStatic && device.address.kind == PeerKind::Resolvable))) {
 				Some(device) => Some(device.address),
 				None => {
 					print(b"btctl: this controller knows nothing with that address\n");
@@ -425,12 +439,12 @@ impl Tool {
 		loop {
 			match client.progress(self.controller) {
 				Some(Ok(progress)) if progress.state == PairingState::Bonded => {
-					let bonded = client.bonded(self.controller).and_then(Result::ok).and_then(|peers| peers.into_iter().find(|bonded| bonded.address == peer));
+					let bonded = client.bonded(self.controller).and_then(Result::ok).and_then(|peers| peers.into_iter().find(|bonded| bonded.address == progress.address));
 					match bonded {
 						Some(bonded) => print(format!("bonded: {}\n", level(&bonded.level)).as_bytes()),
 						None => print(b"bonded\n"),
 					}
-					print(format!("to trust it for a profile: btctl trust {} PROFILE\n", hex(&peer.bytes)).as_bytes());
+					print(format!("to trust it for a profile: btctl trust {} PROFILE\n", hex(&progress.address.bytes)).as_bytes());
 					break;
 				}
 				Some(Ok(progress)) if progress.state == PairingState::Failed => {

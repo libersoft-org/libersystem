@@ -92,6 +92,15 @@ pub struct Submission {
 }
 
 impl Submission {
+	/// A backend that actually finished while borrowing its resources needs no retained-ID allocation.
+	/// Pending submissions must use their own retained ownership instead of this terminal constructor.
+	pub fn terminal(serial: u64, source: u32, status: Status) -> Result<Self, Error> {
+		if !status.terminal() {
+			return Err(Error::InvalidRenderState { reason: "a synchronous submission cannot return pending without retaining its resources" });
+		}
+		Ok(Self { completion: Completion { serial, source }, status, retained: Vec::new() })
+	}
+
 	pub fn retained(&self) -> &[u32] {
 		&self.retained
 	}
@@ -113,6 +122,30 @@ pub struct ReadbackTicket {
 	pub status: Status,
 	/// Where the bytes land. The caller's own identifier for a readback buffer.
 	pub destination: u32,
+}
+
+/// A resolved pixel, with its actual type preserved through readback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReadbackValue {
+	Identity(u32),
+	Depth(f32),
+	Colour(render_math::Vec4),
+}
+
+/// One completed readback and its shared submission ticket. Consuming it consumes the completion token.
+pub struct ReadbackResult {
+	pub ticket: ReadbackTicket,
+	pub value: Option<ReadbackValue>,
+}
+
+impl ReadbackResult {
+	pub fn finish(self) -> Result<ReadbackValue, Error> {
+		match self.ticket.completion.wait(self.ticket.status)? {
+			Status::Complete => self.value.ok_or(Error::InvalidRenderState { reason: "a completed readback has no value" }),
+			Status::Failed(error) => Err(error),
+			_ => Err(Error::InvalidRenderState { reason: "a cancelled or lost readback has no readable value" }),
+		}
+	}
 }
 
 /// The queue: bounded, ordered, and the owner of every submission's retained set.

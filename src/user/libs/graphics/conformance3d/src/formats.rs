@@ -65,6 +65,7 @@ fn admitted(format: PixelFormat, bytes_per_texel: u32, name: &str, filtered: boo
 	Ok(())
 }
 
+// @covers: FormatR8
 pub fn format_r8() -> Outcome {
 	let row = declared("R8", 8)?;
 	require!(row.filterable && row.blendable && row.msaa, "R8 is filterable, blendable and multisampled");
@@ -72,6 +73,7 @@ pub fn format_r8() -> Outcome {
 	admitted(PixelFormat::R8Unorm, 1, "R8", true, AlphaMode::Opaque)
 }
 
+// @covers: FormatRG8
 pub fn format_rg8() -> Outcome {
 	let row = declared("RG8", 16)?;
 	require!(row.filterable && row.blendable, "RG8 is filterable and blendable");
@@ -79,6 +81,7 @@ pub fn format_rg8() -> Outcome {
 	admitted(PixelFormat::R8G8Unorm, 2, "RG8", true, AlphaMode::Opaque)
 }
 
+// @covers: FormatRGBA8
 pub fn format_rgba8() -> Outcome {
 	// AND IT IS NOT sRGB-ENCODED, which the profile says in the format's own full name: the encoding
 	// is `ColorSpace`'s and is never a second storage format. A backend that carried an `RGBA8_SRGB`
@@ -89,6 +92,7 @@ pub fn format_rgba8() -> Outcome {
 	admitted(PixelFormat::R8G8B8A8Unorm, 4, "RGBA8", true, AlphaMode::Straight)
 }
 
+// @covers: FormatRGB10A2
 pub fn format_rgb10a2() -> Outcome {
 	// TEN BITS A CHANNEL IN THIRTY-TWO, which is what makes it worth having: the same texel size as
 	// `RGBA8` and four times the tonal resolution, at two bits of alpha.
@@ -98,6 +102,7 @@ pub fn format_rgb10a2() -> Outcome {
 	Ok(())
 }
 
+// @covers: FormatRGBA16F
 pub fn format_rgba16f() -> Outcome {
 	// A HALF-FLOAT FORMAT IS FILTERABLE AND BLENDABLE, which is what makes it the one an HDR pass
 	// uses: full float is neither.
@@ -106,6 +111,7 @@ pub fn format_rgba16f() -> Outcome {
 	admitted(PixelFormat::R16G16B16A16Float, 8, "RGBA16F", true, AlphaMode::Straight)
 }
 
+// @covers: FormatRGBA32F
 pub fn format_rgba32f() -> Outcome {
 	// THREE FALSE CELLS, EACH WITH A REASON, and this is the scene that holds them to it. A filtered
 	// fetch of 128 bits is four lerps a tap and eight taps for trilinear; a blend is a
@@ -126,6 +132,7 @@ pub fn format_rgba32f() -> Outcome {
 	Ok(())
 }
 
+// @covers: FormatR32Uint
 pub fn format_r32_uint() -> Outcome {
 	// AN INTEGER FORMAT IS NOT FILTERABLE OR BLENDABLE, and the reason is not performance: there is
 	// no correct answer to what the average of two object ids is, and blending them produces an id

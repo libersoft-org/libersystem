@@ -21,12 +21,16 @@ SCRIPT_NAME=check-qemu-3d-demo.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../lib.sh"
 
 FRAMES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/3d-demo-frames.XXXXXX")"
+mkdir -p "$REPO_ROOT/.build/logs"
+PROOF_DIR="$(mktemp -d "$REPO_ROOT/.build/logs/qemu-3d-demo.XXXXXX")"
 BOOTED=0
 cleanup() {
 	if ((BOOTED)); then
 		"$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true
 	fi
+	cp -a "$FRAMES_DIR/." "$PROOF_DIR/"
 	rm -rf "$FRAMES_DIR"
+	note "3D frame and performance proof: $PROOF_DIR"
 }
 trap cleanup EXIT
 
@@ -45,11 +49,10 @@ if ! "$REPO_ROOT/lab.sh" sh uname >/dev/null 2>&1; then
 	BOOTED=1
 fi
 
-# THE SCENE RENDERS SMALLER THAN THE WINDOW IT IS SHOWN IN, and that is the gate's own choice rather
-# than the demo's default: this is a CPU rasteriser, every fragment is a shader run, and a frame at
-# the full screen takes seconds. `--scene-width/--scene-height` is the control the demo provides for
-# exactly this, and what it changes is how many fragments are shaded - not what is drawn.
+# The visual fixtures use a fixed 320x240 scene; the performance runs below use all three
+# required physical render sizes without scaling the scene down.
 SCENE="--scene-width 320 --scene-height 240"
+VISUAL_RUN=0
 
 # Run the demo in the background and wait until the screen is its. WAITED FOR RATHER THAN SLEPT
 # THROUGH: a capture taken before the first present shows the CONSOLE, which is not a blank screen -
@@ -62,7 +65,10 @@ SCENE="--scene-width 320 --scene-height 240"
 # the last check reads.
 start_demo() {
 	local arguments="$1"
-	"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw $SCENE $arguments" >"$FRAMES_DIR/demo.log" 2>&1 &
+	VISUAL_RUN=$((VISUAL_RUN + 1))
+	DEMO_LOG="$FRAMES_DIR/demo-$VISUAL_RUN.log"
+	printf 'test3d-sw %s %s\n' "$SCENE" "$arguments" >"$DEMO_LOG"
+	"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw $SCENE $arguments" >>"$DEMO_LOG" 2>&1 &
 	DEMO_PID=$!
 	local ready=0
 	for _ in $(seq 1 90); do
@@ -72,13 +78,13 @@ start_demo() {
 		fi
 		sleep 2
 	done
-	((ready == 1)) || die "the demo never reached the screen: its output so far was $(tail -n 3 "$FRAMES_DIR/demo.log" 2>/dev/null)"
+	((ready == 1)) || die "the demo never reached the screen: its output so far was $(tail -n 3 "$DEMO_LOG" 2>/dev/null)"
 }
 
 finish_demo() {
 	"$REPO_ROOT/lab.sh" key q >/dev/null 2>&1 || die "the quit key was not delivered"
 	wait "$DEMO_PID" 2>/dev/null || true
-	grep -q "test3d-sw: presented" "$FRAMES_DIR/demo.log" || die "the demo did not run to completion; its output was: $(tail -n 3 "$FRAMES_DIR/demo.log")"
+	grep -q "test3d-sw: presented" "$DEMO_LOG" || die "the demo did not run to completion; its output was: $(tail -n 3 "$DEMO_LOG")"
 }
 
 # 1. THE LIVE RUN: three timed frames, and the first thing asked of them is that they DIFFER. One
@@ -128,3 +134,81 @@ done
 python3 "$CHECK" --console "$FRAMES_DIR/after.ppm" || die "the console was not restored after the demo left"
 
 note "live frames prove animation, a bounded central object, a repeating ground texture, a blended panel, the 2D overlay in the same frame, two stated poses, two aspect ratios and a restored console"
+
+# Full-size release measurements. The first five presents warm the frame path; thirty subsequent
+# intervals include pacing, acquire, rendering, HUD, present and worker-thread allocation activity.
+{
+	date -u +%Y-%m-%dT%H:%M:%SZ
+	qemu-system-x86_64 --version | head -n 1
+	LC_ALL=C lscpu
+	"$REPO_ROOT/lab.sh" monitor "info kvm"
+	"$REPO_ROOT/lab.sh" monitor "info cpus"
+	python3 - "$REPO_ROOT" <<'ENVIRONMENT'
+import hashlib,json,os,pathlib,re,shlex,sys
+root=pathlib.Path(sys.argv[1])
+state=pathlib.Path(os.environ.get("LIBER_DEV_STATE") or root/".build/boot")
+try:
+    pgid=int((state/"lab-guest.pgid").read_text().strip())
+except (OSError,ValueError):
+    pgid=int(json.loads((state/"dev-instance.lock").read_text())["pgid"])
+found=False
+for process in pathlib.Path("/proc").iterdir():
+    if not process.name.isdecimal(): continue
+    try:
+        if os.getpgid(int(process.name))!=pgid: continue
+        args=[arg.decode() for arg in (process/"cmdline").read_bytes().split(b"\0") if arg]
+    except (OSError,UnicodeError):
+        continue
+    if args and pathlib.Path(args[0]).name.startswith("qemu-system-"):
+        print("guest-command="+shlex.join(args))
+        found=True
+assert found, "cannot identify the live lab guest's QEMU command"
+artifact=root/".build/image/x86_64-unknown-none/bin/test3d-sw"
+data=artifact.read_bytes()
+print("staged-demo-sha256="+hashlib.sha256(data).hexdigest())
+for key in ("target","profile","rustc-commit","rustflags","features"):
+    value=re.search(rb"(?:^|\n)"+key.encode()+rb"=([^\n\0]+)",data)
+    assert value, "missing built artifact identity field: "+key
+    print(key+"="+value.group(1).decode())
+print("frame-clock=rt::clock_ns / SYS_CLOCK_MONO_NS (guest calibrated monotonic nanoseconds)")
+print("measurement=5 warmup presents, 30 complete frame intervals; animated scene; fixed physical/render extent")
+ENVIRONMENT
+} >"$FRAMES_DIR/environment.log" 2>&1
+failed=0
+for phase in core extended; do
+	repeat=0
+	row=0
+	for size in "320 240" "800 600" "640 480" "640 480" "640 480"; do
+		read -r width height <<<"$size"
+		row=$((row + 1))
+		if [[ "$width" == 640 ]]; then repeat=$((repeat + 1)); fi
+		[[ "$phase" == extended && "$width" == 640 && "$repeat" -gt 1 ]] && continue
+		extra=""
+		[[ "$phase" == extended ]] && extra="--postprocess"
+		log="$FRAMES_DIR/perf-$phase-${width}x${height}-$row.log"
+		"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw --no-input --report --frames 35 --width $width --height $height --scene-width $width --scene-height $height $extra" >"$log" 2>&1 || failed=1
+		cat "$log"
+		if python3 - "$log" "$phase" "$width" "$height" <<'PERF'; then :; else failed=1; fi
+import pathlib,re,sys
+path,phase,width,height=sys.argv[1:]
+text=pathlib.Path(path).read_text()
+assert "test3d-sw: presented 35 frame(s)" in text, "all requested frames must finish"
+assert "allocation counter observes shared-library preparation" in text, "the actual allocator counter must observe library allocations"
+match=re.search(r"steady samples (\d+) median_us (\d+) p99_us (\d+) render_alloc_max (\d+) loop_alloc_max (\d+)",text)
+assert match, "missing steady-state timing/allocation report"
+samples,median,p99,render_alloc,loop_alloc=map(int,match.groups())
+assert samples==30 and render_alloc==0 and loop_alloc==0, "steady-state frames must allocate nothing"
+assert "test3d-sw: colour " in text and "test3d-sw: present " in text and "heap live_bytes " in text and "scene prepared bytes " in text and "present_max_us " in text, "memory and present stages must be reported"
+if phase=="core" and width=="640" and height=="480":
+    elapsed=re.search(r"steady elapsed_ns (\d+) max_us (\d+)",text)
+    assert elapsed, "missing complete frame-window elapsed time"
+    elapsed_ns,maximum=map(int,elapsed.groups())
+    assert median<=33333 and elapsed_ns<=samples*1_000_000_000//30, f"stable 30 FPS floor missed: median={median}us, window={elapsed_ns}ns, p99/max={p99}/{maximum}us"
+if phase=="extended":
+    assert "HDR chain executed six downsamples, five upsamples and resolve" in text
+    assert "test3d-sw: postprocess " in text and "test3d-sw: shadow " in text and "HDR prepared bytes " in text
+PERF
+	done
+done
+((failed == 0)) || die "3D performance/allocation criteria failed; proof retained in $PROOF_DIR"
+note "all three core/Extended sizes measured, 640x480 core stable 30 FPS across three windows and steady-state zero allocations passed"

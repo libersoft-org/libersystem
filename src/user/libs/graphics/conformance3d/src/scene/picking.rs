@@ -13,7 +13,7 @@ use crate::Outcome;
 use crate::harness::close;
 use crate::scene::{material, world};
 use render_math::{Vec3, Viewport};
-use scene3d::{Aabb, Blending, Drawable, MaterialKind, Node, Pending, Ray, Readback, pick};
+use scene3d::{Aabb, Blending, Drawable, MaterialKind, Node, Ray, Readback, pick};
 
 fn unit() -> Aabb {
 	Aabb::new(Vec3::new(-0.5, -0.5, -0.5), Vec3::new(0.5, 0.5, 0.5))
@@ -136,6 +136,7 @@ pub fn transparent_writes_no_identity() -> Outcome {
 }
 
 pub fn identity_readback() -> Outcome {
+	crate::readback::readback_object_id()?;
 	// AN IDENTITY READBACK ANSWERS A DRAWABLE, and it is the ONLY readback that does. A depth value
 	// reinterpreted as an identity names whichever drawable happens to hold that number - an answer
 	// that is wrong and looks right, which is the worst kind there is.
@@ -157,6 +158,7 @@ pub fn identity_readback() -> Outcome {
 }
 
 pub fn depth_readback() -> Outcome {
+	crate::readback::readback_depth()?;
 	// A DEPTH READBACK ANSWERS WHERE, which a CAD viewport placing a cursor in the world needs and an
 	// editor selecting an object does not. It is a separate feature from the identity because it reads
 	// a DIFFERENT ATTACHMENT of the same pass - and one request type with a kind is what keeps the
@@ -186,6 +188,7 @@ pub fn depth_readback() -> Outcome {
 }
 
 pub fn colour_readback() -> Outcome {
+	crate::readback::readback_color()?;
 	// A COLOUR READBACK ANSWERS THE PIXEL, which a colour picker and a screenshot want. Three kinds
 	// and not one, because they read three different attachments - and a caller that had to use three
 	// mechanisms would have three completion rules to get right.
@@ -203,18 +206,9 @@ pub fn colour_readback() -> Outcome {
 	Ok(())
 }
 
+// @covers: AsynchronousReadback
 pub fn asynchronous_readback() -> Outcome {
-	// THE RESULT ARRIVES WITH THE FRAME'S COMPLETION AND NOT BEFORE. A synchronous pick stalls the
-	// whole pipeline for a cursor, so what a caller gets is a TICKET carrying the submission serial it
-	// will be answered by - and a software backend that could answer at once still hands one back,
-	// because the API shape must not change between backends.
-	let pending: Pending = pick::request(Readback::Identity, 1, 1, 8, 8, 0, 42)?;
-	require!(pending.serial == 42, "the ticket carries the submission it completes with: {}", pending.serial);
-	require!(!pending.is_answered_by(41), "a queue that has completed an earlier frame has not answered it");
-	require!(pending.is_answered_by(42), "the frame it was submitted with does");
-	require!(pending.is_answered_by(43), "and so does a later one, because serials increase and a later completion implies every earlier one");
-	require!(!pending.is_answered_by(0), "while nothing completed answers nothing");
-	Ok(())
+	crate::readback::completed_scene_pick()
 }
 
 pub fn pick_outside_attachment_refusal() -> Outcome {

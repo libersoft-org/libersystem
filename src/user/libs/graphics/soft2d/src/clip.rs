@@ -134,6 +134,7 @@ impl ClipStack {
 	/// THE PRODUCT AND NOT THE MINIMUM. Two antialiased edges crossing at a corner let through the
 	/// product of their coverages; taking the minimum makes the corner of a rounded clip inside
 	/// another rounded clip too dark, which is visible as a bright notch.
+	// @handles: ClipNested
 	pub fn coverage(&self, x: u32, y: u32) -> f32 {
 		let mut coverage = 1.0f32;
 		for level in &self.levels {

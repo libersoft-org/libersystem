@@ -5,6 +5,6 @@ What each implementation in this tree says about itself, measured against the pr
 implementation conforms when nothing backend-owned is missing: `Unsupported` for a profile
 feature is not a gap, it is a failure to conform.
 
-No implementation declares a handler yet, so there is nothing to report. This is the state
-the profile was written in, on purpose: the checklist above is what the first backend works
-through, and a checklist written after a backend is a description rather than a requirement.
+## `user/libs/graphics/soft3d`
+
+80 of 80 backend-owned features handled.

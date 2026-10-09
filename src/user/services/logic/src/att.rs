@@ -39,6 +39,9 @@ pub const MAX_DISCOVERED: usize = 32;
 pub const FIRST_HANDLE: u16 = 0x0001;
 pub const LAST_HANDLE: u16 = 0xffff;
 
+/// An application's bounded walk from a characteristic value to its own CCCD.
+pub mod subscription;
+
 /// The opcodes this subset speaks.
 pub mod op {
 	pub const ERROR_RESPONSE: u8 = 0x01;

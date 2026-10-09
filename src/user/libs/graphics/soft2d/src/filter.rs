@@ -41,6 +41,7 @@ use crate::target::Surface;
 /// the blur's twelve. The regions come from the profile's own bounds map (`FilterNode::required_input`),
 /// walked backwards from `wanted`, so a pixel inside `wanted` is the same number it was.
 #[allow(clippy::too_many_arguments)]
+// @handles: FilterDropShadow
 pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, wanted: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
 	results.clear();
 	let regions = regions(graph, bounds, wanted);
@@ -73,6 +74,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			FilterNode::Source => copy(source, &mut into, region),
 			// THE BACKDROP IS WHAT IS ALREADY THERE, read before the layer composites over it - which
 			// is what makes a frosted panel a blur of the scene rather than of itself.
+			// @handles: FilterBackdrop
 			FilterNode::Backdrop => copy_from(backdrop, &mut into, region),
 			FilterNode::Image(handle) => {
 				if let Some((view, _, table)) = images.lookup(handle.0)
@@ -85,6 +87,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterGaussianBlur
 			FilterNode::Blur { input: slot, .. } => {
 				// THE SEPARABLE BLUR NEEDS ONE MORE SURFACE, for what the horizontal pass wrote and
 				// the vertical pass reads. Borrowing it from the pool rather than from the stack is
@@ -133,6 +136,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterColorMatrix
 			FilterNode::ColorMatrix { input: slot, matrix } => {
 				if let Some(from) = input(*slot) {
 					for y in region.y..region.y.saturating_add(region.height) {
@@ -150,6 +154,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterComposite
 			FilterNode::Composite { source: source_slot, backdrop: backdrop_slot, operator } => {
 				if let (Some(over), Some(under)) = (input(*source_slot), input(*backdrop_slot)) {
 					for y in region.y..region.y.saturating_add(region.height) {
@@ -159,6 +164,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterBlend
 			FilterNode::Blend { source: source_slot, backdrop: backdrop_slot, mode } => {
 				if let (Some(over), Some(under)) = (input(*source_slot), input(*backdrop_slot)) {
 					for y in region.y..region.y.saturating_add(region.height) {
@@ -171,6 +177,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			// THE CONVOLUTION IS THREE BY THREE AND READS THROUGH THE SURFACE rather than through a
 			// span buffer: nine taps a pixel is not what the blur's row cache exists for, and a
 			// second buffered path would be a second place for the edge rule to be wrong.
+			// @handles: FilterConvolution
 			FilterNode::Convolution { input: slot, weights, divisor, bias } => {
 				if let Some(from) = input(*slot) {
 					// A DIVISOR OF ZERO IS THE SUM OF THE WEIGHTS, and a sum of zero is one - so an
@@ -198,16 +205,19 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterMorphologyDilate
 			FilterNode::MorphologyDilate { input: slot, x: radius_x, y: radius_y } => {
 				if let Some(from) = input(*slot) {
 					morphology(from, &mut into, region, *radius_x, *radius_y, true);
 				}
 			}
+			// @handles: FilterMorphologyErode
 			FilterNode::MorphologyErode { input: slot, x: radius_x, y: radius_y } => {
 				if let Some(from) = input(*slot) {
 					morphology(from, &mut into, region, *radius_x, *radius_y, false);
 				}
 			}
+			// @handles: FilterDisplacementMap
 			FilterNode::DisplacementMap { input: slot, map, scale, x_channel, y_channel } => {
 				if let (Some(from), Some(displacement)) = (input(*slot), input(*map)) {
 					for y in region.y..region.y.saturating_add(region.height) {
@@ -223,6 +233,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterCrop
 			FilterNode::Crop { input: slot, rect } => {
 				if let Some(from) = input(*slot) {
 					let keep = pixel_rect(*rect);
@@ -234,6 +245,7 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 					}
 				}
 			}
+			// @handles: FilterTile
 			FilterNode::Tile { input: slot, rect } => {
 				if let Some(from) = input(*slot) {
 					let keep = pixel_rect(*rect);
@@ -371,70 +383,61 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 	// surface would fetch one pixel at a time through a bounds check, a row lookup and a half-float
 	// decode - twenty-five times per pixel for a four-pixel blur.
 	if width > 0 && spans.filter_input.len() >= width {
-		let offset = reach(horizontal);
 		for y in top + pass_from as u32..top + pass_to as u32 {
 			from.read_span(left, y, &mut spans.filter_input[..width]);
-			// THE INTERIOR HAS NO EDGE TO TEST FOR, and it is nearly all of the row. Every tap of
-			// every pixel asked whether it had fallen off the source - two comparisons and a branch
-			// inside a loop that runs `2 * radius + 1` times per pixel, which for the blur in a real
-			// scene is sixty times. A pixel at least `offset` from either end cannot have a tap
-			// outside, so the question is answered once for the whole run rather than per tap.
-			//
-			// OUTSIDE THE SOURCE IS TRANSPARENT AND NOT THE EDGE PIXEL, which is what the edges below
-			// still evaluate. A blur that clamped its edge would smear the border of a layer outward,
-			// which is visible as a bright rim around every shadow.
-			//
-			// THE ORDER OF THE ADDITIONS IS UNCHANGED - tap zero to tap last, for every pixel - which
-			// is what makes this the same number and not merely a close one.
-			let interior = (offset.max(0) as usize).min(width)..width.saturating_sub(offset.max(0) as usize).max((offset.max(0) as usize).min(width));
-			for x in columns_from..columns_to {
-				let mut sum = Rgba::TRANSPARENT;
-				if interior.contains(&x) {
-					let base = x - offset.max(0) as usize;
-					for (index, weight) in horizontal.iter().enumerate() {
-						sum = sum.plus(spans.filter_input[base + index].scaled(*weight));
-					}
-				} else {
-					for (index, weight) in horizontal.iter().enumerate() {
-						let tap = x as i64 + index as i64 - offset;
-						if tap >= 0 && (tap as usize) < width {
-							sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
-						}
-					}
-				}
-				spans.filter_output[x] = sum;
-			}
+			blur_run(&spans.filter_input[..width], &mut spans.filter_output, columns_from..columns_to, horizontal);
 			horizontal_pass.write_span(region.x, y, &spans.filter_output[columns_from..columns_to]);
 		}
 	}
 	if height > 0 && spans.filter_input.len() >= height {
-		let offset = reach(vertical);
 		for x in region.x..region.x + region.width {
 			// THE COLUMN IS READ AND WRITTEN AS A RUN, which is what the first pass already did for
 			// its rows. Walking it with `get` and `set` recomputed the local coordinates, the bounds
 			// check and the byte offset for every pixel - twice, once each way - over the whole of
 			// the second pass of every blur in the frame.
 			horizontal_pass.read_column(x, top, &mut spans.filter_input[..height]);
-			// The same split as the first pass, for the same reason.
-			let interior = (offset.max(0) as usize).min(height)..height.saturating_sub(offset.max(0) as usize).max((offset.max(0) as usize).min(height));
-			for y in rows_from..rows_to {
-				let mut sum = Rgba::TRANSPARENT;
-				if interior.contains(&y) {
-					let base = y - offset.max(0) as usize;
-					for (index, weight) in vertical.iter().enumerate() {
-						sum = sum.plus(spans.filter_input[base + index].scaled(*weight));
-					}
-				} else {
-					for (index, weight) in vertical.iter().enumerate() {
-						let tap = y as i64 + index as i64 - offset;
-						if tap >= 0 && (tap as usize) < height {
-							sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
-						}
-					}
-				}
-				spans.filter_output[y] = sum;
-			}
+			blur_run(&spans.filter_input[..height], &mut spans.filter_output, rows_from..rows_to, vertical);
 			into.write_column(x, region.y, &spans.filter_output[rows_from..rows_to]);
+		}
+	}
+}
+
+// Eight independent output pixels keep eight Gaussian reductions in flight. Each reduction still
+// starts at transparent black and adds tap zero through the last tap, in that exact order.
+// Border pixels use their clipped contiguous tap window; absent taps remain transparent.
+fn blur_run(input: &[Rgba], output: &mut [Rgba], wanted: core::ops::Range<usize>, weights: &[f32]) {
+	let radius = (weights.len() - 1) / 2;
+	let right_reach = weights.len() - radius - 1;
+	let interior_end = input.len().saturating_sub(right_reach);
+	let mut at = wanted.start;
+	while at < wanted.end {
+		if at >= radius && at + 8 <= wanted.end && at + 8 <= interior_end {
+			let taps = &input[at - radius..at - radius + weights.len() + 7];
+			let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (Rgba::TRANSPARENT, Rgba::TRANSPARENT, Rgba::TRANSPARENT, Rgba::TRANSPARENT, Rgba::TRANSPARENT, Rgba::TRANSPARENT, Rgba::TRANSPARENT, Rgba::TRANSPARENT);
+			for (pixels, weight) in taps.windows(8).zip(weights) {
+				a = a.plus(pixels[0].scaled(*weight));
+				b = b.plus(pixels[1].scaled(*weight));
+				c = c.plus(pixels[2].scaled(*weight));
+				d = d.plus(pixels[3].scaled(*weight));
+				e = e.plus(pixels[4].scaled(*weight));
+				f = f.plus(pixels[5].scaled(*weight));
+				g = g.plus(pixels[6].scaled(*weight));
+				h = h.plus(pixels[7].scaled(*weight));
+			}
+			output[at..at + 8].copy_from_slice(&[a, b, c, d, e, f, g, h]);
+			at += 8;
+		} else {
+			let first_weight = radius.saturating_sub(at);
+			let first_pixel = at.saturating_sub(radius);
+			let count = (weights.len() - first_weight).min(input.len() - first_pixel);
+			let pixels = &input[first_pixel..first_pixel + count];
+			let weights = &weights[first_weight..first_weight + count];
+			let mut sum = Rgba::TRANSPARENT;
+			for (pixel, weight) in pixels.iter().zip(weights) {
+				sum = sum.plus(pixel.scaled(*weight));
+			}
+			output[at] = sum;
+			at += 1;
 		}
 	}
 }
@@ -573,3 +576,7 @@ fn wrap(value: i64, period: u32) -> u32 {
 	let period = period as i64;
 	(((value % period) + period) % period) as u32
 }
+
+#[cfg(test)]
+#[path = "filter/tests.rs"]
+mod tests;

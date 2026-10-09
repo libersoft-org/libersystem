@@ -44,6 +44,7 @@ pub struct Display {
 	// The last illuminance the sensor sent, so a stream opened between reports starts with it.
 	last: Option<u64>,
 	levels: u64,
+	level_seq: u32,
 	light: u64,
 	light_seq: u32,
 	buf: Vec<u8>,
@@ -89,9 +90,9 @@ pub unsafe fn probe(hc: &mut Xhci, mut dev: UsbDevice, interface: Interface) -> 
 		if !crate::admits(hc, ClassKind::Display, dev.class) {
 			return Err(dev);
 		}
-		// THE INTERRUPT PIPE ONLY FOR A SENSOR: a monitor's brightness is all control transfers.
+		// The interrupt pipe carries the sensor and changes made with the monitor's own buttons.
 		let mut input = None;
-		if map.is_light_sensor() {
+		if map.brightness_input.is_some() || map.illuminance.is_some_and(|field| field.kind == ReportKind::Input) {
 			let Some(pipe) = Pipe::new(dev.slot, dev.speed, &interface.interrupt_in) else {
 				print(b"driver.xhci: a monitor is on the bus and no pages were left for its sensor's pipe\n");
 				return Err(dev);
@@ -110,7 +111,7 @@ pub unsafe fn probe(hc: &mut Xhci, mut dev: UsbDevice, interface: Interface) -> 
 			Some(serial) if !serial.is_empty() => format!("usb:{:04x}:{:04x}:{serial}", dev.vendor, dev.product),
 			_ => format!("usb:{:04x}:{:04x}@port{}.{:x}", dev.vendor, dev.product, dev.port, dev.route),
 		};
-		let mut display = Display { dev, interface: interface.interface, input, table, map, key, monitor: None, last: None, levels: 0, light: 0, light_seq: 0, buf: alloc::vec![0u8; REQUEST_BYTES] };
+		let mut display = Display { dev, interface: interface.interface, input, table, map, key, monitor: None, last: None, levels: 0, level_seq: 0, light: 0, light_seq: 0, buf: alloc::vec![0u8; REQUEST_BYTES] };
 		// A SENSOR IS TOLD TO REPORT: all events, at full power - where it declares the two properties. A device reset
 		// clears them, and the enumeration that follows one comes back through this probe.
 		display.wake_sensor(hc, &mut none);
@@ -246,6 +247,21 @@ impl Display {
 		self.last
 	}
 
+	fn send_level(&mut self, level: u32) {
+		if self.levels == 0 {
+			return;
+		}
+		let mut frame = [0u8; 64];
+		let mut handles = wire::Handles::new();
+		let Some(len) = backlight::events_frame(self.level_seq, &BacklightEvent::Level(level), &mut frame, &mut handles) else { return };
+		if try_send(self.levels, &frame[..len], 0) {
+			self.level_seq = self.level_seq.wrapping_add(1);
+		} else {
+			close(self.levels);
+			self.levels = 0;
+		}
+	}
+
 	fn send_reading(&mut self, milli_lux: u64) {
 		if self.light == 0 {
 			return;
@@ -281,6 +297,10 @@ struct BacklightView<'a> {
 }
 
 impl backlight::Service for BacklightView<'_> {
+	fn firmware_display_id(&mut self) -> Result<Option<u32>, Error> {
+		Ok(None)
+	}
+
 	fn describe(&mut self) -> Result<BacklightDescription, Error> {
 		self.display.describe()
 	}
@@ -343,8 +363,7 @@ impl Module for Display {
 
 	// THE SENSOR'S PIPE STANDS FROM THE PUBLICATION ON: a reading the policy was not there for is still the last one.
 	fn start(&mut self, hc: &mut Xhci) {
-		let Some(field) = self.map.illuminance else { return };
-		let length = u32::from(self.report_bytes(field.kind, field.report_id));
+		let length = [self.map.illuminance, self.map.brightness_input].into_iter().flatten().filter(|field| field.kind == ReportKind::Input).map(|field| u32::from(self.report_bytes(field.kind, field.report_id))).max().unwrap_or(0);
 		if let Some(input) = self.input.as_mut() {
 			let length = length.max(input.mps.min(64));
 			input.post(hc, length);
@@ -363,12 +382,11 @@ impl Module for Display {
 			let mut view = BacklightView { display: self, hc, hids };
 			let Some((corr, _)) = backlight::events_open(&mut view, &request, &mut handles) else { return true };
 			let Some((producer, consumer)) = channel_with_depth(STREAM_DEPTH) else { return true };
-			// NOTHING ARRIVES ON IT UNASKED: a monitor's own buttons change no report the host is sent. It stands so
-			// the contract is the same as a firmware backlight's.
 			if self.levels != 0 {
 				close(self.levels);
 			}
 			self.levels = producer;
+			self.level_seq = 0;
 			send_caps_blocking(chan, &corr.to_le_bytes(), &[consumer]);
 			return true;
 		}
@@ -427,11 +445,18 @@ impl Module for Display {
 			let bytes = input.read(moved as usize);
 			let id = if self.table.uses_ids { bytes[0] } else { 0 };
 			if let (Some(field), Some(body)) = (self.map.illuminance, self.body_of(id, &bytes))
+				&& field.kind == ReportKind::Input
 				&& field.report_id == id
 				&& let Some(milli_lux) = hid_display::milli_lux(&field, &body)
 			{
 				self.last = Some(milli_lux);
 				self.send_reading(milli_lux);
+			}
+			if let (Some(field), Some(body)) = (self.map.brightness_input, self.body_of(id, &bytes))
+				&& field.report_id == id
+				&& let Some(level) = hid_display::level(&field, &body)
+			{
+				self.send_level(level);
 			}
 		} else if classes::stalled(code) {
 			let mut none = Hids::new();

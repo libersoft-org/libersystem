@@ -2286,7 +2286,7 @@ fn the_3d_profiles_conform_on_the_target() {
 	assert!(printed.iter().any(|line| line == "test3d-conformance: and carries Scene3D Extended Profile 1"), "and the run says so: {shown}");
 }
 
-tagged_test!(the_3d_demo_renders_a_lit_scene_and_survives_a_resize, [Display, Input, Process, Service, Image], id = "kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize", covers = ["bin.test3d-sw", "render3d", "soft3d", "render-shader", "render-math", "graphics-app", "surface"]);
+tagged_test!(the_3d_demo_renders_a_lit_scene_and_survives_a_resize, [Display, Input, Process, Service, Image], id = "kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize", covers = ["bin.test3d-sw", "scene3d", "render3d", "soft3d", "render-shader", "render-math", "graphics-app", "surface"]);
 fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -2356,9 +2356,12 @@ fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 	let mut presents_before_resize = 0usize;
 	let mut resized = false;
 	let mut asked_to_leave = false;
+	let mut closed = false;
 	for _ in 0..400_000u32 {
 		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
-		if host.poll() == Some(HostCall::Presented) {
+		let call = host.poll();
+		closed |= call == Some(HostCall::Closed);
+		if call == Some(HostCall::Presented) {
 			if first_frame.is_empty() {
 				first_frame = read_from_object(&host.image(0), (WIDTH * HEIGHT * 4) as usize);
 			} else if later_frame.is_empty() && host.presents >= 3 {
@@ -2412,6 +2415,7 @@ fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
 
 	assert!(contains(b"test3d-sw: open"), "the demo opened its surface: {output:?}");
+	assert!(contains(b"test3d-sw: core passes recorded by scene3d"), "the displayed core passes came through the retained scene and command model: {output:?}");
 	assert!(host.presents >= 6, "and presented repeatedly: {} present(s), {output:?}", host.presents);
 	// A SCENE AND NOT A CLEAR. The background is dark and the cube, the ground and the panel are not,
 	// so a frame with only one distinct colour in it is a frame nothing was drawn into.
@@ -2437,6 +2441,7 @@ fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 	// so this is the whole path and not a flag the demo set itself.
 	assert!(asked_to_leave, "the demo was asked to leave with a key");
 	assert!(process.is_terminated(), "and it left: {output:?}");
+	assert!(closed, "the demo explicitly closed its queue before exiting: {output:?}");
 
 	assert!(contains(b"test3d-sw: presented "), "reporting what it had drawn: {output:?}");
 }
@@ -2619,4 +2624,65 @@ fn the_3d_demo_renders_the_same_frames_through_its_workers() {
 	assert!(process.is_terminated(), "the run ended on its frame count with its workers alive, and the process still finished: {output:?}");
 	assert!(!process.is_killed(), "it finished rather than being killed: {output:?}");
 	assert_eq!(process.exit_status(), Some(0), "and reported the demo's own status, not a worker's: {output:?}");
+}
+
+tagged_test!(the_3d_demo_executes_the_hdr_bloom_chain, [Display, Process, Service, Image], id = "kernel.applications.the_3d_demo_executes_the_hdr_bloom_chain", covers = ["bin.test3d-sw", "scene3d", "render3d", "soft3d", "render-shader", "graphics-app", "surface"]);
+fn the_3d_demo_executes_the_hdr_bloom_chain() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let elf = program_elf(&package, volume, b"test3d-sw").expect("3D demo");
+	for (height, arguments, succeeds) in [
+		(48u32, &b"--postprocess --fixed --no-input --width 64 --height 48 --frames 2 --workers 2 --compare --report"[..], false),
+		(64u32, &b"--postprocess --fixed --no-input --width 64 --height 64 --frames 2 --workers 2 --compare --report"[..], true),
+	] {
+		let (bootstrap, child) = Channel::create();
+		let (stdout, child_stdout) = Channel::create();
+		let (display, client) = Channel::create();
+		let process = spawn_dynamic_test_process(sched::root_domain(), elf, child);
+		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("stdout");
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("ready");
+		bootstrap.send(Message::new(launch_context(arguments, b"vol://system"), alloc::vec::Vec::new())).expect("arguments");
+		send_cap(&bootstrap, b"DISPLAY", client, Rights::ALL).expect("display");
+		let mut host = SurfaceHost::new(display, 64, height);
+		let mut output = alloc::vec::Vec::new();
+		let mut frame = alloc::vec::Vec::new();
+		let mut closed = false;
+		for _ in 0..600_000u32 {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			let call = host.poll();
+			closed |= call == Some(HostCall::Closed);
+			if call == Some(HostCall::Presented) && frame.is_empty() {
+				frame = read_from_object(&host.image(0), (64 * height * 4) as usize);
+			}
+			while let Ok(message) = stdout.recv() {
+				output.extend_from_slice(&message.bytes);
+			}
+			if process.is_terminated() {
+				break;
+			}
+		}
+		while let Ok(message) = stdout.recv() {
+			output.extend_from_slice(&message.bytes);
+		}
+		for line in output.split(|byte| *byte == b'\n') {
+			if !line.is_empty() {
+				crate::serial_println!("  {}", alloc::string::String::from_utf8_lossy(line));
+			}
+		}
+		assert!(process.is_terminated(), "HDR phase terminated: {output:?}");
+		assert!(closed, "the prepared/refused phase releases its surface: {output:?}");
+		let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
+		if succeeds {
+			assert_eq!(host.presents, 2, "two complete HDR frames: {output:?}");
+			assert!(contains(b"HDR chain executed six downsamples, five upsamples and resolve"));
+			assert!(contains(b"28 pass(es) through 2 worker(s) matched the serial walk"), "every shadow, lighting and postprocess pass agrees: {output:?}");
+			assert!(contains(b"test3d-sw: postprocess ") && contains(b"test3d-sw: HDR prepared bytes "));
+			let first = &frame[..4];
+			assert!(frame.chunks_exact(4).filter(|pixel| *pixel != first).count() > 64, "a shaded HDR frame reaches the surface");
+		} else {
+			assert_eq!(host.presents, 0, "a window too small for six levels never presents a shortened pyramid");
+			assert!(!contains(b"HDR chain executed"));
+		}
+	}
 }

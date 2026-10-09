@@ -45,6 +45,8 @@ const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+const CMD_GET_EDID: u32 = 0x010a;
+const FEATURE_EDID: u32 = 1 << 1;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
@@ -100,6 +102,7 @@ struct Gpu {
 	cmd_phys: u64,
 	resp_virt: u64,
 	resp_phys: u64,
+	edid: bool,
 }
 
 impl Gpu {
@@ -138,6 +141,20 @@ impl Gpu {
 			// - four billion, or anything whose pitch has already wrapped - was believed, and the
 			// framebuffer described from it is the one ConsoleService maps and draws into.
 			gpu::display_geometry((w, h), (FALLBACK_W, FALLBACK_H))
+		}
+	}
+
+	fn monitor(&self) -> Option<wire::MonitorDescription> {
+		if !self.edid {
+			return None;
+		}
+		unsafe {
+			self.hdr(CMD_GET_EDID);
+			wr32(self.cmd_virt + 24, SCANOUT_ID);
+			wr32(self.cmd_virt + 28, 0);
+			core::ptr::write_bytes(self.resp_virt as *mut u8, 0, gpu::monitor::RESPONSE_BYTES);
+			let used = self.q.submit(&[(self.cmd_phys, 32, false), (self.resp_phys, gpu::monitor::RESPONSE_BYTES as u32, true)])?;
+			gpu::monitor::response(core::slice::from_raw_parts(self.resp_virt as *const u8, gpu::monitor::RESPONSE_BYTES), used)
 		}
 	}
 
@@ -369,7 +386,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    then receive the config-change Interrupt capability ("IRQ") DeviceManager
 		//    acquired for us.
 		let (bind, resources) = common::handshake(bootstrap);
-		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, 0);
+		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, FEATURE_EDID);
 		let irq: u64 = resources.irq;
 		// 2. set up the control queue (queue 0) and go live. The queue stays polled
 		//    (NO_VECTOR - set_msix_vector runs after setup_queue on purpose); only the
@@ -394,7 +411,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		let cmd_phys = dma_buffer_phys(cmd.handle);
 		let resp_phys = dma_buffer_phys(resp.handle);
-		let gpu = Gpu { q, cmd_virt: cmd.virt, cmd_phys, resp_virt: resp.virt, resp_phys };
+		let gpu = Gpu { q, cmd_virt: cmd.virt, cmd_phys, resp_virt: resp.virt, resp_phys, edid: device.features_word0() & FEATURE_EDID != 0 };
 
 		// 3. query the current display size, then create the resource + framebuffer at
 		//    exactly that geometry - the backing grows on demand when the host display
@@ -457,6 +474,7 @@ struct Scanout<'a> {
 	generation: u32,
 	/// The event stream's producer end, or zero before the service opens one.
 	events: u64,
+	monitor: Option<wire::MonitorDescription>,
 }
 
 impl Scanout<'_> {
@@ -555,6 +573,13 @@ impl wire::display_device::Service for Scanout<'_> {
 	fn events(&mut self) -> Vec<wire::DeviceEvent> {
 		Vec::new()
 	}
+
+	fn monitor(&mut self) -> Result<wire::MonitorDescription, wire::Error> {
+		if !self.gpu.edid {
+			return Err(wire::Error::Unsupported);
+		}
+		self.monitor.clone().ok_or(wire::Error::Io)
+	}
 }
 
 // SAFE NOW, AND SAYING SO IS THE POINT. It was `unsafe fn` with an `unsafe` body because it decoded a
@@ -563,7 +588,7 @@ impl wire::display_device::Service for Scanout<'_> {
 // dereferences anything the compiler cannot see.
 fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, backing: Backing, service: u64, irq: u64) -> ! {
 	{
-		let mut scanout: Scanout<'_> = Scanout { gpu, visible: (backing.w, backing.h), backing, generation: 1, events: 0 };
+		let mut scanout: Scanout<'_> = Scanout { gpu, visible: (backing.w, backing.h), backing, generation: 1, events: 0, monitor: gpu.monitor() };
 		let mut seq: u32 = 0;
 		let mut req: [u8; 128] = [0u8; 128];
 		loop {
@@ -606,6 +631,13 @@ fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, backin
 				// a display change (or poll timeout): a resize shows up as a new
 				// GET_DISPLAY_INFO size.
 				let (mut nw, mut nh) = gpu.display_size();
+				// Metadata can change without a backing resize. Refetch after the same display-change
+				// notification (or fallback poll), withdrawing old identity when a read becomes invalid.
+				let monitor = gpu.monitor();
+				if monitor != scanout.monitor {
+					scanout.monitor = monitor;
+					scanout.emit(&wire::DeviceEvent::MonitorChanged, &mut seq);
+				}
 				if nw > 0 && nh > 0 && (nw, nh) != scanout.visible {
 					if nw > scanout.backing.w || nh > scanout.backing.h {
 						// the display outgrew the allocation: reallocate at the new geometry
@@ -676,7 +708,8 @@ fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, backin
 						if op == wire::display_device::OP_EVENTS {
 							open_event_stream(service, &req[..len], &mut handles, &mut scanout);
 						} else {
-							let mut reply: [u8; 128] = [0u8; 128];
+							// At most 29 monitor modes plus identity/size; scanout/present replies still fit.
+							let mut reply: [u8; 1024] = [0u8; 1024];
 							let mut reply_handles = Handles::new();
 							match wire::display_device::dispatch(&mut scanout, &req[..len], &mut handles, &mut reply, &mut reply_handles) {
 								Some(n) => {

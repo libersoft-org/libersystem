@@ -32,6 +32,10 @@ unsafe extern "Rust" {
 	fn audio_control_set_default(chan: u64, device: &u32, direction: &AudioDirection) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_audio_audio_control_set_volume"]
 	fn audio_control_set_volume(chan: u64, device: &u32, volume: &u8) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_microphone_volume"]
+	fn audio_control_microphone_volume(chan: u64, device: &u32) -> Option<Result<u8, Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_control_set_microphone_volume"]
+	fn audio_control_set_microphone_volume(chan: u64, device: &u32, volume: &u8) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_audio_audio_control_streams"]
 	fn audio_control_streams(chan: u64) -> Option<Vec<AudioStreamInfo>>;
 	#[link_name = "liber_channel_liber_audio_audio_control_counters"]
@@ -161,6 +165,16 @@ impl AudioControlClient {
 	#[inline(always)]
 	pub fn set_volume(&mut self, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
 		unsafe { audio_control_set_volume(self.chan, device, volume) }
+	}
+
+	#[inline(always)]
+	pub fn microphone_volume(&mut self, device: &u32) -> Option<Result<u8, Error>> {
+		unsafe { audio_control_microphone_volume(self.chan, device) }
+	}
+
+	#[inline(always)]
+	pub fn set_microphone_volume(&mut self, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
+		unsafe { audio_control_set_microphone_volume(self.chan, device, volume) }
 	}
 
 	#[inline(always)]

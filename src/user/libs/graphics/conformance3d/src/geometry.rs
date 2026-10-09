@@ -31,6 +31,7 @@ fn at(x: f32, y: f32) -> (u32, u32) {
 	((((x + 1.0) * 0.5) * width) as u32, (((1.0 - y) * 0.5) * height) as u32)
 }
 
+// @covers: IndexU16
 pub fn index_u16() -> Outcome {
 	// A SIXTEEN-BIT INDEX IS NOT A THIRTY-TWO-BIT ONE READ NARROWLY. A backend that read `u16`
 	// indices two bytes at a time out of a `u32` reading would draw a triangle from vertices 0, 0, 1
@@ -46,6 +47,7 @@ pub fn index_u16() -> Outcome {
 	Ok(())
 }
 
+// @covers: IndexU32
 pub fn index_u32() -> Outcome {
 	let scene = corner_triangle().indexed32(vec![0, 1, 2]);
 	let frame = render(&scene, &Plan::default())?;
@@ -54,6 +56,7 @@ pub fn index_u32() -> Outcome {
 	Ok(())
 }
 
+// @covers: MultipleVertexStreams
 pub fn multiple_vertex_streams() -> Outcome {
 	// TWO STREAMS IS WHAT A PER-INSTANCE ATTRIBUTE IS. The position comes from the per-vertex stream
 	// and the offset from a second one indexed by INSTANCE rather than by vertex; a backend with one
@@ -69,6 +72,7 @@ pub fn multiple_vertex_streams() -> Outcome {
 	Ok(())
 }
 
+// @covers: ConfigurableAttributes
 pub fn configurable_attributes() -> Outcome {
 	// AN ATTRIBUTE IS READ BY LOCATION AND NOT BY POSITION IN A STRUCT. The colour is at location 1
 	// and the identity at 3; a backend that handed them over in declaration order would paint the
@@ -97,6 +101,7 @@ fn quad_corners() -> Vec<Vertex> {
 	]
 }
 
+// @covers: TriangleList
 pub fn triangle_list() -> Outcome {
 	let scene = Scene::new(quad_corners()).indexed16(vec![0, 1, 2, 1, 3, 2]);
 	let plan = Plan { topology: Topology::TriangleList, count: 6, ..Plan::default() };
@@ -106,6 +111,7 @@ pub fn triangle_list() -> Outcome {
 	Ok(())
 }
 
+// @covers: TriangleStrip
 pub fn triangle_strip() -> Outcome {
 	// A STRIP OF FOUR IS TWO TRIANGLES AND NOT FOUR. Each vertex after the second closes one triangle
 	// with the two before it, and the winding of every second one is flipped - a backend that did not
@@ -118,6 +124,7 @@ pub fn triangle_strip() -> Outcome {
 	Ok(())
 }
 
+// @covers: TriangleFan
 pub fn triangle_fan() -> Outcome {
 	// A FAN SHARES ITS FIRST VERTEX WITH EVERY TRIANGLE, which is what makes the same four vertices a
 	// different shape from the strip above.
@@ -138,6 +145,7 @@ pub fn triangle_fan() -> Outcome {
 	Ok(())
 }
 
+// @covers: LineList
 pub fn line_list() -> Outcome {
 	// A LINE IS NOT A THIN TRIANGLE. What the profile requires is that a line primitive rasterises at
 	// all, and what tells a line from a filled shape is that the pixels BETWEEN two lines are not
@@ -157,6 +165,7 @@ pub fn line_list() -> Outcome {
 	Ok(())
 }
 
+// @covers: LineStrip
 pub fn line_strip() -> Outcome {
 	let scene = Scene::new(vec![
 		Vertex::at(-0.9, -0.9, 0.5).coloured(1.0, 1.0, 1.0, 1.0),
@@ -169,6 +178,7 @@ pub fn line_strip() -> Outcome {
 	Ok(())
 }
 
+// @covers: PointList
 pub fn point_list() -> Outcome {
 	// A POINT IS ONE PIXEL AND NOT A DOT OF SOME SIZE THE BACKEND CHOSE. Three points are three
 	// covered pixels, which is the only statement about a point list that a second backend must also
@@ -185,6 +195,7 @@ pub fn point_list() -> Outcome {
 	Ok(())
 }
 
+// @covers: PrimitiveRestart
 pub fn primitive_restart() -> Outcome {
 	// THE RESTART VALUE ENDS A STRIP AND BEGINS THE NEXT, and it is the largest index the type can
 	// hold rather than a number a caller chose. A backend that treated it as an ordinary index would
@@ -207,6 +218,7 @@ pub fn primitive_restart() -> Outcome {
 	Ok(())
 }
 
+// @covers: IndexedDraw
 pub fn indexed_draw() -> Outcome {
 	// AN INDEX BUFFER IS WHAT LETS ONE VERTEX BE USED TWICE, which is the whole of what indexing is
 	// for: three vertices and six indices are two triangles.
@@ -217,6 +229,7 @@ pub fn indexed_draw() -> Outcome {
 	Ok(())
 }
 
+// @covers: NonIndexedDraw
 pub fn non_indexed_draw() -> Outcome {
 	// WITHOUT AN INDEX BUFFER, VERTEX `i` IS INDEX `i`, and the count is a vertex count rather than
 	// an index count.
@@ -229,6 +242,7 @@ pub fn non_indexed_draw() -> Outcome {
 	Ok(())
 }
 
+// @covers: Instancing
 pub fn instancing() -> Outcome {
 	// EVERY INSTANCE DRAWS THE SAME VERTICES, and what tells them apart is the instance index. Two
 	// instances of one triangle are two primitives and two places on the target.
@@ -243,6 +257,7 @@ pub fn instancing() -> Outcome {
 	Ok(())
 }
 
+// @covers: BaseVertex
 pub fn base_vertex() -> Outcome {
 	// A BASE VERTEX IS ADDED TO EVERY INDEX and is not a first-index offset: the same index buffer
 	// reads a different part of the vertex buffer. Here it moves the draw from the first triangle to
@@ -265,6 +280,7 @@ pub fn base_vertex() -> Outcome {
 	Ok(())
 }
 
+// @covers: BaseInstance
 pub fn base_instance() -> Outcome {
 	// A FIRST INSTANCE IS ADDED TO THE INSTANCE INDEX the per-instance attribute is read with, so one
 	// instance starting at one reads the SECOND offset. A backend that ignored it would draw the

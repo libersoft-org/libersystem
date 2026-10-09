@@ -37,6 +37,13 @@ name = "render-math"
 version = "0.0.0"
 
 [[package]]
+name = "render-shader"
+version = "0.0.0"
+dependencies = [
+ "graphics-profile",
+]
+
+[[package]]
 name = "render3d"
 version = "0.0.0"
 dependencies = [
@@ -51,6 +58,7 @@ version = "0.0.0"
 dependencies = [
  "graphics-profile",
  "render-math",
+ "render-shader",
  "render3d",
 ]
 

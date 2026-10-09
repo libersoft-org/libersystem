@@ -275,6 +275,7 @@ fn texel_key(texture: u32, level: u32, x: u32, y: u32, z: u32) -> u64 {
 /// APPLIED AFTER THE LEVEL IS CHOSEN, so a wrapped coordinate does not change the derivative the
 /// level came from - which is the ordering the profile states and the one that keeps a repeating
 /// texture from picking the coarsest level at every seam.
+// @handles: SamplerWrapClamp, SamplerWrapRepeat, SamplerWrapMirror, SamplerWrapBorder
 fn address(coordinate: f32, extent: u32, wrap: Wrap) -> Option<i64> {
 	let size = extent as i64;
 	if size == 0 {
@@ -341,6 +342,7 @@ fn fetch(texture: &Texture, level: &Level, level_index: u32, x: i64, y: i64, z: 
 /// The maximum rather than a geometric mean, because the mean under-filters exactly where an
 /// anisotropic footprint is worst - a floor seen at a grazing angle, which is where aliasing is most
 /// visible.
+// @handles: LodBias, LodClamp
 pub fn lambda(ddx: [f32; 2], ddy: [f32; 2], width: u32, height: u32, sampler: &Sampler, levels: u32) -> f32 {
 	let scale = |d: [f32; 2]| {
 		let sx = d[0] * width as f32;
@@ -356,6 +358,7 @@ pub fn lambda(ddx: [f32; 2], ddy: [f32; 2], width: u32, height: u32, sampler: &S
 }
 
 /// Sample one level with the sampler's within-level filter.
+// @handles: Texture2D, Texture3D
 fn sample_level(texture: &Texture, level_index: u32, coordinate: [f32; 3], sampler: &Sampler, filter: Filter, cache: &mut Option<&mut Cache>) -> Texel {
 	let Some(level) = texture.level(level_index) else { return sampler.border.texel() };
 	// TEXEL CENTRES AT `(i + 0.5) / extent`, so the sample point in texel units is
@@ -420,6 +423,7 @@ pub fn sample(texture: &Texture, sampler: &Sampler, coordinate: [f32; 3], level:
 }
 
 /// The same, through a cache the caller keeps.
+// @handles: Sampler, MinNearest, MinLinear, MagNearest, MagLinear, MipNearest, MipLinear, Trilinear
 pub fn sample_cached(texture: &Texture, sampler: &Sampler, coordinate: [f32; 3], level: f32, magnifying: bool, cache: &mut Option<&mut Cache>) -> Texel {
 	let within = if magnifying { sampler.magnify } else { sampler.minify };
 	let last = texture.levels().saturating_sub(1) as f32;
@@ -450,6 +454,7 @@ pub fn sample_cached(texture: &Texture, sampler: &Sampler, coordinate: [f32; 3],
 ///
 /// REFUSES A LAYER THE TEXTURE DOES NOT HAVE rather than clamping to the last one, which would draw
 /// the wrong page of an atlas and look like an authoring mistake.
+// @handles: Texture2DArray
 pub fn sample_array(texture: &Texture, sampler: &Sampler, coordinate: [f32; 2], layer: u32, level: f32) -> Result<Texel, Error> {
 	let index = libm::floorf(level.max(0.0)) as u32;
 	let Some(texels) = texture.level(index.min(texture.levels().saturating_sub(1))) else {
@@ -470,6 +475,7 @@ pub fn sample_array(texture: &Texture, sampler: &Sampler, coordinate: [f32; 2], 
 ///
 /// THE LEVEL COMES FROM THE MINOR AXIS. Taking it from the major one is the isotropic answer and
 /// blurs exactly the direction anisotropy exists to keep sharp.
+// @handles: Anisotropy8
 pub fn sample_anisotropic(texture: &Texture, sampler: &Sampler, coordinate: [f32; 3], ddx: [f32; 2], ddy: [f32; 2], width: u32, height: u32) -> Texel {
 	let length = |d: [f32; 2]| {
 		let sx = d[0] * width as f32;
@@ -507,6 +513,7 @@ pub fn sample_anisotropic(texture: &Texture, sampler: &Sampler, coordinate: [f32
 /// FILTERING THE DEPTHS AND COMPARING ONCE PRODUCES A HARD EDGE and is the wrong answer: it is what
 /// makes a shadow map look like a stencil instead of a soft boundary, and it is the single commonest
 /// shadow bug.
+// @handles: DepthCompareSampling
 pub fn sample_compare(texture: &Texture, sampler: &Sampler, coordinate: [f32; 2], level: u32, reference: f32) -> Result<f32, Error> {
 	let compare = sampler.compare.ok_or(Error::InvalidRenderState { reason: "a depth-compare sample through a sampler with no comparison" })?;
 	let Some(texels) = texture.level(level) else {
@@ -543,6 +550,7 @@ pub fn sample_compare(texture: &Texture, sampler: &Sampler, coordinate: [f32; 2]
 /// THE RESULT IS DECLARED LINEAR AND PREMULTIPLIED, because that is what the blend path wrote. A
 /// texture that claimed otherwise would be decoded a second time on its first fetch, which is the
 /// double-decode that makes a render-to-texture chain darker at every step.
+// @handles: RenderToTexture
 pub fn from_attachment(attachment: &crate::pass::Colour, id: u32) -> Result<Texture, Error> {
 	let resolved = attachment.resolve()?;
 	let mut level = Level::new(attachment.width, attachment.height, 1);
@@ -596,6 +604,7 @@ pub fn cube_face(direction: [f32; 3]) -> (u32, [f32; 2]) {
 /// Clamping is what makes the seam visible; the taps are gathered by re-projecting each tap's own
 /// direction, which is the construction that needs no table of edge adjacencies and cannot get one
 /// of them backwards.
+// @handles: TextureCube
 pub fn sample_cube(texture: &Texture, sampler: &Sampler, direction: [f32; 3], level: f32) -> Texel {
 	let (face, coordinate) = cube_face(direction);
 	let Some(texels) = texture.level(libm::floorf(level) as u32) else { return sampler.border.texel() };
@@ -656,6 +665,7 @@ fn direction_of(face: u32, coordinate: [f32; 2]) -> [f32; 3] {
 /// AN ODD DIMENSION HALVES BY `max(1, floor(n/2))` AND THE BOX TAKES THE TEXELS THAT EXIST. There is
 /// no weighting to invent, and inventing one is how two implementations produce different chains
 /// from the same image.
+// @handles: Mipmaps
 pub fn generate_mips(texture: &mut Texture) {
 	if texture.levels.is_empty() {
 		return;

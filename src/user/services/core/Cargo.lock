@@ -154,6 +154,7 @@ dependencies = [
  "bootproto",
  "display-device-proto",
  "driver-protocol",
+ "edid",
  "hid-i2c",
  "i2c-client",
  "i2c-device-proto",
@@ -168,6 +169,10 @@ dependencies = [
  "usb-pd",
  "wire",
 ]
+
+[[package]]
+name = "edid"
+version = "0.0.0"
 
 [[package]]
 name = "equivalent"

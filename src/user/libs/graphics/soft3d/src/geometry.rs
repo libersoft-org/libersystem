@@ -49,20 +49,21 @@ impl Indices<'_> {
 		}
 	}
 
-	/// The index at a position, or `None` when it is the restart value.
-	fn at(&self, position: usize, base_vertex: i32) -> Result<Option<u32>, Error> {
+	/// The index at a position, or `None` for the sentinel when restart is enabled.
+	// @handles: IndexU16, IndexU32, BaseVertex
+	fn at(&self, position: usize, base_vertex: i32, restart: bool) -> Result<Option<u32>, Error> {
 		let raw = match self {
 			Self::None => position as u32,
 			Self::U16(values) => {
 				let value = *values.get(position).ok_or(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: position as u32, vertices: values.len() as u32 } })?;
-				if value == RESTART_U16 {
+				if restart && value == RESTART_U16 {
 					return Ok(None);
 				}
 				value as u32
 			}
 			Self::U32(values) => {
 				let value = *values.get(position).ok_or(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: position as u32, vertices: values.len() as u32 } })?;
-				if value == RESTART_U32 {
+				if restart && value == RESTART_U32 {
 					return Ok(None);
 				}
 				value
@@ -83,9 +84,20 @@ impl Indices<'_> {
 /// the provoking-vertex rule is stated against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Primitive {
-	Triangle { vertices: [u32; 3], index: u32 },
-	Line { vertices: [u32; 2], index: u32 },
-	Point { vertex: u32, index: u32 },
+	/// The local provoking slot preserves topology order after strip winding swaps and restart.
+	Triangle {
+		vertices: [u32; 3],
+		index: u32,
+		provoking: u8,
+	},
+	Line {
+		vertices: [u32; 2],
+		index: u32,
+	},
+	Point {
+		vertex: u32,
+		index: u32,
+	},
 }
 
 impl Primitive {
@@ -105,20 +117,29 @@ impl Primitive {
 /// NOTHING IS ALLOCATED PER PRIMITIVE DURING TRAVERSAL by a caller that reuses `into` - it is
 /// cleared, not reallocated.
 pub fn assemble(topology: Topology, indices: Indices<'_>, count: u32, base_vertex: i32, restart: bool, into: &mut Vec<Primitive>, run: &mut Vec<u32>) -> Result<(), Error> {
+	assemble_from(topology, indices, 0, count, base_vertex, restart, into, run)
+}
+
+/// Assemble the selected index window, or the selected vertices of a non-indexed draw.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_from(topology: Topology, indices: Indices<'_>, first: u32, count: u32, base_vertex: i32, restart: bool, into: &mut Vec<Primitive>, run: &mut Vec<u32>) -> Result<(), Error> {
 	into.clear();
 	run.clear();
 	if restart && matches!(topology, Topology::TriangleList | Topology::LineList | Topology::PointList) {
 		return Err(Error::InvalidRenderState { reason: "primitive restart on a list topology, which has nothing to restart" });
 	}
-	if !matches!(indices, Indices::None) && count as usize > indices.len() {
-		return Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: count, vertices: indices.len() as u32 } });
+	let end = first as u64 + count as u64;
+	if end > u32::MAX as u64 + 1 || (!matches!(indices, Indices::None) && end > indices.len() as u64) {
+		return Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: end.saturating_sub(1).min(u32::MAX as u64) as u32, vertices: indices.len() as u32 } });
 	}
 	let mut primitive = 0_u32;
 	// The run of indices since the last restart, which is what a strip or a fan is built over. THE
 	// CALLER OWNS IT so an assembled draw allocates nothing.
 	let mut hub: Option<u32> = None;
-	for position in 0..count as usize {
-		match indices.at(position, base_vertex)? {
+	for offset in 0..count as usize {
+		let position = first as usize + offset;
+		match indices.at(position, base_vertex, restart)? {
+			// @handles: PrimitiveRestart
 			None => {
 				run.clear();
 				hub = None;
@@ -132,30 +153,34 @@ pub fn assemble(topology: Topology, indices: Indices<'_>, count: u32, base_verte
 			}
 		}
 		match topology {
+			// @handles: TriangleList
 			Topology::TriangleList => {
 				if run.len() == 3 {
-					into.push(Primitive::Triangle { vertices: [run[0], run[1], run[2]], index: primitive });
+					into.push(Primitive::Triangle { vertices: [run[0], run[1], run[2]], index: primitive, provoking: 0 });
 					primitive += 1;
 					run.clear();
 				}
 			}
+			// @handles: TriangleStrip
 			Topology::TriangleStrip => {
 				if run.len() >= 3 {
 					let last = run.len() - 1;
 					// THE WINDING ALTERNATES so every triangle of a strip faces the same way. A strip
 					// that did not alternate would have every other triangle culled.
 					let vertices = if (last - 2) % 2 == 0 { [run[last - 2], run[last - 1], run[last]] } else { [run[last - 1], run[last - 2], run[last]] };
-					into.push(Primitive::Triangle { vertices, index: primitive });
+					into.push(Primitive::Triangle { vertices, index: primitive, provoking: ((last - 2) % 2) as u8 });
 					primitive += 1;
 				}
 			}
+			// @handles: TriangleFan
 			Topology::TriangleFan => {
 				if run.len() >= 3 {
 					let last = run.len() - 1;
-					into.push(Primitive::Triangle { vertices: [run[0], run[last - 1], run[last]], index: primitive });
+					into.push(Primitive::Triangle { vertices: [run[0], run[last - 1], run[last]], index: primitive, provoking: 1 });
 					primitive += 1;
 				}
 			}
+			// @handles: LineList
 			Topology::LineList => {
 				if run.len() == 2 {
 					into.push(Primitive::Line { vertices: [run[0], run[1]], index: primitive });
@@ -163,6 +188,7 @@ pub fn assemble(topology: Topology, indices: Indices<'_>, count: u32, base_verte
 					run.clear();
 				}
 			}
+			// @handles: LineStrip
 			Topology::LineStrip => {
 				if run.len() >= 2 {
 					let last = run.len() - 1;
@@ -170,6 +196,7 @@ pub fn assemble(topology: Topology, indices: Indices<'_>, count: u32, base_verte
 					primitive += 1;
 				}
 			}
+			// @handles: PointList
 			Topology::PointList => {
 				into.push(Primitive::Point { vertex: run[0], index: primitive });
 				primitive += 1;

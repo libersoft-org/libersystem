@@ -573,6 +573,7 @@ soft2d = { path = "../../libs/graphics/soft2d" }
 # AND THE 3D HALF OF THE SAME MODEL, for the one tool that drives it: a backend, the API it is driven
 # through, the shader IR its stages are built with and the matrix arithmetic its camera is.
 render3d = { path = "../../libs/graphics/render3d" }
+scene3d = { path = "../../libs/graphics/scene3d" }
 soft3d = { path = "../../libs/graphics/soft3d" }
 render-math = { path = "../../libs/graphics/render-math" }
 render-shader = { path = "../../libs/graphics/render-shader" }

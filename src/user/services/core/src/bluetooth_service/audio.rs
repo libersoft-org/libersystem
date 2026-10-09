@@ -60,6 +60,8 @@ const MAX_ENDPOINTS: usize = 16;
 pub(crate) struct AudioRoot {
 	// The producer end of the one subscriber's endpoints stream, zero with none.
 	pub subscriber: u64,
+	// A failed/full event stream is retired by Stack, which also owns the profiles' close hooks.
+	subscriber_failed: bool,
 	pub endpoints: Vec<AudioEndpoint>,
 	// Which link each endpoint is a stream on: its id, the controller and the link's handle.
 	pub owners: Vec<(u32, usize, u16)>,
@@ -72,7 +74,7 @@ pub(crate) struct AudioRoot {
 
 impl AudioRoot {
 	pub const fn new() -> AudioRoot {
-		AudioRoot { subscriber: 0, endpoints: Vec::new(), owners: Vec::new(), pcm: Vec::new(), next_id: 1, call: BtCallState::None }
+		AudioRoot { subscriber: 0, subscriber_failed: false, endpoints: Vec::new(), owners: Vec::new(), pcm: Vec::new(), next_id: 1, call: BtCallState::None }
 	}
 
 	pub fn owner(&self, id: u32) -> Option<(usize, u16)> {
@@ -81,15 +83,16 @@ impl AudioRoot {
 
 	// One event to the subscriber; a subscriber that has gone is let go, and with it every endpoint's channel.
 	fn send(&mut self, event: &AudioEvent) {
-		if self.subscriber == 0 {
+		if self.subscriber == 0 || self.subscriber_failed {
 			return;
 		}
 		let mut frame = [0u8; 256];
 		let mut handles = wire::Handles::new();
 		let Some(len) = bluetooth_audio::endpoints_frame(0, event, &mut frame, &mut handles) else { return };
-		if matches!(try_send_outcome(self.subscriber, &frame[..len], 0), SendOutcome::Failed) {
-			close(self.subscriber);
-			self.subscriber = 0;
+		// Losing a level update would leave the consumer's inventory stale. A full stream is
+		// closed too; the normal re-subscription supplies the current bounded snapshot.
+		if !matches!(try_send_outcome(self.subscriber, &frame[..len], 0), SendOutcome::Delivered) {
+			self.subscriber_failed = true;
 			self.call = BtCallState::None;
 		}
 	}
@@ -135,6 +138,12 @@ impl AudioRoot {
 		}
 	}
 
+	pub fn microphone_volume_changed(&mut self, id: u32, volume: u8) {
+		if self.endpoints.iter().any(|endpoint| endpoint.id == id) {
+			self.send(&AudioEvent::MicrophoneVolume(EndpointVolume { id, volume: volume.min(100) }));
+		}
+	}
+
 	// A HEADSET'S CALL COMMAND, relayed when a session declares a call; the gateway itself answered ERROR when none does.
 	pub fn command(&mut self, command: BtCallCommand) -> bool {
 		if self.call == BtCallState::None || self.subscriber == 0 {
@@ -153,15 +162,31 @@ pub(crate) struct AudioView<'a> {
 impl bluetooth_audio::Service for AudioView<'_> {
 	// Validated here; the stream itself is made by `serve_endpoints`, which owns the channel.
 	fn endpoints(&mut self) -> Result<Vec<AudioEvent>, Error> {
+		// A replacement may arrive before the main loop handles the old stream's closure.
+		self.stack.serve_audio_subscriber(&mut [0u8; 256]);
 		if self.stack.audio.subscriber != 0 {
 			return Err(Error::Again);
 		}
-		Ok(self.stack.audio.endpoints.iter().cloned().map(AudioEvent::Arrived).collect())
+		let mut snapshot = Vec::new();
+		for endpoint in self.stack.audio.endpoints.clone() {
+			let id = endpoint.id;
+			snapshot.push(AudioEvent::Arrived(endpoint));
+			if let Ok(volume) = self.microphone_volume(id) {
+				snapshot.push(AudioEvent::MicrophoneVolume(EndpointVolume { id, volume }));
+			}
+		}
+		Ok(snapshot)
 	}
 
 	// THE PCM CHANNEL OF AN ENDPOINT: one holder, served here on the device-side contract. An endpoint not offered is not
 	// found, and one already open is busy.
 	fn open(&mut self, id: u32) -> Result<u64, Error> {
+		self.stack.serve_audio_subscriber(&mut [0u8; 256]);
+		if self.stack.audio.subscriber == 0 {
+			// A retired stream can still have queued Arrived events at its consumer. They do not
+			// authorize reopening PCM channels after that subscriber's ownership has ended.
+			return Err(Error::Closed);
+		}
 		let audio = &mut self.stack.audio;
 		let endpoint = audio.endpoints.iter().find(|endpoint| endpoint.id == id).cloned().ok_or(Error::NotFound)?;
 		let (at, handle) = audio.owner(id).ok_or(Error::NotFound)?;
@@ -205,6 +230,29 @@ impl bluetooth_audio::Service for AudioView<'_> {
 		Ok(())
 	}
 
+	fn microphone_volume(&mut self, id: u32) -> Result<u8, Error> {
+		let endpoint = self.stack.audio.endpoints.iter().find(|endpoint| endpoint.id == id).ok_or(Error::NotFound)?;
+		if endpoint.kind != AudioEndpointKind::Voice || self.stack.source_of(id) != Source::Classic {
+			return Err(Error::Unsupported);
+		}
+		let (at, handle) = self.stack.audio.owner(id).ok_or(Error::NotFound)?;
+		self.stack.voice_microphone_volume(at, handle)
+	}
+
+	fn set_microphone_volume(&mut self, id: u32, volume: u8) -> Result<u8, Error> {
+		if volume > 100 {
+			return Err(Error::Invalid);
+		}
+		// The query validates the endpoint and the profile's independent microphone control.
+		self.microphone_volume(id)?;
+		let (at, handle) = self.stack.audio.owner(id).ok_or(Error::NotFound)?;
+		self.stack.voice_set_microphone_volume(at, handle, volume)?;
+		let applied = self.microphone_volume(id)?;
+		// Keep this update ordered behind any older remote VGM already queued on the events stream.
+		self.stack.audio.microphone_volume_changed(id, applied);
+		Ok(applied)
+	}
+
 	fn set_call(&mut self, state: BtCallState) -> Result<(), Error> {
 		self.stack.audio.call = state;
 		self.stack.voice_call(state);
@@ -224,6 +272,7 @@ pub(crate) fn serve_endpoints(stack: &mut Stack, channel: u64, request: &[u8], h
 					&& send_caps_blocking(channel, &reply[..len], &[consumer])
 				{
 					stack.audio.subscriber = producer;
+					stack.audio.subscriber_failed = false;
 					stack.audio.call = BtCallState::None;
 					for event in &snapshot {
 						stack.audio.send(event);
@@ -254,6 +303,50 @@ pub(crate) enum Source {
 }
 
 impl Stack {
+	// The events stream is also the subscriber's lifetime. In particular, a held capture or playback
+	// request is not in the PCM waitset, so its peer's exit must retire it through this stream.
+	pub(crate) fn serve_audio_subscriber(&mut self, buf: &mut [u8]) {
+		if self.audio.subscriber == 0 {
+			return;
+		}
+		let gone = if self.audio.subscriber_failed {
+			true
+		} else {
+			match try_recv_caps(self.audio.subscriber, buf) {
+				PolledCaps::Closed => true,
+				PolledCaps::Empty => false,
+				PolledCaps::Message { handles, .. } => {
+					for &handle in handles.as_slice() {
+						close(handle);
+					}
+					false
+				}
+			}
+		};
+		if !gone {
+			return;
+		}
+		close(core::mem::replace(&mut self.audio.subscriber, 0));
+		self.audio.subscriber_failed = false;
+		self.audio.call = BtCallState::None;
+		self.voice_call(BtCallState::None);
+		// Remove ownership together, so closing an LE call cannot restart an old media channel.
+		for pcm in core::mem::take(&mut self.audio.pcm) {
+			self.close_pcm(pcm);
+		}
+	}
+
+	fn close_pcm(&mut self, pcm: Pcm) {
+		close(pcm.chan);
+		match (self.source_of(pcm.endpoint), pcm.kind) {
+			(Source::LeAudio, _) => self.le_audio_close(pcm.endpoint),
+			(Source::Broadcast, _) => {}
+			(Source::Classic, AudioEndpointKind::Output) => self.a2dp_stop(pcm.at, pcm.handle),
+			(Source::Classic, AudioEndpointKind::Voice) => self.voice_down(pcm.at, pcm.handle),
+			_ => {}
+		}
+	}
+
 	pub(crate) fn source_of(&self, id: u32) -> Source {
 		if self.le_device_of(id).is_some() {
 			Source::LeAudio
@@ -283,14 +376,7 @@ impl Stack {
 			PolledCaps::Empty => return,
 			PolledCaps::Closed => {
 				let pcm = self.audio.pcm.remove(index);
-				close(pcm.chan);
-				match (self.source_of(pcm.endpoint), pcm.kind) {
-					(Source::LeAudio, _) => self.le_audio_close(pcm.endpoint),
-					(Source::Broadcast, _) => {}
-					(Source::Classic, AudioEndpointKind::Output) => self.a2dp_stop(pcm.at, pcm.handle),
-					(Source::Classic, AudioEndpointKind::Voice) => self.voice_down(pcm.at, pcm.handle),
-					_ => {}
-				}
+				self.close_pcm(pcm);
 				return;
 			}
 		};

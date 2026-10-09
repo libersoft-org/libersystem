@@ -6,6 +6,22 @@ use super::*;
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[test]
+fn attachment_allocation_refusal_is_recoverable() {
+	let colour = crate::counted::fail_after(0, || crate::pass::Colour::try_new(64, 48, 1, false));
+	assert!(matches!(colour, Err(render3d::Error::OutOfMemory { bytes: 49152 })));
+	// Reject either allocation separately, including the stencil request after depth succeeded.
+	for successful in [0, 1, 2, 3] {
+		let depth = crate::counted::fail_after(successful, || crate::pass::DepthStencil::try_new(64, 48, 1, render3d::DepthFormat::Depth32F));
+		assert!(matches!(depth, Err(render3d::Error::OutOfMemory { .. })));
+	}
+	assert!(matches!(crate::pass::Colour::try_new(u32::MAX, u32::MAX, u32::MAX, false), Err(render3d::Error::OutOfMemory { .. })));
+	let mut recovered = crate::pass::Colour::try_new(2, 2, 1, false).expect("a later allocation can succeed");
+	let value = render_math::Vec4::new(1.0, 1.0, 1.0, 1.0);
+	recovered.set(1, 1, 0, value);
+	assert_eq!(recovered.at(1, 1, 0), value);
+}
+
 use render_math::{Vec3, Vec4, Viewport};
 
 use crate::clip::{Varyings, Vertex};
@@ -493,6 +509,27 @@ fn the_provoking_vertex_is_the_one_each_topology_names() {
 	assert_eq!(geometry::provoking(Topology::LineList, 3), 6);
 	assert_eq!(geometry::provoking(Topology::LineStrip, 3), 3);
 	assert_eq!(geometry::provoking(Topology::PointList, 3), 3);
+}
+
+#[test]
+fn selected_index_windows_preserve_provoking_slots_after_winding_and_restart() {
+	let indices = [99_u16, 10, 11, 12, 13, geometry::RESTART_U16, 20, 21, 22];
+	for (topology, expected) in [(Topology::TriangleStrip, vec![10, 11, 20]), (Topology::TriangleFan, vec![11, 12, 21])] {
+		let mut out = Vec::new();
+		geometry::assemble_from(topology, Indices::U16(&indices), 1, 8, 0, true, &mut out, &mut Vec::new()).unwrap();
+		let actual: Vec<_> = out
+			.iter()
+			.map(|primitive| match primitive {
+				Primitive::Triangle { vertices, provoking, .. } => vertices[*provoking as usize],
+				_ => panic!("expected triangles"),
+			})
+			.collect();
+		assert_eq!(actual, expected);
+	}
+	let mut out = Vec::new();
+	geometry::assemble_from(Topology::TriangleList, Indices::U16(&indices), 1, 3, -10, false, &mut out, &mut Vec::new()).unwrap();
+	assert!(matches!(out[0], Primitive::Triangle { vertices: [0, 1, 2], provoking: 0, .. }));
+	assert!(matches!(geometry::assemble_from(Topology::PointList, Indices::None, u32::MAX, 2, 0, false, &mut out, &mut Vec::new()), Err(render3d::Error::InvalidMesh { reason: render3d::error::MeshFault::IndexOutOfRange { .. } })));
 }
 
 /// A window-space point in subpixel units.
@@ -1491,11 +1528,140 @@ fn colour_fragment() -> Module {
 }
 
 fn pipeline(topology: Topology) -> Pipeline {
-	Pipeline { state: PipelineState { topology, cull: CullMode::None, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: passthrough_vertex(), fragment: colour_fragment(), blend: vec![opaque_blend(), opaque_blend()], stencil: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
+	Pipeline { state: PipelineState { topology, cull: CullMode::None, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: passthrough_vertex(), fragment: colour_fragment(), blend: vec![opaque_blend(), opaque_blend()], stencil: None, stencil_back: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
 }
 
 fn white() -> [f32; 4] {
 	[1.0, 1.0, 1.0, 1.0]
+}
+
+#[test]
+fn recorded_shared_indices_render_and_actual_invalid_indices_are_refused() {
+	use render3d::command::{Buffer, CommandList, GraphicsPipeline, Rect};
+	use render3d::resource::{Aspect, LoadOp, RenderTargetSet, RenderTargetView, StoreOp, TextureDimension, TextureViewDesc};
+	struct Indexed<'a> {
+		mesh: &'a Mesh,
+		indices: &'a [u32],
+	}
+	impl Source for Indexed<'_> {
+		fn attribute(&self, location: u32, vertex: u32, instance: u32) -> Option<Val> {
+			self.mesh.attribute(location, vertex, instance)
+		}
+		fn uniform(&self, _block: u32, _member: u32) -> Option<Val> {
+			None
+		}
+		fn sample(&self, _texture: u32, _sampler: u32, _coordinate: &Val) -> Option<Val> {
+			None
+		}
+		fn indices(&self) -> Indices<'_> {
+			Indices::U32(self.indices)
+		}
+	}
+	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![white(); 4], instance_offset: [0.0; 4] };
+	let view = TextureViewDesc { dimension: TextureDimension::D2, aspect: Aspect::Colour, base_mip: 0, mip_count: 1, base_layer: 0, layer_count: 1 };
+	let targets = [RenderTargetView { texture: 0, view, format: "R32G32B32A32_FLOAT", samples: 1, width: 16, height: 16, load: LoadOp::Load, store: StoreOp::Store }];
+	let set = RenderTargetSet { colour: &targets, depth_stencil: None, resolve: &[] };
+	for (indices, first, base, valid, missing_vertex) in [
+		(vec![0, 1, 2, 0, 2, 3], 0, 0, true, false),
+		(vec![8, 9, 10, 8, 10, 11], 0, -8, true, false),
+		(vec![4, 4, 4, 0, 1, 2, 0, 2, 3], 3, 0, true, false),
+		(vec![u32::MAX - 1, 0, 0, 8, 9, 10, 8, 10, 11], 3, -8, true, false),
+		(vec![0, 1, 2, 0, 2, 3], 2, 0, false, false),
+		(vec![0, 1, 2, 0, 2, 3], u32::MAX - 5, 0, false, false),
+		(vec![0, 1, 2, 0, 2, 3], 0, -1, false, false),
+		(vec![u32::MAX - 1, 0, 1, 0, 1, 2], 0, 2, false, false),
+		(vec![4, 1, 2, 0, 2, 3], 0, 0, false, true),
+	] {
+		let state = pipeline(Topology::TriangleList);
+		let mut commands = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+		commands.begin_render_pass(0, &set).unwrap();
+		commands.bind_pipeline(GraphicsPipeline(0), &state.state, 1).unwrap();
+		commands.set_viewport(Rect { x: 0, y: 0, width: 16, height: 16 }).unwrap();
+		commands.bind_index_buffer(Buffer(0), 0, true).unwrap();
+		commands.draw_indexed(Topology::TriangleList, 6, 1, first, base, 0, 4).unwrap();
+		commands.end_render_pass().unwrap();
+		commands.finish().unwrap();
+		let draws = frame::draws_from(commands.commands(), Topology::TriangleList);
+		let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], draws, 16, 16).unwrap();
+		let mut colour = Colour::new(16, 16, 1, false);
+		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(16.0, 16.0), scissor: None };
+		let result = frame::execute(&mut prepared, &mut attachments, &Indexed { mesh: &mesh, indices: &indices });
+		if valid {
+			let stats = result.expect("actual shared indices are in range");
+			assert_eq!(stats.primitives, 2);
+			assert_eq!(stats.fragments, 256);
+			assert!(near(colour.at(8, 8, 0).x, 1.0));
+		} else {
+			if missing_vertex {
+				assert!(matches!(result, Err(render3d::Error::InvalidShader { reason: "a shader read a binding the frame does not supply" })), "the checked source refuses the missing vertex attribute: {result:?}");
+			} else {
+				assert!(matches!(result, Err(render3d::Error::InvalidMesh { reason: render3d::error::MeshFault::IndexOutOfRange { .. } })), "the actual signed index sum is refused: {result:?}");
+			}
+			for y in 0..16 {
+				for x in 0..16 {
+					assert_eq!(colour.at(x, y, 0), Vec4::ZERO, "refused before shading");
+				}
+			}
+		}
+	}
+}
+
+#[test]
+fn recorded_first_vertex_selects_geometry_and_refuses_unavailable_vertices() {
+	use render3d::command::{Command, CommandList, GraphicsPipeline, Rect};
+	use render3d::resource::{Aspect, LoadOp, RenderTargetSet, RenderTargetView, StoreOp, TextureDimension, TextureViewDesc};
+	let red = [1.0, 0.0, 0.0, 1.0];
+	let green = [0.0, 1.0, 0.0, 1.0];
+	// The prefix is outside the viewport. Selecting the second triangle must draw green.
+	let mesh = Mesh { positions: vec![[2.0, 2.0, 0.5, 1.0]; 3].into_iter().chain([[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]]).collect(), colours: vec![red, red, red, green, green, green], instance_offset: [0.0; 4] };
+	let view = TextureViewDesc { dimension: TextureDimension::D2, aspect: Aspect::Colour, base_mip: 0, mip_count: 1, base_layer: 0, layer_count: 1 };
+	let targets = [RenderTargetView { texture: 0, view, format: "R32G32B32A32_FLOAT", samples: 1, width: 16, height: 16, load: LoadOp::Load, store: StoreOp::Store }];
+	for first in [3, 4] {
+		let state = pipeline(Topology::TriangleList);
+		let mut commands = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+		commands.begin_render_pass(0, &RenderTargetSet { colour: &targets, depth_stencil: None, resolve: &[] }).unwrap();
+		commands.bind_pipeline(GraphicsPipeline(0), &state.state, 1).unwrap();
+		commands.set_viewport(Rect { x: 0, y: 0, width: 16, height: 16 }).unwrap();
+		commands.draw(Topology::TriangleList, 3, 1, first, 0).unwrap();
+		commands.end_render_pass().unwrap();
+		commands.finish().unwrap();
+		assert!(commands.commands().iter().any(|command| matches!(command, Command::Draw { first_vertex, .. } if *first_vertex == first)));
+		let draws = frame::draws_from(commands.commands(), Topology::TriangleList);
+		let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], draws, 16, 16).unwrap();
+		let mut colour = Colour::new(16, 16, 1, false);
+		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(16.0, 16.0), scissor: None };
+		let result = frame::execute(&mut prepared, &mut attachments, &mesh);
+		if first == 3 {
+			assert_eq!(result.unwrap().primitives, 1);
+			assert_eq!(colour.at(2, 5, 0), Vec4::new(0.0, 1.0, 0.0, 1.0));
+			assert_eq!(colour.at(5, 2, 0), Vec4::ZERO);
+		} else {
+			assert!(matches!(result, Err(render3d::Error::InvalidShader { reason: "a shader read a binding the frame does not supply" })), "missing selected vertex: {result:?}");
+			for y in 0..16 {
+				for x in 0..16 {
+					assert_eq!(colour.at(x, y, 0), Vec4::ZERO);
+				}
+			}
+		}
+	}
+}
+
+#[test]
+fn offset_fans_render_the_selected_rim_vertices_flat_colours() {
+	let red = [1.0, 0.0, 0.0, 1.0];
+	let green = [0.0, 1.0, 0.0, 1.0];
+	let blue = [0.0, 0.0, 1.0, 1.0];
+	let mesh = Mesh { positions: vec![[2.0, 2.0, 0.5, 1.0], [-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![red, red, green, blue, red], instance_offset: [0.0; 4] };
+	let mut state = pipeline(Topology::TriangleFan);
+	state.vertex.varyings[0].interpolation = render_shader::Interpolation::Flat;
+	state.fragment.varyings[0].interpolation = render_shader::Interpolation::Flat;
+	let draw = Draw { pipeline: 0, topology: Topology::TriangleFan, first: 1, count: 4, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![draw], 16, 16).unwrap();
+	let mut colour = Colour::new(16, 16, 1, false);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(16.0, 16.0), scissor: None };
+	assert_eq!(frame::execute(&mut prepared, &mut attachments, &mesh).unwrap().fragments, 256);
+	assert_eq!(colour.at(12, 12, 0), Vec4::new(0.0, 1.0, 0.0, 1.0), "first fan triangle uses its first rim vertex");
+	assert_eq!(colour.at(2, 2, 0), Vec4::new(0.0, 0.0, 1.0, 1.0), "next triangle uses the next rim vertex, not its hub");
 }
 
 #[test]
@@ -1506,7 +1672,7 @@ fn one_triangle_covers_exactly_the_pixels_its_edges_enclose() {
 	// NDC (-1,-1), (1,-1), (-1,1): counter-clockwise, so front-facing. In a 16 x 16 viewport that is
 	// window (0,16), (16,16), (0,0), whose interior is `y > x`.
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![white(), white(), white()], instance_offset: [0.0; 4] };
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 16, 16).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 16, 16).unwrap();
 
 	let mut colour = Colour::new(16, 16, 1, false);
 	let mut depth = DepthStencil::new(16, 16, 1, DepthFormat::Depth32F);
@@ -1536,7 +1702,7 @@ fn the_nearer_of_two_overlapping_triangles_wins_in_either_order() {
 	for (first, second, expected) in [(far, near_one, [0.0_f32, 1.0]), (near_one, far, [0.0, 1.0])] {
 		let mesh = Mesh { positions: first.iter().chain(second.iter()).copied().collect(), colours: vec![[1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]], instance_offset: [0.0; 4] };
 		let _ = expected;
-		let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 16, 16).unwrap();
+		let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 16, 16).unwrap();
 		let mut colour = Colour::new(16, 16, 1, false);
 		let mut depth = DepthStencil::new(16, 16, 1, DepthFormat::Depth32F);
 		depth.clear(1.0, 0);
@@ -1555,7 +1721,7 @@ fn the_nearer_of_two_overlapping_triangles_wins_in_either_order() {
 // would be missing.
 fn a_scissor_removes_the_fragments_outside_it_and_shades_none_of_them() {
 	let quad = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0], [-1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![white(); 6], instance_offset: [0.0; 4] };
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let covered = |colour: &Colour| (0..32).flat_map(|y| (0..32).map(move |x| (x, y))).filter(|(x, y)| colour.at(*x, *y, 0).x > 0.5).count();
 
 	// The whole target first, so the scissored run has something to be a subset of.
@@ -1600,7 +1766,7 @@ fn a_scissor_removes_the_fragments_outside_it_and_shades_none_of_them() {
 fn an_instanced_draw_runs_its_vertex_stage_once_per_instance() {
 	// A small triangle in the lower-left, shifted right by a quarter of the volume per instance.
 	let mesh = Mesh { positions: vec![[-0.9, -0.9, 0.5, 1.0], [-0.7, -0.9, 0.5, 1.0], [-0.9, -0.7, 0.5, 1.0]], colours: vec![white(), white(), white()], instance_offset: [0.5, 0.0, 0.0, 0.0] };
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 3, first_instance: 0, base_vertex: 0, restart: false }], 64, 64).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 3, first_instance: 0, base_vertex: 0, restart: false }], 64, 64).unwrap();
 	let mut colour = Colour::new(64, 64, 1, false);
 	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(64.0, 64.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
@@ -1613,7 +1779,7 @@ fn an_instanced_draw_runs_its_vertex_stage_once_per_instance() {
 	assert!(lit.iter().any(|x| *x < 10) && lit.iter().any(|x| *x > 24), "and they are spread across the target: {lit:?}");
 
 	// A draw of zero instances is refused at PREPARE, not silently skipped at execution.
-	let bad = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 0, first_instance: 0, base_vertex: 0, restart: false }], 16, 16);
+	let bad = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 0, first_instance: 0, base_vertex: 0, restart: false }], 16, 16);
 	assert!(bad.is_err());
 }
 
@@ -1642,7 +1808,7 @@ fn a_pass_writes_several_attachments_and_leaves_the_ones_its_shader_did_not() {
 	state.fragment = fragment.finish();
 
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![white(), white(), white()], instance_offset: [0.0; 4] };
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 16, 16).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 16, 16).unwrap();
 
 	let mut targets = vec![Colour::new(16, 16, 1, false), Colour::new(16, 16, 1, true)];
 	targets[1].fill(Vec4::new(9.0, 0.0, 0.0, 1.0));
@@ -1682,7 +1848,7 @@ fn prepare_refuses_what_execute_must_never_meet() {
 	assert!(matches!(frame::prepare(limits, vec![per_sample], vec![], 16, 16), Err(render3d::Error::IncompatiblePipeline { .. })));
 
 	// A draw naming a pipeline the plan does not hold, and a target past the raster grid.
-	let draw = Draw { pipeline: 4, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 4, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	assert!(frame::prepare(limits, vec![pipeline(Topology::TriangleList)], vec![draw], 16, 16).is_err());
 	assert!(frame::prepare(limits, vec![pipeline(Topology::TriangleList)], vec![], crate::MAX_RASTER_EXTENT + 1, 16).is_err());
 	assert!(frame::prepare(limits, vec![pipeline(Topology::TriangleList)], vec![], 0, 16).is_err());
@@ -1694,7 +1860,7 @@ fn prepare_refuses_what_execute_must_never_meet() {
 // to hope for.
 fn a_second_frame_reuses_every_buffer_the_first_one_sized() {
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![white(), white(), white()], instance_offset: [0.0; 4] };
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
 
 	let once = |prepared: &mut crate::frame::Prepared, colour: &mut Colour| {
@@ -1729,7 +1895,7 @@ fn a_line_and_a_point_draw_through_the_same_plan_and_are_never_culled() {
 	// A cull mode that would remove a front face, to show it does not reach a line.
 	let mut state = pipeline(Topology::LineList);
 	state.state.cull = CullMode::Front;
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { pipeline: 0, topology: Topology::LineList, count: 2, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { first: 0, pipeline: 0, topology: Topology::LineList, count: 2, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
 	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
@@ -1749,7 +1915,7 @@ fn a_line_and_a_point_draw_through_the_same_plan_and_are_never_culled() {
 	let mut point_state = pipeline(Topology::PointList);
 	point_state.state.cull = CullMode::Back;
 	let mesh = Mesh { positions: vec![[0.0, 0.0, 0.5, 1.0]], colours: vec![white()], instance_offset: [0.0; 4] };
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![point_state], vec![Draw { pipeline: 0, topology: Topology::PointList, count: 1, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![point_state], vec![Draw { first: 0, pipeline: 0, topology: Topology::PointList, count: 1, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
 	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
@@ -1781,7 +1947,7 @@ fn alpha_to_coverage_narrows_a_multisampled_draw_and_leaves_an_identity_alone() 
 
 	// A half-transparent triangle covering the whole target.
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [3.0, -1.0, 0.5, 1.0], [-1.0, 3.0, 0.5, 1.0]], colours: vec![[1.0, 1.0, 1.0, 0.5]; 3], instance_offset: [0.0; 4] };
-	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 8, 8).unwrap();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 8, 8).unwrap();
 	let mut colour = Colour::new(8, 8, 4, false);
 	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(8.0, 8.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
@@ -1802,7 +1968,7 @@ fn hierarchical_depth_rejects_hidden_geometry_without_changing_the_picture() {
 	let mesh = Mesh { positions: covering.iter().chain(hidden.iter()).copied().collect(), colours: vec![[1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]], instance_offset: [0.0; 4] };
 	// TWO DRAWS, so the near one has finished filling the tiles before the far one is binned - which
 	// is the case the bound exists for.
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw, Draw { base_vertex: 3, ..draw }], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
 	let mut depth = DepthStencil::new(32, 32, 1, DepthFormat::Depth32F);
@@ -1814,6 +1980,89 @@ fn hierarchical_depth_rejects_hidden_geometry_without_changing_the_picture() {
 	assert!(near(colour.at(16, 16, 0).x, 1.0) && near(colour.at(16, 16, 0).y, 0.0), "the near triangle won: {:?}", colour.at(16, 16, 0));
 	// And the hidden triangle's fragments were never shaded: one target's worth, not two.
 	assert!(stats.fragments <= 32 * 32 + 8, "the hidden draw was rejected before shading: {}", stats.fragments);
+}
+
+#[test]
+fn early_depth_matches_late_depth_and_preserves_shader_depth_and_stencil() {
+	let triangle = [[-0.9, -0.9, 0.2, 1.0], [0.9, -0.9, 0.2, 1.0], [-0.9, 0.9, 0.2, 1.0]];
+	let hidden = triangle.map(|mut point| {
+		point[2] = 0.9;
+		point
+	});
+	let mesh = Mesh { positions: triangle.into_iter().chain(hidden).collect(), colours: vec![[1.0, 0.0, 0.0, 1.0]; 6], instance_offset: [0.0; 4] };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	for format in render3d::depth::ALL_DEPTH_FORMATS {
+		let run = |stencil| {
+			let mut pipeline = pipeline(Topology::TriangleList);
+			pipeline.stencil = stencil;
+			let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline], vec![draw], 32, 32).unwrap();
+			let mut colour = Colour::new(32, 32, 1, false);
+			let mut depth = DepthStencil::new(32, 32, 1, *format);
+			let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(32.0, 32.0), scissor: None };
+			let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
+			(colour, depth, stats)
+		};
+		let (early_colour, early_depth, early) = run(None);
+		let (late_colour, late_depth, late) = run(Some(StencilFace::default()));
+		assert_eq!(early_colour, late_colour);
+		assert_eq!(early_depth, late_depth);
+		assert_eq!(early.samples_written, late.samples_written);
+		assert_eq!(early.fragments * 2, late.fragments, "the occluded half was not shaded: {format:?}");
+		let (_, stencil, _) = run(Some(StencilFace { on_depth_fail: StencilOp::Replace, reference: 7, ..StencilFace::default() }));
+		assert_eq!(stencil.stencil_at(8, 24, 0), 7, "depth-fail stencil still runs: {format:?}");
+	}
+	// A fragment depth stored in a branch can bring the geometrically hidden triangle forward.
+	let mut written = pipeline(Topology::TriangleList);
+	let mut fragment = Builder::new(Stage::Fragment, "depth override");
+	let zero = fragment.constant(Constant::F32(0.0));
+	let one = fragment.constant(Constant::F32(1.0));
+	let colour = fragment.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![zero, one, zero, one]));
+	let depth = fragment.constant(Constant::F32(0.1));
+	let condition = fragment.constant(Constant::Bool(true));
+	fragment.store(Output::Colour(0), colour);
+	let branch = fragment.if_then(condition);
+	fragment.store(Output::Depth, depth);
+	fragment.end_if(branch);
+	written.fragment = fragment.finish();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList), written], vec![Draw { count: 3, ..draw }, Draw { first: 0, pipeline: 1, count: 3, base_vertex: 3, ..draw }], 32, 32).unwrap();
+	let mut colour = Colour::new(32, 32, 1, false);
+	let mut depth = DepthStencil::new(32, 32, 1, DepthFormat::Depth32F);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(32.0, 32.0), scissor: None };
+	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
+	assert_eq!(colour.at(8, 24, 0), Vec4::new(0.0, 1.0, 0.0, 1.0));
+}
+
+#[test]
+fn colour_and_picking_share_depth_stencil_and_attachment_zero_coverage() {
+	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [3.0, -1.0, 0.5, 1.0], [-1.0, 3.0, 0.5, 1.0]], colours: vec![white(); 3], instance_offset: [0.0; 4] };
+	let mut pipeline = pipeline(Topology::TriangleList);
+	pipeline.state.samples = 4;
+	pipeline.alpha_to_coverage = true;
+	pipeline.stencil = Some(StencilFace { on_depth_fail: StencilOp::IncrementClamp, on_pass: StencilOp::IncrementClamp, ..StencilFace::default() });
+	let mut fragment = Builder::new(Stage::Fragment, "colour and identity");
+	let zero = fragment.constant(Constant::F32(0.0));
+	let one = fragment.constant(Constant::F32(1.0));
+	let half = fragment.constant(Constant::F32(0.5));
+	let colour = fragment.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![one, zero, zero, half]));
+	let identity = fragment.constant(Constant::U32(7));
+	fragment.store(Output::Colour(0), colour);
+	fragment.store(Output::Integer(1), identity);
+	pipeline.fragment = fragment.finish();
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline], vec![Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 8, 8).unwrap();
+	let mut colour = [Colour::new(8, 8, 4, false), Colour::new(8, 8, 4, true)];
+	colour[1].fill(Vec4::new(9.0, 0.0, 0.0, 1.0));
+	let mut depth = DepthStencil::new(8, 8, 4, DepthFormat::Depth32FStencil8);
+	// An existing nearer sample rejects bit zero. Alpha-to-coverage leaves bits zero and one,
+	// so only bit one must change in BOTH attachments; stencil executes once for each tested bit.
+	let blend = opaque_blend();
+	pass::write_fragment(&mut colour[0], Some(&mut depth), &Fragment { x: 4, y: 4, coverage: 1, depth: 0.1, colour: Vec4::ZERO, blend: &blend, depth_compare: CompareOp::Less, depth_write: true, stencil: None, sample_mask: u32::MAX, alpha_to_coverage: false }).unwrap();
+	let mut attachments = Attachments { colour: &mut colour, depth_stencil: Some(&mut depth), viewport: viewport(8.0, 8.0), scissor: None };
+	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
+	for sample in 0..4 {
+		assert_eq!(colour[0].at(4, 4, sample).x, if sample == 1 { 1.0 } else { 0.0 });
+		assert_eq!(colour[1].at(4, 4, sample).x, if sample == 1 { 7.0 } else { 9.0 });
+		assert_eq!(depth.stencil_at(4, 4, sample), if sample < 2 { 1 } else { 0 });
+	}
 }
 
 #[test]
@@ -1862,7 +2111,7 @@ fn a_warmed_frame_asks_the_allocator_for_nothing() {
 		colours: vec![white(); 6],
 		instance_offset: [0.0; 4],
 	};
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 2, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 2, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 64, 64).unwrap();
 	let mut colour = Colour::new(64, 64, 1, false);
 	let mut depth = DepthStencil::new(64, 64, 1, DepthFormat::Depth32F);
@@ -1982,7 +2231,7 @@ fn a_texel_cache_serves_the_same_values_and_is_hit_by_neighbouring_taps() {
 // would charge for them twice.
 fn a_prepared_plan_reports_the_bytes_it_reserved() {
 	let mesh = Mesh { positions: vec![[-0.9, -0.9, 0.5, 1.0], [0.9, -0.9, 0.5, 1.0], [-0.9, 0.9, 0.5, 1.0]], colours: vec![white(); 3], instance_offset: [0.0; 4] };
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut small = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 64, 64).unwrap();
 	let mut large = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 1024, 1024).unwrap();
 	// A bigger target reserves more, because the tile grid is the part that scales with it.
@@ -2253,7 +2502,7 @@ fn a_canary_attachment_beside_the_target_is_never_touched() {
 		colours: vec![white(); 3],
 		instance_offset: [0.0; 4],
 	};
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 16, 16).unwrap();
 
 	let mut targets = vec![Colour::new(16, 16, 1, false), Colour::new(16, 16, 1, false)];
@@ -2374,7 +2623,7 @@ fn five_hundred_hostile_draws_are_each_answered_rather_than_crashing() {
 			1 => CullMode::Front,
 			_ => CullMode::Back,
 		};
-		let draw = Draw { pipeline: 0, topology, count: noise.below(12), instances: noise.below(3) + 1, first_instance: 0, base_vertex: (noise.below(6) as i32) - 3, restart: false };
+		let draw = Draw { first: 0, pipeline: 0, topology, count: noise.below(12), instances: noise.below(3) + 1, first_instance: 0, base_vertex: (noise.below(6) as i32) - 3, restart: false };
 		let Ok(mut prepared) = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![draw], width, height) else {
 			refusals += 1;
 			continue;
@@ -2468,7 +2717,7 @@ fn a_frame_interpolates_each_qualifier_by_its_own_rule() {
 	// A FORESHORTENED TRIANGLE, so the three rules disagree: two vertices four times as far away as
 	// the third. The attribute is zero at the near vertex and one at both far ones.
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [4.0, -4.0, 2.0, 4.0], [-4.0, 4.0, 2.0, 4.0]], colours: vec![[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], instance_offset: [0.0; 4] };
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![draw], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
 	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
@@ -2759,8 +3008,8 @@ fn crowd(seed: u64, width: u32, height: u32, triangles: usize) -> Crowd {
 	// TWO DRAWS, so the second is binned against the hierarchical depth the first left behind.
 	let half = count / 6 * 3;
 	let draws = vec![
-		Draw { pipeline: 0, topology: Topology::TriangleList, count: half, instances: 1, first_instance: 0, base_vertex: 0, restart: false },
-		Draw { pipeline: 0, topology: Topology::TriangleList, count: count - half, instances: 1, first_instance: 0, base_vertex: half as i32, restart: false },
+		Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: half, instances: 1, first_instance: 0, base_vertex: 0, restart: false },
+		Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: count - half, instances: 1, first_instance: 0, base_vertex: half as i32, restart: false },
 	];
 	Crowd { width, height, pipeline: state, draws, mesh: Mesh { positions, colours, instance_offset: [0.0; 4] }, scissor: Some(frame::Scissor { x: 7, y: 5, width: width - 19, height: height - 13 }) }
 }
@@ -2843,7 +3092,7 @@ fn a_failing_draw_answers_the_same_failure_through_any_pool() {
 	let mut state = pipeline(Topology::TriangleList);
 	state.fragment = fragment.finish();
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [3.0, -1.0, 0.5, 1.0], [-1.0, 3.0, 0.5, 1.0]], colours: vec![white(); 3], instance_offset: [0.0; 4] };
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let run = |workers: &dyn Workers| {
 		let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state.clone()], vec![draw], 96, 96).unwrap();
 		let mut colour = Colour::new(96, 96, 1, false);
@@ -2928,3 +3177,242 @@ fn attachment_storage_answers_every_address_and_nothing_outside() {
 		assert_eq!(depth.tiles().count() as u32, width.div_ceil(raster::TILE) * height.div_ceil(raster::TILE));
 	}
 }
+
+#[test]
+fn integer_attachments_preserve_all_bits_masks_and_sample_zero() {
+	let mut identity = Colour::new(33, 33, 4, true);
+	let values = [0x0100_0001, 0x8000_0001, 0xffff_fffe, u32::MAX];
+	identity.fill_identity(u32::MAX).unwrap();
+	for (sample, value) in values.into_iter().enumerate() {
+		assert!(identity.set_identity(32, 32, sample as u32, value));
+	}
+	assert_eq!(identity.resolve_identities().unwrap()[1088], values[0]);
+	assert_eq!(identity.identity_at(33, 32, 0), None);
+	assert!(!identity.set_identity(32, 33, 0, 7));
+	let mut last = identity.tiles().last().unwrap();
+	assert_eq!(last.identity_at(32, 32, 3), Some(u32::MAX));
+	assert_eq!(last.identity_at(0, 0, 0), None, "a tile cannot read its neighbour");
+	let mut state = opaque_blend();
+	state.write_mask.red = false;
+	pass::write_identity_into(&mut last, 32, 32, 0b1111, 0, &state).unwrap();
+	for (sample, value) in values.into_iter().enumerate() {
+		assert_eq!(last.identity_at(32, 32, sample as u32), Some(value), "a masked lane keeps its exact old integer");
+	}
+	state.write_mask.red = true;
+	pass::write_identity_into(&mut last, 32, 32, 0b0101, 0x8000_0001, &state).unwrap();
+	assert_eq!(last.identity_at(32, 32, 0), Some(0x8000_0001));
+	assert_eq!(last.identity_at(32, 32, 1), Some(values[1]));
+	assert_eq!(last.identity_at(32, 32, 2), Some(0x8000_0001));
+	assert_eq!(last.identity_at(32, 32, 3), Some(values[3]));
+	state.enabled = true;
+	assert!(matches!(pass::write_identity_into(&mut last, 32, 32, 15, 1, &state), Err(render3d::Error::UnsupportedFormat { .. })));
+	assert_eq!(last.identity_at(32, 32, 0), Some(0x8000_0001));
+	let mut colour = Colour::new(1, 1, 1, false);
+	assert_eq!(colour.identity_at(0, 0, 0), None);
+	assert!(colour.fill_identity(3).is_err());
+	assert!(colour.resolve_identities().is_err());
+}
+
+#[test]
+fn u32_shader_constants_and_flat_varyings_survive_clipping_depth_and_workers() {
+	struct IdMesh {
+		mesh: Mesh,
+		ids: [u32; 6],
+	}
+	impl Source for IdMesh {
+		fn attribute(&self, location: u32, vertex: u32, instance: u32) -> Option<Val> {
+			if location == 2 { self.ids.get(vertex as usize).copied().map(Val::scalar_u32) } else { self.mesh.attribute(location, vertex, instance) }
+		}
+		fn uniform(&self, _: u32, _: u32) -> Option<Val> {
+			None
+		}
+		fn sample(&self, _: u32, _: u32, _: &Val) -> Option<Val> {
+			None
+		}
+		fn indices(&self) -> Indices<'_> {
+			Indices::None
+		}
+	}
+	for id in [0, 0x0100_0001, 0x8000_0001, 0xffff_fffe, u32::MAX] {
+		for flat in [false, true] {
+			for samples in [1, 4] {
+				let mut vertex = Builder::new(Stage::Vertex, "exact-identity");
+				let position = vertex.load(Type::vec(4), Binding::Attribute { location: 0 });
+				vertex.store(Output::Position, position);
+				if flat {
+					vertex.varying(2, Type::Scalar(render_shader::ir::ScalarType::U32), render_shader::Interpolation::Flat);
+					let value = vertex.load(Type::Scalar(render_shader::ir::ScalarType::U32), Binding::Attribute { location: 2 });
+					vertex.store(Output::Varying(2), value);
+				}
+				let stage = |identity| {
+					let mut fragment = Builder::new(Stage::Fragment, "exact-identity");
+					let value = if flat {
+						fragment.varying(2, Type::Scalar(render_shader::ir::ScalarType::U32), render_shader::Interpolation::Flat);
+						fragment.load(Type::Scalar(render_shader::ir::ScalarType::U32), Binding::Varying { location: 2 })
+					} else {
+						fragment.constant(Constant::U32(identity))
+					};
+					fragment.store(Output::Integer(1), value);
+					fragment.finish()
+				};
+				let mut state = pipeline(Topology::TriangleList);
+				state.vertex = vertex.finish();
+				state.fragment = stage(id);
+				state.state.samples = samples;
+				state.sample_mask = 0b0101;
+				let mut far_state = state.clone();
+				far_state.fragment = stage(!id);
+				let positions = vec![[-2.0, -1.0, 0.25, 1.0], [1.0, -1.0, 0.25, 1.0], [-1.0, 1.0, 0.25, 1.0], [-2.0, -1.0, 0.75, 1.0], [1.0, -1.0, 0.75, 1.0], [-1.0, 1.0, 0.75, 1.0]];
+				// The provoking vertex is clipped away, and only its exact integer must survive.
+				let mesh = IdMesh { mesh: Mesh { positions, colours: vec![white(); 6], instance_offset: [0.0; 4] }, ids: [id, 7, 9, !id, 4, 6] };
+				let draw = Draw { pipeline: 0, topology: Topology::TriangleList, first: 0, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+				let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state, far_state], vec![draw, Draw { pipeline: 1, first: 3, ..draw }], 64, 64).unwrap();
+				let mut reference = None;
+				for workers in [&frame::Serial as &dyn Workers, &Threads(3)] {
+					let mut targets = vec![Colour::new(64, 64, samples, false), Colour::new(64, 64, samples, true)];
+					targets[1].fill_identity(0x7654_3210).unwrap();
+					let mut depth = DepthStencil::new(64, 64, samples, DepthFormat::Depth32F);
+					let mut attachments = Attachments { colour: &mut targets, depth_stencil: Some(&mut depth), viewport: viewport(64.0, 64.0), scissor: None };
+					let stats = frame::execute_with(&mut prepared, &mut attachments, &mesh, workers).unwrap();
+					assert!(stats.clipped > 0);
+					assert_eq!(targets[1].identity_at(2, 48, 0), Some(id), "flat={flat}, samples={samples}, id={id:x}; the occluded draw must not overwrite the identity");
+					if samples == 4 {
+						assert_eq!(targets[1].identity_at(2, 48, 1), Some(0x7654_3210), "masked sample remains untouched");
+					}
+					assert_eq!(targets[1].identity_at(63, 0, 0), Some(0x7654_3210));
+					assert_eq!(targets[1].resolve_identities().unwrap()[48 * 64 + 2], id);
+					if let Some((expected, expected_depth)) = &reference {
+						assert_eq!(&targets, expected);
+						assert_eq!(&depth, expected_depth);
+					} else {
+						reference = Some((targets, depth));
+					}
+				}
+			}
+		}
+	}
+}
+
+#[test]
+fn opposite_faces_select_distinct_stencil_state_in_one_draw() {
+	let positions = vec![[-1.0, -1.0, 0.5, 1.0], [0.0, -1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0], [0.0, -1.0, 0.5, 1.0], [0.0, 1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0]];
+	let mesh = Mesh { positions, colours: vec![white(); 6], instance_offset: [0.0; 4] };
+	let face = |reference| StencilFace { compare: CompareOp::Always, read_mask: 255, write_mask: 255, reference, on_fail: StencilOp::Keep, on_depth_fail: StencilOp::Keep, on_pass: StencilOp::Replace };
+	let mut state = pipeline(Topology::TriangleList);
+	state.stencil = Some(face(5));
+	state.stencil_back = Some(face(9));
+	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, first: 0, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![draw], 32, 32).unwrap();
+	let mut colour = Colour::new(32, 32, 1, false);
+	let mut depth = DepthStencil::new(32, 32, 1, DepthFormat::Depth24Stencil8);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(32.0, 32.0), scissor: None };
+	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
+	assert_eq!(depth.stencil_at(2, 24, 0), 5);
+	assert_eq!(depth.stencil_at(18, 24, 0), 9);
+	assert_eq!(depth.stencil_at(31, 0, 0), 0);
+}
+
+#[test]
+fn maximum_indices_are_vertices_when_primitive_restart_is_disabled() {
+	let mut primitives = Vec::new();
+	let mut run = Vec::new();
+	for (indices, maximum) in [(Indices::U16(&[u16::MAX]), u16::MAX as u32), (Indices::U32(&[u32::MAX]), u32::MAX)] {
+		geometry::assemble(Topology::PointList, indices, 1, 0, false, &mut primitives, &mut run).unwrap();
+		assert_eq!(primitives, vec![Primitive::Point { vertex: maximum, index: 0 }]);
+		geometry::assemble(Topology::PointList, indices, 1, -1, false, &mut primitives, &mut run).unwrap();
+		assert_eq!(primitives, vec![Primitive::Point { vertex: maximum - 1, index: 0 }]);
+		geometry::assemble(Topology::TriangleStrip, indices, 1, 0, true, &mut primitives, &mut run).unwrap();
+		assert!(primitives.is_empty() && run.is_empty());
+	}
+	assert!(matches!(geometry::assemble(Topology::PointList, Indices::U32(&[u32::MAX]), 1, 1, false, &mut primitives, &mut run), Err(render3d::Error::InvalidMesh { .. })));
+}
+
+#[test]
+fn discarded_attachment_samples_become_readable_only_when_written() {
+	let mut colour = Colour::new(1, 1, 4, false);
+	assert!(colour.readable_at(0, 0, 0).is_ok(), "construction explicitly clears storage");
+	colour.discard();
+	assert!(matches!(colour.readable_at(0, 0, 0), Err(render3d::Error::InvalidRenderState { reason: "a readback of contents a pass discarded" })));
+	let mut state = opaque_blend();
+	state.write_mask = render3d::ColorWriteMask { red: true, green: false, blue: false, alpha: false };
+	pass::write_fragment(&mut colour, None, &Fragment { coverage: 1, ..fragment(Vec4::new(0.25, 0.5, 0.75, 1.0), 0.5, &state) }).unwrap();
+	assert!(colour.readable_at(0, 0, 0).is_err(), "red alone does not define three untouched channels");
+	state.write_mask = render3d::ColorWriteMask { red: false, green: true, blue: true, alpha: true };
+	pass::write_fragment(&mut colour, None, &Fragment { coverage: 1, ..fragment(Vec4::new(0.0, 0.5, 0.75, 1.0), 0.5, &state) }).unwrap();
+	assert!(colour.readable_at(0, 0, 0).is_ok());
+	assert_eq!(colour.at(0, 0, 0), Vec4::new(0.25, 0.5, 0.75, 1.0));
+	assert!(colour.readable_at(0, 0, 1).is_err(), "a different covered sample cannot define this sample");
+	assert!(colour.resolve().is_err(), "colour resolve observes every sample");
+	state.enabled = true;
+	assert!(pass::write_fragment(&mut colour, None, &Fragment { coverage: 2, ..fragment(Vec4::new(0.0, 0.0, 0.0, 1.0), 0.5, &state) }).is_err(), "blending cannot read a discarded backdrop");
+	colour.mark_undefined();
+	assert!(matches!(colour.readable_at(0, 0, 0), Err(render3d::Error::InvalidRenderState { reason: "a readback of a subresource nothing has written" })));
+	colour.fill(Vec4::ZERO);
+	assert!(colour.resolve().is_ok());
+
+	let mut identity = Colour::new(1, 1, 4, true);
+	identity.discard();
+	pass::write_identity_into(&mut identity.view(), 0, 0, 1, u32::MAX, &opaque_blend()).unwrap();
+	assert!(identity.readable_at(0, 0, 1).is_err());
+	assert_eq!(identity.resolve_identities().unwrap(), vec![u32::MAX], "integer resolve needs only sample zero");
+
+	let mut depth = DepthStencil::new(1, 1, 4, DepthFormat::Depth24Stencil8);
+	depth.discard_depth();
+	depth.clear_stencil(7);
+	assert!(depth.readable_depth_at(0, 0, 0).is_err(), "clearing stencil does not define depth");
+	assert_eq!(depth.furthest_in(0, 0, 1, 1), f32::INFINITY);
+	let reject = StencilFace { compare: CompareOp::Never, reference: 9, read_mask: 255, write_mask: 255, on_fail: StencilOp::Replace, on_depth_fail: StencilOp::Keep, on_pass: StencilOp::Keep };
+	let state = opaque_blend();
+	assert_eq!(pass::write_fragment(&mut colour, Some(&mut depth), &Fragment { coverage: 1, stencil: Some((&reject, true)), ..fragment(Vec4::ZERO, 0.5, &state) }).unwrap(), 0, "stencil rejection precedes any read of discarded depth");
+	assert_eq!(depth.stencil_at(0, 0, 0), 9);
+
+	let state = opaque_blend();
+	pass::write_fragment(&mut colour, Some(&mut depth), &Fragment { coverage: 2, depth_compare: CompareOp::Always, ..fragment(Vec4::ZERO, 0.25, &state) }).unwrap();
+	assert!(depth.readable_depth_at(0, 0, 0).is_err());
+	assert!(depth.readable_depth_at(0, 0, 1).is_ok());
+	depth.clear_depth(0.75);
+	assert!((0..4).all(|sample| depth.readable_depth_at(0, 0, sample).is_ok()));
+	assert_eq!(depth.stencil_at(0, 0, 1), 7);
+}
+
+#[test]
+fn discarded_stencil_bits_follow_read_and_write_masks() {
+	let mut colour = Colour::new(1, 1, 1, false);
+	let mut depth = DepthStencil::new(1, 1, 1, DepthFormat::Depth24Stencil8);
+	depth.discard_stencil();
+	let state = opaque_blend();
+	let mut face = StencilFace { compare: CompareOp::Always, reference: 0x35, read_mask: 255, write_mask: 0x0f, on_fail: StencilOp::Keep, on_depth_fail: StencilOp::Keep, on_pass: StencilOp::Replace };
+	let draw = |depth: &mut DepthStencil, colour: &mut Colour, face: &StencilFace| pass::write_fragment(colour, Some(depth), &Fragment { coverage: 1, depth_compare: CompareOp::Always, stencil: Some((face, true)), ..fragment(Vec4::ZERO, 0.5, &state) });
+	draw(&mut depth, &mut colour, &face).unwrap();
+	assert!(depth.readable_stencil_at(0, 0, 0, 0x0f).is_ok());
+	assert!(depth.readable_stencil_at(0, 0, 0, 0xf0).is_err());
+	face.on_pass = StencilOp::Invert;
+	draw(&mut depth, &mut colour, &face).unwrap();
+	assert_eq!(depth.stencil_at(0, 0, 0) & 15, 10, "invert reads only the written bits");
+	face.on_pass = StencilOp::Replace;
+	draw(&mut depth, &mut colour, &face).unwrap();
+
+	face.compare = CompareOp::Equal;
+	face.read_mask = 0x0f;
+	face.on_pass = StencilOp::Keep;
+	assert_eq!(draw(&mut depth, &mut colour, &face).unwrap(), 1, "the comparison reads only defined bits");
+	face.read_mask = 255;
+	assert!(draw(&mut depth, &mut colour, &face).is_err());
+	face.compare = CompareOp::Always;
+	face.write_mask = 0xf0;
+	face.on_pass = StencilOp::Replace;
+	draw(&mut depth, &mut colour, &face).unwrap();
+	assert_eq!(depth.stencil_at(0, 0, 0), 0x35);
+	assert!(depth.readable_stencil_at(0, 0, 0, 255).is_ok());
+	depth.discard_stencil();
+	face.on_pass = StencilOp::IncrementClamp;
+	assert!(draw(&mut depth, &mut colour, &face).is_err(), "arithmetic operations need the old byte");
+	face.write_mask = 0;
+	draw(&mut depth, &mut colour, &face).unwrap();
+	assert!(depth.readable_stencil_at(0, 0, 0, 255).is_err());
+	depth.clear_stencil(7);
+	assert!(depth.readable_stencil_at(0, 0, 0, 255).is_ok());
+}
+
+#[path = "frame/allocation_tests.rs"]
+mod animated_allocation;

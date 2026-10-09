@@ -1094,6 +1094,30 @@ fn pass_targets() -> PassTargets {
 }
 
 #[test]
+fn a_shared_vertex_quad_records_six_indices_over_four_vertices() {
+	struct Quad;
+	impl Geometry for Quad {
+		fn draw_of(&self, mesh: u32) -> Option<MeshDraw> {
+			let mut draw = OneMesh { indexed: true }.draw_of(mesh)?;
+			draw.vertices = 4;
+			draw.indices.as_mut()?.count = 6;
+			Some(draw)
+		}
+	}
+	let mut scene = Scene::new(Limits::PROFILE_MINIMUM);
+	let node = scene.add_node(Node::identity()).unwrap();
+	let material = scene.add_material(opaque(0)).unwrap();
+	scene.add_drawable(Drawable::new(node, 0, material)).unwrap();
+	let queue = crate::queue::build_with(&mut scene, Vec3::ZERO, &crate::cull::Frustum::from_view_projection(&Mat4::IDENTITY), u32::MAX);
+	let colour = [colour_target()];
+	let set = RenderTargetSet { colour: &colour, depth_stencil: None, resolve: &[] };
+	let mut list = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+	crate::emit::record(&scene, &queue, &Quad, &mut list, &set, &pass_targets()).expect("shared vertices are a valid indexed mesh");
+	list.finish().unwrap();
+	assert!(list.commands().iter().any(|command| matches!(command, Command::DrawIndexed { indices: 6, instances: 1, .. })));
+}
+
+#[test]
 fn a_shadow_pass_draws_the_casters_and_not_the_glass() {
 	// A SURFACE THAT LETS LIGHT THROUGH DOES NOT STOP IT. A shadow map holds ONE depth per texel and
 	// has no way to say "some of the light got past", so a transparent caster written into it casts

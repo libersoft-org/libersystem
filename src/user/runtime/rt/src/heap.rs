@@ -32,6 +32,15 @@ const PAGE_SIZE: usize = 4096;
 #[cfg_attr(not(feature = "host-tests"), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::new();
 
+pub(crate) fn allocation_count() -> u64 {
+	ALLOCATOR.lock().allocations
+}
+
+pub(crate) fn allocation_bytes() -> (u64, u64) {
+	let heap = ALLOCATOR.lock();
+	(heap.live_bytes, heap.peak_bytes)
+}
+
 // A node in the free list, stored in-place at the start of each free block.
 struct FreeRegion {
 	size: usize,
@@ -55,11 +64,14 @@ impl FreeRegion {
 struct Heap {
 	head: FreeRegion,
 	initialized: bool,
+	allocations: u64,
+	live_bytes: u64,
+	peak_bytes: u64,
 }
 
 impl Heap {
 	const fn empty() -> Heap {
-		Heap { head: FreeRegion::new(0), initialized: false }
+		Heap { head: FreeRegion::new(0), initialized: false, allocations: 0, live_bytes: 0, peak_bytes: 0 }
 	}
 
 	// Map the backing region on first use; after this the free list owns
@@ -237,6 +249,7 @@ unsafe impl GlobalAlloc for LockedHeap {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 		let pointer = unsafe {
 			let mut heap = self.lock();
+			heap.allocations = heap.allocations.saturating_add(1);
 			heap.ensure_init();
 			// A degenerate layout (align/size overflow) can never be satisfied: return
 			// null (the GlobalAlloc contract) rather than panicking the process.
@@ -257,6 +270,8 @@ unsafe impl GlobalAlloc for LockedHeap {
 			};
 			match region {
 				Some((region, alloc_start)) => {
+					heap.live_bytes = heap.live_bytes.saturating_add(size as u64);
+					heap.peak_bytes = heap.peak_bytes.max(heap.live_bytes);
 					let alloc_end = alloc_start.checked_add(size).expect("alloc overflow");
 					// The bytes alignment skipped at the front of the region are free too, and
 					// were being dropped on the floor before: the region is unlinked whole, so
@@ -294,7 +309,9 @@ unsafe impl GlobalAlloc for LockedHeap {
 			// A layout `alloc` would have rejected was never handed out, so there is
 			// nothing to reclaim.
 			if let Some((size, _)) = Heap::size_align(layout) {
-				self.lock().add_free_region(ptr as usize, size);
+				let mut heap = self.lock();
+				heap.live_bytes = heap.live_bytes.saturating_sub(size as u64);
+				heap.add_free_region(ptr as usize, size);
 			}
 		}
 	}

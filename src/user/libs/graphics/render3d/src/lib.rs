@@ -39,7 +39,7 @@ pub use interop::{Bridge, admit_as_texture, bridge_for_attachment};
 pub use limits::{Granted, Render3DLimits, negotiate};
 pub use msaa::{SAMPLE_COUNTS, ShadingRate, alpha_to_coverage, centroid, coverage_after_masks, resolve_colour, resolve_first, sample_positions, shading_rate};
 pub use resource::{Aspect, BufferDesc, BufferUsage, Contents, DepthStencilView, HostVisibility, LoadOp, RenderTargetSet, RenderTargetView, StoreOp, TextureDesc, TextureDimension, TextureUsage, TextureViewDesc};
-pub use submission::{Completion, Queue, ReadbackTicket, Status, Submission};
+pub use submission::{Completion, Queue, ReadbackResult, ReadbackTicket, ReadbackValue, Status, Submission};
 
 #[cfg(test)]
 mod tests;

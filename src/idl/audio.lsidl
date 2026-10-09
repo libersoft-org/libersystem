@@ -178,6 +178,15 @@ interface audio-control {
 	@op(3) set-volume:  func(device: u32, volume: u8) -> result<unit, error>;
 	@op(4) streams:     func() -> list<audio-stream-info>;
 	@op(5) counters:    func() -> audio-counters;
+	/// The effective microphone level, 0 to 100, independently controlled after the first explicit microphone set.
+	/// Before that, a software provider preserves the original combined device-level behavior. Reading never changes it.
+	/// Invalid for a device without recording input, including a phone/broadcast route; not-found for an absent device.
+	/// Unsupported while a hardware Bluetooth endpoint has reported no independent microphone level.
+	@op(6) microphone-volume: func(device: u32) -> result<u8, error>;
+	/// Set recording gain independently of the existing speaker/device level. A headset applies its own microphone
+	/// gain; otherwise captured samples are scaled here. Values above 100 are invalid. A definite refusal preserves
+	/// the level; transport loss may be commit-uncertain and retires that Bluetooth connection.
+	@op(7) set-microphone-volume: func(device: u32, volume: u8) -> result<unit, error>;
 }
 
 // ------------------------------------------------------------------ voice and calls

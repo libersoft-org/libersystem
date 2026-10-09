@@ -16,6 +16,9 @@
 
 use render_math::{Vec3, exp};
 
+/// Portable full-screen programs for executing this chain through any Render3D backend.
+pub mod shaders;
+
 /// Rec. 709 luminance in linear light, which is the same triple the image-colour profile uses.
 pub const LUMINANCE_REC709: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 

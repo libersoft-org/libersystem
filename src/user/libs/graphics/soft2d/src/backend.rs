@@ -43,7 +43,7 @@ use render2d::{Error, resource::FilterHandle};
 use crate::clip::{ClipLevel, ClipStack, write_mask_row};
 use crate::glyph::{GlyphImage, GlyphProvider, GlyphRaster, NoGlyphs};
 use crate::layer::{Layer, layer_bounds};
-use crate::paint::{ImageLookup, Ramp, Shader, ramp_for, shader, to_working};
+use crate::paint::{CachedPaint, ImageLookup, Ramp, Shader, ramp_for, shader, to_working};
 use crate::raster::Rasteriser;
 use crate::stroke::{StrokeParameters, dashed, outline};
 use crate::target::{ImageSource, NoImages, Raster};
@@ -76,6 +76,7 @@ enum Step {
 	},
 	Image {
 		edges: crate::raster::Edges,
+		opaque_rect: Option<PixelRect>,
 		paint: Paint,
 		transform: Transform,
 		blend: BlendMode,
@@ -159,6 +160,8 @@ enum Placed {
 
 /// What `prepare` produced.
 pub struct SoftPrepared {
+	cached_images: Vec<Option<CachedPaint>>,
+	covers: Vec<Option<PixelRect>>,
 	key: PreparedKey,
 	steps: Vec<Step>,
 	bounds: Vec<Option<PixelRect>>,
@@ -182,10 +185,10 @@ pub struct SoftPrepared {
 	damage: Option<PixelRect>,
 	/// THE PART OF EACH TILE THE ROUND TRIP COVERS - see `tile_regions`.
 	regions: Vec<PixelRect>,
-	/// WHICH TILES NEED NO DECODE OF THE TARGET, one flag per tile - see `tiles_without_backdrop`.
+	/// Tiles that need no decode, and the first visible command in bins containing only plain draws.
 	/// Worked out here rather than per frame, because it is a function of the list and the target
 	/// and a prepared list is already bound to both.
-	no_backdrop: Vec<bool>,
+	no_backdrop: Vec<Option<u32>>,
 	/// THE LANES THIS FRAME RUNS WITH - what the ceiling left room for, at most what the pool offered
 	/// and at most the units it is cut into - and HOW IT IS CUT: each unit a run of tiles, in serial
 	/// order.
@@ -197,6 +200,15 @@ pub struct SoftPrepared {
 }
 
 impl SoftPrepared {
+	#[cfg(test)]
+	pub(crate) fn discard_image_samples(&mut self) -> usize {
+		let count = self.cached_images.iter().flatten().count();
+		self.cached_images.clear();
+		// The cache may have proved an image opaque; the uncached comparison keeps the normal
+		// backdrop decode so the test also verifies that skipping it did not change any pixels.
+		self.no_backdrop.fill(None);
+		count
+	}
 	/// THE CONSERVATIVE DAMAGE of the whole list: the union of every command's bound, clipped to the
 	/// target. Exact damage would mean comparing old and new pixels - a source-over with alpha zero
 	/// changes nothing while covering a rectangle - and that cost defeats the purpose.
@@ -211,7 +223,7 @@ impl SoftPrepared {
 	/// fired correctly are indistinguishable from the target alone, and the first is what an
 	/// accidentally disabled fast path looks like for ever.
 	pub fn tiles_without_backdrop(&self) -> usize {
-		self.no_backdrop.iter().filter(|skipped| **skipped).count()
+		self.no_backdrop.iter().filter(|skipped| skipped.is_some()).count()
 	}
 
 	/// THE DAMAGE OF ONE DRAW, which is what a compositor asks when it wants to know what a single
@@ -337,6 +349,54 @@ impl<'a> Soft2d<'a> {
 	pub fn with_cancellation(mut self, cancellation: &'a dyn Cancellation) -> Self {
 		self.cancellation = Some(cancellation);
 		self
+	}
+
+	/// Release borrowed providers while retaining the renderer's allocated scratch and caches.
+	/// The returned backend uses serial workers until the caller supplies a pool again.
+	pub fn unbind(self) -> Soft2d<'static> {
+		Soft2d { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: self.unit_kind, cache: self.cache, lanes: self.lanes, shader_table: self.shader_table, unit_table: self.unit_table, finished: self.finished, intermediate: self.intermediate, tables: self.tables }
+	}
+
+	/// Refresh changed image content in place. The layout generation is structural and must still
+	/// match; no geometry, glyphs, filters, sampling precision or scratch reservations are changed.
+	pub fn refresh_images(&mut self, prepared: &mut SoftPrepared, records: &[ImageRecord]) -> Result<(), Error> {
+		if records.len() != prepared.images.len() || records.iter().zip(&prepared.images).any(|(a, b)| a.identity != b.identity || a.layout_generation != b.layout_generation) {
+			return Err(Error::DegenerateShape { what: "image layout changed; prepare the list again" });
+		}
+		// A later resource may refuse refresh after an earlier one changed alpha. Until every
+		// resource is settled, no previously computed opaque-coverage proof may skip a backdrop.
+		prepared.no_backdrop.fill(None);
+		for (index, record) in records.iter().enumerate() {
+			if record.content_generation == prepared.images[index].content_generation {
+				continue;
+			}
+			if let Some((_, pyramid)) = prepared.pyramids.iter_mut().find(|(image, _)| *image == index as u32) {
+				let space = self.images.planes(record.identity).map(|view| view.layout().color_space).or_else(|| self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space()));
+				let table = space.and_then(|space| Self::table_for(&self.tables, space.transfer()));
+				let sampler = match self.images.planes(record.identity) {
+					Some(view) => graphics_core::sample::Sampler::planar(view, prepared.working, graphics_core::sample::Spread::Clamp, table),
+					None => self.images.image(record.identity).ok_or(graphics_core::Error::Allocation).and_then(|view| graphics_core::sample::Sampler::with_table(view, prepared.working, graphics_core::sample::Spread::Clamp, table)),
+				}
+				.map_err(crate::target::from_core)?;
+				pyramid.refresh(&sampler).map_err(crate::target::from_core)?;
+			}
+			let lookup = Lookup { source: self.images, records: &prepared.images, pyramids: &prepared.pyramids, tables: &self.tables };
+			for (command, step) in prepared.steps.iter().enumerate() {
+				if let Step::Image { paint: paint @ Paint::Image { image, .. }, transform, opaque_rect, .. } = step {
+					if image.0 != index as u32 {
+						continue;
+					}
+					if let Some(cache) = prepared.cached_images.get_mut(command).and_then(Option::as_mut) {
+						let shader = shader(paint, transform, prepared.working, prepared.ramps[command].as_ref(), &lookup);
+						cache.refresh(&shader);
+						prepared.covers[command] = if cache.opaque() { *opaque_rect } else { None };
+					}
+				}
+			}
+			prepared.images[index] = *record;
+		}
+		refresh_tiles_without_backdrop(&prepared.tiling, &prepared.bins, &prepared.steps, &prepared.covers, &mut prepared.no_backdrop);
+		Ok(())
 	}
 
 	pub fn glyph_cache(&self) -> &GlyphRaster {
@@ -535,13 +595,19 @@ fn tile_regions(tiling: &Tiling, bins: &Bins, steps: &[Step], bounds: &[Option<P
 	answer
 }
 
-fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>]) -> Vec<bool> {
-	let mut answer: Vec<bool> = Vec::with_capacity(tiling.count());
+fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>]) -> Vec<Option<u32>> {
+	let mut answer = alloc::vec![None;tiling.count()];
+	refresh_tiles_without_backdrop(tiling, bins, steps, covers, &mut answer);
+	answer
+}
+
+fn refresh_tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>], answer: &mut [Option<u32>]) {
 	for index in 0..tiling.count() {
 		let tile = tiling.tile(index);
 		let mut clips: u32 = 0;
 		let mut layers: u32 = 0;
-		let mut covered_tile = false;
+		let mut covered_tile = None;
+		let simple = bins.commands(index).iter().all(|command| matches!(steps.get(*command as usize), Some(Step::Fill { .. } | Step::Image { .. } | Step::Glyphs { .. } | Step::AliasedLines { .. })));
 		for command in bins.commands(index) {
 			match steps.get(*command as usize) {
 				Some(Step::PushClip { .. } | Step::PushClipRect { .. } | Step::PushClipMask { .. }) => clips += 1,
@@ -550,15 +616,13 @@ fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: 
 				Some(Step::EndLayer) => layers = layers.saturating_sub(1),
 				_ => {
 					if clips == 0 && layers == 0 && covers.get(*command as usize).copied().flatten().is_some_and(|cover| cover.contains_rect(&tile)) {
-						covered_tile = true;
-						break;
+						covered_tile = Some(if simple { *command } else { 0 });
 					}
 				}
 			}
 		}
-		answer.push(covered_tile && !tile.is_empty());
+		answer[index] = if tile.is_empty() { None } else { covered_tile };
 	}
-	answer
 }
 
 /// A rectangle as a path, which is how an image's destination enters the one rasteriser.
@@ -605,6 +669,7 @@ impl<'a> Backend for Soft2d<'a> {
 					covers.push(opaque_cover(&contours, paint, *opacity, *blend, *operator).map(covered).map(|rect| rect.intersection(&target_rect)));
 					(Step::Fill { edges: crate::raster::Edges::build(&contours), rule: *rule, paint: *paint, transform: *transform, antialias: *antialias, blend: *blend, operator: *operator, opacity: *opacity }, bound)
 				}
+				// @handles: AnalyticCoverageStroke
 				Command::StrokePath { path, paint, style, transform, antialias, blend, operator, opacity } => {
 					// THE STROKE BECOMES A FILL HERE, IN `prepare`, and not per frame: the outline of
 					// a stroke is a function of the path, the style and the transform, all of which a
@@ -640,6 +705,7 @@ impl<'a> Backend for Soft2d<'a> {
 					// punch a hole at every place the pen crossed its own path.
 					(Step::Fill { edges: crate::raster::Edges::build(&contours), rule: FillRule::NonZero, paint: *paint, transform: *transform, antialias: *antialias, blend: *blend, operator: *operator, opacity: *opacity }, bound)
 				}
+				// @handles: ImageSourceDestRect
 				Command::DrawImage { image, source, destination, quality, transform, blend, operator, opacity } => {
 					let contours = rect_contours(*destination, transform);
 					let bound = contour_bounds(&contours).map(cover).map(|rect| rect.intersection(&target_rect));
@@ -649,7 +715,8 @@ impl<'a> Backend for Soft2d<'a> {
 					// rules about edges.
 					let mapping = source_to_destination(*source, *destination);
 					let paint = Paint::Image { image: *image, source: *source, quality: *quality, spread: graphics_core::sample::Spread::Clamp, transform: mapping };
-					(Step::Image { edges: crate::raster::Edges::build(&contours), paint, transform: *transform, blend: *blend, operator: *operator, opacity: *opacity }, bound)
+					let opaque_rect = if *opacity >= 1.0 && matches!(blend, BlendMode::Normal) && matches!(operator, Operator::SrcOver | Operator::Src) { axis_aligned_rect(&contours).map(covered).map(|rect| rect.intersection(&target_rect)) } else { None };
+					(Step::Image { edges: crate::raster::Edges::build(&contours), opaque_rect, paint, transform: *transform, blend: *blend, operator: *operator, opacity: *opacity }, bound)
 				}
 				Command::DrawGlyphRun { run, paint, transform, blend, operator, opacity } => {
 					let bound = glyph_run_bounds(resources, run.0, transform).map(|rect| rect.intersection(&target_rect));
@@ -768,7 +835,6 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 		let tiling = Tiling::new(target.extent, TILE_SIZE);
 		let bins = Bins::build(&tiling, &bounds);
-		let no_backdrop = tiles_without_backdrop(&tiling, &bins, &steps, &covers);
 		let regions = tile_regions(&tiling, &bins, &steps, &bounds);
 		let scratch_extent = (TILE_SIZE + expansion * 2, TILE_SIZE + expansion * 2);
 		// ONE SURFACE PER OPEN LAYER, one per filter node of the largest graph, one for the blur's
@@ -789,7 +855,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 		shape.reserve(&mut self.lanes[0])?;
 		let lane_bytes = self.lanes[0].scratch_bytes();
-		let fixed = lane_bytes + bins.scratch_bytes();
+		let fixed = lane_bytes + bins.scratch_bytes() + (tiling.count() * core::mem::size_of::<Option<u32>>() + covers.capacity() * core::mem::size_of::<Option<PixelRect>>()) as u64;
 		let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
 		// THE OPTIONAL COPIES ARE GIVEN BACK BEFORE ANYTHING IS REFUSED, newest first, against the list's
 		// own scratch and ONE lane's - so a frame that fitted before this optimisation existed still fits.
@@ -854,7 +920,7 @@ impl<'a> Backend for Soft2d<'a> {
 		self.unit_table.reserve(units.len().saturating_sub(self.unit_table.len()));
 		self.shader_table.reserve(steps.len().saturating_sub(self.shader_table.len()));
 
-		let ramps = steps
+		let ramps: Vec<_> = steps
 			.iter()
 			.map(|step| match step {
 				Step::Fill { paint, .. } | Step::Image { paint, .. } | Step::Glyphs { paint, .. } | Step::AliasedLines { paint, .. } => ramp_for(paint, working, &resources.stops),
@@ -862,8 +928,42 @@ impl<'a> Backend for Soft2d<'a> {
 			})
 			.collect();
 		let kernels = resources.filters.iter().map(crate::filter::kernels).collect();
+		// Image filtering depends on the prepared resources, not on the destination's contents.
+		// Cache those device-space samples if the admitted scratch still has room. Layer draws keep
+		// their sampler because filter expansion can reach outside the target-clipped command bound.
+		let mut cached_images = Vec::new();
+		let table_bytes = (steps.len() * core::mem::size_of::<Option<CachedPaint>>()) as u64;
+		if scratch_bytes + table_bytes <= ceiling && cached_images.try_reserve_exact(steps.len()).is_ok() {
+			scratch_bytes += table_bytes;
+			let lookup = Lookup { source: self.images, records: &resources.images, pyramids: &pyramids, tables: &self.tables };
+			let mut layers = 0usize;
+			for (index, step) in steps.iter().enumerate() {
+				let cached = match step {
+					Step::BeginLayer { .. } => {
+						layers += 1;
+						None
+					}
+					Step::EndLayer => {
+						layers = layers.saturating_sub(1);
+						None
+					}
+					Step::Image { paint, transform, opaque_rect, .. } if layers == 0 => bounds[index].filter(|rect| (rect.width as u64).saturating_mul(rect.height as u64).saturating_mul(core::mem::size_of::<Rgba>() as u64) <= ceiling - scratch_bytes).and_then(|rect| {
+						let prepared_shader = shader(paint, transform, working, ramps[index].as_ref(), &lookup);
+						let cache = CachedPaint::prepare(&prepared_shader, rect)?;
+						if cache.opaque() {
+							covers[index] = *opaque_rect;
+						}
+						scratch_bytes += cache.bytes();
+						Some(cache)
+					}),
+					_ => None,
+				};
+				cached_images.push(cached);
+			}
+		}
+		let no_backdrop = tiles_without_backdrop(&tiling, &bins, &steps, &covers);
 		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
-		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), ramps, filters: resources.filters.clone(), kernels, working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop, regions, lanes, unit_kind, units, slot_bytes })
+		Ok(SoftPrepared { cached_images, covers, key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), ramps, filters: resources.filters.clone(), kernels, working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop, regions, lanes, unit_kind, units, slot_bytes })
 	}
 
 	fn render(&mut self, prepared: &Self::Prepared, target: &mut ImageViewMut<'_>) -> Result<(), Error> {
@@ -886,9 +986,18 @@ impl<'a> Backend for Soft2d<'a> {
 		// tiles built every one of those sixteen thousand times. A gradient's ramp is the prepared
 		// list's, resolved once.
 		let mut shaders: Vec<Shader<'_>> = recycle(core::mem::take(shader_table));
-		shaders.extend(prepared.steps.iter().zip(prepared.ramps.iter()).map(|(step, ramp)| match step {
-			Step::Fill { paint, transform, .. } | Step::Image { paint, transform, .. } | Step::Glyphs { paint, transform, .. } | Step::AliasedLines { paint, transform, .. } => shader(paint, transform, prepared.working, ramp.as_ref(), &lookup),
-			_ => Shader::Nothing,
+		shaders.extend(prepared.steps.iter().zip(prepared.ramps.iter()).enumerate().map(|(index, (step, ramp))| {
+			if let Some(cache) = prepared.cached_images.get(index).and_then(Option::as_ref) {
+				match step {
+					Step::Image { paint: Paint::Image { image, .. }, .. } if lookup.lookup(image.0).is_some() || lookup.planes(image.0).is_some() => Shader::Cached(cache),
+					_ => Shader::Nothing,
+				}
+			} else {
+				match step {
+					Step::Fill { paint, transform, .. } | Step::Image { paint, transform, .. } | Step::Glyphs { paint, transform, .. } | Step::AliasedLines { paint, transform, .. } => shader(paint, transform, prepared.working, ramp.as_ref(), &lookup),
+					_ => Shader::Nothing,
+				}
+			}
 		}));
 		let table = tables.iter().find(|(kind, _)| *kind == prepared.target_transfer).map(|(_, table)| table);
 		let lanes = &mut lanes[..prepared.lanes.max(1)];
@@ -899,6 +1008,7 @@ impl<'a> Backend for Soft2d<'a> {
 		let stopped = AtomicBool::new(false);
 		let cancellation = *cancellation;
 		let shaders_ref: &[Shader<'_>] = &shaders;
+		let cached_sources_present = shaders.iter().zip(&prepared.cached_images).all(|(shader, cache)| cache.is_none() || !matches!(shader, Shader::Nothing));
 		let work = |lane: &mut Lane, unit: &mut Unit<'_>| {
 			// A UNIT HANDED OUT TWICE IS REPLAYED ONCE, and a unit after the lowest that failed is not
 			// replayed at all: the serial walk would never have reached it.
@@ -927,7 +1037,7 @@ impl<'a> Backend for Soft2d<'a> {
 					continue;
 				}
 				lane.tile.rebase((tile.x, tile.y));
-				if let Err(error) = replay(prepared, &mut unit.access, tile, index, lane, shaders_ref, &lookup, table) {
+				if let Err(error) = replay(prepared, &mut unit.access, tile, index, lane, shaders_ref, &lookup, table, cached_sources_present) {
 					failed.fetch_min(unit.index, Ordering::Relaxed);
 					if lane.failure.as_ref().is_none_or(|(at, _)| unit.index < *at) {
 						lane.failure = Some((unit.index, error));
@@ -1145,7 +1255,7 @@ fn assemble(target: &mut ImageViewMut<'_>, prepared: &SoftPrepared, intermediate
 /// Replay one tile: every command binned to it, in bin order, into the lane's tile surface - then
 /// encoded into the unit's part of the target.
 #[allow(clippy::too_many_arguments)]
-fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, index: usize, lane: &mut Lane, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>) -> Result<(), Error> {
+fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, index: usize, lane: &mut Lane, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>, cached_sources_present: bool) -> Result<(), Error> {
 	{
 		let Lane { raster, pool, masks, spans, tile: surface, clips, layers, nodes, .. } = lane;
 		// THE DECODE IS SKIPPED FOR A TILE SOMETHING OVERWRITES WHOLE. See `tiles_without_backdrop`:
@@ -1154,18 +1264,25 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 		// THE ROUND TRIP IS OVER WHAT CAN CHANGE - see `tile_regions` - and the tile is the answer
 		// whenever anything in it is not a plain draw.
 		let region = prepared.regions.get(index).copied().unwrap_or(tile);
-		if !prepared.no_backdrop.get(index).copied().unwrap_or(false) {
+		let first_command = prepared.no_backdrop.get(index).copied().flatten().filter(|_| cached_sources_present);
+		if first_command.is_none() {
 			surface.load(access, region, prepared.working, table)?;
 		}
 		// THE STACKS ARE THE LANE'S, reserved at `prepare` to the depths the list reaches.
 		clips.reset(tile);
 		layers.clear();
 		for command in prepared.bins.commands(index) {
+			// With no clips or layers, an opaque whole-tile overwrite also hides every earlier
+			// draw. Complex bins retain their full replay because filters may read outside a tile.
+			if *command < first_command.unwrap_or(0) {
+				continue;
+			}
 			let Some(step) = prepared.steps.get(*command as usize) else { continue };
 			match step {
 				// A FILL AND AN IMAGE ARE THE SAME DRAW with different paints, which is what makes an
 				// image one path through the rasteriser rather than a second blitter with its own
 				// rules about where an edge is.
+				// @handles: ImageOpacity
 				Step::Fill { edges, blend, operator, opacity, .. } | Step::Image { edges, blend, operator, opacity, .. } => {
 					let (rule, antialias) = match step {
 						Step::Fill { rule, antialias, .. } => (*rule, *antialias),
@@ -1204,6 +1321,7 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 					let bounds = bounds.intersection(&clips.bounds());
 					draw_aliased_lines(points, bounds, into, shader, clips, *opacity, *blend, *operator);
 				}
+				// @handles: ClipRoundedRect, ClipPath, ClipInverse
 				Step::PushClip { edges, rule, antialias, bounds, inverse } => {
 					let parent = match layers.last() {
 						Some(layer) => layer.bounds,
@@ -1240,6 +1358,7 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 						None => clips.push(ClipLevel::rectangle(level_bounds)),
 					}
 				}
+				// @handles: ClipRect
 				Step::PushClipRect { bounds } => {
 					let parent = match layers.last() {
 						Some(layer) => layer.bounds,
@@ -1247,6 +1366,7 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 					};
 					clips.push(ClipLevel::rectangle(parent.intersection(bounds)));
 				}
+				// @handles: ClipAlphaMask
 				Step::PushClipMask { image, transform, inverse } => {
 					let parent = match layers.last() {
 						Some(layer) => layer.bounds,
@@ -1295,6 +1415,7 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 						None => return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes }),
 					}
 				}
+				// @handles: LayerGroupOpacity, LayerBlendMode
 				Step::EndLayer => {
 					let Some(layer) = layers.pop() else { continue };
 					// A LAYER CLOSES ITS OWN CLIPS. One left open would apply to whatever came after
@@ -1551,6 +1672,7 @@ fn polyline_bounds(points: &[(i32, i32)]) -> Option<PixelRect> {
 /// and not changed - and each distinct key is resolved through the cache once, a miss decoded by the
 /// provider. An outline or a colour layer is flattened at its placed origin and its edges built there,
 /// once per placed glyph where a tile used to do it in every tile the run reached.
+// @handles: GlyphTransform, GlyphSubpixelPositioning
 fn place_glyphs(cache: &mut GlyphRaster, provider: &dyn GlyphProvider, run: &render2d::list::RecordedGlyphRun, transform: &Transform, working: Working, widest_edges: &mut usize) -> Vec<Placed> {
 	let mut placed = Vec::with_capacity(run.glyphs.len());
 	let mut pen_x = run.origin_x;
@@ -1600,6 +1722,7 @@ fn place_glyphs(cache: &mut GlyphRaster, provider: &dyn GlyphProvider, run: &ren
 
 /// Draw a run's placed glyphs into a tile, from the prepared list alone.
 #[allow(clippy::too_many_arguments)]
+// @handles: GlyphOutlines, GlyphGrayscaleMask, GlyphBitmapStrike, GlyphColorLayers, GlyphEmbeddedColorBitmap, AnalyticCoverageGlyph
 fn draw_placed(raster: &mut Rasteriser, spans: &mut Spans, placed: &[Placed], bounds: PixelRect, into: &mut dyn Raster, shader: &Shader<'_>, clips: &ClipStack, opacity: f32, blend: BlendMode, operator: Operator, working: Working) {
 	for glyph in placed {
 		match glyph {

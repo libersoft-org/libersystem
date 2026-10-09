@@ -34,6 +34,8 @@ method audio-control.set-default op=2 (device:u32:rights=,direction:audio-direct
 method audio-control.set-volume op=3 (device:u32:rights=,volume:u8:rights=) -> result<unit, liber:base@1::error>
 method audio-control.streams op=4 () -> list<audio-stream-info>
 method audio-control.counters op=5 () -> audio-counters
+method audio-control.microphone-volume op=6 (device:u32:rights=) -> result<u8, liber:base@1::error>
+method audio-control.set-microphone-volume op=7 (device:u32:rights=,volume:u8:rights=) -> result<unit, liber:base@1::error>
 enum call-state(none=0,incoming=1,outgoing=2,active=3,held=4)
 enum call-command(answer=1,hang-up=2,reject=3,redial=4)
 interface voice-session

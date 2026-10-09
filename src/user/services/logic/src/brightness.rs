@@ -278,12 +278,14 @@ pub enum BacklightTarget {
 
 /// One backlight as the join sees it: its kind, its target, and the binding that publishes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Candidate {
+pub struct Candidate<'a> {
 	pub kind: Kind,
 	pub target: BacklightTarget,
 	pub publisher: Function,
 	/// Left out of the join: its provider stopped answering.
 	pub failed: bool,
+	pub firmware_display_id: Option<u32>,
+	pub stable_key: &'a str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -323,9 +325,9 @@ pub struct Place {
 
 /// THE JOIN for output 0, run whenever a backlight appears or leaves or the output's source changes: each candidate's
 /// reason, if it joins, and its standing. Precedence native, then firmware by adapter, then USB by EDID, then single
-/// output; a tie goes to the earlier candidate, which is arrival order. A USB backlight joins by `single-output` only
+/// output; firmware ties prefer the internal flat panel (_ADR bits11:8 ==4), then namespace order. Other ties use arrival order. A USB backlight joins by `single-output` only
 /// when nothing joined by the other rules and it is the only USB backlight left unjoined.
-pub fn join(output: &Output, candidates: &[Candidate]) -> Vec<Place> {
+pub fn join(output: &Output, candidates: &[Candidate<'_>]) -> Vec<Place> {
 	let mut reasons: Vec<Option<Reason>> = candidates
 		.iter()
 		.map(|candidate| {
@@ -346,7 +348,19 @@ pub fn join(output: &Output, candidates: &[Candidate]) -> Vec<Place> {
 			reasons[only] = Some(Reason::SingleOutput);
 		}
 	}
-	let winner = reasons.iter().enumerate().filter_map(|(at, reason)| reason.map(|reason| (reason.rank(), at))).min().map(|(_, at)| at);
+	let winner = reasons
+		.iter()
+		.enumerate()
+		.filter_map(|(at, reason)| {
+			reason.map(|reason| {
+				let candidate = &candidates[at];
+				let firmware = reason == Reason::FirmwareAdapter;
+				let internal = candidate.firmware_display_id.is_some_and(|id| (id >> 8) & 0xf == 4);
+				(reason.rank(), u8::from(firmware && !internal), if firmware { candidate.stable_key } else { "" }, at)
+			})
+		})
+		.min()
+		.map(|(_, _, _, at)| at);
 	reasons
 		.iter()
 		.enumerate()

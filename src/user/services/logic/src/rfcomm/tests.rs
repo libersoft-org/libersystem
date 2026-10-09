@@ -188,3 +188,38 @@ fn room_bounds_a_writer_and_a_paused_reader_holds_the_peer() {
 	assert_eq!(moved.iter().filter(|out| matches!(out, Out::Send(_))).count(), 7);
 	assert_eq!(a.room(3), QUEUED_FRAMES.saturating_sub(1) * frame);
 }
+
+#[test]
+fn microphone_gain_commits_only_after_a_bounded_open_dlc_accepts_the_line() {
+	use crate::hfp::{GainRefusal, Gateway};
+	for headset in [false, true] {
+		let mut gateway = Gateway::new(headset);
+		let mut a = Session::new(true, 1691);
+		let mut b = Session::new(false, 1691);
+		assert_eq!(gateway.queue_microphone_gain(6, &mut a, 3), Err(GainRefusal::Closed));
+		assert_eq!(gateway.microphone_gain(), 10);
+		let first = a.connect(3).unwrap();
+		pump(&mut a, &mut b, first, &mut |_| Admission::Accept);
+		let update = gateway.queue_microphone_gain(6, &mut a, 3).unwrap();
+		let (_, received) = pump(&mut a, &mut b, update, &mut |_| Admission::Accept);
+		assert!(received.iter().any(|out| matches!(out, Out::Data(3, bytes) if bytes == b"\r\n+VGM: 6\r\n")));
+		assert_eq!(gateway.microphone_gain(), 6);
+		assert_eq!(gateway.speaker_gain(), 10);
+		assert_eq!(gateway.queue_microphone_gain(16, &mut a, 3), Err(GainRefusal::Invalid));
+		// Exhaust credits without delivering frames and fill exactly the existing queue bound.
+		let frame = a.dlc(3).unwrap().frame;
+		let credits = usize::from(a.dlc(3).unwrap().tx_credits);
+		a.write(3, &alloc::vec![0x55; (credits + QUEUED_FRAMES) * frame]).unwrap();
+		let before = a.dlc(3).unwrap().queue.clone();
+		assert_eq!(a.room(3), 0);
+		for _ in 0..100 {
+			assert_eq!(gateway.queue_microphone_gain(12, &mut a, 3), Err(GainRefusal::Full));
+		}
+		assert_eq!(a.dlc(3).unwrap().queue, before, "refused updates must not accumulate bytes");
+		assert_eq!(gateway.microphone_gain(), 6);
+		assert_eq!(gateway.speaker_gain(), 10);
+		a.disconnect(3);
+		assert_eq!(gateway.queue_microphone_gain(12, &mut a, 3), Err(GainRefusal::Closed));
+		assert_eq!(gateway.microphone_gain(), 6);
+	}
+}

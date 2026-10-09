@@ -74,6 +74,8 @@ declare -A GATES=(
 	["icd-selection"]="tools/check-icd-selection.sh"
 	["bluetooth-service"]="tools/check-bluetooth-service.sh"
 	["bluetooth-classic"]="tools/check-bluetooth-classic.sh"
+	["bluetooth-codecs"]="python3 tools/check-bluetooth-codecs.py"
+	["bluetooth-independent"]="python3 tools/check-bluetooth-independent.py"
 	["bluetooth-input"]="tools/check-bluetooth-input.sh"
 	["bluetooth-le"]="tools/check-bluetooth-le.sh"
 	["bluetooth-audio"]="tools/check-bluetooth-audio.sh"
@@ -93,6 +95,7 @@ declare -A GATES=(
 	# AND THROUGH THE FIRMWARE, on the ACPI fixture: the panel joined by its adapter, its hotkeys, the keypad, automatic
 	# brightness through `_ALR` and the stored level restored across a reset.
 	["brightness-acpi"]="tools/check-brightness-acpi.sh"
+	["brightness-acpi-no-dos"]="tools/check-brightness-acpi.sh --no-dos"
 	# IPMI ON x86_64 q35: the five system interfaces against QEMU's simulated BMCs, a pair, the harness's own BMC with
 	# its hostile modes, malformed records and an orderly reboot - through the drivers, the BMC service and the tool.
 	["ipmi"]="tools/check-ipmi.sh"
@@ -204,6 +207,14 @@ declare -A GATES=(
 	# read back after a cold reboot with `lsblk` naming the controller; the paired volume chosen over an unpaired
 	# LiberFS decoy; and a paired volume no driver bound before it can reach refused by name.
 	["boot-volume-controllers"]="tools/check-boot-volume-controllers.sh"
+	["boot-volume-controllers-aarch64"]="tools/check-boot-volume-controllers.sh --arch aarch64"
+	["boot-volume-controllers-riscv64"]="tools/check-boot-volume-controllers.sh --arch riscv64"
+	["camera-usb"]="tools/check-camera-usb.sh"
+	["camera-usb-aarch64"]="tools/check-camera-usb.sh --arch aarch64"
+	["camera-usb-riscv64"]="tools/check-camera-usb.sh --arch riscv64"
+	["virtio-gpu-edid"]="tools/check-virtio-gpu-edid.sh"
+	["virtio-gpu-edid-aarch64"]="tools/check-virtio-gpu-edid.sh --arch aarch64"
+	["virtio-gpu-edid-riscv64"]="tools/check-virtio-gpu-edid.sh --arch riscv64"
 	# THE HARDWARE WATCHDOG on development instances of its own, one device at a time: the i6300esb, q35's TCO and a
 	# WDAT over it each armed by name and fed through three timeouts, and each expiring - `watchdog` in QEMU's run
 	# state under `-action watchdog=pause` - once ServiceManager stops answering `alive`; the i6300esb also through a
@@ -222,6 +233,8 @@ declare -A GATES=(
 	# test for every feature, and no test claiming a feature the profile does not have. Host-only and
 	# seconds; the two coverage halves report NOT PERFORMED until a backend and a suite exist.
 	["graphics-profile"]="tools/check-graphics-profile.sh"
+	# The frozen native serial replay floor; a missed budget is a failing gate.
+	["soft2d-performance"]="tools/check-soft2d-performance.sh"
 	# THE OPENTYPE PROFILE, which bounds what a FONT may contain rather than what a backend must
 	# draw. Its publication is a START GATE for the parser that reads untrusted font bytes, and a
 	# start gate that drifts before the work begins has bounded nothing. Host-only and seconds.

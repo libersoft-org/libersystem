@@ -44,6 +44,7 @@ fn plain(minify: Filter, magnify: Filter, mip: Filter) -> Sampler {
 	Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, wrap_w: Wrap::ClampToEdge, minify, magnify, mip, ..Sampler::NEAREST }
 }
 
+// @covers: MinNearest
 pub fn min_nearest() -> Outcome {
 	// MINIFICATION IS THE FILTER USED WHEN A TEXEL IS SMALLER THAN A PIXEL, and `magnifying` is what
 	// selects between the two. Nearest picks ONE texel, which here is a value none of the others
@@ -55,6 +56,7 @@ pub fn min_nearest() -> Outcome {
 	Ok(())
 }
 
+// @covers: MinLinear
 pub fn min_linear() -> Outcome {
 	// LINEAR MINIFICATION AVERAGES THE FOUR TEXELS AROUND THE COORDINATE, so a point at the centre of
 	// a two-by-two image is a quarter of each - a value no single texel has.
@@ -65,6 +67,7 @@ pub fn min_linear() -> Outcome {
 	Ok(())
 }
 
+// @covers: MagNearest
 pub fn mag_nearest() -> Outcome {
 	// AND THE MAGNIFYING FILTER IS A SEPARATE FIELD, which is what a backend that used one filter for
 	// both would get wrong: the same coordinate under the same sampler answers differently depending
@@ -76,6 +79,7 @@ pub fn mag_nearest() -> Outcome {
 	Ok(())
 }
 
+// @covers: MagLinear
 pub fn mag_linear() -> Outcome {
 	let texture = quad_texture();
 	let sampler = plain(Filter::Nearest, Filter::Linear, Filter::Nearest);
@@ -84,6 +88,7 @@ pub fn mag_linear() -> Outcome {
 	Ok(())
 }
 
+// @covers: MipNearest
 pub fn mip_nearest() -> Outcome {
 	// NEAREST MIP FILTERING PICKS ONE LEVEL AND READS IT, so a level of 1.4 reads level one exactly
 	// and a level of 1.6 reads level two exactly. A backend that blended would answer something in
@@ -104,6 +109,7 @@ pub fn mip_nearest() -> Outcome {
 	Ok(())
 }
 
+// @covers: MipLinear
 pub fn mip_linear() -> Outcome {
 	// LINEAR MIP FILTERING BLENDS THE TWO LEVELS BY THE FRACTION, which is a value neither level has.
 	let texture = levelled();
@@ -113,6 +119,7 @@ pub fn mip_linear() -> Outcome {
 	Ok(())
 }
 
+// @covers: Trilinear
 pub fn trilinear() -> Outcome {
 	// TRILINEAR IS LINEAR IN BOTH DIRECTIONS AT ONCE: within each level and between the two. This is
 	// the combination, and the value it produces is one neither of the other two filters can.
@@ -143,6 +150,7 @@ fn wrapped(wrap: Wrap) -> Sampler {
 	Sampler { wrap_u: wrap, wrap_v: wrap, wrap_w: wrap, minify: Filter::Nearest, magnify: Filter::Nearest, mip: Filter::Nearest, ..Sampler::NEAREST }
 }
 
+// @covers: SamplerWrapClamp
 pub fn sampler_wrap_clamp() -> Outcome {
 	// CLAMP READS THE EDGE TEXEL FOR EVERYTHING OUTSIDE, which is what stops a stretched image
 	// wrapping round to its other side.
@@ -155,6 +163,7 @@ pub fn sampler_wrap_clamp() -> Outcome {
 	Ok(())
 }
 
+// @covers: SamplerWrapRepeat
 pub fn sampler_wrap_repeat() -> Outcome {
 	// REPEAT IS THE EUCLIDEAN REMAINDER, which is the rule that makes `-0.25` and `0.75` the SAME
 	// texel. The language's `%` gives `-0.25` for the first, which lands somewhere else - and the
@@ -169,6 +178,7 @@ pub fn sampler_wrap_repeat() -> Outcome {
 	Ok(())
 }
 
+// @covers: SamplerWrapMirror
 pub fn sampler_wrap_mirror() -> Outcome {
 	// MIRROR REFLECTS EVERY OTHER PERIOD, which is what makes a mirrored tile seamless: the sequence
 	// of texels read as the coordinate goes past one is the REVERSE of the sequence below it, so a
@@ -194,6 +204,7 @@ pub fn sampler_wrap_mirror() -> Outcome {
 	Ok(())
 }
 
+// @covers: SamplerWrapBorder
 pub fn sampler_wrap_border() -> Outcome {
 	// BORDER READS A COLOUR THAT IS NOT IN THE IMAGE AT ALL, which is what makes a clamped-to-border
 	// read distinguishable from a clamped-to-edge one.
@@ -206,6 +217,7 @@ pub fn sampler_wrap_border() -> Outcome {
 	Ok(())
 }
 
+// @covers: LodBias
 pub fn lod_bias() -> Outcome {
 	// A BIAS IS ADDED TO THE COMPUTED LEVEL, which is what lets an application sharpen or soften a
 	// whole material without touching its coordinates.
@@ -227,6 +239,7 @@ pub fn lod_bias() -> Outcome {
 	Ok(())
 }
 
+// @covers: LodClamp
 pub fn lod_clamp() -> Outcome {
 	// AND THE CLAMPS BOUND IT AFTERWARDS, which is what stops a bias walking off the end of the
 	// chain: a maximum of zero pins every read to the sharpest level however it was computed, and a
@@ -247,6 +260,7 @@ pub fn lod_clamp() -> Outcome {
 	Ok(())
 }
 
+// @covers: DepthCompareSampling
 pub fn depth_compare_sampling() -> Outcome {
 	// A DEPTH-COMPARE READ ANSWERS A COVERAGE AND NOT A COLOUR: the reference is compared against the
 	// stored depth and what comes back is how much of the read passed. That is what a shadow map is,
@@ -272,6 +286,7 @@ pub fn depth_compare_sampling() -> Outcome {
 	Ok(())
 }
 
+// @covers: Anisotropy8
 pub fn anisotropy8() -> Outcome {
 	// ANISOTROPY IS FOR THE GRAZING CASE and is defined against the isotropic answer: a footprint
 	// four texels wide and one tall would take a level chosen by the LONG axis under an isotropic

@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use graphics_core::ImageView;
-use graphics_core::geom::{PointF, RectF};
+use graphics_core::geom::{PixelRect, PointF, RectF};
 use graphics_core::pixel::{Rgba, Working};
 use graphics_core::sample::{Pyramid, Quality, Sampler, Spread};
 use render2d::paint::{Color, GradientStop, Paint};
@@ -32,6 +32,7 @@ pub struct Ramp {
 }
 
 impl Ramp {
+	// @handles: GradientMultiStop
 	pub fn new(stops: &[GradientStop], working: Working) -> Self {
 		let mut resolved: Vec<(f32, Rgba)> = Vec::with_capacity(stops.len());
 		for stop in stops {
@@ -75,6 +76,7 @@ impl Ramp {
 /// A paint, ready to be evaluated at a device point.
 pub enum Shader<'a> {
 	Solid(Rgba),
+	Cached(&'a CachedPaint),
 	Linear {
 		ramp: &'a Ramp,
 		from: PointF,
@@ -134,8 +136,10 @@ impl Shader<'_> {
 	/// is the dispatch, not a multiply.
 	pub fn row(&self, x: u32, y: u32, out: &mut [Rgba]) {
 		match self {
+			Shader::Cached(cache) => cache.row(x, y, out),
 			Shader::Solid(colour) => out.fill(*colour),
 			Shader::Nothing => out.fill(Rgba::TRANSPARENT),
+			// @handles: PaintLinearGradient
 			Shader::Linear { ramp, from, axis, length_squared, spread, inverse } => {
 				// A DEGENERATE GRADIENT IS DECIDED ONCE FOR THE ROW AND NOT ONCE PER PIXEL. Its
 				// length does not vary along a span - it does not vary at all - so the test inside
@@ -157,6 +161,7 @@ impl Shader<'_> {
 					};
 				}
 			}
+			// @handles: PaintRadialGradient
 			Shader::Radial { ramp, from, from_radius, to, to_radius, spread, inverse } => {
 				for (offset, slot) in out.iter_mut().enumerate() {
 					let point = PointF { x: (x + offset as u32) as f32 + 0.5, y: y as f32 + 0.5 };
@@ -211,6 +216,7 @@ impl Shader<'_> {
 	pub fn at(&self, x: f32, y: f32) -> Rgba {
 		let point = PointF { x: x + 0.5, y: y + 0.5 };
 		match self {
+			Shader::Cached(cache) => cache.at(x, y),
 			Shader::Solid(colour) => *colour,
 			Shader::Nothing => Rgba::TRANSPARENT,
 			Shader::Linear { ramp, from, axis, length_squared, spread, inverse } => {
@@ -230,6 +236,7 @@ impl Shader<'_> {
 					None => Rgba::TRANSPARENT,
 				}
 			}
+			// @handles: PaintConicGradient
 			Shader::Conic { ramp, centre, start_angle, end_angle, spread, inverse } => {
 				let Some(local) = inverse.map_point(point) else { return Rgba::TRANSPARENT };
 				let angle = libm::atan2f(local.y - centre.y, local.x - centre.x);
@@ -246,6 +253,7 @@ impl Shader<'_> {
 				}
 				ramp.at(spread_position(position, *spread))
 			}
+			// @handles: PaintImagePattern, ImageProjective, ImageNearest, ImageBilinear, ImageBicubic, ImageMipmappedMinification
 			Shader::Image { sampler, pyramid, quality, spread, inverse, source } => {
 				// THE INVERSE MAPS A DEVICE PIXEL BACK INTO THE IMAGE'S OWN TEXEL COORDINATES, which
 				// is what the paint's transform is stated in - so the source rectangle is already
@@ -278,7 +286,66 @@ impl Shader<'_> {
 	}
 }
 
+/// Samples of an image paint at device pixel centres. The prepared list fixes its transform,
+/// source generations and quality; replay still rasterises coverage and composites the live
+/// backdrop. Stored f32 channels are exactly the shader's answers, with no extra quantisation.
+pub struct CachedPaint {
+	bounds: PixelRect,
+	values: Vec<Rgba>,
+}
+
+impl CachedPaint {
+	pub(crate) fn prepare(shader: &Shader<'_>, bounds: PixelRect) -> Option<Self> {
+		if bounds.is_empty() {
+			return None;
+		}
+		let count = (bounds.width as usize).checked_mul(bounds.height as usize)?;
+		let mut values = Vec::new();
+		values.try_reserve_exact(count).ok()?;
+		values.resize(count, Rgba::TRANSPARENT);
+		for (row, values) in values.chunks_exact_mut(bounds.width as usize).enumerate() {
+			shader.row(bounds.x, bounds.y + row as u32, values);
+		}
+		Some(Self { bounds, values })
+	}
+
+	pub(crate) fn bytes(&self) -> u64 {
+		(self.values.capacity() * core::mem::size_of::<Rgba>()) as u64
+	}
+	pub(crate) fn refresh(&mut self, shader: &Shader<'_>) {
+		for (row, values) in self.values.chunks_exact_mut(self.bounds.width as usize).enumerate() {
+			shader.row(self.bounds.x, self.bounds.y + row as u32, values);
+		}
+	}
+	pub(crate) fn opaque(&self) -> bool {
+		self.values.iter().all(|value| value.alpha == 1.0)
+	}
+
+	fn row(&self, x: u32, y: u32, out: &mut [Rgba]) {
+		out.fill(Rgba::TRANSPARENT);
+		let Some(row) = y.checked_sub(self.bounds.y).filter(|row| *row < self.bounds.height) else { return };
+		// A tile's span can straddle the image bounds. Only covered pixels are consumed by the
+		// rasteriser, but the cached part of that span must still be returned.
+		let left = (x as usize).max(self.bounds.x as usize);
+		let right = (x as usize + out.len()).min(self.bounds.x as usize + self.bounds.width as usize);
+		if left < right {
+			let start = row as usize * self.bounds.width as usize + left - self.bounds.x as usize;
+			out[left - x as usize..right - x as usize].copy_from_slice(&self.values[start..start + right - left]);
+		}
+	}
+
+	fn at(&self, x: f32, y: f32) -> Rgba {
+		if x < 0.0 || y < 0.0 {
+			return Rgba::TRANSPARENT;
+		}
+		let mut pixel = [Rgba::TRANSPARENT];
+		self.row(x as u32, y as u32, &mut pixel);
+		pixel[0]
+	}
+}
+
 /// Bring a texel coordinate into a source rectangle under a spread mode.
+// @handles: ImageWrapClamp, ImageWrapRepeat, ImageWrapMirror
 fn wrap_into(source: RectF, texel: PointF, spread: Spread) -> PointF {
 	if source.width <= 0.0 || source.height <= 0.0 {
 		return texel;
@@ -333,6 +400,7 @@ fn radial_position(point: PointF, from: PointF, from_radius: f32, to: PointF, to
 }
 
 /// Apply a spread mode to a gradient position.
+// @handles: SpreadClamp, SpreadRepeat, SpreadMirror
 pub fn spread_position(position: f32, spread: Spread) -> f32 {
 	if !position.is_finite() {
 		return 0.0;
@@ -375,6 +443,7 @@ pub fn ramp_for(paint: &Paint, working: Working, stops: &[Vec<GradientStop>]) ->
 ///
 /// THE INVERSE IS COMPUTED ONCE PER DRAW, not per pixel: it is a 3x3 adjugate, and a drawing that
 /// inverted its transform per pixel would spend more time on the inverse than on the paint.
+// @handles: PaintTransform
 pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, ramp: Option<&'a Ramp>, images: &'a dyn ImageLookup) -> Shader<'a> {
 	let combined = transform.concat(&paint.transform());
 	let Some(inverse) = combined.inverse() else {
@@ -384,6 +453,7 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, ramp: 
 		return Shader::Nothing;
 	};
 	match paint {
+		// @handles: PaintSolid
 		Paint::Solid(color) => Shader::Solid(to_working(*color, working)),
 		// A GRADIENT WITH NO RAMP names a stop list the list does not have, which `ramp_for` answered with
 		// nothing - and paints nothing, as it did when the lookup was made here.

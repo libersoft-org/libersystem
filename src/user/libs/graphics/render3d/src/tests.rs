@@ -570,7 +570,7 @@ fn a_render_target_set_holds_its_attachments_to_one_extent_and_one_sample_count(
 
 	// A resolve of a multisampled pass into a single-sample target of the same format.
 	let multi = [target("RGBA8", 4)];
-	let resolve = [Some(target("RGBA8", 1))];
+	let resolve = [Some(RenderTargetView { texture: 2, ..target("RGBA8", 1) })];
 	assert_eq!(RenderTargetSet { colour: &multi, depth_stencil: None, resolve: &resolve }.validate(&limits), Ok(()));
 	// A resolve that is a conversion is refused.
 	let converting = [Some(target("RGBA16F", 1))];
@@ -763,7 +763,7 @@ fn bindings_do_not_survive_the_end_of_a_pass() {
 // the draw rather than the pipeline.
 fn a_pipeline_whose_sample_count_disagrees_with_the_pass_is_refused_at_the_bind() {
 	let colour = [target("RGBA8", 4)];
-	let resolve = [Some(target("RGBA8", 1))];
+	let resolve = [Some(RenderTargetView { texture: 2, ..target("RGBA8", 1) })];
 	let set = RenderTargetSet { colour: &colour, depth_stencil: None, resolve: &resolve };
 	let mut list = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
 	list.begin_render_pass(0, &set).expect("a multisampled pass");
@@ -793,13 +793,15 @@ fn a_draw_is_refused_when_it_cannot_make_one_primitive() {
 	assert!(matches!(list.draw(Topology::LineList, 1, 1, 0, 0), Err(Error::InvalidMesh { reason: MeshFault::TooFewVertices { needs: 2, has: 1, .. } })));
 	list.draw(Topology::PointList, 1, 1, 0, 0).expect("one point is one primitive");
 	assert!(matches!(list.draw(Topology::PointList, 1, 0, 0, 0), Err(Error::InvalidMesh { .. })), "and no instances is no draw");
+	list.draw(Topology::TriangleList, 3, 1, 7, 0).expect("a nonzero first vertex is recorded");
+	list.draw(Topology::PointList, 1, 1, u32::MAX, 0).expect("the final representable vertex is allowed");
+	assert!(matches!(list.draw(Topology::TriangleList, 3, 1, u32::MAX - 1, 0), Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { .. } })), "the selected vertex range cannot wrap");
 }
 
 #[test]
-// AN INDEXED DRAW WITH NO INDEX BUFFER READS WHATEVER WAS BOUND LAST, and the BASE VERTEX IS SIGNED -
-// so the check is on the LARGEST index the draw can reach, which a per-index check at draw time
-// cannot do and this can.
-fn an_indexed_draw_needs_its_buffer_and_its_range_is_checked_through_the_base_vertex() {
+// Index positions and index VALUES are different. The recorder has only the former; actual
+// values and their signed base are checked by the backend when it ingests the bound storage.
+fn an_indexed_draw_checks_known_bounds_without_inventing_index_values() {
 	let colour = a_pass_target();
 	let set = RenderTargetSet { colour: &colour, depth_stencil: None, resolve: &[] };
 	let mut list = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
@@ -810,11 +812,12 @@ fn an_indexed_draw_needs_its_buffer_and_its_range_is_checked_through_the_base_ve
 	assert!(matches!(list.draw_indexed(Topology::TriangleList, 3, 1, 0, 0, 0, 64), Err(Error::InvalidRenderState { .. })), "no index buffer bound");
 	list.bind_index_buffer(Buffer(9), 0, false).expect("an index buffer");
 	list.draw_indexed(Topology::TriangleList, 3, 1, 0, 0, 0, 64).expect("inside the vertex buffer");
-	// The highest index the draw reaches is first_index + count - 1 + base_vertex.
-	assert!(matches!(list.draw_indexed(Topology::TriangleList, 3, 1, 62, 0, 0, 64), Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { .. } })));
-	// A NEGATIVE BASE VERTEX IS A READ BEFORE THE BUFFER, which is the case this check exists for.
-	assert!(matches!(list.draw_indexed(Topology::TriangleList, 3, 1, 0, -8, 0, 64), Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { .. } })));
-	list.draw_indexed(Topology::TriangleList, 3, 1, 8, -8, 0, 64).expect("a negative base that stays inside is fine");
+	list.draw_indexed(Topology::TriangleList, 6, 1, 0, 0, 0, 4).expect("two triangles share four vertices");
+	list.draw_indexed(Topology::TriangleList, 3, 1, 62, 0, 0, 4).expect("index positions62..64 may all hold values below4");
+	list.draw_indexed(Topology::TriangleList, 3, 1, 0, -8, 0, 4).expect("actual indices8..10 with base-8 may be valid");
+	assert!(matches!(list.draw_indexed(Topology::TriangleList, 3, 1, u32::MAX - 1, 0, 0, 4), Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { .. } })), "an index-buffer position cannot wrap");
+	assert!(matches!(list.draw_indexed(Topology::TriangleList, 3, 1, 0, 4, 0, 4), Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { .. } })), "every possible nonnegative index would be past the vertices");
+	assert!(matches!(list.draw_indexed(Topology::TriangleList, 3, 1, 0, -8, 0, 0), Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { .. } })), "no vertex storage");
 }
 
 #[test]

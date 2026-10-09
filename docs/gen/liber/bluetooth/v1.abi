@@ -98,12 +98,14 @@ record audio-endpoint(id:u32,peer:peer-address,name:string:bound=48,kind:audio-e
 record endpoint-volume(id:u32,volume:u8)
 enum bt-call-state(none=0,incoming=1,outgoing=2,active=3,held=4)
 enum bt-call-command(answer=1,hang-up=2,reject=3,redial=4)
-variant audio-event(arrived=0:audio-endpoint,departed=1:u32,volume=2:endpoint-volume,command=3:bt-call-command)
+variant audio-event(arrived=0:audio-endpoint,departed=1:u32,volume=2:endpoint-volume,command=3:bt-call-command,microphone-volume=4:endpoint-volume)
 interface bluetooth-audio
 method bluetooth-audio.endpoints op=1 () -> result<stream<audio-event>, liber:base@1::error>
 method bluetooth-audio.open op=2 (id:u32:rights=) -> result<handle<channel>, liber:base@1::error>
 method bluetooth-audio.set-volume op=3 (id:u32:rights=,volume:u8:rights=) -> result<unit, liber:base@1::error>
 method bluetooth-audio.set-call op=4 (state:bt-call-state:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-audio.microphone-volume op=5 (id:u32:rights=) -> result<u8, liber:base@1::error>
+method bluetooth-audio.set-microphone-volume op=6 (id:u32:rights=,volume:u8:rights=) -> result<u8, liber:base@1::error>
 record network-link(id:u32,peer:peer-address,name:string:bound=64,replace-uplink:bool)
 variant network-event(arrived=0:network-link,departed=1:u32)
 interface bluetooth-network

@@ -155,6 +155,25 @@ pub struct Rect {
 	pub height: u32,
 }
 
+/// Which typed attachment a one-pixel readback resolves. Integer identities never pass through floating point.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadbackAttachment {
+	Colour(u32),
+	Identity(u32),
+	ResolvedColour(u32),
+	ResolvedIdentity(u32),
+	Depth,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReadbackCommand {
+	pub targets: u32,
+	pub attachment: ReadbackAttachment,
+	pub x: u32,
+	pub y: u32,
+	pub destination: Buffer,
+}
+
 /// One recorded command. THE LIST IS THE FRAME, and a backend replays it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Command {
@@ -168,6 +187,7 @@ pub enum Command {
 	SetScissor(Rect),
 	Draw { vertices: u32, instances: u32, first_vertex: u32, first_instance: u32 },
 	DrawIndexed { indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32 },
+	Readback(ReadbackCommand),
 }
 
 /// What the recorder knows about the list so far. The state machine the refusals are about.
@@ -182,8 +202,18 @@ struct Recording {
 }
 
 /// A command list being recorded, or finished.
+/// Immutable attachment metadata for a recorded BeginRenderPass, in pass order.
+/// Backends must use these operations rather than a later caller-supplied readback descriptor.
+pub struct PassAttachments {
+	pub targets: u32,
+	pub colour: Vec<crate::resource::RenderTargetView>,
+	pub depth_stencil: Option<crate::resource::DepthStencilView>,
+	pub resolve: Vec<Option<crate::resource::RenderTargetView>>,
+}
+
 pub struct CommandList {
 	commands: Vec<Command>,
+	passes: Vec<PassAttachments>,
 	state: Recording,
 	limits: Render3DLimits,
 	/// The bytes the recorded commands occupy, against the device's own bound.
@@ -192,11 +222,15 @@ pub struct CommandList {
 
 impl CommandList {
 	pub fn new(limits: Render3DLimits) -> Self {
-		Self { commands: Vec::new(), state: Recording::default(), limits, bytes: 0 }
+		Self { commands: Vec::new(), passes: Vec::new(), state: Recording::default(), limits, bytes: 0 }
 	}
 
 	pub fn commands(&self) -> &[Command] {
 		&self.commands
+	}
+
+	pub fn passes(&self) -> &[PassAttachments] {
+		&self.passes
 	}
 
 	pub fn is_finished(&self) -> bool {
@@ -225,7 +259,17 @@ impl CommandList {
 			return Err(Error::InvalidRenderState { reason: "a render pass begun inside another one" });
 		}
 		set.validate(&self.limits)?;
+		// Preserve the actual operations; readback cannot replace a preceding StoreDiscard with a
+		// different descriptor supplied after that pass. Admission includes this metadata's bytes.
+		let metadata_bytes = core::mem::size_of::<PassAttachments>() as u64 + core::mem::size_of_val(set.colour) as u64 + core::mem::size_of_val(set.resolve) as u64;
+		let asked = self.bytes.saturating_add(metadata_bytes).saturating_add(core::mem::size_of::<Command>() as u64);
+		if asked > self.limits.max_command_bytes {
+			return Err(Error::LimitExceeded { limit: "command bytes", ceiling: self.limits.max_command_bytes, asked });
+		}
+		let metadata = PassAttachments { targets, colour: set.colour.to_vec(), depth_stencil: set.depth_stencil, resolve: set.resolve.to_vec() };
 		self.push(Command::BeginRenderPass { targets })?;
+		self.bytes += metadata_bytes;
+		self.passes.push(metadata);
 		self.state.in_pass = true;
 		// EVERY BINDING IS PER PASS. A pipeline bound in one pass is not bound in the next: the
 		// attachments changed, so the pipeline's compatibility with them has to be established
@@ -317,13 +361,17 @@ impl CommandList {
 		if instances == 0 {
 			return Err(Error::InvalidMesh { reason: MeshFault::TooFewVertices { topology: topology.name(), needs: 1, has: 0 } });
 		}
+		if first_vertex.checked_add(vertices - 1).is_none() {
+			return Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: u32::MAX, vertices } });
+		}
 		self.push(Command::Draw { vertices, instances, first_vertex, first_instance })?;
 		self.state.draws_in_pass += 1;
 		self.bound_draws()
 	}
 
-	/// An indexed draw. REFUSES WITHOUT AN INDEX BUFFER, which is the mistake that otherwise reads
-	/// whatever was bound last.
+	/// An indexed draw. Refuses missing bindings and impossible ranges here; the backend checks
+	/// each actual index plus the signed base against its vertex storage when it ingests the draw.
+	/// Index-buffer positions cannot establish vertex bounds: six indices may name four vertices.
 	pub fn draw_indexed(&mut self, topology: Topology, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32, vertices_available: u32) -> Result<(), Error> {
 		self.ready_to_draw()?;
 		if !self.state.index_buffer {
@@ -335,12 +383,15 @@ impl CommandList {
 		if instances == 0 {
 			return Err(Error::InvalidMesh { reason: MeshFault::TooFewVertices { topology: topology.name(), needs: 1, has: 0 } });
 		}
-		// THE BASE VERTEX IS SIGNED AND THE SUM IS CHECKED. A negative base with a small index is a
-		// read before the buffer, which is the case a per-index check at draw time cannot catch and
-		// this one can: the LARGEST index the draw can reach is bounded here.
-		let highest = (first_index as i64 + indices as i64 - 1) + base_vertex as i64;
-		if highest < 0 || highest >= vertices_available as i64 {
-			return Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: highest.max(0) as u32, vertices: vertices_available } });
+		// first_index is a POSITION IN THE INDEX BUFFER, not an index value. Repeated indices
+		// legitimately make the index count larger than the vertex count, and a negative base can
+		// be valid when the actual values are large enough. Those values are not in this recorder.
+		let last_position = first_index as u64 + indices as u64 - 1;
+		if last_position > u32::MAX as u64 {
+			return Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: u32::MAX, vertices: vertices_available } });
+		}
+		if vertices_available == 0 || base_vertex as i64 >= vertices_available as i64 {
+			return Err(Error::InvalidMesh { reason: MeshFault::IndexOutOfRange { index: base_vertex.max(0) as u32, vertices: vertices_available } });
 		}
 		self.push(Command::DrawIndexed { indices, instances, first_index, base_vertex, first_instance })?;
 		self.state.draws_in_pass += 1;
@@ -350,6 +401,39 @@ impl CommandList {
 	/// Finish recording. THE LIST IS IMMUTABLE AFTERWARDS, and a list finished with a pass still
 	/// open is refused: the attachments it wrote have no store operation applied, so what they hold
 	/// is undefined and a backend would have to invent an answer.
+	/// Record after a pass, in list order. The target descriptor supplies exact format, extent and store validity.
+	pub fn readback(&mut self, request: ReadbackCommand, set: &RenderTargetSet<'_>) -> Result<(), Error> {
+		if self.state.in_pass {
+			return Err(Error::InvalidRenderState { reason: "a readback recorded before the render pass ended" });
+		}
+		set.validate(&self.limits)?;
+		let (width, height, stored) = match request.attachment {
+			ReadbackAttachment::Colour(slot) | ReadbackAttachment::Identity(slot) => {
+				let view = set.colour.get(slot as usize).ok_or(Error::InvalidRenderState { reason: "a readback names no colour attachment" })?;
+				let integer = matches!(view.format, "R32_UINT" | "R32Uint");
+				if integer != matches!(request.attachment, ReadbackAttachment::Identity(_)) {
+					return Err(Error::InvalidRenderState { reason: "identity and colour readbacks have different attachment types" });
+				}
+				(view.width, view.height, view.store == crate::resource::StoreOp::Store)
+			}
+			ReadbackAttachment::ResolvedColour(slot) | ReadbackAttachment::ResolvedIdentity(slot) => {
+				let view = set.resolve.get(slot as usize).and_then(Option::as_ref).ok_or(Error::InvalidRenderState { reason: "readback names no resolve destination" })?;
+				if matches!(view.format, "R32_UINT" | "R32Uint") != matches!(request.attachment, ReadbackAttachment::ResolvedIdentity(_)) {
+					return Err(Error::InvalidRenderState { reason: "resolve destination and readback types disagree" });
+				}
+				(view.width, view.height, view.store == crate::resource::StoreOp::Store)
+			}
+			ReadbackAttachment::Depth => {
+				let view = set.depth_stencil.ok_or(Error::InvalidRenderState { reason: "a depth readback has no depth attachment" })?;
+				(view.width, view.height, view.depth_store == crate::resource::StoreOp::Store)
+			}
+		};
+		if request.x >= width || request.y >= height || !stored {
+			return Err(Error::InvalidRenderState { reason: "a readback is outside its attachment or reads discarded contents" });
+		}
+		self.push(Command::Readback(request))
+	}
+
 	pub fn finish(&mut self) -> Result<(), Error> {
 		if self.state.finished {
 			return Err(Error::InvalidRenderState { reason: "a list finished twice" });

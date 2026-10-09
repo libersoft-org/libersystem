@@ -30,6 +30,7 @@ pub struct StrokeParameters {
 }
 
 impl StrokeParameters {
+	// @handles: StrokeWidth
 	pub fn from_style(style: &StrokeStyle, device_scale: f32) -> Self {
 		let width = match style.scaling {
 			// THE WIDTH IS IN USER SPACE AND IS SCALED WITH THE DRAWING, which is what a shape scaled
@@ -141,6 +142,7 @@ fn normal_of(from: PointF, to: PointF, half: f32) -> Option<PointF> {
 }
 
 /// Add the join between two segment normals at a corner.
+// @handles: JoinMiter, JoinBevel, JoinRound, MiterLimit
 fn join_points(out: &mut Vec<PointF>, corner: PointF, from: PointF, to: PointF, half: f32, parameters: StrokeParameters) {
 	// THE TURN'S SIGN DECIDES WHICH SIDE IS OUTER. On the inner side the two offsets cross, and the
 	// crossing is left for the non-zero fill to resolve rather than trimmed here: trimming it needs
@@ -190,6 +192,7 @@ fn join_points(out: &mut Vec<PointF>, corner: PointF, from: PointF, to: PointF, 
 }
 
 /// Add the cap that closes one end of an open stroke.
+// @handles: CapButt, CapRound, CapSquare
 fn cap_points(out: &mut Vec<PointF>, before: PointF, end: PointF, half: f32, cap: Cap) {
 	let Some(normal) = normal_of(before, end, half) else { return };
 	let direction = PointF { x: -normal.y, y: normal.x };
@@ -221,6 +224,7 @@ fn cap_points(out: &mut Vec<PointF>, before: PointF, end: PointF, half: f32, cap
 /// query answers - so a dash pattern and a label placed at a distance agree about where they are. The
 /// phase is where in the pattern the first dash starts, and an odd-length pattern repeats with its
 /// roles swapped.
+// @handles: StrokeDash
 pub fn dashed(contours: &[Contour], pattern: &[f32], phase: f32) -> Vec<Contour> {
 	let total: f32 = pattern.iter().filter(|length| length.is_finite() && **length > 0.0).sum();
 	if !(total.is_finite() && total > 0.0) {

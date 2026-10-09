@@ -8698,6 +8698,8 @@ pub enum AudioEvent {
 	Volume(EndpointVolume),
 	/// A voice device's call command.
 	Command(BtCallCommand),
+	/// An independent headset microphone gain changed. Existing variants retain their wire tags and payloads.
+	MicrophoneVolume(EndpointVolume),
 }
 
 impl AudioEvent {
@@ -8753,6 +8755,10 @@ impl AudioEvent {
 				w.u8(3)?;
 				v216.write(w)?;
 			}
+			AudioEvent::MicrophoneVolume(v217) => {
+				w.u8(4)?;
+				v217.write(w)?;
+			}
 		}
 		Some(())
 	}
@@ -8762,6 +8768,7 @@ impl AudioEvent {
 			1 => Some(AudioEvent::Departed(r.u32()?)),
 			2 => Some(AudioEvent::Volume(EndpointVolume::read(r)?)),
 			3 => Some(AudioEvent::Command(BtCallCommand::read(r)?)),
+			4 => Some(AudioEvent::MicrophoneVolume(EndpointVolume::read(r)?)),
 			_ => None,
 		}
 	}
@@ -8781,6 +8788,8 @@ pub mod bluetooth_audio {
 	pub const OP_OPEN: u16 = 2;
 	pub const OP_SET_VOLUME: u16 = 3;
 	pub const OP_SET_CALL: u16 = 4;
+	pub const OP_MICROPHONE_VOLUME: u16 = 5;
+	pub const OP_SET_MICROPHONE_VOLUME: u16 = 6;
 
 	pub trait Service {
 		/// The endpoints offered now, then every change, as a stream. One subscriber: a second is refused.
@@ -8790,6 +8799,11 @@ pub mod bluetooth_audio {
 		fn set_volume(&mut self, id: u32, volume: u8) -> Result<(), Error>;
 		/// The call state the voice device reports; none when no session declares one.
 		fn set_call(&mut self, state: BtCallState) -> Result<(), Error>;
+		/// The headset's current independent microphone level; unsupported where the profile offers no microphone control.
+		fn microphone_volume(&mut self, id: u32) -> Result<u8, Error>;
+		/// Independent HFP/HSP microphone gain, 0 to 100; does not alter the speaker level. Invalid above 100.
+		/// Returns the actual level after the profile's gain quantization.
+		fn set_microphone_volume(&mut self, id: u32, volume: u8) -> Result<u8, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -8821,14 +8835,14 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v217) => {
+						Ok(v218) => {
 							w.u8(1)?;
-							w.set_handle(*v217)?;
+							w.set_handle(*v218)?;
 							w.u32(0)?;
 						}
-						Err(v218) => {
+						Err(v219) => {
 							w.u8(0)?;
-							v218.write(w)?;
+							v219.write(w)?;
 						}
 					}
 					Some(())
@@ -8860,12 +8874,12 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v219) => {
+						Ok(v220) => {
 							w.u8(1)?;
 						}
-						Err(v220) => {
+						Err(v221) => {
 							w.u8(0)?;
-							v220.write(w)?;
+							v221.write(w)?;
 						}
 					}
 					Some(())
@@ -8896,12 +8910,87 @@ pub mod bluetooth_audio {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v221) => {
+						Ok(v222) => {
 							w.u8(1)?;
 						}
-						Err(v222) => {
+						Err(v223) => {
 							w.u8(0)?;
-							v222.write(w)?;
+							v223.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_MICROPHONE_VOLUME => {
+				let id = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.microphone_volume(id);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v224) => {
+							w.u8(1)?;
+							w.u8(*v224)?;
+						}
+						Err(v225) => {
+							w.u8(0)?;
+							v225.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_MICROPHONE_VOLUME => {
+				let id = r.u32()?;
+				let volume = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_microphone_volume(id, volume);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v226) => {
+							w.u8(1)?;
+							w.u8(*v226)?;
+						}
+						Err(v227) => {
+							w.u8(0)?;
+							v227.write(w)?;
 						}
 					}
 					Some(())
@@ -9209,6 +9298,73 @@ pub mod bluetooth_audio {
 			}
 			decoded
 		}
+		pub fn microphone_volume(&mut self, id: &u32) -> Option<Result<u8, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_MICROPHONE_VOLUME)?;
+			w.u32(corr)?;
+			w.u32(*id)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u8()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_microphone_volume(&mut self, id: &u32, volume: &u8) -> Option<Result<u8, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_MICROPHONE_VOLUME)?;
+			w.u32(corr)?;
+			w.u32(*id)?;
+			w.u8(*volume)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u8()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -9241,6 +9397,22 @@ pub mod bluetooth_audio {
 	fn channel_invoke_set_call(chan: u64, state: &BtCallState) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.set_call(state)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_audio_microphone_volume")]
+	fn channel_invoke_microphone_volume(chan: u64, id: &u32) -> Option<Result<u8, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.microphone_volume(id)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_audio_set_microphone_volume")]
+	fn channel_invoke_set_microphone_volume(chan: u64, id: &u32, volume: &u8) -> Option<Result<u8, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_microphone_volume(id, volume)
 	}
 }
 
@@ -9300,8 +9472,8 @@ impl NetworkLink {
 		let id = r.u32()?;
 		let peer = PeerAddress::read(r)?;
 		let name = {
-			let v223 = r.string_lp()?;
-			(v223.len() <= 64).then_some(v223)?
+			let v228 = r.string_lp()?;
+			(v228.len() <= 64).then_some(v228)?
 		};
 		let replace_uplink = r.boolean()?;
 		Some(NetworkLink { id, peer, name, replace_uplink })
@@ -9354,13 +9526,13 @@ impl NetworkEvent {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			NetworkEvent::Arrived(v224) => {
+			NetworkEvent::Arrived(v229) => {
 				w.u8(0)?;
-				v224.write(w)?;
+				v229.write(w)?;
 			}
-			NetworkEvent::Departed(v225) => {
+			NetworkEvent::Departed(v230) => {
 				w.u8(1)?;
-				w.u32(*v225)?;
+				w.u32(*v230)?;
 			}
 		}
 		Some(())
@@ -9424,14 +9596,14 @@ pub mod bluetooth_network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v226) => {
+						Ok(v231) => {
 							w.u8(1)?;
-							w.set_handle(*v226)?;
+							w.set_handle(*v231)?;
 							w.u32(0)?;
 						}
-						Err(v227) => {
+						Err(v232) => {
 							w.u8(0)?;
-							v227.write(w)?;
+							v232.write(w)?;
 						}
 					}
 					Some(())
@@ -9792,13 +9964,13 @@ impl PeerAddress {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v229 = true;
-		for v228 in self.bytes.iter() {
-			if !v229 {
+		let mut v234 = true;
+		for v233 in self.bytes.iter() {
+			if !v234 {
 				out.push(',');
 			}
-			v229 = false;
-			let _ = write!(out, "{}", v228);
+			v234 = false;
+			let _ = write!(out, "{}", v233);
 		}
 		out.push(']');
 		out.push('}');
@@ -9810,13 +9982,13 @@ impl PeerAddress {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v231 = true;
-		for v230 in self.bytes.iter() {
-			if !v231 {
+		let mut v236 = true;
+		for v235 in self.bytes.iter() {
+			if !v236 {
 				out.push_str(", ");
 			}
-			v231 = false;
-			let _ = write!(out, "{}", v230);
+			v236 = false;
+			let _ = write!(out, "{}", v235);
 		}
 		out.push(']');
 		out.push('}');
@@ -9827,8 +9999,8 @@ impl PeerAddress {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v232 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v232 as u64);
+		for v237 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v237 as u64);
 		}
 	}
 }
@@ -10049,13 +10221,13 @@ impl ScanResult {
 		out.push(',');
 		out.push_str("\"services\":");
 		out.push('[');
-		let mut v234 = true;
-		for v233 in self.services.iter() {
-			if !v234 {
+		let mut v239 = true;
+		for v238 in self.services.iter() {
+			if !v239 {
 				out.push(',');
 			}
-			v234 = false;
-			v233.to_json_into(out);
+			v239 = false;
+			v238.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -10086,13 +10258,13 @@ impl ScanResult {
 		out.push_str(", ");
 		out.push_str("services=");
 		out.push('[');
-		let mut v236 = true;
-		for v235 in self.services.iter() {
-			if !v236 {
+		let mut v241 = true;
+		for v240 in self.services.iter() {
+			if !v241 {
 				out.push_str(", ");
 			}
-			v236 = false;
-			v235.to_text_into(out);
+			v241 = false;
+			v240.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -10113,8 +10285,8 @@ impl ScanResult {
 		crate::codec::cbor::uint(out, self.class_of_device as u64);
 		crate::codec::cbor::text(out, "services");
 		crate::codec::cbor::array(out, self.services.len());
-		for v237 in self.services.iter() {
-			v237.to_cbor_into(out);
+		for v242 in self.services.iter() {
+			v242.to_cbor_into(out);
 		}
 	}
 }
@@ -10508,21 +10680,21 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => out.push_str("\"yes\""),
 			PromptReply::No => out.push_str("\"no\""),
-			PromptReply::Passkey(v238) => {
+			PromptReply::Passkey(v243) => {
 				out.push_str("{\"passkey\":");
-				let _ = write!(out, "{}", v238);
+				let _ = write!(out, "{}", v243);
 				out.push('}');
 			}
-			PromptReply::Pin(v239) => {
+			PromptReply::Pin(v244) => {
 				out.push_str("{\"pin\":");
 				out.push('[');
-				let mut v241 = true;
-				for v240 in v239.iter() {
-					if !v241 {
+				let mut v246 = true;
+				for v245 in v244.iter() {
+					if !v246 {
 						out.push(',');
 					}
-					v241 = false;
-					let _ = write!(out, "{}", v240);
+					v246 = false;
+					let _ = write!(out, "{}", v245);
 				}
 				out.push(']');
 				out.push('}');
@@ -10533,21 +10705,21 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => out.push_str("yes"),
 			PromptReply::No => out.push_str("no"),
-			PromptReply::Passkey(v242) => {
+			PromptReply::Passkey(v247) => {
 				out.push_str("passkey(");
-				let _ = write!(out, "{}", v242);
+				let _ = write!(out, "{}", v247);
 				out.push(')');
 			}
-			PromptReply::Pin(v243) => {
+			PromptReply::Pin(v248) => {
 				out.push_str("pin(");
 				out.push('[');
-				let mut v245 = true;
-				for v244 in v243.iter() {
-					if !v245 {
+				let mut v250 = true;
+				for v249 in v248.iter() {
+					if !v250 {
 						out.push_str(", ");
 					}
-					v245 = false;
-					let _ = write!(out, "{}", v244);
+					v250 = false;
+					let _ = write!(out, "{}", v249);
 				}
 				out.push(']');
 				out.push(')');
@@ -10558,17 +10730,17 @@ impl PromptReply {
 		match self {
 			PromptReply::Yes => crate::codec::cbor::text(out, "yes"),
 			PromptReply::No => crate::codec::cbor::text(out, "no"),
-			PromptReply::Passkey(v246) => {
+			PromptReply::Passkey(v251) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "passkey");
-				crate::codec::cbor::uint(out, *v246 as u64);
+				crate::codec::cbor::uint(out, *v251 as u64);
 			}
-			PromptReply::Pin(v247) => {
+			PromptReply::Pin(v252) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "pin");
-				crate::codec::cbor::array(out, v247.len());
-				for v248 in v247.iter() {
-					crate::codec::cbor::uint(out, *v248 as u64);
+				crate::codec::cbor::array(out, v252.len());
+				for v253 in v252.iter() {
+					crate::codec::cbor::uint(out, *v253 as u64);
 				}
 			}
 		}
@@ -10621,8 +10793,8 @@ impl DeviceStatus {
 		out.push(',');
 		out.push_str("\"level\":");
 		match &self.level {
-			Some(v249) => {
-				v249.to_json_into(out);
+			Some(v254) => {
+				v254.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -10631,32 +10803,32 @@ impl DeviceStatus {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v251 = true;
-		for v250 in self.trusted.iter() {
-			if !v251 {
+		let mut v256 = true;
+		for v255 in self.trusted.iter() {
+			if !v256 {
 				out.push(',');
 			}
-			v251 = false;
-			v250.to_json_into(out);
+			v256 = false;
+			v255.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"connected-profiles\":");
 		out.push('[');
-		let mut v253 = true;
-		for v252 in self.connected_profiles.iter() {
-			if !v253 {
+		let mut v258 = true;
+		for v257 in self.connected_profiles.iter() {
+			if !v258 {
 				out.push(',');
 			}
-			v253 = false;
-			v252.to_json_into(out);
+			v258 = false;
+			v257.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"battery\":");
 		match &self.battery {
-			Some(v254) => {
-				let _ = write!(out, "{}", v254);
+			Some(v259) => {
+				let _ = write!(out, "{}", v259);
 			}
 			None => {
 				out.push_str("null");
@@ -10694,8 +10866,8 @@ impl DeviceStatus {
 		out.push_str(", ");
 		out.push_str("level=");
 		match &self.level {
-			Some(v255) => {
-				v255.to_text_into(out);
+			Some(v260) => {
+				v260.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -10704,32 +10876,32 @@ impl DeviceStatus {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v257 = true;
-		for v256 in self.trusted.iter() {
-			if !v257 {
+		let mut v262 = true;
+		for v261 in self.trusted.iter() {
+			if !v262 {
 				out.push_str(", ");
 			}
-			v257 = false;
-			v256.to_text_into(out);
+			v262 = false;
+			v261.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("connected-profiles=");
 		out.push('[');
-		let mut v259 = true;
-		for v258 in self.connected_profiles.iter() {
-			if !v259 {
+		let mut v264 = true;
+		for v263 in self.connected_profiles.iter() {
+			if !v264 {
 				out.push_str(", ");
 			}
-			v259 = false;
-			v258.to_text_into(out);
+			v264 = false;
+			v263.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("battery=");
 		match &self.battery {
-			Some(v260) => {
-				let _ = write!(out, "{}", v260);
+			Some(v265) => {
+				let _ = write!(out, "{}", v265);
 			}
 			None => {
 				out.push('-');
@@ -10753,8 +10925,8 @@ impl DeviceStatus {
 		crate::codec::cbor::boolean(out, self.connected);
 		crate::codec::cbor::text(out, "level");
 		match &self.level {
-			Some(v261) => {
-				v261.to_cbor_into(out);
+			Some(v266) => {
+				v266.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -10762,18 +10934,18 @@ impl DeviceStatus {
 		}
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v262 in self.trusted.iter() {
-			v262.to_cbor_into(out);
+		for v267 in self.trusted.iter() {
+			v267.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "connected-profiles");
 		crate::codec::cbor::array(out, self.connected_profiles.len());
-		for v263 in self.connected_profiles.iter() {
-			v263.to_cbor_into(out);
+		for v268 in self.connected_profiles.iter() {
+			v268.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "battery");
 		match &self.battery {
-			Some(v264) => {
-				crate::codec::cbor::uint(out, *v264 as u64);
+			Some(v269) => {
+				crate::codec::cbor::uint(out, *v269 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -10875,13 +11047,13 @@ impl BondedPeer {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v266 = true;
-		for v265 in self.trusted.iter() {
-			if !v266 {
+		let mut v271 = true;
+		for v270 in self.trusted.iter() {
+			if !v271 {
 				out.push(',');
 			}
-			v266 = false;
-			v265.to_json_into(out);
+			v271 = false;
+			v270.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -10915,13 +11087,13 @@ impl BondedPeer {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v268 = true;
-		for v267 in self.trusted.iter() {
-			if !v268 {
+		let mut v273 = true;
+		for v272 in self.trusted.iter() {
+			if !v273 {
 				out.push_str(", ");
 			}
-			v268 = false;
-			v267.to_text_into(out);
+			v273 = false;
+			v272.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -10945,8 +11117,8 @@ impl BondedPeer {
 		self.level.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v269 in self.trusted.iter() {
-			v269.to_cbor_into(out);
+		for v274 in self.trusted.iter() {
+			v274.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alias");
 		crate::codec::cbor::text(out, &self.alias);
@@ -11121,8 +11293,8 @@ impl ReceivedObject {
 		out.push(',');
 		out.push_str("\"declared\":");
 		match &self.declared {
-			Some(v270) => {
-				let _ = write!(out, "{}", v270);
+			Some(v275) => {
+				let _ = write!(out, "{}", v275);
 			}
 			None => {
 				out.push_str("null");
@@ -11134,13 +11306,13 @@ impl ReceivedObject {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v272 = true;
-		for v271 in self.bytes.iter() {
-			if !v272 {
+		let mut v277 = true;
+		for v276 in self.bytes.iter() {
+			if !v277 {
 				out.push(',');
 			}
-			v272 = false;
-			let _ = write!(out, "{}", v271);
+			v277 = false;
+			let _ = write!(out, "{}", v276);
 		}
 		out.push(']');
 		out.push('}');
@@ -11158,8 +11330,8 @@ impl ReceivedObject {
 		out.push_str(", ");
 		out.push_str("declared=");
 		match &self.declared {
-			Some(v273) => {
-				let _ = write!(out, "{}", v273);
+			Some(v278) => {
+				let _ = write!(out, "{}", v278);
 			}
 			None => {
 				out.push('-');
@@ -11171,13 +11343,13 @@ impl ReceivedObject {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v275 = true;
-		for v274 in self.bytes.iter() {
-			if !v275 {
+		let mut v280 = true;
+		for v279 in self.bytes.iter() {
+			if !v280 {
 				out.push_str(", ");
 			}
-			v275 = false;
-			let _ = write!(out, "{}", v274);
+			v280 = false;
+			let _ = write!(out, "{}", v279);
 		}
 		out.push(']');
 		out.push('}');
@@ -11192,8 +11364,8 @@ impl ReceivedObject {
 		crate::codec::cbor::text(out, &self.object_type);
 		crate::codec::cbor::text(out, "declared");
 		match &self.declared {
-			Some(v276) => {
-				crate::codec::cbor::uint(out, *v276 as u64);
+			Some(v281) => {
+				crate::codec::cbor::uint(out, *v281 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -11203,8 +11375,8 @@ impl ReceivedObject {
 		crate::codec::cbor::uint(out, self.received as u64);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v277 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v277 as u64);
+		for v282 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v282 as u64);
 		}
 	}
 }
@@ -11389,13 +11561,13 @@ impl GamepadFrame {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v279 = true;
-		for v278 in self.bytes.iter() {
-			if !v279 {
+		let mut v284 = true;
+		for v283 in self.bytes.iter() {
+			if !v284 {
 				out.push(',');
 			}
-			v279 = false;
-			let _ = write!(out, "{}", v278);
+			v284 = false;
+			let _ = write!(out, "{}", v283);
 		}
 		out.push(']');
 		out.push('}');
@@ -11404,13 +11576,13 @@ impl GamepadFrame {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v281 = true;
-		for v280 in self.bytes.iter() {
-			if !v281 {
+		let mut v286 = true;
+		for v285 in self.bytes.iter() {
+			if !v286 {
 				out.push_str(", ");
 			}
-			v281 = false;
-			let _ = write!(out, "{}", v280);
+			v286 = false;
+			let _ = write!(out, "{}", v285);
 		}
 		out.push(']');
 		out.push('}');
@@ -11419,8 +11591,8 @@ impl GamepadFrame {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v282 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v282 as u64);
+		for v287 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v287 as u64);
 		}
 	}
 }
@@ -11443,58 +11615,58 @@ impl InputReport {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			InputReport::Pointer(v283) => {
+			InputReport::Pointer(v288) => {
 				out.push_str("{\"pointer\":");
-				v283.to_json_into(out);
+				v288.to_json_into(out);
 				out.push('}');
 			}
-			InputReport::Key(v284) => {
+			InputReport::Key(v289) => {
 				out.push_str("{\"key\":");
-				v284.to_json_into(out);
+				v289.to_json_into(out);
 				out.push('}');
 			}
-			InputReport::Gamepad(v285) => {
+			InputReport::Gamepad(v290) => {
 				out.push_str("{\"gamepad\":");
-				v285.to_json_into(out);
+				v290.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			InputReport::Pointer(v286) => {
+			InputReport::Pointer(v291) => {
 				out.push_str("pointer(");
-				v286.to_text_into(out);
+				v291.to_text_into(out);
 				out.push(')');
 			}
-			InputReport::Key(v287) => {
+			InputReport::Key(v292) => {
 				out.push_str("key(");
-				v287.to_text_into(out);
+				v292.to_text_into(out);
 				out.push(')');
 			}
-			InputReport::Gamepad(v288) => {
+			InputReport::Gamepad(v293) => {
 				out.push_str("gamepad(");
-				v288.to_text_into(out);
+				v293.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			InputReport::Pointer(v289) => {
+			InputReport::Pointer(v294) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "pointer");
-				v289.to_cbor_into(out);
+				v294.to_cbor_into(out);
 			}
-			InputReport::Key(v290) => {
+			InputReport::Key(v295) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "key");
-				v290.to_cbor_into(out);
+				v295.to_cbor_into(out);
 			}
-			InputReport::Gamepad(v291) => {
+			InputReport::Gamepad(v296) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "gamepad");
-				v291.to_cbor_into(out);
+				v296.to_cbor_into(out);
 			}
 		}
 	}
@@ -11668,13 +11840,13 @@ impl GattValue {
 		out.push(',');
 		out.push_str("\"value\":");
 		out.push('[');
-		let mut v293 = true;
-		for v292 in self.value.iter() {
-			if !v293 {
+		let mut v298 = true;
+		for v297 in self.value.iter() {
+			if !v298 {
 				out.push(',');
 			}
-			v293 = false;
-			let _ = write!(out, "{}", v292);
+			v298 = false;
+			let _ = write!(out, "{}", v297);
 		}
 		out.push(']');
 		out.push('}');
@@ -11686,13 +11858,13 @@ impl GattValue {
 		out.push_str(", ");
 		out.push_str("value=");
 		out.push('[');
-		let mut v295 = true;
-		for v294 in self.value.iter() {
-			if !v295 {
+		let mut v300 = true;
+		for v299 in self.value.iter() {
+			if !v300 {
 				out.push_str(", ");
 			}
-			v295 = false;
-			let _ = write!(out, "{}", v294);
+			v300 = false;
+			let _ = write!(out, "{}", v299);
 		}
 		out.push(']');
 		out.push('}');
@@ -11703,8 +11875,8 @@ impl GattValue {
 		crate::codec::cbor::uint(out, self.handle as u64);
 		crate::codec::cbor::text(out, "value");
 		crate::codec::cbor::array(out, self.value.len());
-		for v296 in self.value.iter() {
-			crate::codec::cbor::uint(out, *v296 as u64);
+		for v301 in self.value.iter() {
+			crate::codec::cbor::uint(out, *v301 as u64);
 		}
 	}
 }
@@ -11729,13 +11901,13 @@ impl SerialBytes {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v298 = true;
-		for v297 in self.bytes.iter() {
-			if !v298 {
+		let mut v303 = true;
+		for v302 in self.bytes.iter() {
+			if !v303 {
 				out.push(',');
 			}
-			v298 = false;
-			let _ = write!(out, "{}", v297);
+			v303 = false;
+			let _ = write!(out, "{}", v302);
 		}
 		out.push(']');
 		out.push('}');
@@ -11744,13 +11916,13 @@ impl SerialBytes {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v300 = true;
-		for v299 in self.bytes.iter() {
-			if !v300 {
+		let mut v305 = true;
+		for v304 in self.bytes.iter() {
+			if !v305 {
 				out.push_str(", ");
 			}
-			v300 = false;
-			let _ = write!(out, "{}", v299);
+			v305 = false;
+			let _ = write!(out, "{}", v304);
 		}
 		out.push(']');
 		out.push('}');
@@ -11759,8 +11931,8 @@ impl SerialBytes {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v301 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v301 as u64);
+		for v306 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v306 as u64);
 		}
 	}
 }
@@ -11794,13 +11966,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"key\":");
 		out.push('[');
-		let mut v303 = true;
-		for v302 in self.key.iter() {
-			if !v303 {
+		let mut v308 = true;
+		for v307 in self.key.iter() {
+			if !v308 {
 				out.push(',');
 			}
-			v303 = false;
-			let _ = write!(out, "{}", v302);
+			v308 = false;
+			let _ = write!(out, "{}", v307);
 		}
 		out.push(']');
 		out.push(',');
@@ -11822,13 +11994,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"link-key\":");
 		out.push('[');
-		let mut v305 = true;
-		for v304 in self.link_key.iter() {
-			if !v305 {
+		let mut v310 = true;
+		for v309 in self.link_key.iter() {
+			if !v310 {
 				out.push(',');
 			}
-			v305 = false;
-			let _ = write!(out, "{}", v304);
+			v310 = false;
+			let _ = write!(out, "{}", v309);
 		}
 		out.push(']');
 		out.push(',');
@@ -11840,13 +12012,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"trusted\":");
 		out.push('[');
-		let mut v307 = true;
-		for v306 in self.trusted.iter() {
-			if !v307 {
+		let mut v312 = true;
+		for v311 in self.trusted.iter() {
+			if !v312 {
 				out.push(',');
 			}
-			v307 = false;
-			v306.to_json_into(out);
+			v312 = false;
+			v311.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -11855,13 +12027,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"irk\":");
 		out.push('[');
-		let mut v309 = true;
-		for v308 in self.irk.iter() {
-			if !v309 {
+		let mut v314 = true;
+		for v313 in self.irk.iter() {
+			if !v314 {
 				out.push(',');
 			}
-			v309 = false;
-			let _ = write!(out, "{}", v308);
+			v314 = false;
+			let _ = write!(out, "{}", v313);
 		}
 		out.push(']');
 		out.push(',');
@@ -11870,13 +12042,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"rand\":");
 		out.push('[');
-		let mut v311 = true;
-		for v310 in self.rand.iter() {
-			if !v311 {
+		let mut v316 = true;
+		for v315 in self.rand.iter() {
+			if !v316 {
 				out.push(',');
 			}
-			v311 = false;
-			let _ = write!(out, "{}", v310);
+			v316 = false;
+			let _ = write!(out, "{}", v315);
 		}
 		out.push(']');
 		out.push('}');
@@ -11894,13 +12066,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("key=");
 		out.push('[');
-		let mut v313 = true;
-		for v312 in self.key.iter() {
-			if !v313 {
+		let mut v318 = true;
+		for v317 in self.key.iter() {
+			if !v318 {
 				out.push_str(", ");
 			}
-			v313 = false;
-			let _ = write!(out, "{}", v312);
+			v318 = false;
+			let _ = write!(out, "{}", v317);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11922,13 +12094,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("link-key=");
 		out.push('[');
-		let mut v315 = true;
-		for v314 in self.link_key.iter() {
-			if !v315 {
+		let mut v320 = true;
+		for v319 in self.link_key.iter() {
+			if !v320 {
 				out.push_str(", ");
 			}
-			v315 = false;
-			let _ = write!(out, "{}", v314);
+			v320 = false;
+			let _ = write!(out, "{}", v319);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11940,13 +12112,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("trusted=");
 		out.push('[');
-		let mut v317 = true;
-		for v316 in self.trusted.iter() {
-			if !v317 {
+		let mut v322 = true;
+		for v321 in self.trusted.iter() {
+			if !v322 {
 				out.push_str(", ");
 			}
-			v317 = false;
-			v316.to_text_into(out);
+			v322 = false;
+			v321.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11955,13 +12127,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("irk=");
 		out.push('[');
-		let mut v319 = true;
-		for v318 in self.irk.iter() {
-			if !v319 {
+		let mut v324 = true;
+		for v323 in self.irk.iter() {
+			if !v324 {
 				out.push_str(", ");
 			}
-			v319 = false;
-			let _ = write!(out, "{}", v318);
+			v324 = false;
+			let _ = write!(out, "{}", v323);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -11970,13 +12142,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("rand=");
 		out.push('[');
-		let mut v321 = true;
-		for v320 in self.rand.iter() {
-			if !v321 {
+		let mut v326 = true;
+		for v325 in self.rand.iter() {
+			if !v326 {
 				out.push_str(", ");
 			}
-			v321 = false;
-			let _ = write!(out, "{}", v320);
+			v326 = false;
+			let _ = write!(out, "{}", v325);
 		}
 		out.push(']');
 		out.push('}');
@@ -11991,8 +12163,8 @@ impl BondRecord {
 		self.peer.to_cbor_into(out);
 		crate::codec::cbor::text(out, "key");
 		crate::codec::cbor::array(out, self.key.len());
-		for v322 in self.key.iter() {
-			crate::codec::cbor::uint(out, *v322 as u64);
+		for v327 in self.key.iter() {
+			crate::codec::cbor::uint(out, *v327 as u64);
 		}
 		crate::codec::cbor::text(out, "security");
 		self.security.to_cbor_into(out);
@@ -12004,8 +12176,8 @@ impl BondRecord {
 		self.radio.to_cbor_into(out);
 		crate::codec::cbor::text(out, "link-key");
 		crate::codec::cbor::array(out, self.link_key.len());
-		for v323 in self.link_key.iter() {
-			crate::codec::cbor::uint(out, *v323 as u64);
+		for v328 in self.link_key.iter() {
+			crate::codec::cbor::uint(out, *v328 as u64);
 		}
 		crate::codec::cbor::text(out, "link-key-type");
 		crate::codec::cbor::uint(out, self.link_key_type as u64);
@@ -12013,22 +12185,22 @@ impl BondRecord {
 		self.level.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trusted");
 		crate::codec::cbor::array(out, self.trusted.len());
-		for v324 in self.trusted.iter() {
-			v324.to_cbor_into(out);
+		for v329 in self.trusted.iter() {
+			v329.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alias");
 		crate::codec::cbor::text(out, &self.alias);
 		crate::codec::cbor::text(out, "irk");
 		crate::codec::cbor::array(out, self.irk.len());
-		for v325 in self.irk.iter() {
-			crate::codec::cbor::uint(out, *v325 as u64);
+		for v330 in self.irk.iter() {
+			crate::codec::cbor::uint(out, *v330 as u64);
 		}
 		crate::codec::cbor::text(out, "ediv");
 		crate::codec::cbor::uint(out, self.ediv as u64);
 		crate::codec::cbor::text(out, "rand");
 		crate::codec::cbor::array(out, self.rand.len());
-		for v326 in self.rand.iter() {
-			crate::codec::cbor::uint(out, *v326 as u64);
+		for v331 in self.rand.iter() {
+			crate::codec::cbor::uint(out, *v331 as u64);
 		}
 	}
 }
@@ -12444,73 +12616,88 @@ impl AudioEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			AudioEvent::Arrived(v327) => {
+			AudioEvent::Arrived(v332) => {
 				out.push_str("{\"arrived\":");
-				v327.to_json_into(out);
+				v332.to_json_into(out);
 				out.push('}');
 			}
-			AudioEvent::Departed(v328) => {
+			AudioEvent::Departed(v333) => {
 				out.push_str("{\"departed\":");
-				let _ = write!(out, "{}", v328);
+				let _ = write!(out, "{}", v333);
 				out.push('}');
 			}
-			AudioEvent::Volume(v329) => {
+			AudioEvent::Volume(v334) => {
 				out.push_str("{\"volume\":");
-				v329.to_json_into(out);
+				v334.to_json_into(out);
 				out.push('}');
 			}
-			AudioEvent::Command(v330) => {
+			AudioEvent::Command(v335) => {
 				out.push_str("{\"command\":");
-				v330.to_json_into(out);
+				v335.to_json_into(out);
+				out.push('}');
+			}
+			AudioEvent::MicrophoneVolume(v336) => {
+				out.push_str("{\"microphone-volume\":");
+				v336.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			AudioEvent::Arrived(v331) => {
+			AudioEvent::Arrived(v337) => {
 				out.push_str("arrived(");
-				v331.to_text_into(out);
+				v337.to_text_into(out);
 				out.push(')');
 			}
-			AudioEvent::Departed(v332) => {
+			AudioEvent::Departed(v338) => {
 				out.push_str("departed(");
-				let _ = write!(out, "{}", v332);
+				let _ = write!(out, "{}", v338);
 				out.push(')');
 			}
-			AudioEvent::Volume(v333) => {
+			AudioEvent::Volume(v339) => {
 				out.push_str("volume(");
-				v333.to_text_into(out);
+				v339.to_text_into(out);
 				out.push(')');
 			}
-			AudioEvent::Command(v334) => {
+			AudioEvent::Command(v340) => {
 				out.push_str("command(");
-				v334.to_text_into(out);
+				v340.to_text_into(out);
+				out.push(')');
+			}
+			AudioEvent::MicrophoneVolume(v341) => {
+				out.push_str("microphone-volume(");
+				v341.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			AudioEvent::Arrived(v335) => {
+			AudioEvent::Arrived(v342) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "arrived");
-				v335.to_cbor_into(out);
+				v342.to_cbor_into(out);
 			}
-			AudioEvent::Departed(v336) => {
+			AudioEvent::Departed(v343) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "departed");
-				crate::codec::cbor::uint(out, *v336 as u64);
+				crate::codec::cbor::uint(out, *v343 as u64);
 			}
-			AudioEvent::Volume(v337) => {
+			AudioEvent::Volume(v344) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "volume");
-				v337.to_cbor_into(out);
+				v344.to_cbor_into(out);
 			}
-			AudioEvent::Command(v338) => {
+			AudioEvent::Command(v345) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "command");
-				v338.to_cbor_into(out);
+				v345.to_cbor_into(out);
+			}
+			AudioEvent::MicrophoneVolume(v346) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "microphone-volume");
+				v346.to_cbor_into(out);
 			}
 		}
 	}
@@ -12601,43 +12788,43 @@ impl NetworkEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			NetworkEvent::Arrived(v339) => {
+			NetworkEvent::Arrived(v347) => {
 				out.push_str("{\"arrived\":");
-				v339.to_json_into(out);
+				v347.to_json_into(out);
 				out.push('}');
 			}
-			NetworkEvent::Departed(v340) => {
+			NetworkEvent::Departed(v348) => {
 				out.push_str("{\"departed\":");
-				let _ = write!(out, "{}", v340);
+				let _ = write!(out, "{}", v348);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			NetworkEvent::Arrived(v341) => {
+			NetworkEvent::Arrived(v349) => {
 				out.push_str("arrived(");
-				v341.to_text_into(out);
+				v349.to_text_into(out);
 				out.push(')');
 			}
-			NetworkEvent::Departed(v342) => {
+			NetworkEvent::Departed(v350) => {
 				out.push_str("departed(");
-				let _ = write!(out, "{}", v342);
+				let _ = write!(out, "{}", v350);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			NetworkEvent::Arrived(v343) => {
+			NetworkEvent::Arrived(v351) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "arrived");
-				v343.to_cbor_into(out);
+				v351.to_cbor_into(out);
 			}
-			NetworkEvent::Departed(v344) => {
+			NetworkEvent::Departed(v352) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "departed");
-				crate::codec::cbor::uint(out, *v344 as u64);
+				crate::codec::cbor::uint(out, *v352 as u64);
 			}
 		}
 	}

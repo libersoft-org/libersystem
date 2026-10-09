@@ -1,15 +1,15 @@
 //! PREPARE AND EXECUTE, AND WHY THE BOUNDARY IS WHERE IT IS.
 //!
-//! EVERYTHING THAT CAN FAIL, VALIDATE OR ALLOCATE HAPPENS IN `prepare`. Resource admission, shader
-//! validation, pipeline compatibility, command-list checking and the tile and bin scratch are all
-//! settled before a frame starts; `execute` then walks a plan and allocates NOTHING in steady state.
+//! SOURCE-INDEPENDENT VALIDATION HAPPENS IN `prepare`. The first execution fallibly reserves bounded
+//! scratch for its actual attachments and workers before any write. Later poses reuse that capacity;
+//! `execute` walks the plan and allocates NOTHING in steady state with unchanged resources.
 //! Without that boundary, programmable shaders, pipeline creation, mip generation and the pass graph
 //! each become a place a frame can start allocating - and the no-steady-state-allocation rule this
 //! milestone holds the 2D side to becomes untestable on the 3D one.
 //!
-//! `execute` FULFILS THE `Submission` CONTRACT. It is the software backend's answer to a submitted
-//! list: it runs to completion and reports, which is the "already-completed ticket" shape the
-//! submission model was written to admit beside a GPU backend's pending one.
+//! `execute` runs a prepared frame to completion and returns its statistics. Recorded command
+//! submission lives in `readback::Prepared::submit`, which wraps this execution in the terminal
+//! `Submission` and readback-ticket contract rather than treating statistics as a completion.
 //!
 //! THE DERIVATIVES A TEXTURE LOD NEEDS ARE TAKEN FROM THE TRIANGLE'S OWN PLANE at `(x+1, y)` and
 //! `(x, y+1)`. That is the SAME quantity a 2x2 quad estimates: within one primitive a quad's lanes
@@ -45,7 +45,9 @@ pub struct Pipeline {
 	pub fragment: Module,
 	/// One blend state per colour attachment.
 	pub blend: Vec<AttachmentBlend>,
+	/// Front-face stencil state; also used by the back face unless overridden.
 	pub stencil: Option<StencilFace>,
+	pub stencil_back: Option<StencilFace>,
 	pub depth_compare: CompareOp,
 	pub depth_write: bool,
 	/// `(constant_factor, slope_factor, clamp)` of the frozen depth-bias equation.
@@ -77,6 +79,8 @@ pub trait Source: Sync {
 pub struct Draw {
 	pub pipeline: u32,
 	pub topology: Topology,
+	/// First index-buffer entry, or first vertex when the source is non-indexed.
+	pub first: u32,
 	pub count: u32,
 	pub instances: u32,
 	pub first_instance: u32,
@@ -145,11 +149,9 @@ struct Scratch {
 	/// One interpreter machine per stage, reused across every vertex and every fragment.
 	vertex_machine: interpreter::Machine,
 	fragment_machine: interpreter::Machine,
-	// AN `Option<Box<_>>` AND NOT A `Box<_>`. `core::mem::take` on a `Box` builds a fresh default
-	// one - an allocation per primitive, which is precisely what this boundary exists to prevent -
-	// while taking an `Option` leaves `None` and allocates nothing. The first primitive of the first
-	// frame builds it; nothing after that does.
-	clip_work: Option<alloc::boxed::Box<clip::Workspace>>,
+	// One fallibly reserved workspace, including when the initial pose clips every primitive out.
+	// Taking an empty Vec allocates nothing; the retained element is never rebuilt per primitive.
+	clip_work: Vec<clip::Workspace>,
 	clipped: Clipped,
 	/// One per worker, sized to the pool on the first frame that uses it.
 	lanes: Vec<Lane>,
@@ -275,12 +277,12 @@ fn recycle<T, U>(mut vector: Vec<T>) -> Vec<U> {
 	vector.into_iter().map(|_| unreachable!("an emptied vector yields nothing")).collect()
 }
 
-/// A validated plan. NOTHING HERE CAN FAIL AT SUBMISSION.
+/// A validated command/shader plan. Actual source bindings and first-use scratch remain fallible.
 pub struct Prepared {
 	pipelines: Vec<Pipeline>,
 	/// Where each fragment varying lives in the three interpolated arrays, per pipeline. COMPUTED
 	/// ONCE: it is a property of the pipeline, and rebuilding it per draw would allocate per draw.
-	maps: Vec<Vec<(u32, Interpolation, usize, usize)>>,
+	maps: Vec<Vec<(u32, Interpolation, usize, usize, render_shader::Type)>>,
 	draws: Vec<Draw>,
 	bins: Bins,
 	scratch: Scratch,
@@ -298,7 +300,7 @@ pub struct Stats {
 	pub discarded: u32,
 }
 
-/// Validate everything that can be validated, and reserve everything that has to be reserved.
+/// Validate the source-independent command and shader plan; actual execution reserves scratch.
 ///
 /// THE SHADERS ARE VALIDATED HERE AND NOT AT THE DRAW. A module is checked ONCE with the whole
 /// program in front of it, which is where the position dependency slice can be walked at all.
@@ -353,11 +355,66 @@ pub fn prepare(limits: Render3DLimits, pipelines: Vec<Pipeline>, draws: Vec<Draw
 			return Err(Error::InvalidMesh { reason: render3d::error::MeshFault::TooFewVertices { topology: "an instanced draw", needs: 1, has: 0 } });
 		}
 	}
-	let maps: Vec<Vec<(u32, Interpolation, usize, usize)>> = pipelines.iter().map(varying_map).collect();
+	let maps: Vec<Vec<(u32, Interpolation, usize, usize, render_shader::Type)>> = pipelines.iter().map(varying_map).collect();
 	Ok(Prepared { pipelines, maps, draws, bins: Bins::new(width, height), scratch: Scratch::default(), limits })
 }
 
 impl Prepared {
+	/// Geometry moves without becoming a new resource. Reserve against the recorded topology and
+	/// the clipper's proven expansion bound, not against whichever primitives the first pose showed.
+	/// This runs before writes on the first actual execution: inactive plans need no large scratch.
+	fn reserve_execution(&mut self, workers: usize, attachments: usize) -> Result<(), Error> {
+		fn storage<T>(values: &mut Vec<T>, count: usize) -> Result<(), Error> {
+			if values.capacity() < count {
+				let bytes = count.checked_mul(core::mem::size_of::<T>()).ok_or(Error::OutOfMemory { bytes: u64::MAX })?;
+				values.try_reserve_exact(count.saturating_sub(values.len())).map_err(|_| Error::OutOfMemory { bytes: bytes as u64 })?;
+			}
+			Ok(())
+		}
+		let (mut primitives, mut triangles, mut segments, mut points, mut run) = (0, 0, 0, 0, 0);
+		for draw in &self.draws {
+			let count = draw.count as usize;
+			let (p, r) = match draw.topology {
+				Topology::TriangleList => (count / 3, count.min(3)),
+				Topology::TriangleStrip | Topology::TriangleFan => (count.saturating_sub(2), count),
+				Topology::LineList => (count / 2, count.min(2)),
+				Topology::LineStrip => (count.saturating_sub(1), count),
+				Topology::PointList => (count, count.min(1)),
+			};
+			primitives = primitives.max(p);
+			run = run.max(r);
+			match draw.topology {
+				Topology::TriangleList | Topology::TriangleStrip | Topology::TriangleFan => triangles = triangles.max(p),
+				Topology::LineList | Topology::LineStrip => segments = segments.max(p),
+				Topology::PointList => points = points.max(p),
+			}
+		}
+		let triangles = triangles.checked_mul(clip::MAX_TRIANGLES_AFTER_CLIP).ok_or(Error::OutOfMemory { bytes: u64::MAX })?;
+		storage(&mut self.scratch.primitives, primitives)?;
+		storage(&mut self.scratch.run, run)?;
+		storage(&mut self.scratch.setups, triangles)?;
+		storage(&mut self.scratch.segments, segments)?;
+		storage(&mut self.scratch.points, points)?;
+		if (triangles != 0 || segments != 0) && self.scratch.clip_work.is_empty() {
+			storage(&mut self.scratch.clip_work, 1)?;
+			self.scratch.clip_work.push(clip::Workspace::default());
+		}
+		self.bins.reserve_triangles(triangles)?;
+		storage(&mut self.scratch.lanes, workers)?;
+		self.scratch.lanes.resize_with(workers, Lane::default);
+		let tiles = self.bins.across() as usize * self.bins.down() as usize;
+		storage(&mut self.scratch.tiles, tiles)?;
+		storage(&mut self.scratch.views, tiles.checked_mul(attachments).ok_or(Error::OutOfMemory { bytes: u64::MAX })?)?;
+		for pipeline in &self.pipelines {
+			self.scratch.vertex_machine.reserve(&pipeline.vertex)?;
+			self.scratch.fragment_machine.reserve(&pipeline.fragment)?;
+			for lane in &mut self.scratch.lanes {
+				lane.machine.reserve(&pipeline.fragment)?;
+			}
+		}
+		Ok(())
+	}
+
 	pub fn pipelines(&self) -> &[Pipeline] {
 		&self.pipelines
 	}
@@ -387,7 +444,7 @@ impl Prepared {
 	/// `execute` borrows them - so charging for them here would charge for them twice.
 	pub fn reserved_bytes(&self) -> usize {
 		let of = |capacity: usize, each: usize| capacity * each;
-		of(self.pipelines.capacity(), core::mem::size_of::<Pipeline>()) + self.maps.iter().map(|map| of(map.capacity(), core::mem::size_of::<(u32, Interpolation, usize, usize)>())).sum::<usize>() + of(self.draws.capacity(), core::mem::size_of::<Draw>()) + self.bins.reserved_bytes() + of(self.scratch.primitives.capacity(), core::mem::size_of::<Primitive>()) + of(self.scratch.setups.capacity(), core::mem::size_of::<Binned>()) + of(self.scratch.segments.capacity(), core::mem::size_of::<Segment>()) + of(self.scratch.points.capacity(), core::mem::size_of::<Dot>()) + of(self.scratch.run.capacity(), core::mem::size_of::<u32>()) + self.scratch.clip_work.as_ref().map_or(0, |_| core::mem::size_of::<clip::Workspace>()) + core::mem::size_of::<Clipped>()
+		of(self.pipelines.capacity(), core::mem::size_of::<Pipeline>()) + self.maps.iter().map(|map| of(map.capacity(), core::mem::size_of::<(u32, Interpolation, usize, usize, render_shader::Type)>())).sum::<usize>() + of(self.draws.capacity(), core::mem::size_of::<Draw>()) + self.bins.reserved_bytes() + of(self.scratch.primitives.capacity(), core::mem::size_of::<Primitive>()) + of(self.scratch.setups.capacity(), core::mem::size_of::<Binned>()) + of(self.scratch.segments.capacity(), core::mem::size_of::<Segment>()) + of(self.scratch.points.capacity(), core::mem::size_of::<Dot>()) + of(self.scratch.run.capacity(), core::mem::size_of::<u32>()) + of(self.scratch.clip_work.capacity(), core::mem::size_of::<clip::Workspace>()) + core::mem::size_of::<Clipped>() + of(self.scratch.lanes.capacity(), core::mem::size_of::<Lane>()) + self.scratch.lanes.iter().map(|lane| lane.machine.reserved_bytes()).sum::<usize>() + of(self.scratch.tiles.capacity(), core::mem::size_of::<Tile<'static, 'static>>()) + of(self.scratch.views.capacity(), core::mem::size_of::<Option<ColourView<'static>>>()) + self.scratch.vertex_machine.reserved_bytes() + self.scratch.fragment_machine.reserved_bytes()
 	}
 
 	/// How much scratch this plan is holding, so a fixture can assert that a steady-state frame
@@ -412,12 +469,12 @@ pub fn execute(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 /// every line and point stays on the caller's thread.
 pub fn execute_with(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers) -> Result<Stats, Error> {
 	let mut stats = Stats::default();
-	let (width, height) = match attachments.colour.first() {
-		Some(first) => (first.width, first.height),
-		None => return Err(Error::TargetMismatch { reason: render3d::error::AttachmentFault::TooMany { count: 0, ceiling: prepared.limits.max_colour_attachments } }),
+	let (width, height, samples) = match (attachments.colour.first(), attachments.depth_stencil.as_deref()) {
+		(Some(first), _) => (first.width, first.height, first.samples),
+		(None, Some(depth)) => (depth.width, depth.height, depth.samples),
+		(None, None) => return Err(Error::TargetMismatch { reason: render3d::error::AttachmentFault::TooMany { count: 0, ceiling: prepared.limits.max_colour_attachments } }),
 	};
 	// EVERY ATTACHMENT SHARES ONE EXTENT AND ONE SAMPLE COUNT. A pass has one set of fragments.
-	let samples = attachments.colour[0].samples;
 	for attachment in attachments.colour.iter() {
 		if attachment.width != width || attachment.height != height || attachment.samples != samples {
 			return Err(Error::TargetMismatch { reason: render3d::error::AttachmentFault::ExtentMismatch { width: attachment.width, height: attachment.height, expected_width: width, expected_height: height } });
@@ -430,6 +487,7 @@ pub fn execute_with(prepared: &mut Prepared, attachments: &mut Attachments<'_>, 
 	}
 	prepared.bins.resize(width, height);
 	prepared.bins.reset_depth();
+	prepared.reserve_execution(workers.lanes().max(1), attachments.colour.len())?;
 
 	// THE PLAN IS TAKEN OUT RATHER THAN CLONED. A `Pipeline` holds two shader modules; cloning one
 	// per draw would allocate several vectors per draw, which is exactly what this boundary exists
@@ -453,17 +511,18 @@ pub fn execute_with(prepared: &mut Prepared, attachments: &mut Attachments<'_>, 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, draw: &Draw, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, draw: &Draw, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if pipeline.state.samples != samples {
 		return Err(Error::IncompatiblePipeline { reason: "the pipeline's sample count disagrees with the pass's attachments" });
 	}
 	if pipeline.blend.len() < attachments.colour.len() {
 		return Err(Error::IncompatiblePipeline { reason: "a pipeline with fewer blend states than the pass has colour attachments" });
 	}
+	// @handles: Instancing, BaseInstance, IndexedDraw, NonIndexedDraw
 	for instance in 0..draw.instances {
 		let instance_index = draw.first_instance + instance;
 		let mut run = core::mem::take(&mut prepared.scratch.run);
-		let assembled = geometry::assemble(draw.topology, source.indices(), draw.count, draw.base_vertex, draw.restart, &mut prepared.scratch.primitives, &mut run);
+		let assembled = geometry::assemble_from(draw.topology, source.indices(), draw.first, draw.count, draw.base_vertex, draw.restart, &mut prepared.scratch.primitives, &mut run);
 		prepared.scratch.run = run;
 		assembled?;
 		let primitives = core::mem::take(&mut prepared.scratch.primitives);
@@ -476,11 +535,11 @@ fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: 
 
 		for primitive in &primitives {
 			match primitive {
-				Primitive::Triangle { vertices, index } => {
-					stage_triangle(prepared, pipeline, source, *vertices, *index, draw.topology, instance_index, &attachments.viewport, width, height, stats)?;
+				Primitive::Triangle { vertices, provoking, .. } => {
+					stage_triangle(prepared, pipeline, source, *vertices, *provoking, instance_index, &attachments.viewport, width, height, stats)?;
 				}
-				Primitive::Line { vertices, index } => {
-					stage_line(prepared, pipeline, source, *vertices, *index, draw.topology, instance_index, &attachments.viewport, stats)?;
+				Primitive::Line { vertices, .. } => {
+					stage_line(prepared, pipeline, source, *vertices, instance_index, &attachments.viewport, stats)?;
 				}
 				Primitive::Point { vertex, index } => {
 					stage_point(prepared, pipeline, source, *vertex, *index, draw.topology, instance_index, &attachments.viewport, stats)?;
@@ -496,6 +555,7 @@ fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: 
 }
 
 /// Run the vertex stage for one vertex and split its varyings by declared qualifier.
+// @handles: ProgrammableVertexStage
 fn run_vertex(pipeline: &Pipeline, source: &dyn Source, vertex: u32, instance: u32, machine: &mut interpreter::Machine) -> Result<Shaded, Error> {
 	let bindings = VertexBindings { source, vertex, instance };
 	interpreter::execute_into(&pipeline.vertex, &bindings, machine).map_err(fault)?;
@@ -511,7 +571,7 @@ fn run_vertex(pipeline: &Pipeline, source: &dyn Source, vertex: u32, instance: u
 		let room = match varying.interpolation {
 			Interpolation::Smooth => value.f32_components().all(|component| shaded.smooth.push(component)),
 			Interpolation::NoPerspective => value.f32_components().all(|component| shaded.noperspective.push(component)),
-			Interpolation::Flat => value.f32_components().all(|component| shaded.flat.push(component)),
+			Interpolation::Flat => value.words().iter().all(|word| shaded.flat.push(f32::from_bits(*word))),
 		};
 		if !room {
 			// REFUSED AND NOT TRUNCATED, and `prepare` has already refused the pipeline that could
@@ -542,6 +602,7 @@ impl Resources for VertexBindings<'_> {
 		self.source.uniform(block, member)
 	}
 
+	// @handles: MultipleVertexStreams, ConfigurableAttributes
 	fn attribute(&self, location: u32) -> Option<Val> {
 		self.source.attribute(location, self.vertex, self.instance)
 	}
@@ -570,7 +631,7 @@ struct FragmentBindings<'a> {
 	smooth: &'a [f32],
 	noperspective: &'a [f32],
 	flat: &'a [f32],
-	locations: &'a [(u32, Interpolation, usize, usize)],
+	locations: &'a [(u32, Interpolation, usize, usize, render_shader::Type)],
 	front_facing: bool,
 	coordinate: [f32; 4],
 	sample_index: u32,
@@ -589,14 +650,18 @@ impl Resources for FragmentBindings<'_> {
 	}
 
 	fn varying(&self, location: u32) -> Option<Val> {
-		let (_, interpolation, offset, count) = *self.locations.iter().find(|(name, ..)| *name == location)?;
+		let (_, interpolation, offset, count, kind) = self.locations.iter().find(|(name, ..)| *name == location)?;
 		let source = match interpolation {
 			Interpolation::Smooth => self.smooth,
 			Interpolation::NoPerspective => self.noperspective,
 			Interpolation::Flat => self.flat,
 		};
-		let slice = source.get(offset..offset + count)?;
-		Some(Val::vector_f32(slice))
+		let slice = source.get(*offset..offset + count)?;
+		let mut words = [0_u32; crate::clip::MAX_VARYING_COMPONENTS];
+		for (word, value) in words.iter_mut().zip(slice) {
+			*word = value.to_bits();
+		}
+		Some(Val::new(kind.clone(), &words[..*count]))
 	}
 
 	fn built_in(&self, which: render_shader::ir::BuiltIn) -> Option<Val> {
@@ -616,7 +681,7 @@ impl Resources for FragmentBindings<'_> {
 }
 
 /// Where each fragment varying lives in the three interpolated arrays.
-fn varying_map(pipeline: &Pipeline) -> Vec<(u32, Interpolation, usize, usize)> {
+fn varying_map(pipeline: &Pipeline) -> Vec<(u32, Interpolation, usize, usize, render_shader::Type)> {
 	let mut out = Vec::new();
 	let (mut smooth, mut noperspective, mut flat) = (0, 0, 0);
 	for varying in &pipeline.vertex.varyings {
@@ -638,13 +703,13 @@ fn varying_map(pipeline: &Pipeline) -> Vec<(u32, Interpolation, usize, usize)> {
 				at
 			}
 		};
-		out.push((varying.location, varying.interpolation, offset, count));
+		out.push((varying.location, varying.interpolation, offset, count, varying.kind.clone()));
 	}
 	out
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertices: [u32; 3], index: u32, topology: Topology, instance: u32, viewport: &Viewport, width: u32, height: u32, stats: &mut Stats) -> Result<(), Error> {
+fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertices: [u32; 3], provoking: u8, instance: u32, viewport: &Viewport, width: u32, height: u32, stats: &mut Stats) -> Result<(), Error> {
 	let mut machine = core::mem::take(&mut prepared.scratch.vertex_machine);
 	let shaded = {
 		let mut run = |vertex: u32| run_vertex(pipeline, source, vertex, instance, &mut machine);
@@ -664,9 +729,9 @@ fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Sou
 	// THE FLAT VALUE COMES FROM THE PROVOKING VERTEX OF THE PRIMITIVE AS ASSEMBLED, captured before
 	// the clip - a clipped triangle is the same triangle, and taking the value from a vertex the
 	// clipper invented would make an object id depend on where the camera is.
-	let provoking = geometry::provoking(topology, index);
-	let which = vertices.iter().position(|vertex| *vertex == provoking).unwrap_or(0);
-	let flat = shaded[which].flat.clone();
+	// The assembler records a local slot, not an index-buffer position compared with a vertex
+	// value. It therefore also stays correct after a nonzero first offset or strip restart.
+	let flat = shaded[provoking as usize].flat.clone();
 
 	let corners = [
 		clip::Vertex::new(shaded[0].position).with_smooth(shaded[0].smooth).with_noperspective(shaded[0].noperspective),
@@ -674,10 +739,7 @@ fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Sou
 		clip::Vertex::new(shaded[2].position).with_smooth(shaded[2].smooth).with_noperspective(shaded[2].noperspective),
 	];
 	// The workspace and the result both belong to the FRAME, so a primitive allocates nothing.
-	let mut work = prepared.scratch.clip_work.take().unwrap_or_default();
-	let outcome = clip::clip_triangle_into(&corners, flat, &mut work, &mut prepared.scratch.clipped);
-	prepared.scratch.clip_work = Some(work);
-	outcome?;
+	clip::clip_triangle_into(&corners, flat, &mut prepared.scratch.clip_work[0], &mut prepared.scratch.clipped)?;
 	let clipped = prepared.scratch.clipped;
 	if clipped.is_empty() {
 		stats.culled += 1;
@@ -691,11 +753,13 @@ fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Sou
 		let mut window = [render_math::Vec3::ZERO; 3];
 		let mut inverse_w = [0.0_f32; 3];
 		for (slot, vertex) in triangle.iter().enumerate() {
+			// @handles: Viewport
 			let (point, one_over_w) = raster::project(clipped.vertices()[*vertex].position, viewport)?;
 			window[slot] = point;
 			inverse_w[slot] = one_over_w;
 		}
 		let Some(setup) = raster::setup(window, inverse_w, width, height)? else { continue };
+		// @handles: RasteriserState
 		if raster::culled(setup.facing, pipeline.state.cull) {
 			stats.culled += 1;
 			continue;
@@ -715,20 +779,24 @@ fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Sou
 struct Shared<'s> {
 	setups: &'s [Binned],
 	bins: &'s [Vec<u32>],
+	overflow: &'s [bool],
 	pipeline: &'s Pipeline,
-	map: &'s [(u32, Interpolation, usize, usize)],
+	map: &'s [(u32, Interpolation, usize, usize, render_shader::Type)],
 	source: &'s dyn Source,
 	keep: (i64, i64, i64, i64),
 	width: u32,
 	height: u32,
 	samples: u32,
+	early_depth: bool,
+	hierarchical_depth: bool,
 	/// The lowest tile that has failed so far. A tile past it is not shaded: the draw has already
 	/// failed, and its answer is that tile's failure or a lower one.
 	failed: AtomicUsize,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+// @handles: Scissor
+fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if prepared.scratch.setups.is_empty() {
 		return Ok(());
 	}
@@ -755,12 +823,18 @@ fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source
 		}
 	}
 	let mut depth_tiles = attachments.depth_stencil.as_deref_mut().map(|buffer| buffer.tiles());
-	let (bins, far) = prepared.bins.parts();
-	for ((index, colour), far) in views.chunks_mut(per_tile).enumerate().zip(far.iter_mut()) {
+	let (bins, overflow, far) = prepared.bins.parts();
+	let mut remaining_views = views.as_mut_slice();
+	for (index, far) in far.iter_mut().enumerate() {
+		// A depth-only tile owns an empty colour slice; splitting at zero is defined, unlike
+		// chunks_mut(0), and its real depth view still carries all of the attachment's pixels.
+		let (colour, rest) = remaining_views.split_at_mut(per_tile);
+		remaining_views = rest;
 		let depth = depth_tiles.as_mut().and_then(Iterator::next);
 		tiles.push(Tile { index, x: index as u32 % across, y: index as u32 / across, colour, depth, far, ran: false });
 	}
-	let shared = Shared { setups: &setups, bins, pipeline, map, source, keep: writable(attachments.scissor, width, height), width, height, samples, failed: AtomicUsize::new(usize::MAX) };
+	let fixed_depth = pipeline.stencil.is_none() && pipeline.stencil_back.is_none() && !writes_fragment_depth(&pipeline.fragment.body);
+	let shared = Shared { setups: &setups, bins, overflow, pipeline, map, source, keep: writable(attachments.scissor, width, height), width, height, samples, early_depth: fixed_depth && samples == 1, hierarchical_depth: fixed_depth && pipeline.bias == (0.0, 0.0, 0.0), failed: AtomicUsize::new(usize::MAX) };
 	// A TILE WHOSE VIEWS ARE MISSING IS A TILE THIS DRAW CANNOT SHADE - storage shorter than the
 	// extent it claims - and it is refused rather than shaded into nothing.
 	let whole = tiles.len() == count && tiles.iter().all(|tile| tile.colour.iter().all(Option::is_some)) && (depth_tiles.is_none() || tiles.iter().all(|tile| tile.depth.is_some()));
@@ -819,9 +893,13 @@ fn shade_tile(shared: &Shared<'_>, lane: &mut Lane, tile: &mut Tile<'_, '_>) -> 
 	let tile_far = *tile.far;
 	let mut drew_anything = false;
 	let mut targets = Targets { colour: &mut *tile.colour, depth: tile.depth.as_mut() };
-	for triangle in shared.bins.get(tile.index).map_or(&[][..], Vec::as_slice) {
-		let binned = &shared.setups[*triangle as usize];
-		if matches!(pipeline.depth_compare, CompareOp::Less | CompareOp::LessOrEqual) {
+	let bin = shared.bins.get(tile.index).map_or(&[][..], Vec::as_slice);
+	let overflow = shared.overflow.get(tile.index).copied().unwrap_or(false);
+	// A full index cache falls back to the already validated setup list in its original order.
+	// The same bounds below reject setups outside this tile; none is omitted or visited twice.
+	for index in 0..if overflow { shared.setups.len() } else { bin.len() } {
+		let binned = &shared.setups[if overflow { index } else { bin[index] as usize }];
+		if shared.hierarchical_depth && matches!(pipeline.depth_compare, CompareOp::Less | CompareOp::LessOrEqual) {
 			let nearest = binned.setup.depth.iter().fold(f32::INFINITY, |held: f32, depth| held.min(*depth));
 			if nearest > tile_far {
 				continue;
@@ -839,7 +917,7 @@ fn shade_tile(shared: &Shared<'_>, lane: &mut Lane, tile: &mut Tile<'_, '_>) -> 
 					continue;
 				}
 				drew_anything = true;
-				shade_pixel(&mut targets, shared.source, pipeline, shared.map, binned, x, y, coverage, shared.samples, &mut lane.stats, &mut lane.machine)?;
+				shade_pixel(&mut targets, shared.source, pipeline, shared.map, binned, x, y, coverage, shared.samples, shared.early_depth, &mut lane.stats, &mut lane.machine)?;
 			}
 		}
 	}
@@ -865,7 +943,8 @@ struct Targets<'t, 'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], binned: &Binned, x: i64, y: i64, coverage: u32, samples: u32, stats: &mut Stats, machine: &mut interpreter::Machine) -> Result<(), Error> {
+// @handles: ProgrammableFragmentStage
+fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], binned: &Binned, x: i64, y: i64, coverage: u32, samples: u32, early_depth: bool, stats: &mut Stats, machine: &mut interpreter::Machine) -> Result<(), Error> {
 	let centre = |dx: i64, dy: i64| (crate::Subpixel((x + dx) * crate::fixed::SUBPIXEL_ONE + crate::fixed::SUBPIXEL_HALF), crate::Subpixel((y + dy) * crate::fixed::SUBPIXEL_ONE + crate::fixed::SUBPIXEL_HALF));
 	let weights = raster::barycentric(&binned.setup, centre(0, 0));
 	// INTERPOLATED INTO FIXED ARRAYS, not into vectors: a `Vec` per fragment is an allocation per
@@ -885,11 +964,11 @@ fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pi
 		}
 		(smooth, screen_linear)
 	};
-	let (smooth, noperspective) = interpolate(weights);
 	let depth = interp::depth(weights, binned.setup.depth);
 	// THE DEPTH BIAS IS APPLIED AFTER THE DEPTH IS COMPUTED AND BEFORE THE TEST AND THE WRITE, which
 	// is the frozen equation's own ordering. The slope is the maximum of the two gradients over the
 	// primitive, taken from the plane the same way the derivatives below are.
+	// @handles: DepthBias
 	let depth = if pipeline.bias.0 != 0.0 || pipeline.bias.1 != 0.0 {
 		let (dx_weights, dy_weights) = (raster::barycentric(&binned.setup, centre(1, 0)), raster::barycentric(&binned.setup, centre(0, 1)));
 		let slope = (interp::depth(dx_weights, binned.setup.depth) - depth).abs().max((interp::depth(dy_weights, binned.setup.depth) - depth).abs());
@@ -898,6 +977,19 @@ fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pi
 	} else {
 		depth
 	};
+	// With one sample, no stencil effects and no shader-written depth, a failed depth test is
+	// final before interpolation or shading. Use the same stored-depth equation as the late path,
+	// including normalised-depth rounding; do not write anything until the shader has run.
+	if early_depth && let Some(buffer) = targets.depth.as_deref() {
+		if !matches!(pipeline.depth_compare, CompareOp::Always | CompareOp::Never) {
+			buffer.readable_depth_at(x as u32, y as u32, 0)?;
+		}
+		let stored = buffer.depth_at(x as u32, y as u32, 0);
+		if !render3d::depth::test(buffer.format(), pipeline.depth_compare, false, depth, stored, None).passed {
+			return Ok(());
+		}
+	}
+	let (smooth, noperspective) = interpolate(weights);
 
 	let bindings = FragmentBindings { source, smooth: smooth.as_slice(), noperspective: noperspective.as_slice(), flat: binned.flat.as_slice(), locations: map, front_facing: binned.setup.facing == Facing::Front, coordinate: [x as f32 + 0.5, y as f32 + 0.5, depth, interp::inverse_w_at(weights, binned.setup.inverse_w)], sample_index: 0, sample_mask: coverage };
 	interpreter::execute_into(&pipeline.fragment, &bindings, machine).map_err(fault)?;
@@ -912,49 +1004,59 @@ fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pi
 	Ok(())
 }
 
+fn writes_fragment_depth(body: &[render_shader::Stmt]) -> bool {
+	use render_shader::Stmt;
+	use render_shader::ir::Output;
+	body.iter().any(|statement| match statement {
+		Stmt::Store(Output::Depth, _) => true,
+		Stmt::If { then_body, else_body, .. } => writes_fragment_depth(then_body) || writes_fragment_depth(else_body),
+		Stmt::Switch { cases, default, .. } => cases.iter().any(|(_, body)| writes_fragment_depth(body)) || writes_fragment_depth(default),
+		Stmt::Loop { body, .. } => writes_fragment_depth(body),
+		_ => false,
+	})
+}
+
 #[allow(clippy::too_many_arguments)]
-fn write_outputs(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, outputs: &interpreter::Outputs, x: u32, y: u32, coverage: u32, depth: f32, facing: Facing, _samples: u32) -> Result<u32, Error> {
+// @handles: BlendStatePerAttachment, MultipleColorAttachments
+fn write_outputs(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, outputs: &interpreter::Outputs, x: u32, y: u32, coverage: u32, depth: f32, facing: Facing, samples: u32) -> Result<u32, Error> {
 	// A SHADER-WRITTEN DEPTH REPLACED THE INTERPOLATED ONE AT THE CALLER, which is what a
 	// depth-writing shader is for; the bias was applied to the interpolated value and is not
 	// reapplied.
-	let stencil = pipeline.stencil.as_ref().map(|face| (face, facing == Facing::Front));
+	// @handles: StencilSeparateFrontBack
+	let stencil = if facing == Facing::Back { pipeline.stencil_back.as_ref().or(pipeline.stencil.as_ref()) } else { pipeline.stencil.as_ref() }.map(|face| (face, facing == Facing::Front));
+	let first = targets.colour.first().and_then(Option::as_ref);
+	let alpha = outputs.colour.iter().find(|(slot, _)| *slot == 0).map_or(1.0, |(_, value)| value.f32_at(3));
+	// surviving_samples uses no blend state. A depth-only pipeline therefore needs no public
+	// colour target or corresponding blend entry, while retaining the same depth/stencil tests.
+	let unused_blend = AttachmentBlend::default();
+	let fragment = Fragment { x, y, coverage, depth, colour: Vec4::new(0.0, 0.0, 0.0, alpha), blend: pipeline.blend.first().unwrap_or(&unused_blend), depth_compare: pipeline.depth_compare, depth_write: pipeline.depth_write, stencil, sample_mask: outputs.sample_mask.unwrap_or(u32::MAX) & pipeline.sample_mask, alpha_to_coverage: pipeline.alpha_to_coverage && first.is_some_and(|colour| !colour.integer()) };
+	let coverage = crate::pass::surviving_samples(targets.depth.as_deref_mut(), &fragment, samples)?;
+	if coverage == 0 {
+		return Ok(0);
+	}
+	if targets.colour.is_empty() {
+		return Ok(if pipeline.depth_write || stencil.is_some() { coverage.count_ones() } else { 0 });
+	}
 	let mut written = 0;
 	// MULTIPLE COLOUR ATTACHMENTS: each with its OWN blend state and write mask, because a pass that
 	// writes colour to one and object ids to another must blend the first and not the second.
 	//
-	// THE DEPTH AND STENCIL TEST RUNS ONCE, against the first attachment, and the rest follow its
-	// answer. Running it per attachment would test the same fragment several times and write the
-	// depth buffer more than once for one fragment.
+	// The depth/stencil result and attachment zero's alpha coverage have already been computed.
+	// Reusing their sample mask keeps an occluded fragment from changing a later picking attachment.
 	for (index, colour) in targets.colour.iter_mut().enumerate() {
 		let Some(colour) = colour.as_mut() else { continue };
-		let value = if colour.integer() {
-			let identity = outputs.integer.iter().find(|(slot, _)| *slot as usize == index).map(|(_, value)| *value).unwrap_or(0);
-			Vec4::new(identity as f32, 0.0, 0.0, 1.0)
-		} else {
-			match outputs.colour.iter().find(|(slot, _)| *slot as usize == index) {
-				Some((_, value)) => Vec4::new(value.f32_at(0), value.f32_at(1), value.f32_at(2), value.f32_at(3)),
-				// AN ATTACHMENT THE SHADER DID NOT WRITE IS LEFT ALONE, not cleared: a pass with two
-				// attachments whose shader writes one is ordinary, and zeroing the other would make
-				// it a pass that erases what it does not touch.
-				None => continue,
-			}
+		if colour.integer() {
+			let Some((_, identity)) = outputs.integer.iter().find(|(slot, _)| *slot as usize == index) else { continue };
+			written += crate::pass::write_identity_into(colour, x, y, coverage, *identity, &pipeline.blend[index])?;
+			continue;
+		}
+		let value = match outputs.colour.iter().find(|(slot, _)| *slot as usize == index) {
+			Some((_, value)) => Vec4::new(value.f32_at(0), value.f32_at(1), value.f32_at(2), value.f32_at(3)),
+			// An attachment the shader did not write is left alone, including an identity target.
+			None => continue,
 		};
-		let fragment = Fragment {
-			x,
-			y,
-			coverage,
-			depth,
-			colour: value,
-			blend: &pipeline.blend[index],
-			depth_compare: pipeline.depth_compare,
-			depth_write: pipeline.depth_write,
-			stencil,
-			// THE SHADER'S MASK AND THE PIPELINE'S ARE BOTH APPLIED, and neither replaces the
-			// other: the pipeline's is the pass's decision and the shader's is the fragment's.
-			sample_mask: outputs.sample_mask.unwrap_or(u32::MAX) & pipeline.sample_mask,
-			alpha_to_coverage: pipeline.alpha_to_coverage && !colour.integer(),
-		};
-		written += crate::pass::write_fragment_into(colour, if index == 0 { targets.depth.as_deref_mut() } else { None }, &fragment)?;
+		let fragment = Fragment { x, y, coverage, depth, colour: value, blend: &pipeline.blend[index], depth_compare: pipeline.depth_compare, depth_write: pipeline.depth_write, stencil, sample_mask: u32::MAX, alpha_to_coverage: false };
+		written += crate::pass::write_fragment_into(colour, None, &fragment)?;
 	}
 	Ok(written)
 }
@@ -964,7 +1066,7 @@ fn write_outputs(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, outputs: &i
 // ---------------------------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn stage_line(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertices: [u32; 2], index: u32, topology: Topology, instance: u32, viewport: &Viewport, stats: &mut Stats) -> Result<(), Error> {
+fn stage_line(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertices: [u32; 2], instance: u32, viewport: &Viewport, stats: &mut Stats) -> Result<(), Error> {
 	let mut machine = core::mem::take(&mut prepared.scratch.vertex_machine);
 	let shaded = {
 		let first = run_vertex(pipeline, source, vertices[0], instance, &mut machine);
@@ -980,18 +1082,13 @@ fn stage_line(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source,
 		}
 	};
 	prepared.scratch.vertex_machine = machine;
-	let provoking = geometry::provoking(topology, index);
-	let which = vertices.iter().position(|vertex| *vertex == provoking).unwrap_or(0);
 	// A LINE IS CLIPPED AS A TWO-VERTEX POLYGON AND KEEPS TWO VERTICES OR NONE.
 	let corners = [
 		clip::Vertex::new(shaded[0].position).with_smooth(shaded[0].smooth).with_noperspective(shaded[0].noperspective),
 		clip::Vertex::new(shaded[1].position).with_smooth(shaded[1].smooth).with_noperspective(shaded[1].noperspective),
 		clip::Vertex::new(shaded[1].position).with_smooth(shaded[1].smooth).with_noperspective(shaded[1].noperspective),
 	];
-	let mut work = prepared.scratch.clip_work.take().unwrap_or_default();
-	let outcome = clip::clip_triangle_into(&corners, shaded[which].flat, &mut work, &mut prepared.scratch.clipped);
-	prepared.scratch.clip_work = Some(work);
-	outcome?;
+	clip::clip_triangle_into(&corners, shaded[0].flat, &mut prepared.scratch.clip_work[0], &mut prepared.scratch.clipped)?;
 	let clipped = prepared.scratch.clipped;
 	if clipped.vertices().len() < 2 {
 		stats.culled += 1;
@@ -1040,7 +1137,7 @@ fn whole<'t, 'a>(attachments: &'t mut Attachments<'a>, views: &mut Vec<Option<Co
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if prepared.scratch.segments.is_empty() {
 		return Ok(());
 	}
@@ -1094,6 +1191,7 @@ fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 						continue;
 					}
 					let coverage = (1_u32 << samples) - 1;
+					let depth = machine.outputs().depth.unwrap_or(depth);
 					stats.samples_written += write_outputs(&mut targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, Facing::Front, samples)?;
 				}
 			}
@@ -1109,7 +1207,7 @@ fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if prepared.scratch.points.is_empty() {
 		return Ok(());
 	}
@@ -1147,7 +1245,8 @@ fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sour
 						stats.discarded += 1;
 						continue;
 					}
-					stats.samples_written += write_outputs(&mut targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, dot.depth, Facing::Front, samples)?;
+					let depth = machine.outputs().depth.unwrap_or(dot.depth);
+					stats.samples_written += write_outputs(&mut targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, Facing::Front, samples)?;
 				}
 			}
 		}
@@ -1171,14 +1270,18 @@ pub fn draws_from(commands: &[Command], topology: Topology) -> Vec<Draw> {
 	for command in commands {
 		match command {
 			Command::BindPipeline(handle) => pipeline = handle.0,
-			Command::Draw { vertices, instances, first_instance, .. } => {
-				out.push(Draw { pipeline, topology, count: *vertices, instances: *instances, first_instance: *first_instance, base_vertex: 0, restart: false });
+			Command::Draw { vertices, instances, first_vertex, first_instance } => {
+				out.push(Draw { pipeline, topology, first: *first_vertex, count: *vertices, instances: *instances, first_instance: *first_instance, base_vertex: 0, restart: false });
 			}
-			Command::DrawIndexed { indices, instances, base_vertex, first_instance, .. } => {
-				out.push(Draw { pipeline, topology, count: *indices, instances: *instances, first_instance: *first_instance, base_vertex: *base_vertex, restart: false });
+			Command::DrawIndexed { indices, instances, first_index, base_vertex, first_instance } => {
+				out.push(Draw { pipeline, topology, first: *first_index, count: *indices, instances: *instances, first_instance: *first_instance, base_vertex: *base_vertex, restart: false });
 			}
 			_ => {}
 		}
 	}
 	out
 }
+
+#[cfg(test)]
+#[path = "frame/depth_only_tests.rs"]
+mod depth_only_tests;

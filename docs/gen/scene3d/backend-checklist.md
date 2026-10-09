@@ -7,10 +7,10 @@ does it, which is what makes a deleted handler stop claiming coverage.
 
 | feature | group | handled by |
 | --- | --- | --- |
-| `IdentityReadback` | picking | - |
-| `DepthReadback` | picking | - |
-| `ColourReadback` | picking | - |
-| `AsynchronousReadback` | picking | - |
-| `OffscreenTarget` | passes | - |
+| `IdentityReadback` | picking | `user/libs/graphics/soft3d/src/pass.rs:217` |
+| `DepthReadback` | picking | `user/libs/graphics/soft3d/src/readback.rs:401` |
+| `ColourReadback` | picking | `user/libs/graphics/soft3d/src/pass.rs:255`, `user/libs/graphics/soft3d/src/readback.rs:412` |
+| `AsynchronousReadback` | picking | `user/libs/graphics/scene3d/src/pick.rs:143`, `user/libs/graphics/soft3d/src/readback.rs:219` |
+| `OffscreenTarget` | passes | `user/libs/graphics/soft3d/src/pass.rs:132` |
 
-0 of 5 implemented.
+5 of 5 implemented.

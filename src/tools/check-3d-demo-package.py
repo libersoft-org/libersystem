@@ -31,11 +31,9 @@ ARTIFACT = f'bin/{PROGRAM}'
 # Both halves are here on purpose. The 3D demo is also the 2D/3D interop proof, so a build in which
 # the overlay quietly became a private copy of `render2d` would still draw the same HUD.
 #
-# `render3d` IS NOT ON THIS LIST AND MUST NOT BE. It is the backend-neutral API: what an application
-# takes from it is types, constants and generics, every one of which the compiler inlines, so a
-# correctly linked program imports NO symbol from it - which is also why its manifest row does not
-# name it. Requiring an import here would be requiring the build to be wrong.
-RENDERING = ('soft3d', 'render_shader', 'render_math', 'render2d', 'soft2d', 'graphics_app', 'graphics_core', 'surface')
+# The retained scene now records a real CommandList before the backend prepares it. Both scene3d
+# and render3d therefore contribute executable code as well as types to this application.
+RENDERING = ('scene3d', 'render3d', 'soft3d', 'render_shader', 'render_math', 'render2d', 'soft2d', 'graphics_app', 'graphics_core', 'surface')
 GRANTS = ('Display', 'InputKeys')
 
 

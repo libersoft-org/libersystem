@@ -141,6 +141,9 @@ pub enum DeviceEvent {
 	/// The backing was replaced: a new object, a new generation, and the old handle is the service's
 	/// to release once it has mapped this one.
 	Replaced(Scanout),
+	/// The monitor description changed or became unavailable. Query `monitor` again; this notification
+	/// carries no framebuffer and does not change the backing generation.
+	MonitorChanged,
 }
 
 impl DeviceEvent {
@@ -188,6 +191,9 @@ impl DeviceEvent {
 				w.u8(1)?;
 				v1.write(w)?;
 			}
+			DeviceEvent::MonitorChanged => {
+				w.u8(2)?;
+			}
 		}
 		Some(())
 	}
@@ -195,6 +201,7 @@ impl DeviceEvent {
 		match r.u8()? {
 			0 => Some(DeviceEvent::Resized(Extent2d::read(r)?)),
 			1 => Some(DeviceEvent::Replaced(Scanout::read(r)?)),
+			2 => Some(DeviceEvent::MonitorChanged),
 			_ => None,
 		}
 	}
@@ -210,6 +217,7 @@ pub mod display_device {
 	pub const OP_SCANOUT: u16 = 1;
 	pub const OP_PRESENT: u16 = 2;
 	pub const OP_EVENTS: u16 = 3;
+	pub const OP_MONITOR: u16 = 4;
 
 	pub trait Service {
 		/// The current scanout. Called once at adoption and again after a rebind; a driver that cannot
@@ -221,6 +229,9 @@ pub mod display_device {
 		fn present(&mut self, generation: u32, damage: DamageRegion) -> Result<(), Error>;
 		/// The bounded event stream: resizes and replacements.
 		fn events(&mut self) -> Vec<DeviceEvent>;
+		/// The bound output's EDID base-block modes and physical size. Unsupported means the transport
+		/// offers no EDID; unavailable means it supplied no valid description. Neither prevents scanout.
+		fn monitor(&mut self) -> Result<MonitorDescription, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -295,6 +306,42 @@ pub mod display_device {
 						Err(v5) => {
 							w.u8(0)?;
 							v5.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_MONITOR => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.monitor();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v6) => {
+							w.u8(1)?;
+							v6.write(w)?;
+						}
+						Err(v7) => {
+							w.u8(0)?;
+							v7.write(w)?;
 						}
 					}
 					Some(())
@@ -528,6 +575,38 @@ pub mod display_device {
 			}
 			Some(reply_handles.first())
 		}
+		pub fn monitor(&mut self) -> Option<Result<MonitorDescription, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_MONITOR)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(MonitorDescription::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -552,6 +631,14 @@ pub mod display_device {
 	fn channel_invoke_events(chan: u64) -> Option<u64> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.events()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_device_display_device_monitor")]
+	fn channel_invoke_monitor(chan: u64) -> Option<Result<MonitorDescription, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.monitor()
 	}
 }
 
@@ -670,6 +757,156 @@ impl MonitorIdentity {
 	}
 }
 
+/// One advertised base-block timing. This is discovery, not a promise that a controller can set it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorMode {
+	pub size: Extent2d,
+	pub refresh_millihertz: u32,
+	pub interlaced: bool,
+}
+
+impl MonitorMode {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MonitorMode> {
+		let mut r = Reader::new(bytes);
+		let value = MonitorMode::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MonitorMode> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MonitorMode::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.size.write(w)?;
+		w.u32(self.refresh_millihertz)?;
+		w.boolean(self.interlaced)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<MonitorMode> {
+		let size = Extent2d::read(r)?;
+		let refresh_millihertz = r.u32()?;
+		let interlaced = r.boolean()?;
+		Some(MonitorMode { size, refresh_millihertz, interlaced })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorDescription {
+	pub identity: MonitorIdentity,
+	/// Absent for an aspect ratio or unspecified size; neither is a physical measurement.
+	pub physical_size_mm: Option<Extent2d>,
+	/// At most 29 modes: four detailed, seventeen established, eight standard timings, deduplicated.
+	pub modes: Vec<MonitorMode>,
+	/// Index of the preferred detailed timing, when the EDID declares one.
+	pub preferred: Option<u32>,
+}
+
+impl MonitorDescription {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MonitorDescription> {
+		let mut r = Reader::new(bytes);
+		let value = MonitorDescription::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MonitorDescription> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MonitorDescription::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.identity.write(w)?;
+		match &self.physical_size_mm {
+			Some(v8) => {
+				w.u8(1)?;
+				v8.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		if self.modes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.modes.len() as u16)?;
+		for v9 in self.modes.iter() {
+			v9.write(w)?;
+		}
+		match &self.preferred {
+			Some(v10) => {
+				w.u8(1)?;
+				w.u32(*v10)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<MonitorDescription> {
+		let identity = MonitorIdentity::read(r)?;
+		let physical_size_mm = if r.tag()? { Some(Extent2d::read(r)?) } else { None };
+		let modes = {
+			let v11 = r.u16()? as usize;
+			let v11 = (v11 <= 29).then_some(v11)?;
+			let mut v12 = Vec::new();
+			v12.try_reserve_exact(v11).ok()?;
+			for _ in 0..v11 {
+				v12.push(MonitorMode::read(r)?);
+			}
+			v12
+		};
+		let preferred = if r.tag()? { Some(r.u32()?) } else { None };
+		Some(MonitorDescription { identity, physical_size_mm, modes, preferred })
+	}
+}
+
 /// WHAT A BACKLIGHT BELONGS TO, as its driver reads it and never derives: the ACPI driver copies its adapter's function
 /// from its claim's identity, the USB one reads the monitor's EDID from the device.
 #[derive(Clone, Debug, PartialEq)]
@@ -716,13 +953,13 @@ impl BacklightTarget {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			BacklightTarget::Function(v6) => {
+			BacklightTarget::Function(v13) => {
 				w.u8(0)?;
-				v6.write(w)?;
+				v13.write(w)?;
 			}
-			BacklightTarget::Monitor(v7) => {
+			BacklightTarget::Monitor(v14) => {
 				w.u8(1)?;
-				v7.write(w)?;
+				v14.write(w)?;
 			}
 			BacklightTarget::None => {
 				w.u8(2)?;
@@ -842,19 +1079,19 @@ impl BacklightScale {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			BacklightScale::Levels(v8) => {
+			BacklightScale::Levels(v15) => {
 				w.u8(0)?;
-				if v8.len() > u16::MAX as usize {
+				if v15.len() > u16::MAX as usize {
 					return None;
 				}
-				w.u16(v8.len() as u16)?;
-				for v9 in v8.iter() {
-					w.u32(*v9)?;
+				w.u16(v15.len() as u16)?;
+				for v16 in v15.iter() {
+					w.u32(*v16)?;
 				}
 			}
-			BacklightScale::Range(v10) => {
+			BacklightScale::Range(v17) => {
 				w.u8(1)?;
-				v10.write(w)?;
+				v17.write(w)?;
 			}
 		}
 		Some(())
@@ -862,13 +1099,13 @@ impl BacklightScale {
 	pub fn read(r: &mut Reader) -> Option<BacklightScale> {
 		match r.u8()? {
 			0 => Some(BacklightScale::Levels({
-				let v11 = r.u16()? as usize;
-				let mut v12 = Vec::new();
-				v12.try_reserve_exact(v11).ok()?;
-				for _ in 0..v11 {
-					v12.push(r.u32()?);
+				let v18 = r.u16()? as usize;
+				let mut v19 = Vec::new();
+				v19.try_reserve_exact(v18).ok()?;
+				for _ in 0..v18 {
+					v19.push(r.u32()?);
 				}
-				v12
+				v19
 			})),
 			1 => Some(BacklightScale::Range(BacklightRange::read(r)?)),
 			_ => None,
@@ -982,18 +1219,18 @@ impl BacklightDescription {
 		w.bytes_lp(self.key.as_bytes())?;
 		self.scale.write(w)?;
 		match &self.ac_default {
-			Some(v13) => {
+			Some(v20) => {
 				w.u8(1)?;
-				w.u32(*v13)?;
+				w.u32(*v20)?;
 			}
 			None => {
 				w.u8(0)?;
 			}
 		}
 		match &self.battery_default {
-			Some(v14) => {
+			Some(v21) => {
 				w.u8(1)?;
-				w.u32(*v14)?;
+				w.u32(*v21)?;
 			}
 			None => {
 				w.u8(0)?;
@@ -1117,13 +1354,13 @@ impl BacklightEvent {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match self {
-			BacklightEvent::Level(v15) => {
+			BacklightEvent::Level(v22) => {
 				w.u8(0)?;
-				w.u32(*v15)?;
+				w.u32(*v22)?;
 			}
-			BacklightEvent::Hotkey(v16) => {
+			BacklightEvent::Hotkey(v23) => {
 				w.u8(1)?;
-				v16.write(w)?;
+				v23.write(w)?;
 			}
 		}
 		Some(())
@@ -1149,6 +1386,7 @@ pub mod backlight {
 	pub const OP_GET: u16 = 2;
 	pub const OP_SET: u16 = 3;
 	pub const OP_EVENTS: u16 = 4;
+	pub const OP_FIRMWARE_DISPLAY_ID: u16 = 5;
 
 	pub trait Service {
 		fn describe(&mut self) -> Result<BacklightDescription, Error>;
@@ -1157,6 +1395,9 @@ pub mod backlight {
 		/// Set a level from the scale, answering the level set.
 		fn set(&mut self, level: u32) -> Result<u32, Error>;
 		fn events(&mut self) -> Vec<BacklightEvent>;
+		/// ACPI output _ADR, when available; used only to choose among firmware outputs of one adapter.
+		/// Additive optional metadata: consumers of older providers fall back to namespace ordering.
+		fn firmware_display_id(&mut self) -> Result<Option<u32>, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1187,13 +1428,13 @@ pub mod backlight {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v17) => {
+						Ok(v24) => {
 							w.u8(1)?;
-							v17.write(w)?;
+							v24.write(w)?;
 						}
-						Err(v18) => {
+						Err(v25) => {
 							w.u8(0)?;
-							v18.write(w)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -1223,13 +1464,13 @@ pub mod backlight {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v19) => {
+						Ok(v26) => {
 							w.u8(1)?;
-							w.u32(*v19)?;
+							w.u32(*v26)?;
 						}
-						Err(v20) => {
+						Err(v27) => {
 							w.u8(0)?;
-							v20.write(w)?;
+							v27.write(w)?;
 						}
 					}
 					Some(())
@@ -1260,13 +1501,57 @@ pub mod backlight {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v21) => {
+						Ok(v28) => {
 							w.u8(1)?;
-							w.u32(*v21)?;
+							w.u32(*v28)?;
 						}
-						Err(v22) => {
+						Err(v29) => {
 							w.u8(0)?;
-							v22.write(w)?;
+							v29.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_FIRMWARE_DISPLAY_ID => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.firmware_display_id();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v30) => {
+							w.u8(1)?;
+							match v30 {
+								Some(v32) => {
+									w.u8(1)?;
+									w.u32(*v32)?;
+								}
+								None => {
+									w.u8(0)?;
+								}
+							}
+						}
+						Err(v31) => {
+							w.u8(0)?;
+							v31.write(w)?;
 						}
 					}
 					Some(())
@@ -1531,6 +1816,38 @@ pub mod backlight {
 			}
 			Some(reply_handles.first())
 		}
+		pub fn firmware_display_id(&mut self) -> Option<Result<Option<u32>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_FIRMWARE_DISPLAY_ID)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(if r.tag()? { Some(r.u32()?) } else { None }) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1563,6 +1880,14 @@ pub mod backlight {
 	fn channel_invoke_events(chan: u64) -> Option<u64> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.events()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_device_backlight_firmware_display_id")]
+	fn channel_invoke_firmware_display_id(chan: u64) -> Option<Result<Option<u32>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.firmware_display_id()
 	}
 }
 
@@ -1667,20 +1992,20 @@ impl AmbientLightDescription {
 			return None;
 		}
 		w.u16(self.curve.len() as u16)?;
-		for v23 in self.curve.iter() {
-			v23.write(w)?;
+		for v33 in self.curve.iter() {
+			v33.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<AmbientLightDescription> {
 		let curve = {
-			let v24 = r.u16()? as usize;
-			let mut v25 = Vec::new();
-			v25.try_reserve_exact(v24).ok()?;
-			for _ in 0..v24 {
-				v25.push(LightResponse::read(r)?);
+			let v34 = r.u16()? as usize;
+			let mut v35 = Vec::new();
+			v35.try_reserve_exact(v34).ok()?;
+			for _ in 0..v34 {
+				v35.push(LightResponse::read(r)?);
 			}
-			v25
+			v35
 		};
 		Some(AmbientLightDescription { curve })
 	}
@@ -1781,13 +2106,13 @@ pub mod ambient_light {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v26) => {
+						Ok(v36) => {
 							w.u8(1)?;
-							v26.write(w)?;
+							v36.write(w)?;
 						}
-						Err(v27) => {
+						Err(v37) => {
 							w.u8(0)?;
-							v27.write(w)?;
+							v37.write(w)?;
 						}
 					}
 					Some(())
@@ -2083,44 +2408,47 @@ impl DeviceEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			DeviceEvent::Resized(v28) => {
+			DeviceEvent::Resized(v38) => {
 				out.push_str("{\"resized\":");
-				v28.to_json_into(out);
+				v38.to_json_into(out);
 				out.push('}');
 			}
-			DeviceEvent::Replaced(v29) => {
+			DeviceEvent::Replaced(v39) => {
 				out.push_str("{\"replaced\":");
-				v29.to_json_into(out);
+				v39.to_json_into(out);
 				out.push('}');
 			}
+			DeviceEvent::MonitorChanged => out.push_str("\"monitor-changed\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			DeviceEvent::Resized(v30) => {
+			DeviceEvent::Resized(v40) => {
 				out.push_str("resized(");
-				v30.to_text_into(out);
+				v40.to_text_into(out);
 				out.push(')');
 			}
-			DeviceEvent::Replaced(v31) => {
+			DeviceEvent::Replaced(v41) => {
 				out.push_str("replaced(");
-				v31.to_text_into(out);
+				v41.to_text_into(out);
 				out.push(')');
 			}
+			DeviceEvent::MonitorChanged => out.push_str("monitor-changed"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			DeviceEvent::Resized(v32) => {
+			DeviceEvent::Resized(v42) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "resized");
-				v32.to_cbor_into(out);
+				v42.to_cbor_into(out);
 			}
-			DeviceEvent::Replaced(v33) => {
+			DeviceEvent::Replaced(v43) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "replaced");
-				v33.to_cbor_into(out);
+				v43.to_cbor_into(out);
 			}
+			DeviceEvent::MonitorChanged => crate::codec::cbor::text(out, "monitor-changed"),
 		}
 	}
 }
@@ -2227,6 +2555,187 @@ impl MonitorIdentity {
 	}
 }
 
+impl MonitorMode {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"size\":");
+		self.size.to_json_into(out);
+		out.push(',');
+		out.push_str("\"refresh-millihertz\":");
+		let _ = write!(out, "{}", self.refresh_millihertz);
+		out.push(',');
+		out.push_str("\"interlaced\":");
+		if self.interlaced {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("size=");
+		self.size.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("refresh-millihertz=");
+		let _ = write!(out, "{}", self.refresh_millihertz);
+		out.push_str(", ");
+		out.push_str("interlaced=");
+		if self.interlaced {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "size");
+		self.size.to_cbor_into(out);
+		crate::codec::cbor::text(out, "refresh-millihertz");
+		crate::codec::cbor::uint(out, self.refresh_millihertz as u64);
+		crate::codec::cbor::text(out, "interlaced");
+		crate::codec::cbor::boolean(out, self.interlaced);
+	}
+}
+
+impl MonitorDescription {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"identity\":");
+		self.identity.to_json_into(out);
+		out.push(',');
+		out.push_str("\"physical-size-mm\":");
+		match &self.physical_size_mm {
+			Some(v44) => {
+				v44.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"modes\":");
+		out.push('[');
+		let mut v46 = true;
+		for v45 in self.modes.iter() {
+			if !v46 {
+				out.push(',');
+			}
+			v46 = false;
+			v45.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"preferred\":");
+		match &self.preferred {
+			Some(v47) => {
+				let _ = write!(out, "{}", v47);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("identity=");
+		self.identity.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("physical-size-mm=");
+		match &self.physical_size_mm {
+			Some(v48) => {
+				v48.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("modes=");
+		out.push('[');
+		let mut v50 = true;
+		for v49 in self.modes.iter() {
+			if !v50 {
+				out.push_str(", ");
+			}
+			v50 = false;
+			v49.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("preferred=");
+		match &self.preferred {
+			Some(v51) => {
+				let _ = write!(out, "{}", v51);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "identity");
+		self.identity.to_cbor_into(out);
+		crate::codec::cbor::text(out, "physical-size-mm");
+		match &self.physical_size_mm {
+			Some(v52) => {
+				v52.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "modes");
+		crate::codec::cbor::array(out, self.modes.len());
+		for v53 in self.modes.iter() {
+			v53.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "preferred");
+		match &self.preferred {
+			Some(v54) => {
+				crate::codec::cbor::uint(out, *v54 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
 impl BacklightTarget {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -2245,14 +2754,14 @@ impl BacklightTarget {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			BacklightTarget::Function(v34) => {
+			BacklightTarget::Function(v55) => {
 				out.push_str("{\"function\":");
-				v34.to_json_into(out);
+				v55.to_json_into(out);
 				out.push('}');
 			}
-			BacklightTarget::Monitor(v35) => {
+			BacklightTarget::Monitor(v56) => {
 				out.push_str("{\"monitor\":");
-				v35.to_json_into(out);
+				v56.to_json_into(out);
 				out.push('}');
 			}
 			BacklightTarget::None => out.push_str("\"none\""),
@@ -2260,14 +2769,14 @@ impl BacklightTarget {
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			BacklightTarget::Function(v36) => {
+			BacklightTarget::Function(v57) => {
 				out.push_str("function(");
-				v36.to_text_into(out);
+				v57.to_text_into(out);
 				out.push(')');
 			}
-			BacklightTarget::Monitor(v37) => {
+			BacklightTarget::Monitor(v58) => {
 				out.push_str("monitor(");
-				v37.to_text_into(out);
+				v58.to_text_into(out);
 				out.push(')');
 			}
 			BacklightTarget::None => out.push_str("none"),
@@ -2275,15 +2784,15 @@ impl BacklightTarget {
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			BacklightTarget::Function(v38) => {
+			BacklightTarget::Function(v59) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "function");
-				v38.to_cbor_into(out);
+				v59.to_cbor_into(out);
 			}
-			BacklightTarget::Monitor(v39) => {
+			BacklightTarget::Monitor(v60) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "monitor");
-				v39.to_cbor_into(out);
+				v60.to_cbor_into(out);
 			}
 			BacklightTarget::None => crate::codec::cbor::text(out, "none"),
 		}
@@ -2347,64 +2856,64 @@ impl BacklightScale {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			BacklightScale::Levels(v40) => {
+			BacklightScale::Levels(v61) => {
 				out.push_str("{\"levels\":");
 				out.push('[');
-				let mut v42 = true;
-				for v41 in v40.iter() {
-					if !v42 {
+				let mut v63 = true;
+				for v62 in v61.iter() {
+					if !v63 {
 						out.push(',');
 					}
-					v42 = false;
-					let _ = write!(out, "{}", v41);
+					v63 = false;
+					let _ = write!(out, "{}", v62);
 				}
 				out.push(']');
 				out.push('}');
 			}
-			BacklightScale::Range(v43) => {
+			BacklightScale::Range(v64) => {
 				out.push_str("{\"range\":");
-				v43.to_json_into(out);
+				v64.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			BacklightScale::Levels(v44) => {
+			BacklightScale::Levels(v65) => {
 				out.push_str("levels(");
 				out.push('[');
-				let mut v46 = true;
-				for v45 in v44.iter() {
-					if !v46 {
+				let mut v67 = true;
+				for v66 in v65.iter() {
+					if !v67 {
 						out.push_str(", ");
 					}
-					v46 = false;
-					let _ = write!(out, "{}", v45);
+					v67 = false;
+					let _ = write!(out, "{}", v66);
 				}
 				out.push(']');
 				out.push(')');
 			}
-			BacklightScale::Range(v47) => {
+			BacklightScale::Range(v68) => {
 				out.push_str("range(");
-				v47.to_text_into(out);
+				v68.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			BacklightScale::Levels(v48) => {
+			BacklightScale::Levels(v69) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "levels");
-				crate::codec::cbor::array(out, v48.len());
-				for v49 in v48.iter() {
-					crate::codec::cbor::uint(out, *v49 as u64);
+				crate::codec::cbor::array(out, v69.len());
+				for v70 in v69.iter() {
+					crate::codec::cbor::uint(out, *v70 as u64);
 				}
 			}
-			BacklightScale::Range(v50) => {
+			BacklightScale::Range(v71) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "range");
-				v50.to_cbor_into(out);
+				v71.to_cbor_into(out);
 			}
 		}
 	}
@@ -2482,8 +2991,8 @@ impl BacklightDescription {
 		out.push(',');
 		out.push_str("\"ac-default\":");
 		match &self.ac_default {
-			Some(v51) => {
-				let _ = write!(out, "{}", v51);
+			Some(v72) => {
+				let _ = write!(out, "{}", v72);
 			}
 			None => {
 				out.push_str("null");
@@ -2492,8 +3001,8 @@ impl BacklightDescription {
 		out.push(',');
 		out.push_str("\"battery-default\":");
 		match &self.battery_default {
-			Some(v52) => {
-				let _ = write!(out, "{}", v52);
+			Some(v73) => {
+				let _ = write!(out, "{}", v73);
 			}
 			None => {
 				out.push_str("null");
@@ -2517,8 +3026,8 @@ impl BacklightDescription {
 		out.push_str(", ");
 		out.push_str("ac-default=");
 		match &self.ac_default {
-			Some(v53) => {
-				let _ = write!(out, "{}", v53);
+			Some(v74) => {
+				let _ = write!(out, "{}", v74);
 			}
 			None => {
 				out.push('-');
@@ -2527,8 +3036,8 @@ impl BacklightDescription {
 		out.push_str(", ");
 		out.push_str("battery-default=");
 		match &self.battery_default {
-			Some(v54) => {
-				let _ = write!(out, "{}", v54);
+			Some(v75) => {
+				let _ = write!(out, "{}", v75);
 			}
 			None => {
 				out.push('-');
@@ -2549,8 +3058,8 @@ impl BacklightDescription {
 		self.scale.to_cbor_into(out);
 		crate::codec::cbor::text(out, "ac-default");
 		match &self.ac_default {
-			Some(v55) => {
-				crate::codec::cbor::uint(out, *v55 as u64);
+			Some(v76) => {
+				crate::codec::cbor::uint(out, *v76 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -2558,8 +3067,8 @@ impl BacklightDescription {
 		}
 		crate::codec::cbor::text(out, "battery-default");
 		match &self.battery_default {
-			Some(v56) => {
-				crate::codec::cbor::uint(out, *v56 as u64);
+			Some(v77) => {
+				crate::codec::cbor::uint(out, *v77 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -2630,43 +3139,43 @@ impl BacklightEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			BacklightEvent::Level(v57) => {
+			BacklightEvent::Level(v78) => {
 				out.push_str("{\"level\":");
-				let _ = write!(out, "{}", v57);
+				let _ = write!(out, "{}", v78);
 				out.push('}');
 			}
-			BacklightEvent::Hotkey(v58) => {
+			BacklightEvent::Hotkey(v79) => {
 				out.push_str("{\"hotkey\":");
-				v58.to_json_into(out);
+				v79.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			BacklightEvent::Level(v59) => {
+			BacklightEvent::Level(v80) => {
 				out.push_str("level(");
-				let _ = write!(out, "{}", v59);
+				let _ = write!(out, "{}", v80);
 				out.push(')');
 			}
-			BacklightEvent::Hotkey(v60) => {
+			BacklightEvent::Hotkey(v81) => {
 				out.push_str("hotkey(");
-				v60.to_text_into(out);
+				v81.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			BacklightEvent::Level(v61) => {
+			BacklightEvent::Level(v82) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "level");
-				crate::codec::cbor::uint(out, *v61 as u64);
+				crate::codec::cbor::uint(out, *v82 as u64);
 			}
-			BacklightEvent::Hotkey(v62) => {
+			BacklightEvent::Hotkey(v83) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "hotkey");
-				v62.to_cbor_into(out);
+				v83.to_cbor_into(out);
 			}
 		}
 	}
@@ -2735,13 +3244,13 @@ impl AmbientLightDescription {
 		out.push('{');
 		out.push_str("\"curve\":");
 		out.push('[');
-		let mut v64 = true;
-		for v63 in self.curve.iter() {
-			if !v64 {
+		let mut v85 = true;
+		for v84 in self.curve.iter() {
+			if !v85 {
 				out.push(',');
 			}
-			v64 = false;
-			v63.to_json_into(out);
+			v85 = false;
+			v84.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2750,13 +3259,13 @@ impl AmbientLightDescription {
 		out.push('{');
 		out.push_str("curve=");
 		out.push('[');
-		let mut v66 = true;
-		for v65 in self.curve.iter() {
-			if !v66 {
+		let mut v87 = true;
+		for v86 in self.curve.iter() {
+			if !v87 {
 				out.push_str(", ");
 			}
-			v66 = false;
-			v65.to_text_into(out);
+			v87 = false;
+			v86.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2765,8 +3274,8 @@ impl AmbientLightDescription {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "curve");
 		crate::codec::cbor::array(out, self.curve.len());
-		for v67 in self.curve.iter() {
-			v67.to_cbor_into(out);
+		for v88 in self.curve.iter() {
+			v88.to_cbor_into(out);
 		}
 	}
 }

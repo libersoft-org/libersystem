@@ -3698,6 +3698,7 @@ enum AudioServiceScenario {
 	Mp3Continuity,
 	DriverLoss,
 	Inventory,
+	MicrophoneVolume,
 }
 
 // THE CATALOGUE'S CONVERSATION, KEPT OPEN: as `serve_provider_catalogue`, but the subscription's stream is handed back
@@ -3930,7 +3931,14 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	let catalogue_stream = serve_provider_catalogue_kept(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
 	sched::run_until_idle();
 	// WHAT THE DEVICE IS, FIRST: the fixed 48 kHz stereo every provider spoke before it was asked.
-	answer_format(&snd_host, &driver_protocol::audio::DeviceFormat::LEGACY);
+	if matches!(scenario, AudioServiceScenario::MicrophoneVolume) {
+		let asked = snd_host.recv().expect("the legacy provider's format request");
+		assert_eq!(asked.bytes, [driver_protocol::audio::CMD_FORMAT]);
+		snd_host.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("the old provider refuses format negotiation");
+		sched::run_until_idle();
+	} else {
+		answer_format(&snd_host, &driver_protocol::audio::DeviceFormat::LEGACY);
+	}
 	// THE COUNTERS ARE READ NEXT, before anything plays - and what the observation root answers after that is what
 	// the driver said, no older and no invented.
 	let asked = snd_host.recv().expect("the counters asked for as the device connected");
@@ -4102,6 +4110,100 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			let streams = control(&control_root).streams().expect("the streams");
 			assert!(streams.iter().all(|stream| stream.device.is_none()), "every stream plays on no device");
 			drop(late);
+		}
+		AudioServiceScenario::MicrophoneVolume => {
+			use audio_proto::generated::liber::audio::v1::{Error, audio, pcm_capture};
+			use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP, DeviceFormat};
+
+			// The real public capture channel is answered by a legacy provider's unscaled samples.
+			// Read the complete returned period: a cached getter alone cannot prove gain is applied.
+			fn captured(capture: &Channel, snd: &Channel, correlation: u32, expected: i16) {
+				let request = [pcm_capture::OP_READ.to_le_bytes().as_slice(), &correlation.to_le_bytes()].concat();
+				capture.send(Message::new(request, alloc::vec::Vec::new())).expect("capture read");
+				sched::run_until_idle();
+				assert_eq!(from_driver(snd, "capture request at the provider").bytes, [CMD_CAPTURE]);
+				snd.send(Message::new(pcm(512, 2, 20_000), alloc::vec::Vec::new())).expect("unscaled captured period");
+				sched::run_until_idle();
+				let reply = capture.recv().expect("captured PCM reaches its public client");
+				assert_eq!(le_u32(&reply.bytes, 0), correlation);
+				assert_eq!(reply.bytes[4], 1, "capture read succeeds");
+				assert_eq!(le_u16(&reply.bytes, 5), 2_048, "the complete stereo period is returned");
+				assert_eq!(reply.bytes.len(), 2_055);
+				assert!(reply.caps.is_empty(), "capture returns bytes, not capabilities");
+				assert!(reply.bytes[7..].chunks_exact(2).all(|pair| i16::from_le_bytes([pair[0], pair[1]]) == expected), "every captured sample has the microphone gain");
+			}
+
+			fn played(stream: &Channel, snd: &Channel, correlation: u32, expected: i16) {
+				send_write(stream, correlation, &pcm(512, 2, 20_000));
+				sched::run_until_idle();
+				write_reply(stream, correlation, 512);
+				let period = from_driver(snd, "playback period at the provider");
+				assert_eq!(period.bytes.len(), 2_048);
+				assert!(period.bytes.chunks_exact(2).all(|pair| i16::from_le_bytes([pair[0], pair[1]]) == expected), "playback keeps its own gain");
+				snd.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("playback period acknowledged");
+				sched::run_until_idle();
+				assert!(from_driver(snd, "playback stop").bytes.is_empty());
+				snd.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("playback stop acknowledged");
+				sched::run_until_idle();
+			}
+
+			let first = control(&control_root).devices().expect("the legacy device inventory")[0].id;
+			let capture_request = [audio::OP_OPEN_CAPTURE_FROM.to_le_bytes().as_slice(), &70u32.to_le_bytes(), &first.to_le_bytes(), &48_000u32.to_le_bytes(), &[2]].concat();
+			service_client.send(Message::new(capture_request, alloc::vec::Vec::new())).expect("open a capture on the named device");
+			sched::run_until_idle();
+			let opened = service_client.recv().expect("capture open reply");
+			assert_eq!(le_u32(&opened.bytes, 0), 70);
+			assert_eq!(opened.bytes[4], 1);
+			let capture = opened.caps.first().expect("capture capability").object().into_any_arc().downcast::<Channel>().expect("capture channel");
+			let playback = open(&service_client, 71, 48_000, 2).expect("playback on the same device");
+
+			assert_eq!(control(&control_root).set_volume(&first, &50), Some(Ok(())));
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(50)), "legacy software capture follows the combined device level");
+			captured(&capture, &snd_host, 72, 5_000);
+			assert_eq!(control(&control_root).set_volume(&first, &100), Some(Ok(())));
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(100)), "reading the microphone level did not opt into separate control");
+			captured(&capture, &snd_host, 73, 20_000);
+
+			assert_eq!(control(&control_root).set_microphone_volume(&first, &50), Some(Ok(())));
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(50)));
+			assert_eq!(control(&control_root).devices().expect("inventory after microphone set")[0].volume, 100, "microphone gain does not replace speaker volume");
+			captured(&capture, &snd_host, 74, 5_000);
+			played(&playback, &snd_host, 75, 20_000);
+			assert_eq!(control(&control_root).set_volume(&first, &25), Some(Ok(())));
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(50)), "later speaker changes leave the explicit microphone gain alone");
+			captured(&capture, &snd_host, 76, 5_000);
+			played(&playback, &snd_host, 77, 1_250);
+
+			assert_eq!(control(&control_root).set_microphone_volume(&first, &101), Some(Err(Error::Invalid)));
+			assert_eq!(control(&control_root).microphone_volume(&u32::MAX), Some(Err(Error::NotFound)));
+			assert_eq!(control(&control_root).set_microphone_volume(&u32::MAX, &50), Some(Err(Error::NotFound)));
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(50)), "refusals do not change the last valid gain");
+			for (correlation, level, sample) in [(78, 0, 0), (79, 100, 20_000)] {
+				assert_eq!(control(&control_root).set_microphone_volume(&first, &level), Some(Ok(())));
+				assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(level)));
+				captured(&capture, &snd_host, correlation, sample);
+			}
+			assert_eq!(control(&control_root).devices().expect("inventory after microphone bounds")[0].volume, 25);
+
+			let (output_host, output_service) = Channel::create();
+			publish_provider(&catalogue_server, &catalogue_stream, device_proto::generated::liber::device::v1::ProviderKind::Audio, 1, true, Some(output_service)).expect("an output-only provider");
+			sched::run_until_idle();
+			answer_format(&output_host, &DeviceFormat { input: None, ..DeviceFormat::LEGACY });
+			let output = control(&control_root).devices().expect("the output-only device inventory").iter().find(|device| device.id != first).expect("the new device").id;
+			assert_eq!(control(&control_root).microphone_volume(&output), Some(Err(Error::Invalid)));
+			assert_eq!(control(&control_root).set_microphone_volume(&output, &50), Some(Err(Error::Invalid)));
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Ok(100)), "another device's refusal leaves this microphone alone");
+
+			capture.send(Message::new([pcm_capture::OP_CLOSE.to_le_bytes().as_slice(), &80u32.to_le_bytes()].concat(), alloc::vec::Vec::new())).expect("close capture");
+			sched::run_until_idle();
+			assert_eq!(capture.recv().expect("capture close reply").bytes[4], 1);
+			assert_eq!(from_driver(&snd_host, "capture stop").bytes, [CMD_CAPTURE_STOP]);
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("capture stop acknowledged");
+			sched::run_until_idle();
+			publish_provider(&catalogue_server, &catalogue_stream, device_proto::generated::liber::device::v1::ProviderKind::Audio, 0, false, None).expect("the microphone provider leaves");
+			sched::run_until_idle();
+			assert_eq!(control(&control_root).microphone_volume(&first), Some(Err(Error::NotFound)));
+			assert_eq!(control(&control_root).set_microphone_volume(&first, &50), Some(Err(Error::NotFound)));
 		}
 		// THE INVENTORY AND THE ROUTING RULE: a second provider in a format of its own arrives and takes the default, a
 		// stream plays on it at its rate and channel count, its level is applied here, and when it is withdrawn the
@@ -6291,9 +6393,21 @@ pub(crate) fn scanout_reply(corr: u32, width: u32, height: u32, len: u64) -> all
 // `None` WHEN THE SERVICE DID NOT ASK, which is a real answer rather than a failure: a harness that
 // panicked here would be asserting the order of two calls the interface does not order.
 pub(crate) fn answer_device_events(gpu: &object::channel::Channel) -> Option<alloc::sync::Arc<object::channel::Channel>> {
+	use display_device_proto::codec::Sink;
 	use object::channel::Channel;
 	use object::rights::Rights;
-	let request = gpu.recv().ok()?;
+	let mut request = gpu.recv().ok()?;
+	// Generic framebuffer stand-ins have no monitor transport. Answer the typed refusal before
+	// the event subscription; real-device gates separately exercise the EDID-capable provider.
+	if le_u16(&request.bytes, 0) == display_device_proto::generated::liber::display_device::v1::display_device::OP_MONITOR {
+		let mut writer = display_device_proto::codec::VecWriter::new();
+		writer.u32(le_u32(&request.bytes, 2))?;
+		writer.u8(0)?;
+		display_device_proto::generated::liber::display_device::v1::Error::Unsupported.write(&mut writer)?;
+		gpu.send(object::channel::Message::new(writer.into_inner()?, alloc::vec::Vec::new())).ok()?;
+		sched::run_until_idle();
+		request = gpu.recv().ok()?;
+	}
 	if le_u16(&request.bytes, 0) != 3 {
 		return None;
 	}
@@ -6951,7 +7065,7 @@ impl ConsoleHarness {
 		// And the outputs root, which only the power policy is handed: none here.
 		display_boot.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
 		// And the brightness's two roots and the system-key stream, which the deployed system hands it: none here.
-		for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..]] {
+		for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..], &b"BRIGHTCAT"[..]] {
 			display_boot.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
 		}
 
@@ -6973,8 +7087,6 @@ impl ConsoleHarness {
 		sched::run_until_idle();
 		let online = display_boot.recv().expect("DisplayService online report");
 		assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
-		// THE BACKLIGHT SUBSCRIPTION, which the service makes once it is online: answered with nothing.
-		crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the backlight subscription with nothing");
 
 		let (console_boot, console_boot_user) = Channel::create();
 		let (vt1_console, vt1_program) = Channel::create();

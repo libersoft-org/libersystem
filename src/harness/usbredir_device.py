@@ -47,6 +47,8 @@ THE DEVICES, chosen with `--emulate`:
               interface 1's alternates 1-5 carry isochronous IN 0x83 and OUT 0x03 of 9, 17, 25, 33 and 49 bytes, and
               every SCO packet that arrives on the OUT pipe goes back out on the IN pipe in pieces of the setting's
               size - except one on handle 0xffe, whose second piece goes back LOST (an error status, no data).
+  bt-bridge   the same USB interfaces, forwarding HCI commands/events, ACL, SCO and ISO to an independent
+              RootCanal controller over H4 TCP (--hci HOST:PORT). It synthesizes no HCI response or peer data.
   midi2       a USB MIDI 2.0 device: its MIDI 1.0 face on alternate 0 (bulk 0x01 and 0x81, two cables each way, packets
               looped back) and its UMP face on alternate 1 (the same endpoints, words looped back), two Group Terminal
               Blocks over four groups - "Keys" on groups 0-1 and "Pads" on 2-3, both ways - read with GET_DESCRIPTOR,
@@ -168,6 +170,9 @@ class Device:
         pass
 
     def on_reset(self):
+        pass
+
+    def poll(self):
         pass
 
     # One isochronous IN packet's data, for the stream on `address`.
@@ -526,6 +531,114 @@ class BtSco(Device):
         say(self.name, f"voice stream on 0x{address:02x} stopped")
 
 
+class BtBridge(BtSco):
+    """USB framing only; RootCanal owns the controller and every HCI response."""
+
+    name = "bt-bridge"
+    strings = {1: "LiberSystem harness", 2: "RootCanal HCI bridge", 3: "LIBERBTBRIDGE"}
+
+    def __init__(self, endpoint):
+        super().__init__()
+        host, port = endpoint.rsplit(':', 1)
+        self.hci = socket.create_connection((host, int(port)), timeout=5)
+        self.hci.setblocking(False)
+        self.received_hci = bytearray()
+        self.pending_hci = bytearray()
+        self.iso_handles = set()
+        self.packet_counts = collections.Counter()
+
+    def forward(self, kind, packet):
+        if len(self.pending_hci) + len(packet) > 1024 * 1024:
+            raise OSError('RootCanal is not consuming HCI packets')
+        self.pending_hci += bytes([kind]) + packet
+        self.packet_counts[f'out-{kind}'] += 1
+        self.poll()
+
+    def poll(self):
+        if self.pending_hci:
+            try:
+                sent = self.hci.send(self.pending_hci)
+                del self.pending_hci[:sent]
+            except BlockingIOError:
+                pass
+        while True:
+            try:
+                data = self.hci.recv(65536)
+            except BlockingIOError:
+                break
+            if not data:
+                raise OSError('RootCanal closed HCI')
+            self.received_hci += data
+        while self.received_hci:
+            kind = self.received_hci[0]
+            header = {2: 4, 3: 3, 4: 2, 5: 4}.get(kind)
+            if header is None:
+                raise OSError(f'invalid incoming H4 type {kind}')
+            if len(self.received_hci) < header + 1:
+                break
+            length = (int.from_bytes(self.received_hci[3:5], 'little') & (0x3fff if kind == 5 else 0xffff)) if kind in (2, 5) else self.received_hci[header]
+            total = 1 + header + length
+            if len(self.received_hci) < total:
+                break
+            packet = bytes(self.received_hci[1:total])
+            del self.received_hci[:total]
+            self.packet_counts[f'in-{kind}'] += 1
+            if kind == 4:
+                # LE CIS Established (Core 7.7.65.25): status then connection handle.
+                if packet[:3] == b'\x3e\x1d\x19' and packet[3] == 0:
+                    self.iso_handles.add(int.from_bytes(packet[4:6], 'little'))
+                # Disconnection Complete removes a CIS just as it removes an ACL link.
+                if packet[:2] == b'\x05\x04' and packet[2] == 0:
+                    self.iso_handles.discard(int.from_bytes(packet[3:5], 'little'))
+                self.event(packet)
+            elif kind in (2, 5):
+                self.acl_back += packet
+            else:
+                size = self.SIZES[self.alternates.get(1, 0)]
+                if size:
+                    self.sco_back.extend(packet[at:at + size] for at in range(0, len(packet), size))
+            if len(self.acl_back) + sum(map(len, self.events)) + sum(map(len, self.sco_back)) > 1024 * 1024:
+                raise OSError('guest is not consuming RootCanal packets')
+
+    def control(self, request_type, request, value, index, length, data):
+        if request_type != 0x20 or request != 0 or len(data) < 3 or len(data) != data[2] + 3:
+            return STALL, b''
+        if data[:2] == b'\x03\x0c':
+            self.iso_handles.clear()
+        self.forward(1, data)
+        return SUCCESS, b''
+
+    def bulk_out(self, address, data):
+        self.acl_held += data
+        while len(self.acl_held) >= 4:
+            handle = int.from_bytes(self.acl_held[:2], 'little') & 0x0fff
+            kind = 5 if handle in self.iso_handles else 2
+            length = 4 + (int.from_bytes(self.acl_held[2:4], 'little') & (0x3fff if kind == 5 else 0xffff))
+            if len(self.acl_held) < length:
+                break
+            packet = bytes(self.acl_held[:length])
+            del self.acl_held[:length]
+            self.forward(kind, packet)
+
+    def iso_out(self, address, data):
+        self.sco_held += data
+        while len(self.sco_held) >= 3:
+            length = 3 + self.sco_held[2]
+            if len(self.sco_held) < length:
+                break
+            packet = bytes(self.sco_held[:length])
+            del self.sco_held[:length]
+            self.forward(3, packet)
+
+    def on_reset(self):
+        self.acl_held.clear()
+        self.sco_held.clear()
+        self.acl_back.clear()
+        self.sco_back.clear()
+        self.events.clear()
+        self.iso_handles.clear()
+
+
 class Midi2(Device):
     """A USB MIDI 2.0 device with both faces - see the head of this file."""
 
@@ -612,10 +725,11 @@ class UvcIso(Device):
     PAYLOAD = 512
     LOST_FRAME, LOST_PACKET, BAD_FRAME = 2, 4, 3
 
-    def __init__(self):
+    def __init__(self, unplug_at=2):
         super().__init__()
         self.probe = self.default_probe()
         self.commits = 0
+        self.unplug_at = unplug_at
         self.number = 0
         self.queue = []
         self.packets = 0
@@ -696,15 +810,15 @@ class UvcIso(Device):
     # ONE SERVICE INTERVAL'S PAYLOAD - or `None`, a packet lost, which goes out with an error status and no data.
     def iso_in(self, address):
         if not self.queue:
-            # THE SECOND STREAM ENDS WITH THE CAMERA LEAVING after its first frame - and not at once: QEMU prefills
+            # THE SELECTED STREAM ENDS WITH THE CAMERA LEAVING after its first frame - and not at once: QEMU prefills
             # its buffer of isochronous IN packets before it hands any to the guest and drops what it holds when the
             # device goes. So the first frame is followed by a tenth of a second of empty payloads still carrying ITS
             # FID - which the class says belong to no frame - and then the camera leaves.
-            if self.commits >= 2 and self.number == 1 and not self.filled:
+            if self.commits >= self.unplug_at and self.number == 1 and not self.filled:
                 self.filled = True
                 self.queue = [bytes([2, 0x80])] * 100
-            elif self.commits >= 2 and self.filled:
-                say(self.name, "leaving the bus in the middle of the second stream")
+            elif self.commits >= self.unplug_at and self.filled:
+                say(self.name, f"leaving the bus in the middle of stream {self.commits}")
                 self.leaving = "gone"
                 return b""
             else:
@@ -1105,6 +1219,7 @@ class Redirection:
     # stream that fell behind catches up in bursts of at most a few packets a turn rather than skipping frames -
     # the counter in the samples must never jump, so late is the only way this side may be wrong.
     def pump(self):
+        self.device.poll()
         # THE DATA THE MODEL HAS FOR THE HOST: interrupt packets as they come, and waiting bulk requests answered, each
         # with as much as it asked for and no more.
         for address in sorted(self.interrupts):
@@ -1182,11 +1297,20 @@ DEVICES = {"bt-sco": BtSco, "mic": Microphone, "midi2": Midi2, "speaker-async": 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--emulate", required=True, choices=sorted(DEVICES))
+    parser.add_argument("--emulate", required=True, choices=sorted([*DEVICES, "bt-bridge"]))
     parser.add_argument("--socket", required=True, help="the Unix socket QEMU's chardev connects to")
     parser.add_argument("--ready", help="a file to write once the socket is listening")
+    parser.add_argument("--hci", help="RootCanal's H4 TCP address, required for bt-bridge")
+    parser.add_argument("--connections", type=int, default=1, help="sequential USB guest connections to one bt-bridge controller (cold-boot bond verification)")
+    parser.add_argument("--uvc-unplug-at", type=int, default=2, help="UVC committed stream that unplugs after its first frame (default 2)")
     args = parser.parse_args()
-    device = DEVICES[args.emulate]()
+    if args.uvc_unplug_at < 1 or (args.uvc_unplug_at != 2 and args.emulate != "uvc-iso"):
+        parser.error("--uvc-unplug-at must be positive and is only for uvc-iso")
+    if (args.emulate == 'bt-bridge') != bool(args.hci):
+        parser.error('--hci is required only with --emulate bt-bridge')
+    if args.connections < 1 or (args.connections != 1 and args.emulate != 'bt-bridge'):
+        parser.error('--connections must be positive and is only for bt-bridge')
+    device = BtBridge(args.hci) if args.emulate == 'bt-bridge' else UvcIso(args.uvc_unplug_at) if args.emulate == 'uvc-iso' else DEVICES[args.emulate]()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(args.socket)
     listener.listen(1)
@@ -1194,13 +1318,31 @@ def main():
         with open(args.ready, "w") as handle:
             handle.write("ready\n")
     say(device.name, f"listening on {args.socket}")
-    connection, _ = listener.accept()
-    listener.close()
     try:
-        return Redirection(connection, device).serve()
+        for _ in range(args.connections):
+            connection, _ = listener.accept()
+            try:
+                if isinstance(device, BtBridge):
+                    # The physical controller stays powered across guest boots. Only
+                    # USB transfer state belongs to the departed USB host; the next
+                    # guest initializes the same HCI controller with its own Reset.
+                    device.on_reset()
+                    device.configuration = 0
+                    device.alternates.clear()
+                result = Redirection(connection, device).serve()
+                if result:
+                    return result
+            finally:
+                connection.close()
+        return 0
     except (OSError, struct.error) as error:
         say(device.name, f"stopped: {error}")
         return 1
+    finally:
+        listener.close()
+        if isinstance(device, BtBridge):
+            say(device.name, f'H4 packets {dict(device.packet_counts)}')
+            device.hci.close()
 
 
 if __name__ == "__main__":

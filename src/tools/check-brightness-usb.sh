@@ -62,7 +62,7 @@ if ! USB_GADGET_ID="$(src/harness/usb-gadget.sh setup monitor 2>>"$work/gadget.l
 fi
 gadget=1
 export USB_GADGET_ID USB_GADGET_PORT=3
-python3 src/harness/monitor-sim.py 2>"$work/monitor-sim.log" &
+python3 src/harness/monitor-sim.py --button-after 55:63 2>"$work/monitor-sim.log" &
 sim=$!
 export NET_NONE=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
@@ -83,6 +83,8 @@ commands=(
 	"brightcheck level 82 30"
 	"brightcheck level 13 30"
 	"brightcheck auto off"
+	"brightcheck set 55"
+	"brightcheck level 63 30"
 	"brightcheck set 60"
 	"stop power_service"
 	"start power_service"
@@ -125,6 +127,11 @@ expect "brightcheck: auto on" "automatic brightness turned on"
 expect "brightcheck: level reached 82" "two thousand lux is eighty-two percent on the default curve"
 expect "brightcheck: level reached 13" "ten lux is thirteen"
 expect "brightcheck: auto off" "and off again"
+expect "brightcheck: level reached 63" "the monitor's own button must update the public brightness state"
+grep -aq 'device button changed brightness to 63' "$work/monitor-sim.log" || fail "the monitor sent no device-originated level change"
+if grep -aq 'brightness set to 63$' "$work/monitor-sim.log"; then
+	fail "the device-originated brightness was echoed back as a SET"
+fi
 expect "brightcheck: settings automatic=false idle=off" "the restarted policy must read its stored settings back"
 expect "brightcheck: set level=45" "and forward a set again"
 online="$(grep -ac 'BrightnessPolicy: online' "$GUEST_LINES" || true)"
@@ -134,7 +141,7 @@ echo "brightness-usb: the policy came back after PowerService's restart"
 # WHAT THE DEVICE RECEIVED: every level the checks set, in order, and nothing it has no control for.
 all=" $(grep -aoE 'brightness set to [0-9]+' "$work/monitor-sim.log" | awk '{print $4}' | tr '\n' ' ')"
 received="$all"
-for level in 40 70 76 70 5 0 82 13 60 45; do
+for level in 40 70 76 70 5 0 82 13 55 60 45; do
 	case "$received" in
 	*" $level "*) received=" ${received#*" $level "}" ;;
 	*) fail "the monitor did not receive level $level in order (it received:$all)" ;;

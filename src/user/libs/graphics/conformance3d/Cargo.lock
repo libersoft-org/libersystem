@@ -72,6 +72,7 @@ version = "0.0.0"
 dependencies = [
  "graphics-profile",
  "render-math",
+ "render-shader",
  "render3d",
 ]
 

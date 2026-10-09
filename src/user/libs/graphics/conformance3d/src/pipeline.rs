@@ -13,6 +13,7 @@ use render_shader::builder::Builder;
 use render_shader::ir::{BinaryOp, Binding, Constant, Op, Output, Stage, Type};
 use render3d::{CompareOp, Cull, Topology};
 
+// @covers: ProgrammableVertexStage
 pub fn programmable_vertex_stage() -> Outcome {
 	// A VERTEX STAGE COMPUTES THE POSITION, which is what makes it programmable rather than a fixed
 	// transform with parameters: this one halves every coordinate, and the triangle it draws is half
@@ -242,6 +243,7 @@ fn strict_transcendental_vertices_straddle_a_clip_boundary() -> Outcome {
 	Ok(())
 }
 
+// @covers: ProgrammableFragmentStage
 pub fn programmable_fragment_stage() -> Outcome {
 	// A FRAGMENT STAGE COMPUTES THE COLOUR, and this one computes a value no vertex carries: the
 	// interpolated colour times itself. A backend that passed the varying straight through would
@@ -262,6 +264,7 @@ pub fn programmable_fragment_stage() -> Outcome {
 	Ok(())
 }
 
+// @covers: VertexLayout
 pub fn vertex_layout() -> Outcome {
 	// A LAYOUT SAYS WHICH LOCATION A STAGE READS AND WHAT SHAPE IT IS, and `render3d` refuses one
 	// that is not a layout: two attributes at one location is a description with two answers to one
@@ -286,6 +289,7 @@ pub fn vertex_layout() -> Outcome {
 	Ok(())
 }
 
+// @covers: PrimitiveTopology
 pub fn primitive_topology() -> Outcome {
 	// THE TOPOLOGY IS PIPELINE STATE and not a property of the data: the SAME vertices assembled two
 	// ways are two different pictures, which is the whole reason it is a feature of its own beside
@@ -303,6 +307,7 @@ pub fn primitive_topology() -> Outcome {
 	Ok(())
 }
 
+// @covers: RasteriserState
 pub fn rasteriser_state() -> Outcome {
 	// THE RASTERISER STATE THIS PROFILE HAS IS THE CULL RULE, and what it decides is which SIDE of a
 	// surface is drawn. One triangle, two states: front-facing culling removes it and back-facing
@@ -322,6 +327,7 @@ pub fn rasteriser_state() -> Outcome {
 	Ok(())
 }
 
+// @covers: DepthStencilState
 pub fn depth_stencil_state() -> Outcome {
 	// THE STATE IS PART OF THE PIPELINE AND NOT OF THE ATTACHMENT, which is what lets two draws into
 	// one buffer test differently. The same geometry and the same buffer under two states: one is
@@ -340,6 +346,7 @@ pub fn depth_stencil_state() -> Outcome {
 	Ok(())
 }
 
+// @covers: BlendStatePerAttachment
 pub fn blend_state_per_attachment() -> Outcome {
 	// PER ATTACHMENT IS THE WHOLE POINT. A pass that writes colour to one target and object ids to
 	// another must blend the first and not the second, and a backend with one blend state for the
@@ -362,6 +369,7 @@ pub fn blend_state_per_attachment() -> Outcome {
 	Ok(())
 }
 
+// @covers: ColorWriteMask
 pub fn color_write_mask() -> Outcome {
 	// A MASK IS APPLIED AFTER BLENDING, so a masked channel keeps the DESTINATION's value rather than
 	// blending into it. A red quad over a blue clear with the red channel masked off leaves the blue
@@ -377,6 +385,7 @@ pub fn color_write_mask() -> Outcome {
 	Ok(())
 }
 
+// @covers: Viewport
 pub fn viewport() -> Outcome {
 	// THE VIEWPORT IS WHERE CLIP SPACE LANDS, and a smaller one is the same geometry in fewer pixels
 	// rather than a smaller part of it: the whole quad is still drawn, in the corner it names.
@@ -390,6 +399,7 @@ pub fn viewport() -> Outcome {
 	Ok(())
 }
 
+// @covers: Scissor
 pub fn scissor() -> Outcome {
 	// A SCISSOR REMOVES FRAGMENTS OUTSIDE A RECTANGLE AND CHANGES NOTHING ELSE, which is what makes
 	// it different from a viewport: the geometry lands where it always did and part of it is

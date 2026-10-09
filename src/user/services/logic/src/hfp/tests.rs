@@ -137,3 +137,36 @@ fn audio_is_asked_for_only_while_a_session_holds_it() {
 	assert!(gateway.negotiates());
 	assert!(!Gateway::new(true).negotiates(), "the headset profile negotiates nothing");
 }
+
+#[test]
+fn speaker_and_microphone_gains_are_independent_in_both_profiles() {
+	for headset in [false, true] {
+		let mut gateway = Gateway::new(headset);
+		// A headset can report gains before HFP's codec/endpoint is offered.
+		assert_eq!(sent(&gateway.receive(b"AT+VGM=4\r")), ["OK"]);
+		assert_eq!(gateway.microphone_gain(), 4);
+		assert_eq!(gateway.speaker_gain(), 10);
+		assert_eq!(events(&gateway.receive(b"AT+VGS=12\r")), [Event::SpeakerGain(12)]);
+		assert_eq!(gateway.microphone_gain(), 4);
+		assert_eq!(gateway.speaker_gain(), 12);
+		assert_eq!(events(&gateway.receive(b"AT+VGM=6\r")), [Event::MicrophoneGain(6)]);
+		assert_eq!(gateway.microphone_gain(), 6);
+		assert_eq!(gateway.speaker_gain(), 12);
+		assert_eq!(sent(&gateway.set_speaker_gain(9)), ["+VGS: 9"]);
+		assert_eq!(gateway.microphone_gain(), 6);
+		assert_eq!(gateway.speaker_gain(), 9);
+		// Invalid remote levels neither change state nor echo a gain notification.
+		for command in [b"AT+VGM=16\r".as_slice(), b"AT+VGM=-1\r", b"AT+VGS=16\r"] {
+			let output = gateway.receive(command);
+			assert_eq!(sent(&output), ["ERROR"]);
+			assert!(events(&output).is_empty());
+		}
+		assert_eq!(gateway.microphone_gain(), 6);
+		assert_eq!(gateway.speaker_gain(), 9);
+		assert_eq!(events(&gateway.receive(b"AT+VGM=0\r")), [Event::MicrophoneGain(0)]);
+		assert_eq!(gateway.microphone_gain(), 0);
+		assert_eq!(events(&gateway.receive(b"AT+VGM=15\r")), [Event::MicrophoneGain(15)]);
+		assert_eq!(gateway.microphone_gain(), 15);
+		assert_eq!(gateway.speaker_gain(), 9);
+	}
+}

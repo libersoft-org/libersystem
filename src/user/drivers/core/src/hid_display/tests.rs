@@ -10,6 +10,7 @@ pub const MONITOR_DESCRIPTOR: &[u8] = &[
 	0x05, 0x80, 0x09, 0x01, 0xa1, 0x01,
 	0x85, 0x01, 0x09, 0x02, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x20, 0xb2, 0x02, 0x01,
 	0x05, 0x82, 0x85, 0x02, 0x09, 0x10, 0x15, 0x00, 0x25, 0x64, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x02,
+	0x85, 0x04, 0x09, 0x10, 0x81, 0x02,
 	0xc0,
 	0x05, 0x20, 0x09, 0x41, 0xa1, 0x01,
 	0x85, 0x03, 0x0a, 0xd1, 0x04, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x75, 0x10, 0x95, 0x01, 0x55, 0x00, 0x81, 0x02,
@@ -138,4 +139,29 @@ fn a_sensors_reporting_and_power_states_are_found_and_chosen_by_selector() {
 	assert_eq!(selector_value(&reporting, PAGE_SENSOR << 16 | 0x0830), None, "a usage before the first selector chooses nothing");
 	assert!(map.is_light_sensor() && !map.is_monitor());
 	assert!(!table.fields.iter().any(|info| info.array && info.kind != ReportKind::Feature), "an input array is still not entered");
+}
+
+#[test]
+fn monitor_buttons_report_levels_without_an_ambient_sensor() {
+	let end = MONITOR_DESCRIPTOR.iter().position(|byte| *byte == 0xc0).unwrap() + 1;
+	let table = fields(&MONITOR_DESCRIPTOR[..end]).unwrap();
+	let mapped = map(&table).unwrap();
+	assert!(mapped.is_monitor() && !mapped.is_light_sensor());
+	let field = mapped.brightness_input.expect("the monitor buttons' input");
+	assert_eq!((field.kind, field.report_id), (ReportKind::Input, 4));
+	assert_eq!(level(&field, &[63]), Some(63));
+	assert_eq!(level(&field, &[101]), None);
+	assert_eq!(level(&field, &[]), None);
+	assert_eq!(mapped.brightness.unwrap().kind, ReportKind::Feature, "input does not replace writable feature");
+}
+
+#[test]
+fn brightness_outside_the_monitor_application_does_not_bind() {
+	let mut descriptor = MONITOR_DESCRIPTOR.to_vec();
+	descriptor[1] = 0x01;
+	descriptor[3] = 0x06; // Keyboard application, containing unrelated VESA usage fields.
+	let mapped = map(&fields(&descriptor).unwrap()).unwrap();
+	assert!(!mapped.is_monitor());
+	assert!(mapped.brightness_input.is_none());
+	assert!(mapped.is_light_sensor());
 }

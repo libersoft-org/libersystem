@@ -23,6 +23,7 @@ fn written(value: f32) -> Colour {
 	colour
 }
 
+// @covers: LoadClear
 pub fn load_clear() -> Outcome {
 	// A CLEAR REPLACES WHAT IS THERE WITH A STATED VALUE, which is the only load operation that has
 	// one.
@@ -33,6 +34,7 @@ pub fn load_clear() -> Outcome {
 	Ok(())
 }
 
+// @covers: LoadLoad
 pub fn load_load() -> Outcome {
 	// A LOAD KEEPS WHAT THE PREVIOUS PASS LEFT, which is what makes a multi-pass graph possible at
 	// all: a backend that cleared anyway would lose the first pass's output every time.
@@ -42,6 +44,7 @@ pub fn load_load() -> Outcome {
 	Ok(())
 }
 
+// @covers: LoadDiscard
 pub fn load_discard() -> Outcome {
 	// A DISCARD SAYS NOTHING ABOUT THE CONTENTS, and that is different from clearing them: a clear
 	// has a value and a discard has none. `soft3d` POISONS a discarded attachment rather than leaving
@@ -61,6 +64,7 @@ pub fn load_discard() -> Outcome {
 	Ok(())
 }
 
+// @covers: StoreStore
 pub fn store_store() -> Outcome {
 	// A STORE KEEPS THE PASS'S OUTPUT AND SAYS SO, which is the answer a later read depends on.
 	let mut attachment = written(0.75);
@@ -70,6 +74,7 @@ pub fn store_store() -> Outcome {
 	Ok(())
 }
 
+// @covers: StoreDiscard
 pub fn store_discard() -> Outcome {
 	// AND A DISCARDED ONE MAY NOT, which is the whole of what makes a discard worth having: a
 	// backend may throw the contents away instead of writing them back, and the contract is that
@@ -81,6 +86,7 @@ pub fn store_discard() -> Outcome {
 	Ok(())
 }
 
+// @covers: MultipleColorAttachments
 pub fn multiple_color_attachments() -> Outcome {
 	// TWO ATTACHMENTS, ONE FRAGMENT, TWO WRITES. The fragment stage writes a colour to one and an
 	// identity to the other, and what makes this a feature rather than an accident is that the two
@@ -99,6 +105,7 @@ pub fn multiple_color_attachments() -> Outcome {
 	Ok(())
 }
 
+// @covers: DepthStencilAttachment
 pub fn depth_stencil_attachment() -> Outcome {
 	// A DEPTH-STENCIL ATTACHMENT IS ONE ATTACHMENT WITH TWO PLANES, and a pass writes both from one
 	// fragment. What this checks is that they are independent: the depth is the fragment's and the
@@ -113,6 +120,7 @@ pub fn depth_stencil_attachment() -> Outcome {
 	Ok(())
 }
 
+// @covers: OffscreenRenderTarget
 pub fn offscreen_render_target() -> Outcome {
 	// AN OFFSCREEN TARGET IS ONE NOTHING PRESENTS, and what makes it a feature is that a pass may
 	// render into an extent that is not the display's. This one is a different size from every other
@@ -124,6 +132,7 @@ pub fn offscreen_render_target() -> Outcome {
 	Ok(())
 }
 
+// @covers: RenderToTexture
 pub fn render_to_texture() -> Outcome {
 	// WHAT A PASS WROTE IS WHAT THE NEXT ONE READS, which is the whole of render-to-texture: an
 	// attachment becomes a texture without a copy through anything else. `from_attachment` is that

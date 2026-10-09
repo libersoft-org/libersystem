@@ -16,6 +16,7 @@ through its read side; the interrupt pipe carries whatever this process writes. 
 It runs until the run's teardown stops it.
 """
 
+import argparse
 import errno
 import os
 import select
@@ -69,6 +70,13 @@ def send(fd, report):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--button-after', help='after receiving SET A, report a device button change to B (A:B), once')
+    args = parser.parse_args()
+    button = tuple(map(int, args.button_after.split(':'))) if args.button_after else None
+    if button is not None and (len(button) != 2 or not all(0 <= level <= 100 for level in button)):
+        parser.error('--button-after needs two levels in 0..100')
+    button_at = None
     deadline = time.monotonic() + 900
     fd = None
     while fd is None:
@@ -90,6 +98,12 @@ def main():
     next_step = time.monotonic() + STEP_SECONDS
     while True:
         now = time.monotonic()
+        if button_at is not None and now >= button_at:
+            register(fd, brightness_report(button[1]))
+            send(fd, bytes([4, button[1]]))
+            say(f"device button changed brightness to {button[1]}")
+            button = None
+            button_at = None
         if now >= next_step:
             lux = BRIGHT if lux == DARK else DARK
             register(fd, light_report(lux))
@@ -118,6 +132,8 @@ def main():
         level = written[1]
         register(fd, brightness_report(level))
         say(f"brightness set to {level}")
+        if button is not None and level == button[0] and button_at is None:
+            button_at = time.monotonic() + 2.0
 
 
 if __name__ == "__main__":

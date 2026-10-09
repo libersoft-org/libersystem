@@ -77,6 +77,21 @@ impl Val {
 	pub fn words(&self) -> &[u32] {
 		self.words.as_slice()
 	}
+
+	pub(crate) fn reserved_bytes(&self) -> usize {
+		type_reserved_bytes(&self.kind)
+			+ match &self.words {
+				Words::Inline(..) => 0,
+				Words::Heap(words) => words.capacity() * core::mem::size_of::<u32>(),
+			}
+	}
+}
+
+pub(crate) fn type_reserved_bytes(kind: &Type) -> usize {
+	match kind {
+		Type::Array(element, _) => core::mem::size_of::<Type>() + type_reserved_bytes(element),
+		_ => 0,
+	}
 }
 
 /// A value AS THE REGISTER FILE HOLDS IT: its declared type and its words, borrowed in place.

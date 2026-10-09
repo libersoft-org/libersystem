@@ -2796,3 +2796,136 @@ earlier probes separated out - 70 ms and 45 of the old bicubic's 254 - plus what
 costs to walk compared with a four-byte one, which is the price of the copy showing up on the other
 side. UI-effects is where it was: the blur is 49 ms of it and the remaining hundred and twenty-eight
 are spread over forty-five commands, with no dominant term and no probe here separating one.
+
+
+### P02M0103 native serial floor acceptance, 2026-10-09
+
+The first complete five-scene run below every original ceiling passed with one worker. The frozen fixtures, 640×480 target, command/resource counts, filter quality, five warmups and thirty measured samples are unchanged. Preparation remains outside replay. The reference host is the same Intel Xeon Platinum 8272CL at 2.60 GHz, 100 logical CPUs (the host itself runs under KVM); Linux 6.12.111+deb13-amd64, rustc 1.93.1 (01f6ddf75), Cargo 1.93.1. The host runner uses the ordinary Cargo release profile, no RUSTFLAGS or release-profile environment overrides, and std::time::Instant. No guest or competing build was run during this coordinated measurement window.
+
+Commands: `cargo build --offline --release --manifest-path src/tools/soft2d-bench/Cargo.toml`, then `.build/cargo/shared/release/soft2d-bench --check`. Raw evidence: `.build/logs/end-of-job/qemu-only-20261009/render103/soft2d-blur-four-floor.log`.
+
+| Scene | Commands/resources | Prepare ms | Replay median ms | Replay p99 ms | Original ceiling ms | Initial frozen budget ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UI-basic | 252/153 | 1.943 | 10.837 | 11.134 | 16.7 | 10.837 |
+| UI-effects | 45/34 | 38.879 | 65.640 | 67.049 | 66.7 | 65.640 |
+| vector-stress | 240/241 | 5.894 | 65.509 | 66.107 | 66.7 | 65.509 |
+| image-resample | 11/1 | 62.979 | 13.414 | 24.356 | 16.7 | 13.414 |
+| image-convert | 14/2 | 75.805 | 16.063 | 16.215 | 16.7 | 16.063 |
+
+Per the plan, these first accepted measurements (at the runner's reported millisecond precision) now define the frozen budgets; the earlier historical statement that budgets remain at ceilings is superseded by this acceptance. Budgets may only decrease. No tolerance or allowance for run-to-run variance has been added. The newly registered `./check.sh --gate soft2d-performance` executes the release benchmark with `--check --workers 1`, clears diagnostic probe/freeze modes, and exits nonzero if any replay median exceeds its frozen budget or original ceiling. It is a required release gate and covers the renderer and the graphics dependencies it exercises. Verification against the newly frozen budgets is still pending; the accepting run used the original ceilings.
+
+The final filter optimization evaluates four independent Gaussian outputs together while preserving each output's original tap-addition order. Other changes prepare exact image samples, avoid provably overwritten backdrop work and remove repeated decoder dispatch. None lowers the frozen workload or precision. The separately reported two-worker result is informational and does not replace the serial acceptance. Final guest 3D, HiDPI and emulated-port rows remain pending at this point.
+
+
+### P02M0103 frozen-budget follow-up, 2026-10-09
+
+The initial frozen budgets above remain unchanged. Two wrapper attempts failed: the first overlapped a host compilation; its quiet diagnostic missed only image-convert at16.244ms. The release disassembly then identified avoidable unsigned-64 conversion work for transfer-table indices bounded to4096. Using u32 indices preserves exact lookup/interpolation values. A subsequent quiet run improved conversion to15.673ms but missed effects at67.199ms. Expanding four independent Gaussian output accumulators to eight preserved every output's ordered tap arithmetic and produced the following complete passing serial run. The new transfer-index regression and the Gaussian scalar differential both pass bit for bit.
+
+| Scene | Prepare ms | Replay median ms | Replay p99 ms | Unchanged frozen budget ms | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| UI-basic | 1.934 | 10.205 | 10.423 | 10.837 | PASS |
+| UI-effects | 37.857 | 64.625 | 65.857 | 65.640 | PASS |
+| vector-stress | 6.037 | 62.423 | 63.732 | 65.509 | PASS |
+| image-resample | 61.839 | 11.838 | 12.450 | 13.414 | PASS |
+| image-convert | 72.551 | 15.232 | 15.464 | 16.063 | PASS |
+
+Command: `.build/cargo/shared/release/soft2d-bench --check --workers 1`, exit0. Evidence: `.build/logs/end-of-job/qemu-only-20261009/render103/soft2d-eight-transfer-floor.log`. Environment, fixtures and sample counts are the same as the initial acceptance; the team kept this bounded measurement window free of builds and guests. These numbers establish a passing frozen-budget run, not immunity to host contention. Final registered-gate execution and guest/port evidence remain pending.
+
+
+## P02M0103 quiet verification continuation (2026-10-09 UTC)
+
+These are actual retained measurements, not acceptance of the remaining 3D floor. Evidence is under `.build/logs/end-of-job/qemu-only-20261009/render103/`. The host remains Intel Xeon Platinum 8272CL at 2.60 GHz, 100 logical CPUs, Linux 6.12.111+deb13-amd64, rustc 1.93.1 (01f6ddf75). The team held these windows free of other builds, tests and guests. Commands, UTC times, wall time, environment and exits are in each window's `results.json`/`environment.json`.
+
+The registered native `RUST_MIN_STACK=33554432 ./check.sh --gate soft2d-performance` passed in 10.612s at 21:04:21Z, with its unchanged release profile, one worker, five warmups and 30 samples. No inherited compiler/profile or diagnostic benchmark overrides were set. The later Soft2D source changes were coverage comments only; this performance evidence remains applicable to its runtime.
+
+| scene | median ms | p99 ms | frozen budget ms | result |
+| --- | ---: | ---: | ---: | --- |
+| UI-basic | 10.282 | 10.869 | 10.837 | pass |
+| UI-effects | 64.337 | 66.101 | 65.640 | pass |
+| vector-stress | 61.866 | 63.392 | 65.509 | pass |
+| image-resample | 11.472 | 11.759 | 13.414 | pass |
+| image-convert | 15.182 | 32.092 | 16.063 | pass |
+
+Exact log: `host-acceptance-20261009T210419Z/soft2d-performance.log`. No tolerance or budget increase was introduced.
+
+The ordinary live guest used `SMP=32 RUST_MIN_STACK=33554432 ./lab.sh boot`, QEMU 10.0.13 with KVM enabled, `-cpu host`, 32 verified vCPUs, 4 GiB RAM and enforcing-required DMA. The actual full QEMU command, opened ISO descriptor/path/hash, package/volume identities and demo identities are in `guest-acceptance-20261009T220436Z/guest-identity.json`. Its ISO SHA256 was `37661ebef6ec68188a168b7d24e659aae614a398277cc61ce3d383a3ea32f83f`. This ordinary image did not set LIBER_DEVELOPMENT; it is separate from the development-image functional and Bluetooth proofs. Both demos identify themselves as release/shared-image, `-C relocation-model=pic`. The frame clock is the guest's calibrated monotonic nanosecond syscall. Thirty complete frame intervals follow five warmup presents.
+
+The first exact command was `./lab.sh sh --timeout 900 'test3d-sw --no-input --report --frames 35 --width 640 --height 480 --scene-width 640 --scene-height 480'`. It completed 35 presents, but failed both required performance and allocation criteria:
+
+| measurement | actual |
+| --- | ---: |
+| median complete interval | 902380us |
+| p99 / maximum interval | 920580us |
+|30 complete intervals | 27095551569ns |
+| measured steady rate | 1.107FPS |
+| maximum renderer allocations in one measured frame | 8 |
+| maximum whole-loop allocations in one measured frame | 8 |
+| present maximum | 41282us |
+| scene prepared capacity report | 82232bytes |
+| process heap live / peak | 30223024 /30223056bytes |
+| colour / depth / scene image | 6600 /3300 /1200KiB |
+
+Stage means over the full 35-frame run were scene 657466us, transparent 144556us, handover 9781us, 2D overlay 29452us and present 36702us. The whole35-frame mean was 901676us. The renderer reported 32 workers, but non-invasive host thread accounting showed vCPU0 using 31.75 CPU seconds over 32.738 seconds wall time; each of the other 31 vCPUs used only 0.01–0.03 seconds. Source inspection independently confirms that existing starts and wakes place these threads on the caller's CPU. Merely reporting 32 lanes is not proof of parallel execution. The plan's 30 FPS threshold, animated scene, physical/render extent and warmup were unchanged. Full registered 3D performance/screenshot acceptance was deferred after this diagnostic failure rather than repeating known failed windows. The subsequent renderer capacity correction has host counter proof but has not yet been measured in a rebuilt guest; these numbers describe the preceding snapshot.
+
+Independent registered `./check.sh --gate qemu-2d-demo` passed in 105.385s. Its three 1280x800 captures proved animation, coverage, blending, filtering and a colour glyph; the package audit passed on all three staged targets. Captures and application output are retained in `.build/logs/qemu-2d-demo.MLmROA/`. The explicit live measurement `./lab.sh sh --timeout 180 'test2d-sw --frames=160 --phase-frames=40 --size=640x480'` completed all 160 frames and four damage phases:
+
+| live 2D extent | frames | lanes / units | draw mean / worst us | interval mean / worst us |
+| --- | ---: | --- | --- | --- |
+|1280x800 visual gate |600|32 /260|146790 /172410|170955 /201270|
+|640x480 explicit measurement |160|32 /80|61601 /68026|104670 /127783|
+
+These live presentation reports do not redefine or replace the native headless budgets. Neither run changed scale (`scale-frames=0`); the required fixed-HiDPI and emulated-port reports remain separate guest-fixture evidence. The owned guest was shut down before the following native benchmark.
+
+`RUST_MIN_STACK=33554432 cargo run --offline --release --manifest-path src/tools/soft3d-bench/Cargo.toml -- --workers 1` completed in 15.381s on the same post-profile/readback snapshot, before the later animated-capacity correction. Its frozen 640x480 scene has 192 triangles, 384 vertices, two warmups and eight measured samples per variant:
+
+| variant | mean ms/frame | difference ms |
+| --- | ---: | ---: |
+| geometry |1.372|1.372|
+| raster, depth and write |94.739|93.366|
+| shading |361.792|267.053|
+| texturing |491.458|129.666|
+| blending |499.224|7.766|
+
+The full variant reported 385 triangles/s, 466406 shaded fragments/s, 192 primitives, 33 clipped, 141 culled, 232841 fragments and samples written. This heavy serial backend workload is a separate stage/rate report, not a 30 FPS live acceptance. The earlier 40.778→21.067ms investigation used 32 host workers; comparing it with this one-worker result as a regression would mix configurations. Exact log: `guest-acceptance-20261009T220436Z/soft3d-workers1.log`.
+
+
+The later animated-capacity correction was checked at 2026-10-09T22:32:03Z with a separate host reservation fixture:9,218 triangles,32 configured lanes,800x600 lighting and512x512 shadow. The reported inactive plans held16,899/10,548 bytes; after execution they held70,017,658/69,707,299 bytes (139,724,957 combined), and a repeated execution allocated zero times. These are actual reserved capacities for representative simple shaders and clipped-out geometry, excluding borrowed attachments, not a full PBR frame timing or process heap peak. The fixture proves inactive Core plans avoid this large reservation. The HDR memory report now includes capacities acquired on first execution and actual attachment validity storage. Final restaged guest allocation/heap and performance measurements are still pending; the earlier failed live metrics above remain unchanged evidence.
+
+
+### Rebuilt animated-allocation verification (2026-10-09T22:54:18Z)
+
+Actual ordinary QEMU/KVM diagnostics now verify the corrected full demos at640x480. Configuration remains32 vCPUs, host CPU,4GiB RAM, release/shared-image, rustc01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf and `-C relocation-model=pic`. The runner uses `SMP=32 RUST_MIN_STACK=33554432 LC_ALL=C` with LIBER_DEVELOPMENT unset. Opened ISO SHA256 is `ba392ffb7dba127bba648134667d2e21a9becf3cfc12c5d934b793c790df9cdb`, staged ordinary-volume SHA256 `e700c66ef181ca39fdca19a7060876a4096790af6592c06bdef1bb81a7c7c76d`, and3D demo SHA256 `4473bbb3888d298dbc7110abbeb73c8755ee9e5308f4d9e34d1e2984b031067f`. The exact opened descriptor, mutable private volume, separate bootable volume, all argv/package identities and monitor CPU mapping are in `render103/allocation-guest-20261009T224820Z/guest-identity.json` under the end-of-job proof directory. This is an ordinary image, not a development-agent image.
+
+Commands: `./lab.sh sh --timeout 900 'test3d-sw --no-input --report --frames 35 --width 640 --height 480 --scene-width 640 --scene-height 480'`, then the identical command with trailing `--postprocess`. Both completed35 frames without resize, retained30 complete intervals after five warmups, and passed the real shared-library allocator sanity probe.
+
+|640x480 actual metric | Core | Extended with HDR |
+| --- | ---: | ---: |
+| maximum renderer / whole-loop allocations |0 /0|0 /0|
+| median interval us |904460|2778032|
+| p99 / maximum interval us |935903 /935903|2882331 /2882331|
+|30 complete intervals ns |27136544570|83470076123|
+| measured frames/s |1.105520|0.359410|
+| scene prepared bytes |961118|140101154|
+| HDR prepared bytes |not active|16873630|
+| heap live / peak bytes |30517808 /30518800|186683712 /186684704|
+| maximum present us |40506|41986|
+| command wall seconds |32.870|99.201|
+
+| mean stage us/frame | Core | Extended with HDR |
+| --- | ---: | ---: |
+| shadow |0|42697|
+| scene |657214|1310486|
+| postprocess |0|1334797|
+| transparent |145159|0|
+| handover |9684|9868|
+| overlay |30407|29244|
+| present |36919|36951|
+
+Both reported primary colour6600KiB, depth3300KiB and image1200KiB. The Extended run executed the actual sphere/ground lighting and shadow geometry (18436 primitives,2 clipped,3427 culled,216025 fragments), shadow map18512/262144 occupied texels, and six downsamples/five upsamples/resolve. Its actual full-process186684704-byte peak replaces the earlier representative-only capacity uncertainty for this guest/configuration. The earlier failed eight-allocation snapshot remains preserved above.
+
+Monitor maps vCPU0 to host thread1666954. During Core it consumes31.44 user+0.40 system=31.84 CPU seconds over32.870s wall; each other vCPU consumes0.01–0.02s. During Extended it consumes96.42+1.73=98.15 CPU seconds over99.201s wall; each other vCPU consumes0.01–0.03s. Complete per-thread snapshots are in results.json. Thus the zero-allocation correction is verified, while the unchanged Core30FPS floor still fails and the CPU-placement decision remains pending. No30FPS floor is imposed on Extended. The runner deliberately records this performance failure separately from allocation/report acceptance and always attempted both phases. Owned shutdown passed in1.271s with no remaining QEMU.
+
+The320x240/800x600 rows, three successful Core640 windows, complete eight-row registered3D screenshot/performance gate, changed-runtime serial Soft3D benchmark and final whole-job verification remain unperformed in this continuation. No performance completion is claimed.
+
+
+Post-allocation native benchmark (2026-10-09 23:09:16 UTC): After the animated allocation correction, a quiet native release measurement `RUST_MIN_STACK=33554432 cargo run --offline --release --manifest-path src/tools/soft3d-bench/Cargo.toml -- --workers 1` PASS. This is the deterministic640x480/192-triangle/384-vertex benchmark with2 warmup frames and8 samples, one host worker and the benchmark's host clock. Cumulative variants: geometry1.287ms, raster91.208ms, shading345.633ms, texturing481.958ms, blending/full488.455ms per frame; respective incremental contributions1.287/89.921/254.426/136.325/6.497ms. Throughput393triangles/s and476688shaded fragments/s;192primitives,33clipped,141culled,232841fragments/samples written per frame. Output `.build/logs/end-of-job/qemu-only-20261009/render103/soft3d-post-allocation-workers1.log`; release executable SHA256 `1ed545a1b3b048e83b298e42ea1c9c1030ee275d0bf1a0ade6e3540a970e14ea`. This updates the required changed-runtime native stage decomposition and does not establish the separate live30FPS floor. ActualCore/Extended640 zero-allocation passes and the Core30FPS failure remain as recorded above;320/800sizes, threeCore640windows, the full registered gate and final common verification remain pending.

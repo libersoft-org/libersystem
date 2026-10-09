@@ -34,6 +34,51 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+#[cfg(test)]
+extern crate alloc;
+// Execute the same prepared HDR chain the guest application uses, including its command recording
+// and half-float target handovers. A second implementation here would miss integration defects.
+#[cfg(test)]
+#[path = "../../../user/apps/tools/src/test3d_sw/postprocess.rs"]
+mod postprocess;
+
+#[cfg(test)]
+mod allocation_test {
+	use std::alloc::{GlobalAlloc, Layout, System};
+	use std::cell::Cell;
+	std::thread_local! { static COUNT: Cell<Option<usize>> = const { Cell::new(None) }; }
+	struct Allocator;
+	#[global_allocator]
+	static ALLOCATOR: Allocator = Allocator;
+
+	unsafe impl GlobalAlloc for Allocator {
+		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+			COUNT.with(|count| {
+				if let Some(n) = count.get() {
+					count.set(Some(n + 1));
+				}
+			});
+			unsafe { System.alloc(layout) }
+		}
+		unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+			unsafe { System.dealloc(ptr, layout) }
+		}
+		unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+			COUNT.with(|count| {
+				if let Some(n) = count.get() {
+					count.set(Some(n + 1));
+				}
+			});
+			unsafe { System.realloc(ptr, layout, size) }
+		}
+	}
+	pub fn count(run: impl FnOnce()) -> usize {
+		COUNT.with(|count| count.set(Some(0)));
+		run();
+		COUNT.with(|count| count.replace(None).unwrap_or(0))
+	}
+}
+
 use render_math::{Mat4, Quat, Vec3, Vec4, camera};
 use render_shader::builder::Builder;
 use render_shader::ir::{BinaryOp, Binding, Constant, Interpolation, Module, Op, Output, Sampling, Stage, Transcendental, Type, UnaryOp};
@@ -358,7 +403,7 @@ fn fragment_stage(variant: Variant) -> Module {
 
 fn pipeline_for(variant: Variant) -> Pipeline {
 	let blend = if variant.blending() { render3d::AttachmentBlend { enabled: true, colour: render3d::BlendEquation { source: render3d::BlendFactor::SrcAlpha, destination: render3d::BlendFactor::OneMinusSrcAlpha, operation: render3d::BlendOp::Add }, alpha: render3d::BlendEquation { source: render3d::BlendFactor::One, destination: render3d::BlendFactor::OneMinusSrcAlpha, operation: render3d::BlendOp::Add }, write_mask: render3d::ColorWriteMask::ALL } } else { render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL } };
-	Pipeline { state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: Cull::Back, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: vertex_stage(), fragment: fragment_stage(variant), blend: vec![blend], stencil: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
+	Pipeline { state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: Cull::Back, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: vertex_stage(), fragment: fragment_stage(variant), blend: vec![blend], stencil: None, stencil_back: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
 }
 
 /// Host threads made once and parked between frames: `soft3d`'s `Workers` for this benchmark.
@@ -528,7 +573,7 @@ fn fingerprint(colour: &Colour) -> u64 {
 
 fn measure(variant: Variant, frame: &mut Frame, requested_width: u32, requested_height: u32, workers: &dyn Workers) -> Measured {
 	let (width, height) = variant.extent(requested_width, requested_height);
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: frame.scene.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: frame.scene.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared: Prepared = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline_for(variant)], vec![draw], width, height).expect("the benchmark pipeline is one the profile admits");
 	let mut colour = Colour::new(width, height, 1, false);
 	let mut depth = DepthStencil::new(width, height, 1, DepthFormat::Depth32F);

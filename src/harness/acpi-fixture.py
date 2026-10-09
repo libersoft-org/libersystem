@@ -296,12 +296,12 @@ def sleep_devices(ivsh):
 	]
 
 
-def brightness_devices(ivsh):
+def brightness_devices(ivsh, no_dos=False):
 	"""THE PANEL BELOW Q35'S VGA FUNCTION, ITS ADAPTER'S `_DOS` AND `_DOD`, AND THE LIGHT SENSOR."""
 	vga = f'\\_SB.PCI0.S{VGA_SLOT << 3:02X}'
 	return [
 		E.scope(vga, [
-			E.method('_DOS', 1, [E.store(E.arg(0), ivsh + '.DOSV'), E.increment(ivsh + '.DOSN')], serialized=True),
+			*([] if no_dos else [E.method('_DOS', 1, [E.store(E.arg(0), ivsh + '.DOSV'), E.increment(ivsh + '.DOSN')], serialized=True)]),
 			E.name('_DOD', E.package(0x80010400)),
 			E.device('LCD0', [
 				E.name('_ADR', 0x400),
@@ -404,7 +404,7 @@ def fans(ivsh):
 	]
 
 
-def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False, brightness=False):
+def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False, brightness=False, brightness_no_dos=False):
 	# THE NODES QEMU'S DSDT ALREADY HAS for the three functions - `S` and the slot times eight - opened with `Scope`: a
 	# second node with the same `_ADR` would be a second companion of one function.
 	ivsh = f'\\_SB.PCI0.S{IVSHMEM_SLOT << 3:02X}'
@@ -574,11 +574,11 @@ def ssdt_body(ucsi_version=0x0210, sleep=False, processors=False, brightness=Fal
 				E.method('_SCP', 1, [E.store(E.arg(0), ivsh + '.SCPM'), E.increment(ivsh + '.SCPN')], serialized=True),
 			] if processors else [])),
 		]),
-	] + (processor_objects(ivsh) if processors else []) + (brightness_devices(ivsh) if brightness else [])
+	] + (processor_objects(ivsh) if processors else []) + (brightness_devices(ivsh, brightness_no_dos) if brightness else [])
 
 
-def ssdt(ucsi_version=0x0210, sleep=False, processors=False, brightness=False):
-	return E.table('SSDT', ssdt_body(ucsi_version, sleep, processors, brightness), oem_table_id=b'LIBACPIF')
+def ssdt(ucsi_version=0x0210, sleep=False, processors=False, brightness=False, brightness_no_dos=False):
+	return E.table('SSDT', ssdt_body(ucsi_version, sleep, processors, brightness, brightness_no_dos), oem_table_id=b'LIBACPIF')
 
 
 HID_OVER_I2C = '3cdff6f7-4267-4555-ad05-b30a3d8938de'
@@ -920,6 +920,9 @@ def self_test():
 			failures.append(f'the brightness table lacks {needle!r}')
 		if needle in table and needle not in (b'BEVT',):
 			failures.append(f'the plain table carries the brightness gate\'s {needle!r}')
+	no_dos = ssdt(brightness=True, brightness_no_dos=True)
+	if b'_DOS' in no_dos or any(needle not in no_dos for needle in (b'_DOD', b'_BCL', b'_BCM', b'_BQC')) or sum(no_dos) & 0xff:
+		failures.append('the no-_DOS adapter must retain _DOD and the complete panel')
 	if b'FAN0' not in sleep:
 		failures.append('the sleep table lacks the fans')
 	tcpc = tcpc_ssdt()
@@ -961,6 +964,7 @@ def main():
 	parser.add_argument('--processors', action='store_true', help='the table carries the processor-power gate\'s processors, fans and zone objects')
 	parser.add_argument('--processor-read', metavar='FILE')
 	parser.add_argument('--brightness', action='store_true', help='the table and the memory carry the brightness gate\'s panel, its adapter\'s methods and the light sensor')
+	parser.add_argument('--brightness-no-dos', action='store_true', help='omit only the brightness adapter _DOS method; requires --brightness')
 	parser.add_argument('--brightness-read', metavar='FILE')
 	parser.add_argument('--brightness-event', nargs=3, metavar=('FILE', 'CONTROL', 'VALUE'))
 	parser.add_argument('--brightness-set', nargs='+', metavar='FILE NAME=VALUE')
@@ -971,11 +975,13 @@ def main():
 	parser.add_argument('--power-read', metavar='FILE')
 	parser.add_argument('--self-test', action='store_true')
 	args = parser.parse_args()
+	if args.brightness_no_dos and not args.brightness:
+		parser.error('--brightness-no-dos requires --brightness')
 	if args.self_test:
 		return self_test()
 	if args.out:
 		with open(args.out, 'wb') as out:
-			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep, args.processors, args.brightness))
+			out.write(ssdt(args.ucsi_version or 0x0210, args.sleep, args.processors, args.brightness, args.brightness_no_dos))
 	if args.hid_out:
 		with open(args.hid_out, 'wb') as out:
 			out.write(hid_ssdt())

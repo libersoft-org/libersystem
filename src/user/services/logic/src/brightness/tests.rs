@@ -82,8 +82,8 @@ const GPU: Function = Function { bus: 0, dev: 1, func: 0 };
 const OTHER: Function = Function { bus: 0, dev: 9, func: 0 };
 const MONITOR: Monitor = Monitor { manufacturer: 0x10ac, product: 0x4050, serial: 7 };
 
-fn candidate(kind: Kind, target: BacklightTarget, publisher: Function) -> Candidate {
-	Candidate { kind, target, publisher, failed: false }
+fn candidate(kind: Kind, target: BacklightTarget, publisher: Function) -> Candidate<'static> {
+	Candidate { kind, target, publisher, failed: false, firmware_display_id: None, stable_key: "" }
 }
 
 #[test]
@@ -281,4 +281,27 @@ fn automatic_brightness_follows_the_curve_and_a_hand_on_the_level_pauses_it_unti
 fn the_firmware_curve_is_sorted_and_capped_at_the_top_of_the_range() {
 	let curve = firmware_curve([(150, 1000), (70, 0), (100, 300), (73, 10), (99, 300)].into_iter());
 	assert_eq!(curve, vec![CurvePoint { percent: 70, lux: 0 }, CurvePoint { percent: 73, lux: 10 }, CurvePoint { percent: 100, lux: 300 }, CurvePoint { percent: 100, lux: 1000 }]);
+}
+
+#[test]
+fn firmware_ties_use_internal_panel_then_namespace_not_publication_order() {
+	let function = Function { bus: 0, dev: 1, func: 0 };
+	let output = Output { source: OutputSource::BootFramebuffer(Some(function)), edid: None };
+	let mut external = candidate(Kind::Firmware, BacklightTarget::Function(function), function);
+	external.firmware_display_id = Some(0x100);
+	external.stable_key = "acpi:AAA0";
+	let mut last_internal = external;
+	last_internal.firmware_display_id = Some(0x80010400);
+	last_internal.stable_key = "acpi:LCD1";
+	let mut first_internal = last_internal;
+	first_internal.stable_key = "acpi:LCD0";
+	let places = join(&output, &[external, last_internal, first_internal]);
+	assert_eq!(places[2].standing, Standing::Active);
+	assert_eq!(places[0].standing, Standing::Shadowed(2));
+	assert_eq!(places[1].standing, Standing::Shadowed(2));
+	let places = join(&output, &[first_internal, external, last_internal]);
+	assert_eq!(places[0].standing, Standing::Active);
+	first_internal.firmware_display_id = None;
+	last_internal.firmware_display_id = None;
+	assert_eq!(join(&output, &[last_internal, first_internal])[1].standing, Standing::Active);
 }

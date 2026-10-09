@@ -1013,6 +1013,7 @@ version = "0.0.0"
 dependencies = [
  "graphics-profile",
  "render-math",
+ "render-shader",
  "render3d",
 ]
 
@@ -1269,6 +1270,7 @@ dependencies = [
  "resources-client",
  "resources-client-provider",
  "rt",
+ "scene3d",
  "security-client",
  "security-client-provider",
  "service-logic",

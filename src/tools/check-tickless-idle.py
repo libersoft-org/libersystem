@@ -35,6 +35,8 @@
 # and its boot-time clock including it, with the synchronous entry/resume ticks checked against host time - and the parking
 # from the last sleep's record: no core woke for a device,
 # cpu0 at most once for the timer, every other core at most once, for the IPI that ends its park.
+# On ARM, first request the RAM state this firmware does not offer: admission must refuse it before
+# any transaction or entry, and its last record must name that missing state rather than an idle sleep.
 #
 # ONE GUEST AT A TIME: each target is booted, driven and torn down before the next one boots.
 #
@@ -281,6 +283,18 @@ def suspend_to_idle(target, serial, scale):
 	if not offered:
 		raise GateError('the kernel never said what this firmware offers a sleep')
 	note(f'{target}: {lab.strip_ansi(offered.group(0)).decode(errors="replace")}')
+	if target == 'aarch64':
+		if b'sleep: PSCI SYSTEM_SUSPEND is not offered by this firmware' not in serial.data:
+			raise GateError('ARM firmware no longer reports SYSTEM_SUSPEND absent; this platform needs its offered-state proof')
+		status = serial.run('sleepctl status', 60 * scale)
+		states = re.search(r'^states: ([^\r\n]*)', status, re.M)
+		if states is None or 'suspend to RAM' in states.group(1) or 'suspend to idle' not in states.group(1):
+			raise GateError(f'ARM sleep admission disagrees with the absent firmware feature: {status}')
+		mark = len(serial.data)
+		request = serial.run(f'sleepctl suspend ram {IDLE_WAKE_S}', 60 * scale)
+		record = serial.run('sleepctl last', 60 * scale)
+		check_arm_ram_refusal(request, record, serial.text_since(mark).decode(errors='replace'))
+		note('aarch64: RAM refused as Unsupported before any transaction or kernel entry; last record names the absent state')
 	mark = len(serial.data)
 	serial.type(b'sleepcheck count 30 &\n')
 	serial.wait_for(mark, lambda seen: b'sleepcheck: count 1 ' in seen, 60 * scale, 'the counter in the background')
@@ -328,6 +342,40 @@ def suspend_to_idle(target, serial, scale):
 	if not parked:
 		raise GateError('suspend to idle: the record lists no core')
 	note(f'{target}: suspend to idle - the host measured {slept:.0f} ms for a {IDLE_WAKE_S} s wake with the counter silent, count {left[2]} then {right[2]} (monotonic +{mono} ms, boot-time +{boot} ms), {parked} cores parked with no wake but the wake')
+
+
+def check_arm_ram_refusal(request, record, trace):
+	if 'sleepctl: the sleep was refused - Unsupported' not in request:
+		raise GateError(f'ARM RAM request had no explicit unsupported-state refusal: {request}')
+	if any(token in trace for token in ('ServiceManager: sleep: accepted ', 'ServiceManager: sleep: step ', 'sleep: entered (')):
+		raise GateError('ARM unsupported RAM request started a sleep transaction or entered a sleep')
+	if 'last sleep: suspend to RAM (Requested)' not in record or not re.search(
+		r'^\s*refused before anything was frozen:  - this machine does not offer suspend to RAM\s*$', record, re.M
+	):
+		raise GateError(f'ARM RAM refusal did not leave the matching pre-freeze record: {record}')
+
+
+def arm_refusal_self_test():
+	request = 'sleepctl: the sleep was refused - Unsupported\n'
+	record = 'last sleep: suspend to RAM (Requested)\n  refused before anything was frozen:  - this machine does not offer suspend to RAM\n'
+	check_arm_ram_refusal(request, record, request + record)
+	cases = [
+		('unrelated refusal', request.replace('Unsupported', 'AccessDenied'), record, request + record),
+		('missing reply', '', record, record),
+		('admitted transaction', request, record, request + 'ServiceManager: sleep: accepted suspend to RAM\n'),
+		('freeze before refusal', request, record, request + 'ServiceManager: sleep: step freeze at tick 10\n'),
+		('entered idle instead', request, record, request + 'sleep: entered (suspend to idle, at tick 10)\n'),
+		('stale different state', request, record.replace('last sleep: suspend to RAM', 'last sleep: suspend to idle'), request),
+		('refused for another reason', request, record.replace('this machine does not offer suspend to RAM', 'a driver refused'), request),
+		('unwound after entry', request, record.replace('refused before anything was frozen', 'unwound at drivers'), request),
+	]
+	for name, response, last, trace in cases:
+		try:
+			check_arm_ram_refusal(response, last, trace)
+		except GateError:
+			continue
+		raise GateError(f'the ARM early-refusal oracle accepted {name}')
+	note('ARM refusal oracle self-test PASS (unsupported accepted, eight false outcomes rejected)')
 
 
 def wakes_on(rows, identity):
@@ -535,6 +583,7 @@ def main():
 	args = sys.argv[1:]
 	if args == ['--self-test']:
 		clock_self_test()
+		arm_refusal_self_test()
 		return 0
 	skip_build = '--no-build' in args
 	targets = [a for a in args if not a.startswith('--')] or list(TARGETS)

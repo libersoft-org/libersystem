@@ -1,15 +1,13 @@
 //! The scanner proves it REFUSES before it is trusted to APPROVE.
 //!
-//! WHY THIS EXISTS TODAY OF ALL DAYS. Nothing in the tree claims a feature yet, so both coverage
-//! checks report NOT PERFORMED and a clean run proves nothing about a scan that has stopped
-//! matching. This builds a small tree with the four cases that matter - a real claim, a sentence
-//! that only mentions the marker, a name the profile does not have, and a handler for a feature no
-//! backend owns - and asserts the scan and the checks answer each one.
+//! A generated matrix must refuse missing handlers, missing tests and invalid claims. The small
+//! source tree below also distinguishes real markers from prose mentioning their convention.
 
 use std::path::Path;
 
+use crate::scan::Claim;
 use graphics_profile::capability::{Coverage, Range};
-use graphics_profile::{FeatureOwner, RENDER2D_CORE_PROFILE_1};
+use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1};
 
 use crate::scan::{self, Marker};
 
@@ -63,6 +61,21 @@ pub fn run(directory: &Path) -> bool {
 	// AND THE MISSING HALF IS STILL MISSING. A scan that found two handlers and called the profile
 	// complete would be the failure this whole gate is against.
 	ok &= expect("what is not claimed is reported missing", handlers.missing().any(|entry| entry.name == "StrokeWidth") && !handlers.complete());
+	// Exercise the actual gate, including deletion of the entire handler or test set.
+	static REQUIRED: &[ProfileEntry<()>] = &[
+		ProfileEntry { feature: (), group: "fixture", owner: FeatureOwner::Backend, name: "FillNonZero" },
+		ProfileEntry { feature: (), group: "fixture", owner: FeatureOwner::Render2D, name: "QueryPathLength" },
+	];
+	let claim = |feature: &str| Claim { feature: feature.to_owned(), file: "fixture.rs".to_owned(), line: 1 };
+	let real_handler = [claim("FillNonZero")];
+	let real_tests = [claim("FillNonZero"), claim("QueryPathLength")];
+	ok &= expect("complete actual handler and test sets pass", crate::checks("self-test", REQUIRED, &real_handler, &real_tests));
+	ok &= expect("deleting every handler fails", !crate::checks("self-test", REQUIRED, &[], &real_tests));
+	ok &= expect("deleting every conformance claim fails", !crate::checks("self-test", REQUIRED, &real_handler, &[]));
+	ok &= expect("deleting one conformance claim fails", !crate::checks("self-test", REQUIRED, &real_handler, &real_tests[..1]));
+	ok &= expect("a non-backend handler fails the actual gate", !crate::checks("self-test", REQUIRED, &real_tests, &real_tests));
+	ok &= expect("an unknown conformance claim fails the actual gate", !crate::checks("self-test", REQUIRED, &real_handler, &[claim("FillZigzag")]));
+
 	ok
 }
 

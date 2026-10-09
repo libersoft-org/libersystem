@@ -305,6 +305,7 @@ pub struct Plan {
 	pub samples: u32,
 	pub blend: Vec<render3d::AttachmentBlend>,
 	pub stencil: Option<render3d::StencilFace>,
+	pub stencil_back: Option<render3d::StencilFace>,
 	pub bias: (f32, f32, f32),
 	pub alpha_to_coverage: bool,
 	pub sample_mask: u32,
@@ -330,7 +331,7 @@ pub struct Plan {
 
 impl Default for Plan {
 	fn default() -> Plan {
-		Plan { topology: Topology::TriangleList, cull: Cull::None, depth_test: None, depth_write: false, samples: 1, blend: vec![render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL }], stencil: None, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX, vertex: vertex_stage(), fragment: fragment_stage(), count: 3, instances: 1, base_vertex: 0, first_instance: 0, restart: false, width: WIDTH, height: HEIGHT, clear: Vec4::new(0.0, 0.0, 0.0, 1.0), depth_format: DepthFormat::Depth32F, identity_attachment: true, viewport: None, scissor: None }
+		Plan { topology: Topology::TriangleList, cull: Cull::None, depth_test: None, depth_write: false, samples: 1, blend: vec![render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL }], stencil: None, stencil_back: None, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX, vertex: vertex_stage(), fragment: fragment_stage(), count: 3, instances: 1, base_vertex: 0, first_instance: 0, restart: false, width: WIDTH, height: HEIGHT, clear: Vec4::new(0.0, 0.0, 0.0, 1.0), depth_format: DepthFormat::Depth32F, identity_attachment: true, viewport: None, scissor: None }
 	}
 }
 
@@ -368,7 +369,7 @@ impl Frame {
 
 	/// The identity written at a pixel, or zero where the attachment is absent.
 	pub fn identity(&self, x: u32, y: u32) -> u32 {
-		self.identity.as_ref().map(|attachment| attachment.at(x, y, 0).x as u32).unwrap_or(0)
+		self.identity.as_ref().and_then(|attachment| attachment.identity_at(x, y, 0)).unwrap_or(0)
 	}
 
 	/// The stored depth at a pixel, as the number a scene states its expectation in.
@@ -418,7 +419,7 @@ impl Frame {
 }
 
 /// Render one scene under one plan.
-pub fn render(scene: &Scene, plan: &Plan) -> Result<Frame, Trouble> {
+pub fn render(scene: &dyn Source, plan: &Plan) -> Result<Frame, Trouble> {
 	let mut colour = vec![Colour::new(plan.width, plan.height, plan.samples, false)];
 	colour[0].fill(plan.clear);
 	if plan.identity_attachment {
@@ -462,13 +463,17 @@ pub fn render_pair(first: &Scene, first_plan: &Plan, second: &Scene, second_plan
 }
 
 /// The prepared plan one draw needs, with a blend state for every attachment the pass has.
-fn prepare_for(plan: &Plan, attachments: usize) -> Result<Prepared, Trouble> {
+pub(crate) fn pipeline_for(plan: &Plan, attachments: usize) -> Pipeline {
 	let mut blend = plan.blend.clone();
 	while blend.len() < attachments {
 		blend.push(render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL });
 	}
-	let pipeline = Pipeline { state: render3d::command::PipelineState { topology: plan.topology, cull: plan.cull, depth_test: plan.depth_test, depth_write: plan.depth_write, samples: plan.samples, per_sample_shading: false }, vertex: plan.vertex.clone(), fragment: plan.fragment.clone(), blend, stencil: plan.stencil, depth_compare: plan.depth_test.unwrap_or(CompareOp::Always), depth_write: plan.depth_write, bias: plan.bias, alpha_to_coverage: plan.alpha_to_coverage, sample_mask: plan.sample_mask };
-	let draw = Draw { pipeline: 0, topology: plan.topology, count: plan.count, instances: plan.instances, first_instance: plan.first_instance, base_vertex: plan.base_vertex, restart: plan.restart };
+	Pipeline { state: render3d::command::PipelineState { topology: plan.topology, cull: plan.cull, depth_test: plan.depth_test, depth_write: plan.depth_write, samples: plan.samples, per_sample_shading: false }, vertex: plan.vertex.clone(), fragment: plan.fragment.clone(), blend, stencil: plan.stencil, stencil_back: plan.stencil_back, depth_compare: plan.depth_test.unwrap_or(CompareOp::Always), depth_write: plan.depth_write, bias: plan.bias, alpha_to_coverage: plan.alpha_to_coverage, sample_mask: plan.sample_mask }
+}
+
+pub(crate) fn prepare_for(plan: &Plan, attachments: usize) -> Result<Prepared, Trouble> {
+	let pipeline = pipeline_for(plan, attachments);
+	let draw = Draw { first: 0, pipeline: 0, topology: plan.topology, count: plan.count, instances: plan.instances, first_instance: plan.first_instance, base_vertex: plan.base_vertex, restart: plan.restart };
 	Ok(soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline], vec![draw], plan.width, plan.height)?)
 }
 

@@ -2547,6 +2547,8 @@ pub mod audio_control {
 	pub const OP_SET_VOLUME: u16 = 3;
 	pub const OP_STREAMS: u16 = 4;
 	pub const OP_COUNTERS: u16 = 5;
+	pub const OP_MICROPHONE_VOLUME: u16 = 6;
+	pub const OP_SET_MICROPHONE_VOLUME: u16 = 7;
 
 	pub trait Service {
 		fn devices(&mut self) -> Vec<AudioDevice>;
@@ -2556,6 +2558,15 @@ pub mod audio_control {
 		fn set_volume(&mut self, device: u32, volume: u8) -> Result<(), Error>;
 		fn streams(&mut self) -> Vec<AudioStreamInfo>;
 		fn counters(&mut self) -> AudioCounters;
+		/// The effective microphone level, 0 to 100, independently controlled after the first explicit microphone set.
+		/// Before that, a software provider preserves the original combined device-level behavior. Reading never changes it.
+		/// Invalid for a device without recording input, including a phone/broadcast route; not-found for an absent device.
+		/// Unsupported while a hardware Bluetooth endpoint has reported no independent microphone level.
+		fn microphone_volume(&mut self, device: u32) -> Result<u8, Error>;
+		/// Set recording gain independently of the existing speaker/device level. A headset applies its own microphone
+		/// gain; otherwise captured samples are scaled here. Values above 100 are invalid. A definite refusal preserves
+		/// the level; transport loss may be commit-uncertain and retires that Bluetooth connection.
+		fn set_microphone_volume(&mut self, device: u32, volume: u8) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -2724,6 +2735,80 @@ pub mod audio_control {
 					return None;
 				}
 			}
+			OP_MICROPHONE_VOLUME => {
+				let device = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.microphone_volume(device);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v43) => {
+							w.u8(1)?;
+							w.u8(*v43)?;
+						}
+						Err(v44) => {
+							w.u8(0)?;
+							v44.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_MICROPHONE_VOLUME => {
+				let device = r.u32()?;
+				let volume = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_microphone_volume(device, volume);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v45) => {
+							w.u8(1)?;
+						}
+						Err(v46) => {
+							w.u8(0)?;
+							v46.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -2832,13 +2917,13 @@ pub mod audio_control {
 					return None;
 				}
 				let value = {
-					let v43 = r.u16()? as usize;
-					let mut v44 = Vec::new();
-					v44.try_reserve_exact(v43).ok()?;
-					for _ in 0..v43 {
-						v44.push(AudioDevice::read(r)?);
+					let v47 = r.u16()? as usize;
+					let mut v48 = Vec::new();
+					v48.try_reserve_exact(v47).ok()?;
+					for _ in 0..v47 {
+						v48.push(AudioDevice::read(r)?);
 					}
-					v44
+					v48
 				};
 				r.finish()?;
 				Some(value)
@@ -2941,13 +3026,13 @@ pub mod audio_control {
 					return None;
 				}
 				let value = {
-					let v45 = r.u16()? as usize;
-					let mut v46 = Vec::new();
-					v46.try_reserve_exact(v45).ok()?;
-					for _ in 0..v45 {
-						v46.push(AudioStreamInfo::read(r)?);
+					let v49 = r.u16()? as usize;
+					let mut v50 = Vec::new();
+					v50.try_reserve_exact(v49).ok()?;
+					for _ in 0..v49 {
+						v50.push(AudioStreamInfo::read(r)?);
 					}
-					v46
+					v50
 				};
 				r.finish()?;
 				Some(value)
@@ -2982,6 +3067,73 @@ pub mod audio_control {
 					return None;
 				}
 				let value = AudioCounters::read(r)?;
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn microphone_volume(&mut self, device: &u32) -> Option<Result<u8, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_MICROPHONE_VOLUME)?;
+			w.u32(corr)?;
+			w.u32(*device)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u8()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn set_microphone_volume(&mut self, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_MICROPHONE_VOLUME)?;
+			w.u32(corr)?;
+			w.u32(*device)?;
+			w.u8(*volume)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -3031,6 +3183,22 @@ pub mod audio_control {
 	fn channel_invoke_counters(chan: u64) -> Option<AudioCounters> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.counters()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_microphone_volume")]
+	fn channel_invoke_microphone_volume(chan: u64, device: &u32) -> Option<Result<u8, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.microphone_volume(device)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_control_set_microphone_volume")]
+	fn channel_invoke_set_microphone_volume(chan: u64, device: &u32, volume: &u8) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_microphone_volume(device, volume)
 	}
 }
 
@@ -3217,13 +3385,13 @@ pub mod voice_session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v47) => {
+						Ok(v51) => {
 							w.u8(1)?;
-							w.u32(*v47)?;
+							w.u32(*v51)?;
 						}
-						Err(v48) => {
+						Err(v52) => {
 							w.u8(0)?;
-							v48.write(w)?;
+							v52.write(w)?;
 						}
 					}
 					Some(())
@@ -3253,19 +3421,19 @@ pub mod voice_session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v49) => {
+						Ok(v53) => {
 							w.u8(1)?;
-							if v49.len() > u16::MAX as usize {
+							if v53.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v49.len() as u16)?;
-							for v51 in v49.iter() {
-								w.u8(*v51)?;
+							w.u16(v53.len() as u16)?;
+							for v55 in v53.iter() {
+								w.u8(*v55)?;
 							}
 						}
-						Err(v50) => {
+						Err(v54) => {
 							w.u8(0)?;
-							v50.write(w)?;
+							v54.write(w)?;
 						}
 					}
 					Some(())
@@ -3296,12 +3464,12 @@ pub mod voice_session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v52) => {
+						Ok(v56) => {
 							w.u8(1)?;
 						}
-						Err(v53) => {
+						Err(v57) => {
 							w.u8(0)?;
-							v53.write(w)?;
+							v57.write(w)?;
 						}
 					}
 					Some(())
@@ -3351,12 +3519,12 @@ pub mod voice_session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v54) => {
+						Ok(v58) => {
 							w.u8(1)?;
 						}
-						Err(v55) => {
+						Err(v59) => {
 							w.u8(0)?;
-							v55.write(w)?;
+							v59.write(w)?;
 						}
 					}
 					Some(())
@@ -3573,13 +3741,13 @@ pub mod voice_session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v56 = r.u16()? as usize;
-						let mut v57 = Vec::new();
-						v57.try_reserve_exact(v56).ok()?;
-						for _ in 0..v56 {
-							v57.push(r.u8()?);
+						let v60 = r.u16()? as usize;
+						let mut v61 = Vec::new();
+						v61.try_reserve_exact(v60).ok()?;
+						for _ in 0..v60 {
+							v61.push(r.u8()?);
 						}
-						v57
+						v61
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3892,8 +4060,8 @@ impl AudioDevice {
 		out.push(',');
 		out.push_str("\"output\":");
 		match &self.output {
-			Some(v58) => {
-				v58.to_json_into(out);
+			Some(v62) => {
+				v62.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -3902,8 +4070,8 @@ impl AudioDevice {
 		out.push(',');
 		out.push_str("\"input\":");
 		match &self.input {
-			Some(v59) => {
-				v59.to_json_into(out);
+			Some(v63) => {
+				v63.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -3972,8 +4140,8 @@ impl AudioDevice {
 		out.push_str(", ");
 		out.push_str("output=");
 		match &self.output {
-			Some(v60) => {
-				v60.to_text_into(out);
+			Some(v64) => {
+				v64.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -3982,8 +4150,8 @@ impl AudioDevice {
 		out.push_str(", ");
 		out.push_str("input=");
 		match &self.input {
-			Some(v61) => {
-				v61.to_text_into(out);
+			Some(v65) => {
+				v65.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -4049,8 +4217,8 @@ impl AudioDevice {
 		self.transport.to_cbor_into(out);
 		crate::codec::cbor::text(out, "output");
 		match &self.output {
-			Some(v62) => {
-				v62.to_cbor_into(out);
+			Some(v66) => {
+				v66.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4058,8 +4226,8 @@ impl AudioDevice {
 		}
 		crate::codec::cbor::text(out, "input");
 		match &self.input {
-			Some(v63) => {
-				v63.to_cbor_into(out);
+			Some(v67) => {
+				v67.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4143,8 +4311,8 @@ impl AudioStreamInfo {
 		out.push('{');
 		out.push_str("\"device\":");
 		match &self.device {
-			Some(v64) => {
-				let _ = write!(out, "{}", v64);
+			Some(v68) => {
+				let _ = write!(out, "{}", v68);
 			}
 			None => {
 				out.push_str("null");
@@ -4153,8 +4321,8 @@ impl AudioStreamInfo {
 		out.push(',');
 		out.push_str("\"named\":");
 		match &self.named {
-			Some(v65) => {
-				let _ = write!(out, "{}", v65);
+			Some(v69) => {
+				let _ = write!(out, "{}", v69);
 			}
 			None => {
 				out.push_str("null");
@@ -4189,8 +4357,8 @@ impl AudioStreamInfo {
 		out.push('{');
 		out.push_str("device=");
 		match &self.device {
-			Some(v66) => {
-				let _ = write!(out, "{}", v66);
+			Some(v70) => {
+				let _ = write!(out, "{}", v70);
 			}
 			None => {
 				out.push('-');
@@ -4199,8 +4367,8 @@ impl AudioStreamInfo {
 		out.push_str(", ");
 		out.push_str("named=");
 		match &self.named {
-			Some(v67) => {
-				let _ = write!(out, "{}", v67);
+			Some(v71) => {
+				let _ = write!(out, "{}", v71);
 			}
 			None => {
 				out.push('-');
@@ -4235,8 +4403,8 @@ impl AudioStreamInfo {
 		crate::codec::cbor::map(out, 7);
 		crate::codec::cbor::text(out, "device");
 		match &self.device {
-			Some(v68) => {
-				crate::codec::cbor::uint(out, *v68 as u64);
+			Some(v72) => {
+				crate::codec::cbor::uint(out, *v72 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4244,8 +4412,8 @@ impl AudioStreamInfo {
 		}
 		crate::codec::cbor::text(out, "named");
 		match &self.named {
-			Some(v69) => {
-				crate::codec::cbor::uint(out, *v69 as u64);
+			Some(v73) => {
+				crate::codec::cbor::uint(out, *v73 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);

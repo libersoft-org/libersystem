@@ -12,8 +12,9 @@ extern crate alloc;
 
 use alloc::format;
 use ipc_client::ChannelTransport;
-use proto::system::{Error, bluetooth_gatt};
+use proto::system::{Error, LaunchContext, bluetooth_gatt};
 use rt::*;
+use wire::Sink;
 
 const TICKS: u64 = 100;
 
@@ -26,11 +27,36 @@ fn say(line: &str) {
 	print(format!("btgatt: {line}\n").as_bytes());
 }
 
+// Queue through the real grant without waiting, so the owner can end while the
+// independent peer deliberately withholds the subscription discovery response.
+fn queued(grant: u64, op: u16, corr: u32, handle: u16, value: Option<&[u8]>) {
+	let mut writer = wire::VecWriter::new();
+	let encoded = (|| {
+		writer.u16(op)?;
+		writer.u32(corr)?;
+		writer.u16(handle)?;
+		if let Some(value) = value {
+			writer.u16(value.len() as u16)?;
+			writer.raw(value)?;
+		}
+		Some(())
+	})();
+	if !encoded.and_then(|()| writer.into_inner()).is_some_and(|bytes| send_blocking(grant, &bytes, 0)) {
+		fail("the queued grant operation could not be sent");
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 128];
 	inherit_stdout(bootstrap);
-	let _ = recv_launch_bytes(bootstrap);
+	let launch = recv_launch_bytes(bootstrap);
+	let context = launch.as_deref().and_then(LaunchContext::decode);
+	let mode = context.as_ref().map_or("", |context| context.arguments.trim());
+	if !matches!(mode, "" | "indicate" | "timeout" | "revoke") {
+		fail("expected indicate, timeout or revoke");
+	}
+	let indicate = mode == "indicate";
 	let grant = recv_tagged(bootstrap, &mut buf, b"BTGATT").unwrap_or(0);
 	if grant == 0 {
 		fail("no GATT grant was delivered");
@@ -60,7 +86,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		other => fail(&format!("the battery level read {other:?}")),
 	}
 	let value = match client().characteristics(&custom.start) {
-		Some(Ok(found)) => found.into_iter().find(|characteristic| characteristic.uuid == 0xfff1).unwrap_or_else(|| fail("the custom characteristic was not found")),
+		Some(Ok(found)) => found.into_iter().find(|characteristic| characteristic.uuid == if indicate { 0xfff2 } else { 0xfff1 }).unwrap_or_else(|| fail("the custom characteristic was not found")),
 		other => fail(&format!("the custom service's characteristics could not be listed: {other:?}")),
 	};
 	match client().read(&value.handle) {
@@ -72,7 +98,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail("a handle outside the granted services was not refused");
 	}
 	say("a handle outside the granted services is refused");
-	let stream = match client().subscribe(&value.handle) {
+	if mode == "revoke" {
+		queued(grant, bluetooth_gatt::OP_SUBSCRIBE, 0x10001, value.handle, None);
+		queued(grant, bluetooth_gatt::OP_WRITE, 0x10002, value.handle, Some(b"revoked-write"));
+		// Cached services replies immediately; FIFO request delivery proves both
+		// preceding operations reached BluetoothService before this owner exits.
+		if !matches!(client().services(), Some(Ok(_))) {
+			fail("the queue barrier was not answered");
+		}
+		say("the subscription and write are queued; the owner will end");
+		sleep_until(clock() + 10 * TICKS);
+		close(grant);
+		print(b"btgatt: PASS revoke owner ended with queued operations\n");
+		exit();
+	}
+	let started = clock();
+	let subscribed = client().subscribe(&value.handle);
+	if mode == "timeout" {
+		let elapsed = clock().saturating_sub(started);
+		if !matches!(subscribed, Some(Err(Error::TimedOut))) || !(30 * TICKS..=45 * TICKS).contains(&elapsed) {
+			fail(&format!("silent subscription result {subscribed:?}, elapsed {elapsed} ticks"));
+		}
+		print(format!("btgatt: PASS silent subscription timed out after {elapsed} ticks\n").as_bytes());
+		exit();
+	}
+	let stream = match subscribed {
 		Some(Ok(stream)) => stream,
 		other => fail(&format!("the subscription was refused: {other:?}")),
 	};
@@ -87,7 +137,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		},
 		_ => fail("no notification arrived"),
 	}
-	say("the write went, and the peer's notification came back on the subscription");
+	say(if indicate { "the write went, and the peer's indication came back on the subscription" } else { "the write went, and the peer's notification came back on the subscription" });
 	print(b"btgatt: PASS\n");
 	exit();
 }

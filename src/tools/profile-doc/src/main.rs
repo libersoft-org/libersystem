@@ -13,9 +13,8 @@
 //!
 //! THE THREE CHECKS NO REVIEWER RELIABLY CATCHES, run by `--check` over the claims in the tree:
 //! every `Backend`-owned feature has a handler, every feature has at least one conformance test, and
-//! no test claims a feature outside the profile. Where nothing claims anything yet the check is
-//! reported as NOT PERFORMED with the count it ranged over, because a check over an empty set
-//! passing is not the same as a check passing.
+//! no test claims a feature outside the profile. Missing claims fail, including an entirely empty
+//! handler or conformance set: deleting all markers cannot turn a missing implementation green.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -259,6 +258,9 @@ fn capability_report(profile: &Profile, handled: &[Claim]) -> String {
 			let _ = writeln!(out);
 		}
 	}
+	while out.ends_with("\n\n") {
+		out.pop();
+	}
 	out
 }
 
@@ -315,9 +317,7 @@ fn checks<F: 'static>(slug: &str, entries: &'static [ProfileEntry<F>], handled: 
 		ok = false;
 	}
 
-	if handled.is_empty() {
-		println!("{slug}: backend handlers NOT PERFORMED - nothing declares `@handles:`, {} features await one", handlers.required());
-	} else if handlers.complete() {
+	if handlers.complete() {
 		println!("{slug}: every one of the {} backend-owned features has a handler", handlers.required());
 	} else {
 		for entry in handlers.missing() {
@@ -326,9 +326,7 @@ fn checks<F: 'static>(slug: &str, entries: &'static [ProfileEntry<F>], handled: 
 		}
 	}
 
-	if covered.is_empty() {
-		println!("{slug}: conformance coverage NOT PERFORMED - nothing declares `@covers:`, {} features await a test", coverage.required());
-	} else if coverage.complete() {
+	if coverage.complete() {
 		println!("{slug}: every one of the {} features has at least one conformance test", coverage.required());
 	} else {
 		for entry in coverage.missing() {

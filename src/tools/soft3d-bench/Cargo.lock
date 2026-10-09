@@ -53,6 +53,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scene3d"
+version = "0.0.0"
+dependencies = [
+ "graphics-profile",
+ "render-math",
+ "render-shader",
+ "render3d",
+]
+
+[[package]]
 name = "soft3d"
 version = "0.0.0"
 dependencies = [
@@ -73,6 +83,7 @@ dependencies = [
  "render-math",
  "render-shader",
  "render3d",
+ "scene3d",
  "soft3d",
 ]
 

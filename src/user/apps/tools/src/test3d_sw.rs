@@ -6,8 +6,8 @@
 // application drives it: a scene, a camera that moves, lighting that changes, and a frame that has
 // to be finished in time to be presented.
 //
-// THE PATH ONE FRAME TRAVELS is the point of the program: `render3d` describes the draw, `soft3d`
-// executes it into an attachment, and the result reaches a `Surface`. A game, an editor and a map
+// THE PATH ONE FRAME TRAVELS is the point of the program: `scene3d` records the scene into `render3d`
+// commands, `soft3d` executes them into an attachment, and the result reaches a `Surface`. A game, an editor and a map
 // application all take that path, and it is the one nothing else in this tree exercises end to end.
 //
 // TWO GRANTS AND NOTHING ELSE - `display` and `input-keys`. Every vertex is computed here and every
@@ -19,6 +19,9 @@
 #![no_main]
 
 extern crate alloc;
+
+#[path = "test3d_sw/postprocess.rs"]
+mod postprocess;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,13 +43,14 @@ use render2d::paint::{Color, ImageQuality, Paint};
 use render2d::path::{FillRule, PathBuilder};
 use render3d::{CompareOp, Cull as CullMode, DepthFormat, Render3DLimits, Topology};
 use rt::*;
+use scene3d::material::{Blending, Material, MaterialKind};
 use soft2d::Soft2d;
 use soft3d::frame::{Attachments, Draw, Lane, Pipeline, Prepared, Source, Tile, Workers};
 use soft3d::pass::{Colour, DepthStencil};
 use soft3d::texture::{Filter, Kind, Level, Sampler, Texture, Wrap};
 use soft3d::{Indices, Val};
 
-const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended] [--workers N] [--compare]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\n--workers N shades the scene on N threads (1 is this thread alone; the default is one per core, up to 32); --compare renders every pass again on this thread and checks the two agree.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
+const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended] [--postprocess] [--workers N] [--compare]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\n--postprocess adds the six-level HDR bloom and tone-map phase; both scene dimensions must be at least 64.\n--workers N shades the scene on N threads (1 is this thread alone; the default is one per core, up to 32); --compare renders every pass again on this thread and checks the two agree.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
 
 // THE SCENE IS RENDERED AT THE SURFACE'S OWN SIZE unless a run says otherwise, because that is what
 // an application does and what makes a measurement at a stated resolution mean anything: a demo that
@@ -762,13 +766,16 @@ fn shadow_fragment_stage() -> Module {
 }
 
 /// The Extended lighting pass's vertex stage.
-fn pbr_vertex_stage() -> Module {
+fn pbr_vertex_stage(hdr: bool) -> Module {
 	let mut builder = Builder::new(Stage::Vertex, "pbr-vertex");
 	for location in [0, 1, 2, 3, 4] {
 		builder.varying(location, Type::vec(4), render_shader::Interpolation::Smooth);
 	}
 	builder.varying_at(5, Type::vec(4), render_shader::Interpolation::Flat, render_shader::ir::Sampling::Pixel);
 	builder.varying(6, Type::vec(4), render_shader::Interpolation::Smooth);
+	if hdr {
+		builder.varying(7, Type::vec(4), render_shader::Interpolation::Smooth);
+	}
 	let position = builder.load(Type::vec(4), Binding::Attribute { location: 0 });
 	let normal = builder.load(Type::vec(4), Binding::Attribute { location: 1 });
 	let colour = builder.load(Type::vec(4), Binding::Attribute { location: 2 });
@@ -788,6 +795,11 @@ fn pbr_vertex_stage() -> Module {
 	// what the shadow pass wrote: both are the light's view-projection times the world position, and
 	// a lookup computed from anything else would be comparing two different points.
 	let light_clip = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, light_vp, world));
+	if hdr {
+		let depth = builder.assign(Type::f32(), Op::Extract(clip, 3));
+		let depth = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![depth, zero, zero, zero]));
+		builder.store(Output::Varying(7), depth);
+	}
 	builder.store(Output::Position, clip);
 	builder.store(Output::Varying(0), colour);
 	builder.store(Output::Varying(1), world_normal);
@@ -807,7 +819,7 @@ fn pbr_vertex_stage() -> Module {
 /// the specular is `D * V * F` and not `D * G * F / (4 ...)` - and Schlick for the Fresnel, its
 /// fifth power by multiplication rather than by a transcendental. A demo that wrote a different
 /// Smith term from the one `scene3d` fixtures would look right and prove nothing.
-fn pbr_fragment_stage() -> Module {
+fn pbr_fragment_stage(hdr: bool) -> Module {
 	let mut builder = Builder::new(Stage::Fragment, "pbr-fragment");
 	for location in [0, 1, 2, 3, 4] {
 		builder.varying(location, Type::vec(4), render_shader::Interpolation::Smooth);
@@ -815,6 +827,9 @@ fn pbr_fragment_stage() -> Module {
 	builder.varying_at(5, Type::vec(4), render_shader::Interpolation::Flat, render_shader::ir::Sampling::Pixel);
 	builder.varying(6, Type::vec(4), render_shader::Interpolation::Smooth);
 
+	if hdr {
+		builder.varying(7, Type::vec(4), render_shader::Interpolation::Smooth);
+	}
 	let base = builder.load(Type::vec(4), Binding::Varying { location: 0 });
 	let normal_in = builder.load(Type::vec(4), Binding::Varying { location: 1 });
 	let world = builder.load(Type::vec(4), Binding::Varying { location: 2 });
@@ -969,16 +984,33 @@ fn pbr_fragment_stage() -> Module {
 	let lit = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, diffuse, specular_v));
 	let lit = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, lit, ambient_term));
 
-	// THE SCENE IS WRITTEN CLAMPED, because this attachment is what a person sees and there is no
-	// tone map between here and the surface. The HDR path's own answer is the `postprocess` chain in
-	// `scene3d`, which is a pass graph rather than a demo.
+	// The HDR phase fogs linear radiance before bloom and tone mapping. Clip W from this
+	// perspective is positive view-space depth; Euclidean eye distance would be a different fog.
+	let lit = if hdr {
+		let depth = builder.load(Type::vec(4), Binding::Varying { location: 7 });
+		let depth = builder.assign(Type::f32(), Op::Extract(depth, 0));
+		let density = builder.constant(Constant::F32(0.045));
+		let depth = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, depth, zero));
+		let depth = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, depth, density));
+		let squared = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, depth, depth));
+		let negative = builder.assign(Type::f32(), Op::Unary(UnaryOp::Negate, squared));
+		let surviving = builder.assign(Type::f32(), Op::Transcendental(Transcendental::Exp, negative, None));
+		let fog_r = builder.constant(Constant::F32(0.05));
+		let fog_g = builder.constant(Constant::F32(0.06));
+		let fog_b = builder.constant(Constant::F32(0.10));
+		let fog = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![fog_r, fog_g, fog_b, one]));
+		let surviving = splat(&mut builder, surviving);
+		builder.assign(Type::vec(4), Op::Mix { from: fog, to: lit, at: surviving })
+	} else {
+		lit
+	};
 	let alpha = builder.assign(Type::f32(), Op::Extract(base, 3));
 	let r = builder.assign(Type::f32(), Op::Extract(lit, 0));
 	let g = builder.assign(Type::f32(), Op::Extract(lit, 1));
 	let bb = builder.assign(Type::f32(), Op::Extract(lit, 2));
-	let r = builder.assign(Type::f32(), Op::Clamp { value: r, low: zero, high: one });
-	let g = builder.assign(Type::f32(), Op::Clamp { value: g, low: zero, high: one });
-	let bb = builder.assign(Type::f32(), Op::Clamp { value: bb, low: zero, high: one });
+	let r = if hdr { r } else { builder.assign(Type::f32(), Op::Clamp { value: r, low: zero, high: one }) };
+	let g = if hdr { g } else { builder.assign(Type::f32(), Op::Clamp { value: g, low: zero, high: one }) };
+	let bb = if hdr { bb } else { builder.assign(Type::f32(), Op::Clamp { value: bb, low: zero, high: one }) };
 	let out = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![r, g, bb, alpha]));
 	builder.store(Output::Colour(ATTACH_COLOUR), out);
 	let ident = builder.load(Type::vec(4), Binding::Varying { location: 5 });
@@ -1012,6 +1044,7 @@ struct Controls {
 	/// gate and its scene is what that gate asserts about; a phase that added to it would make every
 	/// core check depend on an optional profile being implemented.
 	extended: bool,
+	postprocess: bool,
 	/// How many threads shade the scene, this one included. ZERO IS "ONE PER CORE", up to
 	/// `AUTO_WORKERS`; one is this thread alone, which is the serial walk.
 	workers: u32,
@@ -1023,7 +1056,7 @@ struct Controls {
 
 impl Controls {
 	fn parse(arguments: &[u8]) -> Controls {
-		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false, workers: 0, compare: false };
+		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false, postprocess: false, workers: 0, compare: false };
 		let mut words = arguments.split(|byte| *byte == b' ').filter(|word| !word.is_empty());
 		while let Some(word) = words.next() {
 			match word {
@@ -1037,6 +1070,10 @@ impl Controls {
 				b"--frames" => controls.frames = words.next().and_then(number).unwrap_or(0),
 				b"--report" => controls.report = true,
 				b"--extended" => controls.extended = true,
+				b"--postprocess" => {
+					controls.extended = true;
+					controls.postprocess = true;
+				}
 				b"--scene-width" => controls.scene_width = words.next().and_then(number).unwrap_or(0),
 				b"--scene-height" => controls.scene_height = words.next().and_then(number).unwrap_or(0),
 				b"--pose" => controls.pose = words.next().and_then(number).unwrap_or(u32::MAX),
@@ -1158,9 +1195,9 @@ struct Spare {
 }
 
 impl Spare {
-	fn new(extent: (u32, u32)) -> Spare {
+	fn new(extent: (u32, u32)) -> Option<Spare> {
 		let (width, height) = extent;
-		Spare { colour: [Colour::new(width, height, 1, false), Colour::new(width, height, 1, true)], depth: DepthStencil::new(width, height, 1, DepthFormat::Depth32F), shadow_colour: [Colour::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, false)], shadow_depth: DepthStencil::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, DepthFormat::Depth32F) }
+		Some(Spare { colour: [Colour::try_new(width, height, 1, false).ok()?, Colour::try_new(width, height, 1, true).ok()?], depth: DepthStencil::try_new(width, height, 1, DepthFormat::Depth32F).ok()?, shadow_colour: [Colour::try_new(SHADOW_EXTENT, SHADOW_EXTENT, 1, false).ok()?], shadow_depth: DepthStencil::try_new(SHADOW_EXTENT, SHADOW_EXTENT, 1, DepthFormat::Depth32F).ok()? })
 	}
 }
 
@@ -1177,8 +1214,12 @@ fn same(left: &[Colour], right: &[Colour], left_depth: &DepthStencil, right_dept
 		&& left.iter().zip(right).all(|(a, b)| {
 			a.width == b.width
 				&& a.height == b.height
+				&& a.integer == b.integer
 				&& (0..a.height).all(|y| {
 					(0..a.width).all(|x| {
+						if a.integer {
+							return a.identity_at(x, y, 0) == b.identity_at(x, y, 0);
+						}
 						let (p, q) = (a.at(x, y, 0), b.at(x, y, 0));
 						[p.x, p.y, p.z, p.w].map(f32::to_bits) == [q.x, q.y, q.z, q.w].map(f32::to_bits)
 					})
@@ -1234,14 +1275,15 @@ struct Targets {
 	shadow_colour: [Colour; 1],
 	shadow_depth: DepthStencil,
 	image: OwnedImage,
+	postprocess: Option<postprocess::Postprocess>,
 }
 
 impl Targets {
-	fn new(extent: (u32, u32), draw: &Draw, panel_draw: &Draw, extended_draw: &Draw) -> Option<Targets> {
+	fn new(extent: (u32, u32), mesh: &Mesh, panel_mesh: &Mesh, extended_draw: &Draw, hdr: bool, compare: bool) -> Option<Targets> {
 		let (width, height) = extent;
-		let scene = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![scene_pipeline()], vec![*draw], width, height).ok()?;
-		let panel = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![panel_pipeline()], vec![*panel_draw], width, height).ok()?;
-		let pbr = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pbr_pipeline()], vec![*extended_draw], width, height).ok()?;
+		let scene = prepare_scene(mesh, scene_pipeline(), Blending::Opaque, extent)?;
+		let panel = prepare_scene(panel_mesh, panel_pipeline(), Blending::Blended, extent)?;
+		let pbr = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pbr_pipeline(hdr)], vec![*extended_draw], width, height).ok()?;
 		let shadow = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![shadow_pipeline()], vec![*extended_draw], SHADOW_EXTENT, SHADOW_EXTENT).ok()?;
 		// STRAIGHT ALPHA AND sRGB, which is what the surface this ends up on holds. A scene image in
 		// a different space would be converted twice - once here and once at the composite - and
@@ -1257,13 +1299,14 @@ impl Targets {
 			panel,
 			// TWO COLOUR ATTACHMENTS: what a person sees, and what a pick reads. The second is
 			// declared INTEGER, which is what stops it being resolved, filtered or blended.
-			colour: [Colour::new(width, height, 1, false), Colour::new(width, height, 1, true)],
-			depth: DepthStencil::new(width, height, 1, DepthFormat::Depth32F),
+			colour: [Colour::try_new(width, height, 1, false).ok()?, Colour::try_new(width, height, 1, true).ok()?],
+			depth: DepthStencil::try_new(width, height, 1, DepthFormat::Depth32F).ok()?,
 			pbr,
 			shadow,
-			shadow_colour: [Colour::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, false)],
-			shadow_depth: DepthStencil::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, DepthFormat::Depth32F),
+			shadow_colour: [Colour::try_new(SHADOW_EXTENT, SHADOW_EXTENT, 1, false).ok()?],
+			shadow_depth: DepthStencil::try_new(SHADOW_EXTENT, SHADOW_EXTENT, 1, DepthFormat::Depth32F).ok()?,
 			image: OwnedImage::new(layout).ok()?,
+			postprocess: if hdr { Some(postprocess::Postprocess::new(width, height, compare)?) } else { None },
 		})
 	}
 
@@ -1281,18 +1324,53 @@ impl Targets {
 		self.extent.0 as f32 / self.extent.1 as f32
 	}
 
-	/// What the targets cost, in bytes, one number per thing that is allocated.
-	///
-	/// COMPUTED FROM THE EXTENT AND NOT ASKED OF AN ALLOCATOR, which is the only form a reader can
-	/// check: a peak the allocator reports is this frame's answer on this machine, and a formula is
-	/// what says what a different extent would cost before anybody runs it.
+	/// The reserved primary attachment bytes, including exact IDs and readback-validity planes.
 	fn bytes(&self) -> (u64, u64, u64) {
 		let pixels = self.extent.0 as u64 * self.extent.1 as u64;
-		// A colour attachment holds one `Vec4` per pixel per sample; there are two of them, and this
-		// scene is single-sampled. A depth-stencil holds a four-byte depth and a one-byte stencil.
-		// The shared image is four bytes a pixel, which is what the surface holds.
-		(pixels * 16 * 2, pixels * 5, pixels * 4)
+		(self.colour.iter().map(|colour| colour.reserved_bytes() as u64).sum(), self.depth.reserved_bytes() as u64, pixels * 4)
 	}
+}
+
+/// Record the core scene's retained drawable before preparing its software draw.
+///
+/// The mesh and material are unchanged while the camera and light uniforms animate. Recording is
+/// therefore part of target preparation, including resize, and allocates nothing per frame. Bounds
+/// are deliberately absent: the ground crosses the frustum and the backend clips it against the
+/// current camera, rather than culling it against a camera remembered during preparation.
+fn prepare_scene(mesh: &Mesh, pipeline: Pipeline, blending: Blending, extent: (u32, u32)) -> Option<Prepared> {
+	use render3d::command::{Buffer, CommandList, GraphicsPipeline, Rect};
+	use render3d::resource::{Aspect, DepthStencilView, LoadOp, RenderTargetSet, RenderTargetView, StoreOp, TextureDimension, TextureViewDesc};
+	use scene3d::emit::{Geometry, MeshDraw, PassTargets};
+	use scene3d::scene::{Drawable, Limits, Node};
+
+	struct GeometrySource(MeshDraw);
+	impl Geometry for GeometrySource {
+		fn draw_of(&self, mesh: u32) -> Option<MeshDraw> {
+			(mesh == 0).then_some(self.0)
+		}
+	}
+
+	let mut scene = scene3d::Scene::new(Limits::PROFILE_MINIMUM);
+	let node = scene.add_node(Node::identity()).ok()?;
+	let material = Material::new(MaterialKind::BlinnPhong, GraphicsPipeline(0), 0).with_blending(blending).with_blend_state(pipeline.blend[0]);
+	let material = scene.add_material(material).ok()?;
+	scene.add_drawable(Drawable::new(node, 0, material)).ok()?;
+	let queue = scene3d::queue::build_with(&mut scene, Vec3::ZERO, &scene3d::cull::Frustum::from_view_projection(&Mat4::IDENTITY), u32::MAX);
+	let geometry = GeometrySource(MeshDraw { topology: pipeline.state.topology, state: pipeline.state, vertex_buffer: Buffer(0), instance_buffer: None, vertices: mesh.vertices.len() as u32, indices: Some(scene3d::emit::Indices { buffer: Buffer(0), count: mesh.indices.len() as u32, wide: true }) });
+	let (width, height) = extent;
+	let view = TextureViewDesc { dimension: TextureDimension::D2, aspect: Aspect::Colour, base_mip: 0, mip_count: 1, base_layer: 0, layer_count: 1 };
+	let colour = [
+		RenderTargetView { texture: 0, view, format: "R32G32B32A32_FLOAT", samples: 1, width, height, load: LoadOp::Load, store: StoreOp::Store },
+		RenderTargetView { texture: 1, view, format: "R32_UINT", samples: 1, width, height, load: LoadOp::Load, store: StoreOp::Store },
+	];
+	let depth = DepthStencilView { texture: 2, view: TextureViewDesc { aspect: Aspect::Depth, ..view }, format: DepthFormat::Depth32F, samples: 1, width, height, depth_load: LoadOp::Load, depth_store: StoreOp::Store, stencil_load: LoadOp::Discard, stencil_store: StoreOp::Discard };
+	let set = RenderTargetSet { colour: &colour, depth_stencil: Some(depth), resolve: &[] };
+	let pass = PassTargets { targets: 0, viewport: Rect { x: 0, y: 0, width, height }, samples: 1, id_set: None };
+	let mut commands = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+	scene3d::emit::record(&scene, &queue, &geometry, &mut commands, &set, &pass).ok()?;
+	commands.finish().ok()?;
+	let draws = soft3d::frame::draws_from(commands.commands(), pipeline.state.topology);
+	soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline], draws, width, height).ok()
 }
 
 /// The opaque pass's pipeline.
@@ -1308,6 +1386,7 @@ fn scene_pipeline() -> Pipeline {
 			render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL },
 		],
 		stencil: None,
+		stencil_back: None,
 		depth_compare: CompareOp::Less,
 		depth_write: true,
 		bias: (0.0, 0.0, 0.0),
@@ -1317,16 +1396,17 @@ fn scene_pipeline() -> Pipeline {
 }
 
 /// The Extended lighting pass's pipeline: the same attachments as the core scene's, its own stages.
-fn pbr_pipeline() -> Pipeline {
+fn pbr_pipeline(hdr: bool) -> Pipeline {
 	Pipeline {
 		state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: CullMode::Back, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false },
-		vertex: pbr_vertex_stage(),
-		fragment: pbr_fragment_stage(),
+		vertex: pbr_vertex_stage(hdr),
+		fragment: pbr_fragment_stage(hdr),
 		blend: vec![
 			render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL },
 			render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL },
 		],
 		stencil: None,
+		stencil_back: None,
 		depth_compare: CompareOp::Less,
 		depth_write: true,
 		bias: (0.0, 0.0, 0.0),
@@ -1342,7 +1422,7 @@ fn pbr_pipeline() -> Pipeline {
 /// far side of a closed object puts the recorded depth behind the surface that is lit - which moves
 /// the self-shadowing error to the side facing away from the camera, where nobody is looking.
 fn shadow_pipeline() -> Pipeline {
-	Pipeline { state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: CullMode::Front, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: shadow_vertex_stage(), fragment: shadow_fragment_stage(), blend: vec![render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL }], stencil: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
+	Pipeline { state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: CullMode::Front, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: shadow_vertex_stage(), fragment: shadow_fragment_stage(), blend: vec![render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL }], stencil: None, stencil_back: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
 }
 
 /// THE TRANSPARENT PASS IS A SECOND PLAN OVER THE SAME ATTACHMENTS, and the three differences
@@ -1367,6 +1447,7 @@ fn panel_pipeline() -> Pipeline {
 			render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL },
 		],
 		stencil: None,
+		stencil_back: None,
 		depth_compare: CompareOp::Less,
 		depth_write: false,
 		bias: (0.0, 0.0, 0.0),
@@ -1418,10 +1499,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mesh = Mesh::scene();
 	let panel = Mesh::panel();
 	let extended = Mesh::extended();
-	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: mesh.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
-	let extended_draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: extended.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
-
-	let panel_draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: panel.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let extended_draw = Draw { first: 0, pipeline: 0, topology: Topology::TriangleList, count: extended.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 
 	// EVERYTHING THAT DEPENDS ON THE SCENE'S SIZE, BUILT IN ONE PLACE AND REBUILT IN ONE PLACE. The
 	// two prepared plans reserve for an extent, the three attachments are that extent, and the image
@@ -1429,12 +1507,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The camera, the spin, the pause and the overlay toggle are in `View`, which this does not
 	// touch: that is what "preserves camera and animation state" means.
 	let configuration = frames.surface().configuration();
-	let Some(mut targets) = Targets::new(controls.scene_extent(configuration.physical_extent.width, configuration.physical_extent.height), &draw, &panel_draw, &extended_draw) else {
+	let Some(mut targets) = Targets::new(controls.scene_extent(configuration.physical_extent.width, configuration.physical_extent.height), &mesh, &panel, &extended_draw, controls.postprocess, controls.compare) else {
 		print(b"test3d-sw: the pipeline was refused\n");
+		drop(frames);
 		exit();
 	};
+	print(b"test3d-sw: core passes recorded by scene3d\n");
 	let Some(mut hud) = Hud::new() else {
 		print(b"test3d-sw: no overlay\n");
+		drop(frames);
 		exit();
 	};
 	// THE WORKERS, ONCE, FOR THE WHOLE RUN. A pool gives its threads back when it is dropped and a
@@ -1447,7 +1528,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	line.decimal(shading.lanes() as u64);
 	line.push(b" worker(s)\n");
 	print(line.as_bytes());
-	let mut spare = controls.compare.then(|| Spare::new(targets.extent));
+	let mut spare = if controls.compare {
+		let Some(spare) = Spare::new(targets.extent) else {
+			print(b"test3d-sw: comparison attachments could not be allocated\n");
+			drop(frames);
+			exit();
+		};
+		Some(spare)
+	} else {
+		None
+	};
 	let mut verdict = Verdict::default();
 	let mut view = View::reset();
 	let mut state = Frame3d { mesh, panel, extended, normal_map: normal_map(TEX_NORMAL, 128, 6, 0.045), shadow_map: empty_shadow_map(TEX_SHADOW, SHADOW_EXTENT), shadowed: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Nearest, minify: Filter::Nearest, ..Sampler::NEAREST }, light_vp: Mat4::IDENTITY, pass: Pass::Scene, checker: checkerboard(TEX_CHECKER, 64, 8, [1.0, 1.0, 1.0, 1.0], [0.16, 0.16, 0.20, 1.0]), ground: checkerboard(TEX_GROUND, 32, 2, [1.28, 1.28, 1.36, 1.0], [0.62, 0.62, 0.70, 1.0]), clamped: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, repeated: Sampler { wrap_u: Wrap::Repeat, wrap_v: Wrap::Repeat, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, mvp: Mat4::IDENTITY, model: Mat4::IDENTITY, light_dir: [0.45, 0.8, 0.35, 0.0], light_point: [0.0, 2.0, 0.0, 1.0], eye: [0.0, 0.0, DISTANCE_START, 1.0], ambient: [0.22, 0.22, 0.26, 0.0] };
@@ -1480,6 +1570,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut counts = soft3d::frame::Stats::default();
 	let run_began = clock_ns();
 	let mut running = true;
+	let mut previous_present = clock_ns();
+	let mut previous_allocations = heap_allocation_count();
 	while running {
 		if interrupted() {
 			break;
@@ -1521,13 +1613,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						// continue the animation rather than restart it.
 						let wanted = controls.scene_extent(rebuilt_to.extent.width, rebuilt_to.extent.height);
 						if wanted != targets.extent {
-							let Some(rebuilt_targets) = Targets::new(wanted, &draw, &panel_draw, &extended_draw) else {
+							let Some(rebuilt_targets) = Targets::new(wanted, &state.mesh, &state.panel, &extended_draw, controls.postprocess, controls.compare) else {
 								print(b"test3d-sw: the scene could not be rebuilt at the new size\n");
 								break;
 							};
 							targets = rebuilt_targets;
 							if let Some(spare) = spare.as_mut() {
-								*spare = Spare::new(targets.extent);
+								let Some(rebuilt_spare) = Spare::new(targets.extent) else {
+									print(b"test3d-sw: comparison attachments could not be rebuilt\n");
+									break;
+								};
+								*spare = rebuilt_spare;
 							}
 						}
 					}
@@ -1539,6 +1635,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				continue;
 			}
 		}
+		let render_allocations = heap_allocation_count();
 		if controls.pose != u32::MAX {
 			view.spin = controls.pose as f32 * 0.01;
 		} else if !view.paused {
@@ -1672,12 +1769,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			timing.transparent += clock_ns().saturating_sub(stage_began);
 		}
 
+		if let Some(postprocess) = &mut targets.postprocess {
+			let began = clock_ns();
+			match postprocess.execute(&mut targets.colour[0], &shading) {
+				Ok((passes, differed)) => {
+					verdict.passes += passes;
+					verdict.differed += differed;
+				}
+				Err(_) => {
+					print(b"test3d-sw: the HDR postprocess pass was refused\n");
+					break;
+				}
+			}
+			timing.postprocess += clock_ns().saturating_sub(began);
+			if presented == 0 {
+				print(b"test3d-sw: HDR chain executed six downsamples, five upsamples and resolve\n");
+			}
+		}
+
 		// AND THE FRAME CROSSES INTO THE 2D MODEL HERE. What was a direct write into the mapped
 		// surface is now an image the 2D half composites a HUD over - which is the path an
 		// application takes and the one nothing else in this tree exercises end to end.
 		let stage_began = clock_ns();
 		hud.absorb(&mut targets, view.picking);
 		timing.handover += clock_ns().saturating_sub(stage_began);
+		let before_acquire = heap_allocation_count();
 		let Some(frame) = frames.acquire() else {
 			// AN ACQUIRE THAT ANSWERS NOTHING IS NOT ALWAYS A REASON TO WAIT. Four of the five answers
 			// are policy - `again`, `not visible` and `out of date` each move the pacing and the step
@@ -1692,6 +1808,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			continue;
 		};
+		let after_acquire = heap_allocation_count();
 		refusals = 0;
 		let stage_began = clock_ns();
 		// THE DESTINATION IS THE SURFACE'S CURRENT EXTENT AND NOT A REMEMBERED ONE, which is what
@@ -1702,17 +1819,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			frames.abandon(frame);
 			break;
 		}
-		if !hud.present_into(&targets, &frame) {
+		if !hud.present_into(&targets, &frame, presented) {
 			print(b"test3d-sw: the composite was refused\n");
 			frames.abandon(frame);
 			break;
 		}
 		timing.overlay += clock_ns().saturating_sub(stage_began);
+		let rendering_allocations = heap_allocation_count().saturating_sub(after_acquire) + before_acquire.saturating_sub(render_allocations);
 		let stage_began = clock_ns();
 		if !frames.present_whole(frame) {
 			break;
 		}
-		timing.present += clock_ns().saturating_sub(stage_began);
+		let present_elapsed = clock_ns().saturating_sub(stage_began);
+		timing.present += present_elapsed;
+		timing.present_max = timing.present_max.max(present_elapsed);
+		let now = clock_ns();
+		let allocations = heap_allocation_count();
+		if presented >= 5 && timing.sample_count < timing.intervals.len() {
+			timing.intervals[timing.sample_count] = now.saturating_sub(previous_present);
+			timing.sample_count += 1;
+			timing.render_allocations = timing.render_allocations.max(rendering_allocations);
+			timing.loop_allocations = timing.loop_allocations.max(allocations.saturating_sub(previous_allocations));
+		}
+		previous_present = now;
+		previous_allocations = allocations;
 		presented += 1;
 		if controls.frames != 0 && presented >= controls.frames {
 			break;
@@ -1726,8 +1856,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	line.push(b"\n");
 	print(line.as_bytes());
 	if controls.report {
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: scene prepared bytes ");
+		line.decimal((targets.scene.reserved_bytes() + targets.panel.reserved_bytes() + targets.pbr.reserved_bytes() + targets.shadow.reserved_bytes()) as u64);
+		line.push(b"\n");
+		print(line.as_bytes());
+		if let Some(postprocess) = &targets.postprocess {
+			let mut line = common_line::Line::new();
+			line.push(b"test3d-sw: HDR prepared bytes ");
+			line.decimal(postprocess.bytes());
+			line.push(b"\n");
+			print(line.as_bytes());
+		}
 		report(&timing, &counts, presented, clock_ns().saturating_sub(run_began), controls.width, controls.height, targets.extent, targets.bytes());
 	}
+	// exit() terminates the process without unwinding these local Rust values. Release the queue explicitly
+	// so both normal exits and a failed resize notify the display before the process disappears.
+	drop(frames);
 	if controls.compare {
 		let mut line = common_line::Line::new();
 		line.push(b"test3d-sw: ");
@@ -1855,6 +2000,8 @@ struct Hud {
 	canvas: Canvas,
 	list: DrawList,
 	backend: Soft2d<'static>,
+	prepared: Option<soft2d::backend::SoftPrepared>,
+	recorded: Option<(Extent2D, (u32, u32), bool)>,
 	forms: Forms,
 }
 
@@ -1872,7 +2019,7 @@ const COLOUR_GLYPH: u32 = 99;
 
 impl Hud {
 	fn new() -> Option<Hud> {
-		Some(Hud { canvas: Canvas::new(), list: DrawList::default(), backend: Soft2d::new(), forms: Forms { height: 12.0 } })
+		Some(Hud { canvas: Canvas::new(), list: DrawList::default(), backend: Soft2d::new(), prepared: None, recorded: None, forms: Forms { height: 12.0 } })
 	}
 
 	/// Copy the resolved colour attachment into the shared image. THE ONE PLACE THE TWO MODELS MEET:
@@ -1882,7 +2029,7 @@ impl Hud {
 		let mut view = targets.image.view_mut();
 		for y in 0..height {
 			for x in 0..width {
-				let texel = if overlay { identity_colour(targets.colour[ATTACH_IDENT as usize].at(x, y, 0).x) } else { targets.colour[ATTACH_COLOUR as usize].at(x, y, 0) };
+				let texel = if overlay { identity_colour(targets.colour[ATTACH_IDENT as usize].identity_at(x, y, 0).unwrap_or(0)) } else { targets.colour[ATTACH_COLOUR as usize].at(x, y, 0) };
 				graphics_core::pixel::write(&mut view, x, y, graphics_core::pixel::Rgba::new(texel.x, texel.y, texel.z, 1.0));
 			}
 		}
@@ -1890,6 +2037,11 @@ impl Hud {
 
 	/// Record the frame: the scene, then the HUD over it.
 	fn record(&mut self, targets: &Targets, extent: Extent2D, presented: u32, view: &View) -> bool {
+		let key = (extent, targets.extent, view.paused);
+		if self.recorded == Some(key) {
+			return true;
+		}
+		self.prepared = None;
 		let (width, height) = (extent.width as f32, extent.height as f32);
 		self.canvas.restart();
 		// NEAREST, because what the scale has to preserve is WHICH pixels the rasteriser covered, and
@@ -1930,11 +2082,15 @@ impl Hud {
 		if self.canvas.draw_glyph_run(label(panel.x + height * 0.10, panel.y + height * 0.115, glyph_height), Paint::Solid(srgb(0.06, 0.08, 0.16, 1.0))).is_err() {
 			return false;
 		}
-		self.canvas.finish_into(&mut self.list).is_ok()
+		if self.canvas.finish_into(&mut self.list).is_err() {
+			return false;
+		}
+		self.recorded = Some(key);
+		true
 	}
 
 	/// Replay the recorded list into the acquired surface image.
-	fn present_into(&mut self, targets: &Targets, frame: &graphics_app::Frame) -> bool {
+	fn present_into(&mut self, targets: &Targets, frame: &graphics_app::Frame, presented: u32) -> bool {
 		let Some(span) = frame.layout.backend_access_span(true) else { return false };
 		// SAFETY: the mapping is live while the frame is held, and the span is the layout's own
 		// answer for what a backend may touch.
@@ -1944,10 +2100,26 @@ impl Hud {
 		let description = TargetDescription { extent: frame.layout.extent, format, color_space: ColorSpace::Srgb, scale: 1.0, luminance: graphics_core::pixel::OutputLuminance::UNKNOWN };
 		let images = Scene { image: targets.image.view() };
 		let mut backend = core::mem::replace(&mut self.backend, Soft2d::new()).with_images(&images).with_glyphs(&self.forms);
-		match backend.prepare(&self.list, &description) {
-			Ok(prepared) => backend.render(&prepared, &mut target).is_ok(),
-			Err(_) => false,
+		if self.prepared.is_none() {
+			let allocations = heap_allocation_count();
+			self.prepared = backend.prepare(&self.list, &description).ok();
+			let allocated = heap_allocation_count().saturating_sub(allocations);
+			if allocated == 0 {
+				print(b"test3d-sw: allocation counter failed shared-library preparation sanity check\n");
+				return false;
+			}
+			if presented == 0 {
+				print(b"test3d-sw: allocation counter observes shared-library preparation\n");
+			}
 		}
+		let result = if let Some(prepared) = self.prepared.as_mut() {
+			let record = ImageRecord { identity: SCENE_IMAGE, layout_generation: 1, content_generation: presented as u64 + 1 };
+			backend.refresh_images(prepared, &[record]).is_ok() && backend.render(prepared, &mut target).is_ok()
+		} else {
+			false
+		};
+		self.backend = backend.unbind();
+		result
 	}
 }
 
@@ -1955,8 +2127,8 @@ impl Hud {
 ///
 /// FLAT AND DISTINCT, with no shading at all: what this view has to show is WHICH object owns a
 /// pixel, and a lit rendering of an id is a picture in which two objects can share a colour.
-fn identity_colour(ident: f32) -> Vec4 {
-	match ident as u32 {
+fn identity_colour(ident: u32) -> Vec4 {
+	match ident {
 		1 => Vec4::new(0.95, 0.25, 0.20, 1.0),
 		2 => Vec4::new(0.20, 0.45, 0.95, 1.0),
 		3 => Vec4::new(0.95, 0.85, 0.20, 1.0),
@@ -2040,20 +2212,62 @@ fn label(origin_x: f32, origin_y: f32, size: f32) -> RecordedGlyphRun {
 /// only that something got slower.
 #[derive(Default)]
 struct Timing {
+	intervals: [u64; 30],
+	sample_count: usize,
+	render_allocations: u64,
+	loop_allocations: u64,
 	scene: u64,
 	/// The Extended phase's shadow pass, counted SEPARATELY from the lighting pass it feeds. Folding
 	/// it into `scene` would report one number for two passes that scale with different things: the
 	/// lighting pass with the window, and the shadow pass with the light's own map.
 	shadow: u64,
+	postprocess: u64,
 	transparent: u64,
 	handover: u64,
 	overlay: u64,
 	present: u64,
+	present_max: u64,
 }
 
 /// Print the timing report. NOT IN THE ORDINARY RUN: it is asked for with `--report`, because a demo
 /// that printed measurements at every exit would be a demo whose output a person has to read past.
 fn report(timing: &Timing, counts: &soft3d::frame::Stats, frames: u32, wall: u64, width: u32, height: u32, scene: (u32, u32), memory: (u64, u64, u64)) {
+	if timing.sample_count > 0 {
+		let mut samples = timing.intervals;
+		let samples = &mut samples[..timing.sample_count];
+		let elapsed: u64 = samples.iter().sum();
+		samples.sort_unstable();
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: steady samples ");
+		line.decimal(samples.len() as u64);
+		line.push(b" median_us ");
+		line.decimal(samples[samples.len() / 2] / 1000);
+		line.push(b" p99_us ");
+		line.decimal(samples[samples.len() - 1] / 1000);
+		line.push(b" render_alloc_max ");
+		line.decimal(timing.render_allocations);
+		line.push(b" loop_alloc_max ");
+		line.decimal(timing.loop_allocations);
+		line.push(b"\n");
+		print(line.as_bytes());
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: steady elapsed_ns ");
+		line.decimal(elapsed);
+		line.push(b" max_us ");
+		line.decimal(samples[samples.len() - 1] / 1000);
+		line.push(b"\n");
+		print(line.as_bytes());
+	}
+	let (live, peak) = heap_allocation_bytes();
+	let mut line = common_line::Line::new();
+	line.push(b"test3d-sw: heap live_bytes ");
+	line.decimal(live);
+	line.push(b" peak_bytes ");
+	line.decimal(peak);
+	line.push(b" present_max_us ");
+	line.decimal(timing.present_max / 1000);
+	line.push(b"\n");
+	print(line.as_bytes());
 	let divisor = frames.max(1) as u64;
 	let mut line = common_line::Line::new();
 	line.push(b"test3d-sw: surface ");
@@ -2083,6 +2297,7 @@ fn report(timing: &Timing, counts: &soft3d::frame::Stats, frames: u32, wall: u64
 	for (name, total) in [
 		(&b"shadow"[..], timing.shadow),
 		(b"scene", timing.scene),
+		(b"postprocess", timing.postprocess),
 		(b"transparent", timing.transparent),
 		(b"handover", timing.handover),
 		(b"overlay", timing.overlay),

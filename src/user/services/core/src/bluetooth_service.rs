@@ -2256,6 +2256,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut reply = alloc::vec![0u8; 8192];
 	let mut subscribed = subscription != 0;
 	loop {
+		stack.serve_audio_subscriber(&mut buf);
 		let mut waitset: Vec<u64> = Vec::with_capacity(8 + clients.len() + 3 * MAX_CONTROLLERS);
 		for root in [read_root, operator_root, profile_root, admin_root, audio_root, network_root] {
 			if root != 0 {
@@ -2290,15 +2291,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		}
 		waitset.extend(clients.iter().map(|client| client.chan));
+		// The subscriber sends no requests here; its closure ends all of its PCM ownership.
+		if stack.audio.subscriber != 0 {
+			waitset.push(stack.audio.subscriber);
+		}
 		// THE OPENED ENDPOINTS' CHANNELS, each read only while it holds no unanswered request.
 		waitset.extend(stack.audio.pcm.iter().filter(|pcm| !pcm.holding()).map(|pcm| pcm.chan));
-		let deadline = [stack.pcm_deadline(), stack.serial_deadline(), stack.opp_deadline(), stack.broadcast_deadline(), stack.le_audio_deadline()].into_iter().flatten().fold(stack.next_deadline(), u64::min);
+		let deadline = [stack.pcm_deadline(), stack.serial_deadline(), stack.opp_deadline(), stack.broadcast_deadline(), stack.le_audio_deadline(), stack.gatt_deadline()].into_iter().flatten().fold(stack.next_deadline(), u64::min);
 		let ready = wait_any(&waitset, deadline);
 		stack.run_timers();
 		stack.broadcast_timers();
 		stack.le_audio_timers();
 		stack.pcm_timers();
 		stack.serial_timers();
+		stack.gatt_timers();
 		stack.opp_timers();
 		for controller in &mut stack.controllers {
 			controller.pump();
@@ -2307,6 +2313,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			continue;
 		}
 		let handle = waitset[ready as usize];
+		if handle == stack.audio.subscriber {
+			stack.serve_audio_subscriber(&mut buf);
+			continue;
+		}
 
 		// A CONTROLLER'S PACKETS OR ITS CONTROL STREAM.
 		if let Some(at) = stack.controllers.iter().position(|controller| controller.packets == handle) {

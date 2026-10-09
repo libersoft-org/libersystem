@@ -18,12 +18,16 @@ SCRIPT_NAME=check-qemu-2d-demo.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../lib.sh"
 
 FRAMES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/2d-demo-frames.XXXXXX")"
+mkdir -p "$REPO_ROOT/.build/logs"
+PROOF_DIR="$(mktemp -d "$REPO_ROOT/.build/logs/qemu-2d-demo.XXXXXX")"
 BOOTED=0
 cleanup() {
 	if ((BOOTED)); then
 		"$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true
 	fi
+	cp -a "$FRAMES_DIR/." "$PROOF_DIR/"
 	rm -rf "$FRAMES_DIR"
+	note "2D frame proof: $PROOF_DIR"
 }
 trap cleanup EXIT
 

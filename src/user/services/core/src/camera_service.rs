@@ -28,13 +28,11 @@ use wire::{Handles, Reader, Sink, Transport, TransportError};
 
 include!(concat!(env!("OUT_DIR"), "/roles_camera_service.rs"));
 
-// THE CONFIGURED CAMERAS: an alias a policy row may name, and the provider metadata it binds. The one
-// alias is the development fixture's, and a configuration that ships binds no fixture, so there it names
-// nothing and no capture grant can be minted until somebody configures a camera.
-//
-// NOT `cfg`-GATED: this service is built once, into the shared image both configurations stage, and that
-// build has no development feature - a gated alias was absent from the development image too.
-const ALIASES: &[(&str, &[u8])] = &[("fixture", b"org.libersystem.camera-fixture")];
+// Configured aliases bind provider metadata, never the first camera present. The USB alias is used by
+// the development USB capture probe; ordinary applications still need an explicit PermissionManager policy.
+// Both aliases must resolve to exactly one current publication; duplicate USB cameras are refused.
+// Not cfg-gated: this service is built once into the shared image staged by both configurations.
+const ALIASES: &[(&str, &[u8])] = &[("fixture", b"org.libersystem.camera-fixture"), ("usb-video", driver_protocol::provider::USB_VIDEO_NAME)];
 
 const MAX_ADMINS: usize = 4;
 const VERSION: u32 = 1;

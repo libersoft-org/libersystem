@@ -45,6 +45,7 @@ impl Rgba {
 	}
 
 	/// Scale every channel, which on a PREMULTIPLIED colour is what an opacity or a coverage is.
+	#[inline]
 	pub fn scaled(self, factor: f32) -> Self {
 		Self { red: self.red * factor, green: self.green * factor, blue: self.blue * factor, alpha: self.alpha * factor }
 	}
@@ -52,6 +53,7 @@ impl Rgba {
 	/// Channel-wise addition. NOT `core::ops::Add`, deliberately: an operator on a premultiplied
 	/// colour would read as arithmetic that is meaningful for any two colours, and adding two
 	/// premultiplied colours is meaningful only where a filter is accumulating weighted taps.
+	#[inline]
 	pub fn plus(self, other: Self) -> Self {
 		Self { red: self.red + other.red, green: self.green + other.green, blue: self.blue + other.blue, alpha: self.alpha + other.alpha }
 	}
@@ -460,7 +462,7 @@ pub fn dither_offset(x: u32, y: u32) -> f32 {
 
 /// Half-precision to single. Written out because the storage format is half and the arithmetic is
 /// not: every subnormal, infinity and NaN has to survive the trip for a round trip to mean anything.
-pub fn half_to_f32(bits: u16) -> f32 {
+pub const fn half_to_f32(bits: u16) -> f32 {
 	let sign = (bits as u32 & 0x8000) << 16;
 	let exponent = (bits as u32 >> 10) & 0x1f;
 	let mantissa = bits as u32 & 0x3ff;
@@ -566,10 +568,13 @@ impl TransferTable {
 			return color::decode(self.transfer, value as f64) as f32;
 		}
 		let position = value * DECODE_ENTRIES as f32;
-		let index = position as usize;
+		// The guarded domain is at most 1024 (4096 for encode below). Keep its index in
+		// that integer range: a usize conversion on a 64-bit target otherwise carries
+		// the full unsigned-64 saturation and float round-trip into every channel.
+		let index = position as u32;
 		let fraction = position - index as f32;
-		let low = self.decode[index.min(DECODE_ENTRIES)];
-		let high = self.decode[(index + 1).min(DECODE_ENTRIES)];
+		let low = self.decode[index.min(DECODE_ENTRIES as u32) as usize];
+		let high = self.decode[(index + 1).min(DECODE_ENTRIES as u32) as usize];
 		low + (high - low) * fraction
 	}
 
@@ -579,10 +584,10 @@ impl TransferTable {
 			return color::encode(self.transfer, value as f64) as f32;
 		}
 		let position = crate::composite::sqrt_inline(value) * ENCODE_ENTRIES as f32;
-		let index = position as usize;
+		let index = position as u32;
 		let fraction = position - index as f32;
-		let low = self.encode[index.min(ENCODE_ENTRIES)];
-		let high = self.encode[(index + 1).min(ENCODE_ENTRIES)];
+		let low = self.encode[index.min(ENCODE_ENTRIES as u32) as usize];
+		let high = self.encode[(index + 1).min(ENCODE_ENTRIES as u32) as usize];
 		low + (high - low) * fraction
 	}
 }
@@ -622,6 +627,11 @@ impl Decoder {
 	/// Stage one and two: decode the transfer function, then STRAIGHT TO PREMULTIPLIED.
 	pub fn decode(&self, raw: Rgba) -> Rgba {
 		self.decode_inner(raw, None)
+	}
+
+	/// Whether stored channels already are premultiplied light in the working primaries.
+	pub(crate) fn is_identity(&self) -> bool {
+		self.working_is_linear && matches!(self.transfer, graphics_profile::image::Transfer::Linear) && self.matrix.is_none() && matches!(self.alpha, AlphaMode::Premultiplied)
 	}
 
 	/// A WHOLE RUN, WITH EVERY DECISION TAKEN ONCE.
@@ -690,7 +700,7 @@ impl Decoder {
 		// below says so - and they round-trip a value through `x / a * a` when there is no transfer to
 		// correct for. Skipping the pair returns `raw` itself, which is the value that round trip is
 		// approximating.
-		if self.working_is_linear && matches!(self.transfer, graphics_profile::image::Transfer::Linear) && self.matrix.is_none() && matches!(self.alpha, AlphaMode::Premultiplied) {
+		if self.is_identity() {
 			return raw;
 		}
 		let mut value = raw;
@@ -1069,3 +1079,6 @@ pub fn convert_image(source: &ImageView<'_>, target: &mut ImageViewMut<'_>, work
 	}
 	Ok(())
 }
+
+#[cfg(test)]
+mod tests;

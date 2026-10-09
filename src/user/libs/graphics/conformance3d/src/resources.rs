@@ -43,6 +43,7 @@ fn texture_of(kind: Kind, levels: alloc::vec::Vec<Level>) -> Texture {
 	Texture { id: 1, kind, levels, transfer: Transfer::Linear, semantics: Semantics::Color, premultiplied: false }
 }
 
+// @covers: Buffer
 pub fn buffer() -> Outcome {
 	// A BUFFER IS A SIZE, A USE AND A VISIBILITY, and the description is where a mistake is refused:
 	// a zero-sized buffer is an out-of-range access at every later use, and creating it successfully
@@ -56,9 +57,86 @@ pub fn buffer() -> Outcome {
 	// AND A BUFFER WITH NO USE AT ALL is a buffer nothing may do anything with.
 	let useless = BufferDesc { usage: BufferUsage::default(), ..good };
 	require!(useless.validate(&limits()).is_err(), "a buffer declared for no use is refused");
+
+	// Backend-owned upload bytes reach the actual vertex and fragment stages through Source.
+	// One device buffer carries vertices and a uniform; a second copy is a host readback.
+	use render_shader::builder::Builder;
+	use render_shader::ir::{Binding, Output, Stage, Type};
+	use soft3d::buffer::Buffer;
+	use soft3d::{Indices, Source, Val};
+	struct Buffered<'a> {
+		data: &'a Buffer,
+		indices: [u16; 3],
+	}
+	fn vector(bytes: &[u8]) -> Val {
+		let words: [u32; 4] = core::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
+		Val::new(Type::vec(4), &words)
+	}
+	impl Source for Buffered<'_> {
+		fn attribute(&self, location: u32, vertex: u32, _: u32) -> Option<Val> {
+			if location != 0 || vertex >= 4 {
+				return None;
+			}
+			let offset = u64::from(vertex) * 16;
+			Some(vector(self.data.vertex_bytes(offset..offset + 16).ok()?))
+		}
+		fn uniform(&self, block: u32, member: u32) -> Option<Val> {
+			if block != 0 || member != 0 {
+				return None;
+			}
+			Some(vector(self.data.uniform_bytes(64..80).ok()?))
+		}
+		fn sample(&self, _: u32, _: u32, _: &Val) -> Option<Val> {
+			None
+		}
+		fn indices(&self) -> Indices<'_> {
+			Indices::U16(&self.indices)
+		}
+	}
+	let usage = BufferUsage { vertex: true, index: true, uniform: true, copy_source: true, copy_destination: true, ..BufferUsage::default() };
+	let desc = BufferDesc { size: 86, usage, host_visibility: HostVisibility::Upload };
+	let mut upload = Buffer::new(desc, &limits())?;
+	let values = [
+		[4.0f32, 4.0, 0.5, 1.0], // an unused vertex, making the copied index stream meaningful
+		[-0.8, -0.8, 0.5, 1.0],
+		[0.8, -0.8, 0.5, 1.0],
+		[0.0, 0.8, 0.5, 1.0],
+		[0.25, 0.5, 0.75, 1.0],
+	];
+	let mut map = upload.map_write(0..86)?;
+	for (slot, value) in map[..80].chunks_exact_mut(4).zip(values.iter().flatten()) {
+		slot.copy_from_slice(&value.to_le_bytes());
+	}
+	map[80..].copy_from_slice(&[1, 0, 2, 0, 3, 0]);
+	map.unmap();
+	let mut device = Buffer::new(BufferDesc { host_visibility: HostVisibility::None, ..desc }, &limits())?;
+	device.copy_from(0, &upload, 0, 86)?;
+	let raw_indices = device.index_bytes(80..86)?;
+	let indices = core::array::from_fn(|i| u16::from_le_bytes([raw_indices[2 * i], raw_indices[2 * i + 1]]));
+	let mut vertex = Builder::new(Stage::Vertex, "buffer-vertex");
+	let position = vertex.load(Type::vec(4), Binding::Attribute { location: 0 });
+	vertex.store(Output::Position, position);
+	let mut fragment = Builder::new(Stage::Fragment, "buffer-uniform");
+	let colour = fragment.load(Type::vec(4), Binding::Uniform { block: 0, member: 0 });
+	fragment.store(Output::Colour(0), colour);
+	let plan = crate::harness::Plan { vertex: vertex.finish(), fragment: fragment.finish(), identity_attachment: false, ..crate::harness::Plan::default() };
+	let frame = crate::harness::render(&Buffered { data: &device, indices }, &plan)?;
+	let pixel = frame.pixel(16, 16);
+	require!(crate::harness::colour_close(pixel, 0.25, 0.5, 0.75), "copied vertex/index/uniform bytes reach a drawn pixel: {pixel:?}");
+	require!(crate::harness::colour_close(frame.pixel(0, 0), 0.0, 0.0, 0.0), "the stored triangle leaves the clear corner untouched");
+
+	device.write(64, &1.0f32.to_le_bytes())?;
+	let updated = crate::harness::render(&Buffered { data: &device, indices }, &plan)?;
+	require!(crate::harness::colour_close(updated.pixel(16, 16), 1.0, 0.5, 0.75), "a subsequent write changes the next executed frame");
+	let mut readback = Buffer::new(BufferDesc { host_visibility: HostVisibility::Readback, ..desc }, &limits())?;
+	readback.copy_from(0, &device, 64, 16)?;
+	let map = readback.map_read(0..16)?;
+	require!(vector(&map).f32_at(0) == 1.0 && vector(&map).f32_at(2) == 0.75, "readback observes the same committed buffer bytes");
+	map.unmap();
 	Ok(())
 }
 
+// @covers: Texture2D
 pub fn texture_2d() -> Outcome {
 	let desc = TextureDesc { dimension: TextureDimension::D2, width: 4, height: 4, depth: 1, mip_levels: 1, layers: 1, samples: 1, format: "RGBA8", usage: TextureUsage { sampled: true, ..TextureUsage::default() } };
 	desc.validate(&limits()).map_err(|error| crate::Trouble::Unsupported(alloc::format!("a plain 2D texture was refused: {error:?}")))?;
@@ -71,6 +149,7 @@ pub fn texture_2d() -> Outcome {
 	Ok(())
 }
 
+// @covers: TextureCube
 pub fn texture_cube() -> Outcome {
 	// A CUBE IS SIX SQUARE FACES AND THE COUNT IS CHECKED. A description with five is not a cube map
 	// with one missing; it is a description of nothing, and a backend that accepted it would index
@@ -99,6 +178,7 @@ pub fn texture_cube() -> Outcome {
 	Ok(())
 }
 
+// @covers: Texture2DArray
 pub fn texture_2d_array() -> Outcome {
 	// AN ARRAY IS ADDRESSED BY AN EXPLICIT INDEX AND NOT BY A FILTERED COORDINATE, which is the
 	// difference between a 2D array and a 3D texture: there is no blending between layers.
@@ -120,6 +200,7 @@ pub fn texture_2d_array() -> Outcome {
 	Ok(())
 }
 
+// @covers: Texture3D
 pub fn texture_3d() -> Outcome {
 	// A 3D TEXTURE'S THIRD DIMENSION IS DEPTH AND NOT AN ARRAY, which the description says in the
 	// only way that matters: a 3D texture with layers is refused.
@@ -136,6 +217,7 @@ pub fn texture_3d() -> Outcome {
 	Ok(())
 }
 
+// @covers: Sampler
 pub fn sampler() -> Outcome {
 	// A SAMPLER IS SEPARATE FROM THE TEXTURE, which is what lets one image be read two ways in one
 	// frame. The same texture and two samplers answer differently, and that is the whole feature.
@@ -162,6 +244,7 @@ pub fn sampler() -> Outcome {
 	Ok(())
 }
 
+// @covers: Mipmaps
 pub fn mipmaps() -> Outcome {
 	// A MIP CHAIN IS A LENGTH THE EXTENT DECIDES, and a description claiming more levels than the
 	// extent has is refused rather than truncated.
@@ -179,6 +262,7 @@ pub fn mipmaps() -> Outcome {
 	Ok(())
 }
 
+// @covers: RenderTarget
 pub fn render_target() -> Outcome {
 	// A RENDER TARGET IS A VIEW WITH A LOAD AND A STORE, and what makes it a resource feature rather
 	// than a pass one is that the TEXTURE has to say it may be one: a description without the usage

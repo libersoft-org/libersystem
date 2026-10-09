@@ -13,11 +13,8 @@
 # The claims are markers in the source - `@handles:` on the code, `@covers:` on the test - so a
 # deleted handler takes its claim with it, which a registry beside the code would not.
 #
-# WHAT IS NOT PERFORMED TODAY, AND SAYS SO. No backend and no conformance suite exist yet; the first
-# two checks range over nothing and the tool prints NOT PERFORMED with the count awaiting a claim,
-# rather than printing a pass a reader would take for one. That is also why the scanner proves it
-# REFUSES before it is trusted to APPROVE: a clean tree says nothing about a scan that has stopped
-# matching.
+# Backends now implement all three profiles. Missing claims, including empty sets, fail this gate.
+# The scanner self-test proves those refusal paths as well as valid claims and prose exclusions.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

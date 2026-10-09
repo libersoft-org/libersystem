@@ -121,6 +121,7 @@ impl Surface {
 	/// the storage, the pitch, the alpha mode and the span - which is exactly right once per image and
 	/// is forty nanoseconds per PIXEL when a get builds one. This surface owns its storage, knows its
 	/// layout is the canonical one, and computes the offset itself.
+	#[inline]
 	pub fn get(&self, x: u32, y: u32) -> Rgba {
 		let Some(offset) = self.offset(x, y) else { return Rgba::TRANSPARENT };
 		let bytes = self.image.bytes();
@@ -128,6 +129,7 @@ impl Surface {
 		decode_half(pixel)
 	}
 
+	#[inline]
 	pub fn set(&mut self, x: u32, y: u32, value: Rgba) {
 		let Some(offset) = self.offset(x, y) else { return };
 		let bytes = self.image.bytes_mut();
@@ -211,6 +213,7 @@ impl Surface {
 	}
 
 	/// The byte offset of a pixel, or `None` when it is outside this surface.
+	#[inline]
 	fn offset(&self, x: u32, y: u32) -> Option<usize> {
 		let (local_x, local_y) = self.local(x, y)?;
 		let pitch = self.image.layout().pitch as usize;
@@ -221,6 +224,7 @@ impl Surface {
 		self.image.view()
 	}
 
+	#[inline]
 	fn local(&self, x: u32, y: u32) -> Option<(u32, u32)> {
 		let extent = self.image.layout().extent;
 		let local_x = x.checked_sub(self.origin.0)?;
@@ -286,11 +290,13 @@ impl Surface {
 /// which is a loss the conformance suite tolerated rather than wanted.
 const BYTES_PER_PIXEL: usize = 16;
 
+#[inline]
 fn decode_half(pixel: &[u8]) -> Rgba {
 	let channel = |index: usize| f32::from_le_bytes([pixel[index * 4], pixel[index * 4 + 1], pixel[index * 4 + 2], pixel[index * 4 + 3]]);
 	Rgba::new(channel(0), channel(1), channel(2), channel(3))
 }
 
+#[inline]
 fn encode_half(pixel: &mut [u8], value: Rgba) {
 	for (index, channel) in [value.red, value.green, value.blue, value.alpha].into_iter().enumerate() {
 		pixel[index * 4..index * 4 + 4].copy_from_slice(&channel.to_le_bytes());

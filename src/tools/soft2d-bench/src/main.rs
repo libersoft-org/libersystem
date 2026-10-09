@@ -70,18 +70,21 @@ struct Scene {
 /// space the same. COLOUR CONVERSION is what a wide-gamut source into an sRGB target and a YUV
 /// source from its planes cost, and two of its three kinds of draw cover the WHOLE FRAME. One number
 /// over the two says which of them is slow only by accident of how they were summed.
+///
+/// Budgets were frozen at the first accepted whole serial run on 2026-10-09, at the runner's
+/// reported millisecond precision. See docs/PERF.md; ceilings and fixture content did not change.
 const SCENES: [Scene; 5] = [
-	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 16.7, commands: 252, resources: 153 },
-	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 66.7, commands: 45, resources: 34 },
-	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 66.7, commands: 240, resources: 241 },
+	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 10.837, commands: 252, resources: 153 },
+	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 65.640, commands: 45, resources: 34 },
+	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 65.509, commands: 240, resources: 241 },
 	// BOTH CEILINGS ARE INHERITED FROM THE SCENE THESE CAME OUT OF AND NEITHER IS A NEW ANSWER. The
 	// owner was asked whether a video scene's ceiling is 60 Hz at this content or whether the scene
 	// is two scenes, and answered the second; that settles the split and leaves the first question
 	// open for `image-convert`, which is the half that draws two full frames through a transfer
 	// function and a matrix. `image-resample` at 16.7 is not in doubt - UI imagery at UI sizes is a
 	// per-frame cost.
-	Scene { name: "image-resample", ceiling_ms: 16.7, budget_ms: 16.7, commands: 11, resources: 1 },
-	Scene { name: "image-convert", ceiling_ms: 16.7, budget_ms: 16.7, commands: 14, resources: 2 },
+	Scene { name: "image-resample", ceiling_ms: 16.7, budget_ms: 13.414, commands: 11, resources: 1 },
+	Scene { name: "image-convert", ceiling_ms: 16.7, budget_ms: 16.063, commands: 14, resources: 2 },
 ];
 
 /// The images the scenes reference, under their recorded identities.
@@ -290,7 +293,7 @@ fn main() {
 		let allowed = scene.budget_ms.min(scene.ceiling_ms);
 		let met = median <= allowed;
 		failed |= check && !met;
-		println!("{}\t{}\t{}\t{prepare_ms:.3}\t{median:.3}\t{percentile:.3}\t{:.1}\t{:.1}\t{}\t{workers}\t{}\t{}", scene.name, scene.commands, scene.resources, scene.budget_ms, scene.ceiling_ms, if met { "met" } else { "OVER" }, prepared.lanes(), prepared.units());
+		println!("{}\t{}\t{}\t{prepare_ms:.3}\t{median:.3}\t{percentile:.3}\t{:.3}\t{:.1}\t{}\t{workers}\t{}\t{}", scene.name, scene.commands, scene.resources, scene.budget_ms, scene.ceiling_ms, if met { "met" } else { "OVER" }, prepared.lanes(), prepared.units());
 	}
 	if failed {
 		eprintln!("soft2d-bench: a scene is over its frozen budget");

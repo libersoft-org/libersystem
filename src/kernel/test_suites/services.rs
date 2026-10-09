@@ -1488,6 +1488,10 @@ mod display_harness {
 	}
 
 	pub(super) fn start(width: u32, height: u32) -> Harness {
+		start_with_brightness(width, height, None)
+	}
+
+	pub(super) fn start_with_brightness(width: u32, height: u32, brightness: Option<[Arc<Channel>; 3]>) -> Harness {
 		let init = init_package_bytes().expect("init package module not found");
 		let volume = volume_package_bytes().expect("volume package module not found");
 		let package = pkg::Package::parse(init).expect("init package parses");
@@ -1523,8 +1527,12 @@ mod display_harness {
 		// And the outputs root, which only the power policy is handed: none here.
 		boot_kernel.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
 		// And the brightness's two roots and the system-key stream, which the deployed system hands it: none here.
-		for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..]] {
-			boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
+		for (tag, index) in [(&b"BRIGHTNESS"[..], Some(0)), (&b"BRIGHTNESSCTL"[..], Some(1)), (&b"SYSKEYS"[..], None), (&b"BRIGHTCAT"[..], Some(2))] {
+			if let Some(endpoint) = brightness.as_ref().and_then(|endpoints| index.map(|index| &endpoints[index])) {
+				send_cap(&boot_kernel, tag, endpoint.clone(), Rights::ALL).expect("display brightness capability");
+			} else {
+				boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
+			}
 		}
 		sched::run_until_idle();
 		crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
@@ -1550,11 +1558,15 @@ mod display_harness {
 		sched::run_until_idle();
 		let online = boot_kernel.recv().expect("DisplayService online report");
 		assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
-		// THE BACKLIGHT SUBSCRIPTION, which the service makes once it is online: answered with nothing.
-		crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the backlight subscription with nothing");
 		Harness { console: console_client, focus: focus_input, kill: kill_input, stats: stats_root, admin: display_admin_channel, gpu: gpu_kernel, device_events: device_stream, scanout, service, boot: boot_kernel }
 	}
 }
+
+#[path = "display_brightness.rs"]
+mod display_brightness_tests;
+
+#[path = "display_3d_cleanup.rs"]
+mod display_3d_cleanup_tests;
 
 // `Memory` GOES FOR THE REASON THE IMAGE SUITE'S DOES: this test is about a display service
 // restoring a console surface, and it allocates on the way. What it CATCHES is already recorded in
@@ -2419,6 +2431,11 @@ fn audio_service_keeps_streams_through_driver_loss() {
 tagged_test!(audio_service_routes_streams_by_the_device_inventory, [Service, Audio, AudioService], id = "kernel.services.audio_service_routes_streams_by_the_device_inventory", covers = ["kernel", "bin.audio_service"]);
 fn audio_service_routes_streams_by_the_device_inventory() {
 	run_audio_service_scenario(AudioServiceScenario::Inventory);
+}
+
+tagged_test!(audio_service_separates_microphone_gain_without_changing_legacy_capture, [Service, Audio, AudioService], id = "kernel.services.audio_service_separates_microphone_gain_without_changing_legacy_capture", covers = ["kernel", "bin.audio_service", "audio-proto"]);
+fn audio_service_separates_microphone_gain_without_changing_legacy_capture() {
+	run_audio_service_scenario(AudioServiceScenario::MicrophoneVolume);
 }
 
 tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services", "bin.network_service"]);
@@ -3661,7 +3678,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	display_boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 	// And the outputs root, which only the power policy is handed: none here.
 	display_boot_kernel.send(Message::new(b"OUTPUTS".to_vec(), alloc::vec::Vec::new())).expect("display outputs bootstrap");
-	for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..]] {
+	for tag in [&b"BRIGHTNESS"[..], &b"BRIGHTNESSCTL"[..], &b"SYSKEYS"[..], &b"BRIGHTCAT"[..]] {
 		display_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("display brightness bootstrap");
 	}
 	sched::run_until_idle();
@@ -3686,7 +3703,6 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	sched::run_until_idle();
 	let online = display_boot_kernel.recv().expect("DisplayService online report");
 	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
-	crate::tests::serve_provider_catalogue_empty(&display_catalogue_server).expect("the catalogue answered the backlight subscription with nothing");
 
 	// Every synchronous present the console makes goes to the gpu and waits for the acknowledgement,
 	// so the stand-in gpu has to answer them or the console parks mid-frame. Drains whatever is

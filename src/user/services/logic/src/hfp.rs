@@ -92,6 +92,14 @@ const CALL: usize = 2;
 const CALLSETUP: usize = 3;
 const CALLHELD: usize = 4;
 
+/// An operator microphone update is committed only once its exact RFCOMM line fits the bounded open DLC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GainRefusal {
+	Closed,
+	Full,
+	Invalid,
+}
+
 /// ONE HEADSET'S GATEWAY.
 #[derive(Clone, Debug)]
 pub struct Gateway {
@@ -106,6 +114,8 @@ pub struct Gateway {
 	partial: Vec<u8>,
 	/// A voice session holds the link open: a headset's request for audio is taken only then.
 	audio_allowed: bool,
+	speaker_gain: u8,
+	microphone_gain: u8,
 }
 
 fn line(text: &str) -> Out {
@@ -132,7 +142,7 @@ fn number(text: &[u8]) -> Option<u32> {
 impl Gateway {
 	/// A gateway for a hands-free device, or - `headset_profile` - for one that speaks only the headset profile.
 	pub fn new(headset_profile: bool) -> Gateway {
-		Gateway { stage: if headset_profile { Stage::Connected } else { Stage::Features }, headset_profile, hf_features: 0, hf_codecs: [false; 3], reporting: false, call: Call::None, codec: None, partial: Vec::new(), audio_allowed: false }
+		Gateway { stage: if headset_profile { Stage::Connected } else { Stage::Features }, headset_profile, hf_features: 0, hf_codecs: [false; 3], reporting: false, call: Call::None, codec: None, partial: Vec::new(), audio_allowed: false, speaker_gain: 10, microphone_gain: 10 }
 	}
 
 	/// Whether the service level connection is up.
@@ -277,6 +287,7 @@ impl Gateway {
 			match number(value.as_bytes()).filter(|gain| *gain <= 15) {
 				Some(gain) => {
 					out.push(ok());
+					self.speaker_gain = gain as u8;
 					out.push(Out::Event(Event::SpeakerGain(gain as u8)));
 				}
 				None => out.push(error()),
@@ -285,6 +296,7 @@ impl Gateway {
 			match number(value.as_bytes()).filter(|gain| *gain <= 15) {
 				Some(gain) => {
 					out.push(ok());
+					self.microphone_gain = gain as u8;
 					out.push(Out::Event(Event::MicrophoneGain(gain as u8)));
 				}
 				None => out.push(error()),
@@ -345,7 +357,35 @@ impl Gateway {
 
 	/// The level AudioService set, as the speaker gain the headset applies itself.
 	pub fn set_speaker_gain(&mut self, gain: u8) -> Vec<Out> {
-		alloc::vec![line(&alloc::format!("+VGS: {}", gain.min(15)))]
+		self.speaker_gain = gain.min(15);
+		alloc::vec![line(&alloc::format!("+VGS: {}", self.speaker_gain))]
+	}
+
+	/// The two headset gains are independent, including changes received before its endpoint is offered.
+	pub fn speaker_gain(&self) -> u8 {
+		self.speaker_gain
+	}
+
+	pub fn microphone_gain(&self) -> u8 {
+		self.microphone_gain
+	}
+
+	/// Queue the independent microphone update before changing local state. No credits permits bounded queueing;
+	/// a full queue or a closed DLC refuses the whole update, preserving the previous gain.
+	pub fn queue_microphone_gain(&mut self, gain: u8, session: &mut crate::rfcomm::Session, channel: u8) -> Result<Vec<crate::rfcomm::Out>, GainRefusal> {
+		if gain > 15 {
+			return Err(GainRefusal::Invalid);
+		}
+		if !session.dlc(channel).is_some_and(|dlc| dlc.state == crate::rfcomm::DlcState::Open) {
+			return Err(GainRefusal::Closed);
+		}
+		let bytes = alloc::format!("\r\n+VGM: {gain}\r\n");
+		if session.room(channel) < bytes.len() {
+			return Err(GainRefusal::Full);
+		}
+		let out = session.write(channel, bytes.as_bytes()).ok_or(GainRefusal::Closed)?;
+		self.microphone_gain = gain;
+		Ok(out)
 	}
 }
 

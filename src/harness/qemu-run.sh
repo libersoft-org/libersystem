@@ -38,6 +38,9 @@
 #   SPICE_ADDR= SPICE bind address (default 0.0.0.0 - every interface, unauthenticated; see below)
 #   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
+#   AUDIO_OUT_VOICES=N  explicit positive output-voice count for the none audio backend only
+#             (default unchanged; refused with AUDIO_WAV or SPICE). Independent emulated cards
+#             need separate voices when a crash leaves one active without supplying samples.
 #   QEMU_EXTRA= extra QEMU arguments
 #   ENTROPY=1   a `virtio-rng-pci` on an aarch64 or riscv64 run outside the suite, which has its own: neither port has
 #               a random instruction, so without a device `SYS_RANDOM_GET` refuses - and a hibernation's keys are drawn
@@ -45,10 +48,11 @@
 #   RUN_DISK=   a system disk that outlives the run: created if absent - from the volume the medium is
 #               paired with, where there is one - and used as it is if present, so two boots can share
 #               one disk for a cold-reboot proof
-#   SYSTEM_DISK= virtio | nvme | ahci | virtio-scsi - the controller the x86_64 system disk sits behind (default
+#   SYSTEM_DISK= virtio | nvme | ahci | virtio-scsi - the controller the system disk sits behind (default
 #               virtio). The others are how a gate boots the system from a disk that is not virtio-blk: the
 #               same disk, on a controller of its own, so the scratch media the suite attaches stay where
-#               its oracles look for them
+#               its oracles look for them. On aarch64/riscv64, an explicit value also selects the paired
+#               bootable volume; without it the ordinary unpaired port boot is unchanged.
 #   LIBER_RUN_MODE=test|development|public|gate
 #             THE RUN MODE, and the one carrier of it. It is REQUIRED: the outermost entry point
 #             that knows sets it - `test.sh` says `test`, `run.sh` says `public`, the lab says
@@ -208,12 +212,26 @@ qemu_append_watchdog_action() {
 # QEMU refuses to start on that. An interactive aarch64 or riscv64 boot could not come up.
 qemu_append_audio() {
 	local -n audio_args="$1"
+	local output_voices="${AUDIO_OUT_VOICES-}" voice_option=""
+	if [[ ${AUDIO_OUT_VOICES+x} == x ]]; then
+		# QEMU stores its HW-voice budget in a signed int. Validate before arithmetic
+		# and before appending arguments, including an explicitly empty override.
+		if [[ ! "$output_voices" =~ ^[1-9][0-9]*$ || ${#output_voices} -gt 10 ]] || ((10#$output_voices > 2147483647)); then
+			echo "qemu-run: AUDIO_OUT_VOICES must be a decimal integer from 1 to 2147483647" >&2
+			exit 2
+		fi
+		if [[ -n "${AUDIO_WAV:-}" || "$want_spice" == "1" ]]; then
+			echo "qemu-run: AUDIO_OUT_VOICES is supported only by the none backend, not WAV or SPICE" >&2
+			exit 2
+		fi
+		voice_option=",out.voices=$output_voices"
+	fi
 	if [[ -n "${AUDIO_WAV:-}" ]]; then
 		audio_args+=(-audiodev "wav,id=snd0,path=$AUDIO_WAV")
 	elif [[ "$want_spice" == "1" ]]; then
 		audio_args+=(-audiodev "spice,id=snd0")
 	else
-		audio_args+=(-audiodev "none,id=snd0")
+		audio_args+=(-audiodev "none,id=snd0$voice_option")
 	fi
 }
 
@@ -657,7 +675,7 @@ qemu_attach_system_disk() {
 	virtio) qemu_attach_virtio_blk system_args "$file" vblk "$legacy" ;;
 	nvme) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "nvme,drive=vblk,serial=libersystem-system") ;;
 	ahci) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "ahci,id=systemsata" -device "ide-hd,drive=vblk,bus=systemsata.0") ;;
-	virtio-scsi) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "virtio-scsi-pci,id=systemscsi" -device "scsi-hd,drive=vblk,bus=systemscsi.0") ;;
+	virtio-scsi) system_args+=(-drive "file=$file,if=none,id=vblk,format=raw" -device "virtio-scsi-pci,id=systemscsi${legacy:+,$legacy}" -device "scsi-hd,drive=vblk,bus=systemscsi.0") ;;
 	*)
 		echo "qemu-run: SYSTEM_DISK=${SYSTEM_DISK} is none of virtio, nvme, ahci, virtio-scsi" >&2
 		return 1
@@ -1524,9 +1542,31 @@ dma_independent_dtb_args() {
 #
 # Signed with the published test key, through the tool that owns it. A build that cannot sign is a
 # build that stops here rather than staging a medium whose signed manifest is missing or stale.
+# An explicit controller fixture boots the architecture's signed bootable volume. Ordinary port
+# boots keep the existing zero pairing; a missing/mismatched fixture is refused before QEMU starts.
+qemu_port_volume_pairing() {
+	local arch="$1" pairing=00000000000000000000000000000000
+	if [[ -n "${SYSTEM_DISK:-}" ]]; then
+		local volume="$QEMU_BUILD_DIR/system-volume-bootable-$arch.img"
+		local uuid="$QEMU_BUILD_DIR/system-volume-bootable-$arch.uuid"
+		if [[ ! -f "$volume" || ! -f "$uuid" ]]; then
+			echo "qemu-run: SYSTEM_DISK requires the paired bootable volume and UUID for $arch (build --arch $arch --kernel-on-volume)" >&2
+			return 1
+		fi
+		source "$REPO_ROOT/src/tools/volume-pairing.sh"
+		pairing="$(tr -d '[:space:]-' <"$uuid" | tr 'A-F' 'a-f')"
+		if [[ ! "$pairing" =~ ^[0-9a-f]{32}$ || "$pairing" == 00000000000000000000000000000000 ]] || ! pairing_matches_volume "$pairing" "$volume"; then
+			echo "qemu-run: the $arch bootable volume and its pairing UUID do not agree" >&2
+			return 1
+		fi
+	fi
+	printf '%s\n' "$pairing"
+}
+
 stage_signed_boot_manifest() {
 	local esp="$1" bootstrap="$2" arch="$3" package="${4:-}"
-	local out="$QEMU_BUILD_DIR/boot.manifest2.$$"
+	local out="$QEMU_BUILD_DIR/boot.manifest2.$$" pairing
+	pairing="$(qemu_port_volume_pairing "$arch")" || exit 1
 	# The release the manifest names, out of the one file that holds it.
 	local PRODUCT_VERSION_FOR_MANIFEST
 	PRODUCT_VERSION_FOR_MANIFEST="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$HERE/../../product.conf")"
@@ -1553,7 +1593,7 @@ stage_signed_boot_manifest() {
 	(cd "$HERE/../tools/sign-manifest" && cargo run --quiet -- \
 		--profile test-trust --product LiberSystem --arch "$arch" --source boot-medium \
 		--release "$PRODUCT_VERSION_FOR_MANIFEST" --dma-mode harness \
-		--volume-uuid 00000000000000000000000000000000 \
+		--volume-uuid "$pairing" \
 		"${rows[@]}" --out "$out") >&2 || {
 		echo "qemu-run: the boot medium's manifest could not be signed" >&2
 		exit 1
@@ -2679,12 +2719,20 @@ qemu_run_aarch64() {
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
-		local run_disk
-		run_disk="$(qemu_run_system_disk "$virtio_disk")" || {
+		local run_disk paired_volume=""
+		if [[ -n "${SYSTEM_DISK:-}" ]]; then
+			qemu_port_volume_pairing aarch64 >/dev/null || exit 1
+			paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-aarch64.img"
+		fi
+		run_disk="$(qemu_run_system_disk "${paired_volume:-$virtio_disk}" "$paired_volume")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
-		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "$virtio_opts"
+		if [[ -n "${SYSTEM_DISK:-}" ]]; then
+			qemu_attach_system_disk qemu_args "$run_disk" "$virtio_opts" || exit 1
+		else
+			qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "$virtio_opts"
+		fi
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
@@ -3067,12 +3115,20 @@ qemu_run_riscv64() {
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-riscv64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
-		local run_disk
-		run_disk="$(qemu_run_system_disk "$virtio_disk")" || {
+		local run_disk paired_volume=""
+		if [[ -n "${SYSTEM_DISK:-}" ]]; then
+			qemu_port_volume_pairing riscv64 >/dev/null || exit 1
+			paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-riscv64.img"
+		fi
+		run_disk="$(qemu_run_system_disk "${paired_volume:-$virtio_disk}" "$paired_volume")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
-		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "$virtio_opts"
+		if [[ -n "${SYSTEM_DISK:-}" ]]; then
+			qemu_attach_system_disk qemu_args "$run_disk" "$virtio_opts" || exit 1
+		else
+			qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "$virtio_opts"
+		fi
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.

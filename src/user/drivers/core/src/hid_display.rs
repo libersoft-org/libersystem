@@ -40,6 +40,8 @@ pub const EDID_HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
 pub struct Map {
 	/// The writable Brightness, preferring a Feature report, which GET_REPORT can also read back.
 	pub brightness: Option<FieldInfo>,
+	/// Unsolicited changes made with the monitor's own controls.
+	pub brightness_input: Option<FieldInfo>,
 	/// The EDID Information bytes of one Feature report, in order.
 	pub edid: Vec<FieldInfo>,
 	/// The illuminance reading, preferring an Input report, which the device sends as the light changes.
@@ -61,7 +63,8 @@ impl Map {
 
 /// The map of a descriptor, or `None` for one that is neither a monitor with a brightness nor an ambient-light sensor.
 pub fn map(table: &FieldTable) -> Option<Map> {
-	let brightness = [ReportKind::Feature, ReportKind::Output].into_iter().find_map(|kind| table.fields.iter().find(|info| info.usage == BRIGHTNESS && info.kind == kind).copied());
+	let brightness = [ReportKind::Feature, ReportKind::Output].into_iter().find_map(|kind| table.fields.iter().find(|info| info.usage == BRIGHTNESS && info.application == (PAGE_MONITOR << 16 | 1) && info.kind == kind).copied());
+	let brightness_input = table.fields.iter().find(|info| info.usage == BRIGHTNESS && info.application == (PAGE_MONITOR << 16 | 1) && info.kind == ReportKind::Input).copied();
 	let mut edid: Vec<FieldInfo> = Vec::new();
 	if let Some(first) = table.fields.iter().find(|info| info.usage == EDID_INFORMATION && info.kind == ReportKind::Feature && info.size == 8) {
 		edid = table.fields.iter().filter(|info| info.usage == EDID_INFORMATION && info.kind == ReportKind::Feature && info.size == 8 && info.report_id == first.report_id).copied().collect();
@@ -73,7 +76,7 @@ pub fn map(table: &FieldTable) -> Option<Map> {
 		return None;
 	}
 	let property = |usage: u32| table.fields.iter().find(|info| info.kind == ReportKind::Feature && info.array && info.collection == usage).copied();
-	Some(Map { brightness, edid, illuminance, reporting_state: property(REPORTING_STATE), power_state: property(POWER_STATE) })
+	Some(Map { brightness, brightness_input, edid, illuminance, reporting_state: property(REPORTING_STATE), power_state: property(POWER_STATE) })
 }
 
 /// A field's raw bits as its logical value - sign-extended where its logical range goes below zero.

@@ -260,9 +260,9 @@ impl TextureViewDesc {
 	/// Whether two views of ONE texture reach the same texels. The question every hazard rule below
 	/// is really about: sampling mip 2 while rendering into mip 0 is not a conflict.
 	pub fn overlaps(&self, other: &Self) -> bool {
-		let mips = self.base_mip < other.base_mip + other.mip_count && other.base_mip < self.base_mip + self.mip_count;
-		let layers = self.base_layer < other.base_layer + other.layer_count && other.base_layer < self.base_layer + self.layer_count;
-		let aspects = matches!((self.aspect, other.aspect), (Aspect::Colour, Aspect::Colour) | (Aspect::Depth, Aspect::Depth | Aspect::DepthAndStencil) | (Aspect::Stencil, Aspect::Stencil | Aspect::DepthAndStencil) | (Aspect::DepthAndStencil, _));
+		let mips = (self.base_mip as u64) < other.base_mip as u64 + other.mip_count as u64 && (other.base_mip as u64) < self.base_mip as u64 + self.mip_count as u64;
+		let layers = (self.base_layer as u64) < other.base_layer as u64 + other.layer_count as u64 && (other.base_layer as u64) < self.base_layer as u64 + self.layer_count as u64;
+		let aspects = matches!((self.aspect, other.aspect), (Aspect::Colour, Aspect::Colour) | (Aspect::Depth, Aspect::Depth | Aspect::DepthAndStencil) | (Aspect::Stencil, Aspect::Stencil | Aspect::DepthAndStencil) | (Aspect::DepthAndStencil, Aspect::Depth | Aspect::Stencil | Aspect::DepthAndStencil));
 		mips && layers && aspects
 	}
 }
@@ -433,6 +433,14 @@ impl RenderTargetSet<'_> {
 				return Err(Error::TargetMismatch { reason: AttachmentFault::ExtentMismatch { width: destination.width, height: destination.height, expected_width: width, expected_height: height } });
 			}
 		}
+		// All simultaneous destinations participate, including the depth plane and resolves.
+		// Compare subresources rather than whole textures: separate cube faces/mips may share a pass.
+		let writes = || self.colour.iter().map(|view| (view.texture, &view.view)).chain(self.depth_stencil.as_ref().map(|view| (view.texture, &view.view))).chain(self.resolve.iter().flatten().map(|view| (view.texture, &view.view)));
+		for (index, (texture, view)) in writes().enumerate() {
+			if writes().take(index).any(|(other_texture, other_view)| texture == other_texture && view.overlaps(other_view)) {
+				return Err(Error::TargetMismatch { reason: AttachmentFault::ResolveMismatch { reason: "two writable attachment views overlap in one pass" } });
+			}
+		}
 		Ok(())
 	}
 }
@@ -445,7 +453,7 @@ impl RenderTargetSet<'_> {
 /// this hazard, and refusing it would refuse a legitimate and common thing.
 pub fn refuse_sampled_attachment(sampled: &[(u32, TextureViewDesc)], targets: &RenderTargetSet<'_>) -> Result<(), Error> {
 	for (texture, view) in sampled {
-		for attachment in targets.colour {
+		for attachment in targets.colour.iter().chain(targets.resolve.iter().flatten()) {
 			if attachment.texture == *texture && view.overlaps(&attachment.view) {
 				return Err(Error::TargetMismatch { reason: AttachmentFault::ResolveMismatch { reason: "a texture sampled while it is an attachment of the same pass has no defined value" } });
 			}
@@ -472,3 +480,7 @@ pub fn refuse_write_in_flight(in_flight: bool) -> Result<(), Error> {
 fn bytes_per_texel(format: &'static str) -> Result<u64, Error> {
 	graphics_profile::render3d_spec::COLOUR_FORMATS.iter().find(|entry| entry.name == format).map(|entry| (entry.bits_per_texel as u64).div_ceil(8)).ok_or(Error::UnsupportedFormat { format, used_as: "a texture format" })
 }
+
+#[cfg(test)]
+#[path = "resource/alias_tests.rs"]
+mod alias_tests;

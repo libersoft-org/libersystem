@@ -22,15 +22,30 @@ cd "$root/.."
 source "$root/tools/guest-gate.sh"
 
 guest_gate_arch "$@"
-[[ "$GUEST_ARCH" == x86_64 ]] || guest_gate_fail "the system disk's controller is chosen on x86_64 runs only (SYSTEM_DISK)"
 
 fail() { guest_gate_fail "$@"; }
 
-bootable="$root/../.build/boot/system-volume-bootable-x86_64.img"
-template="$root/../.build/boot/system-volume-x86_64.img"
-[[ -f "$bootable" ]] || fail "there is no bootable system volume beside the image - build it:  ./image.sh"
-[[ -f "$template" ]] || fail "there is no unpaired system volume to use as the decoy - build it:  ./image.sh"
+bootable="$root/../.build/boot/system-volume-bootable-$GUEST_ARCH.img"
+template="$root/../.build/boot/system-volume-$GUEST_ARCH.img"
+[[ -f "$bootable" ]] || fail "there is no bootable system volume beside the image - build it:  LIBER_DEVELOPMENT=1 ./build.sh --arch $GUEST_ARCH --kernel-on-volume"
+[[ -f "$template" ]] || fail "there is no unpaired system volume to use as the decoy - build it:  LIBER_DEVELOPMENT=1 ./build.sh --arch $GUEST_ARCH --kernel-on-volume"
 export NET_NONE=1
+# The ports need the emulated boot budget; their six boots prove the same effects as x86_64.
+served_seconds=150 served_timeout=200 decoy_seconds=120 decoy_timeout=170 refused_seconds=90 refused_timeout=120
+if [[ "$GUEST_ARCH" != x86_64 ]]; then
+	served_seconds=600 served_timeout=900 decoy_seconds=600 decoy_timeout=900 refused_seconds=600 refused_timeout=900
+fi
+kept="$root/../.build/logs/boot-volume-controllers-$GUEST_ARCH"
+mkdir -p "$kept"
+keep_evidence() {
+	local status=$? name
+	for name in nvme-first nvme-second ahci-first ahci-second decoy fallback guest run driver; do
+		[[ ! -f "$guest_gate_work/$name" ]] || cp "$guest_gate_work/$name" "$kept/$name.log"
+	done
+	guest_gate_cleanup
+	return "$status"
+}
+trap keep_evidence EXIT
 
 expect() {
 	local lines="$1" line="$2" why="$3"
@@ -59,7 +74,7 @@ system_device() {
 # ---- 1. per controller: write through it, power off, read it back cold.
 for bus in nvme ahci; do
 	export SYSTEM_DISK="$bus" RUN_DISK="$guest_gate_work/$bus-system.img"
-	export GUEST_GATE_SECONDS=150 GUEST_GATE_TIMEOUT=200
+	export GUEST_GATE_SECONDS="$served_seconds" GUEST_GATE_TIMEOUT="$served_timeout"
 	proof="written-through-$bus"
 	guest_gate_run $'lsblk\nwrite boot-volume-proof.txt '"$proof"$'\ncat boot-volume-proof.txt\npoweroff' ""
 	first="$guest_gate_work/$bus-first"
@@ -85,7 +100,7 @@ done
 cp --reflink=auto "$template" "$guest_gate_work/decoy.img"
 export SYSTEM_DISK=nvme RUN_DISK="$guest_gate_work/decoy-system.img"
 export QEMU_EXTRA="-drive file=$guest_gate_work/decoy.img,if=none,id=decoy,format=raw -device virtio-blk-pci,drive=decoy"
-export GUEST_GATE_SECONDS=120 GUEST_GATE_TIMEOUT=170
+export GUEST_GATE_SECONDS="$decoy_seconds" GUEST_GATE_TIMEOUT="$decoy_timeout"
 guest_gate_run $'lsblk\npoweroff' ""
 unset QEMU_EXTRA
 decoy="$guest_gate_work/decoy"
@@ -100,7 +115,7 @@ echo "boot-volume-controllers: the paired volume on NVMe was chosen over an unpa
 
 # ---- 3. the fallback: the paired volume where no driver bound before it can reach it.
 export SYSTEM_DISK=virtio-scsi RUN_DISK="$guest_gate_work/scsi-system.img"
-export GUEST_GATE_SECONDS=90 GUEST_GATE_TIMEOUT=120
+export GUEST_GATE_SECONDS="$refused_seconds" GUEST_GATE_TIMEOUT="$refused_timeout"
 guest_gate_run $'lsblk' ""
 fallback="$guest_gate_work/fallback"
 cp "$GUEST_LINES" "$fallback"
@@ -110,4 +125,4 @@ if grep -aqF "StorageService: online (vol://system)" "$fallback"; then
 fi
 echo "boot-volume-controllers: the paired volume behind virtio-scsi was refused by name, and nothing else was served as vol://system"
 
-echo "boot-volume-controllers: PASS - the system volume served, written, and read back after a cold reboot through NVMe and through AHCI with lsblk naming each; chosen by its pairing over a decoy; refused by name where no driver bound before it reaches it"
+echo "boot-volume-controllers: PASS on $GUEST_ARCH - the system volume served, written, and read back after a cold reboot through NVMe and through AHCI with lsblk naming each; chosen by its pairing over a decoy; refused by name where no driver bound before it reaches it"

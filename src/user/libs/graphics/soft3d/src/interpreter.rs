@@ -138,6 +138,75 @@ impl Machine {
 	pub fn outputs(&self) -> &Outputs {
 		&self.outputs
 	}
+
+	pub(crate) fn reserved_bytes(&self) -> usize {
+		fn storage<T>(values: &Vec<T>) -> usize {
+			values.capacity() * core::mem::size_of::<T>()
+		}
+		storage(&self.words) + storage(&self.len) + storage(&self.kinds) + self.kinds.iter().map(crate::value::type_reserved_bytes).sum::<usize>() + storage(&self.wide) + self.wide.iter().flatten().map(storage).sum::<usize>() + storage(&self.stamp) + storage(&self.outputs.varyings) + storage(&self.outputs.colour) + storage(&self.outputs.integer) + self.outputs.position.as_ref().map_or(0, Val::reserved_bytes) + self.outputs.varyings.iter().chain(&self.outputs.colour).map(|(_, value)| value.reserved_bytes()).sum::<usize>()
+	}
+
+	/// Reserve every register and output slot before a lane can receive its first fragment.
+	/// A parked lane may first get covered pixels long after the frame's warmup, and shader
+	/// branches may write outputs that the initial pose never reached.
+	pub(crate) fn reserve(&mut self, module: &Module) -> Result<(), render3d::Error> {
+		fn storage<T>(values: &mut Vec<T>, count: usize) -> Result<(), render3d::Error> {
+			if values.capacity() < count {
+				let bytes = count.checked_mul(core::mem::size_of::<T>()).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+				values.try_reserve_exact(count.saturating_sub(values.len())).map_err(|_| render3d::Error::OutOfMemory { bytes: bytes as u64 })?;
+			}
+			Ok(())
+		}
+		fn outputs(body: &[Stmt]) -> Result<[usize; 3], render3d::Error> {
+			let mut total = [0usize; 3];
+			for statement in body {
+				let mut add = [0; 3];
+				match statement {
+					Stmt::Store(render_shader::ir::Output::Varying(_), _) => add[0] = 1,
+					Stmt::Store(render_shader::ir::Output::Colour(_), _) => add[1] = 1,
+					Stmt::Store(render_shader::ir::Output::Integer(_), _) => add[2] = 1,
+					Stmt::If { then_body, else_body, .. } => {
+						let a = outputs(then_body)?;
+						let b = outputs(else_body)?;
+						for i in 0..3 {
+							add[i] = a[i].max(b[i]);
+						}
+					}
+					Stmt::Switch { cases, default, .. } => {
+						add = outputs(default)?;
+						for (_, body) in cases {
+							let count = outputs(body)?;
+							for i in 0..3 {
+								add[i] = add[i].max(count[i]);
+							}
+						}
+					}
+					Stmt::Loop { trips, body } => {
+						add = outputs(body)?;
+						for count in &mut add {
+							*count = count.checked_mul(*trips as usize).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+						}
+					}
+					_ => {}
+				}
+				for i in 0..3 {
+					total[i] = total[i].checked_add(add[i]).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+				}
+			}
+			Ok(total)
+		}
+		let count = module.types.len();
+		let words = count.checked_mul(STRIDE).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+		storage(&mut self.kinds, count)?;
+		storage(&mut self.words, words)?;
+		storage(&mut self.len, count)?;
+		storage(&mut self.wide, count)?;
+		storage(&mut self.stamp, count)?;
+		let [varyings, colour, integer] = outputs(&module.body)?;
+		storage(&mut self.outputs.varyings, varyings)?;
+		storage(&mut self.outputs.colour, colour)?;
+		storage(&mut self.outputs.integer, integer)
+	}
 }
 
 /// Run one stage into a machine the caller keeps.
@@ -167,15 +236,10 @@ pub fn execute_into(module: &Module, resources: &dyn Resources, machine: &mut Ma
 		machine.run = 1;
 	}
 	machine.outputs.clear();
-	let mut state = Run { resources, words: core::mem::take(&mut machine.words), len: core::mem::take(&mut machine.len), kinds: core::mem::take(&mut machine.kinds), wide: core::mem::take(&mut machine.wide), stamp: core::mem::take(&mut machine.stamp), run: machine.run, outputs: core::mem::take(&mut machine.outputs) };
-	let outcome = state.body(&module.body);
-	machine.words = state.words;
-	machine.len = state.len;
-	machine.kinds = state.kinds;
-	machine.wide = state.wide;
-	machine.stamp = state.stamp;
-	machine.outputs = state.outputs;
-	outcome.map(|_| ())
+	// Borrow the prepared storage for this invocation. Moving six owned fields out and back for
+	// every fragment copies their headers and the entire Outputs value without changing ownership.
+	let mut state = Run { resources, machine };
+	state.body(&module.body).map(|_| ())
 }
 
 /// Run one stage. ALLOCATES A MACHINE - a fixture, or a one-off. A renderer uses `execute_into`.
@@ -206,13 +270,7 @@ enum Flow {
 
 struct Run<'a> {
 	resources: &'a dyn Resources,
-	words: Vec<u32>,
-	len: Vec<u8>,
-	kinds: Vec<Type>,
-	wide: Vec<Option<Vec<u32>>>,
-	stamp: Vec<u32>,
-	run: u32,
-	outputs: Outputs,
+	machine: &'a mut Machine,
 }
 
 impl Run<'_> {
@@ -272,7 +330,7 @@ impl Run<'_> {
 			Stmt::Continue => Ok(Flow::Continue),
 			Stmt::Return => Ok(Flow::Return),
 			Stmt::Discard => {
-				self.outputs.discarded = true;
+				self.machine.outputs.discarded = true;
 				// A DISCARD ENDS THE STAGE. Continuing would run stores whose results are thrown
 				// away, and a texture read among them would be work a discarded fragment paid for.
 				Ok(Flow::Return)
@@ -283,13 +341,13 @@ impl Run<'_> {
 	fn store(&mut self, output: render_shader::ir::Output, value: Val) {
 		use render_shader::ir::Output;
 		match output {
-			Output::Position => self.outputs.position = Some(value),
-			Output::PointSize => self.outputs.point_size = Some(value.f32_at(0)),
-			Output::Varying(location) => self.outputs.varyings.push((location, value)),
-			Output::Colour(index) => self.outputs.colour.push((index, value)),
-			Output::Integer(index) => self.outputs.integer.push((index, value.u32_at(0))),
-			Output::Depth => self.outputs.depth = Some(value.f32_at(0)),
-			Output::SampleMask => self.outputs.sample_mask = Some(value.u32_at(0)),
+			Output::Position => self.machine.outputs.position = Some(value),
+			Output::PointSize => self.machine.outputs.point_size = Some(value.f32_at(0)),
+			Output::Varying(location) => self.machine.outputs.varyings.push((location, value)),
+			Output::Colour(index) => self.machine.outputs.colour.push((index, value)),
+			Output::Integer(index) => self.machine.outputs.integer.push((index, value.u32_at(0))),
+			Output::Depth => self.machine.outputs.depth = Some(value.f32_at(0)),
+			Output::SampleMask => self.machine.outputs.sample_mask = Some(value.u32_at(0)),
 		}
 	}
 
@@ -308,42 +366,42 @@ impl Run<'_> {
 		// earlier stamp, so reading a value this run never wrote is the same refusal it always was -
 		// and a module that reads one is a module the validator should have refused, which is why
 		// this is a fault rather than a zero.
-		if self.stamp.get(slot).copied() != Some(self.run) {
+		if self.machine.stamp.get(slot).copied() != Some(self.machine.run) {
 			return Err(Fault::Unassigned { value: value.0 });
 		}
-		let kind = self.kinds.get(slot).ok_or(Fault::Unassigned { value: value.0 })?;
-		if let Some(wide) = self.wide.get(slot).and_then(|held| held.as_ref()) {
+		let kind = self.machine.kinds.get(slot).ok_or(Fault::Unassigned { value: value.0 })?;
+		if let Some(wide) = self.machine.wide.get(slot).and_then(|held| held.as_ref()) {
 			return Ok(Reg::new(kind, wide));
 		}
 		let start = slot * STRIDE;
-		let end = start + self.len[slot] as usize;
-		Ok(Reg::new(kind, &self.words[start..end]))
+		let end = start + self.machine.len[slot] as usize;
+		Ok(Reg::new(kind, &self.machine.words[start..end]))
 	}
 
 	/// Write a value into a slot. THE WORDS THE OPERATION COMPUTED AND NOTHING ELSE: a four-component
 	/// value copies sixteen bytes here, where returning one through a `Val` copied about a hundred
 	/// and eighty.
 	fn put(&mut self, slot: usize, kind: Type, words: &[u32]) -> Result<(), Fault> {
-		if slot >= self.kinds.len() {
+		if slot >= self.machine.kinds.len() {
 			return Err(Fault::TypeMismatch);
 		}
 		if words.len() > STRIDE {
 			// ALLOC-OK: an array uniform, loaded once per stage. Everything a shader COMPUTES fits
 			// the stride, which is what makes the arena the hot path and this the cold one.
-			self.wide[slot] = Some(words.to_vec());
-			self.len[slot] = 0;
+			self.machine.wide[slot] = Some(words.to_vec());
+			self.machine.len[slot] = 0;
 		} else {
 			// TOUCHED ONLY WHEN IT HOLDS SOMETHING, so the ordinary assignment does not pay for the
 			// fallback's existence.
-			if self.wide[slot].is_some() {
-				self.wide[slot] = None;
+			if self.machine.wide[slot].is_some() {
+				self.machine.wide[slot] = None;
 			}
 			let start = slot * STRIDE;
-			self.words[start..start + words.len()].copy_from_slice(words);
-			self.len[slot] = words.len() as u8;
+			self.machine.words[start..start + words.len()].copy_from_slice(words);
+			self.machine.len[slot] = words.len() as u8;
 		}
-		self.kinds[slot] = kind;
-		self.stamp[slot] = self.run;
+		self.machine.kinds[slot] = kind;
+		self.machine.stamp[slot] = self.machine.run;
 		Ok(())
 	}
 

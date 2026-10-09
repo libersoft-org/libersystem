@@ -34,6 +34,7 @@ use graphics_core::pixel::Rgba;
 pub const LANES: usize = 4;
 
 /// Composite a run of source pixels onto a run of destination pixels.
+// @handles: CompositeClear, CompositeSource, CompositeDestination, CompositeSourceOver, CompositeDestinationOver, CompositeSourceIn, CompositeDestinationIn, CompositeSourceOut, CompositeDestinationOut, CompositeSourceAtop, CompositeDestinationAtop, CompositeXor, CompositePlus
 pub fn composite_span(destination: &mut [Rgba], source: &[Rgba], operator: Operator, blend: BlendMode) {
 	if matches!(operator, Operator::SrcOver) && matches!(blend, BlendMode::Normal) {
 		composite_span_over(destination, source);
@@ -43,6 +44,7 @@ pub fn composite_span(destination: &mut [Rgba], source: &[Rgba], operator: Opera
 }
 
 /// THE REFERENCE. Every path above agrees with this one or is a defect.
+// @handles: BlendMultiply, BlendScreen, BlendOverlay, BlendDarken, BlendLighten, BlendColorDodge, BlendColorBurn, BlendHardLight, BlendSoftLight, BlendDifference, BlendExclusion, BlendHue, BlendSaturation, BlendColor, BlendLuminosity
 pub fn composite_span_scalar(destination: &mut [Rgba], source: &[Rgba], operator: Operator, blend: BlendMode) {
 	for (slot, value) in destination.iter_mut().zip(source.iter()) {
 		*slot = composite(operator, blend, *value, *slot);

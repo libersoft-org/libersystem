@@ -399,6 +399,7 @@ impl Stack {
 		{
 			attempt.state = PairingState::Bonded;
 			attempt.security = security_of(&level);
+			attempt.peer = identity;
 		}
 		controller.le.legacy = None;
 		if let Some(irk) = bonded.irk {

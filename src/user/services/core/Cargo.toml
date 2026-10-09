@@ -583,3 +583,8 @@ opt-level = 2
 # `build-std`'s `core` and `compiler_builtins` too, where a warning is not ours to answer.
 [lints.rust]
 warnings = "deny"
+
+[[bin]]
+name = "uvccheck"
+path = "src/uvccheck.rs"
+required-features = ["development"]

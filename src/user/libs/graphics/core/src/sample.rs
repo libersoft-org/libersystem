@@ -85,6 +85,8 @@ pub struct Sampler<'a> {
 	/// channels. A sampler is built once per image per frame; all of that is the same answer every
 	/// time.
 	packed: Option<Packed>,
+	/// Prepared linear-half images need neither a format dispatch nor a decoder at each tap.
+	working_half: Option<WorkingHalf<'a>>,
 }
 
 /// The constants a packed fetch needs, so it is an offset and a read.
@@ -130,7 +132,8 @@ impl<'a> Sampler<'a> {
 			(PixelStorage::Known(format), bytes_per_pixel, Some(_)) if bytes_per_pixel > 0 => Some(Packed { format, pitch: layout.pitch as usize, bytes_per_pixel: bytes_per_pixel as usize, top_left: matches!(layout.origin, RowOrigin::TopLeft), height: layout.extent.height }),
 			_ => None,
 		};
-		Ok(Self { source: Source::Packed(view), decoder, spread, table, packed })
+		let working_half = if decoder.is_identity() && layout.storage == PixelStorage::Known(PixelFormat::R16G16B16A16Float) { Some(WorkingHalf { bytes: view.bytes(), pitch: layout.pitch as usize, extent: layout.extent, top_left: matches!(layout.origin, RowOrigin::TopLeft) }) } else { None };
+		Ok(Self { source: Source::Packed(view), decoder, spread, table, packed, working_half })
 	}
 
 	/// A sampler over PLANES.
@@ -141,7 +144,7 @@ impl<'a> Sampler<'a> {
 	pub fn planar(view: crate::planar::MultiPlaneView<'a>, working: Working, spread: Spread, table: Option<&'a TransferTable>) -> Result<Self, Error> {
 		let semantics = ImageSemantics::Color { color_space: view.layout().color_space, alpha_mode: AlphaMode::Opaque };
 		let decoder = Decoder::new(&semantics, working)?;
-		Ok(Self { source: Source::Planar(view), decoder, spread, table, packed: None })
+		Ok(Self { source: Source::Planar(view), decoder, spread, table, packed: None, working_half: None })
 	}
 
 	/// The extent this sampler reads, whatever its source is.
@@ -195,6 +198,13 @@ impl<'a> Sampler<'a> {
 	/// shifts every scaled image by half a pixel, which is the offset that shows up as a blurry
 	/// one-to-one blit.
 	pub fn sample(&self, x: f32, y: f32, quality: Quality) -> Rgba {
+		if let Some(half) = &self.working_half {
+			return match quality {
+				Quality::Nearest => half.texel(floor_i64(x), floor_i64(y), self.spread),
+				Quality::Bilinear | Quality::Mipmapped => half.bilinear(x, y, self.spread),
+				Quality::Bicubic => bicubic_with(x, y, |x, y| half.texel(x, y, self.spread)),
+			};
+		}
 		match quality {
 			Quality::Nearest => self.texel(floor_i64(x), floor_i64(y)),
 			Quality::Bilinear | Quality::Mipmapped => self.bilinear(x, y),
@@ -212,27 +222,31 @@ impl<'a> Sampler<'a> {
 	}
 
 	fn bicubic(&self, x: f32, y: f32) -> Rgba {
-		let (x, y) = (x - 0.5, y - 0.5);
-		let (x0, y0) = (floor_i64(x), floor_i64(y));
-		let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-		let mut rows = [Rgba::TRANSPARENT; 4];
-		for (index, row) in rows.iter_mut().enumerate() {
-			let sample_y = y0 - 1 + index as i64;
-			let mut accumulated = Rgba::TRANSPARENT;
-			for column in 0..4i64 {
-				let weight = mitchell(column as f32 - 1.0 - fx);
-				accumulated = accumulated.plus(self.texel(x0 - 1 + column, sample_y).scaled(weight));
-			}
-			*row = accumulated;
-		}
-		let mut out = Rgba::TRANSPARENT;
-		for (index, row) in rows.iter().enumerate() {
-			out = out.plus(row.scaled(mitchell(index as f32 - 1.0 - fy)));
-		}
-		// A CUBIC KERNEL OVERSHOOTS, which is what makes it look sharp, and a negative alpha or a
-		// colour above its own alpha is not a premultiplied colour any more.
-		clamp_premultiplied(out)
+		bicubic_with(x, y, |x, y| self.texel(x, y))
 	}
+}
+
+fn bicubic_with(x: f32, y: f32, texel: impl Fn(i64, i64) -> Rgba) -> Rgba {
+	let (x, y) = (x - 0.5, y - 0.5);
+	let (x0, y0) = (floor_i64(x), floor_i64(y));
+	let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+	let weights = core::array::from_fn::<_, 4, _>(|column| mitchell(column as f32 - 1.0 - fx));
+	let mut rows = [Rgba::TRANSPARENT; 4];
+	for (index, row) in rows.iter_mut().enumerate() {
+		let sample_y = y0 - 1 + index as i64;
+		let mut accumulated = Rgba::TRANSPARENT;
+		for (column, weight) in weights.iter().enumerate() {
+			accumulated = accumulated.plus(texel(x0 - 1 + column as i64, sample_y).scaled(*weight));
+		}
+		*row = accumulated;
+	}
+	let mut out = Rgba::TRANSPARENT;
+	for (index, row) in rows.iter().enumerate() {
+		out = out.plus(row.scaled(mitchell(index as f32 - 1.0 - fy)));
+	}
+	// A CUBIC KERNEL OVERSHOOTS, which is what makes it look sharp, and a negative alpha or a
+	// colour above its own alpha is not a premultiplied colour any more.
+	clamp_premultiplied(out)
 }
 
 /// A pyramid of progressively halved levels, in the canonical premultiplied linear float format.
@@ -344,6 +358,48 @@ impl Pyramid {
 		self.levels.len()
 	}
 
+	/// Refresh content in the existing storage. A layout change requires a new preparation; a new
+	/// video frame of the same size does not allocate or change the sampling precision.
+	pub fn refresh(&mut self, sampler: &Sampler<'_>) -> Result<(), Error> {
+		let Some(base) = self.levels.first_mut() else { return Err(Error::Allocation) };
+		if base.layout().extent != sampler.extent() {
+			return Err(Error::Overflow);
+		}
+		let extent = sampler.extent();
+		let mut target = base.view_mut();
+		for y in 0..extent.height {
+			for x in 0..extent.width {
+				write(&mut target, x, y, sampler.texel(x as i64, y as i64));
+			}
+		}
+		for index in 1..self.levels.len() {
+			let (before, after) = self.levels.split_at_mut(index);
+			let source = before[index - 1].view();
+			let source_extent = source.layout().extent;
+			let extent = after[0].layout().extent;
+			let mut target = after[0].view_mut();
+			for y in 0..extent.height {
+				for x in 0..extent.width {
+					let mut sum = Rgba::TRANSPARENT;
+					let mut count = 0.0;
+					for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+						let (sx, sy) = (x * 2 + dx, y * 2 + dy);
+						if sx < source_extent.width && sy < source_extent.height {
+							if let Some(value) = read(&source, sx, sy) {
+								sum = sum.plus(value);
+								count += 1.0;
+							}
+						}
+					}
+					if count > 0.0 {
+						write(&mut target, x, y, sum.scaled(1.0 / count));
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
 	pub fn level(&self, index: usize) -> Option<ImageView<'_>> {
 		self.levels.get(index).map(|level| level.view())
 	}
@@ -359,13 +415,16 @@ impl Pyramid {
 		let high = (low + 1).min(self.levels.len().saturating_sub(1));
 		let fraction = clamped - low as f32;
 		let sample_at = |index: usize| -> Rgba {
-			let Some(view) = self.level(index) else { return Rgba::TRANSPARENT };
+			let Some(level) = self.levels.get(index) else { return Rgba::TRANSPARENT };
 			let scale = 1.0 / (1u32 << index) as f32;
 			// NO DECODER AND NO SAMPLER ARE BUILT HERE. A level of this pyramid is ALREADY in the
 			// working space, premultiplied and linear - `build` put it there - so a texel is a read
 			// and nothing else. Constructing a sampler per tap meant deriving a colour-space matrix,
 			// with its Bradford adaptation, once per texel of every scaled image on the screen.
-			bilinear_working(&view, x * scale, y * scale, spread)
+			// Every level was allocated by pyramid_layout: its format and origin are fixed. Reading
+			// the owned storage avoids revalidating that same layout at every sample.
+			let half = WorkingHalf { bytes: level.bytes(), pitch: level.layout().pitch as usize, extent: level.layout().extent, top_left: true };
+			half.bilinear(x * scale, y * scale, spread)
 		};
 		if fraction <= 0.0 {
 			return sample_at(low);
@@ -401,19 +460,54 @@ impl Pyramid {
 	}
 }
 
-/// A bilinear tap over a level that is already in the working space.
-fn bilinear_working(view: &ImageView<'_>, x: f32, y: f32, spread: Spread) -> Rgba {
-	let extent = view.layout().extent;
-	let texel = |x: i64, y: i64| -> Rgba {
-		let (Some(x), Some(y)) = (spread.wrap(x, extent.width), spread.wrap(y, extent.height)) else { return Rgba::TRANSPARENT };
-		read(view, x, y).unwrap_or(Rgba::TRANSPARENT)
-	};
-	let (x, y) = (x - 0.5, y - 0.5);
-	let (x0, y0) = (floor_i64(x), floor_i64(y));
-	let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-	let top = lerp(texel(x0, y0), texel(x0 + 1, y0), fx);
-	let bottom = lerp(texel(x0, y0 + 1), texel(x0 + 1, y0 + 1), fx);
-	lerp(top, bottom, fy)
+/// A validated half-float image already in the working space. Keep the filter arithmetic identical
+/// to the general sampler; only layout/format/decoder decisions move out of its tap loop.
+struct WorkingHalf<'a> {
+	bytes: &'a [u8],
+	pitch: usize,
+	extent: crate::geom::Extent2D,
+	top_left: bool,
+}
+
+// Every positive half, including subnormals and NaN payloads, has one exact single-precision bit
+// pattern. A shared 128-KiB read-only table avoids sixteen exponent conversions per bilinear tap;
+// applying the sign afterward preserves negative zero and negative NaNs too.
+const HALF_BITS: [u32; 32768] = {
+	let mut bits = [0; 32768];
+	let mut index = 0;
+	while index < bits.len() {
+		bits[index] = crate::pixel::half_to_f32(index as u16).to_bits();
+		index += 1;
+	}
+	bits
+};
+
+impl WorkingHalf<'_> {
+	fn read(&self, x: u32, y: u32) -> Rgba {
+		let y = if self.top_left { y } else { self.extent.height - 1 - y };
+		let start = y as usize * self.pitch + x as usize * 8;
+		let Some(pixel) = self.bytes.get(start..start + 8) else { return Rgba::TRANSPARENT };
+		let channel = |index| {
+			let half = u16::from_le_bytes([pixel[index], pixel[index + 1]]);
+			f32::from_bits(HALF_BITS[(half & 0x7fff) as usize] | ((half as u32 & 0x8000) << 16))
+		};
+		Rgba::new(channel(0), channel(2), channel(4), channel(6))
+	}
+
+	fn texel(&self, x: i64, y: i64, spread: Spread) -> Rgba {
+		let (Some(x), Some(y)) = (spread.wrap(x, self.extent.width), spread.wrap(y, self.extent.height)) else { return Rgba::TRANSPARENT };
+		self.read(x, y)
+	}
+
+	fn bilinear(&self, x: f32, y: f32, spread: Spread) -> Rgba {
+		let (x, y) = (x - 0.5, y - 0.5);
+		let (x0, y0) = (floor_i64(x), floor_i64(y));
+		let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+		let (Some(left), Some(right), Some(top), Some(bottom)) = (spread.wrap(x0, self.extent.width), spread.wrap(x0 + 1, self.extent.width), spread.wrap(y0, self.extent.height), spread.wrap(y0 + 1, self.extent.height)) else { return Rgba::TRANSPARENT };
+		let upper = lerp(self.read(left, top), self.read(right, top), fx);
+		let lower = lerp(self.read(left, bottom), self.read(right, bottom), fx);
+		lerp(upper, lower, fy)
+	}
 }
 
 fn pyramid_layout(extent: crate::geom::Extent2D, space: ColorSpace) -> Result<ImageLayout, Error> {
@@ -483,4 +577,39 @@ fn mitchell(distance: f32) -> f32 {
 		0.0
 	};
 	value / 6.0
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn prepared_half_filters_match_the_general_reader_bit_for_bit() {
+		let semantics = ImageSemantics::Color { color_space: ColorSpace::SrgbLinear, alpha_mode: AlphaMode::Premultiplied };
+		for origin in [RowOrigin::TopLeft, RowOrigin::BottomLeft] {
+			let layout = ImageLayout::new(crate::geom::Extent2D::new(3, 2), 32, PixelStorage::Known(PixelFormat::R16G16B16A16Float), origin, semantics).unwrap();
+			let mut image = OwnedImage::new(layout).unwrap();
+			for y in 0..2 {
+				for x in 0..3 {
+					let alpha = (x + y * 3) as f32 / 5.0;
+					write(&mut image.view_mut(), x, y, Rgba::new(alpha * 0.37, alpha * 0.79, alpha / 3.0, alpha));
+				}
+			}
+			for spread in [Spread::Clamp, Spread::Repeat, Spread::Mirror] {
+				let fast = Sampler::new(image.view(), Working::linear(ColorSpace::Srgb), spread).unwrap();
+				assert!(fast.working_half.is_some());
+				let mut general = Sampler::new(image.view(), Working::linear(ColorSpace::Srgb), spread).unwrap();
+				general.working_half = None;
+				for quality in [Quality::Nearest, Quality::Bilinear, Quality::Bicubic, Quality::Mipmapped] {
+					for y in -12..24 {
+						for x in -18..30 {
+							let (x, y) = (x as f32 / 4.0, y as f32 / 4.0);
+							let bits = |value: Rgba| [value.red.to_bits(), value.green.to_bits(), value.blue.to_bits(), value.alpha.to_bits()];
+							assert_eq!(bits(fast.sample(x, y, quality)), bits(general.sample(x, y, quality)), "{origin:?} {spread:?} {quality:?} at {x},{y}");
+						}
+					}
+				}
+			}
+		}
+	}
 }

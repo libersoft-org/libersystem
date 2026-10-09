@@ -22,7 +22,8 @@ use tools::{parse_u64, split_args};
 const USAGE: &[u8] = b"usage: audioctl COMMAND
   devices                           every device, its formats, latency, level and the defaults it is
   default DEVICE output|input|voice make it the default, as its arrival would
-  volume DEVICE LEVEL               its level, 0 to 100
+  volume DEVICE LEVEL               its existing speaker/device level, 0 to 100
+  microphone DEVICE [LEVEL]         read or set independent microphone level, 0 to 100
   streams                           where every stream plays, its latency and the silence it played
   counters                          streams moved, frames played into no device, the phone stream's buffer
 ";
@@ -58,6 +59,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			let device = parse_device(args[1]);
 			let level = parse_u64(args[2]).filter(|level| *level <= 100).unwrap_or_else(|| usage()) as u8;
 			done(client.set_volume(&device, &level), "setting the level");
+		}
+		(Some(b"microphone"), 2 | 3) => {
+			let device = parse_device(args[1]);
+			if args.len() == 3 {
+				let level = parse_u64(args[2]).filter(|level| *level <= 100).unwrap_or_else(|| usage()) as u8;
+				done(client.set_microphone_volume(&device, &level), "setting the microphone level");
+			} else {
+				match client.microphone_volume(&device) {
+					Some(Ok(level)) => print(format!("device {device}: microphone level {level}\n").as_bytes()),
+					Some(Err(error)) => done(Some(Err(error)), "reading the microphone level"),
+					None => done(None, "reading the microphone level"),
+				}
+			}
 		}
 		(Some(b"streams"), 1) => streams(&mut client),
 		(Some(b"counters"), 1) => match client.counters() {
