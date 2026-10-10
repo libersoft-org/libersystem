@@ -32,7 +32,8 @@
 //                      and its link going is its departure
 //   btclassic le       LE beyond one mouse: the tag paired by Numeric Comparison from its private address and bonded
 //                      under the identity it gave with its resolving key, its battery level in its status; the display by Passkey Entry this host
-//                      types; the remote refused until `pair-legacy`, then bonded at the legacy level with its EDIV and
+//                      types and then shows for the same peer set to KeyboardOnly; an actual SC Just Works downgrade
+//                      refused with the original authenticated key reused; the remote refused until `pair-legacy`, then bonded at the legacy level with its EDIV and
 //                      Rand; three LE links at once; this host's name read through its attribute server; and the tag
 //                      and the remote reconnecting through the accept list, the tag resolved, each on its stored key
 //   btclassic audio    music: the headset connected for audio streams what AudioService plays - the fixture hears
@@ -863,6 +864,22 @@ fn gamepad(probe: &mut Probe) {
 
 // ------------------------------------------------------------------ le
 
+// A fixture-side disconnect has been delivered to the controller too before the next operator pairing is begun.
+fn le_wait_disconnected(probe: &Probe, peer: &PeerAddress) {
+	let deadline = clock() + 3 * TICKS;
+	loop {
+		match probe.operator().devices(&0) {
+			Some(Ok(devices)) if !devices.iter().any(|device| device.address == *peer && device.connected) => return,
+			Some(Ok(_)) => {}
+			_ => fail("the LE connection inventory could not be read"),
+		}
+		if clock() >= deadline {
+			fail("the disconnected LE peer remained connected in the host inventory");
+		}
+		sleep_until(clock() + TICKS / 10);
+	}
+}
+
 fn le(probe: &mut Probe) {
 	probe.ready();
 	let handle = match probe.read().scan(&0, &4000) {
@@ -939,7 +956,83 @@ fn le(probe: &mut Probe) {
 		Some(bond) if bond.level.agreement == KeyAgreement::SecureConnections && bond.level.authenticated => {}
 		_ => fail("the display's bond is not Secure Connections, authenticated"),
 	}
+	probe.expect("the display did not validate all twenty typed passkey rounds", 3 * TICKS, |line| line == "display completed twenty Secure Connections passkey rounds peer-shown");
 	say("Passkey Entry on LE: this host typed the digits the display showed, twenty rounds, and it bonded authenticated");
+
+	// THE REVERSE SC DIRECTION: the same fixture responder now has a keyboard. Its first received commitment
+	// must wait for the digits this host actually shows; all twenty bit commitments and both check values still run.
+	if probe.act(DISPLAY, FixtureAction::Disconnect, 0) != 0 {
+		fail("the display could not disconnect before its IO capability change");
+	}
+	probe.expect("the display did not disconnect before its IO capability change", 3 * TICKS, |line| line == "disconnected display");
+	le_wait_disconnected(probe, &identity_of(DISPLAY));
+	if probe.act(DISPLAY, FixtureAction::LeIoCapability, 2) != 0 || !matches!(probe.operator().pair(&0, &identity_of(DISPLAY)), Some(Ok(()))) {
+		fail("the keyboard-capable display could not begin a new SC pairing");
+	}
+	let prompt = probe.prompt("SC passkey shown by this host raised no prompt", 10 * TICKS);
+	if prompt.question != PromptQuestion::ShowPasskey || prompt.radio != Radio::Le || prompt.value > 999_999 {
+		fail("SC pairing did not show a six-digit LE passkey on this host");
+	}
+	probe.answer(&prompt, PromptReply::Yes);
+	if probe.act(DISPLAY, FixtureAction::TypePasskey, prompt.value) != 0 || probe.settle(15 * TICKS) != PairingState::Bonded {
+		fail("SC passkey typed on the fixture did not complete an authenticated bond");
+	}
+	probe.expect("the fixture did not validate all twenty host-shown passkey rounds", 3 * TICKS, |line| line == "display completed twenty Secure Connections passkey rounds host-shown");
+	probe.expect("the host-shown SC pairing did not encrypt the link", 3 * TICKS, |line| line.starts_with("encrypted display with key "));
+	match probe.bond(DISPLAY) {
+		Some(bond) if bond.level.agreement == KeyAgreement::SecureConnections && bond.level.authenticated => {}
+		_ => fail("the host-shown passkey bond is not Secure Connections, authenticated"),
+	}
+	say("SC Passkey Entry shown by this host: twenty checked rounds, encrypted link, authenticated Secure Connections bond");
+
+	// AN ACTUAL SC AUTHENTICATION DOWNGRADE, not pair-legacy's policy shortcut. With no prompt watcher this host
+	// declares NoInputNoOutput: the tag completes SC Just Works on a fresh key, and the host must reject the result.
+	// The fixture explicitly saves/restores its own old keys; no guest bond is rewritten by that test control.
+	probe.unwatch();
+	if probe.act(TAG, FixtureAction::Disconnect, 0) != 0 {
+		fail("the tag could not disconnect before the SC downgrade attempt");
+	}
+	probe.expect("the tag did not disconnect before the SC downgrade attempt", 3 * TICKS, |line| line == "disconnected tag");
+	le_wait_disconnected(probe, &identity_of(TAG));
+	if probe.act(TAG, FixtureAction::LeSaveKeys, 0) != 0 {
+		fail("the fixture could not explicitly save the tag's original keys");
+	}
+	let saved = probe.expect("the fixture did not record its explicit key snapshot", 3 * TICKS, |line| line.starts_with("tag explicitly saved key "));
+	if key_of(&saved) != key_of(&paired_tag) {
+		fail("the SC downgrade did not begin with the tag's original key saved");
+	}
+	say("BEGIN SC authentication downgrade");
+	if !matches!(probe.operator().pair(&0, &tag), Some(Ok(()))) {
+		fail("the operator refused to begin the SC authentication downgrade attempt");
+	}
+	probe.expect("the downgrade did not send a fresh SMP Pairing Request", 10 * TICKS, |line| line == "pairing tag from the host's request");
+	probe.expect("the downgrade did not actually negotiate SC Just Works", 5 * TICKS, |line| line == "Secure Connections Just Works tag");
+	let weaker = probe.expect("the fresh SC Just Works exchange did not encrypt its link", 10 * TICKS, |line| line.starts_with("encrypted tag with key "));
+	if weaker == paired_tag || probe.settle(10 * TICKS) != PairingState::Failed {
+		fail("the SC authentication downgrade did not fail after a fresh lower-security key exchange");
+	}
+	probe.expect("the host kept the downgraded SC link", 5 * TICKS, |line| line == "disconnected by the host tag");
+	le_wait_disconnected(probe, &tag);
+	le_wait_disconnected(probe, &identity_of(TAG));
+	match probe.bond(TAG) {
+		Some(bond) if bond.level.agreement == KeyAgreement::SecureConnections && bond.level.authenticated => {}
+		_ => fail("SC Just Works replaced the tag's authenticated SC bond"),
+	}
+	if probe.act(TAG, FixtureAction::LeRestoreKeys, 0) != 0 {
+		fail("the fixture could not explicitly restore the tag's original keys");
+	}
+	let restored = probe.expect("the fixture did not record its explicit old-key restore", 3 * TICKS, |line| line.starts_with("tag explicitly restored key "));
+	if key_of(&restored) != key_of(&paired_tag) {
+		fail("the fixture restored a different tag key");
+	}
+	probe.trust(TAG, Profile::Input, true);
+	probe.expect("the tag did not reconnect after the rejected SC downgrade", 5 * TICKS, |line| line == "connected tag - the host from its random address");
+	let reused = probe.expect("the rejected SC downgrade did not leave a reusable old key", 5 * TICKS, |line| line.starts_with("encrypted tag with key "));
+	if reused != paired_tag {
+		fail("the host did not reuse the original authenticated SC key after rejecting Just Works");
+	}
+	say("SC authentication downgrade: fresh Just Works exchange refused, authenticated bond retained, original key reused on encrypted reconnect");
+	probe.watch();
 
 	// LE LEGACY ONLY ON THE OPERATOR'S WORD.
 	if !matches!(probe.operator().pair(&0, &identity_of(REMOTE)), Some(Ok(()))) {

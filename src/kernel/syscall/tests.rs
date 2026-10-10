@@ -1,6 +1,103 @@
 use super::*;
 use crate::arch;
 
+// Expose a real Timer, arming it between the first readiness scan and the deadline lookup.
+// WAIT/WAIT_ANY first query its type for ProcessGroup handling; WAITSET has no such query.
+struct TimerArmedDuringScan {
+	timer: Arc<Timer>,
+	queries: core::sync::atomic::AtomicUsize,
+	arm_at: usize,
+}
+
+impl KernelObject for TimerArmedDuringScan {
+	fn header(&self) -> &crate::object::ObjectHeader {
+		self.timer.header()
+	}
+
+	fn object_type(&self) -> ObjectType {
+		ObjectType::Timer
+	}
+
+	fn as_any(&self) -> &dyn core::any::Any {
+		let query = self.queries.fetch_add(1, core::sync::atomic::Ordering::SeqCst) + 1;
+		if query == self.arm_at {
+			assert_eq!(self.timer.deadline(), None, "the first readiness scan saw an unarmed timer");
+			self.timer.set(0);
+		}
+		self.timer.as_ref()
+	}
+
+	fn into_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
+		self.timer.clone()
+	}
+}
+
+fn wait_on_test_object(call: u64, object: Arc<dyn KernelObject>, deadline: u64) -> (i64, i64) {
+	let thread = sched::current_thread().expect("a test thread");
+	let koid = object.header().koid();
+	let set = if call == SYS_WAITSET_WAIT {
+		let set = WaitSet::create_in(thread.domain().clone()).expect("a test wait set");
+		set.add(object.clone()).expect("a test wait set member");
+		Some(set)
+	} else {
+		None
+	};
+	let installed: Arc<dyn KernelObject> = match &set {
+		Some(set) => set.clone(),
+		None => object,
+	};
+	let handle = thread.handles().lock().insert_object(installed, Rights::WAIT);
+	let handles = [handle.raw()];
+	let result = unsafe { if call == SYS_WAIT_ANY { arch::syscall::invoke(call, handles.as_ptr() as u64, 1, deadline, 0) } else { arch::syscall::invoke(call, handle.raw(), deadline, 0, 0) } } as i64;
+	if let Some(set) = &set {
+		set.remove(koid).expect("remove the test wait set member");
+	}
+	thread.handles().lock().close(handle).expect("close the test handle");
+	(result, if call == SYS_WAITSET_WAIT { koid as i64 } else { 0 })
+}
+
+fn timer_readiness_is_not_a_caller_timeout(call: u64) {
+	use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(call: u64) {
+		for deadline in [0, u64::MAX - 1] {
+			let timer = Timer::create().expect("a test timer");
+			assert!(!timer.is_expired());
+			let wrapper = Arc::new(TimerArmedDuringScan { timer, queries: AtomicUsize::new(0), arm_at: if call == SYS_WAITSET_WAIT { 2 } else { 3 } });
+			let (result, ready) = wait_on_test_object(call, wrapper.clone(), deadline);
+			assert!(wrapper.queries.load(Ordering::SeqCst) >= wrapper.arm_at, "the deadline lookup must trigger the race");
+			assert_eq!(wrapper.timer.deadline(), Some(0));
+			assert!(wrapper.timer.is_expired());
+			assert_eq!(result, ready, "a timer becoming ready during the scan is not the caller's timeout");
+		}
+		assert!(arch::apic::ticks() >= 1, "the caller deadline control must already be expired");
+		let timer = Timer::create().expect("an unarmed control timer");
+		let (result, _) = wait_on_test_object(call, timer.clone(), 1);
+		assert!(!timer.is_expired(), "the timeout control has no ready object");
+		assert_eq!(result, ERR_TIMED_OUT, "an expired caller deadline must still time out");
+		DONE.store(true, Ordering::SeqCst);
+	}
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(body, call);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the timer race cases completed");
+}
+
+crate::tagged_test!(wait_returns_ready_when_a_timer_expires_during_the_readiness_scan, [Object, Scheduler, Syscall], id = "kernel.syscall.wait_returns_ready_when_a_timer_expires_during_the_readiness_scan", covers = ["kernel"]);
+fn wait_returns_ready_when_a_timer_expires_during_the_readiness_scan() {
+	timer_readiness_is_not_a_caller_timeout(SYS_WAIT);
+}
+
+crate::tagged_test!(wait_any_returns_ready_when_a_timer_expires_during_the_readiness_scan, [Object, Scheduler, Syscall], id = "kernel.syscall.wait_any_returns_ready_when_a_timer_expires_during_the_readiness_scan", covers = ["kernel"]);
+fn wait_any_returns_ready_when_a_timer_expires_during_the_readiness_scan() {
+	timer_readiness_is_not_a_caller_timeout(SYS_WAIT_ANY);
+}
+
+crate::tagged_test!(waitset_returns_ready_when_a_timer_expires_during_the_readiness_scan, [Object, Scheduler, Syscall], id = "kernel.syscall.waitset_returns_ready_when_a_timer_expires_during_the_readiness_scan", covers = ["kernel"]);
+fn waitset_returns_ready_when_a_timer_expires_during_the_readiness_scan() {
+	timer_readiness_is_not_a_caller_timeout(SYS_WAITSET_WAIT);
+}
+
 crate::tagged_test!(syscall_roundtrip_stateless, [Syscall, Smoke], id = "kernel.syscall.syscall_roundtrip_stateless", covers = ["kernel"]);
 fn syscall_roundtrip_stateless() {
 	// Stateless syscalls round-trip from the test (idle) context: there is no

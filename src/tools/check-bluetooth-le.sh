@@ -12,7 +12,8 @@
 #                                gives with its resolving key; this host scans and connects from a private address of
 #                                its own, which the tag resolves with the identity this host gave it
 #   every LE model             Numeric Comparison with the tag (the prompt's digits are the tag's), Passkey Entry
-#                                this host types for the display, legacy Passkey Entry this host shows for the
+#                                this host types and then shows for the display in KeyboardOnly mode (both SC20 rounds),
+#                                an actual SC Just Works downgrade refused with the original key reused, legacy Passkey Entry for the
 #                                remote - refused until `pair-legacy`, never over a Secure Connections bond
 #   several links              the tag, the display and the remote connected at once
 #   the attribute server       the tag reads this host's name through it
@@ -47,12 +48,30 @@ export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-330}"
 
 guest_gate_run $'btclassic le\nbtgatt\nbtclassic ctkd' ""
 lines="$GUEST_LINES"
-for verdict in "btclassic: PASS le" "btgatt: PASS" "btclassic: PASS ctkd"; do
+for verdict in "btclassic: PASS le" "btgatt: PASS" "btclassic: PASS ctkd" \
+	"btclassic: SC Passkey Entry shown by this host: twenty checked rounds, encrypted link, authenticated Secure Connections bond" \
+	"btclassic: SC authentication downgrade: fresh Just Works exchange refused, authenticated bond retained, original key reused on encrypted reconnect"; do
 	grep -qF "$verdict" "$lines" || {
 		echo "bluetooth-le: expected \"$verdict\"" >&2
 		grep -aE 'btclassic|btgatt|bt-fixture|BluetoothService|PermissionManager' "$lines" >&2 || cat "$lines" >&2
 		exit 1
 	}
 done
+# A failed new exchange with the old bond still present could also be a storage failure. Require the production
+# policy's exact reason during this fresh negative scenario, in addition to the probe's cryptographic/identity checks.
+python3 - "$lines" <<'PY_CAUSE'
+from pathlib import Path
+import sys
+lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+begin = "btclassic: BEGIN SC authentication downgrade"
+end = "btclassic: SC authentication downgrade: fresh Just Works exchange refused, authenticated bond retained, original key reused on encrypted reconnect"
+reason = "BluetoothService: a bonded LE peer paired again at a lower level; the bond is kept and the link refused"
+starts = [i for i, line in enumerate(lines) if line.strip() == begin]
+ends = [i for i, line in enumerate(lines) if line.strip() == end]
+if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+    raise SystemExit("bluetooth-le: FAIL: missing, duplicate or unordered SC downgrade scenario markers")
+if not any(line.strip() == reason for line in lines[starts[0] + 1:ends[0]]):
+    raise SystemExit("bluetooth-le: FAIL: SC downgrade did not fail for the required lower-level bond policy reason")
+PY_CAUSE
 grep -aE '^(btclassic|btgatt): ' "$lines" | sed 's/^/bluetooth-le: /'
-echo "bluetooth-le: PASS - privacy both ways, Numeric Comparison, Passkey Entry and legacy on request, several links, the attribute server, reconnection through the accept list, an application's GATT grant, and keys derived across transports both ways"
+echo "bluetooth-le: PASS - privacy both ways, Numeric Comparison, both SC Passkey Entry directions, actual SC authentication downgrade refusal and original-key reuse, legacy on request, several links, the attribute server, reconnection through the accept list, an application's GATT grant, and keys derived across transports both ways"

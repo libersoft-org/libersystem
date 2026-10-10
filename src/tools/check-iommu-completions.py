@@ -56,6 +56,11 @@ mod mem {
 mod arch {
     pub mod apic { pub fn ticks() -> u64 { 1 } }
     pub mod interrupts { pub fn msi_quarantined_for_device(_: u32) -> u32 { 0 } }
+    pub mod serial {
+        pub fn console_hand_over(_: u64, _: usize, _: u64) -> bool {
+            panic!("the fixture is a PCI endpoint with no console resource")
+        }
+    }
 }
 mod dma_policy {
     pub fn admit_decision(_: u16, _: u8, _: u8, _: u8) -> dma::BindDecision { dma::BindDecision::Translated }
@@ -95,10 +100,37 @@ mod iommu {
     pub use super::{attach_for, attachment_quarantined, map_device_buffer, unmap_for_device};
     pub fn translating() -> bool { true }
 }
+// The fixture has no AML-owned ranges, chipset register row or console resource.
+// Unexpected entry into one of those hardware seams must fail, not silently succeed.
+mod firmware {
+    pub fn claim_refusal(entry: &crate::device::Entry) -> Option<&'static str> {
+        entry.assert_fixture_identity();
+        None
+    }
+}
+mod declared {
+    pub struct Row { pub name: &'static str }
+    pub fn row_for(vendor: u16, product: u16) -> Option<&'static Row> {
+        assert_eq!((vendor, product), (0x1af4, 0x1041));
+        None
+    }
+    pub fn suppressed(_: &Row) -> bool { panic!("the fixture has no chipset row") }
+    pub fn claim_writes(index: usize, vendor: u16, product: u16, bus: u8, dev: u8, func: u8) {
+        assert_eq!((index, bus, dev, func), (0, 0, 0, 7));
+        assert!(row_for(vendor, product).is_none(), "no declared register writes for this endpoint");
+    }
+}
+mod object { pub mod dma_buffer { pub use crate::buffers::holds_for; } }
 mod driver_binding {
     // The device identity the policy decides on. One struct, by value, with the fields `claim`
     // fills in - the crate it comes from is userspace and is not a dependency of this fixture.
+    #[derive(Default)]
     pub struct Discovered { pub transport: u8, pub virtio_type: u32, pub class: u8, pub subclass: u8, pub prog_if: u8, pub vendor: u16, pub product: u16, pub bus: u8, pub dev: u8, pub func: u8 }
+    impl Discovered {
+        pub fn add_platform_id(&mut self, _: u8, _: &[u8]) {
+            panic!("the fixture is a PCI endpoint, not a platform row")
+        }
+    }
 }
 // THE ENTRY EVERY CLAIM IN THIS FIXTURE IS MADE UNDER. A claim names the manifest entry it is
 // admitted against, and what these regressions are about is what happens AFTER that answer, so
@@ -106,38 +138,53 @@ mod driver_binding {
 pub const ENTRY: [u8; abi::ENTRY_NAME_LEN] = [0; abi::ENTRY_NAME_LEN];
 mod device {
     use super::{SpinLock, Ordering, AtomicUsize};
-    use crate::{driver_binding, dma_policy};
+    use crate::driver_binding;
     // THE FIELDS `claim` READS TODAY. This stub carried five and the production function it is
     // compiled against builds a `Discovered` out of eleven, so the fixture stopped compiling the
     // moment the device identity grew - which is the whole of what this checker had been
     // reporting as a failure.
-    struct Entry { device_type: u16, transport: u8, vendor: u16, product: u16, class: u8, subclass: u8, prog_if: u8, bus: u8, dev: u8, func: u8, on_bus: bool }
+    pub struct Entry { device_type: u16, transport: u8, vendor: u16, product: u16, class: u8, subclass: u8, prog_if: u8, bus: u8, dev: u8, func: u8, on_bus: bool,
+        platform: Option<PlatformRow>, port_count: u8, ports: [abi::PortResource; abi::MAX_PORT_RESOURCES] }
+    type DeviceEntry = Entry;
+    struct PlatformRow { part: abi::PlatformPart }
+    impl Entry {
+        fn has_config_space(&self) -> bool { self.on_bus && self.platform.is_none() }
+        fn has_io_bar(&self) -> bool {
+            self.ports[..self.port_count as usize].iter().any(|port| port.source == abi::PORT_SOURCE_IO_BAR)
+        }
+        pub fn assert_fixture_identity(&self) {
+            assert_eq!((self.vendor, self.product, self.bus, self.dev, self.func), (0x1af4, 0x1041, 0, 0, 7));
+            assert!(self.on_bus && self.platform.is_none() && self.port_count == 0);
+        }
+    }
+    fn io_decode(_: &Entry, _: bool) { panic!("the fixture has no I/O BAR") }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ClaimState { Free, Claimed, Releasing, Quarantined }
     #[derive(Debug, PartialEq, Eq)]
-    pub enum ClaimError { NoSuchDevice, AlreadyClaimed, Quarantined, Retired, Refused }
+    pub enum ClaimError { NoSuchDevice, AlreadyClaimed, Quarantined, Retired, Refused, FirmwareDriven }
     // AND THE TWO A CLAIM RECORDS ABOUT ITSELF: the entry name it was admitted under and the DMA
     // policy that entry declares, both written by `claim` and both absent here.
     struct Slot { state: ClaimState, generation: u64, retired: bool, entry: [u8; abi::ENTRY_NAME_LEN], policy: u8, msi_quarantined_at_claim: u32,
-        mmio_unconfirmed_at_claim: u32, mmio_unconfirmed: u32 }
+        mmio_unconfirmed_at_claim: u32, mmio_unconfirmed: u32, master_deferred: bool }
     static DEVICES: SpinLock<Vec<Entry>> = SpinLock::new(Vec::new());
     static CLAIMS: SpinLock<Vec<Slot>> = SpinLock::new(Vec::new());
     pub static MASTERED: AtomicUsize = AtomicUsize::new(0);
     fn bus_master(_: &Entry, enabled: bool) { if enabled { MASTERED.fetch_add(1, Ordering::SeqCst); } }
     pub fn setup_claim() {
-        *DEVICES.lock() = vec![Entry { device_type: 1, transport: 0, vendor: 0x1af4, product: 0x1041, class: 2, subclass: 0, prog_if: 0, bus: 0, dev: 0, func: 7, on_bus: true }];
+        *DEVICES.lock() = vec![Entry { device_type: 1, transport: 0, vendor: 0x1af4, product: 0x1041, class: 2, subclass: 0, prog_if: 0, bus: 0, dev: 0, func: 7, on_bus: true, platform: None, port_count: 0, ports: [abi::PortResource { base: 0, len: 0, source: 0, index: 0, _pad: [0; 2] }; abi::MAX_PORT_RESOURCES] }];
         *CLAIMS.lock() = vec![Slot { state: ClaimState::Free, generation: 0, retired: false,
             entry: [0; abi::ENTRY_NAME_LEN], policy: 0,
-            msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, mmio_unconfirmed: 0 }];
+            msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, mmio_unconfirmed: 0, master_deferred: false }];
         MASTERED.store(0, Ordering::SeqCst);
     }
+    pub fn master_deferred() -> bool { CLAIMS.lock()[0].master_deferred }
     pub fn state() -> (ClaimState, u64) { let slots = CLAIMS.lock(); (slots[0].state, slots[0].generation) }
     pub fn binding_of_faulting_endpoint(_: u8, _: u8, _: u8, _: u64) -> Option<(usize, bool)> { Some((0, false)) }
     pub fn contain_faulting_endpoint(_: u8, _: u8, _: u8) -> Option<usize> { None }
     pub fn contain_faulting_endpoint_of_a_live_binding(_: u8, _: u8, _: u8, _: u64) -> Option<usize> { None }
 }
 '''
-    prelude = prelude.replace('mod device {', 'mod device {\n' + function(DEVICE.read_text(), 'claim'))
+    prelude = prelude.replace('mod device {', 'mod device {\n' + '\n'.join(function(DEVICE.read_text(), name) for name in ('claim', 'discovered', 'console_base', 'master_if_deferred')))
     queue_fixture = r'''
     pub fn simulated() -> (VirtQueue, u64, u64) {
         fn page() -> u64 { Box::into_raw(Box::new([0u64; 512])) as u64 }
@@ -302,6 +349,36 @@ fn a_late_completion_never_confirms_a_reused_request_or_overwrites_its_scratch()
     assert_eq!(unsafe { std::slice::from_raw_parts(scratch as *const u8, 4) }, &[1, 2, 3, 4]);
 }
 #[test]
+fn a_reclaimed_device_defers_mastering_until_the_current_binding_resets_it() {
+    setup(false);
+    buffers::release_for(0);
+    let domain = alloc::sync::Arc::new(Domain { charged: AtomicUsize::new(0) });
+    mem::frame::RETIRED.store(0, Ordering::SeqCst);
+    let old = abi::ClaimKey { device_index: 0, _pad: 0, generation: 1 };
+    let buffer = buffers::DmaBuffer::create_for(&domain, 4096, Some(old)).unwrap();
+    buffer.mark_orphaned();
+    drop(buffer);
+    assert_eq!(mem::frame::RETIRED.load(Ordering::SeqCst), 1);
+    assert_eq!(domain.charged.load(Ordering::SeqCst), 0);
+    assert!(buffers::holds_for(0), "confirmed translated frames leave the engine-stop marker");
+    assert_eq!(buffers::held_frames_for_test(0), 0);
+    assert!(detach_for_inner(0, 0, 0, 7));
+    device::setup_claim();
+    let current = device::claim(0, &ENTRY).expect("the replacement attaches normally");
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 0, "a surviving engine must not master against the new domain");
+    assert!(device::master_deferred());
+    device::master_if_deferred(abi::ClaimKey { generation: current.generation + 1, ..current });
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 0, "a different binding cannot enable this one");
+    assert_eq!(buffers::release_for(0), 0, "reset clears a marker, not already returned frames");
+    assert!(!buffers::holds_for(0));
+    device::master_if_deferred(current);
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 1);
+    assert!(!device::master_deferred());
+    device::master_if_deferred(current);
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 1, "mastering is enabled only once");
+    assert!(detach_for_inner(0, 0, 0, 7));
+}
+#[test]
 fn a_surviving_buffer_reclaims_its_frames_after_confirmed_domain_retirement() {
     for drop_before_detach in [false, true] {
         let isolation = setup(false);
@@ -379,9 +456,9 @@ mod buffers {
         program = prelude + 'mod virtqueue {\n' + QUEUE.read_text() + queue_fixture + wire + lifecycle + attach_failure + production + buffer_fixture
         (path / 'tests.rs').write_text(program)
         result = subprocess.run(['cargo', 'test', '--offline', '--quiet', '--manifest-path', str(path / 'Cargo.toml'), '--lib', '--', '--test-threads=1'], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or '8 passed' not in result.stdout:
+        if result.returncode or '9 passed' not in result.stdout:
             raise SystemExit(result.stdout)
-        print('iommu-completions: 8 production attach, claim, queue, teardown and buffer regressions passed')
+        print('iommu-completions: 9 production attach, claim, queue, teardown and buffer regressions passed')
         reservation = re.search(r'\tif domains.try_reserve\(1\).is_err\(\) \{.*?\n\t\}\n', program, re.S).group()
         mutations = {
             'bookkeeping reserved after hardware attach': program.replace(reservation, '').replace('\t\t\tdomains.push((index as u32, domain));', reservation + '\t\t\tdomains.push((index as u32, domain));'),
@@ -392,6 +469,7 @@ mod buffers {
             'confirmed translated frames held after reset': program.replace('(Some(device), true, false) =>', '(Some(device), true, _) =>'),
             'unconfirmed attachment association forgotten': program.replace('RETAINED.lock()[index] = Some(domain);', 'let _ = domain;'),
             'unconfirmed attachment claim left free': program.replace('if crate::iommu::attachment_quarantined(index) {', 'if false {'),
+            'held DMA bypasses deferred mastering': program.replace('if crate::object::dma_buffer::holds_for(index as u32) {', 'if false {'),
         }
         for name, mutant in mutations.items():
             if mutant == program:

@@ -1325,6 +1325,7 @@ fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result
 		// command containing `./test.sh --arch `, and it stopped being true the moment a
 		// gate row that boots QEMU through `check.sh` became its own step.
 		println!("STEPGUESTS\t{index}\t{}", step.guests);
+		println!("STEPEXCLUSIVE\t{index}\t{}", u8::from(step.exclusive_guests));
 		for key in &step.keys {
 			println!("KEY\t{index}\t{}", key.display());
 		}

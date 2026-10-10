@@ -678,6 +678,170 @@ log.write_text('boot OK\n' + ('PERF tsc_hz 123\n' if profile == 'development-tra
         self.assertFalse(self.exercise(ignore_private_output=True))
 
 
+class GuestGateImagePreparation(unittest.TestCase):
+    """Execute the real shared gate boundary; only producers and guest launch are fakes."""
+
+    def exercise(self, *, arch="x86_64", pinned=False, missing_pin=False, build_fails=False,
+                 disk=None, mutate_disk=False):
+        import json
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "tree with spaces"
+            tools = root / "src/tools"
+            harness = root / "src/harness"
+            binaries = root / "bin"
+            temporary = root / "private tmp"
+            boot = root / ".build/boot"
+            for path in (tools, harness, binaries, temporary, boot):
+                path.mkdir(parents=True, exist_ok=True)
+            (tools / "guest-gate.sh").write_text((HERE / "guest-gate.sh").read_text())
+            for name in ("libersystem.iso", "libersystem-dev.iso"):
+                (boot / name).write_text("stale public artifact")
+            (boot / "system-volume-bootable-x86_64.img").write_text("unrelated globally replaced volume")
+            image = root / "pinned image.iso"
+            if pinned and not missing_pin:
+                image.write_text("selected pinned volume")
+            persistent = root / "persistent disk.img"
+            if disk == "existing":
+                persistent.write_text("preexisting state")
+
+            def executable(path, text):
+                path.write_text(text)
+                path.chmod(0o755)
+
+            executable(root / "image.sh", '''#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['FIXTURE_ROOT'])
+with (root/'build.jsonl').open('a') as out:
+    out.write(json.dumps({'args':sys.argv[1:],'output':os.environ['LIBER_IMAGE_OUTPUT'],
+                         'development':os.environ.get('LIBER_DEVELOPMENT'),
+                         'rustflags':os.environ.get('RUSTFLAGS')})+'\\n')
+if os.environ.get('FIXTURE_BUILD_FAIL') == '1':
+    raise SystemExit(19)
+image=pathlib.Path(os.environ['LIBER_IMAGE_OUTPUT'])
+image.write_text('fresh paired volume')
+pathlib.Path(str(image)+'.build-key').write_text('current inputs')
+pathlib.Path(str(image)+'.build-digest').write_text('current output')
+''')
+            executable(root / "run.sh", '''#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['FIXTURE_ROOT'])
+args=sys.argv[1:]
+image=pathlib.Path(args[args.index('--image')+1]) if '--image' in args else None
+disk=pathlib.Path(os.environ['RUN_DISK']) if os.environ.get('RUN_DISK') else None
+row={'args':args,'image_bytes':image.read_text() if image else None,
+     'receipts':all(pathlib.Path(str(image)+suffix).is_file() for suffix in ('.build-key','.build-digest')) if image else False,
+     'disk_bytes':disk.read_text() if disk and disk.exists() else None,
+     'development':os.environ.get('LIBER_DEVELOPMENT'),'rustflags':os.environ.get('RUSTFLAGS')}
+with (root/'runs.jsonl').open('a') as out: out.write(json.dumps(row)+'\\n')
+''')
+            executable(harness / "guest-console.py", '''#!/usr/bin/env python3
+import pathlib,sys
+args=sys.argv[1:]
+pathlib.Path(args[args.index('--log')+1]).write_text('fixture: PASS\\n')
+''')
+            executable(binaries / "xorriso", '''#!/usr/bin/env python3
+import pathlib,sys
+args=sys.argv[1:]
+assert args[:2] == ['-osirrox','on']
+assert args[args.index('-extract')+1] == '/boot/efiboot.img'
+pathlib.Path(args[-1]).write_bytes(pathlib.Path(args[args.index('-indev')+1]).read_bytes())
+''')
+            executable(binaries / "mcopy", '''#!/usr/bin/env python3
+import pathlib,sys
+args=sys.argv[1:]
+assert args[0] == '-i' and args[2] == '::/system-volume.img'
+pathlib.Path(args[3]).write_bytes(pathlib.Path(args[1]).read_bytes())
+''')
+            env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}",
+                       FIXTURE_ROOT=str(root), FIXTURE_BUILD_FAIL=str(int(build_fails)),
+                       TMPDIR=str(temporary), LIBER_DEVELOPMENT="1", RUSTFLAGS="--cfg fixture_flag")
+            for name in ("BOOT_IMAGE", "RUN_DISK", "LIBER_IMAGE_OUTPUT"):
+                env.pop(name, None)
+            if pinned:
+                env["BOOT_IMAGE"] = str(image)
+            if disk:
+                env["RUN_DISK"] = str(persistent)
+            script = r'''
+set -euo pipefail
+root="$1/src"
+source "$root/tools/guest-gate.sh"
+guest_gate_arch --arch "$2"
+guest_gate_run 'probe first' fixture
+if [[ "$3" == 1 ]]; then printf '%s' 'state written by first guest' >"$RUN_DISK"; fi
+guest_gate_run 'probe second' fixture
+'''
+            result = subprocess.run(["bash", "-c", script, "fixture", str(root), arch,
+                                     str(int(mutate_disk))], cwd=root, env=env,
+                                    text=True, capture_output=True, timeout=10)
+            def records(name):
+                path = root / name
+                return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            builds, runs = records("build.jsonl"), records("runs.jsonl")
+            self.assertFalse(list(temporary.iterdir()), "owned image, receipts and temporary directories must be cleaned")
+            self.assertEqual((boot / "libersystem.iso").read_text(), "stale public artifact")
+            self.assertEqual((boot / "libersystem-dev.iso").read_text(), "stale public artifact")
+            return result, builds, runs
+
+    def test_stale_defaults_are_ignored_and_one_private_image_serves_both_boots(self):
+        result, builds, runs = self.exercise()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(builds[0]["args"], ["--format", "iso", "--dma-mode", "harness"])
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0]["args"], runs[1]["args"])
+        self.assertIn("private tmp", runs[0]["args"][-1])
+        for run in runs:
+            self.assertEqual(run["image_bytes"], "fresh paired volume")
+            self.assertTrue(run["receipts"])
+            self.assertEqual(run["development"], "1")
+            self.assertEqual(run["rustflags"], "--cfg fixture_flag")
+        self.assertEqual(builds[0]["development"], "1")
+        self.assertEqual(builds[0]["rustflags"], "--cfg fixture_flag")
+
+    def test_explicit_pin_with_spaces_avoids_build_and_remains_authoritative(self):
+        result, builds, runs = self.exercise(pinned=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(builds, [])
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(all(run["image_bytes"] == "selected pinned volume" for run in runs))
+        self.assertTrue(all(run["args"][-1].endswith("pinned image.iso") for run in runs))
+
+    def test_failed_preparation_prevents_any_guest_launch_and_cleans_owned_files(self):
+        result, builds, runs = self.exercise(build_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(runs, [])
+        self.assertIn("current x86 gate image did not build", result.stderr)
+
+    def test_missing_explicit_pin_neither_builds_nor_launches(self):
+        result, builds, runs = self.exercise(pinned=True, missing_pin=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((builds, runs), ([], []))
+
+    def test_port_launches_keep_existing_arguments_and_do_not_prepare_an_iso(self):
+        for arch in ("aarch64", "riscv64"):
+            with self.subTest(arch=arch):
+                result, builds, runs = self.exercise(arch=arch, pinned=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(builds, [])
+                self.assertEqual([run["args"] for run in runs], [["--arch", arch, "--smp", "2"]] * 2)
+
+    def test_existing_persistent_disk_is_not_replaced_by_preparation(self):
+        result, builds, runs = self.exercise(disk="existing", mutate_disk=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual([run["disk_bytes"] for run in runs], ["preexisting state", "state written by first guest"])
+
+    def test_new_disk_comes_from_exact_selected_iso_and_survives_the_second_boot(self):
+        for pinned in (False, True):
+            with self.subTest(pinned=pinned):
+                result, builds, runs = self.exercise(pinned=pinned, disk="missing", mutate_disk=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(builds), 0 if pinned else 1)
+                self.assertEqual(runs[0]["disk_bytes"], "selected pinned volume" if pinned else "fresh paired volume")
+                self.assertEqual(runs[1]["disk_bytes"], "state written by first guest")
+
+
 class KernelBuildOnly(unittest.TestCase):
     def exercise(self, remove_return):
         with tempfile.TemporaryDirectory() as temp:
@@ -731,6 +895,371 @@ print(json.dumps({'reason':'compiler-artifact','executable':str(out),'target':{'
         status, started, _ = self.exercise(True)
         self.assertNotEqual(status, 0)
         self.assertTrue(started)
+
+
+class ThreeDimensionalGatePhases(unittest.TestCase):
+    """Execute the real report/verdict loop; the guest command alone is a bounded stand-in."""
+
+    def run_phase(self, phase, bad=None):
+        source = (ROOT / "src/tools/check-qemu-3d-demo.sh").read_text()
+        marker = "failed=0\n"
+        self.assertEqual(source.count(marker), 1)
+        measurement = source[source.index(marker):]
+        with tempfile.TemporaryDirectory(prefix="3d phases ") as temporary:
+            root = Path(temporary)
+            frames = root / "frames"
+            frames.mkdir()
+            guest = root / "lab.sh"
+            guest.write_text("""#!/usr/bin/env python3
+import json,os,pathlib,re,sys
+command=sys.argv[-1]
+phase='extended' if '--postprocess' in command else 'core'
+width=int(re.search(r'--width (\\d+)',command)[1])
+height=int(re.search(r'--height (\\d+)',command)[1])
+with (pathlib.Path(__file__).parent/'calls.jsonl').open('a') as handle:
+    handle.write(json.dumps([phase,width,height])+ '\\n')
+bad=os.environ.get('BAD_ROW','')==f'{phase}:{width}'
+print('test3d-sw: presented 35 frame(s)')
+print('allocation counter observes shared-library preparation')
+print('steady samples 30 median_us', 1000000 if phase=='extended' else 33333, 'p99_us', 1000000 if phase=='extended' else 80000, 'render_alloc_max 0 loop_alloc_max 0')
+print('steady elapsed_ns', 30000000000 if phase=='extended' else (1000000001 if bad else 1000000000), 'max_us', 1000000 if phase=='extended' else 80000)
+print('test3d-sw: colour 1; test3d-sw: present 1; heap live_bytes 1; scene prepared bytes 1; present_max_us 1')
+if phase=='extended':
+    if not bad:
+        print('HDR chain executed six downsamples, five upsamples and resolve')
+    print('test3d-sw: postprocess 1; test3d-sw: shadow 1; HDR prepared bytes 1')
+""")
+            guest.chmod(0o755)
+            script = ('set -euo pipefail\n'
+                      'die() { printf "%s\\n" "$*" >&2; exit 1; }\n'
+                      'note() { printf "%s\\n" "$*"; }\n' + measurement)
+            result = subprocess.run(["bash", "-c", script], env={**os.environ,
+                "phase": phase, "REPO_ROOT": str(root), "FRAMES_DIR": str(frames),
+                "PROOF_DIR": str(frames), "BAD_ROW": bad or ""},
+                capture_output=True, text=True, timeout=10)
+            import json
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            logs = {path.name: path.read_text() for path in frames.iterdir()}
+            return result, calls, logs
+
+    def test_core_has_five_rows_and_cannot_run_extended(self):
+        result, calls, logs = self.run_phase("core", "extended:640")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, [["core", 320, 240], ["core", 800, 600]] + [["core", 640, 480]] * 3)
+        self.assertEqual(len(logs), 5)
+
+    def test_extended_has_three_rows_and_no_core_floor(self):
+        result, calls, logs = self.run_phase("extended", "core:640")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, [["extended", 320, 240], ["extended", 800, 600], ["extended", 640, 480]])
+        self.assertEqual(len(logs), 3)
+
+    def test_core_missed_full_window_keeps_all_five_proofs(self):
+        result, calls, logs = self.run_phase("core", "core:640")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stable 30 FPS floor missed", result.stderr)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(logs), 5)
+        self.assertTrue(all("presented 35 frame(s)" in log for log in logs.values()))
+
+    def test_extended_failure_keeps_all_three_proofs(self):
+        result, calls, logs = self.run_phase("extended", "extended:320")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(logs), 3)
+        self.assertTrue(all("presented 35 frame(s)" in log for log in logs.values()))
+
+    def test_registered_wrapper_selects_only_extended(self):
+        wrapper = (ROOT / "src/tools/check-qemu-3d-extended.sh").read_text()
+        self.assertIn('check-qemu-3d-demo.sh" --extended "$@"', wrapper)
+        source = (ROOT / "src/tools/check-qemu-3d-demo.sh").read_text()
+        self.assertIn('[[ "$#" == 1 && "$1" == --extended ]]', source)
+        self.assertIn('if [[ "$phase" == core ]]; then\n', source)
+        self.assertNotIn('for phase in core extended', source)
+
+
+class ThreeDimensionalResizePixels(unittest.TestCase):
+    """Independent ray-pattern fixtures for the native aspect oracle, without a guest."""
+
+    @staticmethod
+    def frame(path, width, height, fixed_aspect=None, shifted=0, flat=False):
+        pixels = bytearray()
+        for y in range(height):
+            v = y / height
+            for x in range(width):
+                ray = ((x / width - .5) * fixed_aspect if fixed_aspect else (x - width / 2) / height) + shifted
+                if flat:
+                    pixel = (30, 35, 40)
+                elif abs(ray) < .17 and .27 < v < .62:
+                    pixel = (int(110 + (ray + .2) * 200), int(60 + v * 100), int(70 + (ray + .2) * 120))
+                elif v > .60:
+                    checker = (int((ray + .5) * 18) + int(v * 19)) % 2
+                    pixel = (90 + checker * 70, int(80 + v * 70), int(45 + (ray + .5) * 130))
+                else:
+                    pixel = (15, 20, 35)
+                pixels.extend(pixel)
+        path.write_bytes(f"P6\n{width} {height}\n255\n".encode() + pixels)
+        spec = importlib.util.spec_from_file_location("resize_pixels", HERE / "check-3d-demo-frames.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module, module.Frame(path)
+
+    def compare(self, **options):
+        with tempfile.TemporaryDirectory(prefix="resize pixels ") as temporary:
+            root = Path(temporary)
+            module, first = self.frame(root / "desktop.ppm", 512, 384, flat=options.get("flat", False))
+            _, second = self.frame(root / "portrait.ppm", 240, 400, **options)
+            problems = []
+            module.check_resize(first, second, 240, 400, problems)
+            return problems
+
+    def test_fixed_vertical_fov_survives_changed_native_aspect(self):
+        self.assertEqual(self.compare(), [])
+
+    def test_stretching_a_retained_four_by_three_scene_fails(self):
+        self.assertTrue(self.compare(fixed_aspect=4 / 3))
+
+    def test_changed_camera_state_fails(self):
+        self.assertTrue(self.compare(shifted=.15))
+
+    def test_flat_frame_is_not_resize_evidence(self):
+        self.assertTrue(self.compare(flat=True))
+
+    def test_old_scanout_dimensions_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            module, frame = self.frame(Path(temporary) / "old.ppm", 512, 384)
+            problems = []
+            module.check_resize(frame, frame, 240, 400, problems)
+            self.assertTrue(problems)
+
+
+
+class ThreeDimensionalNativeResizeVerdict(unittest.TestCase):
+    """The complete native verdict must accept portrait projection and reject missing content."""
+
+    @staticmethod
+    def frame(path, width, height, *, flat=False, object_missing=False, panel_missing=False, stretched=False):
+        pixels = bytearray()
+        for y in range(height):
+            v = y / height
+            for x in range(width):
+                u = x / width
+                ray = (u - .5) * (4 / 3 if stretched else width / height)
+                pixel = (15, 20, 35)
+                if v > .60:
+                    checker = (int((ray + 1) * 18) + int(v * 19)) % 2
+                    shade = 70 + checker * 65 + int(v * 35)
+                    pixel = (shade, shade + 3, shade + 20)
+                if not object_missing and abs(ray) < .28 and .27 < v < .65:
+                    pixel = (int(110 + (ray + .3) * 180), int(90 + v * 80), int(80 + (ray + .3) * 140))
+                if not panel_missing and -.24 < ray < -.015 and .45 < v < .96:
+                    pixel = tuple((a + b) // 2 for a, b in zip(pixel, (20, 180, 245)))
+                if .04 < u < .43 and .03 < v < .19:
+                    pixel = (115, 130, 170)
+                    if .085 < u < .31 and .10 <= v <= .15 and int(u * 100) % 4 < 2:
+                        pixel = (20, 25, 40)
+                if flat:
+                    pixel = (30, 35, 40)
+                pixels.extend(pixel)
+        path.write_bytes(f"P6\n{width} {height}\n255\n".encode() + pixels)
+
+    def verdict(self, *, reference_options=None, **current_options):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        spec = importlib.util.spec_from_file_location("native_resize_verdict", HERE / "check-3d-demo-frames.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="native aspect verdict ") as temporary:
+            root = Path(temporary)
+            reference, current = root / "reference.ppm", root / "portrait.ppm"
+            self.frame(reference, 512, 384, **(reference_options or {}))
+            self.frame(current, 240, 400, **current_options)
+            output = StringIO()
+            with redirect_stdout(output):
+                code = module.main(["--resize", "240", "400", str(reference), str(current)])
+            return code, output.getvalue()
+
+    def test_native_portrait_with_a_wide_projected_object_passes_the_complete_verdict(self):
+        code, output = self.verdict()
+        self.assertEqual(code, 0, output)
+        self.assertIn("resize preserves the static scene, camera projection and HUD", output)
+
+    def test_blank_current_cannot_pass_as_a_resized_scene(self):
+        code, output = self.verdict(flat=True)
+        self.assertNotEqual(code, 0)
+        self.assertIn("cleared surface rather than a scene", output)
+
+    def test_object_removed_from_current_fails_camera_correspondence(self):
+        code, output = self.verdict(object_missing=True)
+        self.assertNotEqual(code, 0)
+        self.assertIn("corresponding camera rays match after resize", output)
+
+    def test_stretching_a_retained_scene_fails_camera_correspondence(self):
+        code, output = self.verdict(stretched=True)
+        self.assertNotEqual(code, 0)
+        self.assertIn("corresponding camera rays match after resize", output)
+
+    def test_blank_reference_cannot_supply_the_object_proof(self):
+        code, output = self.verdict(reference_options=dict(flat=True))
+        self.assertNotEqual(code, 0)
+        self.assertIn("cleared surface rather than a scene", output)
+
+    def test_object_absent_from_reference_cannot_supply_the_object_proof(self):
+        code, output = self.verdict(reference_options=dict(object_missing=True, panel_missing=True))
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing stands in front of the horizon", output)
+
+
+resize_tests_spec = importlib.util.spec_from_file_location("rfb_resize_tests", HERE / "test-3d-demo-resize.py")
+resize_tests_module = importlib.util.module_from_spec(resize_tests_spec)
+resize_tests_spec.loader.exec_module(resize_tests_module)
+RfbResizeTests = resize_tests_module.RfbResizeTests
+RfbOwnershipTests = resize_tests_module.RfbOwnershipTests
+RfbAdmissionTests = resize_tests_module.RfbAdmissionTests
+
+
+class ThreeDimensionalResizeOwnership(unittest.TestCase):
+    """Real admission/cleanup shell, with the image and lab lifecycle substituted."""
+
+    def exercise(self, running=False, phase="core", boot_fails=False, changed=False, owned_on_failure=True, quit_fails=False, remains_alive=False, live=False, appears_after_probe=False, identity_error=False):
+        import json
+        source = (HERE / "check-qemu-3d-demo.sh").read_text()
+        marker = 'if [[ "$phase" == core ]]; then\n\tpython3 "$RESIZE"'
+        self.assertEqual(source.count(marker), 1)
+        prefix = source[:source.index(marker)]
+        with tempfile.TemporaryDirectory(prefix="3d owned ") as temporary:
+            root = Path(temporary)
+            (root / "src/tools").mkdir(parents=True)
+            (root / "lib.sh").write_text('set -euo pipefail\nREPO_ROOT="$TEST_ROOT"\nnote() { :; }\ndie() { echo "$*" >&2; exit 1; }\n')
+            (root / "src/tools/check-3d-demo-package.py").write_text('pass\n')
+            (root / "src/tools/3d-demo-resize.py").write_text("""import os,json,sys,pathlib
+if '--live-state' in sys.argv:
+    if os.environ['IDENTITY_ERROR']=='1': sys.exit(2)
+    active=os.environ['EXISTING_LIVE']=='1' or (os.environ['APPEARS_AFTER_PROBE']=='1' and (pathlib.Path(os.environ['TEST_ROOT'])/'probed').exists())
+    print(json.dumps({'pid':122,'pgid':122,'started':33} if active else None))
+    sys.exit(0 if active else 1)
+if '--owner-state' in sys.argv:
+    active=(pathlib.Path(os.environ['TEST_ROOT'])/'active').exists()
+    print(json.dumps({'pid':123,'pgid':123,'arguments':['private']} if active else None))
+    sys.exit(0 if active else 1)
+with open(os.environ['CALLS'],'a') as f: f.write(json.dumps(['resize']+sys.argv[1:])+'\\n')
+""")
+            lab = root / "lab.sh"
+            lab.write_text('''#!/usr/bin/env python3
+import os,json,sys,pathlib
+args=sys.argv[1:]
+with open(os.environ['CALLS'],'a') as f:
+    f.write(json.dumps(args+[os.environ.get('SMP'),os.environ.get('VNC_ADDR')])+'\\n')
+if args[:2]==['sh','uname']:
+    (pathlib.Path(os.environ['TEST_ROOT'])/'probed').touch()
+    sys.exit(0 if os.environ['RUNNING']=='1' else 1)
+if args[0]=='boot':
+    if os.environ['BOOT_FAILS']!='1' or os.environ['OWNED_ON_FAILURE']=='1':
+        (pathlib.Path(os.environ['TEST_ROOT'])/'active').touch()
+    sys.exit(1 if os.environ['BOOT_FAILS']=='1' else 0)
+if args[0]=='quit':
+    if os.environ['REMAINS_ALIVE']!='1':
+        (pathlib.Path(os.environ['TEST_ROOT'])/'active').unlink(missing_ok=True)
+    sys.exit(1 if os.environ['QUIT_FAILS']=='1' else 0)
+if args==['monitor','info cpus']:
+    for i in range(32): print(f' CPU #{i}: thread_id={i}')
+if args==['monitor','info kvm']: print('kvm support: enabled')
+''')
+            lab.chmod(0o755)
+            gate = root / "src/tools/check-qemu-3d-demo.sh"
+            tail = '\n'
+            if changed:
+                tail += 'ORIGINAL_WIDTH=1280\nORIGINAL_HEIGHT=800\nVNC_CHANGED=1\n'
+            tail += 'exit 0\n'
+            gate.write_text(prefix + tail)
+            env = {**os.environ, "TEST_ROOT": str(root), "CALLS": str(root / "calls"),
+                   "RUNNING": str(int(running)), "BOOT_FAILS": str(int(boot_fails)), "SMP": "4",
+                   "OWNED_ON_FAILURE": str(int(owned_on_failure)), "QUIT_FAILS": str(int(quit_fails)),
+                   "REMAINS_ALIVE": str(int(remains_alive)), "EXISTING_LIVE": str(int(live)),
+                   "APPEARS_AFTER_PROBE": str(int(appears_after_probe)), "IDENTITY_ERROR": str(int(identity_error))}
+            result = subprocess.run(["bash", str(gate)] + (["--extended"] if phase == "extended" else []),
+                                    env=env, capture_output=True, text=True, timeout=10)
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()] if (root / "calls").exists() else []
+            for call in calls:
+                if call[0] == "boot" and call[-1]:
+                    directory = Path(call[-1].removeprefix("unix:")).parent
+                    self.assertEqual(directory.exists(), remains_alive, "private endpoint must remain only while its owned guest survives")
+                    if directory.exists():
+                        import shutil
+                        shutil.rmtree(directory)  # Fixture-only teardown; no real guest was started.
+            return result, calls
+
+    def test_foreign_core_guest_is_refused_without_resize_or_shutdown(self):
+        result, calls = self.exercise(running=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call[0] for call in calls], ["sh"])
+
+    def test_live_busy_core_guest_is_refused_before_shell_or_boot(self):
+        result, calls = self.exercise(live=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("existing live lab guest was left unchanged", result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_live_busy_extended_guest_is_not_replaced_after_failed_shell(self):
+        result, calls = self.exercise(phase="extended", live=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call[0] for call in calls], ["sh"])
+
+    def test_core_rechecks_live_identity_after_failed_shell(self):
+        result, calls = self.exercise(appears_after_probe=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call[0] for call in calls], ["sh"])
+
+    def test_unreadable_identity_cannot_authorize_boot(self):
+        result, calls = self.exercise(identity_error=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to boot", result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_owned_core_uses_private_vnc_and_only_its_shutdown(self):
+        result, calls = self.exercise()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        boot = next(call for call in calls if call[0] == "boot")
+        self.assertEqual(boot[1:3], ["--vnc", "32"])
+        self.assertTrue(boot[-1].startswith("unix:/tmp/liber-3d-vnc."))
+        self.assertEqual(sum(call[0] == "quit" for call in calls), 1)
+
+    def test_failed_owned_boot_still_cleans_up(self):
+        result, calls = self.exercise(boot_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sum(call[0] == "quit" for call in calls), 1)
+
+    def test_failed_boot_without_ownership_never_quits(self):
+        result, calls = self.exercise(boot_fails=True, owned_on_failure=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(call[0] in ("quit", "resize") for call in calls))
+
+    def test_failed_quit_turns_successful_body_into_failure(self):
+        result, _ = self.exercise(quit_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_surviving_owned_guest_fails_and_keeps_private_endpoint(self):
+        result, _ = self.exercise(remains_alive=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_changed_output_is_restored_before_owned_shutdown(self):
+        result, calls = self.exercise(changed=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        resize_index = next(i for i, call in enumerate(calls) if call[0] == "resize")
+        quit_index = next(i for i, call in enumerate(calls) if call[0] == "quit")
+        self.assertLess(resize_index, quit_index)
+        self.assertEqual(calls[resize_index][-6:], ["--width", "1280", "--height", "800", "--timeout", "10"])
+
+    def test_extended_can_reuse_checked_guest_without_owning_it(self):
+        result, calls = self.exercise(running=True, phase="extended", live=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call[0] in ("boot", "resize", "quit") for call in calls))
+
+
+gadget_cleanup_spec = importlib.util.spec_from_file_location("gadget_cleanup_tests", HERE / "test-usb-gadget-cleanup.py")
+gadget_cleanup_module = importlib.util.module_from_spec(gadget_cleanup_spec)
+gadget_cleanup_spec.loader.exec_module(gadget_cleanup_module)
+UsbGadgetCleanupTests = gadget_cleanup_module.UsbGadgetCleanupTests
 
 
 if __name__ == "__main__":

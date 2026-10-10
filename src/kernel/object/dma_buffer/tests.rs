@@ -72,7 +72,10 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	// the generation is what stops a mapping from landing in a later binding's domain. These test
 	// devices are not translated, so the key is here to name the device rather than to be checked.
 	const BINDING: abi::ClaimKey = abi::ClaimKey { device_index: DEVICE, _pad: 0, generation: 1 };
-	let domain = crate::sched::root_domain();
+	let parent = Domain::new(u64::MAX, u64::MAX, u64::MAX);
+	let domain = Domain::new_child(&parent, u64::MAX, u64::MAX, u64::MAX).expect("a child DMA account");
+	domain.account().dma().set_limit(3 * PAGE_SIZE);
+	parent.account().dma().set_limit(3 * PAGE_SIZE);
 	assert_eq!(super::held_frames_for_test(DEVICE), 0, "nothing is held for this device to begin with");
 
 	// 1. A buffer whose owner CLOSED it: the frames go back at once, exactly as before.
@@ -81,6 +84,8 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	};
 	drop(deliberate);
 	assert_eq!(super::held_frames_for_test(DEVICE), 0, "a buffer its owner released is not held - that would leak on the ordinary path");
+	assert_eq!(domain.account().dma().used(), 0, "clean close returns the child's charge");
+	assert_eq!(parent.account().dma().used(), 0, "and its ancestor's charge");
 
 	// 2. A buffer whose owner was TERMINATED holding it. The process teardown marks it, so the drop
 	//    that follows keeps the frames out of circulation.
@@ -96,6 +101,9 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	// AND THE DEVICE IS KNOWN TO BE ONE ITS LAST DRIVER LEFT RUNNING, which is what holds a re-claim's bus
 	// mastering off until the next driver has reset it.
 	assert!(super::holds_for(DEVICE), "frames held for the device say its last driver ended with its DMA unconfirmed");
+	assert_eq!(domain.account().dma().used(), 3 * PAGE_SIZE, "killing the owner retains the held backing's charge");
+	assert_eq!(parent.account().dma().used(), 3 * PAGE_SIZE, "the same retained charge reaches its ancestor");
+	assert!(matches!(DmaBuffer::create_in(&domain, PAGE_SIZE as usize), Err(super::MemoryError::QuotaExceeded)), "retained frames cannot be hidden from the DMA limit by killing their process");
 	assert!(!super::holds_for(DEVICE + 1), "and say nothing about any other device");
 
 	// 3. And they come back when - and only when - somebody proves the device has been stopped.
@@ -108,13 +116,34 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	let other = DeviceMemory::for_claim(other_key, 0x1000_0000, PAGE_SIZE as usize).expect("a test device memory");
 	assert_eq!(super::release_for(other.claim().expect("it names a binding").device_index), 0, "resetting a different device releases nothing");
 	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "still held");
+	assert_eq!(domain.account().dma().used(), 3 * PAGE_SIZE, "another device's reset refunds nothing here");
+	assert_eq!(parent.account().dma().used(), 3 * PAGE_SIZE);
 
 	let released = super::release_for(DEVICE);
 	assert_eq!(released, frames.len(), "resetting the device releases exactly its held frames");
 	assert_eq!(super::held_frames_for_test(DEVICE), 0, "and nothing is held for it any more");
 	assert!(!super::holds_for(DEVICE), "a device that was reset holds nothing back for its next binding");
+	assert_eq!(domain.account().dma().used(), 0, "a confirmed release refunds the child exactly once");
+	assert_eq!(parent.account().dma().used(), 0, "and its ancestor exactly once");
+	assert_eq!(super::release_for(DEVICE), 0, "repeated reset releases nothing twice");
+	assert_eq!(domain.account().dma().used(), 0);
+	assert_eq!(parent.account().dma().used(), 0);
+	let Ok(replacement) = DmaBuffer::create_in(&domain, 3 * PAGE_SIZE as usize) else { panic!("a reset makes the quota available again") };
+	drop(replacement);
 	drop(process);
 	crate::sched::run_until_idle();
+
+	// A standalone account has no parent's child list keeping it alive. The held backing itself
+	// must retain its owner after the creating buffer and all caller references disappear.
+	let owner = Domain::new(u64::MAX, u64::MAX, u64::MAX);
+	let weak = alloc::sync::Arc::downgrade(&owner);
+	let Ok(pending) = DmaBuffer::create_for(&owner, PAGE_SIZE as usize, Some(BINDING)) else { panic!("one held page") };
+	pending.mark_orphaned();
+	drop(pending);
+	drop(owner);
+	assert_eq!(weak.upgrade().expect("held frames retain their account").account().dma().used(), PAGE_SIZE);
+	assert_eq!(super::release_for(DEVICE), 1);
+	assert!(weak.upgrade().is_none(), "confirmed release also relinquishes the held account owner");
 }
 
 crate::tagged_test!(a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them, [Dma, Drivers, Memory, Kernel], id = "kernel.object.dma_buffer.a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them", covers = ["kernel"]);
@@ -142,12 +171,27 @@ fn a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them() {
 	assert_eq!(super::held_frames_for_test(DEVICE), super::MAX_HELD, "a table with room holds every entry");
 	assert_eq!(super::leaked_frames_for_test(), leaked_before, "and loses nothing while it has room");
 
-	// One past it. The frames do not come back and they are not retired - they are counted lost.
-	super::hold_for_test(DEVICE, alloc::vec![FAKE_BASE + 0x1_0000, FAKE_BASE + 0x2_0000, FAKE_BASE + 0x3_0000]);
+	// One past it, through the actual buffer destructor. These three frame numbers are invented,
+	// just like the filled table; the full-table branch must NEVER retire them. The charge is real
+	// test accounting, so this catches a destructor that refunds after hold reports overflow.
+	let parent = Domain::new(u64::MAX, u64::MAX, u64::MAX);
+	let domain = Domain::new_child(&parent, u64::MAX, u64::MAX, u64::MAX).expect("an overflow account");
+	domain.account().dma().set_limit(3 * PAGE_SIZE);
+	assert!(domain.try_charge_dma(3 * PAGE_SIZE));
+	let owner = alloc::sync::Arc::downgrade(&domain);
+	let orphan = DmaBuffer { header: super::ObjectHeader::new(), frames: alloc::vec![FAKE_BASE + 0x1_0000, FAKE_BASE + 0x2_0000, FAKE_BASE + 0x3_0000], size: 3 * PAGE_SIZE as usize, mappings: super::SpinLock::new(alloc::vec::Vec::new()), domain: domain.clone(), device: Some(DEVICE), translation: super::SpinLock::new(None), orphaned: super::AtomicBool::new(true) };
+	drop(orphan);
 	assert_eq!(super::held_frames_for_test(DEVICE), super::MAX_HELD, "the table did not grow");
 	assert_eq!(super::leaked_frames_for_test(), leaked_before + 3, "the three frames it could not hold are counted as leaked");
 	assert_eq!(crate::mem::frame::lost_pages(), lost_before + 3, "and counted in the machine-wide lost total, which is where a leak is diagnosed from");
 
 	super::forget_for_test(DEVICE);
 	assert_eq!(super::held_frames_for_test(DEVICE), 0, "the test leaves the table as it found it");
+	assert_eq!(super::release_for(DEVICE), 0, "a later reset cannot recover overflow pages whose records were lost");
+	assert_eq!(domain.account().dma().used(), 3 * PAGE_SIZE, "permanently lost pages stay charged after all retained entries are gone");
+	assert_eq!(parent.account().dma().used(), 3 * PAGE_SIZE, "permanent loss remains charged to the ancestor too");
+	assert!(matches!(DmaBuffer::create_in(&domain, PAGE_SIZE as usize), Err(super::MemoryError::QuotaExceeded)), "overflow cannot erase its quota cost");
+	drop(domain);
+	drop(parent);
+	assert_eq!(owner.upgrade().expect("the lost backing permanently retains its charged owner").account().dma().used(), 3 * PAGE_SIZE);
 }

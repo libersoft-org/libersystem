@@ -11,10 +11,11 @@
 // core is `enqueue_on` plus a wake IPI to that core (`arch::apic::send_wake_ipi`), and a wake is
 // wake-side migration: `wake_object` puts the woken thread on the WAKER's run queue, so a thread
 // can resume on a different core than it blocked on - see the migration note in `enqueue`. There
-// is no load balancer and no affinity; a runnable thread stays on the core it was placed on until
+// is no load balancer; a legacy runnable thread stays on the core it was placed on until
 // it blocks and something wakes it elsewhere. An address space that is live on several cores is
 // kept coherent by the synchronous cross-core shootdown in `mem::tlb`, which the same note
-// describes.
+// describes. An opt-in SYS_THREAD_START_ON instead records one immutable CPU, honored by every
+// enqueue below; existing starts keep their wake-side migration unchanged.
 //
 // The bootstrap/idle context of each core (the stack the kernel booted on, and
 // the AP idle loop) is the fallback that runs when no thread is ready. Its stack
@@ -169,6 +170,9 @@ static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
 // every core at creation, growing the deque outside the lock) are recorded there because both are
 // worse than not needing to.
 fn enqueue_on(cpu: usize, thread: Arc<Thread>) {
+	// Placement is published with the first start claim and can never change. All initial and
+	// wake enqueues come here; preemption/yield already requeue on that same executing CPU.
+	let cpu = thread.cpu_placement().unwrap_or(cpu);
 	// ALLOC-OK: NOTHING IS ALLOCATED - the intrusive `RunQueue` moves pointers, since the link
 	// lives in the `Thread` itself. The same marker the requeue path above carries, and it has to
 	// be repeated HERE rather than left in the comment block above the function: the gate reads a
@@ -615,11 +619,25 @@ pub fn thread_create_suspended(process: Arc<Process>, entry: extern "C" fn(u64),
 // once. Returns false if the thread was already started, so a repeated call is a
 // safe no-op rather than a double-enqueue.
 pub fn thread_start(thread: Arc<Thread>) -> bool {
+	thread_start_with_placement(thread, None)
+}
+
+// A persistent, opt-in placement. A CPU that never came online is refused before the start claim,
+// leaving the suspended thread intact. Online CPUs are not removed by this kernel; suspend parks
+// and restores the same cores without removing them from its online set.
+pub fn thread_start_on(thread: Arc<Thread>, cpu: usize) -> bool {
+	if cpu >= crate::smp::cpu_count() || !crate::smp::is_online(cpu) {
+		return false;
+	}
+	thread_start_with_placement(thread, Some(cpu))
+}
+
+fn thread_start_with_placement(thread: Arc<Thread>, cpu: Option<usize>) -> bool {
 	// THROUGH THE PROCESS, so the check and the claim are one operation. A bare `try_start` answers
 	// "has this thread been started before" and says nothing about whether its process is still
 	// alive; `claim_thread_start` takes the same lock teardown publishes under, so a termination
 	// cannot complete between the two.
-	if !thread.process().claim_thread_start(&thread) {
+	if !thread.process().claim_thread_start(&thread, cpu) {
 		return false;
 	}
 	thread.set_state(ThreadState::Ready);
@@ -1090,7 +1108,7 @@ pub fn earliest_deadline() -> Option<u64> {
 	TIMED_WAITERS.lock().iter().map(|w: &TimedWaiter| w.deadline).min()
 }
 
-// Make a woken thread runnable again on the current core.
+// Make a woken thread runnable on its immutable placement, or on the waker for a legacy start.
 fn enqueue(thread: Arc<Thread>, cause: u8) {
 	// A freshly claimed thread may still be completing its switch away: the block
 	// path zeroes the saved stack pointer before parking and the context switch
@@ -1105,7 +1123,7 @@ fn enqueue(thread: Arc<Thread>, cause: u8) {
 	if crate::perf::armed() {
 		crate::perf::wake(&thread, cause);
 	}
-	// The WAKER's run queue, which means a woken thread can resume on a different core
+	// Without explicit placement, the WAKER's run queue, so a thread can resume on a different core
 	// than it left. That is migration, and it is deliberate: it puts the thread where the
 	// data that woke it is warm, and it needs no balancer.
 	//
@@ -1567,6 +1585,8 @@ fn reschedule_as(disp: Disposition, why: u8) {
 	reap(sched);
 
 	let mut guard = sched.inner.lock();
+	#[cfg(test)]
+	observe_placed_execution(guard.current.as_deref());
 	// THE DRAIN'S WINDOW ENDS A THREAD'S TURN, and this is the only place it can.
 	//
 	// Only for a REQUEUE: a thread that is blocking or retiring is leaving anyway, and both of those
@@ -1768,3 +1788,45 @@ fn stash_prev(inner: &mut CpuSchedInner, sched: &CpuSched, prev: Option<Arc<Thre
 
 #[cfg(test)]
 mod tests;
+
+// A test-only record of placed threads which have actually executed and are now yielding,
+// blocking or exiting. Recording the outgoing thread retains even short or already retired
+// workers; it is evidence of execution on distinct CPUs, not an instantaneous concurrency count.
+#[cfg(test)]
+static PLACED_EXECUTION: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
+
+#[cfg(test)]
+pub fn begin_placed_execution(process: &Arc<Process>) {
+	let mut observation = PLACED_EXECUTION.lock();
+	assert_eq!(observation.0, 0, "only one placement observation may be armed");
+	*observation = (process.header().koid(), 0);
+}
+
+#[cfg(test)]
+pub fn read_placed_execution() -> u64 {
+	PLACED_EXECUTION.lock().1
+}
+
+#[cfg(test)]
+pub fn end_placed_execution() -> u64 {
+	let mut observation = PLACED_EXECUTION.lock();
+	let mask = observation.1;
+	*observation = (0, 0);
+	mask
+}
+
+#[cfg(test)]
+fn observe_placed_execution(thread: Option<&Thread>) {
+	let cpu = current_cpu_id();
+	if let Some(thread) = thread
+		&& thread.cpu_placement() == Some(cpu)
+	{
+		let mut observation = PLACED_EXECUTION.lock();
+		if observation.0 == thread.process().header().koid() {
+			observation.1 |= 1u64 << cpu;
+		}
+	}
+}
+
+#[cfg(test)]
+mod placement_tests;

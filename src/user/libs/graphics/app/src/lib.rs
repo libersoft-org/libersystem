@@ -19,6 +19,9 @@ mod pacing;
 
 pub use pacing::{Pacing, Step, Timing};
 
+#[cfg(any(feature = "runtime", test))]
+mod frame_starts;
+
 #[cfg(feature = "runtime")]
 mod frame_loop;
 

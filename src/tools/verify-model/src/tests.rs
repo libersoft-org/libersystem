@@ -2749,7 +2749,7 @@ fn evidence_under_another_model_does_not_qualify_a_candidate() {
 // whatever it had converged to. All three produced a WRONG PLAN rather than an error, which is the
 // one outcome a scheduler cannot recover from, so each is asserted here on its own.
 fn step_for_test(id: &str, requires: &[&str]) -> crate::commands::Step {
-	crate::commands::Step { id: id.to_string(), requires: requires.iter().map(|r| (*r).to_string()).collect(), label: id.to_string(), command: String::from("true"), keys: Vec::new(), note: None, guests: 0 }
+	crate::commands::Step { id: id.to_string(), requires: requires.iter().map(|r| (*r).to_string()).collect(), label: id.to_string(), command: String::from("true"), keys: Vec::new(), note: None, guests: 0, exclusive_guests: false }
 }
 
 #[test]
@@ -2871,6 +2871,34 @@ fn every_profile_row_is_a_step_of_its_own() {
 	for name in crate::catalog::PROFILE_ROW_GATES {
 		assert!(known.contains(name), "{name} is named as a profile row and is not a registered gate");
 	}
+}
+
+#[test]
+fn shared_guest_scenarios_keep_their_keys_and_slots_but_require_isolation() {
+	let model = model();
+	let steps = crate::commands::release_steps(&model.catalog, &model.registry);
+	let known = crate::catalog::catalog_gate_names();
+	for gate in crate::catalog::EXCLUSIVE_GUEST_GATES {
+		assert!(known.contains(*gate), "unknown exclusive gate {gate}");
+		let selected: Vec<_> = steps.iter().filter(|step| step.keys.iter().any(|key| key.check == format!("gate.{gate}"))).collect();
+		assert_eq!(selected.len(), 1, "the real release plan keeps exactly one step for {gate}");
+		assert!(selected[0].exclusive_guests, "{gate} must hold its scenario's shared resources");
+		assert_eq!(selected[0].guests, crate::catalog::gate_concurrent_guests(gate));
+	}
+	for step in &steps {
+		if step.id.starts_with("guest:") || step.id.starts_with("gate-profile:") {
+			assert!(!step.exclusive_guests, "isolated suites and profile rows still overlap: {}", step.id);
+		}
+	}
+	for gate in ["virtio-gpu-edid-aarch64", "virtio-gpu-edid-riscv64"] {
+		let step = steps.iter().find(|step| step.keys.iter().any(|key| key.check == format!("gate.{gate}"))).unwrap();
+		assert!(!step.exclusive_guests, "the private port EDID guest builds no image and keeps its concurrency");
+	}
+	let lifecycle = steps.iter().find(|step| step.id == "dev:lifecycle").unwrap();
+	assert!(lifecycle.exclusive_guests);
+	assert_eq!(lifecycle.guests, 1);
+	let overlap = steps.iter().find(|step| step.keys.iter().any(|key| key.check == "gate.concurrent-selection")).unwrap();
+	assert_eq!(overlap.guests, 2, "isolation must not trim the two actual concurrent guests");
 }
 
 // ---------------------------------------------------------------------------------------------

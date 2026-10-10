@@ -190,3 +190,182 @@ fn focus_follows_the_surface_and_is_not_visibility() {
 	assert!(!pacing.focused());
 	assert_eq!(pacing.step(0), Step::Draw, "and a visible window without focus still draws");
 }
+
+#[test]
+fn fallback_counts_rendering_and_blocking_present_inside_the_interval() {
+	let mut pacing = adopted(1);
+	pacing.on_present_started(1, 5_000_000, Some(0));
+	assert_eq!(pacing.step(5_000_000), Step::AwaitCompletion, "a due time cannot release an image");
+	pacing.on_release(1);
+	for now in [5_000_000, 8_000_000, 15_999_999] {
+		pacing.on_event(&SurfaceEvent::ImageAvailable);
+		assert_eq!(pacing.step(now), Step::Idle { until: Some(16_000_000) }, "early events do not restart or finish the deadline");
+	}
+	assert_eq!(pacing.step(16_000_000), Step::Draw);
+	pacing.on_present_started(2, 56_000_000, Some(16_000_000));
+	assert_eq!(pacing.step(56_000_000), Step::AwaitCompletion);
+	pacing.on_release(2);
+	assert_eq!(pacing.step(56_000_000), Step::Draw, "forty milliseconds of useful frame work need no extra sixteen");
+	pacing.on_present_started(3, 61_000_000, Some(56_000_000));
+	pacing.on_release(3);
+	assert_eq!(pacing.step(61_000_000), Step::Idle { until: Some(72_000_000) }, "a subsequent cheap frame waits again, without catching up");
+}
+
+#[test]
+fn a_late_wake_starts_a_new_cadence_and_does_not_catch_up() {
+	let mut pacing = adopted(2);
+	pacing.on_present_started(1, 90_000_000, Some(84_000_000));
+	pacing.on_release(1);
+	assert_eq!(pacing.step(120_000_000), Step::Draw);
+	pacing.on_present_started(2, 125_000_000, Some(120_000_000));
+	pacing.on_release(2);
+	assert_eq!(pacing.step(125_000_000), Step::Idle { until: Some(136_000_000) });
+}
+
+#[test]
+fn acquired_images_keep_independent_starts_when_presented_out_of_order() {
+	use crate::frame_starts::FrameStarts;
+	let mut starts = FrameStarts::new(2, 1).unwrap();
+	let mut pacing = adopted(2);
+	starts.step(Step::Draw, 100_000_000);
+	let a = starts.begin_acquire();
+	starts.acquired(0, 0x1000, a);
+	starts.step(Step::Draw, 110_000_000);
+	let b = starts.begin_acquire();
+	starts.acquired(1, 0x2000, b);
+	assert_eq!(starts.take(0, 0x9999, 1), None, "a different mapping does not spend A's start");
+	pacing.on_present_started(2, 115_000_000, starts.take(1, 0x2000, 1));
+	pacing.on_present_started(1, 116_000_000, starts.take(0, 0x1000, 1));
+	assert_eq!(pacing.step(116_000_000), Step::AwaitCompletion);
+	pacing.on_release(2);
+	assert_eq!(pacing.step(116_000_000), Step::Idle { until: Some(126_000_000) }, "A's earlier start does not shorten B's cadence");
+	assert_eq!(starts.take(0, 0x1000, 1), None);
+	assert_eq!(starts.take(1, 0x2000, 1), None);
+}
+
+#[test]
+fn a_direct_acquire_deadline_is_not_shortened_by_an_older_started_image() {
+	use crate::frame_starts::FrameStarts;
+	let mut starts = FrameStarts::new(2, 1).unwrap();
+	let mut pacing = adopted(2);
+	starts.step(Step::Draw, 0);
+	let a = starts.begin_acquire();
+	starts.acquired(0, 0x1000, a);
+	let b = starts.begin_acquire();
+	assert_eq!(b, None, "a direct acquire has no invented frame-start time");
+	starts.acquired(1, 0x2000, b);
+	pacing.on_present_started(2, 15_000_000, starts.take(1, 0x2000, 1));
+	pacing.on_present_started(1, 20_000_000, starts.take(0, 0x1000, 1));
+	pacing.on_release(2);
+	assert_eq!(pacing.step(20_000_000), Step::Idle { until: Some(31_000_000) });
+	// The public entry point still chooses exactly now + interval, even when called directly
+	// with a time older than a prior test frame; it does not inherit the private max guard.
+	pacing.on_release(1);
+	pacing.on_present(3, 1_000_000);
+	assert_eq!(pacing.step(1_000_000), Step::Idle { until: Some(17_000_000) });
+}
+
+#[test]
+fn repeated_draw_queries_and_refused_acquires_do_not_move_work_to_another_image() {
+	use crate::frame_starts::FrameStarts;
+	let mut starts = FrameStarts::new(2, 1).unwrap();
+	starts.step(Step::Draw, 10);
+	starts.step(Step::Draw, 20);
+	assert_eq!(starts.begin_acquire(), Some(10), "querying Draw twice does not erase work already begun");
+	// That attempt was refused: no acquired slot is assigned.
+	assert_eq!(starts.begin_acquire(), None);
+	starts.step(Step::AwaitCompletion, 30);
+	starts.step(Step::Draw, 40);
+	let next = starts.begin_acquire();
+	starts.acquired(1, 0x2000, next);
+	assert_eq!(starts.take(1, 0x2000, 1), Some(40));
+	starts.step(Step::Draw, 50);
+	starts.step(Step::Idle { until: Some(80) }, 60);
+	assert_eq!(starts.begin_acquire(), None, "a non-Draw decision cancels unacquired work");
+}
+
+#[test]
+fn abandoning_or_failing_one_present_consumes_only_that_images_start() {
+	use crate::frame_starts::FrameStarts;
+	let mut starts = FrameStarts::new(3, 1).unwrap();
+	for (index, addr, time) in [(0, 0x1000, 10), (1, 0x2000, 20)] {
+		starts.step(Step::Draw, time);
+		let began = starts.begin_acquire();
+		starts.acquired(index, addr, began);
+	}
+	starts.step(Step::Draw, 30);
+	assert_eq!(starts.take(0, 0x1000, 1), Some(10), "abandon consumes A");
+	assert_eq!(starts.take(0, 0x1000, 1), None);
+	assert_eq!(starts.take(1, 0x2000, 1), Some(20), "a present takes B before its RPC can fail");
+	assert_eq!(starts.take(1, 0x2000, 1), None, "failure cannot reuse B's timestamp");
+	let c = starts.begin_acquire();
+	assert_eq!(c, Some(30), "neither operation consumes an unrelated pending Draw");
+	starts.acquired(2, 0x3000, c);
+	assert_eq!(starts.take(2, 0x3000, 1), Some(30));
+}
+
+#[test]
+fn hidden_and_rebuild_transitions_do_not_leave_a_pending_start() {
+	use crate::frame_starts::FrameStarts;
+	let mut starts = FrameStarts::new(2, 1).unwrap();
+	let mut pacing = adopted(2);
+	starts.step(Step::Draw, 10);
+	let began = starts.begin_acquire();
+	starts.acquired(0, 0x1000, began);
+	starts.step(Step::Draw, 20);
+	// These are the same adapter operations as a false visibility event, even if a true event
+	// follows before the application next asks step(). An already acquired image stays its own.
+	starts.cancel_pending();
+	pacing.on_event(&SurfaceEvent::VisibilityChanged(false));
+	assert_eq!(starts.begin_acquire(), None);
+	pacing.on_present_started(1, 30, starts.take(0, 0x1000, 1));
+	assert_eq!(pacing.step(30), Step::Idle { until: Some(30 + BACKGROUND_INTERVAL_NS) });
+	pacing.on_release(1);
+	pacing.on_event(&SurfaceEvent::VisibilityChanged(true));
+	starts.step(Step::Draw, 40);
+	let began = starts.begin_acquire();
+	starts.acquired(0, 0x1000, began);
+	starts.step(Step::Draw, 50);
+	starts.invalidate();
+	assert_eq!(starts.take(0, 0x1000, 1), None, "even a failed rebuild discarded old mapping metadata");
+	assert_eq!(starts.begin_acquire(), None);
+	starts.reset(3, 2).unwrap();
+	pacing.adopt(&configuration(2, 2, 128, 128, true), 3);
+	assert_eq!(pacing.step(0), Step::Draw, "the new generation is immediately drawable");
+	starts.step(Step::Draw, 100);
+	let began = starts.begin_acquire();
+	starts.acquired(0, 0x1000, began);
+	assert_eq!(starts.take(0, 0x1000, 1), None, "an old generation cannot consume fresh metadata");
+	assert_eq!(starts.take(0, 0x1000, 2), Some(100));
+}
+
+#[test]
+fn real_timing_replaces_the_frame_start_fallback_without_leaking_a_deadline() {
+	let mut pacing = adopted(3);
+	pacing.on_present_started(1, 5_000_000, Some(0));
+	pacing.on_completion(&completion(1, PresentOutcome::Displayed, FrameTiming { preferred_deadline: Some(500_000_000), refresh_interval: Some(8_000_000) }));
+	pacing.on_present_started(2, 10_000_000, Some(6_000_000));
+	assert_eq!(pacing.step(10_000_000), Step::Idle { until: Some(500_000_000) });
+	pacing.on_completion(&completion(2, PresentOutcome::Displayed, unpaced()));
+	pacing.on_present_started(3, 15_000_000, Some(11_000_000));
+	assert_eq!(pacing.step(15_000_000), Step::Idle { until: Some(27_000_000) }, "an obsolete real deadline never enters the fallback guard");
+	pacing.on_completion(&completion(3, PresentOutcome::Displayed, FrameTiming { preferred_deadline: None, refresh_interval: Some(8_000_000) }));
+	pacing.on_present_started(4, 20_000_000, Some(12_000_000));
+	assert_eq!(pacing.step(20_000_000), Step::Idle { until: Some(28_000_000) }, "a real interval still starts at present return");
+	pacing.on_completion(&completion(4, PresentOutcome::Displayed, unpaced()));
+	pacing.on_present_started(5, 21_000_000, Some(12_000_000));
+	assert_eq!(pacing.step(21_000_000), Step::Idle { until: Some(28_000_000) });
+}
+
+#[test]
+fn frame_start_metadata_reservation_failure_discards_old_evidence() {
+	use crate::frame_starts::FrameStarts;
+	assert!(FrameStarts::new(usize::MAX, 1).is_err(), "the setup allocation refuses an impossible table");
+	let mut starts = FrameStarts::new(2, 1).unwrap();
+	starts.step(Step::Draw, 10);
+	let began = starts.begin_acquire();
+	starts.acquired(0, 0x1000, began);
+	assert!(starts.reset(usize::MAX, 2).is_err());
+	assert_eq!(starts.take(0, 0x1000, 1), None, "a failed reconfiguration must not resurrect prior metadata");
+	assert_eq!(starts.begin_acquire(), None);
+}

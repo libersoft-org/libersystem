@@ -2198,23 +2198,31 @@ fn the_2d_profile_conforms_on_the_target() {
 }
 
 tagged_test!(the_3d_profiles_conform_on_the_target, [Image, Process, Slow], id = "kernel.applications.the_3d_profiles_conform_on_the_target", covers = ["bin.test3d-conformance-sw", "render3d", "scene3d", "soft3d", "render-shader", "render-math", "kernel"]);
-// `Render3D Core Profile 1` AND `Scene3D Core Profile 1`, WALKED ENTRY BY ENTRY WHERE THE ARITHMETIC
-// ACTUALLY RUNS.
-//
-// THE HOST TESTS OF THE SAME SCENES ARE NOT THIS CLAIM. A host test runs on the machine that built
-// the image, once, with that machine's floating point; what "the profiles are implemented on all
-// three architectures" is about is the same rasteriser and the same scene-layer ordering running on
-// the target. The suite is a library for exactly this reason, and this runs the staged program that
-// is a few lines around it.
-//
-// IT HOLDS NOTHING. No display, no input, no volume: every scene of the command half draws into
-// memory it allocated itself and every scene of the retained half asks the scene layer a question -
-// so a failure here is about the profiles and not about a service that happened to be running.
-//
-// AND IT FAILS ON `Unsupported` AS WELL AS ON A WRONG ANSWER. A profile is a CLOSED list: a backend
-// that refuses a Profile 1 frame is not a backend with a gap, it is a backend that does not conform,
-// and the program reports the two apart so a reader can tell "this is wrong" from "this is missing".
+// Core is a separate executable phase: it neither executes nor waits for Extended.
 fn the_3d_profiles_conform_on_the_target() {
+	let printed = run_3d_conformance_phase(b"--core", false);
+	let shown = printed.join(" | ");
+	assert!(printed.iter().any(|line| line == "test3d-conformance: start core"), "{shown}");
+	assert_eq!(printed.iter().filter(|line| line.starts_with("test3d-conformance: pass ")).count(), 160, "every entry of the two frozen Core profiles: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: render3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "Render3D Core: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "Scene3D Core: {shown}");
+	assert!(printed.iter().any(|line| line == "test3d-conformance: conforms"), "{shown}");
+	assert!(!printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d-extended ") || line.contains("Scene3D Extended Profile 1")), "Core did not request or claim Extended: {shown}");
+}
+
+tagged_test!(the_3d_extended_profile_conforms_on_the_target, [Image, Process, Slow], id = "kernel.applications.the_3d_extended_profile_conforms_on_the_target", covers = ["bin.test3d-conformance-sw", "scene3d", "soft3d", "render-shader", "render-math", "kernel"]);
+// Extended is claimed entirely on each architecture, with its own key and result.
+fn the_3d_extended_profile_conforms_on_the_target() {
+	let printed = run_3d_conformance_phase(b"--extended", true);
+	let shown = printed.join(" | ");
+	assert!(printed.iter().any(|line| line == "test3d-conformance: start extended"), "{shown}");
+	assert_eq!(printed.iter().filter(|line| line.starts_with("test3d-conformance: pass ")).count(), 62, "every entry of the frozen Extended profile: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d-extended ") && line.contains("0 failed, 0 unsupported, 0 untested")), "Scene3D Extended: {shown}");
+	assert!(printed.iter().any(|line| line == "test3d-conformance: carries Scene3D Extended Profile 1"), "{shown}");
+	assert!(!printed.iter().any(|line| line.starts_with("test3d-conformance: render3d ") || line.starts_with("test3d-conformance: scene3d ") || line == "test3d-conformance: conforms"), "Extended did not run or claim Core: {shown}");
+}
+
+fn run_3d_conformance_phase(arguments: &[u8], extended: bool) -> alloc::vec::Vec<alloc::string::String> {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
@@ -2226,7 +2234,7 @@ fn the_3d_profiles_conform_on_the_target() {
 	let _suite = spawn_dynamic_test_process(sched::root_domain(), suite_elf, boot_user);
 	send_cap(&boot_kernel, b"STDOUT", program_console, Rights::ALL).expect("the suite's console");
 	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
-	boot_kernel.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new())).expect("the suite's launch context");
+	boot_kernel.send(Message::new(launch_context(arguments, b"vol://system"), alloc::vec::Vec::new())).expect("the suite's launch context");
 
 	// EVERY LINE IT PRINTS, and a bound on the waiting. A run that never answers is a failure with
 	// something to show rather than a suite that stops.
@@ -2246,12 +2254,8 @@ fn the_3d_profiles_conform_on_the_target() {
 					}
 					printed.push(alloc::string::String::from_utf8_lossy(line).into_owned());
 				}
-				// THE BREAK IS ON THE PROGRAM'S LAST LINE AND NOT ON ITS FIRST VERDICT. It used to
-				// fire on "conforms", which stopped the read before the line AFTER it - so adding a
-				// second verdict silently made it unreadable, and the test failed claiming the program
-				// had not printed something it had. The extended claim is now last, and both of its
-				// forms carry the profile's name.
-				if printed.iter().any(|line| line.contains("Scene3D Extended Profile 1")) {
+				// Each phase has its own terminal verdict; Core never waits for Extended.
+				if printed.iter().any(|line| if extended { line.contains("Scene3D Extended Profile 1") } else { line == "test3d-conformance: conforms" || line == "test3d-conformance: DOES NOT CONFORM" }) {
 					break;
 				}
 			}
@@ -2259,31 +2263,10 @@ fn the_3d_profiles_conform_on_the_target() {
 		}
 	}
 
-	// THE FAILURES, IN THE RUN'S OWN LOG, one line each and named by feature - which is the whole
-	// difference between this and a screenshot comparison: a reader sees WHICH entry of which profile
-	// is not implemented rather than that something changed.
 	for line in printed.iter().filter(|line| !line.starts_with("test3d-conformance: pass ")) {
 		crate::serial_println!("  {line}");
 	}
-	let shown: alloc::string::String = printed.iter().filter(|line| !line.starts_with("test3d-conformance: pass ")).cloned().collect::<alloc::vec::Vec<_>>().join(" | ");
-	let passes = printed.iter().filter(|line| line.starts_with("test3d-conformance: pass ")).count();
-	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: start")), "the suite started, and printed: {shown}");
-	assert!(passes > 210, "every feature of all three profiles has a scene and each one printed its own line: {passes} passed, {shown}");
-	// EACH PROFILE'S OWN COUNT, because an implementation may carry the command layer and not the
-	// retained one - and one number that mixed them could not say which conformed.
-	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: render3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "the command profile conforms entry by entry: {shown}");
-	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "and so does the retained one: {shown}");
-	assert!(printed.iter().any(|line| line == "test3d-conformance: conforms"), "the run conforms, and printed: {shown}");
-	// AND THE EXTENDED PROFILE, ON THE TARGET. This is the half a host fixture cannot give: the
-	// equations are exact and their expected values come from the profile, so what a guest run adds
-	// is that the ARITHMETIC AGREES HERE - the same GGX, the same Smith, the same white furnace, on
-	// this architecture's floating point rather than on the one that built the tree.
-	//
-	// IT IS ASSERTED SEPARATELY FROM "conforms" BECAUSE IT IS A SEPARATE CLAIM: `Scene3D Extended
-	// Profile 1` is optional as a whole, so a layer that carried neither would still conform. This
-	// one carries it, and that is what is checked.
-	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d-extended ") && line.contains("0 failed, 0 unsupported, 0 untested")), "the extended profile conforms entry by entry: {shown}");
-	assert!(printed.iter().any(|line| line == "test3d-conformance: and carries Scene3D Extended Profile 1"), "and the run says so: {shown}");
+	printed
 }
 
 tagged_test!(the_3d_demo_renders_a_lit_scene_and_survives_a_resize, [Display, Input, Process, Service, Image], id = "kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize", covers = ["bin.test3d-sw", "scene3d", "render3d", "soft3d", "render-shader", "render-math", "graphics-app", "surface"]);
@@ -2586,6 +2569,7 @@ fn the_3d_demo_renders_the_same_frames_through_its_workers() {
 	let (stdout, child_stdout) = Channel::create();
 	let (display, display_client) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+	sched::begin_placed_execution(&process);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
 	bootstrap.send(Message::new(launch_context(b"--fixed --frames 3 --no-input --width 64 --height 48 --workers 4 --compare", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
@@ -2613,6 +2597,19 @@ fn the_3d_demo_renders_the_same_frames_through_its_workers() {
 	}
 	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
 
+	// The test-only scheduler records CPUs when this process's placed workers actually leave
+	// an execution turn. Unlike polling current threads, it cannot miss a short tile between
+	// samples. This cumulative mask proves distinct-CPU execution, not simultaneous occupancy.
+	let required_cpus = (0..crate::smp::cpu_count()).filter(|&cpu| crate::smp::is_online(cpu)).count().min(3);
+	// The process publishes termination just before its last thread switches out. Allow that
+	// final outgoing record to arrive before disarming the observer; never wait without a bound.
+	let observation_deadline = arch::apic::ticks() + 100;
+	while process.is_terminated() && (sched::read_placed_execution().count_ones() as usize) < required_cpus && arch::apic::ticks() < observation_deadline {
+		sched::run_until_idle_until(arch::apic::ticks() + 1);
+	}
+	let worker_cpus = sched::end_placed_execution();
+	crate::serial_println!("  rt pool: actual placed-worker CPU mask={worker_cpus:#x}");
+	assert!(worker_cpus.count_ones() as usize >= required_cpus, "placed workers actually ran on {required_cpus} distinct CPU(s), mask={worker_cpus:#x}");
 	assert!(contains(b"test3d-sw: shading on 4 worker(s)"), "the demo got the three workers it asked for besides itself: {output:?}");
 	assert!(host.presents >= 1, "and presented: {} present(s), {output:?}", host.presents);
 	assert!(!contains(b"DIFFERED"), "no pass through the workers differs from the serial walk: {output:?}");
@@ -2620,6 +2617,7 @@ fn the_3d_demo_renders_the_same_frames_through_its_workers() {
 	let marker = b"test3d-sw: ";
 	let passes: u64 = output.split(|byte| *byte == b'\n').find(|line| line.ends_with(b"worker(s) matched the serial walk")).and_then(|line| line.strip_prefix(&marker[..])).map(|rest| rest.iter().copied().take_while(u8::is_ascii_digit).collect::<alloc::vec::Vec<u8>>()).and_then(|digits| alloc::string::String::from_utf8_lossy(&digits).parse().ok()).unwrap_or(0);
 	assert!(passes >= 2, "every pass of at least one frame was compared - the scene and the panel: {passes}, {output:?}");
+	assert!(contains(b"3 HUD frame(s) matched the serial walk"), "the composite also compares its actual worker replay: {output:?}");
 
 	assert!(process.is_terminated(), "the run ended on its frame count with its workers alive, and the process still finished: {output:?}");
 	assert!(!process.is_killed(), "it finished rather than being killed: {output:?}");
@@ -2677,6 +2675,7 @@ fn the_3d_demo_executes_the_hdr_bloom_chain() {
 			assert_eq!(host.presents, 2, "two complete HDR frames: {output:?}");
 			assert!(contains(b"HDR chain executed six downsamples, five upsamples and resolve"));
 			assert!(contains(b"28 pass(es) through 2 worker(s) matched the serial walk"), "every shadow, lighting and postprocess pass agrees: {output:?}");
+			assert!(contains(b"2 HUD frame(s) matched the serial walk"), "both complete HDR composites agree with serial replay: {output:?}");
 			assert!(contains(b"test3d-sw: postprocess ") && contains(b"test3d-sw: HDR prepared bytes "));
 			let first = &frame[..4];
 			assert!(frame.chunks_exact(4).filter(|pixel| *pixel != first).count() > 64, "a shaded HDR frame reaches the surface");

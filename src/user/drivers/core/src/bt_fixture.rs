@@ -709,6 +709,18 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 		if bt_le_world::LeWorld::is_device(peer) {
 			let earbud = bt_le_world::LeWorld::is_earbud(peer);
 			let outs = match action {
+				FixtureAction::LeIoCapability => {
+					if !matches!(argument, 0 | 2) || !fixture.le.set_io_capability(peer, argument as u8) {
+						return Err(Error::Invalid);
+					}
+					Some(Vec::new())
+				}
+				FixtureAction::LeSaveKeys | FixtureAction::LeRestoreKeys => {
+					if argument != 0 || !(if action == FixtureAction::LeSaveKeys { fixture.le.save_keys(peer) } else { fixture.le.restore_keys(peer) }) {
+						return Err(Error::Invalid);
+					}
+					Some(Vec::new())
+				}
 				FixtureAction::TypePasskey => fixture.le.type_passkey(peer, argument),
 				FixtureAction::Disconnect => fixture.le.act_disconnect(peer),
 				FixtureAction::Forget => fixture.le.forget(peer).then(Vec::new),
@@ -776,7 +788,7 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			FixtureAction::HangUp => 20,
 			FixtureAction::AudioRequest => 21,
 			FixtureAction::PushObject => 22,
-			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall | FixtureAction::LeFeatures => return Err(Error::Unsupported),
+			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall | FixtureAction::LeFeatures | FixtureAction::LeIoCapability | FixtureAction::LeSaveKeys | FixtureAction::LeRestoreKeys => return Err(Error::Unsupported),
 		};
 		match fixture.world.act(peer, code, argument) {
 			Ok((result, outs)) => {

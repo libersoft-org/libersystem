@@ -5,12 +5,16 @@ import time
 GROUP = 'le-generic'
 
 
-def control(g, action, peer='tag', **values):
-    return g.control(action, group=GROUP, peer=peer, **values)
+def data_peer(g):
+    return getattr(g, 'le_data_peer', 'tag')
 
 
-def state(g, peer='tag'):
-    return control(g, 'status')[peer]
+def control(g, action, peer=None, **values):
+    return g.control(action, group=GROUP, peer=peer or data_peer(g), **values)
+
+
+def state(g, peer=None):
+    return control(g, 'status')[peer or data_peer(g)]
 
 
 def settled(g, peer, predicate, timeout=40):
@@ -49,7 +53,8 @@ def no_grant(g, error):
 
 
 def type_tag(g, label):
-    row = settled(g, 'tag', lambda row: any(c['encrypted'] and c['hid_notify'] for c in row['connections']))
+    row = settled(g, data_peer(g), lambda row: any(c['encrypted'] and c['hid_notify'] for c in row['connections']))
+    g.wait_hid_input(label, peer=data_peer(g), group=GROUP)
     mark = len(g.serial.data)
     control(g, 'type', text=f'echo independent-hogp-{label}\n')
     output = g.finish(mark)
@@ -83,7 +88,7 @@ def subscription_failures(g):
     cursor = g.events()['next']
     control(g, 'att-hold')
     mark = g.start('btgatt revoke')
-    held = g.event('generic-att-held', 'tag', since=cursor, timeout=15)
+    held = g.event('generic-att-held', data_peer(g), since=cursor, timeout=15)
     output = g.finish(mark, timeout=20)
     g.require('btgatt: PASS revoke owner ended with queued operations' in output and 'btgatt: FAIL' not in output,
               f'queued GATT owner did not finish its revocation fixture: {output}')
@@ -101,14 +106,14 @@ def subscription_failures(g):
     cursor = g.events()['next']
     control(g, 'att-hold')
     mark = g.start('btgatt timeout')
-    held = g.event('generic-att-held', 'tag', since=cursor, timeout=15)
+    held = g.event('generic-att-held', data_peer(g), since=cursor, timeout=15)
     output = g.finish(mark, timeout=50)
     g.require(re.search(r'btgatt: PASS silent subscription timed out after [0-9]+ ticks', output)
               and 'btgatt: FAIL' not in output, f'silent GATT subscription did not meet its deadline: {output}')
-    ended = settled(g, 'tag', lambda row: len(row['att_held']) == 1 and not row['att_held'][0]['connected'], timeout=10)
+    ended = settled(g, data_peer(g), lambda row: len(row['att_held']) == 1 and not row['att_held'][0]['connected'], timeout=10)
     released = control(g, 'att-release')
     g.require(released == dict(released=0, retired=1), f'a late response was moved onto a replacement bearer: {released}')
-    settled(g, 'tag', lambda row: len(row['encryptions']) > len(before['encryptions'])
+    settled(g, data_peer(g), lambda row: len(row['encryptions']) > len(before['encryptions'])
             and any(c['encrypted'] for c in row['connections']))
     g.command('btgatt', expect='btgatt: PASS')
     after = state(g)
@@ -118,19 +123,15 @@ def subscription_failures(g):
              oracle='same-team withheld ATT request on independent Bumble server')
 
 
-def ordinary_le(g, pair):
-    # The tag starts at a real RPA and distributes a separate static identity.
-    tag = control(g, 'advertise')
-    advertising = tag['advertising_address'].split('/')[0].lower()
-    g.require(advertising != g.address('tag'), 'private-address peer advertised its identity')
-    pair(g, 'tag', 'Secure Connections, authenticated', group=GROUP, kind='random',
-         address=advertising, io='DISPLAY_OUTPUT_AND_YES_NO_INPUT')
-    g.command(f'btctl alias {g.address("tag")} tag-1', expect='is "tag-1"')
+def application_le(g):
+    # The grant/ATT/HOGP contract is the same on either explicitly bonded peer;
+    # callers retain their actual pairing level in the evidence.
+    g.command(f'btctl alias {g.address(data_peer(g))} tag-1', expect='is "tag-1"')
     no_grant(g, 'Denied')
-    g.command(f'btctl trust {g.address("tag")} gatt', expect='is trusted for gatt')
+    g.command(f'btctl trust {g.address(data_peer(g))} gatt', expect='is trusted for gatt')
     g.command('btgatt', expect='btgatt: PASS')
     g.command('btgatt indicate', expect="peer's indication came back")
-    tag = settled(g, 'tag', lambda row: row['indications'] >= 1)
+    tag = settled(g, data_peer(g), lambda row: row['indications'] >= 1)
     g.require(len(tag['writes']) == 2 and all(row['value'] == b'hello'.hex() and row['encrypted'] for row in tag['writes']),
               f'application GATT operations did not reach the independent encrypted attributes: {tag["writes"]}')
     subscription_failures(g)
@@ -138,14 +139,25 @@ def ordinary_le(g, pair):
     g.require(server['names'] == ['LiberSystem'] and server['appearances'], f'guest GAP server values missing: {server}')
     g.require(any('1800' in uuid for uuid in server['services']) and any('1801' in uuid for uuid in server['services']),
               f'guest did not expose GAP/GATT services: {server}')
-    g.command_eventually('btctl list', lambda text: any(g.address('tag') in line.lower() and '87%' in line for line in text.splitlines()))
-    g.command(f'btctl trust {g.address("tag")} input', expect='is trusted for input')
+    g.command_eventually('btctl list', lambda text: any(g.address(data_peer(g)) in line.lower() and '87%' in line for line in text.splitlines()))
+    g.command(f'btctl trust {g.address(data_peer(g))} input', expect='is trusted for input')
     type_tag(g, 'initial')
     g.le_privacy_initial = privacy_evidence(g)
     g.le_privacy_started = time.monotonic()
     g.le_tag_keys = fingerprints(state(g))
     g.le_tag_pairings = paired_count(state(g))
-    g.record('ordinary-le-gatt-hogp', peer=state(g), privacy=g.le_privacy_initial, guest_server=server)
+    g.record('ordinary-le-gatt-hogp', peer_name=data_peer(g), security=('SC authenticated' if data_peer(g) == 'tag' else 'explicit LE legacy Just Works'), peer=state(g), privacy=g.le_privacy_initial, guest_server=server)
+
+
+
+def ordinary_le(g, pair):
+    # The tag starts at a real RPA and distributes a separate static identity.
+    tag = control(g, 'advertise')
+    advertising = tag['advertising_address'].split('/')[0].lower()
+    g.require(advertising != g.address('tag'), 'private-address peer advertised its identity')
+    pair(g, 'tag', 'Secure Connections, authenticated', group=GROUP, kind='random',
+         address=advertising, io='DISPLAY_OUTPUT_AND_YES_NO_INPUT')
+    application_le(g)
 
     # Secure Connections Passkey Entry in both directions, with three LE links
     # actually present together (the earbuds later cover SC Just Works).
@@ -198,7 +210,36 @@ def ordinary_le(g, pair):
     reuse_tag(g, 'peer-rpa', rotate=True)
 
 
-def ctkd(g, pair):
+def ordinary_le_without_dhkey(g, pair):
+    # These are the already-required explicitly requested legacy cases. Never
+    # relabel them as a replacement proof of any Secure Connections scenario.
+    g.le_data_peer = 'remote'
+    control(g, 'advertise')
+    control(g, 'pairing-config', io='KEYBOARD_INPUT_ONLY', sc=False)
+    g.command('btctl scan 5', expect=g.address('remote'))
+    output = g.command(f'btctl pair {g.address("remote")} random')
+    g.require('the pairing was refused (Unsupported)' in output,
+              f'controller without DHKey did not refuse ordinary LE SC pairing: {output}')
+    g.record('le-sc-controller-refusal', output=output,
+             scope='controller capability refusal; not the SMP legacy Authentication Requirements negative')
+    pair(g, 'remote', 'LE legacy', group=GROUP, kind='random', io='KEYBOARD_INPUT_ONLY', sc=False, legacy=True)
+    legacy = state(g)
+    g.command(f'btctl trust {g.address("remote")} input', expect='is trusted for input')
+    control(g, 'disconnect')
+    restored = settled(g, 'remote', lambda row: len(row['encryptions']) > len(legacy['encryptions']) and any(c['encrypted'] for c in row['connections']))
+    g.require(paired_count(restored) == paired_count(legacy) and fingerprints(restored) == fingerprints(legacy), 'legacy reconnect did not reuse EDIV/Rand/LTK without pairing')
+    g.command(f'btctl forget {g.address("remote")}', expect='is forgotten')
+    control(g, 'disconnect')
+    control(g, 'forget-keys')
+    pair(g, 'remote', 'LE legacy', group=GROUP, kind='random', io='NO_OUTPUT_NO_INPUT', sc=False, mitm=False, legacy=True)
+    g.record('ordinary-le-explicit-legacy-models', peer=state(g), legacy_reconnect=restored,
+             scope='Passkey Entry then Just Works; SC models and SC downgrade negatives remain fixture evidence')
+    application_le(g)
+    ctkd(g, pair, le_sc=False)
+    reuse_tag(g, 'peer-rpa', rotate=True)
+
+
+def ctkd(g, pair, *, le_sc=True):
     # Both radios use this peer's actual controller public address. The operator
     # disambiguates the two records by radio; no second authority/grant is added.
     peer, address = 'dual', g.address('dual')
@@ -216,6 +257,8 @@ def ctkd(g, pair):
         g.command(f'btctl -k {kind} forget {address}', expect='is forgotten')
     control(g, 'disconnect', peer)
     control(g, 'forget-keys', peer)
+    if not le_sc:
+        return
     control(g, 'advertise', peer)
     pair(g, peer, 'Secure Connections, authenticated', group=GROUP, kind='public', io='DISPLAY_OUTPUT_AND_YES_NO_INPUT')
     derived = settled(g, peer, both_keys)
@@ -230,15 +273,20 @@ def ctkd(g, pair):
 
 def reuse_tag(g, label, *, rotate=False):
     before = state(g)
+    rotation = None
     if rotate:
-        changed = control(g, 'rotate')['address']
-        g.require(changed != before['advertising_address'], 'peer RPA did not change')
+        rotation = control(g, 'rotate')
+        g.require(rotation['is_resolvable'] and rotation['identity'].split('/')[0].lower() == g.address(data_peer(g)),
+                  f'peer rotation did not retain its actual identity/address kind: {rotation}')
+        g.require(rotation['address'] != before['advertising_address'], 'peer RPA did not change')
     else:
         control(g, 'advertise')
     row = type_tag(g, label)
     g.require(paired_count(row) == g.le_tag_pairings and fingerprints(row) == g.le_tag_keys, f'{label} replaced the stored LE bond')
     privacy = privacy_evidence(g)
-    g.record('ordinary-le-reuse-' + label, privacy=privacy, peer=row)
+    if rotation:
+        g.require(row['advertising_address'] == rotation['address'], 'encrypted reconnection did not retain the rotated advertising address')
+    g.record('ordinary-le-reuse-' + label, peer_name=data_peer(g), privacy=privacy, peer=row, peer_rotation=rotation)
     return privacy
 
 
@@ -251,16 +299,18 @@ def privacy_rotation(g):
         g.pause(remaining)
     before = state(g)
     control(g, 'disconnect')
-    settled(g, 'tag', lambda row: len(row['encryptions']) > len(before['encryptions']) and any(c['encrypted'] for c in row['connections']))
+    settled(g, data_peer(g), lambda row: len(row['encryptions']) > len(before['encryptions']) and any(c['encrypted'] for c in row['connections']))
     privacy = reuse_tag(g, 'host-rpa')
     g.require(privacy['remote'] != g.le_privacy_initial['remote'], 'guest own RPA never rotated on its production timer')
     g.record('ordinary-le-periodic-privacy', before=g.le_privacy_initial, after=privacy)
 
 
 def forget_tag(g):
-    g.command(f'btctl forget {g.address("tag")}', expect='is forgotten')
-    control(g, 'rotate')
+    g.command(f'btctl forget {g.address(data_peer(g))}', expect='is forgotten')
+    rotated = control(g, 'rotate')
+    g.require(rotated['is_resolvable'], f'forgotten peer did not advertise an actual RPA: {rotated}')
     g.pause(3)
     g.require(not state(g)['connections'], 'forgotten HOGP peer rejoined the accept list')
     no_grant(g, 'NotFound')
-    g.record('ordinary-le-forget', peer=state(g))
+    g.record('ordinary-le-forget', peer_name=data_peer(g), peer=state(g),
+             peer_rotation=rotated)

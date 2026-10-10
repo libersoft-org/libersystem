@@ -13,7 +13,8 @@
 //                                                       a battery and a custom service on its attribute server
 //    9 remote    KeyboardOnly, legacy only              legacy Passkey Entry, this host showing the digits; gives
 //                                                       its long-term key with its EDIV and Rand
-//   10 display   DisplayOnly, Secure Connections        Passkey Entry, this host typing what it shows
+//   10 display   DisplayOnly, Secure Connections        Passkey Entry, this host typing what it shows; the gate may
+//                                                       switch its disconnected IO to KeyboardOnly for the reverse
 //   11 phone     DisplayYesNo, Secure Connections       THE PHONE'S LE HALF, a dual-mode device: heard from its public
 //                                                       address only while it advertises (`le-advertise` on device 2);
 //                                                       asks for the BR/EDR key to be derived from its LE pairing,
@@ -109,13 +110,24 @@ struct LeLink {
 	tk: [u8; 16],
 	mconfirm: Option<[u8; 16]>,
 	typed: Option<u32>,
-	// Passkey Entry runs: this device shows its digits and the host's person types them.
+	// Passkey Entry runs: either this device shows its digits or its person types the host's digits.
 	passkey_model: bool,
 	// A characteristic's notifications are on.
 	notify: Vec<u16>,
 }
 
+struct SavedKeys {
+	ltk: [u8; 16],
+	ediv: u16,
+	rand: [u8; 8],
+	host_irk: Option<[u8; 16]>,
+	reset: bool,
+}
+
 struct LeDevice {
+	// Only the disconnected fixture control changes this; the link records the negotiated capability.
+	capability: u8,
+	saved_keys: Option<SavedKeys>,
 	spec: &'static LeSpec,
 	irk: [u8; 16],
 	rpa: [u8; 6],
@@ -184,7 +196,7 @@ impl LeWorld {
 			let hash = ah(&irk, prand);
 			let rpa = [prand[0], prand[1], prand[2], hash[0], hash[1], hash[2]];
 			let passkey = (world.next() % 1_000_000) as u32;
-			world.devices.push(LeDevice { spec, irk, rpa, ltk: None, ediv: 0, rand: [0; 8], passkey, host_irk: None, reset: false, link: None, custom: b"fixture".to_vec(), advertising: spec.dual.is_none() });
+			world.devices.push(LeDevice { capability: spec.capability, saved_keys: None, spec, irk, rpa, ltk: None, ediv: 0, rand: [0; 8], passkey, host_irk: None, reset: false, link: None, custom: b"fixture".to_vec(), advertising: spec.dual.is_none() });
 			let _ = at;
 		}
 		world
@@ -458,15 +470,16 @@ impl LeWorld {
 		let own = self.own(at);
 		let spec = self.devices[at].spec;
 		let name = self.short(at);
-		let passkey = self.devices[at].passkey;
+		let capability = self.devices[at].capability;
+		let passkey = self.devices[at].link.as_ref().and_then(|link| link.typed).unwrap_or(self.devices[at].passkey);
 		let state = self.devices[at].link.as_ref().map(|link| link.smp);
 		let Some(state) = state else { return out };
 		match (state, code) {
 			(_, 0x01) if pdu.len() == 7 => {
 				let host_sc = pdu[3] & 0x08 != 0;
 				// A DEVICE WITH NO INPUT AND NO OUTPUT asks for no protection it cannot give: Just Works, on both sides.
-				let mitm = if spec.capability == 0x03 { 0 } else { 0x04 };
-				let mut response = [0x02, spec.capability, 0x00, 0x01 | mitm, 16, 0, 0];
+				let mitm = if capability == 0x03 { 0 } else { 0x04 };
+				let mut response = [0x02, capability, 0x00, 0x01 | mitm, 16, 0, 0];
 				if spec.secure_connections {
 					response[3] |= 0x08;
 				}
@@ -515,33 +528,37 @@ impl LeWorld {
 				out.push(key);
 				let pkax: [u8; 32] = reversed(&link.pka[..32]);
 				let pkbx: [u8; 32] = reversed(&public_key(at)[..32]);
-				// PASSKEY ENTRY when protection is asked for and the host has a keyboard; Just Works otherwise.
-				link.passkey_model = spec.capability == 0x00 && (link.request[3] | link.response[3]) & 0x04 != 0 && matches!(link.request[1], 0x02 | 0x04);
+				// BOTH PASSKEY DIRECTIONS: a display opposite a keyboard, with MITM protection requested. The initiator
+				// commits first even when its own display shows the digits, so a keyboard must hold that commitment
+				// until its person supplies the passkey through TypePasskey.
+				let protected = (link.request[3] | link.response[3]) & 0x04 != 0;
+				let showing = capability == 0x00 && matches!(link.request[1], 0x02 | 0x04);
+				let typing = capability == 0x02 && matches!(link.request[1], 0x00 | 0x01 | 0x04);
+				link.passkey_model = protected && (showing || typing);
 				if link.passkey_model {
-					// DISPLAY ONLY: it shows its passkey, and the host's person types it; the host commits first.
 					link.smp = Smp::AwaitConfirm;
-					self.say(format!("passkey {name} {passkey:06}"));
+					if showing {
+						self.say(format!("passkey {name} {passkey:06}"));
+					}
 				} else {
 					let cb = f4(&pkbx, &pkax, &nb, 0);
 					let mut confirm = alloc::vec![0x03];
 					confirm.extend_from_slice(&reversed::<16>(&cb));
 					out.push(confirm);
 					link.smp = Smp::AwaitRandom;
+					if !(protected && matches!(capability, 0x01 | 0x04) && matches!(link.request[1], 0x01 | 0x04)) {
+						self.say(format!("Secure Connections Just Works {name}"));
+					}
 				}
 			}
 			// A PASSKEY ROUND: the host's commitment, then this side's.
 			(Smp::AwaitConfirm, 0x03) if pdu.len() == 17 => {
-				let nbi = self.nonce();
 				let link = self.devices[at].link.as_mut().expect("a link");
-				link.cai = reversed(&pdu[1..]);
-				link.nb = nbi;
-				let pkax: [u8; 32] = reversed(&link.pka[..32]);
-				let pkbx: [u8; 32] = reversed(&public_key(at)[..32]);
-				let cbi = f4(&pkbx, &pkax, &nbi, Self::passkey_bit(link, passkey));
-				let mut confirm = alloc::vec![0x03];
-				confirm.extend_from_slice(&reversed::<16>(&cbi));
-				out.push(confirm);
-				link.smp = Smp::AwaitRandom;
+				link.mconfirm = Some(reversed(&pdu[1..]));
+				if capability == 0x02 && link.typed.is_none() {
+					return out;
+				}
+				out.push(self.passkey_confirm(at));
 			}
 			(Smp::AwaitRandom, 0x04) if pdu.len() == 17 => {
 				let link = self.devices[at].link.as_mut().expect("a link");
@@ -565,7 +582,9 @@ impl LeWorld {
 						link.smp = Smp::AwaitConfirm;
 						return out;
 					}
-				} else if spec.capability == 0x01 {
+					let direction = if capability == 0x02 { "host-shown" } else { "peer-shown" };
+					self.say(format!("{name} completed twenty Secure Connections passkey rounds {direction}"));
+				} else if matches!(capability, 0x01 | 0x04) && matches!(link.request[1], 0x01 | 0x04) {
 					let value = g2(&pkax, &pkbx, &na, &link.nb) % 1_000_000;
 					self.say(format!("compare {name} {value:06}"));
 				}
@@ -605,7 +624,7 @@ impl LeWorld {
 				link.mconfirm = Some(reversed(&pdu[1..]));
 				// A KEYBOARD PAIRED BY A HOST THAT ASKED FOR PROTECTION waits for its person to type the digits.
 				let host_mitm = link.request[3] & 0x04 != 0 && link.request[1] != 0x03;
-				if spec.capability == 0x02 && host_mitm && link.typed.is_none() {
+				if capability == 0x02 && host_mitm && link.typed.is_none() {
 					return out;
 				}
 				out.extend(self.legacy_confirm(at));
@@ -647,6 +666,22 @@ impl LeWorld {
 		out
 	}
 
+	// ONE SC PASSKEY ROUND, only after this side knows the digits and has the initiator's commitment.
+	fn passkey_confirm(&mut self, at: usize) -> Vec<u8> {
+		let nbi = self.nonce();
+		let passkey = self.devices[at].link.as_ref().and_then(|link| link.typed).unwrap_or(self.devices[at].passkey);
+		let link = self.devices[at].link.as_mut().expect("a link");
+		link.cai = link.mconfirm.take().expect("the initiator committed");
+		link.nb = nbi;
+		let pkax: [u8; 32] = reversed(&link.pka[..32]);
+		let pkbx: [u8; 32] = reversed(&public_key(at)[..32]);
+		let cbi = f4(&pkbx, &pkax, &nbi, Self::passkey_bit(link, passkey));
+		let mut confirm = alloc::vec![0x03];
+		confirm.extend_from_slice(&reversed::<16>(&cbi));
+		link.smp = Smp::AwaitRandom;
+		confirm
+	}
+
 	fn legacy_confirm(&mut self, at: usize) -> Vec<Vec<u8>> {
 		let own = self.own(at);
 		let srand = self.nonce();
@@ -665,15 +700,27 @@ impl LeWorld {
 	// THE PERSON AT THE REMOTE TYPES THE DIGITS the host shows: its temporary key, and its confirm goes.
 	pub fn type_passkey(&mut self, device: u8, passkey: u32) -> Option<Vec<LeOut>> {
 		let at = usize::from(device.checked_sub(FIRST_LE_DEVICE)?);
+		let device = self.devices.get(at)?;
+		if passkey > 999_999 || device.capability != 0x02 {
+			return None;
+		}
+		let link = device.link.as_ref()?;
+		if link.typed.is_some() || !matches!(link.smp, Smp::LegacyConfirm | Smp::AwaitConfirm) {
+			return None;
+		}
 		let name = self.short(at);
-		let link = self.devices.get_mut(at)?.link.as_mut()?;
+		let link = self.devices[at].link.as_mut()?;
 		link.typed = Some(passkey);
 		let mut tk = [0u8; 16];
 		tk[12..].copy_from_slice(&passkey.to_be_bytes());
 		link.tk = tk;
 		self.say(format!("typed the passkey on {name}"));
-		let ready = self.devices[at].link.as_ref().is_some_and(|link| link.smp == Smp::LegacyConfirm && link.mconfirm.is_some());
-		let answers = if ready { self.legacy_confirm(at) } else { Vec::new() };
+		let ready = self.devices[at].link.as_ref().filter(|link| link.mconfirm.is_some()).map(|link| link.smp);
+		let answers = match ready {
+			Some(Smp::LegacyConfirm) => self.legacy_confirm(at),
+			Some(Smp::AwaitConfirm) => alloc::vec![self.passkey_confirm(at)],
+			_ => Vec::new(),
+		};
 		let mut out = Vec::new();
 		for answer in answers {
 			out.extend(self.send(at, SMP_CID, &answer));
@@ -695,7 +742,7 @@ impl LeWorld {
 			let link_key = self.devices[at].link.as_ref().is_some_and(|link| link.request[5] & link.response[5] & link.request[6] & link.response[6] & 0x08 != 0);
 			if link_key && let Some(ltk) = self.devices[at].ltk {
 				let ct2 = self.devices[at].link.as_ref().is_some_and(|link| link.request[3] & link.response[3] & 0x20 != 0);
-				let authenticated = self.devices[at].link.as_ref().is_some_and(|link| link.passkey_model || spec.capability == 0x01 && (link.request[3] | link.response[3]) & 0x04 != 0 && matches!(link.request[1], 0x01 | 0x04));
+				let authenticated = self.devices[at].link.as_ref().is_some_and(|link| link.passkey_model || matches!(link.response[1], 0x01 | 0x04) && (link.request[3] | link.response[3]) & 0x04 != 0 && matches!(link.request[1], 0x01 | 0x04));
 				let key = crate::bt_peer::link_key_from_ltk(&ltk, ct2);
 				self.say(format!("{name} derived its BR/EDR key from the LE pairing, key {:08x}", fingerprint(&key)));
 				self.derived = Some((spec.identity, key, authenticated));
@@ -920,6 +967,47 @@ impl LeWorld {
 		}
 	}
 
+	// EXPLICIT TEST CONTROLS, usable only between links. They change the far-side device; they cannot modify the
+	// guest's bond. A saved key is restored only on a separate control action and its fingerprint is recorded.
+	pub fn set_io_capability(&mut self, device: u8, capability: u8) -> bool {
+		let Some(at) = device.checked_sub(FIRST_LE_DEVICE).map(usize::from).filter(|at| *at < self.devices.len()) else { return false };
+		let held = &mut self.devices[at];
+		if device != FIRST_LE_DEVICE + 2 || !matches!(capability, 0 | 2) || held.link.is_some() {
+			return false;
+		}
+		held.capability = capability;
+		self.say(format!("{} IO capability {capability}", self.short(at)));
+		true
+	}
+
+	pub fn save_keys(&mut self, device: u8) -> bool {
+		let Some(at) = device.checked_sub(FIRST_LE_DEVICE).map(usize::from).filter(|at| *at < self.devices.len()) else { return false };
+		let held = &mut self.devices[at];
+		if held.link.is_some() || held.spec.earbud.is_some() {
+			return false;
+		}
+		let Some(ltk) = held.ltk else { return false };
+		held.saved_keys = Some(SavedKeys { ltk, ediv: held.ediv, rand: held.rand, host_irk: held.host_irk, reset: held.reset });
+		self.say(format!("{} explicitly saved key {:08x}", self.short(at), fingerprint(&ltk)));
+		true
+	}
+
+	pub fn restore_keys(&mut self, device: u8) -> bool {
+		let Some(at) = device.checked_sub(FIRST_LE_DEVICE).map(usize::from).filter(|at| *at < self.devices.len()) else { return false };
+		let held = &mut self.devices[at];
+		if held.link.is_some() || held.spec.earbud.is_some() {
+			return false;
+		}
+		let Some(saved) = held.saved_keys.take() else { return false };
+		held.ltk = Some(saved.ltk);
+		held.ediv = saved.ediv;
+		held.rand = saved.rand;
+		held.host_irk = saved.host_irk;
+		held.reset = saved.reset;
+		self.say(format!("{} explicitly restored key {:08x}", self.short(at), fingerprint(&saved.ltk)));
+		true
+	}
+
 	pub fn forget(&mut self, device: u8) -> bool {
 		let Some(at) = device.checked_sub(FIRST_LE_DEVICE).map(usize::from).filter(|at| *at < self.devices.len()) else { return false };
 		let name = self.short(at);
@@ -1089,3 +1177,7 @@ impl LeWorld {
 		Some(self.from_audio(outs))
 	}
 }
+
+#[cfg(test)]
+#[path = "bt_le_world/tests.rs"]
+mod tests;

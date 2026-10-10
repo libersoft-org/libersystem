@@ -373,6 +373,7 @@ impl Tile {
 	/// Decode `bounds` of the target into the tile, through the unit's part of the target.
 	pub(crate) fn load(&mut self, access: &Access<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>) -> Result<(), Error> {
 		match access {
+			Access::Samples { .. } => return Err(Error::DegenerateShape { what: "sample rows are not a render target" }),
 			Access::Band { view, top } => self.load_from(&view.as_view(), *top, bounds, working, table),
 			// THE WHOLE TARGET, READ ONLY: nothing writes it while the units run, so every tile reads the
 			// pixels the frame started with - which is what the serial walk reads, since no tile writes
@@ -412,6 +413,7 @@ impl Tile {
 	/// pixel is on the target - a slot's own coordinates would dither every tile alike.
 	pub(crate) fn store(&self, access: &mut Access<'_>, bounds: PixelRect, working: Working, output: OutputLuminance, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
 		let layout = match access {
+			Access::Samples { .. } => return Err(Error::DegenerateShape { what: "sample rows are not a render target" }),
 			Access::Band { view, .. } => *view.layout(),
 			Access::Slot { source, .. } => *source.layout(),
 			Access::Rect { layout, .. } => *layout,
@@ -419,6 +421,7 @@ impl Tile {
 		let encoder = Encoder::new_for_output(&layout.semantics, layout.storage, working, output).map_err(from_core)?;
 		let width = (bounds.width as usize).min(scratch.len());
 		match access {
+			Access::Samples { .. } => return Err(Error::DegenerateShape { what: "sample rows are not a render target" }),
 			Access::Band { view, top } => {
 				for y in bounds.y..bounds.y.saturating_add(bounds.height) {
 					let Some(start) = self.index(bounds.x, y) else { continue };

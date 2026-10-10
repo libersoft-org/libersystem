@@ -295,6 +295,56 @@ for budget in 0 1; do
 	check "budget $budget starts no guest" 0 "$(wc -c <"$trace")"
 done
 
+# 8. A RESOURCE BARRIER IS DISTINCT FROM THE GUEST-SLOT BOUND. Earlier ordinary guests
+# finish before a shared fixture starts; later ones wait for its cleanup. Fixture failure does
+# not become an invented prerequisite of unrelated work. These keyless scheduler fixtures are
+# unit evidence only, never an acceptance run or a replacement for the ordinary FULL plan.
+plan="$work/exclusive"
+trace="$work/exclusive.trace"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	for index in 0 1 2; do
+		command="echo start-$index >> '$trace'; sleep 1; echo end-$index >> '$trace'"
+		[[ "$index" != 1 ]] || command+="; false"
+		step "$index" 1 "isolation step $index" "$command"
+		printf 'STEPGUESTS\t%s\t1\n' "$index"
+		[[ "$index" != 1 ]] || printf 'STEPEXCLUSIVE\t1\t1\n'
+	done
+} >"$plan"
+rc=0
+run_plan "$plan" --jobs 2 || rc=$?
+check "the exclusive scenario waits on both sides, including failure cleanup" "start-0 end-0 start-1 end-1 start-2 end-2" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
+check "its actual failure is reported" 1 "$rc"
+check "an unrelated later guest is not suppressed" 0 "$(grep -c 'BLOCKED:' "$out" || true)"
+
+# An exclusive step can itself require two concurrent guests. Isolation must not rewrite its
+# capacity claim or run the gate under an artificial --jobs 1.
+plan="$work/exclusive-wide"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	step 0 1 "exclusive overlap gate" "test \"\$LIBER_CONCURRENT_GUESTS\" -ge 2"
+	printf 'STEPGUESTS\t0\t2\nSTEPEXCLUSIVE\t0\t1\n'
+} >"$plan"
+rc=0
+run_plan "$plan" --jobs 2 || rc=$?
+check "an exclusive overlap gate retains its two-slot allowance" 0 "$rc"
+rc=0
+run_plan "$plan" --jobs 1 || rc=$?
+check "the same required overlap gate remains incomplete with only one slot" 6 "$rc"
+check "the explicit slot refusal remains visible" 1 "$(grep -c 'it starts 2 guests at once and --jobs is 1' "$out" || true)"
+
+# A malformed declaration fails before commands start rather than silently enabling overlap.
+plan="$work/exclusive-invalid"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	step 0 1 "must not run" "touch '$work/invalid-ran'"
+	printf 'STEPGUESTS\t0\t1\nSTEPEXCLUSIVE\t0\tmaybe\n'
+} >"$plan"
+rc=0
+run_plan "$plan" --jobs 2 || rc=$?
+check "an invalid isolation declaration is refused" 1 "$rc"
+check "invalid metadata starts no step" absent "$([[ -e "$work/invalid-ran" ]] && echo present || echo absent)"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1

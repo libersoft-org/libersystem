@@ -584,6 +584,9 @@ class BtBridge(BtSco):
             del self.received_hci[:total]
             self.packet_counts[f'in-{kind}'] += 1
             if kind == 4:
+                from bluetooth_controller_capabilities import capability_reply
+                if observed := capability_reply(packet):
+                    say(self.name, f'HCI capability {observed}')
                 # LE CIS Established (Core 7.7.65.25): status then connection handle.
                 if packet[:3] == b'\x3e\x1d\x19' and packet[3] == 0:
                     self.iso_handles.add(int.from_bytes(packet[4:6], 'little'))

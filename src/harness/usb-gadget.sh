@@ -52,8 +52,8 @@ VENDOR_ID=1d6b
 PRODUCT_ID=0104
 
 # Every module a gadget of any supported kind needs, in dependency order. `modprobe` pulls what it
-# needs anyway; the list is here because the REMOVAL set is computed against it and a module this
-# script never names is a module it never removes.
+# needs anyway; the named modules absent before setup seed the removal set, together with new
+# host USB/HID drivers and their dependencies that were also absent before setup.
 # The MIDI function is the one that reaches past the gadget stack: it is an ALSA card as well, so the sound
 # core's raw MIDI modules come with it - named here so a run that loaded them is the run that unloads them.
 ALL_MODULES=(udc_core libcomposite dummy_hcd u_serial usb_f_acm usb_f_hid usb_f_uac2 usb_f_printer snd_seq_device snd_rawmidi usb_f_midi usb_f_fs)
@@ -67,8 +67,17 @@ refuse() {
 	exit 1
 }
 
+loaded_modules() {
+	local module
+	for module in /sys/module/*; do
+		# sysfs also contains builtins and a non-directory compression attribute.
+		[[ -d "$module" && -f "$module/initstate" ]] || continue
+		printf '%s\n' "${module##*/}"
+	done
+}
+
 loaded() {
-	lsmod 2>/dev/null | awk -v want="$1" '$1 == want { found = 1 } END { exit !found }'
+	[[ -f "/sys/module/${1//-/_}/initstate" ]]
 }
 
 # What this run is allowed to take apart, recorded the moment it is created.
@@ -247,6 +256,25 @@ hid_report_length() {
 	esac
 }
 
+# A setup failure must clean its own effects: callers only claim a successfully returned gadget.
+# Read ownership from the persisted records, not cmd_setup locals that may already be out of scope.
+setup_exit() {
+	local setup_status="$1"
+	trap - EXIT
+	if [[ "$setup_status" != "0" ]]; then
+		# Keep the original failure even if teardown refuses. The child retains errexit for its
+		# filesystem operations; testing cmd_teardown directly with `if` would disable that.
+		set +e
+		(
+			set -e
+			cmd_teardown
+		)
+		local cleanup_status=$?
+		[[ "$cleanup_status" == "0" ]] || say "failed setup cleanup is incomplete; ownership records are retained"
+	fi
+	exit "$setup_status"
+}
+
 cmd_setup() {
 	local kind="${1:-}"
 	[[ -n "$kind" ]] || refuse "setup needs a kind"
@@ -260,29 +288,35 @@ cmd_setup() {
 	mkdir -p "$STATE_DIR"
 	[[ ! -e "$(state_file name)" ]] || refuse "a gadget from this harness is already set up - run teardown first"
 
+	# Check a foreign-name collision before recording ownership or installing cleanup.
+	local name="liber$$"
+	local dir="$GADGET_ROOT/$name"
+	[[ ! -e "$dir" ]] || refuse "$dir already exists - this harness never clears a gadget it did not make"
+
 	# RULE 7: what the host had loaded, and which USB drivers it had, before anything of this run's existed.
-	lsmod | awk 'NR > 1 { print $1 }' | sort >"$(state_file modules-before)"
-	host_drivers | sort >"$(state_file usb-drivers-before)"
-	systemctl is-active systemd-rfkill.socket >"$(state_file rfkill-socket-before)" 2>/dev/null || true
+	loaded_modules | sort >"$(state_file modules-before)" || refuse "cannot record the preexisting modules"
+	host_drivers | sort >"$(state_file usb-drivers-before)" || refuse "cannot record the preexisting host drivers"
+	local rfkill_before
+	rfkill_before="$(systemctl is-active systemd-rfkill.socket 2>/dev/null || true)"
+	printf '%s\n' "$rfkill_before" >"$(state_file rfkill-socket-before)" || refuse "cannot record the preexisting rfkill socket"
 
-	# RULE 2: what was absent BEFORE is the only thing teardown may remove.
-	local absent=()
-	local module
-	for module in "${ALL_MODULES[@]}"; do
-		loaded "$module" || absent+=("$module")
-	done
+	# Record the run BEFORE loading anything, including failures before a UDC exists.
+	printf '%s\n' "$plan" >"$(state_file plan)" || refuse "cannot record the gadget plan"
+	: >"$(state_file modules)" || refuse "cannot create the module ownership ledger"
+	printf '%s\n' "$name" >"$(state_file name)" || refuse "cannot record the gadget name"
+	trap 'setup_exit "$?"' EXIT
 
-	# A GADGETFS DEVICE is the whole gadget, with no configfs tree: its module joins the set this run may load,
-	# and the configfs functions are not loaded for it at all.
+	# A GADGETFS DEVICE uses only its whole-device stack, not configfs function modules.
 	local modules_wanted=("${ALL_MODULES[@]}")
-	if [[ "$plan" == gadgetfs* ]]; then
-		modules_wanted=(udc_core dummy_hcd gadgetfs)
-		absent=()
-		for module in "${modules_wanted[@]}"; do
-			loaded "$module" || absent+=("$module")
-		done
-	fi
+	[[ "$plan" != gadgetfs* ]] || modules_wanted=(udc_core dummy_hcd gadgetfs)
+	local module
 	for module in "${modules_wanted[@]}"; do
+		module="${module//-/_}"
+		# Write ahead of each side effect. Unload ignores entries that never became loaded,
+		# and its dependency closure excludes every module from the saved before inventory.
+		if ! grep -qxF "$module" "$(state_file modules-before)"; then
+			printf '%s\n' "$module" >>"$(state_file modules)" || refuse "cannot record module ownership before loading $module"
+		fi
 		modprobe "$module" 2>/dev/null || true
 	done
 	# udc_core and dummy_hcd are the two that must actually be there; the function modules are
@@ -303,25 +337,13 @@ cmd_setup() {
 	holder="$(cat "/sys/class/udc/$udc/function" 2>/dev/null || true)"
 	[[ -z "$holder" ]] || refuse "UDC $udc is already driving '$holder' - this harness does not take a controller from whatever is using it"
 
-	# RULE 1: named for this run, and a collision refuses.
-	local name="liber$$"
-	local dir="$GADGET_ROOT/$name"
-	[[ ! -e "$dir" ]] || refuse "$dir already exists - this harness never clears a gadget it did not make"
-
-	# Recorded BEFORE the first mkdir, so a setup that dies half way still has a teardown that knows
-	# what to undo. Rule 5 is why the order is this way round.
-	printf '%s\n' "$name" >"$(state_file name)"
-	printf '%s\n' "$plan" >"$(state_file plan)"
 	printf '%s\n' "$udc" >"$(state_file udc)"
-	: >"$(state_file modules)"
-	for module in "${absent[@]}"; do
-		loaded "$module" && printf '%s\n' "$module" >>"$(state_file modules)"
-	done
 
 	if [[ "$plan" == gadgetfs* ]]; then
 		start_gadgetfs "${plan#gadgetfs }"
 		say "$kind is bound to $udc through gadgetfs ($VENDOR_ID:$PRODUCT_ID)"
 		printf '%s:%s\n' "$VENDOR_ID" "$PRODUCT_ID"
+		trap - EXIT
 		return 0
 	fi
 
@@ -362,6 +384,7 @@ cmd_setup() {
 
 	say "$kind is bound to $udc as $name ($VENDOR_ID:$PRODUCT_ID)"
 	printf '%s:%s\n' "$VENDOR_ID" "$PRODUCT_ID"
+	trap - EXIT
 }
 
 # What one function needs written into it before it is linked into a configuration. A shape with
@@ -434,58 +457,75 @@ host_drivers() {
 	done
 }
 
-# A module name as `lsmod` spells it: `modinfo` answers with dashes where the loaded name has underscores.
-module_name() {
-	printf '%s\n' "${1//-/_}"
+# An individual module removal must not hold teardown forever if the host kernel is unhealthy.
+# GNU timeout owns only this invocation's process group; no unrelated process is signalled.
+remove_owned_module() {
+	local status=0
+	timeout --signal=TERM --kill-after=1 5 rmmod "$1" 2>/dev/null || status=$?
+	if [[ "$status" == "124" || "$status" == "137" ]]; then
+		say "removing $1 timed out; no further module removal is attempted"
+		return 2
+	fi
+	return "$status"
 }
 
-# RULE 7: the host drivers the gadget caused, and nothing else.
-#
-# THE CANDIDATES are the USB interface drivers - and the HID drivers a HID function's devices bring - that
-# registered while the run went on and whose module was
-# not loaded before it - which is what the host's own USB core loads for a device it has never seen. THEIR
-# DEPENDENCIES that were also absent before join them, because a driver pulls its chain in with it. Each
-# is removed only when nothing holds it, repeating while that makes progress - so a dependency goes after
-# the driver that held it - and anything something else still uses is left and named.
-unload_host_drivers() {
-	local before_modules before_drivers
+# RULES 2 AND 7: explicit gadget modules, new USB/HID drivers, and dependencies that were absent
+# before this run. Remove each one independently: modprobe -r also removes unused PREEXISTING
+# dependencies, even when the named module itself was ours.
+unload_owned_modules() {
+	local before_modules before_drivers ledger
 	before_modules="$(state_file modules-before)"
 	before_drivers="$(state_file usb-drivers-before)"
-	[[ -f "$before_modules" && -f "$before_drivers" ]] || return 0
+	ledger="$(state_file modules)"
+	[[ -f "$before_modules" && -f "$before_drivers" && -f "$ledger" ]] || {
+		say "module ownership records are missing; no module is removed"
+		return 1
+	}
 	local -A chain=()
-	local driver module dependency
+	local driver module holder dependency
+	while read -r module; do
+		[[ -n "$module" ]] || continue
+		if grep -qxF "$module" "$before_modules"; then
+			say "$module was present before this run but appears in its removal ledger"
+			return 1
+		fi
+		chain["$module"]=1
+	done <"$ledger"
 	for driver in /sys/bus/usb/drivers/* /sys/bus/hid/drivers/*; do
 		[[ -e "$driver/module" ]] || continue
 		grep -qxF "$(basename "$(dirname "$(dirname "$driver")")")/$(basename "$driver")" "$before_drivers" && continue
 		module="$(basename "$(readlink -f "$driver/module")")"
 		grep -qxF "$module" "$before_modules" && continue
-		# A module rule 2 removes is rule 2's - `usb_f_midi` still holds the raw MIDI core at this point.
-		grep -qxF "$module" "$(state_file modules)" 2>/dev/null && continue
-		chain["$module"]=1
+		loaded "$module" && chain["$module"]=1
 	done
-	# The dependency closure, inside what was absent before.
+	# holders is the reverse dependency relation: an owned holder can only release a dependency
+	# after it leaves. Builtins have no initstate and are not candidates.
 	local grew=1
 	while [[ "$grew" == "1" ]]; do
 		grew=0
-		for module in "${!chain[@]}"; do
-			for dependency in $(modinfo -F depends "$module" 2>/dev/null | tr ',' ' '); do
-				dependency="$(module_name "$dependency")"
-				[[ -n "$dependency" && -z "${chain[$dependency]:-}" ]] || continue
-				grep -qxF "$dependency" "$before_modules" && continue
-				grep -qxF "$dependency" "$(state_file modules)" 2>/dev/null && continue
-				loaded "$dependency" || continue
+		while read -r dependency; do
+			[[ -z "${chain[$dependency]:-}" ]] || continue
+			grep -qxF "$dependency" "$before_modules" && continue
+			for holder in "/sys/module/$dependency/holders/"*; do
+				[[ -e "$holder" && -n "${chain[${holder##*/}]:-}" ]] || continue
 				chain["$dependency"]=1
 				grew=1
+				break
 			done
-		done
+		done < <(loaded_modules)
 	done
-	# A HOLDER THAT GOES AWAY BY ITSELF IS WAITED FOR, a few seconds and no more: `rfkill` arriving with a Bluetooth
-	# gadget starts `systemd-rfkill` for a moment, and the module is busy while it runs.
-	local round progress
+	# Keep the complete ownership fact before the first removal: on refusal, an already orphaned
+	# dependency still belongs to this run and the next teardown can identify it without guessing.
+	for module in "${!chain[@]}"; do
+		if ! grep -qxF "$module" "$ledger"; then
+			printf '%s\n' "$module" >>"$ledger" || {
+				say "the module ownership ledger could not be extended; no module is removed"
+				return 1
+			}
+		fi
+	done
+	local round progress status
 	for round in $(seq 1 20); do
-		# RFKILL IS HELD BY PID 1 while `systemd-rfkill.socket` is active, and the socket starts when `/dev/rfkill`
-		# appears - so it is stopped, but only when it was not active before this run, which is exactly when this
-		# run started it.
 		if [[ -n "${chain[rfkill]:-}" ]] && [[ "$(cat "$(state_file rfkill-socket-before)" 2>/dev/null)" != "active" ]] && [[ "$(systemctl is-active systemd-rfkill.socket 2>/dev/null)" == "active" ]]; then
 			systemctl stop systemd-rfkill.socket 2>/dev/null && say "stopped systemd-rfkill.socket, which rfkill's arrival started"
 		fi
@@ -497,13 +537,16 @@ unload_host_drivers() {
 					unset "chain[$module]"
 					continue
 				}
-				# Nothing holds it: no other module, and no user count.
 				[[ -z "$(ls "/sys/module/$module/holders" 2>/dev/null)" ]] || continue
 				[[ "$(cat "/sys/module/$module/refcnt" 2>/dev/null || echo 1)" == "0" ]] || continue
-				if rmmod "$module" 2>/dev/null; then
-					say "unloaded $module, which the host loaded for the gadget"
+				status=0
+				remove_owned_module "$module" || status=$?
+				if [[ "$status" == "0" ]]; then
+					say "unloaded $module, which this run loaded for the gadget"
 					unset "chain[$module]"
 					progress=1
+				elif [[ "$status" == "2" ]]; then
+					return 1
 				fi
 			done
 		done
@@ -513,6 +556,14 @@ unload_host_drivers() {
 	for module in "${!chain[@]}"; do
 		say "$module was loaded for the gadget and is in use - it was left loaded"
 	done
+	[[ "${#chain[@]}" == "0" ]] || return 1
+	while read -r module; do
+		[[ -n "$module" ]] || continue
+		loaded "$module" || {
+			say "preexisting module $module is missing after teardown"
+			return 1
+		}
+	done <"$before_modules"
 }
 
 # RULES 1 AND 3 FOR A FUNCTIONFS INSTANCE: its mount point is a directory this run makes inside its own state
@@ -639,24 +690,7 @@ cmd_teardown() {
 		unmount_functionfs
 	fi
 
-	unload_host_drivers
-
-	# RULE 2: only what this run loaded, in reverse order, and NEVER forced. A module that refuses
-	# to go is one something else picked up while the run was going; saying so and leaving it is the
-	# correct answer, not `-f`.
-	local module
-	local modules=()
-	mapfile -t modules < <(cat "$(state_file modules)" 2>/dev/null || true)
-	local index
-	for ((index = ${#modules[@]} - 1; index >= 0; index--)); do
-		module="${modules[index]}"
-		[[ -n "$module" ]] || continue
-		# Already gone - rule 7 took it with the host driver that was holding it.
-		loaded "$module" || continue
-		if ! modprobe -r "$module" 2>/dev/null; then
-			say "$module is in use and was left loaded"
-		fi
-	done
+	unload_owned_modules || return 1
 
 	# A setup that died before the gadget directory existed can still have started an emulator.
 	stop_emulators
@@ -679,7 +713,23 @@ cmd_verify() {
 		say "state from an earlier setup remains: $(state_file name)"
 		remaining=1
 	fi
-	if grep -qE " $STATE_DIR/(ffs-|gadgetfs)" /proc/mounts 2>/dev/null; then
+	local owned_mounts
+	owned_mounts="$(
+		python3 - "$STATE_DIR" <<'PY_MOUNTS'
+from pathlib import Path
+import re
+import sys
+state = sys.argv[1]
+for line in Path('/proc/self/mountinfo').read_text().splitlines():
+    mount = re.sub(r'\\(040|011|012|134)', lambda match: chr(int(match[1], 8)), line.split()[4])
+    if mount.startswith((state + '/ffs-', state + '/gadgetfs')):
+        print(mount)
+PY_MOUNTS
+	)" || {
+		say "the host mount inventory could not be read"
+		return 1
+	}
+	if [[ -n "$owned_mounts" ]]; then
 		say "a FunctionFS or gadgetfs mount of this harness's is still there"
 		remaining=1
 	fi

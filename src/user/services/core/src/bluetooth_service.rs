@@ -1111,9 +1111,17 @@ impl Stack {
 		let mut peer = [0u8; 7];
 		peer[0] = peer_kind & 0x01;
 		peer[1..].copy_from_slice(&address);
+		let connection_peer = peer;
 		let controller = &mut self.controllers[at];
 		let through_list = core::mem::take(&mut controller.le.accepting);
 		let relist = through_list && core::mem::take(&mut controller.le.relist);
+		// A LEGACY CONNECTION COMPLETE names the raw advertising address even when the controller
+		// resolved it for the accept list. Find that bond's identity before matching the attempt or looking up its key.
+		if peer_kind == KIND_RANDOM
+			&& let Some(identity) = controller.le.resolve(&address)
+		{
+			peer = identity;
+		}
 		if status != 0 {
 			controller.fail_attempt(&peer);
 			controller.reconnect = None;
@@ -1143,7 +1151,7 @@ impl Stack {
 		link.local = controller.le.local(local_address(controller));
 		controller.links.push(link);
 		if pairing_peer {
-			self.start_le_pairing(at, handle);
+			self.start_le_pairing(at, handle, connection_peer);
 		} else {
 			// RECONNECT: the key comes from the store, and encryption is PROVED before input is
 			// enabled - a link that will not encrypt with the stored key is a peer that is not the one
@@ -1720,6 +1728,14 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		}
 		self.stack.bonds().delete(&local_wire(controller), &peer_to_wire(&peer)).ok_or(Error::Closed)??;
 		let controller = &mut self.stack.controllers[at as usize];
+		// A forgotten peer's next private advertisement is a new pairing address, not its old identity.
+		controller.le.irks.retain_mut(|(held, irk)| {
+			if *held != peer {
+				return true;
+			}
+			scrub(irk);
+			false
+		});
 		if controller.reconnect == Some(peer) {
 			controller.reconnect = None;
 		}

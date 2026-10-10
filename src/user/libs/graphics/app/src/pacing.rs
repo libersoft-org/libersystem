@@ -67,6 +67,8 @@ pub struct Pacing {
 	timing: Timing,
 	/// When the loop may next draw, in monotonic nanoseconds. Zero means "now".
 	next_frame: u64,
+	/// The last frame-start fallback deadline, separate from real backend timing.
+	frame_fallback: Option<u64>,
 	/// What the last completed present became, for a caller that reports or reacts.
 	last_outcome: Option<PresentOutcome>,
 	/// Whether the service has said an image is available since the last time this loop was told
@@ -87,7 +89,9 @@ pub const BACKGROUND_INTERVAL_NS: u64 = 250_000_000;
 /// WHAT TO WAIT WHEN THE BACKEND SAYS NOTHING AT ALL.
 ///
 /// Not a refresh rate and not pretending to be one: it is the interval at which a loop with no
-/// timing contract wakes to see whether anything changed. A backend that reports a real deadline
+/// timing contract wakes to see whether anything changed. The real frame loop counts rendering and
+/// blocking present inside this interval; direct policy callers retain a present-time anchor.
+/// A backend that reports a real deadline
 /// overrides it, which is the whole reason the timing fields are optional rather than defaulted.
 pub const UNPACED_INTERVAL_NS: u64 = 16_000_000;
 
@@ -106,6 +110,7 @@ impl Pacing {
 			focused: false,
 			timing: Timing::default(),
 			next_frame: 0,
+			frame_fallback: None,
 			last_outcome: None,
 			image_available: true,
 			close_requested: false,
@@ -131,6 +136,7 @@ impl Pacing {
 		// new size, so pacing it behind the deadline the OLD generation set would leave a resized
 		// window blank for a frame nobody is waiting for.
 		self.next_frame = 0;
+		self.frame_fallback = None;
 	}
 
 	/// What the service said, folded in.
@@ -154,6 +160,12 @@ impl Pacing {
 
 	/// A present this loop made was accepted, under the serial the service answered with.
 	pub fn on_present(&mut self, serial: u64, now: u64) {
+		self.on_present_started(serial, now, None);
+	}
+
+	/// The real loop can account rendering and blocking present inside its fallback interval.
+	/// Direct policy callers keep the original present-time anchor through `on_present`.
+	pub(crate) fn on_present_started(&mut self, serial: u64, now: u64, started: Option<u64>) {
 		// A RESERVATION THAT FAILS IS A FRAME THIS LOOP FORGETS IT SENT, which would let it run
 		// ahead of the queue - so the slot is booked and a short heap paces the loop to nothing
 		// rather than past its limit.
@@ -163,9 +175,30 @@ impl Pacing {
 		// AND THE NEXT FRAME IS DUE WHEN THE BACKEND SAYS, which is what stops a loop that can draw
 		// from drawing as fast as the machine allows and calling that a frame rate.
 		self.next_frame = match (self.timing.preferred_deadline, self.timing.refresh_interval) {
-			(Some(deadline), _) => deadline,
-			(None, Some(interval)) => now.saturating_add(interval),
-			(None, None) => now.saturating_add(UNPACED_INTERVAL_NS),
+			(Some(deadline), _) => {
+				self.frame_fallback = None;
+				deadline
+			}
+			(None, Some(interval)) => {
+				self.frame_fallback = None;
+				now.saturating_add(interval)
+			}
+			(None, None) => {
+				// Independently acquired images may be presented out of order. An older start
+				// must not shorten the cadence already chosen for a newer accepted frame. This
+				// guard contains only fallback deadlines, never an obsolete backend deadline.
+				let deadline = started.map_or_else(
+					|| now.saturating_add(UNPACED_INTERVAL_NS),
+					|start| {
+						let deadline = start.saturating_add(UNPACED_INTERVAL_NS);
+						self.frame_fallback.map_or(deadline, |previous| previous.max(deadline))
+					},
+				);
+				// A legacy/direct present keeps its exact old deadline, but a later older
+				// started image must not shorten that accepted frame's fallback either.
+				self.frame_fallback = Some(deadline);
+				deadline
+			}
 		};
 	}
 

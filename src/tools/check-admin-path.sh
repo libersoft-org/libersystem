@@ -56,7 +56,7 @@ export RUN_DISK="$disk_dir/system.img"
 # WHAT WAS RUN, by digest, so the evidence below names the build it is evidence about.
 image="$repo/.build/image/x86_64-unknown-none"
 built="$repo/.build/cargo/user/x86_64-unknown-none/debug"
-for artifact in "$repo/.build/cargo/kernel/x86_64-unknown-none/debug/kernel" "$repo/.build/boot/system-volume-bootable-x86_64.img" "$built/admin_service" "$image/libexec/permission_manager" "$image/libexec/display_service" "$image/libexec/input_service" "$built/admin_fixture" "$built/admincheck" "$scenario"; do
+for artifact in "$repo/.build/cargo/kernel/x86_64-unknown-none/debug/kernel" "$repo/.build/boot/system-volume-bootable-x86_64.img" "$built/admin_service" "$image/libexec/permission_manager" "$image/libexec/display_service" "$built/input_service" "$built/admin_fixture" "$built/admincheck" "$scenario"; do
 	if [[ -f "$artifact" ]]; then
 		echo "qemu-admin-path: input $(sha256sum "$artifact" | cut -c1-16) ${artifact#"$repo/"}"
 	else

@@ -43,9 +43,9 @@ pub struct Step {
 	pub note: Option<String>,
 	// HOW MANY GUESTS THIS STEP STARTS AT ONCE, which is the number `--jobs` is the answer for.
 	//
-	// Zero for everything that boots nothing and for a step whose guests are started SERIALLY: a
-	// gate that boots one machine after another needs one slot however many boots it makes, and the
-	// runner already puts every such step behind a barrier and runs it alone.
+	// Zero for everything that boots nothing. A gate that boots one machine after another needs
+	// one slot however many boots it makes. Shared-resource isolation is a separate declaration
+	// (`exclusive_guests`), so a one-slot step is not automatically safe to overlap.
 	//
 	// It is not zero for a step whose whole subject is OVERLAP. `concurrent-selection` starts two
 	// same-architecture suites at the same time, and the runner counted it as a host gate - so at
@@ -53,6 +53,9 @@ pub struct Step {
 	// The count travels with the step so the scheduler can refuse to start it inside a budget that
 	// cannot hold it, rather than the step deciding for itself.
 	pub guests: usize,
+	// Whole-scenario ownership of shared gadget/lab/image state. This is attached while
+	// lowering the command, before tiers remove already-accounted evidence keys.
+	pub exclusive_guests: bool,
 }
 
 // THE DEPENDENCY GRAPH, VALIDATED BEFORE ANYTHING WALKS IT.
@@ -248,7 +251,7 @@ pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::regist
 		for variant in &check.variants {
 			let id = scoped_id("producer", &variant.architecture, &[check.id.clone()]);
 			producer_ids.insert(check.id.clone(), id.clone());
-			steps.push(Step { id, requires: build_last.get(&variant.architecture).cloned().into_iter().collect(), label: format!("{} (image producer)", check.id), command: item(check, variant).command, keys: vec![item(check, variant).key], note: Some(String::from("built work: the image the gates of this run boot, published into the run as an immutable artifact")), guests: 0 });
+			steps.push(Step { id, requires: build_last.get(&variant.architecture).cloned().into_iter().collect(), label: format!("{} (image producer)", check.id), command: item(check, variant).command, keys: vec![item(check, variant).key], note: Some(String::from("built work: the image the gates of this run boot, published into the run as an immutable artifact")), guests: 0, exclusive_guests: false });
 		}
 	}
 	let mut suite_ids: Vec<String> = Vec::new();
@@ -256,7 +259,7 @@ pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::regist
 		for variant in &check.variants {
 			let id = scoped_id("guest", &variant.architecture, &[String::from("all")]);
 			suite_ids.push(id.clone());
-			steps.push(Step { id, requires: build_last.get(&variant.architecture).cloned().into_iter().collect(), label: format!("kernel suite {} (whole)", variant.architecture), command: item(check, variant).command, keys: vec![item(check, variant).key], note: Some(String::from("the whole suite: the guest runner's envelope discharges every kernel test key of this target")), guests: 1 });
+			steps.push(Step { id, requires: build_last.get(&variant.architecture).cloned().into_iter().collect(), label: format!("kernel suite {} (whole)", variant.architecture), command: item(check, variant).command, keys: vec![item(check, variant).key], note: Some(String::from("the whole suite: the guest runner's envelope discharges every kernel test key of this target")), guests: 1, exclusive_guests: false });
 		}
 	}
 	if let Some(lifecycle) = catalog.checks.iter().find(|check| check.release_required && check.id == crate::catalog::DEV_LIFECYCLE_PRODUCER.0) {
@@ -269,7 +272,7 @@ pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::regist
 			}
 			let mut requires: Vec<String> = build_last.get(&variant.architecture).cloned().into_iter().collect();
 			requires.extend(lifecycle.prerequisites.iter().filter_map(|id| producer_ids.get(id).cloned()));
-			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1 });
+			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1, exclusive_guests: true });
 		}
 	}
 	// The catalog's prerequisite edges - a gate that reads an image requires the step that built
@@ -300,7 +303,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 		for part in crate::catalog::BUILD_PARTS {
 			let Some(item) = items.iter().find(|item| item.kind == CheckKind::Build && item.key.architecture == architecture && item.key.check == format!("build.{part}")) else { continue };
 			let id = scoped_id("build", architecture, &[part.to_string()]);
-			steps.push(Step { id: id.clone(), requires: build_ids.get(architecture).cloned().into_iter().collect(), label: format!("build {architecture} {part}"), command: item.command.clone(), keys: vec![item.key.clone()], note: None, guests: 0 });
+			steps.push(Step { id: id.clone(), requires: build_ids.get(architecture).cloned().into_iter().collect(), label: format!("build {architecture} {part}"), command: item.command.clone(), keys: vec![item.key.clone()], note: None, guests: 0, exclusive_guests: false });
 			build_ids.insert(architecture.to_string(), id);
 		}
 	}
@@ -310,7 +313,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	// the one that never ships, and running only that one is what this model exists to stop.
 	for item in items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
 		let crate_name = item.key.check.strip_prefix("host.").unwrap_or(&item.key.check);
-		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None, guests: 0 });
+		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None, guests: 0, exclusive_guests: false });
 	}
 
 	// Gates each have a separate step. Gates that consume guest output also require that guest.
@@ -352,17 +355,17 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	let booting: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_boots_a_guest(&gate_name(item)) && !crate::catalog::gate_is_profile_row(&gate_name(item)) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1).collect();
 	for item in booting.iter() {
 		let name = gate_name(item);
-		steps.push(Step { id: scoped_id("gate-guest", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate (boots a guest)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("this gate boots a guest of its own: its own step, its own key, its own measured cost and its own guest slot")), guests: 1 });
+		steps.push(Step { id: scoped_id("gate-guest", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate (boots a guest)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("this gate boots a guest of its own: its own step, its own key, its own measured cost and its own guest slot")), guests: 1, exclusive_guests: crate::catalog::EXCLUSIVE_GUEST_GATES.contains(&name.as_str()) });
 	}
 	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1 && !crate::catalog::gate_is_profile_row(&gate_name(item)) && !crate::catalog::gate_boots_a_guest(&gate_name(item))).collect();
 	for item in profile_rows.iter() {
 		let name = gate_name(item);
-		steps.push(Step { id: scoped_id("gate-profile", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} profile"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("one profile of a multi-profile gate: its own step, its own key, its own measured cost and its own guest slot")), guests: 1 });
+		steps.push(Step { id: scoped_id("gate-profile", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} profile"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("one profile of a multi-profile gate: its own step, its own key, its own measured cost and its own guest slot")), guests: 1, exclusive_guests: false });
 	}
 	for item in concurrent.iter() {
 		let name = gate_name(item);
 		let guests = crate::catalog::gate_concurrent_guests(&name);
-		steps.push(Step { id: scoped_id("gate-concurrent", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate ({guests} guests at once)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(format!("this gate's subject is overlap: it starts {guests} guests at the same time, so it needs that many of the runner's slots")), guests });
+		steps.push(Step { id: scoped_id("gate-concurrent", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate ({guests} guests at once)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(format!("this gate's subject is overlap: it starts {guests} guests at the same time, so it needs that many of the runner's slots")), guests, exclusive_guests: crate::catalog::EXCLUSIVE_GUEST_GATES.contains(&name.as_str()) });
 	}
 	// ONE STEP PER GATE, BECAUSE ONE GATE IS ONE SEPARATELY SCHEDULABLE UNIT (corrected 2026-09-03).
 	//
@@ -378,7 +381,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	// what was left was the assumption that the cheap ones are too cheap to be worth an id.
 	for item in before_guest.iter() {
 		let name = gate_name(item);
-		steps.push(Step { id: scoped_id("gate", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: None, guests: 0 });
+		steps.push(Step { id: scoped_id("gate", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: None, guests: 0, exclusive_guests: false });
 	}
 	let gates_after_guest: Vec<&crate::plan::PlanItem> = after_guest;
 	let conformance_items: Vec<&crate::plan::PlanItem> = items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
@@ -387,7 +390,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	// time and admit on its own.
 	for item in conformance_items.iter() {
 		let name = item.key.check.strip_prefix("conformance.").unwrap_or(&item.key.check).to_string();
-		steps.push(Step { id: scoped_id("conformance", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} conformance suite"), command: format!("./check.sh --conformance {name}"), keys: vec![item.key.clone()], note: None, guests: 0 });
+		steps.push(Step { id: scoped_id("conformance", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} conformance suite"), command: format!("./check.sh --conformance {name}"), keys: vec![item.key.clone()], note: None, guests: 0, exclusive_guests: false });
 	}
 
 	// One boot per architecture, whatever the selection inside it.
@@ -422,7 +425,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 		} else {
 			(scoped_id("guest", architecture, &[String::from("all")]), format!("./test.sh --arch {architecture}"), None)
 		};
-		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note, guests: 1 });
+		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note, guests: 1, exclusive_guests: false });
 	}
 
 	// The two guest steps that stand in for a target's tests, and they are steps like any other.
@@ -436,7 +439,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	for item in items.iter().filter(|item| item.kind == CheckKind::GuestFallback) {
 		let architecture = item.key.architecture.as_str();
 		let (label, note) = if item.key.check == "guest.whole-suite" { (format!("kernel suite {architecture} (unenumerated)"), String::from("the model could not enumerate this target's tests, so the whole suite runs and is recorded against one aggregate key")) } else { (format!("boot check {architecture}"), String::from("this target is booted and no test selected it, so it runs a named boot check rather than everything or nothing")) };
-		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note), guests: 1 });
+		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note), guests: 1, exclusive_guests: false });
 	}
 
 	// The gates that read what a guest wrote, after the guests wrote it. Every guest step emitted
@@ -445,7 +448,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	if !gates_after_guest.is_empty() {
 		let names: Vec<String> = gates_after_guest.iter().map(|item| gate_name(item)).collect();
 		let guest_ids: Vec<String> = steps.iter().filter(|step| step.id.starts_with("guest:")).map(|step| step.id.clone()).collect();
-		steps.push(Step { id: scoped_id("gate-after-guest", "host", &names), requires: guest_ids, label: format!("{} gate(s) that read a guest run", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gates_after_guest.iter().map(|item| item.key.clone()).collect(), note: Some(String::from("these read a log a guest run wrote, so they cannot run before one")), guests: 0 });
+		steps.push(Step { id: scoped_id("gate-after-guest", "host", &names), requires: guest_ids, label: format!("{} gate(s) that read a guest run", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gates_after_guest.iter().map(|item| item.key.clone()).collect(), note: Some(String::from("these read a log a guest run wrote, so they cannot run before one")), guests: 0, exclusive_guests: false });
 	}
 
 	// Development checks mutate the same persistent instance, so each waits for its predecessor.
@@ -453,7 +456,7 @@ pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target:
 	let mut previous_dev: Option<String> = None;
 	for item in items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
 		let id = scoped_id("dev", &item.key.check, &[]);
-		steps.push(Step { id: id.clone(), requires: previous_dev.into_iter().collect(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1 });
+		steps.push(Step { id: id.clone(), requires: previous_dev.into_iter().collect(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1, exclusive_guests: true });
 		previous_dev = Some(id);
 	}
 

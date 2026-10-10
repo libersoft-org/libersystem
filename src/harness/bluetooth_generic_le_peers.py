@@ -30,6 +30,7 @@ class GenericPeer(Peer):
         self.att_requests = []
         self.advertising = None
         self.want_advertising = False
+        self.advertising_restart = None
         self.sc, self.mitm = True, True
         super().__init__(*args)
         self.device.host.long_term_key_provider = self.legacy_responder_key
@@ -116,7 +117,7 @@ class GenericPeer(Peer):
     def disconnected(self, connection, reason):
         super().disconnected(connection, reason)
         if self.want_advertising and connection.transport == core.PhysicalTransport.LE:
-            self.spawn(self.advertise())
+            self.advertising_restart = self.spawn(self.advertise())
 
     def paired_le(self, connection, stored):
         self.smp_pairings += 1
@@ -197,14 +198,24 @@ class GenericPeer(Peer):
         elif not self.advertising.enabled:
             await self.advertising.start()
 
-    async def rotate(self):
-        if self.name != 'tag':
-            raise ValueError('the tag is the privacy peer')
+    async def stop_advertising(self):
+        # A disconnect may already have queued an automatic restart. Let that
+        # actual HCI operation settle before disabling/changing the address;
+        # cancellation would leave an uncertain controller-side enable behind.
         self.want_advertising = False
+        if self.advertising_restart is not None:
+            restart, self.advertising_restart = self.advertising_restart, None
+            await restart
+            self.want_advertising = False
         if self.advertising:
             self.advertising.auto_restart = False
             if self.advertising.enabled:
                 await self.advertising.stop()
+
+    async def rotate(self):
+        if self.name not in ('tag', 'remote'):
+            raise ValueError('privacy rotation is offered by the tag and the explicit legacy remote')
+        await self.stop_advertising()
         for connection in list(self.connections.values()):
             await connection.disconnect()
         address = hci.Address.generate_private_address(self.device.irk)
@@ -283,11 +294,7 @@ class GenericPeers:
         if action == 'advertise':
             await peer.advertise()
         elif action == 'stop-advertising':
-            peer.want_advertising = False
-            if peer.advertising:
-                peer.advertising.auto_restart = False
-                if peer.advertising.enabled:
-                    await peer.advertising.stop()
+            await peer.stop_advertising()
         elif action == 'pairing-config':
             peer.sc, peer.mitm = request.get('sc', True), request.get('mitm', True)
             peer.pairing_delegate.number = None
@@ -300,7 +307,9 @@ class GenericPeers:
         elif action == 'report':
             await peer.device.notify_subscribers(peer.hid, bytes.fromhex(request['data']))
         elif action == 'rotate':
-            return dict(address=await peer.rotate())
+            address = await peer.rotate()
+            return dict(address=address, is_resolvable=peer.device.random_address.is_resolvable,
+                        identity=str(peer.device.static_address))
         elif action == 'privacy':
             return await peer.privacy()
         elif action == 'server-values':

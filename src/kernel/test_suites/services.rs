@@ -5642,3 +5642,6 @@ fn modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back()
 	}
 	assert!(readmitted.is_some(), "a closed client connection gave its slot back");
 }
+
+#[path = "services/bluetooth_audio.rs"]
+mod bluetooth_audio;

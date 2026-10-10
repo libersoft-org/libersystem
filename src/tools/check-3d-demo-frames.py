@@ -172,7 +172,7 @@ def visible_faces(pose):
 	return shown
 
 
-def check_scene(frame, problems):
+def check_scene(frame, problems, *, object_reference=None):
 	width, height = frame.span()
 	if width < 64 or height < 48:
 		problems.append(f'{frame.path}: the window is {width}x{height}, which is too small to have been the demo drawing')
@@ -201,6 +201,13 @@ def check_scene(frame, problems):
 	crossings = alternations(floor, 4.0)
 	if crossings < 3:
 		problems.append(f'{frame.path}: the ground crosses its own mean {crossings} time(s) along one line, so its texture is not repeating')
+
+	# A fixed vertical FOV can make the cube fill a portrait viewport. The median
+	# skyline and width bounds below belong to the reference aspect; native resize
+	# also requires matching camera rays, plus the current pose, in the caller.
+	if object_reference is not None:
+		check_scene(object_reference, problems)
+		return
 
 	# THE OBJECT IS IN A BOUNDED CENTRAL REGION, FOUND BY WHAT IT OCCLUDES AND NOT BY ITS COLOUR.
 	#
@@ -314,10 +321,66 @@ def differing(first, second):
 	return count
 
 
+def check_resize(reference, current, width, height, problems):
+	"""A native surface must preserve camera rays across an aspect change.
+
+	The demo has a fixed vertical field of view. Coordinates relative to the centre,
+	measured in image heights, therefore see the same static pose at every aspect.
+	Stretching an old fixed-aspect scene does not preserve this relationship. Ignore
+	the HUD's top strip; a two-pixel neighbourhood covers discrete sampling at the
+	two resolutions, without accepting a geometrically stretched scene.
+	"""
+	if (current.width, current.height) != (width, height):
+		problems.append(f'{current.path}: scanout is {current.width}x{current.height}, expected {width}x{height}')
+		return
+	for frame in (reference, current):
+		if frame.x0 > 2 or frame.y0 > 2 or frame.x1 < frame.width - 2 or frame.y1 < frame.height - 2:
+			problems.append(f'{frame.path}: a native resized surface must fill its scanout')
+			return
+	matched = total = 0
+	colours = set()
+	for row in range(31):
+		v = 0.25 + row * 0.02
+		for column in range(-12, 13):
+			offset = column * 0.02
+			x = int(reference.width / 2 + offset * reference.height)
+			y = int(v * reference.height)
+			u = int(current.width / 2 + offset * current.height)
+			w = int(v * current.height)
+			if not (0 <= x < reference.width and 2 <= u < current.width - 2):
+				continue
+			pixel = reference.at(x, y)
+			colours.add(tuple(channel // 16 for channel in pixel))
+			total += 1
+			if any(distance(pixel, current.at(u + dx, w + dy)) <= 18
+			       for dy in range(-2, 3) for dx in range(-2, 3)):
+				matched += 1
+	if total < 500 or len(colours) < 12:
+		problems.append(f'{current.path}: resize comparison lacks scene evidence ({total} rays, {len(colours)} colours)')
+	elif matched * 10 < total * 9:
+		problems.append(f'{current.path}: only {matched}/{total} corresponding camera rays match after resize; projection or camera state changed')
+
+
 def main(argv):
 	if not argv:
 		print('usage: check-3d-demo-frames.py [--ready FRAME | --console FRAME | --pose N FRAME | FRAME...]')
 		return 2
+
+	if argv[0] == '--resize':
+		width, height = int(argv[1]), int(argv[2])
+		reference, current = Frame(argv[3]), Frame(argv[4])
+		problems = []
+		check_scene(current, problems, object_reference=reference)
+		check_overlay(current, problems)
+		check_transparency(current, problems)
+		check_pose(current, 0, problems)
+		check_resize(reference, current, width, height, problems)
+		for problem in problems:
+			print(f'3d-demo-frames: {problem}')
+		if problems:
+			return 1
+		print(f'3d-demo-frames: native {width}x{height} resize preserves the static scene, camera projection and HUD')
+		return 0
 
 	if argv[0] == '--ready':
 		# THE SCREEN IS THE DEMO'S SCENE, which is a question about the frame rather than about the

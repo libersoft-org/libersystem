@@ -218,7 +218,16 @@ impl Stack {
 
 	// THE OPERATOR'S LE PAIRING: a connection to what the scan heard, from this host's private address.
 	pub(crate) fn pair_le(&mut self, at: usize, peer: Peer, legacy: bool) -> Result<(), Error> {
-		let held = self.record(at, &peer).map(|record| level_from_wire(&record.level));
+		// A scan result retained across bonding may still name the peer's private address. Keep that
+		// address for the connection command, but apply bond policy and track the attempt by identity.
+		let identity = if peer[0] == KIND_RANDOM {
+			let mut address = [0u8; 6];
+			address.copy_from_slice(&peer[1..]);
+			self.controllers[at].le.resolve(&address).unwrap_or(peer)
+		} else {
+			peer
+		};
+		let held = self.record(at, &identity).map(|record| level_from_wire(&record.level));
 		let controller = &self.controllers[at];
 		if legacy {
 			// LE LEGACY ONLY FOR A DEVICE THAT CANNOT DO BETTER, and never over a Secure Connections bond.
@@ -228,7 +237,7 @@ impl Stack {
 		} else if !controller.secure_connections || controller.public_key.is_none() {
 			return Err(Error::Unsupported);
 		}
-		if controller.link_to(&peer).is_some() || controller.links.len() >= bt_bounds::LINKS_PER_CONTROLLER || controller.reconnect.is_some() {
+		if controller.link_to(&identity).is_some() || controller.links.len() >= bt_bounds::LINKS_PER_CONTROLLER || controller.reconnect.is_some() {
 			return Err(Error::Again);
 		}
 		self.set_aside(at);
@@ -239,8 +248,8 @@ impl Stack {
 		if !controller.le_create_connection(&hci_codec::create_connection_from(peer[0], &address, own)) {
 			return Err(Error::Exhausted);
 		}
-		controller.le.legacy = legacy.then_some(peer);
-		controller.attempt = Some(Attempt { peer, deadline: clock().saturating_add(PAIRING_TICKS), state: PairingState::Connecting, security: SecurityLevel::None });
+		controller.le.legacy = legacy.then_some(identity);
+		controller.attempt = Some(Attempt { peer: identity, deadline: clock().saturating_add(PAIRING_TICKS), state: PairingState::Connecting, security: SecurityLevel::None });
 		Ok(())
 	}
 
@@ -273,7 +282,7 @@ impl Stack {
 		}
 	}
 
-	pub(crate) fn start_le_pairing(&mut self, at: usize, handle: u16) {
+	pub(crate) fn start_le_pairing(&mut self, at: usize, handle: u16, connection_peer: Peer) {
 		let irk = self.own_irk(at).unwrap_or([0; 16]);
 		let controller = &mut self.controllers[at];
 		// HEALTHY SYSTEM RANDOMNESS OR NO PAIRING: every nonce, the passkey and legacy's random value come from it.
@@ -293,7 +302,8 @@ impl Stack {
 		let cross_transport = controller.classic && controller.classic_sc;
 		let options = Options { io: if watcher { IO_KEYBOARD_DISPLAY } else { IO_NO_INPUT_NO_OUTPUT }, legacy, irk, identity, cross_transport };
 		let Some(link) = controller.link_mut(handle) else { return };
-		let (pairing, first) = smp_pairing::Initiator::start(link.local, link.peer, if legacy { None } else { public_key }, seed, options);
+		// SMP authenticates the actual connection addresses, not the identity used to find a bond.
+		let (pairing, first) = smp_pairing::Initiator::start(link.local, connection_peer, if legacy { None } else { public_key }, seed, options);
 		seed.fill(0);
 		link.pairing = Some(pairing);
 		if let Some(attempt) = controller.attempt.as_mut() {

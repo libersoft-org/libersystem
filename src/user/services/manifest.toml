@@ -1123,7 +1123,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/test3d-conformance-sw.lsexe"
-providers = ["render3d-conformance", "lsrt"]
+providers = ["render3d-conformance", "base-proto", "lsrt"]
 
 # THE INTERACTIVE 3D DEMO, and the same two grants for the same reason: every texture in the scene is
 # generated procedurally and every shape is computed, so a rotating lit textured cube over a ground
@@ -6232,7 +6232,9 @@ presence = "optional"
 
 [[services.roles]]
 tag = "CONFIG"
-kind = "client"
+# Each policy instance owns its request/reply stream. A duplicated root retains
+# replies from a stopped instance and races the supervisor and other clients.
+kind = "factory"
 provider = "config_service"
 interface = "liber:config@1/config"
 presence = "optional"

@@ -470,13 +470,35 @@ pub fn blit(source: Image<'_>, mut target: Target<'_>, damage: Rect, first: bool
 		let end_y = (damage.y + damage.height) as u64 * out_height as u64;
 		((damage.x as u64 * out_width as u64 / sw) as u32, (damage.y as u64 * out_height as u64 / sh) as u32, end_x.div_ceil(sw) as u32, end_y.div_ceil(sh) as u32)
 	};
-	for output_y in y0..y1 {
-		let source_y = (output_y as u64 * source.height() as u64 / out_height as u64) as u32;
-		for output_x in x0..x1 {
-			let source_x = (output_x as u64 * source.width() as u64 / out_width as u64) as u32;
-			let source_offset = source_y as usize * source.pitch() as usize + source_x as usize * 4;
-			let pixel = u32::from_le_bytes(source.bytes()[source_offset..source_offset + 4].try_into().ok()?);
-			write_pixel(&mut target, offset_x + output_x, offset_y + output_y, pixel);
+	// A scaled BGR8 scanout has the source's exact colour bytes. The generic packer divides
+	// those bytes by 255 and quantises them back to the same bytes; copying avoids that work.
+	// Match the complete layout, including the absent reserved span: the generic packer writes
+	// a declared reserved span as ones. Here it writes the fourth byte as zero, regardless of
+	// source alpha, so a four-byte source copy would change the existing scaled-blit result.
+	if target.channels() == PixelFormat::B8G8R8A8Unorm.packed_masks() {
+		let target_pitch = target.pitch() as usize;
+		let target_bytes = target.bytes_mut();
+		for output_y in y0..y1 {
+			let source_y = (output_y as u64 * source.height() as u64 / out_height as u64) as usize;
+			let source_row = source_y * source.pitch() as usize;
+			let start = (offset_y + output_y) as usize * target_pitch + (offset_x + x0) as usize * 4;
+			let end = start + (x1 - x0) as usize * 4;
+			for (output_x, pixel) in (x0..x1).zip(target_bytes[start..end].chunks_exact_mut(4)) {
+				let source_x = (output_x as u64 * source.width() as u64 / out_width as u64) as usize;
+				let source_offset = source_row + source_x * 4;
+				pixel[..3].copy_from_slice(&source.bytes()[source_offset..source_offset + 3]);
+				pixel[3] = 0;
+			}
+		}
+	} else {
+		for output_y in y0..y1 {
+			let source_y = (output_y as u64 * source.height() as u64 / out_height as u64) as u32;
+			for output_x in x0..x1 {
+				let source_x = (output_x as u64 * source.width() as u64 / out_width as u64) as u32;
+				let source_offset = source_y as usize * source.pitch() as usize + source_x as usize * 4;
+				let pixel = u32::from_le_bytes(source.bytes()[source_offset..source_offset + 4].try_into().ok()?);
+				write_pixel(&mut target, offset_x + output_x, offset_y + output_y, pixel);
+			}
 		}
 	}
 	let width = x1 - x0;
@@ -589,3 +611,7 @@ fn write_pixel(target: &mut Target<'_>, x: u32, y: u32, bgrx: u32) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "scaled_tests.rs"]
+mod scaled_tests;

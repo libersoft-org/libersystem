@@ -1717,6 +1717,18 @@ pub const SYS_LATENCY_REQUEST: u64 = 127;
 // `SYS_PROCESSOR_PERF_PREFERENCE(privilege, cpu, value)`: CPPC's energy-performance preference, 0 (performance) to 255
 // (energy), written to core `cpu`'s preference register. `ERR_UNSUPPORTED` where its table names none.
 pub const SYS_PROCESSOR_PERF_PREFERENCE: u64 = 128;
+
+// Start one suspended thread with immutable CPU placement.
+//   a0 = Thread handle carrying MANAGE
+//   a1 = logical CPU index (the position in SYS_CPU_INFO, not its hardware id)
+// Returns 0 on the first successful start, ERR_INVALID for an unavailable/out-of-range CPU,
+// an already started thread or a terminating process, and the usual handle/rights errors.
+// A refusal leaves an unstarted thread available for retry. The placement is retained across
+// object, deadline and signal wakes; yield/preemption retain the same CPU. No CPU-removal policy
+// is implied: the kernel's online set grows and system suspend restores the same CPU identities.
+// SYS_THREAD_START keeps its existing current-CPU start and wake-side migration behavior.
+pub const SYS_THREAD_START_ON: u64 = 129;
+
 pub const MAX_INJECT_PERMILLE: u64 = 500;
 
 // A REGISTER a processor table names, as ACPI's Generic Address Structure gives it: the space (0 memory, 1 I/O, 0x0A the

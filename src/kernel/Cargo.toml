@@ -168,6 +168,8 @@ bootproto = { path = "../boot/protocol" }
 system-manifest = { path = "../tools/system-manifest" }
 
 [dev-dependencies]
+# Bluetooth audio publisher wire for the actual consumer recovery scenario.
+bluetooth-proto = { path = "../user/libs/protocol/bluetooth-proto" }
 # The audio leaves, for the `audioconv` scenario: the test builds its own input with the WAV
 # encoder and decodes what came back with the decoder of whichever format was written, so the
 # assertion is against samples rather than against a byte count.

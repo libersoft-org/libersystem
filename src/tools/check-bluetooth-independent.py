@@ -5,7 +5,8 @@ The host controls peer actions, never guest packets or guest verdicts. Independe
 codec readers check the actual over-the-radio payloads. BNEP/OPP adapters are
 explicitly same-team peers; DHCP and IP answers come from dnsmasq/Linux.
 Existing in-guest fixtures retain malformed-packet and resource-exhaustion cases.
-Run after the shared development build/image; this gate never builds the guest.
+An explicit BOOT_IMAGE is authoritative. Otherwise prepare one current private
+development image before starting peers, then reuse it and its paired disk for both boots.
 """
 import argparse
 import ast
@@ -133,6 +134,8 @@ class Gate:
         self.logs = []
         self.control_log = (work / 'control.jsonl').open('w')
         self.results = []
+        self.fixture_requirements = []
+        self.boot_image = None
 
     def spawn(self, command, log, env=None):
         stream = (self.work / log).open('wb')
@@ -147,6 +150,36 @@ class Gate:
             require(process.poll() is None, f'host/guest process exited before {path} appeared')
             require(time.monotonic() < end, f'timeout waiting for {path}')
             time.sleep(.05)
+
+    def prepare_image(self):
+        # Like guest-gate.sh, own one fresh medium unless the caller supplied one.
+        # The runner otherwise packages whichever ordinary/development artifacts
+        # a preceding gate left behind. An environment flag alone cannot rebuild them.
+        supplied = os.environ.get('BOOT_IMAGE')
+        image = (ROOT / supplied).resolve() if supplied else self.work / 'development.iso'
+        if not supplied:
+            env = dict(os.environ, LIBER_DEVELOPMENT='1', LIBER_IMAGE_OUTPUT=str(image))
+            process = self.spawn(['bash', str(ROOT / 'image.sh'), '--format', 'iso', '--dma-mode', 'harness'],
+                                 'image-build.log', env)
+            require(process.wait() == 0, 'the current development image did not build; see image-build.log')
+        require(image.is_file(), f'the selected development image does not exist: {image}')
+        disk = self.work / 'system.img'
+        require(not disk.exists(), 'refusing to replace a persistent Bluetooth test disk')
+        # Extract THIS medium's paired volume, never a mutable canonical volume.
+        # Subsequent cold boots reuse the now-written disk without reseeding it.
+        with tempfile.TemporaryDirectory(prefix='paired-', dir=self.work) as scratch:
+            esp = Path(scratch) / 'esp.img'
+            extract = self.spawn(['xorriso', '-osirrox', 'on', '-indev', str(image), '-extract',
+                                  '/boot/efiboot.img', str(esp)], 'image-extract.log')
+            require(extract.wait() == 0, 'the selected image could not provide its ESP; see image-extract.log')
+            copy = self.spawn(['mcopy', '-i', str(esp), '::/system-volume.img', str(disk)], 'image-volume.log')
+            require(copy.wait() == 0 and disk.is_file(), 'the selected image could not seed its paired volume; see image-volume.log')
+        def identity(path):
+            with path.open('rb') as stream:
+                return dict(path=str(path), bytes=path.stat().st_size,
+                            sha256=hashlib.file_digest(stream, 'sha256').hexdigest())
+        self.boot_image = image
+        self.record('boot-artifacts', supplied=bool(supplied), image=identity(image), initial_disk=identity(disk))
 
     def start_peers(self):
         python = ROOT / '.build/bluetooth-oracles/venv/bin/python'
@@ -219,6 +252,48 @@ class Gate:
         self.serial.wait_prompt(mark, timeout, 'command completion')
         return self.serial.text_since(mark).decode(errors='replace')
 
+    def wait_hid_input(self, label, *, peer='keyboard', group='classic'):
+        # Encryption/CCCD readiness is at the peer. InputService opens its input
+        # stream independently, on a two-second retry. Observe that whole path
+        # with an empty HID-typed line before sending the acceptance text once.
+        # Serial.wait_prompt may nudge via UART, so it cannot prove HID adoption.
+        end = time.monotonic() + 10
+        attempts = 0
+        with (self.work / 'hid-readiness.jsonl').open('a') as log:
+            while time.monotonic() < end:
+                require(self.serial.settle(tickless.lab.PROMPT_SETTLE, min(1, end - time.monotonic())),
+                        f'{group}/{peer} input readiness could not drain prior serial output')
+                require(time.monotonic() < end, f'{group}/{peer} input readiness exceeded its 10 s bound')
+                mark = len(self.serial.data)
+                attempts += 1
+                row = dict(label=label, peer=peer, group=group, attempt=attempts, mark=mark,
+                           seconds=time.monotonic(), status='requested', text='\n')
+                log.write(json.dumps(row) + '\n')
+                log.flush()
+                ready = False
+                try:
+                    self.control('type', peer=peer, group=group, text='\n')
+                    attempt_end = min(end, time.monotonic() + 1)
+                    while time.monotonic() < attempt_end:
+                        # Require the Enter's line ending and a complete fresh
+                        # prompt, not a prompt prefix or anything before mark.
+                        text = self.serial.text_since(mark)
+                        if re.search(rb'\nvol://[^\r\n>]*> $', text):
+                            settle = tickless.lab.PROMPT_SETTLE
+                            if time.monotonic() + settle <= attempt_end and not self.serial.pump(settle):
+                                ready = True
+                                break
+                        self.serial.pump(min(.05, max(0, attempt_end - time.monotonic())))
+                finally:
+                    log.write(json.dumps(dict(row, status='ready' if ready else 'not-ready',
+                                              completed=time.monotonic(), end=len(self.serial.data),
+                                              observed=self.serial.text_since(mark).decode(errors='replace'))) + '\n')
+                    log.flush()
+                if ready:
+                    self.record('hid-input-ready', label=label, peer=peer, group=group, attempts=attempts)
+                    return
+        raise GateError(f'{group}/{peer} did not reach InputService and a fresh console prompt within 10 s')
+
     def command(self, command, expect=None, timeout=120):
         mark = self.start(command)
         output = self.finish(mark, timeout)
@@ -250,8 +325,10 @@ class Gate:
         return row
 
     def stop_service(self, name):
-        before = self.service_status(name, 'ready', 'running')
+        before = self.service_status(name, 'running', 'running')
         output = self.command(f'stop {name}')
+        require(f'supervisor: {name} did not end within its bound after SIG_KILL - it is left behind' not in output,
+                f'{name}: supervisor acknowledged stop without observing process exit: {output}')
         # stop prints an ordered, newline-delimited teardown list on success.
         # A command echo, log line, failure or another stopped name cannot pass.
         reply = re.search(r'(?m)^stopped:\r?\n((?:[a-z][a-z0-9_.-]*\r?\n)+)', output)
@@ -266,7 +343,7 @@ class Gate:
         output = self.command(f'start {name}')
         require(re.search(r'(?m)^started: ' + re.escape(name) + r'\r?\n', output) is not None,
                 f'{name}: supervisor start was not acknowledged: {output}')
-        started = self.service_status(name, 'ready', 'running')
+        started = self.service_status(name, 'running', 'running')
         require(started['epoch'] != previous_epoch,
                 f'{name}: restart did not create a new process: {started}')
         self.record('service-started', service=name, previous_epoch=previous_epoch, started=started)
@@ -287,14 +364,23 @@ class Gate:
         (self.work / 'results.json').write_text(json.dumps(self.results, indent=2) + '\n')
         note(f'PASS {name}')
 
+    def fixture_required(self, row):
+        self.fixture_requirements.append(row)
+        self.results.append(dict(scenario='fixture-required', status='NOT RUN independently', **row))
+        (self.work / 'results.json').write_text(json.dumps(self.results, indent=2) + '\n')
+        note(f"FIXTURE REQUIRED {row['feature']}: {row['reason']} ({row['gate']})")
+
     def boot(self, label):
         serial_path = self.sockets / 'serial'
         serial_path.unlink(missing_ok=True)
         env = dict(os.environ, LIBER_DEVELOPMENT='1', LIBER_RUN_MODE='development', DEV_PROFILE='1', COLD='0', UEFI='1', SMP='2', LIBER_DEV_STATE=str(self.sockets), SERIAL=f'unix:{serial_path},server=on,wait=off', USB_REDIR_SOCKET=str(self.sockets / 'usb'), RUN_DISK=str(self.work / 'system.img'))
         for name in ('TEST', 'QEMU_EXTRA', 'NET_NONE', 'BT_FIXTURE', 'IDLE_FIXTURE', 'SYSTEM_SUSPEND_FIXTURE'):
             env.pop(name, None)
+        require(self.boot_image is not None, 'the development image was not prepared')
+        env['BOOT_IMAGE'] = str(self.boot_image)
+        # qemu-run's explicit-medium path boots its embedded kernel, without a
+        # canonical host ELF prerequisite or another image/loader build.
         kernel = ROOT / '.build/cargo/kernel/x86_64-unknown-none/debug/kernel'
-        require(kernel.exists(), 'missing development kernel: run the shared development build/image first')
         self.guest = self.spawn(['bash', str(HARNESS / 'qemu-run.sh'), 'x86_64', str(kernel)], f'{label}-runner.log', env)
         self.await_file(serial_path, self.guest)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -352,7 +438,7 @@ class Gate:
         self.control_log.close()
 
 
-def pair(g, peer, level, *, kind='bredr', io=None, sc=True, mitm=True, legacy=False, group='classic', address=None):
+def pair(g, peer, level, *, kind='bredr', io=None, sc=True, mitm=True, legacy=False, group='classic', address=None, required_prompt=None):
     address = address or g.address(peer)
     if io:
         g.control('pairing-config', peer=peer, group=group, io=io, sc=sc, mitm=mitm, ssp=not legacy)
@@ -392,6 +478,7 @@ def pair(g, peer, level, *, kind='bredr', io=None, sc=True, mitm=True, legacy=Fa
         g.pause(.05)
     output = g.finish(mark)
     require('bonded: ' + level in output, f'{peer} did not earn {level}: {output}')
+    require(required_prompt is None or required_prompt in answered, f'{peer} did not complete required {required_prompt} prompt')
     g.record('pair-' + peer, level=level, prompts=sorted(answered))
 
 
@@ -407,6 +494,7 @@ def keyboard(g, label):
         g.pause(.3)
     g.control('hid-reconnect', peer='keyboard', address=g.guest_address)
     g.eventually('status', lambda result: result['keyboard']['encrypted'] > state['encrypted'])
+    g.wait_hid_input(label)
     mark = len(g.serial.data)
     g.control('type', peer='keyboard', text=f'echo independent-keyboard-{label}\n')
     g.finish(mark)
@@ -539,17 +627,69 @@ def le_audio(g):
         g.command(f'btctl untrust {g.address(peer)} audio', expect='is no longer trusted for audio')
 
 
+def verify_stereo_broadcast(value):
+    if value['samples'] < 24000:
+        return False
+    require(value.get('rate') == 48000 and len(value.get('channels', [])) == 2,
+            f'broadcast A2DP decode lost stereo/48k format: {value}')
+    return all(row['samples'] >= 24000 and row['rms'] > 100 and row['peak_frequency'] == frequency
+               for row, frequency in zip(value['channels'], (1500, 3000)))
+
+
+def broadcast_to_classic(g):
+    # BIS reception does not require pairing. Preserve independent USB ISO +
+    # LC3 decoding/routing evidence even when SC earbuds cannot be bonded.
+    g.control('disconnect', peer='phone')
+    g.command(f'btctl connect {g.address("headset")} audio', expect='connecting audio')
+    device, row = wait_audio(g)
+    require('48000 Hz stereo' in row, f'BIS route has no stereo A2DP output: {row}')
+    g.command(f'audioctl default {device} output', expect='done')
+    g.command(f'audioctl volume {device} 100', expect='done')
+    for encrypted in (False, True):
+        request = {'code': b'IndependentCode!'.hex()} if encrypted else {}
+        g.control('broadcast-start', group='le', broadcast_id=0x123456, **request)
+        g.command('btctl broadcast scan 5', expect='0x123456', timeout=90)
+        g.control('music-reset', peer='headset')
+        g.command('btctl broadcast play 0x123456' + (' IndependentCode!' if encrypted else ''), expect='joining broadcast')
+        first = g.eventually('music-verdict', verify_stereo_broadcast, peer='headset')
+        observed = domain_snapshot(g)
+        # Discard captured RTP only, not any transmitted data, then require a
+        # fresh decoded half-second on both channels while the route stays live.
+        g.control('music-reset', peer='headset')
+        continuing = g.eventually('music-verdict', verify_stereo_broadcast, peer='headset')
+        label = 'encrypted' if encrypted else 'clear'
+        g.record('domain-live-broadcast-to-a2dp-' + label, **observed,
+                 capture_before=first, fresh_capture_after=continuing,
+                 load='independent BIG -> LC3 decode -> AudioService mix -> SBC/A2DP; not the unavailable simultaneous CIS load')
+        g.command('btctl broadcast stop', expect='the broadcast was stopped')
+        g.control('broadcast-stop', group='le')
+        g.record('le-broadcast-to-a2dp-' + label, independent_decode=continuing,
+                 code_scope='correct-code command/transport; RF wrong-code rejection remains in-guest fixture')
+
+
 def run(g):
+    g.prepare_image()
     g.start_peers()
     g.boot('first')
     rest = g.command('btctl list')
+    from bluetooth_controller_capabilities import read_capabilities, fixture_fallbacks
+    capabilities = read_capabilities((g.work / 'usb.log').read_text())
+    le_sc = capabilities['le_secure_connections']
+    require(('cannot pair on LE (no LE Secure Connections)' not in controller_line(rest)) == le_sc,
+            'guest inventory disagrees with the actual controller command bitmap')
+    g.record('controller-capabilities', **capabilities)
+    for row in fixture_fallbacks(capabilities):
+        g.fixture_required(row)
     require(not any(word in controller_line(rest) for word in ('connectable', 'discoverable', 'pairable')), 'unwatched, untrusted radio is open at rest')
     g.command('btctl discoverable 2', expect='discoverable for 2 s')
     g.pause(3)
     output = g.command('btctl list')
     require('discoverable' not in controller_line(output), 'discoverable lease did not expire')
-    from bluetooth_guest_le import ordinary_le, privacy_rotation, reuse_tag, forget_tag
-    ordinary_le(g, pair)
+    from bluetooth_guest_le import ordinary_le, ordinary_le_without_dhkey, privacy_rotation, reuse_tag, forget_tag
+    if le_sc:
+        ordinary_le(g, pair)
+    else:
+        ordinary_le_without_dhkey(g, pair)
     from bluetooth_guest_classic import classic_pairing
     classic_pairing(g, pair)
     classic_input(g)
@@ -563,11 +703,14 @@ def run(g):
     from bluetooth_guest_classic import music_voice, transfer
     music_voice(g)
     transfer(g)
+    if not le_sc:
+        broadcast_to_classic(g)
     # Classic outputs must leave before the one-device LE set assertions.
     for peer in ('headset', 'phone'):
         g.control('disconnect', peer=peer)
     g.command_eventually('audioctl devices', lambda output: '(Bluetooth' not in output)
-    le_audio(g)
+    if le_sc:
+        le_audio(g)
     privacy_rotation(g)
     g.record('domain-after-load', **domain_snapshot(g))
     before = g.control('status')['keyboard']['pairings']
@@ -600,12 +743,297 @@ def run(g):
     counters = re.findall(r'H4 packets (\{[^\n]+\})', bridge)
     require(counters, 'USB bridge did not preserve H4 transport counters')
     counters = ast.literal_eval(counters[-1])
-    for direction, kind in [('out', 1), ('in', 4), ('in', 2), ('out', 2), ('in', 3), ('out', 3), ('in', 5), ('out', 5)]:
+    required_transport = [('out', 1), ('in', 4), ('in', 2), ('out', 2), ('in', 3), ('out', 3), ('in', 5)]
+    if le_sc:
+        required_transport.append(('out', 5))  # CIS transmit depends on bonding the SC earbuds.
+    for direction, kind in required_transport:
         require(counters.get(f'{direction}-{kind}', 0) > 0, f'USB transport never carried {direction} H4 type {kind}')
-    g.record('production-usb-hci', packets=counters)
+    g.record('production-usb-hci', packets=counters, required_directions=required_transport,
+             outbound_iso='CIS exercised' if le_sc else 'fixture required: SC earbud bonding unavailable')
+
+
+def image_preparation_self_test():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    class BeforeGuest(Exception):
+        pass
+
+    # Real Gate preparation/boot methods; only external builders/media tools are
+    # substituted. These are orchestration tests, not a new image-format oracle.
+    for supplied, fault in ((False, None), (True, None), ('relative', None), (False, 'build'),
+                            (False, 'missing-built'), (True, 'missing-supplied'),
+                            (True, 'extract'), (True, 'copy'), (True, 'missing-disk'),
+                            (True, 'existing-disk')):
+        with tempfile.TemporaryDirectory(prefix='liber-bt-image-test-') as scratch:
+            work = Path(scratch)
+            external = work / 'supplied medium.iso'
+            if supplied and fault != 'missing-supplied':
+                external.write_bytes(b'selected-medium')
+            if fault == 'existing-disk':
+                (work / 'system.img').write_bytes(b'prior-bonds')
+            gate = Gate(work, work)
+            commands = []
+            def spawn(command, log, env=None):
+                commands.append((command, env))
+                code = 0
+                if command[0] == 'bash' and command[1] == str(ROOT / 'image.sh'):
+                    require(env['LIBER_DEVELOPMENT'] == '1', 'image preparation kept an ordinary build profile')
+                    code = 1 if fault == 'build' else 0
+                    if not code and fault != 'missing-built':
+                        Path(env['LIBER_IMAGE_OUTPUT']).write_bytes(b'fresh-development-medium')
+                elif command[0] == 'xorriso':
+                    require(command[command.index('-indev') + 1] == str(external if supplied else work / 'development.iso'),
+                            'volume extraction used an unrelated canonical medium')
+                    code = 1 if fault == 'extract' else 0
+                    if not code:
+                        Path(command[-1]).write_bytes(b'paired-esp')
+                elif command[0] == 'mcopy':
+                    code = 1 if fault == 'copy' else 0
+                    if not code and fault != 'missing-disk':
+                        Path(command[-1]).write_bytes(b'volume-from-selected-medium')
+                else:
+                    require(command[:2] == ['bash', str(HARNESS / 'qemu-run.sh')], 'unexpected preparation tool')
+                return SimpleNamespace(wait=lambda: code)
+            gate.spawn = spawn
+            gate.await_file = lambda *args, **kwargs: (_ for _ in ()).throw(BeforeGuest())
+            try:
+                supplied_path = os.path.relpath(external, ROOT) if supplied == 'relative' else str(external)
+                with patch.dict(os.environ, {'BOOT_IMAGE': supplied_path if supplied else '', 'LIBER_DEVELOPMENT': '0'}):
+                    try:
+                        gate.prepare_image()
+                    except GateError:
+                        require(fault is not None and gate.boot_image is None, 'valid medium refused or failed medium committed')
+                    else:
+                        require(fault is None, f'image preparation accepted failure: {fault}')
+                        built = [c for c, _ in commands if c[:2] == ['bash', str(ROOT / 'image.sh')]]
+                        require(len(built) == (0 if supplied else 1), 'explicit image rebuilt, or fresh image not built once')
+                        initial = gate.results[-1]
+                        require(initial['initial_disk']['sha256'] == hashlib.sha256(b'volume-from-selected-medium').hexdigest(),
+                                'initial paired-volume identity was not recorded')
+                        (work / 'system.img').write_bytes(b'remembered-bonds')
+                        prepared_commands = len(commands)
+                        for label in ('first', 'cold'):
+                            try:
+                                gate.boot(label)
+                            except BeforeGuest:
+                                pass
+                            else:
+                                raise GateError('mock boot reached the guest')
+                            require(commands[-1][1]['BOOT_IMAGE'] == str(gate.boot_image), 'cold boot selected a different medium')
+                            require((work / 'system.img').read_bytes() == b'remembered-bonds', 'cold boot erased persistent bonds')
+                        require(len(commands) == prepared_commands + 2, 'boot rebuilt the selected image')
+                    if fault == 'existing-disk':
+                        require((work / 'system.img').read_bytes() == b'prior-bonds', 'preparation overwrote an existing disk')
+            finally:
+                gate.close()
+    note('image preparation self-test PASS: fresh development build, explicit-image authority, exact paired extraction, cold-disk retention and failure refusals')
+
+
+def hid_readiness_self_test():
+    from unittest.mock import patch
+    import bluetooth_guest_le
+
+    class Clock:
+        now = 0.0
+        def monotonic(self):
+            return self.now
+
+    class Serial(tickless.Serial):
+        def __init__(self, clock):
+            self.clock = clock
+            self.scale = 1
+            self.data = bytearray(b'old output\nvol://system> ')
+            self.pending = []
+        def pump(self, wait):
+            self.clock.now += wait
+            if self.pending:
+                self.data.extend(self.pending.pop(0))
+                return True
+            return False
+        def type(self, _data):
+            raise GateError('HID readiness attempted a UART write')
+
+    # Actual Gate readiness, actual HOGP/Classic acceptance functions, fake
+    # peer/serial only. The clock advances without sleeping or starting a guest.
+    for mode in ('absent', 'stale', 'partial', 'fresh', 'delayed', 'partial-acceptance'):
+        for profile in ('le-generic', 'classic'):
+            with tempfile.TemporaryDirectory(prefix='bluetooth-hid-ready-') as scratch:
+                clock = Clock()
+                gate = Gate.__new__(Gate)
+                gate.work = Path(scratch)
+                gate.serial = Serial(clock)
+                if mode == 'absent':
+                    gate.serial.data.clear()
+                gate.results = []
+                gate.require = require
+                sent = []
+                attempts = 0
+                row = dict(connections=[dict(encrypted=True, hid_notify=True)],
+                           hid_reads=14, pairings=2, encrypted=1)
+                def control(action, *, peer='keyboard', group='classic', **values):
+                    nonlocal attempts
+                    if action == 'status':
+                        return {'keyboard': row, 'tag': row}
+                    if action in ('disconnect', 'hid-reconnect'):
+                        return {}
+                    require(action == 'type', 'unexpected HID readiness mock action')
+                    text = values['text']
+                    sent.append((group, peer, text))
+                    if text == '\n':
+                        attempts += 1
+                        if mode == 'stale':
+                            gate.serial.pending.append(b'vol://system> ')
+                        elif mode == 'partial':
+                            gate.serial.pending.append(b'\nvol://system>')
+                        elif mode in ('fresh', 'partial-acceptance') or (mode == 'delayed' and attempts >= 3):
+                            gate.serial.pending.extend([b'\r\n\x1b[1;32mvol://sys', b'tem> \x1b[0m'])
+                    else:
+                        require(text.startswith('echo independent-') and text.endswith('\n'), 'acceptance text changed')
+                        output = text[5:].encode() if mode != 'partial-acceptance' else b'unknown command\n'
+                        gate.serial.pending.append(text.encode() + output + b'vol://system> ')
+                    return row
+                gate.control = control
+                gate.guest_address = 'host'
+                gate.eventually = lambda action, predicate, **values: {'keyboard': row, 'tag': row}
+                with patch.object(time, 'monotonic', clock.monotonic):
+                    try:
+                        if profile == 'le-generic':
+                            bluetooth_guest_le.type_tag(gate, 'self-test')
+                        else:
+                            keyboard(gate, 'self-test')
+                    except GateError:
+                        require(mode in ('absent', 'stale', 'partial', 'partial-acceptance'), 'ready HID path was refused')
+                    else:
+                        require(mode in ('fresh', 'delayed'), 'invalid HID readiness/acceptance was accepted')
+                accepted = [text for _, _, text in sent if text != '\n']
+                require(len(accepted) == (1 if mode in ('fresh', 'delayed', 'partial-acceptance') else 0),
+                        'acceptance text ran before readiness or was retried')
+                expected_peer = 'tag' if profile == 'le-generic' else 'keyboard'
+                require(all(group == profile and peer == expected_peer for group, peer, _ in sent),
+                        'readiness and acceptance used different HID peers')
+                rows = [json.loads(line) for line in (gate.work / 'hid-readiness.jsonl').read_text().splitlines()]
+                require(len(rows) == attempts * 2 and all(row['text'] == '\n' for row in rows),
+                        'not every readiness attempt was retained')
+                if mode in ('absent', 'stale', 'partial'):
+                    require(not any(row['status'] == 'ready' for row in rows) and clock.now <= 11,
+                            'missing consumer/stale prompt escaped the readiness bound')
+                if mode == 'delayed':
+                    require(attempts == 3, 'delayed adoption was not actually observed')
+    note('HID readiness self-test PASS: stale/partial/absent refused, fresh/delayed adopted, original acceptance once on LE and Classic')
+
+
+def classic_p192_self_test():
+    from unittest.mock import patch
+
+    # Run the exact scenario call and actual pair() helper. Only the serial and
+    # peer-control boundaries are mocked; this does not execute the radio model.
+    source = ast.parse((HARNESS / 'bluetooth_guest_classic.py').read_text())
+    scenario = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'classic_pairing')
+    calls = [node for node in ast.walk(scenario) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == 'pair'
+             and len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and node.args[1].value == 'gamepad']
+    require(len(calls) == 1, 'gamepad P192 scenario is absent or ambiguous')
+    command = compile(ast.Expression(calls[0]), '<actual-gamepad-pair-call>', 'eval')
+
+    class PeerSerial:
+        def __init__(self, owner):
+            self.owner = owner
+            self.writes = []
+            self.reads = 0
+        def text_since(self, mark):
+            require(mark == 17, 'P192 prompt cursor changed')
+            self.reads += 1
+            if self.owner.mode == 'no-comparison':
+                return b'bonded: P-192 Simple Pairing, authenticated\n'
+            if self.owner.mode == 'refused':
+                return b'btctl: the pairing failed\n'
+            # Matches the observed DisplayOnly run and the controller's documented
+            # DisplayYesNo/DisplayOnly association; no cryptography is simulated.
+            if self.owner.mode == 'just-works' or self.owner.io == 'DISPLAY_OUTPUT_ONLY':
+                return b'bonded: P-192 Simple Pairing, Just Works\n'
+            if self.reads <= 2:
+                return b'Does it match 000027? [y/n]'
+            return b'bonded: P-192 Simple Pairing, authenticated\n'
+        def type(self, data):
+            self.writes.append(data)
+
+    class Peer:
+        require = staticmethod(require)
+        def __init__(self, mode):
+            self.mode, self.io, self.now = mode, None, 0.0
+            self.serial = PeerSerial(self)
+            self.rows, self.event_calls = [], []
+        def address(self, peer):
+            require(peer == 'gamepad', 'unexpected P192 peer')
+            return 'da:4c:10:de:00:01'
+        def control(self, action, **values):
+            require(action == 'pairing-config' and values['peer'] == 'gamepad'
+                    and values['group'] == 'classic' and values['sc'] is False
+                    and values['mitm'] is True and values['ssp'] is True,
+                    'P192 authentication configuration weakened')
+            self.io = values['io']
+        def command(self, value, **_kwargs):
+            require(value == 'btctl scan 5', 'unexpected P192 discovery command')
+            return self.address('gamepad')
+        def events(self):
+            return {'next': 43}
+        def start(self, value):
+            require(value == 'btctl pair da:4c:10:de:00:01 bredr', 'P192 used legacy or a different address')
+            return 17
+        def event(self, event, peer, **values):
+            require(event == 'pairing-number' and peer == 'gamepad' and values == {'since': 43},
+                    'P192 comparison did not use a fresh peer event')
+            self.event_calls.append((event, peer, values))
+            if self.mode == 'missing-peer-number':
+                raise GateError('independent peer comparison number absent')
+            return {'number': 28 if self.mode == 'mismatch' else 27}
+        def pause(self, seconds):
+            self.now += seconds
+            require(self.now < 1, 'mock P192 transcript did not terminate')
+        def finish(self, mark):
+            return self.serial.text_since(mark).decode()
+        def record(self, scenario, **values):
+            self.rows.append(dict(scenario=scenario, **values))
+
+    reasons = {
+        'mismatch': 'Numeric Comparison numbers differ',
+        'missing-peer-number': 'independent peer comparison number absent',
+        'no-comparison': 'gamepad did not complete required compare prompt',
+        'just-works': 'gamepad did not earn P-192 Simple Pairing, authenticated',
+        'refused': 'gamepad did not earn P-192 Simple Pairing, authenticated',
+    }
+    for mode in ('matching', *reasons):
+        guest = Peer(mode)
+        with patch.object(time, 'monotonic', lambda: guest.now):
+            try:
+                eval(command, {'pair': pair, 'g': guest})
+            except GateError as error:
+                require(mode in reasons and reasons[mode] in str(error),
+                        f'P192 {mode} failed for an unexpected cause: {error}')
+                require(not guest.serial.writes and not guest.rows, 'refused P192 transcript was confirmed or recorded as passing')
+            else:
+                require(mode == 'matching', f'P192 {mode} transcript was falsely accepted')
+                require(guest.io == 'DISPLAY_OUTPUT_AND_YES_NO_INPUT', 'P192 peer cannot confirm the displayed number')
+                require(guest.serial.writes == [b'y\n'] and len(guest.event_calls) == 1,
+                        'P192 Numeric Comparison was missing, duplicated or not independently matched')
+                require(guest.rows == [dict(scenario='pair-gamepad', level='P-192 Simple Pairing, authenticated', prompts=['compare'])],
+                        'P192 comparison proof was not retained')
+    note('P192 pairing self-test PASS: six actual-call transcripts; matching fresh numbers confirmed once, mismatch/missing number/missing prompt/Just Works/refusal rejected')
 
 
 def self_test():
+    classic_p192_self_test()
+    hid_readiness_self_test()
+    from bluetooth_le_reconnect import run as le_reconnect_self_test
+    le_reconnect_self_test(ROOT)
+    from bluetooth_le_audio_identity import run as le_audio_identity_self_test
+    le_audio_identity_self_test(ROOT)
+    image_preparation_self_test()
+    from bluetooth_audio_lifecycle import run as audio_lifecycle_self_test
+    audio_lifecycle_self_test(ROOT)
+    from bluetooth_controller_capabilities import self_test as capability_self_test
+    capability_self_test()
     from types import SimpleNamespace
     accounting = 'bluetooth_service: memory=1212416/67108864 handles=21/256 threads=1/4 ipc-queue=1200/4194304 dma=0/0 stack=131072/2097152\n'
     def observer(usage=accounting, graph='graph bluetooth_service\nname=bluetooth_service state=running\n'):
@@ -688,7 +1116,7 @@ def main():
                 run(gate)
             finally:
                 gate.close()
-        note('PASS independent classic/LE profiles, production USB transport, stored bonds across service restart and cold reboot')
+        note(f'PASS supported independent scenarios, production USB transport and bond persistence; {len(gate.fixture_requirements)} explicit per-feature fixture requirements remain in results.json (no all-profile independent PASS)')
         return 0
     except (GateError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f'bluetooth-independent: FAIL - {error}', file=sys.stderr, flush=True)

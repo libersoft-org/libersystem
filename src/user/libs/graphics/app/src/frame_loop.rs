@@ -4,6 +4,7 @@
 //! PRESENT_DONE, re-reading a configuration. Every decision it takes comes from `Pacing`, which is a
 //! value with no syscalls in it, so the rules are checked as fixtures rather than by booting.
 
+use crate::frame_starts::FrameStarts;
 use crate::pacing::{Pacing, Step};
 use base_proto::generated::liber::base::v1::Error;
 use graphics_core::geom::Extent2D;
@@ -28,6 +29,7 @@ pub struct Rebuilt {
 pub struct FrameLoop {
 	surface: Surface,
 	pacing: Pacing,
+	starts: FrameStarts,
 	events: u64,
 	/// How many events this loop has read, and how many of them were each of the kinds a frame loop
 	/// acts on. Reported rather than inferred, because "the stream said nothing", "there is no
@@ -47,11 +49,15 @@ impl FrameLoop {
 		};
 		let mut pacing = Pacing::new(images);
 		pacing.adopt(surface.configuration(), surface.image_count() as u32);
+		let starts = match FrameStarts::new(surface.image_count(), surface.generation()) {
+			Ok(starts) => starts,
+			Err(_) => return Some(Err(Error::Exhausted)),
+		};
 		// THE EVENT STREAM IS OPENED WITH THE SURFACE and not on the first change, because a client
 		// that opened it later would have missed the changes in between - and a loop that polls
 		// instead is the busy spin the stream exists to replace.
 		let events = surface.events().unwrap_or(0);
-		Some(Ok(FrameLoop { surface, pacing, events, seen: 0, configures: 0, visibility: 0 }))
+		Some(Ok(FrameLoop { surface, pacing, starts, events, seen: 0, configures: 0, visibility: 0 }))
 	}
 
 	pub fn pacing(&self) -> &Pacing {
@@ -75,6 +81,9 @@ impl FrameLoop {
 				display_proto::generated::liber::display::v1::SurfaceEvent::VisibilityChanged(_) => self.visibility = self.visibility.saturating_add(1),
 				_ => {}
 			}
+			if matches!(event, display_proto::generated::liber::display::v1::SurfaceEvent::Configure(_) | display_proto::generated::liber::display::v1::SurfaceEvent::VisibilityChanged(false)) {
+				self.starts.cancel_pending();
+			}
 			self.pacing.on_event(&event);
 		}
 	}
@@ -82,7 +91,10 @@ impl FrameLoop {
 	/// What to do now.
 	pub fn step(&mut self) -> Step {
 		self.poll_events();
-		self.pacing.step(clock_ns())
+		let now = clock_ns();
+		let step = self.pacing.step(now);
+		self.starts.step(step, now);
+		step
 	}
 
 	/// Take the next image, or say why there is none.
@@ -92,6 +104,7 @@ impl FrameLoop {
 	/// rebuild. A loop that treated any of them as "ask again" would spin against a service that is
 	/// deliberately not blocking.
 	pub fn acquire(&mut self) -> Option<Frame> {
+		let started = self.starts.begin_acquire();
 		// THE FRAME ACCOUNT'S SITES: the call to DisplayService begun and answered, with the
 		// image it answered or `u64::MAX` for none. One cached-flag test each unless a measurement is
 		// armed on a `development-trace` boot.
@@ -107,6 +120,7 @@ impl FrameLoop {
 		match acquired {
 			Some(Ok(AcquiredImage::Image(index))) => {
 				let mapping = self.surface.image(index)?;
+				self.starts.acquired(index, mapping.addr(), started);
 				Some(Frame { index, layout: mapping.layout(), addr: mapping.addr() })
 			}
 			Some(Ok(AcquiredImage::Again)) => {
@@ -131,7 +145,16 @@ impl FrameLoop {
 	/// between the acquire and the draw makes the frame one nobody wanted, and returning the image
 	/// is what stops a resized window leaking one per resize.
 	pub fn abandon(&mut self, frame: Frame) {
+		let _ = self.frame_start(&frame);
 		let _ = self.surface.abandon(frame.index);
+	}
+
+	fn frame_start(&mut self, frame: &Frame) -> Option<u64> {
+		let mapping = self.surface.image(frame.index)?;
+		if mapping.addr() != frame.addr || mapping.layout() != frame.layout {
+			return None;
+		}
+		self.starts.take(frame.index, frame.addr, self.surface.generation())
 	}
 
 	/// Whether the loop has been asked to close. A REQUEST AND NEVER A TEARDOWN: the application
@@ -142,6 +165,7 @@ impl FrameLoop {
 
 	/// Present a drawn image WHOLE, which is what the first frame of a generation must be.
 	pub fn present_whole(&mut self, frame: Frame) -> bool {
+		let started = self.frame_start(&frame);
 		// THE RENDER IS COMPLETE, SAID ON PRODUCER_READY. There are two completion pairs, one per
 		// direction, and this is the one the client owns: the present that follows says the same
 		// thing and carries damage with it, so the signal is what a client sends when it wants the
@@ -161,7 +185,7 @@ impl FrameLoop {
 		);
 		match presented {
 			Some(Ok(serial)) => {
-				self.pacing.on_present(serial, clock_ns());
+				self.pacing.on_present_started(serial, clock_ns(), started);
 				true
 			}
 			_ => false,
@@ -170,6 +194,7 @@ impl FrameLoop {
 
 	/// Present a drawn image's damaged rectangles.
 	pub fn present_rects(&mut self, frame: Frame, rects: &[surface::Rect]) -> bool {
+		let started = self.frame_start(&frame);
 		perf_site(b"ready\0\0\0", frame.index as u64);
 		surface::signal_ready(self.surface.producer_endpoint(), frame.index);
 		perf_site(b"prs-beg\0", rects.len() as u64);
@@ -183,7 +208,7 @@ impl FrameLoop {
 		);
 		match presented {
 			Some(Ok(serial)) => {
-				self.pacing.on_present(serial, clock_ns());
+				self.pacing.on_present_started(serial, clock_ns(), started);
 				true
 			}
 			_ => false,
@@ -196,10 +221,14 @@ impl FrameLoop {
 	/// split this whole helper exists for: a renderer that had to know about a present queue to
 	/// survive a resize is a renderer with a window system inside it.
 	pub fn rebuild(&mut self) -> Option<Result<Rebuilt, Error>> {
+		self.starts.invalidate();
 		if let Err(error) = self.surface.rebuild()? {
 			return Some(Err(error));
 		}
 		let configuration = self.surface.configuration().clone();
+		if self.starts.reset(self.surface.image_count(), self.surface.generation()).is_err() {
+			return Some(Err(Error::Exhausted));
+		}
 		self.pacing.adopt(&configuration, self.surface.image_count() as u32);
 		Some(Ok(Rebuilt { extent: Extent2D::new(configuration.physical_extent.width, configuration.physical_extent.height), generation: configuration.generation }))
 	}

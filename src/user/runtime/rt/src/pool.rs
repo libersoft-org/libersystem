@@ -5,7 +5,7 @@
 //! runs a closure once per item, spread over the workers and the calling thread, and returns when
 //! every one has run. That is the shape of every consumer this tree has (the software rasteriser's
 //! tiles), and it is the shape that needs no thread to END while the program runs, which is what
-//! makes it possible without a kernel change - see EXIT below.
+//! keeps individual thread exit unnecessary - see EXIT below.
 //!
 //! WHAT A WORKER IS. A thread made with `SYS_THREAD_CREATE` on the process's own handle
 //! (`SYS_PROCESS_SELF`), started once, on a stack of its own: a memory object charged to the
@@ -36,7 +36,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
-use crate::{RIGHT_MAP, RIGHT_READ, Received, SIG_KILL, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_USER_EXIT, channel, close, duplicate, map_object, memory_object_create, process_self, recv_blocking, send_blocking, signal, sys_is_err, syscall, unmap_object, yield_now};
+use crate::{ERR_BAD_SYSCALL, ERR_INVALID, RIGHT_MAP, RIGHT_READ, Received, SIG_KILL, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_THREAD_START_ON, SYS_USER_EXIT, channel, close, cpu_info, duplicate, map_object, memory_object_create, process_self, recv_blocking, send_blocking, signal, sys_is_err, syscall, unmap_object, yield_now};
 
 /// The most workers one process may hold.
 pub const MAX_WORKERS: usize = 64;
@@ -80,6 +80,38 @@ static WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Held while a worker is being made, so two threads making pools cannot fill one slot twice.
 static MAKING: AtomicBool = AtomicBool::new(false);
+
+/// Next logical CPU to try, advanced only after an accepted placed start. `MAKING` serializes it.
+/// Start at 1 to leave the usual boot CPU to the caller; the caller itself remains unplaced and
+/// may migrate on a completion wake. Offline slots are retried without consuming another thread.
+static NEXT_CPU: AtomicUsize = AtomicUsize::new(1);
+
+/// Start one newly made worker on the next available logical CPU. The CPU inventory's values are
+/// hardware identities, so only its returned slot count is used. A refused start leaves this same
+/// suspended thread available for the next slot; authority/resource failures are not retried.
+/// Older kernels without this additive operation keep the previous unplaced start behavior.
+fn start_worker(thread: u64) -> bool {
+	let count = cpu_info(&mut []);
+	if count <= 0 {
+		return !sys_is_err(unsafe { syscall(SYS_THREAD_START, thread, 0, 0, 0) });
+	}
+	let count = count as usize;
+	let first = NEXT_CPU.load(Ordering::Relaxed) % count;
+	for offset in 0..count {
+		let cpu = (first + offset) % count;
+		let started = unsafe { syscall(SYS_THREAD_START_ON, thread, cpu as u64, 0, 0) };
+		if !sys_is_err(started) {
+			NEXT_CPU.store((cpu + 1) % count, Ordering::Relaxed);
+			return true;
+		}
+		match started as i64 {
+			ERR_INVALID => continue,
+			ERR_BAD_SYSCALL => return !sys_is_err(unsafe { syscall(SYS_THREAD_START, thread, 0, 0, 0) }),
+			_ => return false,
+		}
+	}
+	false
+}
 
 /// This process's handle to itself, asked for once.
 static SELF: AtomicU64 = AtomicU64::new(0);
@@ -231,9 +263,9 @@ fn make() -> bool {
 			close(orders);
 			return false;
 		}
-		let started = unsafe { syscall(SYS_THREAD_START, thread, 0, 0, 0) };
+		let started = start_worker(thread);
 		close(thread);
-		if sys_is_err(started) {
+		if !started {
 			close(command);
 			return false;
 		}

@@ -2929,3 +2929,63 @@ The320x240/800x600 rows, three successful Core640 windows, complete eight-row re
 
 
 Post-allocation native benchmark (2026-10-09 23:09:16 UTC): After the animated allocation correction, a quiet native release measurement `RUST_MIN_STACK=33554432 cargo run --offline --release --manifest-path src/tools/soft3d-bench/Cargo.toml -- --workers 1` PASS. This is the deterministic640x480/192-triangle/384-vertex benchmark with2 warmup frames and8 samples, one host worker and the benchmark's host clock. Cumulative variants: geometry1.287ms, raster91.208ms, shading345.633ms, texturing481.958ms, blending/full488.455ms per frame; respective incremental contributions1.287/89.921/254.426/136.325/6.497ms. Throughput393triangles/s and476688shaded fragments/s;192primitives,33clipped,141culled,232841fragments/samples written per frame. Output `.build/logs/end-of-job/qemu-only-20261009/render103/soft3d-post-allocation-workers1.log`; release executable SHA256 `1ed545a1b3b048e83b298e42ea1c9c1030ee275d0bf1a0ade6e3540a970e14ea`. This updates the required changed-runtime native stage decomposition and does not establish the separate live30FPS floor. ActualCore/Extended640 zero-allocation passes and the Core30FPS failure remain as recorded above;320/800sizes, threeCore640windows, the full registered gate and final common verification remain pending.
+
+
+Placement-corrected ordinary guest (2026-10-10 01:16:05 UTC): actual x86 QEMU/KVM host CPU,32vCPUs,4GiB, release/shared-image demo, guest monotonic full-present intervals; complete environment/identities in `.build/logs/end-of-job/qemu-only-20261009/render103/post-placement-guest-20261010T010800Z/`. Core640x480:35frames/30steady intervals, median154546us, p99/max175316us, elapsed4658579523ns=6.439731FPS;30FPS FAIL. Extended640x480: median439539us, max478031us, elapsed13215216718ns=2.270110FPS, no30FPS floor. Both renderer and whole-loop steady allocation maxima0. Core heap peak30518800B, scene prepared961118B; Extended peak186684704B, scene prepared140101154B, HDR prepared16873630B. Core35-frame stage means(us): scene47457, transparent9247, handover10330, overlay29230, present36740; Extended shadow36331, scene127561, postprocess171919, handover10971, overlay29360, present37269. All32 actual vCPU threads consumed CPU time, independently mapped by the monitor. No new native-stage benchmark or320/800 result is claimed.
+
+
+### P02M0103 measured scaled presentation correction (2026-10-10 01:22:18 UTC)
+
+A native release comparison of the unchanged generic scaler against the applied exact packed-BGR8 branch used identical input bytes, target layout, aspect/damage calculations and whole-buffer/BlitResult equality. Each row is30 calls after5 warmups; independent current guest acceptance remains pending.
+
+| Case | Original median | Applied candidate median | Exact output |
+| --- | ---: | ---: | --- |
+|640x480 source to1280x800, whole damage|40.430ms|2.514ms|PASS|
+|800x600 source to1280x800, whole damage|41.015ms|2.555ms|PASS|
+|640x480 source to1280x800, partial damage|0.505ms|0.0299ms|PASS|
+|640x480 equal-size direct copy|0.09469ms|0.09447ms|PASS; direct code unchanged|
+
+No SIMD, new buffers, workers, display lifecycle or timing threshold change. Canonical scaled bytes retain X=0 independently of source alpha; layouts with declared reserved bits remain generic.13 functional tests passed including the frozen original as an oracle. Host benchmark command, compiler/configuration, exact patch identity, output and initial duplicate-smoke-symbol fixture link failure are retained under `.build/logs/end-of-job/qemu-only-20261009/present-scaling`. The successful retry changed only that unused baseline symbol's name. These host component measurements do not revise the last actual ordinary SMP32 Core result6.439731FPS (FAIL30); a rebuilt live guest remains required.
+
+
+### P02M0103 isolated HUD attribution (2026-10-10 01:27:02 UTC)
+
+Exact old/applied app Hud/list/Scene/Forms, deterministic preallocated opaque640x480 RGBA source, changing content generation, persistent host workers (std condition variables),5 warmups and30 measured frames. These are independent medians; total is not a sum of medians. All rows retain hash25379433745664d0 and maximum warmed allocation count0.
+
+| Path | Workers | Refresh median | Replay median | Total median |
+| --- | ---: | ---: | ---: | ---: |
+| Original |1|16.061ms|10.002ms|26.025ms|
+| Applied |1|15.904ms|10.021ms|25.824ms|
+| Applied |32|16.353ms|2.087ms|18.444ms|
+| Applied repeat |32|16.105ms|2.087ms|18.160ms|
+
+Evidence: `.build/logs/end-of-job/qemu-only-20261009/render103/hud-parallel/hud-attribution-results.json` and exact extraction manifest. This is a HUD-only host diagnostic using a fixed input field, not the real guest renderer or rt IPC pool; it claims no30FPS result. Serial cache refresh is now measured as the remaining dominant HUD cost.
+
+
+### P02M0103 cached HUD refresh (2026-10-10 01:46:57 UTC)
+
+Exact extracted existing HUD, changing640x480 content,5 warmups plus30 measured samples,32 persistent host workers. Independently measured medians compare previously applied parallel replay with newly applied parallel cache refresh.
+
+| Path | Refresh median | Replay median | Total median |
+| --- | ---: | ---: | ---: |
+| Before parallel cache refresh |16.177640ms|2.102320ms|18.281219ms|
+| Applied parallel cache refresh |3.033903ms|1.678749ms|4.728779ms|
+
+Both retain exact pixel hash25379433745664d0 and maximum measured allocations0. Exact sources, binaries and commands are under `.build/logs/end-of-job/qemu-only-20261009/render103/hud-refresh/`. This host pool uses condition variables; current guest performance remains unmeasured. Applied graphics-app fallback pacing now counts from Draw through present instead of adding16ms after present; cheap-frame throttling, genuine backend timing and no-spin requirements remain.18 host policy/ownership regressions pass. Historical frame accounts retain the old phase. No new live FPS is claimed; actual Core6.439731FPS remains below unchanged30FPS.
+
+
+Shared-runtime copy attribution (2026-10-10): an exact252-byte lsrt memcpy shim passed1,072 length/alignment/guard cases and confirmed executable symbol binding.32-worker/30-pose paired native shader measurements using that shim gave baseline scene+panel36.095/37.772ms and applied0–4-word scalar-store candidate32.974/31.622ms (approximately12.6% mean reduction). All rows preserve combined colour/identity/depth hash b318488e33b3be99 and0 warmed allocations. The initial constant-copy match was rejected because LLVM emitted the same dynamic memcpy. Actual scalar-store disassembly confirms the intended change;128 Soft3D tests pass. Evidence under render103/shading-attribution includes exact source, ELF, shim, command and output identities. No whole-guest gap attribution or new30FPS PASS is claimed.
+
+
+### P02M0103 ordinary guest after measured graphics corrections (2026-10-10 02:33:26 UTC)
+
+Quiet x86 QEMU/KVM 10.0.13, Xeon Platinum 8272CL host, 32 vCPUs, 4GiB, release/shared-image demo and guest monotonic full-present intervals. Exact opened ISO, paired volume, compiler/source identities and commands: `.build/logs/end-of-job/qemu-only-20261009/render103/post-hud-guest-20261010T022500Z/`. Both rows present 35 frames and measure 30 intervals after five warmups; both renderer/whole-loop allocation maxima are zero.
+
+| Scene at 640x480 | Median | p99/max | 30-interval elapsed | Measured FPS | Floor |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Core | 61,522us | 77,751us | 1,894,855,136ns | 15.832345 | FAIL required 30 FPS |
+| Extended with HDR | 348,816us | 375,342us | 10,479,024,298ns | 2.862862 | No Core floor |
+
+Core mean scene/transparent/handover/overlay/present times: 37,934/9,272/1,768/6,129/7,295us; present maximum 12,103us. Heap live/peak 36,886,624/36,886,656B; scene prepared 961,118B. Extended mean shadow/scene/postprocess/handover/overlay/present: 24,883/125,852/171,514/2,174/8,742/10,352us; present maximum 12,608us. Heap live/peak 193,052,528/193,052,560B; scene prepared 140,101,154B and HDR prepared 16,873,630B. Stage means cover all 35 frames, not the 30 steady intervals. All 32 actual vCPU threads consumed CPU time, with 48.13 total CPU seconds over the 3.534s Core command and 170.51 over 13.825s Extended. The source fingerprint stayed unchanged throughout build and measurement, and owned shutdown passed.
+
+This diagnostic does not replace three successful Core windows, other extents, native-resize visuals, changed-runtime serial benchmark or the final registered gates. The later Core/Extended harness/conformance separation has only host verification at this point. Historical failed measurements above remain evidence for their earlier source trees.

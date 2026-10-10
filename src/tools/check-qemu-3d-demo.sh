@@ -2,35 +2,70 @@
 # check-qemu-3d-demo.sh - the LIVE half of the 3D demo's proof: frames off a real screen.
 #
 # WHAT THE GUEST TEST CANNOT SHOW. `kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize`
-# reads what the demo SAYS it did - that it opened a surface, that it presented, that it rebuilt for a
-# resize, that a key ended it - and a renderer that drew nothing at all says exactly the same things.
+# reads rendered/animated pixels against stand-in services and exercises surface rebuilding. This
+# gate additionally reads the live scanout while the real driver and DisplayService resize it.
 # What needs a screen is the picture: that there is a lit object standing in front of a horizon, that
 # the ground's texture REPEATS across it, that the translucent panel is a mix of what is in front and
 # what is behind rather than either alone, that the 2D overlay reached the same frame the 3D scene
 # did, and that successive frames differ.
 #
 # FOUR RUNS, EACH ANSWERING ONE QUESTION. A live animated run for the frames that must differ; a run
-# at a STATED POSE for the checks that need to know what is in front of the camera; two runs at
-# different aspect ratios for the geometry that must survive one; and the console, which `q` must give
-# back.
+# at each STATED POSE for the checks that need to know what is in front of the camera; one native
+# surface resized live through two aspect ratios; and the console, which `q` must give back.
 #
-# IT BOOTS ITS OWN GUEST unless one is already up, and takes down only what it started - a gate that
-# quit somebody's development instance would be a gate nobody runs twice.
+# CORE NEEDS ITS OWN GUEST because changing another owner's display is not this gate's authority.
+# Extended may reuse a checked guest. Both take down only what they started.
 
 SCRIPT_NAME=check-qemu-3d-demo.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../lib.sh"
 
+# The Extended phase has its own registered gate. It shares the guest ownership and measurement
+# protocol, but its three rows cannot determine whether the Core gate passes.
+phase=core
+if (($#)); then
+	[[ "$#" == 1 && "$1" == --extended ]] || die "usage: check-qemu-3d-demo.sh [--extended]"
+	phase=extended
+	SCRIPT_NAME=check-qemu-3d-extended.sh
+fi
+
 FRAMES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/3d-demo-frames.XXXXXX")"
 mkdir -p "$REPO_ROOT/.build/logs"
-PROOF_DIR="$(mktemp -d "$REPO_ROOT/.build/logs/qemu-3d-demo.XXXXXX")"
+PROOF_NAME="${SCRIPT_NAME#check-}"
+PROOF_DIR="$(mktemp -d "$REPO_ROOT/.build/logs/${PROOF_NAME%.sh}.XXXXXX")"
 BOOTED=0
+VNC_DIR=""
+VNC_CHANGED=0
+RESIZE="$REPO_ROOT/src/tools/3d-demo-resize.py"
+LAB_STATE="${LIBER_DEV_STATE:-$REPO_ROOT/.build/boot}"
 cleanup() {
+	local status=$? cleanup_failed=0 may_quit=1 keep_vnc=0
+	trap - EXIT
 	if ((BOOTED)); then
-		"$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true
+		if [[ "$phase" == core ]]; then
+			if ! python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --owner-state "$LAB_STATE" >"$FRAMES_DIR/owner-before-cleanup.json" 2>"$FRAMES_DIR/owner-before-cleanup.log"; then
+				may_quit=0
+				cleanup_failed=1
+				printf '%s\n' 'the current lab guest no longer matches this invocation; refusing to quit it' >"$FRAMES_DIR/cleanup-error.log"
+			fi
+		fi
+		if ((may_quit)); then
+			if ((VNC_CHANGED)); then
+				python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --width "$ORIGINAL_WIDTH" --height "$ORIGINAL_HEIGHT" --timeout 10 >"$FRAMES_DIR/resize-cleanup.json" 2>"$FRAMES_DIR/resize-cleanup.log" || cleanup_failed=1
+			fi
+			"$REPO_ROOT/lab.sh" quit >"$FRAMES_DIR/quit.log" 2>&1 || cleanup_failed=1
+		fi
+		if [[ "$phase" == core ]] && python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --owner-state "$FRAMES_DIR/owned-state" >"$FRAMES_DIR/owner-after-cleanup.json" 2>"$FRAMES_DIR/owner-after-cleanup.log"; then
+			cleanup_failed=1
+			keep_vnc=1
+			printf '%s\n' 'the proven-owned QEMU remains alive; its private VNC endpoint is retained' >>"$FRAMES_DIR/cleanup-error.log"
+		fi
 	fi
-	cp -a "$FRAMES_DIR/." "$PROOF_DIR/"
+	if [[ -n "$VNC_DIR" ]] && ((keep_vnc == 0)); then rm -rf "$VNC_DIR"; fi
+	cp -a "$FRAMES_DIR/." "$PROOF_DIR/" || cleanup_failed=1
 	rm -rf "$FRAMES_DIR"
 	note "3D frame and performance proof: $PROOF_DIR"
+	if ((status == 0 && cleanup_failed)); then status=1; fi
+	exit "$status"
 }
 trap cleanup EXIT
 
@@ -41,99 +76,174 @@ CHECK="$REPO_ROOT/src/tools/check-3d-demo-frames.py"
 # the shared library, and a program holding capabilities it has no business with draws it too.
 python3 "$REPO_ROOT/src/tools/check-3d-demo-package.py" || die "the demo's package is not what its manifest says it is"
 
-# AN INSTANCE THAT IS ALREADY UP IS USED AS IT IS. The probe is a shell command rather than a socket
-# test: a socket that exists and answers nothing is the case a gate has to survive.
+# This gate's documented reference machine has 32 vCPUs. Scope the override to its owned
+# boot so ordinary verification can retain SMP=4. A reused guest is checked as it actually
+# exists; changing the caller's environment cannot change a running machine's topology.
+# A foreground application or broken broker can hide the prompt while its QEMU remains
+# alive. lab boot replaces that recorded group, so establish absence without shell I/O.
+refuse_live_guest() {
+	local status=0
+	python3 "$RESIZE" --live-state "$LAB_STATE" >"$FRAMES_DIR/existing-guest.json" 2>"$FRAMES_DIR/existing-guest.log" || status=$?
+	case "$status" in
+	0) die "an existing live lab guest was left unchanged; this gate will not replace it" ;;
+	1) ;;
+	*) die "existing guest ownership could not be established; refusing to boot" ;;
+	esac
+}
+if [[ "$phase" == core ]]; then refuse_live_guest; fi
 if ! "$REPO_ROOT/lab.sh" sh uname >/dev/null 2>&1; then
-	note "no instance is up - booting one"
-	"$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
-	BOOTED=1
+	# Recheck after a failed shell request, including Extended's supported reuse path.
+	refuse_live_guest
+	note "no instance is up - booting the 32-vCPU reference machine"
+	if [[ "$phase" == core ]]; then
+		# A short private UNIX path avoids a public VNC listener and AF_UNIX path truncation.
+		VNC_DIR="$(mktemp -d /tmp/liber-3d-vnc.XXXXXX)"
+		printf '%s\n' "$VNC_DIR/display.sock" >"$FRAMES_DIR/vnc-endpoint.log"
+		boot_status=0
+		SMP=32 VNC_ADDR="unix:$VNC_DIR/display.sock" "$REPO_ROOT/lab.sh" boot --vnc >/dev/null || boot_status=$?
+		if python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --owner-state "$LAB_STATE" >"$FRAMES_DIR/owned-guest.json" 2>"$FRAMES_DIR/owned-guest.log"; then
+			BOOTED=1
+			mkdir -p "$FRAMES_DIR/owned-state"
+			python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pgid"])' "$FRAMES_DIR/owned-guest.json" >"$FRAMES_DIR/owned-state/lab-guest.pgid"
+		fi
+		((boot_status == 0 && BOOTED == 1)) || die "the guest did not boot with this invocation's proven private VNC ownership"
+	else
+		SMP=32 "$REPO_ROOT/lab.sh" boot >/dev/null || die "the guest did not boot"
+		BOOTED=1
+	fi
+elif [[ "$phase" == core ]]; then
+	die "live resize needs a gate-owned guest and private VNC endpoint; the existing instance was left unchanged"
+fi
+"$REPO_ROOT/lab.sh" monitor "info cpus" >"$FRAMES_DIR/cpus.log" || die "the guest's CPU topology could not be read"
+"$REPO_ROOT/lab.sh" monitor "info kvm" >"$FRAMES_DIR/kvm.log" || die "the guest's accelerator could not be read"
+if python3 - "$FRAMES_DIR/cpus.log" "$FRAMES_DIR/kvm.log" <<'TOPOLOGY'; then :; else
+import pathlib,re,sys
+cpus=pathlib.Path(sys.argv[1]).read_text()
+kvm=pathlib.Path(sys.argv[2]).read_text()
+ids=[int(value) for value in re.findall(r"^\s*\*?\s*CPU #(\d+):",cpus,re.M)]
+assert sorted(ids)==list(range(32)), f"expected exactly 32 live vCPUs, observed CPU IDs {ids}"
+assert re.search(r"^kvm support: enabled\s*$",kvm,re.M), "the documented reference guest requires KVM enabled"
+TOPOLOGY
+	die "this gate requires the documented 32-vCPU KVM guest; a reused instance was left unchanged"
 fi
 
-# The visual fixtures use a fixed 320x240 scene; the performance runs below use all three
-# required physical render sizes without scaling the scene down.
-SCENE="--scene-width 320 --scene-height 240"
-VISUAL_RUN=0
+if [[ "$phase" == core ]]; then
+	python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --query >"$FRAMES_DIR/resize-original.json" || die "the owned VNC extent could not be read"
+	read -r ORIGINAL_WIDTH ORIGINAL_HEIGHT < <(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v["width"],v["height"])' "$FRAMES_DIR/resize-original.json")
+	# Animation/pose fixtures keep their existing small scene. The live-resize run below omits
+	# both overrides, so the native surface's new physical extent changes the projection.
+	# Performance rows retain their fixed physical/render extents.
+	SCENE="--scene-width 320 --scene-height 240"
+	VISUAL_RUN=0
 
-# Run the demo in the background and wait until the screen is its. WAITED FOR RATHER THAN SLEPT
-# THROUGH: a capture taken before the first present shows the CONSOLE, which is not a blank screen -
-# it is white text on black, and a checker that read it would blame the renderer for its own timing.
-#
-# NO FRAME LIMIT, AND THE KEY ENDS IT. A frame count would have to be chosen against a rate nobody
-# measured on the machine the gate happens to run on: too few and the demo has left before the
-# captures, too many and the run outlives the harness's patience. What the captures need is a demo
-# that is still drawing, and what ends it is the same `q` a person presses - which is also the exit
-# the last check reads.
-start_demo() {
-	local arguments="$1"
-	VISUAL_RUN=$((VISUAL_RUN + 1))
-	DEMO_LOG="$FRAMES_DIR/demo-$VISUAL_RUN.log"
-	printf 'test3d-sw %s %s\n' "$SCENE" "$arguments" >"$DEMO_LOG"
-	"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw $SCENE $arguments" >>"$DEMO_LOG" 2>&1 &
-	DEMO_PID=$!
-	local ready=0
-	for _ in $(seq 1 90); do
-		if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/ready.ppm" >/dev/null 2>&1 && python3 "$CHECK" --ready "$FRAMES_DIR/ready.ppm"; then
-			ready=1
+	# Run the demo in the background and wait until the screen is its. WAITED FOR RATHER THAN SLEPT
+	# THROUGH: a capture taken before the first present shows the CONSOLE, which is not a blank screen -
+	# it is white text on black, and a checker that read it would blame the renderer for its own timing.
+	#
+	# NO FRAME LIMIT, AND THE KEY ENDS IT. A frame count would have to be chosen against a rate nobody
+	# measured on the machine the gate happens to run on: too few and the demo has left before the
+	# captures, too many and the run outlives the harness's patience. What the captures need is a demo
+	# that is still drawing, and what ends it is the same `q` a person presses - which is also the exit
+	# the last check reads.
+	start_demo() {
+		local arguments="$1" scene="${2-$SCENE}"
+		VISUAL_RUN=$((VISUAL_RUN + 1))
+		DEMO_LOG="$FRAMES_DIR/demo-$VISUAL_RUN.log"
+		printf 'test3d-sw %s %s\n' "$scene" "$arguments" >"$DEMO_LOG"
+		"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw $scene $arguments" >>"$DEMO_LOG" 2>&1 &
+		DEMO_PID=$!
+		local ready=0
+		for _ in $(seq 1 90); do
+			if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/ready.ppm" >/dev/null 2>&1 && python3 "$CHECK" --ready "$FRAMES_DIR/ready.ppm"; then
+				ready=1
+				break
+			fi
+			sleep 2
+		done
+		((ready == 1)) || die "the demo never reached the screen: its output so far was $(tail -n 3 "$DEMO_LOG" 2>/dev/null)"
+	}
+
+	finish_demo() {
+		"$REPO_ROOT/lab.sh" key q >/dev/null 2>&1 || die "the quit key was not delivered"
+		wait "$DEMO_PID" 2>/dev/null || true
+		grep -q "test3d-sw: presented" "$DEMO_LOG" || die "the demo did not run to completion; its output was: $(tail -n 3 "$DEMO_LOG")"
+	}
+
+	# 1. THE LIVE RUN: three timed frames, and the first thing asked of them is that they DIFFER. One
+	#    frame proves a drawing; three seconds apart prove a drawing that is running.
+	start_demo "--width 1280 --height 800"
+	captured=0
+	for index in 1 2 3; do
+		if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/frame-$index.ppm" >/dev/null 2>&1; then
+			captured=$((captured + 1))
+		fi
+		sleep 3
+	done
+	finish_demo
+	((captured == 3)) || die "only $captured of three live frames were captured"
+	python3 "$CHECK" "$FRAMES_DIR/frame-1.ppm" "$FRAMES_DIR/frame-2.ppm" "$FRAMES_DIR/frame-3.ppm" || die "the live frames do not show the scene the demo draws"
+
+	# 2. THE DETERMINISTIC POSE. A live capture cannot say which face is in front, because which faces a
+	#    rotation shows depends on the rotation - so the rotation is STATED, and the checker computes
+	#    what that pose must show from the same camera the demo uses.
+	for pose in 0 90; do
+		start_demo "--pose $pose --width 1280 --height 800"
+		"$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/pose-$pose.ppm" >/dev/null 2>&1 || die "the pose $pose frame was not captured"
+		finish_demo
+		python3 "$CHECK" --pose "$pose" "$FRAMES_DIR/pose-$pose.ppm" || die "the frame at pose $pose is not what that pose puts in front of the camera"
+	done
+
+	# 3. ONE LIVE NATIVE SURFACE. VNC's SetDesktopSize reaches virtio-gpu's existing UIInfo
+	# event; DisplayService then changes the surface generation. A VNC acknowledgement alone
+	# cannot pass: the screenshot must have the new dimensions and the same camera rays/pose.
+	start_demo "--pose 0 --report --width 0 --height 0" ""
+	cp "$FRAMES_DIR/ready.ppm" "$FRAMES_DIR/native-original.ppm"
+	expected_rebuilds=0
+	resize_capture() {
+		local width="$1" height="$2" name="$3" ready=0 changed
+		VNC_CHANGED=1
+		python3 "$RESIZE" --socket "$VNC_DIR/display.sock" --width "$width" --height "$height" --timeout 30 >"$FRAMES_DIR/resize-$name.json" 2>"$FRAMES_DIR/resize-$name.log" || die "the $name resize was refused or did not complete"
+		changed="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["changed"]))' "$FRAMES_DIR/resize-$name.json")"
+		expected_rebuilds=$((expected_rebuilds + changed))
+		for _ in $(seq 1 90); do
+			if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/$name.ppm" >/dev/null 2>&1 && python3 "$CHECK" --resize "$width" "$height" "$FRAMES_DIR/native-original.ppm" "$FRAMES_DIR/$name.ppm" >"$FRAMES_DIR/resize-$name-pixels.log" 2>&1; then
+				ready=1
+				break
+			fi
+			sleep 2
+		done
+		((ready == 1)) || die "the native scene never reached the $name extent/projection; see resize-$name-pixels.log"
+		cat "$FRAMES_DIR/resize-$name-pixels.log"
+	}
+	resize_capture 1024 768 desktop
+	resize_capture 480 800 mobile
+	# Restore the reference scanout before the fixed performance workload below.
+	resize_capture "$ORIGINAL_WIDTH" "$ORIGINAL_HEIGHT" restored
+	VNC_CHANGED=0
+	finish_demo
+	python3 - "$DEMO_LOG" "$expected_rebuilds" "$ORIGINAL_WIDTH" "$ORIGINAL_HEIGHT" <<'RESIZED'
+import pathlib,re,sys
+log=pathlib.Path(sys.argv[1]).read_text()
+expected,width,height=map(int,sys.argv[2:])
+match=re.search(r"presented \d+ frame\(s\) rebuilt=(\d+)",log)
+assert expected>=2 and match and int(match[1])>=expected, "the same live demo must rebuild for the requested aspect changes"
+assert f"scene {width}x{height}" in log, "the scene's final render extent must follow the restored native surface"
+RESIZED
+
+	# 4. AND `q` GAVE THE SCREEN BACK. An application that took the console and left it holding a
+	#    rendered frame is a machine a person sees as dead. Every run above ended on that key; this reads
+	#    what the screen holds now that the last one has.
+	for _ in $(seq 1 20); do
+		sleep 1
+		"$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/after.ppm" >/dev/null 2>&1 || continue
+		if python3 "$CHECK" --console "$FRAMES_DIR/after.ppm" >/dev/null 2>&1; then
 			break
 		fi
-		sleep 2
 	done
-	((ready == 1)) || die "the demo never reached the screen: its output so far was $(tail -n 3 "$DEMO_LOG" 2>/dev/null)"
-}
+	python3 "$CHECK" --console "$FRAMES_DIR/after.ppm" || die "the console was not restored after the demo left"
 
-finish_demo() {
-	"$REPO_ROOT/lab.sh" key q >/dev/null 2>&1 || die "the quit key was not delivered"
-	wait "$DEMO_PID" 2>/dev/null || true
-	grep -q "test3d-sw: presented" "$DEMO_LOG" || die "the demo did not run to completion; its output was: $(tail -n 3 "$DEMO_LOG")"
-}
-
-# 1. THE LIVE RUN: three timed frames, and the first thing asked of them is that they DIFFER. One
-#    frame proves a drawing; three seconds apart prove a drawing that is running.
-start_demo "--width 1280 --height 800"
-captured=0
-for index in 1 2 3; do
-	if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/frame-$index.ppm" >/dev/null 2>&1; then
-		captured=$((captured + 1))
-	fi
-	sleep 3
-done
-finish_demo
-((captured == 3)) || die "only $captured of three live frames were captured"
-python3 "$CHECK" "$FRAMES_DIR/frame-1.ppm" "$FRAMES_DIR/frame-2.ppm" "$FRAMES_DIR/frame-3.ppm" || die "the live frames do not show the scene the demo draws"
-
-# 2. THE DETERMINISTIC POSE. A live capture cannot say which face is in front, because which faces a
-#    rotation shows depends on the rotation - so the rotation is STATED, and the checker computes
-#    what that pose must show from the same camera the demo uses.
-for pose in 0 90; do
-	start_demo "--pose $pose --width 1280 --height 800"
-	"$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/pose-$pose.ppm" >/dev/null 2>&1 || die "the pose $pose frame was not captured"
-	finish_demo
-	python3 "$CHECK" --pose "$pose" "$FRAMES_DIR/pose-$pose.ppm" || die "the frame at pose $pose is not what that pose puts in front of the camera"
-done
-
-# 3. TWO ASPECT RATIOS, because a projection that is right at one and wrong at the other is a
-#    projection that divides by the wrong extent - and a window is not always a desktop's shape.
-for shape in "1024 768 desktop" "480 800 mobile"; do
-	set -- $shape
-	start_demo "--pose 0 --width $1 --height $2"
-	"$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/$3.ppm" >/dev/null 2>&1 || die "the $3 frame was not captured"
-	finish_demo
-	python3 "$CHECK" --pose 0 "$FRAMES_DIR/$3.ppm" || die "the scene at the $3 aspect ratio is not the scene"
-done
-
-# 4. AND `q` GAVE THE SCREEN BACK. An application that took the console and left it holding a
-#    rendered frame is a machine a person sees as dead. Every run above ended on that key; this reads
-#    what the screen holds now that the last one has.
-for _ in $(seq 1 20); do
-	sleep 1
-	"$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/after.ppm" >/dev/null 2>&1 || continue
-	if python3 "$CHECK" --console "$FRAMES_DIR/after.ppm" >/dev/null 2>&1; then
-		break
-	fi
-done
-python3 "$CHECK" --console "$FRAMES_DIR/after.ppm" || die "the console was not restored after the demo left"
-
-note "live frames prove animation, a bounded central object, a repeating ground texture, a blended panel, the 2D overlay in the same frame, two stated poses, two aspect ratios and a restored console"
+	note "live frames prove animation, a bounded central object, a repeating ground texture, a blended panel, the 2D overlay in the same frame, two stated poses, live desktop/portrait resize preserving camera projection and a restored console"
+fi
 
 # Full-size release measurements. The first five presents warm the frame path; thirty subsequent
 # intervals include pacing, acquire, rendering, HUD, present and worker-thread allocation activity.
@@ -141,8 +251,7 @@ note "live frames prove animation, a bounded central object, a repeating ground 
 	date -u +%Y-%m-%dT%H:%M:%SZ
 	qemu-system-x86_64 --version | head -n 1
 	LC_ALL=C lscpu
-	"$REPO_ROOT/lab.sh" monitor "info kvm"
-	"$REPO_ROOT/lab.sh" monitor "info cpus"
+	cat "$FRAMES_DIR/kvm.log" "$FRAMES_DIR/cpus.log"
 	python3 - "$REPO_ROOT" <<'ENVIRONMENT'
 import hashlib,json,os,pathlib,re,shlex,sys
 root=pathlib.Path(sys.argv[1])
@@ -175,20 +284,19 @@ print("measurement=5 warmup presents, 30 complete frame intervals; animated scen
 ENVIRONMENT
 } >"$FRAMES_DIR/environment.log" 2>&1
 failed=0
-for phase in core extended; do
-	repeat=0
-	row=0
-	for size in "320 240" "800 600" "640 480" "640 480" "640 480"; do
-		read -r width height <<<"$size"
-		row=$((row + 1))
-		if [[ "$width" == 640 ]]; then repeat=$((repeat + 1)); fi
-		[[ "$phase" == extended && "$width" == 640 && "$repeat" -gt 1 ]] && continue
-		extra=""
-		[[ "$phase" == extended ]] && extra="--postprocess"
-		log="$FRAMES_DIR/perf-$phase-${width}x${height}-$row.log"
-		"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw --no-input --report --frames 35 --width $width --height $height --scene-width $width --scene-height $height $extra" >"$log" 2>&1 || failed=1
-		cat "$log"
-		if python3 - "$log" "$phase" "$width" "$height" <<'PERF'; then :; else failed=1; fi
+repeat=0
+row=0
+for size in "320 240" "800 600" "640 480" "640 480" "640 480"; do
+	read -r width height <<<"$size"
+	row=$((row + 1))
+	if [[ "$width" == 640 ]]; then repeat=$((repeat + 1)); fi
+	[[ "$phase" == extended && "$width" == 640 && "$repeat" -gt 1 ]] && continue
+	extra=""
+	[[ "$phase" == extended ]] && extra="--postprocess"
+	log="$FRAMES_DIR/perf-$phase-${width}x${height}-$row.log"
+	"$REPO_ROOT/lab.sh" sh --timeout 900 "test3d-sw --no-input --report --frames 35 --width $width --height $height --scene-width $width --scene-height $height $extra" >"$log" 2>&1 || failed=1
+	cat "$log"
+	if python3 - "$log" "$phase" "$width" "$height" <<'PERF'; then :; else failed=1; fi
 import pathlib,re,sys
 path,phase,width,height=sys.argv[1:]
 text=pathlib.Path(path).read_text()
@@ -208,7 +316,10 @@ if phase=="extended":
     assert "HDR chain executed six downsamples, five upsamples and resolve" in text
     assert "test3d-sw: postprocess " in text and "test3d-sw: shadow " in text and "HDR prepared bytes " in text
 PERF
-	done
 done
 ((failed == 0)) || die "3D performance/allocation criteria failed; proof retained in $PROOF_DIR"
-note "all three core/Extended sizes measured, 640x480 core stable 30 FPS across three windows and steady-state zero allocations passed"
+if [[ "$phase" == core ]]; then
+	note "all three Core sizes measured, 640x480 stable 30 FPS across three windows and steady-state zero allocations passed"
+else
+	note "all three Extended sizes measured with shadow/HDR stages and steady-state zero allocations; no Core frame-rate floor applies"
+fi

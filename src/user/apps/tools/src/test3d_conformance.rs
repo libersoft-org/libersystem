@@ -33,23 +33,49 @@
 extern crate alloc;
 
 use alloc::format;
-use render3d_conformance::{Summary, Verdict, run};
+use proto::system::LaunchContext;
+use render3d_conformance::{Summary, Verdict, run, run_core, run_extended};
 use rt::*;
+
+enum Phase {
+	All,
+	Core,
+	Extended,
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	inherit_stdout(bootstrap);
-	let _ = recv_launch_bytes(bootstrap);
-	print(b"test3d-conformance: start\n");
-
-	let summary: Summary = run(|name, group, verdict| {
+	let launch = recv_launch_bytes(bootstrap).unwrap_or_default();
+	let arguments = LaunchContext::decode(&launch).map(|context| context.arguments).unwrap_or_default();
+	let mut words = arguments.split_ascii_whitespace();
+	let phase = match (words.next(), words.next()) {
+		(None, None) => Phase::All,
+		(Some("--core"), None) => Phase::Core,
+		(Some("--extended"), None) => Phase::Extended,
+		_ => {
+			print(b"test3d-conformance: invalid arguments; usage: test3d-conformance-sw [--core|--extended]\n");
+			exit_with(2);
+		}
+	};
+	print(match phase {
+		Phase::All => b"test3d-conformance: start\n".as_slice(),
+		Phase::Core => b"test3d-conformance: start core\n".as_slice(),
+		Phase::Extended => b"test3d-conformance: start extended\n".as_slice(),
+	});
+	let report = |name, group, verdict: &Verdict| {
 		let line = match verdict {
 			Verdict::Pass => format!("test3d-conformance: pass {group}/{name}\n"),
 			Verdict::Fail(why) => format!("test3d-conformance: FAIL {group}/{name}: {why}\n"),
 			Verdict::Unsupported(why) => format!("test3d-conformance: UNSUPPORTED {group}/{name}: {why}\n"),
 		};
 		print(line.as_bytes());
-	});
+	};
+	let summary: Summary = match phase {
+		Phase::All => run(report),
+		Phase::Core => run_core(report),
+		Phase::Extended => Summary { extended: run_extended(report), ..Summary::default() },
+	};
 
 	// A FEATURE WITH NO SCENE IS A FAILURE OF THE SUITE, reported by name and by the profile it is
 	// in. Without this a feature added to a profile is a feature nobody tests, and every run still
@@ -63,15 +89,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	for name in &summary.extended.untested {
 		print(format!("test3d-conformance: UNTESTED scene3d-extended/{name}\n").as_bytes());
 	}
-	print(format!("test3d-conformance: render3d {} passed, {} failed, {} unsupported, {} untested\n", summary.render3d.passed, summary.render3d.failed, summary.render3d.unsupported, summary.render3d.untested.len()).as_bytes());
-	print(format!("test3d-conformance: scene3d {} passed, {} failed, {} unsupported, {} untested\n", summary.scene3d.passed, summary.scene3d.failed, summary.scene3d.unsupported, summary.scene3d.untested.len()).as_bytes());
-	print(format!("test3d-conformance: scene3d-extended {} passed, {} failed, {} unsupported, {} untested\n", summary.extended.passed, summary.extended.failed, summary.extended.unsupported, summary.extended.untested.len()).as_bytes());
+	if !matches!(phase, Phase::Extended) {
+		print(format!("test3d-conformance: render3d {} passed, {} failed, {} unsupported, {} untested\n", summary.render3d.passed, summary.render3d.failed, summary.render3d.unsupported, summary.render3d.untested.len()).as_bytes());
+		print(format!("test3d-conformance: scene3d {} passed, {} failed, {} unsupported, {} untested\n", summary.scene3d.passed, summary.scene3d.failed, summary.scene3d.unsupported, summary.scene3d.untested.len()).as_bytes());
+	}
+	if !matches!(phase, Phase::Core) {
+		print(format!("test3d-conformance: scene3d-extended {} passed, {} failed, {} unsupported, {} untested\n", summary.extended.passed, summary.extended.failed, summary.extended.unsupported, summary.extended.untested.len()).as_bytes());
+	}
 	print(format!("test3d-conformance: {} passed, {} failed, {} unsupported, {} untested\n", summary.passed(), summary.failed(), summary.unsupported(), summary.untested()).as_bytes());
-	// THE TWO CLAIMS ARE PRINTED SEPARATELY BECAUSE THEY ARE TWO CLAIMS. `Scene3D Extended Profile 1`
-	// is optional as a whole, so "conforms" is about the two CORE profiles; a layer that carries the
-	// extended part says so on its own line, and a reader can tell a core-conforming implementation
-	// without the part from one that claims it and fails it.
-	print(if summary.complete() { b"test3d-conformance: conforms\n".as_slice() } else { b"test3d-conformance: DOES NOT CONFORM\n".as_slice() });
-	print(if summary.complete_with_extended() { b"test3d-conformance: and carries Scene3D Extended Profile 1\n".as_slice() } else { b"test3d-conformance: DOES NOT CARRY Scene3D Extended Profile 1\n".as_slice() });
+	// Explicit phases make no claim about the profile they did not run. The default
+	// retains both historical verdict lines and their meaning.
+	if !matches!(phase, Phase::Extended) {
+		print(if summary.complete() { b"test3d-conformance: conforms\n".as_slice() } else { b"test3d-conformance: DOES NOT CONFORM\n".as_slice() });
+	}
+	match phase {
+		Phase::All => print(if summary.complete_with_extended() { b"test3d-conformance: and carries Scene3D Extended Profile 1\n".as_slice() } else { b"test3d-conformance: DOES NOT CARRY Scene3D Extended Profile 1\n".as_slice() }),
+		Phase::Extended => print(if summary.extended.complete() { b"test3d-conformance: carries Scene3D Extended Profile 1\n".as_slice() } else { b"test3d-conformance: DOES NOT CARRY Scene3D Extended Profile 1\n".as_slice() }),
+		Phase::Core => {}
+	}
 	exit()
 }

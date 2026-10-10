@@ -388,7 +388,10 @@ impl<'a> Soft2d<'a> {
 					}
 					if let Some(cache) = prepared.cached_images.get_mut(command).and_then(Option::as_mut) {
 						let shader = shader(paint, transform, prepared.working, prepared.ramps[command].as_ref(), &lookup);
-						cache.refresh(&shader);
+						// A refused or cancelled refresh may have changed only some rows. Keep its
+						// old generation for retry, and never retain an opaque proof for those rows.
+						prepared.covers[command] = None;
+						refresh_samples(cache, &shader, prepared.lanes, self.workers, &mut self.lanes, &mut self.unit_table, self.cancellation)?;
 						prepared.covers[command] = if cache.opaque() { *opaque_rect } else { None };
 					}
 				}
@@ -422,6 +425,59 @@ impl<'a> Soft2d<'a> {
 	pub fn cancelled(&self) -> bool {
 		self.cancellation.map(|cancellation| cancellation.cancelled()).unwrap_or(false)
 	}
+}
+
+/// Reuse the frame's admitted unit and lane storage for disjoint cached-image row bands.
+/// Empty preparations and refreshes through a different backend retain the old serial path.
+fn refresh_samples(cache: &mut CachedPaint, shader: &Shader<'_>, wanted: usize, workers: &dyn Workers, lanes: &mut [Lane], unit_table: &mut Vec<Unit<'static>>, cancellation: Option<&dyn Cancellation>) -> Result<(), Error> {
+	let (bounds, values) = cache.samples_mut();
+	let count = wanted.min(lanes.len()).min(unit_table.capacity()).min(bounds.height as usize);
+	if count == 0 {
+		for (row, values) in values.chunks_exact_mut(bounds.width as usize).enumerate() {
+			if cancellation.is_some_and(|cancellation| cancellation.cancelled()) {
+				return Err(Error::Cancelled);
+			}
+			shader.row(bounds.x, bounds.y + row as u32, values);
+		}
+		return Ok(());
+	}
+	let lanes = &mut lanes[..count];
+	for lane in lanes.iter_mut() {
+		lane.failure = None;
+	}
+	let stopped = AtomicBool::new(false);
+	let mut units: Vec<Unit<'_>> = recycle(core::mem::take(unit_table));
+	// Every nonempty preparation admits at least one unit per lane. The explicit capacity
+	// bound also preserves allocation-free refresh through a smaller, unrelated backend.
+	let rows = (bounds.height as usize).div_ceil(count);
+	let length = rows * bounds.width as usize;
+	for (index, values) in values.chunks_mut(length).enumerate() {
+		let band = PixelRect { x: bounds.x, y: bounds.y + (index * rows) as u32, width: bounds.width, height: (values.len() / bounds.width as usize) as u32 };
+		units.push(Unit { index, first_tile: 0, tiles: 0, access: Access::Samples { values, bounds: band }, ran: false, whole: false });
+	}
+	let work = |lane: &mut Lane, unit: &mut Unit<'_>| {
+		if unit.ran {
+			return;
+		}
+		unit.ran = true;
+		let Access::Samples { values, bounds } = &mut unit.access else {
+			lane.failure = Some((unit.index, Error::DegenerateShape { what: "image refresh requires sample rows" }));
+			return;
+		};
+		for (row, values) in values.chunks_exact_mut(bounds.width as usize).enumerate() {
+			if stopped.load(Ordering::Relaxed) || cancellation.is_some_and(|cancellation| cancellation.cancelled()) {
+				stopped.store(true, Ordering::Relaxed);
+				return;
+			}
+			shader.row(bounds.x, bounds.y + row as u32, values);
+		}
+		unit.whole = true;
+	};
+	workers.run(lanes, &mut units, &work);
+	let result = verdict(&units, lanes, &stopped).and_then(|()| if units.iter().all(|unit| unit.whole) { Ok(()) } else { Err(Error::IncompletePool) });
+	// Neither refusal nor cancellation may discard the reusable table's allocation.
+	*unit_table = recycle(units);
+	result
 }
 
 /// The device scale a transform applies, which is what a stroke width in user space is multiplied by.

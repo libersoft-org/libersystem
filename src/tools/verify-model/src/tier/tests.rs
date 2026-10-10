@@ -380,8 +380,8 @@ fn a_shared_prerequisite_executes_twice_but_its_key_is_accounted_once() {
 	let host = PlanItemKey { check: "build.kernel".into(), architecture: "x86_64".into(), environment: Environment::Host, configuration: "test".into() };
 	let port = PlanItemKey { check: "kernel.port".into(), architecture: "aarch64".into(), environment: Environment::TestGuest, configuration: "test".into() };
 	let steps = vec![
-		Step { id: "producer".into(), requires: vec![], label: "producer".into(), command: "produce".into(), keys: vec![host.clone()], note: None, guests: 0 },
-		Step { id: "consumer".into(), requires: vec!["producer".into()], label: "consumer".into(), command: "consume".into(), keys: vec![port.clone()], note: None, guests: 1 },
+		Step { id: "producer".into(), requires: vec![], label: "producer".into(), command: "produce".into(), keys: vec![host.clone()], note: None, guests: 0, exclusive_guests: false },
+		Step { id: "consumer".into(), requires: vec!["producer".into()], label: "consumer".into(), command: "consume".into(), keys: vec![port.clone()], note: None, guests: 1, exclusive_guests: false },
 	];
 	let (inner, deferred) = partition(&steps, &[host.clone(), port.clone()].into_iter().collect()).unwrap();
 	assert_eq!(inner, [host].into_iter().collect());
@@ -395,6 +395,22 @@ fn a_shared_prerequisite_executes_twice_but_its_key_is_accounted_once() {
 	let mut broken = steps;
 	broken[1].requires = vec!["missing".into()];
 	assert!(closed_steps(&broken, &deferred).is_err());
+}
+
+#[test]
+fn an_exclusive_guest_prerequisite_keeps_its_barrier_after_key_stripping() {
+	let earlier = PlanItemKey { check: "gate.brightness-usb".into(), architecture: "host".into(), environment: Environment::Host, configuration: "default".into() };
+	let later = PlanItemKey { check: "kernel.port".into(), architecture: "aarch64".into(), environment: Environment::TestGuest, configuration: "test".into() };
+	let steps = vec![
+		Step { id: "fixture".into(), requires: vec![], label: "fixture".into(), command: "./check.sh --gate brightness-usb".into(), keys: vec![earlier], note: None, guests: 1, exclusive_guests: true },
+		Step { id: "consumer".into(), requires: vec!["fixture".into()], label: "consumer".into(), command: "consume".into(), keys: vec![later.clone()], note: None, guests: 1, exclusive_guests: false },
+	];
+	let lowered = closed_steps(&steps, &[later].into_iter().collect()).unwrap();
+	assert_eq!(lowered.len(), 2);
+	assert!(lowered[0].keys.is_empty(), "a retained prerequisite does not record its answered key again");
+	assert!(lowered[0].exclusive_guests, "the same command still owns the same shared resources");
+	assert_eq!(lowered[0].guests, 1, "isolation does not alter its actual guest-slot claim");
+	assert!(!lowered[1].exclusive_guests, "the unrelated isolated consumer keeps ordinary scheduling");
 }
 
 #[test]

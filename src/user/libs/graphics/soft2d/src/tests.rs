@@ -2200,3 +2200,6 @@ fn a_cancelled_frame_leaves_every_unit_whole_or_untouched() {
 		assert!(whole >= 1 && untouched >= 1, "{kind:?}: the frame was stopped part way: {whole} whole, {untouched} untouched");
 	}
 }
+
+#[path = "refresh_tests.rs"]
+mod refresh_tests;

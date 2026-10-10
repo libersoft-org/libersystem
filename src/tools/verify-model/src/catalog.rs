@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 189] = [
+const GATES: [(&str, &str); 190] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -536,6 +536,8 @@ const GATES: [(&str, &str); 189] = [
 	// whose depth test, texture addressing or blend equation is wrong reports exactly what a correct
 	// one reports, and the difference is in the pixels.
 	("qemu-3d-demo", "bin.test3d-sw"),
+	// Extended retains its own phase/verdict and does not extend the Core gate.
+	("qemu-3d-extended", "bin.test3d-sw"),
 	// A DEVICE PLUGGED INTO A LIVE MACHINE. Its subject is the kernel, because what it drives is the
 	// slot protocol, the writable inventory and the event that reaches the manager - three pieces
 	// that only ever happen together on a machine that is already running.
@@ -944,7 +946,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 88] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 89] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
@@ -1021,6 +1023,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 88] = [
 	"qemu-2d-demo",
 	"qemu-2d-account",
 	"qemu-3d-demo",
+	"qemu-3d-extended",
 	"qemu-pcie-hotplug",
 	"qemu-pcie-aer",
 	"tickless-idle",
@@ -1052,6 +1055,81 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 88] = [
 	"rollback-floor-x86_64",
 	"signed-boot",
 	"smp-core-cap",
+];
+
+// Guest slots are a capacity bound, not an isolation contract. These gates also own shared
+// gadget, lab or image state for their entire scenario, so they run behind the guest barrier.
+// Kernel suites and isolated profile rows retain ordinary parallel scheduling. Keep this list
+// explicit: adding a gate here does not change its keys, command, cost, prerequisites or slots.
+pub const EXCLUSIVE_GUEST_GATES: &[&str] = &[
+	// The global dummy_hcd/configfs gadget, including the private development guest that drives it.
+	"brightness-usb",
+	"brightness-acpi",
+	"brightness-acpi-no-dos",
+	"power-ups",
+	// Development-image gates: shared ordinary control/media paths and current image preparation.
+	"bluetooth-service",
+	"bluetooth-classic",
+	"bluetooth-input",
+	"bluetooth-le",
+	"bluetooth-audio",
+	"bluetooth-transfer",
+	"bluetooth-le-audio",
+	"power-service",
+	"smartcard-service",
+	"qemu-modem-service",
+	"qemu-camera-service",
+	"qemu-midi-service",
+	"qemu-gamepad-tool",
+	"i2c-hid",
+	"boot-volume-controllers",
+	"boot-volume-controllers-aarch64",
+	"boot-volume-controllers-riscv64",
+	"camera-usb",
+	"camera-usb-aarch64",
+	"camera-usb-riscv64",
+	"virtio-gpu-edid",
+	"firmware-tree-aarch64",
+	"firmware-tree-riscv64",
+	// The lab broker/cold-run namespace or dev-up image producer, even with private instance state.
+	"audio-routing",
+	"qemu-2d-demo",
+	"qemu-2d-account",
+	"qemu-3d-demo",
+	"qemu-3d-extended",
+	"qemu-pcie-hotplug",
+	"qemu-pcie-aer",
+	"qemu-admin-path",
+	"qemu-dfu-tool",
+	"qemu-ipmi-admin",
+	"qemu-tpm-tool",
+	"shell-large-output",
+	"serial-handoff",
+	"acpi",
+	"hibernate",
+	"ipmi",
+	"processor-power",
+	"sleep",
+	"typec-ucsi",
+	"typec-tcpci",
+	"typec-tcpci-aarch64",
+	"typec-tcpci-riscv64",
+	"watchdog",
+	// Python cold scenarios share the same per-architecture cold QMP/media namespace.
+	"hibernate-ports",
+	"system-suspend-riscv64",
+	"tickless-idle",
+	// Direct x86 development image/ordinary-media consumers and the shipping-image producer.
+	"bluetooth-independent",
+	"perf-anchor",
+	"dma-mode-x86_64",
+	"rollback-floor-x86_64",
+	// Its degraded half builds no-iommu globally and then restores the ordinary volume.
+	"qemu-virtio-iommu-x86_64",
+	// This legacy oracle chooses the newest global capture; another test guest can replace that choice.
+	"virtio-multiport",
+	// Its internal two-guest overlap must be observed without another gate changing the process baseline.
+	"concurrent-selection",
 ];
 
 // Whether this gate boots a guest of its own and therefore needs one of the runner's slots.
@@ -1184,7 +1262,7 @@ impl Catalog {
 				covers.push("bin.device_manager".to_string());
 				covers.push("driver-binding".to_string());
 			}
-			if gate == "qemu-3d-demo" {
+			if gate == "qemu-3d-demo" || gate == "qemu-3d-extended" {
 				for component in ["scene3d", "render3d", "soft3d", "render-shader", "render-math", "render2d", "soft2d", "surface", "graphics-app"] {
 					covers.push(component.to_string());
 				}

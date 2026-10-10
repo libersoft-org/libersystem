@@ -397,7 +397,25 @@ impl Run<'_> {
 				self.machine.wide[slot] = None;
 			}
 			let start = slot * STRIDE;
-			self.machine.words[start..start + words.len()].copy_from_slice(words);
+			let destination = &mut self.machine.words[start..start + words.len()];
+			// The measured scalar/vector path uses fixed word stores so shared-image execution
+			// does not call the general runtime memcpy for every register assignment.
+			if words.len() <= 4 {
+				if !words.is_empty() {
+					destination[0] = words[0];
+					if words.len() >= 2 {
+						destination[1] = words[1];
+						if words.len() >= 3 {
+							destination[2] = words[2];
+							if words.len() == 4 {
+								destination[3] = words[3];
+							}
+						}
+					}
+				}
+			} else {
+				destination.copy_from_slice(words);
+			}
 			self.machine.len[slot] = words.len() as u8;
 		}
 		self.machine.kinds[slot] = kind;
@@ -893,3 +911,7 @@ fn transcendental(which: Transcendental, value: Reg<'_>, second: Option<Reg<'_>>
 pub fn stage(module: &Module) -> Stage {
 	module.stage
 }
+
+#[cfg(test)]
+#[path = "interpreter/copy_tests.rs"]
+mod copy_tests;

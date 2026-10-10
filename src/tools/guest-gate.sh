@@ -76,9 +76,49 @@ guest_gate_require_quarantine() {
 	[[ -f "$staged" ]] || guest_gate_fail "$name is not staged for $GUEST_ARCH - build the development image:  LIBER_DEVELOPMENT=1 ./build.sh --arch $GUEST_ARCH"
 }
 
+# One current ISO per owned x86 gate. A caller's explicit image is authoritative;
+# otherwise image.sh builds the required system and writes a private medium. The
+# public run.sh deliberately builds nothing and must receive its --image flag.
+# Harness signing follows the lab's development image; the existing gate carrier
+# still selects the actual enforced/no-IOMMU machine. Build/profile flags are inherited.
+guest_gate_image=""
+guest_gate_image_args=()
+guest_gate_prepare_image() {
+	guest_gate_image_args=()
+	[[ "$GUEST_ARCH" == x86_64 ]] || return 0
+	local image="${BOOT_IMAGE:-}"
+	if [[ -z "$image" ]]; then
+		if [[ -z "$guest_gate_image" ]]; then
+			guest_gate_image="$guest_gate_work/guest.iso"
+			LIBER_IMAGE_OUTPUT="$guest_gate_image" "$root/../image.sh" --format iso --dma-mode harness >"$guest_gate_work/image.log" 2>&1 || {
+				cat "$guest_gate_work/image.log" >&2
+				guest_gate_fail "the current x86 gate image did not build"
+			}
+		fi
+		image="$guest_gate_image"
+	fi
+	[[ -f "$image" ]] || guest_gate_fail "the selected x86 gate image does not exist: $image"
+	guest_gate_image_args=(--image "$image")
+	# A caller's persistent disk survives its later cold boots unchanged. Seed only a
+	# new one, from THIS ISO rather than a global volume another image build can replace.
+	if [[ -n "${RUN_DISK:-}" && ! -e "$RUN_DISK" ]]; then
+		local paired
+		paired="$(mktemp -d "$guest_gate_work/paired.XXXXXX")"
+		if ! xorriso -osirrox on -indev "$image" -extract /boot/efiboot.img "$paired/esp.img" >"$paired/extract.log" 2>&1 ||
+			! mcopy -i "$paired/esp.img" ::/system-volume.img "$paired/system-volume.img" >>"$paired/extract.log" 2>&1 ||
+			! cp --reflink=auto "$paired/system-volume.img" "$RUN_DISK"; then
+			cat "$paired/extract.log" >&2
+			guest_gate_fail "the selected image could not seed its paired persistent disk"
+		fi
+		rm -rf "$paired"
+	fi
+}
+
 # Boot the guest, type `command`, and reduce the log to the lines `prefix:` begins.
 guest_gate_run() {
 	local command="$1" prefix="$2"
+	# Preparation precedes the console/guest deadline, so builds do not consume it.
+	guest_gate_prepare_image
 	local script="$guest_gate_work/script"
 	# ONE LINE PER COMMAND. A caller with three of them passes them as three lines, which is what the
 	# console driver types and what a gate observing a SEQUENCE needs.
@@ -97,7 +137,7 @@ guest_gate_run() {
 	fi
 	python3 src/harness/guest-console.py --socket "$socket" --log "$GUEST_LOG" --script "$script" --seconds "$console" >"$guest_gate_work/driver" 2>&1 &
 	guest_gate_driver=$!
-	SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 >"$guest_gate_work/run" 2>&1 || true
+	SERIAL="unix:$socket,server=on,wait=off" timeout "$deadline" ./run.sh --arch "$GUEST_ARCH" --smp 2 "${guest_gate_image_args[@]}" >"$guest_gate_work/run" 2>&1 || true
 	wait "$guest_gate_driver" 2>/dev/null || true
 	guest_gate_driver=""
 	[[ -s "$GUEST_LOG" ]] || guest_gate_fail "the guest produced no console output"

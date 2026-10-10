@@ -958,6 +958,7 @@ step_unpriced=()
 # so it starts two AT ONCE and cannot be made serial without deleting its subject. The model
 # declares the count, this reserves it, and a `--jobs` that cannot hold it does not run the step.
 step_guests=()
+step_exclusive=()
 while IFS=$'\t' read -r marker index rest; do
 	case "$marker" in
 	STEPID) step_ids[$index]="$rest" ;;
@@ -965,6 +966,7 @@ while IFS=$'\t' read -r marker index rest; do
 	STEPCOST) step_costs[$index]="$rest" ;;
 	STEPUNPRICED) step_unpriced[$index]=1 ;;
 	STEPGUESTS) step_guests[$index]="$rest" ;;
+	STEPEXCLUSIVE) step_exclusive[$index]="$rest" ;;
 	esac
 done <"$steps_file"
 for i in "${!step_ids[@]}"; do
@@ -972,6 +974,8 @@ for i in "${!step_ids[@]}"; do
 	step_costs[$i]="${step_costs[$i]:-0}"
 	step_unpriced[$i]="${step_unpriced[$i]:-0}"
 	step_guests[$i]="${step_guests[$i]:-0}"
+	step_exclusive[$i]="${step_exclusive[$i]:-0}"
+	[[ "${step_exclusive[$i]}" == 0 || "${step_exclusive[$i]}" == 1 ]] || die "step $i has an invalid exclusive-guest declaration: ${step_exclusive[$i]}"
 done
 
 BUDGET_TOTAL=0
@@ -1146,21 +1150,12 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 		skipped+=("$label")
 		continue
 	fi
-	# A GUEST STEP IS THE ONLY THING `--jobs` LETS OVERLAP, and only with another guest step.
-	#
-	# The expensive item in any plan is a boot, and two boots of different targets have nothing to
-	# contend over now that every writable image is per-run. Everything else - a gate that boots one
-	# of its own, a conformance suite, a build - runs alone, because "how many QEMUs may run" must
-	# have exactly one answer on this machine and a gate's inner boot is not counted by this loop.
-	# WHAT COUNTS AS GUEST WORK IS DECLARED BY THE MODEL, NOT INFERRED FROM THE COMMAND TEXT
-	# (corrected 2026-09-02). This matched the literal string `./test.sh --arch `, which is one way of
-	# booting a guest and not the only one: a per-profile gate row boots QEMU through `check.sh` and
-	# was therefore classified as host work, drained behind the barrier and run alone - so the profile
-	# rows that were split out to be schedulable were the one thing the scheduler could not reach.
-	# `STEPGUESTS` is the model saying how many slots a step needs, it is already emitted for the gate
-	# whose subject is overlap, and reading it here is what gives "how many QEMUs may run" one answer
-	# for every step rather than one for the steps whose command happened to match.
+	# Capacity and isolation are separate. The model declares actual guest slots plus a barrier
+	# for shared gadget/lab/image scenarios; isolated suites and profiles can still overlap.
+	# Do not turn this into prerequisite edges: one failed gadget gate must not suppress an
+	# unrelated gate merely because both need exclusive access to the same host resources.
 	wants_guests="${step_guests[$index]:-0}"
+	exclusive_guest="${step_exclusive[$index]:-0}"
 	is_guest=0
 	((wants_guests >= 1)) && is_guest=1
 	# THE BARRIER COMES BEFORE THE BLOCKER CHECK, AND THAT ORDER IS WHAT MAKES THE CHECK SOUND.
@@ -1178,7 +1173,7 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	# requires another guest today, so this is the rule rather than the current shape of the graph:
 	# a check that is only correct for the edges the planner happens to emit is a check that breaks
 	# silently when it emits one more.
-	if ((is_guest == 0)); then
+	if ((is_guest == 0 || exclusive_guest == 1)); then
 		drain_guests
 	else
 		for req in ${step_reqs[$index]}; do
@@ -1233,7 +1228,7 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 		note "        $command"
 	fi
 	outfile="$(mktemp)"
-	if ((is_guest == 1 && JOBS > 1)); then
+	if ((is_guest == 1 && JOBS > 1 && exclusive_guest == 0)); then
 		# ROOM FOR WHAT THIS STEP WANTS, NOT ROOM FOR ONE MORE PROCESS. See `guests_in_flight`: a
 		# step declaring two slots must wait until two are free, and a one-slot step must not start
 		# beside it just because the array holds a single entry.

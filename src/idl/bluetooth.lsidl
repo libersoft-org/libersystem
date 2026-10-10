@@ -648,6 +648,13 @@ enum fixture-action {
 	/// refuses the legacy scan and connection commands once an extended one is used; 0 the controller it starts as,
 	/// with none of them.
 	le-features   = 28,
+	/// The disconnected LE display fixture (peer 10): 0 DisplayOnly or 2 KeyboardOnly for the two SC passkey
+	/// directions. Other peers or values are refused. This changes its next real SMP exchange, never its result.
+	le-io-capability = 29,
+	/// Save the disconnected non-audio LE peer's current keys, or explicitly restore that snapshot after a deliberately
+	/// weaker pairing. `argument` must be zero. The guest's bond store is never touched; a reconnect must prove its key.
+	le-save-keys    = 30,
+	le-restore-keys = 31,
 }
 
 /// THE IN-GUEST BLUETOOTH FIXTURE'S CONTROL ENDPOINT. DEVELOPMENT ONLY: it exists on a development fixture

@@ -20,6 +20,9 @@
 
 extern crate alloc;
 
+#[path = "test3d_sw/handover.rs"]
+mod handover;
+
 #[path = "test3d_sw/postprocess.rs"]
 mod postprocess;
 
@@ -1185,6 +1188,16 @@ impl Workers for Shading {
 	}
 }
 
+// Both renderers borrow the same pool for successive passes; no second set of threads is made.
+impl soft2d::Workers for Shading {
+	fn lanes(&self) -> usize {
+		self.pool.threads() + 1
+	}
+	fn run<'u>(&self, lanes: &mut [soft2d::Lane], units: &mut [soft2d::Unit<'u>], work: &(dyn Fn(&mut soft2d::Lane, &mut soft2d::Unit<'u>) + Sync)) {
+		self.pool.for_each(lanes, units, work);
+	}
+}
+
 /// `--compare`'s own attachments, the same extents as the scene's, which every pass is rendered
 /// into a second time on this thread alone.
 struct Spare {
@@ -1525,7 +1538,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let shading = Shading { pool: rt::pool::Pool::new(participants.saturating_sub(1)) };
 	let mut line = common_line::Line::new();
 	line.push(b"test3d-sw: shading on ");
-	line.decimal(shading.lanes() as u64);
+	line.decimal(Workers::lanes(&shading) as u64);
 	line.push(b" worker(s)\n");
 	print(line.as_bytes());
 	let mut spare = if controls.compare {
@@ -1791,7 +1804,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// surface is now an image the 2D half composites a HUD over - which is the path an
 		// application takes and the one nothing else in this tree exercises end to end.
 		let stage_began = clock_ns();
-		hud.absorb(&mut targets, view.picking);
+		hud.absorb(&mut targets, view.picking, &shading);
 		timing.handover += clock_ns().saturating_sub(stage_began);
 		let before_acquire = heap_allocation_count();
 		let Some(frame) = frames.acquire() else {
@@ -1819,7 +1832,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			frames.abandon(frame);
 			break;
 		}
-		if !hud.present_into(&targets, &frame, presented) {
+		if !hud.present_into(&targets, &frame, presented, &shading, controls.compare) {
+			if controls.compare {
+				hud.differed += 1;
+			}
 			print(b"test3d-sw: the composite was refused\n");
 			frames.abandon(frame);
 			break;
@@ -1879,19 +1895,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if verdict.differed == 0 {
 			line.decimal(verdict.passes as u64);
 			line.push(b" pass(es) through ");
-			line.decimal(shading.lanes() as u64);
+			line.decimal(Workers::lanes(&shading) as u64);
 			line.push(b" worker(s) matched the serial walk\n");
 		} else {
 			line.decimal(verdict.differed as u64);
 			line.push(b" of ");
 			line.decimal(verdict.passes as u64);
 			line.push(b" pass(es) through ");
-			line.decimal(shading.lanes() as u64);
+			line.decimal(Workers::lanes(&shading) as u64);
 			line.push(b" worker(s) DIFFERED from the serial walk\n");
 		}
 		print(line.as_bytes());
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: ");
+		line.decimal(hud.compared as u64);
+		line.push(b" HUD frame(s) ");
+		line.push(if hud.differed == 0 { b"matched the serial walk\n" } else { b"DIFFERED from the serial walk\n" });
+		print(line.as_bytes());
 		// A DIFFERENCE IS A FAILED RUN, and says so where a launcher can read it.
-		if verdict.differed != 0 {
+		if verdict.differed != 0 || hud.differed != 0 {
 			exit_with(1);
 		}
 	}
@@ -2003,6 +2025,9 @@ struct Hud {
 	prepared: Option<soft2d::backend::SoftPrepared>,
 	recorded: Option<(Extent2D, (u32, u32), bool)>,
 	forms: Forms,
+	comparison: Option<OwnedImage>,
+	compared: u32,
+	differed: u32,
 }
 
 /// A colour in the space the surface holds, which is the only one this program names.
@@ -2019,20 +2044,20 @@ const COLOUR_GLYPH: u32 = 99;
 
 impl Hud {
 	fn new() -> Option<Hud> {
-		Some(Hud { canvas: Canvas::new(), list: DrawList::default(), backend: Soft2d::new(), prepared: None, recorded: None, forms: Forms { height: 12.0 } })
+		Some(Hud { canvas: Canvas::new(), list: DrawList::default(), backend: Soft2d::new(), prepared: None, recorded: None, forms: Forms { height: 12.0 }, comparison: None, compared: 0, differed: 0 })
 	}
 
 	/// Copy the resolved colour attachment into the shared image. THE ONE PLACE THE TWO MODELS MEET:
 	/// after this the 3D result is an ordinary image and nothing downstream knows otherwise.
-	fn absorb(&mut self, targets: &mut Targets, overlay: bool) {
-		let (width, height) = targets.extent;
-		let mut view = targets.image.view_mut();
-		for y in 0..height {
-			for x in 0..width {
-				let texel = if overlay { identity_colour(targets.colour[ATTACH_IDENT as usize].identity_at(x, y, 0).unwrap_or(0)) } else { targets.colour[ATTACH_COLOUR as usize].at(x, y, 0) };
-				graphics_core::pixel::write(&mut view, x, y, graphics_core::pixel::Rgba::new(texel.x, texel.y, texel.z, 1.0));
+	fn absorb(&mut self, targets: &mut Targets, overlay: bool, shading: &Shading) {
+		let mut bands = handover::bands(&mut targets.image);
+		let mut lanes = [(); AUTO_WORKERS];
+		let participants = Workers::lanes(shading).min(lanes.len());
+		shading.pool.for_each(&mut lanes[..participants], &mut bands, &|_, band| {
+			if let Some(band) = band {
+				handover::paint(band, &targets.colour[ATTACH_COLOUR as usize], &targets.colour[ATTACH_IDENT as usize], overlay);
 			}
-		}
+		});
 	}
 
 	/// Record the frame: the scene, then the HUD over it.
@@ -2090,7 +2115,7 @@ impl Hud {
 	}
 
 	/// Replay the recorded list into the acquired surface image.
-	fn present_into(&mut self, targets: &Targets, frame: &graphics_app::Frame, presented: u32) -> bool {
+	fn present_into(&mut self, targets: &Targets, frame: &graphics_app::Frame, presented: u32, shading: &Shading, compare: bool) -> bool {
 		let Some(span) = frame.layout.backend_access_span(true) else { return false };
 		// SAFETY: the mapping is live while the frame is held, and the span is the layout's own
 		// answer for what a backend may touch.
@@ -2099,7 +2124,7 @@ impl Hud {
 		let PixelStorage::Known(format) = frame.layout.storage else { return false };
 		let description = TargetDescription { extent: frame.layout.extent, format, color_space: ColorSpace::Srgb, scale: 1.0, luminance: graphics_core::pixel::OutputLuminance::UNKNOWN };
 		let images = Scene { image: targets.image.view() };
-		let mut backend = core::mem::replace(&mut self.backend, Soft2d::new()).with_images(&images).with_glyphs(&self.forms);
+		let mut backend = core::mem::replace(&mut self.backend, Soft2d::new()).with_images(&images).with_glyphs(&self.forms).with_workers(shading);
 		if self.prepared.is_none() {
 			let allocations = heap_allocation_count();
 			self.prepared = backend.prepare(&self.list, &description).ok();
@@ -2110,29 +2135,46 @@ impl Hud {
 			}
 			if presented == 0 {
 				print(b"test3d-sw: allocation counter observes shared-library preparation\n");
+				if let Some(prepared) = &self.prepared {
+					let mut line = common_line::Line::new();
+					line.push(b"test3d-sw: HUD replay on ");
+					line.decimal(prepared.lanes() as u64);
+					line.push(b" worker(s)\n");
+					print(line.as_bytes());
+				}
 			}
 		}
 		let result = if let Some(prepared) = self.prepared.as_mut() {
 			let record = ImageRecord { identity: SCENE_IMAGE, layout_generation: 1, content_generation: presented as u64 + 1 };
-			backend.refresh_images(prepared, &[record]).is_ok() && backend.render(prepared, &mut target).is_ok()
+			let rendered = backend.refresh_images(prepared, &[record]).is_ok() && backend.render(prepared, &mut target).is_ok();
+			if rendered && compare {
+				if self.comparison.as_ref().is_none_or(|image| image.layout() != target.layout()) {
+					self.comparison = OwnedImage::new(*target.layout()).ok();
+				}
+				if let Some(image) = self.comparison.as_mut() {
+					// The same prepared list, sources and allocated lanes, replayed by the scalar
+					// worker. The opaque scene covers every pixel before the translucent HUD.
+					backend = backend.with_workers(&soft2d::Serial);
+					if backend.render(prepared, &mut image.view_mut()).is_err() {
+						return false;
+					}
+					self.compared += 1;
+					let reference = image.view();
+					let actual = target.as_view();
+					// Row padding is not image content, and the acquired mapping may retain it.
+					if (0..actual.layout().extent.height).any(|y| reference.row(y) != actual.row(y)) {
+						self.differed += 1;
+					}
+				} else {
+					return false;
+				}
+			}
+			rendered
 		} else {
 			false
 		};
 		self.backend = backend.unbind();
 		result
-	}
-}
-
-/// What one object identity looks like when the overlay is on.
-///
-/// FLAT AND DISTINCT, with no shading at all: what this view has to show is WHICH object owns a
-/// pixel, and a lit rendering of an id is a picture in which two objects can share a colour.
-fn identity_colour(ident: u32) -> Vec4 {
-	match ident {
-		1 => Vec4::new(0.95, 0.25, 0.20, 1.0),
-		2 => Vec4::new(0.20, 0.45, 0.95, 1.0),
-		3 => Vec4::new(0.95, 0.85, 0.20, 1.0),
-		_ => Vec4::new(0.02, 0.02, 0.03, 1.0),
 	}
 }
 

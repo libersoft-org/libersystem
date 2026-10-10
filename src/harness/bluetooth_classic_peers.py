@@ -31,8 +31,8 @@ def pcm_tone(rate, count, channels, frequency=1000, start=0):
         for i in range(count) for _ in range(channels)))
 
 
-def audio_metrics(pcm, rate, channels):
-    samples = struct.unpack(f'<{len(pcm) // 2}h', pcm)[::channels]
+def audio_metrics(pcm, rate, channels, channel=0):
+    samples = struct.unpack(f'<{len(pcm) // 2}h', pcm)[channel::channels]
     # Use a complete half-second window after decoder/filter start-up.
     samples = samples[-rate // 2:]
     if not samples:
@@ -537,7 +537,9 @@ class AudioPeer(Peer):
         config = ([16000, 32000, 44100, 48000][header >> 6], ((header >> 4 & 3) + 1) * 4, header >> 2 & 3, header >> 1 & 1, 8 if header & 1 else 4, frames[0][2])
         pcm = b''.join(self.oracle.Sbc().decode(config, frames, False))
         (self.work / f'{self.name}-music.pcm').write_bytes(pcm)
-        return audio_metrics(pcm, config[0], 1 if config[2] == 0 else 2)
+        channels = 1 if config[2] == 0 else 2
+        metrics = [audio_metrics(pcm, config[0], channels, channel) for channel in range(channels)]
+        return dict(metrics[0], rate=config[0], channels=metrics)
 
 
 class ClassicPeers:

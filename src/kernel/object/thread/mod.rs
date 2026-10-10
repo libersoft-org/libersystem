@@ -8,7 +8,7 @@
 
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::address_space::AddressSpace;
 use super::domain::Domain;
@@ -83,10 +83,10 @@ pub struct Thread {
 	syscall_rsp: AtomicU64,
 	// Owns the kernel stack memory; accessed only through kstack_ptr.
 	stack: KernelStack,
-	// Set the first time the thread is enqueued through thread_start, so a thread
-	// built suspended (the userspace spawn path) can be started exactly once and a
-	// repeated start is a safe no-op rather than a double-enqueue.
-	started: AtomicBool,
+	// One atomic start claim also publishes immutable placement: 0 is unstarted,
+	// 1 is the legacy unplaced start, and CPU + 2 selects that logical CPU forever.
+	// A racing second start cannot change the winner's placement or enqueue twice.
+	started: AtomicUsize,
 	// The process this thread belongs to. It owns the address space, handle table,
 	// and Domain the thread runs under, and outlives the thread.
 	process: Arc<Process>,
@@ -369,7 +369,7 @@ impl Thread {
 			kstack_ptr: AtomicU64::new(sp),
 			syscall_rsp: AtomicU64::new(0),
 			stack,
-			started: AtomicBool::new(false),
+			started: AtomicUsize::new(0),
 			process,
 			run_link: SpinLock::new(None),
 			perf_window: AtomicU64::new(0),
@@ -438,7 +438,18 @@ impl Thread {
 	// true exactly once; later calls return false, so thread_start cannot enqueue
 	// the same thread twice (which would corrupt the run queue).
 	pub fn try_start(&self) -> bool {
-		self.started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+		self.try_start_with_placement(None)
+	}
+
+	// The scheduler validates a requested CPU before claiming the start. Publishing both in one
+	// CAS makes placement immutable even when legacy and placed starts race on the same handle.
+	pub(crate) fn try_start_with_placement(&self, cpu: Option<usize>) -> bool {
+		let started = cpu.map_or(1, |cpu| cpu + 2);
+		self.started.compare_exchange(0, started, Ordering::AcqRel, Ordering::Acquire).is_ok()
+	}
+
+	pub(crate) fn cpu_placement(&self) -> Option<usize> {
+		self.started.load(Ordering::Acquire).checked_sub(2)
 	}
 
 	// Address of the saved-stack-pointer slot, handed to switch_context.
@@ -528,7 +539,7 @@ impl Drop for Thread {
 		//
 		// Only for a thread that never started: one that ran has already been counted out on its
 		// way through `sched::exit`, and counting it again would take the process below zero.
-		if !self.started.load(Ordering::Acquire) && self.process.thread_exited() {
+		if self.started.load(Ordering::Acquire) == 0 && self.process.thread_exited() {
 			self.process.mark_exited();
 		}
 	}

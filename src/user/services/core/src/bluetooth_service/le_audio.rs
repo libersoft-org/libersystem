@@ -378,13 +378,19 @@ impl Stack {
 			}
 			return;
 		};
-		let Some(peer) = peer_from_wire(address) else { return };
+		let Some(connection_peer) = peer_from_wire(address) else { return };
+		let mut peer = connection_peer;
+		if peer[0] == KIND_RANDOM {
+			let mut address = [0u8; 6];
+			address.copy_from_slice(&peer[1..]);
+			peer = self.controllers[at].le.resolve(&address).unwrap_or(peer);
+		}
 		if self.le_devices[index].holds(&peer) || self.record(at, &peer).is_some() {
 			return;
 		}
 		// PAIRED AS THE SET'S - the operator's pairing of the first member was the consent - and a member only once the
 		// attempt is taken; one refused for now (another pairing running) is tried again at its next advertisement.
-		match self.pair_le(at, peer, false) {
+		match self.pair_le(at, connection_peer, false) {
 			Ok(()) => {
 				print(b"BluetoothService: the coordinated set's other member was found; it is paired as the set's\n");
 				self.le_devices[index].members.push(peer);

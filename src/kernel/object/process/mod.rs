@@ -658,12 +658,12 @@ impl Process {
 	//
 	// Returns false when the process is tearing down or the thread was already started; the caller
 	// enqueues only on true, and the enqueue happens outside this lock.
-	pub fn claim_thread_start(&self, thread: &Arc<Thread>) -> bool {
+	pub fn claim_thread_start(&self, thread: &Arc<Thread>, cpu: Option<usize>) -> bool {
 		let _threads = self.threads.lock();
 		if self.terminating.load(Ordering::Acquire) {
 			return false;
 		}
-		thread.try_start()
+		thread.try_start_with_placement(cpu)
 	}
 
 	fn register_thread(&self, thread: &Arc<Thread>) -> bool {

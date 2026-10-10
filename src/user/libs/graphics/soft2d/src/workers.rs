@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 use graphics_core::geom::PixelRect;
 use graphics_core::layout::ImageLayout;
+use graphics_core::pixel::Rgba;
 use graphics_core::{ImageView, ImageViewMut};
 use render2d::Error;
 
@@ -129,6 +130,8 @@ impl Unit<'_> {
 /// frame asks for.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Access<'u> {
+	/// Disjoint rows of a prepared image paint, refreshed by the same bounded worker pool.
+	Samples { values: &'u mut [Rgba], bounds: PixelRect },
 	/// Every row of the unit's band and nothing else, as a view of its own whose row zero is the band's
 	/// first row `top`.
 	Band { view: ImageViewMut<'u>, top: u32 },

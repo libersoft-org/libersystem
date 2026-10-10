@@ -7901,6 +7901,13 @@ pub enum FixtureAction {
 	/// refuses the legacy scan and connection commands once an extended one is used; 0 the controller it starts as,
 	/// with none of them.
 	LeFeatures = 28,
+	/// The disconnected LE display fixture (peer 10): 0 DisplayOnly or 2 KeyboardOnly for the two SC passkey
+	/// directions. Other peers or values are refused. This changes its next real SMP exchange, never its result.
+	LeIoCapability = 29,
+	/// Save the disconnected non-audio LE peer's current keys, or explicitly restore that snapshot after a deliberately
+	/// weaker pairing. `argument` must be zero. The guest's bond store is never touched; a reconnect must prove its key.
+	LeSaveKeys = 30,
+	LeRestoreKeys = 31,
 }
 
 impl FixtureAction {
@@ -7971,6 +7978,9 @@ impl FixtureAction {
 			26 => Some(FixtureAction::LeVolume),
 			27 => Some(FixtureAction::LeCall),
 			28 => Some(FixtureAction::LeFeatures),
+			29 => Some(FixtureAction::LeIoCapability),
+			30 => Some(FixtureAction::LeSaveKeys),
+			31 => Some(FixtureAction::LeRestoreKeys),
 			_ => None,
 		}
 	}
@@ -12251,6 +12261,9 @@ impl FixtureAction {
 			FixtureAction::LeVolume => out.push_str("\"le-volume\""),
 			FixtureAction::LeCall => out.push_str("\"le-call\""),
 			FixtureAction::LeFeatures => out.push_str("\"le-features\""),
+			FixtureAction::LeIoCapability => out.push_str("\"le-io-capability\""),
+			FixtureAction::LeSaveKeys => out.push_str("\"le-save-keys\""),
+			FixtureAction::LeRestoreKeys => out.push_str("\"le-restore-keys\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -12283,6 +12296,9 @@ impl FixtureAction {
 			FixtureAction::LeVolume => out.push_str("le-volume"),
 			FixtureAction::LeCall => out.push_str("le-call"),
 			FixtureAction::LeFeatures => out.push_str("le-features"),
+			FixtureAction::LeIoCapability => out.push_str("le-io-capability"),
+			FixtureAction::LeSaveKeys => out.push_str("le-save-keys"),
+			FixtureAction::LeRestoreKeys => out.push_str("le-restore-keys"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -12315,6 +12331,9 @@ impl FixtureAction {
 			FixtureAction::LeVolume => crate::codec::cbor::text(out, "le-volume"),
 			FixtureAction::LeCall => crate::codec::cbor::text(out, "le-call"),
 			FixtureAction::LeFeatures => crate::codec::cbor::text(out, "le-features"),
+			FixtureAction::LeIoCapability => crate::codec::cbor::text(out, "le-io-capability"),
+			FixtureAction::LeSaveKeys => crate::codec::cbor::text(out, "le-save-keys"),
+			FixtureAction::LeRestoreKeys => crate::codec::cbor::text(out, "le-restore-keys"),
 		}
 	}
 }

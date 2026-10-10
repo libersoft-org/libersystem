@@ -291,6 +291,8 @@ declare -A GATES=(
 	# overlay reached the same frame the 3D scene did, that two stated poses show what those poses
 	# must show, that two aspect ratios show the same scene, and that `q` gives the console back.
 	["qemu-3d-demo"]="tools/check-qemu-3d-demo.sh"
+	# The Extended shadow/HDR phase has separate measurements and no Core 30 FPS threshold.
+	["qemu-3d-extended"]="tools/check-qemu-3d-extended.sh"
 	# A DEVICE PLUGGED INTO A LIVE MACHINE AND TAKEN OUT OF IT AGAIN, which is the only place the
 	# whole hot-plug path happens at once: a port asserts, the kernel reads the slot, the inventory
 	# grows a row, a driver binds - and a removal stops the driver and waits for its claim BEFORE the

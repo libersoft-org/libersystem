@@ -45,21 +45,34 @@ def late_voice_completion(g):
     peer_event(g, 'hfp-indicator', cursor, name='call', value=1)
     g.control('hangup', peer='headset')
     g.require('PASS radio-voice-close' in g.finish(mark), 'the pending voice owner did not close')
-    audio_epoch = g.stop_service('audio_service')
-    # Release the actual independent headset's accept only after both application and service
-    # ownership ended. A protocol timeout is not the required successful late completion.
+    # The application made no PCM request, so its close reaches AudioService's
+    # last-owner cleanup and the Bluetooth PCM peer-close without an outstanding
+    # period hiding that channel from the wait set. BCC ERROR is the causal barrier:
+    # only voice_down clears audio_allowed; setting the call to None does not.
+    peer_event(g, 'hfp-indicator', cursor, name='call', value=0)
+    healthy = g.control('hfp-at', peer='headset', command='AT+CLCC')
+    g.require(healthy.get('response') == '[]', 'the live negotiated HFP channel did not answer CLCC with OK/no call')
+    refusal = g.control('hfp-expect-error', peer='headset', command='AT+BCC')
+    g.require(refusal.get('status') == 'ERROR', 'voice-owner withdrawal lacked an actual BCC ERROR')
+    healthy = g.control('hfp-at', peer='headset', command='AT+CLCC')
+    g.require(healthy.get('response') == '[]', 'the HFP channel stopped answering after BCC refusal')
+    g.require(g.control('status')['headset']['sco_request_held'], 'the independent acceptance was no longer held')
+    # Release the actual independent headset's accept only after application/PCM
+    # ownership ended. A timeout or disconnected HFP channel cannot satisfy this.
     g.control('sco-release', peer='headset')
     g.event('sco-connected', 'headset', since=cursor, timeout=15)
     departed = g.event('sco-disconnected', 'headset', since=cursor, timeout=15)
     g.require(departed['reason'] == 0x13, f'orphan SCO was not explicitly disconnected by the guest: {departed}')
-    g.require(not g.control('status')['headset']['sco'], 'orphan SCO remains after its subscriber ended')
-    g.start_service('audio_service', audio_epoch)
+    g.require(not g.control('status')['headset']['sco'], 'orphan SCO remains after its voice owner ended')
+    retained = g.control('events', since=cursor)['events']
+    g.require(not any(item.get('peer') == 'headset' and item.get('event') in ('hfp-slc', 'hsp-connected', 'disconnection') for item in retained),
+              'late-completion refusal did not stay on the same negotiated HFP connection')
     voice, _ = audio_device(g, lambda line: 'Bluetooth, voice' in line)
     g.command_eventually(f'audioctl microphone {voice}', lambda text: f'device {voice}: microphone level 53' in text)
     g.command(f'audioctl default {voice} voice')
     g.record('classic-late-voice-completion', scheduling='held real independent headset acceptance',
-             completion='actual SCO success after owner/service close', refusal=departed,
-             recovery='headset still connected, microphone53 restored; normal duplex call follows')
+             completion='actual SCO success after voice-owner/PCM close', refusal=departed,
+             recovery='same HFP connection, microphone53 retained; normal duplex/endpoint reopen follows')
 
 
 def refused_pair(g, peer, cause, *, legacy=False):
@@ -138,7 +151,7 @@ def classic_pairing(g, pair):
     g.command_eventually('btctl list', lambda text: any(headset in row.lower() and 'Secure Connections, Just Works' in row for row in text.splitlines()))
     g.record('classic-incoming-policy', unwatched=refused, watched='consent prompt then encrypted Secure Connections')
 
-    pair(g, 'gamepad', 'P-192 Simple Pairing, authenticated', io='DISPLAY_OUTPUT_ONLY', sc=False)
+    pair(g, 'gamepad', 'P-192 Simple Pairing, authenticated', io='DISPLAY_OUTPUT_AND_YES_NO_INPUT', sc=False, required_prompt='compare')
     g.control('pairing-config', peer='serial', io='NO_OUTPUT_NO_INPUT', sc=False, mitm=False, ssp=False)
     g.command('btctl scan 5')
     refused_pair(g, 'serial', 'BluetoothService: a legacy PIN pairing was refused - the operator did not ask for one, or a better bond exists')
@@ -242,19 +255,31 @@ def music_voice(g):
         g.require(refusal.get('status') == 'ERROR', 'invalid microphone gain did not produce the exact HFP ERROR')
         g.command(f'audioctl microphone {voice}', expect=f'device {voice}: microphone level 40')
         gain_notifications(g, cursor, [])
-        # Retain a non-default value without another peer update after restart:
-        # only the live endpoint snapshot can restore this microphone state.
+        # Retain a non-default value across the supported application's voice
+        # ownership and freshly minted control grants. AudioService itself has
+        # restart=escalate; this is not a consumer restart/resnapshot assertion.
         g.control('hfp-at', peer='headset', command='AT+VGM=7')
         g.command_eventually(f'audioctl microphone {voice}', lambda text: f'device {voice}: microphone level 47' in text)
         cursor = g.control('events')['next']
-        audio_epoch = g.stop_service('audio_service')
-        g.start_service('audio_service', audio_epoch)
-        voice, _ = audio_device(g, lambda line: 'Bluetooth, voice' in line)
-        g.command_eventually(f'audioctl microphone {voice}', lambda text: f'device {voice}: microphone level 47' in text)
+        mark = g.start('audioprobe radio-voice-close')
+        g.wait(mark, 'radio-voice-close waiting')
+        g.event('sco-connected', 'headset', since=cursor, timeout=15)
+        if codec == 'hsp':
+            g.control('hfp-at', peer='headset', command='AT+CKPD=200')
+        else:
+            peer_event(g, 'hfp-indicator', cursor, name='call', value=1)
+            g.control('hangup', peer='headset')
+        g.require('PASS radio-voice-close' in g.finish(mark), 'the microphone-retention voice owner did not close')
+        closed = g.event('sco-disconnected', 'headset', since=cursor, timeout=15)
+        g.require(closed['reason'] == 0x13, f'voice-owner close did not explicitly end SCO: {closed}')
+        g.require(not g.control('status')['headset']['sco'], 'closed voice owner left SCO alive')
+        # Each audioctl process receives a fresh operator grant; no new VGM is
+        # sent after the value above. Normal duplex below reopens the PCM endpoint.
+        g.command(f'audioctl microphone {voice}', expect=f'device {voice}: microphone level 47')
         audio_device(g, lambda line: line.startswith(f'device {voice}:') and 'level 100 ' in line)
-        restarted = g.control('events', since=cursor)['events']
-        g.require(not any(item.get('peer') == 'headset' and item.get('event') in ('hfp-slc', 'hsp-connected', 'disconnection') for item in restarted),
-                  'microphone snapshot assertion recreated the headset connection')
+        retained = g.control('events', since=cursor)['events']
+        g.require(not any(item.get('peer') == 'headset' and item.get('event') in ('hfp-slc', 'hsp-connected', 'disconnection') for item in retained),
+                  'microphone retention assertion recreated the headset connection')
         gain_notifications(g, cursor, [])
         g.command(f'audioctl default {voice} voice')
         # A nonrepresentable operator level is read back at the actual 0..15 gain.
@@ -304,7 +329,7 @@ def music_voice(g):
                  no_session='HSP button creates no SCO' if codec == 'hsp' else 'ATA/BCC rejected',
                  calls='HSP button answer/hangup' if codec == 'hsp' else 'incoming/answer/active/hangup',
                  speaker_gain='operator60 -> peer9; peer15 -> operator100',
-                 microphone_gain='peer9 -> API60; API40 -> peer6; API50 -> peer8/API53; exact ERROR for16; no gain cross-notifications; retained47 after AudioService restart',
+                 microphone_gain='peer9 -> API60; API40 -> peer6; API50 -> peer8/API53; exact ERROR for16; no gain cross-notifications; retained47 across actual voice-owner close and fresh control grants',
                  microphone_energy=dict(guest_mean_square=int(measured[2]), ratio=ratio, reference=reference),
                  battery=None if codec == 'hsp' else 80)
         g.control('disconnect', peer='headset')

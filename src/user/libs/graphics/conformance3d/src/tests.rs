@@ -1,31 +1,54 @@
-//! THE SUITE RUN AS A HOST TEST, which is what makes it runnable at all while it is being written.
-//!
-//! WHAT THIS ASSERTS IS THE SUITE'S OWN CLAIM: every scene passes, and every feature the profile has
-//! is covered by one. The guest run makes the same claim on each target; this one makes it on the
-//! machine that builds the tree, in a second.
+//! Each mandatory Core profile and the optional Extended profile has its own host result.
+//! The default combined API remains covered, with exactly the same original scenes.
 
-use super::{Verdict, run};
+use super::{Verdict, run, run_core, run_extended};
 
 #[test]
-fn every_scene_passes_and_every_feature_has_one() {
-	let mut trouble = alloc::vec::Vec::new();
-	let summary = run(|name, group, verdict| {
-		if !matches!(verdict, Verdict::Pass) {
-			trouble.push(alloc::format!("{group}/{name}: {verdict:?}"));
-		}
+fn core_scenes_pass_without_running_or_claiming_extended() {
+	let mut reports = alloc::vec::Vec::new();
+	let mut summary = run_core(|name, group, verdict| {
+		assert!(matches!(verdict, Verdict::Pass), "{group}/{name}: {verdict:?}");
+		reports.push((name, group));
 	});
-	assert!(trouble.is_empty(), "scenes that did not pass:\n{}", trouble.join("\n"));
-	assert!(summary.render3d.untested.is_empty(), "Render3D features with no scene: {:?}", summary.render3d.untested);
-	assert!(summary.scene3d.untested.is_empty(), "Scene3D features with no scene: {:?}", summary.scene3d.untested);
+	let mut expected: alloc::vec::Vec<_> = graphics_profile::RENDER3D_CORE_PROFILE_1.iter().map(|entry| (entry.name, entry.group)).chain(graphics_profile::SCENE3D_CORE_PROFILE_1.iter().map(|entry| (entry.name, entry.group))).collect();
+	reports.sort_unstable();
+	expected.sort_unstable();
+	assert_eq!(reports, expected, "Core must report exactly its two registries, with no Extended scene");
 	assert!(summary.complete(), "{summary:?}");
+	assert_eq!(summary.extended.total(), 0, "Extended was not executed");
+	assert!(!summary.complete_with_extended(), "unperformed Extended is not conformance");
+	// A separately failed/unsupported/missing Extended profile never changes Core's claim.
+	summary.extended.failed = 1;
+	summary.extended.unsupported = 1;
+	summary.extended.untested.push("not performed");
+	assert!(summary.complete());
+	assert!(!summary.complete_with_extended());
+}
 
-	// AND THE EXTENDED PROFILE, WHICH THIS LAYER CLAIMS. It is optional as a whole - `complete()`
-	// above deliberately leaves it out, because an implementation conforms to the two core profiles
-	// while supporting none of it - so the claim that this one carries it is made here, separately
-	// and on purpose.
-	assert!(summary.extended.untested.is_empty(), "Extended features with no scene: {:?}", summary.extended.untested);
-	assert!(summary.complete_with_extended(), "this layer claims Scene3D Extended Profile 1: {summary:?}");
-	// ENTIRELY OR NOT AT ALL: one case per entry, neither more nor fewer. A case for a feature the
-	// profile does not have would be a scene measuring an extension while reporting Profile 1.
-	assert_eq!(super::EXTENDED_CASES.len(), graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len(), "one scene per entry: {} cases against {} features", super::EXTENDED_CASES.len(), graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len());
+#[test]
+fn extended_scenes_pass_as_their_own_profile() {
+	let mut reports = alloc::vec::Vec::new();
+	let summary = run_extended(|name, group, verdict| {
+		assert!(matches!(verdict, Verdict::Pass), "{group}/{name}: {verdict:?}");
+		reports.push((name, group));
+	});
+	let mut expected: alloc::vec::Vec<_> = graphics_profile::SCENE3D_EXTENDED_PROFILE_1.iter().map(|entry| (entry.name, entry.group)).collect();
+	reports.sort_unstable();
+	expected.sort_unstable();
+	assert_eq!(reports, expected, "Extended must report only its own registry");
+	assert!(summary.complete(), "{summary:?}");
+	assert_eq!(super::EXTENDED_CASES.len(), graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len());
+	assert_eq!(summary.passed, expected.len());
+}
+
+#[test]
+fn combined_entry_point_preserves_all_three_profile_results() {
+	let mut reports = 0;
+	let summary = run(|name, group, verdict| {
+		assert!(matches!(verdict, Verdict::Pass), "{group}/{name}: {verdict:?}");
+		reports += 1;
+	});
+	assert!(summary.complete_with_extended(), "{summary:?}");
+	assert_eq!(reports, graphics_profile::RENDER3D_CORE_PROFILE_1.len() + graphics_profile::SCENE3D_CORE_PROFILE_1.len() + graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len());
+	assert_eq!(summary.passed(), reports);
 }

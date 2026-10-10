@@ -312,10 +312,8 @@ impl CachedPaint {
 	pub(crate) fn bytes(&self) -> u64 {
 		(self.values.capacity() * core::mem::size_of::<Rgba>()) as u64
 	}
-	pub(crate) fn refresh(&mut self, shader: &Shader<'_>) {
-		for (row, values) in self.values.chunks_exact_mut(self.bounds.width as usize).enumerate() {
-			shader.row(self.bounds.x, self.bounds.y + row as u32, values);
-		}
+	pub(crate) fn samples_mut(&mut self) -> (PixelRect, &mut [Rgba]) {
+		(self.bounds, &mut self.values)
 	}
 	pub(crate) fn opaque(&self) -> bool {
 		self.values.iter().all(|value| value.alpha == 1.0)

@@ -3,8 +3,8 @@
 // A DmaBuffer owns physical frames pinned for device DMA: a driver maps it to
 // fill or drain it and hands its physical address to its device. Unlike a plain
 // MemoryObject the memory is charged to the owning Domain's DMA quota - pinned DMA
-// is a distinct, separately capped resource (the anti-DoS rule for drivers) - and
-// the frames are freed and the quota refunded when the last reference drops.
+// is a distinct, separately capped resource (the anti-DoS rule for drivers). A confirmed
+// release returns the frames and charge; an unconfirmed teardown retains both.
 //
 // Every buffer uses one physically contiguous frame run, so a device receives a
 // single physical span for a virtqueue ring, block-data stage or jumbo frame.
@@ -29,7 +29,7 @@ pub struct DmaBuffer {
 	size: usize,
 	// The driver and display server map the same backing in different address spaces.
 	mappings: SpinLock<Vec<(u64, u64)>>,
-	// Domain charged for this buffer's pinned DMA memory; refunded on drop.
+	// Domain charged for this buffer's pinned DMA memory until its frames can be returned.
 	domain: Arc<Domain>,
 	// The device-table entry this buffer was created for, if the creator named one.
 	//
@@ -71,6 +71,9 @@ pub struct DmaBuffer {
 struct Held {
 	device: u32,
 	frames: Vec<u64>,
+	// The account follows the physical backing, not the dead buffer handle. An Arc keeps it
+	// alive until a confirmed reset refunds it. Translated zero-frame markers have no charge.
+	charge: Option<(Arc<Domain>, u64)>,
 }
 
 // Bounded, because the entries come from processes dying and nothing else prunes them.
@@ -96,11 +99,18 @@ static LEAKED: AtomicUsize = AtomicUsize::new(0);
 // A pinned frame is a bounded loss the machine survives. The count is reported beside the frame
 // allocator's other losses so a machine accumulating them is diagnosable, which is the whole
 // difference between a leak and a disappearance.
-fn hold(device: u32, frames: Vec<u64>) {
+fn hold(device: u32, frames: Vec<u64>, charge: Option<(Arc<Domain>, u64)>) {
 	let mut held = HELD.lock();
 	if let Some(slot) = held.iter_mut().find(|slot| slot.is_none()) {
-		*slot = Some(Held { device, frames });
+		*slot = Some(Held { device, frames, charge });
 		return;
+	}
+	drop(held);
+	// There is no record with which a later reset could return these lost frames. Keep their
+	// charge and its owner permanently too. Forgetting the Arc allocates nothing and prevents
+	// even a standalone account from disappearing.
+	if let Some((domain, _)) = charge {
+		core::mem::forget(domain);
 	}
 	LEAKED.fetch_add(frames.len(), Ordering::Relaxed);
 	// Counted in the frame allocator's LOST total as well, which is the number a machine losing
@@ -141,6 +151,11 @@ pub fn release_for(device: u32) -> usize {
 		// SAFETY: these frames belonged to a DmaBuffer that has been dropped, so nothing owns them,
 		// and the device that could have been writing into them has been reset by the caller.
 		unsafe { frame::retire(&entry.frames) };
+		// Outside HELD: return the exact charge through the existing Domain hierarchy, only after
+		// the physical frames became reusable. Taking the entry makes repeated reset a no-op.
+		if let Some((domain, bytes)) = entry.charge {
+			domain.uncharge_dma(bytes);
+		}
 	}
 	released
 }
@@ -155,16 +170,23 @@ pub fn leaked_frames_for_test() -> usize {
 
 #[cfg(test)]
 pub fn forget_for_test(device: u32) {
-	for slot in HELD.lock().iter_mut() {
-		if slot.as_ref().is_some_and(|held| held.device == device) {
-			*slot = None;
+	loop {
+		let entry = {
+			let mut held = HELD.lock();
+			held.iter_mut().find(|slot| slot.as_ref().is_some_and(|held| held.device == device)).and_then(Option::take)
+		};
+		let Some(entry) = entry else { break };
+		// This test-only cleanup must not retire possibly invented frame addresses. Existing
+		// lifecycle fixtures also put real charged entries here, so return their test charge.
+		if let Some((domain, bytes)) = entry.charge {
+			domain.uncharge_dma(bytes);
 		}
 	}
 }
 
 #[cfg(test)]
 pub fn hold_for_test(device: u32, frames: Vec<u64>) {
-	hold(device, frames);
+	hold(device, frames, None);
 }
 
 // How many frames are being held for `device`, for the test that is about the holding itself.
@@ -426,8 +448,10 @@ impl Drop for DmaBuffer {
 			// A confirmed translated close already proves the device cannot reach these frames.
 			// Holding them for a later reset would strand a buffer that outlived that reset.
 			(Some(device), true, false) => {
-				hold(device, frames);
-				Vec::new()
+				hold(device, frames, Some((self.domain.clone(), self.size as u64)));
+				// Held or permanently lost backing still consumes quota. Its retained entry is
+				// now responsible for a refund, if a later reset can actually release the frames.
+				return;
 			}
 			// A TERMINATED DRIVER'S TRANSLATED BUFFER: its unmap confirmed, so its frames are no device's and go back -
 			// but nothing confirmed the DEVICE stopped, and an engine that driver started may still be running against
@@ -438,7 +462,7 @@ impl Drop for DmaBuffer {
 			// untranslated case (`device::claim`) until its reset; the reset's `release_for` clears the mark.
 			(Some(device), true, true) => {
 				if !holds_for(device) {
-					hold(device, Vec::new());
+					hold(device, Vec::new(), None);
 				}
 				frames
 			}

@@ -43,6 +43,10 @@ extern crate alloc;
 mod postprocess;
 
 #[cfg(test)]
+#[path = "../../../user/apps/tools/src/test3d_sw/handover.rs"]
+mod handover;
+
+#[cfg(test)]
 mod allocation_test {
 	use std::alloc::{GlobalAlloc, Layout, System};
 	use std::cell::Cell;

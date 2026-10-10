@@ -608,7 +608,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_SIGNAL_CATCH => sys_signal_catch(a0),
 		SYS_SIGNAL_TAKE => sys_signal_take(a0),
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
-		SYS_THREAD_START => sys_thread_start(a0),
+		SYS_THREAD_START => sys_thread_start(a0, None),
+		abi::SYS_THREAD_START_ON => sys_thread_start(a0, Some(a1)),
 		SYS_CONSOLE_ATTACH => sys_console_attach(a0, a1),
 		SYS_DEVICE_COUNT => device::count() as i64,
 		SYS_DEVICE_INFO => sys_device_info(a0, a1, a2),
@@ -2989,7 +2990,7 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 // Start a suspended thread created by thread_create, enqueueing it to run. Exactly
 // once: a repeated start returns ERR_INVALID rather than double-enqueueing it.
 // Requires the MANAGE right on the thread handle.
-fn sys_thread_start(thread_handle: u64) -> i64 {
+fn sys_thread_start(thread_handle: u64, cpu: Option<u64>) -> i64 {
 	let target = match current_typed::<Thread>(thread_handle, ObjectType::Thread, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
@@ -3001,7 +3002,14 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 	if target.process().is_terminating() {
 		return ERR_INVALID;
 	}
-	if sched::thread_start(target) { 0 } else { ERR_INVALID }
+	let started = match cpu {
+		Some(cpu) => match usize::try_from(cpu) {
+			Ok(cpu) => sched::thread_start_on(target, cpu),
+			Err(_) => false,
+		},
+		None => sched::thread_start(target),
+	};
+	if started { 0 } else { ERR_INVALID }
 }
 
 // Deliver a signal to a process: the holder of its MANAGE capability requests a
@@ -4244,7 +4252,7 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 			return 0;
 		}
 		let block_deadline = wait_block_deadline(&object, deadline);
-		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
+		if deadline != 0 && arch::apic::ticks() >= deadline {
 			return ERR_TIMED_OUT;
 		}
 		if group_koids.is_empty() {
@@ -4377,7 +4385,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 				block_deadline = core::cmp::min(block_deadline, wait_block_deadline(object, deadline));
 			}
 		}
-		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
+		if deadline != 0 && arch::apic::ticks() >= deadline {
 			return ERR_TIMED_OUT;
 		}
 		sched::block_on_any(&koids, block_deadline, periodic, || objects.iter().take(n).any(|slot| slot.as_ref().is_some_and(|o| object_ready(o))));
@@ -4509,7 +4517,7 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 		if let Some(koid) = ready {
 			return koid;
 		}
-		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
+		if deadline != 0 && arch::apic::ticks() >= deadline {
 			return ERR_TIMED_OUT;
 		}
 		// ONE registration, on the set. What makes this the point of the whole object: a member's

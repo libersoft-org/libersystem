@@ -135,7 +135,7 @@ impl Summary {
 	/// ENTIRELY OR NOT AT ALL, which is the part's own rule: a layer claiming Extended claims every
 	/// entry of it, so a single untested or refused feature is a claim that does not hold.
 	pub fn complete_with_extended(&self) -> bool {
-		self.complete() && self.extended.complete()
+		self.complete() && self.extended.total() == SCENE3D_EXTENDED_PROFILE_1.len() && self.extended.complete()
 	}
 
 	pub fn passed(&self) -> usize {
@@ -179,6 +179,14 @@ pub fn extended_entry(feature: ExtendedFeature) -> Option<&'static graphics_prof
 /// THE TWO PROFILES ARE WALKED SEPARATELY AND TALLIED SEPARATELY, so "the backend conforms and the
 /// scene layer does not" is a sentence this run can say.
 pub fn run(mut report: impl FnMut(&'static str, &'static str, &Verdict)) -> Summary {
+	let mut summary = run_core(&mut report);
+	summary.extended = run_extended(report);
+	summary
+}
+
+/// Run only Render3D and Scene3D Core Profile 1. No Extended scene is invoked.
+/// The empty Extended tally is unperformed, so `complete_with_extended` is false.
+pub fn run_core(mut report: impl FnMut(&'static str, &'static str, &Verdict)) -> Summary {
 	let mut summary = Summary::default();
 	for case in CASES {
 		let Some(entry) = entry(case.feature) else {
@@ -208,20 +216,26 @@ pub fn run(mut report: impl FnMut(&'static str, &'static str, &Verdict)) -> Summ
 			summary.scene3d.untested.push(entry.name);
 		}
 	}
+	summary
+}
+
+/// Run only Scene3D Extended Profile 1, with its own outcome and no Core claim.
+pub fn run_extended(mut report: impl FnMut(&'static str, &'static str, &Verdict)) -> Tally {
+	let mut result = Tally::default();
 	for case in EXTENDED_CASES {
 		let Some(entry) = extended_entry(case.feature) else {
-			summary.extended.failed += 1;
+			result.failed += 1;
 			continue;
 		};
-		let verdict = tally(&mut summary.extended, case.scene);
+		let verdict = tally(&mut result, case.scene);
 		report(entry.name, entry.group, &verdict);
 	}
 	for entry in SCENE3D_EXTENDED_PROFILE_1 {
 		if !EXTENDED_CASES.iter().any(|case| case.feature == entry.feature) {
-			summary.extended.untested.push(entry.name);
+			result.untested.push(entry.name);
 		}
 	}
-	summary
+	result
 }
 
 /// Run one scene and count it.
