@@ -102,12 +102,32 @@ fn lines_arrive_in_pieces() {
 }
 
 #[test]
-// THE HEADSET PROFILE'S ONE BUTTON: audio with no call, an answer while ringing.
+// THE HEADSET PROFILE'S ONE BUTTON cannot create a voice session; it controls an existing owner or call.
 fn the_headset_profile_button() {
 	let mut gateway = Gateway::new(true);
-	assert_eq!(events(&gateway.receive(b"AT+CKPD=200\r")), [Event::AudioRequested]);
-	gateway.set_call(Call::Incoming);
-	assert_eq!(events(&gateway.receive(b"AT+CKPD=200\r")), [Event::Command(Command::Answer)]);
+	// Never owned, owned, withdrawn, and owned again: no stale permission after close.
+	for allowed in [false, true, false, true] {
+		gateway.set_audio_allowed(allowed);
+		let reply = gateway.receive(b"AT+CKPD=200\r");
+		if allowed {
+			assert_eq!(sent(&reply), ["OK"]);
+			assert_eq!(events(&reply), [Event::AudioRequested]);
+		} else {
+			assert_eq!(sent(&reply), ["ERROR"]);
+			assert!(events(&reply).is_empty(), "a button without a voice owner must not request SCO");
+		}
+	}
+	for (call, command) in [(Call::Incoming, Command::Answer), (Call::Active, Command::HangUp), (Call::Outgoing, Command::HangUp), (Call::Held, Command::HangUp)] {
+		gateway.set_call(call);
+		let reply = gateway.receive(b"AT+CKPD=200\r");
+		assert_eq!(sent(&reply), ["OK"]);
+		assert_eq!(events(&reply), [Event::Command(command)]);
+	}
+	gateway.set_call(Call::None);
+	gateway.set_audio_allowed(false);
+	let reply = gateway.receive(b"AT+CKPD=200\r");
+	assert_eq!(sent(&reply), ["ERROR"]);
+	assert!(events(&reply).is_empty(), "ending the call and owner must restore the refusal");
 }
 
 #[test]

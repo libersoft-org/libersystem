@@ -309,12 +309,16 @@ impl Gateway {
 		} else if upper == "AT+BLDN" {
 			out.extend(self.call_command(Command::Redial, self.call != Call::None));
 		} else if upper.starts_with("AT+CKPD") && self.headset_profile {
-			// THE HEADSET PROFILE'S ONE BUTTON: it answers a ringing call, ends an active one, and asks for audio.
-			out.push(ok());
-			match self.call {
-				Call::Incoming => out.push(Out::Event(Event::Command(Command::Answer))),
-				Call::Active | Call::Outgoing | Call::Held => out.push(Out::Event(Event::Command(Command::HangUp))),
-				Call::None => out.push(Out::Event(Event::AudioRequested)),
+			// THE HEADSET PROFILE'S ONE BUTTON follows the declared call or an existing voice owner.
+			if self.call == Call::None && !self.audio_allowed {
+				out.push(error());
+			} else {
+				out.push(ok());
+				match self.call {
+					Call::Incoming => out.push(Out::Event(Event::Command(Command::Answer))),
+					Call::Active | Call::Outgoing | Call::Held => out.push(Out::Event(Event::Command(Command::HangUp))),
+					Call::None => out.push(Out::Event(Event::AudioRequested)),
+				}
 			}
 		} else if upper == "AT+CLCC" {
 			// The current calls: none listed - the declared call has no number.

@@ -526,8 +526,13 @@ def classic_input(g):
     mark = g.start('gamepad')
     g.wait(mark, 'gamepad - q or Ctrl+C leaves')
     g.control('hid-reconnect', peer='gamepad', address=g.guest_address)
+    # Channel completion precedes descriptor decoding and InputService adoption.
+    # Observe this application's complete initial state before its one test report.
+    g.wait(mark, lambda text: re.search(rb'(?m)^\d+  bluetooth gamepad\r*\n    buttons: none\r*\n'
+                                       rb'    X 0 \(-127\.\.127\)  Y 0 \(-127\.\.127\)  hat 1 centred\r*\n', text), timeout=10)
+    report_mark = len(g.serial.data)
     g.control('report', peer='gamepad', data='01400002')
-    g.wait(mark, lambda text: b'buttons: 1' in text and b'X 64 (-127..127)' in text and b'hat 1 E' in text)
+    g.wait(report_mark, lambda text: b'buttons: 1' in text and b'X 64 (-127..127)' in text and b'hat 1 E' in text)
     departed = len(g.serial.data)
     g.control('disconnect', peer='gamepad')
     g.wait(departed, 'No gamepad is connected.')
@@ -923,6 +928,120 @@ def hid_readiness_self_test():
     note('HID readiness self-test PASS: stale/partial/absent refused, fresh/delayed adopted, original acceptance once on LE and Classic')
 
 
+def classic_gamepad_self_test():
+    from unittest.mock import patch
+
+    # Execute the actual complete gamepad scenario with real Gate/Serial waits.
+    # Only peer responses, consumer adoption and serial bytes are modeled here.
+    source = ast.parse(Path(__file__).read_text())
+    scenario = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'classic_input')
+    begin = next(index for index, node in enumerate(scenario.body)
+                 if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                 and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == 'start'
+                 and node.value.args and isinstance(node.value.args[0], ast.Constant) and node.value.args[0].value == 'gamepad')
+    command = compile(ast.Module(body=scenario.body[begin:], type_ignores=[]), '<actual-classic-gamepad-scenario>', 'exec')
+    neutral = (b'7  bluetooth gamepad\r\r\n    buttons: none\r\r\n'
+               b'    X 0 (-127..127)  Y 0 (-127..127)  hat 1 centred\r\r\n')
+    values = b'buttons: 1\r\nX 64 (-127..127)  Y 0 (-127..127)  hat 1 E\r\n'
+    readiness_faults = ('stale', 'banner', 'partial', 'wrong-peer', 'wrong-shape', 'no-state')
+    acceptance_faults = ('stale-values', 'no-button', 'no-axis', 'no-hat')
+
+    class Serial(tickless.Serial):
+        def __init__(self, mode):
+            self.mode, self.now, self.scale = mode, 0.0, 1
+            self.data = bytearray() if mode == 'banner' else bytearray(neutral + values)  # Old evidence must never count.
+            self.pending, self.writes, self.reports = [], [], []
+            self.adopted, self.report_before_ready = False, False
+        def pump(self, wait):
+            self.now += wait
+            arrived = False
+            while self.pending and self.pending[0][0] <= self.now:
+                _, text, adopted = self.pending.pop(0)
+                self.data.extend(text)
+                self.adopted |= adopted
+                arrived = True
+            return arrived
+        def type(self, data):
+            self.writes.append(data)
+            if data == b'gamepad\n':
+                self.data.extend(b'gamepad - q or Ctrl+C leaves\r\n\r\nwatching\r\n')
+                if self.mode == 'present':
+                    self.data.extend(neutral)
+                    self.adopted = True
+            else:
+                require(data == b'q', 'gamepad proof sent an extra UART command or nudge')
+                self.data.extend(b'\r\nvol://system> ')
+
+    for mode in ('delayed', 'present', 'fragmented', *readiness_faults, *acceptance_faults, 'no-departure'):
+        with tempfile.TemporaryDirectory(prefix='bluetooth-gamepad-ready-') as scratch:
+            gate = Gate.__new__(Gate)
+            gate.work, gate.results, gate.guest_address = Path(scratch), [], 'host'
+            serial = gate.serial = Serial(mode)
+            actions = []
+            def control(action, *, peer, **arguments):
+                require(peer == 'gamepad', 'gamepad acceptance targeted another peer')
+                actions.append(action)
+                if action == 'hid-reconnect':
+                    require(arguments == dict(address='host'), 'gamepad reconnect arguments changed')
+                    if mode in ('stale', 'banner', 'present'):
+                        return {}
+                    text = neutral
+                    if mode == 'partial':
+                        text = text[:-6]
+                    elif mode == 'wrong-peer':
+                        text = text.replace(b'bluetooth gamepad', b'USB gamepad')
+                    elif mode == 'wrong-shape':
+                        text = text.replace(b'(-127..127)', b'(-128..127)')
+                    elif mode == 'no-state':
+                        text = text.replace(b'X 0 ', b'X - ').replace(b'Y 0 ', b'Y - ')
+                    elif mode == 'stale-values':
+                        text += values  # Acceptance text before the report is invalid.
+                    if mode == 'fragmented':
+                        middle = len(text) // 2
+                        serial.pending = [(1, text[:middle], False), (2, text[middle:], True)]
+                    else:
+                        serial.pending = [(2, text, mode not in readiness_faults)]
+                    return {}
+                if action == 'report':
+                    require(arguments == dict(data='01400002'), 'gamepad acceptance report changed')
+                    serial.reports.append(arguments['data'])
+                    serial.report_before_ready |= not serial.adopted
+                    if serial.adopted and mode != 'stale-values':
+                        text = values
+                        for fault, field in (('no-button', b'buttons: 1'), ('no-axis', b'X 64 (-127..127)'), ('no-hat', b'hat 1 E')):
+                            if mode == fault:
+                                text = text.replace(field, b'wrong state')
+                        serial.data.extend(text)
+                    return {}
+                require(action == 'disconnect' and not arguments, 'gamepad teardown changed')
+                if mode != 'no-departure':
+                    serial.data.extend(b'No gamepad is connected.\r\n')
+                return {}
+            gate.control = control
+            with patch.object(time, 'monotonic', lambda: serial.now):
+                try:
+                    exec(command, {'g': gate, 're': re})
+                except GateError as error:
+                    require(mode in (*readiness_faults, *acceptance_faults, 'no-departure'),
+                            f'gamepad {mode} failed before required success (report_before_ready={serial.report_before_ready}, reports={len(serial.reports)}): {error}')
+                    require(not gate.results, 'failed gamepad scenario was recorded as passing')
+                    if mode in readiness_faults:
+                        require('within 10 s' in str(error) and serial.now <= 10.1 and not serial.reports,
+                                'missing fresh consumer readiness sent acceptance or escaped its bound')
+                    else:
+                        require('within 120 s' in str(error) and serial.reports == ['01400002'] and not serial.report_before_ready,
+                                'gamepad values/departure were weakened, retried or sent before readiness')
+                else:
+                    require(mode in ('delayed', 'present', 'fragmented'), f'gamepad {mode} was falsely accepted')
+                    require(serial.reports == ['01400002'] and not serial.report_before_ready,
+                            'gamepad acceptance report was lost, repeated or sent before adoption')
+                    require(actions == ['hid-reconnect', 'report', 'disconnect'] and serial.writes == [b'gamepad\n', b'q'],
+                            'gamepad report/teardown sequence changed')
+                    require(gate.results == [dict(scenario='classic-input', trusted_sink_keys='ignored', gamepad='button, axis, hat, departure')],
+                            'actual gamepad scenario record is incomplete')
+    note('gamepad readiness self-test PASS: actual scenario waits for fresh full consumer state; original single report, fresh button/axis/hat evidence and departure remain required')
+
+
 def classic_p192_self_test():
     from unittest.mock import patch
 
@@ -1022,7 +1141,222 @@ def classic_p192_self_test():
     note('P192 pairing self-test PASS: six actual-call transcripts; matching fresh numbers confirmed once, mismatch/missing number/missing prompt/Just Works/refusal rejected')
 
 
+def classic_legacy_refusal_self_test():
+    from unittest.mock import patch
+    import copy
+
+    # Execute the actual serial scenario and pairing helpers; only serial/peer
+    # boundaries are transcripts. No controller or crypto behavior is simulated.
+    source = ast.parse((HARNESS / 'bluetooth_guest_classic.py').read_text())
+    scenario = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'classic_pairing')
+    refused = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'refused_pair')
+    def call(statement, method, first):
+        return (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and isinstance(statement.value.func.value, ast.Name)
+                and statement.value.func.value.id == 'g' and statement.value.func.attr == method
+                and statement.value.args and isinstance(statement.value.args[0], ast.Constant)
+                and statement.value.args[0].value == first)
+    starts = [index for index, statement in enumerate(scenario.body)
+              if call(statement, 'control', 'pairing-config')
+              and any(key.arg == 'peer' and isinstance(key.value, ast.Constant) and key.value.value == 'serial'
+                      for key in statement.value.keywords)]
+    ends = [index for index, statement in enumerate(scenario.body) if call(statement, 'record', 'classic-legacy-consent')]
+    require(len(starts) == len(ends) == 1 and starts[0] < ends[0], 'serial legacy scenario is absent or ambiguous')
+    statements = scenario.body[starts[0]:ends[0] + 1]
+    refusal_scope = {'re': re, 'time': time}
+    exec(compile(ast.Module(body=[refused], type_ignores=[]), '<actual-refused-pair-helper>', 'exec'), refusal_scope)
+    cause = 'BluetoothService: a legacy PIN pairing was refused - the operator did not ask for one, or a better bond exists'
+
+    class PeerSerial:
+        def __init__(self, owner):
+            self.owner, self.writes = owner, []
+        def text_since(self, mark):
+            require(mark == self.owner.phase, 'legacy transcript cursor changed')
+            if mark == 'ordinary':
+                if self.owner.mode == 'silent-failure':
+                    return b'btctl: the pairing failed\n'
+                if self.owner.mode == 'ordinary-bond':
+                    return b'bonded: legacy PIN\n'
+                prefix = b'PIN for serial: ' if self.owner.mode == 'forbidden-pin' else b''
+                return prefix + cause.encode() + b'\nbtctl: the pairing failed\n'
+            if self.owner.mode == 'missing-explicit-pin' or self.writes:
+                return b'bonded: legacy PIN\n'
+            return b'PIN for serial: '
+        def type(self, data):
+            require(self.owner.phase == 'explicit' and data == b'1234\n', 'PIN supplied during forbidden pairing')
+            self.writes.append(data)
+
+    class Peer:
+        event = Gate.event
+        eventually = Gate.eventually
+
+        def __init__(self, mode):
+            self.mode, self.now, self.phase = mode, 0.0, None
+            self.connected, self.refusal_checked, self.no_bond_checked = True, False, False
+            self.serial = PeerSerial(self)
+            self.actions, self.rows = [], []
+        def require(self, condition, message):
+            require(condition, message)
+            if message.startswith('pairing failure lacks the causal guest policy refusal'):
+                self.refusal_checked = True
+            if message == 'ordinary pairing admitted legacy before explicit request':
+                self.no_bond_checked = True
+        def address(self, peer):
+            require(peer == 'serial', 'unexpected legacy peer')
+            return 'da:4c:10:de:00:02'
+        def control(self, action, **values):
+            self.actions.append(action)
+            if action == 'status':
+                return {'serial': {'connections': int(self.connected), 'pairings': int(self.mode == 'ordinary-paired')}}
+            if action == 'events':
+                events = [] if self.mode == 'missing-peer-pin' else [dict(
+                    event='pairing-pin-required', peer='phone' if self.mode == 'wrong-peer-pin' else 'serial',
+                    sequence=93 if self.mode == 'stale-peer-pin' else 94)]
+                return {'events': [event for event in events if event['sequence'] >= values['since']], 'next': 95}
+            require(values.get('peer') == 'serial', 'legacy control targets another peer')
+            if action == 'disconnect':
+                require(self.refusal_checked and self.no_bond_checked, 'refused attempt was not proved before teardown')
+                if self.mode != 'still-connected':
+                    self.connected = False
+                return None
+            require(action == 'pairing-config' and values['sc'] is False
+                    and values['mitm'] is False and values['ssp'] is False, 'legacy peer configuration changed')
+            if self.phase == 'ordinary':
+                require(values['io'] == 'KEYBOARD_INPUT_ONLY', 'explicit legacy peer cannot supply PIN input')
+            else:
+                require(values['io'] == 'NO_OUTPUT_NO_INPUT', 'ordinary legacy refusal peer changed')
+            return None
+        def command(self, value, **_kwargs):
+            require(value == 'btctl scan 5', 'legacy discovery command changed')
+            if self.phase == 'ordinary':
+                require(not self.connected, 'explicit legacy scan began before refused link teardown')
+            return self.address('serial')
+        def events(self):
+            return {'next': 92 if self.connected else 94}
+        def start(self, value):
+            ordinary = f'btctl pair {self.address("serial")} bredr'
+            explicit = f'btctl pair-legacy {self.address("serial")} bredr'
+            require(value in (ordinary, explicit), 'legacy pairing command changed')
+            self.phase = 'ordinary' if value == ordinary else 'explicit'
+            if self.phase == 'explicit':
+                require(self.refusal_checked and self.no_bond_checked and not self.connected,
+                        'explicit legacy attempt began without the refused-attempt proof and teardown')
+            return self.phase
+        def pause(self, seconds):
+            self.now += seconds
+            require(self.now <= 121, 'legacy transcript failed to terminate')
+        def finish(self, mark):
+            return self.serial.text_since(mark).decode()
+        def record(self, scenario, **values):
+            self.rows.append(dict(scenario=scenario, **values))
+
+    reasons = {
+        'silent-failure': 'pairing failure lacks the causal guest policy refusal',
+        'forbidden-pin': 'forbidden legacy pairing reached a PIN-entry prompt',
+        'ordinary-bond': 'forbidden pairing lacked an explicit refusal',
+        'ordinary-paired': 'ordinary pairing admitted legacy before explicit request',
+        'still-connected': 'refused legacy link did not depart before the explicit request',
+        'missing-explicit-pin': 'serial did not complete required pin prompt',
+        'no-disconnect': 'refused legacy link did not depart before the explicit request',
+        'ignored-refusal': 'refused attempt was not proved before teardown',
+        'wrong-peer-io': 'explicit legacy peer cannot supply PIN input',
+        'missing-peer-pin': 'peer condition for events did not occur',
+        'wrong-peer-pin': 'peer condition for events did not occur',
+        'stale-peer-pin': 'peer condition for events did not occur',
+    }
+    for mode in ('separate-attempts', *reasons):
+        body = copy.deepcopy(statements)
+        if mode == 'no-disconnect':
+            body = [statement for statement in body if not call(statement, 'control', 'disconnect')]
+        elif mode == 'ignored-refusal':
+            body = [statement for statement in body if not (isinstance(statement, ast.Expr)
+                    and isinstance(statement.value, ast.Call) and isinstance(statement.value.func, ast.Name)
+                    and statement.value.func.id == 'refused_pair')]
+        elif mode == 'wrong-peer-io':
+            for statement in body:
+                if (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                        and isinstance(statement.value.func, ast.Name) and statement.value.func.id == 'pair'):
+                    for keyword in statement.value.keywords:
+                        if keyword.arg == 'io':
+                            keyword.value.value = 'NO_OUTPUT_NO_INPUT'
+        guest = Peer(mode)
+        with patch.object(time, 'monotonic', lambda: guest.now):
+            try:
+                exec(compile(ast.Module(body=body, type_ignores=[]), '<actual-serial-legacy-scenario>', 'exec'),
+                     {'g': guest, 'pair': pair, 'refused_pair': refusal_scope['refused_pair']})
+            except GateError as error:
+                require(mode in reasons and reasons[mode] in str(error), f'legacy {mode} failed for an unexpected cause: {error}')
+                allowed_partial = ([dict(scenario='pair-serial', level='legacy PIN', prompts=['pin'])]
+                                   if mode in ('missing-peer-pin', 'wrong-peer-pin', 'stale-peer-pin') else [])
+                require(guest.rows == allowed_partial, 'failed legacy consent scenario was recorded as passing')
+            else:
+                require(mode == 'separate-attempts', f'legacy {mode} was falsely accepted')
+                require(guest.actions.count('disconnect') == 1 and guest.serial.writes == [b'1234\n'],
+                        'legacy teardown/PIN entry was missing or repeated')
+                require(guest.rows == [dict(scenario='pair-serial', level='legacy PIN', prompts=['pin']),
+                                       dict(scenario='classic-legacy-consent', ordinary='refused', explicit='PIN prompt and legacy bond')],
+                        'legacy proof records changed or are incomplete')
+    note('legacy refusal self-test PASS: actual separate-attempt ordering; missing refusal, forbidden PIN/bond, retained link and missing explicit PIN refused; omitted refusal/teardown and wrong peer IO mutants rejected; fresh independent peer PIN request required')
+
+
+
+def hsp_no_session_self_test():
+    source = ast.parse((HARNESS / 'bluetooth_guest_classic.py').read_text())
+    scenario = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'music_voice')
+    checks = [node for node in ast.walk(scenario) if isinstance(node, ast.If)
+              and any(isinstance(value, ast.Constant) and value.value == 'HSP button without a voice owner did not return ERROR'
+                      for statement in node.body for value in ast.walk(statement))]
+    require(len(checks) == 1, 'HSP no-session check is absent or ambiguous')
+    barrier = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'gain_notifications')
+    scope = {}
+    exec(compile(ast.Module(body=[barrier], type_ignores=[]), '<actual-gain-barrier>', 'exec'), scope)
+    command = compile(ast.Module(body=checks[0].body, type_ignores=[]), '<actual-HSP-no-session-check>', 'exec')
+
+    class Peer:
+        require = staticmethod(require)
+        def __init__(self, mode):
+            self.mode, self.actions = mode, []
+        def control(self, action, **values):
+            self.actions.append((action, values))
+            if action == 'events':
+                if 'since' not in values:
+                    return {'next': 17}
+                require(values['since'] == 17, 'HSP check lost its fresh event cursor')
+                peer = 'phone' if self.mode == 'other-peer' else 'headset'
+                sequence = 16 if self.mode == 'stale' else 17
+                events = [] if self.mode not in ('transient', 'other-peer', 'stale') else [
+                    dict(event='sco-connected', peer=peer, sequence=sequence),
+                    dict(event='sco-disconnected', peer=peer, sequence=sequence)]
+                return {'events': [event for event in events if event['sequence'] >= values['since']]}
+            if action == 'status':
+                return {'headset': {'sco': self.mode == 'live'}}
+            require(action == 'hfp-expect-error' and values['peer'] == 'headset', 'HSP rejection used another peer or a success command')
+            if values['command'] == 'AT+CKPD=200':
+                return {'status': 'OK' if self.mode == 'accepted' else 'ERROR'}
+            require(values['command'] == 'AT+INDEPENDENT_GAIN_BARRIER', 'HSP rejection lost the same-DLC response barrier')
+            return {'status': 'TIMEOUT' if self.mode == 'lost-channel' else 'ERROR'}
+
+    reasons = {'accepted': 'HSP button without a voice owner did not return ERROR',
+               'transient': 'HSP button attempted SCO', 'live': 'HSP button opened SCO',
+               'lost-channel': 'gain event barrier was not an actual ERROR response'}
+    for mode in ('refused', 'other-peer', 'stale', *reasons):
+        guest = Peer(mode)
+        try:
+            exec(command, {'g': guest, 'gain_notifications': scope['gain_notifications']})
+        except GateError as error:
+            require(mode in reasons and reasons[mode] in str(error), f'HSP {mode} failed unexpectedly: {error}')
+        else:
+            require(mode not in reasons, f'HSP {mode} was falsely accepted')
+            require(sum(action == 'hfp-expect-error' for action, _ in guest.actions) == 2,
+                    'HSP rejection or response barrier was skipped')
+    note('HSP no-session self-test PASS: real scenario requires exact ERROR, live DLC and no fresh transient/current SCO')
+
+
 def self_test():
+    classic_gamepad_self_test()
+    hsp_no_session_self_test()
+    classic_legacy_refusal_self_test()
     classic_p192_self_test()
     hid_readiness_self_test()
     from bluetooth_le_reconnect import run as le_reconnect_self_test

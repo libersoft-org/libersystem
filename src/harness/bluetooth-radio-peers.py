@@ -30,9 +30,104 @@ def control_error(error):
     return reply
 
 
+async def legacy_peer_pin_self_test():
+    """Exercise pinned Bumble's actual PIN dispatch; host HCI transport is captured."""
+    from types import SimpleNamespace
+    from bumble import device, hci, pairing, utils
+    from bluetooth_classic_peers import ScenarioPairing
+
+    address = hci.Address('DA:4C:10:DE:00:0C', hci.Address.PUBLIC_DEVICE_ADDRESS)
+    for io in ('NO_OUTPUT_NO_INPUT', 'KEYBOARD_INPUT_ONLY'):
+        observed, sent = [], []
+        delegate = ScenarioPairing(SimpleNamespace(observe=lambda event, **fields: observed.append((event, fields))))
+        delegate.io_capability = pairing.PairingDelegate.IoCapability[io]
+        async def send(command):
+            sent.append(command)
+        async def cancel_on_disconnection(operation):
+            return await operation
+        connection = SimpleNamespace(peer_address=address, cancel_on_disconnection=cancel_on_disconnection)
+        instance = SimpleNamespace(
+            host=SimpleNamespace(send_sync_command=send), pending_connections={}, connections={7: connection},
+            pairing_config_factory=lambda _: pairing.PairingConfig(sc=False, mitm=False, bonding=True, delegate=delegate))
+        before = set(utils.AsyncRunner.running_tasks)
+        # The real address-to-connection decorator and actual Device handler run.
+        device.Device.on_pin_code_request(instance, address)
+        tasks = set(utils.AsyncRunner.running_tasks) - before
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+        assert len(sent) == 1 and sent[0].bd_addr == address
+        if io == 'NO_OUTPUT_NO_INPUT':
+            assert isinstance(sent[0], hci.HCI_PIN_Code_Request_Negative_Reply_Command)
+            assert observed == []
+        else:
+            assert isinstance(sent[0], hci.HCI_PIN_Code_Request_Reply_Command)
+            assert sent[0].pin_code_length == 4 and sent[0].pin_code[:4] == b'1234'
+            assert observed == [('pairing-pin-required', {})]
+    print('bluetooth-radio-peers: pinned PIN dispatch PASS: no-input negative reply; keyboard delegate event and positive 1234 reply (captured HCI, no radio/PIN cryptographic validation)')
+
+
+async def hsp_peer_self_test():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from bumble import hci, hfp, rfcomm
+
+    audio = object.__new__(AudioPeer)
+    audio.tasks = set()
+    audio.hf_configuration = hfp.HfConfiguration(
+        [hfp.HfFeature.CODEC_NEGOTIATION], [], [hfp.AudioCodec.CVSD, hfp.AudioCodec.MSBC])
+    observed, writes, callbacks = [], [], {}
+    audio.observe = lambda event, **fields: observed.append(dict(event=event, **fields))
+    connection = SimpleNamespace(handle=7, peer_address=hci.Address('DA:4C:10:DE:00:00', hci.Address.PUBLIC_DEVICE_ADDRESS),
+                                 transport=core.PhysicalTransport.BR_EDR, on=lambda *args: None)
+    audio.connections = {connection.handle: connection}
+    channel = SimpleNamespace(connection=connection, EVENT_CLOSE='close', on=lambda name, callback: callbacks.update({name: callback}))
+    dlc = SimpleNamespace(multiplexer=SimpleNamespace(l2cap_channel=channel))
+    def write(command):
+        writes.append(command)
+        assert command == 'AT+CKPD=200\r', 'HSP parser initiated an HFP command'
+        dlc.sink(b'\r\nERROR\r\n')
+    dlc.write = write
+    async def start():
+        return None
+    async def open_dlc(channel):
+        assert channel == 2
+        return dlc
+    async def find_channel(actual_connection, uuid):
+        assert actual_connection is connection and uuid == core.UUID.from_16_bits(0x1112)
+        return 2
+    client = SimpleNamespace(start=start, multiplexer=SimpleNamespace(open_dlc=open_dlc))
+    with patch.object(rfcomm, 'Client', lambda actual_connection: client if actual_connection is connection else None), \
+         patch.object(rfcomm, 'find_rfcomm_channel_with_uuid', find_channel):
+        await audio.hsp_connect('DA:4C:10:DE:00:00')
+    tasks = list(audio.tasks)
+    try:
+        await asyncio.sleep(0)
+        assert writes == [], 'HSP parser initiated an HFP command'
+        assert audio.hf.active_codec == hfp.AudioCodec.CVSD
+        dlc.sink(b'\r\nRING\r\n\r\n+VGM: 6\r\n\r\n+VGS: 9\r\n')
+        await asyncio.sleep(0)
+        assert observed == [dict(event='hsp-connected', channel=2, codec=int(hfp.AudioCodec.CVSD)),
+                            dict(event='hfp-ring'), dict(event='hfp-microphone-volume', value=6),
+                            dict(event='hfp-volume', value=9)]
+        try:
+            await audio.hf.execute_command('AT+CKPD=200')
+        except hfp.HfpProtocolError as error:
+            assert error.error_name == 'ERROR'
+        else:
+            raise AssertionError('HSP parser lost the actual ERROR response')
+        assert writes == ['AT+CKPD=200\r']
+    finally:
+        callbacks['close']()
+        await asyncio.wait_for(asyncio.gather(*tasks), 2)
+    assert all(task.done() for task in tasks)
+
+
 async def self_test():
     from types import SimpleNamespace
     from bumble import hci, hfp, l2cap
+
+    await legacy_peer_pin_self_test()
+    await hsp_peer_self_test()
 
     refusal = l2cap.L2CAP_Connection_Response.Result.CONNECTION_REFUSED_SECURITY_BLOCK
     reply = control_error(l2cap.L2capError(refusal, refusal.name))
@@ -98,7 +193,7 @@ async def self_test():
     audio.sco_request(connection, hci.HCI_Connection_Complete_Event.LinkType.SCO)
     audio.disconnected(connection, 0x13)
     assert audio.held_sco_request is None
-    print('bluetooth-radio-peers: self-test PASS: address reuse, exact protocol errors, pinned HFP gains, bounded SCO hold/release and stale-connection refusal')
+    print('bluetooth-radio-peers: self-test PASS: address reuse, exact protocol errors, HSP without HFP SLC, pinned HFP gains, bounded SCO hold/release and stale-connection refusal')
 
 
 def free_ports(count):

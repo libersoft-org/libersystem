@@ -76,7 +76,11 @@ def late_voice_completion(g):
 
 
 def refused_pair(g, peer, cause, *, legacy=False):
-    """Answer any real numeric prompt, then require a protocol failure, never a timeout."""
+    """Answer any real numeric prompt, then require the exact guest policy refusal.
+
+    A pairing timeout alone is not evidence; the causal refusal must be present.
+    This does not claim the controller completed its negative-PIN procedure.
+    """
     cursor = g.events()['next']
     mark = g.start(f'btctl pair-legacy {g.address(peer)} bredr' if legacy else f'btctl pair {g.address(peer)} bredr')
     answered = False
@@ -94,6 +98,7 @@ def refused_pair(g, peer, cause, *, legacy=False):
         g.require(b'PIN for ' not in text, 'forbidden legacy pairing reached a PIN-entry prompt')
         g.pause(.05)
     output = g.finish(mark)
+    g.require('PIN for ' not in output, 'forbidden legacy pairing reached a PIN-entry prompt')
     g.require('bonded:' not in output and ('btctl: the pairing failed' in output or 'was refused' in output),
               f'forbidden pairing lacked an explicit refusal: {output}')
     g.require(cause in output, f'pairing failure lacks the causal guest policy refusal (a timeout is not evidence): {output}')
@@ -156,7 +161,14 @@ def classic_pairing(g, pair):
     g.command('btctl scan 5')
     refused_pair(g, 'serial', 'BluetoothService: a legacy PIN pairing was refused - the operator did not ask for one, or a better bond exists')
     g.require(g.control('status')['serial']['pairings'] == 0, 'ordinary pairing admitted legacy before explicit request')
-    pair(g, 'serial', 'legacy PIN', io='NO_OUTPUT_NO_INPUT', sc=False, mitm=False, legacy=True)
+    # End the refused attempt before the separate explicit request. Pinned
+    # RootCanal leaves a negative PIN command pending until this link departs;
+    # its own link removal returns that command's completion/credit.
+    g.control('disconnect', peer='serial')
+    g.require(g.control('status')['serial']['connections'] == 0, 'refused legacy link did not depart before the explicit request')
+    pin_cursor = g.events()['next']
+    pair(g, 'serial', 'legacy PIN', io='KEYBOARD_INPUT_ONLY', sc=False, mitm=False, legacy=True, required_prompt='pin')
+    g.event('pairing-pin-required', 'serial', since=pin_cursor)
     g.record('classic-legacy-consent', ordinary='refused', explicit='PIN prompt and legacy bond')
     g.command(f'btctl forget {g.address("serial")}', expect='is forgotten')
     g.control('disconnect', peer='serial')
@@ -291,8 +303,15 @@ def music_voice(g):
         if codec == 'msbc':
             late_voice_completion(g)
         if codec == 'hsp':
-            g.control('hfp-at', peer='headset', command='AT+CKPD=200')
-            g.pause(.5)
+            cursor = g.control('events')['next']
+            refusal = g.control('hfp-expect-error', peer='headset', command='AT+CKPD=200')
+            g.require(refusal.get('status') == 'ERROR', 'HSP button without a voice owner did not return ERROR')
+            # The same DLC must remain responsive after refusing the button. Its
+            # recorded events also reject a transient SCO that has already closed.
+            gain_notifications(g, cursor, [])
+            observed = g.control('events', since=cursor)['events']
+            g.require(not any(item.get('peer') == 'headset' and item.get('event') in ('sco-request-held', 'sco-connected', 'sco-disconnected') for item in observed),
+                      'HSP button attempted SCO without an application voice session')
             g.require(not g.control('status')['headset']['sco'], 'HSP button opened SCO without an application voice session')
         else:
             g.control('hfp-at', peer='headset', command='AT+BIEV=2,80')
@@ -326,7 +345,7 @@ def music_voice(g):
                   f'{codec} capture was scaled again or corrupted (mic level53, energy ratio {ratio}, reference {reference})')
         peer_event(g, 'sco-disconnected', cursor)
         g.record('classic-voice-' + codec, independent_decode=voice_pcm,
-                 no_session='HSP button creates no SCO' if codec == 'hsp' else 'ATA/BCC rejected',
+                 no_session='CKPD rejected with ERROR; no fresh SCO events' if codec == 'hsp' else 'ATA/BCC rejected',
                  calls='HSP button answer/hangup' if codec == 'hsp' else 'incoming/answer/active/hangup',
                  speaker_gain='operator60 -> peer9; peer15 -> operator100',
                  microphone_gain='peer9 -> API60; API40 -> peer6; API50 -> peer8/API53; exact ERROR for16; no gain cross-notifications; retained47 across actual voice-owner close and fresh control grants',

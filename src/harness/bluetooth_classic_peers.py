@@ -409,7 +409,16 @@ class AudioPeer(Peer):
         # not execute HFP's SLC, indicators or codec negotiation commands.
         self.hfp_connected(dlc)
         self.observe('hsp-connected', channel=channel, codec=int(self.hf.active_codec))
-        self.spawn(self.hf.run())
+        self.spawn(self.hsp_messages(self.hf))
+
+    async def hsp_messages(self, protocol):
+        # HfProtocol.run() starts HFP's SLC. HSP uses only its AT response parser;
+        # keep this connection's protocol even if a later connection replaces self.hf.
+        try:
+            while True:
+                await protocol.handle_unsolicited()
+        except hfp.HfProtocol.HfLoopTermination:
+            return
 
     def status(self):
         return dict(super().status(), sco=bool(self.sco_link and self.sco_link.handle in self.device.sco_links), sco_request_held=self.held_sco_request is not None)
