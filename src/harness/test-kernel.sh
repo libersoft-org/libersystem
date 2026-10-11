@@ -35,6 +35,7 @@ mkdir -p "$LOG_DIR"
 LOG_STEM="${ARCH}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 GUEST_LOG="$LOG_DIR/$LOG_STEM-guest.log"
 RUN_LOG="$LOG_DIR/$LOG_STEM-run.log"
+USB_MIC_PCAP=""
 
 print_full_logs() {
 	cat "$RUN_LOG"
@@ -564,6 +565,9 @@ elif [[ "${USB_GADGET:-}" == "mic" || "${USB_GADGET:-}" == "speaker-async" || "$
 	done
 	if [[ -e "$USB_REDIR_DIR/ready" ]]; then
 		export USB_REDIR_SOCKET
+		if [[ "$USB_GADGET" == mic ]]; then
+			USB_MIC_PCAP="$LOG_DIR/$LOG_STEM-usb-audio.pcap"
+		fi
 		# A SPEAKER OF ITS OWN TAKES THE ONE SINK THE DRIVER BINDS, so QEMU's is left off the bus.
 		if [[ "$USB_GADGET" == "speaker-async" || "$USB_GADGET" == "speaker-uac2" ]]; then
 			export USB_QEMU_SPEAKER=off
@@ -743,7 +747,7 @@ set +e
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" USB_QEMU_SPEAKER="${USB_QEMU_SPEAKER:-on}" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" USB_QEMU_SPEAKER="${USB_QEMU_SPEAKER:-on}" USB_MIC_PCAP="$USB_MIC_PCAP" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e
@@ -838,6 +842,18 @@ fi
 # Printed before the verdict so it is present on a failure too, which is when a consumer most needs
 # to be told which files to look in.
 echo "[test-$ARCH] RESULT-LOGS $RUN_LOG $GUEST_LOG"
+# The capture oracle's Play reply is queue credit, so its one-period sink claim
+# also needs the independent USB device receipt. Runs selecting other tests do
+# not claim this oracle and retain their existing verdict.
+if [[ "$status" -eq 0 && -n "$USB_MIC_PCAP" ]] && grep -hEq '^kernel\.hardware\.usb_audio_capture_delivers_the_microphones_frames_in_order\.\.\.' "$RUN_LOG" "$GUEST_LOG"; then
+	echo "[test-$ARCH] USB-AUDIO-PCAP $USB_MIC_PCAP"
+	if ! grep -hFq 'usb-audio-capture: eight periods of the microphone' "$RUN_LOG" "$GUEST_LOG"; then
+		echo "[test-$ARCH] microphone capture completion marker is missing" >&2
+		status=1
+	elif ! python3 "$ROOT/tools/check-usb-audio-pcap.py" --pcap "$USB_MIC_PCAP" --qemu-log "$RUN_LOG"; then
+		status=1
+	fi
+fi
 if [[ "$status" -eq 0 ]]; then
 	result="$(grep -hE '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG" | tail -1 | tr -d '\r')"
 	echo "[test-$ARCH] PASS: $result (${elapsed}s); logs: $RUN_LOG $GUEST_LOG"

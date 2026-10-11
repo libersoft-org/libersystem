@@ -21,6 +21,8 @@
 # THE GADGET IS A PERMISSION (the owner's, 2026-09-21, with the rules `usb-gadget.sh` enforces): it needs root and the
 # host's `dummy_hcd`, and without them this gate FAILS with the reason rather than skipping. The teardown and the
 # check that the host carries nothing of it run on every exit.
+# BRIGHTNESS_USB_TRANSPORT=userspace explicitly selects the same HID reports through QEMU usb-redir.
+# This uses no host USB modules and proves the guest path, not Linux usb_f_hid/usb-host acceptance.
 set -euo pipefail
 GUEST_GATE_NAME="brightness-usb"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,6 +32,9 @@ source "$root/tools/guest-gate.sh"
 guest_gate_arch "$@"
 
 fail() { guest_gate_fail "$@"; }
+
+transport="${BRIGHTNESS_USB_TRANSPORT:-gadget}"
+[[ "$transport" == gadget || "$transport" == userspace ]] || fail "BRIGHTNESS_USB_TRANSPORT must be gadget or userspace"
 
 guest_gate_require_programs brightcheck brightread brightness_policy display_service xhci
 
@@ -46,7 +51,7 @@ finish() {
 		src/harness/usb-gadget.sh verify >>"$work/gadget.log" 2>&1 || echo "brightness-usb: the host still carries something of the gadget's (see .build/logs/brightness-usb/gadget.log)" >&2
 	fi
 	mkdir -p .build/logs/brightness-usb
-	cp -f "$work/gadget.log" "$work/monitor-sim.log" .build/logs/brightness-usb/ 2>/dev/null || true
+	cp -f "$work/gadget.log" "$work/monitor-sim.log" "$work/transport.log" .build/logs/brightness-usb/ 2>/dev/null || true
 	if [[ -n "$GUEST_LOG" ]]; then
 		cp -f "$GUEST_LOG" .build/logs/brightness-usb/guest.log 2>/dev/null || true
 	fi
@@ -55,15 +60,32 @@ finish() {
 }
 trap finish EXIT
 
-# THE DEVICE, built before QEMU starts because `usb-host` is pointed at it on the command line, and its firmware.
-if ! USB_GADGET_ID="$(src/harness/usb-gadget.sh setup monitor 2>>"$work/gadget.log")"; then
-	cat "$work/gadget.log" >&2
-	fail "the monitor gadget could not be built - it needs root and the host's dummy_hcd and usb_f_hid"
+# THE DEVICE listens before QEMU starts. The default remains the Linux gadget.
+printf 'brightness-usb: transport=%s\n' "$transport" >"$work/transport.log"
+if [[ "$transport" == gadget ]]; then
+	unset USB_REDIR_SOCKET
+	if ! USB_GADGET_ID="$(src/harness/usb-gadget.sh setup monitor 2>>"$work/gadget.log")"; then
+		cat "$work/gadget.log" >&2
+		fail "the monitor gadget could not be built - it needs root and the host's dummy_hcd and usb_f_hid"
+	fi
+	gadget=1
+	export USB_GADGET_ID USB_GADGET_PORT=3
+	python3 src/harness/monitor-sim.py --button-after 55:63 2>"$work/monitor-sim.log" &
+	sim=$!
+else
+	# Do not inherit a usb-host attachment into the explicitly userspace-only run.
+	unset USB_GADGET_ID USB_GADGET_PORT
+	export USB_REDIR_SOCKET="$work/monitor.sock"
+	python3 src/harness/brightness-usbredir.py --emulate monitor --button-after 55:63 --socket "$USB_REDIR_SOCKET" --ready "$work/ready" 2>"$work/monitor-sim.log" &
+	sim=$!
+	for _ in $(seq 1 100); do
+		[[ -e "$work/ready" && -S "$USB_REDIR_SOCKET" ]] && break
+		kill -0 "$sim" 2>/dev/null || break
+		sleep 0.05
+	done
+	[[ -e "$work/ready" && -S "$USB_REDIR_SOCKET" ]] && kill -0 "$sim" 2>/dev/null || fail "the userspace monitor did not start (see .build/logs/brightness-usb/monitor-sim.log)"
 fi
-gadget=1
-export USB_GADGET_ID USB_GADGET_PORT=3
-python3 src/harness/monitor-sim.py --button-after 55:63 2>"$work/monitor-sim.log" &
-sim=$!
+cat "$work/transport.log"
 export NET_NONE=1
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-300}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-480}"

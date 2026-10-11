@@ -2802,6 +2802,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let cat_read: Vec<u8> = demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &mut clients, &mut audit, &mut buf);
 	let ip_read: Vec<u8> = demonstrate_tool(procsvc, IP_NAME, b"", &mut clients, &mut audit, &mut buf);
 
+	// A pipeline carries every stage's arguments and the environment in one typed request.
+	// Receive any frame the existing transport admits; a 512-byte scratch buffer refused
+	// ordinary redirected commands before dispatch and ended the root serve loop.
+	let mut request: Vec<u8> = Vec::new();
+	if request.try_reserve_exact(rt::MAX_MESSAGE_BYTES).is_err() {
+		fail_bootstrap(bootstrap, b"request buffer", b"could not allocate the IPC receive buffer");
+	}
+	request.resize(rt::MAX_MESSAGE_BYTES, 0);
+
 	// 4. report in to the supervisor, then relay each governed component's proof and its
 	//    decisions summary (exactly which capabilities it was and was not given): the bytes
 	//    sandbox_probe read through its storage grant, the instant `date` printed through its
@@ -2828,7 +2837,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    OP_AUDIT opens a stream (the log-tail model): the trail is framed entry by entry onto
 	//    a fresh sub-channel, so it never has to fit one reply.
 	let mut manager: Manager = Manager { audit, procsvc, clients };
-	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
 		let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };

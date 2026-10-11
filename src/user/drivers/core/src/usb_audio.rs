@@ -514,18 +514,20 @@ unsafe fn post_playback(hc: &mut Xhci, dev: &UsbDevice, sink: &mut Sink) {
 				let byte = sink.queue.pop_front().unwrap_or(0);
 				((at + offset as u64) as *mut u8).write_volatile(byte);
 			}
-			// THE REST OF THE PACKET IS SILENCE when the queue could not fill it - and an ending stream sends only what
-			// it has, so its last packet is short rather than padded.
-			let length = if sink.ending { taken } else { bytes };
-			if taken < bytes && !sink.ending {
+			// Keep the final packet at the paced size too: a fixed-size sink can discard a short packet.
+			// Its intentional end padding is not an underrun, and the empty ending queue posts no further packet.
+			let length = bytes;
+			if taken < bytes {
 				for offset in taken..bytes {
 					((at + offset as u64) as *mut u8).write_volatile(0);
 				}
-				if !sink.dry {
-					sink.dry = true;
-					sink.underruns += 1;
+				if !sink.ending {
+					if !sink.dry {
+						sink.dry = true;
+						sink.underruns += 1;
+					}
+					sink.silent_frames += ((bytes - taken) as u32 / frame) as u64;
 				}
-				sink.silent_frames += ((bytes - taken) as u32 / frame) as u64;
 			} else if taken == bytes {
 				sink.dry = false;
 			}
@@ -595,6 +597,25 @@ pub unsafe fn play(hc: &mut Xhci, devices: &mut Devices, server: u64, period: &[
 		post_playback(hc, dev, sink);
 		sink.waiting = server;
 		answer_play(sink);
+	}
+}
+
+/// Take an already credited period that arrived after the provider wait selected its wake.
+/// Only a sink completion can need this refill; control requests and uncredited data keep their order.
+pub unsafe fn play_before_refill(hc: &mut Xhci, devices: &mut Devices, server: u64, control: u32) -> bool {
+	unsafe {
+		let Some((dev, sink)) = devices.sink() else { return false };
+		let dci = control >> 16 & 0x1f;
+		if control >> 24 != dev.slot || (dci != sink.dci && !sink.feedback.as_ref().is_some_and(|feedback| feedback.dci == dci)) || sink.waiting != 0 || sink.queue.len() + audio::PERIOD_BYTES as usize > PLAYBACK_QUEUE || server == 0 || channel_peek(server) != i64::from(audio::PERIOD_BYTES) {
+			return false;
+		}
+		let mut period = [0u8; audio::PERIOD_BYTES as usize];
+		let Polled::Message { len, handle } = try_recv(server, &mut period) else { return false };
+		if handle != 0 {
+			close(handle);
+		}
+		play(hc, devices, server, &period[..len]);
+		true
 	}
 }
 

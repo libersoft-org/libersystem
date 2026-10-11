@@ -365,7 +365,9 @@ def music_voice(g):
         cursor = g.control('events')['next']
         mark = g.start('audioprobe radio-voice-close')
         g.wait(mark, 'radio-voice-close waiting')
-        g.event('sco-connected', 'headset', since=cursor, timeout=15)
+        connected = g.event('sco-connected', 'headset', since=cursor, timeout=15)
+        g.require(connected['link_type'] == (0 if codec == 'hsp' else 2),
+                  f'{codec} negotiated the wrong synchronous link type: {connected}')
         if codec == 'hsp':
             g.control('hfp-at', peer='headset', command='AT+CKPD=200')
         else:
@@ -419,6 +421,8 @@ def music_voice(g):
         g.wait(mark, 'radio-voice answered')
         g.pause(2)
         voice_pcm = g.eventually('voice-verdict', lambda value: value['samples'] >= 8000, peer='headset', timeout=15)
+        g.require(voice_pcm['link_type'] == (0 if codec == 'hsp' else 2),
+                  f'{codec} duplex audio used the wrong synchronous link type: {voice_pcm}')
         g.require(voice_pcm['rms'] > 500 and voice_pcm['peak_frequency'] == 333, f'independent {codec} peer did not hear the application voice tone: {voice_pcm}')
         if codec == 'hsp':
             g.control('hfp-at', peer='headset', command='AT+CKPD=200')
@@ -435,6 +439,7 @@ def music_voice(g):
                   f'{codec} capture was scaled again or corrupted (mic level53, energy ratio {ratio}, reference {reference})')
         peer_event(g, 'sco-disconnected', cursor)
         g.record('classic-voice-' + codec, independent_decode=voice_pcm,
+                 link_type=voice_pcm['link_type'],
                  no_session='CKPD rejected with ERROR; no fresh SCO events' if codec == 'hsp' else 'ATA/BCC rejected',
                  calls='HSP button answer/hangup' if codec == 'hsp' else 'incoming/answer/active/hangup',
                  speaker_gain='operator60 -> peer9; peer15 -> operator100',
@@ -479,8 +484,14 @@ def transfer(g):
     g.record('classic-opp', outgoing=receipts, incoming=sent, peer='same-team OBEX over independent Bumble RFCOMM and L2CAP ERTM')
 
     denied = g.control('opp-send', peer='phone', address=g.guest_address, name='unconsented.txt', data=b'unconsented'.hex(), allow_error=True)
-    g.require(not denied['ok'] and ('OPP RFCOMM channel 9 refused by peer' in denied.get('error', '')
-                                   or 'OBEX refusal code ' in denied.get('error', '')),
+    # Without a waiting receiver, the policy can refuse the shared RFCOMM
+    # session before channel 9 is opened. L2CAP result 3 is Security Block;
+    # transport timeouts, unavailable PSMs and resource failures are not refusal.
+    g.require(denied.get('ok') is False and (
+                  'OPP RFCOMM channel 9 refused by peer' in denied.get('error', '')
+                  or 'OBEX refusal code ' in denied.get('error', '')
+                  or (denied.get('error_namespace') == 'L2CAP'
+                      and type(denied.get('error_code')) is int and denied['error_code'] == 3)),
               f'OPP without a waiting receiver had no protocol refusal: {denied}')
     mark = g.start(f'btctl receive {phone} 64 > {in_path}')
     g.wait(mark, 'waiting up to 180 seconds')

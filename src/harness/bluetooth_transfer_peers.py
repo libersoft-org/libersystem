@@ -189,7 +189,16 @@ class TransferPeer:
             self.peer.observe('opp-sent', **result)
             return result
         finally:
-            await client.shutdown()
+            try:
+                await client.shutdown()
+            except core.InvalidStateError:
+                # The peer may close L2CAP while shutdown awaits the RFCOMM
+                # multiplexer reply. Bumble then attempts to disconnect the
+                # already closed channel after clearing its multiplexer.
+                if (client.multiplexer is not None or client.l2cap_channel is None
+                        or client.l2cap_channel.state != l2cap.ClassicChannel.State.CLOSED):
+                    raise
+                client.l2cap_channel = None
 
     async def pan_start(self):
         if self.network:

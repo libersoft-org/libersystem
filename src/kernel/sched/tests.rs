@@ -283,6 +283,33 @@ fn a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself() {
 	// Let it finish so the queue is clean for whatever runs next.
 	STOP.store(true, Ordering::SeqCst);
 	sched::run_until_idle();
+
+	// A SOLE NON-YIELDING THREAD must give the bootstrap caller its deadline too. Its finite fallback makes a
+	// kernel with the old sole-thread timer shortcut fail this assertion rather than hang the test suite.
+	static BUSY_ENDED: AtomicBool = AtomicBool::new(false);
+	static BUSY_UNTIL: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn busy(_arg: u64) {
+		while !STOP.load(Ordering::SeqCst) && arch::apic::ticks() < BUSY_UNTIL.load(Ordering::SeqCst) {
+			core::hint::spin_loop();
+		}
+		BUSY_ENDED.store(true, Ordering::SeqCst);
+	}
+	STOP.store(false, Ordering::SeqCst);
+	BUSY_ENDED.store(false, Ordering::SeqCst);
+	let worker = sched::spawn(busy, 0);
+	let deadline = arch::apic::ticks() + 3;
+	let fallback = deadline + 20;
+	BUSY_UNTIL.store(fallback, Ordering::SeqCst);
+	let idled = sched::run_until_idle_until(deadline);
+	let returned_at = arch::apic::ticks();
+	let ended_before_stop = BUSY_ENDED.load(Ordering::SeqCst);
+	STOP.store(true, Ordering::SeqCst);
+	sched::run_until_idle_until(fallback + 3);
+	assert!(BUSY_ENDED.load(Ordering::SeqCst), "the finite busy worker was stopped and drained");
+	drop(worker);
+	assert!(!idled, "a sole busy thread did not let the bounded drain idle");
+	assert!(returned_at >= deadline && returned_at < fallback, "the pump returned at its deadline, before the busy worker's fallback: deadline {deadline}, returned {returned_at}, fallback {fallback}");
+	assert!(!ended_before_stop, "the bounded pump returned while its sole non-yielding worker was still running");
 }
 
 crate::tagged_test!(a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer, [Scheduler, Kernel], id = "kernel.sched.a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer", covers = ["kernel"]);

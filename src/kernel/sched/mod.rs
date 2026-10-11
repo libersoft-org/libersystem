@@ -1517,9 +1517,9 @@ pub fn on_timer_preempt(from_user: bool) {
 		let inner = sched.inner.lock();
 		// A SOLE THREAD KEEPS ITS CORE - but not the boot core while a request waits for that core's idle context, which
 		// a thread that never blocks would otherwise hold off for as long as it runs (see `reschedule_as`), and not a
-		// core owing injected idle.
+		// core owing injected idle, or a bounded drain whose caller must regain this core after its deadline.
 		let owed = cpu == 0 && arch::sleep::s3_pending();
-		if inner.current.is_none() || (inner.run_queue.is_empty() && !owed && !inject) {
+		if inner.current.is_none() || (inner.run_queue.is_empty() && !owed && !inject && !sched.drain_expired()) {
 			return;
 		}
 	}

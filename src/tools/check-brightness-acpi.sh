@@ -22,6 +22,8 @@
 #
 # IT BOOTS ITS OWN INSTANCE in private state and takes it down from the EXIT trap. THE GADGET IS A PERMISSION (the
 # owner's, 2026-09-21, with the rules `usb-gadget.sh` enforces): without root and `dummy_hcd` this gate FAILS.
+# BRIGHTNESS_USB_TRANSPORT=userspace selects consumer reports through QEMU usb-redir without host USB modules.
+# Its guest assertions are identical; this path does not establish Linux usb_f_hid/usb-host acceptance.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
@@ -38,6 +40,8 @@ if [[ "${1:-}" == --no-dos ]]; then
 fi
 [[ $# == 0 ]] || fail "usage: check-brightness-acpi.sh [--no-dos]"
 [[ "$no_dos" == 0 || "$no_dos" == 1 ]] || fail "BRIGHTNESS_NO_DOS must be 0 or 1"
+transport="${BRIGHTNESS_USB_TRANSPORT:-gadget}"
+[[ "$transport" == gadget || "$transport" == userspace ]] || fail "BRIGHTNESS_USB_TRANSPORT must be gadget or userspace"
 command -v python3 >/dev/null || fail "python3 is not installed, and the lab is written in it"
 [[ ! -S .build/boot/lab-ctl.sock ]] || fail "an ad-hoc lab guest is up (.build/boot/lab-ctl.sock) - take it down with ./lab.sh quit first"
 
@@ -150,14 +154,30 @@ for _ in $(seq 1 100); do
 	sleep 0.05
 done
 [[ -e "$fixture/ready" ]] || fail "the vhost-user backend did not start (see $kept/backend.log)"
-if ! USB_GADGET_ID="$(src/harness/usb-gadget.sh setup consumer-keys 2>>"$state/gadget.log")"; then
-	cat "$state/gadget.log" >&2
-	fail "the consumer-keys gadget could not be built - it needs root and the host's dummy_hcd and usb_f_hid"
+printf 'brightness-acpi: transport=%s\n' "$transport" >"$state/transport.log"
+if [[ "$transport" == gadget ]]; then
+	unset USB_REDIR_SOCKET
+	if ! USB_GADGET_ID="$(src/harness/usb-gadget.sh setup consumer-keys 2>>"$state/gadget.log")"; then
+		cat "$state/gadget.log" >&2
+		fail "the consumer-keys gadget could not be built - it needs root and the host's dummy_hcd and usb_f_hid"
+	fi
+	gadget=1
+	KEYS_SIM_TRIGGER="$state/press" python3 src/harness/keys-sim.py 2>"$state/keys-sim.log" &
+	keys_pid="$!"
+	export USB_GADGET_ID USB_GADGET_PORT=3
+else
+	unset USB_GADGET_ID USB_GADGET_PORT
+	export USB_REDIR_SOCKET="$state/keys.sock"
+	KEYS_SIM_TRIGGER="$state/press" python3 src/harness/brightness-usbredir.py --emulate consumer-keys --socket "$USB_REDIR_SOCKET" --ready "$state/keys-ready" 2>"$state/keys-sim.log" &
+	keys_pid=$!
+	for _ in $(seq 1 100); do
+		[[ -e "$state/keys-ready" && -S "$USB_REDIR_SOCKET" ]] && break
+		kill -0 "$keys_pid" 2>/dev/null || break
+		sleep 0.05
+	done
+	[[ -e "$state/keys-ready" && -S "$USB_REDIR_SOCKET" ]] && kill -0 "$keys_pid" 2>/dev/null || fail "the userspace consumer keys did not start (see $kept/keys-sim.log)"
 fi
-gadget=1
-KEYS_SIM_TRIGGER="$state/press" python3 src/harness/keys-sim.py 2>"$state/keys-sim.log" &
-keys_pid="$!"
-export USB_GADGET_ID USB_GADGET_PORT=3
+cat "$state/transport.log"
 export ACPI_FIXTURE="$fixture/fixture.aml" ACPI_FIXTURE_MEMORY="$fixture/ivshmem.bin"
 export I2C_FIXTURE=bus I2C_SOCKET="$fixture/i2c.sock" GPIO_SOCKET="$fixture/gpio.sock"
 export VGA=std

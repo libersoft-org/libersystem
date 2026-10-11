@@ -1080,6 +1080,13 @@ fn a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage(
 	// greeting, which the storage tests read through the service, so its own text is what to look
 	// for rather than anything this test could have produced.
 	assert!(result.redirect_read.windows(8).any(|window| window == b"Hello fr"), "the bytes are the file's, so a redirect_in that failed to open it cannot pass this: {:?}", core::str::from_utf8(&result.redirect_read));
+	// The actual OPP file-creation payload is 48 copies of this 24-byte phrase, plus echo's
+	// newline. It crosses the same broker before the real FAT media writer publishes it.
+	let mut expected = b"independent-opp-payload-".repeat(48);
+	expected.push(b'\n');
+	assert!(result.stream_reads[3].is_empty(), "redirect_out completed without a diagnostic: {:?}", result.stream_reads[3]);
+	assert_eq!(result.stream_reads[4], expected, "the oversized valid pipeline stored and read back every byte");
+	assert_eq!(result.stream_reads[5], b"permission-manager-still-serving\n", "the same broker and ProcessService still launch tools after the large request");
 }
 
 // `2>&1` IS THE SAME PIPELINE WITH ONE FLAG, AND THE DIAGNOSTIC CHANGES SIDES.

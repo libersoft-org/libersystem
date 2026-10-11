@@ -1390,6 +1390,52 @@ def profile_inventory_self_test():
     note('profile inventory self-test PASS: Classic selected beside CTKD LE row; LE-only, wrong peer, duplicate and opposite profile state refused')
 
 
+def opp_refusal_self_test():
+    """Exercise the actual no-receiver and size-bound predicates, not a replica."""
+    from types import SimpleNamespace
+    source = ast.parse((HARNESS / 'bluetooth_guest_classic.py').read_text())
+    scenario = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'transfer')
+    predicates = {}
+    for variable, marker in (
+            ('denied', 'OPP without a waiting receiver had no protocol refusal'),
+            ('bounded', 'OPP declared-size bound did not refuse the object')):
+        checks = [node for node in scenario.body if isinstance(node, ast.Expr)
+                  and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                  and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == 'g'
+                  and node.value.func.attr == 'require' and len(node.value.args) == 2
+                  and any(isinstance(value, ast.Constant) and isinstance(value.value, str) and marker in value.value
+                          for value in ast.walk(node.value.args[1]))]
+        require(len(checks) == 1, 'OPP refusal predicate is absent or ambiguous: ' + variable)
+        predicates[variable] = compile(ast.Module(body=checks, type_ignores=[]), '<actual-OPP-' + variable + '>', 'exec')
+
+    # This is the actual structured no-receiver result retained from the guest.
+    security = dict(ok=False, error='L2capError()', error_type='L2capError',
+                    error_namespace='L2CAP', error_code=3, error_name='CONNECTION_REFUSED_SECURITY_BLOCK')
+    rfcomm = dict(ok=False, error="ValueError('OPP RFCOMM channel 9 refused by peer')")
+    obex = dict(ok=False, error="ValueError('OBEX refusal code 0xc3')")
+    accepted = [security, rfcomm, obex]
+    rejected = [dict(security, ok=True), dict(security, ok=0), dict(security, ok=None),
+                dict(security, error_code='3'), dict(security, error_code=True),
+                *(dict(security, error_code=code) for code in (0, 1, 2, 4)),
+                *(dict(security, error_namespace=namespace) for namespace in ('hci', 'rfcomm', 'l2cap', None)),
+                dict(ok=False, error='L2capError()'), dict(ok=False, error='TimeoutError()'),
+                dict(ok=False, error='KeyError()'), dict(ok=False, error='connection refused'),
+                dict(ok=False, error_namespace='hci', error_code=0x04),
+                dict(ok=False, error_namespace='hci', error_code=0x08),
+                dict(ok=True, error=rfcomm['error']), dict(ok=True, error=obex['error'])]
+    guest = SimpleNamespace(require=require)
+    for variable, positives, negatives in (
+            ('denied', accepted, rejected), ('bounded', [obex], [security, rfcomm, *rejected])):
+        for reply, should_pass in [(reply, True) for reply in positives] + [(reply, False) for reply in negatives]:
+            try:
+                exec(predicates[variable], {'g': guest, variable: reply})
+            except GateError:
+                require(not should_pass, f'valid OPP {variable} refusal rejected: {reply}')
+            else:
+                require(should_pass, f'non-protocol OPP {variable} result accepted: {reply}')
+    note('OPP refusal self-test PASS: actual no-receiver predicate accepts only exact L2CAP Security Block or existing RFCOMM/OBEX refusal; size-bound still requires OBEX; success, mistyped codes, timeouts and unrelated failures rejected')
+
+
 def self_test():
     bridge_spec = importlib.util.spec_from_file_location('bluetooth_bridge_check', HARNESS / 'check-bluetooth-bridge.py')
     bridge_check = importlib.util.module_from_spec(bridge_spec)
@@ -1397,6 +1443,13 @@ def self_test():
     bridge_check.self_test(ROOT)
     from bluetooth_voice_fairness import run as voice_fairness_self_test
     voice_fairness_self_test(ROOT)
+    from bluetooth_voice_partial_write import run as voice_partial_write_self_test
+    voice_partial_write_self_test(ROOT)
+    from bluetooth_voice_sco import run as voice_sco_self_test
+    voice_sco_self_test(ROOT)
+    from bluetooth_opp_disconnect import run as opp_disconnect_self_test
+    opp_disconnect_self_test(ROOT)
+    opp_refusal_self_test()
     profile_inventory_self_test()
     classic_gamepad_self_test()
     hsp_no_session_self_test()

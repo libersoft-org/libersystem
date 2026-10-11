@@ -91,6 +91,10 @@ fn tone(frames: usize, channels: usize) -> Buffer {
 }
 
 fn tone_channels(frames: usize, channels: usize, distinct: bool) -> Buffer {
+	tone_channels_from(frames, channels, distinct, 0)
+}
+
+fn tone_channels_from(frames: usize, channels: usize, distinct: bool, first_frame: usize) -> Buffer {
 	let bytes = frames * channels * 2;
 	let handle = memory_object_create(bytes as u64);
 	if handle < 0 {
@@ -101,7 +105,7 @@ fn tone_channels(frames: usize, channels: usize, distinct: bool) -> Buffer {
 	let samples = unsafe { core::slice::from_raw_parts_mut(base as *mut i16, frames * channels) };
 	for (at, sample) in samples.iter_mut().enumerate() {
 		let half_period = if distinct && at % channels == 1 { 12 } else { 24 };
-		*sample = if (at / channels / half_period) % 2 == 0 { 4_000 } else { -4_000 };
+		*sample = if ((first_frame + at / channels) / half_period) % 2 == 0 { 4_000 } else { -4_000 };
 	}
 	unmap_object(handle);
 	Buffer { handle, len: bytes as u64 }
@@ -366,13 +370,17 @@ fn radio_voice(probe: &Probe) {
 	let mut energy = 0u64;
 	let mut crossings = 0usize;
 	let mut previous = 0i16;
+	// A write may accept only a prefix; resume the same waveform at its next source frame.
+	let mut written_frames = 0usize;
 	let deadline = clock() + 30 * TICKS;
 	while !hung_up {
 		if clock() >= deadline {
 			fail("the independent peer did not answer and hang up the radio call");
 		}
-		match client().write(&tone(480, 1)) {
-			Some(Ok(accepted)) if accepted > 0 => {}
+		match client().write(&tone_channels_from(480, 1, false, written_frames)) {
+			Some(Ok(accepted)) if accepted > 0 => {
+				written_frames += accepted as usize;
+			}
 			other => fail(&format!("the radio voice write failed: {other:?}")),
 		}
 		if let Some(Ok(period)) = client().read() {

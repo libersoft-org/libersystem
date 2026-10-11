@@ -708,7 +708,8 @@ pub(crate) struct PermissionScenarioResult {
 	// same failure, one flag, and the sentence changes which side of the pipe it comes out on.
 	merged_read: alloc::vec::Vec<u8>,
 	// What the three migrated-tool pipelines printed, in the order the scenario runs them:
-	// `... | wc`, `... | head -n 1`, `... | tee <path> | wc`.
+	// `... | wc`, `... | head -n 1`, `... | tee <path> | wc`, followed by the large
+	// redirected write, its exact readback and a subsequent broker-launched echo.
 	stream_reads: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 	// What the REAL SHELL printed after one typed line - the layer every other field here skips.
 	shell_read: alloc::vec::Vec<u8>,
@@ -910,7 +911,9 @@ fn build_permission_scenario(scenario: PermissionScenario) -> Result<PermissionS
 	// this domain's own empty state rather than a number read off somewhere else.
 	let before = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
 	let outcome = build_permission_scenario_in(scenario, &domain);
-	let reaped = reap_permission_fixture(&domain, before);
+	// Base starts five services and retains its shell; all other cleanup bounds stay at five.
+	let max_lingering = if scenario == PermissionScenario::GovernedTools { 6 } else { 5 };
+	let reaped = reap_permission_fixture(&domain, before, max_lingering);
 	// A SETUP FAILURE KEEPS ITS OWN DIAGNOSTIC. The teardown result only decides a run that
 	// otherwise succeeded: if the scenario failed, that is what the consumer needs to be told, and
 	// "and the cleanup was also unhappy" would bury it.
@@ -927,7 +930,7 @@ fn build_permission_scenario(scenario: PermissionScenario) -> Result<PermissionS
 // wrong - a retained handle inside a cached observation would be invisible until some later test
 // behaved strangely - so the fixture is required to prove it against counters the kernel keeps
 // itself.
-fn reap_permission_fixture(domain: &alloc::sync::Arc<object::domain::Domain>, before: (u64, u64, u64)) -> Result<(), &'static str> {
+fn reap_permission_fixture(domain: &alloc::sync::Arc<object::domain::Domain>, before: (u64, u64, u64), max_lingering: u64) -> Result<(), &'static str> {
 	domain.kill();
 	// PUMP UNTIL NOTHING OF IT IS STILL RUNNING.
 	//
@@ -988,21 +991,21 @@ fn reap_permission_fixture(domain: &alloc::sync::Arc<object::domain::Domain>, be
 	// THE BOUND IS A CONSTANT, not the number of processes that happen to be left. It was
 	// `lingering * RESIDUE`, computed from the count measured after the run - so a sixth process
 	// raised its own allowance and the check could not fail on one, while the comment beside it
-	// claimed it could. Measured on this tree: five for the base scenario (four services and the
-	// shell) and four for the scoped one.
+	// claimed it could. Each caller supplies its fixed setup bound: six for the five-service
+	// base scenario plus its shell; five for scoped grants and the unchanged fault/resolved
+	// fixtures. The allowance never depends on the measured count.
 	let lingering = domain.live_processes().len() as u64;
-	const MAX_LINGERING: u64 = 5;
 	const RESIDUE_BYTES_PER_PROCESS: u64 = 128 * 1024;
-	if lingering > MAX_LINGERING {
+	if lingering > max_lingering {
 		return Err("the permission fixture left more terminated processes behind than it starts");
 	}
 	if after.1 != before.1 {
 		return Err("the permission fixture's domain did not give back its handles");
 	}
-	if after.0 > before.0 + MAX_LINGERING * RESIDUE_BYTES_PER_PROCESS {
+	if after.0 > before.0 + max_lingering * RESIDUE_BYTES_PER_PROCESS {
 		return Err("the permission fixture's domain kept more memory than its terminated processes account for");
 	}
-	if after.2 > before.2 + MAX_LINGERING {
+	if after.2 > before.2 + max_lingering {
 		return Err("the permission fixture's domain kept more thread slots than its terminated processes account for");
 	}
 	Ok(())
@@ -1077,10 +1080,15 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	core::mem::drop(supervisor_server);
 	// The manager's grantable volume capabilities: the four non-system volume StorageService
 	// clients (media / iso / udf / usb) it bundles with the system storage client under the
-	// `volumes` capability. Real, dead-peer clients here (no such services run in this scenario),
-	// held but never granted to the governed components (the `lsvol` command is not among them).
+	// `volumes` capability. Base serves writable media for its redirection round trip; Scoped
+	// keeps the original dead-peer media client, as do the other three volumes in both scenarios.
 	let (storage_media_server, storage_media_client) = Channel::create();
-	core::mem::drop(storage_media_server);
+	let storage_media_server = if scenario == PermissionScenario::GovernedTools {
+		Some(storage_media_server)
+	} else {
+		core::mem::drop(storage_media_server);
+		None
+	};
 	let (storage_iso_server, storage_iso_client) = Channel::create();
 	core::mem::drop(storage_iso_server);
 	let (storage_udf_server, storage_udf_client) = Channel::create();
@@ -1117,6 +1125,28 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL).map_err(|_| "failed to load ProcessService")?;
 	let _time = spawn_dynamic_test_process(domain.clone(), time_elf, time_boot_user);
 	let _permission_manager = spawn_dynamic_test_process(domain.clone(), pm_elf, pm_boot_user);
+
+	// Keep the read-only system archive. The redirect tools accept the media volume; Base's
+	// extra StorageService serves a real FAT filesystem in this same reaped fixture Domain.
+	// Reuse the storage tests' sector map and block responder, pumped only by the new sequence.
+	let mut writable_media = if let Some(server) = storage_media_server {
+		let image = fat16_image(&[], false);
+		let capacity = image.len() as u64;
+		let mut disk = alloc::collections::BTreeMap::new();
+		for (lba, chunk) in image.chunks(512).enumerate() {
+			let mut sector = alloc::vec![0u8; 512];
+			sector[..chunk.len()].copy_from_slice(chunk);
+			disk.insert(lba as u64, sector);
+		}
+		let (boot, boot_user) = Channel::create();
+		let (block, block_user) = Channel::create();
+		loader::spawn_elf_process(domain.clone(), storage_elf, boot_user, Rights::ALL).map_err(|_| "failed to load media StorageService")?;
+		send_cap(&boot, b"FATBLOCK", block_user, Rights::ALL)?;
+		send_cap(&boot, b"SERVE", server, Rights::ALL)?;
+		Some((boot, block, disk, capacity))
+	} else {
+		None
+	};
 
 	// StorageService: the ramdisk volume and its service channel.
 	send_ramdisk(&storage_boot_kernel, volume)?;
@@ -1174,12 +1204,8 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	send_cap(&pm_boot_kernel, b"STORAGE_ISO", storage_iso_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_UDF", storage_udf_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_USB", storage_usb_client, Rights::ALL)?;
-	// The two memory volumes. Sent even though this scenario mounts neither, though no longer
-	// because it must be: PermissionManager now takes its capabilities by NAME, so one it never
-	// receives simply reads as absent instead of swallowing the next message and shifting
-	// everything after it - which is exactly how this failed when the pair was added to the
-	// manager and not here. Kept because the scenario is more faithful for sending them.
-	for tag in [b"STORAGE_RAM".as_slice(), b"STORAGE_TMP".as_slice()] {
+	// Neither scenario serves RAM or TMP; writable media uses its existing named slot above.
+	for tag in [b"STORAGE_RAM", b"STORAGE_TMP"] {
 		pm_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not hand PermissionManager a memory volume slot")?;
 	}
 	send_cap(&pm_boot_kernel, b"SERVICES", services_client, Rights::ALL)?;
@@ -1428,6 +1454,63 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 			}
 		}
 		stream_reads.push(read);
+	}
+
+	if scenario == PermissionScenario::GovernedTools {
+		// The independent Bluetooth gate creates this exact payload before its OPP send. The
+		// complete pipeline request exceeds the old 512-byte receive buffer. Write through the
+		// real broker and redirect_out, then read through a fresh governed pipeline after the
+		// writer has committed; a successful launch alone does not prove the bytes were stored.
+		if program_elf(&package, volume, b"redirect_out").is_none() {
+			return Err("redirect_out is not staged in the volume");
+		}
+		let large_payload = b"independent-opp-payload-".repeat(48);
+		for (correlation, stages) in [
+			(7u32, &[(&b"echo"[..], large_payload.as_slice()), (&b"redirect_out"[..], &b"vol://media/bt-oracle-out.txt"[..])][..]),
+			(8u32, &[(&b"redirect_in"[..], &b"vol://media/bt-oracle-out.txt"[..])][..]),
+			(9u32, &[(&b"echo"[..], &b"permission-manager-still-serving"[..])][..]),
+		] {
+			let (read_end, write_end) = Channel::create();
+			let request = permission_pipeline_request(correlation, stages);
+			send_cap(&perm_client, &request, write_end, Rights::ALL)?;
+			sched::run_until_idle();
+			let reply = perm_client.recv().map_err(|_| "PermissionManager did not answer the large-redirection sequence")?;
+			if reply.bytes.get(4) != Some(&1) || le_u32(&reply.bytes, 0) != correlation {
+				return Err("PermissionManager refused the large-redirection sequence");
+			}
+			let group = reply.caps.first().ok_or("the redirection sequence has no process group")?.object().into_any_arc().downcast::<object::process_group::ProcessGroup>().map_err(|_| "the redirection sequence returned no process group")?;
+			let mut read = alloc::vec::Vec::new();
+			let mut records = [None; 2];
+			for _ in 0..256 {
+				sched::run_until_idle();
+				if let Some((_, block, disk, capacity)) = &mut writable_media {
+					pump_block_stand_in(block, disk, *capacity);
+				}
+				while let Ok(message) = read_end.recv() {
+					read.extend_from_slice(&message.bytes);
+				}
+				// The exit flag precedes publication of the group's completion record.
+				if group.finished() && group.records_into(&mut records) == stages.len() && records[..stages.len()].iter().all(Option::is_some) {
+					break;
+				}
+			}
+			if !group.finished() {
+				return Err("the large-redirection sequence did not finish");
+			}
+			// A last write may have arrived between the drain above and the completed exit.
+			while let Ok(message) = read_end.recv() {
+				read.extend_from_slice(&message.bytes);
+			}
+			if group.records_into(&mut records) != stages.len() || records[..stages.len()].iter().any(|record| !matches!(record, Some(record) if record.state == syscall::PROC_STATE_STOPPED && record.completion_valid == 1 && record.completion == 0)) {
+				return Err("a large-redirection stage did not exit successfully");
+			}
+			stream_reads.push(read);
+		}
+		// Losing this manager used to close all three minting roots and take those services
+		// down with it. These stand-in peers must remain live after the real launch/readback.
+		if display_admin_server.is_peer_closed() || input_admin_server.is_peer_closed() || audio_admin_server.is_peer_closed() {
+			return Err("the large-redirection sequence closed a service minting root");
+		}
 	}
 
 	// The text-processing command tools, through the same governed path as everything else.
@@ -2351,7 +2434,7 @@ pub(crate) fn run_permission_fault_scenario() -> Result<FaultReport, &'static st
 	let domain = object::domain::Domain::new(PERMISSION_FIXTURE_MEMORY, object::domain::UNLIMITED, object::domain::UNLIMITED);
 	let before = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
 	let outcome = run_permission_fault_scenario_in(&domain);
-	let reaped = reap_permission_fixture(&domain, before);
+	let reaped = reap_permission_fixture(&domain, before, 5);
 	match (outcome, reaped) {
 		(Err(diagnostic), _) => Err(diagnostic),
 		(Ok(_), Err(diagnostic)) => Err(diagnostic),
@@ -2507,7 +2590,7 @@ pub(crate) fn run_permission_resolved_grant_scenario() -> Result<ResolvedGrantRe
 	let domain = object::domain::Domain::new(PERMISSION_FIXTURE_MEMORY, object::domain::UNLIMITED, object::domain::UNLIMITED);
 	let before = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
 	let outcome = run_permission_resolved_grant_scenario_in(&domain);
-	let reaped = reap_permission_fixture(&domain, before);
+	let reaped = reap_permission_fixture(&domain, before, 5);
 	match (outcome, reaped) {
 		(Err(diagnostic), _) => Err(diagnostic),
 		(Ok(_), Err(diagnostic)) => Err(diagnostic),

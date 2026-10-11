@@ -57,6 +57,9 @@ pub(crate) struct Receiver {
 	assembler: Assembler,
 	deadline: u64,
 	received: u64,
+	// The object arrived whole; retain its transport until the peer's DISCONNECT response has drained.
+	completed: bool,
+	disconnecting: bool,
 }
 
 // A DEFERRED FINISH'S ANSWER, encoded by running the generated dispatch again over the result.
@@ -360,7 +363,7 @@ impl Stack {
 
 	// THE RECEIVER'S STREAM IS MADE: it waits from now.
 	pub(crate) fn receiver_started(&mut self, at: usize, peer: Peer, max_bytes: u64, stream: u64) {
-		self.receivers.push(Receiver { stream, at, peer, server: PushServer::new(max_bytes), transport: None, assembler: Assembler::new(obex::MAX_PACKET), deadline: clock().saturating_add(RECEIVE_TICKS), received: 0 });
+		self.receivers.push(Receiver { stream, at, peer, server: PushServer::new(max_bytes), transport: None, assembler: Assembler::new(obex::MAX_PACKET), deadline: clock().saturating_add(RECEIVE_TICKS), received: 0, completed: false, disconnecting: false });
 		self.controllers[at].bredr_state.receive_waits = Some(peer);
 		self.refresh_policy(at);
 	}
@@ -374,10 +377,16 @@ impl Stack {
 
 	// A REQUEST FROM THE PEER'S CLIENT: answered, and what it carried told to the receiver.
 	fn receive_data(&mut self, index: usize, handle: u16, bytes: &[u8]) {
+		// A valid DISCONNECT has ended this session. Only its queued reply remains; do not accept more requests
+		// or recurse through rfcomm_send while the flush hook may retire this receiver.
+		if self.receivers[index].disconnecting {
+			return;
+		}
 		let packets = match self.receivers[index].assembler.push(bytes) {
 			Ok(packets) => packets,
 			Err(_) => {
-				self.end_receiver(index, Some(event(ReceivedKind::Failed, self.receivers[index].received)));
+				let kind = if self.receivers[index].completed { ReceivedKind::Complete } else { ReceivedKind::Failed };
+				self.end_receiver(index, Some(event(kind, self.receivers[index].received)));
 				return;
 			}
 		};
@@ -388,6 +397,13 @@ impl Stack {
 				Some(Transport::Rfcomm(channel)) => self.rfcomm_send(at, handle, channel, &reply),
 				Some(Transport::L2cap(cid)) => self.ertm_send(at, handle, cid, &reply),
 				None => {}
+			}
+			if self.receivers[index].completed && packet.first() == Some(&obex::opcode::DISCONNECT) && reply.first() == Some(&obex::response::SUCCESS) {
+				// Set this only after rfcomm_send: its nested run_rfcomm must not remove the receiver while this
+				// request still uses its index. The explicit flush below may end it; nothing reads the index after it.
+				self.receivers[index].disconnecting = true;
+				self.opp_rfcomm_flushed(at, handle);
+				return;
 			}
 			let stream = self.receivers[index].stream;
 			for happened in events {
@@ -408,9 +424,10 @@ impl Stack {
 						ok
 					}
 					ServerEvent::Complete => {
-						let received = self.receivers[index].received;
-						self.end_receiver(index, Some(event(ReceivedKind::Complete, received)));
-						return;
+						// The peer still ends OBEX with DISCONNECT. Leave its DLC open so that response can drain
+						// even when it awaits credits; loss or the original deadline also ends the wait.
+						self.receivers[index].completed = true;
+						true
 					}
 					ServerEvent::Failed(_) => {
 						let received = self.receivers[index].received;
@@ -424,6 +441,18 @@ impl Stack {
 					return;
 				}
 			}
+		}
+	}
+
+	// All RFCOMM Send outputs have been emitted before this is called. Closing a DLC with queued bytes would
+	// discard its DISCONNECT response; a later credit-only frame calls this again after Session drains that queue.
+	pub(crate) fn opp_rfcomm_flushed(&mut self, at: usize, handle: u16) {
+		let Some(link) = self.controllers[at].link(handle) else { return };
+		let Some(index) = self.receivers.iter().position(|receiver| receiver.at == at && receiver.peer == link.peer && receiver.completed && receiver.disconnecting) else { return };
+		let Some(Transport::Rfcomm(channel)) = self.receivers[index].transport else { return };
+		let drained = link.classic.as_ref().and_then(|classic| classic.rfcomm.as_ref()).and_then(|rfcomm| rfcomm.session.dlc(channel)).is_some_and(|dlc| dlc.state == service_logic::rfcomm::DlcState::Open && dlc.queue.is_empty());
+		if drained {
+			self.end_receiver(index, Some(event(ReceivedKind::Complete, self.receivers[index].received)));
 		}
 	}
 
@@ -506,9 +535,10 @@ impl Stack {
 				if let Some(index) = self.receivers.iter().position(|receiver| receiver.at == at && receiver.peer == peer && receiver.transport == Some(Transport::Rfcomm(channel))) {
 					self.receivers[index].transport = None;
 					let failed = self.receivers[index].server.lost();
-					if !failed.is_empty() {
+					if self.receivers[index].completed || !failed.is_empty() {
 						let received = self.receivers[index].received;
-						self.end_receiver(index, Some(event(ReceivedKind::Failed, received)));
+						let kind = if self.receivers[index].completed { ReceivedKind::Complete } else { ReceivedKind::Failed };
+						self.end_receiver(index, Some(event(kind, received)));
 					}
 				}
 			}
@@ -549,9 +579,10 @@ impl Stack {
 		}
 		if let Some(index) = self.receivers.iter().position(|receiver| receiver.at == at && receiver.peer == *peer && receiver.transport.is_some()) {
 			self.receivers[index].transport = None;
-			if !self.receivers[index].server.lost().is_empty() {
+			if self.receivers[index].completed || !self.receivers[index].server.lost().is_empty() {
 				let received = self.receivers[index].received;
-				self.end_receiver(index, Some(event(ReceivedKind::Failed, received)));
+				let kind = if self.receivers[index].completed { ReceivedKind::Complete } else { ReceivedKind::Failed };
+				self.end_receiver(index, Some(event(kind, received)));
 			}
 		}
 	}
@@ -573,7 +604,13 @@ impl Stack {
 		}
 		while let Some(index) = self.receivers.iter().position(|receiver| now >= receiver.deadline) {
 			let received = self.receivers[index].received;
-			let kind = if self.receivers[index].transport.is_some() { ReceivedKind::Failed } else { ReceivedKind::TimedOut };
+			let kind = if self.receivers[index].completed {
+				ReceivedKind::Complete
+			} else if self.receivers[index].transport.is_some() {
+				ReceivedKind::Failed
+			} else {
+				ReceivedKind::TimedOut
+			};
 			self.end_receiver(index, Some(event(kind, received)));
 		}
 	}

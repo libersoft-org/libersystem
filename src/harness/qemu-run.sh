@@ -1247,7 +1247,12 @@ qemu_attach_xhci() {
 			# transfer type the xHCI driver had no code for until the audio class needed it. LEFT OFF when a run
 			# plays a speaker of its own (`USB_QEMU_SPEAKER=off`): the driver binds one sink, and the first.
 			if [[ "${USB_QEMU_SPEAKER:-on}" != off ]]; then
-				arr+=(-device "usb-audio,bus=usb.0,port=1.4,audiodev=snd0")
+				local speaker="usb-audio,bus=usb.0,port=1.4,audiodev=snd0"
+				if [[ -n "${USB_MIC_PCAP:-}" ]]; then
+					speaker+=",pcap=$USB_MIC_PCAP,debug=2"
+					echo "qemu-run: microphone duplex sink capture enabled (usb-audio debug=2)"
+				fi
+				arr+=(-device "$speaker")
 			fi
 			arr+=(
 				-drive "file=$uas,if=none,id=uasdisk,format=raw"

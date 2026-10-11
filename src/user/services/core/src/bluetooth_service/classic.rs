@@ -1718,6 +1718,7 @@ impl Stack {
 		for (channel, happened) in opp_events {
 			self.opp_rfcomm(at, handle, channel, happened);
 		}
+		self.opp_rfcomm_flushed(at, handle);
 	}
 
 	// ONE SDU ON AN ENHANCED RETRANSMISSION CHANNEL: segmented, numbered and kept until the peer acknowledges it.

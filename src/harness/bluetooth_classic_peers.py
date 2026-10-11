@@ -338,6 +338,7 @@ class AudioPeer(Peer):
         self.sco_link = None
         self.hold_sco_accept = False
         self.held_sco_request = None
+        self.sco_only = False
         self.microphone_reference = None
         if not phone:
             self.hf_configuration = hfp.HfConfiguration(
@@ -397,6 +398,7 @@ class AudioPeer(Peer):
         self.observe('a2dp-source-started', codec='AOSP SBC', bytes=len(self.source_data))
 
     async def hfp_connect(self, address, codec):
+        self.sco_only = False
         self.hf_configuration.supported_audio_codecs = [hfp.AudioCodec.CVSD] if codec == 'cvsd' else [hfp.AudioCodec.CVSD, hfp.AudioCodec.MSBC]
         connection = await self.connection(address)
         self.rfcomm_client = rfcomm.Client(connection)
@@ -408,6 +410,7 @@ class AudioPeer(Peer):
         self.spawn(self.hf.run())
 
     async def hsp_connect(self, address):
+        self.sco_only = True
         connection = await self.connection(address)
         channel = await rfcomm.find_rfcomm_channel_with_uuid(connection, core.UUID.from_16_bits(0x1112))
         if channel != 2:
@@ -480,16 +483,20 @@ class AudioPeer(Peer):
     def accept_sco(self, connection, kind):
         codec = self.hf.active_codec
         selection = hfp.DefaultCodecParameters.ESCO_MSBC_T2 if codec == hfp.AudioCodec.MSBC else hfp.DefaultCodecParameters.ESCO_CVSD_S4
-        if kind == hci.HCI_Connection_Complete_Event.LinkType.SCO:
+        if self.sco_only or kind == hci.HCI_Connection_Complete_Event.LinkType.SCO:
             selection = hfp.DefaultCodecParameters.SCO_CVSD_D1
-        parameters = hfp.ESCO_PARAMETERS[selection]
-        self.spawn(self.device.send_async_command(hci.HCI_Enhanced_Accept_Synchronous_Connection_Request_Command(bd_addr=connection.peer_address, **parameters.asdict())))
+        parameters = dict(hfp.ESCO_PARAMETERS[selection].asdict())
+        if self.sco_only:
+            # Bumble's D1 allows HV3 but leaves the inverted EDR bits clear.
+            # Explicitly refuse every eSCO type: this peer really supports only SCO.
+            parameters['packet_type'] |= 0x03c0
+        self.spawn(self.device.send_async_command(hci.HCI_Enhanced_Accept_Synchronous_Connection_Request_Command(bd_addr=connection.peer_address, **parameters)))
 
     def sco_connected(self, link):
         self.sco_link = link
         self.sco_buffer.clear()
         self.sco_frames.clear()
-        self.observe('sco-connected', handle=link.handle, air_mode=int(link.air_mode), codec=int(self.hf.active_codec))
+        self.observe('sco-connected', handle=link.handle, air_mode=int(link.air_mode), codec=int(self.hf.active_codec), link_type=int(link.link_type))
         link.sink = self.sco_data
         link.on('disconnection', lambda reason: self.observe('sco-disconnected', reason=int(reason)))
         self.spawn(self.microphone(link))
@@ -536,7 +543,8 @@ class AudioPeer(Peer):
         msbc = self.hf.active_codec == hfp.AudioCodec.MSBC
         pcm = b''.join(self.oracle.Sbc().decode((16000, 15, 0, 0, 8, 26), self.sco_frames, True)) if msbc else b''.join(self.sco_frames)
         (self.work / f'{self.name}-voice.pcm').write_bytes(pcm)
-        return dict(audio_metrics(pcm, 16000 if msbc else 8000, 1), microphone_reference=self.microphone_reference)
+        return dict(audio_metrics(pcm, 16000 if msbc else 8000, 1), microphone_reference=self.microphone_reference,
+                    link_type=int(self.sco_link.link_type) if self.sco_link is not None else None)
 
     def music_verdict(self):
         frames = []

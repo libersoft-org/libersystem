@@ -198,6 +198,7 @@ async def self_test():
     audio.connections = {connection.handle: connection}
     audio.hold_sco_accept = True
     audio.held_sco_request = None
+    audio.sco_only = False
     audio.sco_request(connection, hci.HCI_Connection_Complete_Event.LinkType.SCO)
     await asyncio.sleep(0)
     assert not sent and audio.held_sco_request[0] is connection
@@ -205,6 +206,15 @@ async def self_test():
     await asyncio.sleep(0)
     assert len(sent) == 1 and isinstance(sent[0], hci.HCI_Enhanced_Accept_Synchronous_Connection_Request_Command)
     assert sent[0].bd_addr == connection.peer_address
+    # HSP restricts the actual acceptance to HV3, including all inverted EDR exclusions.
+    audio.sco_only = True
+    audio.accept_sco(connection, hci.HCI_Connection_Complete_Event.LinkType.ESCO)
+    await asyncio.sleep(0)
+    assert len(sent) == 2 and int(sent[-1].packet_type) == 0x03c4
+    assert int(sent[-1].retransmission_effort) == 0
+    assert int(hfp.ESCO_PARAMETERS[hfp.DefaultCodecParameters.SCO_CVSD_D1].packet_type) == 4
+    audio.sco_only = False
+    sent.pop()
     assert audio.held_sco_request is None and not audio.hold_sco_accept
     audio.hold_sco_accept = True
     audio.sco_request(connection, hci.HCI_Connection_Complete_Event.LinkType.SCO)

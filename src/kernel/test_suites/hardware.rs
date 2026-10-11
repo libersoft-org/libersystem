@@ -2628,7 +2628,7 @@ impl printer_device_proto::codec::Transport for KernelTransport<'_> {
 		self.channel.send(object::channel::Message::new(request.to_vec(), caps)).map_err(|_| TransportError::PeerClosed)?;
 		let give_up = arch::apic::ticks() + self.patience;
 		while arch::apic::ticks() < give_up {
-			sched::run_until_idle();
+			sched::run_until_idle_until(core::cmp::min(give_up, arch::apic::ticks() + 1));
 			match self.channel.recv() {
 				Ok(message) => {
 					for capability in message.caps {
@@ -2652,6 +2652,53 @@ impl printer_device_proto::codec::Transport for KernelTransport<'_> {
 			let _ = self.take(*handle);
 		}
 	}
+}
+
+tagged_test!(kernel_transport_reads_a_ready_reply_without_waiting_for_unrelated_work, [Kernel, Scheduler], id = "kernel.hardware.kernel_transport_reads_a_ready_reply_without_waiting_for_unrelated_work", covers = ["kernel"]);
+fn kernel_transport_reads_a_ready_reply_without_waiting_for_unrelated_work() {
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	use object::channel::{Channel, Message};
+	use printer_device_proto::codec::{Handles, Transport};
+
+	static STOP: AtomicBool = AtomicBool::new(false);
+	static SENT: AtomicBool = AtomicBool::new(false);
+	static ENDED: AtomicBool = AtomicBool::new(false);
+	static BUSY_UNTIL: AtomicU64 = AtomicU64::new(0);
+	const REQUEST: &[u8] = b"finite transport request";
+	const REPLY: &[u8] = b"ready transport reply";
+
+	extern "C" fn responder(arg: u64) {
+		// SAFETY: the caller handed this worker exactly one strong channel reference.
+		let channel = unsafe { alloc::sync::Arc::from_raw(arg as *const Channel) };
+		// The transport sends before it first pumps this core, so the request is already queued here.
+		if channel.recv().is_ok_and(|request| request.bytes == REQUEST && request.caps.is_empty()) && channel.send(Message::new(REPLY.to_vec(), alloc::vec::Vec::new())).is_ok() {
+			SENT.store(true, Ordering::SeqCst);
+			while !STOP.load(Ordering::SeqCst) && arch::apic::ticks() < BUSY_UNTIL.load(Ordering::SeqCst) {
+				core::hint::spin_loop();
+			}
+		}
+		ENDED.store(true, Ordering::SeqCst);
+	}
+
+	let (client, server) = Channel::create();
+	STOP.store(false, Ordering::SeqCst);
+	SENT.store(false, Ordering::SeqCst);
+	ENDED.store(false, Ordering::SeqCst);
+	let worker = sched::spawn(responder, alloc::sync::Arc::into_raw(server) as u64);
+	let fallback = arch::apic::ticks() + 20;
+	BUSY_UNTIL.store(fallback, Ordering::SeqCst);
+	let mut transport = KernelTransport::new(&client, 3);
+	let mut handles = Handles::new();
+	let reply = transport.call(REQUEST, &[], &mut handles, 0);
+	let ended_before_stop = ENDED.load(Ordering::SeqCst);
+	STOP.store(true, Ordering::SeqCst);
+	sched::run_until_idle_until(fallback + 3);
+	assert!(ENDED.load(Ordering::SeqCst), "the finite transport responder was stopped and drained");
+	drop(worker);
+	assert!(SENT.load(Ordering::SeqCst), "the responder received the exact request and queued its reply");
+	assert_eq!(reply.as_deref(), Ok(REPLY), "the actual transport received the queued reply intact");
+	assert!(handles.as_slice().is_empty(), "the reply carried no capabilities");
+	assert!(!ended_before_stop, "a ready reply was consumed while unrelated work stayed runnable, before its finite fallback");
 }
 
 // The documents the printer oracle sends, by the formula `printer-sink.py` checks them against.
@@ -4199,7 +4246,7 @@ fn usb_video_streams_over_isochronous_packets() {
 	let mut dropped_by_device = 0;
 	let give_up = arch::apic::ticks() + patience * 2;
 	while (good.iter().filter(|&&number| number > 3).count() < 4 || dropped_by_device < 2) && arch::apic::ticks() < give_up {
-		sched::run_until_idle();
+		sched::run_until_idle_until(core::cmp::min(give_up, arch::apic::ticks() + 1));
 		let Ok(frame) = events.recv() else { continue };
 		let mut frame_handles = camera_device_proto::codec::Handles::new();
 		match camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("an event decodes") {
@@ -4212,7 +4259,7 @@ fn usb_video_streams_over_isochronous_packets() {
 				assert!(number != 3, "frame 3 carried the device's error bit and was delivered anyway");
 				assert!(bytes[8..].iter().enumerate().all(|(at, &byte)| byte == (((at + 8) as u64 * 7 + number * 13) % 251) as u8), "frame {number} arrived as the device sent it, across its thirteen packets");
 				good.push(number);
-				assert_eq!(client.queue(&1, &done.buffer, &lease), Some(Ok(())), "and its buffer is queued again");
+				assert_eq!(client.queue(&1, &done.buffer, &lease), Some(Ok(())), "and its buffer is queued again; transport={:?}", client.last_error());
 				lease += 1;
 			}
 			camera::CameraDeviceEvent::Dropped(drop) => {
@@ -4240,7 +4287,7 @@ fn usb_video_streams_over_isochronous_packets() {
 	let mut delays: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 	let started = clock_ns();
 	while clock_ns() - started < 2_000_000_000 {
-		sched::run_until_idle();
+		sched::run_until_idle_until(arch::apic::ticks() + 1);
 		most = most.max(driver.memory_bytes());
 		let Ok(frame) = events.recv() else { continue };
 		let taken = clock_ns();
@@ -4265,6 +4312,30 @@ fn usb_video_streams_over_isochronous_packets() {
 	assert_eq!(client.stop(&1), Some(Ok(())), "the stream stops, the camera back at zero bandwidth, every buffer back");
 	assert_eq!(client.queue(&1, &0, &lease), Some(Err(camera::Error::Stale)), "and a stopped stream takes no buffer");
 
+	// Stop returns the mappings, but completions already sent remain in this connection's event channel.
+	// Drain the stopped generation before reusing its buffers, as CameraService separates events by generation.
+	let mut stopped_frames = 0;
+	loop {
+		match events.recv() {
+			Ok(frame) => {
+				let mut frame_handles = camera_device_proto::codec::Handles::new();
+				let generation = match camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("a stopped-stream event decodes") {
+					camera::CameraDeviceEvent::Frame(done) => {
+						assert_eq!(done.valid_bytes as usize, FRAME, "a queued completion still describes a whole frame");
+						stopped_frames += 1;
+						done.stream_generation
+					}
+					camera::CameraDeviceEvent::Dropped(drop) => drop.stream_generation,
+					camera::CameraDeviceEvent::Gap(gap) => gap.stream_generation,
+				};
+				assert_eq!(generation, 1, "only the stopped stream has produced events");
+			}
+			Err(object::channel::ChannelError::Empty) => break,
+			Err(error) => panic!("stopping a stream must leave its event connection open: {error:?}"),
+		}
+	}
+	crate::serial_println!("usb-video-iso: drained {stopped_frames} completed frame(s) of the stopped stream before reusing its buffers");
+
 	// AND AN UNPLUG IN THE MIDDLE OF A STREAM, as on bulk: the second stream's first frame, then the camera gone.
 	let negotiated = client.negotiate(&2, &request).expect("answered").expect("a second stream negotiated");
 	assert_eq!(negotiated.stream_generation, 2);
@@ -4281,7 +4352,7 @@ fn usb_video_streams_over_isochronous_packets() {
 	let give_up = arch::apic::ticks() + patience * 2;
 	let closed = loop {
 		assert!(arch::apic::ticks() < give_up, "the camera leaving did not end the event stream; frames of the second stream: {second:?}");
-		sched::run_until_idle();
+		sched::run_until_idle_until(core::cmp::min(give_up, arch::apic::ticks() + 1));
 		match events.recv() {
 			Ok(frame) => {
 				let mut frame_handles = camera_device_proto::codec::Handles::new();
@@ -4515,90 +4586,98 @@ fn usb_audio_capture_delivers_the_microphones_frames_in_order() {
 	// period in between, which must still reach QEMU's speaker through the same provider; it stops asking long
 	// enough to overrun the driver's FIFO, which must END the capture with the wire's refusal; and a stop and a
 	// new capture must start again.
-	use object::channel::{Channel, Message};
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::channel::Channel;
 
 	let asked = option_env!("USB_GADGET").unwrap_or("");
 	if asked != "mic" {
 		crate::serial_println!("usb-audio-capture: NOT RUN - no microphone on this run; play one with USB_GADGET=mic");
 		return;
 	}
-	#[cfg(target_arch = "x86_64")]
-	let patience: u64 = 1000;
-	#[cfg(not(target_arch = "x86_64"))]
-	let patience: u64 = 1000 * 13;
-	const PERIOD: usize = driver_protocol::audio::PERIOD_BYTES as usize;
+	static DONE: AtomicBool = AtomicBool::new(false);
+
+	// Capture is consumed by a scheduled thread, just like the playback feeders:
+	// its next request is woken by the reply instead of waiting for a bootstrap drain.
+	extern "C" fn consumer(arg: u64) {
+		// SAFETY: this is the one strong reference transferred by Arc::into_raw below.
+		let pcm = unsafe { alloc::sync::Arc::from_raw(arg as *const Channel) };
+		let koid = crate::object::KernelObject::header(&*pcm).koid();
+		let patience = PCM_PATIENCE;
+		const PERIOD: usize = driver_protocol::audio::PERIOD_BYTES as usize;
+		let ask = |bytes| pcm_ask(&pcm, bytes).expect("the provider did not answer within the patience");
+		// EVERY PERIOD WHOLE, EVERY FRAME ITS OWN COMPLEMENT ON THE RIGHT, AND EACH FRAME THE ONE AFTER THE LAST.
+		let mut expected: Option<u16> = None;
+		let check = |expected: &mut Option<u16>, period: &[u8], what: &str| {
+			assert_eq!(period.len(), PERIOD, "{what}: a captured period is exactly one period");
+			for (at, frame) in period.chunks_exact(4).enumerate() {
+				let left = u16::from_le_bytes([frame[0], frame[1]]);
+				let right = u16::from_le_bytes([frame[2], frame[3]]);
+				assert_eq!(right, left ^ 0xffff, "{what}: frame {at} is the microphone's own, right the complement of left");
+				if let Some(next) = *expected {
+					assert_eq!(left, next, "{what}: frame {at} continues the stream, nothing lost and nothing repeated");
+				}
+				*expected = Some(left.wrapping_add(1));
+			}
+		};
+
+		// THE FIRST PERIOD, once the microphone is on the bus - until then the provider has no source and refuses.
+		let give_up = arch::apic::ticks() + patience * 2;
+		let first = loop {
+			let reply = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+			if !reply.is_empty() {
+				break reply;
+			}
+			assert!(arch::apic::ticks() < give_up, "the controller never captured from the microphone");
+			let retry = arch::apic::ticks().saturating_add(20);
+			while arch::apic::ticks() < retry {
+				sched::block_on(koid, retry);
+			}
+		};
+		check(&mut expected, &first, "the first period");
+		for n in 0..6 {
+			let period = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+			check(&mut expected, &period, if n == 0 { "the second period" } else { "a later period" });
+		}
+		// ONE PROVIDER, BOTH DIRECTIONS: a period played now goes to QEMU's speaker, and the capture's transfers that
+		// complete while it plays are kept and not lost.
+		// One distinctive period, checked independently at QEMU's USB sink by the harness.
+		assert_eq!(ask(pcm_period(99)), driver_protocol::audio::OK, "the speaker took a period through the provider that is capturing");
+		assert_eq!(ask(alloc::vec::Vec::new()), driver_protocol::audio::OK, "ending playback flushes the single primed period");
+		let after = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+		check(&mut expected, &after, "the period after the playback");
+
+		// AN OVERRUN ENDS THE CAPTURE. Nobody asks for long enough to fill the driver's eight periods, and the next
+		// request is refused - and stays refused until the capture is stopped.
+		// The worker is blocked for the same clock-bounded pause, without asking for samples.
+		let until = arch::apic::ticks().saturating_add(60);
+		while arch::apic::ticks() < until {
+			sched::block_on(koid, until);
+		}
+		assert!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]).is_empty(), "a capture that overran is ended, and says so with the wire's refusal");
+		assert!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]).is_empty(), "and stays ended until it is stopped");
+		assert_eq!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP]), driver_protocol::audio::OK, "the stop is acknowledged");
+
+		// A NEW CAPTURE STARTS AGAIN, from wherever the microphone's counter is now.
+		expected = None;
+		let fresh = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+		check(&mut expected, &fresh, "the first period of a new capture");
+		let next = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+		check(&mut expected, &next, "the second period of a new capture");
+		assert_eq!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP]), driver_protocol::audio::OK);
+
+		DONE.store(true, Ordering::SeqCst);
+	}
 
 	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
 	let audio_token = offer_token_of(&offers, driver_protocol::provider::AUDIO).expect("a controller with an audio device on it publishes its PCM provider");
 	let (pcm, driver_end) = Channel::create();
 	send_connect(&kernel_ep, generation, audio_token, driver_end).expect("the audio CONNECT should send");
 	sched::run_until_idle();
-	let ask = |bytes: alloc::vec::Vec<u8>| -> alloc::vec::Vec<u8> {
-		pcm.send(Message::new(bytes, alloc::vec::Vec::new())).expect("the request should send");
-		let give_up = arch::apic::ticks() + patience;
-		loop {
-			sched::run_until_idle();
-			if let Ok(reply) = pcm.recv() {
-				return reply.bytes;
-			}
-			assert!(arch::apic::ticks() < give_up, "the provider did not answer within the patience");
-		}
-	};
-	// EVERY PERIOD WHOLE, EVERY FRAME ITS OWN COMPLEMENT ON THE RIGHT, AND EACH FRAME THE ONE AFTER THE LAST.
-	let mut expected: Option<u16> = None;
-	let check = |expected: &mut Option<u16>, period: &[u8], what: &str| {
-		assert_eq!(period.len(), PERIOD, "{what}: a captured period is exactly one period");
-		for (at, frame) in period.chunks_exact(4).enumerate() {
-			let left = u16::from_le_bytes([frame[0], frame[1]]);
-			let right = u16::from_le_bytes([frame[2], frame[3]]);
-			assert_eq!(right, left ^ 0xffff, "{what}: frame {at} is the microphone's own, right the complement of left");
-			if let Some(next) = *expected {
-				assert_eq!(left, next, "{what}: frame {at} continues the stream, nothing lost and nothing repeated");
-			}
-			*expected = Some(left.wrapping_add(1));
-		}
-	};
-
-	// THE FIRST PERIOD, once the microphone is on the bus - until then the provider has no source and refuses.
-	let give_up = arch::apic::ticks() + patience * 2;
-	let first = loop {
-		let reply = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
-		if !reply.is_empty() {
-			break reply;
-		}
-		assert!(arch::apic::ticks() < give_up, "the controller never captured from the microphone");
-		sched::run_until_idle_until(arch::apic::ticks().saturating_add(20));
-	};
-	check(&mut expected, &first, "the first period");
-	for n in 0..6 {
-		let period = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
-		check(&mut expected, &period, if n == 0 { "the second period" } else { "a later period" });
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(consumer, alloc::sync::Arc::into_raw(pcm.clone()) as u64);
+	while !DONE.load(Ordering::SeqCst) {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(10));
 	}
-	// ONE PROVIDER, BOTH DIRECTIONS: a period played now goes to QEMU's speaker, and the capture's transfers that
-	// complete while it plays are kept and not lost.
-	let silence = alloc::vec![0u8; PERIOD];
-	assert_eq!(ask(silence), driver_protocol::audio::OK, "the speaker took a period through the provider that is capturing");
-	let after = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
-	check(&mut expected, &after, "the period after the playback");
-
-	// AN OVERRUN ENDS THE CAPTURE. Nobody asks for long enough to fill the driver's eight periods, and the next
-	// request is refused - and stays refused until the capture is stopped.
-	// A DRAIN RETURNS AS SOON AS NOTHING IS RUNNABLE, so the pause is the clock's and not one call's.
-	let until = arch::apic::ticks().saturating_add(60);
-	while arch::apic::ticks() < until {
-		sched::run_until_idle_until(until);
-	}
-	assert!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]).is_empty(), "a capture that overran is ended, and says so with the wire's refusal");
-	assert!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]).is_empty(), "and stays ended until it is stopped");
-	assert_eq!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP]), driver_protocol::audio::OK, "the stop is acknowledged");
-
-	// A NEW CAPTURE STARTS AGAIN, from wherever the microphone's counter is now.
-	expected = None;
-	let fresh = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
-	check(&mut expected, &fresh, "the first period of a new capture");
-	let next = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
-	check(&mut expected, &next, "the second period of a new capture");
-	assert_eq!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP]), driver_protocol::audio::OK);
 
 	crate::serial_println!("usb-audio-capture: eight periods of the microphone's frames arrived whole and in order around a period played, an overrun ended the capture with the refusal, and a new capture started");
 	driver.terminate();

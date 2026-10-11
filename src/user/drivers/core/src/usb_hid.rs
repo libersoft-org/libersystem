@@ -440,7 +440,10 @@ fn push_decimal(out: &mut Vec<u8>, value: u32) {
 
 // Post an interface's next input-report TRB (sized by its layout, into its own report page) and ring its
 // doorbell.
-fn post_report(hc: &Xhci, dev: &UsbDevice, h: &mut Hid) {
+fn post_report(hc: &mut Xhci, dev: &UsbDevice, h: &mut Hid) {
+	if !hc.hid_rx.contains(&(dev.slot, h.dci)) {
+		hc.hid_rx.push((dev.slot, h.dci));
+	}
 	unsafe {
 		h.ring.push(h.page.phys, h.layout.report_bytes(), TRB_NORMAL << 10 | TRB_IOC);
 		w32(hc.db + dev.slot as u64 * 4, h.dci);
@@ -450,7 +453,7 @@ fn post_report(hc: &Xhci, dev: &UsbDevice, h: &mut Hid) {
 
 // Post the first report TRB of every HID interface that is not serving yet (at the service loop's start, and
 // after a runtime attach).
-pub fn post_reports(hc: &Xhci, hids: &mut Hids) {
+pub fn post_reports(hc: &mut Xhci, hids: &mut Hids) {
 	for (dev, interfaces) in hids.entries.iter_mut() {
 		for h in interfaces.iter_mut().filter(|h| !h.posted) {
 			post_report(hc, dev, h);
@@ -470,8 +473,14 @@ pub fn handle_hid_event(hc: &mut Xhci, hids: &mut Hids, status: u32, control: u3
 			return;
 		}
 		let (slot, dci) = (control >> 24, control >> 16 & 0x1f);
-		let Some(i) = hids.entries.iter().position(|(dev, _)| dev.slot == slot) else { return };
-		let Some(j) = hids.entries[i].1.iter().position(|h| h.dci == dci) else { return };
+		let Some(i) = hids.entries.iter().position(|(dev, _)| dev.slot == slot) else {
+			crate::keep_hid(hc, status, control);
+			return;
+		};
+		let Some(j) = hids.entries[i].1.iter().position(|h| h.dci == dci) else {
+			crate::keep_hid(hc, status, control);
+			return;
+		};
 		if code == CC_STALL {
 			// the endpoint is halted (no reports can be in flight on it), so the recovery's own waits run
 			// against the other devices only - and the gamepad publication, which a report reaped meanwhile

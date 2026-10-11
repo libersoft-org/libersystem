@@ -44,6 +44,12 @@ fi
 # object compiled from a previous run's mutation. See `restore` below for why this is not paranoia.
 find "$WORK/src" -name '*.rs' -exec touch {} +
 
+# The xHCI binary has no Cargo host harness. Exercise its actual event waits and consumers
+# against memory-backed rings, including named retention/drain mutations, on this same copy.
+xhci_work="$(mktemp -d "$WORK/xhci-event-retention.XXXXXX")"
+python3 "$REPO/src/tools/xhci_event_retention.py" --root "$WORK" --candidate-tree "$WORK" --output "$xhci_work/proof" --run
+python3 "$REPO/src/tools/check-usb-audio-pcap.py" --self-test
+
 # The unmutated copy must PASS first. A copy that cannot pass is a gate whose every mutation "fails"
 # for a reason that has nothing to do with the mutation, which is the shape of a check that tests
 # nothing while reporting success.

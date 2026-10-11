@@ -481,6 +481,14 @@ struct Xhci {
 	// nothing re-posts until the stashed one is drained.
 	net_rx: Option<(u32, u32)>,
 	net_pending: Option<(u32, u32)>,
+	// The notification pipe has its own standing transfer, independent of the frame receive.
+	// Keep its completion too: only consuming it clears Notify::posted and schedules the next read.
+	net_notify_rx: Option<(u32, u32)>,
+	net_notify_pending: Option<(u32, u32)>,
+	// Reports which a wait without the owning Hids set cannot handle inline. Each registered
+	// interface has one standing report and cannot post another until this completion is consumed.
+	hid_rx: Vec<(u32, u32)>,
+	hid_pending: Vec<(u32, u32)>,
 	// AND THE SERIAL ADAPTER'S, WHICH HAD THE SAME HOLE AND LOST THE SAME WAY. Its standing receive
 	// completes on its own endpoint, and a completion that landed during a synchronous wait - which
 	// is exactly when it lands, because the echo of a write comes back while `transmit` is still
@@ -981,7 +989,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: Vec::new(), audio_pending: Vec::new(), redo_port: None })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, net_notify_rx: None, net_notify_pending: None, hid_rx: Vec::new(), hid_pending: Vec::new(), serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: Vec::new(), audio_pending: Vec::new(), redo_port: None })
 	}
 }
 
@@ -1226,7 +1234,7 @@ fn wait_event(hc: &mut Xhci, wanted: u32) -> Option<(u64, u32, u32)> {
 				}
 				// A STANDING TRANSFER COMPLETING DURING A COMMAND IS NOT THE COMMAND FAILING: it is kept for the
 				// loop, which is what a class device plugged in beside a busy one needs.
-				if keep_stray(hc, param, status, control) {
+				if keep_stray(hc, param, status, control) || keep_hid(hc, status, control) {
 					continue;
 				}
 				if kind != TRB_EV_PORT_STATUS {
@@ -1457,6 +1465,7 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			let _ = hc.budget.admit(ClassKind::Network);
 			slots.set_kind(dev.slot, KIND_NETWORK);
 			hc.net_rx = Some((dev.slot, net.receive_endpoint()));
+			hc.net_notify_rx = net.notify_endpoint().map(|dci| (dev.slot, dci));
 			*network = Some((dev, net));
 		} else if uas.is_none()
 			&& admits(hc, ClassKind::Uas, dev.class)
@@ -2017,6 +2026,19 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			// and last the retry, ARMED EVERY PASS: a tick away while a gamepad frame is owed, at the notification
 			// read's interval while one waits for it, and never otherwise, because a timer stays expired until it is
 			// armed again.
+			// These waits may already have consumed the interrupt that carried a report or notification.
+			// Finish them before sleeping, including notifications reaped by HID stall recovery.
+			drain_hid_pending(hc, &mut hids);
+			if let Some((status, control)) = hc.net_notify_pending.take()
+				&& let Some((dev, net)) = network.as_mut()
+			{
+				handle_net_notification(hc, dev, net, status, control);
+			}
+			// HID stall recovery can fill a stash whose drain above already ran. Its interrupt
+			// was consumed by that wait, so run the next drain pass without waiting for another.
+			if hc.net_pending.is_some() || hc.serial_pending.iter().any(Option::is_some) || !hc.class_pending.is_empty() || !hc.audio_pending.is_empty() || !hc.hid_pending.is_empty() || hc.net_notify_pending.is_some() {
+				continue;
+			}
 			hids.pads.flush();
 			let owed = hids.pads.owes();
 			let renote = network.as_ref().and_then(|(_, net)| notification_due(net));
@@ -2061,6 +2083,25 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				}
 				continue;
 			}
+			// A READY PERIOD HAS ROOM RESERVED BY THE PREVIOUS PLAY REPLY. Take it before
+			// completions refill the standing packets, or those refills may pad with silence
+			// while the sound is already waiting on this channel. Other commands retain their
+			// order after the event drain, including stats, capture, end and consumer closure.
+			let mut played_audio = false;
+			if let common::ProviderReady::Consumer(at) = ready
+				&& serving.token_at(at) == 5
+				&& channel_peek(serving.at(at)) == i64::from(audio::PERIOD_BYTES)
+			{
+				let server = serving.at(at);
+				let mut period = [0u8; audio::PERIOD_BYTES as usize];
+				if let Polled::Message { len, handle } = try_recv(server, &mut period) {
+					if handle != 0 {
+						close(handle);
+					}
+					usb_audio::play(hc, &mut audio, server, &period[..len]);
+					played_audio = true;
+				}
+			}
 			// THE WAKE IS ACKNOWLEDGED BEFORE THE RING IS READ, AND NEVER AFTER IT (corrected 2026-09-25).
 			//
 			// Acknowledging clears the interrupt object's signal. Done after the drain, as it was, it cleared
@@ -2086,7 +2127,10 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			if let Some((_, target)) = uas.as_mut() {
 				usb_uas::expire(target);
 			}
-			while let Some((pointer, status, control)) = take_event(hc) {
+			// A continuously replenished streaming ring must not postpone an already selected request forever.
+			// Consume at most one ring per pass; the final ERDP/EHB write rearms any remaining events.
+			for _ in 0..RING_TRBS {
+				let Some((pointer, status, control)) = take_event(hc) else { break };
 				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
 					rescan = true;
 					continue;
@@ -2104,37 +2148,9 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				// the driver configured and never read from is one the device eventually cannot
 				// write to, and a link transition is the one thing the frame pipe cannot say: from
 				// there, a cable nobody plugged in and a quiet network are the same silence.
-				if control >> 10 & 0x3f == TRB_EV_TRANSFER
-					&& let Some((dev, net)) = network.as_mut()
-					&& net.notify_endpoint() == Some(control >> 16 & 0x1f)
-					&& control >> 24 == dev.slot
+				if let Some((dev, net)) = network.as_mut()
+					&& handle_net_notification(hc, dev, net, status, control)
 				{
-					let arrived = NOTIFY_WINDOW.saturating_sub((status & 0x00ff_ffff) as usize);
-					if let Some(said) = handle_notification(net, arrived) {
-						match said {
-							drivers::cdc::Notification::Link { up } => {
-								print(if up {
-									b"driver.xhci: the CDC adapter reports its link is up
-"
-									.as_slice()
-								} else {
-									b"driver.xhci: the CDC adapter reports its link is down
-"
-									.as_slice()
-								});
-							}
-							// SAID AND NOT ACTED ON. What a speed change means to a stack is a
-							// policy this driver does not own, and a notification it does not know
-							// is not a link change - reporting either as one would be a log that
-							// reads like a flapping cable.
-							drivers::cdc::Notification::Speed { .. } => print(
-								b"driver.xhci: the CDC adapter reports a link speed change
-",
-							),
-							_ => {}
-						}
-					}
-					post_notification(hc, dev, net);
 					continue;
 				}
 				// THE NETWORK EVENT IS OFFERED THE EVENT FIRST AND THE HID PATH SECOND, and each
@@ -2168,9 +2184,19 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				if taken {
 					continue;
 				}
-				// THE AUDIO SOURCE'S STANDING CAPTURE.
-				if control >> 10 & 0x3f == TRB_EV_TRANSFER && usb_audio::absorb(hc, &mut audio, pointer, status, control) {
-					continue;
+				// A credited period can arrive after wake selection or during this event batch.
+				// Take only that full PCM head before a sink completion refills standing packets.
+				if control >> 10 & 0x3f == TRB_EV_TRANSFER {
+					let server = serving.first_for(5);
+					if usb_audio::play_before_refill(hc, &mut audio, server, control)
+						&& let common::ProviderReady::Consumer(at) = ready
+						&& serving.at(at) == server
+					{
+						played_audio = true;
+					}
+					if usb_audio::absorb(hc, &mut audio, pointer, status, control) {
+						continue;
+					}
 				}
 				// AND THE CLASS MODULES', each answering only for its own pipes.
 				if classes.absorb(hc, &mut hids, pointer, status, control) {
@@ -2229,6 +2255,9 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				&& index > 0
 			{
 				classes.ready(hc, &mut hids, waiting[index]);
+			}
+			if played_audio {
+				continue;
 			}
 			let common::ProviderReady::Consumer(at) = ready else { continue };
 			let server = serving.at(at);
@@ -2517,6 +2546,9 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		// did - leaks three pages per attach on a port somebody plugs and unplugs.
 		let Hids { entries, pads } = hids;
 		for (dev, interfaces) in entries.iter_mut().filter(|(dev, _)| dev.port == port) {
+			// Stop retaining this generation before releasing pages or waiting for Disable Slot.
+			hc.hid_rx.retain(|&(slot, _)| slot != dev.slot);
+			hc.hid_pending.retain(|&(_, control)| control >> 24 != dev.slot);
 			// EVERY GAMEPAD OF EVERY INTERFACE DEPARTS FIRST, before its rings and pages are released: the
 			// detach used to release the device and tell nobody.
 			depart(pads, interfaces);
@@ -2549,6 +2581,8 @@ unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids,
 		if let Some((dev, net)) = network.as_mut()
 			&& dev.port == port
 		{
+			hc.net_notify_rx = None;
+			hc.net_notify_pending = None;
 			net.release();
 			dev.release(hc);
 			hc.budget.release(ClassKind::Network);
@@ -2671,6 +2705,10 @@ fn keep_stray(hc: &mut Xhci, pointer: u64, status: u32, control: u32) -> bool {
 		return false;
 	}
 	let owner = (control >> 24, control >> 16 & 0x1f);
+	if hc.net_notify_rx == Some(owner) && hc.net_notify_pending.is_none() {
+		hc.net_notify_pending = Some((status, control));
+		return true;
+	}
 	// A COMPLETION FOR THE ADAPTER'S RECEIVE ENDPOINT IS KEPT AND NOT OFFERED TO THE HID PATH, which does not
 	// answer for it. See `Xhci::net_pending`.
 	if hc.net_rx == Some(owner) && hc.net_pending.is_none() {
@@ -2695,6 +2733,50 @@ fn keep_stray(hc: &mut Xhci, pointer: u64, status: u32, control: u32) -> bool {
 		return true;
 	}
 	classes::keep(hc, pointer, status, control)
+}
+
+// Keep only a registered HID report which this wait cannot handle inline. The report page remains
+// untouched until its owner consumes it and posts the next transfer; one entry per owner is enough.
+fn keep_hid(hc: &mut Xhci, status: u32, control: u32) -> bool {
+	if control >> 10 & 0x3f != TRB_EV_TRANSFER {
+		return false;
+	}
+	let owner = (control >> 24, control >> 16 & 0x1f);
+	if !hc.hid_rx.contains(&owner) {
+		return false;
+	}
+	if !hc.hid_pending.iter().any(|&(_, kept)| (kept >> 24, kept >> 16 & 0x1f) == owner) {
+		hc.hid_pending.push((status, control));
+	}
+	true
+}
+
+// The service loop owns the complete live Hids set. Detach this batch before handling it: stall
+// recovery can itself wait synchronously and retain reports for the next loop pass.
+fn drain_hid_pending(hc: &mut Xhci, hids: &mut Hids) {
+	for (status, control) in core::mem::take(&mut hc.hid_pending) {
+		handle_hid_event(hc, hids, status, control);
+	}
+}
+
+// The same notification consumer is used for a hardware-ring event and one a synchronous wait kept.
+fn handle_net_notification(hc: &Xhci, dev: &UsbDevice, net: &mut Net, status: u32, control: u32) -> bool {
+	if control >> 10 & 0x3f != TRB_EV_TRANSFER || net.notify_endpoint() != Some(control >> 16 & 0x1f) || control >> 24 != dev.slot {
+		return false;
+	}
+	let arrived = NOTIFY_WINDOW.saturating_sub((status & 0x00ff_ffff) as usize);
+	if let Some(said) = handle_notification(net, arrived) {
+		match said {
+			drivers::cdc::Notification::Link { up } => {
+				print(if up { b"driver.xhci: the CDC adapter reports its link is up\n".as_slice() } else { b"driver.xhci: the CDC adapter reports its link is down\n".as_slice() });
+			}
+			// A speed report is diagnostic, not a link transition.
+			drivers::cdc::Notification::Speed { .. } => print(b"driver.xhci: the CDC adapter reports a link speed change\n"),
+			_ => {}
+		}
+	}
+	post_notification(hc, dev, net);
+	true
 }
 
 // Wait for a transfer event on the given slot/endpoint, servicing HID events

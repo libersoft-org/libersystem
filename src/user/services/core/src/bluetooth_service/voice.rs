@@ -30,7 +30,7 @@ const CAPTURE_HOLD_MS: usize = 100;
 // The voice setting: CVSD's 16-bit linear input, and transparent data for mSBC.
 const VOICE_CVSD: u16 = 0x0060;
 const VOICE_TRANSPARENT: u16 = 0x0063;
-// EV3 alone, the EDR types barred: what both of the codecs' settings run on.
+// The eSCO base mask: EV3 allowed, the EDR types barred. CVSD also permits legacy HV packets below.
 const PACKET_TYPES: u16 = 0x0008 | 0x03c0;
 // The samples one mSBC frame carries: 7.5 ms at 16 kHz.
 const MSBC_SAMPLES: usize = 120;
@@ -216,8 +216,10 @@ impl Stack {
 			return;
 		}
 		voice.setting_up = true;
-		let (latency, setting) = if voice.msbc() { (13, VOICE_TRANSPARENT) } else { (12, VOICE_CVSD) };
-		self.controllers[at].command(hci_bredr::opcode::SETUP_SYNCHRONOUS_CONNECTION, &hci_bredr::setup_synchronous(handle, latency, setting, 2, PACKET_TYPES));
+		// CVSD also permits legacy SCO; the controller prefers eSCO where the peer supports it.
+		// Don't-care retransmission permits a SCO-only peer's no-retransmission setting.
+		let (latency, setting, retransmission, packets) = if voice.msbc() { (13, VOICE_TRANSPARENT, 2, PACKET_TYPES) } else { (12, VOICE_CVSD, 0xff, PACKET_TYPES | 0x0007) };
+		self.controllers[at].command(hci_bredr::opcode::SETUP_SYNCHRONOUS_CONNECTION, &hci_bredr::setup_synchronous(handle, latency, setting, retransmission, packets));
 	}
 
 	// THE SESSION CLOSED IT: the synchronous link goes down, and the headset may not ask for one.
