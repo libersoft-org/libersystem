@@ -2141,6 +2141,11 @@ impl Stack {
 			// bytes are freed next, and `buf` is reused for every message after this one.
 			scrub(&mut packet.bytes);
 			scrub(&mut buf[..len]);
+			// A SCO reply waits for its last USB interval. Yield after one so PCM and call requests can
+			// replenish the voice queue even while the controller keeps delivering packets.
+			if matches!(packet.kind, HciPacketKind::Sco) {
+				return true;
+			}
 		}
 	}
 
@@ -2297,6 +2302,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if subscribed {
 			waitset.push(subscription);
 		}
+		waitset.extend(clients.iter().map(|client| client.chan));
+		// The subscriber sends no requests here; its closure ends all of its PCM ownership.
+		if stack.audio.subscriber != 0 {
+			waitset.push(stack.audio.subscriber);
+		}
+		// THE OPENED ENDPOINTS' CHANNELS, each read only while it holds no unanswered request.
+		waitset.extend(stack.audio.pcm.iter().filter(|pcm| !pcm.holding()).map(|pcm| pcm.chan));
+		// Ready PCM and control requests get their turn before the next clock-paced SCO packet.
 		for controller in &stack.controllers {
 			waitset.push(controller.packets);
 			waitset.push(controller.control);
@@ -2306,13 +2319,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waitset.push(controller.bredr_state.watcher);
 			}
 		}
-		waitset.extend(clients.iter().map(|client| client.chan));
-		// The subscriber sends no requests here; its closure ends all of its PCM ownership.
-		if stack.audio.subscriber != 0 {
-			waitset.push(stack.audio.subscriber);
-		}
-		// THE OPENED ENDPOINTS' CHANNELS, each read only while it holds no unanswered request.
-		waitset.extend(stack.audio.pcm.iter().filter(|pcm| !pcm.holding()).map(|pcm| pcm.chan));
 		let deadline = [stack.pcm_deadline(), stack.serial_deadline(), stack.opp_deadline(), stack.broadcast_deadline(), stack.le_audio_deadline(), stack.gatt_deadline()].into_iter().flatten().fold(stack.next_deadline(), u64::min);
 		let ready = wait_any(&waitset, deadline);
 		stack.run_timers();

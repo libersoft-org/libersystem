@@ -673,7 +673,14 @@ impl Stack {
 		self.controllers[at].bredr_state.wants.retain(|(held, _)| *held != peer);
 		for want in wanted {
 			match want {
-				Want::Profile(profile) => self.start_profile(at, handle, profile),
+				Want::Profile(profile) => {
+					if profile == Profile::Input
+						&& let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut())
+					{
+						classic.hid.outgoing = true;
+					}
+					self.start_profile(at, handle, profile);
+				}
 				Want::Push => self.start_push_search(at, handle),
 			}
 		}
@@ -1450,25 +1457,32 @@ impl Stack {
 		}
 	}
 
+	// Either HID channel ending retires the whole input device. Drop its decoder too: a later
+	// open-input must not replay stale arrivals, and reconnect must read the descriptor afresh.
+	fn hid_channel_closed(&mut self, at: usize, handle: u16, cid: u16) {
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
+		let Some(classic) = link.classic.as_mut() else { return };
+		if classic.hid.control != Some(cid) && classic.hid.interrupt != Some(cid) {
+			return;
+		}
+		let other = if classic.hid.control == Some(cid) { classic.hid.interrupt } else { classic.hid.control };
+		// A descriptor answer already in flight cannot bring the retired device back.
+		let search = if classic.sdp_client.as_ref().is_some_and(|client| client.purpose == Purpose::Profile(Profile::Input)) { classic.sdp_client.take().map(|client| client.cid) } else { None };
+		classic.hid = Hid::default();
+		classic.profiles = classic.profiles.with(bt_policy::Profile::Input, false);
+		release_streams(link);
+		link.decoder = None;
+		for channel in [other, search].into_iter().flatten() {
+			self.close_channel(at, handle, channel);
+		}
+	}
+
 	fn channel_closed(&mut self, at: usize, handle: u16, cid: u16) {
+		self.hid_channel_closed(at, handle, cid);
 		self.a2dp_channel_closed(at, handle, cid);
 		self.opp_l2cap_closed(at, handle, cid);
 		self.pan_closed(at, handle, cid);
 		let Some(link) = self.controllers[at].link_mut(handle) else { return };
-		// THE INTERRUPT CHANNEL GOING ENDS THE DEVICE'S INPUT: what it held is let go on its streams.
-		if link.classic.as_ref().is_some_and(|classic| classic.hid.interrupt == Some(cid) || classic.hid.control == Some(cid)) {
-			let releases = link.decoder.as_mut().map(input::Decoder::releases).unwrap_or_default();
-			deliver(link, &releases);
-			if let Some(classic) = link.classic.as_mut() {
-				if classic.hid.interrupt == Some(cid) {
-					classic.hid.interrupt = None;
-				}
-				if classic.hid.control == Some(cid) {
-					classic.hid.control = None;
-				}
-				classic.profiles = classic.profiles.with(bt_policy::Profile::Input, false);
-			}
-		}
 		let Some(classic) = link.classic.as_mut() else { return };
 		classic.ertm.retain(|(held, _)| *held != cid);
 		if classic.sdp_client.as_ref().is_some_and(|client| client.cid == cid) {
@@ -1763,9 +1777,18 @@ impl Stack {
 		if profile == Profile::Pan {
 			return self.disconnect_pan(at, peer);
 		}
+		if profile == Profile::Audio {
+			return self.disconnect_a2dp(at, peer);
+		}
 		let controller = &mut self.controllers[at];
 		let Some(handle) = controller.link_to(peer).map(|link| link.handle) else { return Err(Error::NotFound) };
 		let Some(classic) = controller.link_mut(handle).and_then(|link| link.classic.as_mut()) else { return Err(Error::Unsupported) };
+		if profile == Profile::Input {
+			let cid = classic.hid.control.or(classic.hid.interrupt).ok_or(Error::NotFound)?;
+			self.close_channel(at, handle, cid);
+			self.hid_channel_closed(at, handle, cid);
+			return Ok(());
+		}
 		let Some(rfcomm) = classic.rfcomm.as_mut() else { return Err(Error::NotFound) };
 		let Some(&(server_channel, _)) = rfcomm.open.iter().find(|(_, held)| *held == profile) else { return Err(Error::NotFound) };
 		let outs = rfcomm.session.disconnect(server_channel);

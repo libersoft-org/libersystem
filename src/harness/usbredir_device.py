@@ -47,8 +47,9 @@ THE DEVICES, chosen with `--emulate`:
               interface 1's alternates 1-5 carry isochronous IN 0x83 and OUT 0x03 of 9, 17, 25, 33 and 49 bytes, and
               every SCO packet that arrives on the OUT pipe goes back out on the IN pipe in pieces of the setting's
               size - except one on handle 0xffe, whose second piece goes back LOST (an error status, no data).
-  bt-bridge   the same USB interfaces, forwarding HCI commands/events, ACL, SCO and ISO to an independent
-              RootCanal controller over H4 TCP (--hci HOST:PORT). It synthesizes no HCI response or peer data.
+  bt-bridge   those USB interfaces plus wideband voice alternate 6 (63 bytes), forwarding HCI commands/events,
+              ACL, SCO and ISO to an independent RootCanal controller over H4 TCP (--hci HOST:PORT). It
+              synthesizes no HCI response or peer data.
   midi2       a USB MIDI 2.0 device: its MIDI 1.0 face on alternate 0 (bulk 0x01 and 0x81, two cables each way, packets
               looped back) and its UMP face on alternate 1 (the same endpoints, words looped back), two Group Terminal
               Blocks over four groups - "Keys" on groups 0-1 and "Pads" on 2-3, both ways - read with GET_DESCRIPTOR,
@@ -535,6 +536,8 @@ class BtBridge(BtSco):
     """USB framing only; RootCanal owns the controller and every HCI response."""
 
     name = "bt-bridge"
+    # HFP mSBC uses alternate 6; keep the bt-sco narrowband fixture unchanged.
+    SIZES = (*BtSco.SIZES, 63)
     strings = {1: "LiberSystem harness", 2: "RootCanal HCI bridge", 3: "LIBERBTBRIDGE"}
 
     def __init__(self, endpoint):

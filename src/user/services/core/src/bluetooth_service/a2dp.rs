@@ -21,6 +21,7 @@ use proto::system::{AudioEndpoint, AudioEndpointKind};
 use service_logic::audio_routing::TimerPacer;
 use service_logic::avdtp::{self, Kind, Message, Role, Sbc, signal};
 use service_logic::avrcp::{self, Frame, Operation, ctype, pdu};
+use service_logic::bt_policy;
 use service_logic::l2cap_bredr::psm;
 use service_logic::sbc;
 
@@ -217,8 +218,9 @@ impl Stack {
 		let name = self.controllers[at].bredr_state.name_of(&peer).unwrap_or_default();
 		let endpoint = AudioEndpoint { id: 0, peer: peer_to_wire(&peer), name, kind: if outgoing { AudioEndpointKind::Output } else { AudioEndpointKind::Route }, rate: config.frequency, channels: config.mode.channels() as u8, latency_us, hardware_volume, volume };
 		let Some(id) = self.audio.offer(endpoint, at, handle) else { return };
-		if let Some(a2dp) = self.a2dp(at, handle) {
-			a2dp.endpoint = Some(id);
+		if let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()) {
+			classic.a2dp.endpoint = Some(id);
+			classic.profiles = classic.profiles.with(bt_policy::Profile::Audio, true);
 		}
 		print(b"BluetoothService: an A2DP stream is offered to AudioService\n");
 	}
@@ -235,7 +237,8 @@ impl Stack {
 	}
 
 	pub(crate) fn a2dp_channel_closed(&mut self, at: usize, handle: u16, cid: u16) {
-		let Some(a2dp) = self.a2dp(at, handle) else { return };
+		let Some(classic) = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()) else { return };
+		let a2dp = &mut classic.a2dp;
 		if a2dp.avctp == Some(cid) {
 			a2dp.avctp = None;
 			return;
@@ -246,6 +249,7 @@ impl Stack {
 			let endpoint = a2dp.endpoint.take();
 			let avctp = a2dp.avctp;
 			*a2dp = A2dp { avctp, ..A2dp::default() };
+			classic.profiles = classic.profiles.with(bt_policy::Profile::Audio, false);
 			if let Some(id) = endpoint {
 				self.audio.withdraw(id);
 			}
@@ -253,6 +257,27 @@ impl Stack {
 				self.close_channel(at, handle, other);
 			}
 		}
+	}
+
+	// The operator ends this audio profile, including its remote control, while the ACL
+	// and any voice, input, serial or network profile on it remain intact.
+	pub(crate) fn disconnect_a2dp(&mut self, at: usize, peer: &Peer) -> Result<(), Error> {
+		let handle = self.controllers[at].link_to(peer).map(|link| link.handle).ok_or(Error::NotFound)?;
+		let classic = self.controllers[at].link_mut(handle).and_then(|link| link.classic.as_mut()).ok_or(Error::Unsupported)?;
+		let cid = classic.a2dp.signalling.or(classic.a2dp.media).or(classic.a2dp.avctp).ok_or(Error::NotFound)?;
+		let avctp = classic.a2dp.avctp;
+		// A pending reconnect search must not reopen an explicitly retired profile.
+		let search = if classic.sdp_client.as_ref().is_some_and(|client| client.purpose == super::classic::Purpose::Profile(Profile::Audio)) { classic.sdp_client.take().map(|client| client.cid) } else { None };
+		self.close_channel(at, handle, cid);
+		self.a2dp_channel_closed(at, handle, cid);
+		if let Some(remote_control) = avctp.filter(|held| *held != cid) {
+			self.close_channel(at, handle, remote_control);
+			self.a2dp_channel_closed(at, handle, remote_control);
+		}
+		if let Some(search) = search {
+			self.close_channel(at, handle, search);
+		}
+		Ok(())
 	}
 
 	// The link is gone: its stream's endpoint leaves.

@@ -176,6 +176,67 @@ def classic_pairing(g, pair):
     pair(g, 'serial', 'Secure Connections, Just Works', io='NO_OUTPUT_NO_INPUT', mitm=False)
 
 
+def profile_inventory(g, peer, profile, connected):
+    address = g.address(peer).lower()
+    def matches(text):
+        rows = [line for line in text.splitlines() if line.strip().lower().startswith(address + ' bredr ')]
+        if len(rows) != 1:
+            return False
+        match = re.search(r'; using ([^;\r\n]+)', rows[0])
+        profiles = match[1].split(',') if match else []
+        return (profile in profiles) == connected
+    result = g.command_eventually('btctl list', matches, timeout=10)
+    return next(line for line in result.splitlines() if line.strip().lower().startswith(address + ' bredr '))
+
+
+def input_profile_lifecycle(g):
+    peer = 'keyboard'
+    address = g.address(peer)
+    before = g.control('status')[peer]
+    g.require(before['connections'] == 1 and before['hid_control'] == before['hid_interrupt'] == 'OPEN',
+              'operator input teardown did not start with both live HID channels')
+    row = profile_inventory(g, peer, 'input', True)
+    g.require('trusted for input' in row and 'Secure Connections, authenticated' in row,
+              'operator input teardown lacks the original authenticated input trust')
+    cursor = g.events()['next']
+    g.command(f'btctl disconnect {address} input', expect='disconnecting input')
+    g.eventually('status', lambda state: all(state[peer][key] in (None, 'CLOSED')
+                 for key in ('hid_control', 'hid_interrupt')), timeout=10)
+    row = profile_inventory(g, peer, 'input', False)
+    g.require('; connected' in row and 'trusted for input' in row and 'Secure Connections, authenticated' in row,
+              'input disconnect lost the ACL, trust or authenticated bond')
+    g.require(g.control('status')[peer]['connections'] == 1, 'input disconnect ended its ACL')
+
+    def reconnect(label):
+        g.command(f'btctl connect {address} input', expect='connecting input')
+        g.eventually('status', lambda state: state[peer]['hid_control'] == state[peer]['hid_interrupt'] == 'OPEN', timeout=10)
+        profile_inventory(g, peer, 'input', True)
+        g.wait_hid_input(label)
+        mark = len(g.serial.data)
+        g.control('type', peer=peer, text=f'echo independent-keyboard-{label}\n')
+        g.finish(mark)
+        g.require(re.search(rf'(?m)^independent-keyboard-{label}\r?$', g.serial.text_since(mark).decode()),
+                  'operator-connected keyboard did not execute its fresh HID command')
+        g.require(g.control('status')[peer]['pairings'] == before['pairings'], 'operator input reconnect paired again')
+
+    reconnect('profile-reconnect')
+    events = g.events(since=cursor)['events']
+    g.require(not any(item.get('peer') == peer and item.get('event') in ('connection', 'disconnection') for item in events),
+              'input profile teardown/reconnect replaced its ACL')
+    # An explicit cold-ACL precondition exercises the queued operator request;
+    # neither reconnect below asks the peer to open the HID channels.
+    g.control('disconnect', peer=peer)
+    g.require(g.control('status')[peer]['connections'] == 0, 'cold input precondition retained an ACL')
+    # The peer's completion can precede the guest's HCI disconnection event.
+    g.command_eventually('btctl list', lambda text: any(
+        line.strip().lower().startswith(address.lower() + ' bredr ') and '; not connected' in line
+        and 'trusted for input' in line and 'Secure Connections, authenticated' in line
+        for line in text.splitlines()), timeout=10)
+    reconnect('profile-cold')
+    g.record('classic-input-profile-lifecycle', teardown='both HID channels closed; input inventory cleared',
+             retained='ACL, authenticated bond and input trust', reconnect='operator same-ACL and cold-ACL; fresh HID commands without pairing')
+
+
 def music_voice(g):
     headset, phone = g.address('headset'), g.address('phone')
     cursor = g.control('events')['next']
@@ -206,7 +267,7 @@ def music_voice(g):
     g.control('music-reset', peer='headset')
     g.command(f'btctl connect {phone} audio', expect='connecting audio')
     g.control('source-start', peer='phone', address=g.guest_address)
-    _, route = audio_device(g, lambda line: 'Bluetooth, a phone playing to this system' in line)
+    route_id, route = audio_device(g, lambda line: 'Bluetooth, a phone playing to this system' in line)
     g.require('48000' in route, 'phone route did not expose its negotiated SBC sample rate')
     g.pause(2)
     g.command('audioctl streams', expect="the phone's stream")
@@ -222,7 +283,36 @@ def music_voice(g):
         g.require(response['pressed_code'] == 0x08 and response['released_code'] == 0x08,
                   f'guest acknowledged unsupported AVRCP {key} instead of NOT_IMPLEMENTED: {response}')
     g.record('classic-avrcp-target', keys=['PLAY', 'PAUSE', 'FORWARD', 'BACKWARD'], response='NOT_IMPLEMENTED for press and release')
+    profile_inventory(g, 'phone', 'audio', True)
+    profile_inventory(g, 'headset', 'audio', True)
+    before = g.control('status')
+    g.require(before['phone']['connections'] == before['headset']['connections'] == 1,
+              'audio teardown did not start with both independent ACLs')
+    cursor = g.events()['next']
     g.command(f'btctl disconnect {phone} audio', expect='disconnecting audio')
+    g.eventually('status', lambda state: all(state['phone'][key] in (None, 'CLOSED')
+                 for key in ('audio_signalling', 'audio_media', 'audio_remote_control')), timeout=10)
+    profile_inventory(g, 'phone', 'audio', False)
+    profile_inventory(g, 'headset', 'audio', True)
+    g.command_eventually('audioctl devices', lambda text:
+        not re.search(rf'(?m)^device {route_id}:', text)
+        and re.search(rf'(?m)^device {output}:.*\(Bluetooth\)', text), timeout=10)
+    g.command_eventually('audioctl streams', lambda text: "the phone's stream" not in text
+        and re.search(r'(?m)^(?:no streams\r?$|stream \d+(?: \([^)]*\))?: )', text), timeout=10)
+    # The other peer's output must still carry real application samples.
+    g.control('music-reset', peer='headset')
+    g.command('audioprobe radio-music', expect='PASS radio-music')
+    retained = g.eventually('music-verdict', lambda value: value['samples'] >= 24000, peer='headset', timeout=15)
+    g.require(retained['rms'] > 1000 and retained['peak_frequency'] == 1000,
+              f'audio profile teardown broke the independent headset: {retained}')
+    after = g.control('status')
+    g.require(all(after[peer]['connections'] == 1 and after[peer]['pairings'] == before[peer]['pairings']
+                  for peer in ('phone', 'headset')), 'audio teardown replaced an ACL or bond')
+    events = g.events(since=cursor)['events']
+    g.require(not any(item.get('peer') in ('phone', 'headset') and item.get('event') in ('connection', 'disconnection') for item in events),
+              'audio profile teardown disconnected or replaced an ACL')
+    g.record('classic-audio-profile-disconnect', teardown='AVDTP and AVCTP closed; route and stream withdrawn',
+             retained='phone and headset ACLs/bonds; headset output', independent_decode=retained)
 
     # Both controller voice modes use the same application call contract. The
     # independent peer encodes a 1500 Hz microphone; the guest verifies its pitch.

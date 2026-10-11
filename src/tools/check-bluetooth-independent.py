@@ -522,6 +522,8 @@ def classic_input(g):
     g.finish(mark)
     require(re.search(rb'(?m)^independent-keyboard-alive\r?$', g.serial.text_since(mark)), 'radio power/chord prevented the following command')
     require(g.serial.text_since(0).count(b'BluetoothService: online') == 1, 'radio key caused an unexpected service/machine restart')
+    from bluetooth_guest_classic import input_profile_lifecycle
+    input_profile_lifecycle(g)
     trust(g, 'gamepad', 'input')
     mark = g.start('gamepad')
     g.wait(mark, 'gamepad - q or Ctrl+C leaves')
@@ -1353,7 +1355,49 @@ def hsp_no_session_self_test():
     note('HSP no-session self-test PASS: real scenario requires exact ERROR, live DLC and no fresh transient/current SCO')
 
 
+def profile_inventory_self_test():
+    from bluetooth_guest_classic import profile_inventory
+    address = 'da:4c:10:de:00:00'
+    def row(radio, using):
+        return f'  {address} {radio} "peer" - Secure Connections, authenticated; connected; trusted for input' + ('; using input' if using else '') + '\r\n'
+    class Inventory:
+        def __init__(self, text):
+            self.text = text
+        def address(self, peer):
+            require(peer == 'keyboard', 'profile inventory selected the wrong peer')
+            return address
+        def command_eventually(self, command, predicate, timeout):
+            require(command == 'btctl list' and timeout == 10, 'profile inventory query changed')
+            require(predicate(self.text), 'profile inventory transcript refused')
+            return self.text
+    # Exact paired rows from the retained real controller/guest transcript.
+    retained = ('  da:4c:10:de:00:00 bredr "Bumble keyboard" - Secure Connections, authenticated; connected\r\n'
+                '  da:4c:10:de:00:00 le-public "Bumble keyboard" - Secure Connections, authenticated; not connected\r\n')
+    cases = ((retained, False, True),
+             (row('bredr', True) + row('le-public', False), True, True),
+             (row('le-public', True) + row('bredr', False), False, True),
+             (row('bredr', False) + row('le-public', True), True, False),
+             (row('le-public', False), False, False),
+             (row('bredr', True) * 2, True, False),
+             (row('bredr', True).replace(address, 'da:4c:10:de:00:01'), True, False))
+    for text, connected, accepted in cases:
+        try:
+            selected = profile_inventory(Inventory(text), 'keyboard', 'input', connected)
+        except GateError as error:
+            require(not accepted and str(error) == 'profile inventory transcript refused', f'unexpected profile inventory refusal: {error}')
+        else:
+            require(accepted and selected.strip().startswith(address + ' bredr '), 'profile inventory accepted absent, duplicate or wrong-radio state')
+    note('profile inventory self-test PASS: Classic selected beside CTKD LE row; LE-only, wrong peer, duplicate and opposite profile state refused')
+
+
 def self_test():
+    bridge_spec = importlib.util.spec_from_file_location('bluetooth_bridge_check', HARNESS / 'check-bluetooth-bridge.py')
+    bridge_check = importlib.util.module_from_spec(bridge_spec)
+    bridge_spec.loader.exec_module(bridge_check)
+    bridge_check.self_test(ROOT)
+    from bluetooth_voice_fairness import run as voice_fairness_self_test
+    voice_fairness_self_test(ROOT)
+    profile_inventory_self_test()
     classic_gamepad_self_test()
     hsp_no_session_self_test()
     classic_legacy_refusal_self_test()
@@ -1364,6 +1408,8 @@ def self_test():
     from bluetooth_le_audio_identity import run as le_audio_identity_self_test
     le_audio_identity_self_test(ROOT)
     image_preparation_self_test()
+    from bluetooth_profile_lifecycle import run as profile_lifecycle_self_test
+    profile_lifecycle_self_test(ROOT)
     from bluetooth_audio_lifecycle import run as audio_lifecycle_self_test
     audio_lifecycle_self_test(ROOT)
     from bluetooth_controller_capabilities import self_test as capability_self_test

@@ -122,10 +122,39 @@ async def hsp_peer_self_test():
     assert all(task.done() for task in tasks)
 
 
+def profile_status_self_test():
+    from types import SimpleNamespace
+    from bumble import l2cap
+    from bluetooth_classic_peers import HidPeer
+
+    for kind in (HidPeer, AudioPeer):
+        peer = object.__new__(kind)
+        peer.name, peer.device = 'observed', SimpleNamespace(public_address='DA:4C:10:DE:00:01', sco_links={})
+        peer.connections, peer.pairings, peer.encrypted, peer.received = {7: object()}, 2, 3, b''
+        channel = SimpleNamespace(state=l2cap.ClassicChannel.State.OPEN)
+        if kind is HidPeer:
+            peer.hid = SimpleNamespace(l2cap_ctrl_channel=channel, l2cap_intr_channel=channel)
+            fields = ('hid_control', 'hid_interrupt')
+        else:
+            peer.phone, peer.sco_link, peer.held_sco_request = True, None, None
+            peer.avdtp = SimpleNamespace(l2cap_channel=channel)
+            peer.source_stream = SimpleNamespace(rtp_channel=channel)
+            peer.avrcp = SimpleNamespace(avctp_protocol=SimpleNamespace(l2cap_channel=channel))
+            fields = ('audio_signalling', 'audio_media', 'audio_remote_control')
+        for state in l2cap.ClassicChannel.State:
+            channel.state = state
+            observed = peer.status()
+            assert observed['connections'] == 1 and observed['pairings'] == 2
+            assert all(observed[field] == state.name for field in fields)
+            assert all((observed[field] in (None, 'CLOSED')) == (state == l2cap.ClassicChannel.State.CLOSED) for field in fields)
+    print('bluetooth-radio-peers: profile status PASS: retained objects report actual pinned L2CAP states; pending disconnect is not closed')
+
+
 async def self_test():
     from types import SimpleNamespace
     from bumble import hci, hfp, l2cap
 
+    profile_status_self_test()
     await legacy_peer_pin_self_test()
     await hsp_peer_self_test()
 

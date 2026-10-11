@@ -197,6 +197,12 @@ class ScenarioPairing(pairing.PairingDelegate):
         return self.pin[:max_length]
 
 
+def channel_state(channel):
+    # Outgoing Bumble HID channels can retain their object after remote close.
+    # A pending disconnect is not a completed teardown.
+    return None if channel is None else channel.state.name
+
+
 class HidPeer(Peer):
     def setup(self, keyboard):
         self.keyboard = keyboard
@@ -206,6 +212,10 @@ class HidPeer(Peer):
         self.hid.register_get_protocol_cb(lambda: hid.Device.GetSetStatus(status=hid.Device.GetSetReturn.SUCCESS, data=bytes([self.protocol])))
         self.hid.register_set_protocol_cb(self.set_protocol)
         self.hid.register_get_report_cb(lambda *_: hid.Device.GetSetStatus(status=hid.Device.GetSetReturn.SUCCESS, data=b'\0' * (8 if keyboard else 4)))
+
+    def status(self):
+        return dict(super().status(), hid_control=channel_state(self.hid.l2cap_ctrl_channel),
+                    hid_interrupt=channel_state(self.hid.l2cap_intr_channel))
 
     def set_protocol(self, protocol):
         self.protocol = protocol
@@ -421,7 +431,13 @@ class AudioPeer(Peer):
             return
 
     def status(self):
-        return dict(super().status(), sco=bool(self.sco_link and self.sco_link.handle in self.device.sco_links), sco_request_held=self.held_sco_request is not None)
+        stream = getattr(self, 'source_stream', None) if self.phone else getattr(getattr(self, 'sink', None), 'stream', None)
+        avctp = self.avrcp.avctp_protocol
+        return dict(super().status(), sco=bool(self.sco_link and self.sco_link.handle in self.device.sco_links),
+                    sco_request_held=self.held_sco_request is not None,
+                    audio_signalling=channel_state(self.avdtp.l2cap_channel if self.avdtp else None),
+                    audio_media=channel_state(stream.rtp_channel if stream else None),
+                    audio_remote_control=channel_state(avctp.l2cap_channel if avctp else None))
 
     def disconnected(self, connection, reason):
         if self.held_sco_request is not None and self.held_sco_request[0] is connection:
