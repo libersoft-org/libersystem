@@ -235,6 +235,14 @@ impl Probe {
 		if self.watcher != 0 {
 			close(self.watcher);
 			self.watcher = 0;
+			// THE CLOSE IS SEEN BY THE SERVICE IN ITS OWN TIME, and a request on another channel made right after it
+			// can be served first: a pairing then still found a watcher to ask, and declared the IO capabilities of a
+			// host with someone at it. So the service's own word that no watcher is left - `pairable` is exactly
+			// that - is waited for, two seconds at most; one that never says so fails the step that needed it.
+			let deadline = clock() + 2 * TICKS;
+			while self.controller().pairable && clock() < deadline {
+				sleep_until(clock() + TICKS / 20);
+			}
 		}
 	}
 

@@ -437,6 +437,14 @@ rt = { path = "../../runtime/rt", features = ["host-tests"] }
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
 
+# THE DRIVERS RUN COMPILED, as the kernel's hot crates and the services' ciphers already do. Their time is the
+# hardware's: a USB speaker takes a packet every millisecond - eight a millisecond at high speed - and on an
+# emulated core the xHCI driver built at opt-level 0 could not keep a 48 kHz stream fed even after its byte loops
+# were gone (the ports' speaker cases still ran dry 22 to 66 times on riscv64 and twice on aarch64, 2026-10-12).
+# Debug assertions and overflow checks stay on; only the code generation changes.
+[profile.dev.package.drivers]
+opt-level = 2
+
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
 # call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry

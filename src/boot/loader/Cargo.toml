@@ -46,6 +46,21 @@ opt-level = 2
 [profile.dev.package.fat]
 opt-level = 2
 
+# AND THE HASHES, WHICH WERE MOST OF AN EMULATED BOOT. The loader proves the kernel and the volume package
+# against the signed manifest before it hands either over, and at opt-level 0 the SHA-256 that does it -
+# `bootproto`'s, the one the kernel already builds at opt-level 3 - was the longest thing it did: on riscv64
+# under TCG, 172 s for the kernel and 187 s for the volume package of a 388 s loader (timestamped serial,
+# 2026-10-12), which is what ran the ports' boot gates out of their budget. The manifest's Ed25519 check and
+# its SHA-512 come with it. The checks are unchanged; they are compiled.
+[profile.dev.package.bootproto]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 2
+
+[profile.dev.package.bootsig]
+opt-level = 2
+
 [profile.dev]
 panic = "abort"
 

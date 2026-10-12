@@ -4926,3 +4926,31 @@ CAUSES FOUND AND CHANGES MADE:
 6. NetworkService's DHCP client sent one DISCOVER and gave up after 2 s, which is also why slow aarch64 boots with slirp fell back to the static configuration; now DISCOVER x3 / REQUEST x2, 2 s apart (details under P02M0194).
 
 PENDING AT THIS ENTRY: the x86 regression gates (camera-usb, boot-volume-controllers, virtio-gpu-edid, the three USB audio cases, driver-mutations) and, at the end of the job, the ports' runs (camera-usb-aarch64/-riscv64, the six USB audio cases, boot-volume-controllers-aarch64/-riscv64, virtio-gpu-edid-riscv64). NOT PERFORMABLE HERE: the twenty Linux-gadget-dependent cases (host module operations oops this shared host; recorded since 2026-10-10) and DDC/AUX (no display controller that reaches a bus).
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-10-12 05:52:54 UTC):
+
+x86_64 REGRESSION RUNS OF THIS SESSION'S CHANGES, all on the current tree (development images built from it):
+- `./check.sh --gate camera-usb` PASS 301 s: 154 frames in 2000486 us, client buffers 12288 bytes, completion latency min/median/max 379/417/9554 us, 39 no-buffer drops, 0 device drops, 0 discontinuities; capture revoked and replacement admitted in 394052 us; unplug retired the grant.
+- `./check.sh --gate boot-volume-controllers` PASS 842 s (NVMe and AHCI served/written/read back cold, decoy refused, virtio-scsi refused by name) - covers the LiberFS whole-extent read and the gate's edits on x86.
+- `./check.sh --gate virtio-gpu-edid` PASS 141 s - covers the fault.rs termination change on x86's shutdown path.
+- `./check.sh --gate driver-mutations` PASS 222 s: 20 xHCI proof outcomes (7 candidate PASS, 13 expected causal failures) and 89/89 planted defects. Two tool updates were needed by this session's driver edits: the "leave-final-audio-padding" mutation now plants its defect in the `write_bytes` form of the padding, and the fixture models `usb_audio::request_before_fill` (no capture device in either fixture, where production answers false at `devices.source()`).
+- USB audio through usbredir (`taskset 0-3`, SMP4, TEST_STALL 1500, the original selections): speaker-async PASS (53 s), speaker-uac2 PASS (37 s), microphone PASS (36 s) with `usb-audio-pcap: PASS: 11 completed isochronous packets, 2048 PCM bytes and 64 final padding bytes`.
+- Kernel tests on x86 for the scheduler and the reworked worker pool, one selection: 11 passed in 47 s (3D/3D-extended conformance on the target, the 3D demo's resize/extended/workers/HDR runs, partly-allocated-queue cleanup, emergency kill, the 2D demo and its workers, `kernel.sched.a_drain_that_never_empties_still_expires_timed_waits`).
+- `foreign-audit-link.py --check` PASS twice (the second after a soft3d edit moved panic locations and with them the staged icdprobe identity).
+
+NEXT AND LAST: the ports' runs (camera-usb-aarch64/-riscv64, boot-volume-controllers-aarch64 with the AHCI firmware and -riscv64, virtio-gpu-edid-riscv64, the six USB audio cases, the worker-pool kernel tests), recorded in the following entry.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-10-12 09:11:42 UTC):
+
+THE PORTS' RUNS (end of job; aarch64 lane on CPUs 0-23, riscv64 lane on CPUs 24-47; development builds with `--kernel-on-volume --dma-mode harness` for the guest gates and `LIBER_DEVELOPMENT=1 ./build.sh --arch X` for test.sh):
+- camera-usb-aarch64 PASS 1200 s (inventory, capture 7 frames in 2034917 us, cycle replacement in 5279942 us, unplug); camera-usb-riscv64 PASS 1200 s (6 frames in 2055426 us). Both failed at their 1600 s limit on 2026-10-11; the difference is the scheduler fix (timed waits expire on a saturated boot CPU).
+- boot-volume-controllers-aarch64 PASS 3901 s, with the AHCI pair booted through `.build/firmware/AAVMF_CODE.ahci.fd` (built by `src/tools/build-aavmf-ahci.sh`).
+- boot-volume-controllers-riscv64 FAILED twice (900 s, first boot; kernel entry at 394 s and 421 s), then PASS 3901 s. A timestamped serial capture located the loader's time: 172 s verifying the kernel and 187 s verifying the volume package - `bootproto::sha256` built at opt-level 0 in the loader (an `sha2`/`bootsig` override alone, tried first, changed nothing, which is how the right crate was found). FIX `src/boot/loader/Cargo.toml`: `[profile.dev.package.bootproto] opt-level = 3` (+ sha2, bootsig at 2). Kernel entry now at 14-22 s of uptime. The same loader then booted x86_64 (`virtio-gpu-edid` PASS 293 s) and aarch64 (its test.sh runs below).
+- virtio-gpu-edid-riscv64 PASS 1201 s (the shutdown fault is gone).
+- USB audio microphone PASS on aarch64 (36 s) and riscv64 (311 s), each with its PCAP check. Speakers FAIL: aarch64 async - steady phase clean, then 2 underruns in the 200 ms starvation where 1 is required (hardware.rs:4505); aarch64 UAC2 (2, 310, 0); riscv64 async (66, 20908, 0); riscv64 UAC2 (22, 4665, 0) - against (271, 72136, 0), (197, 59958, 0), (280, 166982, 0), (198, 105087, 0) on 2026-10-11. Remaining cause: emulation speed with the xHCI driver (static `drivers` binary) at opt-level 0; an optimised `drivers` build is proposed, not made (it changes every driver on every target at the end of the job).
+- Worker-pool and scheduler kernel tests (3D demo through workers, 2D demo through workers, 3D emergency kill, the new scheduler test): PASS aarch64 (4 in 63 s) and riscv64 (4 in 344 s).
+- Port builds needed `src/tools/foreign-audit-link.py --check` AFTER their first build had staged the new icdprobe (the earlier relink had used the previous port staging); then they built.
+
+STILL OPEN IN P02M0099: the ports' speaker clauses (above); the twenty Linux-gadget-dependent cases (unsafe on this host since the 2026-10-10 OOPS); DDC/AUX (no display controller that reaches a bus); the conformance/integration items that need all of these; the three process-rule rows that close with the milestone.

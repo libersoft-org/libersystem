@@ -307,3 +307,13 @@ Final document and selection verification: `./check.sh --gate milestone-index` a
 Exact final receipts: `.build/logs/end-of-job/qemu-only-20261010-shared-host/final-host-milestone-index-after-source4-media96-soft2d-unlayered-current/slot-release.json` (SHA256 e790557f2ed714cf9988ce89bfb21625704fb113d089e45250334b34f4a323a7) and `.build/logs/end-of-job/qemu-only-20261010-shared-host/final-readonly-plan-source6-unlayered-current/terminal-clean-release.json` (SHA256 1e069f4ffbd771e904afc044faadede2cdc342ac9ec10503e9c1c4f61805cd1f). These results precede this verification-only append; the implementation, scoped successes, failed runs and remaining limitations recorded above are unchanged.
 
 Final status: OPEN. All previous audit content is preserved; no audit rating is assigned.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0199 (2026-10-12 05:31:19 UTC):
+
+Session goal: finish every open milestone except P02M0105/P02M0106, or record what cannot be finished. What was open for P02M0199 was (a) the ACPI brightness gates, unrun since the 2026-10-10 host OOPS made the Linux gadget transport unsafe, and (b) DDC/CI.
+
+(a) RUN AND PASSED on the userspace transport (QEMU usb-redir consumer keys, `brightness-usbredir.py`; no host module touched): `BRIGHTNESS_USB_TRANSPORT=userspace ./check.sh --gate brightness-acpi` PASS 599 s and `BRIGHTNESS_USB_TRANSPORT=userspace ./check.sh --gate brightness-acpi-no-dos` PASS 323 s, x86_64, development image built by `dev.sh up` from the current tree. Assertions passed unchanged: adapter bound (_DOS called once / no-_DOS path), region at the firmware AC default 70, set 40, 0x86/0x87/0x85 stepping, 0x88 to the floor 10 and not below, 0x89 logged without a change, three key presses stepping 20/30/20, automatic curve 300 lux -> 100 and 10 lux -> 70, the stored 60 restored on the second boot, held across suspend to idle and S3 with both drivers answering. Logs: `.build/claude-work/gate-brightness-acpi.log`, `.build/claude-work/gate-brightness-acpi-no-dos.log`.
+(b) NOT DONE: DDC/CI (MCCS luminance over the display cable) needs the DDC/AUX transport that P02M0099 records as blocked on a display controller that can reach a bus; no such controller is emulated or available. Physical-panel evidence remains unperformed.
+
+No source change was made for P02M0199 in this session. Status: OPEN only for DDC/CI.

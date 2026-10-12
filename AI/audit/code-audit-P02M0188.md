@@ -1021,3 +1021,15 @@ Final document and selection verification: `./check.sh --gate milestone-index` a
 Exact final receipts: `.build/logs/end-of-job/qemu-only-20261010-shared-host/final-host-milestone-index-after-source4-media96-soft2d-unlayered-current/slot-release.json` (SHA256 e790557f2ed714cf9988ce89bfb21625704fb113d089e45250334b34f4a323a7) and `.build/logs/end-of-job/qemu-only-20261010-shared-host/final-readonly-plan-source6-unlayered-current/terminal-clean-release.json` (SHA256 1e069f4ffbd771e904afc044faadede2cdc342ac9ec10503e9c1c4f61805cd1f). These results precede this verification-only append; the implementation, scoped successes, failed runs and remaining limitations recorded above are unchanged.
 
 Final status: OPEN. All previous audit content is preserved; no audit rating is assigned.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0188 (2026-10-12 04:07:00 UTC):
+
+Session goal: finish every open milestone except P02M0105/P02M0106, or record what cannot be finished. P02M0188's one open item is the gate registration, whose remaining clause is a whole `./verify.sh` run; the owner scheduled that run (2026-09-25) "after P02M0099 and P02M0103 are implemented, as one run for all of them". It was NOT performed in this session, for two independent reasons:
+
+1. IT CANNOT RUN SAFELY ON THIS HOST. `./verify.sh --catalog` (read-only, 2026-10-12) includes Linux-gadget-dependent checks - e.g. `kernel.hardware.usb_cdc_acm_carries_bytes_to_the_host_and_back`, `kernel.hardware.usb_gamepads_report_which_pad_pressed_what`, `kernel.hardware.usb_printer_prints_a_document_waits_on_a_slow_printer_and_survives_its_unplug`, and `gate.brightness-usb` in its default gadget transport. `src/harness/usb-gadget.sh setup` runs `modprobe` for every gadget module, and since the 2026-10-10 host OOPS the shared host's module_mutex is held by a dead task: any module operation or read of /proc/modules oopses the host kernel again. The owner cannot restart this server. verify.sh has no switch that excludes those checks, and a narrowed `--required` run is by its own definition a rehearsal, not the run this item names.
+2. ITS PRECONDITION IS NOT MET. P02M0099 and P02M0103 are not complete (P02M0103's headless 2D floor waits for the owner's ceiling decision; P02M0099 has hardware-blocked and gadget-blocked items), so the one combined run the owner scheduled has no complete set to verify.
+
+What did run in this session that touches this milestone's gate machinery: `./check.sh --gate source-hygiene` PASS (97 s), `./check.sh --gate graphics-profile` PASS, `./check.sh --gate driver-mutations` PASS (222 s, 20 xHCI proof outcomes, 89/89 planted defects), `src/tools/foreign-audit-link.py --check` PASS (79 s, the pass-2 inventory reproduces on all three targets after the rt::pool change). The admin-path gate itself was not rerun; nothing in AdminService, the broker, the trusted input/display path or the journal changed in this session.
+
+Status: OPEN, blocked on a safe host for the whole verify.sh (and on the owner's sequencing).
