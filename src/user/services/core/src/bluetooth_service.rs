@@ -406,6 +406,98 @@ fn scrub_record(record: &mut BondRecord) {
 
 // A request encoded here, sent and answered over one channel. The reply comes back in a vector this service
 // owns, for the caller to zero once it has read it; no key rides in a capability, so any that arrive are closed.
+// THE BOND STORE'S REPLIES, MATCHED TO THE REQUEST THEY ANSWER.
+//
+// The store is reached through a duplicate of its root, so a restarted service holds the same end its
+// predecessor held - and a reply the store sent to a request the killed predecessor never read is still
+// queued there. Every call took "the next message" as its answer and every request carried the same
+// correlation, so the first call after a restart read that stale reply and every later one the answer to
+// the call before it: a restarted service read its own identity resolving key and each peer's as garbage,
+// set no private address and gave the controller no resolving list, and no bonded LE device that uses a
+// private address was reconnected. Each request goes out under a correlation this process has not used
+// before, the reply to it is the one carrying it, and anything else is dropped - zeroed first, since a
+// lookup's reply carries a key.
+static BOND_CORR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn bond_corr() -> u32 {
+	if BOND_CORR.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+		// SEEDED ONCE, so a successor's correlations are not its predecessor's.
+		let mut seed = [0u8; 4];
+		let seed = if random_get(&mut seed) == 4 { u32::from_le_bytes(seed) } else { clock() as u32 };
+		let _ = BOND_CORR.compare_exchange(0, seed | 1, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
+	}
+	match BOND_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) {
+		0 => BOND_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+		corr => corr,
+	}
+}
+
+struct BondTransport {
+	chan: u64,
+}
+
+impl BondTransport {
+	// Send `request` with its correlation - bytes 2..6 - replaced by a fresh one, and answer the reply carrying
+	// that one, with the caller's correlation put back so the caller decodes it as it always did.
+	fn exchange(&self, request: &mut [u8], request_handles: &[u64], reply_handles: &mut wire::Handles, deadline: u64) -> Result<Vec<u8>, wire::TransportError> {
+		if request.len() < 6 {
+			return Err(wire::TransportError::SendRefused);
+		}
+		let mut asked = [0u8; 4];
+		asked.copy_from_slice(&request[2..6]);
+		let ours = bond_corr().to_le_bytes();
+		request[2..6].copy_from_slice(&ours);
+		if !send_caps_blocking(self.chan, request, request_handles) {
+			return Err(wire::TransportError::SendRefused);
+		}
+		loop {
+			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+				ReceivedVecCaps::Message { mut bytes } => {
+					if bytes.len() >= 4 && bytes[..4] == ours {
+						bytes[..4].copy_from_slice(&asked);
+						return Ok(bytes);
+					}
+					scrub(&mut bytes);
+					for &handle in reply_handles.as_slice() {
+						close(handle);
+					}
+					reply_handles.clear();
+				}
+				ReceivedVecCaps::Closed => return Err(wire::TransportError::PeerClosed),
+				ReceivedVecCaps::Failed => return Err(wire::TransportError::ReceiveFailed),
+				ReceivedVecCaps::TimedOut => return Err(wire::TransportError::TimedOut),
+			}
+		}
+	}
+}
+
+impl Transport for BondTransport {
+	// The generated calls - `list` and `delete` - carry two addresses and nothing secret, so the request may be
+	// copied to stamp it.
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut wire::Handles, deadline: u64) -> Result<Vec<u8>, wire::TransportError> {
+		let mut stamped = request.to_vec();
+		self.exchange(&mut stamped, request_handles, reply_handles, deadline)
+	}
+
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			if handle != 0 {
+				close(handle);
+			}
+		}
+	}
+}
+
+// One raw request to the bond store, built in a buffer the caller owns and zeroes.
+fn bond_exchange(chan: u64, request: &mut [u8]) -> Option<Vec<u8>> {
+	let mut handles = wire::Handles::new();
+	let reply = BondTransport { chan }.exchange(request, &[], &mut handles, 0).ok();
+	for &handle in handles.as_slice() {
+		close(handle);
+	}
+	reply
+}
+
 fn exchange(chan: u64, request: &[u8]) -> Option<Vec<u8>> {
 	let mut handles = wire::Handles::new();
 	let reply = ChannelTransport { chan }.call(request, &[], &mut handles, 0).ok();
@@ -793,8 +885,8 @@ fn deliver(link: &mut Link, reports: &[InputReport]) {
 // ------------------------------------------------------------------ the bond store
 
 impl Stack {
-	fn bonds(&self) -> bluetooth_bond_store::Client<ChannelTransport> {
-		bluetooth_bond_store::Client::new(ChannelTransport { chan: self.bonds })
+	fn bonds(&self) -> bluetooth_bond_store::Client<BondTransport> {
+		bluetooth_bond_store::Client::new(BondTransport { chan: self.bonds })
 	}
 
 	// The stored record for this controller and peer, KEYS INCLUDED - so only the callers that need a key or
@@ -810,7 +902,7 @@ impl Stack {
 		request[2..6].copy_from_slice(&CORR.to_le_bytes());
 		let local = local_wire(&self.controllers[at]).encode(&mut request[6..])?;
 		let peer = peer_to_wire(peer).encode(&mut request[6 + local..])?;
-		let mut reply = exchange(self.bonds, &request[..6 + local + peer])?;
+		let mut reply = bond_exchange(self.bonds, &mut request[..6 + local + peer])?;
 		let answer = answered(&reply, BondRecord::read);
 		scrub(&mut reply);
 		match answer {
@@ -834,7 +926,7 @@ impl Stack {
 		request[..2].copy_from_slice(&bluetooth_bond_store::OP_STORE.to_le_bytes());
 		request[2..6].copy_from_slice(&CORR.to_le_bytes());
 		let len = record.encode(&mut request[6..]).map(|body| 6 + body);
-		let reply = len.and_then(|len| exchange(self.bonds, &request[..len]));
+		let reply = len.and_then(|len| bond_exchange(self.bonds, &mut request[..len]));
 		scrub(&mut request);
 		reply.and_then(|reply| answered(&reply, |_| Some(()))).is_some_and(|result| result.is_ok())
 	}

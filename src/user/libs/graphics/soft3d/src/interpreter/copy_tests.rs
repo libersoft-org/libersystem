@@ -19,7 +19,7 @@ impl Resources for Empty {
 	}
 }
 fn machine() -> Machine {
-	Machine { words: vec![0xdead_beef; 3 * STRIDE], len: vec![0; 3], kinds: vec![Type::f32(); 3], wide: vec![None; 3], stamp: vec![0; 3], run: 9, outputs: Outputs::default() }
+	Machine { words: vec![0xdead_beef; 3 * STRIDE], len: vec![0; 3], kinds: vec![Type::f32(); 3], wide: vec![None; 3], stamp: vec![0; 3], run: 9, outputs: Outputs::default(), registers: Default::default() }
 }
 #[test]
 fn writes_preserve_exact_words_type_neighbours_and_array_transitions() {

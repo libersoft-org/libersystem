@@ -94,6 +94,19 @@ impl Varyings {
 	}
 
 	/// Append one component, answering whether there was room.
+	/// The first `len` components, each the closure's answer for its index - the same values as
+	/// pushing them in order, without a bound check per component. A length past the bound is cut to it,
+	/// which no caller reaches: a varying set is refused at `prepare` before it could be that long.
+	pub(crate) fn from_fn(len: usize, mut component: impl FnMut(usize) -> f32) -> Self {
+		let mut out = Self::EMPTY;
+		let len = len.min(MAX_VARYING_COMPONENTS);
+		for (index, slot) in out.values[..len].iter_mut().enumerate() {
+			*slot = component(index);
+		}
+		out.len = len as u8;
+		out
+	}
+
 	pub fn push(&mut self, value: f32) -> bool {
 		if self.len as usize >= MAX_VARYING_COMPONENTS {
 			return false;

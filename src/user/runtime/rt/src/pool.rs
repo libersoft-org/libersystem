@@ -13,13 +13,24 @@
 //! so a worker that runs off the bottom of its stack faults - which ends the process - instead of
 //! writing into whatever happened to be mapped below. The only argument `SYS_THREAD_CREATE` carries
 //! is one handle, moved into the new thread's first argument register, and that handle is the
-//! channel the worker takes its orders from. Everything else it learns from the orders.
+//! channel the worker is rung on. The first thing it hears there is which slot is its own; every
+//! order after that it reads from the slot.
 //!
-//! THE ORDERING CONTRACT IS STATED HERE AND NOT BORROWED. Work goes to a worker as a message and
-//! comes back as a message, with a release fence before every send and an acquire fence after every
-//! receive: whatever a thread wrote before it sent is visible to the thread that received it. The
-//! kernel's channel locks would give the same edge today; a contract that leaned on them would stop
-//! holding the day a channel became lock-free, and nothing would say so.
+//! THE ORDERING CONTRACT IS STATED HERE AND NOT BORROWED. Work goes to a worker through its slot: the
+//! order's words are written, the call is opened, and only then is the slot's mail posted, by a
+//! sequentially consistent store the worker takes with a sequentially consistent swap and follows
+//! with an acquire fence - so whatever the caller wrote before posting is visible to the worker that
+//! took the mail. A parked worker is rung on its channel as well, which carries nothing but the
+//! request to look. It comes back through the call's count of finished items, each finish a release
+//! of what its item wrote and an acquire of every finish before it, and the caller's state or the
+//! last finisher's one report - so the caller, past either, has seen every item. None of this leans
+//! on the kernel's channel locks, which would stop holding the day a channel became lock-free.
+//!
+//! A CALL WAITS FOR ITS ITEMS AND NOT FOR EVERY WORKER IT WOKE. A worker whose core halted can be
+//! slow to come back - under a hypervisor, far slower than the work it was woken for - and one that
+//! arrives after the last item was claimed has nothing to do. So each worker's slot says which call
+//! it may join, the pool closes the call once its items are done, and a worker that looks after the
+//! close touches nothing of the caller's; the pool waits only for workers already inside.
 //!
 //! EXIT. The kernel latches the exit status of the FIRST thread to call `SYS_USER_EXIT`, so a worker
 //! that ended on its own - with a status of its own, before the program had decided its answer -
@@ -34,9 +45,9 @@
 //! and quietly ended would leave the thread waiting for it waiting for ever. A process that never
 //! made a worker behaves exactly as it did before this file existed.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 
-use crate::{ERR_BAD_SYSCALL, ERR_INVALID, RIGHT_MAP, RIGHT_READ, Received, SIG_KILL, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_THREAD_START_ON, SYS_USER_EXIT, channel, close, cpu_info, duplicate, map_object, memory_object_create, process_self, recv_blocking, send_blocking, signal, sys_is_err, syscall, unmap_object, yield_now};
+use crate::{ERR_BAD_SYSCALL, ERR_INVALID, RIGHT_MAP, RIGHT_READ, Received, SIG_KILL, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_THREAD_START_ON, SYS_USER_EXIT, channel, clock_ns, close, cpu_info, duplicate, map_object, memory_object_create, process_self, recv_blocking, send_blocking, signal, sys_is_err, syscall, unmap_object, yield_now};
 
 /// The most workers one process may hold.
 pub const MAX_WORKERS: usize = 64;
@@ -50,13 +61,43 @@ const PAGE: u64 = 4096;
 /// worker is not made. See `stack`.
 const GUARD_ATTEMPTS: usize = 8;
 
-const RUN: u8 = 1;
+/// What a worker's channel carries: its slot, once, first; the end of the process; a ring to look
+/// at its mail. And what a worker reports on its pool's channel: the last item done.
+const SLOT: u8 = 1;
 const EXIT: u8 = 2;
 const DONE: u8 = 3;
-/// `RUN`, then the entry, the dispatch, the lane and the channel to report on: four words.
-const ORDER: usize = 40;
+const RING: u8 = 4;
+/// `SLOT` or `EXIT`, then one word: the slot's index or the status.
+const MESSAGE: usize = 9;
+
+/// How long a worker that has just finished keeps asking for its next order before it parks, unless
+/// its pool says otherwise (`Pool::linger`).
+///
+/// A PARKED WORKER IS A SLOW ONE TO GET BACK. Its core halts, and under a hypervisor - this system's
+/// reference machine runs nested - the wake that ends the halt can take far longer than the work it
+/// brings. A frame is several calls in a row with short gaps between them, so a worker that stays
+/// on its core for a moment after each call takes the next one at once.
+///
+/// IT ASKS IN USER MODE. It polls its slot's mail with a pause between polls and makes a system
+/// call only every `POLLS_PER_YIELD` of them - to read the clock and to yield, so anything else
+/// made runnable on its core waits tens of microseconds and not a scheduling tick. Asking through
+/// the channel instead - a receive and a yield per poll - was measured (2026-10-12, 32 workers on
+/// the nested reference host) to slow everything else the machine was doing at the same moment:
+/// the display service's present took 10-12 ms beside polling workers against 7 beside quiet ones.
+pub const LINGER_NS: u64 = 2_000_000;
+
+/// How many polls between two looks at the clock - each look a system call - and the yield after it.
+const POLLS_PER_YIELD: u32 = 256;
+
+/// The mail that ends a worker with the process's own status, which `leaving` stores first.
+const MAIL_EXIT: u64 = u64::MAX;
+static EXIT_STATUS: AtomicU64 = AtomicU64::new(0);
 
 /// One worker, as the process knows it.
+///
+/// A CACHE LINE OF ITS OWN, because its worker polls it: slots sharing a line would have every post
+/// to one invalidate the line its neighbour is polling.
+#[repr(align(64))]
 struct Slot {
 	/// The channel end its orders are sent on. ZERO: there is no worker in this slot.
 	orders: AtomicU64,
@@ -65,13 +106,39 @@ struct Slot {
 	high: AtomicU64,
 	/// Lent to a live pool.
 	lent: AtomicBool,
+	/// The call this worker may join, or zero. HERE AND NOT IN THE POOL, because a worker can wake to
+	/// an order for a call that ended long ago - even for a pool that is gone - and a slot outlives
+	/// every pool: what tells the worker the call is over must still be there when it looks.
+	open: AtomicU64,
+	/// Between taking an order and finishing with it. The pool waits for this to clear before the
+	/// call's slices may be released.
+	inside: AtomicBool,
+	/// The call this worker is asked to join, or zero: posted after the order's words below and taken
+	/// by the worker. `MAIL_EXIT` ends it with the process.
+	mail: AtomicU64,
+	/// The worker is about to block, or is blocked, on its channel, and a post must ring it.
+	parked: AtomicBool,
+	/// The order: the entry, the dispatch, the worker's lane, and how long it lingers after the call.
+	entry: AtomicU64,
+	data: AtomicU64,
+	lane: AtomicU64,
+	linger: AtomicU64,
 }
 
 impl Slot {
 	const fn new() -> Slot {
-		Slot { orders: AtomicU64::new(0), low: AtomicU64::new(0), high: AtomicU64::new(0), lent: AtomicBool::new(false) }
+		Slot { orders: AtomicU64::new(0), low: AtomicU64::new(0), high: AtomicU64::new(0), lent: AtomicBool::new(false), open: AtomicU64::new(0), inside: AtomicBool::new(false), mail: AtomicU64::new(0), parked: AtomicBool::new(false), entry: AtomicU64::new(0), data: AtomicU64::new(0), lane: AtomicU64::new(0), linger: AtomicU64::new(0) }
 	}
 }
+
+/// The next call's number. Never zero, which is what a closed slot holds.
+static CALLS: AtomicU64 = AtomicU64::new(1);
+
+/// Where the caller of `for_each` is while the last items finish: still asking, parked on its report
+/// channel, or past both because the last item is done.
+const ASKING: u8 = 0;
+const PARKED: u8 = 1;
+const FINISHED: u8 = 2;
 
 static SLOTS: [Slot; MAX_WORKERS] = [const { Slot::new() }; MAX_WORKERS];
 
@@ -211,35 +278,121 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 	u64::from_le_bytes(out)
 }
 
-/// A worker, for the life of the process: take an order, carry it out, report, and take the next.
-extern "C" fn worker(orders: u64) -> ! {
-	let mut order = [0u8; ORDER];
+/// End this worker with the program's own status, whichever thread the kernel hears first.
+fn exit_with_status(status: u64) -> ! {
+	unsafe { syscall(SYS_USER_EXIT, status, 0, 0, 0) };
+	die();
+}
+
+/// This slot's mail, if any is waiting: the call it names - or, for `MAIL_EXIT`, the end.
+fn take(slot: &Slot) -> Option<u64> {
+	if slot.mail.load(Ordering::Relaxed) == 0 {
+		return None;
+	}
+	match slot.mail.swap(0, Ordering::SeqCst) {
+		0 => None,
+		MAIL_EXIT => exit_with_status(EXIT_STATUS.load(Ordering::Acquire)),
+		call => Some(call),
+	}
+}
+
+/// Poll in user mode, a pause between polls, until `ready` answers or `until` passes on the clock -
+/// which is read, and the core yielded, only every `POLLS_PER_YIELD` polls. `until` of zero polls not
+/// at all. Answers what `ready` did, or `None` past `until`.
+fn poll<R>(until: u64, mut ready: impl FnMut() -> Option<R>) -> Option<R> {
+	let mut polls = 0u32;
+	while until != 0 {
+		if let Some(answer) = ready() {
+			return Some(answer);
+		}
+		core::hint::spin_loop();
+		polls += 1;
+		if polls == POLLS_PER_YIELD {
+			polls = 0;
+			if clock_ns() >= until {
+				break;
+			}
+			yield_now();
+		}
+	}
+	None
+}
+
+/// The next call this worker is asked to join: its slot polled until `linger_until`, then waited for.
+fn next_call(slot: &Slot, orders: u64, message: &mut [u8; MESSAGE], mut linger_until: u64) -> u64 {
 	loop {
-		let length = match recv_blocking(orders, &mut order) {
-			Received::Message { len, .. } => len,
-			// NOBODY CLOSES A WORKER'S ORDERS: the process is going, or something is badly wrong.
+		if let Some(call) = poll(linger_until, || take(slot)) {
+			return call;
+		}
+		// PARKED IS SAID BEFORE THE MAIL IS LOOKED AT, and a caller posts before it looks at this: one
+		// of the two sees the other, so no call is posted to a worker that then sleeps through it.
+		slot.parked.store(true, Ordering::SeqCst);
+		if let Some(call) = take(slot) {
+			slot.parked.store(false, Ordering::SeqCst);
+			return call;
+		}
+		match recv_blocking(orders, message) {
+			Received::Message { len, .. } => {
+				slot.parked.store(false, Ordering::SeqCst);
+				if len == MESSAGE && message[0] == EXIT {
+					exit_with_status(word(message, 1));
+				}
+				// A RING SAYS ONLY "LOOK", and one rung for mail this worker had already taken finds
+				// none: it parks again.
+				if let Some(call) = take(slot) {
+					return call;
+				}
+				linger_until = 0;
+			}
+			// NOBODY CLOSES A WORKER'S CHANNEL: the process is going, or something is badly wrong.
 			Received::Closed => die(),
-		};
-		fence(Ordering::Acquire);
-		match order[0] {
-			RUN if length == ORDER => {
-				// SAFETY: a `RUN` is only ever sent by `Pool::for_each`, whose entry is a
-				// `participate` of the dispatch's own types and whose dispatch outlives every
-				// participant - it waits for this worker's `DONE` before it returns.
-				let entry = unsafe { core::mem::transmute::<u64, unsafe fn(*const (), usize)>(word(&order, 8)) };
-				unsafe { entry(word(&order, 16) as *const (), word(&order, 24) as usize) };
+		}
+	}
+}
+
+/// A worker, for the life of the process: learn its slot, then take an order, carry it out, and take
+/// the next.
+extern "C" fn worker(orders: u64) -> ! {
+	let mut message = [0u8; MESSAGE];
+	let slot = match recv_blocking(orders, &mut message) {
+		Received::Message { len, .. } if len == MESSAGE && message[0] == SLOT => match SLOTS.get(word(&message, 1) as usize) {
+			Some(slot) => slot,
+			None => die(),
+		},
+		// THE PROGRAM ENDED WHILE THIS WORKER WAS BEING MADE.
+		Received::Message { len, .. } if len == MESSAGE && message[0] == EXIT => exit_with_status(word(&message, 1)),
+		_ => die(),
+	};
+	let mut linger_until = 0;
+	loop {
+		let call = next_call(slot, orders, &mut message, linger_until);
+		let linger = slot.linger.load(Ordering::Relaxed);
+		let mut reported = false;
+		// IN BEFORE LOOKING, so a pool that closes the call after this load sees this worker inside and
+		// waits for it, and one that closed it before is seen here as closed - which is also what makes
+		// stale mail harmless: a call that closed before its worker looked is skipped whole.
+		slot.inside.store(true, Ordering::SeqCst);
+		if slot.open.load(Ordering::SeqCst) == call {
+			fence(Ordering::Acquire);
+			// SAFETY: an open call's words are the ones `Pool::for_each` wrote before posting it, whose
+			// entry is a `participate` of the dispatch's own types, and the call is still open: the pool
+			// does not let the dispatch go while this slot says it is inside.
+			let entry = unsafe { core::mem::transmute::<u64, unsafe fn(*const (), usize) -> Option<u64>>(slot.entry.load(Ordering::Relaxed)) };
+			// THE LAST ITEM'S FINISHER REPORTS, ONCE PER CALL AND ONLY TO A PARKED CALLER: the pool
+			// waits for the items, not for every worker it woke.
+			if let Some(report) = unsafe { entry(slot.data.load(Ordering::Relaxed) as *const (), slot.lane.load(Ordering::Relaxed) as usize) } {
 				fence(Ordering::Release);
-				if !send_blocking(word(&order, 32), &[DONE], 0) {
+				if !send_blocking(report, &[DONE], 0) {
 					die();
 				}
+				reported = true;
 			}
-			EXIT if length == 9 => {
-				// THE PROGRAM'S OWN STATUS, whichever thread the kernel hears first.
-				unsafe { syscall(SYS_USER_EXIT, word(&order, 1), 0, 0, 0) };
-				die();
-			}
-			_ => die(),
 		}
+		slot.inside.store(false, Ordering::SeqCst);
+		// THE WORKER THAT REPORTED PARKS AT ONCE. Its report woke the caller onto this core - a wake
+		// lands on the waker's - and polling here would share the core with the caller for the rest of
+		// its frame, and with whatever the caller wakes there next.
+		linger_until = if reported { 0 } else { clock_ns().saturating_add(linger) };
 	}
 }
 
@@ -256,6 +409,15 @@ fn make() -> bool {
 		let Some(me) = self_handle() else { return false };
 		let Some((low, high)) = stack() else { return false };
 		let Some((command, orders)) = channel() else { return false };
+		// ITS SLOT IS THE FIRST THING IT HEARS, queued before it can run, so no ring can come first.
+		let mut message = [0u8; MESSAGE];
+		message[0] = SLOT;
+		message[1..9].copy_from_slice(&(index as u64).to_le_bytes());
+		if !send_blocking(command, &message, 0) {
+			close(command);
+			close(orders);
+			return false;
+		}
 		let thread = unsafe { syscall(SYS_THREAD_CREATE, me, liber_rt_worker_entry as *const () as u64, high, orders) };
 		if sys_is_err(thread) {
 			// The kernel gives a refused handle back where it was, so both ends are still ours.
@@ -284,6 +446,8 @@ fn make() -> bool {
 pub struct Pool {
 	lent: [u8; MAX_WORKERS],
 	count: usize,
+	/// How long its workers keep asking for the next call after each one: `LINGER_NS` unless set.
+	linger_ns: u64,
 	/// Where a worker says it has finished, and where the owner hears it.
 	report: u64,
 	reports: u64,
@@ -295,7 +459,7 @@ impl Pool {
 	/// and it still works, because the calling thread does whatever the workers do not.
 	pub fn new(threads: usize) -> Pool {
 		let (report, reports) = channel().unwrap_or((0, 0));
-		let mut pool = Pool { lent: [0; MAX_WORKERS], count: 0, report, reports };
+		let mut pool = Pool { lent: [0; MAX_WORKERS], count: 0, linger_ns: LINGER_NS, report, reports };
 		if report == 0 {
 			return pool;
 		}
@@ -320,10 +484,19 @@ impl Pool {
 		self.count
 	}
 
+	/// How long this pool's workers keep asking for its next call after each one before they park.
+	///
+	/// A PROGRAM THAT CALLS AGAIN AT A KNOWN RATE says so here: a frame loop whose calls are a frame
+	/// apart keeps its workers awake across the gap and pays no wake at the frame's first call, at the
+	/// price of the polling in between. Zero parks a worker as soon as it is done.
+	pub fn linger(&mut self, ns: u64) {
+		self.linger_ns = ns;
+	}
+
 	/// Run `work` once for every item, each with a lane of its own for the whole call: the caller
 	/// takes lane 0, worker `k` takes lane `k + 1`, and items are claimed one at a time by whoever is
 	/// free, so a slow item holds up only the participant that took it. Returns when every item has
-	/// run.
+	/// run - and NOT when every worker has answered; see the module's note on waiting.
 	///
 	/// NO MORE PARTICIPANTS THAN LANES: `lanes.len() - 1` workers at most are woken, and a call with
 	/// no lanes runs nothing.
@@ -331,35 +504,61 @@ impl Pool {
 		if lanes.is_empty() {
 			return;
 		}
-		let helpers = self.count.min(lanes.len() - 1).min(items.len().saturating_sub(1));
-		let dispatch = Dispatch { lanes: lanes.as_mut_ptr(), items: items.as_mut_ptr(), count: items.len(), next: AtomicUsize::new(0), work };
+		// ONE ITEM IS THE CALLER'S OWN: waking a worker for it would only add the round trip.
+		let helpers = if items.len() <= 1 { 0 } else { self.count.min(lanes.len() - 1).min(items.len() - 1) };
+		let call = CALLS.fetch_add(1, Ordering::Relaxed);
+		let dispatch = Dispatch { lanes: lanes.as_mut_ptr(), items: items.as_mut_ptr(), count: items.len(), next: AtomicUsize::new(0), done: AtomicUsize::new(0), caller: AtomicU8::new(if items.is_empty() { FINISHED } else { ASKING }), report: self.report, work };
 		let data = &dispatch as *const Dispatch<'_, L, T> as *const ();
-		let entry = participate::<L, T> as unsafe fn(*const (), usize) as usize as u64;
-		fence(Ordering::Release);
-		let mut sent = 0;
+		let entry = participate::<L, T> as unsafe fn(*const (), usize) -> Option<u64> as usize as u64;
+		// THE ORDER IS WRITTEN AND THE CALL OPEN BEFORE ANY MAIL GOES, so mail is never early for its
+		// own call.
 		for (helper, index) in self.lent[..helpers].iter().enumerate() {
-			let mut order = [0u8; ORDER];
-			order[0] = RUN;
-			order[8..16].copy_from_slice(&entry.to_le_bytes());
-			order[16..24].copy_from_slice(&(data as u64).to_le_bytes());
-			order[24..32].copy_from_slice(&(helper as u64 + 1).to_le_bytes());
-			order[32..40].copy_from_slice(&self.report.to_le_bytes());
-			// A WORKER THAT CANNOT BE REACHED IS SIMPLY NOT WAITED FOR: the items are claimed, not
-			// assigned, so the participants that did start take its share.
-			if send_blocking(SLOTS[*index as usize].orders.load(Ordering::Acquire), &order, 0) {
-				sent += 1;
+			let slot = &SLOTS[*index as usize];
+			slot.entry.store(entry, Ordering::Relaxed);
+			slot.data.store(data as u64, Ordering::Relaxed);
+			slot.lane.store(helper as u64 + 1, Ordering::Relaxed);
+			slot.linger.store(self.linger_ns, Ordering::Relaxed);
+			slot.open.store(call, Ordering::SeqCst);
+		}
+		// POSTED, THEN LOOKED AT: a worker found parked is rung, and one that parks after the post finds
+		// the mail itself - see `next_call`. A WORKER THAT CANNOT BE RUNG IS SIMPLY NOT WAITED FOR: the
+		// items are claimed, not assigned, so the participants that did start take its share.
+		for index in &self.lent[..helpers] {
+			let slot = &SLOTS[*index as usize];
+			slot.mail.store(call, Ordering::SeqCst);
+			if slot.parked.load(Ordering::SeqCst) {
+				let _ = send_blocking(slot.orders.load(Ordering::Acquire), &[RING], 0);
 			}
 		}
-		// SAFETY: lane 0 is the caller's alone - every worker was given a lane above it.
-		unsafe { participate::<L, T>(data, 0) };
-		for _ in 0..sent {
+		// SAFETY: lane 0 is the caller's alone - every worker was given a lane above it. The caller's own
+		// finish of the last item asks for no report: it is not parked.
+		let _ = unsafe { participate::<L, T>(data, 0) };
+		// THE ITEMS ARE WAITED FOR, NOT THE WORKERS, and first by ASKING. A caller that parks is woken by
+		// the last item's finisher - a halted core brought back, which nested under a hypervisor costs a
+		// millisecond and more - and is moved onto that finisher's core besides. So it asks for as long
+		// as the pool's workers would, and parks only past that; the finisher reports only to a caller
+		// that did park, so a report is never sent that nobody takes.
+		let finished = || (dispatch.caller.load(Ordering::Acquire) == FINISHED).then_some(());
+		if poll(clock_ns().saturating_add(self.linger_ns), finished).is_none() && dispatch.caller.compare_exchange(ASKING, PARKED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
 			let mut reply = [0u8; 1];
 			match recv_blocking(self.reports, &mut reply) {
 				Received::Message { len: 1, .. } if reply[0] == DONE => {}
-				// A worker that will never report is a process that cannot finish this call; it ends
-				// here rather than returning while a worker may still hold the caller's slices.
+				// A report that will never come is a process that cannot finish this call; it ends
+				// here rather than returning while a worker may still hold its slices.
 				_ => die(),
 			}
+		}
+		// CLOSE THE CALL, then wait out every worker that got inside before the close: one that
+		// looks after it reads the call as over and touches nothing of the caller's. Mail nobody took
+		// is taken back, so a worker that comes to it late is not woken for nothing.
+		for index in &self.lent[..helpers] {
+			let slot = &SLOTS[*index as usize];
+			slot.open.store(0, Ordering::SeqCst);
+			let _ = slot.mail.compare_exchange(call, 0, Ordering::SeqCst, Ordering::Relaxed);
+		}
+		for index in &self.lent[..helpers] {
+			let slot = &SLOTS[*index as usize];
+			let _ = poll(u64::MAX, || (!slot.inside.load(Ordering::SeqCst)).then_some(()));
 		}
 		fence(Ordering::Acquire);
 	}
@@ -384,25 +583,40 @@ struct Dispatch<'w, L, T> {
 	items: *mut T,
 	count: usize,
 	next: AtomicUsize,
+	/// Items finished. The participant that takes it to `count` finished the call's last item.
+	done: AtomicUsize,
+	/// Whether the caller is asking, parked or finished; see `ASKING`.
+	caller: AtomicU8,
+	/// Where the last item's finisher reports, when that is not the caller.
+	report: u64,
 	work: &'w (dyn Fn(&mut L, &mut T) + Sync),
 }
 
-/// One participant's share of a dispatch: items claimed one at a time until none are left.
+/// One participant's share of a dispatch: items claimed one at a time until none are left. Answers
+/// where to report when this participant finished the call's last item and the caller had parked.
 ///
 /// # Safety
 /// `data` must point at a live `Dispatch<L, T>` with more than `lane` lanes, and no other
 /// participant may be using lane `lane`. Each item index is claimed by exactly one `fetch_add`, so
 /// the `&mut` made for it here is the only one.
-unsafe fn participate<L, T>(data: *const (), lane: usize) {
+unsafe fn participate<L, T>(data: *const (), lane: usize) -> Option<u64> {
 	let dispatch = unsafe { &*(data as *const Dispatch<'_, L, T>) };
 	let lane = unsafe { &mut *dispatch.lanes.add(lane) };
+	let mut last = None;
 	loop {
 		let index = dispatch.next.fetch_add(1, Ordering::Relaxed);
 		if index >= dispatch.count {
 			break;
 		}
 		(dispatch.work)(lane, unsafe { &mut *dispatch.items.add(index) });
+		// RELEASE FOR WHAT THIS ITEM WROTE, ACQUIRE FOR EVERY ITEM BEFORE IT: the finisher of the last
+		// one has seen all of them, and passes them on - to a caller still asking through the state it
+		// reads, to a parked one through the report it is woken by.
+		if dispatch.done.fetch_add(1, Ordering::AcqRel) + 1 == dispatch.count && dispatch.caller.swap(FINISHED, Ordering::AcqRel) == PARKED {
+			last = Some(dispatch.report);
+		}
 	}
+	last
 }
 
 /// Whether the calling thread is one of this process's workers - asked of its own stack pointer,
@@ -436,7 +650,12 @@ pub(crate) fn leaving(status: u64) {
 	if on_worker() {
 		die();
 	}
-	let mut order = [0u8; 9];
+	// A POLLING WORKER ENDS ON ITS MAIL, a parked one on the message below.
+	EXIT_STATUS.store(status, Ordering::Release);
+	for slot in &SLOTS[..workers] {
+		slot.mail.store(MAIL_EXIT, Ordering::SeqCst);
+	}
+	let mut order = [0u8; MESSAGE];
 	order[0] = EXIT;
 	order[1..9].copy_from_slice(&status.to_le_bytes());
 	fence(Ordering::Release);

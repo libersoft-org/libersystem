@@ -181,6 +181,10 @@ def production(root, overlay, *, candidate):
         'pub struct Audio {', 'pub struct Devices {', 'fn frame_bytes(',
         'unsafe fn post_playback(', 'fn answer_play(', 'pub unsafe fn play(',
         'pub unsafe fn end_play(', 'unsafe fn absorb_sink(', 'impl Audio {')]
+    if 'pub unsafe fn request_before_fill(' in usb_audio:
+        # No capture device is present in the playback fixture, and production answers false at
+        # `devices.source()` before it reads the consumer's channel; this is that answer.
+        audio_chunks.append('pub unsafe fn request_before_fill(_: &mut Xhci, _: &mut Hids, _: &mut Devices, _: u64, _: u32) -> bool { false }')
     if 'pub unsafe fn play_before_refill(' in usb_audio:
         audio_chunks.append(take(usb_audio, 'usb_audio.rs', 'pub unsafe fn play_before_refill('))
     else:
@@ -230,7 +234,8 @@ def production(root, overlay, *, candidate):
                       sha256=hashlib.sha256(raw_audio.encode()).hexdigest()))
     chunks.append('unsafe fn audio_completion(hc: &mut Xhci, mut audio: &mut usb_audio::Devices, '
         'serving: &common::Serving, ready: common::ProviderReady, pointer: u64, status: u32, control: u32) -> bool { unsafe {\n'
-        'let mut played_audio = false; let mut entered = false; loop { if entered { break; } entered = true;\n'
+        + ('let mut hids = Hids::new();\n' if 'request_before_fill(' in raw_audio else '')
+        + 'let mut played_audio = false; let mut entered = false; loop { if entered { break; } entered = true;\n'
         + raw_audio + '\nbreak; } played_audio } }')
     # Preserve the entire production dispatch body. Only device/MMIO producer and
     # absent class backends are modeled by SERVICE_DRAIN_MODELS in the fixture.
@@ -322,6 +327,14 @@ def run(args):
                       'audio-late', 'late credited PCM must precede the next silent refill'))
     frozen = {**old_pins, **new_pins, **audio_old_pins, **tail_old_pins, **service_old_pins, **late_old_pins,
               str(fixture_path): digest(fixture_path), str(Path(__file__).resolve()): digest(Path(__file__))}
+    # Both reviewed rustfmt spellings retain the same nested-recovery branch.
+    nested_skip_anchors = (
+        '|| hc.net_notify_pending.is_some()\n\t\t\t{\n\t\t\t\tcontinue;',
+        '|| hc.net_notify_pending.is_some() {\n\t\t\t\tcontinue;',
+    )
+    if sum(new.count(anchor) for anchor in nested_skip_anchors) != 1:
+        raise ValueError('nested-recovery mutation needs exactly one supported source spelling')
+    nested_skip = next(anchor for anchor in nested_skip_anchors if anchor in new)
     cases += [
         ('candidate', new, new_modules, True, 'all', None),
         ('drop-cdc-payload', replace_once(new, 'hc.net_notify_pending = Some((status, control));',
@@ -333,8 +346,7 @@ def run(args):
         ('keep-detached-hid', replace_once(new, 'hc.hid_pending.retain(|&(_, control)| control >> 24 != dev.slot);',
             'let _ = dev.slot;'), new_modules, True, 'detach', 'detached HID completion must not survive slot reuse'),
         ('sleep-after-nested-recovery', replace_once(new,
-            '|| hc.net_notify_pending.is_some()\n\t\t\t{\n\t\t\t\tcontinue;',
-            '|| hc.net_notify_pending.is_some()\n\t\t\t{\n\t\t\t\tlet _ = hc;'),
+            nested_skip, nested_skip.replace('continue;', 'let _ = hc;')),
             new_modules, True, 'nested-stall', 'nested recovery completions must prevent sleep'),
     ]
     cases += [
@@ -354,7 +366,8 @@ def run(args):
             'if !sink.ending {\n\t\t\t\t\tif !sink.dry', 'if true {\n\t\t\t\t\tif !sink.dry'),
             new_modules, True, 'audio-tail', 'intentional end padding is not an underrun'),
         ('leave-final-audio-padding', replace_once(new,
-            'for offset in taken..bytes {', 'for offset in taken..(if sink.ending { taken } else { bytes }) {'),
+            'core::ptr::write_bytes((at + taken as u64) as *mut u8, 0, bytes - taken);',
+            'core::ptr::write_bytes((at + taken as u64) as *mut u8, 0, if sink.ending { 0 } else { bytes - taken });'),
             new_modules, True, 'audio-tail', 'ending DMA preserves every PCM byte and zero-fills only final tail'),
     ]
     cases += [

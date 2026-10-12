@@ -159,6 +159,9 @@ impl Texture {
 		let decoded = match self.semantics {
 			// A MEASUREMENT AND A DIRECTION ARE NOT LIGHT. Decoding them changes what they mean.
 			Semantics::Data | Semantics::Normal | Semantics::Depth | Semantics::Identity | Semantics::Mask => texel,
+			// THE IDENTITY TRANSFER IS THE SAME WIDENING AND NARROWING without the call: `decode` answers
+			// a linear value unchanged, so what remains of it is the `f64` round trip, kept here as it is.
+			Semantics::Color if self.transfer == Transfer::Linear => [(texel[0] as f64) as f32, (texel[1] as f64) as f32, (texel[2] as f64) as f32, texel[3]],
 			Semantics::Color => [
 				graphics_core::color::decode(self.transfer, texel[0] as f64) as f32,
 				graphics_core::color::decode(self.transfer, texel[1] as f64) as f32,
@@ -270,25 +273,34 @@ fn texel_key(texture: u32, level: u32, x: u32, y: u32, z: u32) -> u64 {
 	interleaved | (rest << 8)
 }
 
-/// Bring a normalised coordinate into range, per axis, and say whether it landed on the border.
+/// Bring a texel index into range, per axis, and say whether it landed on the border.
 ///
 /// APPLIED AFTER THE LEVEL IS CHOSEN, so a wrapped coordinate does not change the derivative the
 /// level came from - which is the ordering the profile states and the one that keeps a repeating
 /// texture from picking the coarsest level at every seam.
+///
+/// EVERY CALLER ASKS WITH A WHOLE NUMBER OF TEXELS - a tap's floor or its neighbour - and the index is
+/// taken through an `f32` exactly as a coordinate would be: a whole number beyond `2^24` is not an
+/// `f32` and rounds, and that rounded value, clamped to the bound, is the index the wrap sees. A floor
+/// of a whole number is itself and a whole number is never a NaN, so neither is computed.
 // @handles: SamplerWrapClamp, SamplerWrapRepeat, SamplerWrapMirror, SamplerWrapBorder
-fn address(coordinate: f32, extent: u32, wrap: Wrap) -> Option<i64> {
+fn address(index: i64, extent: u32, wrap: Wrap) -> Option<i64> {
 	let size = extent as i64;
 	if size == 0 {
 		return None;
 	}
-	if coordinate.is_nan() {
-		return None;
-	}
-	let index = libm::floorf(coordinate.clamp(-TEXEL_COORD_BOUND, TEXEL_COORD_BOUND)) as i64;
+	let index = (index as f32).clamp(-TEXEL_COORD_BOUND, TEXEL_COORD_BOUND) as i64;
+	wrap_index(index, size, wrap)
+}
+
+/// Bring a whole texel index into a level of `size` texels.
+fn wrap_index(index: i64, size: i64, wrap: Wrap) -> Option<i64> {
 	match wrap {
 		Wrap::ClampToEdge => Some(index.clamp(0, size - 1)),
-		// THE EUCLIDEAN REMAINDER, so a negative coordinate lands where its positive twin does.
-		Wrap::Repeat => Some(index.rem_euclid(size)),
+		// THE EUCLIDEAN REMAINDER, so a negative coordinate lands where its positive twin does. For a
+		// power-of-two extent it is the low bits of the two's-complement index - the same number, without
+		// the division.
+		Wrap::Repeat => Some(if size & (size - 1) == 0 { index & (size - 1) } else { index.rem_euclid(size) }),
 		Wrap::MirroredRepeat => {
 			let period = 2 * size;
 			let folded = index.rem_euclid(period);
@@ -306,15 +318,22 @@ fn address(coordinate: f32, extent: u32, wrap: Wrap) -> Option<i64> {
 
 /// One texel of one level, after addressing, decoding and premultiplication.
 fn fetch(texture: &Texture, level: &Level, level_index: u32, x: i64, y: i64, z: i64, sampler: &Sampler, cache: &mut Option<&mut Cache>) -> Texel {
-	let Some(x) = address(x as f32, level.width, sampler.wrap_u) else { return sampler.border.texel() };
-	let Some(y) = address(y as f32, level.height, sampler.wrap_v) else { return sampler.border.texel() };
+	fetch_addressed(texture, level, level_index, address(x, level.width, sampler.wrap_u), address(y, level.height, sampler.wrap_v), z, sampler, cache)
+}
+
+/// `fetch` with the first two axes already brought into range, which is what lets a bilinear tap
+/// address each of its two columns and two rows once rather than once per texel: `address` is a pure
+/// function of the index, so the four texels see exactly the addresses they would have computed.
+fn fetch_addressed(texture: &Texture, level: &Level, level_index: u32, x: Option<i64>, y: Option<i64>, z: i64, sampler: &Sampler, cache: &mut Option<&mut Cache>) -> Texel {
+	let Some(x) = x else { return sampler.border.texel() };
+	let Some(y) = y else { return sampler.border.texel() };
 	// A FLAT TEXTURE HAS ONE PLANE AND ITS ADDRESS IS ZERO, so the third axis is not wrapped: the
 	// caller only ever asks for `z = 0` on a depth-one level - `sample_level` builds the second
 	// plane exclusively when `depth > 1` - and every wrap mode maps index zero inside an extent of
 	// one to zero. This is the same answer `address` returns, not a different one: what it removes
 	// is a third of the per-tap addressing on every 2D texture, which is all of them in this scene.
 	let z = if level.depth > 1 {
-		match address(z as f32, level.depth, sampler.wrap_w) {
+		match address(z, level.depth, sampler.wrap_w) {
 			Some(z) => z,
 			None => return sampler.border.texel(),
 		}
@@ -384,13 +403,17 @@ fn sample_level(texture: &Texture, level_index: u32, coordinate: [f32; 3], sampl
 			fetch(texture, level, level_index, round(u), round(v), round(w), sampler, cache)
 		}
 		Filter::Linear => {
-			let (x0, y0) = (libm::floorf(u) as i64, libm::floorf(v) as i64);
-			let (fx, fy) = (u - libm::floorf(u), v - libm::floorf(v));
+			let (floor_u, floor_v) = (libm::floorf(u), libm::floorf(v));
+			let (x0, y0) = (floor_u as i64, floor_v as i64);
+			let (fx, fy) = (u - floor_u, v - floor_v);
+			// THE TWO COLUMNS AND THE TWO ROWS ARE ADDRESSED ONCE, for every plane of the tap.
+			let (column, next_column) = (address(x0, level.width, sampler.wrap_u), address(x0 + 1, level.width, sampler.wrap_u));
+			let (row, next_row) = (address(y0, level.height, sampler.wrap_v), address(y0 + 1, level.height, sampler.wrap_v));
 			let plane = |z: i64, cache: &mut Option<&mut Cache>| {
-				let a = fetch(texture, level, level_index, x0, y0, z, sampler, cache);
-				let b = fetch(texture, level, level_index, x0 + 1, y0, z, sampler, cache);
-				let c = fetch(texture, level, level_index, x0, y0 + 1, z, sampler, cache);
-				let d = fetch(texture, level, level_index, x0 + 1, y0 + 1, z, sampler, cache);
+				let a = fetch_addressed(texture, level, level_index, column, row, z, sampler, cache);
+				let b = fetch_addressed(texture, level, level_index, next_column, row, z, sampler, cache);
+				let c = fetch_addressed(texture, level, level_index, column, next_row, z, sampler, cache);
+				let d = fetch_addressed(texture, level, level_index, next_column, next_row, z, sampler, cache);
 				blend(blend(a, b, fx), blend(c, d, fx), fy)
 			};
 			if level.depth > 1 {

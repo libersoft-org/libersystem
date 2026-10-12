@@ -2194,6 +2194,10 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 					{
 						played_audio = true;
 					}
+					// AND A CAPTURE REQUEST ALREADY WAITING is taken before the source's completion is: a
+					// batch of events is up to a ring of them, a capture standing behind the whole batch
+					// waits while every completion in it fills the FIFO, and a slow core overran it there.
+					usb_audio::request_before_fill(hc, &mut hids, &mut audio, server, control);
 					if usb_audio::absorb(hc, &mut audio, pointer, status, control) {
 						continue;
 					}
@@ -2376,40 +2380,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 							if handle != 0 {
 								close(handle);
 							}
-							match audio::message(&period[..len]) {
-								// A PERIOD IS QUEUED ON THE STANDING PLAYBACK, and answered when there is room for the next.
-								audio::Message::Play => usb_audio::play(hc, &mut audio, server, &period[..len]),
-								// A CAPTURE IS ANSWERED FROM THE SOURCE'S STANDING CAPTURE - now, or when a
-								// period is there - and its end stops the stream.
-								audio::Message::Capture => usb_audio::capture(hc, &mut hids, &mut audio, server),
-								audio::Message::EndCapture => {
-									usb_audio::end_capture(hc, &mut hids, &mut audio);
-									send_blocking(server, audio::OK, 0);
-								}
-								// THE END OF THE PLAYBACK STREAM: what is queued plays out, and the stream goes idle.
-								audio::Message::EndPlayback => {
-									usb_audio::end_play(hc, &mut audio);
-									send_blocking(server, audio::OK, 0);
-								}
-								// THE SINK'S COUNTERS, or a refusal with no sink here.
-								audio::Message::Stats => match usb_audio::stats(&mut audio) {
-									Some(stats) => {
-										send_blocking(server, &stats.encode(), 0);
-									}
-									None => {
-										send_blocking(server, audio::REFUSED, 0);
-									}
-								},
-								// WHAT THIS PROVIDER IS: the directions its function has, at the wire's fixed format.
-								audio::Message::Format => {
-									send_blocking(server, &usb_audio::format(&mut audio).encode(), 0);
-								}
-								// A SHAPE THIS WIRE DOES NOT HAVE is refused, with the wire's own refusal - and so is a
-								// level, which this driver leaves to the consumer to scale.
-								audio::Message::Unknown | audio::Message::Volume(_) => {
-									send_blocking(server, audio::REFUSED, 0);
-								}
-							}
+							usb_audio::serve(hc, &mut hids, &mut audio, server, &period[..len]);
 							false
 						}
 						Polled::Empty => false,

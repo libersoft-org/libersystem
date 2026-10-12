@@ -2,7 +2,7 @@
 //! its destination rows; workers only read attachments. The fixed array books all dispatch storage.
 
 use graphics_core::layout::RowOrigin;
-use graphics_core::pixel::{Rgba, write};
+use graphics_core::pixel::{Rgba, write_row};
 use graphics_core::{ImageViewMut, OwnedImage};
 use render_math::Vec4;
 use soft3d::pass::Colour;
@@ -32,12 +32,24 @@ pub(super) fn bands(image: &mut OwnedImage) -> [Option<Band<'_>>; MAX_BANDS] {
 }
 
 pub(super) fn paint(band: &mut Band<'_>, colour: &Colour, identities: &Colour, overlay: bool) {
+	// A ROW IS WRITTEN IN RUNS, through the row writer's own path for the format, rather than a pixel
+	// at a time through the general one: the same channels, quantised by the same function in the same
+	// order, without asking the layout what each pixel is.
+	const RUN: usize = 64;
 	let extent = band.view.layout().extent;
+	let mut run = [Rgba::new(0.0, 0.0, 0.0, 1.0); RUN];
 	for y in 0..extent.height {
-		for x in 0..extent.width {
-			let source_y = band.first_y + y;
-			let texel = if overlay { identity_colour(identities.identity_at(x, source_y, 0).unwrap_or(0)) } else { colour.at(x, source_y, 0) };
-			write(&mut band.view, x, y, Rgba::new(texel.x, texel.y, texel.z, 1.0));
+		let source_y = band.first_y + y;
+		let mut x = 0;
+		while x < extent.width {
+			let count = (extent.width - x).min(RUN as u32) as usize;
+			for (offset, slot) in run[..count].iter_mut().enumerate() {
+				let source_x = x + offset as u32;
+				let texel = if overlay { identity_colour(identities.identity_at(source_x, source_y, 0).unwrap_or(0)) } else { colour.at(source_x, source_y, 0) };
+				*slot = Rgba::new(texel.x, texel.y, texel.z, 1.0);
+			}
+			write_row(&mut band.view, x, y, &run[..count]);
+			x += count as u32;
 		}
 	}
 }

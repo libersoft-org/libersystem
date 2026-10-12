@@ -1266,7 +1266,77 @@ rather than invented, and the HDR item in `P02M0103` records the same boundary.
 benchmark above locates the cost in the shader interpreter's value plumbing, and closing a gap of
 that size needs the two structural changes it names - a register-file interpreter and parallel tile
 execution - rather than more measurement. Recording the number here, unmet, is what keeps the floor a
-floor.
+floor. (MET ON 2026-10-12 - the section below.)
+
+## The 3D demo at its floor (2026-10-12)
+
+`./check.sh --gate qemu-3d-demo` and `./check.sh --gate qemu-3d-extended`, both PASS, 2026-10-12 from
+02:16Z: an x86_64 guest under QEMU 10.0.13 with KVM on the reference host - an Intel Xeon Platinum 8272CL
+at 2.60 GHz, 100 logical CPUs, itself a KVM guest, so the demo's machine runs NESTED - with the 32 vCPUs
+the gate boots and checks, release builds, and the guest's own monotonic clock (`rt::clock_ns`,
+`SYS_CLOCK_MONO_NS`). Each row is one `test3d-sw --no-input --report --frames 35` run at a fixed surface
+and scene extent: five warm-up presents, then thirty complete frame intervals, the scene animated, and
+the surface scaled by DisplayService onto the 1280x800 scanout.
+
+| surface and scene | median | p99 | 30 intervals | scene | transparent | handover | 2D overlay | present | fragments | heap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 320x240 | 20.1 ms | 26.1 ms | 600 ms | 3.17 ms | 1.37 ms | 0.11 ms | 1.19 ms | 4.58 ms | 59,856 | 22.7 MB |
+| 800x600 | 23.4 ms | 30.1 ms | 734 ms | 12.56 ms | 3.26 ms | 0.40 ms | 4.29 ms | 4.07 ms | 374,050 | 47.1 MB |
+| 640x480 | 16.5 ms | 24.0 ms | 516 ms | 7.98 ms | 2.43 ms | 0.23 ms | 2.81 ms | 3.84 ms | 239,406 | 37.7 MB |
+| 640x480 | 16.6 ms | 20.4 ms | 509 ms | 8.11 ms | 2.38 ms | 0.24 ms | 2.69 ms | 3.21 ms | 239,406 | 37.7 MB |
+| 640x480 | 17.0 ms | 27.4 ms | 537 ms | 8.18 ms | 2.50 ms | 0.32 ms | 2.86 ms | 3.51 ms | 239,406 | 37.7 MB |
+
+**THE FLOOR IS MET, IN ALL THREE WINDOWS AND WITH ROOM.** It is a median of at most 33.3 ms and thirty
+intervals in at most one second, at 640x480, with no steady-state allocation; the three windows took
+516, 509 and 537 ms, and no frame of them took longer than 27.4 ms. The slowest present was 11.9 ms.
+Attachments at 640x480: colour 6,600 kB, depth 3,300 kB, the shared image 1,200 kB.
+
+THE 640x480 MEDIANS ARE THE FRAME LOOP'S OWN PACE, NOT THE WORK. With no timing from the display
+service, `graphics-app` paces a loop at 16 ms (`UNPACED_INTERVAL_NS`) and parks on a deadline the
+kernel's 10 ms tick rounds up, so a frame that finishes early waits. The stages sum to 17 to 18 ms;
+the 320x240 row, whose work is half that, shows the pacing alone at 20 ms.
+
+WHAT MOVED IT from the 63 ms (15.8 fps) measured on 2026-10-11, each measured on its own in the same
+guest:
+  1. COMPILED SHADER PROGRAMS (`soft3d::compiled`): a stage's IR is compiled once per pipeline into
+     typed straight-line code - specialised `f32` arithmetic, dot/normalize/length, matrix-vector,
+     clamp/mix, the transcendentals, structured jumps for the control flow - with any operation it
+     does not specialise run through the interpreter's own `operation`, uniforms read once per draw,
+     and fragments shaded eight at a time where a stage allows it. A program that cannot run hands
+     the run back to the interpreter. HELD TO THE INTERPRETER BIT FOR BIT: every stage the crate's
+     tests and the conformance suite execute is run both ways and compared (`differential`), and
+     `compiled::tests` drives every arithmetic family through NaN, both zeros, both infinities and a
+     denormal, plus control flow that reads a value only one path assigned, and the batch lane by lane.
+     61.5 ms to 47.5 ms, with the texture addressing below.
+  2. TEXTURE ADDRESSING on integers once a texel index is known, a power-of-two repeat as a mask, the
+     bilinear footprint's four addresses computed once, and a linear-transfer colour texture read
+     without its conversion.
+  3. THE WORKER POOL WAITS FOR ITEMS, NOT WORKERS, AND WAITS IN USER MODE. A call is open per slot, so
+     a worker that arrives late finds nothing to do and holds nobody up; the last finisher reports only
+     to a caller that parked, and parks itself; and a waiting worker or caller polls its slot's mail
+     with a pause, making a system call only every 256 polls, while a parked worker is rung on its
+     channel. 47.5 ms to 39.7 ms for the first two parts; the user-mode wait took the rows from 28.5 ms
+     to 19 ms, and most of what it removed was the cost of a call rather than of its work: the
+     handover, a pass over 307,200 pixels, went from 2.4 ms to 0.2 ms with nothing else changed.
+     Polling THROUGH THE CHANNEL - a receive and a yield per poll - was measured and is not here:
+     beside 31 workers polling that way the display service's present took 10 to 12 ms against 6 to 7
+     beside quiet ones, and the tiny-scene probe's median rose from 16 to 24-28 ms.
+  4. THE HANDOVER WRITES ROWS, sixty-four pixels at a time through `write_row`, where it wrote pixels.
+  5. THE SCALED PRESENT (`pix`, DisplayService's blit onto a scanout of another size): the source
+     column is stepped instead of divided per pixel, a row an upscale repeats is copied whole, and a
+     pixel is one four-byte copy. 5.3-6.6 ms to 3.2-3.8 ms. `scaled_tests` holds it to the frozen
+     generic blitter byte for byte, at the real 640x480-on-1280x800 geometry among others.
+
+THE EXTENDED PHASE, measured in the same session by its own gate, which no floor applies to:
+
+| surface and scene | median | 30 intervals | shadow | lighting | postprocess | present |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 320x240 | 83.1 ms | 2,517 ms | 15.3 ms | 40.8 ms | 26.7 ms | 4.35 ms |
+| 640x480 | 124.7 ms | 3,764 ms | 14.3 ms | 47.6 ms | 58.5 ms | 3.87 ms |
+| 800x600 | 158.6 ms | 4,783 ms | 14.4 ms | 52.2 ms | 85.1 ms | 4.01 ms |
+
+The HDR postprocess - six downsamples, five upsamples and the resolve - is now the largest stage and the
+one that grows with the window; the shadow pass stays flat, as its map's extent is the light's.
 
 ## soft2d on several cores (2026-09-27)
 

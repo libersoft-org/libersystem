@@ -2053,6 +2053,32 @@ fn a_warmed_frame_asks_the_allocator_for_nothing() {
 // frame is cut into by default, and the boundary and the pool's six with the other two. (Each count is
 // a preparation that decodes a copy the size of the ceiling, which is what the case costs.)
 fn a_second_lane_never_displaces_a_decoded_copy() {
+	// This boundary forces the decoded-half sampler without a device-space cache.
+	// Use rt::pool's actual 256-KiB worker budget for that unoptimised path; the
+	// general Threads helper and its other 128-KiB-stack checks remain unchanged.
+	struct DecodedCopyThreads(usize);
+	impl Workers for DecodedCopyThreads {
+		fn lanes(&self) -> usize {
+			self.0
+		}
+		fn run<'u>(&self, lanes: &mut [Lane], units: &mut [Unit<'u>], work: &(dyn Fn(&mut Lane, &mut Unit<'u>) + Sync)) {
+			let queue = std::sync::Mutex::new(units.iter_mut());
+			std::thread::scope(|scope| {
+				for lane in lanes.iter_mut() {
+					let queue = &queue;
+					std::thread::Builder::new()
+						.stack_size(256 * 1024)
+						.spawn_scoped(scope, move || {
+							loop {
+								let Some(unit) = queue.lock().unwrap().next() else { break };
+								work(lane, unit);
+							}
+						})
+						.unwrap();
+				}
+			});
+		}
+	}
 	let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
 	let draw_image = |size: u32| {
 		let record = render2d::list::ImageRecord { identity: 9, layout_generation: 1, content_generation: 1 };
@@ -2065,13 +2091,27 @@ fn a_second_lane_never_displaces_a_decoded_copy() {
 	// A small copy first, to learn what the frame and one lane cost without it.
 	let small = source(8);
 	let mut probe = Soft2d::new().with_images(&small);
-	let prepared = probe.prepare(&draw_image(8), &description(&target(512, 448))).expect("a small preparation");
-	let base = render2d::backend::Prepared::scratch_bytes(&prepared) - 8 * 8 * 8;
+	let small_list = draw_image(8);
+	let mut prepared = probe.prepare(&small_list, &description(&target(512, 448))).expect("a small preparation");
+	assert_eq!(prepared.commands(), 2, "the original ground and image, without a layer");
+	let sampled = prepared.command_damage(1).expect("the image's device-space bounds");
+	let sample_bytes = u64::from(sampled.width) * u64::from(sampled.height) * core::mem::size_of::<graphics_core::pixel::Rgba>() as u64;
+	// Device-space samples and their table are charged AFTER lane admission. Only the
+	// calibration preparations are discarded before rendering; their actual cache count
+	// and public command bounds identify the charge that must not inflate the lane budget.
+	let cache_table = (prepared.commands() * core::mem::size_of::<Option<crate::paint::CachedPaint>>()) as u64;
+	assert_eq!(prepared.discard_image_samples(), 1, "the small probe admitted one device-space cache");
+	let base = render2d::backend::Prepared::scratch_bytes(&prepared) - 8 * 8 * 8 - cache_table - sample_bytes;
 	// WHAT A SECOND LANE COSTS with each kind of unit: in bands its scratch and nothing more, cut into
 	// tiles the unit table as well, and through the intermediate the intermediate too.
 	let second = |kind: UnitKind| {
 		let mut two = Soft2d::new().with_images(&small).with_workers(&Rotating(2)).with_units(kind);
-		render2d::backend::Prepared::scratch_bytes(&two.prepare(&draw_image(8), &description(&target(512, 448))).expect("two lanes")) - 8 * 8 * 8 - base
+		let mut prepared = two.prepare(&draw_image(8), &description(&target(512, 448))).expect("two lanes");
+		assert_eq!(prepared.lanes(), 2, "the calibration frame admits both offered lanes");
+		assert_eq!(prepared.commands(), 2, "the same two-command calibration frame");
+		assert_eq!(prepared.command_damage(1), Some(sampled), "the same device-space sample bounds");
+		assert_eq!(prepared.discard_image_samples(), 1, "the two-lane probe admitted one device-space cache");
+		render2d::backend::Prepared::scratch_bytes(&prepared) - 8 * 8 * 8 - cache_table - sample_bytes - base
 	};
 	let lane = second(UnitKind::Bands);
 	assert!(lane > 0, "a second lane costs scratch");
@@ -2081,22 +2121,29 @@ fn a_second_lane_never_displaces_a_decoded_copy() {
 	let big = source(size);
 	let list = draw_image(size);
 	let mut serial = Soft2d::new().with_images(&big);
-	let one = serial.prepare(&list, &description(&target(512, 448))).expect("a preparation that fits");
+	let mut one = serial.prepare(&list, &description(&target(512, 448))).expect("a preparation that fits");
 	assert_eq!(one.decoded_images(), 1, "the copy fits beside one lane");
+	let one_bytes = render2d::backend::Prepared::scratch_bytes(&one);
+	assert_eq!(one_bytes, base + u64::from(size) * u64::from(size) * 8 + cache_table, "the large frame has the same fixed costs and no device-space samples");
+	assert!(one_bytes <= ceiling, "the complete one-lane preparation fits the scratch ceiling");
+	let room = ceiling - (one_bytes - cache_table);
+	assert!(lane <= room && room < 2 * lane, "the actual rounded image leaves room for a second lane, not a third: {room} bytes, {lane} per lane");
 	let mut reference = target(512, 448);
 	serial.render(&one, &mut reference.view_mut()).expect("the serial frame");
+	assert_eq!(one.discard_image_samples(), 0, "the large serial frame admitted no device-space samples; checked after its unmodified render");
 	for kind in [UnitKind::Bands, UnitKind::Tiles, UnitKind::Rectangles] {
 		// TWO LANES WHERE THE SECOND LANE'S WHOLE COST FITS THE ROOM LEFT, and never three: the room is
 		// less than two lanes' scratch.
-		let fits = if second(kind) <= lane + lane / 2 { 2 } else { 1 };
+		let fits = if second(kind) <= room { 2 } else { 1 };
 		if kind == UnitKind::Bands {
 			assert_eq!(fits, 2, "bands fit a second lane, so the case sits on the boundary it tests");
 		}
 		let counts: &[usize] = if kind == UnitKind::Rectangles { &[1, 2, 3, 4, 5, 6] } else { &[2, 6] };
 		for &workers in counts {
-			let pool = Threads(workers);
+			let pool = DecodedCopyThreads(workers);
 			let mut backend = Soft2d::new().with_images(&big).with_workers(&pool).with_units(kind);
-			let prepared = backend.prepare(&list, &description(&target(512, 448))).expect("a preparation with a pool");
+			let mut prepared = backend.prepare(&list, &description(&target(512, 448))).expect("a preparation with a pool");
+			assert!(render2d::backend::Prepared::scratch_bytes(&prepared) <= ceiling, "{kind:?} x{workers}: the complete preparation stays within the scratch ceiling");
 			assert_eq!(prepared.decoded_images(), 1, "{kind:?} x{workers}: the pool's lanes did not displace the copy");
 			assert!(prepared.units() >= pool.lanes(), "{kind:?} x{workers}: the frame has {} units, fewer than the pool's lanes", prepared.units());
 			assert_eq!(prepared.lanes(), workers.min(fits), "{kind:?} x{workers}: the lanes are what the ceiling left room for");
@@ -2105,6 +2152,7 @@ fn a_second_lane_never_displaces_a_decoded_copy() {
 			}
 			let mut image = target(512, 448);
 			backend.render(&prepared, &mut image.view_mut()).expect("a frame");
+			assert_eq!(prepared.discard_image_samples(), 0, "{kind:?} x{workers}: no device-space samples; checked after the unmodified render");
 			assert!(image.bytes() == reference.bytes(), "{kind:?} x{workers}: the pixels are the one-lane frame's");
 		}
 	}

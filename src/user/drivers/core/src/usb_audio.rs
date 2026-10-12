@@ -510,17 +510,21 @@ unsafe fn post_playback(hc: &mut Xhci, dev: &UsbDevice, sink: &mut Sink) {
 			let bytes = (frames * frame) as usize;
 			let at = sink.virt + u64::from(sink.next) * u64::from(sink.binding.max_packet);
 			let taken = bytes.min(sink.queue.len());
-			for offset in 0..taken {
-				let byte = sink.queue.pop_front().unwrap_or(0);
-				((at + offset as u64) as *mut u8).write_volatile(byte);
+			// THE QUEUE'S BYTES MOVE AS RUNS, not one at a time: two copies at most, one per half of the
+			// ring buffer, into the packet's slot - ordinary DMA memory the release fence below orders
+			// before the TRB that names it.
+			let (front, back) = sink.queue.as_slices();
+			let first = taken.min(front.len());
+			core::ptr::copy_nonoverlapping(front.as_ptr(), at as *mut u8, first);
+			if taken > first {
+				core::ptr::copy_nonoverlapping(back.as_ptr(), (at + first as u64) as *mut u8, taken - first);
 			}
+			sink.queue.drain(..taken);
 			// Keep the final packet at the paced size too: a fixed-size sink can discard a short packet.
 			// Its intentional end padding is not an underrun, and the empty ending queue posts no further packet.
 			let length = bytes;
 			if taken < bytes {
-				for offset in taken..bytes {
-					((at + offset as u64) as *mut u8).write_volatile(0);
-				}
+				core::ptr::write_bytes((at + taken as u64) as *mut u8, 0, bytes - taken);
 				if !sink.ending {
 					if !sink.dry {
 						sink.dry = true;
@@ -588,7 +592,7 @@ pub unsafe fn play(hc: &mut Xhci, devices: &mut Devices, server: u64, period: &[
 			send_blocking(server, audio::REFUSED, 0);
 			return;
 		}
-		sink.queue.extend(period.iter().copied());
+		sink.queue.extend(period);
 		sink.ending = false;
 		if !sink.running && sink.queue.len() >= PLAYBACK_START {
 			sink.running = true;
@@ -615,6 +619,66 @@ pub unsafe fn play_before_refill(hc: &mut Xhci, devices: &mut Devices, server: u
 			close(handle);
 		}
 		play(hc, devices, server, &period[..len]);
+		true
+	}
+}
+
+/// ONE MESSAGE FROM THE AUDIO CONSUMER on `server`, whatever its shape: the one place the wire's requests are answered,
+/// for the provider loop and for a request taken ahead of an event batch.
+pub unsafe fn serve(hc: &mut Xhci, hids: &mut Hids, devices: &mut Devices, server: u64, message: &[u8]) {
+	unsafe {
+		match audio::message(message) {
+			// A PERIOD IS QUEUED ON THE STANDING PLAYBACK, and answered when there is room for the next.
+			audio::Message::Play => play(hc, devices, server, message),
+			// A CAPTURE IS ANSWERED FROM THE SOURCE'S STANDING CAPTURE - now, or when a period is there - and its end
+			// stops the stream.
+			audio::Message::Capture => capture(hc, hids, devices, server),
+			audio::Message::EndCapture => {
+				end_capture(hc, hids, devices);
+				send_blocking(server, audio::OK, 0);
+			}
+			// THE END OF THE PLAYBACK STREAM: what is queued plays out, and the stream goes idle.
+			audio::Message::EndPlayback => {
+				end_play(hc, devices);
+				send_blocking(server, audio::OK, 0);
+			}
+			// THE SINK'S COUNTERS, or a refusal with no sink here.
+			audio::Message::Stats => match stats(devices) {
+				Some(stats) => {
+					send_blocking(server, &stats.encode(), 0);
+				}
+				None => {
+					send_blocking(server, audio::REFUSED, 0);
+				}
+			},
+			// WHAT THIS PROVIDER IS: the directions its function has, at the wire's fixed format.
+			audio::Message::Format => {
+				send_blocking(server, &format(devices).encode(), 0);
+			}
+			// A SHAPE THIS WIRE DOES NOT HAVE is refused, with the wire's own refusal - and so is a level, which this driver
+			// leaves to the consumer to scale.
+			audio::Message::Unknown | audio::Message::Volume(_) => {
+				send_blocking(server, audio::REFUSED, 0);
+			}
+		}
+	}
+}
+
+/// A REQUEST WAITING ON THE CONSUMER'S CHANNEL, taken when the source's completion is next: every request on this wire
+/// but a period is one byte, so one at the channel's head is answered here - a capture before the completion that
+/// can answer it is absorbed, rather than after the whole batch of events it arrived in. Whether one was taken.
+pub unsafe fn request_before_fill(hc: &mut Xhci, hids: &mut Hids, devices: &mut Devices, server: u64, control: u32) -> bool {
+	unsafe {
+		let Some((dev, source)) = devices.source() else { return false };
+		if control >> 24 != dev.slot || control >> 16 & 0x1f != source.dci || server == 0 || channel_peek(server) != 1 {
+			return false;
+		}
+		let mut request = [0u8; 1];
+		let Polled::Message { len, handle } = try_recv(server, &mut request) else { return false };
+		if handle != 0 {
+			close(handle);
+		}
+		serve(hc, hids, devices, server, &request[..len]);
 		true
 	}
 }
@@ -827,7 +891,15 @@ fn answer_waiting(source: &mut Source) {
 		send_blocking(source.waiting, audio::REFUSED, 0);
 		source.waiting = 0;
 	} else if source.fifo.len() >= audio::PERIOD_BYTES as usize {
-		let period: Vec<u8> = source.fifo.drain(..audio::PERIOD_BYTES as usize).collect();
+		// A PERIOD OUT OF THE FIFO AS TWO RUNS AT MOST, into a buffer of the period's own size: no
+		// allocation per period and no byte at a time.
+		const BYTES: usize = audio::PERIOD_BYTES as usize;
+		let mut period = [0u8; BYTES];
+		let (front, back) = source.fifo.as_slices();
+		let first = BYTES.min(front.len());
+		period[..first].copy_from_slice(&front[..first]);
+		period[first..].copy_from_slice(&back[..BYTES - first]);
+		source.fifo.drain(..audio::PERIOD_BYTES as usize);
 		send_blocking(source.waiting, &period, 0);
 		source.waiting = 0;
 	}
@@ -912,9 +984,8 @@ pub unsafe fn absorb(hc: &mut Xhci, devices: &mut Devices, pointer: u64, status:
 				print(b"driver.xhci: audio capture overran its FIFO - the capture is ended, and refused until it is stopped\n");
 			} else {
 				let base = source.virt + slot as u64 * packet as u64;
-				for at in 0..moved as u64 {
-					source.fifo.push_back(r8(base + at));
-				}
+				// THE PACKET'S BYTES IN ONE APPEND: the transfer completed, so the device is done with them.
+				source.fifo.extend(core::slice::from_raw_parts(base as *const u8, moved as usize));
 			}
 		}
 		post_captures(hc, dev, source);

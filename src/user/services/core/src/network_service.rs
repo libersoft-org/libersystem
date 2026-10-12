@@ -57,9 +57,17 @@ const PING_TIMEOUT_TICKS: u64 = 50;
 const DNS_TIMEOUT_TICKS: u64 = 300;
 // How long an SNTP query waits for its reply (100 Hz ticks).
 const NTP_TIMEOUT_TICKS: u64 = 300;
-// How long DHCP waits for each of the OFFER and the ACK before falling back to the
-// static configuration (100 Hz ticks).
-const DHCP_TIMEOUT_TICKS: u64 = 200;
+// How long DHCP waits after each DISCOVER or REQUEST before sending it again, and how many times
+// each goes out before the client falls back to the static configuration (100 Hz ticks).
+//
+// NOT ONE SHOT. A healthy server may stay silent for seconds on purpose: dnsmasq pings an address
+// before offering it and stays deaf to DHCP for up to its `PING_WAIT` of three seconds while it
+// waits, and RFC 2131 4.1 puts a client's first retransmission at four seconds for that reason. A
+// client that sent one DISCOVER and gave up after two seconds took the static fallback against every
+// such server, and a DISCOVER lost on a link still coming up was never sent again.
+const DHCP_RETRANSMIT_TICKS: u64 = 200;
+const DHCP_DISCOVERS: u32 = 3;
+const DHCP_REQUESTS: u32 = 2;
 // The scheduler tick rate the lease clock converts the DHCP seconds with.
 const TICKS_PER_SEC: u64 = 100;
 // How often an unanswered lease-extension REQUEST (or a failed re-acquisition
@@ -3084,57 +3092,70 @@ fn do_dhcp(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> bool
 	let mut txn: dhcp::Transaction = dhcp::Transaction::new(random_u32(), stack.mac().0);
 	txn.phase = dhcp::Phase::Selecting;
 	stack.set_dhcp_xid(txn.xid);
-	// Broadcast a DISCOVER and wait for the server's OFFER.
-	let discover: usize = stack.build_dhcp_discover(tx);
-	send_frame(frames, &tx[..discover]);
-	let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
-	while clock() < deadline && txn.phase == dhcp::Phase::Selecting {
-		if wait_frames(frames, stack, deadline) != 0 {
-			break;
+	// Broadcast a DISCOVER and wait for the server's OFFER, sending it again while none comes. It is
+	// BUILT AGAIN each time because answering ARP while waiting writes into the same buffer; the
+	// transaction identity is the same, so an OFFER to any of the copies is admissible.
+	for _ in 0..DHCP_DISCOVERS {
+		let discover: usize = stack.build_dhcp_discover(tx);
+		send_frame(frames, &tx[..discover]);
+		let deadline: u64 = clock() + DHCP_RETRANSMIT_TICKS;
+		while clock() < deadline && txn.phase == dhcp::Phase::Selecting {
+			if wait_frames(frames, stack, deadline) != 0 {
+				break;
+			}
+			let Event::DhcpReply(reply) = pump(frames, stack, rx, tx) else {
+				continue;
+			};
+			// ADMITTED FIRST, COMMITTED AFTER. A reply that is not admissible in this phase changes
+			// nothing at all, which is the property the old write-then-check order could not have.
+			if let dhcp::Admit::SelectOffer = txn.admit(&reply) {
+				// THE CLIENT SELECTS ONE OFFER and freezes the server and the address: from here a
+				// reply is admissible only if it comes from that server for that address, which `xid`
+				// and `chaddr` alone cannot decide because every legitimate server answering the same
+				// discover shares both.
+				txn.server = reply.server;
+				txn.requested = Some(reply.yiaddr);
+				txn.phase = dhcp::Phase::Requesting;
+				stack.commit_lease();
+			}
 		}
-		let Event::DhcpReply(reply) = pump(frames, stack, rx, tx) else {
-			continue;
-		};
-		// ADMITTED FIRST, COMMITTED AFTER. A reply that is not admissible in this phase changes
-		// nothing at all, which is the property the old write-then-check order could not have.
-		if let dhcp::Admit::SelectOffer = txn.admit(&reply) {
-			// THE CLIENT SELECTS ONE OFFER and freezes the server and the address: from here a reply
-			// is admissible only if it comes from that server for that address, which `xid` and
-			// `chaddr` alone cannot decide because every legitimate server answering the same
-			// discover shares both.
-			txn.server = reply.server;
-			txn.requested = Some(reply.yiaddr);
-			txn.phase = dhcp::Phase::Requesting;
-			stack.commit_lease();
+		if txn.phase == dhcp::Phase::Requesting || stack.channel_closed() {
+			break;
 		}
 	}
 	if txn.phase != dhcp::Phase::Requesting {
 		return false;
 	}
-	// REQUEST the offered address and wait for the server's ACK.
-	let request: usize = stack.build_dhcp_request(tx);
-	send_frame(frames, &tx[..request]);
-	let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
-	while clock() < deadline {
-		if wait_frames(frames, stack, deadline) != 0 {
-			break;
+	// REQUEST the offered address and wait for the server's ACK, again sent more than once.
+	for _ in 0..DHCP_REQUESTS {
+		let request: usize = stack.build_dhcp_request(tx);
+		send_frame(frames, &tx[..request]);
+		let deadline: u64 = clock() + DHCP_RETRANSMIT_TICKS;
+		while clock() < deadline {
+			if wait_frames(frames, stack, deadline) != 0 {
+				break;
+			}
+			let Event::DhcpReply(reply) = pump(frames, stack, rx, tx) else {
+				continue;
+			};
+			match txn.admit(&reply) {
+				dhcp::Admit::CommitLease => {
+					stack.commit_lease();
+					stack.apply_dhcp();
+					return true;
+				}
+				// AN ADMISSIBLE NAK IS A STATE TRANSITION, not a non-event: the server has declared
+				// this client's request invalid, so the lease and the address go and discovery starts
+				// again.
+				dhcp::Admit::ClearLease => {
+					stack.clear_lease();
+					return false;
+				}
+				_ => {}
+			}
 		}
-		let Event::DhcpReply(reply) = pump(frames, stack, rx, tx) else {
-			continue;
-		};
-		match txn.admit(&reply) {
-			dhcp::Admit::CommitLease => {
-				stack.commit_lease();
-				stack.apply_dhcp();
-				return true;
-			}
-			// AN ADMISSIBLE NAK IS A STATE TRANSITION, not a non-event: the server has declared this
-			// client's request invalid, so the lease and the address go and discovery starts again.
-			dhcp::Admit::ClearLease => {
-				stack.clear_lease();
-				return false;
-			}
-			_ => {}
+		if stack.channel_closed() {
+			break;
 		}
 	}
 	false

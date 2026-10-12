@@ -245,6 +245,17 @@ pub fn terminate_user(info: FaultInfo) -> ! {
 	let have_thread = match sched::current_thread() {
 		Some(thread) => {
 			let process = thread.process();
+			// A PAGE FAULT IN A PROCESS ALREADY BEING TORN DOWN BELONGS TO THE TEARDOWN. `terminate`
+			// unmaps every memory object first and a thread of the process reaches a kill point only
+			// later - one running on another core, or preempted and resumed, touches its own heap in
+			// between and faults on memory the kill took. The process is ending for whatever began
+			// the teardown; recording, printing and reporting a crash here would report one that did
+			// not happen, and tell its supervisor so. `is_terminating` and not `is_killed`, which is
+			// published only after the unmap - the very window this is.
+			if info.kind == FAULT_PAGE && process.is_terminating() {
+				drop(thread);
+				arch::usermode::exit_to_kernel();
+			}
 			process.set_fault(info);
 			let koid = process.header().koid();
 			// The report belongs here rather than in each architecture's trap handler, and

@@ -30,6 +30,7 @@ use render3d::depth::{DepthFormat, StencilFace};
 use render3d::{CompareOp, Error, Render3DLimits};
 
 use crate::clip::{self, Clipped, Varyings};
+use crate::compiled;
 use crate::geometry::{self, Indices, Primitive};
 use crate::interp;
 use crate::interpreter::{self, Resources};
@@ -240,8 +241,23 @@ impl Workers for Serial {
 #[derive(Default)]
 pub struct Lane {
 	machine: interpreter::Machine,
+	/// The registers and outputs of a batched fragment run, and the fragments waiting for one.
+	batch: compiled::Batch,
+	pending: Vec<Pending>,
 	stats: Stats,
 	failure: Option<(usize, Error)>,
+}
+
+/// A fragment that passed its early tests, interpolated and waiting for the shader.
+#[derive(Clone, Copy)]
+struct Pending {
+	x: i64,
+	y: i64,
+	coverage: u32,
+	depth: f32,
+	inverse_w: f32,
+	smooth: Varyings,
+	noperspective: Varyings,
 }
 
 /// One tile of one draw: its pixels in every colour attachment and the depth one, and its bound.
@@ -283,6 +299,8 @@ pub struct Prepared {
 	/// Where each fragment varying lives in the three interpolated arrays, per pipeline. COMPUTED
 	/// ONCE: it is a property of the pipeline, and rebuilding it per draw would allocate per draw.
 	maps: Vec<Vec<(u32, Interpolation, usize, usize, render_shader::Type)>>,
+	/// Each pipeline's stages compiled once, with the storage their uniforms are read into per draw.
+	programs: Vec<Programs>,
 	draws: Vec<Draw>,
 	bins: Bins,
 	scratch: Scratch,
@@ -356,7 +374,8 @@ pub fn prepare(limits: Render3DLimits, pipelines: Vec<Pipeline>, draws: Vec<Draw
 		}
 	}
 	let maps: Vec<Vec<(u32, Interpolation, usize, usize, render_shader::Type)>> = pipelines.iter().map(varying_map).collect();
-	Ok(Prepared { pipelines, maps, draws, bins: Bins::new(width, height), scratch: Scratch::default(), limits })
+	let programs = pipelines.iter().zip(&maps).map(|(pipeline, map)| Programs::new(pipeline, map)).collect();
+	Ok(Prepared { pipelines, maps, programs, draws, bins: Bins::new(width, height), scratch: Scratch::default(), limits })
 }
 
 impl Prepared {
@@ -412,6 +431,21 @@ impl Prepared {
 				lane.machine.reserve(&pipeline.fragment)?;
 			}
 		}
+		for programs in &self.programs {
+			if let Some(program) = &programs.vertex {
+				self.scratch.vertex_machine.registers.reserve(program)?;
+			}
+			if let Some(program) = &programs.fragment {
+				self.scratch.fragment_machine.registers.reserve(program)?;
+				for lane in &mut self.scratch.lanes {
+					lane.machine.registers.reserve(program)?;
+					if program.batched() {
+						lane.batch.reserve(program, &programs.module)?;
+						storage(&mut lane.pending, compiled::LANES)?;
+					}
+				}
+			}
+		}
 		Ok(())
 	}
 
@@ -444,7 +478,7 @@ impl Prepared {
 	/// `execute` borrows them - so charging for them here would charge for them twice.
 	pub fn reserved_bytes(&self) -> usize {
 		let of = |capacity: usize, each: usize| capacity * each;
-		of(self.pipelines.capacity(), core::mem::size_of::<Pipeline>()) + self.maps.iter().map(|map| of(map.capacity(), core::mem::size_of::<(u32, Interpolation, usize, usize, render_shader::Type)>())).sum::<usize>() + of(self.draws.capacity(), core::mem::size_of::<Draw>()) + self.bins.reserved_bytes() + of(self.scratch.primitives.capacity(), core::mem::size_of::<Primitive>()) + of(self.scratch.setups.capacity(), core::mem::size_of::<Binned>()) + of(self.scratch.segments.capacity(), core::mem::size_of::<Segment>()) + of(self.scratch.points.capacity(), core::mem::size_of::<Dot>()) + of(self.scratch.run.capacity(), core::mem::size_of::<u32>()) + of(self.scratch.clip_work.capacity(), core::mem::size_of::<clip::Workspace>()) + core::mem::size_of::<Clipped>() + of(self.scratch.lanes.capacity(), core::mem::size_of::<Lane>()) + self.scratch.lanes.iter().map(|lane| lane.machine.reserved_bytes()).sum::<usize>() + of(self.scratch.tiles.capacity(), core::mem::size_of::<Tile<'static, 'static>>()) + of(self.scratch.views.capacity(), core::mem::size_of::<Option<ColourView<'static>>>()) + self.scratch.vertex_machine.reserved_bytes() + self.scratch.fragment_machine.reserved_bytes()
+		of(self.pipelines.capacity(), core::mem::size_of::<Pipeline>()) + self.maps.iter().map(|map| of(map.capacity(), core::mem::size_of::<(u32, Interpolation, usize, usize, render_shader::Type)>())).sum::<usize>() + of(self.draws.capacity(), core::mem::size_of::<Draw>()) + self.bins.reserved_bytes() + of(self.scratch.primitives.capacity(), core::mem::size_of::<Primitive>()) + of(self.scratch.setups.capacity(), core::mem::size_of::<Binned>()) + of(self.scratch.segments.capacity(), core::mem::size_of::<Segment>()) + of(self.scratch.points.capacity(), core::mem::size_of::<Dot>()) + of(self.scratch.run.capacity(), core::mem::size_of::<u32>()) + of(self.scratch.clip_work.capacity(), core::mem::size_of::<clip::Workspace>()) + core::mem::size_of::<Clipped>() + of(self.scratch.lanes.capacity(), core::mem::size_of::<Lane>()) + self.scratch.lanes.iter().map(|lane| lane.machine.reserved_bytes() + lane.batch.reserved_bytes() + of(lane.pending.capacity(), core::mem::size_of::<Pending>())).sum::<usize>() + of(self.scratch.tiles.capacity(), core::mem::size_of::<Tile<'static, 'static>>()) + of(self.scratch.views.capacity(), core::mem::size_of::<Option<ColourView<'static>>>()) + self.scratch.vertex_machine.reserved_bytes() + self.scratch.fragment_machine.reserved_bytes() + of(self.programs.capacity(), core::mem::size_of::<Programs>()) + self.programs.iter().map(Programs::reserved_bytes).sum::<usize>()
 	}
 
 	/// How much scratch this plan is holding, so a fixture can assert that a steady-state frame
@@ -495,11 +529,16 @@ pub fn execute_with(prepared: &mut Prepared, attachments: &mut Attachments<'_>, 
 	let draws = core::mem::take(&mut prepared.draws);
 	let pipelines = core::mem::take(&mut prepared.pipelines);
 	let maps = core::mem::take(&mut prepared.maps);
+	let mut programs = core::mem::take(&mut prepared.programs);
 	let mut outcome = Ok(());
 	for draw in &draws {
 		let pipeline = &pipelines[draw.pipeline as usize];
 		let map = &maps[draw.pipeline as usize];
-		outcome = draw_one(prepared, attachments, source, workers, draw, pipeline, map, width, height, samples, &mut stats);
+		// THE DRAW'S UNIFORMS ARE READ ONCE, before its first vertex: the source does not change while
+		// the frame runs, so every invocation of the draw would read these same values.
+		let compiled = &mut programs[draw.pipeline as usize];
+		compiled.bind(source);
+		outcome = draw_one(prepared, attachments, source, workers, draw, pipeline, compiled, map, width, height, samples, &mut stats);
 		if outcome.is_err() {
 			break;
 		}
@@ -507,11 +546,12 @@ pub fn execute_with(prepared: &mut Prepared, attachments: &mut Attachments<'_>, 
 	prepared.draws = draws;
 	prepared.pipelines = pipelines;
 	prepared.maps = maps;
+	prepared.programs = programs;
 	outcome.map(|()| stats)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, draw: &Draw, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, draw: &Draw, pipeline: &Pipeline, programs: &Programs, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if pipeline.state.samples != samples {
 		return Err(Error::IncompatiblePipeline { reason: "the pipeline's sample count disagrees with the pass's attachments" });
 	}
@@ -536,29 +576,29 @@ fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: 
 		for primitive in &primitives {
 			match primitive {
 				Primitive::Triangle { vertices, provoking, .. } => {
-					stage_triangle(prepared, pipeline, source, *vertices, *provoking, instance_index, &attachments.viewport, width, height, stats)?;
+					stage_triangle(prepared, pipeline, programs, source, *vertices, *provoking, instance_index, &attachments.viewport, width, height, stats)?;
 				}
 				Primitive::Line { vertices, .. } => {
-					stage_line(prepared, pipeline, source, *vertices, instance_index, &attachments.viewport, stats)?;
+					stage_line(prepared, pipeline, programs, source, *vertices, instance_index, &attachments.viewport, stats)?;
 				}
 				Primitive::Point { vertex, index } => {
-					stage_point(prepared, pipeline, source, *vertex, *index, draw.topology, instance_index, &attachments.viewport, stats)?;
+					stage_point(prepared, pipeline, programs, source, *vertex, *index, draw.topology, instance_index, &attachments.viewport, stats)?;
 				}
 			}
 		}
 		prepared.scratch.primitives = primitives;
-		shade_bins(prepared, attachments, source, workers, pipeline, map, width, height, samples, stats)?;
-		shade_lines(prepared, attachments, source, pipeline, map, width, height, samples, stats)?;
-		shade_points(prepared, attachments, source, pipeline, map, width, height, samples, stats)?;
+		shade_bins(prepared, attachments, source, workers, pipeline, programs, map, width, height, samples, stats)?;
+		shade_lines(prepared, attachments, source, pipeline, programs, map, width, height, samples, stats)?;
+		shade_points(prepared, attachments, source, pipeline, programs, map, width, height, samples, stats)?;
 	}
 	Ok(())
 }
 
 /// Run the vertex stage for one vertex and split its varyings by declared qualifier.
 // @handles: ProgrammableVertexStage
-fn run_vertex(pipeline: &Pipeline, source: &dyn Source, vertex: u32, instance: u32, machine: &mut interpreter::Machine) -> Result<Shaded, Error> {
+fn run_vertex(pipeline: &Pipeline, programs: &Programs, source: &dyn Source, vertex: u32, instance: u32, machine: &mut interpreter::Machine) -> Result<Shaded, Error> {
 	let bindings = VertexBindings { source, vertex, instance };
-	interpreter::execute_into(&pipeline.vertex, &bindings, machine).map_err(fault)?;
+	run_stage(&pipeline.vertex, programs.vertex(), &bindings, machine).map_err(fault)?;
 	let outputs = machine.outputs();
 	let position = outputs.position.as_ref().ok_or(Error::InvalidShader { reason: "a vertex stage that produced no position" })?;
 	let mut shaded = Shaded { position: Vec4::new(position.f32_at(0), position.f32_at(1), position.f32_at(2), position.f32_at(3)), point_size: outputs.point_size.unwrap_or(1.0), smooth: Varyings::EMPTY, noperspective: Varyings::EMPTY, flat: Varyings::EMPTY };
@@ -580,6 +620,157 @@ fn run_vertex(pipeline: &Pipeline, source: &dyn Source, vertex: u32, instance: u
 		}
 	}
 	Ok(shaded)
+}
+
+/// A pipeline's two stages compiled, and the uniforms each reads, filled per draw.
+struct Programs {
+	vertex: Option<compiled::Program>,
+	fragment: Option<compiled::Program>,
+	/// The fragment module, which sizes a batch's outputs.
+	module: render_shader::Module,
+	vertex_uniforms: compiled::Uniforms,
+	fragment_uniforms: compiled::Uniforms,
+}
+
+impl Programs {
+	/// Compile both stages. A stage that will not compile runs through the interpreter, which is
+	/// always correct, so this cannot fail a pipeline that validated.
+	fn new(pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)]) -> Self {
+		let vertex = compiled::compile(&pipeline.vertex, None);
+		let fragment = compiled::compile(&pipeline.fragment, Some(map));
+		let vertex_uniforms = vertex.as_ref().map(compiled::Uniforms::for_program).unwrap_or_default();
+		let fragment_uniforms = fragment.as_ref().map(compiled::Uniforms::for_program).unwrap_or_default();
+		Self { vertex, fragment, module: pipeline.fragment.clone(), vertex_uniforms, fragment_uniforms }
+	}
+
+	/// Read the draw's uniforms. ALLOCATES NOTHING: the storage was sized when the stage compiled.
+	fn bind(&mut self, source: &dyn Source) {
+		if let Some(program) = &self.vertex {
+			self.vertex_uniforms.fill(program, |block, member| source.uniform(block, member));
+		}
+		if let Some(program) = &self.fragment {
+			self.fragment_uniforms.fill(program, |block, member| source.uniform(block, member));
+		}
+	}
+
+	fn vertex(&self) -> Option<(&compiled::Program, &compiled::Uniforms)> {
+		self.vertex.as_ref().map(|program| (program, &self.vertex_uniforms))
+	}
+
+	fn fragment(&self) -> Option<(&compiled::Program, &compiled::Uniforms)> {
+		self.fragment.as_ref().map(|program| (program, &self.fragment_uniforms))
+	}
+
+	fn reserved_bytes(&self) -> usize {
+		self.vertex.as_ref().map_or(0, compiled::Program::reserved_bytes) + self.fragment.as_ref().map_or(0, compiled::Program::reserved_bytes) + self.vertex_uniforms.reserved_bytes() + self.fragment_uniforms.reserved_bytes() + core::mem::size_of_val(self.module.body.as_slice()) + core::mem::size_of_val(self.module.types.as_slice())
+	}
+}
+
+/// Run one stage invocation: COMPILED where the stage compiled and the draw's uniforms are the types
+/// it was compiled for, THE INTERPRETER otherwise - and for the one invocation a compiled run hands
+/// back.
+fn run_stage<B: Resources + compiled::Inputs>(module: &render_shader::Module, compiled: Option<(&compiled::Program, &compiled::Uniforms)>, bindings: &B, machine: &mut interpreter::Machine) -> Result<(), interpreter::Fault> {
+	if let Some((program, uniforms)) = compiled {
+		if uniforms.usable() {
+			let outcome = compiled::run(program, uniforms, bindings, machine);
+			#[cfg(any(test, feature = "differential"))]
+			differential(module, bindings, &outcome, machine);
+			match outcome {
+				Ok(compiled::Ran::Done) => return Ok(()),
+				Ok(compiled::Ran::Deopt) => {}
+				Err(fault) => return Err(fault),
+			}
+		}
+	}
+	interpreter::execute_into(module, bindings, machine)
+}
+
+/// EVERY COMPILED RUN CHECKED AGAINST THE INTERPRETER, in this crate's tests and in any crate's that
+/// turns on `differential`: the same outputs bit for bit, or the same fault. A run the program handed
+/// back is the interpreter's anyway.
+#[cfg(any(test, feature = "differential"))]
+fn differential(module: &render_shader::Module, bindings: &dyn Resources, outcome: &Result<compiled::Ran, interpreter::Fault>, machine: &interpreter::Machine) {
+	let check = || {
+		let mut shadow = interpreter::Machine::default();
+		let reference = interpreter::execute_into(module, bindings, &mut shadow);
+		match outcome {
+			Ok(compiled::Ran::Done) => {
+				assert_eq!(reference, Ok(()), "the interpreter faulted where the compiled {:?} stage `{}` ran", module.stage, module.name);
+				assert!(machine.outputs().same_bits(shadow.outputs()), "the compiled {:?} stage `{}` disagrees with the interpreter: {:?} against {:?}", module.stage, module.name, machine.outputs(), shadow.outputs());
+			}
+			Ok(compiled::Ran::Deopt) => {}
+			Err(fault) => assert_eq!(reference, Err(fault.clone()), "the compiled {:?} stage `{}` faulted differently", module.stage, module.name),
+		}
+	};
+	#[cfg(test)]
+	crate::counted::uncounted(check);
+	#[cfg(not(test))]
+	check();
+}
+
+impl compiled::Inputs for VertexBindings<'_> {
+	fn varyings(&self, _array: u8) -> &[f32] {
+		&[]
+	}
+
+	fn built_in(&self, which: render_shader::ir::BuiltIn, out: &mut [u32; 4]) -> Option<usize> {
+		let value = Resources::built_in(self, which)?;
+		let words = value.words();
+		out[..words.len()].copy_from_slice(words);
+		Some(words.len())
+	}
+
+	fn attribute(&self, location: u32) -> Option<Val> {
+		Resources::attribute(self, location)
+	}
+
+	fn sample(&self, texture: u32, sampler: u32, coordinate: &Val) -> Option<Val> {
+		Resources::sample(self, texture, sampler, coordinate)
+	}
+}
+
+impl compiled::Inputs for FragmentBindings<'_> {
+	fn varyings(&self, array: u8) -> &[f32] {
+		match array {
+			0 => self.smooth,
+			1 => self.noperspective,
+			_ => self.flat,
+		}
+	}
+
+	fn built_in(&self, which: render_shader::ir::BuiltIn, out: &mut [u32; 4]) -> Option<usize> {
+		use render_shader::ir::BuiltIn;
+		// THE SAME ANSWERS AS `Resources::built_in` BELOW, without building a value per read.
+		match which {
+			BuiltIn::FragmentCoordinate => {
+				for (slot, value) in out.iter_mut().zip(self.coordinate) {
+					*slot = value.to_bits();
+				}
+				Some(4)
+			}
+			BuiltIn::FrontFacing => {
+				out[0] = u32::from(self.front_facing);
+				Some(1)
+			}
+			BuiltIn::SampleIndex => {
+				out[0] = self.sample_index;
+				Some(1)
+			}
+			BuiltIn::SampleMaskIn => {
+				out[0] = self.sample_mask;
+				Some(1)
+			}
+			_ => None,
+		}
+	}
+
+	fn attribute(&self, _location: u32) -> Option<Val> {
+		None
+	}
+
+	fn sample(&self, texture: u32, sampler: u32, coordinate: &Val) -> Option<Val> {
+		self.source.sample(texture, sampler, coordinate)
+	}
 }
 
 fn fault(fault: interpreter::Fault) -> Error {
@@ -709,10 +900,10 @@ fn varying_map(pipeline: &Pipeline) -> Vec<(u32, Interpolation, usize, usize, re
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertices: [u32; 3], provoking: u8, instance: u32, viewport: &Viewport, width: u32, height: u32, stats: &mut Stats) -> Result<(), Error> {
+fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, programs: &Programs, source: &dyn Source, vertices: [u32; 3], provoking: u8, instance: u32, viewport: &Viewport, width: u32, height: u32, stats: &mut Stats) -> Result<(), Error> {
 	let mut machine = core::mem::take(&mut prepared.scratch.vertex_machine);
 	let shaded = {
-		let mut run = |vertex: u32| run_vertex(pipeline, source, vertex, instance, &mut machine);
+		let mut run = |vertex: u32| run_vertex(pipeline, programs, source, vertex, instance, &mut machine);
 		let outcome = (run(vertices[0]), run(vertices[1]), run(vertices[2]));
 		match outcome {
 			(Ok(a), Ok(b), Ok(c)) => [a, b, c],
@@ -781,6 +972,8 @@ struct Shared<'s> {
 	bins: &'s [Vec<u32>],
 	overflow: &'s [bool],
 	pipeline: &'s Pipeline,
+	/// The fragment stage compiled, with the draw's uniforms, when it can run that way.
+	fragment: Option<(&'s compiled::Program, &'s compiled::Uniforms)>,
 	map: &'s [(u32, Interpolation, usize, usize, render_shader::Type)],
 	source: &'s dyn Source,
 	keep: (i64, i64, i64, i64),
@@ -796,7 +989,7 @@ struct Shared<'s> {
 
 #[allow(clippy::too_many_arguments)]
 // @handles: Scissor
-fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, pipeline: &Pipeline, programs: &Programs, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if prepared.scratch.setups.is_empty() {
 		return Ok(());
 	}
@@ -834,7 +1027,7 @@ fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source
 		tiles.push(Tile { index, x: index as u32 % across, y: index as u32 / across, colour, depth, far, ran: false });
 	}
 	let fixed_depth = pipeline.stencil.is_none() && pipeline.stencil_back.is_none() && !writes_fragment_depth(&pipeline.fragment.body);
-	let shared = Shared { setups: &setups, bins, overflow, pipeline, map, source, keep: writable(attachments.scissor, width, height), width, height, samples, early_depth: fixed_depth && samples == 1, hierarchical_depth: fixed_depth && pipeline.bias == (0.0, 0.0, 0.0), failed: AtomicUsize::new(usize::MAX) };
+	let shared = Shared { setups: &setups, bins, overflow, pipeline, fragment: programs.fragment(), map, source, keep: writable(attachments.scissor, width, height), width, height, samples, early_depth: fixed_depth && samples == 1, hierarchical_depth: fixed_depth && pipeline.bias == (0.0, 0.0, 0.0), failed: AtomicUsize::new(usize::MAX) };
 	// A TILE WHOSE VIEWS ARE MISSING IS A TILE THIS DRAW CANNOT SHADE - storage shorter than the
 	// extent it claims - and it is refused rather than shaded into nothing.
 	let whole = tiles.len() == count && tiles.iter().all(|tile| tile.colour.iter().all(Option::is_some)) && (depth_tiles.is_none() || tiles.iter().all(|tile| tile.depth.is_some()));
@@ -910,16 +1103,45 @@ fn shade_tile(shared: &Shared<'_>, lane: &mut Lane, tile: &mut Tile<'_, '_>) -> 
 		let x1 = bounds.x1.min(area.x1).min(keep.2);
 		let y0 = bounds.y0.max(area.y0).max(keep.1);
 		let y1 = bounds.y1.min(area.y1).min(keep.3);
-		for y in y0..y1 {
-			for x in x0..x1 {
-				let coverage = raster::coverage(&binned.setup, x, y, shared.samples)?;
-				if coverage == 0 {
-					continue;
+		// A BATCHED FRAGMENT STAGE shades the triangle's fragments eight at a time and writes them in
+		// the order they were met. The batch ends with the triangle, so a later triangle's early depth
+		// test sees every write before it, and a pixel never appears twice in one batch.
+		let batched = shared.fragment.filter(|(program, uniforms)| program.batched() && uniforms.usable());
+		let Some((program, uniforms)) = batched else {
+			for y in y0..y1 {
+				for x in x0..x1 {
+					let coverage = raster::coverage(&binned.setup, x, y, shared.samples)?;
+					if coverage == 0 {
+						continue;
+					}
+					drew_anything = true;
+					shade_pixel(&mut targets, shared.source, pipeline, shared.fragment, shared.map, binned, x, y, coverage, shared.samples, shared.early_depth, &mut lane.stats, &mut lane.machine)?;
 				}
-				drew_anything = true;
-				shade_pixel(&mut targets, shared.source, pipeline, shared.map, binned, x, y, coverage, shared.samples, shared.early_depth, &mut lane.stats, &mut lane.machine)?;
 			}
-		}
+			continue;
+		};
+		lane.pending.clear();
+		let outcome = (|| -> Result<(), Error> {
+			for y in y0..y1 {
+				for x in x0..x1 {
+					let coverage = raster::coverage(&binned.setup, x, y, shared.samples)?;
+					if coverage == 0 {
+						continue;
+					}
+					drew_anything = true;
+					let Some(fragment) = prepare_fragment(&mut targets, pipeline, binned, x, y, coverage, shared.early_depth)? else { continue };
+					lane.pending.push(fragment);
+					if lane.pending.len() == compiled::LANES {
+						flush(&mut targets, shared, program, uniforms, binned, lane)?;
+					}
+				}
+			}
+			Ok(())
+		})();
+		// WHAT WAS MET BEFORE A FAILURE IS WRITTEN BEFORE IT IS ANSWERED, as the serial walk would have.
+		let flushed = flush(&mut targets, shared, program, uniforms, binned, lane);
+		outcome?;
+		flushed?;
 	}
 	// THE BOUND IS READ BACK FROM THE DEPTH BUFFER, once per tile, after the tile is drawn. A bound
 	// inferred from the triangles that covered it would only be valid when one of them covered the
@@ -944,7 +1166,16 @@ struct Targets<'t, 'a> {
 
 #[allow(clippy::too_many_arguments)]
 // @handles: ProgrammableFragmentStage
-fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], binned: &Binned, x: i64, y: i64, coverage: u32, samples: u32, early_depth: bool, stats: &mut Stats, machine: &mut interpreter::Machine) -> Result<(), Error> {
+fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pipeline, compiled: Option<(&compiled::Program, &compiled::Uniforms)>, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], binned: &Binned, x: i64, y: i64, coverage: u32, samples: u32, early_depth: bool, stats: &mut Stats, machine: &mut interpreter::Machine) -> Result<(), Error> {
+	let Some(fragment) = prepare_fragment(targets, pipeline, binned, x, y, coverage, early_depth)? else { return Ok(()) };
+	let bindings = fragment_bindings(&fragment, binned, source, map);
+	run_stage(&pipeline.fragment, compiled, &bindings, machine).map_err(fault)?;
+	finish_fragment(targets, pipeline, binned, &fragment, machine.outputs(), samples, stats)
+}
+
+/// A fragment's depth, its early tests and its interpolated inputs: everything before the shader.
+/// `None` when the early depth test already rejected it.
+fn prepare_fragment(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, binned: &Binned, x: i64, y: i64, coverage: u32, early_depth: bool) -> Result<Option<Pending>, Error> {
 	let centre = |dx: i64, dy: i64| (crate::Subpixel((x + dx) * crate::fixed::SUBPIXEL_ONE + crate::fixed::SUBPIXEL_HALF), crate::Subpixel((y + dy) * crate::fixed::SUBPIXEL_ONE + crate::fixed::SUBPIXEL_HALF));
 	let weights = raster::barycentric(&binned.setup, centre(0, 0));
 	// INTERPOLATED INTO FIXED ARRAYS, not into vectors: a `Vec` per fragment is an allocation per
@@ -954,14 +1185,8 @@ fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pi
 		// does not depend on the value being interpolated, and a stage with four `vec4` varyings was
 		// computing the identical number sixteen times.
 		let shared = interp::perspective(weights, binned.setup.inverse_w);
-		let mut smooth = Varyings::EMPTY;
-		for index in 0..binned.smooth[0].len() {
-			smooth.push(interp::smooth_with(&shared, [binned.smooth[0].as_slice()[index], binned.smooth[1].as_slice()[index], binned.smooth[2].as_slice()[index]]));
-		}
-		let mut screen_linear = Varyings::EMPTY;
-		for index in 0..binned.noperspective[0].len() {
-			screen_linear.push(interp::noperspective(weights, [binned.noperspective[0].as_slice()[index], binned.noperspective[1].as_slice()[index], binned.noperspective[2].as_slice()[index]]));
-		}
+		let smooth = Varyings::from_fn(binned.smooth[0].len(), |index| interp::smooth_with(&shared, [binned.smooth[0].as_slice()[index], binned.smooth[1].as_slice()[index], binned.smooth[2].as_slice()[index]]));
+		let screen_linear = Varyings::from_fn(binned.noperspective[0].len(), |index| interp::noperspective(weights, [binned.noperspective[0].as_slice()[index], binned.noperspective[1].as_slice()[index], binned.noperspective[2].as_slice()[index]]));
 		(smooth, screen_linear)
 	};
 	let depth = interp::depth(weights, binned.setup.depth);
@@ -986,22 +1211,79 @@ fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pi
 		}
 		let stored = buffer.depth_at(x as u32, y as u32, 0);
 		if !render3d::depth::test(buffer.format(), pipeline.depth_compare, false, depth, stored, None).passed {
-			return Ok(());
+			return Ok(None);
 		}
 	}
 	let (smooth, noperspective) = interpolate(weights);
+	Ok(Some(Pending { x, y, coverage, depth, inverse_w: interp::inverse_w_at(weights, binned.setup.inverse_w), smooth, noperspective }))
+}
 
-	let bindings = FragmentBindings { source, smooth: smooth.as_slice(), noperspective: noperspective.as_slice(), flat: binned.flat.as_slice(), locations: map, front_facing: binned.setup.facing == Facing::Front, coordinate: [x as f32 + 0.5, y as f32 + 0.5, depth, interp::inverse_w_at(weights, binned.setup.inverse_w)], sample_index: 0, sample_mask: coverage };
-	interpreter::execute_into(&pipeline.fragment, &bindings, machine).map_err(fault)?;
+/// What a prepared fragment's shader reads.
+fn fragment_bindings<'a>(fragment: &'a Pending, binned: &'a Binned, source: &'a dyn Source, map: &'a [(u32, Interpolation, usize, usize, render_shader::Type)]) -> FragmentBindings<'a> {
+	FragmentBindings { source, smooth: fragment.smooth.as_slice(), noperspective: fragment.noperspective.as_slice(), flat: binned.flat.as_slice(), locations: map, front_facing: binned.setup.facing == Facing::Front, coordinate: [fragment.x as f32 + 0.5, fragment.y as f32 + 0.5, fragment.depth, fragment.inverse_w], sample_index: 0, sample_mask: fragment.coverage }
+}
+
+/// Everything after the shader: the counts, a discard, and the writes.
+fn finish_fragment(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, binned: &Binned, fragment: &Pending, outputs: &interpreter::Outputs, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	stats.fragments += 1;
-	if machine.outputs().discarded {
+	if outputs.discarded {
 		stats.discarded += 1;
 		return Ok(());
 	}
-	let depth = machine.outputs().depth.unwrap_or(depth);
-	let written = write_outputs(targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, binned.setup.facing, samples)?;
+	let depth = outputs.depth.unwrap_or(fragment.depth);
+	let written = write_outputs(targets, pipeline, outputs, fragment.x as u32, fragment.y as u32, fragment.coverage, depth, binned.setup.facing, samples)?;
 	stats.samples_written += written;
 	Ok(())
+}
+
+/// Shade and write the lane's waiting fragments, in the order they were met.
+///
+/// A BATCH THAT ANY LANE CANNOT FINISH - a fault, a load of another type - is run again one fragment
+/// at a time, each written before the next is shaded: the serial walk's own order, so its first
+/// fault and everything written before it are the same.
+fn flush(targets: &mut Targets<'_, '_>, shared: &Shared<'_>, program: &compiled::Program, uniforms: &compiled::Uniforms, binned: &Binned, lane: &mut Lane) -> Result<(), Error> {
+	if lane.pending.is_empty() {
+		return Ok(());
+	}
+	let pipeline = shared.pipeline;
+	let count = lane.pending.len();
+	let last = count - 1;
+	let inputs: [FragmentBindings<'_>; compiled::LANES] = core::array::from_fn(|index| fragment_bindings(&lane.pending[index.min(last)], binned, shared.source, shared.map));
+	let outcome = if compiled::run_batch(program, uniforms, &inputs[..count], &mut lane.batch) {
+		(|| -> Result<(), Error> {
+			for (index, fragment) in lane.pending.iter().enumerate() {
+				#[cfg(any(test, feature = "differential"))]
+				differential_batch(&pipeline.fragment, &inputs[index], lane.batch.outputs(index));
+				finish_fragment(targets, pipeline, binned, fragment, lane.batch.outputs(index), shared.samples, &mut lane.stats)?;
+			}
+			Ok(())
+		})()
+	} else {
+		(|| -> Result<(), Error> {
+			for (index, fragment) in lane.pending.iter().enumerate() {
+				run_stage(&pipeline.fragment, Some((program, uniforms)), &inputs[index], &mut lane.machine).map_err(fault)?;
+				finish_fragment(targets, pipeline, binned, fragment, lane.machine.outputs(), shared.samples, &mut lane.stats)?;
+			}
+			Ok(())
+		})()
+	};
+	lane.pending.clear();
+	outcome
+}
+
+/// A batched lane's outputs against the interpreter's for the same fragment.
+#[cfg(any(test, feature = "differential"))]
+fn differential_batch(module: &render_shader::Module, bindings: &dyn Resources, outputs: &interpreter::Outputs) {
+	let check = || {
+		let mut shadow = interpreter::Machine::default();
+		let reference = interpreter::execute_into(module, bindings, &mut shadow);
+		assert_eq!(reference, Ok(()), "the interpreter faulted where the batched stage `{}` ran", module.name);
+		assert!(outputs.same_bits(shadow.outputs()), "the batched stage `{}` disagrees with the interpreter: {:?} against {:?}", module.name, outputs, shadow.outputs());
+	};
+	#[cfg(test)]
+	crate::counted::uncounted(check);
+	#[cfg(not(test))]
+	check();
 }
 
 fn writes_fragment_depth(body: &[render_shader::Stmt]) -> bool {
@@ -1066,11 +1348,11 @@ fn write_outputs(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, outputs: &i
 // ---------------------------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn stage_line(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertices: [u32; 2], instance: u32, viewport: &Viewport, stats: &mut Stats) -> Result<(), Error> {
+fn stage_line(prepared: &mut Prepared, pipeline: &Pipeline, programs: &Programs, source: &dyn Source, vertices: [u32; 2], instance: u32, viewport: &Viewport, stats: &mut Stats) -> Result<(), Error> {
 	let mut machine = core::mem::take(&mut prepared.scratch.vertex_machine);
 	let shaded = {
-		let first = run_vertex(pipeline, source, vertices[0], instance, &mut machine);
-		let second = run_vertex(pipeline, source, vertices[1], instance, &mut machine);
+		let first = run_vertex(pipeline, programs, source, vertices[0], instance, &mut machine);
+		let second = run_vertex(pipeline, programs, source, vertices[1], instance, &mut machine);
 		match (first, second) {
 			(Ok(a), Ok(b)) => [a, b],
 			(first, second) => {
@@ -1103,9 +1385,9 @@ fn stage_line(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_point(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source, vertex: u32, index: u32, topology: Topology, instance: u32, viewport: &Viewport, stats: &mut Stats) -> Result<(), Error> {
+fn stage_point(prepared: &mut Prepared, pipeline: &Pipeline, programs: &Programs, source: &dyn Source, vertex: u32, index: u32, topology: Topology, instance: u32, viewport: &Viewport, stats: &mut Stats) -> Result<(), Error> {
 	let mut machine = core::mem::take(&mut prepared.scratch.vertex_machine);
-	let outcome = run_vertex(pipeline, source, vertex, instance, &mut machine);
+	let outcome = run_vertex(pipeline, programs, source, vertex, instance, &mut machine);
 	prepared.scratch.vertex_machine = machine;
 	let shaded = outcome?;
 	let _ = (index, topology);
@@ -1137,7 +1419,7 @@ fn whole<'t, 'a>(attachments: &'t mut Attachments<'a>, views: &mut Vec<Option<Co
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, programs: &Programs, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if prepared.scratch.segments.is_empty() {
 		return Ok(());
 	}
@@ -1184,7 +1466,7 @@ fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 						sample_index: 0,
 						sample_mask: u32::MAX,
 					};
-					interpreter::execute_into(&pipeline.fragment, &bindings, &mut machine).map_err(fault)?;
+					run_stage(&pipeline.fragment, programs.fragment(), &bindings, &mut machine).map_err(fault)?;
 					stats.fragments += 1;
 					if machine.outputs().discarded {
 						stats.discarded += 1;
@@ -1207,7 +1489,7 @@ fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, programs: &Programs, map: &[(u32, Interpolation, usize, usize, render_shader::Type)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if prepared.scratch.points.is_empty() {
 		return Ok(());
 	}
@@ -1239,7 +1521,7 @@ fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sour
 						continue;
 					}
 					let bindings = FragmentBindings { source, smooth: dot.values.as_slice(), noperspective: dot.values.as_slice(), flat: dot.flat.as_slice(), locations: map, front_facing: true, coordinate: [x as f32 + 0.5, y as f32 + 0.5, dot.depth, 1.0], sample_index: 0, sample_mask: coverage };
-					interpreter::execute_into(&pipeline.fragment, &bindings, &mut machine).map_err(fault)?;
+					run_stage(&pipeline.fragment, programs.fragment(), &bindings, &mut machine).map_err(fault)?;
 					stats.fragments += 1;
 					if machine.outputs().discarded {
 						stats.discarded += 1;

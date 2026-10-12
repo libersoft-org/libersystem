@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod buffer;
 pub mod clip;
+pub mod compiled;
 pub mod fixed;
 pub mod frame;
 pub mod geometry;
@@ -57,7 +58,32 @@ mod counted {
 		static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
 	}
 
+	std::thread_local! {
+		static PAUSED: Cell<bool> = const { Cell::new(false) };
+	}
+
+	/// Run `work` with this thread's allocations neither counted nor refused: the differential check
+	/// runs the interpreter beside every compiled stage, and what it allocates is the check's, not the
+	/// frame's.
+	pub fn uncounted<T>(work: impl FnOnce() -> T) -> T {
+		struct Resume(bool);
+		impl Drop for Resume {
+			fn drop(&mut self) {
+				PAUSED.with(|paused| paused.set(self.0));
+			}
+		}
+		let _resume = Resume(PAUSED.with(|paused| paused.replace(true)));
+		work()
+	}
+
+	fn paused() -> bool {
+		PAUSED.with(|paused| paused.get())
+	}
+
 	fn refused() -> bool {
+		if paused() {
+			return false;
+		}
 		FAIL_AFTER.with(|remaining| match remaining.get() {
 			Some(0) => true,
 			Some(count) => {
@@ -87,7 +113,9 @@ mod counted {
 	// thread-local `Cell<usize>` with no destructor, so touching it cannot itself allocate.
 	unsafe impl GlobalAlloc for Counting {
 		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-			COUNT.with(|count| count.set(count.get() + 1));
+			if !paused() {
+				COUNT.with(|count| count.set(count.get() + 1));
+			}
 			if refused() {
 				return core::ptr::null_mut();
 			}
@@ -101,7 +129,9 @@ mod counted {
 		unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
 			// A REALLOC IS AN ALLOCATION. A vector that grows is exactly what a steady-state frame
 			// must not do, and counting only `alloc` would miss every one of them.
-			COUNT.with(|count| count.set(count.get() + 1));
+			if !paused() {
+				COUNT.with(|count| count.set(count.get() + 1));
+			}
 			if refused() {
 				return core::ptr::null_mut();
 			}

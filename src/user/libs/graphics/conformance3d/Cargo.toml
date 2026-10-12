@@ -20,5 +20,10 @@ scene3d = { path = "../scene3d" }
 # `no_std` has neither a power nor a square root.
 libm = "0.2"
 
+[dev-dependencies]
+# THE SUITE'S SCENES DRIVE EVERY COMPILED SHADER AGAINST THE INTERPRETER: in this crate's tests, each
+# compiled stage run is checked bit for bit against the reference it replaces.
+soft3d = { path = "../soft3d", features = ["differential"] }
+
 [lints.rust]
 warnings = "deny"

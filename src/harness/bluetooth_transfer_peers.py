@@ -258,6 +258,7 @@ class TransferPeer:
         if not 14 <= len(frame) <= 1518:
             raise ValueError('BNEP Ethernet frame length is invalid')
         self.frames_in += 1
+        self.pan_trace('to-network', frame, kind)
         self.network_writer.write(struct.pack('<H', len(frame)) + frame)
 
     async def pan_receive(self):
@@ -267,6 +268,32 @@ class TransferPeer:
             if self.pan_channel and self.pan_channel.state == l2cap.ClassicChannel.State.OPEN:
                 self.pan_channel.write(b'\0' + frame)
                 self.frames_out += 1
+                self.pan_trace('to-guest', frame)
+            else:
+                self.pan_trace('dropped-no-channel', frame)
+
+    def pan_trace(self, direction, frame, kind=0):
+        """One PAN frame's shape on the event stream: which way, the BNEP type it crossed as, its
+        Ethernet type and destination, and for IPv4 UDP its ports and DHCP message type. A trace
+        and not an assertion - it says where a lease stopped, and checks nothing itself."""
+        shape = dict(direction=direction, bnep=kind, length=len(frame), dst=frame[0:6].hex(), ethertype=frame[12:14].hex())
+        if frame[12:14] == b'\x08\x00' and len(frame) >= 34 and frame[23] == 17:
+            header = (frame[14] & 0x0f) * 4
+            udp = 14 + header
+            if len(frame) >= udp + 8:
+                shape.update(src_ip='.'.join(str(b) for b in frame[26:30]), dst_ip='.'.join(str(b) for b in frame[30:34]), sport=int.from_bytes(frame[udp:udp + 2], 'big'), dport=int.from_bytes(frame[udp + 2:udp + 4], 'big'))
+                options = udp + 8 + 240
+                if shape['sport'] in (67, 68) and len(frame) > options:
+                    at = options
+                    while at + 2 <= len(frame) and frame[at] != 255:
+                        if frame[at] == 0:
+                            at += 1
+                            continue
+                        if frame[at] == 53 and at + 2 < len(frame):
+                            shape['dhcp'] = frame[at + 2]
+                            break
+                        at += 2 + frame[at + 1]
+        self.peer.observe('pan-frame', **shape)
 
     def pan_verdict(self):
         leases = self.peer.work / 'dnsmasq.leases'

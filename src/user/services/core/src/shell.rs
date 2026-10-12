@@ -789,6 +789,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"modemdata", Shape::Rest),
 	(b"modemfail", Shape::Rest),
 	(b"tpmprobe", Shape::Rest),
+	(b"uvccheck", Shape::Rest),
 	(b"camcheck", Shape::Rest),
 	(b"camhold", Shape::Rest),
 	(b"camread", Shape::Rest),

@@ -75,6 +75,13 @@ pub trait Resources {
 }
 
 impl Outputs {
+	/// The same outputs BIT FOR BIT, which `==` is not: the two `f32` fields compare by value there, so a
+	/// NaN depth written identically by both sides of a differential check read as a disagreement.
+	#[cfg(any(test, feature = "differential"))]
+	pub fn same_bits(&self, other: &Outputs) -> bool {
+		self.position == other.position && self.point_size.map(f32::to_bits) == other.point_size.map(f32::to_bits) && self.varyings == other.varyings && self.colour == other.colour && self.integer == other.integer && self.depth.map(f32::to_bits) == other.depth.map(f32::to_bits) && self.sample_mask == other.sample_mask && self.discarded == other.discarded
+	}
+
 	/// Empty it, KEEPING every allocation. A stage runs once per covered pixel, so freeing these
 	/// vectors and building them again is an allocation per pixel.
 	pub fn clear(&mut self) {
@@ -131,7 +138,10 @@ pub struct Machine {
 	/// resetting the table is incrementing one counter instead of writing every slot.
 	stamp: Vec<u32>,
 	run: u32,
-	outputs: Outputs,
+	pub(crate) outputs: Outputs,
+	/// The register file of a COMPILED run of the same stage (`crate::compiled`), kept beside the
+	/// interpreter's so a lane that falls back for one invocation holds both without allocating.
+	pub(crate) registers: crate::compiled::Registers,
 }
 
 impl Machine {
@@ -143,7 +153,7 @@ impl Machine {
 		fn storage<T>(values: &Vec<T>) -> usize {
 			values.capacity() * core::mem::size_of::<T>()
 		}
-		storage(&self.words) + storage(&self.len) + storage(&self.kinds) + self.kinds.iter().map(crate::value::type_reserved_bytes).sum::<usize>() + storage(&self.wide) + self.wide.iter().flatten().map(storage).sum::<usize>() + storage(&self.stamp) + storage(&self.outputs.varyings) + storage(&self.outputs.colour) + storage(&self.outputs.integer) + self.outputs.position.as_ref().map_or(0, Val::reserved_bytes) + self.outputs.varyings.iter().chain(&self.outputs.colour).map(|(_, value)| value.reserved_bytes()).sum::<usize>()
+		self.registers.reserved_bytes() + storage(&self.words) + storage(&self.len) + storage(&self.kinds) + self.kinds.iter().map(crate::value::type_reserved_bytes).sum::<usize>() + storage(&self.wide) + self.wide.iter().flatten().map(storage).sum::<usize>() + storage(&self.stamp) + outputs_reserved_bytes(&self.outputs)
 	}
 
 	/// Reserve every register and output slot before a lane can receive its first fragment.
@@ -157,44 +167,6 @@ impl Machine {
 			}
 			Ok(())
 		}
-		fn outputs(body: &[Stmt]) -> Result<[usize; 3], render3d::Error> {
-			let mut total = [0usize; 3];
-			for statement in body {
-				let mut add = [0; 3];
-				match statement {
-					Stmt::Store(render_shader::ir::Output::Varying(_), _) => add[0] = 1,
-					Stmt::Store(render_shader::ir::Output::Colour(_), _) => add[1] = 1,
-					Stmt::Store(render_shader::ir::Output::Integer(_), _) => add[2] = 1,
-					Stmt::If { then_body, else_body, .. } => {
-						let a = outputs(then_body)?;
-						let b = outputs(else_body)?;
-						for i in 0..3 {
-							add[i] = a[i].max(b[i]);
-						}
-					}
-					Stmt::Switch { cases, default, .. } => {
-						add = outputs(default)?;
-						for (_, body) in cases {
-							let count = outputs(body)?;
-							for i in 0..3 {
-								add[i] = add[i].max(count[i]);
-							}
-						}
-					}
-					Stmt::Loop { trips, body } => {
-						add = outputs(body)?;
-						for count in &mut add {
-							*count = count.checked_mul(*trips as usize).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
-						}
-					}
-					_ => {}
-				}
-				for i in 0..3 {
-					total[i] = total[i].checked_add(add[i]).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
-				}
-			}
-			Ok(total)
-		}
 		let count = module.types.len();
 		let words = count.checked_mul(STRIDE).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
 		storage(&mut self.kinds, count)?;
@@ -202,11 +174,69 @@ impl Machine {
 		storage(&mut self.len, count)?;
 		storage(&mut self.wide, count)?;
 		storage(&mut self.stamp, count)?;
-		let [varyings, colour, integer] = outputs(&module.body)?;
-		storage(&mut self.outputs.varyings, varyings)?;
-		storage(&mut self.outputs.colour, colour)?;
-		storage(&mut self.outputs.integer, integer)
+		reserve_outputs(&mut self.outputs, module)
 	}
+}
+
+/// The bytes a stage's outputs hold.
+pub(crate) fn outputs_reserved_bytes(outputs: &Outputs) -> usize {
+	fn storage<T>(values: &Vec<T>) -> usize {
+		values.capacity() * core::mem::size_of::<T>()
+	}
+	storage(&outputs.varyings) + storage(&outputs.colour) + storage(&outputs.integer) + outputs.position.as_ref().map_or(0, Val::reserved_bytes) + outputs.varyings.iter().chain(&outputs.colour).map(|(_, value)| value.reserved_bytes()).sum::<usize>()
+}
+
+/// Reserve every output slot `module` can write in one run, so its first fragment does not allocate.
+pub(crate) fn reserve_outputs(into: &mut Outputs, module: &Module) -> Result<(), render3d::Error> {
+	fn storage<T>(values: &mut Vec<T>, count: usize) -> Result<(), render3d::Error> {
+		if values.capacity() < count {
+			let bytes = count.checked_mul(core::mem::size_of::<T>()).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+			values.try_reserve_exact(count.saturating_sub(values.len())).map_err(|_| render3d::Error::OutOfMemory { bytes: bytes as u64 })?;
+		}
+		Ok(())
+	}
+	fn outputs(body: &[Stmt]) -> Result<[usize; 3], render3d::Error> {
+		let mut total = [0usize; 3];
+		for statement in body {
+			let mut add = [0; 3];
+			match statement {
+				Stmt::Store(render_shader::ir::Output::Varying(_), _) => add[0] = 1,
+				Stmt::Store(render_shader::ir::Output::Colour(_), _) => add[1] = 1,
+				Stmt::Store(render_shader::ir::Output::Integer(_), _) => add[2] = 1,
+				Stmt::If { then_body, else_body, .. } => {
+					let a = outputs(then_body)?;
+					let b = outputs(else_body)?;
+					for i in 0..3 {
+						add[i] = a[i].max(b[i]);
+					}
+				}
+				Stmt::Switch { cases, default, .. } => {
+					add = outputs(default)?;
+					for (_, body) in cases {
+						let count = outputs(body)?;
+						for i in 0..3 {
+							add[i] = add[i].max(count[i]);
+						}
+					}
+				}
+				Stmt::Loop { trips, body } => {
+					add = outputs(body)?;
+					for count in &mut add {
+						*count = count.checked_mul(*trips as usize).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+					}
+				}
+				_ => {}
+			}
+			for i in 0..3 {
+				total[i] = total[i].checked_add(add[i]).ok_or(render3d::Error::OutOfMemory { bytes: u64::MAX })?;
+			}
+		}
+		Ok(total)
+	}
+	let [varyings, colour, integer] = outputs(&module.body)?;
+	storage(&mut into.varyings, varyings)?;
+	storage(&mut into.colour, colour)?;
+	storage(&mut into.integer, integer)
 }
 
 /// Run one stage into a machine the caller keeps.
@@ -271,6 +301,22 @@ enum Flow {
 struct Run<'a> {
 	resources: &'a dyn Resources,
 	machine: &'a mut Machine,
+}
+
+/// Where an operation reads its operands from.
+///
+/// THE INTERPRETER'S REGISTER FILE AND THE COMPILED PROGRAM'S ARE TWO STORAGES FOR ONE SET OF RULES.
+/// `operation` below is the only definition of what an operation computes, what type it answers and
+/// which fault it raises; the compiled program calls it for every operation it has no specialised
+/// instruction for, so a rule cannot be changed in one of them and not the other.
+pub(crate) trait Operands {
+	fn read(&self, value: Value) -> Result<Reg<'_>, Fault>;
+}
+
+impl Operands for Run<'_> {
+	fn read(&self, value: Value) -> Result<Reg<'_>, Fault> {
+		Run::read(self, value)
+	}
 }
 
 impl Run<'_> {
@@ -444,129 +490,8 @@ impl Run<'_> {
 			_ => {}
 		}
 		let mut out = [0_u32; STRIDE];
-		let (count, kind) = self.operation(op, &mut out)?;
+		let (count, kind) = operation(self, op, &mut out)?;
 		self.put(slot, kind, &out[..count])
-	}
-
-	/// Compute one operation's WORDS into `out`, answering how many of them there are and what type
-	/// they carry.
-	///
-	/// `Op::Load` AND `Op::Sample` ARE NOT HERE: both answer an owned value through the resource
-	/// trait and either can be wider than `out`, so `assign` takes them before it calls this.
-	fn operation(&self, op: &Op, out: &mut [u32; STRIDE]) -> Result<(usize, Type), Fault> {
-		match op {
-			Op::Const(constant) => {
-				let (word, kind) = match constant {
-					Constant::Bool(value) => (u32::from(*value), Type::Scalar(ScalarType::Bool)),
-					Constant::I32(value) => (*value as u32, Type::Scalar(ScalarType::I32)),
-					Constant::U32(value) => (*value, Type::Scalar(ScalarType::U32)),
-					Constant::F32(value) => (value.to_bits(), Type::Scalar(ScalarType::F32)),
-				};
-				out[0] = word;
-				Ok((1, kind))
-			}
-			Op::Load(_) | Op::Sample { .. } => Err(Fault::TypeMismatch),
-			Op::Compose(kind, parts) => {
-				let mut count = 0;
-				for part in parts {
-					for word in self.read(*part)?.words {
-						if count >= STRIDE {
-							return Err(Fault::TypeMismatch);
-						}
-						out[count] = *word;
-						count += 1;
-					}
-				}
-				if count != Val::words_in(kind) {
-					return Err(Fault::TypeMismatch);
-				}
-				Ok((count, kind.clone()))
-			}
-			Op::Extract(value, component) => {
-				let value = self.read(*value)?;
-				let index = *component as usize;
-				// A COMPONENT PAST THE VALUE IS REFUSED and not wrapped: wrapping would read the
-				// next component of a vector, which is a colour that is almost right.
-				out[0] = *value.words.get(index).ok_or(Fault::IndexOutOfRange { index: index as i64, length: value.len() as u32 })?;
-				Ok((1, Type::Scalar(value.scalar_type())))
-			}
-			Op::Unary(unary, value) => self.unary(*unary, self.read(*value)?, out),
-			Op::Binary(binary, left, right) => self.binary(*binary, self.read(*left)?, self.read(*right)?, out),
-			Op::Compare(kind, left, right) => {
-				out[0] = u32::from(compare(*kind, self.read(*left)?, self.read(*right)?));
-				Ok((1, Type::Scalar(ScalarType::Bool)))
-			}
-			Op::Select { condition, on_true, on_false } => {
-				let condition = self.read(*condition)?;
-				let on_true = self.read(*on_true)?;
-				let on_false = self.read(*on_false)?;
-				// COMPONENT-WISE FOR A VECTOR CONDITION, which is what makes a per-component mask
-				// expressible without a branch per component.
-				if condition.len() > 1 {
-					let count = on_true.len().min(STRIDE);
-					for (index, slot) in out[..count].iter_mut().enumerate() {
-						*slot = if condition.bool_at(index) { on_true.words[index] } else { on_false.words[index] };
-					}
-					return Ok((count, on_true.kind.clone()));
-				}
-				let chosen = if condition.bool_at(0) { on_true } else { on_false };
-				let count = chosen.len().min(STRIDE);
-				out[..count].copy_from_slice(&chosen.words[..count]);
-				Ok((count, chosen.kind.clone()))
-			}
-			Op::Transcendental(which, value, second) => {
-				let value = self.read(*value)?;
-				let second = match second {
-					Some(other) => Some(self.read(*other)?),
-					None => None,
-				};
-				Ok((transcendental(*which, value, second, out), value.kind.clone()))
-			}
-			Op::Clamp { value, low, high } => {
-				let value = self.read(*value)?;
-				let low = self.read(*low)?;
-				let high = self.read(*high)?;
-				let count = value.len().min(STRIDE);
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					let at = |source: Reg<'_>, index: usize| if source.len() == 1 { source.f32_at(0) } else { source.f32_at(index) };
-					// `min(max(v, low), high)` AND NOT `clamp`: the order is stated because with a
-					// NaN bound the two differ, and two backends that chose differently would
-					// produce different colours from the same shader.
-					*slot = f32::to_bits(at(value, index).max(at(low, index)).min(at(high, index)));
-				}
-				Ok((count, value.kind.clone()))
-			}
-			Op::Mix { from, to, at } => {
-				let from = self.read(*from)?;
-				let to = self.read(*to)?;
-				let at_value = self.read(*at)?;
-				let count = from.len().min(STRIDE);
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					let t = if at_value.len() == 1 { at_value.f32_at(0) } else { at_value.f32_at(index) };
-					// `(1-t)*a + t*b`, exact at both ends whatever the rounding.
-					*slot = f32::to_bits((1.0 - t) * from.f32_at(index) + t * to.f32_at(index));
-				}
-				Ok((count, from.kind.clone()))
-			}
-			Op::Index { array, index } => {
-				let array = self.read(*array)?;
-				let index = self.read(*index)?.i32_at(0) as i64;
-				let Type::Array(element, length) = array.kind else { return Err(Fault::TypeMismatch) };
-				let length = *length;
-				if index < 0 || index >= length as i64 {
-					// THE COMPUTED CASE, which validation cannot decide.
-					return Err(Fault::IndexOutOfRange { index, length });
-				}
-				let stride = Val::words_in(element);
-				if stride > STRIDE {
-					return Err(Fault::TypeMismatch);
-				}
-				let start = index as usize * stride;
-				let slice = array.words.get(start..start + stride).ok_or(Fault::IndexOutOfRange { index, length })?;
-				out[..stride].copy_from_slice(slice);
-				Ok((stride, (**element).clone()))
-			}
-		}
 	}
 
 	fn load(&self, binding: &Binding) -> Result<Val, Fault> {
@@ -579,225 +504,346 @@ impl Run<'_> {
 		}
 		.ok_or(Fault::MissingBinding)
 	}
+}
 
-	fn unary(&self, unary: UnaryOp, value: Reg<'_>, out: &mut [u32; STRIDE]) -> Result<(usize, Type), Fault> {
-		let scalar = value.scalar_type();
-		let count = value.len().min(STRIDE);
-		match unary {
-			UnaryOp::Negate => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = match scalar {
-						ScalarType::F32 => (-value.f32_at(index)).to_bits(),
-						ScalarType::I32 => value.i32_at(index).wrapping_neg() as u32,
-						_ => value.u32_at(index).wrapping_neg(),
-					};
-				}
-			}
-			UnaryOp::Not => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = u32::from(!value.bool_at(index));
-				}
-				let kind = match value.kind {
-					Type::Vector(_, components) => Type::Vector(ScalarType::Bool, *components),
-					_ => Type::Scalar(ScalarType::Bool),
-				};
-				return Ok((count, kind));
-			}
-			UnaryOp::Complement => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = !value.u32_at(index);
-				}
-			}
-			UnaryOp::Abs => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = match scalar {
-						ScalarType::F32 => libm::fabsf(value.f32_at(index)).to_bits(),
-						ScalarType::I32 => value.i32_at(index).wrapping_abs() as u32,
-						_ => value.u32_at(index),
-					};
-				}
-			}
-			UnaryOp::Floor => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = libm::floorf(value.f32_at(index)).to_bits();
-				}
-			}
-			UnaryOp::Ceil => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = libm::ceilf(value.f32_at(index)).to_bits();
-				}
-			}
-			// `x - floor(x)` AND NOT `x % 1`. The two differ for a negative `x`, and `fract(-0.25)`
-			// is `0.75` here - which is what a repeating texture coordinate needs and what the
-			// language's `%` does not give.
-			UnaryOp::Fract => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					let at = value.f32_at(index);
-					*slot = (at - libm::floorf(at)).to_bits();
-				}
-			}
-			UnaryOp::Length => {
-				let mut sum = 0.0_f32;
-				for index in 0..value.len() {
-					sum += value.f32_at(index) * value.f32_at(index);
-				}
-				out[0] = libm::sqrtf(sum).to_bits();
-				return Ok((1, Type::Scalar(ScalarType::F32)));
-			}
-			UnaryOp::Normalize => {
-				let mut sum = 0.0_f32;
-				for index in 0..value.len() {
-					sum += value.f32_at(index) * value.f32_at(index);
-				}
-				let length = libm::sqrtf(sum);
-				// A ZERO-LENGTH VECTOR NORMALISES TO ITSELF rather than to a NaN. The alternative
-				// puts a NaN into a lighting term, and one NaN makes a whole surface black.
-				if length == 0.0 || !length.is_finite() {
-					out[..count].copy_from_slice(&value.words[..count]);
-					return Ok((count, value.kind.clone()));
-				}
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = (value.f32_at(index) / length).to_bits();
-				}
-			}
-			UnaryOp::Convert(target) => {
-				for (index, slot) in out[..count].iter_mut().enumerate() {
-					*slot = match (scalar, target) {
-						(ScalarType::F32, ScalarType::I32) => value.f32_at(index) as i32 as u32,
-						(ScalarType::F32, ScalarType::U32) => value.f32_at(index) as u32,
-						(ScalarType::F32, ScalarType::Bool) => u32::from(value.f32_at(index) != 0.0),
-						(ScalarType::I32, ScalarType::F32) => (value.i32_at(index) as f32).to_bits(),
-						(ScalarType::U32, ScalarType::F32) => (value.u32_at(index) as f32).to_bits(),
-						(ScalarType::Bool, ScalarType::F32) => f32::from(value.bool_at(index)).to_bits(),
-						(ScalarType::Bool, _) => u32::from(value.bool_at(index)),
-						(_, ScalarType::Bool) => u32::from(value.u32_at(index) != 0),
-						_ => value.u32_at(index),
-					};
-				}
-				let kind = match value.kind {
-					Type::Vector(_, components) => Type::Vector(target, *components),
-					_ => Type::Scalar(target),
-				};
-				return Ok((count, kind));
-			}
-		}
-		Ok((count, value.kind.clone()))
-	}
-
-	fn binary(&self, binary: BinaryOp, left: Reg<'_>, right: Reg<'_>, out: &mut [u32; STRIDE]) -> Result<(usize, Type), Fault> {
-		match binary {
-			BinaryOp::Dot => {
-				let mut sum = 0.0_f32;
-				for index in 0..left.len().min(right.len()) {
-					sum += left.f32_at(index) * right.f32_at(index);
-				}
-				out[0] = sum.to_bits();
-				return Ok((1, Type::Scalar(ScalarType::F32)));
-			}
-			BinaryOp::Cross => {
-				if left.len() != 3 || right.len() != 3 {
-					return Err(Fault::TypeMismatch);
-				}
-				let (a, b) = (left.to_f32(), right.to_f32());
-				out[0] = (a[1] * b[2] - a[2] * b[1]).to_bits();
-				out[1] = (a[2] * b[0] - a[0] * b[2]).to_bits();
-				out[2] = (a[0] * b[1] - a[1] * b[0]).to_bits();
-				return Ok((3, Type::Vector(ScalarType::F32, 3)));
-			}
-			BinaryOp::MatrixProduct => return matrix_product(left, right, out),
-			_ => {}
-		}
-		let scalar = if left.len() >= right.len() { left.scalar_type() } else { right.scalar_type() };
-		let count = left.len().max(right.len()).min(STRIDE);
-		for (index, into) in out[..count].iter_mut().enumerate() {
-			let at = |source: Reg<'_>, index: usize| if source.len() == 1 { 0 } else { index };
-			let (li, ri) = (at(left, index), at(right, index));
-			*into = match scalar {
-				ScalarType::F32 => {
-					let (a, b) = (left.f32_at(li), right.f32_at(ri));
-					match binary {
-						BinaryOp::Add => a + b,
-						BinaryOp::Subtract => a - b,
-						BinaryOp::Multiply => a * b,
-						BinaryOp::Divide => a / b,
-						// EUCLIDEAN REMAINDER and not the language's `%`, so `-0.25 mod 1` is
-						// `0.75` - which is what a repeating coordinate needs and what makes the
-						// answer independent of the sign convention of the host language.
-						BinaryOp::Modulo => a - b * libm::floorf(a / b),
-						BinaryOp::Min => a.min(b),
-						BinaryOp::Max => a.max(b),
-						_ => a,
-					}
-					.to_bits()
-				}
-				ScalarType::I32 => {
-					let (a, b) = (left.i32_at(li), right.i32_at(ri));
-					(match binary {
-						BinaryOp::Add => a.wrapping_add(b),
-						BinaryOp::Subtract => a.wrapping_sub(b),
-						BinaryOp::Multiply => a.wrapping_mul(b),
-						// A DIVISION BY ZERO ANSWERS ZERO rather than trapping. A shader has no
-						// way to report one and a trap would take the frame down; the profile's
-						// non-finite rules cover the float case and this is the integer one.
-						BinaryOp::Divide => {
-							if b == 0 {
-								0
-							} else {
-								a.wrapping_div(b)
-							}
-						}
-						BinaryOp::Modulo => {
-							if b == 0 {
-								0
-							} else {
-								a.rem_euclid(b)
-							}
-						}
-						BinaryOp::And => a & b,
-						BinaryOp::Or => a | b,
-						BinaryOp::Xor => a ^ b,
-						BinaryOp::ShiftLeft => a.wrapping_shl(b as u32),
-						BinaryOp::ShiftRight => a.wrapping_shr(b as u32),
-						BinaryOp::Min => a.min(b),
-						BinaryOp::Max => a.max(b),
-						_ => a,
-					}) as u32
-				}
-				_ => {
-					let (a, b) = (left.u32_at(li), right.u32_at(ri));
-					match binary {
-						BinaryOp::Add => a.wrapping_add(b),
-						BinaryOp::Subtract => a.wrapping_sub(b),
-						BinaryOp::Multiply => a.wrapping_mul(b),
-						BinaryOp::Divide => {
-							if b == 0 {
-								0
-							} else {
-								a / b
-							}
-						}
-						BinaryOp::Modulo => {
-							if b == 0 {
-								0
-							} else {
-								a % b
-							}
-						}
-						BinaryOp::And => a & b,
-						BinaryOp::Or => a | b,
-						BinaryOp::Xor => a ^ b,
-						BinaryOp::ShiftLeft => a.wrapping_shl(b),
-						BinaryOp::ShiftRight => a.wrapping_shr(b),
-						BinaryOp::Min => a.min(b),
-						BinaryOp::Max => a.max(b),
-						_ => a,
-					}
-				}
+/// Compute one operation's WORDS into `out`, answering how many of them there are and what type
+/// they carry.
+///
+/// `Op::Load` AND `Op::Sample` ARE NOT HERE: both answer an owned value through the resource
+/// trait and either can be wider than `out`, so `assign` takes them before it calls this.
+pub(crate) fn operation<O: Operands + ?Sized>(regs: &O, op: &Op, out: &mut [u32; STRIDE]) -> Result<(usize, Type), Fault> {
+	match op {
+		Op::Const(constant) => {
+			let (word, kind) = match constant {
+				Constant::Bool(value) => (u32::from(*value), Type::Scalar(ScalarType::Bool)),
+				Constant::I32(value) => (*value as u32, Type::Scalar(ScalarType::I32)),
+				Constant::U32(value) => (*value, Type::Scalar(ScalarType::U32)),
+				Constant::F32(value) => (value.to_bits(), Type::Scalar(ScalarType::F32)),
 			};
+			out[0] = word;
+			Ok((1, kind))
 		}
-		let kind = if left.len() >= right.len() { left.kind } else { right.kind };
-		Ok((count, kind.clone()))
+		Op::Load(_) | Op::Sample { .. } => Err(Fault::TypeMismatch),
+		Op::Compose(kind, parts) => {
+			let mut count = 0;
+			for part in parts {
+				for word in regs.read(*part)?.words {
+					if count >= STRIDE {
+						return Err(Fault::TypeMismatch);
+					}
+					out[count] = *word;
+					count += 1;
+				}
+			}
+			if count != Val::words_in(kind) {
+				return Err(Fault::TypeMismatch);
+			}
+			Ok((count, kind.clone()))
+		}
+		Op::Extract(value, component) => {
+			let value = regs.read(*value)?;
+			let index = *component as usize;
+			// A COMPONENT PAST THE VALUE IS REFUSED and not wrapped: wrapping would read the
+			// next component of a vector, which is a colour that is almost right.
+			out[0] = *value.words.get(index).ok_or(Fault::IndexOutOfRange { index: index as i64, length: value.len() as u32 })?;
+			Ok((1, Type::Scalar(value.scalar_type())))
+		}
+		Op::Unary(which, value) => unary(*which, regs.read(*value)?, out),
+		Op::Binary(which, left, right) => binary(*which, regs.read(*left)?, regs.read(*right)?, out),
+		Op::Compare(kind, left, right) => {
+			out[0] = u32::from(compare(*kind, regs.read(*left)?, regs.read(*right)?));
+			Ok((1, Type::Scalar(ScalarType::Bool)))
+		}
+		Op::Select { condition, on_true, on_false } => {
+			let condition = regs.read(*condition)?;
+			let on_true = regs.read(*on_true)?;
+			let on_false = regs.read(*on_false)?;
+			// COMPONENT-WISE FOR A VECTOR CONDITION, which is what makes a per-component mask
+			// expressible without a branch per component.
+			if condition.len() > 1 {
+				let count = on_true.len().min(STRIDE);
+				for (index, slot) in out[..count].iter_mut().enumerate() {
+					*slot = if condition.bool_at(index) { on_true.words[index] } else { on_false.words[index] };
+				}
+				return Ok((count, on_true.kind.clone()));
+			}
+			let chosen = if condition.bool_at(0) { on_true } else { on_false };
+			let count = chosen.len().min(STRIDE);
+			out[..count].copy_from_slice(&chosen.words[..count]);
+			Ok((count, chosen.kind.clone()))
+		}
+		Op::Transcendental(which, value, second) => {
+			let value = regs.read(*value)?;
+			let second = match second {
+				Some(other) => Some(regs.read(*other)?),
+				None => None,
+			};
+			Ok((transcendental(*which, value, second, out), value.kind.clone()))
+		}
+		Op::Clamp { value, low, high } => {
+			let value = regs.read(*value)?;
+			let low = regs.read(*low)?;
+			let high = regs.read(*high)?;
+			let count = value.len().min(STRIDE);
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				let at = |source: Reg<'_>, index: usize| if source.len() == 1 { source.f32_at(0) } else { source.f32_at(index) };
+				// `min(max(v, low), high)` AND NOT `clamp`: the order is stated because with a
+				// NaN bound the two differ, and two backends that chose differently would
+				// produce different colours from the same shader.
+				*slot = f32::to_bits(at(value, index).max(at(low, index)).min(at(high, index)));
+			}
+			Ok((count, value.kind.clone()))
+		}
+		Op::Mix { from, to, at } => {
+			let from = regs.read(*from)?;
+			let to = regs.read(*to)?;
+			let at_value = regs.read(*at)?;
+			let count = from.len().min(STRIDE);
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				let t = if at_value.len() == 1 { at_value.f32_at(0) } else { at_value.f32_at(index) };
+				// `(1-t)*a + t*b`, exact at both ends whatever the rounding.
+				*slot = f32::to_bits((1.0 - t) * from.f32_at(index) + t * to.f32_at(index));
+			}
+			Ok((count, from.kind.clone()))
+		}
+		Op::Index { array, index } => {
+			let array = regs.read(*array)?;
+			let index = regs.read(*index)?.i32_at(0) as i64;
+			let Type::Array(element, length) = array.kind else { return Err(Fault::TypeMismatch) };
+			let length = *length;
+			if index < 0 || index >= length as i64 {
+				// THE COMPUTED CASE, which validation cannot decide.
+				return Err(Fault::IndexOutOfRange { index, length });
+			}
+			let stride = Val::words_in(element);
+			if stride > STRIDE {
+				return Err(Fault::TypeMismatch);
+			}
+			let start = index as usize * stride;
+			let slice = array.words.get(start..start + stride).ok_or(Fault::IndexOutOfRange { index, length })?;
+			out[..stride].copy_from_slice(slice);
+			Ok((stride, (**element).clone()))
+		}
 	}
+}
+
+fn unary(unary: UnaryOp, value: Reg<'_>, out: &mut [u32; STRIDE]) -> Result<(usize, Type), Fault> {
+	let scalar = value.scalar_type();
+	let count = value.len().min(STRIDE);
+	match unary {
+		UnaryOp::Negate => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = match scalar {
+					ScalarType::F32 => (-value.f32_at(index)).to_bits(),
+					ScalarType::I32 => value.i32_at(index).wrapping_neg() as u32,
+					_ => value.u32_at(index).wrapping_neg(),
+				};
+			}
+		}
+		UnaryOp::Not => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = u32::from(!value.bool_at(index));
+			}
+			let kind = match value.kind {
+				Type::Vector(_, components) => Type::Vector(ScalarType::Bool, *components),
+				_ => Type::Scalar(ScalarType::Bool),
+			};
+			return Ok((count, kind));
+		}
+		UnaryOp::Complement => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = !value.u32_at(index);
+			}
+		}
+		UnaryOp::Abs => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = match scalar {
+					ScalarType::F32 => libm::fabsf(value.f32_at(index)).to_bits(),
+					ScalarType::I32 => value.i32_at(index).wrapping_abs() as u32,
+					_ => value.u32_at(index),
+				};
+			}
+		}
+		UnaryOp::Floor => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = libm::floorf(value.f32_at(index)).to_bits();
+			}
+		}
+		UnaryOp::Ceil => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = libm::ceilf(value.f32_at(index)).to_bits();
+			}
+		}
+		// `x - floor(x)` AND NOT `x % 1`. The two differ for a negative `x`, and `fract(-0.25)`
+		// is `0.75` here - which is what a repeating texture coordinate needs and what the
+		// language's `%` does not give.
+		UnaryOp::Fract => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				let at = value.f32_at(index);
+				*slot = (at - libm::floorf(at)).to_bits();
+			}
+		}
+		UnaryOp::Length => {
+			let mut sum = 0.0_f32;
+			for index in 0..value.len() {
+				sum += value.f32_at(index) * value.f32_at(index);
+			}
+			out[0] = libm::sqrtf(sum).to_bits();
+			return Ok((1, Type::Scalar(ScalarType::F32)));
+		}
+		UnaryOp::Normalize => {
+			let mut sum = 0.0_f32;
+			for index in 0..value.len() {
+				sum += value.f32_at(index) * value.f32_at(index);
+			}
+			let length = libm::sqrtf(sum);
+			// A ZERO-LENGTH VECTOR NORMALISES TO ITSELF rather than to a NaN. The alternative
+			// puts a NaN into a lighting term, and one NaN makes a whole surface black.
+			if length == 0.0 || !length.is_finite() {
+				out[..count].copy_from_slice(&value.words[..count]);
+				return Ok((count, value.kind.clone()));
+			}
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = (value.f32_at(index) / length).to_bits();
+			}
+		}
+		UnaryOp::Convert(target) => {
+			for (index, slot) in out[..count].iter_mut().enumerate() {
+				*slot = match (scalar, target) {
+					(ScalarType::F32, ScalarType::I32) => value.f32_at(index) as i32 as u32,
+					(ScalarType::F32, ScalarType::U32) => value.f32_at(index) as u32,
+					(ScalarType::F32, ScalarType::Bool) => u32::from(value.f32_at(index) != 0.0),
+					(ScalarType::I32, ScalarType::F32) => (value.i32_at(index) as f32).to_bits(),
+					(ScalarType::U32, ScalarType::F32) => (value.u32_at(index) as f32).to_bits(),
+					(ScalarType::Bool, ScalarType::F32) => f32::from(value.bool_at(index)).to_bits(),
+					(ScalarType::Bool, _) => u32::from(value.bool_at(index)),
+					(_, ScalarType::Bool) => u32::from(value.u32_at(index) != 0),
+					_ => value.u32_at(index),
+				};
+			}
+			let kind = match value.kind {
+				Type::Vector(_, components) => Type::Vector(target, *components),
+				_ => Type::Scalar(target),
+			};
+			return Ok((count, kind));
+		}
+	}
+	Ok((count, value.kind.clone()))
+}
+
+fn binary(binary: BinaryOp, left: Reg<'_>, right: Reg<'_>, out: &mut [u32; STRIDE]) -> Result<(usize, Type), Fault> {
+	match binary {
+		BinaryOp::Dot => {
+			let mut sum = 0.0_f32;
+			for index in 0..left.len().min(right.len()) {
+				sum += left.f32_at(index) * right.f32_at(index);
+			}
+			out[0] = sum.to_bits();
+			return Ok((1, Type::Scalar(ScalarType::F32)));
+		}
+		BinaryOp::Cross => {
+			if left.len() != 3 || right.len() != 3 {
+				return Err(Fault::TypeMismatch);
+			}
+			let (a, b) = (left.to_f32(), right.to_f32());
+			out[0] = (a[1] * b[2] - a[2] * b[1]).to_bits();
+			out[1] = (a[2] * b[0] - a[0] * b[2]).to_bits();
+			out[2] = (a[0] * b[1] - a[1] * b[0]).to_bits();
+			return Ok((3, Type::Vector(ScalarType::F32, 3)));
+		}
+		BinaryOp::MatrixProduct => return matrix_product(left, right, out),
+		_ => {}
+	}
+	let scalar = if left.len() >= right.len() { left.scalar_type() } else { right.scalar_type() };
+	let count = left.len().max(right.len()).min(STRIDE);
+	for (index, into) in out[..count].iter_mut().enumerate() {
+		let at = |source: Reg<'_>, index: usize| if source.len() == 1 { 0 } else { index };
+		let (li, ri) = (at(left, index), at(right, index));
+		*into = match scalar {
+			ScalarType::F32 => {
+				let (a, b) = (left.f32_at(li), right.f32_at(ri));
+				match binary {
+					BinaryOp::Add => a + b,
+					BinaryOp::Subtract => a - b,
+					BinaryOp::Multiply => a * b,
+					BinaryOp::Divide => a / b,
+					// EUCLIDEAN REMAINDER and not the language's `%`, so `-0.25 mod 1` is
+					// `0.75` - which is what a repeating coordinate needs and what makes the
+					// answer independent of the sign convention of the host language.
+					BinaryOp::Modulo => a - b * libm::floorf(a / b),
+					BinaryOp::Min => a.min(b),
+					BinaryOp::Max => a.max(b),
+					_ => a,
+				}
+				.to_bits()
+			}
+			ScalarType::I32 => {
+				let (a, b) = (left.i32_at(li), right.i32_at(ri));
+				(match binary {
+					BinaryOp::Add => a.wrapping_add(b),
+					BinaryOp::Subtract => a.wrapping_sub(b),
+					BinaryOp::Multiply => a.wrapping_mul(b),
+					// A DIVISION BY ZERO ANSWERS ZERO rather than trapping. A shader has no
+					// way to report one and a trap would take the frame down; the profile's
+					// non-finite rules cover the float case and this is the integer one.
+					BinaryOp::Divide => {
+						if b == 0 {
+							0
+						} else {
+							a.wrapping_div(b)
+						}
+					}
+					BinaryOp::Modulo => {
+						if b == 0 {
+							0
+						} else {
+							a.rem_euclid(b)
+						}
+					}
+					BinaryOp::And => a & b,
+					BinaryOp::Or => a | b,
+					BinaryOp::Xor => a ^ b,
+					BinaryOp::ShiftLeft => a.wrapping_shl(b as u32),
+					BinaryOp::ShiftRight => a.wrapping_shr(b as u32),
+					BinaryOp::Min => a.min(b),
+					BinaryOp::Max => a.max(b),
+					_ => a,
+				}) as u32
+			}
+			_ => {
+				let (a, b) = (left.u32_at(li), right.u32_at(ri));
+				match binary {
+					BinaryOp::Add => a.wrapping_add(b),
+					BinaryOp::Subtract => a.wrapping_sub(b),
+					BinaryOp::Multiply => a.wrapping_mul(b),
+					BinaryOp::Divide => {
+						if b == 0 {
+							0
+						} else {
+							a / b
+						}
+					}
+					BinaryOp::Modulo => {
+						if b == 0 {
+							0
+						} else {
+							a % b
+						}
+					}
+					BinaryOp::And => a & b,
+					BinaryOp::Or => a | b,
+					BinaryOp::Xor => a ^ b,
+					BinaryOp::ShiftLeft => a.wrapping_shl(b),
+					BinaryOp::ShiftRight => a.wrapping_shr(b),
+					BinaryOp::Min => a.min(b),
+					BinaryOp::Max => a.max(b),
+					_ => a,
+				}
+			}
+		};
+	}
+	let kind = if left.len() >= right.len() { left.kind } else { right.kind };
+	Ok((count, kind.clone()))
 }
 
 /// A matrix times a vector, or a matrix times a matrix. COLUMN-MAJOR AND `M * v`, the same

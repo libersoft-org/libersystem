@@ -3303,8 +3303,20 @@ qemu_run_riscv64() {
 		bind_object uboot_bound "$uboot" "firmware UBOOT"
 		[[ "$bios" == default ]] || bind_object bios_bound "$bios" "firmware BIOS"
 		bind_tool qemu_bin qemu-system-riscv64
-		# ESP is NVMe so U-Boot's default boot order tries nvme0 first.
-		qemu_args+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
+		# U-Boot's default boot targets include only nvme0. Keep the ESP first when
+		# this fixture also attaches a system NVMe disk.
+		if [[ "${SYSTEM_DISK:-}" == "nvme" ]]; then
+			qemu_args=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp" "${qemu_args[@]}")
+		elif [[ "${SYSTEM_DISK:-}" == "ahci" ]]; then
+			# AND ON AHCI WHEN THE SYSTEM DISK IS THERE. U-Boot's distro boot tries nvme0 before it
+			# ever runs `scsi scan`, so an ESP on NVMe booted with the SATA disks never scanned and the
+			# loader found no system volume; and of the SATA disks it tries `scsi0` alone, the first
+			# disk of the first controller. An AHCI controller of the ESP's own, ahead of the system
+			# disk's, is that disk - and the scan it takes to reach it shows the loader both.
+			qemu_args=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "ahci,id=espsata" -device "ide-hd,drive=esp,bus=espsata.0" "${qemu_args[@]}")
+		else
+			qemu_args+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
+		fi
 		# AN EMPTY HOT-PLUG SLOT, ON THIS PORT TOO AND NOT ONLY UNDER `TEST=1`.
 		#
 		# `qemu_attach_suite_devices` returns at its first line unless the run is a TEST run, so a

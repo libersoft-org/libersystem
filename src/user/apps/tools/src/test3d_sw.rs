@@ -53,7 +53,7 @@ use soft3d::pass::{Colour, DepthStencil};
 use soft3d::texture::{Filter, Kind, Level, Sampler, Texture, Wrap};
 use soft3d::{Indices, Val};
 
-const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended] [--postprocess] [--workers N] [--compare]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\n--postprocess adds the six-level HDR bloom and tone-map phase; both scene dimensions must be at least 64.\n--workers N shades the scene on N threads (1 is this thread alone; the default is one per core, up to 32); --compare renders every pass again on this thread and checks the two agree.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
+const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended] [--postprocess] [--workers N] [--linger-ms N] [--compare]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\n--postprocess adds the six-level HDR bloom and tone-map phase; both scene dimensions must be at least 64.\n--workers N shades the scene on N threads (1 is this thread alone; the default is one per core, up to 32); --linger-ms N keeps them polling N ms after each pass instead of the runtime's default; --compare renders every pass again on this thread and checks the two agree.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
 
 // THE SCENE IS RENDERED AT THE SURFACE'S OWN SIZE unless a run says otherwise, because that is what
 // an application does and what makes a measurement at a stated resolution mean anything: a demo that
@@ -1051,6 +1051,9 @@ struct Controls {
 	/// How many threads shade the scene, this one included. ZERO IS "ONE PER CORE", up to
 	/// `AUTO_WORKERS`; one is this thread alone, which is the serial walk.
 	workers: u32,
+	/// How long the shading workers keep asking for the next pass after each one, in milliseconds -
+	/// `u32::MAX` is the runtime's own default. A frame loop's passes are a frame apart at most.
+	linger_ms: u32,
 	/// Render every pass a second time on this thread alone, into attachments of its own, and hold
 	/// the two to the same bits - the parallel path checked against the scalar reference in the
 	/// place it actually runs.
@@ -1059,7 +1062,7 @@ struct Controls {
 
 impl Controls {
 	fn parse(arguments: &[u8]) -> Controls {
-		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false, postprocess: false, workers: 0, compare: false };
+		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false, postprocess: false, workers: 0, linger_ms: u32::MAX, compare: false };
 		let mut words = arguments.split(|byte| *byte == b' ').filter(|word| !word.is_empty());
 		while let Some(word) = words.next() {
 			match word {
@@ -1081,6 +1084,7 @@ impl Controls {
 				b"--scene-height" => controls.scene_height = words.next().and_then(number).unwrap_or(0),
 				b"--pose" => controls.pose = words.next().and_then(number).unwrap_or(u32::MAX),
 				b"--workers" => controls.workers = words.next().and_then(number).unwrap_or(0),
+				b"--linger-ms" => controls.linger_ms = words.next().and_then(number).unwrap_or(u32::MAX),
 				b"--compare" => controls.compare = true,
 				_ => {}
 			}
@@ -1169,6 +1173,12 @@ fn wrap(x: f32) -> f32 {
 /// a frame this size stops getting faster - the host benchmark measured 32 workers at 23 times one
 /// and 64 at 26 - and every worker holds a stack.
 const AUTO_WORKERS: usize = 32;
+
+/// How long the shading workers keep asking for the next pass after each one, unless `--linger-ms`
+/// says otherwise: longer than the part of a frame that is not theirs, so a frame's first pass finds
+/// them awake. Measured on the reference machine, nested, at 640x480: no lingering left the frame at
+/// 50 ms and two milliseconds at 40, with most of the difference in waking workers for the scene.
+const FRAME_LINGER_NS: u64 = 40_000_000;
 
 /// Who shades the scene's tiles: this thread, and the workers `rt::pool` lent it.
 ///
@@ -1535,7 +1545,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// thread in this system does not end before its process, so a resize keeps them: what it
 	// rebuilds is the scene's size, and the tiles are cut from that at every frame.
 	let participants = if controls.workers == 0 { (cpu_info(&mut [0u64; 1]).max(1) as usize).min(AUTO_WORKERS) } else { controls.workers as usize };
-	let shading = Shading { pool: rt::pool::Pool::new(participants.saturating_sub(1)) };
+	let mut shading = Shading { pool: rt::pool::Pool::new(participants.saturating_sub(1)) };
+	// A FRAME LOOP CALLS ITS WORKERS AGAIN WITHIN A FRAME, so they wait out the frame's other half -
+	// the present, the event poll - awake, and its next first pass does not pay for waking them.
+	shading.pool.linger(if controls.linger_ms == u32::MAX { FRAME_LINGER_NS } else { u64::from(controls.linger_ms) * 1_000_000 });
 	let mut line = common_line::Line::new();
 	line.push(b"test3d-sw: shading on ");
 	line.decimal(Workers::lanes(&shading) as u64);

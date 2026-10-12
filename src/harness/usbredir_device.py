@@ -549,12 +549,38 @@ class BtBridge(BtSco):
         self.pending_hci = bytearray()
         self.iso_handles = set()
         self.packet_counts = collections.Counter()
+        # AN OPTIONAL HCI TRACE, for a failure the counters cannot place: one line per command and per event with
+        # its time, opcode or event code and status - never a parameter, since commands carry keys.
+        trace = os.environ.get('BT_BRIDGE_HCI_TRACE')
+        self.trace = open(trace, 'a', buffering=1) if trace else None
+
+    def traced(self, direction, kind, packet):
+        if self.trace is None:
+            return
+        line = f'{time.monotonic():.6f} {direction} {kind}'
+        if kind == 1 and len(packet) >= 3:
+            line += f' cmd 0x{int.from_bytes(packet[0:2], "little"):04x} len {packet[2]}'
+        elif kind == 4 and len(packet) >= 2:
+            code = packet[0]
+            line += f' evt 0x{code:02x}'
+            if code == 0x0e and len(packet) >= 6:
+                line += f' complete 0x{int.from_bytes(packet[3:5], "little"):04x} status 0x{packet[5]:02x}'
+            elif code == 0x0f and len(packet) >= 6:
+                line += f' status 0x{packet[2]:02x} for 0x{int.from_bytes(packet[4:6], "little"):04x}'
+            elif code == 0x3e and len(packet) >= 4:
+                line += f' le 0x{packet[2]:02x} status 0x{packet[3]:02x}'
+            elif code == 0x05 and len(packet) >= 6:
+                line += f' disconnected 0x{int.from_bytes(packet[3:5], "little"):04x} reason 0x{packet[5]:02x}'
+        elif kind in (2, 5) and len(packet) >= 4:
+            line += f' handle 0x{int.from_bytes(packet[0:2], "little") & 0x0fff:03x} len {len(packet) - 4}'
+        self.trace.write(line + '\n')
 
     def forward(self, kind, packet):
         if len(self.pending_hci) + len(packet) > 1024 * 1024:
             raise OSError('RootCanal is not consuming HCI packets')
         self.pending_hci += bytes([kind]) + packet
         self.packet_counts[f'out-{kind}'] += 1
+        self.traced('out', kind, packet)
         self.poll()
 
     def poll(self):
@@ -586,6 +612,7 @@ class BtBridge(BtSco):
             packet = bytes(self.received_hci[1:total])
             del self.received_hci[:total]
             self.packet_counts[f'in-{kind}'] += 1
+            self.traced('in', kind, packet)
             if kind == 4:
                 from bluetooth_controller_capabilities import capability_reply
                 if observed := capability_reply(packet):

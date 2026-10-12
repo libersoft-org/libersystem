@@ -1,6 +1,7 @@
 use super::*;
 use graphics_core::geom::Extent2D;
 use graphics_core::layout::ImageLayout;
+use graphics_core::pixel::write;
 use graphics_core::semantics::ImageSemantics;
 use graphics_core::{AlphaMode, ColorSpace, PixelFormat, PixelStorage};
 use std::sync::atomic::{AtomicUsize, Ordering};

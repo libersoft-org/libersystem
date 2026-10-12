@@ -475,20 +475,47 @@ pub fn blit(source: Image<'_>, mut target: Target<'_>, damage: Rect, first: bool
 	// Match the complete layout, including the absent reserved span: the generic packer writes
 	// a declared reserved span as ones. Here it writes the fourth byte as zero, regardless of
 	// source alpha, so a four-byte source copy would change the existing scaled-blit result.
+	//
+	// AND IT IS THE PATH EVERY PRESENT OF A SURFACE SMALLER THAN ITS SCANOUT TAKES - a 640x480 frame on
+	// a 1280x800 output is 853,000 output pixels a frame - so it does per row what it can and per
+	// pixel only what it must. The column is STEPPED, not divided: `source_x` is `output_x * sw /
+	// out_width` rounded down, which adding `sw` to the numerator each column and carrying the
+	// remainder gives exactly, without a 64-bit division per pixel. A row whose source row is the
+	// one before it - every row an upscale repeats - is that row's bytes again, copied whole. And a
+	// pixel is one four-byte load with its fourth byte cleared, the same bytes the three-byte copy and
+	// the zero wrote. `scaled_tests` holds all three to the frozen generic blitter byte for byte.
 	if target.channels() == PixelFormat::B8G8R8A8Unorm.packed_masks() {
 		let target_pitch = target.pitch() as usize;
+		let source_pitch = source.pitch() as usize;
+		let source_bytes = source.bytes();
 		let target_bytes = target.bytes_mut();
+		let row_bytes = (x1 - x0) as usize * 4;
+		let columns = out_width as u64;
+		let (step, carry) = ((sw / columns) as usize, sw % columns);
+		let mut previous: Option<(usize, usize)> = None;
 		for output_y in y0..y1 {
-			let source_y = (output_y as u64 * source.height() as u64 / out_height as u64) as usize;
-			let source_row = source_y * source.pitch() as usize;
+			let source_y = (output_y as u64 * sh / out_height as u64) as usize;
 			let start = (offset_y + output_y) as usize * target_pitch + (offset_x + x0) as usize * 4;
-			let end = start + (x1 - x0) as usize * 4;
-			for (output_x, pixel) in (x0..x1).zip(target_bytes[start..end].chunks_exact_mut(4)) {
-				let source_x = (output_x as u64 * source.width() as u64 / out_width as u64) as usize;
-				let source_offset = source_row + source_x * 4;
-				pixel[..3].copy_from_slice(&source.bytes()[source_offset..source_offset + 3]);
-				pixel[3] = 0;
+			if let Some((row, from)) = previous
+				&& row == source_y
+			{
+				target_bytes.copy_within(from..from + row_bytes, start);
+				continue;
 			}
+			let source_row = &source_bytes[source_y * source_pitch..];
+			let mut source_x = (x0 as u64 * sw / columns) as usize;
+			let mut remainder = x0 as u64 * sw % columns;
+			for pixel in target_bytes[start..start + row_bytes].chunks_exact_mut(4) {
+				let texel: [u8; 4] = source_row[source_x * 4..source_x * 4 + 4].try_into().unwrap_or([0; 4]);
+				pixel.copy_from_slice(&(u32::from_le_bytes(texel) & 0x00ff_ffff).to_le_bytes());
+				source_x += step;
+				remainder += carry;
+				if remainder >= columns {
+					remainder -= columns;
+					source_x += 1;
+				}
+			}
+			previous = Some((source_y, start));
 		}
 	} else {
 		for output_y in y0..y1 {

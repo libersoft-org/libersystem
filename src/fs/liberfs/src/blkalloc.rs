@@ -728,9 +728,14 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(ExtentFault::Checksum);
 		}
 		let mut comp = vec![0u8; ext.store_len as usize * BLOCK_SIZE];
+		// THE STORED RUN IS CONTIGUOUS, SO IT IS ONE DEVICE REQUEST: a loader reading a compressed kernel
+		// through firmware Block I/O paid a firmware call per block, which on an emulated controller is
+		// most of the boot. Every block is still checked, in order. A run that will not read whole is read
+		// again a block at a time, so which fault is reported - and for which block - is the same.
+		let whole = self.dev.read_blocks(ext.physical, ext.store_len as u64, &mut comp);
 		for s in 0..ext.store_len as usize {
 			let dst = &mut comp[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE];
-			if !self.dev.read_block(ext.stored(s as u64), dst) {
+			if !whole && !self.dev.read_block(ext.stored(s as u64), dst) {
 				return Err(ExtentFault::Io);
 			}
 			let stored = u32::from_le_bytes(cbuf[s * 4..s * 4 + 4].try_into().unwrap());

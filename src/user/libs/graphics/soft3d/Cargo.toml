@@ -20,5 +20,11 @@ graphics-core = { path = "../core" }
 # zero ULP, which `render-shader::validate` is what enforces.
 libm = "0.2"
 
+[features]
+# EVERY COMPILED SHADER RUN CHECKED AGAINST THE INTERPRETER, bit for bit (`frame::differential`). For a
+# test suite that drives this backend from outside, such as the conformance scenes: it runs every
+# stage twice and allocates per invocation, so nothing staged turns it on.
+differential = []
+
 [lints.rust]
 warnings = "deny"

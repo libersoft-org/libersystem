@@ -1278,6 +1278,11 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 	loop {
 		while !cpu_sched(cpu).inner.lock().run_queue.is_empty() {
 			if expired(outer) {
+				// A BUSY BOOT CORE STILL OWES THE MACHINE ITS TIMEOUTS. This drain is the only place a
+				// deadline is scanned, and the scans below are reached when the queue empties - which on
+				// a core that a stream of device wakes keeps busy may be never. Every caller comes back
+				// within a tick, so scanning at each window's end bounds a timeout's lateness by one.
+				check_deadlines();
 				reap(cpu_sched(cpu));
 				return false;
 			}

@@ -249,6 +249,16 @@ class HidPeer(Peer):
 
 
 class SerialPeer(Peer):
+    # A SERIAL DEVICE WITH A BOUNDED ECHO BUFFER. Bumble's DLC gives a credit back for every frame it receives,
+    # whatever its application does with the data, so an echo nobody reads piled up without bound here and the
+    # host met this device's credits only when the radio happened to be slower than its writer - `btserial`'s
+    # burst passed or failed on the host's speed. A device holds what it has not yet echoed in a buffer of its
+    # own: past ECHO_HELD bytes of it this one gives no credits back, and gives them again once the host has
+    # taken the echo down to ECHO_RESUME. Bumble's credit accounting and framing are unchanged; only when this
+    # device grants is its own.
+    ECHO_HELD = 4096
+    ECHO_RESUME = 1024
+
     def setup(self):
         self.server = rfcomm.Server(self.device)
         channel = self.server.listen(self.accept, channel=3)
@@ -257,13 +267,28 @@ class SerialPeer(Peer):
     def accept(self, dlc):
         self.dlc = dlc
         self.observe('spp-open')
+        threshold = dlc.rx_credits_threshold
+        ended = (rfcomm.DLC.State.DISCONNECTING, rfcomm.DLC.State.DISCONNECTED, rfcomm.DLC.State.RESET)
 
         def data_received(data):
             self.received.extend(data)
             dlc.write(data)
+            # HELD BEFORE BUMBLE ANSWERS THE FRAME: it decides on credits right after this sink returns.
+            if len(dlc.tx_buffer) > self.ECHO_HELD and dlc.rx_credits_threshold >= 0:
+                dlc.rx_credits_threshold = -1
+                self.observe('spp-credits-held', backlog=len(dlc.tx_buffer))
             self.observe('spp-data', length=len(data), total=len(self.received), digest=hashlib.sha256(self.received).hexdigest())
 
+        async def release():
+            while dlc.state not in ended:
+                if dlc.rx_credits_threshold < 0 and len(dlc.tx_buffer) <= self.ECHO_RESUME:
+                    dlc.rx_credits_threshold = threshold
+                    self.observe('spp-credits-released', backlog=len(dlc.tx_buffer))
+                    dlc.process_tx()
+                await asyncio.sleep(.005)
+
         dlc.sink = data_received
+        self.spawn(release())
 
 
 class VolumeDelegate(avrcp.Delegate):

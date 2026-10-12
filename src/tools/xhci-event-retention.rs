@@ -973,6 +973,11 @@ mod usb_audio {
 	pub fn play_before_refill(_: &mut Xhci, _: &mut (), _: u64, _: u32) -> bool {
 		false
 	}
+	// No audio source is present in the service-drain model, where production answers false at
+	// `devices.source()` before it looks at the consumer's channel.
+	pub fn request_before_fill(_: &mut Xhci, _: &mut Hids, _: &mut (), _: u64, _: u32) -> bool {
+		false
+	}
 }
 fn handle_net_notification(_: &mut Xhci, _: &mut UsbDevice, _: &mut Net, _: u32, _: u32) -> bool {
 	panic!("no network device");

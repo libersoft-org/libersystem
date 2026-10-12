@@ -115,6 +115,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("modemdata", "modemdata - use a modem with a data grant alone"),
 	("tpmprobe", "tpmprobe CASE - drive the TPM gate's refusals and a held connection with the observation and sealing grants"),
 	("modemfail", "modemfail - a launch whose second modem grant cannot be minted"),
+	("uvccheck", "uvccheck capture|cycle|unplug - drive the USB camera gate through CameraService"),
 	("camcheck", "camcheck CASE - drive the camera gate against the in-guest fixture"),
 	("camhold", "camhold CASE - hold a camera capture for the camera gate"),
 	("camread", "camread - list cameras with inventory alone"),

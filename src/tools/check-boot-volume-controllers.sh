@@ -35,6 +35,24 @@ served_seconds=150 served_timeout=200 decoy_seconds=120 decoy_timeout=170 refuse
 if [[ "$GUEST_ARCH" != x86_64 ]]; then
 	served_seconds=600 served_timeout=900 decoy_seconds=600 decoy_timeout=900 refused_seconds=600 refused_timeout=900
 fi
+# ON aarch64 AN AHCI DISK NEEDS FIRMWARE THAT DRIVES ONE. Debian's AAVMF carries no SATA driver, so its loader
+# sees no disk behind the controller and the boot runs from the medium instead; `build-aavmf-ahci.sh` builds the
+# same firmware with edk2's three. Only the AHCI boots take it - every other boot keeps the firmware it had.
+ahci_code="" ahci_vars=""
+if [[ "$GUEST_ARCH" == aarch64 ]]; then
+	ahci_code="$root/../.build/firmware/AAVMF_CODE.ahci.fd"
+	ahci_vars="$root/../.build/firmware/AAVMF_VARS.ahci.fd"
+	[[ -f "$ahci_code" && -f "$ahci_vars" ]] || fail "aarch64's AHCI boots need firmware with SATA drivers - build it:  src/tools/build-aavmf-ahci.sh"
+fi
+boot_through() {
+	local bus="$1"
+	shift
+	if [[ "$bus" == ahci && -n "$ahci_code" ]]; then
+		AAVMF_CODE="$ahci_code" AAVMF_VARS="$ahci_vars" guest_gate_run "$@"
+	else
+		guest_gate_run "$@"
+	fi
+}
 kept="$root/../.build/logs/boot-volume-controllers-$GUEST_ARCH"
 mkdir -p "$kept"
 keep_evidence() {
@@ -76,7 +94,7 @@ for bus in nvme ahci; do
 	export SYSTEM_DISK="$bus" RUN_DISK="$guest_gate_work/$bus-system.img"
 	export GUEST_GATE_SECONDS="$served_seconds" GUEST_GATE_TIMEOUT="$served_timeout"
 	proof="written-through-$bus"
-	guest_gate_run $'lsblk\nwrite boot-volume-proof.txt '"$proof"$'\ncat boot-volume-proof.txt\npoweroff' ""
+	boot_through "$bus" $'lsblk\nwrite boot-volume-proof.txt '"$proof"$'\ncat boot-volume-proof.txt\npoweroff' ""
 	first="$guest_gate_work/$bus-first"
 	cp "$GUEST_LINES" "$first"
 	from_the_disk "$first" "$bus, first boot"
@@ -85,7 +103,7 @@ for bus in nvme ahci; do
 	[[ "$device" == "$bus" ]] || fail "$bus, first boot: lsblk named '${device:-nothing}' as the device under vol://system"
 	echo "boot-volume-controllers: $bus: vol://system served from the paired disk, and lsblk names $bus as its device"
 	expect "$first" "wrote vol://system/boot-volume-proof.txt" "the file must be written to the system volume"
-	guest_gate_run $'lsblk\ncat boot-volume-proof.txt\npoweroff' ""
+	boot_through "$bus" $'lsblk\ncat boot-volume-proof.txt\npoweroff' ""
 	second="$guest_gate_work/$bus-second"
 	cp "$GUEST_LINES" "$second"
 	from_the_disk "$second" "$bus, second boot"
@@ -119,7 +137,16 @@ export GUEST_GATE_SECONDS="$refused_seconds" GUEST_GATE_TIMEOUT="$refused_timeou
 guest_gate_run $'lsblk' ""
 fallback="$guest_gate_work/fallback"
 cp "$GUEST_LINES" "$fallback"
-expect "$fallback" "StorageService: selected root volume is missing; refused" "a paired volume no boot-critical driver reaches must be refused by name"
+# ON riscv64 THE REFUSAL COMES ONE STEP EARLIER, and by a name of its own. U-Boot drives no virtio-scsi,
+# so the loader never sees the paired volume, promotes none and boots the medium's own kernel; StorageService
+# then refuses to serve any disk as the system volume. Elsewhere the firmware reads the volume, the loader
+# promotes it, and no boot-critical driver reaches it.
+if [[ "$GUEST_ARCH" == riscv64 ]]; then
+	expect "$fallback" "loader: no LiberFS volume on any block device" "the firmware drives no virtio-scsi, so the loader must find no volume to promote"
+	expect "$fallback" "StorageService: the loader promoted no block volume for this boot - refusing to serve one as the system volume" "a boot whose loader promoted no volume must serve none as the system volume"
+else
+	expect "$fallback" "StorageService: selected root volume is missing; refused" "a paired volume no boot-critical driver reaches must be refused by name"
+fi
 if grep -aqF "StorageService: online (vol://system)" "$fallback"; then
 	fail "fallback: vol://system came online from a disk the medium is not paired with"
 fi

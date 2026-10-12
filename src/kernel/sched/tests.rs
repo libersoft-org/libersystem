@@ -312,6 +312,49 @@ fn a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself() {
 	assert!(!ended_before_stop, "the bounded pump returned while its sole non-yielding worker was still running");
 }
 
+crate::tagged_test!(a_drain_that_never_empties_still_expires_timed_waits, [Scheduler, Kernel], id = "kernel.sched.a_drain_that_never_empties_still_expires_timed_waits", covers = ["kernel"]);
+fn a_drain_that_never_empties_still_expires_timed_waits() {
+	// THE BOOT CORE THAT NEVER IDLES. Deadlines are scanned only by the bounded drain, and only once
+	// its queue is empty - so a core kept busy by a thread that always requeues itself never reached a
+	// scan, and every timed wait on the machine waited for ever: a capture loop's half-second sleep,
+	// every RPC deadline behind it. A window that ends with the queue still full scans before it
+	// returns, so the sleeper here wakes while the yielder is still running.
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	static STOP: AtomicBool = AtomicBool::new(false);
+	static WOKE: AtomicBool = AtomicBool::new(false);
+	static SPINS: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn yielder(_arg: u64) {
+		while !STOP.load(Ordering::SeqCst) {
+			SPINS.fetch_add(1, Ordering::SeqCst);
+			sched::yield_now();
+		}
+	}
+	extern "C" fn sleeper(_arg: u64) {
+		// A koid nothing ever signals, so only the deadline can end this wait.
+		sched::block_on(u64::MAX, arch::apic::ticks() + 2);
+		WOKE.store(true, Ordering::SeqCst);
+	}
+	STOP.store(false, Ordering::SeqCst);
+	WOKE.store(false, Ordering::SeqCst);
+	SPINS.store(0, Ordering::SeqCst);
+	sched::spawn(yielder, 0);
+	sched::spawn(sleeper, 0);
+	for _ in 0..8 {
+		let idled = sched::run_until_idle_until(arch::apic::ticks() + 1);
+		assert!(!idled, "the yielder keeps the queue from emptying, so no window can idle");
+		if WOKE.load(Ordering::SeqCst) {
+			break;
+		}
+	}
+	let woke = WOKE.load(Ordering::SeqCst);
+	let spins = SPINS.load(Ordering::SeqCst);
+	STOP.store(true, Ordering::SeqCst);
+	sched::run_until_idle();
+	assert!(spins > 0, "the yielder did run, so the queue really was busy");
+	assert!(woke, "a timed wait expired while its core never emptied its queue");
+	crate::serial_println!("    a two-tick wait woke within eight one-tick windows of a queue that never emptied");
+}
+
 crate::tagged_test!(a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer, [Scheduler, Kernel], id = "kernel.sched.a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer", covers = ["kernel"]);
 fn a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer() {
 	// THE OTHER HALF: a thread that WAITS past the window.
