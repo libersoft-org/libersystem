@@ -4401,8 +4401,24 @@ fn pcm_ask(pcm: &object::channel::Channel, bytes: alloc::vec::Vec<u8>) -> Option
 }
 
 // Period `n` of a ramp, never silent: what a device counts as silent is what the driver played in its place.
+//
+// ONE COPY OUT OF A RAMP MADE AT COMPILE TIME, the same bytes a period always had - byte `at` of period `n` is
+// `(at + 7n) % 251 | 1`, which is the ramp read from `7n % 251`. What the feeder spends making a period comes out of
+// the period it has to deliver it in, and in this kernel - unoptimised, and under TCG on the ports - a byte at a time
+// through an iterator was the feeder's own share of a stream that ran dry.
+const PCM_RAMP_BYTES: usize = driver_protocol::audio::PERIOD_BYTES as usize + 251;
+static PCM_RAMP: [u8; PCM_RAMP_BYTES] = {
+	let mut ramp = [0u8; PCM_RAMP_BYTES];
+	let mut at = 0;
+	while at < PCM_RAMP_BYTES {
+		ramp[at] = (at % 251) as u8 | 1;
+		at += 1;
+	}
+	ramp
+};
 fn pcm_period(n: usize) -> alloc::vec::Vec<u8> {
-	(0..driver_protocol::audio::PERIOD_BYTES as usize).map(|at| ((at + n * 7) % 251) as u8 | 1).collect()
+	let from = n * 7 % 251;
+	PCM_RAMP[from..from + driver_protocol::audio::PERIOD_BYTES as usize].to_vec()
 }
 
 // Periods `from..from + count`, each answered `OK` once queued with room for the next - so the feeding is paced by the
@@ -4467,11 +4483,17 @@ fn usb_audio_playback_follows_an_asynchronous_speakers_clock() {
 			while arch::apic::ticks() < resume {
 				sched::block_on(koid, resume);
 			}
-			if !feed(1, 282) {
-				return Err("the period after the starvation was refused");
+			// THE COUNTERS ARE READ WITH THE QUEUE FULL AGAIN - the provider's four periods - and not behind a single
+			// period. One period is 10.6 ms of sound, and the counters asked for behind it are a round trip that has to
+			// end, and the next period arrive, before that sound does: an emulated core does not make it, and the stream
+			// ran dry a second time for the test's sake, which the counters then reported as part of the starvation.
+			// Every claim below is unchanged.
+			const RESUME: usize = 4;
+			if !feed(RESUME, 282) {
+				return Err("a period after the starvation was refused or not answered");
 			}
 			let starved = stats().ok_or("the counters after the starvation were not answered")?;
-			if !feed(100, 283) {
+			if !feed(100, 282 + RESUME) {
 				return Err("a period after the starvation was refused or not answered");
 			}
 			let after = stats().ok_or("the counters at the end were not answered")?;

@@ -3679,3 +3679,18 @@ NOT DONE (milestone stays OPEN):
 - "Meet an enforceable soft2d performance floor with a HEADLESS benchmark runner" - blocked on the owner's decision about the ceilings: the item itself records that `image-convert` cannot reach 16.7 ms without changing a pixel or an instruction set, which the owner's earlier answer forbids, and that a cheaper blur for UI-effects is a profile change. No implementer may pick a ceiling, so it was not attempted.
 - "It passes only when ..." (the 2D `d` acceptance) names that same headless floor, so it stays open with it.
 - An `rt` change makes the development image's audit-linked `abiprobe`/`vkprobe` stale; `src/tools/foreign-audit-link.py --check` and the ports' runs belong to the end-of-job verification (recorded with P02M0188).
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-10-12 14:10:04 UTC):
+
+CORRECTION OF THE 02:21:04 UTC ENTRY: it said the soft2d headless floor was "blocked on the owner's decision about the ceilings". That was wrong. The milestone header (2026-10-09) already records that the image-convert lower-bound argument was incorrect (the tile renderer encodes once) and `docs/PERF.md` records the five scenes passing their ceilings on 2026-10-09, with those first accepted measurements as the frozen budgets and `soft2d-performance` registered. What was actually left was evidence on the current tree for both open items; it was produced today and both items are ticked. The milestone is COMPLETE (status line and TODO.md row updated).
+
+RUN TODAY (2026-10-12), all PASS, on the tree with the worker-pool mailbox, the scaled present blit and the optimised drivers:
+- `RUST_MIN_STACK=33554432 ./check.sh --gate soft2d-performance` (9 s, no guest running): UI-basic 10.239 ms (frozen budget 10.837, ceiling 16.7), UI-effects 64.965 (65.640, 66.7), vector-stress 63.928 (65.509, 66.7), image-resample 11.776 (13.414, 16.7), image-convert 15.464 (16.063, 16.7); p99 11.058 / 67.816 / 65.190 / 20.665 / 16.260 ms.
+- `kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage` on x86_64 (27 s), aarch64 (50 s), riscv64 (44 s), SMP=4: draw mean at 1:1 / 2:1 (192x128 logical, 384x256 physical) 9.049/12.500 ms, 110.497/150.355 ms, 143.312/209.045 ms; presented=14, rebuilt=2, phase=5, lanes=4 units=20 on each.
+- `kernel.applications.the_2d_profile_conforms_on_the_target` + `kernel.services.display_service_restores_the_console_surface` on all three (2 passed each; x86_64 23 s, aarch64 44 s, riscv64 38 s): `test2d-conformance: 112 passed, 0 failed, 0 unsupported, 0 untested` / `conforms` on each.
+- `./check.sh --gate qemu-2d-demo` 214 s: `2d-demo-package: position-independent on 3 target(s), 8 declared provider(s) ... exactly the Display + InputKeys grants`; `2d-demo-frames: 3 frame(s) at 1280x800: animation, analytic coverage, blending, filtering and a colour glyph all present`; proof `.build/logs/qemu-2d-demo.iI3whR`.
+- Live 640x480: `SMP=32 ./lab.sh boot` (44.3 s) then `./lab.sh sh --timeout 300 'test2d-sw --frames=160 --phase-frames=40 --size=640x480'`: presented=160 partial=38 multi-rect=38, draw-mean-us=13800, draw-worst-us=38011, interval-mean-us=20029, interval-worst-us=42171, lanes=32 units=80 (2026-10-09: 61601 / 104670).
+- Earlier today on the same tree: `kernel.services.the_2d_demo_draws_the_same_frames_through_its_workers` and the 3D worker/emergency-kill tests PASS on aarch64 and riscv64 (P02M0099 lanes), `qemu-3d-demo`/`qemu-3d-extended` PASS on x86_64.
+
+DOCUMENTS: `docs/PERF.md` "The 2D floor on the current tree (2026-10-12)"; `docs/todo/P02M0103.md` both items ticked with their evidence and the status line COMPLETE; `docs/todo/TODO.md` row ticked COMPLETE (2026-10-12).

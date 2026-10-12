@@ -1338,6 +1338,45 @@ THE EXTENDED PHASE, measured in the same session by its own gate, which no floor
 The HDR postprocess - six downsamples, five upsamples and the resolve - is now the largest stage and the
 one that grows with the window; the shadow pass stays flat, as its map's extent is the light's.
 
+## The 2D floor on the current tree (2026-10-12)
+
+Taken after the worker pool's mailbox protocol and the scaled present blit (both under "The 3D demo at its
+floor" above), on the tree those changes are in. Nothing here moves a budget or a ceiling.
+
+THE HEADLESS FLOOR, `RUST_MIN_STACK=33554432 ./check.sh --gate soft2d-performance`, PASS in 9 s at 16:03 CEST on
+the reference host with no guest running: the release benchmark, `--check --workers 1`, five warm-ups and thirty
+samples per scene, the frozen fixtures checked before the clock starts.
+
+| scene | commands/resources | prepare | replay median | replay p99 | frozen budget | ceiling |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UI-basic | 252/153 | 1.700 ms | 10.239 ms | 11.058 ms | 10.837 ms | 16.7 ms |
+| UI-effects | 45/34 | 38.564 ms | 64.965 ms | 67.816 ms | 65.640 ms | 66.7 ms |
+| vector-stress | 240/241 | 5.970 ms | 63.928 ms | 65.190 ms | 65.509 ms | 66.7 ms |
+| image-resample | 11/1 | 63.354 ms | 11.776 ms | 20.665 ms | 13.414 ms | 16.7 ms |
+| image-convert | 14/2 | 73.126 ms | 15.464 ms | 16.260 ms | 16.063 ms | 16.7 ms |
+
+THE LIVE FRAME AT 640x480, `./lab.sh sh 'test2d-sw --frames=160 --phase-frames=40 --size=640x480'` in a lab guest
+booted with `SMP=32` (KVM, 32 vCPUs): 160 frames, 38 partial and 38 multi-rect presents, 32 lanes over 80 units -
+**draw mean 13.8 ms, worst 38.0 ms; present interval mean 20.0 ms, worst 42.2 ms.** The same command on 2026-10-09
+measured a 61.6 ms draw and a 104.7 ms interval; the difference is the pool, whose callers and workers no longer
+round-trip through the kernel for every call, and the present, whose scaled blit no longer divides per pixel.
+
+AT A HiDPI SCALE AND ON THE EMULATED PORTS, the guest test `kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage`
+(the same measurement as "At a HiDPI scale" above: the demo's scene at 192x128 logical, the scale phase setting 2:1
+through DisplayService's admin channel, so 384x256 physical; SMP=4, four lanes over twenty units), one run each:
+
+| target | scale 1:1 draw mean | scale 2:1 draw mean | ratio |
+| --- | ---: | ---: | ---: |
+| x86_64 (KVM) | 9.05 ms | 12.50 ms | 1.38x |
+| aarch64 (TCG) | 110.5 ms | 150.4 ms | 1.36x |
+| riscv64 (TCG) | 143.3 ms | 209.0 ms | 1.46x |
+
+These are reported and not held to the 640x480 reference-host ceilings, as the plan says. In the same session the 2D
+profile conformance (`kernel.applications.the_2d_profile_conforms_on_the_target`) reported `112 passed, 0 failed,
+0 unsupported, 0 untested` on all three targets, `kernel.services.display_service_restores_the_console_surface`
+passed on all three, and `./check.sh --gate qemu-2d-demo` passed (214 s: the package audit, then three live frames
+proving animation, analytic coverage, blending, filtering and a colour glyph).
+
 ## soft2d on several cores (2026-09-27)
 
 `soft2d` replays a prepared frame on a WORKER POOL the caller supplies - `soft2d::Workers`, the shape

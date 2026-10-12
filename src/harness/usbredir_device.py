@@ -57,9 +57,9 @@ THE DEVICES, chosen with `--emulate`:
   uvc-iso     a UVC 1.1 camera streaming 64x48 YUY2 ISOCHRONOUSLY: alternate zero carries no endpoint, alternates 1-3
               carry isochronous IN 0x81 of 256, 512 and 1023 bytes, and the probe answers a 512-byte payload. Frames
               are the gadget camera's - the number in the first eight bytes, the shared pattern after - cut into
-              payloads with FID and EOF; frame 2 has one packet LOST (sent with an error status and no data) and frame
-              3 carries the error bit; the second stream committed ends with the camera leaving the bus after its
-              first frame and a tenth of a second of empty payloads.
+              payloads with FID, EOF and the frame's PTS; frame 2 has one packet LOST (sent with an error status
+              and no data) and frame 3 carries the error bit; the second stream committed ends with the camera
+              leaving the bus after its first frame and a tenth of a second of empty payloads.
   dfu-upload  the `dfu-reset` target with `bitCanUpload` in both modes: in DFU mode DFU_UPLOAD reads its firmware - a
               factory image of 2500 bytes by the shared formula, seed 3, until an image is manifested in its place - in
               1024-byte blocks, the last one short.
@@ -828,16 +828,20 @@ class UvcIso(Device):
     def iso_stopped(self, address):
         say(self.name, f"stopped after {self.packets} packets, {self.lost} of them lost on purpose, at frame {self.number}")
 
+    # EVERY PAYLOAD CARRIES ITS FRAME'S PTS, as a camera that stamps them does: the device clock the control interface
+    # declares (6 MHz) at the frame interval, the same in every payload of one frame - which is what lets the class
+    # tell two frames joined by packets QEMU dropped without a word from one whole frame.
     def frame(self, number):
         data = struct.pack("<Q", number) + bytes((at * 7 + number * 13) % 251 for at in range(8, self.FRAME))
-        room = self.PAYLOAD - 2
+        room = self.PAYLOAD - 6
         chunks = [data[at:at + room] for at in range(0, len(data), room)]
+        pts = struct.pack("<I", number * 200_000 & 0xFFFFFFFF)
         out = []
         for at, chunk in enumerate(chunks):
-            flags = 0x80 | (number & 1) | (0x02 if at == len(chunks) - 1 else 0)
+            flags = 0x80 | 0x04 | (number & 1) | (0x02 if at == len(chunks) - 1 else 0)
             if number == self.BAD_FRAME and at == 0:
                 flags |= 0x40
-            out.append(None if number == self.LOST_FRAME and at == self.LOST_PACKET else bytes([2, flags]) + chunk)
+            out.append(None if number == self.LOST_FRAME and at == self.LOST_PACKET else bytes([6, flags]) + pts + chunk)
         return out
 
     # ONE SERVICE INTERVAL'S PAYLOAD - or `None`, a packet lost, which goes out with an error status and no data.

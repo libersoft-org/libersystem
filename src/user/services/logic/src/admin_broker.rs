@@ -411,10 +411,16 @@ impl Broker {
 				}
 				// THE EXECUTION ADMISSION BOUNDARY. A death observed now means no dispatch, and the spent grant
 				// is recorded as failed without one.
+				//
+				// AND THE HOLDER IS REFUSED, as it is when the death was observed before its call: which of the two
+				// it gets must not depend on when this service noticed. A process's channels close before its task
+				// reads as ended, so a delegate that saw its owner's pipe close can call while the task still
+				// reads as alive - and was answered `failed` for the same dead owner a moment's lead would have
+				// had refused (the gate's delegate step, x86_64, 2026-10-12).
 				if !self.live(connection) || now >= self.requests[at].grant_by {
 					self.requests[at].state = State::Failed;
 					self.requests[at].redeeming = false;
-					effects.push(Effect::Redeemed { request, outcome: Some(Outcome::Failed) });
+					effects.push(Effect::Redeemed { request, outcome: None });
 					effects.push(Effect::CloseGrant { request });
 					self.requests[at].journaling = Some(Event::Failed);
 					self.requests[at].exchange_by = now + EXCHANGE_TICKS;

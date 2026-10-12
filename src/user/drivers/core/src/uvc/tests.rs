@@ -285,7 +285,9 @@ fn a_probe_carries_the_selection_and_its_answer_the_sizes() {
 
 #[test]
 fn a_payload_header_is_believed_only_as_far_as_its_length() {
-	assert_eq!(payload(&[2, 0x83, 9, 9]), Some(Payload { fid: true, eof: true, err: false, data: 2 }));
+	assert_eq!(payload(&[2, 0x83, 9, 9]), Some(Payload { fid: true, eof: true, err: false, pts: None, data: 2 }));
+	assert_eq!(payload(&[6, 0x85, 0x78, 0x56, 0x34, 0x12, 9]), Some(Payload { fid: true, eof: false, err: false, pts: Some(0x1234_5678), data: 6 }));
+	assert_eq!(payload(&[5, 0x84, 1, 2, 3, 9]), None, "a header that says PTS and cannot hold one");
 	assert_eq!(payload(&[12, 0x40]), None, "a header longer than its transfer");
 	assert_eq!(payload(&[1, 0]), None, "a header shorter than itself");
 	assert!(payload(&[2, 0xc0]).unwrap().err);
@@ -342,6 +344,15 @@ fn part(fid: bool, eof: bool, err: bool, data: &[u8]) -> Vec<u8> {
 	}
 	let mut out = alloc::vec![2, info];
 	out.extend_from_slice(data);
+	out
+}
+
+// One payload stamped with its frame's PTS.
+fn stamped(fid: bool, eof: bool, pts: u32, data: &[u8]) -> Vec<u8> {
+	let mut out = part(fid, eof, false, data);
+	out[0] = 6;
+	out[1] |= HEADER_PTS;
+	out.splice(2..2, pts.to_le_bytes());
 	out
 }
 
@@ -459,4 +470,30 @@ fn a_lost_packet_loses_its_frame_and_nothing_after_it() {
 	assembler.lost();
 	feed(&mut assembler, &mut buffers, &[part(true, true, false, &[2]), part(false, true, false, &[3])]);
 	assert_eq!(buffers.ended.iter().map(|(frame, _)| frame.bad).collect::<Vec<_>>(), alloc::vec![false, true, false]);
+}
+
+#[test]
+fn a_frame_two_frames_later_is_not_this_frames_tail_when_the_device_stamps_its_payloads() {
+	// WHOLE: every payload of a frame carries the frame's PTS, and the frames assemble as without one.
+	let mut assembler = Assembler::new();
+	let mut buffers = Buffers::queued(&[16, 16]);
+	feed(&mut assembler, &mut buffers, &[stamped(false, false, 100, &[1, 2]), stamped(false, true, 100, &[3]), stamped(true, true, 200, &[4])]);
+	assert_eq!(buffers.ended[0], (Assembled { buffered: true, written: 3, bad: false, eof: true }, alloc::vec![1, 2, 3]));
+	assert!(buffers.ended[1].0.whole(Some(1)));
+	// SPLICED: frame 0's head, then - frames 1 and 2 lost without a word - frame 2's tail, the same FID and the
+	// frame's exact length. Without a PTS nothing can tell; with one, the frame is lost and the next is whole.
+	let mut assembler = Assembler::new();
+	let mut buffers = Buffers::queued(&[16, 16]);
+	feed(&mut assembler, &mut buffers, &[part(false, false, false, &[1, 2]), part(false, true, false, &[9])]);
+	assert!(buffers.ended[0].0.whole(Some(3)), "the splice an unstamped stream cannot see");
+	let mut assembler = Assembler::new();
+	let mut buffers = Buffers::queued(&[16, 16]);
+	feed(&mut assembler, &mut buffers, &[stamped(false, false, 100, &[1, 2]), stamped(false, true, 300, &[9]), stamped(true, true, 400, &[4])]);
+	assert_eq!(buffers.ended[0].0, Assembled { buffered: true, written: 2, bad: true, eof: true }, "lost, and nothing of the other frame written");
+	assert!(!buffers.ended[0].0.whole(Some(3)) && buffers.ended[1].0.whole(Some(1)));
+	// A PTS that first appears mid-frame is the frame's from there on.
+	let mut assembler = Assembler::new();
+	let mut buffers = Buffers::queued(&[16]);
+	feed(&mut assembler, &mut buffers, &[part(false, false, false, &[1]), stamped(false, false, 7, &[2]), stamped(false, true, 7, &[3])]);
+	assert!(buffers.ended[0].0.whole(Some(3)));
 }

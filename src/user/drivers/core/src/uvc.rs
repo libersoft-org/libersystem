@@ -332,6 +332,8 @@ pub const VS_COMMIT_CONTROL: u8 = 0x02;
 
 pub const HEADER_FID: u8 = 1 << 0;
 pub const HEADER_EOF: u8 = 1 << 1;
+/// A presentation time stamp follows the two header bytes: four bytes, the same in every payload of one frame.
+pub const HEADER_PTS: u8 = 1 << 2;
 pub const HEADER_ERR: u8 = 1 << 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,6 +447,8 @@ pub struct Payload {
 	pub fid: bool,
 	pub eof: bool,
 	pub err: bool,
+	/// The frame's presentation time stamp, when the header carries one.
+	pub pts: Option<u32>,
 	/// Where the data starts in the transfer.
 	pub data: usize,
 }
@@ -455,7 +459,16 @@ pub fn payload(transfer: &[u8]) -> Option<Payload> {
 		return None;
 	}
 	let info = transfer[1];
-	Some(Payload { fid: info & HEADER_FID != 0, eof: info & HEADER_EOF != 0, err: info & HEADER_ERR != 0, data: length })
+	// A header that says it carries a PTS and is too short to hold one is not a header.
+	let pts = if info & HEADER_PTS != 0 {
+		if length < 6 {
+			return None;
+		}
+		Some(le32(transfer, 2))
+	} else {
+		None
+	};
+	Some(Payload { fid: info & HEADER_FID != 0, eof: info & HEADER_EOF != 0, err: info & HEADER_ERR != 0, pts, data: length })
 }
 
 /// Where an assembled frame's bytes go - the consumer's leased buffer in the class module, a vector in a test.
@@ -500,6 +513,8 @@ impl Assembled {
 #[derive(Clone, Copy)]
 struct Open {
 	fid: bool,
+	/// The PTS the frame's payloads carry, from the first that carried one.
+	pts: Option<u32>,
 	capacity: Option<u64>,
 	written: u32,
 	bad: bool,
@@ -526,6 +541,14 @@ impl Open {
 /// AND AN ISOCHRONOUS TRANSPORT LOSES PACKETS, which a bulk one never does: `lost` says one was missed. The frame open
 /// when it happened has a hole in it and is lost; with none open, the packet may have been the start of the next, so
 /// the next frame to open is lost too - and nothing after it.
+///
+/// AND IT CAN LOSE THEM WITHOUT SAYING SO. Two whole frames gone between two payloads join one frame's head to the
+/// tail of the frame two after it: the same FID, and - when the head and the tail are as long as one frame - exactly a
+/// frame's length, ended by an EOF, which no bit above can tell from a whole frame. A device that stamps its payloads
+/// with a PTS stamps every payload of a frame with the same one, so a payload whose PTS differs from the open frame's
+/// is from another frame, and the open frame is lost. (QEMU's usbredir drops buffered isochronous IN packets without
+/// telling the guest when its queue overflows, which is the likeliest reading of a damaged frame that reached a client
+/// on aarch64 under TCG on 2026-10-12.)
 #[derive(Default)]
 pub struct Assembler {
 	frame: Option<Open>,
@@ -564,8 +587,13 @@ impl Assembler {
 			return;
 		}
 		let lost_between = core::mem::take(&mut self.lost_between);
-		let frame = self.frame.get_or_insert_with(|| Open { fid: header.fid, capacity: sink.open(), written: 0, bad: lost_between });
+		let frame = self.frame.get_or_insert_with(|| Open { fid: header.fid, pts: header.pts, capacity: sink.open(), written: 0, bad: lost_between });
 		frame.bad |= header.err;
+		match (frame.pts, header.pts) {
+			(Some(open), Some(this)) if open != this => frame.bad = true,
+			(None, Some(this)) => frame.pts = Some(this),
+			_ => {}
+		}
 		let data = &transfer[header.data..];
 		if let Some(capacity) = frame.capacity
 			&& !frame.bad

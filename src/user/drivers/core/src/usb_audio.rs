@@ -21,8 +21,9 @@
 // the nominal rate for an adaptive or synchronous sink, the rate an asynchronous sink's FEEDBACK ENDPOINT asks for
 // otherwise, read from the group of transfers that stands on it. WHEN THE QUEUE RUNS DRY WHILE THE STREAM PLAYS, a packet of
 // SILENCE goes out in its place - the owner's option (a), 2026-09-25: the device's clock keeps running, the gap is
-// silence and the stream resumes without a restart - and one underrun is counted per dry spell, with the silent
-// frames. `EndPlayback` lets the queue drain and the stream go idle. The counters answer `CMD_STATS`.
+// silence and the stream resumes without a restart, once it holds what an idle stream starts with - and one underrun is
+// counted per dry spell, with the silent frames. `EndPlayback` lets the queue drain and the stream go idle. The counters
+// answer `CMD_STATS`.
 //
 // A CAPTURE STANDS WHILE IT RUNS. From the first `CMD_CAPTURE` until `CMD_CAPTURE_STOP` the source's
 // capture setting is selected and `CAPTURE_POSTED` isochronous IN transfers stay posted, each re-posted as
@@ -502,14 +503,20 @@ unsafe fn post_playback(hc: &mut Xhci, dev: &UsbDevice, sink: &mut Sink) {
 			if sink.ending && sink.queue.is_empty() {
 				break;
 			}
+			// A STREAM THAT RAN DRY RESUMES THE WAY AN IDLE ONE STARTS, from `PLAYBACK_START` queued and not from the
+			// first period back: one period is less sound than the floor below keeps standing, so a stream resumed on
+			// it padded its next packet unless the period after it was already here - and ran dry again, a second
+			// underrun inside one starvation (riscv64 under TCG, 2026-10-12). Until then the silence goes on, counted
+			// in the same dry spell. An ending stream plays what it has.
+			let queued = if sink.dry && !sink.ending && sink.queue.len() < PLAYBACK_START { 0 } else { sink.queue.len() };
 			let bytes = (sink.pacer.peek() * frame) as usize;
-			if sink.queue.len() < bytes && !sink.ending && sink.posted + (count as u32) >= floor {
+			if queued < bytes && !sink.ending && sink.posted + (count as u32) >= floor {
 				break;
 			}
 			let frames = sink.pacer.next();
 			let bytes = (frames * frame) as usize;
 			let at = sink.virt + u64::from(sink.next) * u64::from(sink.binding.max_packet);
-			let taken = bytes.min(sink.queue.len());
+			let taken = bytes.min(queued);
 			// THE QUEUE'S BYTES MOVE AS RUNS, not one at a time: two copies at most, one per half of the
 			// ring buffer, into the packet's slot - ordinary DMA memory the release fence below orders
 			// before the TRB that names it.

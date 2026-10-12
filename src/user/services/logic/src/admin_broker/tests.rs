@@ -202,6 +202,7 @@ fn owner_death_is_requester_loss_in_every_phase_and_nothing_revives_it() {
 	broker.owner_died(connection, 21, &mut effects);
 	broker.journaled(request, Event::Consumed, true, 22, &mut effects);
 	assert_eq!(dispatches(&effects), 0);
+	assert!(effects.contains(&Effect::Redeemed { request, outcome: None }), "the holder is refused, as it would have been a moment earlier");
 	assert_eq!(broker.request(request).unwrap().state, State::Failed);
 	assert_eq!(journal_of(&effects), Some((request, Event::Failed)));
 	assert!(!broker.redeem(request, 23, &mut effects));
@@ -389,6 +390,7 @@ fn termination_ready_beside_other_work_wins() {
 	broker.owner_died(connection, 21, &mut effects);
 	broker.journaled(request, Event::Consumed, true, 21, &mut effects);
 	assert_eq!((broker.request(request).unwrap().state, dispatches(&effects)), (State::Failed, 0));
+	assert!(effects.contains(&Effect::Redeemed { request, outcome: None }), "and refused, whichever was seen first");
 	assert!(!broker.redeem(request, 22, &mut effects));
 }
 
