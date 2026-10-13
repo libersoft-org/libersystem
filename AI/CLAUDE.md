@@ -56,3 +56,18 @@ automatically, and there are 59 of them and they run in about eighteen seconds t
   found exactly this way, and two of them were tests that passed for the wrong reason.
 - **Say what was measured, not what should be true.** Milestone documents in `docs/todo/` record
   numbers, including the ones that showed an idea did not pay.
+
+## Phase 2 is QEMU, and nothing is built without an oracle we can run
+
+Decided by the owner on 2026-10-13.
+
+- **Phase 2 is QEMU and everything that can be tested on it.** Real hardware is not part of phase 2.
+  A requirement that only physical hardware or a firmware no emulator offers can prove (a laptop's
+  embedded controller run, a board run, PCI PME, wake on LAN, PSCI SYSTEM_SUSPEND on aarch64) is
+  recorded where it belongs as **not tested on real hardware - not part of phase 2**, and it does not
+  hold a phase-2 milestone open. Do not create a separate "hardware acceptance" milestone for it.
+- **No driver and no feature without an oracle that runs here.** Before anything is built, name the
+  oracle that will prove it on this machine: a QEMU device, a `usbredir_device.py` model, a host USB
+  gadget, an in-guest fixture, or a register-level model in host tests. A physical device alone is not
+  a phase-2 oracle. If no such oracle exists, the item is not started in phase 2 - it is written down
+  as out of phase 2, with the reason, rather than implemented blind or left as an open box.
