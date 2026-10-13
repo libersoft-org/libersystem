@@ -353,6 +353,19 @@ unload_owned_modules
         self.assertEqual(pending,{'oldpcm'})
         self.assertIn('newhid',{call[-1] for call in calls})
 
+    def test_a_new_module_holding_an_owned_one_joins_the_owned_set(self):
+        # THE MONITOR'S AMBIENT LIGHT: hid_sensor_hub's platform drivers load on no USB or HID bus and hold it.
+        result,pending,_,calls,_=self.exercise(dependencies={'function': ['dependency'], 'dependency': ['oldpcm'], 'sensor': ['function', 'iio'], 'iio': ['oldpcm']})
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(pending,{'oldpcm'})
+        self.assertTrue({'sensor','iio'} <= {call[-1] for call in calls})
+
+    def test_a_preexisting_module_holding_an_owned_one_is_never_taken(self):
+        result,pending,_,calls,_=self.exercise(old=('oldpcm','oldsensor'),dependencies={'function': ['dependency'], 'dependency': ['oldpcm'], 'oldsensor': ['function']})
+        self.assertNotEqual(result.returncode,0)
+        self.assertTrue({'oldpcm','oldsensor','function'} <= pending)
+        self.assertNotIn('oldsensor',{call[-1] for call in calls})
+
     def test_cascade_mutation_reproduces_loss_and_fails_preservation(self):
         result,pending,_,calls,_=self.exercise(mutate_cascade=True)
         self.assertNotEqual(result.returncode,0)

@@ -500,7 +500,12 @@ unload_owned_modules() {
 	done
 	# holders is the reverse dependency relation: an owned holder can only release a dependency
 	# after it leaves. Builtins have no initstate and are not candidates.
-	local grew=1
+	#
+	# AND A MODULE ABSENT BEFORE THIS RUN THAT HOLDS AN OWNED ONE IS THIS RUN'S TOO. The monitor's ambient-light
+	# collection makes the host's hid_sensor_hub create platform devices, whose drivers (hid_sensor_als and its
+	# iio stack) load on no USB or HID bus; they held hid_sensor_hub, so it could never leave and the state stayed
+	# behind, refusing every later setup (first seen on a freshly booted host, 2026-10-13).
+	local grew=1 owned
 	while [[ "$grew" == "1" ]]; do
 		grew=0
 		while read -r dependency; do
@@ -513,6 +518,14 @@ unload_owned_modules() {
 				break
 			done
 		done < <(loaded_modules)
+		for owned in "${!chain[@]}"; do
+			for holder in "/sys/module/$owned/holders/"*; do
+				[[ -e "$holder" && -z "${chain[${holder##*/}]:-}" ]] || continue
+				grep -qxF "${holder##*/}" "$before_modules" && continue
+				chain["${holder##*/}"]=1
+				grew=1
+			done
+		done
 	done
 	# Keep the complete ownership fact before the first removal: on refusal, an already orphaned
 	# dependency still belongs to this run and the next teardown can identify it without guessing.

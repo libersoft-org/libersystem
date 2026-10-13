@@ -223,7 +223,11 @@ impl Uvc {
 			uvc::Kind::Yuy2 => Some(stream.selection.stride * u32::from(stream.selection.height)),
 			uvc::Kind::Mjpeg => None,
 		};
+		// A FRAME THE DEVICE OR ITS TRANSPORT LOST IS THE DEVICE'S, buffer or no buffer: it would have been dropped with
+		// one queued, and `no-buffer` tells a consumer it lost a good frame by being late, which it did not. Under TCG a
+		// slow consumer met the emulator's bad frames with nothing queued and counted them as its own.
 		let event = match slot {
+			None if frame.bad => CameraDeviceEvent::Dropped(CameraDrop { stream_generation: generation, first_sequence: sequence, count: 1, reason: CameraDropReason::Device }),
 			None => CameraDeviceEvent::Dropped(CameraDrop { stream_generation: generation, first_sequence: sequence, count: 1, reason: CameraDropReason::NoBuffer }),
 			Some((at, lease)) => {
 				if frame.whole(expected) {

@@ -3791,7 +3791,8 @@ fn usb_bluetooth_carries_commands_events_and_acl_and_resets_into_a_new_epoch() {
 	sched::run_until_idle();
 	let mut client = device::hci_transport::Client::new(KernelTransport::new(&host_end, patience));
 	let attached = client.attach(&1).expect("answered").expect("attached");
-	assert!(!attached.iso && attached.max_command == 258 && attached.max_acl >= 516, "the ceilings are advertised, and ISO is not carried: {attached:?}");
+	// ISO IS CARRIED: it shares the ACL pair, and its ceiling is advertised with the others.
+	assert!(attached.iso && attached.max_iso == 1032 && attached.max_command == 258 && attached.max_acl >= 516, "the ceilings are advertised, ISO's among them: {attached:?}");
 	let epoch = attached.epoch;
 	let packets = client.receive().expect("the receive stream opened");
 	let control = client.control().expect("the control stream opened");
@@ -3884,9 +3885,15 @@ fn usb_bluetooth_carries_commands_events_and_acl_and_resets_into_a_new_epoch() {
 	assert_eq!(client.send(&device::HciPacketKind::Acl, &after_stall), Some(Ok(after_stall.len() as u32)), "and the next send goes through the pipe that was recovered");
 	looped(&after_stall);
 
+	// ISO ON THE ACL PAIR: a whole packet goes out on the bulk OUT pipe and comes back as the IN pipe delivers everything -
+	// as `acl`, for BluetoothService to tell apart by its handle - with its completion on its own handle.
+	let isochronous = acl(0x0a1, 40);
+	assert_eq!(client.send(&device::HciPacketKind::Iso, &isochronous), Some(Ok(isochronous.len() as u32)));
+	looped(&isochronous);
+
 	// WHAT A TRANSPORT REFUSES, and says so by kind.
 	assert_eq!(client.send(&device::HciPacketKind::Event, &[0x0e, 0].to_vec()), Some(Err(device::Error::Invalid)), "a host sending an event has confused its directions");
-	assert_eq!(client.send(&device::HciPacketKind::Iso, &[0, 0, 0, 0].to_vec()), Some(Err(device::Error::Unsupported)));
+	assert_eq!(client.send(&device::HciPacketKind::Iso, &[0xa1, 0x00, 5, 0].to_vec()), Some(Err(device::Error::Invalid)), "an ISO packet shorter than its header says");
 	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x03, 0x0c, 0x05].to_vec()), Some(Err(device::Error::Invalid)), "a command whose length is not its own");
 
 	// A RESET IS A NEW SESSION: announced on the control stream, and every packet after it carries the new epoch.
@@ -3922,7 +3929,7 @@ fn usb_bluetooth_carries_commands_events_and_acl_and_resets_into_a_new_epoch() {
 	assert_eq!((removed.kind, removed.epoch), (device::HciControlKind::Removed, renewed), "the controller's removal, named against the session it ended");
 	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 2), "the controller withdrew the Bluetooth publication when the controller left");
 
-	crate::serial_println!("usb-bluetooth: three commands answered, four ACL packets looped back through the device, a stall recovered each way, a reset into epoch {renewed}, and the controller's unplug announced and withdrawn");
+	crate::serial_println!("usb-bluetooth: three commands answered, four ACL packets and an ISO one looped back through the device, a malformed ISO packet refused, a stall recovered each way, a reset into epoch {renewed}, and the controller's unplug announced and withdrawn");
 	driver.terminate();
 	sched::run_until_idle();
 	let _ = crate::device::release_claim(claim);
