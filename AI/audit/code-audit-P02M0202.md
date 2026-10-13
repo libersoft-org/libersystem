@@ -632,3 +632,10 @@ Final status: PARTIAL overall; owner-approved QEMU-only phase COMPLETE. All prev
 Session goal: finish every open milestone except P02M0105/P02M0106, or record what cannot be finished. P02M0202's one open item is "a recorded run on real hardware where the owner provides a board, never in place of the fixtures" (state in the milestone: "OPEN: the owner's board"). No board with a USB Type-C port controller or UCSI firmware is available to this session, and QEMU emulates neither, so the item cannot be performed here: NOT DONE, blocked on owner-provided hardware.
 
 No code change was made for P02M0202 in this session; the fixture-based gates and their recorded results stand as written. Status: OPEN, blocked on hardware only.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0202 (2026-10-13 02:17:50 UTC):
+
+OWNER DECISION APPLIED (2026-10-13): phase 2 is QEMU and everything that can be tested on it; real hardware is not part of phase 2 and is marked in place, with no separate hardware-acceptance milestone; nothing is built without an oracle that runs here (recorded in `AI/CLAUDE.md` and in the Phase 2 preamble of `docs/todo/TODO.md`).
+
+The recorded run on an owner-provided board is no longer an open box: written as NOT TESTED ON REAL HARDWARE - not part of phase 2; the fixtures and their gates on all three targets are phase 2's proof. No open item remains; status COMPLETE (2026-10-13) for phase 2; TODO.md row ticked. No code changed for this milestone in this step.

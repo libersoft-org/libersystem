@@ -317,3 +317,8 @@ Session goal: finish every open milestone except P02M0105/P02M0106, or record wh
 (b) NOT DONE: DDC/CI (MCCS luminance over the display cable) needs the DDC/AUX transport that P02M0099 records as blocked on a display controller that can reach a bus; no such controller is emulated or available. Physical-panel evidence remains unperformed.
 
 No source change was made for P02M0199 in this session. Status: OPEN only for DDC/CI.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0199 (2026-10-13 02:17:50 UTC):
+
+OWNER DECISION APPLIED (2026-10-13): phase 2 is QEMU and what can be tested on it; nothing is built without an oracle that runs here. The DDC/CI item is no longer an open box: written as NOT PART OF PHASE 2 - no emulated display reaches a DDC bus and no code was written; an external monitor's brightness in phase 2 is its USB Monitor Control interface. `brightness-usb` passed on 2026-10-13 through the host gadget on x86_64 (569 s), aarch64 and riscv64 (1605 s each), after the gadget teardown fix recorded under P02M0099. The status line is updated once `brightness-acpi` with its default gadget transport has run in the owner's whole `./verify.sh` (in progress).

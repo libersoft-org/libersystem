@@ -1259,3 +1259,10 @@ Session goal: finish every open milestone except P02M0105/P02M0106, or record wh
 2. THE WAKE SET - PCI PME and a network device's wake. Everything else in the list is done and gated (`sleep`). No device this harness can present raises a PME, and the network functions driven here (virtio-net, CDC-ECM) have no wake at all, so there is nothing to arm or to observe. NOT DONE: waits for hardware that has a PME-capable device or Wake-on-LAN.
 
 Status: OPEN, blocked on firmware (aarch64 SYSTEM_SUSPEND) and on hardware (PME, network wake). No existing result was changed or relabelled.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0197 (2026-10-13 02:17:50 UTC):
+
+OWNER DECISION APPLIED (2026-10-13): phase 2 is QEMU and everything that can be tested on it; real hardware is not part of phase 2 and is marked in place, with no separate hardware-acceptance milestone; nothing is built without an oracle that runs here (recorded in `AI/CLAUDE.md` and in the Phase 2 preamble of `docs/todo/TODO.md`).
+
+SYSTEM SUSPEND ON THE OTHER TWO is ticked as the item defines it ("where the platform offers it"): riscv64 SBI system suspend implemented and verified on the OpenSBI fixture; on aarch64 no firmware QEMU runs offers PSCI SYSTEM_SUSPEND (checked again 2026-10-12), so it has no oracle here and is not built - not tested on real hardware, not part of phase 2. THE WAKE SET is ticked: every wake source QEMU can present is armed and proven by the `sleep` gate; PCI PME and network wake have no emulated device - not part of phase 2. No open item remains; status COMPLETE (2026-10-13) for phase 2; TODO.md row ticked. No code changed for this milestone in this step.

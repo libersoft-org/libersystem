@@ -616,3 +616,10 @@ Session goal: finish every open milestone except P02M0105/P02M0106, or record wh
 - RECORDED RUNS ON REAL HARDWARE: by definition the owner's hardware; none was provided. NOT DONE, blocked on hardware.
 
 Status: OPEN, blocked on owner-provided hardware only. Nothing in this session changed the ACPI service, the EC library or their tests, so the earlier recorded evidence stands unchanged. The cross-cutting end-of-job checks (whole `./verify.sh`) are reported in P02M0188's record.
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0196 (2026-10-13 02:17:50 UTC):
+
+OWNER DECISION APPLIED (2026-10-13): phase 2 is QEMU and everything that can be tested on it; real hardware is not part of phase 2 and is marked in place, with no separate hardware-acceptance milestone; nothing is built without an oracle that runs here (recorded in `AI/CLAUDE.md` and in the Phase 2 preamble of `docs/todo/TODO.md`).
+
+The embedded-controller item is ticked for phase 2: the library and the ACPI service's handler are implemented and proven against the register model in host tests, the oracle that runs here (QEMU has no EC). The recorded laptop runs are no longer an open box: they are written as NOT TESTED ON REAL HARDWARE - not part of phase 2. No open item remains; status COMPLETE (2026-10-13) for phase 2; TODO.md row ticked. No code changed for this milestone in this step.
