@@ -1377,6 +1377,56 @@ profile conformance (`kernel.applications.the_2d_profile_conforms_on_the_target`
 passed on all three, and `./check.sh --gate qemu-2d-demo` passed (214 s: the package audit, then three live frames
 proving animation, analytic coverage, blending, filtering and a colour glyph).
 
+## UI-effects off the edge of its budget (2026-10-14)
+
+THE TABLE ABOVE HAD UI-effects AT 64.965 ms AGAINST A FROZEN 65.640 ms - one per cent - and one per cent is noise. Five
+quiet runs on 2026-10-13 measured 64.7, 63.9, 64.9, 66.3 and 65.6 ms, and a whole verification failed the gate on 66.4.
+Nothing about the scene had changed; it was simply sitting on its budget.
+
+TWO CHANGES, NEITHER OF WHICH MOVES A PIXEL:
+
+- **The intermediate's pixel decode and encode are forced inline.** Both are four `f32` byte moves, marked `#[inline]`,
+  and the compiler kept them out of line inside `read_span`, `write_span`, `read_column` and `write_column` - a call
+  per pixel, each with its own bounds checks, through every run the backend reads or writes: the blur's two passes,
+  the layer composite, the filter nodes. `#[inline(always)]` turns each into a sixteen-byte load or store.
+- **The pointwise filter nodes walk runs.** `Source`, `Backdrop`, a whole-pixel `Offset`, `Flood`, `ColorMatrix`,
+  `Composite`, `Blend` and `In` fetched every pixel through `get` and stored it through `set` - an offset and a bounds
+  check per pixel on each side. They read and write sixty-four-pixel pieces of a row now, through `read_run` and
+  `write_run`, which clip to the raster exactly where `get` answers transparent and `set` writes nothing (a host test
+  holds them to `get` and `set` pixel for pixel, across every edge and past `u32::MAX`). The arithmetic per pixel is
+  the same operations on the same values in the same order.
+
+THE PROOF THAT NOTHING MOVED: every frozen scene and every probe rendered by the tree before and after, into the
+benchmark's 8-bit target and into a linear `R32G32B32A32_FLOAT` one that carries the intermediate's values unrounded,
+under bands, tiles and rectangles at one and four workers - every hash identical. The 2D conformance suite passes
+its 112 scenes and the soft2d host suite its 44 tests.
+
+THE PROBES, `SOFT2D_BENCH_PROBE=1`, one core, the tree before and after on the same quiet host:
+
+| probe | before | after |
+| --- | ---: | ---: |
+| effects-layers-plain | 14.254 ms | 13.862 ms |
+| effects-layers-blur | 32.808 ms | 27.419 ms |
+| effects-layers-blur-x | 28.517 ms | 24.372 ms |
+| effects-layers-blur-y | 28.934 ms | 24.289 ms |
+| effects-layers-filtered | 53.324 ms | 45.884 ms |
+| effects-backdrop | 17.292 ms | 15.355 ms |
+
+THE HEADLESS FLOOR AFTER, `RUST_MIN_STACK=33554432 ./check.sh --gate soft2d-performance`, PASS at 07:51 CEST with no
+guest running. The budgets are unchanged; a frozen budget may only come down, and that is a decision for a separate
+freeze rather than a side effect of this one.
+
+| scene | prepare | replay median | replay p99 | frozen budget |
+| --- | ---: | ---: | ---: | ---: |
+| UI-basic | 1.309 ms | 10.182 ms | 10.489 ms | 10.837 ms |
+| UI-effects | 38.050 ms | 54.775 ms | 55.478 ms | 65.640 ms |
+| vector-stress | 5.624 ms | 62.135 ms | 63.672 ms | 65.509 ms |
+| image-resample | 60.088 ms | 11.494 ms | 11.854 ms | 13.414 ms |
+| image-convert | 72.139 ms | 15.073 ms | 15.471 ms | 16.063 ms |
+
+`vector-stress` is still within five per cent of its budget, as it has been in every run since the freeze (63.3 to
+64.1 ms in four whole verifications). Its time is the rasteriser and the gradient, which neither change touches.
+
 ## soft2d on several cores (2026-09-27)
 
 `soft2d` replays a prepared frame on a WORKER POOL the caller supplies - `soft2d::Workers`, the shape

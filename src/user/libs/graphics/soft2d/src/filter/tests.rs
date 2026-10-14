@@ -35,3 +35,70 @@ fn independent_blur_accumulators_match_scalar_taps_bit_for_bit() {
 		}
 	}
 }
+
+// A RUN READS AND WRITES WHAT `get` AND `set` WOULD, PIXEL FOR PIXEL. The pointwise nodes walk their regions
+// through `read_run` and `write_run` now, so a run that starts before a raster, ends past it, lies on a row it
+// does not have, or reaches a coordinate `get` cannot be asked for must still answer transparent exactly where
+// `get` did - and write exactly the pixels `set` would have, and no others.
+#[test]
+fn a_run_reads_and_writes_what_get_and_set_would_across_every_edge() {
+	use crate::target::{Raster, Tile};
+	let bits = |pixel: Rgba| [pixel.red.to_bits(), pixel.green.to_bits(), pixel.blue.to_bits(), pixel.alpha.to_bits()];
+	let colour = |x: u32, y: u32| Rgba::new(x as f32 + 0.25, y as f32 - 0.5, -(x as f32), 0.5 + (x % 3) as f32);
+	let sentinel = Rgba::new(-3.0, 7.0, 9.0, 2.0);
+	let lengths = [0usize, 1, 2, 5, 7, 9, 20];
+	// A SURFACE WELL INSIDE THE COORDINATE SPACE, a tile beside it, and a surface whose last columns lie past
+	// `u32::MAX`, where `get` cannot reach.
+	let near_the_end = u32::MAX - 3;
+	let mut tile = Tile::new(6);
+	tile.rebase((4, 2));
+	for y in 2..8 {
+		for x in 4..10 {
+			tile.set(x, y, colour(x, y));
+		}
+	}
+	for bounds in [PixelRect::new(5, 3, 7, 4), PixelRect::new(near_the_end, 1, 8, 2)] {
+		let mut surface = Surface::new(bounds, graphics_core::ColorSpace::SrgbLinear).expect("a surface");
+		for y in bounds.y..bounds.y + bounds.height {
+			for x in bounds.x..=bounds.x.saturating_add(bounds.width - 1) {
+				surface.set(x, y, colour(x, y));
+			}
+		}
+		let (left, top) = (i64::from(bounds.x), i64::from(bounds.y));
+		let expected_at = |raster: &dyn Raster, x: i64, y: i64| if x < 0 || y < 0 || x > i64::from(u32::MAX) || y > i64::from(u32::MAX) { Rgba::TRANSPARENT } else { raster.get(x as u32, y as u32) };
+		for y in top - 2..top + i64::from(bounds.height) + 2 {
+			for x in left - 3..left + i64::from(bounds.width) + 4 {
+				for length in lengths {
+					for raster in [&surface as &dyn Raster, &tile as &dyn Raster] {
+						let mut run = alloc::vec![sentinel; length];
+						raster.read_run(x, y, &mut run);
+						for (index, pixel) in run.iter().enumerate() {
+							assert_eq!(bits(*pixel), bits(expected_at(raster, x + index as i64, y)), "read at x={x} y={y} length={length} index={index}");
+						}
+					}
+				}
+			}
+		}
+		// THE WRITES: one surface written by runs, one by `set`, both from the same starting picture.
+		for y in bounds.y.saturating_sub(1)..bounds.y + bounds.height + 1 {
+			for x in bounds.x.saturating_sub(3)..=bounds.x.saturating_add(bounds.width + 3) {
+				for length in lengths {
+					let mut by_run = Surface::new(bounds, graphics_core::ColorSpace::SrgbLinear).expect("a surface");
+					let mut by_pixel = Surface::new(bounds, graphics_core::ColorSpace::SrgbLinear).expect("a surface");
+					let values: Vec<Rgba> = (0..length).map(|index| Rgba::new(index as f32, 1.0, 2.0, 0.75)).collect();
+					by_run.write_run(x, y, &values);
+					for (index, value) in values.iter().enumerate() {
+						if let Some(at) = x.checked_add(index as u32) {
+							by_pixel.set(at, y, *value);
+						}
+					}
+					for row in bounds.y..bounds.y + bounds.height {
+						for column in bounds.x..=bounds.x.saturating_add(bounds.width - 1) {
+							assert_eq!(bits(by_run.get(column, row)), bits(by_pixel.get(column, row)), "write at x={x} y={y} length={length}, pixel {column},{row}");
+						}
+					}
+				}
+			}
+		}
+	}
+}

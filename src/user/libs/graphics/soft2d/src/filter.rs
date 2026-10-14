@@ -115,14 +115,13 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 				if let Some(from) = input(*slot)
 					&& whole_pixels
 				{
+					// A SOURCE PIXEL BEFORE ZERO OR PAST `u32::MAX` IS TRANSPARENT, which `read_run` answers for it.
 					let (shift_x, shift_y) = (*dx as i64, *dy as i64);
-					for target_y in region.y..region.y.saturating_add(region.height) {
-						for target_x in region.x..region.x.saturating_add(region.width) {
-							let (source_x, source_y) = (target_x as i64 - shift_x, target_y as i64 - shift_y);
-							let value = if source_x < 0 || source_y < 0 || source_x > u32::MAX as i64 || source_y > u32::MAX as i64 { Rgba::TRANSPARENT } else { from.get(source_x as u32, source_y as u32) };
-							into.set(target_x, target_y, value);
-						}
-					}
+					let mut run = [Rgba::TRANSPARENT; RUN];
+					for_runs(region, |x, y, length| {
+						from.read_run(i64::from(x) - shift_x, i64::from(y) - shift_y, &mut run[..length]);
+						into.write_run(x, y, &run[..length]);
+					});
 				} else if let Some(from) = input(*slot) {
 					for target_y in region.y..region.y.saturating_add(region.height) {
 						for target_x in region.x..region.x.saturating_add(region.width) {
@@ -139,39 +138,46 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			// @handles: FilterColorMatrix
 			FilterNode::ColorMatrix { input: slot, matrix } => {
 				if let Some(from) = input(*slot) {
-					for y in region.y..region.y.saturating_add(region.height) {
-						for x in region.x..region.x.saturating_add(region.width) {
-							into.set(x, y, colour_matrix(from.get(x, y), matrix));
+					let mut run = [Rgba::TRANSPARENT; RUN];
+					for_runs(region, |x, y, length| {
+						from.read_run(i64::from(x), i64::from(y), &mut run[..length]);
+						for pixel in run[..length].iter_mut() {
+							*pixel = colour_matrix(*pixel, matrix);
 						}
-					}
+						into.write_run(x, y, &run[..length]);
+					});
 				}
 			}
 			FilterNode::Flood { color } => {
-				let colour = to_working(*color, working);
-				for y in region.y..region.y.saturating_add(region.height) {
-					for x in region.x..region.x.saturating_add(region.width) {
-						into.set(x, y, colour);
-					}
-				}
+				let run = [to_working(*color, working); RUN];
+				for_runs(region, |x, y, length| into.write_run(x, y, &run[..length]));
 			}
 			// @handles: FilterComposite
 			FilterNode::Composite { source: source_slot, backdrop: backdrop_slot, operator } => {
 				if let (Some(over), Some(under)) = (input(*source_slot), input(*backdrop_slot)) {
-					for y in region.y..region.y.saturating_add(region.height) {
-						for x in region.x..region.x.saturating_add(region.width) {
-							into.set(x, y, graphics_core::composite::composite(*operator, render2d::blend::BlendMode::Normal, over.get(x, y), under.get(x, y)));
+					let (mut above, mut below) = ([Rgba::TRANSPARENT; RUN], [Rgba::TRANSPARENT; RUN]);
+					for_runs(region, |x, y, length| {
+						over.read_run(i64::from(x), i64::from(y), &mut above[..length]);
+						under.read_run(i64::from(x), i64::from(y), &mut below[..length]);
+						for (pixel, under) in above[..length].iter_mut().zip(&below[..length]) {
+							*pixel = graphics_core::composite::composite(*operator, render2d::blend::BlendMode::Normal, *pixel, *under);
 						}
-					}
+						into.write_run(x, y, &above[..length]);
+					});
 				}
 			}
 			// @handles: FilterBlend
 			FilterNode::Blend { source: source_slot, backdrop: backdrop_slot, mode } => {
 				if let (Some(over), Some(under)) = (input(*source_slot), input(*backdrop_slot)) {
-					for y in region.y..region.y.saturating_add(region.height) {
-						for x in region.x..region.x.saturating_add(region.width) {
-							into.set(x, y, graphics_core::composite::composite(render2d::blend::Operator::SrcOver, *mode, over.get(x, y), under.get(x, y)));
+					let (mut above, mut below) = ([Rgba::TRANSPARENT; RUN], [Rgba::TRANSPARENT; RUN]);
+					for_runs(region, |x, y, length| {
+						over.read_run(i64::from(x), i64::from(y), &mut above[..length]);
+						under.read_run(i64::from(x), i64::from(y), &mut below[..length]);
+						for (pixel, under) in above[..length].iter_mut().zip(&below[..length]) {
+							*pixel = graphics_core::composite::composite(render2d::blend::Operator::SrcOver, *mode, *pixel, *under);
 						}
-					}
+						into.write_run(x, y, &above[..length]);
+					});
 				}
 			}
 			// THE CONVOLUTION IS THREE BY THREE AND READS THROUGH THE SURFACE rather than through a
@@ -266,13 +272,17 @@ pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Su
 			}
 			FilterNode::In { input: slot, mask } => {
 				if let (Some(from), Some(mask)) = (input(*slot), input(*mask)) {
-					for y in region.y..region.y.saturating_add(region.height) {
-						for x in region.x..region.x.saturating_add(region.width) {
-							// KEEP ONLY WHERE THE MASK HAS ALPHA, which is what every clip-shaped
-							// effect is built on.
-							into.set(x, y, from.get(x, y).scaled(mask.get(x, y).alpha));
+					let (mut kept, mut shape) = ([Rgba::TRANSPARENT; RUN], [Rgba::TRANSPARENT; RUN]);
+					for_runs(region, |x, y, length| {
+						from.read_run(i64::from(x), i64::from(y), &mut kept[..length]);
+						mask.read_run(i64::from(x), i64::from(y), &mut shape[..length]);
+						// KEEP ONLY WHERE THE MASK HAS ALPHA, which is what every clip-shaped
+						// effect is built on.
+						for (pixel, mask) in kept[..length].iter_mut().zip(&shape[..length]) {
+							*pixel = pixel.scaled(mask.alpha);
 						}
-					}
+						into.write_run(x, y, &kept[..length]);
+					});
 				}
 			}
 		}
@@ -343,17 +353,36 @@ fn give_back(pool: &mut Pool, results: &mut Vec<Option<Surface>>) {
 }
 
 fn copy_from(from: &dyn crate::target::Raster, into: &mut Surface, bounds: PixelRect) {
-	for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-		for x in bounds.x..bounds.x.saturating_add(bounds.width) {
-			into.set(x, y, from.get(x, y));
-		}
-	}
+	let mut run = [Rgba::TRANSPARENT; RUN];
+	for_runs(bounds, |x, y, length| {
+		from.read_run(i64::from(x), i64::from(y), &mut run[..length]);
+		into.write_run(x, y, &run[..length]);
+	});
 }
 
 fn copy(from: &Surface, into: &mut Surface, bounds: PixelRect) {
-	for y in bounds.y..bounds.y.saturating_add(bounds.height) {
-		for x in bounds.x..bounds.x.saturating_add(bounds.width) {
-			into.set(x, y, from.get(x, y));
+	let mut run = [Rgba::TRANSPARENT; RUN];
+	for_runs(bounds, |x, y, length| {
+		from.read_run(i64::from(x), i64::from(y), &mut run[..length]);
+		into.write_run(x, y, &run[..length]);
+	});
+}
+
+// THE POINTWISE NODES WALK THEIR REGION A PIECE OF A ROW AT A TIME, through `read_run` and `write_run`.
+// Fetching every pixel through `get` and storing it through `set` computed an offset and checked a bound
+// on both sides of every pixel, which was most of what a flood, an offset, a mask and a composite cost.
+// Each pixel is still the same arithmetic on the same values in the same order - the picture is the same
+// to the bit. The pieces are on the stack and short, so a wide region needs no buffer sized for it.
+const RUN: usize = 64;
+
+fn for_runs(region: PixelRect, mut each: impl FnMut(u32, u32, usize)) {
+	let end = region.x.saturating_add(region.width);
+	for y in region.y..region.y.saturating_add(region.height) {
+		let mut x = region.x;
+		while x < end {
+			let length = ((end - x) as usize).min(RUN);
+			each(x, y, length);
+			x += length as u32;
 		}
 	}
 }

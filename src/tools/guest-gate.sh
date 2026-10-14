@@ -109,6 +109,11 @@ guest_gate_prepare_image() {
 	local image="${BOOT_IMAGE:-}"
 	if [[ -z "$image" ]]; then
 		if [[ -z "$guest_gate_image" ]]; then
+			# THE MEDIUM THESE GATES BOOT IS THE DEVELOPMENT ONE: their probes and fixtures are development-only,
+			# and an image built in the shipping profile carries none of them - every probe answered "no artifact"
+			# unless whoever ran the gate had exported LIBER_DEVELOPMENT=1 first, which `./check.sh --gate` and
+			# `verify.sh` never do. The shared staging is rebuilt in the caller's profile on the way out.
+			guest_gate_development
 			guest_gate_image="$guest_gate_work/guest.iso"
 			LIBER_IMAGE_OUTPUT="$guest_gate_image" "$root/../image.sh" --format iso --dma-mode harness >"$guest_gate_work/image.log" 2>&1 || {
 				cat "$guest_gate_work/image.log" >&2

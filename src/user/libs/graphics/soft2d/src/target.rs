@@ -212,6 +212,33 @@ impl Surface {
 		}
 	}
 
+	/// Read a horizontal run that may reach past this surface, from coordinates that may be negative: what the
+	/// surface does not hold reads TRANSPARENT, pixel for pixel what `get` answers there.
+	///
+	/// FOR THE FILTER NODES, which fetched every pixel through `get` and stored it through `set` - an offset
+	/// and a bounds check per pixel on each side, which was most of what a flood, an offset, a mask and a
+	/// composite cost. `read_span` refuses a run that is not wholly inside, so a run that is partly
+	/// outside is cut to the part that is inside and only that part is read.
+	pub fn read_run(&self, x: i64, y: i64, out: &mut [Rgba]) {
+		let extent = self.image.layout().extent;
+		let (first, last) = held(x, y, out.len(), self.origin, (extent.width, extent.height));
+		out[..first].fill(Rgba::TRANSPARENT);
+		out[last..].fill(Rgba::TRANSPARENT);
+		if first < last {
+			self.read_span((x + first as i64) as u32, y as u32, &mut out[first..last]);
+		}
+	}
+
+	/// Write a horizontal run that may reach past this surface: the part it holds is written, as `set`
+	/// would write it pixel by pixel, and the rest is dropped.
+	pub fn write_run(&mut self, x: u32, y: u32, values: &[Rgba]) {
+		let extent = self.image.layout().extent;
+		let (first, last) = held(i64::from(x), i64::from(y), values.len(), self.origin, (extent.width, extent.height));
+		if first < last {
+			self.write_span(x + first as u32, y, &values[first..last]);
+		}
+	}
+
 	/// The byte offset of a pixel, or `None` when it is outside this surface.
 	#[inline]
 	fn offset(&self, x: u32, y: u32) -> Option<usize> {
@@ -290,17 +317,31 @@ impl Surface {
 /// which is a loss the conformance suite tolerated rather than wanted.
 const BYTES_PER_PIXEL: usize = 16;
 
-#[inline]
+#[inline(always)]
 fn decode_half(pixel: &[u8]) -> Rgba {
 	let channel = |index: usize| f32::from_le_bytes([pixel[index * 4], pixel[index * 4 + 1], pixel[index * 4 + 2], pixel[index * 4 + 3]]);
 	Rgba::new(channel(0), channel(1), channel(2), channel(3))
 }
 
-#[inline]
+#[inline(always)]
 fn encode_half(pixel: &mut [u8], value: Rgba) {
 	for (index, channel) in [value.red, value.green, value.blue, value.alpha].into_iter().enumerate() {
 		pixel[index * 4..index * 4 + 4].copy_from_slice(&channel.to_le_bytes());
 	}
+}
+
+/// THE PART OF THE RUN `x..x + length` ON ROW `y` THAT A RASTER AT `origin` OF `extent` HOLDS, as offsets
+/// into the run - `(0, 0)` when it holds none of it. A coordinate `get` cannot be asked for (a negative
+/// one, or one past `u32::MAX`) is outside, which is where `get` answers transparent.
+fn held(x: i64, y: i64, length: usize, origin: (u32, u32), extent: (u32, u32)) -> (usize, usize) {
+	let (left, top) = (i64::from(origin.0), i64::from(origin.1));
+	let limit = i64::from(u32::MAX) + 1;
+	if y < top || y >= (top + i64::from(extent.1)).min(limit) {
+		return (0, 0);
+	}
+	let start = x.max(left);
+	let end = x.saturating_add(length as i64).min(left + i64::from(extent.0)).min(limit);
+	if start >= end { (0, 0) } else { ((start - x) as usize, (end - x) as usize) }
 }
 
 /// The layout of every intermediate this backend makes.
@@ -336,6 +377,8 @@ pub trait Raster {
 	fn set(&mut self, x: u32, y: u32, value: Rgba);
 	fn read_span(&self, x: u32, y: u32, out: &mut [Rgba]);
 	fn write_span(&mut self, x: u32, y: u32, values: &[Rgba]);
+	/// A run that may reach past the raster: what it does not hold reads TRANSPARENT, as `get` answers.
+	fn read_run(&self, x: i64, y: i64, out: &mut [Rgba]);
 }
 
 /// The target's working copy of one tile, in `f32`.
@@ -494,6 +537,15 @@ impl Raster for Tile {
 			row.copy_from_slice(values);
 		}
 	}
+
+	fn read_run(&self, x: i64, y: i64, out: &mut [Rgba]) {
+		let (first, last) = held(x, y, out.len(), self.origin, (self.width, self.height));
+		out[..first].fill(Rgba::TRANSPARENT);
+		out[last..].fill(Rgba::TRANSPARENT);
+		if first < last {
+			self.read_span((x + first as i64) as u32, y as u32, &mut out[first..last]);
+		}
+	}
 }
 
 impl Raster for Surface {
@@ -511,5 +563,9 @@ impl Raster for Surface {
 
 	fn write_span(&mut self, x: u32, y: u32, values: &[Rgba]) {
 		Surface::write_span(self, x, y, values)
+	}
+
+	fn read_run(&self, x: i64, y: i64, out: &mut [Rgba]) {
+		Surface::read_run(self, x, y, out)
 	}
 }

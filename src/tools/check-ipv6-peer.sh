@@ -46,6 +46,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
 
 work="$(mktemp -d)"
+media="$(mktemp -d)"
 # A FAILED RUN KEEPS ITS ROWS. Every row's capture, guest console, peer and runner log is copied to
 # `.build/logs/ipv6-peer/` before the work directory goes: the rows that fail are the ones that pass when run
 # alone, and a failure nobody can read again has to be waited for again.
@@ -56,7 +57,7 @@ keep_rows() {
 		mkdir -p .build/logs
 		cp -a "$work" .build/logs/ipv6-peer 2>/dev/null || true
 	fi
-	rm -rf "$work"
+	rm -rf "$work" "$media"
 	[[ -n "${peer_pid:-}" ]] && kill "$peer_pid" 2>/dev/null || true
 }
 trap keep_rows EXIT
@@ -79,6 +80,21 @@ fail() {
 note() {
 	echo "ipv6-peer: $*"
 }
+
+# THE ROWS BOOT A MEDIUM BUILT FROM THIS TREE. `run.sh` boots whatever `.build/boot/libersystem.iso` the last
+# `./image.sh` left there and builds nothing, so a whole verification that never ran `image.sh` booted a day-old
+# medium here - and failed on a lost FIN and an IPv6 window update sent over IPv4, both already fixed in the tree it
+# was verifying. A caller's BOOT_IMAGE is still authoritative. The medium lives outside `$work`, so a failed run keeps
+# its rows without two hundred megabytes of ISO.
+image="${BOOT_IMAGE:-}"
+if [[ -z "$image" ]]; then
+	image="$media/guest.iso"
+	LIBER_IMAGE_OUTPUT="$image" ./image.sh --format iso --dma-mode enforcing-required >"$media/image.log" 2>&1 || {
+		cat "$media/image.log" >&2
+		fail "the current x86_64 image did not build"
+	}
+fi
+[[ -f "$image" ]] || fail "the selected x86_64 image does not exist: $image"
 
 # A port nothing else is on. Chosen per row so two rows cannot collide.
 free_port() {
@@ -124,10 +140,10 @@ row() {
 		rm -f "$socket"
 		python3 src/harness/guest-console.py --socket "$socket" --log "$guest" --script "$script" --seconds "$((seconds - 2))" >"$work/$label.driver" 2>&1 &
 		driver_pid=$!
-		NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="unix:$socket,server=on,wait=off" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 >"$work/$label.run" 2>&1 || true
+		NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="unix:$socket,server=on,wait=off" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 --image "$image" >"$work/$label.run" 2>&1 || true
 		wait "$driver_pid" 2>/dev/null || true
 	else
-		NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="file:$guest" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 >"$work/$label.run" 2>&1 || true
+		NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="file:$guest" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 --image "$image" >"$work/$label.run" 2>&1 || true
 	fi
 	wait "$peer_pid" 2>/dev/null || true
 	peer_pid=""
