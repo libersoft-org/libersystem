@@ -98,13 +98,6 @@ impl LtpfEncoder {
 		LtpfEncoder { hp: [0.0; 4], hp_buf: [0.0; HP_HIST + MAX_LEN12], x6_buf: [0.0; X6_HIST + MAX_LEN12 / 2], t_prev: K_MIN, mem_active: false, mem_nc: 0.0, mem_mem_nc: 0.0, mem_pitch: 0.0 }
 	}
 
-	/// x~_12.8,D(n) of the last analyzed frame, n = 0 .. len12.8 (equation 84).
-	#[cfg(test)]
-	pub(crate) fn delayed(&self, cfg: &Config, n: usize) -> f64 {
-		let d = if cfg.dt == Duration::Ms10 { 24 } else { 44 };
-		self.hp_buf[HP_HIST - d + n]
-	}
-
 	/// Sections 3.3.9.3 to 3.3.9.8 for one frame. `x` holds the scaled input with history:
 	/// x[off + n] is x_s(n) for -240/P <= n < NF.
 	pub(crate) fn analyze(&mut self, cfg: &Config, x: &[f64], off: usize, nbits: usize, near_nyquist: bool) -> LtpfParams {
@@ -376,32 +369,6 @@ fn l_den(cfg: &Config) -> usize {
 impl LtpfDecoder {
 	pub(crate) fn new() -> LtpfDecoder {
 		LtpfDecoder { input: [0.0; IN_HIST + MAX_NF], y: [0.0; OUT_HIST + MAX_NF], active: false, p_int: 0, p_fr: 0, c_num: [0.0; 11], c_den: [0.0; 13] }
-	}
-
-	/// A decoder whose previous frames are given: `prev_input` ends with the unfiltered signal of
-	/// the previous frame, `prev_output` with the filtered output, and the previous frame's filter
-	/// was `prev_active` with `prev_pitch_index` at `prev_nbits`.
-	#[cfg(test)]
-	pub(crate) fn with_history(cfg: &Config, prev_input: &[f64], prev_output: &[f64], prev_active: bool, prev_pitch_index: u32, prev_nbits: usize) -> LtpfDecoder {
-		let mut d = LtpfDecoder::new();
-		d.input[..IN_HIST].copy_from_slice(&prev_input[prev_input.len() - IN_HIST..]);
-		d.y[OUT_HIST - prev_output.len()..OUT_HIST].copy_from_slice(prev_output);
-		d.active = prev_active;
-		if prev_active {
-			let f = filter_params(cfg, prev_pitch_index, prev_nbits);
-			d.p_int = f.p_int;
-			d.p_fr = f.p_fr;
-			d.c_num = f.c_num;
-			d.c_den = f.c_den;
-		}
-		d
-	}
-
-	/// The filter coefficients c_num, c_den of a pitch index at a bit rate.
-	#[cfg(test)]
-	pub(crate) fn coefficients(cfg: &Config, pitch_index: u32, nbits: usize) -> ([f64; 11], [f64; 13]) {
-		let f = filter_params(cfg, pitch_index, nbits);
-		(f.c_num, f.c_den)
 	}
 
 	/// Filters one frame in place: x holds x^(n), n < NF, and receives x^_ltpf(n).

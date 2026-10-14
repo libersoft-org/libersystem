@@ -2,9 +2,11 @@
 //! carry - written from the Bluetooth SIG specification (LC3 v1.0) in plain Rust: no dependencies, no unsafe code,
 //! no heap.
 //!
-//! HELD TO THE SPECIFICATION'S OWN DATA. The suites code Appendix C's reference frames byte for byte and check every
-//! intermediate step of the encoder and the decoder against the appendix's values; the in-guest earbuds and broadcast
-//! source read and write LC3 with a frame reader and writer of their own, written apart.
+//! HELD TO ANOTHER IMPLEMENTATION. The `bluetooth-codecs` gate crosses this encoder and decoder with Google's liblc3 in
+//! every configuration and holds the decoded output to the specification's published thresholds (the appendix C test
+//! data the suites once carried was removed on 2026-10-14: it was the specification's text, and this repository is
+//! public); the in-guest earbuds and broadcast source read and write LC3 with a frame reader and writer of their own,
+//! written apart.
 //!
 //! One Encoder or Decoder codes one audio channel (stereo is two of each). Every configuration of
 //! the specification is supported: 8, 16, 24, 32, 44.1 and 48 kHz (44.1 kHz runs the 48 kHz

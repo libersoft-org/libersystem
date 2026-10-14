@@ -1,9 +1,10 @@
 // The constant tables of LC3 specification section 3.7, extracted mechanically from the
 // specification's text - never typed by hand. The suites check their dimensions, values the text
-// states outright, their internal consistency, and every one of them through Appendix C's frames.
+// states outright and their internal consistency; the `bluetooth-codecs` gate checks every one of them
+// through the frames this codec exchanges with Google's liblc3.
 //
-// Floating point tables keep the specification's double precision (the reference intermediate
-// data of appendix C is double precision too); the arithmetic coding tables are integers.
+// Floating point tables keep the specification's double precision; the arithmetic coding tables are
+// integers.
 
 pub(crate) const I_10_8000: [u16; 65] = [
 	0,
