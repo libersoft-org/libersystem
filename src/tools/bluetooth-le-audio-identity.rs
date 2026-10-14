@@ -1,7 +1,6 @@
 // Exact production LE Audio advertising/bonded methods, privacy resolver, RSI parser
 // and cryptography are inserted by prepare.py. Storage IPC and pair_le are boundary
 // mocks. The companion production-pair regression must prove HCI/SMP dispatch.
-#![allow(dead_code)]
 extern crate alloc;
 use std::cell::RefCell;
 /* EXACT_MODULES */

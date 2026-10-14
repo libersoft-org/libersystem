@@ -1624,14 +1624,9 @@ impl Stack {
 	}
 
 	// Build an Ethernet + IPv4 + TCP segment to connection `ci`'s peer with `flags`,
-	// sequence `seq`, acknowledgement `ack`, and `payload`, into `out`, returning its
-	// length (0 if it does not fit). No TCP options are emitted (a 20-byte header).
-	fn build_tcp(&self, ci: usize, flags: u8, seq: u32, ack: u32, payload: &[u8], out: &mut [u8]) -> usize {
-		self.build_tcp_opts(ci, flags, seq, ack, &[], payload, out)
-	}
-
-	// `build_tcp` with TCP options: `opts` follows the fixed header (its length must
-	// be a multiple of 4, NOP-padded by the caller) and widens the data offset. The
+	// sequence `seq`, acknowledgement `ack`, TCP options `opts` and `payload`, into `out`,
+	// returning its length (0 if it does not fit). `opts` follows the fixed header (its
+	// length must be a multiple of 4, NOP-padded by the caller) and widens the data offset. The
 	// advertised window is the receive buffer's free space shifted right by the
 	// connection's window scale - except on a SYN, where the field is never scaled.
 	#[allow(clippy::too_many_arguments)]
@@ -2191,7 +2186,10 @@ impl Stack {
 		}
 		let seq: u32 = self.next_sequence(ci);
 		let ack: u32 = self.conns[ci].rcv_nxt;
-		self.build_tcp(ci, TCP_ACK, seq, ack, &[], out)
+		// THROUGH `emit_tcp`, WHICH KNOWS THE CONNECTION'S FAMILY. Built as IPv4 whatever the connection
+		// was, an IPv6 connection's window update went out as an IPv4 segment from the guest's IPv4 address -
+		// a stray packet to the peer and no window update at all where it was due.
+		self.emit_tcp(ci, TCP_ACK, seq, ack, &[], &[], out)
 	}
 
 	// Handle an ICMP message: reply to an echo request, report an echo reply.

@@ -23,9 +23,29 @@ guest_gate_fail() {
 guest_gate_cleanup() {
 	[[ -n "$guest_gate_driver" ]] && kill "$guest_gate_driver" 2>/dev/null
 	[[ -n "$guest_gate_work" ]] && rm -rf "$guest_gate_work"
+	guest_gate_restore_shipping
 	return 0
 }
 trap guest_gate_cleanup EXIT
+
+# A GATE THAT NEEDS THE DEVELOPMENT IMAGE builds it, and puts the shared staging back the way it found it. image.sh
+# rebuilds `.build/image` and the system volume in the profile it runs under, so every later step reading them - a
+# kernel suite above all - would find development fixtures in a shipping volume: on 2026-10-13 the x86_64 suite failed
+# "system volume contains an undeclared entry drivers/acpi_fixture.lsexe" right after such a gate. On x86_64, where the
+# gate builds its own medium, a run that began in the shipping profile rebuilds it on the way out.
+guest_gate_shipping_to_restore=""
+guest_gate_development() {
+	if [[ "${LIBER_DEVELOPMENT:-}" != 1 && "$GUEST_ARCH" == x86_64 ]]; then
+		guest_gate_shipping_to_restore=1
+	fi
+	export LIBER_DEVELOPMENT=1
+}
+guest_gate_restore_shipping() {
+	[[ -n "$guest_gate_shipping_to_restore" ]] || return 0
+	guest_gate_shipping_to_restore=""
+	echo "${GUEST_GATE_NAME:-guest-gate}: rebuilding the shipping x86_64 staging this gate's development image replaced" >&2
+	env -u LIBER_DEVELOPMENT "$root/../build.sh" --arch x86_64 >/dev/null 2>&1 || echo "${GUEST_GATE_NAME:-guest-gate}: the shipping staging did not rebuild - run ./build.sh --arch x86_64" >&2
+}
 
 # `--arch ARCH`, defaulting to x86_64.
 guest_gate_arch() {

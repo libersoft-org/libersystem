@@ -47,6 +47,8 @@ set -euo pipefail
 GUEST_GATE_NAME="modem-service"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root/.."
+# IT RUNS test.sh ITSELF for the bounds selection, so it states the mode a gate runs in.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 source "$root/tools/guest-gate.sh"
 
 guest_gate_arch "$@"

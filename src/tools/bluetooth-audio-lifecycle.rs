@@ -1,7 +1,6 @@
 // Test boundaries only. bluetooth_audio_lifecycle.py inserts the exact production methods below.
 // IPC is an in-memory bounded duplex queue; profile operations are traceable hooks. The wire stub
 // keeps complete typed event values, so this is lifecycle evidence, not codec, radio or kernel IPC proof.
-#![allow(dead_code)]
 use bluetooth_audio::Service;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};

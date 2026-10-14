@@ -149,3 +149,11 @@ fn the_dropped_marker_names_the_count_on_a_line_of_its_own() {
 	let n = dropped_marker(u64::MAX, &mut out);
 	assert!(out[..n].ends_with(b"]\r\n"), "the largest count still fits");
 }
+
+#[test]
+fn a_rate_no_divisor_comes_within_three_percent_of_is_refused_rather_than_run_fast() {
+	// 1.8432 MHz at 100000: the nearest divisor is 1, which makes 115200 - fifteen per cent fast, a rate the far end
+	// misreads every byte of - so there is no line. At 112000 the same divisor is 2.9% fast, inside the bound.
+	assert_eq!(Line::new(PC_CLOCK_HZ, 100_000), None);
+	assert_eq!(Line::new(PC_CLOCK_HZ, 112_000), Some(Line { divisor: 1 }));
+}

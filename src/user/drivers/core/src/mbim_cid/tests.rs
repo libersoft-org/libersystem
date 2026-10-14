@@ -108,3 +108,20 @@ fn a_done_and_an_indication_carry_their_service_cid_and_buffer() {
 	assert_eq!(indicated(&indication).map(|read| read.cid), Ok(CID_REGISTER_STATE));
 	assert_eq!(signal_dbm(&[99, 0, 0, 0]), Ok(None), "99 is unknown");
 }
+
+#[test]
+fn a_string_reaching_past_its_buffer_is_refused_rather_than_read() {
+	let info = InfoWriter::new(64).u32(0).u32(0).u32(0).u32(0).u32(0).u32(0).u32(0).u32(0).u32(0).u32(0).string("490154203237518").string("fw 1.0").string("LiberSystem harness modem").finish();
+	// The last string ends exactly where the buffer does, and is read.
+	assert_eq!(device_caps(&info).expect("device caps read").hardware.as_deref(), Some("LiberSystem harness modem"));
+	// The same buffer a byte short: the last string's size now reaches past what arrived.
+	assert_eq!(device_caps(&info[..info.len() - 1]), Err(InfoRefused::Field), "a string one byte past the buffer");
+	// An offset at the buffer's end, with a size that would fit anywhere inside it.
+	let mut outside = info.clone();
+	outside[40..44].copy_from_slice(&(info.len() as u32).to_le_bytes());
+	assert_eq!(device_caps(&outside), Err(InfoRefused::Field), "an offset past the buffer");
+	// An offset at the top of its field.
+	let mut top = info.clone();
+	top[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+	assert_eq!(device_caps(&top), Err(InfoRefused::Field), "an offset no buffer reaches");
+}

@@ -611,17 +611,30 @@ impl Runtime {
 		}
 	}
 
-	// Frames arrived on the link: run one through the stack, then feed the receive streams and answer
-	// any deferred `accept` the frame may have completed.
+	// Frames arrived on the link: run one through the stack. What it received is handed on by
+	// `serve_received`, which the loop runs after every event.
 	fn on_frames(&mut self) {
-		let Runtime { link, socks, listeners, .. } = self;
-		let Some(Link { frames, stack, lease, rx, tx }) = link.as_mut() else {
+		let Some(Link { frames, stack, lease, rx, tx }) = self.link.as_mut() else {
 			return;
 		};
 		let frames: u64 = *frames;
 		if let Event::DhcpReply(reply) = pump(frames, stack, rx, tx) {
 			lease.on_reply(&reply, stack);
 		}
+	}
+
+	// Feed the receive streams and answer any deferred `accept` - AFTER EVERY EVENT, NOT ONLY AFTER A
+	// FRAME. A request's own handler pumps the stack while it waits - a send for its acknowledgment, a
+	// close for the peer's FIN - and a frame it takes can carry another connection's data, its FIN or
+	// the last ACK of an inbound handshake. Served only from `on_frames`, that connection heard nothing
+	// until the NEXT frame came: a peer's FIN taken while another socket was answering left `nc` on a
+	// stream that never ended (`ipv6-peer`'s hostile-quote row, where it was the last frame of the row).
+	fn serve_received(&mut self) {
+		let Runtime { link, socks, listeners, .. } = self;
+		let Some(Link { frames, stack, tx, .. }) = link.as_mut() else {
+			return;
+		};
+		let frames: u64 = *frames;
 		// Feed any newly received bytes to each active recv stream, closing the producer (end of
 		// stream) once that connection's peer closes or resets.
 		for slot in socks.iter_mut().filter(|slot| slot.chan != 0 && !slot.dead && slot.stream_prod != 0) {
@@ -1272,6 +1285,8 @@ fn serve(mut runtime: Runtime) -> ! {
 				Ready::Listener => runtime.on_listener(slot_of[ready]),
 			}
 		}
+		// WHATEVER THE EVENT PUMPED, handed on: see `serve_received`.
+		runtime.serve_received();
 		// A link whose channel closed during any of the above ends here, before the next wait.
 		runtime.check_link();
 	}

@@ -17,6 +17,8 @@
 # mismatched fields, and each of those has to be refused.
 
 set -euo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 SCRIPT_NAME=check-run-verdict.sh
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"

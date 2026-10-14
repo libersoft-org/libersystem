@@ -172,13 +172,12 @@ fn refresh_keeps_identity_layout_and_empty_or_unrelated_backend_compatibility() 
 fn refresh_unit_keeps_the_previous_inline_table_layout() {
 	// Mirror only the previous storage layout, not any rendering behavior. The large inline
 	// rectangle must continue to bound Unit after adding its smaller cached-row alternative.
-	#[allow(dead_code, clippy::large_enum_variant)]
+	#[allow(clippy::large_enum_variant)]
 	enum PreviousAccess<'u> {
 		Band { view: graphics_core::ImageViewMut<'u>, top: u32 },
 		Slot { source: &'u graphics_core::ImageView<'u>, slot: &'u mut [u8], tile: PixelRect, pitch: usize },
 		Rect { rows: [&'u mut [u8]; crate::TILE_SIZE as usize], tile: PixelRect, layout: ImageLayout },
 	}
-	#[allow(dead_code)]
 	struct PreviousUnit<'u> {
 		index: usize,
 		first_tile: u32,
@@ -187,6 +186,19 @@ fn refresh_unit_keeps_the_previous_inline_table_layout() {
 		ran: bool,
 		whole: bool,
 	}
+	// THE MIRROR IS BUILT AND READ HERE, never run: it exists for its layout, and these say what that layout is of.
+	let _band: for<'u> fn(graphics_core::ImageViewMut<'u>, u32) -> PreviousAccess<'u> = |view, top| PreviousAccess::Band { view, top };
+	let _slot: for<'u> fn(&'u graphics_core::ImageView<'u>, &'u mut [u8], PixelRect, usize) -> PreviousAccess<'u> = |source, slot, tile, pitch| PreviousAccess::Slot { source, slot, tile, pitch };
+	let _rect: for<'u> fn([&'u mut [u8]; crate::TILE_SIZE as usize], PixelRect, ImageLayout) -> PreviousAccess<'u> = |rows, tile, layout| PreviousAccess::Rect { rows, tile, layout };
+	let _read: for<'u> fn(PreviousUnit<'u>) = |unit| {
+		let PreviousUnit { index, first_tile, tiles, access, ran, whole } = unit;
+		let _ = (index, first_tile, tiles, ran, whole);
+		match access {
+			PreviousAccess::Band { view, top } => drop((view, top)),
+			PreviousAccess::Slot { source, slot, tile, pitch } => drop((source, slot, tile, pitch)),
+			PreviousAccess::Rect { rows, tile, layout } => drop((rows, tile, layout)),
+		}
+	};
 	assert_eq!(core::mem::size_of::<Unit<'_>>(), core::mem::size_of::<PreviousUnit<'_>>());
 	assert_eq!(core::mem::align_of::<Unit<'_>>(), core::mem::align_of::<PreviousUnit<'_>>());
 	println!("Unit before/after={} bytes alignment={}", core::mem::size_of::<Unit<'_>>(), core::mem::align_of::<Unit<'_>>());

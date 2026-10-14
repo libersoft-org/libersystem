@@ -40,6 +40,9 @@ else
 	cp -a "$REPO/src" "$WORK/src"
 fi
 [[ -f "$REPO/Cargo.toml" ]] && cp -a "$REPO/Cargo.toml" "$WORK/" 2>/dev/null || true
+# THE PRODUCT VERSION THE BUILD SCRIPTS READ lives at the root, and a copy without it fails to build at all on a cold
+# target directory - a gate that then reports every mutation for a reason that has nothing to do with it.
+cp -a "$REPO/product.conf" "$WORK/"
 # Everything the sync brought over is stamped new, so the first build after a sync cannot reuse an
 # object compiled from a previous run's mutation. See `restore` below for why this is not paranoia.
 find "$WORK/src" -name '*.rs' -exec touch {} +
@@ -49,6 +52,14 @@ find "$WORK/src" -name '*.rs' -exec touch {} +
 xhci_work="$(mktemp -d "$WORK/xhci-event-retention.XXXXXX")"
 python3 "$REPO/src/tools/xhci_event_retention.py" --root "$WORK" --candidate-tree "$WORK" --output "$xhci_work/proof" --run
 python3 "$REPO/src/tools/check-usb-audio-pcap.py" --self-test
+
+# A MUTATION THAT TAKES A LOOP'S BOUND AWAY makes the test planted under it allocate until something stops it: one such
+# test binary of this crate reached 252 GB on 2026-10-13 before the host's OOM killer ended it, with the rest of the
+# shared host waiting. Every test binary this gate runs goes into a scope of its own with a memory ceiling, so a
+# runaway ends inside it - where systemd can make one; elsewhere the binary runs as before.
+if command -v systemd-run >/dev/null && systemd-run --quiet --scope -p MemoryMax=1G -- true 2>/dev/null; then
+	export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="systemd-run --quiet --scope -p MemoryMax=16G -p MemorySwapMax=0 --"
+fi
 
 # The unmutated copy must PASS first. A copy that cannot pass is a gate whose every mutation "fails"
 # for a reason that has nothing to do with the mutation, which is the shape of a check that tests
@@ -107,6 +118,11 @@ PY
 	# did exactly that: the trace showed the mutation planted, the test failing, and the script
 	# ending there with no output at all.
 	outcome="$(cd "$WORK" && cargo test --quiet --manifest-path "$manifest" --lib "$test" 2>/dev/null | grep -E "^test result:" | tail -1 || true)"
+	# NO RESULT LINE AT ALL IS ASKED ONCE MORE. The compiler on this machine crashes now and then, and a crash
+	# prints no result exactly as a mutation that does not build does; a second build tells the two apart.
+	if [[ -z "$outcome" ]]; then
+		outcome="$(cd "$WORK" && cargo test --quiet --manifest-path "$manifest" --lib "$test" 2>/dev/null | grep -E "^test result:" | tail -1 || true)"
+	fi
 	case "$outcome" in
 	*"0 passed; 0 failed"*)
 		restore "$file"
@@ -116,11 +132,25 @@ PY
 		restore "$file"
 		fail "$test still passes with $file mutated - it does not check what it is named for"
 		;;
+	# ONLY A TEST THAT RAN AND FAILED CAUGHT IT. The crate denies warnings, so a mutation that leaves a binding
+	# unused does not compile, prints no result line at all, and used to fall through to here and be counted as
+	# caught - as would a compiler that crashed. A defect that never built is not one a test caught.
+	*"FAILED."*) ;;
+	*)
+		restore "$file"
+		fail "$file did not build with this mutation, or $test ran nothing or was killed - a defect that does not compile is not one a test caught"
+		;;
 	esac
 	caught=$((caught + 1))
 	echo "driver-mutations: $test caught the defect planted in $(basename "$file")"
 	restore "$file"
 }
+
+# THE MUTATIONS BELOW ARE WRITTEN TO COMPILE. The crate denies warnings, so a mutation that leaves a binding, a
+# constant or an import unused never builds - and until 2026-10-13 such a mutation was counted as caught. Twelve of
+# them were, two naming tests that had since been renamed. Each now keeps what it no longer decides with in the
+# expression (`false && ...`, `... || true`, `x & 0`), so it plants the same defect and builds, and the named test
+# has to fail.
 
 # NVMe: the queue size register is ZERO-BASED. Taking it as a size makes every queue one entry too
 # long, and the entry past the end is where the controller writes.
@@ -186,10 +216,10 @@ mutate "$DRIVERS" src/user/drivers/core/src/ahci.rs \
 	"	if sact & (1 << slot) != 0 {
 		return Outcome::Pending;
 	}" \
-	"	if false {
+	"	if false && sact & (1 << slot) != 0 {
 		return Outcome::Pending;
 	}" \
-	a_queued_tag_is_outstanding_while_its_sact_bit_is_set
+	a_queued_command_is_outstanding_in_sact_and_not_in_ci
 
 # AHCI: the port bitmap is not a port count, and walking the count reads registers of ports that are
 # not there.
@@ -268,7 +298,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
 # page - and publishes whatever the last command left there as a medium.
 mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
 	"	let usable = claimed.min(arrived) / 8;" \
-	"	let usable = claimed / 8;" \
+	"	let usable = claimed.min(arrived.max(claimed)) / 8;" \
 	a_list_longer_than_the_answer_is_clamped_to_what_arrived
 
 # HID: an absolute axis is read in the signedness its descriptor declared. Read signed, an eight-bit
@@ -321,7 +351,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 	"	let (notify_in, notify_packet) = function.notify.unwrap_or((0, 0));" \
 	"	let (notify_in, notify_packet) = function.notify.unwrap_or((0, 0));
-	let data_interface = union_data + 1;" \
+	let data_interface = union_data + 1 + (data_interface & 0);" \
 	the_union_names_the_data_interface_and_the_next_one_is_not_it
 
 # CDC-ACM: a data interface's bulk pair is kept UNDER ITS OWN INTERFACE NUMBER, and the union is what
@@ -331,7 +361,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 # one function is handed the other's endpoints and the two byte streams cross.
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 	"data.iter().flatten().find(|(iface, ..)| *iface == union_data)" \
-	"data.iter().flatten().min_by_key(|(iface, ..)| *iface)" \
+	"data.iter().flatten().min_by_key(|(iface, ..)| *iface | (union_data & 0))" \
 	each_serial_function_of_a_composite_device_binds_its_own_endpoints
 
 # CDC-ACM: ONE stop bit is encoded as ZERO. Writing the number you mean asks for one and a half,
@@ -355,7 +385,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 # saying why. Measured on QEMU's own `usb-net`, which is RNDIS by default.
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 	"&& protocol != PROTOCOL_VENDOR " \
-	"" \
+	"&& (protocol == protocol || protocol != PROTOCOL_VENDOR) " \
 	an_acm_shaped_rndis_control_interface_is_not_a_serial_port
 
 # CDC-ACM: the line-coding capability is bit ONE of the bitmap. Read as any bit set, a device that
@@ -404,9 +434,9 @@ mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \
 	iu[2] = (tag >> 8) as u8;
 	iu[3] = tag as u8;" \
 	"	iu[0] = IU_TASK_MANAGEMENT;
-	iu[2] = (managed_tag >> 8) as u8;
+	iu[2] = ((managed_tag | (tag & 0)) >> 8) as u8;
 	iu[3] = managed_tag as u8;" \
-	a_task_management_header_carries_the_requests_own_tag_and_not_the_doomed_ones
+	a_task_management_unit_carries_two_tags_in_two_places
 
 # UAS: a residue larger than the request is a device describing a transfer that did not happen, and
 # subtracting it computes a negative length as an enormous positive one.
@@ -441,7 +471,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 # bound the walk never ends, inside a driver, on bytes a device chose.
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 	"			if self.visited > self.most {" \
-	"			if false {" \
+	"			if self.visited > self.most + 64 {" \
 	a_pointer_chain_that_loops_ends_rather_than_spinning
 
 # vsock: the credit counters are free-running u32s and the window between them is MODULAR. A
@@ -467,7 +497,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/vsock.rs \
 # this side still had to write, and the loss is silent at both ends.
 mutate "$DRIVERS" src/user/drivers/core/src/vsock.rs \
 	"			if peer_done && we_done { State::Closed } else { State::HalfClosed { peer_done, we_done } }" \
-	"			State::Closed" \
+	"			if peer_done || we_done || true { State::Closed } else { State::HalfClosed { peer_done, we_done } }" \
 	shutdown_is_directional_and_one_direction_is_not_a_close
 
 # The local stream wire: a send declares its own length, and the header is a claim another address
@@ -551,7 +581,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/usb.rs \
 # against a promise nothing kept.
 mutate "$DRIVERS" src/user/drivers/core/src/usb.rs \
 	"if key & 0x0f == SENSE_ILLEGAL_REQUEST && asc == ASC_INVALID_COMMAND" \
-	"if key & 0x0f == SENSE_ILLEGAL_REQUEST" \
+	"if key & 0x0f == SENSE_ILLEGAL_REQUEST && (asc == ASC_INVALID_COMMAND || true)" \
 	a_flush_that_failed_is_a_failure_unless_the_unit_has_no_cache
 
 # virtio: a descriptor id is an INDEX into a ring of `size` entries, so `size` itself is not one of
@@ -570,7 +600,10 @@ mutate "$DRIVERS" src/user/drivers/core/src/virtio.rs \
 		return Err(UsedFault::Length);
 	}
 " \
-	"" \
+	"	if len > max_len && false {
+		return Err(UsedFault::Length);
+	}
+" \
 	the_pure_checks_refuse_a_foreign_id_an_oversized_length_and_an_index_past_what_was_posted
 
 # virtio: the used index is a free-running u16 and the difference WRAPS. Read as a signed move, the
@@ -843,7 +876,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/blk.rs \
 # answers for them - which on most devices is the first sectors of the medium.
 mutate "$DRIVERS" src/user/drivers/core/src/blk.rs \
 	"	if end > capacity_sectors {" \
-	"	if lba > capacity_sectors {" \
+	"	if lba.max(end.min(lba)) > capacity_sectors {" \
 	a_request_past_the_last_sector_is_refused_by_range
 
 # Block: a write's source has to be READABLE through the handle it arrived on. Checked for any right
@@ -851,7 +884,7 @@ mutate "$DRIVERS" src/user/drivers/core/src/blk.rs \
 # never granted.
 mutate "$DRIVERS" src/user/drivers/core/src/blk.rs \
 	"	if info.rights & RIGHT_READ == 0 {" \
-	"	if info.rights == 0 {" \
+	"	if info.rights & (RIGHT_READ | !RIGHT_READ) == 0 {" \
 	a_write_source_must_be_a_readable_memory_object_at_least_as_long_as_the_request
 
 # Block: a ten-byte command's block address ENDS at 2^32, so the last block it can name is 2^32 - 1
@@ -893,6 +926,617 @@ mutate "$DRIVERS" src/user/drivers/core/src/input.rs \
 	"	if max <= 0 {" \
 	"	if max == 0 {" \
 	a_position_normalises_onto_the_range_a_consumer_receives
+
+# THE FAMILIES WRITTEN AFTER THE FIRST FOUR (2026-10-13): ACPI and firmware drivers, the USB classes, HID, I2C, SMBus,
+# Type-C, the UARTs, MIDI, Bluetooth and the administrative executor - each family's decisions on device- or
+# firmware-supplied data, and the in-guest fixtures whose protocol decisions the gates are judged against.
+
+# ACPI buttons: a press is the consumer's only when it REACHED the consumer. Handed to one whose stream is full or gone
+# and counted as handled, it is acted on by nobody - the power button does nothing, and nothing anywhere says a press
+# was lost.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_button.rs \
+	"	if watched && delivered { Actor::Consumer } else { Actor::Driver }" \
+	"	if watched && (delivered || !delivered) { Actor::Consumer } else { Actor::Driver }" \
+	a_press_is_the_consumer_s_only_when_it_reached_a_consumer
+
+# ACPI buttons: `_LID` answers NONZERO FOR OPEN. Read the other way round, the screen goes dark on the desk and stays
+# lit in the bag - and the firmware's answer is a perfectly good integer either way, so nothing is refused.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_button.rs \
+	"		Value::Integer(open) => Ok(*open == 0)," \
+	"		Value::Integer(open) => Ok(*open != 0)," \
+	a_lid_is_closed_at_zero_and_a_package_is_no_answer
+
+# ACPI fan: an `_FPS` level is { Control, TripPoint, Speed, ... } - THE TRIP POINT SITS BETWEEN THE CONTROL AND THE
+# SPEED. Read one field early, every level's speed is its trip point, and the policy, which orders a fan's levels by
+# speed to choose one, drives it through them in the wrong order while every command it sends succeeds.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_fan.rs \
+	"speed_rpm: known(dword(&fields[2], \"an _FPS level's speed\")?)" \
+	"speed_rpm: known(dword(&fields[1], \"an _FPS level's speed\")?)" \
+	fps_reads_each_level_and_an_unknown_speed_as_none
+
+# ACPI fan: `_FIF`'s step size is the FIRMWARE'S NUMBER and is clamped to the one to nine percent the specification
+# allows. Believed, a step of zero is published as a fan that moves in steps of nothing, and a step of fifty turns the
+# owner's curve into a fan that is off, at half or at full - with no refusal anywhere.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_fan.rs \
+	"step: dword(&elements[2], \"_FIF's step size\")?.clamp(1, 9) })" \
+	"step: dword(&elements[2], \"_FIF's step size\")? })" \
+	fif_says_whether_the_speed_is_the_operating_system_s
+
+# ACPI power: a 32-bit field the firmware answered past 32 bits is the specification's UNKNOWN, NOT ITS LOW HALF. Cut
+# instead, a battery whose rate the firmware does not know reports one of five milliwatts, and everything the power
+# model builds on it is a confident number rather than an unknown.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_power.rs \
+	"		Value::Integer(raw) => Ok(u32::try_from(*raw).unwrap_or(u32::MAX))," \
+	"		Value::Integer(raw) => Ok(*raw as u32)," \
+	a_battery_s_status_and_the_adapter_and_zone_integers
+
+# ACPI power: A STORM OF NOTIFICATIONS IS BOUNDED. Without the bar, firmware that raises `Notify` in a loop has the
+# driver evaluating the node's methods as fast as the notifications arrive, which reads as a busy machine and not as an
+# error.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_power.rs \
+	"		if now >= self.barred_until {" \
+	"		if true {" \
+	a_storm_of_notifications_refreshes_once_per_interval
+
+# ACPI time and alarm: `_GRT` is LOCAL TIME and UTC is local PLUS the zone. Subtracted instead, the clock handed to the
+# kernel is wrong by twice the zone on every machine whose firmware states one - a time that parses, passes every range
+# check and is hours off.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_tad.rs \
+	"		minutes if (-1440..=1440).contains(&minutes) => minutes as i64 * 60," \
+	"		minutes if (-1440..=1440).contains(&minutes) => -(minutes as i64) * 60," \
+	the_time_is_read_at_its_offsets_and_the_zone_is_added_back
+
+# ACPI time and alarm: a timed wake is whole seconds ROUNDED UP. Rounded down, the machine wakes up to a second before
+# it was asked to, and a wake under a second programs the timer with zero.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_tad.rs \
+	"	let seconds = timed_wake_ms.div_ceil(1000);" \
+	"	let seconds = timed_wake_ms / 1000;" \
+	a_timed_wake_is_whole_seconds_rounded_up_and_none_programs_nothing
+
+# ACPI video: FIRMWARE THAT STEPS THE LEVEL ITSELF as well as notifying has made the press's step already. Not
+# recognised, the key is forwarded too and the policy steps again - every brightness key moves the panel two steps,
+# and both of them succeed.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_video.rs \
+	"		Hotkey::Up => now > last," \
+	"		Hotkey::Up => false," \
+	firmware_that_stepped_itself_is_one_step_not_two
+
+# ACPI video: `_BCL`'s FIRST TWO ENTRIES ARE THE AC AND BATTERY DEFAULTS, not levels. Taken as levels, a default the
+# panel lists nowhere becomes a step of the slider, and setting it asks `_BCM` for a level the firmware never offered.
+mutate "$DRIVERS" src/user/drivers/core/src/acpi_video.rs \
+	"	for element in elements[2..].iter().take(MAX_LEVELS) {" \
+	"	for element in elements[..].iter().take(MAX_LEVELS) {" \
+	bcl_is_normalised_into_its_defaults_and_sorted_deduplicated_levels
+
+# WDAT: a table whose `SET_REBOOT` cannot be run is NOT A WATCHDOG. Loaded anyway, the action is dropped and never run,
+# so an expiry does whatever the firmware left it set to - over the TCO, with No-Reboot set, nothing at all. The
+# watchdog is published, armed and petted, and "some actions not run" at bind is all that says it cannot reset anything.
+mutate "$DRIVERS" src/user/drivers/core/src/wdat.rs \
+	"			if REQUIRED.contains(&action) || action == SET_REBOOT {" \
+	"			if REQUIRED.contains(&action) {" \
+	a_register_outside_what_was_minted_is_never_executed
+
+# WDAT: AN ACTION WITH ONE UNRUNNABLE INSTRUCTION IS NOT RUN AT ALL. Run in part, the instructions that were in range
+# leave a register in a state the table never describes, and the action answers as if it had completed.
+mutate "$DRIVERS" src/user/drivers/core/src/wdat.rs \
+	"		steps.retain(|step| !bad.contains(&step.action));" \
+	"		steps.retain(|_| true);" \
+	a_register_outside_what_was_minted_is_never_executed
+
+# Watchdog: the ICH9 TCO resets only at its SECOND EXPIRY, so one count is a pair of 0.6 s ticks. Divided by the single
+# tick, the device is programmed with twice the count: the consumer is told the timeout it asked for, and a hung machine
+# is reset at double it.
+mutate "$DRIVERS" src/user/drivers/core/src/watchdog.rs \
+	"pub const TCO_TICK_PAIR_MS: u32 = 1_200;" \
+	"pub const TCO_TICK_PAIR_MS: u32 = 600;" \
+	the_tco_counts_pairs_of_ticks_from_two_to_1023
+
+# Watchdog: the resume arms the timer again with the timeout it had BUT NO LONGER THAN THE RESUME'S BOUND. What it
+# had is the longest the service set for the sleep - half an hour on some devices - so without the bound a resume that
+# hangs after the drivers is reset half an hour later, and nothing in between says it hung.
+mutate "$DRIVERS" src/user/drivers/core/src/watchdog.rs \
+	"			Some(timeout) => match self.provider.timer.arm(timeout.min(RESUME_WATCH_MS)) {" \
+	"			Some(timeout) => match self.provider.timer.arm(timeout) {" \
+	a_watchdog_in_a_sleep_is_disarmed_where_it_can_be_and_otherwise_bounds_the_sleep
+
+# GPIO: an interrupt line is given its TRIGGER BEFORE ITS EVENT BUFFER. Queued first, the buffer comes straight back
+# invalid because the line's interrupt type is still none - and the line, with no buffer left to report on, never fires
+# while every request that set it up succeeded.
+mutate "$DRIVERS" src/user/drivers/core/src/gpio.rs \
+	"			Scope::Interrupt(trigger) => {
+				steps.push(Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line, value: trigger as u32 }));
+				steps.push(Step::QueueEvent(line));" \
+	"			Scope::Interrupt(trigger) => {
+				steps.push(Step::QueueEvent(line));
+				steps.push(Step::Send(Request { kind: MSG_SET_IRQ_TYPE, line, value: trigger as u32 }));" \
+	an_interrupt_line_is_armed_with_its_trigger_before_its_buffer
+
+# GPIO: an event buffer that comes back INVALID IS A DISARM, NOT AN EVENT. Delivered, a buffer the device handed back
+# unfired reaches the line's consumer as an interrupt - an edge that never happened, acted on as if it had.
+mutate "$DRIVERS" src/user/drivers/core/src/gpio.rs \
+	"			Held::Armed(trigger) if status == EVENT_VALID => {" \
+	"			Held::Armed(trigger) if status <= EVENT_VALID => {" \
+	a_buffer_that_comes_back_invalid_or_for_nobody_delivers_nothing
+
+# IPMI: A SEL CLEAR ERASES ONLY WHAT WAS COUNTED. Without the live count compared, an event logged after the operator
+# looked - the one that explains the incident - is erased with the rest, unseen, and the clear reports success.
+mutate "$DRIVERS" src/user/drivers/core/src/ipmi_bmc.rs \
+	"	if info.entries != count {" \
+	"	if false {" \
+	a_sel_clear_erases_only_what_was_counted
+
+# IPMI: a FRU read the BMC answers with MORE THAN WAS ASKED is malformed. Taken, whatever the BMC put past the count -
+# a padded or stale buffer - is stored as the device's next bytes and parsed as its serial and part numbers, and the
+# device grows past the size it stated.
+mutate "$DRIVERS" src/user/drivers/core/src/ipmi_bmc.rs \
+	"		if got.is_empty() || got.len() > count as usize {" \
+	"		if got.is_empty() {" \
+	a_fru_read_answered_with_more_than_was_asked_or_with_nothing_is_malformed
+
+# CCID: the class descriptor's slot field is the HIGHEST SLOT INDEX, ZERO-BASED, and not a count. Read
+# as a count, a one-slot reader reports none and a five-slot reader slips under the four-slot bound - so
+# a reader the contract cannot carry is truncated to the slots it can rather than refused, and nothing
+# anywhere says a slot is missing.
+mutate "$DRIVERS" src/user/drivers/core/src/ccid.rs \
+	"let slots = class.field(4).map_err(|_| NotBindable::Incomplete)?.saturating_add(1);" \
+	"let slots = class.field(4).map_err(|_| NotBindable::Incomplete)?;" \
+	a_reader_with_more_slots_than_the_contract_carries_is_refused
+
+# CCID: a reply answers the request whose SEQUENCE AND SLOT it names. Matched on the sequence alone, a
+# multi-slot reader's answer about one card is taken as the other card's - a well-formed response with a
+# good status word, from the wrong card. THE SLOT STAYS IN THE EXPRESSION because the crate denies
+# warnings: an unused parameter fails the build, not the test.
+mutate "$DRIVERS" src/user/drivers/core/src/ccid.rs \
+	"		if self.seq != seq || self.slot != slot {" \
+	"		if self.seq != seq || false && self.slot != slot {" \
+	a_reply_answers_only_the_request_whose_sequence_and_slot_it_names
+
+# DFU: the device that comes back in DFU mode is the one that detached only IN THE SAME PLACE AND WITH
+# THE SAME SERIAL - the product id may change, so the serial is all that names it. Followed by place
+# alone, another device on that port when the bus re-enumerates is written the image the person confirmed
+# for the first one, and the download reports success.
+mutate "$DRIVERS" src/user/drivers/core/src/dfu.rs \
+	"	detached.port == returned.port && detached.route == returned.route && detached.serial == returned.serial" \
+	"	detached.port == returned.port && detached.route == returned.route" \
+	a_device_that_came_back_is_the_one_that_detached_only_where_it_was_and_by_its_serial
+
+# DFU: a suffix's CRC is CHECKED and not merely carried. Without the check, an image damaged on its way
+# that still names the right vendor and product goes into the device's flash - and the first thing to
+# notice is the device, the next time it boots.
+mutate "$DRIVERS" src/user/drivers/core/src/dfu.rs \
+	"	let crc = u32::from_le_bytes([suffix[12], suffix[13], suffix[14], suffix[15]]);
+	if suffix_crc(&payload[..payload.len() - 4]) != crc {" \
+	"	if false {" \
+	a_suffix_is_held_against_the_target_and_its_crc
+
+# MBIM: a datagram pointer is an index AND A LENGTH, and its END is held inside the block's own length.
+# Checked at its start alone, a pointer reaching past the block hands the network stack bytes that are
+# not this block's - the transfer's tail, or a page further on - as one IP datagram.
+mutate "$DRIVERS" src/user/drivers/core/src/mbim.rs \
+	"			if index < NTH16_LENGTH || index.checked_add(len).is_none_or(|end| end > block.len()) || len == 0 {" \
+	"			if index < NTH16_LENGTH || len == 0 {" \
+	every_offset_in_a_block_is_checked_and_a_cycle_is_refused
+
+# MBIM: an NDP's signature carries its SESSION in the top byte, and a datagram belongs to that session's
+# context alone. Read without it, a modem with two contexts up - the Internet and the operator's own -
+# has the second one's packets delivered on the first one's interface, as if they had arrived there.
+mutate "$DRIVERS" src/user/drivers/core/src/mbim.rs \
+	"		let tagged = (signature >> 24) as u8;" \
+	"		let tagged = session;" \
+	a_transfer_block_yields_its_sessions_datagrams
+
+# MBIM: a string is an offset and a size INTO THE INFORMATION BUFFER, and the end they name is held
+# against that buffer before a byte is read. Unchecked, where the read lands is the modem's choice.
+#
+# THE TEST NAMED FOR IT NEVER FED ONE. `strings_are_bounded_by_the_buffer_and_by_their_contract` fed an
+# odd size and an overlong string and no string past the buffer, so this check could go and it passed.
+mutate "$DRIVERS" src/user/drivers/core/src/mbim_cid.rs \
+	"	if size % 2 != 0 || size / 2 > bound || offset.checked_add(size).is_none_or(|end| end > info.len()) {" \
+	"	if size % 2 != 0 || size / 2 > bound {" \
+	a_string_reaching_past_its_buffer_is_refused_rather_than_read
+
+# MBIM: an IPv4 address in an IP configuration is FOUR BYTES IN NETWORK ORDER inside a buffer whose every
+# other field is little-endian. Read little-endian, 10.64.0.2 is installed as 2.0.64.10 - a valid address,
+# on a link where nothing answers it, with no error anywhere.
+mutate "$DRIVERS" src/user/drivers/core/src/mbim_cid.rs \
+	"	let address = u32::from_be_bytes(info[offset + 4..offset + 8]" \
+	"	let address = u32::from_le_bytes(info[offset + 4..offset + 8]" \
+	an_ipv4_configuration_is_read_by_its_own_offsets
+
+# Printer: a device ID's length is the PRINTER'S CLAIM, believed only as far as what arrived. Held
+# against the contract's bound alone, an ID claiming more than the transfer carried is reported that
+# long, and the rest of it is whatever the page held from the transfer before.
+mutate "$DRIVERS" src/user/drivers/core/src/printer.rs \
+	"	(2..=bytes.len().min(MAX_DEVICE_ID)).contains(&declared).then_some(declared)" \
+	"	(2..=MAX_DEVICE_ID).contains(&declared).then_some(declared)" \
+	a_device_id_is_believed_only_as_far_as_its_length_and_the_transfer_agree
+
+# Printer: the BIDIRECTIONAL setting is preferred, whatever order the alternates come in. A printer lists
+# its unidirectional alternate first, so taking the first usable one prints every page and never reads
+# the port status - paper out and an error state are never seen, and the job reports success.
+mutate "$DRIVERS" src/user/drivers/core/src/printer.rs \
+	"	for protocol in [PROTOCOL_BIDIRECTIONAL, PROTOCOL_UNIDIRECTIONAL] {" \
+	"	for protocol in [PROTOCOL_UNIDIRECTIONAL, PROTOCOL_BIDIRECTIONAL] {" \
+	the_bidirectional_setting_is_preferred_over_the_unidirectional_one
+
+# PTP: the transaction a cancel names is the command container's THIRD FIELD, after the length, the
+# type and the code. Read four bytes early, a cancel names the type and the code as a transaction no
+# device has outstanding - which it ignores, and the transfer it was meant to stop carries on.
+mutate "$DRIVERS" src/user/drivers/core/src/ptp.rs \
+	"	match container.get(8..12) {" \
+	"	match container.get(4..8) {" \
+	a_cancel_names_the_last_commands_transaction
+
+# PTP: a device status's length is the DEVICE'S CLAIM and is held against what arrived. Held only against
+# the contract's bound, a status claiming more than the transfer carried is read past its end - on bytes
+# the camera chose, in the transport that is supposed to parse nothing.
+mutate "$DRIVERS" src/user/drivers/core/src/ptp.rs \
+	"	if length < 4 || length > bytes.len() || length > MAX_STATUS || (length - 4) % 4 != 0 {" \
+	"	if length < 4 || length > MAX_STATUS || (length - 4) % 4 != 0 {" \
+	a_device_status_is_believed_only_as_far_as_its_length
+
+# Configuration walk: endpoint zero is the NUMBER in the low four bits, whatever the direction bit says.
+# Compared as a whole byte, 0x80 passes - the default control pipe's IN half, bound as a class's bulk IN -
+# and its device context index is the control endpoint's own.
+mutate "$DRIVERS" src/user/drivers/core/src/usb_function.rs \
+	"					if address & 0x0f == 0 || setting.endpoints.iter().any(|endpoint| endpoint.address == address) {" \
+	"					if address == 0 || setting.endpoints.iter().any(|endpoint| endpoint.address == address) {" \
+	endpoint_zero_and_a_repeated_address_are_refused
+
+# Configuration walk: `wMaxPacketSize` is a size in bits 10:0 and a high-bandwidth count in 12:11. Taken
+# whole, a high-bandwidth endpoint's packet is read as five kilobytes where it is one, and every transfer
+# sized from it asks the controller for packets the endpoint never sends.
+mutate "$DRIVERS" src/user/drivers/core/src/usb_function.rs \
+	"		self.packet & 0x07ff" \
+	"		self.packet" \
+	packet_sizes_drop_the_high_bandwidth_bits
+
+# UVC: a frame ENDED BY ITS EOF records its FID exactly as one ended by a toggle does. Without that, a
+# device out of step with its own frames - still sending the ended frame's FID - opens a new frame on
+# that stale data, takes a client buffer for it and delivers it as a picture.
+mutate "$DRIVERS" src/user/drivers/core/src/uvc.rs \
+	"			self.ended = Some(done.fid);
+" \
+	"" \
+	after_a_frame_ends_its_fid_starts_nothing_until_it_toggles
+
+# UVC: YUY2 is TWO BYTES A PIXEL, and a frame's declared buffer is held against that. Held against one, a
+# camera declaring half the buffer its frames need is offered, every client buffer leased from that
+# number is half a frame, and every frame is lost past its buffer while the stream looks healthy.
+mutate "$DRIVERS" src/user/drivers/core/src/uvc.rs \
+	"				if bytes > max_bytes {" \
+	"				if bytes / 2 > max_bytes {" \
+	dimensions_strides_and_sizes_are_checked_exactly
+
+# The PIV fixture card: GENERAL AUTHENTICATE answers only after a verification. A fixture that signed
+# without one would let the smart-card gate's "no signature before the PIN" case pass against a card that
+# never asks - the service's own refusal would be the only thing tested, and nothing would show it.
+mutate "$DRIVERS" src/user/drivers/core/src/piv_card.rs \
+	"				if !self.verified {
+					return status(0x69, 0x82);" \
+	"				if false {
+					return status(0x69, 0x82);" \
+	authentication_needs_a_verification_and_a_challenge_the_card_knows
+
+# HID monitor and light sensor: a sensor field's usage carries a MODIFIER in its top nibble - the same
+# field's maximum, its accuracy, its sensitivity - and only the unmodified field is the reading. Matched
+# on the low twelve bits, a sensor that declares only a modifier binds as a light sensor and reports
+# that modifier's value as the room's lux.
+mutate "$DRIVERS" src/user/drivers/core/src/hid_display.rs \
+	"info.usage & !SENSOR_MODIFIER == ILLUMINANCE && info.usage & SENSOR_MODIFIER == 0 && info.application >> 16 == PAGE_SENSOR" \
+	"info.usage & !SENSOR_MODIFIER == ILLUMINANCE && info.application >> 16 == PAGE_SENSOR" \
+	a_sensor_reading_with_a_modifier_is_not_the_reading_and_a_keyboard_is_neither
+
+# HID monitor: a body SHORTER THAN ITS FIELD holds no level. The field reader pads a short body with
+# zeros, so without the check a GET_REPORT answer cut short reads as brightness zero - which is inside
+# every monitor's range, so nothing refuses it.
+mutate "$DRIVERS" src/user/drivers/core/src/hid_display.rs \
+	"pub fn level(info: &FieldInfo, body: &[u8]) -> Option<u32> {
+	if (info.bit_offset + info.size).div_ceil(8) as usize > body.len() {" \
+	"pub fn level(info: &FieldInfo, body: &[u8]) -> Option<u32> {
+	if false {" \
+	a_brightness_reads_and_writes_inside_its_range_only
+
+# HID power: a control is written only INSIDE ITS FIELD'S LOGICAL RANGE. The bits hold more than the
+# range admits: a delay of 40000 fits the sixteen bits of a field whose range is -1..32767, and the UPS
+# reads those bits as a negative delay - which nothing on the host ever sees.
+mutate "$DRIVERS" src/user/drivers/core/src/hid_power.rs \
+	"	if logical < info.logical_min as i64 || logical > info.logical_max as i64 {" \
+	"	if logical < info.logical_min as i64 {" \
+	a_control_is_written_into_its_own_bits_and_only_inside_its_range
+
+# HID power: a report the device CUT SHORT holds none of the fields past its end. The field reader pads
+# with zeros, so without the check a truncated input report reads as an empty battery with no run time
+# left - the reading a UPS monitor shuts a machine down for.
+mutate "$DRIVERS" src/user/drivers/core/src/hid_power.rs \
+	"	if (info.bit_offset + info.size).div_ceil(8) as usize > report.body.len() {" \
+	"	if false {" \
+	a_report_the_device_cut_short_reads_as_absent_and_not_as_zero
+
+# I2C-HID: each input report is routed by the COLLECTION ITS ID BELONGS TO. A touch pad's finger report
+# carries Generic Desktop X and Y like a mouse's, so a fallback that folds every report outside the named
+# collections into the pointer moves the cursor by numbers that were never a pointer's - and nothing
+# refuses them.
+mutate "$DRIVERS" src/user/drivers/core/src/i2c_hid.rs \
+	"		_ => Route::Nothing," \
+	"		_ => Route::Pointer," \
+	a_precision_touchpad_publishes_pointer_alone_and_its_finger_report_goes_nowhere
+
+# I2C-HID: the descriptor register is the DEVICE'S OWN `hid-descr-addr`, at depth zero. A child node's
+# property of the same name, read as the device's, has the driver fetch its HID descriptor from a
+# register the device never named.
+mutate "$DRIVERS" src/user/drivers/core/src/i2c_hid.rs \
+	"rt::DEVICE_PROPERTY_VALUE && depth == 0 &&" \
+	"rt::DEVICE_PROPERTY_VALUE && depth <= 1 &&" \
+	the_descriptor_register_comes_from_the_tree_s_property_or_the_dsm_s_integer
+
+# virtio-i2c: a write then a read is two requests and the FIRST CARRIES FAIL_NEXT. Without it the device
+# runs them as two transfers, so a register-pointer write that failed is followed by a read that
+# succeeds - from wherever the pointer was - and the caller gets plausible bytes from the wrong register.
+mutate "$DRIVERS" src/user/drivers/core/src/i2c.rs \
+	"header(address, FLAG_FAIL_NEXT), buffer: Buffer::Write(out)" \
+	"header(address, 0), buffer: Buffer::Write(out)" \
+	a_write_then_a_read_is_two_requests_and_the_first_fails_the_next
+
+# SMBus: a PEC that does not match is ITS OWN FAILURE AND NOT DATA. Returning the bytes anyway is what a
+# driver that strips the PEC without checking it does, and it hands a corrupted word to its consumer as
+# a good one - the one case the PEC exists to catch.
+mutate "$DRIVERS" src/user/drivers/core/src/smbus.rs \
+	"			return Err(Refusal::Pec);" \
+	"			return Ok(data);" \
+	a_read_s_pec_covers_both_address_bytes_and_a_wrong_one_is_refused
+
+# SMBus: an answer of THE WRONG LENGTH is not taken. Checked only for being short, a controller that
+# answered more bytes than the transaction reads has them handed on as the value.
+mutate "$DRIVERS" src/user/drivers/core/src/smbus.rs \
+	"		if read.len() != self.read_len {" \
+	"		if read.len() < self.read_len {" \
+	a_read_after_its_command_is_one_transfer_with_a_repeated_start
+
+# TCPCI: a board describing MORE THAN SEVEN sink PDOs describes what Sink_Capabilities cannot carry. The
+# engine sends the first seven, so an eighth is dropped from what the partner is told with nothing
+# saying so.
+mutate "$DRIVERS" src/user/drivers/core/src/typec_tcpci.rs \
+	"!objects.is_empty() && objects.len() <= MAX_SINK_PDOS &&" \
+	"!objects.is_empty() &&" \
+	a_source_or_dual_role_connector_is_refused_and_a_missing_description_is_the_type_c_current
+
+# TCPCI: a partner offers USB data when its first offer's USB Communications Capable bit - bit 26 - is
+# set. Bit 25 is Dual-Role Data, its neighbour, and read instead it publishes a host as a charger.
+mutate "$DRIVERS" src/user/drivers/core/src/typec_tcpci.rs \
+	"first & (1 << 26) != 0" \
+	"first & (1 << 25) != 0" \
+	the_record_carries_the_contract_the_offers_and_the_type_c_current
+
+# UCSI: the request's object position is ONE-BASED. Read as an index, the contract names the next offer
+# up - a 9 V contract reported as 15 V - and while there is a next offer it exists, so nothing refuses it.
+mutate "$DRIVERS" src/user/drivers/core/src/typec_ucsi.rs \
+	"	let object = *offers.get(usize::from(position).checked_sub(1)?)?;" \
+	"	let object = *offers.get(usize::from(position))?;" \
+	a_charger_is_a_charger_with_its_contract_and_offers_and_an_online_source_measuring_only_what_2_1_reads
+
+# UCSI: a downstream-facing partner that supplies this machine is a charger only when it OFFERS NO USB
+# DATA. Without the partner's USB flag, a host offering data is published as a charger.
+mutate "$DRIVERS" src/user/drivers/core/src/typec_ucsi.rs \
+	"			PartnerType::Dfp if !status.source && !status.partner_usb() => PartnerKind::Charger," \
+	"			PartnerType::Dfp if !status.source => PartnerKind::Charger," \
+	a_host_offering_data_and_a_device_turn_the_data_role_round
+
+# 16550: a FIFO load goes only into an EMPTY holding register. Written while the transmitter is busy,
+# the bytes past the FIFO's room are lost on the UART and nothing reports them.
+mutate "$DRIVERS" src/user/drivers/core/src/uart.rs \
+	"		if bytes.is_empty() || self.regs.read(LSR) & LSR_THR_EMPTY == 0 {" \
+	"		if bytes.is_empty() {" \
+	a_full_holding_register_takes_nothing_and_an_empty_one_takes_a_fifo_load
+
+# PL011: the divisor is LATCHED BY THE LINE-CONTROL WRITE THAT FOLLOWS IT. Written after the line control,
+# the divisor registers hold the new rate and the UART keeps running at the old one - garbage on the wire
+# and a register dump that says everything is right.
+mutate "$DRIVERS" src/user/drivers/core/src/pl011.rs \
+	"		self.regs.write(LCR_H, 0);
+		if let Some(line) = line {
+			self.regs.write(IBRD, u32::from(line.ibrd));
+			self.regs.write(FBRD, u32::from(line.fbrd));
+		}
+		self.regs.write(LCR_H, LCR_H_8N1_FIFO);" \
+	"		self.regs.write(LCR_H, 0);
+		self.regs.write(LCR_H, LCR_H_8N1_FIFO);
+		if let Some(line) = line {
+			self.regs.write(IBRD, u32::from(line.ibrd));
+			self.regs.write(FBRD, u32::from(line.fbrd));
+		}" \
+	programming_follows_the_trm_order_keeps_an_undescribed_divisor_and_unmasks_receive_last
+
+# PL011: a byte goes into the transmit FIFO only while the FIFO is NOT FULL. Written into a full one, the
+# UART drops it, and the driver counts it as sent.
+mutate "$DRIVERS" src/user/drivers/core/src/pl011.rs \
+	"		while n < bytes.len() && self.regs.read(FR) & FR_TXFF == 0 {" \
+	"		while n < bytes.len() {" \
+	the_transmitter_takes_bytes_until_its_fifo_is_full_and_nothing_once_it_is
+
+# Console UART: the baud clock is the one `clock-names` calls `uartclk` or `baudclk`. A PL011's other
+# clock is its bus clock, which divides nothing on the line, and taking the first whatever the names say
+# programs a divisor from a board's bus clock - a console at a rate the far end does not read.
+mutate "$DRIVERS" src/user/drivers/core/src/console_uart.rs \
+	"clocks[named.unwrap_or(0).min(clock_count - 1)]" \
+	"clocks[named.unwrap_or(0).min(0)]" \
+	a_pl011_s_clock_is_the_one_its_clock_names_call_uartclk
+
+# Console UART: only the device's own records - depth zero - describe its registers. A child node's
+# `reg-shift` or `clock-frequency`, read as the UART's, spaces or clocks it by someone else's numbers.
+mutate "$DRIVERS" src/user/drivers/core/src/console_uart.rs \
+	"		if depth != 0 {" \
+	"		if depth > 1 {" \
+	a_child_node_s_properties_describe_nothing_of_the_uart_and_a_cut_record_ends_the_block
+
+# UMP: a message's length follows from its type ALONE, RESERVED TYPES INCLUDED - which is what lets a
+# receiver skip a message it does not know. Sized as four words, a reserved one-word type swallows the
+# three words after it, and from there on the stream is cut at the wrong words into messages nothing
+# refuses.
+mutate "$DRIVERS" src/user/drivers/core/src/ump.rs \
+	"		0x0..=0x2 | 0x6 | 0x7 => 1," \
+	"		0x0..=0x2 => 1," \
+	every_message_type_says_its_own_length
+
+# UMP: a Group Terminal Block's groups must lie INSIDE THE SIXTEEN. Checked only at its first group, a
+# block starting at fifteen and claiming two names a group no packet can carry.
+mutate "$DRIVERS" src/user/drivers/core/src/ump.rs \
+	"		if groups == 0 || u16::from(first_group) + u16::from(groups) > 16 {" \
+	"		if groups == 0 || first_group > 15 {" \
+	group_terminal_blocks_are_read_and_a_hostile_answer_refused
+
+# USB-MIDI: code indexes C and D carry TWO bytes and the other channel messages three. Read as three, a
+# program change takes its padding byte as data, and the receiver gets a message one byte too long
+# whose every byte is valid MIDI.
+mutate "$DRIVERS" src/user/drivers/core/src/usb_midi.rs \
+	"			let length = if matches!(cin, 0xc | 0xd) { 2 } else { 3 };" \
+	"			let length = if matches!(cin, 0xd) { 2 } else { 3 };" \
+	short_messages_decode_exactly_and_padding_is_checked
+
+# USB-MIDI: a packet's cable is checked against the cables the ENDPOINT DECLARED, not the sixteen a
+# nibble can name. Against the sixteen, a cable the device does not have is decoded as messages on a
+# port nobody bound, and the cables that are there are not reset.
+mutate "$DRIVERS" src/user/drivers/core/src/usb_midi.rs \
+	"			if cable >= self.cables {" \
+	"			if cable >= MAX_CABLES {" \
+	what_cannot_be_attributed_resets_every_cable
+
+# 16550: the divisor is refused when the rate it makes is MORE THAN THREE PER CENT off. Read as three
+# times the rate rather than three per cent of it, the bound admits a console fifteen per cent fast -
+# every byte misread at the far end, and nothing on this side wrong.
+mutate "$DRIVERS" src/user/drivers/core/src/uart.rs \
+	"		if error * 100 > 3 * baud as u64 {" \
+	"		if error > 3 * baud as u64 {" \
+	a_rate_no_divisor_comes_within_three_percent_of_is_refused_rather_than_run_fast
+
+# USB-MIDI: cables are numbered FROM ZERO, so the endpoint's count is itself the first cable it does not
+# have. Bounded with `>`, a two-cable endpoint attributes cable 2 and decodes its packets as messages on
+# a port nobody bound.
+mutate "$DRIVERS" src/user/drivers/core/src/usb_midi.rs \
+	"			if cable >= self.cables {" \
+	"			if cable > self.cables {" \
+	the_cable_one_past_the_endpoint_s_count_is_not_attributable
+
+# Bluetooth USB: an HCI packet is as long as its own header says, and a header claiming more than the transport carries
+# is a stream out of step. HOLDING ITS BYTES TO WAIT FOR THE REST SWALLOWS EVERY PACKET AFTER IT - no error anywhere, only
+# a controller whose events and data stop arriving.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_usb.rs \
+	"			if length > ceiling {
+				self.held.clear();" \
+	"			if length > ceiling {" \
+	a_length_past_the_ceiling_drops_the_stream_rather_than_waiting
+
+# Bluetooth USB: ISO data shares the ACL bulk pair, so the IN pipe is cut at the larger of the two ceilings. CUT AT THE
+# ACL CEILING ALONE, every ISO packet past 1028 bytes reads as a stream out of step and is dropped with whatever was
+# held - an LE Audio stream that loses its largest SDUs while every ACL packet still arrives.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_usb.rs \
+	"Kind::Acl => MAX_ACL.max(MAX_ISO)," \
+	"Kind::Acl => MAX_ACL," \
+	iso_packets_share_the_bulk_pair
+
+# Fixture LC3: a bandwidth index past the sampling rate's own is a bit error and not a wider band. READ ON, the frame is
+# decoded against a band the rate does not have, and the earbud reports a damaged frame as one it heard.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_lc3.rs \
+	"if bandwidth > g.fs_ind {" \
+	"if bandwidth > 4 {" \
+	a_decoder_refuses_a_bandwidth_or_lastnz_past_the_rate
+
+# Fixture LC3: lastnz is bounded by the lines the RATE codes, not by the lines a frame's spectrum can hold. BOUNDED BY THE
+# BUFFER, a 16 kHz frame claiming 256 lines reads its zero 2-tuples on past 160 without meeting another bit error, and
+# the earbud reads lines the rate never codes.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_lc3.rs \
+	"if lastnz > g.ne {" \
+	"if lastnz > MAX_LINES {" \
+	a_lastnz_past_the_rates_lines_is_refused_where_the_spectrum_has_room_for_it
+
+# Fixture SBC: a joint-stereo frame carries one join bit per subband before its scale factors. A LENGTH WITHOUT THEM is
+# a byte short at eight subbands, so the headset cuts every frame of the stream early - and the CRC, which ends with the
+# scale factors, does not notice.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_sbc.rs \
+	"_ => (self.subbands + self.blocks * bitpool).div_ceil(8)," \
+	"_ => (self.blocks * bitpool).div_ceil(8)," \
+	what_the_phone_writes_the_headset_reads
+
+# Fixture SBC: the CRC covers the header from its second byte, so the sync word is checked by nothing but itself. A
+# READER THAT TAKES ANY FIRST BYTE AS SBC'S hears a frame behind whatever byte the stream is out of step on, and the CRC
+# still holds.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_sbc.rs \
+	"if frame.len() < 4 || frame[0] != 0x9c {" \
+	"if frame.len() < 4 {" \
+	what_is_not_a_frame_is_not_heard
+
+# Fixture LE Audio: a time-stamped ISO packet carries four bytes before its sequence number. READ WITHOUT THE TS FLAG,
+# every packet from a host that stamps its SDUs is refused - and a refused packet completes no buffer, so the host's ISO
+# credits run out and the stream stops with nothing saying why.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_le_audio.rs \
+	"header & 0x4000 != 0);" \
+	"false);" \
+	iso_packets_have_the_core_layout
+
+# Fixture LE peer: Secure Connections is bit 3 of the pairing request's AuthReq, and bit 0 is bonding. A RESPONDER TESTING
+# THE WRONG BIT answers a legacy request that asks to bond as a Secure Connections one, and the host is refused one
+# exchange later with Unspecified Reason instead of at the start with Authentication Requirements.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_peer.rs \
+	"if pdu[3] & 0x08 == 0 {" \
+	"if pdu[3] & 0x01 == 0 {" \
+	the_responder_refuses_a_legacy_request_and_an_out_of_order_pdu
+
+# Fixture LE peer: HOGP lets a host turn the boot report on only over an encrypted link. WITHOUT THE RULE a host that
+# never encrypts still receives input, and the gate's "input arrived" stops meaning "input arrived over an encrypted
+# link".
+mutate "$DRIVERS" src/user/drivers/core/src/bt_peer.rs \
+	"				if !encrypted {
+					// Insufficient encryption." \
+	"				if false {
+					// Insufficient encryption." \
+	reports_cannot_be_enabled_before_the_link_is_encrypted
+
+# Fixture BR/EDR world: RFCOMM's check covers address, control AND LENGTH on every frame but UIH, which covers the first
+# two alone. A CHECK OVER THE FIRST TWO EVERYWHERE is right for data and wrong for every SABM, UA, DM and DISC, so a
+# correct host discards the fixture's channel setup while every data frame it sends checks.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_world.rs \
+	"let check = if control == 0xEF { crc8(&out[..2]) } else { crc8(&out) };" \
+	"let check = crc8(&out[..2]);" \
+	rfcomm_frames_carry_the_specified_check
+
+# Fixture BR/EDR world: an L2CAP PDU is as long as its basic header says, and fragments that run past it are a host out
+# of step. READ WITH ITS SURPLUS, the PDU is answered where a device would discard it, and a host whose fragmentation is
+# wrong passes the gate that exists to catch it.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_world.rs \
+	"if pdu.len() != link.want {" \
+	"if pdu.len() < link.want {" \
+	l2cap_that_does_not_add_up_is_dropped_and_the_next_request_answered
+
+# Fixture LE world: in Passkey Entry each round's commitment is checked against that round's bit of the passkey. A
+# RESPONDER THAT DOES NOT CHECK IT completes the pairing with a host that never knew the digits - an authenticated key
+# from an unauthenticated exchange, and the gate counts it a success.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_le_world.rs \
+	"if passkey_entry && f4(&pkax, &pkbx, &na, Self::passkey_bit(link, passkey)) != link.cai {" \
+	"if false {" \
+	sc_keyboard_rejects_a_commitment_to_a_different_digit
+
+# Fixture LE world: Passkey Entry is TWENTY rounds, one for each bit of a passkey up to 999999. ONE ROUND SHORT never
+# checks bit 19, so a host wrong only about whether the passkey is past 524287 pairs anyway - and nothing but this
+# counts the rounds.
+mutate "$DRIVERS" src/user/drivers/core/src/bt_le_world.rs \
+	"if link.round < 20 {" \
+	"if link.round < 19 {" \
+	sc_keyboard_checks_twenty_rounds_with_digits_before_or_after_the_first_commitment
+
+# Administrative operations: the start guard admits ONE attempt. A GUARD THAT CHECKS AND DOES NOT RECORD lets the same
+# confirmed operation run twice - a second write of what a person confirmed once, and nothing refuses it.
+mutate "$DRIVERS" src/user/drivers/core/src/admin_operation.rs \
+	"self.held[at].started = true;" \
+	"self.held[at].started = false;" \
+	the_start_guard_admits_one_attempt_and_only_on_the_live_target
+
+# Administrative operations: a preparation is frozen against the target generation a person confirmed, and any other
+# generation is stale. A GUARD THAT REFUSES ONLY AN OLDER ONE starts on a replaced target - the payload confirmed for one
+# device is written to whatever took its place, and the newer generation reads as fresher rather than as different.
+mutate "$DRIVERS" src/user/drivers/core/src/admin_operation.rs \
+	"if held.generation != generation {" \
+	"if held.generation > generation {" \
+	the_start_guard_admits_one_attempt_and_only_on_the_live_target
 
 echo "driver-mutations: $caught of $planted planted defect(s) were caught by the test named for each"
 [[ "$planted" -eq "$caught" ]] || fail "a planted defect went uncaught"

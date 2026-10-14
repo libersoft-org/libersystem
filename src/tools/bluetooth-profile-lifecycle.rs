@@ -1,7 +1,6 @@
 // Exact production methods are inserted below. L2CAP allocation/close bookkeeping is real.
 // Controller, SDP response, HID decoding, codec and IPC boundaries are explicit spies.
 // This proves service retirement/reconnection decisions, not radio negotiation or HID parsing.
-#![allow(dead_code)]
 extern crate alloc;
 /* EXACT_MODULES */
 mod classic {

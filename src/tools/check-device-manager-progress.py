@@ -119,7 +119,7 @@ fn settle_dependencies(_: &mut [Node], _: &mut Catalogue) -> usize { 0 }
 fn needs_met(_: &Node, _: &Catalogue) -> bool { true }
 fn say_line(_: &[&[u8]]) {}
 fn driver_text(name: &[u8]) -> Vec<u8> { name.to_vec() }
-fn decimal(_: u64, _: &mut [u8; 20]) -> usize { 0 }
+fn decimal<T>(_: T, _: &mut [u8; 20]) -> usize { 0 }
 struct Package;
 impl Package { fn lookup(&self, _: &[u8]) -> Option<&[u8]> { Some(&[]) } }
 fn begin_bind(node: &mut Node, _: &u64, _: &[u8], _: &[u8], _: u64, _: u64, _: u64, _: u64, _: Option<()>) { node.record.state = BindingState::Binding; RT.with_borrow_mut(|rt| rt.binds += 1); }

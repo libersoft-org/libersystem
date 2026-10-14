@@ -1713,6 +1713,7 @@ pub unsafe fn retire(frames: &[u64]) {
 				drop(quarantine);
 				unsafe { drain_quarantine() };
 				quarantine = QUARANTINE.lock();
+				// ALLOC-OK: the same fixed ring, emptied a line above.
 				if quarantine.push(phys) {
 					continue;
 				}

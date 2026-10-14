@@ -116,6 +116,10 @@ fn send_frame(channel: u64, opcode: driver_protocol::Opcode, _: u64, _: &[u8], _
     assert_eq!(opcode, driver_protocol::Opcode::Stop);
     EFFECTS.with_borrow_mut(|effects| effects.push((true, channel))); true
 }
+// THE HEARTBEAT'S SEND, which waits for nothing in production: these regressions never fill a driver's queue, so a
+// ping is always taken.
+enum SendOutcome { Delivered, Failed, Stalled }
+fn offer_frame(_: u64, _: driver_protocol::Opcode, _: u64, _: &[u8]) -> SendOutcome { SendOutcome::Delivered }
 #[cfg(test)] mod tests;
 '''
 

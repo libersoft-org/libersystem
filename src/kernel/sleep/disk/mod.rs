@@ -207,6 +207,8 @@ impl Snapshot {
 		for index in 0..self.capacity {
 			let [_, copy] = self.lists.get(index);
 			// SAFETY: every copy frame was allocated by `prepare` and is referenced by nothing else.
+			// NEVER-MAPPED: a snapshot copy is reached only through the direct map (`bytes`) - `copy_now` fills it and
+			// `read` hands out a slice of it - and no page table ever points at it.
 			unsafe { frame::deallocate(copy) };
 		}
 		self.lists.free();
@@ -272,6 +274,7 @@ pub fn prepare(context: [u8; SNAPSHOT_CONTEXT]) -> Result<u64, i64> {
 			Some(copy) => lists.put(index, [0, copy]),
 			None => {
 				for given in 0..index {
+					// NEVER-MAPPED: allocated in this loop and not yet written; nothing points at it.
 					unsafe { frame::deallocate(lists.get(given)[1]) };
 				}
 				lists.free();
@@ -518,6 +521,7 @@ impl Restore {
 				return Some(phys);
 			}
 			if aside.try_reserve(1).is_err() {
+				// NEVER-MAPPED: allocated a line above and never touched.
 				unsafe { frame::deallocate(phys) };
 				return None;
 			}
@@ -529,6 +533,7 @@ impl Restore {
 		for index in 0..self.written {
 			let [_, held] = self.lists.get(index);
 			// SAFETY: a frame `write` allocated for this restore.
+			// NEVER-MAPPED: a restore frame is filled through the direct map by `write`; no page table points at it.
 			unsafe { frame::deallocate(held) };
 		}
 		unsafe { frame::free_pages(&self.aside) };
@@ -621,6 +626,7 @@ pub fn write(first: u64, count: u64, mut read: impl FnMut(usize, *mut u8) -> Res
 	for at in 0..count {
 		let Some(phys) = Restore::safe_frame(&restore.targets, &mut restore.aside) else { return Err(ERR_RESOURCE_EXHAUSTED) };
 		if let Err(error) = read(at as usize * PAGE as usize, bytes(phys)) {
+			// NEVER-MAPPED: taken by `safe_frame` above and written only through the direct map.
 			unsafe { frame::deallocate(phys) };
 			return Err(error);
 		}

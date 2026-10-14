@@ -1,7 +1,6 @@
 // Exact production connection handler/resolver and crypto/HCI parser are inserted
 // by bluetooth_le_reconnect.py. Bond-store IPC and controller commands are mocked;
 // these tests do not claim independent radio, kernel IPC or completed encryption.
-#![allow(dead_code)]
 extern crate alloc;
 use std::cell::RefCell;
 

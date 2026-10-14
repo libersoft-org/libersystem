@@ -19,6 +19,8 @@
 # The two selections are deliberately small and disjoint so the gate costs two short guests rather
 # than two full suites.
 set -uo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 # THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
 # EXIT trap, before the directory is removed - on failure too, which is when they matter.
 # shellcheck source=evidence.sh

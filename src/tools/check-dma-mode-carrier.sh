@@ -100,8 +100,15 @@ for gate in src/tools/check-*.sh; do
 	# A gate that INVOKES a runner - as a command, at the start of a line, after `env ...` or after
 	# the verdict tool's `--` - must state its mode. A gate that only mentions one in a message it
 	# prints, or reads the logs a run left behind, boots nothing and is not asked to.
-	if grep -vE '^\s*#' "$gate" | grep -vE '^\s*(echo|fail|die|note|printf|#)' | grep -qE '(^\s*|\s(env\s[^|]*\s)?|-- )(\./test\.sh|\./run\.sh|(src/)?harness/qemu-run\.sh)(\s|$)'; then
-		grep -q '^export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"' "$gate" || fail "$gate boots a guest and does not set LIBER_RUN_MODE=gate"
+	#
+	# THE SCRIPT IS READ WHOLE BEFORE IT IS SEARCHED, and the requirement is a fixed string. A pipeline ending in
+	# `grep -q` under pipefail answered by RACE - the reader that stopped at the first match broke the pipe under
+	# the one still writing, and a script was judged to boot nothing or something depending on which finished
+	# first - and the requirement, a basic regular expression with `${` in it, matched no script at all. Between
+	# them the rule had passed for months while twenty booting gates said no mode.
+	code="$(grep -vE '^\s*#' "$gate" | grep -vE '^\s*(echo|fail|die|note|printf|#)' || true)"
+	if grep -qE '(^\s*|\s(env\s[^|]*\s)?|-- )(\./test\.sh|\./run\.sh|(src/)?harness/qemu-run\.sh)(\s|$)' <<<"$code"; then
+		grep -qxF 'export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"' "$gate" || fail "$gate boots a guest and does not set LIBER_RUN_MODE=gate"
 	fi
 done
 echo "dma-mode-carrier: every entry point sets the run mode only when unset, every booting gate says gate, and the runner refuses an unset mode"

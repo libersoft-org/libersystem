@@ -227,6 +227,41 @@ fn fru_data_is_read_in_bounded_chunks() {
 	assert_eq!(bmc.received.iter().filter(|command| **command == (netfn::STORAGE, fru::READ_FRU_DATA)).count(), 4, "32 bytes at a time");
 }
 
+// A BMC WHOSE EVERY FRU READ ANSWERS `answer`, whatever was asked, for a device of `size` bytes.
+struct FruAnswering {
+	size: u16,
+	answer: Vec<u8>,
+}
+
+impl Bmc for FruAnswering {
+	fn ask(&mut self, request: &Request) -> Result<Response, Failure> {
+		let data = match (request.netfn, request.cmd) {
+			(netfn::STORAGE, fru::GET_FRU_INVENTORY_AREA_INFO) => vec![self.size as u8, (self.size >> 8) as u8, 0],
+			(netfn::STORAGE, fru::READ_FRU_DATA) => self.answer.clone(),
+			_ => return Ok(Response { cc: cc::INVALID_COMMAND, data: Vec::new() }),
+		};
+		Ok(Response { cc: 0, data })
+	}
+
+	fn now_ms(&mut self) -> u64 {
+		0
+	}
+
+	fn pause(&mut self) {}
+}
+
+// A FRU READ ANSWERED WITH MORE THAN WAS ASKED - or with nothing, or with a count its bytes do not fill - is malformed:
+// never a device longer than its size, and never a read that asks for the same bytes for ever.
+#[test]
+fn a_fru_read_answered_with_more_than_was_asked_or_with_nothing_is_malformed() {
+	let mut long = FruAnswering { size: 100, answer: [&[40u8][..], &[0xAA; 40][..]].concat() };
+	assert_eq!(fru_bytes(&mut long, 0), Err(Answer::Malformed), "forty bytes to a read of thirty-two");
+	let mut empty = FruAnswering { size: 100, answer: vec![0] };
+	assert_eq!(fru_bytes(&mut empty, 0), Err(Answer::Malformed), "no bytes is no progress");
+	let mut short = FruAnswering { size: 100, answer: vec![32, 1, 2] };
+	assert_eq!(fru_bytes(&mut short, 0), Err(Answer::Malformed), "a count its bytes do not fill");
+}
+
 #[test]
 fn an_answer_is_reduced_to_what_a_reader_reports() {
 	assert_eq!(answer_of(&Ok(Response { cc: cc::TIMEOUT, data: Vec::new() })), Answer::Unavailable);

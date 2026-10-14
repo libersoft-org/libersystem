@@ -48,6 +48,8 @@ fn encode_request(_: &proto::SuspendRequest) -> u64 { 0 }
 fn common_sleep_step(_: u64, _: &Bind, _: &proto::SuspendRequest, _: Option<&mut Serving>) -> Control { Control::Continue }
 fn resumed(_: u64, _: &Bind, _: bool) -> bool { true }
 fn clock() -> u64 { 0 }
+// The loop says why it ends before it returns; these regressions read what it returns.
+fn leaving(_: &[u8], _: u64) {}
 static QUEUED: Mutex<VecDeque<(Vec<u8>, u64)>> = Mutex::new(VecDeque::new());
 static SCHEDULED: Mutex<VecDeque<(Vec<u8>, u64)>> = Mutex::new(VecDeque::new());
 static CLOSED: Mutex<Vec<u64>> = Mutex::new(Vec::new());

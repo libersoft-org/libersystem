@@ -254,11 +254,13 @@ pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &
 // a machine may protect from this kernel altogether, is never read. Sorted by base.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn retained_map(pool: &[MemRegion], kernel: (u64, u64), holes: &[(Hole, u32)]) -> alloc::vec::Vec<MemRegion> {
+	// ALLOC-OK: BOOT-ONLY: `retained_map` is called once, from the aarch64 and riscv64 boot paths, before any task exists.
 	let mut out: alloc::vec::Vec<MemRegion> = pool.iter().filter(|region| region.length != 0).copied().collect();
 	let candidates = core::iter::once((Hole { start: kernel.0, end: kernel.1 }, bootproto::MEM_KERNEL)).chain(holes.iter().copied());
 	for (hole, kind) in candidates {
 		let (mut start, end) = (hole.start & !(PAGE - 1), (hole.end + PAGE - 1) & !(PAGE - 1));
 		// WHAT EARLIER RANGES DO NOT HOLD: walked in order, each overlap skipping the start past it or splitting the range.
+		// ALLOC-OK: the same boot-only map.
 		let mut taken: alloc::vec::Vec<(u64, u64)> = out.iter().map(|region| (region.base, region.base + region.length)).collect();
 		taken.sort_unstable();
 		for (base, top) in taken {
@@ -269,11 +271,13 @@ pub fn retained_map(pool: &[MemRegion], kernel: (u64, u64), holes: &[(Hole, u32)
 				continue;
 			}
 			if base > start {
+				// ALLOC-OK: the same boot-only map.
 				out.push(MemRegion { base: start, length: base - start, kind, _pad: 0 });
 			}
 			start = start.max(top);
 		}
 		if start < end {
+			// ALLOC-OK: the same boot-only map.
 			out.push(MemRegion { base: start, length: end - start, kind, _pad: 0 });
 		}
 	}

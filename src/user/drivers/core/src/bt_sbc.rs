@@ -340,4 +340,24 @@ mod tests {
 		frame[5] ^= 1;
 		assert!(!super::hear(&frame[..83]).unwrap().crc_good, "a scale factor changed fails the CRC");
 	}
+
+	// WHAT IS NOT A FRAME IS NOT HEARD: a sync word that is neither SBC's nor mSBC's, a frame shorter than its header or
+	// cut short of the length its header says, and a header changed under its CRC - refused or caught, and never a panic.
+	// The CRC covers the header from its second byte, so nothing but the sync check refuses a wrong first one.
+	#[test]
+	fn what_is_not_a_frame_is_not_heard() {
+		let mut frame = [0u8; 128];
+		let mut phase = 0;
+		let length = super::tone_frame(2, 12, &mut phase, &mut frame);
+		assert!(super::hear(&frame[..length]).is_some_and(|heard| heard.crc_good));
+		let mut unsynced = frame;
+		unsynced[0] = 0x9d;
+		assert!(super::hear(&unsynced[..length]).is_none(), "an unknown sync word");
+		for cut in [0, 1, 3, 4, 12, length - 1] {
+			assert!(super::hear(&frame[..cut]).is_none(), "cut to {cut} of {length} bytes");
+		}
+		let mut changed = frame;
+		changed[1] ^= 0x02;
+		assert!(super::hear(&changed[..length]).is_none_or(|heard| !heard.crc_good), "the header is under the CRC");
+	}
 }

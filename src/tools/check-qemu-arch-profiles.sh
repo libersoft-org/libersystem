@@ -18,6 +18,8 @@
 # aarch64 and riscv64 are emulated on an x86_64 host, so this is minutes rather than seconds. It is
 # separate from `arch-surface` for that reason: that one is a static scan and belongs in every run.
 set -euo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 # THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
 # EXIT trap, before the directory is removed - on failure too, which is when they matter.
 # shellcheck source=evidence.sh

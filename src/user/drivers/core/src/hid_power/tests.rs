@@ -229,3 +229,21 @@ fn outlets_are_counted_by_their_own_collection() {
 	assert_eq!((map.outlets[0].bit_offset, map.outlets[1].bit_offset), (0, 8));
 	assert_eq!((map.outlets[0].occurrence, map.outlets[1].occurrence), (0, 1));
 }
+
+#[test]
+fn a_report_the_device_cut_short_reads_as_absent_and_not_as_zero() {
+	// A BODY SHORTER THAN ITS FIELDS is the device's answer, and the bits past its end are not zero - they are not there.
+	// Read as zero, an input report cut after its flags says the battery is empty with no run time left, which is the
+	// reading a UPS monitor shuts a machine down for.
+	let table = fields(UPS_DESCRIPTOR).unwrap();
+	let map = map(&table).unwrap();
+	let mut cut = reports(0b0_0011, 80, 3600);
+	cut[0].body.truncate(1);
+	cut[1].body.truncate(5);
+	let ups = decode(&map, &cut);
+	assert_eq!((ups.status.ac_present, ups.status.charging), (Some(true), Some(true)), "the flags that arrived are read");
+	assert!(ups.remaining_capacity.is_none() && ups.run_time_to_empty.is_none(), "the capacity and the run time past the cut are not known");
+	assert!(ups.design_capacity.is_some() && ups.voltage.is_none(), "a feature report a byte short loses only the field that byte held");
+	cut[0].body.clear();
+	assert_eq!(decode(&map, &cut).status.ac_present, None, "and an empty body holds no flag at all");
+}

@@ -29,6 +29,14 @@ PROMPT = b"vol://system> "
 # keeps a prompt printed during boot from being mistaken for readiness.
 READY = b"shell attached"
 
+# HOW LONG THE PROMPT MUST HAVE BEEN THERE BEFORE A LINE IS TYPED. The shell prints its prompt a moment
+# before the console hands its input back to the line editor, and a line typed the instant the prompt
+# appears can arrive split: its first character went to whatever held the input a moment earlier, and
+# the rest reached the shell as a command nobody typed (`h` / `ttpd &` -> "unknown command"). Half a
+# second of quiet after the prompt is far longer than that hand-back and far shorter than any line's
+# budget.
+SETTLE_SECONDS = 0.5
+
 
 def connect(path, deadline):
 	"""Keep trying until QEMU has created the socket, or the deadline passes."""
@@ -72,7 +80,9 @@ def main():
 	seen = bytearray()
 	sent = 0
 	ready = False
-	client.settimeout(0.5)
+	prompt_at = None
+	prompt_first = 0.0
+	client.settimeout(0.1)
 	with open(arguments.log, "wb") as log:
 		while time.monotonic() < deadline:
 			try:
@@ -104,6 +114,16 @@ def main():
 				# Everything was typed; keep recording until the deadline so a late line is captured.
 				continue
 			if PROMPT in seen:
+				# Output after the prompt restarts the wait - the shell is still talking - but never past
+				# four settles, so a console that logs without pause is still typed into.
+				now = time.monotonic()
+				if prompt_at is None:
+					prompt_at, prompt_first = now, now
+				elif chunk:
+					prompt_at = now
+				if now - prompt_at < SETTLE_SECONDS and now - prompt_first < 4 * SETTLE_SECONDS:
+					continue
+				prompt_at = None
 				seen.clear()
 				client.sendall(commands[sent].encode() + b"\n")
 				log.write(b"\n# guest-console sent: " + commands[sent].encode() + b"\n")

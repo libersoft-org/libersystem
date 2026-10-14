@@ -134,14 +134,12 @@ pub fn take_events(out: &mut dyn FnMut(u8, u16)) {
 // THE WIRED LINES THE KERNEL USES, which no namespace device's `_CRS` may name: the timer's (IRQ 0 and the GSI 2 an
 // override routes it to) and the SCI's. A kernel-held console's line is the kernel-held row's own.
 pub fn kernel_lines() -> ([u32; 3], usize) {
-	#[allow(unused_mut)]
-	let (mut lines, mut count) = ([0u32, 2, 0], 2);
+	// THE SCI'S LINE ONLY WHERE THERE IS AN SCI: a host test has no FADT, and the two fixed lines are the answer there.
 	#[cfg(not(test))]
 	if let Some(sci) = super::sci::sci_line() {
-		lines[2] = sci;
-		count = 3;
+		return ([0, 2, sci], 3);
 	}
-	(lines, count)
+	([0, 2, 0], 2)
 }
 
 // THE CONFIGURATION REGISTERS THE KERNEL'S CHIPSET ROWS OWN, by (vendor, device): q35's MCH PCIEXBAR - the ECAM base -

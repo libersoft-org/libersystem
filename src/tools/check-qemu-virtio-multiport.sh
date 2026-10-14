@@ -21,6 +21,8 @@
 # the profile inherits the harness's timeouts, log collection and staleness checks instead of a
 # second copy of all three that can drift from them.
 set -euo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

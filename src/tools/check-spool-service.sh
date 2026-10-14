@@ -20,6 +20,8 @@
 #                              no spool authority
 
 set -euo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
 export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 

@@ -270,6 +270,20 @@ fn a_decoder_refuses_a_bandwidth_or_lastnz_past_the_rate() {
 	assert!(read(&bytes, 48_000, 10_000).is_err());
 }
 
+// LASTNZ PAST THE RATE'S LINES AND INSIDE THE SPECTRUM'S: at 16 kHz the seven lastnz bits reach 256, past the 160 lines
+// the rate codes and short of the 400 a frame holds. A frame of nothing reads its zero 2-tuples on past 160 without
+// meeting any other bit error, so the rate's own bound is the only thing that refuses it.
+#[test]
+fn a_lastnz_past_the_rates_lines_is_refused_where_the_spectrum_has_room_for_it() {
+	let mut bytes = [0u8; 40];
+	let frame = Frame { bandwidth: 1, lastnz: 160, ..Frame::empty() };
+	write_frame(&frame, 16_000, 10_000, &mut bytes).unwrap();
+	assert_eq!(read_frame(&bytes, 16_000, 10_000).map(|frame| frame.lastnz), Ok(160));
+	// The last byte: one bandwidth bit, then seven of lastnz - all ones is 256.
+	bytes[39] |= 0xfe;
+	assert!(read_frame(&bytes, 16_000, 10_000).is_err());
+}
+
 // THE SNS JOINT INDEX'S CHECKS: the largest index each demultiplexing accepts, and the next one refused.
 #[test]
 fn a_decoder_refuses_an_sns_index_past_the_codebooks() {

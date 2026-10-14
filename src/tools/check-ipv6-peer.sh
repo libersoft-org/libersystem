@@ -40,11 +40,26 @@
 # because either alone can be satisfied by an implementation that is wrong in the other.
 
 set -euo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"; [[ -n "${peer_pid:-}" ]] && kill "$peer_pid" 2>/dev/null || true' EXIT
+# A FAILED RUN KEEPS ITS ROWS. Every row's capture, guest console, peer and runner log is copied to
+# `.build/logs/ipv6-peer/` before the work directory goes: the rows that fail are the ones that pass when run
+# alone, and a failure nobody can read again has to be waited for again.
+keep_rows() {
+	local status=$?
+	if ((status != 0)); then
+		rm -rf .build/logs/ipv6-peer
+		mkdir -p .build/logs
+		cp -a "$work" .build/logs/ipv6-peer 2>/dev/null || true
+	fi
+	rm -rf "$work"
+	[[ -n "${peer_pid:-}" ]] && kill "$peer_pid" 2>/dev/null || true
+}
+trap keep_rows EXIT
 
 # A FAILURE PRINTS THE EVIDENCE IT JUDGED. A gate over a captured conversation that says only "not
 # found" leaves the next person to reproduce the whole run before they can see what was there.

@@ -1,7 +1,6 @@
 // Exact production receiver and protocol code is inserted by bluetooth_opp_disconnect.py.
 // Only IPC delivery, link lookup, policy refresh and the L2CAP frame carrier are modeled.
 // No guest/kernel/Bumble/RF outcome is invented by these in-memory boundaries.
-#![allow(dead_code)]
 extern crate alloc;
 use std::cell::RefCell;
 use std::collections::VecDeque;

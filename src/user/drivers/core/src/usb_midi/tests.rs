@@ -347,3 +347,11 @@ fn what_goes_out_decodes_back_to_what_was_sent() {
 		assert_eq!(got.message.is_some(), want.message.is_some());
 	}
 }
+
+#[test]
+fn the_cable_one_past_the_endpoint_s_count_is_not_attributable() {
+	// CABLES ARE NUMBERED FROM ZERO, so an endpoint with two has no cable 2 - the first one a bound checked with `>` lets in.
+	let mut decoder = Decoder::new(2);
+	assert_eq!(decode(&mut decoder, &[[0x29, 0x90, 0x3c, 0x64]], 0), alloc::vec![Output::Fault { cable: None, code: FaultCode::Cable }]);
+	assert_eq!(chunk(&decode(&mut decoder, &[[0x19, 0x90, 0x3c, 0x64]], 0)[0]).cable, 1, "and the last it has is cable 1");
+}

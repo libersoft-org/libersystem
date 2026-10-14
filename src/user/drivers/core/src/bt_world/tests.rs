@@ -206,3 +206,22 @@ fn the_object_push_server_takes_an_object() {
 	assert_eq!(opp::note(64).len(), 64);
 	assert!(opp::note(64).starts_with(b"line 00001 of the phone's note\n"));
 }
+
+// A HOST'S L2CAP THAT DOES NOT ADD UP IS DROPPED WHOLE: fragments that run past the length the basic header gave, and a
+// signalling command whose own length runs past the PDU, are answered with nothing but the buffer they used - and the
+// next well-formed request is answered as if they had never come.
+#[test]
+fn l2cap_that_does_not_add_up_is_dropped_and_the_next_request_answered() {
+	let mut world = World::new(7);
+	let handle = world.new_link(0);
+	let answered = |out: &[Out]| out.iter().any(|out| matches!(out, Out::Acl(_)));
+	// A connection request for SDP from source channel 0x0040, in a basic header.
+	let request = [8u8, 0, 1, 0, 0x02, 1, 4, 0, 0x01, 0x00, 0x40, 0x00];
+	// THE CONTINUATION RUNS THREE BYTES PAST THE TWELVE THE HEADER SAID.
+	assert!(!answered(&world.acl(handle, 0b10, &request[..10]).unwrap()));
+	assert!(!answered(&world.acl(handle, 0b01, &[0x40, 0x00, 0xde, 0xad, 0xbe]).unwrap()), "a PDU past its own length");
+	// A first fragment too short to say its length, and a command claiming more than the PDU carries.
+	assert!(!answered(&world.acl(handle, 0b10, &[8]).unwrap()));
+	assert!(!answered(&world.acl(handle, 0b10, &[8, 0, 1, 0, 0x02, 1, 0x40, 0, 0x01, 0x00, 0x40, 0x00]).unwrap()), "a command past its PDU");
+	assert!(answered(&world.acl(handle, 0b10, &request).unwrap()), "and the next whole request is answered");
+}

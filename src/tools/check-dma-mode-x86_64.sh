@@ -29,6 +29,8 @@
 # image and the degraded image itself, and puts the tree back the way an enforcing `./image.sh`
 # leaves it, so the gates that check the shipping image's freshness are not disturbed.
 set -euo pipefail
+# It starts a runner itself, so it states the mode a gate runs in (check.sh does too, for a direct run).
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 # THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
 # EXIT trap, before the directory is removed - on failure too, which is when they matter.
 # shellcheck source=evidence.sh

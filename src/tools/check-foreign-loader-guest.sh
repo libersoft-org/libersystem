@@ -45,6 +45,11 @@ source "$root/tools/guest-gate.sh"
 fail() { guest_gate_fail "$@"; }
 
 guest_gate_arch "$@"
+# THE QUARANTINE ARTIFACT IS STAGED ONLY IN A DEVELOPMENT IMAGE, so this gate builds one rather than inheriting
+# whatever the last build was - on x86_64 its own medium, built before the staging is checked, and the shipping
+# staging rebuilt after it (`guest_gate_development`).
+guest_gate_development
+guest_gate_prepare_image
 guest_gate_require_quarantine vkprobe
 
 staged="$root/../.build/image/$(guest_gate_triple)/libexec/vkprobe"
