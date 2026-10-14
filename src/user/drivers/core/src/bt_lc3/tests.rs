@@ -1,4 +1,3 @@
-use super::vectors::{DECODED, ENCODED};
 use super::*;
 
 const RATES: [u32; 6] = [8_000, 16_000, 24_000, 32_000, 44_100, 48_000];
@@ -6,138 +5,6 @@ const SIZES: [usize; 9] = [20, 26, 30, 40, 60, 100, 120, 155, 400];
 
 fn lines_of(sample_rate: u32) -> usize {
 	geometry(sample_rate, 10_000, 40).unwrap().ne
-}
-
-// The spectrum as long as the frame codes it, from a vector's own length.
-fn spectrum_of(frame: &Frame, lines: usize) -> &[i32] {
-	&frame.spectrum[..lines]
-}
-
-// ------------------------------------------------------------------ Appendix C
-
-// THE SPECIFICATION'S DECODER, FRAME BY FRAME: every value Appendix C prints after reading its four bitstreams - the
-// side information, the TNS orders and coefficient indices the arithmetic decoder found, the residual bits, the zero
-// frame flag, the whole quantized spectrum and the noise filling seed taken from it.
-#[test]
-fn the_appendix_bitstreams_read_as_its_decoder_read_them() {
-	for (encoded, decoded) in ENCODED.iter().zip(DECODED.iter()) {
-		assert_eq!(encoded.frame_us, decoded.frame_us);
-		let frame = read_frame(encoded.bytes, 16_000, decoded.frame_us).expect("the appendix's frame reads");
-		assert_eq!(frame.bandwidth, decoded.bandwidth);
-		assert_eq!(frame.lastnz, decoded.lastnz);
-		assert_eq!(frame.lsb_mode, decoded.lsb_mode);
-		assert_eq!(frame.global_gain, decoded.global_gain);
-		assert_eq!(if frame.bandwidth < 3 { 1 } else { 2 }, decoded.num_tns_filters);
-		assert_eq!(frame.tns_order.map(|order| u8::from(order > 0)), decoded.tns_active);
-		assert_eq!(frame.tns_order, decoded.tns_order);
-		assert_eq!(frame.tns_index, decoded.tns_index);
-		assert_eq!(geometry(16_000, decoded.frame_us, encoded.bytes.len()).unwrap().tns_lpc_weighting, usize::from(decoded.tns_lpc_weighting));
-		assert_eq!(frame.pitch.is_some(), decoded.pitch_present);
-		assert_eq!(frame.pitch.map_or(0, |pitch| pitch.index), decoded.pitch_index);
-		assert_eq!(frame.pitch.is_some_and(|pitch| pitch.ltpf_active), decoded.ltpf_active);
-		assert_eq!(frame.noise, decoded.noise);
-		assert_eq!(frame.sns.ind_lf, decoded.ind_lf);
-		assert_eq!(frame.sns.ind_hf, decoded.ind_hf);
-		assert_eq!(frame.sns.shape >> 1, decoded.submode_msb);
-		assert_eq!(frame.sns.gain, decoded.gind);
-		assert_eq!(frame.sns.ls_a, decoded.ls_a);
-		assert_eq!(frame.sns.idx_a, decoded.idx_a);
-		if let Some(lsb) = decoded.submode_lsb {
-			assert_eq!(frame.sns.shape & 1, lsb);
-		}
-		if let Some(shape) = decoded.shape {
-			assert_eq!(frame.sns.shape, shape);
-		}
-		if let Some(ls_b) = decoded.ls_b {
-			assert_eq!(frame.sns.ls_b, ls_b);
-		}
-		if let Some(idx_b) = decoded.idx_b {
-			assert_eq!(frame.sns.idx_b, idx_b);
-		}
-		assert_eq!(frame.room, decoded.nbits_residual);
-		let residual: Vec<u8> = frame.residual[..usize::from(frame.residual_len)].iter().map(|&bit| u8::from(bit)).collect();
-		assert_eq!(residual, decoded.residual);
-		let zero_frame = frame.lastnz == 2 && frame.spectrum[0] == 0 && frame.spectrum[1] == 0 && frame.global_gain == 0 && frame.noise == 7;
-		assert_eq!(zero_frame, decoded.zero_frame);
-		assert_eq!(spectrum_of(&frame, decoded.spectrum.len()), decoded.spectrum);
-		assert!(frame.spectrum[decoded.spectrum.len()..].iter().all(|&value| value == 0));
-		let seed = frame.spectrum.iter().enumerate().map(|(k, value)| value.unsigned_abs() * k as u32).sum::<u32>() & 0xffff;
-		assert_eq!(seed, decoded.nf_seed);
-	}
-}
-
-// THE SPECIFICATION'S ENCODER, FRAME BY FRAME: what it put into each bitstream - after its global gain adjustment and
-// requantization where it made them - is what the reader finds there, the whole quantized spectrum included.
-#[test]
-fn the_appendix_bitstreams_carry_what_its_encoder_put_in() {
-	for encoded in ENCODED.iter() {
-		let frame = read_frame(encoded.bytes, 16_000, encoded.frame_us).expect("the appendix's frame reads");
-		assert_eq!(frame.bandwidth, encoded.bandwidth);
-		assert_eq!(frame.global_gain, encoded.global_gain);
-		assert_eq!(frame.lastnz, encoded.lastnz);
-		assert_eq!(frame.lsb_mode, encoded.lsb_mode);
-		assert_eq!(frame.tns_order, encoded.tns_order);
-		for f in 0..2 {
-			let order = usize::from(encoded.tns_order[f]);
-			assert_eq!(frame.tns_index[f][..order], encoded.tns_index[f][..order]);
-		}
-		assert_eq!(frame.pitch.is_some(), encoded.pitch_present);
-		if let Some(pitch) = frame.pitch {
-			assert_eq!(pitch.ltpf_active, encoded.ltpf_active);
-			assert_eq!(pitch.index, encoded.pitch_index);
-		}
-		assert_eq!((frame.sns.ind_lf, frame.sns.ind_hf), (encoded.ind_lf, encoded.ind_hf));
-		assert_eq!(frame.sns.shape >> 1, encoded.submode_msb);
-		assert_eq!(frame.sns.gain, encoded.gind);
-		assert_eq!((frame.sns.ls_a, frame.sns.idx_a), (encoded.ls_a, encoded.idx_a));
-		assert!(encoded.ls_b.is_none_or(|ls_b| ls_b == frame.sns.ls_b));
-		assert!(encoded.idx_b.is_none_or(|idx_b| idx_b == frame.sns.idx_b));
-		assert!(encoded.shape.is_none_or(|shape| shape == frame.sns.shape));
-		assert_eq!(frame.noise, encoded.noise);
-		assert_eq!(spectrum_of(&frame, encoded.spectrum.len()), encoded.spectrum);
-		// The encoder had more residual bits than the frame had room for: the frame carries the first of them.
-		let carried: Vec<u8> = frame.residual[..usize::from(frame.residual_len)].iter().map(|&bit| u8::from(bit)).collect();
-		assert_eq!(carried[..], encoded.residual[..carried.len()]);
-		assert_eq!(usize::from(frame.room).min(encoded.residual.len()), carried.len());
-		if encoded.frame_us == 10_000 {
-			let loudest = (0..encoded.spectrum.len()).fold(None::<usize>, |best, k| match best {
-				Some(top) if encoded.spectrum[top].unsigned_abs() >= encoded.spectrum[k].unsigned_abs() => Some(top),
-				_ if encoded.spectrum[k] != 0 => Some(k),
-				other => other,
-			});
-			let info = read(encoded.bytes, 16_000, 10_000).unwrap();
-			assert_eq!(info, FrameInfo { bandwidth: encoded.bandwidth, lastnz: encoded.lastnz, global_gain: encoded.global_gain, loudest: loudest.map(|k| k as u16) });
-		}
-	}
-}
-
-// AND WRITTEN BACK, BYTE FOR BYTE: the encoder's values laid out by `write_frame` are the appendix's bitstreams. The
-// appendix prints no LS_indB for its 10 ms frames, nor their shape (regular: the submode bit is 0 and there is an idxB);
-// the sign alone is taken from the frame as read.
-#[test]
-fn the_appendix_bitstreams_are_written_byte_for_byte() {
-	for encoded in ENCODED.iter() {
-		let read_back = read_frame(encoded.bytes, 16_000, encoded.frame_us).unwrap();
-		let mut frame = Frame::empty();
-		frame.bandwidth = encoded.bandwidth;
-		frame.lastnz = encoded.lastnz;
-		frame.lsb_mode = encoded.lsb_mode;
-		frame.global_gain = encoded.global_gain;
-		frame.tns_order = encoded.tns_order;
-		frame.tns_index = encoded.tns_index;
-		frame.pitch = encoded.pitch_present.then_some(Pitch { ltpf_active: encoded.ltpf_active, index: encoded.pitch_index });
-		assert!(encoded.shape.is_some() || (encoded.submode_msb == 0 && encoded.idx_b.is_some()));
-		frame.sns = Sns { ind_lf: encoded.ind_lf, ind_hf: encoded.ind_hf, shape: encoded.shape.unwrap_or(0), gain: encoded.gind, ls_a: encoded.ls_a, idx_a: encoded.idx_a, ls_b: encoded.ls_b.unwrap_or(read_back.sns.ls_b), idx_b: encoded.idx_b.unwrap_or(0) };
-		frame.noise = encoded.noise;
-		frame.spectrum[..encoded.spectrum.len()].copy_from_slice(encoded.spectrum);
-		for (bit, &value) in frame.residual.iter_mut().zip(encoded.residual) {
-			*bit = value == 1;
-		}
-		frame.residual_len = encoded.residual.len() as u16;
-		let mut out = vec![0xa5u8; encoded.bytes.len()];
-		write_frame(&frame, 16_000, encoded.frame_us, &mut out).expect("the appendix's frame writes");
-		assert_eq!(out, encoded.bytes);
-	}
 }
 
 // ------------------------------------------------------------------ the tone
@@ -330,7 +197,7 @@ fn a_decoder_refuses_an_sns_index_past_the_codebooks() {
 // there is rightly invisible.)
 #[test]
 fn a_flipped_bit_is_usually_noticed() {
-	let mut frames: Vec<(Vec<u8>, u32, u32)> = ENCODED.iter().map(|encoded| (encoded.bytes.to_vec(), 16_000, encoded.frame_us)).collect();
+	let mut frames: Vec<(Vec<u8>, u32, u32)> = Vec::new();
 	for (rate, size, line) in [(8_000, 20, 5), (16_000, 40, 37), (24_000, 60, 200), (32_000, 100, 1), (48_000, 155, 399), (48_000, 400, 120)] {
 		frames.push((tone(line, rate, size), rate, 10_000));
 	}

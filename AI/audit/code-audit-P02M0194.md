@@ -1622,3 +1622,14 @@ Continuation of the entry above: the restart failure's cause found and fixed, an
 7. Items ticked in docs/todo/P02M0194.md: `btctl` and THE ORACLE; no unchecked item remains, and the TODO.md row is marked COMPLETE (2026-10-12). `./check.sh --gate milestone-index` PASS.
 
 Not run for this milestone: the ports' cross-builds of the changed services happen in the end-of-job port builds (recorded under P02M0099); no port guest runs Bluetooth by design ("the ports cross-build the stack and do not run it").
+
+
+## IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0194 (2026-10-14 17:14:21 UTC):
+
+SPECIFICATION TEXT REMOVED FROM THE TREE, on the owner's decision of 2026-10-14 (the repository is public and the LC3 specification's text is the Bluetooth SIG's work; the codecs themselves are this project's own code, written from the specifications, and stay; no logo, no SIG registration, no qualification claim).
+- `src/user/services/logic/src/lc3/appendix_c.txt` (237 KB, Appendix C's reference data) deleted, with the eight tests that read it (`appendix_c_encoder_frames`, `appendix_c_decoder_output`, `appendix_c_encoder_stages`, `appendix_c_sns_outlier_shape`, `appendix_c_attack_detector`, `appendix_c_decoder_stages`, `appendix_c_tns_two_filters`, `appendix_c_ltpf_transitions`), the record parsers and `assert_close`, and the three `#[cfg(test)]` accessors only they used (`LtpfEncoder::delayed`, `LtpfDecoder::with_history`, `LtpfDecoder::coefficients`). LC3 tests: 27 PASS (one ignored measurement, as before).
+- `src/user/drivers/core/src/bt_lc3/vectors.rs` (14 KB, the fixture's copy of the appendix's four frames) deleted, with the three tests that compared against it; `a_flipped_bit_is_usually_noticed` now flips bits in frames the fixture writes itself; the unused `spectrum_of` removed. Drivers host suite: 578 PASS. The fixture's 7.5 ms path stays, covered by `random_frames_round_trip` and `arbitrary_bytes_are_read_or_refused`.
+- Kept, and said so in the comments: `lc3/tables.rs`, the codec's normative constants - an implementation cannot work without them, and every implementation (liblc3 among them) carries them.
+- Conformance after the removal: `./check.sh --gate bluetooth-codecs` PASS (33 s) - SBC/mSBC 769 configurations, 49,216 cross-decoded frames; LC3 12 configurations, 11,448 frames, maximum normalized difference 0.00045776, worst RMS -107.88 dB.
+- Comments corrected in `lc3.rs`, `lc3/tables.rs`, `lc3/tests.rs` and `bt_lc3.rs`; the milestone's LC3 item carries the removal. The deleted files remain in the repository's history (commit bb04e770); removing them from it would mean rewriting published history, which is the owner's to decide.
+- A SLIP, reported to the owner: the first deletion was made with `git rm --cached`, which staged it in the index; the instructions are never to touch git state. The staged change is the same one the owner's commit would record.

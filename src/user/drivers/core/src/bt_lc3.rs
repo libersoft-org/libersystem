@@ -8,9 +8,10 @@
 //
 // What it covers is the specification's bitstream and nothing past it: Section 3.4.2's reading of the side information,
 // the TNS data and the spectrum's 2-tuples through the arithmetic decoder, the residual and LSB-mode bits, and every bit
-// error check that section names; and Section 3.3.13's writing of the same, byte for byte - Appendix C's encoded
-// frames come out of `write_frame` identical. The SNS indices are read and written, never dequantized; no noise filling,
-// TNS or SNS synthesis, no inverse MDCT and no long-term postfilter.
+// error check that section names; and Section 3.3.13's writing of the same - what `write_frame` writes, `read_frame`
+// reads back as the same frame. The SNS indices are read and written, never dequantized; no noise filling, TNS or SNS
+// synthesis, no inverse MDCT and no long-term postfilter. (The specification's Appendix C frames these were once held
+// to were removed on 2026-10-14: they were the specification's text, and this repository is public.)
 
 mod tables;
 
@@ -128,7 +129,7 @@ struct Geometry {
 	tns_lpc_weighting: usize,
 }
 
-// 7.5 ms frames are here for Appendix C, whose verification frames include two; `read` and `write_tone` take 10 ms.
+// `read_frame` and `write_frame` take 7.5 ms frames as well; `read` and `write_tone`, which the fixture streams use, take 10 ms.
 fn geometry(sample_rate: u32, frame_us: u32, nbytes: usize) -> Result<Geometry, &'static str> {
 	let fs_ind = match sample_rate {
 		8_000 => 0,
@@ -858,6 +859,3 @@ fn exp2(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod vectors;
