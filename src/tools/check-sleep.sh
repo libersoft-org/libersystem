@@ -20,7 +20,8 @@
 #      firmware's fallback to Startup(CLEAR) would have extended an error separator into each - PCRs 16 and 23, extended
 #      before it, zero after it - a Shutdown(STATE) saves 0 to 15 - and a secret sealed to PCR 4 before it unsealing.
 #   3. S3, woken by the RTC alarm `sleepctl` arms: `suspended`, then `running` with no host wake at all - QEMU wakes a
-#      suspended guest on the RTC only with RTC_EN set, so this proves the kernel's arming too - and the wake named.
+#      suspended guest on the RTC only with RTC_EN set, so this proves the kernel's arming too - and the wake named. Then
+#      S3 woken by a wake scheduled with `sleepctl wake-at`, spent by the sleep it woke.
 #   AFTER EVERY WAKE: the network answers a ping, a file written before the sleep reads back, a frame reaches the
 #   display (the screen changes for a line typed on the emulated keyboard), a line typed at the serial console is
 #   answered, the wall clock is within two seconds of the host's, and a wait armed after the resume completes on time.
@@ -30,7 +31,7 @@
 #      at its next value.
 #   6. A driver made to refuse - the sleep gate's fixture, an `ivshmem-plain` function hot-plugged into the empty port and
 #      so the last binding and the first suspended - aborts the suspend: unwound at the drivers' step, the binding named,
-#      the system running.
+#      the system running, and the system graph's `sleep` node failed with the same step and binding.
 #   7. A PERSON'S SHUTDOWN DURING A SLEEP THAT WOULD OTHERWISE SUCCEED: the fixture holds the drivers' step, `shutdown` is
 #      typed at the serial shell, and once ServiceManager says it took the orderly sequence the fixture is released - no
 #      `sleep: entered`, the unwind naming the sequence and its door, the power verb after it, and QEMU's exit.
@@ -89,6 +90,9 @@ command -v swtpm >/dev/null || fail "swtpm is not installed - setup.sh installs 
 IDLE_WAKE_S=5
 IDLE_MARGIN_MS=300
 RTC_WAKE_S=8
+# How far ahead the scheduled wake is set: past the whole suspend sequence, which runs between the scheduling and the
+# sleep, so the alarm is still ahead when the platform is armed.
+SCHEDULED_WAKE_S=20
 
 state="$(mktemp -d "${TMPDIR:-/tmp}/liber-sleep.XXXXXX")"
 export LIBER_DEV_STATE="$state"
@@ -561,6 +565,23 @@ tail -n +"$((baseline_lines + 1))" "$serial" | grep -a -q "sleep: resumed (the R
 say "suspend to RAM - woken by the RTC alarm the kernel armed, with no host wake"
 after_wake rtc
 
+# 3b. S3, WOKEN BY THE SCHEDULED WAKE: `sleepctl wake-at` on its own `sleep-wake` grant, then a suspend with no timed wake
+#     of its own - the platform alarm armed for the scheduled time, no host wake, and the scheduled wake spent once.
+baseline_lines=$(wc -l <"$serial")
+ended=$(seen "ServiceManager: sleep: the transaction ended")
+out="$(launch sleepctl wake-at "$SCHEDULED_WAKE_S")" || true
+grep -q "sleepctl: a wake is scheduled at" <<<"$out" || fail "the scheduled wake was not taken: $out"
+launch sleepctl suspend ram >"$state/sleepctl-scheduled.log" 2>&1 &
+await_state suspended 60 "suspend to RAM with a scheduled wake"
+await_state running $((SCHEDULED_WAKE_S + 20)) "suspend to RAM with a scheduled wake, with no host wake"
+await_end "$ended" "suspend to RAM with a scheduled wake"
+after="$(tail -n +"$((baseline_lines + 1))" "$serial")"
+grep -a -q "sleep: resumed (the RTC alarm" <<<"$after" || fail "suspend to RAM: the scheduled wake was not the RTC alarm"
+grep -a -q "the scheduled wake at [0-9]* is spent" <<<"$after" || fail "suspend to RAM: the scheduled wake was not spent"
+out="$(launch sleepctl status)" || true
+grep -q "scheduled wake: none" <<<"$out" || fail "the scheduled wake is still there after the sleep it woke: $out"
+say "suspend to RAM - woken by the wake sleepctl scheduled, with no host wake, and the scheduled wake spent"
+
 # 5. A STOPPED JOB ACROSS A SLEEP: Ctrl+Z at the serial shell before it, still stopped after the thaw, `fg` resuming it at
 #    its next value. THE JOB IS STARTED IN THE BACKGROUND AND BROUGHT TO THE FOREGROUND: a governed tool typed without `&`
 #    runs to completion inside the line, with no job to stop, and only a job the shell tracks is handed to the terminal
@@ -631,7 +652,14 @@ grep -q "sleep_fixture\|01:00.0" <<<"$refused" || fail "the refusal did not name
 tail -n +"$((baseline_lines + 1))" "$serial" | grep -a -q "sleep: entered" && fail "a refused suspend entered the sleep anyway"
 out="$(launch uname)" || true
 grep -q "LiberSystem" <<<"$out" || fail "the system is not running after the refused suspend"
-say "a driver's refusal unwound the suspend, named: $refused"
+# AND THE SYSTEM GRAPH SAYS IT: a failed `sleep` node naming the step and the binding, beside the log line above.
+graphed=$(seen "{name=sleep, type=service, state=failed")
+type_serial "graph sleep" || fail "the serial console took no input"
+await_line "{name=sleep, type=service, state=failed" "the system graph did not show the refused suspend as a failed node" "$graphed" 30
+node="$(grep -a "{name=sleep, type=service, state=failed" "$serial" | tail -n 1)"
+grep -q "unwound at Drivers" <<<"$node" || fail "the graph's sleep node does not name the drivers' step: $node"
+grep -q "sleep_fixture\|01:00.0" <<<"$node" || fail "the graph's sleep node does not name the fixture's binding: $node"
+say "a driver's refusal unwound the suspend, named: $refused - and the system graph shows it: $node"
 
 # 7. A PERSON'S SHUTDOWN DURING A SLEEP THAT WOULD OTHERWISE SUCCEED. The fixture holds its answer; `sleepctl` runs in the
 #    background at the serial shell, so the shell is back at its prompt; `shutdown` is typed once the fixture says it

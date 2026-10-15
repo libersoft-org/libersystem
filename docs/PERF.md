@@ -1427,6 +1427,74 @@ freeze rather than a side effect of this one.
 `vector-stress` is still within five per cent of its budget, as it has been in every run since the freeze (63.3 to
 64.1 ms in four whole verifications). Its time is the rasteriser and the gradient, which neither change touches.
 
+## Filters across tile boundaries, and what UI-effects costs drawn right (2026-10-15)
+
+THE NUMBERS ABOVE WERE MEASURED ON A REPLAY THAT DREW EVERY FILTERED LAYER WRONG AT EVERY TILE BOUNDARY. soft2d computed
+each spatial filter one 64-pixel tile at a time: a draw inside a filtered layer was clipped to the bare tile, a command
+was binned by its own bounds and not by where its filter reaches, and a top-level backdrop read the tile's working copy,
+which is transparent past the tile. So a blur, a shadow, an offset and a backdrop blurred against nothing at every tile
+edge - in `UI-effects` too, whose first-row cards lost their shadows below y = 192 and whose frosted panel had seams at
+x = 128, 192, ... and y = 192, 256. The milliseconds above do not include the work a correct frame does there.
+
+WHAT THE REPLAY DOES NOW:
+
+- **Each command's margin** - how far past its tile it has to be right - is worked out at `prepare` by walking the list
+  backwards: a filtered layer's content is needed its graph's reach beyond what its parent needs of the composite, and
+  a graph that reads the backdrop raises what the parent needs of everything drawn before the layer. Commands are binned
+  by their bounds grown by it, and surfaces, clip masks and the working copy are reserved to it.
+- **Each tile's replay runs the same walk over its own bin with rectangles**, each layer's stated bounds in them, so a
+  tile far from the frosted panel needs nothing of the panel's margin and a card's content is drawn only around where
+  the card composites into the tile.
+- **A top-level read past a tile decodes from a copy of the target** taken before any unit runs: a unit of rows or of
+  one tile holds no byte of its neighbours, and in the serial walk the neighbours above and to the left are already
+  finished. Tiles drawn through the intermediate read the target itself, and a one-tile target needs no copy. In
+  `UI-effects` the full-screen fill covers every tile, so no tile decodes and no copy is taken.
+- **A pooled surface is aimed at the rectangle it is taken for and clears only that**; past it, a read answers
+  transparent exactly as a cleared pixel did. A layer that composites into nothing in a tile now costs nothing there -
+  before, each of the ten cards cleared about eight whole surfaces in every one of the eighty tiles.
+- **A lane reserves one surface per open layer** - the deepest nesting - and not one per layer the list has. With the
+  larger margins a correct frame needs, `UI-effects` was otherwise admitted 11 lanes at 32 and 64 workers; it is 22-23
+  now (20 before this change).
+
+THE PROOF THAT THE PICTURE IS RIGHT is the untiled evaluation: eleven filtered scenes (a Gaussian, a drop shadow, whole
+and fractional offsets, morphology into convolution, a displacement, a backdrop, nested filtered layers, a backdrop
+inside a layer, a filtered layer under a rounded clip, a backdrop of a filtered layer) and a backdrop over the target's
+own pixels, each drawn into a target that is one tile and moved into a larger one at three places tile boundaries cross,
+are the same picture to the bit in a float target and to the byte in the 8-bit one - through the serial walk and every
+pool and kind of unit. The 2D conformance suite's blur, shadow and backdrop scenes now compare every pixel of a
+160-pixel target with the graph evaluated at f64; the old replay fails all three, this one passes all 112 scenes.
+`soft2d-bench --scaling` draws the one-worker picture to the byte at 1 to 64 workers with every kind of unit.
+
+THE FROZEN FIXTURES ARE FROZEN WHOLE NOW: besides the command and resource counts, each scene's canonical encoding
+(`render2d::encode::digest`, which now encodes paints as well - it left them out) and a digest of the target and every
+generated image are asserted before the clock starts. A smaller blur, destination rectangle or image fails `--check`.
+
+PROVISIONAL, on a shared host with other builds running (load average 1.1 to 2.4 on 100 cores), 2026-10-15 between
+17:30 and 18:00 UTC: the release benchmark with `--workers 1`, five warm-ups and thirty samples, the old replay and
+this one built alternately four times and measured six times each. The final measurement is taken at the end of the
+job on a quiet host.
+
+| scene | old replay, median of six | this replay, median of six | range of this replay | frozen budget |
+| --- | ---: | ---: | ---: | ---: |
+| UI-basic | 10.32 ms | 10.46 ms | 10.41 - 10.78 ms | 10.837 ms |
+| UI-effects | 56.58 ms | 44.22 ms | 42.96 - 44.42 ms | 65.640 ms |
+| vector-stress | 64.11 ms | 62.70 ms | 62.07 - 63.63 ms | 65.509 ms |
+| image-resample | 11.80 ms | 11.63 ms | 11.33 - 11.80 ms | 13.414 ms |
+| image-convert | 15.92 ms | 15.48 ms | 14.96 - 15.63 ms | 16.063 ms |
+
+`UI-effects` drawn right is twelve milliseconds faster than drawn wrong, because the surfaces' clearing went with the
+work that was wasted. `UI-basic` has no layer, and nothing on its path changed but a rectangle intersection per draw,
+yet it measured about 0.15 ms slower in every alternation; it remains under its budget, with less room than before.
+
+THE PROBES, `SOFT2D_BENCH_PROBE=1`, one core, this replay (load average 2.4):
+
+| probe | 2026-10-14 | 2026-10-15 |
+| --- | ---: | ---: |
+| effects-layers-plain | 13.862 ms | 13.977 ms |
+| effects-layers-blur | 27.419 ms | 23.980 ms |
+| effects-layers-filtered | 45.884 ms | 28.886 ms |
+| effects-backdrop | 15.355 ms | 17.170 ms |
+
 ## soft2d on several cores (2026-09-27)
 
 `soft2d` replays a prepared frame on a WORKER POOL the caller supplies - `soft2d::Workers`, the shape

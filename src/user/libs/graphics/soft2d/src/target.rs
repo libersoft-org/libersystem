@@ -56,9 +56,16 @@ impl ImageSource for NoImages {
 }
 
 /// A rectangle of the canonical intermediate, with its place in the target.
+///
+/// THE STORAGE IS RESERVED ONCE AND THE RECTANGLE IN USE IS AIMED PER TAKE: `extent` is the part of the
+/// storage this surface currently is, and everything outside it reads TRANSPARENT and takes no write -
+/// exactly what a cleared pixel nobody writes would do, which is what made clearing the whole storage the
+/// old way of saying it. A layer that composites into three rows of a tile then costs three rows to
+/// clear rather than the whole reservation, and one that composites into nothing costs nothing.
 pub struct Surface {
 	image: OwnedImage,
 	origin: (u32, u32),
+	extent: (u32, u32),
 }
 
 impl Surface {
@@ -67,12 +74,11 @@ impl Surface {
 		let extent = Extent2D::new(bounds.width.max(1), bounds.height.max(1));
 		let layout = canonical_layout(extent, space).map_err(from_core)?;
 		let image = OwnedImage::new(layout).map_err(from_core)?;
-		Ok(Self { image, origin: (bounds.x, bounds.y) })
+		Ok(Self { image, origin: (bounds.x, bounds.y), extent: (extent.width, extent.height) })
 	}
 
 	pub fn bounds(&self) -> PixelRect {
-		let extent = self.image.layout().extent;
-		PixelRect::new(self.origin.0, self.origin.1, extent.width, extent.height)
+		PixelRect::new(self.origin.0, self.origin.1, self.extent.0, self.extent.1)
 	}
 
 	/// Move this surface to another place in the target, KEEPING its storage.
@@ -83,8 +89,23 @@ impl Surface {
 		self.origin = origin;
 	}
 
+	/// Be `bounds` of the target, as far as the storage reaches: moved there and cut to its size. What the
+	/// rectangle held before is whatever the last use left, so a caller clears it or overwrites it.
+	pub fn aim(&mut self, bounds: PixelRect) {
+		let capacity = self.image.layout().extent;
+		self.origin = (bounds.x, bounds.y);
+		self.extent = (bounds.width.min(capacity.width), bounds.height.min(capacity.height));
+	}
+
 	pub fn clear(&mut self) {
-		self.image.view_mut().bytes_mut().fill(0);
+		let pitch = self.image.layout().pitch as usize;
+		let row_bytes = self.extent.0 as usize * BYTES_PER_PIXEL;
+		let bytes = self.image.bytes_mut();
+		for row in 0..self.extent.1 as usize {
+			if let Some(line) = bytes.get_mut(row * pitch..row * pitch + row_bytes) {
+				line.fill(0);
+			}
+		}
 	}
 
 	/// CLEAR WHAT `bounds` DOES NOT COVER - the columns right of it and the rows below it, to the
@@ -93,7 +114,7 @@ impl Surface {
 	/// trivial nodes cost; what is left beyond `bounds` must still read transparent, because a
 	/// bilinear tap or a convolution reaches one pixel past the edge.
 	pub fn clear_outside(&mut self, bounds: PixelRect) {
-		let extent = self.image.layout().extent;
+		let extent = Extent2D::new(self.extent.0, self.extent.1);
 		let pitch = self.image.layout().pitch as usize;
 		let row_bytes = extent.width as usize * BYTES_PER_PIXEL;
 		// THE KEPT RECTANGLE IN THIS SURFACE'S OWN PIXELS, clamped to it: the columns `left..right` of the
@@ -152,7 +173,7 @@ impl Surface {
 	/// a fixed-size window with no failure case in it - MEASURED, on the probe that isolates this:
 	/// one opaque full-screen fill.
 	pub fn read_span(&self, x: u32, y: u32, out: &mut [Rgba]) {
-		let Some(offset) = self.offset(x, y) else {
+		let Some(offset) = self.run_offset(x, y, out.len()) else {
 			out.fill(Rgba::TRANSPARENT);
 			return;
 		};
@@ -180,11 +201,13 @@ impl Surface {
 		};
 		let pitch = self.image.layout().pitch as usize;
 		let bytes = self.image.bytes();
+		// THE ROWS THIS SURFACE IS, and not the rows its storage has: below them is a previous use's.
+		let rows = (self.extent.1 - (y - self.origin.1)) as usize;
 		for (index, slot) in out.iter_mut().enumerate() {
 			let start = offset + index * pitch;
 			*slot = match bytes.get(start..start + BYTES_PER_PIXEL) {
-				Some(pixel) => decode_half(pixel),
-				None => Rgba::TRANSPARENT,
+				Some(pixel) if index < rows => decode_half(pixel),
+				_ => Rgba::TRANSPARENT,
 			};
 		}
 	}
@@ -193,8 +216,9 @@ impl Surface {
 	pub fn write_column(&mut self, x: u32, y: u32, values: &[Rgba]) {
 		let Some(offset) = self.offset(x, y) else { return };
 		let pitch = self.image.layout().pitch as usize;
+		let rows = (self.extent.1 - (y - self.origin.1)) as usize;
 		let bytes = self.image.bytes_mut();
-		for (index, value) in values.iter().enumerate() {
+		for (index, value) in values.iter().take(rows).enumerate() {
 			let start = offset + index * pitch;
 			if let Some(pixel) = bytes.get_mut(start..start + BYTES_PER_PIXEL) {
 				encode_half(pixel, *value);
@@ -204,7 +228,7 @@ impl Surface {
 
 	/// Write a horizontal run of pixels. One bounds check for the run - see `read_span`.
 	pub fn write_span(&mut self, x: u32, y: u32, values: &[Rgba]) {
-		let Some(offset) = self.offset(x, y) else { return };
+		let Some(offset) = self.run_offset(x, y, values.len()) else { return };
 		let bytes = self.image.bytes_mut();
 		let Some(run) = bytes.get_mut(offset..offset + values.len() * BYTES_PER_PIXEL) else { return };
 		for (value, pixel) in values.iter().zip(run.chunks_exact_mut(BYTES_PER_PIXEL)) {
@@ -220,8 +244,7 @@ impl Surface {
 	/// composite cost. `read_span` refuses a run that is not wholly inside, so a run that is partly
 	/// outside is cut to the part that is inside and only that part is read.
 	pub fn read_run(&self, x: i64, y: i64, out: &mut [Rgba]) {
-		let extent = self.image.layout().extent;
-		let (first, last) = held(x, y, out.len(), self.origin, (extent.width, extent.height));
+		let (first, last) = held(x, y, out.len(), self.origin, self.extent);
 		out[..first].fill(Rgba::TRANSPARENT);
 		out[last..].fill(Rgba::TRANSPARENT);
 		if first < last {
@@ -232,8 +255,7 @@ impl Surface {
 	/// Write a horizontal run that may reach past this surface: the part it holds is written, as `set`
 	/// would write it pixel by pixel, and the rest is dropped.
 	pub fn write_run(&mut self, x: u32, y: u32, values: &[Rgba]) {
-		let extent = self.image.layout().extent;
-		let (first, last) = held(i64::from(x), i64::from(y), values.len(), self.origin, (extent.width, extent.height));
+		let (first, last) = held(i64::from(x), i64::from(y), values.len(), self.origin, self.extent);
 		if first < last {
 			self.write_span(x + first as u32, y, &values[first..last]);
 		}
@@ -247,16 +269,24 @@ impl Surface {
 		Some(local_y as usize * pitch + local_x as usize * BYTES_PER_PIXEL)
 	}
 
+	/// The byte offset of a run of `length` pixels, or `None` unless all of it is inside this surface: a run
+	/// past the right edge would read a previous use's pixels, or the next row's.
+	#[inline]
+	fn run_offset(&self, x: u32, y: u32, length: usize) -> Option<usize> {
+		let (local_x, _) = self.local(x, y)?;
+		(local_x as usize + length <= self.extent.0 as usize).then(|| self.offset(x, y)).flatten()
+	}
+
+	/// The whole STORAGE, whatever part of it the surface is aimed at.
 	pub fn view(&self) -> ImageView<'_> {
 		self.image.view()
 	}
 
 	#[inline]
 	fn local(&self, x: u32, y: u32) -> Option<(u32, u32)> {
-		let extent = self.image.layout().extent;
 		let local_x = x.checked_sub(self.origin.0)?;
 		let local_y = y.checked_sub(self.origin.1)?;
-		(local_x < extent.width && local_y < extent.height).then_some((local_x, local_y))
+		(local_x < self.extent.0 && local_y < self.extent.1).then_some((local_x, local_y))
 	}
 
 	/// Decode a rectangle of a target image into this surface.
@@ -398,6 +428,23 @@ impl Tile {
 		self.origin = origin;
 	}
 
+	/// Room for a working copy of `width` by `height`: a tile and the margin its list's filters read past
+	/// it. CALLED IN `prepare`, and never shrinks.
+	pub fn reserve(&mut self, width: u32, height: u32) {
+		let wanted = (width as usize).saturating_mul(height as usize);
+		if self.pixels.len() < wanted {
+			self.pixels.resize(wanted, Rgba::TRANSPARENT);
+		}
+	}
+
+	/// Hold `region` of the target: a tile, or a tile and its margin. Its rows are `region.width` apart, and
+	/// a region larger than the reservation is cut to the rows that fit rather than grown into.
+	pub fn aim(&mut self, region: PixelRect) {
+		self.origin = (region.x, region.y);
+		self.width = region.width;
+		self.height = if region.width == 0 { 0 } else { region.height.min((self.pixels.len() / region.width as usize) as u32) };
+	}
+
 	pub fn clear(&mut self) {
 		self.pixels.fill(Rgba::TRANSPARENT);
 	}
@@ -412,17 +459,31 @@ impl Tile {
 		(local_x < self.width && local_y < self.height).then(|| local_y as usize * self.width as usize + local_x as usize)
 	}
 
-	/// Decode a rectangle of a target image into this tile.
-	/// Decode `bounds` of the target into the tile, through the unit's part of the target.
-	pub(crate) fn load(&mut self, access: &Access<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>) -> Result<(), Error> {
+	/// Decode `bounds` of the target into the tile, through the unit's part of the target - or, where the
+	/// frame took one, from its SNAPSHOT of the target as it found it, which is what a tile decoding past its
+	/// own edge reads (see `take_snapshot`). A unit that holds only its own rows refuses a region past them
+	/// rather than reading something else in their place.
+	pub(crate) fn load(&mut self, access: &Access<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>, snapshot: Option<&ImageView<'_>>) -> Result<(), Error> {
+		if let Some(snapshot) = snapshot {
+			return self.load_from(snapshot, 0, bounds, working, table);
+		}
+		const PAST_THE_UNIT: Error = Error::DegenerateShape { what: "a tile decoding past its unit needs the frame's snapshot" };
 		match access {
 			Access::Samples { .. } => return Err(Error::DegenerateShape { what: "sample rows are not a render target" }),
-			Access::Band { view, top } => self.load_from(&view.as_view(), *top, bounds, working, table),
+			Access::Band { view, top } => {
+				if !PixelRect::new(0, *top, view.layout().extent.width, view.layout().extent.height).contains_rect(&bounds) {
+					return Err(PAST_THE_UNIT);
+				}
+				self.load_from(&view.as_view(), *top, bounds, working, table)
+			}
 			// THE WHOLE TARGET, READ ONLY: nothing writes it while the units run, so every tile reads the
 			// pixels the frame started with - which is what the serial walk reads, since no tile writes
 			// another's pixels.
 			Access::Slot { source, .. } => self.load_from(source, 0, bounds, working, table),
 			Access::Rect { rows, tile, layout } => {
+				if !tile.contains_rect(&bounds) {
+					return Err(PAST_THE_UNIT);
+				}
 				let decoder = Decoder::new(&layout.semantics, working).map_err(from_core)?;
 				let part = part_layout(layout, tile)?;
 				let width = bounds.width as usize;

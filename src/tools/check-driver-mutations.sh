@@ -474,6 +474,30 @@ mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 	"			if self.visited > self.most + 64 {" \
 	a_pointer_chain_that_loops_ends_rather_than_spinning
 
+# CDC: a received NCM block is refused WHOLE. A refusal that left the datagrams walked before it in the
+# list hands up frames from a table the device got wrong - and passes every test that looks only at the
+# answer.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"	if let Some(fault) = refused.or(walk.fault()) {
+		out.clear();" \
+	"	if let Some(fault) = refused.or(walk.fault()) {" \
+	a_malformed_block_is_refused_whole_and_nothing_in_it_is_delivered
+
+# CDC: an NCM block this host sends that ends exactly on a packet boundary, short of the device's maximum,
+# carries one more byte. Without it the device's transfer has not ended, and the next block is read as the
+# rest of this one.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"		if total % self.packet == 0 && total < self.device_most {" \
+	"		if false {" \
+	a_block_that_is_a_whole_number_of_packets_carries_one_more_byte
+
+# CDC: the NCM table alignment the device asks for is a power of two of at least four, and anything else is
+# refused rather than rounded - a host that rounds is deciding what the device meant.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"	if parameters.out_alignment < 4 || !parameters.out_alignment.is_power_of_two() {" \
+	"	if parameters.out_alignment < 4 {" \
+	ntb_parameters_outside_their_bounds_are_refused_rather_than_rounded
+
 # vsock: the credit counters are free-running u32s and the window between them is MODULAR. A
 # subtraction that is not wrapping gives four gibibytes of window at the wrap and zero the other way
 # - the first sends into a buffer that is not there, the second stalls a healthy connection for ever.

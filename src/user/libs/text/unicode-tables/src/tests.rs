@@ -177,3 +177,25 @@ fn the_canonical_decompositions_and_compositions_agree_with_each_other() {
 	assert_eq!(combining_class('\u{0327}'), 202, "a mark below");
 	assert_eq!(combining_class('a'), 0);
 }
+
+#[test]
+// THE MIRRORING TABLE IS A MAPPING, sorted so the lookup can search it, and every entry answered both
+// ways: a character drawn as its mirror at an odd level is drawn as itself again by its mirror. The
+// bracket pairs rule N0 reads are a different property - most mirrored characters are not brackets -
+// so the operators and the guillemets are asserted here directly.
+fn the_mirroring_table_is_sorted_and_every_pair_answers_both_ways() {
+	assert!(!BIDI_MIRRORING.is_empty());
+	for pair in BIDI_MIRRORING.windows(2) {
+		assert!(pair[0].0 < pair[1].0, "{:#x} is not sorted before {:#x}", pair[0].0, pair[1].0);
+	}
+	for (character, mirror) in BIDI_MIRRORING {
+		let back = BIDI_MIRRORING.binary_search_by_key(mirror, |(candidate, _)| *candidate).map(|at| BIDI_MIRRORING[at].1);
+		assert_eq!(back, Ok(*character), "{character:#x} mirrors to {mirror:#x}, which does not mirror back");
+	}
+	let mirror_of = |character: u32| BIDI_MIRRORING.binary_search_by_key(&character, |(candidate, _)| *candidate).ok().map(|at| BIDI_MIRRORING[at].1);
+	assert_eq!(mirror_of(0x3C), Some(0x3E), "less-than mirrors to greater-than, and is not a bracket");
+	assert_eq!(mirror_of(0xAB), Some(0xBB), "the guillemets mirror");
+	assert_eq!(mirror_of(0x2264), Some(0x2265));
+	assert_eq!(mirror_of(0x2211), None, "summation is mirrored and has no mirror character");
+	assert!(BIDI_BRACKETS.iter().all(|(bracket, pair, _)| mirror_of(*bracket) == Some(*pair)), "every bracket pair is also a mirroring pair");
+}

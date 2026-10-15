@@ -34,6 +34,18 @@ pub const CSTS_READY: u32 = 1 << 0;
 // `CSTS.CFS` - the controller has failed. A bring-up that waits for READY without watching this
 // waits for the full timeout on a controller that has already said it will never be ready.
 pub const CSTS_FATAL: u32 = 1 << 1;
+// `CC.SHN`, bits 15:14, and `CSTS.SHST`, bits 3:2: the shutdown a controller is told about before
+// its power goes, and its answer. A NORMAL notification is 01b. "Processing complete" is 10b, and
+// 01b - still occurring - is not it.
+pub const CC_SHUTDOWN_NORMAL: u32 = 1 << 14;
+pub const CC_SHUTDOWN_MASK: u32 = 3 << 14;
+pub const CSTS_SHUTDOWN_MASK: u32 = 3 << 2;
+pub const CSTS_SHUTDOWN_COMPLETE: u32 = 2 << 2;
+
+// Whether `CSTS` says the shutdown this driver asked for has finished.
+pub fn shutdown_complete(csts: u32) -> bool {
+	csts & CSTS_SHUTDOWN_MASK == CSTS_SHUTDOWN_COMPLETE
+}
 
 // A submission queue entry is 64 bytes and a completion queue entry is 16, and `CC.IOSQES`/`IOCQES`
 // carry those as powers of two. They are constants of the command set rather than choices.
@@ -142,6 +154,43 @@ impl Completion {
 	// still a failure, and reading only the code would call it success.
 	pub fn succeeded(&self) -> bool {
 		self.status_type == 0 && self.status_code == 0
+	}
+}
+
+// Why a command did not produce an answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fault {
+	// The controller reported a non-zero status, and WHICH one is carried: a status type and code
+	// name one refusal, while a bare "it failed" names every one of them.
+	Failed { status_type: u8, status_code: u8 },
+	// No completion arrived inside the bound.
+	Timeout,
+	// A completion arrived for a command that is not outstanding, which means the driver and the
+	// controller disagree about what is in flight.
+	//
+	// IT CARRIES THE ID IT SAW AND THE RAW DWORDS IT CAME OUT OF, because "not outstanding" is
+	// consistent with three different defects and the numbers tell them apart: an id that is the
+	// OPCODE means dword 0 is built wrong, an id that is plausible but off by a step means the
+	// bookkeeping is, and a dword of arbitrary bits means this is not a completion at all and the
+	// slot being read is the wrong memory.
+	Unexpected { saw: u16, expected: u16, dw2: u32, dw3: u32 },
+	// The controller could not be reset after an earlier fault, so nothing was issued.
+	Down,
+}
+
+impl Fault {
+	// WHETHER THE CONTROLLER MAY STILL BE RUNNING THE COMMAND, which decides what the driver owes
+	// before it answers anyone.
+	//
+	// A STATUS IS AN ANSWER: the controller consumed the command and finished it, the queue is in
+	// step, and the request is refused. Anything else leaves a command the driver gave up on that
+	// the controller may still be executing - against the one data span every request moves
+	// through, and with its completion still to land in the slot the next command waits at. So the
+	// controller is reset, which ends everything it was doing, and its queues are made again BEFORE
+	// the caller is answered: a write answered as failed must not land later carrying the next
+	// request's bytes.
+	pub fn needs_reset(self) -> bool {
+		!matches!(self, Fault::Failed { .. } | Fault::Down)
 	}
 }
 

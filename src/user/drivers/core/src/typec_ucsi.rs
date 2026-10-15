@@ -177,9 +177,10 @@ pub fn pin_assignment(vdo: u32) -> Option<u8> {
 }
 
 /// DisplayPort's configuration for `SET_NEW_CAM`: the pin assignment chosen, DisplayPort signalling, and this machine
-/// as the source of the display (UFP_U as DFP_D on the partner's side).
+/// as the source of the display - so the partner is configured as its sink, select 10b, "UFP_U as UFP_D". 01b would
+/// make the partner the source (UFP_U as DFP_D), and the pin assignment is chosen from the partner's UFP_D set.
 pub fn dp_configuration(pin: u8) -> u32 {
-	u32::from(pin) << 8 | 1 << 2 | 1
+	u32::from(pin) << 8 | 1 << 2 | 0b10
 }
 
 /// WHY A ROLE SWAP IS REFUSED BEFORE ANY COMMAND: the connector cannot take the role asked for.

@@ -100,6 +100,25 @@ for target in targets:
 	if entry["init_array"] != ["loader_init_library"] or entry["fini_array"] != ["loader_free_library"]:
 		failures.append(f"{target}: the lifecycle entries moved - init {entry['init_array']}, fini {entry['fini_array']}")
 
+# THE NEGOTIATED VERSION IS RECORDED BESIDE THE SYMBOLS, and it is the decision rather than whatever
+# the last link happened to see: the substrate admits 2 through 6, the loader asks for more than that,
+# so what a negotiation through the substrate can settle on is 2 through 6 - and the admitted set is
+# the one the substrate declares NOW, read from its source the way the declared surface above is.
+interface = inventory.get("_icd_interface")
+if interface is None:
+	failures.append("the inventory records no ICD interface version, so which version the substrate admits is an assumption rather than a derived fact")
+else:
+	version = pathlib.Path("src/user/libs/foreign/discovery/src/version.rs").read_text()
+	declared_versions = [int(value) for value in re.search(r"pub const ADMITTED: \[u32; \d+\] = \[([^\]]*)\];", version).group(1).split(",")]
+	if interface["substrate_admits"] != declared_versions:
+		failures.append(f"the inventory records the substrate admitting {interface['substrate_admits']} and the substrate declares {declared_versions}")
+	if interface["substrate_admits"] != [2, 3, 4, 5, 6] or (interface["negotiated_at_least"], interface["negotiated_at_most"]) != (2, 6):
+		failures.append(f"the recorded interface range is {interface['negotiated_at_least']}..{interface['negotiated_at_most']} over {interface['substrate_admits']}, and the decision is 2..6")
+	if interface["loader_asks_for"] <= interface["negotiated_at_most"]:
+		failures.append(f"the pinned loader asks for {interface['loader_asks_for']}; the bound this records is only exercised if it asks for more than {interface['negotiated_at_most']}, so the inventory and the substrate's reason to bound no longer agree")
+	if interface["exports_resolved"] != ["vk_icdGetInstanceProcAddr", "vk_icdNegotiateLoaderICDInterfaceVersion"] or interface["export_refused_by_name"] != "vk_icdGetPhysicalDeviceProcAddr":
+		failures.append(f"the substrate resolves {interface['exports_resolved']} and refuses {interface['export_refused_by_name']}, and the closed surface is the two exports with the physical-device one refused")
+
 shapes = {frozenset(inventory[target]["archive_surface"]) for target in targets if target in inventory}
 if len(shapes) != 1:
 	failures.append("the three targets ask for different symbols; one substrate cannot serve them")
@@ -114,8 +133,10 @@ PY
 
 echo "foreign-audit-link: the recorded pass-2 inventory is a converged, exact surface with no threads and no TLS"
 
-if [[ ! -d "$ROOT/.build/foreign/src-loader" ]]; then
-	echo "foreign-audit-link: NOT PERFORMED: the pinned sources are not unpacked under .build/foreign, so the link was not re-run"
+# THE ARCHIVES ARE WHAT THE LINK IS RE-RUN FROM: every tree it compiles is derived from them and the
+# pinned patch series, so their absence - not a tree's - is what makes the second half impossible.
+if ! compgen -G "$ROOT/.build/foreign/vulkan-loader-*.tar.gz" >/dev/null || ! compgen -G "$ROOT/.build/foreign/vulkan-headers-*.tar.gz" >/dev/null; then
+	echo "foreign-audit-link: NOT PERFORMED: the pinned upstream archives are not under .build/foreign, so the link was not re-run"
 	exit 0
 fi
 # THE SCAN IS PROVED ABLE TO SEE WHAT IT REPORTS ABSENT before its zeroes are believed. Two of this

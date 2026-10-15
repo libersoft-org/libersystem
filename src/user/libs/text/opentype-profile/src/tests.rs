@@ -174,6 +174,7 @@ fn a_refusal_names_what_it_refused() {
 		Unsupported::GposLookup(10),
 		Unsupported::Paint(33),
 		Unsupported::Script(*b"egyp"),
+		Unsupported::TextScript("Adlam"),
 		Unsupported::Variation("avar 2"),
 		Unsupported::ExcludedByProfile("hinting programs"),
 	];

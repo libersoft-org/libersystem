@@ -10,15 +10,27 @@
 //! apply where they belong and nowhere else. The lookups themselves are the font's.
 
 use alloc::vec::Vec;
+use font_parse::Error;
 use unicode_tables::{IndicSyllabic, JoiningType, Script, indic_syllabic, joining_type, script};
 
 use crate::buffer::{Buffer, GLOBAL};
+
+/// Storage for this many entries, or the typed refusal - never the infallible allocation that ends
+/// the caller's process over one run.
+fn storage<T>(count: usize) -> Result<Vec<T>, Error> {
+	let mut out = Vec::new();
+	out.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
+	Ok(out)
+}
 
 /// The mask bits the positional forms take. Bit 0 is `GLOBAL`, which every glyph carries.
 pub const ISOL: u32 = 1 << 1;
 pub const INIT: u32 = 1 << 2;
 pub const MEDI: u32 = 1 << 3;
 pub const FINA: u32 = 1 << 4;
+
+/// The four positional forms together, which the cursive pass owns and nothing else sets.
+const FORMS: u32 = ISOL | INIT | MEDI | FINA;
 
 /// The joining form a letter takes in its context.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,7 +86,10 @@ pub enum Shaper {
 pub fn shaper_for(characters: &[char]) -> Shaper {
 	for character in characters {
 		match script(*character) {
-			Script::Arabic | Script::Syriac | Script::Nko | Script::Mandaic | Script::Adlam => return Shaper::Cursive,
+			// ONLY THE CURSIVE SCRIPTS THE PROFILE NAMES. Mandaic and Adlam join too, and the profile
+			// does not name them: text in either is refused before it reaches a shaper, rather than
+			// shaped with rules nobody undertook to get right for it.
+			Script::Arabic | Script::Syriac | Script::Nko => return Shaper::Cursive,
 			Script::Devanagari | Script::Bengali | Script::Gurmukhi | Script::Gujarati | Script::Oriya | Script::Tamil | Script::Telugu | Script::Kannada | Script::Malayalam | Script::Sinhala => {
 				return Shaper::Indic;
 			}
@@ -94,9 +109,10 @@ pub fn shaper_for(characters: &[char]) -> Shaper {
 /// following letter, and the marks between them are TRANSPARENT - which is the whole reason the
 /// joining type has a `T` at all. A shaper that looked at the immediate neighbour would break a
 /// join wherever a vowel mark happens to sit, which in Arabic is most places.
-pub fn cursive_forms(characters: &[char]) -> Vec<Form> {
-	let types: Vec<JoiningType> = characters.iter().map(|character| joining_type(*character)).collect();
-	let mut forms = Vec::with_capacity(characters.len());
+pub fn cursive_forms(characters: &[char]) -> Result<Vec<Form>, Error> {
+	let mut types: Vec<JoiningType> = storage(characters.len())?;
+	types.extend(characters.iter().map(|character| joining_type(*character)));
+	let mut forms = storage(characters.len())?;
 	for index in 0..characters.len() {
 		if types[index] == JoiningType::T {
 			// A transparent character has no form of its own; it takes the isolated mask so a font
@@ -119,19 +135,23 @@ pub fn cursive_forms(characters: &[char]) -> Vec<Form> {
 		};
 		forms.push(form);
 	}
-	forms
+	Ok(forms)
 }
 
 /// Set each glyph's mask from the form its character takes.
 ///
 /// ONE CHARACTER PER GLYPH AT THIS POINT, which is true because the masks are set BEFORE any
 /// substitution runs - that is the only moment at which the buffer and the text still correspond.
-pub fn apply_cursive_masks(buffer: &mut Buffer, characters: &[char]) {
-	let forms = cursive_forms(characters);
+///
+/// ONLY THE FORM BITS ARE THIS PASS'S. A bit the caller set - `rtlm` on a glyph it did not mirror -
+/// is kept, or a right-to-left run would lose its mirrored forms to the joining pass.
+pub fn apply_cursive_masks(buffer: &mut Buffer, characters: &[char]) -> Result<(), Error> {
+	let forms = cursive_forms(characters)?;
 	for (index, info) in buffer.infos.iter_mut().enumerate() {
 		let Some(form) = forms.get(index) else { continue };
-		info.mask = GLOBAL | form.mask();
+		info.mask = (info.mask & !FORMS) | GLOBAL | form.mask();
 	}
+	Ok(())
 }
 
 /// The features a cursive run turns on, with the mask each applies under.
@@ -157,8 +177,8 @@ pub fn cursive_features() -> [([u8; 4], u32); 8] {
 /// defined relative to a syllable rather than to the run - so a shaper that has not found the
 /// syllable boundaries cannot do either. The categories come from the generated
 /// `Indic_Syllabic_Category` table.
-pub fn syllable_starts(characters: &[char]) -> Vec<usize> {
-	let mut starts = Vec::new();
+pub fn syllable_starts(characters: &[char]) -> Result<Vec<usize>, Error> {
+	let mut starts = storage(characters.len())?;
 	let mut index = 0usize;
 	while index < characters.len() {
 		starts.push(index);
@@ -173,6 +193,16 @@ pub fn syllable_starts(characters: &[char]) -> Vec<usize> {
 					after_virama = true;
 					true
 				}
+				// A JOINER AFTER A VIRAMA IS STILL THE SAME SYLLABLE. `Ra, virama, ZWJ` is how two
+				// scripts write an explicit reph and `C, virama, ZWJ` asks for a half form; ending the
+				// syllable at the joiner would hand the consonant it binds to the next one. A ZWNJ
+				// there ENDS the conjunct - it asks for the visible virama - so the consonant after it
+				// starts a syllable of its own.
+				IndicSyllabic::Joiner if after_virama => true,
+				IndicSyllabic::NonJoiner if after_virama => {
+					after_virama = false;
+					true
+				}
 				// A MEDIAL OR SUBJOINED CONSONANT IS PART OF THE CLUSTER IT FOLLOWS, always: that is
 				// what makes it medial. Only a full consonant needs a virama before it to belong to
 				// the syllable rather than to start the next one - and requiring one for all four
@@ -185,13 +215,13 @@ pub fn syllable_starts(characters: &[char]) -> Vec<usize> {
 			if !continues {
 				break;
 			}
-			if !matches!(category, IndicSyllabic::Virama | IndicSyllabic::InvisibleStacker) {
+			if !matches!(category, IndicSyllabic::Virama | IndicSyllabic::InvisibleStacker | IndicSyllabic::Joiner | IndicSyllabic::NonJoiner) {
 				after_virama = false;
 			}
 			index += 1;
 		}
 	}
-	starts
+	Ok(starts)
 }
 
 /// THE INDIC SHAPER'S SECOND HALF: the reordering that makes the script readable.
@@ -200,8 +230,12 @@ pub fn syllable_starts(characters: &[char]) -> Vec<usize> {
 /// feature - it is the writing system - and a shaper that leaves the order alone renders Devanagari
 /// with every `ि` on the wrong side of its letter. The categories say which signs those are;
 /// `Indic_Positional_Category` says `Left`, and this moves them to the front of their syllable.
-pub fn reorder_indic(characters: &[char], buffer: &mut Buffer) {
-	let starts = syllable_starts(characters);
+///
+/// THE FRONT IS AFTER A REPH THAT IS STILL TO FORM. A syllable-initial `Ra, virama` the plan marked
+/// for `rphf` becomes a mark drawn over the base and is moved there after the basic features; a
+/// vowel sign put in front of it would split the two characters the reph is formed from.
+pub fn reorder_indic(characters: &[char], buffer: &mut Buffer) -> Result<(), Error> {
+	let starts = syllable_starts(characters)?;
 	for (index, start) in starts.iter().enumerate() {
 		let end = starts.get(index + 1).copied().unwrap_or(characters.len()).min(buffer.len());
 		let start = *start;
@@ -210,8 +244,11 @@ pub fn reorder_indic(characters: &[char], buffer: &mut Buffer) {
 		}
 		// Find the pre-base vowel signs of this syllable and move them to its front, keeping their
 		// order among themselves.
-		let mut at = start + 1;
 		let mut insert_at = start;
+		while insert_at < end && buffer.infos[insert_at].mask & crate::indic::RPHF != 0 {
+			insert_at += 1;
+		}
+		let mut at = insert_at;
 		while at < end {
 			let is_pre_base = unicode_tables::indic_positional(characters[at]) == unicode_tables::IndicPositional::Left;
 			if is_pre_base {
@@ -224,22 +261,7 @@ pub fn reorder_indic(characters: &[char], buffer: &mut Buffer) {
 			at += 1;
 		}
 	}
-}
-
-/// The features an Indic run turns on.
-pub fn indic_features() -> [([u8; 4], u32); 10] {
-	[
-		(*b"nukt", GLOBAL),
-		(*b"akhn", GLOBAL),
-		(*b"rphf", GLOBAL),
-		(*b"blwf", GLOBAL),
-		(*b"half", GLOBAL),
-		(*b"vatu", GLOBAL),
-		(*b"pres", GLOBAL),
-		(*b"blws", GLOBAL),
-		(*b"abvs", GLOBAL),
-		(*b"psts", GLOBAL),
-	]
+	Ok(())
 }
 
 /// THE HANGUL SHAPER: jamo composed into the syllable a font actually has a glyph for.
@@ -249,7 +271,7 @@ pub fn indic_features() -> [([u8; 4], u32); 10] {
 /// them, so a shaper that left a decomposed sequence alone renders three letters in a row where a
 /// reader expects one block. The composition is arithmetic rather than a table - which is why this
 /// is a shaper rather than a feature.
-pub fn compose_hangul(characters: &[char], buffer: &mut Buffer) -> Vec<char> {
+pub fn compose_hangul(characters: &[char], buffer: &mut Buffer) -> Result<Vec<char>, Error> {
 	// The blocks, as Unicode defines them for this arithmetic.
 	const L_BASE: u32 = 0x1100;
 	const V_BASE: u32 = 0x1161;
@@ -259,7 +281,7 @@ pub fn compose_hangul(characters: &[char], buffer: &mut Buffer) -> Vec<char> {
 	const V_COUNT: u32 = 21;
 	const T_COUNT: u32 = 28;
 
-	let mut composed: Vec<char> = Vec::with_capacity(characters.len());
+	let mut composed: Vec<char> = storage(characters.len())?;
 	let mut index = 0usize;
 	while index < characters.len() {
 		let lead = characters[index] as u32;
@@ -295,7 +317,7 @@ pub fn compose_hangul(characters: &[char], buffer: &mut Buffer) -> Vec<char> {
 		composed.push(syllable);
 		index += consumed;
 	}
-	composed
+	Ok(composed)
 }
 
 /// The features a Hangul run turns on, for the jamo a font DOES carry glyphs for.
@@ -307,12 +329,12 @@ pub fn hangul_features() -> [([u8; 4], u32); 3] {
 /// `coeng` - and writes some of its vowels before the consonant they are pronounced after, like the
 /// Indic scripts. What it does NOT share is the Indic syllable model, which is why the profile names
 /// it separately: a Khmer cluster can carry two subjoined consonants and a pre-base vowel at once.
-pub fn reorder_khmer(characters: &[char], buffer: &mut Buffer) {
+pub fn reorder_khmer(characters: &[char], buffer: &mut Buffer) -> Result<(), Error> {
 	// The syllable model is the same shape - an invisible stacker binds what follows into the
 	// cluster - and `syllable_starts` already reads `Invisible_Stacker`, which is what Khmer's coeng
 	// is. What differs is only that the pre-base vowels are moved to the front of the WHOLE cluster
 	// including its subjoined consonants, which is what this does.
-	reorder_indic(characters, buffer);
+	reorder_indic(characters, buffer)
 }
 
 /// The features a Khmer run turns on.
@@ -324,8 +346,8 @@ pub fn khmer_features() -> [([u8; 4], u32); 6] {
 /// the order they are drawn in, and unlike Indic the reordering is by CATEGORY rather than by
 /// position: the pre-base vowel `e` moves before its consonant, and the medial `ra` moves before
 /// everything in its cluster.
-pub fn reorder_myanmar(characters: &[char], buffer: &mut Buffer) {
-	let starts = syllable_starts(characters);
+pub fn reorder_myanmar(characters: &[char], buffer: &mut Buffer) -> Result<(), Error> {
+	let starts = syllable_starts(characters)?;
 	for (index, start) in starts.iter().enumerate() {
 		let end = starts.get(index + 1).copied().unwrap_or(characters.len()).min(buffer.len());
 		let start = *start;
@@ -350,6 +372,7 @@ pub fn reorder_myanmar(characters: &[char], buffer: &mut Buffer) {
 			at += 1;
 		}
 	}
+	Ok(())
 }
 
 /// The features a Myanmar run turns on.
@@ -365,7 +388,7 @@ pub fn myanmar_features() -> [([u8; 4], u32); 5] {
 /// three times at the pen. It needs no reordering for these three, which is why it is a cluster
 /// model rather than a reordering model - and saying so is better than leaving a reader to wonder
 /// which reordering it forgot.
-pub fn universal_clusters(characters: &[char]) -> Vec<usize> {
+pub fn universal_clusters(characters: &[char]) -> Result<Vec<usize>, Error> {
 	syllable_starts(characters)
 }
 
@@ -382,42 +405,64 @@ pub fn universal_features() -> [([u8; 4], u32); 4] {
 /// font made this century uses, and the fallback chain in `features_for` reaches the old one and then
 /// `DFLT` on its own.
 pub fn script_tag(characters: &[char]) -> [u8; 4] {
+	characters.iter().find_map(|character| tag_of(script(*character))).unwrap_or(*b"DFLT")
+}
+
+/// The tag a run is shaped under, or the typed refusal when any of its text is in a script the
+/// profile does not name.
+///
+/// A SCRIPT OUTSIDE THE PROFILE IS REFUSED, NOT SHAPED. Shaping it with the default shaper under
+/// `DFLT` would apply whatever a face happened to carry with rules nobody undertook to get right for
+/// that script, and report nothing - which is the silent wrong result the closed profile exists to
+/// rule out. A character whose script decides nothing - `Common`, `Inherited`, and `Unknown`, which
+/// is where a private-use icon lives - never refuses a run: it is drawn with the run it is in.
+pub fn profile_script(characters: &[char]) -> Result<[u8; 4], Error> {
+	let mut chosen: Option<[u8; 4]> = None;
 	for character in characters {
-		let tag = match script(*character) {
-			Script::Arabic => *b"arab",
-			Script::Syriac => *b"syrc",
-			Script::Nko => *b"nko ",
-			Script::Hebrew => *b"hebr",
-			Script::Devanagari => *b"dev2",
-			Script::Bengali => *b"bng2",
-			Script::Gurmukhi => *b"gur2",
-			Script::Gujarati => *b"gjr2",
-			Script::Oriya => *b"ory2",
-			Script::Tamil => *b"tml2",
-			Script::Telugu => *b"tel2",
-			Script::Kannada => *b"knd2",
-			Script::Malayalam => *b"mlm2",
-			Script::Sinhala => *b"sinh",
-			Script::Khmer => *b"khmr",
-			Script::Myanmar => *b"mym2",
-			Script::Thai => *b"thai",
-			Script::Lao => *b"lao ",
-			Script::Tibetan => *b"tibt",
-			Script::Hangul => *b"hang",
-			Script::Han => *b"hani",
-			Script::Hiragana | Script::Katakana => *b"kana",
-			Script::Greek => *b"grek",
-			Script::Cyrillic => *b"cyrl",
-			Script::Armenian => *b"armn",
-			Script::Georgian => *b"geor",
-			Script::Ethiopic => *b"ethi",
-			Script::Thaana => *b"thaa",
-			Script::Latin => *b"latn",
-			// A character whose script decides nothing - a space, a digit, a mark - does not pick
-			// the tag for the run.
-			_ => continue,
-		};
-		return tag;
+		let found = script(*character);
+		if matches!(found, Script::Common | Script::Inherited | Script::Unknown) {
+			continue;
+		}
+		let tag = tag_of(found).filter(|tag| opentype_profile::scripts::script_support(tag).is_some()).ok_or(Error::Unsupported(opentype_profile::Unsupported::TextScript(found.ucd_name())))?;
+		chosen.get_or_insert(tag);
 	}
-	*b"DFLT"
+	Ok(chosen.unwrap_or(*b"DFLT"))
+}
+
+/// The tag of one script, for the scripts the profile names. `None` for every other one - including
+/// the ones whose script decides nothing, which do not pick the tag for a run.
+fn tag_of(found: Script) -> Option<[u8; 4]> {
+	Some(match found {
+		Script::Arabic => *b"arab",
+		Script::Syriac => *b"syrc",
+		Script::Nko => *b"nko ",
+		Script::Hebrew => *b"hebr",
+		Script::Devanagari => *b"dev2",
+		Script::Bengali => *b"bng2",
+		Script::Gurmukhi => *b"gur2",
+		Script::Gujarati => *b"gjr2",
+		Script::Oriya => *b"ory2",
+		Script::Tamil => *b"tml2",
+		Script::Telugu => *b"tel2",
+		Script::Kannada => *b"knd2",
+		Script::Malayalam => *b"mlm2",
+		Script::Sinhala => *b"sinh",
+		Script::Khmer => *b"khmr",
+		Script::Myanmar => *b"mym2",
+		Script::Thai => *b"thai",
+		Script::Lao => *b"lao ",
+		Script::Tibetan => *b"tibt",
+		Script::Hangul => *b"hang",
+		Script::Han => *b"hani",
+		Script::Hiragana | Script::Katakana => *b"kana",
+		Script::Bopomofo => *b"bopo",
+		Script::Greek => *b"grek",
+		Script::Cyrillic => *b"cyrl",
+		Script::Armenian => *b"armn",
+		Script::Georgian => *b"geor",
+		Script::Ethiopic => *b"ethi",
+		Script::Thaana => *b"thaa",
+		Script::Latin => *b"latn",
+		_ => return None,
+	})
 }

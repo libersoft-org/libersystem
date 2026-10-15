@@ -81,22 +81,150 @@ impl Frame {
 	pub fn empty(&self, x: u32, y: u32) -> bool {
 		self.alpha(x, y) == 0
 	}
+
+	/// Whether a pixel the drawing covers WHOLLY holds exactly a straight colour at an alpha - the frozen edge
+	/// policy, which compares such a pixel exactly. See `stored`.
+	pub fn holds(&self, x: u32, y: u32, colour: [f32; 3], alpha: f32) -> bool {
+		self.pixel(x, y) == [stored(colour[0], x, y), stored(colour[1], x, y), stored(colour[2], x, y), byte(alpha)]
+	}
 }
+
+/// THE FROZEN THRESHOLDS, as the numbers a comparison applies. Each is the `render2d` entry of
+/// `graphics_profile::thresholds::THRESHOLDS` it is named after, and a host test holds that entry's text to
+/// the number here - so the suite cannot drift from the freeze without a test saying so.
+pub mod threshold {
+	/// "antialiasing coverage": per pixel, against the analytic area.
+	pub const COVERAGE_PER_PIXEL: f64 = 2.0 / 255.0;
+	/// "antialiasing coverage": the mean over the partially covered pixels.
+	pub const COVERAGE_MEAN: f64 = 1.0 / 255.0;
+	/// "a filter kernel's output": relative, against the kernel evaluated at f64, per channel in linear space.
+	pub const FILTER_RELATIVE: f64 = 1e-3;
+}
+
+/// A TARGET OF SEVERAL TILES on a side: the reference backend replays a frame sixty-four pixels at a time,
+/// so a drawing on this one is cut by tile boundaries at 64 and 128 on both axes - which is where an effect
+/// that reads past the pixel it writes, or a group composited once per tile, shows a seam.
+pub const WIDE: u32 = 160;
 
 /// A value and the byte it is stored as in a linear target.
 pub fn byte(value: f32) -> u8 {
 	(value * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
 
-/// Is a stored byte the value the scene expects, within a rounding?
+/// Is a stored byte a PARTIALLY COVERED pixel's expected value, within the frozen coverage tolerance?
 ///
-/// THE TOLERANCE IS TWO PARTS IN 255 AND NOT ZERO. The working intermediate is half-float, the
-/// coverage is a fraction and the final quantisation rounds, so an exact comparison would be a
-/// comparison against this backend's rounding rather than against the profile's arithmetic. Two parts
-/// is smaller than any difference between two definitions the profile distinguishes.
+/// TWO PARTS IN 255 AND NOT ZERO, because that is the frozen per-pixel bound for a pixel whose analytic
+/// coverage is a fraction - and ONLY for such a pixel. A fully covered or an empty one is compared
+/// exactly, by `stored` and `Frame::holds`: a fully covered pixel that differs at all is a colour error
+/// wearing an antialiasing tolerance.
 pub fn near(seen: u8, expected: f32) -> bool {
 	let expected = byte(expected) as i32;
 	(seen as i32 - expected).abs() <= 2
+}
+
+/// THE BYTE A FULLY COVERED PIXEL STORES A COLOUR CHANNEL AS, EXACTLY.
+///
+/// WHAT LIES BETWEEN THE ARITHMETIC AND THE BYTE is the target's own quantisation: the value in code units
+/// moved by the profile's ORDERED DITHER at that pixel and rounded. A value that is a whole code value comes
+/// back as itself whatever the dither, and one that is not lands on the code below it at one pixel and the
+/// one above at the next - so the exact comparison the edge policy asks for is against this and not against
+/// the value rounded. Alpha is not dithered: its byte is `byte`.
+pub fn stored(value: f32, x: u32, y: u32) -> u8 {
+	graphics_core::pixel::quantise_u8(value + graphics_core::pixel::dither_offset(x, y) * (1.0 / 255.0))
+}
+
+/// Compare EVERY PIXEL of a frame with what it should hold, which is the frozen comparison mask: no border
+/// excluded and no pixel skipped. The first that differs is the answer.
+pub fn every_pixel(frame: &Frame, expected: impl Fn(u32, u32) -> [u8; 4]) -> Result<(), crate::Trouble> {
+	let extent = frame.image.layout().extent;
+	for y in 0..extent.height {
+		for x in 0..extent.width {
+			let (seen, wanted) = (frame.pixel(x, y), expected(x, y));
+			require!(seen == wanted, "pixel ({x}, {y}) holds {seen:?} and should hold exactly {wanted:?}");
+		}
+	}
+	Ok(())
+}
+
+/// A frame in the comparison space the thresholds NAME - linear Rec. 709, premultiplied, at f32 - for a scene
+/// whose expectation is a kernel evaluated at f64, which an eight-bit target would quantise before it could
+/// be compared.
+pub struct Linear {
+	image: OwnedImage,
+}
+
+impl Linear {
+	/// One pixel, premultiplied: red, green, blue, alpha.
+	pub fn value(&self, x: u32, y: u32) -> [f32; 4] {
+		let view = self.image.view();
+		let mut out = [0.0f32; 4];
+		if let Some(pixel) = view.row(y).and_then(|row| row.get(x as usize * 16..x as usize * 16 + 16)) {
+			for (channel, bytes) in out.iter_mut().zip(pixel.chunks_exact(4)) {
+				*channel = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+			}
+		}
+		out
+	}
+
+	pub fn extent(&self) -> Extent2D {
+		self.image.layout().extent
+	}
+
+	/// Compare EVERY PIXEL with what it should be, at f64. A pixel the expectation marks exact must be it to
+	/// the bit in every channel, which is the edge policy for a pixel the drawing covers wholly or not at all;
+	/// any other is a filter's output, and each of its channels must be within the frozen kernel tolerance.
+	pub fn compare(&self, expected: impl Fn(u32, u32) -> ([f64; 4], bool)) -> Result<(), crate::Trouble> {
+		let extent = self.extent();
+		for y in 0..extent.height {
+			for x in 0..extent.width {
+				let (wanted, exact) = expected(x, y);
+				let seen = self.value(x, y);
+				for (channel, (seen, wanted)) in seen.iter().zip(wanted.iter()).enumerate() {
+					let difference = (*seen as f64 - wanted).abs();
+					let within = if exact { *seen as f64 == *wanted } else { difference <= threshold::FILTER_RELATIVE * wanted.abs() };
+					require!(within, "pixel ({x}, {y}) channel {channel} is {seen} and should be {wanted}{}", if exact { " exactly" } else { ", within the frozen 1e-3 relative" });
+				}
+			}
+		}
+		Ok(())
+	}
+}
+
+/// Draw into a target in the named comparison space and hand back its values.
+pub fn draw_linear(width: u32, height: u32, build: impl FnOnce(&mut Canvas) -> Result<(), render2d::Error>) -> Result<Linear, Trouble> {
+	let mut canvas = Canvas::new();
+	build(&mut canvas).map_err(|error| Trouble::Failed(format!("the scene could not be recorded: {error:?}")))?;
+	let list = canvas.finish().map_err(|error| Trouble::Failed(format!("the scene's recording is unbalanced: {error:?}")))?;
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::SrgbLinear, alpha_mode: AlphaMode::Premultiplied };
+	let storage = PixelStorage::Known(PixelFormat::R32G32B32A32Float);
+	let layout = ImageLayout::new(Extent2D::new(width, height), width * 16, storage, RowOrigin::TopLeft, semantics).map_err(|error| Trouble::Failed(format!("the target layout was refused: {error:?}")))?;
+	let mut image = OwnedImage::new(layout).map_err(|error| Trouble::Failed(format!("the target could not be allocated: {error:?}")))?;
+	let description = TargetDescription { extent: image.layout().extent, format: PixelFormat::R32G32B32A32Float, color_space: ColorSpace::SrgbLinear, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
+	let mut backend = Soft2d::new();
+	let prepared = backend.prepare(&list, &description).map_err(|error| Trouble::Unsupported(format!("the backend refused to prepare this drawing: {error:?}")))?;
+	{
+		let mut view = image.view_mut();
+		backend.render(&prepared, &mut view).map_err(|error| Trouble::Unsupported(format!("the backend refused to draw this: {error:?}")))?;
+	}
+	Ok(Linear { image })
+}
+
+/// THE GAUSSIAN THE PROFILE NAMES, EVALUATED AT f64: `exp(-d^2 / 2 sigma^2)` at every whole-pixel offset out
+/// to three standard deviations rounded up - the reach the profile's bounds map gives a blur, and never less
+/// than one pixel or more than the profile's largest filter radius - normalised to sum to one. The first entry
+/// is the farthest tap on the negative side.
+pub fn gaussian(sigma: f64) -> alloc::vec::Vec<f64> {
+	let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_radius as f64;
+	let radius = libm::ceil(sigma * 3.0).clamp(1.0, ceiling) as i64;
+	let weights: alloc::vec::Vec<f64> = (-radius..=radius).map(|distance| libm::exp(-((distance * distance) as f64) / (2.0 * sigma * sigma))).collect();
+	let total: f64 = weights.iter().sum();
+	weights.into_iter().map(|weight| weight / total).collect()
+}
+
+/// One pass of a separable blur at f64: the weighted sum of `value` over the kernel's taps around `at`.
+pub fn blurred(kernel: &[f64], at: i64, value: impl Fn(i64) -> f64) -> f64 {
+	let radius = (kernel.len() as i64 - 1) / 2;
+	kernel.iter().enumerate().map(|(index, weight)| weight * value(at + index as i64 - radius)).sum()
 }
 
 /// Draw into a target of this size and hand back the pixels.

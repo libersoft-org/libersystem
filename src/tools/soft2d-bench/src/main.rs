@@ -6,9 +6,13 @@
 //! becoming a prerequisite of the backend's own floor.
 //!
 //! THE FIXTURES ARE FROZEN AND THIS PROGRAM CHECKS THAT THEY ARE. Each one's command count, resource
-//! count and extent are asserted against the numbers recorded here, so a later simplification cannot
-//! quietly lower the workload and report the same milliseconds against an easier scene. A benchmark
-//! whose workload can drift measures the workload and not the renderer.
+//! count and the digest of its canonical encoding - every command with its paint, every path point,
+//! gradient stop, filter parameter and image record - are asserted against the numbers recorded here,
+//! and so is a digest of the target and of every generated image, pixels and layout. So a later
+//! simplification cannot quietly lower the workload and report the same milliseconds against an easier
+//! scene: a smaller blur, a smaller destination rectangle or a smaller image is a different number, and
+//! the check stops before the clock starts. A benchmark whose workload can drift measures the workload
+//! and not the renderer.
 //!
 //! PREPARATION AND REPLAY ARE REPORTED SEPARATELY, because they are different claims: `prepare`
 //! flattens, strokes, bins and reserves once, and `render` is what a repeated frame costs. The floor
@@ -59,6 +63,8 @@ struct Scene {
 	budget_ms: f64,
 	commands: usize,
 	resources: usize,
+	/// The digest of the list's canonical encoding, `render2d::encode::digest`.
+	list: u64,
 }
 
 /// The scenes, with the frozen counts a fixture is checked against.
@@ -74,18 +80,47 @@ struct Scene {
 /// Budgets were frozen at the first accepted whole serial run on 2026-10-09, at the runner's
 /// reported millisecond precision. See docs/PERF.md; ceilings and fixture content did not change.
 const SCENES: [Scene; 5] = [
-	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 10.837, commands: 252, resources: 153 },
-	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 65.640, commands: 45, resources: 34 },
-	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 65.509, commands: 240, resources: 241 },
+	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 10.837, commands: 252, resources: 153, list: LIST_UI_BASIC },
+	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 65.640, commands: 45, resources: 34, list: LIST_UI_EFFECTS },
+	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 65.509, commands: 240, resources: 241, list: LIST_VECTOR_STRESS },
 	// BOTH CEILINGS ARE INHERITED FROM THE SCENE THESE CAME OUT OF AND NEITHER IS A NEW ANSWER. The
 	// owner was asked whether a video scene's ceiling is 60 Hz at this content or whether the scene
 	// is two scenes, and answered the second; that settles the split and leaves the first question
 	// open for `image-convert`, which is the half that draws two full frames through a transfer
 	// function and a matrix. `image-resample` at 16.7 is not in doubt - UI imagery at UI sizes is a
 	// per-frame cost.
-	Scene { name: "image-resample", ceiling_ms: 16.7, budget_ms: 13.414, commands: 11, resources: 1 },
-	Scene { name: "image-convert", ceiling_ms: 16.7, budget_ms: 16.063, commands: 14, resources: 2 },
+	Scene { name: "image-resample", ceiling_ms: 16.7, budget_ms: 13.414, commands: 11, resources: 1, list: LIST_IMAGE_RESAMPLE },
+	Scene { name: "image-convert", ceiling_ms: 16.7, budget_ms: 16.063, commands: 14, resources: 2, list: LIST_IMAGE_CONVERT },
 ];
+
+/// THE FROZEN DIGESTS of the scenes' canonical encodings, written from a `SOFT2D_BENCH_FREEZE` run.
+const LIST_UI_BASIC: u64 = 0x6c4e_d318_371b_836e;
+const LIST_UI_EFFECTS: u64 = 0x7d72_d6fe_e4c7_1c0b;
+const LIST_VECTOR_STRESS: u64 = 0xe816_acd0_26e1_9b8c;
+const LIST_IMAGE_RESAMPLE: u64 = 0x9a71_0f6f_2ee6_cb02;
+const LIST_IMAGE_CONVERT: u64 = 0x8317_02e7_300a_1871;
+
+/// THE FROZEN DIGEST OF WHAT THE SCENES DRAW FROM AND INTO - the target's extent and format, and every
+/// generated image's layout and pixels - written from a `SOFT2D_BENCH_FREEZE` run. A list names an image by
+/// its identity and not its size, so a smaller photograph would leave every list's digest as it was.
+const CONTENT: u64 = 0x09b0_ce17_ee68_3ae3;
+
+/// FNV-1a over a run of bytes, continuing from `hash` - the same digest `render2d::encode::digest` is.
+fn fnv(hash: u64, bytes: &[u8]) -> u64 {
+	bytes.iter().fold(hash, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// The digest of the target description and of every image the scenes reference, layout and pixels.
+fn content_digest(images: &Images) -> u64 {
+	let mut hash = fnv(0xcbf2_9ce4_8422_2325, format!("{WIDTH}x{HEIGHT} {:?} {:?}", PixelFormat::B8G8R8A8Unorm, ColorSpace::Srgb).as_bytes());
+	for image in [&images.photo, &images.icon, &images.wide] {
+		hash = fnv(hash, format!("{:?}", image.layout()).as_bytes());
+		hash = fnv(hash, image.bytes());
+	}
+	hash = fnv(hash, format!("{:?}", images.video.layout).as_bytes());
+	hash = fnv(hash, &images.video.luma);
+	fnv(hash, &images.video.chroma)
+}
 
 /// The images the scenes reference, under their recorded identities.
 struct Images {
@@ -268,19 +303,27 @@ fn main() {
 		return;
 	}
 	println!("scene\tcommands\tresources\tprepare_ms\treplay_median_ms\treplay_p99_ms\tbudget_ms\tceiling_ms\tverdict\tworkers\tlanes\tunits");
+	let freezing = std::env::var("SOFT2D_BENCH_FREEZE").is_ok();
+	// WHAT THE SCENES DRAW FROM AND INTO IS FROZEN TOO, and checked before any clock starts.
+	if freezing {
+		eprintln!("freeze: content={:#018x}", content_digest(&images));
+	} else {
+		assert_eq!(content_digest(&images), CONTENT, "the frozen target or a generated image changed");
+	}
 	let mut failed = false;
 	for scene in SCENES.iter() {
 		let list = scene_list(scene.name);
 		// THE FROZEN SHAPE IS CHECKED BEFORE THE CLOCK STARTS. A fixture that lost half its commands
 		// would otherwise report a comfortable number against a scene nobody agreed to.
-		if std::env::var("SOFT2D_BENCH_FREEZE").is_ok() {
-			// FREEZING IS AN EXPLICIT ACT. The counts below are what the scenes are, and this prints
-			// them so the constants above can be written from a run rather than guessed - it never
+		if freezing {
+			// FREEZING IS AN EXPLICIT ACT. The counts and digests below are what the scenes are, and this
+			// prints them so the constants above can be written from a run rather than guessed - it never
 			// rewrites them itself, because a benchmark that updates its own workload has none.
-			eprintln!("freeze: {} commands={} resources={}", scene.name, list.commands().len(), resource_count(&list));
+			eprintln!("freeze: {} commands={} resources={} list={:#018x}", scene.name, list.commands().len(), resource_count(&list), render2d::encode::digest(&list));
 		} else {
 			assert_eq!(list.commands().len(), scene.commands, "{}: the frozen command count changed", scene.name);
 			assert_eq!(resource_count(&list), scene.resources, "{}: the frozen resource count changed", scene.name);
+			assert_eq!(render2d::encode::digest(&list), scene.list, "{}: the frozen list changed - a command, a paint, a path, a filter parameter or an image record", scene.name);
 		}
 
 		let mut target = target();

@@ -134,8 +134,9 @@ echo "profile-sysroot: declarations and inventory agree"
 
 # THE THIRD CLAIM. It needs the audit-only upstream, and says so when it is absent rather than
 # passing quietly.
-if [[ ! -d "$ROOT/.build/foreign/src-loader-port" || ! -d "$ROOT/.build/foreign/src-headers" ]]; then
-	echo "profile-sysroot: NOT PERFORMED: the ported sources are not unpacked under .build/foreign, so the archives were not rebuilt against this sysroot"
+# The archives, not the trees: the builder derives every tree it compiles from them.
+if ! compgen -G "$ROOT/.build/foreign/vulkan-loader-*.tar.gz" >/dev/null || ! compgen -G "$ROOT/.build/foreign/vulkan-headers-*.tar.gz" >/dev/null; then
+	echo "profile-sysroot: NOT PERFORMED: the pinned upstream archives are not under .build/foreign, so the archives were not rebuilt against this sysroot"
 	exit 0
 fi
 

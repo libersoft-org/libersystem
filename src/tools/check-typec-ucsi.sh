@@ -224,7 +224,7 @@ probe await 2 partner device
 result="$(probe enter 2 ff01 000c0045)"
 [[ "$result" == *"answer enter 2: done"* ]] || fail "v12: DisplayPort must be entered under the override (read: $result)"
 probe await 2 entered ff01
-grep -q "SET_NEW_CAM connector 2 enter offset 0 configuration 0x00000805" "$fixture/ppm-$label.log" || fail "v12: the PPM must have been asked for DisplayPort with pin assignment D"
+grep -q "SET_NEW_CAM connector 2 enter offset 0 configuration 0x00000806" "$fixture/ppm-$label.log" || fail "v12: the PPM must have been asked for DisplayPort with pin assignment D"
 # THE PPM GONE SILENT: the change it announces is read into silence, the connectors reported not answering, and the
 # PPM reset and read again once it answers.
 silent_out="$state/await-silent.log"
@@ -417,8 +417,13 @@ sleep 2
 ppm_across "S3"
 probe await 1 detached
 echo "typec-ucsi: sleep: the detach the PPM made while the guest was in S3 was reported after the resume"
+# AND THE CONNECTOR'S NEXT CHANGE IS ANNOUNCED. The resume reads the detach; the change the PPM indicated with it has to
+# be acknowledged as a change too, or the PPM keeps it pending and announces nothing more for that connector.
+ppm "attach 1 charger" >/dev/null
+probe await 1 contract 9000
+echo "typec-ucsi: sleep: an attach after the resume was announced and read - the change the resume read was acknowledged"
 kill "$follower" 2>/dev/null || true
 cp -f "$state/serial-stamped-$label.log" "$kept/" 2>/dev/null || true
 take_down
 unset QEMU_EXTRA
-echo "typec-ucsi: PASS - UCSI 1.2 and 2.1 through the _CID match: a charger's offers and contract, its supply beside the ACPI adapter and measured under 2.1, a data-role swap done, a power-role swap refused with the PPM's error, DisplayPort entered under the override and refused without it, a mode the PPM entered itself reported, malformed answers refused and a silent PPM recovered, a slow PPM served past its slow start, a spoiling one served as the others, a suspend to idle and an S3 cycle with no command while asleep and every connector read after it, a detach made in S3 reported - and no break of the command discipline"
+echo "typec-ucsi: PASS - UCSI 1.2 and 2.1 through the _CID match: a charger's offers and contract, its supply beside the ACPI adapter and measured under 2.1, a data-role swap done, a power-role swap refused with the PPM's error, DisplayPort entered under the override and refused without it, a mode the PPM entered itself reported, malformed answers refused and a silent PPM recovered, a slow PPM served past its slow start, a spoiling one served as the others, a suspend to idle and an S3 cycle with no command while asleep and every connector read after it, a detach made in S3 reported and the connector's next attach announced - and no break of the command discipline"

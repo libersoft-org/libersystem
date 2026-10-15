@@ -455,13 +455,224 @@ mod build {
 		tables.push((*b"maxp", maxp(5)));
 		font(&tables)
 	}
+
+	/// A `cmap` with one format 12 subtable in the Windows full-Unicode record, mapping the
+	/// characters given - which is what lets a fixture ask the face the question a real caller asks.
+	pub fn cmap(entries: &[(char, u16)]) -> std::vec::Vec<u8> {
+		let mut sorted = entries.to_vec();
+		sorted.sort_by_key(|(character, _)| *character as u32);
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 0);
+		u16(&mut out, 1);
+		u16(&mut out, 3);
+		u16(&mut out, 10);
+		u32(&mut out, 12);
+		u16(&mut out, 12);
+		u16(&mut out, 0);
+		u32(&mut out, (16 + 12 * sorted.len()) as u32);
+		u32(&mut out, 0);
+		u32(&mut out, sorted.len() as u32);
+		for (character, glyph) in sorted {
+			u32(&mut out, character as u32);
+			u32(&mut out, character as u32);
+			u32(&mut out, glyph as u32);
+		}
+		out
+	}
+
+	/// A layout table with ONE LOOKUP PER FEATURE - feature `i` names lookup `i` - under `DFLT`,
+	/// whose default language system selects the features `default` names and whose named language
+	/// systems select theirs.
+	pub fn layout_features(features: &[([u8; 4], std::vec::Vec<u8>)], default: &[u16], languages: &[([u8; 4], &[u16])]) -> std::vec::Vec<u8> {
+		let lang_sys = |indices: &[u16]| {
+			let mut out = std::vec::Vec::new();
+			u16(&mut out, 0);
+			u16(&mut out, 0xFFFF);
+			u16(&mut out, indices.len() as u16);
+			for index in indices {
+				u16(&mut out, *index);
+			}
+			out
+		};
+		let default_system = lang_sys(default);
+		let named: std::vec::Vec<std::vec::Vec<u8>> = languages.iter().map(|(_, indices)| lang_sys(indices)).collect();
+		let header = 4 + 6 * languages.len();
+		let mut script = std::vec::Vec::new();
+		u16(&mut script, header as u16);
+		u16(&mut script, languages.len() as u16);
+		let mut at = header + default_system.len();
+		for ((tag, _), body) in languages.iter().zip(&named) {
+			script.extend_from_slice(tag);
+			u16(&mut script, at as u16);
+			at += body.len();
+		}
+		script.extend_from_slice(&default_system);
+		for body in &named {
+			script.extend_from_slice(body);
+		}
+
+		let mut script_list = std::vec::Vec::new();
+		u16(&mut script_list, 1);
+		script_list.extend_from_slice(b"DFLT");
+		u16(&mut script_list, 8);
+		script_list.extend_from_slice(&script);
+
+		let bodies: std::vec::Vec<std::vec::Vec<u8>> = (0..features.len())
+			.map(|index| {
+				let mut body = std::vec::Vec::new();
+				u16(&mut body, 0);
+				u16(&mut body, 1);
+				u16(&mut body, index as u16);
+				body
+			})
+			.collect();
+		let mut feature_list = std::vec::Vec::new();
+		u16(&mut feature_list, features.len() as u16);
+		let mut at = 2 + 6 * features.len();
+		for ((tag, _), body) in features.iter().zip(&bodies) {
+			feature_list.extend_from_slice(tag);
+			u16(&mut feature_list, at as u16);
+			at += body.len();
+		}
+		for body in &bodies {
+			feature_list.extend_from_slice(body);
+		}
+
+		let mut lookup_list = std::vec::Vec::new();
+		u16(&mut lookup_list, features.len() as u16);
+		let mut at = 2 + 2 * features.len();
+		for (_, lookup) in features {
+			u16(&mut lookup_list, at as u16);
+			at += lookup.len();
+		}
+		for (_, lookup) in features {
+			lookup_list.extend_from_slice(lookup);
+		}
+
+		let script_at = 10usize;
+		let feature_at = script_at + script_list.len();
+		let lookup_at = feature_at + feature_list.len();
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 1);
+		u16(&mut out, 0);
+		u16(&mut out, script_at as u16);
+		u16(&mut out, feature_at as u16);
+		u16(&mut out, lookup_at as u16);
+		out.extend_from_slice(&script_list);
+		out.extend_from_slice(&feature_list);
+		out.extend_from_slice(&lookup_list);
+		out
+	}
+
+	/// A bare two-component ligature LOOKUP: `first` + `second` becomes `result`.
+	pub fn ligature_lookup(first: u16, second: u16, result: u16) -> std::vec::Vec<u8> {
+		let mut ligature = std::vec::Vec::new();
+		u16(&mut ligature, result);
+		u16(&mut ligature, 2);
+		u16(&mut ligature, second);
+		let mut set = std::vec::Vec::new();
+		u16(&mut set, 1);
+		u16(&mut set, 4);
+		set.extend_from_slice(&ligature);
+		let coverage = coverage(&[first]);
+		let coverage_at = 8usize;
+		let set_at = coverage_at + coverage.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, coverage_at as u16);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, set_at as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&set);
+		lookup(4, 0, subtable)
+	}
+
+	/// A bare pair-kerning LOOKUP: `first` before `second` changes the first's advance by `kern`.
+	pub fn kern_lookup(first: u16, second: u16, kern: i16) -> std::vec::Vec<u8> {
+		let mut pair_set = std::vec::Vec::new();
+		u16(&mut pair_set, 1);
+		u16(&mut pair_set, second);
+		u16(&mut pair_set, kern as u16);
+		let coverage = coverage(&[first]);
+		let coverage_at = 12usize;
+		let set_at = coverage_at + coverage.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, coverage_at as u16);
+		u16(&mut subtable, 0x0004);
+		u16(&mut subtable, 0x0000);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, set_at as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&pair_set);
+		lookup(2, 0, subtable)
+	}
+
+	/// A bare mark-to-base LOOKUP: `mark` attaches to `base` at the anchors given.
+	pub fn mark_lookup(base: u16, mark: u16, base_anchor: (i16, i16), mark_anchor: (i16, i16)) -> std::vec::Vec<u8> {
+		let anchor = |(x, y): (i16, i16)| {
+			let mut out = std::vec::Vec::new();
+			u16(&mut out, 1);
+			u16(&mut out, x as u16);
+			u16(&mut out, y as u16);
+			out
+		};
+		let mark_coverage = coverage(&[mark]);
+		let base_coverage = coverage(&[base]);
+		let mut mark_array = std::vec::Vec::new();
+		u16(&mut mark_array, 1);
+		u16(&mut mark_array, 0);
+		u16(&mut mark_array, 6);
+		mark_array.extend_from_slice(&anchor(mark_anchor));
+		let mut base_array = std::vec::Vec::new();
+		u16(&mut base_array, 1);
+		u16(&mut base_array, 4);
+		base_array.extend_from_slice(&anchor(base_anchor));
+		let mark_coverage_at = 12usize;
+		let base_coverage_at = mark_coverage_at + mark_coverage.len();
+		let mark_array_at = base_coverage_at + base_coverage.len();
+		let base_array_at = mark_array_at + mark_array.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, mark_coverage_at as u16);
+		u16(&mut subtable, base_coverage_at as u16);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, mark_array_at as u16);
+		u16(&mut subtable, base_array_at as u16);
+		subtable.extend_from_slice(&mark_coverage);
+		subtable.extend_from_slice(&base_coverage);
+		subtable.extend_from_slice(&mark_array);
+		subtable.extend_from_slice(&base_array);
+		lookup(4, 0, subtable)
+	}
+
+	/// A face of `glyphs` glyphs carrying a `cmap` and whichever layout tables are given.
+	pub fn mapped(characters: &[(char, u16)], gsub: Option<std::vec::Vec<u8>>, gpos: Option<std::vec::Vec<u8>>, gdef: Option<std::vec::Vec<u8>>, glyphs: u16) -> std::vec::Vec<u8> {
+		let mut tables: std::vec::Vec<([u8; 4], std::vec::Vec<u8>)> = std::vec::Vec::new();
+		if let Some(gdef) = gdef {
+			tables.push((*b"GDEF", gdef));
+		}
+		if let Some(gpos) = gpos {
+			tables.push((*b"GPOS", gpos));
+		}
+		if let Some(gsub) = gsub {
+			tables.push((*b"GSUB", gsub));
+		}
+		tables.push((*b"cmap", cmap(characters)));
+		tables.push((*b"head", head()));
+		tables.push((*b"hhea", hhea(glyphs)));
+		let advances: std::vec::Vec<u16> = (0..glyphs).map(|index| 200 + index * 3).collect();
+		tables.push((*b"hmtx", hmtx(&advances)));
+		tables.push((*b"maxp", maxp(glyphs)));
+		font(&tables)
+	}
 }
 
 /// A buffer of the glyphs given, each its own cluster.
 fn glyphs(glyphs: &[u16]) -> Buffer {
 	let mut buffer = Buffer::new();
 	for (index, glyph) in glyphs.iter().enumerate() {
-		buffer.push(*glyph, index as u32);
+		buffer.push(*glyph, index as u32).expect("room for a glyph");
 	}
 	buffer
 }
@@ -546,7 +757,7 @@ fn a_font_with_no_layout_tables_shapes_to_its_own_advances() {
 // cluster, and a ligature takes the first one's.
 fn the_buffer_keeps_clusters_through_substitution() {
 	let mut buffer = glyphs(&[1, 2, 3]);
-	buffer.decompose(1, &[7, 8, 9]);
+	buffer.decompose(1, &[7, 8, 9]).expect("a decomposition well inside the ceiling");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![1, 7, 8, 9, 3]);
 	assert_eq!(buffer.infos.iter().map(|info| info.cluster).collect::<std::vec::Vec<_>>(), std::vec![0, 1, 1, 1, 2]);
 	assert_eq!(buffer.positions.len(), buffer.infos.len(), "a position per glyph, always");
@@ -568,21 +779,21 @@ fn the_buffer_keeps_clusters_through_substitution() {
 fn a_cursive_run_takes_the_joining_form_each_letter_can_reach() {
 	use crate::scripts::{Form, cursive_forms};
 	// BEH is dual-joining, ALEF joins only to its right. `بب` is initial then final.
-	assert_eq!(cursive_forms(&['\u{0628}', '\u{0628}']), std::vec![Form::Initial, Form::Final]);
+	assert_eq!(cursive_forms(&['\u{0628}', '\u{0628}']), Ok(std::vec![Form::Initial, Form::Final]));
 	// Three of them: initial, medial, final.
-	assert_eq!(cursive_forms(&['\u{0628}', '\u{0628}', '\u{0628}']), std::vec![Form::Initial, Form::Medial, Form::Final]);
+	assert_eq!(cursive_forms(&['\u{0628}', '\u{0628}', '\u{0628}']), Ok(std::vec![Form::Initial, Form::Medial, Form::Final]));
 	// A letter alone is isolated.
-	assert_eq!(cursive_forms(&['\u{0628}']), std::vec![Form::Isolated]);
+	assert_eq!(cursive_forms(&['\u{0628}']), Ok(std::vec![Form::Isolated]));
 	// ALEF joins BACKWARD only, so what follows it starts a new join: `با` is initial, final; but
 	// `اب` is isolated, isolated - the alef cannot reach forward.
-	assert_eq!(cursive_forms(&['\u{0628}', '\u{0627}']), std::vec![Form::Initial, Form::Final]);
-	assert_eq!(cursive_forms(&['\u{0627}', '\u{0628}']), std::vec![Form::Isolated, Form::Isolated]);
+	assert_eq!(cursive_forms(&['\u{0628}', '\u{0627}']), Ok(std::vec![Form::Initial, Form::Final]));
+	assert_eq!(cursive_forms(&['\u{0627}', '\u{0628}']), Ok(std::vec![Form::Isolated, Form::Isolated]));
 	// A SPACE BREAKS THE JOIN, which is what makes a word a word.
-	assert_eq!(cursive_forms(&['\u{0628}', ' ', '\u{0628}']), std::vec![Form::Isolated, Form::Isolated, Form::Isolated]);
+	assert_eq!(cursive_forms(&['\u{0628}', ' ', '\u{0628}']), Ok(std::vec![Form::Isolated, Form::Isolated, Form::Isolated]));
 	// AND A MARK BETWEEN TWO LETTERS IS TRANSPARENT. This is the rule a shaper looking at its
 	// immediate neighbour gets wrong, and in Arabic a vowel mark sits between letters constantly -
 	// so that shaper breaks the join almost everywhere.
-	assert_eq!(cursive_forms(&['\u{0628}', '\u{064E}', '\u{0628}']), std::vec![Form::Initial, Form::Isolated, Form::Final]);
+	assert_eq!(cursive_forms(&['\u{0628}', '\u{064E}', '\u{0628}']), Ok(std::vec![Form::Initial, Form::Isolated, Form::Final]));
 }
 
 #[test]
@@ -593,7 +804,7 @@ fn the_positional_features_apply_only_where_their_form_was_decided() {
 	use crate::scripts::{FINA, INIT, MEDI, apply_cursive_masks};
 	let characters = ['\u{0628}', '\u{0628}', '\u{0628}'];
 	let mut buffer = glyphs(&[1, 1, 1]);
-	apply_cursive_masks(&mut buffer, &characters);
+	apply_cursive_masks(&mut buffer, &characters).expect("masks");
 	assert_eq!(buffer.infos[0].mask & INIT, INIT);
 	assert_eq!(buffer.infos[0].mask & FINA, 0, "the first letter is not a final form");
 	assert_eq!(buffer.infos[1].mask & MEDI, MEDI);
@@ -605,7 +816,7 @@ fn the_positional_features_apply_only_where_their_form_was_decided() {
 	let bytes = build::sample(Some(build::gsub_single(b"fina", 1, 4)), None, None);
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	let mut buffer = glyphs(&[1, 1, 1]);
-	apply_cursive_masks(&mut buffer, &characters);
+	apply_cursive_masks(&mut buffer, &characters).expect("masks");
 	shape_with_masks(&face, &mut buffer, *b"DFLT", *b"dflt", &crate::scripts::cursive_features()).expect("shaping");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![1, 1, 4], "only the final form was substituted");
 }
@@ -630,25 +841,25 @@ fn an_indic_pre_base_vowel_is_moved_in_front_of_its_consonant() {
 	use crate::scripts::{reorder_indic, syllable_starts};
 	// क ि - KA followed by the pre-base vowel sign I.
 	let characters = ['\u{0915}', '\u{093F}'];
-	assert_eq!(syllable_starts(&characters), std::vec![0], "one syllable");
+	assert_eq!(syllable_starts(&characters), Ok(std::vec![0]), "one syllable");
 	let mut buffer = glyphs(&[10, 11]);
-	reorder_indic(&characters, &mut buffer);
+	reorder_indic(&characters, &mut buffer).expect("reordering");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![11, 10], "the vowel sign is drawn first");
 	// A post-base sign is left where it is: ा is `Right`, not `Left`.
 	let characters = ['\u{0915}', '\u{093E}'];
 	let mut buffer = glyphs(&[10, 12]);
-	reorder_indic(&characters, &mut buffer);
+	reorder_indic(&characters, &mut buffer).expect("reordering");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![10, 12]);
 	// TWO SYLLABLES REORDER INDEPENDENTLY, which is what the syllable boundaries are for: the vowel
 	// of the second must not travel to the front of the first.
 	let characters = ['\u{0915}', '\u{093F}', '\u{0916}', '\u{093F}'];
-	assert_eq!(syllable_starts(&characters), std::vec![0, 2]);
+	assert_eq!(syllable_starts(&characters), Ok(std::vec![0, 2]));
 	let mut buffer = glyphs(&[10, 11, 20, 21]);
-	reorder_indic(&characters, &mut buffer);
+	reorder_indic(&characters, &mut buffer).expect("reordering");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![11, 10, 21, 20]);
 	// AND A CONJUNCT IS ONE SYLLABLE: consonant, virama, consonant.
 	let characters = ['\u{0915}', '\u{094D}', '\u{0937}'];
-	assert_eq!(syllable_starts(&characters), std::vec![0], "the virama binds the next consonant in");
+	assert_eq!(syllable_starts(&characters), Ok(std::vec![0]), "the virama binds the next consonant in");
 }
 
 #[test]
@@ -660,24 +871,24 @@ fn hangul_jamo_compose_into_the_syllable_a_font_has_a_glyph_for() {
 	// ᄒ ᅡ ᆫ becomes 한, three jamo to one syllable.
 	let characters = ['\u{1112}', '\u{1161}', '\u{11AB}'];
 	let mut buffer = glyphs(&[1, 2, 3]);
-	let composed = compose_hangul(&characters, &mut buffer);
+	let composed = compose_hangul(&characters, &mut buffer).expect("composition");
 	assert_eq!(composed, std::vec!['\u{D55C}']);
 	assert_eq!(buffer.len(), 1, "the buffer follows the characters");
 	assert_eq!(buffer.infos[0].cluster, 0, "and keeps the first jamo's cluster");
 	// Two jamo with no trailing consonant compose too: ᄀ ᅡ becomes 가.
 	let characters = ['\u{1100}', '\u{1161}'];
 	let mut buffer = glyphs(&[1, 2]);
-	assert_eq!(compose_hangul(&characters, &mut buffer), std::vec!['\u{AC00}']);
+	assert_eq!(compose_hangul(&characters, &mut buffer), Ok(std::vec!['\u{AC00}']));
 	// A LEAD WITH NOTHING TO COMPOSE WITH IS LEFT ALONE rather than dropped, which is what a font
 	// carrying real jamo glyphs needs.
 	let characters = ['\u{1100}', 'a'];
 	let mut buffer = glyphs(&[1, 2]);
-	assert_eq!(compose_hangul(&characters, &mut buffer), std::vec!['\u{1100}', 'a']);
+	assert_eq!(compose_hangul(&characters, &mut buffer), Ok(std::vec!['\u{1100}', 'a']));
 	assert_eq!(buffer.len(), 2);
 	// And an already-composed syllable passes through untouched.
 	let characters = ['\u{D55C}'];
 	let mut buffer = glyphs(&[9]);
-	assert_eq!(compose_hangul(&characters, &mut buffer), std::vec!['\u{D55C}']);
+	assert_eq!(compose_hangul(&characters, &mut buffer), Ok(std::vec!['\u{D55C}']));
 }
 
 #[test]
@@ -688,12 +899,12 @@ fn myanmar_moves_its_medial_and_pre_base_vowel_in_front() {
 	// က ြ ေ - KA, medial RA, vowel E: drawn as medial, vowel, consonant.
 	let characters = ['\u{1000}', '\u{103C}', '\u{1031}'];
 	let mut buffer = glyphs(&[10, 11, 12]);
-	reorder_myanmar(&characters, &mut buffer);
+	reorder_myanmar(&characters, &mut buffer).expect("reordering");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![11, 12, 10]);
 	// A consonant with neither is left where it is.
 	let characters = ['\u{1000}', '\u{102C}'];
 	let mut buffer = glyphs(&[10, 13]);
-	reorder_myanmar(&characters, &mut buffer);
+	reorder_myanmar(&characters, &mut buffer).expect("reordering");
 	assert_eq!(buffer.infos.iter().map(|info| info.glyph).collect::<std::vec::Vec<_>>(), std::vec![10, 13]);
 }
 
@@ -787,7 +998,7 @@ fn a_run_past_the_frozen_input_ceiling_is_refused_before_any_work_is_done() {
 	let characters: std::vec::Vec<char> = core::iter::repeat_n('a', ceiling).collect();
 	let mut buffer = Buffer::new();
 	for (index, _) in characters.iter().enumerate() {
-		buffer.push(1, index as u32);
+		buffer.push(1, index as u32).expect("room for a glyph");
 	}
 	assert!(crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt").is_ok());
 }
@@ -837,9 +1048,13 @@ fn a_layout_table_corrupted_anywhere_is_refused_rather_than_read_past() {
 				// And through the script path too, which runs a shaper's own pass before any lookup.
 				let mut buffer = Buffer::new();
 				for (index, _) in ['a', 'b', 'c'].iter().enumerate() {
-					buffer.push(index as u16 + 1, index as u32);
+					buffer.push(index as u16 + 1, index as u32).expect("room for a glyph");
 				}
 				let _ = crate::shape::shape_run(&face, &mut buffer, &['a', 'b', 'c'], *b"dflt");
+				// AND THROUGH THE INDIC PLAN, which asks the face's `GSUB` about pairs of glyphs
+				// before any lookup runs - another walk of the same offsets.
+				let mut buffer = glyphs(&[1, 2, 3]);
+				let _ = crate::shape::shape_run(&face, &mut buffer, &['\u{0930}', '\u{094D}', '\u{0915}'], *b"dflt");
 			}
 		}
 	}
@@ -925,4 +1140,287 @@ fn a_contextual_chain_runs_to_the_frozen_depth_and_no_further() {
 
 	// One more link is refused by name.
 	assert_eq!(chain(ceiling + 1).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "context depth", ceiling: opentype_profile::limits::CONTEXT_DEPTH, asked: opentype_profile::limits::CONTEXT_DEPTH as u64 + 1 })));
+}
+
+/// Shape a string the way a caller does: every character mapped through the face's `cmap`, every
+/// glyph's cluster the byte offset of the character it came from.
+fn shaped_buffer(face: &Face<'_>, text: &str, language: [u8; 4]) -> Buffer {
+	let characters: std::vec::Vec<char> = text.chars().collect();
+	let mut buffer = Buffer::new();
+	for (offset, character) in text.char_indices() {
+		let glyph = face.glyph_for(character).expect("a readable cmap").expect("a character the fixture face maps");
+		buffer.push(glyph, offset as u32).expect("room for a glyph");
+	}
+	shape_run(face, &mut buffer, &characters, language).expect("shaping");
+	buffer
+}
+
+fn glyph_ids(buffer: &Buffer) -> std::vec::Vec<u16> {
+	buffer.infos.iter().map(|info| info.glyph).collect()
+}
+
+#[test]
+// `locl` IS WHAT A LANGUAGE CHANGES. The profile's languages are defined by it - Turkish dotless i,
+// Romanian comma-below, the Serbian italic forms - and a shaper that selected the language system and
+// never applied `locl` rendered every one of them as the default language.
+fn the_local_forms_of_a_language_apply_under_that_language_only() {
+	let gsub = build::layout_features(&[(*b"locl", build::single_lookup(1, 4))], &[], &[(*b"TRK ", &[0])]);
+	let bytes = build::sample(Some(gsub), None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[1]);
+	shape_run(&face, &mut buffer, &['i'], *b"TRK ").expect("shaping");
+	assert_eq!(glyph_ids(&buffer), std::vec![4], "Turkish selects its local form");
+	let mut buffer = glyphs(&[1]);
+	shape_run(&face, &mut buffer, &['i'], *b"dflt").expect("shaping");
+	assert_eq!(glyph_ids(&buffer), std::vec![1], "and the default language does not");
+}
+
+#[test]
+// A SCRIPT OUTSIDE THE PROFILE IS REFUSED, NOT SHAPED. Adlam and Mandaic join and the profile names
+// neither: shaping them with the cursive engine under `DFLT` was a silent best effort, with rules
+// nobody undertook to get right for them, and text in any other unnamed script went the same way.
+fn text_in_a_script_the_profile_does_not_name_is_refused() {
+	use crate::scripts::{Shaper, profile_script, shaper_for};
+	let bytes = build::sample(None, None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	for (text, name) in [(&['\u{1E900}', '\u{1E901}'][..], "Adlam"), (&['\u{0840}'][..], "Mandaic"), (&['\u{13A0}'][..], "Cherokee"), (&['a', ' ', '\u{1E900}'][..], "Adlam")] {
+		let mut buffer = glyphs(&std::vec![1; text.len()]);
+		assert_eq!(shape_run(&face, &mut buffer, text, *b"dflt").err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::TextScript(name))), "{name} text was shaped");
+	}
+	assert_eq!(shaper_for(&['\u{1E900}']), Shaper::Default, "no engine is chosen for a script the profile does not name");
+	// TEXT THAT DECIDES NO SCRIPT IS NEVER REFUSED - digits, a mark with nothing before it, a
+	// private-use icon - and every script the profile does name is shaped: Bopomofo too, which the
+	// shaper had no tag for.
+	for text in [&['1', '2'][..], &['\u{0301}'][..], &['\u{E000}'][..], &['\u{3105}'][..], &['a', '1'][..]] {
+		let mut buffer = glyphs(&std::vec![1; text.len()]);
+		assert!(shape_run(&face, &mut buffer, text, *b"dflt").is_ok(), "{text:?} was refused");
+	}
+	assert_eq!(profile_script(&['\u{3105}']), Ok(*b"bopo"));
+	assert_eq!(profile_script(&[' ', '\u{E000}']), Ok(*b"DFLT"), "nothing to decide by");
+}
+
+#[test]
+// KERNING IS NOT A LATIN FEATURE. An Arabic face kerns its joined forms the way any face kerns its
+// letters, and the cursive shaper's set never asked for `kern`.
+fn a_cursive_run_is_kerned() {
+	let gpos = build::layout_features(&[(*b"kern", build::kern_lookup(1, 2, -50))], &[0], &[]);
+	let bytes = build::sample(None, Some(gpos), None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[1, 2]);
+	shape_run(&face, &mut buffer, &['\u{0628}', '\u{0628}'], *b"dflt").expect("shaping");
+	assert_eq!(buffer.positions[0].x_advance, 300 - 50, "300 from hmtx, less the pair the face declares");
+}
+
+#[test]
+// `rtlm` REACHES THE GLYPHS THE CALLER MARKED AND NO OTHERS. A right-to-left glyph the caller drew
+// from the mirror character already faces the right way, and the face's own mirrored form applied
+// to it as well would turn it back - so the caller marks the ones it did not mirror, and the joining
+// pass must keep that mark rather than overwrite it with the joining forms.
+fn the_faces_mirrored_forms_apply_where_the_caller_marked_them() {
+	let gsub = build::layout_features(&[(*b"rtlm", build::single_lookup(1, 4))], &[0], &[]);
+	let bytes = build::sample(Some(gsub), None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut buffer = glyphs(&[1, 1]);
+	buffer.infos[0].mask |= crate::buffer::RTLM;
+	shape_run(&face, &mut buffer, &['\u{0628}', '\u{0628}'], *b"dflt").expect("shaping");
+	assert_eq!(glyph_ids(&buffer), std::vec![4, 1]);
+}
+
+/// The glyphs of the Indic fixture face.
+mod indic_face {
+	pub const KA: u16 = 1;
+	pub const RA: u16 = 3;
+	pub const VIRAMA: u16 = 4;
+	pub const AA: u16 = 5;
+	pub const REPH: u16 = 6;
+	pub const HALF_KA: u16 = 7;
+	pub const RA_BELOW: u16 = 8;
+	pub const ANUSVARA: u16 = 9;
+	pub const ZWJ: u16 = 10;
+	pub const SIGN_I: u16 = 11;
+	pub const GLYPHS: u16 = 12;
+
+	/// Devanagari, Bengali and Telugu share the fixture's glyphs: what is under test is where each
+	/// script's shaping puts them, not what they look like.
+	pub const CHARACTERS: [(char, u16); 15] = [
+		('\u{0915}', KA),
+		('\u{0930}', RA),
+		('\u{094D}', VIRAMA),
+		('\u{093E}', AA),
+		('\u{093F}', SIGN_I),
+		('\u{0902}', ANUSVARA),
+		('\u{0995}', KA),
+		('\u{09B0}', RA),
+		('\u{09CD}', VIRAMA),
+		('\u{09BE}', AA),
+		('\u{0C15}', KA),
+		('\u{0C30}', RA),
+		('\u{0C4D}', VIRAMA),
+		('\u{200D}', ZWJ),
+		('\u{0020}', 2),
+	];
+}
+
+/// A face for the Indic fixtures: `rphf` forms the reph from Ra and virama, `half` the half form of
+/// ka - and, when `below` is set, `blwf` a below-base form of Ra.
+fn indic_face(below: bool, gpos: Option<std::vec::Vec<u8>>, gdef: Option<std::vec::Vec<u8>>) -> std::vec::Vec<u8> {
+	use indic_face::*;
+	let mut features = std::vec![(*b"rphf", build::ligature_lookup(RA, VIRAMA, REPH)), (*b"half", build::ligature_lookup(KA, VIRAMA, HALF_KA))];
+	if below {
+		features.push((*b"blwf", build::ligature_lookup(VIRAMA, RA, RA_BELOW)));
+	}
+	let all: std::vec::Vec<u16> = (0..features.len() as u16).collect();
+	let gsub = build::layout_features(&features, &all, &[]);
+	build::mapped(&CHARACTERS, Some(gsub), gpos, gdef, GLYPHS)
+}
+
+#[test]
+// A POSITIONAL FEATURE APPLIED TO THE WHOLE RUN IS NOT POSITIONAL. `half` is the form of a consonant
+// BEFORE its syllable's base and `rphf` is a syllable-initial Ra with a base after it. Applied
+// everywhere, the dead consonant that ends a word became a half form and a word-final `र्` a reph
+// floating over nothing.
+fn the_indic_forms_apply_only_where_their_syllable_puts_them() {
+	use indic_face::*;
+	let bytes = indic_face(false, None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	// क् ending a word: the consonant is its own base, so it keeps its virama and takes no half form.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0915}\u{094D}", *b"dflt")), std::vec![KA, VIRAMA]);
+	// कर्: the र् ends the word with no base after it - a dead Ra, not a reph.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0915}\u{0930}\u{094D}", *b"dflt")), std::vec![KA, RA, VIRAMA]);
+	// AND WHERE THEY DO BELONG THEY STILL FORM: a half form before the base,
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0915}\u{094D}\u{0930}", *b"dflt")), std::vec![HALF_KA, RA]);
+	// and one asked for explicitly, with a ZWJ after the virama at the end of a word.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0915}\u{094D}\u{200D}", *b"dflt")), std::vec![HALF_KA, ZWJ]);
+}
+
+#[test]
+// THE REPH IS WRITTEN FIRST AND DRAWN LAST. Once `rphf` has formed it, the final reordering moves it
+// to where its script draws it, and its cluster goes with it - the cluster follows the glyph, as it
+// does for a pre-base vowel sign.
+fn the_reph_is_moved_to_where_its_script_draws_it() {
+	use indic_face::*;
+	let bytes = indic_face(false, None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let pairs = |text: &str| shaped_buffer(&face, text, *b"dflt").infos.iter().map(|info| (info.glyph, info.cluster)).collect::<std::vec::Vec<_>>();
+	// र्क: after its base, still carrying the Ra's cluster.
+	assert_eq!(pairs("\u{0930}\u{094D}\u{0915}"), std::vec![(KA, 6), (REPH, 0)]);
+	// DEVANAGARI DRAWS IT AT THE END OF THE SYLLABLE: after a right-side vowel sign, before the
+	// anusvara.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0930}\u{094D}\u{0915}\u{093E}\u{0902}", *b"dflt")), std::vec![KA, AA, REPH, ANUSVARA]);
+	// A PRE-BASE VOWEL SIGN GOES IN FRONT OF THE BASE AND BEHIND THE REPH STILL TO FORM, or it would
+	// split the two characters the reph is made of: र्कि.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0930}\u{094D}\u{0915}\u{093F}", *b"dflt")), std::vec![SIGN_I, KA, REPH]);
+	// BENGALI DRAWS IT AFTER THE BASE AND BEFORE A RIGHT-SIDE VOWEL SIGN.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{09B0}\u{09CD}\u{0995}\u{09BE}", *b"dflt")), std::vec![KA, REPH, AA]);
+	// TELUGU WRITES IT EXPLICITLY, as Ra, virama, ZWJ - and there Ra, virama before a consonant is not
+	// a reph at all.
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0C30}\u{0C4D}\u{200D}\u{0C15}", *b"dflt")), std::vec![ZWJ, KA, REPH]);
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0C30}\u{0C4D}\u{0C15}", *b"dflt")), std::vec![RA, VIRAMA, KA]);
+}
+
+#[test]
+// THE BASE IS THE FACE'S QUESTION AS MUCH AS THE TEXT'S. In क्र the र is either a consonant of its
+// own or a form drawn below the क; with a face whose `blwf` has that form the क is the base - so it
+// takes no half form, and the र is drawn below it.
+fn a_consonant_the_face_draws_below_the_base_does_not_become_the_base() {
+	use indic_face::*;
+	let bytes = indic_face(true, None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	assert_eq!(glyph_ids(&shaped_buffer(&face, "\u{0915}\u{094D}\u{0930}", *b"dflt")), std::vec![KA, RA_BELOW]);
+}
+
+#[test]
+// THE INDIC MARK FEATURES. A face written for these scripts places its reph, its below-base forms
+// and its vowel signs through `abvm` and `blwm` rather than through `mark`, and a shaper that never
+// asked for them left the reph at the pen.
+fn the_reph_is_placed_by_the_above_base_mark_feature() {
+	use indic_face::*;
+	let gpos = build::layout_features(&[(*b"abvm", build::mark_lookup(KA, REPH, (300, 700), (50, 0)))], &[0], &[]);
+	let bytes = indic_face(false, Some(gpos), Some(build::gdef(&[REPH])));
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let buffer = shaped_buffer(&face, "\u{0930}\u{094D}\u{0915}", *b"dflt");
+	assert_eq!(glyph_ids(&buffer), std::vec![KA, REPH]);
+	// The base's anchor, less the mark's, less the advance the pen made over the base: 300 - 50 - 203.
+	assert_eq!((buffer.positions[1].x_offset, buffer.positions[1].y_offset), (47, 700));
+	assert_eq!(buffer.infos[1].attached_to, Some(0));
+}
+
+#[test]
+// A FACE THAT MULTIPLIES EVERY GLYPH IS REFUSED AS IT GROWS, not after: the run's output ceiling is
+// held where a decomposition grows the buffer, or the memory for the whole expansion would have been
+// handed over before the count was ever looked at.
+fn a_decomposition_past_the_frozen_output_ceiling_is_refused_while_it_grows() {
+	let ceiling = opentype_profile::limits::RUN_OUTPUT as usize;
+	let mut buffer = Buffer::new();
+	for index in 0..ceiling - 1 {
+		buffer.push(1, index as u32).expect("room for a glyph");
+	}
+	assert!(buffer.decompose(0, &[1, 2]).is_ok(), "growing to exactly the ceiling is a decomposition");
+	assert_eq!(buffer.len(), ceiling);
+	assert_eq!(buffer.decompose(0, &[1, 2]).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "run output", ceiling: opentype_profile::limits::RUN_OUTPUT, asked: ceiling as u64 + 1 })));
+	assert_eq!(buffer.len(), ceiling, "and the refused one changed nothing");
+}
+
+/// AN ALLOCATION LIMIT FOR ONE THREAD: every allocation on the thread that set it and is larger than
+/// it fails, and every other thread is untouched - which is how a fixture reaches the refusal a real
+/// Domain reaches when it runs out.
+mod limited {
+	use std::alloc::{GlobalAlloc, Layout, System};
+	use std::cell::Cell;
+
+	std::thread_local! {
+		static LIMIT: Cell<usize> = const { Cell::new(usize::MAX) };
+	}
+
+	pub struct Limited;
+
+	// SAFETY: every call is forwarded to the system allocator unchanged, except an allocation the
+	// thread's limit refuses, which answers null - the documented way an allocator reports failure.
+	unsafe impl GlobalAlloc for Limited {
+		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+			if layout.size() > LIMIT.try_with(Cell::get).unwrap_or(usize::MAX) {
+				return core::ptr::null_mut();
+			}
+			unsafe { System.alloc(layout) }
+		}
+
+		unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+			unsafe { System.dealloc(pointer, layout) }
+		}
+
+		unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+			if size > LIMIT.try_with(Cell::get).unwrap_or(usize::MAX) {
+				return core::ptr::null_mut();
+			}
+			unsafe { System.realloc(pointer, layout, size) }
+		}
+	}
+
+	#[global_allocator]
+	static ALLOCATOR: Limited = Limited;
+
+	/// Run `work` with every allocation on this thread larger than `bytes` failing.
+	pub fn within<T>(bytes: usize, work: impl FnOnce() -> T) -> T {
+		LIMIT.with(|limit| limit.set(bytes));
+		let out = work();
+		LIMIT.with(|limit| limit.set(usize::MAX));
+		out
+	}
+}
+
+#[test]
+// STORAGE A RUN CANNOT HAVE IS A TYPED REFUSAL, NOT AN EXIT. The shaper copies its input, builds its
+// syllable and joining tables and grows its buffer, all in proportion to the run; a Domain that
+// cannot give it that gets `Allocation` back, and the process that asked is still running to read it.
+fn storage_the_run_cannot_have_is_refused_rather_than_fatal() {
+	let bytes = build::sample(None, None, None);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let characters: std::vec::Vec<char> = core::iter::repeat_n('a', 2000).collect();
+	let mut buffer = glyphs(&std::vec![1; characters.len()]);
+	let refused = limited::within(1024, || crate::shape::shape_run(&face, &mut buffer, &characters, *b"dflt").err());
+	assert_eq!(refused, Some(font_parse::Error::Allocation));
+	// And the buffer refuses to grow past what it can have, rather than ending the process.
+	let mut buffer = Buffer::new();
+	let refused = limited::within(1024, || (0..2000u32).try_for_each(|index| buffer.push(1, index)).err());
+	assert_eq!(refused, Some(font_parse::Error::Allocation));
 }

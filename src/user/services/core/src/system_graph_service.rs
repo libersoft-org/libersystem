@@ -203,6 +203,11 @@ impl system_graph::Service for GraphService {
 					if s.name == "watchdog_probe" {
 						components.push(Component { name: s.name.clone(), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: s.restarts, watchdog_trips: s.watchdog_trips, last_failure: s.last_failure.clone() }, resources: Vec::new() });
 					}
+					// THE LAST SLEEP, when it failed: ServiceManager's transaction, a failed node naming the step and the
+					// driver or service that refused or failed it.
+					if s.name == "sleep" {
+						components.push(Component { name: s.name.clone(), r#type: ComponentType::Service, state: ComponentState::Failed, deps: alloc::vec![String::from("service_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: s.last_failure.clone() }, resources: Vec::new() });
+					}
 				}
 			}
 			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: clock_ns().wrapping_sub(sup_start) });

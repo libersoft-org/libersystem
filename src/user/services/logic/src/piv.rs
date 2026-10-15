@@ -182,10 +182,15 @@ fn der_ecdsa(bytes: &[u8]) -> bool {
 			return None;
 		}
 		let len = *bytes.get(at + 1)? as usize;
+		// THE LENGTH IS JUDGED BEFORE THE VALUE IS READ: an empty INTEGER has no first byte, and the
+		// card's answer is what put it here.
+		if len == 0 || len > 33 {
+			return None;
+		}
 		let value = bytes.get(at + 2..at + 2 + len)?;
 		// Positive, minimally encoded, and no longer than a P-256 scalar with its sign byte.
 		let minimal = len == 1 || !(value[0] == 0x00 && value[1] & 0x80 == 0);
-		if len == 0 || len > 33 || value[0] & 0x80 != 0 || !minimal {
+		if value[0] & 0x80 != 0 || !minimal {
 			return None;
 		}
 		Some(at + 2 + len)

@@ -70,6 +70,9 @@ pub fn parse(bytes: &[u8]) -> Result<Atr, Refusal> {
 	let mut first: Option<u8> = None;
 	let mut ta1 = None;
 	let mut level = 1;
+	// Whether some TD named T=15. It is not a protocol a card transmits with, but it is one of the
+	// indications that decide whether TCK is there.
+	let mut global_bytes = false;
 	loop {
 		// TA, TB, TC, TD in that order, each present when its bit is set.
 		for bit in 0..3 {
@@ -91,6 +94,8 @@ pub fn parse(bytes: &[u8]) -> Result<Atr, Refusal> {
 		if protocol != 15 {
 			protocols |= 1 << protocol;
 			first.get_or_insert(protocol);
+		} else {
+			global_bytes = true;
 		}
 		presence = td >> 4;
 		level += 1;
@@ -106,8 +111,11 @@ pub fn parse(bytes: &[u8]) -> Result<Atr, Refusal> {
 	if at > bytes.len() {
 		return Err(Refusal::Truncated);
 	}
-	// TCK EXACTLY WHEN SOMETHING OTHER THAN T=0 IS OFFERED.
-	let needs_check = protocols & !1 != 0;
+	// TCK EXACTLY WHEN SOMETHING OTHER THAN T=0 IS INDICATED, and T=15 is something other than T=0:
+	// ISO/IEC 7816-3 has TCK absent only when T=0 alone is indicated, and present "if T=0 and T=15
+	// are present and in all the other cases". A T=0 card that declares global bytes - the class
+	// indicator, which many PIV cards carry - ends its ATR with a check byte.
+	let needs_check = protocols & !1 != 0 || global_bytes;
 	if needs_check {
 		if at >= bytes.len() {
 			return Err(Refusal::Truncated);

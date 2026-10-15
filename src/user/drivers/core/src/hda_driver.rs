@@ -64,6 +64,10 @@ const CAPTURE_TICKS: u64 = 50;
 // about eleven milliseconds, so this is many of them, and a controller that stops playing is refused rather than waited
 // on for ever.
 const PLAYBACK_TICKS: u64 = 50;
+// How long the stream engines, the two ring engines and the controller's own reset are given to read back
+// stopped when this driver lets the device go - for a stop or for a sleep. Each takes a few frames of the link,
+// microseconds, so this is far more than any of them needs and still a bound.
+const QUIESCE_TICKS: u64 = 10;
 
 use drivers::common::Deadline;
 unsafe fn r8(addr: u64) -> u8 {
@@ -762,6 +766,78 @@ unsafe fn stop_capture(controller: &mut Controller) {
 	}
 }
 
+// LET THE DEVICE GO QUIET, AND CONFIRM IT: what a stop certifies to the kernel and what a sleep that cuts the power
+// needs. True only when everything that can master the bus has READ BACK stopped.
+//
+// CLEARING A RUN BIT IS A REQUEST, NOT A FACT. The specification has software read a stream's RUN bit back as zero
+// before it may treat the stream as stopped, and the same for the command ring's run bit and the response ring's DMA
+// enable - so both streams and both rings are asked, then waited on. `rings` stops the command and response rings and
+// then holds the controller in reset, which ends anything a codec could still DMA into the response ring; without it
+// only the streams stop, which is what a sleep that keeps the power wants: silence, with the codec's route and the rings
+// left as they are.
+unsafe fn quiesce(controller: &mut Controller, rings: bool) -> bool {
+	unsafe {
+		stop(controller);
+		stop_capture(controller);
+		for stream in [controller.stream, controller.capture_stream] {
+			if stream != 0 {
+				w8(stream + hda::SD_CTL, r8(stream + hda::SD_CTL) & !hda::SD_RUN);
+			}
+		}
+		let base = controller.base;
+		if rings {
+			w8(base + hda::REG_CORBCTL, r8(base + hda::REG_CORBCTL) & !hda::RING_RUN);
+			w8(base + hda::REG_RIRBCTL, r8(base + hda::REG_RIRBCTL) & !hda::RING_RUN);
+		}
+		let streams_stopped = || [controller.stream, controller.capture_stream].iter().all(|&stream| stream == 0 || r8(stream + hda::SD_CTL) & hda::SD_RUN == 0);
+		let rings_stopped = || !rings || (r8(base + hda::REG_CORBCTL) & hda::RING_RUN == 0 && r8(base + hda::REG_RIRBCTL) & hda::RING_RUN == 0);
+		let mut deadline = Deadline::ticks(QUIESCE_TICKS);
+		while !(streams_stopped() && rings_stopped()) {
+			if !deadline.waiting() {
+				return false;
+			}
+		}
+		if !rings {
+			return true;
+		}
+		w32(base + hda::REG_GCTL, 0);
+		while r32(base + hda::REG_GCTL) & hda::GCTL_RESET != 0 {
+			if !deadline.waiting() {
+				return false;
+			}
+		}
+		true
+	}
+}
+
+// THE SLEEP. Every stream is stopped and confirmed stopped, so a period nobody is feeding is not looped while the
+// machine sleeps; for a state that cuts the power the command and response rings are stopped as well and the controller
+// is held in reset - no DMA into memory about to stop being refreshed. A sleep that kept the power resumes with nothing
+// to undo: a stream starts again with the next period it is handed. One that cut it, or that reset the controller,
+// answers that the device did not come back, because the codec's route is the bind's to set up and a controller in
+// reset has none - and it is bound again.
+struct Sleep<'a> {
+	controller: &'a mut Controller,
+	// Whether this step held the controller in reset.
+	reset: bool,
+}
+
+impl common::SleepStep for Sleep<'_> {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let rings = request.state.loses_power();
+		if !unsafe { quiesce(self.controller, rings) } {
+			print(b"driver.hda: the sleep is refused - the controller did not confirm its engines stopped\n");
+			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+		}
+		self.reset = rings;
+		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
+	}
+
+	fn resume(&mut self, lost_power: bool) -> bool {
+		!lost_power && !core::mem::take(&mut self.reset)
+	}
+}
+
 // Serve AudioService over `driver_protocol::audio`.
 //
 // THE WIRE IS THE SHARED ONE NOW, AND IT WAS NOT BEFORE (2026-09-19). This driver read a length and
@@ -774,12 +850,25 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 		// than truncated, because half a period played is a click rather than an error.
 		let mut period = [0u8; 16384];
 		let mut half: u64 = 0;
+		common::takes_sleep();
 		loop {
-			if !common::serve_or_answer(bootstrap, bind, service) {
-				stop(controller);
-				stop_capture(controller);
-				common::finish_stop(bootstrap, bind, controller.device, true);
+			let ready = match common::wait_or_sleep(bootstrap, bind, &[service]) {
+				Some(Some(_)) => true,
+				Some(None) => common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, reset: false }) && !common::stop_requested(),
+				None => false,
+			};
+			if !ready {
+				// THE STOP CERTIFIES WHAT `quiesce` CONFIRMED: both streams and both rings read back stopped and the
+				// controller held in reset - not that a run bit was written.
+				let quiet = quiesce(controller, true);
+				if !quiet {
+					print(b"driver.hda: the controller did not confirm its engines stopped - no clean stop is claimed for it\n");
+				}
+				common::finish_stop(bootstrap, bind, controller.device, quiet);
 				exit();
+			}
+			if !poll_ready(service) {
+				continue;
 			}
 			let Received::Message { len, .. } = recv_blocking(service, &mut period) else {
 				stop(controller);

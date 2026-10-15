@@ -2537,6 +2537,116 @@ fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
 	let _ = crate::device::release_claim(claim);
 }
 
+tagged_test!(usb_cdc_ncm_carries_frames_both_ways_in_transfer_blocks, [Drivers, Usb, Slow], id = "kernel.hardware.usb_cdc_ncm_carries_frames_both_ways_in_transfer_blocks", covers = ["kernel", "drivers", "bin.xhci"]);
+fn usb_cdc_ncm_carries_frames_both_ways_in_transfer_blocks() {
+	// THE NCM HALF OF THE CDC NETWORK CLASS, AGAINST AN NCM IMPLEMENTATION THIS TREE DID NOT WRITE.
+	//
+	// QEMU's `usb-net` is ECM, which is why NCM's framing was host tests and no binding for so long. The
+	// device here is the host kernel's own `usb_f_ncm` on `dummy_hcd`, handed to the guest by `usb-host`:
+	// ITS parser reads the blocks this driver builds, and ITS packer builds the blocks this driver splits.
+	// On the gadget's network interface `ncm-peer.py` answers each probe with copies of it sent back to
+	// back - which the device packs into one block when they arrive close enough together - and this side
+	// requires every copy, in order and byte for byte.
+	//
+	// GATED AT COMPILE TIME like every gadget oracle: without the gadget there is no device, and this says
+	// so rather than passing quietly.
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "ncm" {
+		crate::serial_println!("usb-cdc-ncm: NOT RUN - no CDC-NCM gadget on this run; build one with USB_GADGET=ncm");
+		return;
+	}
+	use object::channel::{Channel, Message};
+
+	// The two addresses `usb-gadget.sh` gives the function: the one it publishes for the host's side of the
+	// link - this guest's - and the one its own interface on the host answers from.
+	const GUEST: [u8; 6] = [0x02, 0x4c, 0x53, 0x00, 0x4e, 0x01];
+	const PEER: [u8; 6] = [0x02, 0x4c, 0x53, 0x00, 0x4e, 0x02];
+	// IEEE 802's local experimental EtherType, and the marker `ncm-peer.py` answers - so nothing else on
+	// the link is mistaken for an answer, and nothing this sends is mistaken for anything else.
+	const ETHERTYPE: [u8; 2] = [0x88, 0xb5];
+	const MAGIC: &[u8; 9] = b"LIBER-NCM";
+	// After the Ethernet header and the marker: the probe's number, the copies it asks for, and which copy
+	// an answer is - 0xff in the probe itself, which no answer carries.
+	const SEQUENCE: usize = 14 + 9;
+	const COPIES: usize = SEQUENCE + 1;
+	const INDEX: usize = SEQUENCE + 2;
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+	let net_token = offer_token_of(&offers, driver_protocol::provider::NET).expect("the driver publishes the NCM adapter's link, because this run attached one");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, net_token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let hello = host_end.recv().expect("the adapter leads its connection with its MAC and the link MTU");
+	assert_eq!(hello.bytes.len(), 11, "the same eleven bytes virtio-net and the ECM adapter send");
+	assert_eq!(&hello.bytes[..3], b"MAC");
+	assert_eq!(&hello.bytes[3..9], &GUEST, "the MAC the gadget publishes for the host's side - this is the NCM function, and not QEMU's ECM adapter");
+	assert_eq!(u16::from_le_bytes([hello.bytes[9], hello.bytes[10]]), 1500, "the function's 1514-byte segment less the Ethernet header");
+
+	// THE PROBES, by size and the copies each asks for:
+	// - 60 bytes, the shortest frame on a wire, answered once;
+	// - 300 bytes answered six times, small frames back to back, which the device packs;
+	// - 484 bytes, whose outgoing block is EXACTLY 512 bytes - a whole number of packets, which the driver
+	//   sends one byte longer or the device never sees the transfer end - answered three times;
+	// - 1514 bytes, the longest frame the link carries, answered twice: two of them fit one block.
+	let probes: [(usize, u8); 4] = [(60, 1), (300, 6), (484, 3), (1514, 2)];
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 500;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 500 * 13;
+	let mut answered = 0usize;
+	let mut probe = alloc::vec::Vec::new();
+	for (sequence, &(len, copies)) in probes.iter().enumerate() {
+		probe.clear();
+		probe.extend_from_slice(&PEER);
+		probe.extend_from_slice(&GUEST);
+		probe.extend_from_slice(&ETHERTYPE);
+		probe.extend_from_slice(MAGIC);
+		probe.extend_from_slice(&[sequence as u8, copies, 0xff]);
+		while probe.len() < len {
+			probe.push((probe.len() as u8).wrapping_mul(13) ^ sequence as u8);
+		}
+		host_end.send(Message::new(probe.clone(), alloc::vec::Vec::new())).expect("the probe should send");
+		// EVERY COPY, IN ORDER, AND EACH THE PROBE WITH ITS ADDRESSES SWAPPED - so a frame delivered twice,
+		// one dropped, two exchanged or one cut short inside a block is a failure here, and not a count that
+		// happens to come out right.
+		let give_up = arch::apic::ticks() + patience;
+		let mut next: u8 = 0;
+		while next < copies && arch::apic::ticks() < give_up {
+			sched::run_until_idle();
+			while let Ok(frame) = host_end.recv() {
+				let bytes = &frame.bytes;
+				// Anything else on the link is not this oracle's to judge.
+				if bytes.len() <= INDEX || bytes[12..14] != ETHERTYPE || &bytes[14..SEQUENCE] != MAGIC {
+					continue;
+				}
+				assert_eq!(bytes[SEQUENCE], sequence as u8, "an answer to probe {sequence} and not to an earlier one - a copy too many is caught here");
+				assert_eq!(bytes[INDEX], next, "probe {sequence}'s copies arrive in the order they were sent");
+				assert_eq!(bytes.len(), len, "copy {next} of probe {sequence} is the probe's length, not a piece of a block");
+				assert_eq!(&bytes[..6], &GUEST, "addressed back to this guest");
+				assert_eq!(&bytes[6..12], &PEER, "from the peer the probe went to");
+				assert_eq!(bytes[COPIES], copies);
+				assert_eq!(&bytes[INDEX + 1..], &probe[INDEX + 1..], "and the rest of the probe, byte for byte");
+				next += 1;
+				answered += 1;
+			}
+		}
+		assert_eq!(next, copies, "probe {sequence} ({len} bytes) was answered {next} of {copies} time(s)");
+	}
+	// AND NOTHING AFTER THE LAST ANSWER: a copy delivered twice at the very end has no next probe to trip.
+	let quiet = arch::apic::ticks() + patience / 10;
+	while arch::apic::ticks() < quiet {
+		sched::run_until_idle();
+		while let Ok(frame) = host_end.recv() {
+			let bytes = &frame.bytes;
+			assert!(bytes.len() <= INDEX || bytes[12..14] != ETHERTYPE || &bytes[14..SEQUENCE] != MAGIC, "an answer arrived after every probe was answered - a frame went up twice");
+		}
+	}
+	crate::serial_println!("usb-cdc-ncm: {} frame(s) out in transfer blocks and {} answer(s) back in order, 60 to 1514 bytes", probes.len(), answered);
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
 // THE SERVICE-BACKED USB CLASSES, each proved against a device the harness built.
 //
 // THESE PUBLICATIONS ARE LIVE ONES. A class device is published after the handshake, under a fresh token,

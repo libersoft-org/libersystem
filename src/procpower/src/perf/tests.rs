@@ -91,3 +91,16 @@ fn a_window_is_obeyed_at_once_and_a_bad_one_refused() {
 	assert_eq!(Window { cap: 3, floor: 2 }.check(4), Err(Refusal::BadWindow));
 	assert_eq!(Window { cap: 0, floor: 4 }.check(4), Err(Refusal::BadWindow));
 }
+
+#[test]
+fn a_domain_software_must_coordinate_across_processors_is_refused_and_one_it_need_not_is_admitted() {
+	let in_domain = |coordination: Coordination, processors: u32| Table { domain: Some(Domain { domain: 7, coordination, processors }), ..pss(3) };
+	// SEVERAL PROCESSORS, AND THE OPERATING SYSTEM TO COORDINATE THEM: refused - each core would set a shared register
+	// on its own decision.
+	assert_eq!(check_table(&in_domain(Coordination::SoftwareAll, 2), Arch::X86_64), Err(Refusal::SoftwareCoordinated));
+	assert_eq!(check_table(&in_domain(Coordination::SoftwareAny, 4), Arch::X86_64), Err(Refusal::SoftwareCoordinated));
+	// The hardware coordinates its own domain, and a domain of one processor has nothing to coordinate.
+	assert_eq!(check_table(&in_domain(Coordination::HardwareAll, 4), Arch::X86_64), Ok(()));
+	assert_eq!(check_table(&in_domain(Coordination::SoftwareAll, 1), Arch::X86_64), Ok(()));
+	assert_eq!(check_table(&in_domain(Coordination::SoftwareAny, 1), Arch::X86_64), Ok(()));
+}

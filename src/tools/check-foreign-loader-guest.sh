@@ -30,6 +30,15 @@
 #                               mutated candidate before an image can even be built. It is not
 #                               repeated here because a mutated candidate cannot reach a booted
 #                               guest - the refusal happens earlier, which is the stronger place.
+#   THE NEGOTIATION IS        the loader asks every driver for interface version 7, and what it is
+#     BOUNDED BY THE            handed for the driver's negotiation export is the substrate's entry
+#     SUBSTRATE                 point, which offers the driver at most 6 and refuses an answer
+#                               outside 2..6. The substrate reports each negotiation itself, so the
+#                               line asserted here is the bound running on the ported loader's own
+#                               path - not the synthetic driver clamping itself, which it also does.
+#                               The refusals - drivers answering 0, 1 or 7 - need drivers no image
+#                               stages; the discovery crate's host suite asserts them through the same
+#                               entry point.
 #   AND THE INSTANCE FAILS    with `VK_ERROR_INCOMPATIBLE_DRIVER`, which is the honest outcome and
 #                               not a shortfall: the synthetic ICD implements no Vulkan entry point,
 #                               because this milestone exports no Vulkan ABI. The loader found a
@@ -92,6 +101,10 @@ expect "enabled layer refused by name" "a query naming a layer must be refused r
 expect "instance with a layer refused by name" "an instance creation enabling a layer must be refused by name"
 expect "loader lookup address" "the loader must answer out of its own table, which is its own code running"
 expect "instance result=4294967287" "with a driver that implements nothing, VK_ERROR_INCOMPATIBLE_DRIVER is the honest answer"
+expect "foreign: icd interface: loader asked 7, substrate offered 6, driver answered 6 - agreed 6" "the loader must negotiate through the substrate's bounded entry point, which offers the driver at most 6"
+if grep -q "^vkprobe: foreign: icd interface: .* - refused" "$lines"; then
+	fail "the substrate refused the synthetic ICD's negotiation, which is a conforming 2..6 driver"
+fi
 
 # THE COUNTS. Zero would mean the loader never reached the driver - which is exactly what happened
 # the first time this ran, because its search path and the record's paths never met.

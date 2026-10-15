@@ -52,6 +52,7 @@ def production(root, source_tree, item):
     policy_items.append(trust)
     policy_items.extend('pub ' + constant(policy, name) for name in ('HFP_CHANNEL', 'HSP_CHANNEL', 'OPP_CHANNEL'))
     dependencies.append('mod bt_policy {\n' + '\n'.join(policy_items) + '\n}')
+    dependencies.append('mod classic {\n\tpub ' + constant(classic, 'OPP_RECORD') + '\n}')
     declarations = [constant(opp, name) for name in ('RECEIVE_TICKS', 'PIECE')]
     declarations.extend(item(opp, anchor) for anchor in (
         '#[derive(Clone, Copy, PartialEq, Eq, Debug)]\npub(crate) enum Transport {',

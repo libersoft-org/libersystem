@@ -66,7 +66,7 @@ const COVERAGE: &[(&str, Coverage)] = &[
 	("features", Coverage::Bound { file: "src/user/libs/text/font-shape/src/tests.rs", at: "more_features_than_the_profile_freezes_are_refused_rather_than_dropped", past: "more_features_than_the_profile_freezes_are_refused_rather_than_dropped" }),
 	("bidi depth", Coverage::Bound { file: "src/user/libs/text/unicode-bidi/src/tests.rs", at: "embeddings_nest_to_the_algorithms_own_depth_and_overflow_past_it", past: "embeddings_nest_to_the_algorithms_own_depth_and_overflow_past_it" }),
 	("fallback faces", Coverage::Bound { file: "src/user/libs/text/text-pipeline/src/tests.rs", at: "the_fallback_walk_stops_at_the_frozen_number_of_faces", past: "the_fallback_walk_stops_at_the_frozen_number_of_faces" }),
-	("shaping retries", Coverage::NoSite { reason: "nothing re-shapes a run yet; a retry count cannot be exceeded before there are retries" }),
+	("shaping retries", Coverage::NoSite { reason: "nothing shapes the same text twice: a line break shapes each piece of a split run once, as new text (stage 9), and a missing glyph is not retried with another face; a retry count cannot be exceeded before there are retries" }),
 	("line passes", Coverage::NoSite { reason: "the line layout is single-pass by construction; a pass count will first apply to a justification that re-shapes, as Arabic kashida justification does" }),
 	("paragraph passes", Coverage::NoSite { reason: "the same, one level up: there is no iterative paragraph fit to bound" }),
 	("run input", Coverage::Bound { file: "src/user/libs/text/font-shape/src/tests.rs", at: "a_run_past_the_frozen_input_ceiling_is_refused_before_any_work_is_done", past: "a_run_past_the_frozen_input_ceiling_is_refused_before_any_work_is_done" }),

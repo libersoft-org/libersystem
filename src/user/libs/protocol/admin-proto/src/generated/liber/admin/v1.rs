@@ -2590,6 +2590,8 @@ pub struct AdminProbeEffects {
 	pub dispatches: u32,
 	pub digest: Vec<u8>,
 	pub generation: u64,
+	/// The preparations it holds that may still run: neither started nor cancelled, and inside their lifetime.
+	pub prepared: u32,
 }
 
 impl AdminProbeEffects {
@@ -2638,6 +2640,7 @@ impl AdminProbeEffects {
 			w.u8(*v62)?;
 		}
 		w.u64(self.generation)?;
+		w.u32(self.prepared)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<AdminProbeEffects> {
@@ -2654,7 +2657,8 @@ impl AdminProbeEffects {
 			v64
 		};
 		let generation = r.u64()?;
-		Some(AdminProbeEffects { writes, dispatches, digest, generation })
+		let prepared = r.u32()?;
+		Some(AdminProbeEffects { writes, dispatches, digest, generation, prepared })
 	}
 }
 
@@ -4497,6 +4501,9 @@ impl AdminProbeEffects {
 		out.push(',');
 		out.push_str("\"generation\":");
 		let _ = write!(out, "{}", self.generation);
+		out.push(',');
+		out.push_str("\"prepared\":");
+		let _ = write!(out, "{}", self.prepared);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4521,10 +4528,13 @@ impl AdminProbeEffects {
 		out.push_str(", ");
 		out.push_str("generation=");
 		let _ = write!(out, "{}", self.generation);
+		out.push_str(", ");
+		out.push_str("prepared=");
+		let _ = write!(out, "{}", self.prepared);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "writes");
 		crate::codec::cbor::uint(out, self.writes as u64);
 		crate::codec::cbor::text(out, "dispatches");
@@ -4536,6 +4546,8 @@ impl AdminProbeEffects {
 		}
 		crate::codec::cbor::text(out, "generation");
 		crate::codec::cbor::uint(out, self.generation as u64);
+		crate::codec::cbor::text(out, "prepared");
+		crate::codec::cbor::uint(out, self.prepared as u64);
 	}
 }
 

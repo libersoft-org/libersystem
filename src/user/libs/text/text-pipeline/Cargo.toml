@@ -5,6 +5,10 @@ description = "The ordered text pipeline: one sequence of typed stages, with the
 
 [dependencies]
 font-contract = { path = "../font-contract" }
+# THE SHAPING STAGE IS A STAGE OF THIS PIPELINE, not something left to a caller: the face each run
+# is drawn with, read as hostile input, and the shaper the run's characters go through.
+font-parse = { path = "../font-parse" }
+font-shape = { path = "../font-shape" }
 # THE FROZEN CEILINGS. They live with the profile because that is where they were frozen; this layer
 # reads them rather than restating them, because a ceiling each layer chose for itself is a ceiling
 # nobody froze.

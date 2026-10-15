@@ -24,6 +24,9 @@
 //   modemcheck inherit     a transferred data endpoint does not keep its dead owner's context
 //   modemcheck lock        replace the SIM with a locked one
 //   modemcheck uncertain   a PIN whose answer never comes is outcome-unknown, sent once, and reconciled
+//   modemcheck uncertain-retired
+//                          the same PIN with its grant closed before the modem answers: the expiry
+//                          has nobody to answer and is reconciled all the same
 //   modemcheck limits      the limits are exposed, and nothing is left in use
 //   modemcheck republish   a withdrawn modem's grant fails; republication is another modem
 //   modemcheck busy        with a NIC selected, a data grant that may not replace it is refused, and the
@@ -424,6 +427,29 @@ fn uncertain(probe: &Probe) {
 	say(b"PASS uncertain: an unanswered PIN was outcome-unknown, reached the SIM once, and a fresh query reconciled the state");
 }
 
+fn uncertain_retired(probe: &Probe) {
+	let modem = probe.modem();
+	if probe.status().sim != SimState::LockedPin {
+		fail(b"uncertain-retired: the SIM is not locked - run `modemcheck lock` first");
+	}
+	let before = probe.stats();
+	probe.fixture_ok(probe.fixture().delay(&CommandKind::EnterPin, &0), b"uncertain-retired: the fixture could not hold the PIN's answer");
+	// SENT AND NOT WAITED FOR: a deadline already reached takes the request out and gives up on the answer
+	// at once.
+	let _ = modem_manage::Client::with_deadline(ChannelTransport { chan: probe.manage }, 1).enter_pin(&modem, "1234", &false);
+	if !until(3, || probe.stats().pin_attempts == before.pin_attempts + 1) {
+		fail(b"uncertain-retired: the PIN never reached the modem");
+	}
+	// AND THE GRANT THAT ISSUED IT ENDS while the modem has not answered: its five-second deadline expires
+	// with nobody to answer, and its unknown outcome must be reconciled by a query all the same - or the
+	// modem refuses every state change from here on.
+	close(probe.manage);
+	if !until(10, || probe.status().sim == SimState::Ready) {
+		fail(b"uncertain-retired: a retired grant's unanswered PIN was never reconciled");
+	}
+	say(b"PASS uncertain-retired: a PIN whose grant ended before the modem answered was reconciled by a fresh query");
+}
+
 fn limits(probe: &Probe) {
 	match probe.state().limits() {
 		Some(Ok(limits)) if limits.providers_max == 4 && limits.clients_max == 32 && limits.contexts_max == 1 && limits.providers == 1 && limits.contexts == 0 => {}
@@ -497,10 +523,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"inherit" => inherit(&probe),
 		b"lock" => lock(&probe),
 		b"uncertain" => uncertain(&probe),
+		b"uncertain-retired" => uncertain_retired(&probe),
 		b"limits" => limits(&probe),
 		b"republish" => republish(&probe),
 		b"busy" => busy(&probe),
-		_ => fail(b"usage: modemcheck clients | pin | identity | activate | context | drop | sim | rollback | inherit | lock | uncertain | limits | republish | busy"),
+		_ => fail(b"usage: modemcheck clients | pin | identity | activate | context | drop | sim | rollback | inherit | lock | uncertain | uncertain-retired | limits | republish | busy"),
 	}
 	exit();
 }

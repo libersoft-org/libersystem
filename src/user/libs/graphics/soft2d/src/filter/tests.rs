@@ -36,6 +36,31 @@ fn independent_blur_accumulators_match_scalar_taps_bit_for_bit() {
 	}
 }
 
+// THE KERNEL IS THE GAUSSIAN THE PROFILE NAMES, TO THE FROZEN TOLERANCE. `graphics-profile` freezes a filter
+// kernel's output at 1e-3 relative against the kernel evaluated at f64; the test above holds the two passes to
+// these f32 weights bit for bit, so the weights are where the comparison with f64 belongs. Every weight, from
+// a deviation under a pixel to one whose reach is the profile's largest radius, against `exp(-d^2 / 2 sigma^2)`
+// at f64 over the same reach - three deviations in whole pixels, at least one - normalised the same way.
+#[test]
+fn the_blur_kernel_is_the_gaussian_at_f64_within_the_frozen_tolerance() {
+	let frozen = graphics_profile::thresholds::THRESHOLDS.iter().find(|threshold| threshold.profile == "render2d" && threshold.what == "a filter kernel's output").expect("the frozen kernel threshold");
+	assert!(frozen.tolerance.starts_with("<= 1e-3 relative against the kernel evaluated at f64"), "the tolerance applied here is the frozen one: {}", frozen.tolerance);
+	const RELATIVE: f64 = 1e-3;
+	for sigma in [0.2f32, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 10.0, 25.5, 85.0] {
+		let weights = kernel(sigma);
+		let radius = (weights.len() - 1) / 2;
+		let sigma = f64::from(sigma);
+		assert_eq!(radius, (sigma * 3.0).ceil().max(1.0) as usize, "sigma {sigma}: the reach is three deviations in whole pixels");
+		let exact: Vec<f64> = (0..weights.len()).map(|index| (-(index as f64 - radius as f64).powi(2) / (2.0 * sigma * sigma)).exp()).collect();
+		let total: f64 = exact.iter().sum();
+		for (index, (weight, exact)) in weights.iter().zip(&exact).enumerate() {
+			let exact = exact / total;
+			let difference = (f64::from(*weight) - exact).abs();
+			assert!(difference <= RELATIVE * exact, "sigma {sigma}, tap {index}: {weight} against {exact} at f64 is {} relative", difference / exact);
+		}
+	}
+}
+
 // A RUN READS AND WRITES WHAT `get` AND `set` WOULD, PIXEL FOR PIXEL. The pointwise nodes walk their regions
 // through `read_run` and `write_run` now, so a run that starts before a raster, ends past it, lies on a row it
 // does not have, or reaches a coordinate `get` cannot be asked for must still answer transparent exactly where

@@ -29,7 +29,7 @@ record admin-record(sequence:u64,broker-epoch:u64,request:u64,launch:u64,request
 record admin-journal-page(records:list<admin-record>:bound=16,oldest:u64,next:u64,evicted:u64)
 interface admin-journal
 method admin-journal.read op=1 (from:u64:rights=) -> result<admin-journal-page, liber:base@1::error>
-record admin-probe-effects(writes:u32,dispatches:u32,digest:list<u8>:bound=32,generation:u64)
+record admin-probe-effects(writes:u32,dispatches:u32,digest:list<u8>:bound=32,generation:u64,prepared:u32)
 enum admin-probe-fault(none=0,lose-reply=1,fail=2)
 interface admin-probe-witness
 method admin-probe-witness.effects op=1 () -> result<admin-probe-effects, liber:base@1::error>

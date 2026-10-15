@@ -61,6 +61,24 @@
 			"x86_64": []
 		}
 	},
+	"_icd_interface": {
+		"export_refused_by_name": "vk_icdGetPhysicalDeviceProcAddr",
+		"exports_resolved": [
+			"vk_icdGetInstanceProcAddr",
+			"vk_icdNegotiateLoaderICDInterfaceVersion"
+		],
+		"loader_accepts_down_to": 0,
+		"loader_asks_for": 7,
+		"negotiated_at_least": 2,
+		"negotiated_at_most": 6,
+		"substrate_admits": [
+			2,
+			3,
+			4,
+			5,
+			6
+		]
+	},
 	"aarch64": {
 		"archive": ".build/foreign/pass2/aarch64/libvulkan.a",
 		"archive_surface": [
@@ -118,7 +136,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 632424,
+		"elf_bytes": 639992,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -267,7 +285,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 950272,
+		"elf_bytes": 957784,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -417,7 +435,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 610432,
+		"elf_bytes": 618152,
 		"fini_array": [
 			"loader_free_library"
 		],

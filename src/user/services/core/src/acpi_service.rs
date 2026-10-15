@@ -1941,6 +1941,13 @@ impl Platform for SleepPlatform<'_> {
 		}
 	}
 
+	fn disable_device_wake(&mut self, identity: &str) {
+		let Some(node) = self.0.node_of_identity(identity) else { return };
+		if !self.0.run(node, b"_DSW", &[Object::Integer(0), Object::Integer(0), Object::Integer(0)]) {
+			self.0.run(node, b"_PSW", &[Object::Integer(0)]);
+		}
+	}
+
 	fn set_wake_event(&mut self, number: u16) -> bool {
 		gpe(self.0.host.privilege, GPE_WAKE_SET, number) == 0
 	}

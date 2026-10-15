@@ -238,9 +238,13 @@ impl tpm::Service for GrantView {
 }
 
 impl Service {
-	// Whether seal, unseal and quote can run on the TPM being served.
-	fn owner_usable(&self) -> bool {
-		self.provider.as_ref().is_some_and(|provider| !provider.description.owner_auth_set && provider.description.owner_enabled)
+	// What is known of the owner hierarchy seal, unseal and quote run under: nothing while no TPM is served.
+	fn owner(&self) -> tl::Owner {
+		match self.provider.as_ref() {
+			None => tl::Owner::Unknown,
+			Some(provider) if !provider.description.owner_auth_set && provider.description.owner_enabled => tl::Owner::Usable,
+			Some(_) => tl::Owner::Unusable,
+		}
 	}
 
 	// ------------------------------------------------------------------ the provider
@@ -389,14 +393,14 @@ impl Service {
 			let answer = match self.provider.as_ref() {
 				Some(provider) => {
 					let described = &provider.description;
-					InfoAnswer { outcome: Outcome::Done, code: 0, info: Some(TpmInfo { interface: described.interface, manufacturer: described.manufacturer.clone(), vendor: described.vendor.clone(), firmware_1: described.firmware_1, firmware_2: described.firmware_2, sealing: self.owner_usable() }) }
+					InfoAnswer { outcome: Outcome::Done, code: 0, info: Some(TpmInfo { interface: described.interface, manufacturer: described.manufacturer.clone(), vendor: described.vendor.clone(), firmware_1: described.firmware_1, firmware_2: described.firmware_2, sealing: self.owner() == tl::Owner::Usable }) }
 				}
 				None => InfoAnswer { outcome: Outcome::Unavailable, code: 0, info: None },
 			};
 			send_answer(chan, corr, Answer::Info(answer));
 			return true;
 		}
-		if let Err(refusal) = tl::admit(grant, &op, self.owner_usable()) {
+		if let Err(refusal) = tl::admit(grant, &op, self.owner()) {
 			send_answer(chan, corr, refused(&op, outcome(refusal)));
 			return true;
 		}

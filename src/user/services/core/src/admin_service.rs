@@ -549,7 +549,7 @@ impl Service {
 			if payload != 0 {
 				close(payload);
 			}
-			service.step(|broker, now, effects| broker.prepared(request, Err(reason), now, effects));
+			service.step(|broker, now, effects| broker.prepared(request, 0, Err(reason), now, effects));
 		};
 		let Some(asked) = self.broker.request(request).map(|held| held.asked.clone()) else {
 			if payload != 0 {
@@ -572,7 +572,7 @@ impl Service {
 			let _ = admin_executor::Client::new(capture).prepare(&action_wire(asked.action), &asked.target, &asked.parameters, &asked.payload_length, &payload);
 		});
 		if !sent {
-			return self.step(|broker, now, effects| broker.prepared(request, Err("the executor could not be reached"), now, effects));
+			return self.step(|broker, now, effects| broker.prepared(request, key, Err("the executor could not be reached"), now, effects));
 		}
 		executor.sent.push((corr, Sent::Prepare(request)));
 		let _ = now;
@@ -1380,13 +1380,13 @@ impl Service {
 							let encoded = prepared.descriptor.encode_vec().map_or(usize::MAX, |bytes| bytes.len());
 							self.operation_ms.push((request, prepared.deadline_ms));
 							let operation = prepared.operation;
-							self.step(|broker, now, effects| broker.prepared(request, Ok((descriptor, encoded, operation)), now, effects));
+							self.step(|broker, now, effects| broker.prepared(request, key, Ok((descriptor, encoded, operation)), now, effects));
 						}
 						Some(prepared) => {
 							self.release(key, prepared.operation);
-							self.step(|broker, now, effects| broker.prepared(request, Err("the executor named another executor"), now, effects));
+							self.step(|broker, now, effects| broker.prepared(request, key, Err("the executor named another executor"), now, effects));
 						}
-						None => self.step(|broker, now, effects| broker.prepared(request, Err("the executor refused to prepare it"), now, effects)),
+						None => self.step(|broker, now, effects| broker.prepared(request, key, Err("the executor refused to prepare it"), now, effects)),
 					}
 				}
 				Sent::Revalidate(request) => self.step(|broker, now, effects| broker.revalidated(request, ok, now, effects)),

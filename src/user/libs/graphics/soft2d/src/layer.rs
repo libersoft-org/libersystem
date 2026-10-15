@@ -49,10 +49,11 @@ impl Pool {
 	}
 
 	/// Take a cleared surface aimed at `bounds`, or `None` when the reservation is exhausted - which
-	/// is a refusal the caller turns into a typed error rather than an allocation.
+	/// is a refusal the caller turns into a typed error rather than an allocation. ONLY `bounds` IS
+	/// CLEARED, because only `bounds` is the surface: the rest of the storage reads transparent without it.
 	pub fn take(&mut self, bounds: PixelRect) -> Option<Surface> {
 		let mut surface = self.free.pop()?;
-		surface.rebase((bounds.x, bounds.y));
+		surface.aim(bounds);
 		surface.clear();
 		Some(surface)
 	}
@@ -61,7 +62,7 @@ impl Pool {
 	/// cleared.
 	pub fn take_overwritten(&mut self, bounds: PixelRect, written: PixelRect) -> Option<Surface> {
 		let mut surface = self.free.pop()?;
-		surface.rebase((bounds.x, bounds.y));
+		surface.aim(bounds);
 		surface.clear_outside(written);
 		Some(surface)
 	}
@@ -91,18 +92,15 @@ pub struct Layer {
 	pub clip_depth: usize,
 }
 
-/// The bounds a layer occupies inside a tile.
+/// The bounds a layer occupies in a tile's replay: what its content is needed over there - the tile grown
+/// by the layer's margin - inside its stated bounds.
 ///
-/// A LAYER WITHOUT STATED BOUNDS IS THE WHOLE TILE, which is the conservative answer: a layer whose
+/// A LAYER WITHOUT STATED BOUNDS IS ALL OF THAT, which is the conservative answer: a layer whose
 /// contents reach further than the caller said would otherwise be silently cut, and a caller that
 /// knows its bounds passes them and pays less.
-pub fn layer_bounds(bounds: Option<RectF>, tile: PixelRect, expansion: u32) -> PixelRect {
-	let expanded = PixelRect::new(tile.x.saturating_sub(expansion), tile.y.saturating_sub(expansion), tile.width.saturating_add(expansion.saturating_mul(2)), tile.height.saturating_add(expansion.saturating_mul(2)));
+pub fn layer_bounds(bounds: Option<RectF>, needed: PixelRect) -> PixelRect {
 	match bounds {
-		None => expanded,
-		Some(rect) => {
-			let device = crate::tile::cover(rect);
-			expanded.intersection(&device)
-		}
+		None => needed,
+		Some(rect) => needed.intersection(&crate::tile::cover(rect)),
 	}
 }

@@ -73,16 +73,21 @@ runtime_references = 12
 # THE CONVERGED RESULT, per target. The gate is the FIXED POINT - two consecutive links producing the
 # same resolved set - and not the first link's output.
 inventory = "src/foreign/INVENTORY-pass2.json"
-inventory_sha256 = "6bd124215feac2d9c122e4e41c24bfe7a488b6da9d90843814099e06641bbfe4"
+# REFROZEN 2026-10-15, after the substrate began bounding the ICD negotiation and the identity
+# records began binding what produced them. The surface, both resolved sets, the runtime references,
+# the stop-condition scopes and the lifecycle entries did not move on any target; what moved is the
+# three ELF sizes below, by the bounded entry point, and the inventory gained the negotiated
+# interface range it is required to record beside the symbols.
+inventory_sha256 = "aac23d48c48dc6ce2035022a5bd01881bb3012d45c24f2d863f755ab2aa5f605"
 tool = "src/tools/foreign-audit-link.py"
-tool_sha256 = "4261629fa350e73090ddf2041d5f6bb3f64aa84e67ebc6cc56801080e4186310"
+tool_sha256 = "a087a519e787322878256e73901aab2c406ec62e2e8c839baae76457191bb9e8"
 surface = 52
 # Of which forty-eight come from the substrate crates and four from the runtime; see the
 # compiler-runtime section, which the artifact check corrected.
 resolved_from_substrate = 48
-x86_64 = { elf_bytes = 610432, converged = true }
-aarch64 = { elf_bytes = 632424, converged = true }
-riscv64 = { elf_bytes = 950272, converged = true }
+x86_64 = { elf_bytes = 618152, converged = true }
+aarch64 = { elf_bytes = 639992, converged = true }
+riscv64 = { elf_bytes = 957784, converged = true }
 
 [forbidden_mechanisms]
 # THE MECHANISMS THIS PROFILE REFUSES, with the flags that stop them being emitted and the gate that

@@ -19,8 +19,12 @@ THE TWO EXPORTS ARE THE WHOLE SURFACE, which is the substrate's decision and not
 `vk_icdNegotiateLoaderICDInterfaceVersion` and `vk_icdGetInstanceProcAddr`, with versions 2 through 6
 admitted. Version 1 has no negotiation function, version 0 has a different bootstrap shape, version 7
 lets a driver stop exporting what this substrate resolves, and version 4's
-`vk_icdGetPhysicalDeviceProcAddr` would be a third export. Each of those is refused, and the
-refusals need ICDs shaped to be refused - which is why the neighbouring files exist.
+`vk_icdGetPhysicalDeviceProcAddr` would be a third export. Each of those is refused - and not by this
+driver. The ported loader is handed the substrate's bounded negotiation entry point instead of a
+driver's own, which offers at most 6 and refuses any answer outside 2..6, and the substrate refuses
+the third export by name. The drivers shaped to be refused - answering 0, 1 and 7, and offering the
+physical-device function through their lookup - are fixtures in `foreign-discovery`'s host suite,
+because no image stages them. This driver is the conforming one they are measured against.
 
 NEGOTIATION IS A NEGOTIATION, so one artifact covers both ends of the admitted range: the caller
 writes what it wants, this writes back what it will do, and the answer is the lower of the two. That

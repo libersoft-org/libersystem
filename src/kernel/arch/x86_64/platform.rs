@@ -50,10 +50,12 @@ pub fn describe() -> Vec<Described> {
 		}
 		push(&mut out, description);
 	}
-	// fw_cfg: its selector and data ports, and the DMA address register QEMU puts beside them.
+	// fw_cfg: its selector and data ports and the DMA address register QEMU puts beside them, as ONE range - the twelve
+	// ports from 0x510 the reserved set holds and QEMU's own `FWCF` describes. Declared as two, the namespace's one
+	// range overlapped the row without starting where its second part did, and the kernel's own device was refused
+	// as a conflicting one instead of merging.
 	if let Some(mut fw_cfg) = held(b"kernel:fw-cfg") {
-		fw_cfg.add_port(0x510, 2);
-		fw_cfg.add_port(0x514, 8);
+		fw_cfg.add_port(0x510, 12);
 		push(&mut out, fw_cfg);
 	}
 	// THE LOCAL APIC WINDOW, every core's register page at one physical address.

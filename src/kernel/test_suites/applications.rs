@@ -2042,20 +2042,41 @@ tagged_test!(the_text_stack_draws_its_corpus_to_the_analytic_oracle, [Text, Serv
 // application would take and along no other. A test that handed the program its font bytes would
 // have proved the arithmetic and nothing about the system.
 //
-// WHAT IT COMPARES AGAINST IS GEOMETRY, not a captured image: every glyph of the staged face is an
-// axis-aligned ring, so each pixel's coverage is an exact product of two overlaps, which the program
-// computes from the outline the face declares. A baseline captured from `soft2d` would agree with
-// `soft2d` by construction.
+// WHAT IT COMPARES AGAINST IS GEOMETRY, not a captured image: every glyph the program draws is made of
+// axis-aligned rectangles, so each pixel's coverage is an exact product of two overlaps, which the
+// program computes from the outline the face declares. A baseline captured from `soft2d` would agree
+// with `soft2d` by construction.
+//
+// AND THE SCRIPTS THE CLAIM IS ABOUT ARE IN IT. The staged last-resort face draws every code point as
+// one box and carries no layout tables, so a string of it proves nothing about shaping. Two faces of
+// the authored conformance corpus are therefore INSTALLED here - into the font directory of this
+// test's own copy of the volume, with their declarations, before the catalogue starts - and the
+// program shapes Arabic, Devanagari, Thai and a paragraph of two directions with them, compares every
+// glyph with the corpus the host gate reads, and draws each against the same kind of oracle. The faces
+// are this test's and no image's: a shipping volume never holds a face that exercises Thai stacking.
 fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	// THE CORPUS FACES, as `font-gen` writes them and the host gate pins them, each with the declaration
+	// the catalogue requires beside a face before it will publish it.
+	const CORPUS: [(&[u8], &[u8]); 4] = [
+		(b"vol://system/share/fonts/conformance-alpha.ttf", include_bytes!("../../tests/fonts/conformance-alpha.ttf")),
+		(b"vol://system/share/fonts/conformance-alpha.ttf.face", include_bytes!("../../tests/fonts/conformance-alpha.ttf.face")),
+		(b"vol://system/share/fonts/conformance-complex.ttf", include_bytes!("../../tests/fonts/conformance-complex.ttf")),
+		(b"vol://system/share/fonts/conformance-complex.ttf.face", include_bytes!("../../tests/fonts/conformance-complex.ttf.face")),
+	];
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	let catalogue_elf = program_elf(&package, volume, b"font_catalogue").expect("font_catalogue in the package or volume");
 	let textconf_elf = program_elf(&package, volume, b"textconf").expect("textconf in the package or volume");
 	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	// INSTALLED BEFORE THE CATALOGUE STARTS, so its first scan publishes them: what is under test is the
+	// shaping on the target, not how soon a watch notices a face.
+	for (index, (path, bytes)) in CORPUS.iter().enumerate() {
+		assert!(storage.write(path, bytes, 0xf0_0100 + index as u32), "the corpus file {} was installed into this test's volume", core::str::from_utf8(path).unwrap_or("?"));
+	}
 
 	// THE CATALOGUE'S WHOLE AUTHORITY. `writable: false` is not decoration: a read-only directory
 	// scope refuses the mutating operations by name, which is what lets a service that reads faces
@@ -2089,7 +2110,51 @@ fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 	send_cap(&boot_kernel, b"STDOUT", program_console, Rights::ALL).expect("the program's console");
 	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
 	boot_kernel.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new())).expect("the program's launch context");
-	send_cap(&boot_kernel, b"FONT", serve_client, Rights::ALL).expect("the program's font catalogue");
+	// THIS TEST'S OWN CONNECTION to the catalogue, minted before the root is handed on: the watch is checked on it below.
+	let watcher = storage.connect_from(&serve_client);
+	// TWO CLIENTS AT ONCE, INTERLEAVED. PermissionManager mints each application a connection of its own from this root,
+	// because every generated client starts its correlations at the same number and takes exactly the next reply: two
+	// applications holding one connection would read each other's answers. Two connections minted the way it mints them,
+	// a LIST sent on the first and a RESOLVE-INFO on the second before either is read: each answer arrives on its own
+	// connection, and is its own.
+	{
+		let first = storage.connect_from(&serve_client);
+		let second = storage.connect_from(&serve_client);
+		let ask = |channel: &Channel, op: u16, corr: u32, body: &[u8]| {
+			let mut request = alloc::vec::Vec::new();
+			request.extend_from_slice(&op.to_le_bytes());
+			request.extend_from_slice(&corr.to_le_bytes());
+			request.extend_from_slice(body);
+			channel.send(Message::new(request, alloc::vec::Vec::new())).expect("a catalogue request");
+		};
+		let answer = |storage: &mut StorageHarness, channel: &Channel| -> Message {
+			for _ in 0..100_000 {
+				storage.pump();
+				if let Ok(reply) = channel.recv() {
+					return reply;
+				}
+			}
+			panic!("the font catalogue did not answer");
+		};
+		// THE FACE'S IDENTITY, from a LIST on its own first: its digest's length, the digest, the index.
+		ask(&first, 1, 0xf1_0001, &[]);
+		let list = answer(&mut storage, &first);
+		assert!(le_u32(&list.bytes, 0) == 0xf1_0001 && list.bytes.get(4) == Some(&1) && list.bytes.len() >= 9 && u16::from_le_bytes([list.bytes[5], list.bytes[6]]) >= 1, "the catalogue lists its staged faces");
+		let digest_length = usize::from(u16::from_le_bytes([list.bytes[7], list.bytes[8]]));
+		let identity = list.bytes[7..9 + digest_length + 4].to_vec();
+		ask(&first, 1, 0xf1_0002, &[]);
+		ask(&second, 2, 0xf2_0002, &identity);
+		let resolved = answer(&mut storage, &second);
+		let listed = answer(&mut storage, &first);
+		assert_eq!((le_u32(&resolved.bytes, 0), resolved.bytes.get(4).copied()), (0xf2_0002, Some(1)), "the second client's RESOLVE-INFO is answered on its own connection");
+		assert_eq!(resolved.bytes.get(5..5 + identity.len()), Some(&identity[..]), "about the face it named");
+		assert_eq!((le_u32(&listed.bytes, 0), listed.bytes.get(4).copied()), (0xf1_0002, Some(1)), "the first client's LIST is answered on its own connection");
+		assert_eq!(listed.bytes.get(5..), list.bytes.get(5..), "with the same listing");
+		crate::serial_println!("  two catalogue clients interleaved a LIST and a RESOLVE-INFO, each answered on its own connection");
+	}
+	// THE ROOT IS HELD HERE TOO, not only handed on: the catalogue's serve loop ends when its root closes, and the program
+	// closes its end when it exits - before the watch below is checked.
+	send_cap(&boot_kernel, b"FONT", serve_client.clone(), Rights::ALL).expect("the program's font catalogue");
 
 	// EVERY LINE IT PRINTS, and a bound on the waiting. A run that never answers is a failure with
 	// something to show rather than a suite that stops.
@@ -2128,7 +2193,69 @@ fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 	// exercise one of the two rules and report a pass for both.
 	assert!(printed.iter().any(|line| line.starts_with("textconf: 50 px:")), "the aligned size was compared, and printed: {shown}");
 	assert!(printed.iter().any(|line| line.starts_with("textconf: 37 px:")), "the fractional size was compared, and printed: {shown}");
+	// THE SCRIPTS, BY THE TAG EACH CASE WAS SHAPED UNDER - Arabic, Devanagari and Thai - and the
+	// paragraph whose two directions meet on one line. Every case shaped is drawn at both of the
+	// corpus sizes: the aligned one, where every pixel is compared exactly, and the fractional one.
+	assert!(printed.iter().any(|line| line.starts_with("textconf: loaded ") && line.contains("conformance-alpha.ttf")), "the Arabic and Hebrew face was reached through the catalogue, and printed: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("textconf: loaded ") && line.contains("conformance-complex.ttf")), "the Devanagari and Thai face was reached through the catalogue, and printed: {shown}");
+	for script in ["(arab)", "(dev2)", "(thai)"] {
+		assert!(printed.iter().any(|line| line.starts_with("textconf: shaped '") && line.contains(script) && line.contains("exactly as authored")), "a {script} case was shaped exactly as the corpus declares, and printed: {shown}");
+	}
+	let shaped = printed.iter().filter(|line| line.starts_with("textconf: shaped '") || line.starts_with("textconf: laid out '")).count();
+	let paragraphs = printed.iter().filter(|line| line.starts_with("textconf: laid out '") && line.contains("in the authored order with the authored glyphs")).count();
+	assert!(paragraphs >= 1, "the mixed-direction paragraph went through every stage of the pipeline as authored, and printed: {shown}");
+	for size in ["200", "50"] {
+		let marker = alloc::format!(" at {size} px: ");
+		let drawn = printed.iter().filter(|line| line.starts_with("textconf: drawn '") && line.contains(marker.as_str()) && line.ends_with("and a one-pixel shift is refused")).count();
+		assert_eq!(drawn, shaped, "every shaped case and paragraph was drawn to the analytic oracle at {size} px, and printed: {shown}");
+	}
 	assert!(printed.iter().any(|line| line.starts_with("textconf: PASSED")), "the corpus rendered to the analytic oracle, and printed: {shown}");
+
+	// THE DIRECTORY IS WATCHED. A face removed behind the catalogue's back - through a writable scope on the same
+	// directory, as an installer's would be - is withdrawn without anyone asking for a rescan: LIST stops naming it
+	// within a few of the catalogue's one-second looks. Unwatched, it was listed until the service restarted.
+	let listed = |storage: &mut StorageHarness, corr: u32| -> Option<u16> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		watcher.send(Message::new(request, alloc::vec::Vec::new())).ok()?;
+		for _ in 0..100_000 {
+			storage.pump();
+			if let Ok(reply) = watcher.recv() {
+				let answered = le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&1) && reply.bytes.len() >= 7;
+				return answered.then(|| u16::from_le_bytes([reply.bytes[5], reply.bytes[6]]));
+			}
+		}
+		None
+	};
+	let before = listed(&mut storage, 0xf0_0001).filter(|faces| *faces >= 1).expect("the staged faces are listed before one is removed");
+	let writable = storage.open_directory_scope(b"vol://system/share/fonts", true);
+	let path = b"vol://system/share/fonts/lastresort.ttf";
+	let mut remove = alloc::vec::Vec::new();
+	remove.extend_from_slice(&4u16.to_le_bytes());
+	remove.extend_from_slice(&0xf0_0002u32.to_le_bytes());
+	remove.extend_from_slice(&(path.len() as u16).to_le_bytes());
+	remove.extend_from_slice(path);
+	writable.send(Message::new(remove, alloc::vec::Vec::new())).expect("the remove request");
+	let mut removed = None;
+	for _ in 0..100_000 {
+		storage.pump();
+		if let Ok(reply) = writable.recv() {
+			removed = Some(reply);
+			break;
+		}
+	}
+	assert_eq!(removed.and_then(|reply| reply.bytes.get(4).copied()), Some(1), "the writable scope removed the face");
+	let deadline = arch::apic::ticks().saturating_add(1000);
+	let mut corr = 0xf0_0010u32;
+	let mut withdrawn = false;
+	while !withdrawn && arch::apic::ticks() < deadline {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(10));
+		corr += 1;
+		withdrawn = listed(&mut storage, corr) == Some(before - 1);
+	}
+	assert!(withdrawn, "the catalogue withdrew a face removed from its watched directory, with no rescan asked for");
+	crate::serial_println!("  the face removed from the watched directory was withdrawn with no rescan asked for");
 }
 
 tagged_test!(the_2d_profile_conforms_on_the_target, [Image, Process, Slow], id = "kernel.applications.the_2d_profile_conforms_on_the_target", covers = ["bin.test2d-conformance-sw", "render2d", "soft2d", "kernel"]);

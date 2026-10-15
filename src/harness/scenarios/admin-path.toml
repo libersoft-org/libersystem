@@ -658,13 +658,22 @@ unordered = true
 timeout = 60
 
 # THE COUNTS: exactly the writes the confirmed attempts made - approve, substitute, the live delegate and the
-# outcome storage refused - and no dispatch that was not one of them.
+# outcome storage refused - and no dispatch that was not one of them. And before them, what the executor still
+# holds prepared: every ending above released its preparation, so at most the orphan is left.
 [[step]]
 do = "key"
 keys = ["ret"]
 
 [[step]]
 do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck slots"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS slots"
 
 [[step]]
 do = "key"

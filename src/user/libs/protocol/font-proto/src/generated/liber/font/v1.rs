@@ -1037,8 +1037,9 @@ pub mod font_catalogue {
 		/// The generation is the one `resolve-info` answered about, and it is what closes the race
 		/// between the two calls.
 		fn resolve_into(&mut self, identity: FaceIdentity, generation: u64, target: u64) -> Result<ResolveOutcome, Error>;
-		/// Learn that the published set changed, without polling.
-		fn subscribe(&mut self) -> Vec<GenerationEvent>;
+		/// Learn that the published set changed, without polling. A connection holds one subscription, and the
+		/// catalogue as many as its bound: past either is `exhausted`, answered at the ask.
+		fn subscribe(&mut self) -> Result<Vec<GenerationEvent>, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1199,7 +1200,7 @@ pub mod font_catalogue {
 		Some(writer.pos())
 	}
 
-	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<GenerationEvent>)> {
+	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<GenerationEvent>, Error>)> {
 		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let _op = r.u16()?;
@@ -1208,6 +1209,22 @@ pub mod font_catalogue {
 		request_handles.clear();
 		let items = service.subscribe();
 		Some((corr, items))
+	}
+	pub fn subscribe_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(1)?;
+		w.u32(0)?;
+		writer.finish()
+	}
+	pub fn subscribe_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(0)?;
+		error.write(w)?;
+		writer.finish()
 	}
 	pub fn subscribe_frame(seq: u32, item: &GenerationEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
@@ -1425,7 +1442,7 @@ pub mod font_catalogue {
 			}
 			decoded
 		}
-		pub fn subscribe(&mut self) -> Option<u64> {
+		pub fn subscribe(&mut self) -> Option<Result<u64, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1434,21 +1451,38 @@ pub mod font_catalogue {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+			let decoded = (|| {
+				if r.u32()? != corr {
+					return None;
+				}
+				if r.tag()? {
+					let _ = r.u32()?;
+					r.finish()?;
+					if reply_handles.len() != 1 {
+						return None;
+					}
+					return Some(Ok(reply_handles.first()));
+				}
+				if !reply_handles.is_empty() {
+					return None;
+				}
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
+			})();
+			if !matches!(decoded, Some(Ok(_))) {
 				self.transport.discard_handles(reply_handles.as_slice());
-				return None;
 			}
-			Some(reply_handles.first())
+			decoded
 		}
 	}
 
@@ -1479,7 +1513,7 @@ pub mod font_catalogue {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_font_font_catalogue_subscribe")]
-	fn channel_invoke_subscribe(chan: u64) -> Option<u64> {
+	fn channel_invoke_subscribe(chan: u64) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.subscribe()
 	}

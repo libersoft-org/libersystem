@@ -131,6 +131,18 @@ do = "expect"
 contains = "tpm: pcr "
 timeout = 30
 
+# A SECRET PAST ITS NINETY-SIX BYTES is `bounds`, by its name - it is never sent, so the connection that would have
+# carried it is not closed for a request the service cannot decode.
+
+[[step]]
+do = "key"
+text = "tpm seal 16 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefX vol://tmp/sealed-long.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: seal refused: bounds"
+timeout = 30
+
 # SEALED TO PCR 16, and opened.
 
 [[step]]
@@ -222,6 +234,17 @@ text = "tpm random 8"
 [[step]]
 do = "expect"
 contains = "tpm: random refused: unavailable"
+timeout = 30
+
+# AND A CALL THAT NEEDS THE OWNER HIERARCHY is `unavailable` too, while no TPM is served - not
+# `owner-hierarchy-unavailable`, whose only remedy is a TPM clear.
+[[step]]
+do = "key"
+text = "tpm seal 16 liber-secret vol://tmp/sealed-down.bin"
+
+[[step]]
+do = "expect"
+contains = "tpm: seal refused: unavailable"
 timeout = 30
 
 [[step]]

@@ -763,6 +763,17 @@ impl Sleeper {
 		}
 	}
 
+	// THE LAST SLEEP'S FAILURE, for the system graph: a refusal or an unwind, in the words the log said it in - and
+	// nothing while no sleep has been asked for, or once one has slept and woken.
+	pub(super) fn failure(&self) -> Option<String> {
+		let record = &self.record;
+		match record.outcome {
+			SleepOutcome::Refused if !record.who.is_empty() => Some(format!("refused: {} - {}", record.who, record.why)),
+			SleepOutcome::Unwound if !record.who.is_empty() => Some(format!("unwound at {:?}: {} - {}", record.step, record.who, record.why)),
+			_ => None,
+		}
+	}
+
 	// ------------------------------------------------------------------ the end
 
 	fn finish(&mut self) -> Ended {

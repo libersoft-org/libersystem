@@ -21,6 +21,10 @@
 //!
 //! AND IT PROVES IT REFUSES BEFORE IT APPROVES. `--self-test` corrupts a pinned face, breaks an
 //! expectation and drops a glyph name, and requires each to be caught.
+//!
+//! THE SHAPING AND PARAGRAPH CASES ARE SHARED WITH THE GUEST RUN. `bin/textconf` compiles the same
+//! file and shapes the cases it names inside a booted guest on each architecture, so the host and the
+//! guest are held to one statement of what the corpus declares rather than to two that could drift.
 
 use bootproto::sha256;
 use font_parse::Face;
@@ -29,27 +33,14 @@ use font_shape::buffer::GlyphInfo;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+// THE AUTHORED CASES, from beside the guest program that compiles them too - see the file's own
+// note for why they live there.
+#[path = "../../../user/apps/tools/src/textconf/corpus.rs"]
+mod corpus;
+// The variation instances, which only this gate reads.
 mod cases;
 
-/// One expected glyph: which glyph, which cluster it came from, and where it sits.
-pub struct Expect {
-	pub glyph: &'static str,
-	pub cluster: u32,
-	pub x_advance: i32,
-	pub x_offset: i32,
-	pub y_offset: i32,
-}
-
-/// One shaping case: a string, the face that draws it, and what must come out.
-pub struct Case<'a> {
-	pub name: &'static str,
-	pub face: &'static str,
-	pub text: &'static str,
-	/// BORROWED RATHER THAN `'static` so the self-test can build a deliberately wrong one and drive
-	/// it through the same comparison the real cases use. A second comparison written for the
-	/// self-test would be the thing that goes stale.
-	pub expect: &'a [Expect],
-}
+use corpus::{Case, Expect};
 
 /// A face as the pin file describes it: its digest, and what its glyphs are called.
 struct Pinned {
@@ -114,7 +105,34 @@ fn main() -> std::process::ExitCode {
 		return std::process::ExitCode::FAILURE;
 	}
 
-	for case in cases::CASES {
+	// THE CASES THE GUEST RUNS ARE CASES OF THIS CORPUS. The guest finds them by name, so a renamed case
+	// would otherwise surface as a guest run that cannot find what it was told to shape - on three
+	// architectures, minutes into a boot - rather than here.
+	for name in corpus::GUEST_CASES {
+		match corpus::CASES.iter().find(|case| case.name == *name) {
+			Some(case) if pins.contains_key(case.face) => {}
+			Some(case) => {
+				eprintln!("text-corpus: the guest runs '{name}', whose face {} the pin file does not name", case.face);
+				failures += 1;
+			}
+			None => {
+				eprintln!("text-corpus: the guest runs '{name}', and no case of this corpus has that name");
+				failures += 1;
+			}
+		}
+	}
+	for name in corpus::GUEST_PARAGRAPHS {
+		if !corpus::PARAGRAPHS.iter().any(|paragraph| paragraph.name == *name && pins.contains_key(paragraph.face)) {
+			eprintln!("text-corpus: the guest lays out '{name}', and no paragraph of this corpus with a pinned face has that name");
+			failures += 1;
+		}
+	}
+	if failures > 0 {
+		return std::process::ExitCode::FAILURE;
+	}
+	println!("text-corpus: the guest run's {} case(s) and {} paragraph(s) are cases of this corpus", corpus::GUEST_CASES.len(), corpus::GUEST_PARAGRAPHS.len());
+
+	for case in corpus::CASES {
 		let Some(face_bytes) = bytes.get(case.face) else {
 			eprintln!("text-corpus: {}: the case names a face the pin file does not: {}", case.name, case.face);
 			failures += 1;
@@ -131,13 +149,20 @@ fn main() -> std::process::ExitCode {
 		}
 	}
 
-	// THE BIDI CASES ARE NOT SHAPING CASES and are run through the pipeline rather than the shaper:
-	// what a mixed-direction paragraph is about is the VISUAL ORDER of its runs, which is decided
-	// after line breaking and not by any font.
-	for case in cases::PARAGRAPHS {
+	// THE PARAGRAPH CASES RUN THROUGH EVERY STAGE OF THE PIPELINE with the pinned face installed:
+	// fallback, mirroring, shaping, measurement, breaking, reshaping and the per-line visual order.
+	// What a mixed-direction paragraph is about is the VISUAL ORDER of its lines, decided after line
+	// breaking; what a mirrored character or a reshaped line is about is the GLYPHS those lines carry.
+	for case in corpus::PARAGRAPHS {
+		let Some(face_bytes) = bytes.get(case.face) else {
+			eprintln!("text-corpus: {}: the paragraph names a face the pin file does not: {}", case.name, case.face);
+			failures += 1;
+			continue;
+		};
+		let Some(pinned) = pins.get(case.face) else { continue };
 		checked += 1;
-		match run_paragraph(case) {
-			Ok(()) => println!("text-corpus: {} -> the visual order is what the levels require", case.name),
+		match run_paragraph(face_bytes, pinned, case) {
+			Ok(()) => println!("text-corpus: {} -> {} line(s) in the order and with the glyphs the corpus declares", case.name, case.lines.len()),
 			Err(problem) => {
 				eprintln!("text-corpus: {}: {problem}", case.name);
 				failures += 1;
@@ -211,23 +236,55 @@ fn run_case(bytes: &[u8], pinned: &Pinned, case: &Case<'_>) -> Result<(), String
 	Ok(())
 }
 
-/// A mixed-direction paragraph: the levels, and the order its clusters are drawn in.
-fn run_paragraph(case: &cases::Paragraph<'_>) -> Result<(), String> {
-	use text_pipeline::stages::{self, Faced, Shaped};
+/// The size the paragraph cases are laid out at, which the corpus states beside them.
+const PARAGRAPH_SIZE: i16 = corpus::PARAGRAPH_SIZE;
 
+/// One pinned face, installed as the only face a paragraph may use.
+struct Installed<'a> {
+	face: Face<'a>,
+}
+
+impl text_pipeline::Coverage for Installed<'_> {
+	fn covers(&self, face: u16, spelling: &[char]) -> bool {
+		face == 0 && !spelling.is_empty() && spelling.iter().all(|character| matches!(self.face.glyph_for(*character), Ok(Some(_))))
+	}
+}
+
+impl text_pipeline::Faces for Installed<'_> {
+	fn face(&self, face: u16) -> Option<&Face<'_>> {
+		(face == 0).then_some(&self.face)
+	}
+}
+
+/// A paragraph through every stage of the pipeline: its levels, its lines, the order each line is
+/// drawn in, and the glyphs each line's runs were shaped to.
+fn run_paragraph(bytes: &[u8], pinned: &Pinned, case: &corpus::Paragraph<'_>) -> Result<(), String> {
+	use text_pipeline::stages;
+
+	let installed = Installed { face: Face::open(bytes, 0).map_err(|error| format!("the face does not open: {error:?}"))? };
+	let policy = text_pipeline::Policy::new(&[text_pipeline::FaceEntry { face: 0, script: None, language: None, rank: 0 }], None);
 	let source = text_pipeline::Source::new(case.text).map_err(|error| format!("the paragraph is refused: {error:?}"))?;
-	let items = stages::itemise(source);
-	let levelled = stages::resolve_levels(items, case.direction);
+	let levelled = stages::resolve_levels(stages::itemise(source), case.direction);
 	if levelled.levels.paragraph_level != case.paragraph_level {
 		return Err(format!("the paragraph level is {} where the corpus declares {}", levelled.levels.paragraph_level, case.paragraph_level));
 	}
-	let shaped = Shaped { faced: Faced { levelled, faces: Vec::new(), mirrored: Vec::new() }, runs: Vec::new() };
+	let faced = stages::choose_faces(levelled, &policy, &installed).map_err(|error| format!("fallback refused: {error:?}"))?;
+	let shaped = stages::shape(faced, &installed, font_contract::Fixed266::from_pixels(PARAGRAPH_SIZE)).map_err(|error| format!("shaping refused: {error:?}"))?;
 	let measured = stages::measure(shaped).map_err(|error| format!("measuring refused: {error:?}"))?;
-	let lines = stages::break_lines(measured, font_contract::Fixed266::from_pixels(1000));
-	let visual = stages::reorder(lines);
-	let order: Vec<usize> = visual.order.first().cloned().unwrap_or_default();
-	if order != case.order {
-		return Err(format!("the visual order is {order:?} where the corpus declares {:?}", case.order));
+	let lines = stages::break_lines(measured, font_contract::Fixed266::from_pixels(case.width)).map_err(|error| format!("line breaking refused: {error:?}"))?;
+	let reshaped = stages::reshape(lines, &installed).map_err(|error| format!("reshaping refused: {error:?}"))?;
+	let visual = stages::reorder(reshaped).map_err(|error| format!("reordering refused: {error:?}"))?;
+	if visual.order.len() != case.lines.len() {
+		return Err(format!("the paragraph broke into {} line(s) where the corpus declares {}", visual.order.len(), case.lines.len()));
+	}
+	for (index, (line, expect)) in visual.order.iter().zip(case.lines).enumerate() {
+		if line.as_slice() != expect.order {
+			return Err(format!("line {index}'s visual order is {line:?} where the corpus declares {:?}", expect.order));
+		}
+		let glyphs: Vec<String> = visual.reshaped.runs[index].iter().flat_map(|run| run.buffer.infos.iter().map(|info| name_of(pinned, info.glyph))).collect();
+		if glyphs != expect.glyphs {
+			return Err(format!("line {index} was shaped to {glyphs:?} where the corpus declares {:?}", expect.glyphs));
+		}
 	}
 	Ok(())
 }
@@ -375,7 +432,7 @@ fn self_check(directory: &Path, pins: &BTreeMap<String, Pinned>) -> Result<(), S
 
 	// AN EXPECTATION THAT IS WRONG, run through the same comparison the real cases use. The case
 	// below is a copy of a real one with its first glyph's advance moved by one unit.
-	let case = cases::CASES.first().ok_or_else(|| "no cases".to_string())?;
+	let case = corpus::CASES.first().ok_or_else(|| "no cases".to_string())?;
 	let real = case.expect.first().ok_or_else(|| "a case with no expectations".to_string())?;
 	let broken_expect = [Expect { glyph: real.glyph, cluster: real.cluster, x_advance: real.x_advance + 1, x_offset: real.x_offset, y_offset: real.y_offset }];
 	let broken = Case { name: "a deliberately wrong advance", face: case.face, text: case.text, expect: &broken_expect };
@@ -394,16 +451,29 @@ fn self_check(directory: &Path, pins: &BTreeMap<String, Pinned>) -> Result<(), S
 		Err(problem) => println!("text-corpus: an undeclared glyph name is refused: {problem}"),
 	}
 
-	// AND A PARAGRAPH WHOSE VISUAL ORDER IS WRONG.
-	let paragraph = cases::PARAGRAPHS.first().ok_or_else(|| "no paragraphs".to_string())?;
-	let mut order = paragraph.order.to_vec();
+	// AND A PARAGRAPH WHOSE VISUAL ORDER IS WRONG, and one whose line carries a glyph it was not
+	// shaped to - the two halves of what a paragraph case compares.
+	let paragraph = corpus::PARAGRAPHS.first().ok_or_else(|| "no paragraphs".to_string())?;
+	let line = paragraph.lines.first().ok_or_else(|| "a paragraph with no lines".to_string())?;
+	let paragraph_bytes = std::fs::read(directory.join(paragraph.face)).map_err(|error| format!("{} could not be read: {error}", paragraph.face))?;
+	let paragraph_pins = pins.get(paragraph.face).ok_or_else(|| format!("{} is not pinned", paragraph.face))?;
+	let mut order = line.order.to_vec();
 	order.reverse();
-	let broken = cases::Paragraph { name: "a deliberately reversed order", text: paragraph.text, direction: paragraph.direction, paragraph_level: paragraph.paragraph_level, order: &order };
-	match run_paragraph(&broken) {
+	let reversed = [corpus::Line { order: &order, glyphs: line.glyphs }];
+	let broken = corpus::Paragraph { name: "a deliberately reversed order", face: paragraph.face, text: paragraph.text, direction: paragraph.direction, paragraph_level: paragraph.paragraph_level, width: paragraph.width, lines: &reversed };
+	match run_paragraph(&paragraph_bytes, paragraph_pins, &broken) {
 		Ok(()) => return Err("a reversed visual order was accepted".to_string()),
 		Err(problem) => println!("text-corpus: a wrong visual order is refused: {problem}"),
 	}
+	let mut glyphs = line.glyphs.to_vec();
+	glyphs.reverse();
+	let swapped = [corpus::Line { order: line.order, glyphs: &glyphs }];
+	let broken = corpus::Paragraph { name: "deliberately swapped glyphs", face: paragraph.face, text: paragraph.text, direction: paragraph.direction, paragraph_level: paragraph.paragraph_level, width: paragraph.width, lines: &swapped };
+	match run_paragraph(&paragraph_bytes, paragraph_pins, &broken) {
+		Ok(()) => return Err("a line declared with glyphs it was not shaped to was accepted".to_string()),
+		Err(problem) => println!("text-corpus: a line's wrong glyphs are refused: {problem}"),
+	}
 
-	println!("text-corpus: the gate refuses a corrupted face, a wrong position, an undeclared glyph and a wrong order");
+	println!("text-corpus: the gate refuses a corrupted face, a wrong position, an undeclared glyph, a wrong order and a wrong line");
 	Ok(())
 }

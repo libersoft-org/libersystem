@@ -500,8 +500,40 @@ pub fn quad_at_depth(depth: f32, red: f32, green: f32, blue: f32) -> Scene {
 }
 
 /// Two values are equal within the tolerance a shaded comparison is made at.
+///
+/// A COLOUR'S TOLERANCE AND NOT A DEPTH'S: a depth is compared by `depth_is`, against the threshold the
+/// profile freezes for it.
 pub fn close(left: f32, right: f32) -> bool {
 	(left - right).abs() < 1.0 / 255.0
+}
+
+/// THE FROZEN DEPTH THRESHOLD, as the number a comparison applies. `graphics_profile::thresholds` freezes
+/// "a depth value" at one ULP for a floating-point format and EXACT for a normalised one, and a host test
+/// holds that entry's text to this.
+pub const DEPTH_FLOAT_ULPS: u32 = 1;
+
+/// Whether a pixel's STORED depth is `expected` within the frozen depth threshold: within `DEPTH_FLOAT_ULPS`
+/// of it in a floating-point format, and in a normalised one exactly the integer the profile's conversion
+/// makes of it, `round(d * maximum)` - a normalised depth is an integer after the conversion, and an integer
+/// that differs is a different depth test.
+pub fn depth_is(frame: &Frame, x: u32, y: u32, expected: f32) -> bool {
+	match (frame.depth_stored(x, y), frame.depth.format.normalised_maximum()) {
+		(render3d::depth::Stored::Float(value), None) => ulps_apart(value, expected) <= DEPTH_FLOAT_ULPS,
+		(render3d::depth::Stored::Normalised(value), Some(maximum)) => value == (f64::from(expected) * f64::from(maximum) + 0.5) as u32,
+		_ => false,
+	}
+}
+
+/// How many representable `f32` values lie between two finite values of one sign, counting one of the ends:
+/// zero for equal values, and as far as there is for any other pair.
+pub fn ulps_apart(left: f32, right: f32) -> u32 {
+	if left == right {
+		return 0;
+	}
+	if !(left.is_finite() && right.is_finite()) || left.is_sign_negative() != right.is_sign_negative() {
+		return u32::MAX;
+	}
+	left.to_bits().abs_diff(right.to_bits())
 }
 
 /// A whole colour within that tolerance.

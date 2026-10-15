@@ -383,6 +383,9 @@ record zone-cooling {
 record zone-reading {
 	temperature: u32,
 	sequence:    u32,
+	/// The zone said its trip points changed - `Notify(0x81)` - since the last reading: `describe` answers the new ones,
+	/// and a policy that judged this reading against the old ones would be following trips the zone no longer has.
+	trips-changed: bool,
 }
 
 /// THE `thermal-zone` PROVIDER CONTRACT, which a zone's driver serves to ProcessorPowerService alone: the zone's cooling
@@ -466,6 +469,8 @@ record zone-power {
 	hot:             option<u32>,
 	passive-engaged: bool,
 	cap-percent:     u32,
+	/// Its `_ACx` trips: the temperature of each, and the fans it lists - the trips the fans and the curve act on.
+	@bound(10) active: list<active-trip>,
 }
 
 /// One fan, as the policy commands it.

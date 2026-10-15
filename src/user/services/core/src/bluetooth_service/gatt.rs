@@ -21,8 +21,12 @@ use service_logic::att::{op, subscription::Subscription};
 
 // The services this stack drives itself, which no grant reaches: GAP, GATT, HID, and the LE Audio services.
 const STACK_SERVICES: [u16; 11] = [0x1800, 0x1801, 0x1812, 0x184e, 0x184f, 0x1850, 0x1844, 0x1846, 0x184c, 0x1853, 0x1855];
-// Grants alive at once, across every controller.
+// Grants alive at once, across every controller: GATT's and the serial port's together (`Stack::minted`).
 const MAX_GRANTS: usize = bt_bounds::MINTED_GRANTS;
+// Subscriptions a grant holds, one stream per value; and all grants together, one for each grant the bound allows -
+// each holds a handle of this Domain's.
+const GRANT_SUBSCRIPTIONS: usize = 4;
+const ALL_SUBSCRIPTIONS: usize = bt_bounds::MINTED_GRANTS;
 // Operations a link holds queued.
 const MAX_QUEUED_OPS: usize = 16;
 // A subscribe's entire bounded discovery and write, including time on the link's queue.
@@ -202,7 +206,7 @@ impl bluetooth_admin::Service for AdminView<'_> {
 		if owner == 0 {
 			return Err(Error::Invalid);
 		}
-		if alias.is_empty() || self.stack.grants.len() >= MAX_GRANTS {
+		if alias.is_empty() || self.stack.minted() >= MAX_GRANTS {
 			if owner != 0 {
 				close(owner);
 			}
@@ -238,6 +242,11 @@ impl bluetooth_admin::Service for AdminView<'_> {
 }
 
 impl Stack {
+	// GRANTS MINTED AND ALIVE, of both kinds: GATT's and the serial port's share one bound.
+	pub(crate) fn minted(&self) -> usize {
+		self.grants.len() + self.serials.len()
+	}
+
 	// The link a grant's peer is connected on, encrypted - or why there is none.
 	fn grant_link(&self, grant: &Grant) -> Result<u16, Error> {
 		let controller = self.controllers.get(grant.at).ok_or(Error::Closed)?;
@@ -489,7 +498,15 @@ impl Stack {
 				Err(error) => self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, error),
 				Ok(true) => {
 					let corr = u32::from_le_bytes([op.request[2], op.request[3], op.request[4], op.request[5]]);
-					if let Some((producer, consumer)) = channel_with_depth(32) {
+					// ONE STREAM PER VALUE: subscribing again to a value the grant holds ends the stream it had.
+					let subscriptions = &mut self.grants[grant_index].subscriptions;
+					if let Some(held) = subscriptions.iter().position(|&(subscribed, _)| subscribed == walk.value()) {
+						close(subscriptions.remove(held).1);
+					}
+					let all: usize = self.grants.iter().map(|grant| grant.subscriptions.len()).sum();
+					if self.grants[grant_index].subscriptions.len() >= GRANT_SUBSCRIPTIONS || all >= ALL_SUBSCRIPTIONS {
+						self.refuse(chan, &op.request, bluetooth_gatt::OP_SUBSCRIBE, Error::Exhausted);
+					} else if let Some((producer, consumer)) = channel_with_depth(32) {
 						let mut out = [0u8; 64];
 						if let Some(len) = bluetooth_gatt::subscribe_reply_ok(corr, &mut out)
 							&& send_caps_blocking(chan, &out[..len], &[consumer])

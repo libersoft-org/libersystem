@@ -180,9 +180,16 @@ pub struct Setting {
 }
 
 /// A CORE'S PERFORMANCE TABLE, checked whole: one to thirty-two states fastest first, every register one this kernel
-/// writes - no model-specific register, no platform channel - a coordination it knows, and throttling states with T0
-/// first.
+/// writes - no model-specific register, no platform channel - a coordination it performs, and throttling states with
+/// T0 first.
+///
+/// A COORDINATION IT PERFORMS: a domain of one processor, or one the hardware coordinates. A domain of several
+/// processors that software must coordinate is refused rather than accepted and ignored - this kernel decides each
+/// core's level alone, and the processor handshake does not offer software coordination either.
 pub fn check_table(table: &Table, arch: Arch) -> Result<(), Refusal> {
+	if table.domain.is_some_and(|domain| domain.processors > 1 && domain.coordination != Coordination::HardwareAll) {
+		return Err(Refusal::SoftwareCoordinated);
+	}
 	match &table.control {
 		Control::States { control, status, states } => {
 			if states.is_empty() {

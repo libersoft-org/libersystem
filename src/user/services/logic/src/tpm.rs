@@ -79,10 +79,23 @@ pub fn needs_owner(op: &Op) -> bool {
 	matches!(op, Op::Seal { .. } | Op::Unseal { .. } | Op::Quote { .. })
 }
 
+/// What is known of the owner hierarchy a call would run under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Owner {
+	/// No TPM is being served - none was found, or its driver is restarting - so nothing is known of one. A call
+	/// that needs the owner is not refused for it here: the queue answers `unavailable`, which is what it is, and
+	/// what a caller waiting for the TPM to come back retries on.
+	Unknown,
+	Usable,
+	/// A provisioned owner hierarchy this service cannot use: an authorization value is set, or it is disabled.
+	/// Its only remedy is a TPM clear, which is why it is never said of a TPM that is merely not there.
+	Unusable,
+}
+
 /// EVERY CHECK A CALL PASSES BEFORE IT IS QUEUED, in the order a caller would want to be told: the grant, the
 /// PCR, the bounds, and the owner hierarchy - which is asked last, so a call that could never run on any TPM is
 /// told why before it is told about this one.
-pub fn admit(grant: Grant, op: &Op, owner_usable: bool) -> Result<(), Refusal> {
+pub fn admit(grant: Grant, op: &Op, owner: Owner) -> Result<(), Refusal> {
 	if !carries(grant, op) {
 		return Err(Refusal::NotGranted);
 	}
@@ -120,7 +133,7 @@ pub fn admit(grant: Grant, op: &Op, owner_usable: bool) -> Result<(), Refusal> {
 			}
 		}
 	}
-	if needs_owner(op) && !owner_usable {
+	if needs_owner(op) && owner == Owner::Unusable {
 		return Err(Refusal::OwnerHierarchyUnavailable);
 	}
 	Ok(())

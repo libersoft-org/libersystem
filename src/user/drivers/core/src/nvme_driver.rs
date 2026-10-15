@@ -21,7 +21,8 @@
 #![no_main]
 
 use driver_protocol::block;
-use drivers::nvme::{self, Prp, Reaped};
+use drivers::common::Deadline;
+use drivers::nvme::{self, Fault, Prp, Reaped};
 use drivers::{blk, common};
 use rt::*;
 
@@ -40,14 +41,26 @@ const IO_QUEUE: u16 = 1;
 // applied on top. It bounds the growable data span and therefore the DMA this process pins.
 const TRANSFER_BOUND: u64 = 128 * 1024;
 
-// How long a completion may take before the driver gives up on it. A REAL BOUND RATHER THAN A SPIN:
-// a controller that never answers would otherwise hold this process, and its client, forever.
-const COMPLETION_SPINS: u64 = 200_000_000;
+// How long one I/O command may take before the driver gives up on it, in the 100 Hz ticks of
+// `common::Deadline`: thirty seconds, the bound Linux gives an I/O command by default. A REAL BOUND
+// AND A TIME, NOT A SPIN COUNT: a controller that never answers must not hold this process and its
+// clients for ever, and a count of spins is a different time in every build and on every machine -
+// so a slow flush on a busy host was a "timeout" in one build and not in another.
+const IO_TICKS: u64 = 3000;
 
-// The enable/disable handshake's budget, as a multiple of the controller's own `CAP.TO` unit. The
-// specification states that timeout in 500 ms units, so this is scaled by what the controller
+// How long the admin commands of one bring-up or one reset may take, together. A fraction of the
+// bind window READY is due in (200 ticks), shared by every command in it, so a bring-up where
+// everything times out still finishes in time to say so.
+const ADMIN_TICKS: u64 = 150;
+
+// How long a controller is given to finish the shutdown it is told about before a sleep cuts its
+// power: inside the five seconds this driver's `suspend-deadline` gives the whole sleep step.
+const SHUTDOWN_TICKS: u64 = 200;
+
+// The enable/disable handshake's budget per unit of the controller's own `CAP.TO`, which the
+// specification states in 500 ms units - fifty ticks - so this is scaled by what the controller
 // reports rather than being a constant this driver invented.
-const READY_SPINS_PER_UNIT: u64 = 20_000_000;
+const READY_TICKS_PER_UNIT: u64 = 50;
 
 // Admin command opcodes.
 const ADMIN_CREATE_SQ: u8 = 0x01;
@@ -140,26 +153,6 @@ impl Bringup {
 	}
 }
 
-// Why a command did not produce an answer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fault {
-	// The controller reported a non-zero status, and WHICH one is carried: a status type and code
-	// name one refusal, while a bare "it failed" names every one of them.
-	Failed { status_type: u8, status_code: u8 },
-	// No completion arrived inside the bound.
-	Timeout,
-	// A completion arrived for a command that is not outstanding, which means this driver and the
-	// controller disagree about what is in flight. Reported apart from a failure because it is a
-	// reason to stop using the queue rather than to fail one request.
-	//
-	// IT CARRIES THE ID IT SAW AND THE RAW DWORD IT CAME OUT OF, because "not outstanding" is
-	// consistent with three different defects and the number tells them apart: an id that is the
-	// OPCODE means dword 0 is built wrong, an id that is plausible but off by a step means the
-	// bookkeeping is, and a dword of arbitrary bits means this is not a completion at all and the
-	// slot being read is the wrong memory.
-	Unexpected { saw: u16, expected: u16, dw2: u32, dw3: u32 },
-}
-
 // One submission/completion pair, and everything needed to ring for it.
 struct Pair {
 	sq_virt: u64,
@@ -198,8 +191,8 @@ impl Pair {
 	// complete" names five commands and a status type and code name exactly one thing. A driver that
 	// swallows the controller's own answer leaves whoever reads the log guessing at the one fact the
 	// controller took the trouble to report.
-	unsafe fn wait_named(&mut self, command_id: u16, opcode: u8) -> Result<(), Fault> {
-		let outcome = unsafe { self.wait(command_id) };
+	unsafe fn wait_named(&mut self, command_id: u16, opcode: u8, deadline: &mut Deadline) -> Result<(), Fault> {
+		let outcome = unsafe { self.wait(command_id, deadline) };
 		if let Err(fault) = outcome {
 			let mut line: common::Bounded<128> = common::Bounded::new();
 			line.push(b"driver.nvme: command ");
@@ -212,6 +205,7 @@ impl Pair {
 					line.push(&common::hex2(status_code));
 				}
 				Fault::Timeout => line.push(b" never completed"),
+				Fault::Down => line.push(b" was not issued - the controller could not be reset"),
 				Fault::Unexpected { saw, expected, dw2, dw3 } => {
 					// DWORD 2 IS THE FIELD THAT SETTLES IT: bits 31:16 are the SUBMISSION QUEUE this
 					// completion claims to be for, and bits 15:0 are how far the controller has
@@ -239,9 +233,8 @@ impl Pair {
 		outcome
 	}
 
-	// Wait for the completion of `command_id`.
-	unsafe fn wait(&mut self, command_id_wanted: u16) -> Result<(), Fault> {
-		let mut spins: u64 = 0;
+	// Wait for the completion of `command_id`, until `deadline`.
+	unsafe fn wait(&mut self, command_id_wanted: u16, deadline: &mut Deadline) -> Result<(), Fault> {
 		loop {
 			// THE PHASE IS READ FIRST, THEN A BARRIER, THEN THE REST OF THE ENTRY - and that order
 			// is the repair for the defect that made every bring-up a coin toss.
@@ -266,8 +259,7 @@ impl Pair {
 			let slot = self.cq_virt + (self.cq_head as u64) * nvme::CQ_ENTRY_LEN as u64;
 			let phase_seen = unsafe { r32(slot + 12) } & (1 << 16) != 0;
 			if phase_seen != self.phase {
-				spins += 1;
-				if spins > COMPLETION_SPINS {
+				if !deadline.waiting() {
 					return Err(Fault::Timeout);
 				}
 				continue;
@@ -282,14 +274,12 @@ impl Pair {
 				// now, where a host test can watch it: it was written here, in the one place no test
 				// could reach, and it is the rule that ended an intermittent bring-up.
 				Reaped::Arriving => {
-					spins += 1;
-					if spins > COMPLETION_SPINS {
+					if !deadline.waiting() {
 						return Err(Fault::Timeout);
 					}
 				}
 				Reaped::Empty => {
-					spins += 1;
-					if spins > COMPLETION_SPINS {
+					if !deadline.waiting() {
 						return Err(Fault::Timeout);
 					}
 				}
@@ -360,9 +350,17 @@ unsafe fn zero(virt: u64, bytes: u64) {
 
 // The controller, once it is up.
 struct Controller {
+	base: u64,
 	device: u64,
+	caps: nvme::Capabilities,
+	// How many entries each of the four queues has.
+	entries: u32,
 	admin: Pair,
 	io: Pair,
+	// THE FOUR QUEUE PAGES - admin submission and completion, then I/O submission and completion -
+	// contiguous and in that order, so a reset empties them and describes them to the controller
+	// again from the same memory.
+	queues: Dma,
 	// The next command id, monotonic so that a late completion from a timed-out command cannot be
 	// mistaken for the next one's answer.
 	next_id: u16,
@@ -375,6 +373,15 @@ struct Controller {
 	prp_list: Dma,
 	// The growable data span one request moves through.
 	data: Dma,
+	// A reset that did not bring the controller back: nothing is issued until one does.
+	down: bool,
+}
+
+// One command on the I/O queue, as `Controller::io` issues it - and, after a reset, issues it again.
+#[derive(Clone, Copy)]
+enum Io {
+	Transfer { opcode: u8, lba: u64, blocks: u32, bytes: u64 },
+	Flush,
 }
 
 impl Controller {
@@ -415,6 +422,124 @@ impl Controller {
 		}
 	}
 
+	// From disabled to enabled with an empty admin pair, over the queue memory this driver already
+	// holds - the part of a bring-up a reset has to do again before the I/O pair.
+	unsafe fn enable(&mut self) -> Result<(), Bringup> {
+		unsafe {
+			// A QUEUE WHOSE MEMORY STILL HOLDS THE LAST PASS has completion entries whose phase bit may
+			// already match, so it is emptied and both pairs start over - every time, not only the first.
+			zero(self.queues.virt, self.queues.bytes);
+			self.admin = ring(self.base, &self.caps, &self.queues, self.entries, 0);
+			self.io = ring(self.base, &self.caps, &self.queues, self.entries, IO_QUEUE);
+			// AQA carries both sizes ZERO-BASED, which is the same trap `CAP.MQES` sets and is why the
+			// decoded `entries` is the real count everywhere else in this file.
+			let entries = self.entries;
+			w32(self.base + nvme::REG_AQA, ((entries - 1) << 16) | (entries - 1));
+			w64(self.base + nvme::REG_ASQ, self.queues.phys);
+			w64(self.base + nvme::REG_ACQ, self.queues.phys + PAGE);
+			// CC: the two entry sizes as powers of two, the NVM command set (zero), the host page size
+			// (zero, meaning 4 kB, which `Capabilities::decode` already checked this host can describe),
+			// no shutdown notification, and enable.
+			w32(self.base + nvme::REG_CC, (nvme::CQ_ENTRY_SHIFT << 20) | (nvme::SQ_ENTRY_SHIFT << 16) | nvme::CC_ENABLE);
+			if !wait_ready(self.base, true, self.caps.timeout_500ms) {
+				return Err(Bringup::NotReady);
+			}
+
+			// THE DOORBELLS ARE SET TO ZERO BEFORE THE FIRST COMMAND, and this is the repair for the
+			// defect that made every bring-up a coin toss.
+			//
+			// WHAT WAS SEEN: the first admin command was submitted with command id 1 and opcode 6, read
+			// back out of the queue memory to prove the write had landed, and the completion that came
+			// back carried command id 0 with a SUCCESS status. A zeroed submission entry is exactly that
+			// command - opcode 0x00 is FLUSH and its command id is 0 - so the controller had fetched a
+			// slot this driver never wrote. It does that when its tail doorbell still holds a value from
+			// before: on enable it believes there are entries queued up to that tail and consumes them,
+			// and the entries are the zeroed page.
+			//
+			// A DRIVER MAY NOT ASSUME THE RESET CLEARED THEM. Writing its own view - tail zero, head
+			// zero - onto a queue it has just created costs two stores and cannot be wrong: the queue IS
+			// empty at that moment, so zero is what both ends should believe.
+			self.zero_doorbells(0);
+			Ok(())
+		}
+	}
+
+	unsafe fn zero_doorbells(&self, queue: u16) {
+		unsafe {
+			w32(self.base + self.caps.doorbell(queue, false), 0);
+			w32(self.base + self.caps.doorbell(queue, true), 0);
+		}
+	}
+
+	// One admin command and its completion, inside the bring-up's or the reset's shared deadline.
+	unsafe fn admin(&mut self, opcode: u8, namespace: u32, prp1: u64, cdw: [u32; 6], deadline: &mut Deadline) -> Result<(), Fault> {
+		let id = self.command_id();
+		unsafe {
+			self.admin.submit(&command(opcode, id, namespace, prp1, 0, cdw));
+			self.admin.wait_named(id, opcode, deadline)
+		}
+	}
+
+	// IDENTIFY CONTROLLER, for `MDTS`, and IDENTIFY NAMESPACE, for the size, the formatted LBA and
+	// the protection settings: what this controller can move in one command, and what it serves.
+	unsafe fn identify(&mut self, deadline: &mut Deadline) -> Result<(u64, nvme::Namespace), Bringup> {
+		unsafe {
+			let (phys, virt) = (self.scratch.phys, self.scratch.virt);
+			zero(virt, PAGE);
+			self.admin(ADMIN_IDENTIFY, 0, phys, [CNS_CONTROLLER, 0, 0, 0, 0, 0], deadline).map_err(|_| Bringup::Admin)?;
+			let most_bytes = nvme::max_transfer(r8(virt + ID_CTRL_MDTS), self.caps.min_page, TRANSFER_BOUND);
+			zero(virt, PAGE);
+			self.admin(ADMIN_IDENTIFY, NAMESPACE, phys, [CNS_NAMESPACE, 0, 0, 0, 0, 0], deadline).map_err(|_| Bringup::Admin)?;
+			let blocks = r64(virt);
+			let flbas = r8(virt + ID_NS_FLBAS);
+			let dps = r8(virt + ID_NS_DPS);
+			let index = nvme::lba_format_index(flbas).ok_or(Bringup::Namespace)?;
+			let lbaf = r32(virt + ID_NS_LBAF + (index as u64) * 4);
+			let namespace = nvme::namespace(blocks, flbas, lbaf, dps).map_err(|_| Bringup::Namespace)?;
+			Ok((most_bytes, namespace))
+		}
+	}
+
+	// THE I/O PAIR, made on an enabled controller.
+	unsafe fn open_io(&mut self, deadline: &mut Deadline) -> Result<(), Bringup> {
+		unsafe {
+			// ASK FOR ONE I/O QUEUE PAIR. Both counts in dword 11 are zero-based, so zero asks for one
+			// of each. The controller's answer may be fewer than asked for; one is the fewest this
+			// driver can work with, and the create commands below fail against a controller granting
+			// none rather than this driver assuming it got what it asked for.
+			self.admin(ADMIN_SET_FEATURES, 0, 0, [FEATURE_NUM_QUEUES, 0, 0, 0, 0, 0], deadline).map_err(|_| Bringup::NoIoQueue)?;
+			// THE COMPLETION QUEUE FIRST, because the submission queue names it. The other order is
+			// refused by the controller, which is the good case; the bad case is a driver that ignores
+			// the status and then waits forever on a queue that was never made.
+			let size = (IO_QUEUE as u32) | ((self.entries - 1) << 16);
+			let (io_sq, io_cq) = (self.queues.phys + 2 * PAGE, self.queues.phys + 3 * PAGE);
+			self.admin(ADMIN_CREATE_CQ, 0, io_cq, [size, QUEUE_CONTIGUOUS, 0, 0, 0, 0], deadline).map_err(|_| Bringup::NoIoQueue)?;
+			let reports_to = (IO_QUEUE as u32) << 16;
+			self.admin(ADMIN_CREATE_SQ, 0, io_sq, [size, QUEUE_CONTIGUOUS | reports_to, 0, 0, 0, 0], deadline).map_err(|_| Bringup::NoIoQueue)?;
+			// The same for the pair that was just created, for the same reason.
+			self.zero_doorbells(IO_QUEUE);
+			Ok(())
+		}
+	}
+
+	// RESET THE CONTROLLER AND MAKE ITS QUEUES AGAIN, over the same memory, keeping the binding, its
+	// provider and every consumer's connection - the system volume a StorageService mounted over that
+	// provider among them. A timed-out command and a resume after lost power both need exactly this:
+	// the first because a reset is the only thing that ends a command the controller may still be
+	// running, the second because a controller that lost its power has no queues at all.
+	//
+	// `same_disk` identifies the controller and namespace 1 again and refuses what is not the disk
+	// this driver has been serving: a resume must find THE disk its consumers were using, with the
+	// size and transfer limit they were told, not merely a disk.
+	unsafe fn reset(&mut self, same_disk: bool) -> bool {
+		unsafe {
+			let mut deadline = Deadline::ticks(ADMIN_TICKS);
+			let back = disable(self.base, &self.caps) && self.enable().is_ok() && (!same_disk || self.identify(&mut deadline).is_ok_and(|(most_bytes, namespace)| most_bytes == self.most_bytes && namespace == self.namespace)) && self.open_io(&mut deadline).is_ok();
+			self.down = !back;
+			back
+		}
+	}
+
 	// Describe the data span to the controller and issue one namespace command over it.
 	//
 	// THE PRP PLAN COMES FROM THE TESTED FUNCTION and the only thing done here is writing the list
@@ -442,17 +567,119 @@ impl Controller {
 		let id = self.command_id();
 		unsafe {
 			self.io.submit(&command(opcode, id, NAMESPACE, prp1, prp2, cdw));
-			self.io.wait_named(id, opcode)
+			self.io.wait_named(id, opcode, &mut Deadline::ticks(IO_TICKS))
 		}
+	}
+
+	// Issue one I/O command, once.
+	unsafe fn issue(&mut self, io: Io) -> Result<(), Fault> {
+		unsafe {
+			match io {
+				Io::Transfer { opcode, lba, blocks, bytes } => self.transfer(opcode, lba, blocks, bytes),
+				Io::Flush => {
+					let id = self.command_id();
+					self.io.submit(&command(IO_FLUSH, id, NAMESPACE, 0, 0, [0; 6]));
+					self.io.wait_named(id, IO_FLUSH, &mut Deadline::ticks(IO_TICKS))
+				}
+			}
+		}
+	}
+
+	// ONE I/O COMMAND, RECOVERED.
+	//
+	// A command the controller answered is answered with its status. One that never came back, or
+	// came back as another command's, may still be running against the data span
+	// (`Fault::needs_reset`): the controller is reset, which ends it, its queues are made again, and
+	// the command is issued once more - a read or a write of the same blocks from the same span, or a
+	// flush, is the same request twice. NOTHING IS ANSWERED WHILE A COMMAND THIS DRIVER GAVE UP ON MAY
+	// STILL BE MOVING BYTES, so a second failure of that kind resets the controller again before it is
+	// reported. A controller that could not be reset is tried again at the next request, and nothing
+	// is issued to it until a reset succeeds.
+	unsafe fn io(&mut self, io: Io) -> Result<(), Fault> {
+		unsafe {
+			if self.down {
+				if !self.reset(false) {
+					return Err(Fault::Down);
+				}
+				print(b"driver.nvme: the controller is back from its reset and its queues are made again\n");
+			}
+			let first = self.issue(io);
+			let Err(fault) = first else { return first };
+			if !fault.needs_reset() || !self.recover() {
+				return first;
+			}
+			let again = self.issue(io);
+			if let Err(fault) = again
+				&& fault.needs_reset()
+			{
+				self.recover();
+			}
+			again
+		}
+	}
+
+	// Reset after a command that did not come back as itself, and say so.
+	unsafe fn recover(&mut self) -> bool {
+		print(b"driver.nvme: a command did not come back as itself - the controller is reset before anyone is answered\n");
+		let back = unsafe { self.reset(false) };
+		if !back {
+			print(b"driver.nvme: the controller did not come back from its reset - requests are refused until it does\n");
+		}
+		back
 	}
 
 	// Every write this controller has taken must reach the medium.
 	unsafe fn flush(&mut self) -> Result<(), Fault> {
-		let id = self.command_id();
+		unsafe { self.io(Io::Flush) }
+	}
+
+	// TELL THE CONTROLLER ITS POWER IS GOING - a normal shutdown notification - and wait for it to
+	// finish, which settles its own state and stops its DMA. One that does not confirm the shutdown is
+	// reset instead, which stops its DMA too; a controller that does neither is not left for a sleep.
+	unsafe fn shut_down(&self) -> bool {
 		unsafe {
-			self.io.submit(&command(IO_FLUSH, id, NAMESPACE, 0, 0, [0; 6]));
-			self.io.wait_named(id, IO_FLUSH)
+			let cc = r32(self.base + nvme::REG_CC);
+			w32(self.base + nvme::REG_CC, (cc & !nvme::CC_SHUTDOWN_MASK) | nvme::CC_SHUTDOWN_NORMAL);
+			let mut deadline = Deadline::ticks(SHUTDOWN_TICKS);
+			while deadline.waiting() {
+				if nvme::shutdown_complete(r32(self.base + nvme::REG_CSTS)) {
+					return true;
+				}
+			}
+			print(b"driver.nvme: the controller did not confirm its shutdown - it is reset instead\n");
+			disable(self.base, &self.caps)
 		}
+	}
+}
+
+// The pair for `queue` - 0, the admin pair, or `IO_QUEUE` - over its two pages of the queue memory,
+// as a fresh ring.
+fn ring(base: u64, caps: &nvme::Capabilities, queues: &Dma, entries: u32, queue: u16) -> Pair {
+	let first = if queue == 0 { 0 } else { 2 };
+	Pair {
+		sq_virt: queues.virt + first * PAGE,
+		sq_tail: 0,
+		cq_virt: queues.virt + (first + 1) * PAGE,
+		cq_head: 0,
+		// A FRESH RING EXPECTS PHASE ONE: the memory was zeroed and the controller sets the bit on the
+		// first entry it writes.
+		phase: true,
+		entries,
+		sq_doorbell: base + caps.doorbell(queue, false),
+		cq_doorbell: base + caps.doorbell(queue, true),
+	}
+}
+
+// TAKE THE CONTROLLER DOWN: `CC.EN` cleared and `CSTS.RDY` waited out. That is the controller
+// reset, and it ends every command the controller was running - so once this answers true, nothing
+// it was given can still move a byte.
+unsafe fn disable(base: u64, caps: &nvme::Capabilities) -> bool {
+	unsafe {
+		let cc = r32(base + nvme::REG_CC);
+		if cc & nvme::CC_ENABLE != 0 {
+			w32(base + nvme::REG_CC, cc & !nvme::CC_ENABLE);
+		}
+		wait_ready(base, false, caps.timeout_500ms)
 	}
 }
 
@@ -474,19 +701,19 @@ fn command(opcode: u8, command_id: u16, namespace: u32, prp1: u64, prp2: u64, cd
 //
 // `CSTS.CFS` IS WATCHED ALONGSIDE IT. A bring-up that only waits for READY waits out the whole
 // timeout against a controller that has already reported a fatal fault and will never be ready.
+// A RESET IS NOT REFUSED FOR IT: clearing `CC.EN` is what a controller in that state is owed, and
+// the wait for `RDY` to fall is what says whether the reset took.
 unsafe fn wait_ready(base: u64, want: bool, timeout_500ms: u32) -> bool {
-	let budget = READY_SPINS_PER_UNIT * (timeout_500ms.max(1) as u64);
-	let mut spins: u64 = 0;
+	let mut deadline = Deadline::ticks(READY_TICKS_PER_UNIT * (timeout_500ms.max(1) as u64));
 	loop {
 		let csts = unsafe { r32(base + nvme::REG_CSTS) };
-		if csts & nvme::CSTS_FATAL != 0 {
+		if want && csts & nvme::CSTS_FATAL != 0 {
 			return false;
 		}
 		if (csts & nvme::CSTS_READY != 0) == want {
 			return true;
 		}
-		spins += 1;
-		if spins > budget {
+		if !deadline.waiting() {
 			return false;
 		}
 	}
@@ -554,11 +781,7 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		// DISABLE FIRST, WHATEVER THE CONTROLLER WAS DOING. It may have been left enabled by the
 		// firmware or by a driver that died, in which case its old queues are still live and its old
 		// DMA frames are still being written into.
-		let cc = r32(base + nvme::REG_CC);
-		if cc & nvme::CC_ENABLE != 0 {
-			w32(base + nvme::REG_CC, cc & !nvme::CC_ENABLE);
-		}
-		if !wait_ready(base, false, caps.timeout_500ms) {
+		if !disable(base, &caps) {
 			return Err(Bringup::NotReady);
 		}
 		// "I HAVE RESET THIS DEVICE", which releases the DMA frames the kernel is holding for the
@@ -571,128 +794,56 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		let region = dma(device, 6 * PAGE).ok_or(Bringup::NoDma)?;
 		zero(region.virt, region.bytes);
 		let at = |n: u64| Dma { handle: 0, virt: region.virt + n * PAGE, phys: region.phys + n * PAGE, bytes: PAGE };
-		let (admin_sq, admin_cq, io_sq, io_cq) = (at(0), at(1), at(2), at(3));
-		let scratch = at(4);
-		let prp_list = at(5);
-
-		// AQA carries both sizes ZERO-BASED, which is the same trap `CAP.MQES` sets and is why the
-		// decoded `entries` is the real count everywhere else in this file.
-		w32(base + nvme::REG_AQA, ((entries - 1) << 16) | (entries - 1));
-		w64(base + nvme::REG_ASQ, admin_sq.phys);
-		w64(base + nvme::REG_ACQ, admin_cq.phys);
-		// CC: the two entry sizes as powers of two, the NVM command set (zero), the host page size
-		// (zero, meaning 4 kB, which `Capabilities::decode` already checked this host can describe),
-		// and enable.
-		w32(base + nvme::REG_CC, (nvme::CQ_ENTRY_SHIFT << 20) | (nvme::SQ_ENTRY_SHIFT << 16) | nvme::CC_ENABLE);
-		if !wait_ready(base, true, caps.timeout_500ms) {
-			return Err(Bringup::NotReady);
-		}
-
-		// THE DOORBELLS ARE SET TO ZERO BEFORE THE FIRST COMMAND, and this is the repair for the
-		// defect that made every bring-up a coin toss.
-		//
-		// WHAT WAS SEEN: the first admin command was submitted with command id 1 and opcode 6, read
-		// back out of the queue memory to prove the write had landed, and the completion that came
-		// back carried command id 0 with a SUCCESS status. A zeroed submission entry is exactly that
-		// command - opcode 0x00 is FLUSH and its command id is 0 - so the controller had fetched a
-		// slot this driver never wrote. It does that when its tail doorbell still holds a value from
-		// before: on enable it believes there are entries queued up to that tail and consumes them,
-		// and the entries are the zeroed page.
-		//
-		// A DRIVER MAY NOT ASSUME THE RESET CLEARED THEM. Writing its own view - tail zero, head
-		// zero - onto a queue it has just created costs two stores and cannot be wrong: the queue IS
-		// empty at that moment, so zero is what both ends should believe.
-		let zero_doorbells = |queue: u16| {
-			w32(base + caps.doorbell(queue, false), 0);
-			w32(base + caps.doorbell(queue, true), 0);
-		};
-		zero_doorbells(0);
-
-		let ring = |sq: &Dma, cq: &Dma, queue: u16| Pair {
-			sq_virt: sq.virt,
-			sq_tail: 0,
-			cq_virt: cq.virt,
-			cq_head: 0,
-			// A FRESH RING EXPECTS PHASE ONE: the memory was zeroed and the controller sets the bit
-			// on the first entry it writes.
-			phase: true,
-			entries,
-			sq_doorbell: base + caps.doorbell(queue, false),
-			cq_doorbell: base + caps.doorbell(queue, true),
-		};
-		let mut controller = Controller { device, admin: ring(&admin_sq, &admin_cq, 0), io: ring(&io_sq, &io_cq, IO_QUEUE), next_id: 0, most_bytes: TRANSFER_BOUND, namespace: nvme::Namespace { blocks: 0, block_bytes: 0 }, scratch, prp_list, data: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 } };
-
-		// IDENTIFY CONTROLLER, for `MDTS`.
-		let id = controller.command_id();
-		let scratch_phys = controller.scratch.phys;
-		let scratch_virt = controller.scratch.virt;
-		let sent = ADMIN_IDENTIFY;
-		controller.admin.submit(&command(sent, id, 0, scratch_phys, 0, [CNS_CONTROLLER, 0, 0, 0, 0, 0]));
-		controller.admin.wait_named(id, sent).map_err(|_| Bringup::Admin)?;
-		controller.most_bytes = nvme::max_transfer(r8(scratch_virt + ID_CTRL_MDTS), caps.min_page, TRANSFER_BOUND);
-
-		// IDENTIFY NAMESPACE, for the size, the formatted LBA and the protection settings.
-		zero(scratch_virt, PAGE);
-		let id = controller.command_id();
-		let sent = ADMIN_IDENTIFY;
-		controller.admin.submit(&command(sent, id, NAMESPACE, scratch_phys, 0, [CNS_NAMESPACE, 0, 0, 0, 0, 0]));
-		controller.admin.wait_named(id, sent).map_err(|_| Bringup::Admin)?;
-		let blocks = r64(scratch_virt);
-		let flbas = r8(scratch_virt + ID_NS_FLBAS);
-		let dps = r8(scratch_virt + ID_NS_DPS);
-		let index = nvme::lba_format_index(flbas).ok_or(Bringup::Namespace)?;
-		let lbaf = r32(scratch_virt + ID_NS_LBAF + (index as u64) * 4);
-		controller.namespace = nvme::namespace(blocks, flbas, lbaf, dps).map_err(|_| Bringup::Namespace)?;
-
-		// ASK FOR ONE I/O QUEUE PAIR. Both counts in dword 11 are zero-based, so zero asks for one
-		// of each. The controller's answer may be fewer than asked for; one is the fewest this
-		// driver can work with, and the create commands below fail against a controller granting
-		// none rather than this driver assuming it got what it asked for.
-		let id = controller.command_id();
-		let sent = ADMIN_SET_FEATURES;
-		controller.admin.submit(&command(sent, id, 0, 0, 0, [FEATURE_NUM_QUEUES, 0, 0, 0, 0, 0]));
-		controller.admin.wait_named(id, sent).map_err(|_| Bringup::NoIoQueue)?;
-
-		// THE COMPLETION QUEUE FIRST, because the submission queue names it. The other order is
-		// refused by the controller, which is the good case; the bad case is a driver that ignores
-		// the status and then waits forever on a queue that was never made.
-		let size = (IO_QUEUE as u32) | ((entries - 1) << 16);
-		let id = controller.command_id();
-		let sent = ADMIN_CREATE_CQ;
-		controller.admin.submit(&command(sent, id, 0, io_cq.phys, 0, [size, QUEUE_CONTIGUOUS, 0, 0, 0, 0]));
-		controller.admin.wait_named(id, sent).map_err(|_| Bringup::NoIoQueue)?;
-
-		let id = controller.command_id();
-		let reports_to = (IO_QUEUE as u32) << 16;
-		let sent = ADMIN_CREATE_SQ;
-		controller.admin.submit(&command(sent, id, 0, io_sq.phys, 0, [size, QUEUE_CONTIGUOUS | reports_to, 0, 0, 0, 0]));
-		controller.admin.wait_named(id, sent).map_err(|_| Bringup::NoIoQueue)?;
-		// The same for the pair that was just created, for the same reason.
-		zero_doorbells(IO_QUEUE);
-
+		let queues = Dma { handle: 0, virt: region.virt, phys: region.phys, bytes: 4 * PAGE };
+		let admin = ring(base, &caps, &queues, entries, 0);
+		let io = ring(base, &caps, &queues, entries, IO_QUEUE);
+		let mut controller = Controller { base, device, caps, entries, admin, io, queues, next_id: 0, most_bytes: TRANSFER_BOUND, namespace: nvme::Namespace { blocks: 0, block_bytes: 0 }, scratch: at(4), prp_list: at(5), data: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, down: false };
+		controller.enable()?;
+		let mut deadline = Deadline::ticks(ADMIN_TICKS);
+		(controller.most_bytes, controller.namespace) = controller.identify(&mut deadline)?;
+		controller.open_io(&mut deadline)?;
 		Ok(controller)
 	}
 }
 
 // THE SLEEP, between two requests: the controller's volatile write cache is flushed, so a battery that dies in the
-// sleep loses nothing this driver accepted. A controller that lost its power is not reprogrammed here - its queues are
-// the bind's to create - so its resume answers it did not come back, and it is bound again.
+// sleep loses nothing this driver accepted, and for a state that cuts the power the controller is told so and finishes
+// its shutdown - which stops its DMA into memory about to stop being refreshed. ITS RESUME, after lost power or after
+// that shutdown, resets the controller and makes its queues again over the same memory, and checks it is still the same
+// disk: under the same binding, with every consumer's connection kept, so a system volume a StorageService mounted over
+// this provider is still mounted after the sleep. Only a controller that does not come back is bound again.
 struct Sleep<'a> {
 	controller: &'a mut Controller,
 	serving: &'a mut common::Serving,
+	// Whether this step shut the controller down, which a resume that lost no power must undo all the same.
+	shut_down: bool,
 }
 
 impl common::SleepStep for Sleep<'_> {
-	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let refused = driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
 		if unsafe { self.controller.flush() }.is_err() {
 			print(b"driver.nvme: the sleep is refused - the controller did not complete the flush it requires\n");
-			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+			return refused;
+		}
+		if request.state.loses_power() {
+			if !unsafe { self.controller.shut_down() } {
+				print(b"driver.nvme: the sleep is refused - the controller neither finished its shutdown nor stopped\n");
+				return refused;
+			}
+			self.shut_down = true;
 		}
 		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
 	}
 
 	fn resume(&mut self, lost_power: bool) -> bool {
-		!lost_power
+		let reset = lost_power || core::mem::take(&mut self.shut_down);
+		if !reset {
+			return true;
+		}
+		let back = unsafe { self.controller.reset(true) };
+		print(if back { b"driver.nvme: the controller is back from the sleep - reset, its queues made again, the same disk\n" } else { b"driver.nvme: the controller did not come back from the sleep\n" });
+		back
 	}
 
 	fn serving(&mut self) -> Option<&mut common::Serving> {
@@ -715,7 +866,7 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 		loop {
 			let ready = common::serve_any_or_sleep(bootstrap, bind, &mut serving);
 			if let Some(None) = ready {
-				if common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, serving: &mut serving }) {
+				if common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, serving: &mut serving, shut_down: false }) {
 					continue;
 				}
 			}
@@ -727,7 +878,14 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 				if !flushed {
 					print(b"driver.nvme: the controller did not complete the flush this stop requires - no clean stop is claimed for it\n");
 				}
-				common::finish_stop(bootstrap, bind, controller.device, flushed);
+				// AND THE CONTROLLER IS RESET, which is what makes the stop QUIET. `finish_stop` claims this
+				// device masters nothing any more, and a controller left enabled still owns its queues and
+				// may still write into them.
+				let stopped = disable(controller.base, &controller.caps);
+				if !stopped {
+					print(b"driver.nvme: the controller did not confirm its reset - no clean stop is claimed for it\n");
+				}
+				common::finish_stop(bootstrap, bind, controller.device, flushed && stopped);
 				exit();
 			};
 			let endpoint: u64 = serving.at(at);
@@ -782,7 +940,7 @@ fn reply(endpoint: u64, status: u32, transferred: u64) {
 unsafe fn serve_read(controller: &mut Controller, endpoint: u64, lba: u64, count: u32) {
 	unsafe {
 		let bytes = count as u64 * controller.namespace.block_bytes as u64;
-		if !controller.grow(bytes) || controller.transfer(IO_READ, lba, count, bytes).is_err() {
+		if !controller.grow(bytes) || controller.io(Io::Transfer { opcode: IO_READ, lba, blocks: count, bytes }).is_err() {
 			reply(endpoint, block::STATUS_ERR, 0);
 			return;
 		}
@@ -846,7 +1004,7 @@ unsafe fn serve_write(controller: &mut Controller, endpoint: u64, lba: u64, coun
 		core::ptr::copy_nonoverlapping(mapped as *const u8, controller.data.virt as *mut u8, bytes as usize);
 		unmap_object(handle);
 		close(handle);
-		let ok = controller.transfer(IO_WRITE, lba, count, bytes).is_ok();
+		let ok = controller.io(Io::Transfer { opcode: IO_WRITE, lba, blocks: count, bytes }).is_ok();
 		reply(endpoint, if ok { block::STATUS_OK } else { block::STATUS_ERR }, 0);
 	}
 }

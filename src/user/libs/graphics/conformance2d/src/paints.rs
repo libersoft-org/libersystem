@@ -6,7 +6,7 @@
 //! wrong spread and the wrong interpolation space.
 
 use crate::Outcome;
-use crate::harness::{draw, draw_with, near, rect_path, solid};
+use crate::harness::{draw, draw_with, every_pixel, rect_path, solid, stored};
 use graphics_core::geom::{PointF, RectF};
 use render2d::paint::{Color, GradientStop, ImageQuality, Paint, SpreadMode};
 use render2d::path::FillRule;
@@ -25,10 +25,9 @@ fn black_to_white() -> alloc::vec::Vec<GradientStop> {
 /// A solid paint is its colour, everywhere inside the shape.
 pub fn paint_solid() -> Outcome {
 	let frame = draw(16, 16, |canvas| canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), solid(0.2, 0.6, 0.8, 1.0), FillRule::NonZero))?;
-	let pixel = frame.pixel(8, 8);
-	require!(near(pixel[0], 0.2) && near(pixel[1], 0.6) && near(pixel[2], 0.8), "a solid paint is the colour it was given: {pixel:?}");
-	require!(near(frame.pixel(1, 14)[1], 0.6), "in every pixel of the shape and not only the middle: {:?}", frame.pixel(1, 14));
-	Ok(())
+	// EVERY PIXEL IS COVERED WHOLLY, so every one is compared exactly - and against the colour, not only in
+	// the middle.
+	every_pixel(&frame, |x, y| [stored(0.2, x, y), stored(0.6, x, y), stored(0.8, x, y), 255])
 }
 
 // @covers: PaintLinearGradient
@@ -40,8 +39,8 @@ pub fn paint_linear_gradient() -> Outcome {
 		let paint = Paint::Linear { from: PointF { x: 0.0, y: 0.0 }, to: PointF { x: 32.0, y: 0.0 }, stops, spread: SpreadMode::Clamp, transform: Transform::IDENTITY };
 		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 32.0, 32.0)), paint, FillRule::NonZero)
 	})?;
-	require!(near(frame.pixel(8, 16)[0], 8.5 / 32.0), "a quarter along the axis is a quarter of the way: {:?}", frame.pixel(8, 16));
-	require!(near(frame.pixel(24, 16)[0], 24.5 / 32.0), "and three quarters along is three quarters: {:?}", frame.pixel(24, 16));
+	require!(frame.pixel(8, 16)[0] == stored(8.5 / 32.0, 8, 16), "a quarter along the axis is a quarter of the way: {:?}", frame.pixel(8, 16));
+	require!(frame.pixel(24, 16)[0] == stored(24.5 / 32.0, 24, 16), "and three quarters along is three quarters: {:?}", frame.pixel(24, 16));
 	require!(frame.pixel(8, 2)[0] == frame.pixel(8, 30)[0], "a point off the axis takes its projection's value: {:?} against {:?}", frame.pixel(8, 2), frame.pixel(8, 30));
 	Ok(())
 }
@@ -58,7 +57,7 @@ pub fn paint_radial_gradient() -> Outcome {
 	let (right, below) = (frame.pixel(24, 16)[0], frame.pixel(16, 24)[0]);
 	require!((right as i32 - below as i32).abs() <= 2, "the same distance in two directions is the same colour: {right} against {below}");
 	require!(frame.pixel(18, 16)[0] < right, "and nearer the centre is nearer the first stop: {:?}", frame.pixel(18, 16));
-	require!(near(right, 8.5 / 16.0), "half the radius out is half way along the stops: {right}");
+	require!(right == stored(8.5 / 16.0, 24, 16), "half the radius out is half way along the stops: {right}");
 	Ok(())
 }
 
@@ -83,7 +82,7 @@ pub fn paint_conic_gradient() -> Outcome {
 	};
 	for (x, y) in [(16u32, 28u32), (4, 16), (16, 4), (28, 16)] {
 		let expected = fraction_at(x, y);
-		require!(near(frame.pixel(x, y)[0], expected), "at ({x},{y}) the angle is {expected} of a turn round and the pixel is {:?}", frame.pixel(x, y));
+		require!(frame.pixel(x, y)[0] == stored(expected, x, y), "at ({x},{y}) the angle is {expected} of a turn round and the pixel is {:?}", frame.pixel(x, y));
 	}
 	// AND IT IS AN ANGLE AND NOT A RADIUS: two points the same distance from the centre in different
 	// directions are different colours, which a radial gradient's are not.
@@ -194,6 +193,6 @@ pub fn linear_light_stops() -> Outcome {
 	// The target is linear, so half the light is stored as half of 255 - and an implementation that
 	// interpolated the sRGB encodings would store about 188 here.
 	let middle = frame.pixel(16, 4)[0];
-	require!(near(middle, 16.5 / 32.0), "the midpoint of a black-to-white gradient is half the LIGHT: {middle}");
+	require!(middle == stored(16.5 / 32.0, 16, 4), "the midpoint of a black-to-white gradient is half the LIGHT: {middle}");
 	Ok(())
 }

@@ -93,9 +93,12 @@ struct State {
 	// THE NAMESPACE DEVICES A DMAR PUTS BEHIND A HARDWARE UNIT: each one's identity (`acpi:` and its path, every
 	// segment four characters) and the requester id its DMA carries.
 	streams: Vec<(Vec<u8>, u32)>,
+	// THE SYSTEMIO REGIONS THE RUNNING INSTANCE MINTED BY ADDRESS - an ECDT's embedded-controller ports among them, taken
+	// before its walk could report the controller's node.
+	ports: Vec<(u16, u16)>,
 }
 
-static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None, events: None, decoded: Vec::new(), io_windows: Vec::new(), mappings: Vec::new(), held: Vec::new(), companions: Vec::new(), parents: Vec::new(), merged: Vec::new(), reported: Vec::new(), grants: Vec::new(), lists: Vec::new(), ipmi: Vec::new(), processor_held: Vec::new(), streams: Vec::new() });
+static STATE: SpinLock<State> = SpinLock::new(State { instance: 0, holder: None, events: None, decoded: Vec::new(), io_windows: Vec::new(), mappings: Vec::new(), held: Vec::new(), companions: Vec::new(), parents: Vec::new(), merged: Vec::new(), reported: Vec::new(), grants: Vec::new(), lists: Vec::new(), ipmi: Vec::new(), processor_held: Vec::new(), streams: Vec::new(), ports: Vec::new() });
 
 // A NAMESPACE DEVICE THAT MASTERS THE BUS, as the DMAR names it (`\_SB.PCI0.I2C1`): kept under the identity the ACPI
 // service will publish it with - `acpi:` and the path with every segment padded to four characters, as the namespace
@@ -291,7 +294,17 @@ pub fn tree_companion(identity: &[u8], bus: u8, dev: u8, func: u8) {
 
 // The memory map as the policy reads it - None where the heap cannot hold it.
 fn regions() -> Option<Vec<(u64, u64, MemoryKind)>> {
-	heap::try_collect((0..crate::mem::memmap_len()).filter_map(crate::mem::memmap_get).filter(|region| region.length != 0).map(|region| (region.base, region.length, MemoryKind::from_memmap(region.kind))))
+	heap::try_collect(map_regions())
+}
+
+fn map_regions() -> impl Iterator<Item = (u64, u64, MemoryKind)> {
+	(0..crate::mem::memmap_len()).filter_map(crate::mem::memmap_get).filter(|region| region.length != 0).map(|region| (region.base, region.length, MemoryKind::from_memmap(region.kind)))
+}
+
+// THE MEMORY TYPE A CLAIM MAPS `base..base+len` WITH, from the memory map and the policy's one rule - read straight off
+// the map, allocating nothing, since a claim is minted on a syscall's path.
+pub fn claim_write_back(base: u64, len: u64) -> bool {
+	platform::policy::claim_write_back(map_regions(), base, len)
 }
 
 // A claimed row's ranges and the node that owns them: a platform row's own identity, or the companion node of a PCI
@@ -637,6 +650,15 @@ fn msi_ranges(bus: u8, dev: u8, func: u8) -> Option<Vec<(u16, u16)>> {
 	Some(out)
 }
 
+// A SYSTEMIO REGION THE RUNNING INSTANCE MINTED BY ADDRESS, remembered for its firmware-held rows. A short heap forgets
+// it, and a row naming those ports is then refused as it was before - nothing is admitted on a guess.
+pub fn note_instance_ports(base: u16, len: u16) {
+	let mut state = STATE.lock();
+	if state.ports.try_reserve(1).is_ok() {
+		state.ports.push((base, len));
+	}
+}
+
 // ATTACH THE CALLER AS THE RUNNING INSTANCE, its events on `channel`: a new number, the previous instance's reported
 // set forgotten - its walk is the new instance's to report again.
 pub fn attach(process: u64, channel: Arc<Channel>) -> u64 {
@@ -645,6 +667,7 @@ pub fn attach(process: u64, channel: Arc<Channel>) -> u64 {
 	state.holder = Some(process);
 	state.events = Some(channel);
 	state.reported.clear();
+	state.ports.clear();
 	crate::serial_println!("firmware: the ACPI service's instance {} is attached", state.instance);
 	state.instance
 }
@@ -711,7 +734,13 @@ fn admit(tables: &crate::device::Tables<'_>, description: &platform::Description
 	io_bars.try_reserve(state.io_windows.len()).map_err(|_| crate::device::Unpublished::NoMemory)?;
 	io_bars.extend(state.io_windows.iter().copied());
 	let lines = wired_lines_the_kernel_uses(tables).ok_or(crate::device::Unpublished::NoMemory)?;
-	let checked = view.with(|view| policy::crs(description, view, |base, len| crate::object::port_range::grants::recordable(base, len).is_ok(), &io_bars, &lines)).ok_or(crate::device::Unpublished::NoMemory)?;
+	// A FIRMWARE-HELD ROW MAY NAME PORTS THE RUNNING INSTANCE ITSELF HOLDS: the embedded controller an ECDT describes is
+	// reached through ports the service minted before its walk, and that walk then reports the controller's node - which
+	// is held by the service and never claimable, so its ports are accounted for by being the service's. Every other
+	// row's ports are held to the reserved set and the live grants as they always were.
+	let firmware_held = description.part.state == abi::PLATFORM_STATE_FIRMWARE_HELD;
+	let own = |base: u16, len: u16| firmware_held && state.ports.iter().any(|&(start, size)| base >= start && u32::from(base) + u32::from(len) <= u32::from(start) + u32::from(size));
+	let checked = view.with(|view| policy::crs(description, view, |base, len| own(base, len) || crate::object::port_range::grants::recordable(base, len).is_ok(), &io_bars, &lines)).ok_or(crate::device::Unpublished::NoMemory)?;
 	checked.map_err(crate::device::Unpublished::Crs)
 }
 

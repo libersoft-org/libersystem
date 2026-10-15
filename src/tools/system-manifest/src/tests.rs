@@ -868,3 +868,65 @@ fn a_service_notice_is_declared_once_and_generated_as_its_bits() {
 	assert!(row.contains("notices: 3,"), "{row}");
 	let _ = fs::remove_dir_all(root);
 }
+
+// A DECLARED LICENCE IS A REVIEWED ONE. The two row kinds that may carry somebody else's licence - a
+// foreign library and an audit-produced program - used to be checked for the SPELLING of an
+// identifier and nothing else, so a row carrying a reciprocal licence built, staged that licence into
+// its identity record and launched. The list is the one the dependency gate holds vendored sources to.
+#[test]
+fn a_declared_licence_must_be_in_the_reviewed_set() {
+	let root = fixture_workspace();
+	fs::create_dir_all(root.join("user/libs/foreign/probe")).unwrap();
+	fs::write(root.join("user/libs/foreign/probe/probe.c"), "int probe(void) { return 0; }\n").unwrap();
+	let foreign = |licence: &str| format!("{}\n[[sources]]\nowner = \"probe\"\npath = \"user/libs/foreign/probe\"\nproducer = \"foreign\"\n\n[[libraries]]\nname = \"probe\"\nowner = \"probe\"\ndestination = \"lib/foreign/probe.lslib\"\nobjects = [\"probe.c\"]\n{licence}", valid_fixture());
+	// THE PROJECT'S OWN TERM, by default and by name, and a reviewed upstream term.
+	Manifest::parse(&foreign(""), &root).expect("a foreign row this tree wrote is carried under the project licence");
+	Manifest::parse(&foreign("licence = \"project\"\n"), &root).expect("and may say so");
+	Manifest::parse(&foreign("licence = \"Apache-2.0\"\n"), &root).expect("a reviewed upstream licence");
+	// AN UNREVIEWED ONE IS REFUSED, and so is one that merely starts like a reviewed one.
+	for unreviewed in ["GPL-3.0-only", "BSD-4-Clause"] {
+		let error = Manifest::parse(&foreign(&format!("licence = \"{unreviewed}\"\n")), &root).unwrap_err().to_string();
+		assert!(error.contains("libraries.probe.licence") && error.contains(&format!("{unreviewed} is not in the reviewed permissive set")), "{error}");
+	}
+
+	// THE AUDIT-PRODUCED PROGRAM, the other row kind that may declare one.
+	let audit = |licence: &str| format!("{}\n[[programs]]\nname = \"quarantine\"\nowner = \"tool\"\nrole = \"probe\"\nlinkage = \"dynamic\"\nstage = \"volume\"\ndestination = \"libexec/quarantine.lsexe\"\nproducer = \"audit\"\ndevelopment = true\n{licence}", valid_fixture());
+	Manifest::parse(&audit("licence = \"Apache-2.0\"\n"), &root).expect("a quarantine program linking a reviewed upstream");
+	let error = Manifest::parse(&audit("licence = \"GPL-3.0-only\"\n"), &root).unwrap_err().to_string();
+	assert!(error.contains("programs.quarantine.licence") && error.contains("GPL-3.0-only is not in the reviewed permissive set"), "{error}");
+	fs::remove_dir_all(root).unwrap();
+}
+
+// ONE LIST, NOT TWO THAT AGREE TODAY. The dependency gate reads the file this crate compiles in, by
+// that path, and the entries are the same lines either way.
+#[test]
+fn the_reviewed_set_is_the_file_the_dependency_gate_reads() {
+	let tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+	let gate = fs::read_to_string(tools.join("check-dependency-policy.sh")).unwrap();
+	assert!(gate.contains("src/tools/system-manifest/src/reviewed-licences.txt"), "the dependency gate holds vendored sources to some other list");
+	assert!(!gate.contains("allowed=(Unlicense"), "the dependency gate still carries a list of its own");
+	let entries = reviewed_licences().collect::<Vec<_>>();
+	assert!(entries.contains(&"Apache-2.0") && entries.contains(&"Unlicense"), "{entries:?}");
+	assert!(entries.iter().all(|entry| !entry.starts_with('#') && !entry.is_empty() && entry.trim() == *entry), "{entries:?}");
+}
+
+#[test]
+// THE FONT CATALOGUE'S TWO ROOTS STAY APART. A text client reads faces; forcing a full directory read, digest and
+// metadata pass is the operator's alone, and the catalogue tells the two apart only by the root a request arrives on.
+// So PermissionManager's `FONT` is a client of the catalogue's `SERVE` root and its `FONTADMIN` of the seeded `ADMIN`
+// root, and those are two different serve roots speaking two different interfaces.
+fn the_font_grants_resolve_to_different_serve_roots() {
+	let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+	let manifest = Manifest::load_workspace(&workspace).expect("the production manifest must validate");
+	let service = |name: &str| manifest.services.values().find(|service| service.name.as_str() == name).unwrap_or_else(|| panic!("no {name} service"));
+	let catalogue = service("font_catalogue");
+	let root = |tag: &str| catalogue.roles.iter().find(|role| role.kind == RoleKind::ServeRoot && role.tag.as_str() == tag).unwrap_or_else(|| panic!("the catalogue serves no {tag} root"));
+	assert_eq!(root("SERVE").interface, "liber:font@1/font-catalogue");
+	assert_eq!(root("ADMIN").interface, "liber:font@1/font-catalogue-admin");
+	let permission = service("permission_manager");
+	let grant = |tag: &str| permission.roles.iter().find(|role| role.tag.as_str() == tag).unwrap_or_else(|| panic!("PermissionManager holds no {tag}"));
+	let (font, admin) = (grant("FONT"), grant("FONTADMIN"));
+	assert_eq!((font.provider.as_str(), font.source.as_str(), font.interface.as_str()), ("font_catalogue", "SERVE", "liber:font@1/font-catalogue"));
+	assert_eq!((admin.provider.as_str(), admin.source.as_str(), admin.interface.as_str()), ("font_catalogue", "ADMIN", "liber:font@1/font-catalogue-admin"));
+	assert_ne!(font.source, admin.source, "the reading grant and the operator's resolve to different serve roots");
+}

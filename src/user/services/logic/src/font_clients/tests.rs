@@ -57,3 +57,17 @@ fn a_generation_change_reaches_exactly_the_subscribers() {
 	assert_eq!(reached, alloc::vec![first, third]);
 	assert!(!reached.contains(&second));
 }
+
+#[test]
+// A SUBSCRIPTION GIVEN BACK ALONE - its stream could not be opened, or its reader went - leaves the connection its
+// place: the connection may subscribe again, and the slot is not handed to anyone else.
+fn an_unsubscribe_keeps_the_connection() {
+	let mut endpoints = Endpoints::new();
+	let slot = endpoints.connect().expect("a slot");
+	endpoints.subscribe(slot).expect("subscribed");
+	endpoints.unsubscribe(slot);
+	assert_eq!(endpoints.subscribers(), 0);
+	assert_eq!(endpoints.clients(), 1, "the connection keeps its place");
+	assert_eq!(endpoints.subscribe(slot), Ok(()), "and may subscribe again");
+	assert_eq!(endpoints.connect(), Ok(slot + 1), "its slot is not handed out");
+}

@@ -13,8 +13,9 @@
 //!
 //! WHAT THIS PRODUCES IS LEVELS, and one reordering helper over them. A level is even for
 //! left-to-right and odd for right-to-left; the shaping stack reads them per run and the layout
-//! reverses by level. Mirroring is a property lookup the renderer applies to the character it draws,
-//! which is why it is answered here and not done here.
+//! reverses by level. Mirroring is a property lookup the shaping stage applies to the character it
+//! maps, because only that stage knows whether the face has the mirror - which is why it is answered
+//! here and not done here.
 
 #![cfg_attr(not(test), no_std)]
 

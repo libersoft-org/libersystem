@@ -290,6 +290,9 @@ fn the_handshakes_grant_only_what_was_asked_and_answered() {
 	assert_eq!(handshake::platform_granted(Some(&[0, u32::MAX])), handshake::PLATFORM_SUPPORT);
 	// THE PROCESSOR FORMS NAME NO MODEL-SPECIFIC REGISTER: not P-state (bit 0) nor T-state (bit 2) fixed hardware.
 	assert_eq!(handshake::PROCESSOR_SUPPORT & (0x0001 | 0x0004), 0);
+	// NO SOFTWARE COORDINATION OF P OR T STATES IS OFFERED, which the kernel does not perform; the hardware's is.
+	assert_eq!(handshake::PROCESSOR_SUPPORT & (0x0020 | 0x0080), 0, "software coordination of P and T states is not offered");
+	assert_ne!(handshake::PROCESSOR_SUPPORT & 0x0800, 0, "hardware coordination of P states is");
 	assert_ne!(handshake::PROCESSOR_SUPPORT & 0x0300, 0, "the MWAIT hints are declared");
 	assert_eq!(&handshake::pdc_buffer()[8..12], &handshake::PROCESSOR_SUPPORT.to_le_bytes());
 	// A SCRIPTED HOST BRIDGE: its `_OSC` keeps hot-plug and PME and answers the rest masked.

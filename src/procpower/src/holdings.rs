@@ -55,7 +55,8 @@ impl Holdings {
 				None => self.held.push((*register, 1)),
 			}
 		}
-		let mut released = Vec::new();
+		// INTO THE LIST RESERVED ABOVE, which is what lets this not fail once counting has begun: a second, unreserved one
+		// here could grow while `held` was already changed, and on a short kernel heap abort inside the syscall.
 		for register in old {
 			if let Some(at) = self.held.iter().position(|(held, _)| held == register) {
 				self.held[at].1 -= 1;

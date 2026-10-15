@@ -54,8 +54,8 @@ use rt::*;
 
 use crate::usb_audio::configure_audio;
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, TOUCH_SINK, configure_hid, depart, handle_hid_event, post_reports};
-use crate::usb_net::{NOTIFY_WINDOW, Net, configure_network, handle_net_event, handle_notification, notification_due, post_notification, post_receive, transmit};
-use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
+use crate::usb_net::{NOTIFY_WINDOW, Net, Received, configure_network, handle_net_event, handle_notification, notification_due, post_notification, post_receive, transmit};
+use crate::usb_storage::{STATUS_ERR, STATUS_INVALID, Storage, configure_storage, reply_block, serve_block_request};
 use crate::usb_uas::{Uas, configure_uas};
 use driver_protocol::audio;
 use drivers::usb_class::ClassKind;
@@ -1932,6 +1932,9 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 		// A RECEIVED FRAME'S BUFFER, HELD ACROSS THE LOOP rather than allocated per frame: this runs
 		// once per arriving packet on a busy link.
 		let mut frame: Vec<u8> = Vec::new();
+		// AND THE NETWORK ADAPTER'S, which is a transfer and the frames in it: one for ECM, as many as the
+		// device packed into a block for NCM.
+		let mut received = Received::default();
 		// And the transmit side's, which a consumer's message is read into.
 		let mut outgoing: Vec<u8> = alloc::vec![0u8; 2048];
 		// These tokens are the positions in this binding's OFFER list. Keep the factory even
@@ -2006,15 +2009,18 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			// THE STASHED COMPLETION FIRST, because it is older than anything still on the ring.
 			if let Some((status, control)) = hc.net_pending.take()
 				&& let Some((dev, net)) = network.as_mut()
-				&& handle_net_event(hc, dev, net, status, control, &mut frame)
+				&& handle_net_event(hc, dev, net, status, control, &mut received)
 			{
-				for at in (0..serving.as_slice().len()).rev() {
-					if serving.token_at(at) != 3 {
-						continue;
-					}
-					if !send_blocking(serving.at(at), &frame, 0) {
-						let token = serving.close_at(at);
-						common::disconnected(bootstrap, bind, token);
+				// EVERY FRAME THE TRANSFER CARRIED, each a message of its own.
+				for frame in received.frames() {
+					for at in (0..serving.as_slice().len()).rev() {
+						if serving.token_at(at) != 3 {
+							continue;
+						}
+						if !send_blocking(serving.at(at), frame, 0) {
+							let token = serving.close_at(at);
+							common::disconnected(bootstrap, bind, token);
+						}
 					}
 				}
 			}
@@ -2157,15 +2163,18 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				// answers only for its own slot and endpoint - so an event for neither falls through
 				// both, which is what the HID path already did for a block transfer's completion.
 				if let Some((dev, net)) = network.as_mut()
-					&& handle_net_event(hc, dev, net, status, control, &mut frame)
+					&& handle_net_event(hc, dev, net, status, control, &mut received)
 				{
-					for at in (0..serving.as_slice().len()).rev() {
-						if serving.token_at(at) != 3 {
-							continue;
-						}
-						if !send_blocking(serving.at(at), &frame, 0) {
-							let token = serving.close_at(at);
-							common::disconnected(bootstrap, bind, token);
+					// EVERY FRAME THE TRANSFER CARRIED, each a message of its own.
+					for frame in received.frames() {
+						for at in (0..serving.as_slice().len()).rev() {
+							if serving.token_at(at) != 3 {
+								continue;
+							}
+							if !send_blocking(serving.at(at), frame, 0) {
+								let token = serving.close_at(at);
+								common::disconnected(bootstrap, bind, token);
+							}
 						}
 					}
 					continue;
@@ -2283,7 +2292,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 						if handle != 0 {
 							close(handle);
 						}
-						reply_block(server, STATUS_ERR, 0);
+						reply_block(server, STATUS_INVALID, 0);
 						false
 					}
 					Polled::Empty => false,
@@ -2365,7 +2374,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 						if handle != 0 {
 							close(handle);
 						}
-						reply_block(server, STATUS_ERR, 0);
+						reply_block(server, STATUS_INVALID, 0);
 						false
 					}
 					Polled::Empty => false,

@@ -47,6 +47,11 @@ pub enum Error {
 	Malformed(Malformed),
 	/// The file is well formed and outside `OpenType Profile 1`.
 	Unsupported(Unsupported),
+	/// STORAGE THE SHAPER NEEDED AND COULD NOT HAVE - a property of the caller's Domain, not of the
+	/// font. This parser allocates nothing; the shaper that shares this type does, and a refusal is
+	/// what it answers instead of the infallible allocation that would end the caller's process over
+	/// one paragraph.
+	Allocation,
 }
 
 /// What was wrong with a font that does not hold up.

@@ -121,8 +121,9 @@ fn encode_command(command: &Command, out: &mut Vec<u8>) {
 	};
 	out.push(tag);
 	match command {
-		Command::FillPath { path, rule, transform, antialias, blend, operator, opacity, .. } => {
+		Command::FillPath { path, paint, rule, transform, antialias, blend, operator, opacity } => {
 			out.extend_from_slice(&path.0.to_le_bytes());
+			encode_paint(paint, out);
 			out.push(*rule as u8);
 			encode_transform(transform, out);
 			out.push(*antialias as u8);
@@ -130,8 +131,9 @@ fn encode_command(command: &Command, out: &mut Vec<u8>) {
 			out.push(*operator as u8);
 			out.extend_from_slice(&opacity.to_bits().to_le_bytes());
 		}
-		Command::StrokePath { path, style, transform, antialias, blend, operator, opacity, .. } => {
+		Command::StrokePath { path, paint, style, transform, antialias, blend, operator, opacity } => {
 			out.extend_from_slice(&path.0.to_le_bytes());
+			encode_paint(paint, out);
 			out.extend_from_slice(&style.width.to_bits().to_le_bytes());
 			out.push(style.cap as u8);
 			out.push(style.join as u8);
@@ -164,8 +166,9 @@ fn encode_command(command: &Command, out: &mut Vec<u8>) {
 			out.push(*operator as u8);
 			out.extend_from_slice(&opacity.to_bits().to_le_bytes());
 		}
-		Command::DrawGlyphRun { run, transform, blend, operator, opacity, .. } => {
+		Command::DrawGlyphRun { run, paint, transform, blend, operator, opacity } => {
 			out.extend_from_slice(&run.0.to_le_bytes());
+			encode_paint(paint, out);
 			encode_transform(transform, out);
 			out.push(*blend as u8);
 			out.push(*operator as u8);
@@ -203,6 +206,62 @@ fn encode_command(command: &Command, out: &mut Vec<u8>) {
 			}
 		}
 		Command::PopClip | Command::EndLayer => {}
+	}
+}
+
+/// THE PAINT IS PART OF THE DRAWING, so it is part of the digest: the same shape in another colour, in a
+/// gradient instead of a colour, or in the same gradient along another axis is another picture - and a cache
+/// keyed by an encoding that left the paint out returns the raster of whichever was drawn first. A tag per
+/// kind first, for the reason a command has one.
+fn encode_paint(paint: &crate::paint::Paint, out: &mut Vec<u8>) {
+	use crate::paint::Paint;
+	let point = |point: &graphics_core::geom::PointF, out: &mut Vec<u8>| {
+		out.extend_from_slice(&point.x.to_bits().to_le_bytes());
+		out.extend_from_slice(&point.y.to_bits().to_le_bytes());
+	};
+	match paint {
+		Paint::Solid(color) => {
+			out.push(1);
+			for channel in [color.red, color.green, color.blue, color.alpha] {
+				out.extend_from_slice(&channel.to_bits().to_le_bytes());
+			}
+			out.push(color.space as u8);
+		}
+		Paint::Linear { from, to, stops, spread, transform } => {
+			out.push(2);
+			point(from, out);
+			point(to, out);
+			out.extend_from_slice(&stops.0.to_le_bytes());
+			out.push(*spread as u8);
+			encode_transform(transform, out);
+		}
+		Paint::Radial { from, from_radius, to, to_radius, stops, spread, transform } => {
+			out.push(3);
+			point(from, out);
+			out.extend_from_slice(&from_radius.to_bits().to_le_bytes());
+			point(to, out);
+			out.extend_from_slice(&to_radius.to_bits().to_le_bytes());
+			out.extend_from_slice(&stops.0.to_le_bytes());
+			out.push(*spread as u8);
+			encode_transform(transform, out);
+		}
+		Paint::Conic { centre, start_angle, end_angle, stops, spread, transform } => {
+			out.push(4);
+			point(centre, out);
+			out.extend_from_slice(&start_angle.to_bits().to_le_bytes());
+			out.extend_from_slice(&end_angle.to_bits().to_le_bytes());
+			out.extend_from_slice(&stops.0.to_le_bytes());
+			out.push(*spread as u8);
+			encode_transform(transform, out);
+		}
+		Paint::Image { image, source, quality, spread, transform } => {
+			out.push(5);
+			out.extend_from_slice(&image.0.to_le_bytes());
+			encode_rect(source, out);
+			out.push(*quality as u8);
+			out.push(*spread as u8);
+			encode_transform(transform, out);
+		}
 	}
 }
 

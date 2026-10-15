@@ -16,16 +16,22 @@
 #   the LOWEST and the        2 and 6 are the ends of the admitted range. A gate that negotiated one
 #     HIGHEST admitted          convenient version would leave the substrate at every other admitted
 #     version                   version undecided, which is the deferral this milestone refuses.
-#   the FOUR REFUSALS         an ICD offering 0 and one offering only 1 are below the floor -
-#                               negotiation does not exist there, so the two-export rule cannot be
-#                               satisfied. One offering 7 is above the ceiling, where the interface
-#                               functions MAY be queried rather than exported, so a conforming driver
-#                               need not export what this substrate resolves. And the third export,
-#                               `vk_icdGetPhysicalDeviceProcAddr`, is refused by NAME: admitting it
-#                               would open a third symbol in a surface this milestone defines as
-#                               closed.
+#   the DRIVER'S OWN FLOOR    `icdcheck` calls the synthetic ICD the way a loader would, so what it
+#     AND CEILING               reads back is the DRIVER's behaviour: it has nothing to agree to with
+#                               a caller below 2, and brings a caller above 6 down to 6. That is a
+#                               conforming driver over exactly 2..6, and it is asserted because it is
+#                               the driver every other foreign gate runs against.
 #   the LOOKUP answers        the second export is reached and consulted, not merely present in a
 #                               symbol table.
+#
+# WHAT THIS GATE DOES NOT ASSERT, AND USED TO CLAIM (corrected 2026-10-15): the four refusals. Asking a
+# conforming driver to speak 0, 1 or 7 shows how THAT driver answers; it shows nothing about a driver
+# that offers 0, 1 or 7, because no such driver is here and nothing here refuses one. The refusals are
+# the SUBSTRATE's: the ported loader is handed the substrate's bounded negotiation entry point instead
+# of the driver's own, which offers at most 6 and refuses any answer outside 2..6 - asserted against
+# drivers that do answer 0, 1 and 7, and one offering the physical-device function, in the discovery
+# crate's host suite, and on the ported loader's own path in a guest by `foreign-loader-guest`. The
+# physical-device export is ALSO refused at build time, below, by the exact-symbol rule.
 #
 # THE THIRD-EXPORT REFUSAL IS A BUILD-TIME ONE and is asserted here as such: a slot declares the
 # symbols its kind admits, and the build requires every candidate to export EXACTLY that set. A
@@ -83,12 +89,12 @@ expect() {
 # The slot bound and the provider answered: negotiation at both ends of the admitted range.
 expect "icd lowest asked=2 accepted agreed=2" "the lowest admitted version must be agreed as asked"
 expect "icd highest asked=6 accepted agreed=6" "the highest admitted version must be agreed as asked"
-# Below the floor, refused: version 1 exports one symbol and version 0 has another bootstrap shape.
-expect "icd below asked=0 refused agreed=0" "an ICD offering 0 must be refused"
-expect "icd below asked=1 refused agreed=1" "an ICD offering only 1 must be refused"
-# Above the ceiling, lowered rather than accepted: at 7 the interface functions may be queried.
-expect "icd above asked=7 accepted agreed=6" "a caller offering 7 must be brought down to 6"
+# The driver's own floor: a caller asking for 0 or 1 gets nothing agreed, and its value back untouched.
+expect "icd below asked=0 refused agreed=0" "the synthetic ICD must have nothing to agree to with a caller asking for 0"
+expect "icd below asked=1 refused agreed=1" "the synthetic ICD must have nothing to agree to with a caller asking for 1"
+# The driver's own ceiling: a caller asking for 7 is brought down to 6 rather than agreed with.
+expect "icd above asked=7 accepted agreed=6" "the synthetic ICD must bring a caller asking for 7 down to 6"
 # The second export is consulted rather than merely present.
 expect "icd lookup known=address unknown=null" "the lookup must answer its own name and nothing else"
 
-echo "icd-selection: the slot bound the synthetic ICD and the admitted range holds at both ends"
+echo "icd-selection: the slot bound the synthetic ICD, which negotiates as a conforming driver over exactly 2..6"

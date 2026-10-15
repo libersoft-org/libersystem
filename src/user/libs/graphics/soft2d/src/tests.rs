@@ -19,8 +19,12 @@ fn target(width: u32, height: u32) -> OwnedImage {
 	OwnedImage::new(layout).expect("an image")
 }
 
+/// What a target says it is, read from its own layout - so a fixture that draws into a float target goes
+/// through the same helpers as one that draws into the eight-bit one.
 fn description(image: &OwnedImage) -> TargetDescription {
-	TargetDescription { extent: image.layout().extent, format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN }
+	let layout = image.layout();
+	let PixelStorage::Known(format) = layout.storage else { panic!("a fixture's target has a known format") };
+	TargetDescription { extent: layout.extent, format, color_space: layout.semantics.color_space().expect("a colour target"), scale: 1.0, luminance: OutputLuminance::UNKNOWN }
 }
 
 /// The stored bytes of one pixel, which is what a fixture states its expectations in.
@@ -2246,6 +2250,385 @@ fn a_cancelled_frame_leaves_every_unit_whole_or_untouched() {
 			}
 		}
 		assert!(whole >= 1 && untouched >= 1, "{kind:?}: the frame was stopped part way: {whole} whole, {untouched} untouched");
+	}
+}
+
+// ------------------------------------------------------------------ filters across tiles
+//
+// A FILTER READS AROUND THE PIXEL IT WRITES, and a tile is sixty-four pixels: a blur, a shadow, an offset or
+// a backdrop read that crosses a tile boundary has to read the content on the other side of it. The oracle
+// is the renderer itself with the tiling taken away - a scene that fits in one 64-pixel square is drawn
+// once into a target that IS one tile, where nothing is cut, and once moved into a larger target where tile
+// boundaries run through the middle of it. The two must be the same picture, to the bit: the arithmetic per
+// pixel is the same, so any difference is content the tiled replay did not have.
+
+/// A target that keeps the intermediate's values unrounded: linear, premultiplied, four floats - no
+/// quantisation and no dither, so two drawings compare by their bits.
+fn float_target(width: u32, height: u32) -> OwnedImage {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::SrgbLinear, alpha_mode: AlphaMode::Premultiplied };
+	let storage = PixelStorage::Known(PixelFormat::R32G32B32A32Float);
+	let layout = ImageLayout::new(Extent2D::new(width, height), width * 16, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+	OwnedImage::new(layout).expect("an image")
+}
+
+/// A filter graph built in place, for a fixture that adds one.
+fn graph(build: impl FnOnce(&mut render2d::filter::FilterGraph)) -> render2d::filter::FilterGraph {
+	let mut graph = render2d::filter::FilterGraph::default();
+	build(&mut graph);
+	graph
+}
+
+fn fill(canvas: &mut Canvas, x: f32, y: f32, width: f32, height: f32, colour: (f32, f32, f32, f32)) {
+	canvas.fill_path(rect_path(RectF::new(x, y, width, height)), Paint::Solid(Color::new(colour.0, colour.1, colour.2, colour.3, ColorSpace::Srgb)), FillRule::NonZero).expect("a fill");
+}
+
+/// One filtered scene, drawn with its top-left at `(x, y)`: everything it draws, and everything its filters
+/// reach, lies inside the 64-pixel square from there.
+type FilteredScene = fn(&mut Canvas, f32, f32);
+
+/// EVERY WAY A FILTER READS PAST THE PIXEL IT WRITES: a Gaussian, the shadow every interface draws, a
+/// whole-pixel and a fractional offset, a morphology into a convolution, a displacement, a backdrop under a
+/// panel, a filtered layer inside a filtered layer, a backdrop read inside a layer, a filtered layer under a
+/// masked clip, and a backdrop read OF a filtered layer - which is the case where what the parent drew has
+/// to be right further out than any one graph reaches.
+fn filtered_scenes() -> Vec<(&'static str, FilteredScene)> {
+	use render2d::filter::{Channel, FilterNode};
+	alloc::vec![
+		("blur", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Blur { input: source, x: 2.5, y: 2.0 }).expect("a blur");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 18.0, y + 20.0, 28.0, 24.0, (1.0, 0.0, 0.0, 1.0));
+			fill(canvas, x + 30.0, y + 34.0, 10.0, 10.0, (0.0, 1.0, 0.0, 0.5));
+			canvas.end_layer().expect("closed");
+		}),
+		("drop shadow", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					let blur = graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+					let offset = graph.push(FilterNode::Offset { input: blur, dx: 3.0, dy: 4.0 }).expect("an offset");
+					let flood = graph.push(FilterNode::Flood { color: Color::new(0.0, 0.0, 0.0, 0.6, ColorSpace::Srgb) }).expect("a flood");
+					let shadow = graph.push(FilterNode::In { input: flood, mask: offset }).expect("a mask");
+					graph.push(FilterNode::Composite { source, backdrop: shadow, operator: Operator::SrcOver }).expect("a composite");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(Some(RectF::new(x + 12.0, y + 12.0, 40.0, 40.0)), 0.95, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 16.0, y + 16.0, 28.0, 26.0, (0.95, 0.95, 0.98, 1.0));
+			fill(canvas, x + 20.0, y + 20.0, 20.0, 8.0, (0.3, 0.6, 0.9, 1.0));
+			canvas.end_layer().expect("closed");
+		}),
+		("offset", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Offset { input: source, dx: 13.0, dy: -9.0 }).expect("an offset");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 14.0, y + 28.0, 18.0, 20.0, (0.2, 0.4, 1.0, 1.0));
+			canvas.end_layer().expect("closed");
+		}),
+		("fractional offset", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Offset { input: source, dx: 5.5, dy: 2.25 }).expect("an offset");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 16.0, y + 18.0, 26.0, 24.0, (1.0, 0.6, 0.1, 0.9));
+			canvas.end_layer().expect("closed");
+		}),
+		("morphology into convolution", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					let dilated = graph.push(FilterNode::MorphologyDilate { input: source, x: 2.0, y: 1.0 }).expect("a dilation");
+					graph.push(FilterNode::Convolution { input: dilated, weights: [[0.0, -1.0, 0.0], [-1.0, 5.0, -1.0], [0.0, -1.0, 0.0]], divisor: 1.0, bias: 0.0 }).expect("a sharpen");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 20.0, y + 22.0, 22.0, 18.0, (0.1, 0.2, 0.9, 0.6));
+			fill(canvas, x + 30.0, y + 30.0, 8.0, 8.0, (1.0, 0.0, 0.0, 1.0));
+			canvas.end_layer().expect("closed");
+		}),
+		("displacement", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					let map = graph.push(FilterNode::Flood { color: Color::new(1.0, 0.25, 0.5, 1.0, ColorSpace::SrgbLinear) }).expect("a map");
+					graph.push(FilterNode::DisplacementMap { input: source, map, scale: 8.0, x_channel: Channel::Red, y_channel: Channel::Green }).expect("a displacement");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 20.0, y + 20.0, 24.0, 20.0, (0.9, 0.9, 0.2, 1.0));
+			canvas.end_layer().expect("closed");
+		}),
+		("backdrop", |canvas, x, y| {
+			fill(canvas, x + 8.0, y + 8.0, 24.0, 48.0, (0.0, 0.0, 1.0, 1.0));
+			fill(canvas, x + 32.0, y + 8.0, 24.0, 48.0, (1.0, 0.0, 0.0, 1.0));
+			fill(canvas, x + 26.0, y + 26.0, 12.0, 12.0, (0.0, 1.0, 0.0, 0.7));
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let backdrop = graph.push(FilterNode::Backdrop).expect("a node");
+					graph.push(FilterNode::Blur { input: backdrop, x: 3.0, y: 3.0 }).expect("a blur");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(Some(RectF::new(x + 14.0, y + 14.0, 36.0, 36.0)), 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 14.0, y + 14.0, 36.0, 36.0, (1.0, 1.0, 1.0, 0.15));
+			canvas.end_layer().expect("closed");
+		}),
+		("nested filtered layers", |canvas, x, y| {
+			let outer = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Blur { input: source, x: 1.5, y: 1.5 }).expect("a blur");
+				}))
+				.expect("a graph");
+			let inner = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Offset { input: source, dx: 6.0, dy: 3.0 }).expect("an offset");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(outer)).expect("a layer");
+			fill(canvas, x + 14.0, y + 16.0, 14.0, 30.0, (0.0, 0.5, 1.0, 1.0));
+			canvas.begin_layer(None, 0.8, BlendMode::Normal, Some(inner)).expect("a nested layer");
+			fill(canvas, x + 26.0, y + 20.0, 16.0, 16.0, (1.0, 1.0, 0.0, 1.0));
+			canvas.end_layer().expect("closed");
+			canvas.end_layer().expect("closed");
+		}),
+		("backdrop inside a layer", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let backdrop = graph.push(FilterNode::Backdrop).expect("a node");
+					graph.push(FilterNode::Blur { input: backdrop, x: 2.0, y: 2.0 }).expect("a blur");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 0.9, BlendMode::Normal, None).expect("a layer");
+			fill(canvas, x + 10.0, y + 10.0, 44.0, 22.0, (0.0, 0.8, 0.2, 1.0));
+			fill(canvas, x + 10.0, y + 32.0, 44.0, 22.0, (0.8, 0.0, 0.8, 1.0));
+			canvas.begin_layer(Some(RectF::new(x + 16.0, y + 16.0, 32.0, 32.0)), 1.0, BlendMode::Normal, Some(handle)).expect("a nested layer");
+			fill(canvas, x + 16.0, y + 16.0, 32.0, 32.0, (1.0, 1.0, 1.0, 0.2));
+			canvas.end_layer().expect("closed");
+			canvas.end_layer().expect("closed");
+		}),
+		("under a masked clip", |canvas, x, y| {
+			let handle = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+				}))
+				.expect("a graph");
+			canvas.save().expect("a save");
+			let mut rounded = PathBuilder::new();
+			rounded.add_rounded_rect(RectF::new(x + 8.0, y + 8.0, 48.0, 48.0), 10.0, 10.0).expect("a rounded rectangle");
+			canvas.set_clip(rounded.finish(), FillRule::NonZero).expect("a clip");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			fill(canvas, x + 14.0, y + 14.0, 36.0, 36.0, (1.0, 0.0, 0.0, 1.0));
+			canvas.end_layer().expect("closed");
+			canvas.restore().expect("a restore");
+		}),
+		("backdrop of a filtered layer", |canvas, x, y| {
+			let shadow = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let source = graph.push(FilterNode::Source).expect("a node");
+					graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+				}))
+				.expect("a graph");
+			let frosted = canvas
+				.resources()
+				.add_filter(graph(|graph| {
+					let backdrop = graph.push(FilterNode::Backdrop).expect("a node");
+					graph.push(FilterNode::Blur { input: backdrop, x: 2.0, y: 2.0 }).expect("a blur");
+				}))
+				.expect("a graph");
+			canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(shadow)).expect("a layer");
+			fill(canvas, x + 16.0, y + 16.0, 18.0, 32.0, (0.1, 0.1, 0.1, 1.0));
+			canvas.end_layer().expect("closed");
+			canvas.begin_layer(Some(RectF::new(x + 26.0, y + 14.0, 24.0, 36.0)), 1.0, BlendMode::Normal, Some(frosted)).expect("a layer");
+			fill(canvas, x + 26.0, y + 14.0, 24.0, 36.0, (1.0, 1.0, 1.0, 0.1));
+			canvas.end_layer().expect("closed");
+		}),
+	]
+}
+
+/// The first pixel two targets of one layout differ at, with both values, or `None` when they are the same.
+fn first_difference(drawn: &OwnedImage, expected: &OwnedImage) -> Option<String> {
+	let bytes = drawn.layout().storage.bytes_per_pixel() as usize;
+	let extent = drawn.layout().extent;
+	for y in 0..extent.height {
+		let (row, wanted) = (drawn.view().row(y).expect("a row"), expected.view().row(y).expect("a row"));
+		for x in 0..extent.width as usize {
+			let (got, want) = (&row[x * bytes..(x + 1) * bytes], &wanted[x * bytes..(x + 1) * bytes]);
+			if got != want {
+				let value = |pixel: &[u8]| -> alloc::vec::Vec<f32> { if bytes == 16 { pixel.chunks_exact(4).map(|channel| f32::from_le_bytes([channel[0], channel[1], channel[2], channel[3]])).collect() } else { pixel.iter().map(|byte| *byte as f32).collect() } };
+				return Some(alloc::format!("pixel ({x}, {y}) is {:?} and should be {:?}", value(got), value(want)));
+			}
+		}
+	}
+	None
+}
+
+/// `before` with `window` - an image of the window's size - copied over it at `(x, y)`.
+fn with_window(before: &OwnedImage, window: &OwnedImage, x: u32, y: u32) -> OwnedImage {
+	let mut out = copy_of(before);
+	let bytes = before.layout().storage.bytes_per_pixel() as usize;
+	let width = window.layout().extent.width as usize * bytes;
+	for row in 0..window.layout().extent.height {
+		let source = window.view().row(row).expect("a row").to_vec();
+		let mut view = out.view_mut();
+		let target = view.row_mut(y + row).expect("a row");
+		target[x as usize * bytes..x as usize * bytes + width].copy_from_slice(&source);
+	}
+	out
+}
+
+/// A target of `extent` holding `pattern` - which is in the scene's own coordinates, so the same pattern
+/// moved with the scene - in the target's own format.
+fn patterned(make: fn(u32, u32) -> OwnedImage, width: u32, height: u32, at: (u32, u32), pattern: Option<fn(i64, i64) -> graphics_core::pixel::Rgba>) -> OwnedImage {
+	let mut image = make(width, height);
+	if let Some(pattern) = pattern {
+		let mut view = image.view_mut();
+		for y in 0..height {
+			for x in 0..width {
+				graphics_core::pixel::write(&mut view, x, y, pattern(i64::from(x) - i64::from(at.0), i64::from(y) - i64::from(at.1)));
+			}
+		}
+	}
+	image
+}
+
+/// What was in a target before the frame, where a scene reads it: eight-pixel squares of two colours, one of
+/// them half transparent, over the scene's square and nothing outside it. NOTHING OUTSIDE IT because a tile
+/// the frame replays makes the round trip through the working space whole, and transparent black is the one
+/// value every target format brings back unchanged - so the part of the larger target that is not the scene
+/// is the same before and after in both drawings.
+fn under_the_scene(x: i64, y: i64) -> graphics_core::pixel::Rgba {
+	let size = i64::from(crate::TILE_SIZE);
+	if !(0..size).contains(&x) || !(0..size).contains(&y) {
+		return graphics_core::pixel::Rgba::TRANSPARENT;
+	}
+	if (x / 8 + y / 8) % 2 == 0 { graphics_core::pixel::Rgba::new(0.1, 0.5, 0.2, 1.0) } else { graphics_core::pixel::Rgba::new(0.4, 0.05, 0.3, 0.5) }
+}
+
+/// A backdrop read over the TARGET'S OWN PIXELS, which no command of the list drew: what a tile reads of them
+/// past its edge is the target as the frame found it - including the parts a neighbouring tile has already
+/// replaced by the time this one is replayed.
+fn frosted_glass(canvas: &mut Canvas, x: f32, y: f32) {
+	use render2d::filter::FilterNode;
+	let handle = canvas
+		.resources()
+		.add_filter(graph(|graph| {
+			let backdrop = graph.push(FilterNode::Backdrop).expect("a node");
+			graph.push(FilterNode::Blur { input: backdrop, x: 3.0, y: 2.0 }).expect("a blur");
+		}))
+		.expect("a graph");
+	canvas.begin_layer(Some(RectF::new(x + 12.0, y + 12.0, 40.0, 40.0)), 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+	fill(canvas, x + 12.0, y + 12.0, 40.0, 40.0, (1.0, 1.0, 1.0, 0.1));
+	canvas.end_layer().expect("closed");
+}
+
+#[test]
+// A FILTERED LAYER IS THE SAME PICTURE WHEREVER THE TILES CUT IT. Every scene above, and a backdrop read over
+// what was in the target before the frame, drawn into a target that is one tile and into a larger one at
+// three places where tile boundaries cross it - compared over the WHOLE larger target, in a float target to
+// the bit and in the eight-bit one to the byte (the places are multiples of eight, so the dither's phase is
+// the same) - and at the first place through every pool and kind of unit as well as the serial walk.
+fn a_filtered_layer_is_the_same_picture_wherever_the_tiles_cut_it() {
+	let tile = crate::TILE_SIZE;
+	let mut scenes: alloc::vec::Vec<(&'static str, FilteredScene, Option<fn(i64, i64) -> graphics_core::pixel::Rgba>)> = filtered_scenes().into_iter().map(|(name, scene)| (name, scene, None)).collect();
+	scenes.push(("backdrop over the target's own pixels", frosted_glass, Some(under_the_scene)));
+	// THE BOUNDARIES AT 64 AND 128 CROSS EACH PLACE at a different point of the scene's square.
+	let places = [(96u32, 32u32), (40, 104), (112, 80)];
+	let mut failures = alloc::vec::Vec::new();
+	for (format, make) in [("float", float_target as fn(u32, u32) -> OwnedImage), ("eight-bit", target as fn(u32, u32) -> OwnedImage)] {
+		for (name, scene, pattern) in &scenes {
+			// THE UNTILED EVALUATION: the scene alone in a target that is one tile.
+			let mut alone = patterned(make, tile, tile, (0, 0), *pattern);
+			let mut canvas = Canvas::new();
+			scene(&mut canvas, 0.0, 0.0);
+			let list = canvas.finish().expect("a list");
+			let mut backend = Soft2d::new();
+			let prepared = backend.prepare(&list, &description(&alone)).expect("a preparation");
+			backend.render(&prepared, &mut alone.view_mut()).expect("a frame");
+			for (place, at) in places.into_iter().enumerate() {
+				let before = patterned(make, 3 * tile, 3 * tile, at, *pattern);
+				let mut canvas = Canvas::new();
+				scene(&mut canvas, at.0 as f32, at.1 as f32);
+				let list = canvas.finish().expect("a list");
+				let mut image = copy_of(&before);
+				let mut backend = Soft2d::new();
+				let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+				backend.render(&prepared, &mut image.view_mut()).expect("a frame");
+				let expected = with_window(&before, &alone, at.0, at.1);
+				match first_difference(&image, &expected) {
+					Some(difference) => failures.push(alloc::format!("{format} {name} at {at:?}: {difference}")),
+					None if place == 0 => every_schedule_agrees(&list, &before, &expected, &target::NoImages, &crate::glyph::NoGlyphs),
+					None => {}
+				}
+			}
+		}
+	}
+	assert!(failures.is_empty(), "{} of {} drawings differ from the untiled one:\n{}", failures.len(), scenes.len() * places.len() * 2, failures.join("\n"));
+}
+
+#[test]
+// THE AUDIT'S OWN CASE, WITH ITS EXPECTED VALUES. An opaque 100-pixel square inside a `Blur { 4, 4 }` layer on
+// a 256-pixel target, which the tile boundaries at 128 and 192 cut through. Twelve pixels in from every edge
+// the kernel lies wholly inside the square, so the blurred alpha there is the kernel's sum - ONE, stored as
+// 255. And the blurred edge is the same profile at every row and column it crosses, and the same profile
+// mirrored on the far side: a tile boundary running through the square changes neither.
+fn a_blurred_opaque_square_stays_opaque_inside_and_its_edge_is_one_profile() {
+	use render2d::filter::FilterNode;
+	let mut image = target(256, 256);
+	let mut canvas = Canvas::new();
+	let handle = canvas
+		.resources()
+		.add_filter(graph(|graph| {
+			let source = graph.push(FilterNode::Source).expect("a node");
+			graph.push(FilterNode::Blur { input: source, x: 4.0, y: 4.0 }).expect("a blur");
+		}))
+		.expect("a graph");
+	canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+	fill(&mut canvas, 100.0, 100.0, 100.0, 100.0, (1.0, 1.0, 1.0, 1.0));
+	canvas.end_layer().expect("closed");
+	draw(&canvas.finish().expect("a list"), &mut image);
+	let alpha = |x: u32, y: u32| pixel(&image, x, y)[3];
+	let mut thin = alloc::vec::Vec::new();
+	for y in 112..188 {
+		for x in 112..188 {
+			if alpha(x, y) != 255 {
+				thin.push((x, y, alpha(x, y)));
+			}
+		}
+	}
+	assert!(thin.is_empty(), "{} pixel(s) twelve or more inside the square are not opaque, the first {:?}", thin.len(), thin.first());
+	for along in 112..188 {
+		for across in 0..24 {
+			let (near, far) = (88 + across, 211 - across);
+			let left = (alpha(near, along), alpha(far, along), alpha(near, 150));
+			let top = (alpha(along, near), alpha(along, far), alpha(150, near));
+			assert!(left.0 == left.1 && left.0 == left.2, "the vertical edges at row {along}, {across} from the outside: {left:?}");
+			assert!(top.0 == top.1 && top.0 == top.2, "the horizontal edges at column {along}, {across} from the outside: {top:?}");
+		}
 	}
 }
 

@@ -251,9 +251,9 @@ fn admin_journal_page_wire_is_stable() {
 }
 #[test]
 fn admin_probe_effects_wire_is_stable() {
-	let sample = AdminProbeEffects { writes: 7, dispatches: 7, digest: alloc::vec![7], generation: 7 };
+	let sample = AdminProbeEffects { writes: 7, dispatches: 7, digest: alloc::vec![7], generation: 7, prepared: 7 };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 7, 7, 0, 0, 0, 0, 0, 0, 0];
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 7, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(AdminProbeEffects::decode(&bytes).unwrap(), sample);
 }

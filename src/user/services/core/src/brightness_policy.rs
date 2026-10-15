@@ -291,13 +291,20 @@ impl Service {
 
 	// ------------------------------------------------------------------ activity
 
-	// THE ACTIVITY SIGNAL AT THE IDLE TIMEOUT, watched again whenever it changes; none while it is off.
+	// THE ACTIVITY SIGNAL AT THE IDLE TIMEOUT, watched again whenever it changes. With dimming off it is still watched
+	// while automatic brightness is on, at the default timeout and for one thing alone: a change somebody made pauses
+	// automatic brightness "until the next idle", and with no watch there was no next idle - one key press stopped it
+	// for the life of the policy. Idle dims nothing there; it only ends the pause.
 	fn watch_activity(&mut self) {
 		if self.activity_stream != 0 {
 			close(self.activity_stream);
 			self.activity_stream = 0;
 		}
-		let Some(seconds) = self.policy.settings.idle_seconds else { return };
+		let seconds = match (self.policy.settings.idle_seconds, self.policy.settings.automatic) {
+			(Some(seconds), _) => seconds,
+			(None, true) => logic::DEFAULT_IDLE_SECONDS,
+			(None, false) => return,
+		};
 		if self.activity == 0 {
 			return;
 		}
@@ -393,6 +400,21 @@ impl Service {
 		self.sensors.push(Sensor { info, chan, stream, curve });
 	}
 
+	// THE SENSOR DESCRIBED AND ITS READINGS OPENED AGAIN, on the connection it already has.
+	fn reopen_sensor(&mut self, at: usize) -> bool {
+		let mut client = ambient_light::Client::with_deadline(ChannelTransport { chan: self.sensors[at].chan }, clock() + ASK_TICKS);
+		let Some(Ok(description)) = client.describe() else { return false };
+		client.set_deadline(clock() + ASK_TICKS);
+		let Some(stream) = client.events() else { return false };
+		let curve = logic::firmware_curve(description.curve.iter().map(|point| (point.adjustment, point.illuminance)));
+		if curve != self.sensors[at].curve {
+			say(if curve.is_empty() { "an ambient-light sensor's response curve was read again - none; automatic brightness follows the default curve" } else { "an ambient-light sensor's response curve was read again - automatic brightness follows the firmware's new curve" });
+		}
+		self.sensors[at].curve = curve;
+		self.sensors[at].stream = stream;
+		true
+	}
+
 	// A READING. Only the first sensor's moves a level: two in one room would fight.
 	fn take_reading(&mut self, at: usize, buf: &mut [u8]) {
 		let stream = self.sensors[at].stream;
@@ -407,9 +429,15 @@ impl Service {
 				}
 				PolledCaps::Empty => break,
 				PolledCaps::Closed => {
-					let gone = self.sensors.remove(at);
-					close(gone.stream);
-					close(gone.chan);
+					// A STREAM ITS SENSOR CLOSED is opened again on the same connection, the sensor described again:
+					// the sensor closes it when its firmware changed the response curve - `Notify(0x82)` - so the curve
+					// followed is the new one, and when a reading could not be queued, so the reading is the one now.
+					// A sensor whose connection is gone is let go.
+					close(stream);
+					if !self.reopen_sensor(at) {
+						let gone = self.sensors.remove(at);
+						close(gone.chan);
+					}
 					return;
 				}
 			}
@@ -462,6 +490,8 @@ impl brightness_policy::Service for Control<'_> {
 			return Err(Error::Io);
 		}
 		self.service.policy.set_automatic(on);
+		// The activity watch follows automatic brightness too, where dimming is off - see `watch_activity`.
+		self.retarget = true;
 		say(if on { "automatic brightness on" } else { "automatic brightness off" });
 		Ok(())
 	}

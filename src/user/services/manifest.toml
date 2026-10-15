@@ -1285,10 +1285,13 @@ stage = "volume"
 destination = "bin/textconf.lsexe"
 # WHAT IT ACTUALLY IMPORTS, which is shorter than what it uses: the profile's ceilings are `const`,
 # the seam's geometry is inlined, and a provider row satisfying no import is a claim the build
-# contradicts.
+# contradicts. `font-contract` is the seam's one rounding rule, which the corpus oracle places glyphs
+# by; `unicode-bidi` is the mirror the pipeline's face stage asks for, compiled into this program
+# because that stage is generic over the faces it is handed.
 providers = [
 	"base-proto",
 	"font-client",
+	"font-contract",
 	"font-parse",
 	"font-run",
 	"font-shape",
@@ -1297,6 +1300,7 @@ providers = [
 	"soft2d",
 	"text-layout",
 	"text-pipeline",
+	"unicode-bidi",
 	"lsrt",
 ]
 
@@ -6120,7 +6124,10 @@ presence = "optional"
 
 [[services.roles]]
 tag = "CONFIG"
-kind = "client"
+# Its own connection, minted at each launch: the policy is read with a fresh client whose correlations start
+# at zero, and on a duplicated root another reader's reply with an equal correlation would be taken for
+# `watchdog.enabled` or a timing key - arming a machine whose owner turned the watchdog off.
+kind = "factory"
 provider = "config_service"
 interface = "liber:config@1/config"
 presence = "optional"
@@ -7362,7 +7369,9 @@ name = "font-shape"
 owner = "font-shape"
 destination = "lib/text/font-shape.lslib"
 features = []
-providers = ["font-parse", "unicode-tables", "lsrt"]
+# THE PROFILE DIRECTLY, and not only through the parser: the shaper refuses a script the profile does not
+# name and asks it which lookup types and table versions it admits, so its imports name the profile.
+providers = ["font-parse", "opentype-profile", "unicode-tables", "lsrt"]
 
 [[libraries]]
 name = "font-run"
@@ -7383,7 +7392,16 @@ name = "text-pipeline"
 owner = "text-pipeline"
 destination = "lib/text/text-pipeline.lslib"
 features = []
-providers = ["unicode-bidi", "unicode-segmentation", "unicode-tables", "lsrt"]
+# THE SHAPING STAGE IS THE PIPELINE'S OWN, so the library imports from the parser and the shaper: a
+# cluster is spelled through the face's `cmap` and appended to the shaper's buffer inside it.
+providers = [
+	"font-parse",
+	"font-shape",
+	"unicode-bidi",
+	"unicode-segmentation",
+	"unicode-tables",
+	"lsrt",
+]
 
 # THE 2D DRAWING API AND THE RASTERISER UNDER IT. `render2d` produces a bounded, validated display
 # list and draws nothing; `soft2d` is the complete CPU implementation of Profile 1 behind the backend

@@ -1238,6 +1238,10 @@ const MAX_HELD: usize = 16;
 // there costs almost nothing, short enough that a person switching a device on does not wonder whether
 // it worked.
 const BLUETOOTH_RETRY_TICKS: u64 = 200;
+// How long one question to BluetoothService may take: one second. A stack that is alive answers at once; one that
+// has not answered by then is wedged or busy, and this loop - the pointer, the keys, every other device - does not
+// wait on it longer.
+const BLUETOOTH_ASK_TICKS: u64 = 100;
 
 impl Bluetooth {
 	fn wanted(&self) -> bool {
@@ -1257,16 +1261,16 @@ impl Bluetooth {
 			}
 			return;
 		}
-		let mut client = proto::system::bluetooth_profile::Client::new(ChannelTransport { chan: self.profile });
+		let ask = |profile: u64| proto::system::bluetooth_profile::Client::with_deadline(ChannelTransport { chan: profile }, clock().saturating_add(BLUETOOTH_ASK_TICKS));
+		let mut client = ask(self.profile);
 		let peers = match client.enabled() {
 			Some(Ok(peers)) => peers,
 			// THE CONNECTION ITSELF IS DEAD: BluetoothService was restarted and this channel was to the
 			// instance that ended. The next retry asks the broker for one to the live instance. A failed
 			// transport answers as an error VALUE like any refusal, so it is told apart by the client's
 			// own record of what the transport did, not by the shape of the answer.
-			_ if client.last_error().is_some() => {
-				close(self.profile);
-				self.profile = 0;
+			_ if let Some(error) = client.last_error() => {
+				self.drop_profile(error);
 				return;
 			}
 			_ => return,
@@ -1278,10 +1282,26 @@ impl Bluetooth {
 			if self.inputs.iter().any(|input| input.controller == peer.controller && input.peer == peer.peer) {
 				continue;
 			}
-			if let Some(Ok(stream)) = client.open_input(&peer.controller, &peer.peer) {
-				self.inputs.push(BluetoothInput { controller: peer.controller, peer: peer.peer, stream, pointer: service_logic::hogp::Pointer::new(), mods: drivers::keys::Mods::default(), held: [0; MAX_HELD], holding: 0 });
+			let mut client = ask(self.profile);
+			match client.open_input(&peer.controller, &peer.peer) {
+				Some(Ok(stream)) => self.inputs.push(BluetoothInput { controller: peer.controller, peer: peer.peer, stream, pointer: service_logic::hogp::Pointer::new(), mods: drivers::keys::Mods::default(), held: [0; MAX_HELD], holding: 0 }),
+				_ if let Some(error) = client.last_error() => {
+					self.drop_profile(error);
+					return;
+				}
+				_ => {}
 			}
 		}
+	}
+
+	// THE CONNECTION IS DROPPED as a dead one is - and one that did not answer in time is dropped too, since its late
+	// reply would be read as the next question's answer. The next retry asks the broker for a new one.
+	fn drop_profile(&mut self, error: wire::TransportError) {
+		if error == wire::TransportError::TimedOut {
+			print(b"InputService: BluetoothService did not answer within a second; its connection is dropped and a new one asked for\n");
+		}
+		close(self.profile);
+		self.profile = 0;
 	}
 
 	// The broker's answer to a resolve. Anything else on this channel is not this slot's and is left

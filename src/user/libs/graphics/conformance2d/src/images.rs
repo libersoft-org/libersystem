@@ -2,7 +2,7 @@
 //! happens to their colour on the way into a target that is not in their own space.
 
 use crate::Outcome;
-use crate::harness::{Frame, draw_with, near, render_in};
+use crate::harness::{Frame, draw_with, render_in, stored};
 use graphics_core::geom::{Extent2D, RectF};
 use graphics_core::layout::{ImageLayout, RowOrigin};
 use graphics_core::pixel::Rgba;
@@ -120,8 +120,8 @@ pub fn image_bilinear() -> Outcome {
 	let frame = drawn(&black_and_white(), ImageQuality::Bilinear, RectF::new(0.0, 0.0, 2.0, 1.0), RectF::new(0.0, 0.0, 32.0, 32.0))?;
 	// THE TEXEL CENTRES LAND AT 8 AND 24, so the pixel whose centre is 12.5 is `(12.5 - 8) / 16` of
 	// the way along - the half-pixel is the part an expectation written as "a quarter" gets wrong.
-	require!(near(frame.pixel(12, 16)[0], (12.5 - 8.0) / 16.0), "the ramp is the straight line between the texel centres: {:?}", frame.pixel(12, 16));
-	require!(near(frame.pixel(20, 16)[0], (20.5 - 8.0) / 16.0), "at every point along it: {:?}", frame.pixel(20, 16));
+	require!(frame.pixel(12, 16)[0] == stored((12.5 - 8.0) / 16.0, 12, 16), "the ramp is the straight line between the texel centres: {:?}", frame.pixel(12, 16));
+	require!(frame.pixel(20, 16)[0] == stored((20.5 - 8.0) / 16.0, 20, 16), "at every point along it: {:?}", frame.pixel(20, 16));
 	// AND IT IS FLAT OUTSIDE THEM: a two-tap kernel reaches one texel and no further.
 	require!(frame.pixel(6, 16)[0] == 0, "before the first texel centre there is nothing to interpolate with: {:?}", frame.pixel(6, 16));
 	Ok(())
@@ -220,7 +220,7 @@ pub fn image_opacity() -> Outcome {
 		canvas.set_opacity(0.5);
 		canvas.draw_image(record(), RectF::new(0.0, 0.0, 1.0, 1.0), RectF::new(0.0, 0.0, 16.0, 16.0), ImageQuality::Nearest)
 	})?;
-	require!(near(frame.alpha(8, 8), 0.5), "half opacity is half alpha: {:?}", frame.pixel(8, 8));
+	require!(frame.holds(8, 8, [1.0, 1.0, 1.0], 0.5), "half opacity is half alpha, of the white the image is: {:?}", frame.pixel(8, 8));
 	Ok(())
 }
 

@@ -18,6 +18,14 @@
 //! input could pass over an empty set for months while its comparison quietly stopped comparing. The
 //! self-test builds a face, agrees with it, and is then required to disagree with the same face under
 //! each field made wrong in turn.
+//!
+//! AND THE STAGING ITSELF IS CHECKED, NOT ONLY THE DECLARATIONS IN IT. The catalogue takes every file
+//! without the declaration suffix as a face, refuses to publish one with no declaration, and
+//! publishes at most `MAX_INSTALLED_FACES`. A check that walked the declarations alone would pass a
+//! face staged without one - the catalogue then quietly publishes less than the image carries - and
+//! nothing would count the faces until a boot did. So the listing is read whole: a face with no
+//! declaration, a declaration with no face and a staging past the ceiling are each refused here,
+//! where the person who staged them is.
 
 mod build;
 
@@ -25,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use font_parse::Face;
 use font_parse::metadata::{Names, Os2, name_id, selection};
-use service_logic::font_record::{FaceFormat, FaceRecord, FaceSlant, FaceWidth};
+use service_logic::font_record::{FaceFormat, FaceRecord, FaceSlant, FaceWidth, MAX_INSTALLED_FACES, RECORD_SUFFIX};
 
 fn main() -> std::process::ExitCode {
 	let Some(root) = repository_root() else {
@@ -35,7 +43,7 @@ fn main() -> std::process::ExitCode {
 	if std::env::args().any(|argument| argument == "--self-test") {
 		return match prove_it_refuses() {
 			Ok(cases) => {
-				println!("font-oracle: self-test passed - a matching declaration is accepted and {cases} altered ones are each refused by field");
+				println!("font-oracle: self-test passed - a matching declaration and a valid staging are accepted, and {cases} altered ones are each refused");
 				std::process::ExitCode::SUCCESS
 			}
 			Err(reason) => {
@@ -45,37 +53,118 @@ fn main() -> std::process::ExitCode {
 		};
 	}
 	let staged = root.join("src/volume/share/fonts");
+	let mut failed = false;
 	match check(&staged) {
 		Ok(0) => {
 			// NOT PERFORMED RATHER THAN A PASS. A gate that printed "ok" over an empty set would be
 			// reporting the absence of the thing it exists to check as success.
 			println!("font-oracle: NOT PERFORMED - no face is staged at src/volume/share/fonts, so nothing was checked");
-			std::process::ExitCode::SUCCESS
 		}
-		Ok(count) => {
-			println!("font-oracle: {count} staged face(s) agree with their declarations");
-			std::process::ExitCode::SUCCESS
-		}
+		Ok(count) => println!("font-oracle: {count} staged face(s) agree with their declarations"),
 		Err(problems) => {
 			for problem in problems {
 				eprintln!("font-oracle: {problem}");
 			}
-			std::process::ExitCode::FAILURE
+			failed = true;
 		}
 	}
+	// AND THE CORPUS FACES A GUEST TEST INSTALLS. They are staged into no image, but the kernel's text
+	// conformance test writes them and their declarations into the font directory of the volume it
+	// runs against - so the catalogue publishes what those declarations claim, and a claim nobody
+	// checks is not a fact there either.
+	let corpus = root.join("src/tests/fonts");
+	match check_installed(&corpus) {
+		Ok(0) => println!("font-oracle: NOT PERFORMED - no corpus face at src/tests/fonts carries a declaration, so none was checked"),
+		Ok(count) => println!("font-oracle: {count} corpus face(s) a guest test installs agree with their declarations"),
+		Err(problems) => {
+			for problem in problems {
+				eprintln!("font-oracle: src/tests/fonts: {problem}");
+			}
+			failed = true;
+		}
+	}
+	if failed { std::process::ExitCode::FAILURE } else { std::process::ExitCode::SUCCESS }
 }
 
-/// Check every declaration in a directory, answering how many faces were checked.
+/// What the listing alone says is wrong with a staging, in the catalogue's own terms: a face with no
+/// declaration, a declaration with no face, and more faces than the catalogue will publish.
+///
+/// A FACE IS EVERY FILE WITHOUT THE DECLARATION SUFFIX, because that is what the catalogue takes one
+/// to be - it does not look inside a file to decide - so a stray file is a face with no declaration,
+/// which is exactly what the catalogue would refuse to publish.
+fn staging(names: &[String]) -> Vec<String> {
+	let mut problems = Vec::new();
+	let faces: Vec<&String> = names.iter().filter(|name| !name.ends_with(RECORD_SUFFIX)).collect();
+	for face in &faces {
+		if !names.iter().any(|name| name.strip_suffix(RECORD_SUFFIX) == Some(face.as_str())) {
+			problems.push(format!("{face}: staged without a declaration, so the catalogue would refuse to publish it - add {face}{RECORD_SUFFIX}"));
+		}
+	}
+	for name in names {
+		if let Some(face) = name.strip_suffix(RECORD_SUFFIX)
+			&& !faces.iter().any(|candidate| candidate.as_str() == face)
+		{
+			problems.push(format!("{name}: a declaration with no face beside it"));
+		}
+	}
+	if faces.len() > MAX_INSTALLED_FACES {
+		problems.push(format!("{} faces are staged and the catalogue publishes at most {MAX_INSTALLED_FACES}: the image would carry faces no client can be given", faces.len()));
+	}
+	problems
+}
+
+/// Check the staging and every declaration in it, answering how many faces were checked.
 fn check(staged: &Path) -> Result<usize, Vec<String>> {
 	let Ok(entries) = std::fs::read_dir(staged) else {
 		return Ok(0);
 	};
 	let mut problems = Vec::new();
-	let mut checked = 0usize;
-	let mut paths: Vec<PathBuf> = entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|extension| extension == "face")).collect();
+	let mut names: Vec<String> = Vec::new();
+	for entry in entries.filter_map(|entry| entry.ok()) {
+		let name = entry.file_name().to_string_lossy().into_owned();
+		if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+			problems.push(format!("{name}: not a file - only faces and their declarations are staged here, directly"));
+			continue;
+		}
+		names.push(name);
+	}
 	// SORTED, so two machines report the same faces in the same order - a gate whose output depends
 	// on a directory's iteration order is a gate whose failures are hard to compare.
-	paths.sort();
+	names.sort();
+	problems.extend(staging(&names));
+	let checked = agree(staged, &names, &mut problems);
+	if problems.is_empty() { Ok(checked) } else { Err(problems) }
+}
+
+/// The declarations of the corpus faces a guest test installs, each against the face beside it.
+///
+/// NOT A STAGING, so the staging rules do not apply: the corpus directory also holds its pin file
+/// and the faces no guest installs, and neither is a face the catalogue is ever handed. What does
+/// apply is everything a declaration claims - and a declaration with no face beside it, which would
+/// be a test installing a claim about nothing.
+fn check_installed(directory: &Path) -> Result<usize, Vec<String>> {
+	let Ok(entries) = std::fs::read_dir(directory) else {
+		return Ok(0);
+	};
+	let mut names: Vec<String> = entries.filter_map(|entry| entry.ok()).filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file())).map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+	names.sort();
+	let mut problems = Vec::new();
+	for name in &names {
+		if let Some(face) = name.strip_suffix(RECORD_SUFFIX)
+			&& !names.iter().any(|candidate| candidate == face)
+		{
+			problems.push(format!("{name}: a declaration with no face beside it"));
+		}
+	}
+	let checked = agree(directory, &names, &mut problems);
+	if problems.is_empty() { Ok(checked) } else { Err(problems) }
+}
+
+/// Every declaration among `names` that has a face beside it, against that face - the comparison
+/// both the staging and the installed corpus are held to. Answers how many faces were checked.
+fn agree(directory: &Path, names: &[String], problems: &mut Vec<String>) -> usize {
+	let mut checked = 0usize;
+	let paths: Vec<PathBuf> = names.iter().filter(|name| name.strip_suffix(RECORD_SUFFIX).is_some_and(|face| names.iter().any(|candidate| candidate == face))).map(|name| directory.join(name)).collect();
 	for declaration in paths {
 		let named = declaration.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_string();
 		// THE DECLARATION MUST NAME A FACE. `sans.ttf.face` sits beside `sans.ttf`; stripping the
@@ -105,7 +194,7 @@ fn check(staged: &Path) -> Result<usize, Vec<String>> {
 		}
 		checked += 1;
 	}
-	if problems.is_empty() { Ok(checked) } else { Err(problems) }
+	checked
 }
 
 /// What the face says against what the record says, field by field.
@@ -371,8 +460,10 @@ fn hex(digest: &[u8; 32]) -> String {
 	digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Prove the comparison REFUSES before trusting it to approve, over a face this tool builds.
+/// Prove the comparison REFUSES before trusting it to approve, over a face this tool builds - and the
+/// staging check over listings this tool writes.
 fn prove_it_refuses() -> Result<usize, String> {
+	let staged = prove_the_staging_is_checked()?;
 	let axes = [(*b"wght", 100i32, 400, 900)];
 	let bytes = build::face("Test Family", "Bold Italic", 700, 3, selection::BOLD | selection::ITALIC, &axes);
 	let declaration = |family: &str, style: &str, format: &str, index: u32, weight: u16, width: &str, slant: &str, axis: &str| format!("family = {family}\nstyle = {style}\nformat = {format}\nface-index = {index}\nweight = {weight}\nwidth = {width}\nslant = {slant}\n{axis}digest = {}\n", hex(&digest(&bytes)));
@@ -412,7 +503,83 @@ fn prove_it_refuses() -> Result<usize, String> {
 	if agree(&none)?.is_empty() {
 		return Err(String::from("a declaration that states no axes for a variable face was accepted"));
 	}
-	Ok(wrong.len() + 1)
+	Ok(wrong.len() + 1 + staged)
+}
+
+/// The staging check, through the SAME `check` the real run calls, over directories this tool writes
+/// and removes: exactly the ceiling of declared faces accepted, and each kind of staging the catalogue
+/// would not publish whole refused. Answers how many refusals it proved.
+///
+/// OVER A DIRECTORY AND NOT A LIST OF NAMES, because what is being proved is that the real run reads
+/// the listing whole: a check that tested the rule alone would keep passing after the run stopped
+/// asking it.
+fn prove_the_staging_is_checked() -> Result<usize, String> {
+	let bytes = build::face("Test Family", "Regular", 400, 5, 0, &[]);
+	let declaration = format!("family = Test Family\nstyle = Regular\nformat = truetype-glyf\nface-index = 0\nweight = 400\nwidth = normal\nslant = upright\ndigest = {}\n", hex(&digest(&bytes)));
+	let scratch = std::env::temp_dir().join(format!("font-oracle-self-test-{}", std::process::id()));
+	let stage = |declared: usize, extra: &[(&str, &[u8])]| -> Result<(), String> {
+		let _ = std::fs::remove_dir_all(&scratch);
+		std::fs::create_dir_all(&scratch).map_err(|error| format!("{} could not be created: {error}", scratch.display()))?;
+		for index in 0..declared {
+			let face = format!("face{index:02}.ttf");
+			std::fs::write(scratch.join(&face), &bytes).map_err(|error| format!("{face} could not be written: {error}"))?;
+			std::fs::write(scratch.join(format!("{face}{RECORD_SUFFIX}")), &declaration).map_err(|error| format!("{face}'s declaration could not be written: {error}"))?;
+		}
+		for (name, content) in extra {
+			std::fs::write(scratch.join(name), content).map_err(|error| format!("{name} could not be written: {error}"))?;
+		}
+		Ok(())
+	};
+	let outcome = (|| -> Result<usize, String> {
+		// EXACTLY THE CEILING IS A STAGING, which is what makes the number the ceiling.
+		stage(MAX_INSTALLED_FACES, &[])?;
+		match check(&scratch) {
+			Ok(count) if count == MAX_INSTALLED_FACES => {}
+			Ok(count) => return Err(format!("a staging of {MAX_INSTALLED_FACES} declared faces checked {count}")),
+			Err(problems) => return Err(format!("a staging of exactly {MAX_INSTALLED_FACES} declared faces was refused: {}", problems.join("; "))),
+		}
+		let past = MAX_INSTALLED_FACES + 1;
+		let refused: [(&str, usize, Vec<(&str, &[u8])>, &str); 3] = [
+			("one face past the ceiling", past, Vec::new(), "faces are staged"),
+			("a face staged without a declaration", 1, vec![("stray.ttf", bytes.as_slice())], "stray.ttf: staged without a declaration"),
+			("a declaration with no face", 1, vec![("gone.ttf.face", declaration.as_bytes())], "gone.ttf.face: a declaration with no face"),
+		];
+		for (what, declared, extra, named) in &refused {
+			stage(*declared, extra)?;
+			match check(&scratch) {
+				Ok(_) => return Err(format!("a staging with {what} was accepted")),
+				Err(problems) if problems.iter().any(|problem| problem.contains(named)) => {}
+				Err(problems) => return Err(format!("a staging with {what} was refused for something else: {}", problems.join("; "))),
+			}
+		}
+
+		// AND THE INSTALLED CORPUS, through the SAME `check_installed` the real run calls: a pin file and a
+		// face nobody installs sit beside the declared faces and are not its business, while a
+		// declaration that disagrees with its face and one with no face beside it are each refused.
+		let pins = b"face face00.ttf 00\n".as_slice();
+		stage(1, &[("corpus.pins", pins), ("undeclared.ttf", bytes.as_slice())])?;
+		match check_installed(&scratch) {
+			Ok(1) => {}
+			Ok(count) => return Err(format!("an installed corpus of one declared face checked {count}")),
+			Err(problems) => return Err(format!("an installed corpus beside its pin file and an undeclared face was refused: {}", problems.join("; "))),
+		}
+		let other = declaration.replace("family = Test Family", "family = Other Family");
+		let installed_refused: [(&str, Vec<(&str, &[u8])>, &str); 2] = [
+			("a declaration that disagrees with its face", vec![("wrong.ttf", bytes.as_slice()), ("wrong.ttf.face", other.as_bytes())], "wrong.ttf.face: the declared family"),
+			("a declaration with no face", vec![("gone.ttf.face", declaration.as_bytes())], "gone.ttf.face: a declaration with no face"),
+		];
+		for (what, extra, named) in &installed_refused {
+			stage(1, extra)?;
+			match check_installed(&scratch) {
+				Ok(_) => return Err(format!("an installed corpus with {what} was accepted")),
+				Err(problems) if problems.iter().any(|problem| problem.contains(named)) => {}
+				Err(problems) => return Err(format!("an installed corpus with {what} was refused for something else: {}", problems.join("; "))),
+			}
+		}
+		Ok(refused.len() + installed_refused.len())
+	})();
+	let _ = std::fs::remove_dir_all(&scratch);
+	outcome
 }
 
 /// The repository root, found from this tool's own location rather than from the working directory.

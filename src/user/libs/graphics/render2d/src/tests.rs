@@ -255,6 +255,24 @@ fn the_canonical_encoding_distinguishes_drawings_that_differ() {
 	// EVERY FIELD THE ENCODING CARRIES MUST CHANGE IT, or that field is the one a cache hit loses.
 	assert_ne!(encode::digest(&base), encode::digest(&draw(0.5, FillRule::NonZero)), "opacity");
 	assert_ne!(encode::digest(&base), encode::digest(&draw(1.0, FillRule::EvenOdd)), "fill rule");
+	// AND THE PAINT IS PART OF THE DRAWING: the same shape in another colour, or in a gradient, or a run of
+	// glyphs or a stroke in another paint, is another picture - and a cache keyed by a digest that left the
+	// paint out would hand one back for the other.
+	// Every list carries the same stops, so the paint is the only thing that differs.
+	let painted = |paint: &dyn Fn(crate::resource::PaintHandle) -> Paint| {
+		let mut canvas = Canvas::new();
+		let stops = canvas.resources().add_stops(std::vec![crate::paint::GradientStop { offset: 0.0, color: Color::new(1.0, 0.0, 0.0, 1.0, ColorSpace::SrgbLinear) }]).expect("stops");
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 4.0, 4.0)), paint(stops), FillRule::NonZero).expect("a fill");
+		canvas.stroke_path(rect_path(RectF::new(1.0, 1.0, 2.0, 2.0)), paint(stops), crate::path::StrokeStyle::default()).expect("a stroke");
+		encode::digest(&canvas.finish().expect("balanced"))
+	};
+	let solid = |red: f32, space: ColorSpace| move |_| Paint::Solid(Color::new(red, 0.0, 0.0, 1.0, space));
+	let linear = |to: f32| move |stops| Paint::Linear { from: PointF { x: 0.0, y: 0.0 }, to: PointF { x: to, y: 0.0 }, stops, spread: crate::paint::SpreadMode::Clamp, transform: Transform::IDENTITY };
+	assert_eq!(painted(&solid(1.0, ColorSpace::SrgbLinear)), painted(&solid(1.0, ColorSpace::SrgbLinear)), "the same paint must key the same");
+	assert_ne!(painted(&solid(1.0, ColorSpace::SrgbLinear)), painted(&solid(0.5, ColorSpace::SrgbLinear)), "a paint's colour");
+	assert_ne!(painted(&solid(1.0, ColorSpace::SrgbLinear)), painted(&solid(1.0, ColorSpace::Srgb)), "a paint's colour space");
+	assert_ne!(painted(&solid(1.0, ColorSpace::SrgbLinear)), painted(&linear(4.0)), "a solid against a gradient");
+	assert_ne!(painted(&linear(4.0)), painted(&linear(8.0)), "a gradient's geometry");
 	// AND THE VERSION IS THE FIRST FIELD, so two lists recorded under different schemas cannot collide
 	// however similar their commands are.
 	assert_eq!(&encode::encode(&base)[..4], &DRAW_LIST_VERSION.to_le_bytes());

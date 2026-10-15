@@ -12,7 +12,9 @@
 #   1. the kernel's handoff line and the driver's online line, which with the count at zero can only have
 #      crossed the tap and the driver;
 #   2. `lab sh` round-trips through the driver: typed into the UART it reads, answered through the writes it
-#      serves;
+#      serves - and again ACROSS A SLEEP: a suspend to idle while the driver holds COM1, `sleep: entered` and
+#      `sleep: resumed` in the log, and `lab sh` answering through the driver after the resume, so the kill that
+#      follows reports its zero count over a hold that included the sleep;
 #   3. the driver's process killed (a development kernel request, SIG_KILL as DeviceManager sends it): the
 #      kernel's reacquisition line with a zero count, DeviceManager's restart, the next handoff line - and
 #      `lab sh` works again through the restarted driver;
@@ -25,15 +27,13 @@
 #      development channel puts the terminal-path writer's dropped count, then `*** KERNEL PANIC ***` and its
 #      message, in the log.
 #
-# ACROSS A SLEEP is P02M0197b's to add to this gate: there is no sleep entry to drive yet.
-#
 # IT BOOTS ITS OWN INSTANCE in private state, as the development lifecycle gate does, and takes it down from
 # the EXIT trap whatever happened.
 #
 # THE DEVICE-TREE PORTS, `--arch aarch64` or `--arch riscv64`: the same handoff of their console UART - the PL011, the
 # 16550 in a register window - to `console_uart`, as one cold development boot (`lab scenario-cold`), since the
 # persistent instance is x86_64's alone. The scenario `harness/scenarios/serial-handoff-port.toml`, filled for the port,
-# drives steps 2 to 6 above - with `--serial-broker`, so the round trips are typed into the UART and answered through
+# drives steps 2 to 6 above, the sleep among them - with `--serial-broker`, so the round trips are typed into the UART and answered through
 # it - and this script then reads from the serial log what happened before the scenario's first step: the kernel's
 # handoff line naming the UART and its receive line, the driver's online line and ConsoleService's attachment, and
 # every reacquisition line's count at zero.
@@ -185,6 +185,20 @@ all_counts_zero
 # 2. THROUGH THE DRIVER.
 round_trip "handoff-through-the-driver" "through the driver"
 
+# ... AND ACROSS A SLEEP: the kernel's sleep entry lends the UART while it suspends and gives it back with the driver's
+# settings, and no ordinary kernel path may touch COM1 while the driver holds it, before the sleep or after it.
+entered=$(seen "sleep: entered")
+resumed=$(seen "sleep: resumed")
+ended=$(seen "ServiceManager: sleep: the transaction ended")
+./dev.sh launch --timeout 120 sleepctl suspend idle 3 >"$state/sleepctl.log" 2>&1 || true
+await_line "sleep: entered" "the suspend to idle never entered" "$entered"
+await_line "sleep: resumed" "the suspend to idle never resumed" "$resumed"
+await_line "ServiceManager: sleep: the transaction ended" "the sleep transaction never ended" "$ended"
+last="$(grep -a "ServiceManager: sleep: the transaction ended" "$(serial_log)" | tail -n 1)"
+grep -q "slept and woke" <<<"$last" || fail "the suspend to idle did not sleep and wake: $last"
+all_counts_zero
+round_trip "handoff-after-the-sleep" "through the driver after a suspend to idle"
+
 # 3. THE DRIVER KILLED: the kernel takes COM1 back, DeviceManager restarts the driver, the next handoff.
 back=$(seen "$BACK")
 restarted=$(seen "DeviceManager: restarting")
@@ -229,4 +243,4 @@ await_line "a panic asked for over the development channel" "the panic's message
 # IN THAT ORDER: the count, then the panic.
 order="$(grep -a -E -- "dropped at the ring's bound before this point|\*\*\* KERNEL PANIC \*\*\*" "$(serial_log)" 2>/dev/null | tail -2)"
 grep -q "dropped at the ring's bound" <<<"$(head -1 <<<"$order")" || fail "the dropped count did not come before the panic: $order"
-echo "serial-handoff: PASS - COM1 went to its driver and came back to the kernel on a kill and on a disable with zero stray kernel accesses each time, lab sh answered through both, and a panic under a driver that had stopped draining reached the wire after the dropped count"
+echo "serial-handoff: PASS - COM1 went to its driver, kept it across a suspend to idle, and came back to the kernel on a kill and on a disable with zero stray kernel accesses each time, lab sh answered through both, and a panic under a driver that had stopped draining reached the wire after the dropped count"

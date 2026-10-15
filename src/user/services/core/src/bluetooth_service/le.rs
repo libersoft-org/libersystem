@@ -21,6 +21,9 @@ use service_logic::smp_pairing::{self, Answer, Bonded, Options};
 
 // How long one private address is used.
 const ROTATE_TICKS: u64 = 15 * 60 * TICKS_PER_SECOND;
+// How long a rotation the controller refused waits before it is asked again: a scan or a connection attempt that was
+// running then has usually ended.
+const ROTATE_RETRY_TICKS: u64 = 10 * TICKS_PER_SECOND;
 // The LE IO capabilities this host declares.
 const IO_KEYBOARD_DISPLAY: u8 = smp_pairing::IO_KEYBOARD_DISPLAY;
 const IO_NO_INPUT_NO_OUTPUT: u8 = smp_pairing::IO_NO_INPUT_NO_OUTPUT;
@@ -43,11 +46,16 @@ pub(crate) struct LeState {
 	// The standing attempt was cancelled because the bonds it waits for changed: when its cancellation lands, it is
 	// taken up again with the new list.
 	pub relist: bool,
+	// The standing attempt was cancelled for a new private address, which is set once the cancellation lands and the
+	// attempt is taken up again from it - the controller refuses a new address while an attempt is out.
+	pub rotate: bool,
+	// The private address asked for and not yet confirmed: it becomes `own` only when the controller accepts it.
+	pub pending_own: Option<[u8; 6]>,
 }
 
 impl LeState {
 	pub fn new() -> LeState {
-		LeState { irk: None, own: None, rotate_at: 0, irks: Vec::new(), accepting: false, legacy: None, relist: false }
+		LeState { irk: None, own: None, rotate_at: 0, irks: Vec::new(), accepting: false, legacy: None, relist: false, rotate: false, pending_own: None }
 	}
 
 	// THE ADDRESS THIS HOST USES on a new LE link, as SMP's derivations take it.
@@ -74,6 +82,9 @@ impl LeState {
 	pub fn end_session(&mut self) {
 		self.own = None;
 		self.accepting = false;
+		self.relist = false;
+		self.rotate = false;
+		self.pending_own = None;
 	}
 }
 
@@ -152,10 +163,43 @@ impl Stack {
 		}
 		let address = service_logic::bt_keys::private_address(&irk, u32::from_le_bytes(random));
 		let controller = &mut self.controllers[at];
+		// ASKED FOR, AND NOT YET THIS HOST'S ADDRESS: `own` is what new links and SMP's derivations take, so it changes only
+		// once the controller has accepted the address - one refused while a scan was running would otherwise have failed
+		// every pairing's confirm and DHKey check until a later rotation took.
 		if controller.command(opcode::LE_SET_RANDOM_ADDRESS, &hci_codec::random_address(&address)) {
-			controller.le.own = Some(address);
+			controller.le.pending_own = Some(address);
 			controller.le.rotate_at = clock().saturating_add(ROTATE_TICKS);
 		}
+	}
+
+	// THE CONTROLLER'S ANSWER TO A NEW PRIVATE ADDRESS: accepted, it is this host's address from now on; refused, the old
+	// one stays and the rotation is asked again shortly.
+	pub(crate) fn address_set(&mut self, at: usize, status: u8) {
+		let controller = &mut self.controllers[at];
+		let Some(address) = controller.le.pending_own.take() else { return };
+		if status == 0 {
+			controller.le.own = Some(address);
+		} else {
+			controller.le.rotate_at = clock().saturating_add(ROTATE_RETRY_TICKS);
+		}
+	}
+
+	// TIME FOR A NEW PRIVATE ADDRESS: set at once when no connection attempt is out; otherwise the standing attempt is
+	// cancelled, and the address set and the attempt taken up again once the cancellation lands. A machine whose bonded
+	// mouse is switched off keeps its attempt out indefinitely, and kept one address for as long.
+	pub(crate) fn rotate_due(&mut self, at: usize) {
+		let controller = &mut self.controllers[at];
+		if controller.le.pending_own.is_some() {
+			return;
+		}
+		if controller.le.accepting {
+			if !controller.le.rotate && controller.command(opcode::LE_CREATE_CONNECTION_CANCEL, &[]) {
+				controller.le.rotate = true;
+				controller.le.relist = true;
+			}
+			return;
+		}
+		self.rotate_address(at);
 	}
 
 	// THE STANDING ATTEMPT: every bonded LE peer trusted for input and not connected on the accept list, those with a
@@ -302,8 +346,10 @@ impl Stack {
 		let cross_transport = controller.classic && controller.classic_sc;
 		let options = Options { io: if watcher { IO_KEYBOARD_DISPLAY } else { IO_NO_INPUT_NO_OUTPUT }, legacy, irk, identity, cross_transport };
 		let Some(link) = controller.link_mut(handle) else { return };
-		// SMP authenticates the actual connection addresses, not the identity used to find a bond.
-		let (pairing, first) = smp_pairing::Initiator::start(link.local, connection_peer, if legacy { None } else { public_key }, seed, options);
+		// SMP authenticates the actual connection addresses, not the identity used to find a bond. Secure Connections is
+		// offered wherever this controller can do it, the operator's legacy word included: `options.legacy` admits
+		// legacy only as the fall-back for a peer whose response lacks it.
+		let (pairing, first) = smp_pairing::Initiator::start(link.local, connection_peer, public_key, seed, options);
 		seed.fill(0);
 		link.pairing = Some(pairing);
 		if let Some(attempt) = controller.attempt.as_mut() {

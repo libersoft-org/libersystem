@@ -343,3 +343,31 @@ fn a_completion_arriving_for_a_command_the_reader_has_given_up_on_is_told_apart_
 	torn[14] = 1;
 	assert_eq!(reap(&torn, true, 8), Reaped::Arriving);
 }
+
+#[test]
+fn a_command_the_controller_answered_leaves_the_queue_usable_and_one_it_did_not_needs_a_reset() {
+	// A status is the controller's answer: the queue is in step and only the request fails.
+	assert!(!Fault::Failed { status_type: 0, status_code: 0x0B }.needs_reset());
+	// A command given up on may still be running against the data span, and its completion is still
+	// to land where the next command waits - both end only when the controller is reset.
+	assert!(Fault::Timeout.needs_reset());
+	assert!(Fault::Unexpected { saw: 7, expected: 8, dw2: 0, dw3: 0 }.needs_reset());
+	// A controller that could not be reset was issued nothing, so there is nothing running to end.
+	assert!(!Fault::Down.needs_reset());
+}
+
+#[test]
+fn a_shutdown_is_complete_only_when_the_controller_says_its_processing_is() {
+	assert!(!shutdown_complete(0));
+	// 01b is "shutdown processing occurring", which is not done.
+	assert!(!shutdown_complete(1 << 2));
+	assert!(shutdown_complete(2 << 2));
+	// 11b is reserved, not complete.
+	assert!(!shutdown_complete(3 << 2));
+	// The ready, fatal and other bits do not answer it.
+	assert!(shutdown_complete((2 << 2) | CSTS_READY | (1 << 4)));
+	assert!(!shutdown_complete(CSTS_READY | CSTS_FATAL));
+	// And the notification asked for is the normal one, in the two bits the specification gives it.
+	assert_eq!(CC_SHUTDOWN_NORMAL & CC_SHUTDOWN_MASK, CC_SHUTDOWN_NORMAL);
+	assert_eq!(CC_SHUTDOWN_NORMAL >> 14, 0b01);
+}

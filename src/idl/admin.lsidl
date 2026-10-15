@@ -204,6 +204,8 @@ record admin-probe-effects {
 	dispatches:        u32,
 	@bound(32) digest: list<u8>,
 	generation:        u64,
+	/// The preparations it holds that may still run: neither started nor cancelled, and inside their lifetime.
+	prepared:          u32,
 }
 
 enum admin-probe-fault {

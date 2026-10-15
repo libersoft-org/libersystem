@@ -55,6 +55,20 @@ fn not_granted_bytes() -> Option<Result<BytesAnswer, Error>> {
 	Some(Ok(BytesAnswer { outcome: Outcome::NotGranted, code: 0, bytes: Vec::new() }))
 }
 
+// THE CONTRACT'S BOUNDS, ANSWERED `bounds` HERE. A list past its wire bound is a request the service cannot decode,
+// and an undecodable request closes the connection that sent it - so a call that would carry one is never sent, and
+// is told what the contract says it is: `bounds`. A digest, secret, sealed object or nonce at or under its bound
+// goes, and anything else the service refuses is answered by the service.
+const DIGEST_LEN: usize = 32;
+const MAX_SECRET: usize = 96;
+const MAX_SEALED: usize = 1024;
+const MAX_NONCE: usize = 64;
+
+#[inline(always)]
+fn bounds_bytes() -> Option<Result<BytesAnswer, Error>> {
+	Some(Ok(BytesAnswer { outcome: Outcome::Bounds, code: 0, bytes: Vec::new() }))
+}
+
 impl TpmClient {
 	/// The connections the program received under `TPM`, `TPMMEASURE` and `TPMSEAL`, each zero if it was not given.
 	#[inline(always)]
@@ -97,6 +111,9 @@ impl TpmClient {
 		if self.measure == 0 {
 			return Some(Ok(Status { outcome: Outcome::NotGranted, code: 0 }));
 		}
+		if digest.len() > DIGEST_LEN {
+			return Some(Ok(Status { outcome: Outcome::Bounds, code: 0 }));
+		}
 		unsafe { tpm_pcr_extend(self.measure, &pcr, digest) }
 	}
 
@@ -105,6 +122,9 @@ impl TpmClient {
 	pub fn seal(&mut self, pcr: u32, secret: &[u8]) -> Option<Result<BytesAnswer, Error>> {
 		if self.seal == 0 {
 			return not_granted_bytes();
+		}
+		if secret.len() > MAX_SECRET {
+			return bounds_bytes();
 		}
 		unsafe { tpm_seal(self.seal, &pcr, secret) }
 	}
@@ -115,6 +135,9 @@ impl TpmClient {
 		if self.seal == 0 {
 			return not_granted_bytes();
 		}
+		if sealed.len() > MAX_SEALED {
+			return bounds_bytes();
+		}
 		unsafe { tpm_unseal(self.seal, sealed) }
 	}
 
@@ -123,6 +146,9 @@ impl TpmClient {
 	pub fn quote(&mut self, pcr: u32, nonce: &[u8]) -> Option<Result<QuoteAnswer, Error>> {
 		if self.tpm == 0 {
 			return Some(Ok(QuoteAnswer { outcome: Outcome::NotGranted, code: 0, quote: None }));
+		}
+		if nonce.len() > MAX_NONCE {
+			return Some(Ok(QuoteAnswer { outcome: Outcome::Bounds, code: 0, quote: None }));
 		}
 		unsafe { tpm_quote(self.tpm, &pcr, nonce) }
 	}

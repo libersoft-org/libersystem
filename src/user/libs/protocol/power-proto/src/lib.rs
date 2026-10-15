@@ -4,3 +4,6 @@ extern crate alloc;
 
 pub use wire as codec;
 pub mod generated;
+
+#[cfg(test)]
+mod tests;

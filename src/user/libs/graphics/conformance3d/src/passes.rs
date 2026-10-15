@@ -115,7 +115,7 @@ pub fn depth_stencil_attachment() -> Outcome {
 	let plan = Plan { depth_format: render3d::DepthFormat::Depth24Stencil8, depth_test: Some(render3d::CompareOp::Always), depth_write: true, stencil: Some(face), count: 6, ..Plan::default() };
 	let frame = render(&scene, &plan)?;
 	let (x, y) = frame.centre();
-	require!(close(frame.depth_at(x, y), 0.25), "the depth plane holds the fragment's depth: {}", frame.depth_at(x, y));
+	require!(crate::harness::depth_is(&frame, x, y, 0.25), "the depth plane holds the fragment's depth: {}", frame.depth_at(x, y));
 	require!(frame.stencil_at(x, y) == 6, "and the stencil plane holds the state's reference, which is {}", frame.stencil_at(x, y));
 	Ok(())
 }

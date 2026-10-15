@@ -6,10 +6,11 @@
 // receiver's stream, which `btctl` writes to its output. Nothing here opens a file, and the peer's name for an object
 // is handed on as its words.
 //
-// RECEIVING IS CONSENTED BY THE CALL. While a receiver waits, its peer's page and its channel to this host's Object
-// Push record are admitted (`bt_policy`'s `receive_waits_for_it`), and nobody else's; the first object that peer
-// pushes is the one taken, bounded by the receiver's `max-bytes` (`service_logic::obex::PushServer`), and the receiver
-// ends with it, or after 180 seconds, or when its stream is closed.
+// RECEIVING IS CONSENTED BY THE CALL. While a receiver waits, this host's SDP server offers the Object Push record, and
+// its peer's page and its channel to that record are admitted (`bt_policy`'s `receive_waits_for_it`), and nobody
+// else's; with no receiver the record is withdrawn and the channel refused. The first object that peer pushes is the
+// one taken, bounded by the receiver's `max-bytes` (`service_logic::obex::PushServer`), and the receiver ends with it,
+// or after 180 seconds, or when its stream is closed.
 
 use super::*;
 use proto::system::{ReceivedKind, ReceivedObject, object_push};
@@ -365,6 +366,7 @@ impl Stack {
 	pub(crate) fn receiver_started(&mut self, at: usize, peer: Peer, max_bytes: u64, stream: u64) {
 		self.receivers.push(Receiver { stream, at, peer, server: PushServer::new(max_bytes), transport: None, assembler: Assembler::new(obex::MAX_PACKET), deadline: clock().saturating_add(RECEIVE_TICKS), received: 0, completed: false, disconnecting: false });
 		self.controllers[at].bredr_state.receive_waits = Some(peer);
+		self.controllers[at].bredr_state.sdp.offer(sdp::opp_server(classic::OPP_RECORD, bt_policy::OPP_CHANNEL, None));
 		self.refresh_policy(at);
 	}
 
@@ -467,6 +469,7 @@ impl Stack {
 		let at = receiver.at;
 		if self.controllers.get(at).is_some_and(|controller| controller.bredr_state.receive_waits == Some(receiver.peer)) {
 			self.controllers[at].bredr_state.receive_waits = None;
+			self.controllers[at].bredr_state.sdp.withdraw(classic::OPP_RECORD);
 			self.refresh_policy(at);
 		}
 		let Some(handle) = self.controllers.get(at).and_then(|controller| controller.link_to(&receiver.peer)).map(|link| link.handle) else { return };
@@ -545,10 +548,11 @@ impl Stack {
 		}
 	}
 
-	// AN L2CAP CHANNEL OPENED: a push's, where it is one.
-	pub(crate) fn opp_l2cap_opened(&mut self, at: usize, handle: u16, cid: u16) {
+	// AN L2CAP CHANNEL OPENED: a push's, where it is one - each of its packets one SDU, within the channel's MTU.
+	pub(crate) fn opp_l2cap_opened(&mut self, at: usize, handle: u16, cid: u16, peer_mtu: usize) {
 		let Some(peer) = self.controllers[at].link(handle).map(|link| link.peer) else { return };
 		if let Some(index) = self.pushes.iter().position(|pusher| pusher.at == at && pusher.peer == peer && pusher.transport == Some(Transport::L2cap(cid))) {
+			self.pushes[index].client.limit(peer_mtu);
 			self.push_opened(index);
 		}
 	}

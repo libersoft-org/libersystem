@@ -95,8 +95,31 @@ struct Link {
 	peer: Peer,
 	classic: Option<Classic>,
 }
+// Modeled SDP server boundary: the records offered, by handle and RFCOMM channel.
+#[derive(Default)]
+struct Records(Vec<sdp::Record>);
+impl Records {
+	fn offer(&mut self, record: sdp::Record) {
+		self.0.retain(|held| held.0 != record.0);
+		self.0.push(record);
+	}
+	fn withdraw(&mut self, handle: u32) {
+		self.0.retain(|held| held.0 != handle);
+	}
+	fn offers(&self, channel: u8) -> bool {
+		self.0.iter().any(|record| record.1 == channel)
+	}
+}
+mod sdp {
+	pub struct Record(pub u32, pub u8);
+	pub fn opp_server(handle: u32, channel: u8, goep: Option<u16>) -> Record {
+		assert_eq!(goep, None, "this host's Object Push server is offered on RFCOMM alone");
+		Record(handle, channel)
+	}
+}
 struct Bredr {
 	receive_waits: Option<Peer>,
+	sdp: Records,
 }
 struct Controller {
 	powered: bool,
@@ -181,7 +204,7 @@ impl Stack {
 		bt_policy::decide(bt_policy::inbound_by_channel(bt_policy::OPP_CHANNEL), &standing) == bt_policy::Decision::Accept
 	}
 	fn frame(&mut self, bytes: &[u8]) {
-		let allowed = self.accept(PEER, true);
+		let allowed = self.accept(PEER, true) && self.controllers[0].bredr_state.sdp.offers(bt_policy::OPP_CHANNEL);
 		let mut admit = |channel| if allowed && channel == bt_policy::OPP_CHANNEL { rfcomm::Admission::Accept } else { rfcomm::Admission::Refuse };
 		let out = self.controllers[0].link.classic.as_mut().unwrap().rfcomm.as_mut().unwrap().session.receive(bytes, &mut admit);
 		self.run_rfcomm(0, HANDLE, out);
@@ -199,9 +222,11 @@ struct Exchange {
 impl Exchange {
 	fn new(limit: u64, open: bool) -> Self {
 		BOUNDARY.with_borrow_mut(|b| *b = Boundary { now: 100, ..Boundary::default() });
-		let mut result = Self { stack: Stack { controllers: vec![Controller { powered: true, classic: true, bredr_state: Bredr { receive_waits: None }, link: Link { peer: PEER, classic: Some(Classic { rfcomm: Some(Rfcomm { session: Session::new(false, 256) }) }) } }], receivers: Vec::new(), pushes: Vec::new(), wire: VecDeque::new(), known: true }, peer: Session::new(true, 256), pending: VecDeque::new(), assembler: Assembler::new(obex::MAX_PACKET), responses: Vec::new(), peer_closed: 0 };
+		let mut result = Self { stack: Stack { controllers: vec![Controller { powered: true, classic: true, bredr_state: Bredr { receive_waits: None, sdp: Records::default() }, link: Link { peer: PEER, classic: Some(Classic { rfcomm: Some(Rfcomm { session: Session::new(false, 256) }) }) } }], receivers: Vec::new(), pushes: Vec::new(), wire: VecDeque::new(), known: true }, peer: Session::new(true, 256), pending: VecDeque::new(), assembler: Assembler::new(obex::MAX_PACKET), responses: Vec::new(), peer_closed: 0 };
 		assert_eq!(result.stack.receive_object(0, PEER, limit), Ok(()));
+		assert!(!result.stack.controllers[0].bredr_state.sdp.offers(bt_policy::OPP_CHANNEL), "OPP_RECORD_OFFERED_WITHOUT_RECEIVER");
 		result.stack.receiver_started(0, PEER, limit, STREAM);
+		assert!(result.stack.controllers[0].bredr_state.sdp.offers(bt_policy::OPP_CHANNEL), "OPP_RECORD_NOT_OFFERED");
 		assert_eq!(result.stack.opp_deadline(), Some(100 + 180 * TICKS_PER_SECOND));
 		assert_eq!(result.stack.receive_object(0, PEER, limit), Err(Error::Again));
 		assert!(!result.stack.accept([KIND_BREDR, 6, 5, 4, 3, 2, 1], true));
@@ -302,6 +327,7 @@ impl Exchange {
 		assert_eq!(self.stack.receiver_streams().count(), 0);
 		assert_eq!(self.stack.opp_deadline(), None);
 		assert_eq!(self.stack.controllers[0].bredr_state.receive_waits, None);
+		assert!(!self.stack.controllers[0].bredr_state.sdp.offers(bt_policy::OPP_CHANNEL), "OPP_RECORD_NOT_WITHDRAWN");
 		assert!(!self.stack.accept(PEER, true));
 		assert!(self.stack.opp_rfcomm_channels(0, HANDLE).is_empty());
 		BOUNDARY.with_borrow(|b| assert!(b.closed));

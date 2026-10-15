@@ -1172,8 +1172,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		Err(answer) => driver.say(&format!("Get Device ID was not answered - {answer:?}; the BMC is looked for again every ten seconds")),
 	}
-	driver.read_repository();
-	// THE WATCHDOG, on every form but SSIF: what the last reset was, and a timer found running taken over.
+	// THE WATCHDOG, on every form but SSIF: what the last reset was, and a timer found running taken over - AT ONCE, before
+	// the repository is read. A timer left running for the firmware or a previous driver is petted now and fed from
+	// here on: every transaction the repository read makes serves its pets first, so a long repository behind a slow
+	// interface is read under a fed watchdog instead of racing its countdown.
 	if !ssif_form {
 		match ipmi_bmc::data(&mut driver, &ipmi::watchdog::get()).ok().and_then(|bytes| ipmi::watchdog::state(&bytes)) {
 			Some(state) => {
@@ -1198,6 +1200,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => driver.say("its watchdog did not answer Get Watchdog Timer - none is published"),
 		}
 	}
+	driver.read_repository();
 	// THE PUBLICATIONS.
 	let mut offers: Vec<(u16, u16, u64, &[u8])> = alloc::vec![(TOKEN_IPMI, driver_protocol::provider::IPMI, 0, driver_protocol::provider::IPMI_NAME)];
 	if !driver.zones.is_empty() {

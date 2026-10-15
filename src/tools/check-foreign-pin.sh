@@ -16,6 +16,14 @@
 #                             than a missing header on all three targets. That claim is re-checked
 #                             against the recorded upstream when the sources are present, and is
 #                             reported as unverifiable when they are not - never assumed.
+#   what the build reads      (2026-10-15) the lockfile is not only checked against the tree, it is
+#                             what the builds read - so the tools that run must print the version
+#                             lines it pins, its [build] must be one the builder can follow, the
+#                             licences its upstreams are taken under must be in the reviewed set, and
+#                             with the archives present the builder's own lockfile check runs for
+#                             both trees on all three targets: the trees derived from the archives and
+#                             the series, every pinned option's effect, the source list, the generated
+#                             sources and the cross files.
 #
 # THE UPSTREAM IS AUDIT-ONLY AND CONTENT-ADDRESSED, not vendored. It lives under `.build/` where the
 # archives were placed once, by a person. This check therefore has two modes and says which it ran:
@@ -217,6 +225,46 @@ if derived_path.is_file():
 	if static_state != "present":
 		failures.append("derived: the derived part exists and the static-target part does not - it has frozen values derived from something unfrozen")
 
+# 6. THE TOOLS THAT RUN ARE THE ONES PINNED, by the version line each prints. The builder refuses a
+#    compiler or archiver that differs and the audit link a linker that does; this says so even on a
+#    run that builds nothing. The linker is the one the repository root's toolchain provides, which
+#    is where both the image build and the audit link find it.
+import shutil
+import subprocess
+
+
+def version_line(command, **kwargs):
+	result = subprocess.run(command, capture_output=True, text=True, **kwargs)
+	return result.stdout.splitlines()[0] if result.returncode == 0 and result.stdout else ""
+
+
+toolchain = pin["toolchain"]
+for role in ("compiler", "archiver"):
+	if not shutil.which(toolchain[role]):
+		failures.append(f"toolchain: the pinned {role} {toolchain[role]} is not installed")
+	elif version_line([toolchain[role], "--version"]) != toolchain[f"{role}_version"]:
+		failures.append(f"toolchain: {toolchain[role]} is '{version_line([toolchain[role], '--version'])}' and the lockfile pins '{toolchain[f'{role}_version']}'")
+sysroot_line = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True, cwd=root)
+linkers = sorted(pathlib.Path(sysroot_line.stdout.strip()).rglob(toolchain["linker"])) if sysroot_line.returncode == 0 else []
+if not linkers:
+	failures.append(f"toolchain: no {toolchain['linker']} in the toolchain the repository root selects")
+elif version_line([str(linkers[0]), "-flavor", "gnu", "--version"]) != toolchain["linker_version"]:
+	failures.append(f"toolchain: {linkers[0]} is '{version_line([str(linkers[0]), '-flavor', 'gnu', '--version'])}' and the lockfile pins '{toolchain['linker_version']}'")
+
+# 7. THE BUILD IS ONE THE BUILDER CAN FOLLOW. It reads these three values and nothing else decides
+#    how the pinned configuration is optimised.
+build = pin.get("build", {})
+if not str(build.get("optimisation", "")).startswith("-O") or build.get("assertions") not in ("live", "off") or build.get("debug_info") not in ("none", "full"):
+	failures.append(f"build: the bootstrap part's [build] is {build} - it needs an -O optimisation, assertions live or off, and debug_info none or full")
+
+# 8. THE PINNED UPSTREAMS ARE TAKEN UNDER REVIEWED LICENCES. The same list the dependency gate and the
+#    system manifest read; the audit-only upstream is under the same review as anything else that
+#    enters the tree.
+reviewed = [line for line in (root / "src/tools/system-manifest/src/reviewed-licences.txt").read_text().splitlines() if line and not line.startswith("#")]
+for name, entry in pin["upstream"].items():
+	if entry.get("licence") not in reviewed:
+		failures.append(f"{name}: taken under {entry.get('licence')!r}, which is not in the reviewed permissive set")
+
 for line in failures:
 	print(f"foreign-pin: {line}", file=sys.stderr)
 if failures:
@@ -247,6 +295,19 @@ if [[ -f src/foreign/INVENTORY-pass1.json ]]; then
 	else
 		note "the pass-1 inventory is recorded and its archives are not built, so it was NOT regenerated on this run"
 	fi
+fi
+
+# WHAT THE BUILD READS, CHECKED WHERE IT IS READ. With the archives present the builder derives the
+# trees from them and the pinned series and holds its own configuration to the bootstrap part, for
+# both trees on all three targets, and compiles nothing. Without them that half is named as not run.
+if compgen -G ".build/foreign/vulkan-loader-*.tar.gz" >/dev/null && compgen -G ".build/foreign/vulkan-headers-*.tar.gz" >/dev/null; then
+	for arch in x86_64 aarch64 riscv64; do
+		"$HERE/build-foreign-static.sh" --arch "$arch" --check-lockfile >/dev/null || fail "$arch: the pinned tree's configuration is not the lockfile's"
+		"$HERE/build-foreign-static.sh" --arch "$arch" --ported --check-lockfile >/dev/null || fail "$arch: the ported tree's configuration is not the lockfile's"
+	done
+	note "the builder reads the lockfile: both trees are the derivation of the pinned archives and series, and their configuration is the pinned one, on all three targets"
+else
+	note "the pinned upstream archives are not staged, so the builder's configuration was NOT checked against the lockfile on this run"
 fi
 
 note "the freeze order holds: the policy precedes the pin, and the pin matches the tree"

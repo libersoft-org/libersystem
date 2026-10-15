@@ -15,6 +15,8 @@
 //                      SDP client and RFCOMM finding and opening a serial port, credits flowing both ways; sniff
 //   btclassic reuse    after a restart or a cold reboot: the trusted keyboard pages, and the link is secured with
 //                      the stored key - which the fixture reports - without pairing again
+//   btclassic knob     the keyboard's link encrypted with a one-octet key is disconnected before its channel opens;
+//                      at sixteen octets it is kept
 //   btclassic serial   the serial device aliased `serial-1` and trusted for the serial port, for `btserial`'s grant
 //   btclassic transfer the phone and the serial device bonded for the file pushes, and a push the phone tries with no
 //                      receiver waiting refused
@@ -22,6 +24,8 @@
 //   btclassic tether held|up  the PAN link `btctl connect` asked for: up on both sides, and held by NetworkService - no
 //                      lease asked - or taken as the uplink, the phone's address leased
 //   btclassic forget   the keyboard forgotten: this host no longer takes its page
+//   btclassic stall    the fixture answers a send twenty seconds late: the service gives it up within five, ends the
+//                      session and answers meanwhile; after the fixture's reset the controller comes back and scans
 //   btclassic input    the keyboard paired, trusted for input, reconnecting its HID channels, its report descriptor
 //                      read from its record, and connected for input; then it is told to type, after this probe has
 //                      ended: `btclassic typed` at the prompt, Ctrl+Alt+Delete and its Power key, and `btclassic alive`
@@ -34,8 +38,10 @@
 //                      under the identity it gave with its resolving key, its battery level in its status; the display by Passkey Entry this host
 //                      types and then shows for the same peer set to KeyboardOnly; an actual SC Just Works downgrade
 //                      refused with the original authenticated key reused; the remote refused until `pair-legacy`, then bonded at the legacy level with its EDIV and
-//                      Rand; three LE links at once; this host's name read through its attribute server; and the tag
-//                      and the remote reconnecting through the accept list, the tag resolved, each on its stored key
+//                      Rand; the display, forgotten, bonded by `pair-legacy` at Secure Connections, which it offers;
+//                      three LE links at once; this host's name read through its attribute server; and the tag
+//                      and the remote reconnecting through the accept list, the tag resolved, each on its stored key -
+//                      one after the other, and both after leaving at once
 //   btclassic audio    music: the headset connected for audio streams what AudioService plays - the fixture hears
 //                      SBC at the configuration both support with every CRC good and the tone in its subband - its
 //                      delay is in the latency, its level goes both ways and its play button is answered not
@@ -697,6 +703,33 @@ fn reuse(probe: &mut Probe) {
 	print(b"btclassic: PASS reuse\n");
 }
 
+// KNOB: THE KEYBOARD'S LINK ENCRYPTED WITH A ONE-OCTET KEY, under its Secure Connections bond - what a radio attacker
+// can make of LMP's unauthenticated key-size negotiation. This host asks the key's length before the link counts as
+// encrypted, and drops a link whose key is shorter than its link key promises; nothing waiting for encryption opens.
+fn knob(probe: &mut Probe) {
+	probe.ready();
+	probe.act(KEYBOARD, FixtureAction::KeySize, 1);
+	probe.page(KEYBOARD);
+	probe.expect("this host did not take the keyboard's page", 3 * TICKS, |line| line.starts_with("accepted keyboard"));
+	probe.act(KEYBOARD, FixtureAction::OpenPsm, 0x0011);
+	probe.expect("the keyboard's link was not encrypted", 5 * TICKS, |line| line == "encrypted keyboard");
+	probe.expect("this host kept a link encrypted with a one-octet key", 5 * TICKS, |line| line.starts_with("disconnected by the host keyboard"));
+	if probe.saw(TICKS, |line| line.starts_with("l2cap keyboard channel") && line.ends_with(" open")) {
+		fail("a channel opened on a link encrypted with a one-octet key");
+	}
+	// And at its full length the same bond is used as before.
+	probe.act(KEYBOARD, FixtureAction::KeySize, 16);
+	probe.page(KEYBOARD);
+	probe.expect("this host did not take the keyboard's page again", 3 * TICKS, |line| line.starts_with("accepted keyboard"));
+	probe.act(KEYBOARD, FixtureAction::OpenPsm, 0x0011);
+	probe.expect("the keyboard's link was not encrypted again", 5 * TICKS, |line| line == "encrypted keyboard");
+	if probe.saw(2 * TICKS, |line| line.starts_with("disconnected by the host keyboard")) {
+		fail("this host dropped a link encrypted with a full-length key");
+	}
+	probe.act(KEYBOARD, FixtureAction::Disconnect, 0);
+	print(b"btclassic: PASS knob\n");
+}
+
 // ------------------------------------------------------------------ input
 
 fn input(probe: &mut Probe) {
@@ -1073,6 +1106,29 @@ fn le(probe: &mut Probe) {
 	}
 	say("LE legacy: refused until pair-legacy, then a passkey bond at the legacy level; never over a Secure Connections bond");
 
+	// PAIR-LEGACY STILL OFFERS SECURE CONNECTIONS: legacy is the fall-back for a device without it. The display - which
+	// has it, and refuses a request that does not offer it - is forgotten and paired again by pair-legacy.
+	if !matches!(probe.operator().forget(&0, &identity_of(DISPLAY)), Some(Ok(()))) {
+		fail("forgetting the display was refused");
+	}
+	le_wait_disconnected(probe, &identity_of(DISPLAY));
+	if !matches!(probe.operator().pair_legacy(&0, &identity_of(DISPLAY)), Some(Ok(()))) {
+		fail("pair-legacy was refused for the forgotten display");
+	}
+	let prompt = probe.prompt("the display's pair-legacy raised no prompt", 10 * TICKS);
+	if prompt.question != PromptQuestion::ShowPasskey {
+		fail("the display's pair-legacy did not show a passkey to type on it");
+	}
+	probe.answer(&prompt, PromptReply::Yes);
+	if probe.act(DISPLAY, FixtureAction::TypePasskey, prompt.value) != 0 || probe.settle(15 * TICKS) != PairingState::Bonded {
+		fail("pair-legacy did not bond the display, which offers Secure Connections");
+	}
+	match probe.bond(DISPLAY) {
+		Some(bond) if bond.level.agreement == KeyAgreement::SecureConnections && bond.level.authenticated => {}
+		_ => fail("pair-legacy bonded the display below Secure Connections, which it supports"),
+	}
+	say("pair-legacy offered Secure Connections, and a device that has it bonded with it");
+
 	// SEVERAL LE LINKS AT ONCE, and this host's attribute server.
 	let connected = match probe.operator().devices(&0) {
 		Some(Ok(devices)) => devices.into_iter().filter(|device| device.radio == Radio::Le && device.connected).count(),
@@ -1104,6 +1160,15 @@ fn le(probe: &mut Probe) {
 		fail("the remote reconnected on a key other than the one it gave");
 	}
 	say("the tag and the remote reconnected through the accept list, the tag resolved by its key, each encrypted on its stored key");
+	// BOTH GONE AT ONCE, BOTH BACK. The second to leave goes onto a new list beside the first, and the attempt that ends
+	// with the first device it connects is taken up again for the other: the remote must not wait for the tag to leave.
+	probe.act(TAG, FixtureAction::Disconnect, 0);
+	probe.act(REMOTE, FixtureAction::Disconnect, 0);
+	probe.take("the tag did not come back when both left at once", 10 * TICKS, |line| line == "connected tag - the host from its random address");
+	probe.take("the remote did not come back when both left at once", 10 * TICKS, |line| line == "connected remote - the host from its random address");
+	probe.take("the tag's link was not encrypted when both came back", 5 * TICKS, |line| line.starts_with("encrypted tag with key "));
+	probe.take("the remote's link was not encrypted when both came back", 5 * TICKS, |line| line.starts_with("encrypted remote with key "));
+	say("the tag and the remote left at once and both came back through the accept list");
 	// THE TAG, NAMED FOR APPLICATIONS: an alias, and trust for GATT - what `btgatt`'s grant is checked against.
 	if !matches!(probe.operator().alias(&0, &identity_of(TAG), "tag-1"), Some(Ok(()))) {
 		fail("the tag could not be aliased");
@@ -1941,7 +2006,7 @@ fn serial(probe: &mut Probe) {
 // ------------------------------------------------------------------ transfer
 
 // THE PEERS OF THE FILE PUSHES: the phone bonded by Numeric Comparison, the serial device by Just Works - and a push the
-// phone tries with no receiver waiting refused at this host's door.
+// phone tries with no receiver waiting finding no Object Push record, and refused at this host's door.
 fn transfer(probe: &mut Probe) {
 	probe.ready();
 	let handle = match probe.read().scan(&0, &3000) {
@@ -1969,10 +2034,12 @@ fn transfer(probe: &mut Probe) {
 		}
 	}
 	say("the phone and the serial device are bonded");
-	// NO RECEIVER WAITING: the phone's push is refused before a byte of it.
+	// NO RECEIVER WAITING: this host's records offer no Object Push, and the phone's push - which opens the channel
+	// whatever its search found - is refused before a byte of it.
 	probe.act(PHONE, FixtureAction::PushObject, 100);
+	probe.expect("this host offered Object Push with no receiver waiting", 10 * TICKS, |line| line == "sdp phone found 0 records for 0x1105");
 	probe.expect("a push with no receiver waiting was not refused", 10 * TICKS, |line| line.starts_with("phone's push was refused"));
-	say("a push with no receiver waiting was refused");
+	say("with no receiver waiting, this host offered no Object Push record and a push was refused");
 	print(b"btclassic: PASS transfer\n");
 }
 
@@ -2027,6 +2094,45 @@ fn forget(probe: &mut Probe) {
 	print(b"btclassic: PASS forget\n");
 }
 
+// ------------------------------------------------------------------ stall
+
+// A CONTROLLER THAT STOPS TAKING PACKETS DOES NOT PARK THIS HOST. The fixture answers BluetoothService's next send
+// twenty seconds late: the service gives the send up within its five-second deadline and ends the controller's session,
+// and a call made meanwhile is answered long before the late answer comes. Then the fixture resets the controller: the
+// late answer is dropped rather than read as a later send's, and the controller comes back and scans.
+fn stall(probe: &mut Probe) {
+	probe.ready();
+	probe.act(0, FixtureAction::WithholdSend, 20);
+	let started = clock();
+	// A SCAN SENDS AT ONCE, so the held send is this one's or one just before it.
+	let _ = probe.read().scan(&0, &1000);
+	let answered = probe.operator().devices(&0).is_some();
+	let waited = clock().saturating_sub(started);
+	if !answered || waited >= 10 * TICKS {
+		fail(&format!("the service answered {waited} ticks after its controller stopped taking packets; a send is given up after five seconds"));
+	}
+	match probe.read().controllers() {
+		Some(Ok(controllers)) if controllers.first().is_some_and(|controller| !controller.powered) => {}
+		_ => fail("the controller that stopped taking packets still reads as powered"),
+	}
+	say(&format!("the controller stopped taking packets; the service gave the send up, ended the session and answered after {waited} ticks"));
+	probe.expect("the fixture never answered the held send", 25 * TICKS, |line| line == "the controller answered the held send late, and was reset");
+	probe.ready();
+	let handle = match probe.read().scan(&0, &3000) {
+		Some(Ok(handle)) => handle,
+		_ => fail("the scan after the reset was refused"),
+	};
+	let deadline = clock() + 6 * TICKS;
+	while clock() < deadline && !matches!(probe.read().results(&handle), Some(Ok(results)) if results.iter().any(|result| result.address == address_of(PHONE))) {
+		sleep_until(clock() + TICKS / 4);
+	}
+	if !matches!(probe.read().results(&handle), Some(Ok(results)) if results.iter().any(|result| result.address == address_of(PHONE))) {
+		fail("the controller that came back did not hear the phone");
+	}
+	say("the controller was reset and came back, the late answer dropped, and its scan heard the phone");
+	print(b"btclassic: PASS stall\n");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 256];
@@ -2048,7 +2154,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		"pair" => pair(&mut probe),
 		"policy" => policy(&mut probe),
 		"reuse" => reuse(&mut probe),
+		"knob" => knob(&mut probe),
 		"forget" => forget(&mut probe),
+		"stall" => stall(&mut probe),
 		"input" => input(&mut probe),
 		"gamepad" => gamepad(&mut probe),
 		"le" => le(&mut probe),
@@ -2065,7 +2173,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// TYPED AT THE PROMPT BY THE BLUETOOTH KEYBOARD: that this ran is the claim.
 		"typed" => print(b"btclassic: PASS typed - this command was typed by the Bluetooth keyboard\n"),
 		"alive" => print(b"btclassic: PASS alive - the machine still runs after the keyboard's Ctrl+Alt+Delete and Power key\n"),
-		_ => fail("usage: btclassic pair|policy|reuse|forget|input|typed|alive|gamepad|le|ctkd|audio|voice|leaudio|broadcast|serial|transfer|push BYTES|tether held|tether up"),
+		_ => fail("usage: btclassic pair|policy|reuse|knob|forget|stall|input|typed|alive|gamepad|le|ctkd|audio|voice|leaudio|broadcast|serial|transfer|push BYTES|tether held|tether up"),
 	}
 	probe.unwatch();
 	exit();

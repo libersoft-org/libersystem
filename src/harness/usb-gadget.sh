@@ -57,6 +57,10 @@ PRODUCT_ID=0104
 # The MIDI function is the one that reaches past the gadget stack: it is an ALSA card as well, so the sound
 # core's raw MIDI modules come with it - named here so a run that loaded them is the run that unloads them.
 ALL_MODULES=(udc_core libcomposite dummy_hcd u_serial usb_f_acm usb_f_hid usb_f_uac2 usb_f_printer snd_seq_device snd_rawmidi usb_f_midi usb_f_fs)
+# THE NETWORK FUNCTION'S MODULES, LOADED ONLY FOR THE KIND THAT USES THEM. Every other kind's run would otherwise load and
+# unload two more modules in the host's kernel for nothing - and module operations are the part of this harness that has
+# hurt the host before. Recorded in the same ledger as the others when a run does load them.
+NCM_MODULES=(u_ether usb_f_ncm)
 
 say() {
 	echo "usb-gadget: $*" >&2
@@ -150,7 +154,12 @@ plan_for() {
 	mbim) printf 'gadgetfs mbim\n' ;;
 	# And a video camera streaming over bulk.
 	uvc) printf 'gadgetfs uvc\n' ;;
-	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, hid-gamepad-pair, uac2, printer, midi, midi-echo, ups, monitor, consumer-keys, ccid, dfu, bt, mbim, uvc" ;;
+	# A CDC-NCM ETHERNET ADAPTER, the kernel's own `usb_f_ncm`: an NCM implementation this tree did not write, whose
+	# parser reads the transfer blocks the guest builds and whose packer builds the ones the guest splits. Its host side
+	# is a network interface, brought up bare after the bind, and `ncm-peer.py` answers on it at the Ethernet level - see
+	# `start_ncm_peer`.
+	ncm) printf 'c.1 ncm.usb0 ncm-peer\n' ;;
+	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, hid-gamepad-pair, uac2, printer, midi, midi-echo, ups, monitor, consumer-keys, ccid, dfu, bt, mbim, uvc, ncm" ;;
 	esac
 }
 
@@ -309,6 +318,7 @@ cmd_setup() {
 	# A GADGETFS DEVICE uses only its whole-device stack, not configfs function modules.
 	local modules_wanted=("${ALL_MODULES[@]}")
 	[[ "$plan" != gadgetfs* ]] || modules_wanted=(udc_core dummy_hcd gadgetfs)
+	[[ "$kind" != ncm ]] || modules_wanted+=("${NCM_MODULES[@]}")
 	local module
 	for module in "${modules_wanted[@]}"; do
 		module="${module//-/_}"
@@ -382,6 +392,12 @@ cmd_setup() {
 		refuse "$udc would not take this gadget - either something else is binding to it, or $kind is a function this controller cannot carry (the kernel log says which)"
 	fi
 
+	# AND THE FAR END OF A FUNCTION WHOSE HOST SIDE IS A NETWORK INTERFACE, which exists only once the gadget is bound.
+	while read -r config function_name shape; do
+		[[ "$shape" == ncm-peer ]] || continue
+		start_ncm_peer "$dir" "$function_name"
+	done <<<"$plan"
+
 	say "$kind is bound to $udc as $name ($VENDOR_ID:$PRODUCT_ID)"
 	printf '%s:%s\n' "$VENDOR_ID" "$PRODUCT_ID"
 	trap - EXIT
@@ -427,6 +443,13 @@ configure_function() {
 	# bound before that is refused by the kernel, so the setup waits for them - and refuses if they never come.
 	ffs-*)
 		start_functionfs "$function_name" "${shape#ffs-}"
+		;;
+	# TWO ADDRESSES THE ORACLE KNOWS, rather than the random pair the function would make up: the one it publishes for
+	# the host's side of the link - the guest's MAC, read from the Ethernet descriptor's string - and the one its own
+	# interface on this host answers from. Both locally administered.
+	ncm-peer)
+		write_attr "$dir/functions/$function_name/host_addr" 02:4c:53:00:4e:01
+		write_attr "$dir/functions/$function_name/dev_addr" 02:4c:53:00:4e:02
 		;;
 	hid-touch | hid-gamepad | hid-ups | hid-monitor | hid-consumer)
 		write_attr "$dir/functions/$function_name/protocol" 0
@@ -627,12 +650,54 @@ start_gadgetfs() {
 	refuse "the $emulate emulator never wrote its descriptors"
 }
 
+# THE FAR END OF THE NETWORK FUNCTION: the interface `usb_f_ncm` makes on this host, brought up BARE, and `ncm-peer.py`
+# answering on it at the Ethernet level.
+#
+# THE INTERFACE IS THIS RUN'S, which is what lets it be touched at all: it is the net device of the function directory
+# this run made, named by that directory's own `ifname`, and it leaves the host with the directory. Nothing else of the
+# host's network changes - no address, no route - and two settings of THIS interface are made before it comes up: IPv6
+# off, so the host's own stack neither keeps an address for it nor sends anything down the cable (a duplicate-address
+# check, a router solicitation, a listener report) for the guest to read; and IPv4 forwarding off, so a host that
+# forwards between its interfaces - this one does, by default, for every new one - never routes what the guest sends
+# onto its own networks. The interface has to be UP all the same: the function queues nothing to receive the guest's
+# frames into until its interface is.
+#
+# AFTER THE BIND AND NOT BEFORE, because the function registers its net device when the gadget binds - before that the
+# attribute names no interface - and udev may still be renaming it, which the settle waits out.
+start_ncm_peer() {
+	local dir="$1" function_name="$2"
+	udevadm settle --timeout=10 >/dev/null 2>&1 || true
+	local ifname
+	ifname="$(cat "$dir/functions/$function_name/ifname" 2>/dev/null || true)"
+	[[ -n "$ifname" && -e "/sys/class/net/$ifname" ]] || refuse "the NCM function names no network interface on this host ('$ifname')"
+	if [[ -e "/proc/sys/net/ipv6/conf/$ifname/disable_ipv6" ]]; then
+		printf '1\n' >"/proc/sys/net/ipv6/conf/$ifname/disable_ipv6" || refuse "IPv6 would not turn off on $ifname, so it is not brought up"
+	fi
+	if [[ -e "/proc/sys/net/ipv4/conf/$ifname/forwarding" ]]; then
+		printf '0\n' >"/proc/sys/net/ipv4/conf/$ifname/forwarding" || refuse "IPv4 forwarding would not turn off on $ifname, so it is not brought up"
+	fi
+	ip link set dev "$ifname" up || refuse "$ifname would not come up"
+	local ready="$STATE_DIR/ncm-peer.ready"
+	printf '%s\n' "$ready" >>"$(state_file mounts)"
+	python3 "$(dirname "${BASH_SOURCE[0]}")/ncm-peer.py" --interface "$ifname" --ready "$ready" >/dev/null &
+	printf '%s\n' "$!" >>"$(state_file emulators)"
+	local attempt
+	for attempt in $(seq 1 100); do
+		if [[ -e "$ready" ]]; then
+			say "ncm-peer.py answers on $ifname, which carries no address"
+			return 0
+		fi
+		sleep 0.1
+	done
+	refuse "ncm-peer.py never started listening on $ifname"
+}
+
 stop_emulators() {
 	local pid
 	while read -r pid; do
 		[[ -n "$pid" ]] || continue
 		# OURS BY WHAT IT IS RUNNING, not by a number that may have been reused.
-		if grep -qaE "usb_ffs.py|usb_gadgetfs.py" "/proc/$pid/cmdline" 2>/dev/null; then
+		if grep -qaE "usb_ffs.py|usb_gadgetfs.py|ncm-peer.py" "/proc/$pid/cmdline" 2>/dev/null; then
 			kill "$pid" 2>/dev/null || true
 			local attempt
 			for attempt in $(seq 1 50); do
@@ -647,7 +712,7 @@ stop_emulators() {
 unmount_functionfs() {
 	local mount
 	while read -r mount; do
-		[[ -n "$mount" && ("$mount" == "$STATE_DIR"/ffs-* || "$mount" == "$STATE_DIR"/gadgetfs*) ]] || continue
+		[[ -n "$mount" && ("$mount" == "$STATE_DIR"/ffs-* || "$mount" == "$STATE_DIR"/gadgetfs* || "$mount" == "$STATE_DIR"/ncm-peer.ready) ]] || continue
 		# The emulator's ready file, which this script named in its own state directory.
 		if [[ "$mount" == *.ready ]]; then
 			rm -f "$mount"
@@ -758,7 +823,7 @@ setup)
 teardown) cmd_teardown ;;
 verify) cmd_verify ;;
 *)
-	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|hid-gamepad-pair|uac2|printer|midi|midi-echo|ups|monitor|consumer-keys|ccid|dfu|bt|mbim|uvc> | teardown | verify" >&2
+	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|hid-gamepad-pair|uac2|printer|midi|midi-echo|ups|monitor|consumer-keys|ccid|dfu|bt|mbim|uvc|ncm> | teardown | verify" >&2
 	exit 2
 	;;
 esac

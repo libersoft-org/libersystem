@@ -487,7 +487,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	match words.next().unwrap_or("") {
 		"effects" => {
 			let effects = probe.effects();
-			say(&format!("effects writes {} dispatches {} generation {}", effects.writes, effects.dispatches, effects.generation));
+			say(&format!("effects writes {} dispatches {} generation {} prepared {}", effects.writes, effects.dispatches, effects.generation, effects.prepared));
+		}
+		// WHAT IS STILL PREPARED AT THE EXECUTOR after every ending the scenario has driven: a grant that expired
+		// unused, a consumption held across its owner's death, a decline - each releases what it prepared. The one
+		// preparation that may still be held is the restarted service's orphan, which nothing is left to release
+		// and which the executor reclaims when its lifetime passes. More than that is a slot nobody will free.
+		"slots" => {
+			let effects = probe.effects();
+			if effects.prepared > 1 {
+				fail(&format!("slots: the executor still holds {} preparations that will never run", effects.prepared));
+			}
+			say(&format!("PASS slots: the executor holds {} preparation(s), at most the restarted service's orphan", effects.prepared));
 		}
 		"unavailable" => {
 			let before = probe.effects();
@@ -541,7 +552,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		"delegate" => delegate(&probe, words.next() == Some("live")),
 		"hold" => hold(&probe, words.next() == Some("consumption")),
 		"journal" => journal(&probe),
-		_ => fail("usage: admincheck effects | unavailable | forged | wrong-target | storage | request CASE | delegate dead|live | hold approval|consumption | journal"),
+		_ => fail("usage: admincheck effects | slots | unavailable | forged | wrong-target | storage | request CASE | delegate dead|live | hold approval|consumption | journal"),
 	}
 	exit();
 }

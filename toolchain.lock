@@ -136,6 +136,13 @@ url = "https://www.unicode.org/Public/17.0.0/ucd/BidiBrackets.txt"
 sha256 = "dadbaf38a0d0246e5b805bf8725cb81b7c621f93d030595635f5ba2c2f179428"
 cache = ".build/ucd/17.0.0/BidiBrackets.txt"
 
+[ucd_bidi_mirroring]
+purpose = "Bidi_Mirroring_Glyph, which rule L4 answers from - the bracket pairs alone leave < > « » ≤ ≥ and every other mirrored character facing the wrong way in right-to-left text"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/BidiMirroring.txt"
+sha256 = "a2f16fb873ab4fcdf3221cb1a8a85a134ddd6ed03603181823ff5206af3741ce"
+cache = ".build/ucd/17.0.0/BidiMirroring.txt"
+
 [ucd_bidi_test]
 purpose = "the NORMATIVE bidi conformance file, by class sequence - every ordering the algorithm must produce"
 version = "17.0.0"

@@ -83,7 +83,9 @@ pub fn apply(table: Table, kind: u16, subtable: Reader<'_>, buffer: &mut Buffer,
 
 /// The nested applications a rule carries, read from a rule table positioned after its input.
 fn nested_of(table: Table, rule: Reader<'_>, at: usize, count: usize) -> Result<Vec<Nested>, Error> {
+	// THE COUNT IS THE FONT'S, so the storage for it is asked for rather than assumed.
 	let mut out = Vec::new();
+	out.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
 	for index in 0..count {
 		let offset = at.checked_add(index.checked_mul(4).ok_or_else(|| bad(table))?).ok_or_else(|| bad(table))?;
 		let mut reader = rule;

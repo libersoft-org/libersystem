@@ -133,7 +133,7 @@ struct WitnessView<'a> {
 impl admin_probe_witness::Service for WitnessView<'_> {
 	fn effects(&mut self) -> Result<AdminProbeEffects, Error> {
 		let fixture = &*self.fixture;
-		Ok(AdminProbeEffects { writes: fixture.writes, dispatches: fixture.dispatches, digest: fixture.digest.clone(), generation: fixture.generation })
+		Ok(AdminProbeEffects { writes: fixture.writes, dispatches: fixture.dispatches, digest: fixture.digest.clone(), generation: fixture.generation, prepared: fixture.operations.live(clock()) as u32 })
 	}
 
 	// THE TARGET IS REPLACED: every preparation against the old generation fails revalidation and its start.

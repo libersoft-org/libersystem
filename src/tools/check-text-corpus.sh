@@ -51,11 +51,14 @@ trap 'rm -rf "$work"' EXIT
 # A PRIVATE TREE WITH THE SAME SHAPE, because the crates reach each other by relative path and the
 # tool finds the corpus by walking up to `product.conf`. Copying the layout rather than rewriting the
 # manifests keeps the mutated build identical to the real one in everything but the one line.
-mkdir -p "$work/src/user/libs" "$work/src/boot" "$work/src/tools" "$work/src/tests"
+mkdir -p "$work/src/user/libs" "$work/src/boot" "$work/src/tools" "$work/src/tests" "$work/src/user/apps/tools/src/textconf"
 cp -r src/user/libs/text "$work/src/user/libs/text"
 cp -r src/boot/protocol "$work/src/boot/protocol"
 cp -r src/tools/text-corpus "$work/src/tools/text-corpus"
 cp -r src/tests/fonts "$work/src/tests/fonts"
+# THE AUTHORED CASES live beside the guest program that compiles them too, and the gate includes them
+# from there - so the private tree carries that one file, at the same relative place.
+cp src/user/apps/tools/src/textconf/corpus.rs "$work/src/user/apps/tools/src/textconf/corpus.rs"
 cp product.conf "$work/product.conf"
 
 # A mutation that matches nothing is a gate that stopped testing what it names, so a miss is an error

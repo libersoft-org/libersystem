@@ -138,6 +138,11 @@ fn status(admin: u64) {
 		let trip = |name: &str, value: Option<u32>| value.map(|value| format!(", {name} {}", celsius(value))).unwrap_or_default();
 		let passive = if zone.passive_engaged { format!(" - passive cooling engaged, its processors held to {} %", zone.cap_percent) } else { String::new() };
 		say(&format!("  {}: {}{}{}{}{passive}", zone.zone, celsius(zone.temperature), trip("_PSV", zone.passive), trip("_HOT", zone.hot), trip("_CRT", zone.critical)));
+		// THE ACTIVE TRIPS, which the fans and the curve act on: each `_ACx` with the fans its `_ALx` lists.
+		for active in &zone.active {
+			let fans = if active.devices.is_empty() { String::from("no fan listed") } else { active.devices.join(", ") };
+			say(&format!("    _AC{}: {} - {fans}", active.level, celsius(active.temperature)));
+		}
 	}
 	if status.fans.is_empty() {
 		say("fans: none");

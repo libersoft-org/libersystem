@@ -1582,6 +1582,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut shadow_reported = false;
 	let mut presented: u32 = 0;
 	let mut rebuilt: u32 = 0;
+	// WHAT A RESIZE COSTS, measured apart from the steady frames as the floor says it is: the allocations each rebuild of
+	// the surface and the scene's targets made, the most one made and all of them together.
+	let mut rebuild_allocations_max: u64 = 0;
+	let mut rebuild_allocations_total: u64 = 0;
 	/// How many acquires in a row may answer nothing before the display is taken to have gone.
 	///
 	/// A NUMBER AND NOT A DEADLINE, because what this counts is TURNS OF A LOOP THAT PACED ITSELF:
@@ -1630,6 +1634,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				continue;
 			}
 			Step::Rebuild => {
+				let rebuild_began = heap_allocation_count();
 				match frames.rebuild() {
 					Some(Ok(rebuilt_to)) => {
 						rebuilt += 1;
@@ -1658,6 +1663,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						break;
 					}
 				}
+				let rebuild_allocations = heap_allocation_count().saturating_sub(rebuild_began);
+				rebuild_allocations_max = rebuild_allocations_max.max(rebuild_allocations);
+				rebuild_allocations_total += rebuild_allocations;
+				// The next steady frame's loop count starts after the rebuild, which is not one of its own.
+				previous_allocations = heap_allocation_count();
 				continue;
 			}
 		}
@@ -1885,6 +1895,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	line.push(b"\n");
 	print(line.as_bytes());
 	if controls.report {
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: resize rebuilt ");
+		line.decimal(rebuilt as u64);
+		line.push(b" allocations max ");
+		line.decimal(rebuild_allocations_max);
+		line.push(b" total ");
+		line.decimal(rebuild_allocations_total);
+		line.push(b"\n");
+		print(line.as_bytes());
 		let mut line = common_line::Line::new();
 		line.push(b"test3d-sw: scene prepared bytes ");
 		line.decimal((targets.scene.reserved_bytes() + targets.panel.reserved_bytes() + targets.pbr.reserved_bytes() + targets.shadow.reserved_bytes()) as u64);

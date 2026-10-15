@@ -1119,9 +1119,10 @@ fn enqueue(thread: Arc<Thread>, cause: u8) {
 		core::hint::spin_loop();
 	}
 	thread.set_state(ThreadState::Ready);
-	// THE FRAME ACCOUNT'S WAKE RECORD, while a measurement is armed; otherwise one test of the flag.
+	// THE FRAME ACCOUNT'S WAKE RECORD, while a measurement is armed; otherwise one test of the flag. It names the core the
+	// thread is queued on - its placement where it has one, as `enqueue_on` decides below - and not the waker's.
 	if crate::perf::armed() {
-		crate::perf::wake(&thread, cause);
+		crate::perf::wake(&thread, cause, thread.cpu_placement().unwrap_or(current_cpu_id()));
 	}
 	// Without explicit placement, the WAKER's run queue, so a thread can resume on a different core
 	// than it left. That is migration, and it is deliberate: it puts the thread where the

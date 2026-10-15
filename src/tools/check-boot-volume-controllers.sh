@@ -8,7 +8,9 @@
 # present, nor what happens when it cannot be reached. So, per controller:
 #   1. two boots on ONE persistent disk: the first from the paired block volume (not a copy in memory), `lsblk`
 #      naming the controller as the device under `vol://system`, and a file written; the second, cold, reading that
-#      file back - written through that controller, flushed, and found again after a power-off.
+#      file back - written through that controller, flushed, and found again after a power-off. On x86_64 the first
+#      boot also sleeps to RAM between two writes, woken by its RTC alarm: the driver shuts the controller down or
+#      stops its port before a sleep that takes the power, and the disk must take the second write after it.
 # And once each:
 #   2. THE DECOY: an unpaired LiberFS volume on a virtio-blk disk beside the paired one on NVMe. The volume is chosen
 #      by the medium's pairing uuid and never by bus order or transport, so `vol://system` is still the NVMe disk.
@@ -94,7 +96,16 @@ for bus in nvme ahci; do
 	export SYSTEM_DISK="$bus" RUN_DISK="$guest_gate_work/$bus-system.img"
 	export GUEST_GATE_SECONDS="$served_seconds" GUEST_GATE_TIMEOUT="$served_timeout"
 	proof="written-through-$bus"
-	boot_through "$bus" $'lsblk\nwrite boot-volume-proof.txt '"$proof"$'\ncat boot-volume-proof.txt\npoweroff' ""
+	slept="slept-on-$bus"
+	sleep_step="" sleep_read=""
+	if [[ "$GUEST_ARCH" == x86_64 ]]; then
+		# S3 OFFERED, as the sleep gate offers it; the alarm wakes it with nothing from the host.
+		export QEMU_EXTRA="-global ICH9-LPC.disable_s3=0"
+		sleep_step=$'\nsleepctl suspend ram 5\nwrite boot-volume-slept.txt '"$slept"
+		sleep_read=$'\ncat boot-volume-slept.txt'
+	fi
+	boot_through "$bus" $'lsblk\nwrite boot-volume-proof.txt '"$proof""$sleep_step"$'\ncat boot-volume-proof.txt\npoweroff' ""
+	unset QEMU_EXTRA
 	first="$guest_gate_work/$bus-first"
 	cp "$GUEST_LINES" "$first"
 	from_the_disk "$first" "$bus, first boot"
@@ -103,7 +114,12 @@ for bus in nvme ahci; do
 	[[ "$device" == "$bus" ]] || fail "$bus, first boot: lsblk named '${device:-nothing}' as the device under vol://system"
 	echo "boot-volume-controllers: $bus: vol://system served from the paired disk, and lsblk names $bus as its device"
 	expect "$first" "wrote vol://system/boot-volume-proof.txt" "the file must be written to the system volume"
-	boot_through "$bus" $'lsblk\ncat boot-volume-proof.txt\npoweroff' ""
+	if [[ "$GUEST_ARCH" == x86_64 ]]; then
+		expect "$first" "sleep: resumed (the RTC alarm" "the machine must sleep to RAM on the $bus disk and wake on its alarm"
+		expect "$first" "wrote vol://system/boot-volume-slept.txt" "the $bus disk must take a write after a sleep that took its power"
+		echo "boot-volume-controllers: $bus: slept to RAM, woke on its alarm, and took a write after it"
+	fi
+	boot_through "$bus" $'lsblk\ncat boot-volume-proof.txt'"$sleep_read"$'\npoweroff' ""
 	second="$guest_gate_work/$bus-second"
 	cp "$GUEST_LINES" "$second"
 	from_the_disk "$second" "$bus, second boot"
@@ -111,7 +127,10 @@ for bus in nvme ahci; do
 	[[ "$device" == "$bus" ]] || fail "$bus, second boot: lsblk named '${device:-nothing}' as the device under vol://system"
 	# THE LINE ALONE, which only `cat` prints: the typed command echoes the text after its own name.
 	grep -aqxF -- "$proof"$'\r' "$second" || grep -aqxF -- "$proof" "$second" || fail "$bus, second boot: the file written through $bus before the power-off did not read back"
-	echo "boot-volume-controllers: $bus: the file written in the first boot read back after a cold reboot"
+	if [[ "$GUEST_ARCH" == x86_64 ]]; then
+		grep -aqxF -- "$slept"$'\r' "$second" || grep -aqxF -- "$slept" "$second" || fail "$bus, second boot: the file written after the sleep did not read back"
+	fi
+	echo "boot-volume-controllers: $bus: the files written in the first boot read back after a cold reboot"
 done
 
 # ---- 2. the decoy: an unpaired LiberFS volume on virtio-blk beside the paired one on NVMe.

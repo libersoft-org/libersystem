@@ -7908,6 +7908,12 @@ pub enum FixtureAction {
 	/// weaker pairing. `argument` must be zero. The guest's bond store is never touched; a reconnect must prove its key.
 	LeSaveKeys = 30,
 	LeRestoreKeys = 31,
+	/// The encryption key length, in octets, a BR/EDR device's next encryption negotiates - sixteen unless this shortens
+	/// it, as LMP's unauthenticated negotiation lets a radio attacker do (KNOB).
+	KeySize = 32,
+	/// THE CONTROLLER ITSELF (peer 0): the transport answers this host's next send `argument` seconds late (1 to 60),
+	/// then reports the controller reset - a controller that stopped taking packets for that long, and came back.
+	WithholdSend = 33,
 }
 
 impl FixtureAction {
@@ -7981,6 +7987,8 @@ impl FixtureAction {
 			29 => Some(FixtureAction::LeIoCapability),
 			30 => Some(FixtureAction::LeSaveKeys),
 			31 => Some(FixtureAction::LeRestoreKeys),
+			32 => Some(FixtureAction::KeySize),
+			33 => Some(FixtureAction::WithholdSend),
 			_ => None,
 		}
 	}
@@ -12264,6 +12272,8 @@ impl FixtureAction {
 			FixtureAction::LeIoCapability => out.push_str("\"le-io-capability\""),
 			FixtureAction::LeSaveKeys => out.push_str("\"le-save-keys\""),
 			FixtureAction::LeRestoreKeys => out.push_str("\"le-restore-keys\""),
+			FixtureAction::KeySize => out.push_str("\"key-size\""),
+			FixtureAction::WithholdSend => out.push_str("\"withhold-send\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -12299,6 +12309,8 @@ impl FixtureAction {
 			FixtureAction::LeIoCapability => out.push_str("le-io-capability"),
 			FixtureAction::LeSaveKeys => out.push_str("le-save-keys"),
 			FixtureAction::LeRestoreKeys => out.push_str("le-restore-keys"),
+			FixtureAction::KeySize => out.push_str("key-size"),
+			FixtureAction::WithholdSend => out.push_str("withhold-send"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -12334,6 +12346,8 @@ impl FixtureAction {
 			FixtureAction::LeIoCapability => crate::codec::cbor::text(out, "le-io-capability"),
 			FixtureAction::LeSaveKeys => crate::codec::cbor::text(out, "le-save-keys"),
 			FixtureAction::LeRestoreKeys => crate::codec::cbor::text(out, "le-restore-keys"),
+			FixtureAction::KeySize => crate::codec::cbor::text(out, "key-size"),
+			FixtureAction::WithholdSend => crate::codec::cbor::text(out, "withhold-send"),
 		}
 	}
 }

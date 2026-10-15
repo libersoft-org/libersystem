@@ -62,6 +62,10 @@ pub struct Lane {
 	pub(crate) clips: ClipStack,
 	pub(crate) layers: Vec<Layer>,
 	pub(crate) nodes: Vec<Option<Surface>>,
+	/// WHAT EACH COMMAND OF THE TILE BEING REPLAYED HAS TO BE RIGHT OVER, one per command of its bin, and
+	/// the stack of open levels the walk that works it out keeps - see `backend::tile_needs`.
+	pub(crate) needs: Vec<PixelRect>,
+	pub(crate) regions: Vec<PixelRect>,
 	/// The first unit this lane failed in, and why - the frame reports the lowest across lanes, which
 	/// is the one the serial walk would have met first.
 	pub(crate) failure: Option<(usize, Error)>,
@@ -69,14 +73,14 @@ pub struct Lane {
 
 impl Default for Lane {
 	fn default() -> Self {
-		Self { raster: Rasteriser::new(), pool: Pool::new(), masks: MaskPool::new(), spans: crate::backend::Spans::default(), tile: Tile::new(crate::TILE_SIZE), clips: ClipStack::new(), layers: Vec::new(), nodes: Vec::new(), failure: None }
+		Self { raster: Rasteriser::new(), pool: Pool::new(), masks: MaskPool::new(), spans: crate::backend::Spans::default(), tile: Tile::new(crate::TILE_SIZE), clips: ClipStack::new(), layers: Vec::new(), nodes: Vec::new(), needs: Vec::new(), regions: Vec::new(), failure: None }
 	}
 }
 
 impl Lane {
 	/// What this lane's scratch costs, which is what a second lane is charged against the ceiling.
 	pub(crate) fn scratch_bytes(&self) -> u64 {
-		self.pool.scratch_bytes() + self.masks.scratch_bytes() + self.raster.scratch_bytes() + self.spans.scratch_bytes() + self.tile.scratch_bytes() + self.clips.reserved_bytes() + (self.layers.capacity() * core::mem::size_of::<Layer>()) as u64 + (self.nodes.capacity() * core::mem::size_of::<Option<Surface>>()) as u64
+		self.pool.scratch_bytes() + self.masks.scratch_bytes() + self.raster.scratch_bytes() + self.spans.scratch_bytes() + self.tile.scratch_bytes() + self.clips.reserved_bytes() + (self.layers.capacity() * core::mem::size_of::<Layer>()) as u64 + (self.nodes.capacity() * core::mem::size_of::<Option<Surface>>()) as u64 + ((self.needs.capacity() + self.regions.capacity()) * core::mem::size_of::<PixelRect>()) as u64
 	}
 }
 

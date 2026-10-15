@@ -316,17 +316,6 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 			return None;
 		}
 	}
-	// A CLAIMABLE ROW'S PORTS ARE CHECKED AGAINST THE RESERVED SET AND THE LIVE GRANTS, as a PCI row's are.
-	// A kernel-held row's ports ARE the reserved set: publishing them accounts for them - and so are the
-	// console UART's, whose claim is the one mint the set admits them to (`grants::grant_from_install`).
-	if description.part.state == abi::PLATFORM_STATE_CLAIMABLE && description.part.flags & abi::PLATFORM_FLAG_CONSOLE == 0 {
-		for port in description.ports() {
-			if let Err(refusal) = crate::object::port_range::grants::recordable(port.base, port.len) {
-				crate::serial_println!("device: {name} is not published - its ports {:#06x}..{:#06x} are {refusal:?}", port.base, port.base as u32 + port.len as u32 - 1);
-				return None;
-			}
-		}
-	}
 	let placement = {
 		// The suite's own console row is not placed against: it sits over a UART other suites publish rows for,
 		// and a description merged into it would become a console claim. See `synthetic_console_row`.
@@ -359,6 +348,21 @@ fn publish_locked(table: &mut Vec<DeviceEntry>, item: Described, forbidden: &[(u
 			None
 		}
 		platform::Placement::New => {
+			// A NEW CLAIMABLE ROW'S PORTS ARE CHECKED AGAINST THE RESERVED SET AND THE LIVE GRANTS, as a PCI row's are.
+			// A kernel-held row's ports ARE the reserved set: publishing them accounts for them - and so are the
+			// console UART's, whose claim is the one mint the set admits them to (`grants::grant_from_install`).
+			//
+			// ONLY A NEW ROW, AS THE NAMESPACE'S PATH HAS IT. A description that is a row already published - an SPCR
+			// or DBG2 naming COM1, which is `kernel:com1` - joins that row, whose ports were accounted for when it was
+			// published; checked first, it was refused as reserved and never reached the merge it is.
+			if description.part.state == abi::PLATFORM_STATE_CLAIMABLE && description.part.flags & abi::PLATFORM_FLAG_CONSOLE == 0 {
+				for port in description.ports() {
+					if let Err(refusal) = crate::object::port_range::grants::recordable(port.base, port.len) {
+						crate::serial_println!("device: {name} is not published - its ports {:#06x}..{:#06x} are {refusal:?}", port.base, port.base as u32 + port.len as u32 - 1);
+						return None;
+					}
+				}
+			}
 			let index = table.len();
 			let Some(entry) = platform_entry(&description, properties) else {
 				crate::serial_println!("device: {name} is not published - there is no memory for its row");

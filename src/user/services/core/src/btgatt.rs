@@ -3,7 +3,8 @@
 //
 // Its policy row names the peer aliased `tag-1` and two services, the battery's and a custom one. It proves what a
 // grant reaches and what it does not: the granted services and no other, their characteristics, a read, a write, a
-// notification - and a handle outside the granted services refused before anything goes on the radio.
+// notification - and a handle outside the granted services refused before anything goes on the radio. `again`
+// subscribes to the same value twice: the second subscription's stream takes the notification, and the first ends.
 
 #![no_std]
 #![no_main]
@@ -53,8 +54,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let launch = recv_launch_bytes(bootstrap);
 	let context = launch.as_deref().and_then(LaunchContext::decode);
 	let mode = context.as_ref().map_or("", |context| context.arguments.trim());
-	if !matches!(mode, "" | "indicate" | "timeout" | "revoke") {
-		fail("expected indicate, timeout or revoke");
+	if !matches!(mode, "" | "indicate" | "timeout" | "revoke" | "again") {
+		fail("expected indicate, timeout, revoke or again");
 	}
 	let indicate = mode == "indicate";
 	let grant = recv_tagged(bootstrap, &mut buf, b"BTGATT").unwrap_or(0);
@@ -122,10 +123,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		print(format!("btgatt: PASS silent subscription timed out after {elapsed} ticks\n").as_bytes());
 		exit();
 	}
-	let stream = match subscribed {
+	let mut stream = match subscribed {
 		Some(Ok(stream)) => stream,
 		other => fail(&format!("the subscription was refused: {other:?}")),
 	};
+	// ONE STREAM PER VALUE: the same value subscribed again replaces the first subscription.
+	let first = (mode == "again").then_some(stream);
+	if first.is_some() {
+		stream = match client().subscribe(&value.handle) {
+			Some(Ok(stream)) => stream,
+			other => fail(&format!("the second subscription to the same value was refused: {other:?}")),
+		};
+	}
 	if !matches!(client().write(&value.handle, &b"hello".to_vec()), Some(Ok(()))) {
 		fail("the write was refused");
 	}
@@ -138,6 +147,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => fail("no notification arrived"),
 	}
 	say(if indicate { "the write went, and the peer's indication came back on the subscription" } else { "the write went, and the peer's notification came back on the subscription" });
+	if let Some(first) = first {
+		match recv_caps_deadline(first, &mut frame, clock() + 2 * TICKS) {
+			DeadlineCaps::Closed => {}
+			DeadlineCaps::Message { .. } => fail("the first subscription to the value still took a notification"),
+			DeadlineCaps::TimedOut => fail("the first subscription's stream did not end when the value was subscribed again"),
+		}
+		say("the value subscribed again: the new stream took the notification, and the first stream ended");
+		print(b"btgatt: PASS again\n");
+		exit();
+	}
 	print(b"btgatt: PASS\n");
 	exit();
 }

@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 use font_parse::{Error, Face};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, GLOBAL, RTLM};
 use crate::layout::{LayoutTable, class_of};
 use crate::{Table, context, gpos, gsub};
 
@@ -27,7 +27,9 @@ pub const MAX_LOOKUPS: usize = opentype_profile::limits::FEATURES as usize;
 /// `features` are the tags to turn on beyond what the language system requires. A shaper above this
 /// decides which those are per script; this applies what it is given and the required one always.
 pub fn shape(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], features: &[[u8; 4]]) -> Result<(), Error> {
-	let masked: Vec<([u8; 4], u32)> = features.iter().map(|tag| (*tag, crate::buffer::GLOBAL)).collect();
+	let mut masked: Vec<([u8; 4], u32)> = Vec::new();
+	masked.try_reserve_exact(features.len()).map_err(|_| Error::Allocation)?;
+	masked.extend(features.iter().map(|tag| (*tag, GLOBAL)));
 	shape_with_masks(face, buffer, script, language, &masked)
 }
 
@@ -39,10 +41,22 @@ pub fn shape(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u
 /// entirely of endings - which is why the per-glyph mask exists and why the script shapers set it
 /// before this runs.
 pub fn shape_with_masks(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)]) -> Result<(), Error> {
+	shape_in_stages(face, buffer, script, language, &[features], &mut |_| Ok(()))
+}
+
+/// The same, with the substitution features applied in STAGES and a pass between them.
+///
+/// THE INDIC SHAPER IS WHY THERE ARE STAGES. A reph is formed by the basic features and then MOVED,
+/// and the presentation features are written against the syllable after the move - so the two
+/// groups cannot be one pass however their lookups are ordered. Within a stage the rule above holds:
+/// lookup-list order, each lookup once. Positioning runs once, over every stage's features, after all
+/// of them.
+fn shape_in_stages(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], stages: &[&[([u8; 4], u32)]], between: &mut dyn FnMut(&mut Buffer) -> Result<(), Error>) -> Result<(), Error> {
 	// EACH SELECTED FEATURE CONTRIBUTES LOOKUPS AND EACH LOOKUP WALKS THE BUFFER, so the feature
 	// count is work per run rather than a declaration.
-	if features.len() > opentype_profile::limits::FEATURES as usize {
-		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "features", ceiling: opentype_profile::limits::FEATURES, asked: features.len() as u64 }));
+	let count: usize = stages.iter().map(|stage| stage.len()).sum();
+	if count > opentype_profile::limits::FEATURES as usize {
+		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "features", ceiling: opentype_profile::limits::FEATURES, asked: count as u64 }));
 	}
 	// THE INPUT CEILING IS ABSOLUTE AND THE EXPANSION RULE IS PROPORTIONAL, and both are checked:
 	// a ratio against an unbounded input is not a bound, and an input cap alone still admits a run a
@@ -51,8 +65,25 @@ pub fn shape_with_masks(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], l
 	if input > opentype_profile::limits::RUN_INPUT as usize {
 		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "run input", ceiling: opentype_profile::limits::RUN_INPUT, asked: input as u64 }));
 	}
-	classify(face, buffer)?;
-	substitute(face, buffer, script, language, features)?;
+	let substitution = match face.table(b"GSUB")? {
+		Some(table) => Some(LayoutTable::new(table, *b"GSUB")?),
+		None => None,
+	};
+	for (index, stage) in stages.iter().enumerate() {
+		if index > 0 {
+			between(buffer)?;
+		}
+		// THE CLASSES ARE READ BEFORE EVERY STAGE, because the stage before it changed the glyphs: a
+		// reph formed from a consonant and a virama is a mark, and a lookup that skips marks has to
+		// know that before it runs.
+		classify(face, buffer)?;
+		if let Some(table) = &substitution {
+			// THE REQUIRED FEATURE BELONGS TO THE FIRST STAGE, which is where a face expects it.
+			for (lookup, mask) in selected_lookups(table, script, language, stage, index == 0)? {
+				apply_lookup(Table::Substitution, table, lookup, buffer, mask)?;
+			}
+		}
+	}
 	// THE CLASSES AND THE ADVANCES ARE BOTH READ AFTER SUBSTITUTION, and both for the same reason:
 	// the buffer now holds different glyphs. A ligature has its own advance rather than the sum of
 	// its components', and its own `GDEF` class - positioning it as though it were still its first
@@ -69,7 +100,12 @@ pub fn shape_with_masks(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], l
 	}
 	classify(face, buffer)?;
 	advances(face, buffer)?;
-	position(face, buffer, script, language, features)
+	let mut features: Vec<([u8; 4], u32)> = Vec::new();
+	features.try_reserve_exact(count).map_err(|_| Error::Allocation)?;
+	for stage in stages {
+		features.extend_from_slice(stage);
+	}
+	position(face, buffer, script, language, &features)
 }
 
 /// Give every glyph its `GDEF` class. A font with no `GDEF` leaves them all zero, which is not an
@@ -99,27 +135,19 @@ fn advances(face: &Face<'_>, buffer: &mut Buffer) -> Result<(), Error> {
 	Ok(())
 }
 
-fn substitute(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)]) -> Result<(), Error> {
-	let Some(table) = face.table(b"GSUB")? else { return Ok(()) };
-	let table = LayoutTable::new(table, *b"GSUB")?;
-	for (index, mask) in selected_lookups(&table, script, language, features)? {
-		apply_lookup(Table::Substitution, &table, index, buffer, mask)?;
-	}
-	Ok(())
-}
-
 fn position(face: &Face<'_>, buffer: &mut Buffer, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)]) -> Result<(), Error> {
 	let Some(table) = face.table(b"GPOS")? else { return Ok(()) };
 	let table = LayoutTable::new(table, *b"GPOS")?;
-	for (index, mask) in selected_lookups(&table, script, language, features)? {
+	for (index, mask) in selected_lookups(&table, script, language, features, true)? {
 		apply_lookup(Table::Positioning, &table, index, buffer, mask)?;
 	}
 	Ok(())
 }
 
 /// The lookups a script, a language and a set of feature tags select - IN LOOKUP-LIST ORDER, with
-/// each applied once however many features name it.
-fn selected_lookups(table: &LayoutTable<'_>, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)]) -> Result<Vec<(u16, u32)>, Error> {
+/// each applied once however many features name it. `required` says whether the language system's
+/// required feature is among them, which it is everywhere but a stage after the first and a probe.
+fn selected_lookups(table: &LayoutTable<'_>, script: [u8; 4], language: [u8; 4], features: &[([u8; 4], u32)], required: bool) -> Result<Vec<(u16, u32)>, Error> {
 	let indices = table.features_for(script, language)?;
 	let mut lookups: Vec<(u16, u32)> = Vec::new();
 	// A LOOKUP NAMED BY TWO FEATURES TAKES BOTH THEIR MASKS, rather than appearing twice: applying
@@ -129,6 +157,7 @@ fn selected_lookups(table: &LayoutTable<'_>, script: [u8; 4], language: [u8; 4],
 		if let Some(entry) = lookups.iter_mut().find(|(index, _)| *index == lookup) {
 			entry.1 |= mask;
 		} else if lookups.len() < MAX_LOOKUPS {
+			lookups.try_reserve(1).map_err(|_| Error::Allocation)?;
 			lookups.push((lookup, mask));
 		} else {
 			// REFUSED RATHER THAN DROPPED. A lookup silently left out is a run shaped as though the
@@ -137,11 +166,11 @@ fn selected_lookups(table: &LayoutTable<'_>, script: [u8; 4], language: [u8; 4],
 		}
 		Ok(())
 	};
-	if let Some(required) = indices.required {
-		let feature = table.feature(required)?;
+	if let Some(feature_index) = indices.required.filter(|_| required) {
+		let feature = table.feature(feature_index)?;
 		for index in 0..feature.len() {
 			let Some(lookup) = feature.lookup_index(index) else { continue };
-			add(lookup, crate::buffer::GLOBAL, &mut lookups)?;
+			add(lookup, GLOBAL, &mut lookups)?;
 		}
 	}
 	for index in 0..indices.len() {
@@ -260,6 +289,14 @@ fn unwrap_extension<'a>(table: Table, kind: u16, subtable: font_parse::Reader<'a
 /// The buffer must already hold one glyph per character, in the run's order - which is what the
 /// caller's `cmap` mapping produced. What comes back is the characters AFTER the shaper's own pass,
 /// because Hangul composition changes them.
+///
+/// THE LANGUAGE SELECTS THE FACE'S LANGUAGE SYSTEM, and `locl` is what applies what that system says:
+/// Turkish dotless i, Romanian comma-below, the Serbian italic forms. A run in the face's `dflt`
+/// language and one in a language it names are shaped differently by design.
+///
+/// A RIGHT-TO-LEFT RUN'S MIRRORED FORMS are the caller's half and this one's together: the caller maps
+/// a mirrored character to its mirror when the face has it, and marks every other glyph of the run
+/// with `RTLM` - so the face's own `rtlm` forms apply exactly where no mirror character did.
 pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], language: [u8; 4]) -> Result<Vec<char>, Error> {
 	use crate::scripts::{self, Shaper};
 
@@ -269,44 +306,51 @@ pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], lang
 	if characters.len() > opentype_profile::limits::RUN_INPUT as usize {
 		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "run input", ceiling: opentype_profile::limits::RUN_INPUT, asked: characters.len() as u64 }));
 	}
+	// THE SCRIPT TAG THE FONT'S OWN TABLES ARE INDEXED BY - and the refusal of a script the profile
+	// does not name, before any of its text is shaped by an engine written for another.
+	let script = scripts::profile_script(characters)?;
 	let shaper = scripts::shaper_for(characters);
-	let mut characters = characters.to_vec();
+	let mut copied: Vec<char> = Vec::new();
+	copied.try_reserve_exact(characters.len()).map_err(|_| Error::Allocation)?;
+	copied.extend_from_slice(characters);
+	let mut characters = copied;
+	// THE INDIC SYLLABLE PLAN, which the reordering below already reads: where each reph is, which
+	// consonant is each syllable's base, and the masks that keep each positional feature inside the
+	// part of the syllable it belongs to.
+	let indic = if shaper == Shaper::Indic { crate::indic::plan(face, buffer, &characters, script, language)? } else { None };
 	// THE SHAPER'S OWN PASS, before any lookup: this is the part that is not a feature.
 	match shaper {
-		Shaper::Default => {}
+		Shaper::Default | Shaper::Universal => Ok(()),
 		Shaper::Cursive => scripts::apply_cursive_masks(buffer, &characters),
 		Shaper::Indic => scripts::reorder_indic(&characters, buffer),
 		Shaper::Khmer => scripts::reorder_khmer(&characters, buffer),
 		Shaper::Myanmar => scripts::reorder_myanmar(&characters, buffer),
-		Shaper::Hangul => characters = scripts::compose_hangul(&characters, buffer),
-		Shaper::Universal => {}
-	}
-	// The script tag the font's own tables are indexed by.
-	let script = scripts::script_tag(&characters);
+		Shaper::Hangul => {
+			characters = scripts::compose_hangul(&characters, buffer)?;
+			Ok(())
+		}
+	}?;
 	// And the features that shaper turns on, each with the mask that says where.
-	let mut features: Vec<([u8; 4], u32)> = match shaper {
+	let mut features: Vec<([u8; 4], u32)> = Vec::new();
+	features.try_reserve_exact(32).map_err(|_| Error::Allocation)?;
+	match shaper {
 		Shaper::Default | Shaper::Universal => {
-			let mut features: Vec<([u8; 4], u32)> = scripts::universal_features().to_vec();
+			features.extend_from_slice(&scripts::universal_features());
 			// The two every run gets: standard ligatures and contextual alternates.
-			features.push((*b"liga", crate::buffer::GLOBAL));
-			features.push((*b"calt", crate::buffer::GLOBAL));
-			features.push((*b"kern", crate::buffer::GLOBAL));
-			features.push((*b"mark", crate::buffer::GLOBAL));
-			features.push((*b"mkmk", crate::buffer::GLOBAL));
-			features
+			features.extend_from_slice(&[(*b"liga", GLOBAL), (*b"calt", GLOBAL), (*b"kern", GLOBAL), (*b"mark", GLOBAL), (*b"mkmk", GLOBAL)]);
 		}
 		Shaper::Cursive => {
-			let mut features: Vec<([u8; 4], u32)> = scripts::cursive_features().to_vec();
-			features.push((*b"curs", crate::buffer::GLOBAL));
-			features.push((*b"mark", crate::buffer::GLOBAL));
-			features.push((*b"mkmk", crate::buffer::GLOBAL));
-			features
+			features.extend_from_slice(&scripts::cursive_features());
+			// KERNING IS NOT A LATIN FEATURE. An Arabic face kerns its joined forms like any other
+			// face kerns its letters, and a cursive set without `kern` draws every pair the face
+			// adjusts at its default distance.
+			features.extend_from_slice(&[(*b"curs", GLOBAL), (*b"kern", GLOBAL), (*b"mark", GLOBAL), (*b"mkmk", GLOBAL)]);
 		}
-		Shaper::Indic => with_marks(scripts::indic_features().to_vec()),
-		Shaper::Khmer => with_marks(scripts::khmer_features().to_vec()),
-		Shaper::Myanmar => with_marks(scripts::myanmar_features().to_vec()),
-		Shaper::Hangul => with_marks(scripts::hangul_features().to_vec()),
-	};
+		Shaper::Indic => with_marks(&mut features, &crate::indic::basic_features()),
+		Shaper::Khmer => with_marks(&mut features, &scripts::khmer_features()),
+		Shaper::Myanmar => with_marks(&mut features, &scripts::myanmar_features()),
+		Shaper::Hangul => with_marks(&mut features, &scripts::hangul_features()),
+	}
 	// `ccmp` BELONGS TO EVERY SCRIPT AND TO EVERY SHAPER, which is why it is added here rather than
 	// in any one of the lists above. It is how a face says that a precomposed character is DRAWN as
 	// two glyphs, or that two characters are drawn as one, and it is the feature a font expects to
@@ -317,17 +361,93 @@ pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], lang
 	// FIRST IN THE LIST, which is not what decides the order it runs in - the LOOKUP LIST decides
 	// that - but is what a reader of this function expects to find, and costs nothing to state.
 	features.insert(0, (*b"ccmp", crate::buffer::GLOBAL));
-	shape_with_masks(face, buffer, script, language, &features)?;
+	// `locl` TOO, and for the same reason: the profile's languages are defined by what they change -
+	// Turkish dotless i, Romanian comma-below, the Serbian italic forms - and every one of those is a
+	// `locl` lookup under the language system the caller selected. A shaper that selected the system
+	// and never applied `locl` would render all of them as the default language.
+	features.insert(1, (*b"locl", GLOBAL));
+	// And `rtlm`, which reaches only the glyphs the caller marked: the right-to-left ones it did not
+	// map to a mirror character.
+	features.push((*b"rtlm", RTLM));
+	match indic {
+		// THE INDIC SHAPER IN TWO STAGES, with the final reordering between them: the reph the basic
+		// features formed is moved before the presentation features see the syllable.
+		Some(config) => shape_in_stages(face, buffer, script, language, &[&features, &crate::indic::presentation_features()], &mut |buffer| crate::indic::final_reorder(buffer, &config))?,
+		None => shape_with_masks(face, buffer, script, language, &features)?,
+	}
 	Ok(characters)
 }
 
 /// THE MARK FEATURES ARE ADDED TO EVERY SCRIPT'S SET, because every script that has marks needs them
 /// and no script's own list carries them: `mark` and `mkmk` are what attach an accent to its base
 /// and to another accent, and a shaper that left them out of one script's list renders that script
-/// with its marks at the pen.
-fn with_marks(mut features: Vec<([u8; 4], u32)>) -> Vec<([u8; 4], u32)> {
-	features.push((*b"kern", crate::buffer::GLOBAL));
-	features.push((*b"mark", crate::buffer::GLOBAL));
-	features.push((*b"mkmk", crate::buffer::GLOBAL));
-	features
+/// with its marks at the pen. The syllable-based shapers take the Indic positioning features too -
+/// `abvm` and `blwm` place what is drawn above and below a syllable's base, `dist` its distances -
+/// because their faces position a reph, a below-base form and a vowel sign through them rather than
+/// through `mark`.
+fn with_marks(features: &mut Vec<([u8; 4], u32)>, own: &[([u8; 4], u32)]) {
+	features.extend_from_slice(own);
+	features.extend_from_slice(&[(*b"kern", GLOBAL), (*b"mark", GLOBAL), (*b"mkmk", GLOBAL), (*b"abvm", GLOBAL), (*b"blwm", GLOBAL), (*b"dist", GLOBAL)]);
+}
+
+/// What a face's substitution lookups would do to a short sequence, asked BEFORE shaping.
+///
+/// HOW THE INDIC PLAN LEARNS WHAT THE FACE CAN FORM. Whether `र` after a virama is a consonant of its
+/// own or a form below the base, and whether `Ra, virama` becomes a reph at all, is the face's answer
+/// and not the script's - so the plan asks the face's own lookups about the exact pair, the way the
+/// specification describes, rather than keeping a list of its own.
+pub(crate) struct Probe<'a> {
+	table: Option<LayoutTable<'a>>,
+	script: [u8; 4],
+	language: [u8; 4],
+	scratch: Buffer,
+	/// The lookups each feature asked about selects, found once: a plan asks the same few features
+	/// about every consonant of a run.
+	selected: Vec<([u8; 4], Vec<(u16, u32)>)>,
+}
+
+impl<'a> Probe<'a> {
+	pub(crate) fn new(face: &Face<'a>, script: [u8; 4], language: [u8; 4]) -> Result<Self, Error> {
+		let table = match face.table(b"GSUB")? {
+			Some(table) => Some(LayoutTable::new(table, *b"GSUB")?),
+			None => None,
+		};
+		let mut scratch = Buffer::new();
+		scratch.reserve(4)?;
+		Ok(Self { table, script, language, scratch, selected: Vec::new() })
+	}
+
+	/// Would the lookups `feature` selects substitute ALL of `glyphs`, applied where they begin?
+	///
+	/// THE WHOLE SEQUENCE, not its first glyph: a lookup that rewrote the virama alone has not formed
+	/// anything from the pair, so it is a ligature that consumed them or a rule that rewrote a glyph
+	/// past the first that counts.
+	pub(crate) fn would_substitute(&mut self, feature: [u8; 4], glyphs: &[u16]) -> Result<bool, Error> {
+		let Some(table) = &self.table else { return Ok(false) };
+		let found = match self.selected.iter().position(|(tag, _)| *tag == feature) {
+			Some(found) => found,
+			None => {
+				let lookups = selected_lookups(table, self.script, self.language, &[(feature, GLOBAL)], false)?;
+				self.selected.try_reserve(1).map_err(|_| Error::Allocation)?;
+				self.selected.push((feature, lookups));
+				self.selected.len() - 1
+			}
+		};
+		for (lookup, _) in &self.selected[found].1 {
+			let lookup = *lookup;
+			self.scratch.infos.clear();
+			self.scratch.positions.clear();
+			for glyph in glyphs {
+				self.scratch.push(*glyph, 0)?;
+			}
+			if apply_lookup_at(Table::Substitution, table, lookup, &mut self.scratch, 0, 0)? {
+				let consumed = self.scratch.len() < glyphs.len();
+				let rewritten = self.scratch.infos.iter().zip(glyphs).skip(1).any(|(info, glyph)| info.glyph != *glyph);
+				if consumed || rewritten {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
+	}
 }

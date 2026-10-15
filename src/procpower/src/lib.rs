@@ -103,6 +103,10 @@ pub enum Refusal {
 	OutOfOrder,
 	/// A window whose floor is faster than its cap, or a level past the table.
 	BadWindow,
+	/// A `_PSD` domain of more than one processor whose coordination falls to the operating system - software-all or
+	/// software-any. This kernel decides each core's level by itself, and independent decisions written to a shared
+	/// or co-dependent control register fight: an idle member's "slowest" holds the busy member back.
+	SoftwareCoordinated,
 }
 
 /// THE ARCHITECTURE a table is checked for.

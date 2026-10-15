@@ -28,7 +28,7 @@ unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_font_font_catalogue_resolve_into"]
 	fn font_resolve_into(chan: u64, identity: &FaceIdentity, generation: &u64, target: &u64) -> Option<Result<ResolveOutcome, Error>>;
 	#[link_name = "liber_channel_liber_font_font_catalogue_subscribe"]
-	fn font_subscribe(chan: u64) -> Option<u64>;
+	fn font_subscribe(chan: u64) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_font_font_catalogue_admin_rescan"]
 	fn font_rescan(chan: u64) -> Option<Result<RescanOutcome, Error>>;
 }
@@ -64,9 +64,10 @@ impl FontClient {
 		unsafe { font_resolve_into(self.chan, identity, &generation, &target) }
 	}
 
-	/// The consumer end of a live generation stream.
+	/// The consumer end of a live generation stream; `exhausted` past this connection's one subscription or the
+	/// catalogue's bound.
 	#[inline(always)]
-	pub fn subscribe(&mut self) -> Option<u64> {
+	pub fn subscribe(&mut self) -> Option<Result<u64, Error>> {
 		unsafe { font_subscribe(self.chan) }
 	}
 }

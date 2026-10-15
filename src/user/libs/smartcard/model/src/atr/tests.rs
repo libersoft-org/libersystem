@@ -59,6 +59,20 @@ fn t15_is_not_a_transmission_protocol() {
 }
 
 #[test]
+fn a_t0_card_that_declares_global_bytes_ends_with_a_check_byte() {
+	// 3B DB 96 00 80 1F 03 + eleven historical bytes + TCK: TA1, TC1, TD1 = T=0, TD2 = T=15 with TA3
+	// (the class indicator). Only T=0 transmits, and the TCK is there because T=15 was indicated.
+	let atr = [0x3b, 0xdb, 0x96, 0x00, 0x80, 0x1f, 0x03, 0x00, 0x31, 0xc0, 0x64, 0xb0, 0xf3, 0x10, 0x00, 0x07, 0x90, 0x00, 0x80];
+	let parsed = parse(&atr).unwrap();
+	assert_eq!((parsed.protocols, parsed.first, parsed.ta1), (0b1, 0, Some(0x96)));
+	// Without its check byte it is truncated, and with a wrong one it fails the check.
+	assert_eq!(parse(&atr[..atr.len() - 1]), Err(Refusal::Truncated));
+	let mut wrong = atr;
+	wrong[atr.len() - 1] ^= 0x01;
+	assert_eq!(parse(&wrong), Err(Refusal::Check));
+}
+
+#[test]
 fn inverse_convention_is_recognised_and_anything_else_refused() {
 	assert!(parse(&[0x3f, 0x00]).unwrap().inverse);
 	assert_eq!(parse(&[0x3c, 0x00]), Err(Refusal::Convention));

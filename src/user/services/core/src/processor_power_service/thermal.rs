@@ -105,11 +105,33 @@ impl Thermal {
 		processor_policy::strictest(self.zones.iter().filter(|zone| zone.passive.engaged && zone.cooling.passive_processors.iter().any(|listed| listed == path)).map(|zone| zone.passive.limit))
 	}
 
-	// `_SCP` on every zone that has it.
+	// `_SCP` on every zone that has it - and its trips read again after it.
 	pub(crate) fn cooling_policy(&mut self, mode: u8) {
 		self.mode = mode;
-		for zone in self.zones.iter().filter(|zone| zone.cooling.scp) {
-			let _ = thermal_zone::Client::with_deadline(ChannelTransport { chan: zone.chan }, clock() + ASK_TICKS).cooling_policy(&mode);
+		for at in 0..self.zones.len() {
+			if !self.zones[at].cooling.scp {
+				continue;
+			}
+			let _ = thermal_zone::Client::with_deadline(ChannelTransport { chan: self.zones[at].chan }, clock() + ASK_TICKS).cooling_policy(&mode);
+			self.describe_again(at, "its cooling policy was set");
+		}
+		self.update_fans();
+	}
+
+	// THE ZONE'S TRIP POINTS, READ AGAIN. `_SCP` exists so the platform can move `_PSV` and the `_ACx` trips between an
+	// active- and a passive-preferring set, and ACPI has the operating system re-evaluate them after it runs `_SCP` and
+	// when the zone notifies 0x81. Read once at adoption, a moved trip was followed on its old value - passive cooling,
+	// the fans, `_HOT`'s hibernation and the orderly `_CRT` power-off alike. A zone whose driver does not answer keeps
+	// what was read before.
+	fn describe_again(&mut self, at: usize, why: &str) {
+		let Some(Ok(cooling)) = thermal_zone::Client::with_deadline(ChannelTransport { chan: self.zones[at].chan }, clock() + ASK_TICKS).describe() else {
+			say(&format!("{} did not describe itself again after {why} - its trips stay as they were read", self.zones[at].cooling.zone));
+			return;
+		};
+		if cooling != self.zones[at].cooling {
+			let trip = |value: Option<u32>| value.map_or(String::from("none"), celsius);
+			say(&format!("{}'s trips were read again - {why}: _PSV {}, _HOT {}, _CRT {}, {} active trip(s)", cooling.zone, trip(cooling.passive), trip(cooling.hot), trip(cooling.critical), cooling.active.len()));
+			self.zones[at].cooling = cooling;
 		}
 	}
 
@@ -194,10 +216,16 @@ impl Thermal {
 		};
 		let trip = |value: Option<u32>| value.map_or(String::from("none"), celsius);
 		say(&format!("follows {} - _PSV {}, _HOT {}, _CRT {}, {} active trip(s), {} passive processor(s)", cooling.zone, trip(cooling.passive), trip(cooling.hot), trip(cooling.critical), cooling.active.len(), cooling.passive_processors.len()));
-		if cooling.scp {
+		let scp = cooling.scp;
+		if scp {
 			let _ = thermal_zone::Client::with_deadline(ChannelTransport { chan }, clock() + ASK_TICKS).cooling_policy(&self.mode);
 		}
 		self.zones.push(Zone { info, chan, stream, cooling, temperature: None, passive: Cooling::default(), trips: Trips::default(), evaluated_at: 0 });
+		// The trips the policy follows are the ones `_SCP` left, not the ones read before it ran.
+		if scp {
+			let at = self.zones.len() - 1;
+			self.describe_again(at, "its cooling policy was set");
+		}
 	}
 
 	fn drop_zone(&mut self, at: usize, why: &str) {
@@ -220,6 +248,9 @@ impl Thermal {
 					let Some(reading) = thermal_zone::readings_read(&buf[..len], &mut frame) else { continue };
 					for &leftover in frame.as_slice() {
 						close(leftover);
+					}
+					if reading.trips_changed {
+						self.describe_again(at, "the zone said its trip points changed");
 					}
 					self.reading(at, reading.temperature);
 				}
@@ -373,7 +404,7 @@ impl Thermal {
 	// ------------------------------------------------------------------ the status
 
 	pub(crate) fn zone_status(&self) -> Vec<ZonePower> {
-		self.zones.iter().take(16).map(|zone| ZonePower { zone: zone.cooling.zone.clone(), temperature: zone.temperature.unwrap_or(0), passive: zone.cooling.passive, critical: zone.cooling.critical, hot: zone.cooling.hot, passive_engaged: zone.passive.engaged, cap_percent: zone.passive.limit / 10 }).collect()
+		self.zones.iter().take(16).map(|zone| ZonePower { zone: zone.cooling.zone.clone(), temperature: zone.temperature.unwrap_or(0), passive: zone.cooling.passive, critical: zone.cooling.critical, hot: zone.cooling.hot, passive_engaged: zone.passive.engaged, cap_percent: zone.passive.limit / 10, active: zone.cooling.active.clone() }).collect()
 	}
 
 	pub(crate) fn fan_status(&self) -> Vec<FanPower> {

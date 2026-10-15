@@ -24,7 +24,9 @@
 //
 // THE CONTROL ENDPOINT. A gate's probe reaches the fixture through a `fixture-control` publication, which only
 // a development probe's policy row grants: it makes a device act - page this host, pair from its side, open a
-// channel, type a passkey - and reads what the far side saw, line by line, as `bt-fixture:` prints it.
+// channel, type a passkey - and reads what the far side saw, line by line, as `bt-fixture:` prints it. The
+// controller itself (peer 0) can answer the host's next send late and then reset, which is how a host that must not
+// wait on its transport for ever is proved.
 //
 // AN LE AUDIO CONTROLLER. It has extended advertising, periodic advertising, the CIS central role and the
 // synchronized receiver role, and keeps the rule real ones keep: a host that used an extended command is refused
@@ -99,6 +101,16 @@ struct Fixture {
 	accepting: Option<u8>,
 	// What the far side saw and the probe has not read yet.
 	events: VecDeque<String>,
+	// The gate's word that the host's next send is answered late - by this many ticks - and the answer held meanwhile.
+	withhold: Option<u64>,
+	withheld: Option<Withheld>,
+}
+
+// AN ANSWER TO A SEND, HELD: the channel it goes back on, its bytes, and when it is due.
+struct Withheld {
+	channel: u64,
+	reply: Vec<u8>,
+	due: u64,
 }
 
 // ------------------------------------------------------------------ what the gate reads
@@ -676,8 +688,17 @@ struct ControlView<'a> {
 impl bluetooth_fixture::Service for ControlView<'_> {
 	fn act(&mut self, peer: u8, action: FixtureAction, argument: u32) -> Result<u32, Error> {
 		let fixture = &mut *self.fixture;
-		// THE CONTROLLER ITSELF, peer 0: the kind it is from its next reset - an LE Audio one (1) or a plain LE one (0).
+		// THE CONTROLLER ITSELF, peer 0: the kind it is from its next reset - an LE Audio one (1) or a plain LE one (0) -
+		// or a transport that answers the host's next send late, then resets.
 		if peer == 0 {
+			if action == FixtureAction::WithholdSend {
+				if !(1..=60).contains(&argument) || fixture.withhold.is_some() || fixture.withheld.is_some() {
+					return Err(Error::Invalid);
+				}
+				fixture.withhold = Some(u64::from(argument) * 100);
+				fixture.note(alloc::format!("the controller will answer the host's next send {argument} seconds late"));
+				return Ok(0);
+			}
 			if action != FixtureAction::LeFeatures || argument > 1 {
 				return Err(if action == FixtureAction::LeFeatures { Error::Invalid } else { Error::Unsupported });
 			}
@@ -788,7 +809,8 @@ impl bluetooth_fixture::Service for ControlView<'_> {
 			FixtureAction::HangUp => 20,
 			FixtureAction::AudioRequest => 21,
 			FixtureAction::PushObject => 22,
-			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall | FixtureAction::LeFeatures | FixtureAction::LeIoCapability | FixtureAction::LeSaveKeys | FixtureAction::LeRestoreKeys => return Err(Error::Unsupported),
+			FixtureAction::KeySize => 23,
+			FixtureAction::ReadHostName | FixtureAction::LeAdvertise | FixtureAction::Broadcast | FixtureAction::LeVolume | FixtureAction::LeCall | FixtureAction::LeFeatures | FixtureAction::LeIoCapability | FixtureAction::LeSaveKeys | FixtureAction::LeRestoreKeys | FixtureAction::WithholdSend => return Err(Error::Unsupported),
 		};
 		match fixture.world.act(peer, code, argument) {
 			Ok((result, outs)) => {
@@ -863,6 +885,14 @@ fn serve(fixture: &mut Fixture, channel: u64, buf: &mut [u8]) -> bool {
 	let mut reply = [0u8; 512];
 	let mut reply_handles = wire::Handles::new();
 	if let Some(written) = hci_transport::dispatch(fixture, &buf[..len], &mut handles, &mut reply, &mut reply_handles) {
+		// A SEND THE GATE ASKED TO BE ANSWERED LATE: taken as any other, its answer held until it is due.
+		if op == hci_transport::OP_SEND
+			&& let Some(ticks) = fixture.withhold.take()
+		{
+			fixture.withheld = Some(Withheld { channel, reply: reply[..written].to_vec(), due: clock().saturating_add(ticks) });
+			fixture.note(String::from("the controller holds its answer to the host's send"));
+			return true;
+		}
 		send_caps_blocking(channel, &reply[..written], reply_handles.as_slice());
 	}
 	true
@@ -884,7 +914,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut world = World::new(u64::from_le_bytes(seed));
 	world.mix(&clock().to_le_bytes());
 	let le = LeWorld::new(u64::from_le_bytes(seed) ^ 0x5bd1_e995);
-	let mut fixture = Fixture { epoch: 1, packets: 0, control: 0, scanning: false, connected: false, encrypted: false, peer: Peer::new(), step: 0, world, le, host_random: None, accept: Vec::new(), resolving: Vec::new(), resolution: false, accepting: None, events: VecDeque::new() };
+	let mut fixture = Fixture { epoch: 1, packets: 0, control: 0, scanning: false, connected: false, encrypted: false, peer: Peer::new(), step: 0, world, le, host_random: None, accept: Vec::new(), resolving: Vec::new(), resolution: false, accepting: None, events: VecDeque::new(), withhold: None, withheld: None };
 	let mut buf = alloc::vec![0u8; 4400];
 	loop {
 		match common::wait_providers_or_answer(bootstrap, &bind, &mut serving, &[timer]) {
@@ -909,7 +939,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(common::ProviderReady::Consumer(index)) => {
 				if !serve(&mut fixture, serving.at(index), &mut buf) {
 					let token = serving.close_at(index);
-					// The consumer is gone: the links and the streams go with it.
+					// The consumer is gone: the links and the streams go with it, and an answer held for it.
+					fixture.withheld = None;
 					fixture.connected = false;
 					fixture.encrypted = false;
 					fixture.world.reset();
@@ -928,6 +959,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 			Some(common::ProviderReady::Device(_)) => {
+				// A HELD ANSWER, DUE: sent late, and the controller reset - one that stopped taking packets and came back.
+				if let Some(held) = fixture.withheld.take_if(|held| clock() >= held.due) {
+					let _ = try_send_outcome(held.channel, &held.reply, 0);
+					let _ = hci_transport::Service::reset(&mut fixture);
+					fixture.note(String::from("the controller answered the held send late, and was reset"));
+				}
 				fixture.tick();
 				// A STREAM ON THE PHONE'S CLOCK, a voice link's microphone, and every LE Audio stream and train are fed every
 				// tick; otherwise the reports' pace is enough.

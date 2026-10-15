@@ -1,0 +1,23 @@
+# THE REVIEWED PERMISSIVE SET: every licence an imported source, or an artifact built from one, may
+# be carried under. `docs/DEPENDENCY_POLICY.md` states the test each of these passed; this is the
+# list of what passed it.
+#
+# ONE LIST, READ BY BOTH PLACES THAT DECIDE IT. `src/tools/check-dependency-policy.sh` holds every
+# vendored upstream in `third_party/INVENTORY.tsv` to it, and the system manifest compiles this file
+# in and holds every row that declares a licence - a foreign library, an audit-produced program - to
+# the same lines. Two copies would be two reviews that agree until one of them is edited.
+#
+# A LIST AND NOT A PATTERN. An identifier not written here has not been reviewed, and guessing from
+# a prefix is how a reciprocal licence with a permissive-looking name gets admitted.
+#
+# One SPDX expression per line, exactly as it is written where it is used. Blank lines and lines
+# starting with `#` are not entries.
+Unlicense
+MIT
+BSD-2-Clause
+BSD-3-Clause
+ISC
+Apache-2.0
+Zlib
+CC0-1.0
+Apache-2.0 WITH LLVM-exception

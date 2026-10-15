@@ -67,7 +67,6 @@ struct ReaderConn {
 struct Stream {
 	chan: u64,
 	seq: u32,
-	queue: cs::EventQueue<Vec<u8>>,
 }
 
 struct GrantConn {
@@ -446,42 +445,32 @@ impl Service {
 			},
 			slot: Some(slot_state(&view)),
 		};
+		let mut frame = [0u8; FRAME_BYTES];
+		let mut handles = Handles::new();
+		let Some(len) = smartcard::events_frame(0, &event, &mut frame, &mut handles) else { return };
 		for grant in self.grants.iter_mut().filter(|grant| grant.reader == key) {
-			for stream in &mut grant.streams {
-				let mut frame = [0u8; FRAME_BYTES];
-				let mut handles = Handles::new();
-				if let Some(len) = smartcard::events_frame(0, &event, &mut frame, &mut handles) {
-					// A SLOW READER'S OVERFLOW CLOSES ITS OWN STREAM, and nothing else waits on it.
-					let _ = stream.queue.push(frame[..len].to_vec());
-				}
-			}
-		}
-	}
-
-	fn drain_streams(&mut self) {
-		for grant in &mut self.grants {
+			// THE STREAM'S OWN CHANNEL IS THE CLIENT'S WHOLE BACKLOG, sixteen frames deep: a frame that
+			// does not fit is the seventeenth this client has not read, and its stream is closed. A slow
+			// reader's overflow closes its own stream and nothing else waits on it. There used to be a
+			// second queue of sixteen in front of a channel with sixteen more room, so a client could
+			// fall about twice the stated bound behind before anything was closed.
 			grant.streams.retain_mut(|stream| {
-				if stream.queue.overflowed() {
-					print(b"SmartcardService: an event stream fell sixteen behind and is closed\n");
-					close(stream.chan);
-					return false;
-				}
-				while let Some(frame) = stream.queue.front() {
-					let mut numbered = frame.clone();
-					numbered[..4].copy_from_slice(&stream.seq.to_le_bytes());
-					match try_send_outcome(stream.chan, &numbered, 0) {
-						SendOutcome::Delivered => {
-							stream.seq = stream.seq.wrapping_add(1);
-							stream.queue.pop();
-						}
-						SendOutcome::Stalled => break,
-						SendOutcome::Failed => {
-							close(stream.chan);
-							return false;
-						}
+				frame[..4].copy_from_slice(&stream.seq.to_le_bytes());
+				match try_send_outcome(stream.chan, &frame[..len], 0) {
+					SendOutcome::Delivered => {
+						stream.seq = stream.seq.wrapping_add(1);
+						true
+					}
+					SendOutcome::Stalled => {
+						print(b"SmartcardService: an event stream fell sixteen behind and is closed\n");
+						close(stream.chan);
+						false
+					}
+					SendOutcome::Failed => {
+						close(stream.chan);
+						false
 					}
 				}
-				true
 			});
 		}
 	}
@@ -677,7 +666,9 @@ impl Service {
 			};
 			frames.push(frame[..len].to_vec());
 		}
-		let Some((producer, consumer)) = channel_with_depth(frames.len() as u64 + cs::MAX_EVENTS as u64) else {
+		// SIXTEEN FRAMES DEEP, the snapshot's among them: a client that has read its snapshot has room
+		// for sixteen changes and no more, and one that has not has room for fewer.
+		let Some((producer, consumer)) = channel_with_depth(frames.len().max(cs::MAX_EVENTS) as u64) else {
 			refuse(Error::Exhausted, reply_buf);
 			return true;
 		};
@@ -691,7 +682,7 @@ impl Service {
 		}
 		match smartcard::events_reply_ok(corr, reply_buf) {
 			Some(len) if send_caps_blocking(chan, &reply_buf[..len], &[consumer]) => {
-				self.grants[at].streams.push(Stream { chan: producer, seq: frames.len() as u32, queue: cs::EventQueue::default() });
+				self.grants[at].streams.push(Stream { chan: producer, seq: frames.len() as u32 });
 			}
 			_ => {
 				close(producer);
@@ -742,12 +733,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			service.lose(key, b"its new session was never proven quiescent");
 			continue;
 		}
-		let backlog = service.grants.iter().any(|grant| grant.streams.iter().any(|stream| !stream.queue.is_empty()));
-		let deadlines = [
-			service.cards.next_deadline(),
-			backlog.then_some(now + 10),
-			service.readers.iter().filter_map(|reader| reader.opening.map(|(_, since)| since + SESSION_TICKS)).min(),
-		];
+		let deadlines = [service.cards.next_deadline(), service.readers.iter().filter_map(|reader| reader.opening.map(|(_, since)| since + SESSION_TICKS)).min()];
 		let deadline = deadlines.into_iter().flatten().min().map_or(0, |deadline| deadline.max(now + 1));
 		let ready = wait_any(&waitset, deadline);
 		let effects = service.cards.tick(clock());
@@ -755,7 +741,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if ready >= 0 {
 			serve(&mut service, waitset[ready as usize], catalogue, subscription, &mut subscribed, admin_root, &mut buf, &mut reply_buf);
 		}
-		service.drain_streams();
 	}
 }
 

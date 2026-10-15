@@ -655,6 +655,12 @@ enum fixture-action {
 	/// weaker pairing. `argument` must be zero. The guest's bond store is never touched; a reconnect must prove its key.
 	le-save-keys    = 30,
 	le-restore-keys = 31,
+	/// The encryption key length, in octets, a BR/EDR device's next encryption negotiates - sixteen unless this shortens
+	/// it, as LMP's unauthenticated negotiation lets a radio attacker do (KNOB).
+	key-size        = 32,
+	/// THE CONTROLLER ITSELF (peer 0): the transport answers this host's next send `argument` seconds late (1 to 60),
+	/// then reports the controller reset - a controller that stopped taking packets for that long, and came back.
+	withhold-send   = 33,
 }
 
 /// THE IN-GUEST BLUETOOTH FIXTURE'S CONTROL ENDPOINT. DEVELOPMENT ONLY: it exists on a development fixture

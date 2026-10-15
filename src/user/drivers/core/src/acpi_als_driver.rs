@@ -112,8 +112,15 @@ impl Sensor {
 			return;
 		}
 		// A STREAM THAT CANNOT TAKE A READING IS CLOSED: the policy opens it again and starts from the reading then.
-		close(self.stream);
-		self.stream = 0;
+		self.end_stream();
+	}
+
+	// The reading stream ended, for the policy to open again.
+	fn end_stream(&mut self) {
+		if self.stream != 0 {
+			close(self.stream);
+			self.stream = 0;
+		}
 	}
 }
 
@@ -286,6 +293,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						SensorNotification::Response => {
 							sensor.read_curve();
 							sensor.say(&format!("the firmware changed its response curve - {} point(s)", sensor.curve.len()));
+							// AND THE POLICY IS TOLD, by the end of its reading stream: it describes the sensor again and
+							// opens a new stream, so automatic brightness follows the new curve rather than the copy it
+							// took when the sensor appeared.
+							sensor.end_stream();
 						}
 						SensorNotification::Other(value) => sensor.say(&format!("a Notify of {value:#04x}, which a light sensor does not raise, is ignored")),
 					}

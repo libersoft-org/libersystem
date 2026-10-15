@@ -1,8 +1,15 @@
 //! FILTERS: a bounded GRAPH, which is why the scenes below are one node each plus the two that are
 //! only meaningful as a composition - a drop shadow and a backdrop filter.
+//!
+//! THE THREE THAT READ PAST THE PIXEL THEY WRITE ARE DRAWN ACROSS TILE BOUNDARIES AND COMPARED WHOLE: a
+//! blur, a shadow and a backdrop, each on a target of several tiles, every pixel against the graph
+//! evaluated at f64 within the frozen kernel tolerance - and exactly where the drawing covers a pixel
+//! wholly or not at all. A backend that computes a filter one tile at a time and blurs against nothing at
+//! the tile's edge is wrong by half the drawing's alpha there, and only a scene larger than a tile, read
+//! everywhere, can see it.
 
 use crate::Outcome;
-use crate::harness::{Frame, draw, near, rect_path, solid, white};
+use crate::harness::{Frame, WIDE, blurred, draw, draw_linear, gaussian, rect_path, solid, white};
 use graphics_core::geom::RectF;
 use render2d::blend::{BlendMode, Operator};
 use render2d::filter::{Channel, FilterGraph, FilterNode};
@@ -20,37 +27,71 @@ fn filtered(build: impl Fn(&mut FilterGraph)) -> Result<Frame, crate::Trouble> {
 	})
 }
 
+/// Whether `at` lies in the half-open span `from..to`, as a coverage of nothing or everything.
+fn inside(at: i64, from: i64, to: i64) -> f64 {
+	if (from..to).contains(&at) { 1.0 } else { 0.0 }
+}
+
 // @covers: FilterGaussianBlur
-/// A blur SPREADS PAST THE SHAPE, which is what the graph's bounds map grows the layer by: a blur
-/// clipped to its input is the defect that gives every shadow a straight edge.
+/// A blur IS THE SEPARABLE GAUSSIAN, AT EVERY PIXEL. An opaque white rectangle whose edges are whole pixels,
+/// blurred by a different deviation on each axis, across the tile boundaries at 64 and 128 - and every
+/// pixel's four channels compared with the product of the two one-dimensional Gaussian sums at f64. The
+/// middle stays at one, the edges fall off as the kernel says on both sides of every boundary, and nothing
+/// is left where the kernel does not reach.
 pub fn filter_gaussian_blur() -> Outcome {
-	let frame = filtered(|graph| {
-		let source = graph.push(FilterNode::Source).expect("a node");
-		graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+	let (left, top, right, bottom) = (36i64, 44i64, 136i64, 136i64);
+	let (across, down) = (3.0f32, 2.0f32);
+	let frame = draw_linear(WIDE, WIDE, |canvas| {
+		let mut graph = FilterGraph::default();
+		let source = graph.push(FilterNode::Source)?;
+		graph.push(FilterNode::Blur { input: source, x: across, y: down })?;
+		let handle = canvas.resources().add_filter(graph)?;
+		canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle))?;
+		canvas.fill_path(rect_path(RectF::new(left as f32, top as f32, (right - left) as f32, (bottom - top) as f32)), white(), FillRule::NonZero)?;
+		canvas.end_layer()
 	})?;
-	require!(frame.alpha(16, 16) > 200, "the middle of the shape survives: {:?}", frame.pixel(16, 16));
-	require!(frame.alpha(10, 16) > 0, "and it reaches past the shape's own edge: {:?}", frame.pixel(10, 16));
-	require!(frame.alpha(10, 16) < frame.alpha(13, 16), "further out is fainter, which is what a Gaussian is: {:?}", frame.pixel(10, 16));
-	Ok(())
+	let (horizontal, vertical) = (gaussian(across as f64), gaussian(down as f64));
+	frame.compare(|x, y| {
+		let alpha = blurred(&horizontal, x as i64, |at| inside(at, left, right)) * blurred(&vertical, y as i64, |at| inside(at, top, bottom));
+		([alpha; 4], false)
+	})
 }
 
 // @covers: FilterDropShadow
 /// A DROP SHADOW IS A COMPOSITION AND NOT A NODE - blur, offset, flood, keep-inside, composite under -
 /// which is the whole reason the profile requires a graph: an API with a `drop_shadow` call has one
 /// shadow and no way to make another.
+///
+/// AND IT IS THAT COMPOSITION AT EVERY PIXEL, across tile boundaries: where the white rectangle is, the
+/// rectangle exactly; everywhere else the blue flood at the alpha of the rectangle blurred and moved five
+/// pixels down and right, which is the Gaussian at f64 - so a shadow cut off where a tile ends, or missing
+/// where the shape that cast it lies in the tile beside it, is a pixel that differs.
 pub fn filter_drop_shadow() -> Outcome {
-	let frame = filtered(|graph| {
-		let source = graph.push(FilterNode::Source).expect("a node");
-		let blur = graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
-		let offset = graph.push(FilterNode::Offset { input: blur, dx: 5.0, dy: 5.0 }).expect("an offset");
-		let flood = graph.push(FilterNode::Flood { color: render2d::paint::Color::new(0.0, 0.0, 1.0, 1.0, graphics_core::ColorSpace::SrgbLinear) }).expect("a flood");
-		let tint = graph.push(FilterNode::In { input: flood, mask: offset }).expect("kept inside the blur");
-		graph.push(FilterNode::Composite { source, backdrop: tint, operator: Operator::SrcOver }).expect("the shape over its shadow");
+	let (left, top, right, bottom) = (40i64, 36i64, 116i64, 124i64);
+	let (dx, dy) = (5i64, 5i64);
+	let frame = draw_linear(WIDE, WIDE, |canvas| {
+		let mut graph = FilterGraph::default();
+		let source = graph.push(FilterNode::Source)?;
+		let blur = graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 })?;
+		let offset = graph.push(FilterNode::Offset { input: blur, dx: dx as f32, dy: dy as f32 })?;
+		let flood = graph.push(FilterNode::Flood { color: render2d::paint::Color::new(0.0, 0.0, 1.0, 1.0, graphics_core::ColorSpace::SrgbLinear) })?;
+		let tint = graph.push(FilterNode::In { input: flood, mask: offset })?;
+		graph.push(FilterNode::Composite { source, backdrop: tint, operator: Operator::SrcOver })?;
+		let handle = canvas.resources().add_filter(graph)?;
+		canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle))?;
+		canvas.fill_path(rect_path(RectF::new(left as f32, top as f32, (right - left) as f32, (bottom - top) as f32)), white(), FillRule::NonZero)?;
+		canvas.end_layer()
 	})?;
-	require!(frame.pixel(16, 16)[0] > 200, "the shape itself is still white: {:?}", frame.pixel(16, 16));
-	let shadow = frame.pixel(23, 23);
-	require!(shadow[3] > 0 && shadow[2] > shadow[0], "and below-right of it is a blue shadow: {shadow:?}");
-	Ok(())
+	let kernel = gaussian(2.0);
+	frame.compare(|x, y| {
+		let (x, y) = (x as i64, y as i64);
+		if inside(x, left, right) * inside(y, top, bottom) > 0.0 {
+			// The shape over its shadow is the shape: an opaque source leaves nothing of what is under it.
+			return ([1.0; 4], true);
+		}
+		let shadow = blurred(&kernel, x - dx, |at| inside(at, left, right)) * blurred(&kernel, y - dy, |at| inside(at, top, bottom));
+		([0.0, 0.0, shadow, shadow], false)
+	})
 }
 
 // @covers: FilterColorMatrix
@@ -67,9 +108,9 @@ pub fn filter_color_matrix() -> Outcome {
 		canvas.fill_path(rect_path(RectF::new(12.0, 12.0, 8.0, 8.0)), solid(0.8, 0.0, 0.0, 1.0), FillRule::NonZero)?;
 		canvas.end_layer()
 	})?;
-	let pixel = frame.pixel(16, 16);
-	require!(near(pixel[2], 0.8) && pixel[0] < 8, "the red channel was moved into blue: {pixel:?}");
-	require!(pixel[3] == 255, "and the alpha row left the coverage alone: {pixel:?}");
+	// A PIXEL THE SQUARE COVERS WHOLLY, so it is compared exactly: red moved into blue, and the alpha row left
+	// the coverage alone.
+	require!(frame.holds(16, 16, [0.0, 0.0, 0.8], 1.0), "the red channel was moved into blue at full alpha: {:?}", frame.pixel(16, 16));
 	Ok(())
 }
 
@@ -102,7 +143,7 @@ pub fn filter_blend() -> Outcome {
 		canvas.fill_path(rect_path(RectF::new(12.0, 12.0, 8.0, 8.0)), solid(0.8, 0.8, 0.8, 1.0), FillRule::NonZero)?;
 		canvas.end_layer()
 	})?;
-	require!(near(frame.pixel(16, 16)[0], 0.4), "half multiplied by four fifths is two fifths: {:?}", frame.pixel(16, 16));
+	require!(frame.holds(16, 16, [0.4, 0.4, 0.4], 1.0), "half multiplied by four fifths is two fifths, exactly where the square covers the pixel: {:?}", frame.pixel(16, 16));
 	Ok(())
 }
 
@@ -196,22 +237,40 @@ pub fn filter_tile() -> Outcome {
 // @covers: FilterBackdrop
 /// A BACKDROP FILTER READS WHAT IS UNDER THE LAYER - which is what a frosted panel is, and without it
 /// the whole class of them has to be built by drawing the scene twice.
+///
+/// UNDER IT, AND NOT UNDER ONE TILE OF IT. Blue on the left of the target and red on the right, and a panel
+/// across both and across the tile boundaries whose graph is the backdrop blurred: inside the panel every
+/// pixel is that blur - of the backdrop inside the panel's bounds, which is what the layer is - composited
+/// over the backdrop, at f64; outside it every pixel is the backdrop, exactly. A panel that blurred each
+/// tile's own part of the scene against nothing has a seam at every tile boundary it crosses.
 pub fn filter_backdrop() -> Outcome {
-	let frame = draw(32, 32, |canvas| {
-		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 32.0, 16.0)), solid(0.0, 0.0, 1.0, 1.0), FillRule::NonZero)?;
+	let split = 80i64;
+	let (left, top, right, bottom) = (24i64, 24i64, 136i64, 136i64);
+	let frame = draw_linear(WIDE, WIDE, |canvas| {
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, split as f32, WIDE as f32)), solid(0.0, 0.0, 1.0, 1.0), FillRule::NonZero)?;
+		canvas.fill_path(rect_path(RectF::new(split as f32, 0.0, (WIDE as i64 - split) as f32, WIDE as f32)), solid(1.0, 0.0, 0.0, 1.0), FillRule::NonZero)?;
 		let mut graph = FilterGraph::default();
 		let backdrop = graph.push(FilterNode::Backdrop)?;
 		graph.push(FilterNode::Blur { input: backdrop, x: 3.0, y: 3.0 })?;
-		let reads = graph.reads_backdrop();
 		let handle = canvas.resources().add_filter(graph)?;
-		canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle))?;
-		canvas.fill_path(rect_path(RectF::new(8.0, 8.0, 16.0, 16.0)), solid(1.0, 1.0, 1.0, 0.1), FillRule::NonZero)?;
-		canvas.end_layer()?;
-		// A GRAPH THAT READS THE BACKDROP SAYS SO, which is the question a compositor asks before it
-		// reorders or caches anything.
-		let _ = reads;
-		Ok(())
+		canvas.begin_layer(Some(RectF::new(left as f32, top as f32, (right - left) as f32, (bottom - top) as f32)), 1.0, BlendMode::Normal, Some(handle))?;
+		canvas.fill_path(rect_path(RectF::new(left as f32, top as f32, (right - left) as f32, (bottom - top) as f32)), solid(1.0, 1.0, 1.0, 0.1), FillRule::NonZero)?;
+		canvas.end_layer()
 	})?;
-	require!(frame.pixel(16, 17)[2] > 0, "the blue under the panel is blurred past the edge it had: {:?}", frame.pixel(16, 17));
-	Ok(())
+	let kernel = gaussian(3.0);
+	// THE BACKDROP, premultiplied: opaque blue left of the split and opaque red from it.
+	let under = |x: i64| if x < split { [0.0, 0.0, 1.0, 1.0] } else { [1.0, 0.0, 0.0, 1.0] };
+	frame.compare(|x, y| {
+		let (x, y) = (x as i64, y as i64);
+		let backdrop = under(x);
+		if inside(x, left, right) * inside(y, top, bottom) == 0.0 {
+			return (backdrop, true);
+		}
+		// The backdrop inside the panel's bounds, blurred: it varies only across, so the blur is a sum across
+		// times a sum down, and outside the bounds there is nothing for it to read.
+		let down = blurred(&kernel, y, |at| inside(at, top, bottom));
+		let blur: [f64; 4] = core::array::from_fn(|channel| blurred(&kernel, x, |at| inside(at, left, right) * under(at)[channel]) * down);
+		// And composited over the backdrop at full opacity.
+		(core::array::from_fn(|channel| blur[channel] + (1.0 - blur[3]) * backdrop[channel]), false)
+	})
 }

@@ -227,6 +227,10 @@ log=pathlib.Path(sys.argv[1]).read_text()
 expected,width,height=map(int,sys.argv[2:])
 match=re.search(r"presented \d+ frame\(s\) rebuilt=(\d+)",log)
 assert expected>=2 and match and int(match[1])>=expected, "the same live demo must rebuild for the requested aspect changes"
+# A RESIZE IS MEASURED SEPARATELY: its rebuilds' allocations, apart from the steady frames' zero.
+resized=re.search(r"resize rebuilt (\d+) allocations max (\d+) total (\d+)",log)
+assert resized and int(resized[1])==int(match[1]), "the resize rebuilds' allocations must be reported apart from the steady frames"
+print(f"3d-demo: {resized[1]} resize rebuild(s), at most {resized[2]} allocation(s) each, {resized[3]} in all")
 assert f"scene {width}x{height}" in log, "the scene's final render extent must follow the restored native surface"
 RESIZED
 
@@ -312,6 +316,10 @@ if phase=="core" and width=="640" and height=="480":
     assert elapsed, "missing complete frame-window elapsed time"
     elapsed_ns,maximum=map(int,elapsed.groups())
     assert median<=33333 and elapsed_ns<=samples*1_000_000_000//30, f"stable 30 FPS floor missed: median={median}us, window={elapsed_ns}ns, p99/max={p99}/{maximum}us"
+    # BOUNDED PRESENT LATENCY, the floor's other half: the slowest present of the run inside one frame interval at
+    # thirty frames a second - a present that took longer than that is a frame the floor missed, whatever the median.
+    present=re.search(r"present_max_us (\d+)",text)
+    assert present and int(present[1])<=33333, f"present latency unbounded: present_max={present[1] if present else 'missing'}us, over one 30 FPS interval"
 if phase=="extended":
     assert "HDR chain executed six downsamples, five upsamples and resolve" in text
     assert "test3d-sw: postprocess " in text and "test3d-sw: shadow " in text and "HDR prepared bytes " in text

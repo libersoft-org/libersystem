@@ -56,7 +56,11 @@ pub mod opcode {
 	pub const WRITE_SECURE_CONNECTIONS_HOST_SUPPORT: u16 = 0x0C7A;
 	pub const READ_LOCAL_SUPPORTED_FEATURES: u16 = 0x1003;
 	pub const READ_BUFFER_SIZE: u16 = 0x1005;
+	pub const READ_ENCRYPTION_KEY_SIZE: u16 = 0x1408;
 }
+
+/// The status a controller answers a command it does not implement with.
+pub const UNKNOWN_COMMAND: u8 = 0x01;
 
 /// Classic event codes.
 pub mod event {
@@ -267,6 +271,21 @@ pub fn passkey_reply(address: &[u8; 6], passkey: u32) -> Vec<u8> {
 
 pub fn handle_only(handle: u16) -> Vec<u8> {
 	handle.to_le_bytes().to_vec()
+}
+
+/// `Read Encryption Key Size`'s return parameters: the status, the connection handle and the key's length in octets -
+/// `None` for an answer too short to carry them.
+pub fn encryption_key_size(params: &[u8]) -> Option<(u8, u16, u8)> {
+	let &[status, low, high, size, ..] = params else { return None };
+	Some((status, u16::from_le_bytes([low, high]), size))
+}
+
+/// THE SHORTEST ENCRYPTION KEY A BR/EDR LINK IS HELD TO: sixteen octets under a Secure Connections link key, seven under
+/// any other. LMP's key-size negotiation is not authenticated, so a radio attacker can bring a link down to one octet
+/// under a bond reported as authenticated Secure Connections (KNOB, CVE-2019-9506); a link encrypted with a shorter key
+/// than its own key promises is encrypted in name only.
+pub fn key_size_holds(octets: u8, secure_connections: bool) -> bool {
+	octets >= if secure_connections { 16 } else { 7 }
 }
 
 pub fn set_encryption(handle: u16, on: bool) -> Vec<u8> {

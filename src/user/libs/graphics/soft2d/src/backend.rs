@@ -140,7 +140,11 @@ enum Step {
 		operator: Operator,
 		filter: Option<FilterHandle>,
 	},
-	EndLayer,
+	/// `begin` is the index of its `BeginLayer`, whose graph decides how far past the tile the layer's
+	/// content has to be drawn - see `margins`.
+	EndLayer {
+		begin: u32,
+	},
 }
 
 /// One glyph of a run, where it lands on the target and in the form it is drawn in.
@@ -180,7 +184,14 @@ pub struct SoftPrepared {
 	/// What the destination said it can show, carried from the description to the one place that
 	/// encodes into it.
 	output: graphics_core::pixel::OutputLuminance,
-	expansion: u32,
+	/// HOW FAR PAST ITS TILE EACH COMMAND HAS TO BE RIGHT - see `margins` - with the most the TOP level
+	/// ever needs, which is what a tile's working copy covers, and the most anything needs, which is what
+	/// the clip stack starts from and every surface is sized to.
+	margins: Vec<u32>,
+	top_margin: u32,
+	max_margin: u32,
+	/// Each filter graph's reach and whether it reads the backdrop - see `graph_reach`.
+	reach: Vec<(u32, bool)>,
 	scratch_bytes: u64,
 	damage: Option<PixelRect>,
 	/// THE PART OF EACH TILE THE ROUND TRIP COVERS - see `tile_regions`.
@@ -297,6 +308,9 @@ pub struct Soft2d<'a> {
 	/// THE TILE-MAJOR INTERMEDIATE, when a frame's units are tiles on more than one lane: one slot per
 	/// unit, each a tile of the target's format.
 	intermediate: Vec<u8>,
+	/// THE TARGET AS THE FRAME FOUND IT, for a list whose tiles read past their own edge - see `take_snapshot`.
+	/// Grown at `prepare` and never shrunk, as the intermediate is.
+	snapshot: Vec<u8>,
 	/// THE TRANSFER FUNCTIONS THIS DRAWING NEEDS, built once in `prepare`. One per distinct function
 	/// rather than one per image: four images in sRGB share one table, and building a table per image
 	/// would spend more on the tables than the powers they replace.
@@ -319,7 +333,7 @@ impl<'a> Soft2d<'a> {
 		// at four to sixty-four workers they beat bands, which stop at eight units of a 480-row frame, and
 		// tiles through the intermediate, which copy what was drawn after every unit has returned (the
 		// numbers are in `docs/PERF.md`). A frame on one lane is cut into bands whatever this says.
-		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Rectangles, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), tables: Vec::new() }
+		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Rectangles, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), snapshot: Vec::new(), tables: Vec::new() }
 	}
 
 	/// Replay a frame's units on `workers`' lanes. `Serial` - this thread, unit after unit - is the
@@ -354,7 +368,7 @@ impl<'a> Soft2d<'a> {
 	/// Release borrowed providers while retaining the renderer's allocated scratch and caches.
 	/// The returned backend uses serial workers until the caller supplies a pool again.
 	pub fn unbind(self) -> Soft2d<'static> {
-		Soft2d { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: self.unit_kind, cache: self.cache, lanes: self.lanes, shader_table: self.shader_table, unit_table: self.unit_table, finished: self.finished, intermediate: self.intermediate, tables: self.tables }
+		Soft2d { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: self.unit_kind, cache: self.cache, lanes: self.lanes, shader_table: self.shader_table, unit_table: self.unit_table, finished: self.finished, intermediate: self.intermediate, snapshot: self.snapshot, tables: self.tables }
 	}
 
 	/// Refresh changed image content in place. The layout generation is structural and must still
@@ -398,7 +412,7 @@ impl<'a> Soft2d<'a> {
 			}
 			prepared.images[index] = *record;
 		}
-		refresh_tiles_without_backdrop(&prepared.tiling, &prepared.bins, &prepared.steps, &prepared.covers, &mut prepared.no_backdrop);
+		refresh_tiles_without_backdrop(&prepared.tiling, &prepared.bins, &prepared.steps, &prepared.covers, &prepared.margins, &mut prepared.no_backdrop);
 		Ok(())
 	}
 
@@ -628,7 +642,7 @@ fn tile_regions(tiling: &Tiling, bins: &Bins, steps: &[Step], bounds: &[Option<P
 		let mut whole = false;
 		for command in bins.commands(index) {
 			match steps.get(*command as usize) {
-				Some(Step::BeginLayer { .. } | Step::EndLayer | Step::PushClipMask { .. }) => {
+				Some(Step::BeginLayer { .. } | Step::EndLayer { .. } | Step::PushClipMask { .. }) => {
 					whole = true;
 					break;
 				}
@@ -651,13 +665,18 @@ fn tile_regions(tiling: &Tiling, bins: &Bins, steps: &[Step], bounds: &[Option<P
 	answer
 }
 
-fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>]) -> Vec<Option<u32>> {
+fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>], margins: &[u32]) -> Vec<Option<u32>> {
 	let mut answer = alloc::vec![None;tiling.count()];
-	refresh_tiles_without_backdrop(tiling, bins, steps, covers, &mut answer);
+	refresh_tiles_without_backdrop(tiling, bins, steps, covers, margins, &mut answer);
 	answer
 }
 
-fn refresh_tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>], answer: &mut [Option<u32>]) {
+/// A COVER THAT SKIPS THE DECODE COVERS WHAT ITS TILE NEEDS OF THE TOP LEVEL FROM IT ON: the tile and its
+/// margin at that command - see `margins`. What a tile's working copy holds beyond that margin is never
+/// read after the covering command, because what the top level needs only shrinks going forwards, so the
+/// previous tile's pixels left there are harmless; inside it, they would be read as backdrop.
+fn refresh_tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>], margins: &[u32], answer: &mut [Option<u32>]) {
+	let target = PixelRect::new(0, 0, tiling.extent.width, tiling.extent.height);
 	for index in 0..tiling.count() {
 		let tile = tiling.tile(index);
 		let mut clips: u32 = 0;
@@ -669,9 +688,10 @@ fn refresh_tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], 
 				Some(Step::PushClip { .. } | Step::PushClipRect { .. } | Step::PushClipMask { .. }) => clips += 1,
 				Some(Step::PopClip) => clips = clips.saturating_sub(1),
 				Some(Step::BeginLayer { .. }) => layers += 1,
-				Some(Step::EndLayer) => layers = layers.saturating_sub(1),
+				Some(Step::EndLayer { .. }) => layers = layers.saturating_sub(1),
 				_ => {
-					if clips == 0 && layers == 0 && covers.get(*command as usize).copied().flatten().is_some_and(|cover| cover.contains_rect(&tile)) {
+					let needed = grown(tile, margins.get(*command as usize).copied().unwrap_or(0)).intersection(&target);
+					if clips == 0 && layers == 0 && covers.get(*command as usize).copied().flatten().is_some_and(|cover| cover.contains_rect(&needed)) {
 						covered_tile = Some(if simple { *command } else { 0 });
 					}
 				}
@@ -679,6 +699,131 @@ fn refresh_tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], 
 		}
 		answer[index] = if tile.is_empty() { None } else { covered_tile };
 	}
+}
+
+/// A rectangle grown by `by` pixels on every side, stopping at zero - the target's own edge on that side.
+fn grown(rect: PixelRect, by: u32) -> PixelRect {
+	let (x, y) = (rect.x.saturating_sub(by), rect.y.saturating_sub(by));
+	let right = rect.x.saturating_add(rect.width).saturating_add(by);
+	let bottom = rect.y.saturating_add(rect.height).saturating_add(by);
+	PixelRect::new(x, y, right - x, bottom - y)
+}
+
+/// HOW FAR A GRAPH READS PAST THE PIXEL IT WRITES, in whole device pixels - the profile's bounds map asked
+/// about one pixel - and whether it reads the BACKDROP. Bounded by the profile's largest filter radius, as
+/// a layer's scratch always was.
+fn graph_reach(graph: &render2d::filter::FilterGraph) -> (u32, bool) {
+	let probe = RectF::new(0.0, 0.0, 1.0, 1.0);
+	let needed = graph.required_input(probe);
+	let grow = (probe.x - needed.x).max(probe.y - needed.y).max(needed.right() - probe.right()).max(needed.bottom() - probe.bottom());
+	let reach = if grow.is_finite() && grow > 0.0 { (libm::ceilf(grow) as u32).min(graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_radius) } else { 0 };
+	(reach, graph.reads_backdrop())
+}
+
+/// HOW FAR PAST ITS TILE EACH COMMAND HAS TO BE RIGHT, for the tile's own pixels to be.
+///
+/// A FILTER READS AROUND THE PIXEL IT WRITES. A blur's output at a tile's edge is a sum over its layer's
+/// content up to three standard deviations past that edge, so the tile's replay has to draw that content
+/// there - from commands binned that much further out - and a graph that reads the BACKDROP reads what its
+/// parent already holds around the tile, so everything the parent drew before the layer has to be right
+/// that far out as well. A replay that drew only the tile blurred against nothing at every tile boundary.
+///
+/// WALKED BACKWARDS, because that is the direction the question runs: the target needs the tile and no
+/// more; a layer's composite needs its graph's output where its parent needs it; the graph needs the
+/// layer's content its reach further out; and a backdrop read raises what the parent needs of everything
+/// it drew BEFORE the layer. What a level needs only grows going backwards, so what it needs at its
+/// `BeginLayer` is the most its content is ever needed, which is what its surface has to cover.
+///
+/// THE ANSWER, per command: a draw's or a clip's is its level's need where it stands, a `BeginLayer`'s the
+/// most its own content is needed, and an `EndLayer`'s what its parent needs of the composite - with the
+/// most the TOP level ever needs beside them. Nothing is needed past the target, so `ceiling` - the
+/// target's larger side - bounds every answer.
+fn margins(steps: &[Step], reach: &[(u32, bool)], ceiling: u32) -> (Vec<u32>, u32) {
+	let mut margins = alloc::vec![0u32; steps.len()];
+	// What each open level needs, the target's first.
+	let mut needs: Vec<u32> = alloc::vec![0];
+	for (index, step) in steps.iter().enumerate().rev() {
+		let level = needs.last().copied().unwrap_or(0);
+		match step {
+			Step::EndLayer { begin } => {
+				let (grow, backdrop) = match steps.get(*begin as usize) {
+					Some(Step::BeginLayer { filter: Some(handle), .. }) => reach.get(handle.0 as usize).copied().unwrap_or((0, false)),
+					_ => (0, false),
+				};
+				let inner = level.saturating_add(grow).min(ceiling);
+				margins[index] = level;
+				if backdrop && let Some(parent) = needs.last_mut() {
+					*parent = (*parent).max(inner);
+				}
+				needs.push(inner);
+			}
+			Step::BeginLayer { .. } => margins[index] = if needs.len() > 1 { needs.pop().unwrap_or(level) } else { level },
+			_ => margins[index] = level,
+		}
+	}
+	(margins, needs.first().copied().unwrap_or(0))
+}
+
+/// WHAT EACH COMMAND OF ONE TILE'S BIN HAS TO BE RIGHT OVER: `margins` asked again for one tile, with every
+/// layer's own bounds in the answer.
+///
+/// THE MARGINS ARE THE WORST CASE OVER THE WHOLE TARGET, which is what bins a command and sizes a surface.
+/// A tile far from a frosted panel needs nothing of what the panel reads around itself, and a card's shadow
+/// needs the card's content only around where the card composites into the tile. So this is the same walk,
+/// backwards over the tile's own bin, carrying a rectangle where `margins` carries a distance: a layer
+/// composites into what its parent needs INSIDE ITS BOUNDS, its content is needed that far out by its
+/// graph's reach, and a graph that reads the backdrop raises its parent's need by the part of that inside
+/// its bounds, which is all of the backdrop it reads. A layer that composites nothing into what the tile
+/// needs is needed nowhere, and so is everything drawn inside it.
+///
+/// `out` gets one rectangle per command of the bin - a `BeginLayer`'s is what its surface covers and an
+/// `EndLayer`'s what it composites into - and the answer is what the top level needs, which is what the
+/// tile's working copy holds, and the hull of everything, which is where the clip stack has to answer.
+/// Each rectangle lies inside the tile grown by the command's margin, so the reservations cover it.
+fn tile_needs(prepared: &SoftPrepared, tile: PixelRect, bin: &[u32], needs: &mut Vec<PixelRect>, out: &mut Vec<PixelRect>) -> (PixelRect, PixelRect) {
+	let target = PixelRect::new(0, 0, prepared.tiling.extent.width, prepared.tiling.extent.height);
+	out.clear();
+	out.resize(bin.len(), tile);
+	needs.clear();
+	needs.push(tile);
+	let mut everything = tile;
+	for (position, command) in bin.iter().enumerate().rev() {
+		let level = needs.last().copied().unwrap_or(tile);
+		let region = match prepared.steps.get(*command as usize) {
+			Some(Step::EndLayer { begin }) => {
+				let (stated, filter) = match prepared.steps.get(*begin as usize) {
+					Some(Step::BeginLayer { bounds, filter, .. }) => (bounds.map_or(target, crate::tile::cover), *filter),
+					_ => (target, None),
+				};
+				let composite = level.intersection(&stated);
+				let (reach, backdrop) = filter.and_then(|handle| prepared.reach.get(handle.0 as usize)).copied().unwrap_or((0, false));
+				let inner = if composite.is_empty() || reach == 0 { composite } else { grown(composite, reach).intersection(&target) };
+				if backdrop && let Some(parent) = needs.last_mut() {
+					*parent = hull(*parent, inner.intersection(&stated));
+				}
+				needs.push(inner);
+				composite
+			}
+			Some(Step::BeginLayer { .. }) if needs.len() > 1 => needs.pop().unwrap_or(level),
+			_ => level,
+		};
+		if let Some(slot) = out.get_mut(position) {
+			*slot = region;
+		}
+		everything = hull(everything, region);
+	}
+	(needs.first().copied().unwrap_or(tile), everything)
+}
+
+/// The smallest rectangle covering both, where an empty one covers nothing.
+fn hull(left: PixelRect, right: PixelRect) -> PixelRect {
+	if left.is_empty() {
+		return right;
+	}
+	if right.is_empty() {
+		return left;
+	}
+	union(left, right)
 }
 
 /// A rectangle as a path, which is how an image's destination enters the one rasteriser.
@@ -807,8 +952,9 @@ impl<'a> Backend for Soft2d<'a> {
 					(Step::PushClip { edges: crate::raster::Edges::build(&contours), rule: *rule, antialias: *antialias, bounds: clip_bounds, inverse: *inverse }, None)
 				}
 				Command::PopClip => (Step::PopClip, None),
+				// AN END IS PAIRED WITH ITS BEGINNING BELOW, once every command has its step.
 				Command::BeginLayer { bounds: layer, opacity, blend, operator, filter } => (Step::BeginLayer { bounds: *layer, opacity: *opacity, blend: *blend, operator: *operator, filter: *filter }, None),
-				Command::EndLayer => (Step::EndLayer, None),
+				Command::EndLayer => (Step::EndLayer { begin: u32::MAX }, None),
 			};
 			steps.push(step);
 			bounds.push(bound);
@@ -819,20 +965,31 @@ impl<'a> Backend for Soft2d<'a> {
 			}
 		}
 
-		// THE FILTER EXPANSION IS WHAT A LAYER'S SCRATCH IS GROWN BY, and it is taken from the graphs
-		// this list actually carries rather than from the profile's ceiling: reserving for a
-		// two-hundred-and-fifty-six-pixel blur that nothing asks for is sixty megabytes of scratch a
-		// drawing of rectangles would have to fit inside its budget.
-		let mut expansion = 0u32;
-		for graph in &resources.filters {
-			let probe = RectF::new(0.0, 0.0, 1.0, 1.0);
-			let needed = graph.required_input(probe);
-			let grow = (probe.x - needed.x).max(probe.y - needed.y).max(needed.right() - probe.right()).max(needed.bottom() - probe.bottom());
-			if grow.is_finite() && grow > 0.0 {
-				expansion = expansion.max(libm::ceilf(grow) as u32);
+		// EVERY END KNOWS WHERE ITS LAYER BEGAN. The list's own validation refused one that does not balance.
+		// And the deepest the layers nest is how many are ever open at once.
+		let mut open: Vec<usize> = Vec::new();
+		let mut deepest = 0usize;
+		for index in 0..steps.len() {
+			match steps[index] {
+				Step::BeginLayer { .. } => {
+					open.push(index);
+					deepest = deepest.max(open.len());
+				}
+				Step::EndLayer { .. } => {
+					if let Some(begin) = open.pop() {
+						steps[index] = Step::EndLayer { begin: begin as u32 };
+					}
+				}
+				_ => {}
 			}
 		}
-		expansion = expansion.min(graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_radius);
+		// HOW FAR PAST ITS TILE EACH COMMAND HAS TO BE RIGHT, from what the graphs this list actually
+		// carries reach - see `margins` - rather than from the profile's ceiling: reserving for a
+		// two-hundred-and-fifty-six-pixel blur that nothing asks for is sixty megabytes of scratch a
+		// drawing of rectangles would have to fit inside its budget.
+		let reach: Vec<(u32, bool)> = resources.filters.iter().map(graph_reach).collect();
+		let (margins, top_margin) = margins(&steps, &reach, target.extent.width.max(target.extent.height));
+		let max_margin = margins.iter().copied().max().unwrap_or(0).max(top_margin);
 
 		// THE PYRAMIDS, for the images this list samples with minification. Built here because a
 		// pyramid is an allocation and a pyramid per frame is the allocation this design exists to
@@ -890,12 +1047,24 @@ impl<'a> Backend for Soft2d<'a> {
 			}
 		}
 		let tiling = Tiling::new(target.extent, TILE_SIZE);
-		let bins = Bins::build(&tiling, &bounds);
+		// A DRAW IS BINNED WHERE IT HAS TO BE RIGHT, which is its own bound grown by its margin: the tiles
+		// whose filtered neighbourhood it is in replay it as well. A bound that is empty stays empty - a
+		// drawing wholly outside the target is not there to be filtered into it.
+		let binned: Vec<Option<PixelRect>> = bounds.iter().zip(&margins).map(|(bound, margin)| bound.map(|rect| if rect.is_empty() || *margin == 0 { rect } else { grown(rect, *margin).intersection(&target_rect) })).collect();
+		let bins = Bins::build(&tiling, &binned);
 		let regions = tile_regions(&tiling, &bins, &steps, &bounds);
-		let scratch_extent = (TILE_SIZE + expansion * 2, TILE_SIZE + expansion * 2);
+		// A TILE GROWN BY A MARGIN, AND NEVER PAST THE TARGET: what a surface holds is a part of the target.
+		let around = |margin: u32| {
+			let side = TILE_SIZE.saturating_add(margin.saturating_mul(2));
+			(side.min(target.extent.width).max(1), side.min(target.extent.height).max(1))
+		};
+		let scratch_extent = around(max_margin);
 		// ONE SURFACE PER OPEN LAYER, one per filter node of the largest graph, one for the blur's
-		// second pass, and one for the tile itself.
-		let layers_wanted = list.commands().iter().filter(|command| matches!(command, Command::BeginLayer { .. })).count();
+		// second pass, and one for the tile itself. OPEN, and not one per layer the list has: a layer gives
+		// its surface back when it ends, so a list of eleven cards side by side holds one at a time - and a
+		// surface reserved for each would be ten tiles' worth of scratch per lane that nothing ever takes,
+		// charged against the ceiling the lanes share.
+		let layers_wanted = deepest;
 		let filter_nodes = resources.filters.iter().map(|graph| graph.nodes().len()).max().unwrap_or(0);
 		let surfaces = layers_wanted + filter_nodes + 2;
 		// A RECTANGLE CLIP RESERVES NO MASK, because it never takes one - see `Step::PushClipRect`.
@@ -903,7 +1072,18 @@ impl<'a> Backend for Soft2d<'a> {
 		let clips_wanted = steps.iter().filter(|step| matches!(step, Step::PushClip { .. } | Step::PushClipMask { .. })).count();
 		// EVERY CLIP LEVEL a tile can push, rectangles included: what a lane's clip stack is reserved to.
 		let clip_levels = steps.iter().filter(|step| matches!(step, Step::PushClip { .. } | Step::PushClipRect { .. } | Step::PushClipMask { .. })).count();
-		let shape = LaneShape { surfaces, extent: scratch_extent, space: target.color_space, masks: clips_wanted, edges: widest_edges, clips: clip_levels, layers: layers_wanted, nodes: filter_nodes };
+		// A TILE'S OWN RECTANGLES, one per command of the longest bin and one per open level, where anything
+		// reads past a tile at all - see `tile_needs`.
+		let bin = if max_margin > 0 { (0..tiling.count()).map(|index| bins.commands(index).len()).max().unwrap_or(0) } else { 0 };
+		let shape = LaneShape { surfaces, extent: scratch_extent, tile: around(top_margin), space: target.color_space, masks: clips_wanted, edges: widest_edges, clips: clip_levels, layers: layers_wanted, nodes: filter_nodes, bin };
+		// THE FRAME'S COPY OF THE TARGET, for a list whose tiles read the top level past their own edge -
+		// see `take_snapshot` - on a target that has more than the one tile, past which there is nothing. One
+		// per frame and not per lane: every lane only reads it.
+		let snapshot_bytes = if top_margin > 0 && tiling.count() > 1 { target.format.minimum_row_bytes(target.extent.width).ok_or(Error::Allocation)? as usize * target.extent.height as usize } else { 0 };
+		if self.snapshot.len() < snapshot_bytes {
+			self.snapshot.try_reserve_exact(snapshot_bytes - self.snapshot.len()).map_err(|_| Error::Allocation)?;
+			self.snapshot.resize(snapshot_bytes, 0);
+		}
 
 		// THE FIRST LANE IS SETTLED THE WAY THE ONE SET OF SCRATCH ALWAYS WAS, and every frame has it.
 		if self.lanes.is_empty() {
@@ -911,7 +1091,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 		shape.reserve(&mut self.lanes[0])?;
 		let lane_bytes = self.lanes[0].scratch_bytes();
-		let fixed = lane_bytes + bins.scratch_bytes() + (tiling.count() * core::mem::size_of::<Option<u32>>() + covers.capacity() * core::mem::size_of::<Option<PixelRect>>()) as u64;
+		let fixed = lane_bytes + bins.scratch_bytes() + snapshot_bytes as u64 + (tiling.count() * core::mem::size_of::<Option<u32>>() + covers.capacity() * core::mem::size_of::<Option<PixelRect>>()) as u64;
 		let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
 		// THE OPTIONAL COPIES ARE GIVEN BACK BEFORE ANYTHING IS REFUSED, newest first, against the list's
 		// own scratch and ONE lane's - so a frame that fitted before this optimisation existed still fits.
@@ -999,7 +1179,7 @@ impl<'a> Backend for Soft2d<'a> {
 						layers += 1;
 						None
 					}
-					Step::EndLayer => {
+					Step::EndLayer { .. } => {
 						layers = layers.saturating_sub(1);
 						None
 					}
@@ -1017,9 +1197,9 @@ impl<'a> Backend for Soft2d<'a> {
 				cached_images.push(cached);
 			}
 		}
-		let no_backdrop = tiles_without_backdrop(&tiling, &bins, &steps, &covers);
+		let no_backdrop = tiles_without_backdrop(&tiling, &bins, &steps, &covers, &margins);
 		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
-		Ok(SoftPrepared { cached_images, covers, key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), ramps, filters: resources.filters.clone(), kernels, working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop, regions, lanes, unit_kind, units, slot_bytes })
+		Ok(SoftPrepared { cached_images, covers, key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), ramps, filters: resources.filters.clone(), kernels, working, target_transfer: target.color_space.transfer(), output: target.luminance, margins, top_margin, max_margin, reach, scratch_bytes, damage, no_backdrop, regions, lanes, unit_kind, units, slot_bytes })
 	}
 
 	fn render(&mut self, prepared: &Self::Prepared, target: &mut ImageViewMut<'_>) -> Result<(), Error> {
@@ -1030,7 +1210,7 @@ impl<'a> Backend for Soft2d<'a> {
 		// THE BACKEND IS TAKEN APART INTO ITS FIELDS so the shaders can borrow the image table while
 		// the lanes borrow the scratch. Both are `self`, and only disjoint field borrows let one be read
 		// while the other is written.
-		let Soft2d { images, cancellation, workers, lanes, shader_table, unit_table, finished, intermediate, tables, .. } = self;
+		let Soft2d { images, cancellation, workers, lanes, shader_table, unit_table, finished, intermediate, snapshot, tables, .. } = self;
 		// A PREPARED LIST FROM ANOTHER BACKEND reserved lanes this one does not have.
 		if lanes.len() < prepared.lanes.max(1) || finished.len() < prepared.units.len() || (prepared.unit_kind == UnitKind::Tiles && intermediate.len() < prepared.units.len() * prepared.slot_bytes) {
 			return Err(Error::Allocation);
@@ -1065,6 +1245,12 @@ impl<'a> Backend for Soft2d<'a> {
 		let cancellation = *cancellation;
 		let shaders_ref: &[Shader<'_>] = &shaders;
 		let cached_sources_present = shaders.iter().zip(&prepared.cached_images).all(|(shader, cache)| cache.is_none() || !matches!(shader, Shader::Nothing));
+		// THE TARGET AS THE FRAME FOUND IT, taken before any unit runs, when a tile decodes past its own
+		// edge from a unit that holds only its own rows - see `take_snapshot`. Tiles drawn through the
+		// intermediate read the target itself, which nothing writes until every unit has returned.
+		let decodes = (0..prepared.tiling.count()).any(|index| !prepared.tiling.tile(index).is_empty() && !prepared.bins.commands(index).is_empty() && prepared.no_backdrop.get(index).copied().flatten().filter(|_| cached_sources_present).is_none());
+		let snapshot = if prepared.top_margin > 0 && prepared.tiling.count() > 1 && prepared.unit_kind != UnitKind::Tiles && decodes { Some(take_snapshot(target, snapshot)?) } else { None };
+		let snapshot = snapshot.as_ref();
 		let work = |lane: &mut Lane, unit: &mut Unit<'_>| {
 			// A UNIT HANDED OUT TWICE IS REPLAYED ONCE, and a unit after the lowest that failed is not
 			// replayed at all: the serial walk would never have reached it.
@@ -1092,8 +1278,7 @@ impl<'a> Backend for Soft2d<'a> {
 				if tile.is_empty() || prepared.bins.commands(index).is_empty() {
 					continue;
 				}
-				lane.tile.rebase((tile.x, tile.y));
-				if let Err(error) = replay(prepared, &mut unit.access, tile, index, lane, shaders_ref, &lookup, table, cached_sources_present) {
+				if let Err(error) = replay(prepared, &mut unit.access, tile, index, lane, shaders_ref, &lookup, table, cached_sources_present, snapshot) {
 					failed.fetch_min(unit.index, Ordering::Relaxed);
 					if lane.failure.as_ref().is_none_or(|(at, _)| unit.index < *at) {
 						lane.failure = Some((unit.index, error));
@@ -1285,6 +1470,30 @@ fn rectangle_units<'u>(units: &mut Vec<Unit<'u>>, target: &'u mut ImageViewMut<'
 	Ok(())
 }
 
+/// THE TARGET AS THE FRAME FOUND IT, in `storage`, for tiles that read the top level past their own edge.
+///
+/// A BACKDROP READ AT A TILE'S EDGE IS A READ OF WHAT WAS UNDER THE LAYER, and part of that is in the tile
+/// beside it - as the frame found it, not as that tile's replay left it. In the serial walk the tiles above
+/// and to the left are finished before this one starts, in a pool any neighbour may be, and a unit of rows
+/// or of one tile holds no byte of its neighbours to read in any case. So the frame keeps one copy, taken
+/// before any unit runs, and every tile that decodes past its edge decodes from it - its own part included,
+/// which nobody else writes. Rows in picture order, so a bottom-left target reads the same.
+fn take_snapshot<'s>(target: &ImageViewMut<'_>, storage: &'s mut [u8]) -> Result<ImageView<'s>, Error> {
+	let layout = *target.layout();
+	let row_bytes = layout.minimum_row_bytes().ok_or(Error::Allocation)? as usize;
+	let copy = graphics_core::layout::ImageLayout::new(layout.extent, row_bytes as u32, layout.storage, graphics_core::layout::RowOrigin::TopLeft, layout.semantics).map_err(crate::target::from_core)?;
+	// A TARGET OF ANOTHER FORMAT THAN THE ONE PREPARED FOR is a copy that does not fit the reservation,
+	// and the replay allocates nothing.
+	let storage = storage.get_mut(..row_bytes * layout.extent.height as usize).ok_or(Error::Allocation)?;
+	let source = target.as_view();
+	for (y, row) in storage.chunks_exact_mut(row_bytes.max(1)).enumerate() {
+		if let Some(from) = source.row(y as u32) {
+			row.copy_from_slice(from);
+		}
+	}
+	ImageView::new(copy, storage).map_err(crate::target::from_core)
+}
+
 /// Copy every finished unit's slot into the target: the part of each tile its replay wrote.
 fn assemble(target: &mut ImageViewMut<'_>, prepared: &SoftPrepared, intermediate: &[u8], finished: &[bool]) {
 	let bytes_per_pixel = target.layout().storage.bytes_per_pixel() as usize;
@@ -1310,30 +1519,49 @@ fn assemble(target: &mut ImageViewMut<'_>, prepared: &SoftPrepared, intermediate
 
 /// Replay one tile: every command binned to it, in bin order, into the lane's tile surface - then
 /// encoded into the unit's part of the target.
+///
+/// THE TILE IS REPLAYED WITH THE MARGIN ITS FILTERS READ - see `margins`. The working copy holds the tile
+/// and what the top level has to be right over around it, each command is drawn as far past the tile as
+/// it has to be right, into whatever its level is, and a layer's surface covers what its content is needed
+/// over; only the tile itself is encoded back. So a blur at the tile's edge sums content this replay drew
+/// beyond it, and the neighbouring tile's replay draws the same content from its own side.
 #[allow(clippy::too_many_arguments)]
-fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, index: usize, lane: &mut Lane, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>, cached_sources_present: bool) -> Result<(), Error> {
+fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, index: usize, lane: &mut Lane, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>, cached_sources_present: bool, snapshot: Option<&ImageView<'_>>) -> Result<(), Error> {
 	{
-		let Lane { raster, pool, masks, spans, tile: surface, clips, layers, nodes, .. } = lane;
+		let Lane { raster, pool, masks, spans, tile: surface, clips, layers, nodes, needs, regions, .. } = lane;
+		let bin = prepared.bins.commands(index);
+		// WHAT EACH COMMAND HAS TO BE RIGHT OVER IN THIS TILE - see `tile_needs` - and so what the working copy
+		// holds, which is the most the top level is needed over, and what the clip stack starts from, which
+		// is the most anything is: a clip pushed at the top level clips the content of a filtered layer
+		// opened under it, and that content reaches further than the top level does. A list that reads
+		// nothing past a tile needs the tile, for every command.
+		let per_tile = prepared.max_margin > 0;
+		let (working, base) = if per_tile { tile_needs(prepared, tile, bin, needs, regions) } else { (tile, tile) };
+		surface.aim(working);
 		// THE DECODE IS SKIPPED FOR A TILE SOMETHING OVERWRITES WHOLE. See `tiles_without_backdrop`:
-		// the scratch then still holds the previous tile's pixels, every one of which the covering
-		// command replaces, and the encode on the way out writes a full tile either way.
+		// the scratch then still holds the previous tile's pixels, every one of which that is read again
+		// the covering command replaces, and the encode on the way out writes a full tile either way.
 		// THE ROUND TRIP IS OVER WHAT CAN CHANGE - see `tile_regions` - and the tile is the answer
 		// whenever anything in it is not a plain draw.
 		let region = prepared.regions.get(index).copied().unwrap_or(tile);
 		let first_command = prepared.no_backdrop.get(index).copied().flatten().filter(|_| cached_sources_present);
 		if first_command.is_none() {
-			surface.load(access, region, prepared.working, table)?;
+			// A TOP LEVEL READ PAST THE TILE IS DECODED PAST IT, as the frame found it - see `take_snapshot`.
+			let load = if prepared.top_margin > 0 { working } else { region };
+			surface.load(access, load, prepared.working, table, snapshot)?;
 		}
 		// THE STACKS ARE THE LANE'S, reserved at `prepare` to the depths the list reaches.
-		clips.reset(tile);
+		clips.reset(base);
 		layers.clear();
-		for command in prepared.bins.commands(index) {
+		for (position, command) in bin.iter().enumerate() {
 			// With no clips or layers, an opaque whole-tile overwrite also hides every earlier
 			// draw. Complex bins retain their full replay because filters may read outside a tile.
 			if *command < first_command.unwrap_or(0) {
 				continue;
 			}
 			let Some(step) = prepared.steps.get(*command as usize) else { continue };
+			// AS FAR PAST THE TILE AS THIS COMMAND HAS TO BE RIGHT, which is all of it that is drawn.
+			let needed = if per_tile { regions.get(position).copied().unwrap_or(tile) } else { tile };
 			match step {
 				// A FILL AND AN IMAGE ARE THE SAME DRAW with different paints, which is what makes an
 				// image one path through the rasteriser rather than a second blitter with its own
@@ -1354,34 +1582,34 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 					// panel that was clipping it perfectly.
 					let (into, bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
 						Some(layer) => (&mut layer.surface, layer.bounds),
-						None => (&mut *surface, tile),
+						None => (&mut *surface, working),
 					};
-					let bounds = bounds.intersection(&clips.bounds());
+					let bounds = bounds.intersection(&clips.bounds()).intersection(&needed);
 					fill_edges(raster, spans, edges, rule, antialias, bounds, into, shader, clips, *opacity, *blend, *operator);
 				}
 				Step::Glyphs { placed, blend, operator, opacity, .. } => {
 					let Some(shader) = shaders.get(*command as usize) else { continue };
 					let (into, bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
 						Some(layer) => (&mut layer.surface, layer.bounds),
-						None => (&mut *surface, tile),
+						None => (&mut *surface, working),
 					};
-					let bounds = bounds.intersection(&clips.bounds());
+					let bounds = bounds.intersection(&clips.bounds()).intersection(&needed);
 					draw_placed(raster, spans, placed, bounds, into, shader, clips, *opacity, *blend, *operator, prepared.working);
 				}
 				Step::AliasedLines { points, blend, operator, opacity, .. } => {
 					let Some(shader) = shaders.get(*command as usize) else { continue };
 					let (into, bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
 						Some(layer) => (&mut layer.surface, layer.bounds),
-						None => (&mut *surface, tile),
+						None => (&mut *surface, working),
 					};
-					let bounds = bounds.intersection(&clips.bounds());
+					let bounds = bounds.intersection(&clips.bounds()).intersection(&needed);
 					draw_aliased_lines(points, bounds, into, shader, clips, *opacity, *blend, *operator);
 				}
 				// @handles: ClipRoundedRect, ClipPath, ClipInverse
 				Step::PushClip { edges, rule, antialias, bounds, inverse } => {
 					let parent = match layers.last() {
 						Some(layer) => layer.bounds,
-						None => tile,
+						None => base,
 					};
 					// AN INVERSE CLIP'S LEVEL COVERS THE PARENT and not the shape: what it keeps is
 					// everything the shape misses, so a level bounded by the shape would clip away the
@@ -1418,7 +1646,7 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 				Step::PushClipRect { bounds } => {
 					let parent = match layers.last() {
 						Some(layer) => layer.bounds,
-						None => tile,
+						None => base,
 					};
 					clips.push(ClipLevel::rectangle(parent.intersection(bounds)));
 				}
@@ -1426,7 +1654,7 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 				Step::PushClipMask { image, transform, inverse } => {
 					let parent = match layers.last() {
 						Some(layer) => layer.bounds,
-						None => tile,
+						None => base,
 					};
 					let sampler = lookup.lookup(image.0).and_then(|(view, _, table)| graphics_core::sample::Sampler::with_table(view, prepared.working, graphics_core::sample::Spread::Clamp, table).ok());
 					let inverse_transform = transform.inverse();
@@ -1459,26 +1687,31 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 					}
 				}
 				Step::PopClip => clips.pop(masks),
-				Step::BeginLayer { bounds, opacity, blend, operator, filter } => {
-					let parent = match layers.last() {
-						Some(layer) => layer.bounds,
-						None => tile,
-					};
-					let expansion = if filter.is_some() { prepared.expansion } else { 0 };
-					let layer_rect = layer_bounds(*bounds, parent, expansion);
+				Step::BeginLayer { bounds, opacity, blend, operator, filter, .. } => {
+					// THE LAYER'S SURFACE COVERS WHAT ITS CONTENT IS NEEDED OVER, which for a filtered layer
+					// is its parent's need grown by the graph's reach - see `margins`.
+					let layer_rect = layer_bounds(*bounds, needed);
 					match pool.take(layer_rect) {
 						Some(layer_surface) => layers.push(Layer { surface: layer_surface, bounds: layer_rect, opacity: *opacity, blend: *blend, operator: *operator, filter: *filter, clip_depth: clips.depth() }),
 						None => return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes }),
 					}
 				}
 				// @handles: LayerGroupOpacity, LayerBlendMode
-				Step::EndLayer => {
+				Step::EndLayer { .. } => {
 					let Some(layer) = layers.pop() else { continue };
 					// A LAYER CLOSES ITS OWN CLIPS. One left open would apply to whatever came after
 					// the layer, which is a clip nobody pushed.
 					while clips.depth() > layer.clip_depth {
 						clips.pop(masks);
 					}
+					// WHAT THE LAYER IS COMPOSITED FROM is its bounds inside the surface it composites onto,
+					// as far past the tile as its parent is needed there - and that is all of the graph's
+					// output anything reads.
+					let into_bounds = match layers.last() {
+						Some(parent) => parent.bounds,
+						None => working,
+					};
+					let wanted = into_bounds.intersection(&layer.bounds).intersection(&needed);
 					let filtered = match layer.filter.and_then(|handle| prepared.filters.get(handle.0 as usize)) {
 						Some(graph) => {
 							// THE BACKDROP IS WHAT THE LAYER IS ABOUT TO COMPOSITE ONTO, which is the
@@ -1489,24 +1722,17 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 								None => &*surface,
 							};
 							let kernels = layer.filter.and_then(|handle| prepared.kernels.get(handle.0 as usize)).map_or(&[][..], |kernels| kernels.as_slice());
-							// WHAT THE LAYER IS COMPOSITED FROM is its bounds inside the surface it composites onto, and
-							// that is all of the graph's output anything reads.
-							let into_bounds = match layers.last() {
-								Some(parent) => parent.bounds,
-								None => tile,
-							};
-							let wanted = into_bounds.intersection(&layer.bounds);
 							Some(crate::filter::evaluate(graph, kernels, &layer.surface, backdrop, layer.bounds, wanted, pool, spans, nodes, prepared.working, lookup)?)
 						}
 						None => None,
 					};
 					{
 						let source = filtered.as_ref().unwrap_or(&layer.surface);
-						let (into, into_bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
-							Some(parent) => (&mut parent.surface, parent.bounds),
-							None => (&mut *surface, tile),
+						let into: &mut dyn Raster = match layers.last_mut() {
+							Some(parent) => &mut parent.surface,
+							None => &mut *surface,
 						};
-						let bounds = into_bounds.intersection(&layer.bounds);
+						let bounds = wanted;
 						for y in bounds.y..bounds.y.saturating_add(bounds.height) {
 							for x in bounds.x..bounds.x.saturating_add(bounds.width) {
 								let clip = clips.coverage(x, y);
@@ -1542,13 +1768,18 @@ fn replay(prepared: &SoftPrepared, access: &mut Access<'_>, tile: PixelRect, ind
 /// What one lane is reserved to for a list: the same shape for every lane of a frame.
 struct LaneShape {
 	surfaces: usize,
+	/// The most a surface or a clip mask covers: a tile and the largest margin, inside the target.
 	extent: (u32, u32),
+	/// What the tile's working copy covers: a tile and the top level's margin, inside the target.
+	tile: (u32, u32),
 	space: graphics_core::ColorSpace,
 	masks: usize,
 	edges: usize,
 	clips: usize,
 	layers: usize,
 	nodes: usize,
+	/// The longest bin, when the list reads past a tile: what a tile's rectangles are reserved to.
+	bin: usize,
 }
 
 impl LaneShape {
@@ -1556,10 +1787,17 @@ impl LaneShape {
 		lane.pool.reserve(self.surfaces, self.extent, self.space)?;
 		lane.masks.reserve(self.masks, self.extent.0 as usize * self.extent.1 as usize);
 		lane.raster.reserve(self.extent.0 as usize, self.edges);
-		lane.spans.reserve(self.extent.0 as usize);
+		lane.tile.reserve(self.tile.0, self.tile.1);
+		// A ROW AND A COLUMN: a span is a row of a surface and a blur's second pass a column of one, and
+		// the two differ where the target cuts a surface short on one side.
+		lane.spans.reserve(self.extent.0.max(self.extent.1) as usize);
 		lane.clips.reserve(self.clips);
 		lane.layers.reserve(self.layers.saturating_sub(lane.layers.len()));
 		lane.nodes.reserve(self.nodes.saturating_sub(lane.nodes.len()));
+		if self.bin > 0 {
+			lane.regions.reserve(self.bin.saturating_sub(lane.regions.len()));
+			lane.needs.reserve((self.layers + 1).saturating_sub(lane.needs.len()));
+		}
 		Ok(())
 	}
 }

@@ -42,7 +42,7 @@ fn at_prompt() -> (Broker, ConnectionId, RequestId, Vec<Effect>) {
 	let request = broker.ask(connection, asked(), 0, &mut effects).unwrap();
 	assert_eq!(effects, [Effect::Prepare { request }]);
 	broker.bind_executor(request, 5);
-	broker.prepared(request, Ok((frozen(), 300, 900)), 1, &mut effects);
+	broker.prepared(request, 5, Ok((frozen(), 300, 900)), 1, &mut effects);
 	assert_eq!(journal_of(&effects), Some((request, Event::Requested)));
 	broker.journaled(request, Event::Requested, true, 2, &mut effects);
 	assert_eq!(broker.request(request).unwrap().state, State::AwaitingAttention);
@@ -144,7 +144,7 @@ fn an_executor_that_prepared_something_else_is_refused_and_released() {
 		let mut effects = Vec::new();
 		let request = broker.ask(connection, asked(), 0, &mut effects).unwrap();
 		broker.bind_executor(request, 5);
-		broker.prepared(request, Ok((wrong, 200, 900)), 1, &mut effects);
+		broker.prepared(request, 5, Ok((wrong, 200, 900)), 1, &mut effects);
 		assert!(effects.contains(&Effect::Release { request, executor: 5, operation: 900 }), "what it prepared is released");
 		assert_eq!(journal_of(&effects), Some((request, Event::Declined)));
 	}
@@ -154,7 +154,7 @@ fn an_executor_that_prepared_something_else_is_refused_and_released() {
 	let connection = broker.open("adminreq".to_string(), scope(), 1).unwrap();
 	let mut effects = Vec::new();
 	let request = broker.ask(connection, asked(), 0, &mut effects).unwrap();
-	broker.prepared(request, Ok((frozen(), 4097, 900)), 1, &mut effects);
+	broker.prepared(request, 5, Ok((frozen(), 4097, 900)), 1, &mut effects);
 	assert_eq!(journal_of(&effects), Some((request, Event::Declined)));
 }
 
@@ -168,7 +168,7 @@ fn owner_death_is_requester_loss_in_every_phase_and_nothing_revives_it() {
 	let request = broker.ask(connection, asked(), 0, &mut effects).unwrap();
 	broker.bind_executor(request, 5);
 	broker.owner_died(connection, 1, &mut effects);
-	broker.prepared(request, Ok((frozen(), 300, 900)), 2, &mut effects);
+	broker.prepared(request, 5, Ok((frozen(), 300, 900)), 2, &mut effects);
 	assert!(effects.contains(&Effect::Release { request, executor: 5, operation: 900 }));
 	assert_ne!(broker.request(request).unwrap().state, State::Prepared);
 	// ON THE PROMPT: declined, and the screen closes.
@@ -254,7 +254,7 @@ fn a_journal_that_fails_or_never_answers_issues_no_authority() {
 	let connection = broker.open("adminreq".to_string(), scope(), 1).unwrap();
 	let mut effects = Vec::new();
 	let request = broker.ask(connection, asked(), 0, &mut effects).unwrap();
-	broker.prepared(request, Ok((frozen(), 300, 900)), 1, &mut effects);
+	broker.prepared(request, 5, Ok((frozen(), 300, 900)), 1, &mut effects);
 	broker.journaled(request, Event::Requested, false, 2, &mut effects);
 	assert_eq!(broker.request(request).unwrap().state, State::Declining);
 	// The approval's record: failed, or silent past five seconds.
@@ -425,10 +425,52 @@ fn an_executor_that_never_answers_its_preparation_is_a_decline_and_its_late_answ
 	broker.journaled(request, Event::Declined, true, EXCHANGE_TICKS + 1, &mut effects);
 	assert_eq!(answered(&effects), Some(false));
 	// THE PREPARATION ARRIVES AFTERWARDS: nothing is shown, and what it prepared is released.
-	broker.prepared(request, Ok((frozen(), 300, 900)), EXCHANGE_TICKS + 2, &mut effects);
+	broker.prepared(request, 5, Ok((frozen(), 300, 900)), EXCHANGE_TICKS + 2, &mut effects);
 	assert!(effects.contains(&Effect::Release { request, executor: 5, operation: 900 }));
 	assert!(!effects.iter().any(|effect| matches!(effect, Effect::Show { .. } | Effect::Dispatch { .. })));
 	// AND THE CONNECTION MAY ASK AGAIN once the decline is settled: capacity is released on a terminal failure.
 	broker.settle();
 	assert!(broker.ask(connection, asked(), EXCHANGE_TICKS + 3, &mut Vec::new()).is_some());
+}
+
+#[test]
+fn a_preparation_that_will_never_run_is_released_at_its_executor_whatever_ends_it() {
+	let released = |effects: &[Effect], request: RequestId| effects.contains(&Effect::Release { request, executor: 5, operation: 900 });
+	// A grant that expires unused.
+	let (mut broker, _, request, mut effects) = granted();
+	let by = broker.request(request).unwrap().grant_by;
+	broker.tick(by, &mut effects);
+	assert_eq!(broker.request(request).unwrap().state, State::Expired);
+	assert!(released(&effects, request), "an expired grant's preparation is released");
+	// A consumption record that fails.
+	let (mut broker, _, request, mut effects) = granted();
+	assert!(broker.redeem(request, 20, &mut effects));
+	broker.journaled(request, Event::Consumed, false, 21, &mut effects);
+	assert!(released(&effects, request) && dispatches(&effects) == 0, "a consumption that was not recorded releases and dispatches nothing");
+	// A consumption record that never answers.
+	let (mut broker, _, request, mut effects) = granted();
+	assert!(broker.redeem(request, 20, &mut effects));
+	let by = broker.request(request).unwrap().exchange_by;
+	broker.tick(by, &mut effects);
+	assert!(released(&effects, request) && dispatches(&effects) == 0);
+	// The owner lost at the admission boundary, with the consumption recorded.
+	let (mut broker, connection, request, mut effects) = granted();
+	assert!(broker.redeem(request, 20, &mut effects));
+	broker.owner_died(connection, 21, &mut effects);
+	broker.journaled(request, Event::Consumed, true, 22, &mut effects);
+	assert!(released(&effects, request) && dispatches(&effects) == 0, "an owner lost before dispatch releases what was prepared");
+	// And a preparation answered after its request settled and went: released at the executor that answered.
+	let mut broker = Broker::new(1);
+	broker.path = true;
+	let connection = broker.open("adminreq".to_string(), scope(), 42).unwrap();
+	let mut effects = Vec::new();
+	let request = broker.ask(connection, asked(), 0, &mut effects).unwrap();
+	broker.bind_executor(request, 5);
+	broker.cancel(connection, 1, &mut effects);
+	broker.journaled(request, Event::Declined, true, 2, &mut effects);
+	broker.settle();
+	assert!(broker.request(request).is_none());
+	let mut effects = Vec::new();
+	broker.prepared(request, 5, Ok((frozen(), 300, 900)), 3, &mut effects);
+	assert_eq!(effects, [Effect::Release { request, executor: 5, operation: 900 }], "not executor zero, which is nobody");
 }

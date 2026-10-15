@@ -163,7 +163,7 @@ pub fn switch(prev: Option<&Thread>, next: Option<&Thread>, why: u8) {
 
 // A thread made runnable, while armed, on the core it is queued on. Its waker is the thread running
 // here - the sender of a message, say - except for a deadline, which the tick passed and nobody sent.
-pub fn wake(woken: &Thread, cause: u8) {
+pub fn wake(woken: &Thread, cause: u8, queued_on: usize) {
 	let cycles = arch::tsc::now();
 	let waker = if cause == perfbuf::WOKEN_BY_DEADLINE {
 		0
@@ -176,5 +176,7 @@ pub fn wake(woken: &Thread, cause: u8) {
 	};
 	note(woken);
 	// ALLOC-OK: the fixed ring, as above.
-	BUFFER.push(Record { site: [0; 8], cycles, value: waker, thread: koid32(woken.header().koid()), core: core_id(), kind: perfbuf::KIND_WAKE, detail: cause });
+	// THE CORE IT WAS QUEUED ON, which is what a wake record says: a placed thread - an `rt::pool` worker started on its
+	// core - is queued on its placement whichever core woke it, and the waker's core would place it wrongly.
+	BUFFER.push(Record { site: [0; 8], cycles, value: waker, thread: koid32(woken.header().koid()), core: queued_on as u16, kind: perfbuf::KIND_WAKE, detail: cause });
 }

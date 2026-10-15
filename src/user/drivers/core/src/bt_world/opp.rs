@@ -12,13 +12,16 @@
 //               final one, then SUCCESS; what arrived said with its length and an FNV-1a digest of its bytes. The phone's
 //               record offers it on L2CAP (its GOEP PSM) as well as RFCOMM, the serial device's on RFCOMM alone
 //   pushing     five seconds after the gate's word - time for a receiver to start waiting - the phone pages the host
-//               where it has no link, opens the host's Object Push channel, and pushes `fixture-note.txt`, `text/plain`,
-//               of the size the gate asked: numbered lines, so a short or reordered copy shows
+//               where it has no link, searches the host's records for Object Push and says how many it found, opens
+//               the host's Object Push channel whatever the search said - the host's channel policy, not the phone's
+//               manners, is what keeps an unwanted push out - and pushes `fixture-note.txt`, `text/plain`, of the size
+//               the gate asked: numbered lines, so a short or reordered copy shows
 
 use super::*;
 
-// The host's Object Push channel, as its record names it.
+// The host's Object Push channel, as its record names it, and the record's class.
 pub(super) const HOST_CHANNEL: u8 = 9;
+pub(super) const OBJECT_PUSH: u16 = 0x1105;
 // The largest packet a device takes.
 const DEVICE_MAX: u16 = 1024;
 // When a push the gate asked for starts: five seconds of 10 ms ticks.
@@ -45,6 +48,7 @@ pub(super) struct Push {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Stage {
+	Search,
 	Channel,
 	Connect,
 	Put,
@@ -275,7 +279,7 @@ impl World {
 		Ok(Vec::new())
 	}
 
-	// ITS TIME: the link - paged where there is none - then the host's channel.
+	// ITS TIME: the link - paged where there is none - then a search of the host's records, then its channel.
 	pub(super) fn opp_tick(&mut self, now: u64) -> Vec<Out> {
 		let mut out = Vec::new();
 		for at in 0..self.devices.len() {
@@ -299,11 +303,18 @@ impl World {
 			self.devices[at].opp_wanted = None;
 			let body = note(size as usize);
 			if let Some(opp) = self.opp(at) {
-				opp.push = Some(Push { body, sent: 0, host_max: 255, stage: Stage::Channel, assembling: Vec::new() });
+				opp.push = Some(Push { body, sent: 0, host_max: 255, stage: Stage::Search, assembling: Vec::new() });
 			}
-			out.extend(self.open_channel(at, 0x0003, Purpose::Rfcomm(HOST_CHANNEL)).unwrap_or_default());
+			out.extend(self.open_channel(at, 0x0001, Purpose::Sdp(OBJECT_PUSH)).unwrap_or_default());
 		}
 		out
+	}
+
+	// THE HOST ANSWERED THE SEARCH (its count already said): the host's channel.
+	pub(super) fn opp_searched(&mut self, at: usize) -> Vec<Out> {
+		let Some(push) = self.opp(at).and_then(|opp| opp.push.as_mut()).filter(|push| push.stage == Stage::Search) else { return Vec::new() };
+		push.stage = Stage::Channel;
+		self.open_channel(at, 0x0003, Purpose::Rfcomm(HOST_CHANNEL)).unwrap_or_default()
 	}
 
 	// THE HOST'S CHANNEL IS OPEN: CONNECT.

@@ -367,6 +367,24 @@ fn generate(cache: &Path) -> Result<String, String> {
 		let _ = writeln!(out, "];\n");
 	}
 
+	// THE MIRRORING PROPERTY, which is NOT the bracket table. Rule N0 pairs brackets; rule L4 draws
+	// every `Bidi_Mirrored` character as its mirror at an odd level, and most of those are not
+	// brackets at all - the comparison signs, the guillemets, the set and order operators. An answer
+	// taken from the bracket pairs leaves all of them facing the wrong way in right-to-left text.
+	{
+		let path = cache.join("BidiMirroring.txt");
+		let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+		let pairs = parse_mirroring(&text)?;
+		let _ = writeln!(out, "/// `Bidi_Mirroring_Glyph`: `(code point, the character drawn in its place at an odd level)`,");
+		let _ = writeln!(out, "/// sorted. A `Bidi_Mirrored` character with no mirror CHARACTER is absent - its mirrored form is");
+		let _ = writeln!(out, "/// the face's business, through `rtlm`.");
+		let _ = writeln!(out, "pub const BIDI_MIRRORING: &[(u32, u32)] = &[");
+		for (character, mirror) in &pairs {
+			let _ = writeln!(out, "\t({character:#x}, {mirror:#x}),");
+		}
+		let _ = writeln!(out, "];\n");
+	}
+
 	// THE CANONICAL DECOMPOSITIONS, and the combining classes that order them.
 	//
 	// WHAT THEY ARE FOR HERE is one question and not normalisation: does a face cover this cluster?
@@ -619,6 +637,33 @@ fn parse_brackets(text: &str) -> Result<Vec<(u32, u32, bool)>, String> {
 		pairs.push((character, pair, opening));
 	}
 	pairs.sort_by_key(|(character, _, _)| *character);
+	Ok(pairs)
+}
+
+/// `BidiMirroring.txt`: each mirrored character and the one drawn in its place.
+///
+/// THE COMMENTED-OUT TAIL IS NOT DATA. The file lists the `Bidi_Mirrored` characters that have no
+/// mirror character as comments, and reading those would invent a mapping Unicode says does not
+/// exist. A record that is not two code points is an error rather than a skip.
+fn parse_mirroring(text: &str) -> Result<Vec<(u32, u32)>, String> {
+	let mut pairs = Vec::new();
+	for line in text.lines() {
+		let line = line.split('#').next().unwrap_or("").trim();
+		if line.is_empty() {
+			continue;
+		}
+		let fields: Vec<&str> = line.split(';').map(str::trim).collect();
+		if fields.len() != 2 {
+			return Err(format!("a mirroring record with {} fields: {line}", fields.len()));
+		}
+		let character = u32::from_str_radix(fields[0], 16).map_err(|_| format!("cannot read `{}`", fields[0]))?;
+		let mirror = u32::from_str_radix(fields[1], 16).map_err(|_| format!("cannot read `{}`", fields[1]))?;
+		pairs.push((character, mirror));
+	}
+	pairs.sort_by_key(|(character, _)| *character);
+	if pairs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+		return Err(String::from("a character with two mirrors in BidiMirroring.txt"));
+	}
 	Ok(pairs)
 }
 

@@ -81,6 +81,9 @@ struct Power {
 	critical: Option<u32>,
 	readings: u64,
 	reading_seq: u32,
+	// A trip-points change the policy has not yet been told of: carried on the next reading that reaches it, so a reading
+	// dropped on a full stream does not take the change with it.
+	trips_owed: bool,
 	sample_ms: u32,
 	syspower: u64,
 	past_critical: bool,
@@ -178,6 +181,7 @@ impl Power {
 		match self.read(information) {
 			Ok(state) => {
 				if self.class == Class::ThermalZone {
+					self.trips_owed |= information;
 					self.cooling_reading(&state);
 				}
 				if self.state.as_ref() == Some(&state) {
@@ -199,9 +203,11 @@ impl Power {
 			self.reading_seq = self.reading_seq.wrapping_add(1);
 			let mut frame = [0u8; 64];
 			let mut handles = Handles::new();
-			if let Some(len) = thermal_zone::readings_frame(self.reading_seq, &ZoneReading { temperature, sequence: self.reading_seq }, &mut frame, &mut handles) {
+			// A `Notify(0x81)` - THE TRIP POINTS CHANGED - travels with the reading it brought: the policy reads the zone's
+			// trips again before it judges this temperature against them.
+			if let Some(len) = thermal_zone::readings_frame(self.reading_seq, &ZoneReading { temperature, sequence: self.reading_seq, trips_changed: self.trips_owed }, &mut frame, &mut handles) {
 				match try_send_outcome(self.readings, &frame[..len], 0) {
-					SendOutcome::Delivered => {}
+					SendOutcome::Delivered => self.trips_owed = false,
 					SendOutcome::Stalled => say(&self.name, "a reading was dropped: the policy's stream is full"),
 					SendOutcome::Failed => {
 						close(self.readings);
@@ -306,7 +312,7 @@ impl thermal_zone::Service for Power {
 
 	// THE READINGS FROM NOW ON, the last one first.
 	fn readings(&mut self) -> Vec<ZoneReading> {
-		self.temperature.map(|temperature| ZoneReading { temperature, sequence: self.reading_seq }).into_iter().collect()
+		self.temperature.map(|temperature| ZoneReading { temperature, sequence: self.reading_seq, trips_changed: false }).into_iter().collect()
 	}
 
 	fn sample_every(&mut self, milliseconds: u32) -> Result<(), Error> {
@@ -432,7 +438,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		say(&name, "the firmware describes no node for it");
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
 	}
-	let mut power = Power { name, class, node, information: None, state: None, revision: 1, stream: 0, seq: 0, poll: None, temperature: None, critical: None, readings: 0, reading_seq: 0, sample_ms: 0, syspower: resources.syspower, past_critical: false, past_immediate: false };
+	let mut power = Power { name, class, node, information: None, state: None, revision: 1, stream: 0, seq: 0, poll: None, temperature: None, critical: None, readings: 0, reading_seq: 0, trips_owed: false, sample_ms: 0, syspower: resources.syspower, past_critical: false, past_immediate: false };
 	if let Err(why) = power.read(true).map(|state| power.state = Some(state)) {
 		say(&power.name, &format!("its state could not be read - {why}"));
 		common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::DeviceNotResponding);

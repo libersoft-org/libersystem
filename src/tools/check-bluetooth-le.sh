@@ -23,7 +23,9 @@
 #                                pairing made, the remote's with its EDIV and Rand
 #   an application's GATT      `btgatt`, granted a GATT client by its policy row on the peer aliased `tag-1` for the
 #     client                     battery and a custom service: those two listed and neither GAP nor GATT, the battery
-#                                level read, a handle outside the grant refused, a write and the peer's notification
+#                                level read, a handle outside the grant refused, a write and the peer's notification;
+#                                `btgatt again` subscribes to the value twice - the new stream takes the notification,
+#                                and the first ends
 #   the other radio's key      `btclassic ctkd`, with the dual-mode phone: paired on BR/EDR, its LE key derived over
 #                                the BR/EDR Security Manager and its LE half encrypted on it; paired anew on LE, its
 #                                BR/EDR key derived from the LTK and its BR/EDR half authenticated on it - each time
@@ -46,9 +48,9 @@ export QEMU_EXTRA="-device edu,addr=0x1d"
 export GUEST_GATE_SECONDS="${GUEST_GATE_SECONDS:-160}"
 export GUEST_GATE_TIMEOUT="${GUEST_GATE_TIMEOUT:-330}"
 
-guest_gate_run $'btclassic le\nbtgatt\nbtclassic ctkd' ""
+guest_gate_run $'btclassic le\nbtgatt\nbtgatt again\nbtclassic ctkd' ""
 lines="$GUEST_LINES"
-for verdict in "btclassic: PASS le" "btgatt: PASS" "btclassic: PASS ctkd" \
+for verdict in "btclassic: PASS le" "btgatt: PASS" "btgatt: PASS again" "btclassic: PASS ctkd" \
 	"btclassic: SC Passkey Entry shown by this host: twenty checked rounds, encrypted link, authenticated Secure Connections bond" \
 	"btclassic: SC authentication downgrade: fresh Just Works exchange refused, authenticated bond retained, original key reused on encrypted reconnect"; do
 	grep -qF "$verdict" "$lines" || {

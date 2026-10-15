@@ -16,10 +16,15 @@ use proto::codec::Handles;
 use proto::system::{BacklightDescription, BacklightEvent, BacklightHotkey, BacklightScale, BacklightSource, BacklightState, BacklightTarget, BrightnessCause, BrightnessChange, BrightnessOutput, BrightnessRange, BrightnessScale, BrightnessSet, BrightnessTarget, Error, JoinReason, OutputSource, PciFunction, ProviderInfo, ProviderKind, SystemKey, backlight, display_brightness, display_brightness_control, provider_catalogue, system_keys};
 use rt::*;
 use service_logic::brightness as logic;
+use service_logic::provider_retry::{Next, ProviderRetry};
 use wire::Sink;
 
-// How long one backlight call may take before its provider is marked failed: a tenth of a second.
-const CALL_TICKS: u64 = 10;
+// HOW LONG ONE BACKLIGHT CALL MAY TAKE before its provider is marked failed: two seconds, the order of every other
+// provider deadline in this system. It was a tenth of a second, which a provider that is merely busy misses -
+// `acpi_backlight` answering its first `describe` while it still evaluates `_BCL` through the ACPI service, a USB
+// monitor's set queued behind the rest of its controller's loop - and every call here is asynchronous, so a longer
+// bound costs the loop nothing.
+const CALL_TICKS: u64 = 200;
 // How far a subscriber may fall behind before its stream is closed rather than losing a change silently.
 const SUBSCRIBER_DEPTH: u64 = 64;
 
@@ -41,6 +46,10 @@ pub(super) struct Brightness {
 	keys: u64,
 	last_step: logic::LastStep,
 	said_none: bool,
+	// BACKLIGHTS WHOSE ADMISSION DID NOT FINISH IN TIME, asked again later rather than never - and how many times each
+	// publication now being admitted was asked before.
+	retry: ProviderRetry<ProviderInfo>,
+	attempts: Vec<(ProviderInfo, u32)>,
 }
 
 struct Backlight {
@@ -123,7 +132,7 @@ impl Brightness {
 	pub(super) fn new(catalogue: u64, read_root: u64, control_root: u64, keys: u64) -> Brightness {
 		let subscription = if catalogue == 0 { 0 } else { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Backlight).unwrap_or(0) };
 		let keys = if keys == 0 { 0 } else { system_keys::Client::new(ChannelTransport { chan: keys }).watch().unwrap_or(0) };
-		let mut brightness = Brightness { catalogue, subscription, backlights: Vec::new(), source: logic::OutputSource::BootFramebuffer(None), edid: None, pending: Vec::new(), next_corr: 1, places: Vec::new(), serial: 0, reads: if read_root != 0 { alloc::vec![read_root] } else { Vec::new() }, controls: if control_root != 0 { alloc::vec![control_root] } else { Vec::new() }, roots: [read_root, control_root], subscribers: Vec::new(), keys, last_step: logic::LastStep::default(), said_none: false };
+		let mut brightness = Brightness { catalogue, subscription, backlights: Vec::new(), source: logic::OutputSource::BootFramebuffer(None), edid: None, pending: Vec::new(), next_corr: 1, places: Vec::new(), serial: 0, reads: if read_root != 0 { alloc::vec![read_root] } else { Vec::new() }, controls: if control_root != 0 { alloc::vec![control_root] } else { Vec::new() }, roots: [read_root, control_root], subscribers: Vec::new(), keys, last_step: logic::LastStep::default(), said_none: false, retry: ProviderRetry::new(TICKS_PER_SECOND), attempts: Vec::new() };
 		brightness.follow_catalogue();
 		brightness
 	}
@@ -145,7 +154,7 @@ impl Brightness {
 	}
 
 	pub(super) fn deadline(&self) -> u64 {
-		self.pending.iter().map(|pending| pending.deadline).min().unwrap_or(0)
+		self.pending.iter().map(|pending| pending.deadline).chain(self.retry.next_deadline()).min().unwrap_or(0)
 	}
 
 	pub(super) fn poll(&mut self) {
@@ -153,6 +162,24 @@ impl Brightness {
 		while let Some(at) = self.pending.iter().position(|pending| now >= pending.deadline) {
 			let pending = self.pending.remove(at);
 			self.cancel(pending, Error::TimedOut);
+		}
+		if self.catalogue != 0 {
+			for (info, attempts) in self.retry.due(now) {
+				self.attempts.push((info.clone(), attempts));
+				self.add(info);
+			}
+		}
+	}
+
+	// AN ADMISSION THAT DID NOT FINISH IN TIME is tried again, at one, two, four ... seconds, a bounded number of times -
+	// and never once its publication is withdrawn. It used to be abandoned with its channel closed, and the backlight
+	// never appeared until its driver published anew: a panel admitted on a slow boot had no keys, policy or tool.
+	fn admission_failed(&mut self, info: ProviderInfo) {
+		let attempts = self.attempts.iter().position(|(held, _)| same_publication(held, &info)).map_or(0, |at| self.attempts.remove(at).1);
+		match self.retry.failed(info, attempts, clock()) {
+			Next::At(_) if attempts == 0 => print(b"DisplayService: a backlight did not finish its admission in time; it is asked again\n"),
+			Next::At(_) => {}
+			Next::GivenUp => print(b"DisplayService: a backlight did not finish its admission after every retry; it is left out\n"),
 		}
 	}
 
@@ -190,8 +217,17 @@ impl Brightness {
 				// Optional operation absent on an older provider. Its ordinary GET still has its own deadline.
 				self.issue(pending.chan, backlight::OP_GET, Call::Get(info, description, None), |_| Some(()));
 			}
-			Call::Open(_) => {}
-			_ => close(pending.chan),
+			Call::Open(info) => {
+				if error == Error::TimedOut {
+					self.admission_failed(info);
+				}
+			}
+			Call::Describe(info) | Call::DisplayId(info, _) | Call::Get(info, _, _) | Call::Events(info, _, _, _) => {
+				close(pending.chan);
+				if error == Error::TimedOut {
+					self.admission_failed(info);
+				}
+			}
 		}
 	}
 
@@ -237,6 +273,18 @@ impl Brightness {
 		};
 		let len = buf.len();
 		let corr = buf[..len].get(..4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+		// AN ANSWER NOBODY WAITS FOR ANY MORE - a late one, to a call that expired - is still an answer: the provider
+		// answers again, and a backlight marked failed for missing that deadline is let back into the join.
+		if !self.pending.iter().any(|pending| pending.chan == channel && Some(pending.corr) == corr)
+			&& let Some(at) = self.backlights.iter().position(|backlight| backlight.chan == channel)
+			&& self.backlights[at].failed
+		{
+			self.backlights[at].failed = false;
+			print(b"DisplayService: backlight ");
+			print(self.backlights[at].key.as_bytes());
+			print(b" answered again; it is back in the join\n");
+			self.rejoin();
+		}
 		if let Some(at) = self.pending.iter().position(|pending| pending.chan == channel && Some(pending.corr) == corr) {
 			let pending = self.pending.remove(at);
 			if clock() >= pending.deadline {
@@ -258,6 +306,10 @@ impl Brightness {
 						if let Some(channel) = opened {
 							handles.clear();
 							self.issue(channel, backlight::OP_DESCRIBE, Call::Describe(info), |_| Some(()));
+						} else {
+							// A REFUSED OPEN is asked again too: the provider admits one consumer, and the refusal can be
+							// a predecessor's connection it has not yet seen close.
+							self.admission_failed(info);
 						}
 					}
 					Call::Describe(info) => {
@@ -436,6 +488,8 @@ impl Brightness {
 					let pending = self.pending.remove(at);
 					self.cancel(pending, Error::Closed);
 				}
+				self.retry.withdraw(|held| same_publication(held, &info));
+				self.attempts.retain(|(held, _)| !same_publication(held, &info));
 			}
 			let same = |held: &ProviderInfo| same_publication(held, &info);
 			match (info.live, self.backlights.iter().position(|backlight| same(&backlight.info))) {
@@ -452,6 +506,7 @@ impl Brightness {
 	}
 
 	fn admitted(&mut self, info: ProviderInfo, chan: u64, description: BacklightDescription, level: Option<u32>, events: u64, firmware_display_id: Option<u32>) {
+		self.attempts.retain(|(held, _)| !same_publication(held, &info));
 		let scale = match description.scale {
 			BacklightScale::Levels(levels) => logic::Scale::new(levels),
 			BacklightScale::Range(range) => logic::Scale::range(range.minimum, range.maximum),
@@ -558,13 +613,14 @@ impl Brightness {
 		self.issue(self.backlights[at].chan, backlight::OP_SET, Call::Set { client, cause }, |writer| writer.u32(level));
 	}
 
-	// A PROVIDER THAT MISSED ITS DEADLINE is left out of the join until its stream speaks again.
+	// A PROVIDER THAT MISSED ITS DEADLINE is left out of the join until it answers again - its stream speaking, or any
+	// reply on its channel, a late one included.
 	fn fail(&mut self, at: usize) {
 		if !self.backlights[at].failed {
 			self.backlights[at].failed = true;
 			print(b"DisplayService: backlight ");
 			print(self.backlights[at].key.as_bytes());
-			print(b" did not answer in time; it is left out until it speaks again\n");
+			print(b" did not answer in time; it is left out until it answers again\n");
 			self.rejoin();
 		}
 	}

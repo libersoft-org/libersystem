@@ -57,4 +57,8 @@ fn bounds_and_capacity_refuse_before_anything_is_held() {
 	assert_eq!(operations.prepare(1, &[], &[1], 0, LIFETIME).map(|_| ()), Err(Refusal::Busy), "a live preparation is never displaced");
 	operations.cancel(live[0]).unwrap();
 	assert!(operations.prepare(1, &[], &[1], 0, LIFETIME).is_ok(), "a cancelled one makes room");
+	// AND SO DO PREPARATIONS PAST THEIR LIFETIME, which nobody may be left to release: the slots are full of
+	// live ones, and once their lifetime has passed the next preparation finds room.
+	assert_eq!(operations.prepare(1, &[], &[1], LIFETIME - 1, LIFETIME).map(|_| ()), Err(Refusal::Busy), "still inside their lifetime");
+	assert!(operations.prepare(1, &[], &[1], LIFETIME, LIFETIME).is_ok(), "expired ones make room");
 }

@@ -263,7 +263,7 @@ fn request<'a>(face: &'a Face<'a>, text: &'a str, direction: Direction, size: Fi
 fn buffer(entries: &[(u16, u32, Position)]) -> Buffer {
 	let mut buffer = Buffer::new();
 	for (glyph, cluster, position) in entries {
-		buffer.push(*glyph, *cluster);
+		buffer.push(*glyph, *cluster).expect("room for a glyph");
 		let at = buffer.len() - 1;
 		buffer.positions[at] = *position;
 	}
@@ -517,14 +517,14 @@ fn a_run_past_the_frozen_output_ceiling_is_refused_by_name() {
 	let ceiling = opentype_profile::limits::RUN_OUTPUT as usize;
 	let mut shaped = Buffer::new();
 	for _ in 0..=ceiling {
-		shaped.push(1, 0);
+		shaped.push(1, 0).expect("room for a glyph");
 	}
 	assert_eq!(produce(&request(&face, "a", Direction::LeftToRight, Fixed266::from_pixels(16)), &shaped).err(), Some(Error::Exceeded { limit: "run output", ceiling: opentype_profile::limits::RUN_OUTPUT, asked: ceiling as u64 + 1 }));
 	// AND EXACTLY AT THE CEILING IT IS NOT REFUSED, which is what makes the number a ceiling rather
 	// than an approximate one.
 	let mut shaped = Buffer::new();
 	for _ in 0..ceiling {
-		shaped.push(1, 0);
+		shaped.push(1, 0).expect("room for a glyph");
 	}
 	assert!(produce(&request(&face, "a", Direction::LeftToRight, Fixed266::from_pixels(16)), &shaped).is_ok());
 }

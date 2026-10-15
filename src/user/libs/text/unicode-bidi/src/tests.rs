@@ -86,6 +86,17 @@ fn a_mirrored_character_is_answered_and_not_applied() {
 	assert_eq!(mirrored(')'), Some('('));
 	assert_eq!(mirrored('a'), None);
 	assert_eq!(mirrored('\u{05D0}'), None);
+	// AND THE CHARACTERS THAT ARE NOT BRACKETS. The paired-bracket table is what rule N0 reads and it
+	// is not the mirroring property: an answer taken from it leaves the comparison signs, the
+	// guillemets and every mirrored mathematical operator facing the wrong way in right-to-left text.
+	assert_eq!(mirrored('<'), Some('>'));
+	assert_eq!(mirrored('>'), Some('<'));
+	assert_eq!(mirrored('\u{00AB}'), Some('\u{00BB}'), "the guillemets mirror");
+	assert_eq!(mirrored('\u{2264}'), Some('\u{2265}'), "less-than-or-equal mirrors to greater-than-or-equal");
+	assert_eq!(mirrored('\u{2208}'), Some('\u{220B}'), "element-of mirrors to contains-as-member");
+	// A character that is Bidi_Mirrored but has no mirror CHARACTER answers nothing here: its mirrored
+	// form, if the face has one, is reached through `rtlm`.
+	assert_eq!(mirrored('\u{2211}'), None, "n-ary summation has no mirror character");
 }
 
 #[test]

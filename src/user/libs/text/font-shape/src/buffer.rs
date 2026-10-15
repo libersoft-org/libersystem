@@ -7,11 +7,26 @@
 //! EVERY GLYPH REMEMBERS WHICH CHARACTERS IT CAME FROM. A ligature is one glyph for three
 //! characters and a decomposition is three glyphs for one; without the cluster the caret cannot be
 //! put between them and a hit test cannot answer which character was clicked.
+//!
+//! IT GROWS FALLIBLY. Its size comes from the text and from the font, and infallible allocation in
+//! userspace ends the calling process when it fails - which would take a caller's whole program down
+//! over one paragraph instead of answering the typed refusal this stack promises.
 
 use alloc::vec::Vec;
+use font_parse::Error;
+
+use crate::indic::Position as SyllablePosition;
 
 /// The mask bit every glyph carries: the features that apply everywhere.
 pub const GLOBAL: u32 = 1;
+
+/// The mask bit for `rtlm`, the face's own mirrored forms.
+///
+/// SET BY THE CALLER, on the glyphs of a right-to-left run whose character was NOT replaced by its
+/// mirror - because only the caller mapped the characters and knows which ones it mirrored. A glyph
+/// drawn from the mirror character already faces the right way, and applying `rtlm` to it as well
+/// would turn it back.
+pub const RTLM: u32 = 1 << 5;
 
 /// Where a glyph sits, in font units, before scaling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -42,11 +57,20 @@ pub struct GlyphInfo {
 	/// form, which is a word made of endings. Bit 0 is the mask every glyph carries, for the
 	/// features that really are global.
 	pub mask: u32,
+	/// The syllable this glyph belongs to, numbered by the shaper that found the syllables; zero
+	/// where no shaper did.
+	///
+	/// CARRIED ON THE GLYPH, because a substitution changes how many glyphs a syllable has: once a
+	/// ligature has formed, the glyphs themselves are the only thing left that knows where one
+	/// syllable ends and the next begins.
+	pub syllable: u16,
+	/// Where in its syllable the Indic shaper draws this glyph. `None` for every other shaper.
+	pub position: SyllablePosition,
 }
 
 impl GlyphInfo {
 	pub const fn new(glyph: u16, cluster: u32) -> Self {
-		Self { glyph, cluster, class: 0, attached_to: None, mask: GLOBAL }
+		Self { glyph, cluster, class: 0, attached_to: None, mask: GLOBAL, syllable: 0, position: SyllablePosition::None }
 	}
 }
 
@@ -62,9 +86,18 @@ impl Buffer {
 		Self::default()
 	}
 
-	pub fn push(&mut self, glyph: u16, cluster: u32) {
+	/// Make room for this many more glyphs, or refuse.
+	pub fn reserve(&mut self, additional: usize) -> Result<(), Error> {
+		self.infos.try_reserve(additional).map_err(|_| Error::Allocation)?;
+		self.positions.try_reserve(additional).map_err(|_| Error::Allocation)
+	}
+
+	/// Append one glyph, or refuse.
+	pub fn push(&mut self, glyph: u16, cluster: u32) -> Result<(), Error> {
+		self.reserve(1)?;
 		self.infos.push(GlyphInfo::new(glyph, cluster));
 		self.positions.push(Position::default());
+		Ok(())
 	}
 
 	pub fn len(&self) -> usize {
@@ -97,20 +130,31 @@ impl Buffer {
 	}
 
 	/// Replace one glyph with several, as a decomposition does. All of them share its cluster.
-	pub fn decompose(&mut self, at: usize, glyphs: &[u16]) {
+	///
+	/// THE ONLY PLACE A RUN GROWS, so it is where the run's absolute output ceiling is held as it
+	/// grows rather than only after: a face that multiplies every glyph would otherwise be handed
+	/// the memory for the whole expansion before the count was ever looked at.
+	pub fn decompose(&mut self, at: usize, glyphs: &[u16]) -> Result<(), Error> {
 		if glyphs.is_empty() || at >= self.infos.len() {
-			return;
+			return Ok(());
 		}
-		let cluster = self.infos[at].cluster;
+		let grown = self.infos.len() + glyphs.len() - 1;
+		if grown > opentype_profile::limits::RUN_OUTPUT as usize {
+			return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "run output", ceiling: opentype_profile::limits::RUN_OUTPUT, asked: grown as u64 }));
+		}
+		self.reserve(glyphs.len() - 1)?;
+		let source = self.infos[at];
 		self.infos[at].glyph = glyphs[0];
-		let mask = self.infos[at].mask;
 		for (offset, glyph) in glyphs[1..].iter().enumerate() {
-			let mut info = GlyphInfo::new(*glyph, cluster);
-			// A decomposed glyph inherits what its source was allowed, or a per-position feature
-			// would stop applying to the very glyphs a decomposition just produced.
-			info.mask = mask;
+			// A decomposed glyph inherits what its source was allowed and where its source stood, or
+			// a per-position feature would stop applying to the very glyphs a decomposition just
+			// produced and a syllable would lose track of its own pieces.
+			let mut info = source;
+			info.glyph = *glyph;
+			info.attached_to = None;
 			self.infos.insert(at + 1 + offset, info);
 			self.positions.insert(at + 1 + offset, Position::default());
 		}
+		Ok(())
 	}
 }

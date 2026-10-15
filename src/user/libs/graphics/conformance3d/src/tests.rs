@@ -52,3 +52,17 @@ fn combined_entry_point_preserves_all_three_profile_results() {
 	assert_eq!(reports, graphics_profile::RENDER3D_CORE_PROFILE_1.len() + graphics_profile::SCENE3D_CORE_PROFILE_1.len() + graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len());
 	assert_eq!(summary.passed(), reports);
 }
+
+#[test]
+// THE DEPTH THRESHOLD THE SCENES APPLY IS THE FROZEN ONE. `graphics-profile` freezes it as text, and the
+// scenes apply it as a number: this holds the two to each other, so neither moves alone.
+fn the_depth_threshold_the_scenes_apply_is_the_frozen_one() {
+	let frozen = graphics_profile::thresholds::THRESHOLDS.iter().find(|threshold| threshold.profile == "render3d" && threshold.what == "a depth value").expect("the frozen depth threshold");
+	assert!(frozen.tolerance.starts_with("<= 1 ULP for a floating-point format and EXACT for a normalised one"), "{}", frozen.tolerance);
+	assert_eq!(crate::harness::DEPTH_FLOAT_ULPS, 1);
+	// AND ONE ULP IS ONE STEP AND NOT TWO.
+	let half = 0.5f32;
+	assert_eq!(crate::harness::ulps_apart(half, f32::from_bits(half.to_bits() + 1)), 1);
+	assert_eq!(crate::harness::ulps_apart(half, f32::from_bits(half.to_bits() - 2)), 2);
+	assert_eq!(crate::harness::ulps_apart(0.25, 0.25), 0);
+}

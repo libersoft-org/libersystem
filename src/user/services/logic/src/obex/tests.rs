@@ -113,6 +113,58 @@ fn an_object_is_pushed_and_received_whole() {
 	assert_eq!(events, vec![ServerEvent::Offered { name: String::from("empty"), kind: None, length: Some(0) }, ServerEvent::Complete]);
 }
 
+// A CLIENT AGAINST A PEER THAT STATES `stated` IN ITS CONNECT and takes every packet: the largest packet it was sent.
+fn largest_packet(client: &mut PushClient, stated: u16, object: &[u8]) -> usize {
+	let mut outs = client.receive(&Packet { code: response::SUCCESS, connect: Some((VERSION, 0, stated)), headers: Vec::new() }.encode());
+	let mut offset = 0;
+	let mut largest = 0;
+	for _ in 0..10_000 {
+		let Some(out) = outs.pop() else {
+			if offset < object.len() {
+				let (taken, more) = client.write(&object[offset..]);
+				offset += taken;
+				outs = more;
+			} else {
+				outs = client.finish();
+				assert!(!outs.is_empty(), "the push stalled");
+			}
+			continue;
+		};
+		match out {
+			ClientOut::Send(packet) => {
+				largest = largest.max(packet.len());
+				let code = if packet[0] == opcode::PUT { response::CONTINUE } else { response::SUCCESS };
+				outs.extend(client.receive(&Packet::new(code, Vec::new()).encode()));
+			}
+			ClientOut::Done(result) => {
+				assert_eq!(result, Ok(object.len() as u64));
+				return largest;
+			}
+		}
+	}
+	panic!("the push did not end");
+}
+
+#[test]
+// THE PACKET SIZE: both sides state the bound, 1691 bytes, in CONNECT; a client sends nothing larger than the smaller
+// of the peer's statement and its transport's limit - an L2CAP channel's MTU - and never less than OBEX's minimum.
+fn the_packet_size_is_the_bound_and_the_transports() {
+	assert_eq!(MAX_PACKET, crate::bt_bounds::OBEX_PACKET);
+	let (_, connect) = PushClient::new("a", None, None);
+	assert_eq!(Packet::decode(&connect, true).unwrap().connect, Some((VERSION, 0, 1691)));
+	let mut server = PushServer::new(1 << 20);
+	let (reply, _) = server.receive(&connect);
+	assert_eq!(Packet::decode(&reply, true).unwrap().connect, Some((VERSION, 0, 1691)));
+	let object = vec![9u8; 6_000];
+	for (stated, mtu, largest) in [(0x2000u16, None, 1691), (0x2000, Some(672), 672), (1000, Some(4096), 1000), (0x2000, Some(48), MIN_PACKET)] {
+		let (mut client, _) = PushClient::new("big.bin", None, Some(object.len() as u32));
+		if let Some(mtu) = mtu {
+			client.limit(mtu);
+		}
+		assert_eq!(largest_packet(&mut client, stated, &object), largest, "stated {stated}, channel MTU {mtu:?}");
+	}
+}
+
 #[test]
 // THE BOUND: an object declaring more than the receiver takes is refused before a byte; one that passes it while
 // arriving is refused at that packet; and the server takes no second object.

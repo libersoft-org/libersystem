@@ -88,11 +88,13 @@ fn multiple(subtable: Reader<'_>, buffer: &mut Buffer, at: usize) -> Result<bool
 		return Err(bad());
 	}
 	let glyphs = sequence.slice(2, glyph_count.checked_mul(2).ok_or_else(bad)?).ok_or_else(bad)?;
-	let mut replacement = alloc::vec::Vec::with_capacity(glyph_count);
+	// THE SEQUENCE'S LENGTH IS THE FONT'S, so the storage for it is asked for rather than assumed.
+	let mut replacement = alloc::vec::Vec::new();
+	replacement.try_reserve_exact(glyph_count).map_err(|_| Error::Allocation)?;
 	for index in 0..glyph_count {
 		replacement.push(glyphs.u16_at(index).ok_or_else(bad)?);
 	}
-	buffer.decompose(at, &replacement);
+	buffer.decompose(at, &replacement)?;
 	Ok(true)
 }
 

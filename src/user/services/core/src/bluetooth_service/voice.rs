@@ -237,7 +237,7 @@ impl Stack {
 	// THE TRANSPORT'S VOICE SETTING: one channel of 16-bit samples, wideband for mSBC - or none.
 	fn voice_transport(&mut self, at: usize, msbc: Option<bool>) -> bool {
 		let transport = self.controllers[at].transport;
-		let mut client = hci_transport::Client::new(ChannelTransport { chan: transport });
+		let mut client = hci_transport::Client::with_deadline(StampedTransport { chan: transport }, clock().saturating_add(CALL_TICKS));
 		let answer = match msbc {
 			Some(wideband) => client.voice(&1, &16, &wideband),
 			None => client.voice(&0, &0, &false),
@@ -380,17 +380,22 @@ impl Stack {
 
 	// Voice data to the controller, cut to the packets its transport carries.
 	fn send_sco(&mut self, at: usize, sco: u16, data: &[u8]) {
-		let controller = &self.controllers[at];
+		let controller = &mut self.controllers[at];
 		let room = (controller.sco_bytes as usize).saturating_sub(3).min(255);
 		if room == 0 {
 			return;
 		}
 		for chunk in data.chunks(room) {
+			if controller.stalled {
+				return;
+			}
 			let mut packet = Vec::with_capacity(3 + chunk.len());
 			packet.extend_from_slice(&sco.to_le_bytes());
 			packet.push(chunk.len() as u8);
 			packet.extend_from_slice(chunk);
-			send_packet(controller.transport, HciPacketKind::Sco, &packet);
+			if send_packet(controller.transport, HciPacketKind::Sco, &packet) == Sent::Unanswered {
+				controller.unanswered();
+			}
 		}
 	}
 

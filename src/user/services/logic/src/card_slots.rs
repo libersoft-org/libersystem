@@ -1028,55 +1028,11 @@ impl Cards {
 	}
 }
 
-/// The most card events waiting for one client.
+/// The most card events waiting for one client: the depth of its event stream's channel, the
+/// snapshot's frames among them. NOTHING IS COALESCED - a removal and a reinsertion are two events -
+/// and an event that does not fit closes the stream: the client takes a new snapshot, and nothing a
+/// slow reader does holds up a transaction's removal or cancellation, which never wait on a stream.
 pub const MAX_EVENTS: usize = 16;
-
-/// One client's pending card events. NOTHING IS COALESCED - a removal and a reinsertion are two events
-/// - and past sixteen the stream is to be CLOSED: the client takes a new snapshot, and nothing a slow
-/// reader does holds up a transaction's removal or cancellation, which never wait on this queue.
-pub struct EventQueue<T> {
-	queue: VecDeque<T>,
-	overflowed: bool,
-}
-
-impl<T> Default for EventQueue<T> {
-	fn default() -> Self {
-		Self { queue: VecDeque::new(), overflowed: false }
-	}
-}
-
-impl<T> EventQueue<T> {
-	/// Queue one event; false once the queue has overflowed, and for ever after.
-	pub fn push(&mut self, event: T) -> bool {
-		if self.overflowed || self.queue.len() >= MAX_EVENTS {
-			self.overflowed = true;
-			self.queue.clear();
-			return false;
-		}
-		self.queue.push_back(event);
-		true
-	}
-
-	pub fn front(&self) -> Option<&T> {
-		self.queue.front()
-	}
-
-	pub fn pop(&mut self) -> Option<T> {
-		self.queue.pop_front()
-	}
-
-	pub fn overflowed(&self) -> bool {
-		self.overflowed
-	}
-
-	pub fn len(&self) -> usize {
-		self.queue.len()
-	}
-
-	pub fn is_empty(&self) -> bool {
-		self.queue.is_empty()
-	}
-}
 
 fn view(slot: u8, held: &Slot) -> SlotView {
 	SlotView { slot, present: held.present, generation: held.generation, atr: held.atr.clone(), available: !matches!(held.phase, Phase::Unavailable) }

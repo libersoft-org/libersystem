@@ -368,10 +368,22 @@ pub unsafe fn configure_uas(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Uas> {
 		}
 
 		let mut hids: Hids = Hids::new();
-		let ring_command = Ring::new()?;
-		let mut status = streams_or_ring(status_streams)?;
-		let mut data_in = streams_or_ring(in_streams)?;
-		let mut data_out = streams_or_ring(out_streams)?;
+		// EVERY RING AND STREAM ARRAY, OR NONE OF THEM, and from the moment they are in `device` below
+		// every failure gives all of it back through `Uas::release`. The early returns of this
+		// function used to drop whatever was already taken - an attach the controller refused, or a
+		// device that refused its configuration, kept its rings for the life of the driver.
+		let (ring_command, mut status, mut data_in, mut data_out) = match (Ring::new(), streams_or_ring(status_streams), streams_or_ring(in_streams), streams_or_ring(out_streams)) {
+			(Some(command), Some(status), Some(data_in), Some(data_out)) => (command, status, data_in, data_out),
+			(command, status, data_in, data_out) => {
+				if let Some(mut ring) = command {
+					ring.release();
+				}
+				for mut endpoint in [status, data_in, data_out].into_iter().flatten() {
+					endpoint.release();
+				}
+				return None;
+			}
+		};
 
 		let dci_command = dci(command_addr);
 		let dci_status = dci(status_addr);
@@ -395,33 +407,36 @@ pub unsafe fn configure_uas(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Uas> {
 			};
 			write_endpoint(hc, dev, dci_value, packet, kind, pointer, streams_count);
 		}
+		let tags: [TagBuffer; COMMAND_TAGS as usize] = [const { TagBuffer { handle: 0, virt: 0, phys: 0 } }; COMMAND_TAGS as usize];
+		let mut device = Uas { dci_command, dci_status, dci_data_in, dci_data_out, ring_command, status: status.take_streams(), data_in: data_in.take_streams(), data_out: data_out.take_streams(), control_handle: 0, control_virt: 0, control_phys: 0, tags, pending: [const { Pending::IDLE }; COMMAND_TAGS as usize], data_bytes: 4096, capacity: 0 };
 		if command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24).is_none() {
 			// A CONTROLLER THAT WILL NOT CONFIGURE A STREAM ENDPOINT SAYS SO HERE, which is the one
 			// failure that is about the CONTROLLER rather than the device: `HCCPARAMS1.MaxPSASize`
 			// is what bounds the array this asked for.
 			print(b"driver.xhci: the controller refused the UAS device's stream endpoints\n");
+			device.release();
 			return None;
 		}
-		control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, found.config_value as u16, 0)?;
+		if control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, found.config_value as u16, 0).is_none() {
+			device.release();
+			return None;
+		}
 
-		let (control_handle, control_virt, control_phys) = dma_page()?;
-		// ONE DATA PAGE PER COMMAND TAG, taken up front: a transport that allocated them on demand
-		// would fail to start a command for want of memory in the middle of serving, which is the one
-		// moment there is nothing useful to do about it.
-		let mut tags: [TagBuffer; COMMAND_TAGS as usize] = [const { TagBuffer { handle: 0, virt: 0, phys: 0 } }; COMMAND_TAGS as usize];
-		for tag in tags.iter_mut() {
+		// THE CONTROL PAGE, AND ONE DATA PAGE PER COMMAND TAG, taken up front: a transport that
+		// allocated them on demand would fail to start a command for want of memory in the middle of
+		// serving, which is the one moment there is nothing useful to do about it.
+		let Some((control_handle, control_virt, control_phys)) = dma_page() else {
+			device.release();
+			return None;
+		};
+		(device.control_handle, device.control_virt, device.control_phys) = (control_handle, control_virt, control_phys);
+		for at in 0..device.tags.len() {
 			let Some((handle, virt, phys)) = dma_page() else {
-				for built in tags.iter_mut() {
-					if built.handle != 0 {
-						close(built.handle);
-					}
-				}
-				close(control_handle);
+				device.release();
 				return None;
 			};
-			*tag = TagBuffer { handle, virt, phys };
+			device.tags[at] = TagBuffer { handle, virt, phys };
 		}
-		let mut device = Uas { dci_command, dci_status, dci_data_in, dci_data_out, ring_command, status: status.take_streams(), data_in: data_in.take_streams(), data_out: data_out.take_streams(), control_handle, control_virt, control_phys, tags, pending: [const { Pending::IDLE }; COMMAND_TAGS as usize], data_bytes: 4096, capacity: 0 };
 
 		// A FRESHLY ATTACHED UNIT REFUSES ITS FIRST COMMAND with a power-on attention that clears by
 		// being read, which is the same rule every other SCSI path here follows.
@@ -505,6 +520,13 @@ enum Endpoint {
 }
 
 impl Endpoint {
+	fn release(&mut self) {
+		match self {
+			Endpoint::Streams(array) => array.release(),
+			Endpoint::Plain(ring) => ring.release(),
+		}
+	}
+
 	// Take the stream array out, building one over the plain ring when there is none. The rest of
 	// this module drives one structure rather than two.
 	fn take_streams(&mut self) -> Streams {

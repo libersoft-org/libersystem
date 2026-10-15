@@ -15,6 +15,7 @@
 // This module decides. It never transfers: the controller owns the bus.
 
 use crate::descriptor;
+use alloc::vec::Vec;
 
 /// The communications interface class, and the data interface class that pairs with it.
 pub const CLASS_COMMUNICATIONS: u8 = 0x02;
@@ -56,6 +57,7 @@ pub const REQ_GET_LINE_CODING: u8 = 0x21;
 pub const REQ_SET_CONTROL_LINE_STATE: u8 = 0x22;
 pub const REQ_SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
 pub const REQ_GET_NTB_PARAMETERS: u8 = 0x80;
+pub const REQ_SET_NTB_FORMAT: u8 = 0x84;
 pub const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
 
 /// Packet-filter bits, as `SET_ETHERNET_PACKET_FILTER`'s value.
@@ -105,6 +107,9 @@ pub struct Binding {
 	pub mac_string: u8,
 	/// The largest Ethernet frame the device will carry, from the Ethernet functional descriptor.
 	pub max_segment: u16,
+	/// The NCM functional descriptor's `bmNetworkCapabilities`, or zero when there is none - which is what an ECM
+	/// configuration has, and an NCM one that offers none of the optional requests. See `NCM_CAN_FILTER`.
+	pub ncm_capabilities: u8,
 }
 
 /// Why a configuration is not one this driver can bind.
@@ -158,6 +163,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	let mut union_data: Option<u8> = None;
 	let mut mac_string: Option<u8> = None;
 	let mut max_segment: u16 = 0;
+	let mut ncm_capabilities: u8 = 0;
 	// The data interface's candidate settings, as (interface, alternate, in, out, in mps, out mps).
 	let mut candidate: Candidate = None;
 	let mut best: Option<Pair> = None;
@@ -207,6 +213,9 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 						mac_string = record.field(3).ok();
 						max_segment = record.field16(8).unwrap_or(0);
 					}
+					// WHICH OPTIONAL REQUESTS AN NCM FUNCTION TAKES, at offset five after its version. A
+					// record too short to carry the bitmap offers none of them, which is what zero says.
+					FN_NCM => ncm_capabilities = record.field(5).unwrap_or(0),
 					_ => {}
 				}
 			}
@@ -258,7 +267,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	if union_data != data_interface {
 		return Err(NotBindable::NoDataInterface);
 	}
-	Ok(Binding { model, config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, notification, notification_interval, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, mac_string, max_segment })
+	Ok(Binding { model, config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, notification, notification_interval, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, mac_string, max_segment, ncm_capabilities })
 }
 
 /// Decode the MAC address a device publishes as a string descriptor.
@@ -627,6 +636,10 @@ pub enum BlockFault {
 	Datagram,
 	/// The pointer chain does not end.
 	Chain,
+	/// A datagram that is not a frame this link carries: shorter than an Ethernet header, longer than the
+	/// longest frame, inside the block's header - or, added to the ones before it, more bytes than the block
+	/// holds. See `ncm_frames`.
+	Frame,
 }
 
 /// One transfer block's header.
@@ -781,15 +794,202 @@ impl Iterator for Datagrams<'_> {
 	}
 }
 
-/// Build one 16-bit transfer block holding a single datagram, for the transmit side.
+// ---------------------------------------------------------------------------------------------
+// NCM: what the device says about its blocks, and the host's side of that bargain.
+// ---------------------------------------------------------------------------------------------
+
+/// `SET_NTB_FORMAT`'s value for 16-bit blocks, which every NCM function speaks and which is the only
+/// format this driver does.
+pub const NTB_FORMAT_16: u16 = 0x0000;
+
+/// `bmNtbFormatsSupported`: 16-bit blocks, which a function MUST offer, and 32-bit ones, which it MAY.
+pub const NTB_FORMATS_16: u16 = 1 << 0;
+pub const NTB_FORMATS_32: u16 = 1 << 1;
+
+/// The NCM functional descriptor's capability bit for `SET_ETHERNET_PACKET_FILTER`.
+///
+/// OPTIONAL IN NCM WHERE ECM REQUIRES IT, which is why it is read rather than assumed: an ECM device
+/// forwards nothing until it is told a filter, and an NCM function that does not take the request
+/// forwards by its own default - and stalls the request if a driver sends it anyway.
+pub const NCM_CAN_FILTER: u8 = 1 << 0;
+
+/// The length of `GET_NTB_PARAMETERS`' answer, which is also what its own first field says.
+pub const NTB_PARAMETERS_LEN: usize = 28;
+
+/// The smallest block a host may ask a device to send at most - and so the smallest maximum a device
+/// may offer.
+pub const NTB_MIN_IN_SIZE: u32 = 2048;
+
+/// The shortest datagram that is a frame at all: an Ethernet header and nothing after it.
+pub const ETHERNET_HEADER: usize = 14;
+
+/// What `GET_NTB_PARAMETERS` says about the blocks each direction carries - the fields this host acts
+/// on.
+///
+/// THE IN DIRECTION'S LAYOUT FIELDS ARE NOT HERE, deliberately: the device lays out the blocks it
+/// sends, and the receive side checks every offset in one against the block itself, whatever the
+/// device said it would do. What the host needs from the IN half is only how LARGE a block may be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NtbParameters {
+	/// `bmNtbFormatsSupported`.
+	pub formats: u16,
+	/// The largest block the device sends until the host asks for a smaller one.
+	pub in_max: u32,
+	/// The largest block the device takes, and how it wants the datagram and its table placed in one:
+	/// `offset % divisor == remainder` for a datagram, a multiple of `alignment` for a table.
+	pub out_max: u32,
+	pub out_divisor: u16,
+	pub out_remainder: u16,
+	pub out_alignment: u16,
+	/// The most datagrams one block may carry, zero for no limit. This host sends one a block, which
+	/// every value admits.
+	pub out_datagrams: u16,
+}
+
+/// Why a device's parameters are not ones this host can frame for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NtbRefusal {
+	/// Fewer bytes arrived than the structure has, or its own length says it is shorter than its
+	/// fields.
+	Short,
+	/// No 16-bit blocks, which every NCM function must offer and which is the only format spoken here.
+	No16Bit,
+	/// An IN maximum below the 2048-byte floor.
+	InSize,
+	/// A divisor of zero, or a remainder no offset modulo the divisor can leave.
+	Divisor,
+	/// A table alignment that is not a power of two of at least four.
+	Alignment,
+	/// No block within the device's OUT maximum - and this host's buffer - carries one frame of the
+	/// link's size.
+	OutSize,
+}
+
+/// Read `GET_NTB_PARAMETERS`' answer, checking what this host will act on.
+///
+/// EVERY FIELD HERE IS A NUMBER THE DEVICE CHOSE AND THE HOST THEN OBEYS. A divisor of zero is a
+/// division by zero in the host's layout arithmetic, a remainder at or past the divisor names an
+/// offset that cannot exist, and an alignment that is not a power of two of at least four is not one
+/// the specification lets a device ask for - so each is refused rather than rounded to something
+/// nearby, which would be a host deciding what a device meant.
+pub fn ntb_parameters(bytes: &[u8]) -> Result<NtbParameters, NtbRefusal> {
+	if bytes.len() < NTB_PARAMETERS_LEN {
+		return Err(NtbRefusal::Short);
+	}
+	let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+	let word = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+	if (half(0) as usize) < NTB_PARAMETERS_LEN {
+		return Err(NtbRefusal::Short);
+	}
+	let parameters = NtbParameters { formats: half(2), in_max: word(4), out_max: word(16), out_divisor: half(20), out_remainder: half(22), out_alignment: half(24), out_datagrams: half(26) };
+	if parameters.formats & NTB_FORMATS_16 == 0 {
+		return Err(NtbRefusal::No16Bit);
+	}
+	if parameters.in_max < NTB_MIN_IN_SIZE {
+		return Err(NtbRefusal::InSize);
+	}
+	if parameters.out_divisor == 0 || parameters.out_remainder >= parameters.out_divisor {
+		return Err(NtbRefusal::Divisor);
+	}
+	if parameters.out_alignment < 4 || !parameters.out_alignment.is_power_of_two() {
+		return Err(NtbRefusal::Alignment);
+	}
+	Ok(parameters)
+}
+
+/// How long a block the device may send, and whether it has to be TOLD that.
+///
+/// Answers the receive transfer's length and the size `SET_NTB_INPUT_SIZE` asks for - none when the
+/// device's own maximum already fits the buffer, because the default it starts from is then one the
+/// buffer holds.
+///
+/// THE RECEIVE IS POSTED FOR EXACTLY THE SIZE IN FORCE, NOT FOR THE WHOLE BUFFER. A device ends a
+/// block that is a whole number of packets with a zero-length packet - EXCEPT a block of exactly the
+/// size in force, which it sends with nothing after it. A receive posted longer than that size would
+/// take the next block's bytes into this one.
+///
+/// A buffer below the floor is not one a host may offer, and is answered `None`.
+pub fn ntb_input_size(in_max: u32, buffer: u32) -> Option<(u32, Option<u32>)> {
+	if buffer < NTB_MIN_IN_SIZE {
+		return None;
+	}
+	if in_max <= buffer { Some((in_max, None)) } else { Some((buffer, Some(buffer))) }
+}
+
+/// How this host lays out the blocks it sends, decided once from the device's parameters.
+///
+/// ONE DATAGRAM A BLOCK, so the layout is fixed and only its length varies: the header, the table at
+/// the first offset the device's alignment allows after it, and the datagram at the first offset after
+/// the table that leaves the device's remainder modulo its divisor. See `ncm_block`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NtbOut {
+	/// The longest block that may be built: the device's maximum, this host's buffer or the 16-bit
+	/// length field, whichever is least.
+	pub most: usize,
+	/// The device's own maximum, which decides whether a block needs a byte to end it - see `length`.
+	pub device_most: usize,
+	/// Where the table goes, and where the datagram goes.
+	pub table: usize,
+	pub payload: usize,
+	/// The bulk OUT endpoint's packet size.
+	pub packet: usize,
+}
+
+impl NtbOut {
+	/// The layout for this device, or why its parameters admit none: the block carrying a frame of
+	/// `longest` bytes must fit inside the device's maximum and `buffer` both, or the link's own MTU is
+	/// a frame this host could never send.
+	pub fn new(parameters: &NtbParameters, packet: u16, longest: usize, buffer: usize) -> Result<NtbOut, NtbRefusal> {
+		let device_most = parameters.out_max as usize;
+		let alignment = parameters.out_alignment as usize;
+		let divisor = parameters.out_divisor as usize;
+		let remainder = parameters.out_remainder as usize;
+		// `ntb_parameters` refuses these, and the arithmetic below divides by them.
+		if alignment == 0 {
+			return Err(NtbRefusal::Alignment);
+		}
+		if divisor == 0 || remainder >= divisor {
+			return Err(NtbRefusal::Divisor);
+		}
+		let table = NTH16_LEN.div_ceil(alignment) * alignment;
+		let after = table + NDP16_MIN_LEN;
+		let payload = after + (remainder + divisor - after % divisor) % divisor;
+		let layout = NtbOut { most: device_most.min(buffer).min(u16::MAX as usize), device_most, table, payload, packet: packet.max(1) as usize };
+		layout.length(longest).ok_or(NtbRefusal::OutSize)?;
+		Ok(layout)
+	}
+
+	/// The length of the block that carries a frame of `frame` bytes, or `None` when it does not fit.
+	///
+	/// A BLOCK THAT IS A WHOLE NUMBER OF PACKETS IS ONE BYTE LONGER. The device receives into a transfer
+	/// of its own maximum and sees a block end at a short packet - so a block ending exactly on a packet
+	/// boundary, short of that maximum, is a transfer the device is still waiting on, and the next block
+	/// would be read as the rest of it. One byte of padding inside the block's own length makes the
+	/// last packet short; a zero-length packet after it is a second transfer for the same effect.
+	pub fn length(&self, frame: usize) -> Option<usize> {
+		let mut total = self.payload.checked_add(frame)?;
+		if total % self.packet == 0 && total < self.device_most {
+			total += 1;
+		}
+		(total <= self.most).then_some(total)
+	}
+}
+
+/// Build the 16-bit transfer block that carries one frame, for the transmit side.
 ///
 /// ONE DATAGRAM PER BLOCK, DELIBERATELY. Packing several is what NCM is for and it is a latency
 /// trade this driver does not have the evidence to make: a frame held back waiting for a second one
 /// is a frame delayed by whatever the next one takes to arrive, and nothing here measures that yet.
 /// The receive side reads whatever the device packs, which is where the packing matters.
-pub fn ncm_block(sequence: u16, frame: &[u8], out: &mut [u8]) -> Option<usize> {
-	let total = NTH16_LEN + NDP16_MIN_LEN + frame.len();
-	if total > out.len() || total > u16::MAX as usize {
+///
+/// `None` for an empty frame - a zero-length entry is the table's terminator, not a datagram - and for
+/// one whose block does not fit the layout or `out`. Never truncated.
+pub fn ncm_block(sequence: u16, frame: &[u8], layout: &NtbOut, out: &mut [u8]) -> Option<usize> {
+	if frame.is_empty() {
+		return None;
+	}
+	let total = layout.length(frame.len())?;
+	if total > out.len() {
 		return None;
 	}
 	out[..total].fill(0);
@@ -797,18 +997,51 @@ pub fn ncm_block(sequence: u16, frame: &[u8], out: &mut [u8]) -> Option<usize> {
 	out[4..6].copy_from_slice(&(NTH16_LEN as u16).to_le_bytes());
 	out[6..8].copy_from_slice(&sequence.to_le_bytes());
 	out[8..10].copy_from_slice(&(total as u16).to_le_bytes());
-	out[10..12].copy_from_slice(&(NTH16_LEN as u16).to_le_bytes());
-	let ndp = NTH16_LEN;
+	out[10..12].copy_from_slice(&(layout.table as u16).to_le_bytes());
+	let ndp = layout.table;
 	out[ndp..ndp + 4].copy_from_slice(&NDP16_SIGNATURE.to_le_bytes());
 	out[ndp + 4..ndp + 6].copy_from_slice(&(NDP16_MIN_LEN as u16).to_le_bytes());
-	// No next pointer.
-	out[ndp + 6..ndp + 8].copy_from_slice(&0u16.to_le_bytes());
-	let data_at = (NTH16_LEN + NDP16_MIN_LEN) as u16;
-	out[ndp + 8..ndp + 10].copy_from_slice(&data_at.to_le_bytes());
+	// No next pointer, then the one entry. The terminating zero pair and every pad byte are the fill's.
+	out[ndp + 8..ndp + 10].copy_from_slice(&(layout.payload as u16).to_le_bytes());
 	out[ndp + 10..ndp + 12].copy_from_slice(&(frame.len() as u16).to_le_bytes());
-	// The terminating zero pair is already there from the fill.
-	out[data_at as usize..total].copy_from_slice(frame);
+	out[layout.payload..layout.payload + frame.len()].copy_from_slice(frame);
 	Some(total)
+}
+
+/// Every frame one received block carries - all of them, or none.
+///
+/// ALL OR NONE IS THE POINT. A block is one statement by the device, and a block with one bad entry
+/// is a table the device got wrong rather than a table with one bad line: the entries before it were
+/// written by the same mistake. So the whole block is walked before anything is answered, and a
+/// refusal anywhere in it refuses all of it.
+///
+/// THE CHECKS ARE THE ONES A FRAME NEEDS ON TOP OF THE TABLE'S OWN, which `nth16` and `Datagrams`
+/// make: a datagram shorter than an Ethernet header is not a frame, one longer than `longest` is not
+/// one this link carries, one inside the block's header is the header - and THE DATAGRAMS MAY NOT ADD
+/// UP TO MORE THAN THE BLOCK. Each is a piece of it, so together they are less than it; a table naming
+/// the same bytes over and over would turn one block into hundreds of frames, which is a device
+/// multiplying what it sent by what it wrote in a table.
+pub fn ncm_frames(block: &[u8], longest: usize, out: &mut Vec<Datagram>) -> Result<Nth16, BlockFault> {
+	out.clear();
+	let header = nth16(block)?;
+	let room = (header.block_length as usize).saturating_sub(NTH16_LEN);
+	let mut walk = Datagrams::new(block, header);
+	let mut carried: usize = 0;
+	let mut refused: Option<BlockFault> = None;
+	for datagram in walk.by_ref() {
+		let (at, len) = (datagram.at as usize, datagram.len as usize);
+		carried += len;
+		if at < NTH16_LEN || len < ETHERNET_HEADER || len > longest || carried > room {
+			refused = Some(BlockFault::Frame);
+			break;
+		}
+		out.push(datagram);
+	}
+	if let Some(fault) = refused.or(walk.fault()) {
+		out.clear();
+		return Err(fault);
+	}
+	Ok(header)
 }
 
 #[cfg(test)]

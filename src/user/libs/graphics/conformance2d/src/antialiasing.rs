@@ -6,17 +6,54 @@
 //! is the point: the profile says ANALYTIC.
 
 use crate::Outcome;
-use crate::harness::{draw, draw_with, near, rect_path, white};
+use crate::harness::{WIDE, byte, draw, draw_with, every_pixel, near, rect_path, stored, threshold, white};
 use graphics_core::geom::{PointF, RectF};
 use render2d::path::{FillRule, PathBuilder, StrokeStyle};
 
 // @covers: AnalyticCoverageFill
-/// An edge a quarter of the way through a pixel covers a quarter of it.
+/// An edge a quarter of the way through a pixel covers a quarter of it - at EVERY pixel, against the frozen
+/// coverage threshold.
+///
+/// A RECTANGLE IS THE SHAPE WHOSE ANALYTIC AREA A SCENE CAN STATE: its overlap with a pixel is the product of
+/// two one-dimensional overlaps, computed here from the rectangle and not from the backend. So every pixel of
+/// a target several tiles wide is compared - exactly where the area is nothing or everything, within the
+/// frozen 2/255 where it is a fraction, and the mean over those within the frozen 1/255, which is the bound
+/// that catches a bias every pixel is one step inside. The edges are at four phases against the grid, and
+/// the far ones never at the near ones'.
 pub fn analytic_coverage_fill() -> Outcome {
-	let frame = draw(16, 16, |canvas| canvas.fill_path(rect_path(RectF::new(4.25, 4.0, 8.0, 8.0)), white(), FillRule::NonZero))?;
-	require!(near(frame.alpha(4, 8), 0.75), "a pixel three quarters covered reads three quarters: {:?}", frame.pixel(4, 8));
-	require!(frame.covered(5, 8), "the pixel fully inside is full: {:?}", frame.pixel(5, 8));
-	require!(near(frame.alpha(12, 8), 0.25), "and the far edge lands a quarter into its pixel: {:?}", frame.pixel(12, 8));
+	let overlap = |pixel: u32, from: f64, to: f64| (to.min(pixel as f64 + 1.0) - from.max(pixel as f64)).max(0.0);
+	let (mut partial, mut total) = (0usize, 0.0f64);
+	for phase in [0.0f64, 0.25, 0.375, 0.875] {
+		let (left, top, width, height) = (40.0 + phase, 36.5 + phase, 60.5, 50.75);
+		let frame = draw(WIDE, WIDE, |canvas| canvas.fill_path(rect_path(RectF::new(left as f32, top as f32, width as f32, height as f32)), white(), FillRule::NonZero))?;
+		let area = |x: u32, y: u32| overlap(x, left, left + width) * overlap(y, top, top + height);
+		// NOTHING AND EVERYTHING ARE COMPARED EXACTLY, the colour of a partly covered pixel too: a white
+		// shape is white wherever it is at all.
+		every_pixel(&frame, |x, y| match area(x, y) {
+			value if value <= 0.0 => [0; 4],
+			value if value >= 1.0 => [stored(1.0, x, y), stored(1.0, x, y), stored(1.0, x, y), byte(1.0)],
+			_ => {
+				let mut pixel = frame.pixel(x, y);
+				pixel[..3].copy_from_slice(&[stored(1.0, x, y); 3]);
+				pixel
+			}
+		})?;
+		for y in 0..WIDE {
+			for x in 0..WIDE {
+				let wanted = area(x, y);
+				if wanted <= 0.0 || wanted >= 1.0 {
+					continue;
+				}
+				let difference = (frame.alpha(x, y) as f64 / 255.0 - wanted).abs();
+				require!(difference <= threshold::COVERAGE_PER_PIXEL, "pixel ({x}, {y}) at phase {phase} is {} covered by area and drawn at {:?}, which is {difference} out against the frozen 2/255", wanted, frame.pixel(x, y));
+				partial += 1;
+				total += difference;
+			}
+		}
+	}
+	require!(partial > 0, "the edges' phases leave pixels partly covered to compare");
+	let mean = total / partial as f64;
+	require!(mean <= threshold::COVERAGE_MEAN, "the mean difference over {partial} partly covered pixels is {mean}, against the frozen 1/255");
 	Ok(())
 }
 

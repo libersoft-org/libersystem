@@ -168,6 +168,7 @@ enum Fault {
 
 // The controller and the one port this driver serves.
 struct Controller {
+	base: u64,
 	device: u64,
 	port: u64,
 	// The command list, the received-FIS area and one command table per tag.
@@ -364,6 +365,96 @@ impl Controller {
 	unsafe fn flush(&mut self) -> Result<(), Fault> {
 		unsafe { self.named(ahci::ATA_FLUSH_CACHE_EXT, 0, 0, 0, false) }
 	}
+
+	// IDENTIFY DEVICE, answered into tag zero's data span, 512 bytes of it. Only where nothing else is
+	// on a tag: the bind, and a resume.
+	unsafe fn identify(&mut self) -> Result<ahci::Disk, Bringup> {
+		unsafe {
+			if !self.grow(0, 512) {
+				return Err(Bringup::NoDma);
+			}
+			zero(self.data[0].virt, 512);
+			self.named(ahci::ATA_IDENTIFY, 0, 0, 512, false).map_err(|_| Bringup::Identify)?;
+			let mut words = [0u16; 256];
+			for (index, word) in words.iter_mut().enumerate() {
+				*word = (self.data[0].virt as *const u16).add(index).read_volatile();
+			}
+			ahci::identify(&words).map_err(|_| Bringup::Disk)
+		}
+	}
+
+	// THE PORT AND ITS DISK AGAIN, after a power loss took both: AHCI mode, then the port through the
+	// bind's own sequence - its buffers, its link and its signature - the command engine started, and
+	// the disk identified and required to be THE disk this driver was serving, by its size and sector,
+	// so its consumers find the blocks they were using. Every tag is free here, as it is where a
+	// `SUSPEND` is read.
+	unsafe fn reattach(&mut self) -> bool {
+		unsafe {
+			let ghc = r32(self.base + ahci::REG_GHC);
+			w32(self.base + ahci::REG_GHC, ghc | ahci::GHC_AHCI_ENABLE);
+			zero(self.structures.virt, self.structures.bytes);
+			if !matches!(ready_port(self.port, &self.structures), Ok(Some(Attached::Disk))) {
+				return false;
+			}
+			start_port(self.port);
+			let disk = self.disk;
+			self.identify().is_ok_and(|found| found == disk)
+		}
+	}
+}
+
+// BRING ONE PORT TO WHERE ITS DEVICE CAN BE READ, and say what is on it: the command engine stopped,
+// the command list and received-FIS area programmed, FIS receive enabled, the link reset unless it is
+// up with a device behind it, and the signature waited for. `None` for a port whose link does not
+// come up. The bind walks every implemented port through this, and a resume after lost power takes
+// the one port it serves through it again.
+unsafe fn ready_port(port: u64, structures: &Dma) -> Result<Option<Attached>, Bringup> {
+	unsafe {
+		if !stop_port(port) {
+			return Err(Bringup::PortStuck);
+		}
+		// THIS DRIVER RESETS THE PORT ITSELF RATHER THAN INHERITING SOMEBODY ELSE'S, and that is the
+		// defect only a run on a second machine could find.
+		//
+		// On x86_64 the firmware enumerates the AHCI controller before this driver ever sees it - the
+		// boot log lists a SATA device among its boot entries - so the link was already up and
+		// `PxSIG` already latched when the driver read them. On the aarch64 machine the firmware does
+		// not touch the controller at all, and the driver read a port whose link had never been
+		// brought up: "port 0 carries nothing", with a disk plainly attached and QEMU reporting it. An
+		// AHCI driver that only works after somebody else initialised the port is a driver that works
+		// on one machine.
+		//
+		// THE SEQUENCE IS THE SPECIFICATION'S, AND ITS FIRST STEP IS THE ONE THAT IS EASY TO MISS:
+		// `PxSIG` IS NOT A REGISTER THE HBA FILLS BY ITSELF. It is copied out of the device's first
+		// register FIS, and the HBA can only receive that FIS once the port has a FIS receive AREA and
+		// `PxCMD.FRE` is set. A port probed with the receive engine off reports a link that is up and
+		// a signature that is zero, for ever - which is exactly what "port 0 carries nothing" was. So
+		// the buffers are programmed BEFORE the reset, rather than after a port has been chosen.
+		//
+		// Then: ask for a COMRESET in `PxSCTL.DET`, hold it, release it, wait for the link, clear the
+		// errors the reset itself recorded, and only then believe the signature. Every wait is bounded
+		// in the 100 Hz ticks the bind window is measured in.
+		w64(port + ahci::PORT_CLB, structures.phys);
+		w64(port + ahci::PORT_FB, structures.phys + RECEIVED_FIS_OFFSET);
+		w32(port + ahci::PORT_CMD, r32(port + ahci::PORT_CMD) | ahci::CMD_FIS_RECEIVE_ENABLE);
+		if !ahci::link_up(r32(port + ahci::PORT_SSTS)) || matches!(ahci::attached(r32(port + ahci::PORT_SIG)), Attached::None) {
+			reset_port(port);
+		}
+		if !ahci::link_up(r32(port + ahci::PORT_SSTS)) {
+			return Ok(None);
+		}
+		// AND THE SIGNATURE APPEARS AFTER THE LINK RATHER THAN WITH IT. `PxSIG` is written when the
+		// device sends its first register FIS, which is a moment after `PxSSTS.DET` reaches three; a
+		// port still busy has not finished presenting itself.
+		let mut settle = common::Deadline::ticks(SIGNATURE_TICKS);
+		while settle.waiting() {
+			let busy = r32(port + ahci::PORT_TFD) & (ahci::TFD_BSY | ahci::TFD_DRQ) != 0;
+			if !busy && !matches!(ahci::attached(r32(port + ahci::PORT_SIG)), Attached::None) {
+				break;
+			}
+		}
+		Ok(Some(ahci::attached(r32(port + ahci::PORT_SIG))))
+	}
 }
 
 // Bring one port's link up from nothing: a COMRESET asked for in `PxSCTL.DET`, held, released, and
@@ -511,56 +602,13 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		let mut chosen: Option<u64> = None;
 		for index in ahci::implemented_ports(pi, caps.ports) {
 			let port = base + ahci::port_offset(index);
-			if !stop_port(port) {
-				return Err(Bringup::PortStuck);
-			}
-			// THIS DRIVER RESETS THE PORT ITSELF RATHER THAN INHERITING SOMEBODY ELSE'S, and that
-			// is the defect only a run on a second machine could find.
-			//
-			// On x86_64 the firmware enumerates the AHCI controller before this driver ever sees it -
-			// the boot log lists a SATA device among its boot entries - so the link was already up
-			// and `PxSIG` already latched when the driver read them. On the aarch64 machine the
-			// firmware does not touch the controller at all, and the driver read a port whose link
-			// had never been brought up: "port 0 carries nothing", with a disk plainly attached and
-			// QEMU reporting it. An AHCI driver that only works after somebody else initialised the
-			// port is a driver that works on one machine.
-			//
-			// THE SEQUENCE IS THE SPECIFICATION'S, AND ITS FIRST STEP IS THE ONE THAT IS EASY TO
-			// MISS: `PxSIG` IS NOT A REGISTER THE HBA FILLS BY ITSELF. It is copied out of the
-			// device's first register FIS, and the HBA can only receive that FIS once the port has a
-			// FIS receive AREA and `PxCMD.FRE` is set. A port probed with the receive engine off
-			// reports a link that is up and a signature that is zero, for ever - which is exactly
-			// what "port 0 carries nothing" was. So the buffers are programmed BEFORE the reset,
-			// rather than after a port has been chosen.
-			//
-			// Then: ask for a COMRESET in `PxSCTL.DET`, hold it, release it, wait for the link,
-			// clear the errors the reset itself recorded, and only then believe the signature. Every
-			// wait is bounded in the 100 Hz ticks the bind window is measured in.
-			w64(port + ahci::PORT_CLB, structures.phys);
-			w64(port + ahci::PORT_FB, structures.phys + RECEIVED_FIS_OFFSET);
-			w32(port + ahci::PORT_CMD, r32(port + ahci::PORT_CMD) | ahci::CMD_FIS_RECEIVE_ENABLE);
-			if !ahci::link_up(r32(port + ahci::PORT_SSTS)) || matches!(ahci::attached(r32(port + ahci::PORT_SIG)), Attached::None) {
-				reset_port(port);
-			}
-			if !ahci::link_up(r32(port + ahci::PORT_SSTS)) {
-				continue;
-			}
-			// AND THE SIGNATURE APPEARS AFTER THE LINK RATHER THAN WITH IT. `PxSIG` is written when
-			// the device sends its first register FIS, which is a moment after `PxSSTS.DET` reaches
-			// three; a port still busy has not finished presenting itself.
-			let mut settle = common::Deadline::ticks(SIGNATURE_TICKS);
-			while settle.waiting() {
-				let busy = r32(port + ahci::PORT_TFD) & (ahci::TFD_BSY | ahci::TFD_DRQ) != 0;
-				if !busy && !matches!(ahci::attached(r32(port + ahci::PORT_SIG)), Attached::None) {
-					break;
-				}
-			}
-			match ahci::attached(r32(port + ahci::PORT_SIG)) {
-				Attached::Disk => {}
+			match ready_port(port, &structures)? {
+				None => continue,
+				Some(Attached::Disk) => {}
 				// REFUSED BY NAME rather than driven. An ATAPI device answers a packet command set
 				// this driver does not speak, and issuing ATA reads to one produces errors that look
 				// like a failing disk.
-				other => {
+				Some(other) => {
 					let mut line: common::Bounded<96> = common::Bounded::new();
 					line.push(b"driver.ahci: port ");
 					line.decimal(index as u64);
@@ -576,8 +624,8 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 			}
 			// ONE PORT, ONE BLOCK PROVIDER, for the same reason the NVMe driver serves one namespace:
 			// the binding unit is a PCI function and a port is not expressible in one. The buffers
-			// are already programmed above - the receive engine had to be running before the
-			// signature could appear - so what is left is to start the command engine.
+			// are already programmed by `ready_port` - the receive engine had to be running before
+			// the signature could appear - so what is left is to start the command engine.
 			start_port(port);
 			chosen = Some(port);
 			break;
@@ -587,19 +635,8 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		// THE TAGS THIS CONTROLLER ACTUALLY HAS. `CAP.NCS` is how many command slots a port carries,
 		// and a driver issuing a tag past it writes a header outside the command list.
 		let tags = (caps.slots as usize).min(QUEUED_TAGS);
-		let mut controller = Controller { device, port, structures, disk: ahci::Disk { sectors: 0, sector_bytes: 512 }, most_bytes: TRANSFER_BOUND, queued: caps.queued && tags > 1, data: [Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }; QUEUED_TAGS] };
-
-		// IDENTIFY DEVICE answers into tag zero's data span, 512 bytes of it.
-		if !controller.grow(0, 512) {
-			return Err(Bringup::NoDma);
-		}
-		zero(controller.data[0].virt, 512);
-		controller.named(ahci::ATA_IDENTIFY, 0, 0, 512, false).map_err(|_| Bringup::Identify)?;
-		let mut words = [0u16; 256];
-		for (index, word) in words.iter_mut().enumerate() {
-			*word = (controller.data[0].virt as *const u16).add(index).read_volatile();
-		}
-		controller.disk = ahci::identify(&words).map_err(|_| Bringup::Disk)?;
+		let mut controller = Controller { base, device, port, structures, disk: ahci::Disk { sectors: 0, sector_bytes: 512 }, most_bytes: TRANSFER_BOUND, queued: caps.queued && tags > 1, data: [Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }; QUEUED_TAGS] };
+		controller.disk = controller.identify()?;
 		Ok(controller)
 	}
 }
@@ -629,25 +666,47 @@ enum Took {
 }
 
 // THE SLEEP, between two batches - every tag is free where a `SUSPEND` is read: the disk's write cache is flushed, so
-// a battery that dies in the sleep loses nothing this driver accepted. A disk that lost its power is not reprogrammed
-// here - its link, its port and its command lists are the bind's to set up - so its resume answers it did not come
-// back, and it is bound again.
+// a battery that dies in the sleep loses nothing this driver accepted, and for a state that cuts the power the port's
+// command and FIS-receive engines are stopped - no DMA into memory about to stop being refreshed. ITS RESUME, after
+// lost power, takes the port and its disk through the bind's sequence again and checks it is the same disk; after a
+// stop that kept the power it starts the engines again. Under the same binding either way, with every consumer's
+// connection kept - so a system volume a StorageService mounted over this provider is still mounted after the sleep.
+// Only a disk that does not come back is bound again.
 struct Sleep<'a> {
 	controller: &'a mut Controller,
 	serving: &'a mut common::Serving,
+	// Whether this step stopped the port, which a resume that lost no power must undo all the same.
+	stopped: bool,
 }
 
 impl common::SleepStep for Sleep<'_> {
-	fn suspend(&mut self, _request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+	fn suspend(&mut self, request: &driver_protocol::SuspendRequest) -> driver_protocol::Suspended {
+		let refused = driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
 		if unsafe { self.controller.flush() }.is_err() {
 			print(b"driver.ahci: the sleep is refused - the disk did not complete the flush it requires\n");
-			return driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Refused(driver_protocol::DriverFailureCode::DeviceNotResponding), awake_by_ms: 0 };
+			return refused;
+		}
+		if request.state.loses_power() {
+			if !unsafe { stop_port(self.controller.port) } {
+				print(b"driver.ahci: the sleep is refused - the port did not stop its engines\n");
+				return refused;
+			}
+			self.stopped = true;
 		}
 		driver_protocol::Suspended { outcome: driver_protocol::SuspendOutcome::Done, awake_by_ms: 0 }
 	}
 
 	fn resume(&mut self, lost_power: bool) -> bool {
-		!lost_power
+		let stopped = core::mem::take(&mut self.stopped);
+		if lost_power {
+			let back = unsafe { self.controller.reattach() };
+			print(if back { b"driver.ahci: the disk is back from the sleep - its port brought up again, the same disk\n" } else { b"driver.ahci: the disk did not come back from the sleep\n" });
+			return back;
+		}
+		if stopped {
+			unsafe { start_port(self.controller.port) };
+		}
+		true
 	}
 
 	fn serving(&mut self) -> Option<&mut common::Serving> {
@@ -664,7 +723,7 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 		loop {
 			let ready = common::serve_any_or_sleep(bootstrap, bind, &mut serving);
 			if let Some(None) = ready {
-				if common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, serving: &mut serving }) {
+				if common::take_sleep_step(bootstrap, bind, &mut Sleep { controller: &mut *controller, serving: &mut serving, stopped: false }) {
 					continue;
 				}
 			}
@@ -673,7 +732,14 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 				if !flushed {
 					print(b"driver.ahci: the disk did not complete the flush this stop requires - no clean stop is claimed for it\n");
 				}
-				common::finish_stop(bootstrap, bind, controller.device, flushed);
+				// AND THE PORT'S ENGINES ARE STOPPED, which is what makes the stop QUIET: `finish_stop` claims
+				// this device masters nothing any more, and a port whose command list and FIS receive still run
+				// may still write into memory.
+				let stopped = stop_port(controller.port);
+				if !stopped {
+					print(b"driver.ahci: the port did not stop its engines - no clean stop is claimed for it\n");
+				}
+				common::finish_stop(bootstrap, bind, controller.device, flushed && stopped);
 				exit();
 			};
 			take(bootstrap, bind, &mut serving, at, controller, &mut request, &mut flight);

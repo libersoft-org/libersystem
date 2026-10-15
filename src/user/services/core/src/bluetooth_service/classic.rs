@@ -44,6 +44,8 @@ const REJECT_UNACCEPTABLE: u8 = 0x0F;
 const REJECT_RESOURCES: u8 = 0x0D;
 // The page timeout: 5.12 seconds, in 0.625 ms slots.
 const PAGE_TIMEOUT_SLOTS: u16 = 0x2000;
+// The Object Push server's record handle, in the server while a receiver waits and nowhere else.
+pub(crate) const OPP_RECORD: u32 = 0x0001_0007;
 
 // --------------------------------------------------------------------------------- state
 
@@ -99,9 +101,9 @@ pub(crate) struct ControllerState {
 impl ControllerState {
 	pub fn new() -> ControllerState {
 		// THE ROLES THIS SYSTEM OFFERS, each with its record: A2DP's source (a player) and sink (headphones), the remote
-		// control's target - claiming no player category, there being no media session - and controller, the voice
-		// gateway a headset connects to, by the hands-free and the headset profile, and the Object Push server a
-		// receiver's peer pushes to - on RFCOMM; the policy admits it only while a receiver waits.
+		// control's target - claiming no player category, there being no media session - and controller, and the voice
+		// gateway a headset connects to, by the hands-free and the headset profile. The Object Push server's record
+		// (`OPP_RECORD`) is offered only while a receiver waits.
 		let mut sdp = Server::new();
 		sdp.offer(sdp::a2dp(0x0001_0001, false, 0x0001));
 		sdp.offer(sdp::a2dp(0x0001_0002, true, 0x0001));
@@ -109,7 +111,6 @@ impl ControllerState {
 		sdp.offer(sdp::avrcp(0x0001_0004, false, 0x0001));
 		sdp.offer(sdp::hfp_audio_gateway(0x0001_0005, bt_policy::HFP_CHANNEL, hfp::SDP_FEATURES));
 		sdp.offer(sdp::hsp_audio_gateway(0x0001_0006, bt_policy::HSP_CHANNEL));
-		sdp.offer(sdp::opp_server(0x0001_0007, bt_policy::OPP_CHANNEL, None));
 		ControllerState { watcher: 0, prompt: None, next_prompt: 1, discoverable_until: None, written_scan: None, legacy: None, paging: None, sdp, names: Vec::new(), classes: Vec::new(), receive_waits: None, wants: Vec::new(), transaction: 1 }
 	}
 
@@ -251,6 +252,8 @@ pub(crate) struct ClassicLink {
 	pub sniff: bool,
 	// The profiles connected over it: bt_policy's trust bits.
 	pub profiles: bt_policy::Trust,
+	// The encryption key's length was asked for, and the link counts as encrypted only once it is answered long enough.
+	pub key_size_asked: bool,
 	// A2DP's stream and AVRCP's remote control on the link.
 	pub a2dp: super::a2dp::A2dp,
 	// This host is the link's central - it paged, or the peer let it take the role - which is what runs the
@@ -269,7 +272,7 @@ pub(crate) struct ClassicLink {
 
 impl ClassicLink {
 	fn new(central: bool) -> ClassicLink {
-		ClassicLink { channels: Channels::new(), ertm: Vec::new(), held: Vec::new(), sdp_client: None, rfcomm: None, hid: Hid::default(), ours: IoCapability::NoInputNoOutput, theirs: None, pairing: false, refused: false, authenticating: false, level: None, features: None, last_activity: clock(), sniff: false, profiles: bt_policy::Trust::default(), a2dp: super::a2dp::A2dp::default(), central, derive: None, responder: None, voice: None, pan: None }
+		ClassicLink { channels: Channels::new(), ertm: Vec::new(), held: Vec::new(), sdp_client: None, rfcomm: None, hid: Hid::default(), ours: IoCapability::NoInputNoOutput, theirs: None, pairing: false, refused: false, authenticating: false, level: None, features: None, last_activity: clock(), sniff: false, profiles: bt_policy::Trust::default(), key_size_asked: false, a2dp: super::a2dp::A2dp::default(), central, derive: None, responder: None, voice: None, pan: None }
 	}
 
 	// The source key goes the moment it is no longer wanted.
@@ -629,6 +632,52 @@ impl Stack {
 			controller.disconnect(handle, REASON_AUTHENTICATION);
 			return;
 		}
+		// THE KEY'S LENGTH IS ASKED BEFORE THE LINK COUNTS AS ENCRYPTED. LMP's key-size negotiation is not authenticated,
+		// so an Encryption Change that succeeded says nothing about how long the key is - a radio attacker can have
+		// shortened it to one octet under a bond `btctl` reports as authenticated Secure Connections. Nothing that waits for
+		// encryption goes until the controller says the key is as long as the link's own key promises.
+		if let Some(classic) = link.classic.as_mut() {
+			classic.key_size_asked = true;
+		}
+		controller.command(hci_bredr::opcode::READ_ENCRYPTION_KEY_SIZE, &hci_bredr::handle_only(handle));
+	}
+
+	// THE ENCRYPTION KEY'S LENGTH, answered: the link is encrypted only with a key as long as its link key promises -
+	// sixteen octets under Secure Connections, seven under any other. A controller that does not implement the question is
+	// not one a radio attacker controls, and is taken at its word; any other refusal leaves nothing saying the key is long
+	// enough, and the link goes.
+	pub(crate) fn classic_key_size(&mut self, at: usize, params: &[u8]) {
+		let Some((status, handle, octets)) = hci_bredr::encryption_key_size(params) else { return };
+		let Some(link) = self.controllers[at].link_mut(handle) else { return };
+		let Some(classic) = link.classic.as_mut().filter(|classic| classic.key_size_asked) else { return };
+		classic.key_size_asked = false;
+		let peer = link.peer;
+		let level = classic.level.or_else(|| self.record(at, &peer).map(|record| level_from_wire(&record.level)));
+		let secure_connections = level.is_some_and(|level| level.agreement == Agreement::SecureConnections);
+		let holds = match status {
+			0 => hci_bredr::key_size_holds(octets, secure_connections),
+			hci_bredr::UNKNOWN_COMMAND => true,
+			_ => false,
+		};
+		if !holds {
+			if status == 0 {
+				print(alloc::format!("BluetoothService: a BR/EDR link encrypted with a {octets}-octet key is disconnected - its link key needs {}\n", if secure_connections { 16 } else { 7 }).as_bytes());
+			} else {
+				print(b"BluetoothService: the controller did not say how long a BR/EDR link's key is - the link is disconnected\n");
+			}
+			let controller = &mut self.controllers[at];
+			controller.fail_attempt(&peer);
+			controller.disconnect(handle, REASON_AUTHENTICATION);
+			return;
+		}
+		self.encryption_confirmed(at, handle);
+	}
+
+	// THE LINK IS ENCRYPTED, with a key of its link key's length: what waited for it goes now.
+	fn encryption_confirmed(&mut self, at: usize, handle: u16) {
+		let controller = &mut self.controllers[at];
+		let Some(link) = controller.link_mut(handle) else { return };
+		let peer = link.peer;
 		link.encrypted = true;
 		let level = link.classic.as_ref().and_then(|classic| classic.level);
 		let level = level.or_else(|| self.record(at, &peer).map(|record| level_from_wire(&record.level)));
@@ -1020,7 +1069,11 @@ impl Stack {
 		}
 	}
 
-	pub(crate) fn classic_complete(&mut self, _at: usize, _op: u16, _status: u8, _params: &[u8]) {}
+	pub(crate) fn classic_complete(&mut self, at: usize, op: u16, _status: u8, params: &[u8]) {
+		if op == hci_bredr::opcode::READ_ENCRYPTION_KEY_SIZE {
+			self.classic_key_size(at, params);
+		}
+	}
 
 	pub(crate) fn classic_status(&mut self, at: usize, _status: u8, op: u16) {
 		let controller = &mut self.controllers[at];
@@ -1453,7 +1506,7 @@ impl Stack {
 				}
 				self.run_rfcomm(at, handle, outs);
 			}
-			_ => self.opp_l2cap_opened(at, handle, cid),
+			_ => self.opp_l2cap_opened(at, handle, cid, usize::from(channel.peer_mtu)),
 		}
 	}
 

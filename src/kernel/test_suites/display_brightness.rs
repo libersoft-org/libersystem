@@ -7,9 +7,19 @@ use display_device_proto::generated::liber::display_device::v1 as backlight_wire
 use display_v1::{BacklightState, BrightnessTarget, display_brightness, display_brightness_control};
 use wire::Sink as _;
 
+// DisplayService's bound on one backlight call, in ticks - two seconds - and the delay before an admission that missed
+// it is asked again: the first of the retries, one second.
+const CALL_DEADLINE: u64 = 200;
+const FIRST_RETRY: u64 = 100;
+
 fn pump() {
 	// An ordinary run_until_idle would advance straight to the very deadline the test is holding.
 	sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+}
+
+// Run the service past `ticks` more, so the deadline the test is holding passes.
+fn wait(ticks: u64) {
+	sched::run_until_idle_until(arch::apic::ticks().saturating_add(ticks));
 }
 
 fn receive(channel: &Channel, why: &str) -> Message {
@@ -124,14 +134,30 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	assert_eq!(receive(&harness.console, "display heartbeat during describe").bytes, b"PONG");
 	assert!(snapshot(&read, 10).is_empty());
 	assert!(!silent.is_peer_closed(), "both independent requests completed before describe's deadline");
-	sched::run_until_idle_until(arch::apic::ticks().saturating_add(15));
+	wait(CALL_DEADLINE + 5);
 	assert!(silent.is_peer_closed(), "a silent description lost its connection at the deadline");
+	// AND ITS ADMISSION IS ASKED AGAIN: the same publication opened anew a second later, and admitted - a backlight whose
+	// driver was busy at its first `describe` is not lost until its driver publishes again.
+	wait(FIRST_RETRY + 5);
+	let retried = receive(&catalogue, "the retried provider open");
+	assert_eq!(le_u16(&retried.bytes, 0), device::provider_catalogue::OP_OPEN);
+	let retried_driver = open_reply(&catalogue, le_u32(&retried.bytes, 2));
+	let retried_events = admit(&retried_driver, "native:retried");
+	let states = snapshot(&read, 30);
+	assert_eq!(states.len(), 1, "the retried admission completed");
+	assert!(!states[0].failed);
+	announce(&stream, 1, false);
+	pump();
+	assert!(retried_driver.is_peer_closed() && retried_events.is_peer_closed());
+	assert!(snapshot(&read, 31).is_empty());
 
 	// A late catalogue open cannot be mistaken for a later publication's open, and its transferred
 	// endpoint must be closed rather than leaked in the service.
 	announce(&stream, 2, true);
 	let old_open = receive(&catalogue, "held catalogue open");
-	sched::run_until_idle_until(arch::apic::ticks().saturating_add(15));
+	wait(CALL_DEADLINE + 5);
+	// Withdrawn before its retry is due, so nothing asks for it again.
+	announce(&stream, 2, false);
 	announce(&stream, 3, true);
 	let new_open = receive(&catalogue, "new catalogue open");
 	assert_ne!(le_u32(&old_open.bytes, 2), le_u32(&new_open.bytes, 2));
@@ -153,24 +179,37 @@ fn display_service_keeps_serving_while_backlights_stall() {
 	harness.console.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).unwrap();
 	assert_eq!(receive(&harness.console, "display heartbeat during set").bytes, b"PONG");
 	assert_eq!(snapshot(&read, 12)[0].level, Some(50));
+	wait(CALL_DEADLINE + 5);
 	let timeout = receive(&control, "timed-out set reply");
 	refused(&timeout, 20);
 	assert_eq!(display_v1::Error::read(&mut wire::Reader::new(&timeout.bytes[5..])), Some(display_v1::Error::TimedOut));
 	assert!(snapshot(&read, 13)[0].failed);
 
-	// A device event recovers the provider. Its old write response cannot finish or modify a new
-	// write on that same channel, even when the response also smuggles a stream handle.
+	// A LATE ANSWER IS AN ANSWER: the write's completion, after its deadline, lets the provider back into the join -
+	// and finishes nothing, changes no level, and closes the handle it smuggles.
+	let late = |handle| {
+		let mut late_bytes = le_u32(&old_set.bytes, 2).to_le_bytes().to_vec();
+		late_bytes.push(1);
+		late_bytes.extend_from_slice(&77u32.to_le_bytes());
+		send_cap(&driver, &late_bytes, handle, Rights::ALL).unwrap();
+		pump();
+	};
+	let (leaked, late_handle) = Channel::create();
+	late(late_handle);
+	assert!(leaked.is_peer_closed(), "a late completion closes every transferred handle");
+	let recovered = snapshot(&read, 32);
+	assert!(!recovered[0].failed, "a late answer recovers the provider");
+	assert_eq!(recovered[0].level, Some(50), "and sets no level");
+
+	// A device event moves the level. The old write's response, arriving again, cannot finish or modify a new write on
+	// that same channel, even when it smuggles a stream handle.
 	device_level(&events, 33);
 	assert!(!snapshot(&read, 14)[0].failed);
 	set(&control, "native:async-primary", 21, 60);
 	let new_set = receive(&driver, "new level write");
 	assert_ne!(le_u32(&old_set.bytes, 2), le_u32(&new_set.bytes, 2));
 	let (leaked, late_handle) = Channel::create();
-	let mut late_bytes = le_u32(&old_set.bytes, 2).to_le_bytes().to_vec();
-	late_bytes.push(1);
-	late_bytes.extend_from_slice(&77u32.to_le_bytes());
-	send_cap(&driver, &late_bytes, late_handle, Rights::ALL).unwrap();
-	pump();
+	late(late_handle);
 	assert!(leaked.is_peer_closed(), "a late completion closes every transferred handle");
 	assert!(control.recv().is_err(), "the new writer is still waiting for its own correlation");
 	assert_eq!(snapshot(&read, 15)[0].level, Some(33));
@@ -229,6 +268,7 @@ fn display_service_admits_optional_firmware_metadata_without_stalling() {
 			assert_eq!(receive(&harness.console, "display heartbeat during metadata").bytes, b"PONG");
 			assert!(snapshot(&read, 1).is_empty());
 			assert!(driver.recv().is_err(), "GET does not race the pending metadata call");
+			wait(CALL_DEADLINE + 5);
 			let get = receive(&driver, "GET after optional metadata deadline");
 			assert_ne!(metadata_corr, le_u32(&get.bytes, 2));
 			let (leaked, consumer) = Channel::create();

@@ -315,16 +315,3 @@ fn a_withdrawn_reader_answers_everything_closed_and_closes_its_grants() {
 	assert!(effects.contains(&Effect::CloseGrant(A)) && effects.contains(&Effect::CloseGrant(B)));
 	assert_eq!((cards.grant_count(), cards.transaction_count()), (0, 0));
 }
-
-#[test]
-fn a_client_that_falls_sixteen_events_behind_is_closed_and_nothing_is_coalesced() {
-	let mut queue: EventQueue<(EventKind, u64)> = EventQueue::default();
-	for generation in 0..MAX_EVENTS as u64 / 2 {
-		assert!(queue.push((EventKind::Removed, generation)));
-		assert!(queue.push((EventKind::Inserted, generation + 1)), "a reinsertion is its own event");
-	}
-	assert_eq!(queue.len(), MAX_EVENTS);
-	assert!(!queue.push((EventKind::Removed, 99)), "the seventeenth overflows");
-	assert!(queue.overflowed() && queue.is_empty(), "and the stream is to be closed, with nothing left to send");
-	assert!(!queue.push((EventKind::Inserted, 100)), "for ever: a new subscription is a new snapshot");
-}

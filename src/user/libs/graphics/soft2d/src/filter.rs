@@ -36,10 +36,11 @@ use crate::target::Surface;
 /// nothing - it used to build both, in every tile the filtered layer reached.
 ///
 /// EACH NODE IS EVALUATED OVER WHAT THE NODES AFTER IT READ OF IT, and the last over `wanted` - the part
-/// of `bounds` the layer is composited from. `bounds` is the tile grown by the graph's whole expansion,
-/// which every node used to fill: an offset's three pixels widened a flood, a mask and a composite by
-/// the blur's twelve. The regions come from the profile's own bounds map (`FilterNode::required_input`),
-/// walked backwards from `wanted`, so a pixel inside `wanted` is the same number it was.
+/// of `bounds` the layer is composited from. `bounds` is the layer's rectangle in this tile's replay, which
+/// reaches past `wanted` by the graph's whole reach and which every node used to fill: an offset's three
+/// pixels widened a flood, a mask and a composite by the blur's twelve. The regions come from the profile's
+/// own bounds map (`FilterNode::required_input`), walked backwards from `wanted`, so a pixel inside
+/// `wanted` is the same number it was.
 #[allow(clippy::too_many_arguments)]
 // @handles: FilterDropShadow
 pub fn evaluate(graph: &FilterGraph, kernels: &[Option<BlurKernel>], source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, wanted: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, results: &mut Vec<Option<Surface>>, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {

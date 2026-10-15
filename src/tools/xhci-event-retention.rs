@@ -191,7 +191,7 @@ impl Fixture {
 		unsafe {
 			core::ptr::copy_nonoverlapping([0xa1, 0, 1, 0, 0, 0, 0, 0].as_ptr(), page as *mut u8, 8);
 		}
-		let net = Net { dci_in: 5, dci_out: 4, ring_in: self.arena.ring(), ring_out: self.arena.ring(), note: Some(Notify { dci: 3, ring: self.arena.ring(), virt: page, phys: page, posted: false, up: None, every: 10, due: 0 }), rx_virt: 0, rx_phys: 0, rx_handle: 0, tx_virt: 0, tx_phys: 0, tx_handle: 0, posted: false, mac: [0; 6], mtu: 1500 };
+		let net = Net { dci_in: 5, dci_out: 4, ring_in: self.arena.ring(), ring_out: self.arena.ring(), note: Some(Notify { dci: 3, ring: self.arena.ring(), handle: 0, virt: page, phys: page, posted: false, up: None, every: 10, due: 0 }), rx_virt: 0, rx_phys: 0, rx_handle: 0, tx_virt: 0, tx_phys: 0, tx_handle: 0, posted: false, ncm: None, mac: [0; 6], mtu: 1500 };
 		register_network(&mut self.hc, &dev, &net);
 		(dev, net)
 	}
@@ -982,7 +982,15 @@ mod usb_audio {
 fn handle_net_notification(_: &mut Xhci, _: &mut UsbDevice, _: &mut Net, _: u32, _: u32) -> bool {
 	panic!("no network device");
 }
-fn handle_net_event(_: &mut Xhci, _: &mut UsbDevice, _: &mut Net, _: u32, _: u32, _: &mut Vec<u8>) -> bool {
+// The network module's receive output, the frames one transfer carried. No adapter is present here.
+#[derive(Default)]
+struct Received;
+impl Received {
+	fn frames(&self) -> core::iter::Empty<&[u8]> {
+		core::iter::empty()
+	}
+}
+fn handle_net_event(_: &mut Xhci, _: &mut UsbDevice, _: &mut Net, _: u32, _: u32, _: &mut Received) -> bool {
 	panic!("no network device");
 }
 fn handle_hid_event(_: &mut Xhci, _: &mut Hids, _: u32, _: u32) {

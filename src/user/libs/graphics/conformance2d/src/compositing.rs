@@ -12,9 +12,14 @@
 //! AND EVERY BLEND MODE IS ITS EQUATION EVALUATED AT ONE POINT, written out in the scene. The
 //! backdrop and source are chosen with a different value in each channel, so a mode that is right in
 //! one channel and wrong in another cannot pass.
+//!
+//! EVERY PROBE IS A PIXEL THE SHAPES COVER WHOLLY OR NOT AT ALL, so the frozen edge policy compares it
+//! EXACTLY - against the byte the target stores the expected value as, which is the value moved by the
+//! profile's ordered dither at that pixel and rounded (see `harness::stored`). A tolerance here would be a
+//! colour error wearing an antialiasing tolerance.
 
 use crate::Outcome;
-use crate::harness::{Frame, draw, near, rect_path, solid};
+use crate::harness::{Frame, draw, rect_path, solid};
 use graphics_core::geom::RectF;
 use render2d::blend::{BlendMode, Operator};
 use render2d::path::FillRule;
@@ -38,10 +43,9 @@ fn composed(operator: Operator) -> Result<Frame, crate::Trouble> {
 
 fn probe(frame: &Frame, x: u32, expect: &Expect, where_: &str) -> Outcome {
 	let pixel = frame.pixel(x, 4);
-	require!(near(pixel[3], expect.alpha), "{where_}: the alpha should be {} and is {pixel:?}", expect.alpha);
-	if let Some(colour) = expect.colour {
-		require!(near(pixel[0], colour[0]) && near(pixel[1], colour[1]) && near(pixel[2], colour[2]), "{where_}: the colour should be {colour:?} and is {pixel:?}");
-	}
+	// NOTHING THERE IS NOTHING AT ALL, colour included: a transparent pixel stores no colour.
+	let colour = expect.colour.unwrap_or([0.0; 3]);
+	require!(frame.holds(x, 4, colour, expect.alpha), "{where_}: the pixel should hold exactly {colour:?} at alpha {} and is {pixel:?}", expect.alpha);
 	Ok(())
 }
 
@@ -159,8 +163,7 @@ fn blended(mode: BlendMode) -> Result<Frame, crate::Trouble> {
 fn blend_scene(mode: BlendMode, expected: [f32; 3]) -> Outcome {
 	let frame = blended(mode)?;
 	let pixel = frame.pixel(8, 4);
-	require!(pixel[3] == 255, "an opaque source over an opaque backdrop is opaque: {pixel:?}");
-	require!(near(pixel[0], expected[0]) && near(pixel[1], expected[1]) && near(pixel[2], expected[2]), "the equation gives {expected:?} and the pixel is {pixel:?}");
+	require!(frame.holds(8, 4, expected, 1.0), "an opaque source over an opaque backdrop is opaque, and the equation gives exactly {expected:?}: the pixel is {pixel:?}");
 	Ok(())
 }
 
@@ -233,77 +236,83 @@ pub fn blend_exclusion() -> Outcome {
 	blend_scene(BlendMode::Exclusion, [0.56, 0.52, 0.50])
 }
 
-/// The profile's own luminance coefficients, which is what the four non-separable modes are defined
-/// in terms of - so a scene reads the SPEC's number rather than restating one.
-fn luminance(colour: [f32; 3]) -> f32 {
+/// THE NON-SEPARABLE MODES' OWN FUNCTIONS, AT f64: `Lum`, `Sat`, `SetLum`, `SetSat` and `ClipColor` as
+/// `graphics_profile::compositing::model` states them, with the SPEC'S coefficients read from there rather
+/// than restated - so each of the four scenes compares the pixel with its equation's value, exactly, and not
+/// with a property of it a tolerance would let a wrong equation share.
+fn lum(colour: [f64; 3]) -> f64 {
 	let (red, green, blue) = graphics_profile::compositing::model::LUMINANCE_COEFFICIENTS;
-	colour[0] * red as f32 + colour[1] * green as f32 + colour[2] * blue as f32
+	colour[0] * red + colour[1] * green + colour[2] * blue
 }
 
-fn saturation(colour: [f32; 3]) -> f32 {
-	let high = colour[0].max(colour[1]).max(colour[2]);
-	let low = colour[0].min(colour[1]).min(colour[2]);
-	high - low
+fn sat(colour: [f64; 3]) -> f64 {
+	colour[0].max(colour[1]).max(colour[2]) - colour[0].min(colour[1]).min(colour[2])
 }
 
-/// Which channel is the largest, which is the coarse form of "whose hue is this".
-fn strongest(colour: [f32; 3]) -> usize {
-	let mut index = 0;
-	for candidate in 1..3 {
-		if colour[candidate] > colour[index] {
-			index = candidate;
-		}
+/// "with l = Lum(C), n = min channel and x = max channel: if n < 0, C = l + (C - l) * l / (l - n); if x > 1,
+/// C = l + (C - l) * (1 - l) / (x - l)".
+fn clip_color(colour: [f64; 3]) -> [f64; 3] {
+	let light = lum(colour);
+	let (low, high) = (colour[0].min(colour[1]).min(colour[2]), colour[0].max(colour[1]).max(colour[2]));
+	let mut out = colour;
+	if low < 0.0 {
+		out = out.map(|channel| light + (channel - light) * light / (light - low));
 	}
-	index
+	if high > 1.0 {
+		out = out.map(|channel| light + (channel - light) * (1.0 - light) / (high - light));
+	}
+	out
 }
 
-/// The blended pixel as three floats.
-fn blended_colour(mode: BlendMode) -> Result<[f32; 3], crate::Trouble> {
-	let frame = blended(mode)?;
-	let pixel = frame.pixel(8, 4);
-	Ok([pixel[0] as f32 / 255.0, pixel[1] as f32 / 255.0, pixel[2] as f32 / 255.0])
+/// "add l - Lum(C) to every channel, then ClipColor".
+fn set_lum(colour: [f64; 3], light: f64) -> [f64; 3] {
+	let difference = light - lum(colour);
+	clip_color(colour.map(|channel| channel + difference))
 }
 
-const BACKDROP: [f32; 3] = [0.8, 0.4, 0.2];
-const SOURCE: [f32; 3] = [0.4, 0.6, 0.5];
+/// "order the channels; the smallest becomes 0, the largest s, the middle (Cmid - Cmin) * s / (Cmax - Cmin);
+/// if Cmax == Cmin every channel becomes 0".
+fn set_sat(colour: [f64; 3], saturation: f64) -> [f64; 3] {
+	let mut order = [0usize, 1, 2];
+	order.sort_unstable_by(|left, right| colour[*left].total_cmp(&colour[*right]));
+	let (low, middle, high) = (order[0], order[1], order[2]);
+	let mut out = [0.0; 3];
+	if colour[high] > colour[low] {
+		out[middle] = (colour[middle] - colour[low]) * saturation / (colour[high] - colour[low]);
+		out[high] = saturation;
+	}
+	out
+}
+
+const BACKDROP: [f64; 3] = [0.8, 0.4, 0.2];
+const SOURCE: [f64; 3] = [0.4, 0.6, 0.5];
+
+/// A non-separable mode's scene: the pixel is the equation's value, as the target stores it.
+fn non_separable_scene(mode: BlendMode, expected: [f64; 3]) -> Outcome {
+	blend_scene(mode, expected.map(|channel| channel as f32))
+}
 
 // @covers: BlendHue
-/// THE SOURCE'S HUE, THE BACKDROP'S SATURATION AND LUMINANCE. Checked as the DEFINITION rather than
-/// as three numbers, because that is what makes the check independent of the implementation's
-/// arithmetic: the result's luminance is the backdrop's, and its strongest channel is the source's.
+/// THE SOURCE'S HUE, THE BACKDROP'S SATURATION AND LUMINANCE: `SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb))`.
 pub fn blend_hue() -> Outcome {
-	let result = blended_colour(BlendMode::Hue)?;
-	require!((luminance(result) - luminance(BACKDROP)).abs() < 0.02, "the luminance is the backdrop's: {:?} against {:?}", luminance(result), luminance(BACKDROP));
-	require!(strongest(result) == strongest(SOURCE), "and the hue is the source's: {result:?}");
-	Ok(())
+	non_separable_scene(BlendMode::Hue, set_lum(set_sat(SOURCE, sat(BACKDROP)), lum(BACKDROP)))
 }
 
 // @covers: BlendSaturation
-/// The source's SATURATION, with the backdrop's hue and luminance.
+/// The source's SATURATION, with the backdrop's hue and luminance: `SetLum(SetSat(Cb, Sat(Cs)), Lum(Cb))`.
 pub fn blend_saturation() -> Outcome {
-	let result = blended_colour(BlendMode::Saturation)?;
-	require!((luminance(result) - luminance(BACKDROP)).abs() < 0.02, "the luminance is the backdrop's: {result:?}");
-	require!((saturation(result) - saturation(SOURCE)).abs() < 0.03, "the saturation is the source's: {} against {}", saturation(result), saturation(SOURCE));
-	require!(strongest(result) == strongest(BACKDROP), "and the hue is the backdrop's: {result:?}");
-	Ok(())
+	non_separable_scene(BlendMode::Saturation, set_lum(set_sat(BACKDROP, sat(SOURCE)), lum(BACKDROP)))
 }
 
 // @covers: BlendColor
-/// The source's hue AND saturation, with the backdrop's luminance - which is what tinting a
-/// photograph while keeping its shading is.
+/// The source's hue AND saturation, with the backdrop's luminance - which is what tinting a photograph
+/// while keeping its shading is: `SetLum(Cs, Lum(Cb))`.
 pub fn blend_color() -> Outcome {
-	let result = blended_colour(BlendMode::Color)?;
-	require!((luminance(result) - luminance(BACKDROP)).abs() < 0.02, "the luminance is the backdrop's: {result:?}");
-	require!(strongest(result) == strongest(SOURCE), "and both hue and saturation are the source's: {result:?}");
-	require!((saturation(result) - saturation(SOURCE)).abs() < 0.06, "including the saturation: {} against {}", saturation(result), saturation(SOURCE));
-	Ok(())
+	non_separable_scene(BlendMode::Color, set_lum(SOURCE, lum(BACKDROP)))
 }
 
 // @covers: BlendLuminosity
-/// The exact opposite: the source's LUMINANCE with the backdrop's hue and saturation.
+/// The exact opposite: the source's LUMINANCE with the backdrop's hue and saturation: `SetLum(Cb, Lum(Cs))`.
 pub fn blend_luminosity() -> Outcome {
-	let result = blended_colour(BlendMode::Luminosity)?;
-	require!((luminance(result) - luminance(SOURCE)).abs() < 0.02, "the luminance is the source's: {} against {}", luminance(result), luminance(SOURCE));
-	require!(strongest(result) == strongest(BACKDROP), "and the hue is the backdrop's: {result:?}");
-	Ok(())
+	non_separable_scene(BlendMode::Luminosity, set_lum(BACKDROP, lum(SOURCE)))
 }

@@ -116,11 +116,17 @@ impl Record {
 /// would be a caller whose consumer declared two slots, which is a record this entry point would
 /// have to grow a shape for rather than guess one.
 ///
+/// A NULL ENTRY POINT IS REFUSED HERE, before anything is installed. An ICD without a negotiation
+/// function is the version-1 shape (and without either, version 0's), which this substrate does not
+/// admit - and a null function pointer typed as a function is undefined behaviour the moment it is
+/// read as one. The two parameters are therefore `Option`s, which have exactly the C pointer's
+/// layout, so a C caller passing NULL is a refusal and not a jump to address zero later.
+///
 /// # Safety
 /// Every pointer must be valid and NUL-terminated for the life of the process, and the two function
 /// pointers must be the provider's own exports.
 #[cfg_attr(not(test), unsafe(no_mangle))]
-pub unsafe extern "C" fn liber_foreign_install_icd(manifest_path: *const u8, manifest: *const u8, library_path: *const u8, self_path: *const u8, negotiate: NegotiateFn, get_instance_proc_addr: GetInstanceProcAddrFn) -> i32 {
+pub unsafe extern "C" fn liber_foreign_install_icd(manifest_path: *const u8, manifest: *const u8, library_path: *const u8, self_path: *const u8, negotiate: Option<NegotiateFn>, get_instance_proc_addr: Option<GetInstanceProcAddrFn>) -> i32 {
 	// THE STRINGS ARE BORROWED AND NOT COPIED. A record outlives every foreign call, and the caller
 	// is a program whose own image holds these literals for as long as it runs; copying them would
 	// need an allocator this crate does not have and must not acquire.
@@ -140,6 +146,9 @@ pub unsafe extern "C" fn liber_foreign_install_icd(manifest_path: *const u8, man
 		Some(unsafe { core::slice::from_raw_parts(pointer, len) })
 	}
 	let (Some(manifest_path), Some(manifest), Some(library_path), Some(self_path)) = (unsafe { borrow(manifest_path) }, unsafe { borrow(manifest) }, unsafe { borrow(library_path) }, unsafe { borrow(self_path) }) else {
+		return -1;
+	};
+	let (Some(negotiate), Some(get_instance_proc_addr)) = (negotiate, get_instance_proc_addr) else {
 		return -1;
 	};
 	// THE RECORD AND THE ICD ARE PROCESS-WIDE STATICS, written once. There is no allocator here and

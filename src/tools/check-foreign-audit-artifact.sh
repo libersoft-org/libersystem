@@ -17,7 +17,13 @@
 #                         metadata cannot be walked is not something to discover at load time.
 #   IDENTITY            a well-formed v2 record whose language section is the foreign one, carrying
 #                         each tool, the sysroot, the configure inputs, the objects, the patch series
-#                         and the LICENCE the pinned upstream is taken under.
+#                         and the LICENCE the pinned upstream is taken under - and every one of those
+#                         RECOMPUTED from the inputs the link used and compared, for this artifact and
+#                         for both quarantine consumers linked beside it (2026-10-15). Sixty-four hex
+#                         digits was all this checked before, and two of these records were carrying
+#                         digests of constant strings. The sysroot digest is also the one the derived
+#                         part of the lockfile pins, so a record cannot name a sysroot that was not
+#                         frozen.
 #   PROVIDER CLOSURE    the record accounts for exactly the artifact's own `DT_NEEDED` set. A record
 #                         that left an edge out would be refused by the same check that refuses a
 #                         forged one.
@@ -41,6 +47,8 @@ if [[ ! -d "$PASS2" ]]; then
 fi
 
 declare -A TRIPLE=([x86_64]=x86_64-unknown-none [aarch64]=aarch64-unknown-none [riscv64]=riscv64gc-unknown-none-elf)
+
+pinned_sysroot="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["profile_sysroot"]["digest"])' "$ROOT/src/foreign/PIN-derived.toml")" || fail "the derived part of the lockfile could not be read"
 
 # THE ALLOWLIST IS READ FROM THE ONE PLACE THAT DEFINES IT rather than restated here: the runtime
 # loader and the packager both decide with `bootproto::elf::dynamic_relocation_kind`, and a copy in
@@ -86,6 +94,7 @@ for arch in x86_64 aarch64 riscv64; do
 		grep -qE "^$field=[0-9a-f]{64}$" <<<"$record" || fail "$arch: the record has no well-formed $field"
 	done
 	grep -qx "licence=Apache-2.0" <<<"$record" || fail "$arch: the record does not carry the licence the pinned upstream is taken under"
+	grep -qx "sysroot-sha256=$pinned_sysroot" <<<"$record" || fail "$arch: the record names a sysroot that is not the profile sysroot the derived part of the lockfile pins ($pinned_sysroot)"
 
 	# 5. THE PROVIDER CLOSURE: exactly the edges the artifact has, and no others.
 	needed="$(sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' <<<"$dynamic" | sort -u)"
@@ -108,3 +117,10 @@ for arch in x86_64 aarch64 riscv64; do
 		echo "foreign-audit-artifact: $arch: NOT PERFORMED: no staged tree, so the export-collision question was not asked"
 	fi
 done
+
+# 7. THE RECORDS DESCRIBE THEIR ARTIFACTS, field by field. Every producer field of the audit-linked ELF
+#    and of both quarantine consumers is recomputed from what their links used - the builder's
+#    recorded configuration, the objects, the substrate archives, the entry object, the profile
+#    sysroot, the patch series and the three tools - and compared. One computation, in the tool that
+#    writes the records, so this gate cannot drift from it.
+python3 "$HERE/foreign-audit-link.py" --verify-records || fail "an audit-produced identity record does not describe what produced its artifact"

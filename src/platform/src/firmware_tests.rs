@@ -242,3 +242,21 @@ fn every_report_round_trips_and_a_hostile_one_is_refused() {
 	assert!(report::decode(&[9, 0, 0]).is_none());
 	assert!(report::decode(&[report::COMPANION, 1, b'x', 0, 0, 0, 0, 0, 33]).is_none(), "a list past its bound");
 }
+
+#[test]
+fn a_claim_maps_its_range_with_the_one_type_the_map_gives_it_and_its_node_s_region_with_the_same() {
+	let regions = regions();
+	// A CLAIM'S TYPE COMES FROM THE MAP: write-back wholly in firmware memory, uncached for MMIO, a hole or anything mixed.
+	assert!(claim_write_back(regions.iter().copied(), 0x7FF0_8000, 0x100), "ACPI NVS");
+	assert!(claim_write_back(regions.iter().copied(), 0x9F000, 0x10), "firmware-reserved");
+	assert!(!claim_write_back(regions.iter().copied(), 0xFED4_0000, 0x1000), "a hole in the map is MMIO");
+	assert!(!claim_write_back(regions.iter().copied(), 0xFFC0_0000, 0x1000), "reported MMIO");
+	assert!(!claim_write_back(regions.iter().copied(), 0x7FF0_F000, 0x2000), "NVS running into a hole is not write-back");
+	// AND ITS OWN NODE'S REGION INSIDE IT GETS THE SAME TYPE: a mailbox in NVS that a driver has claimed is mapped write-back
+	// by both, never write-back by the firmware service and uncached by the driver.
+	let claimed = [Claimed { base: 0x7FF0_8000, len: 0x1000, node: b"acpi:\\_SB_.MBOX" }];
+	let bars = bar_set(false, false);
+	let view = MemoryView { regions: &regions, kernel_held: &[], bars: &bars, claimed: &claimed, carve_out: false };
+	assert_eq!(system_memory(&view, 0x7FF0_8000, 0x100, b"acpi:\\_SB_.MBOX", None), Ok(Admission::WriteBack));
+	assert!(claim_write_back(regions.iter().copied(), 0x7FF0_8000, 0x1000));
+}

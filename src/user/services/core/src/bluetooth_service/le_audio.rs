@@ -773,8 +773,13 @@ impl Stack {
 			controller.iso_dropped = controller.iso_dropped.saturating_add(1);
 			return;
 		}
-		if send_packet(controller.transport, HciPacketKind::Iso, packet) {
-			controller.iso_free -= 1;
+		if controller.stalled {
+			return;
+		}
+		match send_packet(controller.transport, HciPacketKind::Iso, packet) {
+			Sent::Taken => controller.iso_free -= 1,
+			Sent::Refused => {}
+			Sent::Unanswered => controller.unanswered(),
 		}
 	}
 }

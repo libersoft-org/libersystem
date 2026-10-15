@@ -49,6 +49,13 @@ include!(concat!(env!("OUT_DIR"), "/roles_font_catalogue.rs"));
 // short enough that an operator correcting a bad drop is not left waiting on a number.
 const RESCAN_DELAY_TICKS: u64 = 500;
 
+// How often the directory watch is looked at, in monotonic ticks: once a second, which is how long a face dropped in
+// takes to be seen. A look is a read of the watch's stream that does not wait, and a re-read only when it said something.
+const WATCH_TICKS: u64 = 100;
+// The most watch events one look takes before re-reading: one re-read answers all of them, and a flood of events must
+// not keep the loop from answering its clients.
+const WATCH_EVENTS_PER_LOOK: usize = 64;
+
 // The biggest face this catalogue will serve. A resolve reads the whole file to digest it against
 // the identity it is served under, so the read itself has to be bounded - and 16 MiB is the size the
 // seam already names as the largest face a resolve hands back.
@@ -73,6 +80,13 @@ struct Catalogue {
 	admin: u64,
 	// The channel the request being dispatched arrived on.
 	current: u64,
+	// The directory watch's stream, zero while there is none; when it is next looked at; and a scan owed because the
+	// directory could not be listed.
+	watch: u64,
+	next_look: u64,
+	owed: bool,
+	// Whether a watch that could not be opened has been said, so a refusal repeated every look is said once.
+	unwatched_said: bool,
 }
 
 impl Catalogue {
@@ -111,18 +125,17 @@ impl Catalogue {
 		Some(bytes)
 	}
 
-	// Read the directory and validate every face in it. The catalogue's whole input.
-	fn observe(&self) -> Vec<Observation> {
+	// Read the directory and validate every face in it. The catalogue's whole input - or `None` when the directory
+	// could not be listed whole.
+	fn observe(&self) -> Option<Vec<Observation>> {
 		let mut client = volume::Client::new(ChannelTransport { chan: self.volume });
 		let Some(Ok(consumer)) = client.list(FONT_DIRECTORY) else {
-			return Vec::new();
+			return None;
 		};
-		let Some(entries) = drain_stream_complete(consumer, volume::list_read) else {
-			// A SHORT LISTING IS NOT AN EMPTY DIRECTORY. Treating a drain that failed as "no faces"
-			// would withdraw every published face because of a transport hiccup, which is exactly
-			// what the withdrawal rule must not be reached by.
-			return Vec::new();
-		};
+		// A SHORT LISTING IS NOT AN EMPTY DIRECTORY. Treating a listing that failed, or a drain that did, as "no faces"
+		// would withdraw every published face because of a transport hiccup, which is exactly what the withdrawal rule
+		// must not be reached by.
+		let entries = drain_stream_complete(consumer, volume::list_read)?;
 		let mut observations: Vec<Observation> = Vec::new();
 		for entry in &entries {
 			if entry.name.ends_with(RECORD_SUFFIX) {
@@ -150,19 +163,81 @@ impl Catalogue {
 			};
 			observations.push(Observation { name: entry.name.clone(), record });
 		}
-		observations
+		Some(observations)
 	}
 
 	// Re-read the directory and apply the ordered publish/withdraw rule. Answers what the scan did,
-	// so the operator's report and the subscriber notification are the same decision.
-	fn rescan(&mut self) -> font_scan::ScanOutcome {
-		let observed = self.observe();
+	// so the operator's report and the subscriber notification are the same decision - or `None` when
+	// the directory could not be listed: NO SCAN, the publication standing, and the scan owed to the
+	// next look.
+	fn rescan(&mut self) -> Option<font_scan::ScanOutcome> {
+		let Some(observed) = self.observe() else {
+			if !self.owed {
+				print(b"FontCatalogue: the font directory could not be listed; the published faces stand, and it is read again at the next look\n");
+			}
+			self.owed = true;
+			return None;
+		};
+		self.owed = false;
 		let outcome = font_scan::reconcile(&self.published, &observed);
 		if outcome.advanced {
 			self.published = outcome.publication.clone();
 			self.announce();
 		}
-		outcome
+		Some(outcome)
+	}
+
+	// THE DIRECTORY WATCH, on the same scoped client: its events are hints to re-read.
+	fn open_watch(&mut self) {
+		match volume::Client::new(ChannelTransport { chan: self.volume }).watch(FONT_DIRECTORY) {
+			Some(Ok(stream)) if stream != 0 => {
+				self.watch = stream;
+				self.unwatched_said = false;
+			}
+			_ => {
+				if !self.unwatched_said {
+					print(b"FontCatalogue: the font directory could not be watched; it is asked for again at the next look\n");
+				}
+				self.unwatched_said = true;
+			}
+		}
+	}
+
+	// WHAT THE WATCH SAID SINCE THE LAST LOOK. Any event is a hint, and one re-read answers all of them. A watch that
+	// ended - StorageService drops a watcher that cannot keep up - is opened again, and what it may have missed is
+	// re-read; so is the directory when a watch that could not be opened finally is, and when a scan is owed.
+	fn look(&mut self) {
+		self.next_look = clock().saturating_add(WATCH_TICKS);
+		let mut reread = self.owed;
+		if self.watch == 0 {
+			self.open_watch();
+			reread |= self.watch != 0;
+		} else {
+			let mut frame = [0u8; 4352];
+			for _ in 0..WATCH_EVENTS_PER_LOOK {
+				match try_recv_caps(self.watch, &mut frame) {
+					PolledCaps::Message { handles, .. } => {
+						for &handle in handles.as_slice() {
+							if handle != 0 {
+								close(handle);
+							}
+						}
+						reread = true;
+					}
+					PolledCaps::Empty => break,
+					PolledCaps::Closed => {
+						close(self.watch);
+						self.watch = 0;
+						self.open_watch();
+						reread = true;
+						break;
+					}
+				}
+			}
+		}
+		if reread {
+			let _ = self.rescan();
+		}
 	}
 
 	// Tell every subscriber the generation moved. A stream whose consumer is gone is dropped here,
@@ -183,8 +258,9 @@ impl Catalogue {
 			}
 		}
 		for index in dead.into_iter().rev() {
-			let (_, producer) = self.streams.remove(index);
+			let (slot, producer) = self.streams.remove(index);
 			close(producer);
+			self.endpoints.unsubscribe(slot);
 		}
 	}
 
@@ -284,8 +360,8 @@ impl font::font_catalogue::Service for Catalogue {
 	// The snapshot half of a subscription. The LIVE half cannot be served from here - the producer
 	// end has to outlive the reply - so the op is intercepted before the generated dispatch and this
 	// is what answers if it ever is not.
-	fn subscribe(&mut self) -> Vec<font::GenerationEvent> {
-		alloc::vec![font::GenerationEvent { generation: self.published.generation }]
+	fn subscribe(&mut self) -> Result<Vec<font::GenerationEvent>, Error> {
+		Ok(alloc::vec![font::GenerationEvent { generation: self.published.generation }])
 	}
 }
 
@@ -347,7 +423,10 @@ impl font::font_catalogue_admin::Service for Catalogue {
 			Err(service_logic::font_rescan::Refusal::AlreadyPublished) => return Err(Error::Again),
 		}
 		let previous = self.published.generation;
-		let outcome = self.rescan();
+		let Some(outcome) = self.rescan() else {
+			self.allowance.completed(clock(), Completion::Failed);
+			return Err(Error::Io);
+		};
 		let completion = if outcome.advanced {
 			Completion::Published { replaced: previous }
 		} else if outcome.breach.is_some() {
@@ -393,17 +472,29 @@ fn report_of(outcome: &font_scan::ScanOutcome) -> font::ScanReport {
 // The reply carries the CONSUMER end and this program keeps the producer, so closing it is what
 // tells a consumer the stream ended. Intercepted before the generated dispatch for the same reason
 // the device catalogue's is: a stream that must outlive its reply cannot be returned by value.
-fn open_subscription(catalogue: &mut Catalogue, chan: u64, request: &[u8]) -> bool {
+//
+// OVER EITHER BOUND IS A TYPED REFUSAL AT THE ASK - `exhausted` for a connection that holds its
+// subscription already, or a catalogue at its bound - never a request left unanswered.
+fn open_subscription(catalogue: &mut Catalogue, chan: u64, request: &[u8]) {
+	let Some(corr) = request.get(2..6).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) else { return };
+	let refuse = |error: Error| {
+		let mut out = [0u8; 64];
+		if let Some(len) = font::font_catalogue::subscribe_reply_err(corr, &error, &mut out) {
+			let _ = send_blocking(chan, &out[..len], 0);
+		}
+	};
 	let Some(slot) = catalogue.slot_of(chan) else {
-		return false;
+		refuse(Error::Exhausted);
+		return;
 	};
 	if catalogue.endpoints.subscribe(slot).is_err() {
-		return false;
+		refuse(Error::Exhausted);
+		return;
 	}
-	let corr: u32 = if request.len() >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { return false };
 	let Some((producer, consumer)) = channel() else {
-		let _ = catalogue.endpoints.disconnect(slot);
-		return false;
+		catalogue.endpoints.unsubscribe(slot);
+		refuse(Error::Exhausted);
+		return;
 	};
 	// Queue the current generation before releasing the endpoint: a consumer polls as soon as the
 	// reply arrives, and a subscription that said nothing until the next change would leave it
@@ -414,10 +505,11 @@ fn open_subscription(catalogue: &mut Catalogue, chan: u64, request: &[u8]) -> bo
 		let _ = send_blocking(producer, &frame[..len], 0);
 	}
 	catalogue.streams.push((slot, producer));
-	if !send_blocking(chan, &corr.to_le_bytes(), consumer) {
+	let mut out = [0u8; 64];
+	let sent = font::font_catalogue::subscribe_reply_ok(corr, &mut out).is_some_and(|len| send_blocking(chan, &out[..len], consumer));
+	if !sent {
 		close(consumer);
 	}
-	true
 }
 
 #[unsafe(no_mangle)]
@@ -437,12 +529,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		fail_bootstrap(bootstrap, b"FONTDIR", b"no read-only client on the font directory");
 	}
 
-	let mut catalogue = Catalogue { volume: fontdir, published: Publication::default(), endpoints: Endpoints::new(), slots: Vec::new(), streams: Vec::new(), allowance: Allowance::new(RESCAN_DELAY_TICKS), admin, current: 0 };
+	let mut catalogue = Catalogue { volume: fontdir, published: Publication::default(), endpoints: Endpoints::new(), slots: Vec::new(), streams: Vec::new(), allowance: Allowance::new(RESCAN_DELAY_TICKS), admin, current: 0, watch: 0, next_look: clock().saturating_add(WATCH_TICKS), owed: false, unwatched_said: false };
 
-	// 3. the scan at start seeds the publication. An EMPTY directory is a real answer - an image that
-	//    stages no face has no faces - and it is not the same as the refusal above.
-	let seeded = catalogue.rescan();
-	if seeded.breach.is_some() {
+	// 3. the watch first, so nothing changed between the scan and it goes unseen; then the scan at
+	//    start seeds the publication. An EMPTY directory is a real answer - an image that stages no
+	//    face has no faces - and it is not the same as the refusal above.
+	catalogue.open_watch();
+	if catalogue.rescan().is_some_and(|seeded| seeded.breach.is_some()) {
 		print(b"FontCatalogue: the staged font directory exceeds an installation ceiling; nothing is published\n");
 	}
 
@@ -455,15 +548,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let seeded_set: &[u64] = if admin != 0 { &seed } else { &[] };
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 32768] = [0u8; 32768];
-	serve_multi_seeded(service, seeded_set, &mut request, &mut reply, |chan, req, handles, out, reply_handles| -> Option<usize> {
+	serve_multi_ticked(service, seeded_set, WATCH_TICKS, &mut request, &mut reply, |chan, req, handles, out, reply_handles| -> Option<usize> {
+		// THE WATCH IS LOOKED AT on the loop's quiet tick, and on a request when a look is due - so
+		// clients that keep the loop busy do not keep it from seeing the directory change.
+		if chan == 0 || clock() >= catalogue.next_look {
+			catalogue.look();
+		}
+		if chan == 0 {
+			return None;
+		}
 		catalogue.current = chan;
+		let op = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { return None };
 		// A CLIENT THAT WENT TAKES ITS PLACE AND ITS SUBSCRIPTION WITH IT, on the event the serve
-		// loop already raises.
-		if req.is_empty() {
+		// loop raises: a request carrying the reserved disconnect operation.
+		if req.len() == 2 && op == abi::DISCONNECT_OP {
 			catalogue.disconnected(chan);
 			return None;
 		}
-		let op = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { return None };
 		// THE ADMIN ROOT ANSWERS THE ADMIN INTERFACE AND NOTHING ELSE, and the ordinary roots never
 		// answer it: two interfaces whose opcodes overlap must be told apart by the channel they
 		// arrived on rather than by the number in the message.

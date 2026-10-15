@@ -36,6 +36,12 @@
 #   bonds outlive it          after a restart and a cold reboot the trusted keyboard's page is taken and
 #                               secured with the stored key - the fingerprint the first boot's pairing made -
 #                               and nothing pairs again; after a forget its page is refused
+#   no short keys             a link encrypted with a one-octet key (KNOB) is disconnected and says why; one at
+#                               sixteen octets is kept
+#   a stopped controller      the fixture answers a send twenty seconds late: the service gives it up within
+#                               five, ends the session and answers meanwhile, InputService drops a connection
+#                               that does not answer within a second, and after the fixture's reset the
+#                               controller comes back and scans
 
 set -euo pipefail
 GUEST_GATE_NAME="bluetooth-classic"
@@ -94,7 +100,7 @@ if grep -aqE 'bt-fixture: paired keyboard' "$after_restart"; then
 fi
 
 # ---- boot two: the same disk, a cold reboot, reuse, then forget.
-guest_gate_run $'btclassic reuse\nbtclassic forget' ""
+guest_gate_run $'btclassic reuse\nbtclassic knob\nbtclassic forget\nbtclassic stall' ""
 second="$guest_gate_work/second"
 cp "$GUEST_LINES" "$second"
 presented="$(grep -m 1 -aoE 'bt-fixture: authenticated keyboard with a key this boot never paired, key [0-9a-f]{8}' "$second" | awk '{print $NF}')"
@@ -102,7 +108,12 @@ presented="$(grep -m 1 -aoE 'bt-fixture: authenticated keyboard with a key this 
 [[ "$presented" == "$paired" ]] || fail "after the cold reboot the stack presented key $presented, and the pairing produced $paired"
 echo "bluetooth-classic: after the cold reboot the stack presented the key the first boot's pairing produced ($presented)"
 expect "$second" "btclassic: PASS reuse" "after the cold reboot the bond and its input trust must be used"
+expect "$second" "btclassic: PASS knob" "a BR/EDR link encrypted with a one-octet key must be dropped, and one at full length kept"
+expect "$second" "BluetoothService: a BR/EDR link encrypted with a 1-octet key is disconnected - its link key needs 16" "the stack must say why it dropped the link"
 expect "$second" "btclassic: PASS forget" "a forgotten keyboard's page must be refused"
+expect "$second" "btclassic: PASS stall" "a controller that stops taking packets must not park the service, and must come back after its reset"
+expect "$second" "BluetoothService: a controller did not take a packet in five seconds; nothing more is sent to it until its driver resets it" "the stack must give a send up at its deadline and say so"
+expect "$second" "InputService: BluetoothService did not answer within a second; its connection is dropped and a new one asked for" "InputService must not wait on a Bluetooth stack that is not answering"
 if grep -aqE 'bt-fixture: paired ' "$second"; then
 	fail "something paired on the second boot; the bonds must be reused"
 fi

@@ -417,12 +417,24 @@ fn a_kernel_held_device_an_overlap_and_memory_or_a_bar_are_refused() {
 	let mut over_bar = synthetic_platform_description(b"kernel:test-over-bar");
 	assert!(over_bar.add_mmio(bar, 0x1000));
 	assert_eq!(publish_synthetic_platform(over_bar), None, "a range over a PCI function's BAR is refused");
-	// AND ON x86_64 A CLAIMABLE ROW OVER THE KERNEL'S PORTS.
+	// AND ON x86_64 A CLAIMABLE ROW OVER RESERVED PORTS NO ROW STANDS FOR: the test build's exit device, which the reserved
+	// set holds and no row describes - every fixed range has a kernel row now, and a description starting at one of those
+	// is that row's device, merged, before the port check is reached.
 	#[cfg(target_arch = "x86_64")]
 	{
-		let mut ports = synthetic_platform_description(b"kernel:test-over-com1");
-		assert!(ports.add_port(0x3f8, 8));
-		assert_eq!(publish_synthetic_platform(ports), None, "a claimable row over the console's ports is refused");
+		let mut ports = synthetic_platform_description(b"kernel:test-over-exit");
+		assert!(ports.add_port(0xf4, 1));
+		assert_eq!(publish_synthetic_platform(ports), None, "a claimable row over reserved ports no row stands for is refused");
+		// BUT A DESCRIPTION OF THE KERNEL'S OWN CONSOLE - an SPCR or DBG2 naming COM1 - IS THAT DEVICE: it joins
+		// `kernel:com1`, whose ports that row already accounts for, and the row stays the kernel's and is never claimed.
+		let com1 = (0..device::count()).find(|&index| device::info(index).is_some_and(|info| info.platform.identity() == b"kernel:com1")).expect("the kernel publishes its console as a row");
+		let mut spcr = platform::Description::new(abi::PLATFORM_SOURCE_TABLE, abi::PLATFORM_STATE_CLAIMABLE, b"table:SPCR#test").expect("fits");
+		assert!(spcr.add_port(0x3f8, 8));
+		assert_eq!(publish_synthetic_platform(spcr), Some(com1), "a description of the console's UART joins the console's row");
+		let merged = device::info(com1).expect("the console's row");
+		assert_eq!(merged.platform.state, abi::PLATFORM_STATE_KERNEL_HELD, "and that row is still the kernel's");
+		assert!(merged.platform.match_ids().iter().any(|id| id.kind == abi::MATCH_ID_IDENTITY && id.text() == b"table:SPCR#test"), "with the table's identity beside its own");
+		assert_eq!(device::claim(com1, &dma_policy::entry_field(b"synthetic-none")), Err(device::ClaimError::Refused), "and it is never claimed");
 	}
 }
 

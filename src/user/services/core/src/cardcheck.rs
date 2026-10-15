@@ -529,6 +529,15 @@ fn overflow(probe: &Probe) {
 		}
 	}
 	close(stream);
+	// AND WHERE IT CLOSED IS THE BOUND: the stream is sixteen frames deep, the snapshot's among them, so
+	// a client that read nothing gets exactly sixteen before the end - never the thirty-odd a second
+	// queue in front of the channel used to allow.
+	if frames != service_logic::card_slots::MAX_EVENTS as u64 {
+		let mut line = b"overflow: the stream closed after ".to_vec();
+		number(&mut line, frames);
+		line.extend_from_slice(b" frames, not after the sixteen it is bounded at");
+		fail(&line);
+	}
 	let fresh = probe.events();
 	let current = snapshot(fresh);
 	close(fresh);

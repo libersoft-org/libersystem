@@ -107,9 +107,22 @@ fn inside(base: u64, len: u64, outer_base: u64, outer_len: u64) -> bool {
 
 /// THE KIND OF MEMORY a range is: the kinds of every map region it overlaps, a gap in the map being MMIO.
 fn kinds(view: &MemoryView<'_>, base: u64, len: u64) -> (bool, bool, bool) {
+	range_kinds(view.regions.iter().copied(), base, len)
+}
+
+/// ONE MEMORY TYPE PER RANGE, FOR A CLAIM AS FOR THE FIRMWARE SERVICE'S MAPPINGS: write-back where a claimed range is
+/// wholly firmware memory - ACPI NVS, ACPI-reclaimable or firmware-reserved, where firmware places mailboxes - and
+/// uncached otherwise. `regions` is the memory map. A claim was always minted uncached, so a node's own region in such
+/// memory, mapped write-back by the firmware service, was mapped uncached by its driver: two types for one range.
+pub fn claim_write_back(regions: impl Iterator<Item = (u64, u64, MemoryKind)>, base: u64, len: u64) -> bool {
+	let (ram, write_back, mmio) = range_kinds(regions, base, len);
+	write_back && !ram && !mmio
+}
+
+fn range_kinds(regions: impl Iterator<Item = (u64, u64, MemoryKind)>, base: u64, len: u64) -> (bool, bool, bool) {
 	let (mut ram, mut write_back, mut mmio) = (false, false, false);
 	let mut covered: u64 = 0;
-	for &(start, size, kind) in view.regions {
+	for (start, size, kind) in regions {
 		if !overlaps(base, len, start, size) {
 			continue;
 		}
@@ -180,8 +193,10 @@ pub fn system_memory(view: &MemoryView<'_>, base: u64, len: u64, declaring_node:
 	if let Some(function) = hold {
 		return Ok(Admission::FirmwareHold(function));
 	}
+	// THE TYPE THE CLAIM MAPS ITS RANGE WITH, which `claim_write_back` chose from the same map: a region inside its own
+	// node's claim never gets a second type.
 	if own_claim {
-		return Ok(Admission::Uncached);
+		return Ok(if write_back && !mmio { Admission::WriteBack } else { Admission::Uncached });
 	}
 	Ok(if write_back { Admission::WriteBack } else { Admission::Uncached })
 }

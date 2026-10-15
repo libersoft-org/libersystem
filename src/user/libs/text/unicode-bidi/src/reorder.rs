@@ -6,7 +6,7 @@
 //! the wrong one for two.
 
 use alloc::vec::Vec;
-use unicode_tables::{BidiClass, bidi_class};
+use unicode_tables::BidiClass;
 
 use crate::Levels;
 
@@ -70,13 +70,16 @@ pub fn reorder_visual(levels: &[u8], removed: &[bool]) -> Vec<usize> {
 
 /// L4: the character a mirrored one is drawn as at an odd level.
 ///
-/// ANSWERED RATHER THAN APPLIED. Which glyph is drawn is the renderer's decision - a font may have
-/// its own mirrored form through `GSUB`'s `rtlm` feature - so this says what the character mirrors
-/// to and leaves the substitution where the font is.
+/// ANSWERED HERE AND APPLIED BY THE SHAPING STAGE, which is the one place that knows the face: a
+/// character is drawn as its mirror when the face has a glyph for the mirror, and otherwise the face
+/// is asked for its own mirrored form through `GSUB`'s `rtlm` feature. This says only what a
+/// character mirrors to.
+///
+/// FROM `Bidi_Mirroring_Glyph` AND NOT FROM THE BRACKET PAIRS. Rule N0's pairs are brackets, and most
+/// mirrored characters are not: `<`, `>`, the guillemets and the order and set operators all mirror,
+/// and an answer taken from the bracket table drew every one of them facing the wrong way.
 pub fn mirrored(character: char) -> Option<char> {
-	// The bracket table carries the pairs, and every mirrored character in it mirrors to its pair.
 	let code_point = character as u32;
-	let found = unicode_tables::BIDI_BRACKETS.binary_search_by_key(&code_point, |(candidate, _, _)| *candidate).ok()?;
-	let (_, pair, _) = unicode_tables::BIDI_BRACKETS[found];
-	if bidi_class(character) == BidiClass::ON { char::from_u32(pair) } else { None }
+	let found = unicode_tables::BIDI_MIRRORING.binary_search_by_key(&code_point, |(candidate, _)| *candidate).ok()?;
+	char::from_u32(unicode_tables::BIDI_MIRRORING[found].1)
 }

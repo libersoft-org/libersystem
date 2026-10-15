@@ -227,7 +227,7 @@ impl Ucsi {
 		for at in 0..self.ports.len() {
 			self.read_port(at, false)?;
 		}
-		Ok(())
+		self.acknowledge_changes()
 	}
 
 	// BACK FROM A SLEEP: see the head of this file.
@@ -242,7 +242,23 @@ impl Ucsi {
 		self.changes.clear();
 		for at in 0..self.ports.len() {
 			self.read_port(at, false)?;
+		}
+		self.acknowledge_changes()?;
+		for at in 0..self.ports.len() {
 			self.publish_port(at);
+		}
+		Ok(())
+	}
+
+	// THE CHANGES THE PPM INDICATED WHILE EVERY CONNECTOR WAS READ, each read again with its status and acknowledged in the
+	// same ACK_CC_CI - which is how a connector change is acknowledged. The reads of a bind, a recovery or a wake
+	// acknowledge their commands and not the changes, so a change indicated there - a detach made while the machine
+	// slept, or one that arrived while the bind read - stayed pending at the PPM, which then announces nothing more for
+	// that connector: its next attach or detach was neither announced nor read.
+	fn acknowledge_changes(&mut self) -> Result<(), Failure> {
+		while let Some(number) = self.changes.pop() {
+			let Some(at) = self.ports.iter().position(|port| port.number == number) else { continue };
+			self.read_port(at, true)?;
 		}
 		Ok(())
 	}

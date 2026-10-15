@@ -20,9 +20,17 @@ THE GATE IS THE FIXED POINT, NOT THE FIRST LINK. Removing or adding substrate sy
 can itself change what the next one resolves, so the loop is: link, adjust the substrate to what the
 link resolved, relink. Two consecutive links producing the same resolved set on all three targets is
 what "converged" means, and this tool reports whether that holds rather than assuming it.
+
+THE IDENTITY RECORDS BIND WHAT WAS ACTUALLY USED (2026-10-15). The audit-linked ELF and the two
+quarantine consumers carry the v2 foreign record, and its language section is computed from the
+inputs of the link that produced them - the flags and configuration the builder recorded, the
+profile sysroot's tree, the objects that went into the link, by digest - rather than written as
+prose or as the digest of a constant string. `--verify-records` recomputes every one of those fields
+from the same inputs and compares, which is what the artifact gate runs.
 """
 
 import argparse
+import functools
 import json
 import pathlib
 import hashlib
@@ -30,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
 TARGETS = {
 	# `force-unwind-tables=no` ON ALL THREE, AND IT IS NOT COSMETIC. Exception tables are a mechanism
@@ -61,9 +70,65 @@ THREAD_SYMBOLS = {
 	"CreateThread", "_beginthread", "_beginthreadex", "clone", "clone3", "fork", "vfork",
 }
 
+# THE IDENTITY FIELDS THAT DESCRIBE WHAT PRODUCED AN ARTIFACT, which are what `--verify-records`
+# recomputes. The provider and selection lines are not among them: they name OTHER artifacts by
+# digest, and the staging and launch paths already compare those against the providers actually
+# staged.
+PRODUCER_FIELDS = (
+	"source-sha256", "compiler", "compiler-sha256", "archiver", "archiver-sha256", "linker", "linker-sha256",
+	"cflags", "sysroot-sha256", "configure-sha256", "objects-sha256", "patches-sha256", "licence",
+)
+
 
 def run(command, **kwargs):
 	return subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)
+
+
+def first_line(text):
+	return text.splitlines()[0] if text.splitlines() else ""
+
+
+def digest_file(path):
+	return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def digest_tree(path):
+	"""Every file's own digest and path, in path order, hashed again - the lockfile's tree digest."""
+	inner = hashlib.sha256()
+	base = pathlib.Path(path)
+	for entry in sorted(p for p in base.rglob("*") if p.is_file()):
+		inner.update(hashlib.sha256(entry.read_bytes()).hexdigest().encode())
+		inner.update(b"  ./" + str(entry.relative_to(base)).encode() + b"\n")
+	return inner.hexdigest()
+
+
+def digest_objects(paths):
+	"""The objects that went into a link, in link order: each one's digest and its name, hashed again.
+
+	BY NAME AND NOT BY PATH. Where a build directory lives is not what was linked, and a digest that
+	moved with the checkout would bind the machine rather than the bytes."""
+	return hashlib.sha256("".join(f"{digest_file(path)}  {pathlib.Path(path).name}\n" for path in paths).encode()).hexdigest()
+
+
+def lockfile(root):
+	return tomllib.load(open(root / "src/foreign/PIN-bootstrap.toml", "rb"))
+
+
+@functools.cache
+def rust_lld(root):
+	"""The linker, found the way the image build finds it and held to the version the lockfile pins.
+
+	FROM THE REPOSITORY ROOT, NOT FROM WHEREVER THIS RUNS. `rustc --print sysroot` answers for the
+	toolchain the current directory selects, and a crate directory with its own `rust-toolchain.toml`
+	selects another one, whose `rust-lld` is another linker. Run from the root it is the one the image
+	build links every foreign artifact with - and the one the lockfile names."""
+	sysroot = pathlib.Path(run(["rustc", "--print", "sysroot"], cwd=root).stdout.strip())
+	lld = next(sysroot.rglob("rust-lld"))
+	version = first_line(run([str(lld), "-flavor", "gnu", "--version"]).stdout)
+	pinned = lockfile(root)["toolchain"]["linker_version"]
+	if version != pinned:
+		raise SystemExit(f"foreign-audit-link: {lld} is '{version}' and the lockfile pins '{pinned}'")
+	return lld, version
 
 
 def defined_symbols(path):
@@ -131,6 +196,12 @@ def lifecycle_entries(path, section):
 	return sorted(names.get(target, f"0x{target:x}") for target in targets)
 
 
+def substrate_rlibs(root, settings):
+	"""Where the substrate's two archives are, once built. Named so a check can find them unbuilt."""
+	deps = root / ".build/cargo/user" / settings["triple"] / "release"
+	return [deps / f"lib{crate}.rlib" for crate in SUBSTRATE]
+
+
 def build_substrate(root, arch, settings):
 	for crate in ("abi", "discovery"):
 		directory = root / "src/user/libs/foreign" / crate
@@ -142,11 +213,105 @@ def build_substrate(root, arch, settings):
 		if settings["spec"].endswith(".json"):
 			command.append("-Zjson-target-spec")
 		run(command, cwd=directory, env={**__import__("os").environ, "RUSTFLAGS": settings["rustflags"]})
-	deps = root / ".build/cargo/user" / settings["triple"] / "release"
-	return [deps / f"lib{crate}.rlib" for crate in SUBSTRATE]
+	return substrate_rlibs(root, settings)
 
 
-def identity_record(root, arch, settings, archive, rlibs, elf_bytes_of_objects):
+def builder_configuration(out_dir, arch):
+	"""What the builder recorded it compiled: the text, and its fields by name."""
+	path = out_dir / arch / "configuration"
+	if not path.is_file():
+		raise SystemExit(f"foreign-audit-link: {arch}: {path} is missing - the archive was not built by the current builder; run this tool without --verify-records")
+	text = path.read_text()
+	return text, dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def runtime_of(root, settings):
+	return root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
+
+
+def start_of(root, settings):
+	return root / ".build/state" / f"exe-start-{settings['triple']}.o"
+
+
+def described(arguments):
+	"""A link's arguments as its configuration: every path by its name, so the checkout does not show."""
+	return " ".join(argument.name if isinstance(argument, pathlib.Path) else argument for argument in arguments)
+
+
+def audit_link_arguments(settings, archive, rlibs, runtime):
+	"""The audit link's flags and inputs, without the linker and the outputs. ONE list, which both
+	the link and its identity record are made from."""
+	return [
+		"-flavor", "gnu", "-m", settings["emulation"], "-shared", "--hash-style=sysv", "-Bsymbolic",
+		# THE THREE THAT MAKE IT STRICT: nothing unresolved, nothing unresolved behind a shared
+		# library either, and no default search path or default library anywhere.
+		"--no-undefined", "--no-allow-shlib-undefined", "-nostdlib",
+		"--whole-archive", archive, "--no-whole-archive",
+		*rlibs, runtime,
+		"-soname", "audit-vulkan.lslib",
+	]
+
+
+def quarantine_link_arguments(settings, start, object_file, archive, rlibs, runtime):
+	"""The quarantine consumer's flags and inputs, without the linker and the output."""
+	loader = ["--whole-archive", archive, "--no-whole-archive"] if archive is not None else []
+	return [
+		"-flavor", "gnu", "-m", settings["emulation"], "-pie", "--no-dynamic-linker", "--hash-style=sysv",
+		"--gc-sections", "--build-id=none", "-e", "_start", start, object_file,
+		*loader,
+		*rlibs, runtime,
+		"--no-allow-shlib-undefined", "-z", "undefs",
+	]
+
+
+def patch_series_digest(root):
+	patches = sorted((root / "src/foreign/patches").glob("*.patch"))
+	return hashlib.sha256("".join(f"{path.name}\n{digest_file(path)}\n" for path in patches).encode()).hexdigest()
+
+
+def producer_lines(root, cflags, configure, objects, licence):
+	"""The foreign language section, every line of it computed from what was used.
+
+	THE THREE TOOLS BY VERSION AND BY CONTENT, the flags they were given, the profile sysroot by its
+	tree digest - the one the derived part of the lockfile pins - the configure inputs and the final
+	objects by digest, the patch series, and the licence."""
+	lld, linker_line = rust_lld(root)
+	return [
+		"language=foreign",
+		f"compiler={first_line(run(['clang', '--version']).stdout)}",
+		f"compiler-sha256={digest_file(shutil.which('clang'))}",
+		f"archiver={first_line(run(['llvm-ar', '--version']).stdout)}",
+		f"archiver-sha256={digest_file(shutil.which('llvm-ar'))}",
+		f"linker={linker_line}",
+		f"linker-sha256={digest_file(lld)}",
+		f"cflags={cflags}",
+		f"sysroot-sha256={digest_tree(root / 'src/foreign/profile-sysroot')}",
+		f"configure-sha256={configure}",
+		f"objects-sha256={objects}",
+		f"patches-sha256={patch_series_digest(root)}",
+		f"licence={licence}",
+	]
+
+
+def audit_source_digest(root):
+	"""The audit-linked artifact's SOURCE: the two pinned upstream archives, by digest."""
+	upstream = lockfile(root)["upstream"]
+	archives = [root / ".build/foreign" / f"{name}-{entry['revision']}.tar.gz" for name, entry in sorted(upstream.items())]
+	return hashlib.sha256("".join(f"{digest_file(path)}  {path.name}\n" for path in archives).encode()).hexdigest()
+
+
+def audit_record_fields(root, arch, settings, out_dir, archive, rlibs):
+	"""The audit-linked artifact's source digest and language section, from what its link used."""
+	configuration, fields = builder_configuration(out_dir, arch)
+	arguments = audit_link_arguments(settings, archive, rlibs, runtime_of(root, settings))
+	# WHAT SELECTED WHAT WAS BUILT: the builder's configuration - tree, patch series, sysroot, target,
+	# defines, sources - the Rust half's flags, the substrate crates, and the link itself.
+	configure = hashlib.sha256((configuration + f"rustflags={settings['rustflags']}\nsubstrate={' '.join(SUBSTRATE)}\nlink={described(arguments)}\n").encode()).hexdigest()
+	cflags = f"clang: {fields['cflags']}; rustc: {settings['rustflags']}"
+	return [f"source-sha256={audit_source_digest(root)}", *producer_lines(root, cflags, configure, digest_objects([archive, *rlibs]), "Apache-2.0")]
+
+
+def identity_record(root, arch, settings, out_dir, archive, rlibs):
 	"""The audit-linked artifact's own identity record, in the same v2 format every artifact carries.
 
 	WHY THE QUARANTINE ARTIFACT HAS ONE AT ALL. It is required to pass the generic identity and
@@ -158,55 +323,23 @@ def identity_record(root, arch, settings, archive, rlibs, elf_bytes_of_objects):
 	`language=foreign` AND THE UPSTREAM'S OWN LICENCE. The record is not a claim that this project
 	wrote the code; `licence` is the term the pinned upstream is taken under, which is what has to
 	travel with a binary rather than beside it."""
-	def digest_file(path):
-		return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
-
-	def digest_tree(path):
-		inner = hashlib.sha256()
-		base = pathlib.Path(path)
-		for entry in sorted(p for p in base.rglob("*") if p.is_file()):
-			inner.update(hashlib.sha256(entry.read_bytes()).hexdigest().encode())
-			inner.update(b"  ./" + str(entry.relative_to(base)).encode() + b"\n")
-		return inner.hexdigest()
-
-	def first_line(text):
-		return text.splitlines()[0] if text.splitlines() else ""
-
-	patches = sorted((root / "src/foreign/patches").glob("*.patch"))
-	patch_digest = hashlib.sha256("".join(f"{path.name}\n{digest_file(path)}\n" for path in patches).encode()).hexdigest()
-	tools = {
-		"compiler": (first_line(run(["clang", "--version"]).stdout), digest_file(shutil.which("clang"))),
-		"archiver": (first_line(run(["llvm-ar", "--version"]).stdout), digest_file(shutil.which("llvm-ar"))),
-		"linker": (first_line(run([str(next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld"))), "-flavor", "gnu", "--version"]).stdout), digest_file(next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld")))),
-	}
+	source, *language = audit_record_fields(root, arch, settings, out_dir, archive, rlibs)
 	lines = [
 		"format=liber-image-identity-v2",
 		"kind=library",
 		"artifact=audit-vulkan",
 		"package=vulkan-loader",
-		f"source-sha256={digest_file(archive)}",
+		source,
 		f"target={settings['triple']}",
 		"profile=release",
-		"language=foreign",
-		f"compiler={tools['compiler'][0]}",
-		f"compiler-sha256={tools['compiler'][1]}",
-		f"archiver={tools['archiver'][0]}",
-		f"archiver-sha256={tools['archiver'][1]}",
-		f"linker={tools['linker'][0]}",
-		f"linker-sha256={tools['linker'][1]}",
-		f"cflags=audit link, ported tree, profile sysroot, {arch}",
-		f"sysroot-sha256={digest_tree(root / 'src/foreign/profile-sysroot')}",
-		f"configure-sha256={hashlib.sha256(('whole-archive audit link ' + arch).encode()).hexdigest()}",
-		f"objects-sha256={elf_bytes_of_objects}",
-		f"patches-sha256={patch_digest}",
-		"licence=Apache-2.0",
+		*language,
 	]
 	# THE PROVIDER LINE, BECAUSE THE ARTIFACT HAS AN EDGE. It links against `lsrt.lslib` for the
 	# allocator shims and the panic paths, so its `DT_NEEDED` list names one provider - and the rule
 	# every artifact in this system is held to is that the record ACCOUNTS for exactly that set. A
 	# record that left the edge out would be refused by the same check that refuses a forged one,
 	# which is the point of running the generic checks on this file at all.
-	runtime = root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
+	runtime = runtime_of(root, settings)
 	if runtime.is_file():
 		note = pathlib.Path(str(runtime) + ".identity")
 		run(["llvm-objcopy", "--dump-section", f".note.liber.identity={note}", str(runtime), "/dev/null"])
@@ -219,18 +352,9 @@ def identity_record(root, arch, settings, archive, rlibs, elf_bytes_of_objects):
 
 
 def link(root, arch, settings, archive, rlibs, out, link_map):
-	lld = next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld"))
-	runtime = root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
-	command = [
-		str(lld), "-flavor", "gnu", "-m", settings["emulation"], "-shared", "--hash-style=sysv", "-Bsymbolic",
-		# THE THREE THAT MAKE IT STRICT: nothing unresolved, nothing unresolved behind a shared
-		# library either, and no default search path or default library anywhere.
-		"--no-undefined", "--no-allow-shlib-undefined", "-nostdlib",
-		"--whole-archive", str(archive), "--no-whole-archive",
-		*[str(rlib) for rlib in rlibs], str(runtime),
-		"-soname", "audit-vulkan.lslib", "-Map", str(link_map), "-o", str(out),
-	]
-	subprocess.run(command, check=True)
+	lld, _ = rust_lld(root)
+	arguments = audit_link_arguments(settings, archive, rlibs, runtime_of(root, settings))
+	subprocess.run([str(lld), *map(str, arguments), "-Map", str(link_map), "-o", str(out)], check=True)
 
 
 def member_scan(path):
@@ -240,7 +364,7 @@ def member_scan(path):
 	defined over the FINALLY ADMITTED closure - every archive member that survives selection, the
 	converged resolved set, and the audit-linked ELF - because each can carry something the other two
 	do not: a member can hold a thread-local symbol the link never references, and an ELF can carry a
-	segment no member asked for.
+	segment no member asked for. `stop_conditions` below puts the three together.
 
 	WHOLE-ARCHIVE ADMISSION IS WHY EVERY MEMBER COUNTS. Nothing is selected away, so "survives
 	selection" is every member there is.
@@ -272,6 +396,29 @@ def member_scan(path):
 	return sorted(set(tls)), sorted(set(threads))
 
 
+def stop_conditions(archive, elf):
+	"""Both measured stop conditions, over all three scopes of the finally admitted closure.
+
+	ONE FUNCTION FOR THE MEASUREMENT AND FOR ITS SELF-TEST, so what the self-test shows detecting is
+	what the inventory is computed by. The converged resolved set is what the archive asks a system
+	for together with what the linked ELF still imports - the set the link was resolving."""
+	surface = archive_surface(archive)
+	member_tls, member_threads = member_scan(archive)
+	elf_tls, elf_threads = member_scan(elf)
+	return {
+		"thread_creation_by_scope": {
+			"archive_members": member_threads,
+			"converged_resolved_set": sorted((surface | undefined_symbols(elf)) & THREAD_SYMBOLS),
+			"audit_linked_elf": elf_threads,
+		},
+		"tls_by_scope": {
+			"archive_members": member_tls,
+			"audit_linked_elf": elf_tls,
+			"elf_segment": "TLS" in program_headers(elf),
+		},
+	}
+
+
 def attach_identity(elf, record):
 	"""Put the record into the artifact as the same allocated ELF note every artifact carries.
 
@@ -287,6 +434,13 @@ def attach_identity(elf, record):
 	note.unlink()
 
 
+def embedded_record(elf):
+	"""The identity record an artifact carries, as text."""
+	blob = subprocess.run(["llvm-objcopy", "--dump-section", ".note.liber.identity=/dev/stdout", str(elf), "/dev/null"], check=True, capture_output=True).stdout
+	length = int.from_bytes(blob[4:8], "little")
+	return blob[20:20 + length].decode()
+
+
 def measure(root, arch, settings, out_dir):
 	archive = out_dir / arch / "libvulkan.a"
 	run([str(root / "src/tools/build-foreign-static.sh"), "--arch", arch, "--sysroot", "profile", "--ported", "--out", str(out_dir / arch)])
@@ -294,7 +448,7 @@ def measure(root, arch, settings, out_dir):
 	elf = out_dir / arch / "audit-vulkan.lslib"
 	link_map = out_dir / arch / "link.map"
 	link(root, arch, settings, archive, rlibs, elf, link_map)
-	attach_identity(elf, identity_record(root, arch, settings, archive, rlibs, hashlib.sha256(archive.read_bytes()).hexdigest()))
+	attach_identity(elf, identity_record(root, arch, settings, out_dir, archive, rlibs))
 
 	surface = archive_surface(archive)
 	substrate_exports = set()
@@ -318,7 +472,7 @@ def measure(root, arch, settings, out_dir):
 		consumer = build_quarantine(root, arch, settings, out_dir, archive, rlibs, name, with_loader)
 		if consumer is None:
 			continue
-		attach_identity(consumer, quarantine_identity(root, arch, settings, ["lsrt"], [("vulkan-icd", ["icdprobe"])], name, licence))
+		attach_identity(consumer, quarantine_identity(root, arch, settings, out_dir, archive if with_loader else None, rlibs, ["lsrt"], [("vulkan-icd", ["icdprobe"])], name, licence))
 		# THE UNDEFINED SET IS EXACTLY WHAT THE SLOT AND THE RUNTIME OWE, and nothing else. `-z undefs`
 		# let the link finish with the two ICD exports unresolved; this is what keeps that from being
 		# a hole, because an artifact carrying a third undefined symbol is one the launch would refuse
@@ -328,14 +482,14 @@ def measure(root, arch, settings, out_dir):
 		# WHAT THE RUNTIME OWES IS WHAT THE RUNTIME DEFINES, read off the staged provider rather than
 		# listed here. A list would be a second description of `lsrt`'s export table, and the one
 		# thing this check exists to notice is a symbol NOBODY owes - which a stale list would hide.
-		runtime_owned = defined_symbols(root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib")
+		runtime_owned = defined_symbols(runtime_of(root, settings))
 		surprising = sorted(unresolved - slot - runtime_owned)
 		if surprising:
 			print(f"foreign-audit-link: {arch}: {name} carries undefined symbols nothing owes it: {surprising}", file=sys.stderr)
 			raise SystemExit(1)
 
-	member_tls, member_threads = member_scan(archive)
-	elf_tls, elf_threads = member_scan(elf)
+	scopes = stop_conditions(archive, elf)
+	threads = scopes["thread_creation_by_scope"]
 	return {
 		"archive": str(archive.relative_to(root)) if archive.is_relative_to(root) else str(archive),
 		"archive_surface": sorted(surface),
@@ -347,63 +501,116 @@ def measure(root, arch, settings, out_dir):
 		"init_array": lifecycle_entries(elf, ".init_array"),
 		"fini_array": lifecycle_entries(elf, ".fini_array"),
 		# THE STOP CONDITIONS OVER ALL THREE SCOPES, separately, so a gate can say WHERE one appeared.
-		"thread_creation_symbols": sorted(set(member_threads) | set(elf_threads) | ((surface | set(link_only)) & THREAD_SYMBOLS)),
-		"thread_creation_by_scope": {
-			"archive_members": member_threads,
-			"converged_resolved_set": sorted((surface | set(link_only)) & THREAD_SYMBOLS),
-			"audit_linked_elf": elf_threads,
-		},
-		"tls_by_scope": {
-			"archive_members": member_tls,
-			"audit_linked_elf": elf_tls,
-			"elf_segment": "TLS" in headers,
-		},
+		"thread_creation_symbols": sorted(set(threads["archive_members"]) | set(threads["converged_resolved_set"]) | set(threads["audit_linked_elf"])),
+		"thread_creation_by_scope": threads,
+		"tls_by_scope": scopes["tls_by_scope"],
 		"elf_bytes": elf.stat().st_size,
 	}
 
 
+def icd_interface(root):
+	"""Which Loader/Driver interface versions a negotiation through this substrate can settle on.
+
+	A DERIVED FACT AND NOT A RESTATED ONE. The loader's side is read out of the pinned headers - the
+	version it asks every driver for, and the lowest it would accept on its own - and the substrate's
+	side out of the substrate's own declaration of what it admits. What a negotiation can agree on is
+	then the intersection: the loader asks for more than the substrate admits, and the substrate's
+	bounded entry point is what brings the offer down; nothing below the substrate's floor is agreed,
+	whatever the loader would accept."""
+	header = (root / ".build/foreign/src-headers/include/vulkan/vk_icd.h").read_text()
+	asks = int(re.search(r"#define CURRENT_LOADER_ICD_INTERFACE_VERSION (\d+)", header).group(1))
+	accepts = int(re.search(r"#define MIN_SUPPORTED_LOADER_ICD_INTERFACE_VERSION (\d+)", header).group(1))
+	version = (root / "src/user/libs/foreign/discovery/src/version.rs").read_text()
+	admitted = [int(value) for value in re.search(r"pub const ADMITTED: \[u32; \d+\] = \[([^\]]*)\];", version).group(1).split(",")]
+	library = (root / "src/user/libs/foreign/discovery/src/library.rs").read_text()
+
+	def constant(name):
+		return re.search(rf'pub const {name}: &\[u8\] = b"([^"]*)";', library).group(1)
+
+	return {
+		"loader_asks_for": asks,
+		"loader_accepts_down_to": accepts,
+		"substrate_admits": admitted,
+		"negotiated_at_most": min(asks, max(admitted)),
+		"negotiated_at_least": max(accepts, min(admitted)),
+		"exports_resolved": sorted([constant("NEGOTIATE_SYMBOL"), constant("GET_INSTANCE_PROC_ADDR_SYMBOL")]),
+		"export_refused_by_name": constant("PHYSICAL_DEVICE_SYMBOL"),
+	}
+
+
 def self_test(root, work):
-	"""Prove the scan can SEE what it reports absent, in each scope it reports over.
+	"""Prove the scans can SEE what they report absent, in each of the three scopes they report over.
 
 	AN EMPTY RESULT AND A BROKEN SCAN LOOK IDENTICAL from the outside, and this pass turns an empty
-	result into two of the milestone's stop conditions. So a fixture carrying exactly what the scan
-	looks for is injected into each scope and the scan must find it: a thread-local variable, and a
-	reference to thread creation. A run where the fixture goes unseen is a run whose zeroes mean
-	nothing.
+	result into two of the milestone's stop conditions. So a fixture carrying exactly what the scans
+	look for - a thread-local variable and a reference to thread creation - is put into EACH scope:
+	an archive member, the converged resolved set, and a LINKED ELF, through the same function the
+	inventory is computed by. A run where any scope misses it is a run whose zeroes mean nothing.
+
+	AND A CLEAN FIXTURE THROUGH THE SAME SCOPES MUST COME BACK EMPTY, because a scan that reported
+	everything would pass the half above just as well.
 	"""
 	work.mkdir(parents=True, exist_ok=True)
-	source = work / "stop-condition-fixture.c"
-	source.write_text(
-		"/* Not built into anything. It exists so the scan can be shown finding what it reports absent,\n"
-		"   in each of the three forms it looks for: a thread-local DEFINITION, which lives in .tdata; a\n"
-		"   thread-local ACCESS, which is a relocation and is what an object using somebody else-s\n"
-		"   variable carries instead; and a reference to thread creation. */\n"
-		"__thread int liber_audit_thread_local = 1;\n"
-		"extern __thread int liber_audit_elsewhere;\n"
-		"int liber_audit_reads_a_thread_local(void) { return liber_audit_elsewhere + liber_audit_thread_local; }\n"
-		"extern int pthread_create(void *, const void *, void *(*)(void *), void *);\n"
-		"int liber_audit_starts_a_thread(void) { return pthread_create(0, 0, 0, 0); }\n"
-	)
-	object_file = work / "stop-condition-fixture.o"
-	run(["clang", "--target=x86_64-unknown-none-elf", "-ffreestanding", "-nostdlibinc", "-fPIC", "-O0", "-c", str(source), "-o", str(object_file)])
-	archive = work / "stop-condition-fixture.a"
-	archive.unlink(missing_ok=True)
-	run(["llvm-ar", "crsD", str(archive), str(object_file)])
+	lld, _ = rust_lld(root)
+	fixtures = {
+		"carrying": (
+			"/* Not built into anything. It exists so the scans can be shown finding what they report\n"
+			"   absent, in each of the three forms they look for: a thread-local DEFINITION, which lives in\n"
+			"   .tdata; a thread-local ACCESS, which is a relocation and is what an object using somebody\n"
+			"   else-s variable carries instead; and a reference to thread creation. */\n"
+			"__thread int liber_audit_thread_local = 1;\n"
+			"extern __thread int liber_audit_elsewhere;\n"
+			"int liber_audit_reads_a_thread_local(void) { return liber_audit_elsewhere + liber_audit_thread_local; }\n"
+			"extern int pthread_create(void *, const void *, void *(*)(void *), void *);\n"
+			"int liber_audit_starts_a_thread(void) { return pthread_create(0, 0, 0, 0); }\n"
+		),
+		"clean": (
+			"/* The control: the same shapes with nothing thread-local and nothing that starts a thread. */\n"
+			"int liber_audit_plain = 1;\n"
+			"extern int liber_audit_plain_elsewhere;\n"
+			"int liber_audit_reads_plainly(void) { return liber_audit_plain_elsewhere + liber_audit_plain; }\n"
+		),
+	}
+	scopes = {}
+	for label, text in fixtures.items():
+		source = work / f"stop-condition-{label}.c"
+		source.write_text(text)
+		object_file = work / f"stop-condition-{label}.o"
+		run(["clang", "--target=x86_64-unknown-none-elf", "-ffreestanding", "-nostdlibinc", "-fPIC", "-O0", "-c", str(source), "-o", str(object_file)])
+		archive = work / f"stop-condition-{label}.a"
+		archive.unlink(missing_ok=True)
+		run(["llvm-ar", "crsD", str(archive), str(object_file)])
+		# THE LINKED SCOPE IS A REAL LINK, by the pinned linker, of the fixture into a shared object -
+		# which is what carries a `PT_TLS` segment and the dynamic relocations an object does not. What
+		# it cannot resolve stays imported, as the audit-linked ELF's runtime references do.
+		elf = work / f"stop-condition-{label}.so"
+		run([str(lld), "-flavor", "gnu", "-m", "elf_x86_64", "-shared", "--hash-style=sysv", "-nostdlib", "--whole-archive", str(archive), "--no-whole-archive", "-o", str(elf)])
+		scopes[label] = stop_conditions(archive, elf)
 
 	failures = []
-	for scope, path in (("an archive member", archive), ("an object", object_file)):
-		tls, threads = member_scan(path)
-		if "liber_audit_thread_local" not in tls:
-			failures.append(f"the TLS scan did not see a thread-local DEFINITION in {scope}")
-		if not any(TLS_RELOCATION.search(entry) for entry in tls):
-			failures.append(f"the TLS scan did not see a thread-local ACCESS - a relocation - in {scope}")
-		if "pthread_create" not in threads:
-			failures.append(f"the thread scan did not see a thread-creation reference in {scope}")
+	carrying, clean = scopes["carrying"], scopes["clean"]
+	for scope in ("archive_members", "converged_resolved_set", "audit_linked_elf"):
+		if "pthread_create" not in carrying["thread_creation_by_scope"][scope]:
+			failures.append(f"the thread scan did not see a thread-creation reference in the {scope} scope")
+		if clean["thread_creation_by_scope"][scope]:
+			failures.append(f"the thread scan reported {clean['thread_creation_by_scope'][scope]} in the {scope} scope of a fixture that has none")
+	for scope in ("archive_members", "audit_linked_elf"):
+		found = carrying["tls_by_scope"][scope]
+		if "liber_audit_thread_local" not in found:
+			failures.append(f"the TLS scan did not see a thread-local DEFINITION in the {scope} scope")
+		if not any(TLS_RELOCATION.search(entry) for entry in found):
+			failures.append(f"the TLS scan did not see a thread-local ACCESS - a relocation - in the {scope} scope")
+		if clean["tls_by_scope"][scope]:
+			failures.append(f"the TLS scan reported {clean['tls_by_scope'][scope]} in the {scope} scope of a fixture that has none")
+	if not carrying["tls_by_scope"]["elf_segment"]:
+		failures.append("the segment scan did not see the PT_TLS segment of a linked ELF that has one")
+	if clean["tls_by_scope"]["elf_segment"]:
+		failures.append("the segment scan reported PT_TLS in a linked ELF that has none")
 	for failure in failures:
 		print(f"foreign-audit-link: {failure}", file=sys.stderr)
 	if failures:
 		return 1
-	print("foreign-audit-link: the scan finds an injected thread-local and an injected thread creation in every scope it reports over")
+	print("foreign-audit-link: the scans find an injected thread-local and an injected thread creation in all three scopes - archive members, the converged resolved set and a linked ELF - and nothing in a clean fixture")
 	return 0
 
 
@@ -447,26 +654,42 @@ def build_quarantine(root, arch, settings, out_dir, archive, rlibs, name, with_l
 		command.append("-Zjson-target-spec")
 	subprocess.run(command, check=True)
 
-	lld = next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld"))
-	runtime = root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
-	start = root / ".build/state" / f"exe-start-{settings['triple']}.o"
+	lld, _ = rust_lld(root)
+	start = start_of(root, settings)
 	if not start.is_file():
 		print(f"foreign-audit-link: {arch}: no {start}; the image build has not produced the entry object, so the quarantine consumer was not linked", file=sys.stderr)
 		return None
 	elf = out_dir / arch / f"{name}.lsexe"
-	loader = ["--whole-archive", str(archive), "--no-whole-archive"] if with_loader else []
-	subprocess.run([
-		str(lld), "-flavor", "gnu", "-m", settings["emulation"], "-pie", "--no-dynamic-linker", "--hash-style=sysv",
-		"--gc-sections", "--build-id=none", "-e", "_start", str(start), str(object_file),
-		*loader,
-		*[str(rlib) for rlib in rlibs], str(runtime),
-		"--no-allow-shlib-undefined", "-z", "undefs", "-o", str(elf),
-	], check=True)
+	arguments = quarantine_link_arguments(settings, start, object_file, archive if with_loader else None, rlibs, runtime_of(root, settings))
+	subprocess.run([str(lld), *map(str, arguments), "-o", str(elf)], check=True)
 	run(["llvm-strip", "--strip-debug", str(elf)])
 	return elf
 
 
-def quarantine_identity(root, arch, settings, providers, candidates, name, licence):
+def quarantine_record_fields(root, arch, settings, out_dir, archive, rlibs, name, licence):
+	"""The quarantine consumer's source digest and language section, from what its link used.
+
+	`archive` is the loader archive when the consumer links one, and `None` when it does not."""
+	start = start_of(root, settings)
+	object_file = out_dir / arch / f"{name}.o"
+	arguments = quarantine_link_arguments(settings, start, object_file, archive, rlibs, runtime_of(root, settings))
+	# THE CONSUMER'S OWN COMPILE, then - when it links the loader - the builder's configuration of the
+	# archive it links, then the link. A consumer that links no C has no C flags, and says so by
+	# naming only the producer that compiled it.
+	compile_line = f"consumer={name} --no-default-features --features shared-image rustflags={settings['rustflags']}\n"
+	if archive is not None:
+		configuration, fields = builder_configuration(out_dir, arch)
+		cflags = f"clang: {fields['cflags']}; rustc: {settings['rustflags']}"
+	else:
+		configuration = ""
+		cflags = f"rustc: {settings['rustflags']}"
+	configure = hashlib.sha256((compile_line + configuration + f"substrate={' '.join(SUBSTRATE)}\nlink={described(arguments)}\n").encode()).hexdigest()
+	objects = digest_objects([start, object_file, *([archive] if archive is not None else []), *rlibs])
+	source = f"source-sha256={digest_file(root / 'src/user/apps/tools/src' / f'{name}.rs')}"
+	return [source, *producer_lines(root, cflags, configure, objects, licence)]
+
+
+def quarantine_identity(root, arch, settings, out_dir, archive, rlibs, providers, candidates, name, licence):
 	"""The quarantine consumer's identity record: the same v2 format, with the slot it was built with.
 
 	IT IS `language=foreign` BECAUSE ITS LINK IS. The object is Rust and the record could have said
@@ -474,9 +697,6 @@ def quarantine_identity(root, arch, settings, providers, candidates, name, licen
 	one is the audit substrate, whose compiler, sysroot, patch series and licence are what a reader
 	needs to know about the bytes in front of them.
 	"""
-	def digest_file(path):
-		return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
-
 	def provider_digest(name):
 		library = root / ".build/image" / settings["triple"] / "lib"
 		for candidate in library.rglob(f"{name}.lslib"):
@@ -487,29 +707,16 @@ def quarantine_identity(root, arch, settings, providers, candidates, name, licen
 			return hashlib.sha256(blob[20:20 + int.from_bytes(blob[4:8], "little")]).hexdigest()
 		raise SystemExit(f"foreign-audit-link: no staged {name}.lslib to take a digest from")
 
-	patches = sorted((root / "src/foreign/patches").glob("*.patch"))
-	patch_digest = hashlib.sha256("".join(f"{path.name}\n{digest_file(path)}\n" for path in patches).encode()).hexdigest()
+	source, *language = quarantine_record_fields(root, arch, settings, out_dir, archive, rlibs, name, licence)
 	lines = [
 		"format=liber-image-identity-v2",
 		"kind=executable",
 		f"artifact={name}",
 		"package=tools",
-		f"source-sha256={digest_file(root / 'src/user/apps/tools/src' / f'{name}.rs')}",
+		source,
 		f"target={settings['triple']}",
 		"profile=release",
-		"language=foreign",
-		f"compiler={run(['clang', '--version']).stdout.splitlines()[0]}",
-		f"compiler-sha256={digest_file(shutil.which('clang'))}",
-		f"archiver={run(['llvm-ar', '--version']).stdout.splitlines()[0]}",
-		f"archiver-sha256={digest_file(shutil.which('llvm-ar'))}",
-		f"linker=quarantine link, {arch}",
-		f"linker-sha256={digest_file(next(pathlib.Path(run(['rustc', '--print', 'sysroot']).stdout.strip()).rglob('rust-lld')))}",
-		f"cflags=quarantine consumer against the audit-linked loader, {arch}",
-		f"sysroot-sha256={hashlib.sha256(b'profile sysroot, by reference from the audit link').hexdigest()}",
-		f"configure-sha256={hashlib.sha256(('quarantine ' + arch).encode()).hexdigest()}",
-		f"objects-sha256={hashlib.sha256(b'one object, the tools bin').hexdigest()}",
-		f"patches-sha256={patch_digest}",
-		f"licence={licence}",
+		*language,
 	]
 	for provider in providers:
 		lines.append(f"provider={provider}:{provider_digest(provider)}")
@@ -520,15 +727,68 @@ def quarantine_identity(root, arch, settings, providers, candidates, name, licen
 	return ("\n".join(lines) + "\n").encode()
 
 
+def verify_records(root, work):
+	"""Recompute every producer field of every audit-produced record and compare it with the record.
+
+	WHAT A WELL-FORMED DIGEST COULD NOT SAY. A field of sixty-four hex digits proves nothing about
+	what it digests, and two of these records once carried digests of constant strings that passed
+	that check for months. Here each field is recomputed from the inputs the link used - the archive
+	and the objects beside it, the substrate archives, the entry object, the builder's recorded
+	configuration, the profile sysroot, the patch series and the three tools - so a record that does
+	not describe its own artifact, or an artifact whose inputs moved without a relink, fails by name.
+
+	NOTHING IS BUILT OR LINKED. What is read is what the last link left."""
+	failures = []
+	checked = 0
+	for arch, settings in TARGETS.items():
+		directory = work / arch
+		archive = directory / "libvulkan.a"
+		rlibs = substrate_rlibs(root, settings)
+		missing = [path for path in (archive, *rlibs) if not path.is_file()]
+		if missing:
+			failures.append(f"{arch}: {', '.join(str(path) for path in missing)} - the inputs of the last link are gone, so its records cannot be checked; relink")
+			continue
+		artifacts = [("audit-vulkan", directory / "audit-vulkan.lslib", lambda: audit_record_fields(root, arch, settings, work, archive, rlibs))]
+		for name, with_loader, licence in QUARANTINE_CONSUMERS:
+			artifacts.append((name, directory / f"{name}.lsexe", functools.partial(quarantine_record_fields, root, arch, settings, work, archive if with_loader else None, rlibs, name, licence)))
+		for name, artifact, expected in artifacts:
+			if not artifact.is_file():
+				failures.append(f"{arch}: {artifact.name} is missing")
+				continue
+			recorded = dict(line.split("=", 1) for line in embedded_record(artifact).splitlines() if "=" in line)
+			try:
+				lines = expected()
+			except FileNotFoundError as missing:
+				failures.append(f"{arch}: {name}: {missing.filename} is gone, so what its link used cannot be recomputed")
+				continue
+			for line in lines:
+				field, value = line.split("=", 1)
+				if field not in PRODUCER_FIELDS:
+					continue
+				if recorded.get(field) != value:
+					failures.append(f"{arch}: {name} records {field}={recorded.get(field)!r} and its inputs give {value!r}")
+			checked += 1
+	for failure in failures:
+		print(f"foreign-audit-link: {failure}", file=sys.stderr)
+	if failures:
+		print("foreign-audit-link: a record that does not describe its artifact's inputs is stale or forged; relink with src/tools/foreign-audit-link.py --check", file=sys.stderr)
+		return 1
+	print(f"foreign-audit-link: {checked} identity record(s) describe exactly the inputs their links used, field by field")
+	return 0
+
+
 def main():
 	parser = argparse.ArgumentParser(description="The converging audit link, and what it resolved.")
 	parser.add_argument("--out", default="src/foreign/INVENTORY-pass2.json")
 	parser.add_argument("--work", default=".build/foreign/pass2")
 	parser.add_argument("--check", action="store_true", help="regenerate and compare instead of writing")
 	parser.add_argument("--self-test", action="store_true", help="prove the scan sees what it reports absent, and stop")
+	parser.add_argument("--verify-records", action="store_true", help="recompute the audit-produced identity records from their inputs, and stop")
 	arguments = parser.parse_args()
 	root = pathlib.Path(__file__).resolve().parents[2]
 	work = root / arguments.work
+	if arguments.verify_records:
+		return verify_records(root, work)
 	work.mkdir(parents=True, exist_ok=True)
 	if arguments.self_test:
 		return self_test(root, work / "self-test")
@@ -552,6 +812,10 @@ def main():
 		"per_target_only": {arch: sorted(surface - set.intersection(*surfaces.values())) for arch, surface in surfaces.items()},
 		"note": "the surface is a property of one C configuration, so the three targets agreeing is expected; the ELF sizes and the relocation forms are where three links are visible",
 	}
+	# THE NEGOTIATED VERSION, BESIDE THE SYMBOLS. Which interface version this substrate admits is a
+	# derived fact rather than an assumption, and it is the same on every target - so it is recorded
+	# once, from the pinned headers and the substrate it was linked against.
+	inventory["_icd_interface"] = icd_interface(root)
 	text = json.dumps(inventory, indent="\t", sort_keys=True) + "\n"
 	destination = root / arguments.out
 	if arguments.check:

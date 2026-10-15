@@ -60,6 +60,12 @@ pub enum Unsupported {
 	Paint(u8),
 	/// A script the profile does not shape.
 	Script([u8; 4]),
+	/// TEXT in a script the profile does not name, by its Unicode `Script` value.
+	///
+	/// THE UNICODE NAME AND NOT A TAG. `Script` above carries an OpenType tag, which is the profile's
+	/// own vocabulary - and a script the profile does not name has no tag this system knows. Inventing
+	/// one to fill the field would be a guess wearing the shape of an identity.
+	TextScript(&'static str),
 	/// A variation mechanism outside the profile.
 	Variation(&'static str),
 	/// A structure the profile EXCLUDES by name - see `tables::EXCLUDED`.

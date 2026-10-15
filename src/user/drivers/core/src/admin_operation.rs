@@ -70,8 +70,11 @@ impl Operations {
 		if payload.is_empty() || payload.len() > MAX_PAYLOAD || parameters.len() > MAX_PARAMETERS {
 			return Err(Refusal::Bounds);
 		}
-		// WHAT WILL NEVER RUN makes room first; a live preparation is never displaced.
-		self.held.retain(Prepared::live);
+		// WHAT WILL NEVER RUN makes room first: a started or cancelled preparation, and one PAST ITS LIFETIME -
+		// which the start guard refuses anyway, and which nobody may be left to release: a broker that restarted,
+		// or one that lost track of it, would otherwise hold this executor's few slots for as long as it runs. A
+		// live preparation inside its lifetime is never displaced.
+		self.held.retain(|held| held.live() && now < held.expires);
 		if self.held.len() >= MAX_OPERATIONS {
 			return Err(Refusal::Busy);
 		}
@@ -102,6 +105,11 @@ impl Operations {
 			return Err(Refusal::Expired);
 		}
 		Ok(at)
+	}
+
+	/// How many preparations may still run: neither started nor cancelled, and inside their lifetime.
+	pub fn live(&self, now: u64) -> usize {
+		self.held.iter().filter(|held| held.live() && now < held.expires).count()
 	}
 
 	/// Still the same live target, still unstarted: nothing is started by asking.

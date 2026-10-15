@@ -17,29 +17,62 @@
 //! canonical COMPOSITION or its full DECOMPOSITION. The view is a lookup over the cluster, not a
 //! rewrite of the buffer.
 
-use alloc::vec::Vec;
 use unicode_tables::{canonical_composition, canonical_decomposition, combining_class};
 
-/// How many characters one cluster's canonical view will hold. A cluster longer than this is asked
-/// about as it stands rather than expanded, which is a coverage question answered conservatively
-/// rather than an allocation driven by input.
+/// How many characters one cluster's canonical view will hold. A cluster whose decomposition is
+/// longer than this is asked about AS IT STANDS rather than expanded - a coverage question answered
+/// about the caller's own characters, never about a truncated spelling that would leave some of them
+/// unasked.
 pub const MAX_VIEW: usize = 64;
 
+/// One spelling of a cluster, held inline: asking about a cluster allocates nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Spelling {
+	characters: [char; MAX_VIEW],
+	len: usize,
+}
+
+impl Spelling {
+	const EMPTY: Self = Self { characters: ['\0'; MAX_VIEW], len: 0 };
+
+	fn as_slice(&self) -> &[char] {
+		&self.characters[..self.len]
+	}
+
+	/// Append one character, or say the spelling is full.
+	fn push(&mut self, character: char) -> bool {
+		if self.len == MAX_VIEW {
+			return false;
+		}
+		self.characters[self.len] = character;
+		self.len += 1;
+		true
+	}
+}
+
 /// The two spellings of one cluster, without touching the buffer either came from.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CanonicalView {
-	/// The fully composed spelling.
-	pub composed: Vec<char>,
-	/// The fully decomposed spelling, with its marks in canonical order.
-	pub decomposed: Vec<char>,
+	composed: Spelling,
+	decomposed: Spelling,
 }
 
 impl CanonicalView {
-	/// Both spellings of a cluster.
-	pub fn of(cluster: &[char]) -> Self {
-		let decomposed = decompose(cluster);
+	/// Both spellings of a cluster, or `None` for one whose decomposition is longer than `MAX_VIEW`.
+	pub fn of(cluster: &[char]) -> Option<Self> {
+		let decomposed = decompose(cluster)?;
 		let composed = compose(&decomposed);
-		Self { composed, decomposed }
+		Some(Self { composed, decomposed })
+	}
+
+	/// The fully composed spelling.
+	pub fn composed(&self) -> &[char] {
+		self.composed.as_slice()
+	}
+
+	/// The fully decomposed spelling, with its marks in canonical order.
+	pub fn decomposed(&self) -> &[char] {
+		self.decomposed.as_slice()
 	}
 }
 
@@ -48,43 +81,41 @@ impl CanonicalView {
 /// THE ORDERING IS NOT DECORATION. Two marks on one base may be written in either order and are the
 /// same string; a view that did not sort them would answer "these two clusters differ" for two
 /// spellings Unicode calls identical, and the fallback decision would then differ too.
-fn decompose(cluster: &[char]) -> Vec<char> {
-	let mut out: Vec<char> = Vec::new();
-	for character in cluster.iter().take(MAX_VIEW) {
-		expand(*character, &mut out, 0);
+fn decompose(cluster: &[char]) -> Option<Spelling> {
+	let mut out = Spelling::EMPTY;
+	for character in cluster {
+		if !expand(*character, &mut out, 0) {
+			return None;
+		}
 	}
 	// The canonical ordering: a stable sort of each run of non-starters by combining class.
+	let characters = &mut out.characters[..out.len];
 	let mut start = 0usize;
-	while start < out.len() {
-		if combining_class(out[start]) == 0 {
+	while start < characters.len() {
+		if combining_class(characters[start]) == 0 {
 			start += 1;
 			continue;
 		}
 		let mut end = start;
-		while end < out.len() && combining_class(out[end]) != 0 {
+		while end < characters.len() && combining_class(characters[end]) != 0 {
 			end += 1;
 		}
-		out[start..end].sort_by_key(|character| combining_class(*character));
+		characters[start..end].sort_by_key(|character| combining_class(*character));
 		start = end;
 	}
-	out
+	Some(out)
 }
 
 /// One character's decomposition, recursively - the recursion the table deliberately does not do.
-fn expand(character: char, out: &mut Vec<char>, depth: u8) {
+/// `false` when the spelling would not fit.
+fn expand(character: char, out: &mut Spelling, depth: u8) -> bool {
 	// The standard's own decompositions nest at most a few deep; the bound is here because this
 	// reads a generated table and a table is a thing that can be regenerated wrongly.
-	if depth > 8 || out.len() >= MAX_VIEW {
-		out.push(character);
-		return;
+	if depth > 8 {
+		return out.push(character);
 	}
 	match canonical_decomposition(character) {
-		Some((first, second)) => {
-			expand(first, out, depth + 1);
-			if let Some(second) = second {
-				expand(second, out, depth + 1);
-			}
-		}
+		Some((first, second)) => expand(first, out, depth + 1) && second.is_none_or(|second| expand(second, out, depth + 1)),
 		None => out.push(character),
 	}
 }
@@ -94,27 +125,28 @@ fn expand(character: char, out: &mut Vec<char>, depth: u8) {
 /// THE RULE IS THE STANDARD'S: a starter composes with a following mark when nothing between them
 /// blocks it - a mark of the same or a higher combining class does. Composing past a blocker is how
 /// an implementation produces a spelling that is not canonically equivalent to what it was given.
-fn compose(decomposed: &[char]) -> Vec<char> {
-	let mut out: Vec<char> = Vec::new();
+fn compose(decomposed: &Spelling) -> Spelling {
+	let mut out = Spelling::EMPTY;
 	let mut starter: Option<usize> = None;
 	let mut last_class: u8 = 0;
-	for character in decomposed {
+	for character in decomposed.as_slice() {
 		let class = combining_class(*character);
 		if let Some(at) = starter
 			&& (last_class < class || last_class == 0 && class == 0)
-			&& let Some(composed) = canonical_composition(out[at], *character)
+			&& let Some(composed) = canonical_composition(out.characters[at], *character)
 		{
-			out[at] = composed;
+			out.characters[at] = composed;
 			// The class does not advance: what just composed is gone, and the next mark is measured
 			// against what was before it.
 			continue;
 		}
 		if class == 0 {
-			starter = Some(out.len());
+			starter = Some(out.len);
 			last_class = 0;
 		} else {
 			last_class = class;
 		}
+		// A composition is never longer than the decomposition it came from, so this always fits.
 		out.push(*character);
 	}
 	out
@@ -125,25 +157,25 @@ fn compose(decomposed: &[char]) -> Vec<char> {
 /// A TRAIT RATHER THAN A TYPE, because the pipeline does not own the faces: the catalogue does, and
 /// which faces a run may use is a policy above this layer. What the pipeline owns is the QUESTION -
 /// and that it is asked in the canonical view rather than of the raw bytes.
+///
+/// IT DOES NOT SAY WHICH FACES TO TRY, OR IN WHICH ORDER. That is the fallback policy's, per run
+/// script and language; an order the coverage provider enumerated would be the accident of
+/// enumeration the policy exists to replace.
 pub trait Coverage {
 	/// Does this face cover every character of the spelling given?
 	fn covers(&self, face: u16, spelling: &[char]) -> bool;
-
-	/// The faces to try, in order. The last one is the last resort.
-	fn faces(&self) -> &[u16];
 }
 
-/// The face that covers a cluster, asked in the canonical view.
+/// The first face of `order` that covers a cluster, asked in the canonical view.
 ///
 /// BOTH SPELLINGS, AND A FACE THAT COVERS EITHER COVERS THE CLUSTER. This is the whole of the policy
 /// in one function: ask about the composition, ask about the decomposition, and take the first face
-/// that answers to either - so the two spellings of one string take the SAME fallback decision.
-pub fn face_for(coverage: &impl Coverage, cluster: &[char]) -> Option<u16> {
+/// that answers to either - so the two spellings of one string take the SAME fallback decision. A
+/// cluster too long for the view is asked about as it stands.
+pub fn face_for(coverage: &impl Coverage, order: impl IntoIterator<Item = u16>, cluster: &[char]) -> Option<u16> {
 	let view = CanonicalView::of(cluster);
-	for face in coverage.faces() {
-		if coverage.covers(*face, &view.composed) || coverage.covers(*face, &view.decomposed) {
-			return Some(*face);
-		}
-	}
-	None
+	order.into_iter().find(|face| match &view {
+		Some(view) => coverage.covers(*face, view.composed()) || coverage.covers(*face, view.decomposed()),
+		None => coverage.covers(*face, cluster),
+	})
 }

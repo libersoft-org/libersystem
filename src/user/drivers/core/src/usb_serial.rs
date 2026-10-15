@@ -251,53 +251,67 @@ pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice, limit: usize,
 				((ep_ctx + 16) as *mut u32).write_volatile(mps);
 			}
 		}
-		if command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24).is_none() {
-			print(b"driver.xhci: the CDC-ACM adapter's bulk endpoints were refused by the controller\n");
-			return 0;
-		}
-		// ONE SET_CONFIGURATION FOR THE DEVICE AND NOT ONE PER PORT: the request selects a
-		// configuration, and issuing it again would reset every interface in it - including the one
-		// a port brought up a moment ago.
-		let config_value = bound[0].as_ref().expect("a binding that was counted").config_value;
-		if control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value as u16, 0).is_none() {
-			print(b"driver.xhci: the CDC-ACM adapter refused SET_CONFIGURATION\n");
-			return 0;
-		}
+		// EVERY RING PAIR A PORT DID NOT TAKE IS GIVEN BACK BELOW, whichever way this ends - the
+		// controller refusing the endpoints and the device refusing its configuration included. Those
+		// two used to return straight out of here and keep every pair for the life of the driver.
+		let brought_up: usize = 'ports: {
+			if command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24).is_none() {
+				print(b"driver.xhci: the CDC-ACM adapter's bulk endpoints were refused by the controller\n");
+				break 'ports 0;
+			}
+			// ONE SET_CONFIGURATION FOR THE DEVICE AND NOT ONE PER PORT: the request selects a
+			// configuration, and issuing it again would reset every interface in it - including the one
+			// a port brought up a moment ago.
+			let config_value = bound[0].as_ref().expect("a binding that was counted").config_value;
+			if control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value as u16, 0).is_none() {
+				print(b"driver.xhci: the CDC-ACM adapter refused SET_CONFIGURATION\n");
+				break 'ports 0;
+			}
 
-		let mut brought_up: usize = 0;
-		for index in 0..ready {
-			let one = bound[index].as_ref().expect("a binding that was counted");
-			// THE ALTERNATE SETTING THAT HAS THE ENDPOINTS, which is the request a CDC driver
-			// forgets: setting zero carries none by definition, so everything above is correct and
-			// nothing ever arrives.
-			if control_nodata(hc, &mut hids, dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, one.data_alternate as u16, one.data_interface as u16).is_none() {
-				print(b"driver.xhci: the CDC-ACM adapter refused the alternate setting that carries its endpoints\n");
-				continue;
-			}
-			// AND THE LINE, ONLY IF THE DEVICE SAID IT HAS ONE. A stall here is recovered from
-			// rather than fatal for the same reason the capability is read at all: the byte stream
-			// is the product, and a link with no UART behind it is a working one that cannot be
-			// configured.
-			if one.supports_line_coding() {
-				let coding = cdc::LineCoding::default_8n1().encode();
-				core::ptr::copy_nonoverlapping(coding.as_ptr(), dev.data_virt as *mut u8, coding.len());
-				if control_out_req(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_LINE_CODING, 0, one.control_interface as u16, coding.len() as u16).is_none() {
-					print(b"driver.xhci: the CDC-ACM adapter stalled SET_LINE_CODING although it declared the capability - the byte stream is kept and the line is left as it was\n");
+			let mut brought_up: usize = 0;
+			for index in 0..ready {
+				let one = bound[index].as_ref().expect("a binding that was counted");
+				// THE ALTERNATE SETTING THAT HAS THE ENDPOINTS, which is the request a CDC driver
+				// forgets: setting zero carries none by definition, so everything above is correct and
+				// nothing ever arrives.
+				if control_nodata(hc, &mut hids, dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, one.data_alternate as u16, one.data_interface as u16).is_none() {
+					print(b"driver.xhci: the CDC-ACM adapter refused the alternate setting that carries its endpoints\n");
+					continue;
 				}
-				// DTR AND RTS ARE A BITMAP IN wValue AND THE REQUEST HAS NO DATA STAGE. Raising both
-				// is what tells the other end somebody is here; a device with no modem lines
-				// ignores it.
-				if control_nodata(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_CONTROL_LINE_STATE, cdc::control_lines(true, true), one.control_interface as u16).is_none() {
-					print(b"driver.xhci: the CDC-ACM adapter stalled SET_CONTROL_LINE_STATE - the byte stream is kept\n");
+				// AND THE LINE, ONLY IF THE DEVICE SAID IT HAS ONE. A stall here is recovered from
+				// rather than fatal for the same reason the capability is read at all: the byte stream
+				// is the product, and a link with no UART behind it is a working one that cannot be
+				// configured.
+				if one.supports_line_coding() {
+					let coding = cdc::LineCoding::default_8n1().encode();
+					core::ptr::copy_nonoverlapping(coding.as_ptr(), dev.data_virt as *mut u8, coding.len());
+					if control_out_req(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_LINE_CODING, 0, one.control_interface as u16, coding.len() as u16).is_none() {
+						print(b"driver.xhci: the CDC-ACM adapter stalled SET_LINE_CODING although it declared the capability - the byte stream is kept and the line is left as it was\n");
+					}
+					// DTR AND RTS ARE A BITMAP IN wValue AND THE REQUEST HAS NO DATA STAGE. Raising both
+					// is what tells the other end somebody is here; a device with no modem lines
+					// ignores it.
+					if control_nodata(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_CONTROL_LINE_STATE, cdc::control_lines(true, true), one.control_interface as u16).is_none() {
+						print(b"driver.xhci: the CDC-ACM adapter stalled SET_CONTROL_LINE_STATE - the byte stream is kept\n");
+					}
 				}
+				// BOTH PAGES OR NEITHER: one that was taken when the other could not be is given back.
+				let (rx, tx) = match (dma_page(), dma_page()) {
+					(Some(rx), Some(tx)) => (rx, tx),
+					(rx, tx) => {
+						for (handle, _, _) in [rx, tx].into_iter().flatten() {
+							close(handle);
+						}
+						break;
+					}
+				};
+				let ((rx_handle, rx_virt, rx_phys), (tx_handle, tx_virt, tx_phys)) = (rx, tx);
+				let (ring_in, ring_out) = rings[index].take().expect("a ring pair that was made");
+				out.push(Serial { slot: dev.slot, dci_in: (one.bulk_in & 0x0f) as u32 * 2 + 1, dci_out: (one.bulk_out & 0x0f) as u32 * 2, ring_in, ring_out, rx_handle, rx_virt, rx_phys, tx_handle, tx_virt, tx_phys, posted: false, line_coding: one.supports_line_coding() });
+				brought_up += 1;
 			}
-			let (Some((rx_handle, rx_virt, rx_phys)), Some((tx_handle, tx_virt, tx_phys))) = (dma_page(), dma_page()) else {
-				break;
-			};
-			let (ring_in, ring_out) = rings[index].take().expect("a ring pair that was made");
-			out.push(Serial { slot: dev.slot, dci_in: (one.bulk_in & 0x0f) as u32 * 2 + 1, dci_out: (one.bulk_out & 0x0f) as u32 * 2, ring_in, ring_out, rx_handle, rx_virt, rx_phys, tx_handle, tx_virt, tx_phys, posted: false, line_coding: one.supports_line_coding() });
-			brought_up += 1;
-		}
+			brought_up
+		};
 		// A RING PAIR WHOSE PORT DID NOT COME UP IS GIVEN BACK rather than left to the process's
 		// lifetime - the same rule `Serial::release` keeps for the ones that did.
 		for slot in rings.iter_mut() {

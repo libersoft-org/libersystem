@@ -18,7 +18,8 @@
 use alloc::vec::Vec;
 use unicode_tables::Script;
 
-use crate::canonical::{CanonicalView, Coverage};
+use crate::Error;
+use crate::canonical::{Coverage, face_for};
 
 /// One face as the policy sees it: what it is, and what it is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,92 +57,63 @@ impl Policy {
 		Self { entries, last_resort }
 	}
 
-	/// The faces to try for a run of this script and language, in order.
+	/// The faces to try for a run of this script and language, in order, the last resort last.
 	///
 	/// THREE BANDS, STATED RATHER THAN IMPLIED: the faces preferred for this script AND language,
 	/// then those preferred for the script whatever the language, then the general faces. Within
 	/// each band the stated rank decides, and the face id breaks the tie.
-	pub fn order_for(&self, script: Script, language: [u8; 4]) -> Vec<u16> {
-		let mut out: Vec<u16> = Vec::new();
-		let push = |face: u16, out: &mut Vec<u16>| {
-			if !out.contains(&face) {
-				out.push(face);
-			}
-		};
-		for entry in &self.entries {
-			if entry.script == Some(script) && entry.language == Some(language) {
-				push(entry.face, &mut out);
-			}
-		}
-		for entry in &self.entries {
-			if entry.script == Some(script) && entry.language.is_none() {
-				push(entry.face, &mut out);
-			}
-		}
-		for entry in &self.entries {
-			if entry.script.is_none() {
-				push(entry.face, &mut out);
-			}
-		}
+	pub fn order_for(&self, script: Script, language: [u8; 4]) -> Result<Vec<u16>, Error> {
+		let mut out = Vec::new();
+		self.preferred_into(script, language, &mut out)?;
 		// THE LAST RESORT IS LAST, and it is in the list rather than a special case afterwards: a
 		// caller that walks this order and finds nothing has been told everything the policy knows.
-		if let Some(face) = self.last_resort {
-			push(face, &mut out);
+		if let Some(face) = self.last_resort
+			&& !out.contains(&face)
+		{
+			crate::room(&mut out)?;
+			out.push(face);
 		}
-		out
+		Ok(out)
+	}
+
+	/// The three preference bands alone, written over `out`.
+	pub fn preferred_into(&self, script: Script, language: [u8; 4], out: &mut Vec<u16>) -> Result<(), Error> {
+		out.clear();
+		let bands: [&dyn Fn(&FaceEntry) -> bool; 3] = [&|entry| entry.script == Some(script) && entry.language == Some(language), &|entry| entry.script == Some(script) && entry.language.is_none(), &|entry| {
+			entry.script.is_none()
+		}];
+		for band in bands {
+			for entry in self.entries.iter().filter(|entry| band(entry)) {
+				if !out.contains(&entry.face) {
+					crate::room(out)?;
+					out.push(entry.face);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// The face nothing else need cover.
+	pub fn last_resort(&self) -> Option<u16> {
+		self.last_resort
 	}
 }
 
-/// The policy and the faces' coverage, together - which is what a cluster is actually asked of.
-pub struct Faces<'a, C: Coverage> {
-	pub policy: &'a Policy,
-	pub coverage: &'a C,
-	pub script: Script,
-	pub language: [u8; 4],
-}
-
-impl<C: Coverage> Coverage for Faces<'_, C> {
-	fn covers(&self, face: u16, spelling: &[char]) -> bool {
-		self.coverage.covers(face, spelling)
-	}
-
-	fn faces(&self) -> &[u16] {
-		// The order is the policy's; `face_for` walks it.
-		self.coverage.faces()
-	}
-}
-
-/// The face for one cluster, under the policy.
+/// The face for one cluster, under the policy: THE QUESTION STAGE 4 ASKS.
 ///
 /// WHOLE CLUSTERS, ASKED IN THE CANONICAL VIEW. A face that covers the composition or the
 /// decomposition covers the cluster; a face that covers only part of it does not, which is what
 /// stops a combining sequence being split across two faces.
-pub fn face_for_cluster<C: Coverage>(faces: &Faces<'_, C>, cluster: &[char]) -> Option<u16> {
-	let view = CanonicalView::of(cluster);
-	// A CLUSTER NO FACE COVERS WOULD OTHERWISE TRY EVERY FACE IN THE CATALOGUE, once per cluster, and
-	// the coverage question is not free: it is asked in both canonical spellings. So the walk stops
-	// at the profile's ceiling, and a cluster that needed the seventeenth face is answered the same
-	// way as one nothing covers at all - which is the last resort's job.
-	for face in faces.policy.order_for(faces.script, faces.language).into_iter().take(opentype_profile::limits::FALLBACK_FACES as usize) {
-		if faces.coverage.covers(face, &view.composed) || faces.coverage.covers(face, &view.decomposed) {
-			return Some(face);
-		}
-	}
-	None
-}
-
-/// The faces for a run of clusters, one per cluster, with the runs they form.
 ///
-/// A RUN ENDS WHERE THE FACE CHANGES, which is what makes the shaped runs face-homogeneous - the
-/// shared contract's own requirement, and what a per-character fallback could never produce.
-pub fn runs_for<C: Coverage>(faces: &Faces<'_, C>, clusters: &[Vec<char>]) -> Option<Vec<(usize, usize, u16)>> {
-	let mut runs: Vec<(usize, usize, u16)> = Vec::new();
-	for (index, cluster) in clusters.iter().enumerate() {
-		let face = face_for_cluster(faces, cluster)?;
-		match runs.last_mut() {
-			Some((_, end, current)) if *current == face => *end = index + 1,
-			_ => runs.push((index, index + 1, face)),
-		}
-	}
-	Some(runs)
+/// THE CEILING BOUNDS THE PREFERENCE BANDS AND NEVER THE LAST RESORT. A cluster no face covers would
+/// otherwise try every face in the catalogue, once per cluster, and the coverage question is not
+/// free - so at most `FALLBACK_FACES` faces are asked. But the last resort is the face whose job is
+/// exactly the cluster nothing else covers, and it is the LAST entry of the order: a ceiling cut off
+/// the end of that order would refuse the very cluster it exists for. So it is always among the
+/// faces asked, and the preferred faces get the rest of the ceiling.
+pub fn face_for_cluster(preferred: &[u16], last_resort: Option<u16>, coverage: &impl Coverage, cluster: &[char]) -> Option<u16> {
+	let ceiling = opentype_profile::limits::FALLBACK_FACES as usize;
+	let asked = &preferred[..preferred.len().min(if last_resort.is_some() { ceiling - 1 } else { ceiling })];
+	let last = last_resort.filter(|face| !asked.contains(face));
+	face_for(coverage, asked.iter().copied().chain(last), cluster)
 }

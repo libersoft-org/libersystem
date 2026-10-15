@@ -24,6 +24,7 @@ pub mod buffer;
 pub mod context;
 pub mod gpos;
 pub mod gsub;
+pub mod indic;
 pub mod layout;
 pub mod scripts;
 pub mod shape;

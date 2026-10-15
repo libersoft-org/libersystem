@@ -646,6 +646,12 @@ elif [[ -n "${USB_GADGET:-}" ]]; then
 		case "$USB_GADGET" in
 		printer | midi | midi-echo | ups | ccid | dfu | bt | mbim | uvc | hid-gamepad-pair) export USB_GADGET_PORT=3 ;;
 		esac
+		# AN NCM ADAPTER OF ITS OWN TAKES THE ONE NETWORK ADAPTER THE DRIVER BINDS, so QEMU's ECM one is left off the
+		# bus - as a speaker of its own leaves QEMU's off. Its far end is not started here: it needs the function's
+		# network interface, which `usb-gadget.sh` brings up and answers on itself, and stops with the gadget.
+		if [[ "$USB_GADGET" == ncm ]]; then
+			export USB_QEMU_NET=off
+		fi
 	else
 		# REFUSED RATHER THAN FORCED, and the run goes on without it: the tests that wanted the
 		# gadget report unavailable, which is a state this harness already has, and the ones that
@@ -747,7 +753,7 @@ set +e
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" USB_QEMU_SPEAKER="${USB_QEMU_SPEAKER:-on}" USB_MIC_PCAP="$USB_MIC_PCAP" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" USB_QEMU_SPEAKER="${USB_QEMU_SPEAKER:-on}" USB_QEMU_NET="${USB_QEMU_NET:-on}" USB_MIC_PCAP="$USB_MIC_PCAP" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" I2C_FIXTURE="${I2C_FIXTURE:-}" I2C_SOCKET="${I2C_SOCKET:-}" GPIO_SOCKET="${GPIO_SOCKET:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

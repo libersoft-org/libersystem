@@ -94,7 +94,7 @@ fn displayport_is_entered_by_its_connector_offset_with_pin_d_first_and_refused_w
 	assert_eq!(pin_assignment(0x04_0045), Some(0x04));
 	assert_eq!(pin_assignment(0x00_1005), Some(0x10), "a plug's pins are in bits 15-8");
 	assert_eq!(pin_assignment(0x0000_0045), None);
-	assert_eq!(dp_configuration(0x08), 0x0805);
+	assert_eq!(dp_configuration(0x08), 0x0806, "pin assignment D, DisplayPort signalling, the partner configured as the display's sink");
 	port.current = Some(1);
 	port.pin = Some(0x08);
 	port.attention = Some(0x80);

@@ -19,9 +19,10 @@ use alloc::vec::Vec;
 
 /// The OBEX version this side speaks: 1.0.
 pub const VERSION: u8 = 0x10;
-/// The smallest maximum packet a peer may state, and the largest this side states.
+/// The smallest maximum packet a peer may state, and the largest this side states: the stated bound, the MTU of every
+/// BR/EDR dynamic channel (`bt_bounds::OBEX_PACKET`).
 pub const MIN_PACKET: usize = 255;
-pub const MAX_PACKET: usize = 4096;
+pub const MAX_PACKET: usize = crate::bt_bounds::OBEX_PACKET;
 
 pub mod opcode {
 	pub const CONNECT: u8 = 0x80;
@@ -276,6 +277,8 @@ enum ClientState {
 pub struct PushClient {
 	state: ClientState,
 	peer_max: usize,
+	// The transport's own limit on one packet: an L2CAP channel's MTU, where OBEX runs on one.
+	transport_max: usize,
 	name: String,
 	kind: Option<String>,
 	length: Option<u32>,
@@ -293,9 +296,16 @@ pub const CLIENT_BUFFER: usize = 2 * MAX_PACKET;
 impl PushClient {
 	/// A push of `name`, of `kind` where the caller knows it and `length` bytes where it does: the CONNECT to send.
 	pub fn new(name: &str, kind: Option<&str>, length: Option<u32>) -> (PushClient, Vec<u8>) {
-		let client = PushClient { state: ClientState::Connecting, peer_max: MIN_PACKET, name: String::from(name), kind: kind.map(String::from), length, connection: None, headers_sent: false, pending: VecDeque::new(), ended: false, sent: 0, result: None };
+		let client = PushClient { state: ClientState::Connecting, peer_max: MIN_PACKET, transport_max: MAX_PACKET, name: String::from(name), kind: kind.map(String::from), length, connection: None, headers_sent: false, pending: VecDeque::new(), ended: false, sent: 0, result: None };
 		let connect = Packet { code: opcode::CONNECT, connect: Some((VERSION, 0, MAX_PACKET as u16)), headers: Vec::new() };
 		(client, connect.encode())
+	}
+
+	/// THE TRANSPORT'S LIMIT: over L2CAP each OBEX packet is one SDU, so none may pass the channel's MTU, whatever the
+	/// peer's CONNECT states. OBEX's minimum packet is kept: a channel below it is the peer's own breach.
+	pub fn limit(&mut self, transport_max: usize) {
+		self.transport_max = transport_max.clamp(MIN_PACKET, MAX_PACKET);
+		self.peer_max = self.peer_max.min(self.transport_max);
 	}
 
 	/// How many more bytes `write` takes now.
@@ -382,7 +392,7 @@ impl PushClient {
 					return self.fail(Failure::Refused(packet.code));
 				}
 				let (_, _, max) = packet.connect.unwrap_or((VERSION, 0, MIN_PACKET as u16));
-				self.peer_max = usize::from(max).clamp(MIN_PACKET, MAX_PACKET);
+				self.peer_max = usize::from(max).clamp(MIN_PACKET, MAX_PACKET).min(self.transport_max);
 				self.connection = packet.get(header::CONNECTION_ID).and_then(|header| if let Header::Word(_, id) = header { Some(*id) } else { None });
 				self.state = ClientState::Idle;
 				self.next()

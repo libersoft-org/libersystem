@@ -26,9 +26,9 @@ fn every_grant_carries_exactly_its_operations() {
 				Op::Seal { .. } | Op::Unseal { .. } => grant == Grant::Seal,
 			};
 			assert_eq!(carries(grant, &op), expected, "{grant:?} and {op:?}");
-			assert_eq!(admit(grant, &op, true).is_ok(), expected, "{grant:?} and {op:?}");
+			assert_eq!(admit(grant, &op, Owner::Usable).is_ok(), expected, "{grant:?} and {op:?}");
 			if !expected {
-				assert_eq!(admit(grant, &op, true), Err(Refusal::NotGranted), "{grant:?} and {op:?} is refused by name");
+				assert_eq!(admit(grant, &op, Owner::Usable), Err(Refusal::NotGranted), "{grant:?} and {op:?} is refused by name");
 			}
 		}
 	}
@@ -37,40 +37,40 @@ fn every_grant_carries_exactly_its_operations() {
 #[test]
 fn only_pcrs_16_and_23_are_extended_and_every_pcr_is_read_sealed_to_and_quoted() {
 	for pcr in 0..PCRS {
-		let extend = admit(Grant::Measure, &Op::PcrExtend { pcr, digest: vec![0; 32] }, true);
+		let extend = admit(Grant::Measure, &Op::PcrExtend { pcr, digest: vec![0; 32] }, Owner::Usable);
 		if pcr == 16 || pcr == 23 {
 			assert_eq!(extend, Ok(()), "PCR {pcr}");
 		} else {
 			assert_eq!(extend, Err(Refusal::PcrNotAllowed), "PCR {pcr} is the firmware's, the system's or the dynamic root's");
 		}
-		assert_eq!(admit(Grant::Tpm, &Op::PcrRead { pcr }, true), Ok(()));
-		assert_eq!(admit(Grant::Seal, &Op::Seal { pcr, secret: vec![1] }, true), Ok(()));
-		assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr, nonce: vec![] }, true), Ok(()));
+		assert_eq!(admit(Grant::Tpm, &Op::PcrRead { pcr }, Owner::Usable), Ok(()));
+		assert_eq!(admit(Grant::Seal, &Op::Seal { pcr, secret: vec![1] }, Owner::Usable), Ok(()));
+		assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr, nonce: vec![] }, Owner::Usable), Ok(()));
 	}
-	assert_eq!(admit(Grant::Tpm, &Op::PcrRead { pcr: 24 }, true), Err(Refusal::PcrNotAllowed), "there is no PCR 24");
-	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 24, secret: vec![1] }, true), Err(Refusal::PcrNotAllowed));
-	assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr: 99, nonce: vec![] }, true), Err(Refusal::PcrNotAllowed));
+	assert_eq!(admit(Grant::Tpm, &Op::PcrRead { pcr: 24 }, Owner::Usable), Err(Refusal::PcrNotAllowed), "there is no PCR 24");
+	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 24, secret: vec![1] }, Owner::Usable), Err(Refusal::PcrNotAllowed));
+	assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr: 99, nonce: vec![] }, Owner::Usable), Err(Refusal::PcrNotAllowed));
 }
 
 #[test]
 fn the_bounds_are_the_contracts() {
-	assert_eq!(admit(Grant::Tpm, &Op::Random { count: MAX_RANDOM }, true), Ok(()));
-	assert_eq!(admit(Grant::Tpm, &Op::Random { count: MAX_RANDOM + 1 }, true), Err(Refusal::Bounds));
-	assert_eq!(admit(Grant::Tpm, &Op::Random { count: 0 }, true), Err(Refusal::Bounds));
-	assert_eq!(admit(Grant::Measure, &Op::PcrExtend { pcr: 23, digest: vec![0; 31] }, true), Err(Refusal::Bounds), "a digest is SHA-256's thirty-two bytes");
-	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![1; MAX_SECRET] }, true), Ok(()));
-	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![1; MAX_SECRET + 1] }, true), Err(Refusal::Bounds), "ninety-six bytes: the library's 128 less the tag");
-	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![] }, true), Err(Refusal::Bounds));
-	assert_eq!(admit(Grant::Seal, &Op::Unseal { sealed: vec![0; MAX_SEALED + 1] }, true), Err(Refusal::Bounds));
-	assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr: 16, nonce: vec![0; MAX_NONCE] }, true), Ok(()));
-	assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr: 16, nonce: vec![0; MAX_NONCE + 1] }, true), Err(Refusal::Bounds));
+	assert_eq!(admit(Grant::Tpm, &Op::Random { count: MAX_RANDOM }, Owner::Usable), Ok(()));
+	assert_eq!(admit(Grant::Tpm, &Op::Random { count: MAX_RANDOM + 1 }, Owner::Usable), Err(Refusal::Bounds));
+	assert_eq!(admit(Grant::Tpm, &Op::Random { count: 0 }, Owner::Usable), Err(Refusal::Bounds));
+	assert_eq!(admit(Grant::Measure, &Op::PcrExtend { pcr: 23, digest: vec![0; 31] }, Owner::Usable), Err(Refusal::Bounds), "a digest is SHA-256's thirty-two bytes");
+	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![1; MAX_SECRET] }, Owner::Usable), Ok(()));
+	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![1; MAX_SECRET + 1] }, Owner::Usable), Err(Refusal::Bounds), "ninety-six bytes: the library's 128 less the tag");
+	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![] }, Owner::Usable), Err(Refusal::Bounds));
+	assert_eq!(admit(Grant::Seal, &Op::Unseal { sealed: vec![0; MAX_SEALED + 1] }, Owner::Usable), Err(Refusal::Bounds));
+	assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr: 16, nonce: vec![0; MAX_NONCE] }, Owner::Usable), Ok(()));
+	assert_eq!(admit(Grant::Tpm, &Op::Quote { pcr: 16, nonce: vec![0; MAX_NONCE + 1] }, Owner::Usable), Err(Refusal::Bounds));
 	assert_eq!(MAX_SECRET, 96);
 }
 
 #[test]
 fn a_provisioned_owner_hierarchy_refuses_seal_unseal_and_quote_and_nothing_else() {
 	for (grant, op) in [(Grant::Seal, Op::Seal { pcr: 16, secret: vec![1] }), (Grant::Seal, Op::Unseal { sealed: vec![1] }), (Grant::Tpm, Op::Quote { pcr: 16, nonce: vec![] })] {
-		assert_eq!(admit(grant, &op, false), Err(Refusal::OwnerHierarchyUnavailable), "{op:?}");
+		assert_eq!(admit(grant, &op, Owner::Unusable), Err(Refusal::OwnerHierarchyUnavailable), "{op:?}");
 	}
 	for (grant, op) in [
 		(Grant::Tpm, Op::Info),
@@ -78,9 +78,24 @@ fn a_provisioned_owner_hierarchy_refuses_seal_unseal_and_quote_and_nothing_else(
 		(Grant::Tpm, Op::PcrRead { pcr: 0 }),
 		(Grant::Measure, Op::PcrExtend { pcr: 16, digest: vec![0; 32] }),
 	] {
-		assert_eq!(admit(grant, &op, false), Ok(()), "{op:?} keeps working");
+		assert_eq!(admit(grant, &op, Owner::Unusable), Ok(()), "{op:?} keeps working");
 	}
-	assert_eq!(admit(Grant::Tpm, &Op::Seal { pcr: 16, secret: vec![1] }, false), Err(Refusal::NotGranted), "the grant is told first");
+	assert_eq!(admit(Grant::Tpm, &Op::Seal { pcr: 16, secret: vec![1] }, Owner::Unusable), Err(Refusal::NotGranted), "the grant is told first");
+}
+
+#[test]
+fn with_no_tpm_served_a_call_that_needs_the_owner_is_unavailable_and_not_told_to_clear_the_tpm() {
+	// NOTHING IS KNOWN OF AN OWNER HIERARCHY WHEN NO TPM IS SERVED: seal, unseal and quote pass admission, and
+	// the queue - which has no provider - answers `unavailable`, which a caller waiting for the TPM retries on.
+	// `owner-hierarchy-unavailable` would tell it the only remedy is a TPM clear.
+	let mut queue: Queue<u32> = Queue::default();
+	for (grant, op) in [(Grant::Seal, Op::Seal { pcr: 16, secret: vec![1] }), (Grant::Seal, Op::Unseal { sealed: vec![1] }), (Grant::Tpm, Op::Quote { pcr: 16, nonce: vec![] })] {
+		assert_eq!(admit(grant, &op, Owner::Unknown), Ok(()), "{op:?}");
+		assert!(matches!(queue.submit(1, 7, op).as_slice(), [Effect::Refuse(_, Refusal::Unavailable)]));
+	}
+	// The grant and the bounds are still told first.
+	assert_eq!(admit(Grant::Tpm, &Op::Seal { pcr: 16, secret: vec![1] }, Owner::Unknown), Err(Refusal::NotGranted));
+	assert_eq!(admit(Grant::Seal, &Op::Seal { pcr: 16, secret: vec![] }, Owner::Unknown), Err(Refusal::Bounds));
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! STORES and not only which fragment won.
 
 use crate::Outcome;
-use crate::harness::{Plan, close, quad_at_depth, render};
+use crate::harness::{Plan, close, depth_is, quad_at_depth, render};
 use alloc::vec;
 use render3d::depth::{CompareOp, DepthFormat, StencilFace, StencilOp, Stored};
 
@@ -79,7 +79,7 @@ pub fn depth_compare_ops() -> Outcome {
 		let first = quad_at_depth(0.5, 1.0, 0.0, 0.0);
 		let plan = Plan { depth_test: Some(CompareOp::Always), depth_write: true, count: 6, ..Plan::default() };
 		let frame = render(&first, &plan)?;
-		require!(close(frame.depth_at(frame.centre().0, frame.centre().1), 0.5), "the first draw leaves the buffer at its own depth");
+		require!(depth_is(&frame, frame.centre().0, frame.centre().1, 0.5), "the first draw leaves the buffer at its own depth: {}", frame.depth_at(frame.centre().0, frame.centre().1));
 
 		// The second draw is at the same depth, so the comparison is the whole of the answer.
 		let second = quad_at_depth(0.5, 0.0, 1.0, 0.0);
@@ -112,11 +112,11 @@ pub fn depth_write() -> Outcome {
 	let frame = render_two(&first, &second, &no_write)?;
 	let (x, y) = frame.centre();
 	require!(close(frame.pixel(x, y).y, 1.0), "the nearer fragment passed the test and was drawn");
-	require!(close(frame.depth_at(x, y), 0.5), "and the buffer still holds what the first draw left: {}", frame.depth_at(x, y));
+	require!(depth_is(&frame, x, y, 0.5), "and the buffer still holds what the first draw left: {}", frame.depth_at(x, y));
 
 	let with_write = Plan { depth_write: true, ..no_write };
 	let frame = render_two(&first, &second, &with_write)?;
-	require!(close(frame.depth_at(x, y), 0.25), "and with the write on it holds the nearer depth: {}", frame.depth_at(x, y));
+	require!(depth_is(&frame, x, y, 0.25), "and with the write on it holds the nearer depth: {}", frame.depth_at(x, y));
 	Ok(())
 }
 

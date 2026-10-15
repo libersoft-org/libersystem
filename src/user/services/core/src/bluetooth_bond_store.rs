@@ -369,8 +369,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	send_blocking(bootstrap, b"BluetoothBondStore: online", 0);
 
 	// 3. serve the one capability until its holder goes.
+	//
+	// THE REPLY HOLDS THE WHOLE STORE, because `list` answers in one reply: sixty-four records without their keys,
+	// at most 148 bytes each at the wire's bounds, and seven bytes of header - 9 479 bytes, which bluetooth-proto's
+	// own test measures through the generated dispatch. One kibibyte held six; past them the dispatch answered
+	// `again` for good, and BluetoothService read every bond - trust, reconnection, the no-downgrade checks - as none.
 	let mut request: [u8; 1024] = [0u8; 1024];
-	let mut reply: [u8; 1024] = [0u8; 1024];
+	let mut reply = alloc::vec![0u8; 10 * 1024];
 	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { bluetooth_bond_store::dispatch(&mut bonds, req, handle, out, reply_handle) });
 	exit();
 }

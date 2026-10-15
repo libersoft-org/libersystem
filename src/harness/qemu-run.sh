@@ -1211,8 +1211,10 @@ qemu_attach_xhci() {
 	#
 	# `usb-net` is QEMU's CDC-ECM device: the two-interface shape the specification describes, with
 	# the data interface's endpoints on alternate setting one and a MAC published as a string
-	# descriptor. It is the only Ethernet-over-USB model this harness has, which is also why the NCM
-	# half of that driver is host tests and no binding path.
+	# descriptor. It is QEMU's only Ethernet-over-USB model, so the NCM half of that driver is proved
+	# against a host gadget instead - `USB_GADGET=ncm`, the host kernel's own `usb_f_ncm` - and a run
+	# that builds one leaves this adapter OFF the bus (`USB_QEMU_NET=off`): the driver binds one
+	# adapter, and this one, on hub port 1.3, is enumerated before a gadget on 1.6.
 	#
 	# TEST MODE ONLY, AND THAT IS A GATE'S REQUIREMENT RATHER THAN A PREFERENCE. An interactive
 	# machine with two NICs is a machine where which one NetworkService took is a question nothing
@@ -1222,10 +1224,12 @@ qemu_attach_xhci() {
 	# `trusted-untranslated` and would be admitted, so attaching it there would give that machine a
 	# link and take the gate's subject away.
 	if [[ "$with_net" == "1" ]]; then
-		arr+=(
-			-netdev "user,id=usbnet"
-			-device "usb-net,bus=usb.0,port=1.3,netdev=usbnet"
-		)
+		if [[ "${USB_QEMU_NET:-on}" != off ]]; then
+			arr+=(
+				-netdev "user,id=usbnet"
+				-device "usb-net,bus=usb.0,port=1.3,netdev=usbnet"
+			)
+		fi
 		# AND A UAS DEVICE, WHICH NOTHING BINDS YET AND WHICH IS THERE TO BE READ. The UAS item says
 		# the cheap check is to attach the device and read its pipe-usage and endpoint-companion
 		# descriptors BEFORE writing a transfer path, because whether this controller can drive it

@@ -1,0 +1,13 @@
+# Authored by `src/tools/font-gen` with the rest of the conformance corpus. This face is
+# staged into NO image: the kernel's text conformance test installs it, and this
+# declaration beside it, into the font directory of the volume it runs against, so the
+# guest run reaches it through the catalogue as an application would. Regenerate with
+#   cargo run --manifest-path src/tools/font-gen/Cargo.toml
+family = LiberSystem Conformance Complex
+style = Regular
+format = truetype-glyf
+face-index = 0
+weight = 400
+width = normal
+slant = upright
+digest = a889378f26716cdd164d55a758fc3439ef037eecf4f4e8e075a14b8182021570

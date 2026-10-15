@@ -103,9 +103,12 @@ enum Purpose {
 	Pin { grant: u32, corr: u32 },
 	Identity { grant: u32, corr: u32 },
 	Activate,
-	Deactivate { grant: u32, corr: u32 },
-	// A deactivation nobody asked for: after an installation failed, or when the context's owner, its
-	// grant or its link went away.
+	// A deactivation, and the grant and correlation to answer - none once that grant has been retired:
+	// the deactivation still settles the context, only its answer has nobody to go to.
+	Deactivate { caller: Option<(u32, u32)> },
+	// A state change nobody is waiting for: a deactivation after an installation failed, or when the
+	// context's owner, its grant or its link went away - and a retired grant's PIN or PUK attempt. Its
+	// outcome, when it is unknown, is reconciled by a query all the same.
 	Cleanup,
 	// A read-only query that reconciles an unknown outcome.
 	Reconcile,
@@ -753,7 +756,7 @@ impl Service {
 				self.answer(grant, corr, result, |identity, w| identity.write(w));
 			}
 			Purpose::Activate => self.activated(key, done, payload.and_then(|answer| answer.config)),
-			Purpose::Deactivate { grant, corr } => self.deactivated(done, Some((grant, corr))),
+			Purpose::Deactivate { caller } => self.deactivated(done, caller),
 			Purpose::Cleanup => {
 				if done.result == mc::Outcome::OutcomeUnknown {
 					self.reconcile(key);
@@ -962,7 +965,7 @@ impl Service {
 			return Err(Error::Again);
 		}
 		let (key, sim_generation) = (context.modem, context.sim_generation);
-		self.submit(key, mc::Kind::Deactivate, Purpose::Deactivate { grant, corr }, sim_generation, false, "").map_err(Refused::error)?;
+		self.submit(key, mc::Kind::Deactivate, Purpose::Deactivate { caller: Some((grant, corr)) }, sim_generation, false, "").map_err(Refused::error)?;
 		if let Some(context) = self.context.as_mut() {
 			context.stage = Stage::Deactivating;
 		}
@@ -1226,7 +1229,24 @@ impl Service {
 		let grant = self.grants.remove(at);
 		close(grant.chan);
 		close(grant.owner);
-		self.calls.retain(|call| !matches!(call.purpose, Purpose::Attempts { grant, .. } | Purpose::BeforePin { grant, .. } | Purpose::Pin { grant, .. } | Purpose::Identity { grant, .. } | Purpose::Deactivate { grant, .. } if grant == id));
+		// A COMMAND THAT CHANGES THE MODEM'S STATE OUTLIVES THE GRANT THAT ISSUED IT. It is in flight at
+		// the modem, and its outcome - an unknown one above all - has to be settled whoever is left to tell:
+		// a PIN or PUK becomes a cleanup, whose unknown outcome is reconciled by a query, and a deactivation
+		// keeps its effect on the context and loses only its answer. They used to be dropped here, so an
+		// expiry completed to nobody, no query was ever sent, and the modem refused every state change -
+		// every data activation included - as `again` until some management client happened to query it.
+		for call in self.calls.iter_mut() {
+			let settled = match &call.purpose {
+				Purpose::Pin { grant, .. } => (*grant == id).then_some(Purpose::Cleanup),
+				Purpose::Deactivate { caller: Some((grant, _)) } => (*grant == id).then_some(Purpose::Deactivate { caller: None }),
+				_ => None,
+			};
+			if let Some(purpose) = settled {
+				call.purpose = purpose;
+			}
+		}
+		// What only reads goes with the grant: nobody is left to answer, and nothing it does needs settling.
+		self.calls.retain(|call| !matches!(call.purpose, Purpose::Attempts { grant, .. } | Purpose::BeforePin { grant, .. } | Purpose::Identity { grant, .. } if grant == id));
 	}
 }
 

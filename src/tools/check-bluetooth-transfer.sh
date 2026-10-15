@@ -11,12 +11,14 @@
 #
 # WHAT IS ASSERTED:
 #
-#   nobody waiting       a push the phone tries while no receiver waits is refused at this host's door
+#   nobody waiting       this host's records offer no Object Push while no receiver waits, and a push the phone tries
+#                          anyway is refused at this host's door
 #   sending, L2CAP       `btctl send PHONE big.txt < big.txt` - a 5 KiB file the shell read - reaches the phone over its
 #                          GOEP L2CAP channel in enhanced retransmission mode, its size and its digest the phone's
 #   sending, RFCOMM      the same file to the serial device, whose record offers RFCOMM alone: the same size and digest
-#   receiving            `btctl receive PHONE 8192 > note.txt` takes the phone's 3100-byte push, names it on its
-#                          diagnostics, and the file holds all of it - a hundred numbered lines, the last the hundredth
+#   receiving            while `btctl receive PHONE 8192 > note.txt` waits, the phone's search finds the Object Push
+#                          record; the receiver takes the phone's 3100-byte push, names it on its diagnostics, and the
+#                          file holds all of it - a hundred numbered lines, the last the hundredth
 #   the bound            `btctl receive PHONE 1000` refuses the same push before a byte of it, and says so
 #   a held tether        `btctl connect PHONE pan` brings BNEP up, and NetworkService - on its own NIC - holds the link
 #                          unselected: no lease is asked of the phone
@@ -98,6 +100,7 @@ expect "sent \"big.txt\", $size bytes, to $phone bredr" "btctl must report the p
 expect "sent \"big.txt\", $size bytes, to $serial bredr" "btctl must report the serial device's push with the file's size"
 echo "bluetooth-transfer: the $size-byte file reached the phone over L2CAP and the serial device over RFCOMM, digest ${over_l2cap##* digest } both times"
 
+expect "bt-fixture: sdp phone found 1 records for 0x1105" "this host must offer its Object Push record while a receiver waits"
 expect "btctl: receiving \"fixture-note.txt\" from $phone bredr: 3100 bytes, type \"text/plain\"" "the receiver must name the object as the phone gave it"
 expect "btctl: received 3100 bytes" "the receiver must take the whole object"
 grep -aqE '^[0-9]+ [0-9]+ 3100 [0-9]+ [^ ]*note\.txt' "$lines" || fail "the file the redirection wrote must hold the whole object: wc did not count 3100 bytes"

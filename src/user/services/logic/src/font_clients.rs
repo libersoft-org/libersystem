@@ -70,6 +70,14 @@ impl Endpoints {
 		Ok(())
 	}
 
+	/// A subscription that could not be opened after all, or whose stream's reader went: the connection keeps its
+	/// place and may subscribe again.
+	pub fn unsubscribe(&mut self, slot: usize) {
+		if let Some(subscribed) = self.subscribed.get_mut(slot) {
+			*subscribed = false;
+		}
+	}
+
 	/// A connection went. Its place AND its subscription come back on the same event.
 	pub fn disconnect(&mut self, slot: usize) -> Result<(), Refusal> {
 		if !self.live.get(slot).copied().unwrap_or(false) {

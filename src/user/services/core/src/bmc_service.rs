@@ -30,7 +30,8 @@ use ipc_client::ChannelTransport;
 use proto::generated::liber::bmc::v1 as bmc;
 use proto::system::{Error, ProviderInfo, ProviderKind, ShutdownAction, provider_catalogue, shutdown_notice, supervisor};
 use rt::*;
-use wire::Handles;
+use service_logic::provider_retry::{Next, ProviderRetry};
+use wire::{Handles, Transport, TransportError};
 
 include!(concat!(env!("OUT_DIR"), "/roles_bmc_service.rs"));
 
@@ -91,10 +92,78 @@ struct Service {
 	next_status: u64,
 	// The name a follow request named, as the generated decoder handed it over.
 	follow_name: Option<String>,
+	// THE PUBLICATIONS THAT DID NOT OPEN, asked again later rather than never. A provider admits one consumer, and a
+	// restarted instance's `open` can land while the driver has not yet seen its predecessor's connection close - which
+	// it notices only when it next waits, after whatever request it is serving against a slow BMC. Refused then, it was
+	// never adopted at all: no boot or shutdown event and no `bmc` view for the instance's whole life.
+	unopened: ProviderRetry<ProviderInfo>,
 }
 
-fn provider(chan: u64, ticks: u64) -> bmc::ipmi_provider::Client<ChannelTransport> {
-	bmc::ipmi_provider::Client::with_deadline(ChannelTransport { chan }, clock() + ticks)
+// ONE BINDING'S CALLS, EACH UNDER A CORRELATION OF ITS OWN.
+//
+// Every call here builds a fresh generated client, and a generated client's correlations start at zero - so on a
+// binding's one long-lived request channel, a reply that arrived after its call had given up was taken as the NEXT
+// call's answer: the same operation's reply accepted though stale, another's failing to decode, and every later call
+// reading its predecessor's until the binding went. One expired call was enough, and a silent BMC - each of its
+// transactions answered only after seconds, by a driver that serves one request at a time - expires one. So each
+// request is stamped with this service's next correlation, a reply carrying any other is a late one and is
+// discarded with what it carried, and the caller's own correlation is put back for its decoder.
+struct Stamped {
+	chan: u64,
+}
+
+static NEXT_CORR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+fn next_corr() -> u32 {
+	loop {
+		let corr = NEXT_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+		if corr != 0 {
+			return corr;
+		}
+	}
+}
+
+impl Transport for Stamped {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
+		if request.len() < 6 {
+			return Err(TransportError::SendRefused);
+		}
+		let mut stamped = request.to_vec();
+		let mut asked = [0u8; 4];
+		asked.copy_from_slice(&stamped[2..6]);
+		let ours = next_corr().to_le_bytes();
+		stamped[2..6].copy_from_slice(&ours);
+		if !send_caps_blocking(self.chan, &stamped, request_handles) {
+			return Err(TransportError::SendRefused);
+		}
+		loop {
+			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+				ReceivedVecCaps::Message { mut bytes } => {
+					if bytes.len() >= 4 && bytes[..4] == ours {
+						bytes[..4].copy_from_slice(&asked);
+						return Ok(bytes);
+					}
+					self.discard_handles(reply_handles.as_slice());
+					reply_handles.clear();
+				}
+				ReceivedVecCaps::Closed => return Err(TransportError::PeerClosed),
+				ReceivedVecCaps::Failed => return Err(TransportError::ReceiveFailed),
+				ReceivedVecCaps::TimedOut => return Err(TransportError::TimedOut),
+			}
+		}
+	}
+
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			if handle != 0 {
+				close(handle);
+			}
+		}
+	}
+}
+
+fn provider(chan: u64, ticks: u64) -> bmc::ipmi_provider::Client<Stamped> {
+	bmc::ipmi_provider::Client::with_deadline(Stamped { chan }, clock() + ticks)
 }
 
 impl Service {
@@ -116,7 +185,8 @@ impl Service {
 		members.iter().copied().find(|&at| self.bindings[at].described.available).or_else(|| members.first().copied())
 	}
 
-	fn adopt(&mut self, info: ProviderInfo) {
+	// `attempts` is how many times this publication was asked before, 0 the first time.
+	fn adopt(&mut self, info: ProviderInfo, attempts: u32) {
 		if self.bindings.len() >= MAX_BINDINGS {
 			say("an ipmi provider was refused: this service holds eight");
 			return;
@@ -125,12 +195,12 @@ impl Service {
 			return;
 		}
 		let Some(Ok(chan)) = provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(&info) else {
-			say("a published ipmi provider could not be opened");
+			self.unopened(info, attempts, "could not be opened");
 			return;
 		};
 		let Some(Ok(described)) = provider(chan, QUICK_TICKS).describe() else {
-			say("an ipmi provider did not describe itself");
 			close(chan);
+			self.unopened(info, attempts, "did not describe itself");
 			return;
 		};
 		let changes = provider(chan, QUICK_TICKS).changes().unwrap_or(0);
@@ -149,7 +219,18 @@ impl Service {
 		}
 	}
 
+	// A PUBLICATION THAT DID NOT OPEN, or did not describe itself, is asked again at one, two, four ... seconds - a bounded
+	// number of times, and never once it is withdrawn.
+	fn unopened(&mut self, info: ProviderInfo, attempts: u32, what: &str) {
+		match self.unopened.failed(info, attempts, clock()) {
+			Next::At(_) if attempts == 0 => say(&format!("a published ipmi provider {what} - it is asked again")),
+			Next::At(_) => {}
+			Next::GivenUp => say(&format!("a published ipmi provider {what} after every retry - it is not held")),
+		}
+	}
+
 	fn withdraw(&mut self, info: &ProviderInfo) {
+		self.unopened.withdraw(|pending| pending.slot == info.slot && pending.provider_generation == info.provider_generation);
 		if let Some(at) = self.bindings.iter().position(|binding| binding.info.slot == info.slot && binding.info.provider_generation == info.provider_generation && binding.info.binding_generation == info.binding_generation) {
 			let binding = self.bindings.remove(at);
 			close(binding.chan);
@@ -286,7 +367,7 @@ impl ToolView<'_> {
 		self.service.primary(name).map(|at| self.service.bindings[at].chan).ok_or(Error::NotFound)
 	}
 
-	fn forward<T>(&self, name: &str, ticks: u64, call: impl FnOnce(&mut bmc::ipmi_provider::Client<ChannelTransport>) -> Option<Result<T, Error>>) -> Result<T, Error> {
+	fn forward<T>(&self, name: &str, ticks: u64, call: impl FnOnce(&mut bmc::ipmi_provider::Client<Stamped>) -> Option<Result<T, Error>>) -> Result<T, Error> {
 		let chan = self.binding(name)?;
 		call(&mut provider(chan, ticks)).unwrap_or(Err(Error::TimedOut))
 	}
@@ -395,7 +476,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let (catalogue, status, root) = (roles[0], roles[1], roles[2]);
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Ipmi).unwrap_or(0) } else { 0 };
-	let mut service = Service { catalogue, bindings: Vec::new(), followers: Vec::new(), status, may_write_boot: true, settled: false, status_refused: false, booted: Vec::new(), next_status: clock(), follow_name: None };
+	let mut service = Service { catalogue, bindings: Vec::new(), followers: Vec::new(), status, may_write_boot: true, settled: false, status_refused: false, booted: Vec::new(), next_status: clock(), follow_name: None, unopened: ProviderRetry::new(TICKS_PER_SECOND) };
 	print(b"BmcService: online\n");
 	send_blocking(bootstrap, b"BmcService: online", 0);
 
@@ -420,10 +501,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				service.follow_poll(at);
 			}
 		}
+		for (info, attempts) in service.unopened.due(clock()) {
+			service.adopt(info, attempts);
+		}
 		let mut due = service.followers.iter().map(|follower| follower.next).min().unwrap_or(u64::MAX);
 		if !service.settled && service.status != 0 {
 			due = due.min(service.next_status);
 		}
+		due = due.min(service.unopened.next_deadline().unwrap_or(u64::MAX));
 		timer_set(timer, due);
 		let mut waitset: Vec<u64> = alloc::vec![timer];
 		if control != 0 {
@@ -463,7 +548,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let mut frame_handles = Handles::new();
 				let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else { continue };
 				if info.live {
-					service.adopt(info);
+					service.adopt(info, 0);
 				} else {
 					service.withdraw(&info);
 				}

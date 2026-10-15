@@ -4161,6 +4161,9 @@ impl ZoneCooling {
 pub struct ZoneReading {
 	pub temperature: u32,
 	pub sequence: u32,
+	/// The zone said its trip points changed - `Notify(0x81)` - since the last reading: `describe` answers the new ones,
+	/// and a policy that judged this reading against the old ones would be following trips the zone no longer has.
+	pub trips_changed: bool,
 }
 
 impl ZoneReading {
@@ -4201,12 +4204,14 @@ impl ZoneReading {
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.temperature)?;
 		w.u32(self.sequence)?;
+		w.boolean(self.trips_changed)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ZoneReading> {
 		let temperature = r.u32()?;
 		let sequence = r.u32()?;
-		Some(ZoneReading { temperature, sequence })
+		let trips_changed = r.boolean()?;
+		Some(ZoneReading { temperature, sequence, trips_changed })
 	}
 }
 
@@ -5388,6 +5393,8 @@ pub struct ZonePower {
 	pub hot: Option<u32>,
 	pub passive_engaged: bool,
 	pub cap_percent: u32,
+	/// Its `_ACx` trips: the temperature of each, and the fans it lists - the trips the fans and the curve act on.
+	pub active: Vec<ActiveTrip>,
 }
 
 impl ZonePower {
@@ -5457,12 +5464,19 @@ impl ZonePower {
 		}
 		w.boolean(self.passive_engaged)?;
 		w.u32(self.cap_percent)?;
+		if self.active.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.active.len() as u16)?;
+		for v84 in self.active.iter() {
+			v84.write(w)?;
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ZonePower> {
 		let zone = {
-			let v84 = r.string_lp()?;
-			(v84.len() <= 64).then_some(v84)?
+			let v85 = r.string_lp()?;
+			(v85.len() <= 64).then_some(v85)?
 		};
 		let temperature = r.u32()?;
 		let passive = if r.tag()? { Some(r.u32()?) } else { None };
@@ -5470,7 +5484,17 @@ impl ZonePower {
 		let hot = if r.tag()? { Some(r.u32()?) } else { None };
 		let passive_engaged = r.boolean()?;
 		let cap_percent = r.u32()?;
-		Some(ZonePower { zone, temperature, passive, critical, hot, passive_engaged, cap_percent })
+		let active = {
+			let v86 = r.u16()? as usize;
+			let v86 = (v86 <= 10).then_some(v86)?;
+			let mut v87 = Vec::new();
+			v87.try_reserve_exact(v86).ok()?;
+			for _ in 0..v86 {
+				v87.push(ActiveTrip::read(r)?);
+			}
+			v87
+		};
+		Some(ZonePower { zone, temperature, passive, critical, hot, passive_engaged, cap_percent, active })
 	}
 }
 
@@ -5526,27 +5550,27 @@ impl FanPower {
 			return None;
 		}
 		w.u16(self.curve.len() as u16)?;
-		for v85 in self.curve.iter() {
-			v85.write(w)?;
+		for v88 in self.curve.iter() {
+			v88.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<FanPower> {
 		let path = {
-			let v86 = r.string_lp()?;
-			(v86.len() <= 64).then_some(v86)?
+			let v89 = r.string_lp()?;
+			(v89.len() <= 64).then_some(v89)?
 		};
 		let control = r.u32()?;
 		let speed_rpm = r.u32()?;
 		let curve = {
-			let v87 = r.u16()? as usize;
-			let v87 = (v87 <= 8).then_some(v87)?;
-			let mut v88 = Vec::new();
-			v88.try_reserve_exact(v87).ok()?;
-			for _ in 0..v87 {
-				v88.push(CurvePoint::read(r)?);
+			let v90 = r.u16()? as usize;
+			let v90 = (v90 <= 8).then_some(v90)?;
+			let mut v91 = Vec::new();
+			v91.try_reserve_exact(v90).ok()?;
+			for _ in 0..v90 {
+				v91.push(CurvePoint::read(r)?);
 			}
-			v88
+			v91
 		};
 		Some(FanPower { path, control, speed_rpm, curve })
 	}
@@ -5604,60 +5628,60 @@ impl ProcessorPowerStatus {
 			return None;
 		}
 		w.u16(self.cores.len() as u16)?;
-		for v89 in self.cores.iter() {
-			v89.write(w)?;
+		for v92 in self.cores.iter() {
+			v92.write(w)?;
 		}
 		if self.zones.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.zones.len() as u16)?;
-		for v90 in self.zones.iter() {
-			v90.write(w)?;
+		for v93 in self.zones.iter() {
+			v93.write(w)?;
 		}
 		if self.fans.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.fans.len() as u16)?;
-		for v91 in self.fans.iter() {
-			v91.write(w)?;
+		for v94 in self.fans.iter() {
+			v94.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ProcessorPowerStatus> {
 		let profile = PowerProfile::read(r)?;
 		let because = {
-			let v92 = r.string_lp()?;
-			(v92.len() <= 64).then_some(v92)?
+			let v95 = r.string_lp()?;
+			(v95.len() <= 64).then_some(v95)?
 		};
 		let cores = {
-			let v93 = r.u16()? as usize;
-			let v93 = (v93 <= 64).then_some(v93)?;
-			let mut v94 = Vec::new();
-			v94.try_reserve_exact(v93).ok()?;
-			for _ in 0..v93 {
-				v94.push(CorePower::read(r)?);
+			let v96 = r.u16()? as usize;
+			let v96 = (v96 <= 64).then_some(v96)?;
+			let mut v97 = Vec::new();
+			v97.try_reserve_exact(v96).ok()?;
+			for _ in 0..v96 {
+				v97.push(CorePower::read(r)?);
 			}
-			v94
+			v97
 		};
 		let zones = {
-			let v95 = r.u16()? as usize;
-			let v95 = (v95 <= 16).then_some(v95)?;
-			let mut v96 = Vec::new();
-			v96.try_reserve_exact(v95).ok()?;
-			for _ in 0..v95 {
-				v96.push(ZonePower::read(r)?);
+			let v98 = r.u16()? as usize;
+			let v98 = (v98 <= 16).then_some(v98)?;
+			let mut v99 = Vec::new();
+			v99.try_reserve_exact(v98).ok()?;
+			for _ in 0..v98 {
+				v99.push(ZonePower::read(r)?);
 			}
-			v96
+			v99
 		};
 		let fans = {
-			let v97 = r.u16()? as usize;
-			let v97 = (v97 <= 16).then_some(v97)?;
-			let mut v98 = Vec::new();
-			v98.try_reserve_exact(v97).ok()?;
-			for _ in 0..v97 {
-				v98.push(FanPower::read(r)?);
+			let v100 = r.u16()? as usize;
+			let v100 = (v100 <= 16).then_some(v100)?;
+			let mut v101 = Vec::new();
+			v101.try_reserve_exact(v100).ok()?;
+			for _ in 0..v100 {
+				v101.push(FanPower::read(r)?);
 			}
-			v98
+			v101
 		};
 		Some(ProcessorPowerStatus { profile, because, cores, zones, fans })
 	}
@@ -5710,13 +5734,13 @@ pub mod processor_power_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v99) => {
+						Ok(v102) => {
 							w.u8(1)?;
-							v99.write(w)?;
+							v102.write(w)?;
 						}
-						Err(v100) => {
+						Err(v103) => {
 							w.u8(0)?;
-							v100.write(w)?;
+							v103.write(w)?;
 						}
 					}
 					Some(())
@@ -5747,12 +5771,12 @@ pub mod processor_power_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v101) => {
+						Ok(v104) => {
 							w.u8(1)?;
 						}
-						Err(v102) => {
+						Err(v105) => {
 							w.u8(0)?;
-							v102.write(w)?;
+							v105.write(w)?;
 						}
 					}
 					Some(())
@@ -5776,18 +5800,18 @@ pub mod processor_power_admin {
 			}
 			OP_SET_FAN_CURVE => {
 				let fan = {
-					let v103 = r.string_lp()?;
-					(v103.len() <= 64).then_some(v103)?
+					let v106 = r.string_lp()?;
+					(v106.len() <= 64).then_some(v106)?
 				};
 				let curve = {
-					let v104 = r.u16()? as usize;
-					let v104 = (v104 <= 8).then_some(v104)?;
-					let mut v105 = Vec::new();
-					v105.try_reserve_exact(v104).ok()?;
-					for _ in 0..v104 {
-						v105.push(CurvePoint::read(r)?);
+					let v107 = r.u16()? as usize;
+					let v107 = (v107 <= 8).then_some(v107)?;
+					let mut v108 = Vec::new();
+					v108.try_reserve_exact(v107).ok()?;
+					for _ in 0..v107 {
+						v108.push(CurvePoint::read(r)?);
 					}
-					v105
+					v108
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -5796,12 +5820,12 @@ pub mod processor_power_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v106) => {
+						Ok(v109) => {
 							w.u8(1)?;
 						}
-						Err(v107) => {
+						Err(v110) => {
 							w.u8(0)?;
-							v107.write(w)?;
+							v110.write(w)?;
 						}
 					}
 					Some(())
@@ -5983,8 +6007,8 @@ pub mod processor_power_admin {
 				return None;
 			}
 			w.u16(curve.len() as u16)?;
-			for v108 in curve.iter() {
-				v108.write(w)?;
+			for v111 in curve.iter() {
+				v111.write(w)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -6929,25 +6953,25 @@ impl SourceState {
 		out.push(',');
 		out.push_str("\"trips\":");
 		out.push('[');
-		let mut v110 = true;
-		for v109 in self.trips.iter() {
-			if !v110 {
+		let mut v113 = true;
+		for v112 in self.trips.iter() {
+			if !v113 {
 				out.push(',');
 			}
-			v110 = false;
-			v109.to_json_into(out);
+			v113 = false;
+			v112.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"alarms\":");
 		out.push('[');
-		let mut v112 = true;
-		for v111 in self.alarms.iter() {
-			if !v112 {
+		let mut v115 = true;
+		for v114 in self.alarms.iter() {
+			if !v115 {
 				out.push(',');
 			}
-			v112 = false;
-			v111.to_json_into(out);
+			v115 = false;
+			v114.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -6956,8 +6980,8 @@ impl SourceState {
 		out.push(',');
 		out.push_str("\"source-time\":");
 		match &self.source_time {
-			Some(v113) => {
-				let _ = write!(out, "{}", v113);
+			Some(v116) => {
+				let _ = write!(out, "{}", v116);
 			}
 			None => {
 				out.push_str("null");
@@ -7011,25 +7035,25 @@ impl SourceState {
 		out.push_str(", ");
 		out.push_str("trips=");
 		out.push('[');
-		let mut v115 = true;
-		for v114 in self.trips.iter() {
-			if !v115 {
+		let mut v118 = true;
+		for v117 in self.trips.iter() {
+			if !v118 {
 				out.push_str(", ");
 			}
-			v115 = false;
-			v114.to_text_into(out);
+			v118 = false;
+			v117.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("alarms=");
 		out.push('[');
-		let mut v117 = true;
-		for v116 in self.alarms.iter() {
-			if !v117 {
+		let mut v120 = true;
+		for v119 in self.alarms.iter() {
+			if !v120 {
 				out.push_str(", ");
 			}
-			v117 = false;
-			v116.to_text_into(out);
+			v120 = false;
+			v119.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -7038,8 +7062,8 @@ impl SourceState {
 		out.push_str(", ");
 		out.push_str("source-time=");
 		match &self.source_time {
-			Some(v118) => {
-				let _ = write!(out, "{}", v118);
+			Some(v121) => {
+				let _ = write!(out, "{}", v121);
 			}
 			None => {
 				out.push('-');
@@ -7079,20 +7103,20 @@ impl SourceState {
 		self.temperature.to_cbor_into(out);
 		crate::codec::cbor::text(out, "trips");
 		crate::codec::cbor::array(out, self.trips.len());
-		for v119 in self.trips.iter() {
-			v119.to_cbor_into(out);
+		for v122 in self.trips.iter() {
+			v122.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "alarms");
 		crate::codec::cbor::array(out, self.alarms.len());
-		for v120 in self.alarms.iter() {
-			v120.to_cbor_into(out);
+		for v123 in self.alarms.iter() {
+			v123.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "controls");
 		self.controls.to_cbor_into(out);
 		crate::codec::cbor::text(out, "source-time");
 		match &self.source_time {
-			Some(v121) => {
-				crate::codec::cbor::uint(out, *v121 as u64);
+			Some(v124) => {
+				crate::codec::cbor::uint(out, *v124 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7285,8 +7309,8 @@ impl PowerChange {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v122) => {
-				v122.to_json_into(out);
+			Some(v125) => {
+				v125.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -7295,8 +7319,8 @@ impl PowerChange {
 		out.push(',');
 		out.push_str("\"gone\":");
 		match &self.gone {
-			Some(v123) => {
-				v123.to_json_into(out);
+			Some(v126) => {
+				v126.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -7317,8 +7341,8 @@ impl PowerChange {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v124) => {
-				v124.to_text_into(out);
+			Some(v127) => {
+				v127.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -7327,8 +7351,8 @@ impl PowerChange {
 		out.push_str(", ");
 		out.push_str("gone=");
 		match &self.gone {
-			Some(v125) => {
-				v125.to_text_into(out);
+			Some(v128) => {
+				v128.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -7346,8 +7370,8 @@ impl PowerChange {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v126) => {
-				v126.to_cbor_into(out);
+			Some(v129) => {
+				v129.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7355,8 +7379,8 @@ impl PowerChange {
 		}
 		crate::codec::cbor::text(out, "gone");
 		match &self.gone {
-			Some(v127) => {
-				v127.to_cbor_into(out);
+			Some(v130) => {
+				v130.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7515,8 +7539,8 @@ impl ProviderUpdate {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v128) => {
-				v128.to_json_into(out);
+			Some(v131) => {
+				v131.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -7525,8 +7549,8 @@ impl ProviderUpdate {
 		out.push(',');
 		out.push_str("\"gone\":");
 		match &self.gone {
-			Some(v129) => {
-				let _ = write!(out, "{}", v129);
+			Some(v132) => {
+				let _ = write!(out, "{}", v132);
 			}
 			None => {
 				out.push_str("null");
@@ -7544,8 +7568,8 @@ impl ProviderUpdate {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v130) => {
-				v130.to_text_into(out);
+			Some(v133) => {
+				v133.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -7554,8 +7578,8 @@ impl ProviderUpdate {
 		out.push_str(", ");
 		out.push_str("gone=");
 		match &self.gone {
-			Some(v131) => {
-				let _ = write!(out, "{}", v131);
+			Some(v134) => {
+				let _ = write!(out, "{}", v134);
 			}
 			None => {
 				out.push('-');
@@ -7571,8 +7595,8 @@ impl ProviderUpdate {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v132) => {
-				v132.to_cbor_into(out);
+			Some(v135) => {
+				v135.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7580,8 +7604,8 @@ impl ProviderUpdate {
 		}
 		crate::codec::cbor::text(out, "gone");
 		match &self.gone {
-			Some(v133) => {
-				crate::codec::cbor::uint(out, *v133 as u64);
+			Some(v136) => {
+				crate::codec::cbor::uint(out, *v136 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -7867,13 +7891,13 @@ impl ActiveTrip {
 		out.push(',');
 		out.push_str("\"devices\":");
 		out.push('[');
-		let mut v135 = true;
-		for v134 in self.devices.iter() {
-			if !v135 {
+		let mut v138 = true;
+		for v137 in self.devices.iter() {
+			if !v138 {
 				out.push(',');
 			}
-			v135 = false;
-			crate::codec::json_escape(v134, out);
+			v138 = false;
+			crate::codec::json_escape(v137, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -7888,13 +7912,13 @@ impl ActiveTrip {
 		out.push_str(", ");
 		out.push_str("devices=");
 		out.push('[');
-		let mut v137 = true;
-		for v136 in self.devices.iter() {
-			if !v137 {
+		let mut v140 = true;
+		for v139 in self.devices.iter() {
+			if !v140 {
 				out.push_str(", ");
 			}
-			v137 = false;
-			out.push_str(v136);
+			v140 = false;
+			out.push_str(v139);
 		}
 		out.push(']');
 		out.push('}');
@@ -7907,8 +7931,8 @@ impl ActiveTrip {
 		crate::codec::cbor::uint(out, self.temperature as u64);
 		crate::codec::cbor::text(out, "devices");
 		crate::codec::cbor::array(out, self.devices.len());
-		for v138 in self.devices.iter() {
-			crate::codec::cbor::text(out, v138);
+		for v141 in self.devices.iter() {
+			crate::codec::cbor::text(out, v141);
 		}
 	}
 }
@@ -7936,8 +7960,8 @@ impl ZoneCooling {
 		out.push(',');
 		out.push_str("\"passive\":");
 		match &self.passive {
-			Some(v139) => {
-				let _ = write!(out, "{}", v139);
+			Some(v142) => {
+				let _ = write!(out, "{}", v142);
 			}
 			None => {
 				out.push_str("null");
@@ -7946,8 +7970,8 @@ impl ZoneCooling {
 		out.push(',');
 		out.push_str("\"critical\":");
 		match &self.critical {
-			Some(v140) => {
-				let _ = write!(out, "{}", v140);
+			Some(v143) => {
+				let _ = write!(out, "{}", v143);
 			}
 			None => {
 				out.push_str("null");
@@ -7956,8 +7980,8 @@ impl ZoneCooling {
 		out.push(',');
 		out.push_str("\"hot\":");
 		match &self.hot {
-			Some(v141) => {
-				let _ = write!(out, "{}", v141);
+			Some(v144) => {
+				let _ = write!(out, "{}", v144);
 			}
 			None => {
 				out.push_str("null");
@@ -7975,25 +7999,25 @@ impl ZoneCooling {
 		out.push(',');
 		out.push_str("\"passive-processors\":");
 		out.push('[');
-		let mut v143 = true;
-		for v142 in self.passive_processors.iter() {
-			if !v143 {
+		let mut v146 = true;
+		for v145 in self.passive_processors.iter() {
+			if !v146 {
 				out.push(',');
 			}
-			v143 = false;
-			crate::codec::json_escape(v142, out);
+			v146 = false;
+			crate::codec::json_escape(v145, out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"active\":");
 		out.push('[');
-		let mut v145 = true;
-		for v144 in self.active.iter() {
-			if !v145 {
+		let mut v148 = true;
+		for v147 in self.active.iter() {
+			if !v148 {
 				out.push(',');
 			}
-			v145 = false;
-			v144.to_json_into(out);
+			v148 = false;
+			v147.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -8012,8 +8036,8 @@ impl ZoneCooling {
 		out.push_str(", ");
 		out.push_str("passive=");
 		match &self.passive {
-			Some(v146) => {
-				let _ = write!(out, "{}", v146);
+			Some(v149) => {
+				let _ = write!(out, "{}", v149);
 			}
 			None => {
 				out.push('-');
@@ -8022,8 +8046,8 @@ impl ZoneCooling {
 		out.push_str(", ");
 		out.push_str("critical=");
 		match &self.critical {
-			Some(v147) => {
-				let _ = write!(out, "{}", v147);
+			Some(v150) => {
+				let _ = write!(out, "{}", v150);
 			}
 			None => {
 				out.push('-');
@@ -8032,8 +8056,8 @@ impl ZoneCooling {
 		out.push_str(", ");
 		out.push_str("hot=");
 		match &self.hot {
-			Some(v148) => {
-				let _ = write!(out, "{}", v148);
+			Some(v151) => {
+				let _ = write!(out, "{}", v151);
 			}
 			None => {
 				out.push('-');
@@ -8051,25 +8075,25 @@ impl ZoneCooling {
 		out.push_str(", ");
 		out.push_str("passive-processors=");
 		out.push('[');
-		let mut v150 = true;
-		for v149 in self.passive_processors.iter() {
-			if !v150 {
+		let mut v153 = true;
+		for v152 in self.passive_processors.iter() {
+			if !v153 {
 				out.push_str(", ");
 			}
-			v150 = false;
-			out.push_str(v149);
+			v153 = false;
+			out.push_str(v152);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("active=");
 		out.push('[');
-		let mut v152 = true;
-		for v151 in self.active.iter() {
-			if !v152 {
+		let mut v155 = true;
+		for v154 in self.active.iter() {
+			if !v155 {
 				out.push_str(", ");
 			}
-			v152 = false;
-			v151.to_text_into(out);
+			v155 = false;
+			v154.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -8087,8 +8111,8 @@ impl ZoneCooling {
 		crate::codec::cbor::text(out, &self.zone);
 		crate::codec::cbor::text(out, "passive");
 		match &self.passive {
-			Some(v153) => {
-				crate::codec::cbor::uint(out, *v153 as u64);
+			Some(v156) => {
+				crate::codec::cbor::uint(out, *v156 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8096,8 +8120,8 @@ impl ZoneCooling {
 		}
 		crate::codec::cbor::text(out, "critical");
 		match &self.critical {
-			Some(v154) => {
-				crate::codec::cbor::uint(out, *v154 as u64);
+			Some(v157) => {
+				crate::codec::cbor::uint(out, *v157 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8105,8 +8129,8 @@ impl ZoneCooling {
 		}
 		crate::codec::cbor::text(out, "hot");
 		match &self.hot {
-			Some(v155) => {
-				crate::codec::cbor::uint(out, *v155 as u64);
+			Some(v158) => {
+				crate::codec::cbor::uint(out, *v158 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8120,13 +8144,13 @@ impl ZoneCooling {
 		crate::codec::cbor::uint(out, self.tsp as u64);
 		crate::codec::cbor::text(out, "passive-processors");
 		crate::codec::cbor::array(out, self.passive_processors.len());
-		for v156 in self.passive_processors.iter() {
-			crate::codec::cbor::text(out, v156);
+		for v159 in self.passive_processors.iter() {
+			crate::codec::cbor::text(out, v159);
 		}
 		crate::codec::cbor::text(out, "active");
 		crate::codec::cbor::array(out, self.active.len());
-		for v157 in self.active.iter() {
-			v157.to_cbor_into(out);
+		for v160 in self.active.iter() {
+			v160.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "scp");
 		crate::codec::cbor::boolean(out, self.scp);
@@ -8156,6 +8180,13 @@ impl ZoneReading {
 		out.push(',');
 		out.push_str("\"sequence\":");
 		let _ = write!(out, "{}", self.sequence);
+		out.push(',');
+		out.push_str("\"trips-changed\":");
+		if self.trips_changed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -8165,14 +8196,23 @@ impl ZoneReading {
 		out.push_str(", ");
 		out.push_str("sequence=");
 		let _ = write!(out, "{}", self.sequence);
+		out.push_str(", ");
+		out.push_str("trips-changed=");
+		if self.trips_changed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "temperature");
 		crate::codec::cbor::uint(out, self.temperature as u64);
 		crate::codec::cbor::text(out, "sequence");
 		crate::codec::cbor::uint(out, self.sequence as u64);
+		crate::codec::cbor::text(out, "trips-changed");
+		crate::codec::cbor::boolean(out, self.trips_changed);
 	}
 }
 
@@ -8275,13 +8315,13 @@ impl FanDescription {
 		out.push(',');
 		out.push_str("\"levels\":");
 		out.push('[');
-		let mut v159 = true;
-		for v158 in self.levels.iter() {
-			if !v159 {
+		let mut v162 = true;
+		for v161 in self.levels.iter() {
+			if !v162 {
 				out.push(',');
 			}
-			v159 = false;
-			v158.to_json_into(out);
+			v162 = false;
+			v161.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -8310,13 +8350,13 @@ impl FanDescription {
 		out.push_str(", ");
 		out.push_str("levels=");
 		out.push('[');
-		let mut v161 = true;
-		for v160 in self.levels.iter() {
-			if !v161 {
+		let mut v164 = true;
+		for v163 in self.levels.iter() {
+			if !v164 {
 				out.push_str(", ");
 			}
-			v161 = false;
-			v160.to_text_into(out);
+			v164 = false;
+			v163.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -8333,8 +8373,8 @@ impl FanDescription {
 		crate::codec::cbor::uint(out, self.step_size as u64);
 		crate::codec::cbor::text(out, "levels");
 		crate::codec::cbor::array(out, self.levels.len());
-		for v162 in self.levels.iter() {
-			v162.to_cbor_into(out);
+		for v165 in self.levels.iter() {
+			v165.to_cbor_into(out);
 		}
 	}
 }
@@ -8584,8 +8624,8 @@ impl ZonePower {
 		out.push(',');
 		out.push_str("\"passive\":");
 		match &self.passive {
-			Some(v163) => {
-				let _ = write!(out, "{}", v163);
+			Some(v166) => {
+				let _ = write!(out, "{}", v166);
 			}
 			None => {
 				out.push_str("null");
@@ -8594,8 +8634,8 @@ impl ZonePower {
 		out.push(',');
 		out.push_str("\"critical\":");
 		match &self.critical {
-			Some(v164) => {
-				let _ = write!(out, "{}", v164);
+			Some(v167) => {
+				let _ = write!(out, "{}", v167);
 			}
 			None => {
 				out.push_str("null");
@@ -8604,8 +8644,8 @@ impl ZonePower {
 		out.push(',');
 		out.push_str("\"hot\":");
 		match &self.hot {
-			Some(v165) => {
-				let _ = write!(out, "{}", v165);
+			Some(v168) => {
+				let _ = write!(out, "{}", v168);
 			}
 			None => {
 				out.push_str("null");
@@ -8621,6 +8661,18 @@ impl ZonePower {
 		out.push(',');
 		out.push_str("\"cap-percent\":");
 		let _ = write!(out, "{}", self.cap_percent);
+		out.push(',');
+		out.push_str("\"active\":");
+		out.push('[');
+		let mut v170 = true;
+		for v169 in self.active.iter() {
+			if !v170 {
+				out.push(',');
+			}
+			v170 = false;
+			v169.to_json_into(out);
+		}
+		out.push(']');
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -8633,8 +8685,8 @@ impl ZonePower {
 		out.push_str(", ");
 		out.push_str("passive=");
 		match &self.passive {
-			Some(v166) => {
-				let _ = write!(out, "{}", v166);
+			Some(v171) => {
+				let _ = write!(out, "{}", v171);
 			}
 			None => {
 				out.push('-');
@@ -8643,8 +8695,8 @@ impl ZonePower {
 		out.push_str(", ");
 		out.push_str("critical=");
 		match &self.critical {
-			Some(v167) => {
-				let _ = write!(out, "{}", v167);
+			Some(v172) => {
+				let _ = write!(out, "{}", v172);
 			}
 			None => {
 				out.push('-');
@@ -8653,8 +8705,8 @@ impl ZonePower {
 		out.push_str(", ");
 		out.push_str("hot=");
 		match &self.hot {
-			Some(v168) => {
-				let _ = write!(out, "{}", v168);
+			Some(v173) => {
+				let _ = write!(out, "{}", v173);
 			}
 			None => {
 				out.push('-');
@@ -8670,18 +8722,30 @@ impl ZonePower {
 		out.push_str(", ");
 		out.push_str("cap-percent=");
 		let _ = write!(out, "{}", self.cap_percent);
+		out.push_str(", ");
+		out.push_str("active=");
+		out.push('[');
+		let mut v175 = true;
+		for v174 in self.active.iter() {
+			if !v175 {
+				out.push_str(", ");
+			}
+			v175 = false;
+			v174.to_text_into(out);
+		}
+		out.push(']');
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::map(out, 8);
 		crate::codec::cbor::text(out, "zone");
 		crate::codec::cbor::text(out, &self.zone);
 		crate::codec::cbor::text(out, "temperature");
 		crate::codec::cbor::uint(out, self.temperature as u64);
 		crate::codec::cbor::text(out, "passive");
 		match &self.passive {
-			Some(v169) => {
-				crate::codec::cbor::uint(out, *v169 as u64);
+			Some(v176) => {
+				crate::codec::cbor::uint(out, *v176 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8689,8 +8753,8 @@ impl ZonePower {
 		}
 		crate::codec::cbor::text(out, "critical");
 		match &self.critical {
-			Some(v170) => {
-				crate::codec::cbor::uint(out, *v170 as u64);
+			Some(v177) => {
+				crate::codec::cbor::uint(out, *v177 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8698,8 +8762,8 @@ impl ZonePower {
 		}
 		crate::codec::cbor::text(out, "hot");
 		match &self.hot {
-			Some(v171) => {
-				crate::codec::cbor::uint(out, *v171 as u64);
+			Some(v178) => {
+				crate::codec::cbor::uint(out, *v178 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -8709,6 +8773,11 @@ impl ZonePower {
 		crate::codec::cbor::boolean(out, self.passive_engaged);
 		crate::codec::cbor::text(out, "cap-percent");
 		crate::codec::cbor::uint(out, self.cap_percent as u64);
+		crate::codec::cbor::text(out, "active");
+		crate::codec::cbor::array(out, self.active.len());
+		for v179 in self.active.iter() {
+			v179.to_cbor_into(out);
+		}
 	}
 }
 
@@ -8741,13 +8810,13 @@ impl FanPower {
 		out.push(',');
 		out.push_str("\"curve\":");
 		out.push('[');
-		let mut v173 = true;
-		for v172 in self.curve.iter() {
-			if !v173 {
+		let mut v181 = true;
+		for v180 in self.curve.iter() {
+			if !v181 {
 				out.push(',');
 			}
-			v173 = false;
-			v172.to_json_into(out);
+			v181 = false;
+			v180.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -8765,13 +8834,13 @@ impl FanPower {
 		out.push_str(", ");
 		out.push_str("curve=");
 		out.push('[');
-		let mut v175 = true;
-		for v174 in self.curve.iter() {
-			if !v175 {
+		let mut v183 = true;
+		for v182 in self.curve.iter() {
+			if !v183 {
 				out.push_str(", ");
 			}
-			v175 = false;
-			v174.to_text_into(out);
+			v183 = false;
+			v182.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -8786,8 +8855,8 @@ impl FanPower {
 		crate::codec::cbor::uint(out, self.speed_rpm as u64);
 		crate::codec::cbor::text(out, "curve");
 		crate::codec::cbor::array(out, self.curve.len());
-		for v176 in self.curve.iter() {
-			v176.to_cbor_into(out);
+		for v184 in self.curve.iter() {
+			v184.to_cbor_into(out);
 		}
 	}
 }
@@ -8818,37 +8887,37 @@ impl ProcessorPowerStatus {
 		out.push(',');
 		out.push_str("\"cores\":");
 		out.push('[');
-		let mut v178 = true;
-		for v177 in self.cores.iter() {
-			if !v178 {
+		let mut v186 = true;
+		for v185 in self.cores.iter() {
+			if !v186 {
 				out.push(',');
 			}
-			v178 = false;
-			v177.to_json_into(out);
+			v186 = false;
+			v185.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"zones\":");
 		out.push('[');
-		let mut v180 = true;
-		for v179 in self.zones.iter() {
-			if !v180 {
+		let mut v188 = true;
+		for v187 in self.zones.iter() {
+			if !v188 {
 				out.push(',');
 			}
-			v180 = false;
-			v179.to_json_into(out);
+			v188 = false;
+			v187.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"fans\":");
 		out.push('[');
-		let mut v182 = true;
-		for v181 in self.fans.iter() {
-			if !v182 {
+		let mut v190 = true;
+		for v189 in self.fans.iter() {
+			if !v190 {
 				out.push(',');
 			}
-			v182 = false;
-			v181.to_json_into(out);
+			v190 = false;
+			v189.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -8863,37 +8932,37 @@ impl ProcessorPowerStatus {
 		out.push_str(", ");
 		out.push_str("cores=");
 		out.push('[');
-		let mut v184 = true;
-		for v183 in self.cores.iter() {
-			if !v184 {
+		let mut v192 = true;
+		for v191 in self.cores.iter() {
+			if !v192 {
 				out.push_str(", ");
 			}
-			v184 = false;
-			v183.to_text_into(out);
+			v192 = false;
+			v191.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("zones=");
 		out.push('[');
-		let mut v186 = true;
-		for v185 in self.zones.iter() {
-			if !v186 {
+		let mut v194 = true;
+		for v193 in self.zones.iter() {
+			if !v194 {
 				out.push_str(", ");
 			}
-			v186 = false;
-			v185.to_text_into(out);
+			v194 = false;
+			v193.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("fans=");
 		out.push('[');
-		let mut v188 = true;
-		for v187 in self.fans.iter() {
-			if !v188 {
+		let mut v196 = true;
+		for v195 in self.fans.iter() {
+			if !v196 {
 				out.push_str(", ");
 			}
-			v188 = false;
-			v187.to_text_into(out);
+			v196 = false;
+			v195.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -8906,18 +8975,18 @@ impl ProcessorPowerStatus {
 		crate::codec::cbor::text(out, &self.because);
 		crate::codec::cbor::text(out, "cores");
 		crate::codec::cbor::array(out, self.cores.len());
-		for v189 in self.cores.iter() {
-			v189.to_cbor_into(out);
+		for v197 in self.cores.iter() {
+			v197.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "zones");
 		crate::codec::cbor::array(out, self.zones.len());
-		for v190 in self.zones.iter() {
-			v190.to_cbor_into(out);
+		for v198 in self.zones.iter() {
+			v198.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "fans");
 		crate::codec::cbor::array(out, self.fans.len());
-		for v191 in self.fans.iter() {
-			v191.to_cbor_into(out);
+		for v199 in self.fans.iter() {
+			v199.to_cbor_into(out);
 		}
 	}
 }

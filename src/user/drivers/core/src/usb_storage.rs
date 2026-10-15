@@ -11,13 +11,13 @@
 
 use drivers::blk;
 use drivers::descriptor;
-use drivers::usb::{BotFault, FlushOutcome, csw_outcome, flush_outcome};
+use drivers::usb::{BotFault, CSW_LEN, Csw, FlushOutcome, csw_outcome, flush_outcome};
 use rt::*;
 
 use crate::usb_hid::Hids;
 use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_SET_CONFIGURATION, RT_ENDPOINT, TRB_CONFIGURE_ENDPOINT, TRB_IOC, TRB_NORMAL};
 use crate::{Ring, UsbDevice, Xhci};
-use crate::{command_and_wait, control_in, control_nodata, dma_page, r8, reset_endpoint, w32, wait_transfer};
+use crate::{command_and_wait, control_in, control_nodata, dma_page, r8, reset_endpoint, w32, wait_transfer, wait_transfer_len};
 
 // The USB mass-storage identity within a configuration: the class with the SCSI
 // transparent command set over the Bulk-Only Transport.
@@ -36,7 +36,6 @@ const RT_CLASS_INTERFACE: u8 = 0x21;
 // Command Status Wrapper, each led by its signature; a CSW status of 0 is success.
 const CBW_SIGNATURE: u32 = 0x4342_5355;
 const CBW_LEN: u32 = 31;
-const CSW_LEN: u32 = 13;
 // The CSW rides in the same scratch page as the CBW, at the next 32-byte slot.
 const CSW_OFF: u64 = 32;
 const CBW_FLAG_IN: u8 = 0x80;
@@ -66,14 +65,14 @@ const TRB_DATA_MAX: u32 = 64 * 1024;
 // same protocol to the same client and each used to declare it privately; `driver_protocol::block`
 // is the one declaration now.
 //
-// AND THE TWO SERVERS DISAGREE ABOUT ONE OF ITS VALUES, which is exactly what two copies of a rule
-// produce and is recorded here rather than changed under a path this change does not test: a refused
-// request is answered `STATUS_ERR` here and `STATUS_INVALID` by `virtio-blk`, so on this server the
-// client cannot tell a request it got wrong from a device that failed one it got right. The
-// constant it should use is imported and unused for now, which is why it is not in this list.
+// AND A REFUSAL IS TYPED THE WAY EVERY OTHER BLOCK SERVER TYPES IT: a request this server will not
+// carry - past the medium, too long for one transfer, a write without a readable object as long as it
+// says - is answered `STATUS_INVALID`, and `STATUS_ERR` is kept for a device that failed a request it
+// was right to be asked. This server used to answer `STATUS_ERR` for both, so its client could not
+// tell a request it got wrong from a disk that failed.
 use driver_protocol::block;
-pub use driver_protocol::block::STATUS_ERR;
 use driver_protocol::block::{OP_CAPACITY, OP_FLUSH, OP_READ, OP_WRITE, STATUS_OK};
+pub use driver_protocol::block::{STATUS_ERR, STATUS_INVALID};
 
 // A configured USB mass-storage device (Bulk-Only Transport): the bulk IN and OUT
 // endpoints' device context indices, addresses (for stall recovery) and transfer
@@ -197,58 +196,78 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 		let (dci_in, mps_in, ep_in_addr): (u32, u32, u8) = ep_in?;
 		let (dci_out, mps_out, ep_out_addr): (u32, u32, u8) = ep_out?;
 
-		// bring both bulk endpoints up with one configure-endpoint command.
-		let ring_in: Ring = Ring::new()?;
-		let ring_out: Ring = Ring::new()?;
-		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
-		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out);
-		let entries: u32 = dci_in.max(dci_out);
-		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
-		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20 | dev.route);
-		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
-		// bulk endpoint contexts: IN type 6 / OUT type 2, error count 3, no interval.
-		for &(dci, mps, ep_type, ring) in &[(dci_in, mps_in, 6u32, &ring_in), (dci_out, mps_out, 2u32, &ring_out)] {
-			let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
-			((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
-			((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
-			((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
-			((ep_ctx + 16) as *mut u32).write_volatile(mps);
-		}
-		command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24)?;
-		control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
-
-		let (data_handle, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
-		let mut st: Storage = Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, data_handle, data_bytes: 4096, tag: 1, capacity: 0 };
-
-		// spin the unit up: a freshly attached unit reports a power-on unit attention
-		// on its first command, cleared by reading the sense data - retry a few times.
-		let mut ready: bool = false;
-		let mut attempt: u32 = 0;
-		while attempt < 4 {
-			let turcb = scsi::test_unit_ready();
-			if bot_command(hc, &mut hids, dev, &mut st, &turcb, 0, false) {
-				ready = true;
-				break;
+		// BOTH RINGS AND THE DATA PAGE ARE TAKEN BEFORE THE CONTROLLER IS TOLD ABOUT EITHER RING, and all
+		// three are given back on any failure from here on. An attach that failed part way - an empty
+		// card reader whose unit never comes ready, a disk whose sector is not 512 bytes, a device that
+		// refused its configuration - kept them for the life of the driver, while the class budget the
+		// detach gives back had charged for none of them.
+		let mut st: Storage = match (Ring::new(), Ring::new(), dma_page()) {
+			(Some(ring_in), Some(ring_out), Some((data_handle, data_virt, data_phys))) => Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, data_handle, data_bytes: 4096, tag: 1, capacity: 0 },
+			(ring_in, ring_out, data) => {
+				for mut ring in [ring_in, ring_out].into_iter().flatten() {
+					ring.release();
+				}
+				if let Some((handle, _, _)) = data {
+					close(handle);
+				}
+				return None;
 			}
-			read_sense(hc, &mut hids, dev, &mut st);
-			attempt += 1;
-		}
-		if !ready {
+		};
+		let usable = 'unit: {
+			// bring both bulk endpoints up with one configure-endpoint command.
+			core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
+			((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out);
+			let entries: u32 = dci_in.max(dci_out);
+			let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
+			(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20 | dev.route);
+			((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
+			// bulk endpoint contexts: IN type 6 / OUT type 2, error count 3, no interval.
+			for &(dci, mps, ep_type, ring) in &[(dci_in, mps_in, 6u32, &st.ring_in), (dci_out, mps_out, 2u32, &st.ring_out)] {
+				let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
+				((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
+				((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
+				((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
+				((ep_ctx + 16) as *mut u32).write_volatile(mps);
+			}
+			if command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24).is_none() || control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0).is_none() {
+				break 'unit false;
+			}
+
+			// spin the unit up: a freshly attached unit reports a power-on unit attention
+			// on its first command, cleared by reading the sense data - retry a few times.
+			let mut ready: bool = false;
+			let mut attempt: u32 = 0;
+			while attempt < 4 {
+				let turcb = scsi::test_unit_ready();
+				if bot_command(hc, &mut hids, dev, &mut st, &turcb, 0, false) {
+					ready = true;
+					break;
+				}
+				read_sense(hc, &mut hids, dev, &mut st);
+				attempt += 1;
+			}
+			if !ready {
+				break 'unit false;
+			}
+			// the block protocol serves 512-byte sectors; refuse a disk with another size.
+			let capcb = scsi::read_capacity10();
+			if !bot_command(hc, &mut hids, dev, &mut st, &capcb, 8, true) {
+				break 'unit false;
+			}
+			let block_size: u32 = (r8(st.data_virt + 4) as u32) << 24 | (r8(st.data_virt + 5) as u32) << 16 | (r8(st.data_virt + 6) as u32) << 8 | r8(st.data_virt + 7) as u32;
+			if block_size != SECTOR {
+				break 'unit false;
+			}
+			// the unit's size: READ CAPACITY reports the last LBA (big-endian), so the
+			// sector count is one more.
+			let last_lba: u32 = (r8(st.data_virt) as u32) << 24 | (r8(st.data_virt + 1) as u32) << 16 | (r8(st.data_virt + 2) as u32) << 8 | r8(st.data_virt + 3) as u32;
+			st.capacity = (last_lba as u64 + 1) * SECTOR as u64;
+			true
+		};
+		if !usable {
+			st.release();
 			return None;
 		}
-		// the block protocol serves 512-byte sectors; refuse a disk with another size.
-		let capcb = scsi::read_capacity10();
-		if !bot_command(hc, &mut hids, dev, &mut st, &capcb, 8, true) {
-			return None;
-		}
-		let block_size: u32 = (r8(st.data_virt + 4) as u32) << 24 | (r8(st.data_virt + 5) as u32) << 16 | (r8(st.data_virt + 6) as u32) << 8 | r8(st.data_virt + 7) as u32;
-		if block_size != SECTOR {
-			return None;
-		}
-		// the unit's size: READ CAPACITY reports the last LBA (big-endian), so the
-		// sector count is one more.
-		let last_lba: u32 = (r8(st.data_virt) as u32) << 24 | (r8(st.data_virt + 1) as u32) << 16 | (r8(st.data_virt + 2) as u32) << 8 | r8(st.data_virt + 3) as u32;
-		st.capacity = (last_lba as u64 + 1) * SECTOR as u64;
 		Some(st)
 	}
 }
@@ -304,13 +323,21 @@ unsafe fn bot_transfer(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: 
 		// the data stage, on the direction's endpoint, out of the storage data buffer. A
 		// stall here is routine (the device returned less than asked): unhalt the
 		// endpoint and continue to the CSW, which still reports the command's status.
+		//
+		// AND HOW MANY BYTES THE TRANSPORT SAW MOVE is kept - the length the transfer event reports -
+		// because it is the account of the data stage that does not come from the device: the CSW's
+		// residue is checked against it rather than believed.
+		let mut observed: u32 = 0;
 		if ok && data_len > 0 {
 			let (ring, dci): (&mut Ring, u32) = if data_in { (&mut st.ring_in, st.dci_in) } else { (&mut st.ring_out, st.dci_out) };
 			ring.push(st.data_phys, data_len, TRB_NORMAL << 10 | TRB_IOC);
 			w32(hc.db + dev.slot as u64 * 4, dci);
-			match wait_transfer(hc, hids, dev.slot, dci) {
-				Some(CC_SUCCESS) | Some(CC_SHORT_PACKET) => {}
-				Some(CC_STALL) => recover_bulk(hc, hids, dev, st, data_in),
+			match wait_transfer_len(hc, hids, dev.slot, dci) {
+				Some((CC_SUCCESS | CC_SHORT_PACKET, residual)) => observed = data_len.saturating_sub(residual),
+				Some((CC_STALL, residual)) => {
+					observed = data_len.saturating_sub(residual);
+					recover_bulk(hc, hids, dev, st, data_in);
+				}
 				_ => {
 					bot_reset(hc, hids, dev, st);
 					ok = false;
@@ -322,16 +349,20 @@ unsafe fn bot_transfer(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: 
 		// the transport.
 		if ok {
 			ok = false;
+			let mut received: u32 = 0;
 			let mut attempt: u32 = 0;
 			while attempt < 2 {
 				st.ring_in.push(dev.data_phys + CSW_OFF, CSW_LEN, TRB_NORMAL << 10 | TRB_IOC);
 				w32(hc.db + dev.slot as u64 * 4, st.dci_in);
-				match wait_transfer(hc, hids, dev.slot, st.dci_in) {
-					Some(CC_SUCCESS) | Some(CC_SHORT_PACKET) => {
+				match wait_transfer_len(hc, hids, dev.slot, st.dci_in) {
+					// A SHORT WRAPPER ARRIVES AS A SHORT PACKET, and how short is what `csw_outcome`
+					// refuses it by.
+					Some((CC_SUCCESS | CC_SHORT_PACKET, residual)) => {
+						received = CSW_LEN.saturating_sub(residual);
 						ok = true;
 						break;
 					}
-					Some(CC_STALL) => {
+					Some((CC_STALL, _)) => {
 						recover_bulk(hc, hids, dev, st, true);
 						attempt += 1;
 					}
@@ -346,12 +377,9 @@ unsafe fn bot_transfer(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: 
 			// THE WRAPPER HAS FIVE FIELDS AND THREE WERE READ. The residue is the device's own
 			// account of how many of the bytes it was asked for did not move, and without it a
 			// device that transferred half a sector and said "pass" was a complete success.
-			let csw: u64 = dev.data_virt + CSW_OFF;
-			let signature = (csw as *const u32).read_volatile();
-			let echoed = ((csw + 4) as *const u32).read_volatile();
-			let residue = ((csw + 8) as *const u32).read_volatile();
-			let status = ((csw + 12) as *const u8).read_volatile();
-			let outcome = csw_outcome(signature, echoed, st.tag, status, residue, data_len, allow_short);
+			let at: u64 = dev.data_virt + CSW_OFF;
+			let csw = Csw { signature: (at as *const u32).read_volatile(), echoed_tag: ((at + 4) as *const u32).read_volatile(), residue: ((at + 8) as *const u32).read_volatile(), status: ((at + 12) as *const u8).read_volatile(), received };
+			let outcome = csw_outcome(&csw, st.tag, data_len, observed, allow_short);
 			// A malformed wrapper means the transport lost sync, so reset it; a device that simply
 			// refused the command has not, and resetting there would throw away its sense data.
 			if matches!(outcome, Err(BotFault::Framing) | Err(BotFault::Residue)) {
@@ -388,7 +416,7 @@ pub fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, 
 			if handle != 0 {
 				close(handle);
 			}
-			reply_block(blk_server, STATUS_ERR, 0);
+			reply_block(blk_server, STATUS_INVALID, 0);
 			return;
 		};
 		match op {
@@ -460,7 +488,7 @@ unsafe fn serve_read(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &m
 unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32, src_handle: u64) {
 	unsafe {
 		if src_handle == 0 {
-			reply_block(blk_server, STATUS_ERR, 0);
+			reply_block(blk_server, STATUS_INVALID, 0);
 			return;
 		}
 		// THE THREE QUESTIONS BEFORE ANYTHING IS MAPPED, from one `object_info`: what the handle is,
@@ -471,7 +499,7 @@ unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 			Some(info) if blk::write_source(&info, bytes).is_ok() => {}
 			_ => {
 				close(src_handle);
-				reply_block(blk_server, STATUS_ERR, 0);
+				reply_block(blk_server, STATUS_INVALID, 0);
 				return;
 			}
 		}

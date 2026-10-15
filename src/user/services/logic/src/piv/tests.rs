@@ -133,6 +133,14 @@ fn a_signature_that_is_not_der_ecdsa_is_refused() {
 	let mut wrong = good.clone();
 	wrong[1] ^= 0x01;
 	assert_eq!(wrap(&wrong), Err(Malformed::Signature));
+	// AN EMPTY INTEGER, which a card can answer: refused, not read past - the whole response is
+	// `7C 06 82 04 30 02 02 00`.
+	assert_eq!(authentication_signature(&[0x7c, 0x06, 0x82, 0x04, 0x30, 0x02, 0x02, 0x00]), Err(Malformed::Signature));
+	// And an empty s after a good r.
+	let mut empty_s = alloc::vec![0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x00];
+	assert_eq!(wrap(&empty_s), Err(Malformed::Signature));
+	empty_s[6] = 0x01;
+	assert_eq!(wrap(&empty_s), Err(Malformed::Signature));
 }
 
 #[test]

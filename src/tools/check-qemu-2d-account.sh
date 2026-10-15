@@ -82,7 +82,21 @@ command = "test2d-sw --account --no-input --no-second-surface --frames=160 --pha
 contains = "test2d-sw: done"
 timeout = 300
 EOF
-	LIBER_BOOT_PROFILE=development-trace "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 || die "the $ARCH scaled run failed - see $RESULTS/boot-$ARCH.log"
+	# THE CONDITIONS ARE PART OF EVERY NUMBER, the port rows' as the x86_64 ones: captured while the guest runs, off its
+	# own QEMU - the boot ESP and kernel the cold runner staged for it, the kernel cargo built, the manifest-selected
+	# artifacts, the running system volume, QEMU and the host CPU.
+	env -u GPU_SIZE LIBER_BOOT_PROFILE=development-trace "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 &
+	cold=$!
+	for _ in $(seq 1 600); do
+		ps -eo comm= | grep -q "^qemu-system-$ARCH" && break
+		kill -0 "$cold" 2>/dev/null || break
+		sleep 1
+	done
+	python3 "$SRC_DIR/harness/frame-account-conditions.py" "$ARCH" "$RESULTS/conditions-$ARCH.json" >"$RESULTS/conditions-$ARCH.log" 2>&1 || {
+		wait "$cold" || true
+		die "the $ARCH run's conditions could not be captured - see $RESULTS/conditions-$ARCH.log"
+	}
+	wait "$cold" || die "the $ARCH scaled run failed - see $RESULTS/boot-$ARCH.log"
 	cp "$BUILD_DIR/boot/cold-$ARCH.log" "$RESULTS/serial-$ARCH.log"
 	# Both port entry points attach this buffer only under development-trace; the profile banner is
 	# x86-only. The collector below also requires the anchor, complete drain and matching armed report.
@@ -94,6 +108,12 @@ EOF
 	exit 0
 fi
 TARGET=x86_64-unknown-none
+# AN OPTIMISED ROW IS TAKEN ONLY AGAINST THE ORDINARY RUN IT IS COMPARED WITH: without a reference nothing below could show
+# that the kernel and the driver differ and DisplayService and the demo do not, and the results would carry the optimised
+# suffix with no provenance at all.
+if [[ -n "${CARGO_PROFILE_DEV_OPT_LEVEL:-}" && -z "${ACCOUNT_REFERENCE:-}" ]]; then
+	die "an optimised run (CARGO_PROFILE_DEV_OPT_LEVEL) needs ACCOUNT_REFERENCE naming the ordinary run's results"
+fi
 BOOTED=0
 cleanup() {
 	if ((BOOTED)); then
@@ -166,8 +186,10 @@ boot() {
 	# THE GUEST IS OURS FROM THE MOMENT IT IS STARTED, not from the moment it answers: a boot whose wait
 	# fails leaves its QEMU running, and the exit handler has to take that one down as well.
 	BOOTED=1
-	# Headless and four cores, whatever the caller's environment says.
-	env -u DISPLAYS "$@" SMP=4 "$REPO_ROOT/lab.sh" boot >"$RESULTS/boot-$name.log" 2>&1 || die "boot $name failed - see $RESULTS/boot-$name.log"
+	# Headless and four cores, whatever the caller's environment says - and the profile and the scanout each boot names
+	# itself, never inherited: an exported `LIBER_BOOT_PROFILE=development-trace` made the dormant boot a trace boot, and
+	# an exported `GPU_SIZE` moved the default scanout of the first and the last.
+	env -u DISPLAYS -u LIBER_BOOT_PROFILE -u GPU_SIZE "$@" SMP=4 "$REPO_ROOT/lab.sh" boot >"$RESULTS/boot-$name.log" 2>&1 || die "boot $name failed - see $RESULTS/boot-$name.log"
 	record_conditions "$name"
 }
 
@@ -204,8 +226,12 @@ boot small DEV_PROFILE=1 LIBER_BOOT_PROFILE=development-trace GPU_SIZE=640x480
 run small-direct "${ACCOUNT[@]}" "${PIN[@]}"
 cp "$SERIAL_LOG" "$RESULTS/serial-small.log"
 
-boot dormant DEV_PROFILE=1
+boot dormant DEV_PROFILE=1 LIBER_BOOT_PROFILE=development
 run dormant --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 "${PIN[@]}"
+# DORMANT MEANS DORMANT: the boot's own profile line, and the demo saying its sites are not live - a trace boot here would
+# make every site a syscall and the armed/dormant comparison a comparison of nothing.
+grep -a -q "boot profile.*development" "$RESULTS/conditions-dormant.tsv" && ! grep -a -q "development-trace" "$RESULTS/conditions-dormant.tsv" || die "the dormant boot did not record the development profile - see $RESULTS/conditions-dormant.tsv"
+grep -a -q "site-live=0" "$RESULTS/run-dormant.out" || die "the dormant run's sites were live - see $RESULTS/run-dormant.out"
 # THE SAME RUN WITH THE CORE KEPT BUSY BEFORE EACH DRAW: a draw that falls to the offscreen figure behind
 # the spin was paying for starting on a core that had been idle, which is the host's and not the draw's.
 run warm-core --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 --warm-core=60 "${PIN[@]}"

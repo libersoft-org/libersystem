@@ -296,11 +296,13 @@ impl Broker {
 	}
 
 	/// The executor answered a preparation. Checked against what was asked; a request that moved on while it
-	/// was preparing releases what it prepared.
-	pub fn prepared(&mut self, request: RequestId, answer: Result<(Descriptor, usize, u64), &'static str>, now: u64, effects: &mut Vec<Effect>) {
+	/// was preparing releases what it prepared. `executor` is the executor that answered.
+	pub fn prepared(&mut self, request: RequestId, executor: u32, answer: Result<(Descriptor, usize, u64), &'static str>, now: u64, effects: &mut Vec<Effect>) {
+		// A REQUEST THAT SETTLED AND WENT while its preparation was in flight: what was prepared is released at
+		// the executor that answered - which is the only one holding it, and which the request no longer names.
 		let Some(at) = self.at(request) else {
 			if let Ok((_, _, operation)) = answer {
-				effects.push(Effect::Release { request, executor: 0, operation });
+				effects.push(Effect::Release { request, executor, operation });
 			}
 			return;
 		};
@@ -346,17 +348,25 @@ impl Broker {
 		}
 		self.requests[at].ending = ending;
 		self.hide_if_showing(self.requests[at].id, effects);
-		if self.requests[at].operation != 0 {
-			let (request, executor, operation) = (self.requests[at].id, self.requests[at].executor, self.requests[at].operation);
-			effects.push(Effect::Release { request, executor, operation });
-			self.requests[at].operation = 0;
-		}
+		self.release_prepared(at, effects);
 		if self.requests[at].state == State::Granted {
 			effects.push(Effect::CloseGrant { request: self.requests[at].id });
 		}
 		self.requests[at].state = State::Declining;
 		self.requests[at].reason = reason;
 		self.journal(at, Event::Declined, reason, now, effects);
+	}
+
+	// RELEASE WHAT WAS PREPARED AND WILL NEVER RUN. Every ending without a dispatch passes here - a decline, a
+	// grant that expired unused, a consumption that was not recorded, an owner lost at the admission boundary -
+	// because an executor holds only a few preparations at once, and the ones these endings left behind refused
+	// every later preparation until the executor restarted. None of them dispatched, so releasing is safe.
+	fn release_prepared(&mut self, at: usize, effects: &mut Vec<Effect>) {
+		if self.requests[at].operation != 0 {
+			let (request, executor, operation) = (self.requests[at].id, self.requests[at].executor, self.requests[at].operation);
+			effects.push(Effect::Release { request, executor, operation });
+			self.requests[at].operation = 0;
+		}
 	}
 
 	fn hide_if_showing(&mut self, request: RequestId, effects: &mut Vec<Effect>) {
@@ -405,6 +415,7 @@ impl Broker {
 					// for, and nothing retries it.
 					self.requests[at].state = State::Failed;
 					self.requests[at].redeeming = false;
+					self.release_prepared(at, effects);
 					effects.push(Effect::Redeemed { request, outcome: Some(Outcome::Failed) });
 					effects.push(Effect::CloseGrant { request });
 					return;
@@ -420,6 +431,7 @@ impl Broker {
 				if !self.live(connection) || now >= self.requests[at].grant_by {
 					self.requests[at].state = State::Failed;
 					self.requests[at].redeeming = false;
+					self.release_prepared(at, effects);
 					effects.push(Effect::Redeemed { request, outcome: None });
 					effects.push(Effect::CloseGrant { request });
 					self.requests[at].journaling = Some(Event::Failed);
@@ -666,6 +678,7 @@ impl Broker {
 					self.requests[at].journaling = None;
 					self.requests[at].state = State::Failed;
 					self.requests[at].redeeming = false;
+					self.release_prepared(at, effects);
 					effects.push(Effect::Redeemed { request: id, outcome: Some(Outcome::Failed) });
 					effects.push(Effect::CloseGrant { request: id });
 				}
@@ -678,6 +691,7 @@ impl Broker {
 				State::AwaitingAttention | State::AwaitingDecision if now >= request.confirm_by => self.decline_as(at, State::Expired, "the confirmation expired", now, effects),
 				State::Granted if now >= request.grant_by => {
 					self.requests[at].state = State::Expired;
+					self.release_prepared(at, effects);
 					effects.push(Effect::CloseGrant { request: id });
 					self.requests[at].journaling = Some(Event::Declined);
 					self.requests[at].exchange_by = now + EXCHANGE_TICKS;

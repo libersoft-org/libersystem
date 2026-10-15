@@ -12,7 +12,8 @@
 //! export table and a new ring-3 syscall, which is a kernel redesign this milestone has no business
 //! doing for a substrate audit.
 
-use crate::record::{self, Icd};
+use crate::record::{self, Icd, NegotiateFn};
+use crate::version::{self, Exchange, Negotiated};
 use core::ffi::{c_char, c_void};
 use core::ptr;
 
@@ -45,9 +46,23 @@ pub fn open(path: &[u8]) -> Option<&'static Icd> {
 /// ANYTHING ELSE IS NULL, INCLUDING THE THIRD EXPORT. A loader that asked for the physical-device
 /// function gets the same answer as one that asked for a symbol that does not exist, and that is
 /// correct: within this profile it does not.
+///
+/// AND THE NEGOTIATION EXPORT IS NOT THE DRIVER'S. What the loader gets for it is the substrate's
+/// bounded entry point for the slot this ICD occupies, which offers the driver at most 6 and refuses
+/// any answer outside 2..=6 before the loader hears of it. The loader asks every driver for 7 and
+/// accepts anything down to 0, so handing it the driver's own function made the admitted set a
+/// property of whichever driver happened to clamp itself. Because this answer is never null, the
+/// loader's fallback - asking the driver's own `vk_icdGetInstanceProcAddr` for a negotiation
+/// function - is never taken; and because nothing above 6 is ever agreed, neither is its version-7
+/// path that asks that same lookup for the physical-device function.
 pub fn resolve(icd: &'static Icd, symbol: &[u8]) -> *mut c_void {
 	match symbol {
-		s if s == NEGOTIATE_SYMBOL => icd.negotiate as *mut c_void,
+		s if s == NEGOTIATE_SYMBOL => match slot_of(icd) {
+			Some(slot) => BOUNDED[slot] as *mut c_void,
+			// AN ICD THE INSTALLED RECORD DOES NOT HOLD has no slot and so no bound to run under.
+			// `open` only ever hands out the record's own, so this is a caller with a stale handle.
+			None => ptr::null_mut(),
+		},
 		s if s == GET_INSTANCE_PROC_ADDR_SYMBOL => icd.get_instance_proc_addr as *mut c_void,
 		// THE THIRD EXPORT IS MATCHED AND REFUSED, rather than falling into the same arm as a
 		// misspelling. Both answer NULL, but only one of them is a DECISION - and the decision is
@@ -55,6 +70,111 @@ pub fn resolve(icd: &'static Icd, symbol: &[u8]) -> *mut c_void {
 		// should find the reason here rather than infer it from an absence.
 		s if s == PHYSICAL_DEVICE_SYMBOL => ptr::null_mut(),
 		_ => ptr::null_mut(),
+	}
+}
+
+/// The record slot `icd` occupies, by identity rather than by name.
+fn slot_of(icd: &'static Icd) -> Option<usize> {
+	record::installed()?.icds.iter().position(|held| held.is_some_and(|held| ptr::eq(held, icd)))
+}
+
+/// The negotiation entry point the loader is handed for the ICD in record slot `SLOT`.
+///
+/// ONE PER SLOT, because the interface gives a negotiation function nothing but the version pointer
+/// - no handle, no context - so the function itself has to know which driver it speaks for. The
+/// driver is looked up when the call is made, from the record, so what runs is always what the
+/// record holds.
+///
+/// ON A REFUSAL THE LOADER'S VALUE IS LEFT AS IT WROTE IT. Reporting a version that was never agreed
+/// is how a loader comes to call an entry point that is not there; the result it gets is the one
+/// failure it recognises, and the reason is a line in the diagnostic stream.
+unsafe extern "C" fn bounded_negotiate<const SLOT: usize>(version: *mut u32) -> i32 {
+	let Some(icd) = record::installed().and_then(|record| record.icds.get(SLOT).copied().flatten()) else {
+		return version::INCOMPATIBLE_DRIVER;
+	};
+	if version.is_null() {
+		return version::INCOMPATIBLE_DRIVER;
+	}
+	// SAFETY: the loader passes a live pointer to its own local, checked non-null above.
+	let asked = unsafe { *version };
+	// SAFETY: `negotiate` is the entry point of the provider the launch bound into this slot.
+	let exchange = unsafe { version::exchange(icd.negotiate, asked) };
+	report_exchange(&exchange);
+	match exchange.outcome {
+		Negotiated::At(agreed) => {
+			// SAFETY: as above.
+			unsafe { *version = agreed };
+			version::SUCCESS
+		}
+		Negotiated::Refused(_) => version::INCOMPATIBLE_DRIVER,
+	}
+}
+
+/// The bounded entry points, indexed by record slot. Its length IS the record's bound: a record that
+/// grew a slot without a bounded entry point for it would not compile.
+static BOUNDED: [NegotiateFn; record::MAX_ICDS] = [bounded_negotiate::<0>, bounded_negotiate::<1>, bounded_negotiate::<2>, bounded_negotiate::<3>];
+
+/// Say what one negotiation settled, through the substrate's diagnostic stream.
+///
+/// AN AGREEMENT IS REPORTED TOO, not only a refusal, because it is the one place the bound can be
+/// SEEN working: the loader asked for 7, and the line says what the driver was offered instead and
+/// what came back.
+fn report_exchange(exchange: &Exchange) {
+	let mut line = Line::new();
+	line.text(b"icd interface: loader asked ").number(exchange.asked);
+	if let Some(offered) = exchange.offered {
+		line.text(b", substrate offered ").number(offered);
+		match exchange.outcome {
+			Negotiated::Refused(version::Refusal::DriverDeclined) => line.text(b", driver declined"),
+			_ => line.text(b", driver answered ").number(exchange.answered),
+		};
+	}
+	match exchange.outcome {
+		Negotiated::At(agreed) => line.text(b" - agreed ").number(agreed),
+		Negotiated::Refused(refusal) => line.text(b" - refused: ").text(refusal.reason()),
+	};
+	crate::report(line.as_bytes(), b"");
+}
+
+/// A diagnostic line built in place, because this runs inside the loader's driver scan and must not
+/// allocate. Too long a line is cut rather than refused: it is a diagnostic, not a value.
+struct Line {
+	bytes: [u8; 192],
+	len: usize,
+}
+
+impl Line {
+	fn new() -> Line {
+		Line { bytes: [0; 192], len: 0 }
+	}
+
+	fn text(&mut self, text: &[u8]) -> &mut Line {
+		for byte in text {
+			if self.len < self.bytes.len() {
+				self.bytes[self.len] = *byte;
+				self.len += 1;
+			}
+		}
+		self
+	}
+
+	fn number(&mut self, value: u32) -> &mut Line {
+		let mut digits = [0u8; 10];
+		let mut at = digits.len();
+		let mut left = value;
+		loop {
+			at -= 1;
+			digits[at] = b'0' + (left % 10) as u8;
+			left /= 10;
+			if left == 0 {
+				break;
+			}
+		}
+		self.text(&digits[at..])
+	}
+
+	fn as_bytes(&self) -> &[u8] {
+		&self.bytes[..self.len]
 	}
 }
 

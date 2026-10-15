@@ -82,6 +82,12 @@ const MAX_SCAN_MS: u32 = 10_000;
 const MAX_SCAN_RESULTS: usize = 64;
 // A pairing attempt, whatever the peer does.
 const PAIRING_TICKS: u64 = 60 * TICKS_PER_SECOND;
+// HOW LONG ONE CALL THIS SERVICE MAKES MAY TAKE, so that nothing it calls parks the loop that answers every client and
+// fires every timer. A controller's transport answers a send once the controller has taken the packet - at once, for
+// one with room - and the catalogue's open and the transport's own calls are as quick: five seconds of either is a
+// transport that has stopped. The bond store has ten, a durable commit through StorageService included.
+const CALL_TICKS: u64 = 5 * TICKS_PER_SECOND;
+const BOND_TICKS: u64 = 10 * TICKS_PER_SECOND;
 // The one timer every deadline here is in: a hundred ticks is a second.
 const TICKS_PER_SECOND: u64 = 100;
 // The version of the HCI transport this host speaks.
@@ -272,6 +278,9 @@ struct Controller {
 	bredr_state: classic::ControllerState,
 	// The LE side: this host's privacy, and the bonded peripherals' reconnection.
 	le: le::LeState,
+	// A send was not answered within `CALL_TICKS`: nothing more is sent until the driver reports a reset, and the loop
+	// ends the session (`Stack::end_stalled`).
+	stalled: bool,
 }
 
 struct Stack {
@@ -406,7 +415,7 @@ fn scrub_record(record: &mut BondRecord) {
 
 // A request encoded here, sent and answered over one channel. The reply comes back in a vector this service
 // owns, for the caller to zero once it has read it; no key rides in a capability, so any that arrive are closed.
-// THE BOND STORE'S REPLIES, MATCHED TO THE REQUEST THEY ANSWER.
+// THE REPLIES OF THE BOND STORE, OF A CONTROLLER'S TRANSPORT AND OF THE CATALOGUE, MATCHED TO THE REQUEST THEY ANSWER.
 //
 // The store is reached through a duplicate of its root, so a restarted service holds the same end its
 // predecessor held - and a reply the store sent to a request the killed predecessor never read is still
@@ -416,27 +425,28 @@ fn scrub_record(record: &mut BondRecord) {
 // set no private address and gave the controller no resolving list, and no bonded LE device that uses a
 // private address was reconnected. Each request goes out under a correlation this process has not used
 // before, the reply to it is the one carrying it, and anything else is dropped - zeroed first, since a
-// lookup's reply carries a key.
-static BOND_CORR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+// lookup's reply carries a key. Every call has a deadline (`CALL_TICKS`, `BOND_TICKS`), and the reply to one that
+// gave up on it is dropped the same way when it comes, never read as a later call's.
+static FRESH_CORR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-fn bond_corr() -> u32 {
-	if BOND_CORR.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+fn fresh_corr() -> u32 {
+	if FRESH_CORR.load(core::sync::atomic::Ordering::Relaxed) == 0 {
 		// SEEDED ONCE, so a successor's correlations are not its predecessor's.
 		let mut seed = [0u8; 4];
 		let seed = if random_get(&mut seed) == 4 { u32::from_le_bytes(seed) } else { clock() as u32 };
-		let _ = BOND_CORR.compare_exchange(0, seed | 1, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
+		let _ = FRESH_CORR.compare_exchange(0, seed | 1, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
 	}
-	match BOND_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) {
-		0 => BOND_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+	match FRESH_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) {
+		0 => FRESH_CORR.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
 		corr => corr,
 	}
 }
 
-struct BondTransport {
+struct StampedTransport {
 	chan: u64,
 }
 
-impl BondTransport {
+impl StampedTransport {
 	// Send `request` with its correlation - bytes 2..6 - replaced by a fresh one, and answer the reply carrying
 	// that one, with the caller's correlation put back so the caller decodes it as it always did.
 	fn exchange(&self, request: &mut [u8], request_handles: &[u64], reply_handles: &mut wire::Handles, deadline: u64) -> Result<Vec<u8>, wire::TransportError> {
@@ -445,7 +455,7 @@ impl BondTransport {
 		}
 		let mut asked = [0u8; 4];
 		asked.copy_from_slice(&request[2..6]);
-		let ours = bond_corr().to_le_bytes();
+		let ours = fresh_corr().to_le_bytes();
 		request[2..6].copy_from_slice(&ours);
 		if !send_caps_blocking(self.chan, request, request_handles) {
 			return Err(wire::TransportError::SendRefused);
@@ -471,9 +481,9 @@ impl BondTransport {
 	}
 }
 
-impl Transport for BondTransport {
-	// The generated calls - `list` and `delete` - carry two addresses and nothing secret, so the request may be
-	// copied to stamp it.
+impl Transport for StampedTransport {
+	// The generated calls - the bond store's `list` and `delete`, the catalogue's `open` and the transport's own - carry
+	// nothing secret, so the request may be copied to stamp it.
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut wire::Handles, deadline: u64) -> Result<Vec<u8>, wire::TransportError> {
 		let mut stamped = request.to_vec();
 		self.exchange(&mut stamped, request_handles, reply_handles, deadline)
@@ -491,20 +501,31 @@ impl Transport for BondTransport {
 // One raw request to the bond store, built in a buffer the caller owns and zeroes.
 fn bond_exchange(chan: u64, request: &mut [u8]) -> Option<Vec<u8>> {
 	let mut handles = wire::Handles::new();
-	let reply = BondTransport { chan }.exchange(request, &[], &mut handles, 0).ok();
+	let reply = StampedTransport { chan }.exchange(request, &[], &mut handles, clock().saturating_add(BOND_TICKS)).ok();
 	for &handle in handles.as_slice() {
 		close(handle);
 	}
 	reply
 }
 
-fn exchange(chan: u64, request: &[u8]) -> Option<Vec<u8>> {
+// One `hci-transport.send`, built in a frame the caller owns and zeroes, within its deadline.
+fn exchange(chan: u64, request: &mut [u8]) -> Result<Vec<u8>, wire::TransportError> {
 	let mut handles = wire::Handles::new();
-	let reply = ChannelTransport { chan }.call(request, &[], &mut handles, 0).ok();
+	let reply = StampedTransport { chan }.exchange(request, &[], &mut handles, clock().saturating_add(CALL_TICKS));
 	for &handle in handles.as_slice() {
 		close(handle);
 	}
 	reply
+}
+
+// What became of one send.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sent {
+	Taken,
+	// Refused by the transport: the controller never saw it.
+	Refused,
+	// Not answered in time: the controller has stopped taking packets, and its session ends as a fault ends it.
+	Unanswered,
 }
 
 // A `result` reply to one of those requests: `None` for one that is not an answer to it, `Some(Err)` for a
@@ -523,7 +544,7 @@ fn answered<T>(reply: &[u8], read: impl FnOnce(&mut wire::Reader) -> Option<T>) 
 // carry the LTK, a link key reply carries the link key, and the generated client would copy the packet into
 // a vector of its own and free that - and every smaller one it outgrew - with the key still in it. The reply
 // carries a count and nothing secret.
-fn send_packet(chan: u64, kind: HciPacketKind, packet: &[u8]) -> bool {
+fn send_packet(chan: u64, kind: HciPacketKind, packet: &[u8]) -> Sent {
 	let mut frame = alloc::vec![0u8; packet.len() + 16];
 	let len = (|| {
 		let length = u16::try_from(packet.len()).ok()?;
@@ -534,14 +555,21 @@ fn send_packet(chan: u64, kind: HciPacketKind, packet: &[u8]) -> bool {
 		frame.get_mut(at + 2..at + 2 + packet.len())?.copy_from_slice(packet);
 		Some(at + 2 + packet.len())
 	})();
-	let reply = len.and_then(|len| exchange(chan, &frame[..len]));
+	let reply = match len {
+		Some(len) => exchange(chan, &mut frame[..len]),
+		None => Err(wire::TransportError::SendRefused),
+	};
 	scrub(&mut frame);
-	reply.and_then(|reply| answered(&reply, |reader| reader.u32())).is_some_and(|result| result.is_ok())
+	match reply {
+		Ok(reply) if answered(&reply, |reader| reader.u32()).is_some_and(|result| result.is_ok()) => Sent::Taken,
+		Err(wire::TransportError::TimedOut) => Sent::Unanswered,
+		_ => Sent::Refused,
+	}
 }
 
-fn send_command(chan: u64, command: &[u8]) -> bool {
+fn send_command(chan: u64, command: &[u8]) -> Sent {
 	if command.len() + 16 > COMMAND_FRAME {
-		return false;
+		return Sent::Refused;
 	}
 	send_packet(chan, HciPacketKind::Command, command)
 }
@@ -624,7 +652,7 @@ impl Controller {
 	// which is the defect `hci::Credits` exists to rule out. Then whatever link data the buffers allow.
 	fn pump(&mut self) {
 		self.flush_links();
-		if self.outstanding.is_some() || self.pending.is_empty() {
+		if self.stalled || self.outstanding.is_some() || self.pending.is_empty() {
 			return;
 		}
 		if self.credits.take(Kind::Command).is_err() {
@@ -644,12 +672,16 @@ impl Controller {
 		scrub(&mut bytes);
 		self.credits.drained();
 		match sent {
-			true => self.outstanding = Some(op),
-			false => {
+			Sent::Taken => self.outstanding = Some(op),
+			Sent::Refused => {
 				// A SEND THE TRANSPORT REFUSED IS NOT OUTSTANDING, and the credit it took is given
 				// back: the controller never saw it and will never answer it.
 				self.credits.commands_completed(1);
 				print(b"BluetoothService: the transport refused a command\n");
+			}
+			Sent::Unanswered => {
+				self.credits.commands_completed(1);
+				self.unanswered();
 			}
 		}
 	}
@@ -694,7 +726,7 @@ impl Controller {
 	fn flush_links(&mut self) {
 		for at in 0..self.links.len() {
 			loop {
-				if self.links[at].outbox.is_empty() {
+				if self.stalled || self.links[at].outbox.is_empty() {
 					break;
 				}
 				let classic = self.links[at].is_classic();
@@ -707,13 +739,25 @@ impl Controller {
 				let sent = send_packet(transport, HciPacketKind::Acl, &packet);
 				let (pool, _) = self.pool(classic);
 				pool.drained();
-				if !sent {
+				if sent != Sent::Taken {
 					pool.acl_completed(1);
-					print(b"BluetoothService: the transport refused link data\n");
+					if sent == Sent::Refused {
+						print(b"BluetoothService: the transport refused link data\n");
+					} else {
+						self.unanswered();
+					}
 					break;
 				}
 			}
 		}
+	}
+
+	// A SEND NOT ANSWERED IN TIME: nothing more is sent, and the loop ends the session (`Stack::end_stalled`).
+	fn unanswered(&mut self) {
+		if !self.stalled {
+			print(b"BluetoothService: a controller did not take a packet in five seconds; nothing more is sent to it until its driver resets it\n");
+		}
+		self.stalled = true;
 	}
 
 	fn link(&self, handle: u16) -> Option<&Link> {
@@ -885,8 +929,8 @@ fn deliver(link: &mut Link, reports: &[InputReport]) {
 // ------------------------------------------------------------------ the bond store
 
 impl Stack {
-	fn bonds(&self) -> bluetooth_bond_store::Client<BondTransport> {
-		bluetooth_bond_store::Client::new(BondTransport { chan: self.bonds })
+	fn bonds(&self) -> bluetooth_bond_store::Client<StampedTransport> {
+		bluetooth_bond_store::Client::with_deadline(StampedTransport { chan: self.bonds }, clock().saturating_add(BOND_TICKS))
 	}
 
 	// The stored record for this controller and peer, KEYS INCLUDED - so only the callers that need a key or
@@ -1138,6 +1182,9 @@ impl Stack {
 		if op == service_logic::le_iso::opcode::LE_SET_CIG_PARAMETERS {
 			self.le_audio_cig(at, params);
 		}
+		if op == opcode::LE_SET_RANDOM_ADDRESS {
+			self.address_set(at, status);
+		}
 		self.classic_complete(at, op, status, params);
 	}
 
@@ -1217,8 +1264,17 @@ impl Stack {
 		if status != 0 {
 			controller.fail_attempt(&peer);
 			controller.reconnect = None;
-			// A STANDING ATTEMPT CANCELLED FOR A NEW LIST is taken up again with it now.
+			// A STANDING ATTEMPT CANCELLED FOR A NEW LIST is taken up again with it now - from a new private address first,
+			// where the cancellation was for one.
 			if relist {
+				if core::mem::take(&mut controller.le.rotate) {
+					self.rotate_address(at);
+				}
+				self.reconnect_bonded(at);
+			} else if !through_list {
+				// AN OPERATOR'S ATTEMPT THAT ENDED WITHOUT A LINK - refused, or cancelled at its sixty seconds - had set the
+				// standing attempt aside; it is taken up again now. (The standing attempt failing on its own is not
+				// re-armed here, which would retry a controller's refusal in a loop.)
 				self.reconnect_bonded(at);
 			}
 			return;
@@ -1242,6 +1298,12 @@ impl Stack {
 		link.reconnecting = reconnecting;
 		link.local = controller.le.local(local_address(controller));
 		controller.links.push(link);
+		// THE STANDING ATTEMPT ENDS WITH THE FIRST DEVICE IT CONNECTS, and the bonded peers still absent are waited for
+		// again at once: of two LE input devices, or the two earbuds of a set, the second came back only when the first
+		// left.
+		if through_list {
+			self.reconnect_bonded(at);
+		}
 		if pairing_peer {
 			self.start_le_pairing(at, handle, connection_peer);
 		} else {
@@ -1328,8 +1390,9 @@ impl Stack {
 		if link.is_classic() {
 			self.classic_gone(at, link);
 		} else {
-			// A BONDED PERIPHERAL GONE IS WAITED FOR AGAIN, through the accept list.
-			self.reconnect_bonded(at);
+			// A BONDED PERIPHERAL GONE IS WAITED FOR AGAIN, through the accept list - a NEW list with it on, where an
+			// attempt is already out for the others: that one is cancelled and taken up again once its cancellation lands.
+			self.relist(at);
 		}
 	}
 
@@ -1642,11 +1705,11 @@ impl Stack {
 				}
 			}
 			self.classic_timers(at, now);
-			// A NEW PRIVATE ADDRESS when the old one's time is up - not while a connection attempt is out, which the
-			// controller would refuse.
+			// A NEW PRIVATE ADDRESS when the old one's time is up - through a cancellation of the standing attempt where
+			// one is out, never while the operator's own attempt is, which the controller would refuse.
 			let controller = &self.controllers[at];
-			if controller.powered && controller.le.own.is_some() && now >= controller.le.rotate_at && !controller.le.accepting && controller.attempt.as_ref().is_none_or(|attempt| attempt.state != PairingState::Connecting) {
-				self.rotate_address(at);
+			if controller.powered && controller.le.own.is_some() && now >= controller.le.rotate_at && controller.attempt.as_ref().is_none_or(|attempt| attempt.state != PairingState::Connecting) {
+				self.rotate_due(at);
 			}
 		}
 	}
@@ -2170,21 +2233,21 @@ impl Stack {
 			print(b"BluetoothService: a third controller was published; this service drives two\n");
 			return;
 		}
-		let Some(Ok(transport)) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) else {
+		let Some(Ok(transport)) = provider_catalogue::Client::with_deadline(StampedTransport { chan: catalogue }, clock().saturating_add(CALL_TICKS)).open(&info) else {
 			print(b"BluetoothService: a published controller could not be opened\n");
 			return;
 		};
-		let mut client = hci_transport::Client::new(ChannelTransport { chan: transport });
-		let attachment: HciAttachment = match client.attach(&HCI_VERSION) {
+		let client = || hci_transport::Client::with_deadline(StampedTransport { chan: transport }, clock().saturating_add(CALL_TICKS));
+		let attachment: HciAttachment = match client().attach(&HCI_VERSION) {
 			Some(Ok(attachment)) => attachment,
 			_ => {
-				print(b"BluetoothService: a controller refused the transport version this host speaks\n");
+				print(b"BluetoothService: a controller refused the transport version this host speaks, or did not answer\n");
 				close(transport);
 				return;
 			}
 		};
-		let packets = client.receive().unwrap_or(0);
-		let control = client.control().unwrap_or(0);
+		let packets = client().receive().unwrap_or(0);
+		let control = client().control().unwrap_or(0);
 		if packets == 0 || control == 0 {
 			close(transport);
 			return;
@@ -2192,7 +2255,7 @@ impl Stack {
 		let limits = Limits::of(attachment.iso, attachment.max_command, attachment.max_event, attachment.max_acl, attachment.max_iso);
 		let queue = attachment.acl_queue.min(MAX_QUEUED as u32);
 		let acl_bytes = attachment.max_acl.saturating_sub(4).max(27);
-		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, sco_bytes: if attachment.sco { attachment.max_sco.min(258) } else { 0 }, extended: false, le_audio_capable: false, iso_free: 0, iso_dropped: 0, iso_reassembly: service_logic::le_iso::Reassembly::default(), unclassified: 0, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new() };
+		let mut controller = Controller { info, transport, packets, control, limits, credits: Credits::new(attachment.command_credits.clamp(1, 1), attachment.acl_credits, queue), bredr: Credits::new(1, attachment.acl_credits, queue), le_bytes: acl_bytes, bredr_bytes: acl_bytes, sco_bytes: if attachment.sco { attachment.max_sco.min(258) } else { 0 }, extended: false, le_audio_capable: false, iso_free: 0, iso_dropped: 0, iso_reassembly: service_logic::le_iso::Reassembly::default(), unclassified: 0, le_shares: false, session: Session::new(attachment.epoch), address: [0; 6], powered: false, secure_connections: false, classic: false, classic_sc: false, init: Init::Running, steps: VecDeque::new(), waiting_step: None, pending: Vec::new(), outstanding: None, public_key: None, scan: None, attempt: None, links: Vec::new(), reconnect: None, bredr_state: classic::ControllerState::new(), le: le::LeState::new(), stalled: false };
 		controller.start_init();
 		controller.pump();
 		self.controllers.push(controller);
@@ -2310,6 +2373,20 @@ impl Stack {
 		}
 	}
 
+	// A CONTROLLER THAT DID NOT TAKE A PACKET IN TIME has its session ended as a fault ends it: its links, scans and
+	// pairings are over, and it stays down until its driver reports a reset.
+	fn end_stalled(&mut self) {
+		for at in 0..self.controllers.len() {
+			if !self.controllers[at].stalled || !self.controllers[at].powered {
+				continue;
+			}
+			self.le_audio_reset(at);
+			let controller = &mut self.controllers[at];
+			controller.end_session();
+			controller.powered = false;
+		}
+	}
+
 	// What happened to one controller's transport.
 	fn drain_control(&mut self, at: usize, buf: &mut [u8]) -> bool {
 		loop {
@@ -2330,6 +2407,7 @@ impl Stack {
 					self.le_audio_reset(at);
 					let controller = &mut self.controllers[at];
 					controller.end_session();
+					controller.stalled = false;
 					controller.session.advance();
 					controller.start_init();
 					controller.pump();
@@ -2369,6 +2447,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut reply = alloc::vec![0u8; 8192];
 	let mut subscribed = subscription != 0;
 	loop {
+		stack.end_stalled();
 		stack.serve_audio_subscriber(&mut buf);
 		let mut waitset: Vec<u64> = Vec::with_capacity(8 + clients.len() + 3 * MAX_CONTROLLERS);
 		for root in [read_root, operator_root, profile_root, admin_root, audio_root, network_root] {

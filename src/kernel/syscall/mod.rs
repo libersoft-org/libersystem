@@ -2400,6 +2400,8 @@ fn sys_port_range_firmware(privilege: u64, base: u64, len: u64) -> i64 {
 			return port_refusal(refusal);
 		}
 	};
+	// The running instance's own ports, which its firmware-held rows may name - see `firmware::admit`.
+	crate::firmware::note_instance_ports(base, len);
 	thread.handles().lock().insert_reserved(Capability::new(range, Rights::MAP | Rights::TRANSFER)).raw() as i64
 }
 

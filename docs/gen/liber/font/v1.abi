@@ -18,6 +18,6 @@ interface font-catalogue
 method font-catalogue.list op=1 () -> result<list<face-record>, liber:base@1::error>:bound=64
 method font-catalogue.resolve-info op=2 (identity:face-identity:rights=) -> result<face-bytes, liber:base@1::error>
 method font-catalogue.resolve-into op=3 (identity:face-identity:rights=,generation:u64:rights=,target:handle<buffer-object>:rights=map+write) -> result<resolve-outcome, liber:base@1::error>
-method font-catalogue.subscribe op=4 () -> stream<generation-event>
+method font-catalogue.subscribe op=4 () -> result<stream<generation-event>, liber:base@1::error>
 interface font-catalogue-admin
 method font-catalogue-admin.rescan op=1 () -> result<rescan-outcome, liber:base@1::error>

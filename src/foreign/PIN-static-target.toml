@@ -40,7 +40,13 @@ target_name = "libvulkan.a"
 # The build reads the option set rather than restating it, and archives deterministically - without
 # `llvm-ar`'s `D` modifier two archives of identical objects differ and "reproducibly" is unprovable.
 path = "src/tools/build-foreign-static.sh"
-sha256 = "77e137ace4aec65f3574e2e1f1896c19678b2e8c48637bb24e456fc147c2ae26"
+# REFROZEN 2026-10-15, and the archives did not move. The builder now READS the lockfile instead of
+# restating it - the archives and their digests, this part's patch, the derived part's series, the
+# tool version lines and the bootstrap part's [build] - derives every tree it compiles from the
+# digest-checked archives and the pinned series on each run, takes the source list from upstream's
+# own CMakeLists, and checks its configuration against the bootstrap part before compiling. Rebuilt
+# with it, all three archives below come out digest for digest, and so do the three pass-2 ones.
+sha256 = "a96f1d4833014b74e2bc19214facf13c1867d440a673ab479a09c92e1d852b8c"
 option_deltas = "none beyond the bootstrap option set; the target is built from the loader's own sources under it"
 # THE BUILDER TAKES A SYSROOT AND THE ARCHIVES DO NOT DEPEND ON WHICH (2026-09-11). The profile
 # sysroot is sized by the inventory rather than by the option set, so building against it is how the

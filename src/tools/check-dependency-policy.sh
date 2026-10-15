@@ -42,10 +42,21 @@ note() {
 
 [[ -f "$POLICY" ]] || fail "$POLICY is missing - the policy is what every check below reads"
 
-# THE PERMISSIVE SET, AND IT IS A LIST RATHER THAN A PATTERN. A licence identifier this file does not
+# THE PERMISSIVE SET, AND IT IS A LIST RATHER THAN A PATTERN. A licence identifier the list does not
 # name has not been reviewed against the policy's test, and guessing from a prefix is how a
 # reciprocal licence with a permissive-looking name gets admitted.
-allowed=(Unlicense MIT BSD-2-Clause BSD-3-Clause ISC Apache-2.0 Zlib CC0-1.0 "Apache-2.0 WITH LLVM-exception")
+#
+# ONE LIST, AND THIS GATE IS ONE OF ITS TWO READERS. The system manifest compiles the same file in
+# and holds every row that declares a licence - a foreign library, an audit-produced program - to it;
+# a copy kept here would be a second review that agrees with the first until somebody edits one.
+LICENCES="src/tools/system-manifest/src/reviewed-licences.txt"
+[[ -f "$LICENCES" ]] || fail "$LICENCES is missing - it is the reviewed set every licence is checked against"
+allowed=()
+while IFS= read -r line; do
+	[[ -n "$line" && "${line:0:1}" != "#" ]] || continue
+	allowed+=("$line")
+done <"$LICENCES"
+[[ "${#allowed[@]}" -gt 0 ]] || fail "$LICENCES names no licence, so nothing could be admitted"
 
 is_allowed() {
 	local candidate="$1" known

@@ -99,3 +99,19 @@ fn feature_bits_and_key_types_are_named() {
 	}
 	assert_eq!(IoCapability::from_value(4), None);
 }
+
+#[test]
+fn a_bredr_key_shorter_than_its_link_key_promises_does_not_hold() {
+	// KNOB: one octet, under any key, is no encryption.
+	assert!(!key_size_holds(1, true) && !key_size_holds(1, false));
+	// Secure Connections: the whole sixteen octets, nothing less.
+	assert!(!key_size_holds(15, true));
+	assert!(key_size_holds(16, true));
+	// Any other key: seven octets at the least, which is what the Core specification allows.
+	assert!(!key_size_holds(6, false));
+	assert!(key_size_holds(7, false) && key_size_holds(16, false));
+	// The answer: status, handle, size - and too short an answer is none.
+	assert_eq!(encryption_key_size(&[0x00, 0x0B, 0x00, 0x10]), Some((0, 0x000B, 16)));
+	assert_eq!(encryption_key_size(&[UNKNOWN_COMMAND, 0x0B, 0x00, 0x00]), Some((UNKNOWN_COMMAND, 0x000B, 0)));
+	assert_eq!(encryption_key_size(&[0x00, 0x0B, 0x00]), None);
+}

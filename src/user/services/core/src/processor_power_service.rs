@@ -364,7 +364,9 @@ impl Service {
 // THE LOOP: the processors' notifications, the zones' and fans' publications and readings, the power source and the
 // operator.
 fn serve(service: &mut Service, bootstrap: u64, buf: &mut [u8]) -> ! {
-	let mut reply = alloc::vec![0u8; 8192];
+	// THE LARGEST ANSWER IS THE STATUS, every core, zone and fan in one reply - and each zone now carries its active trips
+	// with the fans they list, which eight kibibytes no longer held on a machine with many zones.
+	let mut reply = alloc::vec![0u8; 64 * 1024];
 	let mut control = bootstrap;
 	loop {
 		let mut waitset: Vec<u64> = Vec::new();

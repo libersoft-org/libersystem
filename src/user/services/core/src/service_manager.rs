@@ -2405,7 +2405,7 @@ fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Des
 				}
 				3 => {
 					// SystemGraphService queried the supervisor state; answer one request.
-					if !serve_stats_once(stats, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) {
+					if !serve_stats_once(stats, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, sleeper.failure(), buf) {
 						stats = 0;
 					}
 				}
@@ -2419,7 +2419,7 @@ fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Des
 				5 => {
 					// The sandboxed `lssvc` tool (granted the services capability) queried the
 					// supervisor state over its own status channel; answer one request.
-					if !serve_stats_once(stats2, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) {
+					if !serve_stats_once(stats2, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, sleeper.failure(), buf) {
 						stats2 = 0;
 					}
 				}
@@ -2474,7 +2474,7 @@ fn supervise(power: u64, system: u64, state: &mut [State; N], desired: &mut [Des
 				_ => {
 					// The BMC service asked for the status - whether the boot has settled. Its channel closing is that
 					// service ending, and the end is dropped unless a relaunch already replaced it.
-					if !serve_stats_once(status, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) && STATUS.compare_exchange(status, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+					if !serve_stats_once(status, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, sleeper.failure(), buf) && STATUS.compare_exchange(status, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
 						close(status);
 					}
 				}

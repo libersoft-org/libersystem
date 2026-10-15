@@ -44,26 +44,40 @@ builds_against = true
 # THE CMAKE OPTION SET IN FULL, WITH ITS VALUES. A configuration with some of its options chosen is
 # not one pinned configuration, and every later branch in this milestone - the ABI inventory, the
 # lifecycle set, the TLS variant, the symbol surface - is derived from this closure.
-BUILD_TESTS = "OFF"                  # the only reason C++17 would be required
-BUILD_WSI_XCB_SUPPORT = "OFF"        # LiberSystem is none of these window systems, and they
-BUILD_WSI_XLIB_SUPPORT = "OFF"       #   are what pull in X11/Wayland/XCB
+#
+# AND THE BUILDER IS HELD TO IT (2026-10-15). `build-foreign-static.sh` compiles without CMake, so
+# what these values mean is what the pinned revision's own CMake would do with them, and it checks
+# that before it compiles anything: every option named here must be one the pinned revision has; an
+# option with a compile-time effect must have exactly that effect - its define or flag present when
+# ON, absent when OFF; and an option the revision does not have is recorded "absent", never given a
+# value. Three were given one and are corrected below.
+BUILD_TESTS = "OFF"                # the only reason C++17 would be required
+BUILD_WSI_XCB_SUPPORT = "OFF"      # LiberSystem is none of these window systems, and they
+BUILD_WSI_XLIB_SUPPORT = "OFF"     #   are what pull in X11/Wayland/XCB
 BUILD_WSI_WAYLAND_SUPPORT = "OFF"
 BUILD_WSI_DIRECTFB_SUPPORT = "OFF"
-BUILD_WSI_SCREEN_QNX_SUPPORT = "OFF"
-LOADER_ENABLE_ASSEMBLY = "OFF"       # per-architecture asm with its own relocation forms, in
-#   the one thing this milestone measures
-LOADER_ENABLE_ADDRESS_SANITIZER = "OFF"            # and every other sanitizer: they add a runtime this
-LOADER_ENABLE_THREAD_SANITIZER = "OFF"             #   system does not have
-LOADER_ENABLE_UNDEFINED_BEHAVIOR_SANITIZER = "OFF"
-BUILD_WERROR = "OFF"                               # upstream warnings are not this milestone's to fix
-ENABLE_WIN10_ONECORE = "OFF"                       # not this platform
-USE_GAS = "OFF"                                    # following the assembly choice above
+# ABSENT, NOT OFF (corrected 2026-10-15): this revision has no such option - QNX is not built
+# through its CMake at all - and a value recorded for an option that does not exist is a guess.
+BUILD_WSI_SCREEN_QNX_SUPPORT = "absent"
+# ABSENT, NOT OFF (corrected 2026-10-15): assembly in this revision is `USE_GAS` on the Unix
+# platforms and `USE_MASM` on Windows, both pinned OFF below. The decision this line recorded - no
+# per-architecture asm, with its own relocation forms, in the one thing this milestone measures -
+# stands; it is those two options that carry it.
+LOADER_ENABLE_ASSEMBLY = "absent"
+LOADER_ENABLE_ADDRESS_SANITIZER = "OFF" # and every other sanitizer: they add a runtime this
+LOADER_ENABLE_THREAD_SANITIZER = "OFF"  #   system does not have
+# ABSENT, NOT OFF (corrected 2026-10-15): this revision gives undefined-behaviour checking no option of
+# its own - it comes with LOADER_ENABLE_ADDRESS_SANITIZER as `-fsanitize=address,undefined`, which
+# is OFF above.
+LOADER_ENABLE_UNDEFINED_BEHAVIOR_SANITIZER = "absent"
+BUILD_WERROR = "OFF"                                  # upstream warnings are not this milestone's to fix
+ENABLE_WIN10_ONECORE = "OFF"                          # not this platform
+USE_GAS = "OFF"                                       # no per-architecture assembly, see above
 USE_MASM = "OFF"
-LOADER_USE_UNSAFE_FILE_SEARCH = "OFF"              # the ambient-file search the discovery item replaces
-LOADER_CODEGEN = "OFF"                             # see [generated_sources]: they are vendored upstream
-CMAKE_BUILD_TYPE_inventory = "Debug"               # a symbol surface is easier to read from it
-CMAKE_BUILD_TYPE_production = "Release"            # and where the two disagree, Release is authoritative
-CMAKE_INSTALL_PREFIX = "run-private"               # nothing is installed into a system location
+LOADER_USE_UNSAFE_FILE_SEARCH = "OFF"                 # the ambient-file search the discovery item replaces
+LOADER_CODEGEN = "OFF"                                # see [generated_sources]: they are vendored upstream
+CMAKE_INSTALL_PREFIX = "run-private"                  # nothing is installed into a system location
+# CMAKE_BUILD_TYPE IS NOT AN OPTION OF THIS CONFIGURATION ANY MORE, and [build] below says why.
 
 # THE STATIC LOADER IS NOT OBTAINED FROM `BUILD_STATIC_LOADER`, which is an Apple-only option
 # upstream and is made to fail elsewhere. A portable static target is its own deliverable and is
@@ -85,21 +99,67 @@ files = [
 	"vk_loader_extensions.h",
 	"vk_object_types.h",
 ]
+# THE TREE DIGEST OF `loader/generated` AS THE ARCHIVE UNPACKS IT - every file's own digest and path,
+# in path order - and the builder recomputes it on the tree it is about to compile and refuses to
+# compile when it differs (2026-10-15; until then nothing read it).
 digest = "c7ed63a3a928518bfbf2ffe824a7649433fc123cee5872a856f215beeb225fba"
 
+[build]
+# THE ONE CONFIGURATION THAT IS COMPILED, LINKED AND MEASURED, and the builder reads it from here.
+#
+# CORRECTED 2026-10-15. This part used to name two CMake build types - `Debug` for pass 1's inventory
+# and `Release` for the production closure, Release authoritative where they disagree - and the
+# builder compiled neither: one configuration at -O2 with `NDEBUG` undefined and no debug
+# information, which every inventory, the audit link, both quarantine consumers and every guest run
+# were taken on. The pin now says what was built, and the two it used to name are MEASURED against
+# it rather than claimed:
+#
+#   Debug  (-O0 -g)           the same 52 symbols on all three targets. Nothing is lost by
+#                               measuring on the configuration that is built.
+#   Release (-O3 -DNDEBUG)    51: the same set less `__liber_assert_failed`, on all three targets.
+#                               With `NDEBUG` defined the profile sysroot's `assert` expands to
+#                               nothing, and that is the one symbol it reached.
+#
+# ASSERTIONS STAY LIVE because what this configuration produces is run - in a guest, as the loader a
+# test drives - and an upstream assertion that fails there must stop the process through the
+# substrate's `__liber_assert_failed`, which diverges, rather than continue past it. The substrate
+# therefore provides that symbol, the converged link resolves it, and the quarantine facility probe
+# resolves it too. A production import built as Release is the importing milestone's, and the
+# exact-surface rule takes the symbol out of the substrate there.
+#
+# Reproduce either measurement with `build-foreign-static.sh --build-type debug|release`.
+optimisation = "-O2"
+assertions = "live"  # `NDEBUG` is not defined
+debug_info = "none"  # no `-g`
+
 [toolchain]
-# IDENTITIES, VERSIONS AND FLAGS. The flags themselves live in the cross files, which are digested
-# below; naming them twice is two descriptions of one ABI.
-c_compiler = "clang"
-cxx_compiler = "clang++"
+# THE TOOLS THAT RUN, BY THE VERSION LINE EACH PRINTS, and the builds read them from here: the
+# builder refuses a compiler or an archiver whose line differs, and the audit link refuses a linker
+# whose line differs. The flags live in `profile-abi.sh`, which the static-target part digests;
+# naming them twice is two descriptions of one ABI.
+#
+# CORRECTED 2026-10-15. The linker was recorded as `ld.lld`, and nothing links with it: the audit link
+# and both quarantine consumers are linked by the `rust-lld` of the toolchain the repository root
+# selects, which is also what the image build links every foreign artifact with - so that is what is
+# pinned. The version was recorded without the package revision clang actually prints, so nothing
+# could compare it; it is the whole line now. `clang++` and `llvm-ranlib` stood here and nothing
+# runs either: `llvm-ar`'s `s` modifier writes the symbol index, and `clang++` only compiles the
+# forbidden-mechanism gate's mutation fixtures, which build nothing. The cross files below still name
+# `ld.lld`, inertly - no CMake build reads them; what they are checked for is the ABI they describe.
+compiler = "clang"
+compiler_version = "Debian clang version 19.1.7 (3+b1)"
 archiver = "llvm-ar"
-ranlib = "llvm-ranlib"
-linker = "ld.lld"
-version = "Debian clang version 19.1.7"
+archiver_version = "Debian LLVM version 19.1.7"
+linker = "rust-lld"
+linker_version = "LLD 21.1.8 (/checkout/src/llvm-project/llvm 85a90d119deb25b518867cd37d62c7b93b575a6f) (compatible with GNU linkers)"
 
 [cross_files]
 # ONE PER TARGET, each with its digest. Without these CMake compiles for the HOST, and that failure
 # is silent: the build succeeds and the inventory describes a system this one is not.
+#
+# NO BUILD RUNS CMAKE, so what makes these more than a description is a check: the builder requires
+# each file's target and ABI flags to be exactly the ones `profile-abi.sh` hands the compile
+# (2026-10-15). Two descriptions of one ABI may exist; two that disagree may not.
 x86_64 = { path = "src/foreign/cross/x86_64.cmake", target = "x86_64-unknown-none-elf", sha256 = "1455edd9d7c907245db141a8ef9a9d17f2e654437350203fe9524e89cf3b3a24" }
 # REFROZEN 2026-09-11, and the reason is recorded rather than left as a changed number. The first
 # version of this file declared `-mgeneral-regs-only`, on the assumption that a freestanding aarch64

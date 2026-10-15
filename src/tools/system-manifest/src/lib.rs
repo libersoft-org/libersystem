@@ -1290,6 +1290,10 @@ impl Manifest {
 			let licence = raw_library.licence.clone().unwrap_or_else(|| String::from("project"));
 			if licence.is_empty() || !licence.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+' | b'_')) {
 				push_error(&mut errors, format!("{location}.licence"), format!("{licence} is not a licence identifier"));
+			} else if licence != "project" && !reviewed_licences().any(|reviewed| reviewed == licence) {
+				// A WELL-SPELLED IDENTIFIER IS NOT A REVIEWED ONE. The policy refuses an unreviewed
+				// licence at build time, and this row is where the build first meets it.
+				push_error(&mut errors, format!("{location}.licence"), format!("{licence} is not in the reviewed permissive set - see docs/DEPENDENCY_POLICY.md"));
 			}
 			match producer {
 				Producer::Rust if !patches.is_empty() => push_error(&mut errors, format!("{location}.patches"), "a Rust library's sources are this tree's own; a patch series here patches nothing"),
@@ -1363,6 +1367,8 @@ impl Manifest {
 			let program_licence = raw_program.licence.clone().unwrap_or_else(|| String::from("project"));
 			if program_licence.is_empty() || !program_licence.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+' | b'_')) {
 				push_error(&mut errors, format!("{location}.licence"), format!("{program_licence} is not a licence identifier"));
+			} else if program_licence != "project" && !reviewed_licences().any(|reviewed| reviewed == program_licence) {
+				push_error(&mut errors, format!("{location}.licence"), format!("{program_licence} is not in the reviewed permissive set - see docs/DEPENDENCY_POLICY.md"));
 			}
 			// A LICENCE OTHER THAN THE PROJECT'S MEANS THIS PROGRAM CARRIES SOMEBODY ELSE'S CODE, and
 			// the only producer here that can is the quarantine one. A Rust program naming one would
@@ -1853,6 +1859,17 @@ const MAX_SLOT_CANDIDATES: usize = 16;
 /// And the kinds a launch admits, from the same module. A manifest able to declare a kind the launch
 /// refuses is a manifest able to describe an image that cannot start.
 const ADMITTED_SLOT_KINDS: [&str; 1] = ["vulkan-icd"];
+
+// THE REVIEWED PERMISSIVE SET, compiled in from the one file the dependency gate also reads. A row
+// that declares a licence declares somebody else's code inside an artifact, and the only licences
+// that may travel that way are the ones this project's policy reviewed - so the list is not restated
+// here, it is that file.
+const REVIEWED_LICENCES: &str = include_str!("reviewed-licences.txt");
+
+/// Every licence the dependency policy has reviewed, one SPDX expression each.
+pub fn reviewed_licences() -> impl Iterator<Item = &'static str> {
+	REVIEWED_LICENCES.lines().filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
 
 fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a str> {
 	if let Some(relative) = source.strip_prefix("user/libs/")

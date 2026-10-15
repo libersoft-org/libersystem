@@ -91,7 +91,14 @@ fn perf_table(read: &ProcessorPower) -> Option<abi::ProcessorPerfTable> {
 		table.coordination = domain.coordination;
 		table.processors = domain.processors;
 	}
-	if let (false, Some(control)) = (read.throttling.is_empty(), &read.ptc_control) {
+	// THROTTLING IS LEFT OUT where `_TSD` makes it a domain of several processors that software would coordinate - the
+	// same rule the kernel holds `_PSD` to: each core's level is decided alone, and two decisions on one shared throttle
+	// register fight. The performance states stay; only the throttling under them goes.
+	let coordinated = read.tsd.as_ref().is_some_and(|domain| domain.processors > 1 && procpower::perf::Coordination::from_type(domain.coordination) != Some(procpower::perf::Coordination::HardwareAll));
+	if coordinated {
+		say("a core's throttling is a software-coordinated domain of several processors - it is left out");
+	}
+	if let (false, false, Some(control)) = (coordinated, read.throttling.is_empty(), &read.ptc_control) {
 		table.throttle_control = register_abi(control);
 		for (at, state) in read.throttling.iter().take(abi::PROCESSOR_MAX_PERF_STATES).enumerate() {
 			table.throttle[at] = abi::ProcessorThrottleState { percent: state.percent, latency_us: state.latency_us, control: state.control };

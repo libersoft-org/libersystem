@@ -543,8 +543,8 @@ def self_test():
 	ppm.attach(2, 'dp')
 	ppm.answer(GET_CONNECTOR_STATUS | 2 << 16)
 	ppm.answer(ACK_CC_CI | 1 << 16 | 1 << 17)
-	cci, _, _, _ = ppm.answer(SET_NEW_CAM | 2 << 16 | 1 << 23 | 0 << 24 | 0x0805 << 32)
-	check('DisplayPort entered under the override', (cci & COMMAND_COMPLETE != 0, ppm.partners[2].cam, ppm.partners[2].configuration), (True, 0, 0x0805))
+	cci, _, _, _ = ppm.answer(SET_NEW_CAM | 2 << 16 | 1 << 23 | 0 << 24 | 0x0806 << 32)
+	check('DisplayPort entered under the override', (cci & COMMAND_COMPLETE != 0, ppm.partners[2].cam, ppm.partners[2].configuration), (True, 0, 0x0806))
 	check('the 1.2 status is nine bytes', len(ppm.partners[2].status(0x0120)), 9)
 	check('the slow profile delays three commands', PROFILES['slow']['slow'], 3)
 	if failures:

@@ -77,6 +77,8 @@ pub trait Platform {
 	fn release_power(&mut self, holder: &str);
 	/// `_DSW(1, target, 0)` on the node, or `_PSW(1)` where it has no `_DSW`.
 	fn enable_device_wake(&mut self, identity: &str, target: u64);
+	/// `_DSW(0, 0, 0)` on the node, or `_PSW(0)` where it has no `_DSW`: its wake disabled again.
+	fn disable_device_wake(&mut self, identity: &str);
 	/// The general-purpose event set for wake; false when the kernel refused it.
 	fn set_wake_event(&mut self, number: u16) -> bool;
 	fn clear_wake_event(&mut self, number: u16);
@@ -90,6 +92,8 @@ pub trait Platform {
 pub struct Sleeper {
 	armed: Vec<u16>,
 	holders: Vec<String>,
+	// The nodes whose device wake `prepare` enabled, for `wake` to disable.
+	enabled: Vec<String>,
 }
 
 impl Sleeper {
@@ -114,6 +118,9 @@ impl Sleeper {
 		for number in core::mem::take(&mut self.armed) {
 			platform.clear_wake_event(number);
 		}
+		// AND EVERY DEVICE WAKE `prepare` ENABLED IS DISABLED AGAIN - a driver cannot do it itself, since `_DSW` and `_PSW`
+		// are refused on its node channel. Left enabled, a node armed once stayed wake-enabled at the device through every
+		// later sleep, its driver's wish or not, and on a GPE shared with an armed node could wake the machine.
 		self.release(platform);
 		platform.root_method(SST, SST_WORKING);
 		platform.say("the platform is awake again");
@@ -141,6 +148,7 @@ impl Sleeper {
 			self.holders.push(holder);
 		}
 		platform.enable_device_wake(identity, target);
+		self.enabled.push(String::from(identity));
 		if platform.set_wake_event(number) {
 			self.armed.push(number);
 			platform.say(&format!("{identity} armed to wake the machine on general-purpose event {number:#04x}"));
@@ -149,7 +157,11 @@ impl Sleeper {
 		}
 	}
 
+	// WHAT A PREPARE TOOK, GIVEN BACK: the device wakes it enabled disabled, then the power their wake needed let go.
 	fn release<P: Platform>(&mut self, platform: &mut P) {
+		for identity in core::mem::take(&mut self.enabled) {
+			platform.disable_device_wake(&identity);
+		}
 		for holder in core::mem::take(&mut self.holders) {
 			platform.release_power(&holder);
 		}

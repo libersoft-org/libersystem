@@ -131,12 +131,12 @@ const STATUS_REPLY_BYTES: usize = 32 * 1024;
 
 // Answer one request on a supervisor stats channel. Returns false once the peer is
 // gone, so the standing supervisor drops that channel from its wait set.
-pub(super) fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desired; N], procs: &[u64; N], lifecycle: &LifecycleLog, sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
+pub(super) fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desired; N], procs: &[u64; N], lifecycle: &LifecycleLog, sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], sleep: Option<String>, buf: &mut [u8]) -> bool {
 	let (len, mut handle) = match recv_caps_blocking(stats, buf) {
 		ReceivedCaps::Message { len, handles } => (len, handles),
 		ReceivedCaps::Closed => return false,
 	};
-	let mut api = StatsApi { state, desired, procs, lifecycle, sup, reason, canary_sup, drivers };
+	let mut api = StatsApi { state, desired, procs, lifecycle, sup, reason, canary_sup, drivers, sleep };
 	// ONE ROW PER SERVICE, THE CANARY AND ONE PER MANIFEST DRIVER - which outgrew 4 KiB as the drivers grew, when the
 	// answer became `again` and `lssvc` and the BMC service's settled test both read nothing. On the heap, since the
 	// standing loop's stack holds the rest.
@@ -178,6 +178,8 @@ struct StatsApi<'a> {
 	reason: &'a [String; N],
 	canary_sup: &'a Supervised,
 	drivers: &'a [(&'static [u8], bool)],
+	// The last sleep's failure, when it failed - see `Sleeper::failure`.
+	sleep: Option<String>,
 }
 
 // What the supervisor WANTS, as one word.
@@ -227,6 +229,13 @@ impl supervisor::Service for StatsApi<'_> {
 		out.push(SupervisorStat { name: String::from("watchdog_probe"), state: String::from("running"), desired: String::new(), epoch: 0, last_reason: String::new(), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
 		for &(name, online) in self.drivers {
 			out.push(SupervisorStat { name: String::from_utf8_lossy(name).into_owned(), state: String::from(if online { "running" } else { "pending" }), desired: String::new(), epoch: 0, last_reason: String::new(), restarts: 0, watchdog_trips: 0, last_failure: String::new() });
+		}
+		// THE LAST SLEEP, WHEN IT FAILED: a row of its own, which the system graph shows as a failed node naming the step
+		// and the driver or service that refused or failed it - the third place a failed sleep is told, beside the log and
+		// `sleepctl last`. A refused `SUSPEND` leaves its binding online with no failure of its own, so without this the
+		// graph showed nothing at all.
+		if let Some(failure) = &self.sleep {
+			out.push(SupervisorStat { name: String::from("sleep"), state: String::from("failed"), desired: String::new(), epoch: 0, last_reason: String::new(), restarts: 0, watchdog_trips: 0, last_failure: failure.clone() });
 		}
 		Ok(out)
 	}

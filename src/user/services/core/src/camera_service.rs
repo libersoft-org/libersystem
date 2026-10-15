@@ -498,6 +498,14 @@ impl Service {
 					// for another stream - has selected nothing, and capture stays stopped.
 					Ok(Some(negotiated)) if negotiated.stream_generation != generation => Err(Error::Invalid),
 					Ok(Some(negotiated)) => match cs::verify(&expected, &selected_of(&negotiated)) {
+						// THE GRANT THAT ASKED IS GONE - its owner died, its connection closed or it was revoked
+						// while the provider negotiated - so the stream is nobody's. It is discarded at the
+						// producer and no run is made for it: a run for a retired grant is one nothing ever ends,
+						// and the camera answered `again` to every grant until the service restarted.
+						Ok(()) if self.grant_at(grant).is_none() => {
+							self.discard(camera, generation);
+							Err(Error::Closed)
+						}
 						Ok(()) if self.cameras[camera].run.is_some() => Err(Error::Again),
 						Ok(()) => {
 							self.cameras[camera].run = Some(Run { grant, stream: cs::Stream::new(generation, expected), clock: cs::DeviceClock::default(), stopping: None, ended: None, status_due: false });

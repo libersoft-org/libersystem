@@ -121,7 +121,7 @@ def production(root, overlay, *, candidate):
                'impl Hids {\n' + take(item(h, 'impl Hids {'), 'usb_hid.rs/Hids', 'pub const fn new(') + '\n}',
                'impl Hid {\n' + take(item(h, 'impl Hid {'), 'usb_hid.rs/Hid', 'pub fn release(') + '\n}']
     chunks += [take(n, 'usb_net.rs', anchor) for anchor in (
-        'struct Notify {', 'pub struct Net {', 'pub fn post_notification(',
+        'struct Notify {', 'struct Ncm {', 'pub struct Net {', 'pub fn post_notification(',
         'pub fn notification_due(', 'pub fn handle_notification(')]
     chunks += [constant(n, 'NOTIFY_BYTES'), constant(n, 'NOTIFY_WINDOW'),
                'impl Net {\n' + '\n'.join(take(item(n, 'impl Net {'), 'usb_net.rs/Net', anchor)
@@ -268,7 +268,7 @@ def production(root, overlay, *, candidate):
             'let mut uas: Option<(UsbDevice, Never)> = None;\n'
             'let mut network: Option<(UsbDevice, Net)> = None;\n'
             'let mut serials = EmptySerials; let mut sessions: Vec<Never> = Vec::new();\n'
-            'let mut buffers: Vec<Vec<u8>> = Vec::new(); let mut frame: Vec<u8> = Vec::new();\n'
+            'let mut buffers: Vec<Vec<u8>> = Vec::new(); let mut frame: Vec<u8> = Vec::new(); let mut received = Received::default();\n'
             'let mut hids = Hids::new(); let mut audio = (); let mut serving = Serving; let mut played_audio = false;\n'
             'let mut entered = false; loop { assert!(!entered); entered = true;\n'
             'let ready = common::ProviderReady::Consumer(0);\n' + service_code + '\n} } }\n}')

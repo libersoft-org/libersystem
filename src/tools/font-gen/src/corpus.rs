@@ -13,11 +13,13 @@
 //! read: every glyph is a rectangle, because what a shaper gate reads is which glyph and where, and
 //! an outline that varied per glyph would be a decision nothing checks. What they DO carry is real:
 //! a `cmap` per plane, real `GSUB` ligature, single and multiple substitutions, real `GPOS` pair and
-//! mark-to-base positioning, a real `GDEF` class definition, and real `fvar`/`gvar`/`HVAR`/`MVAR`.
+//! mark-to-base positioning - under `mark`, and under Devanagari's own `abvm` - a real `GDEF` class
+//! definition, and real `fvar`/`gvar`/`HVAR`/`MVAR`.
 //!
 //! AND THEY ARE NOT STAGED INTO ANY IMAGE. A face that exercises Khmer stacking has no business in
 //! a system volume; these live beside the gate that reads them, pinned by SHA-256 so a corpus that
-//! drifted is a failure rather than a quietly different test.
+//! drifted is a failure rather than a quietly different test. Two of them reach a guest all the same
+//! - see `INSTALLED` - through the test that installs them, never through an image.
 
 use crate::layout::{self, FeatureEntry, Lookup, ScriptEntry};
 use crate::variable;
@@ -108,6 +110,14 @@ fn alphabetic() -> Authored {
 		("dagesh", mark(90, 240, 330)),
 		("qamats", mark(160, -180, -90)),
 		("sheva", mark(120, -200, -110)),
+		// APPENDED, so every glyph above keeps its index. `<` and `>` are the pair a right-to-left
+		// paragraph draws one as the other - and neither is a bracket, so a mirroring answer taken
+		// from the bracket pairs would not reach them. The zero-width space is TRANSPARENT to Arabic
+		// joining and a line may break after it, which is the break that changes how the letters on
+		// either side of it are shaped.
+		("less", drawn(560, 500)),
+		("greater", drawn(560, 500)),
+		("zwsp", Glyph::blank(0)),
 	];
 	let id = |name: &str| glyphs.iter().position(|(known, _)| *known == name).expect("a glyph this face declares") as u16;
 
@@ -129,6 +139,9 @@ fn alphabetic() -> Authored {
 		(0x05B0, id("sheva")),
 		(0x05B8, id("qamats")),
 		(0x05BC, id("dagesh")),
+		(0x003C, id("less")),
+		(0x003E, id("greater")),
+		(0x200B, id("zwsp")),
 	];
 
 	// THE LOOKUP ORDER IS THE FACE'S MEANING. The joining forms run first and the required ligature
@@ -260,6 +273,10 @@ fn complex() -> Authored {
 
 	// THE THAI TONE MARK SITS ABOVE THE VOWEL, NOT ABOVE THE CONSONANT, which is why `mkmk` exists
 	// and why a face with only `mark` stacks the two on top of each other. This face carries both.
+	//
+	// AND DEVANAGARI'S REPH IS PLACED BY `abvm`, the Indic above-base mark feature - over the base it
+	// FOLLOWS, which is why a shaper must move it there first: a mark-to-base rule attaches a mark to
+	// the base before it, and a reph left in front of its consonant has none.
 	let gpos_lookups = vec![
 		// 0: mark - Thai and Khmer vowels and tone marks over their base, and Devanagari's reph.
 		Lookup::new(
@@ -277,8 +294,10 @@ fn complex() -> Authored {
 				2,
 			),
 		),
+		// 1: abvm - the reph over the right of its base.
+		Lookup::new(4, layout::mark_to_base(&[(id("dv.repha"), 0, (100, 640))], &[(id("dv.ka"), vec![(430, 620)]), (id("dv.kha"), vec![(450, 620)]), (id("dv.ra"), vec![(380, 620)])], 1)),
 	];
-	let gpos = layout::table(&[ScriptEntry { tag: *b"thai", features: vec![0] }, ScriptEntry { tag: *b"khmr", features: vec![0] }], &[FeatureEntry { tag: *b"mark", lookups: vec![0] }], &gpos_lookups);
+	let gpos = layout::table(&[ScriptEntry { tag: *b"thai", features: vec![0] }, ScriptEntry { tag: *b"khmr", features: vec![0] }, ScriptEntry { tag: *b"dev2", features: vec![1] }], &[FeatureEntry { tag: *b"mark", lookups: vec![0] }, FeatureEntry { tag: *b"abvm", lookups: vec![1] }], &gpos_lookups);
 
 	// The marks of this face are marks, and its consonants are bases. `dv.virama` and `km.coeng` are
 	// marks too: a Khmer coeng that a kerning pair did not skip would break every stacked cluster.
@@ -386,6 +405,14 @@ fn variable_face() -> Authored {
 pub fn faces() -> Vec<Authored> {
 	vec![alphabetic(), complex(), emoji(), variable_face()]
 }
+
+/// THE FACES A GUEST RUN INSTALLS: the two whose scripts the three-architecture claim is about.
+///
+/// STILL STAGED INTO NO IMAGE. The kernel's text conformance test carries them and writes them, with
+/// the declaration this generator writes beside each, into the font directory of the volume it runs
+/// against - so the guest program reaches them through the catalogue, as an application reaches a
+/// face, and a shipping volume never holds a face that exercises Thai mark stacking.
+pub const INSTALLED: [&str; 2] = ["conformance-alpha.ttf", "conformance-complex.ttf"];
 
 /// The pin file the gate reads: what each face hashes to, and what each of its glyphs is called.
 pub fn pins(digests: &[(String, [u8; 32])]) -> String {

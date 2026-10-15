@@ -38,24 +38,43 @@ pub enum BotFault {
 	Short { moved: u32, wanted: u32 },
 }
 
+// The status wrapper is thirteen bytes, and a shorter one is not a wrapper.
+pub const CSW_LEN: u32 = 13;
+
+// A status wrapper as it arrived: its four fields, and how many of its thirteen bytes the transport
+// actually delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Csw {
+	pub signature: u32,
+	pub echoed_tag: u32,
+	pub residue: u32,
+	pub status: u8,
+	pub received: u32,
+}
+
 // What a status wrapper says about the command that produced it, in bytes actually transferred.
 //
-// `wanted` is the data stage's length as the command block asked for it; `moved_hint` is what the
-// transport itself observed, which is checked against the device's own residue - two independent
-// accounts of the same number, and a disagreement is the device's word against the transport's.
-pub fn csw_outcome(signature: u32, echoed_tag: u32, expected_tag: u32, status: u8, residue: u32, wanted: u32, allow_short: bool) -> Result<u32, BotFault> {
-	if signature != CSW_SIGNATURE || echoed_tag != expected_tag {
+// `wanted` is the data stage's length as the command block asked for it; `observed` is what the
+// transport itself delivered in that stage - the transfer event's length - and it is checked
+// against the device's own residue: two independent accounts of the same number, and the smaller is
+// what moved. A device that answers residue zero after a data stage that came up short has called
+// a buffer whose tail is the previous command's complete.
+//
+// A WRAPPER SHORTER THAN THIRTEEN BYTES IS NOT ONE. Its missing bytes read as whatever the buffer
+// held - the zeroes the driver cleared it to - and a status byte of zero is PASS.
+pub fn csw_outcome(csw: &Csw, expected_tag: u32, wanted: u32, observed: u32, allow_short: bool) -> Result<u32, BotFault> {
+	if csw.received != CSW_LEN || csw.signature != CSW_SIGNATURE || csw.echoed_tag != expected_tag {
 		return Err(BotFault::Framing);
 	}
-	if status != CSW_STATUS_PASS {
-		return Err(BotFault::Status(status));
+	if csw.status != CSW_STATUS_PASS {
+		return Err(BotFault::Status(csw.status));
 	}
 	// THE RESIDUE IS CHECKED BEFORE IT IS SUBTRACTED. A residue larger than the transfer describes
 	// bytes that were never asked for, and subtracting it wraps into a very large "moved".
-	if residue > wanted {
+	if csw.residue > wanted {
 		return Err(BotFault::Residue);
 	}
-	let moved = wanted - residue;
+	let moved = (wanted - csw.residue).min(observed);
 	if !allow_short && moved < wanted {
 		return Err(BotFault::Short { moved, wanted });
 	}

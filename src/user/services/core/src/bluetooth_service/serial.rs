@@ -13,7 +13,7 @@
 use super::*;
 use proto::system::{SerialBytes, bluetooth_serial};
 
-// Serial grants alive at once, across every controller.
+// Grants alive at once, across every controller: the serial port's and GATT's together (`Stack::minted`).
 const MAX_SERIALS: usize = bt_bounds::MINTED_GRANTS;
 // How long a connect may take - a page, the stored key, an SDP search and RFCOMM - before it is answered timed out.
 const CONNECT_TICKS: u64 = 15 * TICKS_PER_SECOND;
@@ -114,7 +114,7 @@ impl gatt::AdminView<'_> {
 		if owner == 0 {
 			return Err(Error::Invalid);
 		}
-		if alias.is_empty() || self.stack.serials.len() >= MAX_SERIALS {
+		if alias.is_empty() || self.stack.minted() >= MAX_SERIALS {
 			close(owner);
 			return Err(if alias.is_empty() { Error::Invalid } else { Error::Exhausted });
 		}

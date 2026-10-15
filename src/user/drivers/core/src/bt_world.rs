@@ -205,6 +205,9 @@ struct Device {
 	hf_wanted: bool,
 	// A push the gate asked for: its size, and when it starts.
 	opp_wanted: Option<(u32, u64)>,
+	// THE ENCRYPTION KEY'S LENGTH its links negotiate, in octets: sixteen, unless the gate shortened it - LMP's
+	// key-size negotiation is not authenticated, and a radio attacker can bring it down to one (KNOB).
+	key_size: u8,
 }
 
 pub struct World {
@@ -430,7 +433,7 @@ impl Default for World {
 
 impl World {
 	pub fn new(seed: u64) -> World {
-		World { devices: DEVICES.iter().map(|spec| Device { spec, key: None, key_type: 0, reset: false, next_type: None, link: None, paging: false, hf_wanted: false, opp_wanted: None }).collect(), scan: 0, log: VecDeque::new(), random: seed | 1, transaction: 1, typing: Vec::new(), now: 0, derived: None }
+		World { devices: DEVICES.iter().map(|spec| Device { spec, key: None, key_type: 0, reset: false, next_type: None, link: None, paging: false, hf_wanted: false, opp_wanted: None, key_size: 16 }).collect(), scan: 0, log: VecDeque::new(), random: seed | 1, transaction: 1, typing: Vec::new(), now: 0, derived: None }
 	}
 
 	fn say(&mut self, line: String) {
@@ -752,6 +755,16 @@ impl World {
 				out.push(status(opcode, 0));
 				out.extend(self.sco_down(handle_of(params)));
 			}
+			// READ ENCRYPTION KEY SIZE: what the link's encryption negotiated.
+			0x1408 => {
+				let handle = handle_of(params);
+				let h = handle.to_le_bytes();
+				match self.by_handle(handle) {
+					Some(at) if self.devices[at].link.as_ref().is_some_and(|link| link.encrypted) => out.push(complete(opcode, &[0, h[0], h[1], self.devices[at].key_size])),
+					// No link, or one not encrypted: the Core specification's Unknown Connection Identifier.
+					_ => out.push(complete(opcode, &[0x02, h[0], h[1], 0])),
+				}
+			}
 			0x0406 => {
 				let handle = handle_of(params);
 				let at = self.by_handle(handle)?;
@@ -1023,6 +1036,12 @@ impl World {
 			21 => out.extend(self.hf_press(at, "AT+BCC")?),
 			// THE PHONE PUSHES AN OBJECT of `argument` bytes, five seconds from now.
 			22 => out.extend(self.opp_push(at, argument)?),
+			// THE KEY LENGTH ITS NEXT ENCRYPTION NEGOTIATES, one to sixteen octets.
+			23 => {
+				let octets = u8::try_from(argument).ok().filter(|octets| (1..=16).contains(octets)).ok_or("a key size is one to sixteen octets")?;
+				self.devices[at].key_size = octets;
+				self.say(format!("key size {octets} for {}", self.short(at)));
+			}
 			14 => {
 				let remote = self.interrupt(at).ok_or("the gamepad's input is not connected")?;
 				let buttons = (argument as u16).to_le_bytes();
@@ -1356,6 +1375,10 @@ impl World {
 				let mut data = remote.to_le_bytes().to_vec();
 				data.extend_from_slice(&cid.to_le_bytes());
 				out.extend(self.signal(at, 0x06, None, &data));
+				// A PUSH WAITED FOR THIS SEARCH: its channel next.
+				if uuid == opp::OBJECT_PUSH {
+					out.extend(self.opp_searched(at));
+				}
 			}
 			(0x0001, _) => out.extend(self.sdp_server(at, remote, payload)),
 			(0x0003, _) => out.extend(self.rfcomm_receive(at, cid, remote, payload)),

@@ -63,9 +63,12 @@ impl DeviceMemory {
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None), write_back: false })
 	}
 
-	// The real one: minted under a claim, and stamped with it - what `SYS_DEVICE_CLAIM` hands out.
+	// The real one: minted under a claim, and stamped with it - what `SYS_DEVICE_CLAIM` hands out. ITS MEMORY TYPE IS THE
+	// MAP'S, as the firmware service's regions' is: write-back where the range is wholly firmware memory, uncached for
+	// registers - so a node's own region the service maps inside the claim is never a second type for the same range.
 	pub fn for_claim(key: abi::ClaimKey, phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None), write_back: false })
+		let write_back = crate::firmware::claim_write_back(phys_base, len as u64);
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None), write_back })
 	}
 
 	// THE FIRMWARE INTERPRETER'S REGION, derived from no claim: the policy admitted the range, and chose its memory

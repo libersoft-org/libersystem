@@ -732,7 +732,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	let mut clients: Vec<Client> = Vec::new();
 	let mut buf = alloc::vec![0u8; 8192];
-	let mut reply = alloc::vec![0u8; 8192];
+	// THE LARGEST ANSWER IS `sources` AT THE REGISTRY'S BOUND, in one reply: 128 snapshots of at most 409 bytes each at
+	// the record's own bounds, and seven bytes of header - 52 359 bytes, which power-proto's own test measures through
+	// the generated dispatch. Eight kibibytes held twenty; past them the dispatch answered `again` for good, and the
+	// enumeration a read grant promises failed inside the bound the service declares.
+	let mut reply = alloc::vec![0u8; 64 * 1024];
 	let mut subscribed = subscription != 0;
 	loop {
 		let mut waitset: Vec<u64> = Vec::with_capacity(4 + clients.len() + 2 * service.providers.len() + service.subscribers.len());

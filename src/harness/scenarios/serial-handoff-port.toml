@@ -29,6 +29,40 @@ command = "echo handoff-through-the-driver"
 contains = "handoff-through-the-driver"
 timeout = 60
 
+# 1b. ACROSS A SLEEP: a suspend to idle while the driver holds the UART - the kernel's sleep entry lends it and gives it back
+# with the driver's settings - and then round-tripped through the driver again. The kill below reports its zero count over
+# a hold that included the sleep.
+
+[[step]]
+do = "serial-sh"
+command = "sleepctl suspend idle 3"
+contains = "accepted"
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "sleep: entered"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "sleep: resumed"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "expect"
+contains = "ServiceManager: sleep: the transaction ended - slept and woke"
+unordered = true
+timeout = 120
+
+[[step]]
+do = "serial-sh"
+command = "echo handoff-after-the-sleep"
+contains = "handoff-after-the-sleep"
+timeout = 60
+
 # 2. THE DRIVER KILLED: the kernel takes the UART back - zero kernel accesses while the driver held it - and DeviceManager
 # restarts the driver, which takes it again.
 
