@@ -3694,3 +3694,80 @@ RUN TODAY (2026-10-12), all PASS, on the tree with the worker-pool mailbox, the 
 - Earlier today on the same tree: `kernel.services.the_2d_demo_draws_the_same_frames_through_its_workers` and the 3D worker/emergency-kill tests PASS on aarch64 and riscv64 (P02M0099 lanes), `qemu-3d-demo`/`qemu-3d-extended` PASS on x86_64.
 
 DOCUMENTS: `docs/PERF.md` "The 2D floor on the current tree (2026-10-12)"; `docs/todo/P02M0103.md` both items ticked with their evidence and the status line COMPLETE; `docs/todo/TODO.md` row ticked COMPLETE (2026-10-12).
+
+AUDITOR'S REVIEW ON P02M0103 (2026-10-15T04:30:07Z):
+
+**Rating: 6/10.** P02M0103 is marked COMPLETE. I sampled its most important claims against the current code: the two performance floors and their gates, the compiled shader path the 3D floor depends on, the `rt::pool` hand-off, DisplayService present validation and cleanup, and how the conformance suites define "conforms". Most of what I checked holds up. `soft2d-bench --check` (run by `./check.sh --gate soft2d-performance`) exits non-zero when a median exceeds min(frozen budget, ceiling), and it checks the frozen counts before the clock starts. `qemu-3d-demo` requires the documented 32-vCPU KVM guest, three 640x480 windows of 30 intervals within 1 s, a median of at most 33.3 ms, and zero render and loop allocations. Those allocations are counted by the process-wide heap counter, which includes worker threads. The compiled shader instructions reproduce the interpreter's f32 expressions in the same operand order, and stages fall back to the interpreter when the compiled path does not apply. The pool's open/inside handshake keeps a late worker away from a closed call. DisplayService validates every damage rectangle before copying any, and blits a new generation's first present whole. However, soft2d computes every spatial filter one 64-pixel tile at a time and treats everything outside the tile as transparent. Blur, offset, drop-shadow and backdrop results are therefore wrong at every tile boundary, including in the benchmark's own `UI-effects` scene and in the 2D demo. The conformance suite cannot see this: every filter scene fits in one tile, and scenes are checked against suite-local probe tolerances rather than the frozen thresholds. There are also two smaller gaps: the benchmark does not freeze its kernels or content, and the 3D gate does not bound present latency.
+
+## Findings
+
+1. **High - Defect: soft2d computes spatial filters per 64x64 tile, drawing nothing beyond the tile and reading nothing from beyond it, so Blur, Offset, drop-shadow and Backdrop output is cut or faded at every tile boundary.**
+   What is wrong:
+   - `replay` resets the clip stack to the bare tile (`clips.reset(tile)`, /data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:1328).
+   - Every draw into an open layer is clipped to `layer.bounds ∩ clips.bounds()` (backend.rs:1355-1360; also 1368 and 1377 for glyphs and lines). So nothing is ever rasterised into the margin a filtered layer is given around the tile. That margin comes from `layer_bounds` (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/layer.rs:99-107, called at backend.rs:1467-1468), and its scratch is sized `TILE_SIZE + 2*expansion` (backend.rs:895).
+   - Commands are binned by their un-expanded geometry bounds (`Bins::build(&tiling, &bounds)`, backend.rs:893; /data/yellow/libersystem/src/user/libs/graphics/soft2d/src/tile.rs:77-104). Layer content in a neighbouring tile is therefore not replayed at all in the tile its blur or offset reaches.
+   - `FilterNode::Source` copies that empty margin (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/filter.rs:74).
+   - For a top-level layer, `FilterNode::Backdrop` copies from the lane's 64x64 `Tile` (backend.rs:1487-1490, filter.rs:78). That tile's `get` and `read_run` return TRANSPARENT outside the tile (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/target.rs:513-548).
+
+   Concrete consequences, derived from these code paths:
+   - An opaque 100x100 square at (100,100) inside a `Blur{4,4}` layer on a 256x256 target is blurred, in the tiles on each side of x/y = 128 and 192, as if the square ended at the tile edge. Its blurred alpha falls to about 0.5 in bands about 12 px wide across its interior, where it should stay at 1.0.
+   - In the frozen `UI-effects` scene (/data/yellow/libersystem/src/tools/soft2d-bench/src/main.rs:612-643), the five first-row cards have layer bounds y 28..202 and fills y 40..190. Their drop shadows (dy=5, sigma 4) are missing for y 192..202, because tile row 3 replays those layers with no content.
+   - The frosted panel (80,180)-(560,300) blurs against transparent along x=128..512 and y=192/256.
+   - `test2d-sw`'s frosted panel has the same problem (/data/yellow/libersystem/src/user/apps/tools/src/test2d_sw.rs:239-247, about 179..379 x 58..154 at 640x480).
+   - The profile defines `Backdrop` as "what is already under the layer" (/data/yellow/libersystem/docs/graphics/RENDER2D_PROFILE_1.md:185), not what lies under it inside one renderer tile.
+
+   Why nothing caught it:
+   - Every filter and layer conformance scene renders into 32x32, which is one tile (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/filters.rs:12-15,60,95,200; layers.rs:14,29,46).
+   - So do soft2d's `every_filter_node_does_its_own_work` and its backdrop check (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/tests.rs:823-917).
+   - The multi-worker schedule tests and `soft2d-bench --scaling` compare tiled output with tiled output.
+
+   Why it matters: Gaussian blur, drop shadow, offset, backdrop, convolution, morphology and displacement are mandatory Profile 1 entries. Part `c` ("the whole `FilterGraph`") and the "2D is complete" clause are not met for any filtered layer that crosses a tile boundary, which is the normal case in a UI. The `UI-effects` floor (54.8 ms against the frozen 65.640 ms in docs/PERF.md, 2026-10-14) was measured on a replay that skips this margin work.
+
+   Fix: rasterise layer content over the whole layer rectangle, and bin commands inside filtered layers by their bounds grown by the graph's expansion. Give `Backdrop` the content under the layer beyond the tile. Add a multi-tile filter scene with expected values. After the fix, `UI-effects` has to be measured again against its frozen budget.
+
+2. **Medium - Defect: the conformance suites do not apply the frozen conformance thresholds, so "conforms" is measured against suite-local tolerances.**
+   What `graphics-profile` freezes for render2d (/data/yellow/libersystem/src/user/libs/graphics/profile/src/thresholds.rs:31-34):
+   - every pixel of the target is compared;
+   - pixels whose analytic coverage is exactly 0 or 1 must match exactly;
+   - partially covered pixels may differ by at most 2/255, with a mean of at most 1/255;
+   - filter kernels must be within 1e-3 relative of the kernel computed at f64.
+
+   The `s` item says no backend may be declared complete until its thresholds are "fixed and exercised". The suites that `d` and `h` close on do something else:
+   - `conformance2d` reads a few probe pixels per scene with its own `near`, which allows ±2 code values (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/harness.rs:97-100).
+   - It applies that tolerance even to fully covered colour probes, such as all 13 operators and every blend mode (compositing.rs:39-45). The frozen edge policy requires an exact match there.
+   - No scene compares the whole target or checks the mean bound.
+   - The Gaussian scene only checks that the blur fades with distance (filters.rs:26-35).
+   - Nothing compares `soft2d::filter::kernel` (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/filter.rs:491-511) with an f64 Gaussian. `filter/tests.rs:3-34` checks the blur against the same f32 weights.
+   - `conformance3d` uses `close`, meaning |a-b| < 1/255 (/data/yellow/libersystem/src/user/libs/graphics/conformance3d/src/harness.rs:502-505). It applies this to `Depth32F` values too (depth.rs:82,115,119), where the registry allows at most 1 ULP (thresholds.rs:39).
+
+   The only place the frozen coverage thresholds are exercised is soft2d's `coverage_meets_the_frozen_threshold_against_the_analytic_area` (tests.rs:1316-1371), and only for axis-aligned rectangles. So "112 passed / conforms" is measured against tolerances the frozen thresholds do not state. Comparing the whole target of any multi-tile filter scene would have exposed finding 1.
+
+3. **Low - Defect: the headless 2D benchmark freezes only command and resource counts, not kernels, extents or content.**
+   - Before the clock starts, `soft2d-bench` asserts only `commands().len()` and `resource_count()` (/data/yellow/libersystem/src/tools/soft2d-bench/src/main.rs:274-284).
+   - The item requires freezing "command/resource counts, extents, kernels and deterministic content ... so a later simplification cannot lower the workload silently".
+   - These changes keep both counts the same: a blur sigma in `ui_effects` (main.rs:623, 637), a destination rectangle in `image_convert` (main.rs:706-721), or a generated image's extent (main.rs:565-571). `./check.sh --gate soft2d-performance` (/data/yellow/libersystem/src/tools/check-soft2d-performance.sh:7) would then pass the lighter scene against the same frozen budget.
+   - Fix: freeze a digest of each list's canonical encoding and of the generated images.
+
+4. **Low - Defect: the 3D floor gate does not enforce "bounded present latency" and does not measure resize allocation separately.**
+   - Item `i`'s floor is "a stable 30 FPS ... plus bounded present latency".
+   - `qemu-3d-demo` only checks that a `present_max_us` field is printed (/data/yellow/libersystem/src/tools/check-qemu-3d-demo.sh:309). Its only numeric checks are the median and the 30-interval window (:313-314). Nothing bounds present time or the largest interval.
+   - The same sentence says a resize and a texture upload "are measured separately". `test3d-sw`'s `Step::Rebuild` path (/data/yellow/libersystem/src/user/apps/tools/src/test3d_sw.rs:1632-1662) counts no allocations.
+   - The recorded numbers are fine (slowest present 11.9 ms); the gate just does not enforce them.
+
+5. **Low - Optional: the `image-convert` (and `image-resample`) replay no longer measures colour conversion.**
+   - `prepare` caches the device-space samples of every top-level image draw (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:988-1019, `CachedPaint::prepare`). Conversion, YUV reconstruction and mip filtering therefore run at prepare time: 72 ms and 60 ms (docs/PERF.md, 2026-10-14).
+   - `image-convert` ends with an opaque full-frame YUV draw (main.rs:720). `refresh_tiles_without_backdrop` (backend.rs:660-681) marks every tile as covered, and replay skips all 13 earlier draws (backend.rs:1323-1336).
+   - Both mechanisms are exact and the floor is defined on "prepared replay", so this complies with the item. But the 16.7 ms ceiling of a scene defined as "scaling and colour conversion, including one YUV source" now bounds one cached copy plus the encode.
+   - A video source gets a new content generation every frame and so pays `refresh_images` (backend.rs:362-402) every frame. No gate measures that. This is informational only.
+
+## Verification performed
+
+- Read the milestone's head and status notes. Read the `c`, `d` and `i` floor and acceptance items, the `s` thresholds item, the `a-wsi` damage item, the per-part Done clauses and the pass-10 list. Read the last implementer sections of this file (2026-10-11/12) and the docs/PERF.md sections for 2026-10-09, "The 3D demo at its floor", "The 2D floor on the current tree" and "UI-effects off the edge of its budget".
+- Floors and gates: read all of `soft2d-bench` main.rs, `check-soft2d-performance.sh`, the `check.sh` registration, all of `check-qemu-3d-demo.sh`, `check-3d-demo-package.py`, `test3d_sw.rs` (frame loop, allocation and interval accounting, report, HUD) and `rt` lib.rs's heap counters.
+- `rt::pool`: read all of pool.rs. I reasoned through the SeqCst open/inside handshake, the ASKING/PARKED/FINISHED caller states, stale mail, late workers and exit, and found no correctness defect. On aarch64/riscv64 the Relaxed pre-load in `take` can lose a ring, which costs only parallelism for one call.
+- 3D shaders: compared soft3d `compiled.rs` op implementations and `run`/`run_batch` with the interpreter's `operation`/`unary`/`binary`/`matrix_product`. Checked `frame.rs`'s batched flush and per-triangle early depth.
+- soft2d: read backend.rs prepare/render/replay (layers, clip stack, bins, opaque cover, image cache, `refresh_images`), filter.rs evaluate/regions/copy, layer.rs, tile.rs, the target.rs `Tile` raster, clip.rs, and the threshold and filter tests.
+- Conformance: read conformance2d (harness, compositing, filters, antialiasing, lib), conformance3d (harness, depth, lib), thresholds.rs, RENDER2D_PROFILE_1.md and the WSI damage rules.
+- WSI: read DisplayService present/reconfigure/blit and `pix::blit`, the `display_3d_cleanup.rs` kill/refund fixtures, and the guest conformance tests in applications.rs.
+- Ran `git log -S` on the tile-clip intersection; it was introduced in d3705b3d (2026-09-15).
+- This was a static, read-only review. Nothing was built, tested, gated or booted. Finding 1's pixel effects are derived from the code paths, not observed.

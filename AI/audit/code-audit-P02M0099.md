@@ -5034,3 +5034,116 @@ THE INTEGRATION ITEM IS DONE, and ticked; the milestone is COMPLETE for phase 2 
 3. THE WHOLE `./verify.sh`: the fifth run (2026-10-14 08:21-12:18 CEST, 14223 s) passed 238 of 240 steps. The two failures, `graphics-profile` and `opentype-profile`, were "profile-doc: docs/gen/render2d/backend-checklist.md differs from the profile": the checklist records each `@handles:` marker's line, and the soft2d filter change moved nine of them in `filter.rs` (diff: line numbers only). Regenerated with `cargo run --manifest-path src/tools/profile-doc/Cargo.toml`; both gates PASS. `./verify.sh --for docs/gen/render2d/backend-checklist.md --plan`: "nothing to verify: every changed path is declared not code". Every run and its fixes are recorded in the P02M0188 audit.
 4. Also reconciled: the bullet "THIS MILESTONE HAS NO COMPLETION CONDITION, BY DECISION (2026-08-30)" is marked as superseded by the 2026-09-13 correction near the head (this file closes when its last item does), which it had contradicted since.
 Status: COMPLETE (phase 2).
+
+AUDITOR'S REVIEW ON P02M0099 (2026-10-15T04:34:07Z):
+
+**Rating: 6/10.** The implementation is very broad, and in the parts sampled the host-tested decision cores are careful and defensive. Every block server applies `drivers::blk` (refusing the count and range, checking the transferred object's type, rights and size before mapping it), there is central virtqueue used-ring validation, and the HID parser is bounded. The USB descriptor walk, the per-class budget arithmetic, the CCID, UAC and NCM parsers, and the `driver-mutations` gate (which counts only a test that ran and FAILED) are all sound, and the gadget harness keeps to its removal rules. Three things keep the milestone from meeting what it requires. The NVMe driver has no timeout recovery: one late completion leaves the I/O queue of a boot-critical controller permanently broken. Six driver families were deleted from the checklist without a recorded decision, while the file still calls them open work. And the CDC-NCM network class was never bound, although an oracle for it now exists on this host. Behind these are DMA page leaks in the older xHCI class modules, which break the class-module lifecycle contract, and two low-severity items: the Bulk-Only Transport still does not check the data length the transport observed, and some drivers claim quiescence at a planned stop without stopping their controllers' DMA engines.
+
+## Findings
+
+1. **NVMe has no timeout recovery: one timed-out command leaves the I/O queue permanently broken, and the driver keeps sending it work (High, Defect).**
+   The item text requires "status and timeout recovery ... validate every completion ID/phase" (`/data/yellow/libersystem/docs/todo/P02M0099.md:2404-2408`).
+   - `Pair::wait` (`/data/yellow/libersystem/src/user/drivers/core/src/nvme_driver.rs:243-310`) returns `Fault::Timeout` at lines 271/287/293. The command is left outstanding.
+   - On the next request, the late completion sits in the slot that request waits on. `Reaped::Unexpected` (`nvme_driver.rs:296-301`) returns an error without consuming that entry: `cq_head` does not advance and the CQ doorbell is not rung. Every later `wait` reads the same stale slot and fails, so the queue never recovers while the driver runs.
+   - The decision module says what should happen instead: an unexpected id "is a reason to stop using the queue, not to fail one request" (`/data/yellow/libersystem/src/user/drivers/core/src/nvme.rs:148-151`). The driver does none of this. There is no controller reset or re-initialisation, no abort, and no report to DeviceManager. `serve_read`/`serve_write` (`nvme_driver.rs:782`, `819-850`) simply answer `STATUS_ERR` and keep submitting.
+   - Submissions keep going while completions are never consumed, so the controller can still run commands the driver has already answered as failed. They read from or write into the single shared data span:
+     - `serve_write` copies each new request into `controller.data`.
+     - `grow` (`nvme_driver.rs:400-417`) closes and replaces that span.
+     - So a write answered as failed can land later carrying the bytes a following request copied into the span, and `grow` can close a span the controller is still using for DMA.
+   - The bound that triggers this is `COMPLETION_SPINS = 200_000_000` (`nvme_driver.rs:45`). It is a raw spin count with no yield, over cacheable DMA memory, in a crate now built at opt-level 2 (`/data/yellow/libersystem/src/user/drivers/core/Cargo.toml:442-446`). Its length in wall-clock time therefore depends on the build and the CPU, the weakness `/data/yellow/libersystem/src/user/drivers/core/src/virtio.rs:780-784` already records for spin budgets. A slow host flush can exceed it.
+   - Impact: `nvme` is `lifecycle = "boot-critical"` (`/data/yellow/libersystem/src/user/services/manifest.toml:2125`) and serves `vol://system` in `boot-volume-controllers`. The driver keeps answering heartbeats, so it stays Online. After one timeout the system volume fails every request until reboot, and writes may be misdirected.
+   - For contrast, AHCI recovers from the same situation: `complete()` (`/data/yellow/libersystem/src/user/drivers/core/src/ahci_driver.rs:843-904`) restarts the port after a failure or timeout.
+   - The host test only asserts the classification (`/data/yellow/libersystem/src/user/drivers/core/src/nvme/tests.rs:334-345`). Nothing tests what the driver does next.
+
+2. **Six driver families were deleted from the checklist with no recorded decision, so the closure rests on a smaller scope that the file itself contradicts (Medium, Defect).**
+   - Which items, and when:
+     - The checkboxes for EHCI, OHCI/UHCI and ACPI NFIT/NVDIMM were removed in commit `2e2275f3`.
+     - The checkboxes for virtio-crypto, virtio-balloon/virtio-mem and virtio-fs were removed in `aa156096`.
+     - Both commits are dated 2026-09-17, and their messages are about other drivers.
+   - Items deleted in the same commit were re-homed in the reference table: UCSI, WDAT, Time and Alarm, and IPMI (rows `/data/yellow/libersystem/docs/todo/P02M0099.md:7361-7363` and `7366`, each naming P02M0202/0200/0197/0201). The six rows above are not (`P02M0099.md:7341-7343`, `7364-7365`, `7367`).
+   - The file still describes them as open work:
+     - "THE OTHER 21 ARE IMPLEMENTATION WORK AND ARE NOT BLOCKED - ... -crypto, -balloon/-mem, -fs, ... EHCI, OHCI/UHCI, ... NFIT" (`P02M0099.md:707-711`).
+     - "none of the work below was ever decided to be optional ... this document is finished when the last of them is" (`P02M0099.md:722-729`; the same wording in `/data/yellow/libersystem/docs/todo/TODO.md:183`).
+     - Meanwhile the status line says every item is done (`P02M0099.md:3-5`).
+   - Nothing else covers them:
+     - No driver for any of them exists under `src/`.
+     - No other milestone owns them; `P02M0104.md:26` only rejects virtio-fs as a transport.
+     - QEMU offers a model for every one of them (EHCI/OHCI/UHCI controllers, `nvdimm`, `virtio-crypto`, `virtio-balloon`, `virtio-mem`, vhost-user-fs). So the owner's 2026-10-13 rule does not explain the silence: under that rule an item leaves phase 2 only when it has no runnable oracle, and only with the reason written down (`/data/yellow/libersystem/AI/CLAUDE.md`).
+   - What closing this needs is implementation, or an explicit recorded owner decision, relocation, or out-of-phase-2 entry for each. It is not a request for new scope.
+
+3. **The CDC-NCM network class was never bound, although the item is ticked and an oracle now exists (Medium, Defect).**
+   - The item requires "USB CDC-ECM and CDC-NCM network classes ... feed the same capability-scoped frame transport NetworkService already consumes" (`P02M0099.md:5880-5885`). `configure_network` refuses every NCM adapter ("this controller drives ECM only - it is left unbound", `/data/yellow/libersystem/src/user/drivers/core/src/usb_net.rs:208-214`).
+   - The NCM framing in `drivers::cdc` (`nth16`, `Datagrams`, `ncm_block` in `/data/yellow/libersystem/src/user/drivers/core/src/cdc.rs:617-820`) has no production caller; only host tests use it. The MBIM module brings its own NTB16 parser instead (`/data/yellow/libersystem/src/user/drivers/core/src/mbim.rs:235-330`).
+   - The recorded reason was "there is no NCM device model in this harness" (`P02M0099.md:5941-5947`, `6059-6061`; `usb_net.rs:16-19`). It was written before the owner approved the host gadget harness on 2026-09-21, and it no longer holds:
+     - The running host kernel ships `usb_f_ncm` alongside the `usb_f_ecm`/`usb_f_acm`/`usb_f_uvc` functions the harness already uses.
+     - `usb-gadget.sh` simply has no `ncm` kind (`/data/yellow/libersystem/src/harness/usb-gadget.sh:153`).
+   - So this half has a runnable oracle under the owner's rule, yet it is neither implemented nor recorded as out of phase 2.
+
+4. **The older xHCI class modules leak DMA pages on detach and on failed configuration, so the class budget no longer tracks memory (Medium, Defect).**
+   - The leak on every detach of a CDC-ECM adapter:
+     - `configure_network` allocates `note_page` (`usb_net.rs:240-243`), then discards its handle when it builds `Notify` (`Some((_, virt, phys))`, `usb_net.rs:317-318`).
+     - `Notify` has no handle field (`usb_net.rs:47-58`), and `Net::release` frees only the notification ring (`usb_net.rs:85-97`).
+     - So every detach of an adapter with a notification endpoint (QEMU's usb-net has one, at 0x81) leaks a page. Meanwhile `detach_port_devices` gives the class budget back (`/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:2552-2562`).
+   - Leaks on failure paths. Nothing in the crate implements `Drop`, including `Ring` (`xhci.rs:268-306`) and `Storage`. Several configure functions return after allocating rings or pages without releasing them:
+     - `configure_storage`: `/data/yellow/libersystem/src/user/drivers/core/src/usb_storage.rs:201-202`, `217-218` and `220`. After `Storage` is built at line 221, the returns at 237 (unit never ready), 242 (READ CAPACITY refused) and 246 (block size not 512) drop `st` without calling `st.release()`.
+     - `configure_network`: `usb_net.rs:230-243`, then `271-290` and `308-309`.
+     - `configure_serial`: returns at `/data/yellow/libersystem/src/user/drivers/core/src/usb_serial.rs:254-265`, before the ring clean-up at `301-310`.
+     - `configure_uas`: `/data/yellow/libersystem/src/user/drivers/core/src/usb_uas.rs:371-374`, then `398-407`.
+     - For example, an empty card reader or a 4 KiB-sector disk leaks two rings and a data page on every plug, and the budget is never charged for them.
+   - The contracts this breaks:
+     - The DRV-007 resource negative, "an enumeration that fails part way ... leave no DMA handle allocated ... counted before and after" (`P02M0099.md:1629-1633`, closed at `8107-8112`).
+     - The class-module lifecycle: "Detach releases the class module's resources" and "the budget cannot drift from the memory" (`P02M0099.md:4889-4892`, `4933-4934`).
+     - The "hundred plug/unplug cycles" evidence covers budget arithmetic only (`/data/yellow/libersystem/src/user/drivers/core/src/usb_class/tests.rs:106-125`).
+   - The newer modules already handle this correctly (`classes.rs` `Pipe::new`, `usb_hid.rs:296-311`, and the later failure paths of `usb_uas.rs`).
+
+5. **The Bulk-Only Transport still does not validate the data length the transport observed — the DRV-006 half (Low, Defect).**
+   - The debt is "ignores actual transfer lengths and CSW residue" (`P02M0099.md:1616-1619`, `1676-1681`). Only the CSW half was fixed:
+     - `bot_transfer` accepts the data stage on `CC_SHORT_PACKET` without reading the residual (`usb_storage.rs:312`).
+     - `wait_transfer` drops the residual (`xhci.rs:2756-2758`); `wait_transfer_len` has no other caller.
+     - Only the CSW's self-reported residue is checked (`usb_storage.rs:354`).
+   - So a device that sends a short data-IN stage and then reports residue 0 / PASS gets the stale tail of the data buffer returned as a successful read (`serve_read` copies the full `bytes`, `usb_storage.rs:443`).
+   - The CSW itself is also accepted on `CC_SHORT_PACKET` (`usb_storage.rs:330`), after its 13 bytes were zeroed (`usb_storage.rs:275`). A 12-byte CSW therefore reads status 0, which means PASS.
+   - The contract comment on `csw_outcome` describes a `moved_hint` cross-check that does not exist (`/data/yellow/libersystem/src/user/drivers/core/src/usb.rs:43-45`).
+   - Minor, related: refused requests are answered `STATUS_ERR` here (`usb_storage.rs:387-392`), not with the typed `STATUS_INVALID` every other block server uses (the code says so itself at `usb_storage.rs:69`). So the USB half of DRV-002's "typed refusal" is not typed on the wire.
+
+6. **AHCI and HDA (and NVMe) claim the device is quiet at a planned stop without stopping the controller's DMA engines (Low, Defect).**
+   - `finish_stop`'s `quiet` is the driver's own statement about its hardware, and "a driver that could not confirm the hardware stopped must not make the claim". The kernel gives back held DMA frames on that claim, because it treats it as "the holder of this capability has just reset the hardware" (`/data/yellow/libersystem/src/user/drivers/core/src/common.rs:1573-1590`; `/data/yellow/libersystem/src/kernel/object/claim/tests.rs:179-180`).
+   - AHCI passes the flush result (`ahci_driver.rs:671-677`) while `PxCMD.ST`/`FRE` stay set. `stop_port` (`ahci_driver.rs:403-419`), which clears both and confirms CR/FR, is not called.
+   - HDA passes `true` (`/data/yellow/libersystem/src/user/drivers/core/src/hda_driver.rs:781`) after only clearing the streams' RUN bits, without waiting for them to clear (`hda_driver.rs:637-646`, `753-762`). The CORB/RIRB DMA engines started at `hda_driver.rs:469-470` are never stopped, and the controller is not put back into reset.
+   - NVMe leaves `CC.EN` set: it disables the controller only at bring-up (`nvme_driver.rs:557-561`), and the stop path is at `nvme_driver.rs:722-731`.
+   - The practical exposure under QEMU is small (no unsolicited responses or spontaneous FISes), hence Low. But it inverts the rule that the kernel's DMA reclamation and the 2026-10-06 deferred-bus-mastering fix depend on.
+
+## Verification performed
+
+**Milestone text read:**
+- The head, status, owner answers and acceptance ledger/contracts (`docs/todo/P02M0099.md` 1-330 and 817-1060), and the scope discussion and status list (690-800).
+- These items:
+  - xHCI maintenance (1592-1706)
+  - NVMe (2404-2500)
+  - AHCI (2644-2700)
+  - PCIe hotplug/AER/PME (3343-3620)
+  - FADT/GAS (4021-4073)
+  - the USB section and the execution-model item (4708-4946)
+  - CDC-ECM/NCM (5880-6069)
+  - UVC (6837-6918)
+  - the conformance and integration items (7665-7970)
+- The DRV debt list (7970-8340), the reference table (7330-7370), and the `docs/todo/TODO.md` row.
+
+**Audit file:** the last implementer entries (2026-10-12..14) of `AI/audit/code-audit-P02M0099.md`.
+
+**Drivers, libraries and kernel code read under `/data/yellow/libersystem/src/`:**
+- Block path and virtio: `blk.rs`; `virtio.rs` (`check_used_element`/`check_used_advance`, `take_used`, `submit_bounded`, `submit_chains`); `virtio_blk.rs` serve loop; `virtio_scsi.rs` and `usb_uas.rs` admission.
+- NVMe and AHCI: `nvme.rs`, `nvme/tests.rs`, `nvme_driver.rs`; `ahci_driver.rs` (`issue`, `command`, `complete`, `take`, stop path, `stop_port`).
+- USB storage and descriptors: `usb.rs` with its tests; `usb_storage.rs` (whole); `descriptor.rs`; `usb_class.rs` with its tests.
+- `xhci.rs`: `Ring`, `Streams`, `UsbDevice::release`, `address_device`, `register_device`, `admits`, `expand_hub`, `detach_port_devices`, `take_event`, `keep_stray`, `control_in_req`, `wait_transfer*`.
+- Other class modules: `usb_net.rs`, `usb_serial.rs`, `usb_hid.rs` (`configure_hid`), `usb_audio.rs` release, `classes.rs` (`Pipe`, `detach_port`), the `class_bt`/`class_uvc` releases, `class_dfu.rs`.
+- Parsers: `hid.rs` (`parse`, `field`, `array_usages`, `remember`); `cdc.rs` NCM; `mbim.rs` NTB16; `uac.rs` Pacer and feedback; `ccid.rs` decode.
+- HDA, SDHCI and the stop contract: `hda_driver.rs` (bring-up rings, stop, serve); the `sdhci_driver.rs` stop path; `common.rs` (`finish_stop`, `recv_from_consumer`).
+- Kernel and runtime: `kernel/main.rs` (`settle_pci_faults`, `settle_hot_plug`); `kernel/device.rs` (`revoke_effects_of`); `kernel/object/dma_buffer/mod.rs` (`Drop`); `kernel/syscall/mod.rs` (`sys_memory_map` rights); `driver-binding` (`Removed`/`DeviceFaulted`); the `rt` `host-tests` feature; and the `nvme`/boot-critical entries in `manifest.toml`.
+- Gates and harness: `src/tools/check-driver-mutations.sh` (outcome classification, 163 stanzas, the final count check) and the removal commands in `src/harness/usb-gadget.sh`.
+
+**Candidate checked and refuted:** I checked whether UVC client buffers registered without the WRITE right could fault the xHCI process. They cannot: the generated camera and camera-device dispatch refuses such handles (`handle_carries(memory, 10, 4)` in `camera_device/v1.rs:623` and `camera/v1.rs:1697`).
+
+**Read-only history and host checks:** `git log`/`git show` for the checklist deletions (`2e2275f3`, `aa156096`) and the commits that closed the milestone; a grep of `docs/` and `src/` showing that nothing implements or owns EHCI, OHCI/UHCI, NFIT, virtio-crypto, virtio-balloon/virtio-mem or virtio-fs; and a read-only listing of the host kernel's gadget function modules (`usb_f_ncm` is present).
+
+**Not run:** no build, test, gate, QEMU boot or `verify.sh`. No source file was modified.

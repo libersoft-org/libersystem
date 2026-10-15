@@ -1084,3 +1084,55 @@ Final document and selection verification: `./check.sh --gate milestone-index` a
 Exact final receipts: `.build/logs/end-of-job/qemu-only-20261010-shared-host/final-host-milestone-index-after-source4-media96-soft2d-unlayered-current/slot-release.json` (SHA256 e790557f2ed714cf9988ce89bfb21625704fb113d089e45250334b34f4a323a7) and `.build/logs/end-of-job/qemu-only-20261010-shared-host/final-readonly-plan-source6-unlayered-current/terminal-clean-release.json` (SHA256 1e069f4ffbd771e904afc044faadede2cdc342ac9ec10503e9c1c4f61805cd1f). These results precede this verification-only append; the implementation, scoped successes, failed runs and remaining limitations recorded above are unchanged.
 
 Final status: COMPLETE. All previous audit content is preserved; no audit rating is assigned.
+
+AUDITOR'S REVIEW ON P02M0183 (2026-10-15T04:36:11Z):
+
+**Rating: 8/10.** ModemService, `service_logic::modem_commands`, NetworkService's link administration, the persistent uplink selection and the raw-IP medium implement the plan closely: four separately minted authorities with identity and management denied by default, owner-bound grants, admission reserved before the modem is asked anything, success reported only after the installation commits, bounded rollback, link-changed teardown with the replaced NIC restored, and every buffer that carried a PIN or PUK zeroed. One recovery path is incomplete. When the grant that issued a PIN, PUK or deactivation is retired before the modem answers it, the expired command's unknown outcome is never reconciled, and the modem then refuses every state change - every data activation included - as `again` until some management client happens to query it. The plan's "admin revocation" trigger also has no operation behind it.
+
+## Findings
+
+1. **Medium, Defect: an unknown outcome whose caller has gone is never reconciled, and the modem keeps refusing state changes.**
+   - **How the state is cleared:** `Device::tick` marks the modem `uncertain` when a state-changing command expires (/data/yellow/libersystem/src/user/services/logic/src/modem_commands.rs:288-310). While it is, `submit` refuses every state change with `Reconcile` (lines 198-205), and only a completed `Query` clears it (lines 258-259).
+   - **Who starts the reconcile:** ModemService sends that query only from the completion of the expired command's own call: `Purpose::Pin` at /data/yellow/libersystem/src/user/services/core/src/modem_service.rs:739-742, `Cleanup` at 757-760, activation at 875 and 890-893, and deactivation at 983-988.
+   - **Where it is lost:** `retire` drops a grant's pending `Pin` and `Deactivate` calls (modem_service.rs:1229), and `complete` returns early when the call is gone (line 708). If a manage client's PIN or PUK, or a data client's deactivation, goes unanswered and the grant is retired before the five-second deadline, the expiry completes to nobody and no query is ever sent. Retirement comes from owner exit, a closed connection or a SIM replacement, which retires the old SIM's grants at 655-663.
+   - **From then on, every activation fails:** it reserves, is refused `Reconcile` at `submit`, is answered `again` (lines 309 and 1112-1113) and gives the reservation back - indefinitely.
+   - **Nothing in the default setup recovers it:**
+     - a data-only client has no operation that sends a query;
+     - identity and management are denied by default;
+     - so on a shipping policy only a withdrawal or a service restart recovers the modem.
+   - **The deactivation case is worse:** the modem may keep an active context that nobody takes down, while its status reads `unknown`.
+   - **Against the plan:** "reconcile through fresh read-only queries before conflicting operations; unreconciled state remains unknown rather than retaining a pending slot forever". The gate's `uncertain` row (/data/yellow/libersystem/src/user/services/core/src/modemcheck.rs:400-425) covers only a caller that stays alive.
+   - **Fix:** in `complete`, when the call is gone and the result is `OutcomeUnknown`, call `reconcile(key)`; or turn a retired grant's state-changing calls into `Cleanup`-like purposes instead of dropping them.
+
+2. **Low, Defect: modem grants have no admin revocation path.**
+   - **Plan:** "admin revocation" is one of the events that "invalidate the scoped authority and tear down its contexts".
+   - **Code:** `modem-admin` has only `mint` (/data/yellow/libersystem/src/idl/modem.lsidl:208-210), and ModemService has no way to revoke a grant from outside its owner and connection. Camera and MIDI, written to the same plan text, each expose `revoke` (/data/yellow/libersystem/src/idl/camera.lsidl:222 and /data/yellow/libersystem/src/idl/midi.lsidl:237).
+   - **Impact:** PermissionManager calls none of them today, so the practical effect is nil now. This is a completeness gap against the stated trigger list.
+   - **Fix:** add `modem-admin.revoke(modem-id)` that retires every grant on that modem through `retire`.
+
+## Verification performed
+
+Static review only; nothing was built, run or tested.
+
+Read in full:
+- `modem.lsidl`, `modem-device.lsidl` and `modem_service.rs`;
+- `service_logic` `modem_commands.rs`, `uplink.rs` and `raw_ip.rs`;
+- `drivers::mbim`.
+
+Read in part:
+- NetworkService's start-up, persistent subscription, `apply`, `tear_down`, `bring_up_raw`, `check_link`, `on_link_admin` and the `LinkAdmin` implementation, and `net.rs`'s raw-medium hooks;
+- PermissionManager's modem arm of `grant_for_task` and `modem_policy`;
+- the broker's `cap_grants`: the modem roots go to `permission_manager` only;
+- the manifest: ModemService's roles, and its LINK factory as the only user of NetworkService's LINKADMIN root;
+- the probe's `uncertain` scenario, and the gate registration.
+
+Confirmed correct:
+- **Secrets:** a PIN/PUK travels in `Secret`, is encoded into an owned 256-byte frame that is scrubbed after the send, and the request and reply buffers are scrubbed too.
+- **Correlation:** commands are matched by connection generation, transaction and kind; a stale SIM or context generation is answered stale.
+- **Limits:** eight pending and one state change per modem; the provider's limits are clamped down. Deadlines are 5 s and 60 s, and nothing is replayed.
+- **Counters:** each is known or unknown, carries its SIM generation and observation time, and an unknown count needs acknowledgement.
+- **Datagrams:** 64 packets and 256 kB per direction within the MTU, with refusals and drops counted.
+- **Activation:** reserve, then activate, then install. `again` without replace authority; success only on `installed`; a bounded deactivation after a failed install; abandon and reconcile after an uncertain activation.
+- **NetworkService's attachment checks:** IPv4 only, a unicast address with room in its prefix, the gateway on the subnet, at most two DNS servers, MTU 576..4096. It installs atomically and tears down with link-changed. It brings the replaced NIC back, or the lowest live one, or none. It releases a reservation whose holder connection closed.
+- **Uplinks:** at most 16 NICs, the lowest stable identity as fallback, a modem never selected automatically.
+- **Raw-IP medium:** it validates datagrams and never sends ARP, runs DHCP or applies the static fallback.

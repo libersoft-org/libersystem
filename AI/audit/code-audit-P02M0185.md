@@ -618,3 +618,50 @@ iteration.
 
 The fixture cannot exercise this path. By review the code is correct, and the MIDI gate shows no regression. The
 milestone is COMPLETE.
+
+AUDITOR'S REVIEW ON P02M0185 (2026-10-15T04:36:46Z):
+
+**Rating: 10/10.** I found nothing in this milestone's scope that needs a code change. The generic vocabulary and its queue (`service_logic::bounded_event`) know no MIDI. The staged USB-MIDI 1.0 decoder classifies every code index as the class specification does and counts SysEx rather than assembling it. MidiService keeps the receive path's identity, order, receipt time, integrity records, terminal endings and bounds as the plan states them, and the earlier fix - a start the provider refuses ends its receiver as `removed` - is in place. P02M0099 later added UMP and output under the same package, which supersedes this milestone's interim "output and UMP are unsupported" answer by design. That code is P02M0099's, and it leaves the MIDI 1.0 receive path, its grants and its gate rows intact.
+
+## Findings
+
+None that require a code change.
+
+## Verification performed
+
+Static review only; nothing was built, run or tested.
+
+Read in full:
+- `event.lsidl`, `midi.lsidl` and `midi-device.lsidl`;
+- `midi_service.rs`;
+- `service_logic::bounded_event`;
+- the `drivers::usb_midi` decoder and encoder.
+
+Read in part:
+- PermissionManager's `midi-input` arm and `midi_policy`;
+- the broker's `cap_grants`: the MIDI roots go to `permission_manager` only;
+- the manifest rows for the service and the development-only fixture;
+- the gate script, current after the UMP additions;
+- the changes to `midi_service.rs` since the last re-audit.
+
+Confirmed correct:
+- **Queue:**
+  - 256 events and 32 kB, both checked at admission, with each event's encoded size the caller's;
+  - an overflow terminates the stream, discards what was queued and keeps the end outside the queue;
+  - the first end stands;
+  - the sequence is assigned in push order and ends as `exhausted` instead of wrapping.
+- **Decoder:**
+  - alignment and the 64-packet batch;
+  - cable membership, where an unattributable fault resets every cable and is reported without a cable;
+  - CIN 0/1 reserved; 2/3 system common; 4 SysEx start/continue; 5 F6 or a one-byte end; 6/7 two- and three-byte ends; 8..E the status nibble, data bytes and padding;
+  - F the single-byte form, with the same SysEx tracking as packets and realtime bytes passing through a SysEx.
+- **SysEx bounds:** counted to 64 kB including delimiters with checked arithmetic, with a 2 s inactivity deadline. Aborts carry the per-cable message number for cap, interruption, restart, fault and reset, and the rest is discarded until an end or a new start. A discarded end is never reported as a successful end.
+- **Time:** the batch's host receipt time is kept through decoding, queueing and late reads.
+- **Endings:**
+  - a late batch for a retired provider or receiver generation is ignored, and one from the future drops the provider;
+  - the provider's `lost` ends the receiver with `source-discontinuity`;
+  - withdrawal ends receivers as `removed`, with their connections still readable;
+  - `revoke` ends a receiver as `revoked`;
+  - the owner's observer retires the receiver whatever copies of its endpoint exist.
+- **Bounds:** one active receiver per endpoint (`again` for a second); four providers, eight endpoints each, 1..16 cables; 32 connections.
+- **Reads:** reads pull at most 64 events, with one read waiting per receiver.

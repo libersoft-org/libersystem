@@ -838,3 +838,72 @@ Verified on the asynchronous policy/admission code: all firmware switch provider
 Real HID integration after asynchronous adoption: `LIBER_DEVELOPMENT=1 ./check.sh --gate power-ups` PASS (94 s), booting the same corrected ordinary ISO (SHA-256 `ddb8e63b14a3eac14a752fd0c1579ed6c3a18a2afc83513c008ca7f1776fcf81`). The real USB HID Power Device descriptor/reports reached PowerService in exact units; the unsupported outlet operation was refused without reaching the device; exactly one scheduled turn-off and one cancel reached the gadget firmware; both on-battery and restored-mains reports reached the live subscriber. Both scripted probes and the final prompt completed before only the owned QEMU/console were stopped; the unchanged gate oracle then passed. The gate stopped its simulator, tore down its gadget and verified cleanup. A separate `src/harness/usb-gadget.sh verify` also PASS: the host carries nothing of this harness. Evidence: `.build/logs/end-of-job/continuation-power-ups-async.log`, `continuation-power-ups-async-{guest,run,script,driver}.log`, `continuation-power-ups-async-cleanup.log`, and `.build/logs/power-ups/{gadget,ups-sim,guest}.log`. This supersedes the earlier HID pass for the final adoption code.
 
 Final P02M0181 continuation state: COMPLETE. Current implementation, all-target compiled artifacts, host/static/generated checks, complete service gate and both actual producer paths are verified as recorded above. The final real ACPI path includes live battery/mains changes and policy restart through the original platform/battery scenarios; the earlier full ACPI update-storm gate remains explicitly earlier evidence. The last real HID gate passed after the asynchronous admission change, including independent host gadget cleanup. Prior failed builds, stale-image attempt and original-service regression failure remain recorded as such; no failed/unrun gate is counted as a pass. Plan and TODO status now reflect this result.
+
+AUDITOR'S REVIEW ON P02M0181 (2026-10-15T04:39:27Z):
+
+**Rating: 9/10.** The service meets its contract; one Low defect remains.
+
+What the review confirmed:
+- **Interfaces and authority.**
+  - `liber:power@1` keeps state, control and provider apart.
+  - The `power-source` kind is reachable only through PowerService's scoped catalogue role.
+  - A read connection that sends anything else is closed.
+- **Normalisation.**
+  - Every provider record passes `power_model::canon::validate`, and the service converts nothing itself.
+  - The ACPI and HID adapters follow the stated unit rules: the sentinel is honoured before arithmetic, the rate is power or current according to the power unit, `_RTV` applies to every value, and the HID conversion is one rational truncated once.
+- **The registry** admits, orders, coalesces and closes as specified:
+  - 128 sources, 8 providers, 16 subscribers and 32 queued records;
+  - 100 ms per source;
+  - additions, removals and alarm transitions are pinned and never coalesced away;
+  - a five-second drain stall closes a subscription.
+- **The control ladder** holds:
+  - one outstanding command per provider, with a five-second deadline;
+  - `indeterminate` is never replayed, whether it comes from a provider or from the deadline;
+  - reconciliation by a fresh query;
+  - `unavailable` after a silent query, with other providers unaffected.
+- **The 2026-10-08 continuation** is correct as written:
+  - asynchronous adoption, with correlation-matched openings, a deadline per stage and bounded retries;
+  - nonblocking policy requests and client replies.
+
+The remaining defect is that the enumeration reply cannot hold the 128 sources the service admits.
+
+## Findings
+
+1. **Low, Defect - `sources` cannot enumerate the service's own source bound: the reply is built in an 8 KiB buffer and becomes `again` long before 128 sources.**
+   - **What the plan requires.** "State grants enumerate sources/thermal zones" and "Cap the complete service at 128 sources" (`/data/yellow/libersystem/docs/todo/P02M0181.md:40`, `:159`).
+   - **What the code does.**
+     - The registry admits 128 sources (`/data/yellow/libersystem/src/user/services/logic/src/power_registry.rs:29`).
+     - PowerService answers `sources` through `power::dispatch` into its fixed 8192-byte `reply` (`/data/yellow/libersystem/src/user/services/core/src/power_service.rs:735`, `:939`).
+     - A `source-snapshot` is 145 bytes before its trips (13 bytes each), its alarms (3 bytes each) and a source time (8 bytes more).
+     - So the reply holds at most:
+       - 56 bare sources;
+       - about 34 ACPI thermal zones that carry seven trips and an alarm;
+       - about 20 sources at the record's own bounds.
+     - Past that, the generated dispatch replaces the answer with `error.again` (`/data/yellow/libersystem/src/user/libs/protocol/power-proto/src/generated/liber/power/v1.rs:1505-1520`). Asking again gets the same answer.
+     - The shipping `powerctl` lists sources this way and would print "refused - Again" (`/data/yellow/libersystem/src/user/apps/tools/src/powerctl.rs:54`, `:77`).
+     - Subscriptions are not affected, because each source travels as its own frame.
+   - **Why it matters.**
+     - The enumeration the read grant promises fails permanently, inside the bound the service declares.
+     - Today's QEMU configurations stay well under the limit, so no gate shows it.
+   - **Minimal fix.** Size `reply` for the bound: 128 × 409 + 7 bytes, about 51 KiB. The message limit is 1 MiB (`/data/yellow/libersystem/src/abi/src/lib.rs:325`).
+
+## Verification performed
+
+- **Documents read.**
+  - `docs/todo/P02M0181.md`, whole.
+  - The last sections of this audit file, including the 2026-10-08 continuation record.
+- **Code read in the current tree.**
+  - `power_service.rs`, whole: adoption, openings, `drain_stream`, `on_reply`, `control`, `subscribe`, `drain_subscribers` and the loop.
+  - `power_service/policy.rs`: the conversion of policy IO to nonblocking requests.
+  - In `service_logic`: `power_registry.rs` whole, `provider_open.rs` and `provider_retry.rs`.
+  - In `power-model`: `convert.rs`, `acpi.rs`, `hid.rs` and `canon.rs`.
+  - `idl/power.lsidl`, interfaces and records.
+  - The generated `power` dispatch.
+  - `permission_manager.rs`, the power rows. `power-control` is held only by the development probes `powercheck` and `upscheck`; the plan requires no shipping operator.
+  - `manifest.toml`, the `power_service` row: `CATALOGUE` kinds `power-source` and `platform-switch`, no other role naming `power-source`.
+  - The gate registrations for `power-service` and `power-ups`.
+- **Wire size.** Computed from the generated `SourceState::write`: u8 enums, u16 list counts.
+- **Later decisions taken as given.**
+  - P02M0197 gives PowerService the `system-power` and `system-shutdown` client roles for the critical-battery power-off (`/data/yellow/libersystem/docs/todo/P02M0197.md:506-510`). This supersedes this plan's "PowerService receives no such client".
+  - The owner-confirmed default, a critical battery doing nothing, is `service_logic::sleep_policy::Settings::default` (`/data/yellow/libersystem/src/user/services/logic/src/sleep_policy.rs:117`).
+- **Not done.** This was a static review only: nothing was built or run.

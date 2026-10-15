@@ -1633,3 +1633,122 @@ SPECIFICATION TEXT REMOVED FROM THE TREE, on the owner's decision of 2026-10-14 
 - Conformance after the removal: `./check.sh --gate bluetooth-codecs` PASS (33 s) - SBC/mSBC 769 configurations, 49,216 cross-decoded frames; LC3 12 configurations, 11,448 frames, maximum normalized difference 0.00045776, worst RMS -107.88 dB.
 - Comments corrected in `lc3.rs`, `lc3/tables.rs`, `lc3/tests.rs` and `bt_lc3.rs`; the milestone's LC3 item carries the removal. The deleted files remain in the repository's history (commit bb04e770); removing them from it would mean rewriting published history, which is the owner's to decide.
 - A SLIP, reported to the owner: the first deletion was made with `git rm --cached`, which staged it in the index; the instructions are never to touch git state. The staged change is the same one the owner's commit would record.
+
+AUDITOR'S REVIEW ON P02M0194 (2026-10-15T04:36:14Z):
+
+**Rating: 5/10.** The implementation is large and mostly careful. The protocol leaves are pure, host-tested and bounds-checked: L2CAP and ERTM, RFCOMM with its FCS and credits, SDP with its continuation, OBEX, AVDTP, the HFP AT parser, ISO reassembly and the BASE parser. The SMP initiator is correct: it commits before it reveals, checks the confirm value and the DHKey check, refuses a reflected public key and insists on 16-octet keys. The two-axis no-downgrade rule is applied on both radios and to cross-transport keys. The inbound policy is enforced by PSM and by RFCOMM server channel. The bond store commits durably and rolls back on a failed write. The restart correlation fix in `BondTransport` is sound. `btctl` covers every listed command, THREAT_MODEL 2.4 has the required content, and the gates are registered in `check.sh` and `release-required.toml`. The LC3 Appendix C removal is consistent: nothing in the tree still refers to the deleted files, and conformance is held by `bluetooth-codecs`. It is not counted against the milestone. However, two High defects break core promises on paths no gate takes. First, the bond store's `list` answers from a 1 KiB buffer. Past a modest number of bonds (7-21, against the stated 64), the stack sees no bonds at all, and with them it loses trust, reconnection, IRKs and every no-downgrade check. Second, the standing LE accept-list attempt is neither refreshed nor re-armed. Of several absent bonded LE peripherals only one can come back, and a coordinated set returns as a single earbud. Two Medium defects follow. The host's own private address does not rotate while that attempt is out, which is the steady state whenever a bonded LE peer is absent. BR/EDR links are accepted as encrypted without checking the negotiated key size (KNOB). Smaller deviations make up the rest: the OPP SDP record is always offered, the OBEX packet bound is not the stated one, the grant and subscription bounds are loose, and LE `pair-legacy` withholds Secure Connections.
+
+## Findings
+
+1. **The bond store answers `list` from a 1 KiB reply buffer, so past about 7-21 bonds every policy lookup sees no bond at all (High, Defect).**
+   - **The buffer.** `BluetoothBondStore` serves with `let mut reply: [u8; 1024]` (/data/yellow/libersystem/src/user/services/core/src/bluetooth_bond_store.rs:372-374).
+   - **Record size.** A keyless `bond-record` on the wire is 44 bytes, plus its name (up to 48), its alias (up to 32 through `btctl alias`) and one byte per trust bit (generated `BondRecord::write`, /data/yellow/libersystem/src/user/libs/protocol/bluetooth-proto/src/generated/liber/bluetooth/v1.rs:7247-7293). The list header adds 7 bytes.
+   - **The host's own record is always listed.** The store's "this host" identity record (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:111) always occupies part of the reply.
+   - **Capacity against the bound.**
+     - 21 bonds fit with empty names, 15 with 16-byte names and 7 with full names and aliases.
+     - A dual-mode device bonded through CTKD takes two records.
+     - The milestone states 64 records ("bonds 64 records in 64 kB"; /data/yellow/libersystem/src/user/services/logic/src/bond_store.rs:28 `MAX_RECORDS = 64`). 64 full records need 9,351 bytes.
+   - **What the stack does with the overflow.** The generated dispatch replaces an outgrown reply with `Err(Again)` (v1.rs:7528-7568). `Stack::records` turns any error into an empty list (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:936-945), and `record()` (948-951) inherits that empty list.
+   - **Downgrade protection is lost.** Every decision then runs as if nothing were bonded, so the no-downgrade refusals are skipped:
+     - a lower-level link key (bluetooth_service/classic.rs:807-814);
+     - Just Works over an authenticated bond (classic.rs:762-771);
+     - a PIN over a better bond (classic.rs:785-789);
+     - LE re-pairing (le.rs:230-236, 370-378);
+     - LE legacy over a Secure Connections bond (bluetooth_service.rs:2002-2004).
+   - **Re-pairing resets trust.** A re-pair is stored with trust, enabled and alias reset (le.rs:381, classic.rs:817).
+   - **Bonded peers are refused or cannot reconnect.**
+     - Bonded trusted peers' pages are rejected (classic.rs:584), and page scan goes off (classic.rs:1008).
+     - LE reconnection and the IRK table are empty (le.rs:169, 132-145).
+     - Grants find no alias (bluetooth_service/gatt.rs:212, bluetooth_service/serial.rs:122).
+     - `btctl list` and `bonded` fail (bluetooth_service.rs:1801-1809).
+   - **Fix.** No test lists more than a handful of bonds. Size the store's reply buffer for 64 full records, as the PermissionManager receive buffer was sized to the transport ceiling.
+
+2. **The standing LE accept-list attempt is neither refreshed nor re-armed, so only one of several absent bonded peripherals can come back (High, Defect).**
+   `reconnect_bonded` returns at once while `le.accepting` is set (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:165). Three paths are affected:
+   - (a) **A second disconnect is not listed.** `on_disconnected` calls only `reconnect_bonded` (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:1331-1332). A second bonded LE peer that leaves while the attempt for the first is out is never put on the filter accept list.
+   - (b) **No re-arm after a reconnection.** LE Create Connection completes with the first device it connects. `on_connected` clears `accepting` (1208), and its reconnect branch (1250-1273) never arms a new attempt for the peers still absent. A new attempt is armed only on:
+     - an LE disconnect;
+     - a trust change or forget (`relist`, 1839 and 2068);
+     - a new bond (le.rs:426);
+     - a GATT mint (gatt.rs:231);
+     - controller readiness (le.rs:129).
+   - (c) **No re-arm after a failed operator pairing.** An operator LE pairing sets the attempt aside (le.rs:211-217, 243). If that connection never completes, the 60-second cancel arrives in `on_connected` with a non-zero status and `relist` false (1217-1225). The standing attempt is then never taken up again, contrary to le.rs:10-12.
+
+   Effects:
+   - **Two LE input devices.** After a reboot or a BluetoothService restart with an LE keyboard and an LE mouse, whichever advertises first reconnects. The other stays out for as long as the first is connected.
+   - **LE Audio sets.** A coordinated set comes back as one earbud. The set search deliberately skips members that are already bonded (bluetooth_service/le_audio.rs:388) and relies on the accept list. When the 10-second search ends, the device is offered with the one member it has (le_audio.rs:291-303).
+
+   This contradicts parts b (several LE links, "bonded peripherals reconnect through the controller's filter accept list"), c (reconnection by the device after a restart) and h (earbuds driven as one device). The gates reconnect the tag and the remote strictly one after the other (/data/yellow/libersystem/src/user/services/core/src/btclassic.rs:1088-1106), which this logic happens to satisfy.
+
+   Fix: relist (cancel and re-arm) when a bonded LE peer leaves while an attempt is out. Re-arm after an accept-list connection completes, and after a cancelled operator attempt.
+
+3. **The host's own resolvable private address does not rotate while the standing attempt is out, and a refused rotation goes unnoticed (Medium, Defect).**
+   - **The condition.** The 15-minute rotation runs only when `!controller.le.accepting` (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:1645-1650). Nothing cancels the attempt in order to rotate.
+   - **How long it lasts.** The attempt stays out for as long as any bonded LE peer trusted for input, GATT or audio is absent (bluetooth_service/le.rs:163-194). A machine whose LE mouse is switched off therefore keeps one private address indefinitely. Part b requires the address "rotated every fifteen minutes" (docs/todo/P02M0194.md:232).
+   - **Why the gate misses it.** The independent gate's `privacy_rotation` keeps its only LE peer connected through the 905-second wait (/data/yellow/libersystem/src/harness/bluetooth_guest_le.py:293-305), so the attempt is never out.
+   - **A refused rotation is recorded anyway.** The rotation condition does not exclude a running scan (operator, broadcast or set search). The HCI specification has the controller refuse LE Set Random Address while scanning or initiating is enabled. `rotate_address` records the new address as soon as the command is queued:
+     - `Controller::command` returns true on queueing (bluetooth_service.rs:554-567; le.rs:155-157);
+     - nothing handles that opcode's status.
+   - **Consequence of a refused rotation.** New links take `link.local` from `le.own` (bluetooth_service.rs:1243), and SMP authenticates with that address (le.rs:306). LE pairing then fails its confirm or DHKey check until a later rotation succeeds.
+   - **Fix.** Rotate through the `relist` cancel and re-arm path, and set `le.own` only when the command succeeds.
+
+4. **BR/EDR links are treated as encrypted whatever key length the controllers negotiated (Medium, Defect).**
+   - **What the host checks.** `classic_encryption` marks the link encrypted on any successful Encryption Change (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/classic.rs:619-632). The held profile channels are then released on it (classic.rs:666-671).
+   - **What it never asks.** The host never issues HCI Read Encryption Key Size. The command is absent from /data/yellow/libersystem/src/user/services/logic/src/hci_bredr.rs:17-59 and from the service.
+   - **The attack.** LMP's key-size negotiation is unauthenticated, so an attacker on the radio can force a 1-octet encryption key (KNOB, CVE-2019-9506). This works under a bond that `btctl` reports as "Secure Connections, authenticated". LE is not affected because SMP insists on 16 octets (/data/yellow/libersystem/src/user/services/logic/src/smp_pairing.rs:490).
+   - **Why it matters here.** "Encryption required on every link that carries user data" and the two-axis levels both assume the encryption has the key's strength.
+   - **Fix.** After Encryption Change on BR/EDR, read the key size before releasing held channels. Disconnect below 16 octets for a Secure Connections key and below 7 otherwise. The in-guest fixture controller can report a short key as the oracle.
+
+5. **The Object Push SDP record is always offered, not only while a `btctl receive` waits (Low, Defect).**
+   - **What the code does.** `ControllerState::new` offers `sdp::opp_server(0x0001_0007, OPP_CHANNEL, None)` alongside the always-on roles (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/classic.rs:112). Nothing ever withdraws it: `sdp::Server::withdraw` (/data/yellow/libersystem/src/user/services/logic/src/sdp.rs:740) has no caller, and `receiver_started` and `end_receiver` (bluetooth_service/opp.rs:365, 461) do not touch the server.
+   - **What the milestone says.** Part a asks for the OPP record "while a `btctl receive` waits". Its DONE note claims "the OPP server on channel 9 offered only while a `btctl receive` waits" (docs/todo/P02M0194.md:187-198), which does not hold.
+   - **Impact.** The RFCOMM admission still refuses the channel (classic.rs:1603-1614), so the effect is a service advertised to any connected peer while it is not running.
+   - **Gate coverage.** No gate checks for the record's absence; btclassic.rs:604-608 checks only the voice gateway and HID.
+   - **Fix.** Offer the record in `receiver_started` and withdraw it when the receiver ends.
+
+6. **OBEX offers a 4096-byte maximum packet instead of the stated bound, and `bt_bounds::OBEX_PACKET` is never used (Low, Defect).**
+   - **The stated bound.** Part a states "OBEX's maximum packet is offered as the same 1691" (docs/todo/P02M0194.md:87-89), and /data/yellow/libersystem/src/user/services/logic/src/bt_bounds.rs:24 defines `OBEX_PACKET = BREDR_MTU`.
+   - **What the code uses instead.** Nothing reads `OBEX_PACKET`.
+     - The push client's CONNECT and the server's CONNECT answer both state `MAX_PACKET = 4096` (/data/yellow/libersystem/src/user/services/logic/src/obex.rs:24, 297, 481).
+     - The client clamps the peer's maximum to 4096 (obex.rs:385).
+     - Both assemblers are sized by it (bluetooth_service/opp.rs:174, 366).
+   - **Interop consequence.** Over GOEP's L2CAP transport each OBEX packet is one SDU. `ertm_send` (bluetooth_service/classic.rs:1725-1732) does not limit it to the channel's `peer_mtu`, so a push can send an SDU larger than the peer configured whenever the peer's OBEX maximum exceeds its MTU.
+   - **Fix.** Offer `OBEX_PACKET`, and clamp pushed packets to the smaller of the peer's OBEX maximum and the channel's peer MTU.
+
+7. **Application grants are capped at twice the stated figure, and a GATT grant's subscriptions are not capped at all (Low, Defect).**
+   - **Grant count.** Part a states "32 minted grants". GATT grants and serial grants are each capped at `MINTED_GRANTS` separately (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/gatt.rs:25, serial.rs:17), which allows 64 together.
+   - **Subscriptions are unbounded.**
+     - Within one grant, each successful `subscribe` adds another producer handle, with no limit and no check for an existing subscription to the same value (gatt.rs:497).
+     - Closed consumers are pruned only when that attribute next notifies (gatt.rs:564-585).
+   - **Consequence.** A single application holding a GATT grant can grow BluetoothService's handle table toward the 256-handle Domain (`bt_bounds::DOMAIN_HANDLES`). Channel creation then fails for prompts, pushes, PCM channels and new clients, which breaks part a's assumption that every table is bounded inside the derived Domain.
+   - **Fix.** Use one bound for both grant kinds, and cap or de-duplicate subscriptions per grant.
+
+8. **`btctl pair-legacy` on LE never offers Secure Connections, so a peer that supports it is bonded at the LE legacy level (Low, Optional).**
+   - **What the code does.** With `legacy` set, `start_le_pairing` passes no public key (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:306). The pairing request then carries no Secure Connections bit (/data/yellow/libersystem/src/user/services/logic/src/smp_pairing.rs:289), so the exchange is legacy whatever the peer supports. `pair_le` checks only that no Secure Connections bond exists (le.rs:232-236).
+   - **What the milestone allows.** Part b allows LE legacy only "for a peer that has nothing better" (docs/todo/P02M0194.md:236-237). BR/EDR's `pair-legacy` meets that by protocol, because a PIN is requested only from a peer without Simple Pairing.
+   - **Fix.** Pass the controller's public key when it has one, and let `options.legacy` permit the legacy fall-back only when the peer's response lacks Secure Connections. The operator's explicit legacy path is kept. RootCanal's runs are unchanged, because its controller reports no P-256 support and so has no public key to offer.
+
+## Verification performed
+
+- **Method.** Static, read-only review against docs/todo/P02M0194.md (requirements, DONE notes and the 2026-10-14 LC3 removal) and the tail of this file. No build, test, cargo, QEMU or gate was run. Git state was not touched, and only this file was written.
+- **Security and pairing paths read in full.**
+  - bluetooth_service.rs: bond store client and `BondTransport`, event dispatch, `on_connected`, `on_encryption`, timers, operator verbs, `pair`, `set_trust`, `devices`.
+  - bluetooth_service/classic.rs: pairing prompts, link keys, inbound policy, L2CAP signalling, CTKD, RFCOMM dispatch.
+  - bluetooth_service/le.rs.
+  - service_logic `bt_pairing`, `bt_policy`, `smp_pairing`, `rfcomm`, `l2cap`, `l2cap_bredr` (signalling and ERTM), `sdp` server, `obex`, `avdtp`, `hfp`, `gtbs`, `uplink`, `bt_bounds`.
+  - bluetooth_bond_store.rs and `bond_store` bounds.
+- **Audio and transfer paths read.**
+  - bluetooth_service/{voice, broadcast, opp, serial, gatt}.rs.
+  - Parts of bluetooth_service/{le_audio, audio, a2dp}.rs.
+  - `le_iso` reassembly and classification.
+  - drivers' `bt_usb` reassembly.
+  - InputService's Bluetooth slot.
+  - NetworkService's PAN links.
+  - AudioService's route endpoints.
+- **Bond list capacity (finding 1).** Computed from the generated `BondRecord::write` and enum widths, and confirmed against the generated dispatch's overflow fallback (v1.rs:7528-7568). I found no caller that falls back from `list` to per-peer lookups.
+- **Reconnection and rotation (findings 2 and 3).** Traced every caller of `reconnect_bonded` and `relist`, and every write of `le.accepting`. Checked the gates' reconnection sequence (btclassic.rs:1088-1106) and the harness rotation scenario (bluetooth_guest_le.py:293-305).
+- **Key size (finding 4).** Searched for any HCI Read Encryption Key Size or key-size handling in hci_bredr.rs, hci_codec.rs and the service; there is none.
+- **OPP record (finding 5).** Searched for every caller of `sdp::Server::offer` and `withdraw`.
+- **Gates, docs and tools.** Checked gate registration (check.sh:75-83; src/tools/verify-model/model/release-required.toml:69-77), THREAT_MODEL 2.4, the subcommand dispatch and helpers of btctl.rs, and the bluetooth.lsidl contracts.
+- **LC3 removal.** Searched for references to the removed Appendix C data; none remain (only historical comments in lc3.rs, lc3/tests.rs and bt_lc3.rs).
+- **Reviewed with no finding.** The SMP state machine, the two-axis level rules, the prompt deadline and watcher handling, the HFP gateway and mSBC H2 framing, PushServer bounds, the broadcast-code scrubbing, the PAN uplink rule and the Domain derivation in service_manager/bootstrap.rs:279.

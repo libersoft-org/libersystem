@@ -157,3 +157,64 @@ PASSED: `./check.sh --refresh dynamic-report` (393 s), log `.build/logs/end-of-j
 Final state: COMPLETE. Lifetime identities no longer wrap; required host boundary checks, the tool gate, six service/real-USB tests, all-target builds and current dynamic-report verification are satisfied, with commands and limitations recorded above. The original combined verification item and TODO entry are checked again only after these final results. No new full unchanged kernel or input-suite rerun is claimed, and no required implementation or verification remains for P02M0192. Prior audit content is preserved.
 
 Final coordinator consistency checks: `./check.sh --gate milestone-index` PASS (3 s; `.build/logs/end-of-job/continuation-milestone-index-final.log`), `git diff --check` PASS. All thirteen original audit files remain exact byte prefixes from baseline `d0f54598`, each with its UTC continuation record. Plan/index review confirms ten completed requested milestones and only P02M0196, P02M0197 and P02M0202 open for their explicitly recorded hardware/design requirements. No owned QEMU, TCPCI backend or UPS simulator remains running.
+
+AUDITOR'S REVIEW ON P02M0192 (2026-10-15T04:39:48Z):
+
+**Rating: 10/10.** Every item is implemented as the plan states it, and I found nothing that needs a code change.
+- **Vocabulary.** The gamepad records and ops are additive in `input.lsidl`: op 4 `subscribe-gamepads`, op 5 `observe-gamepads`, and `input-admin.open-gamepads` as op 2. `input-gamepad` was appended to the capability enum. PermissionManager mints it per launch, and the `gamepad` tool's row grants nothing else.
+- **Wire and publisher.** Both are defined once, in `driver_protocol::gamepad`, and used by the xHCI driver, the fixture and InputService. The publisher:
+  - never closes a full connection;
+  - owes unsent frames in the order they became owed, with `ARRIVAL` before any `STATE` and `DEPARTURE` after the last;
+  - folds later changes into an owed `STATE`;
+  - re-owes everything to a new connection;
+  - refuses, rather than wraps, exhausted handles.
+- **InputService:**
+  - keeps the `gamepad` subscription open, adopts up to four providers and tracks up to eight gamepads under its own lifetime ids;
+  - holds at most one pending state per gamepad and stream, retried on a periodic one-tick wait;
+  - closes a stream that cannot take a `present`, `arrived` or `departed`;
+  - releases held buttons and hats before closing on focus loss and on a protected session;
+  - refuses the console stream while a surface holds focus or another console stream is open.
+- **HID parser.** It maps each Game Pad or Joystick application collection by its usage and occurrence. It keeps those segments out of the pointer, key, consumer and contact paths, and handles out-of-range axis and hat values as specified.
+- **xHCI HID module:**
+  - binds up to four HID interfaces in one Configure Endpoint, each with its own ring and report page, under a four-interface class charge;
+  - routes reports by slot and endpoint;
+  - publishes each gamepad on the token appended last;
+  - departs every gamepad of an unplugged port before its rings and pages are released.
+- **Tool, fixture and evidence.** The `gamepad` tool (full screen and `--lines`), the `edu` fixture, `gamepadcheck`, the cold gate and its three registrations, and the services and hardware suite tests are all present and assert what the plan names.
+
+## Findings
+
+None. I found no defect and no optional change worth making within this milestone's scope.
+
+## Verification performed
+
+- **Documents read:** `docs/todo/P02M0192.md` whole, and the last sections of this audit file, including the 2026-10-08 lifetime-id continuation.
+- **Code read in the current tree:**
+  - **`driver_protocol::gamepad`:** `gamepad.rs` whole, and the list of its ten host tests.
+  - **`input_service.rs`, the gamepad parts:**
+    - `Pad`, `Owed`, `PadStream` (`feed`, `flush`, `offer_state`, `offer_whole`, `close`), `open_pad_stream` and `Gamepads`;
+    - `adopt_pad_source`, `lose_pad_source`, `pad_frame`, `pad_arrived`, `pad_state` and `pad_departed`;
+    - `set_focus`, `protect` and `close_console_pads`;
+    - the scope checks in the serve loop, `stream_subscribe_gamepads`, `stream_observe_gamepads`, and the periodic retry wait.
+  - **`input.lsidl`:** the gamepad records, the ops and the `gamepad-fixture` interface.
+  - **`drivers/core/src/hid.rs`:** gamepad detection in `parse`, `input_segs` exclusions, `gamepads`, `control` and `GamepadMap::{shape, apply}`.
+  - **`drivers/core/src/usb_hid.rs`:**
+    - `configure_hid`, `pad_label` and `Pads::follow`/`flush`;
+    - `handle_hid_event` and `feed_hid_report`;
+    - `depart`.
+  - **`xhci.rs`:**
+    - the offer list (`GAMEPAD_TOKEN` = 9, last) and the `follow` calls;
+    - the kind ranking (`KIND_GAMEPAD` after `KIND_DFU`) and the `(gamepad)` online line;
+    - `detach_port_devices`.
+  - **`usb_class`:** `HID_COST`, `HID_LIMITS` and the four-interface test.
+  - **The tool and its harness:**
+    - `apps/tools/src/gamepad.rs` whole, `gamepad_fixture.rs` and the head of `gamepadcheck.rs`;
+    - the PermissionManager rows;
+    - the manifest rows (tool, probe, fixture, the xHCI `provides` and InputService's four kinds);
+    - the `provider-kind` value 21, which agrees with `driver_protocol::provider::GAMEPAD`.
+  - **The gate and test evidence:**
+    - `check-gamepad-tool.sh` and its registrations;
+    - the assertions of `gamepads_reach_the_focus_owner_and_the_console_watcher_by_identity` and `usb_gamepads_report_which_pad_pressed_what`;
+    - `usb-gadget.sh` (`hid-gamepad-pair`, a seven-byte report), `gamepad-source.py` and `test-kernel.sh`.
+- **Checked that the opening snapshot fits.** It is at most sixteen frames, against the kernel's default channel depth of 64 (`kernel/object/channel/mod.rs:30`).
+- **Static review only:** nothing was built or run.

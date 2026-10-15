@@ -1211,3 +1211,108 @@ device-policy verbs, or a settings application, and choosing it is the owner's c
   - The provider inventory is `match` on all three targets. The dynamic program's new imports are
     `HciPacketKind::encode`, `PeerAddress::encode`, `BondRecord::encode`, `BondRecord::read` and the `wire`
     reader, and all of them come from providers it already declares.
+
+AUDITOR'S REVIEW ON P02M0180 (2026-10-15T04:38:48Z):
+
+**Rating: 7/10.** The milestone is implemented, and the findings of the earlier rounds are fixed in the current tree. That covers:
+- the kind-scoped catalogue: `open-consumer`, `open` checked against the publication's own kind and generation, `subscribe` refused before the snapshot, and a 64-slot table with the manifest's matching budget check;
+- the bounded HCI wire: ceilings narrowed to what the provider advertises, a command checked against the controller's maximum before it is queued, one command outstanding, and credits returned only by the controller;
+- session epochs, the scan and pairing caps, pairing only from a scan, and power-off through `HCI_Reset`;
+- key scrubbing on every IPC copy;
+- the confined bond store, which answers only after a durable `commit`;
+- the prepared-and-released Domain launch, the InputService slot reached through the broker, `btctl` as the one shipping operator, and the gate's registration.
+
+Two defects need code changes inside this milestone:
+- The event loop's waits carry no deadline, contrary to the bounds item. InputService calls BluetoothService the same way, so a stalled controller also stalls InputService's whole delivery loop.
+- The bond store cannot list the 64 records it admits. Past roughly fifteen bonds, every bonded peer silently stops being an input source and is no longer reconnected.
+
+The later P02M0194 revision of the bounds (eight links, sixteen channels, 32 queued ACL packets, a 4 MB IPC figure, all derived in `service_logic::bt_bounds`) is a recorded decision and is taken as given.
+
+## Findings
+
+1. **Medium, Defect - BluetoothService waits on its controller, the catalogue and the bond store with no deadline, and InputService waits on BluetoothService the same way.**
+   - **What the plan requires.** "Event-loop work is bounded per turn and waits use deadlines" (`/data/yellow/libersystem/docs/todo/P02M0180.md:271-272`).
+   - **What the code does:**
+     - **Every HCI send waits without a deadline.** Every command and every ACL packet is a synchronous request:
+       - `Controller::pump` and `Controller::flush_links` call `send_packet` (`/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:640`, `:707`);
+       - `send_packet` calls `exchange` (`:537`), which calls `ChannelTransport { chan }.call(request, &[], &mut handles, 0)` (`:503`);
+       - `ChannelTransport::call` sends with `send_caps_blocking` and then waits in `recv_vec_caps_deadline(chan, .., deadline)` (`/data/yellow/libersystem/src/user/libs/ipc/ipc-client/src/lib.rs:39-51`);
+       - a deadline of 0 means "no timeout" (`/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:1035-1041`, `:3351-3365`).
+     - **The bond store is reached the same way.** `bond_exchange` passes deadline 0 (`bluetooth_service.rs:492-499`). The generated `list` and `delete` go through `BondTransport::call` with the generated client's default deadline, which is also 0.
+     - **Adoption waits too.** `Stack::adopt` (`bluetooth_service.rs:2168-2199`) makes four synchronous calls: the catalogue `open`, then `attach`, `receive` and `control`. All go through clients built with `Client::new`, whose deadline is 0 (`/data/yellow/libersystem/src/user/libs/protocol/device-proto/src/generated/liber/device/v1.rs:2529`, `:3658`).
+     - **The USB provider can leave a send unanswered indefinitely.**
+       - The provider answers an ACL send only when its bulk OUT transfer completes (`/data/yellow/libersystem/src/user/drivers/core/src/class_bt.rs:9-10`, `send_acl` `:158-173`, completion `:489-491`), and nothing times out a pending transfer.
+       - So a controller that does not finish taking one packet parks BluetoothService's whole loop.
+       - While it is parked, no client is answered. No scan deadline and no 60-second pairing cap fires, since `run_timers` runs only between waits, and no report reaches an input stream.
+     - **InputService inherits the stall:**
+       - `Bluetooth::retry` runs every two seconds while the slot holds fewer than eight streams (`/data/yellow/libersystem/src/user/services/core/src/input_service.rs:1240`, `:1566-1567`, `:1594-1596`).
+       - It calls `enabled()` and `open_input()` through `bluetooth_profile::Client::new(ChannelTransport { chan: self.profile })` (`:1260-1261`, `:1281`), again with deadline 0 (`/data/yellow/libersystem/src/user/libs/protocol/bluetooth-proto/src/generated/liber/bluetooth/v1.rs:5329`).
+       - Whenever BluetoothService is busy - a slow send, a bond commit, a parked send - InputService's single loop waits with it. So does every event that loop delivers: the pointer, application keys, contacts and gamepads.
+       - InputService's own comment rejects exactly this for the broker resolve: "a blocking resolve here would park the pointer path" (`input_service.rs:1203-1207`).
+   - **Why it matters.**
+     - The gate proves that unrelated pointer input keeps working while BluetoothService is *stopped*. It does not cover a service that is alive and not answering, which is the case "waits use deadlines" exists for.
+     - Short stalls, such as a bond commit through StorageService, happen in ordinary QEMU runs. An indefinite stall needs a provider that never answers a send.
+   - **Minimal fix:**
+     - Give `exchange`, `bond_exchange` and the four adoption calls a finite deadline. A timeout on the HCI transport should end the session, as `HciControlKind::Fault` already does.
+     - Build InputService's profile client with `bluetooth_profile::Client::with_deadline`, as `/data/yellow/libersystem/src/user/services/core/src/brightness_policy.rs:501` does for PowerService. On a timeout, drop the connection the way a dead one is dropped.
+     - The in-guest Bluetooth fixture can be the oracle by withholding a `send` reply, as `power_fixture` already withholds control replies.
+
+2. **Medium, Defect - The bond store cannot list the 64 records it admits; past roughly fifteen bonds every bond reads as absent, so the mouse is refused as an input source and is not reconnected.**
+   - **What the plan requires.** "Cap records at 64 and the complete store at 64 kB", and the backend "survives service restart/reboot" (`/data/yellow/libersystem/docs/todo/P02M0180.md:235-236`).
+   - **What the code does:**
+     - **The reply buffer is 1024 bytes.** The store serves every request through `serve_multi` with a 1024-byte reply buffer (`/data/yellow/libersystem/src/user/services/core/src/bluetooth_bond_store.rs:372-374`).
+     - **`list` answers in one reply.** It returns every record of a controller at once (`:348-353`), and the store admits 64 (`/data/yellow/libersystem/src/user/services/logic/src/bond_store.rs:28`).
+     - **Record sizes:**
+       - A listed record carries no key but is still at least 44 bytes on the wire.
+       - On top of that come its name (up to 48 bytes, `bond_store.rs:31`), its alias (up to 32 through `alias`) and its trust list (`/data/yellow/libersystem/src/idl/bluetooth.lsidl:531`).
+     - **How many fit:**
+       - The reply holds about fifteen peers with 18-byte names, beside the host's own identity record.
+       - It holds about seven peers at the field bounds.
+       - The record this milestone first defined (version, two addresses, key, security, name and `enabled`) fits about thirteen when names are at full length.
+     - **What an overflowing reply becomes.** The generated dispatch replaces it with `error.again` (`/data/yellow/libersystem/src/user/libs/protocol/bluetooth-proto/src/generated/liber/bluetooth/v1.rs:7528`, `:7562-7568`), and asking again gets the same answer.
+     - **How BluetoothService reads that.**
+       - `Stack::records` turns any error into an empty vector (`bluetooth_service.rs:936-945`), and everything that decides input reads that list.
+       - `enabled_peer` (`:965-967`) answers `None`, so `open_input` refuses the mouse with `not-found` (`:2135-2139`).
+       - A reconnected link is not walked for reports (`:1299-1301`).
+       - `reconnect_bonded` builds an empty accept list, so no bonded LE peer is reconnected (`/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:163-171`).
+       - `btctl list` gets `again` (`bluetooth_service.rs:1801-1809`).
+   - **Why it matters.**
+     - The milestone's promise - bond once, reuse the bond after a restart or a reboot - breaks without a word once enough devices are bonded. The records are all still on the medium.
+     - The gate bonds one mouse, so it cannot show this.
+   - **Minimal fix.**
+     - Size the store's reply buffer for its bound: 64 records at the largest listed size, about 8.2 KiB. Alternatively, page `list`.
+     - Add a check that lists 64 maximal records.
+
+## Verification performed
+
+- **Documents read:**
+  - `docs/todo/P02M0180.md` whole;
+  - the last sections of this audit file (the 2026-09-24 review, the 2026-09-25 re-audit and the responses).
+- **Code read in the current tree:**
+  - `bluetooth_service.rs`:
+    - the constants;
+    - `Controller::{command, pump, l2cap_pdu, flush_links, start_init, advance_init, end_session}`, `release_streams`, `deliver`;
+    - `Stack::{bond, store_bond, records, enabled_peer, on_connected, on_encryption, on_disconnected, on_advertisements, on_acl, on_att, on_notification, run_timers, pair, set_trust, adopt, withdraw, drain_packets, on_packet, drain_control}`;
+    - `ReadView`, `OperatorView`, `ProfileView`;
+    - the main loop.
+  - `bluetooth_service/le.rs`: `load_irks`, `reconnect_bonded`, `relist`.
+  - `bluetooth_bond_store.rs`: whole.
+  - `service_logic`:
+    - `hci`: limits, checks, credits;
+    - `bt_bounds`;
+    - `catalogue_scope`;
+    - the `bond_store` bounds.
+  - `device_manager.rs`: `CatalogueClients`, `serve_catalogue_once`, `open_subscription`, `serve_catalogue_admin_once`, `open_consumer`, `CatalogueView::open`.
+  - `process_service.rs`: `limited_domain`.
+  - `service_manager/bootstrap.rs`: `service_limits`.
+  - `input_service.rs`: the Bluetooth slot and the serve loop's retry.
+  - `permission_manager.rs`: the `btctl`, `btcheck` and `btread` rows.
+  - `drivers/core/src/class_bt.rs`: send and completion.
+  - `rt`: `wait` and `recv_vec_caps_deadline`.
+  - `ipc-client`: `ChannelTransport`.
+  - Generated code: the clients' default deadlines and the dispatch overflow path.
+  - `system-manifest`: the catalogue budget (64 on both sides).
+  - `manifest.toml`: the `bluetooth_service` and `bluetooth_bond_store` rows. The `bluetooth-hci` kind appears in the `bluetooth_service` role alone.
+  - Gate registration: `check.sh`, `verify-model/src/catalog.rs`, `model/release-required.toml`.
+- **Wire sizes.** Computed from the generated `BondRecord::write`: u16 length prefixes, u8 enums.
+- **Not done.** Static review only: nothing was built or run.

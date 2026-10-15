@@ -306,3 +306,57 @@ runtime deadline primitives. Completion is restored; no implementation or verifi
 The complete pre-continuation audit prefix from revision d0f54598 was independently verified byte-for-byte preserved.
 
 Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+AUDITOR'S REVIEW ON P02M0201 (2026-10-15T04:40:15Z):
+
+**Rating: 7/10.** The transports and the driver are complete and careful:
+- The kernel's class rows (0x0C/0x07 interfaces 1 and 2, BAR 0) and the ICH9 `(8086, 2930)` row, which writes HOSTC at claim, restores it at release and replays it after S3.
+- `smbus_ich9` declares only block write, block read with the device's count, and PEC.
+- KCS, BT and SSIF match IPMI 2.0. That covers KCS's IBF/OBF phases and its ABORT within one second; BT's sequence, netfn and command checks with the buffer bound from Get BT Interface Capabilities; and SSIF's single and multi-part writes and reads (block numbering from 0, end at 0xFF), the NACK bound, PEC only when both sides offer it, and one absolute deadline.
+- The message layer: the 272-byte bound, the 5 s deadline, three strikes on 0xC3/0xD2/deadline, the 10 s probe, a new identity read again, and the pet served before every transaction.
+- Discovery by class or by `_IFT` (SMIC refused), and the SMBIOS type 38 cross-check as a match id only.
+- Identity with the GUID or the binding-qualified fallback, held to the 64-byte selector.
+- The SDR, SEL and FRU decoders: I checked the SDR offsets against IPMI 2.0 Tables 43-1/2/3/7/8. Also the `power_model::ipmi` linear conversion, the units and the trip points.
+- The system events (generator 0x41; OS Boot 0x1F/06; OS Stop 0x20/03), the BMC watchdog encodings and sleep step, the AdminService extension (actions 3/4, two executors, the `bmc` policy row, the payload, count and reservation rules, and the `Operation:` line), and the `bmc` tool and its grants.
+
+The defects are in the BMC service's side of each binding. It sends every call on one long-lived channel through a fresh generated client, with a per-call deadline and no disposal of late replies, so a single expired call leaves that binding answering every later call with the previous call's reply. It also never retries a provider whose `open` was refused, which a restart can hit because the provider admits one consumer. A smaller optional point: a watchdog found running at bind is taken over only after the whole SDR read.
+
+## Findings
+
+1. **Medium, Defect - One BMC-service call that outlives its deadline desynchronizes that binding's request channel for good.**
+   - What happens: `src/user/services/core/src/bmc_service.rs:96-98` (`provider`) builds a new `bmc::ipmi_provider::Client::with_deadline(ChannelTransport { chan }, ...)` for every call, and every generated client starts at correlation 0 (`src/user/libs/protocol/bmc-proto/src/generated/liber/bmc/v1.rs:2483`). `ChannelTransport::call` returns the next message on the channel (`src/user/libs/ipc/ipc-client/src/lib.rs:38-51`), and the client only compares that message's correlation with its own (for example `v1.rs:2834` in `system_event`).
+   - Nothing clears late replies: the binding's request channel (`Binding.chan`) is never drained, and only the `changes` streams are in the wait set (`bmc_service.rs:438`).
+   - The deadlines: 10 s (`QUICK_TICKS`: describe, `sel_info`, chassis, identify, the boot event), 60 s (`PROVIDER_TICKS`: sensors, `sel_page`, fru, lan) and 0.5 s for the shutdown event (`:227`). Meanwhile the driver serves one request at a time and finishes a request after the service has given up on it.
+   - The result: once a call expires, its reply arrives later and waits in `chan`, and the next call (again correlation 0) takes it as its own. An answer to the same operation is accepted though stale, an answer to a different operation fails to decode, and every later call reads its predecessor's reply until the binding is withdrawn or the service restarts. The `bmc` tool's view of that BMC and the service's own event writes are wrong from then on.
+   - It is reachable in the milestone's own hostile mode on the fixtures. With the BMC silent, QEMU's `ipmi-bmc-extern` answers each transaction 0xC3 after four seconds. The five-second zone poll of the harness BMC's two temperatures (`src/user/drivers/core/src/ipmi_driver.rs:431`) therefore takes about 8 s before the third strike, so a 10 s call queued behind it expires (the follow poll's `sel_info` at `bmc_service.rs:245`, or `bmc chassis`).
+   - `ProviderView::sensors` (`ipmi_driver.rs:682`, through `sensor()` and `read_sensor` at `:497`) has no availability short-circuit, unlike `zone_state` (`:407`). So `bmc sensors` against a silent BMC with more than fifteen readable sensors outlives 60 s.
+   - The gate cannot show it: the follow probe ends before `mode silent` (`src/tools/check-ipmi.sh:394, 415-418`), and the harness SDR has four readable sensors, so no service call outlives its deadline.
+   - The driver already solves the same problem for SSIF: `SmbusTransport`, `ipmi_driver.rs:133-170`, discards replies whose correlation is not the request's. Keeping one client per binding (with a monotonic correlation) and discarding late replies, or draining `chan` before each call, closes it.
+
+2. **Low, Defect - A restarted BMC service never retries an `ipmi` provider whose `open` was refused.**
+   - `Service::adopt` (`bmc_service.rs:119-130`) gives up on any failed `open`, and the provider is announced again only if it is republished.
+   - The `ipmi` row declares `consumers = 1` (`src/user/services/manifest.toml:3739`), and the catalogue refuses an `open` while the previous instance's connection is still counted (`src/user/services/core/src/device_manager.rs:6351`). That count is refunded only when the driver's loop next waits and finds the closed channel (`ipmi_driver.rs:977` and `:1272`), which is after whatever request it is serving: seconds to minutes against a slow or silent BMC.
+   - A replacement whose `open` lands in that window never adopts the BMC: no boot or shutdown events and no `bmc` view, for its whole life. The plan requires "restart transparent and state reconstructible (a restarted instance re-reads every `ipmi` provider)".
+   - TypeCService retries exactly this case (`src/user/services/core/src/typec_service.rs:222-255`, `service_logic::provider_retry`). The gate's kill/restart case runs with an idle driver and does not reach the window.
+
+3. **Low, Optional - A watchdog found running at bind is taken over only after identification and the whole SDR read.** In `ipmi_driver.rs`, `identify` (`:1167`) and `read_repository()` (`:1175`) both run before Get Watchdog Timer and the take-over (`:1177-1199`). The plan says such a timer is "petted at once and taken over". With the ten-minute boot bound this is harmless on the fixtures, but the delay before the first pet grows with the repository size and the interface speed. Moving the watchdog block ahead of `read_repository()` would match the requirement at no cost.
+
+## Verification performed
+
+- Read the whole plan, and the last sections of this audit file (the 2026-10-08 SSIF deadline continuation included).
+- Kernel. `src/kernel/arch/common/pci/mod.rs:49-52` (the IPMI class rows) and `src/kernel/declared/mod.rs` (the `ich9-smbus` row, `claim_writes` and `replay_claim_writes`). The SMBIOS type 38 attachment as a `smbios:38#n` match id is in `src/kernel/firmware/mod.rs:146-190`.
+- Library. `src/user/libs/driver/ipmi/src/` read in full for `lib.rs` (bounds, `Availability`), `kcs.rs`, `bt.rs`, `ssif.rs`, `queue.rs`, `watchdog.rs`, `event.rs`, `chassis.rs`, `identity.rs` and `sel.rs`. From `sdr.rs` and `fru.rs` I read the record layouts, the repository bounds and the field decoding. SDR offsets were checked against IPMI 2.0 Tables 43-1, 43-2, 43-3, 43-7 and 43-8; the Get Device ID, Set Watchdog Timer and Platform Event Message encodings were checked too. `src/user/libs/power/model/src/ipmi.rs` was read in full.
+- Drivers:
+  - `src/user/drivers/core/src/ipmi_driver.rs` read in full: the interface preparation, the PEC choice, `watchdog_first` and `ask`, availability and `came_back`, the watchdog view and bridge, the sleep step, the provider, power and executor views, `serve`, and the bind order and form detection;
+  - `ipmi_bmc.rs` in full: the repository read, `sel_page`, `fru_bytes`, `lan_channels`, `prepare_sel_clear`/`execute_sel_clear` and the chassis rules;
+  - `smbus_ich9.rs` in full.
+- Services and tools:
+  - `src/user/services/core/src/bmc_service.rs` in full;
+  - `src/user/libs/ipc/ipc-client/src/lib.rs` and the generated `ipmi_provider` client (corr handling);
+  - `src/user/services/logic/src/admin_descriptor.rs` (actions 3/4, the operation table, the `Operation:` line);
+  - AdminService's executor table (`admin_service.rs:69-81, 185-196`);
+  - PermissionManager's `bmc` admin scope and tool rows (`permission_manager.rs:386, 1218`);
+  - the `bmc` tool's head (`src/user/apps/tools/src/bmc.rs`).
+- Manifest: the `smbus_ich9`, `ipmi` and `bmc_service` rows, and the catalogue client bound of 64 in both `system-manifest` and DeviceManager.
+- Gates read, not run: `src/tools/check-ipmi.sh` (the harness BMC section, the silence and close cases). From the harness BMC, `ipmi-harness-bmc.py`'s sensor list.
+- Static, read-only review only. No build, test, gate or QEMU run was performed. The recorded gate passes and the 2026-10-08 continuation results were taken as recorded.

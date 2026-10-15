@@ -639,3 +639,48 @@ No code change was made for P02M0202 in this session; the fixture-based gates an
 OWNER DECISION APPLIED (2026-10-13): phase 2 is QEMU and everything that can be tested on it; real hardware is not part of phase 2 and is marked in place, with no separate hardware-acceptance milestone; nothing is built without an oracle that runs here (recorded in `AI/CLAUDE.md` and in the Phase 2 preamble of `docs/todo/TODO.md`).
 
 The recorded run on an owner-provided board is no longer an open box: written as NOT TESTED ON REAL HARDWARE - not part of phase 2; the fixtures and their gates on all three targets are phase 2's proof. No open item remains; status COMPLETE (2026-10-13) for phase 2; TODO.md row ticked. No code changed for this milestone in this step.
+
+AUDITOR'S REVIEW ON P02M0202 (2026-10-15T04:41:01Z):
+
+**Rating: 8/10.** The milestone is substantially and carefully implemented:
+- The vocabulary: `typec-connector` = 27, `liber:typec@1`, and `usb-c` = 6 with the `usbc` adapter, which publishes measurements as unknown while nothing is attached. `canon::validate` checks the `usb-c` fields and the 60 V bound.
+- TypeCService: a catalogue factory scoped to its kind, the read and operator roots, one outstanding request per connector with a 15 s deadline completed as indeterminate and never retried, and non-blocking provider opens with retries.
+- The `typec` tool holds the read grant only; the operator grant is `typeccheck`'s.
+- UCSI:
+  - transport: VERSION refreshed by function 2 at bind, the version layouts, the `_DSM` function-0 mask, function 1 after every write, and no function 2 after a notification;
+  - commands: one at a time, CCI length checked against MESSAGE_IN and against the command's answer size, every completion acknowledged, ERROR followed by GET_ERROR_STATUS. Every command's field positions agree with UCSI's layout;
+  - recovery: ten-second bounds, two failed resets end the binding, READY before the first reset, and only the first 16 connectors served.
+- TCPCI: the register map and bit values agree with TCPCI 2.0; plain I2C and a level-low alert are required; INIT is awaited at most one second; source and dual-role are refused; a bind that finds VBUS present runs Soft_Reset.
+- The sink engine: Type-C debounce and hard-reset handling, the selection rule (with the 2026-10-08 fallback that refuses a non-5 V first offer), the timer table at ceil(min/10 ms)+1 ticks, and safety invariants 1-7 held in the transition function. The sleep refusal while the sink path is on is in place.
+
+One defect remains, in UCSI's resume path. A connector change that the PPM indicates is read but never acknowledged, so the PPM, and the harness PPM in particular, keeps that change pending and does not announce the connector's next change. An optional note: the DisplayPort configuration sent with SET_NEW_CAM contradicts its own stated intent.
+
+## Findings
+
+1. **Medium, Defect - After a resume, a connector change the PPM indicated is read but never acknowledged, so the next change on that connector can be lost.**
+   - The path: `Ucsi::wake` (`src/user/drivers/core/src/ucsi_acpi.rs:234-252`) drains the node's notifications (`:237`), enables notifications again, clears `self.changes` (`:242`) and reads every connector with `read_port(at, false)` (`:244`). So each GET_CONNECTOR_STATUS is acknowledged with `ack(true, false)` (`src/user/libs/driver/ucsi/src/lib.rs:224`) and never with the connector-change bit.
+   - The PPM's indicator still comes back on every completion. `run()` (`ucsi_acpi.rs:157-170`) queues it in `self.changes`, but `read_changes()` (`:470`) runs only from `on_notify()` (`:466`) and from `request()` (`:562`). Nothing processes that queue after `wake()`, and the same is true after `start()` (`:226-229`), so the change waits for a notification that may never come.
+   - The plan requires a connector change to be acknowledged "in the same ACK_CC_CI as the completion of the GET_CONNECTOR_STATUS that reads it".
+   - The harness PPM shows the consequence. It keeps a change pending until exactly that acknowledgement (`src/harness/ucsi-ppm.py:184-195`), repeats the indicator in every completion (`:290`), and announces a given pending set only once (`:460-466`).
+   - In the gate's S3 case (`src/tools/check-typec-ucsi.sh:406-418`) the detach is made while the guest sleeps. Its notification either never fires, because `Line.notify` gives up after five seconds (`ucsi-ppm.py:350-357, 391`), or it can reach the driver before `wake()` drains it. Either way `wake()` reads the detach (which is what the gate checks) but leaves connector 1 pending with `announced` set, so a later attach or detach on connector 1 is neither announced nor read. The gate stops right after the detach is reported, so it does not see this.
+   - Running `read_changes()` (reading with `change_ack = true`) for the connectors the completions indicated, at the end of `wake()` and `start()`, would restore the discipline.
+
+2. **Low, Optional - The DisplayPort configuration sent with SET_NEW_CAM selects "UFP_U as DFP_D".**
+   - `dp_configuration` (`src/user/drivers/core/src/typec_ucsi.rs:179-183`) returns `pin << 8 | 1 << 2 | 1`. In DisplayPort Alt Mode's Configure VDO, bits 1:0 = 01b configure the partner (UFP_U) as DFP_D, the DisplayPort source. The function's comment says the intent is this machine as the source, which is 10b (UFP_U as UFP_D). The pin assignment it chooses (`pin_assignment`, `:174-177`) is the partner's UFP_D set, which matches 10b, not 01b. Linux's UCSI glue passes only the pin assignment as SET_NEW_CAM's AM-specific field.
+   - The harness PPM accepts any value, and the gate asserts the same `0x00000805` (`check-typec-ucsi.sh:227`, and the unit test `typec_ucsi/tests.rs:97`), so phase 2's oracle cannot tell the difference. It is labelled optional under the owner's QEMU-only decision, but the encoded value contradicts the code's own stated intent.
+
+## Verification performed
+
+- Read the whole plan, the continuation notes, and the last sections of this audit file.
+- `src/user/libs/driver/usb-pd/src/` read in full: `engine.rs`, `pdo.rs`, `timer.rs`, `message.rs` and `tcpci.rs`. I checked:
+  - the TCPCI 2.0 register addresses, the ALERT, POWER_STATUS and POWER_CONTROL bits, the COMMAND codes, ROLE_CONTROL Rd/open, MESSAGE_HEADER_INFO, the RECEIVE_BUFFER and TRANSMIT_BUFFER layouts, the TRANSMIT encodings, and the VBUS scale and alarm units;
+  - PD's header fields, the Fixed RDO bits and the PDO decoding;
+  - the timer minima, and invariants 1-7 against the transition function: the sink path off before any message on detach, Hard Reset, error recovery and alarms; the alarm windows from attach, across Accept to PS_RDY, for an untrusted bind, and off during a hard reset.
+- Drivers. `src/user/drivers/core/src/tcpci_driver.rs` and `typec_tcpci.rs` read in full: alert servicing order, configure, `bind_afresh`, the sleep refusal, the description reader, the record and the supply.
+- UCSI. `src/user/libs/driver/ucsi/src/lib.rs` and `command.rs` (field positions compared with the UCSI layouts as Linux's `ucsi.h` encodes them), and the head of `answer.rs`. `ucsi_acpi.rs` and `typec_ucsi.rs` read in full.
+- Power: `src/user/libs/power/model/src/usbc.rs` and `canon.rs`'s `usb_c` check.
+- TypeCService: `src/user/services/core/src/typec_service.rs` (head, adoption and retry, the request flow) and `src/user/services/logic/src/typec_requests.rs`.
+- Tool and grants: `src/user/apps/tools/src/typec.rs` (read-only), and the PermissionManager rows for `typec` and `typeccheck` (`permission_manager.rs:386-452`).
+- Manifest: the `ucsi_acpi`, `tcpci` and `typec_service` rows, and kind 27 in `system-manifest` and DeviceManager.
+- Harness and gates: `src/harness/ucsi-ppm.py` (the ack, pending, announce and notify logic), `src/harness/tcpc_partner.py` (script outline, overshoot), and `src/tools/check-typec-ucsi.sh` (the sleep case and the DisplayPort assertion).
+- Static, read-only review only. No build, test, gate or QEMU run was performed. Real hardware is out of phase 2 by the owner's decision and is not counted. The recorded gate passes and timings were taken as recorded.

@@ -77,3 +77,80 @@ Status: COMPLETE; no remaining implementation or required-verification item for 
 Additional targeted continuation check: `cd src && cargo test --manifest-path user/libs/graphics/soft2d/Cargo.toml --target x86_64-unknown-linux-gnu a_cancelled_frame_leaves_every_unit_whole_or_untouched` passed (1 test, 0.63 s), confirming each cancelled unit remains wholly rendered or untouched. No source change or additional incomplete item resulted.
 
 Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+AUDITOR'S REVIEW ON P02M0193 (2026-10-15T04:40:09Z):
+
+**Rating: 10/10.** Every item is implemented as written. The one finding is optional.
+
+What the review confirmed:
+
+- **The pool and the ceiling.**
+  - `soft2d` holds a `Workers` from construction. `Serial` is the default and the reference.
+  - The ceiling is spent in the stated order:
+    - the decoded copies are settled against one lane first;
+    - further lanes fit only into what is left, up to the pool's lanes and the frame's units;
+    - the tile unit table, and the tile-major intermediate, are charged with the second lane;
+    - a frame on one lane is cut into bands.
+- **The replay reads only the prepared list.**
+  - Glyphs are placed and edge-built at `prepare`.
+  - Forms are held by `Arc`, so an eviction cannot take a form a list draws.
+  - Ramps and blur kernels are prepared, and each lane's stacks and node table are reserved.
+- **Bad schedules are handled.**
+  - A unit handed out twice is replayed once.
+  - A pool that returns early is refused with `IncompletePool`.
+  - The lowest failing unit's error is the one reported.
+  - Cancellation stops every lane at its next unit and keeps only whole units.
+- **The host suite** holds every existing scene and a crowded 56-tile scene bit-identical across:
+  - real threads, a backwards pool and a pool that hands every unit out twice;
+  - all three unit kinds.
+
+  It also covers:
+  - a warmed frame making zero allocations;
+  - the ceiling-order case, which sits on its boundary;
+  - a render that never misses the glyph cache;
+  - a mid-frame cancellation.
+- **The demo and the gates.**
+  - `test2d-sw` draws on `rt::pool` with `--workers` and `--compare`.
+  - The guest test reads the lane, unit and frame counts from the demo's own line.
+  - The frame-account gate pins `--workers=1` and records the pooled row.
+- **A later change keeps the invariant.** The device-space image cache (`CachedPaint`) is fitted after the lanes. It stores the shader's exact f32 answers, so a lane that displaces it cannot change a pixel.
+
+## Findings
+
+1. **Low, Optional - `test2d-sw` drops its backend after every draw, so every frame of the pooled demo reserves every lane from nothing and grows its unit and shader tables again.**
+   - **What the code does.**
+     - `draw_once` moves the caller's backend out with `core::mem::replace(backend, Soft2d::new())`, rebinds it to the frame's providers and pool, and drops it when it returns (`/data/yellow/libersystem/src/user/apps/tools/src/test2d_sw.rs:1363-1373`). Every frame therefore starts from `Soft2d::new()`.
+     - `prepare` then allocates and zeroes the scratch of every lane again (`/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:908-967`), a cost that grows with `--workers`.
+     - `render` grows the shader and unit tables from empty (`:976-977`, `:1044-1057`, `:1108-1141`).
+     - The glyph cache starts empty every frame too, though that costs the same at any worker count.
+   - **Why it is only optional.**
+     - The pattern predates this milestone, and the plan does not ask the demo to keep its backend.
+     - Its share of the roughly 62 ms pooled draw is small beside the scheduler placement the record already names.
+     - It does contradict the demo's own claim, beside its reused list, to make "no steady-state allocation" a claim and not a hope (`test2d_sw.rs:614-617`).
+   - **The fix is small.** `Soft2d::unbind` exists for exactly this (`backend.rs:354-358`), and `test3d-sw` keeps its 2D backend that way (`/data/yellow/libersystem/src/user/apps/tools/src/test3d_sw.rs:2189`).
+
+## Verification performed
+
+- **Documents read:**
+  - `docs/todo/P02M0193.md`, whole;
+  - this audit file, both records.
+- **Code read in the current tree:**
+  - `soft2d/src/workers.rs`, whole.
+  - `lib.rs`: the counting allocator, with `realloc` counted.
+  - `backend.rs`, whole, including:
+    - `prepare`: the ceiling loop, the lane fitting and the unit cut;
+    - `render`, `verdict`, `cut`, `band_units`, `rectangle_units`, `assemble`, `replay`;
+    - `LaneShape::reserve`, `place_glyphs`, `draw_placed`.
+  - `glyph.rs`.
+  - The reservations in `layer.rs` and `clip.rs`.
+  - `target.rs`: `Tile::load` and `Tile::store` for every `Access` kind, and `ImageSource: Sync`.
+  - `paint.rs`: `CachedPaint`.
+  - `filter.rs`: allocations in `evaluate` against those in `kernels`.
+  - `tests.rs`: the schedule pools (`Threads`, `Backwards`, `Rotating`, `Twice`, `Short`) and the six cases this milestone added.
+  - `test2d_sw.rs`: `Drawing`, `--workers`, `--compare`, `draw` and `draw_once`.
+  - The guest test `the_2d_demo_draws_the_same_frames_through_its_workers`.
+  - The pinning and pooled row in `check-qemu-2d-account.sh`.
+  - `soft2d-bench --workers`, `--units` and `--scaling`.
+  - The `docs/PERF.md` sections on the pool.
+- **Corrected comments:** the "same picture" and "time and nothing else" wording no longer appears in the graphics libraries.
+- **Static review only:** nothing was built or run.

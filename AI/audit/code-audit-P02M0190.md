@@ -202,3 +202,69 @@ Coordinated final checks at the frozen continuation source (2026-10-08), run by 
 Continuation final state for this milestone: no missing TPM implementation requirement was found after source and prior guest-evidence review. Fresh TPM/library/service tests and all three compiled targets passed; the preserved x86_64 and port guest results remain the required runtime evidence. No new TPM guest rerun was performed or claimed. The plan remains COMPLETE.
 
 Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+AUDITOR'S REVIEW ON P02M0190 (2026-10-15T04:29:29Z):
+
+**Rating: 8/10.** The TPM is a usable, typed, split-authority resource, as the milestone asks. The parts and what was checked:
+- **The library:** `GetCapability` is bounded and checks for hostile answers, and `flush_leftovers` and the hierarchy state are in place.
+- **The driver:** it follows the required start order (Startup, SelfTest, the leftovers flushed, the hierarchy and identity read, one line, one provider), runs one operation at a time, and `describe` reads afresh.
+- **The platform row:** one locality-0 page, with no interrupt and no DMA.
+- **The `tpm` provider kind and the three capabilities:** each was appended, not inserted.
+- **TpmService:** its decisions live in `service_logic::tpm`. Its queue answers `busy` past one call per connection or sixteen waiting, `interrupted` (never replayed) for the in-flight call, and `unavailable` for waiting calls.
+- **The grant split:** enforced in the service.
+- **The component tag:** prepended and checked by the service.
+- **PermissionManager:** a per-launch, task-bound mint.
+- **The rest:** `tpm-client`, the tool, the probe and the gate.
+
+Two defects remain. Both are in how TpmService answers, not in what it enforces:
+- With no provider present, `seal`, `unseal` and `quote` answer `owner-hierarchy-unavailable` instead of `unavailable`. That outcome is the one the contract and the documentation reserve for a provisioned TPM whose only remedy is a TPM clear.
+- A secret, nonce or sealed object past its bound closes the grant's connection instead of answering `bounds`.
+
+## Findings
+
+1. **Medium, Defect - With no TPM provider, `seal`, `unseal` and `quote` answer `owner-hierarchy-unavailable` instead of the contract's `unavailable`.**
+   - **The code.** `owner_usable()` is false whenever no provider is held (`/data/yellow/libersystem/src/user/services/core/src/tpm_service.rs:242-244`: `self.provider.as_ref().is_some_and(...)`). `client()` runs `tl::admit(grant, &op, self.owner_usable())` before the queue (:399-404). `admit` refuses an operation that needs the owner with `OwnerHierarchyUnavailable` (`/data/yellow/libersystem/src/user/services/logic/src/tpm.rs:123-125`). The queue's `Refusal::Unavailable` for a missing provider (tpm.rs:212-214) is therefore reachable only by `random`, `pcr-read` and `pcr-extend`.
+   - **What it contradicts:**
+     - the milestone: "calls made while no provider is present, answer `unavailable`" (`docs/todo/P02M0190.md:146-147`);
+     - the contract: `unavailable` = "No TPM is being served: none was found, or its driver is restarting" (`/data/yellow/libersystem/src/idl/tpm.lsidl:41-42`);
+     - `docs/TPM.md:96-97`.
+   - **Why it matters.** The same docs say `owner-hierarchy-unavailable` means a provisioned owner hierarchy whose remedy is a TPM clear that makes every sealed object unopenable (`docs/TPM.md:79-83`). That is what a program is told:
+     - on every machine without a TPM;
+     - before the driver's first publication is adopted;
+     - throughout every driver restart.
+     
+     It also defeats a real consumer. `hibernation_service`'s restore retries `unseal` while the answer is `Unavailable` (`/data/yellow/libersystem/src/user/services/core/src/hibernation_service.rs:300-310`). It receives `OwnerHierarchyUnavailable` instead, stops waiting at once, and fails with "its key did not unseal" (:315) whenever TpmService has not yet adopted the TPM.
+   - **Why nothing caught it.** The host tests cover `Unavailable` only with `Op::Info` on the bare queue (`tpm/tests.rs:100, 132`). The gate's driver-down window exercises only `random` (`src/harness/scenarios/tpm-tool.toml:192-224`).
+   - **Fix.** Answer `unavailable` before the owner check when no provider is held. One way is to treat "no provider" as owner-usable in `admit`, so that the queue answers.
+
+2. **Low, Defect - A secret, nonce, sealed object or digest past its bound closes the application's grant connection instead of answering `bounds`.**
+   - **The code path.** The contract's bounds are IDL `@bound`s. The generated server dispatch returns `None` for a list past them (`/data/yellow/libersystem/src/user/libs/protocol/tpm-proto/src/generated/liber/tpm/v1.rs`): digest ≤ 32 at :823, secret ≤ 96 at :870, sealed ≤ 1024 at :916, nonce ≤ 64 at :963. On that `None`, `client()` returns false (`tpm_service.rs:379`) and `serve()` drops the whole grant (:499-506, "A REQUEST THIS CONNECTION CANNOT CARRY CLOSES IT").
+   - **Nothing stops an over-long argument before it reaches the server.** The generated client checks only `len > u16::MAX` (v1.rs:1235-1237), and `tpm-client` adds no check (`/data/yellow/libersystem/src/user/libs/clients/tpm-client/src/lib.rs:105-128`). As a result, the `MAX_SECRET`/`MAX_SEALED`/`MAX_NONCE` checks in `admit` (logic `tpm.rs:107, 112, 118`) can never fire for an over-long input.
+   - **Why it matters.**
+     - The contract documents `bounds` as "A count, secret or nonce past its bound" (`tpm.lsidl:28-29`).
+     - The tool is required to print "every refusal by its name" (`P02M0190.md:209-210`). Yet `tpm seal 16 <a 97-byte text> FILE`, `tpm quote 16 <a 65-byte nonce> FILE` and `tpm unseal <a 1025-4096-byte file>` print "tpm: TpmService did not answer" (`/data/yellow/libersystem/src/user/apps/tools/src/tpm.rs:149-151`).
+     - A third-party program that passes one over-long argument loses that grant's connection until its next launch.
+   - The bound itself is enforced, so this is not a security issue.
+   - **Fix.** Either of:
+     - reject past-bound lengths in `tpm-client` with `bounds` (and have the tool check them);
+     - raise the wire bounds above the semantic ones, so that `admit` answers `bounds` itself.
+
+## Verification performed
+
+- **Static review only.** Nothing was built, run or tested for this review.
+- **Read:**
+  - `tpm_service.rs` (whole), `service_logic::tpm` and its tests;
+  - `tpm.lsidl`;
+  - `tpm_driver.rs`: start order, `describe`, serving loop;
+  - `src/tpm/src/ops.rs`: `properties`, `handles`, `identity`, `hierarchy`, `flush_leftovers`;
+  - `tpm-client`, and the `tpm` tool;
+  - the manifest rows for `tpm_service` (transparent, reconstructible, optional `tpm` catalogue role, ADMIN root only), `tpm_driver` (two match rules, `dma = "none"`, one `tpm` provider), the dynamic `tpm` tool and the static development-only `tpmprobe`;
+  - PermissionManager's TPM arm: the task duplicated `WAIT|TRANSFER`, `mint`, and the connection narrowed;
+  - the gate `check-tpm-tool.sh` and the outline of the scenario.
+- **Independent cross-check.** A separate read-only pass covered the remaining items, and I re-checked each item it reported against the code above:
+  - the platform rows: one page, with no IRQ;
+  - the appended `tpm` kind in all three closed mappings;
+  - the appended capabilities;
+  - `TPMADMIN` in ServiceManager's three rows.
+- **Both findings were confirmed in the code.** Finding 1 through the `owner_usable` → `admit` → `submit` order, and the hibernation consumer's wait loop. Finding 2 through the generated decode and the `serve()` drop path.
+- **Not counted against this milestone.** "Nothing else holds any of them" no longer holds: P02M0197 later gave `hibernation_service` a ServiceManager-minted `TPMSEAL` role (manifest `[[services]] hibernation_service`). That is P02M0197's extension, not a defect here.

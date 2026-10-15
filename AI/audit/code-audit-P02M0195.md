@@ -404,3 +404,41 @@ The root's post-fix `./check.sh --gate source-hygiene` PASSED (93 s; `.build/log
 Final shared-backend integration evidence: the new dedicated firmware GPIO fixture passed on riscv64 (600 s) and aarch64 (425 s), using the repaired used-ring writer, two independently raised/acknowledged events, and the completed platform-row listings. The unchanged gate oracles passed; logs are `.build/logs/end-of-job/continuation-firmware-tree-<arch>.log`. The P02M0195 continuation is complete: missing specification PEC examples are covered, the shared fixture's confirmed page-crossing defect is repaired and tested, and existing bus/HID requirements and prior guest evidence remain preserved. No new full HID guest run was claimed. The plan remains COMPLETE.
 
 Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+AUDITOR'S REVIEW ON P02M0195 (2026-10-15T04:38:57Z):
+
+**Rating: 10/10.** Every requirement item of both halves is implemented as the plan states it, and I found no defect that needs a code change within the milestone's scope. The contracts (`i2c-device.lsidl`, `gpio-device.lsidl`) carry the functionality set and the error vocabulary. The scoped `CONNECT` is additive: an unscoped payload is still two bytes, and a scope that cannot be read is refused whole. DeviceManager closes the offered endpoint of `i2c-bus`/`gpio-lines` at publication without counting it, counts every scoped mint against `consumers` (8/16) through the host-tested pure rules in `driver-binding`, refunds on `DISCONNECT`, refuses the catalogue's `open` and refuses an unscoped mint. Both controllers hold one address or line per connection, refuse a second or wrongly scoped connection on the connection itself, and report the refusal with a `DISCONNECT`. virtio-gpio's one-buffer-per-line cycle delivers each event once and masks the line until it is acknowledged, and it disarms and deactivates the line on give-back. The child binding works as the plan describes: the connections become function-scoped requirements, the scoped connections are minted inside the bind transaction and closed by its rollback, an `_AEI` line is refused, and a lost controller stops the child as `DependencyLost`. The `i2c_hid` driver implements the descriptor register (`_DSM` or `hid-descr-addr`), D0 before power-on, the bounded RESET handshake retried once, the storm rule, the publications by application collection, the report loop and SET_POWER sleep on STOP. InputService keeps its `pointer` and `touch` subscriptions open with the 4/1 bounds, waiting providers, and contacts lifted when a surface detaches. The manifest rows, the system-manifest refusal of roles that name a bus kind, the kernel oracles and the gates match the plan. One documentation-only observation follows.
+
+## Findings
+
+1. **Low, Optional - InputService now also follows the `input` kind, which the plan says keeps its bootstrap-only discovery.** `src/user/services/core/src/input_service.rs:1467-1472` subscribes `ProviderKind::Input` through the same `Followed` machinery (bound 4) as `pointer`. The plan (P02M0195b, InputService item: "The `input` kind keeps its bootstrap-only discovery") says otherwise. The code comment dates the change to 2026-10-06 and gives the reason: a rebound virtio tablet was never attached again. The behaviour is better than the plan's, and nothing in this milestone depends on the old one. The milestone text could record the deviation so the plan and the code agree. No code change is needed.
+
+## Verification performed
+
+- Read the whole plan, and the last sections of this audit file for context.
+- Contracts and codec. `src/idl/i2c-device.lsidl` and `gpio-device.lsidl`. In `src/user/libs/driver/protocol/src/lib.rs:1030-1165`: `Scope`, `GpioTrigger`, `connection_scope` (ten-bit and past-seven-bit addresses refused; the tree trigger cell and the ACPI mode/polarity mapped to one trigger), `encode_connect` and `decode_connect_scoped`, plus their host tests at `tests.rs:474-531`.
+- DeviceManager (`src/user/services/core/src/device_manager.rs`):
+  - minting: `mint_scoped_connection` and `mint_on` (2698-2770: the scope/kind check, `admits_scoped`, the count increment);
+  - publication: `publish_all`, which closes the offered endpoint (3247-3255), and `outstanding` (3396);
+  - the catalogue: `open` refused for bus kinds and at the consumer bound (6336-6354); the `DISCONNECT` event (4055);
+  - child bindings: `needs_of`, `controller_function`, `needs_met`, `child_connection` with the `_AEI` exclusion (4243-4325), and the bind's `txn.holds` for the minted connections with its rollback (4877-4893);
+  - the dependency-lost stop over `needs` (5655-5705), and the ACPI service's grants from the companion lists (2889-2938);
+  - the development-boot self-test `scoped_bus_publication` (`device_manager/tests.rs:50-85`).
+- The pure rules `scoped_only`, `keeps_offered_endpoint`, `openable` and `admits_scoped`: `src/user/libs/driver/binding/src/lib.rs:879-913`, with their tests at `tests.rs:2045-2061`.
+- The controllers:
+  - `virtio_i2c.rs` in full (the declared set, the TooLong and Unsupported paths, FAIL_NEXT pairs, one address per connection, the sleep step);
+  - `i2c.rs` and `smbus.rs` (the PEC CRC-8 over every bus byte, including both address bytes of a write-read);
+  - `virtio_gpio.rs` and `gpio.rs` in full (the GET_NAMES size bound, the trigger mapping, arming before queueing, the event delivered once with `acknowledge` refused unless outstanding, the disarm/deactivate on give-back, and `restore` after a power loss);
+  - `i2c-client/src/lib.rs` (`ScopedBus` refuses a foreign address before sending; `Smbus` refuses undeclared transactions at construction).
+- HID over I2C: `i2c_hid.rs` and `i2c_hid_driver.rs` in full, the `hid-i2c` library head (consumer and SSIF wording corrected), and the host tests in `i2c_hid/tests.rs`.
+- InputService: `Followed` (`input_service.rs:93-200`) and the serve-loop handling of subscriptions, closures and lifting (1793-1830, 1855-1873). The kernel test `pointer_and_touch_providers_are_followed_as_they_are_published_and_withdrawn` exists (`test_suites/services.rs:311`).
+- Manifest and system manifest:
+  - rows for `virtio_i2c`, `virtio_gpio` and `i2c_hid`, and the `hid-i2c`/`i2c-client` source-row comments (`src/user/services/manifest.toml`);
+  - kind 22/23 in every table (`device.lsidl`, `driver_protocol::provider`, `system-manifest` 285-286, `device_manager.rs` 6896/6934);
+  - the role refusal (`src/tools/system-manifest/src/lib.rs:1590-1598`) and its test (`tests.rs:741-751`).
+- Oracles:
+  - the kernel tests `virtio_i2c_serves_one_address_per_connection_and_every_transaction_it_declares` and `virtio_gpio_delivers_each_event_once...` (`src/kernel/test_suites/hardware.rs:4960-5200`);
+  - `src/tools/check-i2c-bus.sh`;
+  - the HID model in `src/harness/vhost-i2c-gpio.py:694-835`, and its IOTLB/miss and self-test outline;
+  - `qemu-run.sh`'s `I2C_FIXTURE` wiring (993-1095).
+- Static, read-only review only. Per the audit constraints, no build, test, gate or QEMU run was performed. The recorded gate passes (x86_64; aarch64/riscv64 2026-10-07) and the 2026-10-08 continuation results were taken as recorded, not re-run.

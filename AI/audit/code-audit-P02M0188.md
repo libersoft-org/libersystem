@@ -1082,3 +1082,60 @@ THE REGISTRATION ITEM IS DONE, and ticked; the milestone is COMPLETE for phase 2
 Status: COMPLETE (phase 2).
 
 SIXTH RUN AND THE COMMITTED TREE (2026-10-14, 13:35 CEST): the owner had committed every source change in the meantime (a4c9fd0b at 07:14, 5f0a03c4 at 13:05 - soft2d, check-ipv6-peer.sh, guest-gate.sh, the regenerated reports and checklist), so `./verify.sh` saw only the documentation changes of the closures: "nothing to verify: every changed path is declared not code" - 0 inner, 0 deferred, exit 6 "INCOMPLETE: merge is required", which is how every passing default run ends (revision verification is owed by whoever proposes the change). `./verify.sh --for-range a4c9fd0b..5f0a03c4 --plan` answers FULL verification (check-ipv6-peer.sh and guest-gate.sh are harness tools) - the inner share the fifth run already executed on the same code but for guest-gate.sh, plus the deferred set (ports, guest gates) for `--merge`. Not started: that revision-level run is the owner's. What guest-gate.sh's change can reach was run instead, on the committed tree, each as `./check.sh --gate NAME` with LIBER_DEVELOPMENT removed: `icd-selection` PASS (397 s), `lifecycle` PASS (465 s), `virtio-gpu-edid` PASS (408 s), `boot-volume-controllers` PASS (1105 s) - with `brightness-usb` (757 s) and `guest-verdict` earlier; each gate that started in the shipping profile rebuilt the shipping staging on the way out, and the staging held no development fixture afterwards.
+
+AUDITOR'S REVIEW ON P02M0188 (2026-10-15T04:28:18Z):
+
+**Rating: 8/10.** The authorization path still holds on the current tree. An effect is reached only after five steps, in this order: a recorded request; a fresh Enter on a session that both the display and the trusted keyboard acknowledged under the same epoch; an executor revalidation and a recorded approval; a recorded consumption; and a final owner and deadline check at the admission boundary. Requester loss works by task death and by connection closure independently, termination is checked explicitly before any other ready work, the grant channel carries no `duplicate`, and every decline is journaled before it is answered. The 2026-10-12 race fix in `admin_broker::journaled` refuses the holder in both orders. The registration item that two earlier reviews left open is now closed by the owner's `./verify.sh` runs, recorded in the milestone. One real defect remains, and it is about availability, not authority: a prepared operation that will never run is not released on several terminal paths, and the executor never reclaims an expired one. A few such endings therefore disable an executor until its process restarts.
+
+## Findings
+
+1. **Medium, Defect - Preparations that will never run are leaked: they are not released on several terminal paths, and the executor's four slots never reclaim them, so the executor ends up refusing every later preparation.**
+   - **Where the broker drops the operation without asking the executor to cancel it.** The broker emits `Effect::Release` only from `decline_as` (`/data/yellow/libersystem/src/user/services/logic/src/admin_broker.rs:349-353`), from the mismatch branch of `prepared` (:317-322), and for a late preparation answer (:301-313). These paths end a request whose operation is still prepared at the executor, and none of them releases it:
+     - A grant that expires unused: `tick`, `State::Granted` (:679-685) sets `Expired`, closes the grant and journals the decline. `operation` stays set.
+     - A consumption record that fails: `journaled` `(Consuming, Consumed)` with `!ok` (:403-410).
+     - A consumption record that never answers: `tick` `State::Consuming` (:664-671).
+     - Owner lost or deadline passed at the admission boundary (:420-428). This is the branch the 2026-10-12 fix routes the delegate race through.
+   - **The late-answer release goes nowhere.** For a request that has already settled, `prepared` emits `Release { executor: 0 }` (:301-305). Executor keys start at 1 (`/data/yellow/libersystem/src/user/services/core/src/admin_service.rs:1332-1333`, `next_executor: 1` at :1902), so `release` (:625-633) finds no executor and sends nothing.
+   - **Nothing else in AdminService cancels a preparation.** `close_grant` (:665-679) only closes the grant channel. `settle` (:1682-1707) only unpins the journal and closes payloads. A restarted AdminService never cancels what its predecessor prepared.
+   - **The executor side never reclaims them.** `Operations::prepare` reclaims only preparations that are not `live()`, meaning started or cancelled (`/data/yellow/libersystem/src/user/drivers/core/src/admin_operation.rs:51-53`, :73-77). Expiry is consulted only by `check` (:101-103). With `MAX_OPERATIONS = 4` (:18), the fifth live preparation is refused `Busy`. The fixture maps that to `Error::Again` (`admin_fixture.rs:50`), and AdminService turns it into a decline, "the executor refused to prepare it" (`admin_service.rs:1389`).
+   - **Why it matters.** The plan requires termination to "cancel preparation" and the service to "release request capacity on terminal failure". In a long-lived executor, four grants that expire unused, consumptions that are not recorded, or owner deaths at the admission boundary are enough. After them, every later request for that action is declined until the driver restarts or, for DFU, the device is enumerated again. The long-lived executors are the IPMI driver's `sel_ops`/`chassis_ops` and the DFU module's per-device `Operations`.
+   - **The milestone's own gate leaks these slots but cannot see it.** `admin-path.toml` exercises:
+     - grant expiry (:311-345), which leaks one;
+     - the consumption record held across the owner's death (:516-560), which leaks one;
+     - an AdminService restart that strands an issued grant (:598-633), which leaks one.
+     
+     That leaves the fixture one free slot. Nothing prepares again before the reboot, so the gate passes.
+   - **Fix.** Releasing an unstarted preparation is safe on every one of these paths, because none of them dispatched. Either:
+     - emit `Release` with the bound executor wherever a request leaves `Granted` or `Consuming` without a dispatch, and in `prepared` keep the executor key for a settled request; or
+     - let `Operations::prepare` drop preparations past `expires`. This also covers an AdminService restart.
+
+## Verification performed
+
+- **Static review only.** Nothing was built, run or tested for this review.
+- **Read in full:**
+  - `admin_broker.rs`
+  - `admin_journal.rs`
+  - `trusted_keys.rs` and `display_lock.rs`
+  - the `admin_descriptor.rs` template, `wrap` and bounds
+  - `admin_service.rs`
+  - the `admin.lsidl` contract
+  - the executor seam `admin_operation.rs` and `admin_fixture.rs`
+  - the DFU executor's `prepare`, `execute` and `detach` paths in `class_dfu.rs`
+  - the gate `check-admin-path.sh`, and the outline of `admin-path.toml`
+- **Checked against the plan:**
+  - Admission: at most 16 connections; one outstanding request per connection; contention declined while another request is in Preparing through Approving.
+  - Timing: 60 s confirmation, measured from the request's commit; 30 s grant; 5 s exchanges.
+  - Approval: revalidation happens before the approval record, and liveness is rechecked after each acknowledgment.
+  - Redemption: `Granted`, a live original connection and owner, and the deadline are required. Consumption is recorded before dispatch. A lost execution reply becomes `OutcomeUnknown`, never retried.
+  - Grant channel: `SEND|RECEIVE|WAIT|TRANSFER`, with no `DUPLICATE`.
+  - Owners: `check_owners` waits on every owner with an already-reached, non-zero deadline before serving the ready handle. An unobservable owner is treated as lost.
+  - The factory: refuses an ended or unobservable owner; PermissionManager passes a `WAIT|TRANSFER` duplicate of the task, the task's koid as the launch, and the `admin_policy` scope; `for_capability(AdminRequest)` is 0.
+  - InputService: `protect`, arming only once idle, and the chord reserved on the ordinary path.
+  - DisplayService: lock, present, release and reset ending the session.
+  - The journal:
+    - segment and record bounds, reservation at preparation, and pins;
+    - the 256-entry ring with an eviction count;
+    - uncertain commits dropped, not replayed;
+    - recovery used for numbering only, with a fresh epoch.
+  - Registration: `check.sh` :191, `catalog.rs` :444/:980/:1102, `release-required.toml` :180.
+- **Each part of Finding 1 was traced through the code above.** The leak count in the gate was derived from the scenario's step order and the fixture's lifetime.

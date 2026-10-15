@@ -656,3 +656,54 @@ The rejection of Finding 1 is justified. Verified:
   - each grant is bound to one reader key and one operation mask.
 
 No code of this milestone changed in this round, and there is no regression. The milestone is COMPLETE.
+
+AUDITOR'S REVIEW ON P02M0182 (2026-10-15T04:35:32Z):
+
+**Rating: 7/10.** Most of the service slice is sound and matches the plan: the exact-command allowlist, the PIN-free secure-verification template, one verification attempt per request, same-transaction verification before GENERAL AUTHENTICATE, the slot state machine with its abort-then-power-cycle-then-SELECT handoff, owner-bound grants, withdrawal and the bounds, all under a thorough gate. Three problems remain in code this milestone owns: the DER check of the card's authentication signature reads an empty INTEGER before checking its length, so one malformed card answer panics the whole service; the shared ATR leaf leaves T=15 out of the check-byte rule, so standard T=0 cards that declare global bytes are refused; and a client can fall about twice the specified sixteen events behind before its stream is closed, a bound the gate does not measure.
+
+## Findings
+
+1. **Medium, Defect: a zero-length INTEGER in a card's authentication signature panics SmartcardService.**
+   - **Where:** `der_ecdsa` in /data/yellow/libersystem/src/user/services/logic/src/piv.rs:179-202. Line 187 computes `minimal` (`len == 1 || !(value[0] == 0x00 && value[1] & 0x80 == 0)`) before line 188 refuses `len == 0`.
+   - **What goes wrong:** for `len == 0`, `value` is the empty slice that `bytes.get(at + 2..at + 2)` returns, so `value[0]` panics with an index out of bounds.
+   - **The input is the card's.** `authentication_signature` (piv.rs:155-177) passes the card's GENERAL AUTHENTICATE answer straight in, from `Cards::work_answered` at /data/yellow/libersystem/src/user/services/logic/src/card_slots.rs:853. The answer `7C 06 82 04 30 02 02 00` with SW 9000 passes both template checks and reaches `integer(2)` with `len == 0`.
+   - **Why it matters:** a hostile or broken card that answers the pinpad VERIFY with 9000 can crash the service every time a granted client calls `authenticate-piv`. The rt panic handler exits the process (/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:203-208), and `smartcard_service` is `restart = "transparent"` (/data/yellow/libersystem/src/user/services/manifest.toml:5991). Every grant and transaction on every reader dies with it, and the card can repeat this at will.
+   - **Against the plan:** the plan has the service "construct and validate the GENERAL AUTHENTICATE command/response grammar". The DER cases in /data/yellow/libersystem/src/user/services/logic/src/piv/tests.rs:111-135 have no zero-length INTEGER.
+   - **Fix:** test `len == 0 || len > 33` before indexing `value`, and add the vector to the module tests.
+
+2. **Medium, Defect: the shared ATR leaf requires no TCK when only T=0 and T=15 are indicated, so valid cards are refused.**
+   - **Where:** /data/yellow/libersystem/src/user/libs/smartcard/model/src/atr.rs:89-94 leaves T=15 out of `protocols`, and line 110 decides whether TCK is present from `protocols & !1`.
+   - **The standard:** ISO/IEC 7816-3 (8.2.5) makes TCK present whenever a TD indicates any protocol other than T=0, T=15 included ("if T=0 and T=15 are present ... TCK shall be present").
+   - **Who is affected:** a common family of T=0 PIV cards declares T=15 global bytes (the class indicator) and so carries TCK. Example: `3B DB 96 00 80 1F 03 00 31 C0 64 B0 F3 10 00 07 90 00 80`, whose XOR from T0 through TCK is zero. A faithful re-statement of `parse` answers `Trailing` for it.
+   - **Effect in the service:** SmartcardService reads every ATR through this parser (/data/yellow/libersystem/src/user/services/core/src/smartcard_service.rs:567). A refused ATR is `offer: None`, and `reset_step` makes the slot unavailable (/data/yellow/libersystem/src/user/services/logic/src/card_slots.rs:762-769). Every provider-proven recovery repeats the same reset, so such a card can never be used. The plan's supported scope is "short-APDU ... readers for either negotiated T=0 or T=1".
+   - **Coverage:** the host tests pair T=15 only with T=1, which needs TCK anyway (/data/yellow/libersystem/src/user/libs/smartcard/model/src/atr/tests.rs:53-59). The fixture card and P02M0099's CCID emulator both present `3B 88 80 01 ...`, so no QEMU gate exercises the case. The defect is nevertheless in this milestone's own pure leaf, and a host vector shows it.
+   - **Fix:** record that some TD named T=15, and require TCK whenever a protocol other than T=0 was indicated. Add the vector above to the tests.
+
+3. **Low, Defect: a client can fall about 32 card events behind, not 16, before its stream is closed.**
+   - **Plan:** at most 16 pending events per client.
+   - **Two buffers:** `subscribe` sizes the stream channel at `frames.len() + MAX_EVENTS` (/data/yellow/libersystem/src/user/services/core/src/smartcard_service.rs:680). `event` then queues changes in a second, service-side `EventQueue` of 16 (smartcard_service.rs:455; /data/yellow/libersystem/src/user/services/logic/src/card_slots.rs:1032, 1050-1058), and `drain_streams` moves them into the channel while it has room (smartcard_service.rs:461-487).
+   - **Effect:** a client that read its snapshot and then stopped reading holds up to `frames.len()` + 16 changes in the channel, plus 16 in the queue, before `overflowed()` closes the stream. Memory stays bounded, but the code does not enforce the stated bound.
+   - **The checks assert a number nobody measures:** the service's log line "fell sixteen behind" (line 465), and the gate rows at /data/yellow/libersystem/src/tools/check-smartcard-service.sh:99-100. Their probe (/data/yellow/libersystem/src/user/services/core/src/cardcheck.rs:515-541) makes 40 changes and only checks that the stream closed.
+   - **Fix:** keep one bound, for example by treating a `Stalled` send as the overflow instead of keeping the second queue. Have the probe assert where the stream closed.
+
+## Verification performed
+
+Static review only; nothing was built, run or tested. Read in full:
+- `smartcard.lsidl`, `smartcard_service.rs`, `service_logic::card_slots` and `service_logic::piv`, with the piv DER and template tests;
+- `smartcard_model::atr` and its tests;
+- PermissionManager's smart-card arm of `grant_for_task` and `smartcard_policy`;
+- ServiceManager's broker `cap_grants` (`CAP_SMARTCARD_ADMIN` for `permission_manager` alone) and its kept-root release;
+- the manifest rows for `smartcard_service` (a `smartcard-reader`-only CATALOGUE factory, the ADMIN serve root, transparent and reconstructible) and `smartcard_fixture` (`development = true`);
+- the gate script and cardcheck's overflow scenario;
+- the registration in `check.sh`, verify-model's catalogue and guest lists, and `release-required.toml`;
+- the kind value 14 in `device.lsidl`, driver-protocol and DeviceManager's two conversions.
+
+The TCK finding was checked against ISO/IEC 7816-3 and re-stated in a scratch script; the PIV commands were checked against SP 800-73-4. Confirmed correct:
+- **Allowlist:** byte-exact SELECT of the full AID and the two GET DATA objects; the instruction is judged before the class byte; a client's GET RESPONSE is refused.
+- **PIN:** the template carries placeholders only; one verification per request, never retried; a reader whose format does not fit the template answers `trusted-input-unavailable`.
+- **Authentication:** GENERAL AUTHENTICATE only after a verification in the same transaction. Continuation is bounded to 64 pieces and 16 kB under one deadline.
+- **Transactions:** eight FIFO waiters with deadlines, counted in the 32-transaction bound; a 60 s lease cap; APDU and pinpad deadlines clipped to the lease.
+- **Handoff:** every handoff aborts and waits for quiescence, then power-cycles, selects the protocol from the parsed ATR and SELECTs again. Verification state goes with the transaction.
+- **Recovery:** abort and reset are each capped at 5 s, then the slot is unavailable until the provider proves quiescence.
+- **Removal:** removal and reinsertion are separate events. A draining slot stays draining across reinsertion. Late replies are dropped by request identity, and the service also checks the echoed header.
+- **Grants:** each is retired by its owner observer whatever copies of its endpoint exist. Withdrawal closes every grant to the reader. An alias resolves to exactly one publication or the mint fails.

@@ -563,3 +563,50 @@ Code reading only; nothing was built or run for this review. Files read:
 - the manifest's service entry.
 
 I checked the port bits against the USB Printer Class 1.1 `GET_PORT_STATUS` layout.
+
+AUDITOR'S REVIEW ON P02M0186 (2026-10-15T04:37:01Z):
+
+**Rating: 10/10.** I found nothing in this milestone's scope that needs a code change. The job state machine, admission and fallible reservation, all-or-none staging with the size-limit failure, the single explicit submission, transmission by acknowledged prefix with one outstanding write, the deadlines, the closing semantics and the evidence boundary are all implemented as the plan states them. The rules live in `service_logic::spool_jobs` and `service_logic::printer_status`, with non-blocking I/O around them in `spool_service.rs`. The only changes since the last review make a closed SERVE root drop out of the wait set instead of spinning, and they are correct.
+
+## Findings
+
+None that require a code change.
+
+## Verification performed
+
+Static review only; nothing was built, run or tested.
+
+Read in full:
+- `spool.lsidl` and `printer-device.lsidl`;
+- `spool_service.rs`;
+- `service_logic::spool_jobs` and `service_logic::printer_status`.
+
+Read in part:
+- PermissionManager's fresh-connection path for `spool` and the `spool_probe` row;
+- the broker's `cap_grants`;
+- the manifest row: escalate, ephemeral, SERVE, and a `printer`-only CATALOGUE factory;
+- the gate registration, and the diff of the service since the last re-audit.
+
+Confirmed correct:
+- **State machine:** jobs go `writing -> queued -> active -> transferred | failed | cancelled` and never back. A repeated submit answers the state the job has. A write after submission is invalid.
+- **Admission:** zero-length jobs, jobs over 4 MB and unsupported languages are refused before admission. Then 16 records, two per context and 16 MB are checked before `try_reserve_exact`.
+- **Writes and submit:** a write takes at most 4096 bytes, all of it or none; past the declared length it takes none and fails the job with `size-limit`. Submit requires the exact length to be staged.
+- **Closing:**
+  - closing a writing job abandons and refunds it;
+  - closing a submitted job detaches it, and the work goes on;
+  - a terminal record is retired once unwatched;
+  - grant contexts outlive their connection while anything is charged to them, at most 16.
+- **Transmission:**
+  - one active job per printer, oldest submission first;
+  - one write outstanding, advanced by exactly the acknowledged count;
+  - a count larger than offered fails the job as uncertain and resets the printer;
+  - `again` re-offers the frame after a port read;
+  - the 30 s stall deadline is reset only by accepted bytes, and the lifetime is 10 minutes from submission;
+  - a write unanswered for 30 s resets the printer.
+- **Reset and withdrawal:** both fail the printer's jobs with `reset` or `unplugged` and never replay; a write outstanding at the time makes the ending uncertain. A new attachment must differ from the previous one, and a failed attach or reset leaves the printer unavailable.
+- **Evidence:**
+  - the device ID is length-checked, big-endian including its own two bytes, at most 4096, before parsing;
+  - only printable ASCII is accepted, and a duplicate key or disagreeing command sets is ambiguous;
+  - PostScript is an exact, case-insensitive `POSTSCRIPT`, `POSTSCRIPT2` or `POSTSCRIPT3`, and other tokens are kept as bounded metadata;
+  - the port bits follow USB Printer Class 1.1: bit 5 paper empty, bit 4 selected, bit 3 not-error. Cover-open and jam are `unsupported` without evidence, and an unread port is `unavailable`.
+- **Buffers:** the job-write and attach-answer frames are const-asserted to fit the 8192-byte buffer.

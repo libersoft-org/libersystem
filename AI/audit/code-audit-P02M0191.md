@@ -218,3 +218,42 @@ Coordinated final checks at the frozen continuation source (2026-10-08), run by 
 Continuation final state for this milestone: the only owned source change is the byte-for-byte common UART module relocation required by source hygiene. The three final builds resolved it successfully, and post-fix source hygiene passed. The earlier port-range and UART handoff runtime evidence is preserved; no additional serial-handoff guest run was performed solely for the relocation. The plan remains COMPLETE.
 
 Latest final-source cross-build: `LIBER_DEVELOPMENT=1 ./build.sh --arch all` PASS (1277 s; `.build/logs/end-of-job/continuation-build-all-async.log`), SDK, libraries, userspace, kernel, loader, packages and volumes for x86_64, aarch64 and riscv64. This supersedes the earlier build as compiled-source evidence and includes the asynchronous provider/policy IO corrections plus the final additive fixture operation. Current service-logic tests also PASS (955, one pre-existing ignored; `continuation-service-logic-async.log`); source-hygiene/model/model-tests PASS (208 s) and generation drift check PASS (19 s). Runtime gates and milestone-specific completion limitations remain separately recorded.
+
+AUDITOR'S REVIEW ON P02M0191 (2026-10-15T04:38:16Z):
+
+**Rating: 9/10.** Port I/O is a capability exactly as specified. I found no meaningful defect in the kernel mechanism. The one gap is a verification step that the gate item still names and that was never added.
+- **The object.** A `PortRange` has no directional rights, is mapped into one process at most, and grants nothing until it is mapped.
+- **Enforcement.** Every core's TSS carries the 8 KiB bitmap and its trailing `0xFF` byte, under one limit; the map base sits past the limit for a process with no range. Changes are serialised with an odd/even generation and allocate nothing. Copies take no lock and retry a bounded number of times, refusing everything past the bound. The switch, the shootdown service step and the `#GP` pull read only the per-core record, never `current_thread`. A revocation clears the bits, releases the process lock, recopies locally and then runs one shootdown round. An unconfirmed round retires the ports for the boot and ends the claim `Quarantined`.
+- **The reserved set.** Its fixed part is exactly the specified list: `0xCF9` left out, the DMA page registers mintable, the exit port test-only. The FADT blocks are recorded before the boot scan in both builds. Run-time installs are counted per item, and COM1 moves into and out of the claim's grant in one step under the table lock.
+- **The sources.** Exclusivity is checked at record and again at mint. I/O BARs are sized with decode off and refused past `0xFFFF`; the claim sets I/O decode and the release clears it. The derivation table holds only P02M0200's TCO row. The `FirmwareInterpreter` mint is the only call that takes an address.
+- **Other architectures and DeviceManager.** Every call answers `ERR_UNSUPPORTED` on aarch64 and riscv64. DeviceManager mints every port range a row carries, and the console tap.
+- **The COM1 handoff.** The owner state is KERNEL, DRIVER, SLEEP or TERMINAL. Every access goes through one counted access path. The owner flips before IRQ 4 is unregistered. The reacquisition reads the receiver out with DLAB cleared before the FIFO reset. The terminal-path writer is entered before the first line of every fatal path. The sleep entry lends the UART and gives it back with the driver's settings.
+
+## Findings
+
+1. **Low, Defect - The `serial-handoff` gate never gained the "ACROSS A SLEEP" step its item requires, and its header still says there is no sleep entry to drive.**
+   - **What the item asks.** The gate item (`docs/todo/P02M0191.md:432-435`) requires: right after the first `lab sh` round trip, a suspend to idle while the driver holds COM1, then `sleep: entered` and `sleep: resumed` in the log and `lab sh` answering through the driver after the resume. The purpose is "so the kill that follows reports its zero count over a hold that included a sleep". The item says the step is "carried by whichever of this part and P02M0197b lands second".
+   - **What the gate has.** P02M0197b landed second, and its kernel sleep entry is now the production caller of `serial::sleep_begin`/`sleep_wake`/`sleep_end` (`/data/yellow/libersystem/src/kernel/sleep/mod.rs:251`, `src/kernel/arch/x86_64/sleep.rs:385`, `:452`). Yet `/data/yellow/libersystem/src/tools/check-serial-handoff.sh` has no sleep step. Its header still reads "ACROSS A SLEEP is P02M0197b's to add to this gate: there is no sleep entry to drive yet" (:28). P02M0197's own `sleep` gate checks the timing and a typed line after a suspend to idle, but no reacquisition count.
+   - **Why it matters.** The zero-stray-access count over a hold that included a sleep is the gate-level proof that the lend-and-return path leaves no ordinary kernel path touching COM1 while the driver holds it. At present it is shown only on the second UART, by the kernel test `the_sleep_entry_follows_the_owner_it_finds_and_a_wake_from_s3_programs_the_uart_before_its_first_line` (`src/kernel/object/port_range/tests/handoff.rs:247-306`, which asserts `stray() == 0`).
+   - **Fix.** Add the step and correct the header. It is small: `sleepctl` with a timed suspend to idle between steps 2 and 3, then the existing kill and its zero-count check.
+
+## Verification performed
+
+- **Static review only.** Nothing was built, run or tested for this review.
+- **Read:**
+  - `src/kernel/arch/x86_64/ioports.rs` whole: `load`, `switch_in`, `service`, `pull_on_gp`, the FADT blocks, the derivation table and its fixture test;
+  - `src/kernel/object/port_range/mod.rs`: `IoPorts` change/copy protocol, `mint`, `mint_from_install`, `map_into`, `unmap_from`, `revoke`, `take_back`, `give_back_all`;
+  - `src/kernel/object/port_range/grants.rs`: the fixed set, `recordable`, `grant`, `grant_from_install`, `end`, `install`, `uninstall`;
+  - the TSS layout and limit in `gdt.rs`;
+  - `io_bars` and `set_io_decode` in `arch/common/pci/mod.rs`, and the claim/release decode calls in `device.rs`;
+  - the port-range and console-tap syscalls in `syscall/mod.rs`;
+  - DeviceManager's resource loop;
+  - the x86_64 console owner code in `serial.rs`: `write_byte`, `write_bytes`, `hand_over`, `tap_read`, `hand_back`, `terminal`, the sleep entry, `settle_driver`;
+  - the fatal paths: the panic handler, the double fault, ring-0 `#GP` and `user_fault_or_halt`;
+  - the list of port-range and handoff kernel tests;
+  - the gate `check-serial-handoff.sh`;
+  - the `PERF.md` switch-cost section;
+  - the second `isa-serial` in `qemu-run.sh`.
+- **Independent cross-check.** A separate read-only pass covered the lock order and lifetime arguments. I re-checked its two candidates at the code and do not report them, because each needs an extremely unlikely coincidence:
+  - In `write_bytes` (`serial.rs:437-479`), the owner is checked and the ring pushed under two separate lock acquisitions. A terminal-path entry on another core in exactly that gap would strand a mirror chunk in a ring nobody drains. The panic text itself is unaffected.
+  - In `map_into` (`port_range/mod.rs:289`, `:305-307`), `try_reserve(1)` does not reserve one slot per concurrent caller. Two simultaneous maps in one process at a capacity boundary, with an allocation failure at that moment, would make the second `push` infallible-allocate, so its `ALLOC-OK` note overstates the guarantee.

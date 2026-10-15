@@ -424,3 +424,62 @@ implementation and measurement verification for P0189 is now satisfied. The ARM 
 its successful corrected offline postchecks retain their distinct statuses. No audit rating is assigned.
 
 Final coordinator consistency checks: `./check.sh --gate milestone-index` PASS (3 s; `.build/logs/end-of-job/continuation-milestone-index-final.log`), `git diff --check` PASS. All thirteen original audit files remain exact byte prefixes from baseline `d0f54598`, each with its UTC continuation record. Plan/index review confirms ten completed requested milestones and only P02M0196, P02M0197 and P02M0202 open for their explicitly recorded hardware/design requirements. No owned QEMU, TCPCI backend or UPS simulator remains running.
+
+AUDITOR'S REVIEW ON P02M0189 (2026-10-15T04:37:02Z):
+
+**Rating: 9/10.** The milestone delivers what it promised:
+- **The kernel record buffer.** It lives in the host-tested `perfbuf` crate: 32-byte records and 8 MiB. A record past the bound is refused and counted, never wrapped. An append is one `fetch_add` with a release-published kind byte. The buffer is attached only under `development-trace`; otherwise both syscalls answer `ERR_UNSUPPORTED`. Arming empties it. The scheduler's SWITCH and WAKE hooks are one flag test while unarmed.
+- **The sites.** They are cached-flag sites in `rt`, placed in the demo, the frame loop, DisplayService (exactly at the `presentation-stats` clock) and the virtio-gpu driver.
+- **The collector and its fixtures.** It refuses refused or incomplete records, lost lines, a missing anchor, a missing site, a failed serial join, a second application thread inside a draw, and a demo report that disagrees. There are 18 fixtures, and the gate runs them before it boots anything.
+- **The gate.** It refuses to start while another guest is up. It runs three boots with the commands the milestone names. Every run except the pooled row is pinned to one worker, every boot boots one image digest, and the provenance check guards the optimised row.
+- **The account in `docs/PERF.md`.** It covers conditions, profiles and digests; the instrument and dormant cost; per-shape, per-size and hidden-surface tables; copies and mappings; primitives; the system charge with and without the policy wait; the classification of every term above 5 %; the pooled row; the ports; disproofs; the corrected 2026-09-15 label; and named follow-ups.
+
+The terms are the intervals between consecutive sites, so the residue is 0 % by construction. That is a recorded design (`docs/PERF.md:575-577`), and I take it as given. The findings below are about what the gate takes from its environment, and about reproducing the port rows' conditions. None of them changes a published number.
+
+## Findings
+
+1. **Low, Defect - The gate does not enforce two conditions it reports as its own: the optimised row's provenance, and the dormant boot's profile.**
+   - **The optimised row.** The provenance check runs only when both `CARGO_PROFILE_DEV_OPT_LEVEL` and `ACCOUNT_REFERENCE` are set (`/data/yellow/libersystem/src/tools/check-qemu-2d-account.sh:251`). With the variable set and no reference:
+     - nothing is compared;
+     - the run still ends `PASS - four accounts closed ...` (:267);
+     - the results land in a directory suffixed `-opt2` (:54).
+     
+     The milestone says the gate "takes the row only if" the image, kernel and driver digests differ and DisplayService and the demo do not (`docs/todo/P02M0189.md:177-180`).
+   - **The dormant boot.** It passes only `DEV_PROFILE=1` (:207), and `boot` clears only `DISPLAYS` (:170). An inherited `LIBER_BOOT_PROFILE=development-trace` therefore reaches fw_cfg (`/data/yellow/libersystem/src/harness/qemu-run.sh:2620-2621`). That makes the "dormant" boot a trace boot, in which every site is a syscall. The armed/dormant comparison and the dormant-site primitive would then be measured on the wrong profile, and nothing notices:
+     - `record_conditions` only records the profile line (:156-158);
+     - the demo's `site-live=` (`test2d_sw.rs:1260`) is printed but never checked.
+     
+     An inherited `GPU_SIZE` likewise changes the "default 1280x800" scanout of boots 1 and 3. `docs/PERF.md:103` nevertheless says "The gate supplies the trace/dormant profiles itself".
+   - **Why it matters.** The gate is the instrument meant to keep the account true after the next change. The final runs avoided both cases only by unsetting the variables by hand.
+   - **Fix.** Refuse an optimised run without a reference. Pass `LIBER_BOOT_PROFILE=development` to the dormant boot, or assert its recorded profile line and `site-live=0`, and clear `GPU_SIZE` for the default-scanout boots.
+
+2. **Low, Defect - The emulated-port mode records none of the conditions its rows are published with.**
+   - **What the gate does.** The port branch (`check-qemu-2d-account.sh:64-95`) never calls `record_conditions`. It keeps no image, ESP or staged kernel digest, no driver, DisplayService or demo artifact, and no host CPU.
+   - **Where the published conditions came from.** The port provenance `docs/PERF.md:65` cites (`conditions-live.json`, `conditions-final.json`) was captured by an ad-hoc helper, `/data/yellow/libersystem/.build/logs/qemu-2d-account/continuation-20261008/capture-port.py`. It lives under the git-ignored `.build/` (`.gitignore:13`).
+   - **Why it matters.** The milestone makes "THE CONDITIONS ... PART OF EVERY NUMBER" (`P02M0189.md:130`), and says "a measurement nobody can reproduce from the source tree is an anecdote" (:244-246). As it stands, a rerun of the port check from the tree reproduces the accounts but not their conditions.
+   - **Fix.** Record the port boot's conditions in the gate itself: the cold runner's ESP and staged kernel, the manifest-selected artifacts, QEMU and the host CPU.
+
+3. **Low, Optional - For a placed thread, the WAKE record names the waker's core, not the core the thread was queued on.**
+   - `perf::wake` stamps `core: core_id()`, the current CPU (`/data/yellow/libersystem/src/kernel/perf.rs:179`).
+   - Since placements were added, `enqueue_on` queues a placed thread on its placement instead (`/data/yellow/libersystem/src/kernel/sched/mod.rs:172-175`), for example `rt::pool` workers started with `SYS_THREAD_START_ON` (`src/user/runtime/rt/src/pool.rs:169`).
+   - The milestone specifies "the core it was queued on" (`P02M0189.md:217-218`).
+   - No published figure depends on it: the collector does not read the field, and the accounted runs are pinned to one unplaced drawing thread. It would mislead the first analysis of the pooled case.
+
+## Verification performed
+
+- **Static review only.** Nothing was built, run or tested for this review.
+- **The instrument and collector.** Read:
+  - `src/perfbuf/src/lib.rs`;
+  - `src/kernel/perf.rs`, and the scheduler hook sites (`sched/mod.rs` `enqueue` and the four `switch` calls);
+  - `rt`'s `perf_site`, `perf_sites_live` and `perf_clock`;
+  - the frame loop's park sites, and DisplayService's `copy_and_flush` sites;
+  - `src/harness/frame_account.py`: `account`, `frame_terms`, `park_breakdown`, `driver_breakdown`, `summarise`, `compare_with_demo`;
+  - the fixture list in `check-frame-account-collector.py`;
+  - `perf-trace.py --frame-account`.
+- **The gate.** Read `check-qemu-2d-account.sh` whole, and checked the `GPU_SIZE` knob (`qemu-run.sh:2589-2606`).
+- **Registration.** `check.sh:287`; `catalog.rs:534/:1024/:1097/:1250-1254`; `release-required.toml:176`.
+- **The account in `docs/PERF.md`.** The final-tree section (`:59-534`) and the classification table (`:519-534`).
+- **Independent cross-check.** A separate read-only pass covered the remaining items, and I re-checked each of its candidate findings against the code:
+  - "residue tautological": accepted as recorded design;
+  - "does not share `perf-trace.py`'s parser": structural only, not reported;
+  - findings 1-3 above: confirmed at the cited lines.

@@ -749,3 +749,54 @@ A completion the client still needs is therefore never lost, and the bound holds
 buffer.
 
 The camera gate passed after the change. The milestone is COMPLETE.
+
+AUDITOR'S REVIEW ON P02M0184 (2026-10-15T04:36:31Z):
+
+**Rating: 8/10.** The contract, grants, normalizer, selection and lease state machine, stop deadline and quarantine, and the timing and loss accounting all match the plan, and the earlier fixes - the per-buffer completion bound, the discard of never-started streams and the UVC colour code points - are in place and correct. One race in the negotiation path can leave a camera permanently busy: a negotiation that the provider answers after its grant was retired creates a stream that belongs to nobody, and nothing ever retires that stream.
+
+## Findings
+
+1. **Medium, Defect: a negotiation answered after its grant retired leaves an ownerless stream, and the camera answers `again` to everyone from then on.**
+   - **The window:** `negotiate` sends `Pending::Negotiate { grant, ... }` and creates no stream until the provider answers (/data/yellow/libersystem/src/user/services/core/src/camera_service.rs:829-851).
+   - **The grant can be retired meanwhile**, through:
+     - owner death (lines 1044-1046);
+     - a closed connection (1060-1063);
+     - `revoke` (688-695);
+     - a failed prepared launch, which is owner death.
+   - **Retirement finds nothing to end:** `retire` calls `end_stream` (329-340), which returns at once because the camera has no `run` yet (343-344).
+   - **The stream is created anyway:** when the provider's answer arrives, `provider_answer` checks only `run.is_some()` and creates `Run { grant, .. }` in phase `Ready` for the retired grant (495-511). Its reply goes nowhere.
+   - **Nothing ever removes that run:**
+     - `end_stream` acts only for the matching grant, which no longer exists;
+     - `tick` handles only `Stopping`;
+     - `negotiate` refuses any stream that is not retired or quarantined with `Err(Error::Again)` (830-837).
+   - **Effect:** the camera is busy for every grant until it is withdrawn or the service restarts, while inventory reports it neither streaming nor unavailable (`info`, 206-211). The provider also keeps a negotiated stream that nobody will start or stop.
+   - **How likely:** the window is the provider's negotiation time, which a real UVC probe/commit makes non-trivial. A client killed or exiting right after `negotiate` is enough.
+   - **Against the plan:** "close, admin revocation, endpoint loss, client death ... terminate capture and invalidate all operations on that stream".
+   - **Fix:** in the `Negotiate` arm, when `grant_at(grant)` is `None`, do not create the run; `discard(camera, generation)` instead.
+
+## Verification performed
+
+Static review only; nothing was built, run or tested.
+
+Read in full:
+- `camera.lsidl` and `camera-device.lsidl`;
+- `camera_service.rs`;
+- `service_logic::camera_streams`;
+- `drivers::uvc`: the normalizer, `select`, and the transport helpers added later.
+
+Read in part:
+- PermissionManager's capture arm of `grant_for_task` and `camera_policy`;
+- the broker's `cap_grants`: the camera roots go to `permission_manager` only;
+- the manifest row, the gate registration, and the changes to `camera_service.rs` since the last re-audit.
+
+Confirmed correct:
+- **Inventory:** it has no capture operation; anything else it is sent closes the connection.
+- **Grants:** minted with a `RIGHT_WAIT | RIGHT_TRANSFER` owner, and an alias resolves to exactly one publication.
+- **Negotiation:** exactly what was asked, through `expect` and `verify`, stride and plane offset included. One stream per camera; renegotiating needs the previous stream retired.
+- **Buffers:** checked through `object_info` (type, size, kernel identity) against the per-buffer, per-stream and global bounds; one backing once per stream; rights narrowed to map, read, write and transfer.
+- **Leases:** a buffer moves client, then producer, then leased, only on the stream's own checks; stale and double returns are refused.
+- **Completions:** at most one waits per buffer of the running stream, and the status is coalesced outside them.
+- **Stop:** it waits for the producer, and the 2 s deadline quarantines the camera until a late confirmation or the provider's loss. A stream that never started is discarded at the producer.
+- **Timing:** the host arrival time is the producer's, and one from the future is refused. Device time is passed on only when valid, with its generation advanced on reset, domain change and gaps.
+- **Loss:** the observation sequence counts drops, and an unexplained jump is one unknown discontinuity.
+- **UVC normalizer:** it holds descriptor lengths, the 8/32/32 counts, the 64 kB graph budget, the YUY2 layout and UVC's own matrix code points.
