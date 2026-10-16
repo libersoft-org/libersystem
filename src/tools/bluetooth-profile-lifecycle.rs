@@ -365,7 +365,7 @@ mod fixture {
 		fn pan_found(&mut self, _: usize, _: u16, _: &[sdp::Record]) {}
 		fn pan_opened(&mut self, _: usize, _: u16, _: u16) {}
 		fn pan_closed(&mut self, _: usize, _: u16, _: u16) {}
-		fn opp_l2cap_opened(&mut self, _: usize, _: u16, _: u16) {}
+		fn opp_l2cap_opened(&mut self, _: usize, _: u16, _: u16, _: usize) {}
 		fn opp_l2cap_closed(&mut self, _: usize, _: u16, _: u16) {}
 		// Untested AVDTP negotiation is a boundary; retirement/offer methods are exact.
 		fn a2dp_channel_opened(&mut self, _: usize, _: u16, _: u16, _: u16) {}

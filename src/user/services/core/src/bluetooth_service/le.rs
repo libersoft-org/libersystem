@@ -71,8 +71,12 @@ impl LeState {
 		}
 	}
 
+	// THE ADDRESS TYPE A COMMAND QUEUED NOW RUNS UNDER: commands go out in order, so one queued behind the address this
+	// host has asked for runs once the controller has taken it - random from then on, the first time as every other.
+	// Taken from `own` alone, a controller's first connection attempt - queued right behind its first address - went
+	// out from the public address.
 	pub fn own_type(&self) -> u8 {
-		if self.own.is_some() { OWN_RANDOM } else { OWN_PUBLIC }
+		if self.own.is_some() || self.pending_own.is_some() { OWN_RANDOM } else { OWN_PUBLIC }
 	}
 
 	pub fn resolve(&self, address: &[u8; 6]) -> Option<Peer> {
@@ -380,15 +384,29 @@ impl Stack {
 					self.raise(at, peer, question);
 				}
 				Step::Bonded(bonded) => {
+					self.le_pairing_over(at, handle);
 					self.le_bonded(at, handle, bonded);
 				}
 				Step::Failed(_) => {
+					self.le_pairing_over(at, handle);
+					let controller = &mut self.controllers[at];
 					if let Some(attempt) = controller.attempt.as_mut() {
 						attempt.state = PairingState::Failed;
 					}
 					controller.disconnect(handle, REASON_AUTHENTICATION);
 				}
 			}
+		}
+	}
+
+	// THE PAIRING IS OVER, whichever way: a prompt still showing for it - a passkey this host showed, kept on the watcher
+	// after its yes for the keypresses - goes with it, as a BR/EDR pairing's goes at Simple Pairing Complete. Left behind,
+	// it was the prompt still pending when the next pairing asked, and that pairing's question was answered no.
+	pub(crate) fn le_pairing_over(&mut self, at: usize, handle: u16) {
+		let Some(peer) = self.controllers[at].link(handle).map(|link| link.peer) else { return };
+		let state = &mut self.controllers[at].bredr_state;
+		if state.prompt.as_ref().is_some_and(|pending| pending.peer == peer) {
+			state.prompt = None;
 		}
 	}
 

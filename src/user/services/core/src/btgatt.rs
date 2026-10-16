@@ -90,8 +90,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(Ok(found)) => found.into_iter().find(|characteristic| characteristic.uuid == if indicate { 0xfff2 } else { 0xfff1 }).unwrap_or_else(|| fail("the custom characteristic was not found")),
 		other => fail(&format!("the custom service's characteristics could not be listed: {other:?}")),
 	};
+	// THE VALUE THE FIXTURE STARTS WITH, or the one an earlier run of this probe wrote in the same boot - `btgatt again`
+	// follows a plain run on the same peer.
 	match client().read(&value.handle) {
-		Some(Ok(read)) if read == b"fixture" => {}
+		Some(Ok(read)) if read == b"fixture" || read == b"hello" => {}
 		other => fail(&format!("the custom value read {other:?}")),
 	}
 	// OUTSIDE THE GRANT: the peer's name, in GAP, is refused here.

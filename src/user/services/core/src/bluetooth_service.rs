@@ -1390,6 +1390,11 @@ impl Stack {
 		if link.is_classic() {
 			self.classic_gone(at, link);
 		} else {
+			// A PROMPT FOR A PAIRING THE LINK TOOK WITH IT goes too, as a BR/EDR link's does.
+			let state = &mut self.controllers[at].bredr_state;
+			if state.prompt.as_ref().is_some_and(|pending| pending.peer == link.peer) {
+				state.prompt = None;
+			}
 			// A BONDED PERIPHERAL GONE IS WAITED FOR AGAIN, through the accept list - a NEW list with it on, where an
 			// attempt is already out for the others: that one is cancelled and taken up again once its cancellation lands.
 			self.relist(at);

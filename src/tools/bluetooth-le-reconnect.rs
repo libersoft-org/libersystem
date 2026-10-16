@@ -225,7 +225,14 @@ impl Stack {
 		self.records.borrow().iter().find(|(held, _)| held == peer).map(|(_, record)| record.clone())
 	}
 	fn reconnect_bonded(&mut self, at: usize) {
+		// PRODUCTION'S GUARD, kept by the stand-in: nothing while the operator's own LE attempt is still connecting.
+		if self.controllers[at].attempt.as_ref().is_some_and(|attempt| attempt.peer[0] != KIND_BREDR && attempt.state == PairingState::Connecting) {
+			return;
+		}
 		self.controllers[at].actions.push(Action::Relist);
+	}
+	fn rotate_address(&mut self, _: usize) {
+		panic!("unexpected private address rotation")
 	}
 	fn own_irk(&mut self, _: usize) -> Option<[u8; 16]> {
 		Some(IRK)
@@ -307,16 +314,21 @@ fn connect(stack: &mut Stack, status: u8, kind: u8, address: [u8; 6]) {
 	let hci_codec::Event::Connected { status, handle, peer_kind, peer } = hci_codec::event(&event).unwrap() else { panic!("not a connection event") };
 	stack.on_connected(0, status, handle, peer_kind, peer);
 }
-fn reused(stack: &Stack, identity: Peer, legacy: bool) {
+// A CONNECTION THROUGH THE ACCEPT LIST takes the standing attempt up again at once, for the bonded peers still absent,
+// before anything is decided about the device it connected.
+fn rearmed(through_list: bool, then: Action) -> Vec<Action> {
+	if through_list { vec![Action::Relist, then] } else { vec![then] }
+}
+fn reused(stack: &Stack, identity: Peer, legacy: bool, through_list: bool) {
 	assert_eq!(*stack.reads.borrow(), [identity], "only stored identity may select its bond");
 	assert_eq!(stack.controllers[0].links.len(), 1);
 	assert_eq!(stack.controllers[0].links[0].peer, identity);
 	assert!(stack.controllers[0].links[0].reconnecting);
 	let action = if legacy { Action::Legacy(7, [0x42; 16], [0x19; 8], 0x1234) } else { Action::Secure(7, [0x42; 16]) };
-	assert_eq!(stack.controllers[0].actions, [action], "reconnect must request encryption with the stored key");
+	assert_eq!(stack.controllers[0].actions, rearmed(through_list, action), "reconnect must request encryption with the stored key");
 }
-fn refused(stack: &Stack, reason: u8) {
-	assert_eq!(stack.controllers[0].actions, [Action::Disconnect(7, reason)]);
+fn refused(stack: &Stack, through_list: bool, reason: u8) {
+	assert_eq!(stack.controllers[0].actions, rearmed(through_list, Action::Disconnect(7, reason)));
 }
 
 fn connection_cases() {
@@ -324,45 +336,45 @@ fn connection_cases() {
 	for legacy in [true, false] {
 		let mut s = stack(IDENTITY, legacy);
 		connect(&mut s, 0, 1, rpa);
-		reused(&s, IDENTITY, legacy);
+		reused(&s, IDENTITY, legacy, true);
 	}
 	// Static random and already-resolved random identities preserve their kind.
 	for kind in [1, 3] {
 		let mut s = stack(IDENTITY, true);
 		connect(&mut s, 0, kind, address(IDENTITY));
-		reused(&s, IDENTITY, true);
+		reused(&s, IDENTITY, true, true);
 	}
 	// Public and controller-resolved public identities remain public.
 	let public = [0, 0xda, 0x4c, 0x10, 0xde, 0, 0x0b];
 	for kind in [0, 2] {
 		let mut s = stack(public, false);
 		connect(&mut s, 0, kind, address(public));
-		reused(&s, public, false);
+		reused(&s, public, false, true);
 	}
 	// Public-address bytes that happen to look like a valid RPA are not resolved.
 	let mut s = stack(IDENTITY, true);
 	connect(&mut s, 0, 0, rpa);
-	refused(&s, REASON_AUTHENTICATION);
+	refused(&s, true, REASON_AUTHENTICATION);
 	assert_eq!(*s.reads.borrow(), [as_peer(0, rpa)]);
 	let unknown = bt_keys::private_address(&[0x87; 16], 0x12_3456);
 	let mut s = stack(IDENTITY, true);
 	connect(&mut s, 0, 1, unknown);
-	refused(&s, REASON_AUTHENTICATION);
+	refused(&s, true, REASON_AUTHENTICATION);
 	assert_eq!(*s.reads.borrow(), [as_peer(1, unknown)]);
 	// A stale resolving entry cannot resurrect a forgotten bond or an invalid key.
 	let mut s = stack(IDENTITY, true);
 	s.records.borrow_mut().clear();
 	connect(&mut s, 0, 1, rpa);
-	refused(&s, REASON_AUTHENTICATION);
+	refused(&s, true, REASON_AUTHENTICATION);
 	let mut s = stack(IDENTITY, true);
 	s.records.borrow_mut()[0].1.key.pop();
 	connect(&mut s, 0, 1, rpa);
-	refused(&s, REASON_AUTHENTICATION);
+	refused(&s, true, REASON_AUTHENTICATION);
 	// Resolve before duplicate admission, so the same identity cannot take a second slot.
 	let mut s = stack(IDENTITY, true);
 	s.controllers[0].links.push(Link::new(6, IDENTITY));
 	connect(&mut s, 0, 1, rpa);
-	refused(&s, REASON_USER);
+	refused(&s, false, REASON_USER);
 	assert_eq!(s.controllers[0].links.len(), 1);
 	assert!(s.reads.borrow().is_empty());
 	// Failed completion retains cancellation/relist semantics without bond-store lookup.
@@ -376,7 +388,7 @@ fn connection_cases() {
 	let mut s = stack(IDENTITY, true);
 	s.controllers[0].le.accepting = false;
 	connect(&mut s, 0, 1, rpa);
-	refused(&s, REASON_USER);
+	refused(&s, false, REASON_USER);
 	assert!(s.reads.borrow().is_empty());
 	// First pairing to an unknown RPA keeps its explicit operator attempt.
 	let mut s = stack(IDENTITY, true);
@@ -390,7 +402,7 @@ fn connection_cases() {
 	s.controllers[0].le.accepting = false;
 	s.controllers[0].reconnect = Some(IDENTITY);
 	connect(&mut s, 0, 1, rpa);
-	reused(&s, IDENTITY, true);
+	reused(&s, IDENTITY, true, false);
 	// Re-pairing an existing resolved identity keeps identity bookkeeping, while
 	// the exact pairing-start method passes raw RPA/type to SMP c1/f5/f6.
 	let mut s = stack(IDENTITY, true);
@@ -401,7 +413,7 @@ fn connection_cases() {
 	assert_eq!(s.controllers[0].links[0].peer, IDENTITY);
 	assert_eq!(s.controllers[0].actions, [Action::Pair(7, as_peer(1, rpa))], "SMP must receive the raw connection address");
 	let pairing = s.controllers[0].links[0].pairing.as_ref().unwrap();
-	assert!(pairing.legacy && !pairing.public_key_present, "legacy policy is keyed by canonical identity");
+	assert!(pairing.legacy && pairing.public_key_present, "legacy policy is keyed by canonical identity, and Secure Connections is still offered beside it");
 	assert_eq!(s.controllers[0].attempt.as_ref().unwrap().state, PairingState::Pairing);
 	assert!(s.reads.borrow().is_empty());
 	println!("16 actual-handler connection identity/security/compatibility cases passed");
@@ -468,7 +480,7 @@ fn pair_completion_cases() {
 		assert_eq!(s.controllers[0].links[0].peer, IDENTITY);
 		let pairing = s.controllers[0].links[0].pairing.as_ref().unwrap();
 		assert_eq!(pairing.legacy, legacy);
-		assert_eq!(pairing.public_key_present, !legacy);
+		assert!(pairing.public_key_present, "Secure Connections is offered whether or not the operator asked for legacy");
 		assert_eq!(s.controllers[0].attempt.as_ref().unwrap().state, PairingState::Pairing);
 	}
 	let mut s = stack(IDENTITY, false);
@@ -493,7 +505,9 @@ fn pair_completion_cases() {
 		connect(&mut s, 2, 1, rpa);
 		assert_eq!(s.controllers[0].attempt.as_ref().unwrap().state, PairingState::Failed, "failed raw-RPA completion must end the canonical attempt");
 		assert!(s.controllers[0].links.is_empty() && s.reads.borrow().is_empty());
-		assert_eq!(s.controllers[0].actions, if relist { vec![Action::Relist] } else { Vec::new() });
+		// THE STANDING ATTEMPT IS TAKEN UP AGAIN EITHER WAY: a cancellation for a new list, or the operator's attempt it was
+		// set aside for ending without a link.
+		assert_eq!(s.controllers[0].actions, vec![Action::Relist]);
 	}
 	let unknown = as_peer(1, bt_keys::private_address(&[0x87; 16], 0x12_3456));
 	let public = [0, 0xda, 0x4c, 0x10, 0xde, 0, 0x0b];
@@ -507,7 +521,8 @@ fn pair_completion_cases() {
 		s.controllers[0].actions.clear();
 		connect(&mut s, 2, kind, address(choice));
 		assert_eq!(s.controllers[0].attempt.as_ref().unwrap().state, PairingState::Failed);
-		assert!(s.controllers[0].actions.is_empty() && s.controllers[0].links.is_empty());
+		// The operator's attempt ended without a link: the standing attempt it was set aside for is taken up again.
+		assert!(s.controllers[0].actions == [Action::Relist] && s.controllers[0].links.is_empty());
 	}
 	let mut s = stack(IDENTITY, true);
 	s.controllers[0].le.accepting = false;
