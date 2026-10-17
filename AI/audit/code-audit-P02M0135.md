@@ -866,3 +866,74 @@ Static, read-only review; no build, test, cargo, QEMU or gate was run.
 - Discovery and selection: read service-logic selection.rs, icdprobe.c, icdcheck.rs, vkprobe.rs, check-icd-selection.sh, check-foreign-loader-guest.sh, and the dynamic kernel-suite tests for the slot (14 field mutations, malformed slot, renamed candidate), the TLS runtime refusal and the foreign-consumer launch.
 - Lifecycle: read `liber_rt_start` / `run_lifecycle` / `exit_with` in rt, exe-start.rs, the kernel's `lifecycle_of` / `record_lifecycle` / `sys_process_lifecycle`, lifecycle.c and check-lifecycle.sh.
 - Identity and licence: read the build-shared.sh identity writer, check-foreign-identity.sh, check-foreign-audit-artifact.sh, check-foreign-cxx-abi.sh, check-dependency-policy.sh, the system-manifest licence validation, the development and staged-image gates' quarantine handling, and gate registration in check.sh and verify-model/src/catalog.rs.
+
+IMPLEMENTER'S RESPONSE ON P02M0135 (2026-10-17T01:44:22Z):
+
+All five findings were verified and accepted.
+
+**Finding 1 - the admitted ICD interface-version set is enforced only by the synthetic ICD (Medium): ACCEPTED.**
+- `src/user/libs/foreign/discovery/src/library.rs`:
+  - `resolve` no longer hands the loader the driver's own negotiation entry. It hands out the substrate's `bounded_negotiate::<SLOT>`, one per record slot.
+  - That entry offers the driver at most 6. It refuses an answer of 0 or 1, of 7 or above, above what was offered, or an error, with `VK_ERROR_INCOMPATIBLE_DRIVER`, and leaves the loader's value untouched.
+  - It reports the exchange as a diagnostic line.
+- Because the answer is never null, the loader never falls back to asking the driver's own lookup, and nothing above 6 is ever agreed. The physical-device function stays unreachable.
+- `version.rs` gains the exchange.
+- `liber_foreign_install_icd` takes optional function pointers and refuses NULL.
+- `src/foreign/INVENTORY-pass2.json` records the negotiated interface (`_icd_interface`), and `check-foreign-audit-link.sh` holds it to `version.rs`.
+- `check-icd-selection.sh` no longer has the roles inverted.
+- `check-foreign-loader-guest.sh` expects the loader's line: `icd interface: loader asked 7, substrate offered 6, driver answered 6 - agreed 6`.
+- Nine new host tests in `discovery/src/tests.rs` (20 in all) cover 0, 1 and 7 refused, the physical-device function unreachable, and a NULL install refused. Watched failing: six of them fail on the old `resolve`.
+- Not done, and recorded in the milestone: the loader's `VK_LUNARG_direct_driver_loading` path does not go through the substrate. Closing it needs a port patch and a guest run.
+
+**Finding 2 - the lockfile is checked but not what the builds read; the compiled trees are not derived from the pinned inputs (Medium): ACCEPTED.**
+
+`src/tools/build-foreign-static.sh`, on every run:
+- checks both archives and every patch against their pinned digests;
+- derives `src-headers`, `src-loader` (0001) and `src-loader-port` (the derived series, in order, no fuzz) under a lock, and replaces a tree that differs;
+- refuses a compiler or archiver whose version line is not the pinned one;
+- takes the sources from upstream's own `NORMAL_LOADER_SRCS`;
+- before compiling, holds its options, defines, flags, `[build]` section, generated-source digest and cross ABI to the bootstrap part;
+- writes its configuration file.
+
+New modes: `--check-lockfile` and `--build-type debug|release`. `check-foreign-pin.sh` compares the tool lines and licences and runs `--check-lockfile`; ten mutations to the lockfile are each refused by name.
+
+The pins now record what was actually built and measured:
+- `PIN-bootstrap.toml`:
+  - three options that do not exist in the pinned revision are recorded `absent`;
+  - `[build]` pins the measured configuration (-O2, assertions live);
+  - `[toolchain]` names `rust-lld` and the full clang line.
+- Debug and Release are both measured against it: Debug gives 52 symbols on all three targets, Release 51 (without `__liber_assert_failed`).
+- `PIN-static-target.toml` and `PIN-derived.toml` are refrozen.
+
+Making Release authoritative would mean removing `__liber_assert_failed` from the substrate's exact surface, which is outside this fix. The pin was corrected to the configuration that is built and measured instead, as the finding allows.
+
+**Finding 3 - any licence identifier is accepted on a foreign artifact (Low): ACCEPTED.**
+- The reviewed set is one file, `src/tools/system-manifest/src/reviewed-licences.txt`. `check-dependency-policy.sh` reads it.
+- `system-manifest` compiles it in (`include_str!`) and refuses any declared licence outside it, except `project`, on library and program rows.
+- Two new `system-manifest` tests, watched failing: `GPL-3.0-only` and `BSD-4-Clause` are refused, `Apache-2.0` and `project` are accepted.
+
+**Finding 4 - the identity records carry placeholder digests (Low): ACCEPTED.**
+- `src/tools/foreign-audit-link.py` computes real cflags, linker, sysroot, configure, objects and source digests for the audit-linked ELF and for both quarantine consumers.
+- It gains `--verify-records`, which `check-foreign-audit-artifact.sh` runs on the nine records. It also checks the sysroot against the pin.
+- Watched failing: the old records are refused.
+
+**Finding 5 - two watched-fail self-tests prove less than they claim (Low, Optional): ACCEPTED.**
+- The stop-condition self-test injects into all three scopes, including a linked ELF carrying `PT_TLS`, with a clean control.
+- `check-foreign-cxx-abi.sh` has one fixture per forbidden mechanism (five), with a clean control.
+- Each mutation was watched being caught.
+
+The milestone records all five in dated notes. The verification is below.
+
+**Verification:**
+- `host-tests` passed, the discovery library's 20 tests among them. `icd-selection` and `foreign-facilities-guest` passed.
+- `foreign-loader-guest` passed, but only after one correction to the gate itself.
+  - Its first run failed on the line finding 1 added. `guest-gate.sh` filters a probe's lines through `prefix: [a-zA-Z0-9 =_.,-]*`, which stops at a colon, so "vkprobe: foreign: icd interface: ..." could never be found whole.
+  - `check-foreign-loader-guest.sh` now reads that line, and the refusal check, from the guest's whole log.
+  - On the rerun the guest said "foreign: icd interface: loader asked 7, substrate offered 6, driver answered 6 - agreed 6", with 3 negotiations and 3 lookups.
+- `kernel.dynamic.dynamic_foreign_consumer_launches_and_exercises_every_admitted_facility` ran on the ports in the development configuration, where `abiprobe` is staged:
+  - riscv64 passed: 46 checks, 0 failures, 8 s.
+  - aarch64's first run printed nothing past the test's name for 2400 s, and the harness stopped it.
+  - Between that run and the next, `foreign-audit-link.py --check` relinked the audit-linked pass-2 artifacts on all three targets. The rerun on a fresh development build passed: 46 checks, 0 failures, 7 s.
+  - So the first build most likely staged an `abiprobe` older than the substrate. That is not proven, and the hang did not recur.
+  - In the shipping configuration the test says that `abiprobe` is not staged. It is development-only.
+- The shipping builds for aarch64 and riscv64 passed, and so did their development builds.

@@ -268,3 +268,23 @@ Two defects remain. Both are in how TpmService answers, not in what it enforces:
   - `TPMADMIN` in ServiceManager's three rows.
 - **Both findings were confirmed in the code.** Finding 1 through the `owner_usable` → `admit` → `submit` order, and the hibernation consumer's wait loop. Finding 2 through the generated decode and the `serve()` drop path.
 - **Not counted against this milestone.** "Nothing else holds any of them" no longer holds: P02M0197 later gave `hibernation_service` a ServiceManager-minted `TPMSEAL` role (manifest `[[services]] hibernation_service`). That is P02M0197's extension, not a defect here.
+
+IMPLEMENTER'S RESPONSE ON P02M0190 (2026-10-17T01:44:22Z):
+
+Both findings were verified and accepted.
+
+**Finding 1 - with no TPM provider, `seal`/`unseal`/`quote` answer `owner-hierarchy-unavailable` instead of `unavailable` (Medium): ACCEPTED.**
+- `src/user/services/logic/src/tpm.rs`: the owner hierarchy's state is now `Owner::{Unknown, Usable, Unusable}`, and `admit(.., owner)` refuses on that ground only for `Unusable`.
+- `src/user/services/core/src/tpm_service.rs`: `owner()` answers `Unknown` when no provider is served; the sealing `info` maps to `Usable`.
+- New host test `tpm/tests.rs::with_no_tpm_served_a_call_that_needs_the_owner_is_unavailable_and_not_told_to_clear_the_tpm`, watched failing; the existing tests now use `Owner::`.
+- `src/harness/scenarios/tpm-tool.toml` seals while the driver is down and expects `tpm: seal refused: unavailable`.
+
+**Finding 2 - an over-bound secret, nonce, sealed object or digest closes the grant instead of answering `bounds` (Low): ACCEPTED, the client half.**
+- `src/user/libs/clients/tpm-client/src/lib.rs` checks `DIGEST_LEN`, `MAX_SECRET`, `MAX_SEALED` and `MAX_NONCE` before sending, and answers `Outcome::Bounds`.
+- `tpm-tool.toml` seals a 97-byte secret and expects `tpm: seal refused: bounds`.
+- An over-bound request sent raw on the wire still closes the connection, as any request the generated dispatch cannot decode does. That is the transport's rule for every interface, and changing it for one would be a protocol change outside this milestone.
+- Both scenario steps run in the `qemu-tpm-tool` gate.
+
+The milestone records both under "Corrections of 2026-10-15".
+
+**Verification:** `qemu-tpm-tool` passed on x86_64, both steps among its runs, and so did `host-tests`, with the TPM logic and client tests.

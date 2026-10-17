@@ -649,3 +649,62 @@ AUDITOR'S REVIEW ON P02M0196 (2026-10-15T04:41:31Z):
 - Libraries: `src/platform` (`lib.rs`, `policy.rs`, unit tests), `src/acpi/src/gpe.rs`, `src/fdt/src/devices.rs`, `src/aml` (limits, `Load`/`LoadTable`/`Unload`, EC transport), `src/tpm/src/table.rs`, `src/smbios`, and `acpi_model` (`node`, `admission`, `sleep` with its tests, `power`, `handshake`).
 - Services: `acpi_service.rs` (host, walk/account/device, notifications and re-walk, GPE dispatch, EC start, sleep-type registration, `platform-sleep`, device power states); `device_manager.rs` (platform resource minting, `acpi_pass`, node requests); the `acpi_service` manifest entry; ServiceManager's `supervisor_role`.
 - Read earlier gate output without re-running it: /data/yellow/libersystem/.build/logs/acpi/serial-fixture.log and rows-before.log (the namespace accounted for across the service restart, the FWCF/GPE0/PRES refusals, the HPET region refusal) and /data/yellow/libersystem/.build/logs/end-of-job/tree-rows-aarch64/serial.log.
+
+IMPLEMENTER'S RESPONSE ON P02M0196 (2026-10-17T01:44:22Z):
+
+**Finding 1 - SPCR/DBG2 descriptions of the console UART are refused instead of merged (Low): ACCEPTED.**
+- `src/kernel/device.rs::publish_locked`: the claimable-port check now runs only when placement answers `New`, as `publish_namespace` already does.
+- `src/kernel/test_suites/platform_rows.rs`:
+  - publishes `table:SPCR#test` at 0x3F8/8 and requires it merged into `kernel:com1`, still kernel-held, with its identity joined and a claim refused;
+  - still refuses a claimable row over 0xCF8.
+- The old assertion, that a claimable row over the console ports is refused, contradicted the requirement and was replaced.
+- The refused row sits on the test build's exit port (0xF4), which the reserved set holds and no row describes. Every other fixed reserved range now has a kernel row, and a description starting at one is that row's device, merged before the port check is reached.
+- Watched failing in the guest, both ways:
+  - with the port check removed, the refusal assertion fails;
+  - with the check back before placement (the old order), the SPCR merge assertion fails.
+
+**Finding 2 - claims ignore the one-memory-type rule (Low): ACCEPTED.**
+- `src/platform/src/policy.rs` adds `claim_write_back(regions, base, len)`, sharing `range_kinds` with `kinds`. Admission one now answers `WriteBack` for a range in NVS, ACPI-reclaimable or firmware-reserved memory.
+- `src/kernel/object/device_memory.rs`: `DeviceMemory::for_claim` takes its caching from `firmware::claim_write_back`, which reads the memory map and allocates nothing.
+- New host test `platform/src/firmware_tests.rs::a_claim_maps_its_range_with_the_one_type_the_map_gives_it_and_its_node_s_region_with_the_same`, watched failing.
+
+**Finding 3 - `wake` does not undo the device wake `prepare` enabled (Low): ACCEPTED.**
+- `src/user/libs/acpi/model/src/sleep.rs`:
+  - adds `Platform::disable_device_wake`;
+  - `Sleeper` remembers the nodes it enabled, and `release()` disables them before letting their power resources go, on a wake and on the next prepare.
+- `src/user/services/core/src/acpi_service.rs` evaluates `_DSW(0, 0, 0)` or `_PSW(0)`.
+- The sleep tests were updated; four of them fail on the old sequence.
+
+**Finding 4 - the ECDT's embedded controller never becomes the firmware-held row (Low): ACCEPTED.**
+- `src/kernel/firmware/mod.rs`:
+  - the kernel's firmware state remembers the system I/O ports the instance's own address-minted grants hold (`note_instance_ports`, fed from `sys_port_range_firmware` in `src/kernel/syscall/mod.rs`, cleared at attach);
+  - in `admit()`, a `FIRMWARE_HELD` row whose ports lie inside those passes the `_CRS` port check.
+- There is no oracle in phase 2: QEMU has no EC. The kernel builds, and the milestone says so.
+
+**Finding 5 - two q35 namespace nodes refused rather than merged (Low, Optional): ACCEPTED for fw-cfg; REJECTED for the HPET.**
+- `src/kernel/arch/x86_64/platform.rs` declares `kernel:fw-cfg` as the one (0x510, 12) range QEMU's `FWCF` `_CRS` names, so `FWCF` merges.
+- The HPET part is rejected because it needs a policy decision this milestone has not taken, as the finding itself notes: whether a merged kernel-held row's own `_STA` may read its registers through SystemMemory the policy now refuses as kernel-held. The milestone records it as open.
+
+**Finding 6 - the FADT low-power-S0-idle flag is never read (Low, Optional): ACCEPTED as the recorded omission the finding offers.**
+- `docs/todo/P02M0196.md` now states under P02M0196c that the service evaluates `\_S3_`, `\_S4_` and `\_S5_` only, and does not read the flag.
+- Nothing in the tree would consume either: suspend-to-idle is not a state this system enters.
+
+The verification is below.
+
+**Found while running the gates, and fixed:**
+- One `acpi` run failed in round 2, after the service's restart: GSBW and GSBR failed with `Again`, preceded by "driver.virtio-i2c: a connection for address 0x50 was refused - another connection holds it".
+- The cause is in `src/user/services/core/src/device_manager.rs::grant_acpi_connections`.
+  - Between the restarted instance's "namespace loaded" report and the hand-off of its admin connection, DeviceManager still called the ended instance's connection.
+  - The send was refused, and the kernel gives a transferred handle back on an undelivered send, so the minted I2C connection stayed with DeviceManager, still holding address 0x50 at the controller.
+  - The grant made again on the hand-off was then refused as a second holder.
+- The connection is now closed when `last_error()` is `SendRefused`.
+- The window is the hand-off's timing, which no fixture holds open, so it has no deterministic oracle. Neither later run reached it, the one before the fix nor the one after it.
+
+**Verification (x86_64):**
+- `acpi` passed twice (325 s, and 344 s with the fix).
+- `sleep` passed.
+- `kernel.platform_rows...` passed in the full suite.
+  - Finding 1's new test had first expected a claimable row at 0xCF8 to be refused. `kernel:pci-host` already stands there, so the placement merges before the port check runs.
+  - It uses the test build's exit port 0xF4 instead, which is reserved and has no row.
+  - The fix was watched failing both ways: with the port check removed, the refusal assertion fails; with the old order, the SPCR merge fails.
+- `host-tests` passed, the platform policy and acpi model tests among them.

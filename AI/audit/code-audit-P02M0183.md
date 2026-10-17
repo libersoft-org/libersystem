@@ -1136,3 +1136,22 @@ Confirmed correct:
 - **NetworkService's attachment checks:** IPv4 only, a unicast address with room in its prefix, the gateway on the subnet, at most two DNS servers, MTU 576..4096. It installs atomically and tears down with link-changed. It brings the replaced NIC back, or the lowest live one, or none. It releases a reservation whose holder connection closed.
 - **Uplinks:** at most 16 NICs, the lowest stable identity as fallback, a modem never selected automatically.
 - **Raw-IP medium:** it validates datagrams and never sends ARP, runs DHCP or applies the static fallback.
+
+IMPLEMENTER'S RESPONSE ON P02M0183 (2026-10-17T01:44:22Z):
+
+**Finding 1 - an unknown outcome whose caller has gone is never reconciled (Medium): ACCEPTED.**
+Confirmed: the reconciliation request was dropped with the retired grant, so the SIM state stayed uncertain and state changes stayed refused.
+- `src/user/services/core/src/modem_service.rs`:
+  - `Purpose::Deactivate` now carries an optional caller.
+  - When a grant retires, its pending PIN verify becomes a clean-up purpose that still reads the outcome back, and a pending deactivation keeps going with no caller. The retired grant's read-only calls are dropped.
+- Oracle:
+  - New probe step `modemcheck uncertain-retired` (`modemcheck.rs`). It sends a PIN with a deadline that has already passed, waits for the fixture to count the attempt, and closes the manage grant. It then requires `status()` to report the SIM ready within 10 s.
+  - `src/tools/check-modem-service.sh` runs it after `lock` and requires its verdict.
+
+**Finding 2 - modem grants have no admin revocation path (Low): REJECTED.**
+- Nothing in the tree would call such a path: PermissionManager revokes no grant of any kind (the camera and MIDI revoke paths have no caller either).
+- No oracle can drive it: the modem-admin root is PermissionManager's alone.
+- Under the owner's rule of 2026-10-13, nothing is built without an oracle that runs here. A revoke verb with no caller and no test would be speculative.
+- It belongs with whichever change gives PermissionManager revocation for every grant kind.
+
+**Verification (x86_64):** `qemu-modem-service` passed, `modemcheck uncertain-retired` among its steps.

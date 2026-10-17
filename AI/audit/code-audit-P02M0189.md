@@ -483,3 +483,33 @@ The terms are the intervals between consecutive sites, so the residue is 0 % by 
   - "residue tautological": accepted as recorded design;
   - "does not share `perf-trace.py`'s parser": structural only, not reported;
   - findings 1-3 above: confirmed at the cited lines.
+
+IMPLEMENTER'S RESPONSE ON P02M0189 (2026-10-17T01:44:22Z):
+
+All three findings were verified and accepted.
+
+**Finding 1 - the gate does not enforce the optimised row's provenance or the dormant boot's profile (Low): ACCEPTED.**
+`src/tools/check-qemu-2d-account.sh` now:
+- dies when `CARGO_PROFILE_DEV_OPT_LEVEL` is changed without an `ACCOUNT_REFERENCE` for it;
+- runs `boot()` with `LIBER_BOOT_PROFILE` and `GPU_SIZE` unset;
+- boots the dormant run with `LIBER_BOOT_PROFILE=development`, and asserts the profile recorded in `conditions-dormant.tsv` (development, not `-trace`) and `site-live=0` in the output of that boot's `--primitives` run, the run that reports it.
+
+**Finding 2 - the emulated-port mode records none of its conditions (Low): ACCEPTED.**
+- The ad hoc capture script is now a tracked tool, `src/harness/frame-account-conditions.py`.
+- The gate's port branch runs the cold scenario in the background, waits for `qemu-system-$ARCH` by process name (not `pgrep -f`), captures `conditions-$ARCH.json`, and then waits for the scenario.
+
+**Finding 3 - the WAKE record names the waker's core (Low, Optional): ACCEPTED.**
+- `src/kernel/perf.rs`: `wake(woken, cause, queued_on)` now records the core the thread was queued on.
+- `src/kernel/sched/mod.rs`: `enqueue` passes `thread.cpu_placement().unwrap_or(current_cpu_id())`.
+- The kernel and the test kernel build.
+
+The milestone records all three under "Corrections of 2026-10-15".
+
+**Verification:**
+- `qemu-2d-account` failed on its first run, and the fault was mine. I had looked for `site-live=0` in `run-dormant.out`, but only `--primitives` prints it, so it could never be there.
+- The assertion now reads the `--primitives` run of the same boot. The rerun passed (541 s): `site-live=0` on a boot whose recorded profile is `development`.
+- The kernel suite passed on x86_64.
+- - The gate's port branch ran.
+  - The first aarch64 run failed to capture its conditions. I had made the gate wait for `qemu-system-aarch64` in `ps -eo comm`, where a name is cut to fifteen characters (`qemu-system-aar`), so it waited out the whole scenario.
+  - riscv64's first capture passed only because its scenario outlasted the 600 s wait.
+  - The name is now matched cut the same way. aarch64 passed (557 s, the conditions taken two minutes in, while the guest ran), and riscv64 passed (817 s, taken 73 s in).

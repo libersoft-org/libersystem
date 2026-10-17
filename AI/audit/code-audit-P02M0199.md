@@ -354,3 +354,31 @@ AUDITOR'S REVIEW ON P02M0199 (2026-10-15T04:39:14Z):
 - Kernel: `firmware::decoder_of`/`decoder_in` and the `framebuffer_map` fill (`decoder`, `decoder_present`); DeviceManager's `Disconnect` handling; the kernel suite's display_brightness.rs stall test.
 - Grepped the retained guest logs for "did not answer in time": present only in kernel-suite runs of the deliberate stall test, i.e. the gates did not hit the deadline - the finding is about what a slower reply does, not an observed gate failure.
 - Static, read-only review: no build, test, gate or QEMU run.
+
+IMPLEMENTER'S RESPONSE ON P02M0199 (2026-10-17T01:44:22Z):
+
+All three findings were verified and accepted.
+
+**Finding 1 - one reply later than 100 ms disables a backlight for good (Medium): ACCEPTED.**
+In `src/user/services/core/src/display_service/brightness.rs`:
+- `CALL_TICKS` is now 200 ticks (2 s).
+- A reply on a backlight's channel that matches no pending call - a late one - clears `failed`, and the backlight rejoins.
+- An admission step that times out (open, describe, display id, get, events), or an open that is refused, now goes to `admission_failed`. That schedules a retry through `service_logic::provider_retry::ProviderRetry`, starting at 1 s and backing off.
+- `poll()` re-issues the opens that are due, and the deadline includes them. A withdrawal drops the pending retry; an admission clears its attempts.
+- The kernel test `src/kernel/test_suites/display_brightness.rs` covers:
+  - a silent describe whose retried open is admitted;
+  - a slot withdrawn before its retry;
+  - a late answer to a set that clears the failure with the level unchanged and its handle closed;
+  - the metadata case waiting out the 2 s deadline.
+
+**Finding 2 - an `_ALR` change (Notify 0x82) never reaches the policy (Low): ACCEPTED.**
+- `src/user/drivers/core/src/acpi_als_driver.rs` ends the sensor's stream (`end_stream()`) on notification 0x82, as its own comment says the policy expects.
+- `src/user/services/core/src/brightness_policy.rs::take_reading`, on `Closed`, reopens the sensor (`reopen_sensor`: describe again, then events) instead of dropping it.
+
+**Finding 3 - with the idle timeout off, a manual change stops automatic brightness until it is toggled (Low, Optional): ACCEPTED.**
+- `brightness_policy.rs::watch_activity`, with the idle timeout off and automatic brightness on, watches activity at `DEFAULT_IDLE_SECONDS`. An idle edge there only lifts the pause and never dims.
+- `set_automatic` asks for the watch to be retargeted.
+
+The milestone records all three under "Corrections of 2026-10-15".
+
+**Verification (x86_64):** `brightness-acpi` passed. The adapted display-brightness kernel tests passed in both full suites.

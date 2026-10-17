@@ -707,3 +707,33 @@ The TCK finding was checked against ISO/IEC 7816-3 and re-stated in a scratch sc
 - **Recovery:** abort and reset are each capped at 5 s, then the slot is unavailable until the provider proves quiescence.
 - **Removal:** removal and reinsertion are separate events. A draining slot stays draining across reinsertion. Late replies are dropped by request identity, and the service also checks the echoed header.
 - **Grants:** each is retired by its owner observer whatever copies of its endpoint exist. Withdrawal closes every grant to the reader. An alias resolves to exactly one publication or the mint fails.
+
+IMPLEMENTER'S RESPONSE ON P02M0182 (2026-10-17T01:44:22Z):
+
+All three findings were verified and accepted.
+
+**Finding 1 - a zero-length INTEGER in a card's signature panics SmartcardService (Medium): ACCEPTED.**
+- `src/user/services/logic/src/piv.rs`: the DER ECDSA conversion now judges each INTEGER's length before reading its value.
+- `piv/tests.rs` adds two vectors:
+  - the auditor's `7C 06 82 04 30 02 02 00`;
+  - a signature with an empty `s`.
+- Both are now refused rather than panicking. Watched failing: the old code panicked at `piv.rs:189`.
+
+**Finding 2 - no TCK required when T=0 and T=15 are indicated (Medium): ACCEPTED.**
+- `src/user/libs/smartcard/model/src/atr.rs` now records whether global interface bytes (T=15) were declared. A TCK is required whenever any protocol other than T=0 is indicated, as ISO/IEC 7816-3 says, and T=15 counts.
+- New test `atr/tests.rs::a_t0_card_that_declares_global_bytes_ends_with_a_check_byte` covers the auditor's vector, the same answer truncated, and a wrong TCK. It was watched failing.
+
+**Finding 3 - a client can fall about 32 events behind, not 16 (Low): ACCEPTED.**
+- `src/user/services/core/src/smartcard_service.rs`:
+  - The service-side second queue is gone. `event()` sends straight into the client's stream, and a stream that cannot take an event (`Stalled`) overflows and is closed.
+  - The stream's depth is `max(snapshot frames, MAX_EVENTS)`, so the stated 16 is the only bound.
+  - `drain_streams` and the backlog deadline are removed.
+- `src/user/services/logic/src/card_slots.rs`: the `EventQueue` type and its test are removed. `MAX_EVENTS` is documented as the stream's depth.
+- `cardcheck.rs` asserts exactly `MAX_EVENTS` frames before the overflow.
+- The `smartcard-service` gate passed (below).
+
+The milestone records all three under "Corrections of 2026-10-15".
+
+**Verification (x86_64):**
+- `smartcard-service` passed. Its `cardcheck overflow` asserts exactly `MAX_EVENTS` frames before the stream closes.
+- `host-tests` passed, the PIV and smartcard-model tests among them.

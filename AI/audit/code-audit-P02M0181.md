@@ -907,3 +907,19 @@ The remaining defect is that the enumeration reply cannot hold the 128 sources t
   - P02M0197 gives PowerService the `system-power` and `system-shutdown` client roles for the critical-battery power-off (`/data/yellow/libersystem/docs/todo/P02M0197.md:506-510`). This supersedes this plan's "PowerService receives no such client".
   - The owner-confirmed default, a critical battery doing nothing, is `service_logic::sleep_policy::Settings::default` (`/data/yellow/libersystem/src/user/services/logic/src/sleep_policy.rs:117`).
 - **Not done.** This was a static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE ON P02M0181 (2026-10-17T01:44:22Z):
+
+**Finding 1 - `sources` built in an 8 KiB reply that turns into `again` long before 128 sources (Low): ACCEPTED.**
+Confirmed: a maximal source snapshot is 409 bytes on the wire, so the 8 KiB buffer held 20 of them, while the service admits 128.
+- `src/user/services/core/src/power_service.rs`: the serve reply buffer is now 64 KiB.
+- New host test `src/user/libs/protocol/power-proto/src/tests.rs::every_source_the_service_admits_is_one_sources_reply_of_under_sixty_four_kibibytes`, wired in through `mod tests` in `power-proto/src/lib.rs`:
+  - It dispatches `sources` with 128 maximal snapshots: 7 + 128 x 409 = 52359 bytes.
+  - It fails at 8 KiB.
+
+The milestone records it under "Corrections of 2026-10-15".
+
+**Verification:**
+- `host-tests` passed, the new `power-proto` test among them.
+- `acpi` passed, and its `acpipower list` reads every source through PowerService.
+- The shipping builds for aarch64 and riscv64 passed, and so did their development builds.

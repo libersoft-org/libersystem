@@ -360,3 +360,26 @@ The defects are in the BMC service's side of each binding. It sends every call o
 - Manifest: the `smbus_ich9`, `ipmi` and `bmc_service` rows, and the catalogue client bound of 64 in both `system-manifest` and DeviceManager.
 - Gates read, not run: `src/tools/check-ipmi.sh` (the harness BMC section, the silence and close cases). From the harness BMC, `ipmi-harness-bmc.py`'s sensor list.
 - Static, read-only review only. No build, test, gate or QEMU run was performed. The recorded gate passes and the 2026-10-08 continuation results were taken as recorded.
+
+IMPLEMENTER'S RESPONSE ON P02M0201 (2026-10-17T01:44:22Z):
+
+**Finding 1 - one call that outlives its deadline desynchronises the binding's channel for good (Medium): ACCEPTED.**
+- `src/user/services/core/src/bmc_service.rs` adds a `Stamped` transport. Each request goes out under a fresh correlation of the service's own (`next_corr`). A reply carrying any other is a late one, and is discarded together with the handles it carried. The caller's correlation is put back for the generated decoder.
+- `provider()` returns `Client<Stamped>`, and the `call` helper takes it.
+- No deterministic oracle forces the late reply: the window is the driver's own timing. The `ipmi` gate covers the surrounding paths, and it passed.
+
+**Finding 2 - a refused `open` is never retried (Low): ACCEPTED.**
+- `bmc_service.rs`: the service now keeps the providers it could not open (`unopened`, a `ProviderRetry<ProviderInfo>` starting at 1 s and backing off).
+- `adopt(info, attempts)` schedules a retry when `open` or `describe` fails. The loop runs the retries that are due, and its timer includes `next_deadline`.
+- A withdrawal drops the pending retry.
+
+**Finding 3 - a watchdog found running is taken over only after identification and the whole SDR read (Low, Optional): REJECTED after trying it.**
+- I moved the watchdog block before `read_repository()` in `src/user/drivers/core/src/ipmi_driver.rs` and ran the `ipmi` gate.
+- Every harness-BMC case passed, but the out-of-band cross-check (case 7, OpenIPMI's `ipmi_sim` behind `ipmi-bmc-extern` on ISA KCS) failed deterministically, twice: `ipmi_sim` refused the boot's Platform Event with completion code 0xCB, so the event never reached the log.
+- With the original order restored and nothing else changed, case 7 passes (the event "Answered" and read back over the LAN as the same record).
+- Probing `ipmi_sim` directly over its LAN side, Get Watchdog Timer and the same Platform Event both succeed, so the interaction lies on the simulator's system-interface path, and I did not find it.
+- The finding is optional, the only independent oracle rejects the change, and the risk it addresses (a firmware-armed watchdog expiring during a long SDR read) has no fixture here. So the original order stands. The file is back to its pre-job content, and `docs/todo/P02M0201.md` records the attempt and why it was not kept.
+
+The milestone records findings 1 and 2, and the attempt on finding 3, under "Corrections of 2026-10-15".
+
+**Verification (x86_64):** `ipmi` passed (1639 s) with findings 1 and 2 in and the original order for finding 3. Every harness-BMC case and the out-of-band cross-check passed.

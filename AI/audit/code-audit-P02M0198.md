@@ -703,3 +703,49 @@ AUDITOR'S REVIEW ON P02M0198 (2026-10-15T04:39:14Z):
 - Userspace: ProcessorPowerService (main, cores, thermal), `service_logic::processor_policy` (window composition, passive equation checked against ACPI's ΔP = _TC1(Tn-Tn-1) + _TC2(Tn-Tt) in tenths of a kelvin = permille, limit to level then injection, active percent, curve checks, `Trips` once per crossing with the owner's immediate threshold), the zone driver's cooling half and fallback (`acpi_power_driver.rs`), the fan driver and `acpi_fan`, the ACPI model's `_CST`/`_LPI`/`_PSD` parsing and the `_OSC`/`_PDC` forms, ServiceManager's `supervisor_role` rows for PROCPOWER/SLEEP/SHUTDOWN/SYSPOWER, `system-shutdown` serving and the orderly sequence, the manifest row (transparent, plan-relaunchable), AudioService's 1000 us request, `powerctl`.
 - Cross-checked the fixture (`_PSD` one-processor domain, constant trips, `_SCP` recording only) against what the gate can show; listed the kernel tests in processor/idle/power.
 - Static, read-only review: no build, test, gate or QEMU run.
+
+IMPLEMENTER'S RESPONSE ON P02M0198 (2026-10-17T01:44:22Z):
+
+All four findings were verified and accepted.
+
+**Finding 1 - `_PSD`/`_TSD` coordination parsed and ignored (Medium): ACCEPTED, in the refusal form the finding offers rather than a coordinating governor.**
+- `src/procpower/src/perf.rs::check_table` refuses a domain that spans several processors unless its coordination is `HardwareAll`, with the new `Refusal::SoftwareCoordinated`.
+- `src/user/services/core/src/processor_power_service/cores.rs` leaves throttling out for a `_TSD` domain that software would have to coordinate, and says so.
+- `src/user/libs/acpi/model/src/handshake.rs`: `PROCESSOR_SUPPORT` no longer claims software coordination of P- and T-states (0x0020 and 0x0080), which nothing performed, and now claims hardware coordination of P-states (0x0800).
+- Tests:
+  - `procpower/src/perf/tests.rs::a_domain_software_must_coordinate_across_processors_is_refused_and_one_it_need_not_is_admitted`, watched failing;
+  - the acpi model test asserts the new bits.
+
+**Finding 2 - trip points read once, before `_SCP`, and never again (Medium): ACCEPTED.**
+- `src/idl/power.lsidl` gains `zone-reading.trips-changed`; bindings were regenerated.
+- `src/user/drivers/core/src/acpi_power_driver.rs` carries a trip-point change (`trips_owed`) on the next reading it delivers.
+- `processor_power_service/thermal.rs` describes the zone again (`describe_again`):
+  - after `_SCP` in `cooling_policy()`, for every zone, then updates the fans;
+  - in `adopt_zone`, after its `_SCP`;
+  - whenever a reading says the trips changed, before it is judged.
+- There is no gate oracle: the fixture's trips are constant names and its `_SCP` only records. The milestone says so.
+
+**Finding 3 - `Holdings::replace` shadows its pre-reserved vector (Low): ACCEPTED.**
+- `src/procpower/src/holdings.rs`: the second `let mut released = Vec::new()` is removed, so the releases go into the list reserved for them.
+- No host test can discriminate it: it needs an allocation failure. The procpower tests pass.
+
+**Finding 4 - `powerctl` shows no active trip points (Low): ACCEPTED.**
+- `src/idl/power.lsidl` gains `zone-power.active`, a list of active trips bounded at 10.
+- `thermal.rs::zone_status` fills it from the cooling state.
+- `src/user/apps/tools/src/powerctl.rs` prints `_ACn: T - fans`.
+- ProcessorPowerService's reply grows from 8 KiB to 64 KiB.
+
+The kernel, the drivers, the services and `powerctl` build. The milestone records all four under "Corrections of 2026-10-15".
+
+**Found while running the gates:**
+- `processor-power` failed twice at "after the load, C001 did not fall back to CPPC's lowest (cpc_desired reads 255, not 50, after 20 s)". The step relied on something waking core 1 after the load, and nothing guarantees that.
+  - The governor decides only at a scheduler point, a busy core's tick or the end of an idle period, and never by a wakeup of its own, as the milestone requires.
+  - After the load, core 1 halts with nothing queued on it and with no timer of its own, so nothing reaches it to decide at. A diagnostic run measured 133 halts on core 1 since its boot.
+  - The boot core falls back on its 100 ms housekeeping wake.
+  - The same diagnostic run read 255 until a launch, then 50 at once and for the next 20 s.
+- `src/tools/check-processor-power.sh` now runs `powerctl status` after the load. A launch reaches every core, because its address space is torn down with a shootdown of every other core's TLB. The gate then requires C001 at 50 from that first point on.
+
+**Verification (x86_64):**
+- `processor-power` passed (519 s): the tables, the profiles, `_PPC`, the `_LPI` states, the latency request, the relaunch and the three heatings.
+- `acpi` passed.
+- `host-tests` passed, the `procpower` and acpi model tests among them.

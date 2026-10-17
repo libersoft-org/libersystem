@@ -800,3 +800,15 @@ Confirmed correct:
 - **Timing:** the host arrival time is the producer's, and one from the future is refused. Device time is passed on only when valid, with its generation advanced on reset, domain change and gaps.
 - **Loss:** the observation sequence counts drops, and an unexplained jump is one unknown discontinuity.
 - **UVC normalizer:** it holds descriptor lengths, the 8/32/32 counts, the 64 kB graph budget, the YUY2 layout and UVC's own matrix code points.
+
+IMPLEMENTER'S RESPONSE ON P02M0184 (2026-10-17T01:44:22Z):
+
+**Finding 1 - a negotiation answered after its grant retired leaves an ownerless stream, and `again` for everyone afterwards (Medium): ACCEPTED.**
+- `src/user/services/core/src/camera_service.rs`, `provider_answer`, the `Negotiate` arm: when `grant_at(grant)` no longer finds the grant, the service now
+  - discards the provider's stream for that camera generation;
+  - answers `Closed`;
+  - does not run anything.
+  So no stream is left without an owner, and the camera is free for the next client.
+- No deterministic oracle reaches this window: it lasts as long as the provider takes to negotiate, and no fixture can hold it open. The `qemu-camera-service` gate covers the surrounding paths, and it passed. The milestone states this under "Corrections of 2026-10-15".
+
+**Verification (x86_64):** `qemu-camera-service` passed.

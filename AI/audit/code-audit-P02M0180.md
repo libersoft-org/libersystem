@@ -1316,3 +1316,40 @@ The later P02M0194 revision of the bounds (eight links, sixteen channels, 32 que
   - Gate registration: `check.sh`, `verify-model/src/catalog.rs`, `model/release-required.toml`.
 - **Wire sizes.** Computed from the generated `BondRecord::write`: u16 length prefixes, u8 enums.
 - **Not done.** Static review only: nothing was built or run.
+
+IMPLEMENTER'S RESPONSE ON P02M0180 (2026-10-17T01:44:22Z):
+
+Both findings were verified against the tree and accepted.
+
+**Finding 1 - no deadlines on BluetoothService's calls, and InputService waiting on it (Medium): ACCEPTED.**
+Confirmed: `exchange` and `bond_exchange` passed deadline 0, the four adoption calls used `Client::new` (deadline 0), and InputService's profile client did the same, so a provider that never answers a send parked both loops.
+- `src/user/services/core/src/bluetooth_service.rs`:
+  - The stamped transport (formerly `BondTransport`, now `StampedTransport`; `bond_corr` is now `fresh_corr`) serves the bond store, the controller's transport and the catalogue. Each request carries a fresh correlation. A reply carrying any other correlation - for example the late reply to a call that gave up - is zeroed and dropped, never read as a later call's answer.
+  - Two deadlines. `CALL_TICKS` is 5 s, for sends, the catalogue's `open` and the transport's `attach`/`receive`/`control`/`voice`. `BOND_TICKS` is 10 s, for the bond store, whose `store` includes a durable commit through StorageService. `bond_exchange` and `bonds()` (now `Client::with_deadline`) use the latter.
+  - `exchange` and `send_packet` now report a `Sent` (`Taken`, `Refused`, `Unanswered`). On `Unanswered`, `Controller::unanswered()` marks the controller `stalled` and prints its reason once. `pump`, `flush_links`, `send_iso` (`le_audio.rs`) and `send_sco` (`voice.rs`) send nothing while it is set.
+  - `Stack::end_stalled()` runs at the top of every loop turn. It ends a stalled controller's session as `HciControlKind::Fault` does: `le_audio_reset`, `end_session`, `powered = false`. A `Reset` from the driver clears the mark.
+  - `adopt` builds a fresh deadline-bounded client per call, and its refusal message now also covers a transport that did not answer.
+- `src/user/services/core/src/input_service.rs`:
+  - `BLUETOOTH_ASK_TICKS` is 1 s, applied per call to `enabled` and to each `open_input`.
+  - Any transport error drops the profile connection, as a dead connection is dropped (`drop_profile`), and the next retry resolves a new one through the broker. A dropped connection also discards whatever late reply was still on it.
+  - A timeout prints `InputService: BluetoothService did not answer within a second; ...`.
+- Oracle, as the finding proposed:
+  - The fixture withholds a send reply. `src/idl/bluetooth.lsidl` gains `fixture-action.withhold-send = 33` (bindings regenerated with `./gen.sh`). `src/user/drivers/core/src/bt_fixture.rs` holds the answer to the host's next send for N seconds, then sends it late and resets the controller (`HciControlKind::Reset`).
+  - `btclassic stall` (`src/user/services/core/src/btclassic.rs`) holds a send for 20 s. It requires that `devices()` is answered within 10 s, that the controller reads unpowered, and that after the fixture's reset a scan hears the phone. That last check proves the late reply was dropped and the controller came back. Before the fix the call waited the full 20 s.
+  - `src/tools/check-bluetooth-classic.sh` runs `btclassic stall` last on its second boot. It requires `btclassic: PASS stall`, BluetoothService's line and InputService's line.
+
+**Finding 2 - the bond store's 1 KiB `list` reply (Medium): ACCEPTED** (the same defect as P02M0194 finding 1).
+- `src/user/services/core/src/bluetooth_bond_store.rs` now serves from a 10 KiB reply buffer.
+- New host test `src/user/libs/protocol/bluetooth-proto/src/tests.rs::sixty_four_listed_bonds_at_their_wire_bounds_are_one_reply_of_under_ten_kibibytes`:
+  - A record listed at its wire bounds is 148 bytes, so 7 + 64 x 148 = 9479 bytes; the test dispatches exactly that.
+  - It fails with the old 1024-byte buffer, which holds 6 such records.
+- BluetoothService receives the reply with `recv_vec`, so its side has no smaller client buffer.
+
+The milestone records both under "Corrections of 2026-10-15".
+
+**Verification (x86_64):**
+- `bluetooth-classic` passed with `btclassic stall` and both service lines:
+  - "a controller did not take a packet in five seconds; nothing more is sent to it until its driver resets it";
+  - "InputService: BluetoothService did not answer within a second; its connection is dropped and a new one asked for".
+- `bluetooth-input`, `bluetooth-independent` and `bluetooth-service` passed, the last again on the final image.
+- `host-tests` passed, the `bluetooth-proto` test among them.

@@ -5147,3 +5147,125 @@ AUDITOR'S REVIEW ON P02M0099 (2026-10-15T04:34:07Z):
 **Read-only history and host checks:** `git log`/`git show` for the checklist deletions (`2e2275f3`, `aa156096`) and the commits that closed the milestone; a grep of `docs/` and `src/` showing that nothing implements or owns EHCI, OHCI/UHCI, NFIT, virtio-crypto, virtio-balloon/virtio-mem or virtio-fs; and a read-only listing of the host kernel's gadget function modules (`usb_f_ncm` is present).
 
 **Not run:** no build, test, gate, QEMU boot or `verify.sh`. No source file was modified.
+
+IMPLEMENTER'S RESPONSE ON P02M0099 (2026-10-17T01:44:22Z):
+
+All six findings were verified against the tree and accepted. Finding 2 needs a decision from the owner; see below.
+
+**Finding 1 - NVMe has no timeout recovery (High): ACCEPTED.**
+
+`src/user/drivers/core/src/nvme.rs`:
+- `Fault` lives here now, with `Fault::needs_reset()`: a completion the controller gave (`Failed`, `Down`) leaves the queue usable; a `Timeout` or an `Unexpected` id needs a reset.
+- The shutdown constants and `shutdown_complete` (judging `CSTS.SHST`) are added.
+
+`src/user/drivers/core/src/nvme_driver.rs`:
+- The raw spin budgets (`COMPLETION_SPINS`, `READY_SPINS`) are replaced by clock-tick deadlines:
+  - `IO_TICKS`: 30 s;
+  - `ADMIN_TICKS`: 1.5 s, shared across one bring-up or reset;
+  - `READY_TICKS_PER_UNIT`: CAP.TO's 500 ms unit;
+  - `SHUTDOWN_TICKS`: 2 s.
+- The controller is a `Controller { base, caps, entries, queues, down }`, with `enable`, `identify`, `open_io`, `reset(same_disk)`, `io(Io)`, `recover` and `shut_down`.
+- An I/O whose command timed out, or whose completion was not its own, is not answered until the controller has been reset: disabled, re-enabled, admin and I/O queues rebuilt, and the disk checked to be the same. Only then is the I/O retried, once.
+  - A second fault resets again and answers the error.
+  - A controller that cannot be brought back is `down`, and is tried again at the next request.
+- No command answered as failed can still be running against the shared data span.
+- `wait_ready` no longer refuses a disable while CSTS.CFS is set.
+
+Host tests in `nvme/tests.rs`:
+- `a_command_the_controller_answered_leaves_the_queue_usable_and_one_it_did_not_needs_a_reset`;
+- `a_shutdown_is_complete_only_when_the_controller_says_its_processing_is`.
+
+Both were watched failing. QEMU's NVMe model always completes and offers no fault injection, so the reset path has no guest oracle beyond the ordinary I/O of `boot-volume-controllers`, which passed (below).
+
+**Finding 2 - six driver families removed from the checklist with no recorded decision (Medium): ACCEPTED.**
+- Verified with `git show`:
+  - EHCI, OHCI/UHCI and ACPI NFIT/NVDIMM left in `2e2275f3`;
+  - virtio-crypto, virtio-balloon/virtio-mem and virtio-fs left in `aa156096`;
+  - neither commit says why, and nothing else in the tree owns these items.
+- Implementing six driver families is not something a code-audit pass can do, and choosing between implementing, moving them or recording them out of phase 2 is the owner's decision. What I did:
+  - `docs/todo/P02M0099.md` gains a section, "Restored items (2026-10-15)", with the six items back word for word and unticked.
+  - The status line now says every item is done except those six, which wait on the owner's decision.
+  - A head note explains where they went, that QEMU models each of them (so none leaves phase 2 for want of an oracle), and the three choices.
+  - `docs/todo/TODO.md`'s row says the same. Its checkbox is left as the owner set it, pending that decision.
+
+**Finding 3 - CDC-NCM never bound, although an oracle now exists (Medium): ACCEPTED.**
+Confirmed:
+- `configure_network` refused every NCM adapter.
+- `cdc.rs`'s NTB-16 code had no production caller.
+- `usb_f_ncm` is in the host kernel, and `usb-gadget.sh` had no `ncm` kind.
+
+The driver:
+- `src/user/drivers/core/src/cdc.rs` gains the NCM decisions:
+  - `Binding.ncm_capabilities`;
+  - `ntb_parameters()`, which checks GET_NTB_PARAMETERS field by field (`NtbParameters`, `NtbRefusal`);
+  - `ntb_input_size()`;
+  - an OUT layout (`NtbOut`) and `ncm_frames()`, which splits a received block all or nothing.
+  `ncm_block()` takes the layout and still uses the existing `nth16`/`Datagrams` parser; nothing is copied from MBIM.
+- `src/user/drivers/core/src/usb_net.rs` binds NCM through the same frame transport as ECM (the `MAC` + MTU hello, then one frame per message), inside the labelled configure block that releases everything on failure. The order is:
+  1. SET_INTERFACE alt 0 (NCM's reset);
+  2. GET_NTB_PARAMETERS, checked;
+  3. SET_NTB_FORMAT(16), only if 32-bit blocks are also offered;
+  4. SET_NTB_INPUT_SIZE(4096), only if the device offers more;
+  5. alt 1;
+  6. the packet filter, only where the NCM descriptor says the device has one.
+- Refused at bind:
+  - a short parameter answer;
+  - no 16-bit format;
+  - an IN maximum under 2048;
+  - an OUT divisor of 0, or a remainder not below it;
+  - an OUT alignment that is not a power of two of at least 4;
+  - an OUT layout that cannot hold an MTU-sized frame;
+  - a CRC table ("NCM1").
+- Receive: a block is posted for exactly the size in force and split all or none. Any datagram under 14 or over 2048 bytes, inside the header, or overrunning the block refuses the whole block, which is counted.
+- Transmit: one frame per block, the table on the device's alignment, the datagram on its divisor and remainder, and a pad byte where a block would end exactly on a packet boundary.
+- `xhci.rs` hands each frame of a block to NetworkService as its own message.
+- No new DMA allocation: the same three rings and three pages.
+
+Tests:
+- `cdc/tests.rs`: eight new host tests (drivers crate 582 to 590). Eighteen planted defects were each caught.
+- `src/tools/check-driver-mutations.sh`: three new permanent mutations (whole-block refusal, the pad byte, the alignment rule).
+- `src/tools/xhci_event_retention.py` and `xhci-event-retention.rs`: this proof had been broken by my DMA-leak edit for finding 4 (an ambiguous anchor and a missing field). It was mended and passes, with its causal mutants failing.
+
+The oracle:
+- A `ncm` kind in `src/harness/usb-gadget.sh` uses the host kernel's own `usb_f_ncm`, an independent NCM implementation, with fixed locally administered addresses.
+- Its interface is brought up bare: no address, no route, IPv6 and forwarding off on that interface only. `src/harness/ncm-peer.py` answers on it with a raw packet socket bound to that interface alone: probes come back 1 to 8 times with the MACs swapped, and ARP for 10.0.2.2 is answered.
+- `test-kernel.sh` and `qemu-run.sh` leave QEMU's `usb-net` off the bus for that run.
+- The kernel test `kernel.hardware.usb_cdc_ncm_carries_frames_both_ways_in_transfer_blocks` sends four frames, from 60 to 1514 bytes, and requires twelve answers back in order, through NTBs both ways. Without `USB_GADGET=ncm` it says NOT RUN.
+- `docs/todo/P02M0099.md` records it under the CDC-ECM/NCM item.
+
+**Finding 4 - the older xHCI class modules leak DMA pages on detach and failed configuration (Medium): ACCEPTED.**
+- `usb_net.rs`: `Notify` keeps its page's handle and `Net::release` frees it. `Net::take` is all-or-none, and a labelled configure block releases the net on every failure path.
+- `usb_storage.rs`: `Storage` is built before the endpoints, and a labelled unit block calls `st.release()` on the unit-not-ready, READ CAPACITY and block-size returns.
+- `usb_serial.rs`: a labelled ports block lets the ring clean-up always run, and each port gets both pages or neither.
+- `usb_uas.rs`: rings and pages are allocated all-or-none, `Endpoint::release` is added, and the device is built before its commands, so `device.release()` runs on every failure.
+- The kernel suite's USB storage, serial and network tests plug these devices; the full x86_64 suite passed (below).
+
+**Finding 5 - the Bulk-Only Transport does not validate the observed data length (Low): ACCEPTED.**
+- `usb.rs`:
+  - a `Csw` struct and `CSW_LEN`;
+  - `csw_outcome(csw, tag, wanted, observed, allow_short)` treats a wrapper that did not arrive as 13 bytes as a framing fault, and counts what moved as the smaller of `wanted - residue` and what the transport observed;
+  - the comment no longer describes a cross-check that did not exist.
+- `usb_storage.rs::bot_transfer` reads both stages with `wait_transfer_len`: the data stage's observed length (a stall included) and the CSW's received length.
+- New tests in `usb/tests.rs`, both watched failing:
+  - `a_data_stage_shorter_than_the_device_claims_is_short`;
+  - `a_wrapper_that_did_not_arrive_whole_is_a_framing_fault`.
+- Typed refusal: range, handle and object refusals in `usb_storage.rs`, and short block messages in `xhci.rs` (BOT and UAS), now answer `STATUS_INVALID`.
+
+**Finding 6 - AHCI, HDA and NVMe claim quiet at a planned stop without stopping DMA (Low): ACCEPTED.**
+- AHCI's stop calls `stop_port` and reports quiet only when the flush succeeded and the port confirmed stopped.
+- NVMe's stop disables the controller (`disable()`), and reports quiet only when that is confirmed.
+- HDA's stop runs `quiesce(controller, rings)`. It waits for the streams' RUN bits and the CORB/RIRB engines to read back clear, puts the controller in reset (CRST), and only then claims quiet through `finish_stop`.
+
+The milestone records findings 1, 3, 4, 5 and 6 in dated notes, and finding 2 as above.
+
+**Verification (x86_64 unless named):**
+- The full kernel suite passed twice, 569 tests each, the second time on the final tree.
+- `USB_GADGET=ncm` with `kernel.hardware.usb_cdc_ncm_carries_frames_both_ways_in_transfer_blocks` passed against the host kernel's own `usb_f_ncm`:
+  - the guest negotiated 16-bit blocks of up to 4096 bytes in (the device offered 16384) and 4096 out;
+  - one received block carried six datagrams;
+  - it reported "4 frame(s) out in transfer blocks and 12 answer(s) back in order, 60 to 1514 bytes";
+  - afterwards the host carried nothing of the harness, and the host kernel stayed untainted.
+- `boot-volume-controllers` passed (1042 s). On NVMe and on AHCI the system volume was served, slept to RAM and woke on its alarm, took a write, and read back after a cold reboot.
+- `host-tests` passed, the drivers crate's tests among them.
+- The shipping builds for aarch64 and riscv64 passed, and so did their development builds.
+- Not run: `check-driver-mutations.sh`, which carries the three new NCM mutations.

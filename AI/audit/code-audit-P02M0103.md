@@ -3771,3 +3771,83 @@ AUDITOR'S REVIEW ON P02M0103 (2026-10-15T04:30:07Z):
 - WSI: read DisplayService present/reconfigure/blit and `pix::blit`, the `display_3d_cleanup.rs` kill/refund fixtures, and the guest conformance tests in applications.rs.
 - Ran `git log -S` on the tile-clip intersection; it was introduced in d3705b3d (2026-09-15).
 - This was a static, read-only review. Nothing was built, tested, gated or booted. Finding 1's pixel effects are derived from the code paths, not observed.
+
+IMPLEMENTER'S RESPONSE ON P02M0103 (2026-10-17T01:44:22Z):
+
+**Finding 1 - soft2d computes spatial filters per 64x64 tile (High): ACCEPTED.**
+Confirmed at HEAD:
+- `clips.reset(tile)` starts every tile's replay at the bare tile.
+- Draws inside a layer are clipped to `layer.bounds ∩ clips.bounds()`, so a layer's margin was never rasterised.
+- Commands were binned by their un-grown bounds.
+- A top-level Backdrop read the lane's `Tile`, which answers transparent past the tile.
+
+What changed:
+- `src/user/libs/graphics/soft2d/src/backend.rs`:
+  - Each command gets a margin, worked out at prepare by a backward walk. A filtered layer's content is needed its graph's reach beyond what its parent needs, and a layer that reads the backdrop raises what the parent needs before it.
+  - Commands are binned by their bounds grown by that margin.
+  - In each tile's replay, `tile_needs` repeats the walk over the tile's own bin, and the clip stack starts from the hull of those rectangles.
+  - Where the top level is read past a tile, it is read from a copy of the target taken before any unit runs (`take_snapshot`).
+  - `SoftPrepared`'s margin fields replace `expansion`, and a lane reserves one surface per open layer rather than one per layer.
+- `target.rs`: a `Surface` has a logical extent and clears only the rectangle it is aimed at; `Tile` gains `reserve`/`aim`; `Tile::load` refuses to read past its unit without a snapshot.
+- `layer.rs` and `workers.rs`: the matching plumbing.
+
+New tests in `soft2d/src/tests.rs`:
+- `a_filtered_layer_is_the_same_picture_wherever_the_tiles_cut_it`: 11 filtered scenes plus a backdrop, drawn into a one-tile target and at three placements across tile boundaries in a 192x192 target. They must match bit for bit in an f32 target and byte for byte in an 8-bit one, across every pool and unit kind. The old code differed in 68 of 72 drawings.
+- `a_blurred_opaque_square_stays_opaque_inside_and_its_edge_is_one_profile`, the auditor's own case. The old code had 3576 interior pixels below 255.
+
+Each part was broken on purpose, and each break is caught:
+
+| Deliberate break | Drawings that differ |
+| --- | --- |
+| Binning by the un-grown bounds | 24 |
+| No backdrop raise | 22 |
+| An empty snapshot | 6 |
+| Clip stack starting from the bare tile | 54 |
+
+- `soft2d-bench --scaling` gives identical pictures at 1 to 64 workers.
+- Provisional benchmark, on a shared host at load 1.1-2.4, `--workers 1`, six runs each. All five scenes stay under their frozen budgets; no budget changed.
+
+| Scene | Before | After |
+| --- | --- | --- |
+| UI-effects | 56.58 ms | 44.22 ms |
+| UI-basic | 10.32 ms | 10.46 ms |
+
+- The final quiet-host `soft2d-performance` measurement is below.
+- Limits kept and stated in `docs/PERF.md`: graph reach is still capped at 256 px, and surfaces are sized by the worst-case margin.
+
+**Finding 2 - the conformance suites do not apply the frozen thresholds (Medium): ACCEPTED.**
+- `src/user/libs/graphics/conformance2d`:
+  - The blur, drop-shadow and backdrop scenes now draw on a 160-pixel, multi-tile target. Every pixel is compared with the graph evaluated in f64, within the frozen 1e-3 relative, and exactly where coverage is 0 or 1.
+  - The three layer scenes compare the whole target exactly.
+  - `AnalyticCoverageFill` is compared at four sub-pixel phases: exact at 0 and 1, otherwise 2/255 per pixel and 1/255 mean.
+  - `harness::stored` models the profile's ordered dither, so every fully covered probe compares exactly. The four non-separable blends are compared exactly with SetLum/SetSat/ClipColor evaluated in f64.
+  - Run against the original soft2d, the blur, drop-shadow and backdrop scenes fail.
+- `soft2d/src/filter/tests.rs` compares `kernel()` with the f64 Gaussian within 1e-3 relative for 12 sigmas; a kernel 1% wider fails it.
+- `src/user/libs/graphics/conformance3d`: `depth_is`/`ulps_apart` hold Depth32F to 1 ULP and normalised formats to exact equality. An expectation 2 ULP away fails where `close` had accepted it.
+- Both suites hold their threshold numbers to the frozen registry text with a host test.
+- Not done, and stated in the milestone: an analytic per-pixel coverage oracle for curves, strokes and glyphs, which needs a second, exact rasteriser. Their partially covered probes keep ±2/255.
+
+**Finding 3 - the benchmark freezes only counts (Low): ACCEPTED.**
+- `src/tools/soft2d-bench/src/main.rs`: each scene now freezes `render2d::encode::digest`, plus a `CONTENT` digest of the target description and every generated image. Both are checked before the clock starts.
+- `src/user/libs/graphics/render2d/src/encode.rs`: the canonical encoding had left paints out of FillPath, StrokePath and DrawGlyphRun. It now includes them (`encode_paint`), with a test watched failing.
+- Three changes to a scene are each caught before the clock: a blur sigma of 3.5 instead of 4, the YUV destination halved, and the photo extent at 256 instead of 512.
+
+**Finding 4 - the 3D floor gate does not enforce bounded present latency or measure resize allocation (Low): ACCEPTED.**
+- `src/tools/check-qemu-3d-demo.sh` requires the core 640x480 run's `present_max_us` to be at most 33333.
+- The resize run must report `resize rebuilt N allocations max M total T`, with N equal to the rebuilds.
+- `src/user/apps/tools/src/test3d_sw.rs` counts allocations across `Step::Rebuild` (largest and total), resets the steady-loop count after a rebuild so it excludes the rebuild's allocations, and prints the line in `--report`.
+- The gate's result is below.
+
+**Finding 5 - the `image-convert`/`image-resample` replay no longer measures colour conversion (Low, Optional): REJECTED.**
+- The finding states that both mechanisms are exact and that the floor is defined on prepared replay, so the scene complies with the item. It marks itself informational.
+- Changing what the scene measures, or adding a per-frame video-source gate, would be new scope with no failing requirement behind it.
+
+The milestone records findings 1-3 in its own entry and finding 4 under "Corrections of 2026-10-15". `./gen.sh --check` reports no drift on the final tree, the backend checklist's `backend.rs` line numbers included.
+
+**Verification:**
+- `host-tests` passed: soft2d, conformance2d, conformance3d and render2d among them.
+- `soft2d-performance` passed on a quiet host (load average 0.4 to 0.7), median of six runs: UI-basic 10.01 ms, UI-effects 42.10 ms, vector-stress 61.38 ms, image-resample 11.43 ms, image-convert 15.24 ms. Each is under its frozen budget, and none was changed. `docs/PERF.md` records the table.
+- `qemu-3d-demo` passed (159 s), finding 4's assertions included:
+  - three resize rebuilds, at most 622 allocations each and 1866 in all;
+  - the 640x480 runs' slowest present at most 11.6 ms against the 33.3 ms bound.
+- The run before it failed once: after the second resize (to 480x800) the demo rebuilt only once for two changes, and the window stayed cleared for the three minutes the gate waits. It did not reproduce. Finding 4's change only counts allocations and does not take part in the rebuild. The milestone records the failed run.

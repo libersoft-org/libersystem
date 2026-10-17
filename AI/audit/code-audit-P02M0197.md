@@ -1288,3 +1288,48 @@ AUDITOR'S REVIEW ON P02M0197 (2026-10-15T04:41:31Z):
 - Services: `service_manager/sleep.rs` (whole), its standing-loop integration and `handle_admin` in `service_manager.rs`, `service_manager/restore.rs`, `supervisor_role`; `service_logic::{sleep_transaction, sleep_order, sleep_policy}`; `device_manager/sleep.rs` (whole), DeviceManager's binding teardown and sleep-run gating; `process_service.rs` applications Domain and freeze; `time_service.rs`; `hibernation_service.rs` restore order; SystemManager's sleep entry; the StorageService system-volume mount and block I/O path; manifest entries (all 44 drivers' `suspend-deadline`, `storage_service`, `hda`, `acpi_service`).
 - Drivers: `common.rs` (common sleep step, `hold`, `take_sleep_step`, `bringup_bound`), the list of drivers calling `takes_sleep`, and the `resume` implementations of nvme, ahci, sdhci, xhci, virtio_blk and virtio_scsi; hda's bring-up and serve loop; `tpm_driver.rs` sleep notes; `acpi_tad.rs`, `acpi_button.rs`.
 - Read earlier gate output without re-running it: /data/yellow/libersystem/.build/logs/sleep/serial-s3.log (the drivers' step and resume across S3), plus the system-disk and S3/S4 settings of check-sleep.sh, check-hibernate.sh, check-boot-volume-controllers.sh and qemu-run.sh.
+
+IMPLEMENTER'S RESPONSE ON P02M0197 (2026-10-17T01:44:22Z):
+
+All four findings were verified and accepted.
+
+**Finding 1 - a resume that loses power loses a system volume served by NVMe or AHCI (High): ACCEPTED.**
+- `src/user/drivers/core/src/nvme_driver.rs`:
+  - the driver now takes part in the sleep exchange;
+  - a power-losing suspend shuts the controller down (`CC.SHN` normal, with `shutdown_complete` from `nvme.rs` judging `CSTS.SHST`; a disable where the shutdown fails);
+  - a resume after lost power or a shutdown runs `reset(true)`, which brings the controller up again and refuses a different disk (same MDTS and namespace).
+- `src/user/drivers/core/src/ahci_driver.rs`:
+  - a power-losing suspend stops the port (`stop_port`);
+  - a resume after lost power re-attaches: GHC.AE, `ready_port()` (extracted from bring-up), `start_port`, and IDENTIFY compared with the disk it had;
+  - otherwise it restarts the port.
+- Host test `nvme/tests.rs::a_shutdown_is_complete_only_when_the_controller_says_its_processing_is`.
+- The oracle: `src/tools/check-boot-volume-controllers.sh`, on x86_64 with S3 offered (`ICH9-LPC.disable_s3=0`):
+  - sleeps to RAM with the system volume on each controller (`sleepctl suspend ram 5`), between two writes;
+  - requires the RTC alarm's resume and the second write;
+  - after the cold reboot, reads both files back.
+
+**Finding 2 - HDA's DMA engines keep running into S3 and the snapshot (Medium): ACCEPTED.**
+- `src/user/drivers/core/src/hda_driver.rs`: the driver takes the sleep step, and `quiesce()` clears the streams' RUN bits and waits until they read back clear.
+- For a power-losing state it also stops the CORB/RIRB engines and puts the controller in reset (CRST), confirmed by reading back.
+- On resume after a reset or lost power it asks to be bound again; otherwise it carries on.
+- The same `quiesce` serves the planned stop; see P02M0099 finding 6.
+
+**Finding 3 - a failed or unwound sleep is not in the system graph (Low): ACCEPTED.**
+- `src/user/services/core/src/service_manager/sleep.rs`: `Sleeper::failure()` gives the last refused or unwound sleep, naming who, in the log's words.
+- `service_manager/lifecycle.rs`: `serve_stats_once(.., sleep)` reports it as a supervisor row named `sleep`, state failed, with `last_failure`. `service_manager.rs` passes it at the three call sites.
+- `system_graph_service.rs` adds the failed `sleep` node, which depends on `service_manager`.
+- `check-sleep.sh` step 6 requires `graph sleep` to show it, with `unwound at Drivers`, after the fixture's refusal.
+
+**Finding 4 - the scheduled wake has no automated check (Low, Optional): ACCEPTED.**
+`check-sleep.sh` step 3b:
+- sets `sleepctl wake-at` 20 s ahead;
+- suspends to RAM with no timed wake of its own and no wake from the host;
+- requires `sleep: resumed (the RTC alarm`, the wake reported spent, and the status reading `scheduled wake: none`.
+
+The milestone records all four under "Corrections of 2026-10-15".
+
+**Verification (x86_64):**
+- `sleep` passed: the scheduled wake of step 3b, and `graph sleep` naming the unwound failure.
+- `hibernate` passed (2693 s).
+- `boot-volume-controllers` passed (1042 s). Its new S3 step: on NVMe and on AHCI the system disk slept to RAM, woke on its alarm, took a write after it, and the write read back after a cold reboot.
+- `host-tests` passed.

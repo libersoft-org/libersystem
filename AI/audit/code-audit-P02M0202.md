@@ -684,3 +684,21 @@ One defect remains, in UCSI's resume path. A connector change that the PPM indic
 - Manifest: the `ucsi_acpi`, `tcpci` and `typec_service` rows, and kind 27 in `system-manifest` and DeviceManager.
 - Harness and gates: `src/harness/ucsi-ppm.py` (the ack, pending, announce and notify logic), `src/harness/tcpc_partner.py` (script outline, overshoot), and `src/tools/check-typec-ucsi.sh` (the sleep case and the DisplayPort assertion).
 - Static, read-only review only. No build, test, gate or QEMU run was performed. Real hardware is out of phase 2 by the owner's decision and is not counted. The recorded gate passes and timings were taken as recorded.
+
+IMPLEMENTER'S RESPONSE ON P02M0202 (2026-10-17T01:44:22Z):
+
+**Finding 1 - after a resume, an indicated connector change is read but never acknowledged (Medium): ACCEPTED.**
+- `src/user/drivers/core/src/ucsi_acpi.rs` adds `acknowledge_changes()`. It reads and acknowledges every indicated connector change (`read_port(at, true)`).
+- It runs at the end of `start()` and in `wake()`, which now publishes only after acknowledging.
+- The oracle: `src/tools/check-typec-ucsi.sh`, in the S3 case, after the detach is reported, attaches a charger (`ppm attach 1 charger`) and requires its 9 V contract (`probe await 1 contract 9000`). That fails while a change is left unacknowledged.
+
+**Finding 2 - the DisplayPort configuration selects "UFP_U as DFP_D" (Low, Optional): ACCEPTED.**
+- `src/user/drivers/core/src/typec_ucsi.rs::dp_configuration` selects `10b` (UFP_U as UFP_D), so Configure carries 0x0806.
+- These were updated to match:
+  - `typec_ucsi/tests.rs`;
+  - the expectation in `check-typec-ucsi.sh`;
+  - the self-check in `src/harness/ucsi-ppm.py`, which passes.
+
+The milestone records both under "Corrections of 2026-10-15".
+
+**Verification (x86_64):** `typec-ucsi` passed: after the S3 case the charger was attached and its 9 V contract required, which an unacknowledged change would have blocked. The DisplayPort mode was configured as UFP_D. `host-tests` passed, the `typec_ucsi` tests among them.

@@ -2229,3 +2229,151 @@ Static, read-only review; no build, test, cargo, QEMU or gate was run.
 - Bidi and Unicode: read unicode-bidi reorder.rs and the pinned UCD list in toolchain.lock; confirmed no mirroring data beyond `BIDI_BRACKETS` in the generated tables.
 - Contract, run and layout: read font-contract cache.rs, font-run produce.rs, the text-layout allocation sites, and scanned font-parse for `unsafe` / `unwrap` / `expect` / `panic!` outside tests (none).
 - Gates: read the authored corpus (font-gen corpus.rs complex face, lastresort.rs), text-corpus cases.rs / main.rs, textconf.rs (pipeline use, oracle, comparison), the textconf guest test, font-oracle with check-font-declarations.sh, and gate registration in check.sh and verify-model/src/catalog.rs.
+
+IMPLEMENTER'S RESPONSE ON P02M0136 (2026-10-17T01:44:22Z):
+
+All nine findings were verified against the tree and accepted. Finding 8 is done to the minimum the finding names, plus the root separation; finding 9 stops short of the bidi storage, as said below.
+
+**Finding 1 - the font catalogue never watches its directory, and an over-bound subscription is never answered (Medium): ACCEPTED.**
+
+`src/user/services/core/src/font_catalogue.rs`:
+- At start the catalogue opens `volume.watch` on `FONT_DIRECTORY` through its own scoped FONTDIR client (`open_watch`). It opens the watch before the seeding scan, so nothing that changes between the two goes unseen.
+- The serve loop is now `serve_multi_ticked`, with a 1 s tick (`WATCH_TICKS`). `look()` runs on the quiet tick, and also on any request when a look is due, so a busy client cannot starve it. Each look:
+  - drains at most 64 watch events without blocking, and rescans once if there were any;
+  - re-opens a watch that StorageService dropped (stream closed), and rescans;
+  - asks again for a watch that could not be opened;
+  - makes a scan that is owed (see finding 2).
+- Refusals are said once.
+
+The typed refusal:
+- `src/idl/font.lsidl`: `subscribe` now returns `result<stream<generation-event>, error>`; bindings were regenerated.
+- `open_subscription` answers `subscribe_reply_err(corr, Exhausted)` when there is no slot, when the connection already holds a subscription, at the bound, and when no channel can be made. It never leaves the caller unanswered.
+- `src/user/libs/clients/font-client/src/lib.rs`: the extern and `FontClient::subscribe` return `Option<Result<u64, Error>>`. No caller in the tree subscribes yet.
+
+Two adjacent defects found in the same bookkeeping and fixed:
+- Disconnects were never processed. rt announces a client that went as a two-byte `DISCONNECT_OP` request, while the handler looked only for an empty one. Slots therefore leaked, and after 16 connections over the service's life every client was answered `Exhausted`. The handler now calls `disconnected()` on `abi::DISCONNECT_OP`.
+- A failed stream creation freed the live connection's slot (`endpoints.disconnect`). `src/user/services/logic/src/font_clients.rs` gains `Endpoints::unsubscribe` (test `an_unsubscribe_keeps_the_connection`). That path, and dead streams pruned in `announce()`, now use it.
+
+The oracle, in `src/kernel/test_suites/applications.rs::the_text_stack_draws_its_corpus_to_the_analytic_oracle`:
+- The test mints a catalogue connection of its own before handing the root to `textconf`.
+- After `textconf` passes, it lists the faces, removes `vol://system/share/fonts/lastresort.ttf` through a writable scope on the same directory, and requires LIST to drop by one within 1000 ticks with no rescan asked. An unwatched catalogue listed the face until it restarted.
+- The test keeps its own reference to the catalogue's root. The catalogue's serve loop ends when its root closes, and `textconf` closes its end when it exits; the first run failed for exactly that reason.
+- Passes on x86_64. Watched failing: with the re-read after a watch event switched off, the test fails at "the catalogue withdrew a face removed from its watched directory".
+
+**Finding 2 - a failed directory listing withdraws every published face (Medium): ACCEPTED.**
+- `observe()` returns `Option<Vec<Observation>>`: a refused `list`, or a listing that did not drain whole, is `None`.
+- `rescan()` returns `Option<ScanOutcome>`. `None` is no scan: the publication stands, the scan is owed to the next look, and the failure is said once.
+- The admin `rescan` answers `Error::Io` and records `Completion::Failed`.
+- No deterministic oracle for a transient listing failure exists here; it would need fault injection in StorageService. `font_scan::reconcile` is unchanged and host-tested; what changed is that it is no longer fed a failed listing.
+
+**Finding 3 - the fallback policy is not what stage 4 uses, and the ceiling can cut off the last resort (Medium): ACCEPTED.**
+In `src/user/libs/text/text-pipeline`:
+- `canonical::face_for(coverage, order, cluster)` walks the order the policy gives.
+- `stages::choose_faces(levelled, &Policy, &impl Coverage)` asks the policy per item, by script and language.
+- `face_for_cluster` asks at most 16 faces and always admits the last resort, which the ceiling no longer cuts off.
+- `Policy::preferred_into` / `last_resort` / `order_for` return `Result`. The `Faces` adapter and `runs_for` are gone.
+- Tests were added and extended, and watched failing.
+
+**Finding 4 - the pipeline stops at fallback (Medium): ACCEPTED, every part.**
+- Stage 5 is `stages::shape(faced, &impl Faces, size)`. It splits at item, face and level changes, and at the 4096-code-point run ceiling (at the last space). It shapes each run with its language; `ShapedRun` carries buffer, language, level and 26.6 advances.
+- Mirroring: `BidiMirroring.txt` 17.0.0 is pinned in `toolchain.lock`, generated by `ucd-gen` and read by `unicode_bidi::mirrored`. Every shaper applies the mirrored glyph or the `rtlm` mask.
+- Language: `LanguageSpan` / `Source::with_languages` (OpenType LangSys); `Item` carries a language, and a language change starts a new item.
+- Script_Extensions: the rule is stated. `ScriptExtensions.txt` is not pinned, and the milestone records why.
+- Stage 9: `stages::reshape` shapes each piece of a split run once, as new text, and `reorder` takes its result.
+- `break_lines` bugs found on the way were fixed: a mandatory break on the last line, a lost opportunity, a break inside a grapheme, and two quadratic loops.
+- The corpus paragraphs run through every stage with a real face; 13 mutations were each caught.
+
+**Finding 5 - `locl` never applied, and out-of-profile scripts shaped instead of refused (Medium): ACCEPTED.**
+In `src/user/libs/text/font-shape`:
+- `locl` sits beside `ccmp` in every shaper.
+- `profile_script` refuses an unprofiled script with `Unsupported::TextScript(name)`. Common, Inherited and Unknown are never refused.
+- Adlam and Mandaic are no longer routed to the cursive shaper, and Bopomofo maps to `bopo`.
+- Watched failing.
+
+**Finding 6 - the Indic shaper applies positional features to the whole run and never moves the reph (Medium): ACCEPTED.**
+- A new `font-shape/src/indic.rs` plans each syllable:
+  - the reph only where the face's `rphf` forms one;
+  - the base found by probing `blwf`/`vatu`/`pstf`/`pref`;
+  - masks for `rphf`/`half`/`blwf`/`abvf`/`pstf`/`pref`, with ZWJ/ZWNJ honoured.
+- GSUB runs in two stages with final reordering: the reph moves after the main, after the sub, or to the end, depending on the script, and `pref` goes before the base.
+- `abvm`/`blwm`/`dist` apply to Indic, Khmer, Myanmar and Hangul, and `kern` to cursive scripts.
+- Corpus: the complex face gained a Devanagari `abvm` lookup. The reph case now expects `[dv.ka@6, dv.repha@0 (-230,-20)]`, after its base, and two new cases pin where `half` and `rphf` must not apply.
+- 20 mutations were each caught.
+
+**Finding 7 - the guest gate draws one Latin string of boxes (Medium): ACCEPTED.**
+The guest test now shapes, compares and draws the authored complex-script corpus as well as the Latin run.
+- Six corpus cases and one paragraph:
+  - Arabic: the four joining forms, and lam-alef;
+  - Devanagari: the pre-base vowel, and the reph;
+  - Thai: sara am, and the tone mark;
+  - the paragraph "a left-to-right paragraph with a right-to-left run", through every pipeline stage.
+- The faces reach the guest without being staged in an image.
+  - `src/kernel/test_suites/applications.rs::the_text_stack_draws_its_corpus_to_the_analytic_oracle` embeds `conformance-alpha.ttf` and `conformance-complex.ttf` with their new `.face` declarations, and writes them into the test's own copy of the volume before the catalogue starts.
+  - `textconf` reaches them through the catalogue, finding each by the SHA-256 its pin states.
+- This replaces the development-only staging the finding suggested, deliberately:
+  - the scenario volume `test.sh` boots is the shipping `volume.pkg`, so development-only faces would be missing from exactly the runs that make the three-architecture claim;
+  - factory files have no development flag.
+- `src/user/apps/tools/src/textconf.rs` is now glue around modules in `textconf/`:
+  - `raster.rs`: the old draw, oracle and compare, per target size.
+  - `latin.rs`: the old run, unchanged.
+  - `shaping.rs`: shapes each case as `text-corpus` does and compares glyph, cluster, advance and both offsets exactly; compares the produced `GlyphRun`; and draws each case at 200 px, where every pixel is exact, and at 50 px, with the frozen tolerance. It also proves in the guest that it refuses a wrong glyph, cluster, advance, offset, count or order, and a one-pixel shift.
+  - `corpus.rs`: the authored expectations, one file shared with `src/tools/text-corpus` through `#[path]`, so nothing is restated.
+  - `pins.rs`: generated by `font-gen` and held by `--check`.
+- The oracle is analytic: every corpus glyph is an axis-aligned rectangle, and the glyphs are placed from the authored expectations, not from the shaper's output.
+- Watched failing on scratch copies, each caught:
+  - a nikhahit offset of -344 instead of -345;
+  - `jeem.medi` replaced by `jeem.init`;
+  - the offset comparison removed;
+  - the raster comparison disabled;
+  - `isol` applied everywhere;
+  - a y-offset sign flipped in `font-run`;
+  - a reversed run's clusters left in logical order;
+  - bidi reordering skipped;
+  - a right-to-left run reported as left-to-right.
+- Also fixed, in `src/user/services/manifest.toml`: `text-pipeline` lacked its `font-parse` and `font-shape` providers and `font-shape` its `opentype-profile` provider, after the shaping stage of finding 4. Every image build would have failed to link.
+- Two defects this run found are recorded in the milestone as open, not hidden:
+  - In right-to-left runs, marks are drawn a whole base advance away from their anchors. The shaper measures in logical order, and `font-run` reverses without correcting. The oracle refuses a right-to-left run that carries offsets, so no case passes on it; the fix needs a decision on whether the shaper or `font-run` owns the correction.
+  - soft2d composites glyph over glyph where two glyphs share an edge pixel, and nothing frozen says which result is right. The oracle refuses such pixels, and the sizes were chosen so that none occurs.
+- Not changed: the kernel harness still hands `textconf` the catalogue's root rather than a PermissionManager grant. No PermissionManager runs in that harness; it stands in for the grant as it stands in for the supervisor.
+- Its runs on the three architectures are below.
+
+**Finding 8 - most of the catalogue item's listed gates are absent (Low): ACCEPTED - the minimum the finding names, plus the root separation.**
+- `src/tools/font-oracle/src/main.rs` now reads the staged listing whole. It refuses:
+  - a face without a declaration;
+  - a declaration without a face;
+  - anything that is not a file;
+  - more than `MAX_INSTALLED_FACES` faces.
+  Its self-test stages 64 faces (accepted) and 65, a stray file and an orphan (each refused), and was watched failing.
+- Root separation: the new `system-manifest` test `the_font_grants_resolve_to_different_serve_roots` holds the catalogue's SERVE and ADMIN serve roots and their interfaces, and PermissionManager's `FONT` to SERVE and `FONTADMIN` to ADMIN. Watched failing: with `FONTADMIN` swapped to SERVE the manifest still validates, and the test fails.
+- The two-client interleave: the test above also mints two connections from the catalogue's root as PermissionManager mints them. It sends a LIST on the first and a RESOLVE-INFO, for the face that LIST named, on the second, before reading either answer. Each answer must arrive on its own connection with its own correlation, about the right face. It runs with the test.
+- Not done, and why:
+  - A `Factory`-role consumer of the catalogue: no manifest row consumes it that way, so there is nothing to test.
+  - The RESOLVE-INTO race with a dropped hint: since the watch, the race needs the look not to run between the replacement and the resolve, which no harness can force deterministically.
+  - Retained-face Domain accounting and the "no handle across a reply" fixture: kernel-accounting work beyond the minimum the finding names.
+
+**Finding 9 - input-sized allocations on the shaping and pipeline path are infallible (Low): ACCEPTED.**
+- `font-shape` and `text-pipeline` now use fallible allocation on those paths. New errors: `font_parse::Error::Allocation`, and `text_pipeline::Error::{Allocation, Shaping, Overflow, Language}`.
+- Tests under a limiting allocator (watched: an abort before, a typed refusal now).
+- Not converted: the `unicode-bidi` storage, which `tools/unicode-conformance` shares.
+
+Also: `src/tools/text-limits/src/main.rs` had a stale reason for "shaping retries" ("nothing re-shapes a run yet"), which stage 9 made untrue. It now states that no text is shaped twice and that a missing glyph is not retried. `text-limits` passes, and so does its self-test.
+
+The milestone records the text work in its own dated entries. Host commands that pass:
+- every text crate's tests;
+- `ucd-gen --check`;
+- `font-gen --check`;
+- `text-corpus --self-test` and its 36 cases;
+- `text-limits`;
+- `font-oracle`;
+- `bootstrap.sh --verify`;
+- `unicode-conformance`.
+
+**Verification:**
+- `kernel.applications.the_text_stack_draws_its_corpus_to_the_analytic_oracle` passed on x86_64. It ran in both full suites and alone, and in it:
+  - the six corpus cases and the paragraph were shaped, compared exactly and drawn at both sizes;
+  - "two catalogue clients interleaved a LIST and a RESOLVE-INFO, each answered on its own connection" (finding 8);
+  - "the face removed from the watched directory was withdrawn with no rescan asked for" (finding 1).
+- The first full run failed in that test's watch block, and the fault was in the test: it had handed the catalogue's root to `textconf`, so the root closed when `textconf` exited and the catalogue's serve loop ended. The test now keeps its own clone of the root.
+- The watch oracle was watched failing: with `look()` disabled (`if reread && false`), the test fails with "the catalogue withdrew a face removed from its watched directory, with no rescan asked for".
+- - The same kernel test passed on aarch64 (632 s for a two-test selection) and on riscv64 (358 s), with the same lines: every case and the paragraph exact, the two clients interleaved, and the face withdrawn.
+- `host-tests`, `text-corpus`, `font-declarations`, `text-limits` and `./gen.sh --check` passed.

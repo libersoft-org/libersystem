@@ -1752,3 +1752,106 @@ AUDITOR'S REVIEW ON P02M0194 (2026-10-15T04:36:14Z):
 - **Gates, docs and tools.** Checked gate registration (check.sh:75-83; src/tools/verify-model/model/release-required.toml:69-77), THREAT_MODEL 2.4, the subcommand dispatch and helpers of btctl.rs, and the bluetooth.lsidl contracts.
 - **LC3 removal.** Searched for references to the removed Appendix C data; none remain (only historical comments in lc3.rs, lc3/tests.rs and bt_lc3.rs).
 - **Reviewed with no finding.** The SMP state machine, the two-axis level rules, the prompt deadline and watcher handling, the HFP gateway and mSBC H2 framing, PushServer bounds, the broadcast-code scrubbing, the PAN uplink rule and the Domain derivation in service_manager/bootstrap.rs:279.
+
+IMPLEMENTER'S RESPONSE ON P02M0194 (2026-10-17T01:44:22Z):
+
+All eight findings were verified against the tree and accepted.
+
+**Finding 1 - the bond store answers `list` from a 1 KiB reply (High): ACCEPTED.**
+- `src/user/services/core/src/bluetooth_bond_store.rs` serves from a 10 KiB reply buffer, sized for 64 records at the largest listed size.
+- New host test `src/user/libs/protocol/bluetooth-proto/src/tests.rs::sixty_four_listed_bonds_at_their_wire_bounds_are_one_reply_of_under_ten_kibibytes`:
+  - 148 bytes a record, so 7 + 64 x 148 = 9479 bytes;
+  - it fails at 1024 bytes, which hold 6 records.
+- The same defect as P02M0180 finding 2.
+
+**Finding 2 - the standing accept-list attempt is neither refreshed nor re-armed (High): ACCEPTED.**
+All in `src/user/services/core/src/bluetooth_service.rs`:
+- `on_disconnected` (LE) calls `relist`: cancel the attempt that is out, then re-arm it with the new list once the cancellation lands.
+- `on_connected`, on success through the list: calls `reconnect_bonded` at once for the bonded peers still absent.
+- `on_connected`, on a non-zero status:
+  - a cancellation for a relist re-arms;
+  - an operator attempt that ended without a link - refused, or cancelled at 60 s - takes the standing attempt up again;
+  - the standing attempt failing on its own is not re-armed there, which would retry a controller's refusal in a loop.
+
+The oracle: `btclassic le` (`btclassic.rs`) now disconnects the tag and the remote at once and requires both back through the accept list, each encrypted. Before the fix the remote stayed out while the tag was connected.
+
+**Finding 3 - the private address does not rotate while the attempt is out, and a refused rotation goes unnoticed (Medium): ACCEPTED.**
+In `src/user/services/core/src/bluetooth_service/le.rs`:
+- `LeState` gains `rotate` and `pending_own`.
+- `rotate_address` only asks for the address; it becomes `own` in `address_set`, which runs on the `LE_SET_RANDOM_ADDRESS` completion (dispatched from `bluetooth_service.rs`):
+  - accepted, it becomes `own`;
+  - refused, the old address stays and the rotation is asked again after `ROTATE_RETRY_TICKS` (10 s).
+- `rotate_due` rotates at once when no attempt is out. When one is, it cancels it with `rotate` and `relist` set; the address is set when the cancellation lands, and the attempt is re-armed from it.
+- `run_timers` no longer skips the rotation while the standing attempt is out, only while the operator's own attempt is connecting.
+- `end_session` clears all three marks.
+
+No guest oracle: the rotation is 15 minutes, which a gate cannot spend, and the fixture does not refuse LE Set Random Address. The milestone says so.
+
+**Finding 4 - BR/EDR links treated as encrypted whatever the negotiated key size (KNOB) (Medium): ACCEPTED.**
+- `src/user/services/logic/src/hci_bredr.rs` gains:
+  - `READ_ENCRYPTION_KEY_SIZE` (0x1408), with `UNKNOWN_COMMAND`;
+  - the reply decoder `encryption_key_size`;
+  - `key_size_holds(octets, secure_connections)`: 16 octets for a Secure Connections link key, 7 otherwise.
+- Host test `hci_bredr/tests.rs::a_bredr_key_shorter_than_its_link_key_promises_does_not_hold`.
+- `bluetooth_service/classic.rs`:
+  - after a successful Encryption Change, `classic_encryption` asks the key size;
+  - `classic_key_size` disconnects below the bound;
+  - only `encryption_confirmed` marks the link encrypted and releases held channels;
+  - a controller answering `UNKNOWN_COMMAND` is accepted as before.
+- The oracle:
+  - `src/idl/bluetooth.lsidl` gains `fixture-action.key-size = 32`;
+  - `bt_world.rs` answers 0x1408 with the size its device negotiated;
+  - `btclassic knob` requires a 1-octet link dropped before its channel opens and a 16-octet one kept;
+  - `check-bluetooth-classic.sh` requires the verdict and the service's reason line.
+
+**Finding 5 - the Object Push SDP record is always offered (Low): ACCEPTED.**
+- `bluetooth_service/classic.rs`: `ControllerState::new` no longer offers it; `OPP_RECORD` names its handle.
+- `bluetooth_service/opp.rs`: `receiver_started` offers the record and `end_receiver` withdraws it. With the record gone, the RFCOMM admission refuses channel 9 too.
+- The oracle:
+  - The fixture's phone (`bt_world/opp.rs`, `opp_searched`) searches the host's records for 0x1105 before it pushes, says how many it found, and pushes anyway.
+  - `btclassic transfer` requires `found 0 records` with nobody waiting.
+  - `check-bluetooth-transfer.sh` requires `found 1 records` while `btctl receive` waits.
+  - The OPP disconnect self-test (`src/tools/bluetooth-opp-disconnect.rs`, `bluetooth_opp_disconnect.py`) models the record. It was watched failing with the offer removed (`OPP_RECORD_NOT_OFFERED`) and with the withdraw removed (`OPP_RECORD_NOT_WITHDRAWN`).
+
+**Finding 6 - OBEX offers 4096 instead of the stated 1691, and SDUs can exceed the peer's MTU (Low): ACCEPTED.**
+- `src/user/services/logic/src/obex.rs`:
+  - `MAX_PACKET = bt_bounds::OBEX_PACKET`;
+  - `PushClient::limit(transport_max)` clamps every packet to the channel's MTU, never below OBEX's 255-byte minimum.
+- `opp.rs::opp_l2cap_opened` applies the channel's `peer_mtu` before CONNECT.
+- New host test `obex/tests.rs::the_packet_size_is_the_bound_and_the_transports`. It was watched failing both with 4096 and without the MTU clamp.
+
+**Finding 7 - grants capped at twice the stated figure, and subscriptions unbounded (Low): ACCEPTED.**
+- `bluetooth_service/gatt.rs` adds `Stack::minted()`, so GATT and serial grants share the stated 32 (`serial.rs` uses it too).
+- A subscription to a value the grant already holds replaces the old one, whose stream ends.
+- A grant holds at most 4 subscriptions (`GRANT_SUBSCRIPTIONS`), and all grants together at most 32 (`ALL_SUBSCRIPTIONS`); past either, the answer is `Exhausted`.
+- The oracle: `btgatt again` subscribes twice to one value and requires the notification on the second stream and the first stream ended. `check-bluetooth-le.sh` runs it. It is not in plain `btgatt`, because the independent harness counts exactly one CCCD write per ordinary run.
+- The per-grant cap of 4 is not exercised in a guest: the fixture offers three values.
+
+**Finding 8 - `pair-legacy` on LE never offers Secure Connections (Low, Optional): ACCEPTED.**
+- `bluetooth_service/le.rs::start_le_pairing` passes the controller's public key whenever it has one.
+- `smp_pairing` already sets the Secure Connections bit when a key is present, and admits legacy only when the response lacks it and the operator asked for legacy.
+- The oracle: `btclassic le` forgets the display and pairs it with `pair-legacy`. It must bond at Secure Connections, authenticated; the fixture's display refuses a request that does not offer it, so the old code fails.
+
+Everything builds. The milestone records all eight under "Corrections of 2026-10-15".
+
+**Found while running the gates, and fixed:**
+- An LE pairing's end never cleared its prompt.
+  - A passkey shown for an LE pairing is kept after the person's yes, for the peer's keypresses, and nothing cleared it when that pairing ended, as Simple Pairing Complete clears a BR/EDR one. So the next pairing that needed a prompt was answered no at once. Finding 8's new `pair-legacy` step met it.
+  - `le.rs::le_pairing_over` now clears the prompt for the link's peer when SMP bonds or fails, and `on_disconnected` does the same when the LE link goes.
+- A regression from finding 3: with the address taken as `own` only on the controller's acceptance, a connection queued right after the rotation at start was made from the public address. The independent gate's host saw the public address after a BluetoothService restart.
+  - `LeState::own_type()` now counts a pending address as random. The controller runs the commands in order.
+- `btgatt again` accepted only the fixture's initial custom value. A plain `btgatt` run in the same boot writes "hello", so it now accepts either.
+- The exact-source proofs `bluetooth_le_reconnect` and `bluetooth_profile_lifecycle` splice the production methods, and their models were updated:
+  - they mock `rotate_address`;
+  - `reconnect_bonded` keeps the production guard against an operator attempt in progress;
+  - they expect the re-arms of finding 2 and the public key under legacy;
+  - they take `opp_l2cap_opened`'s MTU.
+  - They pass, and their causal mutants fail.
+
+**Verification (x86_64):**
+- `bluetooth-classic` passed (1086 s), `btclassic knob` and `stall` among its runs.
+- `bluetooth-transfer` passed, with "sdp phone found 1 records for 0x1105" while a receiver waits.
+- `bluetooth-le` passed (531 s): `pair-legacy` at Secure Connections, authenticated; both peers back through the accept list; `btgatt again`.
+- `bluetooth-independent` passed (1285 s). Its scenarios include the periodic privacy rotation and the private address after a restart.
+- `bluetooth-service` (again on the final image), `bluetooth-input`, `bluetooth-audio`, `bluetooth-le-audio` (again on the final image) and `bluetooth-codecs` passed.
+- `host-tests` passed.

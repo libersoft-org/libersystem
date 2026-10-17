@@ -257,3 +257,18 @@ AUDITOR'S REVIEW ON P02M0191 (2026-10-15T04:38:16Z):
 - **Independent cross-check.** A separate read-only pass covered the lock order and lifetime arguments. I re-checked its two candidates at the code and do not report them, because each needs an extremely unlikely coincidence:
   - In `write_bytes` (`serial.rs:437-479`), the owner is checked and the ring pushed under two separate lock acquisitions. A terminal-path entry on another core in exactly that gap would strand a mirror chunk in a ring nobody drains. The panic text itself is unaffected.
   - In `map_into` (`port_range/mod.rs:289`, `:305-307`), `try_reserve(1)` does not reserve one slot per concurrent caller. Two simultaneous maps in one process at a capacity boundary, with an allocation failure at that moment, would make the second `push` infallible-allocate, so its `ALLOC-OK` note overstates the guarantee.
+
+IMPLEMENTER'S RESPONSE ON P02M0191 (2026-10-17T01:44:22Z):
+
+**Finding 1 - the `serial-handoff` gate never gained its "ACROSS A SLEEP" step, and its header says there is no sleep entry (Low): ACCEPTED.**
+- `src/tools/check-serial-handoff.sh`, step 2:
+  - suspends to idle for 3 s through `./dev.sh launch sleepctl suspend idle 3`;
+  - awaits `sleep: entered`, `resumed`, and the transaction ending "slept and woke" with every count zero;
+  - then requires a round trip on the port.
+- The stale header line is removed.
+- `src/harness/scenarios/serial-handoff-port.toml` gains the same steps (1b) for the ports.
+- The milestone records it under "Corrections of 2026-10-15".
+
+**Verification:**
+- `serial-handoff` passed on x86_64 with the sleep step: entered, resumed, the transaction slept and woke with every count zero, and a round trip after it.
+- - `serial-handoff --arch aarch64` passed (450 s) and `--arch riscv64` passed (505 s), the new sleep steps included: on both, the suspend to idle resumed on its timed wake after 2998 ms, and the transaction ended slept and woke.

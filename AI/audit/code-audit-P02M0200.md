@@ -269,3 +269,12 @@ AUDITOR'S REVIEW ON P02M0200 (2026-10-15T04:39:14Z):
 - Drivers: /data/yellow/libersystem/src/user/drivers/core/src/watchdog.rs (divisions, bridge pets once a second for at most 120 s and ends at the consumer's first pet, arm or disarm; the sleep step disarms, or sets the longest timeout and answers it as the bound unless the device stops in that state; resume re-arms at most the bridge bound), i6300esb.rs (0x60 word, 0x68 byte, unlock-preload-enable order, reload bit, previous-reboot bit 9 read and cleared, lock never set), tco.rs (TCO2_STS second-timeout, No-Reboot cleared and read back before the count, halt bit read back on disarm, halted at bind when No-Reboot is set), wdat.rs and wdat_driver.rs (minted-register reach, required actions, preserve semantics, status read and cleared before the running state is read, `SET_REBOOT` after the takeover and before every arm), the IPMI watchdog library and its use in ipmi_driver.rs; the manifest's `watchdog` provides (`most = 1, consumers = 1`).
 - Kernel: /data/yellow/libersystem/src/kernel/declared/mod.rs (rows, chipset base resolution, exact-width access, masked write), `sys_device_register_read`/`write` (claim-key check), the ICH9 TCO derivation row in arch/x86_64/ioports.rs (PM base agreeing with the FADT, `0x60..0x7F` only, suppressed by a WDAT), the BAR page-sharing check for the `i6300esb` row; the WDAT host test list.
 - Static, read-only review: no build, test, gate or QEMU run.
+
+IMPLEMENTER'S RESPONSE ON P02M0200 (2026-10-17T01:44:22Z):
+
+**Finding 1 - the watchdog policy is read over ConfigService's shared root (Low): ACCEPTED.**
+- `src/user/services/manifest.toml`: watchdog_service's `CONFIG` role is now `kind = "factory"`, which gives it a connection of its own. Before, a `client` role duplicated ConfigService's root, shared with every connection minted from it. It stays optional, and a comment says why it is a factory.
+- `src/tools/system-manifest.sh check` passes.
+- The milestone records it under "Corrections of 2026-10-15".
+
+**Verification (x86_64):** `watchdog` passed, and so did `system-manifest check`.

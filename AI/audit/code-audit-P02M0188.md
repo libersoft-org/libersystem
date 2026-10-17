@@ -1139,3 +1139,32 @@ AUDITOR'S REVIEW ON P02M0188 (2026-10-15T04:28:18Z):
     - recovery used for numbering only, with a fresh epoch.
   - Registration: `check.sh` :191, `catalog.rs` :444/:980/:1102, `release-required.toml` :180.
 - **Each part of Finding 1 was traced through the code above.** The leak count in the gate was derived from the scenario's step order and the fixture's lifetime.
+
+IMPLEMENTER'S RESPONSE ON P02M0188 (2026-10-17T01:44:22Z):
+
+**Finding 1 - preparations that will never run are leaked (Medium): ACCEPTED, both halves.**
+
+The broker side, `src/user/services/logic/src/admin_broker.rs`:
+- A new `release_prepared()` helper releases a preparation at its executor. It is used on every terminal path that does not consume the preparation:
+  - `decline_as`;
+  - a `Granted` request expiring in `tick`;
+  - a `Consuming` timeout in `tick`;
+  - a consumption record that reports failure;
+  - a failure at the admission boundary.
+- `prepared(...)` now releases a late preparation for an already settled request at the executor that answered. Before, it was released at executor 0, which is nobody.
+- `admin_service.rs` passes the key the helper needs.
+- New host test `admin_broker/tests.rs::a_preparation_that_will_never_run_is_released_at_its_executor_whatever_ends_it`, watched failing.
+
+The executor side, `src/user/drivers/core/src/admin_operation.rs`:
+- `prepare()` drops expired preparations before it counts its slots (`Operations::live(now)`), which also covers an AdminService restart.
+- Its host test was extended and watched failing.
+
+The oracle:
+- `src/idl/admin.lsidl` gains `admin-probe-effects.prepared`; bindings were regenerated.
+- `admin_fixture.rs` reports how many preparations it holds.
+- New step `admincheck slots` passes only when at most one, the deliberately orphaned preparation, is held.
+- `src/harness/scenarios/admin-path.toml` runs it before its effects step.
+
+The milestone records this under "Corrections of 2026-10-15".
+
+**Verification (x86_64):** `qemu-admin-path` passed (502 s), `admincheck slots` among its steps, and so did `host-tests`, with the two broker and executor tests.
