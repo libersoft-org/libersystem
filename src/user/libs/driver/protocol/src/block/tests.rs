@@ -163,6 +163,7 @@ fn a_capacity_reply_names_its_device_and_an_older_or_failed_one_names_nothing() 
 		DeviceClass::VirtioScsi,
 		DeviceClass::UsbMassStorage,
 		DeviceClass::UsbAttachedScsi,
+		DeviceClass::PersistentMemory,
 	] {
 		assert_eq!(DeviceClass::from_wire(class as u32), class, "{} round-trips", class.name());
 	}

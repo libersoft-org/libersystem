@@ -14,6 +14,8 @@ liber/camera_device/v1.abi
 liber/camera_device/v1.md
 liber/config/v1.abi
 liber/config/v1.md
+liber/crypto_device/v1.abi
+liber/crypto_device/v1.md
 liber/device/v1.abi
 liber/device/v1.md
 liber/display/v1.abi
@@ -62,6 +64,8 @@ liber/security/v1.abi
 liber/security/v1.md
 liber/session/v1.abi
 liber/session/v1.md
+liber/share_device/v1.abi
+liber/share_device/v1.md
 liber/smartcard/v1.abi
 liber/smartcard/v1.md
 liber/spool/v1.abi

@@ -41,6 +41,9 @@ extern crate alloc;
 /// General-purpose events: the kernel's state machine over the FADT's GPE blocks.
 pub mod gpe;
 
+/// The NVDIMM Firmware Interface Table: persistent-memory ranges, the modules behind them and their state.
+pub mod nfit;
+
 /// Why a table, or a structure inside one, was refused.
 ///
 /// ONE ERROR TYPE FOR THE CRATE, and each variant names a DIFFERENT way a real table is wrong -

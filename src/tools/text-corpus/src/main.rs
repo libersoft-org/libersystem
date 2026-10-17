@@ -232,6 +232,10 @@ fn run_case(bytes: &[u8], pinned: &Pinned, case: &Case<'_>) -> Result<(), String
 		if position.x_offset != expect.x_offset || position.y_offset != expect.y_offset {
 			return Err(format!("glyph {index} ({}) sits at ({}, {}) where the corpus declares ({}, {})", expect.glyph, position.x_offset, position.y_offset, expect.x_offset, expect.y_offset));
 		}
+		// WHAT A MARK IS ATTACHED TO, which is what a right-to-left run is placed from once reversed.
+		if info.attached_to != expect.base {
+			return Err(format!("glyph {index} ({}) is attached to {:?} where the corpus declares {:?}", expect.glyph, info.attached_to, expect.base));
+		}
 	}
 	Ok(())
 }
@@ -434,7 +438,7 @@ fn self_check(directory: &Path, pins: &BTreeMap<String, Pinned>) -> Result<(), S
 	// below is a copy of a real one with its first glyph's advance moved by one unit.
 	let case = corpus::CASES.first().ok_or_else(|| "no cases".to_string())?;
 	let real = case.expect.first().ok_or_else(|| "a case with no expectations".to_string())?;
-	let broken_expect = [Expect { glyph: real.glyph, cluster: real.cluster, x_advance: real.x_advance + 1, x_offset: real.x_offset, y_offset: real.y_offset }];
+	let broken_expect = [Expect { glyph: real.glyph, cluster: real.cluster, x_advance: real.x_advance + 1, x_offset: real.x_offset, y_offset: real.y_offset, base: real.base }];
 	let broken = Case { name: "a deliberately wrong advance", face: case.face, text: case.text, expect: &broken_expect };
 	let face_bytes = std::fs::read(directory.join(case.face)).map_err(|error| format!("{} could not be read: {error}", case.face))?;
 	let face_pins = pins.get(case.face).ok_or_else(|| format!("{} is not pinned", case.face))?;
@@ -444,11 +448,23 @@ fn self_check(directory: &Path, pins: &BTreeMap<String, Pinned>) -> Result<(), S
 	}
 
 	// A GLYPH NAME THE FACE DOES NOT DECLARE, which is what a renamed or deleted glyph looks like.
-	let absent_expect = [Expect { glyph: "no.such.glyph", cluster: real.cluster, x_advance: real.x_advance, x_offset: real.x_offset, y_offset: real.y_offset }];
+	let absent_expect = [Expect { glyph: "no.such.glyph", cluster: real.cluster, x_advance: real.x_advance, x_offset: real.x_offset, y_offset: real.y_offset, base: real.base }];
 	let absent = Case { name: "a glyph nothing declares", face: case.face, text: case.text, expect: &absent_expect };
 	match run_case(&face_bytes, face_pins, &absent) {
 		Ok(()) => return Err("a case naming a glyph the face does not declare was accepted".to_string()),
 		Err(problem) => println!("text-corpus: an undeclared glyph name is refused: {problem}"),
+	}
+
+	// A MARK DECLARED ON THE WRONG GLYPH, which is what a right-to-left run is placed from once it is
+	// reversed: the Hebrew dagesh said to hang from itself rather than from the alef.
+	let marked = corpus::CASES.iter().find(|case| case.expect.iter().any(|expect| expect.base.is_some())).ok_or_else(|| "no case attaches a mark".to_string())?;
+	let wrong: std::vec::Vec<Expect> = marked.expect.iter().enumerate().map(|(index, expect)| Expect { glyph: expect.glyph, cluster: expect.cluster, x_advance: expect.x_advance, x_offset: expect.x_offset, y_offset: expect.y_offset, base: expect.base.map(|_| index as u16) }).collect();
+	let misattached = Case { name: "a mark on the wrong glyph", face: marked.face, text: marked.text, expect: &wrong };
+	let marked_bytes = std::fs::read(directory.join(marked.face)).map_err(|error| format!("{} could not be read: {error}", marked.face))?;
+	let marked_pins = pins.get(marked.face).ok_or_else(|| format!("{} is not pinned", marked.face))?;
+	match run_case(&marked_bytes, marked_pins, &misattached) {
+		Ok(()) => return Err("a mark declared on the wrong glyph was accepted".to_string()),
+		Err(problem) => println!("text-corpus: a mark on the wrong glyph is refused: {problem}"),
 	}
 
 	// AND A PARAGRAPH WHOSE VISUAL ORDER IS WRONG, and one whose line carries a glyph it was not
@@ -474,6 +490,6 @@ fn self_check(directory: &Path, pins: &BTreeMap<String, Pinned>) -> Result<(), S
 		Err(problem) => println!("text-corpus: a line's wrong glyphs are refused: {problem}"),
 	}
 
-	println!("text-corpus: the gate refuses a corrupted face, a wrong position, an undeclared glyph, a wrong order and a wrong line");
+	println!("text-corpus: the gate refuses a corrupted face, a wrong position, an undeclared glyph, a mark on the wrong glyph, a wrong order and a wrong line");
 	Ok(())
 }

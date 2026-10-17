@@ -1283,6 +1283,77 @@ qemu_attach_xhci() {
 # multiport driver can host the same protocol on a named port unchanged.
 DEV_CHANNEL_PCI_SLOT="0x1e"
 
+# A DIRECTORY OF THE HOST, for a development machine that asks for one (x86_64).
+#
+# `VIRTIOFS_SOCKET` names the vhost-user socket of a `virtiofsd` the caller started over that directory - read-only,
+# without extended attributes - and the machine gets a `vhost-user-fs-pci` device tagged `host`, which only a
+# development image's virtio-fs driver binds. Nothing here starts the daemon or picks the directory: an ambient share
+# is exactly what this must never be, so a machine has one only when the run that wants it says so. vhost-user shares
+# the guest's memory with the daemon, so the machine's memory is a shared memfd - the backend the I2C fixture takes
+# too, and one of them is enough.
+#
+# AND ON A MACHINE WITHOUT THE IOMMU (`IOMMU=0`), refused otherwise. Behind the controller the driver hands the device
+# addresses its domain translates, which the device can only follow through the backend's IOTLB - and `virtiofsd`
+# offers none, so QEMU refuses `iommu_platform=on` for it ("not supported by the device"), and without it the device
+# would write to what those addresses name untranslated. A share is a development machine's, and the IOMMU is not what
+# it is there to exercise.
+qemu_attach_host_share() {
+	local -n share_into=$1
+	local iommu="$2"
+	local mem="$3"
+	[[ -n "${VIRTIOFS_SOCKET:-}" ]] || return 0
+	if [[ ! -S "$VIRTIOFS_SOCKET" ]]; then
+		echo "qemu-run: VIRTIOFS_SOCKET=$VIRTIOFS_SOCKET is not a socket - the run that asks for a share starts virtiofsd on it" >&2
+		exit 2
+	fi
+	if [[ -z "${I2C_FIXTURE:-}" ]]; then
+		share_into+=(-object "memory-backend-memfd,id=liberfixture,size=$mem,share=on" -machine "memory-backend=liberfixture")
+	fi
+	if [[ "$iommu" == "1" ]]; then
+		echo "qemu-run: a host share needs a machine without the IOMMU (IOMMU=0) - virtiofsd offers no IOTLB, so the device cannot sit behind the controller" >&2
+		exit 2
+	fi
+	share_into+=(-chardev "socket,id=hostshare,path=$VIRTIOFS_SOCKET" -device "vhost-user-fs-pci,chardev=hostshare,tag=host")
+	echo "qemu-run: a host share on $VIRTIOFS_SOCKET, tagged host" >&2
+}
+
+# THE PERSISTENT-MEMORY MODULES THE NVDIMM SUITE READS (x86_64 test machines).
+#
+# Two 16 MiB `nvdimm` modules, the second not armed, on a machine that names the memory controller as its persistence
+# domain - so QEMU writes an NFIT with two persistent-memory ranges, their state and the platform's capabilities. Each
+# module is a file of THIS RUN, named for its process so the reaper removes it when the run ends: nothing is kept. And
+# each carries `LIBERSYSTEM NVDIMM <slot> SECTOR <n>` at sectors 0 and 2049, written here before the boot, so the suite
+# can tell its driver read the module where the table says it lies.
+#
+# The modules sit in the machine's device-memory area above its RAM, which `slots` and `maxmem` open: a megabyte count
+# QEMU can read, and a gigabyte of room past the RAM. A size this cannot read leaves the modules out, and says so.
+qemu_attach_nvdimm() {
+	local -n nvdimm_args="$1"
+	local mem="$2" mib
+	case "$mem" in
+	[0-9]*[Gg]) mib="${mem%[Gg]}" && [[ "$mib" =~ ^[0-9]+$ ]] && mib=$((mib * 1024)) ;;
+	[0-9]*[Mm]) mib="${mem%[Mm]}" ;;
+	*) mib="$mem" ;;
+	esac
+	if [[ ! "$mib" =~ ^[0-9]+$ ]]; then
+		echo "qemu-run: memory size '$mem' is not one this runner can open a device-memory area past - no persistent-memory modules" >&2
+		return 0
+	fi
+	nvdimm_args+=(-machine "nvdimm=on,nvdimm-persistence=mem-ctrl" -m "slots=2,maxmem=$((mib + 1024))M")
+	local slot file armed
+	for slot in 0 1; do
+		file="$QEMU_BUILD_DIR/nvdimm-$slot.$$.img"
+		armed=""
+		[[ "$slot" != 1 ]] || armed=",unarmed=on"
+		rm -f "$file"
+		truncate -s 16M "$file"
+		printf 'LIBERSYSTEM NVDIMM %s SECTOR 0' "$slot" | dd of="$file" bs=512 seek=0 conv=notrunc status=none
+		printf 'LIBERSYSTEM NVDIMM %s SECTOR 2049' "$slot" | dd of="$file" bs=512 seek=2049 conv=notrunc status=none
+		nvdimm_args+=(-object "memory-backend-file,id=nvdimm-memory-$slot,share=on,mem-path=$file,size=16M")
+		nvdimm_args+=(-device "nvdimm,id=nvdimm-$slot,memdev=nvdimm-memory-$slot$armed")
+	done
+}
+
 # THE ENTROPY SOURCE THE SUITE SEEDS FROM.
 #
 # Two of this system's three architectures have no hardware random instruction, so without a device
@@ -2226,6 +2297,7 @@ qemu_run_x86_64() {
 	qemu_attach_i2c_fixture qemu_args "$iommu" "${MEM:-4G}"
 	qemu_attach_hid_table qemu_args
 	qemu_attach_acpi_fixture qemu_args
+	qemu_attach_host_share qemu_args "$iommu" "${MEM:-4G}"
 
 	# System volume disk: carries the LiberFS volume itself.
 	# The DMA test kernel enters its suite directly and reads fixtures from the boot archive.
@@ -2556,9 +2628,17 @@ qemu_run_x86_64() {
 		# AND AN `i6300esb` WATCHDOG AFTER IT, for the declared-register suite: its arming registers answer only at
 		# their exact widths, which is what that suite reaches. Nothing arms it - a test boot's watchdog policy is off
 		# - and last, it renumbers nothing.
+		#
+		# AND A `virtio-crypto` ENGINE AFTER THAT, for the crypto driver's suite: QEMU's built-in backend does AES in the
+		# host process, which is the engine a virtual machine is offered. Last again, so it renumbers nothing.
+		#
+		# AND TWO PERSISTENT-MEMORY MODULES, for the NVDIMM driver's suite - memory devices on no bus, so they renumber
+		# nothing either; see `qemu_attach_nvdimm`.
 		if [[ "$dma_fixture" != "1" ]]; then
 			qemu_args+=(-device edu,dma_mask=0xffffffffffffffff)
 			qemu_args+=(-device i6300esb)
+			qemu_args+=(-object cryptodev-backend-builtin,id=cryptoengine -device "virtio-crypto-pci,cryptodev=cryptoengine,${virtio_opts:-disable-legacy=on}")
+			qemu_attach_nvdimm qemu_args "${MEM:-4G}"
 		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start

@@ -99,6 +99,7 @@ pub fn produce(request: &Request<'_>, buffer: &Buffer) -> Result<Run, Error> {
 	let forms = Forms::of(request.face)?;
 	let carets = Carets::of(request.face)?;
 	let reversed = matches!(request.direction, Direction::RightToLeft | Direction::BottomToTop);
+	let x_offsets = drawn_x_offsets(buffer, request.direction)?;
 
 	// THE GLYPHS, IN VISUAL ORDER.
 	// FALLIBLE, because the size comes from input. Infallible allocation in userspace ends the
@@ -108,7 +109,8 @@ pub fn produce(request: &Request<'_>, buffer: &Buffer) -> Result<Run, Error> {
 	for visual in 0..buffer.len() {
 		let logical = if reversed { buffer.len() - 1 - visual } else { visual };
 		let info = buffer.infos[logical];
-		let position = buffer.positions[logical];
+		let mut position = buffer.positions[logical];
+		position.x_offset = x_offsets[logical];
 		let (kind, selection) = forms.kind_of(info.glyph, size_pixels)?;
 		glyphs.push(positioned(info.glyph, position, units_per_em, request.size, kind, selection)?);
 	}
@@ -181,6 +183,35 @@ pub fn produce(request: &Request<'_>, buffer: &Buffer) -> Result<Run, Error> {
 		return Err(Error::InconsistentMapping);
 	}
 	Ok(run)
+}
+
+/// EVERY GLYPH'S HORIZONTAL OFFSET FOR THE ORDER IT IS DRAWN IN, in font units, by logical index.
+///
+/// A MARK OF A RIGHT-TO-LEFT RUN WAS PLACED FOR THE OTHER ORDER. The shaper places an attached mark in
+/// logical order: the base's anchor less the mark's, less everything the pen advanced from the base up
+/// to the mark, the base included - which is right while the base is drawn before the mark. Reversed
+/// for drawing, the mark comes BEFORE its base: the pen has made none of that advance, and has instead
+/// still to cross everything after the base up to the mark, the mark included. Left as it was, the
+/// offset puts the mark a whole base away from its anchor - a dagesh drawn off its letter. The change
+/// is exactly the difference of the pen between the two orders, and it is made here because this is
+/// where the order changes: the shaper's rules are all written about the order the text was typed.
+fn drawn_x_offsets(buffer: &Buffer, direction: Direction) -> Result<Vec<i32>, Error> {
+	let mut offsets = Vec::new();
+	offsets.try_reserve_exact(buffer.len()).map_err(|_| Error::Allocation)?;
+	for at in 0..buffer.len() {
+		let mut offset = i64::from(buffer.positions[at].x_offset);
+		if direction == Direction::RightToLeft
+			&& let Some(base) = buffer.infos[at].attached_to.map(usize::from)
+			&& base < at
+		{
+			let advance = |range: core::ops::Range<usize>| buffer.positions[range].iter().map(|position| i64::from(position.x_advance)).sum::<i64>();
+			// Logically the pen crossed the base and what follows it before the mark; drawn, it crosses
+			// what follows the base and the mark itself before it reaches the base.
+			offset += advance(base..at) + advance(base + 1..at + 1);
+		}
+		offsets.push(i32::try_from(offset).map_err(|_| font_contract::Overflow::Sum)?);
+	}
+	Ok(offsets)
 }
 
 /// One glyph, converted across the one line between font units and the seam.

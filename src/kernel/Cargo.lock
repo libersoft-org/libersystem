@@ -127,6 +127,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "deflate"
 version = "0.0.0"
 dependencies = [
@@ -329,6 +337,7 @@ dependencies = [
  "buddy",
  "camera-device-proto",
  "camera-proto",
+ "crypto-device-proto",
  "device-proto",
  "display-device-proto",
  "display-proto",

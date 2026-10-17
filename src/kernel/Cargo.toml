@@ -113,6 +113,8 @@ input-proto = { path = "../user/libs/protocol/input-proto" }
 # I2C one through the contract's own client side, `hid-i2c`'s bus over an address-scoped connection and the
 # SMBus client - so a harness that drifted from either fails to compile rather than passing on its own copy.
 i2c-device-proto = { path = "../user/libs/protocol/i2c-device-proto" }
+# And the cipher engine's contract, for the virtio-crypto oracle: it drives the driver through the generated client.
+crypto-device-proto = { path = "../user/libs/protocol/crypto-device-proto" }
 gpio-device-proto = { path = "../user/libs/protocol/gpio-device-proto" }
 i2c-client = { path = "../user/libs/driver/i2c-client" }
 hid-i2c = { path = "../user/libs/driver/hid-i2c" }

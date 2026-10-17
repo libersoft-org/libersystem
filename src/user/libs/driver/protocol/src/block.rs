@@ -74,6 +74,7 @@ pub enum DeviceClass {
 	VirtioScsi = 5,
 	UsbMassStorage = 6,
 	UsbAttachedScsi = 7,
+	PersistentMemory = 8,
 }
 
 impl DeviceClass {
@@ -86,6 +87,7 @@ impl DeviceClass {
 			5 => DeviceClass::VirtioScsi,
 			6 => DeviceClass::UsbMassStorage,
 			7 => DeviceClass::UsbAttachedScsi,
+			8 => DeviceClass::PersistentMemory,
 			_ => DeviceClass::Unnamed,
 		}
 	}
@@ -101,6 +103,7 @@ impl DeviceClass {
 			DeviceClass::VirtioScsi => "virtio-scsi",
 			DeviceClass::UsbMassStorage => "usb-storage",
 			DeviceClass::UsbAttachedScsi => "usb-uas",
+			DeviceClass::PersistentMemory => "pmem",
 		}
 	}
 }

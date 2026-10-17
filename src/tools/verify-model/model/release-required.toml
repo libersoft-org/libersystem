@@ -130,6 +130,7 @@ keys = [
 	"gate.guest-verdict / host / host / default",
 	"gate.hibernate / host / host / default",
 	"gate.hibernate-ports / host / host / default",
+	"gate.host-share / host / host / default",
 	"gate.host-tests / host / host / default",
 	"gate.i2c-backend / host / host / default",
 	"gate.i2c-bus / host / host / default",

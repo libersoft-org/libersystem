@@ -170,7 +170,7 @@ fn scripts(catalogue: u64) -> Result<String, String> {
 			shaping::refuses_the_wrong_answer(face, case, &buffer)?;
 			let script = shaping::script_of(case.text)?;
 			say(&format!("shaped '{name}' ({}) -> {} glyph(s) exactly as authored, and a wrong glyph, cluster, advance, offset or count is refused", core::str::from_utf8(&script).unwrap_or("?"), buffer.len()));
-			for (size, exact) in [(shaping::ALIGNED_SIZE, true), (shaping::FRACTIONAL_SIZE, false)] {
+			for (size, exact) in [(shaping::ALIGNED_SIZE, true), (shaping::FRACTIONAL_SIZE, false), (shaping::SHARED_SIZE, false)] {
 				let report = shaping::draw_case(face, case, &buffer, size, exact, &mut refusals_only).map_err(|problem| format!("at {size} px: {problem}"))?;
 				say(&format!("drawn '{name}' at {size} px: {report}"));
 			}
@@ -193,7 +193,7 @@ fn scripts(catalogue: u64) -> Result<String, String> {
 			shaping::compare_paragraph(face, paragraph, &visual)?;
 			shaping::paragraph_refuses_the_wrong_answer(face, paragraph, &visual)?;
 			say(&format!("laid out '{name}' -> level {}, {} line(s) in the authored order with the authored glyphs, and a reversed order or a line's wrong glyphs is refused", paragraph.paragraph_level, visual.order.len()));
-			for (size, exact) in [(shaping::ALIGNED_SIZE, true), (shaping::FRACTIONAL_SIZE, false)] {
+			for (size, exact) in [(shaping::ALIGNED_SIZE, true), (shaping::FRACTIONAL_SIZE, false), (shaping::SHARED_SIZE, false)] {
 				let report = shaping::draw_paragraph(face, paragraph, &visual, size, exact, &mut refusals_only).map_err(|problem| format!("at {size} px: {problem}"))?;
 				say(&format!("drawn '{name}' at {size} px: {report}"));
 			}

@@ -235,6 +235,10 @@ pub enum ProviderKindName {
 	Backlight,
 	/// An ambient-light sensor, with the brightness policy its one consumer.
 	AmbientLight,
+	/// A symmetric cipher engine. Nothing in the system routes its own cryptography through it.
+	Crypto,
+	/// A directory of the host on a development machine, with StorageService its one consumer.
+	HostShare,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -293,6 +297,8 @@ impl ProviderKindName {
 			ProviderKindName::CoolingDevice => 30,
 			ProviderKindName::Backlight => 31,
 			ProviderKindName::AmbientLight => 32,
+			ProviderKindName::Crypto => 33,
+			ProviderKindName::HostShare => 34,
 		}
 	}
 }

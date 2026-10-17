@@ -1,0 +1,84 @@
+//! LiberSystem host share - the contract a `host-share` provider serves: a directory of the HOST, reached over
+//! virtio-fs, for a DEVELOPMENT machine only.
+//!
+//! IT IS NEVER A VOLUME BY ITSELF AND NEVER ANYBODY'S BUT STORAGESERVICE'S. The one consumer is StorageService, which
+//! mounts a share behind its own capability-scoped volume API only on a development build, and only when the machine
+//! was started with the share - so a process reaches a host directory exactly as it reaches any volume: through a
+//! grant for it, or not at all. The system volume, packages and staging never come from here.
+//!
+//! READ-ONLY, BY NODE, AND IN THIS SYSTEM'S TERMS. A node is known by a handle this contract hands out, never by the
+//! host's node id; an attribute crosses as its kind, size, permission bits and modification time, never the host's
+//! inode, device, owner or group. A name is held to the rules a volume's name keeps - no separator, no NUL, not `.`
+//! or `..`, at most 255 bytes - in both directions: one that breaks them is refused as asked and dropped as answered.
+//! Symbolic links, devices, sockets and pipes are listed as `other` and never opened or followed.
+
+package liber:share-device@1;
+
+use liber:base@1.{error};
+
+/// What a node is.
+enum share-kind {
+	file,
+	directory,
+	/// A symbolic link, a device, a socket or a pipe: listed, never opened or followed.
+	other,
+}
+
+/// One node, by the handle this connection knows it by.
+record share-node {
+	/// Zero is never a node; the root is always 1.
+	handle:      u32,
+	kind:        share-kind,
+	size:        u64,
+	/// The permission bits, `0o7777` at most.
+	permissions: u16,
+	/// When it was last written, in seconds since 1970.
+	modified:    u64,
+}
+
+/// The share, as the machine names it.
+record share-info {
+	/// The device's tag: the name the machine was started with it under.
+	@bound(36) tag: string,
+	/// The most bytes one `read` answers.
+	max-read:       u32,
+	/// How many nodes may be held at once.
+	max-nodes:      u32,
+}
+
+/// One entry of a directory.
+record share-entry {
+	@bound(255) name: string,
+	kind:             share-kind,
+}
+
+/// One page of a directory's entries, and where the next one starts.
+record share-listing {
+	@bound(64) entries: list<share-entry>,
+	/// The cursor for the next page; meaningless once `done`.
+	next:               u64,
+	done:               bool,
+}
+
+/// What one `read` answered: at most `max-read` bytes, fewer at the end of the file.
+record share-data {
+	@bound(32768) bytes: list<u8>,
+}
+
+/// THE CONTRACT a `host-share` publication serves on each connection.
+interface share-device {
+	/// The share's tag and the bounds.
+	@op(1) describe:   func() -> result<share-info, error>;
+	/// The share's root directory, handle 1.
+	@op(2) root:       func() -> result<share-node, error>;
+	/// The entry `name` of the directory `dir`, as a node this connection holds until it forgets it.
+	@op(3) lookup:     func(dir: u32, @bound(255) name: string) -> result<share-node, error>;
+	/// A held node's attributes, read again.
+	@op(4) attributes: func(node: u32) -> result<share-node, error>;
+	/// One page of a directory's entries from `cursor` (zero for the first).
+	@op(5) list:       func(dir: u32, cursor: u64) -> result<share-listing, error>;
+	/// Bytes of a file from `offset`.
+	@op(6) read:       func(node: u32, offset: u64, length: u32) -> result<share-data, error>;
+	/// A held node let go; the root is never let go.
+	@op(7) forget:     func(node: u32) -> result<unit, error>;
+}

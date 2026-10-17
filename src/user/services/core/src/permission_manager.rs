@@ -91,6 +91,10 @@ const CAT_NAME: &[u8] = b"cat";
 // interface state and renders it to the caller's stdout.
 const IP_NAME: &[u8] = b"ip";
 const GRANT_RIGHTS: u32 = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER;
+// THE HOST SHARE'S TWO TAGS: the instance's client this manager is handed, and the grant a launch receives - both
+// here and not in the runtime, since this manager and `share` are the only two programs that ever name them.
+const CAP_STORAGE_HOST: &[u8] = b"STORAGE_HOST";
+const CAP_HOST_SHARE: &[u8] = b"HOST_SHARE";
 
 // A system tool launched through `run` receives, before its manifest grants, its launch
 // endpoints as a named run (the caller's console, so its `print` output renders on the launching
@@ -135,7 +139,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 61] = [
+const VOCABULARY: [Capability; 62] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -254,6 +258,8 @@ const VOCABULARY: [Capability; 61] = [
 	// AN APPLICATION'S SERIAL PORT, minted per launch from BluetoothService's admin root for one aliased peer. Read by
 	// tag.
 	Capability::BluetoothSerial,
+	// THE HOST SHARE, a fresh client of `vol://host` per launch - never in the `volumes` bundle. Read by tag.
+	Capability::HostShare,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -415,6 +421,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"btgatt" => Some(granted("btgatt", alloc::vec![Capability::BluetoothGatt])),
 		// THE BR/EDR GATE'S APPLICATION, development-only: one serial port, on the peer aliased `serial-1`, and nothing else.
 		b"btserial" => Some(granted("btserial", alloc::vec![Capability::BluetoothSerial])),
+		// THE HOST SHARE'S ONE READER, development-only: `vol://host` and nothing else - not the volumes, so what it reads
+		// it can only print, and nothing that holds the volumes reaches the host.
+		b"share" => Some(granted("share", alloc::vec![Capability::HostShare])),
 		// THE BR/EDR GATE'S PROBE, development-only: both Bluetooth authorities, since it is the prompt watcher a
 		// person would be, the fixture's control endpoint, through which the devices on the far side act, and the audio
 		// a music player and a call would hold.
@@ -699,6 +708,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::AudioControl => CAP_AUDIO_CONTROL,
 		Capability::AudioVoice => b"AUDIO_VOICE",
 		Capability::BluetoothSerial => b"BTSERIAL",
+		Capability::HostShare => CAP_HOST_SHARE,
 	}
 }
 
@@ -748,6 +758,8 @@ struct Clients {
 	// under their own tags so the receiver's fixed order stays aligned.
 	storage_ram: u64,
 	storage_tmp: u64,
+	// The host share's instance, on a development machine; zero where none was started.
+	storage_host: u64,
 	display_admin: u64,
 	input_admin: u64,
 	audio_admin: u64,
@@ -880,6 +892,8 @@ impl Clients {
 			Capability::BrightnessControl => self.brightness_control,
 			// Minted per launch through BluetoothService's admin root: see `grant_for_task`.
 			Capability::BluetoothGatt | Capability::BluetoothSerial => 0,
+			// Minted per launch from the host share's instance: see `grant_handle`.
+			Capability::HostShare => 0,
 			Capability::AudioControl => self.audio_control,
 		}
 	}
@@ -1402,6 +1416,21 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		let dup = duplicate(minted, GRANT_RIGHTS);
 		close(minted);
 		return if dup >= 0 { dup as u64 } else { 0 };
+	}
+	// THE HOST SHARE: a fresh client of `vol://host` per launch, minted as `grant_volumes` mints the bundle's - and held
+	// apart from that bundle, so a tool granted the volumes never reaches the host.
+	if cap == Capability::HostShare {
+		if clients.storage_host == 0 {
+			return 0;
+		}
+		return match volume::Client::new(ChannelTransport { chan: clients.storage_host }).connect() {
+			Some(Ok(fresh)) => {
+				let dup: i64 = duplicate(fresh, GRANT_RIGHTS);
+				close(fresh);
+				if dup >= 0 { dup as u64 } else { 0 }
+			}
+			_ => 0,
+		};
 	}
 	if cap == Capability::Usb {
 		clients.usb_providers.poll();
@@ -2149,6 +2178,9 @@ fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], e
 				handle != 0 && hand_over(manager_side, tag_for(cap), handle)
 			};
 			if !ok {
+				// SAID, because a launch refused for a grant that could not be minted was otherwise silence: the
+				// caller saw no program and no reason.
+				print(alloc::format!("PermissionManager: {policy_name}: the {cap:?} grant could not be minted - the launch is refused\n").as_bytes());
 				transaction.abandon(Fault::Refused);
 				return Err(Error::NotFound);
 			}
@@ -2760,6 +2792,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let storage_usb: u64 = caps.take(CAP_STORAGE_USB);
 	let storage_ram: u64 = caps.take(CAP_STORAGE_RAM);
 	let storage_tmp: u64 = caps.take(CAP_STORAGE_TMP);
+	let storage_host: u64 = caps.take(CAP_STORAGE_HOST);
 	// The supervisor-status channel the manager grants to the governed `lssvc` command
 	// (whose manifest grants services): a dedicated ServiceManager status channel, separate
 	// from SystemGraphService's, the manager holds but never drives itself.
@@ -2776,7 +2809,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, bt_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, sleep: 0, sleep_wake: 0, processor_power: 0, brightness: 0, brightness_control: 0, audio_control: 0, grant_detail: String::new() };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, storage_host, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, tpm_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, bt_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, bmc: 0, typec: 0, typec_control: 0, sleep: 0, sleep_wake: 0, processor_power: 0, brightness: 0, brightness_control: 0, audio_control: 0, grant_detail: String::new() };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

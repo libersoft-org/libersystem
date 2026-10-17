@@ -768,6 +768,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"audioprobe", Shape::Rest),
 	(b"btgatt", Shape::Args),
 	(b"btserial", Shape::Bare),
+	(b"share", Shape::Rest),
 	(b"hidcheck", Shape::Rest),
 	(b"powercheck", Shape::Rest),
 	(b"powerread", Shape::Rest),

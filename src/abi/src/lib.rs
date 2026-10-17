@@ -786,6 +786,11 @@ pub const VIRTIO_TYPE_VSOCK: u32 = 19;
 // harness: the controllers laptops carry have no emulation, and these are what the bus contracts are proved on.
 pub const VIRTIO_TYPE_I2C: u32 = 34;
 pub const VIRTIO_TYPE_GPIO: u32 = 41;
+// A SYMMETRIC CIPHER ENGINE the host offers. Its every key and byte are the host's to see, so it is an offload a
+// consumer may choose and never a place the system's own cryptography goes.
+pub const VIRTIO_TYPE_CRYPTO: u32 = 20;
+/// virtio-fs: a directory of the host, FUSE over virtqueues - driven on a development machine only.
+pub const VIRTIO_TYPE_FS: u32 = 26;
 
 // virtio-pci modern wire format, shared by the kernel's minimal boot driver and the
 // userspace drivers so the register offsets, status bits and ring flags have one
@@ -939,6 +944,8 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_VSOCK => "virtio-vsock",
 		VIRTIO_TYPE_I2C => "virtio-i2c",
 		VIRTIO_TYPE_GPIO => "virtio-gpio",
+		VIRTIO_TYPE_CRYPTO => "virtio-crypto",
+		VIRTIO_TYPE_FS => "virtio-fs",
 		DEVICE_TYPE_XHCI => "xhci",
 		DEVICE_TYPE_NVME => "nvme",
 		DEVICE_TYPE_AHCI => "ahci",

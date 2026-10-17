@@ -1040,7 +1040,7 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 		// that root would reach it on a channel it does not know, and one end cannot be owned twice.
 		let font_root: u64 = kept.end_of(b"font_catalogue", CAP_SERVE);
 		let font_admin_root: u64 = kept.take_end_of(b"font_catalogue", CAP_ADMIN);
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", b"CATADMIN"), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, kept.end_of(b"process_service", CAP_SERVE), session_client, session1, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"host_storage", CAP_SERVE), kept.end_of(b"device_manager", b"CATADMIN"), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, kept.end_of(b"process_service", CAP_SERVE), session_client, session1, perm_client, admin_server2, stats_server2) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		let report_buf: &mut [u8] = if name == b"storage_service" { &mut system_report } else { buf };
@@ -1379,7 +1379,7 @@ pub(super) fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N]
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root: u64, font_admin_root: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, catalogue_admin_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root: u64, font_admin_root: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, host_client: u64, catalogue_admin_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	// A fresh StorageService connection for the manager (independent of the shell's),
 	// duplicable so the manager can grant a narrowed copy to a sandboxed component.
 	let storage: u64 = match service_connect(storage_client) {
@@ -1591,6 +1591,12 @@ fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root:
 	}
 	let tmp_conn: u64 = service_connect(tmp_client).unwrap_or(0);
 	if !send_blocking(manager_side, CAP_STORAGE_TMP, tmp_conn) {
+		return false;
+	}
+	// AND THE HOST SHARE'S INSTANCE, which is NOT in the bundle: the manager mints from it for the host-share capability
+	// alone. Its tag is named here and in the manager, the two programs that ever use it.
+	let host_conn: u64 = service_connect(host_client).unwrap_or(0);
+	if !send_blocking(manager_side, b"STORAGE_HOST", host_conn) {
 		return false;
 	}
 	// A fresh supervisor-status channel the manager grants to the governed `lssvc` command

@@ -143,6 +143,15 @@ pub mod smbus;
 // drivers a host can test.
 pub mod gpio;
 pub mod i2c;
+// Virtio-crypto's requests (device 20), its configuration and one connection's sessions: the parts of the cipher
+// engine's driver a host can test.
+pub mod crypto;
+// Persistent memory served as blocks: what a namespace takes, how a write is made durable before its answer, and
+// where a request's bytes lie - the parts of the NVDIMM driver a host can test.
+pub mod pmem;
+// The FUSE wire as virtio-fs carries it: the requests, the answers held to their lengths, the name rules a share keeps
+// and the handles that hide the host's node ids - the parts of the virtio-fs driver a host can test.
+pub mod fuse;
 pub mod sdhci;
 pub mod serial_port;
 // THE 16550 REGISTER ENGINE, apart from where the UART is and what clocks it - the console UART's driver is the

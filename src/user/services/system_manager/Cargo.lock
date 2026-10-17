@@ -74,6 +74,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "device-proto"
 version = "0.0.0"
 dependencies = [
@@ -250,6 +258,7 @@ dependencies = [
  "camera-device-proto",
  "camera-proto",
  "config-proto",
+ "crypto-device-proto",
  "device-proto",
  "display-device-proto",
  "display-proto",
@@ -274,6 +283,7 @@ dependencies = [
  "resources-proto",
  "security-proto",
  "session-proto",
+ "share-device-proto",
  "smartcard-proto",
  "spool-proto",
  "storage-proto",
@@ -322,6 +332,14 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "share-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 

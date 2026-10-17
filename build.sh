@@ -104,7 +104,7 @@ step_user() {
 	# shellcheck disable=SC2046,SC2086
 	run_owned_shell '(cd "$(source_path services)" && cargo build $flag $(dev_features))'
 	# shellcheck disable=SC2046,SC2086
-	run_owned_shell '(cd "$(source_path storage)" && cargo build $flag)'
+	run_owned_shell '(cd "$(source_path storage)" && cargo build $flag $(dev_features))'
 	# shellcheck disable=SC2046,SC2086
 	run_owned_shell '(cd "$(source_path drivers)" && cargo build $flag $(dev_features))'
 }

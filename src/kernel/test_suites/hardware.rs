@@ -5307,6 +5307,104 @@ const GPIO_QUIET: u64 = 30;
 #[cfg(not(target_arch = "x86_64"))]
 const GPIO_QUIET: u64 = 30 * 13;
 
+tagged_test!(virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection, [Drivers, Pci], id = "kernel.hardware.virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection", covers = ["kernel", "bin.virtio_crypto", "crypto-device-proto"]);
+// THE HOST'S CIPHER ENGINE, THROUGH THE DRIVER AND ITS CONTRACT. QEMU's `cryptodev-backend-builtin` does AES in the
+// host process; the driver serves it as `crypto-device`, and this drives that contract through the generated client.
+//
+// THE ANSWERS ARE THE STANDARD'S, NOT THE ENGINE'S: NIST SP 800-38A's worked examples - CBC with a 128- and a 256-bit
+// key - are what every output is compared with, so an engine and a driver that agreed with each
+// other on a wrong answer would fail here. And the bounds the contract states: a session stays with its connection, a
+// connection holds at most eight, and a session closed - or left behind by a connection that went - is destroyed at the
+// device, which is proved by opening more than the backend's 256 sessions in all and never being refused.
+fn virtio_crypto_serves_aes_through_sessions_that_stay_with_their_connection() {
+	use crypto_device_proto::generated::liber::crypto_device::v1::{Cipher, Direction, Error, crypto_device::Client};
+
+	fn hex(text: &str) -> alloc::vec::Vec<u8> {
+		(0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex")).collect()
+	}
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_crypto.lsexe")).expect("the virtio_crypto driver should be staged on the volume under drivers/");
+	let engine = bind_bus_controller(elf, abi::VIRTIO_TYPE_CRYPTO, false, driver_protocol::provider::CRYPTO);
+	let first = engine.connect(driver_protocol::Scope::Whole).expect("a connection to the engine is served");
+	let mut client = Client::new(KernelTransport::new(&first, BUS_PATIENCE));
+
+	// 1. WHAT THE ENGINE OFFERS THROUGH THE CONTRACT.
+	let limits = client.limits().expect("the driver answered").expect("and stated its limits");
+	assert_eq!(limits.ciphers, alloc::vec![Cipher::AesCbc], "QEMU's built-in engine offers AES in CBC mode, which is the one cipher the contract names");
+	assert!(limits.max_key_len >= 32, "a 256-bit key is taken");
+	assert_eq!((limits.max_request, limits.max_sessions), (4096, 8), "one page a request, eight sessions a connection");
+
+	// 2. THE STANDARD'S WORKED EXAMPLES. F.2.1, CBC-AES128.
+	let plaintext = hex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+	let iv = hex("000102030405060708090a0b0c0d0e0f");
+	let key128 = hex("2b7e151628aed2a6abf7158809cf4f3c");
+	let encrypt = client.open(&Cipher::AesCbc, &Direction::Encrypt, &key128).expect("answered").expect("a CBC session");
+	let cbc = client.apply(&encrypt, &iv, &plaintext).expect("answered").expect("enciphered");
+	assert_eq!(cbc.data, hex("7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b273bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7"), "SP 800-38A F.2.1");
+	let decrypt = client.open(&Cipher::AesCbc, &Direction::Decrypt, &key128).expect("answered").expect("a CBC decryption session");
+	assert_eq!(client.apply(&decrypt, &iv, &cbc.data).expect("answered").expect("deciphered").data, plaintext, "F.2.2: the ciphertext deciphers to the plaintext");
+	// F.2.5, CBC-AES256.
+	let key256 = hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+	let wide = client.open(&Cipher::AesCbc, &Direction::Encrypt, &key256).expect("answered").expect("a 256-bit session");
+	assert_eq!(client.apply(&wide, &iv, &plaintext).expect("answered").expect("enciphered").data, hex("f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d39f23369a9d9bacfa530e26304231461b2eb05e2c39be9fcda6c19078c6a9d1b"), "SP 800-38A F.2.5");
+	// F.2.6, the same key deciphering F.2.5's ciphertext - a 256-bit key in the other direction.
+	let wide_back = client.open(&Cipher::AesCbc, &Direction::Decrypt, &key256).expect("answered").expect("a 256-bit decryption session");
+	assert_eq!(client.apply(&wide_back, &iv, &hex("f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d39f23369a9d9bacfa530e26304231461b2eb05e2c39be9fcda6c19078c6a9d1b")).expect("answered").expect("deciphered").data, plaintext, "SP 800-38A F.2.6");
+	// EACH REQUEST STARTS FROM ITS OWN IV: the same request twice gives the same answer, so nothing carried over.
+	assert_eq!(client.apply(&encrypt, &iv, &plaintext).expect("answered").expect("enciphered again").data, cbc.data, "nothing carries from one request to the next");
+	// A WHOLE PAGE, enciphered and deciphered back: every byte a function of its position.
+	let page: alloc::vec::Vec<u8> = (0..4096usize).map(|at| (at as u8).wrapping_mul(31) ^ 0xA7).collect();
+	let ciphered = client.apply(&encrypt, &iv, &page).expect("answered").expect("a page enciphered").data;
+	assert_ne!(ciphered, page);
+	assert_eq!(client.apply(&decrypt, &iv, &ciphered).expect("answered").expect("deciphered").data, page, "a page round-trips");
+
+	// 3. WHAT IS REFUSED BEFORE THE DEVICE SEES IT.
+	assert_eq!(client.open(&Cipher::AesCbc, &Direction::Encrypt, &key128[..15]), Some(Err(Error::Invalid)), "a 15-byte key");
+	assert_eq!(client.apply(&encrypt, &iv[..12], &plaintext), Some(Err(Error::Invalid)), "a 12-byte IV");
+	assert_eq!(client.apply(&encrypt, &iv, &plaintext[..63]), Some(Err(Error::Invalid)), "CBC data that is not whole blocks");
+	assert_eq!(client.apply(&encrypt, &iv, &[]), Some(Err(Error::Invalid)), "no data");
+	assert_eq!(client.apply(&999, &iv, &plaintext), Some(Err(Error::NotFound)), "a session this connection never opened");
+
+	// 4. A SESSION STAYS WITH ITS CONNECTION, and a connection holds eight at most.
+	let second = engine.connect(driver_protocol::Scope::Whole).expect("a second connection is served");
+	let mut other = Client::new(KernelTransport::new(&second, BUS_PATIENCE));
+	assert_eq!(other.apply(&encrypt, &iv, &plaintext), Some(Err(Error::NotFound)), "another connection's session is not this connection's to use");
+	assert_eq!(other.close(&encrypt), Some(Err(Error::NotFound)), "nor to close");
+	assert_eq!(client.apply(&encrypt, &iv, &plaintext).expect("answered").expect("still enciphers").data, cbc.data, "and it is still its own connection's");
+	let mut held = alloc::vec::Vec::new();
+	for _ in 0..8 {
+		held.push(other.open(&Cipher::AesCbc, &Direction::Encrypt, &key128).expect("answered").expect("a session within the bound"));
+	}
+	assert_eq!(other.open(&Cipher::AesCbc, &Direction::Encrypt, &key128), Some(Err(Error::Exhausted)), "a ninth is refused");
+	assert_eq!(other.close(&held[0]), Some(Ok(())));
+	assert_eq!(other.apply(&held[0], &iv, &plaintext), Some(Err(Error::NotFound)), "a closed session runs nothing");
+	assert_eq!(other.close(&held[0]), Some(Err(Error::NotFound)), "and closes once");
+	let reopened = other.open(&Cipher::AesCbc, &Direction::Encrypt, &key128).expect("answered").expect("room again");
+	assert!(!held.contains(&reopened), "a new session takes a new number, so a late request for a closed one cannot reach it");
+
+	// 5. EVERY SESSION GIVEN BACK IS DESTROYED AT THE DEVICE: more than the backend's 256 opened in all, by close and by a
+	// connection going, and none refused for room.
+	drop(other);
+	drop(second);
+	sched::run_until_idle();
+	for round in 0..40 {
+		let channel = engine.connect(driver_protocol::Scope::Whole).expect("a connection is served");
+		let mut passing = Client::new(KernelTransport::new(&channel, BUS_PATIENCE));
+		for _ in 0..8 {
+			let opened = passing.open(&Cipher::AesCbc, &Direction::Encrypt, &key128).expect("answered");
+			assert!(opened.is_ok(), "round {round}: a session was refused ({opened:?}) - the ones before it were not all destroyed at the device");
+		}
+		drop(passing);
+		drop(channel);
+		sched::run_until_idle();
+	}
+	for round in 0..300 {
+		let opened = client.open(&Cipher::AesCbc, &Direction::Decrypt, &key128).expect("answered").unwrap_or_else(|error| panic!("open {round} was refused: {error:?} - a closed session was not destroyed"));
+		assert_eq!(client.close(&opened), Some(Ok(())));
+	}
+	crate::serial_println!("virtio-crypto: SP 800-38A's CBC examples through the driver, both key sizes and both ways, a page round-tripped, sessions kept to their connection and eight a connection, and 620 sessions opened and given back without the engine running out");
+}
+
 tagged_test!(virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged, [Drivers, I2c], id = "kernel.hardware.virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged", covers = ["kernel", "bin.virtio_gpio", "bin.virtio_i2c", "gpio-device-proto"]);
 fn virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowledged() {
 	use driver_protocol::{GpioTrigger as Trigger, Scope};
@@ -5426,4 +5524,201 @@ fn virtio_gpio_delivers_each_event_once_and_holds_the_line_until_it_is_acknowled
 	controller.kill(&closed);
 	drop(mailbox);
 	i2c.kill(&[&*mailbox_end]);
+}
+
+// ------------------------------------------------------------------------ persistent memory
+//
+// THE MODULES ARE QEMU'S `nvdimm` DEVICES over two files the harness wrote before the boot: 16 MiB each, the second not
+// armed, on a machine that names the memory controller as its persistence domain - and each file carries the line
+// `LIBERSYSTEM NVDIMM <slot> SECTOR <n>` at sectors 0 and 2049, which only the host put there.
+
+// One persistent-memory row bound to the driver the way DeviceManager binds it, and the block channel it published.
+#[cfg(target_arch = "x86_64")]
+struct Pmem {
+	_kernel_ep: alloc::sync::Arc<object::channel::Channel>,
+	driver: alloc::sync::Arc<object::process::Process>,
+	claim: abi::ClaimKey,
+	blk: alloc::sync::Arc<object::channel::Channel>,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bind_pmem(elf: &[u8], row: usize) -> Pmem {
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+	let info = device::info(row).expect("the row answers");
+	let range = info.platform.mmio()[0];
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	let driver = loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the nvdimm driver should load");
+	let claim = device::claim(row, &crate::tests::entry_for_device(row as u64).expect("the registry declares an entry for the row")).expect("the row is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, claim.generation, 1).expect("the BIND should send");
+	let window = DeviceMemory::for_claim(claim, range.base, range.len as usize).expect("the row's window");
+	assert!(!window.write_back(), "a persistent-memory range in a hole of the memory map is mapped uncached");
+	assert!(device::register_derived(claim, alloc::sync::Arc::downgrade(&(window.clone() as alloc::sync::Arc<dyn object::KernelObject>))), "the window is recorded as derived from this claim");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, claim.generation, window, Rights::ALL).expect("the DEVICE resource should send");
+	sched::run_until_idle();
+	let offers = recv_offers(&kernel_ep, claim.generation).expect("the driver should report READY");
+	let blk = offer_of(&offers, driver_protocol::provider::BLOCK).expect("the driver publishes a block provider").into_any_arc().downcast::<object::channel::Channel>().expect("a channel");
+	Pmem { _kernel_ep: kernel_ep, driver, claim, blk }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Pmem {
+	// One request, its status, and the buffer a read answers with.
+	fn ask(&self, op: u32, lba: u64, count: u32, source: Option<&alloc::sync::Arc<object::memory_object::MemoryObject>>) -> (u32, Option<alloc::vec::Vec<u8>>) {
+		use object::channel::Message;
+		let request = driver_protocol::block::Request { op, lba, count }.encode();
+		let caps = match source {
+			Some(object) => alloc::vec![object::handle::Capability::new(object.clone() as alloc::sync::Arc<dyn object::KernelObject>, object::rights::Rights::ALL)],
+			None => alloc::vec::Vec::new(),
+		};
+		self.blk.send(Message::new(request.to_vec(), caps)).expect("the request should send");
+		sched::run_until_idle();
+		let reply = self.blk.recv().expect("the driver answers");
+		let status = driver_protocol::block::decode_status(&reply.bytes).expect("a status");
+		let data = reply.caps.first().map(|cap| {
+			let object = cap.object();
+			let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("a read answers with a buffer");
+			read_from_object(memory, count as usize * 512)
+		});
+		(status, data)
+	}
+
+	fn kill(self) {
+		assert_eq!(crate::syscall::deliver_signal(&self.driver, abi::SIG_KILL), 0, "the kill is delivered");
+		sched::run_until_idle();
+		assert!(self.blk.is_peer_closed(), "the block channel went with its driver");
+		let _ = device::release_claim(self.claim);
+	}
+}
+
+// A buffer holding `bytes`.
+#[cfg(target_arch = "x86_64")]
+fn pmem_source(bytes: &[u8]) -> alloc::sync::Arc<object::memory_object::MemoryObject> {
+	let object = object::memory_object::MemoryObject::create(bytes.len()).expect("a source buffer");
+	let hhdm = mem::hhdm_offset();
+	for (page, chunk) in bytes.chunks(4096).enumerate() {
+		// SAFETY: the object's own frame, through the direct map, before anything else holds it.
+		unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (hhdm + object.frames()[page]) as *mut u8, chunk.len()) };
+	}
+	object
+}
+
+// What the host wrote at `sector` of module `slot`: its line, and zeros to the end of the sector.
+#[cfg(target_arch = "x86_64")]
+fn host_sector(slot: u32, sector: u64) -> alloc::vec::Vec<u8> {
+	let mut out = alloc::format!("LIBERSYSTEM NVDIMM {slot} SECTOR {sector}").into_bytes();
+	out.resize(512, 0);
+	out
+}
+
+// The module's bytes at `offset`, read by the kernel through an uncached window of its own - not through the driver.
+#[cfg(target_arch = "x86_64")]
+fn pmem_raw(base: u64, offset: u64, len: usize) -> alloc::vec::Vec<u8> {
+	const WINDOW: u64 = 0xffff_f510_0000_0000;
+	let page = (base + offset) & !0xfff;
+	let pages = ((base + offset + len as u64 - page) as usize).div_ceil(4096);
+	for at in 0..pages as u64 {
+		arch::paging::map_page(WINDOW + at * 4096, page + at * 4096, arch::paging::WRITABLE | arch::paging::NO_CACHE | arch::paging::NO_EXECUTE);
+	}
+	let start = WINDOW + (base + offset - page);
+	// SAFETY: inside the pages just mapped over the module's range.
+	let bytes = (0..len).map(|at| unsafe { core::ptr::read_volatile((start + at as u64) as *const u8) }).collect();
+	for at in 0..pages as u64 {
+		let _ = arch::paging::unmap_page(WINDOW + at * 4096);
+	}
+	bytes
+}
+
+tagged_test!(nvdimm_serves_persistent_memory_as_blocks_and_a_module_that_will_not_save_read_only, [Drivers, ArchX86_64], id = "kernel.hardware.nvdimm_serves_persistent_memory_as_blocks_and_a_module_that_will_not_save_read_only", covers = ["kernel", "bin.nvdimm", "acpi"]);
+// THE TABLE, THE ROWS, THE DRIVER, THE MODULE. The NFIT QEMU wrote is read here with the same reader the kernel
+// published the rows with, and every row is held to it and to the memory map; then each row is bound to the driver and
+// its blocks are compared with what the host wrote into the module's file and with what the kernel reads out of the
+// module itself.
+fn nvdimm_serves_persistent_memory_as_blocks_and_a_module_that_will_not_save_read_only() {
+	#[cfg(target_arch = "x86_64")]
+	{
+		use driver_protocol::block::{OP_CAPACITY, OP_FLUSH, OP_READ, OP_WRITE, STATUS_INVALID, STATUS_OK};
+		const MIB: u64 = 1 << 20;
+		let table = crate::smp::acpi_table(crate::boot_info().rsdp, b"NFIT").expect("the machine has persistent memory, so its firmware writes an NFIT");
+		let mut namespaces = alloc::vec::Vec::new();
+		acpi::nfit::namespaces(table, |found| namespaces.push(found.expect("every range QEMU describes passes the reader's checks"))).expect("a whole NFIT");
+		assert_eq!(namespaces.len(), 2, "two modules, two persistent-memory ranges");
+		for namespace in &namespaces {
+			assert_eq!((namespace.len, namespace.modules), (16 * MIB, 1), "each a 16 MiB module of its own");
+			assert_eq!(namespace.capabilities, Some(acpi::nfit::CAPABILITY_MEMORY_CONTROLLER_FLUSH), "the machine names the memory controller as the persistence domain");
+			// THE PHYSICAL MAP: nothing the memory map calls memory lies under the range.
+			for region in (0..mem::memmap_len()).filter_map(mem::memmap_get) {
+				let memory = region.kind != abi::MEMMAP_RESERVED && region.kind != abi::MEMMAP_MMIO && region.length != 0;
+				assert!(!memory || region.base >= namespace.base + namespace.len || namespace.base >= region.base + region.length, "the range {:#x} lies over memory at {:#x}", namespace.base, region.base);
+			}
+		}
+		assert_eq!(namespaces.iter().map(|namespace| namespace.state).collect::<alloc::vec::Vec<_>>(), alloc::vec![0, acpi::nfit::STATE_NOT_ARMED], "the second module is not armed");
+		// ONE ROW A RANGE, ITS WINDOW THE RANGE AND ITS RECORD THE NAMESPACE.
+		let rows: alloc::vec::Vec<usize> = (0..device::count()).filter(|&index| device::info(index).is_some_and(|info| info.platform.identity().starts_with(b"table:NFIT#"))).collect();
+		assert_eq!(rows.len(), 2, "a claimable row per range");
+		for (row, namespace) in rows.iter().zip(&namespaces) {
+			let info = device::info(*row).expect("the row");
+			assert_eq!(info.platform.state, abi::PLATFORM_STATE_CLAIMABLE);
+			assert_eq!(info.platform.mmio().len(), 1, "one window");
+			assert_eq!((info.platform.mmio()[0].base, info.platform.mmio()[0].len), (namespace.base, namespace.len), "and it is the range");
+			assert_eq!(info.platform.properties_len as usize, 12 + acpi::nfit::RECORD_LEN, "the namespace record is the row's property block");
+		}
+		let (volume, _package) = scenario_packages().expect("boot modules should be present");
+		let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/nvdimm.lsexe")).expect("the nvdimm driver should be staged on the volume under drivers/");
+
+		// 1. THE ARMED MODULE: what the host wrote, read where the table says the module lies.
+		let armed = bind_pmem(elf, rows[0]);
+		let (status, capacity) = {
+			use object::channel::Message;
+			armed.blk.send(Message::new(driver_protocol::block::Request { op: OP_CAPACITY, lba: 0, count: 0 }.encode().to_vec(), alloc::vec::Vec::new())).expect("send");
+			sched::run_until_idle();
+			let reply = armed.blk.recv().expect("the capacity reply");
+			(driver_protocol::block::decode_status(&reply.bytes), reply.bytes)
+		};
+		assert_eq!(status, Some(STATUS_OK));
+		assert_eq!(driver_protocol::block::decode_capacity(&capacity).map(|c| (c.bytes, c.max_sectors)), Some((16 * MIB, 256)), "the whole module, 128 KiB a request");
+		assert_eq!(driver_protocol::block::decode_device_class(&capacity), driver_protocol::block::DeviceClass::PersistentMemory);
+		assert_eq!(armed.ask(OP_READ, 0, 1, None), (STATUS_OK, Some(host_sector(0, 0))), "sector 0 is what the host wrote into module 0's file");
+		let (status, two) = armed.ask(OP_READ, 2048, 2, None);
+		assert_eq!(status, STATUS_OK);
+		let two = two.expect("a buffer");
+		assert!(two[..512].iter().all(|byte| *byte == 0) && two[512..] == host_sector(0, 2049)[..], "two sectors from 2048: nothing, then the host's line at 2049 - a megabyte into the module");
+
+		// 2. A WRITE, READ BACK THROUGH THE DRIVER AND OUT OF THE MODULE ITSELF.
+		let pattern: alloc::vec::Vec<u8> = (0..8 * 512).map(|at| (at as u8).wrapping_mul(13) ^ 0x3C).collect();
+		assert_eq!(armed.ask(OP_WRITE, 77, 8, Some(&pmem_source(&pattern))).0, STATUS_OK, "eight sectors written, and answered only once durable");
+		assert_eq!(armed.ask(OP_READ, 77, 8, None), (STATUS_OK, Some(pattern.clone())), "read back through the driver");
+		assert_eq!(pmem_raw(namespaces[0].base, 77 * 512, pattern.len()), pattern, "and in the module, at the offset the request named");
+		let last = 16 * MIB / 512 - 1;
+		let tail = alloc::vec![0xEEu8; 512];
+		assert_eq!(armed.ask(OP_WRITE, last, 1, Some(&pmem_source(&tail))).0, STATUS_OK, "the last sector");
+		assert_eq!(pmem_raw(namespaces[0].base, last * 512, 512), tail);
+		assert_eq!(armed.ask(OP_FLUSH, 0, 0, None).0, STATUS_OK, "a flush has nothing left to make durable");
+
+		// 3. THE REFUSALS: nothing past the module, no empty or oversized request, no write whose buffer is short.
+		assert_eq!(armed.ask(OP_READ, last, 2, None), (STATUS_INVALID, None), "a read running past the last sector");
+		assert_eq!(armed.ask(OP_WRITE, last + 1, 1, Some(&pmem_source(&tail))).0, STATUS_INVALID, "a write past it");
+		assert_eq!(armed.ask(OP_READ, 0, 0, None).0, STATUS_INVALID, "no sectors");
+		assert_eq!(armed.ask(OP_READ, 0, 257, None).0, STATUS_INVALID, "more than one request carries");
+		assert_eq!(armed.ask(OP_WRITE, 100, 16, Some(&pmem_source(&tail))).0, STATUS_INVALID, "a buffer - one page - shorter than the sixteen sectors the request says");
+		assert_eq!(armed.ask(OP_WRITE, 100, 1, None).0, STATUS_INVALID, "a write with no buffer");
+		assert!(pmem_raw(namespaces[0].base, 100 * 512, 16 * 512).iter().all(|byte| *byte == 0), "and none of them wrote");
+
+		// 4. THE BYTES ARE THE MODULE'S, NOT THE DRIVER'S: a driver killed and a new one bound reads them back.
+		armed.kill();
+		let again = bind_pmem(elf, rows[0]);
+		assert_eq!(again.ask(OP_READ, 77, 8, None), (STATUS_OK, Some(pattern)), "what the first driver wrote, read by the second");
+		again.kill();
+
+		// 5. THE MODULE THAT IS NOT ARMED: its contents served, its writes refused.
+		let unarmed = bind_pmem(elf, rows[1]);
+		assert_eq!(unarmed.ask(OP_READ, 0, 1, None), (STATUS_OK, Some(host_sector(1, 0))), "sector 0 is module 1's - the second row is the second module");
+		let before = pmem_raw(namespaces[1].base, 2049 * 512, 512);
+		assert_eq!(before, host_sector(1, 2049));
+		assert_eq!(unarmed.ask(OP_WRITE, 2049, 1, Some(&pmem_source(&tail))).0, STATUS_INVALID, "a write a module will not save is refused, not answered as saved");
+		assert_eq!(pmem_raw(namespaces[1].base, 2049 * 512, 512), before, "and the module is untouched");
+		assert_eq!(unarmed.ask(OP_READ, 2049, 1, None), (STATUS_OK, Some(host_sector(1, 2049))), "reads go on");
+		unarmed.kill();
+		crate::serial_println!("nvdimm: two NFIT ranges, two rows; the host's sectors read where the table puts them, a write durable and in the module, six refusals, a second driver reading the first's bytes, and the unarmed module read-only");
+	}
 }

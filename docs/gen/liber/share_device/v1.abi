@@ -1,0 +1,15 @@
+package liber:share-device@1
+enum share-kind(file=0,directory=1,other=2)
+record share-node(handle:u32,kind:share-kind,size:u64,permissions:u16,modified:u64)
+record share-info(tag:string:bound=36,max-read:u32,max-nodes:u32)
+record share-entry(name:string:bound=255,kind:share-kind)
+record share-listing(entries:list<share-entry>:bound=64,next:u64,done:bool)
+record share-data(bytes:list<u8>:bound=32768)
+interface share-device
+method share-device.describe op=1 () -> result<share-info, liber:base@1::error>
+method share-device.root op=2 () -> result<share-node, liber:base@1::error>
+method share-device.lookup op=3 (dir:u32:rights=,name:string:bound=255:rights=) -> result<share-node, liber:base@1::error>
+method share-device.attributes op=4 (node:u32:rights=) -> result<share-node, liber:base@1::error>
+method share-device.list op=5 (dir:u32:rights=,cursor:u64:rights=) -> result<share-listing, liber:base@1::error>
+method share-device.read op=6 (node:u32:rights=,offset:u64:rights=,length:u32:rights=) -> result<share-data, liber:base@1::error>
+method share-device.forget op=7 (node:u32:rights=) -> result<unit, liber:base@1::error>

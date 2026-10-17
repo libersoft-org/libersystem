@@ -40,9 +40,13 @@ pub const ALIGNED_SIZE: f64 = 200.0;
 /// AND A SIZE AT WHICH THEY DO NOT. At 50 to the em a vertical edge fifty units in from its advance
 /// falls half way through a pixel, so the antialiasing tolerance applies along every one of them.
 /// Every HORIZONTAL edge of these faces is a multiple of twenty units, which is a whole pixel here -
-/// and that is what keeps a mark's lower edge on the same pixel boundary as its base's upper edge
-/// rather than sharing a pixel row with it, the one arrangement the oracle refuses to guess about.
+/// and that keeps a mark's lower edge on the same pixel boundary as its base's upper edge.
 pub const FRACTIONAL_SIZE: f64 = 50.0;
+
+/// AND A SIZE AT WHICH TWO GLYPHS SHARE PIXELS. At 37 to the em a mark's lower edge and its base's
+/// upper edge fall inside one pixel row, so a pixel there is covered in part by each - and what it
+/// holds is the compositing rule (`raster::analytic`), drawn and compared here rather than avoided.
+pub const SHARED_SIZE: f64 = 37.0;
 
 /// The space left around a line inside its target, in whole pixels.
 const MARGIN: f64 = 4.0;
@@ -173,6 +177,10 @@ pub fn compare(installed: &Installed<'_>, buffer: &Buffer, expect: &[Expect]) ->
 		if position.x_offset != expect.x_offset || position.y_offset != expect.y_offset {
 			return Err(format!("glyph {index} ({}) sits at ({}, {}) where the corpus declares ({}, {})", expect.glyph, position.x_offset, position.y_offset, expect.x_offset, expect.y_offset));
 		}
+		// WHAT A MARK HANGS FROM, which is what a right-to-left run is placed from once it is reversed.
+		if info.attached_to != expect.base {
+			return Err(format!("glyph {index} ({}) is attached to {:?} where the corpus declares {:?}", expect.glyph, info.attached_to, expect.base));
+		}
 	}
 	Ok(())
 }
@@ -181,8 +189,8 @@ pub fn compare(installed: &Installed<'_>, buffer: &Buffer, expect: &[Expect]) ->
 /// thing wrong at a time, each of which must be refused. A comparison that stopped comparing a field
 /// would pass every one of these but its own - and in a guest nothing else would notice.
 pub fn refuses_the_wrong_answer(installed: &Installed<'_>, case: &Case<'_>, buffer: &Buffer) -> Result<(), String> {
-	let copy = |expect: &Expect| Expect { glyph: expect.glyph, cluster: expect.cluster, x_advance: expect.x_advance, x_offset: expect.x_offset, y_offset: expect.y_offset };
-	let mutations: [(&str, fn(&mut Vec<Expect>)); 6] = [
+	let copy = |expect: &Expect| Expect { glyph: expect.glyph, cluster: expect.cluster, x_advance: expect.x_advance, x_offset: expect.x_offset, y_offset: expect.y_offset, base: expect.base };
+	let mutations: [(&str, fn(&mut Vec<Expect>)); 7] = [
 		("a wrong glyph", |wrong| wrong[0].glyph = ".notdef"),
 		("a wrong cluster", |wrong| wrong[0].cluster += 1),
 		("an advance one unit out", |wrong| wrong[0].x_advance += 1),
@@ -196,6 +204,10 @@ pub fn refuses_the_wrong_answer(installed: &Installed<'_>, case: &Case<'_>, buff
 		}),
 		("a glyph too few", |wrong| {
 			wrong.pop();
+		}),
+		("a mark on the wrong glyph", |wrong| {
+			let last = wrong.len() - 1;
+			wrong[last].base = Some(last as u16);
 		}),
 	];
 	for (what, mutate) in mutations {
@@ -233,33 +245,21 @@ fn describe(installed: &Installed<'_>, buffer: &Buffer) -> String {
 /// shaper produced, through `font-run` - its one rounding, its visual order, its turn of the y axis -
 /// and through `render2d` into `soft2d`. The oracle places each glyph where the authored expectations
 /// put it, in visual order: the logical order reversed for a right-to-left run, which is what visual
-/// order IS for a run of one level.
-///
-/// AND IT REFUSES A RIGHT-TO-LEFT RUN WHOSE GLYPHS CARRY AN OFFSET. An authored mark offset is the
-/// anchor arithmetic in LOGICAL order - the base's anchor, less the mark's, less the advance the pen
-/// made over the base - and a run reversed for drawing puts the mark BEFORE its base, where that pen
-/// advance has not happened. Reversing the authored glyphs would then place the mark exactly where a
-/// run that merely reversed them draws it, and the comparison would agree with a mark drawn a whole
-/// base away from its anchor. Placing it correctly needs a rule for which side owns the correction,
-/// and that is not this oracle's to choose.
+/// order IS for a run of one level - and a mark where its anchor meets its base's (`drawn_offset`).
 pub fn draw_case(installed: &Installed<'_>, case: &Case<'_>, buffer: &Buffer, size: f64, exact: bool, note: &mut dyn FnMut(&str)) -> Result<String, String> {
 	let face = &installed.face;
 	let units = face.header.units_per_em;
 	let em = fixed(size);
 	let right_to_left = paragraph_level(case.text)? % 2 == 1;
-	if right_to_left && case.expect.iter().any(|expect| expect.x_offset != 0 || expect.y_offset != 0) {
-		return Err(String::from("the oracle draws a right-to-left run by reversing its authored glyphs, which is exact only for a run whose glyphs carry no offset"));
-	}
 
-	let mut visual: Vec<&Expect> = case.expect.iter().collect();
-	if right_to_left {
-		visual.reverse();
-	}
+	let count = case.expect.len();
 	let mut placed = Vec::new();
 	let mut pen = Fixed266::ZERO;
-	for expect in visual {
+	for visual in 0..count {
+		let logical = if right_to_left { count - 1 - visual } else { visual };
+		let expect = &case.expect[logical];
 		let glyph = installed.id(expect.glyph)?;
-		let x = sum(pen, units_to(expect.x_offset, units, em)?)?;
+		let x = sum(pen, units_to(drawn_offset(case, logical, right_to_left)?, units, em)?)?;
 		// UP IN THE FONT IS DOWN THE TARGET.
 		let y = units_to(-expect.y_offset, units, em)?;
 		placed.push(Placed { glyph, x, y });
@@ -273,6 +273,37 @@ pub fn draw_case(installed: &Installed<'_>, case: &Case<'_>, buffer: &Buffer, si
 	compare_run(installed, case, &run, right_to_left, em)?;
 	let recorded = record(&run, run.run().origin_x);
 	raster::check(face, &[recorded], &placed, size, exact, target, note)
+}
+
+/// WHERE AN AUTHORED GLYPH IS DRAWN FROM, as an offset from the pen of the order it is drawn in, in
+/// font units.
+///
+/// A MARK IS PLACED BY ITS ANCHORS, NOT BY THE PEN IT HAPPENS TO MEET. The corpus states a mark's offset
+/// as the format defines it, in logical order: the base's anchor less the mark's, less everything the
+/// pen advanced from the base up to the mark, the base included. So the anchors' difference is the
+/// offset plus those advances, and the mark is drawn at its base's pen plus that difference - wherever
+/// the order puts the two pens. For a left-to-right run that is the authored offset again; for a
+/// right-to-left one, drawn with the mark before its base, it is not, and a reversal that kept the
+/// authored offset would draw the mark a whole base away from its anchor. This is computed from the
+/// authored expectations alone, so it judges `font-run`'s correction rather than repeating it.
+fn drawn_offset(case: &Case<'_>, logical: usize, right_to_left: bool) -> Result<i32, String> {
+	let expect = &case.expect[logical];
+	// The pen a glyph is drawn at: everything drawn before it, which is what precedes it in the text
+	// for a left-to-right run and what follows it for a right-to-left one. Summed rather than stored,
+	// so nothing here allocates.
+	let pen = |at: usize| -> i64 {
+		let before = if right_to_left { &case.expect[at + 1..] } else { &case.expect[..at] };
+		before.iter().map(|glyph| i64::from(glyph.x_advance)).sum()
+	};
+	let offset = match expect.base.map(usize::from) {
+		Some(base) if base < logical => {
+			let anchors = i64::from(expect.x_offset) + case.expect[base..logical].iter().map(|glyph| i64::from(glyph.x_advance)).sum::<i64>();
+			pen(base) + anchors - pen(logical)
+		}
+		Some(base) => return Err(format!("the corpus attaches {} to glyph {base}, which does not precede it", expect.glyph)),
+		None => i64::from(expect.x_offset),
+	};
+	i32::try_from(offset).map_err(|_| format!("{}'s drawn offset does not fit", expect.glyph))
 }
 
 /// THE RUN ITSELF, before its picture: the `GlyphRun` the seam hands a renderer, compared with the
@@ -290,7 +321,7 @@ fn compare_run(installed: &Installed<'_>, case: &Case<'_>, run: &Run, right_to_l
 	for (logical, expect) in case.expect.iter().enumerate() {
 		let visual = if right_to_left { count - 1 - logical } else { logical };
 		let glyph = &produced.glyphs[visual];
-		let wanted = (u32::from(installed.id(expect.glyph)?), units_to(expect.x_advance, units, em)?, units_to(expect.x_offset, units, em)?, units_to(-expect.y_offset, units, em)?, Fixed266::ZERO);
+		let wanted = (u32::from(installed.id(expect.glyph)?), units_to(expect.x_advance, units, em)?, units_to(drawn_offset(case, logical, right_to_left)?, units, em)?, units_to(-expect.y_offset, units, em)?, Fixed266::ZERO);
 		let got = (glyph.glyph, glyph.x_advance, glyph.x_offset, glyph.y_offset, glyph.y_advance);
 		if got != wanted {
 			return Err(format!("the produced run's glyph {visual} is (glyph, x advance, x offset, y offset, y advance) {got:?} where the corpus declares {} as {wanted:?}", expect.glyph));

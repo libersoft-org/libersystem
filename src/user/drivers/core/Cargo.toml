@@ -215,6 +215,32 @@ test = false
 bench = false
 
 [[bin]]
+# The virtio-crypto driver: the host's symmetric cipher engine as the `crypto-device` contract. Its request layouts,
+# configuration and per-connection sessions are `src/crypto.rs`, part of the library and host-tested.
+name = "virtio_crypto"
+path = "src/virtio_crypto.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE NVDIMM DRIVER: a persistent-memory range the NFIT describes, as the block wire. What a namespace takes and how
+# a write is made durable before its answer are `src/pmem.rs`, part of the library and host-tested.
+name = "nvdimm"
+path = "src/nvdimm.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE VIRTIO-FS DRIVER, development-only: a directory of the host as the `share-device` contract, which StorageService
+# serves as `vol://host`. Its FUSE wire, the name rules and the node handles are `src/fuse.rs`, part of the library
+# and host-tested.
+name = "virtio_fs"
+path = "src/virtio_fs.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
 # The virtio-gpio controller driver. Each line's one-event cycle is `src/gpio.rs`, part of the library and
 # host-tested; this binary is the two queues and the line-scoped connections.
 name = "virtio_gpio"

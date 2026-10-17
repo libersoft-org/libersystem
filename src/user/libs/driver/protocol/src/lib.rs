@@ -549,6 +549,12 @@ pub mod provider {
 	/// AN AMBIENT-LIGHT SENSOR, the `liber:display-device@1` `ambient-light` contract, which the brightness policy alone
 	/// consumes.
 	pub const AMBIENT_LIGHT: u16 = 32;
+	/// A SYMMETRIC CIPHER ENGINE, the `liber:crypto-device@1` `crypto-device` contract: sessions on one connection and
+	/// requests that each stand alone. No service routes its own cryptography through it; software stays the baseline.
+	pub const CRYPTO: u16 = 33;
+	/// A DIRECTORY OF THE HOST on a development machine, the `liber:share-device@1` `share-device` contract: read-only,
+	/// by node, with the host's identities kept behind. StorageService alone consumes it.
+	pub const HOST_SHARE: u16 = 34;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

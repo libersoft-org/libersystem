@@ -1,0 +1,63 @@
+//! LiberSystem symmetric crypto offload - the contract a `crypto` provider serves.
+//!
+//! A CIPHER ENGINE THE MACHINE OFFERS, AND NOTHING THIS SYSTEM DEPENDS ON. Software cryptography stays the
+//! correctness baseline: nothing in the tree routes its own encryption here, and what this contract answers
+//! is checked against published vectors and against the software implementation, not trusted for itself. A
+//! virtual machine's engine is the HOST'S - it sees every key and every byte - so offloading to it is never
+//! safer than doing the work here.
+//!
+//! A KEY IS HANDED ONCE AND NEVER ANSWERED BACK. `open` carries it to the device, which keeps it under the
+//! session; the driver zeroes its own copy as soon as the device has answered, and no operation returns it.
+//! A session belongs to the connection that opened it: another connection naming its number is refused, and
+//! every session a connection holds is destroyed when it closes.
+//!
+//! EACH REQUEST STANDS ALONE. The IV travels with the data, and nothing carries from one request to
+//! the next - so there is no chained state for a host to replay or a migration to lose. Operations whose
+//! safety depends on such state are not offered until their threat model is written.
+
+package liber:crypto-device@1;
+
+use liber:base@1.{error};
+
+/// The ciphers this contract can name: AES with a 128-, 192- or 256-bit key, in cipher block chaining - whole
+/// 16-byte blocks, with a 16-byte IV. ONE, BECAUSE ONE IS WHAT CAN BE PROVED HERE: QEMU's engine offers CBC alone,
+/// and a mode named without an engine to run it against would be a promise nobody has checked.
+enum cipher {
+	aes-cbc,
+}
+
+/// Which way a session runs.
+enum direction {
+	encrypt,
+	decrypt,
+}
+
+/// What the device offers through this contract, and the bounds every request is held to.
+record crypto-limits {
+	/// The ciphers the device offers that this contract names.
+	@bound(8) ciphers: list<cipher>,
+	/// The longest key the device takes, in bytes.
+	max-key-len:       u32,
+	/// The most bytes one request may carry.
+	max-request:       u32,
+	/// How many sessions one connection may hold at once.
+	max-sessions:      u32,
+}
+
+/// What one request produced.
+record crypto-output {
+	@bound(4096) data: list<u8>,
+}
+
+/// THE CONTRACT a `crypto` publication serves on each connection.
+interface crypto-device {
+	/// What the device offers, and the bounds.
+	@op(1) limits: func() -> result<crypto-limits, error>;
+	/// A session for one cipher, one direction and one key, answered by its number on this connection. The
+	/// key is never answered back.
+	@op(2) open:   func(cipher: cipher, direction: direction, @bound(32) key: list<u8>) -> result<u32, error>;
+	/// One request on a session: the IV and the data, in whole blocks.
+	@op(3) apply:  func(session: u32, @bound(16) iv: list<u8>, @bound(4096) data: list<u8>) -> result<crypto-output, error>;
+	/// The session is destroyed at the device.
+	@op(4) close:  func(session: u32) -> result<unit, error>;
+}

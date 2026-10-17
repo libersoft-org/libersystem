@@ -353,6 +353,36 @@ fn a_right_to_left_run_is_drawn_in_visual_order_and_mapped_in_logical_order() {
 }
 
 #[test]
+// A MARK OF A RIGHT-TO-LEFT RUN SITS ON ITS BASE, NOT A BASE AWAY. The shaper's offset is the anchor
+// arithmetic in logical order - here 300 - 45 - 620, the base's anchor less the mark's less the base's
+// advance - and the reversed run draws the mark FIRST, before the pen has crossed the base. Drawn with
+// the logical offset the dagesh lands at -365, off the letter; drawn for its order it lands at 255,
+// where the two anchors meet. A left-to-right run keeps the shaper's offset as it is.
+fn a_right_to_left_mark_is_placed_for_the_order_it_is_drawn_in() {
+	let bytes = build::plain();
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let size = Fixed266::from_pixels(16);
+	let units = face.header.units_per_em;
+	let text = "\u{05D0}\u{05BC}";
+	let mark = Position { x_advance: 0, y_advance: 0, x_offset: -365, y_offset: 65 };
+	let mut shaped = buffer(&[(1, 0, advance(620)), (2, 2, mark)]);
+	shaped.infos[1].attached_to = Some(0);
+	let run = produce(&request(&face, text, Direction::RightToLeft, size), &shaped).expect("a run");
+	let glyphs = &run.run().glyphs;
+	assert_eq!((glyphs[0].glyph, glyphs[1].glyph), (2, 1), "the mark is drawn first, then its base");
+	assert_eq!(glyphs[0].x_offset, Fixed266::from_font_units(255, units, size).expect("in range"), "the mark meets its base's anchor");
+	assert_eq!(glyphs[1].x_offset, Fixed266::ZERO, "the base is where its pen is");
+	assert_eq!(glyphs[0].y_offset, Fixed266::from_font_units(-65, units, size).expect("in range"), "the vertical offset does not depend on the order");
+	// The same buffer drawn left to right keeps the shaper's offset: there the base IS drawn first.
+	let run = produce(&request(&face, text, Direction::LeftToRight, size), &shaped).expect("a run");
+	assert_eq!(run.run().glyphs[1].x_offset, Fixed266::from_font_units(-365, units, size).expect("in range"));
+	// A glyph nothing attached is never moved, in either order.
+	let plain = buffer(&[(1, 0, advance(620)), (2, 2, mark)]);
+	let run = produce(&request(&face, text, Direction::RightToLeft, size), &plain).expect("a run");
+	assert_eq!(run.run().glyphs[0].x_offset, Fixed266::from_font_units(-365, units, size).expect("in range"));
+}
+
+#[test]
 // A CLUSTER IS A GRAPHEME CLUSTER AND NOT A CHARACTER. A caret does not stand between a letter and
 // the accent on it, so a mapping that made the mark its own cluster would offer a caret position that
 // is not a place in the text.

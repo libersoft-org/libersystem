@@ -375,6 +375,12 @@ enum provider-kind {
 	/// AN AMBIENT-LIGHT SENSOR - `liber:display-device@1`'s `ambient-light` contract - which the brightness policy alone
 	/// consumes.
 	ambient-light = 32,
+	/// A SYMMETRIC CIPHER ENGINE - `liber:crypto-device@1`'s `crypto-device` contract: sessions and stand-alone
+	/// requests. Nothing in the system routes its own cryptography through it.
+	crypto = 33,
+	/// A DIRECTORY OF THE HOST, on a development machine - `liber:share-device@1`'s `share-device` contract, read-only
+	/// and by node - which StorageService alone consumes, to serve it behind its volume API.
+	host-share = 34,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

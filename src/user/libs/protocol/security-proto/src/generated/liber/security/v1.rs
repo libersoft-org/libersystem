@@ -206,6 +206,10 @@ pub enum Capability {
 	/// AN APPLICATION'S SERIAL PORT, minted per launch for one bonded BR/EDR peer the operator gave an alias and trusted
 	/// for the serial port profile: a byte stream over RFCOMM, never a console. Appended last.
 	BluetoothSerial = 60,
+	/// A DIRECTORY OF THE HOST, on a development machine: a fresh client of `vol://host`, read-only. Never part of the
+	/// `volumes` bundle every tool is handed - granted to `share` alone, which exists only in a development image.
+	/// Appended last.
+	HostShare = 61,
 }
 
 impl Capability {
@@ -309,6 +313,7 @@ impl Capability {
 			58 => Some(Capability::AudioControl),
 			59 => Some(Capability::AudioVoice),
 			60 => Some(Capability::BluetoothSerial),
+			61 => Some(Capability::HostShare),
 			_ => None,
 		}
 	}
@@ -1487,6 +1492,7 @@ impl Capability {
 			Capability::AudioControl => out.push_str("\"audio-control\""),
 			Capability::AudioVoice => out.push_str("\"audio-voice\""),
 			Capability::BluetoothSerial => out.push_str("\"bluetooth-serial\""),
+			Capability::HostShare => out.push_str("\"host-share\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1552,6 +1558,7 @@ impl Capability {
 			Capability::AudioControl => out.push_str("audio-control"),
 			Capability::AudioVoice => out.push_str("audio-voice"),
 			Capability::BluetoothSerial => out.push_str("bluetooth-serial"),
+			Capability::HostShare => out.push_str("host-share"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1617,6 +1624,7 @@ impl Capability {
 			Capability::AudioControl => crate::codec::cbor::text(out, "audio-control"),
 			Capability::AudioVoice => crate::codec::cbor::text(out, "audio-voice"),
 			Capability::BluetoothSerial => crate::codec::cbor::text(out, "bluetooth-serial"),
+			Capability::HostShare => crate::codec::cbor::text(out, "host-share"),
 		}
 	}
 }

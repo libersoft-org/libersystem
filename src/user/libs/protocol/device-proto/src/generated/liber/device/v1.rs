@@ -1502,6 +1502,12 @@ pub enum ProviderKind {
 	/// AN AMBIENT-LIGHT SENSOR - `liber:display-device@1`'s `ambient-light` contract - which the brightness policy alone
 	/// consumes.
 	AmbientLight = 32,
+	/// A SYMMETRIC CIPHER ENGINE - `liber:crypto-device@1`'s `crypto-device` contract: sessions and stand-alone
+	/// requests. Nothing in the system routes its own cryptography through it.
+	Crypto = 33,
+	/// A DIRECTORY OF THE HOST, on a development machine - `liber:share-device@1`'s `share-device` contract, read-only
+	/// and by node - which StorageService alone consumes, to serve it behind its volume API.
+	HostShare = 34,
 }
 
 impl ProviderKind {
@@ -1576,6 +1582,8 @@ impl ProviderKind {
 			30 => Some(ProviderKind::CoolingDevice),
 			31 => Some(ProviderKind::Backlight),
 			32 => Some(ProviderKind::AmbientLight),
+			33 => Some(ProviderKind::Crypto),
+			34 => Some(ProviderKind::HostShare),
 			_ => None,
 		}
 	}
@@ -9057,6 +9065,8 @@ impl ProviderKind {
 			ProviderKind::CoolingDevice => out.push_str("\"cooling-device\""),
 			ProviderKind::Backlight => out.push_str("\"backlight\""),
 			ProviderKind::AmbientLight => out.push_str("\"ambient-light\""),
+			ProviderKind::Crypto => out.push_str("\"crypto\""),
+			ProviderKind::HostShare => out.push_str("\"host-share\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -9093,6 +9103,8 @@ impl ProviderKind {
 			ProviderKind::CoolingDevice => out.push_str("cooling-device"),
 			ProviderKind::Backlight => out.push_str("backlight"),
 			ProviderKind::AmbientLight => out.push_str("ambient-light"),
+			ProviderKind::Crypto => out.push_str("crypto"),
+			ProviderKind::HostShare => out.push_str("host-share"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -9129,6 +9141,8 @@ impl ProviderKind {
 			ProviderKind::CoolingDevice => crate::codec::cbor::text(out, "cooling-device"),
 			ProviderKind::Backlight => crate::codec::cbor::text(out, "backlight"),
 			ProviderKind::AmbientLight => crate::codec::cbor::text(out, "ambient-light"),
+			ProviderKind::Crypto => crate::codec::cbor::text(out, "crypto"),
+			ProviderKind::HostShare => crate::codec::cbor::text(out, "host-share"),
 		}
 	}
 }

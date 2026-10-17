@@ -10,6 +10,9 @@ description = "StorageService service and demo client"
 
 [features]
 default = []
+# THE DEVELOPMENT BUILD: the host-share instance subscribes to the `host-share` provider and mounts `vol://host`. A
+# shipping build has no driver to publish one and this instance does not look.
+development = []
 shared-image = ["ipc-client/shared-image", "proto/shared-image", "rt/shared-image"]
 
 [[bin]]

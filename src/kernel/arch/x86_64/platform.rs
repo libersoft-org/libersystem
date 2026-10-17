@@ -238,6 +238,40 @@ fn tables(out: &mut Vec<Described>, rsdp: u64, madt: Option<&acpi::Madt<'_>>) {
 			Err(refusal) => crate::serial_println!("device: the TPM2 table is refused - {refusal:?}"),
 		}
 	}
+	// PERSISTENT MEMORY: a claimable row per persistent-memory range the NFIT names that passes its checks, the range
+	// as the row's one window and its namespace record - the modules' state, the platform's capabilities - as its
+	// property block, one VALUE record named `NFIT`. A control region or a block window is never a row: those are a
+	// module's registers. The publication then holds the window against the memory map and every BAR, as any row's.
+	if let Some(bytes) = crate::smp::acpi_table(rsdp, b"NFIT") {
+		let mut instance = 0u32;
+		let walked = acpi::nfit::namespaces(bytes, |found| match found {
+			Ok(namespace) => {
+				let len = platform::table_identity(b"NFIT", instance, &mut name);
+				instance += 1;
+				let Some(mut description) = platform::Description::new(abi::PLATFORM_SOURCE_TABLE, abi::PLATFORM_STATE_CLAIMABLE, &name[..len]) else { return };
+				if !(description.add_match(abi::MATCH_ID_TABLE, b"NFIT") && description.add_mmio(namespace.base, namespace.len)) {
+					return;
+				}
+				let mut block: Vec<u8> = Vec::new();
+				if block.try_reserve_exact(12 + acpi::nfit::RECORD_LEN).is_err() {
+					crate::serial_println!("device: no memory for the NFIT namespace record - not published");
+					return;
+				}
+				block.push(abi::DEVICE_PROPERTY_VALUE);
+				block.push(0);
+				block.extend_from_slice(&4u16.to_le_bytes());
+				block.extend_from_slice(&(acpi::nfit::RECORD_LEN as u32).to_le_bytes());
+				block.extend_from_slice(b"NFIT");
+				block.extend_from_slice(&namespace.encode());
+				// ALLOC-OK: boot, once per persistent-memory range the firmware describes.
+				out.push(Described { description, properties: block, targets: Vec::new(), registers: Vec::new() });
+			}
+			Err((index, refusal)) => crate::serial_println!("device: the NFIT's persistent-memory range {index} is refused - {refusal:?}"),
+		});
+		if let Err(error) = walked {
+			crate::serial_println!("device: the NFIT is refused - {error:?}");
+		}
+	}
 	// THE CONSOLE THE FIRMWARE REDIRECTED TO: the UART description it is, merged into that UART's row.
 	if let Some(spcr) = crate::smp::acpi_table(rsdp, b"SPCR").and_then(|bytes| acpi::Spcr::new(bytes).ok()) {
 		let len = platform::table_identity(b"SPCR", 0, &mut name);

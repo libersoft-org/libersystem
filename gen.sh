@@ -27,7 +27,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth power smartcard modem modem-device camera camera-device event midi midi-device spool printer-device import ptp-transport admin i2c-device gpio-device tpm bmc typec)
+PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth power smartcard modem modem-device camera camera-device event midi midi-device spool printer-device import ptp-transport admin i2c-device gpio-device tpm bmc typec crypto-device share-device)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -95,11 +95,15 @@ declare -A EXTERNAL=(
 	# TYPE-C CONNECTORS: the provider contract the connector drivers serve and the reader's and operator's
 	# interfaces TypeCService serves, in one package. Base only.
 	[typec]="base"
+	# SYMMETRIC CRYPTO OFFLOAD: the contract a `crypto` provider serves - sessions and stand-alone requests. Base only.
+	["crypto-device"]="base"
+	# A HOST DIRECTORY ON A DEVELOPMENT MACHINE: the contract a `host-share` provider serves - read-only, by node. Base only.
+	["share-device"]="base"
 )
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(admin audio base bluetooth bmc camera camera-device config device display display-device event font gpio-device graphics i2c-device import input log midi midi-device network observability modem modem-device power printer-device process ptp-transport resources security session smartcard spool storage time tpm typec)
+AGGREGATE_EXTERNAL=(admin audio base bluetooth bmc camera camera-device config crypto-device device display display-device event font gpio-device graphics i2c-device import input log midi midi-device network observability modem modem-device power printer-device process ptp-transport resources security session share-device smartcard spool storage time tpm typec)
 
 help() {
 	usage_and_exit <<EOF

@@ -24,13 +24,17 @@ const ALPHA: &str = "conformance-alpha.ttf";
 const COMPLEX: &str = "conformance-complex.ttf";
 const EMOJI: &str = "conformance-emoji.ttf";
 
-/// One expected glyph: which glyph, which cluster it came from, and where it sits.
+/// One expected glyph: which glyph, which cluster it came from, where it sits, and - for a mark - the
+/// glyph it is attached to.
 pub struct Expect {
 	pub glyph: &'static str,
 	pub cluster: u32,
 	pub x_advance: i32,
 	pub x_offset: i32,
 	pub y_offset: i32,
+	/// THE GLYPH A MARK IS ATTACHED TO, by its index in this list. The offset above is measured from it
+	/// in logical order, so a right-to-left run, drawn the other way round, cannot be placed without it.
+	pub base: Option<u16>,
 }
 
 /// One shaping case: a string, the face that draws it, and what must come out.
@@ -46,12 +50,17 @@ pub struct Case<'a> {
 
 /// A glyph that is where its own advance puts it, which is every glyph no rule has moved.
 const fn at(glyph: &'static str, cluster: u32, x_advance: i32) -> Expect {
-	Expect { glyph, cluster, x_advance, x_offset: 0, y_offset: 0 }
+	Expect { glyph, cluster, x_advance, x_offset: 0, y_offset: 0, base: None }
 }
 
-/// A mark, which has no advance of its own and sits where its anchors put it.
-const fn attached(glyph: &'static str, cluster: u32, x_offset: i32, y_offset: i32) -> Expect {
-	Expect { glyph, cluster, x_advance: 0, x_offset, y_offset }
+/// A mark the face gives no anchor on the glyph before it: no advance, and nothing to move it by.
+const fn unanchored(glyph: &'static str, cluster: u32) -> Expect {
+	Expect { glyph, cluster, x_advance: 0, x_offset: 0, y_offset: 0, base: None }
+}
+
+/// A mark, which has no advance of its own and sits where its anchors on `base` put it.
+const fn attached(glyph: &'static str, cluster: u32, base: u16, x_offset: i32, y_offset: i32) -> Expect {
+	Expect { glyph, cluster, x_advance: 0, x_offset, y_offset, base: Some(base) }
 }
 
 pub static CASES: &[Case<'static>] = &[
@@ -86,11 +95,11 @@ pub static CASES: &[Case<'static>] = &[
 	// Hebrew: marks, and the two classes one base carries.
 	// -----------------------------------------------------------------------------------------
 	// 300 - 45 - 620: the base's anchor, less the mark's, less the advance the pen made over the base.
-	Case { name: "a mark is placed by its anchors", face: ALPHA, text: "\u{05D0}\u{05BC}", expect: &[at("he.alef", 0, 620), attached("dagesh", 2, -365, 65)] },
+	Case { name: "a mark is placed by its anchors", face: ALPHA, text: "\u{05D0}\u{05BC}", expect: &[at("he.alef", 0, 620), attached("dagesh", 2, 0, -365, 65)] },
 	// TWO CLASSES ON ONE BASE. A shaper that ignored the mark class would put both marks at the same
 	// anchor, which is a dot on top of a vowel rather than one inside the letter and one below it.
-	Case { name: "two marks of different classes take different anchors", face: ALPHA, text: "\u{05D0}\u{05BC}\u{05B8}", expect: &[at("he.alef", 0, 620), attached("dagesh", 2, -365, 65), attached("qamats", 4, -390, 15)] },
-	Case { name: "a second base has its own anchors", face: ALPHA, text: "\u{05D1}\u{05B0}", expect: &[at("he.bet", 0, 580), attached("sheva", 2, -340, 45)] },
+	Case { name: "two marks of different classes take different anchors", face: ALPHA, text: "\u{05D0}\u{05BC}\u{05B8}", expect: &[at("he.alef", 0, 620), attached("dagesh", 2, 0, -365, 65), attached("qamats", 4, 0, -390, 15)] },
+	Case { name: "a second base has its own anchors", face: ALPHA, text: "\u{05D1}\u{05B0}", expect: &[at("he.bet", 0, 580), attached("sheva", 2, 0, -340, 45)] },
 	// -----------------------------------------------------------------------------------------
 	// Devanagari: the reordering that happens BEFORE any lookup, and the conjuncts after it.
 	// -----------------------------------------------------------------------------------------
@@ -103,21 +112,21 @@ pub static CASES: &[Case<'static>] = &[
 	// virama, the final reordering moves it after its base - carrying the ra's cluster, because the
 	// cluster follows the glyph - and the face's `abvm` places it: 430 - 100 - 560, the base's
 	// anchor less the mark's less the advance the pen made over the base; 620 - 640 up.
-	Case { name: "a syllable-initial ra becomes the reph, drawn over the base after it", face: COMPLEX, text: "\u{0930}\u{094D}\u{0915}", expect: &[at("dv.ka", 6, 560), attached("dv.repha", 0, -230, -20)] },
+	Case { name: "a syllable-initial ra becomes the reph, drawn over the base after it", face: COMPLEX, text: "\u{0930}\u{094D}\u{0915}", expect: &[at("dv.ka", 6, 560), attached("dv.repha", 0, 0, -230, -20)] },
 	// AND NOT WHERE THE SYLLABLE DOES NOT PUT THEM. A consonant and virama ending a word is its own
 	// base: no half form, which the face would otherwise give it. A ra and virama ending a word have
 	// no base after them: no reph, which the face would otherwise form.
-	Case { name: "a consonant and virama ending a word take no half form", face: COMPLEX, text: "\u{0915}\u{094D}", expect: &[at("dv.ka", 0, 560), attached("dv.virama", 3, 0, 0)] },
-	Case { name: "a ra and virama ending a word are not a reph", face: COMPLEX, text: "\u{0915}\u{0930}\u{094D}", expect: &[at("dv.ka", 0, 560), at("dv.ra", 3, 480), attached("dv.virama", 6, 0, 0)] },
+	Case { name: "a consonant and virama ending a word take no half form", face: COMPLEX, text: "\u{0915}\u{094D}", expect: &[at("dv.ka", 0, 560), unanchored("dv.virama", 3)] },
+	Case { name: "a ra and virama ending a word are not a reph", face: COMPLEX, text: "\u{0915}\u{0930}\u{094D}", expect: &[at("dv.ka", 0, 560), at("dv.ra", 3, 480), unanchored("dv.virama", 6)] },
 	// -----------------------------------------------------------------------------------------
 	// Thai: one character DRAWN AS TWO GLYPHS, which is what `ccmp` is for.
 	// -----------------------------------------------------------------------------------------
-	Case { name: "sara am is decomposed and its upper half attaches", face: COMPLEX, text: "\u{0E01}\u{0E33}", expect: &[at("th.ko", 0, 540), attached("th.nikhahit", 3, -345, -40), at("th.sara-aa", 3, 300)] },
-	Case { name: "a tone mark sits over its consonant", face: COMPLEX, text: "\u{0E01}\u{0E48}", expect: &[at("th.ko", 0, 540), attached("th.mai-ek", 3, -340, -160)] },
+	Case { name: "sara am is decomposed and its upper half attaches", face: COMPLEX, text: "\u{0E01}\u{0E33}", expect: &[at("th.ko", 0, 540), attached("th.nikhahit", 3, 0, -345, -40), at("th.sara-aa", 3, 300)] },
+	Case { name: "a tone mark sits over its consonant", face: COMPLEX, text: "\u{0E01}\u{0E48}", expect: &[at("th.ko", 0, 540), attached("th.mai-ek", 3, 0, -340, -160)] },
 	// -----------------------------------------------------------------------------------------
 	// Khmer: the coeng that binds what follows into a subjoined form under the base.
 	// -----------------------------------------------------------------------------------------
-	Case { name: "a coeng stacks the consonant after it below the base", face: COMPLEX, text: "\u{1780}\u{17D2}\u{1781}", expect: &[at("km.ka", 0, 600), attached("km.kha.sub", 3, -520, 20)] },
+	Case { name: "a coeng stacks the consonant after it below the base", face: COMPLEX, text: "\u{1780}\u{17D2}\u{1781}", expect: &[at("km.ka", 0, 600), attached("km.kha.sub", 3, 0, -520, 20)] },
 	// -----------------------------------------------------------------------------------------
 	// Emoji: a mapping above the basic plane, and sequences that are ONE glyph.
 	// -----------------------------------------------------------------------------------------
@@ -180,7 +189,8 @@ pub static PARAGRAPHS: &[Paragraph<'static>] = &[
 ///
 /// ONE OF EACH KIND THE THREE-ARCHITECTURE CLAIM IS ABOUT and not the whole corpus: Arabic in its
 /// joining forms and its required ligature, Devanagari reordered before and after its base, Thai
-/// decomposed and stacked, and a paragraph whose two directions meet on one line. Each is drawn as
+/// decomposed and stacked, Hebrew marks on a right-to-left base, and a paragraph whose two directions
+/// meet on one line. Each is drawn as
 /// well as shaped, and every glyph of every one of them is an axis-aligned rectangle, so the picture
 /// is compared against coverage computed from the outlines rather than against a captured image.
 ///
@@ -193,6 +203,8 @@ pub static GUEST_CASES: &[&str] = &[
 	"a syllable-initial ra becomes the reph, drawn over the base after it",
 	"sara am is decomposed and its upper half attaches",
 	"a tone mark sits over its consonant",
+	"a mark is placed by its anchors",
+	"two marks of different classes take different anchors",
 ];
 
 pub static GUEST_PARAGRAPHS: &[&str] = &["a left-to-right paragraph with a right-to-left run"];

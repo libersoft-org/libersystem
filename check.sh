@@ -139,6 +139,10 @@ declare -A GATES=(
 	# the reason, a live latency request, a relaunch installing every table again; the zone heated past `_AC0`, `_PSV` and
 	# `_CRT` through the relaunched policy, and past `_CRT` again with it stopped.
 	["processor-power"]="tools/check-processor-power.sh"
+	# THE HOST SHARE ON A DEVELOPMENT MACHINE: a directory of this host served read-only by virtiofsd, the virtio-fs driver
+	# and `vol://host` behind the host-share grant - its names, kinds and bytes the host's, a change on the host read again,
+	# no path or link out of it, and neither `cat` nor `ls`, which hold every volume a tool is handed, reaching it.
+	["host-share"]="tools/check-host-share.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

@@ -40,6 +40,7 @@ extern crate alloc;
 
 #[path = "../../provider_subscription.rs"]
 pub mod provider_subscription;
+use proto::generated::liber::share_device::v1::{ShareKind, ShareNode, share_device};
 use proto::system::{ProviderInfo, ProviderKind};
 use provider_subscription::{ProviderWatch, open_provider, same_binding, same_provider};
 
@@ -68,6 +69,9 @@ const UDF_VOLUME: &[u8] = b"udf";
 const USB_VOLUME: &[u8] = b"usb";
 const RAM_VOLUME: &[u8] = b"ram";
 const TMP_VOLUME: &[u8] = b"tmp";
+// A DIRECTORY OF THE HOST, on a development machine started with one: read-only, through the one `host-share`
+// provider, and granted only to what holds the host-share capability - never in the bundle every tool is handed.
+const HOST_VOLUME: &[u8] = b"host";
 // block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
 // where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
 // of count*512 bytes; a write transfers a MemoryObject of count*512 bytes and replies
@@ -177,7 +181,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// THE HIBERNATION AREA ON THE SYSTEM DISK, found when this instance mounts the system volume.
 	let mut area: Option<Area> = None;
 	let mut system: bool = false;
-	let mut usb: Option<UsbProviders> = None;
+	let mut usb: Option<Providers> = None;
 	let mut vol: Volume = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
@@ -323,7 +327,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			providers.update(&mut volume);
 			// A routed report certifies a real filesystem read through the subscribed provider.
 			routed = providers.handle != 0 && volume.fs.list_entries(b"").is_ok();
-			usb = Some(providers);
+			usb = Some(Providers::Usb(providers));
+			volume
+		}
+		// THE HOST SHARE'S INSTANCE: the same catalogue connection, admitting `host-share` and nothing else. A shipping
+		// build subscribes to nothing - its image carries no virtio-fs driver to publish one, and this instance does not
+		// look - so `vol://host` there names a volume that is never mounted.
+		Received::Message { len, handle } if len == 9 && &buf[..9] == b"HOSTSHARE" => {
+			let mut providers = ShareProviders::new(if cfg!(feature = "development") { handle } else { 0 });
+			if !cfg!(feature = "development") && handle != 0 {
+				close(handle);
+			}
+			let mut volume = Volume::new(alloc::boxed::Box::new(ShareFs { chan: 0 }));
+			providers.update(&mut volume);
+			routed = providers.handle != 0 && volume.fs.list_entries(b"").is_ok();
+			usb = Some(Providers::Share(providers));
 			volume
 		}
 		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
@@ -1384,6 +1402,67 @@ impl UsbProviders {
 	}
 }
 
+// THE HOST SHARE'S PUBLISHER: the one `host-share` provider, opened when it appears and let go when it is withdrawn.
+struct ShareProviders {
+	catalogue: u64,
+	shares: ProviderWatch,
+	selected: Option<ProviderInfo>,
+	handle: u64,
+}
+
+impl ShareProviders {
+	fn new(catalogue: u64) -> Self {
+		Self { catalogue, shares: ProviderWatch::subscribe(catalogue, ProviderKind::HostShare), selected: None, handle: 0 }
+	}
+
+	fn update(&mut self, volume: &mut Volume) {
+		self.shares.poll();
+		if self.selected.as_ref().is_some_and(|selected| !self.shares.entries.iter().any(|info| same_provider(info, selected))) {
+			volume.fs = alloc::boxed::Box::new(ShareFs { chan: 0 });
+			if self.handle != 0 {
+				close(self.handle);
+			}
+			self.handle = 0;
+			self.selected = None;
+		}
+		if self.selected.is_some() {
+			return;
+		}
+		for info in &self.shares.entries {
+			let handle = open_provider(self.catalogue, info);
+			if handle == 0 {
+				continue;
+			}
+			self.handle = handle;
+			self.selected = Some(info.clone());
+			volume.fs = alloc::boxed::Box::new(ShareFs { chan: handle });
+			break;
+		}
+	}
+}
+
+// WHAT AN INSTANCE MOUNTS AS ITS PROVIDERS COME AND GO: the USB stick behind a USB bus, or the host share.
+enum Providers {
+	Usb(UsbProviders),
+	Share(ShareProviders),
+}
+
+impl Providers {
+	fn channels(&self) -> [u64; 2] {
+		match self {
+			Providers::Usb(usb) => [usb.blocks.channel, usb.buses.channel],
+			Providers::Share(share) => [share.shares.channel, 0],
+		}
+	}
+
+	fn update(&mut self, volume: &mut Volume) {
+		match self {
+			Providers::Usb(usb) => usb.update(volume),
+			Providers::Share(share) => share.update(volume),
+		}
+	}
+}
+
 // ONE CLIENT REQUEST, received whole: answered, or registered for a stream or a listing that answers later. Answers
 // whether the client would not take its reply within the bound - see `serve_volume`, which drops it then. Called as the
 // request arrives, and for a request the sleep held, once the writes are released.
@@ -1568,7 +1647,7 @@ struct HeldRequest {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<UsbProviders>, mut control: u64, area: Option<Area>, mut hibernation: u64) -> ! {
+fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Providers>, mut control: u64, area: Option<Area>, mut hibernation: u64) -> ! {
 	// The admin's own `quiet`, for the reason the clients have one.
 	//
 	// The admin channel is never dropped: there is one of it, it is the operator's way in, and
@@ -1595,7 +1674,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 
 	let mut provider_members = Vec::new();
 	if let Some(providers) = usb.as_ref() {
-		for channel in [providers.blocks.channel, providers.buses.channel] {
+		for channel in providers.channels() {
 			if channel == 0 {
 				continue;
 			}
@@ -1737,8 +1816,9 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		if ready > 0 && provider_members.iter().any(|(_, koid)| *koid == ready as u64) {
 			if let Some(providers) = usb.as_mut() {
 				providers.update(vol);
+				let channels = providers.channels();
 				provider_members.retain(|(channel, koid)| {
-					let live = *channel == providers.blocks.channel || *channel == providers.buses.channel;
+					let live = channels.contains(channel);
 					if !live {
 						waitset_remove(set, *koid);
 					}
@@ -3744,6 +3824,193 @@ impl FileSystem for UdfFs {
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
 		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf"), device: block_device(self.chan) })
+	}
+}
+
+// THE HOST SHARE: `vol://host` on a development machine, read-only, over the `share-device` contract of the one
+// `host-share` provider - a directory of the host the virtio-fs driver reaches.
+//
+// EVERY PATH IS WALKED FROM THE SHARE'S ROOT, ONE NAME AT A TIME, and each name is held to a volume's rules before it
+// is asked: an empty middle segment, `.`, `..`, a NUL or a backslash is `invalid` here, and the driver holds the same
+// names to the same rules again. Nothing is walked through but a directory - the driver refuses a symbolic link as a
+// step - so a path cannot reach outside the share by any spelling. A node a walk held is let go as soon as the next one
+// is held, and the last when the request is answered, so a request holds at most two of the driver's nodes.
+struct ShareFs {
+	chan: u64,
+}
+
+// THE MOST ONE WHOLE-FILE READ OF THE SHARE GATHERS: the window reads carry anything larger.
+const SHARE_FILE_MAX: u64 = 16 * 1024 * 1024;
+// THE MOST ENTRIES ONE LISTING OF A SHARE'S DIRECTORY GATHERS.
+const SHARE_LIST_MAX: usize = 4096;
+// The share's root, which the contract fixes.
+const SHARE_ROOT: u32 = 1;
+
+// The names of a share path, each held to the rules: a leading or trailing separator tolerated, as on every volume.
+fn share_segments(path: &[u8]) -> Result<Vec<&[u8]>, Error> {
+	let mut path = path;
+	while let Some(rest) = path.strip_prefix(b"/") {
+		path = rest;
+	}
+	while let Some(rest) = path.strip_suffix(b"/") {
+		path = rest;
+	}
+	let mut segments = Vec::new();
+	if path.is_empty() {
+		return Ok(segments);
+	}
+	for segment in path.split(|byte| *byte == b'/') {
+		if segment.is_empty() || segment == b"." || segment == b".." || segment.len() > 255 || segment.iter().any(|byte| *byte == 0 || *byte == b'\\') || core::str::from_utf8(segment).is_err() {
+			return Err(Error::Invalid);
+		}
+		segments.try_reserve(1).map_err(|_| Error::Again)?;
+		segments.push(segment);
+	}
+	Ok(segments)
+}
+
+// A transport that failed is a provider that went: `again`, which a later request may find mounted.
+fn share_answer<T>(reply: Option<Result<T, Error>>) -> Result<T, Error> {
+	reply.unwrap_or(Err(Error::Again))
+}
+
+impl ShareFs {
+	fn client(&self) -> Result<share_device::Client<ipc_client::ChannelTransport>, Error> {
+		if self.chan == 0 {
+			return Err(Error::NotFound);
+		}
+		Ok(share_device::Client::new(ipc_client::ChannelTransport { chan: self.chan }))
+	}
+
+	// THE NODE `path` NAMES, held: the caller lets it go with `release`.
+	fn walk(&mut self, path: &[u8]) -> Result<ShareNode, Error> {
+		let segments = share_segments(path)?;
+		let mut client = self.client()?;
+		let mut node = share_answer(client.root())?;
+		for segment in segments {
+			let name = core::str::from_utf8(segment).map_err(|_| Error::Invalid)?;
+			let next = share_answer(client.lookup(&node.handle, name));
+			if node.handle != SHARE_ROOT {
+				let _ = client.forget(&node.handle);
+			}
+			node = next?;
+		}
+		Ok(node)
+	}
+
+	fn release(&mut self, node: &ShareNode) {
+		if node.handle != SHARE_ROOT
+			&& let Ok(mut client) = self.client()
+		{
+			let _ = client.forget(&node.handle);
+		}
+	}
+
+	// Up to `len` bytes of a held file from `offset`, in the reads the share answers.
+	fn read_node(&mut self, node: &ShareNode, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+		if node.kind != ShareKind::File {
+			return Err(Error::Invalid);
+		}
+		let mut client = self.client()?;
+		let most = share_answer(client.describe())?.max_read.max(1) as usize;
+		let mut out: Vec<u8> = Vec::new();
+		out.try_reserve_exact(len.min(node.size.saturating_sub(offset) as usize)).map_err(|_| Error::Again)?;
+		let mut at = offset;
+		while out.len() < len {
+			let want = (len - out.len()).min(most) as u32;
+			let data = share_answer(client.read(&node.handle, &at, &want))?;
+			if data.bytes.is_empty() {
+				break;
+			}
+			out.try_reserve(data.bytes.len()).map_err(|_| Error::Again)?;
+			out.extend_from_slice(&data.bytes);
+			at += data.bytes.len() as u64;
+		}
+		Ok(out)
+	}
+}
+
+impl FileSystem for ShareFs {
+	fn volume_name(&self) -> &'static [u8] {
+		HOST_VOLUME
+	}
+
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		let node = self.walk(name)?;
+		let read = if node.size > SHARE_FILE_MAX { Err(Error::Invalid) } else { self.read_node(&node, 0, node.size as usize) };
+		self.release(&node);
+		read
+	}
+
+	fn read_window(&mut self, name: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+		let node = self.walk(name)?;
+		let read = self.read_node(&node, offset, len);
+		self.release(&node);
+		read
+	}
+
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		let node = self.walk(dir)?;
+		let listed = self.list_node(&node);
+		self.release(&node);
+		listed
+	}
+
+	fn stat_entry(&mut self, name: &[u8]) -> Result<FileInfo, Error> {
+		let node = self.walk(name)?;
+		self.release(&node);
+		let (_, base) = split_parent(name);
+		let size = if node.kind == ShareKind::File { node.size } else { 0 };
+		file_info(base, size, node.kind == ShareKind::Directory, node.modified, node.modified)
+	}
+
+	// A SHARE IS NO BLOCK DEVICE: it has no capacity of its own to report.
+	fn capacity(&mut self) -> Result<u64, Error> {
+		Err(Error::Unsupported)
+	}
+
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		let tag = share_answer(self.client()?.describe())?.tag;
+		Ok(VolumeStatus { label: tag, total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("virtio-fs"), device: String::from("host-share") })
+	}
+}
+
+impl ShareFs {
+	// A held directory's entries, page by page, each with its own size and time - read by looking the entry up and
+	// letting it go again. A symbolic link, a device, a socket or a pipe is listed as a file of no length, and a
+	// directory has no length either: what the host says of one is its own filesystem's bookkeeping.
+	fn list_node(&mut self, node: &ShareNode) -> Result<Vec<FileInfo>, Error> {
+		if node.kind != ShareKind::Directory {
+			return Err(Error::Invalid);
+		}
+		let mut client = self.client()?;
+		let mut out: Vec<FileInfo> = Vec::new();
+		let mut cursor = 0u64;
+		loop {
+			let page = share_answer(client.list(&node.handle, &cursor))?;
+			for entry in &page.entries {
+				if out.len() == SHARE_LIST_MAX {
+					return Ok(out);
+				}
+				let (size, mtime) = match (entry.kind, share_answer(client.lookup(&node.handle, &entry.name))) {
+					(ShareKind::Other | ShareKind::Directory, Ok(found)) => {
+						let _ = client.forget(&found.handle);
+						(0, found.modified)
+					}
+					(_, Ok(found)) => {
+						let _ = client.forget(&found.handle);
+						(found.size, found.modified)
+					}
+					(_, Err(_)) => (0, 0),
+				};
+				out.try_reserve(1).map_err(|_| Error::Again)?;
+				out.push(file_info(entry.name.as_bytes(), size, entry.kind == ShareKind::Directory, mtime, mtime)?);
+			}
+			if page.done || page.next == cursor {
+				return Ok(out);
+			}
+			cursor = page.next;
+		}
 	}
 }
 

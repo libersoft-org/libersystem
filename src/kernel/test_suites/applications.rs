@@ -2198,17 +2198,21 @@ fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 	// corpus sizes: the aligned one, where every pixel is compared exactly, and the fractional one.
 	assert!(printed.iter().any(|line| line.starts_with("textconf: loaded ") && line.contains("conformance-alpha.ttf")), "the Arabic and Hebrew face was reached through the catalogue, and printed: {shown}");
 	assert!(printed.iter().any(|line| line.starts_with("textconf: loaded ") && line.contains("conformance-complex.ttf")), "the Devanagari and Thai face was reached through the catalogue, and printed: {shown}");
-	for script in ["(arab)", "(dev2)", "(thai)"] {
+	// AND HEBREW, whose marks sit on a base drawn after them - the right-to-left placement.
+	for script in ["(arab)", "(dev2)", "(thai)", "(hebr)"] {
 		assert!(printed.iter().any(|line| line.starts_with("textconf: shaped '") && line.contains(script) && line.contains("exactly as authored")), "a {script} case was shaped exactly as the corpus declares, and printed: {shown}");
 	}
 	let shaped = printed.iter().filter(|line| line.starts_with("textconf: shaped '") || line.starts_with("textconf: laid out '")).count();
 	let paragraphs = printed.iter().filter(|line| line.starts_with("textconf: laid out '") && line.contains("in the authored order with the authored glyphs")).count();
 	assert!(paragraphs >= 1, "the mixed-direction paragraph went through every stage of the pipeline as authored, and printed: {shown}");
-	for size in ["200", "50"] {
+	for size in ["200", "50", "37"] {
 		let marker = alloc::format!(" at {size} px: ");
 		let drawn = printed.iter().filter(|line| line.starts_with("textconf: drawn '") && line.contains(marker.as_str()) && line.ends_with("and a one-pixel shift is refused")).count();
 		assert_eq!(drawn, shaped, "every shaped case and paragraph was drawn to the analytic oracle at {size} px, and printed: {shown}");
 	}
+	// AND THE COMPOSITING RULE WAS EXERCISED: at 37 px some pixel is covered in part by two glyphs, and it
+	// was drawn as one over the other - a size that shared none would have asserted the rule over nothing.
+	assert!(printed.iter().any(|line| line.starts_with("textconf: drawn '") && line.contains(" at 37 px: ") && !line.contains(", 0 pixel(s) two glyphs share")), "a case drew pixels two glyphs share, and printed: {shown}");
 	assert!(printed.iter().any(|line| line.starts_with("textconf: PASSED")), "the corpus rendered to the analytic oracle, and printed: {shown}");
 
 	// THE DIRECTORY IS WATCHED. A face removed behind the catalogue's back - through a writable scope on the same

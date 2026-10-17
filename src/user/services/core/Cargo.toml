@@ -202,6 +202,12 @@ path = "src/btgatt.rs"
 required-features = ["development"]
 
 [[bin]]
+# The host share's one reader, absent from a shipped image: `vol://host` through the host-share grant alone.
+name = "share"
+path = "src/share.rs"
+required-features = ["development"]
+
+[[bin]]
 # The BR/EDR gate's application, absent from a shipped image: one serial port grant on the aliased fixture device.
 name = "btserial"
 path = "src/btserial.rs"

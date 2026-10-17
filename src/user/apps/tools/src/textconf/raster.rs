@@ -78,13 +78,13 @@ pub struct Placed {
 pub fn check(face: &Face<'_>, runs: &[RecordedGlyphRun], placed: &[Placed], size: f64, exact: bool, target: Target, note: &mut dyn FnMut(&str)) -> Result<String, String> {
 	let scale = size / face.header.units_per_em as f64;
 	let drawn = draw(runs, face, size, target, note)?;
-	let (oracle, cut_in_y) = analytic(face, placed, scale, target)?;
+	let (oracle, cut_in_y, shared) = analytic(face, placed, scale, target)?;
 	let report = compare(&drawn, &oracle, &cut_in_y, exact, target)?;
 	let (shifted, shifted_cut) = shifted_right(&oracle, &cut_in_y, target);
 	if compare(&drawn, &shifted, &shifted_cut, exact, target).is_ok() {
 		return Err(String::from("the comparison accepted an oracle shifted by one pixel, so it is not comparing"));
 	}
-	Ok(format!("{report}, and a one-pixel shift is refused"))
+	Ok(format!("{report}, {shared} pixel(s) two glyphs share, and a one-pixel shift is refused"))
 }
 
 /// The same oracle, one pixel to the right.
@@ -229,18 +229,21 @@ impl Outline for Builder {
 /// them, and a comparison that could not tell them apart would report "the rasteriser is out" where it
 /// could have said which sweep.
 ///
-/// AND IT REFUSES A PIXEL TWO GLYPHS EACH COVER PARTLY. Where one glyph covers a pixel wholly the
-/// answer is a whole pixel however the run is composited, and where a glyph covers it not at all the
-/// other glyph's coverage is the answer. Where two cover it in part, what the pixel holds is decided
-/// by how the renderer composites one glyph over another - an operator, not geometry - so an oracle
-/// that computed it would be asserting a rule nothing froze. The sizes this program draws at keep
-/// every such pixel away, and this is what proves they do.
-pub fn analytic(face: &Face<'_>, placed: &[Placed], scale: f64, target: Target) -> Result<(Vec<f64>, Vec<bool>), String> {
+/// AND A PIXEL TWO GLYPHS EACH COVER PARTLY HOLDS ONE OVER THE OTHER. What it holds is decided by how
+/// the renderer composites one glyph over another - an operator, not geometry - and the rule is now
+/// stated (the owner, 2026-10-17): each glyph is drawn over what the ones before it left, so the pixel
+/// holds the first's coverage and the second's over the part the first left clear, `1 - (1 - a)(1 - b)`
+/// - which is what `soft2d` does and what text renderers generally do. The union of the two areas,
+/// which would be a whole pixel where an edge of each meets, is not it. Where one glyph covers a pixel
+/// wholly, or the other not at all, the two rules agree. How many pixels two glyphs shared is counted,
+/// so a size that is meant to exercise the rule can show that it did.
+pub fn analytic(face: &Face<'_>, placed: &[Placed], scale: f64, target: Target) -> Result<(Vec<f64>, Vec<bool>, usize), String> {
 	let pixels = (target.width * target.height) as usize;
 	let mut coverage = alloc::vec![0.0f64; pixels];
 	let mut cut_in_y = alloc::vec![false; pixels];
 	// Which glyph left a partial coverage at each pixel, by its index in `placed`; `u32::MAX` for none.
 	let mut partial_from = alloc::vec![u32::MAX; pixels];
+	let mut shared = 0usize;
 	for (index, entry) in placed.iter().enumerate() {
 		let rectangles = contours_of(face, entry.glyph)?;
 		let Some(outer) = rectangles.first() else { continue };
@@ -282,16 +285,17 @@ pub fn analytic(face: &Face<'_>, placed: &[Placed], scale: f64, target: Target) 
 				let value = value.clamp(0.0, 1.0);
 				if value > 0.0 && value < 1.0 {
 					if partial_from[at] != u32::MAX && partial_from[at] != index as u32 {
-						return Err(format!("pixel ({x}, {y}) is covered in part by glyph {} and in part by glyph {} of the run, and what two partial coverages make is the renderer's compositing rather than geometry this oracle can compute", partial_from[at], index));
+						shared += 1;
 					}
 					partial_from[at] = index as u32;
 				}
-				coverage[at] = (coverage[at] + value).clamp(0.0, 1.0);
+				// THIS GLYPH OVER WHAT THE ONES BEFORE IT LEFT.
+				coverage[at] += value * (1.0 - coverage[at]);
 				cut_in_y[at] |= partial_in_y;
 			}
 		}
 	}
-	Ok((coverage, cut_in_y))
+	Ok((coverage, cut_in_y, shared))
 }
 
 /// The first pixel a span starting at `low` can touch, inside a target of `extent` pixels.

@@ -551,6 +551,18 @@ path = "user/libs/protocol/i2c-device-proto"
 owner = "gpio-device-proto"
 path = "user/libs/protocol/gpio-device-proto"
 
+# THE SYMMETRIC CRYPTO OFFLOAD CONTRACT a `crypto` provider serves: sessions on one connection, each request standing
+# alone.
+[[sources]]
+owner = "crypto-device-proto"
+path = "user/libs/protocol/crypto-device-proto"
+
+# THE HOST-SHARE CONTRACT a `host-share` provider serves on a development machine: a host directory, read-only and by
+# node, for StorageService alone.
+[[sources]]
+owner = "share-device-proto"
+path = "user/libs/protocol/share-device-proto"
+
 [[sources]]
 owner = "spool-proto"
 path = "user/libs/protocol/spool-proto"
@@ -1437,6 +1449,17 @@ role = "probe"
 linkage = "static"
 stage = "volume"
 destination = "libexec/btgatt.lsexe"
+providers = []
+development = true
+
+# THE HOST SHARE'S ONE READER, development-only: `vol://host` through the host-share grant and nothing else.
+[[programs]]
+name = "share"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/share.lsexe"
 providers = []
 development = true
 
@@ -3645,6 +3668,26 @@ provides = [{ kind = "tpm", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 500
 
+# PERSISTENT MEMORY: a range the NFIT describes, one row per namespace, served as the block wire - StorageService
+# consumes it as it consumes any disk. The range is memory and masters nothing; a write is answered only once it is
+# durable, and a namespace a module will not save is served read-only.
+[[programs]]
+name = "nvdimm"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/nvdimm.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "function"
+dma = "none"
+match = [{ transport = "platform", table = "NFIT" }]
+provides = [{ kind = "block", most = 1, consumers = 4 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
 # THE KERNEL CONSOLE'S UART: the kernel-declared COM1 row, the one kernel row a claim may take - and the claim IS
 # the console's handoff: the kernel stops driving COM1 before the claim's resources are minted, its output leaves
 # through the console tap the claim carries, and the release gives COM1 back. Its ports, its IRQ 4 and the tap;
@@ -3908,6 +3951,47 @@ lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 34 }]
 provides = [{ kind = "i2c-bus", most = 1, consumers = 8 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# A DIRECTORY OF THE HOST, on a development machine only: virtio-fs, served as the `share-device` contract to
+# StorageService alone, which mounts it as `vol://host` behind the host-share capability. In no shipping image; the
+# device exists only on a machine started with a share (`VIRTIOFS_SOCKET`).
+[[programs]]
+name = "virtio_fs"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_fs.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 26 }]
+provides = [{ kind = "host-share", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# THE HOST'S SYMMETRIC CIPHER ENGINE, served as the `crypto-device` contract: sessions on a connection, each request
+# standing alone, a key that crosses once. An offload a consumer may choose - nothing in the system routes its own
+# cryptography through it - so no role in this manifest consumes the kind yet.
+[[programs]]
+name = "virtio_crypto"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_crypto.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 20 }]
+provides = [{ kind = "crypto", most = 1, consumers = 8 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
@@ -5122,6 +5206,7 @@ dependencies = [
 	"iso_storage",
 	"udf_storage",
 	"usb_storage",
+	"host_storage",
 	"network_service",
 	"time_service",
 	"config_service",
@@ -5304,6 +5389,14 @@ interface = "liber:storage@1/volume"
 tag = "STORAGE_TMP"
 kind = "client"
 provider = "tmp_storage"
+interface = "liber:storage@1/volume"
+
+# THE HOST SHARE'S INSTANCE, from which this manager mints a fresh client per launch for the host-share capability.
+[[services.roles]]
+tag = "STORAGE_HOST"
+kind = "client"
+provider = "host_storage"
+presence = "optional"
 interface = "liber:storage@1/volume"
 
 [[services.roles]]
@@ -5787,6 +5880,34 @@ provider = "device_manager"
 source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
 kinds = ["block", "usb-bus"]
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
+
+# THE HOST SHARE: `vol://host`, read-only, from the one `host-share` provider - which only a development image's
+# virtio-fs driver publishes, on a machine started with a share. A shipping build's instance subscribes to nothing and
+# never mounts. Its clients are minted by PermissionManager for the host-share capability alone, never in the volumes
+# bundle every tool is handed.
+[[services]]
+name = "host_storage"
+program = "storage_service"
+restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://host"
+dependencies = ["log_service", "storage_service", "device_manager"]
+notices = ["sleep"]
+
+[[services.roles]]
+tag = "HOSTSHARE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["host-share"]
 
 [[services.roles]]
 tag = "SERVE"

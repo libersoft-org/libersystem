@@ -1,0 +1,10 @@
+package liber:crypto-device@1
+enum cipher(aes-cbc=0)
+enum direction(encrypt=0,decrypt=1)
+record crypto-limits(ciphers:list<cipher>:bound=8,max-key-len:u32,max-request:u32,max-sessions:u32)
+record crypto-output(data:list<u8>:bound=4096)
+interface crypto-device
+method crypto-device.limits op=1 () -> result<crypto-limits, liber:base@1::error>
+method crypto-device.open op=2 (cipher:cipher:rights=,direction:direction:rights=,key:list<u8>:bound=32:rights=) -> result<u32, liber:base@1::error>
+method crypto-device.apply op=3 (session:u32:rights=,iv:list<u8>:bound=16:rights=,data:list<u8>:bound=4096:rights=) -> result<crypto-output, liber:base@1::error>
+method crypto-device.close op=4 (session:u32:rights=) -> result<unit, liber:base@1::error>

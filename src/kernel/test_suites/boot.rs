@@ -135,7 +135,7 @@ fn init_package_starts_system_manager() {
 	// refused on, and this boot comes up with a link over USB. The no-provider state still has a
 	// gate of its own: the `dma-degraded` scenario boots without the suite's devices and requires
 	// the "up without a link" line, which is why the adapter is attached in test mode only.
-	let online_reports: [&[u8]; 42] = [
+	let online_reports: [&[u8]; 43] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online (vol://system)",
@@ -145,6 +145,8 @@ fn init_package_starts_system_manager() {
 		USB_VOLUME_REPORT,
 		b"StorageService: online (vol://ram)",
 		b"StorageService: online (vol://tmp)",
+		// THE HOST SHARE'S INSTANCE, which on this shipping build subscribes to nothing and never mounts.
+		b"StorageService: online (vol://host)",
 		b"ProcessService: online",
 		b"ConfigService: online",
 		// THE FONT CATALOGUE IS A MANIFEST SERVICE AND REPORTS LIKE ONE, and this list did not know
