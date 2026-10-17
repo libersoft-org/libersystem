@@ -101,8 +101,15 @@ expect "enabled layer refused by name" "a query naming a layer must be refused r
 expect "instance with a layer refused by name" "an instance creation enabling a layer must be refused by name"
 expect "loader lookup address" "the loader must answer out of its own table, which is its own code running"
 expect "instance result=4294967287" "with a driver that implements nothing, VK_ERROR_INCOMPATIBLE_DRIVER is the honest answer"
-expect "foreign: icd interface: loader asked 7, substrate offered 6, driver answered 6 - agreed 6" "the loader must negotiate through the substrate's bounded entry point, which offers the driver at most 6"
-if grep -q "^vkprobe: foreign: icd interface: .* - refused" "$lines"; then
+# THE NEGOTIATION'S LINE, read from the whole log: the probe's filtered lines stop at a colon, and this one has three.
+interface="vkprobe: foreign: icd interface: loader asked 7, substrate offered 6, driver answered 6 - agreed 6"
+grep -a -qF "$interface" "$GUEST_LOG" || {
+	echo "foreign-loader-guest: expected \"$interface\" - the loader must negotiate through the substrate's bounded entry point, which offers the driver at most 6" >&2
+	grep -a "vkprobe: foreign: " "$GUEST_LOG" >&2
+	exit 1
+}
+echo "foreign-loader-guest: ${interface#vkprobe: }"
+if grep -a -q "vkprobe: foreign: icd interface: .* - refused" "$GUEST_LOG"; then
 	fail "the substrate refused the synthetic ICD's negotiation, which is a conforming 2..6 driver"
 fi
 

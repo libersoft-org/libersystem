@@ -2929,6 +2929,12 @@ fn grant_acpi_connections(nodes: &[Node], catalogue: &mut Catalogue, at: usize) 
 			// its own - and a grant marked done there was never made again, which left the new instance without the
 			// connection. Given up as a lost instance's, and the whole grant made again on the hand-off.
 			Some(Err(proto::system::Error::Again | proto::system::Error::CommitUncertain)) | None => {
+				// A SEND THE ENDED INSTANCE'S CHANNEL REFUSED gives the connection back to this program, still live and
+				// still holding its address or line at the controller. Kept, it held the field address for the rest of
+				// the boot, and the grant made again on the hand-off was refused by the controller as a second holder.
+				if matches!(client.last_error(), Some(proto::codec::TransportError::SendRefused)) {
+					close(connection);
+				}
 				acpi_admin_lost();
 				return Granted::Lost;
 			}

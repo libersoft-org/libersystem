@@ -87,8 +87,12 @@ EOF
 	# artifacts, the running system volume, QEMU and the host CPU.
 	env -u GPU_SIZE LIBER_BOOT_PROFILE=development-trace "$REPO_ROOT/lab.sh" scenario-cold --serial-broker "$ARCH" "$RESULTS/scaled-$ARCH.toml" >"$RESULTS/boot-$ARCH.log" 2>&1 &
 	cold=$!
+	# A PROCESS'S COMM IS ITS NAME CUT TO FIFTEEN CHARACTERS - `qemu-system-aar`, `qemu-system-ris` - so it is matched
+	# whole against the name cut the same way; the whole name never appears there.
+	qemu_comm="qemu-system-$ARCH"
+	qemu_comm="${qemu_comm:0:15}"
 	for _ in $(seq 1 600); do
-		ps -eo comm= | grep -q "^qemu-system-$ARCH" && break
+		ps -eo comm= | grep -qxF "$qemu_comm" && break
 		kill -0 "$cold" 2>/dev/null || break
 		sleep 1
 	done
@@ -228,14 +232,15 @@ cp "$SERIAL_LOG" "$RESULTS/serial-small.log"
 
 boot dormant DEV_PROFILE=1 LIBER_BOOT_PROFILE=development
 run dormant --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 "${PIN[@]}"
-# DORMANT MEANS DORMANT: the boot's own profile line, and the demo saying its sites are not live - a trace boot here would
-# make every site a syscall and the armed/dormant comparison a comparison of nothing.
+# DORMANT MEANS DORMANT: the boot's own profile line, and below the demo saying its sites are not live - a trace boot here
+# would make every site a syscall and the armed/dormant comparison a comparison of nothing.
 grep -a -q "boot profile.*development" "$RESULTS/conditions-dormant.tsv" && ! grep -a -q "development-trace" "$RESULTS/conditions-dormant.tsv" || die "the dormant boot did not record the development profile - see $RESULTS/conditions-dormant.tsv"
-grep -a -q "site-live=0" "$RESULTS/run-dormant.out" || die "the dormant run's sites were live - see $RESULTS/run-dormant.out"
 # THE SAME RUN WITH THE CORE KEPT BUSY BEFORE EACH DRAW: a draw that falls to the offscreen figure behind
 # the spin was paying for starting on a core that had been idle, which is the host's and not the draw's.
 run warm-core --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 --warm-core=60 "${PIN[@]}"
 run primitives --primitives
+# AND ITS SITES DORMANT, in the demo's own word: `--primitives` reports whether a site is live, on this same boot.
+grep -a -q "site-live=0" "$RESULTS/run-primitives.out" || die "the dormant boot's sites were live - see $RESULTS/run-primitives.out"
 # THE POOLED ROW: the dormant run once more, at the demo's default worker count - one lane per vCPU, and
 # the workers share those four vCPUs with DisplayService.
 run pooled --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480

@@ -394,6 +394,9 @@ media_current() {
 # Selection precedes opening the template or starting QEMU, so an open-file check alone misses
 # active readers. The PID lease lasts through exec into QEMU. Acquisition and deletion share a
 # lock so a sweep cannot pass its last reader check just before a runner acquires the generation.
+# NO AGE IS ASKED FOR: the lease and the open-file check are what say a generation is in use, and a
+# generation no live run leases or holds open is gone at the next preparation - it used to be kept for
+# twelve hours more, one per volume build, so `.build/boot` held every key of the day.
 media_sweep() {
 	local prefix="$1" ext="$2" keep="$3"
 	(
@@ -419,7 +422,6 @@ media_sweep() {
 				fi
 			done
 			((retained == 0)) || continue
-			[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
 			if ! command -v fuser >/dev/null || fuser -s "$stale" 2>/dev/null; then
 				continue
 			fi
@@ -2001,6 +2003,11 @@ qemu_run_x86_64() {
 	# reason a cold run does: it must not attach the persistent instance's images, and having a
 	# set of its own is what lets the disk-conflict check below let it through.
 	[[ -n "${LIBER_DEV_STATE:-}" ]] && artifact_suffix="-dev-$(basename "$LIBER_DEV_STATE")"
+	# AND THE SET GOES WITH THE DIRECTORY: the marker names it, and `run-files.py sweep` removes the set once the
+	# directory is gone - a gate killed before its own cleanup ran leaves nothing behind for longer than that.
+	if [[ -n "${LIBER_DEV_STATE:-}" ]]; then
+		printf '%s\n' "$(cd "$LIBER_DEV_STATE" && pwd)" >"$QEMU_BUILD_DIR/state$artifact_suffix.path"
+	fi
 	timing_event runner start
 	timing_event image start
 	# Select an already-assembled ISO, or build the internal test/development medium for callers that
@@ -3479,6 +3486,14 @@ if [[ "${SYSTEM_SUSPEND_FIXTURE:-0}" == "1" ]]; then
 		exit 2
 	fi
 fi
+
+# A RUN LEAVES NOTHING BEHIND IN `.build/boot`. Every file named after this shell's pid is this run's, and
+# `scratch_sweep` alone, which looks at one prefix, left a private disk behind for every template key that never came
+# back - 743 of them, 30 GB, on 2026-10-16. So every run first removes what any ended run left, whatever its prefix,
+# and a detached `run-files.py reap` removes this run's own disks the moment this pid - QEMU, once exec'd - ends. A
+# console capture and the USB stick a gate reads after the run stay until the next run's sweep.
+python3 "$HERE/run-files.py" sweep "$QEMU_BUILD_DIR" || echo "qemu-run: the sweep of ended runs' files did not finish" >&2
+setsid -f python3 "$HERE/run-files.py" reap "$$" "$QEMU_BUILD_DIR" </dev/null >/dev/null 2>&1 || echo "qemu-run: this run's files will be removed by the next run's sweep, not at its end" >&2
 
 case "$TARGET_ARCH" in
 x86_64) qemu_run_x86_64 "$KERNEL_ELF" ;;

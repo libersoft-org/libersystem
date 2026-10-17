@@ -30,6 +30,7 @@
 # usage: check-hibernate-ports.py [--no-build] [aarch64|riscv64 ...]   (default: both)
 
 import importlib.util
+import contextlib
 import os
 import re
 import shutil
@@ -399,6 +400,10 @@ def main():
 		except GateError as error:
 			print(f'check-hibernate-ports: {target}: FAIL - {error}', file=sys.stderr, flush=True)
 			failed.append(target)
+		finally:
+			# THE LOGS ARE KEPT AND THE DISK IS NOT: it is this run's working copy of the volume, rebuilt by the next.
+			with contextlib.suppress(FileNotFoundError):
+				os.unlink(os.path.join(work, f'hibernate-disk-{target}.img'))
 	if failed:
 		print(f'check-hibernate-ports: FAIL on {", ".join(failed)}', file=sys.stderr)
 		return 1

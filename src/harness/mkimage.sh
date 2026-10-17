@@ -812,10 +812,13 @@ digest_file="$output.build-digest"
 # selection and nothing else would ever remove them. A medium a live guest is reading is never
 # touched: `fuser` answers that question and its absence is answered by keeping the file, which is
 # the safe direction for a sweep. Only the test medium is swept - the shipping media have one name.
+# AN HOUR, NOT A DAY: a medium has no lease, so the age is all that covers the moment between this
+# script naming it and the runner opening it - seconds. Twelve hours kept every selection of the day,
+# ten media at 65 MB each on 2026-10-16.
 if [[ "$cmd" == testiso ]]; then
 	for stale in "$BUILD/$SLUG-test."*.iso; do
 		[[ -f "$stale" && "$stale" != "$output" ]] || continue
-		[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
+		[[ -n "$(find "$stale" -mmin +60 -print -quit 2>/dev/null)" ]] || continue
 		if command -v fuser >/dev/null && fuser -s "$stale" 2>/dev/null; then
 			continue
 		fi

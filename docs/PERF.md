@@ -1486,6 +1486,21 @@ job on a quiet host.
 work that was wasted. `UI-basic` has no layer, and nothing on its path changed but a rectangle intersection per draw,
 yet it measured about 0.15 ms slower in every alternation; it remains under its budget, with less room than before.
 
+THE FINAL MEASUREMENT, on the same host quiet (load average 0.4 to 0.7, nothing else running), 2026-10-17 around 01:05
+local time: this replay only, `soft2d-bench --check --workers 1` six times - the `soft2d-performance` gate's run and
+five more of the same binary - each scene's median of thirty samples, then the median of the six:
+
+| scene | median of six | range | frozen budget |
+| --- | ---: | ---: | ---: |
+| UI-basic | 10.01 ms | 9.93 - 10.15 ms | 10.837 ms |
+| UI-effects | 42.10 ms | 41.89 - 42.38 ms | 65.640 ms |
+| vector-stress | 61.38 ms | 60.81 - 62.94 ms | 65.509 ms |
+| image-resample | 11.43 ms | 11.33 - 11.70 ms | 13.414 ms |
+| image-convert | 15.24 ms | 15.10 - 15.40 ms | 16.063 ms |
+
+Every scene meets its budget; no budget was changed. The old replay was not measured again on the quiet host, so the
+comparison with it stays the shared-host one above.
+
 THE PROBES, `SOFT2D_BENCH_PROBE=1`, one core, this replay (load average 2.4):
 
 | probe | 2026-10-14 | 2026-10-15 |

@@ -300,8 +300,14 @@ for attempt in 1 2 3 4 5; do
 	[[ -n "$loaded" ]] && break
 done
 [[ -n "$loaded" ]] || fail "under five loads neither C000 nor C001 was given its fastest level"
+# AFTER THE LOAD, AT EACH CORE'S NEXT SCHEDULER POINT. An idle core decides when it wakes - the governor never wakes it
+# itself - and a core the load ran on halts with nothing queued on it, so it holds the load's level until something
+# reaches it. The boot core wakes on its housekeeping bound; core 1 may not wake at all (it stayed at 255 for 20 s
+# with nothing run on 2026-10-16, 133 halts since its boot). A launch reaches every core - its address space is torn
+# down with a shootdown of every other core's TLB - and at that first point the level must be the slowest at once.
+launch_says "cores:" status-after-load powerctl status || fail "powerctl status did not answer after the load"
 await_page pct_control "${PSS[3]}" "after the load, C000 did not fall back to its slowest state"
-await_page cpc_desired 50 "after the load, C001 did not fall back to CPPC's lowest"
+await_page cpc_desired 50 "after the load, C001 did not fall back to CPPC's lowest at its next scheduler point"
 say "under load $loaded was given its fastest level (attempt $attempt), and fell back to its slowest after"
 
 # THE PROFILES: performance pins both cores at their fastest, power saving caps C000.

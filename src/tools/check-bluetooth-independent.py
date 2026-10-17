@@ -1549,6 +1549,10 @@ def main():
                 run(gate)
             finally:
                 gate.close()
+                # THE LOGS ARE KEPT AND THE IMAGES ARE NOT: the medium and the bond disk are this run's working copies,
+                # and a directory kept per run held two of them each, 1.3 GB by 2026-10-16.
+                for image in ('system.img', 'development.iso'):
+                    (work / image).unlink(missing_ok=True)
         note(f'PASS supported independent scenarios, production USB transport and bond persistence; {len(gate.fixture_requirements)} explicit per-feature fixture requirements remain in results.json (no all-profile independent PASS)')
         return 0
     except (GateError, OSError, ValueError, subprocess.TimeoutExpired) as error:

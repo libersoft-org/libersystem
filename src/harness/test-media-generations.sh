@@ -72,12 +72,14 @@ done
 [[ "$(tail -1 "$work/a.paths")" != "$(tail -1 "$work/b.paths")" ]]
 # Without a way to observe live readers, cleanup must retain an old generation.
 source "$work/helpers.sh"
-# Once both runner PIDs have exited, the aged generation and its leases can be reclaimed.
+# Once both runner PIDs have exited, every generation no live run leases is reclaimed with its leases, whatever its
+# age; the generation a live run selects is kept, and its exited readers' leases are discarded.
 system_template="$(tail -1 "$work/a.paths")"
 private_disk="${system_template%.img}.$$.img"
 touch -d '2 days ago' "$private_disk"
+kept_template="$(tail -1 "$work/b.paths")"
+media_sweep "$work/shared/system." .img "$kept_template"
 media_sweep "$work/shared/usb-media-test." .img ""
-media_sweep "$work/shared/system." .img ""
 [[ -f "$private_disk" ]]
 while IFS= read -r template; do
 	[[ ! -f "$template" ]]
@@ -86,13 +88,14 @@ while IFS= read -r template; do
 		exit 1
 	fi
 done <"$work/a.paths"
-# Repeated use of one generation must also discard its exited readers' leases.
-system_template="$(tail -1 "$work/b.paths")"
-media_sweep "$work/shared/system." .img "$system_template"
-for lease in "$system_template".lease.*; do
-	[[ "$lease" == "$system_template.lease.$$" ]]
+[[ ! -f "$(head -1 "$work/b.paths")" ]] || {
+	echo "media-generations: a generation no live run leases was kept" >&2
+	exit 1
+}
+for lease in "$kept_template".lease.*; do
+	[[ "$lease" == "$kept_template.lease.$$" ]]
 done
-[[ -f "$system_template" ]]
+[[ -f "$kept_template" ]]
 unobservable="$work/shared/unobservable.$(printf '%064d' 0).img"
 touch -d '2 days ago' "$unobservable"
 command() {
@@ -101,4 +104,61 @@ command() {
 }
 media_sweep "$work/shared/unobservable." .img ""
 [[ -f "$unobservable" ]]
-echo "media-generations: aged USB and system generations survived acquisition and were reclaimed after exit"
+echo "media-generations: each generation survived its acquisition, and the ones no live run leases were reclaimed after exit"
+# A RUN'S FILES GO WITH THE RUN. `run-files.py sweep` takes every file an ended pid owns, whatever its prefix, and leaves
+# a live pid's, a template with its key, and a set's lock; a development set goes once its state directory has; and
+# `reap` waits for its owner, then takes the owner's disks and keeps what a gate reads after the run.
+files="$work/run-files"
+mkdir -p "$files" "$work/state-here"
+dead="$(bash -c 'echo $$')"
+key="$(printf '%064d' 7)"
+for name in "virtio-blk.$key.img" "virtio-blk.$key.img.key" "virtio-blk.$key.$dead.img" "virtio-blk.$key.img.lease.$dead" \
+	"esp-x86_64.$dead.img" "virtio-blk.$key.$$.img" "virtio-blk-dev-x.lock" "virtio-console.$dead.out" \
+	"virtio-blk-dev-gone.$key.img" "usb-media-dev-gone.lock" "virtio-blk-dev-here.$key.img"; do
+	: >"$files/$name"
+done
+printf '%s\n' "$work/state-gone" >"$files/state-dev-gone.path"
+printf '%s\n' "$work/state-here" >"$files/state-dev-here.path"
+python3 "$HERE/run-files.py" sweep "$files"
+for name in "virtio-blk.$key.$dead.img" "virtio-blk.$key.img.lease.$dead" "esp-x86_64.$dead.img" "virtio-console.$dead.out" \
+	"virtio-blk-dev-gone.$key.img" "usb-media-dev-gone.lock" "state-dev-gone.path"; do
+	[[ ! -e "$files/$name" ]] || {
+		echo "run-files: the sweep kept $name, which no live run owns" >&2
+		exit 1
+	}
+done
+for name in "virtio-blk.$key.img" "virtio-blk.$key.img.key" "virtio-blk.$key.$$.img" "virtio-blk-dev-x.lock" \
+	"virtio-blk-dev-here.$key.img" "state-dev-here.path"; do
+	[[ -e "$files/$name" ]] || {
+		echo "run-files: the sweep removed $name, which is in use or no run's" >&2
+		exit 1
+	}
+done
+sleep 30 &
+owner=$!
+for name in "virtio-blk.$key.$owner.img" "scsi-scratch.$owner.img" "virtio-console.$owner.out" "usb-media.$key.$owner.img"; do
+	: >"$files/$name"
+done
+python3 "$HERE/run-files.py" reap "$owner" "$files" &
+reaper=$!
+sleep 0.5
+[[ -e "$files/virtio-blk.$key.$owner.img" ]] || {
+	echo "run-files: the reaper took a live run's disk" >&2
+	exit 1
+}
+kill "$owner"
+wait "$owner" 2>/dev/null || true
+wait "$reaper"
+for name in "virtio-blk.$key.$owner.img" "scsi-scratch.$owner.img"; do
+	[[ ! -e "$files/$name" ]] || {
+		echo "run-files: the reaper kept $name after its run ended" >&2
+		exit 1
+	}
+done
+for name in "virtio-console.$owner.out" "usb-media.$key.$owner.img"; do
+	[[ -e "$files/$name" ]] || {
+		echo "run-files: the reaper removed $name, which a gate reads after the run" >&2
+		exit 1
+	}
+done
+echo "run-files: an ended run's files swept whatever their prefix, a live run's kept, a set gone with its directory, and a run's disks reaped at its end"
