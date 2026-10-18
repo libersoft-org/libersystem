@@ -28,6 +28,12 @@
 
 extern crate alloc;
 
+#[path = "../../provider_subscription.rs"]
+pub mod provider_subscription;
+// The policy over a virtual machine's memory balloon: how much the host may have back.
+#[path = "resource_manager/balloon.rs"]
+mod balloon;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -117,6 +123,9 @@ impl Service for Manager {
 // Send one command to the probe and wait for its DONE acknowledgement. Returns true if the
 // probe answered - proof it survived the round (it did not crash on an over-budget refusal)
 // - or false if the channel send failed or the probe's side is gone.
+// How often the balloon's allowance is looked at again, in ticks: a second.
+const BALLOON_TICK: u64 = 100;
+
 fn drive(channel: u64, command: &[u8], buf: &mut [u8]) -> bool {
 	if !send_blocking(channel, command, 0) {
 		return false;
@@ -202,6 +211,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// dropped. A handoff the sender skips is not skipped: it swallows the next message and
 	// then blocks forever.
 	let process_client: u64 = recv_tagged(bootstrap, &mut buf, b"PROCESS").unwrap_or_else(|| fail_bootstrap(bootstrap, b"process", b"missing process client"));
+	// A CATALOGUE CONNECTION ADMITTING THE MEMORY BALLOON AND NOTHING ELSE, for the policy over what the host may have
+	// back. Always sent - a machine with no balloon has nothing published under the kind - and zero where the sender has
+	// no catalogue to mint from.
+	let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
 
 	// 2. create the bounded sub-Domain that hosts the governed component. It starts
 	//    uncapped; govern() sets and adjusts its memory budget around the probe.
@@ -223,9 +236,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 5. serve generated usage/set-limit requests against the live Domain until the
 	//    supervisor drops the channel.
+	//    And every second, between requests, the balloon's allowance looked at again.
 	let mut manager: Manager = Manager { domain, process: process_client };
+	let mut policy = balloon::BalloonPolicy::new(catalogue);
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { resources::dispatch(&mut manager, req, handle, out, reply_handle) });
+	serve_multi_ticked(service, &[], BALLOON_TICK, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+		if chan == 0 {
+			policy.tick();
+			return None;
+		}
+		resources::dispatch(&mut manager, req, handle, out, reply_handle)
+	});
 	exit();
 }

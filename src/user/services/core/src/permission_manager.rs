@@ -424,6 +424,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// THE HOST SHARE'S ONE READER, development-only: `vol://host` and nothing else - not the volumes, so what it reads
 		// it can only print, and nothing that holds the volumes reaches the host.
 		b"share" => Some(granted("share", alloc::vec![Capability::HostShare])),
+		// THE BALLOON GATE'S PROGRAM THAT NEEDS MEMORY, development-only: memory is charged to its Domain, and it needs no
+		// capability to ask for it.
+		b"memhog" => Some(granted("memhog", alloc::vec![])),
 		// THE BR/EDR GATE'S PROBE, development-only: both Bluetooth authorities, since it is the prompt watcher a
 		// person would be, the fixture's control endpoint, through which the devices on the far side act, and the audio
 		// a music player and a call would hold.

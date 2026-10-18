@@ -563,6 +563,12 @@ path = "user/libs/protocol/crypto-device-proto"
 owner = "share-device-proto"
 path = "user/libs/protocol/share-device-proto"
 
+# THE MEMORY BALLOON CONTRACT a `memory-balloon` provider serves: the host's target and the allowance ResourceManager
+# grants against it.
+[[sources]]
+owner = "balloon-device-proto"
+path = "user/libs/protocol/balloon-device-proto"
+
 [[sources]]
 owner = "spool-proto"
 path = "user/libs/protocol/spool-proto"
@@ -1449,6 +1455,18 @@ role = "probe"
 linkage = "static"
 stage = "volume"
 destination = "libexec/btgatt.lsexe"
+providers = []
+development = true
+
+# THE BALLOON GATE'S PROGRAM THAT NEEDS MEMORY, development-only: it takes what it is asked for, waiting when the machine
+# has none, and needs no capability - memory is charged to its Domain.
+[[programs]]
+name = "memhog"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/memhog.lsexe"
 providers = []
 development = true
 
@@ -2442,7 +2460,15 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/resource_manager.lsexe"
-providers = ["base-proto", "ipc-client", "resources-proto", "wire", "lsrt"]
+providers = [
+	"base-proto",
+	"ipc-client",
+	"resources-proto",
+	"balloon-device-proto",
+	"device-proto",
+	"wire",
+	"lsrt",
+]
 
 [[programs]]
 name = "resource_probe"
@@ -3951,6 +3977,25 @@ lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 34 }]
 provides = [{ kind = "i2c-bus", most = 1, consumers = 8 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
+# A VIRTUAL MACHINE'S MEMORY BALLOON: what the host asks to have back, held within the allowance ResourceManager - the
+# one consumer - grants, and only ever free memory, through the kernel's balloon object. Nothing granted, nothing given.
+[[programs]]
+name = "virtio_balloon"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_balloon.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 5 }]
+provides = [{ kind = "memory-balloon", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
@@ -5477,7 +5522,7 @@ program = "resource_manager"
 restart = "escalate"
 state_class = "reconstructible"
 state_scope = "service"
-dependencies = ["log_service", "process_service"]
+dependencies = ["log_service", "process_service", "device_manager"]
 
 [[services.roles]]
 tag = "PACKAGE"
@@ -5495,6 +5540,15 @@ tag = "PROCESS"
 kind = "client"
 provider = "process_service"
 interface = "liber:process@1/process"
+
+# THE MEMORY BALLOON, if the machine has one: the policy over how much its host may have back is this service's.
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["memory-balloon"]
 
 [[services]]
 name = "session_service"
@@ -7669,6 +7723,14 @@ providers = ["resources-proto"]
 name = "resources-proto"
 owner = "resources-proto"
 destination = "lib/protocol/resources-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+# THE MEMORY BALLOON CONTRACT, shared: ResourceManager - dynamically linked - is its one client.
+[[libraries]]
+name = "balloon-device-proto"
+owner = "balloon-device-proto"
+destination = "lib/protocol/balloon-device-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 

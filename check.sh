@@ -143,6 +143,10 @@ declare -A GATES=(
 	# and `vol://host` behind the host-share grant - its names, kinds and bytes the host's, a change on the host read again,
 	# no path or link out of it, and neither `cat` nor `ls`, which hold every volume a tool is handed, reaching it.
 	["host-share"]="tools/check-host-share.sh"
+	# THE MEMORY BALLOON ON A 2 GiB DEVELOPMENT INSTANCE: the host's requests over QMP given within ResourceManager's
+	# allowance, the reserve kept against a request for nearly everything, a program's need met by the balloon giving
+	# back, the host's cancellation followed, and the guest's statistics in QEMU's hands.
+	["balloon"]="tools/check-balloon.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

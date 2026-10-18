@@ -381,6 +381,9 @@ enum provider-kind {
 	/// A DIRECTORY OF THE HOST, on a development machine - `liber:share-device@1`'s `share-device` contract, read-only
 	/// and by node - which StorageService alone consumes, to serve it behind its volume API.
 	host-share = 34,
+	/// A MEMORY BALLOON - `liber:balloon-device@1`'s `balloon-device` contract: what a virtual machine's host asks to
+	/// have back and the allowance granted against it - which ResourceManager alone consumes.
+	memory-balloon = 35,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

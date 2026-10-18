@@ -1,0 +1,35 @@
+//! LiberSystem memory balloon - the contract a `memory-balloon` provider serves: what a virtual machine's host asks to
+//! have back, and the allowance ResourceManager grants against it.
+//!
+//! THE HOST ASKS AND THE MACHINE DECIDES. The host sets a target - how many pages it wants back - and the balloon holds
+//! the smaller of that and the allowance its one consumer, ResourceManager, grants; the kernel adds its own floor under
+//! both. Only FREE pages are ever given - never one a process, a buffer or a device holds - so no Domain is ever made to
+//! give anything up for the host, and when the machine needs memory again its policy lowers the allowance and the
+//! balloon gives pages back to it first.
+//!
+//! IN PAGES OF 4 KiB, the unit the device counts in.
+
+package liber:balloon-device@1;
+
+use liber:base@1.{error};
+
+/// Where the balloon stands.
+record balloon-status {
+	/// What the host asks this machine to give back.
+	target:    u64,
+	/// What the balloon holds now.
+	held:      u64,
+	/// The most the policy allows it to hold.
+	allowed:   u64,
+	/// How much of the target the allowance or the kernel's floor holds back: what the host asked for and is not given.
+	held-back: u64,
+}
+
+/// THE CONTRACT a `memory-balloon` publication serves.
+interface balloon-device {
+	/// Where the balloon stands.
+	@op(1) status: func() -> result<balloon-status, error>;
+	/// The most it may hold from now on. It moves toward the smaller of the host's target and this in bounded batches,
+	/// and gives pages back first when this falls below what it holds.
+	@op(2) allow:  func(pages: u64) -> result<balloon-status, error>;
+}

@@ -39,8 +39,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		exit();
 	}
 	let mut out = String::new();
-	render_row(&mut out, "Mem:  ", stats.total_frames * FRAME_SIZE, stats.free_frames * FRAME_SIZE, human);
+	// WHAT A BALLOON HOLDS is neither free nor used here: the host has it, and `used` does not count it.
+	let balloon = stats.balloon_frames * FRAME_SIZE;
+	render_row(&mut out, "Mem:  ", stats.total_frames * FRAME_SIZE - balloon, stats.free_frames * FRAME_SIZE, human);
 	render_row(&mut out, "Heap: ", stats.heap_total, stats.heap_free, human);
+	if balloon != 0 {
+		out.push_str("Balloon: given to the host ");
+		push_size(&mut out, balloon, human);
+		out.push('\n');
+	}
 	print(out.as_bytes());
 	exit();
 }

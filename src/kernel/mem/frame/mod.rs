@@ -1272,6 +1272,51 @@ pub fn free_count() -> usize {
 	ALLOCATOR.lock().free_count
 }
 
+// THE BALLOON'S FRAMES: taken out of the free pool for a virtual machine's host, neither free nor in use here. Counted
+// so the totals stay true - `total_count` is the machine's, and a frame the host holds is one this kernel lent, not
+// one it lost.
+static BALLOONED: AtomicUsize = AtomicUsize::new(0);
+
+// THE FLOOR A BALLOON NEVER TAKES BELOW: a sixteenth of the machine's frames, and never fewer than 32 MiB of them - what
+// this kernel keeps free for itself whatever a policy above it grants.
+pub fn balloon_floor(total: usize) -> usize {
+	(total / 16).max(8192)
+}
+
+// How many of `want` frames a balloon may take with `free` of `total` free: those above the floor, at most `want`.
+pub fn balloon_room(free: usize, total: usize, want: usize) -> usize {
+	free.saturating_sub(balloon_floor(total)).min(want)
+}
+
+// ONE FREE FRAME TAKEN FOR A BALLOON, or None at the floor. Only a FREE frame is ever taken - never one a process, a
+// buffer or a device holds - so nothing maps it but the direct map, through which this kernel never reaches a frame it
+// has not allocated.
+pub fn balloon_take() -> Option<u64> {
+	let (total, free) = totals();
+	if balloon_room(free, total, 1) == 0 {
+		return None;
+	}
+	let frame = allocate()?;
+	BALLOONED.fetch_add(1, Ordering::AcqRel);
+	Some(frame)
+}
+
+// A balloon's frame given back to the pool.
+//
+// # Safety
+//
+// `phys` was taken by `balloon_take` for the caller's balloon, is returned exactly once, and nothing maps it.
+pub unsafe fn balloon_return(phys: u64) {
+	// SAFETY: as the caller promises - a frame `allocate` handed out and nothing else holds.
+	unsafe { deallocate(phys) };
+	BALLOONED.fetch_sub(1, Ordering::AcqRel);
+}
+
+// How many frames every balloon holds.
+pub fn ballooned() -> usize {
+	BALLOONED.load(Ordering::Acquire)
+}
+
 // How many frees this allocator has REFUSED, and how many pages it has LOST.
 //
 // The two are different facts and were one, half of it compiled out. `refused_frees` counted a free

@@ -1,0 +1,5 @@
+package liber:balloon-device@1
+record balloon-status(target:u64,held:u64,allowed:u64,held-back:u64)
+interface balloon-device
+method balloon-device.status op=1 () -> result<balloon-status, liber:base@1::error>
+method balloon-device.allow op=2 (pages:u64:rights=) -> result<balloon-status, liber:base@1::error>

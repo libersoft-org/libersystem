@@ -202,6 +202,12 @@ path = "src/btgatt.rs"
 required-features = ["development"]
 
 [[bin]]
+# The balloon gate's program that needs memory, absent from a shipped image: it asks, waits and holds.
+name = "memhog"
+path = "src/memhog.rs"
+required-features = ["development"]
+
+[[bin]]
 # The host share's one reader, absent from a shipped image: `vol://host` through the host-share grant alone.
 name = "share"
 path = "src/share.rs"

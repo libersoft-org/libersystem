@@ -2843,18 +2843,22 @@ fn run_resource_scenario() -> Result<alloc::vec::Vec<u8>, &'static str> {
 
 	// ResourceManager: the init package (to launch the probe from), the channel its clients
 	// reach it on, and a ProcessService client. The order matches ResourceManager's receive
-	// order: PACKAGE, SERVE, PROCESS.
+	// order: PACKAGE, SERVE, PROCESS, CATALOGUE.
 	//
 	// The process client's peer is dropped, the idiom this harness already uses for the
 	// capabilities no scenario here answers on: a bootstrap reads its handoffs in order and
 	// each read consumes whatever arrived, so a skipped one is not skipped - it swallows the
 	// next message and blocks forever. That is how adding a capability to a service breaks
-	// every caller that starts it, this harness included.
+	// every caller that starts it, this harness included. The catalogue connection for the
+	// balloon policy is the same idiom: a peer dropped, so the policy finds no balloon.
 	let (process_peer, process_client) = Channel::create();
 	core::mem::drop(process_peer);
+	let (catalogue_peer, catalogue_client) = Channel::create();
+	core::mem::drop(catalogue_peer);
 	send_package(&rm_boot_kernel, init)?;
 	send_cap(&rm_boot_kernel, b"SERVE", resource_server, Rights::ALL)?;
 	send_cap(&rm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
+	send_cap(&rm_boot_kernel, b"CATALOGUE", catalogue_client, Rights::ALL)?;
 
 	sched::run_until_idle();
 

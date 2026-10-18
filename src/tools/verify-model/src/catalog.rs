@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 190] = [
+const GATES: [(&str, &str); 192] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -386,6 +386,15 @@ const GATES: [(&str, &str); 190] = [
 	// the manifest and the grant and bootstrap plumbing - a userspace change selects it - and it boots a
 	// development image because the fixture is development-only.
 	("smartcard-service", "userspace.build"),
+	// THE HOST SHARE, on a development instance of its own with `virtiofsd` over a directory the gate made: the virtio-fs
+	// driver, StorageService's `vol://host`, the host-share grant and the probe that holds it - with the host's own bytes
+	// and what `cat` and `ls` cannot reach as the oracles. Its subject is the driver, the service and the grant plumbing -
+	// a userspace change selects it - and it boots a development image because the driver is development-only.
+	("host-share", "userspace.build"),
+	// THE MEMORY BALLOON, on a development instance of its own with `virtio-balloon-pci`: the kernel's balloon object, the
+	// driver, ResourceManager's allowance and the probe that needs memory - with QEMU's `actual`, its guest statistics and
+	// the guest's own `free` as the oracles. Its subject is the kernel mechanism and the services and driver above it.
+	("balloon", "kernel"),
 	// MODEMSERVICE AND NETWORKSERVICE'S RAW-IP LINK, against the in-guest modem fixture: four separate
 	// authorities, PIN handling without replay, traffic through ordinary network calls, context loss,
 	// rollback, uplink replacement and fallback and reclamation, on a machine with no NIC and one with.
@@ -946,7 +955,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 89] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 91] = [
 	"dma-mode-x86_64",
 	// The lab machine the audio device model is driven on, with a card hot-plugged under a playing stream.
 	"audio-routing",
@@ -967,6 +976,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 89] = [
 	"brightness-acpi-no-dos",
 	"ipmi",
 	"smartcard-service",
+	"host-share",
+	"balloon",
 	"qemu-modem-service",
 	"qemu-camera-service",
 	"qemu-midi-service",
@@ -1077,6 +1088,8 @@ pub const EXCLUSIVE_GUEST_GATES: &[&str] = &[
 	"bluetooth-le-audio",
 	"power-service",
 	"smartcard-service",
+	"host-share",
+	"balloon",
 	"qemu-modem-service",
 	"qemu-camera-service",
 	"qemu-midi-service",

@@ -152,6 +152,9 @@ pub mod pmem;
 // The FUSE wire as virtio-fs carries it: the requests, the answers held to their lengths, the name rules a share keeps
 // and the handles that hide the host's node ids - the parts of the virtio-fs driver a host can test.
 pub mod fuse;
+// The memory balloon's decisions: a step toward the smaller of the host's target and the allowance, the frame numbers
+// the host is told and the statistics it is answered - the parts of the virtio-balloon driver a host can test.
+pub mod balloon;
 pub mod sdhci;
 pub mod serial_port;
 // THE 16550 REGISTER ENGINE, apart from where the UART is and what clocks it - the console UART's driver is the

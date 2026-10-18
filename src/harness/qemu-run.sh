@@ -2298,6 +2298,9 @@ qemu_run_x86_64() {
 	qemu_attach_hid_table qemu_args
 	qemu_attach_acpi_fixture qemu_args
 	qemu_attach_host_share qemu_args "$iommu" "${MEM:-4G}"
+	# A MEMORY BALLOON, when a run asks for one (`BALLOON=1`): its target is the host's, set over QMP, and the guest's
+	# statistics are asked for every two seconds so the host can read them back.
+	[[ "${BALLOON:-0}" != "1" ]] || qemu_args+=(-device "virtio-balloon-pci,id=balloon0,guest-stats-polling-interval=2${virtio_opts:+,$virtio_opts}")
 
 	# System volume disk: carries the LiberFS volume itself.
 	# The DMA test kernel enters its suite directly and reads fixtures from the boot archive.
@@ -2633,12 +2636,15 @@ qemu_run_x86_64() {
 		# host process, which is the engine a virtual machine is offered. Last again, so it renumbers nothing.
 		#
 		# AND TWO PERSISTENT-MEMORY MODULES, for the NVDIMM driver's suite - memory devices on no bus, so they renumber
-		# nothing either; see `qemu_attach_nvdimm`.
+		# nothing either; see `qemu_attach_nvdimm`. And a MEMORY BALLOON, last of the PCI devices, for the balloon's
+		# suite: its host asks for nothing here, so its driver holds nothing, and the kernel's balloon object is what the
+		# suite drives through it.
 		if [[ "$dma_fixture" != "1" ]]; then
 			qemu_args+=(-device edu,dma_mask=0xffffffffffffffff)
 			qemu_args+=(-device i6300esb)
 			qemu_args+=(-object cryptodev-backend-builtin,id=cryptoengine -device "virtio-crypto-pci,cryptodev=cryptoengine,${virtio_opts:-disable-legacy=on}")
 			qemu_attach_nvdimm qemu_args "${MEM:-4G}"
+			qemu_args+=(-device "virtio-balloon-pci,id=balloon0,${virtio_opts:-disable-legacy=on}")
 		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start

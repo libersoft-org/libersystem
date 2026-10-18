@@ -26,6 +26,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "balloon-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "base-proto"
 version = "0.0.0"
 dependencies = [
@@ -331,6 +340,7 @@ version = "0.0.0"
 dependencies = [
  "admin-proto",
  "audio-proto",
+ "balloon-device-proto",
  "base-proto",
  "bluetooth-proto",
  "bmc-proto",

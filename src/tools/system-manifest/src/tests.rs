@@ -617,6 +617,8 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// DMA: the TPM driver moves every command through the interface's own buffer registers, and the
 			// console UART's driver every byte through its data register.
 			"tpm_driver" | "uart16550" | "console_uart" => DmaPolicy::None,
+			// AND PERSISTENT MEMORY: the range is memory the driver copies to and from, and nothing is mastered.
+			"nvdimm" => DmaPolicy::None,
 			// THE WATCHDOGS MASTER NOTHING: a timer is armed and fed through its registers.
 			"i6300esb" | "tco" | "wdat" => DmaPolicy::None,
 			// THE ACPI GATE'S FIXTURE DRIVER: a namespace device's platform row, reached through its window and its

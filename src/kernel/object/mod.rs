@@ -16,6 +16,8 @@ pub mod event;
 pub mod handle;
 pub mod interrupt;
 pub mod latency_request;
+// Free frames held for a virtual machine's host. See `balloon`.
+pub mod balloon;
 pub mod memory_object;
 pub mod port_range;
 pub mod privilege;
@@ -74,6 +76,8 @@ pub enum ObjectType {
 	Registers,
 	// A bound on every core's idle states. See `latency_request`.
 	LatencyRequest,
+	// Free frames held for a virtual machine's host. See `balloon`.
+	Balloon,
 }
 
 impl ObjectType {
@@ -102,6 +106,7 @@ impl ObjectType {
 			ObjectType::ConsoleTap => abi::OBJECT_TYPE_CONSOLE_TAP,
 			ObjectType::Registers => abi::OBJECT_TYPE_REGISTERS,
 			ObjectType::LatencyRequest => abi::OBJECT_TYPE_LATENCY_REQUEST,
+			ObjectType::Balloon => abi::OBJECT_TYPE_BALLOON,
 		}
 	}
 }

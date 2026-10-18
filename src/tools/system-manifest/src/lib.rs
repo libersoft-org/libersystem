@@ -239,6 +239,8 @@ pub enum ProviderKindName {
 	Crypto,
 	/// A directory of the host on a development machine, with StorageService its one consumer.
 	HostShare,
+	/// A virtual machine's memory balloon, with ResourceManager its one consumer.
+	MemoryBalloon,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -299,6 +301,7 @@ impl ProviderKindName {
 			ProviderKindName::AmbientLight => 32,
 			ProviderKindName::Crypto => 33,
 			ProviderKindName::HostShare => 34,
+			ProviderKindName::MemoryBalloon => 35,
 		}
 	}
 }

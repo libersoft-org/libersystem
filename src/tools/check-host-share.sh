@@ -3,7 +3,7 @@
 # development image's virtio-fs driver, mounted by StorageService as `vol://host` and granted to `share` alone.
 #
 #   1. WHAT `share` LISTS AND PRINTS IS THE DIRECTORY'S: its names and kinds, a file's bytes, a file read across
-#      several of the share's 32 KiB reads line for line, a file in a subdirectory - and a change this script makes on
+#      several of the share's 16 KiB reads line for line, a file in a subdirectory - and a change this script makes on
 #      the host after the boot, read again.
 #   2. NOTHING WALKS OUT OF IT: `..` and `.` in a path, a symbolic link to a file outside the share, read, and one to
 #      the share's parent, walked through, are each refused, and a host name no volume can hold is not listed.
@@ -91,7 +91,7 @@ printf 'hello from the host share\n' >"$share/hello.txt"
 printf 'the inner line\n' >"$share/docs/inner.txt"
 python3 -c 'import sys
 with open(sys.argv[1], "w") as out:
-    for line in range(1, 1601):
+    for line in range(1, 641):
         out.write(f"line {line:05d} of the long file, past two of the share'"'"'s reads\n")' "$share/long.txt"
 printf 'a secret of the host, outside the share\n' >"$outside"
 ln -s "$outside" "$share/outside"
@@ -99,7 +99,8 @@ ln -s .. "$share/up"
 python3 -c 'import os, sys; open(os.path.join(os.fsencode(sys.argv[1]), b"bad\xff"), "w").close()' "$share"
 long_lines="$(wc -l <"$share/long.txt")"
 long_size="$(stat -c %s "$share/long.txt")"
-((long_size > 65536)) || fail "the long file is $long_size bytes, not past two 32 KiB reads"
+# PAST TWO OF THE SHARE'S 16 KiB READS, and inside the 64 KiB of a launch's output the development agent keeps.
+((long_size > 32768 && long_size < 60000)) || fail "the long file is $long_size bytes, not past two 16 KiB reads and inside a launch's output"
 
 # THE DAEMON, read-only, sandboxed, without extended attributes or a cache - so a change on the host is read again.
 "$VIRTIOFSD" --shared-dir "$share" --socket-path "$state/virtiofs.sock" --readonly --sandbox namespace --cache never >"$state/virtiofsd.log" 2>&1 &
@@ -134,7 +135,7 @@ launched inner share cat docs/inner.txt
 says inner "the inner line" "a file in a subdirectory is not the host's"
 launched long share cat long.txt
 says long "line 00001 of the long file" "the long file's first line is missing"
-says long "line 00800 of the long file" "the long file's middle is missing"
+says long "line 00320 of the long file" "the long file's middle is missing"
 says long "line $(printf '%05d' "$long_lines") of the long file" "the long file's last line is missing"
 [[ "$(grep -a -c 'of the long file, past two' "$state/long.log")" == "$long_lines" ]] || fail "the long file did not come back whole, line for line"
 printf 'changed on the host after the boot\n' >"$share/hello.txt"
@@ -143,7 +144,15 @@ says changed "changed on the host after the boot" "a change on the host was not 
 say "the share's names, kinds, sizes and bytes are the host's, and a change on the host is read again"
 
 # 2. NOTHING WALKS OUT OF IT.
-for path in "../outside.txt" "docs/../hello.txt" "./hello.txt" "outside" "up/hello.txt" "up/outside.txt"; do
+# A DOT OR A DOT-DOT is refused by the volume API's own path rule before the share is asked (`not found`: no volume
+# path has one); a link is refused by the share (`refused`). Either way the answer is an error line and no bytes.
+for path in "../outside.txt" "docs/../hello.txt" "./hello.txt"; do
+	launched escape share cat "$path"
+	says escape "share: $path: not found" "'share cat $path' was not refused by the path rule"
+	never escape "a secret of the host" "'share cat $path' reached a file outside the share"
+	never escape "hello from" "'share cat $path' reached a file by another name"
+done
+for path in "outside" "up/hello.txt" "up/outside.txt"; do
 	launched escape share cat "$path"
 	says escape "share: $path: refused" "'share cat $path' was not refused"
 	never escape "a secret of the host" "'share cat $path' reached a file outside the share"

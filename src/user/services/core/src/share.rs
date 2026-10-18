@@ -21,15 +21,15 @@ fn fail(line: &str) -> ! {
 	exit_with(1);
 }
 
-fn why(error: Error) -> &'static str {
-	match error {
+fn why(error: Error) -> String {
+	String::from(match error {
 		Error::NotFound => "not found",
 		Error::Denied => "denied",
 		Error::Invalid => "refused - not a name, a file or a directory this share holds",
 		Error::Again => "the share is not there now; try again",
 		Error::Unsupported => "not supported by the share",
-		_ => "the share could not answer",
-	}
+		other => return format!("the share could not answer ({other:?})"),
+	})
 }
 
 #[unsafe(no_mangle)]

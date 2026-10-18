@@ -21,6 +21,7 @@ use crate::device;
 use crate::fault::FaultInfo;
 use crate::loader::{self, LoadError};
 use crate::mem::frame::PAGE_SIZE;
+use crate::object::balloon::Balloon;
 use crate::object::channel::{Channel, ChannelError, Message, RecvRefusal};
 use crate::object::claim::Claim;
 use crate::object::device_memory::DeviceMemory;
@@ -579,6 +580,9 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 			Err(error) => error,
 		},
 		abi::SYS_LATENCY_REQUEST => sys_latency_request(a0, a1),
+		abi::SYS_BALLOON_CREATE => sys_balloon_create(a0),
+		abi::SYS_BALLOON_TAKE => sys_balloon_take(a0, a1, a2),
+		abi::SYS_BALLOON_GIVE => sys_balloon_give(a0, a1, a2),
 		abi::SYS_DEVICE_NODE => firmware::sys_device_node(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
@@ -1184,7 +1188,7 @@ fn sys_memory_stats(buf_ptr: u64, buf_len: u64) -> i64 {
 	}
 	let (total_frames, free_frames) = crate::mem::frame::totals();
 	let (heap_total, heap_free) = crate::mem::heap::stats();
-	let out = MemoryStats { total_frames: total_frames as u64, free_frames: free_frames as u64, heap_total, heap_free };
+	let out = MemoryStats { total_frames: total_frames as u64, free_frames: free_frames as u64, heap_total, heap_free, balloon_frames: crate::mem::frame::ballooned() as u64 };
 	if let Err(e) = write_user(buf_ptr, out) {
 		return e;
 	}
@@ -2574,6 +2578,77 @@ fn sys_processor_perf_table(privilege: u64, cpu: u64, table: u64) -> i64 {
 }
 
 // A LATENCY REQUEST, counted against its process and the system before its handle is made.
+// A BALLOON FOR THE VIRTIO-BALLOON DEVICE the caller's DeviceMemory capability names, derived from that binding: the
+// device is the authority, since the one program with a reason to hold free frames for the host is that device's
+// driver. Any other device, or a binding that has ended, is refused.
+fn sys_balloon_create(device_handle: u64) -> i64 {
+	let thread = current_thread!();
+	let memory = match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::WRITE) {
+		Ok(memory) => memory,
+		Err(error) => return error,
+	};
+	let Some(key) = memory.claim() else { return ERR_ACCESS_DENIED };
+	if device::claim_stamp(key).is_none() {
+		return ERR_ACCESS_DENIED;
+	}
+	let balloon_device = device::with(key.device_index as usize, |entry| entry.platform.is_none() && entry.transport == abi::TRANSPORT_VIRTIO_PCI && u32::from(entry.device_type) == abi::VIRTIO_TYPE_BALLOON).unwrap_or(false);
+	if !balloon_device {
+		return ERR_ACCESS_DENIED;
+	}
+	let Some(object) = Balloon::new() else { return ERR_NO_MEMORY };
+	// MINTED BEFORE IT IS RECORDED AS DERIVED, for the reason a DMA buffer's capability is: a release in between leaves
+	// the capability born stale rather than one that outlives its binding.
+	let capability = Capability::new(object.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::ALL);
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(object.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	install_capability(&thread, capability)
+}
+
+// UP TO `most` FREE FRAMES TAKEN INTO THE BALLOON, their physical addresses written at `out_ptr`: the count, zero at the
+// floor. A count that cannot be written is given straight back, so the caller never holds a frame it was not told of.
+fn sys_balloon_take(handle: u64, out_ptr: u64, most: u64) -> i64 {
+	let balloon = match current_typed::<Balloon>(handle, ObjectType::Balloon, Rights::WRITE) {
+		Ok(balloon) => balloon,
+		Err(error) => return error,
+	};
+	let most = most.min(abi::MAX_BALLOON_BATCH) as usize;
+	if most == 0 {
+		return 0;
+	}
+	if !user_buf_ok(out_ptr, (most * 8) as u64) {
+		return ERR_INVALID;
+	}
+	let mut frames = [0u64; abi::MAX_BALLOON_BATCH as usize];
+	let taken = balloon.take(&mut frames[..most]);
+	if let Err(error) = copy_to_user_exact(out_ptr, frames.as_ptr() as *const u8, taken * 8) {
+		let _ = balloon.give(&frames[..taken]);
+		return error;
+	}
+	taken as i64
+}
+
+// THE FRAMES AT `in_ptr` GIVEN BACK to the allocator, all or none: the count, or ERR_INVALID when one of them is not the
+// balloon's.
+fn sys_balloon_give(handle: u64, in_ptr: u64, count: u64) -> i64 {
+	let balloon = match current_typed::<Balloon>(handle, ObjectType::Balloon, Rights::WRITE) {
+		Ok(balloon) => balloon,
+		Err(error) => return error,
+	};
+	if count > abi::MAX_BALLOON_BATCH {
+		return ERR_INVALID;
+	}
+	let count = count as usize;
+	let mut frames = [0u64; abi::MAX_BALLOON_BATCH as usize];
+	if let Err(error) = copy_from_user_exact(frames.as_mut_ptr() as *mut u8, in_ptr, count * 8) {
+		return error;
+	}
+	match balloon.give(&frames[..count]) {
+		Ok(given) => given as i64,
+		Err(_) => ERR_INVALID,
+	}
+}
+
 fn sys_latency_request(privilege: u64, bound_us: u64) -> i64 {
 	if let Err(error) = holds_privilege(privilege, PrivilegeKind::IdleLatency) {
 		return error;

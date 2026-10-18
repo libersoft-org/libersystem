@@ -1508,6 +1508,9 @@ pub enum ProviderKind {
 	/// A DIRECTORY OF THE HOST, on a development machine - `liber:share-device@1`'s `share-device` contract, read-only
 	/// and by node - which StorageService alone consumes, to serve it behind its volume API.
 	HostShare = 34,
+	/// A MEMORY BALLOON - `liber:balloon-device@1`'s `balloon-device` contract: what a virtual machine's host asks to
+	/// have back and the allowance granted against it - which ResourceManager alone consumes.
+	MemoryBalloon = 35,
 }
 
 impl ProviderKind {
@@ -1584,6 +1587,7 @@ impl ProviderKind {
 			32 => Some(ProviderKind::AmbientLight),
 			33 => Some(ProviderKind::Crypto),
 			34 => Some(ProviderKind::HostShare),
+			35 => Some(ProviderKind::MemoryBalloon),
 			_ => None,
 		}
 	}
@@ -9067,6 +9071,7 @@ impl ProviderKind {
 			ProviderKind::AmbientLight => out.push_str("\"ambient-light\""),
 			ProviderKind::Crypto => out.push_str("\"crypto\""),
 			ProviderKind::HostShare => out.push_str("\"host-share\""),
+			ProviderKind::MemoryBalloon => out.push_str("\"memory-balloon\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -9105,6 +9110,7 @@ impl ProviderKind {
 			ProviderKind::AmbientLight => out.push_str("ambient-light"),
 			ProviderKind::Crypto => out.push_str("crypto"),
 			ProviderKind::HostShare => out.push_str("host-share"),
+			ProviderKind::MemoryBalloon => out.push_str("memory-balloon"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -9143,6 +9149,7 @@ impl ProviderKind {
 			ProviderKind::AmbientLight => crate::codec::cbor::text(out, "ambient-light"),
 			ProviderKind::Crypto => crate::codec::cbor::text(out, "crypto"),
 			ProviderKind::HostShare => crate::codec::cbor::text(out, "host-share"),
+			ProviderKind::MemoryBalloon => crate::codec::cbor::text(out, "memory-balloon"),
 		}
 	}
 }

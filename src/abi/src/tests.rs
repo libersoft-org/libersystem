@@ -224,6 +224,10 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_LATENCY_REQUEST, 127),
 	(SYS_PROCESSOR_PERF_PREFERENCE, 128),
 	(SYS_THREAD_START_ON, 129),
+	// THE BALLOON'S THREE.
+	(SYS_BALLOON_CREATE, 130),
+	(SYS_BALLOON_TAKE, 131),
+	(SYS_BALLOON_GIVE, 132),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -395,6 +399,7 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(OBJECT_TYPE_CONSOLE_TAP, 16),
 		(OBJECT_TYPE_REGISTERS, 17),
 		(OBJECT_TYPE_LATENCY_REQUEST, 18),
+		(OBJECT_TYPE_BALLOON, 19),
 	];
 	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
 	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.
@@ -908,7 +913,8 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		stack_limit => 96,
 	);
 
-	assert_layout!(covered, MemoryStats, 32, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24);
+	// The balloon's frames extend the prior layout without moving it.
+	assert_layout!(covered, MemoryStats, 40, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24, balloon_frames => 32);
 	// THE TWO BOOLEANS ARE `u8` AND THE PADDING IS EXPLICIT, which is what makes this struct safe to
 	// build out of bytes a caller supplied: a `bool` holding anything but 0 or 1 is undefined
 	// behaviour the moment it is read, and implicit tail padding is bytes nobody has agreed about.

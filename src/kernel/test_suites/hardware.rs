@@ -5722,3 +5722,57 @@ fn nvdimm_serves_persistent_memory_as_blocks_and_a_module_that_will_not_save_rea
 		crate::serial_println!("nvdimm: two NFIT ranges, two rows; the host's sectors read where the table puts them, a write durable and in the module, six refusals, a second driver reading the first's bytes, and the unarmed module read-only");
 	}
 }
+
+// ------------------------------------------------------------------------ the memory balloon
+//
+// THE KERNEL'S HALF, through the syscalls its driver uses, on the test machine's `virtio-balloon-pci` - which asks for
+// nothing here, so the driver's half is the balloon gate's, where a host asks.
+tagged_test!(a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle, [Drivers, Memory, Pci], id = "kernel.hardware.a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle", covers = ["kernel"]);
+fn a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_with_its_handle() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_: u64) {
+		use crate::mem::frame;
+		let invoke = |number: u64, a0: u64, a1: u64, a2: u64| unsafe { arch::syscall::invoke(number, a0, a1, a2, 0) } as i64;
+		let virtio = |kind: u32| (0..device::count()).find(|&index| device::with(index, |entry| entry.platform.is_none() && entry.transport == abi::TRANSPORT_VIRTIO_PCI && u32::from(entry.device_type) == kind).unwrap_or(false));
+		let balloon_device = virtio(abi::VIRTIO_TYPE_BALLOON).expect("the test machine has a memory balloon");
+		let other_device = virtio(abi::VIRTIO_TYPE_RNG).expect("and an entropy source");
+		let grant = crate::tests::claim_device(balloon_device as u64).expect("the balloon is claimed under the entry that declares it");
+		let other = crate::tests::claim_device(other_device as u64).expect("so is the entropy source");
+		// ONLY THE BALLOON'S BINDING MINTS ONE.
+		assert_eq!(invoke(abi::SYS_BALLOON_CREATE, other.memory, 0, 0), abi::ERR_ACCESS_DENIED, "another device's window is no authority over free memory");
+		assert!(invoke(abi::SYS_BALLOON_CREATE, 0, 0, 0) < 0, "and no window none");
+		let balloon = invoke(abi::SYS_BALLOON_CREATE, grant.memory, 0, 0);
+		assert!(balloon > 0, "the balloon device's window mints one ({balloon})");
+		let balloon = balloon as u64;
+		// A BATCH IS BOUNDED, AND WHAT IS TAKEN IS FREE MEMORY THE KERNEL COUNTS AS THE BALLOON'S.
+		let before = frame::ballooned();
+		let mut frames = [0u64; abi::MAX_BALLOON_BATCH as usize];
+		assert_eq!(invoke(abi::SYS_BALLOON_TAKE, balloon, frames.as_mut_ptr() as u64, 300), 256, "at most a batch, whatever is asked");
+		assert_eq!(frame::ballooned(), before + 256);
+		assert!(frames.iter().all(|phys| phys % 4096 == 0 && !frame::is_free(*phys)), "page frames, none of them free while held");
+		// A GIVE IS ALL OR NOTHING.
+		let mut wrong = frames;
+		wrong[7] = 0x1000;
+		assert_eq!(invoke(abi::SYS_BALLOON_GIVE, balloon, wrong.as_ptr() as u64, 256), abi::ERR_INVALID, "a frame that is not the balloon's refuses the whole give");
+		assert_eq!(invoke(abi::SYS_BALLOON_GIVE, balloon, frames.as_ptr() as u64, 257), abi::ERR_INVALID, "and more than a batch");
+		assert_eq!(frame::ballooned(), before + 256, "neither gave anything back");
+		assert_eq!(invoke(abi::SYS_BALLOON_GIVE, balloon, frames.as_ptr() as u64, 100), 100);
+		assert_eq!(frame::ballooned(), before + 156);
+		// THE BINDING ENDS: the balloon takes nothing more, and holds what it has until its handle closes - when every
+		// frame goes back.
+		crate::tests::release_device(&grant);
+		assert!(invoke(abi::SYS_BALLOON_TAKE, balloon, frames.as_mut_ptr() as u64, 1) < 0, "a balloon whose binding ended takes nothing");
+		assert_eq!(frame::ballooned(), before + 156, "and gives back only as it ends");
+		assert_eq!(invoke(abi::SYS_HANDLE_CLOSE, balloon, 0, 0), 0);
+		assert_eq!(frame::ballooned(), before, "every frame went back with the last handle");
+		assert!(frames[100..].iter().all(|phys| frame::is_free(*phys)), "and is free again");
+		crate::tests::release_device(&other);
+		DONE.store(true, Ordering::SeqCst);
+	}
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the balloon test's thread ran to its end");
+	crate::serial_println!("balloon: minted for the balloon's binding alone, a batch of 256 taken from free memory, a wrong give refused whole, and every frame back with the last handle");
+}

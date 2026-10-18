@@ -95,6 +95,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("btgatt", "btgatt - read, write and subscribe through one GATT grant on the peer aliased tag-1"),
 	("btserial", "btserial - connect, write and read through one serial port grant on the peer aliased serial-1"),
 	("share", "share ls [PATH] | share cat PATH - read the host share, vol://host, on a development machine started with one"),
+	("memhog", "memhog MIB [SECONDS] - take MIB mebibytes, waiting when the machine has none, and hold them (development)"),
 	("hidcheck", "hidcheck CASE - drive the HID-over-I2C gate: a live pointer and contact client with a focused surface"),
 	("powercheck", "powercheck CASE - drive the power gate against the in-guest fixture"),
 	("powerread", "powerread - read power state with the read authority alone"),

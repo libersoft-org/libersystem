@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use drivers::common;
@@ -38,14 +39,19 @@ const CONFIG_TAG: u64 = 0;
 const TAG_LEN: usize = 36;
 const CONFIG_REQUEST_QUEUES: u64 = 36;
 
-// THE BOUNDS THIS DRIVER SERVES: one read, one page of a listing, and the bytes asked of one READDIR.
-const MAX_READ: usize = 32 * 1024;
-const MAX_ENTRIES: usize = 64;
-const LISTING_BYTES: u32 = 16 * 1024;
-
+// THE ANSWER'S LAYOUT: its header in a page of its own and its body in DATA_PAGES pages after it, each page one
+// descriptor - the way the FUSE wire is laid out by the drivers its servers are written against, and what makes a
+// body larger than a page reach the guest at all: one descriptor spanning several pages was answered EIO by the host's
+// daemon for every read past the first page. A chain is at most eight descriptors, so four pages of body.
 const PAGE: u64 = 4096;
-// The reply buffer: a header and the largest answer this driver asks for.
-const REPLY_LEN: u64 = 40 * 1024;
+const DATA_PAGES: usize = 4;
+const REPLY_LEN: u64 = (1 + DATA_PAGES as u64) * PAGE;
+
+// THE BOUNDS THIS DRIVER SERVES: one read, one page of a listing, and the bytes asked of one READDIR - each the body
+// the answer's pages hold.
+const MAX_READ: usize = DATA_PAGES * PAGE as usize;
+const MAX_ENTRIES: usize = 64;
+const LISTING_BYTES: u32 = MAX_READ as u32;
 
 // One DMA buffer: its address here and the device's.
 #[derive(Clone, Copy)]
@@ -61,9 +67,10 @@ impl Buffer {
 		unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (self.virt + at as u64) as *mut u8, bytes.len()) };
 	}
 
-	fn bytes(&self, len: usize) -> &[u8] {
+	fn bytes(&self, at: usize, len: usize) -> &[u8] {
+		let at = at.min(self.len as usize);
 		// SAFETY: as above; the device has given the chain back before this is read.
-		unsafe { core::slice::from_raw_parts(self.virt as *const u8, len.min(self.len as usize)) }
+		unsafe { core::slice::from_raw_parts((self.virt + at as u64) as *const u8, len.min(self.len as usize - at)) }
 	}
 
 	fn clear(&self, len: usize) {
@@ -100,12 +107,36 @@ impl Share {
 			at += part.len();
 		}
 		self.reply.clear(fuse::OUT_HEADER);
-		let chain: [(u64, u32, bool); 2] = [(self.request.phys, len as u32, false), (self.reply.phys, self.reply.len as u32, true)];
+		let mut chain = [(0u64, 0u32, false); 2 + DATA_PAGES];
+		chain[0] = (self.request.phys, len as u32, false);
+		chain[1] = (self.reply.phys, fuse::OUT_HEADER as u32, true);
+		for page in 0..DATA_PAGES {
+			chain[2 + page] = (self.reply.phys + (1 + page as u64) * PAGE, PAGE as u32, true);
+		}
 		let mut used = [0u32; 1];
-		self.requests.submit_chains(&[&chain], None, &mut used).map_err(|_| Error::Io)?;
-		let answered = self.reply.bytes(used[0] as usize);
-		let (errno, body) = fuse::out_header(answered, unique).map_err(|_| Error::Io)?;
+		// EVERY FAILURE IS SAID, with the operation and the cause: what a consumer sees is a meaning, and the line
+		// is where the host's own answer stays visible to a developer.
+		if let Err(fault) = self.requests.submit_chains(&[&chain], None, &mut used) {
+			print(format!("driver.virtio-fs: FUSE operation {opcode} was not completed by the device ({fault:?})\n").as_bytes());
+			return Err(Error::Io);
+		}
+		// THE ANSWER REASSEMBLED: its header out of the first page, its body out of the pages after it.
+		let written = used[0] as usize;
+		let mut answered: Vec<u8> = Vec::new();
+		answered.try_reserve_exact(written).map_err(|_| Error::Exhausted)?;
+		answered.extend_from_slice(self.reply.bytes(0, written.min(fuse::OUT_HEADER)));
+		answered.extend_from_slice(self.reply.bytes(PAGE as usize, written.saturating_sub(fuse::OUT_HEADER)));
+		let (errno, body) = match fuse::out_header(&answered, unique) {
+			Ok(answer) => answer,
+			Err(fault) => {
+				print(format!("driver.virtio-fs: FUSE operation {opcode} was answered malformed ({fault:?}, {} byte(s) used)\n", used[0]).as_bytes());
+				return Err(Error::Io);
+			}
+		};
 		if errno != 0 {
+			if opcode != fuse::LOOKUP || errno != 2 {
+				print(format!("driver.virtio-fs: FUSE operation {opcode} answered errno {errno} (answer pages at {:#x})\n", self.reply.phys).as_bytes());
+			}
 			return Err(fuse::errno_error(errno));
 		}
 		let mut out = Vec::new();

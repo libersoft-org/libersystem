@@ -231,6 +231,14 @@ test = false
 bench = false
 
 [[bin]]
+# THE VIRTIO-BALLOON DRIVER: memory a virtual machine gives back to its host, within the allowance ResourceManager grants.
+# Its steps, the frame numbers and the statistics are `src/balloon.rs`, part of the library and host-tested.
+name = "virtio_balloon"
+path = "src/virtio_balloon.rs"
+test = false
+bench = false
+
+[[bin]]
 # THE VIRTIO-FS DRIVER, development-only: a directory of the host as the `share-device` contract, which StorageService
 # serves as `vol://host`. Its FUSE wire, the name rules and the node handles are `src/fuse.rs`, part of the library
 # and host-tested.

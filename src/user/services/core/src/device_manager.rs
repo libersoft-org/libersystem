@@ -6912,6 +6912,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::AMBIENT_LIGHT => proto::system::ProviderKind::AmbientLight,
 		provider::CRYPTO => proto::system::ProviderKind::Crypto,
 		provider::HOST_SHARE => proto::system::ProviderKind::HostShare,
+		provider::MEMORY_BALLOON => proto::system::ProviderKind::MemoryBalloon,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6952,6 +6953,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::AmbientLight => driver_protocol::provider::AMBIENT_LIGHT,
 		proto::system::ProviderKind::Crypto => driver_protocol::provider::CRYPTO,
 		proto::system::ProviderKind::HostShare => driver_protocol::provider::HOST_SHARE,
+		proto::system::ProviderKind::MemoryBalloon => driver_protocol::provider::MEMORY_BALLOON,
 	}
 }
 

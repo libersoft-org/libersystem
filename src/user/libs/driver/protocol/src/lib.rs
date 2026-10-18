@@ -555,6 +555,9 @@ pub mod provider {
 	/// A DIRECTORY OF THE HOST on a development machine, the `liber:share-device@1` `share-device` contract: read-only,
 	/// by node, with the host's identities kept behind. StorageService alone consumes it.
 	pub const HOST_SHARE: u16 = 34;
+	/// A MEMORY BALLOON, the `liber:balloon-device@1` `balloon-device` contract: the host's target and the allowance
+	/// ResourceManager - its one consumer - grants against it.
+	pub const MEMORY_BALLOON: u16 = 35;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

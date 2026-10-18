@@ -789,6 +789,8 @@ pub const VIRTIO_TYPE_GPIO: u32 = 41;
 // A SYMMETRIC CIPHER ENGINE the host offers. Its every key and byte are the host's to see, so it is an offload a
 // consumer may choose and never a place the system's own cryptography goes.
 pub const VIRTIO_TYPE_CRYPTO: u32 = 20;
+/// virtio-balloon: memory a virtual machine gives back to its host - see `SYS_BALLOON_CREATE`.
+pub const VIRTIO_TYPE_BALLOON: u32 = 5;
 /// virtio-fs: a directory of the host, FUSE over virtqueues - driven on a development machine only.
 pub const VIRTIO_TYPE_FS: u32 = 26;
 
@@ -945,6 +947,7 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_I2C => "virtio-i2c",
 		VIRTIO_TYPE_GPIO => "virtio-gpio",
 		VIRTIO_TYPE_CRYPTO => "virtio-crypto",
+		VIRTIO_TYPE_BALLOON => "virtio-balloon",
 		VIRTIO_TYPE_FS => "virtio-fs",
 		DEVICE_TYPE_XHCI => "xhci",
 		DEVICE_TYPE_NVME => "nvme",
@@ -1372,6 +1375,8 @@ pub const OBJECT_TYPE_CONSOLE_TAP: u64 = 16;
 pub const OBJECT_TYPE_REGISTERS: u64 = 17;
 // A latency request: held, it bounds every core's idle states - see `SYS_LATENCY_REQUEST`.
 pub const OBJECT_TYPE_LATENCY_REQUEST: u64 = 18;
+// A balloon: free frames held for a virtual machine's host - see `SYS_BALLOON_CREATE`.
+pub const OBJECT_TYPE_BALLOON: u64 = 19;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1444,8 +1449,9 @@ pub struct DomainStats {
 
 // The memory totals memory_stats writes into the caller's buffer: the physical frame
 // allocator's total and free 4 kB frames (the total is fixed at boot from the usable
-// memory-map regions), and the kernel heap's total and free bytes. repr(C) so the
-// kernel and userspace agree on the layout byte-for-byte.
+// memory-map regions), the kernel heap's total and free bytes, and the frames a balloon
+// holds for the host - neither free nor in use here. repr(C) so the kernel and userspace
+// agree on the layout byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct MemoryStats {
@@ -1453,6 +1459,7 @@ pub struct MemoryStats {
 	pub free_frames: u64,
 	pub heap_total: u64,
 	pub heap_free: u64,
+	pub balloon_frames: u64,
 }
 
 // One module's lifecycle arrays, as `process_lifecycle` writes them into the caller's buffer: the
@@ -1735,6 +1742,22 @@ pub const SYS_PROCESSOR_PERF_PREFERENCE: u64 = 128;
 // is implied: the kernel's online set grows and system suspend restores the same CPU identities.
 // SYS_THREAD_START keeps its existing current-CPU start and wake-side migration behavior.
 pub const SYS_THREAD_START_ON: u64 = 129;
+
+// THE BALLOON: FRAMES A VIRTUAL MACHINE GIVES BACK TO ITS HOST, held so that nothing in this system reuses them while
+// the host has them. Only FREE frames are ever taken - never one a process, a buffer or a device holds - and never
+// below a floor of free memory the kernel keeps for itself; every frame goes back when its holder lets it go or ends.
+//
+// `SYS_BALLOON_CREATE(device)`: a balloon for the virtio-balloon device the caller's DeviceMemory capability names - a
+// handle, or ERR_ACCESS_DENIED for any other device. It is derived from that binding of the device.
+// `SYS_BALLOON_TAKE(balloon, out_ptr, most)`: up to `most` free frames (at most `MAX_BALLOON_BATCH`) taken into the
+// balloon, their physical addresses written as u64s at `out_ptr` - the count taken, zero at the floor.
+// `SYS_BALLOON_GIVE(balloon, in_ptr, count)`: the frames at `in_ptr` (physical addresses, u64s) given back to the
+// allocator - the count, or ERR_INVALID and nothing given when any one of them is not the balloon's.
+pub const SYS_BALLOON_CREATE: u64 = 130;
+pub const SYS_BALLOON_TAKE: u64 = 131;
+pub const SYS_BALLOON_GIVE: u64 = 132;
+// The most frames one take or give moves.
+pub const MAX_BALLOON_BATCH: u64 = 256;
 
 pub const MAX_INJECT_PERMILLE: u64 = 500;
 
