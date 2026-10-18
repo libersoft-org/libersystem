@@ -288,3 +288,39 @@ Both findings were verified and accepted.
 The milestone records both under "Corrections of 2026-10-15".
 
 **Verification:** `qemu-tpm-tool` passed on x86_64, both steps among its runs, and so did `host-tests`, with the TPM logic and client tests.
+
+AUDITOR'S RE-AUDIT ON P02M0190 (2026-10-18T17:47:21Z):
+
+**Rating: 10/10.** Both findings are resolved in the current tree.
+- **No provider.** `owner()` is `Unknown`, and `admit` refuses on owner grounds only for `Unusable`. Seal, unseal and quote therefore reach the queue, which answers `unavailable`. The queue's provider flag is set and cleared together with `self.provider` (in `adopt` and `lose`), so the two cannot disagree. `info` still reports sealing only for a usable owner. The hibernation consumer's wait, which retries while the answer is `unavailable`, now gets that answer.
+- **Over-bound arguments.** `tpm-client` refuses a digest, secret, sealed object or nonce past the contract's wire bounds (32/96/1024/64, matching `tpm.lsidl:115-122`) with `bounds` before anything is sent. The `tpm` tool goes through it for every such call.
+- **The raw-wire half.** A raw over-bound request still closes its connection. Fixing only the client was the first of the two remedies the auditor offered, so the partial acceptance is justified.
+
+## Findings
+
+No unresolved issues, incorrect or incomplete fixes, unjustified rejections, regressions or new material defects were found.
+
+## Verification performed
+
+- **Documents read.** `docs/todo/P02M0190.md` in full; the audit review (206-271) and the implementer's response (272-290); `docs/TPM.md:25-100`; the bounds and refusals in `src/idl/tpm.lsidl`.
+- **Code read in the current tree.**
+  - `src/user/services/logic/src/tpm.rs` in full, and `tpm/tests.rs`.
+  - `src/user/services/core/src/tpm_service.rs:230-420`: `owner`, `adopt`, `lose`, `apply`, `send`, `on_reply`, `client`.
+  - `src/user/libs/clients/tpm-client/src/lib.rs`.
+  - `src/user/apps/tools/src/tpm.rs`.
+  - `src/user/services/core/src/hibernation_service.rs:155-170` and `:299-320`.
+  - The new steps in `src/harness/scenarios/tpm-tool.toml`.
+  - Commits since 2026-10-14. The later `permission_manager.rs` changes append `HostShare` after the TPM capabilities and leave the TPM arm alone.
+- **Claims checked.**
+  - `Owner::{Unknown, Usable, Unusable}`, with `admit` refusing on owner grounds only for `Unusable`: confirmed (`tpm.rs:84-136`).
+  - `owner()` is `Unknown` with no provider, and `info`'s sealing flag means `Usable`: confirmed (`tpm_service.rs:242-248`, `:396`, `:403`).
+  - New host test: present and correct. Admission passes, the provider-less queue answers `Unavailable`, and the grant and the bounds are still reported first. "Watched failing" cannot be checked statically.
+  - Existing tests moved to `Owner::`: confirmed.
+  - Scenario seals while the driver is down and expects `unavailable`: confirmed. The step sits after `tpm random refused: unavailable` and before the enable.
+  - Client-side `DIGEST_LEN`/`MAX_SECRET`/`MAX_SEALED`/`MAX_NONCE` checks answering `Outcome::Bounds`: confirmed (`lib.rs:62-65`, `:114-150`). The tool prints them as "refused: bounds".
+  - The scenario's over-bound secret: confirmed at 97 bytes.
+  - A raw over-bound request still closes the connection: justified, as above.
+  - `qemu-tpm-tool` x86_64 PASS and the host tests: no log of the 2026-10-16 run is retained under `.build/logs`, so this cannot be confirmed statically. It is consistent with the code.
+  - Ports: they have not yet run the two new scenario steps; the milestone schedules that for the end of the job. The changed logic does not depend on the target.
+  - The milestone document does not point at its audit file.
+- **Not done.** This was a static review only: nothing was built or run.

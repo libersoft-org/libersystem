@@ -1155,3 +1155,94 @@ Confirmed: the reconciliation request was dropped with the retired grant, so the
 - It belongs with whichever change gives PermissionManager revocation for every grant kind.
 
 **Verification (x86_64):** `qemu-modem-service` passed, `modemcheck uncertain-retired` among its steps.
+
+AUDITOR'S RE-AUDIT ON P02M0183 (2026-10-18T17:36:02Z):
+
+**Rating: 8/10.** The rest of the milestone is as the last review found it. Of the 2026-10-15 Medium finding, the PIN half is fixed; the deactivation half is not.
+- **PIN and PUK: fixed.** When a grant is retired, its in-flight PIN or PUK becomes a `Cleanup`, so an expiry now sends the reconciling query.
+- **Deactivation: not fixed.** `retire` ends the context before it relabels the deactivation. When that deactivation expires, `deactivated()` looks in `self.context` for the modem to reconcile and finds nothing. The modem therefore still refuses every activation after a retired grant's deactivation expires.
+- **The new probe step proves neither half.** The fixture reports the SIM ready through an indication before the five-second expiry even happens.
+- **The admin-revocation rejection.** It rests partly on a wrong premise, and the milestone still claims that trigger.
+
+## Findings
+
+1. **Medium, Incomplete fix - a retired grant's deactivation that expires is still never reconciled, so the modem keeps refusing every state change.**
+   - **What the plan requires.**
+     - The plan: "At expiry/cancellation ... return ... `outcome-unknown` when a state change may have reached the device ... Reconcile through fresh read-only queries before conflicting operations" (/data/yellow/libersystem/docs/todo/P02M0183.md:91-94).
+     - The 2026-10-15 finding named both cases: "a manage client's PIN or PUK, or a data client's deactivation".
+     - For the deactivation case, the response claims: "a pending deactivation keeps going with no caller".
+   - **What the code does.**
+     - **The context is ended first.** `retire` calls `self.end_context(Error::Closed, false)` (/data/yellow/libersystem/src/user/services/core/src/modem_service.rs:1226-1227), which takes `self.context` (:1015). Only after that does it relabel the call as `Deactivate { caller: None }` (:1241).
+     - **No follow-up deactivation is sent.** `end_context` sees the device as `Deactivating`, not `Active` (:1028-1029; the state is set at /data/yellow/libersystem/src/user/services/logic/src/modem_commands.rs:225).
+     - **At the five-second expiry:**
+       - `Device::tick` sets `uncertain = true` and the context to `Unknown` (modem_commands.rs:296-301).
+       - `complete` calls `self.deactivated(done, caller)` without the modem key it holds (modem_service.rs:759).
+       - The unknown branch takes the key from `self.context` (`let key = self.context.as_ref().map(|context| context.modem)`, :987). That is now `None`, so `reconcile` is never called (:989-990).
+       - From then on `submit` refuses every state change with `Reconcile` (modem_commands.rs:202-203).
+     - **A new variant, introduced by the fix.** A definite `Done` for the caller-less deactivation runs `end_context(Error::Closed, true)` on whatever context is current (modem_service.rs:978-979). If a newer activation is still waiting for its reservation, it is ended with `closed`; `activate` admits one as soon as `self.context` is `None` (:831-837). The old code dropped this completion, so this effect is new.
+   - **Why it matters.**
+     - **The original outcome remains.** On the default policy, identity and management are denied, so a data-only client cannot send a query. Every activation is answered `again` until the modem is withdrawn or the service restarts.
+     - **A context can be left up.** The modem may keep a context that nobody takes down, while the status shows it as `unknown`.
+     - **A second way in.** The same path is reached when a SIM replacement retires the grants (:658-666) during a deactivation that then expires.
+   - **Minimal fix.**
+     - **Option A:** pass `key` from `complete` into `deactivated`. Reconcile it on any result other than `Done`, whether or not `self.context` is set; `reconciled()` already takes an unowned active context down. Touch `self.context` only when it is the context in `Stage::Deactivating`.
+     - **Option B (equivalent):** in `retire`, relabel the retired grant's deactivation as `Purpose::Cleanup`, and have `Cleanup` reconcile on any non-`Done` result.
+     - **Test:** add a probe step that uses `delay(Deactivate, 0)`, closes the data grant mid-deactivation, waits past 5 s, and requires a fresh activation to be admitted.
+
+2. **Low, Incomplete fix - `modemcheck uncertain-retired` passes without the fix, so the claimed verification does not support it.**
+   - **What the plan requires.**
+     - The guest proof must cover "stale replies and complete bounded resource reclamation on authority loss" (P02M0183.md:157-161).
+     - The response presents `uncertain-retired` as the oracle for Finding 1. The tree's rule is that a green test is not evidence until it has been watched failing.
+   - **What the code does.**
+     - **The fixture reports Ready at once.** When it handles the EnterPin, it unlocks the SIM (/data/yellow/libersystem/src/user/drivers/core/src/modem_fixture.rs:391) and sends an indication in the same handler (:465). Only the reply is held (:374, :641-642).
+     - **The service takes that state.** ModemService copies the indication's state into `modem.state` (modem_service.rs:655), and `status()` reports `sim` from it (:399).
+     - **The probe's only check.** It is `until(10, || probe.status().sim == SimState::Ready)`, run right after `close(probe.manage)` (/data/yellow/libersystem/src/user/services/core/src/modemcheck.rs:446-447). That holds at once, before the five-second expiry and so before any reconcile could run. It holds equally on the old code, which dropped the call.
+     - **Nothing later in the run reads the `uncertain` state.** `limits` checks only counts, and `republish` starts a fresh `Device`.
+   - **Why it matters.** The gate's `PASS uncertain-retired` line in the 2026-10-16 log says "reconciled by a fresh query" without observing one. That is how the deactivation half above went unnoticed, and a regression of the PIN half would pass too.
+   - **Minimal fix.**
+     - After closing the grant, wait past the 5 s command deadline.
+     - Then require that a state change is admitted again: an activation through the probe's data grant must not be answered `again`, and is deactivated afterwards.
+     - Add the deactivation case from finding 1.
+
+3. **Low, Unjustified rejection - "admin revocation" is still claimed as done with no path behind it, and the rejection's no-oracle premise does not hold.**
+   - **What the plan requires.** "Close, admin revocation, client endpoint loss, SIM change, device withdrawal and service restart invalidate the scoped authority and tear down its contexts" (P02M0183.md:39-44, ticked `[x]`).
+   - **What the code does.**
+     - **No revoke exists.** `modem-admin` has only `mint` (/data/yellow/libersystem/src/idl/modem.lsidl:208-210).
+     - **The no-oracle premise is wrong.** The response says "No oracle can drive it: the modem-admin root is PermissionManager's alone". But the kernel modem rig creates the service's ADMIN role and keeps its end (/data/yellow/libersystem/src/kernel/test_suites/services.rs:5459, 5466). It is the same rig that already drives the service's bounds, so a revoke could be checked there.
+     - **The other half of the rejection is fair.** Nothing calls the camera or MIDI `revoke` either.
+     - **But only the camera milestone says so.** P02M0184 records it: "Admin revocation is `camera-admin.revoke`; nothing calls it yet" (/data/yellow/libersystem/docs/todo/P02M0184.md:208-209). P02M0183.md records nothing, and no open milestone in docs/todo/TODO.md owns PermissionManager-side revocation.
+   - **Why it matters.** The milestone document claims a trigger the system cannot produce. The deferral the response describes ("belongs with whichever change gives PermissionManager revocation for every grant kind") is written nowhere a later change would find it.
+   - **Minimal fix.** Either of these:
+     - state in P02M0183.md that `modem-admin` has no revoke, and that admin revocation is not implemented because no grant kind has PermissionManager revocation yet;
+     - or add `modem-admin.revoke(modem-id)` that retires through `retire`, with a kernel-rig check.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/docs/todo/P02M0183.md in full, including "Corrections of 2026-10-15" (:284-292).
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0183.md:1088-1157.
+  - /data/yellow/libersystem/docs/todo/P02M0184.md:200-210, for the camera precedent.
+  - The open rows of docs/todo/TODO.md.
+- **Code read in the current tree.** The corrections are commit 58fb476c; 7ee3e9bf changed only the doc.
+  - /data/yellow/libersystem/src/user/services/core/src/modem_service.rs:
+    - `Purpose`, `submit_with`, `on_reply`, `on_indications`, `complete`;
+    - `reconcile` and `reconciled`;
+    - `activate`, `abandon`, `activated`, `install_failed`, `installed`;
+    - `deactivate`, `deactivated`, `end_context`, `on_link` and `reserved`;
+    - `retire`, `lose`, `mint`, the main loop, and `serve`'s grant branches.
+  - /data/yellow/libersystem/src/user/services/logic/src/modem_commands.rs in full.
+  - modemcheck.rs: the helpers, `lock`, `uncertain` and `uncertain_retired`.
+  - modem_fixture.rs: `command`, `indicate`, `set_sim`, `delay`, the hold/held path and `serve`.
+  - Also:
+    - the check-modem-service.sh diff;
+    - the admin interface in `modem.lsidl`;
+    - the kernel modem rig's roles;
+    - the camera and MIDI `revoke` implementations.
+- **Claims checked.**
+  - **A retired grant's PIN or PUK becomes `Cleanup`, and its expiry reconciles:** confirmed (modem_service.rs:1238-1246, :760-763, :776-779).
+  - **The retired grant's read-only calls are dropped:** confirmed (:1249). BeforePin's secrets are zeroed when it is dropped (:86-96).
+  - **"a pending deactivation keeps going with no caller":** it does keep going, but its unknown outcome is not reconciled (finding 1).
+  - **The `uncertain-retired` step:** confirmed that it exists, runs after a second `lock`, and has its own expect row; the old row now matches `PASS uncertain:`. It does not tell the fixed code from the old code (finding 2).
+  - **`qemu-modem-service` passed with `uncertain-retired`:** confirmed as a run by /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-qemu-modem-service.log (2026-10-16, `RESULT ok exit=0 seconds=1100`). It is not evidence for the fix.
+  - **The rejection of the revocation finding:** the substance is partly fair, the premise is not (finding 3).
+- **Not done.** This was a static review only: nothing was built or run.

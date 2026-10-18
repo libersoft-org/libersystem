@@ -382,3 +382,73 @@ In `src/user/services/core/src/display_service/brightness.rs`:
 The milestone records all three under "Corrections of 2026-10-15".
 
 **Verification (x86_64):** `brightness-acpi` passed. The adapted display-brightness kernel tests passed in both full suites.
+
+AUDITOR'S RE-AUDIT ON P02M0199 (2026-10-18T17:47:21Z):
+
+**Rating: 7/10.** The three fixes are in place and behave as described where the tests reach them:
+- An admission step that times out, or an open that is refused, is retried at 1, 2, 4 ... s, up to seven times, and the retry is dropped when the publication is withdrawn.
+- A late answer lets a failed backlight back into the join.
+- `acpi_als` ends its stream on 0x82, and the policy describes the sensor again on the same connection.
+- With idle dimming off and automatic brightness on, the activity watch runs at 300 s and only lifts the pause.
+
+The x86_64 kernel suite (569 passed, both display-brightness tests exercising the new paths) and `brightness-acpi` passed on the fixed tree.
+
+What remains:
+- **A regression.** Raising `CALL_TICKS` to two seconds made it equal to the policy's own two-second wait on DisplayService. A set that times out now leaves its answer on the policy's connection, and every later policy set reads the answer before its own. That breaks the policy's own-change rule, its dims and its stores.
+- **A discarded level.** The late answer's level is thrown away.
+
+No gate exercises the 0x82 path or a timed-out set.
+
+## Findings
+
+1. **Medium, Regression - DisplayService's backlight deadline now equals the brightness policy's own call deadline, so a set that times out leaves its answer queued and every later policy set reads the previous one's answer.**
+   - **What the plan requires.**
+     - `set` "answers the level set and the serial of the event it produced" (/data/yellow/libersystem/docs/todo/P02M0199.md:127-129).
+     - "a change the policy made itself for idle dimming or automatic brightness is never stored, which it knows from the serial its own set answered" (:355-356).
+     - The dim is "restored on `active` unless someone changed the level meanwhile" (:362-363).
+     - A backlight call has a deadline (:137-139).
+   - **What the code does.**
+     - **Equal deadlines.** `CALL_TICKS` is 200 ticks (/data/yellow/libersystem/src/user/services/core/src/display_service/brightness.rs:27), counted from when DisplayService issues the provider call (:193). The waiting client gets `TimedOut` only when that expires (:160-164, :208-214). The policy waits for the answer `ASK_TICKS` = 2 s from its own send (/data/yellow/libersystem/src/user/services/core/src/brightness_policy.rs:44, :228-235). That is the same two seconds, started earlier, so whenever a provider misses DisplayService's deadline the policy gives up first. The best case is a same-tick race.
+     - **The answer stays queued.** DisplayService's answer then sits on the policy's `control` connection, and the policy's loop never waits on that connection (brightness_policy.rs:562-569).
+     - **Every later set is one answer behind.** Each `forward()` builds a fresh generated client whose correlation starts at 0 (/data/yellow/libersystem/src/user/libs/protocol/display-proto/src/generated/liber/display/v1.rs:5465-5483, check at :5538). `ipc_client::ChannelTransport::call` sends and then takes the next message on the channel, with no drain (/data/yellow/libersystem/src/user/libs/ipc/ipc-client/src/lib.rs:39-52). The next `forward()` therefore accepts the queued answer as its own and leaves its own answer for the call after. This lasts for the life of the instance.
+     - **Effect on the policy.** `set_own` records the wrong serial (brightness_policy.rs:222-226), so the policy's own sets come back on the subscription as someone else's. `Policy::changed` then cancels the dim, pauses automatic brightness and schedules the dimmed or automatic level for storing (/data/yellow/libersystem/src/user/services/logic/src/brightness.rs:600-614). `active` then has nothing to undo (:661-664). The tool's `set` through `CONTROL` gets the previous call's result.
+     - **Before the change.** With the old 10 ticks, DisplayService always answered well inside the policy's two seconds.
+   - **Why it matters.** One provider call that misses the deadline is enough. That covers the busy ACPI service or USB loop the change was made for (`acpi_backlight` itself waits up to 5 s per method, /data/yellow/libersystem/src/user/drivers/core/src/acpi_backlight_driver.rs:43), an ACPI-service restart during `_BCM`, or a monitor unplugged mid-set. Until the policy restarts, the screen stays dimmed after the person returns. The dimmed or automatic level is stored as theirs and restored at the next boot. Automatic brightness pauses itself on its own moves. No gate makes a provider miss the deadline, so this comes from reading the two deadlines and the client code, not from an observed failure.
+   - **Minimal fix.** Order the deadlines: the policy's `forward()` should wait longer than `CALL_TICKS` (for example `CALL_TICKS` + 1 s), so DisplayService's answer, level or `TimedOut`, always arrives before the policy gives up. Also discard a reply left by a timed-out call before the next call: keep one client with advancing correlations, or drain `control` before each `set`.
+
+2. **Low, Incomplete fix - a late answer to a timed-out set lets the backlight back into the join but throws its level away.**
+   - **What the plan requires.** "a provider that misses it is marked failed and left out of the join until it answers again" (/data/yellow/libersystem/docs/todo/P02M0199.md:137-139). `subscribe()` gives "one event per change of any backlight whoever made it" (:123-125).
+   - **What the code does.**
+     - **The level is dropped.** A reply that matches no pending call clears `failed` and rejoins (brightness.rs:276-287), and nothing else is read from it. The provider's `set` answers "the level set" (/data/yellow/libersystem/src/idl/display-device.lsidl:191-192). But `level`, `touched` and the change event are produced only for a call that is still pending (brightness.rs:371-385).
+     - **The test pins it.** The late answer carries 77, and the snapshot is required to keep 50: "a late answer recovers the provider ... and sets no level" (/data/yellow/libersystem/src/kernel/test_suites/display_brightness.rs:188-202).
+     - **The deadline tick is worse.** An answer read in the deadline's own tick still matches the pending call, is treated as the timeout and is consumed (brightness.rs:289-291). Nothing then clears `failed`.
+   - **Why it matters.** The panel now holds the level the provider set late, but DisplayService still reports the old one and publishes no change. The policy and `brightness` show the old level. The next key steps from it (:642), so an "up" press can dim. The policy's store never sees the level that was asked for.
+   - **Minimal fix.** Pick one of two:
+     - Keep the expired set's correlation and cause on its backlight while it stays failed; no newer set can be issued then (:598-599). Apply a late answer to it the way a timely one is applied, without answering the client.
+     - Or issue a `get` when a late answer clears `failed`, and publish a `Device` change if the level differs.
+
+     Either way, accept a matching answer that is read at its deadline, and adjust the test's expectation.
+
+## Verification performed
+
+- **Documents read.** /data/yellow/libersystem/docs/todo/P02M0199.md in full, including "Corrections of 2026-10-15". /data/yellow/libersystem/AI/audit/code-audit-P02M0199.md lines 336-384 (the latest review and the response), plus earlier records for context.
+- **Code read in the current tree.** HEAD f6925965; the fixes are in 58fb476c.
+  - DisplayService: /data/yellow/libersystem/src/user/services/core/src/display_service/brightness.rs in full, and the loop order in display_service.rs:2085-2125 (`poll` before `wait_any` and dispatch).
+  - `service_logic::provider_retry` and its tests.
+  - display_brightness.rs (kernel test).
+  - acpi_als_driver.rs in full.
+  - brightness_policy.rs: `forward`, `set_own`, `change`, activity, sensors and main loop.
+  - `service_logic::brightness::Policy`.
+  - The generated display-proto client, `ipc_client::ChannelTransport::call` and `rt::recv_vec_caps_deadline`.
+  - The `backlight` interface in display-device.lsidl.
+  - The `set` paths of acpi_backlight_driver.rs and class_display_hid.rs.
+- **Claims checked.**
+  - `CALL_TICKS` is 200 ticks (2 s): confirmed (brightness.rs:22-27). This is the cause of finding 1.
+  - A late reply clears `failed` and the backlight rejoins: confirmed (brightness.rs:276-287). Its level is dropped (finding 2).
+  - Timed-out open, describe, get and events steps, and a refused open, go to `admission_failed` and `ProviderRetry`, from 1 s and doubling: confirmed (brightness.rs:177-182, 220-231, 305-313; provider_retry.rs gives up after 7 retries). "display id" is not actually in that set: a timed-out `firmware-display-id` still falls through to `get` as optional metadata (brightness.rs:216-219). That behaviour is correct.
+  - `poll()` re-issues due opens, `deadline()` includes them, a withdrawal drops the retry and an admission clears the attempts: confirmed (brightness.rs:156-171, 491-492, 509).
+  - The kernel test covers the four cases: confirmed (display_brightness.rs:137-152, 156-160, 188-202, 271). The guest logs .build/logs/test/x86_64-20261015T200303Z-3087794-guest.log and x86_64-20261016T225541Z-1190693-guest.log (569 passed) show both tests and the new "asked again" and "answered again" lines.
+  - F2, `end_stream()` on 0x82 and `reopen_sensor` on `Closed`: confirmed (acpi_als_driver.rs:118-124, 293-300; brightness_policy.rs:404-416, 431-442). The driver answers with the re-read curve and sends the current reading first on the new stream (acpi_als_driver.rs:128-130, 168-177). No gate raises 0x82 on the sensor: the fixture's `_E08` sends only 0x80 to it.
+  - F3, watch at `DEFAULT_IDLE_SECONDS` with idle off and automatic on, retargeted by `set_automatic`: confirmed (brightness_policy.rs:298-314, 494). `Policy::idle` dims nothing when idle is off (logic brightness.rs:645-649).
+  - `brightness-acpi` passed: confirmed by .build/claude-work/implementer/runs/gate-brightness-acpi.log (2026-10-16 06:01, after the fix commit, RESULT ok in 253 s). `brightness-usb` was not rerun after the corrections; the response does not claim it.
+- **Not done.** This was a static review only: nothing was built or run.

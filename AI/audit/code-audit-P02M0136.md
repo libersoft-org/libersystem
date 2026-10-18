@@ -2377,3 +2377,132 @@ The milestone records the text work in its own dated entries. Host commands that
 - The watch oracle was watched failing: with `look()` disabled (`if reread && false`), the test fails with "the catalogue withdrew a face removed from its watched directory, with no rescan asked for".
 - - The same kernel test passed on aarch64 (632 s for a two-test selection) and on riscv64 (358 s), with the same lines: every case and the paragraph exact, the two clients interleaved, and the face withdrawn.
 - `host-tests`, `text-corpus`, `font-declarations`, `text-limits` and `./gen.sh --check` passed.
+
+AUDITOR'S RE-AUDIT ON P02M0136 (2026-10-18T17:39:37Z):
+
+**Rating: 6/10.** All nine findings of the last review are resolved in the tree. Finding 8 is resolved to the minimum it named. Specifically:
+- The catalogue now opens and serves a `volume.watch`, treats a failed listing as no scan, answers every subscription ask, and processes disconnects.
+- Stage 4 asks the policy per run, and the last resort is always admitted.
+- The pipeline now shapes per homogeneous run, mirrors from the pinned BidiMirroring, carries language, reshapes split runs and reorders per line.
+- `locl` is applied and unprofiled scripts are refused.
+- The Indic shaper plans syllables, masks its positional features and moves the reph.
+- The guest run shapes, compares and draws Arabic, Devanagari, Thai, Hebrew and a mixed-direction paragraph at 200, 50 and 37 px.
+- The shaping path allocates fallibly.
+
+Both owner decisions of 2026-10-17 are in the code and recorded in the milestone:
+- `font-run`'s `drawn_x_offsets` moves a right-to-left mark by the change of pen between the two orders, which is HarfBuzz's backward-direction rule.
+- The oracle composites `1 - (1 - a)(1 - b)`, and the kernel test requires shared pixels at 37 px.
+
+What remains is in the GSUB/GPOS engine. The published profile says these lookups are applied, and no corpus face exercises them:
+- Lookup flags are honoured only at the first glyph of a match, and two of the six are not honoured at all.
+- Mark-to-mark attaches across a base and ignores the parent mark's own offset.
+- Cursive attachment has only left-to-right arithmetic, although all three cursive scripts in the profile are right to left. The milestone records this as open while its status line says COMPLETE.
+
+Three of the catalogue item's own gates are still unbuilt, and the milestone does not say so.
+
+## Findings
+
+1. **Medium, Defect - lookup flags are applied only to the glyph a lookup starts at: excluded glyphs are never skipped while matching the rest of a sequence, and `useMarkFilteringSet` and `markAttachmentType` are not applied at all.**
+   - **What the plan requires.** The profile "states ... `GSUB`/`GPOS` lookup types and flags ... Anything outside it is a typed `Unsupported` refusal, not undefined behaviour and not a silent wrong result" (/data/yellow/libersystem/docs/todo/P02M0136.md:1070-1075). Done when "the published OpenType profile is met" (/data/yellow/libersystem/docs/todo/P02M0136.md:2193-2194). The published profile lists all six flags as honoured, among them `ignoreMarks` "mark glyphs are skipped when matching", `useMarkFilteringSet` "only the marks in the named `GDEF` mark glyph set participate" and `markAttachmentType` "only marks of the named `GDEF` attachment class participate" (/data/yellow/libersystem/src/user/libs/text/opentype-profile/src/layout.rs:71-79, /data/yellow/libersystem/docs/gen/opentype/profile-1.md:127-136).
+   - **What the code does.**
+     - The only flag check is at the starting position (/data/yellow/libersystem/src/user/libs/text/font-shape/src/shape.rs:229).
+     - `skips` reads only bits 0x0002, 0x0004 and 0x0008 (/data/yellow/libersystem/src/user/libs/text/font-shape/src/layout.rs:250-255).
+     - The mark filtering set is parsed (/data/yellow/libersystem/src/user/libs/text/font-shape/src/layout.rs:175-183) and read nowhere. The attachment-type byte and GDEF's attach-class and mark-set tables are never read.
+     - Every later glyph of a match is simply the next buffer slot:
+       - ligature components at `at + 1 + component` (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gsub.rs:168-176);
+       - contextual input, backtrack and lookahead at raw positions, with nested lookups at `at + sequence_index` (/data/yellow/libersystem/src/user/libs/text/font-shape/src/context.rs:73, :131, :183, :211, :226-229, :262, :270);
+       - a pair's second glyph (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gpos.rs:112) and the cursive partner (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gpos.rs:289).
+     - Nothing tests a flag. Every lookup the font-shape tests build has flags 0 (/data/yellow/libersystem/src/user/libs/text/font-shape/src/tests.rs:171-646).
+     - The corpus kern lookup is built `ignoring_marks` under the comment "a mark between two letters must not break the pair" (/data/yellow/libersystem/src/tools/font-gen/src/layout.rs:28-31, /data/yellow/libersystem/src/tools/font-gen/src/corpus.rs:184), yet no case puts a mark between A and V (/data/yellow/libersystem/src/user/apps/tools/src/textconf/corpus.rs:76-78).
+   - **Why it matters.** Marks between letters are the normal case in pointed Hebrew, vocalised Arabic and Indic text. With a real face:
+     - `لَا` (lam, fatha, alef) does not form the required lam-alef ligature;
+     - a contextual or kerning rule written with ignoreMarks does not fire across a mark;
+     - a cursive join breaks at every mark;
+     - a lookup restricted to one mark class or set is applied to marks it excludes.
+
+     These are exactly the silent wrong results the profile item forbids.
+   - **Minimal fix.**
+     - Write one skipping iterator that honours all flag bits, reading GDEF MarkAttachClassDef and MarkGlyphSetsDef.
+     - Use it for every glyph after the first in GSUB 4, in GSUB/GPOS 5-8 (input, backtrack, lookahead, and the mapping of sequence indices to buffer positions), and in GPOS 2 and 3.
+     - Add corpus cases with a mark between kerned letters and a mark between ligature components.
+     - Once a mark can sit inside a ligature, `mark_to_ligature` must take the component from a recorded component index. Today it uses the byte difference of clusters (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gpos.rs:376), which is right only because no mark can currently sit inside a ligature.
+
+2. **Medium, Defect - mark-to-mark attachment crosses a base to an earlier letter's mark, and positions the mark against the pen of the mark it hangs from rather than where that mark is drawn.**
+   - **What the plan requires.**
+     - The shaping item requires "marks and mark attachment" (/data/yellow/libersystem/docs/todo/P02M0136.md:1341-1343). It records `GPOS` type 6 as built and "every lookup type the profile names is now applied" (/data/yellow/libersystem/docs/todo/P02M0136.md:1352-1353, :1360-1361).
+     - The profile applies `MarkToMark` (/data/yellow/libersystem/src/user/libs/text/opentype-profile/src/layout.rs:63).
+     - Done when a string "becomes a correct `GlyphRun`" (/data/yellow/libersystem/docs/todo/P02M0136.md:2195-2196).
+   - **What the code does.**
+     - For type 6 the backward search takes the nearest preceding class-3 glyph and does not stop at a base: `let wanted = if kind == 4 { class != 3 } else { class == 3 }` (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gpos.rs:195-203). A mark that directly follows a base therefore attaches to a mark of the previous letter whenever the lookup's coverage lists both. The shaper turns `mkmk` on for both the default and the cursive feature sets (/data/yellow/libersystem/src/user/libs/text/font-shape/src/shape.rs:340-347).
+     - The offset is `base_x - mark_x - advance_between` (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gpos.rs:249-251). The attached-to glyph's own `x_offset`/`y_offset` is never added, and nothing propagates attachment offsets after GPOS (/data/yellow/libersystem/src/user/libs/text/font-shape/src/shape.rs:138-145).
+     - As a result, a mark stacked on a mark that was itself attached to a base is displaced by that first mark's whole offset: roughly one base advance plus its vertical lift. The same omission moves a mark off any base that carries a placement.
+     - `font-run`'s right-to-left correction (/data/yellow/libersystem/src/user/libs/text/font-run/src/produce.rs:198-215) corrects each mark against its own `attached_to`. Once offsets are propagated, a chained mark would also miss its parent's correction.
+     - Neither corpus face carries an `mkmk` lookup (/data/yellow/libersystem/src/tools/font-gen/src/corpus.rs:188, :300), although the complex face's comment says "This face carries both" (/data/yellow/libersystem/src/tools/font-gen/src/corpus.rs:274-275). No case can see the defect.
+   - **Why it matters.** Stacked marks are routine: a fatha over a shadda, a Thai tone mark over an upper vowel (the case that face comment names), Hebrew and Vietnamese diacritic stacks. With any face that uses `mkmk`, the second mark lands toward the next letter or on a neighbour's mark.
+   - **Minimal fix.**
+     - Stop the type-6 search at the first glyph the lookup does not skip, and require that glyph to be a mark.
+     - Place an attached glyph relative to its parent's drawn position: add the parent's offsets, or resolve attachment chains once after GPOS as HarfBuzz does.
+     - Make `font-run`'s correction follow the chain to its root.
+     - Add an `mkmk` lookup and a stacked-mark case to the complex face.
+
+3. **Medium, Defect - cursive attachment (GPOS type 3) has only left-to-right arithmetic, applied to the three right-to-left cursive scripts. The milestone records this as open while its status says every item is implemented.**
+   - **What the plan requires.** The shaping item requires "cursive attachment" (/data/yellow/libersystem/docs/todo/P02M0136.md:1341-1343). The profile applies `CursiveAttachment` and honours `rightToLeft` ("cursive attachment takes its direction from the run") (/data/yellow/libersystem/docs/gen/opentype/profile-1.md:119, :131). Its cursive-joining scripts `arab`, `syrc` and `nko ` are all right to left (/data/yellow/libersystem/docs/gen/opentype/profile-1.md:230-232). Status: "COMPLETE ... Every item is implemented" (/data/yellow/libersystem/docs/todo/P02M0136.md:3-5).
+   - **What the code does.**
+     - `cursive` sets the first glyph's advance to its exit and moves the second by `-entry_x` (/data/yellow/libersystem/src/user/libs/text/font-shape/src/gpos.rs:276-308). It never consults the lookup's 0x0001 flag.
+     - The shaper is never told the run direction (`shape_run` has none, /data/yellow/libersystem/src/user/libs/text/font-shape/src/shape.rs:300), yet the cursive set turns on `curs` (/data/yellow/libersystem/src/user/libs/text/font-shape/src/shape.rs:347).
+     - The milestone itself says: "FOUND WHILE DOING IT, AND OPEN: cursive attachment (`GPOS` type 3) is written for left-to-right only ... No corpus face carries a cursive lookup" (/data/yellow/libersystem/docs/todo/P02M0136.md:2180-2183).
+     - From a static reading, even a left-to-right chain of three glyphs does not carry the middle glyph's shift to the third, unless its entry anchor sits at x = 0 and the joins do not shift vertically.
+   - **Why it matters.** Any Arabic, Syriac or N'Ko face that joins through `curs` (typical of Nastaliq faces) gets wrong advances and offsets, and its letters are drawn overlapping or apart. This contradicts the Done-when and the COMPLETE status. An authored joining face is a host oracle that can be built in phase 2.
+   - **Minimal fix.**
+     - Pass the run direction to the shaper and implement the right-to-left arithmetic, with chain propagation of the cross-stream offset and the 0x0001 parent rule.
+     - Add a joining face and a case that pins a right-to-left join.
+     - Until that exists, the status line must not claim every item is implemented.
+
+4. **Low, Incomplete fix - three of the catalogue item's own gates are still unbuilt, and the milestone keeps the item ticked without saying so.**
+   - **What the plan requires.** The catalogue item's gates include the following:
+     - "a manifest-declared consumer reaches it through its `Factory` role and an ordinary application through the granted `font-catalogue` capability, so BOTH routes are exercised rather than only whichever one the first consumer happens to use" (/data/yellow/libersystem/docs/todo/P02M0136.md:874-877);
+     - the RESOLVE-INTO race "driven by not delivering the event at all" (/data/yellow/libersystem/docs/todo/P02M0136.md:592-596);
+     - the retained-face Domain-accounting gate and the "no client MemoryObject handle across a reply" fixture (/data/yellow/libersystem/docs/todo/P02M0136.md:599-606).
+
+     A milestone document must say what was done.
+   - **What the code does.** No guest or host test covers any of these. A grep of /data/yellow/libersystem/src/kernel/test_suites/ and the font service-logic suites finds no retained-face or handle-count fixture, and RESOLVE-INTO is exercised only on `textconf`'s success path. The implementer's response lists all three as "Not done, and why", but only in the audit file. The item stays `[x]` (/data/yellow/libersystem/docs/todo/P02M0136.md:96), and the status says every item is implemented (/data/yellow/libersystem/docs/todo/P02M0136.md:3-5). On the reasons given:
+     - Factory route: "no manifest row consumes it that way, so there is nothing to test". This contradicts the gate's stated purpose, which is to exercise both routes whichever one the first consumer uses.
+     - RESOLVE-INTO race: whether the harness can withhold a watch event cannot be decided statically.
+   - **Why it matters.** A reader of the milestone is told the catalogue's gates exist when three of them do not.
+   - **Minimal fix.** Record each unbuilt gate in the catalogue item with its reason, and stop claiming every item is implemented. Alternatively, build them: a test-only Factory consumer, and handle-count and Domain-memory fixtures along the lines of the existing textconf guest test.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/docs/todo/P02M0136.md: status, the catalogue item with its gates and dated entries, the profile item, the shaping item, the pipeline, fallback and limits corrections, the guest-gate item including the 2026-10-17 RTL-mark and shared-pixel resolutions, and the Done-when.
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0136.md:2184-2379, plus a grep of the earlier rounds for lookup flags and mark-to-mark. Neither was ever raised.
+  - /data/yellow/libersystem/docs/gen/opentype/profile-1.md.
+- **Code read in the current tree.** HEAD f6925965, including commits 58fb476c, 7ee3e9bf and 29b33a6b. Files read:
+  - font_catalogue.rs in full; font_scan.rs; font_clients.rs (`unsubscribe`); rt `serve_multi_ticked` and `announce_disconnect`; font.lsidl `subscribe`; font-client.
+  - text-pipeline lib.rs, canonical.rs, fallback.rs and stages.rs in full; its ceiling test.
+  - font-shape shape.rs, gpos.rs, gsub.rs and indic.rs in full; context.rs matchers; layout.rs lookup flags; scripts.rs (`shaper_for`, `profile_script`, `tag_of`, reorders); buffer.rs.
+  - font-run `drawn_x_offsets` and its test.
+  - unicode-bidi `mirrored`; the toolchain.lock pins.
+  - opentype-profile layout.rs.
+  - textconf.rs, and textconf/raster.rs, shaping.rs and corpus.rs.
+  - The kernel test at /data/yellow/libersystem/src/kernel/test_suites/applications.rs:2033-2262.
+  - font-oracle; the system-manifest root-separation test; the font-gen corpus faces and layout builder; text-corpus main.rs; text-limits; the manifest rows for font-shape, text-pipeline and textconf.
+- **Claims checked.**
+  - F1, watch: opened before the seeding scan, 1 s tick, at most 64 events per look, reopen and owed rescan. Confirmed.
+  - F1, subscribe: typed refusal on every path (IDL `result`, `subscribe_reply_err`), and `font-client` returns `Option<Result<u64, Error>>`. Confirmed.
+  - F1, disconnects: `DISCONNECT_OP` is handled, and `Endpoints::unsubscribe` has its test. Confirmed.
+  - F1, guest oracle: its own connection, removal through a writable scope, LIST drops within 1000 ticks, root clone kept. Confirmed in the test; passing runs are not verifiable statically.
+  - F2: `observe` and `rescan` return `Option`, and the admin rescan answers `Io` and records `Failed`. Confirmed.
+  - F3: policy order per item, last resort always admitted, `Faces` adapter and `runs_for` gone, tests present. Confirmed.
+  - F4: stage 5 shaping, BidiMirroring 17.0.0 pinned and read, `rtlm` mask on every shaper, `LanguageSpan`/`Item.language`, the Script_Extensions rule stated, stage 9 `reshape`. Confirmed. The 13 mutations are not verifiable statically.
+  - F5: `locl` in every shaper, `profile_script` refuses unprofiled scripts, Adlam and Mandaic no longer cursive, `bopo` mapped. Confirmed. All 30 named scripts map to tags.
+  - F6: syllable planner, per-syllable masks, two-stage GSUB with final reorder, `abvm`/`blwm`/`dist`, cursive `kern`, reph expected after its base, two negative cases. Confirmed. The 20 mutations are not verifiable statically.
+  - F7: corpus faces and declarations embedded, eight script cases and one paragraph at 200, 50 and 37 px, in-guest refusal checks, shared corpus file and pins, manifest providers. Confirmed. The three-architecture runs are recorded in the milestone and not verifiable statically.
+  - F7, harness: handing the root rather than a PermissionManager grant is acceptable. The deny path is asserted by the sandbox probe summaries.
+  - F8: font-oracle staging refusals and self-test, root-separation test, two-client interleave. Confirmed. The remaining gates are not built; see finding 4.
+  - F9: fallible allocation in font-shape and text-pipeline. Confirmed. The `unicode-bidi` exception is recorded in the milestone at /data/yellow/libersystem/docs/todo/P02M0136.md:1915-1916.
+  - text-limits: the "shaping retries" reason was updated. Confirmed.
+  - Owner decision, RTL marks: the `font-run` correction and its test are present, and the arithmetic matches HarfBuzz's backward rule. Confirmed.
+  - Owner decision, shared pixels: `1-(1-a)(1-b)` is in the oracle and stated in the milestone, and the kernel test requires shared pixels. Confirmed.
+  - No milestone IDs appear in the changed code.
+- **Not done.** This was a static review only: nothing was built or run.

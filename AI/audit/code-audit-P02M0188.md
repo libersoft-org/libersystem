@@ -1168,3 +1168,53 @@ The oracle:
 The milestone records this under "Corrections of 2026-10-15".
 
 **Verification (x86_64):** `qemu-admin-path` passed (502 s), `admincheck slots` among its steps, and so did `host-tests`, with the two broker and executor tests.
+
+AUDITOR'S RE-AUDIT ON P02M0188 (2026-10-18T17:29:39Z):
+
+**Rating: 10/10.** The one finding of the 2026-10-15 review is fixed on both sides, and both sides are tested.
+- **The broker.** It releases a preparation at its executor on every ending that does not dispatch: a decline, a grant that expires unused, a consumption record that fails or never answers, and an owner lost at the admission boundary. A late preparation for a request that has already settled is now released at the executor that answered, not at executor 0.
+- **The executor seam.** It drops preparations past their lifetime before it counts its four slots. This also covers preparations orphaned by an AdminService restart.
+- **The tests.** Host tests cover both halves, and the guest gate now asserts how many preparations the executor still holds.
+
+The authorization path is unchanged. No release can race a dispatch, because the dispatch branch zeroes `operation` before it emits `Dispatch`. Nothing material remains.
+
+## Findings
+
+No unresolved issues, incorrect or incomplete fixes, unjustified rejections, regressions or new material defects were found.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/docs/todo/P02M0188.md (whole).
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0188.md:1086-1170.
+- **Code read in the current tree.**
+  - `admin_broker.rs` (whole) and its new test.
+  - `admin_operation.rs` and its tests (whole).
+  - `admin_fixture.rs` (whole).
+  - In AdminService: `apply`, `prepare`, `dispatch`, `release`, `settle`, and the handling of executor replies.
+  - `admincheck`'s `slots` arm.
+  - `admin-path.toml`, from the expiry step to the end.
+  - `cancel` and `prepare` in the DFU and IPMI executors.
+  - `git show 58fb476c`, the only change since the review.
+- **Claims checked.**
+  - `release_prepared()` on every terminal path that does not consume: confirmed.
+    - The helper is at admin_broker.rs:364-370.
+    - It is called from `decline_as` (:351), a failed consumption record (:418), the admission boundary (:434), the `Consuming` timeout (:681) and `Granted` expiry (:694).
+    - None of these paths dispatched, so releasing is safe. The dispatch branch zeroes `operation` before `Dispatch` (:442-446), and `executor_lost` voids operations without a release (:641).
+  - A late preparation is released at the executor that answered: confirmed (:303-308). AdminService passes the answering key (admin_service.rs:575, :1384-1389). The early refusals pass 0 only together with `Err`, so no release goes to nobody.
+  - The broker host test `a_preparation_that_will_never_run_is_released_at_its_executor_whatever_ends_it` (admin_broker/tests.rs:437): present, and it covers all five paths. By static reading its assertions fail on the code before the fix. The failing run itself cannot be checked statically.
+  - The executor's `prepare` drops started, cancelled and expired preparations before counting: confirmed (admin_operation.rs:73-80); `live(now)` is at :111.
+    - The extended test (admin_operation/tests.rs:60-63) discriminates.
+    - All three executors give a preparation 120 s, longer than the broker's longest path to a dispatch (about 110 s). So no preparation still in use is reclaimed.
+  - The oracle: confirmed.
+    - `admin-probe-effects.prepared` is in the IDL, and the bindings were regenerated.
+    - The fixture reports it (admin_fixture.rs:136).
+    - `admincheck slots` fails above one (admincheck.rs:496).
+    - The scenario runs it before the `effects` step (admin-path.toml:672).
+  - "`qemu-admin-path` passed (502 s), `admincheck slots` among its steps": confirmed.
+    - The log /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-qemu-admin-path.log shows `RESULT ok exit=0 seconds=502`.
+    - Its recorded scenario digest `df89665689530288` matches the current `admin-path.toml`, which contains the step.
+    - On the broker before the fix, the step would have counted the restart's orphan plus the leak from the held consumption.
+  - `host-tests` passed: the log from 2026-10-16, written after the change, shows all 144 suites passing. It does not list individual test names.
+  - Recorded under "Corrections of 2026-10-15": confirmed (P02M0188.md:404-415). It does not point at an audit, and the code carries no milestone ids.
+- **Not done.** This was a static review only: nothing was built or run.

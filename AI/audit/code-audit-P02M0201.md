@@ -383,3 +383,74 @@ IMPLEMENTER'S RESPONSE ON P02M0201 (2026-10-17T01:44:22Z):
 The milestone records findings 1 and 2, and the attempt on finding 3, under "Corrections of 2026-10-15".
 
 **Verification (x86_64):** `ipmi` passed (1639 s) with findings 1 and 2 in and the original order for finding 3. Every harness-BMC case and the out-of-band cross-check passed.
+
+AUDITOR'S RE-AUDIT ON P02M0201 (2026-10-18T17:47:21Z):
+
+**Rating: 9/10.** Findings 1 and 2 are fixed correctly.
+- **Finding 1.** Every call on a binding's request channel now goes through the `Stamped` transport. It sends under a service-wide, non-zero correlation, discards any other reply together with its handles, and restores the caller's correlation for the decoder. A call that gave up can no longer hand its reply to the next call.
+- **Finding 2.** A provider whose `open` or `describe` failed is retried at 1, 2, 4 ... 64 s, and the retry is dropped when the provider is withdrawn.
+- **Finding 3.** The reorder was tried and then reverted to the byte (`git diff 58fb476c^ HEAD -- src/user/drivers/core/src/ipmi_driver.rs` is empty). The attempt is recorded honestly in Corrections.
+
+What remains:
+- The rejection of finding 3 is not a sound reason to keep the plan's explicit "petted at once" requirement unmet, and the checklist item still claims that behaviour.
+- The plan still points at its audit file.
+- The driver's own lists of prepared SEL-clear and chassis operations are never pruned.
+
+## Findings
+
+1. **Low, Unjustified rejection - Finding 3's rejection leaves the take-over-at-once requirement unmet on an unexplained oracle failure, and the checklist still claims it.**
+   - **What the plan requires.** "a timer found running at bind (the firmware's or the last boot's) petted at once and taken over, as P02M0200 requires" (`/data/yellow/libersystem/docs/todo/P02M0201.md:274-275`). The rule it cites: "a driver's first acts are to read and clear the last-reset record and to read whether the timer runs ... A running timer that CAN reset the machine is petted at once" (`/data/yellow/libersystem/docs/todo/P02M0200.md:170-172`).
+   - **What the code does.** At bind the driver identifies the BMC and reads the whole SDR repository (`/data/yellow/libersystem/src/user/drivers/core/src/ipmi_driver.rs:1167-1175`). Only after that does it send Get Watchdog Timer and take the timer over (`:1176-1199`). The checklist item is still `[x]` with "petted at once". Only the Corrections say "the watchdog is read after the repository" (`P02M0201.md:519-524`).
+   - **Why it matters.** The plan claims a behaviour the code does not have, and the grounds given for keeping it that way do not hold:
+     - **The cross-check cannot judge the take-over at all.** Even in the kept order, the driver gets no usable Get Watchdog Timer answer from `ipmi_sim` over KCS and publishes no BMC watchdog (`/data/yellow/libersystem/.build/logs/ipmi/dev-serial.log:450`).
+     - **What the reorder actually showed** is that moving one read made `ipmi_sim` refuse a later, unrelated Platform Event with 0xCB. The cause was not found, and it lies on the KCS/`ipmi-bmc-extern` path that this milestone owns.
+     - **The localisation offered cannot exercise the logging path.** The response says the same event "succeeds" over the LAN, but the gate itself records that "`ipmi_sim` does not log a platform event its LAN side takes" (`/data/yellow/libersystem/src/tools/check-ipmi.sh:43`).
+     - **The watchdog's own oracle accepted the change.** Per the response, the harness BMC passed every `ipmi` case with the reorder in place.
+
+     It is Low because no phase-2 fixture exposes the order: the only timer found running at bind is the 600 s boot bound, and the repositories hold only a few records. A static reading cannot tell whether the 0xCB marks a defect.
+   - **Minimal fix.** Either of these:
+     - find why the event is refused after the reorder, then make the take-over the bind's first act as written; or
+     - have the owner accept the departure, and state it in the checklist item itself (`P02M0201.md:268-276`), not only in Corrections.
+
+2. **Low, Defect - The milestone document points at its audit file.**
+   - **What the plan requires.** The owner's rule: a milestone document says what was done and does not point at an audit file.
+   - **What the code does.** `/data/yellow/libersystem/docs/todo/P02M0201.md:502`: "See the appended continuation section of `AI/audit/code-audit-P02M0201.md` for exact files, commands and limitations." `:507`: "the audit records the failed-before regression, exact correction and commands".
+   - **Why it matters.** The permanent record depends on a working file.
+   - **Minimal fix.** Delete both pointers. The sentences around them already say what was done.
+
+3. **Low, Defect (newly found) - The IPMI executors' own lists of prepared operations are never pruned, so they grow by one entry for every preparation the driver makes.**
+   - **What the plan requires.** The two BMC executors are built on the shared executor seam (`/data/yellow/libersystem/docs/todo/P02M0201.md:283-295`). That seam holds at most `MAX_OPERATIONS` = 4 preparations, and before it counts it drops any that started, were cancelled or expired (`/data/yellow/libersystem/src/user/drivers/core/src/admin_operation.rs:18`, `:73-80`). This is the bound the 2026-10-15 admin-path correction made hold whatever the broker does.
+   - **What the code does.**
+     - Next to the seam, the driver keeps its own lists, `sel_prepared` and `chassis_prepared` (`/data/yellow/libersystem/src/user/drivers/core/src/ipmi_driver.rs:311`, `:313`).
+     - Every successful `prepare` pushes one entry (`:889-890`, `:897-898`). The `retain` before the push removes only an entry with the same operation id. Ids are never reused (`self.next += 1`, `admin_operation.rs:82-83`), so it removes nothing.
+     - `execute` only reads the lists (`ipmi_driver.rs:920`, `:935`). `cancel` (`:952-955`) and the seam's own pruning leave them alone, and nothing else removes from them.
+   - **Why it matters.** The lists keep one entry for every preparation for the life of the driver, whether it was started, cancelled, declined or expired. The growth is slow, because preparations reach the driver only through AdminService from an authorised administrator. But it is exactly the unbounded executor state that the admin-path correction removed from the seam, kept again one level up. No other executor keeps such a list: DFU and the admin fixture hold their state in `Operations` alone.
+   - **Minimal fix.** Prune both lists, before each push, to the operations the seam still holds (a `holds(operation)` query on `Operations`). Or keep the prepared `SelClear`/`Control` inside the seam's own record, and drop the side lists.
+
+## Verification performed
+
+- **Documents read.**
+  - `/data/yellow/libersystem/docs/todo/P02M0201.md` whole, including "Corrections of 2026-10-15" (`:510-525`).
+  - `/data/yellow/libersystem/docs/todo/P02M0200.md:170-176`.
+  - `/data/yellow/libersystem/AI/audit/code-audit-P02M0201.md:300-385`.
+- **Code read in the current tree.**
+  - `/data/yellow/libersystem/src/user/services/core/src/bmc_service.rs`, whole.
+  - `/data/yellow/libersystem/src/user/services/logic/src/provider_retry.rs`.
+  - The generated `ipmi_provider` dispatcher and client (`/data/yellow/libersystem/src/user/libs/protocol/bmc-proto/src/generated/liber/bmc/v1.rs:2063-2075, 2470-2600`). A request is an op u16 followed by a correlation u32, and a reply is led by the correlation; that correlation is what `Stamped` rewrites.
+  - `/data/yellow/libersystem/src/user/libs/ipc/ipc-client/src/lib.rs:33-60`.
+  - `/data/yellow/libersystem/src/user/drivers/core/src/ipmi_driver.rs:300-320, 870-960, 1100-1240, 538-558, 680-688`.
+  - `/data/yellow/libersystem/src/user/drivers/core/src/admin_operation.rs` (`Operations::prepare`, `check`, `cancel`), and the other `Operations` users (`class_dfu.rs`, `admin_fixture.rs`).
+  - `/data/yellow/libersystem/src/user/drivers/core/src/ipmi_bmc.rs:1-200`.
+  - `/data/yellow/libersystem/src/user/libs/driver/ipmi/src/kcs.rs:1-140`.
+  - `/data/yellow/libersystem/src/tools/check-ipmi.sh:385-440, 575-656`.
+  - `git show 58fb476c` and `1f18f0a7` for the changed files.
+- **Claims checked.**
+  - Finding 1, `Stamped` stamps the request, discards foreign replies and restores the caller's correlation: confirmed (`bmc_service.rs:103-163`). Every binding call goes through `provider()` (`:165-167`), including the tool's `forward` (`:370-373`).
+  - Finding 1, no gate forces the late reply: confirmed. The follow probe ends before `mode silent` (`check-ipmi.sh:389-394, 415`).
+  - Finding 2, the `unopened` retry: confirmed. It starts at 1 s and backs off, the loop's timer covers the next retry, and a withdrawal drops it (`bmc_service.rs:95-99, 189-244, 504-511`). There are seven retries, about 127 s in all (`provider_retry.rs:14, 45-52`). That covers every fixture. A predecessor's `sensors` request against a silent BMC with more than about thirty readable sensors could still outlast it, because `ask` has no availability short-circuit (`ipmi_driver.rs:538-558, 680-688`). Not material on the fixtures.
+  - Finding 3, the reorder was made and then reverted to the pre-job content: confirmed (`58fb476c`, `1f18f0a7`, empty diff against `58fb476c^`).
+  - Finding 3, case 7 failed twice with 0xCB, and the LAN-side probe: not verifiable. No log of the failing runs is retained.
+  - Finding 3, the attempt is recorded in the plan: confirmed in Corrections (`P02M0201.md:519-524`). The checklist item is unchanged (Finding 1 above).
+  - `ipmi` passed (1639 s): consistent with the retained 2026-10-16 logs, though the PASS line is not retained. In case 7 the boot event is "Answered" (`/data/yellow/libersystem/.build/logs/ipmi/dev-serial.log:503-504`), and it is read back over the LAN in `oob-sel.log`.
+  - Checked, not a finding: the supervisor status read (`bmc_service.rs:279`) still uses a fresh correlation-0 client with a 10 s deadline. The retained run shows one such timeout (`dev-serial.log:477`, "CommitUncertain"). That channel carries only `status`, so a late reply is an older snapshot of the same operation, and it delays the boot event by a few polls at most.
+- **Not done.** This was a static review only: nothing was built or run.

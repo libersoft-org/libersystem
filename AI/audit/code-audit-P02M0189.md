@@ -513,3 +513,71 @@ The milestone records all three under "Corrections of 2026-10-15".
   - The first aarch64 run failed to capture its conditions. I had made the gate wait for `qemu-system-aarch64` in `ps -eo comm`, where a name is cut to fifteen characters (`qemu-system-aar`), so it waited out the whole scenario.
   - riscv64's first capture passed only because its scenario outlasted the 600 s wait.
   - The name is now matched cut the same way. aarch64 passed (557 s, the conditions taken two minutes in, while the guest ran), and riscv64 passed (817 s, taken 73 s in).
+
+AUDITOR'S RE-AUDIT ON P02M0189 (2026-10-18T17:47:21Z):
+
+**Rating: 9/10.** All three accepted findings are fixed in the tree:
+- **The x86_64 gate.** It refuses an optimised run that has no `ACCOUNT_REFERENCE`. It boots with `LIBER_BOOT_PROFILE` and `GPU_SIZE` cleared, and boots the dormant run as `development`. It then asserts that boot's profile line and the `site-live=0` its `--primitives` run prints. The retained 2026-10-17 x86 results show both.
+- **The port branch.** It now captures its conditions through a tracked tool while the guest runs.
+- **The WAKE record.** It names the core that `enqueue_on` actually queues the thread on.
+
+What remains is small:
+- the port branch's new start-up wait can fire on a short-lived probe QEMU;
+- the milestone's documents break two owner rules.
+
+No published number is affected.
+
+## Findings
+
+1. **Low, Defect - The port branch's start-up wait can fire on the IOMMU probe's short-lived QEMU, and the one capture attempt then fails the run.**
+   - **What the plan requires.** "The gate is the thing that keeps the account true after the next change to any layer in it" (`/data/yellow/libersystem/docs/todo/P02M0189.md:438-439`). The ports run "through the lab's cold scenario runner" (:440-442). The fix promised conditions captured "while the guest ran" (:480-481).
+   - **What the code does.**
+     - The loop stops at the first process whose comm is `qemu-system-aar` or `qemu-system-ris` (`/data/yellow/libersystem/src/tools/check-qemu-2d-account.sh:92-98`). It then runs the capture exactly once (:99-102).
+     - Every non-test port boot first runs `port_iommu_probe`, which is `qemu-system-aarch64 -machine virt,help` or `qemu-system-riscv64 -device gpex-pcihost,help` (`/data/yellow/libersystem/src/harness/qemu-run.sh:1887-1898`, called at :2872 and :3269). It runs because `port_iommu_decide` answers 1 when neither `IOMMU` nor `TEST` is set (:1870-1877).
+     - Only after the probe does the runner build the ESP and exec the guest (:3114, :3531).
+     - This gate's boots take that path: all three 2026-10-17 captures carry `virtio-iommu-pci,boot-bypass=on` in their argv.
+     - If a poll lands on the probe, the tool either finds no QEMU (`/data/yellow/libersystem/src/harness/frame-account-conditions.py:44-45`) or picks the probe's pid, which has no `.build/boot/esp-<arch>.<pid>.img` (:67-72). Either way the gate dies after waiting out the scenario.
+   - **Why it matters.** It fails closed, not with a wrong condition, but each spurious failure costs a whole 9-14 minute port run. How often it happens depends on the probe's lifetime against the one-second poll, which a static reading cannot measure. The retained first aarch64 failure (`.build/logs/qemu-2d-account/20261017T000501Z`, "found 0") had another cause, the uncut comm name, which is fixed.
+   - **Minimal fix.** Retry the capture until it succeeds or the cold run has ended. Have the tool accept only a QEMU whose `esp-<arch>.<pid>.img` exists.
+
+2. **Low, Defect - The milestone's documents name other milestones outside `docs/todo` and point at the audit.**
+   - **What is required.**
+     - The owner's decisions: milestone IDs appear only in `docs/todo`, `docs/todo/TODO.md` and `AI/`, and a milestone document says what was done without pointing at an audit file.
+     - The milestone itself: the account must be reproducible from the tree, since "a measurement nobody can reproduce from the source tree is an anecdote" (`P02M0189.md:245-246`).
+   - **What the documents do.**
+     - `/data/yellow/libersystem/docs/PERF.md:65`, the account's provenance paragraph, says "after P02M0193/P02M0198".
+     - `/data/yellow/libersystem/docs/todo/P02M0189.md:16-17` says "The audit preserves commands, failed and passed outcomes, source/provenance checks and the independent final arithmetic review".
+     - `docs/PERF.md:103`'s reproduction recipe says "Clear inherited boot-profile, scanout/display and gadget overrides as recorded in the audit". That instruction is also partly stale: the gate now clears the boot profile and `GPU_SIZE` itself (`check-qemu-2d-account.sh:196`).
+   - **Why it matters.** It breaks rules the owner has made absolute, and the account's reproduction recipe depends on a file outside the documentation.
+   - **Minimal fix.**
+     - Describe the two changes instead of naming the milestones.
+     - State the remaining overrides in `PERF.md` itself.
+     - Remove both pointers to the audit.
+
+## Verification performed
+
+- **Documents read.** `docs/todo/P02M0189.md` in full; the audit review (lines 428-486) and the implementer's response (487-515); `docs/PERF.md:59-106`.
+- **Code read in the current tree.**
+  - `src/tools/check-qemu-2d-account.sh` and `src/harness/frame-account-conditions.py`, both in full.
+  - `src/kernel/perf.rs:100-182`.
+  - `src/kernel/sched/mod.rs`: `enqueue_on` (:172-186) and `enqueue` (:1112-1160).
+  - `qemu-run.sh`: cold-run media naming, the system-disk generation key, `bind_tool`, `port_iommu_decide`/`port_iommu_probe`, and both port exec paths.
+  - `lab.py`: `cmd_scenario_cold`.
+  - The manifest rows for `virtio_gpu`, `display_service` and `test2d-sw`.
+  - The diffs of commits `58fb476c`, `7ee3e9bf` and `66352298`.
+- **Retained results read (read-only).** All under `.build/logs/qemu-2d-account/`:
+  - `20261016T210117Z`: the failed first run, which has no `run-primitives.out`.
+  - `20261016T220616Z`: the x86 PASS. `conditions-dormant.tsv` reads "LiberSystem boot profile: development" with tsc and buffer absent, and `run-primitives.out` contains `site-live=0`.
+  - `20261017T000501Z`: aarch64, "expected one aarch64 QEMU, found 0".
+  - `20261017T002837Z`, `20261017T001416Z` and `20261017T003754Z`.
+  - `continuation-20261008/capture-port.py`.
+- **Claims checked.**
+  - Optimised run refused without a reference: confirmed (:118-120).
+  - Boots run with `LIBER_BOOT_PROFILE` and `GPU_SIZE` unset: confirmed (:196).
+  - Dormant boot as `development`, with the profile and `site-live=0` assertions: confirmed in the code (:233-243) and in the retained results.
+  - Tracked tool, cold run in the background, comm matched cut to 15 characters, capture, then wait: confirmed (:88-103), with the race in finding 1.
+    - Side observation, not counted as a finding: the tool's `running_system_volume` match (`frame-account-conditions.py:79-84`) never fires on the cold runner's `virtio-blk-cold-<arch>.<sha256>.<pid>.img` names (`qemu-run.sh:2887-2890`, `:3283-3286`). The volume's SHA-256 is still recorded, as the generation key inside that path in the captured argv, so no condition is lost.
+  - WAKE core is the placement or the current CPU, matching `enqueue_on`: confirmed; `enqueue` is the only caller.
+  - "Kernel and test kernel build" and "kernel suite passed": not checkable statically.
+  - x86 PASS in 541 s, aarch64 in 557 s, riscv64 in 817 s, and the first aarch64 failure: consistent with the retained directories' timestamps, logs and account files.
+- **Not done.** This was a static review only: nothing was built or run.

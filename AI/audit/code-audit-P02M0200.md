@@ -278,3 +278,32 @@ IMPLEMENTER'S RESPONSE ON P02M0200 (2026-10-17T01:44:22Z):
 - The milestone records it under "Corrections of 2026-10-15".
 
 **Verification (x86_64):** `watchdog` passed, and so did `system-manifest check`.
+
+AUDITOR'S RE-AUDIT ON P02M0200 (2026-10-18T17:47:21Z):
+
+**Rating: 10/10.** The last review's only finding is resolved. watchdog_service's `CONFIG` role is now a `factory`. ServiceManager mints it afresh through ConfigService's `CONNECT` and narrows it at the first start and again at every plan relaunch, and the role is still optional. `read_policy` reads its keys on that private connection and then closes it. Since the last review, the only changes this milestone owns are the manifest row and `P02M0200.md`, so everything that review verified still holds. P02M0200's "first acts" rule also covers the BMC driver's take-over order, but that is P02M0201's code and is reported there.
+
+## Findings
+
+No unresolved issues, incorrect or incomplete fixes, unjustified rejections, regressions or new material defects were found.
+
+## Verification performed
+
+- **Documents read.**
+  - `/data/yellow/libersystem/docs/todo/P02M0200.md` whole, including "Corrections of 2026-10-15" (`:395-400`).
+  - `/data/yellow/libersystem/AI/audit/code-audit-P02M0200.md:256-280`.
+- **Code read in the current tree.**
+  - `/data/yellow/libersystem/src/user/services/manifest.toml:6389-6420` (the watchdog_service row).
+  - `/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:108-211` (the client and factory delivery arms) and `:959` (the first start).
+  - `/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1871-2040` (`relaunch_service`, `plan_relaunchable`, `relaunch_planned` → `deliver_roles` at `:2016`).
+  - `/data/yellow/libersystem/src/user/services/core/src/watchdog_service.rs:355-553`.
+  - ConfigService's serve loop and `/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:2183-2270`. `CONNECT` mints with no table bound, so the factory connection cannot be refused for capacity.
+  - `git log`/`git show` since 2026-10-14 over the service, logic, drivers, kernel `declared/`, gate and plan: only `58fb476c`/`7ee3e9bf` (the docs and the manifest row).
+- **Claims checked.**
+  - `CONFIG` is `kind = "factory"`, optional, with a comment saying why: confirmed (`manifest.toml:6407-6415`).
+  - The role is plan-resolved on both start paths: confirmed (`bootstrap.rs:186-211`, reached from `bootstrap.rs:959` and `service_manager.rs:2016`).
+  - `system-manifest.sh check` passes: not verifiable by a static review.
+  - The correction is recorded under "Corrections of 2026-10-15": confirmed (`P02M0200.md:395-400`).
+  - `watchdog` passed on x86_64: consistent with the retained 2026-10-16 logs, though the gate's PASS line itself is not retained. In `/data/yellow/libersystem/.build/logs/watchdog/serial-i6300esb.log:492-498`, and again after the crash and plan relaunch (`:500-507`), the service reports "armed by policy (development)", arms the `i6300esb` that `watchdog.device` names and disarms the TCO. So the keys arrived over the minted connection on both paths.
+  - The milestone document does not point at its audit file.
+- **Not done.** This was a static review only: nothing was built or run.

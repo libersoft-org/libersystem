@@ -708,3 +708,84 @@ The verification is below.
   - It uses the test build's exit port 0xF4 instead, which is reserved and has no row.
   - The fix was watched failing both ways: with the port check removed, the refusal assertion fails; with the old order, the SPCR merge fails.
 - `host-tests` passed, the platform policy and acpi model tests among them.
+
+AUDITOR'S RE-AUDIT ON P02M0196 (2026-10-18T17:47:21Z):
+
+**Rating: 9/10.** All six findings from the last review are resolved in the current tree (HEAD f6925965):
+- **SPCR/DBG2:** static descriptions are placed before the port check, so a table naming COM1 merges into `kernel:com1`.
+- **Memory type:** claims take their memory type from the memory map, and admission one gives a node's own region the same type.
+- **Device wake:** `platform-sleep`'s `wake`, and the next `prepare`, disable the device wake they enabled.
+- **ECDT ports:** a firmware-held row may name ports the running instance minted itself.
+- **fw_cfg:** `kernel:fw-cfg` is one 12-port range, and q35's `FWCF` merges into it.
+- **S0-idle flag:** the plan now records that the flag is not read.
+- **HPET:** the `_STA` refusal stays, as the owner decided.
+- **DeviceManager:** the fix for a connection handed back by a refused send is in.
+
+Three Low items remain, and none of them changes behaviour on QEMU:
+- The ECDT admission was built without a test, although the in-guest firmware tests can drive it.
+- One step-1 kernel test fails in scoped selections that start the ACPI service before it runs.
+- The corrections record describes one check the test does not make.
+
+## Findings
+
+1. **Low, Incomplete fix - the firmware-held/ECDT port admission (last review's finding 4) has no test, although a runnable in-guest oracle exists.**
+   - **What the plan requires.** The plan says "its two ports minted as `PortRange`s from the ECDT for early access and from `PNP0C09`'s `_CRS` after, the `PNP0C09` device FIRMWARE-HELD by the service and never claimable" (/data/yellow/libersystem/docs/todo/P02M0196.md:459-461). The owner's phase-2 rule is that nothing is built without an oracle that runs here, and an in-guest fixture or a host-test model counts as one. The correction instead says "QEMU has no EC; the kernel builds and the path has no oracle here" (/data/yellow/libersystem/docs/todo/P02M0196.md:723-724).
+   - **What the code does.**
+     - `note_instance_ports` records every SystemIO range the instance mints by address (/data/yellow/libersystem/src/kernel/firmware/mod.rs:655-661, fed from /data/yellow/libersystem/src/kernel/syscall/mod.rs:2430).
+     - `attach` clears that list (/data/yellow/libersystem/src/kernel/firmware/mod.rs:670).
+     - `admit` passes a FIRMWARE_HELD row whose ports lie inside the list (/data/yellow/libersystem/src/kernel/firmware/mod.rs:741-743).
+     - No kernel or host test mints through `SYS_PORT_RANGE_FIRMWARE` or reports a firmware-held row with ports. Nothing in src/kernel/firmware/tests.rs or src/kernel/test_suites refers to either.
+     - The admission decision needs no EC device. The suite already has the helpers `attach`, `namespace_description(identity, state, hid)` and `device_report` (/data/yellow/libersystem/src/kernel/firmware/tests.rs:97-123). It already uses them to publish namespace rows with ports (/data/yellow/libersystem/src/kernel/firmware/tests.rs:374-410).
+   - **Why it matters.** The fix that makes an ECDT laptop's EC become its row has never run, and nobody has watched it fail. A regression here would only show on hardware that phase 2 never sees. The plan's statement that no oracle exists is wrong for the kernel half.
+   - **Minimal fix.** Add one kernel test:
+     - Attach an instance and mint two free ports through `SYS_PORT_RANGE_FIRMWARE`, for example an EC's 0x62 and 0x66.
+     - Report a FIRMWARE_HELD row naming them, and require that it is published.
+     - Require that the same ports reported as a CLAIMABLE row are refused, and so is a FIRMWARE_HELD row over ports the instance did not mint.
+     - Watch the test fail with the `own` clause removed, then correct the plan sentence.
+
+2. **Low, Defect - the step-1 claim test `kernel.platform_rows.a_platform_row_is_claimed_with_its_resources_and_a_release_takes_every_one_back` depends on which tests ran before it, and fails in scoped selections.**
+   - **What the plan requires.** "KERNEL TESTS OF STEP 1, on all three targets: a test platform row claimed with its MMIO ranges, a port range on x86_64 and a wired line" (/data/yellow/libersystem/docs/todo/P02M0196.md:563-567). These tests run in the subsets `verify.sh` selects.
+   - **What the code does.**
+     - The test publishes `kernel:test-platform-claim` with COM2's ports 0x2F8/8 (/data/yellow/libersystem/src/kernel/test_suites/platform_rows.rs:153-158). It goes through `add_synthetic_platform_row` and then `publish_locked` (/data/yellow/libersystem/src/kernel/device.rs:2155-2166).
+     - `publish_locked`'s placement skips only the suite's `test:console-uart` row (/data/yellow/libersystem/src/kernel/device.rs:322-332). The port-range handoff tests create that row at COM2 (/data/yellow/libersystem/src/kernel/object/port_range/tests/handoff.rs:27).
+     - The failure: `kernel.boot.init_package_starts_system_manager` runs in the same boot without the handoff tests. The ACPI service then publishes `acpi:\_SB_.PCI0.SF8_.COM2` over 0x2F8 as a row of its own. The test's description merges into that row, and the identity assertion at /data/yellow/libersystem/src/kernel/test_suites/platform_rows.rs:163 fails.
+     - Logged twice:
+       - /data/yellow/libersystem/.build/logs/test/x86_64-20261017T184154Z-2494734-guest.log:276 and :586-588, a 38-test selection;
+       - /data/yellow/libersystem/.build/logs/test/x86_64-20261018T081004Z-3819356-guest.log:221 and :591-593, a 16-test selection.
+     - The full suite passes only because the port-range tests run earlier there. ACPI's COM2 then merges into the console row, row 70 (/data/yellow/libersystem/.build/logs/test/x86_64-20261016T225541Z-1190693-guest.log:350, :1156, :1315).
+     - Both tests carry `covers = ["kernel"]`, so a kernel change selects them together.
+   - **Why it matters.** A scoped verification of a kernel change can fail this milestone's own test when nothing is wrong with the change. That already wasted two runs on 2026-10-17/18.
+   - **Minimal fix.** Make the test independent of earlier tests. For example, leave namespace rows (`PLATFORM_SOURCE_ACPI`) out of the placement that `add_synthetic_platform_row` does in test builds, as `test:console-uart` already is. Then show that the 16-test selection above passes.
+
+3. **Low, Incomplete fix - the corrections record describes a refusal the test does not make.**
+   - **What the plan requires.** A milestone document says what was done and measured. Here it says "and a claimable row over 0xCF8 still refused" (/data/yellow/libersystem/docs/todo/P02M0196.md:715-716).
+   - **What the code does.** The test refuses a claimable row at the test build's exit port 0xF4 (/data/yellow/libersystem/src/kernel/test_suites/platform_rows.rs:425-427). A claimable row at 0xCF8 would now merge into `kernel:pci-host`, whose ports start there (/data/yellow/libersystem/src/kernel/arch/x86_64/platform.rs:80-81), because of the same-base rule (/data/yellow/libersystem/src/platform/src/lib.rs:141-142, :169-181). The implementer's own verification notes say the same.
+   - **Why it matters.** The record claims a check the tree does not make. Anyone who adds the check from this description gets a failing test.
+   - **Minimal fix.** Replace "over 0xCF8" with "over the test build's exit port 0xF4, which the reserved set holds and no row describes".
+
+## Verification performed
+
+- **Documents read.** /data/yellow/libersystem/docs/todo/P02M0196.md, all of it; /data/yellow/libersystem/AI/audit/code-audit-P02M0196.md:627-710.
+- **Code read in the current tree.**
+  - `kernel/device.rs`: `init`, `publish_locked`, `publish_namespace`, `add_synthetic_platform_row`, `synthetic_console_row`, and the 2026-10-18 additions `row_line`, `intx_off` and `windows`.
+  - `kernel/firmware/mod.rs`: `map_regions`, `claim_write_back`, `note_instance_ports`, `attach`, `admit`, `report`; and the `firmware/tests.rs` helpers.
+  - `syscall/mod.rs`: `sys_port_range_firmware`, the claim mints, the `NO_CACHE` map flag.
+  - `object/device_memory.rs`, `object/port_range/grants.rs`, `arch/x86_64/platform.rs`.
+  - `src/platform/src`: `lib.rs`, `policy.rs`, `firmware_tests.rs`.
+  - `acpi/model/src/sleep.rs` and its tests; `acpi_service.rs` (startup order, `SleepPlatform`, `run`); `device_manager.rs::grant_acpi_connections`.
+  - `boot/uefi/src/memory.rs::region_kind`; `test_suites/platform_rows.rs`.
+- **Claims checked.**
+  - Finding 1, the port check moved to `Placement::New` with the SPCR merge test: confirmed (/data/yellow/libersystem/src/kernel/device.rs:350-365).
+    - The test passing, and failing both ways: confirmed in the logs. The refusal at :427 fails in x86_64-20261015T200139Z, the merge at :433 fails in T200219Z, and the full suites of 10-15 and 10-16 pass with `table:SPCR#test ... merged`.
+    - The claim that every other fixed reserved range has a row: true except 0x10-0x1F, the DMA alias, where a description is refused anyway. Immaterial.
+  - Finding 2 (`claim_write_back`, `for_claim` uses it, admission one matches, host test present): confirmed in code.
+    - A claim range that straddles firmware memory and a hole can still give a region wholly inside the firmware part a second type. I judge that immaterial.
+    - Whether the host test runs and passes cannot be checked statically.
+  - Finding 3 (`disable_device_wake`, `release` on wake and on the next prepare, four sleep tests assert `_DSW off`): confirmed.
+  - Finding 4: the code is confirmed and plausible on a static reading, but untested (finding 1 above).
+  - Finding 5, fw-cfg as (0x510, 12) and `FWCF` merging: confirmed in code and in /data/yellow/libersystem/.build/logs/acpi/serial-fixture.log ("acpi:\_SB_.PCI0.FWCF is the device row 31 already names, and is merged into it"). The HPET part stays by owner decision.
+  - Finding 6: confirmed (/data/yellow/libersystem/docs/todo/P02M0196.md:495-497).
+  - DeviceManager closes a connection returned by a refused send: confirmed. There is no deterministic oracle, as the response says.
+  - "`acpi` passed twice (325 s, 344 s)": the retained 2026-10-16 log shows both rounds (GSBW/GSBR) and the FWCF merge. The durations and the other run are not in the tree.
+  - "`sleep` passed" and "`host-tests` passed": cannot be checked statically. The disarm has no gate oracle, as the plan says.
+- **Not done.** This was a static review only: nothing was built or run.

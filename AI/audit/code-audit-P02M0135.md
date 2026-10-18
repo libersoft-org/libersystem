@@ -937,3 +937,75 @@ The milestone records all five in dated notes. The verification is below.
   - So the first build most likely staged an `abiprobe` older than the substrate. That is not proven, and the hang did not recur.
   - In the shipping configuration the test says that `abiprobe` is not staged. It is development-only.
 - The shipping builds for aarch64 and riscv64 passed, and so did their development builds.
+
+AUDITOR'S RE-AUDIT ON P02M0135 (2026-10-18T17:31:27Z):
+
+**Rating: 8/10.** All five findings of the 2026-10-15 review were accepted, and the fixes are in the tree.
+- **Finding 1.** The substrate now hands the ported loader its own negotiation entry point, one per record slot. That entry point offers the driver at most 6. It refuses an answer of 0 or 1, of 7 or above, an answer above the offer, and any error. It reports each exchange, and the installer refuses a null entry point. The pass-2 inventory records the 2..6 range, and the audit-link gate checks that range against `version.rs`.
+- **Finding 2.** The builder rebuilds both trees from the pinned archives and the pinned patch series, checking every digest. It refuses a compiler or archiver whose version line differs from the pin, and it reads `[build]` from the lockfile. Before compiling, it checks each option's effect, the generated-source digest and the cross ABI. The pin now describes the configuration that is actually built and measured (-O2, assertions live, no debug info), and `PIN-bootstrap.toml` [build] and the milestone (`docs/todo/P02M0135.md:380-387`) document this, as the owner decided. `rust-lld` and the full clang version line are pinned and enforced.
+- **Finding 3.** The reviewed licence list is now one file, read by both the dependency gate and the manifest.
+- **Finding 4.** The identity records are computed from the inputs of the link that produced them, and the artifact gate recomputes and compares every field (`--verify-records`).
+- **Finding 5.** The stop-condition self-test now covers all three scopes, and the C++ ABI gate has one fixture per mechanism plus a clean control.
+
+Every pinned digest I recomputed matches the tree. What remains is one gap the implementer wrote down as "NOT COVERED" while the milestone still says COMPLETE. The loader's `VK_LUNARG_direct_driver_loading` path is a second way to load a driver, and the substrate's version bound does not apply on it.
+
+## Findings
+
+1. **Medium, Incomplete fix - the admitted interface-version set and the third-export refusal can still be bypassed through the ported loader's `VK_LUNARG_direct_driver_loading` path, yet the milestone is marked COMPLETE.**
+   - **What the plan requires.**
+     - `/data/yellow/libersystem/docs/todo/P02M0135.md:1047-1051`: "REFUSED, 7 and above ... The substrate never negotiates above 6, which is what keeps two exports sufficient".
+     - `:1052-1056`: a driver that requires `vk_icdGetPhysicalDeviceProcAddr` "is outside this profile and is refused by name".
+     - `:839`: "Choose ONE loader/ICD discovery model".
+     - `:473-475`: such paths "are removed by the port rather than left unreachable. A path nothing calls is still a path the closure admits".
+   - **What the code does.**
+     - The fix covers only the `loader_platform_get_proc_address` route (`/data/yellow/libersystem/src/user/libs/foreign/discovery/src/library.rs:58-74, 91-115`).
+     - The ported loader still advertises the extension (`/data/yellow/libersystem/.build/foreign/src-loader-port/loader/loader.c:1653-1658`).
+     - `vkCreateInstance` scans drivers (`trampoline.c:666`) before it validates extensions. That scan calls `loader_scan_for_direct_drivers` (`loader.c:4073`). In EXCLUSIVE mode it skips the scan the substrate's record answers (`:2076-2077`, `:4077`).
+     - `loader_add_direct_driver` takes the negotiation function from the application-supplied `pfnGetInstanceProcAddr` (`:1916-1917`). It negotiates at 7 with no substrate in between (`:1928`, `:1844`), refuses any version below 7 (`:1938`), and fetches `vk_icdGetPhysicalDeviceProcAddr` through the driver's own lookup (`:1966-1967`).
+     - `/data/yellow/libersystem/src/foreign/patches/0002-platform-port.patch` (unchanged since 2026-09-11) has no hunk for this path.
+     - Both functions are linked into the quarantine consumer: `llvm-nm` on `/data/yellow/libersystem/.build/foreign/pass2/x86_64/vkprobe.lsexe` shows `loader_add_direct_driver` and `loader_scan_for_direct_drivers`.
+     - The milestone says so itself at `/data/yellow/libersystem/docs/todo/P02M0135.md:878-880` ("NOT COVERED ... refusing it needs a port-patch hunk and a guest to prove it"), while `:3` says "COMPLETE - every item below is done" and the item is ticked at `:839`.
+   - **Why it matters.** Any consumer that holds the slot-bound driver's `vk_icdGetInstanceProcAddr` can enable the extension and pass that lookup to the loader (vkprobe already imports it, `/data/yellow/libersystem/src/user/apps/tools/src/vkprobe.rs:38-39`). The loader then agrees version 7 with that driver and takes the physical-device function from its lookup. That is the widening finding 1 described, through a second entry, with every gate green. The response's claim "nothing above 6 is ever agreed" holds for only one of the loader's two driver-loading paths.
+   - **Minimal fix.**
+     - Add a hunk to 0002 under `__LiberSystem__` that makes `loader_scan_for_direct_drivers` refuse or ignore a `VkDirectDriverLoadingListLUNARG` before any driver is called, and stop advertising the extension. Dropping it from the advertised list alone is not enough, because the scan runs before extension validation.
+     - Refreeze the derived pin.
+     - Add one vkprobe step that enables the extension with the slot-bound lookup, and have `foreign-loader-guest` assert that it is refused.
+     - Until then the item should not read as done.
+
+## Verification performed
+
+- **Documents read.**
+  - `/data/yellow/libersystem/docs/todo/P02M0135.md` in full.
+  - `/data/yellow/libersystem/AI/audit/code-audit-P02M0135.md:824-939`, with earlier sections for context.
+- **Code read in the current tree.** HEAD f6925965. Fix commits 58fb476c and 7ee3e9bf.
+  - The discovery crate (`library.rs`, `version.rs`, `record.rs`, `lib.rs`, `tests.rs`).
+  - `vkprobe.rs`, `abiprobe.rs` (calls only), `icdprobe.c` and its README, the foreign-abi `fputs`/sink/stderr code.
+  - The three PIN files and the two inventories.
+  - `build-foreign-static.sh`, `check-foreign-pin.sh`, `foreign-audit-link.py`, `foreign-inventory.py`.
+  - `check-foreign-audit-link.sh`, `check-foreign-audit-artifact.sh`, `check-foreign-cxx-abi.sh`, `check-icd-selection.sh`, `check-foreign-loader-guest.sh`, `guest-gate.sh`.
+  - `system-manifest` `lib.rs`/`tests.rs`/`reviewed-licences.txt`, `check-dependency-policy.sh`.
+  - The kernel test `dynamic_foreign_consumer_launches_and_exercises_every_admitted_facility`.
+  - The derived loader tree's negotiation and direct-driver code (`loader.c`, `trampoline.c`) and upstream's `CMakeLists.txt`.
+- **Claims checked.**
+  - `resolve` hands the loader the bounded per-slot entry point, which offers at most 6, refuses 0/1, 7 and above, answers above the offer, and errors, leaves the loader's value untouched, and reports the exchange: confirmed (`library.rs:58-137`, `version.rs:120-173`).
+  - "Never null, so no fallback; physical-device function unreachable": confirmed for `loader_scanned_icd_add` (`loader.c:2149-2161, 2251-2256`). Not confirmed for the direct-driver path (finding 1).
+  - `liber_foreign_install_icd` refuses NULL: confirmed (`record.rs:129, 151-153`; `tests.rs:436-446`).
+  - `_icd_interface` is in the inventory and is checked against `version.rs`: confirmed (`foreign-audit-link.py:511-538`, `check-foreign-audit-link.sh:107-120`).
+  - icd-selection no longer claims the refusals: confirmed (`check-icd-selection.sh:27-34, 89-98`).
+  - foreign-loader-guest asserts the line from the whole log: confirmed (`check-foreign-loader-guest.sh:104-114`). `GUEST_LOG` is private to each run (`guest-gate.sh:151`).
+  - Nine fixture drivers, 20 tests in all: confirmed by count (`tests.rs:322-330, 358-493`). "Six fail on the old `resolve`": plausible, not checkable statically.
+  - Builder digest-checks archives and patches, derives the trees under a lock and replaces any that differ: confirmed (`build-foreign-static.sh:191-251`).
+  - Builder refuses another compiler or archiver: confirmed (`:185-188`). This machine's clang, llvm-ar and the root toolchain's `rust-lld` print the pinned lines.
+  - Sources come from upstream's `NORMAL_LOADER_SRCS`: confirmed (`:370-371`, 14 sources).
+  - Builder checks options, `[build]`, the generated-source digest and the cross ABI, and writes its configuration file: confirmed (`:373-534`). The three "absent" options really are absent from upstream's CMake.
+  - `check-foreign-pin.sh` compares the tool lines and licences and runs `--check-lockfile`: confirmed (`:228-266, :300-311`).
+  - "Ten lockfile mutations refused": not confirmable statically. There is no committed self-test.
+  - Debug 52 / Release 51: recorded only as prose in `PIN-bootstrap.toml:117-121`; accepted per the owner's decision.
+  - The corrected pin is implemented and documented: confirmed. The option-table row at `docs/todo/P02M0135.md:322-326` still reads "Release ... authoritative", but the dated note at `:380-387` supersedes it.
+  - Refrozen digests (builder, ABI, cross files, both sysroots, generated sources, inventory, tool): all recomputed and equal to the pins.
+  - Finding 3, licences: confirmed (`system-manifest/src/lib.rs:1305-1308, 1382-1383, 1879-1884`; `check-dependency-policy.sh`; `check-foreign-pin.sh:260-266`; two new tests).
+  - Finding 4, real identity digests and `--verify-records` wired into the gate: confirmed (`foreign-audit-link.py:272-311, 669-777`; `check-foreign-audit-artifact.sh:97, 126`). I recomputed the source, objects, patches and sysroot digests of the three `audit-vulkan` records from their current inputs, and they match.
+  - Finding 5: confirmed (`foreign-audit-link.py:541-614`; `check-foreign-cxx-abi.sh:104-179`).
+  - Guest and port runs (foreign-loader-guest x86_64 PASS, icd-selection, foreign-facilities-guest, riscv64 and aarch64 kernel test): not confirmable statically. No logs are kept; the gate's work directory is removed on exit.
+  - The aarch64 2400 s hang: the cause is unexplained, as the response itself says, and a static reading cannot settle it. abiprobe never goes through the new negotiation code.
+- **Not done.** This was a static review only: nothing was built or run. I used read-only inspection only: tool version queries, `llvm-nm`/`llvm-readelf`/`llvm-objcopy` section dumps to /dev/null, and recomputing digests. No file was changed.

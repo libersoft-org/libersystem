@@ -702,3 +702,62 @@ IMPLEMENTER'S RESPONSE ON P02M0202 (2026-10-17T01:44:22Z):
 The milestone records both under "Corrections of 2026-10-15".
 
 **Verification (x86_64):** `typec-ucsi` passed: after the S3 case the charger was attached and its 9 V contract required, which an unacknowledged change would have blocked. The DisplayPort mode was configured as UFP_D. `host-tests` passed, the `typec_ucsi` tests among them.
+
+AUDITOR'S RE-AUDIT ON P02M0202 (2026-10-18T17:47:22Z):
+
+**Rating: 9/10.** Both findings are fixed as described.
+- **Finding 1.** `acknowledge_changes()` reads each queued change again with GET_CONNECTOR_STATUS and acknowledges the status and the change in one ACK_CC_CI. It runs at the end of `start()`, and in `wake()` before anything is published. The retained S3 run shows the change acknowledged after the resume, and a later charger attach announced and contracted at 9 V.
+- **Finding 2.** `dp_configuration` now selects 10b, UFP_U as UFP_D (Configure 0x0806). This matches the intent that the partner is the display's sink, and the UFP_D pin set that `pin_assignment` reads. The unit test, the gate and the PPM self-test agree.
+
+What remains:
+- The fix only acknowledges a change that some later completion names again. A change the PPM names only once is still dropped, and the harness PPM masks this.
+- The plan still points at its audit file and carries superseded status statements.
+
+## Findings
+
+1. **Low, Incomplete fix - A connector change the PPM names only once is still never acknowledged.**
+   - **What the plan requires.** "a connector change is acknowledged in the same `ACK_CC_CI` as the completion of the `GET_CONNECTOR_STATUS` that reads it" (`/data/yellow/libersystem/docs/todo/P02M0202.md:229-231`). The correction claims "Every indicated change is read and acknowledged before the driver publishes" (`:545`).
+   - **What the code does.**
+     - `ucsi::execute` reports one connector per exchange. When the command's completion already named a connector, it drops the one named by the acknowledgement's completion (`/data/yellow/libersystem/src/user/libs/driver/ucsi/src/lib.rs:226-232`).
+     - `run()` queues nothing at all from a change-acknowledging exchange (`/data/yellow/libersystem/src/user/drivers/core/src/ucsi_acpi.rs:157-168`).
+     - Example with changes pending on connectors 1 and 2: the acknowledgement of connector 1's change is answered with connector 2's indicator; the harness PPM does exactly this (`/data/yellow/libersystem/src/harness/ucsi-ppm.py:184-195`). The driver discards that indicator. If connector 1 is now detached, `read_port` sends nothing more (`ucsi_acpi.rs:297`). So `acknowledge_changes()` (`:258-264`), and `read_changes()` in normal running (`:486-497`), return with connector 2's change unacknowledged.
+     - Separately, `self.changes.clear()` (`:226`, `:242`) drops whatever the commands before the reads indicated, such as SET_NOTIFICATION_ENABLE's completion (`:238`). The fix therefore relies on the reads' completions naming the change again.
+   - **Why it matters.** This is the accepted Medium finding's outcome in a narrower case. A PPM that names a pending change once, and does not notify for it again, leaves that connector's later attaches and detaches unannounced. The gate cannot show it: the harness PPM repeats its indicator in every completion (`ucsi-ppm.py:290`) and announces again whenever its pending set changes (`:460-466`). Whether a given platform's PPM behaves the same way is beyond a static reading. It is Low because it needs two changes pending at once, and the phase-2 oracle masks it.
+   - **Minimal fix.**
+     - In `execute`, return the acknowledgement completion's connector when it differs from the one just acknowledged, and queue it in `run()` even for a change-acknowledging exchange.
+     - Stop discarding the changes indicated by the commands that precede the reads in `start()`/`wake()`: clear at the reset, not after the configuration.
+     - A harness PPM mode that announces each pending change only once would make both cases testable.
+
+2. **Low, Defect - The milestone document points at its audit file and still states superseded statuses.**
+   - **What the plan requires.** The owner's rule: a milestone document says what was done and does not point at an audit file. The status set after the owner's 2026-10-13 decision reads: "COMPLETE (2026-10-13) for phase 2 ... NOT TESTED ON REAL HARDWARE - not part of phase 2" (`/data/yellow/libersystem/docs/todo/P02M0202.md:3`).
+   - **What the code does.**
+     - Audit pointers in the plan: `P02M0202.md:501` ("Detailed commands, failures, fixes and logs are in the audit record"), `:510-511` ("recorded in `AI/audit/code-audit-P02M0202.md`"), `:522`, `:528`, `:534` and `:539`.
+     - An audit pointer in the TODO row: `/data/yellow/libersystem/docs/todo/TODO.md:304` ("preserved in the audit").
+     - Superseded statuses: the status line still ends "Remaining: the required recorded run on owner-provided real hardware" (`P02M0202.md:6-7`). `:531`, `:536` and `:539` still conclude "PARTIAL overall", and `:522` says "BLOCKED ... not complete".
+   - **Why it matters.** The permanent record depends on a working file, and it contradicts itself about whether the milestone is complete.
+   - **Minimal fix.**
+     - Delete the pointers; the surrounding sentences already say what ran.
+     - Drop "Remaining: ..." from the status line.
+     - Mark the 2026-10-10/11 PARTIAL and BLOCKED conclusions as superseded by the 2026-10-13 decision.
+
+## Verification performed
+
+- **Documents read.**
+  - `/data/yellow/libersystem/docs/todo/P02M0202.md`: the status, the UCSI policy, sleep, transport, discipline and command items (`:140-250`), the sleep case (`:430-447`), and the continuation notes plus "Corrections of 2026-10-15" (`:495-550`).
+  - `/data/yellow/libersystem/AI/audit/code-audit-P02M0202.md:600-704`.
+- **Code read in the current tree.**
+  - `/data/yellow/libersystem/src/user/drivers/core/src/ucsi_acpi.rs:1-330, 430-580`.
+  - `/data/yellow/libersystem/src/user/libs/driver/ucsi/src/lib.rs:150-255` and its test list.
+  - `/data/yellow/libersystem/src/user/drivers/core/src/typec_ucsi.rs:174-184` and `typec_ucsi/tests.rs:94-100`.
+  - `/data/yellow/libersystem/src/harness/ucsi-ppm.py:140-300, 440-470, 540-550`.
+  - `/data/yellow/libersystem/src/tools/check-typec-ucsi.sh:220-228, 395-430`.
+  - `git show 58fb476c` and `7ee3e9bf`. Since 2026-10-14 there has been no change to the TCPCI driver, `usb-pd`, TypeCService or `typec`.
+- **Claims checked.**
+  - Finding 1, `acknowledge_changes()` acknowledges with `read_port(at, true)`: confirmed for every change in `self.changes` (`ucsi_acpi.rs:258-264`). Not true for a change named only by an acknowledgement's completion (Finding 1 above).
+  - Finding 1, it runs at the end of `start()` and in `wake()`, and publishing comes after it: confirmed (`:226-230`, `:242-250`).
+  - Finding 1, the oracle: present (`check-typec-ucsi.sh:420-424`). It discriminates for the single-connector case, because the harness announces an unchanged pending set only once (`ucsi-ppm.py:460-466`). The retained run shows the change acknowledged with both bits after the resume, then the attach contracted (`/data/yellow/libersystem/.build/logs/typec-ucsi/ppm-sleep.log:121-142`, `probe-sleep.log`). Nothing records that the oracle was watched failing before the fix.
+  - Finding 2, `dp_configuration` selects 10b and Configure carries 0x0806: confirmed (`typec_ucsi.rs:182-184`). The test, gate and self-test agree (`typec_ucsi/tests.rs:97`, `check-typec-ucsi.sh:227`, `ucsi-ppm.py:546-547`). The retained v12 log shows `configuration 0x00000806` (`/data/yellow/libersystem/.build/logs/typec-ucsi/ppm-v12.log:173-174`).
+  - Both corrections are recorded under "Corrections of 2026-10-15": confirmed (`P02M0202.md:541-550`).
+  - `typec-ucsi` passed: consistent with the retained logs of 2026-10-16 04:19-04:33.
+  - `host-tests` passed: not verifiable by a static review.
+- **Not done.** This was a static review only: nothing was built or run.

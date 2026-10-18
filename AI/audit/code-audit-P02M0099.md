@@ -5269,3 +5269,352 @@ The milestone records findings 1, 3, 4, 5 and 6 in dated notes, and finding 2 as
 - `host-tests` passed, the drivers crate's tests among them.
 - The shipping builds for aarch64 and riscv64 passed, and so did their development builds.
 - Not run: `check-driver-mutations.sh`, which carries the three new NCM mutations.
+
+AUDITOR'S RE-AUDIT ON P02M0099 (2026-10-18T17:55:15Z):
+
+**Rating: 6/10.** This re-audit covers three things: the implementer's answers to the 2026-10-15 review, and the six restored items in two groups, the legacy USB host controllers (EHCI, OHCI/UHCI) and NVDIMM/virtio-crypto/virtio-balloon/virtio-mem/virtio-fs.
+
+**The answers to the 2026-10-15 review.** Most of its six findings are closed in the code.
+- NVMe now resets the controller before it answers a command it gave up on, and it waits on clock deadlines instead of spin counts.
+- CDC-NCM is bound. Its framing is host-tested, and it has a real oracle: the host kernel's own `usb_f_ncm` gadget.
+- The Bulk-Only Transport now checks the data length the transport actually moved and refuses a CSW that is not 13 bytes. This logic survived the 2026-10-18 move into `drivers::usb_bot`.
+- AHCI, NVMe and HDA claim a quiet stop only after their DMA engines read back as stopped.
+- The six dropped families are settled by the owner's decision, and the restored items are implemented.
+
+**The legacy USB host controllers.** Most of the work holds up.
+- There is one shared USB core over a `Controller` trait.
+- The HID binding and the Bulk-Only transport really moved out of xHCI. Compared with the pre-commit `usb_hid.rs`/`usb_storage.rs`, there is no regression.
+- The three engines program their schedules correctly for QEMU.
+- DMA below 4 GiB is correct in the buddy allocator, the frame allocator and the IOMMU.
+- The kernel's shared-line accounting matches the DONE notes: mask on a firing, a `waiting` flag per holder, unmask only once every holder has acknowledged, edge lines and the other polarity refused.
+- The `usb-legacy` gate exercises what it claims to.
+
+**The NVDIMM and virtio items.** NVDIMM and virtio-fs hold against their item texts and DONE notes. virtio-crypto holds except on the driver's own stop path. virtio-balloon and virtio-mem each hold on their own, but not together.
+
+**What remains** is fifteen findings, seven of them Medium:
+- **Three regressions:**
+  - virtio-mem's change to `frame::totals()` broke the balloon's kernel floor;
+  - two new kernel tests are not limited to x86_64, so the required aarch64 and riscv64 suites will fail;
+  - the `driver-mutations` gate, on which the conformance item closed, now fails before it counts anything.
+- **DMA pages "given back" are still pinned.** No release path in the xHCI process, or in the new legacy USB core, unmaps the buffer it closes.
+- **Three defects in the new legacy-USB run loop and shared-line design:**
+  - a consumer is served by a stale index after a departure;
+  - a root-port change seen during a transfer is not acted on, and OHCI's root-hub interrupt stays masked meanwhile;
+  - a holder that dies unmasks a line its controller may still be asserting.
+- **Eight Low items.**
+
+No gate reaches any of the Medium defects.
+
+## Findings
+
+1. **Medium, Regression - with virtio-mem memory online, the balloon's floor counts plugged frames but takes boot-pool frames only, so a host's balloon request can drain every frame the kernel's own allocations can use.**
+   - **What the plan requires.** "report pressure without letting the host directly choose a victim Domain" (/data/yellow/libersystem/docs/todo/P02M0099.md:7498-7499). The DONE note says the balloon takes "never below the allocator's floor (a sixteenth of the machine, at least 32 MiB)" (:7504-7505), and that "the kernel's heap, page tables, DMA buffers and stacks never do [use plugged memory]" (:7538-7539).
+   - **What the code does.**
+     - Since f6925965, `totals()` adds the plugged regions' online and free frames (/data/yellow/libersystem/src/kernel/mem/frame/mod.rs:1246-1253).
+     - `balloon_take` computes its room from `totals()`, but takes each frame with `allocate()` (:1310-1318). `allocate()` serves only the boot pools (`ALLOCATOR.lock().take_one_from(want)`, :1622-1632).
+     - So while plugged free frames are at or above the floor, the room stays positive until `allocate()` returns None, which means the boot pools are empty.
+     - ResourceManager's allowance (/data/yellow/libersystem/src/user/services/core/src/resource_manager/balloon.rs:27-30, :69) is computed from `MemoryStats`, which is the same `totals()` (/data/yellow/libersystem/src/kernel/syscall/mod.rs:1200). It therefore stays high as long as plugged memory is free, and nothing tells the balloon to give back.
+   - **Why it matters.** Picture a VM that has both devices (libvirt adds a balloon to every guest by default) and some plugged memory free. One large host balloon target then takes the memory that the heap, page tables, kernel stacks and DMA buffers depend on. The kernel's allocations fail across the system until the host lowers the target, so in effect the host has picked the kernel as the victim. Neither gate runs both devices on one machine.
+   - **Minimal fix.** In `balloon_take`, compute the room from the boot pools' own `total_count`/`free_count`, the way `allocate_movable` already does (:1642-1651), not from `totals()`.
+
+2. **Medium, Regression - the virtio-crypto and balloon kernel tests run on every architecture, but only the x86_64 test machine has their devices, so the required aarch64 and riscv64 kernel suites will fail.**
+   - **What the plan requires.** Both DONE notes are "on x86_64" (:7473, :7501). /data/yellow/libersystem/src/tools/verify-model/model/release-required.toml:385-386 requires `suite.kernel / aarch64` and `suite.kernel / riscv64`, and with no arguments test.sh runs "every test" (/data/yellow/libersystem/test.sh:24).
+   - **What the code does.**
+     - `virtio_crypto_serves_aes_...` is tagged `[Drivers, Pci]` with no architecture gate (/data/yellow/libersystem/src/kernel/test_suites/hardware.rs:5310). Its `bind_bus_controller` call (:5327) reaches `found.expect(...)` (:5068).
+     - `a_balloon_is_minted_...` is tagged `[Drivers, Memory, Pci]` (:5730) and calls `.expect("the test machine has a memory balloon")` (:5738).
+     - `virtio-crypto-pci` and `virtio-balloon-pci` are attached only inside `qemu_run_x86_64` (/data/yellow/libersystem/src/harness/qemu-run.sh:2711-2716; the function runs from :2122 to :2807). `qemu_run_aarch64` (from :2808) and `qemu_run_riscv64` (from :3219) attach neither.
+     - The NVDIMM test, by contrast, carries `ArchX86_64` and a cfg'd body (hardware.rs:5632).
+     - The port runs since the restoration were scoped selections. The latest, `.build/logs/test/aarch64-20261018T104112Z-149235-guest.log` (22 passed) and `riscv64-20261018T104200Z-155162-guest.log` (24 passed), contain neither test, so nothing has shown the failure yet.
+   - **Why it matters.** Both tests panic in the end-of-job runs on the other two architectures, so the milestone cannot close with those suites green.
+   - **Minimal fix.** Attach both devices (both are plain virtio-pci) on the aarch64 and riscv64 test machines, or limit the two tests to x86_64 the same way as the NVDIMM test.
+
+3. **Medium, Regression - The `driver-mutations` gate, which the conformance item closed on, fails on the current tree before it counts anything.**
+   - **What the plan requires.**
+     - The conformance item closed on "driver-mutations counts only what a test caught, 163 of 163" (`/data/yellow/libersystem/docs/todo/TODO.md:183`; `/data/yellow/libersystem/docs/todo/P02M0099.md:8375-8390`). The xHCI event-retention proof is part of that item's evidence (`P02M0099.md:8388`).
+     - The response says the proof "was mended and passes".
+   - **What the code does.**
+     - **The gate stops on a missing anchor.** It runs under `set -euo pipefail` (`/data/yellow/libersystem/src/tools/check-driver-mutations.sh:20`), and `mutate` exits when an anchor is not found exactly once (`check-driver-mutations.sh:99-107`).
+     - **(a) The BOT residue stanza no longer matches.**
+       - The stanza anchors on `if residue > wanted {` … `let moved = wanted - residue;` (`check-driver-mutations.sh:586-592`).
+       - The finding-5 change rewrote these lines to `if csw.residue > wanted {` … `let moved = (wanted - csw.residue).min(observed);` (`/data/yellow/libersystem/src/user/drivers/core/src/usb.rs:74-77`).
+       - A static check of all 166 stanzas against the tree found this one with 0 matches; the other 165 match once.
+     - **(b) The retention proof fails first.**
+       - Before any mutation, the gate runs `xhci_event_retention.py --run` (`check-driver-mutations.sh:52-53`).
+       - The proof takes `struct Pad {`, `pub struct Pads {`, `impl gamepad::Sender for Sink {`, `impl Pads {`, `unsafe fn feed_hid_report(`, `struct Sink(u64);` and `MAX_PADS` from `usb_hid.rs`, and raises when one is missing (`/data/yellow/libersystem/src/tools/xhci_event_retention.py:28`, `112-120`).
+       - Commit `f6925965` (2026-10-18) moved all of these into `drivers::usb_input` (for example `MAX_PADS` at `/data/yellow/libersystem/src/user/drivers/core/src/usb_input.rs:39`), and none of them is in `usb_hid.rs` any more.
+     - **The gate was never re-run.** The implementer says so ("Not run: check-driver-mutations.sh"), and the milestone records no pass after 2026-10-14.
+   - **Why it matters.**
+     - The gate that "counts only what a test caught" now fails before it plants anything.
+     - The three new NCM stanzas have never run.
+     - The xHCI retention proof does not pass on the current tree, so the conformance item's closing evidence no longer holds.
+   - **Minimal fix.**
+     - Re-anchor the stanza on the new lines. For example, the mutation could become `let moved = wanted.wrapping_sub(csw.residue).min(observed);`, which `a_residue_past_the_transfer_is_refused_before_it_is_subtracted` still catches.
+     - Point the proof's HID anchors, and its module list, at `usb_input.rs`.
+     - Run `./check.sh --gate driver-mutations`.
+
+4. **Medium, Incomplete fix - Every USB release path closes DMA handles without unmapping them, in xHCI and in the new legacy core alike, so detached and failed devices still keep their rings, their pages and the DMA charge for them.**
+   - **What the plan requires.**
+     - The class-module lifecycle: "Detach releases the class module's resources" (`/data/yellow/libersystem/docs/todo/P02M0099.md:4903-4906`).
+     - The budget "cannot drift from the memory, and a hundred plug/unplug cycles end where they started" (`/data/yellow/libersystem/docs/todo/P02M0099.md:4946-4948`).
+     - DRV-007 calls "the pages pinned for ever" the defect it fixes (`/data/yellow/libersystem/docs/todo/P02M0099.md:1701-1705`).
+     - The 2026-10-15 correction note says the modules "GIVE BACK WHAT THEY TOOK" (`/data/yellow/libersystem/docs/todo/P02M0099.md:9084-9085`).
+   - **What the code does.**
+     - **The allocation helpers map every buffer.**
+       - Every xHCI ring and page comes from `dma_page()` or `dma_buffer_for`, and both map the buffer (`/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:253-258`, `/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:3526-3528`, `3543-3555`). The legacy core's `dma_below_4g` maps in the same way (`/data/yellow/libersystem/src/user/drivers/core/src/usb_host.rs:140-146`).
+       - The kernel's map call stores a strong `Arc<DmaBuffer>` in the process (`record_dma_mapping(dma.clone())`, `/data/yellow/libersystem/src/kernel/syscall/mod.rs:910`; `mapped_dma: SpinLock<Vec<Arc<DmaBuffer>>>`, `/data/yellow/libersystem/src/kernel/object/process/mod.rs:164`).
+     - **Closing a handle does not unmap.**
+       - That reference is dropped only by `SYS_DMA_BUFFER_UNMAP` (`/data/yellow/libersystem/src/kernel/syscall/mod.rs:917-929`) or at process teardown (`unmap_objects`, `/data/yellow/libersystem/src/kernel/object/process/mod.rs:964-970`).
+       - `rt::close` is a bare handle close (`/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:2480-2484`). The kernel's close special-cases only claims (`/data/yellow/libersystem/src/kernel/object/handle/mod.rs:846-855`).
+       - Frames are retired, and the Domain's DMA charge refunded, only in `Drop` (`/data/yellow/libersystem/src/kernel/object/dma_buffer/mod.rs:418-484`).
+     - **No USB release path calls `dma_buffer_unmap`:**
+       - `Ring::release` (`/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:290-295`)
+       - `UsbDevice::release` (`xhci.rs:553-571`)
+       - `Net::release` (`/data/yellow/libersystem/src/user/drivers/core/src/usb_net.rs:136-152`)
+       - `Storage::release` and the buffer replacement in `fit_data` (`/data/yellow/libersystem/src/user/drivers/core/src/usb_storage.rs:53-62`, `81-83`)
+       - `Serial::release` (`/data/yellow/libersystem/src/user/drivers/core/src/usb_serial.rs:98-107`)
+       - `Uas::release` (`/data/yellow/libersystem/src/user/drivers/core/src/usb_uas.rs:174-191`)
+       - `Pipe::release` (`/data/yellow/libersystem/src/user/drivers/core/src/classes.rs:170-178`)
+       - the legacy core's `Dma::release` (`/data/yellow/libersystem/src/user/drivers/core/src/usb_host.rs:130-135`), which every EHCI/OHCI/UHCI ring, transfer page and departed device's buffers go through. `dma_below_4g` also closes a buffer it refuses above 4 GiB without unmapping it (`usb_host.rs:143-145`).
+       - None of `xhci.rs`, `usb_net.rs`, `usb_storage.rs`, `usb_serial.rs`, `usb_uas.rs`, `classes.rs`, `usb_host.rs`, `usb_input.rs`, `usb_bot.rs`, `ehci.rs`, `ohci.rs` or `uhci.rs` calls it.
+     - **The other DMA drivers unmap before closing:** NVMe, AHCI, HDA and virtio-scsi (`nvme_driver.rs:412`, `ahci_driver.rs:204`, `hda_driver.rs:600`, `688`, `virtio_scsi.rs:551`).
+     - **The detach path still refunds the budget**, "with the pages" (`xhci.rs:2464-2467`).
+   - **Why it matters.**
+     - Every plug/unplug and every failed attach permanently keeps its rings, pages and DMA quota while the controller's process lives. A CDC-ECM adapter, for example, keeps three rings and three pages, plus the device's ep0 ring and its three enumeration pages.
+     - Meanwhile the class budget is refunded. This is the drift the 2026-10-15 finding 4 described, and it now covers every module, the newer ones included, and the legacy controllers.
+     - A long-running controller that sees repeated plugging eventually exhausts its Domain's DMA quota and stops enumerating devices.
+     - I found no test that compares the Domain's DMA usage before and after a detach. The plug-cycle evidence covers only budget arithmetic.
+   - **Minimal fix.**
+     - Add one helper that does `dma_buffer_unmap(handle); close(handle)`, for xHCI and for the legacy core's `Dma`.
+     - Use it in `Ring::release`, `UsbDevice::release`, every module's release and `fit_data`, and `Dma::release`. Order it after Disable Slot, or after the endpoints are dropped, so the controller no longer references the frames.
+     - Add one guest assertion that the controller Domain's `dma_used` returns to its pre-plug value after a detach.
+
+5. **Medium, Defect - the legacy-USB run loop serves a consumer by an index taken before `reconcile` + `follow` may have retired publications, so a stick leaving during I/O can orphan another consumer, misreport a disconnect, or crash the driver.**
+   - **What the plan requires.** "bounded transfer ownership and hotplug semantics" (/data/yellow/libersystem/docs/todo/P02M0099.md:7393-7394). The DONE note: publications "offered under a fresh token when one binds, withdrawn when the last leaves ... the USB volume's instance follows the disk from controller to controller" (P02M0099.md:7409-7413).
+   - **What the code does.**
+     - The wait returns `Consumer(at)` (/data/yellow/libersystem/src/user/drivers/core/src/usb_host.rs:1244).
+     - If `look` is set, `host.reconcile()` and `publications.follow(...)` run (usb_host.rs:1265-1273). A departure then calls `serving.retire(token)` (usb_host.rs:1110), which closes that publication's endpoints. `close_at` moves the last live endpoint into each hole and zeroes the slot it leaves (/data/yellow/libersystem/src/user/drivers/core/src/common.rs:1007-1021, 1039-1056).
+     - Only after that does the loop read `serving.at(at)` / `serving.token_at(at)` with the old `at` (usb_host.rs:1274-1276).
+     - If the ready consumer was the last live endpoint, `ends[at]` is 0 and `tokens[at]` is 0, which is `BUS_TOKEN`. `try_recv_caps(0)` then answers `Closed` (/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:1487-1489).
+     - `serving.close_at(at)` (usb_host.rs:1331) then runs on a slot past `count`. `count -= 1` (common.rs:1010) drops the endpoint now at `count-1` from the live set without closing it.
+     - `common::disconnected(bootstrap, bind, 0)` (usb_host.rs:1333) tells the manager the bus inventory lost a consumer.
+     - When `count` was already 0, the subtraction underflows and the driver panics.
+     - `look` is set on a consumer wake when UHCI's `take_port_change` finds a CSC (/data/yellow/libersystem/src/user/drivers/core/src/uhci.rs:521-524), or when a change was remembered inside a transfer (finding 6). That is typically the volume's next block request after a stick on a root port left.
+     - The gate never gets there: its root-port departures wake on the interrupt (`Device(0)`), and its UHCI stick sits behind a hub, which is reaped before the wait (usb_host.rs:1238).
+   - **Why it matters.** Pulling a stick mid-read on the shipping EHCI, or on UHCI, can do any of the following:
+     - Orphan InputService's pointer connection: `first_for` then finds nothing, `PTR_SINK` becomes 0, and that controller's tablet goes dead.
+     - Orphan the bus inventory endpoint.
+     - Misreport consumer counts to the manager.
+     - Crash the driver.
+   - **Minimal fix.** Take `server`/`token` from `ready` before the `look` block (or handle the consumer before `reconcile`). After `follow`, re-find the endpoint by its handle, and skip it if it was retired.
+
+6. **Medium, Defect - a root-port change seen by a wait inside a transfer is remembered, but the loop then blocks without acting on it; OHCI's root-hub interrupt stays masked until an unrelated wake.**
+   - **What the plan requires.** EHCI: "root-hub events" (P02M0099.md:7340). OHCI/UHCI: "hotplug semantics" (P02M0099.md:7393-7394). The DONE note: "the root hub's status change interrupt held off until the change is taken" (P02M0099.md:7400-7401).
+   - **What the code does.**
+     - `settle` calls `hc.service()` on every wake inside a transfer (usb_host.rs:216-236).
+     - EHCI's `service` clears USBSTS and only sets `port_changed` (/data/yellow/libersystem/src/user/drivers/core/src/ehci.rs:637-650).
+     - OHCI's `service` also disables RHSC (/data/yellow/libersystem/src/user/drivers/core/src/ohci.rs:555-566). Only `take_port_change` enables it again (ohci.rs:568-574).
+     - The run loop asks `take_port_change` only after a wait has returned (usb_host.rs:1265). For EHCI/OHCI that wait is unbounded: neither polls its ports (`port_poll` is `None`, ehci.rs:656-658, ohci.rs:576-578), so `timer_set(retry, u64::MAX)` unless a gamepad frame is owed (usb_host.rs:1242), and `wait_any(.., 0)` in `wait_providers_inner` (common.rs:797-840). A manager ping is answered inside that wait and does not return.
+     - On OHCI, `reset_port` writes PRS and then PRSC (ohci.rs:391, 399). QEMU's root hub raises RHSC whenever a write changes a port register. The enumeration's first `settle` therefore services RHSC: the flag is set and RHSC masked, and nothing unmasks it unless some event wakes the loop.
+     - So an OHCI arrival that changes no publication (a keyboard, a hub, a second pointer, an unbound device) leaves the driver deaf to the next root-port plug or unplug. For example, a stick plugged after a keyboard is not enumerated until a key is pressed.
+     - On EHCI, a PCD consumed during a block transfer (stick pulled mid-read) defers the departure to the next unrelated wake. That wake is usually a consumer request, which is the trigger for finding 5.
+     - This is a static reading. The gate passes because every OHCI arrival in it changes a publication, and the resulting CONNECT wakes the loop.
+   - **Why it matters.** Root-port hotplug on OHCI, and on EHCI during I/O, depends on unrelated traffic.
+   - **Minimal fix.** Act on a remembered change before blocking. For example, after `reap_hubs` at the top of the loop: `if host.hc.take_port_change() { host.reconcile(); }`, then `follow`. Or arm `retry` at `clock()` while a change is pending.
+
+7. **Medium, Defect - a holder of a shared wired line that goes away without its function's pin turned off unmasks a level line its controller may still be asserting.**
+   - **What the plan requires.** "no legacy polling path may weaken IRQ, DMA cleanup or controller-process isolation" (P02M0099.md:7395-7396). The DONE note: "its pin turned on when the line is bound and off by the release" (P02M0099.md:7369-7370).
+   - **What the code does.**
+     - The pin is turned off only in `release_claim`, before `revoke_derived` (/data/yellow/libersystem/src/kernel/device.rs:1521). That is correct for a planned release.
+     - When a driver dies or is killed, its handle table drops the Interrupt first. `Drop` calls `unbind(vector, owner)` (/data/yellow/libersystem/src/kernel/object/interrupt.rs:178-188).
+     - x86_64 `unbind` then unmasks the line: for the kernel's hot-plug handler when this was the last holder, or for the remaining holders once they are settled (/data/yellow/libersystem/src/kernel/arch/x86_64/interrupts/mod.rs:358-361, 365-366).
+     - The claim, and with it the function's INTx, stays live until DeviceManager's teardown reaches `release_claim`.
+   - **Why it matters.** A controller whose status was never serviced (for example a hung driver that the watchdog kills) keeps its level INTx asserted.
+     - On the hot-plug port's GSI with no other holder: `dispatch` runs the kernel handler, `signal_line` finds no line, the EOI follows, and the line fires again. That is an interrupt storm on the boot core, which is where every wired line is routed (interrupts/mod.rs:197, 216). It lasts until DeviceManager releases the claim.
+     - With other holders, every firing wakes every sibling driver; each finds nothing and acknowledges, and the line fires again.
+     - The shared-line test only covers a holder leaving after its source was cleared (`edu.acknowledge_interrupt(2)` before `release_device(&b)`, /data/yellow/libersystem/src/kernel/test_suites/platform_rows.rs:632-636).
+   - **Minimal fix.** Record the PCI function on the `Holder`; `platform_line_acquire` already knows it (/data/yellow/libersystem/src/kernel/syscall/mod.rs:2290-2307). In `unbind`, set that function's INTx Disable bit before the line can be unmasked.
+
+8. **Low, Incomplete fix - NVMe's timeout branch has never run, although the item's definition of done asks for an oracle for it and one is available.**
+   - **What the plan requires.**
+     - "status and timeout recovery" (`/data/yellow/libersystem/docs/todo/P02M0099.md:2418-2420`).
+     - "A fake-controller seam covering completion ordering, timeout, reset and resource cleanup" (`P02M0099.md:2499-2500`).
+     - The owner's rule: "No driver and no feature without an oracle that runs here" (`/data/yellow/libersystem/AI/CLAUDE.md:69`).
+     - The prior finding said: "Nothing tests what the driver does next".
+   - **What the code does.**
+     - **The recovery is not host-testable.** `Controller::io`/`recover` (`/data/yellow/libersystem/src/user/drivers/core/src/nvme_driver.rs:598-629`) lives in the driver binary.
+     - **The new tests cover classification only.** They test only `needs_reset` and `shutdown_complete` (`/data/yellow/libersystem/src/user/drivers/core/src/nvme/tests.rs:347-371`). The `FakeRing` seam (`nvme/tests.rs:231-345`) has no timeout, no reset and no retry.
+     - **`reset()` itself does run.** It runs on the S3 resume in `boot-volume-controllers` (`nvme_driver.rs:839-847`).
+     - **The trigger and what follows it never run:** the timeout trigger, the single retry, the second reset and the `down` state. The milestone says as much (`P02M0099.md:9082-9083`).
+     - **The stated reason is incomplete.** "QEMU's NVMe model always completes" is true, but QEMU's block layer can hold a request past the 30 s `IO_TICKS` (`nvme_driver.rs:49`): a `null-co` drive with `latency-ns` can do it, and so can a throttle group changed over the monitor.
+   - **Why it matters.** This path is what keeps `vol://system` alive after one late completion on a boot-critical driver. A defect in it would reproduce the original High failure, and no test would show it.
+   - **Minimal fix.** Add one guest case: an NVMe controller on a delaying backend. Alternatively, move the recovery behind a small trait in `drivers::nvme` and drive it with a register model, as `usb_bot::Transport` is now driven. The case should assert three things:
+     - the reset happens before the request is answered;
+     - a second timeout produces the error reply;
+     - requests are served again once the delay is lifted.
+
+9. **Low, Defect - one holder that does not acknowledge holds the shared line masked for every other holder and for the hot-plug port, with no bound.**
+   - **What the plan requires.** "no legacy polling path may weaken IRQ ... or controller-process isolation" (P02M0099.md:7395-7396).
+   - **What the code does.**
+     - `signal_line` masks the GSI and marks every holder `waiting` (interrupts/mod.rs:240-262).
+     - `acknowledge` unmasks only once `settled()` (interrupts/mod.rs:265-273).
+     - The code states the cost itself: "A holder that never acknowledges holds the line masked for the others until it lets go, which is the price" (interrupts/mod.rs:76-77).
+     - A USB driver can be blocked outside its waits:
+       - in `send_blocking` to the key sink (/data/yellow/libersystem/src/user/drivers/core/src/usb_input.rs:287, 296);
+       - in `reply_block` (/data/yellow/libersystem/src/user/drivers/core/src/usb_bot.rs:441-443);
+       - in `send_caps_blocking` of the inventory (usb_host.rs:1302);
+       - in the sleep `hold`.
+     - Any of these stalls every sibling controller's interrupt-driven loop. The hot-plug port falls back to the idle pass (/data/yellow/libersystem/src/kernel/main.rs:1379-1388).
+   - **Why it matters.** One controller process, or a stalled consumer of it, degrades every other process on the line. xHCI on MSI never had this coupling.
+   - **Minimal fix.** Mask per function rather than per line, using the PCI 2.3 Interrupt Disable bit the kernel already writes (`set_intx_disabled`). On a firing, set it on each holder function whose Interrupt Status bit is set, signal that holder, and leave the I/O APIC pin live; clear it on that holder's acknowledgement. This is VFIO's scheme for shared INTx, and it also closes finding 7.
+
+10. **Low, Incomplete - EHCI ships while the companion drivers it hands full- and low-speed devices to are development-only.**
+    - **What the plan requires.** EHCI "as a lower-priority compatibility path ... prove HID/storage/class parity with xHCI" (P02M0099.md:7338-7341). OHCI/UHCI: "a demonstrated target need before enabling either by default" (P02M0099.md:7394-7395).
+    - **What the code does.**
+      - `ehci` carries no `development` flag (/data/yellow/libersystem/src/user/services/manifest.toml:4317-4337).
+      - `ohci` and `uhci` are `development = true` (manifest.toml:4349, 4373), and their bins require the `development` feature.
+      - `release` hands every full/low-speed root-port device to a companion and prints "handed to its companion controller" (ehci.rs:384-399).
+    - **Why it matters.** In a shipping image on an EHCI-with-companions machine (QEMU's ich9-usb-ehci1 with its UHCI companions, which is the gate's own topology), every keyboard and mouse is handed to a controller nothing drives. The log nonetheless says it was handed over. An EHCI with companions is itself the target need the OHCI/UHCI item waits for.
+    - **Minimal fix.** An owner decision is needed: either ship `uhci`/`ohci` together with `ehci`, or keep `ehci` development-only too. At the least, the DONE note should say that a shipping EHCI drives only high-speed root-port devices, and the hand-over line should say when the image carries no companion driver.
+
+11. **Low, Incomplete - class parity beyond HID and Bulk-Only storage on the legacy controllers is neither built nor recorded.**
+    - **What the plan requires.** "reuse USB enumeration/class drivers above one host-controller interface ... prove HID/storage/class parity with xHCI" (P02M0099.md:7339-7341).
+    - **What the code does.**
+      - The core binds hubs, HID and Bulk-Only storage only (usb_host.rs:16-18; `bind` at usb_host.rs:579-607).
+      - Every other class xHCI's `register_device` carries is addressed and left unbound on these controllers: CDC network, serial, UAS, audio, printer, smart card, MIDI, Bluetooth, MBIM, video, DFU, display. QEMU offers oracles for several of them (usb-serial, usb-net, usb-audio, usb-ccid).
+      - The header's justification, "the classes the earlier controllers carry", is not accurate: USB 1.1 and 2.0 carry all of these classes.
+      - The DONE note does not say the other classes are absent.
+      - If "HID/storage/class" is read as HID and storage class parity only, this finding reduces to the missing record.
+    - **Minimal fix.** State in the DONE note which classes the legacy core carries and that the rest stay xHCI's, and correct the header comment. Alternatively, the owner settles the reading.
+
+12. **Low, Defect - `SYS_MEMORY_PLUG_STATE` writes at most 32768 block states but returns the region's full block count, so a restarted virtio-mem driver treats the rest as offline and asks the host to unplug blocks the kernel still has online.**
+    - **What the plan requires.** "the same range asked again is the same region, with what is online still online - a restarted driver's resynchronisation" (:7532-7533), and "at its start it unplugs whatever the device holds that the kernel does not have online" (:7544-7545).
+    - **What the code does.**
+      - The syscall uses `const MOST: usize = 32768;` and `let len = blocks.min(MOST).min(out_len as usize);`, then returns `blocks` (/data/yellow/libersystem/src/kernel/syscall/mod.rs:2748, :2759, :2773).
+      - The driver zero-fills `states` and accepts the call when `counted == blocks` (/data/yellow/libersystem/src/user/drivers/core/src/virtio_mem.rs:260-266).
+      - `reconcile` then sends a STATE request for every block it thinks is offline and UNPLUGs any the device reports as plugged (:167-184).
+      - The kernel accepts regions up to 512 GiB (/data/yellow/libersystem/src/kernel/mem/hotplug.rs:30, :59-71), so any region over 64 GiB at 2 MiB blocks crosses the cap.
+    - **Why it matters.** The host takes back memory that programs are using, and nothing reports it. The gate uses 512 blocks, so it cannot catch this.
+    - **Minimal fix.** Copy the region's full state, or refuse regions of more than 32768 blocks in `hotplug::check`.
+
+13. **Low, Defect - a stopped virtio-crypto driver exits without destroying its sessions at the device.**
+    - **What the plan requires.** Key material "zeroized on teardown" (:7468-7469). The DONE note says sessions are "destroyed at the device by `close` and when the connection goes" (:7480).
+    - **What the code does.**
+      - On Stop or Ended, the driver calls `finish_stop` and exits without draining `clients` (/data/yellow/libersystem/src/user/drivers/core/src/virtio_crypto.rs:392-404). Only `part` (:310-319) destroys sessions.
+      - QEMU's virtio-crypto reset is believed to reset only queues and status, without closing backend sessions. No QEMU source is on this machine to confirm that.
+      - If so, the sessions and their keys stay alive in the host, and a restarted driver has no ids to destroy them with.
+    - **Why it matters.** After a few restarts with open sessions, the builtin backend's 256-session table is full and `open` answers `Exhausted` until the VM is reset. The DONE claim is also untrue for the stop path.
+    - **Minimal fix.** Before `finish_stop`, on both paths, drain every connection's `Sessions` and call `engine.destroy` on each one.
+
+14. **Low, Defect - The ticked CDC-ECM/NCM item still says its oracle has not run.**
+    - **What the plan requires.**
+      - A milestone document says what was done.
+      - The response states that "`docs/todo/P02M0099.md` records it under the CDC-ECM/NCM item".
+    - **What the code does.**
+      - The item still reads: "THE GADGET RUN IS STILL OWED AND IS LEFT FOR THE END OF THE JOB … Until that run has passed, NCM is host-tested and built, not yet shown against a device" (`/data/yellow/libersystem/docs/todo/P02M0099.md:6124-6130`).
+      - The pass is recorded only in the later corrections list (`P02M0099.md:9093-9094`). The run's numbers appear only in the audit file: blocks negotiated as 16-bit, up to 4096 bytes in; six datagrams in one block; 4 frames out and 12 answers back.
+    - **Why it matters.** Anyone reading the item, or a later audit, would take the NCM half as unproven against a device.
+    - **Minimal fix.** Replace that sentence with the run's date and results.
+
+15. **Low, Defect - The milestone document points at audit files for its evidence.**
+    - **What the plan requires.** The owner's rule: a milestone document says what was done and does not point at an audit file.
+    - **What the code does.**
+      - `/data/yellow/libersystem/docs/todo/P02M0099.md:8305` heads a section with `AI/audit/drivers.md` and `AI/audit/wire.md`, and `:8394` refers to `AI/audit/wire.md`.
+      - `:8908` ends "Full evidence is appended to `AI/audit/code-audit-P02M0099.md`".
+      - The dated continuation notes at `:8892`, `:8920`, `:8923`, `:8929` and `:8937` say their assumptions, arguments, metrics or failures are "recorded in the audit", "appended to the audit" or "preserved in the audit".
+    - **Why it matters.** The permanent record depends on working files for what those runs and decisions were. P02M0181, P02M0197 and P02M0201 carry the same kind of pointer.
+    - **Minimal fix.** Delete the pointers. Where a sentence depends on one, state the result it points at in one clause.
+
+## Verification performed
+
+- **Documents read.**
+  - `/data/yellow/libersystem/AI/audit/code-audit-P02M0099.md:5030-5271`: the 2026-10-15 review and the 2026-10-17 response.
+  - `/data/yellow/libersystem/docs/todo/P02M0099.md`:
+    - 1-60 (head and status)
+    - 695-800 (scope and status text)
+    - 1600-1710 (xHCI maintenance and DRV debts)
+    - 2418-2512 (NVMe item and its definition of done)
+    - 4880-4975 (class-module lifecycle)
+    - 5894-6136 (CDC-ECM/NCM)
+    - 7300-7603 (the six restored items and their DONE notes)
+    - 8300-8395 and 8880-8940 (the fourth-audit section, the conformance item and the dated continuations)
+    - 9040-9094 (2026-10-15 corrections)
+  - The `TODO.md` row and `/data/yellow/libersystem/AI/CLAUDE.md`.
+- **Code read in the current tree.** HEAD f6925965; the restored items are commits 29b33a6b, 3304d0cb and f6925965.
+  - **Answers to the 2026-10-15 review:**
+    - NVMe: `nvme.rs`, `nvme_driver.rs` (whole), `nvme/tests.rs`.
+    - BOT and USB storage: `usb.rs` and its tests, `usb_bot.rs` (whole) and the list of its tests, `usb_storage.rs` (whole).
+    - CDC: `usb_net.rs` (whole); `cdc.rs` (bind, the NTB parameters and layout, `ncm_block`/`ncm_frames`, `nth16`/`Datagrams`) and the new NCM tests.
+    - Other class modules: `usb_serial.rs` and `usb_uas.rs` (configure and release), `classes.rs` (`Pipe::release`).
+    - xhci.rs: `Ring`, `dma_page`, `UsbDevice::release`, `wait_transfer*`, the block dispatch, NCM frame delivery and `detach_port_devices`.
+    - Stop paths: `ahci_driver.rs` (`stop_port`, sleep, stop path); `hda_driver.rs` (`quiesce`, sleep, serve loop); `common.rs` (`Deadline`, `wait_or_sleep`, `take_sleep_step`, `finish_stop`).
+    - Kernel: DMA map/unmap, handle close, `mapped_dma`/`unmap_objects`, and `DmaBuffer::drop`. Runtime: `rt::close`, `dma_buffer_for`. DeviceManager's heartbeat-miss handling and `driver_binding::Heartbeat`; the `nvme` and `xhci` manifest entries.
+    - Harness: the `ncm` kind in `usb-gadget.sh`, `ncm-peer.py`, the `USB_QEMU_NET` handling in `test-kernel.sh`/`qemu-run.sh`, and the kernel test `usb_cdc_ncm_carries_frames_both_ways_in_transfer_blocks`.
+    - Gate tooling: `check-driver-mutations.sh`; all 166 stanzas were checked statically for anchor uniqueness and test existence. The anchors of `xhci_event_retention.py` were checked by grep.
+  - **Legacy USB host controllers:**
+    - `usb_host.rs` and its tests, `usb_input.rs`, `usb_bot.rs`, the `usb_class.rs`/`descriptor.rs` diffs, `ehci.rs`, `ohci.rs`, `uhci.rs`.
+    - The `usb_hid.rs`, `usb_storage.rs` and `xhci.rs` diffs, compared against the pre-commit versions.
+    - `common.rs` (waits, `Serving`, sleep, stop).
+    - Kernel: the x86_64 interrupts/pci/platform diffs, the aarch64/riscv64 `intx_line`, `device.rs` (`row_line`, `intx_off`, `release_claim`, INTx at registration), `syscall/mod.rs` (`platform_line_acquire`, `sys_interrupt_ack`, DMA flags), `object/interrupt.rs`, `dma_buffer`, `frame`, buddy `alloc_contiguous_below`, `iommu` `map_for_device_within`, `main.rs` hot-plug arming and idle fallback.
+    - Services, oracles and build: `device_manager.rs` (line, port ranges), `manifest.toml`, `hidcheck.rs`, `qemu-run.sh` (`qemu_attach_usb_legacy`), `check-usb-legacy.sh`, the `platform_rows` and `dma_buffer` kernel tests, the `Cargo.toml` bins.
+  - **NVDIMM and virtio items:**
+    - NVDIMM: src/acpi/src/nfit.rs and its tests; src/kernel/arch/x86_64/platform.rs:239-272; src/kernel/device.rs (publication, forbidden ranges, windows, derived revocation); src/platform/src/policy.rs:117-140; src/kernel/syscall/mod.rs (device memory map); src/boot/uefi/src/memory.rs:303-316.
+    - Drivers: pmem/nvdimm, crypto/virtio_crypto, balloon/virtio_balloon, memplug/virtio_mem and fuse/virtio_fs, with their tests; drivers::common (Serving, waits, sleep step); the generated crypto dispatch.
+    - Kernel: object/balloon.rs and its tests, mem/hotplug.rs and its tests, object/plug_region.rs, frame/mod.rs, memory_object.rs, sleep/mod.rs, the x86_64 paging try_map_page path, the balloon/plug syscalls and the ABI.
+    - Services and harness: ResourceManager balloon/hotplug policies, memhog, share, StorageService ShareFs/ShareProviders, PermissionManager host-share grant, bootstrap.rs, manifest rows, all five IDLs, qemu-run.sh, run-files.py, check-balloon.sh, check-memory-hotplug.sh, check-host-share.sh, and the hardware/kernel tests.
+- **Claims checked.**
+  - **Answers to the 2026-10-15 review:**
+    - F1, `Fault`/`needs_reset` and the shutdown constants in `nvme.rs`: confirmed.
+    - F1, tick deadlines (30 s I/O, 1.5 s admin, CAP.TO, 2 s shutdown): confirmed.
+    - F1, reset before the answer, one retry, a second reset, and a `down` controller retried at the next request: confirmed by reading.
+    - F1, `wait_ready` no longer refuses a disable while CFS is set: confirmed.
+    - F1, the two host tests: confirmed. A 30 s wait does not get the driver torn down: confirmed, since DeviceManager marks a driver that misses heartbeats and leaves it running.
+    - F1, "the reset path has no oracle": not confirmed (finding 8).
+    - F2, items restored, head note, status line and TODO row: confirmed, and since superseded by the owner's 2026-10-17 decision and the implementation reviewed here.
+    - F3, NCM decisions in `cdc.rs`; bind order; refusals; all-or-none receive; transmit layout and pad byte; one message per frame; no new DMA: confirmed.
+    - F3, eight new host tests: confirmed.
+    - F3, three new mutation stanzas: present and anchored, never run (finding 3).
+    - F3, gadget kind, peer, `USB_QEMU_NET=off` and the kernel test: confirmed.
+    - F3, "recorded under the item": not confirmed (finding 14).
+    - F3, "retention proof mended and passes": not true of the current tree (finding 3).
+    - F4, handles kept and closed on every failure and detach path in `usb_net`, `usb_storage`, `usb_serial` and `usb_uas`: confirmed.
+    - F4, that this gives the memory back: not confirmed (finding 4).
+    - F5, `Csw`/`CSW_LEN`, the smaller of residue and observed length, a short wrapper as a framing fault, and both stage lengths read: confirmed, now through `usb_bot::transfer` and `Bot::bulk`. The refactor preserved the logic.
+    - F5, `STATUS_INVALID` for range, handle and object refusals and for short block messages: confirmed.
+    - F6, AHCI `stop_port` and `flushed && stopped`; NVMe `disable()` and `flushed && stopped`; HDA `quiesce` (RUN bits, CORB/RIRB, CRST, all read back): confirmed.
+    - The run results (suite 569 twice, NCM gadget, `boot-volume-controllers` 1042 s, `host-tests`, port builds) are recorded at `P02M0099.md:9093-9094`. They cannot be reproduced statically. No guest run on the ports after the NVMe, AHCI and HDA changes is claimed.
+  - **Legacy USB host controllers:**
+    - `Controller` trait and `Host` core (addressing, hubs, departure, translator refusal by name): confirmed.
+    - HID, Bulk-Only, admission policy and config head moved into the library, and xHCI runs them: confirmed. The Bulk-Only interface walk now takes the first matching interface, which is a correction.
+    - EHCI engine (async ring behind the head of reclamation, periodic frame list with S-mask, qTDs of at most five pages, alternate next to the status stage, doorbell waited for before reuse, PCD, PORT_OWNER hand-over by name): confirmed.
+    - Split transactions not built for want of an oracle: consistent with the owner's oracle rule.
+    - INTx as line 0 with the pin on at bind and off at release: confirmed for a planned release; the crash path is finding 7.
+    - Shared level lines (up to 8 holders plus the kernel handler, edge and other polarity refused): confirmed.
+    - `DMA_BUFFER_BELOW_4G` (lowest free block per order, hint a lower bound; IOMMU ceiling; unknown flag refused; every existing caller passes 0): confirmed.
+    - Kernel tests and host-test counts (6/5/6/1/1): present as stated.
+    - OHCI/UHCI engines as described: confirmed. "Held off until the change is taken" is the mechanism behind finding 6.
+    - Development-only status: confirmed.
+    - Publications following the bus: confirmed; the consumer-path defect is finding 5.
+    - The gate matches its description. "Following it to the EHCI's when the OHCI's was taken out" is not proven on its own: both sticks carry hello.txt and the gate counts two hello lines. Following across controllers is proven by the later hub/OHCI/EHCI sticks with distinct files. The 949 s PASS and the "watched failing" items cannot be verified statically.
+    - Not rated, because they concern real hardware only under the phase-2 rule:
+      - a 64-bit-capable EHCI's 68-byte QH overflows the 64-byte slots;
+      - there is no EHCI/UHCI BIOS handoff;
+      - EHCI rewrites the overlay on a timeout without unlinking (QEMU resets a guest-updated QH);
+      - `sleep_until(clock()+1)` recovery intervals can be under 2 ms.
+  - **NVDIMM and virtio items:**
+    - NFIT bounds (table and structure lengths, 1024 structures, 16 flush hints, valid capability bits only): confirmed.
+    - Namespace checks (index, length, page alignment, wrap, duplicate, overlap of any type, backed, covered): confirmed.
+    - 12 NFIT host tests, including QEMU's 424-byte table: confirmed.
+    - One claimable row per namespace with a 40-byte record, held against the memory map and every BAR, hole mapped uncached: confirmed.
+    - Persistence plan (Visible / Flushed / read-only for no domain), unarmed module read-only, failed states said and still writable, no direct access: confirmed. The 5 pmem tests are present.
+    - Harness modules (second unarmed, mem-ctrl persistence, host sectors 0/2049, files reaped by pid): confirmed.
+    - Crypto: AES-CBC only, layouts match virtio 1.2 non-revision-1, key zeroed (decoded copy, message, control page), data pages zeroed: confirmed.
+    - Crypto sessions per connection, 8 at most, never reused, refused to other connections: confirmed. Destroyed when a connection goes: confirmed except on driver stop (finding 13). No consumer role: confirmed. The 9 host tests and the NIST vectors in the kernel test: confirmed.
+    - Balloon minted only for a virtio-balloon binding, free frames only, 256 per batch, all-or-none give, everything back with the last handle: confirmed.
+    - Balloon floor: confirmed only without plugged memory (finding 1).
+    - ResourceManager reserve and allowance arithmetic; driver batches, target re-read, deflate tells the host first, statistics queue, sleep handling: confirmed.
+    - virtio-mem region checks, at most four regions, offline only when every frame is free, movable memory only for Domain-charged objects, kernel reserve, hibernation refused while plugged memory is online, totals include plugged memory: confirmed (the totals change is the cause of finding 1).
+    - virtio-mem driver steps, reconcile and RM allowing the whole region: confirmed for regions of at most 32768 blocks (finding 12).
+    - virtio-fs development-only twice over, refused with the IOMMU, FUSE 7.31 with header and body in separate descriptors, per-connection handles (256, never reused), no inode/dev/uid/gid exposed, errno mapped to meanings, name rules in both directions, only directories walked and only files opened, no xattr requests: confirmed.
+    - `vol://host` read-only, not in the volumes bundle, granted only to `share`; refused launch now printed: confirmed.
+    - The gate scripts check what the DONE notes say they check: confirmed statically.
+- **Not done.** This was a static review only: nothing was built or run. QEMU's virtio-crypto reset behaviour could not be checked against source, because none is available here.

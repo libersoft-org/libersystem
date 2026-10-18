@@ -1855,3 +1855,117 @@ Everything builds. The milestone records all eight under "Corrections of 2026-10
 - `bluetooth-independent` passed (1285 s). Its scenarios include the periodic privacy rotation and the private address after a restart.
 - `bluetooth-service` (again on the final image), `bluetooth-input`, `bluetooth-audio`, `bluetooth-le-audio` (again on the final image) and `bluetooth-codecs` passed.
 - `host-tests` passed.
+
+AUDITOR'S RE-AUDIT ON P02M0194 (2026-10-18T17:52:29Z):
+
+**Rating: 7/10.** All eight findings of the last review are fixed in the current tree, and seven of the fixes come with an oracle that fails without them:
+- The bond store answers `list` from 10 KiB. Sixty-four keyless records at their wire bounds are 9,479 bytes, and both the kernel and the client carry a message that size.
+- A departing LE peer relists. A connection through the list re-arms, and so does an operator attempt that ends without a link. `btclassic le` now brings two peers back at once.
+- The new private address becomes `own` only when the controller accepts it, and it rotates through a cancellation of the standing attempt.
+- A BR/EDR link counts as encrypted only after Read Encryption Key Size answers 16 octets (Secure Connections) or 7.
+- The Object Push record exists only while a receiver waits.
+- OBEX states 1691 and clamps its packets to the channel's MTU.
+- GATT and serial grants share 32, and subscriptions are capped.
+- `pair-legacy` offers Secure Connections.
+
+The two fixes found while gating are in place, and the last independent run's image was built after the last Bluetooth source edit.
+
+What remains is in the standing attempt itself:
+- Its accept-list rebuild is one burst into a 16-command queue. Five or six absent bonded LE peripherals with resolving keys therefore leave the stack with no standing attempt at all (Medium).
+- It is not taken up again after its own failed completion, or after an operator connection that the controller refuses at Command Status.
+- Its cancel marks can outlive a cancellation that crosses a connection, on a path no oracle exercises.
+
+Separately, four harness lines still carry the milestone id.
+
+## Findings
+
+1. **Medium, Defect - The standing attempt's accept-list rebuild is one burst into a 16-command queue, so five or six absent bonded LE peripherals get no standing attempt at all.**
+   - **What the plan requires.** "THE ACCEPT LIST FOLLOWS EVERY ABSENT BONDED PERIPHERAL" (/data/yellow/libersystem/docs/todo/P02M0194.md:1364). "bonded peripherals reconnect through the controller's filter accept list" (:203). This holds within "at most 8 ACL links per controller" (:83) and InputService's "one per input peer, at most 8" (:297).
+   - **What the code does.**
+     - `reconnect_bonded` queues the whole rebuild in one handler (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:224-241). That is resolution off, two clears, one accept-list add per absent peer, one resolving-list add per peer with an IRK, resolution on, then LE Create Connection: 5 + N + K commands.
+     - `Controller::command` refuses a command once 16 are pending (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:77, 582-586). It only pushes onto `pending` (:593); nothing is sent until the handler returns and `pump` runs (bluetooth_service.rs:2368).
+     - The refused command is the last one, the connection. `accepting` stays false (le.rs:239-241) and nothing retries.
+     - At boot the same handler has already queued Write Scan Enable (classic.rs:1066-1069, via `after_ready`, bluetooth_service.rs:1244-1245) and the first private address (le.rs:140-141, 173).
+     - With an IRK on every peer, the burst passes 16 at five absent peers at boot on a dual-mode controller (2 + 5 + 10 = 17), and at six at any time (5 + 12 = 17).
+     - Since the fix, the re-arm after a connection through the list is queued before that link's LE Enable Encryption (bluetooth_service.rs:1301-1306, then 1324-1325). `encrypt` ignores a refused command (bluetooth_service.rs:624-627), so with a near-full queue the reconnected link stays unencrypted, with no deadline.
+   - **Why it matters.** Take a desktop with an LE keyboard, an LE mouse, a pair of LE Audio earbuds and one more trusted LE device. After every boot none of them reconnects until some operator action happens to arm the attempt with an emptier queue. With six such devices, none ever reconnects. No gate bonds more than three LE peers.
+   - **Minimal fix.** Feed the rebuild through the queue in steps as commands complete, the way initialisation already works. Alternatively, give the rebuild its own bound, sized for the longest list it builds and capped at the controller's Filter Accept List size. Queue the reconnected link's encryption before the re-arm.
+
+2. **Low, Incomplete fix - The standing attempt is not taken up again after its own failed completion, nor after an operator connection that the controller refuses at Command Status.**
+   - **What the plan requires.**
+     - "an operator's attempt that ends without a link takes the standing attempt up again" (/data/yellow/libersystem/docs/todo/P02M0194.md:1367-1368).
+     - The service's own rule: "one standing connection attempt, set aside while the operator pairs something else and taken up again after" (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:10-12).
+     - The implementer's response says this covers an operator attempt that was "refused, or cancelled at 60 s".
+   - **What the code does.**
+     - A failed completion re-arms only after a relist cancellation, or when the failed attempt was not the list attempt. The standing attempt's own failure is left down deliberately (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:1264-1281, comment at 1275-1277).
+     - `on_status` for a refused LE Create Connection clears `accepting` and fails the operator's attempt, but re-arms nothing (bluetooth_service.rs:1208-1219). This is so even though `pair_le` had cancelled the standing attempt for that connection (le.rs:259-265, 291).
+   - **Why it matters.**
+     - One failed establishment of a list connection ends automatic reconnection for every absent bonded LE peripheral. It stays ended until an unrelated LE disconnect, trust change or new bond. This is Core status 0x3E, which a radio reports when a peripheral misses its first connection events.
+     - The loop the code comment guards against does not arise on this path. A controller that refuses the command answers with Command Status, not with a completion.
+     - The fixture never fails a list connection and never refuses a create command, so no gate reaches either path.
+   - **Minimal fix.** Re-arm after the standing attempt's own failed completion (any status except the cancellation's 0x02), behind a short back-off. Call `reconnect_bonded` from the `on_status` branch when the refused command was the operator's.
+
+3. **Low, Incomplete fix - The `relist` and `rotate` marks can outlive the cancellation they were set for, and no oracle exercises rotation while the attempt is out.**
+   - **What the plan requires.** "THE PRIVATE ADDRESS ROTATES WITH AN ATTEMPT OUT ... It now cancels the standing attempt, sets the address when the cancellation lands and re-arms" (/data/yellow/libersystem/docs/todo/P02M0194.md:1370-1374). "rotated every fifteen minutes" (:232).
+   - **What the code does.**
+     - `rotate_due` sends a cancellation and sets both marks (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service/le.rs:199-205).
+     - If a list connection completes before that cancellation lands, `on_connected` consumes `relist` (/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:1256) and re-arms (1304-1306), but leaves `rotate` set. From then on `rotate_due` sends nothing while the re-armed attempt is out.
+     - When `set_aside` clears `accepting` while a cancellation is in flight (le.rs:261-264), the `through_list && take(relist)` short-circuit (bluetooth_service.rs:1256) leaves `relist` set. The next `relist()` then sends no cancellation for a departing peer (le.rs:249-253).
+     - The exact-source LE reconnect proof panics on any rotation (/data/yellow/libersystem/src/tools/bluetooth-le-reconnect.rs:234-236), and no guest scenario rotates with the attempt out.
+     - The response says a gate cannot spend fifteen minutes, but the independent gate already waits 905 s on the production timer (/data/yellow/libersystem/src/harness/bluetooth_guest_le.py:293-305).
+   - **Why it matters.** These are narrow races. Once one is hit, the host either keeps one private address for as long as a bonded peer stays away, or does not list a departing peer until the next rotation or list connection. Those are exactly the defects of the earlier findings 3 and 2(a).
+   - **Minimal fix.** Consume both marks wherever `accepting` ends without the cancellation landing: in `on_connected`'s success path (rotating before the re-arm), in `set_aside` and in `on_status`. Add a rotation with the attempt out to the LE reconnect proof.
+
+4. **Low, Defect - The milestone id is still written in four lines of the milestone's own oracle harness.**
+   - **What the plan requires.** The owner's rule: "Never write a milestone id ... outside these three places" (docs/todo, TODO.md, /AI/), and "not in gate scripts" (/data/yellow/libersystem/AI/coding-preferences.md:56-66).
+   - **What the code does.** "P02M0194" appears in four lines:
+     - /data/yellow/libersystem/src/harness/bluetooth-oracles.md:1
+     - /data/yellow/libersystem/src/harness/bluetooth_classic_peers.py:1
+     - /data/yellow/libersystem/src/harness/bluetooth_classic_peers.py:320 (the AVRCP album name the Bumble peer reports)
+     - /data/yellow/libersystem/src/harness/prepare-bluetooth-oracles.py:2
+   - **Why it matters.** Permanent files point at a temporary document, against an explicit owner rule.
+   - **Minimal fix.** Drop the id from the four lines. Nothing asserts the album name.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/docs/todo/P02M0194.md:1-120, 160-300 and 1360-1409.
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0194.md:1637-1857.
+  - /data/yellow/libersystem/AI/coding-preferences.md:56-75.
+- **Code read in the current tree.**
+  - Change history: HEAD f6925965. The Bluetooth changes are commits 58fb476c and 1f18f0a7, plus 7ee3e9bf, which only adds image cleanup to the independent gate.
+  - bluetooth_service.rs: StampedTransport, `Controller::command`/`pump`/`encrypt`, `on_complete`, `on_status`, `after_ready`, `on_connected`, `on_encryption`, `on_disconnected`, `run_timers`, `end_stalled`, `drain_control`.
+  - bluetooth_service/le.rs, lines 1-420.
+  - bluetooth_service/classic.rs: `ControllerState`, `classic_encryption`/`classic_key_size`/`encryption_confirmed`, `refresh_policy`, `rfcomm_data`, prompts.
+  - bluetooth_service/opp.rs (receivers), gatt.rs (grants, subscriptions), serial.rs (mint).
+  - bluetooth_bond_store.rs; the generated bond-store client and dispatch; bluetooth-proto tests.rs.
+  - service_logic hci_bredr.rs, obex.rs (with tests), smp_pairing.rs (`start`, `on_response`), bt_bounds.rs.
+  - drivers: bt_fixture.rs (create, cancel), bt_world.rs (0x1408, key size), bt_world/opp.rs.
+  - btclassic.rs (`knob`, `le`, `transfer`, `stall`), btgatt.rs.
+  - Gates: check-bluetooth-{classic,le,transfer}.sh.
+  - Proofs: bluetooth-le-reconnect.rs, bluetooth-opp-disconnect.rs; harness bluetooth_guest_le.py:293-305.
+  - Transport limits: rt `serve_multi` and `recv_vec_caps_deadline`; abi `MAX_MESSAGE_BYTES`.
+- **Claims checked.**
+  - Finding 1: confirmed.
+    - The store replies from a 10 KiB buffer (bluetooth_bond_store.rs:373-379), and `list` is keyless.
+    - A listed record is 148 bytes at the IDL bounds (bluetooth.lsidl:531-563).
+    - The kernel takes messages up to 1 MiB (abi/src/lib.rs:330), and the client sizes its receive by peeking.
+    - Only partly confirmed as a test: bluetooth-proto/src/tests.rs:57-96 measures the wire size, not the store's buffer, which is a separate literal. Shrinking that buffer would not fail the test.
+  - Finding 2: confirmed for the relist on departure (bluetooth_service.rs:1400), the re-arm after a list connection (1301-1306), the re-arms on a failed completion (1264-1281), and `btclassic le`'s both-at-once step (btclassic.rs:1163-1171). Not confirmed for an operator attempt refused at Command Status (finding 2).
+  - Finding 3: confirmed for `pending_own`, and for `address_set` running on the Set Random Address completion (le.rs:181-189; bluetooth_service.rs:1185-1187). Also confirmed: the 10 s retry, `rotate_due`, the timer condition (bluetooth_service.rs:1716) and `end_session` (le.rs:86-92). The statement that a gate cannot spend fifteen minutes is not confirmed (finding 3).
+  - Finding 4: confirmed.
+    - hci_bredr.rs:59-63 and 278-289 hold the opcode and decoder, with a test at hci_bredr/tests.rs:104.
+    - The key size is asked after a successful Encryption Change (classic.rs:622-642).
+    - The link is marked encrypted only in `encryption_confirmed` (classic.rs:677-681), and classic links reach only that path (bluetooth_service.rs:1076-1081).
+    - The fixture answers 0x1408 (bt_world.rs:759); `btclassic knob` and both expect lines are in the gate.
+  - Finding 5: confirmed.
+    - The record is no longer offered in `ControllerState::new` (classic.rs:102-115).
+    - It is offered and withdrawn beside the only writes of `receive_waits` (opp.rs:369, 472).
+    - RFCOMM admission requires an offered channel (classic.rs:1662-1667).
+    - The phone's search and the gate expectations are present.
+  - Finding 6: confirmed. `MAX_PACKET` equals `OBEX_PACKET` (obex.rs:25), `limit` is at obex.rs:306, and the peer's MTU is applied at opp.rs:555 (l2cap_bredr.rs:653). Host test at obex/tests.rs:151.
+  - Finding 7: confirmed. Both mint paths use `minted()` (gatt.rs:209, serial.rs:117). A repeat subscription replaces the old one, and the 4/32 caps are at gatt.rs:500-519. `btgatt again` is in the gate.
+  - Finding 8: confirmed. The public key is passed under legacy (le.rs:356). Secure Connections is set when a key is present (smp_pairing.rs:289), and legacy is used only as a fall-back (smp_pairing.rs:512). The gate step is at btclassic.rs:1109-1130.
+  - Fixes found while gating: confirmed. `le_pairing_over` is at le.rs:387, 391 and 405-411, with the matching clear in `on_disconnected` at bluetooth_service.rs:1393-1397. `own_type` counts a pending address (le.rs:78-80). `btgatt` accepts "hello". Both exact-source proofs are updated.
+  - Gate runs: the independent run /data/yellow/libersystem/.build/logs/bluetooth-independent/20261016-000657 was imaged at 02:09 on 2026-10-16, after the last Bluetooth source edit (le.rs, 01:51). It holds 70 scenario records through bond persistence and forget, which is consistent with the stated pass. The other guest gates log to temporary directories, so their passes could not be checked.
+- **Not done.** This was a static review only: nothing was built or run. The stall and call-deadline changes in BluetoothService (`CALL_TICKS`, `end_stalled`, `btclassic stall`) belong to other milestones' corrections, and were read here only for regressions.

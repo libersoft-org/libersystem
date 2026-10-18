@@ -923,3 +923,42 @@ The milestone records it under "Corrections of 2026-10-15".
 - `host-tests` passed, the new `power-proto` test among them.
 - `acpi` passed, and its `acpipower list` reads every source through PowerService.
 - The shipping builds for aarch64 and riscv64 passed, and so did their development builds.
+
+AUDITOR'S RE-AUDIT ON P02M0181 (2026-10-18T17:39:37Z):
+
+**Rating: 9/10.** The Low finding is fixed. PowerService now serves the state interface from a 64 KiB reply. That holds the 52359-byte `sources` answer at the registry's 128-source bound. The reply still goes out nonblocking, and the client is closed if it cannot be queued. The new `power-proto` test measures that answer through the generated dispatch, though into its own buffer. Since the last review, nothing else in this milestone's code has changed. One Low documentation defect remains: the milestone's status line points at the audit file for its evidence.
+
+## Findings
+
+1. **Low, Defect - The milestone's status line sends the reader to the audit file for its evidence.**
+   - **What the plan requires.** The owner's standing rule: a milestone document must say what was done; it must not point at an audit file.
+   - **What the code does.** The Status paragraph (`/data/yellow/libersystem/docs/todo/P02M0181.md:3-7`) ends with "see `AI/audit/code-audit-P02M0181.md` for exact evidence and the distinction from earlier full-gate runs." `git blame` shows it was added on 2026-10-08 (commit 40b4feed2).
+   - **Why it matters.**
+     - The milestone file is the permanent record. Here its completion evidence depends on a working file.
+     - So does the distinction it mentions between the continuation's runs and the earlier full-gate runs.
+     - This is exactly what the rule forbids.
+   - **Minimal fix.** Delete the clause. If the distinction matters, say it in one sentence in the milestone itself: which gates ran on the 2026-10-08 code, and which ran before it.
+
+## Verification performed
+
+- **Documents read.**
+  - `docs/todo/P02M0181.md`, whole.
+  - `AI/audit/code-audit-P02M0181.md`: the 2026-10-15 review (842-910) and the response (911-925). The 2026-10-08 continuation (786-840) for context.
+- **Code read in the current tree.**
+  - `power_service.rs`: constants, `subscribe` and `drain_subscribers` (600-709), the serve loop and `serve` (711-970).
+  - `power-proto/src/{lib.rs,tests.rs}`. The generated `power` dispatch and `channel_invoke_sources`.
+  - `power.lsidl`: the source-state and source-snapshot bounds.
+  - The `sources` callers: `powerctl` (through `power-client`), `acpipower`, `powercheck`, `powerread`, `upscheck`. All receive through `recv_vec_caps_deadline`, so no client side has a smaller buffer.
+  - `git log --since=2026-10-14` over the milestone's paths shows one commit, `58fb476c`. In this milestone's code it changed only the reply buffer. Its `power.lsidl` and `acpi_power_driver.rs` edits are to the thermal-zone contract, not to the power-source interfaces.
+- **Claims checked.**
+  - **A maximal snapshot is 409 bytes, and 8 KiB held 20:** confirmed. See `power-proto/src/tests.rs:36` and `:40`. Trips and alarms are bounded at 16 (`power.lsidl:184-185`).
+  - **The reply buffer is now 64 KiB:** confirmed (`/data/yellow/libersystem/src/user/services/core/src/power_service.rs:735-739`).
+    - `power::dispatch` uses it (`:943`).
+    - The reply is sent with `try_send_caps`, and the client is closed on failure (`:945-951`, `:965-969`).
+    - 52359 bytes is far under `MAX_MESSAGE_BYTES` (`/data/yellow/libersystem/src/abi/src/lib.rs:330`).
+  - **The new test is wired in through `mod tests`:** confirmed (`power-proto/src/lib.rs:8-9`, `tests.rs:20-41`).
+  - **It dispatches 128 maximal snapshots, 52359 bytes:** confirmed (`tests.rs:31-38`).
+  - **"It fails at 8 KiB":** not confirmed as a guard on the service. The test dispatches into its own 128 KiB buffer and checks a literal 64 KiB (`tests.rs:33`, `:38`); it only computes what 8 KiB held (`:40`). Putting 8 KiB back at `power_service.rs:739` would leave it green.
+  - **The milestone records the correction:** confirmed (`P02M0181.md:276-282`).
+  - **`host-tests`, the `acpi` gate and the aarch64/riscv64 builds:** not re-run. The milestone records the first two (`P02M0181.md:281-282`). It does not record the builds.
+- **Not done.** This was a static review only: nothing was built or run.

@@ -812,3 +812,53 @@ IMPLEMENTER'S RESPONSE ON P02M0184 (2026-10-17T01:44:22Z):
 - No deterministic oracle reaches this window: it lasts as long as the provider takes to negotiate, and no fixture can hold it open. The `qemu-camera-service` gate covers the surrounding paths, and it passed. The milestone states this under "Corrections of 2026-10-15".
 
 **Verification (x86_64):** `qemu-camera-service` passed.
+
+AUDITOR'S RE-AUDIT ON P02M0184 (2026-10-18T17:29:39Z):
+
+**Rating: 9/10.** The one finding of the 2026-10-15 review is fixed correctly. When the provider answers a negotiation whose grant was retired in the meantime, `provider_answer` now creates no stream. It sends the producer `stop` for that generation and answers `closed`, which reaches nobody. The camera is free for the next client, and the producer lets go of what it negotiated. Nothing else in the milestone's code changed since that review. The paths around the fix (`retire`, `end_stream`, `discard`, the single pending negotiation) still hold. What remains is minor and is about evidence, not code: no test exercises the fix, and the milestone excuses that with a statement the fixture itself contradicts.
+
+## Findings
+
+1. **Low, Incomplete fix - the race fix is not exercised, and the claim that no deterministic oracle can reach the window is contradicted by the fixture's own held-answer mechanism.**
+   - **What the plan requires.** The fixture must be able to "script missing timing, drops, delayed stop and withdrawal/replacement" (/data/yellow/libersystem/docs/todo/P02M0184.md:166). The guest proof must "Exercise ... revoke/death cleanup ... and stale handles" (/data/yellow/libersystem/docs/todo/P02M0184.md:177). The milestone's correction says "No deterministic oracle reaches that window - it is the provider's negotiation time" (/data/yellow/libersystem/docs/todo/P02M0184.md:220-221). The response says "no fixture can hold it open".
+   - **What the code does.**
+     - The fixture answers `negotiate` at once (/data/yellow/libersystem/src/user/drivers/core/src/camera_fixture.rs:327-340).
+     - It can already hold a reply on command:
+       - `delay_stop` arms a hold (:434-437);
+       - `stop` sets the hold (:384-396);
+       - `serve` keeps the encoded reply instead of sending it (:528-531);
+       - `release_due` sends it later (:279-290).
+     - The gate already uses this to hold a stop's answer indefinitely (/data/yellow/libersystem/src/user/services/core/src/camcheck.rs:417).
+     - Holding a negotiation's answer the same way would keep the window open as long as a probe needs.
+     - No probe ends an owner while its negotiation is outstanding, so the new branch (/data/yellow/libersystem/src/user/services/core/src/camera_service.rs:501-508) never runs in `qemu-camera-service`.
+   - **Why it matters.**
+     - A static reading says the fix is correct, but no run shows it.
+     - A later change to that arm would go unnoticed, for example to its order against the `run.is_some()` arm, or to the `discard`.
+     - The milestone document records as impossible something the existing fixture already does.
+   - **Minimal fix.**
+     - Give the fixture a held negotiation answer, built like `delay_stop`.
+     - Add one probe step: negotiate, end the owner while the answer is held, then release it.
+     - Check that a second grant's `negotiate` is not answered `again`, and that the fixture counted the discard's `stop`.
+     - If no test is wanted, at least correct P02M0184.md:220-221 to say the window is not exercised, rather than that it cannot be.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/docs/todo/P02M0184.md (whole).
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0184.md:488-814: the earlier rounds, the 2026-10-15 review and the response.
+- **Code read in the current tree.**
+  - `camera_service.rs` (whole).
+  - `service_logic/src/camera_streams.rs`: the phases, `stop`, `stopped`, `forget` and `register`.
+  - `camera_fixture.rs` (whole).
+  - The `camera-device` service in `class_uvc.rs`: `negotiate`, `register`, `start` and `stop` (:444).
+  - `check-camera-service.sh` and camcheck's `quarantine` arm.
+  - `git show 58fb476c`, the only change to the milestone's code since the review.
+- **Claims checked.**
+  - The new check in the `Negotiate` arm: confirmed (camera_service.rs:501-508). It runs after the generation check and `cs::verify`, and before any run is created.
+  - "Discards the provider's stream for that camera generation": confirmed. `discard` sends `stop(generation)` (:373-377). Both providers release a never-started stream on `stop` (camera_fixture.rs:384-396, class_uvc.rs:444).
+  - "Answers `Closed`": confirmed. The answer goes nowhere, because `answer` finds no grant (:232-236).
+  - "Does not run anything; the camera is free for the next client": confirmed. No `Run` is made, and the next `negotiate` is admitted once the pending entry is gone (:838-849).
+  - "No deterministic oracle reaches this window ... no fixture can hold it open": not confirmed (Finding 1).
+  - "`qemu-camera-service` passed": confirmed by /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-qemu-camera-service.log. Every row passed, the handles returned to their baseline of 10, and the run came after the edit. It does not reach the fixed window.
+  - Recorded under "Corrections of 2026-10-15": confirmed (P02M0184.md:216-222). It does not point at an audit, and the code carries no milestone ids.
+- **Not done.** This was a static review only: nothing was built or run.

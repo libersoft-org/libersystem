@@ -749,3 +749,51 @@ The kernel, the drivers, the services and `powerctl` build. The milestone record
 - `processor-power` passed (519 s): the tables, the profiles, `_PPC`, the `_LPI` states, the latency request, the relaunch and the three heatings.
 - `acpi` passed.
 - `host-tests` passed, the `procpower` and acpi model tests among them.
+
+AUDITOR'S RE-AUDIT ON P02M0198 (2026-10-18T17:47:21Z):
+
+**Rating: 9/10.** All four findings from the last review are fixed the way the response says.
+- A `_PSD` domain of several processors that software would have to coordinate is now refused at install with `Refusal::SoftwareCoordinated`, and a host test covers it. A refused table leaves passive cooling to idle injection. A software-coordinated `_TSD` drops only the throttling.
+- The zone is described again after every `_SCP` and before judging any reading flagged `trips-changed`. The zone driver carries that flag from `Notify(0x81)` and keeps it across a stalled send.
+- `Holdings::replace` now fills the list it reserved.
+- `zone-power.active` reaches `powerctl`.
+- The gate's new launch before the after-load C001 check fits the plan's "never by a wakeup of its own": the TLB shootdown IPIs every other core, so the step is deterministic.
+
+The retained logs show `processor-power` (519 s), `acpi` and `host-tests` passing on the fixed tree. One small piece of finding 1 is left: the processor handshake still offers software coordination of C-states, which nothing performs. The trip re-read is correct as written, but no test or gate exercises it (the fixture's trips are constant `Name`s). The milestone says so itself.
+
+## Findings
+
+1. **Low, Incomplete fix - the processor handshake still offers a coordination the kernel does not perform: software coordination of C-states (`_CSD`, bit 0x0040).**
+   - **What the plan requires.** "The processor capabilities the ACPI service declares to the firmware (`_OSC`, and `_PDC` where there is no `_OSC`) are exactly the forms the kernel executes" (/data/yellow/libersystem/docs/todo/P02M0198.md:182-184). The correction itself says the capabilities "no longer claim software coordination ... which nothing performed" (/data/yellow/libersystem/docs/todo/P02M0198.md:548-552).
+   - **What the code does.** `PROCESSOR_SUPPORT = 0x0002 | 0x0008 | 0x0010 | 0x0040 | 0x0100 | 0x0200 | 0x0800 | 0x1000`, and its comment still names "software coordination of C states" (/data/yellow/libersystem/src/user/libs/acpi/model/src/handshake.rs:41-46).
+     - 0x0040 is the C-state counterpart of the 0x0020/0x0080 bits the fix removed: native C-state software coordination from `_CSD`.
+     - Nothing under /data/yellow/libersystem/src evaluates `_CSD`. Each core's idle table and state choice is its own (`CORES[cpu]`, /data/yellow/libersystem/src/kernel/processor/mod.rs:300-319).
+     - The new test asserts only 0x0020, 0x0080 and 0x0800 (/data/yellow/libersystem/src/user/libs/acpi/model/src/tests.rs:293-295).
+     - Separate point, which the tree cannot settle: Linux names 0x1000 `ACPI_PROC_CAP_COLLAB_PROC_PERF` (collaborative performance control, set for HWP), not "`_PPC` notification" as the comment says. Worth checking against Intel's table, because an HWP-style `_CPC` is a model-specific-register form the kernel refuses.
+   - **Why it matters.** Firmware that honours the handshake may describe C-state dependencies across cores (`_CSD`) on the promise that the OS coordinates them. The kernel never reads them and enters each core's state on its own decision. Only real firmware shows the consequence. But the broken rule is the plan's own code-level rule, the one this correction set out to restore.
+   - **Minimal fix.** Remove 0x0040 from `PROCESSOR_SUPPORT`, correct the comment, and add 0x0040 to the test's "not offered" assertion. Confirm what 0x1000 means, and remove it too if it is collaborative performance control.
+
+## Verification performed
+
+- **Documents read.** /data/yellow/libersystem/docs/todo/P02M0198.md in full, including "Corrections of 2026-10-15". /data/yellow/libersystem/AI/audit/code-audit-P02M0198.md lines 684-751 (the latest review and the response), plus earlier records for context. /data/yellow/libersystem/AI/CLAUDE.md.
+- **Code read in the current tree.** HEAD f6925965; the fixes are in 58fb476c and the gate change is in 7ee3e9bf.
+  - procpower: `perf.rs`, `records.rs`, `holdings.rs`, `lib.rs` (`Refusal`), `perf/tests.rs`.
+  - Kernel: `install_perf` and `set_window` in /data/yellow/libersystem/src/kernel/processor/mod.rs; `shootdown` in /data/yellow/libersystem/src/kernel/mem/tlb.rs.
+  - ProcessorPowerService: `processor_power_service.rs` (`apply`, `profile_changed`, `status`, reply buffer), `cores.rs` in full, `thermal.rs` in full.
+  - `service_logic::processor_policy::limit_level`.
+  - /data/yellow/libersystem/src/user/drivers/core/src/acpi_power_driver.rs in full.
+  - The cooling records in power.lsidl and the regenerated `ZoneReading` in power-proto.
+  - `powerctl.rs`, the power-client and generated admin client, `handshake.rs` and the acpi model tests, /data/yellow/libersystem/src/tools/check-processor-power.sh, and the fixture's zone and processor objects in /data/yellow/libersystem/src/harness/acpi-fixture.py.
+- **Claims checked.**
+  - F1, `check_table` refusal: confirmed (/data/yellow/libersystem/src/procpower/src/perf.rs:181-192, lib.rs:106-109). The kernel refuses the install with `ERR_INVALID` and says why (kernel/processor/mod.rs:342-345). With no table installed, passive cooling falls back to injection (/data/yellow/libersystem/src/user/services/logic/src/processor_policy.rs:131-134).
+  - F1, `_TSD` throttling left out and said: confirmed (/data/yellow/libersystem/src/user/services/core/src/processor_power_service/cores.rs:94-107). The line is printed per core, and twice on a re-install, not "once" as the milestone says. Cosmetic.
+  - F1, handshake: 0x0020 and 0x0080 removed and 0x0800 added, confirmed. 0x0040 is still there (finding 1).
+  - F1, tests: present (perf/tests.rs:95-106; acpi model tests.rs:293-295). "Watched failing" cannot be checked statically.
+  - F2, `zone-reading.trips-changed` and regenerated bindings: confirmed (/data/yellow/libersystem/src/idl/power.lsidl:383-389; the generated `ZoneReading` and its compat test).
+  - F2, driver `trips_owed`: confirmed (acpi_power_driver.rs:84-86, 184, 203-211). It is cleared only on a delivered send. `describe` re-evaluates every object (:281-310), so a re-read sees moved trips.
+  - F2, `describe_again` after `_SCP` in `cooling_policy`, in `adopt_zone`, and on a flagged reading: confirmed (thermal.rs:109-136, 219-228, 252-255). The retained serial log shows the `_SCP` evaluations and no "did not describe itself again" line. Nothing moves a trip in any test or gate (acpi-fixture.py:563-574), as the milestone states.
+  - F3: confirmed (/data/yellow/libersystem/src/procpower/src/holdings.rs:47-69).
+  - F4: confirmed (power.lsidl:472-473; thermal.rs:406-408; /data/yellow/libersystem/src/user/apps/tools/src/powerctl.rs:141-145; 64 KiB reply at processor_power_service.rs:367-369). The gate does not read the new `_ACn` lines, and the response does not claim it does.
+  - Gate change (`powerctl status` before awaiting C001 at 50): confirmed (check-processor-power.sh:303-310). The broadcast IPI is at /data/yellow/libersystem/src/kernel/mem/tlb.rs:69-136.
+  - `processor-power` 519 s, `acpi`, `host-tests`: supported by .build/claude-work/implementer/runs/processor-power-1016.log (RESULT ok, 519 s), gate-acpi.log (RESULT ok) and gate-host-tests.log (144 suites, RESULT ok).
+- **Not done.** This was a static review only: nothing was built or run.

@@ -3851,3 +3851,139 @@ The milestone records findings 1-3 in its own entry and finding 4 under "Correct
   - three resize rebuilds, at most 622 allocations each and 1866 in all;
   - the 640x480 runs' slowest present at most 11.6 ms against the 33.3 ms bound.
 - The run before it failed once: after the second resize (to 480x800) the demo rebuilt only once for two changes, and the window stayed cleared for the three minutes the gate waits. It did not reproduce. Finding 4's change only counts allocations and does not take part in the rebuild. The milestone records the failed run.
+
+AUDITOR'S RE-AUDIT ON P02M0103 (2026-10-18T17:52:29Z):
+
+**Rating: 7/10.** The tile-boundary filter defect (the old High finding) is fixed for every graph whose reach is 256 px or less:
+- `prepare` works out how far past its tile each command must be drawn, and bins commands by their bounds grown by that.
+- Each tile repeats that calculation for its own commands, which sizes the clip base, the working copy and each layer surface.
+- A top-level read past the tile decodes from a copy of the target taken before any unit runs.
+- A new host test draws 12 filtered scenes across tile boundaries and requires them to match the one-tile drawing bit for bit, for every unit kind. The x86_64 guest 2D tests pass on the changed tree.
+
+The conformance suites now apply the frozen thresholds where the response says they do. The benchmark freezes digests of its lists and its content. The 3D gate bounds present latency and reports resize allocations. The rejection of finding 5 is justified.
+
+What remains:
+- A resize was lost in one of the three retained `qemu-3d-demo` runs. The milestone records it as "not reproduced" and nobody found the cause.
+- Graph reach is still silently capped at 256 px, and the response's claim that this cap is documented is untrue.
+- The every-pixel comparison mask is applied in only 8 of the 112 conformance scenes.
+- Milestone IDs remain in this milestone's PERF.md sections and in one source comment, and the milestone's head still points at its audit file.
+
+## Findings
+
+1. **Medium, Defect - a live resize to 480x800 was lost in the milestone's own gate; the milestone records it as "not reproduced" and gives no cause.**
+   - **What the plan requires.**
+     - "Resize recreates targets and preserves camera/animation state" (/data/yellow/libersystem/docs/todo/P02M0103.md:5818).
+     - "Capture after resize on desktop and mobile-like aspect ratios" (/data/yellow/libersystem/docs/todo/P02M0103.md:5914).
+     - The milestone's own record: "after the second resize (to 480x800) the demo never rebuilt for the new surface ... Not reproduced; the change above only counts" (/data/yellow/libersystem/docs/todo/P02M0103.md:6777-6779).
+   - **What the code does.**
+     - The retained failed run is /data/yellow/libersystem/.build/logs/qemu-3d-demo.7vUoI4/.
+     - QEMU completed the 480x800 desktop resize: `resize-mobile.json` says `"actual": [480, 800]`. Per /data/yellow/libersystem/src/tools/3d-demo-resize.py:5-6, that completion requires a status-0 ExtendedDesktopSize, i.e. the guest scanout changed.
+     - DisplayService logged the new monitor: `demo-4.log` has `preferred=480x800@74998`.
+     - Yet test3d-sw reports `presented 237 frame(s) rebuilt=1` and `scene 1024x768`. The capture "holds 2 distinct colour(s), which is a cleared surface rather than a scene" (`resize-mobile-pixels.log`).
+     - Both other retained runs (`qemu-3d-demo.tbDaCY`, `qemu-3d-demo.b3ABbD`) rebuilt 3 times.
+     - A reconfigure clears the surface's acknowledgement (/data/yellow/libersystem/src/user/services/core/src/display_service.rs:1090). Every later acquire then answers `OutOfDate` (/data/yellow/libersystem/src/user/services/core/src/display_service.rs:587-589), and the client's pacing turns that into a `Rebuild` (/data/yellow/libersystem/src/user/libs/graphics/app/src/pacing.rs:238-240, 250-252). So either the surface was never reconfigured for 480x800, or the client never acquired again.
+     - A static reading cannot tell which, because every candidate link drops silently:
+       - DisplayService handles a device `Resized`/`Replaced` with no log line, and silently drops a `Resized` larger than `fb` (/data/yellow/libersystem/src/user/services/core/src/display_service.rs:1449-1468, the drop at :1456).
+       - `emit` drops events when the queue is full (/data/yellow/libersystem/src/user/services/core/src/display_service.rs:1038-1060).
+       - The `ReplacedByResize` completions go out only as events and are never released on PRESENT_DONE (/data/yellow/libersystem/src/user/services/core/src/display_service.rs:1099-1104). Ordinary completions are released on PRESENT_DONE (`complete`, :830-853).
+       - The interrupt-driven virtio-gpu loop never re-reads the display size without a new interrupt (/data/yellow/libersystem/src/user/drivers/core/src/virtio_gpu.rs:603, 633).
+   - **Why it matters.** Same-process resize is an acceptance requirement. It failed in 1 of the 3 retained runs and left the window blank for the 180 s the gate waits. The item stays ticked COMPLETE on the strength of the passing reruns.
+   - **Minimal fix.**
+     - Make the path diagnosable: DisplayService should log each device `Resized`/`Replaced` it accepts or drops, and each native-surface reconfigure.
+     - Repeat the gate's resize phase until the loss recurs, then fix the link that drops it.
+     - Until then, record the resize acceptance as intermittently failing rather than met.
+
+2. **Low, Incomplete fix - graph reach is still silently capped at 256 px, so a valid graph that reaches further is still wrong at tile boundaries; the claim that this cap is "stated in docs/PERF.md" is untrue.**
+   - **What the plan requires.**
+     - soft2d "implements the WHOLE profile; a command in Profile 1 that it cannot execute is a defect, not an `Unsupported`" (/data/yellow/libersystem/docs/todo/P02M0103.md:2481-2482).
+     - It must implement "the whole `FilterGraph`" (/data/yellow/libersystem/docs/todo/P02M0103.md:2541-2542).
+   - **What the code does.**
+     - `graph_reach` clamps each graph's reach to `max_filter_radius` = 256 (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:719).
+     - `render2d` bounds only a single Blur, Morphology or Displacement node by that radius. An `Offset` is unbounded, and the reach of chained nodes adds up (/data/yellow/libersystem/src/user/libs/graphics/render2d/src/filter.rs:176-186, 204-229).
+     - Each tile draws a layer's content only over the area it composites into, grown by the clamped reach (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:800, 1693).
+     - Example: `Offset { dx: 300 }` applied to a fill at x=100..200 on a 1280x800 target.
+       - The tile at x=448..512 draws the fill only from x=192, so its output at x=448..492 reads transparent.
+       - The tile at x=384..448 likewise loses x=400..428.
+     - Neither /data/yellow/libersystem/docs/PERF.md:1430-1505 nor the milestone's 2026-10-15 entry (/data/yellow/libersystem/docs/todo/P02M0103.md:6717-6770) mentions the cap.
+   - **Why it matters.** The backend silently draws wrong pixels for lists that validation accepts. That is the same class of defect as the original finding, now limited to large reaches.
+   - **Minimal fix.**
+     - Drop `.min(max_filter_radius)` in `graph_reach`. `margins` already caps at the target's larger side (/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:753, 991), and the scratch check refuses a frame that does not fit with a typed error. Alternatively, refuse such a graph in `prepare`.
+     - Add a cross-tile scene with an offset beyond 256 px to `a_filtered_layer_is_the_same_picture_wherever_the_tiles_cut_it`.
+
+3. **Low, Incomplete fix - the frozen every-pixel comparison mask is applied in only 8 of the 112 conformance scenes.**
+   - **What the plan requires.**
+     - The frozen mask: "EVERY pixel of the target is compared. There is no border exclusion and no mask" (/data/yellow/libersystem/src/user/libs/graphics/profile/src/thresholds.rs:33).
+     - "no affected freeze or backend may be declared complete until its thresholds are fixed and exercised" (/data/yellow/libersystem/docs/todo/P02M0103.md:1089-1090).
+   - **What the code does.**
+     - Only these scenes compare the whole target:
+       - blur, shadow and backdrop (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/filters.rs:54, 86, 263);
+       - coverage fill (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/antialiasing.rs:32);
+       - the three layer scenes (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/layers.rs:44, 60, 75);
+       - one paint scene (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/paints.rs:30).
+     - The rest read 1-3 probe pixels:
+       - the 13 operators and the blend modes read pixels 4, 16 and 28 of row 4 (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/compositing.rs:44-59);
+       - colour matrix, composite, blend, convolution, morphology, displacement, crop and tile probe an 8x8 square in a 32x32 target (/data/yellow/libersystem/src/user/libs/graphics/conformance2d/src/filters.rs:19-27, 97-232).
+     - The milestone's "Not done" (/data/yellow/libersystem/docs/todo/P02M0103.md:6753-6755) excuses two groups:
+       - curves, strokes and glyphs;
+       - five single-node filter scenes, "held bit for bit to the untiled evaluation by the soft2d host test". That test compares soft2d with itself and applies no frozen threshold.
+     - The operator, blend, colour-matrix, composite and crop scenes are built from whole-pixel rectangles, so their full expected image is exact and cheap to state. They are not named as not done.
+   - **Why it matters.** "112 passed / conforms" still rests mostly on probes. A wrong pixel outside the probed ones, such as an edge row, a seam or a stray write, passes.
+   - **Minimal fix.** Use `every_pixel` or `Linear::compare` in the scenes whose expected image is exact at every pixel. Name the remaining probe-only scenes in the milestone's "Not done".
+
+4. **Low, Defect - milestone IDs remain outside docs/todo in this milestone's own files, and the milestone's head still points at its audit file.**
+   - **What the plan requires.** The owner's rules: milestone IDs appear only in docs/todo, docs/todo/TODO.md and AI/; and a milestone document says what was done without pointing at an audit file.
+   - **What the code does.**
+     - /data/yellow/libersystem/docs/PERF.md:1262, 3043, 3062, 3077, 3179, 3193, 3207, 3222: the "P02M0103 ..." headings and one reference in the text.
+     - /data/yellow/libersystem/src/user/apps/tools/src/test2d_sw.rs:881: "`P02M0103a-wsi` introduced more than one surface per client".
+     - /data/yellow/libersystem/docs/todo/P02M0103.md:31: "Details and exact passed/failed/unperformed evidence are appended to AI/audit/code-audit-P02M0103.md" (2026-10-10, commit 46397598a).
+     - That pointer closes the 2026-10-09/10 continuation paragraphs right under the status line (/data/yellow/libersystem/docs/todo/P02M0103.md:7-32). They still say "software work remains OPEN" and "All-port restaging and the real guest retry remain required", and nothing marks them as superseded by the COMPLETE status at :3.
+   - **Why it matters.** Permanent files point at temporary working notes, which the owner has ruled out. The head of the milestone also contradicts its own status.
+   - **Minimal fix.** Reword the PERF.md headings and the source comment to state the fact without the ID. Delete the audit pointer, and mark the 2026-10-09/10 paragraphs as superseded by the 2026-10-12 completion.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0103.md:3690-3853: the latest review and the implementer's response.
+  - /data/yellow/libersystem/docs/todo/P02M0103.md:
+    - head/status: 1-32;
+    - the `s` thresholds item: 1083-1117;
+    - part `c`: 2477-2545;
+    - the part `i` resize, capture and floor items: 5812-5820, 5908-5918, 5960-5975;
+    - the 2026-10-15 entry and its Corrections: 6717-6779.
+  - docs/graphics/RENDER2D_PROFILE_1.md:175-252, docs/PERF.md:1430-1505, and the TODO.md row.
+- **Code read in the current tree.** HEAD f6925965. The changes since the last review are in 58fb476c and 7ee3e9bf.
+  - soft2d:
+    - `backend.rs`: Step, SoftPrepared, `tile_regions`, `refresh_tiles_without_backdrop`, `grown`, `graph_reach`, `margins`, `tile_needs`, `prepare`, `render`, `take_snapshot`, `replay`, LaneShape;
+    - `target.rs`: Surface `aim`/`clear` and spans; Tile `reserve`/`aim`/`load`/`store`;
+    - `layer.rs`, `workers.rs`, `tile.rs`;
+    - `filter.rs`: `evaluate`, `regions`, `blur`;
+    - the new tests at `tests.rs`:2285-2633, and `filter/tests.rs`.
+  - render2d: `filter.rs`, and `encode.rs` with its test.
+  - Conformance:
+    - conformance2d: harness, filters, antialiasing, layers, compositing, tests;
+    - conformance3d: harness, depth, tests;
+    - `thresholds.rs`.
+  - Gates and benchmark:
+    - soft2d-bench `main.rs`, `check-soft2d-performance.sh`;
+    - `check-qemu-3d-demo.sh` and the `test3d_sw.rs` frame loop.
+  - The resize path:
+    - graphics-app `frame_loop.rs` and `pacing.rs`, and the surface library's rebuild;
+    - DisplayService's acquire, emit, complete, reconfigure and device-event handling;
+    - the `virtio_gpu.rs` serve loop, and `3d-demo-resize.py`.
+  - Retained logs: `.build/logs/qemu-3d-demo.{7vUoI4,tbDaCY,b3ABbD}` and `.build/logs/test/x86_64-20261016T225541Z-1190693-guest.log`.
+- **Claims checked.**
+  - **Finding 1, the replay changes: confirmed.** The changes are the per-command margins, binning by grown bounds, the per-tile repeat of that walk, the clip base, the snapshot, surfaces cleared only over their aimed rectangle, one surface reserved per open layer, and `Tile::load` refusing to read past its unit without the snapshot. I traced the margin walk and the backdrop raise, the no-decode cover under margins, the snapshot for each unit kind, and the reservations. I found no defect for reach of 256 px or less.
+  - **Finding 1, the new tests: present as described.** The deliberate-break counts and the before/after timings cannot be checked statically.
+  - **Finding 1, `--scaling` identical at 1-64 workers:** the code asserts it; not run.
+  - **Finding 1, "limits stated in docs/PERF.md": not confirmed** (finding 2).
+  - **Finding 2: confirmed.** This covers the multi-tile f64 blur, shadow and backdrop scenes, the exact layer scenes, the four-phase coverage scene with the mean bound, the `stored()` dither model with exact probes, the f64 SetLum/SetSat/ClipColor expectations, the f64 kernel test, 1-ULP/exact depth, and the registry-text host tests.
+  - **Finding 2, completeness: partial** (finding 3).
+  - **Finding 3: confirmed.** List and content digests are asserted before the clock starts, and paints are now encoded, with a test.
+  - **Finding 4: confirmed.** The core 640x480 runs must show `present_max_us` ≤ 33333, and the resize line is required. Its check that N equals the rebuilds compares one counter with itself, which is harmless.
+  - **Finding 5 rejection: justified.**
+  - **Milestone records and `gen.sh`: confirmed.** The `backend.rs` line references in the checklist that I spot-checked match.
+  - **host-tests passed:** no retained log, so not verifiable. The x86_64 guest run after the change shows `test2d-conformance: 112 passed` and both 2D demo tests `[ok]`.
+  - **soft2d-performance numbers:** they match docs/PERF.md; no retained log.
+  - **qemu-3d-demo pass: confirmed** by `.build/logs/qemu-3d-demo.tbDaCY`: rebuilt=3, max 622 and total 1866 allocations, and `present_max_us` 11617/9620/9181 in the 640x480 runs.
+  - **The failed run: confirmed** by `.build/logs/qemu-3d-demo.7vUoI4`; its cause is still open (finding 1).
+- **Not done.** This was a static review only: nothing was built or run.

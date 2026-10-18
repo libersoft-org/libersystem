@@ -1333,3 +1333,56 @@ The milestone records all four under "Corrections of 2026-10-15".
 - `hibernate` passed (2693 s).
 - `boot-volume-controllers` passed (1042 s). Its new S3 step: on NVMe and on AHCI the system disk slept to RAM, woke on its alarm, took a write after it, and the write read back after a cold reboot.
 - `host-tests` passed.
+
+AUDITOR'S RE-AUDIT ON P02M0197 (2026-10-18T17:47:21Z):
+
+**Rating: 9/10.** All four findings from the last review are resolved, and the evidence is in the tree (HEAD f6925965).
+- **NVMe:** the driver takes its own sleep step. It flushes, and before a sleep that loses power it shuts the controller down: `CC.SHN` normal, judged by `CSTS.SHST`, with a disable if that fails. On resume it resets the controller over the same queues and requires the same MDTS and namespace.
+- **AHCI:** the driver flushes and stops the port's engines. After lost power it re-enables AHCI mode, readies and starts the port, and requires the same disk.
+- **System volume:** both drivers keep their binding and every consumer's connection, so a system volume on NVMe or AHCI survives S3.
+  - `boot-volume-controllers` now shows this on x86_64: sleep, RTC resume, a write, and a read-back after a cold reboot.
+  - The hibernate logs show both scratch controllers back after a snapshot or a hybrid resume.
+- **HDA:** stops and confirms its streams. For a state that loses power it also stops CORB/RIRB and holds CRST before it answers, then asks to be rebound, which the contract allows.
+- **System graph:** a refused or unwound last sleep appears as a failed `sleep` node, and the `sleep` gate checks it.
+- **Scheduled wake:** it has a gate case.
+- **Drivers added since:** all 52 driver entries declare a `suspend-deadline`, and the drivers added since take the exchange themselves (EHCI/OHCI/UHCI through `usb_host`).
+- **Ports:** they were not re-run for these driver changes, because the owner's run order puts slow-architecture runs at the end of the job. That is a pending run, not a defect.
+
+One Low documentation defect remains: the milestone points at its audit file for the evidence of two of its runs.
+
+## Findings
+
+1. **Low, Defect - The milestone document points at its audit file for the evidence of two runs.**
+   - **What the plan requires.** The owner's standing rule: a milestone document must say what was done; it must not point at an audit file.
+   - **What the code does.**
+     - `/data/yellow/libersystem/docs/todo/P02M0197.md:776`: "The original sleep gate's platform and battery scenarios PASS on this code (see `AI/audit/code-audit-P02M0197.md`)". `git blame` dates it to 2026-10-08 (commit 40b4feed2).
+     - `/data/yellow/libersystem/docs/todo/P02M0197.md:795`: "details are appended to `AI/audit/code-audit-P02M0197.md`" (2026-10-10, commit a56d93581).
+   - **Why it matters.** The milestone file is the permanent record, and here what those runs showed depends on a working file. P02M0181 carries the same pointer from the same 2026-10-08 continuation.
+   - **Minimal fix.** Delete both pointers. The sentences around them already say what ran and what passed.
+
+## Verification performed
+
+- **Documents read.** /data/yellow/libersystem/docs/todo/P02M0197.md (status, the transaction and driver contract at :150-270, part e, the continuation notes at :772-800, the corrections at :810-827); /data/yellow/libersystem/AI/audit/code-audit-P02M0197.md:1270-1335.
+- **Code read in the current tree.**
+  - NVMe: `nvme_driver.rs` (`enable`, `reset`, `shut_down`, `Sleep`, `serve`); `nvme.rs::shutdown_complete` and its test.
+  - AHCI: `ahci_driver.rs` (`reattach`, `ready_port`, `stop_port`, `start_port`, `issue`, `Sleep`, `serve`).
+  - HDA: `hda_driver.rs` (`quiesce`, `Sleep`, `serve`).
+  - Shared sleep code: `common.rs` (`take_sleep_step`, `common_sleep_step`), the `usb_host.rs` sleep step, `SleepState::loses_power`.
+  - ServiceManager: `service_manager/sleep.rs` (`failure`, `finish`); `service_manager/lifecycle.rs` (`serve_stats_once`, `StatsApi::status`) and its three call sites.
+  - Other consumers: `system_graph_service.rs`; `bmc_service.rs`, whose settled test ignores the new row because its `desired` is empty; `sleepctl.rs`, whose `suspend` waits for the end record.
+  - Gates and harness: `check-sleep.sh` steps 3b and 6, `check-boot-volume-controllers.sh`, `qemu-run.sh` `SYSTEM_DISK`.
+  - The manifest's driver entries.
+- **Claims checked.**
+  - Finding 1, NVMe (shutdown, reset with the same-disk check): confirmed in code.
+  - Finding 1, AHCI (stop, reattach, identity check, restart otherwise): confirmed in code.
+  - Finding 1, host test: `a_shutdown_is_complete_only_when_the_controller_says_its_processing_is` is present (/data/yellow/libersystem/src/user/drivers/core/src/nvme/tests.rs:359-373); whether it runs and passes cannot be checked statically.
+  - Finding 1, the gate's S3 step on NVMe and AHCI: confirmed in the script and in the logs:
+    - /data/yellow/libersystem/.build/logs/boot-volume-controllers-x86_64/nvme-first.log and ahci-first.log contain `sleep: resumed (the RTC alarm`, "the controller is back from the sleep ... the same disk" and "the disk is back from the sleep";
+    - nvme-second.log and ahci-second.log read back `slept-on-nvme` and `slept-on-ahci`.
+  - Finding 2, HDA (quiesce with read-back, CORB/RIRB and CRST for power-losing states, rebind on resume): confirmed in code. /data/yellow/libersystem/.build/logs/sleep/serial-s3.log shows hda torn down and bound again after each S3.
+  - Finding 3 (`failure()`, the `sleep` supervisor row, the failed graph node, `graph sleep` in step 6): confirmed. .build/logs/sleep contains `{name=sleep, type=service, state=failed, ... last-failure=unwound at Drivers: sleep-fixture (01:00.0) ...}`.
+  - Finding 4, step 3b: confirmed in the script and in serial-s3.log. The step sets `wake-at` 20 s ahead with no timed or host wake, and checks the RTC resume, the wake spent, and `scheduled wake: none`. The combination of a timed and a scheduled wake is still not exercised, which goes beyond what the finding asked for.
+  - "`sleep`, `hibernate` and `boot-volume-controllers` passed": consistent with the retained logs from 2026-10-16 and 2026-10-17; the durations are not in the tree.
+  - "`host-tests` passed": cannot be checked statically.
+  - Audit pointers in the milestone: found at :776 and :795 (finding 1). The run directory :795 names, `.build/logs/end-of-job/qemu-only-20261010-shared-host/kernel-media-review/p0197-current-runs/`, still exists.
+- **Not done.** This was a static review only: nothing was built or run.

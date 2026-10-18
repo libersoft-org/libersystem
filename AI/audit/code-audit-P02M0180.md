@@ -1353,3 +1353,70 @@ The milestone records both under "Corrections of 2026-10-15".
   - "InputService: BluetoothService did not answer within a second; its connection is dropped and a new one asked for".
 - `bluetooth-input`, `bluetooth-independent` and `bluetooth-service` passed, the last again on the final image.
 - `host-tests` passed, the `bluetooth-proto` test among them.
+
+AUDITOR'S RE-AUDIT ON P02M0180 (2026-10-18T17:39:37Z):
+
+**Rating: 10/10.** Both Medium findings are fixed in the current tree.
+- **Deadlines.** Every call BluetoothService makes now has one: 5 s for HCI sends, for the catalogue's `open` and for the transport's own calls, and 10 s for the bond store. The calls go through a transport that stamps each request with a fresh correlation and drops any other reply, so a late answer is never read as the answer to a later call.
+- **Stalls.** A send that gets no answer marks the controller stalled, and nothing more is sent to it. At the top of the next loop turn its session ends the way a fault ends it. Only a driver reset clears the mark.
+- **InputService** gives each call to BluetoothService one second and drops a connection that does not answer.
+- **Oracle.** The fixture's new `withhold-send` action plus `btclassic stall`, which `bluetooth-classic` runs last.
+- **Bond store.** It answers from a 10 KiB reply. That holds the 9479 bytes of 64 records listed at their wire bounds.
+
+Nothing material remains. Two caveats about the evidence are noted under "Claims checked".
+
+## Findings
+
+No unresolved issues, incorrect or incomplete fixes, unjustified rejections, regressions or new material defects were found.
+
+## Verification performed
+
+- **Documents read.**
+  - `docs/todo/P02M0180.md`, whole.
+  - `AI/audit/code-audit-P02M0180.md`: the 2026-10-15 review (lines 1215-1319) and the 2026-10-17 response (1320-1355). Earlier sections only for the history of the bond-store correlation.
+- **Code read in the current tree.** Changes were identified with `git log --since=2026-10-14` and `git show 58fb476c` / `1f18f0a7`.
+  - `bluetooth_service.rs`:
+    - constants;
+    - `fresh_corr`, `StampedTransport`, `bond_exchange`, `exchange`, `Sent`, `send_packet`, `send_command`;
+    - `Controller::{command, pump, flush_links, unanswered, start_init, advance_init, end_session}`;
+    - the bond-store section;
+    - `on_complete` (the init path);
+    - `OperatorView::power`, `ProfileView::{open_input, enabled}`;
+    - `Stack::{adopt, withdraw, drain_packets, on_packet, end_stalled, drain_control}`;
+    - the main loop and the stream replies.
+  - `bluetooth_service/le_audio.rs` (`send_iso`), `voice.rs` (`voice_transport`, `send_sco`), `le.rs` (rotation, `reconnect_bonded`, `relist`).
+  - `bluetooth_bond_store.rs`, whole. `service_logic::bond_store` bounds.
+  - `input_service.rs`, the Bluetooth slot (1180-1400).
+  - `bt_fixture.rs` (the withhold action and the serve paths), `btclassic.rs` `stall`, `check-bluetooth-classic.sh`.
+  - `class_bt.rs`, where a deferred send reply echoes its correlation. DeviceManager's catalogue serve path.
+  - rt: `recv_vec_caps_deadline`, `send_blocking`, `send_caps_blocking`, `service_connect`. ipc-client `ChannelTransport`. The kernel channel's depth and backpressure.
+  - Generated code: the bond-store dispatch and `Client::with_deadline`.
+  - `bluetooth.lsidl` records. `docs/gen/liber/bluetooth/v1.{abi,md}`.
+  - `bluetooth-proto/src/{lib.rs,tests.rs}`.
+  - ServiceManager `serve_resolve`. PermissionManager's Bluetooth rows.
+- **Claims checked.**
+  - **All calls had deadline 0 before the fix:** confirmed from `git show 58fb476c`.
+  - **The stamped transport and `fresh_corr`:** confirmed. `StampedTransport` (formerly `BondTransport`) serves the bond store, the controller's transport and the catalogue (`/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:430-499`, `:933`, `:2241`, `:2245`, `bluetooth_service/voice.rs:240`). A reply with another correlation is zeroed and its capabilities closed (`:466-475`). Every peer echoes the stamped correlation: the generated dispatch, and `class_bt.rs:395-431`, `:489-490`.
+  - **`CALL_TICKS` 5 s and `BOND_TICKS` 10 s:** confirmed (`bluetooth_service.rs:89-90`). `bond_exchange` and `bonds()` use the latter (`:504`, `:933`).
+  - **`Sent` and the stall mark:** confirmed. `Sent::{Taken, Refused, Unanswered}` is at `:521-575`. `unanswered()` sets the mark and prints once (`:755-761`). `pump`, `flush_links`, `send_iso` and `send_sco` send nothing while it is set (`:655`, `:729`, `le_audio.rs:776`, `voice.rs:389`).
+  - **`end_stalled` and the driver reset:** confirmed. It runs at the top of every turn (`:2455`) and ends the session as `Fault` does (`:2383-2393`). A driver `Reset` clears the mark (`:2415`). It skips an unpowered controller, which has no session to end.
+  - **`adopt`:** confirmed. It builds a fresh deadline-bounded client per call and its refusal text is widened (`:2241-2259`).
+  - **InputService:** confirmed. Each call to `enabled` and to every `open_input` has its own 1 s deadline. Any transport error drops the connection, and a timeout prints its line (`input_service.rs:1244`, `:1264-1294`, `:1299-1305`).
+    - Side effect, not raised: the re-resolve then waits in the broker's synchronous `service_connect` (`/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:2398-2408`, `service_manager.rs:1742`) for the rest of the stall. That wait is bounded by the 5 s and 10 s deadlines.
+  - **`withhold-send = 33`, with bindings and docs regenerated:** confirmed (`bluetooth.lsidl:661-663`, generated `v1.rs:7916`, `:7991`, `docs/gen/liber/bluetooth/v1.abi:91`).
+  - **The fixture holds the answer, sends it late and resets:** confirmed (`bt_fixture.rs:694-701`, `:888-895`, `:963-967`).
+  - **`btclassic stall` and its place in the gate:** confirmed.
+    - The probe requires an answer within 10 s, an unpowered controller, and a scan that hears the phone after the reset (`btclassic.rs:2103-2134`).
+    - The gate runs it last on the second boot and requires its PASS line and both service lines (`check-bluetooth-classic.sh:103`, `:114-116`).
+    - "Before the fix the call waited 20 s" cannot be checked statically.
+  - **The bond store's 10 KiB reply:** confirmed (`bluetooth_bond_store.rs:373-379`). Every record the store can list stays within 148 bytes: name and alias ≤ 48, at most 6 trust profiles, no keys (`bond_store.rs:28-41`, `bluetooth_bond_store.rs:192-216`).
+  - **The new host test:** partially confirmed.
+    - It measures 148 bytes per record and 9479 bytes for the whole reply through the generated dispatch (`bluetooth-proto/src/tests.rs:57-96`).
+    - It dispatches into its own 64 KiB buffer and checks a literal 10 KiB (`:88`, `:93`). So "it fails with the old 1024-byte buffer" is true only of that literal. Putting 1 KiB back at `bluetooth_bond_store.rs:378` would leave the test green.
+    - The same applies to the milestone's "fails at the old 1 KiB" (`P02M0180.md:363`).
+  - **BluetoothService receives the reply with `recv_vec`:** confirmed. `recv_vec_caps_deadline` sizes each message by peeking (`rt/src/lib.rs:3351`).
+  - **The milestone records both corrections:** confirmed (`P02M0180.md:357-377`).
+    - Its claim "every call has a deadline" is accurate for calls.
+    - Replies to clients are still blocking sends (`bluetooth_service.rs:2699`). Not raised: every current holder (`btctl`, InputService, the development probes) is a synchronous client and cannot fill its 64-message reply queue.
+  - **Gate and host-test results:** recorded in `P02M0180.md:376-377`, not re-run.
+- **Not done.** This was a static review only: nothing was built or run.

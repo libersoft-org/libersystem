@@ -272,3 +272,62 @@ IMPLEMENTER'S RESPONSE ON P02M0191 (2026-10-17T01:44:22Z):
 **Verification:**
 - `serial-handoff` passed on x86_64 with the sleep step: entered, resumed, the transaction slept and woke with every count zero, and a round trip after it.
 - - `serial-handoff --arch aarch64` passed (450 s) and `--arch riscv64` passed (505 s), the new sleep steps included: on both, the suspend to idle resumed on its timed wake after 2998 ms, and the transaction ended slept and woke.
+
+AUDITOR'S RE-AUDIT ON P02M0191 (2026-10-18T17:47:21Z):
+
+**Rating: 7/10.** The accepted finding is fixed:
+- **The sleep step.** Step 2 of the x86_64 gate now suspends to idle through `sleepctl` while `uart16550` holds COM1. It requires `sleep: entered`, `sleep: resumed` and "slept and woke", then a round trip.
+- **The count across the sleep.** The kill that follows reports its count over a hold that included the sleep. The counter is reset only in `hand_back`, and the retained log shows "0 kernel access(es)".
+- **The header and the ports.** The stale header line is gone, and the ports' scenario has the same steps.
+- **Unchanged.** The port-authority and handoff mechanisms.
+
+What remains: the gate's round-trip check cannot fail on a command the shell refused. The retained log of the latest x86_64 PASS shows exactly that for the step after the disable and the step after the enable.
+
+## Findings
+
+1. **Medium, Defect - The handoff gate's round trips accept a refused command, and in the latest x86_64 PASS the round trip through the kernel's own path and the one after the enable both failed.**
+   - **What the plan requires.** After the disable, "`lab sh` answers through the kernel's own path; the binding enabled again through the same verb and the next handoff line awaited" (`/data/yellow/libersystem/docs/todo/P02M0191.md:424-426`). Earlier, "`lab sh` round-trips through the driver" (:421).
+   - **What the code does.**
+     - `round_trip` passes if the word appears anywhere in `lab sh`'s output (`/data/yellow/libersystem/src/tools/check-serial-handoff.sh:161-166`, used at :221 and :230).
+     - `lab sh` drops the echoed line only when it contains the whole command (`/data/yellow/libersystem/src/harness/lab.py:3455-3456`). The shell's error message quotes the word back.
+     - What the latest x86 run's retained log (`/data/yellow/libersystem/.build/logs/serial-handoff/dev-serial.log`) shows:
+       - after the disable, the shell received "cho handoff-through-the-kernel" and answered "unknown command: cho handoff-through-the-kernel" (:585-586);
+       - after the enable, it answered "unknown command: eecho handoff-after-the-enable" (:591-592);
+       - so the first typed byte arrived after the line's carriage return, and the leftover then broke the next command;
+       - the run nevertheless went on through the flood and the panic (:729-733), so both round trips were accepted.
+     - The port scenario's `serial-sh` steps are weaker still. They search a reply that includes the echoed command (`lab.py:3043`, `/data/yellow/libersystem/src/harness/scenario.py:829-833`), so `serial-handoff-port.toml:132-136` and :167-171 cannot fail on a refused command either. The port logs show those commands did run.
+   - **Why it matters.** The PASS recorded under "RESULTS (2026-10-16/17)" (`P02M0191.md:454`) does not prove two required gate steps. On x86_64, input typed after the kernel took COM1 back arrived out of order.
+   - **Likely cause (not provable statically).** The kernel's own COM1 receive path:
+     - the idle-hook pump (`/data/yellow/libersystem/src/kernel/main.rs:524-526`) and the IRQ 4 handler (:1370-1373) both do `read_byte()` then `feed_serial()`;
+     - `read_byte` masks interrupts only while it holds the UART lock (`/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:547-553`, `/data/yellow/libersystem/src/kernel/sync.rs:38-43`);
+     - IRQ 4 is routed to the BSP, the same core that runs the pump (`serial.rs:673`);
+     - the 14-byte receive trigger (FCR `0xC7`, `serial.rs:329`) can leave a burst's first byte to the pump, so an IRQ taken between the two calls queues the rest of the burst ahead of it.
+
+     That code predates this milestone; the gate is where the failure should have been caught.
+   - **Minimal fix.**
+     - Make `round_trip` require the word as a whole output line and fail on `unknown command`.
+     - In the port `serial-sh` steps, search only the output after the echoed line.
+     - Rerun the gate. If the kernel-path step then fails as this log suggests, make both loops read and enqueue each byte inside one interrupt-masked section.
+
+## Verification performed
+
+- **Documents read.** `docs/todo/P02M0191.md`, the gate item (415-436) and the corrections (448-456); the audit review (222-260) and the implementer's response (261-274).
+- **Code read in the current tree.**
+  - `src/tools/check-serial-handoff.sh` and `src/harness/scenarios/serial-handoff-port.toml`, both in full.
+  - `src/kernel/arch/x86_64/serial.rs`: the access path, `read_byte`, `hand_over`, `hand_back`, `sleep_begin`/`sleep_wake`/`sleep_end`, `settle_driver`, and where the stray counter is reset.
+  - `src/kernel/console_input.rs`.
+  - `main.rs`: the pump, the shell loop and the wired-line handler.
+  - `SpinLock` in `src/kernel/sync.rs`.
+  - `lab.py`: `cmd_sh`, the broker's RUN loop and `serial_sh`.
+  - `scenario.py`: the `serial-sh` check.
+  - The diffs of commits `58fb476c` and `7ee3e9bf`.
+- **Retained results read (read-only).** `.build/logs/serial-handoff/` (`dev-serial.log`, `sleepctl.log`, `up.log`, `down.log`), `serial-handoff-aarch64/serial.log` and `serial-handoff-riscv64/serial.log`.
+- **Claims checked.**
+  - Step 2 suspends to idle for 3 s through `./dev.sh launch sleepctl suspend idle 3`: confirmed (:190-200).
+  - The gate awaits entered, resumed and "slept and woke" with every count zero: confirmed. No reacquisition line exists yet at that point, so the zero count is actually proved by the kill that follows (log :566).
+  - A round trip after the sleep: confirmed (:200; log :559-560).
+  - Stale header removed: confirmed (:14-17).
+  - Port scenario gains step 1b: confirmed (`serial-handoff-port.toml:32-64`).
+  - x86_64 PASS with the sleep step: the sleep is confirmed in the retained log (2905 ms). The same run's kernel-path and post-enable round trips were refusals (finding 1).
+  - aarch64 in 450 s and riscv64 in 505 s, with the 2998 ms timed wake: the sleep lines are confirmed in both port logs (aarch64 :529-554, riscv64 :588-611). The durations cannot be checked statically.
+- **Not done.** This was a static review only: nothing was built or run.

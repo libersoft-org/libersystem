@@ -737,3 +737,45 @@ The milestone records all three under "Corrections of 2026-10-15".
 **Verification (x86_64):**
 - `smartcard-service` passed. Its `cardcheck overflow` asserts exactly `MAX_EVENTS` frames before the stream closes.
 - `host-tests` passed, the PIV and smartcard-model tests among them.
+
+AUDITOR'S RE-AUDIT ON P02M0182 (2026-10-18T17:36:02Z):
+
+**Rating: 10/10.** All three findings of the 2026-10-15 review are fixed in the current tree, and nothing material remains.
+- **The DER check.** `der_ecdsa` now judges an INTEGER's length before it reads the value, so the empty-INTEGER answer is refused instead of panicking the service.
+- **The ATR leaf.** It now requires a TCK whenever T=15 is indicated. The fixture's `3B 88 80 01 ...` ATR is unaffected, because it offers T=1 and needed a TCK anyway.
+- **The event stream.** A client's stream is now one channel, 16 frames deep, and it closes on the first frame that does not fit. `cardcheck overflow` asserts the exact count; the old snapshot-plus-sixteen-plus-queue behaviour would have failed it.
+
+The 2026-10-16 gate log and host-tests log both show passes.
+
+## Findings
+
+No unresolved issues, incorrect or incomplete fixes, unjustified rejections, regressions or new material defects were found.
+
+## Verification performed
+
+- **Documents read.**
+  - /data/yellow/libersystem/docs/todo/P02M0182.md in full, including "Corrections of 2026-10-15" (:246-260).
+  - /data/yellow/libersystem/AI/audit/code-audit-P02M0182.md:641-739: the previous re-audit, the 2026-10-15 review and the implementer's response.
+- **Code read in the current tree.** The corrections are commit 58fb476c; 7ee3e9bf changed only the doc.
+  - /data/yellow/libersystem/src/user/services/logic/src/piv.rs:136-202 (`ber_length`, `authentication_signature`, `der_ecdsa`) and piv/tests.rs:133-143.
+  - /data/yellow/libersystem/src/user/libs/smartcard/model/src/atr.rs in full, and atr/tests.rs:61-73.
+  - /data/yellow/libersystem/src/user/services/core/src/smartcard_service.rs:435-488 (`event`, `close_grant`), :640-694 (`subscribe`), :697-745 (main loop) and :767-778 (stream close).
+  - /data/yellow/libersystem/src/user/services/logic/src/card_slots.rs:1031-1035 and its remaining `VecDeque` users.
+  - /data/yellow/libersystem/src/user/services/core/src/cardcheck.rs:168-193 and :515-549.
+  - /data/yellow/libersystem/src/tools/check-smartcard-service.sh:31, 81 and 99-100.
+  - rt's `try_send_outcome` and `channel_with_depth` (/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:1614-1644; the depth is counted in messages).
+  - Every `atr::parse` consumer: smartcard_fixture.rs:504, piv_card.rs:17-23, the service at :556, and the card_slots tests. Also class_ccid.rs, which passes the ATR through without parsing it.
+- **Claims checked.**
+  - **F1, length judged first:** confirmed (piv.rs:185-189).
+  - **F1, two new vectors:** confirmed (piv/tests.rs:136-143).
+  - **F1, "watched failing ... piv.rs:189":** consistent with the old code indexing `value[0]`, which was at old line 187. The line difference is immaterial. The milestone's prose (P02M0182.md:249) calls the vector "an `r` of two bytes and an `s` with none"; in fact its `r` is the empty INTEGER. Also immaterial.
+  - **F2, `global_bytes` and the TCK rule:** confirmed (atr.rs:75, 94-99, 118). The new test's vector XORs to zero from T0 through TCK (checked arithmetically). The old code answers `Trailing` for it, so the test tells the two apart.
+  - **F3, the second queue removed:** confirmed, along with the rest of the change:
+    - `Stalled` closes the stream;
+    - the depth is `max(frames, MAX_EVENTS)`;
+    - `drain_streams` and the backlog deadline are gone;
+    - `EventQueue` and its test are removed.
+  - **F3, `cardcheck` asserts exactly `MAX_EVENTS` frames:** confirmed (cardcheck.rs:532-540).
+  - **`smartcard-service` passed:** confirmed by /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-smartcard-service.log. It is dated 2026-10-16, after the correcting commit, and shows `cardcheck: PASS overflow` and `RESULT ok exit=0 seconds=677`.
+  - **`host-tests` passed:** confirmed by /data/yellow/libersystem/.build/claude-work/implementer/runs/gate-host-tests.log (144 suites, `RESULT ok exit=0 seconds=478`, 2026-10-16). The log does not print suite names.
+- **Not done.** This was a static review only: nothing was built or run.
