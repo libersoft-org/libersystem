@@ -467,7 +467,8 @@ impl Drop for BranchGuard {
 // AND THEN THE MACHINE GREW MORE HOLDERS: each control-method button's driver (a lid, a power and a
 // sleep button on a laptop), each thermal zone's driver for the forced power-off past `_CRT`, and the
 // two policies that arm it - PowerService's critical battery and ProcessorPowerService's `_CRT`. A
-// laptop's firmware asks for about a dozen; sixteen keeps the restart's room on top of that.
+// laptop's firmware asks for about a dozen; sixteen keeps the restart's room on top of that. The
+// earlier USB controllers' drivers - EHCI, OHCI, UHCI - are keyboard drivers too and take one each.
 const MAX_POWER_CLIENTS: usize = 16;
 
 // The kernel object id behind a handle, which is what a wait set names its members by.

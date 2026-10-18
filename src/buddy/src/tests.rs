@@ -656,3 +656,28 @@ fn a_span_query_is_bounded_by_the_extent_and_not_by_the_caller() {
 	assert!(!pool.any_free(u64::MAX - PAGE_SIZE, 8));
 	assert_eq!(pool.free_span(u64::MAX - PAGE_SIZE, 8), 0);
 }
+
+// A 32-BIT ENGINE'S BUFFER ENDS BELOW ITS CEILING, AND ONLY THERE. A pool straddling the limit whose low part is
+// taken except one small gap: a request that fits the gap gets it, one that does not fit below the limit is
+// refused rather than handed the high memory, and a request with no limit in reach of the pool takes the lowest
+// block as `alloc_contiguous` does.
+#[test]
+fn a_buffer_asked_for_below_a_limit_ends_below_it_or_is_refused() {
+	let base = 0x4000_0000u64;
+	let mut pool = fixture(1024);
+	assert_eq!(pool.free_span(base, 1024), 1024);
+	let limit = base + 256 * PAGE_SIZE;
+	// Everything below the limit taken, then four pages at 128 given back.
+	let low = pool.alloc_contiguous(256).expect("the low quarter");
+	assert_eq!(low, base);
+	assert_eq!(pool.free_span(base + 128 * PAGE_SIZE, 4), 4, "four pages given back below the limit");
+	let before = pool.free_pages();
+	let fitted = pool.alloc_contiguous_below(3, limit).expect("three pages fit the gap below the limit");
+	assert!(fitted + 3 * PAGE_SIZE <= limit, "and they end below it: {fitted:#x}");
+	assert_eq!(fitted, base + 128 * PAGE_SIZE, "in the gap, not in the high memory above it");
+	assert_eq!(pool.free_pages(), before - 3, "the rounding's remainder went back");
+	assert_eq!(pool.alloc_contiguous_below(8, limit), None, "eight pages do not fit below the limit, and high memory is not a substitute");
+	assert_eq!(pool.free_pages(), before - 3, "and a refusal took nothing");
+	let anywhere = pool.alloc_contiguous_below(8, u64::MAX).expect("no limit in reach");
+	assert!(anywhere >= limit, "the only room for eight is above the old limit");
+}

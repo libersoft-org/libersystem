@@ -569,6 +569,12 @@ path = "user/libs/protocol/share-device-proto"
 owner = "balloon-device-proto"
 path = "user/libs/protocol/balloon-device-proto"
 
+# THE PLUGGED-MEMORY CONTRACT a `memory-hotplug` provider serves: what the host plugs in and asks back, and the
+# allowance ResourceManager grants for it.
+[[sources]]
+owner = "hotplug-device-proto"
+path = "user/libs/protocol/hotplug-device-proto"
+
 [[sources]]
 owner = "spool-proto"
 path = "user/libs/protocol/spool-proto"
@@ -2465,6 +2471,7 @@ providers = [
 	"ipc-client",
 	"resources-proto",
 	"balloon-device-proto",
+	"hotplug-device-proto",
 	"device-proto",
 	"wire",
 	"lsrt",
@@ -3999,6 +4006,25 @@ provides = [{ kind = "memory-balloon", most = 1, consumers = 1 }]
 heartbeat-deadline = 100
 suspend-deadline = 100
 
+# MEMORY A VIRTUAL MACHINE'S HOST PLUGS IN AT RUN TIME: virtio-mem, brought online through the kernel's plugged-memory
+# region within the allowance ResourceManager - the one consumer - grants, and given back only once nothing holds it.
+[[programs]]
+name = "virtio_mem"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_mem.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 24 }]
+provides = [{ kind = "memory-hotplug", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+suspend-deadline = 100
+
 # A DIRECTORY OF THE HOST, on a development machine only: virtio-fs, served as the `share-device` contract to
 # StorageService alone, which mounts it as `vol://host` behind the host-share capability. In no shipping image; the
 # device exists only on a machine started with a share (`VIRTIOFS_SOCKET`).
@@ -4274,6 +4300,87 @@ provides = [
 	# AND GAMEPADS, WHICH ARE NOT A POINTER: every gamepad of every HID interface this controller binds, on
 	# one standing publication made at the handshake whether or not one is plugged in, with InputService its
 	# one consumer. LAST, because an offer's token is its position.
+	{ kind = "gamepad", most = 1 },
+]
+heartbeat-deadline = 100
+suspend-deadline = 300
+
+# THE EARLIER USB HOST CONTROLLERS, three engines under one shared USB core (`drivers::usb_host`): enumeration, hubs,
+# and the HID and Bulk-Only storage bindings xHCI's driver runs, over each controller's own schedule. Each publishes
+# what those bindings serve - a disk's block wire, the bus inventory, the pointer, a touch surface and the gamepads -
+# under the kinds xHCI publishes them by, so a consumer cannot tell which controller a device is on. Their interrupt
+# is the function's INTx, their DMA below 4 GiB.
+#
+# EHCI IS A LOWER-PRIORITY COMPATIBILITY PATH AND SHIPS: a USB 2.0 controller xHCI does not replace on the machines
+# that have one. A full- or low-speed device on its root ports is its companion controller's.
+[[programs]]
+name = "ehci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/ehci.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x20 }]
+provides = [
+	{ kind = "block", most = 1 },
+	{ kind = "usb-bus", most = 1 },
+	{ kind = "pointer", most = 1 },
+	{ kind = "touch", most = 1 },
+	{ kind = "gamepad", most = 1 },
+]
+heartbeat-deadline = 100
+suspend-deadline = 300
+
+# OHCI AND UHCI ARE THE FINAL COMPATIBILITY WAVE, AND NOT ENABLED BY DEFAULT: development-only until a target shows it
+# needs one. QEMU's fixtures cover both - see the `usb-legacy` gate.
+[[programs]]
+name = "ohci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/ohci.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x10 }]
+provides = [
+	{ kind = "block", most = 1 },
+	{ kind = "usb-bus", most = 1 },
+	{ kind = "pointer", most = 1 },
+	{ kind = "touch", most = 1 },
+	{ kind = "gamepad", most = 1 },
+]
+heartbeat-deadline = 100
+suspend-deadline = 300
+
+[[programs]]
+name = "uhci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/uhci.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "trusted-untranslated"
+match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x00 }]
+provides = [
+	{ kind = "block", most = 1 },
+	{ kind = "usb-bus", most = 1 },
+	{ kind = "pointer", most = 1 },
+	{ kind = "touch", most = 1 },
 	{ kind = "gamepad", most = 1 },
 ]
 heartbeat-deadline = 100
@@ -5548,7 +5655,7 @@ kind = "factory"
 provider = "device_manager"
 source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
-kinds = ["memory-balloon"]
+kinds = ["memory-balloon", "memory-hotplug"]
 
 [[services]]
 name = "session_service"
@@ -7731,6 +7838,14 @@ providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 name = "balloon-device-proto"
 owner = "balloon-device-proto"
 destination = "lib/protocol/balloon-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+# THE PLUGGED-MEMORY CONTRACT, shared, for the same one client.
+[[libraries]]
+name = "hotplug-device-proto"
+owner = "hotplug-device-proto"
+destination = "lib/protocol/hotplug-device-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 

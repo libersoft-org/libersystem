@@ -59,18 +59,57 @@ static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_
 // aarch64 via arch::common::msi): slot index i maps to vector MSI_BASE + i.
 static REGISTRY: MsiRegistry<MSI_COUNT> = MsiRegistry::new();
 
-// A CLAIMED WIRED LINE: the Global System Interrupt it arrives on, whether it is level-triggered, and the
-// `Interrupt` its driver waits on - held weakly, so the driver letting go (its Interrupt's `Drop`) is what
+// A CLAIMED WIRED LINE: the Global System Interrupt it arrives on, its trigger and polarity, and the
+// `Interrupt`s its drivers wait on - held weakly, so a driver letting go (its Interrupt's `Drop`) is what
 // unbinds it. One per vector - the sixteen legacy vectors, then the wired pool.
 //
-// A SLOT IS FREE ONLY WHEN IT IS EMPTY. An `Interrupt` whose last reference is gone still holds its slot until
-// its `Drop` has run `unbind`, and a bind that took the slot in between would have that `unbind` mask and empty
+// A SLOT IS FREE ONLY WHEN IT IS EMPTY. An `Interrupt` whose last reference is gone still holds its place until
+// its `Drop` has run `unbind`, and a bind that took the place in between would have that `unbind` mask and empty
 // the replacement's line.
+//
+// A LEVEL LINE IS SHARED, AND AN EDGE LINE IS NOT. A PC's firmware routes every PCI function's INTx pin to one of
+// two or four ISA IRQs - QEMU's q35 under OVMF puts every function on IRQ 10 or 11, the hot-plug root port's
+// among them - so a controller with no MSI has a line only if it may share one. A level line can be shared
+// safely: it fires while ANY holder's device asserts it, so it is masked when it fires, every holder is
+// signalled, and it is unmasked only once every holder it signalled has acknowledged - a holder whose device was
+// quiet acknowledges having found nothing, and one whose device still asserts it is the one the next firing is
+// for. A holder that never acknowledges holds the line masked for the others until it lets go, which is the
+// price, and the reason a shared line is never handed to anything but a claim. An edge is a moment, and a second
+// holder of one could not tell its own from another's.
 struct Line {
 	gsi: u32,
 	level: bool,
-	intr: Weak<Interrupt>,
+	low: bool,
+	holders: [Option<Holder>; MAX_SHARERS],
 }
+
+// ONE CLAIM ON A LINE: its `Interrupt`, the address that names it to `acknowledge` and `unbind` - a `Drop` in
+// progress has no strong reference left to compare by - and whether it was signalled while the line is masked
+// and has not acknowledged since.
+struct Holder {
+	intr: Weak<Interrupt>,
+	owner: usize,
+	waiting: bool,
+}
+
+// The most claims one level line carries at once.
+const MAX_SHARERS: usize = 8;
+
+impl Line {
+	fn live(&self) -> impl Iterator<Item = &Holder> {
+		self.holders.iter().flatten()
+	}
+
+	// Whether every holder the last firing signalled has acknowledged it - the condition for unmasking.
+	fn settled(&self) -> bool {
+		!self.live().any(|holder| holder.waiting)
+	}
+}
+
+// THE KERNEL'S OWN LEVEL LINES A CLAIM MAY SHARE, by legacy GSI: zero for none, else one plus whether it is
+// active low. A hot-plug port's INTx is one - its handler reads and clears its slot's own status, so it does not
+// care who else asserted the line. The console UART's and the SCI's are not recorded and stay the kernel's alone.
+static KERNEL_SHARED: [core::sync::atomic::AtomicU8; IRQ_COUNT] = [const { core::sync::atomic::AtomicU8::new(0) }; IRQ_COUNT];
 
 static LINES: [SpinLock<Option<Line>>; IRQ_COUNT + WIRED_COUNT] = [const { SpinLock::new(None) }; IRQ_COUNT + WIRED_COUNT];
 
@@ -88,10 +127,11 @@ fn line_slot(vector: u32) -> Option<usize> {
 	None
 }
 
-// BIND A PLATFORM ROW'S WIRED LINE to a new `Interrupt`: a GSI of 15 or below at `IRQ_BASE + GSI`, one above
-// it at a vector of the wired pool, routed to the boot core with the row's trigger and polarity and unmasked.
-// Refused, in words: a line of another controller, a GSI no I/O APIC answers for, a legacy line the kernel
-// answers itself, one another claim holds, or a full pool.
+// BIND A CLAIMED WIRED LINE to a new `Interrupt`: a GSI of 15 or below at `IRQ_BASE + GSI`, one above it at a
+// vector of the wired pool, routed to the boot core with the row's trigger and polarity and unmasked - or, for a
+// LEVEL line another claim or a hot-plug port already holds with the same polarity, one more holder of it, on its
+// vector. Refused, in words: a line of another controller, a GSI no I/O APIC answers for, a legacy line the kernel
+// answers itself and does not share, a held line that is an edge or of another polarity, a full line or a full pool.
 pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str> {
 	if line.controller != abi::LINE_CONTROLLER_IOAPIC {
 		return Err("its line is not an I/O APIC's");
@@ -100,18 +140,45 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 	if !super::ioapic::handles(gsi) {
 		return Err("no I/O APIC answers for its Global System Interrupt");
 	}
+	let level = line.trigger == abi::LINE_TRIGGER_LEVEL;
+	let low = line.polarity == abi::LINE_POLARITY_LOW;
 	let _binding = BINDING.lock();
-	// ONE CLAIM PER LINE: a second claim on a held line - level or edge - is refused by name, since a shared
-	// level line masked by one driver's interrupt would starve the other's.
-	if LINES.iter().any(|slot| slot.lock().as_ref().is_some_and(|held| held.gsi == gsi)) {
-		return Err("another claim holds that line");
+	// A HELD LINE IS JOINED OR REFUSED, never bound twice: a GSI has one redirection entry and one vector.
+	if let Some(slot) = LINES.iter().position(|slot| slot.lock().as_ref().is_some_and(|held| held.gsi == gsi)) {
+		let mut held = LINES[slot].lock();
+		let Some(shared) = held.as_mut() else { return Err("another claim holds that line") };
+		if !(shared.level && level) {
+			return Err("another claim holds that line, and an edge line is not shared");
+		}
+		if shared.low != low {
+			return Err("another claim holds that line with the other polarity");
+		}
+		let Some(free) = shared.holders.iter().position(Option::is_none) else { return Err("that line is shared by as many claims as it carries") };
+		let vector = slot_vector(slot);
+		let Some(intr) = Interrupt::new(vector) else { return Err("the Interrupt object could not be allocated") };
+		shared.holders[free] = Some(Holder { intr: Arc::downgrade(&intr), owner: Arc::as_ptr(&intr) as usize, waiting: false });
+		intr.mark_bound();
+		return Ok(intr);
 	}
+	// A KERNEL LINE A CLAIM MAY SHARE is joined on the kernel's own vector and entry, which stay as they are routed.
+	let kernel = if gsi < IRQ_COUNT as u32 { KERNEL_SHARED[gsi as usize].load(Ordering::SeqCst) } else { 0 };
 	let vector: u8 = if gsi < IRQ_COUNT as u32 {
 		let vector = IRQ_BASE + gsi as u8;
 		// THE KERNEL'S OWN LEGACY LINES ARE NOT A CLAIM'S: the timer's dedicated gate, and any vector a kernel
-		// handler answers (the console UART, the SCI, a hot-plug slot).
-		if vector == TIMER_VECTOR || HANDLERS[gsi as usize].load(Ordering::SeqCst) != 0 {
+		// handler answers (the console UART, the SCI) - except a level one it declared shareable.
+		if vector == TIMER_VECTOR {
 			return Err("the kernel answers that legacy line itself");
+		}
+		if HANDLERS[gsi as usize].load(Ordering::SeqCst) != 0 {
+			if kernel == 0 {
+				return Err("the kernel answers that legacy line itself");
+			}
+			if !level {
+				return Err("the kernel holds that line as a level line, and an edge line is not shared");
+			}
+			if (kernel == 2) != low {
+				return Err("the kernel holds that line with the other polarity");
+			}
 		}
 		vector
 	} else {
@@ -122,15 +189,41 @@ pub fn bind_wired(line: &abi::WiredLine) -> Result<Arc<Interrupt>, &'static str>
 	};
 	let Some(intr) = Interrupt::new(vector as u32) else { return Err("the Interrupt object could not be allocated") };
 	let Some(slot) = line_slot(vector as u32) else { return Err("the vector is outside the wired windows") };
-	let level = line.trigger == abi::LINE_TRIGGER_LEVEL;
-	*LINES[slot].lock() = Some(Line { gsi, level, intr: Arc::downgrade(&intr) });
+	let mut holders: [Option<Holder>; MAX_SHARERS] = [const { None }; MAX_SHARERS];
+	holders[0] = Some(Holder { intr: Arc::downgrade(&intr), owner: Arc::as_ptr(&intr) as usize, waiting: false });
+	*LINES[slot].lock() = Some(Line { gsi, level, low, holders });
 	intr.mark_bound();
-	if !super::ioapic::route_line(gsi, vector, crate::smp::lapic_id(0), level, line.polarity == abi::LINE_POLARITY_LOW) {
+	let kernel_held = gsi < IRQ_COUNT as u32 && HANDLERS[gsi as usize].load(Ordering::SeqCst) != 0;
+	if !kernel_held && !super::ioapic::route_line(gsi, vector, crate::smp::lapic_id(0), level, low) {
 		*LINES[slot].lock() = None;
 		let _ = intr.disown();
 		return Err("its redirection entry could not be written");
 	}
 	Ok(intr)
+}
+
+// ROUTE A LEVEL LINE THE KERNEL ANSWERS ITSELF AND A CLAIM MAY SHARE - a hot-plug port's INTx - to `handler`, with
+// the trigger and polarity its wiring has, and record it shareable. Answers whether the entry was written.
+#[cfg(not(test))]
+pub fn route_shared_kernel_line(line: &abi::WiredLine, handler: HandlerFn) -> bool {
+	let gsi = line.number;
+	if gsi >= IRQ_COUNT as u32 || line.trigger != abi::LINE_TRIGGER_LEVEL {
+		return false;
+	}
+	let low = line.polarity == abi::LINE_POLARITY_LOW;
+	register(IRQ_BASE as u32 + gsi, handler);
+	KERNEL_SHARED[gsi as usize].store(1 + low as u8, Ordering::SeqCst);
+	super::ioapic::route_line(gsi, IRQ_BASE + gsi as u8, crate::smp::lapic_id(0), true, low)
+}
+
+// The vector a `LINES` slot stands for.
+fn slot_vector(slot: usize) -> u32 {
+	if slot < IRQ_COUNT { IRQ_BASE as u32 + slot as u32 } else { WIRED_BASE as u32 + (slot - IRQ_COUNT) as u32 }
+}
+
+// Whether a kernel handler answers the legacy line at `slot` - a line the kernel needs live whoever else holds it.
+fn kernel_answers(slot: usize) -> bool {
+	slot < IRQ_COUNT && HANDLERS[slot].load(Ordering::SeqCst) != 0
 }
 
 // Whether a claimed line is live at its controller - for the suite, which checks that a level line is masked
@@ -140,29 +233,42 @@ pub fn line_armed(line: &abi::WiredLine) -> bool {
 	super::ioapic::unmasked(line.number)
 }
 
-// A CLAIMED LINE FIRED: its `Interrupt` is signalled, and a LEVEL line is masked at its I/O APIC before the
-// end of interrupt - its source stays asserted until the driver has run, and an unmasked level line would
-// re-fire for as long as that takes. The driver's acknowledgement unmasks it. False when no claim holds it.
+// A CLAIMED LINE FIRED: every `Interrupt` holding it is signalled, and a LEVEL line is masked at its I/O APIC
+// before the end of interrupt - its source stays asserted until a driver has run, and an unmasked level line would
+// re-fire for as long as that takes. The acknowledgement of every holder it signalled unmasks it. False when no
+// claim holds it.
 fn signal_line(vector: u32) -> bool {
 	let Some(slot) = line_slot(vector) else { return false };
-	let held = LINES[slot].lock();
-	let Some(line) = held.as_ref() else { return false };
+	let mut held = LINES[slot].lock();
+	let Some(line) = held.as_mut() else { return false };
 	if line.level {
 		super::ioapic::mask(line.gsi);
 	}
-	if let Some(intr) = line.intr.upgrade() {
-		intr.signal();
+	let mut signalled = false;
+	for holder in line.holders.iter_mut().flatten() {
+		if let Some(intr) = holder.intr.upgrade() {
+			holder.waiting = line.level;
+			intr.signal();
+			signalled = true;
+		}
+	}
+	// A LINE NOBODY LIVE HOLDS IS NOT LEFT MASKED behind a holder whose `Drop` has not run yet - when the kernel
+	// answers it, its handler has run already and needs the next firing.
+	if line.level && !signalled && kernel_answers(slot) {
+		super::ioapic::unmask(line.gsi);
 	}
 	true
 }
 
-// THE DRIVER ACKNOWLEDGED: a level line masked when it fired is unmasked. Nothing for an edge line, an MSI or
-// a vector no claim holds.
-pub fn acknowledge(vector: u32) {
+// A HOLDER ACKNOWLEDGED: a level line masked when it fired is unmasked once every holder it signalled has.
+// Nothing for an edge line, an MSI, a vector no claim holds, or an `owner` that holds no place on it.
+pub fn acknowledge(vector: u32, owner: usize) {
 	let Some(slot) = line_slot(vector) else { return };
-	if let Some(line) = LINES[slot].lock().as_ref()
-		&& line.level
-	{
+	let mut held = LINES[slot].lock();
+	let Some(line) = held.as_mut() else { return };
+	let Some(holder) = line.holders.iter_mut().flatten().find(|holder| holder.owner == owner) else { return };
+	holder.waiting = false;
+	if line.level && line.settled() {
 		super::ioapic::unmask(line.gsi);
 	}
 }
@@ -212,13 +318,14 @@ fn is_msi(vector: u32) -> bool {
 	vector >= MSI_BASE as u32 && (vector as usize) < MSI_BASE as usize + MSI_COUNT
 }
 
-// Remove any binding for `vector` (called from an Interrupt's Drop).
+// Remove any binding for `vector` (called from an Interrupt's Drop) - for a shared line, the place of the holder
+// `owner` names, the Interrupt's address.
 // Returns whether the teardown CONFIRMED, which on this port it always does: masking an MSI-X table
 // entry and freeing the slot are local writes with no remote agreement to wait for. riscv64 is the
 // port where it can fail - see its `unbind`, which asks the owning hart to disable the EID - and the
 // signature is shared so a caller can fold the answer into a claim's terminal state without asking
 // which architecture it is on.
-pub fn unbind(vector: u32) -> bool {
+pub fn unbind(vector: u32, owner: usize) -> bool {
 	if is_msi(vector) {
 		// MASK the device's table entry, then unmap its page, and only then free the vector.
 		//
@@ -237,13 +344,28 @@ pub fn unbind(vector: u32) -> bool {
 		REGISTRY.retire(slot);
 		return true;
 	}
-	// A CLAIMED WIRED LINE: masked at its controller, and only then its vector given back.
+	// A CLAIMED WIRED LINE: this holder's place given back, and the line masked at its controller once nobody holds
+	// it - the vector with it - unless the kernel answers it, whose handler keeps it live. A holder that leaves while
+	// the line waits on it no longer holds it masked for the others.
 	if let Some(slot) = line_slot(vector) {
 		let mut held = LINES[slot].lock();
-		if let Some(line) = held.as_ref() {
-			super::ioapic::mask(line.gsi);
+		if let Some(line) = held.as_mut() {
+			for place in line.holders.iter_mut() {
+				if place.as_ref().is_some_and(|holder| holder.owner == owner) {
+					*place = None;
+				}
+			}
+			if line.live().next().is_none() {
+				if kernel_answers(slot) {
+					super::ioapic::unmask(line.gsi);
+				} else {
+					super::ioapic::mask(line.gsi);
+				}
+				*held = None;
+			} else if line.level && line.settled() {
+				super::ioapic::unmask(line.gsi);
+			}
 		}
-		*held = None;
 	}
 	true
 }
@@ -555,7 +677,7 @@ pub fn is_bound(vector: u32) -> bool {
 	if is_msi(vector) {
 		return REGISTRY.is_bound((vector - MSI_BASE as u32) as usize);
 	}
-	line_slot(vector).is_some_and(|slot| LINES[slot].lock().as_ref().is_some_and(|line| line.intr.strong_count() != 0))
+	line_slot(vector).is_some_and(|slot| LINES[slot].lock().as_ref().is_some_and(|line| line.live().any(|holder| holder.intr.strong_count() != 0)))
 }
 
 // Register `handler` for a device-interrupt `vector` (IRQ_BASE..IRQ_BASE+IRQ_COUNT).

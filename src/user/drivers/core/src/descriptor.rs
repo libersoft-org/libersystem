@@ -135,5 +135,22 @@ impl<'a> Iterator for Walk<'a> {
 	}
 }
 
+// THE HEAD OF A CONFIGURATION DESCRIPTOR, read as the record it is: the total length the whole descriptor is asked
+// for by, the value SET_CONFIGURATION selects it with, and whether it may signal its own resume (`bmAttributes`
+// bit 5). Nine bytes, of which a device that returned four has not sent the total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigHead {
+	pub total: u16,
+	pub value: u8,
+	pub remote_wakeup: bool,
+}
+
+pub fn config_head(bytes: &[u8]) -> Result<ConfigHead, DescriptorFault> {
+	let mut walk = Walk::new(bytes);
+	let Some(record) = walk.next() else { return Err(walk.fault().unwrap_or(DescriptorFault::ShortRecord { length: bytes.len() as u8, needed: 9 })) };
+	check_type(DT_CONFIG, record.kind)?;
+	Ok(ConfigHead { total: record.field16(2)?, value: record.field(5)?, remote_wakeup: record.field(7).is_ok_and(|attributes| attributes & 0x20 != 0) })
+}
+
 #[cfg(test)]
 mod tests;

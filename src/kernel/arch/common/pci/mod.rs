@@ -42,6 +42,11 @@ const VIRTIO_MODERN_BASE: u16 = 0x1040;
 // OHCI/UHCI pair each name their own BAR too, and inherit this rather than discovering it again.
 const RESOURCED: &[(u8, u8, u8, u32, usize)] = &[
 	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_USB, abi::PCI_PROG_IF_XHCI, abi::DEVICE_TYPE_XHCI, 0),
+	// THE EARLIER USB CONTROLLERS WITH A MEMORY REGISTER FILE. They have no MSI, so their row's interrupt is the
+	// function's INTx - see `device::row_line`. UHCI's registers are an I/O BAR and resolve no window: its
+	// function reaches its driver through its recorded port range.
+	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_USB, abi::PCI_PROG_IF_EHCI, abi::DEVICE_TYPE_EHCI, 0),
+	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_USB, abi::PCI_PROG_IF_OHCI, abi::DEVICE_TYPE_OHCI, 0),
 	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_NVM, abi::PCI_PROG_IF_NVME, abi::DEVICE_TYPE_NVME, 0),
 	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_SATA, abi::PCI_PROG_IF_AHCI, abi::DEVICE_TYPE_AHCI, 5),
 	(abi::PCI_CLASS_BASE_PERIPHERAL, abi::PCI_SUBCLASS_SD_HOST, abi::PCI_PROG_IF_SD_HOST, abi::DEVICE_TYPE_SDHCI, 0),

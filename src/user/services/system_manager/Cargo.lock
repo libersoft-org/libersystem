@@ -147,6 +147,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotplug-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "i2c-device-proto"
 version = "0.0.0"
 dependencies = [
@@ -275,6 +283,7 @@ dependencies = [
  "font-proto",
  "gpio-device-proto",
  "graphics-proto",
+ "hotplug-device-proto",
  "i2c-device-proto",
  "import-proto",
  "input-proto",

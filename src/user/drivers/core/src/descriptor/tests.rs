@@ -1,5 +1,5 @@
 // DRV-012's four negatives, each held against the decision that closes it.
-use super::{DescriptorFault, Walk, check_transfer, check_type};
+use super::{ConfigHead, DescriptorFault, Walk, check_transfer, check_type, config_head};
 
 // A minimal well-formed configuration: the configuration record, one interface, one endpoint.
 fn configuration() -> [u8; 25] {
@@ -104,4 +104,18 @@ fn a_record_that_runs_past_the_transfer_or_declares_nothing_ends_the_walk() {
 	walk.next().expect("the configuration record");
 	assert_eq!(walk.next(), None);
 	assert_eq!(walk.fault(), Some(DescriptorFault::Malformed));
+}
+
+#[test]
+// THE HEAD IS A RECORD LIKE ANY OTHER: the total, the value and the wakeup bit read from inside it, a head that is
+// not a configuration refused by type, and one cut short refused rather than read past its end.
+fn a_configuration_head_is_read_from_inside_its_own_nine_bytes() {
+	let head = [9u8, 0x02, 0x22, 0x01, 1, 3, 0, 0xa0, 50];
+	assert_eq!(config_head(&head), Ok(ConfigHead { total: 0x122, value: 3, remote_wakeup: true }));
+	let no_wakeup = [9u8, 0x02, 34, 0, 1, 1, 0, 0x80, 50];
+	assert_eq!(config_head(&no_wakeup).map(|head| head.remote_wakeup), Ok(false));
+	let string = [9u8, 0x03, 34, 0, 1, 1, 0, 0x80, 50];
+	assert_eq!(config_head(&string), Err(DescriptorFault::Type { expected: 0x02, got: 0x03 }));
+	let stunted = [4u8, 0x02, 34, 0];
+	assert_eq!(config_head(&stunted), Err(DescriptorFault::ShortRecord { length: 4, needed: 6 }));
 }

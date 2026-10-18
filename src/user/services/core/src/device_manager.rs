@@ -4745,16 +4745,27 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 		}
 		txn.holds(driver_protocol::ResourceKind::Irq as u16, irq as u64);
 	}
-	if driver_name == b"virtio_input" || driver_name == b"xhci" {
+	// THE EARLIER USB CONTROLLERS HAVE NO MSI, so their interrupt is the function's INTx: line 0 of its row, bound by
+	// the kernel as a level line it shares with whatever else the firmware routed to the same IRQ.
+	let usb_legacy: bool = driver_name == b"ehci" || driver_name == b"ohci" || driver_name == b"uhci";
+	if usb_legacy && info.platform.kind != ROW_KIND_PLATFORM {
+		let line: i64 = device_resource_acquire(grant.claim, abi::RESOURCE_KIND_LINE, 0);
+		if line < 0 {
+			refused(b"its INTx line - the kernel would not bind the function's interrupt");
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+		}
+		txn.holds(driver_protocol::ResourceKind::Line as u16, line as u64);
+	}
+	if driver_name == b"virtio_input" || driver_name == b"xhci" || usb_legacy {
 		let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
 		if sink < 0 {
 			refused(b"a key sink - the raw-key channel could not be duplicated");
 			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 		}
 		txn.holds(driver_protocol::ResourceKind::Keys as u16, sink as u64);
-		// AND THE TRUSTED SINK, to these two alone: the physical keyboard drivers this system binds. A
-		// catalogue provider, the Bluetooth stack, console injection and a client's key stream have no
-		// producer for it, which is what makes a key on it a key a person pressed on this keyboard.
+		// AND THE TRUSTED SINK, to these alone: the physical keyboard drivers this system binds - virtio-input and the
+		// four USB host controllers. A catalogue provider, the Bluetooth stack, console injection and a client's key
+		// stream have no producer for it, which is what makes a key on it a key a person pressed on this keyboard.
 		let trusted_producer: u64 = TRUSTED_KEY_PRODUCER.load(core::sync::atomic::Ordering::Relaxed);
 		if trusted_producer != 0 {
 			let trusted: i64 = duplicate(trusted_producer, RIGHT_SEND | RIGHT_TRANSFER);
@@ -6913,6 +6924,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::CRYPTO => proto::system::ProviderKind::Crypto,
 		provider::HOST_SHARE => proto::system::ProviderKind::HostShare,
 		provider::MEMORY_BALLOON => proto::system::ProviderKind::MemoryBalloon,
+		provider::MEMORY_HOTPLUG => proto::system::ProviderKind::MemoryHotplug,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6954,6 +6966,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Crypto => driver_protocol::provider::CRYPTO,
 		proto::system::ProviderKind::HostShare => driver_protocol::provider::HOST_SHARE,
 		proto::system::ProviderKind::MemoryBalloon => driver_protocol::provider::MEMORY_BALLOON,
+		proto::system::ProviderKind::MemoryHotplug => driver_protocol::provider::MEMORY_HOTPLUG,
 	}
 }
 

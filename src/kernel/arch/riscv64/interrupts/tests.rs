@@ -27,7 +27,7 @@ fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	// EID 0 is "no interrupt" - outside the MSI window - so it dispatches to no one.
 	assert!(!dispatch_msi(0), "EID 0 is not one of the device MSI EIDs");
 	// Unbinding frees the slot for re-use.
-	unbind(vector);
+	unbind(vector, 0);
 	assert!(!is_bound(vector), "unbind drops the binding");
 	// UNBIND IS NOT THE TEARDOWN. It RETIRES the slot pending a later device-quiesced release - the
 	// vector stays masked and held, because a request to stop is not proof of stopping. So a test
@@ -37,7 +37,7 @@ fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	assert!(released >= 1, "the device's retired vector is given back by the release, which is the step `unbind` deliberately does not perform");
 	let again = acquire_msi(table, 0, 3).expect("the released slot is handed out again");
 	assert_eq!(again, vector, "the SAME vector comes back - a release that hands out a different one has not returned this one");
-	unbind(again);
+	unbind(again, 0);
 	let _ = super::release_msi_for_device(3);
 	unsafe { frame::deallocate(table) };
 }
@@ -66,7 +66,7 @@ fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
 		}
 	}
 	assert!(seen, "the acquired MSI vector appears in the inventory");
-	unbind(vector);
+	unbind(vector, 0);
 	unsafe { frame::deallocate(table) };
 }
 
@@ -80,7 +80,7 @@ fn an_eid_is_disabled_in_the_file_that_owns_it() {
 	assert!(crate::arch::imsic::disable_eid_on_owner(vector), "the acquiring hart owns the EID, so it disables it itself");
 	// And an EID nobody owns is already in the state the caller asked for, rather than a refusal.
 	assert!(crate::arch::imsic::disable_eid_on_owner(vector), "an EID with no owner needs no cross-hart request");
-	unbind(vector);
+	unbind(vector, 0);
 	unsafe { frame::deallocate(table) };
 }
 
@@ -100,7 +100,7 @@ fn a_vector_whose_identity_stayed_armed_is_never_handed_out_again() {
 	assert_eq!(release_msi_for_device(12), 0, "a device quiesce does not release a quarantined vector");
 	let next = acquire_msi(table, 0, 13).expect("another EID is available");
 	assert_ne!(next, stranded, "the quarantined EID is not handed out again");
-	unbind(next);
+	unbind(next, 0);
 	unsafe { frame::deallocate(table) };
 }
 

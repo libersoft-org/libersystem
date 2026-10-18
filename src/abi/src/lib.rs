@@ -99,12 +99,17 @@ pub const SYS_WAIT: u64 = 23;
 // Create a DMA buffer.
 //   a0 = size in bytes
 //   a1 = a DeviceMemory handle with WRITE, naming the device the buffer is for (0 = none)
+//   a2 = flags: `DMA_BUFFER_BELOW_4G` for a device that puts only 32 address bits on the bus - the buffer's
+//        frames, and its device address where the device is translated, are then below 4 GiB. Any other bit
+//        is ERR_INVALID.
 //
 // The second argument arrived with the DMA lifetime rule - the kernel holds a dead driver's
 // frames until that device is confirmed stopped - and this line did not mention it. Three stale
 // syscall comments were corrected in this milestone and a fourth appeared within the day, which is
 // the argument for generating these definitions rather than for a fifth correction.
 pub const SYS_DMA_BUFFER_CREATE: u64 = 24;
+// The one flag `SYS_DMA_BUFFER_CREATE` takes: a buffer a 32-bit engine can name - EHCI, OHCI and UHCI among them.
+pub const DMA_BUFFER_BELOW_4G: u64 = 1;
 pub const SYS_DEVICE_MEMORY_MAP: u64 = 25;
 pub const SYS_RANDOM_GET: u64 = 26;
 pub const SYS_INTERRUPT_BIND: u64 = 27;
@@ -791,6 +796,8 @@ pub const VIRTIO_TYPE_GPIO: u32 = 41;
 pub const VIRTIO_TYPE_CRYPTO: u32 = 20;
 /// virtio-balloon: memory a virtual machine gives back to its host - see `SYS_BALLOON_CREATE`.
 pub const VIRTIO_TYPE_BALLOON: u32 = 5;
+/// virtio-mem: memory a virtual machine's host plugs in at run time - see `SYS_MEMORY_PLUG_REGION`.
+pub const VIRTIO_TYPE_MEM: u32 = 24;
 /// virtio-fs: a directory of the host, FUSE over virtqueues - driven on a development machine only.
 pub const VIRTIO_TYPE_FS: u32 = 26;
 
@@ -895,6 +902,14 @@ pub const PCI_PROG_IF_SD_HOST: u8 = 0x01;
 pub const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
 pub const PCI_SUBCLASS_USB: u8 = 0x03;
 pub const PCI_PROG_IF_XHCI: u8 = 0x30;
+// THE THREE EARLIER USB HOST CONTROLLERS, by their programming interface: UHCI (0x00), OHCI (0x10) and EHCI (0x20).
+// OHCI's and EHCI's register files are BAR 0, memory; UHCI's is BAR 4, I/O, which reaches its driver as a port range
+// like any I/O BAR - so only the first two resolve a window.
+pub const PCI_PROG_IF_UHCI: u8 = 0x00;
+pub const PCI_PROG_IF_OHCI: u8 = 0x10;
+pub const PCI_PROG_IF_EHCI: u8 = 0x20;
+pub const DEVICE_TYPE_OHCI: u32 = 0x10a;
+pub const DEVICE_TYPE_EHCI: u32 = 0x10b;
 // An NVM Express controller. 0x101 is taken by the unresolved row below, which was allocated before
 // a second resolved family existed; the numbers are a namespace and not an order.
 pub const DEVICE_TYPE_NVME: u32 = 0x102;
@@ -948,12 +963,15 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_GPIO => "virtio-gpio",
 		VIRTIO_TYPE_CRYPTO => "virtio-crypto",
 		VIRTIO_TYPE_BALLOON => "virtio-balloon",
+		VIRTIO_TYPE_MEM => "virtio-mem",
 		VIRTIO_TYPE_FS => "virtio-fs",
 		DEVICE_TYPE_XHCI => "xhci",
 		DEVICE_TYPE_NVME => "nvme",
 		DEVICE_TYPE_AHCI => "ahci",
 		DEVICE_TYPE_SDHCI => "sdhci",
 		DEVICE_TYPE_HDA => "hda",
+		DEVICE_TYPE_OHCI => "ohci",
+		DEVICE_TYPE_EHCI => "ehci",
 		DEVICE_TYPE_IPMI_KCS => "ipmi-kcs",
 		DEVICE_TYPE_IPMI_BT => "ipmi-bt",
 		DEVICE_TYPE_SHARED_MEMORY => "shared-memory",
@@ -1377,6 +1395,8 @@ pub const OBJECT_TYPE_REGISTERS: u64 = 17;
 pub const OBJECT_TYPE_LATENCY_REQUEST: u64 = 18;
 // A balloon: free frames held for a virtual machine's host - see `SYS_BALLOON_CREATE`.
 pub const OBJECT_TYPE_BALLOON: u64 = 19;
+// A region of plugged memory - see `SYS_MEMORY_PLUG_REGION`.
+pub const OBJECT_TYPE_PLUG_REGION: u64 = 20;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1758,6 +1778,24 @@ pub const SYS_BALLOON_TAKE: u64 = 131;
 pub const SYS_BALLOON_GIVE: u64 = 132;
 // The most frames one take or give moves.
 pub const MAX_BALLOON_BATCH: u64 = 256;
+
+// PLUGGED MEMORY: a range a virtual machine's host plugs in at run time (virtio-mem), block by block, held apart from the
+// memory the boot found and handed out after it. A block comes online only once its host has plugged it, and goes
+// offline only when every frame of it is free - memory anything holds is never taken back.
+//
+// `SYS_MEMORY_PLUG_REGION(device, base, size, block)`: the region [base, base + size) in blocks of `block`, for the
+// virtio-mem device the caller's DeviceMemory capability names - a handle, ERR_ACCESS_DENIED for any other device and
+// ERR_INVALID for a range that is not whole blocks or lies over memory or a device's window. The same range asked for
+// again is the same region, with what is online still online.
+// `SYS_MEMORY_PLUG_ONLINE(region, first, count)`: blocks [first, first + count) online - each offline before.
+// `SYS_MEMORY_PLUG_OFFLINE(region, first, count)`: those blocks offline - each online, every frame free, or
+// ERR_WOULD_BLOCK and nothing changed.
+// `SYS_MEMORY_PLUG_STATE(region, out_ptr, out_len)`: one byte a block at `out_ptr` (1 online, 0 not), at most `out_len` of
+// them - the region's block count.
+pub const SYS_MEMORY_PLUG_REGION: u64 = 133;
+pub const SYS_MEMORY_PLUG_ONLINE: u64 = 134;
+pub const SYS_MEMORY_PLUG_OFFLINE: u64 = 135;
+pub const SYS_MEMORY_PLUG_STATE: u64 = 136;
 
 pub const MAX_INJECT_PERMILLE: u64 = 500;
 

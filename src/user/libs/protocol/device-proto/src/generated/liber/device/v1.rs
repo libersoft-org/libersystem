@@ -1511,6 +1511,9 @@ pub enum ProviderKind {
 	/// A MEMORY BALLOON - `liber:balloon-device@1`'s `balloon-device` contract: what a virtual machine's host asks to
 	/// have back and the allowance granted against it - which ResourceManager alone consumes.
 	MemoryBalloon = 35,
+	/// PLUGGED MEMORY - `liber:hotplug-device@1`'s `hotplug-device` contract: memory a virtual machine's host plugs in
+	/// and may ask back, and the allowance granted for it - which ResourceManager alone consumes.
+	MemoryHotplug = 36,
 }
 
 impl ProviderKind {
@@ -1588,6 +1591,7 @@ impl ProviderKind {
 			33 => Some(ProviderKind::Crypto),
 			34 => Some(ProviderKind::HostShare),
 			35 => Some(ProviderKind::MemoryBalloon),
+			36 => Some(ProviderKind::MemoryHotplug),
 			_ => None,
 		}
 	}
@@ -9072,6 +9076,7 @@ impl ProviderKind {
 			ProviderKind::Crypto => out.push_str("\"crypto\""),
 			ProviderKind::HostShare => out.push_str("\"host-share\""),
 			ProviderKind::MemoryBalloon => out.push_str("\"memory-balloon\""),
+			ProviderKind::MemoryHotplug => out.push_str("\"memory-hotplug\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -9111,6 +9116,7 @@ impl ProviderKind {
 			ProviderKind::Crypto => out.push_str("crypto"),
 			ProviderKind::HostShare => out.push_str("host-share"),
 			ProviderKind::MemoryBalloon => out.push_str("memory-balloon"),
+			ProviderKind::MemoryHotplug => out.push_str("memory-hotplug"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -9150,6 +9156,7 @@ impl ProviderKind {
 			ProviderKind::Crypto => crate::codec::cbor::text(out, "crypto"),
 			ProviderKind::HostShare => crate::codec::cbor::text(out, "host-share"),
 			ProviderKind::MemoryBalloon => crate::codec::cbor::text(out, "memory-balloon"),
+			ProviderKind::MemoryHotplug => crate::codec::cbor::text(out, "memory-hotplug"),
 		}
 	}
 }

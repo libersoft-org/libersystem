@@ -278,6 +278,19 @@ pub fn arm_slot_interrupt(port: &common::HotPlugPort, handler: crate::arch::inte
 	Some(route.spec[0])
 }
 
+// A PCI FUNCTION'S OWN INTx LINE, for a claim of its row: its pin, through the tree's `interrupt-map`, read by the
+// port's own conversion - the route the suite's `edu` line test takes. None for a function with no pin, or one the
+// tree routes to a controller this kernel does not drive.
+pub fn intx_line(bus: u8, dev: u8, func: u8) -> Option<abi::WiredLine> {
+	let pin = (<Access as common::ConfigAccess>::read32(bus, dev, func, 0x3c) >> 8) as u8;
+	if !(1..=4).contains(&pin) {
+		return None;
+	}
+	let tree = super::device_tree()?;
+	let route = tree.pci_intx_route(bus, dev, func, pin)?;
+	super::platform::wired_line(&tree, &route)
+}
+
 // A function's interrupt pin and line bytes (config 0x3D and 0x3C) - for the suite's claimed-line test, which
 // routes the `edu` function's INTx pin as a platform row's line.
 #[cfg(test)]

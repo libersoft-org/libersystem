@@ -195,3 +195,51 @@ fn a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them() {
 	drop(parent);
 	assert_eq!(owner.upgrade().expect("the lost backing permanently retains its charged owner").account().dma().used(), 3 * PAGE_SIZE);
 }
+
+// A 32-BIT ENGINE'S BUFFER IS BELOW 4 GiB, AND A CEILING NOTHING FREE IS UNDER IS A REFUSAL - not a buffer above it.
+// This machine has memory past 4 GiB, so a ceiling that were ignored would show as frames above it sooner or later;
+// the second case shows the ceiling is a rule rather than where the allocator happens to look first: nothing below
+// one mebibyte is free, so a buffer that must end there is refused and nothing is charged.
+crate::tagged_test!(a_dma_buffer_for_a_32_bit_engine_ends_below_its_ceiling_or_is_refused, [Dma, Drivers, Memory], id = "kernel.object.dma_buffer.a_dma_buffer_for_a_32_bit_engine_ends_below_its_ceiling_or_is_refused", covers = ["kernel"]);
+fn a_dma_buffer_for_a_32_bit_engine_ends_below_its_ceiling_or_is_refused() {
+	let domain = Domain::new(1 << 26, 8, 4);
+	let mut held = alloc::vec::Vec::new();
+	for _ in 0..16 {
+		let Ok(dma) = DmaBuffer::create_within(&domain, 64 * PAGE_SIZE as usize, None, 32) else { panic!("a 64-page buffer below 4 GiB should allocate") };
+		let frames = dma.frames();
+		assert!(frames.iter().all(|&frame| frame + PAGE_SIZE <= 1 << 32), "every frame of a 32-bit buffer is below 4 GiB: {:#x}", frames[frames.len() - 1]);
+		held.push(dma);
+	}
+	drop(held);
+	let used = domain.account().dma().used();
+	assert!(DmaBuffer::create_within(&domain, PAGE_SIZE as usize, None, 20).is_err(), "nothing below one mebibyte is free, and a buffer that must end there is refused");
+	assert_eq!(domain.account().dma().used(), used, "and the refusal charged nothing");
+}
+
+// AND THE FLAG IS THE SYSCALL'S ONE: `DMA_BUFFER_BELOW_4G` makes a buffer, and any other bit is refused rather than
+// ignored - a caller asking for something this kernel does not do would otherwise get a buffer without it.
+crate::tagged_test!(the_dma_buffer_syscall_takes_its_one_flag_and_refuses_any_other, [Dma, Kernel, Syscall], id = "kernel.object.dma_buffer.the_dma_buffer_syscall_takes_its_one_flag_and_refuses_any_other", covers = ["kernel"]);
+fn the_dma_buffer_syscall_takes_its_one_flag_and_refuses_any_other() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let below = crate::arch::syscall::invoke(crate::syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, abi::DMA_BUFFER_BELOW_4G, 0);
+			assert!(!crate::syscall::sys_is_err(below), "a buffer below 4 GiB is made");
+			// ITS FRAMES, READ OFF THE OBJECT: a buffer bound to no device has no address the syscall would answer.
+			let thread = crate::sched::current_thread().expect("a current thread");
+			let object = thread.handles().lock().lookup_typed(crate::object::handle::Handle::from_raw(below), crate::object::ObjectType::DmaBuffer, crate::object::rights::Rights::READ).expect("the buffer's handle");
+			let buffer = object.into_any_arc().downcast::<DmaBuffer>().ok().expect("a DmaBuffer");
+			assert!(buffer.frames().iter().all(|&frame| frame + PAGE_SIZE <= 1 << 32), "and its frames are below 4 GiB");
+			drop(buffer);
+			let unknown = crate::arch::syscall::invoke(crate::syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 2, 0);
+			assert_eq!(unknown as i64, crate::syscall::ERR_INVALID, "an unknown flag is refused");
+			crate::arch::syscall::invoke(crate::syscall::SYS_HANDLE_CLOSE, below, 0, 0, 0);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	DONE.store(false, Ordering::SeqCst);
+	let _ = crate::sched::spawn(body, 0);
+	crate::sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the syscall thread ran to its end");
+}

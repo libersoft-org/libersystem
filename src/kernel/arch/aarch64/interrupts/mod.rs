@@ -287,7 +287,9 @@ pub fn signal_line(intid: u32) -> bool {
 }
 
 // THE DRIVER ACKNOWLEDGED: a level line disabled when it fired is enabled again.
-pub fn acknowledge(vector: u32) {
+// `owner` names the acknowledging Interrupt; a line here has one holder, so it is not consulted (shared level
+// lines are x86_64's - see its `Line`).
+pub fn acknowledge(vector: u32, _owner: usize) {
 	if let Some(at) = line_slot(vector)
 		&& let Some(line) = LINES[at].lock().as_ref()
 		&& line.level
@@ -305,7 +307,7 @@ pub fn acknowledge(vector: u32) {
 // retiring the slot are local operations with no remote agreement to wait for. The signature is
 // shared with riscv64, where the answer can be false, so a caller can fold it into a claim's
 // terminal state without asking which architecture it is on.
-pub fn unbind(vector: u32) -> bool {
+pub fn unbind(vector: u32, _owner: usize) -> bool {
 	// A CLAIMED WIRED LINE: disabled at the distributor, and only then its slot given back.
 	if let Some(at) = line_slot(vector) {
 		let mut held = LINES[at].lock();

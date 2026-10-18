@@ -558,6 +558,9 @@ pub mod provider {
 	/// A MEMORY BALLOON, the `liber:balloon-device@1` `balloon-device` contract: the host's target and the allowance
 	/// ResourceManager - its one consumer - grants against it.
 	pub const MEMORY_BALLOON: u16 = 35;
+	/// PLUGGED MEMORY, the `liber:hotplug-device@1` `hotplug-device` contract: what the host plugs in and asks back, and
+	/// the allowance ResourceManager - its one consumer - grants for it.
+	pub const MEMORY_HOTPLUG: u16 = 36;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

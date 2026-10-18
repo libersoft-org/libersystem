@@ -3524,8 +3524,24 @@ pub unsafe fn dma_buffer(size: u64) -> Option<(u64, u64, u64)> {
 // # Safety
 // As `dma_buffer`, with the buffer bound to `device` for its DMA lifetime.
 pub unsafe fn dma_buffer_for(device: u64, size: u64) -> Option<(u64, u64, u64)> {
+	unsafe { dma_buffer_mapped(dma_buffer_create_for(device, size)) }
+}
+
+// The same, for a device that puts only 32 address bits on the bus - EHCI, OHCI, UHCI: the buffer's frames, and its
+// device address where the device is translated, are below 4 GiB.
+pub fn dma_buffer_create_below_4g(device: u64, size: u64) -> i64 {
+	unsafe { syscall(SYS_DMA_BUFFER_CREATE, size, device, DMA_BUFFER_BELOW_4G, 0) as i64 }
+}
+
+/// # Safety
+/// As `dma_buffer_for`.
+pub unsafe fn dma_buffer_below_4g(device: u64, size: u64) -> Option<(u64, u64, u64)> {
+	unsafe { dma_buffer_mapped(dma_buffer_create_below_4g(device, size)) }
+}
+
+// A created buffer's handle, mapped, with its virtual base and its device address.
+unsafe fn dma_buffer_mapped(handle: i64) -> Option<(u64, u64, u64)> {
 	unsafe {
-		let handle: i64 = dma_buffer_create_for(device, size);
 		if handle < 0 {
 			return None;
 		}

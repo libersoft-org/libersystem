@@ -188,11 +188,6 @@ const REQ_CLEAR_FEATURE: u8 = 1;
 const FEATURE_ENDPOINT_HALT: u16 = 0;
 const RT_ENDPOINT: u8 = 0x02;
 
-// Descriptor types within a configuration, shared by every class walk: the
-// interface and endpoint descriptors the HID and mass-storage bindings scan for.
-const DT_INTERFACE: u8 = 4;
-const DT_ENDPOINT: u8 = 5;
-
 // The hub device class (in the device descriptor) and its class descriptor type,
 // plus the hub class requests enumeration drives: GET_STATUS on a port (the status
 // word's connection / low-speed / high-speed bits), SET_FEATURE for port power and
@@ -1414,9 +1409,9 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			// pointer, over every interface the device was bound on.
 			slots.set_kind(
 				dev.slot,
-				if interfaces.iter().any(|h| h.layout.has_keyboard()) {
+				if interfaces.iter().any(|h| h.input.layout.has_keyboard()) {
 					KIND_KEYBOARD
-				} else if interfaces.iter().any(|h| h.layout.has_digitizer()) {
+				} else if interfaces.iter().any(|h| h.input.layout.has_digitizer()) {
 					KIND_TOUCH
 				} else if interfaces.iter().any(|h| h.has_gamepad()) {
 					KIND_GAMEPAD
@@ -1438,7 +1433,7 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			// the bus at enumeration - on a port that emulates every instruction, the bind windows
 			// this harness measures already run at 97 to 181 ticks against an allowance of 200. A
 			// class that cannot be a serial adapter is refused from a byte this driver already has.
-			&& class_is_plausible(ClassKind::Serial, dev.class)
+			&& drivers::usb_class::class_is_plausible(ClassKind::Serial, dev.class)
 			&& admits(hc, ClassKind::Serial, dev.class)
 			&& let brought_up = usb_serial::configure_serial(hc, &mut dev, usb_serial::MAX_PORTS - serials.len(), &mut serials.ports)
 			&& brought_up > 0
@@ -1527,80 +1522,10 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 	}
 }
 
-// Whether a class module has room for another device, reported when it has not.
-//
-// THE REFUSAL IS PRINTED HERE AND NOWHERE ELSE, so a controller that will not take a ninth keyboard
-// says which ceiling it reached rather than leaving a device addressed and silent. The device is not
-// released by a refusal: it stays in the inventory like every other unbound device, which is what
-// lets a later detach give its pages back.
+// Whether a class module has room for another device, reported when it has not - the shared policy's answer, in
+// `drivers::usb_class`, said as this driver.
 fn admits(hc: &Xhci, kind: ClassKind, class: u8) -> bool {
-	let mut trial = hc.budget;
-	match trial.admit(kind) {
-		Ok(()) => true,
-		Err(refusal) => {
-			// A device that is not of this class would be refused by its own configure step anyway,
-			// and saying "the keyboard budget is full" about a printer would be a lie.
-			if class_is_plausible(kind, class) {
-				print(b"driver.xhci: ");
-				print(match kind {
-					ClassKind::Hid => b"HID".as_slice(),
-					ClassKind::Storage => b"storage".as_slice(),
-					ClassKind::Network => b"network".as_slice(),
-					ClassKind::Uas => b"UAS".as_slice(),
-					ClassKind::Serial => b"serial".as_slice(),
-					ClassKind::Audio => b"audio".as_slice(),
-					ClassKind::Printer => b"printer".as_slice(),
-					ClassKind::StillImage => b"still-image".as_slice(),
-					ClassKind::SmartCard => b"smart-card".as_slice(),
-					ClassKind::Midi => b"MIDI".as_slice(),
-					ClassKind::PowerDevice => b"power-device".as_slice(),
-					ClassKind::Bluetooth => b"Bluetooth".as_slice(),
-					ClassKind::Mbim => b"MBIM".as_slice(),
-					ClassKind::Video => b"video".as_slice(),
-					ClassKind::Dfu => b"DFU".as_slice(),
-					ClassKind::Display => b"monitor".as_slice(),
-				});
-				print(b" module is full (");
-				print(refusal.describe());
-				print(b"), device left unbound\n");
-			}
-			false
-		}
-	}
-}
-
-// Whether a device's class byte could belong to this module at all. A composite device declares zero
-// at the device level and names its classes per interface, so zero is plausible for both.
-fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
-	match kind {
-		ClassKind::Hid => class == 0 || class == 0x03,
-		ClassKind::Storage => class == 0 || class == 0x08,
-		// A CDC adapter declares the communications class at the DEVICE level - unlike HID and mass
-		// storage, which declare it per interface and leave zero here.
-		ClassKind::Network => class == 0 || class == drivers::cdc::CLASS_COMMUNICATIONS,
-		ClassKind::Uas => class == 0 || class == usb_uas::CLASS_MASS_STORAGE,
-		// A CDC-ACM adapter declares the communications class at the device level like the network
-		// models do. This is read TWICE now: once here for the refusal message, and once in the
-		// dispatch as the cheap test in front of `configure_serial`'s descriptor walk.
-		ClassKind::Serial => class == 0 || class == drivers::cdc::CLASS_COMMUNICATIONS,
-		// An audio device declares its class PER INTERFACE and leaves zero at the device level, like
-		// HID and mass storage - the audio-control and audio-streaming interfaces are what carry it - or, as a UAC2
-		// function does, the association class (0xef) its interface association descriptor needs.
-		ClassKind::Audio => class == 0 || class == 0xef || class == drivers::uac::CLASS_AUDIO,
-		// THE SERVICE-BACKED CLASSES name themselves per interface, all but two: a Bluetooth controller
-		// declares its class at the device level, and a composite device of any of them declares zero or the
-		// association class (0xef).
-		ClassKind::Printer => class == 0 || class == 0xef || class == drivers::printer::CLASS_PRINTER,
-		ClassKind::StillImage => class == 0 || class == 0xef || class == 0x06,
-		ClassKind::SmartCard => class == 0 || class == 0xef || class == 0x0b,
-		ClassKind::Midi => class == 0 || class == 0xef || class == 0x01,
-		ClassKind::PowerDevice => class == 0 || class == 0xef || class == 0x03,
-		ClassKind::Bluetooth => class == 0 || class == 0xef || class == 0xe0,
-		ClassKind::Mbim => class == 0 || class == 0xef || class == drivers::cdc::CLASS_COMMUNICATIONS,
-		ClassKind::Video => class == 0 || class == 0xef || class == 0x0e,
-		ClassKind::Dfu => class == 0 || class == 0xef || class == 0xfe,
-		ClassKind::Display => class == 0 || class == 0xef || class == 0x03,
-	}
+	hc.budget.admits(kind, class, b"driver.xhci")
 }
 
 // Configure an addressed hub and enumerate the devices on its ports: select its

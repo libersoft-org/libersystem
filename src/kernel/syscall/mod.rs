@@ -31,6 +31,7 @@ use crate::object::event::Event;
 use crate::object::handle::{Capability, Handle, HandleError};
 use crate::object::interrupt::Interrupt;
 use crate::object::memory_object::{MemoryError, MemoryObject};
+use crate::object::plug_region::PlugRegion;
 use crate::object::privilege::{Privilege, PrivilegeKind};
 use crate::object::process::Process;
 use crate::object::rights::Rights;
@@ -523,7 +524,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CLOCK_MONO_NS => arch::common::time::CLOCK.nanos(arch::tsc::now()) as i64,
 		SYS_DEBUG_WRITE => sys_debug_write(a0, a1),
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
-		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0, a1),
+		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0, a1, a2),
 		SYS_DEVICE_QUIESCED => sys_device_quiesced(a0),
 		SYS_DEVICE_EVENTS => sys_device_events(a0, a1),
 		SYS_PLATFORM_EVENTS => sys_platform_events(a0, a1),
@@ -583,6 +584,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		abi::SYS_BALLOON_CREATE => sys_balloon_create(a0),
 		abi::SYS_BALLOON_TAKE => sys_balloon_take(a0, a1, a2),
 		abi::SYS_BALLOON_GIVE => sys_balloon_give(a0, a1, a2),
+		abi::SYS_MEMORY_PLUG_REGION => sys_memory_plug_region(a0, a1, a2, a3),
+		abi::SYS_MEMORY_PLUG_ONLINE => sys_memory_plug_change(a0, a1, a2, true),
+		abi::SYS_MEMORY_PLUG_OFFLINE => sys_memory_plug_change(a0, a1, a2, false),
+		abi::SYS_MEMORY_PLUG_STATE => sys_memory_plug_state(a0, a1, a2),
 		abi::SYS_DEVICE_NODE => firmware::sys_device_node(a0, a1, a2),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
@@ -753,8 +758,14 @@ fn sys_memory_object_create(size: u64) -> i64 {
 // A capability rather than an index, because the two ends of the rule have to be the same
 // authority: the driver that names a device here is the one that will later claim to have stopped
 // it, and both are things only the holder of that device's capability may say.
-fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
+fn sys_dma_buffer_create(size: u64, device_handle: u64, flags: u64) -> i64 {
 	let thread = current_thread!();
+	// ONE FLAG, AND AN UNKNOWN BIT IS A REFUSAL rather than ignored: a caller that asked for something this kernel
+	// does not do would otherwise get a buffer that does not have it.
+	if flags & !abi::DMA_BUFFER_BELOW_4G != 0 {
+		return ERR_INVALID;
+	}
+	let address_bits: u32 = if flags & abi::DMA_BUFFER_BELOW_4G != 0 { 32 } else { 64 };
 	// THE CLAIM COMES WITH THE DEVICE CAPABILITY, which is the point of putting it there: the caller
 	// names a `DeviceMemory` it holds, and the kernel reads BOTH which device this buffer is for and
 	// which binding of it - so ending that binding reaches this buffer without anything having to
@@ -787,7 +798,7 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	// a reclaim during this call installed the translation in the REPLACEMENT binding's domain - and
 	// `register_derived` then refused the old generation, after the effect. The generation is now
 	// part of the request, and `iommu::map_device_buffer` refuses on it before anything is mapped.
-	let object = match DmaBuffer::create_for(thread.domain(), size as usize, claim) {
+	let object = match DmaBuffer::create_within(thread.domain(), size as usize, claim, address_bits) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
@@ -2258,9 +2269,10 @@ fn platform_mmio_acquire(claim_handle: u64, which: u64) -> i64 {
 	thread.handles().lock().insert_reserved(Capability::new(memory as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)).raw() as i64
 }
 
-// ONE WIRED LINE OF A CLAIMED PLATFORM ROW, as an `Interrupt` bound to it on its controller - configured, routed
-// to the boot core and enabled - and derived from the claim, so the release masks the line and gives its vector
-// back. A line the architecture refuses is said, with the row and the reason.
+// ONE WIRED LINE OF A CLAIMED ROW, as an `Interrupt` bound to it on its controller - configured, routed to the boot
+// core and enabled - and derived from the claim, so the release masks the line and gives its vector back. A
+// platform row's lines are the firmware's; a PCI function's row has one, its INTx, whose pin is turned on here and
+// off by the release. A line the architecture refuses is said, with the row and the reason.
 fn platform_line_acquire(claim_handle: u64, which: u64) -> i64 {
 	let thread = current_thread!();
 	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
@@ -2271,7 +2283,7 @@ fn platform_line_acquire(claim_handle: u64, which: u64) -> i64 {
 		return ERR_ACCESS_DENIED;
 	}
 	let key = claim.key();
-	let Some(line) = device::platform_line(key.device_index as usize, which) else { return ERR_INVALID };
+	let Some((line, function)) = device::row_line(key.device_index as usize, which) else { return ERR_INVALID };
 	if !thread.handles().lock().reserve(1) {
 		return ERR_RESOURCE_EXHAUSTED;
 	}
@@ -2288,6 +2300,16 @@ fn platform_line_acquire(claim_handle: u64, which: u64) -> i64 {
 	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>))) {
 		thread.handles().lock().release_reservation(1);
 		return ERR_ACCESS_DENIED;
+	}
+	// THE FUNCTION'S PIN, ON ONLY WHILE ITS BINDING IS CURRENT: a release that ran since the registration has turned
+	// it off already and revoked the line, and a pin turned on after that would assert a line nothing holds for it.
+	if let Some((bus, dev, func)) = function {
+		arch::pci::set_intx_disabled(bus, dev, func, false);
+		if !device::claim_is_current(key) {
+			arch::pci::set_intx_disabled(bus, dev, func, true);
+			thread.handles().lock().release_reservation(1);
+			return ERR_ACCESS_DENIED;
+		}
 	}
 	thread.handles().lock().insert_reserved(Capability::new(interrupt as alloc::sync::Arc<dyn KernelObject>, Rights::ALL)).raw() as i64
 }
@@ -2425,7 +2447,7 @@ fn sys_interrupt_ack(handle: u64) -> i64 {
 	// re-fire in the meantime; the driver saying it is done is what unmasks it. Only while this object owns the
 	// binding: a revoked one's vector may be another claim's line by now.
 	if interrupt.owns_binding() {
-		arch::interrupts::acknowledge(interrupt.vector());
+		arch::interrupts::acknowledge(interrupt.vector(), interrupt.owner());
 	}
 	0
 }
@@ -2647,6 +2669,108 @@ fn sys_balloon_give(handle: u64, in_ptr: u64, count: u64) -> i64 {
 		Ok(given) => given as i64,
 		Err(_) => ERR_INVALID,
 	}
+}
+
+// THE REGION OF PLUGGED MEMORY a virtio-mem device offers, for the caller holding that device's DeviceMemory capability:
+// [base, base + size) in blocks of `block`, laid over nothing the machine has - no region of the memory map, of whatever
+// kind, and no device's window.
+fn sys_memory_plug_region(device_handle: u64, base: u64, size: u64, block: u64) -> i64 {
+	let thread = current_thread!();
+	let memory = match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::WRITE) {
+		Ok(memory) => memory,
+		Err(error) => return error,
+	};
+	let Some(key) = memory.claim() else { return ERR_ACCESS_DENIED };
+	if device::claim_stamp(key).is_none() {
+		return ERR_ACCESS_DENIED;
+	}
+	let mem_device = device::with(key.device_index as usize, |entry| entry.platform.is_none() && entry.transport == abi::TRANSPORT_VIRTIO_PCI && u32::from(entry.device_type) == abi::VIRTIO_TYPE_MEM).unwrap_or(false);
+	if !mem_device {
+		return ERR_ACCESS_DENIED;
+	}
+	let mut taken: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+	for index in 0..crate::mem::memmap_len() {
+		if let Some(region) = crate::mem::memmap_get(index) {
+			if taken.try_reserve(1).is_err() {
+				return ERR_NO_MEMORY;
+			}
+			taken.push((region.base, region.length));
+		}
+	}
+	let mut short = false;
+	device::windows(&mut |window_base, len| {
+		if taken.try_reserve(1).is_err() {
+			short = true;
+			return;
+		}
+		taken.push((window_base, len));
+	});
+	if short {
+		return ERR_NO_MEMORY;
+	}
+	let index = match crate::mem::hotplug::register(base, size, block, &taken) {
+		Ok(index) => index,
+		Err(crate::mem::hotplug::Refusal::Unsupported) => return ERR_UNSUPPORTED,
+		Err(crate::mem::hotplug::Refusal::NoMemory) => return ERR_NO_MEMORY,
+		Err(crate::mem::hotplug::Refusal::TooMany) => return ERR_RESOURCE_EXHAUSTED,
+		Err(_) => return ERR_INVALID,
+	};
+	let Some(object) = PlugRegion::new(index) else { return ERR_NO_MEMORY };
+	let capability = Capability::new(object.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::ALL);
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(object.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	install_capability(&thread, capability)
+}
+
+// BLOCKS [first, first + count) ONLINE or OFFLINE. Offline answers ERR_WOULD_BLOCK, and changes nothing, while a frame of
+// them is held.
+fn sys_memory_plug_change(handle: u64, first: u64, count: u64, online: bool) -> i64 {
+	let region = match current_typed::<PlugRegion>(handle, ObjectType::PlugRegion, Rights::WRITE) {
+		Ok(region) => region,
+		Err(error) => return error,
+	};
+	let (Ok(first), Ok(count)) = (usize::try_from(first), usize::try_from(count)) else { return ERR_INVALID };
+	let changed = if online { crate::mem::hotplug::online(region.index(), first, count) } else { crate::mem::hotplug::offline(region.index(), first, count) };
+	match changed {
+		Ok(()) => 0,
+		Err(crate::mem::hotplug::Refusal::Busy) => ERR_WOULD_BLOCK,
+		#[cfg(target_arch = "x86_64")]
+		Err(crate::mem::hotplug::Refusal::Mapping) => ERR_NO_MEMORY,
+		Err(crate::mem::hotplug::Refusal::NoMemory) => ERR_NO_MEMORY,
+		Err(crate::mem::hotplug::Refusal::Unsupported) => ERR_UNSUPPORTED,
+		Err(_) => ERR_INVALID,
+	}
+}
+
+// WHICH BLOCKS ARE ONLINE, one byte a block at `out_ptr`, at most `out_len` and at most 32768 of them: the block count.
+fn sys_memory_plug_state(handle: u64, out_ptr: u64, out_len: u64) -> i64 {
+	const MOST: usize = 32768;
+	let region = match current_typed::<PlugRegion>(handle, ObjectType::PlugRegion, Rights::READ) {
+		Ok(region) => region,
+		Err(error) => return error,
+	};
+	let mut states: alloc::vec::Vec<bool> = alloc::vec::Vec::new();
+	if states.try_reserve_exact(MOST).is_err() {
+		return ERR_NO_MEMORY;
+	}
+	states.resize(MOST, false);
+	let Some(blocks) = crate::mem::hotplug::state(region.index(), &mut states) else { return ERR_INVALID };
+	let len = blocks.min(MOST).min(out_len as usize);
+	if len != 0 {
+		if !user_buf_ok(out_ptr, len as u64) {
+			return ERR_INVALID;
+		}
+		let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		if bytes.try_reserve_exact(len).is_err() {
+			return ERR_NO_MEMORY;
+		}
+		bytes.extend(states[..len].iter().map(|online| u8::from(*online)));
+		if let Err(error) = copy_to_user_exact(out_ptr, bytes.as_ptr(), len) {
+			return error;
+		}
+	}
+	blocks as i64
 }
 
 fn sys_latency_request(privilege: u64, bound_us: u64) -> i64 {

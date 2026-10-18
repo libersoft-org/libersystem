@@ -268,15 +268,28 @@ pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) ->
 pub fn arm_slot_interrupt(port: &common::HotPlugPort, handler: crate::arch::interrupts::HandlerFn) -> Option<u32> {
 	let line: u8 = common::slot_interrupt_line::<Access>(port)?;
 	common::set_intx_disabled::<Access>(port.bus, port.dev, port.func, false);
-	crate::arch::interrupts::register(crate::arch::interrupts::IRQ_BASE as u32 + line as u32, handler);
-	// LEVEL-TRIGGERED AND ACTIVE-LOW, WHICH IS WHAT AN INTx PIN IS. This routed the ISA defaults,
-	// and the comment on `settle_hot_plug` already named the consequence without connecting it to
-	// the cause: "a level-triggered line one handler already cleared" is a line whose EDGE nobody
-	// saw. Every event this path reports is acknowledged inside the handler - `poll_slots` writes
-	// the slot's sticky bits back before it returns - so the source is clear before the EOI, which
-	// is the condition a level entry needs.
-	crate::arch::ioapic::route(line as u32, crate::arch::interrupts::IRQ_BASE + line, crate::smp::lapic_id(0), crate::arch::ioapic::Kind::LevelLow);
+	// LEVEL-TRIGGERED, WHICH IS WHAT AN INTx PIN IS, with the polarity the MADT gives the IRQ the firmware routed it
+	// to - the one wiring a claimed PCI function on the same IRQ is bound with, since the firmware puts every
+	// function on one of a few, and a USB controller with no MSI shares this line with the port. Every event this
+	// path reports is acknowledged inside the handler - `poll_slots` writes the slot's sticky bits back before it
+	// returns - so the port's source is clear before the EOI, which is the condition a level entry needs.
+	let wiring = crate::arch::platform::pci_intx_line(line);
+	if !crate::arch::interrupts::route_shared_kernel_line(&wiring, handler) {
+		return None;
+	}
 	Some(line as u32)
+}
+
+// A PCI FUNCTION'S OWN INTx LINE, for a claim of its row: its pin's, by the ISA IRQ the firmware wrote in its
+// interrupt-line register. None for a function with no pin, or one the firmware routed nowhere (0xff, or past the
+// sixteen ISA IRQs a line register can name).
+pub fn intx_line(bus: u8, dev: u8, func: u8) -> Option<abi::WiredLine> {
+	let word = <Access as common::ConfigAccess>::read32(bus, dev, func, 0x3c);
+	let (pin, line) = ((word >> 8) as u8, word as u8);
+	if !(1..=4).contains(&pin) || line >= 16 {
+		return None;
+	}
+	Some(crate::arch::platform::pci_intx_line(line))
 }
 
 // A function's interrupt pin and line bytes (config 0x3D and 0x3C) - for the suite's claimed-line test, which

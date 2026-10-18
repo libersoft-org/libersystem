@@ -479,6 +479,26 @@ pub fn count() -> usize {
 	DEVICES.lock().len()
 }
 
+// EVERY WINDOW A DEVICE DECODES: each PCI function's BAR, each platform row's MMIO, and every BAR and bridge window the bus
+// scan recorded - what plugged memory may not be laid over.
+pub fn windows(out: &mut dyn FnMut(u64, u64)) {
+	{
+		let table = DEVICES.lock();
+		for entry in table.iter() {
+			match entry.platform.as_ref() {
+				Some(row) => {
+					for range in row.part.mmio() {
+						out(range.base, range.len);
+					}
+				}
+				None if entry.bar_len != 0 => out(entry.bar_phys, entry.bar_len),
+				None => {}
+			}
+		}
+	}
+	crate::firmware::decoded_ranges(out);
+}
+
 /// The channel the kernel reports bus arrivals and departures on, or `None` until one is registered.
 ///
 /// A NOTIFICATION AND NOT A POLL. The inventory was built once at boot and nothing could change it,
@@ -797,9 +817,30 @@ pub fn platform_mmio(index: usize, which: u64) -> Option<(u64, u64)> {
 	.flatten()
 }
 
-// Wired line `which` of a platform row.
+// Wired line `which` of a platform row - the suite's question; a claim asks `row_line`.
+#[cfg(test)]
 pub fn platform_line(index: usize, which: u64) -> Option<abi::WiredLine> {
 	with(index, |entry| entry.platform.as_ref()?.part.lines().get(which as usize).copied()).flatten()
+}
+
+// WIRED LINE `which` OF ANY ROW: a platform row's own, or - line 0 of a PCI function's row - the function's INTx,
+// with the function it belongs to, whose pin the claim turns on. A controller with no MSI has no other interrupt.
+// The pin and line registers are read outside the table's lock, since a config access is a bus transaction.
+pub fn row_line(index: usize, which: u64) -> Option<(abi::WiredLine, Option<(u8, u8, u8)>)> {
+	enum Row {
+		Platform(Option<abi::WiredLine>),
+		Function(u8, u8, u8),
+	}
+	let row = with(index, |entry| match entry.platform.as_ref() {
+		Some(row) => Some(Row::Platform(row.part.lines().get(which as usize).copied())),
+		None if which == 0 && entry.has_config_space() => Some(Row::Function(entry.bus, entry.dev, entry.func)),
+		None => None,
+	})
+	.flatten()?;
+	match row {
+		Row::Platform(line) => line.map(|line| (line, None)),
+		Row::Function(bus, dev, func) => crate::arch::pci::intx_line(bus, dev, func).map(|line| (line, Some((bus, dev, func)))),
+	}
 }
 
 // A platform row's property block, copied into `out` as far as it fits; its whole length, or None for a
@@ -1477,6 +1518,7 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	with(index, |entry| {
 		bus_master(entry, false);
 		msix_off(entry);
+		intx_off(entry);
 		if entry.has_io_bar() {
 			io_decode(entry, false);
 		}
@@ -1754,6 +1796,15 @@ fn msix_off(entry: &DeviceEntry) {
 		return;
 	}
 	crate::arch::pci::msix_disable(entry.bus, entry.dev, entry.func, entry.msix_cap);
+}
+
+// AND ITS INTx PIN, which a claim that bound the function's line turned on - and which every function's starts
+// with off, so this is the state it is handed to the next binding in. A row with no config space has no pin.
+fn intx_off(entry: &DeviceEntry) {
+	if !entry.has_config_space() {
+		return;
+	}
+	crate::arch::pci::set_intx_disabled(entry.bus, entry.dev, entry.func, true);
 }
 
 // Let the device at `index` master the bus, or stop it.

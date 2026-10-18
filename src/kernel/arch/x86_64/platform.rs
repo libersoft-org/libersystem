@@ -188,22 +188,20 @@ fn isa_line(madt: Option<&acpi::Madt<'_>>, irq: u8) -> abi::WiredLine {
 	abi::WiredLine { number: gsi, trigger: if level { abi::LINE_TRIGGER_LEVEL } else { abi::LINE_TRIGGER_EDGE }, polarity: if low { abi::LINE_POLARITY_LOW } else { abi::LINE_POLARITY_HIGH }, controller: abi::LINE_CONTROLLER_IOAPIC, _pad: 0 }
 }
 
-// An ISA IRQ's wired line on this machine, and a PCI function's INTx line by the ISA IRQ its firmware wrote in
-// its interrupt-line register - LEVEL, active low unless the MADT's override for that IRQ says high - for the
-// suite, which claims both as platform rows' lines.
-#[cfg(test)]
-fn test_madt() -> Option<acpi::Madt<'static>> {
+// An ISA IRQ's wired line on this machine, for the suite, and a PCI function's INTx line by the ISA IRQ its
+// firmware wrote in its interrupt-line register - LEVEL, active low unless the MADT's override for that IRQ says
+// high - for a PCI function's claim and a hot-plug port alike.
+fn madt() -> Option<acpi::Madt<'static>> {
 	crate::smp::acpi_table(crate::boot_info().rsdp, b"APIC").and_then(|bytes| acpi::Madt::new(bytes).ok())
 }
 
 #[cfg(test)]
 pub fn isa_irq_line(irq: u8) -> abi::WiredLine {
-	isa_line(test_madt().as_ref(), irq)
+	isa_line(madt().as_ref(), irq)
 }
 
-#[cfg(test)]
 pub fn pci_intx_line(irq: u8) -> abi::WiredLine {
-	let over = test_madt().and_then(|madt| madt.isa_override(irq));
+	let over = madt().and_then(|madt| madt.isa_override(irq));
 	let high = over.is_some_and(|over| over.polarity == acpi::Polarity::ActiveHigh);
 	abi::WiredLine { number: over.map_or(u32::from(irq), |over| over.gsi), trigger: abi::LINE_TRIGGER_LEVEL, polarity: if high { abi::LINE_POLARITY_HIGH } else { abi::LINE_POLARITY_LOW }, controller: abi::LINE_CONTROLLER_IOAPIC, _pad: 0 }
 }

@@ -155,6 +155,9 @@ pub mod fuse;
 // The memory balloon's decisions: a step toward the smaller of the host's target and the allowance, the frame numbers
 // the host is told and the statistics it is answered - the parts of the virtio-balloon driver a host can test.
 pub mod balloon;
+// virtio-mem's wire and decisions: the requests, the configuration and which blocks one step plugs or offers back - the
+// parts of the virtio-mem driver a host can test.
+pub mod memplug;
 pub mod sdhci;
 pub mod serial_port;
 // THE 16550 REGISTER ENGINE, apart from where the UART is and what clocks it - the console UART's driver is the
@@ -171,9 +174,15 @@ pub mod wdat;
 pub mod uac;
 pub mod uas;
 pub mod usb;
+// SCSI over the Bulk-Only Transport above any host controller: the transaction, its recovery and the block wire.
+pub mod usb_bot;
 // The in-controller class-module execution model: what a USB class driver IS in this system, and the
 // per-class budget that stops two of them inside one Domain from starving each other.
 pub mod usb_class;
+// THE USB CORE ABOVE ONE HOST-CONTROLLER INTERFACE, which EHCI, OHCI and UHCI implement; and the HID binding every
+// controller's driver runs.
+pub mod usb_host;
+pub mod usb_input;
 // ONE CONFIGURATION DESCRIPTOR READ ONCE INTO ITS INTERFACE SETTINGS, which every service-backed class binder
 // reads instead of walking the records itself.
 pub mod usb_function;

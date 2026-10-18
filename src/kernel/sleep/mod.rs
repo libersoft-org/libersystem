@@ -224,6 +224,12 @@ pub fn sys_system_sleep(domain: &alloc::sync::Arc<crate::object::domain::Domain>
 			_ => return Err(ERR_INVALID),
 		},
 	};
+	// AN IMAGE CARRIES WHAT THE MEMORY MAP NAMES, and plugged memory is not in it: a hibernation with plugged memory online
+	// would restore a machine missing what its programs held there, so it is refused until the host takes it back.
+	if matches!(state, abi::SLEEP_STATE_DISK | abi::SLEEP_STATE_DISK_ENTER) && crate::mem::hotplug::totals().0 != 0 {
+		crate::serial_println!("sleep: not entered - plugged memory is online, and an image would not carry it");
+		return Err(ERR_INVALID);
+	}
 	match state {
 		abi::SLEEP_STATE_IDLE => suspend_to_idle(after),
 		abi::SLEEP_STATE_RAM => arch::sleep::suspend_to_ram(after),

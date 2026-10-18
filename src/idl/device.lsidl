@@ -384,6 +384,9 @@ enum provider-kind {
 	/// A MEMORY BALLOON - `liber:balloon-device@1`'s `balloon-device` contract: what a virtual machine's host asks to
 	/// have back and the allowance granted against it - which ResourceManager alone consumes.
 	memory-balloon = 35,
+	/// PLUGGED MEMORY - `liber:hotplug-device@1`'s `hotplug-device` contract: memory a virtual machine's host plugs in
+	/// and may ask back, and the allowance granted for it - which ResourceManager alone consumes.
+	memory-hotplug = 36,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

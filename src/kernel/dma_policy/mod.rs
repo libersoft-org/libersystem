@@ -59,13 +59,19 @@ include!(concat!(env!("OUT_DIR"), "/dma_registry.rs"));
 //
 // AND THE PLATFORM ROWS THE SUITE PUBLISHES, which answer to the hardware id `LSKT0001` and to nothing a real
 // machine describes. A platform claim masters nothing, so its entry declares `none`.
+//
+// AND `edu` ONCE MORE, as a function whose INTx a claim binds - the platform-row suite's PCI-row line case. That
+// claim masters nothing, so it is `none` and is admitted on a machine with no IOMMU, where the fixture's own entry
+// is refused.
 #[cfg(test)]
-const TEST_ENTRIES: [DmaEntry; 5] = [
+const TEST_ENTRIES: [DmaEntry; 6] = [
 	DmaEntry { name: b"synthetic-trusted", policy: abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8, rules: &[SYNTHETIC_RULE] },
 	DmaEntry { name: b"synthetic-none", policy: abi::DMA_POLICY_NONE as u8, rules: &[SYNTHETIC_RULE] },
 	DmaEntry { name: b"synthetic-protected", policy: abi::DMA_POLICY_IOMMU_REQUIRED as u8, rules: &[SYNTHETIC_RULE] },
 	DmaEntry { name: b"edu-fixture", policy: abi::DMA_POLICY_IOMMU_REQUIRED as u8, rules: &[EDU_RULE] },
 	DmaEntry { name: b"synthetic-platform", policy: abi::DMA_POLICY_NONE as u8, rules: &[SYNTHETIC_PLATFORM_RULE] },
+	// LAST, so the fixture's own entry stays the one a claim by identity resolves to.
+	DmaEntry { name: b"edu-line", policy: abi::DMA_POLICY_NONE as u8, rules: &[EDU_RULE] },
 ];
 
 // The hardware id every platform row the suite publishes carries.

@@ -15,6 +15,10 @@
 //   hidcheck malformed  the touchscreen bound again over a descriptor the gate made malformed: the binding fails,
 //                       and nothing is published for it
 //   hidcheck ring       one view of the pointer ring - a second client's answer beside a phase that is watching
+//   hidcheck usb keys|pointer|wait
+//                       the USB legacy gate's: every key event a focused surface's stream carries, or every position the
+//                       pointer moves to, printed as it arrives after the cue - the gate types and moves through one
+//                       controller's device at a time - and a cued pause the gate plugs and unplugs a device in
 //
 // AND THE INPUT FIGURES, which are a measurement and no gate's - the driver roadmap's integration item records them:
 //
@@ -470,6 +474,59 @@ fn rate_keys(display: u64, input_client: u64) {
 	close(stream);
 }
 
+// THE USB LEGACY GATE'S KEYS: a focused surface's key stream, cued, and every key event it carries within the window
+// printed as it arrives - `key 0x04 down` - until the window passes or the stream has been quiet for two seconds after
+// its first event. The gate types through one controller's keyboard at a time and reads which usages came back.
+fn usb_keys(display: u64, input_client: u64) {
+	let (_held, proof) = focused(display);
+	let Some(stream) = input::Client::new(ChannelTransport { chan: input_client }).subscribe_keys(&proof) else { fail(b"usb keys: the key stream was refused to a focused surface") };
+	say(b"usb keys - type now");
+	let mut buf = [0u8; 64];
+	let deadline = clock() + WINDOW_TICKS;
+	let mut count = 0u32;
+	let mut quiet_until = deadline;
+	loop {
+		match recv_caps_deadline(stream, &mut buf, quiet_until.min(deadline)) {
+			DeadlineCaps::Message { len, mut handles } => {
+				if let Some(event) = input::subscribe_keys_read(&buf[..len], &mut handles) {
+					count += 1;
+					say(format!("key {:#04x} {}", event.code, if event.pressed { "down" } else { "up" }).as_bytes());
+					quiet_until = clock() + 2 * TICKS;
+				}
+				for &handle in handles.as_slice() {
+					close(handle);
+				}
+			}
+			DeadlineCaps::TimedOut => break,
+			DeadlineCaps::Closed => fail(b"usb keys: the key stream closed"),
+		}
+	}
+	say(format!("usb keys: {count} event(s)").as_bytes());
+	close(stream);
+}
+
+// AND ITS POINTER: the ring watched for the window after the cue, and every position it moves to printed once -
+// `pointer 412,300` - until it has been still for two seconds after it first moved.
+fn usb_pointer(input_client: u64) {
+	let mut seen: Vec<(u16, u16)> = snapshot(input_client).iter().map(|&(col, row, _)| (col, row)).collect();
+	say(b"usb pointer - move now");
+	let deadline = clock() + WINDOW_TICKS;
+	let mut moved = 0u32;
+	let mut quiet_until = deadline;
+	while clock() < deadline.min(quiet_until) {
+		sleep_until(clock() + TICKS / 5);
+		for (col, row, _) in snapshot(input_client) {
+			if !seen.contains(&(col, row)) {
+				seen.push((col, row));
+				moved += 1;
+				say(format!("pointer {col},{row}").as_bytes());
+				quiet_until = clock() + 2 * TICKS;
+			}
+		}
+	}
+	say(format!("usb pointer: {moved} position(s)").as_bytes());
+}
+
 // THE POINTER, as its one client API gives it: a snapshot of the last thirty-two events InputService mapped. So the host
 // NUMBERS ITS MOVES BY WHERE THEY LAND - the stream's move n at column n mod 80 of row n / 80, the cued rounds on the
 // last row alone - and an event is counted once by its position, whichever snapshot it was seen in. A snapshot a tick
@@ -592,6 +649,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			rate_pointer(input_client, display, focus);
 			exit();
 		}
+		(b"usb", b"keys") => {
+			usb_keys(display, input_client);
+			exit();
+		}
+		(b"usb", b"pointer") => {
+			usb_pointer(input_client);
+			exit();
+		}
+		// A PAUSE THE GATE ACTS IN: cued, and ten seconds for a device to be plugged or unplugged and bound or let go.
+		(b"usb", b"wait") => {
+			say(b"usb wait - act now");
+			sleep_until(clock() + 10 * TICKS);
+			say(b"usb waited");
+			exit();
+		}
 		_ => {}
 	}
 	let held = focus(display, input_client);
@@ -599,7 +671,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		b"watch" => verdict(b"watch", watch(input_client, &held, b"watching - raise the reports now")),
 		b"storm" => verdict(b"storm", watch(input_client, &held, b"hold the lines now, then raise the reports")),
 		b"cycle" => cycle(device_client, policy, input_client, &held),
-		_ => fail(b"usage: hidcheck watch | storm | cycle | malformed | ring | route virtio|usb | rate keys|pointer [focused]"),
+		_ => fail(b"usage: hidcheck watch | storm | cycle | malformed | ring | route virtio|usb | rate keys|pointer [focused] | usb keys|pointer|wait"),
 	}
 	exit();
 }

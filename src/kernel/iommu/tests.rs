@@ -324,12 +324,12 @@ fn a_buffer_from_a_previous_binding_is_not_mapped_into_the_next_one() {
 
 	// THE NEXT BINDING'S NUMBER, AND THE ONE BEFORE IT. Neither is this domain's, and a mapping for
 	// either would be one generation reaching into another's address space.
-	assert_eq!(map_device_buffer(index as u32, BINDING + 1, sentinel.physical, 0x1000), Err(dma::Fault::StaleGeneration), "a later binding's number mapped into this binding's domain");
-	assert_eq!(map_device_buffer(index as u32, BINDING - 1, sentinel.physical, 0x1000), Err(dma::Fault::StaleGeneration), "an earlier binding's number mapped into this binding's domain");
+	assert_eq!(map_device_buffer(index as u32, BINDING + 1, sentinel.physical, 0x1000, 64), Err(dma::Fault::StaleGeneration), "a later binding's number mapped into this binding's domain");
+	assert_eq!(map_device_buffer(index as u32, BINDING - 1, sentinel.physical, 0x1000, 64), Err(dma::Fault::StaleGeneration), "an earlier binding's number mapped into this binding's domain");
 
 	// AND THE BINDING'S OWN NUMBER STILL WORKS, so the refusal above is arithmetic on the generation
 	// rather than a mapping path that stopped working.
-	let mapped = map_device_buffer(index as u32, BINDING, sentinel.physical, 0x1000).expect("the binding's own generation maps");
+	let mapped = map_device_buffer(index as u32, BINDING, sentinel.physical, 0x1000, 64).expect("the binding's own generation maps");
 	let (mapping, _) = mapped.expect("the fixture is translated, so the map answers with one");
 	let _ = unmap_for_device(mapping);
 	assert!(detach_for(index, edu.bus, edu.dev, edu.func), "the fixture's endpoint detaches");
@@ -371,7 +371,7 @@ fn a_translated_address_stops_translating_when_its_claim_is_forced_to_end() {
 	// and the release is the production forced one rather than a detach called by hand.
 	let key = crate::device::claim(index, &crate::tests::entry_for_device(index as u64).unwrap_or([0; abi::ENTRY_NAME_LEN])).expect("the fixture's function is claimable");
 	assert!(attach_for(index, edu.bus, edu.dev, edu.func, key.generation), "the fixture's endpoint attaches under its claim");
-	let (mapping, iova) = map_device_buffer(index as u32, key.generation, sentinel.physical, 0x1000).expect("the binding's own generation maps").expect("the fixture is translated, so the map answers with an address");
+	let (mapping, iova) = map_device_buffer(index as u32, key.generation, sentinel.physical, 0x1000, 64).expect("the binding's own generation maps").expect("the fixture is translated, so the map answers with an address");
 
 	// AND IT WORKS FIRST, which is what makes everything after it a claim about a revocation rather
 	// than about an address that never resolved. The device is told to write its buffer into RAM at

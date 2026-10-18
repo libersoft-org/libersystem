@@ -241,6 +241,8 @@ pub enum ProviderKindName {
 	HostShare,
 	/// A virtual machine's memory balloon, with ResourceManager its one consumer.
 	MemoryBalloon,
+	/// A virtual machine's plugged memory, with ResourceManager its one consumer.
+	MemoryHotplug,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -302,6 +304,7 @@ impl ProviderKindName {
 			ProviderKindName::Crypto => 33,
 			ProviderKindName::HostShare => 34,
 			ProviderKindName::MemoryBalloon => 35,
+			ProviderKindName::MemoryHotplug => 36,
 		}
 	}
 }

@@ -19,6 +19,8 @@ pub mod latency_request;
 // Free frames held for a virtual machine's host. See `balloon`.
 pub mod balloon;
 pub mod memory_object;
+// A region of memory a host plugs in. See `plug_region`.
+pub mod plug_region;
 pub mod port_range;
 pub mod privilege;
 pub mod registers;
@@ -78,6 +80,8 @@ pub enum ObjectType {
 	LatencyRequest,
 	// Free frames held for a virtual machine's host. See `balloon`.
 	Balloon,
+	// A region of memory a host plugs in. See `plug_region`.
+	PlugRegion,
 }
 
 impl ObjectType {
@@ -107,6 +111,7 @@ impl ObjectType {
 			ObjectType::Registers => abi::OBJECT_TYPE_REGISTERS,
 			ObjectType::LatencyRequest => abi::OBJECT_TYPE_LATENCY_REQUEST,
 			ObjectType::Balloon => abi::OBJECT_TYPE_BALLOON,
+			ObjectType::PlugRegion => abi::OBJECT_TYPE_PLUG_REGION,
 		}
 	}
 }

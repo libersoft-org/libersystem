@@ -5776,3 +5776,27 @@ fn a_balloon_is_minted_for_the_balloon_device_alone_and_gives_everything_back_wi
 	assert!(DONE.load(Ordering::SeqCst), "the balloon test's thread ran to its end");
 	crate::serial_println!("balloon: minted for the balloon's binding alone, a batch of 256 taken from free memory, a wrong give refused whole, and every frame back with the last handle");
 }
+
+// ------------------------------------------------------------------------ plugged memory
+tagged_test!(a_plug_region_is_minted_for_a_virtio_mem_device_alone, [Drivers, Memory, Pci], id = "kernel.hardware.a_plug_region_is_minted_for_a_virtio_mem_device_alone", covers = ["kernel"]);
+// THE AUTHORITY: the plugged memory a host offers is the virtio-mem device's binding's to bring online, and another
+// device's window names no region at all. What the regions do is `mem::hotplug`'s suite; a host plugging blocks in is
+// the memory-hotplug gate's.
+fn a_plug_region_is_minted_for_a_virtio_mem_device_alone() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_: u64) {
+		let invoke = |number: u64, a0: u64, a1: u64, a2: u64, a3: u64| unsafe { arch::syscall::invoke(number, a0, a1, a2, a3) } as i64;
+		let rng = (0..device::count()).find(|&index| device::with(index, |entry| entry.platform.is_none() && entry.transport == abi::TRANSPORT_VIRTIO_PCI && u32::from(entry.device_type) == abi::VIRTIO_TYPE_RNG).unwrap_or(false)).expect("the test machine has an entropy source");
+		let grant = crate::tests::claim_device(rng as u64).expect("claimed under the entry that declares it");
+		assert_eq!(invoke(abi::SYS_MEMORY_PLUG_REGION, grant.memory, 0x40_0000_0000, 4 << 20, 2 << 20), abi::ERR_ACCESS_DENIED, "another device's window is no authority over plugged memory");
+		assert!(invoke(abi::SYS_MEMORY_PLUG_REGION, 0, 0x40_0000_0000, 4 << 20, 2 << 20) < 0, "and no window none");
+		assert!(invoke(abi::SYS_MEMORY_PLUG_ONLINE, grant.memory, 0, 1, 0) < 0, "a device window is no region");
+		crate::tests::release_device(&grant);
+		DONE.store(true, Ordering::SeqCst);
+	}
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the plug-region test's thread ran to its end");
+}

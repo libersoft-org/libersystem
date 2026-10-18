@@ -226,7 +226,7 @@ pub(super) fn release_wired_inactive(intr: Arc<Interrupt>, target: u32) {
 	};
 	if intr.disown() {
 		crate::sleep::mark_wake(intr.vector(), false);
-		if unbind(intr.vector())
+		if unbind(intr.vector(), intr.owner())
 			&& let Some(base) = super::aplic::domain()
 		{
 			unsafe { super::aplic::restore_inactive_target(base, source, target) };
@@ -262,7 +262,9 @@ pub fn signal_line(eid: u32) -> bool {
 
 // THE DRIVER ACKNOWLEDGED: a level line disabled when it fired is enabled again, and asked for again in case it
 // is still asserted - see `aplic::unmask_source`.
-pub fn acknowledge(vector: u32) {
+// `owner` names the acknowledging Interrupt; a line here has one holder, so it is not consulted (shared level
+// lines are x86_64's - see its `Line`).
+pub fn acknowledge(vector: u32, _owner: usize) {
 	let Some(at) = line_slot(vector) else { return };
 	if let LineSlot::Held(line) = &*LINES[at].lock()
 		&& line.level
@@ -286,7 +288,7 @@ pub fn acknowledge(vector: u32) {
 // unconfirmed branch quarantines rather than retires. The answer is reported so a claim's terminal
 // state can include it, instead of being decided by the IOMMU alone while a still-armed vector is
 // charged to the claim.
-pub fn unbind(vector: u32) -> bool {
+pub fn unbind(vector: u32, _owner: usize) -> bool {
 	// A CLAIMED WIRED LINE: its source disarmed, then its identity disabled where it was enabled - outside the
 	// slot's lock, since the owning hart may be in `signal_line` for this very slot and must be able to take it
 	// to reach its mailbox - and only then the slot given back. An unanswered disable strands it.

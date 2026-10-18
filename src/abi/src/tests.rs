@@ -228,6 +228,11 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_BALLOON_CREATE, 130),
 	(SYS_BALLOON_TAKE, 131),
 	(SYS_BALLOON_GIVE, 132),
+	// PLUGGED MEMORY'S FOUR.
+	(SYS_MEMORY_PLUG_REGION, 133),
+	(SYS_MEMORY_PLUG_ONLINE, 134),
+	(SYS_MEMORY_PLUG_OFFLINE, 135),
+	(SYS_MEMORY_PLUG_STATE, 136),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -400,6 +405,7 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(OBJECT_TYPE_REGISTERS, 17),
 		(OBJECT_TYPE_LATENCY_REQUEST, 18),
 		(OBJECT_TYPE_BALLOON, 19),
+		(OBJECT_TYPE_PLUG_REGION, 20),
 	];
 	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
 	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.

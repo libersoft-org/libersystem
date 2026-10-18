@@ -16,6 +16,7 @@ pub use event_proto::generated::liber::event;
 pub use font_proto::generated::liber::font;
 pub use gpio_device_proto::generated::liber::gpio_device;
 pub use graphics_proto::generated::liber::graphics;
+pub use hotplug_device_proto::generated::liber::hotplug_device;
 pub use i2c_device_proto::generated::liber::i2c_device;
 pub use import_proto::generated::liber::import;
 pub use input_proto::generated::liber::input;

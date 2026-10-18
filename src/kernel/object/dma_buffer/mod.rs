@@ -215,7 +215,15 @@ impl DmaBuffer {
 	// the replacement binding's domain there, so the mapping went into a domain the caller had no
 	// authority over and the stale-generation refusal that followed came after the effect. The
 	// generation travels with the request and `iommu::map_device_buffer` refuses on it.
+	#[cfg(test)]
 	pub fn create_for(domain: &Arc<Domain>, size: usize, claim: Option<abi::ClaimKey>) -> Result<Arc<Self>, MemoryError> {
+		Self::create_within(domain, size, claim, 64)
+	}
+
+	// THE SAME, FOR A DEVICE THAT NAMES `address_bits` OF ADDRESS: its frames below that ceiling, and - where the
+	// device is translated - its device address too, since a 32-bit engine handed an IOVA above 4 GiB names
+	// something else. 64 is no ceiling.
+	pub fn create_within(domain: &Arc<Domain>, size: usize, claim: Option<abi::ClaimKey>, address_bits: u32) -> Result<Arc<Self>, MemoryError> {
 		let device = claim.map(|key| key.device_index);
 		let generation = claim.map_or(0, |key| key.generation);
 		// A ceiling and checked arithmetic, for the reason `MemoryObject::create_in` has them: the
@@ -230,7 +238,9 @@ impl DmaBuffer {
 		if !domain.try_charge_dma(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
-		let base = match frame::allocate_contiguous(pages) {
+		let ceiling: u64 = if address_bits >= 64 { u64::MAX } else { 1u64 << address_bits };
+		let taken = if ceiling == u64::MAX { frame::allocate_contiguous(pages) } else { frame::allocate_contiguous_below(pages, ceiling) };
+		let base = match taken {
 			Some(b) => b,
 			None => {
 				domain.uncharge_dma(bytes);
@@ -264,7 +274,7 @@ impl DmaBuffer {
 		// stated rather than dressed up: narrowing it needs the create syscall to say which way the
 		// buffer is used, which the protected endpoints will need when they are migrated.
 		let translation = match device.filter(|_| crate::iommu::translating()) {
-			Some(index) => match crate::iommu::map_device_buffer(index, generation, base, (pages * PAGE_SIZE as usize) as u64) {
+			Some(index) => match crate::iommu::map_device_buffer(index, generation, base, (pages * PAGE_SIZE as usize) as u64, address_bits) {
 				Ok(Some(mapped)) => Some(mapped),
 				Ok(None) => None,
 				// AN UNCONFIRMED MAP DOES NOT SAY THE FRAMES ARE FREE.

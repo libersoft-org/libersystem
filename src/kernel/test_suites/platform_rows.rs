@@ -567,3 +567,130 @@ fn the_hpet_table_s_window_is_a_kernel_held_row() {
 	assert_eq!(info.platform.state, abi::PLATFORM_STATE_KERNEL_HELD);
 	assert_eq!(info.platform.mmio().first().map(|range| range.base), Some(hpet.base.address), "over the table's window");
 }
+
+// TWO CLAIMS ON ONE LEVEL LINE, which is what a PC gives every PCI function with no MSI: the firmware routes every
+// pin to one of a few ISA IRQs. Two rows publish the `edu` function's line, and both are claimed and bound: one
+// line, one vector, two holders. A firing signals both and masks the line; the quiet holder's acknowledgement
+// alone does not unmask it, the device's holder's does once it has cleared its source; and a holder that leaves
+// while the line waits on it lets it go live for the other, which goes on being delivered to alone.
+crate::tagged_test!(two_claims_share_a_level_line_and_it_is_unmasked_only_when_both_acknowledged, [Drivers, Interrupt, Kernel], id = "kernel.platform_rows.two_claims_share_a_level_line_and_it_is_unmasked_only_when_both_acknowledged", covers = ["kernel"]);
+fn two_claims_share_a_level_line_and_it_is_unmasked_only_when_both_acknowledged() {
+	#[cfg(not(target_arch = "x86_64"))]
+	{
+		crate::serial_println!("platform-line: shared - NOT RUN, a shared level line is x86_64's");
+	}
+	#[cfg(target_arch = "x86_64")]
+	{
+		static DONE: AtomicBool = AtomicBool::new(false);
+		extern "C" fn body(rows: u64) {
+			shared((rows & 0xffff_ffff) as usize, (rows >> 32) as usize);
+			DONE.store(true, Ordering::SeqCst);
+		}
+		let Some((first, line)) = edu_row(b"kernel:test-edu-share-a") else {
+			crate::serial_println!("platform-line: absent (no edu function on this machine) - the shared case did not run");
+			return;
+		};
+		let mut description = synthetic_platform_description(b"kernel:test-edu-share-b");
+		assert!(description.add_line(line));
+		let second = publish_synthetic_platform(description).expect("the second row over the same line is published");
+		in_thread(body, first as u64 | (second as u64) << 32, &DONE);
+		crate::serial_println!("platform-line: shared - two claims held one level line, and it was unmasked only once both had acknowledged");
+	}
+}
+
+#[cfg(target_arch = "x86_64")]
+fn shared(first: usize, second: usize) {
+	let edu = crate::iommu::edu::find().expect("the edu function");
+	let line = device::platform_line(first, 0).expect("the row's line");
+	let a = crate::tests::claim_device(first as u64).expect("the first row is claimed");
+	let b = crate::tests::claim_device(second as u64).expect("the second row is claimed");
+	let (ha, hb) = (acquire(a.claim, abi::RESOURCE_KIND_LINE, 0), acquire(b.claim, abi::RESOURCE_KIND_LINE, 0));
+	assert!(ha > 0 && hb > 0, "both claims bind the line ({ha}, {hb})");
+	let (ia, ib) = (interrupt_of(ha), interrupt_of(hb));
+	let vector = ia.vector();
+	assert_eq!(ib.vector(), vector, "one line, one vector, two holders");
+	assert!(arch::interrupts::line_armed(&line), "and it is live");
+	// RAISED: both signalled, once, and the line masked.
+	edu.raise_interrupt(1);
+	assert!(within(100, || ia.signals() >= 1 && ib.signals() >= 1), "a firing signals every holder");
+	settle(5);
+	assert_eq!((ia.signals(), ib.signals()), (1, 1), "once each - masked, not a storm");
+	assert!(!arch::interrupts::line_armed(&line), "and the mask is at its controller");
+	// THE QUIET HOLDER ACKNOWLEDGES: still masked, since the other was signalled and has not.
+	assert_eq!(acknowledge(hb), 0);
+	settle(5);
+	assert!(!arch::interrupts::line_armed(&line), "masked while a holder it signalled has not acknowledged");
+	// THE DEVICE'S HOLDER clears its source and acknowledges: live, and quiet.
+	edu.acknowledge_interrupt(1);
+	assert_eq!(acknowledge(ha), 0);
+	settle(5);
+	assert!(arch::interrupts::line_armed(&line), "unmasked once both acknowledged");
+	assert_eq!((ia.signals(), ib.signals()), (1, 1), "and nothing fired since");
+	// A HOLDER THAT LEAVES WHILE THE LINE WAITS ON IT.
+	edu.raise_interrupt(2);
+	assert!(within(100, || ia.signals() >= 2 && ib.signals() >= 2), "the next firing reaches both");
+	edu.acknowledge_interrupt(2);
+	assert_eq!(acknowledge(ha), 0);
+	settle(5);
+	assert!(!arch::interrupts::line_armed(&line), "masked: the second holder has not acknowledged");
+	crate::tests::release_device(&b);
+	assert!(arch::interrupts::line_armed(&line), "the second's release let the line go live for the first");
+	assert!(arch::interrupts::is_bound(vector), "which still holds it");
+	edu.raise_interrupt(4);
+	assert!(within(100, || ia.signals() >= 3), "and it is delivered to the first alone");
+	assert_eq!(ib.signals(), 2, "never to the holder that left");
+	edu.acknowledge_interrupt(4);
+	assert_eq!(acknowledge(ha), 0);
+	crate::tests::release_device(&a);
+	assert!(!arch::interrupts::is_bound(vector), "the last release unbound the line");
+	assert!(!arch::interrupts::line_armed(&line), "and masked it");
+}
+
+// A PCI FUNCTION'S ROW HAS A LINE OF ITS OWN: its INTx. A controller with no MSI - EHCI, OHCI, UHCI - has no other
+// interrupt, so its row answers line 0 with the pin the firmware routed, its claim binds it, the pin is turned on
+// for the binding and off again by the release. The `edu` function is claimed through an entry that masters
+// nothing, so the case runs on a machine with no IOMMU as well.
+crate::tagged_test!(a_pci_function_s_row_binds_its_own_intx_and_the_release_turns_the_pin_off, [Drivers, Interrupt, Kernel], id = "kernel.platform_rows.a_pci_function_s_row_binds_its_own_intx_and_the_release_turns_the_pin_off", covers = ["kernel"]);
+fn a_pci_function_s_row_binds_its_own_intx_and_the_release_turns_the_pin_off() {
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(index: u64) {
+		own_intx(index as usize);
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let Some(edu) = crate::iommu::edu::find() else {
+		crate::serial_println!("platform-line: absent (no edu function on this machine) - the PCI-row case did not run");
+		return;
+	};
+	edu.acknowledge_interrupt(u32::MAX);
+	let index = (0..device::count()).find(|&index| device::info(index).is_some_and(|info| info.transport != abi::TRANSPORT_PLATFORM && (info.bus, info.dev, info.func) == (edu.bus, edu.dev, edu.func))).expect("the edu function has a row");
+	in_thread(body, index as u64, &DONE);
+	crate::serial_println!("platform-line: pci-row - the edu function's row bound its own INTx, delivered, and the release turned its pin off");
+}
+
+fn own_intx(index: usize) {
+	let edu = crate::iommu::edu::find().expect("the edu function");
+	let (line, function) = device::row_line(index, 0).expect("a PCI function with a pin has line 0");
+	assert_eq!(function, Some((edu.bus, edu.dev, edu.func)), "and it is the function's own");
+	assert_eq!(line, edu_line(&edu), "the line its pin is routed to");
+	assert!(device::row_line(index, 1).is_none(), "and no other");
+	let entry = abi::entry_name_field(b"edu-line").expect("the entry's name fits");
+	// THE PIN OFF FIRST: the platform-row cases above publish this line as a row's and turn the pin on to do it.
+	arch::pci::set_intx_disabled(edu.bus, edu.dev, edu.func, true);
+	let grant = crate::tests::claim_device_as(index as u64, &entry).expect("the function is claimed under an entry that masters nothing");
+	let handle = acquire(grant.claim, abi::RESOURCE_KIND_LINE, 0);
+	assert!(handle > 0, "the row's line is bound from the claim ({handle})");
+	assert!(!intx_disabled(&edu), "and its pin is on");
+	let interrupt = interrupt_of(handle);
+	edu.raise_interrupt(1);
+	assert!(within(100, || interrupt.signals() >= 1), "the function's INTx reached its own claim");
+	edu.acknowledge_interrupt(1);
+	assert_eq!(acknowledge(handle), 0);
+	crate::tests::release_device(&grant);
+	assert!(intx_disabled(&edu), "the release turned its pin off");
+	assert!(!arch::interrupts::is_bound(interrupt.vector()), "and unbound its line");
+}
+
+// The function's command-register Interrupt Disable bit.
+fn intx_disabled(edu: &crate::iommu::edu::Edu) -> bool {
+	arch::pci::config_read_exact(edu.bus, edu.dev, edu.func, 0x04, 2).expect("the command register reads") & (1 << 10) != 0
+}

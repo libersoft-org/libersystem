@@ -440,6 +440,90 @@ impl Budget {
 			ClassKind::Display => &mut self.display,
 		}
 	}
+
+	/// WHETHER A CLASS MODULE HAS ROOM FOR ANOTHER DEVICE, said when it has not - by `who`, the driver.
+	///
+	/// THE REFUSAL IS PRINTED HERE AND NOWHERE ELSE, so a controller that will not take a ninth keyboard says which
+	/// ceiling it reached rather than leaving a device addressed and silent - every controller with the same words.
+	/// Nothing is charged: the charge is taken when the module takes the device, since a device that turns out not
+	/// to be of the class is refused by its own configure step and must not spend the budget.
+	pub fn admits(&self, kind: ClassKind, class: u8, who: &[u8]) -> bool {
+		let mut trial = *self;
+		match trial.admit(kind) {
+			Ok(()) => true,
+			Err(refusal) => {
+				// A device that is not of this class would be refused by its own configure step anyway, and saying
+				// "the keyboard budget is full" about a printer would be a lie.
+				if class_is_plausible(kind, class) {
+					rt::print(who);
+					rt::print(b": ");
+					rt::print(kind.name());
+					rt::print(b" module is full (");
+					rt::print(refusal.describe());
+					rt::print(b"), device left unbound\n");
+				}
+				false
+			}
+		}
+	}
+}
+
+impl ClassKind {
+	/// The module's name, as a refusal says it.
+	pub const fn name(self) -> &'static [u8] {
+		match self {
+			ClassKind::Hid => b"HID",
+			ClassKind::Storage => b"storage",
+			ClassKind::Network => b"network",
+			ClassKind::Uas => b"UAS",
+			ClassKind::Serial => b"serial",
+			ClassKind::Audio => b"audio",
+			ClassKind::Printer => b"printer",
+			ClassKind::StillImage => b"still-image",
+			ClassKind::SmartCard => b"smart-card",
+			ClassKind::Midi => b"MIDI",
+			ClassKind::PowerDevice => b"power-device",
+			ClassKind::Bluetooth => b"Bluetooth",
+			ClassKind::Mbim => b"MBIM",
+			ClassKind::Video => b"video",
+			ClassKind::Dfu => b"DFU",
+			ClassKind::Display => b"monitor",
+		}
+	}
+}
+
+/// WHETHER A DEVICE'S CLASS BYTE COULD BELONG TO A MODULE AT ALL. A composite device declares zero at the device
+/// level and names its classes per interface, so zero is plausible for every module; the association class (0xef)
+/// is what an interface association descriptor needs.
+pub fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
+	match kind {
+		ClassKind::Hid => class == 0 || class == 0x03,
+		ClassKind::Storage => class == 0 || class == crate::usb_bot::CLASS_MASS_STORAGE,
+		// A CDC adapter declares the communications class at the DEVICE level - unlike HID and mass storage, which
+		// declare it per interface and leave zero here.
+		ClassKind::Network => class == 0 || class == crate::cdc::CLASS_COMMUNICATIONS,
+		ClassKind::Uas => class == 0 || class == crate::usb_bot::CLASS_MASS_STORAGE,
+		// A CDC-ACM adapter declares the communications class at the device level like the network models do. This
+		// is read TWICE: once for the refusal message, and once in the dispatch as the cheap test in front of the
+		// serial module's descriptor walk.
+		ClassKind::Serial => class == 0 || class == crate::cdc::CLASS_COMMUNICATIONS,
+		// An audio device declares its class PER INTERFACE and leaves zero at the device level, like HID and mass
+		// storage - the audio-control and audio-streaming interfaces are what carry it - or, as a UAC2 function
+		// does, the association class its interface association descriptor needs.
+		ClassKind::Audio => class == 0 || class == 0xef || class == crate::uac::CLASS_AUDIO,
+		// THE SERVICE-BACKED CLASSES name themselves per interface, all but two: a Bluetooth controller declares its
+		// class at the device level, and a composite device of any of them declares zero or the association class.
+		ClassKind::Printer => class == 0 || class == 0xef || class == crate::printer::CLASS_PRINTER,
+		ClassKind::StillImage => class == 0 || class == 0xef || class == 0x06,
+		ClassKind::SmartCard => class == 0 || class == 0xef || class == 0x0b,
+		ClassKind::Midi => class == 0 || class == 0xef || class == 0x01,
+		ClassKind::PowerDevice => class == 0 || class == 0xef || class == 0x03,
+		ClassKind::Bluetooth => class == 0 || class == 0xef || class == 0xe0,
+		ClassKind::Mbim => class == 0 || class == 0xef || class == crate::cdc::CLASS_COMMUNICATIONS,
+		ClassKind::Video => class == 0 || class == 0xef || class == 0x0e,
+		ClassKind::Dfu => class == 0 || class == 0xef || class == 0xfe,
+		ClassKind::Display => class == 0 || class == 0xef || class == 0x03,
+	}
 }
 
 #[cfg(test)]

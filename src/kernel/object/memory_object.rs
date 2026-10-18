@@ -68,7 +68,8 @@ impl MemoryObject {
 		if !domain.try_charge_memory(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
-		let frames = match frame::allocate_pages(pages) {
+		// A PROGRAM'S MEMORY, so it may be plugged memory: it goes when the program lets it go or ends.
+		let frames = match frame::allocate_pages_movable(pages) {
 			Some(f) => f,
 			None => {
 				domain.uncharge_memory(bytes);

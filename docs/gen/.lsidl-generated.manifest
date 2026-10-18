@@ -32,6 +32,8 @@ liber/gpio_device/v1.abi
 liber/gpio_device/v1.md
 liber/graphics/v1.abi
 liber/graphics/v1.md
+liber/hotplug_device/v1.abi
+liber/hotplug_device/v1.md
 liber/i2c_device/v1.abi
 liber/i2c_device/v1.md
 liber/import/v1.abi

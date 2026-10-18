@@ -33,6 +33,9 @@ pub mod provider_subscription;
 // The policy over a virtual machine's memory balloon: how much the host may have back.
 #[path = "resource_manager/balloon.rs"]
 mod balloon;
+// The policy over the memory a host plugs in.
+#[path = "resource_manager/hotplug.rs"]
+mod hotplug;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -239,11 +242,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    And every second, between requests, the balloon's allowance looked at again.
 	let mut manager: Manager = Manager { domain, process: process_client };
 	let mut policy = balloon::BalloonPolicy::new(catalogue);
+	let mut plugged = hotplug::HotplugPolicy::new(catalogue);
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	serve_multi_ticked(service, &[], BALLOON_TICK, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
 		if chan == 0 {
 			policy.tick();
+			plugged.tick();
 			return None;
 		}
 		resources::dispatch(&mut manager, req, handle, out, reply_handle)

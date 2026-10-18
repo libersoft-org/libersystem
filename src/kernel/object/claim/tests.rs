@@ -674,7 +674,7 @@ fn a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner() {
 
 	// And the replacement gives it back the ordinary way, so the vector is not leaked to the rest of
 	// the suite.
-	unbind(vector);
+	unbind(vector, replacement.owner());
 	let _ = release_msi_for_device(owner);
 	// SAFETY: allocated by this call and never mapped.
 	unsafe { frame::deallocate(table) };
@@ -943,7 +943,7 @@ fn a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns() {
 
 	drop(stale);
 	assert!(is_bound(vector), "and its drop did not tear the replacement down either");
-	unbind(vector);
+	unbind(vector, replacement.owner());
 	let _ = release_msi_for_device(owner);
 	// SAFETY: allocated by this call and never mapped.
 	unsafe { frame::deallocate(table) };

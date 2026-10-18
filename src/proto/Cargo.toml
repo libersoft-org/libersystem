@@ -38,6 +38,7 @@ channel-client-impl = [
 	"crypto-device-proto/channel-client-impl",
 	"share-device-proto/channel-client-impl",
 	"balloon-device-proto/channel-client-impl",
+	"hotplug-device-proto/channel-client-impl",
 	"spool-proto/channel-client-impl",
 	"printer-device-proto/channel-client-impl",
 	"import-proto/channel-client-impl",
@@ -81,6 +82,7 @@ shared-image = [
 	"crypto-device-proto/shared-image",
 	"share-device-proto/shared-image",
 	"balloon-device-proto/shared-image",
+	"hotplug-device-proto/shared-image",
 	"spool-proto/shared-image",
 	"printer-device-proto/shared-image",
 	"import-proto/shared-image",
@@ -133,6 +135,7 @@ gpio-device-proto = { path = "../user/libs/protocol/gpio-device-proto" }
 crypto-device-proto = { path = "../user/libs/protocol/crypto-device-proto" }
 share-device-proto = { path = "../user/libs/protocol/share-device-proto" }
 balloon-device-proto = { path = "../user/libs/protocol/balloon-device-proto" }
+hotplug-device-proto = { path = "../user/libs/protocol/hotplug-device-proto" }
 spool-proto = { path = "../user/libs/protocol/spool-proto" }
 printer-device-proto = { path = "../user/libs/protocol/printer-device-proto" }
 import-proto = { path = "../user/libs/protocol/import-proto" }

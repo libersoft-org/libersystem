@@ -147,6 +147,14 @@ declare -A GATES=(
 	# allowance, the reserve kept against a request for nearly everything, a program's need met by the balloon giving
 	# back, the host's cancellation followed, and the guest's statistics in QEMU's hands.
 	["balloon"]="tools/check-balloon.sh"
+	# PLUGGED MEMORY ON A 2 GiB DEVELOPMENT INSTANCE WITH A 1 GiB virtio-mem REGION: plugged in and counted, used past what
+	# the boot had, asked back while held - what is in use staying - given back once freed, and a cancellation followed.
+	["memory-hotplug"]="tools/check-memory-hotplug.sh"
+	# THE EARLIER USB CONTROLLERS ON A DEVELOPMENT GUEST WITH NO xHCI: UHCI, OHCI and EHCI with its companions under one
+	# shared USB core - every controller bound on the shared lines, a full-speed keyboard handed from the EHCI to its
+	# companion, keys and tablet moves through each, and `vol://usb` following sticks out and in on all three, one
+	# behind a hub.
+	["usb-legacy"]="tools/check-usb-legacy.sh"
 	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
 	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
 	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.

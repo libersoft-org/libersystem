@@ -481,6 +481,60 @@ impl Buddy {
 		Some(phys)
 	}
 
+	// THE SAME, ENDING AT OR BELOW `limit` - the DMA allocation for an engine that names fewer address bits than the
+	// machine has. The lowest free block of each order is the one at the lowest address of that order, so it alone
+	// says whether the order can serve below the limit; the smallest order that can is taken, so a large block is
+	// split only when nothing smaller fits. The run is the head of the block, which is where the limit is checked.
+	pub fn alloc_contiguous_below(&mut self, pages: u64, limit: u64) -> Option<u64> {
+		if pages == 0 {
+			return None;
+		}
+		let order = order_for(pages);
+		if order > MAX_ORDER {
+			return None;
+		}
+		let bytes = pages.checked_mul(PAGE_SIZE)?;
+		let fits = (order..=MAX_ORDER).find(|&larger| {
+			let Some(index) = self.peek_first_free(larger) else { return false };
+			let at = self.base + index * (1u64 << larger) * PAGE_SIZE;
+			at.checked_add(bytes).is_some_and(|end| end <= limit)
+		})?;
+		let index = self.first_free(fits)?;
+		self.clear(fits, index);
+		let mut at_order = fits;
+		let mut index = index;
+		while at_order > order {
+			at_order -= 1;
+			index *= 2;
+			self.set(at_order, index + 1);
+		}
+		self.free_pages -= 1u64 << order;
+		let phys = self.base + index * (1u64 << order) * PAGE_SIZE;
+		let taken = 1u64 << order;
+		if taken > pages {
+			let handed_back = self.free_span(phys + pages * PAGE_SIZE, taken - pages);
+			debug_assert_eq!(handed_back, taken - pages, "the rounding remainder of a block must fit back into the pool it came from");
+		}
+		Some(phys)
+	}
+
+	// The lowest free block of `order` without moving its hint - the question `alloc_contiguous_below` asks of
+	// every order before it takes from one.
+	fn peek_first_free(&self, order: usize) -> Option<u64> {
+		if self.counts[order] == 0 {
+			return None;
+		}
+		let start = self.hint[order].min(self.words[order]);
+		for word in start..self.words[order] {
+			let value = self.bits[self.offsets[order] + word];
+			if value != 0 {
+				let index = (word as u64) * 64 + value.trailing_zeros() as u64;
+				return (index < self.blocks_at(order)).then_some(index);
+			}
+		}
+		None
+	}
+
 	// Is this page currently free? For the ownership cross-check and the tests.
 	pub fn is_free_page(&self, phys: u64) -> bool {
 		if phys < self.base {

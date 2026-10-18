@@ -31,6 +31,8 @@
 #   VGA=std   x86_64 interactive: q35's own VGA function at 00:01.0 instead of `virtio-vga` - the boot framebuffer in a
 #             function's BAR, presented by DisplayService as the boot framebuffer (the brightness gate's ACPI half)
 #   MEM=      override RAM (default varies by arch)
+#   USB_LEGACY=1  x86_64: UHCI, OHCI and EHCI with its companions, each carrying devices, in place of xHCI - the
+#             `usb-legacy` gate's machine; see `qemu_attach_usb_legacy`
 #   STRIP=    none | debug | all for a harness-created boot medium (default: all)
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
 #   VNC_ADDR= VNC bind address and display (default 0.0.0.0:0 - every interface, unauthenticated)
@@ -1168,6 +1170,48 @@ vsock_echo_stop() {
 	VSOCK_ECHO_PID=""
 }
 
+# THE EARLIER USB HOST CONTROLLERS IN PLACE OF xHCI, when a run asks for them (`USB_LEGACY=1`) - the `usb-legacy` gate's
+# machine, x86_64 only. No xHCI, so every USB device is on one of these and the USB volume's instance can only take a
+# stick one of them publishes:
+#
+#   UHCI (`piix3-usb-uhci`)  a full-speed hub on port 1 with a keyboard (`lkbd`) on its first port
+#   OHCI (`pci-ohci`)        a tablet (`ltab`) on port 1 and the run's USB stick (`lstick`) on port 2
+#   EHCI (`ich9-usb-ehci1`)  a high-speed stick (`lstick2`, a second private copy) on port 1, a high-speed tablet
+#                            (`ltab2`) on port 2, and a FULL-SPEED keyboard (`lkbd2`, `usb_version=1`) on port 3 -
+#                            which the EHCI driver hands to its companion: `ich9-usb-uhci1..3` on the same slot,
+#                            two ports each, so port 3 is the second companion's first.
+#
+# ALL OF THEM ON THE TWO IRQS THE FIRMWARE ROUTES EVERY PCI PIN TO, which is the shared-line case the kernel's level
+# lines exist for. The second stick is this run's own copy, swept like the first.
+qemu_attach_usb_legacy() {
+	local -n legacy_into=$1
+	local drive_id="$2"
+	local second="${USB_DISK%.img}.legacy.$$.img"
+	scratch_sweep "${USB_DISK%.img}.legacy" .img
+	cp --reflink=auto "$USB_DISK" "$second" || {
+		echo "qemu-run: could not make this run's second USB stick" >&2
+		exit 1
+	}
+	legacy_into+=(
+		-device "piix3-usb-uhci,id=luhci"
+		-device "usb-hub,bus=luhci.0,port=1,id=lhub"
+		-device "usb-kbd,bus=luhci.0,port=1.1,id=lkbd"
+		-device "pci-ohci,id=lohci"
+		-device "usb-tablet,bus=lohci.0,port=1,id=ltab"
+		-device "ich9-usb-ehci1,id=lehci,addr=1d.7,multifunction=on"
+		-device "ich9-usb-uhci1,masterbus=lehci.0,firstport=0,addr=1d.0,multifunction=on"
+		-device "ich9-usb-uhci2,masterbus=lehci.0,firstport=2,addr=1d.1"
+		-device "ich9-usb-uhci3,masterbus=lehci.0,firstport=4,addr=1d.2"
+		-drive "file=$second,if=none,id=vusb2,format=raw"
+		-device "usb-storage,bus=lehci.0,port=1,drive=vusb2,id=lstick2"
+		-device "usb-tablet,bus=lehci.0,port=2,id=ltab2"
+		-device "usb-kbd,bus=lehci.0,port=3,id=lkbd2,usb_version=1"
+	)
+	if [[ -n "$drive_id" ]]; then
+		legacy_into+=(-device "usb-storage,bus=lohci.0,port=2,drive=$drive_id,id=lstick")
+	fi
+}
+
 qemu_attach_xhci() {
 	local -n arr=$1
 	local usb_drive_id="${2:-}"
@@ -1315,6 +1359,25 @@ qemu_attach_host_share() {
 	fi
 	share_into+=(-chardev "socket,id=hostshare,path=$VIRTIOFS_SOCKET" -device "vhost-user-fs-pci,chardev=hostshare,tag=host")
 	echo "qemu-run: a host share on $VIRTIOFS_SOCKET, tagged host" >&2
+}
+
+# MEMORY A HOST PLUGS IN AT RUN TIME, when a run asks for it (`VIRTIO_MEM=1`): a `virtio-mem-pci` device over a 1 GiB
+# backend in 2 MiB blocks, nothing requested at the start - the host asks over QMP (`requested-size`) - in the device-
+# memory area `maxmem` opens past the RAM.
+qemu_attach_virtio_mem() {
+	local -n mem_into="$1"
+	local mem="$2" opts="$3" mib
+	[[ "${VIRTIO_MEM:-0}" == "1" ]] || return 0
+	case "$mem" in
+	[0-9]*[Gg]) mib="${mem%[Gg]}" && [[ "$mib" =~ ^[0-9]+$ ]] && mib=$((mib * 1024)) ;;
+	[0-9]*[Mm]) mib="${mem%[Mm]}" ;;
+	*) mib="$mem" ;;
+	esac
+	if [[ ! "$mib" =~ ^[0-9]+$ ]]; then
+		echo "qemu-run: memory size '$mem' is not one this runner can open a device-memory area past - no virtio-mem" >&2
+		exit 2
+	fi
+	mem_into+=(-m "maxmem=$((mib + 2048))M" -object "memory-backend-ram,id=vmem0,size=1G" -device "virtio-mem-pci,id=vmemdev,memdev=vmem0,block-size=2M,requested-size=0${opts:+,$opts}")
 }
 
 # THE PERSISTENT-MEMORY MODULES THE NVDIMM SUITE READS (x86_64 test machines).
@@ -2301,6 +2364,7 @@ qemu_run_x86_64() {
 	# A MEMORY BALLOON, when a run asks for one (`BALLOON=1`): its target is the host's, set over QMP, and the guest's
 	# statistics are asked for every two seconds so the host can read them back.
 	[[ "${BALLOON:-0}" != "1" ]] || qemu_args+=(-device "virtio-balloon-pci,id=balloon0,guest-stats-polling-interval=2${virtio_opts:+,$virtio_opts}")
+	qemu_attach_virtio_mem qemu_args "${MEM:-4G}" "$virtio_opts"
 
 	# System volume disk: carries the LiberFS volume itself.
 	# The DMA test kernel enters its suite directly and reads fixtures from the boot archive.
@@ -2466,7 +2530,11 @@ qemu_run_x86_64() {
 			fi
 			qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
 		fi
-		qemu_attach_xhci qemu_args "$usb_storage_id" "${TEST:-0}"
+		if [[ "${USB_LEGACY:-0}" == "1" ]]; then
+			qemu_attach_usb_legacy qemu_args "$usb_storage_id"
+		else
+			qemu_attach_xhci qemu_args "$usb_storage_id" "${TEST:-0}"
+		fi
 		# A TPM, WHEN A RUN ASKS FOR ONE: QEMU's CRB or FIFO front-end at the platform's fixed address, described in
 		# the ACPI `TPM2` table QEMU builds, with the `swtpm` `test-kernel.sh` started behind it. Not a PCI device,
 		# so it renumbers nothing.

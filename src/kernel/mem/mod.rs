@@ -5,6 +5,8 @@
 
 pub mod frame;
 pub mod heap;
+// Memory a virtual machine's host plugs in at run time, held apart from the boot pools. See `hotplug`.
+pub mod hotplug;
 pub mod tlb;
 pub mod vapool;
 

@@ -239,6 +239,41 @@ test = false
 bench = false
 
 [[bin]]
+# THE EHCI DRIVER: an EHCI USB 2.0 host controller under the shared USB core (`drivers::usb_host`), BAR 0 registers and
+# its function's INTx - a full- or low-speed device on a root port is handed to the companion controller.
+name = "ehci"
+path = "src/ehci.rs"
+test = false
+bench = false
+
+[[bin]]
+# THE OHCI DRIVER: an OHCI USB 1.1 host controller under the shared USB core (`drivers::usb_host`), BAR 0 registers
+# and its function's INTx. The final compatibility wave, not enabled by default: development-only in the manifest.
+name = "ohci"
+path = "src/ohci.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE UHCI DRIVER: an Intel UHCI USB 1.1 host controller under the shared USB core (`drivers::usb_host`), I/O registers
+# and its function's INTx. The final compatibility wave, not enabled by default: development-only in the manifest.
+name = "uhci"
+path = "src/uhci.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE VIRTIO-MEM DRIVER: memory a virtual machine's host plugs in at run time, brought online within the allowance
+# ResourceManager grants and given back only once nothing holds it. Its wire and steps are `src/memplug.rs`, part of
+# the library and host-tested.
+name = "virtio_mem"
+path = "src/virtio_mem.rs"
+test = false
+bench = false
+
+[[bin]]
 # THE VIRTIO-FS DRIVER, development-only: a directory of the host as the `share-device` contract, which StorageService
 # serves as `vol://host`. Its FUSE wire, the name rules and the node handles are `src/fuse.rs`, part of the library
 # and host-tested.

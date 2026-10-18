@@ -54,6 +54,11 @@ impl Interrupt {
 		self.vector
 	}
 
+	// WHAT NAMES THIS OBJECT TO ITS LINE: its address, which a shared level line's holders are told apart by - the
+	// dispatch table holds them weakly, and a `Drop` in progress has no strong reference left to compare by.
+	pub fn owner(&self) -> usize {
+		self as *const Self as usize
+	}
 	// Mark this Interrupt as the owner of its vector binding (called by bind()).
 	pub fn mark_bound(&self) {
 		self.bound.store(true, Ordering::Release);
@@ -161,7 +166,7 @@ impl Interrupt {
 		// does not repeat it against a slot another device may by then own.
 		if self.bound.swap(false, Ordering::AcqRel) {
 			crate::sleep::mark_wake(self.vector, false);
-			crate::arch::interrupts::unbind(self.vector)
+			crate::arch::interrupts::unbind(self.vector, self.owner())
 		} else {
 			true
 		}
@@ -180,7 +185,7 @@ impl Drop for Interrupt {
 		if self.bound.swap(false, Ordering::AcqRel) {
 			// AND ITS WAKE MARK WITH IT: the vector may be another binding's next.
 			crate::sleep::mark_wake(self.vector, false);
-			crate::arch::interrupts::unbind(self.vector);
+			crate::arch::interrupts::unbind(self.vector, self.owner());
 		}
 	}
 }

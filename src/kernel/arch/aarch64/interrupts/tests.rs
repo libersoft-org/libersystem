@@ -41,14 +41,14 @@ fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	// vector stays masked and held, which is deliberate - a request to stop is not proof of stopping.
 	// So "unbind, therefore the vector is released" was the gate's claim and not the code's, and M3's
 	// teardown checkpoint went unproved while the profile printed that it was satisfied.
-	unbind(vector);
+	unbind(vector, 0);
 	assert!(!is_bound(vector), "unbind drops the binding");
 	// THE RELEASE IS WHAT RETURNS IT, and the proof is that the slot can be acquired again.
 	let released = release_msi_for_device(3);
 	assert!(released >= 1, "the device's retired vector is given back by the release, which is the step `unbind` deliberately does not perform");
 	let again = acquire_msi(table, 0, 3).expect("the released slot is handed out again");
 	assert_eq!(again, vector, "the SAME vector comes back - a release that hands out a different one has not returned this one");
-	unbind(again);
+	unbind(again, 0);
 	let _ = release_msi_for_device(3);
 	unsafe { frame::deallocate(table) };
 }
@@ -86,7 +86,7 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 		}
 	}
 	assert!(seen, "the acquired MSI vector appears in the inventory");
-	unbind(vector);
+	unbind(vector, 0);
 	unsafe { frame::deallocate(table) };
 }
 

@@ -1035,13 +1035,20 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 
 // Install one translation for a device that is behind the IOMMU, and hand back the address the
 // device will use. The frame owner must call `unmap_for_device` even if its domain retired first.
+#[cfg(test)]
 pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction: dma::Direction) -> Result<(dma::MappingId, dma::DmaAddress), Fault> {
+	map_for_device_within(domain, physical, len, direction, 64)
+}
+
+// The same, for a device that puts `address_bits` on the bus: the address it is given is below that ceiling, or
+// the map is refused - a first-fit space hands out low addresses first, and this is what makes that a rule.
+pub fn map_for_device_within(domain: dma::DomainId, physical: u64, len: u64, direction: dma::Direction, address_bits: u32) -> Result<(dma::MappingId, dma::DmaAddress), Fault> {
 	with(|controller| {
 		let config = *controller.iommu().backend().config();
 		// The device's own smallest page is the alignment, and it is a power of two by construction -
 		// `smallest_page` derives it from the bitmap the device published. A device that published none
 		// leaves nothing to map through.
-		let Ok(requirements) = dma::Requirements::new(64, config.smallest_page(), 1, true) else {
+		let Ok(requirements) = dma::Requirements::new(address_bits, config.smallest_page(), 1, true) else {
 			return Err(Fault::Unconfirmed);
 		};
 		let iommu = controller.iommu();
@@ -1457,9 +1464,9 @@ pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma
 // `Ok(None)` is "this device is not translated", which is not a failure: it is every device in this
 // tree today. `Err` is a device that IS translated and whose mapping did not confirm - and the
 // caller must not hand out an address for one of those.
-pub fn map_device_buffer(index: u32, generation: u64, physical: u64, len: u64) -> Result<Option<(dma::MappingId, dma::DmaAddress)>, Fault> {
+pub fn map_device_buffer(index: u32, generation: u64, physical: u64, len: u64, address_bits: u32) -> Result<Option<(dma::MappingId, dma::DmaAddress)>, Fault> {
 	let Some(domain) = domain_for_generation(index, generation)? else { return Ok(None) };
-	map_for_device(domain, physical, len, dma::Direction::Bidirectional).map(Some)
+	map_for_device_within(domain, physical, len, dma::Direction::Bidirectional, address_bits).map(Some)
 }
 
 // Which domain a device's endpoint was attached to, if it was.

@@ -1,0 +1,37 @@
+//! LiberSystem plugged memory - the contract a `memory-hotplug` provider serves: memory a virtual machine's host plugs in
+//! at run time, and the allowance ResourceManager grants for it.
+//!
+//! A PROTOCOL OF ITS OWN, NOT THE BALLOON'S. A balloon gives the host memory the machine has; plugged memory is memory
+//! the host adds and may ask back - and what it asks back is given only once nothing here holds it: a block with one
+//! frame in use stays plugged, whatever the host asks, until that frame is freed. ResourceManager, the one consumer,
+//! allows how much may be plugged and is told how much the host asked back that is still in use.
+//!
+//! IN BYTES, whole blocks of the device's block size.
+
+package liber:hotplug-device@1;
+
+use liber:base@1.{error};
+
+/// Where the plugged memory stands.
+record hotplug-status {
+	/// The device's block: what is plugged and unplugged at a time.
+	block-size:  u64,
+	/// How much the device's region can hold.
+	region-size: u64,
+	/// What the host asks to have plugged.
+	requested:   u64,
+	/// What is plugged and online now.
+	plugged:     u64,
+	/// The most the policy allows to be plugged.
+	allowed:     u64,
+	/// What the host asked back that something here still holds - plugged until it is freed.
+	in-use:      u64,
+}
+
+/// THE CONTRACT a `memory-hotplug` publication serves.
+interface hotplug-device {
+	/// Where the plugged memory stands.
+	@op(1) status: func() -> result<hotplug-status, error>;
+	/// The most that may be plugged from now on, in bytes.
+	@op(2) allow:  func(bytes: u64) -> result<hotplug-status, error>;
+}

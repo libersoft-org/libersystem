@@ -720,6 +720,12 @@ impl FrameAllocator {
 	// one buffer - and the pools are separate bitmaps, so it cannot happen by construction. This
 	// says so where a reader looks for it.
 	fn take_contiguous_from(&mut self, pages: u64, want: Option<NodeId>) -> Option<u64> {
+		self.take_contiguous_below(pages, want, u64::MAX)
+	}
+
+	// A contiguous run that ends at or below `limit` - `u64::MAX` for no limit, which is every request but a 32-bit
+	// engine's.
+	fn take_contiguous_below(&mut self, pages: u64, want: Option<NodeId>, limit: u64) -> Option<u64> {
 		if !self.pools.is_empty() {
 			let mut order = [0usize; MAX_POOLS];
 			let count = self.preference(want, &mut order);
@@ -729,7 +735,8 @@ impl FrameAllocator {
 				if self.pools[at].node.is_some_and(node_is_pretend_empty) {
 					continue;
 				}
-				if let Some(base) = self.pools[at].buddy.alloc_contiguous(pages) {
+				let taken = if limit == u64::MAX { self.pools[at].buddy.alloc_contiguous(pages) } else { self.pools[at].buddy.alloc_contiguous_below(pages, limit) };
+				if let Some(base) = taken {
 					chosen = Some((at, base));
 					break;
 				}
@@ -758,7 +765,7 @@ impl FrameAllocator {
 			return Some(base);
 		}
 		for at in 0..self.runs().len() {
-			if self.runs()[at].pages >= pages {
+			if self.runs()[at].pages >= pages && self.runs()[at].base.checked_add(pages * PAGE_SIZE).is_some_and(|end| end <= limit) {
 				let base = {
 					let run = &mut self.runs_mut()[at];
 					let base = run.base;
@@ -1234,10 +1241,15 @@ pub fn buddy_metadata_bytes() -> usize {
 	ALLOCATOR.lock().pools.iter().map(|pool| pool.buddy.metadata_bytes()).sum()
 }
 
-// The frame pool's totals: (total usable frames fixed at init, frames currently free).
+// The frame pool's totals: (total usable frames - fixed at init, and what a host plugged in since - and frames currently
+// free).
 pub fn totals() -> (usize, usize) {
-	let allocator = ALLOCATOR.lock();
-	(allocator.total_count, allocator.free_count)
+	let (total, free) = {
+		let allocator = ALLOCATOR.lock();
+		(allocator.total_count, allocator.free_count)
+	};
+	let (plugged, plugged_free) = super::hotplug::totals();
+	(total + plugged, free + plugged_free)
 }
 
 // How many frames were free when the allocator came up.
@@ -1261,6 +1273,9 @@ pub fn free_at_start() -> usize {
 // buddy exists. A frame outside every pool is not free: it was never the pool's to hand out. For the hibernation
 // snapshot, which copies every frame in use and calls this for each one in the memory map's seeded regions.
 pub fn is_free(phys: u64) -> bool {
+	if let Some(free) = super::hotplug::is_free(phys) {
+		return free;
+	}
 	let allocator = ALLOCATOR.lock();
 	if !allocator.pools.is_empty() {
 		return allocator.pool_of(phys).is_some_and(|at| allocator.pools[at].buddy.is_free_page(phys));
@@ -1269,7 +1284,8 @@ pub fn is_free(phys: u64) -> bool {
 }
 
 pub fn free_count() -> usize {
-	ALLOCATOR.lock().free_count
+	let free = ALLOCATOR.lock().free_count;
+	free + super::hotplug::totals().1
 }
 
 // THE BALLOON'S FRAMES: taken out of the free pool for a virtual machine's host, neither free nor in use here. Counted
@@ -1615,6 +1631,31 @@ pub fn allocate() -> Option<u64> {
 	ALLOCATOR.lock().take_one_from(want)
 }
 
+// ONE FRAME FOR A PROGRAM'S MEMORY - a memory object charged to its Domain, which goes when the program lets it go or
+// ends - and only that may come from what a host plugged in, once the boot pools have nothing. Nothing the kernel keeps
+// for itself (its heap, a page table, a DMA buffer, a stack) ever does: such a frame would hold its block plugged for
+// good, and a plugged block is the host's to ask back. See `mem::hotplug`.
+//
+// AND THE BOOT POOLS KEEP A RESERVE FOR THE KERNEL: a program's frame comes from them while more than
+// `kernel_reserve` of them are free, and from plugged memory below that - so a program that eats the machine's memory
+// does not take the page tables its own mappings need with it.
+pub fn allocate_movable() -> Option<u64> {
+	let (total, free) = {
+		let allocator = ALLOCATOR.lock();
+		(allocator.total_count, allocator.free_count)
+	};
+	if free > kernel_reserve(total) {
+		return allocate().or_else(super::hotplug::take);
+	}
+	super::hotplug::take().or_else(allocate)
+}
+
+// What the boot pools keep for the kernel once plugged memory can serve programs instead: a thirty-second of them, and
+// never under 16 MiB.
+pub fn kernel_reserve(total: usize) -> usize {
+	(total / 32).max(4096)
+}
+
 // Allocate `pages` physically CONTIGUOUS frames, returning the base address of
 // the span - the allocation DMA buffers ride, so a device sees one run. None if
 // no free run is large enough.
@@ -1624,6 +1665,17 @@ pub fn allocate() -> Option<u64> {
 // purpose is a device reaching memory was the one that ignored which node the memory is on. The
 // contract says contiguous follows the same strict/preferred rule as everything else, and
 // `take_contiguous_from` already takes the node - it was simply never given one.
+// THE SAME, ENDING AT OR BELOW `limit`: a DMA buffer for an engine that names fewer address bits than this machine
+// has - EHCI, OHCI and UHCI put 32 on the bus. Every pool is asked, in the usual order, whether it can serve below
+// the limit; the run table, before the pools exist, by its first run that fits.
+pub fn allocate_contiguous_below(pages: usize, limit: u64) -> Option<u64> {
+	if pages == 0 || injected_failure() {
+		return None;
+	}
+	let want = crate::smp::numa::local_node();
+	ALLOCATOR.lock().take_contiguous_below(pages as u64, want, limit)
+}
+
 pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 	if pages == 0 {
 		return None;
@@ -1661,6 +1713,10 @@ pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 // `allocate_contiguous` span), still owned by the caller, freed exactly once, and no longer
 // mapped anywhere it could be written through.
 pub unsafe fn deallocate(phys: u64) {
+	// A HOTPLUGGED FRAME GOES BACK TO ITS REGION, never into a boot pool that does not cover it.
+	if super::hotplug::give(phys) {
+		return;
+	}
 	// ALLOC-OK: the frame allocator's own free list; a free must not be able to fail.
 	ALLOCATOR.lock().insert(phys, 1);
 }
@@ -1677,6 +1733,15 @@ pub fn pages_for(bytes: usize) -> usize {
 // in ascending physical order so adjacent frames stay adjacent virtually (and a
 // device fed the layout can coalesce them into runs).
 pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
+	allocate_pages_with(pages, allocate)
+}
+
+// The same, for a program's memory object: frames that may come from plugged memory - see `allocate_movable`.
+pub fn allocate_pages_movable(pages: usize) -> Option<Vec<u64>> {
+	allocate_pages_with(pages, allocate_movable)
+}
+
+fn allocate_pages_with(pages: usize, allocate: fn() -> Option<u64>) -> Option<Vec<u64>> {
 	// FALLIBLE. `Vec::with_capacity` answers a request the machine cannot meet by aborting, and
 	// `pages` comes from a syscall argument by way of `pages_for` - so the one place a caller's
 	// number reached an infallible allocation was the metadata for the frames, before a single
